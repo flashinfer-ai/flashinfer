@@ -22,6 +22,7 @@ import functools
 import logging
 import os
 import pathlib
+import platform
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Mapping, Optional, Tuple
 
@@ -67,7 +68,17 @@ FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
 )
 
-FLASHINFER_CACHE_DIR: pathlib.Path = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+# NOTE(Windows): On Windows the full output paths for JIT-compiled CUDA objects
+# can easily exceed the 260-char MAX_PATH limit.
+# On Linux/macOS we keep the conventional layout: $HOME/.cache/flashinfer/...
+# On Windows we use a flat root at C:\_fij to stay well within MAX_PATH.
+FLASHINFER_CACHE_DIR: pathlib.Path
+if os.name == "nt":
+    FLASHINFER_CACHE_DIR = pathlib.Path(
+        os.getenv("FLASHINFER_CACHE_DIR", f"{os.getenv('SYSTEMDRIVE')}/_fij")
+    )
+else:
+    FLASHINFER_CACHE_DIR = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
 _package_root: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 
 _VERSION_MISMATCH_HINT = (
@@ -293,9 +304,14 @@ def _provider_target_compatibility_score(
     return max(scores) if scores else None
 
 
+def jit_library_name(module_name: str) -> str:
+    """File name of a module's shared library: module.dll on Windows (short paths), <name>.so elsewhere."""
+    return "module.dll" if platform.system() == "Windows" else f"{module_name}.so"
+
+
 def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
     """Resolve the best installed AOT artifact for each visible CUDA target."""
-    fallback_path = FLASHINFER_AOT_DIR / module_name / f"{module_name}.so"
+    fallback_path = FLASHINFER_AOT_DIR / module_name / jit_library_name(module_name)
     if fallback_path.exists():
         return (AOTArtifact("flashinfer-python", fallback_path, None),)
 
@@ -314,7 +330,9 @@ def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
             )
             if compatibility_score is None:
                 continue
-            provider_path = provider.jit_cache_dir / module_name / f"{module_name}.so"
+            provider_path = (
+                provider.jit_cache_dir / module_name / jit_library_name(module_name)
+            )
             if provider_path.exists():
                 artifact = AOTArtifact(
                     provider.provider_id,
@@ -330,7 +348,7 @@ def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
 
 def get_aot_path(module_name: str) -> pathlib.Path:
     """Return the primary path for an AOT module, or its stable fallback path."""
-    fallback_path = FLASHINFER_AOT_DIR / module_name / f"{module_name}.so"
+    fallback_path = FLASHINFER_AOT_DIR / module_name / jit_library_name(module_name)
     artifacts = get_aot_artifacts(module_name)
     return artifacts[0].path if artifacts else fallback_path
 

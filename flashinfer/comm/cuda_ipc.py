@@ -15,6 +15,8 @@ limitations under the License.
 """
 
 import ctypes
+import os
+import platform
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -78,6 +80,43 @@ def find_loaded_library(lib_name) -> Optional[str]:
     shared libraries loaded by the process. We can use this file to find the path of the
     a loaded library.
     """  # noqa
+    if platform.system() == "Windows":
+        import torch.version as torch_version
+
+        if os.environ.get("CUDA_HOME"):
+            cuda_path = os.environ.get("CUDA_HOME")
+        elif os.environ.get("CUDA_ROOT"):
+            cuda_path = os.environ.get("CUDA_ROOT")
+        elif os.environ.get("CUDA_PATH"):
+            cuda_path = os.environ.get("CUDA_PATH")
+        elif os.environ.get("CUDA_LIB_PATH"):
+            cuda_path = os.path.abspath(
+                os.path.join(os.environ.get("CUDA_LIB_PATH"), "..", "..")
+            )
+        else:
+            cuda_path = f"C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v{torch_version.cuda}"
+
+        if cuda_path and os.path.exists(cuda_path):
+            cudart_version = torch_version.cuda.split(".")[0]
+            if cudart_version < "12":
+                cudart_version += "0"
+            cuda_arch = (
+                "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+            )
+            arch_bin_path = os.path.join(cuda_path, "bin", cuda_arch)
+            dll_bin_path = (
+                arch_bin_path
+                if os.path.exists(arch_bin_path)
+                else os.path.join(cuda_path, "bin")
+            )
+            return os.path.join(dll_bin_path, f"cudart64_{cudart_version}.dll")
+        else:
+            raise ValueError(
+                "CUDA_LIB_PATH is not set. "
+                "CUDA_LIB_PATH need to be set with the absolute path "
+                "to CUDA root folder on Windows (for example, set "
+                "CUDA_LIB_PATH=C:\\CUDA\\v12.4)"
+            )
     found = False
     with open("/proc/self/maps") as f:
         for line in f:

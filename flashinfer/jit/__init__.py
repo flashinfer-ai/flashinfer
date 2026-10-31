@@ -17,6 +17,8 @@ limitations under the License.
 import ctypes
 import functools
 import os
+import platform
+import torch
 
 # Re-export
 from . import cubin_loader
@@ -204,9 +206,48 @@ from .fused_moe import (
     gen_alphamoe_nvfp4_sm100_module as gen_alphamoe_nvfp4_sm100_module,
 )
 
+if platform.system() == "Windows":
+    cuda_path = None
+    if os.environ.get("CUDA_HOME"):
+        cuda_path = os.environ.get("CUDA_HOME")
+    elif os.environ.get("CUDA_ROOT"):
+        cuda_path = os.environ.get("CUDA_ROOT")
+    elif os.environ.get("CUDA_PATH"):
+        cuda_path = os.environ.get("CUDA_PATH")
+    elif os.environ.get("CUDA_LIB_PATH"):
+        cuda_path = os.path.abspath(
+            os.path.join(os.environ.get("CUDA_LIB_PATH"), "..", "..")
+        )
+    else:
+        cuda_path = f"C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v{torch.version.cuda}"
 
-cuda_lib_path = os.environ.get(
-    "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
-)
-if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
-    ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)
+    if cuda_path and os.path.exists(cuda_path):
+        cudart_version = torch.version.cuda.split(".")[0]
+        if cudart_version < "12":
+            cudart_version += "0"
+        cuda_arch = (
+            "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+        )
+        arch_bin_path = os.path.join(cuda_path, "bin", cuda_arch)
+        dll_bin_path = (
+            arch_bin_path
+            if os.path.exists(arch_bin_path)
+            else os.path.join(cuda_path, "bin")
+        )
+        ctypes.CDLL(
+            os.path.join(dll_bin_path, f"cudart64_{cudart_version}.dll"),
+            mode=ctypes.RTLD_GLOBAL,
+        )
+    else:
+        raise ValueError(
+            "CUDA_LIB_PATH is not set. "
+            "CUDA_LIB_PATH need to be set with the absolute path "
+            "to CUDA root folder on Windows (for example, set "
+            "CUDA_LIB_PATH=C:\\CUDA\\v12.4)"
+        )
+else:
+    cuda_lib_path = os.environ.get(
+        "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
+    )
+    if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
+        ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)

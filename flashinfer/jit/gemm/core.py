@@ -266,10 +266,17 @@ def gen_gemm_sm120_module_cutlass_fp4() -> JitSpec:
         dtype_list = ["__nv_bfloat16", "half"]
         # SM120/121 tile configurations with implied 1x1x1 cluster shape
         cta_m_n_k_list = [
-            (128, 32, 128),
-            (128, 32, 256),
-            (128, 64, 128),
-            (128, 64, 256),
+            # NOTE: 128x32xK and 128x64xK tile sizes are only supported in the dense SM120
+            # blockscaled collective (sm120_blockscaled_mma_tma.hpp), NOT in the grouped/array
+            # variant (sm120_blockscaled_mma_array_tma.hpp). Including them here causes a
+            # compilation failure: the TMA scale factor SmemLayoutAtom collapses to a degenerate
+            # layout with size 0, hitting a static_assert in copy_traits_sm90_tma.hpp:739.
+            # See CUTLASS 4.5.0 changelog: "Add support for 128x32xK and 128x64xK tile sizes
+            # for SM120 blockscaled MMA collective builders" — this only covers dense GEMMs.
+            # (128, 32, 128),
+            # (128, 32, 256),
+            # (128, 64, 128),
+            # (128, 64, 256),
             (128, 128, 128),
             (128, 128, 256),
             (256, 128, 128),
@@ -470,8 +477,15 @@ def gen_gemm_sm120_module_cutlass_mxfp8() -> JitSpec:
         # SM120 tile configs matching CutlassTileConfigSM120 enum entries.
         # ClusterShape is always 1x1x1 for SM120 (no programmatic multicast).
         cta_m_n_k_list = [
-            (128, 32, 128),
-            (128, 64, 128),
+            # NOTE: 128x32xK and 128x64xK tile sizes are only supported in the dense SM120
+            # blockscaled collective (sm120_blockscaled_mma_tma.hpp), NOT in the grouped/array
+            # variant (sm120_blockscaled_mma_array_tma.hpp). Including them here causes a
+            # compilation failure: the TMA scale factor SmemLayoutAtom collapses to a degenerate
+            # layout with size 0, hitting a static_assert in copy_traits_sm90_tma.hpp:739.
+            # See CUTLASS 4.5.0 changelog: "Add support for 128x32xK and 128x64xK tile sizes
+            # for SM120 blockscaled MMA collective builders" — this only covers dense GEMMs.
+            # (128, 32, 128),
+            # (128, 64, 128),
             (128, 128, 128),
         ]
         for cta_m, cta_n, cta_k in cta_m_n_k_list:

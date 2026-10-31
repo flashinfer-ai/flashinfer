@@ -20,6 +20,7 @@ from typing import Any, List, Literal, Optional
 import jinja2
 import torch
 
+from ..cpp_ext import is_windows
 from .. import env as jit_env
 from ..core import (
     JitSpec,
@@ -41,6 +42,42 @@ from ..utils import (
 from .utils import _is_nvfp4_kv_dtype, generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
+
+_WINDOWS_URI_TOKENS = (
+    ("single_decode_with_kv_cache_dtype_q_", "sdkvcd_q_"),
+    ("batch_decode_with_kv_cache_dtype_q_", "bdkvcd_q_"),
+    ("batch_mla_attention_dtype_q_", "bmad_q_"),
+    ("single_prefill_with_kv_cache_dtype_q_", "spkvcd_q_"),
+    ("pod_with_kv_cache_dtype_q_", "pkvcd_q_"),
+    ("batch_prefill_with_attention_sink_kv_cache_dtype_q_", "bpaskvcd_q_"),
+    ("batch_prefill_with_kv_cache_dtype_q_", "bpkvcd_q_"),
+    ("batch_attention_with_kv_cache_dtype_q_", "bakvcd_q_"),
+    ("dtype_kv_", "kv_"),
+    ("dtype_o_", "o_"),
+    ("dtype_idx_", "idx_"),
+    ("head_dim_qk_", "qk_"),
+    ("head_dim_vo_", "vo_"),
+    ("head_dim_ckv_", "ckv_"),
+    ("head_dim_kpe_", "kpe_"),
+    ("head_dim_", "hd_"),
+    ("posenc_", "pe_"),
+    ("use_swa_", "swa_"),
+    ("use_logits_soft_cap_", "lc_"),
+    ("use_logits_cap_", "lc_"),
+    ("use_profiler_", "pr_"),
+    ("profiler_", "pr_"),
+)
+
+
+def _uri(name: str) -> str:
+    # Windows limits a path to 260 characters and the JIT cache repeats the module
+    # name inside its directory, so the long attention URIs are shortened there.
+    # Linux keeps the original names, so existing caches and tests are unchanged.
+    if not is_windows:
+        return name
+    for long, short in _WINDOWS_URI_TOKENS:
+        name = name.replace(long, short)
+    return name
 
 
 class _BatchMLAModuleProxy:
@@ -195,7 +232,7 @@ def get_single_decode_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
 ) -> str:
-    return (
+    return _uri(
         f"single_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -218,7 +255,7 @@ def get_batch_decode_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
 ) -> str:
-    return (
+    return _uri(
         f"batch_decode_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -241,7 +278,7 @@ def get_batch_mla_uri(
     head_dim_kpe: int,
     use_profiler: bool,
 ) -> str:
-    return (
+    return _uri(
         f"batch_mla_attention_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -362,7 +399,7 @@ def get_single_prefill_uri(
     use_fp16_qk_reduction: bool,
     use_token_head_sf: bool = False,
 ) -> str:
-    return (
+    return _uri(
         f"single_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -391,7 +428,7 @@ def get_pod_uri(
     use_sliding_window_d: bool,
     use_logits_soft_cap_d: bool,
 ) -> str:
-    return (
+    return _uri(
         f"pod_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -421,7 +458,7 @@ def get_batch_prefill_uri(
     use_fp16_qk_reduction: bool,
     use_token_head_sf: bool = False,
 ) -> str:
-    return (
+    return _uri(
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -448,7 +485,7 @@ def get_batch_prefill_attention_sink_uri(
     pos_encoding_mode: int,
     use_sliding_window: bool,
 ) -> str:
-    return (
+    return _uri(
         f"batch_prefill_with_attention_sink_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -470,7 +507,7 @@ def get_batch_attention_uri(
     use_logits_soft_cap: bool,
     use_profiler: bool,
 ) -> str:
-    return (
+    return _uri(
         f"batch_attention_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -706,7 +743,7 @@ def gen_batch_pod_module(
     use_sliding_window_d: bool,
     use_logits_soft_cap_d: bool,
 ) -> JitSpec:
-    uri = "batch_" + get_pod_uri(
+    uri = ("b" if is_windows else "batch_") + get_pod_uri(
         dtype_q,
         dtype_kv,
         dtype_o,
@@ -899,6 +936,7 @@ def gen_customize_batch_pod_module(
         kernel_inst_templ = jinja2.Template(f.read())
 
     kwargs = {
+        "instantiate_all_cta_tiles": is_windows,
         "additional_func_params": additional_func_params,
         "additional_params_decl": additional_params_decl,
         "additional_params_setter": additional_params_setter,
@@ -2108,6 +2146,7 @@ def gen_customize_batch_prefill_module(
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
         "use_token_head_sf": str(use_token_head_sf).lower(),
         "paged_kv_stride_mode": paged_kv_stride_mode,
+        "instantiate_all_cta_tiles": is_windows,
         "same_kv_strides_values": {
             "runtime": ["true", "false"],
             "equal": ["true"],
