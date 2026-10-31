@@ -1203,9 +1203,21 @@ def _profile_kernel_names(fn):
     return [e.name for e in prof.events() if str(e.device_type).endswith("CUDA")]
 
 
+# The router's BF16x3 split stage is the deterministic package's program by design (both modes run it); every
+# other program of that package is a K1 / K2 GEMM.
+_DET_SHARED_KERNELS = frozenset(
+    module["kernel"]
+    for module in det_jit.MODULES.values()
+    if module["template"].startswith("split_fp32_det_bf16x3")
+)
+
+
 def _det_kernel(name: str) -> bool:
-    """A kernel of the deterministic package: its programs' symbols and its template bodies' namespace."""
-    return "dense_projection_det_gemm" in name
+    """A K1 / K2 GEMM kernel of the deterministic package (its programs' symbols and its template bodies'
+    namespace); the shared BF16x3 split stage is not one."""
+    return "dense_projection_det_gemm" in name and not any(
+        kernel in name for kernel in _DET_SHARED_KERNELS
+    )
 
 
 def _assert_ran(fn, module_name: str) -> None:
