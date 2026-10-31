@@ -63,7 +63,23 @@ using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 template <bool FLAG, class ReturnType, class... Args>
 std::decay_t<ReturnType> construct_if_true(Args&&... args) {
   if constexpr (FLAG) {
-    return ReturnType{std::forward<Args>(args)...};
+    // 1. Try standard aggregate initialization first
+    if constexpr (std::is_constructible_v<ReturnType, Args...>) {
+      return ReturnType{std::forward<Args>(args)...};
+    }
+    // 2. Workaround for OSS CUTLASS 3 LinearCombination Arguments
+    // Explicitly route the expert_scales pointer array to the 5th field (alpha_ptr_array)
+    else if constexpr (sizeof...(Args) == 1) {
+      return ReturnType{/* alpha */ 1.0f,
+                        /* beta */ 0.0f,
+                        /* alpha_ptr */ nullptr,
+                        /* beta_ptr */ nullptr,
+                        /* alpha_ptr_array */ (std::forward<Args>(args), ...)};
+    }
+    // 3. Fallback (preserves original compiler behavior if arguments don't match)
+    else {
+      return ReturnType{std::forward<Args>(args)...};
+    }
   } else {
     return ReturnType{};
   }

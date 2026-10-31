@@ -72,6 +72,20 @@ namespace tensorrt_llm::kernels::cutlass_kernels_oss {
 using tensorrt_llm::kernels::cutlass_kernels::Fp4Type;
 #endif
 
+// MSVC workaround: Helper to force dependent type resolution.
+// MSVC has a known bug where it fails to resolve nested dependent types
+// from template aliases (C3083/C2039). By wrapping the access in a
+// dedicated struct template, MSVC is forced to fully instantiate the
+// base type before accessing its members.
+template <typename DefaultGemmGroupedType>
+struct MoeGemmKernelTraits {
+  using GemmKernel = typename DefaultGemmGroupedType::GemmKernel;
+  using Mma = typename GemmKernel::Mma;
+  using Epilogue = typename GemmKernel::Epilogue;
+  using ThreadblockSwizzle = typename GemmKernel::ThreadblockSwizzle;
+  static constexpr auto kGroupScheduleMode = GemmKernel::kGroupScheduleMode;
+};
+
 // ============================= Variable batched Gemm things ===========================
 template <typename T, typename WeightType, typename GemmOutputType, typename arch,
           cutlass::WeightOnlyQuantOp QuantOp, typename EpilogueTag, typename ThreadblockShape,
@@ -150,7 +164,9 @@ struct genericMoeGemmKernelLauncher {
 #endif
 
       // Finally, set up the kernel.
-      using GemmKernel_ = typename cutlass::gemm::kernel::DefaultGemmGrouped<
+      // MSVC workaround: use MoeGemmKernelTraits helper to force MSVC to fully
+      // resolve the dependent type chain before accessing nested members.
+      using DefaultGemmGroupedType_ = cutlass::gemm::kernel::DefaultGemmGrouped<
           ElementType, cutlass::layout::RowMajor, cutlass::ComplexTransform::kNone,
           MixedGemmArchTraits::ElementsPerAccessA, CutlassWeightType,
           typename MixedGemmArchTraits::LayoutB, cutlass::ComplexTransform::kNone,
@@ -158,14 +174,15 @@ struct genericMoeGemmKernelLauncher {
           ElementAccumulator, typename MixedGemmArchTraits::OperatorClass, arch, ThreadblockShape,
           WarpShape, typename MixedGemmArchTraits::InstructionShape, EpilogueOp,
           cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle, Stages,
-          cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly, TaggedOperator>::GemmKernel;
+          cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly, TaggedOperator>;
+
+      using Traits_ = MoeGemmKernelTraits<DefaultGemmGroupedType_>;
 
       using GemmKernel =
-          cutlass::gemm::kernel::MoeFCGemm<typename GemmKernel_::Mma,
-                                           typename GemmKernel_::Epilogue,
-                                           typename GemmKernel_::ThreadblockSwizzle,
+          cutlass::gemm::kernel::MoeFCGemm<typename Traits_::Mma, typename Traits_::Epilogue,
+                                           typename Traits_::ThreadblockSwizzle,
                                            arch,  // Ensure top level arch is used for dispatch
-                                           GemmKernel_::kGroupScheduleMode>;
+                                           Traits_::kGroupScheduleMode>;
 
       using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
 
