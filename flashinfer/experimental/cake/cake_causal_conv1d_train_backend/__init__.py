@@ -637,7 +637,8 @@ def _accumulator_views(
     work_dtype = _TORCH_DTYPES[layout["work_dtype"]]
     acc = _storage_view(ws, 0, layout["acc_elems"], acc_dtype)
     work = _storage_view(ws, layout["work_offset"], layout["work_words"], work_dtype)
-    if acc is None or work is None:  # a storage offset off the element grid: plain views, not cached
+    if acc is None or work is None:
+        # a storage offset off the element grid: plain views, not cached
         work_offset = int(layout["work_offset"])
         acc = ws[: int(layout["acc_bytes"])].view(acc_dtype)
         work = ws[work_offset : work_offset + 4 * int(layout["work_words"])].view(
