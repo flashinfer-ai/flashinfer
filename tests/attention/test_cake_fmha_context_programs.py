@@ -1388,10 +1388,15 @@ def test_cake_fmha_context_fp8_one_wave_routes(monkeypatch) -> None:
     pack and m-blocks), for host and device scales; any other launch keeps
     the route it takes without the one-wave table.  2 requests of 400 query
     tokens over 1500 keys, heads 32/4 (104 tiles), take it; 4 requests (208
-    tiles) keep RUNTIME_PACK8.  sm103a names no such launch."""
+    tiles) keep RUNTIME_PACK8.  A launch the split choice gives two splits,
+    whose RUNTIME_PACK8 tiles number 40 .. 148, over at most 1664 keys and
+    more than 128 query tokens, keeps its whole tiles on RUNTIME_PACK8_OW: 2
+    requests of 200 query tokens over 1500 keys (56 tiles) take it; over 4096
+    keys they split.  sm103a names no such launch."""
 
     routes = cake_api._CONTEXT_FP8_ONE_WAVE_ROUTES
     assert routes == {"sm100a": {"RUNTIME_PACK8": "RUNTIME_PACK8_OW"}}
+    assert cake_api._CONTEXT_FP8_ONE_WAVE_SPLIT_BOUNDS == {"sm100a": (40, 1664, 128)}
     assert (
         cake_api._CONTEXT_PROGRAMS[("context_fp8", "RUNTIME_PACK8_OW")][1:]
         == cake_api._CONTEXT_PROGRAMS[("context_fp8", "RUNTIME_PACK8")][1:]
@@ -1401,15 +1406,20 @@ def test_cake_fmha_context_fp8_one_wave_routes(monkeypatch) -> None:
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
     monkeypatch.setattr(cake_api, "_context_split_sm_count", lambda device: 148)
     meta = torch.device("meta")
-    moved = set()
+    # a workspace that holds every split plan's partials
+    workspace = torch.empty(1 << 28, dtype=torch.uint8, device="meta")
+    moved, unsplit = set(), set()
     for batch in (1, 2, 4, 8):
         for q_len in (16, 200, 400, 1024):
             for kv in (128, 1500, 4096):
                 for page in (16, 64):
                     row = ("context_fp8", batch, q_len, kv, 32, 4, page, True, None)
                     for device_scales in (False, True):
-                        kwargs = _context_kwargs(
-                            row, device_scales=device_scales, device="meta"
+                        kwargs = dict(
+                            _context_kwargs(
+                                row, device_scales=device_scales, device="meta"
+                            ),
+                            workspace_buffer=workspace,
                         )
                         with monkeypatch.context() as patch:
                             patch.setattr(cake_api, "_CONTEXT_FP8_ONE_WAVE_ROUTES", {})
@@ -1418,7 +1428,32 @@ def test_cake_fmha_context_fp8_one_wave_routes(monkeypatch) -> None:
                             )
                         route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
                         tiles = batch * (32 // kept.pack_g) * kept.num_m_blocks
-                        if kept.program == "RUNTIME_PACK8" and tiles <= 148:
+                        choice = cake_api._context_fp8_split_choice(
+                            "sm100a", batch, q_len, kv, 32, 8, 148
+                        )
+                        whole_tiles = batch * 4 * -(-q_len // 32)
+                        if (
+                            page != 64
+                            and (kept.program or "").startswith("RUNTIME_SK")
+                            and choice is not None
+                            and choice[1][2] == 2
+                            and 40 <= whole_tiles <= 148
+                            and kv <= 1664
+                            and q_len > 128
+                        ):
+                            with monkeypatch.context() as patch:
+                                patch.setattr(
+                                    cake_api,
+                                    "_context_fp8_split_choice",
+                                    lambda *args: None,
+                                )
+                                whole = cake_api.select_cake_fmha_context_route(
+                                    meta, **kwargs
+                                )
+                            assert whole.program == "RUNTIME_PACK8_OW", whole
+                            assert route == whole, (row, route, whole)
+                            unsplit.add((batch, q_len, kv, page))
+                        elif kept.program == "RUNTIME_PACK8" and tiles <= 148:
                             assert route == dataclasses.replace(
                                 kept, program="RUNTIME_PACK8_OW"
                             )
@@ -1426,6 +1461,7 @@ def test_cake_fmha_context_fp8_one_wave_routes(monkeypatch) -> None:
                         else:
                             assert route == kept, (row, route, kept)
     assert (2, 400, 1500, 16) in moved and (4, 400, 1500, 16) not in moved, moved
+    assert (2, 200, 1500, 16) in unsplit and (2, 200, 4096, 16) not in unsplit, unsplit
 
 
 def test_cake_fmha_context_fp8_tile_blocks_of_one_stage_programs() -> None:

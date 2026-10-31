@@ -765,6 +765,19 @@ _CONTEXT_FP8_MULTI_WAVE_ROUTES: dict[str, dict[str, tuple[str, int, int]]] = {
 _CONTEXT_FP8_ONE_WAVE_ROUTES: dict[str, dict[str, str]] = {
     "sm100a": {"RUNTIME_PACK8": "RUNTIME_PACK8_OW"},
 }
+# Per target, (fewest tiles, most keys, fewest query tokens) of the launches
+# whose two-way split the one-wave program outruns: a launch whose runtime
+# program has a one-wave entry, whose tiles at that program's pack number at
+# least the first and at most the SMs, over at most the keys and more than the
+# query tokens, keeps its whole tiles where the split choice names a plan of
+# two splits.  The cost model prices those splits below the whole tiles; timed
+# B200 (1 .. 4 requests of 160 .. 200 query tokens over 1500 .. 1537 keys,
+# heads 32/4, 64/8 and 16/2, 40 .. 56 tiles): the one-wave program ran
+# 1.7 .. 3.8 % faster than the two-way split; over 1700 keys and more the split
+# ran faster, and the three-way splits as fast or faster.
+_CONTEXT_FP8_ONE_WAVE_SPLIT_BOUNDS: dict[str, tuple[int, int, int]] = {
+    "sm100a": (40, 1664, 128),
+}
 _CONTEXT_FP8_ONE_STAGE_PROGRAMS = frozenset(
     name
     for routes in _CONTEXT_FP8_ONE_STAGE_ROUTES.values()
@@ -5540,6 +5553,17 @@ def select_cake_fmha_context_route(
             choice = _context_fp8_split_choice(
                 target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count
             )
+            bounds = _CONTEXT_FP8_ONE_WAVE_SPLIT_BOUNDS.get(target)
+            if (
+                choice is not None
+                and bounds is not None
+                and choice[1][2] == 2
+                and program in _CONTEXT_FP8_ONE_WAVE_ROUTES.get(target, {})
+                and bounds[0] <= total_bh * num_m_blocks <= sm_count
+                and max_kv_len <= bounds[1]
+                and max_q_len > bounds[2]
+            ):
+                choice = None
             candidates = [] if choice is None else [choice]
             if choice is not None and choice[0] != pack:
                 own = _context_fp8_split_plan(
