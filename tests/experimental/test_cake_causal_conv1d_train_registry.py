@@ -29,8 +29,10 @@ from __future__ import annotations
 import ast
 import filecmp
 import hashlib
+import importlib.util
 import inspect
 import re
+import sys
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
@@ -532,3 +534,40 @@ def test_build_manifest_lists_every_program() -> None:
                     ), source
                 referenced.add(library)
     assert referenced == set(libraries)
+
+
+def _manifest_checker():
+    """``scripts/check_cake_build_manifests.py`` of this checkout, loaded as a module (it never imports flashinfer)."""
+
+    path = REPO / "scripts" / "check_cake_build_manifests.py"
+    if not path.is_file():
+        pytest.skip(
+            "scripts/check_cake_build_manifests.py is not beside this test (installed package)"
+        )
+    spec = importlib.util.spec_from_file_location("check_cake_build_manifests", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules.setdefault("check_cake_build_manifests", module)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.cpu_only
+def test_manifest_checker_lists_the_package() -> None:
+    """The build-manifest checker lists this package (its ``cake_jit.py`` and the KCP registry ``kcp_jit.py``) and
+    its vendored gate finds the package's suite key; once rendered, the in-tree checks report nothing."""
+
+    checker = _manifest_checker()
+    try:
+        path = str(PACKAGE_DIR.relative_to(REPO))
+    except ValueError:
+        pytest.skip(f"the package is imported from {PACKAGE_DIR}, outside this checkout")
+    entries = [p for p in checker.PACKAGES if p.name == pkg.__name__]
+    assert len(entries) == 1, entries
+    (entry,) = entries
+    assert (entry.path, entry.loader) == (path, "cake_jit.py")
+    assert entry.refs is checker.refs_with_kcp
+    assert checker.suite_key(REPO, entry) == KEY
+    if not cake_jit.is_rendered():
+        pytest.skip("build.json is not rendered yet (TODO-EXPORT)")
+    assert checker.run_in_tree(REPO, [entry]) == []
