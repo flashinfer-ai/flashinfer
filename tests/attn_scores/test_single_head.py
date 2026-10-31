@@ -1,24 +1,46 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""single_head_paged_mqa_logits against an exact reference over random paged BF16
-keys."""
+"""The single-head paged MQA kernels and quantize_write_index_k_nvfp4 against
+exact references over random paged BF16 or NVFP4 keys."""
+
+from functools import partial
 
 import pytest
 import torch
 
-from flashinfer.attn_scores import single_head_paged_mqa_logits
-
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="single_head_paged_mqa_logits requires SM10x",
+from flashinfer import nvfp4_kv_dequantize
+from flashinfer.attn_scores import single_head
+from flashinfer.attn_scores import (
+    gather_key_sample,
+    quantize_write_index_k_nvfp4,
+    single_head_paged_mqa_logits,
+    single_head_paged_mqa_threshold_select,
+    thresholds_from_sample,
 )
 
+SM10X = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+sm10x_only = pytest.mark.skipif(not SM10X, reason="requires SM10x")
 
-def bf16(rows: int) -> torch.Tensor:
-    """Random BF16 rows of small integers times {1/8, ..., 2}: exact FP32 dots."""
-    scales = 2.0 ** torch.randint(-3, 2, (rows, 128), device="cuda")
-    return (torch.randint(-8, 9, (rows, 128), device="cuda") * scales).bfloat16()
+
+def rows_of(nvfp4: bool, rows: int) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Random BF16 rows of small integers, or NVFP4 ones, times scales in
+    {1/8, ..., 2}: dot products are exact in FP32 either way."""
+    if not nvfp4:
+        scales = 2.0 ** torch.randint(-3, 2, (rows, 128), device="cuda")
+        values = torch.randint(-8, 9, (rows, 128), device="cuda") * scales
+        return values.bfloat16(), None
+    scales = 2.0 ** torch.randint(-3, 2, (rows, 8), device="cuda")
+    values = torch.randint(256, (rows, 64), device="cuda").byte()
+    return values, scales.to(torch.float8_e4m3fn)
+
+
+def dequantize(values: torch.Tensor, scales: torch.Tensor | None) -> torch.Tensor:
+    if scales is None:
+        return values.double()
+    one = torch.ones(1, device="cuda")
+    return nvfp4_kv_dequantize(values, scales.view(torch.uint8), one).double()
 
 
 @pytest.mark.parametrize(
@@ -29,19 +51,39 @@ def bf16(rows: int) -> torch.Tensor:
     ],
 )
 @pytest.mark.parametrize("rows", [1, 3, 8])
+@pytest.mark.parametrize("keys", ["bf16", "bf16_triton", "nvfp4", "nvfp4_packed"])
 @torch.inference_mode()
-def test_single_head_paged_mqa_logits_match_reference_and_replay(lengths, rows) -> None:
+def test_single_head_paged_mqa_logits_match_reference_and_replay(
+    lengths, rows, keys, monkeypatch
+) -> None:
     """Keys on shuffled pages; table entries past a length would fault if read,
-    and scores past it stay unwritten. A replay sees new lengths and tables."""
+    and scores past it stay unwritten. A replay sees new lengths and tables.
+    nvfp4_packed: keys and scales are views of one cache, each page's 64 keys
+    then their scales."""
+    if keys.startswith("nvfp4") and not SM10X:
+        pytest.skip("Off SM10x, keys are BF16 (scored by Triton)")
+    if keys == "bf16_triton":  # the path off SM10x, also on SM10x
+        monkeypatch.setattr(single_head, "get_compute_capability", lambda _: (9, 0))
+        keys = "bf16"
     torch.manual_seed(rows)
+    nvfp4 = keys != "bf16"
     batch, capacity = len(lengths), max(lengths) + 300
     width = -(-capacity // 64)
     pages = batch * width
-    key_cache = bf16(64 * pages).view(pages, 64, 128)
+    values, scales = rows_of(nvfp4, 64 * pages)
+    key_cache, key_scales = values.view(pages, 64, -1), None
+    if nvfp4:
+        key_scales = scales.view(pages, 64, 8)
+    if keys == "nvfp4_packed":
+        parts = (key_cache.flatten(1), key_scales.view(torch.uint8).flatten(1))
+        cache = torch.cat(parts, 1)
+        key_cache = cache[:, : 64 * 64].unflatten(1, (64, 64))
+        key_scales = cache[:, 64 * 64 :].view(torch.float8_e4m3fn)
+        key_scales = key_scales.unflatten(1, (64, 8))
     table = torch.empty(batch, width, dtype=torch.int32, device="cuda")
     context = torch.empty(batch, dtype=torch.int32, device="cuda")
     requests = torch.arange(batch, dtype=torch.int32, device="cuda").flip(0)
-    query = torch.empty(batch * rows, 128, dtype=torch.bfloat16, device="cuda")
+    query, query_scales = rows_of(nvfp4, batch * rows)
     scores = torch.empty(batch * rows, capacity, device="cuda")
 
     def prepare(lengths: list[int]) -> None:
@@ -50,23 +92,36 @@ def test_single_head_paged_mqa_logits_match_reference_and_replay(lengths, rows) 
         shuffled = torch.randperm(pages, device="cuda")[: table.numel()].int()
         past = torch.arange(width, device="cuda") >= ends
         table[requests.long()] = shuffled.view_as(table).masked_fill(past, 2**31 - 1)
-        query.copy_(bf16(batch * rows))
         scores.fill_(-7)
 
     def check(lengths: list[int]) -> None:
         for group, length in enumerate(lengths):
             mine = slice(group * rows, group * rows + rows)
-            request = int(requests[group])
-            keys = key_cache[table[request, : -(-length // 64)].long()].flatten(0, 1)
-            expected = query[mine].double() @ keys[:length].double().T
+            assert bool((scores[mine, length:] == -7).all())
+            if not length:
+                continue
+            page = table[int(requests[group]), : -(-length // 64)].long()
+            key = key_cache[page].flatten(0, 1)[:length]
+            key_scale = query_scale = None
+            if nvfp4:
+                key_scale = key_scales[page].flatten(0, 1)[:length]
+                query_scale = query_scales[mine]
+            expected = dequantize(query[mine], query_scale)
+            expected = expected @ dequantize(key, key_scale).T
             torch.testing.assert_close(
                 scores[mine, :length], expected.float(), rtol=0, atol=0
             )
-            assert bool((scores[mine, length:] == -7).all())
 
     def run() -> None:
         single_head_paged_mqa_logits(
-            query, key_cache, table, context, requests=requests, scores=scores
+            query,
+            key_cache,
+            table,
+            context,
+            requests=requests,
+            scores=scores,
+            query_scales=query_scales,
+            key_scales=key_scales,
         )
 
     prepare(list(lengths))
@@ -81,6 +136,280 @@ def test_single_head_paged_mqa_logits_match_reference_and_replay(lengths, rows) 
     check(replayed)
 
 
+@sm10x_only
+@pytest.mark.parametrize(
+    ("query_lens", "context_lens"),
+    [
+        ((1, 3, 7, 2), (1, 63, 127, 64)),  # keys end on a page, mid key tile
+        ((129, 3, 1), (4097, 2051, 2049)),
+        # 8 query tiles: runs of several tiles per CTA, some cut short, some empty.
+        ((3, 128, 641), (16384, 16000, 12289)),
+    ],
+)
+@pytest.mark.parametrize("keys", ["bf16", "nvfp4"])
+@pytest.mark.parametrize("repair", [False, True])
+@pytest.mark.parametrize("top_k", [64, 512, 2048])
+@torch.inference_mode()
+def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
+    query_lens, context_lens, top_k, keys, repair
+) -> None:
+    """Causal 128-row tiles, odd ones reversed; rows 2 mod 8 score 0 (ties past
+    the tie slots), rows 5 mod 8 NaN. Counts are exact, and each written slot
+    holds a distinct key of its class with its score (less the threshold). The
+    repair reselects each row that misses at or below its Top-K cutoff."""
+    torch.manual_seed(0)
+    nvfp4, width = keys == "nvfp4", max(context_lens)
+    capacity, blocks = max(width // 2, top_k - 1), -(-width // 64)
+    tiles = [(r, s) for r, n in enumerate(query_lens) for s in range(0, n, 128)]
+    ends = torch.zeros(len(tiles), 128, dtype=torch.int32)
+    for tile, (request, start) in enumerate(tiles):
+        count = min(query_lens[request] - start, 128)
+        first = context_lens[request] - query_lens[request] + start + 1
+        ends[tile, :count] = torch.arange(first, first + count)
+    ends[1::2] = ends[1::2].flip(1)
+    ends, rows = ends.flatten().cuda(), 128 * len(tiles)
+    requests = torch.tensor([r for r, _ in tiles], dtype=torch.int32, device="cuda")
+    pages = len(query_lens) * blocks
+    values, scales = rows_of(nvfp4, 64 * pages)
+    key_cache = values.view(pages, 64, -1)
+    key_scales = scales.view(pages, 64, 8) if nvfp4 else None
+    table = torch.randperm(pages, device="cuda").int().view(-1, blocks)
+    query, query_scales = rows_of(nvfp4, rows)
+    query[2::8] = 0
+    if nvfp4:
+        query_scales.view(torch.uint8)[5::8] = 0x7F  # E4M3 NaN
+    else:
+        query[5::8] = torch.nan
+    thresholds, requested = torch.empty(2, rows, device="cuda")
+    arrivals = torch.zeros(len(tiles), dtype=torch.int32, device="cuda")
+    ranges = torch.empty(2, rows, dtype=torch.int32, device="cuda")
+    repairs = dict(arrivals=arrivals, ranges=ranges) if repair else {}
+    counters = torch.empty(rows, 2, dtype=torch.int32, device="cuda")
+    candidates = torch.empty(rows, top_k + capacity, 2, dtype=torch.int32).cuda()
+
+    def run() -> None:
+        thresholds.copy_(requested)
+        counters.zero_()
+        candidates.fill_(-1)
+        single_head_paged_mqa_threshold_select(
+            *(query, key_cache, ends, requests, table),
+            thresholds=thresholds,
+            counters=counters,
+            candidates=candidates,
+            max_context=width,
+            top_k=top_k,
+            query_scales=query_scales,
+            key_scales=key_scales,
+            **repairs,
+        )
+
+    def reference() -> tuple[torch.Tensor, torch.Tensor]:
+        keys = dequantize(key_cache.flatten(0, 1), None if scales is None else scales)
+        queries = dequantize(query, query_scales)
+        scores = torch.zeros(rows, width, device="cuda")
+        for tile, (request, _) in enumerate(tiles):
+            mine = slice(128 * tile, 128 * tile + 128)
+            slot = table[request].long()[:, None] * 64 + torch.arange(64).cuda()
+            scores[mine] = (queries[mine] @ keys[slot.flatten()[:width]].T).float()
+        return scores, torch.arange(width, device="cuda") < ends[:, None]
+
+    def check(scores: torch.Tensor, valid: torch.Tensor) -> None:
+        if repair:  # rows that fit keep the threshold, the others go at or below
+            need = valid.sum(1).clamp(max=top_k)
+            above = (valid & (scores > requested[:, None])).sum(1)
+            tied = (valid & ~(scores > requested[:, None])).sum(1)
+            tied -= (valid & (scores < requested[:, None])).sum(1)
+            fits = (above <= capacity) & (above + tied.clamp(max=top_k) >= need)
+            ranked = scores.masked_fill(~valid, -torch.inf).sort(1, descending=True)
+            cutoff = ranked[0].gather(1, (need - 1).clamp(min=0)[:, None])[:, 0]
+            assert torch.equal(thresholds[fits], requested[fits])
+            assert bool((thresholds[~fits] <= cutoff[~fits]).all())
+        above = valid & (scores > thresholds[:, None])
+        tied = valid & ~(scores > thresholds[:, None]) & ~(scores < thresholds[:, None])
+        assert torch.equal(counters, torch.stack((above.sum(1), tied.sum(1)), 1).int())
+        fit, tie = above.sum(1).clamp(max=capacity), tied.sum(1).clamp(max=top_k)
+        if repair:  # every row fits, its slots in its range
+            need = valid.sum(1).clamp(max=top_k)
+            assert bool(((fit + tie >= need) & (above.sum(1) <= capacity)).all())
+            assert torch.equal(ranges, torch.stack((top_k - tie, top_k + fit)).int())
+        for row in range(rows):
+            fitted, tied_count = int(fit[row]), int(tie[row])
+            written = candidates[row, top_k - tied_count : top_k + fitted]
+            if not repair:  # a repaired row's first sweep leaves stale slots
+                assert bool((candidates[row, : top_k - tied_count] == -1).all())
+                assert bool((candidates[row, top_k + fitted :] == -1).all())
+            keys, bits = written.long().unbind(1)
+            assert bool((keys >= 0).all()) and keys.unique().numel() == keys.numel()
+            assert bool(tied[row, keys[:tied_count]].all())
+            assert bool(above[row, keys[tied_count:]].all())
+            score, threshold = scores[row, keys], thresholds[row]
+            stored = bits.int().view(torch.float32)
+            exact = torch.where(score <= 2 * threshold, score - threshold, score)
+            torch.testing.assert_close(stored, exact, rtol=0, atol=0, equal_nan=True)
+
+    scores, valid = reference()
+    median = scores.nan_to_num(0).masked_fill(~valid, 0).median(1).values
+    for threshold in (median, scores[:, 0].nan_to_num(0), -torch.inf, torch.inf):
+        requested[:] = threshold
+        run()  # the first run compiles
+        check(scores, valid)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    ends.copy_((ends - 9).clamp(min=0))
+    scores, valid = reference()
+    requested.copy_(scores.nan_to_num(0).masked_fill(~valid, 0).median(1).values)
+    graph.replay()
+    check(scores, valid)
+
+
+@sm10x_only
+@pytest.mark.parametrize("far", [False, True])
+@pytest.mark.parametrize("keys", ["bf16", "nvfp4"])
+@torch.inference_mode()
+def test_gather_key_sample_matches_reference(keys, far) -> None:
+    """Slots below a request's sample end get the key, and its scales, at their
+    offset into their run of pages; the rest stay untouched. `far`: the pages
+    sit past the first 2**31 bytes of the key cache."""
+    torch.manual_seed(0)
+    nvfp4, samples, run_keys, lengths = keys == "nvfp4", 3, 128, [1, 200, 4097, 8193]
+    blocks = -(-max(lengths) // 64)
+    pages = len(lengths) * blocks
+    values, scales = rows_of(nvfp4, 64 * pages)
+    key_cache, key_scales = values.view(pages, 64, -1), None
+    table = torch.randperm(pages, device="cuda").int().view(-1, blocks)
+    if nvfp4:
+        key_scales = scales.view(pages, 64, 8)
+    if far:
+        skip = 2**31 // (key_cache[0].numel() * key_cache.element_size())
+        key_cache = torch.cat(
+            (key_cache.new_zeros(skip, 64, key_cache.shape[2]), key_cache)
+        )
+        if nvfp4:
+            key_scales = torch.cat((key_scales.new_zeros(skip, 64, 8), key_scales))
+        table += skip
+    capacity = 128 * -(-max(lengths) * samples // (128 * run_keys))
+    offsets = torch.randint(run_keys, (capacity,), dtype=torch.uint8, device="cuda")
+    ends = [length // run_keys * samples for length in lengths]
+    shape = (len(ends), capacity)
+    sample_keys = torch.full((*shape, key_cache.shape[2]), 85, device="cuda")
+    sample_keys = sample_keys.to(key_cache.dtype)
+    sample_scales = None
+    if nvfp4:
+        sample_scales = torch.full((*shape, 8), 85, dtype=torch.uint8, device="cuda")
+        sample_scales = sample_scales.view(torch.float8_e4m3fn)
+    expected = [t if t is None else t.clone() for t in (sample_keys, sample_scales)]
+    for request, end in enumerate(ends):
+        key = torch.arange(end, device="cuda") // samples * run_keys
+        key += offsets[:end].long()
+        page = table[request, key // 64].long()
+        expected[0][request, :end] = key_cache[page, key % 64]
+        if nvfp4:
+            expected[1][request, :end] = key_scales[page, key % 64]
+    gather_key_sample(
+        *(key_cache, table, offsets, torch.tensor(ends, device="cuda").int()),
+        sample_keys=sample_keys,
+        samples_per_run=samples,
+        pages_per_run=run_keys // 64,
+        key_scales=key_scales,
+        sample_scales=sample_scales,
+    )
+    assert torch.equal(sample_keys.view(torch.uint8), expected[0].view(torch.uint8))
+    if nvfp4:
+        got = sample_scales.view(torch.uint8)
+        assert torch.equal(got, expected[1].view(torch.uint8))
+
+
+@sm10x_only
+@torch.inference_mode()
+def test_thresholds_from_sample_matches_reference() -> None:
+    """A row's threshold is the least of its sampled scores at its Top
+    positions, a -1 position or a NaN score reading as -inf; its counters are
+    zeroed."""
+    torch.manual_seed(0)
+    rows, samples, rank = 77, 300, 40
+    scores = torch.randn(rows, samples, device="cuda")
+    scores[3, 5] = torch.nan
+    top = torch.rand(rows, samples, device="cuda").argsort(1)[:, :rank].int()
+    top[3, 0] = 5  # a NaN score
+    top[7, -4:] = -1  # a row with fewer samples
+    thresholds = torch.empty(rows, device="cuda")
+    counters = torch.full((rows, 2), 7, dtype=torch.int32, device="cuda")
+    thresholds_from_sample(scores, top, thresholds=thresholds, counters=counters)
+    picked = scores.gather(1, top.clamp(min=0).long()).masked_fill(top < 0, -torch.inf)
+    expected = torch.where(picked.isnan(), -torch.inf, picked).amin(1)
+    assert torch.equal(thresholds, expected)
+    assert bool((counters == 0).all())
+
+
+def e2m1(x: torch.Tensor) -> torch.Tensor:
+    """x rounded to E2M1, to nearest with ties to an even code, saturating."""
+    grid = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=x.device).double()
+    distance = (x.double().abs().clamp(max=6)[..., None] - grid).abs()
+    distance += torch.arange(8, device=x.device) % 2 * 1e-12  # ties: even codes
+    return (grid[distance.argmin(-1)] * x.sign()).float()
+
+
+@sm10x_only
+@pytest.mark.parametrize("tokens", [1, 9, 300])
+@torch.inference_mode()
+def test_quantize_write_index_k_nvfp4_matches_reference(tokens: int) -> None:
+    """Each written key's blocks of 16 are scaled by an E4M3 amax / 6 and
+    rounded to E2M1; slots are shuffled, negative ones skipped, and nothing
+    else is written."""
+    torch.manual_seed(tokens)
+    pages = -(-tokens // 64) + 2
+    spread = 4 ** torch.randn(tokens, 1, device="cuda")
+    key = (torch.randn(tokens, 128, device="cuda") * spread).bfloat16()
+    key[0, :16] = 0  # a zero block: scale 0
+    slots = torch.randperm(64 * pages, device="cuda")[:tokens]
+    slots[1::5] = -1
+    key_cache = torch.full((pages, 64, 64), 7, dtype=torch.uint8, device="cuda")
+    key_scales = torch.full_like(key_cache[..., :8], 7).view(torch.float8_e4m3fn)
+    quantize_write_index_k_nvfp4(key, slots, key_cache, key_scales)
+
+    blocks = key.float().view(tokens, 8, 16)
+    scale = (blocks.abs().amax(-1) / 6).to(torch.float8_e4m3fn).float()
+    inverse = torch.where(scale > 0, 1 / scale, 0)
+    expected = (e2m1(blocks * inverse[..., None]) * scale[..., None]).flatten(1)
+    live = slots >= 0
+    rows, scale_rows = key_cache.view(-1, 64), key_scales.view(-1, 8)
+    torch.testing.assert_close(
+        scale_rows[slots[live]].float(), scale[live], rtol=0, atol=0
+    )
+    got = dequantize(rows[slots[live]], scale_rows[slots[live]]).float()
+    torch.testing.assert_close(got, expected[live], rtol=0, atol=0)
+    untouched = torch.ones(64 * pages, dtype=torch.bool, device="cuda")
+    untouched[slots[live]] = False
+    assert bool((rows[untouched] == 7).all())
+
+
+@sm10x_only
+@torch.inference_mode()
+def test_quantize_write_index_k_nvfp4_rejects_bad_inputs(monkeypatch) -> None:
+    key = torch.zeros(1, 128, dtype=torch.bfloat16, device="cuda")
+    slots = torch.zeros(1, dtype=torch.int64, device="cuda")
+    key_cache = torch.zeros(4, 64, 64, dtype=torch.uint8, device="cuda")
+    key_scales = torch.zeros(4, 64, 8, dtype=torch.float8_e4m3fn, device="cuda")
+    run = quantize_write_index_k_nvfp4
+    with pytest.raises(ValueError, match="key_scales must be"):
+        run(key, slots, key_cache, key_scales[:3])
+    for wrong in (
+        (key.float(), slots, key_cache, key_scales),
+        (key, slots.int(), key_cache, key_scales),
+        (key, slots, key_cache.bfloat16(), key_scales),
+        (key, slots, key_cache, key_scales.float()),
+    ):
+        with pytest.raises(ValueError, match="must be BF16 or FP16"):
+            run(*wrong)
+    monkeypatch.setattr(
+        "flashinfer.attn_scores.single_head.get_compute_capability",
+        lambda device: (9, 0),
+    )
+    with pytest.raises(ValueError, match="requires SM10x"):
+        run(key, slots, key_cache, key_scales)
+
+
 @torch.inference_mode()
 def test_single_head_paged_mqa_logits_rejects_bad_shapes() -> None:
     query = torch.zeros(4, 128, dtype=torch.bfloat16, device="cuda")
@@ -92,5 +421,200 @@ def test_single_head_paged_mqa_logits_rejects_bad_shapes() -> None:
     run = single_head_paged_mqa_logits
     with pytest.raises(ValueError, match="block table must cover"):
         run(query, key_cache, table[:, :1], context, requests=requests, scores=scores)
-    with pytest.raises(ValueError, match="BF16 of dimension 128"):
+    with pytest.raises(ValueError, match="both BF16 or both NVFP4"):
         run(query.float(), key_cache, table, context, requests=requests, scores=scores)
+    with pytest.raises(ValueError, match="need scales"):
+        run(
+            query.view(torch.uint8)[:, :64],
+            key_cache.view(torch.uint8)[..., :64],
+            table,
+            context,
+            requests=requests,
+            scores=scores,
+        )
+    with pytest.raises(ValueError, match="NVFP4 scales must be"):
+        run(
+            torch.zeros(4, 64, dtype=torch.uint8, device="cuda"),
+            torch.zeros(4, 64, 64, dtype=torch.uint8, device="cuda"),
+            table,
+            context,
+            requests=requests,
+            scores=scores,
+            query_scales=torch.zeros(4, 8, device="cuda"),
+            key_scales=torch.zeros(4, 64, 8, device="cuda"),
+        )
+
+
+@sm10x_only
+@torch.inference_mode()
+def test_single_head_paged_mqa_threshold_select_rejects_bad_shapes() -> None:
+    query = torch.zeros(128, 128, dtype=torch.bfloat16, device="cuda")
+    key_cache = torch.zeros(4, 64, 128, dtype=torch.bfloat16, device="cuda")
+    ends = torch.ones(128, dtype=torch.int32, device="cuda")
+    requests = torch.zeros(1, dtype=torch.int32, device="cuda")
+    table = torch.zeros(1, 4, dtype=torch.int32, device="cuda")
+    outputs = dict(
+        thresholds=torch.zeros(128, device="cuda"),
+        counters=torch.zeros(128, 2, dtype=torch.int32, device="cuda"),
+        candidates=torch.zeros(128, 64, 2, dtype=torch.int32, device="cuda"),
+    )
+    # Each shape alone is wrong, though together they hold (2, 2) after the rows.
+    bad = dict(
+        outputs,
+        counters=torch.zeros(128, 2, 2, dtype=torch.int32, device="cuda"),
+        candidates=torch.zeros(128, 64, dtype=torch.int32, device="cuda"),
+    )
+    run = single_head_paged_mqa_threshold_select
+    # The kernel addresses the pairs of a row as int32, so int64 must not pass.
+    long_pairs = dict(outputs, candidates=outputs["candidates"].long())
+    with pytest.raises(ValueError, match="must be int32"):
+        run(
+            query,
+            key_cache,
+            ends,
+            requests,
+            table,
+            **long_pairs,
+            max_context=128,
+            top_k=8,
+        )
+    long_ranges = dict(
+        outputs,
+        arrivals=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        ranges=torch.zeros(2, 128, dtype=torch.int64, device="cuda"),
+    )
+    with pytest.raises(ValueError, match="both int32"):
+        run(
+            query,
+            key_cache,
+            ends,
+            requests,
+            table,
+            **long_ranges,
+            max_context=128,
+            top_k=8,
+        )
+    for wrong in (bad, dict(outputs, candidates=bad["candidates"])):
+        with pytest.raises(ValueError, match="counters must be"):
+            run(
+                query,
+                key_cache,
+                ends,
+                requests,
+                table,
+                **wrong,
+                max_context=128,
+                top_k=8,
+            )
+
+
+@torch.inference_mode()
+def test_single_head_paged_mqa_logits_off_sm10x_rejects_bad_layouts(
+    monkeypatch,
+) -> None:
+    """The Triton path off SM10x checks the layouts its kernel assumes."""
+    monkeypatch.setattr(single_head, "get_compute_capability", lambda _: (9, 0))
+    query = torch.zeros(4, 128, dtype=torch.bfloat16, device="cuda")
+    key_cache = torch.zeros(4, 64, 128, dtype=torch.bfloat16, device="cuda")
+    table = torch.zeros(2, 2, dtype=torch.int32, device="cuda")
+    context = torch.zeros(2, dtype=torch.int32, device="cuda")
+    requests = torch.zeros(2, dtype=torch.int32, device="cuda")
+    scores = torch.zeros(4, 128, device="cuda")
+    run = partial(single_head_paged_mqa_logits, requests=requests)
+    with pytest.raises(ValueError, match="Keys must be"):
+        run(query[:, :64], key_cache[..., :64], table, context, scores=scores)
+    with pytest.raises(ValueError, match="contiguous rows"):
+        run(
+            query,
+            key_cache,
+            table,
+            context,
+            scores=torch.zeros(128, 4, device="cuda").T,
+        )
+    with pytest.raises(ValueError, match="contiguous rows"):  # every other length
+        run(query, key_cache, table, context.repeat(2)[::2], scores=scores)
+
+
+@sm10x_only
+@torch.inference_mode()
+def test_thresholds_from_sample_rejects_bad_counters() -> None:
+    scores = torch.zeros(4, 128, device="cuda")
+    top = torch.zeros(4, 8, dtype=torch.int32, device="cuda")
+    thresholds = torch.zeros(4, device="cuda")
+    with pytest.raises(ValueError, match="counters must be"):
+        thresholds_from_sample(
+            scores,
+            top,
+            thresholds=thresholds,
+            counters=torch.zeros(4, 1, dtype=torch.int32, device="cuda"),
+        )
+
+
+@sm10x_only
+@torch.inference_mode()
+def test_gather_key_sample_rejects_bad_shapes() -> None:
+    """Sample scales short of slots or of scales per key, and keys or scales not
+    64 to a page, are refused: the kernel would write or read past them. (No
+    request has samples, so a call let through writes nothing.)"""
+    zeros = partial(torch.zeros, device="cuda")
+    args = dict(
+        key_cache=zeros(4, 64, 64, dtype=torch.uint8),
+        key_scales=zeros(4, 64, 8, dtype=torch.float8_e4m3fn),
+        sample_keys=zeros(2, 128, 64, dtype=torch.uint8),
+        sample_scales=zeros(2, 128, 8, dtype=torch.float8_e4m3fn),
+    )
+
+    def run(**changes) -> None:
+        call = dict(args, **changes)
+        gather_key_sample(
+            call.pop("key_cache"),
+            zeros(2, 2, dtype=torch.int32),  # block table
+            zeros(128, dtype=torch.uint8),  # offsets
+            zeros(2, dtype=torch.int32),  # sample ends
+            samples_per_run=1,
+            pages_per_run=2,
+            **call,
+        )
+
+    run()
+    for wrong in (
+        dict(sample_scales=args["sample_scales"][:, :64]),  # fewer slots
+        dict(sample_scales=args["sample_scales"][..., :4]),  # fewer scales a key
+        dict(key_scales=args["key_scales"][:, :32]),  # 32 keys a page
+    ):
+        with pytest.raises(ValueError, match="Scales must be"):
+            run(**wrong)
+    with pytest.raises(ValueError, match="Mismatched"):  # BF16 keys, 32 a page
+        run(
+            key_cache=zeros(4, 32, 128, dtype=torch.bfloat16),
+            sample_keys=zeros(2, 128, 128, dtype=torch.bfloat16),
+            key_scales=None,
+            sample_scales=None,
+        )
+
+
+@torch.inference_mode()
+def test_sample_helpers_need_cute_dsl_4_7(monkeypatch) -> None:
+    """Without CuTe DSL 4.7 the sample helpers say so, like the other CuTe
+    single-head APIs, before they import the CuTe scorer."""
+    monkeypatch.setattr(
+        single_head, "is_cute_dsl_experimental_available", lambda: False
+    )
+    zeros = partial(torch.zeros, device="cuda")
+    with pytest.raises(RuntimeError, match="needs CuTe DSL 4.7"):
+        gather_key_sample(
+            zeros(4, 64, 128, dtype=torch.bfloat16),
+            zeros(2, 2, dtype=torch.int32),
+            zeros(128, dtype=torch.uint8),
+            zeros(2, dtype=torch.int32),
+            sample_keys=zeros(2, 128, 128, dtype=torch.bfloat16),
+            samples_per_run=1,
+            pages_per_run=2,
+        )
+    with pytest.raises(RuntimeError, match="needs CuTe DSL 4.7"):
+        thresholds_from_sample(
+            zeros(4, 128),
+            zeros(4, 8, dtype=torch.int32),
+            thresholds=zeros(4),
+            counters=zeros(4, 2, dtype=torch.int32),
+        )
