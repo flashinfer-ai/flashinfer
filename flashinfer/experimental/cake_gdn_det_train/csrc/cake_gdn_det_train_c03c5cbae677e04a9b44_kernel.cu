@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_S_W_OFF 0
 #define SMEM_S_W_STAGE_BYTES 16384
 #define SMEM_S_W_STRIDE 40960
@@ -465,10 +464,10 @@ kernel_cake_gdn_det_train_c03c5cbae677e04a9b44(__nv_bfloat16* __restrict__ kn, _
         int next_off = 40960 - stage_off;
         int next_g_off = 64 - g_off;
         int _min_3_1 = ((seq_len - (it_chunk + 2) * 64) < (64) ? (seq_len - (it_chunk + 2) * 64) : (64));
-        int tok_1 = tid;
+        int tok_2 = tid;
         g_far[0] = 0.0f;
-        if (tok_1 < _min_3_1) {
-            g_far[0] = g_cs[(long long)(tok0 + 128 + tok_1) * (long long)num_v_heads + (long long)hv];
+        if (tok_2 < _min_3_1) {
+            g_far[0] = g_cs[(long long)(tok0 + 128 + tok_2) * (long long)num_v_heads + (long long)hv];
         }
         asm volatile("cp.async.wait_group 0;");
         #pragma unroll
@@ -580,10 +579,10 @@ kernel_cake_gdn_det_train_c03c5cbae677e04a9b44(__nv_bfloat16* __restrict__ kn, _
             for (int half = 0; half < 2; half++) {
                 #pragma unroll
                 for (int e = 0; e < 2; e++) {
-                    int tok_1_0 = (tb * 2 + half) * 8 + quad * 2 + e;
+                    int tok_1 = (tb * 2 + half) * 8 + quad * 2 + e;
                     float decay = 0.0f;
-                    if (tok_1_0 < n_valid) {
-                        float _exp2_12 = approx_exp2(g_last - s_g[g_off + tok_1_0]);
+                    if (tok_1 < n_valid) {
+                        float _exp2_12 = approx_exp2(g_last - s_g[g_off + tok_1]);
                         decay = _exp2_12;
                     }
                     float u_a = ((e == 0) ? __uint_as_float(u_frag[half * 2] << 16) : __uint_as_float(u_frag[half * 2] & 4294901760u));

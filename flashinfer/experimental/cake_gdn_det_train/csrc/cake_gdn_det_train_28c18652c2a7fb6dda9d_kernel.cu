@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_S_KN_OFF 0
 #define SMEM_S_KN_STAGE_BYTES 16384
 #define SMEM_S_KN_STRIDE 65536
@@ -805,53 +804,53 @@ kernel_cake_gdn_det_train_28c18652c2a7fb6dda9d(__nv_bfloat16* __restrict__ qn, _
                 }
             }
             int ld_tok_1_1 = 16 + lane_0 / 2;
-            int words_1[4];
+            int words_2[4];
             {
                 const int4* _ivptr_28 = reinterpret_cast<const int4*>(reinterpret_cast<int*>(s_stage) + stage_u32_base + ld_tok_1_1 * 8 + ((ld_half ^ ld_tok_1_1 >> 2 & 1) << 2));
                 int4 _ivld_28;
                 _ivld_28 = *_ivptr_28;
-                words_1[0 + 0] = _ivld_28.x;
-                words_1[0 + 1] = _ivld_28.y;
-                words_1[0 + 2] = _ivld_28.z;
-                words_1[0 + 3] = _ivld_28.w;
+                words_2[0 + 0] = _ivld_28.x;
+                words_2[0 + 1] = _ivld_28.y;
+                words_2[0 + 2] = _ivld_28.z;
+                words_2[0 + 3] = _ivld_28.w;
             }
             if (ld_tok_1_1 < n_valid) {
                 {
-                    int4 _iv4 = make_int4(words_1[0 + 0], words_1[0 + 1], words_1[0 + 2], words_1[0 + 3]);
+                    int4 _iv4 = make_int4(words_2[0 + 0], words_2[0 + 1], words_2[0 + 2], words_2[0 + 3]);
                     *reinterpret_cast<int4*>(reinterpret_cast<int*>(dv2) + (row_base + (long long)ld_tok_1_1 * tok_stride + (long long)(ld_half * 8)) / 2) = _iv4;
                 }
             }
             int ld_tok_1_2 = 32 + lane_0 / 2;
-            int words_2[4];
+            int words_3[4];
             {
                 const int4* _ivptr_29 = reinterpret_cast<const int4*>(reinterpret_cast<int*>(s_stage) + stage_u32_base + ld_tok_1_2 * 8 + ((ld_half ^ ld_tok_1_2 >> 2 & 1) << 2));
                 int4 _ivld_29;
                 _ivld_29 = *_ivptr_29;
-                words_2[0 + 0] = _ivld_29.x;
-                words_2[0 + 1] = _ivld_29.y;
-                words_2[0 + 2] = _ivld_29.z;
-                words_2[0 + 3] = _ivld_29.w;
+                words_3[0 + 0] = _ivld_29.x;
+                words_3[0 + 1] = _ivld_29.y;
+                words_3[0 + 2] = _ivld_29.z;
+                words_3[0 + 3] = _ivld_29.w;
             }
             if (ld_tok_1_2 < n_valid) {
                 {
-                    int4 _iv4 = make_int4(words_2[0 + 0], words_2[0 + 1], words_2[0 + 2], words_2[0 + 3]);
+                    int4 _iv4 = make_int4(words_3[0 + 0], words_3[0 + 1], words_3[0 + 2], words_3[0 + 3]);
                     *reinterpret_cast<int4*>(reinterpret_cast<int*>(dv2) + (row_base + (long long)ld_tok_1_2 * tok_stride + (long long)(ld_half * 8)) / 2) = _iv4;
                 }
             }
             int ld_tok_1_3 = 48 + lane_0 / 2;
-            int words_3[4];
+            int words_4[4];
             {
                 const int4* _ivptr_30 = reinterpret_cast<const int4*>(reinterpret_cast<int*>(s_stage) + stage_u32_base + ld_tok_1_3 * 8 + ((ld_half ^ ld_tok_1_3 >> 2 & 1) << 2));
                 int4 _ivld_30;
                 _ivld_30 = *_ivptr_30;
-                words_3[0 + 0] = _ivld_30.x;
-                words_3[0 + 1] = _ivld_30.y;
-                words_3[0 + 2] = _ivld_30.z;
-                words_3[0 + 3] = _ivld_30.w;
+                words_4[0 + 0] = _ivld_30.x;
+                words_4[0 + 1] = _ivld_30.y;
+                words_4[0 + 2] = _ivld_30.z;
+                words_4[0 + 3] = _ivld_30.w;
             }
             if (ld_tok_1_3 < n_valid) {
                 {
-                    int4 _iv4 = make_int4(words_3[0 + 0], words_3[0 + 1], words_3[0 + 2], words_3[0 + 3]);
+                    int4 _iv4 = make_int4(words_4[0 + 0], words_4[0 + 1], words_4[0 + 2], words_4[0 + 3]);
                     *reinterpret_cast<int4*>(reinterpret_cast<int*>(dv2) + (row_base + (long long)ld_tok_1_3 * tok_stride + (long long)(ld_half * 8)) / 2) = _iv4;
                 }
             }
