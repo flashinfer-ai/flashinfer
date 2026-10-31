@@ -952,17 +952,24 @@ class _AtomicLaunch:
         self.entry(*self.arguments)
 
 
-def _converted_launch(launch: Any) -> _AtomicLaunch:
-    """A bound launch (this package's or the deterministic package's) whose tensor arguments are converted to
-    ``tvm_ffi.Tensor`` once: a prepared launch binds fixed tensors, and converting a torch tensor on every call is
-    the larger part of the host time of an FFI call.  The converted tensors keep their torch tensors alive."""
-    arguments = tuple(
+def _ffi_tensors(arguments: Any) -> tuple:
+    """``arguments`` with every torch tensor converted to a ``tvm_ffi.Tensor`` (which keeps its torch tensor alive):
+    converting a torch tensor is the larger part of the host time of an FFI call, so the launches convert their
+    arguments before the first launch of a call (or once, when prepared)."""
+    return tuple(
         tvm_ffi.from_dlpack(a, require_contiguous=False)
         if isinstance(a, torch.Tensor)
         else a
-        for a in launch.arguments
+        for a in arguments
     )
-    return _AtomicLaunch(launch.module, launch.entry, arguments, launch.grid)
+
+
+def _converted_launch(launch: Any) -> _AtomicLaunch:
+    """A bound launch (this package's or the deterministic package's) whose tensor arguments are converted to
+    ``tvm_ffi.Tensor`` once (:func:`_ffi_tensors`): a prepared launch binds fixed tensors."""
+    return _AtomicLaunch(
+        launch.module, launch.entry, _ffi_tensors(launch.arguments), launch.grid
+    )
 
 
 # ``cuda.bindings.driver`` once imported (``False``: unavailable, the K2 fill of ``out`` then runs ``out.zero_()``).
@@ -1630,23 +1637,29 @@ def _launch_cached_atomic_k2(
         if entry.split_module is None:
             resid = arena.buffers["k2_split_scratch"][:n].view(split_src.shape)
             det.split_fp32_to_bf16x3_det_(split_src, parts, resid)
+        # the arguments are converted and the fill bound before the first launch: the launches go back to back
         values = _k2_values(plan, A=a_view, parts=parts, out=out)
-        arguments = _order_atomic_arguments(
-            entry.module_name, entry.arg_plan, values, plan.grid
+        arguments = _ffi_tensors(
+            _order_atomic_arguments(
+                entry.module_name, entry.arg_plan, values, plan.grid
+            )
         )
-        with det._ffi_stream_context(index, stream):
-            if entry.split_entry is not None:
-                grid = det._split_grid(n)
-                entry.split_entry(
-                    *_order_atomic_arguments(
-                        entry.split_module,
-                        entry.split_arg_plan,
-                        det._split_values(split_src, parts, n),
-                        grid,
-                    )
+        split_arguments = None
+        if entry.split_entry is not None:
+            split_arguments = _ffi_tensors(
+                _order_atomic_arguments(
+                    entry.split_module,
+                    entry.split_arg_plan,
+                    det._split_values(split_src, parts, n),
+                    det._split_grid(n),
                 )
-            if plan.part_tiles:
-                _out_fill(out, index)(stream)
+            )
+        fill = _out_fill(out, index) if plan.part_tiles else None
+        with det._ffi_stream_context(index, stream):
+            if split_arguments is not None:
+                entry.split_entry(*split_arguments)
+            if fill is not None:
+                fill(stream)
             fn(*arguments)
     return out
 
