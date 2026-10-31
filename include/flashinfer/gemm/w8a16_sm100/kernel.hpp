@@ -42,6 +42,34 @@
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/kernel/sm100_tile_scheduler.hpp"
+
+// Build with -DW8A16_SM100_TRACE to print a per-role %clock timeline of CTA 0 (debugging the
+// fixed costs of a launch; off by default, no code otherwise).
+#ifdef W8A16_SM100_TRACE
+__device__ long long w8a16_sm100_trace_buf[64];
+#define W8A16_TRACE_STAMP(slot)                                               \
+  do {                                                                        \
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && (threadIdx.x % 32) == 0) {                         \
+      w8a16_sm100_trace_buf[(slot)] = clock64();                              \
+    }                                                                         \
+  } while (0)
+#define W8A16_TRACE_PRINT(role, a, b, c, d)                                                   \
+  do {                                                                                        \
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && (threadIdx.x % 32) == 0) {                                         \
+      long long t0 = w8a16_sm100_trace_buf[threadIdx.x / 32];                                 \
+      printf("CPPTRACE %s warp%d: %lld %lld %lld %lld\n", role, int(threadIdx.x / 32),       \
+             (a) ? w8a16_sm100_trace_buf[(a)] - t0 : -1, (b) ? w8a16_sm100_trace_buf[(b)] - t0 : -1, \
+             (c) ? w8a16_sm100_trace_buf[(c)] - t0 : -1, (d) ? w8a16_sm100_trace_buf[(d)] - t0 : -1); \
+    }                                                                                         \
+  } while (0)
+#else
+#define W8A16_TRACE_STAMP(slot) \
+  do {                          \
+  } while (0)
+#define W8A16_TRACE_PRINT(role, a, b, c, d) \
+  do {                                      \
+  } while (0)
+#endif
 #include "cutlass/kernel_hardware_info.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "flashinfer/gemm/w8a16_sm100/policy.hpp"
@@ -406,6 +434,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
     // Account for multiple epilogue and transformation warps
     int warp_idx = canonical_warp_idx_sync();
     WarpCategory warp_category = warp_category_of(warp_idx);
+    W8A16_TRACE_STAMP(warp_idx);
 
     int thread_idx = int(threadIdx.x);
     int thread_idx_in_warp = thread_idx % 32;
@@ -677,6 +706,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
     epilogue_throttle_barrier.arrive();
     bool requires_clc_query = true;
 
+    [[maybe_unused]] bool trace_first_load = true;
     do {
       auto cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
       auto k_tile_iter = scheduler.get_k_tile_iterator(work_tile_info, problem_shape_MNKL,
@@ -696,6 +726,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
       }
 
       if (lane_predicate) {
+        if (trace_first_load) W8A16_TRACE_STAMP(is_participant.main_loadA ? 40 : 42);
         if (is_participant.main_loadA) {
           auto [load2transform_pipeline_producer_state_next, k_tile_iter_next] =
               collective_mainloop.load_A(params.mainloop, load2transform_pipeline,
@@ -726,6 +757,8 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
               cta_coord_mnkl, k_tile_iter_next, k_tile_count - k_tile_prologue);
           load2mma_pipeline_producer_state = load2mma_pipeline_producer_state_next_;
         }
+        if (trace_first_load) W8A16_TRACE_STAMP(is_participant.main_loadA ? 41 : 43);
+        trace_first_load = false;
       }
 
       // Sync warp to prevent non-participating threads entering next wave early
@@ -746,11 +779,13 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
       if (lane_predicate) {
         load2transform_pipeline.producer_tail(load2transform_pipeline_producer_state);
       }
+      W8A16_TRACE_PRINT("loadA(first issue start,end)", 40, 41, 0, 0);
     }
     if (is_participant.main_loadB) {
       if (lane_predicate) {
         load2mma_pipeline.producer_tail(load2mma_pipeline_producer_state);
       }
+      W8A16_TRACE_PRINT("loadB(first issue start,end)", 42, 43, 0, 0);
     }
   }
 
@@ -833,12 +868,14 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
     // Wait for tmem allocation
     tmem_allocation_result_barrier.arrive_and_wait_unaligned();
 
+    [[maybe_unused]] bool trace_first_xf = true;
     do {
       auto k_tile_count =
           TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
       auto k_tile_start = TileScheduler::get_work_k_tile_start(work_tile_info);
       auto k_tile_iter =
           cute::make_coord_iterator(idx2crd(k_tile_start, shape<3>(gA_mkl)), shape<3>(gA_mkl));
+      if (trace_first_xf) W8A16_TRACE_STAMP(50);
       auto [load2transform_pipeline_consumer_state_next,
             transform2mma_pipeline_producer_state_next] =
           collective_mainloop.transform(
@@ -847,6 +884,8 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
               transform_inputs, k_tile_iter, k_tile_count);
       transform2mma_pipeline_producer_state = transform2mma_pipeline_producer_state_next;
       load2transform_pipeline_consumer_state = load2transform_pipeline_consumer_state_next;
+      if (trace_first_xf) W8A16_TRACE_STAMP(51);
+      trace_first_xf = false;
 
       // Fetch next work tile
       auto [next_work_tile_info, increment_pipe] =
@@ -857,6 +896,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
         ++clc_pipeline_consumer_state;
       }
     } while (work_tile_info.is_valid());
+    W8A16_TRACE_PRINT("xform(first start,end)", 50, 51, 0, 0);
 
     transform2mma_pipeline.producer_tail(transform2mma_pipeline_producer_state);
   }
@@ -884,7 +924,9 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
     tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
     __syncwarp();
     tmem_allocation_result_barrier.arrive();
+    W8A16_TRACE_STAMP(20);
     uint32_t tmem_base_ptr = shared_storage.tmem_base_ptr;
+    [[maybe_unused]] bool trace_first_mma = true;
 
     auto mma_input_operands =
         collective_mainloop.mma_init(bulk_tmem, shared_storage.tensors.mainloop);
@@ -905,6 +947,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
       }
 
       if (is_mma_leader_cta) {
+        if (trace_first_mma) W8A16_TRACE_STAMP(21);
         auto [load2mma_pipeline_consumer_state_next, transform2mma_pipeline_consumer_state_next,
               mma2accum_pipeline_producer_state_next] =
             collective_mainloop.mma(load2mma_pipeline, load2mma_pipeline_consumer_state,
@@ -915,6 +958,8 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
         load2mma_pipeline_consumer_state = load2mma_pipeline_consumer_state_next;
         transform2mma_pipeline_consumer_state = transform2mma_pipeline_consumer_state_next;
         mma2accum_pipeline_producer_state = mma2accum_pipeline_producer_state_next;
+        if (trace_first_mma) W8A16_TRACE_STAMP(22);
+        trace_first_mma = false;
       }
     } while (work_tile_info.is_valid());
 
@@ -922,6 +967,8 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
     if (is_mma_leader_cta) {
       mma2accum_pipeline.producer_tail(mma2accum_pipeline_producer_state);
     }
+    W8A16_TRACE_STAMP(23);
+    W8A16_TRACE_PRINT("mma(alloc,mma0,mma0done,tail)", 20, 21, 22, 23);
 
     // Hint on an early release of global memory resources.
     // The timing of calling this function only influences performance,
@@ -1029,6 +1076,7 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
         collective_mainloop.accum_init(bulk_tmem, typename CollectiveEpilogue::CopyOpT2R{},
                                        typename CollectiveEpilogue::EpilogueTile{});
     bool do_tail_store = false;
+    [[maybe_unused]] bool trace_first_epi = true;
     do {
       // Fetch next work tile
       auto [next_work_tile_info, increment_pipe] =
@@ -1040,7 +1088,9 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
 
       auto k_tile_count =
           TileScheduler::get_work_k_tile_count(work_tile_info, problem_shape_MNKL, CtaShape_MNK{});
+      if (trace_first_epi) W8A16_TRACE_STAMP(29);
       mma2accum_pipeline.consumer_wait(mma2accum_pipeline_consumer_state);
+      if (trace_first_epi) W8A16_TRACE_STAMP(30);
 
       // Accumulators
       Tensor accumulators = bulk_tmem(
@@ -1071,6 +1121,8 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
       }
 
       work_tile_info = next_work_tile_info;
+      if (trace_first_epi) W8A16_TRACE_STAMP(31);
+      trace_first_epi = false;
       cta_coord_mnkl = scheduler.work_tile_to_cta_coord(work_tile_info);
     } while (work_tile_info.is_valid());
 
@@ -1082,6 +1134,8 @@ class GemmUniversal<ProblemShape_, CollectiveMainloop_, CollectiveEpilogue_, Til
                                      epi_store_pipeline, epi_store_pipe_producer_state,
                                      CtaShape_MNK{});
     }
+    W8A16_TRACE_STAMP(32);
+    W8A16_TRACE_PRINT("epi(prewait,accready,stored,tail)", 29, 30, 31, 32);
   }
 
   //

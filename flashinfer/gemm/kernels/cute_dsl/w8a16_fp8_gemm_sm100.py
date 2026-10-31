@@ -37,11 +37,7 @@ from cutlass.utils.mixed_input_helpers import TransformMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 
-from .w8a16_fp8_gemm_sm100_utils import (
-    clock_lo,
-    convert_e4m3_fragment,
-    global_timer_lo,
-)
+from .w8a16_fp8_gemm_sm100_utils import clock_lo, convert_e4m3_fragment
 
 
 def _slot_if(cond: cutlass.Boolean, slot: int) -> cutlass.Int32:
@@ -49,6 +45,27 @@ def _slot_if(cond: cutlass.Boolean, slot: int) -> cutlass.Int32:
     condition into the index so a timestamp store needs no nested staged ``if`` (a store
     through a tensor inside nested staged branches trips the tracer's value threading)."""
     return cutlass.Int32(15) - (15 - slot) * cond.to(cutlass.Int32)
+
+
+_FAST_DIVMOD_SHIFT = 40
+
+
+@cute.jit
+def _fast_divmod_magic(d: cutlass.Int32) -> cutlass.Int64:
+    """ceil(2^40 / d): with it, x // d == (x * magic) >> 40 exactly for every
+    0 <= x < 2^20 and 1 <= d < 2^20 (x * d < 2^40 bounds the rounding error below one
+    quotient step).  Work items and cluster counts are far below 2^20."""
+    d64 = d.to(cutlass.Int64)
+    return (cutlass.Int64(1 << _FAST_DIVMOD_SHIFT) + d64 - 1) // d64
+
+
+@cute.jit
+def _fast_divmod(x: cutlass.Int32, d: cutlass.Int32, magic: cutlass.Int64):
+    """(x // d, x % d) by a 64-bit multiply and shift instead of an integer division
+    (~40 dependent instructions each on the GPU; the tile derivation runs it on every
+    warp at kernel start and in the scheduler per tile)."""
+    q = ((x.to(cutlass.Int64) * magic) >> _FAST_DIVMOD_SHIFT).to(cutlass.Int32)
+    return q, x - q * d
 
 
 class Sm100W8A16Fp8GemmKernel:
@@ -106,7 +123,12 @@ class Sm100W8A16Fp8GemmKernel:
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             1, 32 * len(self.epilog_warp_id)
         )
-        self.tmem_ptr_sync_barrier = pipeline.NamedBarrier(2, self.threads_per_cta)
+        # Only the warps that touch TMEM wait for the allocation (epilogue, MMA,
+        # transform); the TMA and scheduler warps start their work meanwhile.
+        self.num_tmem_user_threads = 32 * (
+            len(self.epilog_warp_id) + 1 + self.num_transform_warps
+        )
+        self.tmem_ptr_sync_barrier = pipeline.NamedBarrier(2, self.num_tmem_user_threads)
         self.sched_sync_barrier = pipeline.NamedBarrier(5, 32)
 
         self.smem_buffer_align_bytes = 1024
@@ -581,6 +603,11 @@ class Sm100W8A16Fp8GemmKernel:
 
         self.shared_storage = SharedStorage
 
+        # Magic multipliers for the two dynamic divisors of the tile derivation (see
+        # _fast_divmod): computed once per launch, on the host.
+        _, _, major_clusters, _, total_clusters, _ = self._grid_dims(c)
+        fd_total = _fast_divmod_magic(total_clusters)
+        fd_major = _fast_divmod_magic(major_clusters)
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -593,6 +620,8 @@ class Sm100W8A16Fp8GemmKernel:
             scale,
             bias,
             dbg,
+            fd_total,
+            fd_major,
             self.cluster_layout_vmnk,
             self.smem_layout_a,
             self.smem_layout_a_transform,
@@ -623,6 +652,8 @@ class Sm100W8A16Fp8GemmKernel:
         scale: cute.Tensor,
         bias: cute.Tensor,
         dbg: cute.Tensor,
+        fd_total: cutlass.Int64,
+        fd_major: cutlass.Int64,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout: cute.ComposedLayout,
         a_smem_layout_transform: cute.ComposedLayout,
@@ -642,7 +673,7 @@ class Sm100W8A16Fp8GemmKernel:
             # later uses outside that branch without a dominating definition.
             _ = dbg.iterator
             if tidx == 0:
-                dbg[dbg_base + 16] = global_timer_lo(16)
+                dbg[dbg_base + 16] = clock_lo(16)
         if warp_idx == self.epilog_warp_id[0]:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
@@ -845,22 +876,28 @@ class Sm100W8A16Fp8GemmKernel:
         if cutlass.const_expr(self.debug):
             if warp_idx == self.schedule_warp_id:
                 with cute.arch.elect_one():
-                    dbg[dbg_base + 32] = global_timer_lo(32)
+                    dbg[dbg_base + 32] = clock_lo(32)
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
         if cutlass.const_expr(self.debug):
             if warp_idx == self.schedule_warp_id:
                 with cute.arch.elect_one():
-                    dbg[dbg_base + 33] = global_timer_lo(33)
+                    dbg[dbg_base + 33] = clock_lo(33)
         tmem.allocate(self.num_tmem_alloc_cols)
         if cutlass.const_expr(self.debug):
             if warp_idx == self.schedule_warp_id:
                 with cute.arch.elect_one():
-                    dbg[dbg_base + 34] = global_timer_lo(34)
-        tmem.wait_for_alloc()
+                    dbg[dbg_base + 34] = clock_lo(34)
+        uses_tmem = (
+            (warp_idx != self.schedule_warp_id)
+            & (warp_idx != self.weight_tma_warp_id)
+            & (warp_idx != self.activation_tma_warp_id)
+        )
+        if uses_tmem:
+            tmem.wait_for_alloc()
         if cutlass.const_expr(self.debug):
             if warp_idx == self.schedule_warp_id:
                 with cute.arch.elect_one():
-                    dbg[dbg_base + 30] = global_timer_lo(30)
+                    dbg[dbg_base + 30] = clock_lo(30)
 
         # ---- scheduler warp: hands (cta_coord_m, activation offset, valid, rows left)
         # to every other warp through the tile_info pipeline.
@@ -888,7 +925,7 @@ class Sm100W8A16Fp8GemmKernel:
             dbg_tiles = cutlass.Int32(0)
             if cutlass.const_expr(self.debug):
                 with cute.arch.elect_one():
-                    dbg[dbg_base + 31] = global_timer_lo(31)
+                    dbg[dbg_base + 31] = clock_lo(31)
             while not_last_tile:
                 has_work = lin < total_work
                 cta_tile_coord_m, act_start_l, distance_l, tile_l = self._tile_at(
@@ -899,6 +936,8 @@ class Sm100W8A16Fp8GemmKernel:
                     total_clusters,
                     cta_m_in_cluster,
                     act_in_cluster,
+                    fd_total,
+                    fd_major,
                 )
                 act_tile_idx = act_start_l // self.cta_tile_shape_mnk[1]
                 is_dense_tile = has_work and (act_tile_idx < act_tiles)
@@ -938,12 +977,18 @@ class Sm100W8A16Fp8GemmKernel:
 
         # ---- activation TMA warp (the only role that waits on the preceding grid).
         if warp_idx == self.activation_tma_warp_id:
+            if cutlass.const_expr(self.debug):
+                with cute.arch.elect_one():
+                    dbg[dbg_base + 53] = clock_lo(53)
             cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
+            if cutlass.const_expr(self.debug):
+                with cute.arch.elect_one():
+                    dbg[dbg_base + 54] = clock_lo(54)
             tile_info_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
             work_tile, tile_l = self._first_work_tile(
-                tensor_c, cta_m_in_cluster, act_in_cluster
+                tensor_c, cta_m_in_cluster, act_in_cluster, fd_total, fd_major
             )
             b_load2mma_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_load2trans_stage
@@ -953,7 +998,7 @@ class Sm100W8A16Fp8GemmKernel:
             dbg_tiles = cutlass.Int32(0)
             if cutlass.const_expr(self.debug):
                 with cute.arch.elect_one():
-                    dbg[dbg_base + 18] = global_timer_lo(18)
+                    dbg[dbg_base + 18] = clock_lo(18)
             while work_tile.is_valid_tile:
                 if cutlass.const_expr(self.debug):
                     with cute.arch.elect_one():
@@ -975,6 +1020,9 @@ class Sm100W8A16Fp8GemmKernel:
                 )
                 k_tile_base = tile_l * k_tile_cnt
                 b_load2mma_producer_state.reset_count()
+                if cutlass.const_expr(self.debug):
+                    with cute.arch.elect_one():
+                        dbg[dbg_base + _slot_if(dbg_tiles == 0, 39)] = clock_lo(39)
                 for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                     # Peek first: a free stage then skips the blocking wait and the
                     # acquire is just the transaction-count arrive.
@@ -986,7 +1034,7 @@ class Sm100W8A16Fp8GemmKernel:
                             first = (dbg_tiles == 0).to(cutlass.Int32) * (
                                 _k_tile == 0
                             ).to(cutlass.Int32) == 1
-                            dbg[dbg_base + _slot_if(first, 37)] = global_timer_lo(37)
+                            dbg[dbg_base + _slot_if(first, 37)] = clock_lo(37)
                             dbg[dbg_base + _slot_if(first, 38)] = b_stage_free.to(
                                 cutlass.Int32
                             )
@@ -1003,7 +1051,7 @@ class Sm100W8A16Fp8GemmKernel:
                                     == 1,
                                     35,
                                 )
-                            ] = global_timer_lo(35)
+                            ] = clock_lo(35)
                     cute.copy(
                         tma_atom_b,
                         tBgB_slice[
@@ -1026,14 +1074,14 @@ class Sm100W8A16Fp8GemmKernel:
                                     == 1,
                                     36,
                                 )
-                            ] = global_timer_lo(36)
+                            ] = clock_lo(36)
                     b_load2mma_producer_state.advance()
                 if cutlass.const_expr(self.debug):
                     dbg_tiles += 1
                     with cute.arch.elect_one():
                         dbg[dbg_base + 1] = dbg_tiles
                         dbg[dbg_base + 9] = cutlass.Int32(2)
-                        dbg[dbg_base + _slot_if(dbg_tiles == 1, 19)] = global_timer_lo(
+                        dbg[dbg_base + _slot_if(dbg_tiles == 1, 19)] = clock_lo(
                             19
                         )
                 work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
@@ -1048,7 +1096,7 @@ class Sm100W8A16Fp8GemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
             work_tile, tile_l = self._first_work_tile(
-                tensor_c, cta_m_in_cluster, act_in_cluster
+                tensor_c, cta_m_in_cluster, act_in_cluster, fd_total, fd_major
             )
             a_load2trans_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_load2trans_stage
@@ -1056,7 +1104,7 @@ class Sm100W8A16Fp8GemmKernel:
             dbg_tiles = cutlass.Int32(0)
             if cutlass.const_expr(self.debug):
                 with cute.arch.elect_one():
-                    dbg[dbg_base + 20] = global_timer_lo(20)
+                    dbg[dbg_base + 20] = clock_lo(20)
             while work_tile.is_valid_tile:
                 if cutlass.const_expr(self.debug):
                     with cute.arch.elect_one():
@@ -1143,7 +1191,7 @@ class Sm100W8A16Fp8GemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
             work_tile, tile_l = self._first_work_tile(
-                tensor_c, cta_m_in_cluster, act_in_cluster
+                tensor_c, cta_m_in_cluster, act_in_cluster, fd_total, fd_major
             )
             a_load2trans_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_load2trans_stage
@@ -1164,7 +1212,7 @@ class Sm100W8A16Fp8GemmKernel:
             if cutlass.const_expr(self.debug):
                 if warp_idx == self.transform_warp_id[0]:
                     with cute.arch.elect_one():
-                        dbg[dbg_base + 28] = global_timer_lo(28)
+                        dbg[dbg_base + 28] = clock_lo(28)
             while work_tile.is_valid_tile:
                 if cutlass.const_expr(self.debug):
                     if warp_idx == self.transform_warp_id[0]:
@@ -1212,7 +1260,7 @@ class Sm100W8A16Fp8GemmKernel:
                             dbg[dbg_base + 3] = dbg_tiles
                             dbg[dbg_base + 11] = cutlass.Int32(2)
                             dbg[dbg_base + _slot_if(dbg_tiles == 1, 29)] = (
-                                global_timer_lo(29)
+                                clock_lo(29)
                             )
                 work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
@@ -1250,7 +1298,7 @@ class Sm100W8A16Fp8GemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
             work_tile, tile_l = self._first_work_tile(
-                tensor_c, cta_m_in_cluster, act_in_cluster
+                tensor_c, cta_m_in_cluster, act_in_cluster, fd_total, fd_major
             )
             trans2mma_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_trans2mma_stage
@@ -1270,7 +1318,7 @@ class Sm100W8A16Fp8GemmKernel:
             mma_clock0 = self._dbg_clock(40)
             if cutlass.const_expr(self.debug):
                 with cute.arch.elect_one():
-                    dbg[dbg_base + 21] = global_timer_lo(21)
+                    dbg[dbg_base + 21] = clock_lo(21)
             while work_tile.is_valid_tile:
                 tCtAcc = accumulators[(None, None, None, acc_producer_state.index)]
                 b_load2mma_consumer_state.reset_count()
@@ -1316,7 +1364,7 @@ class Sm100W8A16Fp8GemmKernel:
                                         == 1,
                                         22,
                                     )
-                                ] = global_timer_lo(22)
+                                ] = clock_lo(22)
                         num_kblocks = cute.size(tCrA, mode=[2])
                         for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
                             kblock_coord_a = (
@@ -1357,10 +1405,10 @@ class Sm100W8A16Fp8GemmKernel:
                     with cute.arch.elect_one():
                         dbg[dbg_base + 4] = dbg_tiles
                         dbg[dbg_base + 12] = cutlass.Int32(5)
-                        dbg[dbg_base + _slot_if(dbg_tiles == 1, 23)] = global_timer_lo(
+                        dbg[dbg_base + _slot_if(dbg_tiles == 1, 23)] = clock_lo(
                             23
                         )
-                        dbg[dbg_base + 27] = global_timer_lo(27)
+                        dbg[dbg_base + 27] = clock_lo(27)
                 work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
                     tile_info_pipeline, tile_info_consumer_state, sTile_info
                 )
@@ -1442,7 +1490,7 @@ class Sm100W8A16Fp8GemmKernel:
                 pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
             )
             work_tile, tile_l = self._first_work_tile(
-                tensor_c, cta_m_in_cluster, act_in_cluster
+                tensor_c, cta_m_in_cluster, act_in_cluster, fd_total, fd_major
             )
             weight_rows = cutlass.Int32(cute.size(tensor_c.shape[0]))
             act_rows = cutlass.Int32(cute.size(tensor_c.shape[1]) // self.splits)
@@ -1453,6 +1501,9 @@ class Sm100W8A16Fp8GemmKernel:
             dbg_tiles = cutlass.Int32(0)
             epi_tile_count = cutlass.Int32(0)
             epi_wait_acc = cutlass.Int32(0)
+            epi_cyc_ld = cutlass.Int32(0)
+            epi_cyc_cvt = cutlass.Int32(0)
+            epi_cyc_store = cutlass.Int32(0)
             epi_clock0 = self._dbg_clock(56)
             while work_tile.is_valid_tile:
                 m_base = work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
@@ -1515,7 +1566,7 @@ class Sm100W8A16Fp8GemmKernel:
                     if epi_tidx == 0:
                         dbg[dbg_base + 13] = cutlass.Int32(2)
                         dbg[dbg_base + _slot_if(epi_tile_count == 0, 24)] = (
-                            global_timer_lo(24)
+                            clock_lo(24)
                         )
                 # Scale and bias are read after the accumulator wait so that under PDL
                 # they are ordered behind the preceding grid too.
@@ -1537,6 +1588,7 @@ class Sm100W8A16Fp8GemmKernel:
                 # nothing: the subtile's cost is the smem write, two named barriers
                 # and the TMA store issue, not the TMEM load (GB200 timeline).
                 for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+                    t_l0 = self._dbg_clock(60)
                     cute.copy(
                         tiled_copy_t2r,
                         tTR_tAcc[(None, None, None, subtile_idx)],
@@ -1547,6 +1599,14 @@ class Sm100W8A16Fp8GemmKernel:
                         with cute.arch.elect_one():
                             acc_pipeline.consumer_release(acc_consumer_state)
                         acc_consumer_state.advance()
+                    if cutlass.const_expr(self.debug):
+                        # The load's latency lands on the first use; charge the wait
+                        # for the first element here so the phases separate.
+                        probe = tTR_rAcc[0]
+                        epi_cyc_ld += clock_lo(61) - t_l0 + (probe == 12345.0).to(
+                            cutlass.Int32
+                        )
+                    t_c0 = self._dbg_clock(62)
                     m_thr_slice = m_thr_offset[(None, None, None, subtile_idx)]
                     # scale * acc (+ bias[row]) in fp32: vectorized without the bias,
                     # per element (the row comes from the identity partition) with it.
@@ -1563,7 +1623,7 @@ class Sm100W8A16Fp8GemmKernel:
                     if cutlass.const_expr(self.debug and subtile_idx == 0):
                         if epi_tidx == 0:
                             dbg[dbg_base + _slot_if(epi_tile_count == 0, 6)] = (
-                                global_timer_lo(6)
+                                clock_lo(6)
                             )
 
                     if work_tile.distance_to_boundary >= self.cta_tile_shape_mnk[1]:
@@ -1575,11 +1635,14 @@ class Sm100W8A16Fp8GemmKernel:
                             tiled_copy_r2s, tRS_rC, tRS_sC[(None, None, None, c_buffer)]
                         )
                         cute.arch.fence_proxy("async.shared", space="cta")
+                        t_s0 = self._dbg_clock(63)
+                        if cutlass.const_expr(self.debug):
+                            epi_cyc_cvt += t_s0 - t_c0
                         self.epilog_sync_barrier.arrive_and_wait()
                         if cutlass.const_expr(self.debug and subtile_idx == 0):
                             if epi_tidx == 0:
                                 dbg[dbg_base + _slot_if(epi_tile_count == 0, 7)] = (
-                                    global_timer_lo(7)
+                                    clock_lo(7)
                                 )
                         if warp_idx == self.epilog_warp_id[0]:
                             cute.copy(
@@ -1592,14 +1655,16 @@ class Sm100W8A16Fp8GemmKernel:
                         if cutlass.const_expr(self.debug and subtile_idx == 0):
                             if epi_tidx == 0:
                                 dbg[dbg_base + _slot_if(epi_tile_count == 0, 14)] = (
-                                    global_timer_lo(14)
+                                    clock_lo(14)
                                 )
                         self.epilog_sync_barrier.arrive_and_wait()
                         if cutlass.const_expr(self.debug and subtile_idx == 0):
                             if epi_tidx == 0:
                                 dbg[dbg_base + _slot_if(epi_tile_count == 0, 17)] = (
-                                    global_timer_lo(17)
+                                    clock_lo(17)
                                 )
+                        if cutlass.const_expr(self.debug):
+                            epi_cyc_store += clock_lo(64) - t_s0
                     else:
                         # Partial last activation tile: predicated SIMT store.
                         tTR_rC.store(tTR_rAcc.load().to(self.c_dtype))
@@ -1621,9 +1686,9 @@ class Sm100W8A16Fp8GemmKernel:
                     dbg_tiles += 1
                     if epi_tidx == 0:
                         dbg[dbg_base + _slot_if(epi_tile_count == 1, 25)] = (
-                            global_timer_lo(25)
+                            clock_lo(25)
                         )
-                        dbg[dbg_base + 26] = global_timer_lo(26)
+                        dbg[dbg_base + 26] = clock_lo(26)
                         dbg[dbg_base + 5] = dbg_tiles
                         dbg[dbg_base + 13] = cutlass.Int32(3)
                 work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
@@ -1638,6 +1703,9 @@ class Sm100W8A16Fp8GemmKernel:
                 if epi_tidx == 0:
                     dbg[dbg_base + 45] = epi_wait_acc
                     dbg[dbg_base + 49] = clock_lo(59) - epi_clock0
+                    dbg[dbg_base + 50] = epi_cyc_ld
+                    dbg[dbg_base + 51] = epi_cyc_cvt
+                    dbg[dbg_base + 52] = epi_cyc_store
 
         if cutlass.const_expr(self.enable_pdl):
             if warp_idx == self.mma_warp_id:
@@ -1688,16 +1756,16 @@ class Sm100W8A16Fp8GemmKernel:
         total_clusters: cutlass.Int32,
         cta_m_in_cluster: cutlass.Int32,
         act_in_cluster: cutlass.Int32,
+        fd_total: cutlass.Int64,
+        fd_major: cutlass.Int64,
     ):
         """Work item ``lin`` of this CTA: (cta_coord_m, activation row offset, rows to
         the activation end, K-slice).  Slices are the slowest mode; within a slice the
         linear cluster-tile index maps to (major, minor), through the L2 group remap of
         CUTLASS's swizzle_and_rasterize (groups of swizzle_size clusters along the major
         axis, residual tiles not remapped), then to (m, n)."""
-        tile_l = lin // total_clusters
-        lin_mn = lin % total_clusters
-        major = lin_mn % major_clusters
-        minor = lin_mn // major_clusters
+        tile_l, lin_mn = _fast_divmod(lin, total_clusters, fd_total)
+        minor, major = _fast_divmod(lin_mn, major_clusters, fd_major)
         swizzle = self.swizzle_size
         if cutlass.const_expr(swizzle > 1):
             major_groups = major_clusters // swizzle
@@ -1729,6 +1797,8 @@ class Sm100W8A16Fp8GemmKernel:
         tensor_c: cute.Tensor,
         cta_m_in_cluster: cutlass.Int32,
         act_in_cluster: cutlass.Int32,
+        fd_total: cutlass.Int64,
+        fd_major: cutlass.Int64,
     ):
         """The CTA's first work item, derived from its cluster index by every warp role
         itself (the scheduler warp publishes from the second item on): saves the
@@ -1751,6 +1821,8 @@ class Sm100W8A16Fp8GemmKernel:
             total_clusters,
             cta_m_in_cluster,
             act_in_cluster,
+            fd_total,
+            fd_major,
         )
         group_idx = cutlass.Int32(1)  # 1 = no work (group_count is 1)
         if lin < total_work:
