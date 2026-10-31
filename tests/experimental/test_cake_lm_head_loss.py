@@ -1475,20 +1475,27 @@ def test_dx_slices_fit_every_k_step_count():
 
 
 def test_dx_slice_rule_and_pin_fit_the_k_steps():
-    """The slice rule fits its count to V's K steps on every row count, H and SM count (the unfitted rule picks 3
-    slices over V = 256's four K steps on 148 SMs at T = 1000, H = 6144), and both planners reject an explicit
-    ``k_slices`` pin that leaves a slice without a K step."""
+    """The slice rule fits its count to V's K steps on every row count, H and SM count, with the default geometry and
+    every architecture record's (the unfitted rule picks 3 slices over V = 256's four K steps on 148 and 152 SMs at
+    T = 1000, H = 6144), and both planners reject an explicit ``k_slices`` pin that leaves a slice without a K step."""
     g = Geometry.from_record(None)
-    for sms in (132, 148, 160):
-        for H in (256, 512, 1024, 2048, 4096, 6144, 7168, 8192):
-            for rows in range(1, 8193, 127):
-                raw = recommended_k_slices(rows, H, sms, 4, g)
-                for V in (256, 512, 768, 1024, 154880):
-                    got = recommended_k_slices(rows, H, sms, 4, g, vocab=V)
-                    assert got == cake_backend.dx_slices_fit(raw, V // g.k_block)
-                    assert got == raw or (V == 256 and raw == 3 and got == 2)
-    assert recommended_k_slices(1000, 6144, 148, 4, g) == 3
-    assert recommended_k_slices(1000, 6144, 148, 4, g, vocab=256) == 2
+    geometries = [g] + [Geometry.from_record(r) for r in cake_jit.MODULES.values()]
+    assert len(geometries) >= 3
+    for geo in geometries:
+        for sms in (132, 148, 152, 160):
+            resident = cake_backend.cluster_resident(None, geo.dx_cluster_ctas, sms)
+            for H in (256, 512, 1024, 2048, 4096, 6144, 7168, 8192):
+                for rows in range(1, 8193, 127):
+                    raw = recommended_k_slices(rows, H, sms, 4, geo, resident)
+                    for V in (256, 512, 768, 1024, 154880):
+                        got = recommended_k_slices(
+                            rows, H, sms, 4, geo, resident, vocab=V
+                        )
+                        assert got == cake_backend.dx_slices_fit(raw, V // geo.k_block)
+                        assert got == raw or (V == 256 and raw == 3 and got == 2)
+    for sms in (148, 152):
+        assert recommended_k_slices(1000, 6144, sms, 4, g) == 3
+        assert recommended_k_slices(1000, 6144, sms, 4, g, vocab=256) == 2
     kw = dict(
         need_dx=True,
         need_dw=True,
@@ -6657,14 +6664,21 @@ def test_device_logprob_entry(glm_weight):
     assert torch.all(result["dX"][~inp.valid] == 0)
 
 
-@pytest.mark.parametrize("T,H", [(1000, 6144), (1000, 2048), (4096, 6144)])
+# the default plan's dX slice counts per chunk (chunk size 4096) where the unfitted rule empties a slice on the
+# 148- and 152-SM devices: 3 slices at T = 1000, H = 6144 and [4, 3] for the 4097-row plan's 1-row tail chunk
+_VOCAB_256_DEFAULT_DX_SLICES = {(1000, 6144): (2,), (4097, 6144): (4, 2)}
+
+
+@pytest.mark.parametrize(
+    "T,H", [(1000, 6144), (1000, 2048), (4096, 6144), (4097, 6144)]
+)
 @pytest.mark.parametrize(
     "objective,entry", [("ce", "loss"), ("policy", "loss"), ("ce", "logprob")]
 )
 def test_device_vocab_256_dx_slices(objective, entry, T, H):
-    """V = 256 has four K steps: the dX GEMM's slice rule (3 slices at T = 1000, H = 6144 on 148 SMs before the fit)
-    runs a fitted count, every pinned count whose slices all hold a K step matches the references, and a pin of 3
-    slices is rejected."""
+    """V = 256 has four K steps: the dX GEMM's slice rule (3 slices at T = 1000, H = 6144 and on the 1-row tail chunk
+    of T = 4097 on 148 and 152 SMs before the fit) runs a fitted count, every pinned count whose slices all hold a K
+    step matches the references, and a pin of 3 slices is rejected."""
     _require_program(entry=entry)
     W = make_inputs(1, seed=SEED, H=H, V=256, device=CUDA, ignore_frac=0.0).W
     inp = make_inputs(
@@ -6675,6 +6689,24 @@ def test_device_vocab_256_dx_slices(objective, entry, T, H):
         result = _run(inp, 4096, entry=entry, backend="cake", gemm_tuning=tuning)
         _check_dtypes(result, inp)
         _check_against_references(result, inp, entry=entry)
+    kw = dict(objective=inp.objective, chunk_size=4096, entry=entry)
+    if entry == "loss":
+        kw.update(
+            loss_div=inp.loss_div if inp.objective == "ce" else None,
+            infer_logp=inp.infer_logp,
+            loss_weights=inp.loss_weights,
+        )
+    plan = prepare_lm_head_det_loss(inp.X, inp.W, inp.labels, **kw).plan
+    sms = torch.cuda.get_device_properties(CUDA).multi_processor_count
+    if (T, H) in _VOCAB_256_DEFAULT_DX_SLICES and sms in (148, 152):
+        assert plan.dx_slices == _VOCAB_256_DEFAULT_DX_SLICES[(T, H)], (
+            sms,
+            plan.dx_slices,
+        )
+    # on every device each chunk's slices of ceil(4 / S) steps all hold one of V = 256's four K steps
+    assert all(s == 1 or (s - 1) * -(-4 // s) < 4 for s in plan.dx_slices), (
+        plan.dx_slices
+    )
     with pytest.raises(ValueError, match="K steps"):
         _run(
             inp, 4096, entry=entry, backend="cake", gemm_tuning={"dx": {"k_slices": 3}}
