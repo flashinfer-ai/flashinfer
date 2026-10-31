@@ -467,17 +467,170 @@ def test_k2_routes(monkeypatch):
     assert len(gemm.calls) == 1 and len(atomic.calls) == 4
 
 
-def test_the_split_paths_need_registered_programs():
-    """While this checkout registers no program of the non-deterministic schedule, its paths refuse instead of
-    running anything else."""
-    if cake_jit.MODULES:
-        pytest.skip("this checkout registers non-deterministic programs")
-    A, B, out = _k1_views("nn")
-    with pytest.raises(NotImplementedError, match="not registered"):
-        cake_backend.dense_projection_gemm(A, B, out, deterministic=False)
-    X, W = torch.zeros(64, 32), torch.zeros(16, 32)
-    with pytest.raises(NotImplementedError, match="not registered"):
-        cake_backend.router_forward(X, W, deterministic=False)
+def _register(monkeypatch, arch: str, *templates: str) -> None:
+    """Pretend this checkout registers ``templates`` on ``arch`` (CPU planner tests: nothing is loaded)."""
+    table = dict(cake_jit.KERNELS.get(arch, {}))
+    for template in templates:
+        table[template] = "cake_dense_projection_gemm_" + "0" * 20
+    monkeypatch.setitem(cake_jit.KERNELS, arch, table)
+
+
+def test_k1_planner_plans_the_split_k_weight_gradient(monkeypatch):
+    """The thin weight gradient ``out[32, 4096] = G.T @ X`` in its swapped orientation: one 256-row pair tile per
+    256 input features, a 64-column tile, ``p`` filling the CTA pairs; the descriptor views are ``[L, K, M]`` /
+    ``[L, K, N]``; an explicit split count (the control ``p = 1`` included) is honoured; an unregistered template
+    keeps the row on the deterministic program."""
+    arch, T, N, K = "sm_103a", 16231, 32, 4096
+    G, X = (
+        torch.zeros(T, N, dtype=torch.bfloat16),
+        torch.zeros(T, K, dtype=torch.bfloat16),
+    )
+    out = torch.zeros(N, K, dtype=torch.bfloat16)
+    kw = dict(transposed_out=True, arch=arch, sm_count=152)
+    monkeypatch.setitem(cake_jit.KERNELS, arch, {})  # whatever this checkout registers
+    plan, *_, reason = cake_backend.plan_atomic_gemm(X.t(), G, out, **kw)
+    assert plan is None and "not registered" in reason
+    _register(monkeypatch, arch, "dense_proj_gemm_atomic_nn_n64_t")
+    plan, a_desc, b_desc, out3, reason = cake_backend.plan_atomic_gemm(
+        X.t(), G, out, **kw
+    )
+    assert isinstance(plan, cake_backend.AtomicGemmPlan) and reason == ""
+    assert (plan.L, plan.M, plan.N, plan.K, plan.block_n) == (1, K, N, T, 64)
+    assert (plan.m_tiles, plan.n_tiles, plan.splits) == (
+        16,
+        1,
+        4,
+    )  # 76 pairs // 16 tiles
+    assert (
+        plan.grid == (2 * 64, 1, 1)
+        and plan.template == "dense_proj_gemm_atomic_nn_n64_t"
+    )
+    assert plan.ws_f32_elems == 16 * 256 * 64 and plan.counters_u32 == 16 * 8
+    assert tuple(a_desc.shape) == (1, T, K) and a_desc.stride(-1) == 1
+    assert tuple(b_desc.shape) == (1, T, N) and b_desc.stride(-1) == 1
+    assert tuple(out3.shape) == (1, N, K)
+    for p in (1, 3, 254):
+        assert (
+            cake_backend.plan_atomic_gemm(X.t(), G, out, splits=p, **kw)[0].splits == p
+        )
+    with pytest.raises(ValueError, match="splits must be in"):
+        cake_backend.plan_atomic_gemm(X.t(), G, out, splits=255, **kw)
+    monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, (arch, False, True, 1, K, N), 1)
+    plan, *_, reason = cake_backend.plan_atomic_gemm(X.t(), G, out, **kw)
+    assert plan is None and "p = 1" in reason
+
+
+def test_k1_planner_keeps_rows_it_cannot_serve_on_the_deterministic_program(
+    monkeypatch,
+):
+    arch, T = "sm_100a", 1000
+    _register(
+        monkeypatch,
+        arch,
+        *(cake_backend.atomic_k1_template(bn, False, False) for bn in (64, 128, 256)),
+    )
+    kw = dict(transposed_out=False, arch=arch, sm_count=148)
+
+    def reason(A, B, out):
+        plan, *_, why = cake_backend.plan_atomic_gemm(A, B, out, **kw)
+        assert plan is None
+        return why
+
+    G = torch.zeros(T, 64, dtype=torch.bfloat16)
+    X = torch.zeros(T, 512, dtype=torch.bfloat16)
+    out = torch.zeros(64, 512, dtype=torch.bfloat16)
+    assert cake_backend.plan_atomic_gemm(G.t(), X, out, **kw)[0] is not None
+    assert "K-major" in reason(torch.zeros(64, T, dtype=torch.bfloat16), X, out)
+    assert "bf16" in reason(G.t().float(), X, out)
+    odd = torch.zeros(T, 64, dtype=torch.bfloat16)[:, :60]
+    assert "M or N not a multiple of 8" in reason(
+        odd.t(), X, torch.zeros(60, 512, dtype=torch.bfloat16)
+    )
+    unaligned = torch.zeros(T, 60, dtype=torch.bfloat16)
+    assert "multiples of 8" in reason(
+        unaligned.t(), X, torch.zeros(60, 512, dtype=torch.bfloat16)
+    )
+    shifted = torch.zeros(64 * 512 + 4, dtype=torch.bfloat16)[4:].view(64, 512)
+    assert "output view" in reason(G.t(), X, shifted)
+    with pytest.raises(ValueError, match="out must be"):
+        cake_backend.plan_atomic_gemm(G.t(), X, out.t(), **kw)
+    assert [cake_backend.k1_block_n(n) for n in (32, 48, 64, 128, 576, 1024, 4096)] == [
+        64,
+        64,
+        64,
+        128,
+        64,
+        256,
+        256,
+    ]
+
+
+def test_k2_planner_plans_the_reduce_add_router(monkeypatch):
+    arch, T, K, N = "sm_100a", 4099, 6144, 256
+    X, W, G = torch.zeros(T, K), torch.zeros(N, K), torch.zeros(T, N)
+    fwd = (X, W.t(), torch.zeros(T, N))
+    wgrad = (G.t(), X, torch.zeros(N, K))
+    kw = dict(arch=arch, sm_count=152)
+    monkeypatch.setitem(cake_jit.KERNELS, arch, {})  # whatever this checkout registers
+    plan, reason = cake_backend.plan_atomic_router(*fwd, splits=2, **kw)
+    assert plan is None and "not registered" in reason
+    _register(
+        monkeypatch, arch, "router_fp32_gemm_atomic_kk", "router_fp32_gemm_atomic_nn_t"
+    )
+    plan, reason = cake_backend.plan_atomic_router(*fwd, **kw)
+    assert plan is None and "S = 1" in reason  # the forward's model keeps one split
+    plan, _ = cake_backend.plan_atomic_router(*fwd, splits=2, **kw)
+    assert (plan.layout, plan.template, plan.splits, plan.swapped) == (
+        "kk",
+        "router_fp32_gemm_atomic_kk",
+        2,
+        False,
+    )
+    assert (plan.m_tiles, plan.n_tiles, plan.k_blocks, plan.k_iters_split) == (
+        34,
+        2,
+        192,
+        96,
+    )
+    assert plan.grid == (2 * 2 * 17 * 2, 1, 1)
+    assert cake_backend.plan_atomic_router(*fwd, splits=1, **kw)[0].splits == 1
+    with pytest.raises(ValueError, match="at most 2"):
+        cake_backend.plan_atomic_router(*fwd, splits=3, **kw)
+    plan, _ = cake_backend.plan_atomic_router(*wgrad, **kw)
+    assert (plan.layout, plan.template, plan.swapped, plan.transposed_out) == (
+        "nn_t",
+        "router_fp32_gemm_atomic_nn_t",
+        True,
+        True,
+    )
+    assert (plan.M, plan.N, plan.K) == (K, N, T) and plan.splits > 1
+    dgrad = (G, W, torch.zeros(T, K))
+    assert cake_backend.plan_atomic_router(*dgrad, **kw) == (
+        None,
+        "the input gradient (kn) has one split",
+    )
+    # this package's program stores through an ``out`` 4 bytes past a 16-byte boundary
+    shifted = torch.zeros(T * N + 1)[1:].view(T, N)
+    assert (
+        cake_backend.plan_atomic_router(X, W.t(), shifted, splits=2, **kw)[0]
+        is not None
+    )
+
+
+def test_router_split_model_is_the_wave_model():
+    """The provisional split model (until the measured per-architecture table): the forward keeps one split; the
+    weight gradient minimises waves x (K blocks per unit + overhead)."""
+    kw = dict(arch="sm_100a", N=256, K=16231, sm_count=152)
+    got = [
+        cake_backend._router_split_model("nn_t", M=H, **kw) for H in (4096, 5120, 6144)
+    ]
+    assert got == [7, 7, 3]
+    assert (
+        cake_backend._router_split_model(
+            "kk", M=16231, N=256, K=6144, arch="sm_100a", sm_count=152
+        )
+        == 1
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +774,8 @@ def test_no_det_token_in_generated_names_and_no_non_det_token_anywhere():
     manifest = root / "build.json"
     if manifest.exists():
         document = json.loads(manifest.read_text())
-        assert document["package"] == package.__name__
+        # the in-tree import path: a vendored copy keeps its manifest
+        assert document["package"] == "flashinfer.experimental.dense_projection_gemm"
         for entry in document["libraries"]:
             assert not DET_TOKEN.search(entry["name"])
             assert all(
@@ -716,14 +870,6 @@ def _det_device_or_skip() -> torch.device:
     return torch.device("cuda")
 
 
-def _atomic_device_or_skip() -> tuple[torch.device, str]:
-    device = _det_device_or_skip()
-    arch = det_backend.arch_for(device)
-    if not cake_jit.KERNELS.get(arch):
-        pytest.skip(f"this checkout registers no non-deterministic program for {arch}")
-    return device, arch
-
-
 def _bf16(shape, device, generator, scale=1.0):
     return (torch.randn(shape, device=device, generator=generator) * scale).to(
         torch.bfloat16
@@ -768,60 +914,450 @@ def _rel_fro(out: torch.Tensor, ref: torch.Tensor) -> float:
     return float((out.double() - ref).norm() / ref.norm())
 
 
-def test_gpu_router_non_deterministic_accuracy_and_reproducible_forward():
-    """The router's forward (at most two splits) is bitwise reproducible over reruns and keeps the top-k of the
-    deterministic forward; forward and weight gradient meet the FP32-class budget against FP64 on every rerun."""
-    device, _ = _atomic_device_or_skip()
-    g = torch.Generator(device=device).manual_seed(SEED)
-    T, K, N = 4099, 6144, 256
-    X = torch.randn(T, K, device=device, generator=g)
-    W = torch.randn(N, K, device=device, generator=g) * 0.02
-    G = torch.randn(T, N, device=device, generator=g)
-    ref_fwd = X.double() @ W.double().t()
-    ref_wgrad = G.double().t() @ X.double()
-    first = cake_backend.router_forward(X, W, deterministic=False)
-    det_fwd = cake_backend.router_forward(X, W)
-    assert torch.equal(first.topk(8, dim=1).indices, det_fwd.topk(8, dim=1).indices)
-    worst_fwd = worst_wgrad = 0.0
-    for _ in range(RERUNS):
-        out = cake_backend.router_forward(X, W, deterministic=False)
-        assert torch.equal(out, first)
-        worst_fwd = max(worst_fwd, _rel_fro(out, ref_fwd))
-        worst_wgrad = max(
-            worst_wgrad,
-            _rel_fro(cake_backend.router_wgrad(G, X, deterministic=False), ref_wgrad),
+# ---------------------------------------------------------------------------
+# GPU: the non-deterministic programs.  Every test binds to the programs this checkout registers for the device
+# (the planner's choice, or an explicit split count) and skips a row whose template is not registered.
+# ---------------------------------------------------------------------------
+
+# K1 weight-gradient rows ``out[N, K] = G[T, N].T @ X[T, K]``: label -> (N, K); the thin rows of the GLM-5.2 table
+# (indexer heads, the 8192 -> 128 row, the kv_a projection) and a wide row.
+K1_ROWS = {
+    "indexer_hw": (32, 6144),
+    "thin_48": (48, 5120),
+    "indexer_k": (128, 6144),
+    "kv_a": (576, 6144),
+    "wide_512": (512, 4096),
+}
+K1_RAGGED_T = (16231, 129, 4097, 16172, 777)
+ROUTER_T = 4099
+
+
+def _k1_wgrad_inputs(row, T, out_dtype, device, seed):
+    N, K = K1_ROWS[row]
+    g = torch.Generator(device=device).manual_seed(seed)
+    G, X = _bf16((T, N), device, g), _bf16((T, K), device, g)
+    out = torch.full((N, K), float("nan"), device=device, dtype=out_dtype)
+    return G, X, out
+
+
+def _k1_wgrad_args(G, X, out):
+    """The deterministic package's orientation of the weight gradient: ``(A, B, transposed_out)``."""
+    return det_backend.wgrad_views(
+        G, X, arch=det_backend.arch_for(out.device), out_f32=out.dtype == torch.float32
+    )
+
+
+def _k1_plan_or_skip(A, B, out, transposed, **knobs):
+    facts = det_backend.device_facts(out.device)
+    plan = cake_backend.plan_dense_projection_gemm(
+        A,
+        B,
+        out,
+        transposed_out=transposed,
+        sm_count=facts.sm_count,
+        l2_bytes=facts.l2_bytes,
+        deterministic=False,
+        **knobs,
+    )
+    if not isinstance(plan, cake_backend.AtomicGemmPlan):
+        pytest.skip(
+            f"this row runs the deterministic program on {det_backend.arch_for(out.device)}"
         )
-    assert worst_fwd <= ROUTER_REL_FRO_MAX and worst_wgrad <= ROUTER_REL_FRO_MAX
+    return plan
+
+
+def _k1_check(out, ref, what=""):
+    """The deterministic package's K1 budgets against FP64."""
+    assert bool(torch.isfinite(out).all()), what
+    if out.dtype == torch.bfloat16:
+        bad = (out.double() - ref).abs() > BF16_ATOL + BF16_RTOL * ref.abs()
+        assert int(bad.sum()) == 0, (what, int(bad.sum()))
+    else:
+        assert _rel_fro(out, ref) <= F32_REL_FRO_MAX, (what, _rel_fro(out, ref))
+        assert float(
+            (out.double() - ref).abs().max()
+        ) <= F32_MAX_ABS_OVER_REF_ABSMAX * float(ref.abs().max()), what
+
+
+def _arenas_zero():
+    for arena in cake_backend._ATOMIC_ARENAS.values():
+        for kind in ("k1_acc", "k1_tickets"):
+            buf = arena.buffers.get(kind)
+            if (
+                buf is not None
+                and buf.to(torch.int64 if kind == "k1_tickets" else torch.float32).any()
+            ):
+                return False
+    return True
 
 
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("T", [16231, 4097, 129])
-def test_gpu_weight_gradient_non_deterministic_accuracy(T, out_dtype):
-    """The split-K weight gradient meets the deterministic budgets against FP64 on every one of the reruns, with a
-    poisoned reused output, and leaves its workspace zero."""
-    device, _ = _atomic_device_or_skip()
-    g = torch.Generator(device=device).manual_seed(SEED + T)
-    K, N = 4096, 128
-    G, X = _bf16((T, N), device, g), _bf16((T, K), device, g)
+@pytest.mark.parametrize("row", sorted(K1_ROWS))
+def test_gpu_k1_non_deterministic_budgets_over_reruns(row, out_dtype):
+    """The split-K weight gradient (planner's split count) meets the deterministic budgets against FP64 on every
+    one of ``RERUNS`` prepared launches and convenience calls, each into a NaN-poisoned ``out``; its distance to
+    the deterministic result stays within the same budget; the workspace is zero after every launch."""
+    device = _det_device_or_skip()
+    G, X, out = _k1_wgrad_inputs(row, 16231, out_dtype, device, SEED)
+    A, B, transposed = _k1_wgrad_args(G, X, out)
+    _k1_plan_or_skip(A, B, out, transposed)
     ref = G.double().t() @ X.double()
-    out = torch.full((N, K), float("nan"), device=device, dtype=out_dtype)
-    for _ in range(RERUNS):
+    det_out = cake_backend.projection_wgrad(G, X, torch.empty_like(out))
+    prepared = cake_backend.prepare_projection_wgrad(G, X, out, deterministic=False)
+    assert isinstance(prepared, cake_backend.PreparedAtomicGemm) and prepared.splits > 1
+    for i in range(RERUNS):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        _k1_check(out, ref, f"prepared rerun {i}")
+        _k1_check(out, det_out.double(), f"vs det rerun {i}")
+        assert prepared.workspace_is_zero(), i
         out.fill_(float("nan"))
         cake_backend.projection_wgrad(G, X, out, deterministic=False)
-        if out_dtype == torch.bfloat16:
-            bad = (out.double() - ref).abs() > BF16_ATOL + BF16_RTOL * ref.abs()
-            assert not bad.any()
-        else:
-            assert _rel_fro(out, ref) <= F32_REL_FRO_MAX
-            assert float(
-                (out.double() - ref).abs().max()
-            ) <= F32_MAX_ABS_OVER_REF_ABSMAX * float(ref.abs().max())
+        torch.cuda.synchronize()
+        _k1_check(out, ref, f"convenience rerun {i}")
+    assert _arenas_zero()
+
+
+@pytest.mark.parametrize("splits", [1, 2, 3, 8])
+def test_gpu_k1_explicit_split_counts(splits):
+    """Every explicit split count (``1``: this package's program storing whole tiles, the control of the
+    reduction) gives the budgeted result and leaves the workspace zero."""
+    device = _det_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_k", 16231, torch.bfloat16, device, SEED + 1)
+    A, B, transposed = _k1_wgrad_args(G, X, out)
+    _k1_plan_or_skip(A, B, out, transposed, splits=splits)
+    prepared = cake_backend.prepare_dense_projection_gemm(
+        A, B, out, transposed_out=transposed, deterministic=False, splits=splits
+    )
+    assert (
+        isinstance(prepared, cake_backend.PreparedAtomicGemm)
+        and prepared.splits == splits
+    )
+    prepared.launch()
     torch.cuda.synchronize()
-    for arena in cake_backend._ATOMIC_ARENAS.values():
-        for kind in ("k1_acc", "k1_tickets"):
-            if kind in arena.buffers:
-                assert (
-                    not arena.buffers[kind]
-                    .to(torch.int64 if kind == "k1_tickets" else torch.float32)
-                    .any()
-                )
+    _k1_check(out, G.double().t() @ X.double())
+    assert prepared.workspace_is_zero()
+
+
+def test_gpu_k1_batched_mla_head_views():
+    """The batched MLA weight gradient (64 heads, strided head views of ``[T, H, slot]`` activations): this
+    package's split-K program at an explicit split count (one workspace slab per head tile), then the generic
+    entry point with the planner's choice."""
+    device = _det_device_or_skip()
+    g = torch.Generator(device=device).manual_seed(SEED + 2)
+    T, H, slot, D_in, D_out = 2048, 64, 256, 192, 512
+    act = _bf16((T, H, slot), device, g)[..., :D_in]
+    d_out = _bf16((T, H, D_out), device, g)
+    A, B = (
+        act.permute(1, 2, 0),
+        d_out.permute(1, 0, 2),
+    )  # [H, D_in, T] (unit stride on m), [H, T, D_out]
+    out = torch.full(
+        (H, D_in, D_out), float("nan"), device=device, dtype=torch.bfloat16
+    )
+    _k1_plan_or_skip(A, B, out, False, splits=2)
+    ref = A.double() @ B.double()
+    prepared = cake_backend.prepare_dense_projection_gemm(
+        A, B, out, deterministic=False, splits=2
+    )
+    assert isinstance(prepared, cake_backend.PreparedAtomicGemm)
+    assert (prepared.plan.L, prepared.splits) == (H, 2)
+    for _ in range(3):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        _k1_check(out, ref)
+        assert prepared.workspace_is_zero()
+        out.fill_(float("nan"))
+        cake_backend.dense_projection_gemm(A, B, out, deterministic=False)
+        torch.cuda.synchronize()
+        _k1_check(out, ref)
+    assert _arenas_zero()
+
+
+def test_gpu_k1_ragged_token_counts_reuse_the_poisoned_workspace():
+    """Changing ``T`` up and down on one stream: the convenience path reuses its arena (grown, never shrunk) and
+    every output -- poisoned with NaN before each call -- meets the budget; the zero invariant holds throughout."""
+    device = _det_device_or_skip()
+    cake_backend.clear_convenience_caches()
+    for i, T in enumerate(K1_RAGGED_T):
+        G, X, out = _k1_wgrad_inputs(
+            "thin_48", T, torch.bfloat16, device, SEED + 10 + i
+        )
+        if i == 0:
+            A, B, transposed = _k1_wgrad_args(G, X, out)
+            _k1_plan_or_skip(A, B, out, transposed)
+        cake_backend.projection_wgrad(G, X, out, deterministic=False)
+        torch.cuda.synchronize()
+        _k1_check(out, G.double().t() @ X.double(), f"T={T}")
+        assert _arenas_zero(), T
+    assert len(cake_backend._ATOMIC_ARENAS) == 1
+    (arena,) = cake_backend._ATOMIC_ARENAS.values()
+    assert arena.version >= 2  # created, then grown or reused; never shrunk
+
+
+def _router_inputs(T, device, seed):
+    g = torch.Generator(device=device).manual_seed(seed)
+    K, N = 6144, 256
+    X = torch.randn(T, K, device=device, generator=g)
+    W = torch.randn(N, K, device=device, generator=g) * 0.02
+    G = torch.randn(T, N, device=device, generator=g) * 1e-3
+    return X, W, G
+
+
+def _router_case(op, X, W, G):
+    """``(A, B, out)`` of the router GEMM of ``op`` (``fwd``: ``X @ W.T``, ``wgrad``: ``G.T @ X``)."""
+    if op == "fwd":
+        return (
+            X,
+            W.t(),
+            torch.full((X.shape[0], W.shape[0]), float("nan"), device=X.device),
+        )
+    return G.t(), X, torch.full((G.shape[1], X.shape[1]), float("nan"), device=X.device)
+
+
+def _router_prepare_or_skip(A, B, out, splits):
+    plan = cake_backend.plan_router_fp32_gemm(
+        A, B, out, splits=splits, deterministic=False
+    )
+    if not isinstance(plan, cake_backend.AtomicRouterPlan):
+        pytest.skip(
+            f"the router layout runs the deterministic program on {det_backend.arch_for(out.device)}"
+        )
+    prepared = cake_backend.prepare_router_fp32_gemm(
+        A, B, out, splits=splits, deterministic=False
+    )
+    assert isinstance(prepared, cake_backend.PreparedAtomicRouterGemm)
+    return prepared
+
+
+@pytest.mark.parametrize(
+    "op, splits",
+    [
+        ("fwd", 1),
+        ("fwd", 2),
+        ("wgrad", 1),
+        ("wgrad", None),
+        ("wgrad", 4),
+        ("wgrad", 11),
+    ],
+)
+def test_gpu_router_d11_gate(op, splits):
+    """The router's accuracy gate, the deterministic package's shipped budget: ``rel_fro <= 2e-6`` against FP64 of
+    the exact fp32 operands, finite, worst over ``RERUNS`` launches into a NaN-poisoned ``out``; the forward's top-8
+    agrees with FP64 on every row and repeats bit for bit.  Against the deterministic program at the same split
+    count: one split and two splits give its bits (``0 + a + b == 0 + b + a``); more splits stay within the
+    reorder bound ``2 (S - 1) 2^-24 sum_k |A| |B|``."""
+    device = _det_device_or_skip()
+    X, W, G = _router_inputs(ROUTER_T, device, SEED + 20)
+    A, B, out = _router_case(op, X, W, G)
+    prepared = _router_prepare_or_skip(A, B, out, splits)
+    S = prepared.splits
+    ref = A.double() @ B.double()
+    det_out = torch.empty_like(out)
+    cake_backend.router_fp32_gemm(
+        A, B, det_out, splits=S
+    )  # the deterministic program at the same split count
+    bound = 2 * (S - 1) * 2.0**-24 * (A.double().abs() @ B.double().abs())
+    first, worst = None, 0.0
+    for i in range(RERUNS):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(out).all()), i
+        worst = max(worst, _rel_fro(out, ref))
+        if S <= 2:
+            assert torch.equal(out, det_out), (i, S)
+        else:
+            assert bool(((out.double() - det_out.double()).abs() <= bound).all()), (
+                i,
+                S,
+            )
+        if op == "fwd":
+            if first is None:
+                first = out.clone()
+                ref_top = torch.topk(ref, 8, dim=1).indices.sort(dim=1).values
+                top = torch.topk(out.double(), 8, dim=1).indices.sort(dim=1).values
+                assert int((top != ref_top).any(dim=1).sum()) == 0
+            assert torch.equal(out, first), i
+    assert worst <= ROUTER_REL_FRO_MAX, worst
+
+
+def test_gpu_router_entry_points_reach_the_reduce_add_program():
+    """``router_forward`` / ``router_wgrad`` with ``deterministic=False``: the forward stays reproducible and its
+    top-8 is the deterministic forward's; both meet the gate."""
+    device = _det_device_or_skip()
+    X, W, G = _router_inputs(ROUTER_T, device, SEED + 21)
+    _router_prepare_or_skip(
+        G.t(), X, torch.empty(G.shape[1], X.shape[1], device=device), None
+    )
+    first = cake_backend.router_forward(X, W, deterministic=False, splits=2)
+    det_fwd = cake_backend.router_forward(X, W)
+    assert torch.equal(
+        first.topk(8, dim=1).indices.sort(dim=1).values,
+        det_fwd.topk(8, dim=1).indices.sort(dim=1).values,
+    )
+    ref_fwd, ref_wgrad = X.double() @ W.double().t(), G.double().t() @ X.double()
+    for _ in range(RERUNS):
+        out = cake_backend.router_forward(X, W, deterministic=False, splits=2)
+        assert torch.equal(out, first) and _rel_fro(out, ref_fwd) <= ROUTER_REL_FRO_MAX
+        wgrad = cake_backend.router_wgrad(G, X, deterministic=False)
+        assert _rel_fro(wgrad, ref_wgrad) <= ROUTER_REL_FRO_MAX
+
+
+def _profile_kernel_names(fn):
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    return [e.name for e in prof.events() if str(e.device_type).endswith("CUDA")]
+
+
+def _det_kernel(name: str) -> bool:
+    """A kernel of the deterministic package: its programs' symbols and its template bodies' namespace."""
+    return "dense_projection_det_gemm" in name
+
+
+def test_gpu_non_deterministic_mode_launches_this_packages_programs():
+    """Kernel-name evidence: ``deterministic=False`` launches this package's ``kernel_cake_dense_projection_gemm_*``
+    programs (none of the deterministic package's K1 / K2 programs for the reduced operation), the default only
+    the deterministic package's."""
+    device = _det_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_k", 16231, torch.bfloat16, device, SEED + 30)
+    A, B, transposed = _k1_wgrad_args(G, X, out)
+    plan = _k1_plan_or_skip(A, B, out, transposed)
+    ours = cake_jit.MODULES[
+        cake_jit.select_module(det_backend.arch_for(device), plan.template)
+    ]["kernel"]
+    nondet = _profile_kernel_names(
+        lambda: cake_backend.projection_wgrad(G, X, out, deterministic=False)
+    )
+    assert any(ours in name for name in nondet), nondet
+    assert not any(_det_kernel(name) for name in nondet), nondet
+    det = _profile_kernel_names(lambda: cake_backend.projection_wgrad(G, X, out))
+    assert any(_det_kernel(name) for name in det), det
+    assert not any("kernel_cake_dense_projection_gemm_" in name for name in det), det
+    Xf, Wf, Gf = _router_inputs(1001, device, SEED + 31)
+    A2, B2, out2 = _router_case("wgrad", Xf, Wf, Gf)
+    prepared = _router_prepare_or_skip(A2, B2, out2, 4)
+    names = _profile_kernel_names(prepared.launch)
+    assert any(
+        cake_jit.MODULES[prepared.module_name]["kernel"] in name for name in names
+    ), names
+
+
+def test_gpu_torch_deterministic_mode_rule(torch_determinism):
+    """Under ``torch.use_deterministic_algorithms(True)`` an explicit ``deterministic=False`` raises before any
+    launch; with ``warn_only=True`` it warns and returns the deterministic bits."""
+    device = _det_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_hw", 4097, torch.bfloat16, device, SEED + 40)
+    expected = cake_backend.projection_wgrad(G, X, torch.empty_like(out))
+    torch.use_deterministic_algorithms(True)
+    with pytest.raises(RuntimeError, match="deterministic=True"):
+        cake_backend.projection_wgrad(G, X, out, deterministic=False)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    with pytest.warns(UserWarning, match="running the deterministic path"):
+        got = cake_backend.projection_wgrad(G, X, out, deterministic=False)
+    assert torch.equal(got, expected)
+
+
+def test_gpu_det_then_non_det_share_a_stream_not_a_workspace():
+    """A deterministic call and a non-deterministic call of one geometry on one stream: each package keeps its own
+    arena (the deterministic package's uninitialised slabs never reach this package's zero-invariant workspace)."""
+    device = _det_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_k", 16231, torch.bfloat16, device, SEED + 50)
+    A, B, transposed = _k1_wgrad_args(G, X, out)
+    _k1_plan_or_skip(A, B, out, transposed)
+    cake_backend.clear_convenience_caches()
+    ref = G.double().t() @ X.double()
+    for _ in range(3):
+        det = cake_backend.projection_wgrad(G, X, torch.empty_like(out))
+        nondet = cake_backend.projection_wgrad(G, X, out, deterministic=False)
+        torch.cuda.synchronize()
+        _k1_check(det, ref)
+        _k1_check(nondet, ref)
+    ours = {
+        id(b) for a in cake_backend._ATOMIC_ARENAS.values() for b in a.buffers.values()
+    }
+    theirs = {id(b) for a in det_backend._ARENAS.values() for b in a.buffers.values()}
+    assert ours and theirs and not ours & theirs
+    assert _arenas_zero()
+
+
+def test_gpu_concurrent_streams_keep_their_own_workspaces():
+    """Two streams issuing non-deterministic K1 and K2 calls of different geometries concurrently: one arena per
+    (device, stream), every result within budget, the zero invariant kept."""
+    device = _det_device_or_skip()
+    cake_backend.clear_convenience_caches()
+    streams = [torch.cuda.Stream(device) for _ in range(2)]
+    cases = []
+    for i, (row, T) in enumerate((("indexer_k", 16231), ("thin_48", 4097))):
+        G, X, out = _k1_wgrad_inputs(row, T, torch.bfloat16, device, SEED + 60 + i)
+        if i == 0:
+            A, B, transposed = _k1_wgrad_args(G, X, out)
+            _k1_plan_or_skip(A, B, out, transposed)
+        cases.append((G, X, out))
+    Xf, Wf, Gf = _router_inputs(ROUTER_T, device, SEED + 62)
+    router_outs = [
+        torch.empty(Gf.shape[1], Xf.shape[1], device=device) for _ in streams
+    ]
+    torch.cuda.synchronize()
+    for _ in range(5):
+        for stream, (G, X, out), rout in zip(streams, cases, router_outs, strict=True):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                cake_backend.projection_wgrad(G, X, out, deterministic=False)
+                cake_backend.router_wgrad(Gf, Xf, rout, deterministic=False)
+    torch.cuda.synchronize()
+    for G, X, out in cases:
+        _k1_check(out, G.double().t() @ X.double())
+    ref = Gf.double().t() @ Xf.double()
+    for rout in router_outs:
+        assert _rel_fro(rout, ref) <= ROUTER_REL_FRO_MAX
+    keys = {key[1] for key in cake_backend._ATOMIC_ARENAS}
+    assert {s.cuda_stream for s in streams} <= keys
+    assert _arenas_zero()
+
+
+def test_gpu_prepared_launches_allocate_nothing_and_capture_into_a_graph():
+    """The prepared K1 and K2 launches allocate nothing on the device, capture into one CUDA graph (K2: the split,
+    the memset of ``out`` and the kernel) and replay with fresh operand values copied in place: the replay equals
+    the eager launch's budgeted result, and the K1 workspace is zero after the replays."""
+    device = _det_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_k", 16231, torch.bfloat16, device, SEED + 70)
+    A, B, transposed = _k1_wgrad_args(G, X, out)
+    _k1_plan_or_skip(A, B, out, transposed)
+    k1 = cake_backend.prepare_projection_wgrad(G, X, out, deterministic=False)
+    Xf, Wf, Gf = _router_inputs(ROUTER_T, device, SEED + 71)
+    A2, B2, out2 = _router_case("wgrad", Xf, Wf, Gf)
+    k2 = _router_prepare_or_skip(A2, B2, out2, 4)
+    k1.launch(), k2.launch()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for _ in range(5):
+        k1.launch(), k2.launch()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side), torch.cuda.graph(graph, stream=side):
+        k1.launch()
+        k2.launch()
+    torch.cuda.current_stream().wait_stream(side)
+    g = torch.Generator(device=device).manual_seed(SEED + 72)
+    for _ in range(3):
+        G.copy_(_bf16(G.shape, device, g))
+        X.copy_(_bf16(X.shape, device, g))
+        Xf.copy_(torch.randn(Xf.shape, device=device, generator=g))
+        Gf.copy_(torch.randn(Gf.shape, device=device, generator=g) * 1e-3)
+        out.fill_(float("nan"))
+        out2.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _k1_check(out, G.double().t() @ X.double(), "graph replay")
+        assert _rel_fro(out2, A2.double() @ B2.double()) <= ROUTER_REL_FRO_MAX
+        assert k1.workspace_is_zero()
