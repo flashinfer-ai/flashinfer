@@ -235,8 +235,9 @@ jobs:
           fi
           echo "h100_disabled=$([ "$RUN_H100" = "true" ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
           # A targeted run on a lane never tests more than that lane's bare run: H100
-          # gets the request as-is (its bare run covers tests/); A10G and T4 get it
-          # intersected with their shard lists, and a lane left with nothing is skipped.
+          # and RTX PRO 6000 get the request as-is (their bare runs cover tests/); A10G
+          # and T4 get it intersected with their shard lists, and a lane left with
+          # nothing is skipped.
           # A10G is intersected per shard: each shard whose files overlap the request
           # runs as its own job, so a targeted run keeps the bare run's balancing and
           # -k splits, and shards left with nothing are not scheduled.
@@ -310,6 +311,19 @@ jobs:
                   timeout: 480
                 }'
               fi
+
+              # One RTX PRO 6000 (SM120) per g7e instance, so unlike H100 the runner
+              # owns the whole host. cu130 only: the SM120 pool's driver (595) cannot
+              # start cu134 images, and cu129 runs on the other GPU lanes.
+              jq -nc '{
+                name: "JIT Unittest (RTX PRO 6000)",
+                kind: "rtx-pro-6000",
+                gpu_name: "RTX PRO 6000",
+                runner: ["self-hosted", "linux", "x64", "gpu", "rtx-pro-6000", "on-demand"],
+                cuda: "cu130",
+                script: "task_run_unit_tests.sh",
+                timeout: 480
+              }'
             elif [ "$SKIP_GPU" != "true" ]; then
               # A `@flashinfer-bot run <paths>` comment retargets the GPU lanes at those
               # paths. There is deliberately no arch selection: tests carry their own
@@ -319,8 +333,9 @@ jobs:
               # brace group, which is piped into jq and so runs in a subshell.
               #
               # A10G runs its bare-run shard scripts, restricted to the scope through
-              # JIT_TEST_SCOPE (see scripts/jit_test_logging.sh). T4 and H100 use
-              # task_run_unit_tests.sh, the script that forwards "$@" into TEST_PATH.
+              # JIT_TEST_SCOPE (see scripts/jit_test_logging.sh). T4, H100 and RTX PRO
+              # 6000 use task_run_unit_tests.sh, the script that forwards "$@" into
+              # TEST_PATH.
               #
               # This step does NOT parse the PR body. Turning a declared scope into paths
               # happens once, in whoever issues the trigger (a reviewer, or the screening
@@ -363,6 +378,16 @@ jobs:
                   timeout: 480
                 }'
               fi
+              jq -nc --arg test_path "${REQUESTED_TEST_PATH}" '{
+                name: "Targeted Unittest (RTX PRO 6000)",
+                kind: "rtx-pro-6000",
+                gpu_name: "RTX PRO 6000",
+                runner: ["self-hosted", "linux", "x64", "gpu", "rtx-pro-6000", "on-demand"],
+                cuda: "cu130",
+                script: "task_run_unit_tests.sh",
+                test_path: $test_path,
+                timeout: 480
+              }'
             fi
           } | jq -sc '{include: .}' > matrix.json
 
@@ -615,8 +640,10 @@ jobs:
         if: ${{ always() && matrix.kind != 'aot' }}
         uses: actions/upload-artifact@v4
         with:
-          # Non-H100 names add the runner SM: A10G and T4 rows can run the same script.
-          name: junit-${{ matrix.kind == 'h100' && 'h100' || format('{0}-{1}', matrix.script, matrix.runner[4]) }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Single-lane kinds (h100, rtx-pro-6000) are named by kind, which the summary
+          # job downloads by. A10G and T4 rows can run the same script, so their
+          # names add the runner SM.
+          name: junit-${{ matrix.kind != 'gpu' && matrix.kind || format('{0}-{1}', matrix.script, matrix.runner[4]) }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             junit/**/*.xml
             junit/**/*.telemetry.json
@@ -806,6 +833,15 @@ jobs:
           merge-multiple: true
         continue-on-error: true
 
+      - name: Download RTX PRO 6000 JUnit artifacts
+        if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-rtx-pro-6000-*
+          path: junit-rtx-pro-6000
+          merge-multiple: true
+        continue-on-error: true
+
       - name: Download shard JUnit artifacts (A10G/T4)
         if: needs.gate.outputs.authorized == 'true' && needs.test.result != 'cancelled'
         uses: actions/download-artifact@v4
@@ -822,10 +858,13 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          # Lanes that write run-summary.json (task_run_unit_tests.sh), one per lane.
           SUMMARY_ARGS=""
-          if [ -f junit-h100/run-summary.json ]; then
-            SUMMARY_ARGS="--summary junit-h100/run-summary.json"
-          fi
+          for lane_dir in junit-h100 junit-rtx-pro-6000; do
+            if [ -f "${lane_dir}/run-summary.json" ]; then
+              SUMMARY_ARGS="${SUMMARY_ARGS} --summary ${lane_dir}/run-summary.json --junit-dir ${lane_dir}"
+            fi
+          done
 
           # A10G/T4 shard lanes produce raw JUnit XML (no run-summary.json).
           # Discover them from the merged download directory.
@@ -852,7 +891,6 @@ jobs:
             --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
             $SUMMARY_ARGS \
             $SHARD_ARGS \
-            --junit-dir junit-h100 \
             --github-actions 2>&1) || SKIP_ALL_EXIT=$?
           echo "$REPORT"
 
