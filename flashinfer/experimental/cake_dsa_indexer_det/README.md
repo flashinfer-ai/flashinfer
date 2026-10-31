@@ -164,8 +164,9 @@ mean key tiles per work unit, `(Tkv - T / (2 ratio)) / S / 128`.
 | decision | rule (record fields) |
 |---|---|
 | unit geometry | `block_q_wide` queries per unit first where the record sets `wide_first_rule`, the call is wide-eligible (at least `wide_rule[0]` wide rounds per CTA and `rounds x mean tiles >= wide_rule[1]`) and the mean unit tiles reach `wide_first_rule[0]`; else `block_q_l6` (three math warpgroups) when the mean unit tiles are at most `l6_rule[0]` and `top_k >= l6_rule[1]`; else `block_q_wide` when wide-eligible; else `block_q_narrow` |
-| key-range split | `n_split = clamp(grid // units, 1, min(mean tiles // split_min_range_tiles, split_max))`; on architectures with `split_wave_rule` a two-way split when the units are long and the unsplit call would idle `split_wave_rule[1]` of the CTAs in its ragged last round |
+| key-range split | `n_split = clamp(grid // units, 1, min(mean tiles // split_min_range_tiles, split_max))`; on architectures with `split_wave_rule` a two-way split when the units are long and the unsplit call would idle `split_wave_rule[1]` of the CTAs in its ragged last round; only for a unit geometry of `split_units` (the units whose split program the architecture registers): any other unit runs unsplit |
 | CTA pair | the two-CTA multicast program when the mean unit tiles lie in `pair_rule[0..1]`, `top_k >= pair_rule[2]`, the call is not split (grid made even) and the unit geometry is one of `pair_units` (the units whose pair program the architecture registers) |
+| unpaired three-warpgroup preference | where the record sets `l6_solo_rule` (sm_107a), a call whose plan does not split takes the `block_q_l6` unit without a CTA pair: always with the sampled first threshold off (`sample_tiles_max=0`), and on a sampled call with at least `l6_solo_rule[1]` segments or at most `l6_solo_rule[0]` mean unit tiles; only where the l6 unit would not split either and the program it picks is registered (`PROGRAM_KEYS[arch]`, which the backend passes to `select_program`; without it the preference stays off), else the plan of the rows above |
 | unit order | snake order when `snake_rule` names the program kind and the mean tiles / unit-cost spread reach its floors |
 | tile-loop unroll | `tile_unroll_factor` when `tile_unroll_rule` names the program kind and `top_k` reaches its floor (yielding to the snake order where the rule says so) |
 | sampled first threshold on buffer-fitting units | when the mean unit tiles are at most `sample_fit_max_mean_tiles`, the mean segment offset leaves fitting units and the program kind is one of `sample_fit_kinds` (the kinds whose sampled-fit program the architecture registers; the split programs, for example, run their plain form on every call) |
@@ -199,8 +200,11 @@ that writes the registry verifies the record against them before it is frozen.
   sized under the previous package for such a call must be re-sized (the
   runner rejects it with `workspace_buffer needs N bytes`), and
   `dsa_indexer_det_topk_workspace_size` follows the new plan automatically.  It is
-  sized for the sampled default; a call with `sample_tiles_max=0` (the
-  unsampled capacity values) needs at most as much.  On `sm_100a`, calls with
+  the larger of the sampled default's plan and the plan with the sampled first
+  threshold off (`sample_tiles_max=0`): on sm_107a the unpaired
+  three-warpgroup preference can give an unsampled call six queries per unit
+  where the sampled call keeps four, so a buffer sized by the bound serves both
+  modes.  On `sm_100a`, calls with
   `top_k` below `cand_cap_floor_rule[0]` (1024) take the 8192-slot floor: a
   `top_k = 512` call with six queries per unit (for example the ratio-4 pooled
   selection) needs 57 MiB (59768960 B) on 152 SMs, where the previous package
@@ -211,7 +215,8 @@ that writes the registry verifies the record against them before it is frozen.
 * **No host synchronization**: the segment boundaries and offsets are read on
   the device only; the host uses `T`, `Tkv`, `S`, `ratio`, `top_k`, the SM
   count and the strides.  The eager entry point allocates the outputs and the
-  workspace (unless supplied) through the caching allocator; the prepared
+  workspace (unless supplied) through the caching allocator and zeroes the
+  ticket tail of a supplied workspace once per call; the prepared
   runner (`cake_backend.prepare_dsa_indexer_det_topk`) allocates nothing at launch
   and is CUDA-graph capturable.
 * **Launch structure**: scan, optional merge, finalize (see above).  No

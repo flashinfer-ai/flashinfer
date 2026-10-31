@@ -594,6 +594,7 @@ def plan_dsa_indexer_det_topk(
         finalize_threads=finalize_threads,
         max_seqlen_k=max_seqlen_k,
         outputs_aligned=bool(outputs_aligned),
+        scan_keys=PROGRAM_KEYS.get(arch, {}),
     )
 
 
@@ -618,21 +619,29 @@ def dsa_indexer_det_workspace_size(
     ``T x n_split x top_k x entry_bytes`` when the dispatch splits the key
     ranges.  The dispatch, and with it the bound, depends on ``T``, ``Tkv``,
     ``S``, ``ratio`` and ``top_k``; prepare a call's buffer for its own geometry
-    (or for the largest bound over the geometries it will serve).
+    (or for the largest bound over the geometries it will serve).  The bound
+    covers both sampling modes: where the record's ``l6_solo_rule`` gives a
+    call with the sampled first threshold off (``sample_tiles_max=0``) another
+    unit geometry than the sampled default, the larger of the two plans.
     """
-    choice = plan_dsa_indexer_det_topk(
-        num_queries,
-        num_keys,
-        num_segments,
-        top_k=top_k,
-        ratio=ratio,
-        device=device,
-        arch=arch,
-        grid_ctas=grid_ctas,
-        num_sms=num_sms,
-        candidate_multiplier=candidate_multiplier,
+    return max(
+        int(
+            plan_dsa_indexer_det_topk(
+                num_queries,
+                num_keys,
+                num_segments,
+                top_k=top_k,
+                ratio=ratio,
+                device=device,
+                arch=arch,
+                grid_ctas=grid_ctas,
+                num_sms=num_sms,
+                candidate_multiplier=candidate_multiplier,
+                sample_tiles_max=sample_tiles_max,
+            ).workspace_bytes
+        )
+        for sample_tiles_max in (None, 0)
     )
-    return int(choice.workspace_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -774,8 +783,16 @@ class DSAIndexerDetRunner:
         return self.choice.top_k
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._run(fresh_tail=False)
+
+    def _run(self, *, fresh_tail: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        """``fresh_tail``: the caller knows the shared tail is still as ``prepare`` zeroed it (the eager entry runs a
+        runner it just prepared, on the same stream, with nothing launched in between), so the memset of a
+        caller-owned workspace is skipped; a dirty tail is restored either way."""
         with _ffi_stream_context(self.device_index):
-            if self.ticket_tail is not None and (self._tail_dirty or self._tail_shared):
+            if self.ticket_tail is not None and (
+                self._tail_dirty or (self._tail_shared and not fresh_tail)
+            ):
                 # caller-owned workspace: others may have written the tail since the last run;
                 # or a previous run raised while launching.  Restore the ticket word before the scan.
                 self.ticket_tail.zero_()
@@ -1068,7 +1085,10 @@ def dsa_indexer_det_topk(
     See :func:`prepare_dsa_indexer_det_topk` for the arguments.  The call allocates
     the outputs (unless given) and the workspace (unless given) through the
     caching allocator and performs no host synchronization, so it may be
-    captured into a CUDA graph like any allocation-free launch sequence.
+    captured into a CUDA graph like any allocation-free launch sequence.  With
+    a caller-owned ``workspace_buffer`` the ticket tail is zeroed once per
+    call: ``prepare`` zeroes it on the current stream, and the run that follows
+    on the same stream, with nothing launched in between, does not repeat it.
     """
     runner = prepare_dsa_indexer_det_topk(
         q,
@@ -1094,7 +1114,8 @@ def dsa_indexer_det_topk(
         finalize_threads=finalize_threads,
         backend=backend,
     )
-    return runner.run()
+    # prepare's last device action was the tail memset on this stream: the runner's per-run memset would repeat it
+    return runner._run(fresh_tail=True)
 
 
 __all__ = [
