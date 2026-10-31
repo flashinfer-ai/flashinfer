@@ -62,11 +62,10 @@ tables ``hist``, ``hist_row_off``, ``dpre_tail``, ``tail_row_off``,
 (the binding encodes the descriptors from the tensors at every launch); the
 scalars are :mod:`.cake_jit`'s.
 
-TODO-EXPORT: until the exporter renders this package, the record names are
-``cake_causal_conv1d_train_TODOEXPORT_<tag>_kcp`` placeholders (the copies of
+The program names are ``cake_causal_conv1d_train_<20 hex>_kcp``: the copies of
 the det forward and head programs take the det programs' identity digits under
 this package's prefix, the backward programs the identity digests of their own
-tart module) and nothing loads.
+tart module key.
 """
 
 from __future__ import annotations
@@ -102,8 +101,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # Route ``kcp_fwd``: this package's copy of the det program
     # ``cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp`` (the same build keywords and kernel under this
     # package's prefix; no cross-CTA reduction, so its outputs are bitwise the det program's).
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program.
     "cake_causal_conv1d_train_675940a7a4fc0dba4b53_kcp": {
         "arches": [
             "sm_100a",
@@ -174,9 +171,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``[n_ch_tiles]``); the tile's last CTA stores the rank-local FP32 ``dw`` and zeroes its accumulators and
     # counter, so ``acc`` / ``work`` are zero before and after every launch.  ``dx`` (with the folded
     # ``dpre_tail`` rows) is bitwise the det program's.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp": {
         "arches": [
             "sm_100a",
@@ -271,9 +265,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``[n_ch_tiles]``); the tile's last CTA stores the rank-local FP32 ``dw`` and zeroes its accumulators and
     # counter, so ``acc`` / ``work`` are zero before and after every launch.  ``dx`` (with the folded
     # ``dpre_tail`` rows) is bitwise the det program's.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp": {
         "arches": [
             "sm_107a",
@@ -362,9 +353,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``[n_ch_tiles]``); the tile's last CTA stores the rank-local FP32 ``dw`` and zeroes its accumulators and
     # counter, so ``acc`` / ``work`` are zero before and after every launch.  ``dx`` (with the folded
     # ``dpre_tail`` rows) is bitwise the det program's.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_584216799fed8caece3a_kcp": {
         "arches": [
             "sm_100a",
@@ -464,8 +452,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # Route ``kcp_bwd_head``: this package's copy of the det program
     # ``cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp`` (the same build keywords and kernel under this
     # package's prefix; no cross-CTA reduction, so its outputs are bitwise the det program's).
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program.
     "cake_causal_conv1d_train_17cd42fb05079bbbf840_kcp": {
         "arches": [
             "sm_100a",

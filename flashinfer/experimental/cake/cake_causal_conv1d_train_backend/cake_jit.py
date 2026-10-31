@@ -65,11 +65,6 @@ The program name of a forward copy is ``cake_causal_conv1d_train_<20 hex>``
 (the det program's identity digits under this package's prefix); the backward
 programs' names are the identity digests of their own tart module key (so no
 backward name equals a name the det package ships).
-TODO-EXPORT: until the exporter renders this package (``build.json``,
-``csrc/`` and the derived leaves of every record), the record names are
-``cake_causal_conv1d_train_TODOEXPORT_<tag>`` placeholders and the package is
-not loadable; every program-name, ``kernel_symbol``, ``launch`` and
-``arg_plan`` / ``logical`` leaf is rewritten by that render.
 """
 
 from __future__ import annotations
@@ -92,8 +87,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # chunk_stages=1, pair_math=True``; the same kernel under this package's prefix, so ``y`` is bitwise the det
     # program's); the route's fallback (no ``select_rule``).  ``work`` holds the int32 token-chunk counters (two
     # per channel tile), zero before the first launch and left zero by every launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program.
     "cake_causal_conv1d_train_f5497330bfd286211643": {
         "arches": [
             "sm_100a",
@@ -165,9 +158,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # and the tile's last CTA stores FP32 ``dw`` once (one rounding from FP32) and zeroes its accumulators and
     # counter, so ``acc`` / ``work`` are zero before and after every launch.  No reduce program, no host
     # synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_ea326ebe0f84d8cf2adb": {
         "arches": [
             "sm_100a",
@@ -254,9 +244,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # and the tile's last CTA stores FP32 ``dw`` once (one rounding from FP32) and zeroes its accumulators and
     # counter, so ``acc`` / ``work`` are zero before and after every launch.  No reduce program, no host
     # synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_a79ed3e33712abf525ad": {
         "arches": [
             "sm_107a",
@@ -341,9 +328,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``[n_ch_tiles]``), and the tile's last CTA stores FP32 ``dw`` once (one rounding from FP32) and zeroes its
     # accumulators and counter, so ``acc`` / ``work`` are zero before and after every launch.  No reduce
     # program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_5ed71ee5908c07376183": {
         "arches": [
             "sm_107a",
@@ -433,9 +417,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``[n_ch_tiles]``), and the tile's last CTA stores FP32 ``dw`` once (one rounding from FP32) and zeroes its
     # accumulators and counter, so ``acc`` / ``work`` are zero before and after every launch.  No reduce
     # program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_461d358d7090642c65de": {
         "arches": [
             "sm_100a",
@@ -532,9 +513,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``[n_ch_tiles]``), and the tile's last CTA stores FP32 ``dw`` once (one rounding from FP32) and zeroes its
     # accumulators and counter, so ``acc`` / ``work`` are zero before and after every launch.  No reduce
     # program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_efd2e6f9ac3d58ab92ab": {
         "arches": [
             "sm_103a",
@@ -628,9 +606,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # and the tile's last CTA stores FP32 ``dw`` once (one rounding from FP32) and zeroes its accumulators and
     # counter, so ``acc`` / ``work`` are zero before and after every launch.  No reduce program, no host
     # synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_c798878a383c652c428d": {
         "arches": [
             "sm_107a",
@@ -718,8 +693,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # sched="dynamic", chunk_stages=1, pair_math=True``; the same kernel under this package's prefix, so ``y``
     # is bitwise the det program's); the route's fallback (no ``select_rule``).  ``work`` holds the int32 token-
     # chunk counters (two per channel tile), zero before the first launch and left zero by every launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program.
     "cake_causal_conv1d_train_9c1e7ee9f37e3102660e": {
         "arches": [
             "sm_100a",
@@ -791,8 +764,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # so ``y`` is bitwise the det program's); the route's fallback (no ``select_rule``).  ``work`` holds the
     # int32 token-chunk counters (two per channel tile), zero before the first launch and left zero by every
     # launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program.
     "cake_causal_conv1d_train_08880ca12e4064bc8cdb": {
         "arches": [
             "sm_100a",
@@ -865,8 +836,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # chunk_stages=2, pair_math=True``; the same kernel under this package's prefix, so ``y`` is bitwise the det
     # program's); selected from C = 256 on sm_107a.  ``work`` holds the int32 token-chunk counters (two per
     # channel tile), zero before the first launch and left zero by every launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program.
     "cake_causal_conv1d_train_8665d0756b8240ecb4d0": {
         "arches": [
             "sm_107a",
@@ -939,8 +908,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # sched="dynamic", chunk_stages=2, pair_math=True``; the same kernel under this package's prefix, so ``y``
     # is bitwise the det program's); selected from C = 512 on sm_107a.  ``work`` holds the int32 token-chunk
     # counters (two per channel tile), zero before the first launch and left zero by every launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program.
     "cake_causal_conv1d_train_176ebb3e14f7ad9c94dc": {
         "arches": [
             "sm_107a",
@@ -1015,8 +982,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # fast=True, sched="dynamic", chunk_stages=2, pair_math=True``; the same kernel under this package's prefix,
     # so ``y`` is bitwise the det program's); selected from C = 1024 on sm_107a.  ``work`` holds the int32
     # token-chunk counters (two per channel tile), zero before the first launch and left zero by every launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program.
     "cake_causal_conv1d_train_d829c95e1d610bc14b23": {
         "arches": [
             "sm_107a",
@@ -1096,9 +1061,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # and the tile's last CTA stores ``dw`` (and ``db``) in the dtypes ``flags`` names once (one rounding from
     # FP32) and zeroes its accumulators and counter, so ``acc`` / ``work`` are zero before and after every
     # launch.  No reduce program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_32c5625f33586925f154": {
         "arches": [
             "sm_100a",
@@ -1187,9 +1149,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # and the tile's last CTA stores ``dw`` (and ``db``) in the dtypes ``flags`` names once (one rounding from
     # FP32) and zeroes its accumulators and counter, so ``acc`` / ``work`` are zero before and after every
     # launch.  No reduce program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_d7f458b69c0249f63c37": {
         "arches": [
             "sm_107a",
@@ -1272,9 +1231,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # (uint32 ``[n_ch_tiles]``), and the tile's last CTA stores ``dw`` (and ``db``) in the dtypes ``flags``
     # names once (one rounding from FP32) and zeroes its accumulators and counter, so ``acc`` / ``work`` are
     # zero before and after every launch.  No reduce program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_befc06774f6fee7c36ce": {
         "arches": [
             "sm_100a",
@@ -1367,9 +1323,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # (uint32 ``[n_ch_tiles]``), and the tile's last CTA stores ``dw`` (and ``db``) in the dtypes ``flags``
     # names once (one rounding from FP32) and zeroes its accumulators and counter, so ``acc`` / ``work`` are
     # zero before and after every launch.  No reduce program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_17d30c46fe34f0266e26": {
         "arches": [
             "sm_107a",
@@ -1456,9 +1409,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # and the tile's last CTA stores ``dw`` (and ``db``) in the dtypes ``flags`` names once (one rounding from
     # FP64) and zeroes its accumulators and counter, so ``acc`` / ``work`` are zero before and after every
     # launch.  No reduce program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_c3d9c23921f5573d0577": {
         "arches": [
             "sm_100a",
@@ -1547,9 +1497,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # and the tile's last CTA stores ``dw`` (and ``db``) in the dtypes ``flags`` names once (one rounding from
     # FP64) and zeroes its accumulators and counter, so ``acc`` / ``work`` are zero before and after every
     # launch.  No reduce program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_064063666308a8552401": {
         "arches": [
             "sm_107a",
@@ -1632,9 +1579,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # (uint32 ``[n_ch_tiles]``), and the tile's last CTA stores ``dw`` (and ``db``) in the dtypes ``flags``
     # names once (one rounding from FP64) and zeroes its accumulators and counter, so ``acc`` / ``work`` are
     # zero before and after every launch.  No reduce program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_a47e12df7005fb5fb72b": {
         "arches": [
             "sm_100a",
@@ -1727,9 +1671,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # (uint32 ``[n_ch_tiles]``), and the tile's last CTA stores ``dw`` (and ``db``) in the dtypes ``flags``
     # names once (one rounding from FP64) and zeroes its accumulators and counter, so ``acc`` / ``work`` are
     # zero before and after every launch.  No reduce program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_61b7fb3c4a7d481011eb": {
         "arches": [
             "sm_107a",
@@ -1816,9 +1757,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``[n_ch_tiles]``), and the tile's last CTA stores ``dw`` (and ``db``) in the dtypes ``flags`` names once
     # (one rounding from FP32) and zeroes its accumulators and counter, so ``acc`` / ``work`` are zero before
     # and after every launch.  No reduce program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_012b6319a0cc717911b9": {
         "arches": [
             "sm_100a",
@@ -1918,9 +1856,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # dtypes ``flags`` names once (one rounding from FP32) and zeroes its accumulators and counter, so ``acc`` /
     # ``work`` are zero before and after every launch.  No reduce program, no host synchronization, no
     # cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_383cb5839559d5b0e72b": {
         "arches": [
             "sm_100a",
@@ -2023,9 +1958,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # ``[n_ch_tiles]``), and the tile's last CTA stores ``dw`` (and ``db``) in the dtypes ``flags`` names once
     # (one rounding from FP64) and zeroes its accumulators and counter, so ``acc`` / ``work`` are zero before
     # and after every launch.  No reduce program, no host synchronization, no cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_d542ad2292353c56bd65": {
         "arches": [
             "sm_100a",
@@ -2125,9 +2057,6 @@ MODULES: dict[str, dict[str, Any]] = {
     # dtypes ``flags`` names once (one rounding from FP64) and zeroes its accumulators and counter, so ``acc`` /
     # ``work`` are zero before and after every launch.  No reduce program, no host synchronization, no
     # cooperative launch.
-    # TODO-EXPORT: name, kernel, kernel_symbol and library are placeholders until the exporter renders the
-    # program; ``dynamic_smem_bytes`` 0 is the placeholder of a program whose shared memory follows the kernel;
-    # ``ctas_per_sm`` starts at the det program's co-residency (to be confirmed by the render).
     "cake_causal_conv1d_train_0cc1521134686f49dbc9": {
         "arches": [
             "sm_100a",
@@ -3244,8 +3173,7 @@ def forward_workspace_words(arch: str, C: int) -> int:
 
 
 def is_rendered() -> bool:
-    """Whether the exporter has rendered this package: its ``build.json`` exists next to this file (TODO-EXPORT:
-    until then every record is a placeholder and nothing loads)."""
+    """Whether the exporter has rendered this package: its ``build.json`` exists next to this file."""
 
     return (Path(__file__).parent / "build.json").is_file()
 
