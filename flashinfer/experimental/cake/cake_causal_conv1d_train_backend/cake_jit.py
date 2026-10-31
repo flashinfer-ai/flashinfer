@@ -63,7 +63,7 @@ of the architecture, so one zeroed buffer serves every route.
 
 The program name of a forward copy is ``cake_causal_conv1d_train_<20 hex>``
 (the det program's identity digits under this package's prefix); the backward
-programs' names are the identity digests of their own tart module key (so no
+programs' names are the identity digests of their own kernel module key (so no
 backward name equals a name the det package ships).
 """
 

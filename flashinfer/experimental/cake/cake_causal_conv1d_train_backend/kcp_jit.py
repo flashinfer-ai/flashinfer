@@ -65,7 +65,7 @@ scalars are :mod:`.cake_jit`'s.
 The program names are ``cake_causal_conv1d_train_<20 hex>_kcp``: the copies of
 the det forward and head programs take the det programs' identity digits under
 this package's prefix, the backward programs the identity digests of their own
-tart module key.
+kernel module key.
 """
 
 from __future__ import annotations
