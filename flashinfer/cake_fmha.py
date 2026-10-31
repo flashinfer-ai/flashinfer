@@ -4583,6 +4583,13 @@ _CONTEXT_FP8_ONE_STAGE_ROWS_GAIN: dict[str, frozenset[int]] = {
 # keys) undercount (timed B200: 32 query tokens, heads 32/32, page 64, 1 .. 4
 # requests ran 0.8 .. 1.1 us faster one-stage, predicted 0.3 us).
 _CONTEXT_FP8_ONE_BLOCK_ONE_STAGE_KEYS: dict[str, int] = {"sm100a": 128}
+# Targets whose runtime-size launches of whole tiles in one wave (at most as
+# many tiles as the SMs) that the one-stage costs leave on their launch take
+# the one-stage program of their own pack wherever its tiles (one or more
+# m-blocks of one query stage per head group) also fit one wave: the launch
+# takes as long as its longest tile, and a one-stage tile runs one query
+# stage over the KV blocks its rows meet, half the rows of a two-stage tile.
+_CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS = frozenset({"sm100a"})
 
 
 def _context_fp8_tile_blocks(
@@ -4938,12 +4945,17 @@ def _context_fp8_one_stage_choice(
     sm_count: int,
     current: tuple[int, tuple[int, int, int] | None],
     page_size: int | None = None,
+    runtime: bool = False,
 ) -> int | None:
     """The pack of the one-stage launch of a call whose runtime pack is
     ``pack`` and whose launch is ``current`` (its pack and split plan, ``None``
     for whole tiles), or ``None`` where it keeps that launch (a pure function
     of its arguments, cached).  For a page size the target names in
     :data:`_CONTEXT_FP8_ONE_STAGE_ROWS_GAIN`, the gain takes the scaled unit.
+    A ``runtime`` launch (of a runtime-size program at ``pack``) of whole
+    tiles in one wave on a target of
+    :data:`_CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS` that the costs below leave
+    on its launch takes ``pack`` where its one-stage tiles fit one wave.
 
     The candidates are ``pack`` and the smaller shipped packs dividing it whose
     tiles hold every query token in one stage (``max_q_len <= 128 / pack``),
@@ -5013,6 +5025,20 @@ def _context_fp8_one_stage_choice(
         _context_fp8_split_gain(time, best_time) or (one_block and best_time < time)
     ):
         return best
+    if (
+        runtime
+        and plan is None
+        and current_pack == pack
+        and target in _CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS
+        and len(blocks) <= sm_count
+        and len(
+            _context_fp8_tile_blocks(
+                batch_size, max_q_len, max_kv_len, num_q_heads, pack, 1
+            )
+        )
+        <= sm_count
+    ):
+        return pack
     return None
 
 
@@ -5626,6 +5652,7 @@ def select_cake_fmha_context_route(
                 sm_count,
                 (pack_g, split_plan),
                 page_size,
+                runtime_pack is not None,
             )
             short_tiles = _CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES.get(target)
             short_pack = None

@@ -1392,8 +1392,13 @@ def test_cake_fmha_context_fp8_one_wave_routes(monkeypatch) -> None:
     whose RUNTIME_PACK8 tiles number 40 .. 148, over at most 1664 keys and
     more than 128 query tokens, keeps its whole tiles on RUNTIME_PACK8_OW: 2
     requests of 200 query tokens over 1500 keys (56 tiles) take it; over 4096
-    keys they split.  sm103a names no such launch."""
+    keys they split.  sm103a names no such launch.  (The one-wave one-stage
+    launches, ``_CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS``, are off here: they
+    have their own test.)"""
 
+    monkeypatch.setattr(
+        cake_api, "_CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS", frozenset()
+    )
     routes = cake_api._CONTEXT_FP8_ONE_WAVE_ROUTES
     assert routes == {"sm100a": {"RUNTIME_PACK8": "RUNTIME_PACK8_OW"}}
     assert cake_api._CONTEXT_FP8_ONE_WAVE_SPLIT_BOUNDS == {"sm100a": (40, 1664, 128)}
@@ -1634,6 +1639,71 @@ def test_cake_fmha_context_fp8_one_stage_choice(target) -> None:
     assert one_block == (1 if target == "sm100a" else None)
     # without a cost model the call keeps its launch
     assert choose("sm90a", 2, 128, 1500, 32, 8, sm_count, (8, None)) is None
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_context_fp8_one_wave_one_stage_choice(target) -> None:
+    """A runtime-size launch of whole tiles in one wave on a target of
+    ``_CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS`` (sm100a) that the one-stage
+    costs leave on its launch takes the one-stage program of its own pack
+    where the one-stage tiles also fit one wave: one request of 300 query
+    tokens over 300 keys, heads 32/4 (40 two-stage tiles at pack 8; 76
+    one-stage tiles of 19 m-blocks), takes pack 8.  The same call off the
+    runtime-size route, a launch of more than one wave (16 requests: 640
+    tiles), a launch whose one-stage tiles exceed one wave (2 requests of 400
+    query tokens: 104 two-stage, 200 one-stage tiles) and a split launch keep
+    their launch, and so does every call on sm103a."""
+
+    sm_count = _SM_COUNT[target]
+    choose = cake_api._context_fp8_one_stage_choice
+    assert sorted(cake_api._CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS) == ["sm100a"]
+    chosen = choose(target, 1, 300, 300, 32, 8, sm_count, (8, None), 16, True)
+    assert chosen == (8 if target == "sm100a" else None)
+    assert choose(target, 1, 300, 300, 32, 8, sm_count, (8, None), 16) is None
+    assert choose(target, 16, 300, 300, 32, 8, sm_count, (8, None), 16, True) is None
+    assert choose(target, 2, 400, 1500, 32, 8, sm_count, (8, None), 16, True) is None
+    plan = (8, (40, 2, 2))
+    assert choose(target, 1, 300, 300, 32, 8, sm_count, plan, 16, True) is None
+
+
+def test_cake_fmha_context_fp8_one_wave_one_stage_routes(monkeypatch) -> None:
+    """sm100a: 2 requests of 200 query tokens over 1500 keys, heads 32/4
+    (whole tiles of RUNTIME_PACK8_OW, 56 tiles), take RUNTIME_PACK8_Q1 of 13
+    m-blocks of 16 tokens (104 tiles), for host and device scales; 2 requests
+    of 400 query tokens (200 one-stage tiles) keep RUNTIME_PACK8_OW; without
+    ``_CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS`` the first keeps it too."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    monkeypatch.setattr(cake_api, "_context_split_sm_count", lambda device: 148)
+    meta = torch.device("meta")
+    workspace = torch.empty(1 << 28, dtype=torch.uint8, device="meta")
+    for device_scales in (False, True):
+
+        def route(q_len, device_scales=device_scales):
+            row = ("context_fp8", 2, q_len, 1500, 32, 4, 16, True, None)
+            kwargs = dict(
+                _context_kwargs(row, device_scales=device_scales, device="meta"),
+                workspace_buffer=workspace,
+            )
+            return cake_api.select_cake_fmha_context_route(meta, **kwargs)
+
+        one = route(200)
+        assert (one.program, one.pack_g, one.num_m_blocks) == (
+            "RUNTIME_PACK8_Q1",
+            8,
+            13,
+        ), one
+        kept = route(400)
+        assert (kept.program, kept.pack_g, kept.num_m_blocks) == (
+            "RUNTIME_PACK8_OW",
+            8,
+            13,
+        ), kept
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                cake_api, "_CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS", frozenset()
+            )
+            assert route(200).program == "RUNTIME_PACK8_OW"
 
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
