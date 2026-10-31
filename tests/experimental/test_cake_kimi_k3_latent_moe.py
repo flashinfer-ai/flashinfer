@@ -599,13 +599,13 @@ PARTIAL_PREFETCH_ROUTES = {
 }
 # The few-token multi-partial tail cells served by the global-y instances with the resident-B arithmetic, the routed
 # partials prefetched and each row split over the epilogue warps: (N_PAD, {(SM count, architecture): {tokens: fewest
-# partials}}).  The TP1 rows serve sm_103a parts only, the rows of 3 tokens on the 152-SM part from 9 partials.
+# partials}}).  The TP1 rows serve sm_103a parts only.
 SB_SPLIT_ROUTES = {
     1: (
         32,
         {
             (148, "sm_103a"): {t: 8 for t in range(1, 9)},
-            (152, "sm_103a"): {1: 8, 2: 8, 3: 9, 4: 8, 5: 8, 6: 8, 7: 8, 8: 8},
+            (152, "sm_103a"): {t: 8 for t in range(1, 9)},
         },
     ),
     8: (
@@ -2430,8 +2430,7 @@ def test_tail_sb_split_rules(monkeypatch):
     parts (SM count, architecture): its plan is the ``_sbn_ppf`` instance's but for the flag, up to 17 partials; every
     other row keeps its plan; every cell taken is a cell the planner without the table sends to the resident-B
     arithmetic (the ``_sbn`` global-y instance or the resident-B instance); and the TP1 row of 3 tokens takes the split
-    rows from 8 partials on the 148-SM sm_103a part but from 9 on the 152-SM one, whose 8-partial cell keeps the
-    ``_sbn_ppf`` instance."""
+    rows from 8 partials on both sm_103a parts."""
     assert cb.TAIL_SB_SPLIT_ROUTES == SB_SPLIT_ROUTES
     taken = {}
     for sm_count in QUALIFIED_SM_COUNTS:
@@ -2475,15 +2474,12 @@ def test_tail_sb_split_rules(monkeypatch):
         ("sm_103a", 8),
         ("sm_103a", 1),
     }
-    il1 = i_local_for_tp(1)
-    assert (148, "sm_103a", 1, 3, 8) in taken and (152, "sm_103a", 1, 3, 9) in taken
-    assert (152, "sm_103a", 1, 3, 8) not in taken
-    gb300_t3p8 = decode_tail_plan(3, il1, 1, 8, 152, "sm_103a")
-    assert decode_kernel_key(gb300_t3p8) + "_sbs" == taken[152, "sm_103a", 1, 3, 9]
+    for sm_count in QUALIFIED_SM_COUNTS:
+        assert (sm_count, "sm_103a", 1, 3, 8) in taken
+        assert (sm_count, "sm_103a", 1, 3, 7) not in taken
     monkeypatch.setattr(cb, "TAIL_SB_SPLIT_ROUTES", {})
     decode_tail_plan.cache_clear()
     try:
-        assert decode_tail_plan(3, il1, 1, 8, 152, "sm_103a") == gb300_t3p8
         for sm_count, arch, tp, tokens, num_partials in taken:
             default = decode_tail_plan(
                 tokens, i_local_for_tp(tp), tp, num_partials, sm_count, arch
