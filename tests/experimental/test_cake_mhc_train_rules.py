@@ -27,15 +27,16 @@ prefix, except the ``bwd_finish`` route.  This module checks the registry
 * the program set is the deterministic set without its column-slab
   (``bwd_slab__*``) and final-reduction (``bwd_reduce__*``) records, renamed
   and otherwise equal field for field, plus the three programs of this package
-  (``cake_mhc_train_fn_split_atomic__tv128`` on sm_100a / sm_103a,
-  ``cake_mhc_train_fn_split_atomic__tv128_t128`` on sm_107a and
+  (``cake_mhc_train_fn_split_atomic__tv128_dep`` on sm_100a / sm_103a,
+  ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` on sm_107a and
   ``cake_mhc_train_bwd_slab_atomic__dynr`` on all three), whose records keep
-  the launch, grid and roles of the deterministic records they replace;
+  the launch, grid and roles of the deterministic records they replace (the
+  fn split with the static PDL attribute: it follows the token-owner pass);
 * no record, route, record scalar or PDL edge names a deterministic library;
 * every route, the selection on every route and the PDL bands equal the
-  deterministic ones, except ``bwd_finish``: the atomic fn split of the
-  architecture, the deterministic token-owner records, the atomic column slab,
-  no reduction;
+  deterministic ones, except ``bwd_finish``: the deterministic token-owner
+  records, the atomic fn split of the architecture, the atomic column slab, no
+  reduction;
 * the workspaces: ``fwd`` the deterministic one, ``bwd`` the deterministic
   regions at the same offsets without the trailing ``dfn_part``;
 * the host rules are copies (equal outputs, not the deterministic objects);
@@ -84,8 +85,8 @@ ND_PREFIX, DET_PREFIX = "cake_mhc_train_", "cake_mhc_det_train_"
 BWD_FINISH = "bwd_finish_h4096"
 # The programs of this package and their architectures.
 ATOMIC = {
-    "cake_mhc_train_fn_split_atomic__tv128": ("sm_100a", "sm_103a"),
-    "cake_mhc_train_fn_split_atomic__tv128_t128": ("sm_107a",),
+    "cake_mhc_train_fn_split_atomic__tv128_dep": ("sm_100a", "sm_103a"),
+    "cake_mhc_train_fn_split_atomic__tv128_t128_dep": ("sm_107a",),
     "cake_mhc_train_bwd_slab_atomic__dynr": ("sm_100a", "sm_103a", "sm_107a"),
 }
 SLAB = "cake_mhc_train_bwd_slab_atomic__dynr"
@@ -153,8 +154,9 @@ def _dropped(name: str) -> bool:
 
 
 def _atomic_split(arch: str) -> str:
-    """The atomic fn split of ``arch``: the form of the deterministic backward split (``FN_SPLIT_PROGRAM[arch][1]``)."""
-    return f"{ND_PREFIX}fn_split_atomic__{det.fn_split_program(arch, 1)}"
+    """The atomic fn split of ``arch``: the form of the deterministic backward split (``FN_SPLIT_PROGRAM[arch][1]``),
+    launched as the token-owner pass's programmatic dependent (``_dep``)."""
+    return f"{ND_PREFIX}fn_split_atomic__{det.fn_split_program(arch, 1)}_dep"
 
 
 def _det_role(name: str) -> str:
@@ -218,8 +220,9 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
 @pytest.mark.cpu_only
 def test_atomic_records_keep_the_deterministic_launch() -> None:
     """The three programs: named after their library and kernel symbol; the fn splits keep the launch and fixed grid
-    of the deterministic transposed-layout split of their form and bind ``fn``, ``fnTp``, ``dfn`` and
-    ``accumulate`` (no ``fnp``, no ``want_t``); the column slab keeps the launch and grid rule of the deterministic
+    of the deterministic transposed-layout split of their form but for the static PDL attribute (``use_pdl`` True:
+    they follow the token-owner pass and wait for it) and bind ``fn``, ``fnTp``, ``dfn`` and ``accumulate`` (no
+    ``fnp``, no ``want_t``); the column slab keeps the launch and grid rule of the deterministic
     ``dynr`` record, binds its arguments without ``dfn_part`` and adds ``dfn``, ``param_partial``, ``dscale``,
     ``dbase``, ``chunks`` and ``accumulate``."""
     for name, arches in ATOMIC.items():
@@ -241,11 +244,11 @@ def test_atomic_records_keep_the_deterministic_launch() -> None:
         ]
         assert len(det_splits) == 1, arch
         reference = det.MODULES[det_splits[0]]
-        assert split["launch"] == reference["launch"], arch
+        assert reference["launch"]["use_pdl"] is False, arch
+        assert split["launch"] == {**reference["launch"], "use_pdl": True}, arch
         assert split["grid_rule"] == reference["grid_rule"], arch
         form = det.fn_split_program(arch, 1)
         assert split["grid_rule"] == {"kind": "fixed", "ctas": det.FN_SPLIT_GRID[form]}
-        assert split["launch"]["use_pdl"] is False
         assert set(split["logical"].values()) == {"fn", "fnTp", "dfn", "accumulate"}
         assert [kind for kind, _ in split["arg_plan"]][-3:] == ["grid"] * 3
     slab, dynr = nd.MODULES[SLAB], det.MODULES[DET_DYNR]
@@ -348,8 +351,8 @@ def test_records_speak_the_vocabulary() -> None:
 @pytest.mark.cpu_only
 def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
     """``ROUTES``: the deterministic architectures and route keys; every route the renamed deterministic route except
-    ``bwd_finish``, which is the architecture's atomic fn split, the deterministic token-owner records (renamed, in
-    route order) and the atomic column slab.  Every record is routed, on exactly its architectures."""
+    ``bwd_finish``, which is the deterministic token-owner records (renamed, in route order), the architecture's
+    atomic fn split and the atomic column slab.  Every record is routed, on exactly its architectures."""
     assert set(nd.ROUTES) == set(det.ROUTES) == set(det.ARCHES)
     routed: dict[str, set] = {}
     for arch in det.ARCHES:
@@ -363,7 +366,7 @@ def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
                 continue
             tokens = [_renamed(n) for n in det_route if _det_role(n) == "bwd_token"]
             assert tokens, arch
-            assert route == [_atomic_split(arch), *tokens, SLAB], arch
+            assert route == [*tokens, _atomic_split(arch), SLAB], arch
             assert {_det_role(n) for n in det_route} == {
                 "fn_split_bwd",
                 "bwd_token",
@@ -380,8 +383,8 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
     arch: str, sm: int
 ) -> None:
     """On every token count of record at the count of record and at run-time counts: every kind selects the renamed
-    deterministic records, except ``bwd_finish``: (the atomic fn split, the deterministic token-owner record(s) of
-    the call renamed, the atomic column slab) -- one fn split, one column slab, no reduction."""
+    deterministic records, except ``bwd_finish``: (the deterministic token-owner record(s) of the call renamed, the
+    atomic fn split, the atomic column slab) -- one fn split, one column slab, no reduction."""
     for T in T_VALUES:
         for iters in (det.SINKHORN_ITERS, *RUN_TIME_ITERS):
             for kind in det.KINDS:
@@ -401,7 +404,7 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
                 tokens = tuple(
                     _renamed(n) for n in det_names if _det_role(n) == "bwd_token"
                 )
-                assert names == (_atomic_split(arch), *tokens, SLAB), (what, names)
+                assert names == (*tokens, _atomic_split(arch), SLAB), (what, names)
                 run_time = (nd.MODULES[tokens[0]]["select_rule"] or {}).get("kind")
                 assert (run_time == "run_time_iters") == (
                     iters != det.SINKHORN_ITERS
@@ -414,8 +417,8 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
     """``PDL_EDGES`` = the deterministic edges without ``K7->K8``, the column slab's stem
     ``cake_mhc_train_bwd_slab_atomic`` on ``K6->K7``; ``PDL_OFF_BANDS`` = the deterministic bands without ``K7->K8``.
     On every path and token count (the counts of record and every band boundary) the column slab's ``enable_pdl``
-    equals every deterministic column-slab record's of the route, the fn split launches without the attribute, and
-    every copied record reads the deterministic value."""
+    equals every deterministic column-slab record's of the route, the fn split takes no per-call argument (its
+    attribute is static), and every copied record reads the deterministic value."""
     expected_edges = {
         _renamed(stem): edge
         for stem, edge in det.PDL_EDGES.items()
