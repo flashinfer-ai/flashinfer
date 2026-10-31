@@ -591,7 +591,15 @@ def _accumulator_layout(record: dict, C: int, n_ch_tiles: int) -> dict:
     rule = record["workspace_rule"]
     if rule is None:
         return accumulator_layout(record, C, n_ch_tiles)  # raises naming the record
-    key = (rule["kind"], rule["acc"], rule["taps"], rule["work"], C, n_ch_tiles)
+    key = (
+        rule["kind"],
+        rule["acc"],
+        rule["taps"],
+        rule.get("slots", 1),
+        rule["work"],
+        C,
+        n_ch_tiles,
+    )
     layout = _LAYOUTS.get(key)
     if layout is None:
         layout = _LAYOUTS[key] = accumulator_layout(record, C, n_ch_tiles)

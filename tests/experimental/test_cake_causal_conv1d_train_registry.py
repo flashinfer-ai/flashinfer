@@ -209,12 +209,18 @@ def test_backward_records_are_one_launch_with_accumulators() -> None:
             and launch["dynamic_smem_bytes"] >= 0
         )
         assert cake_jit.select_rule(record) == det_jit.select_rule(det), label
-        assert record["workspace_rule"] == {
+        rule = dict(record["workspace_rule"])
+        slots = rule.pop("slots", 1)
+        assert rule == {
             "acc": "float64" if kind.endswith("fp32g") else "float32",
             "kind": "accumulators",
             "taps": 5 if bias else 4,
             "work": "uint32",
         }, label
+        # Accumulator copies, as the render names them: the fp32g programs may keep several, the FP32 routes one.
+        assert isinstance(slots, int) and slots >= 1, label
+        if not kind.endswith("fp32g"):
+            assert slots == 1, label
 
 
 @pytest.mark.cpu_only
@@ -261,10 +267,12 @@ def test_accumulator_layout() -> None:
                 C, geometry=record["grid_rule"]["geometry"], role="bwd"
             )
             layout = cake_jit.accumulator_layout(record, C, n_ch_tiles)
-            acc_bytes = rule["taps"] * C * size
+            words = rule.get("slots", 1) * rule["taps"]
+            assert cake_jit.accumulator_words_per_channel(record) == words
+            acc_bytes = words * C * size
             assert layout == {
                 "acc_dtype": rule["acc"],
-                "acc_elems": rule["taps"] * C,
+                "acc_elems": words * C,
                 "acc_bytes": acc_bytes,
                 "work_dtype": "uint32",
                 "work_offset": _align16(acc_bytes),
@@ -285,11 +293,48 @@ def test_accumulator_layout() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("kind", ("bwd_fp32g", "bwd_bias_fp32g"))
+@pytest.mark.parametrize("C", (512, 8192))
+def test_accumulators_are_sized_from_the_rule(kind, C) -> None:
+    """The accumulator size comes from the rendered rule, never a fixed ``C x taps``: an fp32g program whose rule
+    names ``slots`` FP64 copies gets ``slots x taps x C`` words (1 copy when it names none), and the public
+    workspace grows with it; a malformed ``slots`` is refused."""
+
+    import copy
+
+    for arch in ARCHES:
+        if kind not in cake_jit.ROUTES[arch]:
+            continue
+        name = cake_jit.route_modules(arch, kind)[0]
+        record = cake_jit.MODULES[name]
+        rule = record["workspace_rule"]
+        assert rule["acc"] == "float64"
+        _, _, n_ch_tiles = cake_jit.channel_split(
+            C, geometry=record["grid_rule"]["geometry"], role="bwd"
+        )
+        rendered = cake_jit.accumulator_layout(record, C, n_ch_tiles)
+        assert rendered["acc_elems"] == rule.get("slots", 1) * rule["taps"] * C
+        for slots in (1, 4):
+            variant = copy.deepcopy(record)
+            variant["workspace_rule"]["slots"] = slots
+            layout = cake_jit.accumulator_layout(variant, C, n_ch_tiles)
+            assert layout["acc_elems"] == slots * rule["taps"] * C, (arch, slots)
+            assert layout["acc_bytes"] == 8 * slots * rule["taps"] * C
+            assert layout["work_offset"] == _align16(layout["acc_bytes"])
+            assert layout["total_bytes"] >= layout["work_offset"] + 4 * n_ch_tiles
+        for slots in (0, -1, 1.5, True, "4"):
+            variant = copy.deepcopy(record)
+            variant["workspace_rule"]["slots"] = slots
+            with pytest.raises(ValueError, match="slots"):
+                cake_jit.accumulator_layout(variant, C, n_ch_tiles)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ARCHES)
 def test_backward_workspace_serves_every_backward_program(arch) -> None:
     """The public backward workspace is the largest layout over every backward program of the architecture, so one
     zeroed buffer serves whichever program and route a call selects; the capacity owner is an FP64 bias program
-    (40 bytes per channel)."""
+    (8 bytes x slots x 5 taps per channel, 40 with one copy)."""
 
     owner = cake_jit.workspace_record(arch)
     assert (
@@ -311,7 +356,8 @@ def test_backward_workspace_serves_every_backward_program(arch) -> None:
                 cake_jit.accumulator_layout(record, C, n_ch_tiles)["total_bytes"]
                 <= nbytes
             ), (arch, C)
-        assert nbytes == _align16(_align16(40 * C) + 4 * cake_jit.channel_split(
+        per_channel = 8 * cake_jit.accumulator_words_per_channel(owner)
+        assert nbytes == _align16(_align16(per_channel * C) + 4 * cake_jit.channel_split(
             C, geometry=owner["grid_rule"]["geometry"], role="bwd")[2])  # fmt: skip
 
 

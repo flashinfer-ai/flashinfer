@@ -60,6 +60,15 @@ CHANNELS = (
 ACCUMULATORS = {"acc": "float32", "kind": "accumulators", "taps": 4, "work": "uint32"}
 
 
+def _accumulator_rule(rule: dict) -> dict:
+    """``rule`` without an explicit one-copy ``slots`` (the KCP programs keep one FP32 copy; a rule may name it)."""
+
+    rule = dict(rule)
+    if rule.get("slots") == 1:
+        del rule["slots"]
+    return rule
+
+
 def _strip(record: dict, *fields: str) -> dict:
     return {key: value for key, value in record.items() if key not in fields}
 
@@ -148,7 +157,7 @@ def test_main_backward_records_are_ordinary_launches_with_accumulators() -> None
             and launch["dynamic_smem_bytes"] >= 0
         )
         assert kcp_jit.select_rule(record) == det_kcp_jit.select_rule(det), label
-        assert record["workspace_rule"] == ACCUMULATORS, label
+        assert _accumulator_rule(record["workspace_rule"]) == ACCUMULATORS, label
 
 
 @pytest.mark.cpu_only
@@ -170,7 +179,7 @@ def test_kcp_backward_workspace(arch) -> None:
 
     owners = kcp_jit.workspace_owners(arch)
     assert [o["kernel"] for o in owners] == list(kcp_jit.route_modules(arch, "kcp_bwd"))
-    assert kcp_jit.workspace_record(arch)["workspace_rule"] == ACCUMULATORS
+    assert _accumulator_rule(kcp_jit.workspace_record(arch)["workspace_rule"]) == ACCUMULATORS
     for C in CHANNELS:
         n_ch_tiles = -(-(C // 8) // min(C // 8, 128))
         layout = kcp_jit.accumulator_layout(owners[0], C, n_ch_tiles)

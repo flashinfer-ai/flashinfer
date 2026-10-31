@@ -938,9 +938,9 @@ def test_two_streams_with_two_workspaces() -> None:
 
 def test_backward_is_one_launch_with_zeroed_accumulators(monkeypatch) -> None:
     """A backward call is ONE ordinary launch of the program ``C`` selects (no reduce program): its arguments
-    carry the ``acc`` / ``work`` views of the record's accumulator layout (FP32 or FP64 ``taps x C`` words, uint32
-    ``n_ch_tiles`` counters), zero at launch, and the grid of the call's plan, at least one CTA per channel
-    tile."""
+    carry the ``acc`` / ``work`` views of the record's accumulator layout (FP32 or FP64 ``slots x taps x C`` words
+    as the rule names them, uint32 ``n_ch_tiles`` counters), zero at launch, and the grid of the call's plan, at
+    least one CTA per channel tile."""
 
     S, C, docs = 1000, 1280, "perf"
     device = _device()
@@ -969,14 +969,57 @@ def test_backward_is_one_launch_with_zeroed_accumulators(monkeypatch) -> None:
         layout = loader.accumulator_layout(record, C, values["n_ch_tiles"])
         acc_dtype = torch.float64 if "fp32g" in kind else torch.float32
         taps = 5 if "bias" in kind else 4
-        assert values["acc"].dtype == acc_dtype and values["acc"].numel() == taps * C
+        words = record["workspace_rule"].get("slots", 1) * taps
+        assert loader.accumulator_words_per_channel(record) == words
+        assert values["acc"].dtype == acc_dtype and values["acc"].numel() == words * C
         assert (
             values["work"].dtype == torch.uint32
             and values["work"].numel() == values["n_ch_tiles"]
         )
-        assert layout["acc_elems"] == taps * C
+        assert layout["acc_elems"] == words * C
         assert acc_nonzero == 0 and work_nonzero == 0
         assert {"x", "w", "cu", "dy", "dx", "dw", "acc", "work"} <= set(values)
+
+
+@pytest.mark.parametrize("kind", ("bwd_fp32g", "bwd_bias_fp32g"))
+@pytest.mark.parametrize("C", (512, 8192))
+def test_fp32g_accumulators_follow_the_rendered_rule(kind, C, monkeypatch) -> None:
+    """An fp32g backward at ``C`` 512 and 8192 hands its program an FP64 ``acc`` of the size the rendered rule names
+    (``slots x taps x C``, however many accumulator copies the program keeps) inside the public workspace; the
+    results stay within budget of the reference, ``dx`` is the deterministic package's, and the workspace reads
+    back zero."""
+
+    _require_route(kind)
+    det = _det()
+    S, docs = 4097, (1000, 0, 3, 3094)
+    device = _device()
+    x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=11)
+    workspace = pkg.cake_causal_conv1d_train_backward_workspace(
+        S, C, device, deterministic=False
+    )
+    seen = []
+    launch = pkg.run_module
+
+    def record_launch(name, values, *, device_index, grid=None):
+        seen.append((name, values["acc"].dtype, values["acc"].numel(), values["n_ch_tiles"]))
+        return launch(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    dx, dw, db = _backward(x, w, cu, dy, b, policy, workspace=workspace)
+    monkeypatch.undo()
+    ((name, acc_dtype, acc_numel, n_ch_tiles),) = seen
+    record = loader.MODULES[name]
+    layout = loader.accumulator_layout(record, C, n_ch_tiles)
+    assert acc_dtype == torch.float64
+    assert acc_numel == layout["acc_elems"] == loader.accumulator_words_per_channel(record) * C
+    assert workspace.numel() >= layout["total_bytes"]
+    _check_grads(
+        dx, dw, db, reference_backward(x, w, cu, dy, b=b, policy=policy),
+        policy=policy, label=f"{kind} C={C}",
+    )  # fmt: skip
+    dx_d, _, _ = _det_backward(det, x, w, cu, dy, b, policy)
+    assert torch.equal(dx, dx_d), f"dx differs from the deterministic package ({kind} C={C})"
+    assert int(torch.count_nonzero(workspace)) == 0
 
 
 def test_backward_keeps_its_speed_beside_a_resident_side_kernel(
