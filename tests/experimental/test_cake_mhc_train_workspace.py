@@ -45,6 +45,9 @@ reference's).  On one buffer reused over realistic token-count sequences:
 * the sequence of FlashInfer issue #7763 (``backward_finish`` at 7832 tokens,
   then at 7435 tokens, on the default workspace of a fresh process, and the
   reverse order), each sequence in its own process;
+* no default buffer is created during a CUDA graph capture (``ValueError``,
+  nothing cached), and the eager call after it creates the buffer and matches
+  the caller-owned workspace's call;
 * one buffer over a ragged sequence with caller outputs, and the sizes of the
   workspace and which sizing serves which backward.
 """
@@ -585,6 +588,77 @@ def test_default_workspace_reported_sequence(Ts: tuple) -> None:
             assert math.isfinite(c[key]) and c[key] <= FP32_REL_L2_MAX, (
                 f"{what}: dfn rel-L2 {c[key]:.3e} to {against} > {FP32_REL_L2_MAX:.0e}"
             )
+
+
+# A fresh process: ``backward_finish(..., deterministic=False)`` on a caller-owned workspace (every module loaded),
+# then the same call with ``workspace=None`` inside a CUDA graph capture, before any default buffer of its bucket
+# exists, then the same call eagerly.
+_CAPTURE_CHILD = r"""
+import importlib, json, sys
+import torch
+pkg = importlib.import_module(sys.argv[1])
+dev = torch.device("cuda:0")
+T = int(sys.argv[2])
+gen = torch.Generator(device="cpu").manual_seed(0)
+def r(*shape, dtype=torch.float32, scale=1.0):
+    return (torch.randn(shape, generator=gen) * scale).to(dtype).to(dev)
+args = [r(T, 4, 4096, dtype=torch.bfloat16), r(T, 4, 4096, dtype=torch.bfloat16, scale=1e-3),
+        r(T, 4096, dtype=torch.bfloat16, scale=1e-3), None, r(24, 16384, scale=0.05), r(3, scale=0.1),
+        r(24), r(T, 64), r(T, 32, scale=1e-3)]
+key = (0, "bwd", 1 << (T - 1).bit_length())
+ws = pkg.cake_mhc_train_backward_workspace(T, dev, deterministic=False)
+ref = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args, workspace=ws, deterministic=False)]
+torch.cuda.synchronize()
+out = {"cached_before": key in pkg._DEFAULT_WORKSPACES, "raised": None}
+graph = torch.cuda.CUDAGraph()
+try:
+    with torch.cuda.graph(graph):
+        pkg.cake_mhc_train_backward_finish(*args, deterministic=False)
+except ValueError as e:
+    out["raised"] = str(e)
+del graph
+torch.cuda.synchronize()
+out["cached_after_capture"] = key in pkg._DEFAULT_WORKSPACES
+got = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args, deterministic=False)]
+torch.cuda.synchronize()
+out["cached_after_eager"] = key in pkg._DEFAULT_WORKSPACES
+out["differs"] = [n for n, a, b in zip(("dX", "dfn", "dscale", "dbase"), got, ref) if n != "dfn" and not torch.equal(a, b)]
+out["finite"] = all(bool(torch.isfinite(t).all()) for t in got)
+print(json.dumps(out), flush=True)
+"""
+
+
+def test_default_workspace_is_not_created_during_capture() -> None:
+    T = 300
+    run = subprocess.run(
+        [sys.executable, "-c", _CAPTURE_CHILD, PACKAGES[KEY], str(T)],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    tail = "\n".join((run.stdout + run.stderr).strip().splitlines()[-6:])
+    assert run.returncode == 0, f"capture child: exit {run.returncode}\n{tail}"
+    lines = [
+        json.loads(line) for line in run.stdout.splitlines() if line.startswith("{")
+    ]
+    assert len(lines) == 1, tail
+    out = lines[0]
+    what = f"backward_finish(deterministic=False) at T={T} on the default workspace"
+    assert not out["cached_before"], (
+        f"{what}: a default buffer existed before the capture"
+    )
+    assert out["raised"] is not None and "CUDA graph capture" in out["raised"], (
+        f"{what}: no ValueError inside the capture ({out['raised']!r})"
+    )
+    assert not out["cached_after_capture"], (
+        f"{what}: the capture cached a default buffer"
+    )
+    assert out["cached_after_eager"], f"{what}: the eager call cached no default buffer"
+    assert out["finite"], f"{what}: non-finite outputs"
+    assert not out["differs"], (
+        f"{what}: {out['differs']} differ from the caller-owned workspace's call"
+    )
 
 
 # ----------------------------------------------------------------------------------------------------------------
