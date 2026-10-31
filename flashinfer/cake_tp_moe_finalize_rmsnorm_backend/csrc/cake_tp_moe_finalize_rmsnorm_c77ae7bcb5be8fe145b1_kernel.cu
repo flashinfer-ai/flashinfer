@@ -233,70 +233,70 @@ kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1(__nv_bfloat16* __restri
             packets[0 + 3] = _uv4_4.w;
         }
     }
-    int ridx1 = idx8[1];
-    if (ridx1 >= 0 && ridx1 < rows) {
+    int ridx_0 = idx8[1];
+    if (ridx_0 >= 0 && ridx_0 < rows) {
         {
-            uint4 _uv4_5 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx1 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_5 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_0 * (long long)row_stride + col64) + 0);
             packets[4 + 0] = _uv4_5.x;
             packets[4 + 1] = _uv4_5.y;
             packets[4 + 2] = _uv4_5.z;
             packets[4 + 3] = _uv4_5.w;
         }
     }
-    int ridx2 = idx8[2];
-    if (ridx2 >= 0 && ridx2 < rows) {
+    int ridx_1 = idx8[2];
+    if (ridx_1 >= 0 && ridx_1 < rows) {
         {
-            uint4 _uv4_6 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx2 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_6 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_1 * (long long)row_stride + col64) + 0);
             packets[8 + 0] = _uv4_6.x;
             packets[8 + 1] = _uv4_6.y;
             packets[8 + 2] = _uv4_6.z;
             packets[8 + 3] = _uv4_6.w;
         }
     }
-    int ridx3 = idx8[3];
-    if (ridx3 >= 0 && ridx3 < rows) {
+    int ridx_2 = idx8[3];
+    if (ridx_2 >= 0 && ridx_2 < rows) {
         {
-            uint4 _uv4_7 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx3 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_7 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_2 * (long long)row_stride + col64) + 0);
             packets[12 + 0] = _uv4_7.x;
             packets[12 + 1] = _uv4_7.y;
             packets[12 + 2] = _uv4_7.z;
             packets[12 + 3] = _uv4_7.w;
         }
     }
-    int ridx4 = idx8[4];
-    if (ridx4 >= 0 && ridx4 < rows) {
+    int ridx_3 = idx8[4];
+    if (ridx_3 >= 0 && ridx_3 < rows) {
         {
-            uint4 _uv4_8 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx4 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_8 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_3 * (long long)row_stride + col64) + 0);
             packets[16 + 0] = _uv4_8.x;
             packets[16 + 1] = _uv4_8.y;
             packets[16 + 2] = _uv4_8.z;
             packets[16 + 3] = _uv4_8.w;
         }
     }
-    int ridx5 = idx8[5];
-    if (ridx5 >= 0 && ridx5 < rows) {
+    int ridx_4 = idx8[5];
+    if (ridx_4 >= 0 && ridx_4 < rows) {
         {
-            uint4 _uv4_9 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx5 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_9 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_4 * (long long)row_stride + col64) + 0);
             packets[20 + 0] = _uv4_9.x;
             packets[20 + 1] = _uv4_9.y;
             packets[20 + 2] = _uv4_9.z;
             packets[20 + 3] = _uv4_9.w;
         }
     }
-    int ridx6 = idx8[6];
-    if (ridx6 >= 0 && ridx6 < rows) {
+    int ridx_5 = idx8[6];
+    if (ridx_5 >= 0 && ridx_5 < rows) {
         {
-            uint4 _uv4_10 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx6 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_10 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_5 * (long long)row_stride + col64) + 0);
             packets[24 + 0] = _uv4_10.x;
             packets[24 + 1] = _uv4_10.y;
             packets[24 + 2] = _uv4_10.z;
             packets[24 + 3] = _uv4_10.w;
         }
     }
-    int ridx7 = idx8[7];
-    if (ridx7 >= 0 && ridx7 < rows) {
+    int ridx_6 = idx8[7];
+    if (ridx_6 >= 0 && ridx_6 < rows) {
         {
-            uint4 _uv4_11 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx7 * (long long)row_stride + col64) + 0);
+            uint4 _uv4_11 = *reinterpret_cast<const uint4*>(gemm2 + ((long long)ridx_6 * (long long)row_stride + col64) + 0);
             packets[28 + 0] = _uv4_11.x;
             packets[28 + 1] = _uv4_11.y;
             packets[28 + 2] = _uv4_11.z;
@@ -304,15 +304,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1(__nv_bfloat16* __restri
         }
     }
     if (tok_push < n_tok) {
-        unsigned int raw0[4];
-        raw0[0] = packets[0];
-        raw0[1] = packets[1];
-        raw0[2] = packets[2];
-        raw0[3] = packets[3];
+        unsigned int raw0_1_0[4];
+        raw0_1_0[0] = packets[0];
+        raw0_1_0[1] = packets[1];
+        raw0_1_0[2] = packets[2];
+        raw0_1_0[3] = packets[3];
         uint32_t _packed16_sanitize_0[4];
         #pragma unroll
         for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-            uint32_t _p16s_carrier_12 = static_cast<uint32_t>(raw0[_p16s_word]);
+            uint32_t _p16s_carrier_12 = static_cast<uint32_t>(raw0_1_0[_p16s_word]);
             uint32_t _p16s_lo_12 = _p16s_carrier_12 & 0x0000ffffu;
             uint32_t _p16s_hi_12 = (_p16s_carrier_12 >> 16) & 0x0000ffffu;
             if (_p16s_lo_12 == 0x00008000u) _p16s_lo_12 = 0u;
@@ -324,15 +324,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1(__nv_bfloat16* __restri
             __builtin_assume(__isGlobal(_gst_13));
             reinterpret_cast<int4*>(_gst_13)[0] = reinterpret_cast<int4*>(_packed16_sanitize_0)[0];
         }
-        unsigned int raw1[4];
-        raw1[0] = packets[4];
-        raw1[1] = packets[5];
-        raw1[2] = packets[6];
-        raw1[3] = packets[7];
+        unsigned int raw0_1_1[4];
+        raw0_1_1[0] = packets[4];
+        raw0_1_1[1] = packets[5];
+        raw0_1_1[2] = packets[6];
+        raw0_1_1[3] = packets[7];
         uint32_t _packed16_sanitize_1[4];
         #pragma unroll
         for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-            uint32_t _p16s_carrier_14 = static_cast<uint32_t>(raw1[_p16s_word]);
+            uint32_t _p16s_carrier_14 = static_cast<uint32_t>(raw0_1_1[_p16s_word]);
             uint32_t _p16s_lo_14 = _p16s_carrier_14 & 0x0000ffffu;
             uint32_t _p16s_hi_14 = (_p16s_carrier_14 >> 16) & 0x0000ffffu;
             if (_p16s_lo_14 == 0x00008000u) _p16s_lo_14 = 0u;
@@ -344,15 +344,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1(__nv_bfloat16* __restri
             __builtin_assume(__isGlobal(_gst_15));
             reinterpret_cast<int4*>(_gst_15)[0] = reinterpret_cast<int4*>(_packed16_sanitize_1)[0];
         }
-        unsigned int raw2[4];
-        raw2[0] = packets[8];
-        raw2[1] = packets[9];
-        raw2[2] = packets[10];
-        raw2[3] = packets[11];
+        unsigned int raw0_1_2[4];
+        raw0_1_2[0] = packets[8];
+        raw0_1_2[1] = packets[9];
+        raw0_1_2[2] = packets[10];
+        raw0_1_2[3] = packets[11];
         uint32_t _packed16_sanitize_2[4];
         #pragma unroll
         for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-            uint32_t _p16s_carrier_16 = static_cast<uint32_t>(raw2[_p16s_word]);
+            uint32_t _p16s_carrier_16 = static_cast<uint32_t>(raw0_1_2[_p16s_word]);
             uint32_t _p16s_lo_16 = _p16s_carrier_16 & 0x0000ffffu;
             uint32_t _p16s_hi_16 = (_p16s_carrier_16 >> 16) & 0x0000ffffu;
             if (_p16s_lo_16 == 0x00008000u) _p16s_lo_16 = 0u;
@@ -364,15 +364,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1(__nv_bfloat16* __restri
             __builtin_assume(__isGlobal(_gst_17));
             reinterpret_cast<int4*>(_gst_17)[0] = reinterpret_cast<int4*>(_packed16_sanitize_2)[0];
         }
-        unsigned int raw3[4];
-        raw3[0] = packets[12];
-        raw3[1] = packets[13];
-        raw3[2] = packets[14];
-        raw3[3] = packets[15];
+        unsigned int raw0_1_3[4];
+        raw0_1_3[0] = packets[12];
+        raw0_1_3[1] = packets[13];
+        raw0_1_3[2] = packets[14];
+        raw0_1_3[3] = packets[15];
         uint32_t _packed16_sanitize_3[4];
         #pragma unroll
         for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-            uint32_t _p16s_carrier_18 = static_cast<uint32_t>(raw3[_p16s_word]);
+            uint32_t _p16s_carrier_18 = static_cast<uint32_t>(raw0_1_3[_p16s_word]);
             uint32_t _p16s_lo_18 = _p16s_carrier_18 & 0x0000ffffu;
             uint32_t _p16s_hi_18 = (_p16s_carrier_18 >> 16) & 0x0000ffffu;
             if (_p16s_lo_18 == 0x00008000u) _p16s_lo_18 = 0u;
@@ -384,15 +384,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1(__nv_bfloat16* __restri
             __builtin_assume(__isGlobal(_gst_19));
             reinterpret_cast<int4*>(_gst_19)[0] = reinterpret_cast<int4*>(_packed16_sanitize_3)[0];
         }
-        unsigned int raw4[4];
-        raw4[0] = packets[16];
-        raw4[1] = packets[17];
-        raw4[2] = packets[18];
-        raw4[3] = packets[19];
+        unsigned int raw0_1_4[4];
+        raw0_1_4[0] = packets[16];
+        raw0_1_4[1] = packets[17];
+        raw0_1_4[2] = packets[18];
+        raw0_1_4[3] = packets[19];
         uint32_t _packed16_sanitize_4[4];
         #pragma unroll
         for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-            uint32_t _p16s_carrier_20 = static_cast<uint32_t>(raw4[_p16s_word]);
+            uint32_t _p16s_carrier_20 = static_cast<uint32_t>(raw0_1_4[_p16s_word]);
             uint32_t _p16s_lo_20 = _p16s_carrier_20 & 0x0000ffffu;
             uint32_t _p16s_hi_20 = (_p16s_carrier_20 >> 16) & 0x0000ffffu;
             if (_p16s_lo_20 == 0x00008000u) _p16s_lo_20 = 0u;
@@ -404,15 +404,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1(__nv_bfloat16* __restri
             __builtin_assume(__isGlobal(_gst_21));
             reinterpret_cast<int4*>(_gst_21)[0] = reinterpret_cast<int4*>(_packed16_sanitize_4)[0];
         }
-        unsigned int raw5[4];
-        raw5[0] = packets[20];
-        raw5[1] = packets[21];
-        raw5[2] = packets[22];
-        raw5[3] = packets[23];
+        unsigned int raw0_1_5[4];
+        raw0_1_5[0] = packets[20];
+        raw0_1_5[1] = packets[21];
+        raw0_1_5[2] = packets[22];
+        raw0_1_5[3] = packets[23];
         uint32_t _packed16_sanitize_5[4];
         #pragma unroll
         for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-            uint32_t _p16s_carrier_22 = static_cast<uint32_t>(raw5[_p16s_word]);
+            uint32_t _p16s_carrier_22 = static_cast<uint32_t>(raw0_1_5[_p16s_word]);
             uint32_t _p16s_lo_22 = _p16s_carrier_22 & 0x0000ffffu;
             uint32_t _p16s_hi_22 = (_p16s_carrier_22 >> 16) & 0x0000ffffu;
             if (_p16s_lo_22 == 0x00008000u) _p16s_lo_22 = 0u;
@@ -424,15 +424,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1(__nv_bfloat16* __restri
             __builtin_assume(__isGlobal(_gst_23));
             reinterpret_cast<int4*>(_gst_23)[0] = reinterpret_cast<int4*>(_packed16_sanitize_5)[0];
         }
-        unsigned int raw6[4];
-        raw6[0] = packets[24];
-        raw6[1] = packets[25];
-        raw6[2] = packets[26];
-        raw6[3] = packets[27];
+        unsigned int raw0_1_6[4];
+        raw0_1_6[0] = packets[24];
+        raw0_1_6[1] = packets[25];
+        raw0_1_6[2] = packets[26];
+        raw0_1_6[3] = packets[27];
         uint32_t _packed16_sanitize_6[4];
         #pragma unroll
         for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-            uint32_t _p16s_carrier_24 = static_cast<uint32_t>(raw6[_p16s_word]);
+            uint32_t _p16s_carrier_24 = static_cast<uint32_t>(raw0_1_6[_p16s_word]);
             uint32_t _p16s_lo_24 = _p16s_carrier_24 & 0x0000ffffu;
             uint32_t _p16s_hi_24 = (_p16s_carrier_24 >> 16) & 0x0000ffffu;
             if (_p16s_lo_24 == 0x00008000u) _p16s_lo_24 = 0u;
@@ -444,15 +444,15 @@ kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1(__nv_bfloat16* __restri
             __builtin_assume(__isGlobal(_gst_25));
             reinterpret_cast<int4*>(_gst_25)[0] = reinterpret_cast<int4*>(_packed16_sanitize_6)[0];
         }
-        unsigned int raw7[4];
-        raw7[0] = packets[28];
-        raw7[1] = packets[29];
-        raw7[2] = packets[30];
-        raw7[3] = packets[31];
+        unsigned int raw0_1_7[4];
+        raw0_1_7[0] = packets[28];
+        raw0_1_7[1] = packets[29];
+        raw0_1_7[2] = packets[30];
+        raw0_1_7[3] = packets[31];
         uint32_t _packed16_sanitize_7[4];
         #pragma unroll
         for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-            uint32_t _p16s_carrier_26 = static_cast<uint32_t>(raw7[_p16s_word]);
+            uint32_t _p16s_carrier_26 = static_cast<uint32_t>(raw0_1_7[_p16s_word]);
             uint32_t _p16s_lo_26 = _p16s_carrier_26 & 0x0000ffffu;
             uint32_t _p16s_hi_26 = (_p16s_carrier_26 >> 16) & 0x0000ffffu;
             if (_p16s_lo_26 == 0x00008000u) _p16s_lo_26 = 0u;
@@ -686,130 +686,130 @@ kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1(__nv_bfloat16* __restri
         float s8_0[8];
         float t0_0_0 = (float)_unpack_bf16_2[0];
         s8_0[0] = t0_0_0;
-        float t0_0_1 = (float)_unpack_bf16_3[0];
-        s8_0[0] = s8_0[0] + t0_0_1;
-        float t0_0_2 = (float)_unpack_bf16_4[0];
-        s8_0[0] = s8_0[0] + t0_0_2;
-        float t0_0_3 = (float)_unpack_bf16_5[0];
-        s8_0[0] = s8_0[0] + t0_0_3;
-        float t0_0_4 = (float)_unpack_bf16_6[0];
-        s8_0[0] = s8_0[0] + t0_0_4;
-        float t0_0_5 = (float)_unpack_bf16_7[0];
-        s8_0[0] = s8_0[0] + t0_0_5;
-        float t0_0_6 = (float)_unpack_bf16_8[0];
-        s8_0[0] = s8_0[0] + t0_0_6;
-        float t0_0_7 = (float)_unpack_bf16_9[0];
-        s8_0[0] = s8_0[0] + t0_0_7;
-        float t0_1_0 = (float)_unpack_bf16_2[1];
-        s8_0[1] = t0_1_0;
+        float t0_1_0 = (float)_unpack_bf16_3[0];
+        s8_0[0] = s8_0[0] + t0_1_0;
+        float t0_2_0 = (float)_unpack_bf16_4[0];
+        s8_0[0] = s8_0[0] + t0_2_0;
+        float t0_3_0 = (float)_unpack_bf16_5[0];
+        s8_0[0] = s8_0[0] + t0_3_0;
+        float t0_4_0 = (float)_unpack_bf16_6[0];
+        s8_0[0] = s8_0[0] + t0_4_0;
+        float t0_5_0 = (float)_unpack_bf16_7[0];
+        s8_0[0] = s8_0[0] + t0_5_0;
+        float t0_6_0 = (float)_unpack_bf16_8[0];
+        s8_0[0] = s8_0[0] + t0_6_0;
+        float t0_7_0 = (float)_unpack_bf16_9[0];
+        s8_0[0] = s8_0[0] + t0_7_0;
+        float t0_0_1 = (float)_unpack_bf16_2[1];
+        s8_0[1] = t0_0_1;
         float t0_1_1 = (float)_unpack_bf16_3[1];
         s8_0[1] = s8_0[1] + t0_1_1;
-        float t0_1_2 = (float)_unpack_bf16_4[1];
-        s8_0[1] = s8_0[1] + t0_1_2;
-        float t0_1_3 = (float)_unpack_bf16_5[1];
-        s8_0[1] = s8_0[1] + t0_1_3;
-        float t0_1_4 = (float)_unpack_bf16_6[1];
-        s8_0[1] = s8_0[1] + t0_1_4;
-        float t0_1_5 = (float)_unpack_bf16_7[1];
-        s8_0[1] = s8_0[1] + t0_1_5;
-        float t0_1_6 = (float)_unpack_bf16_8[1];
-        s8_0[1] = s8_0[1] + t0_1_6;
-        float t0_1_7 = (float)_unpack_bf16_9[1];
-        s8_0[1] = s8_0[1] + t0_1_7;
-        float t0_2_0 = (float)_unpack_bf16_2[2];
-        s8_0[2] = t0_2_0;
-        float t0_2_1 = (float)_unpack_bf16_3[2];
-        s8_0[2] = s8_0[2] + t0_2_1;
+        float t0_2_1 = (float)_unpack_bf16_4[1];
+        s8_0[1] = s8_0[1] + t0_2_1;
+        float t0_3_1 = (float)_unpack_bf16_5[1];
+        s8_0[1] = s8_0[1] + t0_3_1;
+        float t0_4_1 = (float)_unpack_bf16_6[1];
+        s8_0[1] = s8_0[1] + t0_4_1;
+        float t0_5_1 = (float)_unpack_bf16_7[1];
+        s8_0[1] = s8_0[1] + t0_5_1;
+        float t0_6_1 = (float)_unpack_bf16_8[1];
+        s8_0[1] = s8_0[1] + t0_6_1;
+        float t0_7_1 = (float)_unpack_bf16_9[1];
+        s8_0[1] = s8_0[1] + t0_7_1;
+        float t0_0_2 = (float)_unpack_bf16_2[2];
+        s8_0[2] = t0_0_2;
+        float t0_1_2 = (float)_unpack_bf16_3[2];
+        s8_0[2] = s8_0[2] + t0_1_2;
         float t0_2_2 = (float)_unpack_bf16_4[2];
         s8_0[2] = s8_0[2] + t0_2_2;
-        float t0_2_3 = (float)_unpack_bf16_5[2];
-        s8_0[2] = s8_0[2] + t0_2_3;
-        float t0_2_4 = (float)_unpack_bf16_6[2];
-        s8_0[2] = s8_0[2] + t0_2_4;
-        float t0_2_5 = (float)_unpack_bf16_7[2];
-        s8_0[2] = s8_0[2] + t0_2_5;
-        float t0_2_6 = (float)_unpack_bf16_8[2];
-        s8_0[2] = s8_0[2] + t0_2_6;
-        float t0_2_7 = (float)_unpack_bf16_9[2];
-        s8_0[2] = s8_0[2] + t0_2_7;
-        float t0_3_0 = (float)_unpack_bf16_2[3];
-        s8_0[3] = t0_3_0;
-        float t0_3_1 = (float)_unpack_bf16_3[3];
-        s8_0[3] = s8_0[3] + t0_3_1;
-        float t0_3_2 = (float)_unpack_bf16_4[3];
-        s8_0[3] = s8_0[3] + t0_3_2;
+        float t0_3_2 = (float)_unpack_bf16_5[2];
+        s8_0[2] = s8_0[2] + t0_3_2;
+        float t0_4_2 = (float)_unpack_bf16_6[2];
+        s8_0[2] = s8_0[2] + t0_4_2;
+        float t0_5_2 = (float)_unpack_bf16_7[2];
+        s8_0[2] = s8_0[2] + t0_5_2;
+        float t0_6_2 = (float)_unpack_bf16_8[2];
+        s8_0[2] = s8_0[2] + t0_6_2;
+        float t0_7_2 = (float)_unpack_bf16_9[2];
+        s8_0[2] = s8_0[2] + t0_7_2;
+        float t0_0_3 = (float)_unpack_bf16_2[3];
+        s8_0[3] = t0_0_3;
+        float t0_1_3 = (float)_unpack_bf16_3[3];
+        s8_0[3] = s8_0[3] + t0_1_3;
+        float t0_2_3 = (float)_unpack_bf16_4[3];
+        s8_0[3] = s8_0[3] + t0_2_3;
         float t0_3_3 = (float)_unpack_bf16_5[3];
         s8_0[3] = s8_0[3] + t0_3_3;
-        float t0_3_4 = (float)_unpack_bf16_6[3];
-        s8_0[3] = s8_0[3] + t0_3_4;
-        float t0_3_5 = (float)_unpack_bf16_7[3];
-        s8_0[3] = s8_0[3] + t0_3_5;
-        float t0_3_6 = (float)_unpack_bf16_8[3];
-        s8_0[3] = s8_0[3] + t0_3_6;
-        float t0_3_7 = (float)_unpack_bf16_9[3];
-        s8_0[3] = s8_0[3] + t0_3_7;
-        float t0_4_0 = (float)_unpack_bf16_2[4];
-        s8_0[4] = t0_4_0;
-        float t0_4_1 = (float)_unpack_bf16_3[4];
-        s8_0[4] = s8_0[4] + t0_4_1;
-        float t0_4_2 = (float)_unpack_bf16_4[4];
-        s8_0[4] = s8_0[4] + t0_4_2;
-        float t0_4_3 = (float)_unpack_bf16_5[4];
-        s8_0[4] = s8_0[4] + t0_4_3;
+        float t0_4_3 = (float)_unpack_bf16_6[3];
+        s8_0[3] = s8_0[3] + t0_4_3;
+        float t0_5_3 = (float)_unpack_bf16_7[3];
+        s8_0[3] = s8_0[3] + t0_5_3;
+        float t0_6_3 = (float)_unpack_bf16_8[3];
+        s8_0[3] = s8_0[3] + t0_6_3;
+        float t0_7_3 = (float)_unpack_bf16_9[3];
+        s8_0[3] = s8_0[3] + t0_7_3;
+        float t0_0_4 = (float)_unpack_bf16_2[4];
+        s8_0[4] = t0_0_4;
+        float t0_1_4 = (float)_unpack_bf16_3[4];
+        s8_0[4] = s8_0[4] + t0_1_4;
+        float t0_2_4 = (float)_unpack_bf16_4[4];
+        s8_0[4] = s8_0[4] + t0_2_4;
+        float t0_3_4 = (float)_unpack_bf16_5[4];
+        s8_0[4] = s8_0[4] + t0_3_4;
         float t0_4_4 = (float)_unpack_bf16_6[4];
         s8_0[4] = s8_0[4] + t0_4_4;
-        float t0_4_5 = (float)_unpack_bf16_7[4];
-        s8_0[4] = s8_0[4] + t0_4_5;
-        float t0_4_6 = (float)_unpack_bf16_8[4];
-        s8_0[4] = s8_0[4] + t0_4_6;
-        float t0_4_7 = (float)_unpack_bf16_9[4];
-        s8_0[4] = s8_0[4] + t0_4_7;
-        float t0_5_0 = (float)_unpack_bf16_2[5];
-        s8_0[5] = t0_5_0;
-        float t0_5_1 = (float)_unpack_bf16_3[5];
-        s8_0[5] = s8_0[5] + t0_5_1;
-        float t0_5_2 = (float)_unpack_bf16_4[5];
-        s8_0[5] = s8_0[5] + t0_5_2;
-        float t0_5_3 = (float)_unpack_bf16_5[5];
-        s8_0[5] = s8_0[5] + t0_5_3;
-        float t0_5_4 = (float)_unpack_bf16_6[5];
-        s8_0[5] = s8_0[5] + t0_5_4;
+        float t0_5_4 = (float)_unpack_bf16_7[4];
+        s8_0[4] = s8_0[4] + t0_5_4;
+        float t0_6_4 = (float)_unpack_bf16_8[4];
+        s8_0[4] = s8_0[4] + t0_6_4;
+        float t0_7_4 = (float)_unpack_bf16_9[4];
+        s8_0[4] = s8_0[4] + t0_7_4;
+        float t0_0_5 = (float)_unpack_bf16_2[5];
+        s8_0[5] = t0_0_5;
+        float t0_1_5 = (float)_unpack_bf16_3[5];
+        s8_0[5] = s8_0[5] + t0_1_5;
+        float t0_2_5 = (float)_unpack_bf16_4[5];
+        s8_0[5] = s8_0[5] + t0_2_5;
+        float t0_3_5 = (float)_unpack_bf16_5[5];
+        s8_0[5] = s8_0[5] + t0_3_5;
+        float t0_4_5 = (float)_unpack_bf16_6[5];
+        s8_0[5] = s8_0[5] + t0_4_5;
         float t0_5_5 = (float)_unpack_bf16_7[5];
         s8_0[5] = s8_0[5] + t0_5_5;
-        float t0_5_6 = (float)_unpack_bf16_8[5];
-        s8_0[5] = s8_0[5] + t0_5_6;
-        float t0_5_7 = (float)_unpack_bf16_9[5];
-        s8_0[5] = s8_0[5] + t0_5_7;
-        float t0_6_0 = (float)_unpack_bf16_2[6];
-        s8_0[6] = t0_6_0;
-        float t0_6_1 = (float)_unpack_bf16_3[6];
-        s8_0[6] = s8_0[6] + t0_6_1;
-        float t0_6_2 = (float)_unpack_bf16_4[6];
-        s8_0[6] = s8_0[6] + t0_6_2;
-        float t0_6_3 = (float)_unpack_bf16_5[6];
-        s8_0[6] = s8_0[6] + t0_6_3;
-        float t0_6_4 = (float)_unpack_bf16_6[6];
-        s8_0[6] = s8_0[6] + t0_6_4;
-        float t0_6_5 = (float)_unpack_bf16_7[6];
-        s8_0[6] = s8_0[6] + t0_6_5;
+        float t0_6_5 = (float)_unpack_bf16_8[5];
+        s8_0[5] = s8_0[5] + t0_6_5;
+        float t0_7_5 = (float)_unpack_bf16_9[5];
+        s8_0[5] = s8_0[5] + t0_7_5;
+        float t0_0_6 = (float)_unpack_bf16_2[6];
+        s8_0[6] = t0_0_6;
+        float t0_1_6 = (float)_unpack_bf16_3[6];
+        s8_0[6] = s8_0[6] + t0_1_6;
+        float t0_2_6 = (float)_unpack_bf16_4[6];
+        s8_0[6] = s8_0[6] + t0_2_6;
+        float t0_3_6 = (float)_unpack_bf16_5[6];
+        s8_0[6] = s8_0[6] + t0_3_6;
+        float t0_4_6 = (float)_unpack_bf16_6[6];
+        s8_0[6] = s8_0[6] + t0_4_6;
+        float t0_5_6 = (float)_unpack_bf16_7[6];
+        s8_0[6] = s8_0[6] + t0_5_6;
         float t0_6_6 = (float)_unpack_bf16_8[6];
         s8_0[6] = s8_0[6] + t0_6_6;
-        float t0_6_7 = (float)_unpack_bf16_9[6];
-        s8_0[6] = s8_0[6] + t0_6_7;
-        float t0_7_0 = (float)_unpack_bf16_2[7];
-        s8_0[7] = t0_7_0;
-        float t0_7_1 = (float)_unpack_bf16_3[7];
-        s8_0[7] = s8_0[7] + t0_7_1;
-        float t0_7_2 = (float)_unpack_bf16_4[7];
-        s8_0[7] = s8_0[7] + t0_7_2;
-        float t0_7_3 = (float)_unpack_bf16_5[7];
-        s8_0[7] = s8_0[7] + t0_7_3;
-        float t0_7_4 = (float)_unpack_bf16_6[7];
-        s8_0[7] = s8_0[7] + t0_7_4;
-        float t0_7_5 = (float)_unpack_bf16_7[7];
-        s8_0[7] = s8_0[7] + t0_7_5;
-        float t0_7_6 = (float)_unpack_bf16_8[7];
-        s8_0[7] = s8_0[7] + t0_7_6;
+        float t0_7_6 = (float)_unpack_bf16_9[6];
+        s8_0[6] = s8_0[6] + t0_7_6;
+        float t0_0_7 = (float)_unpack_bf16_2[7];
+        s8_0[7] = t0_0_7;
+        float t0_1_7 = (float)_unpack_bf16_3[7];
+        s8_0[7] = s8_0[7] + t0_1_7;
+        float t0_2_7 = (float)_unpack_bf16_4[7];
+        s8_0[7] = s8_0[7] + t0_2_7;
+        float t0_3_7 = (float)_unpack_bf16_5[7];
+        s8_0[7] = s8_0[7] + t0_3_7;
+        float t0_4_7 = (float)_unpack_bf16_6[7];
+        s8_0[7] = s8_0[7] + t0_4_7;
+        float t0_5_7 = (float)_unpack_bf16_7[7];
+        s8_0[7] = s8_0[7] + t0_5_7;
+        float t0_6_7 = (float)_unpack_bf16_8[7];
+        s8_0[7] = s8_0[7] + t0_6_7;
         float t0_7_7 = (float)_unpack_bf16_9[7];
         s8_0[7] = s8_0[7] + t0_7_7;
         unsigned int s8_0_bf16[4];
@@ -1075,150 +1075,150 @@ kernel_cake_tp_moe_finalize_rmsnorm_c77ae7bcb5be8fe145b1(__nv_bfloat16* __restri
             out8[6] = out8[6] + _vec_load_7[2];
             out8[3] = out8[3] + _vec_load_6[3];
             out8[7] = out8[7] + _vec_load_7[3];
-            float _vec_load_8[4];
+            float vec_load_0[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 8192) + 0);
-                _vec_load_8[0 + 0] = _v4.x;
-                _vec_load_8[0 + 1] = _v4.y;
-                _vec_load_8[0 + 2] = _v4.z;
-                _vec_load_8[0 + 3] = _v4.w;
+                vec_load_0[0 + 0] = _v4.x;
+                vec_load_0[0 + 1] = _v4.y;
+                vec_load_0[0 + 2] = _v4.z;
+                vec_load_0[0 + 3] = _v4.w;
             }
-            float _vec_load_9[4];
+            float vec_load_r_0[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 8196) + 0);
-                _vec_load_9[0 + 0] = _v4.x;
-                _vec_load_9[0 + 1] = _v4.y;
-                _vec_load_9[0 + 2] = _v4.z;
-                _vec_load_9[0 + 3] = _v4.w;
+                vec_load_r_0[0 + 0] = _v4.x;
+                vec_load_r_0[0 + 1] = _v4.y;
+                vec_load_r_0[0 + 2] = _v4.z;
+                vec_load_r_0[0 + 3] = _v4.w;
             }
-            out8[0] = out8[0] + _vec_load_8[0];
-            out8[4] = out8[4] + _vec_load_9[0];
-            out8[1] = out8[1] + _vec_load_8[1];
-            out8[5] = out8[5] + _vec_load_9[1];
-            out8[2] = out8[2] + _vec_load_8[2];
-            out8[6] = out8[6] + _vec_load_9[2];
-            out8[3] = out8[3] + _vec_load_8[3];
-            out8[7] = out8[7] + _vec_load_9[3];
-            float _vec_load_10[4];
+            out8[0] = out8[0] + vec_load_0[0];
+            out8[4] = out8[4] + vec_load_r_0[0];
+            out8[1] = out8[1] + vec_load_0[1];
+            out8[5] = out8[5] + vec_load_r_0[1];
+            out8[2] = out8[2] + vec_load_0[2];
+            out8[6] = out8[6] + vec_load_r_0[2];
+            out8[3] = out8[3] + vec_load_0[3];
+            out8[7] = out8[7] + vec_load_r_0[3];
+            float vec_load_1[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 12288) + 0);
-                _vec_load_10[0 + 0] = _v4.x;
-                _vec_load_10[0 + 1] = _v4.y;
-                _vec_load_10[0 + 2] = _v4.z;
-                _vec_load_10[0 + 3] = _v4.w;
+                vec_load_1[0 + 0] = _v4.x;
+                vec_load_1[0 + 1] = _v4.y;
+                vec_load_1[0 + 2] = _v4.z;
+                vec_load_1[0 + 3] = _v4.w;
             }
-            float _vec_load_11[4];
+            float vec_load_r_1[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 12292) + 0);
-                _vec_load_11[0 + 0] = _v4.x;
-                _vec_load_11[0 + 1] = _v4.y;
-                _vec_load_11[0 + 2] = _v4.z;
-                _vec_load_11[0 + 3] = _v4.w;
+                vec_load_r_1[0 + 0] = _v4.x;
+                vec_load_r_1[0 + 1] = _v4.y;
+                vec_load_r_1[0 + 2] = _v4.z;
+                vec_load_r_1[0 + 3] = _v4.w;
             }
-            out8[0] = out8[0] + _vec_load_10[0];
-            out8[4] = out8[4] + _vec_load_11[0];
-            out8[1] = out8[1] + _vec_load_10[1];
-            out8[5] = out8[5] + _vec_load_11[1];
-            out8[2] = out8[2] + _vec_load_10[2];
-            out8[6] = out8[6] + _vec_load_11[2];
-            out8[3] = out8[3] + _vec_load_10[3];
-            out8[7] = out8[7] + _vec_load_11[3];
-            float _vec_load_12[4];
+            out8[0] = out8[0] + vec_load_1[0];
+            out8[4] = out8[4] + vec_load_r_1[0];
+            out8[1] = out8[1] + vec_load_1[1];
+            out8[5] = out8[5] + vec_load_r_1[1];
+            out8[2] = out8[2] + vec_load_1[2];
+            out8[6] = out8[6] + vec_load_r_1[2];
+            out8[3] = out8[3] + vec_load_1[3];
+            out8[7] = out8[7] + vec_load_r_1[3];
+            float vec_load_2[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 16384) + 0);
-                _vec_load_12[0 + 0] = _v4.x;
-                _vec_load_12[0 + 1] = _v4.y;
-                _vec_load_12[0 + 2] = _v4.z;
-                _vec_load_12[0 + 3] = _v4.w;
+                vec_load_2[0 + 0] = _v4.x;
+                vec_load_2[0 + 1] = _v4.y;
+                vec_load_2[0 + 2] = _v4.z;
+                vec_load_2[0 + 3] = _v4.w;
             }
-            float _vec_load_13[4];
+            float vec_load_r_2[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 16388) + 0);
-                _vec_load_13[0 + 0] = _v4.x;
-                _vec_load_13[0 + 1] = _v4.y;
-                _vec_load_13[0 + 2] = _v4.z;
-                _vec_load_13[0 + 3] = _v4.w;
+                vec_load_r_2[0 + 0] = _v4.x;
+                vec_load_r_2[0 + 1] = _v4.y;
+                vec_load_r_2[0 + 2] = _v4.z;
+                vec_load_r_2[0 + 3] = _v4.w;
             }
-            out8[0] = out8[0] + _vec_load_12[0];
-            out8[4] = out8[4] + _vec_load_13[0];
-            out8[1] = out8[1] + _vec_load_12[1];
-            out8[5] = out8[5] + _vec_load_13[1];
-            out8[2] = out8[2] + _vec_load_12[2];
-            out8[6] = out8[6] + _vec_load_13[2];
-            out8[3] = out8[3] + _vec_load_12[3];
-            out8[7] = out8[7] + _vec_load_13[3];
-            float _vec_load_14[4];
+            out8[0] = out8[0] + vec_load_2[0];
+            out8[4] = out8[4] + vec_load_r_2[0];
+            out8[1] = out8[1] + vec_load_2[1];
+            out8[5] = out8[5] + vec_load_r_2[1];
+            out8[2] = out8[2] + vec_load_2[2];
+            out8[6] = out8[6] + vec_load_r_2[2];
+            out8[3] = out8[3] + vec_load_2[3];
+            out8[7] = out8[7] + vec_load_r_2[3];
+            float vec_load_3[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 20480) + 0);
-                _vec_load_14[0 + 0] = _v4.x;
-                _vec_load_14[0 + 1] = _v4.y;
-                _vec_load_14[0 + 2] = _v4.z;
-                _vec_load_14[0 + 3] = _v4.w;
+                vec_load_3[0 + 0] = _v4.x;
+                vec_load_3[0 + 1] = _v4.y;
+                vec_load_3[0 + 2] = _v4.z;
+                vec_load_3[0 + 3] = _v4.w;
             }
-            float _vec_load_15[4];
+            float vec_load_r_3[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 20484) + 0);
-                _vec_load_15[0 + 0] = _v4.x;
-                _vec_load_15[0 + 1] = _v4.y;
-                _vec_load_15[0 + 2] = _v4.z;
-                _vec_load_15[0 + 3] = _v4.w;
+                vec_load_r_3[0 + 0] = _v4.x;
+                vec_load_r_3[0 + 1] = _v4.y;
+                vec_load_r_3[0 + 2] = _v4.z;
+                vec_load_r_3[0 + 3] = _v4.w;
             }
-            out8[0] = out8[0] + _vec_load_14[0];
-            out8[4] = out8[4] + _vec_load_15[0];
-            out8[1] = out8[1] + _vec_load_14[1];
-            out8[5] = out8[5] + _vec_load_15[1];
-            out8[2] = out8[2] + _vec_load_14[2];
-            out8[6] = out8[6] + _vec_load_15[2];
-            out8[3] = out8[3] + _vec_load_14[3];
-            out8[7] = out8[7] + _vec_load_15[3];
-            float _vec_load_16[4];
+            out8[0] = out8[0] + vec_load_3[0];
+            out8[4] = out8[4] + vec_load_r_3[0];
+            out8[1] = out8[1] + vec_load_3[1];
+            out8[5] = out8[5] + vec_load_r_3[1];
+            out8[2] = out8[2] + vec_load_3[2];
+            out8[6] = out8[6] + vec_load_r_3[2];
+            out8[3] = out8[3] + vec_load_3[3];
+            out8[7] = out8[7] + vec_load_r_3[3];
+            float vec_load_4[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 24576) + 0);
-                _vec_load_16[0 + 0] = _v4.x;
-                _vec_load_16[0 + 1] = _v4.y;
-                _vec_load_16[0 + 2] = _v4.z;
-                _vec_load_16[0 + 3] = _v4.w;
+                vec_load_4[0 + 0] = _v4.x;
+                vec_load_4[0 + 1] = _v4.y;
+                vec_load_4[0 + 2] = _v4.z;
+                vec_load_4[0 + 3] = _v4.w;
             }
-            float _vec_load_17[4];
+            float vec_load_r_4[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 24580) + 0);
-                _vec_load_17[0 + 0] = _v4.x;
-                _vec_load_17[0 + 1] = _v4.y;
-                _vec_load_17[0 + 2] = _v4.z;
-                _vec_load_17[0 + 3] = _v4.w;
+                vec_load_r_4[0 + 0] = _v4.x;
+                vec_load_r_4[0 + 1] = _v4.y;
+                vec_load_r_4[0 + 2] = _v4.z;
+                vec_load_r_4[0 + 3] = _v4.w;
             }
-            out8[0] = out8[0] + _vec_load_16[0];
-            out8[4] = out8[4] + _vec_load_17[0];
-            out8[1] = out8[1] + _vec_load_16[1];
-            out8[5] = out8[5] + _vec_load_17[1];
-            out8[2] = out8[2] + _vec_load_16[2];
-            out8[6] = out8[6] + _vec_load_17[2];
-            out8[3] = out8[3] + _vec_load_16[3];
-            out8[7] = out8[7] + _vec_load_17[3];
-            float _vec_load_18[4];
+            out8[0] = out8[0] + vec_load_4[0];
+            out8[4] = out8[4] + vec_load_r_4[0];
+            out8[1] = out8[1] + vec_load_4[1];
+            out8[5] = out8[5] + vec_load_r_4[1];
+            out8[2] = out8[2] + vec_load_4[2];
+            out8[6] = out8[6] + vec_load_r_4[2];
+            out8[3] = out8[3] + vec_load_4[3];
+            out8[7] = out8[7] + vec_load_r_4[3];
+            float vec_load_5[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 28672) + 0);
-                _vec_load_18[0 + 0] = _v4.x;
-                _vec_load_18[0 + 1] = _v4.y;
-                _vec_load_18[0 + 2] = _v4.z;
-                _vec_load_18[0 + 3] = _v4.w;
+                vec_load_5[0 + 0] = _v4.x;
+                vec_load_5[0 + 1] = _v4.y;
+                vec_load_5[0 + 2] = _v4.z;
+                vec_load_5[0 + 3] = _v4.w;
             }
-            float _vec_load_19[4];
+            float vec_load_r_5[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(part + (c_base + 28676) + 0);
-                _vec_load_19[0 + 0] = _v4.x;
-                _vec_load_19[0 + 1] = _v4.y;
-                _vec_load_19[0 + 2] = _v4.z;
-                _vec_load_19[0 + 3] = _v4.w;
+                vec_load_r_5[0 + 0] = _v4.x;
+                vec_load_r_5[0 + 1] = _v4.y;
+                vec_load_r_5[0 + 2] = _v4.z;
+                vec_load_r_5[0 + 3] = _v4.w;
             }
-            out8[0] = out8[0] + _vec_load_18[0];
-            out8[4] = out8[4] + _vec_load_19[0];
-            out8[1] = out8[1] + _vec_load_18[1];
-            out8[5] = out8[5] + _vec_load_19[1];
-            out8[2] = out8[2] + _vec_load_18[2];
-            out8[6] = out8[6] + _vec_load_19[2];
-            out8[3] = out8[3] + _vec_load_18[3];
-            out8[7] = out8[7] + _vec_load_19[3];
+            out8[0] = out8[0] + vec_load_5[0];
+            out8[4] = out8[4] + vec_load_r_5[0];
+            out8[1] = out8[1] + vec_load_5[1];
+            out8[5] = out8[5] + vec_load_r_5[1];
+            out8[2] = out8[2] + vec_load_5[2];
+            out8[6] = out8[6] + vec_load_r_5[2];
+            out8[3] = out8[3] + vec_load_5[3];
+            out8[7] = out8[7] + vec_load_r_5[3];
             unsigned int out8_bf16[4];
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {

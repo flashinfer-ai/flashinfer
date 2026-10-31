@@ -25,7 +25,7 @@ PACKAGES: dict[str, str] = {
     "cake_dsa_train": "flashinfer.experimental.cake_dsa_train",
     "cake_dsa_indexer_det": "flashinfer.experimental.cake_dsa_indexer_det",
     "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",
-    "cake_lm_head_loss": "flashinfer.experimental.cake_lm_head_loss",
+    "cake_lm_head_det_loss": "flashinfer.experimental.cake_lm_head_det_loss",
     "dense_projection_det_gemm": "flashinfer.experimental.dense_projection_det_gemm",
     "cake_moe_grouped_det_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
     # the suite name before the deterministic-family rename (compatibility alias)
@@ -53,7 +53,7 @@ PACKAGES: dict[str, str] = {
 def cake_package(name: str, submodule: str | None = None) -> ModuleType:
     """The package module of ``name`` (a key of :data:`PACKAGES`), or its ``submodule`` (``"cake_backend"``, ...).
 
-    ``cake_package("cake_lm_head_loss")`` is the package itself; ``cake_package("cake_lm_head_loss", "cake_backend")``
+    ``cake_package("cake_lm_head_det_loss")`` is the package itself; ``cake_package("cake_lm_head_det_loss", "cake_backend")``
     is ``<package>.cake_backend``.  Raises ``KeyError`` for a name the table does not list.
     """
     path = PACKAGES[name]
