@@ -163,6 +163,7 @@ def _backend():
     return cake_causal_conv1d_train_backend
 
 
+@flashinfer_experimental_api(feature=_FEATURE)
 def is_cake_causal_conv1d_train_supported(
     device: torch.device, *, deterministic: bool = True
 ) -> bool:
@@ -179,6 +180,7 @@ def is_cake_causal_conv1d_train_supported(
     return _backend().is_cake_causal_conv1d_train_supported(device)
 
 
+@flashinfer_experimental_api(feature=_FEATURE)
 def cake_causal_conv1d_train_backward_workspace_bytes(
     S: int, C: int, device: torch.device, *, deterministic: bool = True
 ) -> int:
@@ -204,6 +206,7 @@ def cake_causal_conv1d_train_backward_workspace_bytes(
     )
 
 
+@flashinfer_experimental_api(feature=_FEATURE)
 def cake_causal_conv1d_train_backward_workspace(
     S: int, C: int, device: torch.device, *, deterministic: bool = True
 ) -> torch.Tensor:
@@ -221,6 +224,7 @@ def cake_causal_conv1d_train_backward_workspace(
     )
 
 
+@flashinfer_experimental_api(feature=_FEATURE)
 def cake_causal_conv1d_train_forward_workspace_bytes(
     S: int, C: int, device: torch.device, *, deterministic: bool = True
 ) -> int:
@@ -238,6 +242,7 @@ def cake_causal_conv1d_train_forward_workspace_bytes(
     )
 
 
+@flashinfer_experimental_api(feature=_FEATURE)
 def cake_causal_conv1d_train_forward_workspace(
     S: int, C: int, device: torch.device, *, deterministic: bool = True
 ) -> torch.Tensor:
@@ -346,7 +351,9 @@ def cake_causal_conv1d_train_backward(
         torch-deterministic-mode fallback of ``deterministic=False``.
     dx, dweight, dbias : torch.Tensor, optional
         Preallocated outputs: BF16 of ``x``'s shape, ``[C, 4]`` and ``[C]``
-        (FP32 or BF16 each; the parameter's dtype when omitted).
+        (FP32 or BF16 each; the parameter's dtype when omitted).  With
+        ``deterministic=False`` an FP32 ``dweight`` must be 16-byte aligned
+        (one 16-byte store per channel; ``ValueError`` otherwise).
     deterministic : bool
         ``True`` (default): main launch + fixed-order reduce launch, bitwise
         reproducible gradients.  ``False``: one launch with unordered

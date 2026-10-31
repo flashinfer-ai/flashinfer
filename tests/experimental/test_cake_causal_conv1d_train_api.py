@@ -362,7 +362,7 @@ def test_facade_signatures_mirror_the_packages() -> None:
 
 @pytest.mark.cpu_only
 def test_entry_points_are_experimental() -> None:
-    for entry in ENTRIES:
+    for entry in (*ENTRIES, *HELPERS, "is_cake_causal_conv1d_train_supported"):
         assert getattr(getattr(facade, entry), "is_experimental", False) is True, entry
     for entry in KCP_ENTRIES:
         assert getattr(getattr(kcp_facade, entry), "is_experimental", False) is True, (

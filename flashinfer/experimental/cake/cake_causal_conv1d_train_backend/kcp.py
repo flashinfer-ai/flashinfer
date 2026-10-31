@@ -113,6 +113,7 @@ from . import (
     _cu_seqlens,
     _device_arch,
     _device_index,
+    _dweight_aligned,
     _output,
     _require_nondeterministic,
     _require_tensor,
@@ -966,7 +967,9 @@ def cake_causal_conv1d_backward_kcp(
     same order.  ``graph`` as in the forward (the backward's key holds the forward's ``hist`` pointer, so its capture
     follows the forward's by one call).  ``deterministic`` must be ``False`` (``ValueError`` otherwise); under
     ``torch.use_deterministic_algorithms(True)`` the call raises a ``RuntimeError`` (a ``UserWarning`` with
-    ``warn_only=True``) before it launches or exchanges anything.
+    ``warn_only=True``) before it launches or exchanges anything.  Preallocated outputs: ``dx`` BF16 of
+    ``x_local``'s shape and ``dweight`` FP32 ``[C, 4]``, contiguous; ``dweight`` must be 16-byte aligned (one
+    16-byte store per channel; ``ValueError`` otherwise).
     """
 
     _require_nondeterministic(deterministic, "cake_causal_conv1d_backward_kcp")
@@ -1028,8 +1031,10 @@ def _kcp_backward(
     dx_out = _output(
         dx, "dx", shape=tuple(x.shape), dtype=torch.bfloat16, device=device
     )
-    dw_out = _output(
-        dweight, "dweight", shape=(C, WIDTH), dtype=torch.float32, device=device
+    dw_out = _dweight_aligned(
+        _output(
+            dweight, "dweight", shape=(C, WIDTH), dtype=torch.float32, device=device
+        )
     )
     device_index = _device_index(device)
     n_head = int(halo.n_head_rows)
@@ -1158,8 +1163,10 @@ def _bwd_host(
     dx_out = _output(
         dx, "dx", shape=tuple(x.shape), dtype=torch.bfloat16, device=device
     )
-    dw_out = _output(
-        dweight, "dweight", shape=(C, WIDTH), dtype=torch.float32, device=device
+    dw_out = _dweight_aligned(
+        _output(
+            dweight, "dweight", shape=(C, WIDTH), dtype=torch.float32, device=device
+        )
     )
     e = _host_cache_entry(
         ctx, ("bwd", S, C, str(device), tuple(ctx.cu_seqlens_local_cpu))
@@ -1656,6 +1663,7 @@ def cake_causal_conv1d_multi_backward_kcp(
     launch per tensor on the stream's accumulator workspace).  ``hists`` are the forward's pools.  Every rank calls
     this function once per layer, in the same order.  ``graph`` as in :func:`cake_causal_conv1d_backward_kcp`.
     ``deterministic`` must be ``False``; under torch's deterministic mode the call alerts like the single backward.
+    ``dxs`` / ``dweights`` entries follow the single backward's output rules (``dweight`` 16-byte aligned).
     """
 
     _require_nondeterministic(deterministic, "cake_causal_conv1d_multi_backward_kcp")

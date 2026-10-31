@@ -377,6 +377,23 @@ def _output(
     return out
 
 
+# The backward programs store one channel's four FP32 ``dweight`` taps with one 16-byte store.
+DWEIGHT_FP32_ALIGN = 16
+
+
+def _dweight_aligned(dw_out: torch.Tensor) -> torch.Tensor:
+    """An FP32 ``dweight`` output whose address is :data:`DWEIGHT_FP32_ALIGN`-byte aligned (``ValueError``
+    otherwise; a fresh tensor always is).  BF16 ``dweight`` and ``dbias`` are stored per element."""
+
+    misaligned = dw_out.data_ptr() % DWEIGHT_FP32_ALIGN
+    if dw_out.dtype == torch.float32 and misaligned:
+        raise ValueError(
+            f"an FP32 dweight must be {DWEIGHT_FP32_ALIGN}-byte aligned (each channel's {WIDTH} taps are stored "
+            f"with one {DWEIGHT_FP32_ALIGN}-byte store), got data_ptr() % {DWEIGHT_FP32_ALIGN} == {misaligned}"
+        )
+    return dw_out
+
+
 def _silu_grad_preactivation(value: object) -> str:
     if value not in SILU_GRAD_PREACTIVATIONS:
         raise ValueError(
@@ -860,6 +877,8 @@ def cake_causal_conv1d_train_backward(
     dx, dweight, dbias : torch.Tensor, optional
         Preallocated outputs: BF16 of ``x``'s shape, ``[C, 4]`` and ``[C]``
         (FP32 or BF16 each; the parameter's dtype when omitted), contiguous.
+        An FP32 ``dweight`` must be 16-byte aligned (each channel's four taps
+        are stored with one 16-byte store; ``ValueError`` otherwise).
         ``dbias`` needs ``bias``.  Every element is overwritten.
     deterministic : bool
         Must be ``False`` (``ValueError`` otherwise).  Under
@@ -890,13 +909,15 @@ def cake_causal_conv1d_train_backward(
     dx_out = _output(
         dx, "dx", shape=tuple(x.shape), dtype=torch.bfloat16, device=device
     )
-    dw_out = _output(
-        dweight,
-        "dweight",
-        shape=(C, WIDTH),
-        dtype=w.dtype,
-        device=device,
-        dtypes=PARAMETER_DTYPES,
+    dw_out = _dweight_aligned(
+        _output(
+            dweight,
+            "dweight",
+            shape=(C, WIDTH),
+            dtype=w.dtype,
+            device=device,
+            dtypes=PARAMETER_DTYPES,
+        )
     )
     if b is None:
         if dbias is not None:
