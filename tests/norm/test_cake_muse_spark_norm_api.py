@@ -183,14 +183,14 @@ GAPS_SM107A = {
 }
 # The declared gaps of the PDL routes, keyed (arch, route, head count or None): the row counts where the CuTe DSL kernel
 # under PDL measured ahead of both the PDL build and the plain build of the routed program, so the facade's auto keeps
-# it there.  Op A's mode-0 routes declare gaps (one on sm_100a, two on sm_103a); op C's bf16_pdl tables declare the token counts the CuTe DSL
+# it there.  Op A's mode-0 routes declare one gap on each architecture; op C's bf16_pdl tables declare the token counts the CuTe DSL
 # kernel under PDL wins in the graph regime (one token at every head count, 128 heads around 64 tokens and 32 heads
 # around 128 and 256 tokens on the Blackwell architectures; one token at every head count, 128 heads at 25-39 and 41-47,
 # 32 heads at 14, 25-63, 66-69 and 71-257 on sm_107a); the windows and gaps partition the token count for every head
 # count and keep the plain route's boundaries a program touches (a gap may span one).
 GAPS_PDL = {
     ("sm_100a", f"{OP_A}_mode0_pdl", None): ((768, 4095),),
-    ("sm_103a", f"{OP_A}_mode0_pdl", None): ((1024, 2048), (4096, 8191)),
+    ("sm_103a", f"{OP_A}_mode0_pdl", None): ((1536, 2048),),
     ("sm_100a", f"{OP_C}_bf16_pdl", 128): ((0, 1), (16, 64)),
     ("sm_100a", f"{OP_C}_bf16_pdl", 32): ((0, 1), (64, 128), (192, 257)),
     ("sm_100a", f"{OP_C}_bf16_pdl", 16): ((0, 1),),
@@ -209,26 +209,32 @@ GAPS_PDL = {
 }
 # Op A's Blackwell PDL routes, (at_most, program) windows per (arch, mode), the last unbounded: a program named by its
 # place in the plain route (c2 / c4 / rsa the three small-M composites, pro the prologue whole-row program, psb the
-# parked whole-row program) stands for its PDL build; (program, "plain") for the plain build the PDL route borrows
-# (launched without the attribute: the PDL build measured slower than the CuTe DSL kernel under PDL there and the
-# plain build faster; no op A window does so since the re-measurement, which gave every such row to the prologue
-# program's PDL build); None for a declared gap.
+# parked whole-row program, l2 the prologue program's L2-prefetch form) stands for its PDL build (the prologue
+# program's plain build ships on sm_100a alone in mode 1, its PDL build on both architectures); a name of
+# OP_A_PDL_ONLY for a form of the prologue program that ships under PDL only; (program, "plain") for the plain build
+# the PDL route borrows (launched without the attribute: the PDL build measured slower than the CuTe DSL kernel under
+# PDL there and the plain build faster; no op A window does so since the re-measurement, which gave every such row to
+# the prologue program's PDL build); None for a declared gap.
 OP_A_PLAIN_ORDER = ("c2", "c4", "rsa", "pro", "psb")
 # The parked program's late-store form (the parked program's build with these keywords changed): the sixth record
-# of sm_100a's mode-1 plain route, owning 512-1024 and 2049-4096 rows, and the fourth of sm_103a's, owning 129-2048.
+# of sm_100a's mode-1 plain route, owning 512-1024 and 2049-4096 rows, and the fourth of sm_103a's, owning 129-1023.
 OP_A_LATE_STORE = {"psb_late": {"planes_path": "sts_late"}}
-# The large-M forms of the prologue program on sm_103a (the prologue program's plain build with these keywords
-# changed): the sixth record of sm_103a's mode-0 plain route, owning 8193 rows up (the alpha / beta planes issued
-# after the row's residual loads), and of its mode-1 route, owning 4097 rows up (the coherent evict_last plane
-# loads: the plain build of the PDL routes' abel form). Both ship on sm_103a alone.
-OP_A_LARGE_M = {"pprl": {"planes_path": "regs_late"}, "abel": {"ab_hint": "el"}}
+# The L2-prefetch forms of the prologue program on sm_103a (the prologue program's plain build with these keywords
+# changed, shipped on sm_103a alone): each CTA issues one bulk L2 prefetch of the row 304 rows ahead of its own (l2),
+# or of that row's residual alone (l2r). In mode 0 l2 owns 1024-8192 rows and l2r the rows above; in mode 1 l2 owns
+# every row from 1024 up. The PDL routes run the PDL build of l2 too.
+OP_A_L2_PREFETCH = {
+    "l2": {"l2_prefetch": 304},
+    "l2r": {"l2_prefetch": 304, "l2pf_form": "res"},
+}
 # Op A's Blackwell plain routes per (arch, mode): (place, windows) rows in route order, a window (above, at_most).
 # The whole-row programs follow the three small-M composites: on sm_100a the prologue program owns 129-383 and the
 # rows above the parked band, the parked program 384-2048 (mode 0: the prologue program from 2049; mode 1: the parked
 # program at 384-511 and 1025-2048 around the late-store form's 512-1024, the late-store form again at 2049-4096 and
-# the prologue program from 4097); on sm_103a,
-# re-measured on GB300, mode 0 parks 129-224 and 257-2048 around the prologue program's 225-256 and mode 1 hands
-# 129-2048 to the late-store form, the prologue program keeping 2049- (the parked program's own build left the route).
+# the prologue program from 4097); on sm_103a, re-measured on GB300, mode 0 parks 129-224 and 257-1023 around the
+# prologue program's 225-256 and gives the rows from 1024 up to the L2-prefetch forms, and mode 1 gives 129-1023 to
+# the late-store form and the rows from 1024 up to the L2-prefetch form (neither the parked program's own build nor
+# the prologue program's plain build is in that route).
 OP_A_PLAIN_WINDOWS = {
     ("sm_100a", 0): (
         ("c2", [(0, 16)]),
@@ -249,26 +255,38 @@ OP_A_PLAIN_WINDOWS = {
         ("c2", [(0, 16)]),
         ("c4", [(16, 64)]),
         ("rsa", [(64, 128)]),
-        ("psb", [(128, 224), (256, 2048)]),
-        ("pro", [(224, 256), (2048, 8192)]),
-        ("pprl", [(8192, None)]),
+        ("psb", [(128, 224), (256, 1023)]),
+        ("pro", [(224, 256)]),
+        ("l2", [(1023, 8192)]),
+        ("l2r", [(8192, None)]),
     ),
     ("sm_103a", 1): (
         ("c2", [(0, 16)]),
         ("c4", [(16, 64)]),
         ("rsa", [(64, 128)]),
-        ("psb_late", [(128, 2048)]),
-        ("pro", [(2048, 4096)]),
-        ("abel", [(4096, None)]),
+        ("psb_late", [(128, 1023)]),
+        ("l2", [(1023, None)]),
     ),
 }
-# The sm_100a PDL routes' forms of the prologue whole-row program that ship under PDL only (no plain-route record):
-# the build of the prologue program's PDL build with these keywords changed.
+# The forms of the prologue whole-row program that ship under PDL only (no plain-route record): the prologue
+# program's PDL build with these keywords changed. abel loads the alpha / beta planes under the evict_last hint, pk
+# is the packed form and h the hoisted form; the l2 forms, on sm_103a alone, add one change to the L2 prefetch of
+# OP_A_L2_PREFETCH: l2x rebuilds the row's values after the reduction barrier instead of holding them in registers,
+# l2i brings the residual row into shared memory by one bulk copy, l2w has the first wave of CTAs prefetch its own
+# rows as well, and l2o writes the output row from shared memory by one bulk store.
 OP_A_PDL_ONLY = {
     "abel": {"ab_hint": "el"},
     "pk": {"packed": True},
     "h": {"hoist": True},
+    "l2x": {"l2_prefetch": 304, "x_late": True},
+    "l2i": {"l2_prefetch": 304, "in_bulk": "res"},
+    "l2w": {"l2_prefetch": 304, "wave0": "own"},
+    "l2o": {"l2_prefetch": 304, "out_bulk": True},
 }
+# On sm_103a the L2-prefetch forms own the PDL routes from 513 rows up in both modes: in mode 0 the
+# late-rebuild form at 513-768, l2 at 769-1536 and 2049-5120 around a gap at 1537-2048, the bulk-residual form at
+# 5121-7168, the first-wave form at 7169-8191 and the bulk-store form from 8192; in mode 1 l2 at 513-5632 and
+# 7169-8191 around the first-wave form's 5633-7168, the bulk-store form from 8192.
 OP_A_PDL_WINDOWS = {
     ("sm_100a", 0): (
         (16, "c2"),
@@ -300,12 +318,13 @@ OP_A_PDL_WINDOWS = {
         (256, "psb"),
         (384, "pk"),
         (512, "pro"),
-        (768, "pk"),
-        (1024, "pro"),
+        (768, "l2x"),
+        (1536, "l2"),
         (2048, None),
-        (4096, "pro"),
-        (8191, None),
-        (None, "pro"),
+        (5120, "l2"),
+        (7168, "l2i"),
+        (8191, "l2w"),
+        (None, "l2o"),
     ),
     ("sm_103a", 1): (
         (16, "c2"),
@@ -313,10 +332,10 @@ OP_A_PDL_WINDOWS = {
         (128, "rsa"),
         (256, "abel"),
         (512, "pro"),
-        (768, "pk"),
-        (1024, "pro"),
-        (2048, "pk"),
-        (None, "pro"),
+        (5632, "l2"),
+        (7168, "l2w"),
+        (8191, "l2"),
+        (None, "l2o"),
     ),
 }
 # Op C's PDL route per architecture: (heads, above, at_most) -> (the selecting keywords of the program, as OP_C_WINDOWS
@@ -484,8 +503,9 @@ def _routes_of(arch: str) -> set:
 def _op_a_programs(arch: str, mode: int) -> dict:
     """The plain route's records of a mode on ``arch`` by their place (OP_A_PLAIN_WINDOWS): the route lists them
     in window order, so a place is told by its build -- the three small-M composites by position, the whole-row
-    programs by beta's plane (``planes_smem`` none: the prologue program; beta parked in shared memory: the parked
-    program, its late-store form under the ``planes_path`` of OP_A_LATE_STORE)."""
+    programs by beta's plane (``planes_smem`` none: the prologue program, its L2-prefetch forms under the keywords of
+    OP_A_L2_PREFETCH; beta parked in shared memory: the parked program, its late-store form under the
+    ``planes_path`` of OP_A_LATE_STORE)."""
     names = loader.route_modules(arch, loader.route_key(OP_A, f"mode{mode}"))
     places = [place for place, _windows in OP_A_PLAIN_WINDOWS[(arch, mode)]]
     assert len(names) == len(places), (arch, mode, names)
@@ -493,14 +513,15 @@ def _op_a_programs(arch: str, mode: int) -> dict:
     for name in names[3:]:
         build = loader.MODULES[name]["build"]
         if build["planes_smem"] == "none":
-            # the prologue program, or one of its large-M forms (told by the keywords of OP_A_LARGE_M)
-            place = next(
-                (
-                    form
-                    for form, keywords in OP_A_LARGE_M.items()
-                    if all(build[key] == value for key, value in keywords.items())
-                ),
-                "pro",
+            # the prologue program, or the L2-prefetch form whose keywords the build carries (the residual-only
+            # form carries the plain form's keyword too, so the form with the most matching keywords is taken)
+            forms = [
+                form
+                for form, keywords in OP_A_L2_PREFETCH.items()
+                if all(build.get(key) == value for key, value in keywords.items())
+            ]
+            place = max(
+                forms, key=lambda form: len(OP_A_L2_PREFETCH[form]), default="pro"
             )
         else:
             assert build["planes_smem"] == "beta", (arch, mode, name)
@@ -510,18 +531,16 @@ def _op_a_programs(arch: str, mode: int) -> dict:
         programs[place] = name
     assert list(programs) == places, (arch, mode, names)
     if "psb_late" in programs:
-        # the parked program's build with the keywords changed; sm_103a's mode-1 route lacks the parked program
-        # itself, so its record comes from the sm_100a route
-        parked = programs.get("psb") or _op_a_programs("sm_100a", mode)["psb"]
+        # the parked program's build with the keywords changed
         assert loader.MODULES[programs["psb_late"]]["build"] == {
-            **loader.MODULES[parked]["build"],
+            **loader.MODULES[_op_a_place(programs, mode, "psb")]["build"],
             **OP_A_LATE_STORE["psb_late"],
         }, (arch, mode)
-    for form, keywords in OP_A_LARGE_M.items():
+    for form, keywords in OP_A_L2_PREFETCH.items():
         if form in programs:
             # the prologue program's build with the form's keywords changed, shipped on sm_103a alone
             assert loader.MODULES[programs[form]]["build"] == {
-                **loader.MODULES[programs["pro"]]["build"],
+                **loader.MODULES[_op_a_place(programs, mode, "pro")]["build"],
                 **keywords,
             }, (arch, mode, form)
             assert loader.MODULES[programs[form]]["arches"] == ["sm_103a"], (
@@ -532,10 +551,19 @@ def _op_a_programs(arch: str, mode: int) -> dict:
     return programs
 
 
-def _op_a_pdl_only(programs: dict, program: str) -> str:
+def _op_a_place(programs: dict, mode: int, place: str) -> str:
+    """The plain record of a whole-row program by its place: the route's own, or, for a program that sm_103a's
+    mode-1 route lacks (the parked program, the prologue program), the record of the sm_100a route of the mode."""
+    if place in programs:
+        return programs[place]
+    return _op_a_programs("sm_100a", mode)[place]
+
+
+def _op_a_pdl_only(programs: dict, mode: int, program: str) -> str:
     """The record of a PDL-only form of op A's prologue program (OP_A_PDL_ONLY): the prologue program's PDL build
     with the form's keywords, found among every record (it is in no plain route)."""
-    base = loader.MODULES[_pdl_build_of(programs["pro"])]["build"]
+    prologue = _op_a_place(programs, mode, "pro")
+    base = loader.MODULES[_pdl_build_of(prologue)]["build"]
     build = {**base, **OP_A_PDL_ONLY[program]}
     (twin,) = [
         other
@@ -865,7 +893,7 @@ def test_routes_partition_the_row_counts():
     assert loader.route_available("sm_107a", loader.route_key(OP, "alpha_tensor_pw"))
     assert (
         len(loader.route_modules("sm_107a", loader.route_key(OP, "alpha_tensor_pw")))
-        == 4
+        == 5
     )
     scalar_pw = loader.route_key(OP, "alpha_scalar_pw")
     small_rows, whole_range = loader.route_modules("sm_107a", scalar_pw)
@@ -1228,13 +1256,22 @@ OP_A_PROBE_ROWS = (
     512,
     768,
     769,
+    1023,
     1024,
     1025,
+    1536,
+    1537,
     2048,
     2049,
     4095,
     4096,
     4097,
+    5120,
+    5121,
+    5632,
+    5633,
+    7168,
+    7169,
     8191,
     8192,
     8193,
@@ -1247,9 +1284,10 @@ def test_gated_residual_rmsnorm_routes_window_the_row_count():
     """Op A's Blackwell plain routes (two architectures x two modes) hold the programs of OP_A_PLAIN_WINDOWS over
     the windows 1-16 / 17-64 / 65-128 of the three small-M composites and the whole-row programs' windows, which
     partition the rows above 128 (the parked program's late-store form a sixth record on sm_100a in mode 1 and in
-    the parked program's place on sm_103a in mode 1; on sm_103a a sixth record in each mode since the large-M
-    re-measurement: the prologue program's regs_late form above 8192 rows in mode 0 and its plain evict_last-plane
-    form above 4096 rows in mode 1); the records appear in the route in window order, each once, and the programs
+    the parked program's place on sm_103a in mode 1; on sm_103a the prologue program's L2-prefetch forms own the
+    rows from 1024 up: in mode 0 the plain prefetch form up to 8192 rows and the residual-only form above, beside
+    the parked program and the prologue program (seven records), in mode 1 the plain prefetch form alone beside the
+    late-store form (five records)); the records appear in the route in window order, each once, and the programs
     of a variant differ only by their windows."""
     for (arch, mode), table in OP_A_PLAIN_WINDOWS.items():
         route = loader.route_key(OP_A, f"mode{mode}")
@@ -1282,7 +1320,7 @@ def test_gated_residual_rmsnorm_routes_window_the_row_count():
             late_form = loader.MODULES[programs["psb_late"]]["build"]
             assert late_form["planes_smem"] == "beta"
             assert late_form["planes_path"] == "sts_late"
-        for place in ("rsa", "pro", "psb", "psb_late", "pprl", "abel"):
+        for place in ("rsa", "pro", "psb", "psb_late", "l2", "l2r"):
             if place not in programs:
                 continue
             window = loader.MODULES[programs[place]]
@@ -1292,7 +1330,8 @@ def test_gated_residual_rmsnorm_routes_window_the_row_count():
         if "psb" in programs:
             parked = loader.MODULES[programs["psb"]]["build"]
             assert parked["planes_smem"] == "beta" and parked["planes_path"] == "sts"
-        assert loader.MODULES[programs["pro"]]["build"]["planes_smem"] == "none"
+        prologue = loader.MODULES[_op_a_place(programs, mode, "pro")]["build"]
+        assert prologue["planes_smem"] == "none" and prologue["l2_prefetch"] == 0
         for name in names:
             build = loader.MODULES[name]["build"]
             assert build["mode"] == mode and build["pdl"] is False
@@ -1300,10 +1339,12 @@ def test_gated_residual_rmsnorm_routes_window_the_row_count():
 
 def test_gated_residual_rmsnorm_pdl_routes_window_the_row_count_per_architecture():
     """Op A's Blackwell PDL routes have windows of their own per (architecture, mode): each names the PDL build of a
-    program of the plain route, a PDL-only form of the prologue program (OP_A_PDL_ONLY: sm_100a, and abel and pk on sm_103a), the plain build
-    itself (borrowed: launched without the attribute where the PDL build measured slower than the CuTe DSL kernel
-    under PDL and the plain build faster) or no program (a declared gap, where neither did); the records appear in
-    the route in window order, each once."""
+    program of the plain route (sm_103a's mode-1 route names the PDL build of the prologue program, whose plain
+    build ships on sm_100a alone), a PDL-only form of the prologue program (OP_A_PDL_ONLY: abel and pk on both
+    architectures, the L2-prefetch forms with a second change on sm_103a), the plain build itself (borrowed:
+    launched without the attribute where the PDL build measured slower than the CuTe DSL kernel under PDL and the
+    plain build faster) or no program (a declared gap, where neither did); the records appear in the route in window
+    order, each once."""
     for (arch, mode), table in OP_A_PDL_WINDOWS.items():
         programs = _op_a_programs(arch, mode)
         plain_route = loader.route_key(OP_A, f"mode{mode}")
@@ -1326,9 +1367,9 @@ def test_gated_residual_rmsnorm_pdl_routes_window_the_row_count_per_architecture
             if form == "plain":
                 name = programs[program]
             elif program in OP_A_PDL_ONLY:
-                name = _op_a_pdl_only(programs, program)
+                name = _op_a_pdl_only(programs, mode, program)
             else:
-                name = _pdl_build_of(programs[program])
+                name = _pdl_build_of(_op_a_place(programs, mode, program))
             if name not in order:
                 order.append(name)
             record = loader.MODULES[name]
@@ -1439,7 +1480,7 @@ def test_gated_residual_rmsnorm_routes_on_sm_107a():
 def test_gated_residual_rmsnorm_helpers_and_support(monkeypatch):
     """The variant of a gated residual RMSNorm call is its mode (``weight`` applied before the norm or absent) and
     its launch form; on the Blackwell architectures every variant's route is exported, the plain routes' windows
-    partition the positive row counts and the mode-0 PDL routes leave 769-4095 (sm_100a) / 1025-2048 and 4097-8191 (sm_103a) rows
+    partition the positive row counts and the mode-0 PDL routes leave 769-4095 (sm_100a) / 1537-2048 (sm_103a) rows
     to the FlashInfer kernel under PDL; on sm_107a mode 0 leaves 129-256 rows to it in both launch forms."""
     assert pkg.GATED_RESIDUAL_RMSNORM == OP_A
     assert pkg.gated_residual_rmsnorm_variant(False, False) == "mode0"
@@ -1996,13 +2037,15 @@ OP_B_SM100A_WINDOWS = {
         [(64, 128)],
         [(512, 959)],
         [(959, 1151)],
-        [(1151, 4096)],
+        [(1151, 1280), (2816, 4096)],
+        [(1280, 2816)],
         [(4096, None)],
     ],
     "alpha_scalar_nopw": [
         [(0, 1)],
         [(1, 64)],
-        [(64, 148)],
+        [(64, 104)],
+        [(104, 148)],
         [(148, 256)],
         [(256, 383), (4096, None)],
         [(383, 4096)],
@@ -2027,28 +2070,34 @@ OP_B_SM100A_POSITIONS = {
         (1024, 5),
         (1151, 5),
         (1152, 6),
-        (1536, 6),
+        (1280, 6),
+        (1281, 7),
+        (1536, 7),
+        (2816, 7),
+        (2817, 6),
         (3072, 6),
         (4096, 6),
-        (4097, 7),
-        (10**6, 7),
+        (4097, 8),
+        (10**6, 8),
     ),
     "alpha_scalar_nopw": (
         (1, 0),
         (2, 1),
         (64, 1),
         (65, 2),
-        (148, 2),
-        (149, 3),
-        (256, 3),
-        (257, 4),
-        (383, 4),
-        (384, 5),
-        (512, 5),
-        (3072, 5),
-        (4096, 5),
-        (4097, 4),
-        (10**6, 4),
+        (104, 2),
+        (105, 3),
+        (148, 3),
+        (149, 4),
+        (256, 4),
+        (257, 5),
+        (383, 5),
+        (384, 6),
+        (512, 6),
+        (3072, 6),
+        (4096, 6),
+        (4097, 5),
+        (10**6, 5),
     ),
     "alpha_scalar_pw": ((1, 0), (255, 0), (256, 0), (10**6, 0)),
 }
@@ -2060,6 +2109,8 @@ OP_B_SM100A_EDGE_ROWS = (
     17,
     64,
     65,
+    104,
+    105,
     128,
     129,
     148,
@@ -2074,6 +2125,10 @@ OP_B_SM100A_EDGE_ROWS = (
     960,
     1151,
     1152,
+    1280,
+    1281,
+    2816,
+    2817,
     4096,
     4097,
     10**6,
@@ -2087,14 +2142,16 @@ def _build_without(record: str, key: str) -> dict:
 def test_gated_residual_next_rmsnorm_routes_window_the_row_count_on_sm_100a(
     monkeypatch,
 ):
-    """Op B's sm_100a routes: the route with a tensor alpha and a post weight holds eight records (the
-    persistent four-CTA program with a two-row L2 prefetch owns 1152-4096 rows and differs from the plain
-    persistent four-CTA program, which owns 17-64 and 129-512, only by that prefetch; the one-CTA ring whose
-    row fills carry the evict_last L2 policy owns 960-1151 rows and differs from the plain ring, which owns
-    513-959, only by that policy), the route with a
-    scalar alpha and no post weight holds six (the L2 load-hint form owns 384-4096 rows and differs from
-    its neighbour, which owns 257-383 and 4097 up, only by the hint), and the route with a scalar alpha and
-    a post weight holds one; every row count from 1 up is served on all three."""
+    """Op B's sm_100a routes: the route with a tensor alpha and a post weight holds nine records (the
+    persistent four-CTA program with a two-row L2 prefetch owns 1152-1280 and 2817-4096 rows and differs from the plain
+    persistent four-CTA program, which owns 17-64 and 129-512, only by that prefetch; its form with the gain
+    loads hoisted owns 1281-2816 rows and differs from it only by that hoist; the one-CTA ring whose row fills
+    carry the evict_last L2 policy owns 960-1151 rows and differs from the plain ring, which owns 513-959, only
+    by that policy), the route with a scalar alpha and no post weight holds seven (the L2 load-hint form owns
+    384-4096 rows and differs from its neighbour, which owns 257-383 and 4097 up, only by the hint; the form of
+    that neighbour that handles two rows per loop pass owns 65-104 rows and differs from it only by that
+    unroll), and the route with a scalar alpha and a post weight holds one; the hoisted and the unrolled forms
+    ship on sm_100a alone, and every row count from 1 up is served on all three routes."""
     for variant, expected in OP_B_SM100A_WINDOWS.items():
         route = loader.route_key(OP, variant)
         names = loader.route_modules("sm_100a", route)
@@ -2113,11 +2170,18 @@ def test_gated_residual_next_rmsnorm_routes_window_the_row_count_on_sm_100a(
                 rows,
             )
     tensor_pw = loader.route_modules("sm_100a", loader.route_key(OP, "alpha_tensor_pw"))
-    plain, prefetch = (loader.MODULES[tensor_pw[i]]["build"] for i in (2, 6))
+    plain, hoisted, prefetch = (
+        loader.MODULES[tensor_pw[i]]["build"] for i in (2, 7, 6)
+    )
     assert prefetch["prefetch_l2"] == 2 and plain["prefetch_l2"] == 0
     assert _build_without(tensor_pw[6], "prefetch_l2") == _build_without(
         tensor_pw[2], "prefetch_l2"
     )
+    assert hoisted["gain_hoist"] is True and prefetch["gain_hoist"] is False
+    assert _build_without(tensor_pw[7], "gain_hoist") == _build_without(
+        tensor_pw[6], "gain_hoist"
+    )
+    assert loader.MODULES[tensor_pw[7]]["arches"] == ["sm_100a"]
     ring, hinted_ring = (loader.MODULES[tensor_pw[i]]["build"] for i in (4, 5))
     assert hinted_ring["tma_hint"] == "evict_last" and ring["tma_hint"] is None
     assert ring["tma_stages"] == 3 and hinted_ring["tma_stages"] == 3
@@ -2128,11 +2192,18 @@ def test_gated_residual_next_rmsnorm_routes_window_the_row_count_on_sm_100a(
     scalar_nopw = loader.route_modules(
         "sm_100a", loader.route_key(OP, "alpha_scalar_nopw")
     )
-    neighbour, hinted = (loader.MODULES[scalar_nopw[i]]["build"] for i in (4, 5))
-    assert hinted["l2_hint"] == "ld_ll" and neighbour["l2_hint"] is None
-    assert _build_without(scalar_nopw[5], "l2_hint") == _build_without(
-        scalar_nopw[4], "l2_hint"
+    unrolled, neighbour, hinted = (
+        loader.MODULES[scalar_nopw[i]]["build"] for i in (2, 5, 6)
     )
+    assert hinted["l2_hint"] == "ld_ll" and neighbour["l2_hint"] is None
+    assert _build_without(scalar_nopw[6], "l2_hint") == _build_without(
+        scalar_nopw[5], "l2_hint"
+    )
+    assert unrolled["row_unroll"] == 2 and neighbour["row_unroll"] == 1
+    assert _build_without(scalar_nopw[2], "row_unroll") == _build_without(
+        scalar_nopw[5], "row_unroll"
+    )
+    assert loader.MODULES[scalar_nopw[2]]["arches"] == ["sm_100a"]
     device = torch.device("cuda", 0)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 0))
     for tensor_alpha, has_post_weight in ((True, True), (False, False), (False, True)):
@@ -2290,3 +2361,70 @@ def test_gated_residual_next_rmsnorm_routes_window_the_row_count_on_sm_103a(
                 tensor_alpha=tensor_alpha,
                 has_post_weight=has_post_weight,
             ), (tensor_alpha, has_post_weight, rows)
+
+
+# Op B's sm_107a routes with a tensor alpha and a post weight and with a scalar alpha and no post weight: windows per
+# record in route order, a window (above, at_most).  The tensor-alpha route gives 928-1280 rows to a form of the
+# one-CTA ring whose row fills carry the evict_last L2 policy (OP_B_SM107A_RING_FORMS); the ring itself keeps the rows
+# above 1280.  The scalar-alpha route gives the rows from 3072 up to that ring's form for a scalar alpha and no post
+# weight, and its four-CTA form with the L2 load hint and the two-row prefetch owns 384-1024 rows.
+OP_B_SM107A_WINDOWS = {
+    "alpha_tensor_pw": [
+        [(0, 383)],
+        [(383, 512)],
+        [(512, 927)],
+        [(927, 1280)],
+        [(1280, None)],
+    ],
+    "alpha_scalar_nopw": [
+        [(0, 256)],
+        [(256, 383), (1024, 3071)],
+        [(383, 1024)],
+        [(3071, None)],
+    ],
+}
+# The ring form of sm_107a's tensor-alpha route by route position: the evict_last ring's build (the route's last
+# record) with these keywords changed -- two rows per loop pass (row_unroll), the half fold (fold_half) and the full
+# split (split_full).
+OP_B_SM107A_RING_FORMS = {
+    3: {"row_unroll": 2, "fold_half": True, "split_full": True},
+}
+
+
+def test_gated_residual_next_rmsnorm_routes_window_the_row_count_on_sm_107a():
+    """Op B's sm_107a routes: the route with a tensor alpha and a post weight holds five records, one of them a
+    form of the evict_last one-CTA ring (OP_B_SM107A_RING_FORMS) over 928-1280 rows that ships on sm_107a alone,
+    the ring keeping the rows above 1280; the route with a scalar alpha and no post weight holds four, the ring's
+    form for that variant owning the rows from 3072 up (it ships on sm_107a alone); every row count from 1 up is
+    served on both routes, each window by its own record."""
+    for variant, expected in OP_B_SM107A_WINDOWS.items():
+        route = loader.route_key(OP, variant)
+        names = loader.route_modules("sm_107a", route)
+        windows = [
+            [
+                tuple(window)
+                for window in loader.MODULES[name]["select_rule"]["windows"]["sm_107a"]
+            ]
+            for name in names
+        ]
+        assert windows == expected, route
+        for name, bounds in zip(names, expected, strict=True):
+            for above, at_most in bounds:
+                for rows in (above + 1, at_most or 10**6):
+                    assert loader.selected_module("sm_107a", route, rows) == name, (
+                        route,
+                        rows,
+                    )
+    tensor_pw = loader.route_modules("sm_107a", loader.route_key(OP, "alpha_tensor_pw"))
+    ring = loader.MODULES[tensor_pw[4]]["build"]
+    assert ring["tma_stages"] == 3 and ring["tma_hint"] == "evict_last"
+    for position, keywords in OP_B_SM107A_RING_FORMS.items():
+        record = loader.MODULES[tensor_pw[position]]
+        assert record["build"] == {**ring, **keywords}, position
+        assert record["arches"] == ["sm_107a"], position
+    scalar_nopw = loader.route_modules(
+        "sm_107a", loader.route_key(OP, "alpha_scalar_nopw")
+    )
+    scalar_ring = loader.MODULES[scalar_nopw[3]]
+    assert scalar_ring["build"] == {**ring, "tensor_alpha": False, "post_weight": False}
+    assert scalar_ring["arches"] == ["sm_107a"]
