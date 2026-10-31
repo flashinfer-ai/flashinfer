@@ -14,6 +14,26 @@ from b12x.attention.paged.traits import (
 from .test_attention_paged_planner import _make_inputs
 
 
+@pytest.mark.parametrize("head_dim_qk", [64, 128, 192, 256])
+def test_head64_decode_admits_one_kv_mma_for_bf16(head_dim_qk) -> None:
+    # The 16-row decode sweep has a single KV MMA candidate, so this layout
+    # does not depend on the device's shared-memory capacity.
+    traits = select_paged_forward_traits(
+        cta_tile_q=16,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=64,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+    assert traits.num_warps_q == 1
+    assert traits.num_mma_kv == 1
+    assert traits.num_mma_d_vo == 4
+    assert traits.cta_tile_kv == traits.num_warps_kv * 16
+    assert traits.launch_smem_bytes <= traits.max_smem_per_threadblock
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
