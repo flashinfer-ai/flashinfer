@@ -331,7 +331,8 @@ GEMM_SCALARS = (
 # writes slab ``s - 1`` of the FP32 workspace ``WS [k_slices - 1, rows, H]`` (``ws_slab`` = elements between
 # slabs) and the host adds the slabs into ``dX_acc`` in fixed slab order (one RN add per element per
 # slab, no atomics).  The slice count of a chunk is chosen from its row count and the SM count
-# (:func:`recommended_k_slices`).  ``WS`` of the other GEMMs is an unused 16-float dummy (``ws_slab`` 0).
+# (:func:`recommended_k_slices`) and fitted to the K steps so that every slice holds one (:func:`dx_slices_fit`).
+# ``WS`` of the other GEMMs is an unused 16-float dummy (``ws_slab`` 0).
 DX_SLICED_STAGE = "gemm_dx_s"
 # Fused weight-gradient output: the LAST chunk's ``dz_c^T @ X_c`` GEMM run in the backward (where the upstream scalar
 # gradient ``g`` is known) with the scale and the output cast fused into its epilogue, ``C = cast(g * (WS + tile))`` --
@@ -1332,6 +1333,11 @@ def _gemm_scalars(
         )
     if ks > k_iters:
         raise ValueError(f"{stage}: {ks} K slices over {k_iters} K steps")
+    if ks > 1 and dx_slices_fit(ks, k_iters) != ks:
+        raise ValueError(
+            f"{stage}: {ks} K slices of {-(-k_iters // ks)} K steps over {k_iters} K steps leave the last slice "
+            "without a K step"
+        )
     return dict(
         M=rows_c,
         m_tiles=geometry.row_tiles(rows_c, item_rows),
@@ -1369,6 +1375,16 @@ def wave_efficiency(
     return items / (-(-items // clusters) * clusters)
 
 
+def dx_slices_fit(k_slices: int, k_iters: int) -> int:
+    """The slice count that runs ``k_slices`` requested slices over ``k_iters`` K steps with every slice holding at least
+    one step (the reduction form's launch contract ``k_slice_iters * (k_slices - 1) < k_iters`` with ``k_slice_iters =
+    ceil(k_iters / k_slices)``): ``ceil(k_iters / ceil(k_iters / k_slices))`` -- ``k_slices`` itself unless the
+    ceil-sized slices cover ``K`` with fewer of them (e.g. 3 requested over 4 steps run as 2)."""
+    ks, k = max(1, int(k_slices)), max(1, int(k_iters))
+    ksi = -(-k // ks)
+    return -(-k // ksi)
+
+
 def recommended_k_slices(
     rows_c: int,
     hidden: int,
@@ -1376,10 +1392,12 @@ def recommended_k_slices(
     max_slices: int,
     geometry: "Geometry",
     resident: Optional[int] = None,
+    vocab: Optional[int] = None,
 ) -> int:
     """Slice count of the dX GEMM for a chunk of ``rows_c`` rows: the ``S`` in ``[1, max_slices]`` with the best
     wave efficiency net of ``K_SLICE_PENALTY`` per extra slab.  Deterministic in the shapes, the SM count and the
-    device's co-resident cluster count (:func:`cluster_resident`)."""
+    device's co-resident cluster count (:func:`cluster_resident`).  ``vocab`` (the dX GEMM's K = V; every planner
+    passes it) fits the count to the K steps (:func:`dx_slices_fit`); ``None`` = the wave rule alone."""
     best, best_score = (
         1,
         wave_efficiency(rows_c, hidden, num_sms, 1, geometry, resident),
@@ -1390,7 +1408,9 @@ def recommended_k_slices(
         ) - K_SLICE_PENALTY * (s - 1)
         if score > best_score + 1e-9:
             best, best_score = s, score
-    return best
+    if vocab is None:
+        return best
+    return dx_slices_fit(best, int(vocab) // int(geometry.k_block))
 
 
 def cluster_resident(
@@ -2541,11 +2561,23 @@ def make_plan(
             raise ValueError(
                 f"gemm_tuning dx k_slices={explicit_k}: the registered program serves 1 .. {int(dx_max_slices)} dX slices"
             )
+        k_iters = int(problem.vocab) // int(geometry.k_block)
+        if dx_slices_fit(explicit_k, k_iters) != explicit_k:
+            raise ValueError(
+                f"gemm_tuning dx k_slices={explicit_k}: V = {problem.vocab} has {k_iters} K steps, which "
+                f"{explicit_k} slices of {-(-k_iters // explicit_k)} steps do not all reach"
+            )
         slices = tuple(explicit_k for _ in chunks)
     elif need_dx and int(dx_max_slices) > 1:
         slices = tuple(
             recommended_k_slices(
-                rows_c, problem.hidden, num_sms, dx_max_slices, geometry, dx_resident
+                rows_c,
+                problem.hidden,
+                num_sms,
+                dx_max_slices,
+                geometry,
+                dx_resident,
+                vocab=problem.vocab,
             )
             for _, rows_c in chunks
         )
@@ -2953,6 +2985,7 @@ def lm_head_det_loss_workspace_size(
                         dx_max_slices(stages),
                         geometry,
                         resident,
+                        vocab=vocab,
                     )
                     for rows_c in rows_candidates
                 ),
