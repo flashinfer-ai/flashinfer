@@ -578,9 +578,13 @@ class TuningConfig:
         """L2 measurement policy recorded in persisted profiling provenance."""
         if not self.use_cold_l2_cache:
             return "hot"
+        # "read": L2 is evicted by reading the flush buffer (``_flush_l2``).
+        # Entries measured under the earlier write-based flush carry "cold" /
+        # "cold-chain:N", which no longer match, so those tactics are
+        # remeasured instead of reused.
         if self.uses_cold_chain:
-            return f"cold-chain:{self.cold_chain_launches}"
-        return "cold"
+            return f"cold-read-chain:{self.cold_chain_launches}"
+        return "cold-read"
 
 
 class ValueProfileArena:
@@ -1517,9 +1521,16 @@ def _make_l2_flush_buffer(num_bytes: int, device: torch.device) -> torch.Tensor:
     """Allocate a zero-filled buffer of at least ``num_bytes`` for ``_flush_l2``.
 
     Zero-filled (one write, when the buffer is allocated) so the float32
-    view holds known values; ``_flush_l2`` itself never writes it.
+    view holds known values; ``_flush_l2`` itself never writes it. One flush
+    runs here, before any caller's barrier or timing loop, so the reduction's
+    scratch is already in PyTorch's caching allocator and later flushes on the
+    same stream (the current one; all three callers flush on it) do not allocate
+    device memory. The allocator keeps freed blocks per stream, so a flush on
+    another stream could still allocate.
     """
-    return torch.zeros((num_bytes + 3) // 4, dtype=torch.float32, device=device)
+    flush_buffer = torch.zeros((num_bytes + 3) // 4, dtype=torch.float32, device=device)
+    _flush_l2(flush_buffer)
+    return flush_buffer
 
 
 def _flush_l2(flush_buffer: torch.Tensor) -> None:
