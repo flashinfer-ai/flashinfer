@@ -1224,7 +1224,7 @@ def test_cake_fmha_context_fp8_split_route(monkeypatch, target) -> None:
         kwargs, workspace_buffer=torch.empty(need - 1, dtype=torch.uint8, device="meta")
     )
     stage = cake_api._context_fp8_one_stage_choice(
-        target, 1, 32, 16384, 32, 8, sm_count, (8, None)
+        target, 1, 32, 16384, 32, 8, sm_count, (8, None), 64
     )
     assert stage is not None and stage < 8
     route = cake_api.select_cake_fmha_context_route(meta, **short)
@@ -1435,7 +1435,7 @@ def _one_stage_expected(monkeypatch, target, row, sm_count, stage_pack=None):
         assert split is not None and split[0] == kept.pack_g, (split, kept)
         plan = split[1]
     choice = cake_api._context_fp8_one_stage_choice(
-        target, batch, q_len, kv_len, hq, pack, sm_count, (kept.pack_g, plan)
+        target, batch, q_len, kv_len, hq, pack, sm_count, (kept.pack_g, plan), page
     )
     if choice is None:
         return kept.program, kept.pack_g
@@ -1472,7 +1472,9 @@ def test_cake_fmha_context_fp8_one_stage_choice(target) -> None:
     fastest under the one-stage costs with the unit scaled by the tile's
     query rows (``_CONTEXT_FP8_ONE_STAGE_ROWS``), and faster than the call's
     launch (its split choice, else whole tiles) by the split margins under
-    the unscaled unit; else ``None``.  2
+    the unscaled unit (at the page sizes of
+    ``_CONTEXT_FP8_ONE_STAGE_ROWS_GAIN``, sm103a page 64: the scaled unit);
+    else ``None``.  2
     requests of 128 query tokens over 1500 keys, heads 32/4, take pack 1's
     one-stage program on both targets; calls of more than 128 query tokens
     keep their launch."""
@@ -1508,6 +1510,13 @@ def test_cake_fmha_context_fp8_one_stage_choice(target) -> None:
                 best = (candidate, one, rank)
         gain = best is not None and cake_api._context_fp8_split_gain(time, best[1])
         assert chosen == (best[0] if gain else None), row
+        # a page size the target names in _CONTEXT_FP8_ONE_STAGE_ROWS_GAIN:
+        # the gain takes the scaled unit (the rank)
+        scaled = 64 in cake_api._CONTEXT_FP8_ONE_STAGE_ROWS_GAIN.get(target, ())
+        if scaled:
+            gain = best is not None and cake_api._context_fp8_split_gain(time, best[2])
+        chosen = choose(target, batch, q_len, kv_len, hq, pack, sm_count, current, 64)
+        assert chosen == (best[0] if gain else None), (row, 64)
     current = cake_api._context_fp8_split_choice(target, 2, 128, 1500, 32, 8, sm_count)
     current = current if current is not None else (8, None)
     assert choose(target, 2, 128, 1500, 32, 8, sm_count, current) == 1
@@ -1527,7 +1536,8 @@ def test_cake_fmha_context_fp8_one_stage_route(monkeypatch, target, page) -> Non
     smaller pack.  An sm103a call of at most 128 keys takes the one-stage
     program with P in its own S columns of the smallest pack whose tiles
     number at most ``_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES`` where the page
-    size has one (every page size), else keeps its short-KV program."""
+    size has one (every page size; at 64-token pages the page-64 program with
+    the short-KV chain)."""
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     meta = torch.device("meta")
@@ -1562,9 +1572,9 @@ def test_cake_fmha_context_fp8_one_stage_route(monkeypatch, target, page) -> Non
         )
         if page == 16:
             assert route.program == "RUNTIME_PACK1_Q1", route
-            assert (route.pack_g, route.num_m_blocks) == (1, 1)
         else:
-            assert route.program == f"RUNTIME_PACK{route.pack_g}{suffix}", route
+            assert route.program == "RUNTIME_PACK1_PAGE64_PX_Q1", route
+        assert (route.pack_g, route.num_m_blocks) == (1, 1)
 
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
@@ -1573,8 +1583,9 @@ def test_cake_fmha_context_fp8_short_kv_one_stage_pack(monkeypatch, target) -> N
     one-stage program of the smallest pack dividing its runtime pack whose
     tiles hold every query token in one stage and number at most
     ``_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES`` (64), and the one-stage choice
-    where no pack has so few tiles; an sm100a call keeps its route (no
-    short-KV programs)."""
+    where no pack has so few tiles; at 64-token pages, the page-64 one-stage
+    program of that pack, pack 2 tried first for calls of at most 32 query
+    tokens; an sm100a call keeps its route (no short-KV programs)."""
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     sm_count = _SM_COUNT[target]
@@ -1604,6 +1615,45 @@ def test_cake_fmha_context_fp8_short_kv_one_stage_pack(monkeypatch, target) -> N
         )
         if target == "sm103a":
             assert route.program == f"RUNTIME_PACK{pack}_Q1", (row, route)
+            assert (route.pack_g, route.num_m_blocks) == (pack, 1), (row, route)
+        else:
+            with monkeypatch.context() as patch:
+                patch.setattr(cake_api, "_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES", {})
+                kept = cake_api.select_cake_fmha_context_route(
+                    meta, **_context_kwargs(row, device="meta")
+                )
+            assert route == kept, (row, route, kept)
+    # 64-token pages (sm103a): the page-64 one-stage program of that pack,
+    # which carries the short-KV chain; calls of at most
+    # _CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TOKENS (32) query tokens with at
+    # least _CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TILES (32) pack-2 tiles try
+    # pack 2 before pack 1
+    if target == "sm103a":
+        assert cake_api._CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TOKENS == {"sm103a": 32}
+        assert cake_api._CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TILES == {"sm103a": 32}
+    cases64 = {
+        (1, 32, 128, 32, 8): 1,
+        (2, 32, 128, 32, 8): 2,
+        (4, 32, 128, 32, 8): 2,
+        (8, 32, 128, 32, 8): 4,
+        (1, 32, 128, 32, 16): 1,
+        (2, 32, 128, 32, 16): 2,
+        (2, 8, 128, 16, 2): 1,
+        (4, 8, 128, 16, 2): 2,
+        (1, 32, 128, 32, 32): 1,
+        (4, 16, 128, 32, 16): 2,
+        (4, 16, 128, 64, 8): 4,
+        (2, 32, 128, 64, 8): 2,
+        (1, 64, 128, 32, 8): 1,
+        (1, 33, 128, 32, 8): 1,
+    }
+    for (batch, q_len, kv_len, hq, hkv), pack in cases64.items():
+        row = ("context_fp8", batch, q_len, kv_len, hq, hkv, 64, True, None)
+        route = cake_api.select_cake_fmha_context_route(
+            meta, **_context_kwargs(row, device="meta")
+        )
+        if target == "sm103a":
+            assert route.program == f"RUNTIME_PACK{pack}_PAGE64_PX_Q1", (row, route)
             assert (route.pack_g, route.num_m_blocks) == (pack, 1), (row, route)
         else:
             with monkeypatch.context() as patch:
