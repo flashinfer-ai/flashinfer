@@ -261,6 +261,7 @@ W8A16_FP8_GEMM_ALGOS_SM90: dict[str, int] = {
     "64x128": 9,
     "128x128_splitk": 10,
     "128x256_splitk": 11,
+    "64x128_splitk": 12,  # CuTe-DSL only (the C++ dispatcher has no code 12)
 }
 
 

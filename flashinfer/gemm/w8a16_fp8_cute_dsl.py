@@ -461,7 +461,7 @@ _SM90_TILES: Dict[int, Tuple[int, int]] = {
 # Stream-K codes run the plain tile (CUTLASS's stream-K scheduler is not ported);
 # split-K codes run the tile over K-slices.
 _SM90_STREAMK_TILE: Dict[int, int] = {7: 2, 8: 3}
-_SM90_SPLITK_TILE: Dict[int, int] = {10: 5, 11: 2}
+_SM90_SPLITK_TILE: Dict[int, int] = {10: 5, 11: 2, 12: 9}
 _SM90_TILE_K = 64
 _SM90_MAX_SPLITS = 8
 _SM90_MIN_KTILES_PER_SPLIT = 8
@@ -578,7 +578,7 @@ def _sm90_pick_by_cost(m: int, n: int, k: int, num_sms: int) -> int:
         consider(t[0], _sm90_plain_us(t, m, n, k, num_sms))
     for a in (7, 8):
         consider(a, _sm90_streamk_us(_sm90_tile_of(a), m, n, k, num_sms))
-    for a in (10, 11):
+    for a in (10, 11, 12):
         t = _sm90_tile_of(a)
         for s in range(2, _SM90_MAX_SPLITS + 1):
             if _sm90_is_legal_split(k, s):
@@ -745,7 +745,7 @@ def _w8a16_fp8_gemm_sm90(
     num_sms = get_device_sm_count(act.device)
     if algo == 0:
         algo = sm90_pick_algo(m, n, k, num_sms)
-    if algo == 1 or algo > 11:
+    if algo == 1 or algo > 12:
         raise ValueError(f"w8a16_fp8_gemm: unknown Hopper algo code {algo}")
     if algo in _SM90_SPLITK_TILE and k % _SM90_TILE_K != 0:
         raise ValueError("w8a16_fp8_gemm split-K: K must be a multiple of 64")
