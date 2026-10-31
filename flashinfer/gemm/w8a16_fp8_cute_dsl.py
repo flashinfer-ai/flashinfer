@@ -149,6 +149,27 @@ def sm100_raster_along_m(
     return tiles_n > tiles_m
 
 
+def _compile_pointers(specs: Tuple):
+    """CuTe pointer objects for ``cute.compile`` from (dtype, address, alignment)
+    triples.  Built only when a kernel is compiled: the compiled function takes the
+    raw addresses."""
+    from ..cute_dsl.utils import make_ptr
+
+    return tuple(
+        make_ptr(dtype, addr, cute_gmem(), assumed_align=align)
+        for dtype, addr, align in specs
+    )
+
+
+def _raw_stream(device: torch.device):
+    """The current Torch stream of ``device`` as a driver stream handle (the public
+    torch.cuda.current_stream() path costs ~20 us per call, most of a small GEMM)."""
+    import cuda.bindings.driver as cuda
+
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return cuda.CUstream(torch._C._cuda_getCurrentRawStream(index))
+
+
 _KERNEL_CACHE: Dict[Tuple, object] = {}
 
 
@@ -159,7 +180,7 @@ def _get_sm100_kernel(
     swizzle_size: int,
     raster_along_m: bool,
     max_active_clusters: int,
-    pointers: Tuple,
+    pointer_specs: Tuple,
     n: int,
     m: int,
     k: int,
@@ -215,7 +236,7 @@ def _get_sm100_kernel(
     )
     compiled = cute.compile(
         kernel.wrapper,
-        *pointers,
+        *_compile_pointers(pointer_specs),
         n,
         m,
         k,
@@ -237,7 +258,7 @@ def _get_sm100_kernel(
 
 
 def _get_reduce_kernel(
-    act_dtype: torch.dtype, has_bias: bool, splits: int, pointers: Tuple, stream
+    act_dtype: torch.dtype, has_bias: bool, splits: int, pointer_specs: Tuple, stream
 ):
     """The split-K reduce (sum of slices, scale, bias, cast), compiled once per
     activation dtype, bias presence and slice count."""
@@ -251,7 +272,7 @@ def _get_reduce_kernel(
         return compiled
     compiled = cute.compile(
         W8A16SplitKReduce(has_bias, splits).wrapper,
-        *pointers,
+        *_compile_pointers(pointer_specs),
         1,
         8,
         1,
@@ -260,6 +281,44 @@ def _get_reduce_kernel(
     )
     _KERNEL_CACHE[key] = compiled
     return compiled
+
+
+_PLAN_CACHE: Dict[Tuple, Tuple] = {}
+
+
+def _sm100_plan(algo: int, m: int, n: int, k: int, num_sms: int) -> Tuple:
+    """(algo, splits, swizzle, raster_along_m, max active clusters) of a Blackwell
+    call.  A pure function of the shape, cached: the cost model is most of the host
+    cost of a call otherwise."""
+    key = ("sm100", algo, m, n, k, num_sms)
+    plan = _PLAN_CACHE.get(key)
+    if plan is not None:
+        return plan
+    from ..cute_dsl.utils import get_max_active_clusters
+
+    if algo == 0:
+        algo = sm100_pick_algo(m, n, k, num_sms)
+    if algo == _SM100_STREAMK:
+        algo = 1  # not ported yet
+    splits = 1
+    if algo == _SM100_SPLITK:
+        splits = sm100_splits_for(m, n, k, num_sms)
+        if splits < 2:
+            raise ValueError(
+                f"w8a16_fp8_gemm split-K cannot slice K={k}: K must be a multiple of "
+                "128 whose k-tile count has a divisor in 2..8"
+            )
+        algo = 1
+    mma_tiler, two_sm, cluster, _ = _SM100_TILES[algo]
+    plan = (
+        algo,
+        splits,
+        sm100_pick_swizzle(m, n, k),
+        sm100_raster_along_m(m, n, mma_tiler, two_sm),
+        get_max_active_clusters(cluster[0] * cluster[1]),
+    )
+    _PLAN_CACHE[key] = plan
+    return plan
 
 
 def w8a16_fp8_gemm_cute_dsl(
@@ -277,9 +336,6 @@ def w8a16_fp8_gemm_cute_dsl(
     least 64 * 4096 entries (pinned host memory to watch a hang) that the kernel's
     debug build writes its per-CTA progress into; None = the production build."""
     import cutlass
-    import cutlass.cute as cute
-
-    from ..cute_dsl.utils import current_cuda_stream, get_max_active_clusters, make_ptr
 
     if act.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"act must be bf16 or fp16, got {act.dtype}")
@@ -318,67 +374,31 @@ def w8a16_fp8_gemm_cute_dsl(
         if debug_buffer is not None:
             raise ValueError("debug_buffer is a Blackwell-kernel feature")
         return _w8a16_fp8_gemm_sm90(act, weight, weight_scale, bias, out, algo)
-    num_sms = get_device_sm_count(act.device)
-    if algo == 0:
-        algo = sm100_pick_algo(m, n, k, num_sms)
-    if algo == _SM100_STREAMK:
-        algo = 1  # not ported yet
+    plan = _sm100_plan(algo, m, n, k, get_device_sm_count(act.device))
+    algo, splits, swizzle_size, raster_along_m, max_active_clusters = plan
     # Split-K: the 256x128 tile over `splits` K-slices writing fp32 partials, then
     # the reduce.  The GEMM's `out` is then the partials buffer and the kernel does
     # no scale / bias.
-    splits = 1
     partials = None
-    if algo == _SM100_SPLITK:
-        splits = sm100_splits_for(m, n, k, num_sms)
-        if splits < 2:
-            raise ValueError(
-                f"w8a16_fp8_gemm split-K cannot slice K={k}: K must be a multiple of "
-                "128 whose k-tile count has a divisor in 2..8"
-            )
-        algo = 1
+    if splits > 1:
         partials = torch.empty((splits, m, n), dtype=torch.float32, device=act.device)
     k_slice = k // splits
-    mma_tiler, two_sm, cluster, _ = _SM100_TILES[algo]
-    swizzle_size = sm100_pick_swizzle(m, n, k)
-    raster_along_m = sm100_raster_along_m(m, n, mma_tiler, two_sm)
     has_bias = bias is not None
     act_ctype = cutlass.BFloat16 if act.dtype == torch.bfloat16 else cutlass.Float16
     bias_tensor = bias if has_bias else weight_scale  # any valid pointer when unused
     bias_ctype = act_ctype if has_bias else cutlass.Float32
     gemm_out = partials if partials is not None else out
     gemm_out_ctype = cutlass.Float32 if partials is not None else act_ctype
-    pointers = (
-        make_ptr(
-            cutlass.Float8E4M3FN,
-            weight.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(act_ctype, act.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
-        make_ptr(
-            cutlass.Float32,
-            weight_scale.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=4,
-        ),
-        make_ptr(
-            bias_ctype, bias_tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=4
-        ),
-        make_ptr(
-            gemm_out_ctype,
-            gemm_out.data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=16,
-        ),
-        make_ptr(
-            cutlass.Int32,
-            (debug_buffer if debug_buffer is not None else weight_scale).data_ptr(),
-            cute.AddressSpace.gmem,
-            assumed_align=4,
-        ),
+    debug_tensor = debug_buffer if debug_buffer is not None else weight_scale
+    pointer_specs = (
+        (cutlass.Float8E4M3FN, weight.data_ptr(), 16),
+        (act_ctype, act.data_ptr(), 16),
+        (cutlass.Float32, weight_scale.data_ptr(), 4),
+        (bias_ctype, bias_tensor.data_ptr(), 4),
+        (gemm_out_ctype, gemm_out.data_ptr(), 16),
+        (cutlass.Int32, debug_tensor.data_ptr(), 4),
     )
-    stream = current_cuda_stream()
-    max_active_clusters = get_max_active_clusters(cluster[0] * cluster[1])
+    stream = _raw_stream(act.device)
     compiled = _get_sm100_kernel(
         algo,
         act.dtype,
@@ -386,7 +406,7 @@ def w8a16_fp8_gemm_cute_dsl(
         swizzle_size,
         raster_along_m,
         max_active_clusters,
-        pointers,
+        pointer_specs,
         n,
         m,
         k_slice,
@@ -401,39 +421,20 @@ def w8a16_fp8_gemm_cute_dsl(
         weight_scale.data_ptr(),
         bias_tensor.data_ptr(),
         gemm_out.data_ptr(),
-        (debug_buffer if debug_buffer is not None else weight_scale).data_ptr(),
+        debug_tensor.data_ptr(),
         n,
         m,
         k_slice,
         stream,
     )
     if partials is not None:
-        reduce_pointers = (
-            make_ptr(
-                cutlass.Float32,
-                partials.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            ),
-            make_ptr(
-                cutlass.Float32,
-                weight_scale.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=4,
-            ),
-            make_ptr(
-                bias_ctype,
-                bias_tensor.data_ptr(),
-                cute.AddressSpace.gmem,
-                assumed_align=16,
-            ),
-            make_ptr(
-                act_ctype, out.data_ptr(), cute.AddressSpace.gmem, assumed_align=16
-            ),
+        reduce_specs = (
+            (cutlass.Float32, partials.data_ptr(), 16),
+            (cutlass.Float32, weight_scale.data_ptr(), 4),
+            (bias_ctype, bias_tensor.data_ptr(), 16),
+            (act_ctype, out.data_ptr(), 16),
         )
-        reduce = _get_reduce_kernel(
-            act.dtype, has_bias, splits, reduce_pointers, stream
-        )
+        reduce = _get_reduce_kernel(act.dtype, has_bias, splits, reduce_specs, stream)
         reduce(
             partials.data_ptr(),
             weight_scale.data_ptr(),
@@ -629,7 +630,7 @@ def _get_sm90_kernel(
     has_bias: bool,
     group: int,
     num_persistent: int,
-    pointers: Tuple,
+    pointer_specs: Tuple,
     n: int,
     m: int,
     k: int,
@@ -653,7 +654,7 @@ def _get_sm90_kernel(
     )
     compiled = cute.compile(
         kernel.wrapper,
-        *pointers,
+        *_compile_pointers(pointer_specs),
         n,
         m,
         k,
@@ -727,22 +728,13 @@ def sm90_tail_plan(
     return tile_algo, full * num_sms, best_s
 
 
-def _w8a16_fp8_gemm_sm90(
-    act: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    out: torch.Tensor,
-    algo: int,
-) -> torch.Tensor:
-    """The Hopper path of ``w8a16_fp8_gemm_cute_dsl`` (inputs already validated)."""
-    import cutlass
-
-    from ..cute_dsl.utils import current_cuda_stream, make_ptr
-
-    m, k = act.shape
-    n = weight.shape[0]
-    num_sms = get_device_sm_count(act.device)
+def _sm90_plan(algo: int, m: int, n: int, k: int, num_sms: int) -> Tuple:
+    """(tile algo, body items, tail splits, tail tiles, L2 group) of a Hopper call:
+    the variant choice and the tail plan, pure functions of the shape, cached."""
+    key = ("sm90", algo, m, n, k, num_sms)
+    plan = _PLAN_CACHE.get(key)
+    if plan is not None:
+        return plan
     if algo == 0:
         algo = sm90_pick_algo(m, n, k, num_sms)
     if algo == 1 or algo > 12:
@@ -758,16 +750,39 @@ def _w8a16_fp8_gemm_sm90(
     tile_w, tile_a = _SM90_TILES[tile_algo]
     tiles = _tiles(n, tile_w) * _tiles(m, tile_a)
     tail_tiles = tiles - body_items
-    has_tail = tail_tiles > 0 and tail_splits > 1
-    if has_tail and tail_tiles * tail_splits > num_sms:
-        # The slices of a tile reduce it among themselves, so they must all be
-        # resident: at most one tail item per CTA.  Split-K over a grid that does not
-        # fit runs the tiles whole instead.
-        has_tail = False
-    if not has_tail:
+    if tail_splits < 2 or tail_tiles * tail_splits > num_sms:
         body_items, tail_splits, tail_tiles = tiles, 1, 0
+    plan = (
+        tile_algo,
+        body_items,
+        tail_splits,
+        tail_tiles,
+        sm90_pick_group(m, n, k, tile_w),
+    )
+    _PLAN_CACHE[key] = plan
+    return plan
+
+
+def _w8a16_fp8_gemm_sm90(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+    algo: int,
+) -> torch.Tensor:
+    """The Hopper path of ``w8a16_fp8_gemm_cute_dsl`` (inputs already validated)."""
+    import cutlass
+
+    m, k = act.shape
+    n = weight.shape[0]
+    num_sms = get_device_sm_count(act.device)
+    tile_algo, body_items, tail_splits, tail_tiles, group = _sm90_plan(
+        algo, m, n, k, num_sms
+    )
+    tile_w, tile_a = _SM90_TILES[tile_algo]
+    has_tail = tail_tiles > 0
     tail_blocks = tail_tiles * tail_splits
-    # One fp32 (tile_w x tile_a) block per tail work item.
     workspace = (
         torch.empty(
             (max(tail_blocks, 1), tile_a, tile_w),
@@ -778,32 +793,27 @@ def _w8a16_fp8_gemm_sm90(
         else weight_scale
     )
     counters = _sm90_tail_counters(act.device, tail_tiles) if has_tail else weight_scale
-    group = sm90_pick_group(m, n, k, tile_w)
     has_bias = bias is not None
     act_ctype = cutlass.BFloat16 if act.dtype == torch.bfloat16 else cutlass.Float16
     bias_tensor = bias if has_bias else weight_scale  # any valid pointer when unused
     bias_ctype = act_ctype if has_bias else cutlass.Float32
-    pointers = (
-        make_ptr(
-            cutlass.Float8E4M3FN, weight.data_ptr(), cute_gmem(), assumed_align=16
-        ),
-        make_ptr(act_ctype, act.data_ptr(), cute_gmem(), assumed_align=16),
-        make_ptr(
-            cutlass.Float32, weight_scale.data_ptr(), cute_gmem(), assumed_align=4
-        ),
-        make_ptr(bias_ctype, bias_tensor.data_ptr(), cute_gmem(), assumed_align=4),
-        make_ptr(act_ctype, out.data_ptr(), cute_gmem(), assumed_align=16),
-        make_ptr(cutlass.Float32, workspace.data_ptr(), cute_gmem(), assumed_align=16),
-        make_ptr(cutlass.Int64, counters.data_ptr(), cute_gmem(), assumed_align=8),
+    pointer_specs = (
+        (cutlass.Float8E4M3FN, weight.data_ptr(), 16),
+        (act_ctype, act.data_ptr(), 16),
+        (cutlass.Float32, weight_scale.data_ptr(), 4),
+        (bias_ctype, bias_tensor.data_ptr(), 4),
+        (act_ctype, out.data_ptr(), 16),
+        (cutlass.Float32, workspace.data_ptr(), 16),
+        (cutlass.Int64, counters.data_ptr(), 8),
     )
-    stream = current_cuda_stream()
+    stream = _raw_stream(act.device)
     compiled = _get_sm90_kernel(
         tile_algo,
         act.dtype,
         has_bias,
         group,
         num_sms,
-        pointers,
+        pointer_specs,
         n,
         m,
         k,
