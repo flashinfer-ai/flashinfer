@@ -17,6 +17,9 @@ Supported (MG) shapes:
   * GLM_NSA: topk in {512, 1024, 2048}
   * GLM_NEXT: topk in {512, 1024, 2048, 2051, 2112}; 2112 is an
     alignment-only container whose per-row ``topk_length`` remains 2051.
+  * KVarN k4v2 (GLM_NSA-presented staged records): topk in {2051, 2176}
+    (fixed 512-pool + incomplete-pool tail / packed container) or the
+    length-scaled containers {4099, 8195, 16387}.
 Anything else (other topk, unsupported heads, GLM dual, etc.) raises ValueError.
 DSV4 + GLM DECODE kernels are untouched and stay byte-identical.
 """
@@ -317,6 +320,14 @@ def run_unified_prefill(
             partitions = ((1, prefix_heads, 0),) if prefix_heads else ()
             if prefix_heads != heads:
                 partitions += ((1, heads - prefix_heads, prefix_heads),)
+        if model_type == ModelType.KVARN_MLA:
+            # KVarN's 536B-class record + BF16 Q fits the SM120 carveout only
+            # with a single 16-head group per CTA (mg_n_hg==1); the launcher
+            # replicates heads across CTAs for wider bindings.
+            prefix_heads = heads - heads % hpb
+            partitions = ((1, prefix_heads, 0),) if prefix_heads else ()
+            if prefix_heads != heads:
+                partitions += ((1, heads - prefix_heads, prefix_heads),)
         if not partitions:
             raise ValueError(
                 f"SM120 sparse MLA prefill requires heads divisible by {hpb // 2}, got {heads}"
@@ -425,8 +436,20 @@ def run_unified_prefill(
         and is_glm_model_type(model_type)
         and scale_format == ScaleFormat.ARBITRARY_FP32
     )
-    glm_topk_supported = topk in (512, 1024, 2048) or (
-        model_type == ModelType.GLM_NEXT and topk in (2051, 2112)
+    glm_topk_supported = (
+        topk in (512, 1024, 2048, 2176)
+        or (model_type == ModelType.GLM_NEXT and topk in (2051, 2112))
+        or (
+            # KVarN k4v2: GLM_NSA-presented staged records stream the fixed
+            # 512-pool + tail container (2051 = 512*4+3), the 2176 packed
+            # container, and the length-scaled top-k containers (DegradationMath
+            # clearing path): select_k(n) = max(512, ceil(N_pool/64)) pools ->
+            # container max_topk_tokens + kpool - 1 = 4099 / 8195 / 16387 for
+            # 256K / 500K / 1M context. The MG kernel streams these via per-row
+            # topk_length, so no new kernel logic is needed. Non-kvarn GLM-5.3
+            # DSA uses only {512, 1024, 2048} and never reaches this clause.
+            is_glm_model_type(model_type) and topk in (2051, 2176, 4099, 8195, 16387)
+        )
     )
     if _mg_glm and glm_topk_supported:
         return _run_partitioned_mg(
@@ -444,14 +467,51 @@ def run_unified_prefill(
         and is_glm_model_type(model_type)
         and scale_format == ScaleFormat.NVFP4_E4M3
     )
-    nvfp4_topk_supported = topk in (128, 512, 1024, 2048) or (
-        model_type == ModelType.GLM_NEXT and topk in (2051, 2112)
+    nvfp4_topk_supported = (
+        topk in (128, 512, 1024, 2048, 2176)
+        or (model_type == ModelType.GLM_NEXT and topk in (2051, 2112))
+        or (
+            # KVarN k4v2: GLM_NSA-presented NVFP4 staged records stream the
+            # 2176 packed container. Non-kvarn NVFP4 GLM-5.3 DSA uses only
+            # {128, 512, 1024, 2048} and never reaches this clause.
+            is_glm_model_type(model_type) and topk == 2176
+        )
     )
     if _mg_nvfp4 and nvfp4_topk_supported:
         return _run_partitioned_mg(
             compute_mode=ComputeMode.BF16,
             model_type=model_type,
             scale_format=ScaleFormat.NVFP4_E4M3,
+        )
+    # ── KVarN (KVARN_DUAL, inline fp16 scale/zp, GLM family) MG gate ──────────
+    # BF16-QK / BF16-XV with in-register dequant of the dual-rate codes --
+    # the same numerics as the validated KVarN decode arms. The record row is
+    # 8B- (not 16B-) aligned, so the IO warps scalar-copy it (bulk_tx_bytes=0,
+    # cp.async.bulk illegal); smem budget allows mg_n_hg==1 only. The packed
+    # 2176 container streams 34 bi=64 tiles; the 2088 = index_topk + kpool - 1
+    # selection container streams 33 (last tile partial, per-row topk_length).
+    _mg_kvarn = (
+        _mg_enabled
+        and not has_extra
+        and model_type == ModelType.KVARN_MLA
+        and scale_format == ScaleFormat.KVARN_DUAL
+    )
+    kvarn_topk_supported = topk in (
+        512,
+        1024,
+        2048,
+        2051,
+        2088,
+        2176,
+        4099,
+        8195,
+        16387,
+    )
+    if _mg_kvarn and kvarn_topk_supported:
+        return _run_partitioned_mg(
+            compute_mode=ComputeMode.BF16,
+            model_type=model_type,
+            scale_format=ScaleFormat.KVARN_DUAL,
         )
     if (
         _mg_enabled
@@ -539,6 +599,8 @@ def run_unified_prefill(
         "GLM_NSA topk in {512, 1024, 2048}; GLM_NEXT topk in "
         "{512, 1024, 2048, 2051, 2112}; "
         "NVFP4 (GLM-family, scale_format=2) topk in {128, 512, 1024, 2048}; "
-        "GLM_NEXT NVFP4 additionally topk in {2051, 2112}. "
+        "GLM_NEXT NVFP4 additionally topk in {2051, 2112}; "
+        "KVarN k4v2 (GLM_NSA-presented) additionally topk in "
+        "{2051, 2176} or length-scaled containers {4099, 8195, 16387}. "
         "No decode-reuse fallback."
     )

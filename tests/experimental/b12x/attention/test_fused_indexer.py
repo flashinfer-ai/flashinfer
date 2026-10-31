@@ -21,6 +21,7 @@ from b12x.attention.dsa_indexer.fused_indexer import (
     _BATCH_SLACK,
     _COOP_STATE_WORDS,
     _DSV4_BATCH_SLACK,
+    _TIE_BREAK_EPS,
     _resolve_fused_batch_slack,
     fused_indexer_decode_warmup_rows,
     fused_indexer_scratch_max_rows,
@@ -305,8 +306,15 @@ def _golden_topk(
         logit = (
             torch.relu(torch.einsum("hd,td->ht", qf[r], kr)) * weights[r].unsqueeze(1)
         ).sum(0) * sc
-        tk = torch.topk(logit, topk, largest=True, sorted=True)
-        vals.append(tk.values)
+        # Mirror the kernel's deterministic tie-break: perturb by token index *
+        # 2^-24 so exact/near ties at the top-k boundary resolve to the same
+        # candidates the fused radix-select picks. Report unperturbed values.
+        tie = (
+            torch.arange(seqlen, device=logit.device, dtype=torch.float32)
+            * _TIE_BREAK_EPS
+        )
+        tk = torch.topk(logit + tie, topk, largest=True, sorted=True)
+        vals.append(logit[tk.indices])
         idxs.append(set(tk.indices.tolist()))
         scores.append(logit)
     if return_scores:

@@ -35,6 +35,13 @@ class ModelType:
     # latent cache record carries no decoupled RoPE payload.
     GLM_NEXT = 2
     DSV41 = 3  # Heterogeneous full post-RoPE SWA FP8 / main FP4 records.
+    # KVarN dual-rate MLA records (arXiv:2606.03458): Hadamard+VarN+RTN,
+    # per-token k_codes/v_codes planes + per-page VarN/RTN tail scales.
+    KVARN_MLA = 4
+    # Precision-tail decode: GLM fp8 math (ARBITRARY_FP32) over records that
+    # live in a 536B-stride kvarn pool (528B fp8 content + 8B pad). The 536B
+    # gmem row stride is not 16B-aligned, so the IO arm stages scalar.
+    KVARN_TAIL_FP8 = 5
 
 
 class ComputeMode:
@@ -46,6 +53,19 @@ class ScaleFormat:
     UE8M0_BYTE = 0  # DSV4: power-of-2 exponent bytes in an 8B footer.
     ARBITRARY_FP32 = 1  # GLM: arbitrary FP32 inline scales (reference.py).
     NVFP4_E4M3 = 2  # GLM/DS MLA latent: E2M1 data + E4M3 group-16 scales.
+    KVARN_DUAL = 3  # KVarN: dual-bit-width RTN codes + page-tail VarN/RTN scales.
+
+
+# KVarN record width -> (k_bits, v_bits). Unambiguous vs the fp8 (528B) and
+# nvfp4 (304/432B) GLM records; the shared reverse lookup for launchers that
+# see only the cache tensor (decode _preparation, MG prefill launcher).
+KVARN_RECORD_VARIANTS = {
+    536: (4, 4),
+    648: (5, 5),
+    600: (5, 4),
+    400: (4, 2),
+    264: (4, 0),  # single-plane shared-code variant (kvarn_mla_k4_g256)
+}
 
 
 @dataclass(frozen=True)
@@ -85,6 +105,12 @@ class UnifiedMLATraits:
     # [292, 296) of the 368-byte fp8-rope record). False keeps every existing
     # specialization (and its smem layout / PTX) byte-identical.
     latent_scale_per_token: bool = False
+    # KVarN dual-rate record geometry (ScaleFormat.KVARN_DUAL only).  These are
+    # int-valued so they double as const_expr keys AND KernelCompileSpec
+    # KeyField entries; 0/0/0 keeps every non-KVarN specialization byte-identical.
+    k_bits: int = 0
+    v_bits: int = 0
+    group: int = 0
     # Decode-local canonical FP8 stage for V4.1's heterogeneous source rows.
     # This is not a cache ABI change: it exists only after the gathered row is
     # owned by the math CTA.
@@ -97,6 +123,10 @@ def make_unified_traits(
     scale_format: int,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
+    k_bits: int = 0,
+    v_bits: int = 0,
+    group: int = 0,
+    kvarn_row_stride: int = 0,
 ) -> UnifiedMLATraits:
     """Build the trait bundle for one specialization tuple.
 
@@ -345,9 +375,160 @@ def make_unified_traits(
             rope_scale_offset=-1,
         )
 
+    if model_type == ModelType.KVARN_MLA:
+        # KVarN dual-rate MLA record (arXiv:2606.03458): per-token k_codes /
+        # v_codes planes at independent bit widths + a per-page (group-token)
+        # tail carrying VarN channel scale + per-channel RTN scale/zero-point.
+        # The record is staged verbatim into the kv_fp8 row; decode math
+        # unpacks the bit planes and dequants to BF16 in-register (mirroring
+        # the GLM_NSA NVFP4 arm), reading the page-tail scales from gmem.
+        import math as _math
+
+        k_bits = int(k_bits)
+        v_bits = int(v_bits)
+        group = int(group)
+        if k_bits not in (2, 3, 4, 5, 6, 7, 8) or (
+            v_bits != 0 and v_bits not in (2, 3, 4, 5, 6, 7, 8)
+        ):
+            raise ValueError(
+                f"KVARN_MLA bit widths must be in [2, 8] (v=0 selects the "
+                f"single-plane variant); got k={k_bits} v={v_bits}"
+            )
+        if group <= 0:
+            raise ValueError(f"KVARN_MLA group must be positive; got {group!r}")
+        latent_dim = 512
+        k_code_bytes = _math.ceil(latent_dim * k_bits / 8)
+        v_code_bytes = _math.ceil(latent_dim * v_bits / 8)
+        # Mod-33 rule (mirrors vllm KvarnMlaLayout / _kvarn_writer): dual
+        # variants keep the C4 alignment gap >= the 3072B per-page tile-scale
+        # tail; single-plane variants (v_bits == 0) skip the bump -- records
+        # end exactly on the C4 boundary (264 = 8 C4 pages for k4) and the
+        # FP8 index tail starts flush.
+        content = k_code_bytes + v_code_bytes + 6
+        record_bytes = (content + 7) // 8 * 8
+        if v_bits != 0:
+            while record_bytes % 33 == 0 or record_bytes % 33 > 21:
+                record_bytes += 8
+        # The KV stage is double-buffered at bi x record_bytes x 2 bytes.
+        # Wide records (k5v5: 648 B -> 107,392 B total at bi=64) exceed the
+        # 99 KB SM120_SMEM_CARVEOUT_BYTES design budget, which the kvarn
+        # assert (smem.py) replaces with the 108 KB KVARN cap. bi stays 64:
+        # the kernel has a hardcoded bi=64 assumption (bi=32 reproduce is an
+        # illegal __shared__ write; see kvarn-mla-design.md section 9).
+        bi = 64
+        return UnifiedMLATraits(
+            model_type=ModelType.KVARN_MLA,
+            compute_mode=ComputeMode.BF16,
+            scale_format=ScaleFormat.KVARN_DUAL,
+            d_nope=latent_dim,
+            d_rope=0,
+            d_v=latent_dim,
+            quant_tile=64,
+            num_scales=8,  # 512 / 64 logical BF16 K steps
+            n_v_chunks=8,
+            nt_per_warp_xv=1,
+            kv_gmem_stride=kvarn_row_stride or record_bytes,
+            kv_smem_stride=record_bytes,
+            q_nope_stride=520,  # BF16 Q-NoPE smem stride: D_NOPE + 8 elems.
+            bi=bi,
+            hpb=16,
+            block_threads=288,
+            math_threads=256,
+            # The record width is not 16B-aligned, so the IO arm scalar-loads
+            # it (no cp.async.bulk transaction); bulk_tx_bytes stays 0.
+            bulk_tx_bytes=0,
+            v_has_rope=False,
+            has_extra_cache=False,
+            fp8_rope=False,
+            rope_gmem_offset=record_bytes,
+            rope_payload_bytes=0,
+            rope_scale_offset=-1,
+            k_bits=k_bits,
+            v_bits=v_bits,
+            group=group,
+        )
+
+    if model_type == ModelType.KVARN_TAIL_FP8:
+        # Precision-tail decode arm: the GLM fp8 MATH (scale_format=
+        # ARBITRARY_FP32, d_rope=0) over fp8 records stored in-place in
+        # kvarn pool slots. Record content [0,528) is the stock GLM fp8
+        # record (512 E4M3 latent + 4 inline fp32 group scales); the rest
+        # of the slot is pad. The gmem row stride is the POOL's slot
+        # width for this dtype -- kvarn_record_bytes(k_bits, v_bits):
+        # 536 for k4v4, 600 for k5v4 -- NOT a hardcoded k4v4 536. The
+        # row stride alternates 0/8 mod 16, so the IO arm stages it
+        # SCALAR (bulk_tx_bytes=0) into the 528B smem kv_fp8 row the GLM
+        # fp8 math expects (kv_smem_stride stays 528).
+        import math as _math
+
+        if not int(k_bits) or not int(v_bits):
+            raise ValueError(
+                "KVARN_TAIL_FP8 requires kvarn_k_bits/kvarn_v_bits on the "
+                "Caps: the gmem row stride is the kvarn pool's slot width "
+                "for the cache dtype (536 for k4v4, 600 for k5v4)"
+            )
+        tail_record = (
+            (
+                _math.ceil(512 * int(k_bits) / 8)
+                + _math.ceil(512 * int(v_bits) / 8)
+                + 6
+                + 7
+            )
+            // 8
+            * 8
+        )
+        while tail_record % 33 == 0 or tail_record % 33 > 21:
+            tail_record += 8
+        if tail_record < 528:
+            raise ValueError(
+                "KVARN_TAIL_FP8 needs pool slots of >= 528B to hold the "
+                f"fp8 record; k={k_bits} v={v_bits} gives {tail_record}B "
+                "(k4v2=400B cannot store the tail in place)"
+            )
+        if scale_format != ScaleFormat.ARBITRARY_FP32:
+            raise ValueError(
+                "KVARN_TAIL_FP8 requires ScaleFormat.ARBITRARY_FP32; "
+                f"got scale_format={scale_format!r}"
+            )
+        if compute_mode != ComputeMode.FP8:
+            raise ValueError(
+                "KVARN_TAIL_FP8 requires ComputeMode.FP8; "
+                f"got compute_mode={compute_mode!r}"
+            )
+        return UnifiedMLATraits(
+            model_type=ModelType.KVARN_TAIL_FP8,
+            compute_mode=compute_mode,
+            scale_format=ScaleFormat.ARBITRARY_FP32,
+            d_nope=512,
+            d_rope=0,
+            d_v=512,
+            quant_tile=128,
+            num_scales=4,
+            n_v_chunks=4,
+            nt_per_warp_xv=2,
+            kv_gmem_stride=tail_record,
+            kv_smem_stride=528,
+            q_nope_stride=528,
+            bi=64,
+            hpb=16,
+            block_threads=288,
+            math_threads=256,
+            bulk_tx_bytes=0,  # scalar staging (536B row stride not 16B-aligned)
+            k_bits=int(k_bits),
+            v_bits=int(v_bits),
+            group=int(group),
+            v_has_rope=False,
+            has_extra_cache=False,
+            fp8_rope=False,
+            rope_gmem_offset=528,
+            rope_payload_bytes=0,
+            rope_scale_offset=-1,
+        )
+
     raise ValueError(
         f"unsupported model_type {model_type!r} (DSV3_2 is dropped; "
-        "valid: ModelType.DSV4, ModelType.DSV41, ModelType.GLM_NSA, ModelType.GLM_NEXT)"
+        "valid: ModelType.DSV4, ModelType.DSV41, ModelType.GLM_NSA, "
+        "ModelType.GLM_NEXT, ModelType.KVARN_MLA)"
     )
 
 
@@ -379,6 +560,8 @@ def infer_model_type(
             ModelType.GLM_NSA: 576,
             ModelType.GLM_NEXT: 512,
             ModelType.DSV41: 512,
+            ModelType.KVARN_MLA: 512,
+            ModelType.KVARN_TAIL_FP8: 512,
         }.get(model_type)
         if expected_q_head_dim is None:
             raise ValueError(f"unsupported explicit model_type={model_type!r}")
@@ -391,6 +574,14 @@ def infer_model_type(
             return (ModelType.DSV41, ComputeMode.BF16, ScaleFormat.NVFP4_E4M3)
         if model_type == ModelType.DSV4:
             return (ModelType.DSV4, ComputeMode.FP8, ScaleFormat.UE8M0_BYTE)
+        if model_type == ModelType.KVARN_MLA:
+            return (ModelType.KVARN_MLA, ComputeMode.BF16, ScaleFormat.KVARN_DUAL)
+        if model_type == ModelType.KVARN_TAIL_FP8:
+            return (
+                ModelType.KVARN_TAIL_FP8,
+                ComputeMode.FP8,
+                ScaleFormat.ARBITRARY_FP32,
+            )
         return (model_type, ComputeMode.FP8, ScaleFormat.ARBITRARY_FP32)
 
     if q_head_dim == 512:
@@ -405,7 +596,12 @@ def infer_model_type(
 
 def is_glm_model_type(model_type: int) -> bool:
     """Return whether ``model_type`` uses the GLM latent-cache family."""
-    return int(model_type) in (ModelType.GLM_NSA, ModelType.GLM_NEXT)
+    return int(model_type) in (
+        ModelType.GLM_NSA,
+        ModelType.GLM_NEXT,
+        ModelType.KVARN_MLA,
+        ModelType.KVARN_TAIL_FP8,
+    )
 
 
 def resolve_unplanned_traits(
@@ -417,6 +613,9 @@ def resolve_unplanned_traits(
     scale_format: int | None = None,
     fp8_rope: bool | None = None,
     latent_scale_per_token: bool = False,
+    k_bits: int = 0,
+    v_bits: int = 0,
+    group: int = 0,
 ) -> UnifiedMLATraits:
     """Resolve the compatibility-only direct-launch cache recipe.
 
@@ -445,18 +644,57 @@ def resolve_unplanned_traits(
                     f"{int(record_bytes)}"
                 )
             fp8_rope = int(record_bytes) == 368
+    if model_type in (ModelType.KVARN_MLA, ModelType.KVARN_TAIL_FP8):
+        # Derive the dual-rate geometry from the concrete record width when the
+        # caller did not spell it out (536->k4v4, 648->k5v5, 600->k5v4,
+        # 400->k4v2, 272->k4 single-plane; the mod-33 padded widths match
+        # KvarnMlaLayout / _kvarn_writer). The tail arm stores fp8 content in
+        # the SAME pool slots, so its slot width follows the same map. v_bits=0
+        # is a legitimate KVARN_MLA spelling (single-plane), so only k_bits==0
+        # triggers derivation; a KVARN_TAIL_FP8 caller with v_bits=0 is
+        # rejected later by the recipe validation.
+        if int(k_bits) == 0:
+            import math as _math
+
+            latent_dim = 512
+            for kb, vb in ((4, 4), (5, 5), (5, 4), (4, 2), (4, 0)):
+                rc = (
+                    _math.ceil(latent_dim * kb / 8)
+                    + _math.ceil(latent_dim * vb / 8)
+                    + 6
+                )
+                rb = (rc + 7) // 8 * 8
+                if vb != 0:
+                    while rb % 33 == 0 or rb % 33 > 21:
+                        rb += 8
+                if rb == int(record_bytes):
+                    k_bits = kb
+                    v_bits = vb
+                    break
+            else:
+                raise ValueError(
+                    f"KVARN_MLA record width {int(record_bytes)} matches no "
+                    "launched variant (536/648/600/400/272)"
+                )
+        if int(group) == 0:
+            group = 256
     traits = make_unified_traits(
         model_type,
         compute_mode,
         scale_format,
         fp8_rope=fp8_rope,
         latent_scale_per_token=bool(latent_scale_per_token),
+        k_bits=int(k_bits),
+        v_bits=int(v_bits),
+        group=int(group),
     )
     if (
         model_type == ModelType.GLM_NEXT
+        or model_type == ModelType.KVARN_MLA
+        or model_type == ModelType.KVARN_TAIL_FP8
         or (scale_format == ScaleFormat.NVFP4_E4M3 and model_type != ModelType.DSV41)
     ) and int(record_bytes) != int(traits.kv_gmem_stride):
-        if model_type != ModelType.GLM_NEXT:
+        if model_type not in (ModelType.GLM_NEXT, ModelType.KVARN_TAIL_FP8):
             raise ValueError(
                 "NVFP4 cache record width disagrees with fp8_rope_override: "
                 f"got {int(record_bytes)} bytes, expected "

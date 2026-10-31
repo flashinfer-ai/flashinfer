@@ -15,9 +15,12 @@ from cutlass import Int32, Int64, Uint32, Uint64
 from b12x._lib.intrinsics import (
     cp_async_bulk_g2s_mbar_l2hint,
     get_ptr_as_int64,
+    ld_global_nc_u32,
+    ld_global_nc_u16,
     ld_global_nc_v2_u32,
     shared_ptr_to_u32,
     st_shared_u32,
+    st_shared_u16,
 )
 from .io import stage_dsv41_fp8_scales
 
@@ -153,6 +156,87 @@ def io_issue_gather_dsv4_nope(
 
 
 @cute.jit
+def io_issue_gather_kvarn(
+    kv_cache_u8: cute.Tensor,
+    topk_indices: cute.Tensor,
+    kv_fp8_dst_addr: Int32,
+    full_mbar_ptr,
+    g_start: Int32,
+    g_end: Int32,
+    page_block_size: Int32,
+    stride_kv_block: Int64,
+    io_lane: Int32,
+    cache_policy: Uint64,
+    *,
+    bi: cutlass.Constexpr,
+    kv_smem_stride: cutlass.Constexpr,
+    io_threads: cutlass.Constexpr = _IO_THREADS,
+    kvarn_record_bytes: cutlass.Constexpr,
+    kvarn_row_stride: Int32 = Int32(0),
+    kvarn_row_per_block: Int32 = Int32(1),
+):
+    """Gather one KVarN BI=64 prefill tile into MG smem by scalar copies.
+
+    KVarN records (536/600/648B) are 8B- but not 16B-aligned, so
+    cp.async.bulk is illegal -- the IO lanes copy 4-byte words, mirroring
+    the decode IO arm (io.io_issue_gather). Addressing is the binding's
+    linear row layout: ``block*stride0 + local*stride1`` (pool rows are
+    602B inline-tail; the packed full-CKV gather arena binds 536B rows
+    whose page equals one kernel tile).
+
+    Pool rows are 2 mod 4 on odd rows (the 602B inline-tail row is 2 mod 4
+    and rows index tokens), so 4-byte words land on different grids in
+    global and shared memory: the copy uses 2-byte units -- the record's
+    native element alignment. The attention path reads only the record;
+    the page tail -- 66B/token of calibration metadata -- carries no
+    per-token dequant math. Invalid entries clamp to slot 0 (the math S3
+    mask drops them, exactly as the decode IO does). No expect_tx: the
+    stores are scalar, so a CTA fence orders them before the leader's
+    zero-tx arrive (decode pattern).
+    """
+    words: cutlass.Constexpr = kvarn_record_bytes // 2
+    row_stride = Int64(kvarn_row_stride)
+    eo = Int32(0)
+    for _ in cutlass.range_constexpr((bi + io_threads - 1) // io_threads):
+        entry = eo + io_lane
+        if entry < Int32(bi):
+            idx_raw = Int32(-1)
+            if g_start + entry < g_end:
+                idx_raw = Int32(topk_indices[g_start + entry])
+            idx = idx_raw
+            if idx < Int32(0):
+                idx = Int32(0)
+            block_idx = idx // page_block_size
+            local_idx = idx - block_idx * page_block_size
+            data_base_off = Int64(block_idx) * stride_kv_block + Int64(
+                local_idx
+            ) * Int64(row_stride)
+            src = get_ptr_as_int64(kv_cache_u8, data_base_off)
+            dst = kv_fp8_dst_addr + entry * Int32(kv_smem_stride)
+            for half in cutlass.range(0, words, 2):
+                w = Int32(half) * Int32(2)
+                st_shared_u16(
+                    dst + w,
+                    ld_global_nc_u16(src + Int64(half) * Int64(2)),
+                )
+                st_shared_u16(
+                    dst + w + 2,
+                    ld_global_nc_u16(src + Int64(half) * Int64(2) + 2),
+                )
+        eo += Int32(io_threads)
+    cute.arch.fence_acq_rel_cta()
+    # Every IO lane's scalar stores must be visible before the leader's
+    # arrive publishes the tile. The per-lane fence orders only that lane's
+    # own stores; without a rendezvous between the stores and lane 0's
+    # arrive there is no happens-before edge from warps 9..11 to the
+    # leader, so math's mbarrier_wait can release while those lanes are
+    # still storing the record tails.
+    cute.arch.barrier(barrier_id=4, number_of_threads=io_threads)
+    if io_lane == Int32(0):
+        cute.arch.mbarrier_arrive_and_expect_tx(full_mbar_ptr, Int32(0))
+
+
+@cute.jit
 def io_issue_gather_glm_mg(
     kv_cache_u8: cute.Tensor,
     topk_indices: cute.Tensor,
@@ -178,6 +262,9 @@ def io_issue_gather_glm_mg(
     dsv41_fp8: cutlass.Constexpr = False,
     ratio_dst_addr: Int32 = Int32(0),
     ratio_stride: cutlass.Constexpr = 0,
+    kvarn_record_bytes: cutlass.Constexpr = 0,
+    kvarn_row_stride: Int32 = Int32(0),
+    kvarn_row_per_block: Int32 = Int32(1),
 ):
     """Gather one BI=64 GLM prefill tile into MG smem.
 
@@ -191,6 +278,26 @@ def io_issue_gather_glm_mg(
 
     ``scale_format`` (const_expr): ARBITRARY_FP32 (1, GLM 656B/528B) or
     NVFP4_E4M3 (2, NVFP4 432B/288B) record geometry."""
+    if cutlass.const_expr(scale_format == 3):
+        io_issue_gather_kvarn(
+            kv_cache_u8,
+            topk_indices,
+            kv_fp8_dst_addr,
+            full_mbar_ptr,
+            g_start,
+            g_end,
+            page_block_size,
+            stride_kv_block,
+            io_lane,
+            cache_policy,
+            bi=bi,
+            kv_smem_stride=kv_smem_stride,
+            io_threads=io_threads,
+            kvarn_record_bytes=kvarn_record_bytes,
+            kvarn_row_stride=kvarn_row_stride,
+            kvarn_row_per_block=kvarn_row_per_block,
+        )
+        return
     if cutlass.const_expr(dsv41):
         _ios = Int64(528 if dsv41_swa else 288)
         _nope = Int32(528 if dsv41_swa else 288)
@@ -224,6 +331,11 @@ def io_issue_gather_glm_mg(
                         swa=dsv41_swa,
                     )
         cute.arch.fence_acq_rel_cta()
+        # Same hazard as io_issue_gather_kvarn: the per-lane fence orders
+        # only its own thread's stores; the footer/scale stores of the
+        # trailer IO lanes need a rendezvous before the leader's arrive
+        # publishes the tile.
+        cute.arch.barrier(barrier_id=4, number_of_threads=io_threads)
     elif cutlass.const_expr(scale_format == 2):
         if cutlass.const_expr(fp8_rope):
             _ios = Int64(_NVFP4_FP8_ROPE_IO_STRIDE)
