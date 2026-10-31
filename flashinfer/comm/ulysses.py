@@ -56,6 +56,8 @@ _INT32_MAX = 2**31 - 1
 # largest capacity that could still be spent by a legal operand; the binding
 # check is per operand in _validate.
 _MAX_CAPACITY_BYTES = _INT32_MAX * 4
+# Marks a capacity-keyword problem in the gathered config (see _resolve_capacity).
+_CAPACITY_ERROR_PREFIX = "<capacity: "
 _PCIE_MLX5_MAX_INTERLEAVED_STRIDE = 65_535
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # The PCIe transport moves bytes (copy engines and RDMA writes, no arithmetic),
@@ -371,6 +373,11 @@ class UlyssesCommunicator:
         CUDA device of this rank; normalized to an explicit index (bare
         ``"cuda"`` means the current device, an int is a CUDA ordinal).
         Defaults to the current CUDA device.
+    max_elems : int, optional
+        Deprecated: the capacity in elements of ``dtype``, as taken before
+        ``max_bytes`` replaced it. Converted to ``max_elems * dtype.itemsize``
+        bytes with a :class:`DeprecationWarning`. Pass ``max_bytes`` or
+        ``max_elems``, not both.
 
     Examples
     --------
@@ -385,11 +392,12 @@ class UlyssesCommunicator:
         self,
         group: Optional[ProcessGroup] = None,
         *,
-        max_bytes: int,
+        max_bytes: Optional[int] = None,
         dtype: torch.dtype,
         backend: str = "auto",
         nvlink_kernel: str = "auto",
         device: Optional[Union[torch.device, str, int]] = None,
+        max_elems: Optional[int] = None,
     ):
         r"""Construct a Ulysses communicator.
 
@@ -425,7 +433,19 @@ class UlyssesCommunicator:
             CUDA device bound to this rank. ``None`` uses the current CUDA
             device. Strings and integers are normalized to an explicit CUDA
             ordinal.
+        max_elems : Optional[int], optional
+            Deprecated capacity in elements of ``dtype``; converted to
+            ``max_elems * dtype.itemsize`` bytes. Pass ``max_bytes`` or
+            ``max_elems``, not both.
         """
+        if max_elems is not None:
+            warnings.warn(
+                "UlyssesCommunicator(max_elems=...) is deprecated; pass "
+                "max_bytes=max_elems * dtype.itemsize instead. Scheduled for "
+                "removal in a future release.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._state = _CLOSED  # flipped to OPEN only when construction succeeds
         self._nvlink_armed = False  # joint property: set on all ranks or none
         # opaque NVLink-backend handle (a C++ UlyssesA2A* as an int) from
@@ -480,7 +500,12 @@ class UlyssesCommunicator:
         # same error on every rank instead of hanging peers in a later gather.
         # Devices are validated per rank but may legitimately differ across
         # ranks (cuda:rank); only max_bytes and dtype must match.
-        config = self._encode_config(max_bytes, dtype, device, backend, nvlink_kernel)
+        # A capacity-keyword problem (both, neither, or a bad deprecated
+        # max_elems) also goes through the gather, so every rank raises it.
+        max_bytes, capacity_error = self._resolve_capacity(max_bytes, max_elems, dtype)
+        config = self._encode_config(
+            max_bytes, dtype, device, backend, nvlink_kernel, capacity_error
+        )
         configs = self._gather(config)
         self._validate_configs_jointly(configs)
 
@@ -663,11 +688,42 @@ class UlyssesCommunicator:
         except Exception:  # noqa: BLE001
             return torch.device("cuda", 0)
 
+    @staticmethod
+    def _resolve_capacity(
+        max_bytes, max_elems, dtype
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """Map the capacity keywords to ``max_bytes``. Never raises: a problem
+        is returned as text for the joint config validation."""
+        if max_elems is None:
+            if max_bytes is None:
+                return None, "max_bytes is required"
+            return max_bytes, None
+        if max_bytes is not None:
+            return None, "pass max_bytes or the deprecated max_elems, not both"
+        if type(max_elems) is not int:
+            return None, (
+                f"max_elems must be a positive int, got <invalid type: "
+                f"{type(max_elems).__name__}>"
+            )
+        if max_elems <= 0:
+            return None, f"max_elems must be a positive int, got {max_elems}"
+        if not isinstance(dtype, torch.dtype):
+            return max_elems, None  # the joint validation reports the dtype
+        return max_elems * dtype.itemsize, None
+
     @classmethod
     def _encode_config(
-        cls, max_bytes, dtype, device, backend, nvlink_kernel="auto"
+        cls,
+        max_bytes,
+        dtype,
+        device,
+        backend,
+        nvlink_kernel="auto",
+        capacity_error: Optional[str] = None,
     ) -> Tuple[str, ...]:
-        if type(max_bytes) is not int:  # bool is an int subclass: reject it too
+        if capacity_error is not None:
+            nbytes = f"{_CAPACITY_ERROR_PREFIX}{capacity_error}>"
+        elif type(max_bytes) is not int:  # bool is an int subclass: reject it too
             nbytes = f"<invalid type: {type(max_bytes).__name__}>"
         else:
             nbytes = str(max_bytes)
@@ -707,7 +763,9 @@ class UlyssesCommunicator:
             dtypes = _PCIE_SUPPORTED_DTYPES if bk == "pcie" else _SUPPORTED_DTYPES
             supported = tuple(str(d) for d in dtypes)
             errs = []
-            if not nbytes.isdigit() or int(nbytes) <= 0:
+            if nbytes.startswith(_CAPACITY_ERROR_PREFIX):
+                errs.append(nbytes[len(_CAPACITY_ERROR_PREFIX) : -1])
+            elif not nbytes.isdigit() or int(nbytes) <= 0:
                 errs.append(f"max_bytes must be a positive int, got {nbytes}")
             elif int(nbytes) > _MAX_CAPACITY_BYTES:
                 errs.append(

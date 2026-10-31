@@ -1065,6 +1065,28 @@ def test_joint_config_validation_uses_gathered_backends():
         )
 
 
+def test_resolve_capacity_maps_deprecated_max_elems_to_bytes():
+    resolve = UlyssesCommunicator._resolve_capacity
+    assert resolve(4096, None, torch.float16) == (4096, None)
+    for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        assert resolve(None, 1000, dtype) == (1000 * dtype.itemsize, None)
+    assert resolve(None, None, torch.float16)[1] == "max_bytes is required"
+    assert "not both" in resolve(4096, 1000, torch.float16)[1]
+    assert "positive int" in resolve(None, -1, torch.float16)[1]
+    assert "positive int" in resolve(None, True, torch.float16)[1]
+
+
+def test_capacity_keyword_errors_go_through_joint_validation():
+    """A capacity-keyword problem is gathered like any other config field, so
+    every rank raises it together instead of one rank raising alone. The bare
+    ``"cuda"`` device keeps this host-only (no visible-device check)."""
+    encode = UlyssesCommunicator._encode_config
+    ok = encode(2048, torch.float16, "cuda", "nccl")
+    bad = encode(None, torch.float16, "cuda", "nccl", "auto", "max_bytes is required")
+    with pytest.raises(ValueError, match="1: 'max_bytes is required'"):
+        UlyssesCommunicator._validate_configs_jointly(None, [ok, bad])
+
+
 @requires_cuda
 def test_ctor_nccl_backend_never_touches_ipc_jit(gloo_pg, monkeypatch):
     forbid_ipc_and_jit(monkeypatch)
@@ -1074,6 +1096,48 @@ def test_ctor_nccl_backend_never_touches_ipc_jit(gloo_pg, monkeypatch):
     assert comm.backend == "nccl"
     assert comm.fallback_reason is None  # explicitly requested, not a fallback
     comm.close()
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_ctor_accepts_deprecated_max_elems(gloo_pg, monkeypatch, dtype):
+    """v0.7.2 callers passed the capacity in elements of ``dtype`` (#8000)."""
+    forbid_ipc_and_jit(monkeypatch)
+    with pytest.warns(DeprecationWarning, match="max_elems"):
+        comm = UlyssesCommunicator(gloo_pg, max_elems=1024, dtype=dtype, backend="nccl")
+    assert comm.max_bytes == 1024 * dtype.itemsize
+    comm.close()
+
+
+@requires_cuda
+def test_ctor_max_bytes_does_not_warn(gloo_pg, monkeypatch):
+    forbid_ipc_and_jit(monkeypatch)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*max_elems", category=Warning)
+        comm = UlyssesCommunicator(
+            gloo_pg, max_bytes=2048, dtype=torch.float16, backend="nccl"
+        )
+    assert comm.max_bytes == 2048
+    comm.close()
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"max_bytes": 2048, "max_elems": 1024}, "not both"),
+        ({}, "max_bytes is required"),
+        ({"max_elems": 0}, "max_elems must be a positive int"),
+        ({"max_elems": 1.5}, "max_elems must be a positive int"),
+    ],
+    ids=["both", "neither", "zero", "float"],
+)
+def test_ctor_rejects_bad_capacity_keywords(gloo_pg, monkeypatch, kwargs, match):
+    forbid_ipc_and_jit(monkeypatch)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        with pytest.raises(ValueError, match=match):
+            UlyssesCommunicator(gloo_pg, dtype=torch.float16, backend="nccl", **kwargs)
 
 
 @requires_cuda
