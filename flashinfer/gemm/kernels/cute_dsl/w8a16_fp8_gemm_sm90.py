@@ -175,8 +175,18 @@ class Sm90W8A16Fp8GemmKernel:
         tile_m, tile_a, tile_k = self.tile_shape_mnk
         # Epilogue subtile: all weight rows of the tile x 32 activation rows.
         self.epi_tile = (tile_m, 32)
+        # Three staging buffers when they fit: before the barrier of a subtile the
+        # storing warp then waits until at most one store is still reading smem (the
+        # previous subtile's), so the buffer the next subtile writes is free and the
+        # previous store's smem read is off the critical path (two buffers need a
+        # wait for every outstanding store, ~0.3 us per 128x256 tile).  Two buffers
+        # where a third would cost a mainloop stage (the 64x256 tile: 6 -> 5 stages
+        # lost more than the epilogue gained).
         self.epi_stage = 2
         self.ab_stage = self._compute_stages()
+        self.epi_stage = 3
+        if self._compute_stages() < self.ab_stage:
+            self.epi_stage = 2
 
         # Weight (fp8, K-major): 64 bytes per row per stage -> the 64-byte swizzle atom;
         # activation (16-bit, K-major): 128 bytes per row -> 128-byte swizzle.
@@ -1170,7 +1180,7 @@ class Sm90W8A16Fp8GemmKernel:
                         # everyone may write it and the store of this subtile can
                         # be issued.
                         if warp_idx == epi_store_warp:
-                            cute.arch.cp_async_bulk_wait_group(0, read=True)
+                            cute.arch.cp_async_bulk_wait_group(self.epi_stage - 2, read=True)
                         epi_barrier.arrive_and_wait()
                         if warp_idx == epi_store_warp:
                             cute.copy(
@@ -1395,9 +1405,9 @@ class Sm90W8A16Fp8GemmKernel:
                 )
                 cute.arch.fence_proxy("async.shared", space="cta")
                 # One barrier per subtile (see the tail path): the storing warp waits
-                # for the previous store's smem read before the barrier.
+                # for the store that read the next subtile's buffer before the barrier.
                 if warp_idx == epi_store_warp:
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    cute.arch.cp_async_bulk_wait_group(self.epi_stage - 2, read=True)
                 epi_barrier.arrive_and_wait()
                 if warp_idx == epi_store_warp:
                     cute.copy(
