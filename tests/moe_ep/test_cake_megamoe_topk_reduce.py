@@ -244,9 +244,13 @@ def _special_partials(
         & 0xFFFF
     )
     bits = torch.where(pick < 0.20, sign | (1 + low % 0x7F), normal)
-    bits = torch.where((pick >= 0.20) & (pick < 0.32), sign | (0x80 + low % 0x100), bits)
+    bits = torch.where(
+        (pick >= 0.20) & (pick < 0.32), sign | (0x80 + low % 0x100), bits
+    )
     bits = torch.where((pick >= 0.32) & (pick < 0.38), sign, bits)
-    bits = torch.where((pick >= 0.38) & (pick < 0.43), sign | (0x7F00 + low % 0x80), bits)
+    bits = torch.where(
+        (pick >= 0.38) & (pick < 0.43), sign | (0x7F00 + low % 0x80), bits
+    )
     bits = torch.where((pick >= 0.43) & (pick < 0.435), sign | 0x7F80, bits)
     bits = torch.where((pick >= 0.435) & (pick < 0.438), 0x7FC0, bits)
     return (bits - ((bits >> 15) << 16)).short().view(torch.bfloat16)
