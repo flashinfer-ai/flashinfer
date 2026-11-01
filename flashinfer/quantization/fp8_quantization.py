@@ -291,9 +291,10 @@ def mxfp8_quantize(
     Parameters
     ----------
     input : torch.Tensor
-        Input tensor of shape ``[M, K]`` with dtype fp16/bf16/fp8_quantized.
-        The ``"cute-dsl"`` backend additionally supports fp32 input; the
-        ``"cuda"`` backend does not.
+        Input tensor of shape ``[M, K]``. CUDA inputs support fp16/bf16.
+        The ``"cute-dsl"`` backend additionally supports fp32 CUDA inputs;
+        the ``"cuda"`` backend does not. CPU inputs with ``backend="cuda"``
+        require ``torch.float32``.
     is_sf_swizzled_layout : bool
         Whether to use the swizzled layout for scale factors.  Defaults to
         ``True``.
@@ -305,7 +306,9 @@ def mxfp8_quantize(
     backend : {"cuda", "cute-dsl"}
         Backend to use:
 
-        - ``"cuda"``: stable JIT-compiled CUDA kernel (default).
+        - ``"cuda"``: stable JIT-compiled kernel (default). CUDA inputs
+          require SM100 or newer. CPU inputs use the host implementation
+          and require ``torch.float32``.
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
     sf_swizzle_layout : SfLayout, optional
         Swizzle layout for scale factors; when supplied this overrides
@@ -318,6 +321,12 @@ def mxfp8_quantize(
         ``FLOAT8_E4M3`` and ``sf`` is the scale-factor tensor whose
         shape depends on the chosen layout and ``sf_vec_size`` (fixed at
         ``32`` here).
+
+    Raises
+    ------
+    RuntimeError
+        If ``backend="cuda"`` receives a CUDA tensor on a device older
+        than SM100.
 
     Warnings
     --------
@@ -359,6 +368,13 @@ def mxfp8_quantize(
         )
     else:
         # backend == "cuda"
+        if input.device.type == "cuda":
+            major, minor = get_compute_capability(input.device)
+            if major < 10:
+                raise RuntimeError(
+                    "mxfp8_quantize with backend='cuda' requires SM100 or newer, "
+                    f"got SM{major}{minor}"
+                )
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
         x_q, sf = get_mxfp8_quantization_sm100_module().mxfp8_quantize_sm100(
