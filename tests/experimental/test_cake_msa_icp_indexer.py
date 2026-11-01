@@ -2849,9 +2849,9 @@ def _dist_main(argv: Sequence[str]) -> int:
             f"symmetric-memory backend {backend!r}: tagged rows need CUDA peers"
         )
         report["symm_mem_backend"] = backend
-        cap, steps, batch, dql, max_dql = 12, 6, 6, 2, 4
+        cap, steps, dql, max_dql = 16, 6, 2, 4  # 16 rows: the 8-request decode configs
         if args.first_exchange:  # rows of every token of the golden select case
-            cap = max(cap, FirstExchange.build(world, False).capacity)
+            cap = max(12, FirstExchange.build(world, False).capacity)
         layout = msa_ops.msa_icp_comm_layout(world, hpr, cap)
         group = dist.group.WORLD.group_name
         if hasattr(symm_mem, "enable_symm_mem_for_group"):
@@ -2889,16 +2889,31 @@ def _dist_main(argv: Sequence[str]) -> int:
             return 0
         # decode: eager steps 0-1, then one captured step replayed for steps 2-5, checked at the end;
         # the default chain (score plane + select publish) and the fused option (``pool``: list
-        # scorer + list publisher) share the receive rows and the oracle
-        for layers, tagged, fused in (
-            (1, False, False),
-            (2, True, False),
-            (3, True, False),
-            (5, True, False),
-            (5, False, False),
-            (2, False, False),
-            (3, True, True),
-            (2, False, True),
+        # scorer + list publisher) share the receive rows and the oracle.  Batch 8 without a pool
+        # takes the facade's chain rule (the fused chain in its own pool on sm_107a at P128 W4 and W2).
+        rule = cake_backend.fused_decode_min_batch(
+            cake_jit.device_arch(local), args.page, world
+        )
+        report["fused_rule"] = rule
+        fused_calls = [0]
+        fused_entry = cake_backend.decode_score_publish
+
+        def counted_fused(*a, **k) -> None:
+            fused_calls[0] += 1
+            fused_entry(*a, **k)
+
+        cake_backend.decode_score_publish = counted_fused
+        for layers, tagged, fused, batch in (
+            (1, False, False, 6),
+            (2, True, False, 6),
+            (3, True, False, 6),
+            (5, True, False, 6),
+            (5, False, False, 6),
+            (2, False, False, 6),
+            (3, True, True, 6),
+            (2, False, True, 6),
+            (2, True, False, 8),
+            (3, False, False, 8),
         ):
             plan = msa_ops.prepare_msa_icp_indexer(
                 world_size=world,
@@ -2917,6 +2932,9 @@ def _dist_main(argv: Sequence[str]) -> int:
             )
             plan.warmup()
             plan.check_comm(comm)
+            assert plan.fused_decode_min_batch == rule
+            assert (plan._fused_pool is None) == (rule is None)
+            fused_calls[0] = 0
             cases = _decode_steps(
                 lay,
                 steps,
@@ -3004,6 +3022,17 @@ def _dist_main(argv: Sequence[str]) -> int:
                     )
                     report["checks"] += 1
             assert int(comm.errors.item()) == 0
+            by_rule = rule is not None and batch >= rule
+            assert (fused_calls[0] > 0) == (fused or by_rule), (
+                layers,
+                tagged,
+                fused,
+                batch,
+                fused_calls[0],
+            )
+            report["rule_fused_configs"] = report.get("rule_fused_configs", 0) + int(
+                by_rule and not fused
+            )
             dist.barrier()
             if not tagged:
                 assert bool((comm.recv[..., 2 * TOPK] == 0).all().item()), (
@@ -3257,7 +3286,8 @@ def _torchrun(
 def test_distributed_decode_and_prefill(world: int, page: int) -> None:
     """``torchrun`` with ``world`` ranks: facade decode chains over symmetric
     memory (legacy and tagged, 1 / 2 / 3 / 5 layers, eager then CUDA Graph
-    replays with no inter-step host sync), a 64-round legacy ready-flag litmus
+    replays with no inter-step host sync; the fused chain with a caller pool
+    and, at 8 requests, by the facade's chain rule), a 64-round legacy ready-flag litmus
     and a prefill exchange, every rank checked against the oracle."""
     if torch.cuda.device_count() < world:
         pytest.skip(f"needs {world} GPUs")

@@ -311,7 +311,8 @@ def msa_icp_decode_index_score_sharded(
     enable_pdl : bool
         Launch with programmatic dependent launch. On compute capability 10.0
         and 10.3 with 64 or 128 local K rows per page (P128 TP2, P256 TP2 and
-        TP4) the scorer then reads ``seq_lens`` and ``block_table`` and starts
+        TP4), and on 10.7 with 32 or 64 (P128 TP4 and TP2, P256 TP4), the
+        scorer then reads ``seq_lens`` and ``block_table`` and starts
         loading the ``index_k`` pages that end at or before
         ``seq_len - decode_query_len`` before it waits on the preceding
         kernel. The kernel launched just before it must not write them, and
@@ -446,8 +447,9 @@ def msa_icp_decode_score_publish(
     other parameters are as in those two functions.
 
     This path is an option; the default decode chain (and the facade's
-    ``decode`` without ``pool``) is the score plane and the select publish.
-    Each request is cut into ``min(clamp(num_sms * ctas_per_sm // batch, 1,
+    ``decode`` without ``pool``) is the score plane and the select publish,
+    except that the facade runs this path in its own pool on compute
+    capability 10.7 at P128 (TP2 and TP4) from 8 requests on.  Each request is cut into ``min(clamp(num_sms * ctas_per_sm // batch, 1,
     128), cap)`` splits, ``cap`` the architecture's ``TOPK16_SPLIT_CAP`` (48),
     from host metadata only.
     """
@@ -609,7 +611,10 @@ def prepare_msa_icp_indexer(
       its score plane follows the ``enable_pdl`` contract of
       :func:`msa_icp_decode_index_score_sharded`);
       with ``pool`` the fused scorer and publisher of
-      :func:`msa_icp_decode_score_publish` replace the first two steps;
+      :func:`msa_icp_decode_score_publish` replace the first two steps
+      (``scores`` unused), and without ``pool`` they do so in the facade's
+      own pool for batches of ``plan.fused_decode_min_batch`` or more
+      requests (compute capability 10.7 at P128 TP2 and TP4: 8; ``None`` elsewhere);
     * ``prefill_window_plan(window, ...)`` once per query window and step,
       ``prefill_local(query, index_k, block_table, window_plan, score_scratch,
       num_valid_pages, carrier_view)`` per query chunk, the caller's one
@@ -623,7 +628,8 @@ def prepare_msa_icp_indexer(
     every rank before the first decode or prefill exchange and before CUDA
     Graph capture: it loads every kernel into the device's context, so no
     first launch waits on module loading while a peer's merge spins.  The facade allocates only its prefill plan storage,
-    here; no method allocates or synchronizes.
+    and the fused chain's pool where ``fused_decode_min_batch`` is set, here;
+    no method allocates or synchronizes.
 
     Parameters
     ----------

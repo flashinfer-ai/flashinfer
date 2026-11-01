@@ -426,6 +426,36 @@ def plane_splits(name: str, rows: int, arch: str, batch: int, device_index: int)
     return splits
 
 
+# The decode chain of the facade (``MSAIcpIndexerPlan.decode`` without a
+# caller ``pool``): (architecture, page size, world size) -> the number of
+# requests from which the fused chain (list scorer and list publisher, at most
+# ``TOPK16_SPLIT_CAP`` splits) replaces the score plane and the select
+# publish, in a pool the facade allocates once.  On sm_107a at P128 (TP4: 32
+# and TP2: 64 local K rows per page) the measured end-to-end decode step is
+# faster with the fused chain from 8 requests on; below that and at P256 TP4
+# the score plane is faster.  Every other layout and architecture keeps the
+# score plane.  Both chains publish the same receive rows.
+FUSED_DECODE_MIN_BATCH: dict[tuple[str, int, int], int] = {
+    ("sm_107a", 128, 4): 8,
+    ("sm_107a", 128, 2): 8,
+}
+
+
+def fused_decode_min_batch(arch: str, page_size: int, world_size: int) -> Optional[int]:
+    """The number of decode requests from which the facade runs the fused
+    chain without a caller ``pool`` on ``arch`` at ``page_size`` /
+    ``world_size``, or ``None`` (always the score plane; also when the
+    architecture has no fused programs).  Host metadata only (no device read,
+    no environment)."""
+    batch = FUSED_DECODE_MIN_BATCH.get((arch, page_size, world_size))
+    if batch is None or not (
+        cake_jit.has_role("decode_topk", arch)
+        and cake_jit.has_role("topk16_publish", arch)
+    ):
+        return None
+    return batch
+
+
 # --------------------------------------------------------------------------- prefill
 
 
@@ -1278,6 +1308,7 @@ __all__ = [
     "decode_score_columns",
     "decode_score_publish",
     "decode_splits",
+    "fused_decode_min_batch",
     "index_layout",
     "index_score_columns",
     "index_score_plan_storage",

@@ -23,7 +23,9 @@ The caller owns every buffer that crosses ranks or outlives a call: the
 receive storage and its counters (``comm``, laid out by
 :func:`~.cake_backend.comm_layout`), the decode score rows, the prefill score
 scratch and carriers, and the outputs.  The facade owns only the prefill plan
-storage of its query windows, allocated once here.  No method allocates,
+storage of its query windows and, on the layouts where its decode runs the
+fused chain (:func:`~.cake_backend.fused_decode_min_batch`), that chain's
+pool, both allocated once here.  No method allocates,
 synchronizes or reads a device value; every method is CUDA Graph safe once
 :meth:`MSAIcpIndexerPlan.warmup` has loaded the programs.  ``warmup`` must run
 on every rank before the first exchange (a kernel loaded lazily at its first
@@ -158,6 +160,23 @@ class MSAIcpIndexerPlan:
         self.max_num_seqs = max_num_seqs
         self.max_model_len = max_model_len
         self.num_sparse_layers = num_sparse_layers
+        # The decode chain rule: from ``fused_decode_min_batch`` requests on,
+        # ``decode`` without a caller pool runs the fused chain in
+        # ``_fused_pool`` (``None``: always the score plane).
+        self.fused_decode_min_batch = cb.fused_decode_min_batch(
+            self.arch, page_size, world_size
+        )
+        self._fused_pool = (
+            torch.empty(
+                cb.decode_pool_bytes(
+                    max_decode_tokens=max_decode_tokens, num_heads=num_index_heads
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+            if self.fused_decode_min_batch is not None
+            else None
+        )
         self.index_scale, self.index_offset = cb.index_layout(
             page_size, world_size, rank
         )
@@ -317,18 +336,21 @@ class MSAIcpIndexerPlan:
         ``pool`` (uint8 scratch of ``decode_pool_bytes`` bytes) the fused
         chain runs instead: the scorer keeps per-split Top16 lists in
         ``pool`` and the list publisher merges them (``scores`` is unused);
-        its receive rows are the default chain's.
+        its receive rows are the default chain's.  Without ``pool``, a batch
+        of :attr:`fused_decode_min_batch` or more requests (compute
+        capability 10.7 at P128 TP2 and TP4, from 8 requests) also runs the fused
+        chain, in the facade's own pool; ``scores`` is then unused.
 
         With ``enable_pdl`` (the default) the default chain's score plane on
         compute capability 10.0 and 10.3 at 64 or 128 local K rows per page
-        reads ``seq_lens`` and ``block_table`` and starts loading the history
-        ``index_k`` pages (those ending at or before ``seq_len -
-        decode_query_len``) before it waits on the preceding kernel.  The
-        kernel launched just before ``decode`` must not write them and must
-        either be launched without programmatic dependent launch or wait on
-        its own predecessor before it triggers; ``enable_pdl=False`` removes
-        the requirement.  The fused (``pool``) chain reads nothing before its
-        wait.
+        and on 10.7 at 32 or 64 reads ``seq_lens`` and ``block_table`` and
+        starts loading the history ``index_k`` pages (those ending at or
+        before ``seq_len - decode_query_len``) before it waits on the
+        preceding kernel.  The kernel launched just before ``decode`` must
+        not write them and must either be launched without programmatic
+        dependent launch or wait on its own predecessor before it triggers;
+        ``enable_pdl=False`` removes the requirement.  The fused chain reads
+        nothing before its wait.
 
         ``tagged`` selects the generation-tagged rows; it needs at least two
         sparse layers between uses of one slot set (``num_sparse_layers >= 2``
@@ -346,6 +368,13 @@ class MSAIcpIndexerPlan:
             raise ValueError("slot must be 0, 1 or 2")
         self._ensure_comm(comm)
         t = index_q.shape[0]
+        if (
+            pool is None
+            and self.fused_decode_min_batch is not None
+            and seq_lens.ndim == 1
+            and seq_lens.shape[0] >= self.fused_decode_min_batch
+        ):
+            pool = self._fused_pool
         if pool is not None:
             cb.decode_score_publish(
                 index_q,
