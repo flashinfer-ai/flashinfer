@@ -289,7 +289,9 @@ and on a `:kvsplit` route of the `partial` kind or a `:short` route a program of
 (`kv_min`, `kv_alignment`) and its metadata buffer are the record's; no fallback of `served_route` lands on a
 `:kvsplit` route. `route_stages(record, arch, K, queries)` applies the rule; `program_names(route, arch)` lists the record's
 programs, then the bucket programs.
-Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:le32:short`, `fp8:{full,partial}:le768:short`,
+Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:le32:short` (on sm_100a the
+`stage_buckets` of `fp8:q128:short` for `K <= 4096` and of `fp8:full:le32:short` for `K <= 32768` launch the warp-scan
+text with a four-stage TMEM accumulator ring), `fp8:{full,partial}:le768:short`,
 `fp8:qle128:short` (one `logits` stage, the program `fp8_fused_qle128` -- bound per architecture since v13: the
 `source_consumer_release` text on sm_100a, the pinned text on sm_103a, `policy.h32_text_options` -- writing the tiered schedule in-kernel for
 `1 < Q <= 128`, `K <= fused_qle128_max_kv`; catalogued where the `le128` tier's precedence reaches it -- under the
