@@ -116,6 +116,7 @@ class TmemCorrResource(DecodeGenResourceBase):
     softmax_local0_ref: Constexpr[TmemSoftmaxLocalResource] = None
     softmax_local1_ref: Constexpr[TmemSoftmaxLocalResource] = None
     scale_softmax_log2: Float32 = None
+    stats_scale: Float32 = None
     output_scale: Float32 = None
     o_ptr: cute.Pointer = None
     partial_o_ptr: cute.Pointer = None
@@ -672,7 +673,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             scaled_max = Float32(-Float32.inf)
             if sum_val > Float32(0.0):
-                scaled_max = max_val * self.scale_softmax_log2 * Float32(math.log(2.0))
+                scaled_max = max_val * self.stats_scale
             denominator = sum_val
             if cutlass.const_expr(self.cfg.use_fp8_pv):
                 denominator *= Float32(1.0 / self.cfg.fp8_p_quant_scale)

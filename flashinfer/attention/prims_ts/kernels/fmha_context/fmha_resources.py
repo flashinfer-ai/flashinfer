@@ -6197,6 +6197,7 @@ class TmemStatsResource(MemoryResource):
     output_scale: Float32 | cute.Tensor | None = field(init=False, default=None)
     lse_output: cute.Tensor | None = field(init=False, default=None)
     softmax_stats: cute.Tensor | None = field(init=False, default=None)
+    stats_scale: Float32 | None = field(init=False, default=None)
     attention_sinks: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     query_seq_len: Int32 | int = field(init=False, default=0)
@@ -6222,6 +6223,7 @@ class TmemStatsResource(MemoryResource):
         output_scale: Float32 | cute.Tensor | None = None,
         lse_output: cute.Tensor | None = None,
         softmax_stats: cute.Tensor | None = None,
+        stats_scale: Float32 | None = None,
         attention_sinks: cute.Tensor | None = None,
         cum_seqlen_q: cute.Tensor | None = None,
         query_seq_len: Int32 | int = 0,
@@ -6236,6 +6238,7 @@ class TmemStatsResource(MemoryResource):
         self.output_scale = output_scale
         self.lse_output = lse_output
         self.softmax_stats = softmax_stats
+        self.stats_scale = stats_scale
         self.attention_sinks = attention_sinks
         self.cum_seqlen_q = cum_seqlen_q
         self.query_seq_len = query_seq_len
@@ -6587,7 +6590,7 @@ class TmemStatsResource(MemoryResource):
                 maximum = Float32(-Float32.inf)
                 denominator = Float32(0.0)
                 if row_sum > Float32(0.0):
-                    maximum = row_max * scale_softmax_log2 * Float32(0.6931471805599453)
+                    maximum = row_max * self.stats_scale
                     denominator = row_sum / Float32(self.cfg.pv_p_scale)
                 offset = (
                     cutlass.Int64(flat_query) * cutlass.Int64(heads)
