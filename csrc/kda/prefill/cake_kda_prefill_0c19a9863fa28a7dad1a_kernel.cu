@@ -474,15 +474,14 @@ kernel_cake_kda_prefill_0c19a9863fa28a7dad1a(int* __restrict__ items, int num_he
             int epilogue_local_warp = warp_in_wg_1;
             int m_base_1 = taddr + (unsigned int)tmem_row_base_1;
             unsigned int _phase_init_ready_0_1 = 0;
+            mbarrier_wait(init_ready_addr, _phase_init_ready_0_1);
+            _phase_init_ready_0_1 ^= 1;
+            asm volatile("tcgen05.fence::after_thread_sync;");
             #pragma unroll 1
             for (int p_1 = 0; p_1 < num_blocks_1 + 1; p_1++) {
                 int is_first_1 = ((p_1 == 0) ? 1 : 0);
                 int is_last = ((num_blocks_1 <= p_1) ? 1 : 0);
-                if (is_first_1 != 0) {
-                    mbarrier_wait(init_ready_addr, _phase_init_ready_0_1);
-                    _phase_init_ready_0_1 ^= 1;
-                    asm volatile("tcgen05.fence::after_thread_sync;");
-                } else {
+                if (is_first_1 == 0) {
                     int _stage_m_ready_1 = (int)((unsigned int)(p_1 - 1) % 2);
                     int _parity_m_ready_1 = (int)((unsigned int)(p_1 - 1) / 2 % 2);
                     mbarrier_wait(m_ready_addr + (_stage_m_ready_1) * 8, _parity_m_ready_1);
