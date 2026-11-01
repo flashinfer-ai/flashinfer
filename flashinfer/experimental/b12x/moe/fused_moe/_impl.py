@@ -7676,6 +7676,24 @@ def plan_tp_moe_execution(
     )
 
 
+def _compact_micro_scratch_nbytes(plan: TPMoEPlan) -> int:
+    """Scratch bytes a compact N64 W4A8 micro plan needs, or zero."""
+    if not (
+        plan.implementation == "micro"
+        and plan.quant_mode == "w4a8_mx"
+        and plan.w4a8_n64_repacked
+    ):
+        return 0
+    from b12x.moe._shared.kernels.w4a8_compact_micro import micro_scratch_nbytes
+
+    return micro_scratch_nbytes(
+        plan.max_rows // plan.num_topk,
+        plan.k,
+        plan.n,
+        plan.num_topk,
+    )
+
+
 def _validate_workspace(
     workspace: object,
     *,
@@ -7713,25 +7731,11 @@ def _validate_workspace(
             f"expected {(plan.implementation, plan.quant_mode, plan.weight_E, plan.k, plan.n, plan.num_topk, plan.device, plan.dtype)}, "
             f"got {actual}"
         )
-    if (
-        plan.implementation == "micro"
-        and plan.quant_mode == "w4a8_mx"
-        and plan.w4a8_n64_repacked
-    ):
-        from b12x.moe._shared.kernels.w4a8_compact_micro import (
-            micro_scratch_nbytes,
+    required = _compact_micro_scratch_nbytes(plan)
+    if required and workspace.micro_intermediate.nbytes < required:
+        raise ValueError(
+            "compact W4A8 micro workspace is smaller than its planned capacity"
         )
-
-        required = micro_scratch_nbytes(
-            plan.max_rows // plan.num_topk,
-            plan.k,
-            plan.n,
-            plan.num_topk,
-        )
-        if workspace.micro_intermediate.nbytes < required:
-            raise ValueError(
-                "compact W4A8 micro workspace is smaller than its planned capacity"
-            )
     if plan.implementation == "w4a16":
         if not isinstance(workspace, TPW4A16Workspace):
             raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
@@ -8184,6 +8188,12 @@ def _resolve_workspace(
         or (
             isinstance(resolved, (TPDynamicWorkspace, TPMicroWorkspace))
             and resolved.routed_rows_capacity < plan.routed_rows
+        )
+        or (
+            # The pool key omits the weight packing, so a reused micro
+            # workspace can predate a compact N64 plan with the same key.
+            isinstance(resolved, TPMicroWorkspace)
+            and resolved.micro_intermediate.nbytes < _compact_micro_scratch_nbytes(plan)
         )
         or (
             isinstance(resolved, TPW4A16Workspace)

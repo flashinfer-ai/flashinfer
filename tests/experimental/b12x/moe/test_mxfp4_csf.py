@@ -675,24 +675,11 @@ def test_m64_prefill_admission_preserves_outputs_and_explicit_limits(
     )
 
 
-def test_pool_workspace_plans_with_the_n64_representation(monkeypatch):
-    """Pool allocation sizes compact micro scratch from the plan's packing."""
+def _pool_micro_plan(*, repacked):
+    """Minimal micro plan fields that pool workspace resolution reads."""
     from types import SimpleNamespace
 
-    from b12x.moe.fused_moe import _impl
-
-    seen = {}
-
-    class _Planned(Exception):
-        pass
-
-    def plan_core_workspace(*args, **kwargs):
-        seen.update(kwargs)
-        raise _Planned
-
-    monkeypatch.setattr(_impl, "_plan_core_workspace", plan_core_workspace)
-    monkeypatch.setattr(_impl.torch.cuda, "is_current_stream_capturing", lambda: False)
-    plan = SimpleNamespace(
+    return SimpleNamespace(
         implementation="micro",
         quant_mode="w4a8_mx",
         state_E=8,
@@ -714,19 +701,73 @@ def test_pool_workspace_plans_with_the_n64_representation(monkeypatch):
             dynamic_route_mode=None, nvfp4_materialize_intermediate=False
         ),
         weight_plan=SimpleNamespace(source_format="fp4_e8m0_k32"),
-        w4a8_n64_repacked=True,
+        w4a8_n64_repacked=repacked,
     )
+
+
+def _resolve_pool_workspace(_impl, pool, plan):
     one = torch.ones(8)
+    return _impl._resolve_workspace(
+        pool, plan=plan, a1_gscale=one, a2_gscale=one, input_scales_static=True
+    )
+
+
+def test_pool_workspace_plans_with_the_n64_representation(monkeypatch):
+    """Pool allocation sizes compact micro scratch from the plan's packing."""
+    from b12x.moe.fused_moe import _impl
+
+    seen = {}
+
+    class _Planned(Exception):
+        pass
+
+    def plan_core_workspace(*args, **kwargs):
+        seen.update(kwargs)
+        raise _Planned
+
+    monkeypatch.setattr(_impl, "_plan_core_workspace", plan_core_workspace)
+    monkeypatch.setattr(_impl.torch.cuda, "is_current_stream_capturing", lambda: False)
     with pytest.raises(_Planned):
-        _impl._resolve_workspace(
-            _impl.TPMoEWorkspacePool(),
-            plan=plan,
-            a1_gscale=one,
-            a2_gscale=one,
-            input_scales_static=True,
+        _resolve_pool_workspace(
+            _impl, _impl.TPMoEWorkspacePool(), _pool_micro_plan(repacked=True)
         )
     assert seen["source_format"] == "fp4_e8m0_k32"
     assert seen["w4a8_n64_repacked"] is True
+
+
+@pytest.mark.parametrize("enough_scratch", [False, True])
+def test_pool_grows_reused_micro_scratch_for_compact_plans(enough_scratch, monkeypatch):
+    """A compact N64 plan does not reuse a smaller micro workspace from the pool."""
+    from b12x.moe._shared.kernels.w4a8_compact_micro import micro_scratch_nbytes
+    from b12x.moe.fused_moe import _impl
+
+    compact = _pool_micro_plan(repacked=True)
+    required = micro_scratch_nbytes(
+        compact.max_rows // compact.num_topk, compact.k, compact.n, compact.num_topk
+    )
+    calls = []
+
+    def alloc_workspace(*args, **kwargs):
+        calls.append(kwargs)
+        workspace = object.__new__(_impl.TPMicroWorkspace)
+        workspace.state_E = args[2]
+        workspace.max_rows = kwargs["max_rows"]
+        workspace.routed_rows_capacity = kwargs["routed_rows"]
+        nbytes = required if enough_scratch or kwargs["w4a8_n64_repacked"] else 256
+        workspace.micro_intermediate = torch.empty(nbytes, dtype=torch.uint8)
+        return workspace
+
+    monkeypatch.setattr(_impl, "_alloc_workspace", alloc_workspace)
+    monkeypatch.setattr(_impl.torch.cuda, "is_current_stream_capturing", lambda: False)
+    pool = _impl.TPMoEWorkspacePool()
+    first = _resolve_pool_workspace(_impl, pool, _pool_micro_plan(repacked=False))
+    second = _resolve_pool_workspace(_impl, pool, compact)
+    if enough_scratch:
+        assert second is first and len(calls) == 1
+    else:
+        assert second is not first and len(calls) == 2
+        assert calls[1]["w4a8_n64_repacked"] is True
+        assert second.micro_intermediate.nbytes >= required
 
 
 def test_direct_binding_rejects_compact_plans_without_prepared_launchers(
