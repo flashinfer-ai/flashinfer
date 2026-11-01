@@ -1058,17 +1058,29 @@ def test_router_units_policy(monkeypatch):
             )
         assert cake_backend.router_units("kn", arch=arch, sm_count=sms, **fwd) is None
     # weight gradient at T = 16231 (508 K blocks), inside the token windows (test_router_wgrad_token_windows):
-    # hidden 5120 "H0.5x3" on sm_100a / sm_103a (76 head + 228 tail units); hidden 4096 and 6144 and sm_107a: the
-    # deterministic plan
+    # sm_100a hidden 4096 "H1x5p44" (44 head units, then 5 tail units per CTA pair), hidden 5120 "H0.5x3" on sm_100a /
+    # sm_103a (76 head + 228 tail units); hidden 6144, sm_103a hidden 4096 and sm_107a: the deterministic plan
     for arch in ("sm_100a", "sm_103a"):
-        for hidden in (4096, 6144):
-            assert cake_backend.ROUTER_RULES[(arch, "nn_t", hidden, 256)] is None
-            assert (
-                cake_backend.router_partition(
-                    "nn_t", arch=arch, sm_count=152, M=hidden, N=256, K=16231
-                )
-                is None
+        assert cake_backend.ROUTER_RULES[(arch, "nn_t", 6144, 256)] is None
+        assert (
+            cake_backend.router_units(
+                "nn_t", arch=arch, sm_count=152, M=6144, N=256, K=16231
             )
+            is None
+        )
+    assert cake_backend.ROUTER_RULES[("sm_100a", "nn_t", 4096, 256)] == (
+        (10240, 16384, "H1x5p44"),
+    )
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_100a", sm_count=152, M=4096, N=256, K=16231
+    ) == (44 + 5 * 76, 22, round(16 * 508 * 44 / 76))
+    assert cake_backend.ROUTER_RULES[("sm_103a", "nn_t", 4096, 256)] is None
+    assert (
+        cake_backend.router_partition(
+            "nn_t", arch="sm_103a", sm_count=152, M=4096, N=256, K=16231
+        )
+        is None
+    )
     for arch in ("sm_100a", "sm_103a"):
         assert cake_backend.router_partition(
             "nn_t", arch=arch, sm_count=152, **wgrad5120
@@ -1177,6 +1189,7 @@ def test_router_units_policy(monkeypatch):
 # the token windows of the router weight gradient (256 experts), (arch, hidden) -> ((first, last, spec), ...); every
 # other token count runs the deterministic program
 ROUTER_WGRAD_WINDOWS = {
+    ("sm_100a", 4096): ((10240, 16384, "H1x5p44"),),
     ("sm_100a", 5120): ((1, 128, "waves"), (10240, 32768, "H0.5x3")),
     ("sm_103a", 5120): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
 }
@@ -1222,7 +1235,10 @@ def test_router_wgrad_token_windows(arch):
                     )
                 assert got == want, (hidden, T, sms)
     if arch == "sm_100a":
-        # the smallest measured "waves" count
+        # the first token count of the hidden 4096 window (320 K blocks) and the smallest measured "waves" count
+        assert cake_backend.router_partition(
+            "nn_t", arch=arch, sm_count=152, M=4096, N=256, K=10240
+        ) == (44 + 5 * 76, 22, round(16 * 320 * 44 / 76))
         assert cake_backend.router_partition(
             "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=64
         ) == (80, 0, 0)

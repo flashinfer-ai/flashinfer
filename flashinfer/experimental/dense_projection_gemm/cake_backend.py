@@ -635,6 +635,9 @@ ROUTER_RULES: dict[
     # ("H0.5x3", 76 head and 228 tail units on 152 SMs; windows measured at 10240 and 12288 (sm_100a), 16172, 16231,
     # 16384 and 32768 tokens; more than 3 % slower next to a resident kernel at 8192 tokens on sm_100a, at 10240 and
     # 12288 on sm_103a).
+    # Hidden 4096 on sm_100a: 44 head units, one per CTA pair left next to a kernel holding 32 SMs, each a pair's
+    # whole share of the steps, then five tail units per pair ("H1x5p44"; measured at 10240, 12288, 16172, 16231 and
+    # 16384 tokens; more than 3 % slower next to a resident kernel at 8192 tokens and, launched before it, at 32768).
     # Hidden 4096 on sm_103a keeps the deterministic plan: "H1x4p44" (four tail units) was up to 7.6 % slower than
     # that plan at 16172 to 16384 tokens when launched before a kernel holding SMs on another stream.  Hidden 6144
     # keeps the deterministic plan: on sm_100a no partition was faster in every run in CUDA graphs; on sm_103a the
@@ -642,7 +645,7 @@ ROUTER_RULES: dict[
     # sm_107a keeps the deterministic plan: at hidden 4096 "H0.5x4" was up to 7 % slower than that plan when a kernel
     # holding 16 SMs on another stream started during it (the kernel takes SMs the head spans wait for), at hidden
     # 6144 it left the backward pass no faster, and at hidden 5120 it was measured on one part only
-    ("sm_100a", "nn_t", 4096, 256): None,
+    ("sm_100a", "nn_t", 4096, 256): ((10240, 16384, "H1x5p44"),),
     ("sm_100a", "nn_t", 5120, 256): ((1, 128, "waves"), (10240, 32768, "H0.5x3")),
     ("sm_100a", "nn_t", 6144, 256): None,
     ("sm_103a", "nn_t", 4096, 256): None,
