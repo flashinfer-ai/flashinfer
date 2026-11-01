@@ -18,7 +18,9 @@ matrices of test_rope.py do not reach:
 
 * a non-RoPE part that is not a multiple of the RoPE part (partial rotary,
   e.g. rope 32 / no-rope 48), for GQA in both layouts and for MLA;
-* a V cache whose strides differ from the K cache's (padded V rows).
+* a V cache whose strides differ from the K cache's (padded V rows);
+* head dims and row strides the 16-element vector accesses cannot handle,
+  which must raise ValueError on the host instead of a sticky CUDA error.
 
 The caches and the Q non-RoPE output start as poison. Every case checks that
 no byte outside the slots of the appended tokens changed and that the slots
@@ -185,6 +187,10 @@ def test_gqa_append_no_rope_tail(rope_dim, no_rope_dim, kv_layout):
     is not a multiple of rope_dim the last chunk is partial and must stay
     inside the head (64-64 is the control)."""
     _skip_unless_fp8()
+    _check_gqa_append(rope_dim, no_rope_dim, kv_layout)
+
+
+def _check_gqa_append(rope_dim, no_rope_dim, kv_layout):
     hnd = kv_layout == "HND"
     num_qo_heads, num_kv_heads = 8, 2
     head_dim = rope_dim + no_rope_dim
@@ -283,3 +289,75 @@ def test_gqa_append_v_cache_strides(kv_layout, v_row_pad):
         v.float() * _SCALE_KV,
         "v_cache",
     )
+
+
+@pytest.mark.parametrize(
+    "rope_dim,no_rope_dim",
+    [(32, 24), (64, 40), (128, 8), (24, 64)],
+    ids=["32-24", "64-40", "128-8", "24-64"],
+)
+def test_gqa_append_rejects_head_dims_not_multiple_of_16(rope_dim, no_rope_dim):
+    """The kernel works in 16-element vectors. Other head dims used to fail
+    with a sticky cudaErrorMisalignedAddress on contiguous caches; they must be
+    rejected on the host, leaving the context usable."""
+    _skip_unless_fp8()
+    num_qo_heads, num_kv_heads = 8, 2
+    head_dim = rope_dim + no_rope_dim
+    batch = _append_batch()
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q = _randn(gen, batch.nnz, num_qo_heads, head_dim)
+    k = _randn(gen, batch.nnz, num_kv_heads, head_dim)
+    v = _randn(gen, batch.nnz, num_kv_heads, head_dim)
+    page = (_NUM_PAGES, _PAGE_SIZE, num_kv_heads, head_dim)
+    caches = (_poisoned(*page).view(_FP8), _poisoned(*page).view(_FP8))
+    rope = _rope(head_dim, rope_dim)
+
+    with pytest.raises(ValueError, match="multiples of 16"):
+        _append(q, k, v, rope_dim, rope, batch, caches)
+    _check_gqa_append(64, 64, "NHD")
+
+
+def test_mla_append_rejects_no_rope_dim_not_multiple_of_16():
+    """Same host check on the MLA path (ckv rows of 40 bytes)."""
+    _skip_unless_fp8()
+    rope_dim, no_rope_dim = 64, 40
+    head_dim = rope_dim + no_rope_dim
+    batch = _append_batch()
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q = _randn(gen, batch.nnz, 16, head_dim)
+    k = _randn(gen, batch.nnz, head_dim)
+    caches = (
+        _poisoned(_NUM_PAGES, _PAGE_SIZE, no_rope_dim).view(_FP8),
+        _poisoned(_NUM_PAGES, _PAGE_SIZE, rope_dim).view(_FP8),
+    )
+    rope = _rope(head_dim, rope_dim)
+
+    with pytest.raises(ValueError, match="multiples of 16"):
+        _append(q, k, None, rope_dim, rope, batch, caches)
+    _check_gqa_append(64, 64, "NHD")
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_gqa_append_rejects_unaligned_v_rows(kv_layout):
+    """Padded V rows are fine (see above) only while their strides stay
+    multiples of 16 bytes; 8 bytes of padding is rejected on the host."""
+    _skip_unless_fp8()
+    rope_dim, no_rope_dim = 64, 64
+    num_qo_heads, num_kv_heads = 8, 2
+    head_dim = rope_dim + no_rope_dim
+    batch = _append_batch()
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    q = _randn(gen, batch.nnz, num_qo_heads, head_dim)
+    k = _randn(gen, batch.nnz, num_kv_heads, head_dim)
+    v = _randn(gen, batch.nnz, num_kv_heads, head_dim)
+    if kv_layout == "HND":
+        page = (num_kv_heads, _PAGE_SIZE)
+    else:
+        page = (_PAGE_SIZE, num_kv_heads)
+    k_cache = _poisoned(_NUM_PAGES, *page, head_dim).view(_FP8)
+    v_cache = _poisoned(_NUM_PAGES, *page, head_dim + 8).view(_FP8)[..., :head_dim]
+    rope = _rope(head_dim, rope_dim)
+
+    with pytest.raises(ValueError, match="v_cache"):
+        _append(q, k, v, rope_dim, rope, batch, (k_cache, v_cache), kv_layout)
+    _check_gqa_append(64, 64, kv_layout)

@@ -967,10 +967,21 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
 
         uint32_t chunk_valid =
             (elem_offset < no_rope_dim) ? min(rope_chunk_size, no_rope_dim - elem_offset) : 0u;
-        uint32_t lane_elem_offset = tx * vec_size;
-        // Handle tail chunks where no_rope_dim is not a multiple of rope_dim.
-        scale_store_partial_chunk<DType, QuantType, vec_size>(
-            k_nope_in_ptr, k_nope_out_ptr, lane_elem_offset, chunk_valid, quant_scale_kv);
+        if (chunk_valid == rope_chunk_size) {
+          // Full chunk (uniform per block): every lane holds a whole vector, since the host
+          // requires rope_dim to be a multiple of 16.
+          vec_t<float, vec_size> k_nope_vec;
+          k_nope_vec.cast_load(k_nope_in_ptr + tx * vec_size);
+#pragma unroll
+          for (uint32_t i = 0; i < vec_size; ++i) {
+            k_nope_vec[i] = k_nope_vec[i] * quant_scale_kv;
+          }
+          k_nope_vec.cast_store(k_nope_out_ptr + tx * vec_size);
+        } else {
+          // Tail chunk where no_rope_dim is not a multiple of rope_dim.
+          scale_store_partial_chunk<DType, QuantType, vec_size>(
+              k_nope_in_ptr, k_nope_out_ptr, tx * vec_size, chunk_valid, quant_scale_kv);
+        }
 
       } else if (by < k_nope_end + (IS_MLA ? 0u : num_kv_heads)) {
         // ============ V processing & Cache Append (GQA/MHA only) ============
@@ -1016,10 +1027,20 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
 
         uint32_t chunk_valid =
             (elem_offset < no_rope_dim) ? min(rope_chunk_size, no_rope_dim - elem_offset) : 0u;
-        uint32_t lane_elem_offset = tx * vec_size;
-        // Handle tail chunks where no_rope_dim is not a multiple of rope_dim.
-        scale_store_partial_chunk<DType, QuantType, vec_size>(
-            q_nope_in_ptr, q_nope_out_ptr, lane_elem_offset, chunk_valid, quant_scale_q);
+        if (chunk_valid == rope_chunk_size) {
+          // Full chunk (uniform per block), as for K above.
+          vec_t<float, vec_size> q_nope_vec;
+          q_nope_vec.cast_load(q_nope_in_ptr + tx * vec_size);
+#pragma unroll
+          for (uint32_t i = 0; i < vec_size; ++i) {
+            q_nope_vec[i] = q_nope_vec[i] * quant_scale_q;
+          }
+          q_nope_vec.cast_store(q_nope_out_ptr + tx * vec_size);
+        } else {
+          // Tail chunk where no_rope_dim is not a multiple of rope_dim.
+          scale_store_partial_chunk<DType, QuantType, vec_size>(
+              q_nope_in_ptr, q_nope_out_ptr, tx * vec_size, chunk_valid, quant_scale_q);
+        }
       }
     }
   }
