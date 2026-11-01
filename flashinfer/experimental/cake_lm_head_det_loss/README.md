@@ -228,8 +228,49 @@ aliases of the same objects.
   not register an arm keeps the previous stages; the hidden valid-row count's
   chunk 0 keeps its device-count GEMM (`gemm_logits_mcnt` /
   `gemm_logits_nostats_mcnt` + `row_grad`).
-* Memory rule: no logits, probability or `dlogits` buffer ever spans more than
-  `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
+* Kept logits (opt-in, `cake` backend: `chunked_lm_head_det_logprob_keep`,
+  the explicit pair `forward_logprob_keep` / `backward_logprob_keep`, the
+  public entry's `memory_mode="keep_logits"`): the log-probability forward
+  runs `gemm_logits` (the whole `z_c`; the label-column arm is off) and keeps
+  every chunk's BF16 logits -- chunk 0 in the chunk buffer, the later chunks
+  in one `[T_v - rows_0, V]` buffer (`KeptForwardResult.logits`, one
+  `[rows_c, V]` view per chunk; `kept_memory_report` adds them to the
+  `memory_report` of the kept plan as `saved_logits_bytes`, `2 * T_v * V`) --
+  and the backward runs `row_grad` over them in place, then the dX and
+  weight-gradient GEMMs: no logits GEMM in the backward (three GEMMs per chunk
+  instead of four).  All logits forms of an architecture share one mainloop
+  and round the same FP32 accumulator to BF16 with RN, so the kept `z_c` is
+  the recompute's and `lse`, `logp`, `dX` and `dW` are bitwise the default
+  path's.  The autograd entry keeps them only where a backward can follow
+  (grad mode on and `X` or `W` trainable); elsewhere -- `torch.no_grad`,
+  `torch.inference_mode`, the first pass of a reentrant
+  `torch.utils.checkpoint`, frozen inputs, the reference backend -- it is
+  `chunked_lm_head_det_logprob` (the label-column forward).  It saves them
+  with `save_for_backward`: a non-reentrant checkpoint drops them after the
+  checkpointed forward and the recomputation in the backward keeps them
+  again, so only the memory held between the forward and the backward drops;
+  the checkpointed forward and the recomputation still allocate the kept
+  `2 * T_v * V` bytes for a while, and the checkpointed step's peak includes
+  them (measured at `T` = 65031 on B200 and GB300: 25501 MiB for the plain
+  and the checkpointed kept step against 8461 MiB for the default ones, 0 MiB
+  held after the checkpointed forward).  `row_grad` overwrites them, so a
+  second backward through a retained graph recomputes (bitwise the same), and
+  `backward_logprob_keep` marks the views it consumed (a second call on them
+  is a `ValueError`).  A forward with a trainable input whose backward never
+  runs pays the full-logits forward instead of the label-column arm
+  (measured per call, both call orders combined: at `T` = 1 +0.4 to +1.6 us on
+  B200 and +9.6 to +13.1 us on GB300; at `T` = 32 and 128 -3.3 to +1.2 us on
+  B200 and 5.4 to 13.0 us faster on GB300) and holds the kept logits until its
+  graph is freed.  The kept logits are outside the chunk bound of the memory
+  rule below.  The default entries are unchanged: the kept form has its own
+  entry points, plan (`_KeptPlan`), binding and cache keys.
+  `prepare_lm_head_det_loss(..., logprob_keep=True)` prepares the kept plan for
+  those entry points only (its runner's `forward` / `backward` raise
+  `NotImplementedError`).  Like `"budget"`, `memory_mode="keep_logits"` is a
+  `ValueError` on the reference backend (the backend-level
+  `chunked_lm_head_det_logprob_keep` runs the default entry there).
+* Memory rule (except the opt-in kept logits above): no logits, probability or
+  `dlogits` buffer ever spans more than `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,
   an empty `logp` and zero gradients without binding or launching.
   `cake_backend.memory_report` reports the peak temporary bytes separately
@@ -266,7 +307,9 @@ aliases of the same objects.
   bitwise the same.
 * Memory budget (`memory_mode`, keyword of `chunked_lm_head_det_loss` /
   `chunked_lm_head_det_logprob`, default `None`, the `"fast"` form; `"budget"`
-  is opt-in, `cake` backend and BF16 `dW` only).  The fast form keeps the FP32 `[V, H]`
+  is opt-in, `cake` backend and BF16 `dW` only; `"keep_logits"`, the
+  log-probability entry's kept logits above, takes no `num_valid_rows` and is a
+  `ValueError` on the loss entry).  The fast form keeps the FP32 `[V, H]`
   weight-gradient accumulator next to the chunk buffers, so its step peak
   (forward through backward, outputs included) is above that of a head that
   materializes the BF16 logits of the valid rows, `B = 2 * T_v * V + 2 * V *
@@ -467,7 +510,8 @@ value is passed down; the two binding-cache variables are read when that
 module is imported and applied through `BINDING_CACHE.configure` when it first
 reaches the backend.  A build that vendors the package without the wrapper
 sees the backend defaults.  The wrapper leaves `logprob_dz` / `logprob_lbl`
-at their backend defaults (no variable) and passes `memory_mode` (no
+at their backend defaults (no variable), reaches the kept logits through
+`memory_mode="keep_logits"` only and passes `memory_mode` (no
 variable either) and the non-switch keywords `num_valid_rows` /
 `check_num_valid_rows` through unchanged.  The gradient placement of the loss
 entry is a process setting of the backend

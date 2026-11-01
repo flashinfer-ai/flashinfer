@@ -180,7 +180,7 @@ import types
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Callable, NamedTuple, Optional, Union
+from typing import Any, Callable, ClassVar, NamedTuple, Optional, Union, cast
 
 import torch
 import torch.utils.checkpoint as _torch_checkpoint
@@ -2401,6 +2401,8 @@ class Plan:
     # recompute writes ``dz`` itself (no ``row_grad``), the forward writes the statistics and the label column only
     logprob_dz: bool = False
     logprob_lbl: bool = False
+    # the kept-logits form of the log-probability entry (:class:`_KeptPlan`); not a field: the default plan is unchanged
+    logprob_keep: ClassVar[bool] = False
 
     def variants_of(self, index: int) -> ChunkVariants:
         return self.variants[index] if self.variants else ChunkVariants()
@@ -2548,6 +2550,25 @@ class Plan:
         return "scale_cast_f32" if fp32 else "scale_cast_bf16"
 
 
+class _KeptPlan(Plan):
+    """The kept-logits plan of the log-probability entry (:func:`chunked_lm_head_det_logprob_keep`): a :class:`Plan`
+    whose forward runs the plain ``gemm_logits`` per chunk (neither logits GEMM arm) and whose backward recomputes
+    nothing -- ``row_grad`` forms each chunk's ``dz`` over the chunk's kept logits (:func:`recompute_keys`).  The same
+    fields; only :func:`make_plan` with ``logprob_keep=True`` builds it."""
+
+    logprob_keep: ClassVar[bool] = True
+
+    @property
+    def stages(self) -> tuple[str, ...]:
+        n = self.num_chunks
+        recompute = {self.recompute_stage(i) for i in range(n)} - {
+            self.forward_logits_stage(i) for i in range(n)
+        }
+        if self.hidden_count:
+            recompute.discard(self.hidden_logits_stage())
+        return tuple(s for s in super().stages if s not in recompute)
+
+
 def make_plan(
     problem: Problem,
     *,
@@ -2567,6 +2588,7 @@ def make_plan(
     hidden_stats: bool = True,
     logprob_dz: bool = False,
     logprob_lbl: bool = False,
+    logprob_keep: bool = False,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count
     (``dx_resident`` = the device's co-resident dX clusters, :func:`cluster_resident`); ``valid_rows`` (compaction)
@@ -2579,9 +2601,18 @@ def make_plan(
     ``arch`` required): chunk 0's gather and logits GEMM already ran in device-count form (``hidden_stats``: with the
     statistics) at the buffer extent ``min(chunk, T)``, whose raster-rule height the plan records.  ``logprob_dz`` /
     ``logprob_lbl`` (a log-probability plan of a record that registers them) run the entry's logits GEMM arms
-    (:attr:`Plan.logprob_dz`, :attr:`Plan.logprob_lbl`)."""
-    if (logprob_dz or logprob_lbl) and problem.entry != "logprob":
+    (:attr:`Plan.logprob_dz`, :attr:`Plan.logprob_lbl`).  ``logprob_keep`` (a log-probability plan, a registered
+    program): the kept-logits plan (:class:`_KeptPlan`), which runs neither arm."""
+    if (logprob_dz or logprob_lbl or logprob_keep) and problem.entry != "logprob":
         raise ValueError("the logits GEMM arms belong to the log-probability entry")
+    if logprob_keep:
+        if arch is None:
+            raise ValueError(
+                "the kept logits (logprob_keep) belong to a registered program (arch required)"
+            )
+        logprob_dz = logprob_lbl = (
+            False  # the whole z_c is stored and row_grad forms dz from it
+        )
     rows = problem.num_rows if valid_rows is None else int(valid_rows)
     chunks = plan_chunks(rows, problem.chunk)
     tuning = gemm_tuning or {}
@@ -2664,7 +2695,7 @@ def make_plan(
             problem.hidden, min(int(problem.chunk), int(problem.num_rows)), arch
         )
         hidden_group = None if raster is None else raster[0]
-    return Plan(
+    return (_KeptPlan if logprob_keep else Plan)(
         problem,
         chunks,
         bool(need_dx),
@@ -2950,6 +2981,24 @@ def memory_report(
         saved_dz_bytes=min(int(chunk), rows) * int(vocab) * 2 if deferred else 0,
         dx_finalize=fused_dx,
         hidden_count=False,
+    )
+
+
+def kept_memory_report(memory: dict[str, Any], plan: Plan) -> dict[str, Any]:
+    """:func:`memory_report` of a kept-logits plan (:class:`_KeptPlan`): the forward keeps every chunk's BF16 logits for
+    the backward -- chunk 0 in the chunk buffer (the ``logits`` temporary, alive until the backward), the chunks after
+    it in one ``[T_v - rows_0, V]`` buffer (``accumulators["saved_logits"]``); ``saved_logits_bytes`` counts both,
+    ``2 * T_v * V``.  The memory rule's chunk bound does not hold for them.  The default report has neither key."""
+    if not plan.chunks:
+        return dict(memory, saved_logits_bytes=0)
+    vocab = plan.problem.vocab
+    accumulators = dict(memory["accumulators"])
+    accumulators["saved_logits"] = (plan.rows - plan.chunks[0][1]) * vocab * 2
+    return dict(
+        memory,
+        accumulators=accumulators,
+        accumulator_bytes=sum(accumulators.values()),
+        saved_logits_bytes=plan.rows * vocab * 2,
     )
 
 
@@ -3843,7 +3892,9 @@ def _dx_keys(plan: Plan, index: int) -> list:
 
 
 def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
-    """Launch keys of the log-probability backward (recompute the logits, then the gradient GEMMs)."""
+    """Launch keys of the log-probability backward (recompute the logits, then the gradient GEMMs).  A kept-logits
+    plan (:class:`_KeptPlan`) recomputes nothing: ``row_grad`` forms each chunk's ``dz`` over its kept logits
+    (the chunk's ``X`` rows are gathered for the weight-gradient GEMM only)."""
     keys: list[tuple[str, Any]] = []
     if plan.compact:
         keys.append(("gather_rows", "d_in"))
@@ -3851,9 +3902,15 @@ def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
         queued = (
             plan.hidden_count and index == 0
         )  # the hidden valid-row count: chunk 0's recompute is already queued
-        if plan.compact and not queued:
+        if plan.logprob_keep:
+            if plan.compact and plan.need_dw:
+                keys.append(("gather_rows", index))
+            keys.append(("row_grad", index))  # dz over the chunk's kept logits
+        elif plan.compact and not queued:
             keys.append(("gather_rows", index))
-        if queued:
+        if plan.logprob_keep:
+            pass  # nothing to recompute
+        elif queued:
             # the queued device-count recompute stored ``z``
             keys.append(("row_grad", index))
         elif plan.logprob_dz:
@@ -4255,6 +4312,23 @@ class LmHeadDetLossRunner:
     __call__ = step
 
 
+class _KeptLossRunner(LmHeadDetLossRunner):
+    """The prepared runner of a kept-logits plan (:class:`_KeptPlan`): its kept views are bound per call, so only the
+    kept-logits entry points launch it (through :class:`_KeptBinding`)."""
+
+    def forward(self):
+        raise NotImplementedError(_KEPT_RUNNER)
+
+    def backward(self, grad: Optional[torch.Tensor] = None):
+        raise NotImplementedError(_KEPT_RUNNER)
+
+
+_KEPT_RUNNER = (
+    "a kept-logits plan (logprob_keep) binds its kept views per call: launch it through the eager entry points "
+    "(forward_logprob_keep / backward_logprob_keep / chunked_lm_head_det_logprob_keep)"
+)
+
+
 def _check_output(t: Optional[torch.Tensor], name: str, shape: tuple, dtype) -> None:
     if t is None:
         return
@@ -4386,6 +4460,7 @@ def prepare_lm_head_det_loss(
     dw_stream: Optional[Union[bool, str]] = None,
     logprob_dz: Optional[bool] = None,
     logprob_lbl: Optional[bool] = None,
+    logprob_keep: bool = False,
 ) -> LmHeadDetLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -4437,13 +4512,23 @@ def prepare_lm_head_det_loss(
     forward's logits GEMM is ``gemm_logits_lbl``, where the record registers
     them (bitwise the same outputs); ``False`` keeps ``gemm_logits_nostats`` +
     ``row_grad`` / ``gemm_logits``.  A loss-entry runner rejects ``True``.
+
+    ``logprob_keep`` (log-probability entry, ``cake`` backend; default
+    ``False``): prepare the kept-logits plan (:class:`_KeptPlan`) for the
+    kept-logits entry points, which bind the kept views per call
+    (:func:`forward_logprob_keep`, :func:`backward_logprob_keep`); the runner
+    itself does not launch it (its ``forward`` / ``backward`` raise
+    ``NotImplementedError``).
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    if entry != "logprob" and (logprob_dz or logprob_lbl):
+    if entry != "logprob" and (logprob_dz or logprob_lbl or logprob_keep):
         raise ValueError(
-            "logprob_dz / logprob_lbl select logits GEMM arms of the log-probability entry"
+            "logprob_dz / logprob_lbl / logprob_keep select logits GEMM arms of the log-probability entry"
         )
+    keep = bool(entry == "logprob" and logprob_keep)
+    if keep and backend != "cake":
+        raise ValueError("the kept logits (logprob_keep) run on the cake backend")
     device = X.device
     record = None
     module_name = None
@@ -4543,6 +4628,7 @@ def prepare_lm_head_det_loss(
         and _logprob_arm(
             record, stages, LOGPROB_LBL_STAGE, _resolve_logprob_lbl(logprob_lbl)
         ),
+        logprob_keep=keep,
     )
     missing = [s for s in plan.stages if s not in stages]
     if missing:
@@ -4699,13 +4785,15 @@ def prepare_lm_head_det_loss(
         fuse_dw_cast=plan.fuse_dw_cast,
         dx_finalize=plan.dx_finalize,
     )
+    if plan.logprob_keep:
+        memory = kept_memory_report(memory, plan)
     if device.type == "cuda":
         device_index = int(
             device.index if device.index is not None else torch.cuda.current_device()
         )
     else:
         device_index = 0
-    return LmHeadDetLossRunner(
+    return (_KeptLossRunner if plan.logprob_keep else LmHeadDetLossRunner)(
         backend=backend,
         module_name=module_name,
         plan=plan,
@@ -4837,6 +4925,56 @@ def logprob_backward_binding_key(
         bool(hidden_count),
         bool(logprob_dz),
     )
+
+
+def _kept_views(plan: Plan, chunk_buffer: torch.Tensor, device) -> tuple:
+    """The kept logits of a kept-logits forward (:class:`_KeptPlan`): one BF16 ``[rows_c, V]`` view per chunk --
+    chunk 0's rows of the call's chunk buffer (also the hidden valid-row count's prologue buffer, which chunk 0's
+    device-count GEMM already filled), the later chunks' rows of one fresh ``[rows - rows_0, V]`` allocation."""
+    V = plan.problem.vocab
+    _, rows_first = plan.chunks[0]
+    views = [chunk_buffer[:rows_first]]
+    rest_rows = plan.rows - rows_first
+    if rest_rows > 0:
+        rest = torch.empty((rest_rows, V), dtype=torch.bfloat16, device=device)
+        for row0, rows_c in plan.chunks[1:]:
+            start = row0 - rows_first
+            views.append(rest[start : start + rows_c])
+    return tuple(views)
+
+
+# the attribute :func:`backward_logprob_keep` sets on kept views it consumed (``row_grad`` overwrote them with ``dz``)
+_KEPT_SPENT = "_cake_lm_head_kept_logits_spent"
+
+
+def check_kept_logits(plan: Plan, logits) -> tuple:
+    """The forward's kept logits as a backward of ``plan`` binds them: one BF16 contiguous ``[rows_c, V]`` CUDA view per
+    chunk of the plan, on the plan's rows, not yet consumed by a backward (``ValueError`` otherwise)."""
+    views = tuple(logits)
+    if any(getattr(view, _KEPT_SPENT, False) for view in views):
+        raise ValueError(
+            "logits: these kept views were consumed by an earlier backward (row_grad overwrote them with dz); run "
+            "forward_logprob_keep again for another backward"
+        )
+    V = plan.problem.vocab
+    if len(views) != plan.num_chunks:
+        raise ValueError(
+            f"logits: {len(views)} kept chunk view(s) for a plan of {plan.num_chunks} chunk(s)"
+        )
+    for (_, rows_c), view in zip(plan.chunks, views, strict=True):
+        if (
+            not isinstance(view, torch.Tensor)
+            or view.dtype != torch.bfloat16
+            or tuple(view.shape) != (rows_c, V)
+            or not view.is_contiguous()
+            or not view.is_cuda
+        ):
+            raise ValueError(
+                f"logits: every kept chunk view must be a contiguous BF16 [rows_c, V] CUDA tensor of the forward "
+                f"(chunk of {rows_c} rows, V = {V}); got {getattr(view, 'dtype', type(view))} "
+                f"{tuple(getattr(view, 'shape', ()))}"
+            )
+    return views
 
 
 # Values a remembered binding owns: the descriptor workspace of pointer-ABI stages and kernel-private scratch (a few
@@ -5177,6 +5315,124 @@ class _Binding:
         return dx, t.get("dw_out")
 
 
+class _KeptBinding(_Binding):
+    """A remembered binding of a kept-logits plan (:class:`_KeptPlan`): the templated launches of :class:`_Binding`,
+    with every launch of chunk ``i`` bound to the chunk's kept view (one BF16 ``[rows_c, V]`` view per chunk,
+    :func:`_kept_views`) where the default plan binds the chunk buffer.  Launched only by the kept-logits entry points
+    (:meth:`forward_keep`, :meth:`backward_logprob_keep`)."""
+
+    def _launch(self, keys: tuple, t: dict[str, Any], dw_stream: str = "auto") -> None:
+        kept = t.get("logits_keep")
+        if kept is None:
+            # chunk 0's early launches, ahead of the kept views: chunk 0's view is the chunk buffer's first rows
+            super()._launch(keys, t, dw_stream)
+            return
+        plan, launches = self.plan, self.launches
+
+        def run_key(key) -> None:
+            stage = key[0]
+            if isinstance(key[1], int):
+                # the chunk's kept view stands in for the chunk buffer
+                t["logits"] = kept[key[1]]
+            host = HOST_STAGES.get(stage)
+            if host is not None:
+                host(
+                    _slot_values(stage, t, plan, key[1])
+                    if stage == "gather_rows"
+                    else stage_values(stage, t, plan, key[1])
+                )
+                return
+            launch = launches[key]
+            arguments = launch.arguments_for(_slot_values(stage, t, plan, key[1]))
+            if launch.prepare is not None:
+                launch.prepare(*arguments)
+            launch.entry(*arguments)
+
+        _run_keys(self.plan, self.device_index, keys, run_key, dw_stream)
+
+    def forward_keep(
+        self, X, W, labels, row_index=None, hidden=None, dw_stream: str = "auto"
+    ):
+        """:meth:`_Binding.forward` of the log-probability entry that keeps the logits: ``(logp, lse, kept)``, ``kept``
+        one BF16 ``[rows_c, V]`` view per chunk (:func:`_kept_views`; chunk 0's in the chunk buffer)."""
+        p, plan = self.plan.problem, self.plan
+        T = plan.rows
+        self._check_hidden(hidden)
+        early = hidden is None and bool(self.forward_early or self.forward_early_labels)
+        t: dict[str, Any] = dict(X=_prepare_x(X, p, plan.compact), W=W)
+        if early:
+            self._compact(t, row_index)
+            self._chunk_buffers(t)
+            if self.forward_early:
+                self._launch(self.forward_early, t, dw_stream)
+            t["labels"] = _prepare_labels(labels, plan.geometry, row_index)
+            if self.forward_early_labels:
+                self._launch(self.forward_early_labels, t, dw_stream)
+            self._scratch(t, chunk_buffers=False)
+        else:
+            t["labels"] = _prepare_labels(labels, plan.geometry, row_index)
+            self._compact(t, row_index)
+            self._scratch(t, hidden)
+        t["lse"] = torch.empty((T,), dtype=torch.float32, device=self.device)
+        t["logp"] = torch.empty((T,), dtype=torch.float32, device=self.device)
+        kept = t["logits_keep"] = _kept_views(plan, t["logits"], self.device)
+        self._launch(self.forward_late if early else self.forward_order, t, dw_stream)
+        return t["logp"], t["lse"], kept
+
+    def backward_logprob_keep(
+        self,
+        X,
+        W,
+        labels,
+        lse,
+        dlogp,
+        logits: tuple,
+        row_index=None,
+        dw_stream: str = "auto",
+    ):
+        """:meth:`_Binding.backward_logprob` over the forward's kept views ``logits`` (:func:`check_kept_logits`):
+        ``row_grad`` overwrites each with the chunk's ``dz``; no chunk logits buffer is allocated."""
+        p, plan = self.plan.problem, self.plan
+        T, H, V = plan.rows, p.hidden, p.vocab
+        self._check_hidden(None)
+        t: dict[str, Any] = dict(
+            X=_prepare_x(X, p, plan.compact),
+            W=W,
+            labels=_prepare_labels(labels, plan.geometry, row_index),
+            lse=lse,
+        )
+        self._compact(t, row_index)
+        if plan.compact:
+            t["d_in_full"] = dlogp
+            t["d_in"] = torch.empty((T,), dtype=torch.float32, device=self.device)
+        else:
+            t["d_in"] = dlogp
+        rows = self.layout["logits"][1] // (V * 2)
+        t["logits"] = logits[0]  # the chunk buffer's place: chunk 0's kept view
+        t["stats"] = torch.empty(
+            (rows, plan.num_tiles, 2), dtype=torch.float32, device=self.device
+        )
+        if plan.compact:
+            t["x_c"] = torch.empty((rows, H), dtype=torch.bfloat16, device=self.device)
+        self._scratch(t, chunk_buffers=False)
+        t["logits_keep"] = logits
+        if plan.need_dx:
+            t["dx_acc"] = torch.empty((T, H), dtype=torch.float32, device=self.device)
+            if plan.dx_cast:
+                t["dx_out"] = torch.empty(
+                    (T, H), dtype=torch.bfloat16, device=self.device
+                )
+        if plan.need_dw:
+            if plan.dw_acc_needed:
+                t["dw_acc"] = torch.empty(
+                    (V, H), dtype=torch.float32, device=self.device
+                )
+            t["dw_out"] = torch.empty((V, H), dtype=torch.bfloat16, device=self.device)
+        self._launch(self.backward_order, t, dw_stream)
+        dx = t.get("dx_out") if plan.dx_cast else t.get("dx_acc")
+        return dx, t.get("dw_out")
+
+
 def _check_slot_values(key, t: dict[str, Any], plan: Plan, names) -> None:
     """:func:`_slot_values` binds what :func:`stage_values` binds for the host values ``names`` of launch ``key``."""
     fast = _slot_values(key[0], t, plan, key[1])
@@ -5393,6 +5649,21 @@ class ForwardResult:
             row_valid=self.row_valid,
             gemm_tuning=self.gemm_tuning,
         )
+
+
+@dataclass
+class KeptForwardResult(ForwardResult):
+    """:class:`ForwardResult` of :func:`forward_logprob_keep`: ``logits`` holds the kept BF16 logits, one
+    ``[rows_c, V]`` view per chunk, for :func:`backward_logprob_keep` (which overwrites them with ``dz``); ``None``
+    when nothing was launched (no row, or every row ignored)."""
+
+    logits: Optional[tuple] = None
+
+
+def _kept_result(result: ForwardResult, logits: Optional[tuple]) -> KeptForwardResult:
+    return KeptForwardResult(
+        **{f.name: getattr(result, f.name) for f in fields(result)}, logits=logits
+    )
 
 
 def _empty_forward(
@@ -6378,6 +6649,249 @@ def backward_logprob(
     return finish_dx(dx), dw
 
 
+def forward_logprob_keep(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    deterministic: bool = True,
+    backend: str = "cake",
+    compact_rows: Optional[bool] = None,
+    hidden_count: Optional[bool] = None,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+) -> KeptForwardResult:
+    """:func:`forward_logprob` that keeps every chunk's BF16 logits for the backward (``cake`` backend): the logits
+    GEMM is the plain ``gemm_logits`` (the whole ``z_c``, not the label-column arm), chunk 0's logits stay in the
+    chunk buffer and the later chunks' go to one ``[T_v - rows_0, V]`` buffer, ``2 * T_v * V`` bytes in all
+    (:attr:`KeptForwardResult.logits`).  Pass them to :func:`backward_logprob_keep`, which forms ``dz`` from them
+    instead of recomputing the logits.  Bitwise the same ``logp`` / ``lse`` as :func:`forward_logprob`."""
+    if backend != "cake":
+        raise ValueError("the kept logits (logprob_keep) run on the cake backend")
+    problem = validate_lm_head_det_inputs(
+        X,
+        W,
+        labels,
+        chunk_size=chunk_size,
+        deterministic=deterministic,
+        entry="logprob",
+    )
+    tuning = _resolve_gemm_tuning(gemm_tuning)
+    T = problem.num_rows
+    if T == 0:
+        return _kept_result(
+            _empty_forward(problem, X, need_dx=False, need_dw=False), None
+        )
+    compact = _resolve_compact(compact_rows)
+    hc = _hidden_count(
+        problem,
+        X,
+        W,
+        labels,
+        backend=backend,
+        compact=compact,
+        stats=True,
+        hidden_count=_resolve_hidden_count(hidden_count),
+    )
+    if hc is not None:
+        row_index = hc.row_index()
+    else:
+        row_index = valid_row_index(labels) if compact else None
+    if row_index is not None and row_index.numel() == 0:  # every row ignored
+        return _kept_result(
+            _empty_forward(
+                problem, X, need_dx=False, need_dw=False, row_index=row_index
+            ),
+            None,
+        )
+    cache = BINDING_CACHE
+    key = None
+    binding: Optional[_KeptBinding] = None
+    if cache.enabled:
+        key = forward_binding_key(
+            X,
+            W,
+            labels,
+            objective="ce",
+            loss_div=None,
+            infer_logp=None,
+            loss_weights=None,
+            chunk_size=chunk_size,
+            need_dx=False,
+            need_dw=False,
+            grad_weight_dtype=torch.bfloat16,
+            entry="logprob",
+            valid_rows=None if row_index is None else int(row_index.numel()),
+            gemm_tuning=tuning,
+            hidden_count=hc is not None,
+            logprob_lbl=False,
+        ) + ("keep",)
+        found = cache.lookup(key)  # a kept key binds a kept binding only
+        if isinstance(found, _KeptBinding):
+            binding = found
+    if binding is None:
+        runner = prepare_lm_head_det_loss(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            need_dx=False,
+            need_dw=False,
+            deterministic=deterministic,
+            entry="logprob",
+            backend=backend,
+            compact_rows=False if row_index is None else row_index,
+            gemm_tuning=tuning,
+            logprob_lbl=False,
+            logprob_keep=True,
+        )
+        # the kept views are bound per call: every call launches through the templated binding
+        binding = cast(_KeptBinding, _KeptBinding.from_runner(runner, hc))
+        del runner
+        if key is not None:
+            cache.remember(key, binding)
+    logp, lse, kept = binding.forward_keep(X, W, labels, row_index, hc)
+    return KeptForwardResult(
+        loss=None,
+        logp=scatter_rows(logp, row_index, T),
+        lse=lse,
+        memory=binding.memory,
+        backend=backend,
+        row_index=row_index,
+        num_rows=T,
+        logits=kept,
+    )
+
+
+def backward_logprob_keep(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    labels: torch.Tensor,
+    lse: torch.Tensor,
+    dlogp: torch.Tensor,
+    logits: tuple,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    need_dx: bool = True,
+    need_dw: bool = True,
+    deterministic: bool = True,
+    backend: str = "cake",
+    compact_rows: Optional[bool] = None,
+    fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
+    dw_stream: Optional[Union[bool, str]] = None,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    row_index: Any = _RECOUNT,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """:func:`backward_logprob` over the kept logits ``logits`` of :func:`forward_logprob_keep`
+    (:attr:`KeptForwardResult.logits`, ``cake`` backend): each chunk's ``dz`` is formed by ``row_grad`` over its kept
+    view in place -- no logits GEMM; the chunk's ``X`` rows are gathered for the weight gradient only -- then ``dX`` /
+    ``dW`` as there (bitwise the same).  The views serve one backward: this call marks them consumed and a second
+    backward on them is a ``ValueError``.  ``row_index`` as in :func:`backward_logprob`
+    (the forward's valid-row index, or a recount); the hidden valid-row count and ``logprob_dz`` do not apply."""
+    if backend != "cake":
+        raise ValueError("the kept logits (logprob_keep) run on the cake backend")
+    problem = validate_lm_head_det_inputs(
+        X,
+        W,
+        labels,
+        chunk_size=chunk_size,
+        deterministic=deterministic,
+        entry="logprob",
+    )
+    stream_mode = dw_stream_mode(dw_stream)
+    tuning = _resolve_gemm_tuning(gemm_tuning)
+    if not (need_dx or need_dw):
+        return None, None
+    T, H, V = problem.num_rows, problem.hidden, problem.vocab
+    fused_dx = bool(need_dx and _resolve_dx_finalize(dx_finalize))
+    compact = bool(T and _resolve_compact(compact_rows))
+    if row_index is not _RECOUNT:
+        if row_index is not None and not compact:
+            raise ValueError("a valid-row index belongs to a compacted backward")
+        row_valid = (labels >= 0) if (row_index is not None and fused_dx) else None
+    else:
+        row_index, row_valid = (
+            valid_rows(labels, mask=fused_dx) if compact else (None, None)
+        )
+    rows = T if row_index is None else int(row_index.numel())
+    if rows == 0:  # no rows, or every row ignored
+        return (
+            torch.zeros((T, H), dtype=torch.bfloat16, device=X.device)
+            if need_dx
+            else None,
+            torch.zeros((V, H), dtype=torch.bfloat16, device=X.device)
+            if need_dw
+            else None,
+        )
+    _check_output(lse, "lse", (rows,), torch.float32)
+    dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
+    fuse = bool(need_dw and _resolve_fuse(fuse_dw_cast))
+    dx_cast = not (fused_dx and row_index is not None)
+    cache = BINDING_CACHE
+    key = None
+    binding: Optional[_KeptBinding] = None
+    if cache.enabled:
+        key = logprob_backward_binding_key(
+            X,
+            W,
+            labels,
+            lse,
+            dlogp,
+            chunk_size=chunk_size,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            valid_rows=None if row_index is None else rows,
+            fuse_dw_cast=fuse,
+            gemm_tuning=tuning,
+            dx_finalize=fused_dx,
+            hidden_count=False,
+            logprob_dz=False,
+        ) + ("keep",)
+        found = cache.lookup(key)  # a kept key binds a kept binding only
+        if isinstance(found, _KeptBinding):
+            binding = found
+    if binding is None:
+        runner = prepare_lm_head_det_loss(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            deterministic=deterministic,
+            entry="logprob",
+            dlogp=dlogp,
+            lse=lse,
+            backend=backend,
+            compact_rows=False if row_index is None else row_index,
+            fuse_dw_cast=fuse,
+            gemm_tuning=tuning,
+            dx_finalize=fused_dx,
+            dx_cast=dx_cast,
+            dw_stream=stream_mode,
+            logprob_dz=False,
+            logprob_keep=True,
+        )
+        binding = cast(_KeptBinding, _KeptBinding.from_runner(runner))
+        del runner
+        if key is not None:
+            cache.remember(key, binding)
+    views = check_kept_logits(binding.plan, logits)
+    for view in views:  # consumed from here on: row_grad overwrites them with dz
+        setattr(view, _KEPT_SPENT, True)
+    dx, dw = binding.backward_logprob_keep(
+        X, W, labels, lse, dlogp, views, row_index, stream_mode
+    )
+    if dx is not None:
+        dx = (
+            scatter_rows(dx, row_index, T)
+            if dx_cast
+            else finalize_dx(dx, None, row_index, row_valid, T, backend=backend)
+        )
+    return dx, dw
+
+
 # ---------------------------------------------------------------------------
 # Autograd Functions and the backend-level entry points
 # ---------------------------------------------------------------------------
@@ -7001,6 +7515,97 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
         return (dx, dw) + (None,) * 12
 
 
+class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
+    """Entry (b) with the kept logits (:func:`chunked_lm_head_det_logprob_keep`): the forward saves the row statistic
+    and the kept logits; the first backward forms ``dz`` from them, a later one (a retained graph) recomputes."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        X,
+        W,
+        labels,
+        chunk_size,
+        deterministic,
+        compact_rows,
+        fuse_dw_cast,
+        dx_finalize,
+        dw_stream,
+        hidden_count,
+        gemm_tuning,
+        logprob_dz,
+    ):
+        compact = _resolve_compact(compact_rows)
+        hidden = _resolve_hidden_count(hidden_count)
+        tuning = _resolve_gemm_tuning(gemm_tuning)
+        result = forward_logprob_keep(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            deterministic=deterministic,
+            compact_rows=compact,
+            hidden_count=hidden,
+            gemm_tuning=tuning,
+        )
+        ctx.set_materialize_grads(False)
+        # the kept logits are saved tensors too, so a non-reentrant checkpoint drops them with the rest; ``row_grad``
+        # overwrites them with ``dz`` through a raw pointer (no version-counter bump), so the first backward spends
+        # them (``ctx.kept`` True -> False) and a later one through a retained graph recomputes (bitwise the same)
+        ctx.save_for_backward(
+            X, W, labels, result.lse, result.row_index, *(result.logits or ())
+        )
+        ctx.kept = result.logits is not None
+        ctx.chunk_size, ctx.deterministic, ctx.compact = (
+            chunk_size,
+            deterministic,
+            compact,
+        )
+        ctx.fuse_dw_cast = _resolve_fuse(fuse_dw_cast)
+        ctx.dx_finalize = _resolve_dx_finalize(dx_finalize)
+        ctx.dw_stream = dw_stream_mode(dw_stream)
+        ctx.hidden_count = hidden
+        ctx.gemm_tuning = tuning
+        ctx.logprob_dz = _resolve_logprob_dz(logprob_dz)
+        return result.logp
+
+    @staticmethod
+    def backward(ctx, dlogp):
+        if dlogp is None:
+            return (None,) * 12
+        need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
+        X, W, labels, lse, row_index, *kept = ctx.saved_tensors
+        common = dict(
+            chunk_size=ctx.chunk_size,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            deterministic=ctx.deterministic,
+            compact_rows=ctx.compact,
+            fuse_dw_cast=ctx.fuse_dw_cast,
+            dx_finalize=ctx.dx_finalize,
+            dw_stream=ctx.dw_stream,
+            gemm_tuning=ctx.gemm_tuning,
+            row_index=row_index,
+        )
+        if ctx.kept and (need_dx or need_dw):
+            ctx.kept = False  # spent: row_grad overwrites them with dz
+            dx, dw = backward_logprob_keep(
+                X, W, labels, lse, dlogp, tuple(kept), **common
+            )
+        else:
+            dx, dw = backward_logprob(
+                X,
+                W,
+                labels,
+                lse,
+                dlogp,
+                hidden_count=ctx.hidden_count,
+                logprob_dz=ctx.logprob_dz,
+                **common,
+            )
+        return (dx, dw) + (None,) * 10
+
+
 def chunked_lm_head_det_loss(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -7181,6 +7786,70 @@ def chunked_lm_head_det_logprob(
         gemm_tuning,
         logprob_dz,
         logprob_lbl,
+    )
+
+
+def chunked_lm_head_det_logprob_keep(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    deterministic: bool = True,
+    backend: str = "cake",
+    compact_rows: Optional[bool] = None,
+    fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
+    dw_stream: Optional[Union[bool, str]] = None,
+    hidden_count: Optional[bool] = None,
+    gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    logprob_dz: Optional[bool] = None,
+    logprob_lbl: Optional[bool] = None,
+) -> torch.Tensor:
+    """:func:`chunked_lm_head_det_logprob` with the kept logits (opt-in; the opt-in module's
+    ``memory_mode="keep_logits"``).  Where a backward can follow -- grad mode on and ``X`` or ``W`` requiring a
+    gradient, ``cake`` backend -- the forward keeps every chunk's BF16 logits as saved tensors (``2 * T_v * V``
+    bytes until the backward; :func:`forward_logprob_keep`) and the first backward forms ``dz`` from them with
+    ``row_grad`` instead of recomputing the logits (three GEMMs per chunk instead of four); a later backward through
+    a retained graph recomputes.  Elsewhere -- grad mode off (``torch.no_grad``, ``torch.inference_mode``, the first
+    pass of a reentrant ``torch.utils.checkpoint``), no input requiring a gradient, the reference backend -- the call
+    is :func:`chunked_lm_head_det_logprob` (the label-column forward).  A forward with a trainable input whose
+    backward never runs pays the full-logits forward and holds the kept logits until the graph is freed.  Bitwise
+    the same ``logp`` / ``dX`` / ``dW`` as the default entry."""
+    if (
+        backend == "cake"
+        and torch.is_grad_enabled()
+        and (X.requires_grad or W.requires_grad)
+    ):
+        return ChunkedLmHeadDetLogprobKeepFunction.apply(
+            X,
+            W,
+            labels,
+            int(chunk_size),
+            deterministic,
+            compact_rows,
+            fuse_dw_cast,
+            dx_finalize,
+            dw_stream,
+            hidden_count,
+            gemm_tuning,
+            logprob_dz,
+        )
+    return chunked_lm_head_det_logprob(
+        X,
+        W,
+        labels,
+        chunk_size=chunk_size,
+        deterministic=deterministic,
+        backend=backend,
+        compact_rows=compact_rows,
+        fuse_dw_cast=fuse_dw_cast,
+        dx_finalize=dx_finalize,
+        dw_stream=dw_stream,
+        hidden_count=hidden_count,
+        gemm_tuning=gemm_tuning,
+        logprob_dz=logprob_dz,
+        logprob_lbl=logprob_lbl,
     )
 
 

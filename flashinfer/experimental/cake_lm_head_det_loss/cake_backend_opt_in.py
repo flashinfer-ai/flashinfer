@@ -20,7 +20,12 @@ Opt-in forms of the Cake chunked LM-head + loss backend (:mod:`.cake_backend`):
   logits of the valid rows (:func:`memory_plan`);
 * ``num_valid_rows=<host integer>``: the forward plans on the caller's
   valid-row count instead of reading the count back from the device
-  (:func:`given_valid_rows`).
+  (:func:`given_valid_rows`);
+* ``memory_mode="keep_logits"`` (log-probability entry, without
+  ``num_valid_rows``): :mod:`.cake_backend`'s
+  ``chunked_lm_head_det_logprob_keep`` -- where a backward can follow, the
+  forward keeps the BF16 logits of the valid rows (``2 * T_v * V`` bytes) and
+  the backward forms ``dz`` from them instead of recomputing them.
 
 A call with neither (``memory_mode`` ``None`` or ``"fast"`` and
 ``num_valid_rows`` ``None``) runs :mod:`.cake_backend`'s entry unchanged.
@@ -153,6 +158,10 @@ MEMORY_MODES = (
     "fast",
     "budget",
 )  # ``memory_mode`` of the autograd entries: the fastest form / the step-peak budget (:func:`memory_plan`)
+# ``memory_mode`` of :func:`chunked_lm_head_det_logprob` only: keep the forward's BF16 logits for the backward
+# (``2 * T_v * V`` bytes), whose ``row_grad`` then forms ``dz`` from them instead of recomputing the logits --
+# :mod:`.cake_backend`'s ``chunked_lm_head_det_logprob_keep``
+KEEP_LOGITS = "keep_logits"
 
 
 # The budget form's margin below the logits-materializing head's bytes (a fraction of them): the peak model of
@@ -4995,11 +5004,45 @@ def chunked_lm_head_det_logprob(
     forward's valid-row index (no count, no host synchronization) and recomputes under the same values.
     ``memory_mode`` (``"budget"``: the backward's weight-gradient form of :func:`memory_plan`), ``num_valid_rows`` and
     ``check_num_valid_rows`` (the forward's count) as in :func:`chunked_lm_head_det_loss`; with neither keyword the call
-    is :mod:`.cake_backend`'s ``chunked_lm_head_det_logprob``."""
+    is :mod:`.cake_backend`'s ``chunked_lm_head_det_logprob``.  ``memory_mode="keep_logits"`` (:data:`KEEP_LOGITS`,
+    without ``num_valid_rows``; ``cake`` backend): :mod:`.cake_backend`'s ``chunked_lm_head_det_logprob_keep`` --
+    where a backward can follow, the forward keeps the BF16 logits of the valid rows (``2 * T_v * V`` bytes until the
+    backward) and the backward forms ``dz`` from them instead of recomputing them (bitwise the same ``logp`` /
+    ``dX`` / ``dW``); where none can, the default entry.  Like ``"budget"`` it is a ``ValueError`` on the reference
+    backend (the backend-level ``chunked_lm_head_det_logprob_keep`` runs the default entry there)."""
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_CHECK_WITHOUT_COUNT)
-    if num_valid_rows is None and _resolve_memory_mode(memory_mode) == "fast":
-        return _main.chunked_lm_head_det_logprob(
+    try:
+        if num_valid_rows is None and _resolve_memory_mode(memory_mode) == "fast":
+            return _main.chunked_lm_head_det_logprob(
+                X,
+                W,
+                labels,
+                chunk_size=chunk_size,
+                deterministic=deterministic,
+                backend=backend,
+                compact_rows=compact_rows,
+                fuse_dw_cast=fuse_dw_cast,
+                dx_finalize=dx_finalize,
+                dw_stream=dw_stream,
+                hidden_count=hidden_count,
+                gemm_tuning=gemm_tuning,
+                logprob_dz=logprob_dz,
+                logprob_lbl=logprob_lbl,
+            )
+    except ValueError:
+        # the resolver rejects every mode outside MEMORY_MODES; this entry takes KEEP_LOGITS below
+        if not (isinstance(memory_mode, str) and memory_mode == KEEP_LOGITS):
+            raise
+    if memory_mode == KEEP_LOGITS:  # past the fast form: the opt-in kept logits
+        if num_valid_rows is not None:
+            raise ValueError(
+                f"memory_mode={KEEP_LOGITS!r} runs the default entry's forward, which counts the valid rows itself: "
+                "pass no num_valid_rows with it"
+            )
+        if backend != "cake":
+            raise ValueError(f"memory_mode={KEEP_LOGITS!r} runs on the cake backend")
+        return _main.chunked_lm_head_det_logprob_keep(
             X,
             W,
             labels,

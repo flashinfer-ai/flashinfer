@@ -347,8 +347,9 @@ def chunked_lm_head_det_loss(
         ``logp`` / ``dX`` / ``dW`` as ``"fast"``; the recompute forms run more
         GEMM work.  The bound assumes a backward that frees the graph
         (``retain_graph=True`` keeps the forward's state); its margin is
-        measured on GB200, GB300 and B200 (see the package README).  No
-        environment variable.
+        measured on GB200, GB300 and B200 (see the package README).
+        ``"keep_logits"`` belongs to ``chunked_lm_head_det_logprob`` (a
+        ``ValueError`` here).  No environment variable.
     num_valid_rows : int, optional
         The number of labels ``>= 0`` (not ``-100``), as a host integer (a
         Python or NumPy integer or a CPU scalar tensor; a CUDA tensor is
@@ -510,7 +511,16 @@ def chunked_lm_head_det_logprob(
     the same values); ``dW`` is returned in BF16.  ``memory_mode``
     (``"budget"``: the backward's weight-gradient form within the same bound),
     ``num_valid_rows`` and ``check_num_valid_rows`` (the forward's count) as in
-    :func:`chunked_lm_head_det_loss`.
+    :func:`chunked_lm_head_det_loss`.  ``memory_mode="keep_logits"`` (this
+    entry only, without ``num_valid_rows``; opt-in): where a backward can
+    follow (grad mode on, ``X`` or ``W`` trainable) the forward keeps the BF16
+    logits of the valid rows, ``2 * T_v * V`` bytes from the forward to the
+    backward (the chunk bound of the memory rule does not hold for them), and
+    the first backward forms the logit gradient from them instead of
+    recomputing the logits (three GEMMs per chunk instead of four; a second
+    backward through a retained graph recomputes); where none can follow
+    (``torch.no_grad``, ``torch.inference_mode``, frozen inputs) the call is
+    the default one.  Bitwise the same ``logp``, ``dX`` and ``dW``.
     """
     if backend != "cake":
         raise ValueError(
