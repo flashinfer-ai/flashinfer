@@ -91,7 +91,9 @@ flashinfer/gdn_decode.py            @kahyunnam @yzh119 @bkryu @yongwww @jiahanc 
 flashinfer/gdn_kernels/             @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
 flashinfer/gdn_prefill.py           @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
 flashinfer/cake_gdn_det_train_kcp.py @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
+flashinfer/cake_gdn_train_kcp.py     @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
 flashinfer/experimental/cake_gdn_det_train_kcp/ @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
+flashinfer/experimental/cake_gdn_train_kcp/ @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
 flashinfer/experimental/cake_gdn_train/ @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
 flashinfer/experimental/cake/cake_gdn_train/ @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
 flashinfer/gdn_train.py             @kahyunnam @yzh119 @bkryu @yongwww @jiahanc @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan @jimmyzho
