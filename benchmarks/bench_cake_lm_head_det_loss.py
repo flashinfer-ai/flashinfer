@@ -32,7 +32,22 @@ only; its internal token chunk is recorded) and Cut Cross-Entropy (``cce``:
 ``impl="cce"`` with gradient filtering off, ``filter_eps=None``, the exact
 form; the policy and log-probability rows composed from its per-token losses;
 ``cce_default`` = its default gradient filtering, approximate and
-informational only, never a gate).
+informational only, never a gate).  ``cake_logprob`` composes the
+log-probability entry with the row's objective in eager PyTorch (the policy
+rows: log-probabilities plus an eager policy loss, against the fused policy
+loss of the ``cake`` arm on the same inputs).
+
+Temperature (``--temperature scalar|constant|hetero``, value
+``--temperature-value``): the log-probability rows divide the logits by the
+per-token temperature (``scalar``: a Python number; ``constant``: the
+``[T]`` tensor of that value; ``hetero``: a log-uniform ``[T]`` tensor in
+[0.25, 4] with some rows at 1.0).  On those rows ``torch_unchunked`` is the
+non-Cake baseline ``log_softmax(X @ W^T / tau)`` with autograd and
+``torch_chunked`` / ``cake`` take the same temperature; an arm without a
+temperature form is reported unsupported.  On the loss rows only
+``cake_logprob`` takes the temperature (the loss entry has none): the other
+arms run the same inputs without it.  ``--accuracy`` has no oracle for the
+loss-row objective with a temperature (``cake_logprob`` there is timing only).
 
 Timing: ``flashinfer.testing.bench_gpu_time`` with CUPTI activity tracing and
 a cold L2 between iterations (per-iteration GPU span); medians over
@@ -47,7 +62,8 @@ and compute capability).
 Usage::
 
     python benchmarks/bench_cake_lm_head_det_loss.py [--rows t16231_c4096_ce ...]
-        [--arms torch_unchunked,torch_chunked,liger,cce,cake] [--steps 20] [--accuracy] [--json out.json]
+        [--arms torch_unchunked,torch_chunked,liger,cce,cake,cake_logprob] [--steps 20] [--accuracy]
+        [--temperature hetero] [--json out.json]
 """
 
 import argparse
@@ -59,6 +75,7 @@ import statistics
 import sys
 import traceback
 import warnings
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -78,8 +95,10 @@ from tests.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
     DEFAULT_H,
     DEFAULT_LOSS_DIV,
     DEFAULT_V,
+    DEFAULT_TEMPERATURE,
     IGNORE_INDEX,
     RATIO_CLIP,
+    TEMPERATURE_FORMS,
     error_report,
     gate_ratios,
     make_inputs,
@@ -201,16 +220,23 @@ def _objective_loss(logp, inp):
 # ---------------------------------------------------------------------------
 # Arms: ``forward()`` returns the state (``loss`` FP32 scalar, ``logp`` FP32 [T] plus what the
 # backward needs); ``backward(st)`` returns ``dX`` (BF16 [T, H]) and ``dW`` (BF16 [V, H]).
+# ``TEMPERATURE_ENTRIES``: the row entries on which an arm applies the inputs' temperature
+# (:func:`_arm_or_error` gives the other loss-row arms the inputs without it and reports the
+# other log-probability-row arms unsupported).
 # ---------------------------------------------------------------------------
 
 
 class ArmAutograd:
     """Base of the autograd arms: leaves, retained-graph backward."""
 
+    TEMPERATURE_ENTRIES: tuple = ()
+
     def __init__(self, inp, *, entry, chunk):
         self.inp, self.entry, self.chunk = inp, entry, chunk
         self.X = inp.X.detach().requires_grad_()
         self.W = inp.W.detach().requires_grad_()
+        # the temperature as the FP32 [T] tensor the PyTorch arms divide by (tensor by tensor); None without one
+        self.tau = inp.temperature_rows()
 
     def backward(self, st):
         dX, dW = torch.autograd.grad(st["loss"], (self.X, self.W), retain_graph=True)
@@ -229,16 +255,21 @@ class ArmAutograd:
 
 
 class ArmTorchUnchunked(ArmAutograd):
-    """The unchunked PyTorch path (accuracy reference): BF16 GEMM promoted to FP32, logsumexp, autograd."""
+    """The unchunked PyTorch path (accuracy reference): BF16 GEMM promoted to FP32, logsumexp, autograd.  With a
+    temperature (log-probability rows) the non-Cake baseline ``log_softmax(X @ W^T / tau)``: the FP32 logits
+    divided by the ``[T]`` temperature tensor before the logsumexp."""
 
     name = "torch_unchunked"
+    TEMPERATURE_ENTRIES = ("logprob",)
 
     def versions(self):
-        return dict(torch=torch.__version__)
+        return dict(torch=torch.__version__, temperature=self.tau is not None)
 
     def forward(self):
         inp = self.inp
         z = (self.X @ self.W.t()).float()
+        if self.tau is not None:
+            z = z / self.tau[:, None]  # tensor by tensor
         lse = torch.logsumexp(z, dim=-1)
         index = torch.where(inp.valid, inp.labels, torch.zeros_like(inp.labels))
         zy = z.gather(1, index[:, None]).squeeze(1)
@@ -251,14 +282,18 @@ class ArmTorchChunked:
 
     Loss entry: the forward produces the FP32 gradient accumulators chunk by
     chunk (three GEMMs), the backward casts them.  Log-probability entry: the
-    forward saves ``lse``; the backward recomputes each chunk's logits.
+    forward saves ``lse``; the backward recomputes each chunk's logits.  With a
+    temperature (log-probability rows) each chunk's FP32 logits are divided by
+    its ``[rows]`` temperature tensor and the row gradient is ``dlogp / tau``.
     """
 
     name = "torch_chunked"
+    TEMPERATURE_ENTRIES = ("logprob",)
 
     def __init__(self, inp, *, entry, chunk):
         self.inp, self.entry, self.chunk = inp, entry, chunk
         self.T = inp.T
+        self.tau = inp.temperature_rows()
         self.dx_acc = torch.empty((self.T, H), dtype=torch.float32, device=inp.X.device)
         self.dw_acc = torch.empty((V, H), dtype=torch.float32, device=inp.X.device)
 
@@ -269,13 +304,19 @@ class ArmTorchChunked:
             torch=torch.__version__,
             dw_accumulate=_addmm_fp32(probe, a.t(), a),
             dx_out=("out_dtype" if _mm_fp32(a, a).dtype == torch.float32 else "?"),
+            temperature=self.tau is not None,
         )
+
+    def _logits(self, r0, r1):
+        """The chunk's BF16 GEMM output promoted to FP32 (divided by the chunk's temperature rows, tensor by
+        tensor, when the row has a temperature)."""
+        inp = self.inp
+        zf = torch.mm(inp.X[r0:r1], inp.W.t()).float()
+        return zf if self.tau is None else zf / self.tau[r0:r1, None]
 
     def _chunk_stats(self, r0, r1):
         inp = self.inp
-        zf = torch.mm(
-            inp.X[r0:r1], inp.W.t()
-        ).float()  # BF16 GEMM output promoted to FP32
+        zf = self._logits(r0, r1)
         lse = torch.logsumexp(zf, dim=-1)
         labels = inp.labels[r0:r1]
         valid = labels >= 0
@@ -332,13 +373,15 @@ class ArmTorchChunked:
         if self.entry == "logprob":
             for i, r0 in enumerate(range(0, self.T, self.chunk)):
                 r1 = min(self.T, r0 + self.chunk)
-                zf = torch.mm(inp.X[r0:r1], inp.W.t()).float()  # recompute
+                zf = self._logits(r0, r1)  # recompute
                 labels = inp.labels[r0:r1]
                 valid = labels >= 0
                 index = torch.where(valid, labels, torch.zeros_like(labels))
-                d = torch.where(
-                    valid, inp.dlogp[r0:r1], torch.zeros_like(st["lse"][r0:r1])
-                )
+                g = inp.dlogp[r0:r1]
+                if self.tau is not None:
+                    # the 1 / tau chain factor, tensor by tensor
+                    g = g / self.tau[r0:r1]
+                d = torch.where(valid, g, torch.zeros_like(st["lse"][r0:r1]))
                 self._accumulate(
                     r0, r1, self._dlogits(zf, st["lse"][r0:r1], index, d), i == 0
                 )
@@ -459,22 +502,36 @@ class ArmCCEDefault(ArmCCE):
 
 
 class ArmCake(ArmAutograd):
-    """The public experimental entry points (``flashinfer.chunked_lm_head``, ``backend="cake"``)."""
+    """The public experimental entry points (``flashinfer.chunked_lm_head``, ``backend="cake"``); a
+    log-probability row with a temperature passes the inputs' temperature argument as is (a Python number for the
+    scalar form, the ``[T]`` tensor otherwise)."""
 
     name = "cake"
+    TEMPERATURE_ENTRIES = ("logprob",)
+    program_entry: str | None = None  # the program the arm needs: the row's entry
 
     def __init__(self, inp, *, entry, chunk):
         super().__init__(inp, entry=entry, chunk=chunk)
         device = inp.X.device
         hidden, vocab = int(inp.X.shape[1]), int(inp.W.shape[0])
-        if not cake_backend.generated_program_available(device, entry=entry):
+        program = self.program_entry or entry
+        if not cake_backend.generated_program_available(device, entry=program):
             capability = torch.cuda.get_device_capability(device)
             raise RuntimeError(
-                f"generated chunked LM-head program ({entry} entry, H {hidden}, V {vocab}) not registered for "
+                f"generated chunked LM-head program ({program} entry, H {hidden}, V {vocab}) not registered for "
                 f"compute capability {capability[0]}.{capability[1]} in this checkout"
             )
         self.module_name, record = cake_backend.record_for(device)
         self.abi = cake_backend.record_abi(record)
+
+    def _logprob(self):
+        """``chunked_lm_head_det_logprob`` of the arm's leaves, with the inputs' temperature when they carry one."""
+        kw = {}
+        if self.inp.temperature is not None:
+            kw["temperature"] = self.inp.temperature
+        return chunked_lm_head_det_logprob(
+            self.X, self.W, self.inp.labels, chunk_size=self.chunk, backend="cake", **kw
+        )
 
     def versions(self):
         # the switches this arm runs with: the public module's resolution of its FLASHINFER_CAKE_LM_HEAD_LOSS_*
@@ -492,18 +549,18 @@ class ArmCake(ArmAutograd):
             abi=self.abi,
             stages=list(
                 cake_backend.stages_for_entry(
-                    self.entry, fuse_dw_cast=switches["fuse_dw_cast"]
+                    self.program_entry or self.entry,
+                    fuse_dw_cast=switches["fuse_dw_cast"],
                 )
             ),
+            temperature=_temperature_form(self.inp.temperature),
             **switches,
         )
 
     def forward(self):
         inp = self.inp
         if self.entry == "logprob":
-            logp = chunked_lm_head_det_logprob(
-                self.X, self.W, inp.labels, chunk_size=self.chunk, backend="cake"
-            )
+            logp = self._logprob()
             return dict(loss=_downstream_loss(logp, inp), logp=logp)
         loss, logp = chunked_lm_head_det_loss(
             self.X,
@@ -520,6 +577,43 @@ class ArmCake(ArmAutograd):
         return dict(loss=loss, logp=logp)
 
 
+class ArmCakeLogprob(ArmCake):
+    """Loss rows through the log-probability entry: ``chunked_lm_head_det_logprob`` (with the inputs' temperature when
+    they carry one) and the row's objective in eager PyTorch on its ``logp`` -- for the policy rows the
+    log-probabilities plus an eager policy loss, the matched-input comparison to the fused policy loss of the
+    ``cake`` arm."""
+
+    name = "cake_logprob"
+    TEMPERATURE_ENTRIES = ("loss",)
+    program_entry = "logprob"
+
+    def __init__(self, inp, *, entry, chunk):
+        if entry != "loss":
+            raise NotImplementedError(
+                "cake_logprob: loss rows only (the log-probability rows run it as the cake arm)"
+            )
+        super().__init__(inp, entry=entry, chunk=chunk)
+
+    def forward(self):
+        logp = self._logprob()
+        return dict(loss=_objective_loss(logp, self.inp), logp=logp)
+
+
+def _temperature_form(temperature):
+    """A JSON description of a temperature argument: ``None``, ``{"scalar": value}`` or ``{"tensor": [min, max,
+    rows at 1.0]}``."""
+    if temperature is None:
+        return None
+    if isinstance(temperature, torch.Tensor):
+        t = temperature.detach().float()
+        return dict(
+            tensor=[float(t.min()), float(t.max()), int((t == 1.0).sum())]
+            if t.numel()
+            else []
+        )
+    return dict(scalar=float(temperature))
+
+
 ARMS = {
     cls.name: cls
     for cls in (
@@ -529,6 +623,7 @@ ARMS = {
         ArmCCE,
         ArmCCEDefault,
         ArmCake,
+        ArmCakeLogprob,
     )
 }
 
@@ -607,9 +702,23 @@ def measure_accuracy(arm, inp, oracle, b0_errors):
     )
 
 
+def _arm_inputs(cls, inp, entry):
+    """The inputs an arm runs: the row's (with its temperature) when the arm applies the temperature on this entry
+    or the row has none; the same inputs without the temperature for the other loss-row arms (the loss entry takes
+    none); ``None`` for a log-probability row with a temperature the arm has no form of."""
+    if inp.temperature is None or entry in cls.TEMPERATURE_ENTRIES:
+        return inp
+    if entry == "loss":
+        return replace(inp, temperature=None)
+    return None
+
+
 def _arm_or_error(cls, inp, entry, chunk):
+    arm_inp = _arm_inputs(cls, inp, entry)
+    if arm_inp is None:
+        return None, f"NotImplementedError: {cls.name} has no temperature form"
     try:
-        return cls(inp, entry=entry, chunk=chunk), None
+        return cls(arm_inp, entry=entry, chunk=chunk), None
     except (
         Exception
     ) as exc:  # optional dependency missing or arm unavailable on this device
@@ -620,7 +729,13 @@ def _row_inputs(row, args, W):
     T, C, objective, entry = ROWS[row]
     return (
         make_inputs(
-            T, objective=objective, seed=SEED_BASE + T, device=args.device, W=W
+            T,
+            objective=objective,
+            seed=SEED_BASE + T,
+            device=args.device,
+            W=W,
+            temperature=args.temperature,
+            temperature_value=args.temperature_value,
         ),
         C,
         entry,
@@ -638,6 +753,7 @@ def run_perf(args, results, W):
             objective=inp.objective,
             entry=entry,
             inputs_gib=gib(inp.bytes_inputs()),
+            temperature=_temperature_form(inp.temperature),
             arms={},
         )
         for name in args.arms:
@@ -649,6 +765,7 @@ def run_perf(args, results, W):
             try:
                 perf = measure_perf(arm, max(args.min_steps, args.steps))
                 perf["versions"] = arm.versions()
+                perf["temperature_applied"] = arm.inp.temperature is not None
             except Exception as exc:
                 perf = dict(
                     error=f"{type(exc).__name__}: {exc}",
@@ -673,8 +790,11 @@ def run_perf(args, results, W):
 def run_accuracy(args, results, W):
     for row in args.rows:
         inp, C, entry = _row_inputs(row, args, W)
-        oracle = reference_fp64(inp, entry=entry)
-        b0 = reference_unchunked(inp, entry=entry)
+        # the oracle of the row's objective: with the temperature on the log-probability rows; the loss rows' oracle
+        # has none (the loss entry takes none), so an arm that applies a temperature there has no oracle
+        ref_inp = inp if entry == "logprob" else replace(inp, temperature=None)
+        oracle = reference_fp64(ref_inp, entry=entry)
+        b0 = reference_unchunked(ref_inp, entry=entry)
         b0_errors = error_report(b0, oracle, inp.labels)
         del b0
         torch.cuda.empty_cache()
@@ -684,6 +804,7 @@ def run_accuracy(args, results, W):
             chunk=C,
             objective=inp.objective,
             entry=entry,
+            temperature=_temperature_form(inp.temperature),
             unchunked_errors=b0_errors,
             arms={},
         )
@@ -696,6 +817,13 @@ def run_accuracy(args, results, W):
             if arm is None:
                 record["arms"][name] = dict(unsupported=error)
                 print(f"{row:22s} {name:16s} unsupported: {error}", flush=True)
+                continue
+            if entry == "loss" and arm.inp.temperature is not None:
+                record["arms"][name] = dict(
+                    timing_only="no oracle of the loss-row objective with a temperature"
+                )
+                print(f"{row:22s} {name:16s} timing only (temperature)", flush=True)
+                del arm
                 continue
             try:
                 record["arms"][name] = measure_accuracy(arm, inp, oracle, b0_errors)
@@ -724,6 +852,18 @@ def main():
         "--arms",
         default="torch_unchunked,torch_chunked,liger,cce,cake",
         help=f"comma-separated subset of {sorted(ARMS)}",
+    )
+    parser.add_argument(
+        "--temperature",
+        default=None,
+        choices=TEMPERATURE_FORMS,
+        help="temperature form of the log-probability calls (default: no temperature)",
+    )
+    parser.add_argument(
+        "--temperature-value",
+        type=float,
+        default=DEFAULT_TEMPERATURE,
+        help="value of the scalar / constant temperature forms",
     )
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--min-steps", type=int, default=5)
@@ -759,6 +899,7 @@ def main():
         capability=env["capability"],
         torch=torch.__version__,
         geometry=dict(H=H, V=V, loss_div=LOSS_DIV, seed_base=SEED_BASE),
+        temperature=dict(form=args.temperature, value=args.temperature_value),
         program_available=dict(
             loss=cake_backend.generated_program_available(device, entry="loss"),
             logprob=cake_backend.generated_program_available(device, entry="logprob"),
