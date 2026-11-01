@@ -56,8 +56,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_trtllm_mla_blackwell_1398348c4ef08bb0671c": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_1398348c4ef08bb0671c_kernel.cu",
+    "cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a", "sm_103a"],
     },
@@ -85,8 +85,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_100a"],
     },
-    "cake_trtllm_mla_blackwell_14fd33b4738fd4437f0b": {
-        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_14fd33b4738fd4437f0b_kernel.cu",
+    "cake_trtllm_mla_blackwell_727d8c54797965d53945": {
+        "device": "cake_trtllm_mla_blackwell/cake_trtllm_mla_blackwell_727d8c54797965d53945_kernel.cu",
         "compile_flags": ["--use_fast_math"],
         "arches": ["sm_103a"],
     },
@@ -234,7 +234,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
     "cake_trtllm_mla_blackwell_family_5b3d4b45f82fac17edbd": {
         "arch": "sm_100a",
         "binding": "cake_trtllm_mla_blackwell/sm_100a/cake_trtllm_mla_blackwell_family_5b3d4b45f82fac17edbd_binding.cu",
-        "dependencies": ["cake_trtllm_mla_blackwell_1398348c4ef08bb0671c"],
+        "dependencies": ["cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_vquarter",
     },
@@ -265,7 +265,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_7fed1cfb7b2de23e",
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_5a25f65a14bfec7b2b1e_sm_103a_0d7b430385a9",
         ],
-        "dependencies": ["cake_trtllm_mla_blackwell_1398348c4ef08bb0671c"],
+        "dependencies": ["cake_trtllm_mla_blackwell_e22bfa68ceed67a200d0"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_vquarter",
     },
@@ -276,9 +276,9 @@ FAMILIES: dict[str, dict[str, Any]] = {
             "-DCAKE_FAMILY_NAME=cake_trtllm_mla_blackwell_family_964007a10127ad82351f",
             "-DCAKE_PROGRAM_SHIM=cake_host_shim_e7a3b284513206b0",
             "-DCAKE_VARIANT_NS=variant_cake_trtllm_mla_blackwell_74250d91903d28576cba_sm_103a_c68808045858",
-            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_14fd33b4738fd4437f0b",
+            "-DCAKE_PROGRAM_KERNEL=kernel_cake_trtllm_mla_blackwell_727d8c54797965d53945",
         ],
-        "dependencies": ["cake_trtllm_mla_blackwell_14fd33b4738fd4437f0b"],
+        "dependencies": ["cake_trtllm_mla_blackwell_727d8c54797965d53945"],
         "compile_flags": ["-std=c++17"],
         "domain": "mla_bf16_clc",
     },
