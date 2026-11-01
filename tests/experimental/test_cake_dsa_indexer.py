@@ -1822,6 +1822,17 @@ def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():
     assert plan(plain, 4096, 65536, 1, None).scan_key == "scan:pair_wide:u2:s0:f0"
     assert plan(p, 4096, 65536, 1, None).scan_key == "scan:wide:u2:s0:f0"
     assert plan(p, 4096, 65536, 1, 0) == plan(plain, 4096, 65536, 1, 0)
+    # without a registry the unpaired wide preference stays off (its program may not be registered: scan:wide:u2:s0:f1 is not)
+    bare = select_program(
+        p,
+        num_queries=4096,
+        num_keys=65536,
+        num_segments=1,
+        ratio=1,
+        top_k=2048,
+        grid=212,
+    )
+    assert bare.scan_key == "scan:pair_wide:u2:s0:f0"
     # the snake pair wide program stays (one causal 64k document, sampled)
     assert plan(p, 65536, 65536, 1, None).scan_key == "scan:pair_wide:u1:s1:f1"
     counts = dict(kept=0, dropped=0, unpaired=0, same=0)

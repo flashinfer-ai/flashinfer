@@ -1347,7 +1347,8 @@ def select_program(
     preference stays off) bounds the ``l6_solo_rule`` preference: it replaces the unit and pair choice of a call that does not
     split with the unpaired l6 unit only where that unit would not split and its program key is registered.  A record's
     ``wide_pair_snake_only`` (sampled calls) drops the CTA pair of a wide unit that would not walk the snake order where the
-    unpaired wide program is in ``scan_keys`` (or no registry is given); ``split_wave_scope`` limits the two-way wave split.
+    unpaired wide program is in ``scan_keys`` (without a registry it stays off, as the l6 preference); ``split_wave_scope``
+    limits the two-way wave split.
     """
     T, Tkv, S, r, K = (
         int(num_queries),
@@ -1391,7 +1392,7 @@ def select_program(
     )
     cap = policy.candidate_capacity(K, mult)
     # wide_pair_snake_only: a sampled call keeps the CTA pair of the wide unit only where the pair walks the snake order;
-    # elsewhere it runs the unpaired wide program (same unit, no split) when that program is in ``scan_keys``
+    # elsewhere it runs the unpaired wide program (same unit, no split) when that program is in ``scan_keys`` (no registry: off)
     if (
         pair
         and tiles > 0
@@ -1409,7 +1410,7 @@ def select_program(
             policy.sample_fit_for(T, Tkv, S, r, cap, physical_kind("wide", "wide")),
             lsf,
         )
-        if scan_keys is None or wide_key in scan_keys:
+        if scan_keys is not None and wide_key in scan_keys:
             pair = False
     # l6_solo_rule: a call that does not split takes the l6 unit without a CTA pair where the rule prefers it (sampling
     # off, or a sampled call of several segments or short units), the l6 unit would not split either (the split rule
