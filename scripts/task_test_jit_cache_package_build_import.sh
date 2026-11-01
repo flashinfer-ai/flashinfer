@@ -212,20 +212,70 @@ python -c "import wheel" 2>/dev/null || pip install --no-deps wheel
 WHEELHOUSE=$(pwd)/dist-jit-cache-provider-test
 rm -rf "${WHEELHOUSE}"
 mkdir -p "${WHEELHOUSE}"
-for provider_architecture in "${PROVIDER_ARCHITECTURE_LIST[@]}"; do
-    rm -rf flashinfer-jit-cache-provider/dist \
-        flashinfer-jit-cache-provider/build \
-        flashinfer-jit-cache-provider/*.egg-info \
-        flashinfer-jit-cache-provider/flashinfer_jit_cache_provider/jit_cache
-    rm -f flashinfer-jit-cache-provider/flashinfer_jit_cache_provider/manifest.json \
-        flashinfer-jit-cache-provider/flashinfer_jit_cache_provider/_build_meta.py
-    run_with_aot_memory_monitor "build_jit_cache_provider_${provider_architecture}" \
-        env FLASHINFER_JIT_CACHE_PROVIDER_ARCH="${provider_architecture}" \
-        FLASHINFER_LOCAL_VERSION="${CUDA_LABEL}" \
-        python -m build --wheel --no-isolation --skip-dependency-check \
-        flashinfer-jit-cache-provider
-    cp flashinfer-jit-cache-provider/dist/*.whl "${WHEELHOUSE}/"
+
+# Providers build as a pool of AOT_PROVIDER_CONCURRENCY at a time (default 1:
+# one after another). Each build is CPU-bound on cache hits, so overlapping them
+# adds no cores; it fills the gaps one build leaves: the 60-75 s of spec
+# generation before ninja starts, and the tail where fewer TUs than MAX_JOBS
+# remain. The total ninja parallelism stays MAX_JOBS, split between the builds.
+: "${AOT_PROVIDER_CONCURRENCY:=1}"
+if ! [[ "${AOT_PROVIDER_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: AOT_PROVIDER_CONCURRENCY must be a positive integer, got '${AOT_PROVIDER_CONCURRENCY}'"
+    exit 1
+fi
+if (( AOT_PROVIDER_CONCURRENCY > ${#PROVIDER_ARCHITECTURE_LIST[@]} )); then
+    AOT_PROVIDER_CONCURRENCY=${#PROVIDER_ARCHITECTURE_LIST[@]}
+fi
+TOTAL_MAX_JOBS=${MAX_JOBS}
+PER_PROVIDER_MAX_JOBS=$(( TOTAL_MAX_JOBS / AOT_PROVIDER_CONCURRENCY ))
+if (( PER_PROVIDER_MAX_JOBS < 1 )); then PER_PROVIDER_MAX_JOBS=1; fi
+echo "Provider concurrency: ${AOT_PROVIDER_CONCURRENCY}, MAX_JOBS per provider: ${PER_PROVIDER_MAX_JOBS}"
+
+# Builds in a private copy of the provider package: `python -m build` writes
+# dist/, build/, the egg-info, the generated manifest and the packaged modules
+# into the package directory, which concurrent builds must not share. The copy
+# sits beside the original so the package config still finds the repository root.
+# The AOT build and generated-source directories are already per provider.
+build_provider_wheel() {
+    local provider_architecture=$1
+    local provider_dir="flashinfer-jit-cache-provider-build-${provider_architecture//./}"
+    # Explicit returns: errexit is off inside a function the caller guards with ||.
+    rm -rf "${provider_dir}" || return 1
+    cp -a flashinfer-jit-cache-provider "${provider_dir}" || return 1
+    rm -rf "${provider_dir}/dist" "${provider_dir}/build" \
+        "${provider_dir}"/*.egg-info \
+        "${provider_dir}/flashinfer_jit_cache_provider/jit_cache" || return 1
+    rm -f "${provider_dir}/flashinfer_jit_cache_provider/manifest.json" \
+        "${provider_dir}/flashinfer_jit_cache_provider/_build_meta.py" || return 1
+    # Prefix each line so interleaved output stays attributable. pipefail (set
+    # above) keeps the build's exit status.
+    {
+        run_with_aot_memory_monitor "build_jit_cache_provider_${provider_architecture}" \
+            env FLASHINFER_JIT_CACHE_PROVIDER_ARCH="${provider_architecture}" \
+            FLASHINFER_LOCAL_VERSION="${CUDA_LABEL}" \
+            MAX_JOBS="${PER_PROVIDER_MAX_JOBS}" \
+            python -m build --wheel --no-isolation --skip-dependency-check \
+            "${provider_dir}"
+    } 2>&1 | sed -u "s/^/[${provider_architecture}] /" || return 1
+    cp "${provider_dir}"/dist/*.whl "${WHEELHOUSE}/" || return 1
+    rm -rf "${provider_dir}" || return 1
+}
+
+# The pool runs each build in a subshell, whose additions to the report list would
+# be lost, so the expected report paths are registered here.
+for provider_architecture in "${BUILD_ARCHITECTURE_LIST[@]}"; do
+    report_label=$(python3 "${AOT_MEMORY_MONITOR_SCRIPT}" safe-label \
+        "build_jit_cache_provider_${provider_architecture}")
+    AOT_MEMORY_REPORT_FILES+=("${AOT_MEMORY_REPORT_DIR}/${report_label}.memory.csv")
 done
+
+PROVIDER_BUILD_STARTED_AT=${SECONDS}
+run_bounded_parallel "${AOT_PROVIDER_CONCURRENCY}" build_provider_wheel \
+    "${PROVIDER_ARCHITECTURE_LIST[@]}" || {
+    echo "ERROR: A provider wheel build failed"
+    exit 1
+}
+echo "Provider wheels built in $(( SECONDS - PROVIDER_BUILD_STARTED_AT )) s"
 
 rm -rf flashinfer-jit-cache/dist flashinfer-jit-cache/build \
     flashinfer-jit-cache/*.egg-info

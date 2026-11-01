@@ -76,6 +76,51 @@ compute_jit_cache_parallelism() {
   export MEM_PER_JOB=$mem_per_job
 }
 
+# Signal PID and everything below it: killing only a background subshell leaves
+# its `python -m build`, ninja and nvcc children running.
+_kill_process_tree() {
+  local pid=$1 child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    _kill_process_tree "$child"
+  done
+  kill "$pid" 2>/dev/null || true
+}
+
+# Run "FUNCTION ITEM" for every ITEM, at most CONCURRENCY at a time, as a pool: a
+# finished item frees its slot for the next one. Output of different items
+# interleaves, so FUNCTION should prefix its own lines. On the first failure,
+# including one after the last item has started, the running items are killed
+# with their descendants and no more start.
+#
+# Args: $1 - CONCURRENCY (>= 1), $2 - function name, $3... - items.
+# Returns 0 when every item succeeded, else 1. Needs bash >= 4.3 (wait -n).
+run_bounded_parallel() {
+  local limit=$1 fn=$2
+  shift 2
+  local item pid failed=0
+  for item in "$@"; do
+    while (( $(jobs -rp | wc -l) >= limit )); do
+      wait -n || failed=1
+      (( failed )) && break
+    done
+    (( failed )) && break
+    "$fn" "$item" &
+  done
+  # Drain what is still running, stopping it at the first failure.
+  while (( $(jobs -rp | wc -l) > 0 )); do
+    if (( failed )); then
+      for pid in $(jobs -rp); do _kill_process_tree "$pid"; done
+      break
+    fi
+    wait -n || failed=1
+  done
+  # Reaps the rest; a status not yet collected counts too.
+  for pid in $(jobs -p); do
+    wait "$pid" || failed=1
+  done
+  return $failed
+}
+
 # Verify that the selected compiler matches the CUDA matrix entry.
 #
 # Args:
