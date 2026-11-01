@@ -28,6 +28,8 @@ PACKAGES: dict[str, str] = {
     "cake_dsa_indexer_det": "flashinfer.experimental.cake_dsa_indexer_det",
     "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",
     "cake_lm_head_det_loss": "flashinfer.experimental.cake_lm_head_det_loss",
+    # the non-deterministic package (deterministic=False); its key carries the namespace
+    "cake.cake_lm_head_loss": "flashinfer.experimental.cake.cake_lm_head_loss",
     "dense_projection_det_gemm": "flashinfer.experimental.dense_projection_det_gemm",
     "dense_projection_gemm": "flashinfer.experimental.dense_projection_gemm",
     "cake_moe_grouped_det_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
