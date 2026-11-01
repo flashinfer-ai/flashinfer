@@ -1558,64 +1558,105 @@ kernel_cake_causal_conv1d_train_383cb5839559d5b0e72b(__nv_bfloat16* __restrict__
     if (last != 0.0f) {
         __threadfence();
         int ch0 = ct * ct_vec * 8;
-        float a4[4];
-#if __CUDA_ARCH__ == 1070
-        float tb_3[1];
-#else
-        float tb_2[1];
-#endif
+        int lim = ((C) < (ch0 + ct_vec * 8) ? (C) : (ch0 + ct_vec * 8));
         float z4[4];
         #pragma unroll
         for (int e = 0; e < 4; e++) {
             z4[e] = 0.0f;
         }
+        float a[16];
+#if __CUDA_ARCH__ == 1070
+        float tb_3[4];
+#else
+        float tb_2[4];
+#endif
         #pragma unroll 1
-        for (int c = ch0 + tid; c < ch0 + ct_vec * 8; c += 128) {
-            if (c < C) {
-                long long c64_2 = (long long)c;
-                {
-                    float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + c64_2 * 4);
-                    a4[0 + 0] = _v4.x;
-                    a4[0 + 1] = _v4.y;
-                    a4[0 + 2] = _v4.z;
-                    a4[0 + 3] = _v4.w;
-                }
-                {
-                    float4 _v4 = make_float4(z4[0 + 0], z4[0 + 1], z4[0 + 2], z4[0 + 3]);
-                    *reinterpret_cast<float4*>(dw_acc + c64_2 * 4) = _v4;
-                }
-                if ((flags & 2) != 0) {
-                    #pragma unroll
-                    for (int e_1 = 0; e_1 < 4; e_1++) {
-                        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_1)) = (__nv_bfloat16)a4[e_1];
-                    }
-                } else {
+#if __CUDA_ARCH__ == 1070
+        for (int c0_0 = ch0 + tid; c0_0 < ch0 + ct_vec * 8; c0_0 += 512) {
+#else
+        for (int c0_1 = ch0 + tid; c0_1 < ch0 + ct_vec * 8; c0_1 += 512) {
+#endif
+            #pragma unroll
+#if __CUDA_ARCH__ == 1070
+            for (int j_8 = 0; j_8 < 4; j_8++) {
+                int cl = c0_0 + 128 * j_8;
+#else
+            for (int j_11 = 0; j_11 < 4; j_11++) {
+                int cl = c0_1 + 128 * j_11;
+#endif
+                if (cl < lim) {
+                    long long cl64 = (long long)cl;
                     {
-                        float4 _v4 = make_float4(a4[0 + 0], a4[0 + 1], a4[0 + 2], a4[0 + 3]);
-                        *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4) = _v4;
+                        float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + cl64 * 4);
+#if __CUDA_ARCH__ == 1070
+                        a[4 * j_8 + 0] = _v4.x;
+                        a[4 * j_8 + 1] = _v4.y;
+                        a[4 * j_8 + 2] = _v4.z;
+                        a[4 * j_8 + 3] = _v4.w;
+#else
+                        a[4 * j_11 + 0] = _v4.x;
+                        a[4 * j_11 + 1] = _v4.y;
+                        a[4 * j_11 + 2] = _v4.z;
+                        a[4 * j_11 + 3] = _v4.w;
+#endif
+                    }
+                    {
+#if __CUDA_ARCH__ == 1070
+                        tb_3[j_8] = *reinterpret_cast<const float*>(dw_acc + ((long long)C * 4 + cl64));
+#else
+                        tb_2[j_11] = *reinterpret_cast<const float*>(dw_acc + ((long long)C * 4 + cl64));
+#endif
                     }
                 }
-                long long bi = (long long)C * 4 + c64_2;
-                {
+            }
+            #pragma unroll
 #if __CUDA_ARCH__ == 1070
-                    tb_3[0] = *reinterpret_cast<const float*>(dw_acc + bi);
+            for (int j_9 = 0; j_9 < 4; j_9++) {
+                int c = c0_0 + 128 * j_9;
 #else
-                    tb_2[0] = *reinterpret_cast<const float*>(dw_acc + bi);
+            for (int j_12 = 0; j_12 < 4; j_12++) {
+                int c = c0_1 + 128 * j_12;
 #endif
-                }
-                *(reinterpret_cast<float*>(dw_acc) + (bi)) = z4[0];
-                if ((flags & 8) != 0) {
+                if (c < lim) {
+                    long long c64_2 = (long long)c;
+                    long long bi = (long long)C * 4 + c64_2;
+                    {
+                        float4 _v4 = make_float4(z4[0 + 0], z4[0 + 1], z4[0 + 2], z4[0 + 3]);
+                        *reinterpret_cast<float4*>(dw_acc + c64_2 * 4) = _v4;
+                    }
+                    *(reinterpret_cast<float*>(dw_acc) + (bi)) = z4[0];
+                    if ((flags & 2) != 0) {
+                        #pragma unroll
+                        for (int e_1 = 0; e_1 < 4; e_1++) {
 #if __CUDA_ARCH__ == 1070
-                    *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_3[0];
+                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_1)) = (__nv_bfloat16)a[4 * j_9 + e_1];
 #else
-                    *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_2[0];
+                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_1)) = (__nv_bfloat16)a[4 * j_12 + e_1];
 #endif
-                } else {
+                        }
+                    } else {
+                        {
 #if __CUDA_ARCH__ == 1070
-                    *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_3[0];
+                            float4 _v4 = make_float4(a[4 * j_9 + 0], a[4 * j_9 + 1], a[4 * j_9 + 2], a[4 * j_9 + 3]);
 #else
-                    *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_2[0];
+                            float4 _v4 = make_float4(a[4 * j_12 + 0], a[4 * j_12 + 1], a[4 * j_12 + 2], a[4 * j_12 + 3]);
 #endif
+                            *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4) = _v4;
+                        }
+                    }
+                    if ((flags & 8) != 0) {
+#if __CUDA_ARCH__ == 1070
+                        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_3[j_9];
+#else
+                        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_2[j_12];
+#endif
+                    } else {
+#if __CUDA_ARCH__ == 1070
+                        *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_3[j_9];
+#else
+                        *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_2[j_12];
+#endif
+                    }
                 }
             }
         }
