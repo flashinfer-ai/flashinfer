@@ -732,7 +732,11 @@ kernel_cake_tinygemm2_wgmma_04148d587a09906e3c39(const __grid_constant__ CUtenso
                     mbarrier_arrive_expect_tx(full_addr + ((int)((unsigned int)st_1 % 4)) * 8, 49152);
                     int kb = (st_1 / 4 * 16 + st_1 % 4) * 64;
                     unsigned int dst = sw_addr + (unsigned int)(st_1 % 4 * 49152);
-                    tma_3d_gmem2smem(dst, (&W), kb, m0, 0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(dst), "l"((&W)), "r"(kb), "r"(m0), "r"(0),
+                           "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                 }
             }
             asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -754,7 +758,11 @@ kernel_cake_tinygemm2_wgmma_04148d587a09906e3c39(const __grid_constant__ CUtenso
                     mbarrier_arrive_expect_tx(full_addr + ((int)((unsigned int)st_3 % 4)) * 8, 49152);
                     int kb_1 = (st_3 / 4 * 16 + st_3 % 4) * 64;
                     unsigned int dst_1 = sw_addr + (unsigned int)(st_3 % 4 * 49152);
-                    tma_3d_gmem2smem(dst_1, (&W), kb_1, m0, 0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(dst_1), "l"((&W)), "r"(kb_1), "r"(m0), "r"(0),
+                           "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     int kbx_1 = (st_3 / 4 * 16 + st_3 % 4) * 64;
                     unsigned int dstx_1 = sx_addr + (unsigned int)(st_3 % 4 * 49152);
                     tma_3d_gmem2smem(dstx_1, (&X), kbx_1, n0, 0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);

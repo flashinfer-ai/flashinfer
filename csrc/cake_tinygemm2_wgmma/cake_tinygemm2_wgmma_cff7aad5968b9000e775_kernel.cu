@@ -475,90 +475,154 @@ kernel_cake_tinygemm2_wgmma_cff7aad5968b9000e775(const __grid_constant__ CUtenso
                     int sl_0 = st_1 * 4;
                     int kb_0 = (sl_0 / 4 * 16 + sl_0 % 4) * 64;
                     unsigned int dst_0 = sw_addr + (unsigned int)(st_1 % 4 * 49152);
-                    tma_2d_gmem2smem(dst_0 + 0, (&W), kb_0, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_0 + 0), "l"((&W)), "r"(kb_0), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     int sl_1 = st_1 * 4;
                     int kb_1 = (sl_1 / 4 * 16 + sl_1 % 4) * 64;
                     unsigned int dst_1 = sw_addr + (unsigned int)(st_1 % 4 * 49152);
-                    tma_2d_gmem2smem(dst_1 + 2048, (&W), kb_1 + 256, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_1 + 2048), "l"((&W)), "r"(kb_1 + 256), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     int sl_2 = st_1 * 4;
                     int kb_2 = (sl_2 / 4 * 16 + sl_2 % 4) * 64;
                     unsigned int dst_2 = sw_addr + (unsigned int)(st_1 % 4 * 49152);
-                    tma_2d_gmem2smem(dst_2 + 4096, (&W), kb_2 + 512, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_2 + 4096), "l"((&W)), "r"(kb_2 + 512), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     int sl_3 = st_1 * 4;
                     int kb_3 = (sl_3 / 4 * 16 + sl_3 % 4) * 64;
                     unsigned int dst_3 = sw_addr + (unsigned int)(st_1 % 4 * 49152);
-                    tma_2d_gmem2smem(dst_3 + 6144, (&W), kb_3 + 768, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_3 + 6144), "l"((&W)), "r"(kb_3 + 768), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     if (1 < nv_w) {
                         int sl_4 = st_1 * 4 + 1;
                         int kb_4 = (sl_4 / 4 * 16 + sl_4 % 4) * 64;
                         unsigned int dst_4 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 8192);
-                        tma_2d_gmem2smem(dst_4 + 0, (&W), kb_4, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_4 + 0), "l"((&W)), "r"(kb_4), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (1 < nv_w) {
                         int sl_5 = st_1 * 4 + 1;
                         int kb_5 = (sl_5 / 4 * 16 + sl_5 % 4) * 64;
                         unsigned int dst_5 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 8192);
-                        tma_2d_gmem2smem(dst_5 + 2048, (&W), kb_5 + 256, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_5 + 2048), "l"((&W)), "r"(kb_5 + 256), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (1 < nv_w) {
                         int sl_6 = st_1 * 4 + 1;
                         int kb_6 = (sl_6 / 4 * 16 + sl_6 % 4) * 64;
                         unsigned int dst_6 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 8192);
-                        tma_2d_gmem2smem(dst_6 + 4096, (&W), kb_6 + 512, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_6 + 4096), "l"((&W)), "r"(kb_6 + 512), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (1 < nv_w) {
                         int sl_7 = st_1 * 4 + 1;
                         int kb_7 = (sl_7 / 4 * 16 + sl_7 % 4) * 64;
                         unsigned int dst_7 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 8192);
-                        tma_2d_gmem2smem(dst_7 + 6144, (&W), kb_7 + 768, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_7 + 6144), "l"((&W)), "r"(kb_7 + 768), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (2 < nv_w) {
                         int sl_8 = st_1 * 4 + 2;
                         int kb_8 = (sl_8 / 4 * 16 + sl_8 % 4) * 64;
                         unsigned int dst_8 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 16384);
-                        tma_2d_gmem2smem(dst_8 + 0, (&W), kb_8, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_8 + 0), "l"((&W)), "r"(kb_8), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (2 < nv_w) {
                         int sl_9 = st_1 * 4 + 2;
                         int kb_9 = (sl_9 / 4 * 16 + sl_9 % 4) * 64;
                         unsigned int dst_9 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 16384);
-                        tma_2d_gmem2smem(dst_9 + 2048, (&W), kb_9 + 256, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_9 + 2048), "l"((&W)), "r"(kb_9 + 256), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (2 < nv_w) {
                         int sl_10 = st_1 * 4 + 2;
                         int kb_10 = (sl_10 / 4 * 16 + sl_10 % 4) * 64;
                         unsigned int dst_10 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 16384);
-                        tma_2d_gmem2smem(dst_10 + 4096, (&W), kb_10 + 512, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_10 + 4096), "l"((&W)), "r"(kb_10 + 512), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (2 < nv_w) {
                         int sl_11 = st_1 * 4 + 2;
                         int kb_11 = (sl_11 / 4 * 16 + sl_11 % 4) * 64;
                         unsigned int dst_11 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 16384);
-                        tma_2d_gmem2smem(dst_11 + 6144, (&W), kb_11 + 768, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_11 + 6144), "l"((&W)), "r"(kb_11 + 768), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (3 < nv_w) {
                         int sl_12 = st_1 * 4 + 3;
                         int kb_12 = (sl_12 / 4 * 16 + sl_12 % 4) * 64;
                         unsigned int dst_12 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 24576);
-                        tma_2d_gmem2smem(dst_12 + 0, (&W), kb_12, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_12 + 0), "l"((&W)), "r"(kb_12), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (3 < nv_w) {
                         int sl_13 = st_1 * 4 + 3;
                         int kb_13 = (sl_13 / 4 * 16 + sl_13 % 4) * 64;
                         unsigned int dst_13 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 24576);
-                        tma_2d_gmem2smem(dst_13 + 2048, (&W), kb_13 + 256, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_13 + 2048), "l"((&W)), "r"(kb_13 + 256), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (3 < nv_w) {
                         int sl_14 = st_1 * 4 + 3;
                         int kb_14 = (sl_14 / 4 * 16 + sl_14 % 4) * 64;
                         unsigned int dst_14 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 24576);
-                        tma_2d_gmem2smem(dst_14 + 4096, (&W), kb_14 + 512, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_14 + 4096), "l"((&W)), "r"(kb_14 + 512), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (3 < nv_w) {
                         int sl_15 = st_1 * 4 + 3;
                         int kb_15 = (sl_15 / 4 * 16 + sl_15 % 4) * 64;
                         unsigned int dst_15 = sw_addr + (unsigned int)(st_1 % 4 * 49152 + 24576);
-                        tma_2d_gmem2smem(dst_15 + 6144, (&W), kb_15 + 768, m0, full_addr + ((int)((unsigned int)st_1 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_15 + 6144), "l"((&W)), "r"(kb_15 + 768), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_1 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                 }
             }
@@ -676,90 +740,154 @@ kernel_cake_tinygemm2_wgmma_cff7aad5968b9000e775(const __grid_constant__ CUtenso
                     int sl_16 = st_3 * 4;
                     int kb_16 = (sl_16 / 4 * 16 + sl_16 % 4) * 64;
                     unsigned int dst_16 = sw_addr + (unsigned int)(st_3 % 4 * 49152);
-                    tma_2d_gmem2smem(dst_16 + 0, (&W), kb_16, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_16 + 0), "l"((&W)), "r"(kb_16), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     int sl_17 = st_3 * 4;
                     int kb_17 = (sl_17 / 4 * 16 + sl_17 % 4) * 64;
                     unsigned int dst_17 = sw_addr + (unsigned int)(st_3 % 4 * 49152);
-                    tma_2d_gmem2smem(dst_17 + 2048, (&W), kb_17 + 256, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_17 + 2048), "l"((&W)), "r"(kb_17 + 256), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     int sl_18 = st_3 * 4;
                     int kb_18 = (sl_18 / 4 * 16 + sl_18 % 4) * 64;
                     unsigned int dst_18 = sw_addr + (unsigned int)(st_3 % 4 * 49152);
-                    tma_2d_gmem2smem(dst_18 + 4096, (&W), kb_18 + 512, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_18 + 4096), "l"((&W)), "r"(kb_18 + 512), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     int sl_19 = st_3 * 4;
                     int kb_19 = (sl_19 / 4 * 16 + sl_19 % 4) * 64;
                     unsigned int dst_19 = sw_addr + (unsigned int)(st_3 % 4 * 49152);
-                    tma_2d_gmem2smem(dst_19 + 6144, (&W), kb_19 + 768, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3}], [%4], %5;"
+                        :: "r"(dst_19 + 6144), "l"((&W)), "r"(kb_19 + 768), "r"(m0),
+                           "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     if (1 < nv_s) {
                         int sl_20 = st_3 * 4 + 1;
                         int kb_20 = (sl_20 / 4 * 16 + sl_20 % 4) * 64;
                         unsigned int dst_20 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 8192);
-                        tma_2d_gmem2smem(dst_20 + 0, (&W), kb_20, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_20 + 0), "l"((&W)), "r"(kb_20), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (1 < nv_s) {
                         int sl_21 = st_3 * 4 + 1;
                         int kb_21 = (sl_21 / 4 * 16 + sl_21 % 4) * 64;
                         unsigned int dst_21 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 8192);
-                        tma_2d_gmem2smem(dst_21 + 2048, (&W), kb_21 + 256, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_21 + 2048), "l"((&W)), "r"(kb_21 + 256), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (1 < nv_s) {
                         int sl_22 = st_3 * 4 + 1;
                         int kb_22 = (sl_22 / 4 * 16 + sl_22 % 4) * 64;
                         unsigned int dst_22 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 8192);
-                        tma_2d_gmem2smem(dst_22 + 4096, (&W), kb_22 + 512, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_22 + 4096), "l"((&W)), "r"(kb_22 + 512), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (1 < nv_s) {
                         int sl_23 = st_3 * 4 + 1;
                         int kb_23 = (sl_23 / 4 * 16 + sl_23 % 4) * 64;
                         unsigned int dst_23 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 8192);
-                        tma_2d_gmem2smem(dst_23 + 6144, (&W), kb_23 + 768, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_23 + 6144), "l"((&W)), "r"(kb_23 + 768), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (2 < nv_s) {
                         int sl_24 = st_3 * 4 + 2;
                         int kb_24 = (sl_24 / 4 * 16 + sl_24 % 4) * 64;
                         unsigned int dst_24 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 16384);
-                        tma_2d_gmem2smem(dst_24 + 0, (&W), kb_24, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_24 + 0), "l"((&W)), "r"(kb_24), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (2 < nv_s) {
                         int sl_25 = st_3 * 4 + 2;
                         int kb_25 = (sl_25 / 4 * 16 + sl_25 % 4) * 64;
                         unsigned int dst_25 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 16384);
-                        tma_2d_gmem2smem(dst_25 + 2048, (&W), kb_25 + 256, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_25 + 2048), "l"((&W)), "r"(kb_25 + 256), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (2 < nv_s) {
                         int sl_26 = st_3 * 4 + 2;
                         int kb_26 = (sl_26 / 4 * 16 + sl_26 % 4) * 64;
                         unsigned int dst_26 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 16384);
-                        tma_2d_gmem2smem(dst_26 + 4096, (&W), kb_26 + 512, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_26 + 4096), "l"((&W)), "r"(kb_26 + 512), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (2 < nv_s) {
                         int sl_27 = st_3 * 4 + 2;
                         int kb_27 = (sl_27 / 4 * 16 + sl_27 % 4) * 64;
                         unsigned int dst_27 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 16384);
-                        tma_2d_gmem2smem(dst_27 + 6144, (&W), kb_27 + 768, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_27 + 6144), "l"((&W)), "r"(kb_27 + 768), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (3 < nv_s) {
                         int sl_28 = st_3 * 4 + 3;
                         int kb_28 = (sl_28 / 4 * 16 + sl_28 % 4) * 64;
                         unsigned int dst_28 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 24576);
-                        tma_2d_gmem2smem(dst_28 + 0, (&W), kb_28, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_28 + 0), "l"((&W)), "r"(kb_28), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (3 < nv_s) {
                         int sl_29 = st_3 * 4 + 3;
                         int kb_29 = (sl_29 / 4 * 16 + sl_29 % 4) * 64;
                         unsigned int dst_29 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 24576);
-                        tma_2d_gmem2smem(dst_29 + 2048, (&W), kb_29 + 256, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_29 + 2048), "l"((&W)), "r"(kb_29 + 256), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (3 < nv_s) {
                         int sl_30 = st_3 * 4 + 3;
                         int kb_30 = (sl_30 / 4 * 16 + sl_30 % 4) * 64;
                         unsigned int dst_30 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 24576);
-                        tma_2d_gmem2smem(dst_30 + 4096, (&W), kb_30 + 512, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_30 + 4096), "l"((&W)), "r"(kb_30 + 512), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     if (3 < nv_s) {
                         int sl_31 = st_3 * 4 + 3;
                         int kb_31 = (sl_31 / 4 * 16 + sl_31 % 4) * 64;
                         unsigned int dst_31 = sw_addr + (unsigned int)(st_3 % 4 * 49152 + 24576);
-                        tma_2d_gmem2smem(dst_31 + 6144, (&W), kb_31 + 768, m0, full_addr + ((int)((unsigned int)st_3 % 4)) * 8);
+                        asm volatile(
+                            "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3}], [%4], %5;"
+                            :: "r"(dst_31 + 6144), "l"((&W)), "r"(kb_31 + 768), "r"(m0),
+                               "r"(full_addr + ((int)((unsigned int)st_3 % 4)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     }
                     int slx_16 = st_3 * 4;
                     int kbx_16 = (slx_16 / 4 * 16 + slx_16 % 4) * 64;
@@ -857,7 +985,7 @@ kernel_cake_tinygemm2_wgmma_cff7aad5968b9000e775(const __grid_constant__ CUtenso
     // Kernel teardown ops
     __syncthreads();
     int el_0 = tid;
-    if (el_0 < 128) {
+    if (tid < 128 && el_0 < 128) {
         int col_0 = el_0 / 16;
         int row_0 = el_0 % 16;
         float c0_0 = red[row_0 * 8 + col_0];
