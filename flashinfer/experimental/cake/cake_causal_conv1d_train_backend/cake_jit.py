@@ -2169,6 +2169,101 @@ MODULES: dict[str, dict[str, Any]] = {
             "work": "uint32",
         },
     },
+    # Route ``bwd``: the single-launch build of the det program
+    # ``cake_causal_conv1d_det_train_8f872e5b653a26ab365d`` (the same build keywords, body and grid; selected
+    # from C = 264 on sm_100a and sm_103a: the single-tile channel counts 264 <= C < 512, whose channel vectors
+    # are no multiple of 32, copy each sub-tile's rows in one bulk copy per row group).  Every per-thread and
+    # per-CTA FP32 step and ``dx`` are bitwise the det program's; only the cross-CTA reduction differs: each CTA
+    # adds its CTA row into the FP32 accumulator ``acc`` (``[C x 4]``), takes a ticket on its channel tile's
+    # ``work`` counter (uint32 ``[n_ch_tiles]``), and the tile's last CTA stores FP32 ``dw`` once (one rounding
+    # from FP32) and zeroes its accumulators and counter, so ``acc`` / ``work`` are zero before and after every
+    # launch.  No reduce program, no host synchronization, no cooperative launch.
+    "cake_causal_conv1d_train_e8e950fb254d3376db52": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "dw_acc"],
+            ["buffer", "work"],
+            ["buffer", "dw"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 3,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_100a": 1,
+                "sm_103a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_train_e8e950fb254d3376db52",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_e8e950fb254d3376db52",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 66560,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_e8e950fb254d3376db52",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dw": "dw",
+            "dw_acc": "acc",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "x_map": "x",
+        },
+        "role": "bwd",
+        "select_rule": {
+            "channels": {
+                "sm_100a": 264,
+                "sm_103a": 264,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "acc": "float32",
+            "slots": 1,
+            "kind": "accumulators",
+            "taps": 4,
+            "work": "uint32",
+        },
+    },
 }
 
 # architecture -> route -> the records the route may launch (fallback first).
@@ -2177,6 +2272,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "bwd": [
             "cake_causal_conv1d_train_ea326ebe0f84d8cf2adb",
             "cake_causal_conv1d_train_461d358d7090642c65de",
+            "cake_causal_conv1d_train_e8e950fb254d3376db52",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_train_befc06774f6fee7c36ce",
@@ -2209,6 +2305,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_ea326ebe0f84d8cf2adb",
             "cake_causal_conv1d_train_461d358d7090642c65de",
             "cake_causal_conv1d_train_efd2e6f9ac3d58ab92ab",
+            "cake_causal_conv1d_train_e8e950fb254d3376db52",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_train_befc06774f6fee7c36ce",
