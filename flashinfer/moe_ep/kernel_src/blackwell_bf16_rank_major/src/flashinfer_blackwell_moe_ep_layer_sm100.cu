@@ -1765,7 +1765,12 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                             elect_commit_cg2_multicast(a_free_addr + (stage) * 8, (uint16_t)(3));
                             elect_commit_cg2_multicast(b_free_addr + (stage) * 8, (uint16_t)(3));
                             stage += 1;
+#if __CUDA_ARCH__ == 1070
+                            // sm_107a: four k-pipe stages in flight (faster than five on R200)
+                            if (stage == 4) { stage = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+#else
                             if (stage == 5) { stage = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+#endif
                             mbarrier_wait(a_full_addr + (stage) * 8, _phase_a_full);
                             mbarrier_wait(b_full_addr + (stage) * 8, _phase_b_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1828,7 +1833,11 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                             elect_commit_cg2_multicast(a_free_addr + (stage) * 8, (uint16_t)(3));
                             elect_commit_cg2_multicast(b_free_addr + (stage) * 8, (uint16_t)(3));
                             stage += 1;
+#if __CUDA_ARCH__ == 1070
+                            if (stage == 4) { stage = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+#else
                             if (stage == 5) { stage = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+#endif
                         }
                         elect_commit_cg2_multicast(mma_full_addr + (acc_stage_1) * 8, (uint16_t)(3));
                         acc_stage_1 += 1;
@@ -1926,7 +1935,11 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                                 :: "r"((a_full_addr + (stage_1) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
                         }
                         stage_1 += 1;
+#if __CUDA_ARCH__ == 1070
+                        if (stage_1 == 4) { stage_1 = 0; _phase_a_free ^= 1; }
+#else
                         if (stage_1 == 5) { stage_1 = 0; _phase_a_free ^= 1; }
+#endif
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
@@ -2082,7 +2095,11 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                         }
 #endif
                         stage_2 += 1;
+#if __CUDA_ARCH__ == 1070
+                        if (stage_2 == 4) { stage_2 = 0; _phase_b_free ^= 1; }
+#else
                         if (stage_2 == 5) { stage_2 = 0; _phase_b_free ^= 1; }
+#endif
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_3) * 8, _phase_work_full_3);
@@ -3113,7 +3130,12 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                             elect_commit_cg2_multicast(a_free_addr + (stage) * 8, (uint16_t)(3));
                             elect_commit_cg2_multicast(b_free_addr + (stage) * 8, (uint16_t)(3));
                             stage += 1;
+#if __CUDA_ARCH__ == 1070
+                            // sm_107a: four k-pipe stages in flight (faster than five on R200)
+                            if (stage == 4) { stage = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+#else
                             if (stage == 5) { stage = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+#endif
                             int iter_k_0 = k_pair + 1;
                             mbarrier_wait(a_full_addr + (stage) * 8, _phase_a_full);
                             mbarrier_wait(b_full_addr + (stage) * 8, _phase_b_full);
@@ -3177,7 +3199,11 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                             elect_commit_cg2_multicast(a_free_addr + (stage) * 8, (uint16_t)(3));
                             elect_commit_cg2_multicast(b_free_addr + (stage) * 8, (uint16_t)(3));
                             stage += 1;
+#if __CUDA_ARCH__ == 1070
+                            if (stage == 4) { stage = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+#else
                             if (stage == 5) { stage = 0; _phase_a_full ^= 1; _phase_b_full ^= 1; }
+#endif
                         }
                         elect_commit_cg2_multicast(mma_full_addr + (acc_stage_1) * 8, (uint16_t)(3));
                         acc_stage_1 += 1;
@@ -3286,7 +3312,11 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                                 :: "r"((a_full_addr + (stage_1) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
                         }
                         stage_1 += 1;
+#if __CUDA_ARCH__ == 1070
+                        if (stage_1 == 4) { stage_1 = 0; _phase_a_free ^= 1; }
+#else
                         if (stage_1 == 5) { stage_1 = 0; _phase_a_free ^= 1; }
+#endif
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
@@ -3407,7 +3437,11 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                                 :: "r"((b_full_addr + (stage_2) * 8) & 0xFEFFFFFF), "r"((uint32_t)(8192)) : "memory");
                         }
                         stage_2 += 1;
+#if __CUDA_ARCH__ == 1070
+                        if (stage_2 == 4) { stage_2 = 0; _phase_b_free ^= 1; }
+#else
                         if (stage_2 == 5) { stage_2 = 0; _phase_b_free ^= 1; }
+#endif
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_3) * 8, _phase_work_full_3);
