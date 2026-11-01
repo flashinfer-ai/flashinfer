@@ -963,6 +963,26 @@ def test_full_forward_file_record_does_not_replace_kernel_tuning(state):
     state.sweep.assert_called_once()
 
 
+def test_forward_cache_contract_uses_effective_route_check_default(state, monkeypatch):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.forward_tuning import (
+        ForwardExecution,
+    )
+
+    execution = ForwardExecution(
+        SimpleNamespace(_kernel_config=SimpleNamespace()),
+        _stage_for_auto(state.workspace, 4),
+        quantize_input=True,
+        output=None,
+    )
+    name = "FLASHINFER_SM107_MEGA_CHECK_ROUTES"
+    monkeypatch.delenv(name, raising=False)
+    default = execution.contract()
+    monkeypatch.setenv(name, "0")
+    assert execution.contract() == default
+    monkeypatch.setenv(name, "1")
+    assert execution.contract() != default
+
+
 def test_forward_cache_contract_preserves_capacity_fallback(state):
     from flashinfer.moe_ep.backends.mega.kernel.sm107.forward_tuning import (
         ForwardExecution,

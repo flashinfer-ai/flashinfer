@@ -33,7 +33,9 @@ from ...push_style_megamoe.shim.protocol import (
     _run_guarded_phase,
 )
 from .cake_gemm import (
+    ExportedGroupedGemm,
     GroupedGemm,
+    _dev_launcher_factory,
     create_grouped_gemm,
     output_row_capacity,
     validate_grouped_gemm_geometry,
@@ -86,6 +88,9 @@ __all__ = [
     "WCX_MAX_TOKENS",
     "WCX_MAX_TOKENS_ENV",
     "WCX_MAX_TOKENS_LIMIT",
+    "WCX_WINDOWS",
+    "early_start_geometry_ok",
+    "wcx_resolves_on",
 ]
 
 # Fast-path kernel selection.  Each toggle defaults to the fused kernel; "0" /
@@ -231,6 +236,24 @@ FC2_EARLY_WINDOWS: dict[tuple[int, int, int, int, int], tuple[int, int]] = {
 WCX_MAX_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_WCX_MAX_TOKENS"
 WCX_MAX_TOKENS = 0
 WCX_MAX_TOKENS_LIMIT = 128
+# WCX above the decode window: when WCX is on (wcx_max_tokens > 0), rounds whose
+# local token count lies in the window (lo, hi] of the pipe's shape also read the
+# WCX copies, and those rounds run the FC2 early-start pair (the swap-AB pair is
+# an early-start pair) whether or not FC2_EARLY_WINDOWS lists the round.  Keyed
+# like FC2_EARLY_WINDOWS by (hidden size, intermediate size, total experts,
+# top_k, EP size).  The windows hold the measured shapes and token ranges where
+# the swap-AB pair was faster than the bf16 path on H100: every expert of the
+# rank's busiest round still fits one 128-row m-tile there.  Rounds with about
+# 128 or more rows per expert keep the bf16 path (a second m-tile re-reads the
+# expert's weights through the swap-AB units), as do other shapes and rounds.
+# A layer without WCX copies keeps its bf16 path in these rounds.  Same bits;
+# rank-local.  Every window starts at or above WCX_MAX_TOKENS_LIMIT.
+WCX_WINDOWS: dict[tuple[int, int, int, int, int], tuple[int, int]] = {
+    # (hidden, intermediate, total experts, top_k, ep): (lo, hi)
+    (7168, 2048, 256, 8, 2): (128, 1024),
+    (7168, 3072, 384, 6, 8): (128, 512),
+    (4096, 2048, 256, 6, 8): (128, 512),
+}
 # Receiver-side prefix inside the single-launch dispatches (fused_begin 2): 1
 # (default) = the small-round fused dispatch and the grid dispatch compute the
 # integer prefix sums over the E x ep (expert, source) keys with the whole block,
@@ -455,6 +478,69 @@ def fc2_early_round(
     return window is not None and window[0] < num_tokens <= window[1]
 
 
+def wcx_window_for(
+    hidden_size: int, intermediate_size: int, num_experts: int, top_k: int, ep: int
+) -> tuple[int, int] | None:
+    """The WCX window (lo, hi] above the decode window for a pipe shape
+    (``num_experts`` = total experts over the EP group), or ``None``."""
+    return WCX_WINDOWS.get(
+        (
+            int(hidden_size),
+            int(intermediate_size),
+            int(num_experts),
+            int(top_k),
+            int(ep),
+        )
+    )
+
+
+def wcx_round(num_tokens: int, window: tuple[int, int] | None) -> bool:
+    """True when a round of ``num_tokens`` local tokens lies in the WCX window
+    ``lo < T <= hi`` above the decode window."""
+    return window is not None and window[0] < num_tokens <= window[1]
+
+
+def early_start_geometry_ok(
+    num_local_experts: int, hidden_size: int, intermediate_size: int
+) -> bool:
+    """True when the FC2 early-start pair supports the layer geometry: the FC2
+    tile id carries the expert in 10 bits, and each FC2 tile has at least 4
+    k-stages."""
+    return num_local_experts <= 1023 and min(hidden_size, intermediate_size) >= 256
+
+
+def wcx_resolves_on(
+    *,
+    wcx_max_tokens: int,
+    fc2_early_max_tokens: int | None,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> bool:
+    """True when a runner of this layer resolves WCX on, so the layer needs the
+    WCX copies: ``wcx_max_tokens`` > 0, the effective ``fc2_early_max_tokens``
+    (the argument, else the environment) > 0, an early-start geometry, and a
+    grouped GEMM with the early-start and WCX pairs (the shipped launcher; a
+    development launcher is assumed to have both, and the runner still turns
+    WCX off if it does not). With WCX off it returns before it reads the
+    environment or imports a development launcher."""
+    if wcx_max_tokens <= 0 or not early_start_geometry_ok(
+        num_local_experts, hidden_size, intermediate_size
+    ):
+        return False
+    early_max = (
+        _fc2_early_max_tokens_default()
+        if fc2_early_max_tokens is None
+        else int(fc2_early_max_tokens)
+    )
+    if early_max <= 0:
+        return False
+    return _dev_launcher_factory() is not None or (
+        getattr(ExportedGroupedGemm, "supports_early_start", False)
+        and getattr(ExportedGroupedGemm, "supports_wcx", False)
+    )
+
+
 def _combine_wire_default(token_capacity: int) -> str:
     """Default combine wire: the environment override when set, otherwise the
     per-shape default (``per_route`` when ``token_capacity`` is at or below
@@ -660,6 +746,7 @@ class Sm90CakeBf16MoERunner:
         self._wcx_max_tokens = validate_wcx_max_tokens(
             wcx_max_tokens_default() if wcx_max_tokens is None else wcx_max_tokens
         )  # effective value fixed after the JIT
+        self._wcx_window: tuple[int, int] | None = None  # fixed after the JIT
         self._wcx_rounds = 0
         self._prefix_form = _form(prefix_form, PREFIX_FORM_ENV, "prefix_form")
         if direct_place is None:
@@ -805,10 +892,8 @@ class Sm90CakeBf16MoERunner:
                 else None
             )
             self.gemm = gemm if gemm is not None else create_grouped_gemm(clamp=clamp)
-            early_ok = (
-                pipe.E <= 1023  # the FC2 tile id carries the expert in 10 bits
-                and min(pipe.H, self.I) >= 256  # >= 4 k-stages per FC2 tile
-                and getattr(self.gemm, "supports_early_start", False)
+            early_ok = early_start_geometry_ok(pipe.E, pipe.H, self.I) and getattr(
+                self.gemm, "supports_early_start", False
             )
             if not early_ok:
                 self._fc2_early_max_tokens = 0
@@ -822,6 +907,10 @@ class Sm90CakeBf16MoERunner:
                     and getattr(self.gemm, "supports_wcx", False)
                 ):
                     self.gemm.prepare_wcx()
+                    # rounds of the shape's WCX window also run the WCX early pair
+                    self._wcx_window = wcx_window_for(
+                        pipe.H, self.I, pipe.E * pipe.ep, pipe.K, pipe.ep
+                    )
                 else:
                     self._wcx_max_tokens = 0
             if early_ok and self._fc2_early_windows:
@@ -904,6 +993,11 @@ class Sm90CakeBf16MoERunner:
     def wcx_max_tokens(self) -> int:
         """Largest decode round (local tokens) that reads the WCX weight copies (0 = off)."""
         return self._wcx_max_tokens
+
+    @property
+    def wcx_window(self) -> tuple[int, int] | None:
+        """This pipe's WCX window (lo, hi] above the decode window, or None (also when WCX is off)."""
+        return self._wcx_window
 
     @property
     def wcx_rounds(self) -> int:
@@ -1426,13 +1520,17 @@ class Sm90CakeBf16MoERunner:
                     )
                     else None
                 )
-                # WCX decode round: the swap-AB early pair on the layer's compressed copies
-                # (FC1 and FC2 switch together; same bits as the early pair)
-                wcx = (
-                    weights.wcx
-                    if sched is not None and 0 < num_tokens <= self._wcx_max_tokens
-                    else None
-                )
+                # WCX round: the swap-AB early pair on the layer's compressed copies
+                # (FC1 and FC2 switch together; same bits as the early pair): an
+                # early-start round of the decode window, or a round of the shape's
+                # WCX window, which then runs the early-start pair
+                wcx = None
+                if weights.wcx is not None:
+                    if sched is not None and 0 < num_tokens <= self._wcx_max_tokens:
+                        wcx = weights.wcx
+                    elif wcx_round(num_tokens, self._wcx_window):
+                        wcx = weights.wcx
+                        sched = self._gemm_sched
                 with _record_stage("fc1", nv):
                     if wcx is not None:
                         self.gemm.fc1_wcx(

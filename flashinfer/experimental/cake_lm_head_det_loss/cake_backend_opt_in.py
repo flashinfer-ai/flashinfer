@@ -91,11 +91,13 @@ from .cake_backend import (
     _dw_stream,
     _dx_keys,
     _dx_reduce,
+    _evict,
     _ffi_stream_context,
     _gather_rows,
     _hidden_count_arange,
     _hidden_count_cell,
     _hidden_count_memory,
+    _layout,
     _logprob_arm,
     _meta,
     _mm_fp32,
@@ -115,6 +117,7 @@ from .cake_backend import (
     _same_view,
     _tuning_key,
     _unit_scale,
+    _values,
     arch_for,
     base_stage,
     bind_stage,
@@ -125,6 +128,7 @@ from .cake_backend import (
     dw_cast_tma_rule,
     dw_stream_mode,
     dx_max_slices,
+    dx_slices_fit,
     dx_wide_items,
     forward_early_keys,
     gemm_scalars,
@@ -528,11 +532,23 @@ def make_plan(
             raise ValueError(
                 f"gemm_tuning dx k_slices={explicit_k}: the registered program serves 1 .. {int(dx_max_slices)} dX slices"
             )
+        k_iters = int(problem.vocab) // int(geometry.k_block)
+        if dx_slices_fit(explicit_k, k_iters) != explicit_k:
+            raise ValueError(
+                f"gemm_tuning dx k_slices={explicit_k}: V = {problem.vocab} has {k_iters} K steps, which "
+                f"{explicit_k} slices of {-(-k_iters // explicit_k)} steps do not all reach"
+            )
         slices = tuple(explicit_k for _ in chunks)
     elif need_dx and int(dx_max_slices) > 1:
         slices = tuple(
             recommended_k_slices(
-                rows_c, problem.hidden, num_sms, dx_max_slices, geometry, dx_resident
+                rows_c,
+                problem.hidden,
+                num_sms,
+                dx_max_slices,
+                geometry,
+                dx_resident,
+                vocab=problem.vocab,
             )
             for _, rows_c in chunks
         )
@@ -2052,15 +2068,16 @@ def logprob_backward_binding_key(
     logprob_dz=False,
 ) -> tuple:
     """Cache key of a log-probability backward binding (as :func:`forward_binding_key`); ``logprob_dz`` the resolved
-    recompute form (:func:`logprob_dz_default`).  A budget form appends its accumulated rows (:attr:`Plan.dw_rows`)."""
+    recompute form (:func:`logprob_dz_default`).  A budget form appends its accumulated rows (:attr:`Plan.dw_rows`).
+    ``lse`` and ``dlogp`` are keyed by layout alone (:func:`_layout`), as in :mod:`.cake_backend`."""
     return (
         "bwd",
         "logprob",
         _meta(X),
         _meta(W),
         _meta(labels),
-        _meta(lse),
-        _meta(dlogp),
+        _layout(lse),
+        _layout(dlogp),
         int(chunk_size),
         bool(need_dx),
         bool(need_dw),
@@ -2424,7 +2441,8 @@ class BindingCache:
     ``capacity`` (default :data:`BINDING_CACHE_DEFAULT_CAPACITY`, 64 bindings) bounds what is kept; ``enabled=False``
     bypasses the cache (every call validates and binds).  :meth:`configure` changes both at runtime.  The templated
     launches of the eager output-boundary casts (:func:`_eager_launch`) are kept alongside, at most
-    :attr:`EAGER_CAPACITY` forms, and follow the same switch and :meth:`clear`."""
+    :attr:`EAGER_CAPACITY` forms, and follow the same switch and :meth:`clear`.  Threads share it without a lock, as
+    :class:`.cake_backend.BindingCache`'s (a step whose key or entry another thread's eviction removed is skipped)."""
 
     # templated launches of the eager output-boundary stages (:func:`_eager_launch`) kept alongside the bindings
     EAGER_CAPACITY = 64
@@ -2455,8 +2473,7 @@ class BindingCache:
                     f"to bypass it), got {capacity!r}"
                 )
             self.capacity = capacity
-            while len(self._bindings) > self.capacity:
-                self._bindings.popitem(last=False)
+            _evict(self._bindings, self.capacity)
         if enabled is not None:
             self.enabled = bool(enabled)
             if not self.enabled:
@@ -2468,7 +2485,7 @@ class BindingCache:
 
     @property
     def owned_bytes(self) -> int:
-        return sum(b.owned_bytes for b in self._bindings.values())
+        return sum(b.owned_bytes for b in _values(self._bindings))
 
     def clear(self) -> None:
         self._bindings.clear()
@@ -2479,14 +2496,19 @@ class BindingCache:
         entry = self._eager.get(form)
         if entry is None or entry[0] is not record:
             return None
-        self._eager.move_to_end(form)
+        # another thread's eviction since the get: the launch stays valid for this call (one line: a ``try`` line of
+        # its own would add a NOP to every hit)
+        # fmt: off
+        try: self._eager.move_to_end(form)  # noqa: E701, SIM105
+        except KeyError: pass  # noqa: E701
+        # fmt: on
         return entry[1]
 
     def eager_remember(self, form: tuple, record, launch: _Launch) -> None:
         self._eager.pop(form, None)
         self._eager[form] = (record, launch)
-        while len(self._eager) > self.EAGER_CAPACITY:
-            self._eager.popitem(last=False)
+        if len(self._eager) > self.EAGER_CAPACITY:
+            _evict(self._eager, self.EAGER_CAPACITY)
 
     def lookup(self, key: tuple) -> Optional[_Binding]:
         binding = self._bindings.get(key)
@@ -2494,7 +2516,12 @@ class BindingCache:
             self.misses += 1
         else:
             self.hits += 1
-            self._bindings.move_to_end(key)
+            # another thread's eviction since the get: the binding stays valid for this call (one line, as in
+            # :meth:`eager_lookup`)
+            # fmt: off
+            try: self._bindings.move_to_end(key)  # noqa: E701, SIM105
+            except KeyError: pass  # noqa: E701
+            # fmt: on
         return binding
 
     def peek(self, key: tuple) -> Optional[_Binding]:
@@ -2503,8 +2530,8 @@ class BindingCache:
     def remember(self, key: tuple, binding: _Binding) -> _Binding:
         self._bindings.pop(key, None)
         self._bindings[key] = binding
-        while len(self._bindings) > self.capacity:
-            self._bindings.popitem(last=False)
+        if len(self._bindings) > self.capacity:
+            _evict(self._bindings, self.capacity)
         return binding
 
 
@@ -3040,6 +3067,7 @@ def _check_budget_call(backend: str, grad_weight_dtype) -> None:
 def _dx_ws_slabs(
     rows: int,
     hidden: int,
+    vocab: int,
     chunk: int,
     num_sms: int,
     dx_max: int,
@@ -3055,7 +3083,9 @@ def _dx_ws_slabs(
         return 0
     return (
         max(
-            recommended_k_slices(rows_c, hidden, num_sms, dx_max, geometry, resident)
+            recommended_k_slices(
+                rows_c, hidden, num_sms, dx_max, geometry, resident, vocab=vocab
+            )
             for _, rows_c in plan_chunks(rows, chunk)
         )
         - 1
@@ -3098,6 +3128,7 @@ def _budget_plan(
         slabs = _dx_ws_slabs(
             int(rows),
             int(hidden),
+            int(vocab),
             int(chunk),
             num_sms,
             dx_max_slices(stages),
@@ -4893,13 +4924,13 @@ def preload(device: Optional[Union[torch.device, int, str]] = None) -> None:
 
     ``preload`` loads every library of the stages ``device``'s architecture registers in ``cake_jit.STAGES`` (a JIT
     build when the package ships no prebuilt ``aot/`` library; the candidate-support stages of ``cake_support`` are
-    not among them and still load at their first call), creates the per-device side stream and its fork event, the
-    hidden count's pinned cell and event, the int32 count constant and the constant cells, launches each PyTorch
-    operator of the valid-row count paths once on a few rows (``ge``, ``cumsum``, ``searchsorted``, ``eq``,
-    ``_assert_async``, ``nonzero``, ``index_select``, ``index_copy_``, ``where``) and then synchronizes ``device``.
-    It does not launch the package's kernels: under the driver's lazy module loading (``CUDA_MODULE_LOADING=LAZY``,
-    the default) each kernel form still loads at its first launch.  ``device``: a CUDA device, its index or ``None``
-    (the current device)."""
+    not among them and still load at their first call), creates the calling thread's side stream and its fork event,
+    the hidden count's pinned cell and event and the int32 count constant (another thread creates its own at its
+    first call) and the constant cells, launches each PyTorch operator of the valid-row count paths once on a few
+    rows (``ge``, ``cumsum``, ``searchsorted``, ``eq``, ``_assert_async``, ``nonzero``, ``index_select``,
+    ``index_copy_``, ``where``) and then synchronizes ``device``.  It does not launch the package's kernels: under the
+    driver's lazy module loading (``CUDA_MODULE_LOADING=LAZY``, the default) each kernel form still loads at its first
+    launch.  ``device``: a CUDA device, its index or ``None`` (the current device)."""
     if device is None:
         dev = torch.device("cuda", torch.cuda.current_device())
     elif isinstance(device, int):

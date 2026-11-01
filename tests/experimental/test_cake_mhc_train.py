@@ -20,14 +20,16 @@ streams; SM100 / SM103 / SM107; FlashInfer issue #8068).
 
 The package is standalone: its forward, statistics replay, residual mixing and
 backward prepare run its own copies of the deterministic programs, and
-``cake_mhc_train_backward_finish(..., deterministic=False)`` launches its
-atomic fn split (which also clears ``dfn`` without ``accumulate``), its copy of
-the deterministic token-owner pass and its atomic column-slab pass, which adds
+``cake_mhc_train_backward_finish(..., deterministic=False)`` launches its copy
+of the deterministic token-owner pass, its atomic fn split (beside the
+token-owner pass as its programmatic dependent; it also clears ``dfn`` without
+``accumulate``) and its atomic column-slab pass, which adds
 the ``dfn`` partial of every (column slab, token chunk) unit into ``dfn`` with
 FP32 reductions and folds ``dscale`` / ``dbase`` in fixed order; there is no
 reduction kernel.  ``dX``, ``dscale`` and ``dbase`` are the deterministic
 package's bits; each ``dfn`` element sums ``P`` per-chunk FP32 partials (``P``
-the chunk count of ``cake_jit.k7_chunks``, at most 32) in an order that may
+the column slab's chunk count: ``cake_jit.k7_chunks``, or the two-size
+geometry where ``cake_jit.lpt_chunks`` fires; at most 32) in an order that may
 change from run to run.  Every entry point takes ``deterministic=False`` (any
 other value is a ``ValueError``, checked without a device by
 ``test_cake_mhc_train_rules.py``).  The deterministic package
@@ -42,17 +44,28 @@ throughout, never a source of tolerances.  This module checks:
   the saturated-sigmoid tail clause and the single-cast cancellation band in
   the deterministic suite's form;
 * against the deterministic backward on the same inputs: ``dX``, ``dscale``,
-  ``dbase`` bitwise; ``|dfn - dfn_det| <= 2 P u (|carried| + 1.02 sum_t |dz'_t|
+  ``dbase`` bitwise; ``|dfn - dfn_det| <= F u (|carried| + 1.02 sum_t |dz'_t|
   |x_t|)`` per element (``u = 2^-24``; the FP64 absolute-value contraction of
-  the reference bounds the magnitude of every partial sum either order forms;
-  ``2 P`` roundings covers ``P`` per side), the largest ratio printed; run to
-  run, ``dX`` / ``dscale`` / ``dbase`` identical and the ``dfn`` bits that
-  differ counted and printed (never asserted);
+  the reference bounds the magnitude of every partial sum either order forms):
+  ``F = 2 P`` where the column slab runs ``dynr`` (both sides sum the same
+  per-chunk partials, ``P`` roundings each) and ``F = 2 max(P, P_k7) + 10``
+  where it runs ``lpt`` (the partials are another partition's; see
+  :func:`_dfn_factor`), the largest ratio printed; run to run, ``dX`` /
+  ``dscale`` / ``dbase`` identical and the ``dfn`` bits that differ counted and
+  printed (never asserted);
+* the two-size schedule at forced geometries (``cake_jit.lpt_chunks`` replaced
+  for one token count: one size, one small chunk, several, small chunks past
+  ``T``, empty small chunks, 32 chunks, one round of units, a short odd row,
+  with and without ``accumulate``, and the screen's best geometry at 16263
+  tokens): the ``lpt`` record launches over ``min(SMs, 64 P)`` CTAs, ``dX`` /
+  ``dscale`` / ``dbase`` bitwise the deterministic package's on two launches
+  (fresh outputs, then a poisoned caller workspace), ``dfn`` within the bound,
+  the ticket word back to 0;
 * the forward entry points (forward prepare, statistics replay, residual
   mixing, backward prepare) bitwise the deterministic package's, and every
   launch one of this package's records (the deterministic package launches
-  nothing; the backward loads exactly the atomic fn split, the token-owner
-  record and the atomic column slab);
+  nothing; the backward loads exactly the token-owner record, the atomic fn
+  split and the column slab's form of the call, in that order);
 * PyTorch's deterministic algorithms: ``backward_finish`` raises PyTorch's
   alert (``RuntimeError`` before any launch; under ``warn_only`` one
   ``UserWarning`` per call, then the non-deterministic backward runs, never a
@@ -158,6 +171,25 @@ _OUTPUTS = ("dX", "dfn", "dscale", "dbase")
 _EXACT = ("dX", "dscale", "dbase")  # bitwise the deterministic package's
 _ALERT = "does not have a deterministic implementation"
 SLAB = "cake_mhc_train_bwd_slab_atomic__dynr"
+LPT = "cake_mhc_train_bwd_slab_atomic__lpt"
+# The lpt record's chunk scalars (cake_jit.slab_plan), in kernel-parameter order (P, rpc, p_big, rpc_small).
+LPT_HOST_KEYS = (
+    "lpt_parts",
+    "lpt_rows_per_chunk",
+    "lpt_big_parts",
+    "lpt_small_rows_per_chunk",
+)
+# Forced two-size geometries (P, rpc, p_big, rpc_small) at T = 2049 (33 tiles, the last one token).
+LPT_FORCED = (
+    (7, 320, 7, 320),  # p_big = P: one size, 7 chunks of 5 tiles
+    (5, 448, 4, 320),  # one small chunk: 4 x 7 tiles, then 5 tiles
+    (6, 512, 3, 192),  # several small chunks: 3 x 8 tiles, then 3 x 3 tiles
+    (8, 512, 3, 192),  # small chunks past T: 3 x 8 tiles, then 5 x 3 tiles of which the last 2 hold no token
+    (6, 512, 4, 256),  # a small chunk longer than the tokens left: 4 x 8 tiles leave 1 token, the second small is empty
+    (5, 768, 3, 128),  # big chunks that reach T (12, 12 and 9 tiles): both small chunks are empty
+    (32, 128, 12, 64),  # 32 chunks: 12 x 2 tiles, then 20 x 1 tile of which the last 11 are empty
+    (2, 1280, 1, 832),  # 128 units, one round on every board: 20 tiles, then 13
+)  # fmt: skip
 
 
 def _device() -> torch.device:
@@ -224,6 +256,37 @@ def _parts(T: int) -> int:
         parts,
     )
     return parts
+
+
+def _lpt_runs(T: int) -> bool:
+    """Whether the column slab runs its two-size ``lpt`` record at ``T`` on this device (read at call time, so a
+    replaced ``cake_jit.lpt_chunks`` counts)."""
+    return loader.bwd_slab_atomic_program(T, _sm_count(), _arch()) == "lpt"
+
+
+def _slab_parts(T: int) -> int:
+    """The chunk count the column slab launches: ``slab_plan``'s ``lpt_parts`` under ``lpt``, else :func:`_parts`."""
+    if not _lpt_runs(T):
+        return _parts(T)
+    parts = loader.slab_plan(T, _sm_count(), _arch())["lpt_parts"]
+    assert 1 <= parts <= 32, (T, parts)
+    return parts
+
+
+def _dfn_factor(T: int) -> float:
+    """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T.  F = 2 P where the column slab runs
+    dynr: both sides sum the same per-chunk partials, at most P roundings each.  Under lpt the partials are another
+    partition's.  Every chunk starts on a 64-token tile and each tile's leading-piece product starts a fresh
+    accumulator, so those products are bitwise the same on both sides.  Each side then differs from the exact sum of
+    those products and the trailing terms by its own compensated summation of its tiles (2u), the rounding of
+    acc - comp (u) and the FP32
+    accumulation of the trailing dz' pieces (at most 2^-8 of each term) over 16-tile groups (at most 128 accumulate
+    steps of at most 2u each: about 1.1u).  That is about 4.1u per side.  The cross-chunk roundings are P on this
+    side and at most P_k7 on the deterministic side.  So F = 2 max(P, P_k7) + 10 >= P + P_k7 + 8.2, which also
+    covers two launches of the same lpt partition (2 P)."""
+    if not _lpt_runs(T):
+        return 2.0 * _parts(T)
+    return 2.0 * max(_slab_parts(T), _parts(T)) + 10.0
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -436,19 +499,21 @@ def _abs_contraction(i: dict) -> torch.Tensor:
 
 
 def _dfn_bound(
-    i: dict, parts: int, *, carried: torch.Tensor | None = None
+    i: dict, factor: float, *, carried: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of the same per-chunk partials in two orders.
+    """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of per-chunk partials in two orders:
+    ``factor u (|carried| + sum_t |dz'_t| |x_t|)`` (``factor`` = :func:`_dfn_factor` of the token count).
 
     Each side adds ``P`` partials (onto the carried-in value with ``accumulate``) with at most ``P`` FP32 roundings,
     each at most ``u`` times the running sum, whose magnitude never exceeds ``|carried| + sum_j |partial_j| <=
-    |carried| + sum_t |terms_t|``: ``|dfn_a - dfn_b| <= 2 P u (|carried| + sum_t |dz'_t| |x_t|)``.  The bound holds
-    for any partition of the tokens into the ``P`` chunks (``sum_j |partial_j| <= sum_t |terms_t|`` up to the
-    within-chunk rounding, which ``ABS_SLACK`` absorbs); it assumes both sides form the same per-chunk partials."""
+    |carried| + sum_t |terms_t|``: two sums of the same partials differ by at most ``2 P u (|carried| + sum_t |dz'_t|
+    |x_t|)``.  The bound holds for any partition of the tokens into the ``P`` chunks (``sum_j |partial_j| <= sum_t
+    |terms_t|`` up to the within-chunk rounding, which ``ABS_SLACK`` absorbs); where the two sides form the partials
+    of two partitions, ``factor`` adds both partitions' roundings and the within-chunk differences."""
     total = ABS_SLACK * _abs_contraction(i)
     if carried is not None:
         total = total + carried.double().abs()
-    return 2.0 * parts * FP32_UNIT_ROUNDOFF * total
+    return float(factor) * FP32_UNIT_ROUNDOFF * total
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -652,7 +717,7 @@ def _assert_dfn_within(
         "max_ratio": ratio,
     }
     assert over == 0, (
-        f"{label}: {over} dfn elements beyond 2 P u (|carried| + sum_t |dz'_t| |x_t|) (largest ratio {ratio:.3e})"
+        f"{label}: {over} dfn elements beyond F u (|carried| + sum_t |dz'_t| |x_t|) (largest ratio {ratio:.3e})"
     )
     return figures
 
@@ -893,7 +958,7 @@ def test_nondeterministic_backward_matches_fp64(T: int) -> None:
     outs = _nd_repeats(i, prep)
     ref = _oracle(i)
     comp = _oracle(i, dtype=F32, block_tokens=None)
-    label = f"T={T} P={_parts(T)} deterministic=False"
+    label = f"T={T} P={_slab_parts(T)} deterministic=False"
     _assert_bf16(outs[0]["dX"], ref["dX32"], f"dX {label}")
     for repeat, out in enumerate(outs[1:], start=1):
         _assert_same_bits(out["dX"], outs[0]["dX"], f"dX {label} launch {repeat}")
@@ -993,14 +1058,15 @@ def test_single_cast_cancellation(T: int) -> None:
 @pytest.mark.parametrize("T", T_COMPARE)
 def test_matches_the_deterministic_backward(T: int) -> None:
     """On the same inputs as the deterministic backward: ``dX``, ``dscale``, ``dbase`` bitwise; every ``dfn`` element
-    within ``2 P u sum_t |dz'_t| |x_t|``.  The launches alternate between the default workspace with fresh outputs
-    and one caller workspace (non-ticket bytes 0xFF before each launch) with NaN-filled outputs; the largest ratio to
-    the bound and the differing bits are printed."""
+    within ``F u sum_t |dz'_t| |x_t|`` (``F`` = :func:`_dfn_factor`: ``2 P`` under ``dynr``, ``2 max(P, P_k7) + 10``
+    where the column slab runs ``lpt`` at ``T`` on this device).  The launches alternate between the default workspace
+    with fresh outputs and one caller workspace (non-ticket bytes 0xFF before each launch) with NaN-filled outputs;
+    the largest ratio to the bound and the differing bits are printed."""
     i = _make_inputs(T, seed=SEED + 1)
     prep = _forward(i)
     want = _snapshot(_det_backward(i, prep))
-    parts = _parts(T)
-    bound = _dfn_bound(i, parts)
+    parts, lpt = _slab_parts(T), _lpt_runs(T)
+    bound = _dfn_bound(i, _dfn_factor(T))
     ws = pkg.cake_mhc_train_backward_workspace(T, _device(), deterministic=False)
     figures = []
     for repeat in range(REPEATS):
@@ -1024,7 +1090,7 @@ def test_matches_the_deterministic_backward(T: int) -> None:
         f"of {MAPPING_ROWS * N} (largest {max(f['max_ulp'] for f in figures)} ulp)"
         + (
             f"; P = 1: equal to the deterministic dfn on every launch: {all(f['max_ulp'] == 0 for f in figures)}"
-            if parts == 1
+            if parts == 1 and not lpt
             else ""
         ),
         flush=True,
@@ -1050,8 +1116,132 @@ def test_run_to_run(T: int) -> None:
             )
         )
     print(
-        f"dfn T={T} P={_parts(T)} run to run (launches 1..{RUN_TO_RUN_REPEATS - 1} vs launch 0; elements, bits, "
+        f"dfn T={T} P={_slab_parts(T)} run to run (launches 1..{RUN_TO_RUN_REPEATS - 1} vs launch 0; elements, bits, "
         f"largest ulp distance): {tallies}",
+        flush=True,
+    )
+
+
+@pytest.fixture
+def forced_lpt():
+    """``forced[T] = (P, rpc, p_big, rpc_small)``: the geometry ``cake_jit.lpt_chunks`` returns at ``T`` instead of
+    the host rule's (every other token count keeps the rule), with the package's route-plan caches cleared on entry
+    and exit (a plan binds the selection and the chunk scalars of its token count)."""
+    forced: dict[int, tuple[int, int, int, int]] = {}
+    rule = loader.lpt_chunks
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            loader,
+            "lpt_chunks",
+            lambda T, sm, arch: forced[T] if T in forced else rule(T, sm, arch),
+        )
+        pkg._PLANS.clear()
+        pkg._FAST_ROUTES.clear()
+        try:
+            yield forced
+        finally:
+            pkg._PLANS.clear()
+            pkg._FAST_ROUTES.clear()
+
+
+# (T, forced geometry or None for the screen's best geometry on this device, accumulate)
+_FORCED_CASES = (
+    *((2049, geometry, False) for geometry in LPT_FORCED),
+    (257, (3, 128, 2, 64), False),  # 5 tiles: 2 x 2 tiles, then one token
+    (2049, LPT_FORCED[2], True),
+    (2049, LPT_FORCED[6], True),
+    (16263, None, False),
+)
+
+
+def _forced_id(case: tuple) -> str:
+    T, geometry, accumulate = case
+    shape = "screen" if geometry is None else "x".join(str(v) for v in geometry)
+    return f"T{T}-{shape}" + ("-accumulate" if accumulate else "")
+
+
+@pytest.mark.parametrize(
+    ("T", "geometry", "accumulate"),
+    _FORCED_CASES,
+    ids=[_forced_id(case) for case in _FORCED_CASES],
+)
+def test_two_size_schedule_at_forced_geometries(
+    forced_lpt, monkeypatch, T: int, geometry, accumulate: bool
+) -> None:
+    """The column slab's ``lpt`` record at a forced geometry (``geometry`` None: the screen's best two-size geometry
+    at ``T`` on this device, ``_lpt_plan`` at ``o_tiles = 1``, also where the table of record is ``None``): the
+    selection's column slab is the ``lpt`` record, the only column slab ``backward_finish`` loads, launched over
+    ``min(SMs, 64 P)`` CTAs with ``slab_plan`` = the geometry.  On two launches -- fresh outputs on the default
+    workspace, then NaN outputs (the carried-in values under ``accumulate``) on a caller workspace whose non-ticket
+    bytes are 0xFF -- ``dX``, ``dscale``, ``dbase`` are bitwise the deterministic backward's, every ``dfn`` element
+    lies within ``_dfn_factor(T) u (|carried| + sum_t |dz'_t| |x_t|)`` and the ticket region is zero; the largest
+    ratio to the bound is printed."""
+    arch, sm, index = _arch(), _sm_count(), _device().index
+    if geometry is None:
+        plan = loader._lpt_plan(T, sm, 1.0)
+        assert plan is not None, (T, sm)
+        geometry = plan[2]
+    forced_lpt[T] = geometry
+    P = geometry[0]
+    assert loader.slab_plan(T, sm, arch) == dict(
+        zip(LPT_HOST_KEYS, geometry, strict=True)
+    )
+    selection = loader.selected_modules(arch, HIDDEN, "bwd_finish", rows=T, sm_count=sm)
+    assert selection[-1] == LPT and SLAB not in selection, selection
+    assert loader.launch_grid(loader.MODULES[LPT], T, device_index=index) == (
+        min(sm, 64 * P),
+        1,
+        1,
+    )
+    i = _make_inputs(T, seed=SEED + 71)
+    prep = _forward(i)
+    carried = None
+    if accumulate:
+        g = torch.Generator(device=_device()).manual_seed(SEED + 72)
+        carried = {
+            "dfn": torch.randn((MAPPING_ROWS, N), generator=g, device=_device()) * 1e-3,
+            "dscale": torch.randn((3,), generator=g, device=_device()) * 1e-3,
+            "dbase": torch.randn((MAPPING_ROWS,), generator=g, device=_device()) * 1e-3,
+        }
+
+    def outputs(poisoned: bool) -> dict:
+        if carried is not None:
+            return {k: v.clone() for k, v in carried.items()}
+        return _poisoned_outputs(T) if poisoned else {}
+
+    want = _snapshot(_det_backward(i, prep, accumulate=accumulate, **outputs(False)))
+    factor = _dfn_factor(T)
+    bound = _dfn_bound(i, factor, carried=None if carried is None else carried["dfn"])
+    ws = pkg.cake_mhc_train_backward_workspace(T, _device(), deterministic=False)
+    loaded: list[str] = []
+    load = loader.load
+
+    def recording_load(name: str, record_arch: str):
+        loaded.append(name)
+        return load(name, record_arch)
+
+    monkeypatch.setattr(loader, "load", recording_load)
+    figures = []
+    for launch in range(2):
+        label = f"T={T} lpt {geometry} accumulate={accumulate} launch {launch}"
+        kwargs = {"accumulate": accumulate, **outputs(launch == 1)}
+        if launch:
+            _poison_workspace(ws)
+            kwargs["workspace"] = ws
+        got = _snapshot(_nd_backward(i, prep, **kwargs))
+        if launch:
+            _assert_ticket_zero(ws, label)
+        _assert_exact_outputs(got, want, f"{label} vs deterministic")
+        figures.append(
+            _assert_dfn_within(
+                got["dfn"], want["dfn"], bound, f"dfn {label} vs deterministic"
+            )
+        )
+    assert loaded == list(selection), loaded
+    print(
+        f"dfn T={T} lpt {geometry} (P_k7 {_parts(T)}, F {factor:g}) accumulate={accumulate}: largest |nd - det| / "
+        f"bound over two launches {max(f['max_ratio'] for f in figures):.3e}, elements differing up to "
+        f"{max(f['differ'] for f in figures)} of {MAPPING_ROWS * N}",
         flush=True,
     )
 
@@ -1118,8 +1308,8 @@ def test_launches_are_this_packages_records(monkeypatch) -> None:
     """Every module the package's entry points load (both forwards, the residual mixing, both backward passes, the
     autograd connection with the statistics saved and replayed, a run-time Sinkhorn count) is one of this package's
     records for the local architecture, and the deterministic package launches nothing (its launch paths refuse);
-    ``backward_finish`` loads exactly its ``bwd_finish`` selection: the architecture's atomic fn split, one
-    token-owner record and the atomic column slab."""
+    ``backward_finish`` loads exactly its ``bwd_finish`` selection, in launch order: one token-owner record, the
+    architecture's atomic fn split and the column slab's form of the call (``bwd_slab_atomic_program``)."""
 
     def refuse(*_args, **_kwargs):
         raise AssertionError("the deterministic package launched a kernel")
@@ -1146,11 +1336,13 @@ def test_launches_are_this_packages_records(monkeypatch) -> None:
     out = _nd_backward(i, prep)
     selection = loader.selected_modules(arch, HIDDEN, "bwd_finish", rows=T, sm_count=sm)
     assert [name for name, _ in loaded[start:]] == list(selection), loaded[start:]
-    assert selection[0] == (
-        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1)}"
+    assert loader.MODULES[selection[0]]["role"] == "bwd_token", selection
+    assert selection[1] == (
+        f"cake_mhc_train_fn_split_atomic__{loader.fn_split_program(arch, 1)}_dep"
     )
-    assert selection[-1] == SLAB and len(selection) == 3, selection
-    assert loader.MODULES[selection[1]]["role"] == "bwd_token", selection
+    program = loader.bwd_slab_atomic_program(T, sm, arch)
+    assert selection[-1] == {"dynr": SLAB, "lpt": LPT}[program], (program, selection)
+    assert len(selection) == 3, selection
     assert all(torch.isfinite(v).all() for v in out.values())
     for save_stats in (True, False):
         leaves = _leaves(i)
@@ -1165,7 +1357,7 @@ def test_launches_are_this_packages_records(monkeypatch) -> None:
     for name, record_arch in loaded:
         assert name in loader.MODULES and name.startswith("cake_mhc_train_"), name
         assert record_arch == arch and arch in loader.MODULES[name]["arches"], name
-    assert SLAB in {name for name, _ in loaded}
+    assert selection[-1] in {name for name, _ in loaded}
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1199,7 +1391,7 @@ def test_policy_strict_alerts_the_direct_backward_only(
     want_prep = _snapshot(_forward(i))
     want_replay = forward_stats(i["X"], i["fn"], i["scale"], i["base"]).clone()
     want = _snapshot(_det_backward(i, want_prep))
-    bound = _dfn_bound(i, _parts(T))
+    bound = _dfn_bound(i, _dfn_factor(T))
     ws = pkg.cake_mhc_train_backward_workspace(T, _device(), deterministic=False)
     deterministic_algorithms(True)
     with warnings.catch_warnings():
@@ -1248,7 +1440,7 @@ def test_policy_warn_only_warns_once_and_runs_the_nondeterministic_backward(
     i = _make_inputs(T, seed=SEED + 7)
     prep = _forward(i)
     want = _snapshot(_det_backward(i, prep))
-    bound = _dfn_bound(i, _parts(T))
+    bound = _dfn_bound(i, _dfn_factor(T))
     det_sized = det.cake_mhc_det_train_backward_workspace(T, _device())
     nd_sized = _nd_workspace_exact(T)
     with pytest.raises(ValueError, match="workspace holds"):
@@ -1348,7 +1540,7 @@ def test_accumulate_four_times(T: int) -> None:
     }
     acc_nd = {k: v.clone() for k, v in carried.items()}
     acc_det = {k: v.clone() for k, v in carried.items()}
-    parts = _parts(T)
+    parts, factor = _slab_parts(T), _dfn_factor(T)
     bound = torch.zeros((MAPPING_ROWS, N), dtype=F64, device=_device())
     figures = []
     for step in range(4):
@@ -1361,7 +1553,7 @@ def test_accumulate_four_times(T: int) -> None:
         want = _det_backward(i, prep, accumulate=True, **acc_det)
         for k in _PARAMETER:
             assert got[k] is acc_nd[k] and want[k] is acc_det[k], (k, step)
-        bound = bound + _dfn_bound(i, parts, carried=before)
+        bound = bound + _dfn_bound(i, factor, carried=before)
         label = f"accumulate x4 T={T} P={parts} step {step}"
         _assert_exact_outputs(got, want, label)
         figures.append(
@@ -1445,7 +1637,8 @@ def test_autograd_matches_the_deterministic_gradients(
     (Y_det.float() * i["dY"].float()).sum().backward()
     assert record["U"].grad is not None and record["U"].grad.dtype == BF16
     bound = _dfn_bound(
-        {**i, "B": record["B"].detach(), "dU": record["U"].grad.detach()}, _parts(T)
+        {**i, "B": record["B"].detach(), "dU": record["U"].grad.detach()},
+        _dfn_factor(T),
     )
     connection = _connection(
         _nd_prepare,
@@ -1500,7 +1693,7 @@ def _connection_bound(i: dict, T: int) -> torch.Tensor:
     U, stats = forward_prepare(i["X"], i["fn"], i["scale"], i["base"])
     B = (U.float() + i["B"].float()).to(BF16)
     dB, _gstats = backward_prepare(i["dY"], B, i["X"], stats)
-    return _dfn_bound({**i, "B": B, "dU": dB}, _parts(T))
+    return _dfn_bound({**i, "B": B, "dU": dB}, _dfn_factor(T))
 
 
 def _assert_grads(got, want, bound: torch.Tensor, label: str) -> dict:
@@ -1688,7 +1881,7 @@ def _chain_bounds(X: torch.Tensor, params: list, dY: torch.Tensor, T: int) -> li
             "dY": g,
             "dU": dB,
         }
-        bounds[c] = _dfn_bound(case, _parts(T))
+        bounds[c] = _dfn_bound(case, _dfn_factor(T))
         g = det_backward_finish(
             xs[c], g, dB, us[c], fn, scale, base, records[c], gstats
         )[0]
@@ -1758,7 +1951,7 @@ def test_repeated_backward_with_retain_graph(T: int, save_stats: bool) -> None:
 
     bound = _connection_bound(i, T)
     # The U-only pass: dY and the gradient statistics are zero, dU is the loss gradient.
-    bound_u = _dfn_bound({**i, "dY": torch.zeros_like(i["dY"])}, _parts(T))
+    bound_u = _dfn_bound({**i, "dY": torch.zeros_like(i["dY"])}, _dfn_factor(T))
     leaves = _leaves(i)
     U, Y = graph(leaves)
     first = torch.autograd.grad(Y, leaves, i["dY"], retain_graph=True)
@@ -1890,7 +2083,7 @@ def _check_case(T: int, *, seed: int = SEED, zero_rows=()) -> None:
     prep = _forward(i)
     outs = _nd_repeats(i, prep)
     want = _snapshot(_det_backward(i, prep))
-    bound = _dfn_bound(i, _parts(T))
+    bound = _dfn_bound(i, _dfn_factor(T))
     label = f"T={T}" + (f" zero_rows={tuple(zero_rows)}" if zero_rows else "")
     for repeat, out in enumerate(outs):
         _assert_exact_outputs(out, want, f"{label} launch {repeat}")
@@ -2034,7 +2227,7 @@ def test_argument_validation() -> None:
     without_b = _snapshot(dict(zip(_OUTPUTS, call(B=None), strict=True)))
     _assert_exact_outputs(without_b, with_b, "B=None")
     _assert_dfn_within(
-        without_b["dfn"], with_b["dfn"], _dfn_bound(i, _parts(T)), "dfn B=None"
+        without_b["dfn"], with_b["dfn"], _dfn_bound(i, _dfn_factor(T)), "dfn B=None"
     )
     with pytest.raises(ValueError):
         _nd_prepare(X.float(), fn, scale, base)
@@ -2071,7 +2264,7 @@ def test_concurrent_streams(Ts: tuple) -> None:
                 "ws": ws,
                 "serial": serial,
                 "want": want,
-                "bound": _dfn_bound(i, _parts(T)),
+                "bound": _dfn_bound(i, _dfn_factor(T)),
                 "outs": _poisoned_outputs(T),
             }
         )

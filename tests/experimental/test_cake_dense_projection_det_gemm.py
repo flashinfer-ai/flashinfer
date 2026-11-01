@@ -44,6 +44,7 @@ ROUTER_SPLITS = cake_backend.ROUTER_SPLITS
 ROW_RULES = cake_backend.ROW_RULES
 SK_DUMMY_BASE = cake_backend.SK_DUMMY_BASE
 SK_MIN_ITERS = cake_backend.SK_MIN_ITERS
+WS_PARTS = cake_backend.WS_PARTS
 SMEM_OPT_IN = cake_backend.SMEM_OPT_IN
 arch_for = cake_backend.arch_for
 bind_launch = cake_backend.bind_launch
@@ -79,6 +80,7 @@ smem_limit_for = cake_backend.smem_limit_for
 split_fp32_to_bf16x3_det_ = cake_backend.split_fp32_to_bf16x3_det_
 stream_k_plan = cake_backend.stream_k_plan
 swap_small_m = cake_backend.swap_small_m
+tile_keyed_workspace = cake_backend.tile_keyed_workspace
 wave_working_set = cake_backend.wave_working_set
 wave_working_set_cgrp = cake_backend.wave_working_set_cgrp
 wgrad_swapped = cake_backend.wgrad_swapped
@@ -585,9 +587,13 @@ ARCH_OF_SM = {148: "sm_100a", 212: "sm_107a"}
 # the SM count of a device of each architecture the planner can target (the two export architectures and
 # compute capability 10.3, whose programs register when the export ships them)
 SM_COUNT_OF_ARCH = {"sm_100a": 148, "sm_103a": 152, "sm_107a": 212}
-# the architecture each eight-warp CTA form token serves: the ``w8r`` / ``w8rs`` programs are sm_103a's, the knob-free
-# ``w8`` program is sm_100a's (test_registry_records_are_well_formed pins the records' arches to it)
-EIGHT_WARP_ARCH_OF_FORM = {"w8r": "sm_103a", "w8rs": "sm_103a", "w8": "sm_100a"}
+# the architectures each eight-warp CTA form token serves: the ``w8r`` / ``w8rs`` programs are sm_100a's and sm_103a's,
+# the knob-free ``w8`` program is sm_100a's (test_registry_records_are_well_formed pins the records' arches to it)
+EIGHT_WARP_ARCHES_OF_FORM = {
+    "w8r": ("sm_100a", "sm_103a"),
+    "w8rs": ("sm_100a", "sm_103a"),
+    "w8": ("sm_100a",),
+}
 
 
 _TRANSPOSED_STEM = re.compile(
@@ -885,12 +891,12 @@ def test_registry_records_are_well_formed():
             )
             if form:
                 # the eight-warp CTA programs take the raster's four fast divisors and run 256 threads per CTA; the
-                # ``w8r`` / ``w8rs`` programs serve sm_103a alone and the knob-free ``w8`` program sm_100a alone;
+                # ``w8r`` / ``w8rs`` programs serve sm_100a and sm_103a and the knob-free ``w8`` program sm_100a alone;
                 # their generator module is not the ten-warp programs'
                 for name_fd in ("fd_tiles_l", "fd_tiles_g", "fd_group", "fd_last"):
                     assert ["parameter", name_fd] in plan_items, (name, name_fd)
                 assert list(record["launch"]["block"]) == [256, 1, 1], name
-                assert record["arches"] == [EIGHT_WARP_ARCH_OF_FORM[form]], name
+                assert record["arches"] == list(EIGHT_WARP_ARCHES_OF_FORM[form]), name
                 if "build" in record:
                     w8_modules.add(record["build"]["module"])
             elif "build" in record:
@@ -2147,10 +2153,11 @@ def test_round21_rules_plan_like_the_cake_launcher(T):
     # with the two-chunk cross-tile pipelined TMEM drain (``kn_n256_tma1_pd2``); the raster group 8 is kept.  A zero-code instance
     # change: no instance-key field is added; sm_107a keeps its round-20 rules (the kv_a row there stays on the quad stores + pd 1)
     key = ("sm_100a", False, True, False, False, False, 6144, 576, None)
-    # (since the knob-free eight-warp program: ``form`` ``w8`` with ``sk: False`` ahead of these knobs and the raster
+    # (since the eight-warp program with the early accumulator release and the loader-issued scheduling queries:
+    # ``form`` ``w8rs`` with ``sk: False`` ahead of these knobs and the raster
     # group 12; the knobs are the row's program where the form yields - test_eight_warp_form_rules_plan_their_programs)
     assert ROW_RULES[key] == {
-        "form": "w8",
+        "form": "w8rs",
         "group_m": 12,
         "slots": 1,
         "epi": "tma",
@@ -4119,6 +4126,156 @@ def test_check_stream_k_plan_refuses_a_plan_outside_the_launch_contract():
     for slab in (0, 2):
         with pytest.raises(ValueError, match="1 <= collectors"):
             check_stream_k_plan(dataclasses.replace(sync, sk_slab=slab, sk_units=16))
+    # a linearised plan of more than WS_PARTS units on a tail tile (2 * iters_per_unit < k_blocks): refused on a program
+    # that keys its workspace by tile (its binding requires the same), taken by a unit-keyed one and without ``arch``
+    table = cake_jit.KERNELS["sm_100a"]
+    by_tile = next(t for t in table if tile_keyed_workspace("sm_100a", t))
+    by_unit = next(
+        t
+        for t in table
+        if t.startswith("dense_proj_det_gemm_")
+        and not tile_keyed_workspace("sm_100a", t)
+    )
+    split = dataclasses.replace(plan, pd=0, sk_units=34, iters_per_unit=8)
+    assert 2 * split.iters_per_unit < split.k_blocks
+    check_stream_k_plan(dataclasses.replace(split, template=by_unit), "sm_100a")
+    check_stream_k_plan(dataclasses.replace(split, template=by_tile))
+    with pytest.raises(ValueError, match="keys its stream-K workspace by tail tile"):
+        check_stream_k_plan(dataclasses.replace(split, template=by_tile), "sm_100a")
+    check_stream_k_plan(dataclasses.replace(plan, template=by_tile), "sm_100a")
+    check_stream_k_plan(
+        dataclasses.replace(split, template=by_tile, sk_exact=2), "sm_100a"
+    )
+
+
+def _slabs_reached(plan, tile_keyed):
+    """The highest workspace slab a program touches over ``plan`` (-1 for none): the stores of every unit that holds
+    part of a tail tile and the last arrival's reads of the tile's ``nparts`` partials, keyed by tile (``t * WS_PARTS +
+    part``, ``t * p + part`` under the exact split) or by unit (``unit + t``) as the generated kernels index them."""
+    if not plan.sk_units or plan.htail_plan:
+        return -1
+    if plan.sk_sync:
+        return plan.tail_tiles - 1
+    if plan.sk_exact:
+        return plan.sk_units - 1 if tile_keyed else plan.sk_units + plan.tail_tiles - 2
+    k, ipu, top = plan.k_blocks, plan.iters_per_unit, -1
+    for t in range(plan.tail_tiles):
+        u_first, u_last = t * k // ipu, ((t + 1) * k - 1) // ipu
+        if u_first < u_last:  # a unit holding the whole tile stores no partial
+            top = max(
+                top, WS_PARTS * t + u_last - u_first if tile_keyed else u_last + t
+            )
+    return top
+
+
+def test_tile_keyed_workspace_matches_the_generated_sources():
+    # the registry predicate against every K1 program's generated sources: a kernel that keys a linearised plan's
+    # partials by tile (``tail_t * WS_PARTS + part``) or a binding that requires 2 * iters_per_unit >= k_iters is
+    # tile-keyed, a kernel that keys them by unit (``unit + tail_t``) is not
+    libraries = {e["name"]: e for e in cake_build.manifest()["libraries"]}
+    root = Path(cake_jit.__file__).parent
+    by_tile = re.compile(rf"int slab(?:_\d+)* = tail_t(?:_\d+)* \* {WS_PARTS} \+")
+    by_unit = re.compile(
+        r"int slab(?:_\d+)* = u(?:_\d+)* \+ tail_t(?:_\d+)*;|\(u_first(?:_\d+)* \+ sidx(?:_\d+)* \+ tail_t"
+    )
+    seen = {True: 0, False: 0}
+    for arch, table in cake_jit.KERNELS.items():
+        for template, name in table.items():
+            if not template.startswith("dense_proj_det_gemm_"):
+                continue
+            sources = libraries[cake_jit.library_name(name, arch)]["sources"]
+            kernel, binding = (
+                (root / s).read_text()
+                for s in sorted(sources, key=lambda s: s.endswith("binding.cu"))
+            )
+            keyed = tile_keyed_workspace(arch, template)
+            if by_tile.search(kernel) or "(2 * iters_per_unit) >= k_iters" in binding:
+                assert keyed, (arch, template)
+            if by_unit.search(kernel):
+                assert not keyed, (arch, template)
+            seen[keyed] += 1
+    assert seen[True] and seen[False]
+    assert not tile_keyed_workspace("sm_100a", "dense_proj_det_gemm_not_registered")
+
+
+def test_stream_k_workspace_holds_every_slab_the_program_reaches():
+    # the review's linearised plan: 70 tail tiles of 65 K steps on 76 pairs -> 76 units of 60 steps; a tile-keyed
+    # program reaches slab 3 * 69 + 1 = 208, past the sk_units + tail_tiles = 146 slabs of the unit-keyed sizing
+    assert stream_k_plan(70, 65, 76, True) == (0, 70, 76, 60)
+    E = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16)  # noqa: E731
+    base, *_ = plan_dense_projection_det_gemm(
+        E(1024, 1032), E(1032, 1000), E(1024, 1000), sm_count=152, l2_bytes=L2_BYTES
+    )
+    review = dataclasses.replace(
+        base,
+        num_full=0,
+        tail_tiles=70,
+        sk_units=76,
+        iters_per_unit=60,
+        k_blocks=65,
+        sk_exact=0,
+        sk_sync=False,
+        htail_plan=False,
+    )
+    slab = 2 * review.cta_rows * review.block_n
+    assert _slabs_reached(review, True) == 208 and _slabs_reached(review, False) == 144
+    assert review.ws_f32_elems == WS_PARTS * 70 * slab
+    # public-API plans of the planner on the four target devices: the weight gradient with the linearised policy
+    # (projection_det_wgrad's sk / cta_rows), and forward / input gradients with prepare's stream-K knobs; every plan
+    # the planner accepts fits its workspace, and a tile-keyed program never gets more than WS_PARTS units on a tile
+    checked, short_before, refused = 0, 0, 0
+    for arch, sm_count in (
+        ("sm_100a", 148),
+        ("sm_100a", 152),
+        ("sm_103a", 152),
+        ("sm_107a", 216),
+    ):
+        cases = []
+        for T in (513, 520, 1025, 1027, 4099):
+            for out_dtype in (torch.bfloat16, torch.float32):
+                G, X = E(T, 32), E(T, 4096)
+                A, B, transposed = wgrad_views(
+                    G, X, arch=arch, out_f32=out_dtype == torch.float32
+                )
+                for knobs in (
+                    dict(sk=True),
+                    dict(sk=True, cta_rows=128),
+                    dict(sk=True, cta_rows=64),
+                ):
+                    out = torch.empty(32, 4096, dtype=out_dtype)
+                    cases.append((A, B, out, dict(knobs, transposed_out=transposed)))
+        for T in (1, 64, 1001):
+            for N, K in ((5120, 5120), (16384, 2048), (1024, 5120)):
+                for knobs in (
+                    dict(sk=True),
+                    dict(sk=True, sk_max_units=32),
+                    dict(sk_parts=2),
+                    dict(sk_parts=3),
+                ):
+                    cases.append((E(T, K), E(N, K).t(), E(T, N), knobs))
+                    cases.append((E(T, N), E(N, K), E(T, K), knobs))
+        for A, B, out, knobs in cases:
+            try:
+                plan, *_ = plan_dense_projection_det_gemm(
+                    A, B, out, sm_count=sm_count, l2_bytes=L2_BYTES, arch=arch, **knobs
+                )
+            except ValueError as e:
+                # count the tile-keyed refusals; a knob the row cannot take is not this test's subject
+                refused += "keys its stream-K workspace by tail tile" in str(e)
+                continue
+            keyed = tile_keyed_workspace(arch, plan.template)
+            linear = plan.sk_units and not (
+                plan.sk_sync or plan.sk_exact or plan.htail_plan
+            )
+            if keyed and linear:
+                assert 2 * plan.iters_per_unit >= plan.k_blocks
+            reached = _slabs_reached(plan, keyed)
+            slab = 2 * plan.cta_rows * plan.block_n
+            assert reached < plan.ws_f32_elems // slab, (arch, plan)
+            checked += reached >= 0
+            short_before += reached >= plan.sk_units + plan.tail_tiles
+    # the sweep covers plans the unit-keyed sizing left short and plans the check refuses
+    assert checked and short_before and refused
 
 
 def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
@@ -4564,7 +4721,9 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 if plan.sk_units and not htail and sync_plan is None:
                     assert (
                         plan.ws_f32_elems
-                        == (plan.sk_units + plan.tail_tiles)
+                        == max(
+                            plan.sk_units + plan.tail_tiles, WS_PARTS * plan.tail_tiles
+                        )
                         * 2
                         * plan.cta_rows
                         * plan.block_n
@@ -5264,6 +5423,46 @@ def test_router_layout_classification_and_swap():
         plan_router_fp32_det_gemm(
             torch.empty(N, 0), torch.empty(0, K), torch.empty(N, K)
         )
+
+
+def _offset_out(rows, cols, offset, device="cpu"):
+    """A contiguous fp32 ``out [rows, cols]`` that starts ``offset`` elements (4 bytes each) past a 16-byte
+    boundary."""
+    storage = torch.empty(rows * cols + 4, device=device)
+    base = (-storage.data_ptr() % 16) // 4  # elements up to the first 16-byte boundary
+    out = storage[base + offset : base + offset + rows * cols].view(rows, cols)
+    assert out.data_ptr() % 16 == 4 * offset
+    return out
+
+
+def test_router_planner_refuses_a_misaligned_out_of_a_single_split_row_major_store():
+    """A single-split ``kk`` / ``kn`` launch stores 16-byte vectors straight into ``out``: an ``out`` that starts
+    4 or 8 bytes past a 16-byte boundary is refused (the kernel would fault with a misaligned address).  A
+    split-K launch stores into its workspace and the transposed ``nn_t`` store writes one element at a time,
+    so those plan with such an ``out``; an aligned ``out`` plans every layout."""
+    T, K, N = 100, 6144, 256
+    X, W, G = torch.empty(T, K), torch.empty(N, K), torch.empty(T, N)
+    cases = dict(kk=(X, W.t(), T, N), kn=(G, W, T, K), nn_t=(G.t(), X, N, K))
+    for layout, (A, B, rows, cols) in cases.items():
+        for splits in sorted({1, 2, ROUTER_SPLITS[layout]}):
+            plan, *_ = plan_router_fp32_det_gemm(
+                A, B, _offset_out(rows, cols, 0), splits=splits
+            )
+            assert (plan.layout, plan.splits) == (layout, splits)
+            for offset in (1, 2):
+                out = _offset_out(rows, cols, offset)
+                if splits == 1 and layout != "nn_t":
+                    with pytest.raises(ValueError, match="16-byte aligned address"):
+                        plan_router_fp32_det_gemm(A, B, out, splits=splits)
+                else:
+                    plan, *_ = plan_router_fp32_det_gemm(A, B, out, splits=splits)
+                    assert (plan.layout, plan.splits) == (layout, splits)
+    # the production split counts: the input gradient (kn, one split) refuses, the forward (kk, 4) and the
+    # weight gradient (nn_t, 6) plan
+    with pytest.raises(ValueError, match="16-byte aligned address"):
+        plan_router_fp32_det_gemm(G, W, _offset_out(T, K, 1))
+    assert plan_router_fp32_det_gemm(X, W.t(), _offset_out(T, N, 1))[0].splits == 4
+    assert plan_router_fp32_det_gemm(G.t(), X, _offset_out(N, K, 1))[0].splits == 6
 
 
 def test_split_fp32_to_bf16x3_is_exact_and_allocation_free_in_place():
@@ -6429,12 +6628,12 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, True, False, False, False, 4096, 32, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 48, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 48, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
-    (('sm_100a', False, True, False, False, False, 4096, 64, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_100a', False, True, False, False, False, 4096, 64, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 4096, 64, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8r'),
+    (('sm_100a', False, True, False, False, False, 4096, 64, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8r'),
     (('sm_100a', False, True, False, False, False, 4096, 128, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma2_pd2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 128, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma2_pd2_lw_pro15'),
-    (('sm_100a', False, True, False, False, False, 4096, 512, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8'),
-    (('sm_100a', False, True, False, False, False, 4096, 512, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8'),
+    (('sm_100a', False, True, False, False, False, 4096, 512, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8rs'),
+    (('sm_100a', False, True, False, False, False, 4096, 512, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8rs'),
     (('sm_100a', False, True, False, False, False, 4096, 1024, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8'),
     (('sm_100a', False, True, False, False, False, 4096, 1024, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8'),
     (('sm_100a', False, True, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_cg_pro15'),
@@ -6445,12 +6644,12 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, True, False, False, False, 5120, 32, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 5120, 48, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 5120, 48, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
-    (('sm_100a', False, True, False, False, False, 5120, 64, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma2_pd3_c1'),
-    (('sm_100a', False, True, False, False, False, 5120, 64, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma2_pd3_c1'),
+    (('sm_100a', False, True, False, False, False, 5120, 64, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8r'),
+    (('sm_100a', False, True, False, False, False, 5120, 64, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8r'),
     (('sm_100a', False, True, False, False, False, 5120, 128, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma2_pd2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 5120, 128, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma2_pd2_lw_pro15'),
-    (('sm_100a', False, True, False, False, False, 5120, 512, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8'),
-    (('sm_100a', False, True, False, False, False, 5120, 512, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8'),
+    (('sm_100a', False, True, False, False, False, 5120, 512, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8r'),
+    (('sm_100a', False, True, False, False, False, 5120, 512, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8r'),
     (('sm_100a', False, True, False, False, False, 5120, 1024, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8'),
     (('sm_100a', False, True, False, False, False, 5120, 1024, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8'),
     (('sm_100a', False, True, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_cg_pro15'),
@@ -7277,11 +7476,26 @@ def test_round2_rules_plan_their_knobs():
         and plan.promo == "l2_256b"
         and plan.group_m == 12
     )  # + the paced output stores (test_sw_rules_plan_the_paced_store_programs)
-    # ... and the GB200 rows that keep round 1
+    # ... and the GB200 rows: the 4096 -> 64 input gradient carries the eight-warp CTA form ``w8r`` with the raster group
+    # 8 (test_eight_warp_form_rules_plan_their_programs), no load-warp form; forcing its round-1 knobs plans the round-1
+    # single-CTA program
     a = dict(kw, arch="sm_100a")
     v = _class_views("kn", False, False, 16384, 4096, 64)
     plan, *_ = plan_dense_projection_det_gemm(v["A"], v["B"], v["out"], **a)
-    assert plan.template == "dense_proj_det_gemm_kn_n256_tma2_pd3_c1" and not plan.lw
+    assert (
+        plan.template == "dense_proj_det_gemm_kn_n256_tma1_w8r"
+        and plan.form == "w8r"
+        and plan.group_m == 8
+        and not plan.lw
+    )
+    plan, *_ = plan_dense_projection_det_gemm(
+        v["A"], v["B"], v["out"], epi="tma", slots=2, cta1=True, pd=3, **a
+    )
+    assert (
+        plan.template == "dense_proj_det_gemm_kn_n256_tma2_pd3_c1"
+        and plan.form == ""
+        and not plan.lw
+    )
     # (the row's eight-warp CTA form is forced off here - its own test is
     # test_eight_warp_form_rules_plan_their_programs; the ten-warp program below is the row's program where it yields)
     v = _class_views("kn", False, False, 16384, 5120, 512)
@@ -7614,12 +7828,12 @@ def test_sw_rules_plan_the_paced_store_programs(T):
     assert "sw" not in cake_backend._CTA1_CLEARED
 
 
-# the ROW_RULES keys that carry the eight-warp CTA form (the six sm_103a and the five sm_100a input-gradient rows)
+# the ROW_RULES keys that carry the eight-warp CTA form (the six sm_103a and the seven sm_100a input-gradient rows)
 EIGHT_WARP_ROWS = sorted(
     (key for key, rule in ROW_RULES.items() if rule.get("form")), key=repr
 )
 # the eight-warp rows per architecture: (N, K) -> (template, form, group_m, promo); the raster group is the row's
-# measured launch parameter (the knob-free ``w8`` program on sm_100a was measured on GB200)
+# measured launch parameter (the sm_100a programs were measured on GB200)
 EIGHT_WARP_ROW_PLANS = {
     "sm_103a": {
         (4096, 48): ("dense_proj_det_gemm_kn_n256_tma1_w8r", "w8r", 16, "none"),
@@ -7630,11 +7844,13 @@ EIGHT_WARP_ROW_PLANS = {
         (6144, 576): ("dense_proj_det_gemm_kn_n256_tma1_w8rs", "w8rs", 12, "none"),
     },
     "sm_100a": {
-        (4096, 512): ("dense_proj_det_gemm_kn_n256_tma1_w8", "w8", 12, "none"),
+        (4096, 64): ("dense_proj_det_gemm_kn_n256_tma1_w8r", "w8r", 8, "none"),
+        (4096, 512): ("dense_proj_det_gemm_kn_n256_tma1_w8rs", "w8rs", 12, "none"),
         (4096, 1024): ("dense_proj_det_gemm_kn_n256_tma1_w8", "w8", 8, "none"),
-        (5120, 512): ("dense_proj_det_gemm_kn_n256_tma1_w8", "w8", 8, "none"),
+        (5120, 64): ("dense_proj_det_gemm_kn_n256_tma1_w8r", "w8r", 8, "none"),
+        (5120, 512): ("dense_proj_det_gemm_kn_n256_tma1_w8r", "w8r", 8, "none"),
         (5120, 1024): ("dense_proj_det_gemm_kn_n256_tma1_w8", "w8", 8, "none"),
-        (6144, 576): ("dense_proj_det_gemm_kn_n256_tma1_w8", "w8", 12, "none"),
+        (6144, 576): ("dense_proj_det_gemm_kn_n256_tma1_w8rs", "w8rs", 12, "none"),
     },
 }
 
@@ -7644,9 +7860,9 @@ EIGHT_WARP_ROW_PLANS = {
 def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
     """The eight-warp CTA form (``form``, instance-key field 37 = LAST, ``_w8r`` / ``_w8rs`` / ``_w8`` directly after
     ``_pro<n>``): the six sm_103a input-gradient rules that carry it (4096 -> 512, 4096 -> 1024 and the kv_a
-    6144 -> 576 with ``w8rs``, 4096 -> 48, 5120 -> 512 and 5120 -> 1024 with ``w8r``) and the five sm_100a
-    input-gradient rules (4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024 and the kv_a 6144 -> 576 with the
-    knob-free ``w8``) plan the eight-warp program of the kn bf16 TMA-store class with the rule's launch parameters and
+    6144 -> 576 with ``w8rs``, 4096 -> 48, 5120 -> 512 and 5120 -> 1024 with ``w8r``) and the seven sm_100a
+    input-gradient rules (4096 -> 1024 and 5120 -> 1024 with the knob-free ``w8``, 4096 -> 512 and the kv_a
+    6144 -> 576 with ``w8rs``, 4096 -> 64, 5120 -> 64 and 5120 -> 512 with ``w8r``) plan the eight-warp program of the kn bf16 TMA-store class with the rule's launch parameters and
     none of the ten-warp pipeline knobs; the ``form=""`` twin is the row's ten-warp program with the same plan
     arithmetic (the picks of these rows are ``_tma1_pd2_pro15`` programs, so the twin ends in ``_pro15`` with ``pd`` 2,
     except the sm_103a 4096 -> 48 twin: the architecture default one-slot program ``_tma1_pro7``, its rule names no
@@ -7775,10 +7991,11 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
         f = _class_views("kn", True, False, T, N_layer, K_layer)
         plan, *_ = plan_dense_projection_det_gemm(f["A"], f["B"], f["out"], **mirror)
         assert plan.form == "" and "_w8" not in plan.template, (N_layer, K_layer)
-        # the other architectures' plans of the row: all five sm_100a rows carry the sm_103a form (``w8rs`` /
-        # ``w8rs`` / ``w8r`` / ``w8r`` / ``w8rs``), the sm_103a rows shared with sm_100a carry the knob-free ``w8``
-        # at its raster there, the sm_103a 4096 -> 48 row carries none on sm_100a (its sm_100a rule names no form),
-        # and sm_107a never carries one
+        # the other architectures' plans of the row: the five sm_100a rows shared with sm_103a carry the sm_103a form
+        # (``w8rs`` / ``w8rs`` / ``w8r`` / ``w8r`` / ``w8rs``) and the sm_100a 4096 -> 64 and 5120 -> 64 rows none there
+        # (their sm_103a rules name no form), the sm_103a rows shared with sm_100a carry sm_100a's form at its raster
+        # there, the sm_103a 4096 -> 48 row carries none on sm_100a (its sm_100a rule names no form), and sm_107a never
+        # carries one
         for other_arch, other_rows in EIGHT_WARP_ROW_PLANS.items():
             if other_arch == arch:
                 continue
@@ -7864,7 +8081,7 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
     with pytest.raises(ValueError, match=r"form"):
         cake_backend.instance_key(a_mn=False, b_mn=True, **key_knobs)
     # the form is a class for the registry fallback: a ten-warp row never falls onto an eight-warp program, nor the
-    # reverse (the eight-warp twin of the ``w8r`` program is the ``w8rs`` program alone)
+    # reverse (on sm_103a the eight-warp twin of the ``w8r`` program is the ``w8rs`` program alone)
     assert all(
         knobs["form"] == ""
         for knobs in cake_backend._registry_variants(
@@ -7877,18 +8094,27 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
             "dense_proj_det_gemm_kn_n256_tma1_w8r", "sm_103a", False
         )
     ] == ["w8rs"]
-    # one eight-warp program on sm_100a: no in-class neighbour (the class never falls onto a ten-warp program)
-    assert (
-        cake_backend._registry_variants(
-            "dense_proj_det_gemm_kn_n256_tma1_w8", "sm_100a", False
-        )
-        == ()
-    )
+    # three eight-warp programs on sm_100a: each one's in-class neighbours are the other two (the class never falls
+    # onto a ten-warp program)
+    for form, others in (
+        ("w8", ["w8r", "w8rs"]),
+        ("w8r", ["w8", "w8rs"]),
+        ("w8rs", ["w8", "w8r"]),
+    ):
+        assert (
+            sorted(
+                knobs["form"]
+                for knobs in cake_backend._registry_variants(
+                    f"dense_proj_det_gemm_kn_n256_tma1_{form}", "sm_100a", False
+                )
+            )
+            == others
+        ), form
     assert "form" not in cake_backend._CTA1_CLEARED
     for key, rule in ROW_RULES.items():
         assert "form" not in rule or (
             rule["form"] in cake_backend.W8_FORMS
-            and EIGHT_WARP_ARCH_OF_FORM[rule["form"]] == key[0]
+            and key[0] in EIGHT_WARP_ARCHES_OF_FORM[rule["form"]]
         ), key
 
 
@@ -8238,7 +8464,7 @@ def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
     "key", EIGHT_WARP_ROWS, ids=lambda key: f"{key[0]}-{key[6]}x{key[7]}"
 )
 def test_eight_warp_form_rows_match_fp64_reference(key, T):
-    """The eight-warp input-gradient rows of the device's architecture (six on sm_103a, five on sm_100a) run their
+    """The eight-warp input-gradient rows of the device's architecture (six on sm_103a, seven on sm_100a) run their
     eight-warp program at a short T against the FP64 reference of the exact BF16 operands (the package tolerance);
     the row's ten-warp program is launched on the same operands beside it and the two outputs are compared
     (reported, not asserted: bitwise agreement and the largest difference).  A key of another architecture is
@@ -8705,6 +8931,57 @@ def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 1
     assert len(cake_backend._K2_CACHE) == 1 and torch.equal(again, v["out"])
+
+
+@pytest.mark.parametrize("op, T", [("fwd", 257), ("dgrad", 257), ("wgrad", 1001)])
+def test_router_misaligned_out_is_refused_or_matches_fp64_reference(op, T):
+    """An ``out`` 4 bytes past a 16-byte boundary on the device: a single-split ``kk`` / ``kn`` launch is refused
+    on both host paths before anything is launched (its 16-byte vector store would fault with a misaligned
+    address); the split-K launches and the transposed ``nn_t`` store write the bits of an aligned ``out`` and
+    match the FP64 reference."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    v = _router_inputs(op, T, seed=SEED + 22)
+    plan, *_ = plan_router_fp32_det_gemm(v["A"], v["B"], v["out"])
+    _require_program(plan.template)
+    rows, cols = (int(s) for s in v["out"].shape)
+    expected = torch.matmul(v["A"].double(), v["B"].double())
+    for splits in sorted({1, 2, ROUTER_SPLITS[plan.layout]}):
+        aligned = _offset_out(rows, cols, 0, device="cuda")
+        shifted = _offset_out(rows, cols, 1, device="cuda")
+        eager = _offset_out(rows, cols, 1, device="cuda")
+        cake_backend.clear_convenience_caches()
+        if splits == 1 and not plan.transposed_out:
+            with pytest.raises(ValueError, match="16-byte aligned address"):
+                prepare_router_fp32_det_gemm(v["A"], v["B"], shifted, splits=splits)
+            with pytest.raises(ValueError, match="16-byte aligned address"):
+                cake_backend.router_fp32_det_gemm(v["A"], v["B"], eager, splits=splits)
+            torch.cuda.synchronize()  # nothing was launched: the context stays healthy
+            prepare_router_fp32_det_gemm(
+                v["A"], v["B"], aligned, splits=splits
+            ).launch()
+            outs = [aligned]
+        else:
+            prepare_router_fp32_det_gemm(
+                v["A"], v["B"], aligned, splits=splits
+            ).launch()
+            prepare_router_fp32_det_gemm(
+                v["A"], v["B"], shifted, splits=splits
+            ).launch()
+            cake_backend.router_fp32_det_gemm(v["A"], v["B"], eager, splits=splits)
+            outs = [shifted, eager]
+        torch.cuda.synchronize()
+        for out in outs:
+            assert torch.equal(out, aligned), splits
+        diff = (aligned.double() - expected).abs()
+        rel_fro = float(diff.norm() / expected.norm())
+        assert bool(torch.isfinite(aligned).all()) and rel_fro <= ROUTER_REL_FRO_MAX, (
+            splits,
+            rel_fro,
+        )
 
 
 def test_fused_split_matches_the_torch_chain_bit_exactly():

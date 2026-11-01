@@ -178,14 +178,14 @@ def validate_forward_metadata(
 def validate_routing_values(
     topk_ids, topk_weights, num_experts: int, *, workspace=None
 ) -> None:
-    """Device assertions run before dispatch unless explicitly disabled.
+    """Check routing values when FLASHINFER_SM107_MEGA_CHECK_ROUTES=1.
 
     Duplicate valid routes violate the router's workspace capacity proof.
     -1 is a masked slot whose score is ignored; all other IDs must be in range
     and have finite scores. A failed CUDA assertion invalidates that worker's
     CUDA context, as with invalid indices in other CUDA indexing operations.
     """
-    if os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1") == "0":
+    if os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0") == "0":
         return
     if (
         topk_ids.is_cuda

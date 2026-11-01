@@ -25,11 +25,14 @@ dispatching entry points (``deterministic=True`` -> the deterministic package
 Numerical contract against the deterministic package: the forward, the
 statistics replay, the residual mixing and ``backward_prepare`` run copies of
 the deterministic programs (the same bits).  ``backward_finish`` runs the
-atomic fn split, the deterministic token-owner pass and the atomic column slab
-(see :mod:`.cake_jit`): the column slab adds the ``dfn`` sum of every (column
-slab, token chunk) unit into ``dfn`` with FP32 reductions, so only the
-summation order of ``dfn`` varies from run to run (each element within
-``P <= 32`` FP32 roundings of the fixed-order sum; the FP32 reduction flushes
+deterministic token-owner pass, the atomic fn split (beside the token-owner
+pass, as its programmatic dependent) and the atomic column slab (see
+:mod:`.cake_jit`; its dynamic-schedule form, or at the token counts and devices
+the host rule picks, the two-size tail schedule over other chunk sizes): the
+column slab adds the ``dfn`` sum of every (column slab, token chunk) unit into
+``dfn`` with FP32 reductions, so only the summation order of ``dfn`` varies
+from run to run (each element within ``P <= 32`` FP32 roundings of the
+fixed-order sum of its per-chunk partials; the FP32 reduction flushes
 subnormal addends and results to zero).  ``dX``, ``dscale`` and ``dbase`` are
 the deterministic package's bits.  There is no final reduction kernel, and the
 backward workspace has no per-chunk ``dfn`` partial region.
@@ -120,6 +123,18 @@ def _require_nondeterministic(deterministic: Any, entry: str) -> None:
         raise ValueError(
             f"{entry} computes non-deterministically and takes deterministic=False (got "
             f"{deterministic!r}); flashinfer.cake_mhc_det_train is the deterministic package"
+        )
+
+
+def _require_hidden(hidden: Any, entry: str) -> None:
+    """The hidden-size contract of the workspace entry points: the package exports hidden ``HIDDEN`` only, so a
+    ``hidden`` keyword other than ``HIDDEN`` raises ``ValueError`` (the deterministic package also exports other
+    hidden sizes)."""
+
+    if type(hidden) is not int or hidden != HIDDEN:
+        raise ValueError(
+            f"{entry}(deterministic=False) supports hidden={HIDDEN} only (got {hidden!r}); "
+            "flashinfer.cake_mhc_det_train is the deterministic package for the other hidden sizes"
         )
 
 
@@ -402,7 +417,11 @@ def _workspace_bytes(kind: str, rows: int, device: torch.device) -> int:
 
 
 def cake_mhc_train_forward_workspace_bytes(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = HIDDEN,
+    deterministic: bool = True,
 ) -> int:
     """Bytes of the caller-owned forward workspace for up to ``T`` tokens on ``device``.
 
@@ -416,15 +435,20 @@ def cake_mhc_train_forward_workspace_bytes(
     zero on first use (allocate with ``torch.zeros`` or
     :func:`cake_mhc_train_forward_workspace`); the kernels leave them zero.
     ``T == 0`` needs no workspace (nothing is launched).  ``deterministic`` must
-    be ``False``.
+    be ``False`` and ``hidden`` 4096 (the package's only hidden size).
     """
 
     _require_nondeterministic(deterministic, "cake_mhc_train_forward_workspace_bytes")
+    _require_hidden(hidden, "cake_mhc_train_forward_workspace_bytes")
     return _workspace_bytes("fwd", T, device)
 
 
 def cake_mhc_train_backward_workspace_bytes(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = HIDDEN,
+    deterministic: bool = True,
 ) -> int:
     """Bytes of the caller-owned backward workspace for up to ``T`` tokens on ``device``.
 
@@ -437,29 +461,40 @@ def cake_mhc_train_backward_workspace_bytes(
     bytes, ``P <= 32``), so a deterministic backward workspace also serves this
     package.  The size is the maximum over every token count up to ``T`` (see
     :func:`cake_mhc_train_forward_workspace_bytes`).  ``deterministic`` must be
-    ``False``.
+    ``False`` and ``hidden`` 4096.
     """
 
     _require_nondeterministic(deterministic, "cake_mhc_train_backward_workspace_bytes")
+    _require_hidden(hidden, "cake_mhc_train_backward_workspace_bytes")
     return _workspace_bytes("bwd", T, device)
 
 
 def cake_mhc_train_forward_workspace(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = HIDDEN,
+    deterministic: bool = True,
 ) -> torch.Tensor:
     """Allocate a zero-initialized forward workspace (see ``..._forward_workspace_bytes``)."""
 
     _require_nondeterministic(deterministic, "cake_mhc_train_forward_workspace")
+    _require_hidden(hidden, "cake_mhc_train_forward_workspace")
     nbytes = _workspace_bytes("fwd", T, device)
     return torch.zeros(nbytes, dtype=torch.uint8, device=torch.device(device))
 
 
 def cake_mhc_train_backward_workspace(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = HIDDEN,
+    deterministic: bool = True,
 ) -> torch.Tensor:
     """Allocate a zero-initialized backward workspace (see ``..._backward_workspace_bytes``)."""
 
     _require_nondeterministic(deterministic, "cake_mhc_train_backward_workspace")
+    _require_hidden(hidden, "cake_mhc_train_backward_workspace")
     nbytes = _workspace_bytes("bwd", T, device)
     return torch.zeros(nbytes, dtype=torch.uint8, device=torch.device(device))
 
@@ -820,7 +855,8 @@ def _current_stream(device_index: int) -> int:
 # The per-call logical values of each route, in the order a call passes them to
 # :func:`_launch_route`, then the workspace regions (fetched from the views with
 # ``_WORKSPACE_VALUES``); the token count and the host-plan scalars of a route
-# are fixed per token count (``_HOST_VALUES``) and bound into the plan.
+# (and the column slab's ``lpt`` chunks of ``cake_jit.slab_plan``) are fixed per
+# token count (``_HOST_VALUES``) and bound into the plan.
 _CALL_VALUES: dict[str, tuple[str, ...]] = {
     "fwd_prepare": (
         "fn",
@@ -894,7 +930,17 @@ _HOST_VALUES: dict[str, tuple[str, ...]] = {
     "fwd_recompute": ("m_tiles", "log2_pk", "p_k", "t_pad"),
     "fwd_finish": (),
     "bwd_prepare": (),
-    "bwd_finish": ("t_pad", "rows_per_cta", "parts", "rows_per_chunk", "chunks"),
+    "bwd_finish": (
+        "t_pad",
+        "rows_per_cta",
+        "parts",
+        "rows_per_chunk",
+        "chunks",
+        "lpt_parts",
+        "lpt_rows_per_chunk",
+        "lpt_big_parts",
+        "lpt_small_rows_per_chunk",
+    ),
 }
 
 
@@ -942,7 +988,11 @@ def _build_fast_route(
     position_of = {name: position for position, name in enumerate(names)}
     host: dict[str, Any] = {"rows": rows}
     if _HOST_VALUES[kind]:
-        host_plan = _loader.host_plan(rows, _loader.sm_count(device_index), arch)
+        sm = _loader.sm_count(device_index)
+        host_plan = _loader.host_plan(rows, sm, arch)
+        if kind == "bwd_finish":
+            # the column slab's lpt chunks: slab_plan, read when the plan is built (not part of the cached host plan)
+            host_plan = {**host_plan, **_loader.slab_plan(rows, sm, arch)}
         for name in _HOST_VALUES[kind]:
             host[name] = host_plan[name]
     statics: list[Any] = []
@@ -1612,11 +1662,13 @@ def cake_mhc_train_backward_finish(
     residual-mixing contributions in FP32 and rounds once, and ``dscale`` /
     ``dbase`` are fixed-order FP64 folds rounded once: all three bitwise the
     deterministic package's.  ``dfn`` adds the per-unit FP32 sums of at most
-    ``P <= 32`` token chunks per element in an order that varies from run to run
-    (each element within ``P`` FP32 roundings of the fixed-order sum; the FP32
-    reduction flushes subnormal addends and results to zero).  With ``T == 0``
-    nothing is launched: ``dX`` is empty and the parameter gradients are zeroed
-    (``accumulate=False``) or left untouched (``accumulate=True``).
+    ``P <= 32`` token chunks (the host rule's chunk sizes per token count and
+    device) per element in an order that varies from run to run (each element
+    within ``P`` FP32 roundings of the fixed-order sum of the same chunk
+    partials; the FP32 reduction flushes subnormal addends and results to
+    zero).  With ``T == 0`` nothing is launched: ``dX`` is empty and the
+    parameter gradients are zeroed (``accumulate=False``) or left untouched
+    (``accumulate=True``).
 
     With ``torch.use_deterministic_algorithms(True)`` the call raises PyTorch's
     alert for an operation without a deterministic implementation
@@ -1769,14 +1821,16 @@ def _backward_finish(
         return dX, dfn, dscale, dbase
     ws = _workspace_for(workspace, "bwd", rows, device)
     _alert_nondeterministic(alert)
-    plan = _loader.host_plan(
-        rows, _loader.sm_count(_device_index(device)), _device_arch(device)
-    )
+    sm = _loader.sm_count(_device_index(device))
+    plan = _loader.host_plan(rows, sm, arch)
+    slab = _loader.slab_plan(rows, sm, arch)
     # The atomic fn split writes the transposed operand layout and, without
-    # accumulate, zeroes dfn.  The column-slab pass describes the
-    # ``[T, 4, 4096]`` tensors as ``[T, 16384]``, reads the first ``T`` rows of
-    # the padded ``dz'`` record, draws its work units from the workspace's
-    # self-resetting ticket word, adds into dfn and folds dscale / dbase.
+    # accumulate, zeroes dfn.  The column-slab pass (the dynr record over the
+    # one-size chunks or the lpt record over the host rule's two-size chunks)
+    # describes the ``[T, 4, 4096]`` tensors as ``[T, 16384]``, reads the first
+    # ``T`` rows of the padded ``dz'`` record, draws its work units from the
+    # workspace's self-resetting ticket word, adds into dfn and folds dscale /
+    # dbase.
     values: dict[str, Any] = {
         "fn": fn,
         "fnTp": ws["fnTp"],
@@ -1801,6 +1855,10 @@ def _backward_finish(
         "ticket": ws["ticket"],
         "parts": plan["parts"],
         "rows_per_chunk": plan["rows_per_chunk"],
+        "lpt_parts": slab["lpt_parts"],
+        "lpt_rows_per_chunk": slab["lpt_rows_per_chunk"],
+        "lpt_big_parts": slab["lpt_big_parts"],
+        "lpt_small_rows_per_chunk": slab["lpt_small_rows_per_chunk"],
         "dfn": dfn,
         "dscale": dscale,
         "dbase": dbase,

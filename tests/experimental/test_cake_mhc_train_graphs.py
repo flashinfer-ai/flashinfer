@@ -54,6 +54,7 @@ calls at the larger count, closes the module.
 from __future__ import annotations
 
 import functools
+import gc
 
 import pytest
 import torch
@@ -121,6 +122,15 @@ def warmup_jit():
     yield
 
 
+@pytest.fixture(autouse=True)
+def collect_dead_graphs():
+    # torch skips its gc.collect() before a capture by default (TORCH_CUDAGRAPH_GC): an earlier test's dead CUDA graph
+    # that a cyclic collection destroys during a global-mode capture invalidates that capture.
+    gc.collect()
+    yield
+    gc.collect()
+
+
 def _arch() -> str:
     return loader.arch_for_capability(_capability())
 
@@ -134,6 +144,29 @@ def _parts(T: int) -> int:
     parts = loader.host_plan(T, _sm_count(), _arch())["parts"]
     assert 1 <= parts <= 32, (T, parts)
     return parts
+
+
+def _lpt_runs(T: int) -> bool:
+    """Whether the column slab runs its two-size ``lpt`` record at ``T`` on this device."""
+    return loader.bwd_slab_atomic_program(T, _sm_count(), _arch()) == "lpt"
+
+
+def _slab_parts(T: int) -> int:
+    """The chunk count the column slab launches: ``slab_plan``'s ``lpt_parts`` under ``lpt``, else :func:`_parts`."""
+    if not _lpt_runs(T):
+        return _parts(T)
+    parts = loader.slab_plan(T, _sm_count(), _arch())["lpt_parts"]
+    assert 1 <= parts <= 32, (T, parts)
+    return parts
+
+
+def _dfn_factor(T: int) -> float:
+    """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T (``test_cake_mhc_train.py``'s
+    ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr (both sides sum the same per-chunk
+    partials), 2 max(P, P_k7) + 10 where it runs lpt (the partials are another partition's)."""
+    if not _lpt_runs(T):
+        return 2.0 * _parts(T)
+    return 2.0 * max(_slab_parts(T), _parts(T)) + 10.0
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -190,15 +223,16 @@ def _dzp(i: dict) -> torch.Tensor:
 
 
 def _dfn_bound(i: dict) -> torch.Tensor:
-    """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of the same ``P`` per-chunk partials in two orders:
-    ``2 P u * 1.02 sum_t |dz'_t| |x_t|`` (``test_cake_mhc_train.py``'s ``_dfn_bound``)."""
+    """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of per-chunk partials in two orders:
+    ``F u * 1.02 sum_t |dz'_t| |x_t|`` with ``F`` = :func:`_dfn_factor` (``test_cake_mhc_train.py``'s
+    ``_dfn_bound``)."""
     T = i["X"].shape[0]
     dzp = _dzp(i).abs()
     A = torch.zeros((MAPPING_ROWS, N), dtype=F64, device=_device())
     for lo in range(0, T, BLOCK_TOKENS):
         hi = min(T, lo + BLOCK_TOKENS)
         A += dzp[lo:hi].T @ i["X"][lo:hi].reshape(hi - lo, N).double().abs()
-    return 2.0 * _parts(T) * FP32_UNIT_ROUNDOFF * ABS_SLACK * A
+    return _dfn_factor(T) * FP32_UNIT_ROUNDOFF * ABS_SLACK * A
 
 
 def _layer_bound(i: dict, W: torch.Tensor) -> torch.Tensor:

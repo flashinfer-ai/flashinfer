@@ -945,6 +945,12 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a(int* __restrict_
                 unsigned int aligned_m = (task[5] + 15) / 16 * 16;
                 unsigned int token_offset = public_m + (unsigned int)cta_rank * (aligned_m / 2);
                 unsigned long long pending = 68719476735;
+                unsigned int a_rows32 = 0;
+                if (task[0] == 1) {
+                    if (aligned_m <= 64) {
+                        a_rows32 = 1;
+                    }
+                }
                 if (task[0] == 1) {
                     {
                     unsigned int _acquire_observed;
@@ -970,13 +976,20 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t4096_sm103a(int* __restrict_
                     if (elect_sync()) {
                         if (task[0] == 1) {
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 8192, (&A), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
+                            if (a_rows32 == 0) {
+                                tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 8192 + 4096, (&A), k * 128, token_offset + 32, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
+                            }
                             tma_2d_gmem2smem_cta2(smem_sfa_addr + a_stage * 512, (&PrivateSF1), task[4] * 128, k, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                         } else {
                             tma_2d_gmem2smem_cta2(smem_a_addr + a_stage * 8192, (&A2), k * 128, token_offset, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                             tma_2d_gmem2smem_cta2(smem_sfa_addr + a_stage * 512, (&PrivateSF2), task[4] * 128, k, ((full_addr + (a_stage) * 8) & 0xFEFFFFFF));
                         }
                         if (cta_rank == 0) {
-                            mbarrier_arrive_expect_tx(full_addr + (a_stage) * 8, 17408);
+                            if (a_rows32 != 0) {
+                                mbarrier_arrive_expect_tx(full_addr + (a_stage) * 8, 9216);
+                            } else {
+                                mbarrier_arrive_expect_tx(full_addr + (a_stage) * 8, 17408);
+                            }
                         } else {
                             asm volatile(
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"

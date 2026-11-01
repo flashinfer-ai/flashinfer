@@ -355,7 +355,7 @@ kernel_cake_dense_projection_det_gemm_bab00fb2b95c93758095(const __grid_constant
                     "tcgen05.ld.sync.aligned.32x32b.x64.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, [%64];"
                     : "=f"(acc[0]), "=f"(acc[1]), "=f"(acc[2]), "=f"(acc[3]), "=f"(acc[4]), "=f"(acc[5]), "=f"(acc[6]), "=f"(acc[7]), "=f"(acc[8]), "=f"(acc[9]), "=f"(acc[10]), "=f"(acc[11]), "=f"(acc[12]), "=f"(acc[13]), "=f"(acc[14]), "=f"(acc[15]), "=f"(acc[16]), "=f"(acc[17]), "=f"(acc[18]), "=f"(acc[19]), "=f"(acc[20]), "=f"(acc[21]), "=f"(acc[22]), "=f"(acc[23]), "=f"(acc[24]), "=f"(acc[25]), "=f"(acc[26]), "=f"(acc[27]), "=f"(acc[28]), "=f"(acc[29]), "=f"(acc[30]), "=f"(acc[31]), "=f"(acc[32]), "=f"(acc[33]), "=f"(acc[34]), "=f"(acc[35]), "=f"(acc[36]), "=f"(acc[37]), "=f"(acc[38]), "=f"(acc[39]), "=f"(acc[40]), "=f"(acc[41]), "=f"(acc[42]), "=f"(acc[43]), "=f"(acc[44]), "=f"(acc[45]), "=f"(acc[46]), "=f"(acc[47]), "=f"(acc[48]), "=f"(acc[49]), "=f"(acc[50]), "=f"(acc[51]), "=f"(acc[52]), "=f"(acc[53]), "=f"(acc[54]), "=f"(acc[55]), "=f"(acc[56]), "=f"(acc[57]), "=f"(acc[58]), "=f"(acc[59]), "=f"(acc[60]), "=f"(acc[61]), "=f"(acc[62]), "=f"(acc[63])
-                    : "r"(lane_addr + 0));
+                    : "r"(lane_addr));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
                 for (int _lp = 0; _lp < 32; _lp++) {
@@ -379,8 +379,8 @@ kernel_cake_dense_projection_det_gemm_bab00fb2b95c93758095(const __grid_constant
                 asm volatile("barrier.sync 1, 128;" ::: "memory");
                 if (epi_warp % 2 == 0) {
                     if (lane == 0) {
-                        tma_store_3d((&OUT16), off_n + 0, row0, head, slot);
-                        tma_store_3d((&OUT16), off_n + 0, row0 + 32, head, slot + 4096);
+                        tma_store_3d((&OUT16), off_n, row0, head, slot);
+                        tma_store_3d((&OUT16), off_n, row0 + 32, head, slot + 4096);
                     }
                 }
                 asm volatile("cp.async.bulk.commit_group;");

@@ -131,26 +131,26 @@ kernel_cake_deepgemm_dense_mqa_6846d1718ab7505f345c(unsigned int* __restrict__ S
     unsigned int span_offset = (3 * SM_COUNT + 1) / 2 * 2;
     unsigned int q_bound = ((num_q_blocks) < (29046) ? (num_q_blocks) : (29046));
     #pragma unroll 1
-    for (unsigned int qidx_rb = (unsigned int)tid; qidx_rb < q_bound; qidx_rb += 256) {
-        if (num_q_blocks > qidx_rb) {
-            unsigned int start_rb = 4294967295;
-            unsigned int end_rb = 0;
+    for (unsigned int qidx = (unsigned int)tid; qidx < q_bound; qidx += 256) {
+        if (num_q_blocks > qidx) {
+            unsigned int start = 4294967295;
+            unsigned int end = 0;
             #pragma unroll
-            for (int qi_rb = 0; qi_rb < 4; qi_rb++) {
-                unsigned int row_rb = ((qidx_rb * 4 + (unsigned int)qi_rb) < (num_q_tokens - 1) ? (qidx_rb * 4 + (unsigned int)qi_rb) : (num_q_tokens - 1));
-                unsigned int _min_1 = ((Starts[row_rb]) < (num_kv_tokens) ? (Starts[row_rb]) : (num_kv_tokens));
-                unsigned int _min_0 = ((start_rb) < (_min_1) ? (start_rb) : (_min_1));
-                start_rb = _min_0;
-                unsigned int _min_3 = ((Ends[row_rb]) < (num_kv_tokens) ? (Ends[row_rb]) : (num_kv_tokens));
-                unsigned int _max_2 = ((end_rb) > (_min_3) ? (end_rb) : (_min_3));
-                end_rb = _max_2;
+            for (int qi = 0; qi < 4; qi++) {
+                unsigned int row = ((qidx * 4 + (unsigned int)qi) < (num_q_tokens - 1) ? (qidx * 4 + (unsigned int)qi) : (num_q_tokens - 1));
+                unsigned int _min_1 = ((Starts[row]) < (num_kv_tokens) ? (Starts[row]) : (num_kv_tokens));
+                unsigned int _min_0 = ((start) < (_min_1) ? (start) : (_min_1));
+                start = _min_0;
+                unsigned int _min_3 = ((Ends[row]) < (num_kv_tokens) ? (Ends[row]) : (num_kv_tokens));
+                unsigned int _max_2 = ((end) > (_min_3) ? (end) : (_min_3));
+                end = _max_2;
             }
-            unsigned int base_rb = start_rb / 4 * 4;
-            unsigned int splits_rb = (end_rb - base_rb + 255) / 256;
-            Metadata[span_offset + qidx_rb * 2] = base_rb;
-            Metadata[span_offset + qidx_rb * 2 + 1] = splits_rb;
-            work_prefix[qidx_rb] = splits_rb;
-            cost_prefix[qidx_rb] = splits_rb + (unsigned int)(((splits_rb == 0) ? 0 : 1));
+            unsigned int base = start / 4 * 4;
+            unsigned int splits = (end - base + 255) / 256;
+            Metadata[span_offset + qidx * 2] = base;
+            Metadata[span_offset + qidx * 2 + 1] = splits;
+            work_prefix[qidx] = splits;
+            cost_prefix[qidx] = splits + (unsigned int)(((splits == 0) ? 0 : 1));
         }
     }
     __syncthreads();
@@ -210,94 +210,94 @@ kernel_cake_deepgemm_dense_mqa_6846d1718ab7505f345c(unsigned int* __restrict__ S
         unsigned int coordinate = total_work;
         if (target != total_cost) {
             block = 0;
-            unsigned int candidate = block + 16384;
-            if (candidate <= num_q_blocks) {
-                if (target >= cost_prefix[candidate - 1]) {
-                    block = candidate;
-                }
-            }
-            unsigned int candidate_0 = block + 8192;
+            unsigned int candidate_0 = block + 16384;
             if (candidate_0 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_0 - 1]) {
                     block = candidate_0;
                 }
             }
-            unsigned int candidate_1 = block + 4096;
+            unsigned int candidate_1 = block + 8192;
             if (candidate_1 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_1 - 1]) {
                     block = candidate_1;
                 }
             }
-            unsigned int candidate_2 = block + 2048;
+            unsigned int candidate_2 = block + 4096;
             if (candidate_2 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_2 - 1]) {
                     block = candidate_2;
                 }
             }
-            unsigned int candidate_3 = block + 1024;
+            unsigned int candidate_3 = block + 2048;
             if (candidate_3 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_3 - 1]) {
                     block = candidate_3;
                 }
             }
-            unsigned int candidate_4 = block + 512;
+            unsigned int candidate_4 = block + 1024;
             if (candidate_4 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_4 - 1]) {
                     block = candidate_4;
                 }
             }
-            unsigned int candidate_5 = block + 256;
+            unsigned int candidate_5 = block + 512;
             if (candidate_5 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_5 - 1]) {
                     block = candidate_5;
                 }
             }
-            unsigned int candidate_6 = block + 128;
+            unsigned int candidate_6 = block + 256;
             if (candidate_6 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_6 - 1]) {
                     block = candidate_6;
                 }
             }
-            unsigned int candidate_7 = block + 64;
+            unsigned int candidate_7 = block + 128;
             if (candidate_7 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_7 - 1]) {
                     block = candidate_7;
                 }
             }
-            unsigned int candidate_8 = block + 32;
+            unsigned int candidate_8 = block + 64;
             if (candidate_8 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_8 - 1]) {
                     block = candidate_8;
                 }
             }
-            unsigned int candidate_9 = block + 16;
+            unsigned int candidate_9 = block + 32;
             if (candidate_9 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_9 - 1]) {
                     block = candidate_9;
                 }
             }
-            unsigned int candidate_10 = block + 8;
+            unsigned int candidate_10 = block + 16;
             if (candidate_10 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_10 - 1]) {
                     block = candidate_10;
                 }
             }
-            unsigned int candidate_11 = block + 4;
+            unsigned int candidate_11 = block + 8;
             if (candidate_11 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_11 - 1]) {
                     block = candidate_11;
                 }
             }
-            unsigned int candidate_12 = block + 2;
+            unsigned int candidate_12 = block + 4;
             if (candidate_12 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_12 - 1]) {
                     block = candidate_12;
                 }
             }
-            unsigned int candidate_13 = block + 1;
+            unsigned int candidate_13 = block + 2;
             if (candidate_13 <= num_q_blocks) {
                 if (target >= cost_prefix[candidate_13 - 1]) {
                     block = candidate_13;
+                }
+            }
+            unsigned int candidate_14 = block + 1;
+            if (candidate_14 <= num_q_blocks) {
+                if (target >= cost_prefix[candidate_14 - 1]) {
+                    block = candidate_14;
                 }
             }
             unsigned int _min_5 = ((block) < (29045) ? (block) : (29045));
@@ -320,94 +320,94 @@ kernel_cake_deepgemm_dense_mqa_6846d1718ab7505f345c(unsigned int* __restrict__ S
         unsigned int coordinate_0 = total_work;
         if (target_0 != total_cost) {
             block_0 = 0;
-            unsigned int candidate_14 = block_0 + 16384;
-            if (candidate_14 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_14 - 1]) {
-                    block_0 = candidate_14;
+            unsigned int candidate_15 = block_0 + 16384;
+            if (candidate_15 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_15 - 1]) {
+                    block_0 = candidate_15;
                 }
             }
-            unsigned int candidate_0_1 = block_0 + 8192;
-            if (candidate_0_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_0_1 - 1]) {
-                    block_0 = candidate_0_1;
+            unsigned int candidate_16 = block_0 + 8192;
+            if (candidate_16 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_16 - 1]) {
+                    block_0 = candidate_16;
                 }
             }
-            unsigned int candidate_1_1 = block_0 + 4096;
-            if (candidate_1_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_1_1 - 1]) {
-                    block_0 = candidate_1_1;
+            unsigned int candidate_17 = block_0 + 4096;
+            if (candidate_17 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_17 - 1]) {
+                    block_0 = candidate_17;
                 }
             }
-            unsigned int candidate_2_1 = block_0 + 2048;
-            if (candidate_2_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_2_1 - 1]) {
-                    block_0 = candidate_2_1;
+            unsigned int candidate_18 = block_0 + 2048;
+            if (candidate_18 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_18 - 1]) {
+                    block_0 = candidate_18;
                 }
             }
-            unsigned int candidate_3_1 = block_0 + 1024;
-            if (candidate_3_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_3_1 - 1]) {
-                    block_0 = candidate_3_1;
+            unsigned int candidate_19 = block_0 + 1024;
+            if (candidate_19 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_19 - 1]) {
+                    block_0 = candidate_19;
                 }
             }
-            unsigned int candidate_4_1 = block_0 + 512;
-            if (candidate_4_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_4_1 - 1]) {
-                    block_0 = candidate_4_1;
+            unsigned int candidate_20 = block_0 + 512;
+            if (candidate_20 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_20 - 1]) {
+                    block_0 = candidate_20;
                 }
             }
-            unsigned int candidate_5_1 = block_0 + 256;
-            if (candidate_5_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_5_1 - 1]) {
-                    block_0 = candidate_5_1;
+            unsigned int candidate_21 = block_0 + 256;
+            if (candidate_21 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_21 - 1]) {
+                    block_0 = candidate_21;
                 }
             }
-            unsigned int candidate_6_1 = block_0 + 128;
-            if (candidate_6_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_6_1 - 1]) {
-                    block_0 = candidate_6_1;
+            unsigned int candidate_22 = block_0 + 128;
+            if (candidate_22 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_22 - 1]) {
+                    block_0 = candidate_22;
                 }
             }
-            unsigned int candidate_7_1 = block_0 + 64;
-            if (candidate_7_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_7_1 - 1]) {
-                    block_0 = candidate_7_1;
+            unsigned int candidate_23 = block_0 + 64;
+            if (candidate_23 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_23 - 1]) {
+                    block_0 = candidate_23;
                 }
             }
-            unsigned int candidate_8_1 = block_0 + 32;
-            if (candidate_8_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_8_1 - 1]) {
-                    block_0 = candidate_8_1;
+            unsigned int candidate_24 = block_0 + 32;
+            if (candidate_24 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_24 - 1]) {
+                    block_0 = candidate_24;
                 }
             }
-            unsigned int candidate_9_1 = block_0 + 16;
-            if (candidate_9_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_9_1 - 1]) {
-                    block_0 = candidate_9_1;
+            unsigned int candidate_25 = block_0 + 16;
+            if (candidate_25 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_25 - 1]) {
+                    block_0 = candidate_25;
                 }
             }
-            unsigned int candidate_10_1 = block_0 + 8;
-            if (candidate_10_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_10_1 - 1]) {
-                    block_0 = candidate_10_1;
+            unsigned int candidate_26 = block_0 + 8;
+            if (candidate_26 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_26 - 1]) {
+                    block_0 = candidate_26;
                 }
             }
-            unsigned int candidate_11_1 = block_0 + 4;
-            if (candidate_11_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_11_1 - 1]) {
-                    block_0 = candidate_11_1;
+            unsigned int candidate_27 = block_0 + 4;
+            if (candidate_27 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_27 - 1]) {
+                    block_0 = candidate_27;
                 }
             }
-            unsigned int candidate_12_1 = block_0 + 2;
-            if (candidate_12_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_12_1 - 1]) {
-                    block_0 = candidate_12_1;
+            unsigned int candidate_28 = block_0 + 2;
+            if (candidate_28 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_28 - 1]) {
+                    block_0 = candidate_28;
                 }
             }
-            unsigned int candidate_13_1 = block_0 + 1;
-            if (candidate_13_1 <= num_q_blocks) {
-                if (target_0 >= cost_prefix[candidate_13_1 - 1]) {
-                    block_0 = candidate_13_1;
+            unsigned int candidate_29 = block_0 + 1;
+            if (candidate_29 <= num_q_blocks) {
+                if (target_0 >= cost_prefix[candidate_29 - 1]) {
+                    block_0 = candidate_29;
                 }
             }
             unsigned int _min_9 = ((block_0) < (29045) ? (block_0) : (29045));

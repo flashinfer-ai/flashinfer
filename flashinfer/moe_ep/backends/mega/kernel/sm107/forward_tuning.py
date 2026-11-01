@@ -50,12 +50,12 @@ class ForwardExecution:
             "inputs": {name: layout(value) for name, value in inputs.items()},
             "output": layout(self.output),
             "staging": {
-                name: os.environ.get(name, "1")
-                for name in (
-                    "FLASHINFER_MEGA_FUSED_STAGE",
-                    "FLASHINFER_SM107_MEGA_CHECK_ROUTES",
-                    "FLASHINFER_SM107_FUSED_ROUTE_CHECK",
-                    "FLASHINFER_SM107_PREP_TVM_FFI",
+                name: os.environ.get(name, default)
+                for name, default in (
+                    ("FLASHINFER_MEGA_FUSED_STAGE", "1"),
+                    ("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0"),
+                    ("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1"),
+                    ("FLASHINFER_SM107_PREP_TVM_FFI", "1"),
                 )
             },
         }

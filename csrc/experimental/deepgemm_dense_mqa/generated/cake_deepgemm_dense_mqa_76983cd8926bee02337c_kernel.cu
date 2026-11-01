@@ -504,25 +504,25 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
     __syncthreads();
     unsigned long long previous_carry = scan_carry[0];
     unsigned long long lane_sum = value_1;
-    unsigned long long synced = __shfl_up_sync(0xFFFFFFFF, lane_sum, 1, 32);
+    unsigned long long synced_4_0 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 1, 32);
     if (lane >= 1) {
-        lane_sum += synced;
+        lane_sum += synced_4_0;
     }
-    unsigned long long synced_0 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 2, 32);
+    unsigned long long synced_4_1 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 2, 32);
     if (lane >= 2) {
-        lane_sum += synced_0;
+        lane_sum += synced_4_1;
     }
-    unsigned long long synced_1 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 4, 32);
+    unsigned long long synced_4_2 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 4, 32);
     if (lane >= 4) {
-        lane_sum += synced_1;
+        lane_sum += synced_4_2;
     }
-    unsigned long long synced_2 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 8, 32);
+    unsigned long long synced_4_3 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 8, 32);
     if (lane >= 8) {
-        lane_sum += synced_2;
+        lane_sum += synced_4_3;
     }
-    unsigned long long synced_3 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 16, 32);
+    unsigned long long synced_4_4 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 16, 32);
     if (lane >= 16) {
-        lane_sum += synced_3;
+        lane_sum += synced_4_4;
     }
     if (lane == 31) {
         scan_warp_sums[warp] = lane_sum;
@@ -533,25 +533,25 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
         warp_total = scan_warp_sums[lane];
     }
     unsigned long long warp_sum = warp_total;
-    unsigned long long synced_w = __shfl_up_sync(0xFFFFFFFF, warp_sum, 1, 32);
+    unsigned long long synced_w_1_0 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 1, 32);
     if (lane >= 1) {
-        warp_sum += synced_w;
+        warp_sum += synced_w_1_0;
     }
-    unsigned long long synced_w_4 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 2, 32);
+    unsigned long long synced_w_1_1 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 2, 32);
     if (lane >= 2) {
-        warp_sum += synced_w_4;
+        warp_sum += synced_w_1_1;
     }
-    unsigned long long synced_w_5 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 4, 32);
+    unsigned long long synced_w_1_2 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 4, 32);
     if (lane >= 4) {
-        warp_sum += synced_w_5;
+        warp_sum += synced_w_1_2;
     }
-    unsigned long long synced_w_6 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 8, 32);
+    unsigned long long synced_w_1_3 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 8, 32);
     if (lane >= 8) {
-        warp_sum += synced_w_6;
+        warp_sum += synced_w_1_3;
     }
-    unsigned long long synced_w_7 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 16, 32);
+    unsigned long long synced_w_1_4 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 16, 32);
     if (lane >= 16) {
-        warp_sum += synced_w_7;
+        warp_sum += synced_w_1_4;
     }
     unsigned long long preceding = __shfl_sync(0xFFFFFFFF, warp_sum - warp_total, warp);
     unsigned long long scanned_1 = lane_sum - value_1 + preceding + value_1 + previous_carry;
@@ -596,58 +596,58 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
         }
         __syncthreads();
         unsigned long long previous_carry_2 = scan_carry[0];
-        unsigned long long lane_sum_3 = value_1_1;
-        unsigned long long synced_4 = __shfl_up_sync(0xFFFFFFFF, lane_sum_3, 1, 32);
+        unsigned long long lane_sum_0 = value_1_1;
+        unsigned long long synced_4_5 = __shfl_up_sync(0xFFFFFFFF, lane_sum_0, 1, 32);
         if (lane >= 1) {
-            lane_sum_3 += synced_4;
+            lane_sum_0 += synced_4_5;
         }
-        unsigned long long synced_5 = __shfl_up_sync(0xFFFFFFFF, lane_sum_3, 2, 32);
+        unsigned long long synced_4_6 = __shfl_up_sync(0xFFFFFFFF, lane_sum_0, 2, 32);
         if (lane >= 2) {
-            lane_sum_3 += synced_5;
+            lane_sum_0 += synced_4_6;
         }
-        unsigned long long synced_6 = __shfl_up_sync(0xFFFFFFFF, lane_sum_3, 4, 32);
+        unsigned long long synced_4_7 = __shfl_up_sync(0xFFFFFFFF, lane_sum_0, 4, 32);
         if (lane >= 4) {
-            lane_sum_3 += synced_6;
+            lane_sum_0 += synced_4_7;
         }
-        unsigned long long synced_7 = __shfl_up_sync(0xFFFFFFFF, lane_sum_3, 8, 32);
+        unsigned long long synced_4_8 = __shfl_up_sync(0xFFFFFFFF, lane_sum_0, 8, 32);
         if (lane >= 8) {
-            lane_sum_3 += synced_7;
+            lane_sum_0 += synced_4_8;
         }
-        unsigned long long synced_8 = __shfl_up_sync(0xFFFFFFFF, lane_sum_3, 16, 32);
+        unsigned long long synced_4_9 = __shfl_up_sync(0xFFFFFFFF, lane_sum_0, 16, 32);
         if (lane >= 16) {
-            lane_sum_3 += synced_8;
+            lane_sum_0 += synced_4_9;
         }
         if (lane == 31) {
-            scan_warp_sums[warp] = lane_sum_3;
+            scan_warp_sums[warp] = lane_sum_0;
         }
         __syncthreads();
-        unsigned long long warp_total_9 = 0;
+        unsigned long long warp_total_0 = 0;
         if (lane < 12) {
-            warp_total_9 = scan_warp_sums[lane];
+            warp_total_0 = scan_warp_sums[lane];
         }
-        unsigned long long warp_sum_10 = warp_total_9;
-        unsigned long long synced_w_11 = __shfl_up_sync(0xFFFFFFFF, warp_sum_10, 1, 32);
+        unsigned long long warp_sum_0 = warp_total_0;
+        unsigned long long synced_w_1_5 = __shfl_up_sync(0xFFFFFFFF, warp_sum_0, 1, 32);
         if (lane >= 1) {
-            warp_sum_10 += synced_w_11;
+            warp_sum_0 += synced_w_1_5;
         }
-        unsigned long long synced_w_12 = __shfl_up_sync(0xFFFFFFFF, warp_sum_10, 2, 32);
+        unsigned long long synced_w_1_6 = __shfl_up_sync(0xFFFFFFFF, warp_sum_0, 2, 32);
         if (lane >= 2) {
-            warp_sum_10 += synced_w_12;
+            warp_sum_0 += synced_w_1_6;
         }
-        unsigned long long synced_w_13 = __shfl_up_sync(0xFFFFFFFF, warp_sum_10, 4, 32);
+        unsigned long long synced_w_1_7 = __shfl_up_sync(0xFFFFFFFF, warp_sum_0, 4, 32);
         if (lane >= 4) {
-            warp_sum_10 += synced_w_13;
+            warp_sum_0 += synced_w_1_7;
         }
-        unsigned long long synced_w_14 = __shfl_up_sync(0xFFFFFFFF, warp_sum_10, 8, 32);
+        unsigned long long synced_w_1_8 = __shfl_up_sync(0xFFFFFFFF, warp_sum_0, 8, 32);
         if (lane >= 8) {
-            warp_sum_10 += synced_w_14;
+            warp_sum_0 += synced_w_1_8;
         }
-        unsigned long long synced_w_15 = __shfl_up_sync(0xFFFFFFFF, warp_sum_10, 16, 32);
+        unsigned long long synced_w_1_9 = __shfl_up_sync(0xFFFFFFFF, warp_sum_0, 16, 32);
         if (lane >= 16) {
-            warp_sum_10 += synced_w_15;
+            warp_sum_0 += synced_w_1_9;
         }
-        unsigned long long preceding_16 = __shfl_sync(0xFFFFFFFF, warp_sum_10 - warp_total_9, warp);
-        unsigned long long scanned_1_17 = lane_sum_3 - value_1_1 + preceding_16 + value_1_1 + previous_carry_2;
+        unsigned long long preceding_0 = __shfl_sync(0xFFFFFFFF, warp_sum_0 - warp_total_0, warp);
+        unsigned long long scanned_1_17 = lane_sum_0 - value_1_1 + preceding_0 + value_1_1 + previous_carry_2;
         if (qidx_1_0 < (unsigned int)num_q_blocks) {
             local_work[qidx_1_0] = (unsigned int)(scanned_1_17 >> 32);
             local_cost[qidx_1_0] = (unsigned int)scanned_1_17;
@@ -670,70 +670,70 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
         unsigned int coordinate = total_work;
         if (target != total_cost) {
             block = 0;
-            unsigned int probe = block + 1024;
-            if (probe <= scan_blocks) {
-                if (target >= local_cost[probe - 1]) {
-                    block = probe;
+            unsigned int probe_5_0 = block + 1024;
+            if (probe_5_0 <= scan_blocks) {
+                if (target >= local_cost[probe_5_0 - 1]) {
+                    block = probe_5_0;
                 }
             }
-            unsigned int probe_0 = block + 512;
-            if (probe_0 <= scan_blocks) {
-                if (target >= local_cost[probe_0 - 1]) {
-                    block = probe_0;
+            unsigned int probe_5_1 = block + 512;
+            if (probe_5_1 <= scan_blocks) {
+                if (target >= local_cost[probe_5_1 - 1]) {
+                    block = probe_5_1;
                 }
             }
-            unsigned int probe_1 = block + 256;
-            if (probe_1 <= scan_blocks) {
-                if (target >= local_cost[probe_1 - 1]) {
-                    block = probe_1;
+            unsigned int probe_5_2 = block + 256;
+            if (probe_5_2 <= scan_blocks) {
+                if (target >= local_cost[probe_5_2 - 1]) {
+                    block = probe_5_2;
                 }
             }
-            unsigned int probe_2 = block + 128;
-            if (probe_2 <= scan_blocks) {
-                if (target >= local_cost[probe_2 - 1]) {
-                    block = probe_2;
+            unsigned int probe_5_3 = block + 128;
+            if (probe_5_3 <= scan_blocks) {
+                if (target >= local_cost[probe_5_3 - 1]) {
+                    block = probe_5_3;
                 }
             }
-            unsigned int probe_3 = block + 64;
-            if (probe_3 <= scan_blocks) {
-                if (target >= local_cost[probe_3 - 1]) {
-                    block = probe_3;
+            unsigned int probe_5_4 = block + 64;
+            if (probe_5_4 <= scan_blocks) {
+                if (target >= local_cost[probe_5_4 - 1]) {
+                    block = probe_5_4;
                 }
             }
-            unsigned int probe_4 = block + 32;
-            if (probe_4 <= scan_blocks) {
-                if (target >= local_cost[probe_4 - 1]) {
-                    block = probe_4;
+            unsigned int probe_5_5 = block + 32;
+            if (probe_5_5 <= scan_blocks) {
+                if (target >= local_cost[probe_5_5 - 1]) {
+                    block = probe_5_5;
                 }
             }
-            unsigned int probe_5 = block + 16;
-            if (probe_5 <= scan_blocks) {
-                if (target >= local_cost[probe_5 - 1]) {
-                    block = probe_5;
+            unsigned int probe_5_6 = block + 16;
+            if (probe_5_6 <= scan_blocks) {
+                if (target >= local_cost[probe_5_6 - 1]) {
+                    block = probe_5_6;
                 }
             }
-            unsigned int probe_6 = block + 8;
-            if (probe_6 <= scan_blocks) {
-                if (target >= local_cost[probe_6 - 1]) {
-                    block = probe_6;
+            unsigned int probe_5_7 = block + 8;
+            if (probe_5_7 <= scan_blocks) {
+                if (target >= local_cost[probe_5_7 - 1]) {
+                    block = probe_5_7;
                 }
             }
-            unsigned int probe_7 = block + 4;
-            if (probe_7 <= scan_blocks) {
-                if (target >= local_cost[probe_7 - 1]) {
-                    block = probe_7;
+            unsigned int probe_5_8 = block + 4;
+            if (probe_5_8 <= scan_blocks) {
+                if (target >= local_cost[probe_5_8 - 1]) {
+                    block = probe_5_8;
                 }
             }
-            unsigned int probe_8 = block + 2;
-            if (probe_8 <= scan_blocks) {
-                if (target >= local_cost[probe_8 - 1]) {
-                    block = probe_8;
+            unsigned int probe_5_9 = block + 2;
+            if (probe_5_9 <= scan_blocks) {
+                if (target >= local_cost[probe_5_9 - 1]) {
+                    block = probe_5_9;
                 }
             }
-            unsigned int probe_9 = block + 1;
-            if (probe_9 <= scan_blocks) {
-                if (target >= local_cost[probe_9 - 1]) {
-                    block = probe_9;
+            unsigned int probe_5_10 = block + 1;
+            if (probe_5_10 <= scan_blocks) {
+                if (target >= local_cost[probe_5_10 - 1]) {
+                    block = probe_5_10;
                 }
             }
             unsigned int cost_before = 0;
@@ -749,94 +749,94 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
         }
         unsigned int _min_11 = (((unsigned int)(bid + 1)) < (remainder_1) ? ((unsigned int)(bid + 1)) : (remainder_1));
         unsigned int target_0 = (unsigned int)(bid + 1) * quotient_1 + _min_11;
-        unsigned int block_1 = scan_blocks;
-        unsigned int split_2 = 0;
-        unsigned int coordinate_3 = total_work;
+        unsigned int block_0 = scan_blocks;
+        unsigned int split_0 = 0;
+        unsigned int coordinate_0 = total_work;
         if (target_0 != total_cost) {
-            block_1 = 0;
-            unsigned int probe_10 = block_1 + 1024;
-            if (probe_10 <= scan_blocks) {
-                if (target_0 >= local_cost[probe_10 - 1]) {
-                    block_1 = probe_10;
+            block_0 = 0;
+            unsigned int probe_5_11 = block_0 + 1024;
+            if (probe_5_11 <= scan_blocks) {
+                if (target_0 >= local_cost[probe_5_11 - 1]) {
+                    block_0 = probe_5_11;
                 }
             }
-            unsigned int probe_0_1 = block_1 + 512;
-            if (probe_0_1 <= scan_blocks) {
-                if (target_0 >= local_cost[probe_0_1 - 1]) {
-                    block_1 = probe_0_1;
+            unsigned int probe_5_12 = block_0 + 512;
+            if (probe_5_12 <= scan_blocks) {
+                if (target_0 >= local_cost[probe_5_12 - 1]) {
+                    block_0 = probe_5_12;
                 }
             }
-            unsigned int probe_1_1 = block_1 + 256;
-            if (probe_1_1 <= scan_blocks) {
-                if (target_0 >= local_cost[probe_1_1 - 1]) {
-                    block_1 = probe_1_1;
+            unsigned int probe_5_13 = block_0 + 256;
+            if (probe_5_13 <= scan_blocks) {
+                if (target_0 >= local_cost[probe_5_13 - 1]) {
+                    block_0 = probe_5_13;
                 }
             }
-            unsigned int probe_2_1 = block_1 + 128;
-            if (probe_2_1 <= scan_blocks) {
-                if (target_0 >= local_cost[probe_2_1 - 1]) {
-                    block_1 = probe_2_1;
+            unsigned int probe_5_14 = block_0 + 128;
+            if (probe_5_14 <= scan_blocks) {
+                if (target_0 >= local_cost[probe_5_14 - 1]) {
+                    block_0 = probe_5_14;
                 }
             }
-            unsigned int probe_3_1 = block_1 + 64;
-            if (probe_3_1 <= scan_blocks) {
-                if (target_0 >= local_cost[probe_3_1 - 1]) {
-                    block_1 = probe_3_1;
+            unsigned int probe_5_15 = block_0 + 64;
+            if (probe_5_15 <= scan_blocks) {
+                if (target_0 >= local_cost[probe_5_15 - 1]) {
+                    block_0 = probe_5_15;
                 }
             }
-            unsigned int probe_4_1 = block_1 + 32;
-            if (probe_4_1 <= scan_blocks) {
-                if (target_0 >= local_cost[probe_4_1 - 1]) {
-                    block_1 = probe_4_1;
+            unsigned int probe_5_16 = block_0 + 32;
+            if (probe_5_16 <= scan_blocks) {
+                if (target_0 >= local_cost[probe_5_16 - 1]) {
+                    block_0 = probe_5_16;
                 }
             }
-            unsigned int probe_5_1 = block_1 + 16;
-            if (probe_5_1 <= scan_blocks) {
-                if (target_0 >= local_cost[probe_5_1 - 1]) {
-                    block_1 = probe_5_1;
+            unsigned int probe_5_17 = block_0 + 16;
+            if (probe_5_17 <= scan_blocks) {
+                if (target_0 >= local_cost[probe_5_17 - 1]) {
+                    block_0 = probe_5_17;
                 }
             }
-            unsigned int probe_6_1 = block_1 + 8;
-            if (probe_6_1 <= scan_blocks) {
-                if (target_0 >= local_cost[probe_6_1 - 1]) {
-                    block_1 = probe_6_1;
+            unsigned int probe_5_18 = block_0 + 8;
+            if (probe_5_18 <= scan_blocks) {
+                if (target_0 >= local_cost[probe_5_18 - 1]) {
+                    block_0 = probe_5_18;
                 }
             }
-            unsigned int probe_7_1 = block_1 + 4;
-            if (probe_7_1 <= scan_blocks) {
-                if (target_0 >= local_cost[probe_7_1 - 1]) {
-                    block_1 = probe_7_1;
+            unsigned int probe_5_19 = block_0 + 4;
+            if (probe_5_19 <= scan_blocks) {
+                if (target_0 >= local_cost[probe_5_19 - 1]) {
+                    block_0 = probe_5_19;
                 }
             }
-            unsigned int probe_8_1 = block_1 + 2;
-            if (probe_8_1 <= scan_blocks) {
-                if (target_0 >= local_cost[probe_8_1 - 1]) {
-                    block_1 = probe_8_1;
+            unsigned int probe_5_20 = block_0 + 2;
+            if (probe_5_20 <= scan_blocks) {
+                if (target_0 >= local_cost[probe_5_20 - 1]) {
+                    block_0 = probe_5_20;
                 }
             }
-            unsigned int probe_9_1 = block_1 + 1;
-            if (probe_9_1 <= scan_blocks) {
-                if (target_0 >= local_cost[probe_9_1 - 1]) {
-                    block_1 = probe_9_1;
+            unsigned int probe_5_21 = block_0 + 1;
+            if (probe_5_21 <= scan_blocks) {
+                if (target_0 >= local_cost[probe_5_21 - 1]) {
+                    block_0 = probe_5_21;
                 }
             }
             unsigned int cost_before_1 = 0;
             unsigned int work_before_1 = 0;
-            if (block_1 > 0) {
-                cost_before_1 = local_cost[block_1 - 1];
-                work_before_1 = local_work[block_1 - 1];
+            if (block_0 > 0) {
+                cost_before_1 = local_cost[block_0 - 1];
+                work_before_1 = local_work[block_0 - 1];
             }
             unsigned int _max_13 = ((target_0 - cost_before_1) > (1) ? (target_0 - cost_before_1) : (1));
-            unsigned int _min_12 = ((_max_13 - 1) < (local_work[block_1] - work_before_1 - 1) ? (_max_13 - 1) : (local_work[block_1] - work_before_1 - 1));
-            split_2 = _min_12;
-            coordinate_3 = work_before_1 + split_2;
+            unsigned int _min_12 = ((_max_13 - 1) < (local_work[block_0] - work_before_1 - 1) ? (_max_13 - 1) : (local_work[block_0] - work_before_1 - 1));
+            split_0 = _min_12;
+            coordinate_0 = work_before_1 + split_0;
         }
         local_header[0] = block;
         local_header[1] = split;
-        local_header[2] = coordinate_3 - coordinate;
+        local_header[2] = coordinate_0 - coordinate;
         ScheduleMeta[2 * bid] = block;
         ScheduleMeta[2 * bid + 1] = split;
-        ScheduleMeta[2 * SM_COUNT + bid] = coordinate_3 - coordinate;
+        ScheduleMeta[2 * SM_COUNT + bid] = coordinate_0 - coordinate;
     }
     __syncthreads();
     if (warp >= 8 && warp <= 11) {
@@ -939,14 +939,14 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
                         }
                         float2 total = add_f32x2_noftz(sum0, sum1);
                         float relu_wsum = (total.x + total.y) * 0.5f;
-                        float weighted_sum = relu_wsum;
-                        int q_row = q_start;
-                        unsigned long long q_offset = (unsigned long long)q_row * (unsigned long long)stride_logits;
-                        unsigned long long out_elem = q_offset + (unsigned long long)kv_pos;
-                        weighted_sum = ((kv_pos >= seq_start[0] && kv_pos < seq_end[0]) ? weighted_sum : -CUDART_INF_F);
-                        *(reinterpret_cast<float*>(Logits + out_elem) + (0)) = weighted_sum;
+                        float weighted_sum_0 = relu_wsum;
+                        int q_row_0 = q_start;
+                        unsigned long long q_offset_0 = (unsigned long long)q_row_0 * (unsigned long long)stride_logits;
+                        unsigned long long out_elem_0 = q_offset_0 + (unsigned long long)kv_pos;
+                        weighted_sum_0 = ((kv_pos >= seq_start[0] && kv_pos < seq_end[0]) ? weighted_sum_0 : -CUDART_INF_F);
+                        *(reinterpret_cast<float*>(Logits + out_elem_0) + (0)) = weighted_sum_0;
                         float2 sum0_0 = make_float2(0.0f, 0.0f);
-                        float2 sum1_1 = make_float2(0.0f, 0.0f);
+                        float2 sum1_0 = make_float2(0.0f, 0.0f);
                         #pragma unroll
                         for (int j_1 = 0; j_1 < 32; j_1 += 4) {
                             asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
@@ -962,21 +962,21 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
                                 "add.rn.f32x2 _pr, _pr, _pa;\n\t"
                                 "mov.b64 _pb, {%3, %4};\n\t"
                                 "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                                : "+l"(*(unsigned long long*)&sum1_1) : "f"(_tmem_load_1[j_1 + 2]), "f"(_tmem_load_1[j_1 + 3]), "f"(weights_reg[32 + j_1 + 2]), "f"(weights_reg[32 + j_1 + 3]));
+                                : "+l"(*(unsigned long long*)&sum1_0) : "f"(_tmem_load_1[j_1 + 2]), "f"(_tmem_load_1[j_1 + 3]), "f"(weights_reg[32 + j_1 + 2]), "f"(weights_reg[32 + j_1 + 3]));
                         }
-                        float2 total_2 = add_f32x2_noftz(sum0_0, sum1_1);
-                        float relu_wsum_3 = (total_2.x + total_2.y) * 0.5f;
-                        float weighted_sum_4 = relu_wsum_3;
-                        int q_row_5 = q_start + 1;
-                        unsigned long long q_offset_6 = (unsigned long long)q_row_5 * (unsigned long long)stride_logits;
-                        unsigned long long out_elem_7 = q_offset_6 + (unsigned long long)kv_pos;
-                        weighted_sum_4 = ((kv_pos >= seq_start[1] && kv_pos < seq_end[1]) ? weighted_sum_4 : -CUDART_INF_F);
-                        *(reinterpret_cast<float*>(Logits + out_elem_7) + (0)) = weighted_sum_4;
+                        float2 total_0 = add_f32x2_noftz(sum0_0, sum1_0);
+                        float relu_wsum_0 = (total_0.x + total_0.y) * 0.5f;
+                        float weighted_sum_1 = relu_wsum_0;
+                        int q_row_1 = q_start + 1;
+                        unsigned long long q_offset_1 = (unsigned long long)q_row_1 * (unsigned long long)stride_logits;
+                        unsigned long long out_elem_1 = q_offset_1 + (unsigned long long)kv_pos;
+                        weighted_sum_1 = ((kv_pos >= seq_start[1] && kv_pos < seq_end[1]) ? weighted_sum_1 : -CUDART_INF_F);
+                        *(reinterpret_cast<float*>(Logits + out_elem_1) + (0)) = weighted_sum_1;
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
-                        float2 sum0_8 = make_float2(0.0f, 0.0f);
-                        float2 sum1_9 = make_float2(0.0f, 0.0f);
+                        float2 sum0_1 = make_float2(0.0f, 0.0f);
+                        float2 sum1_1 = make_float2(0.0f, 0.0f);
                         #pragma unroll
                         for (int j_2 = 0; j_2 < 32; j_2 += 4) {
                             asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
@@ -985,25 +985,25 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
                                 "add.rn.f32x2 _pr, _pr, _pa;\n\t"
                                 "mov.b64 _pb, {%3, %4};\n\t"
                                 "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                                : "+l"(*(unsigned long long*)&sum0_8) : "f"(_tmem_load_2[j_2]), "f"(_tmem_load_2[j_2 + 1]), "f"(weights_reg[64 + j_2]), "f"(weights_reg[64 + j_2 + 1]));
+                                : "+l"(*(unsigned long long*)&sum0_1) : "f"(_tmem_load_2[j_2]), "f"(_tmem_load_2[j_2 + 1]), "f"(weights_reg[64 + j_2]), "f"(weights_reg[64 + j_2 + 1]));
                             asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
                                 "abs.f32 _ab0, %1;\n\tabs.f32 _ab1, %2;\n\t"
                                 "mov.b64 _pr, {%1, %2};\n\tmov.b64 _pa, {_ab0, _ab1};\n\t"
                                 "add.rn.f32x2 _pr, _pr, _pa;\n\t"
                                 "mov.b64 _pb, {%3, %4};\n\t"
                                 "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                                : "+l"(*(unsigned long long*)&sum1_9) : "f"(_tmem_load_2[j_2 + 2]), "f"(_tmem_load_2[j_2 + 3]), "f"(weights_reg[64 + j_2 + 2]), "f"(weights_reg[64 + j_2 + 3]));
+                                : "+l"(*(unsigned long long*)&sum1_1) : "f"(_tmem_load_2[j_2 + 2]), "f"(_tmem_load_2[j_2 + 3]), "f"(weights_reg[64 + j_2 + 2]), "f"(weights_reg[64 + j_2 + 3]));
                         }
-                        float2 total_10 = add_f32x2_noftz(sum0_8, sum1_9);
-                        float relu_wsum_11 = (total_10.x + total_10.y) * 0.5f;
-                        float weighted_sum_12 = relu_wsum_11;
-                        int q_row_13 = q_start + 2;
-                        unsigned long long q_offset_14 = (unsigned long long)q_row_13 * (unsigned long long)stride_logits;
-                        unsigned long long out_elem_15 = q_offset_14 + (unsigned long long)kv_pos;
-                        weighted_sum_12 = ((kv_pos >= seq_start[2] && kv_pos < seq_end[2]) ? weighted_sum_12 : -CUDART_INF_F);
-                        *(reinterpret_cast<float*>(Logits + out_elem_15) + (0)) = weighted_sum_12;
-                        float2 sum0_16 = make_float2(0.0f, 0.0f);
-                        float2 sum1_17 = make_float2(0.0f, 0.0f);
+                        float2 total_1 = add_f32x2_noftz(sum0_1, sum1_1);
+                        float relu_wsum_1 = (total_1.x + total_1.y) * 0.5f;
+                        float weighted_sum_2 = relu_wsum_1;
+                        int q_row_2 = q_start + 2;
+                        unsigned long long q_offset_2 = (unsigned long long)q_row_2 * (unsigned long long)stride_logits;
+                        unsigned long long out_elem_2 = q_offset_2 + (unsigned long long)kv_pos;
+                        weighted_sum_2 = ((kv_pos >= seq_start[2] && kv_pos < seq_end[2]) ? weighted_sum_2 : -CUDART_INF_F);
+                        *(reinterpret_cast<float*>(Logits + out_elem_2) + (0)) = weighted_sum_2;
+                        float2 sum0_2 = make_float2(0.0f, 0.0f);
+                        float2 sum1_2 = make_float2(0.0f, 0.0f);
                         #pragma unroll
                         for (int j_3 = 0; j_3 < 32; j_3 += 4) {
                             asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
@@ -1012,23 +1012,23 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
                                 "add.rn.f32x2 _pr, _pr, _pa;\n\t"
                                 "mov.b64 _pb, {%3, %4};\n\t"
                                 "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                                : "+l"(*(unsigned long long*)&sum0_16) : "f"(_tmem_load_3[j_3]), "f"(_tmem_load_3[j_3 + 1]), "f"(weights_reg[96 + j_3]), "f"(weights_reg[96 + j_3 + 1]));
+                                : "+l"(*(unsigned long long*)&sum0_2) : "f"(_tmem_load_3[j_3]), "f"(_tmem_load_3[j_3 + 1]), "f"(weights_reg[96 + j_3]), "f"(weights_reg[96 + j_3 + 1]));
                             asm("{\n\t.reg .f32 _ab0, _ab1;\n\t.reg .b64 _pr, _pa, _pb;\n\t"
                                 "abs.f32 _ab0, %1;\n\tabs.f32 _ab1, %2;\n\t"
                                 "mov.b64 _pr, {%1, %2};\n\tmov.b64 _pa, {_ab0, _ab1};\n\t"
                                 "add.rn.f32x2 _pr, _pr, _pa;\n\t"
                                 "mov.b64 _pb, {%3, %4};\n\t"
                                 "fma.rn.f32x2 %0, _pr, _pb, %0;\n\t}"
-                                : "+l"(*(unsigned long long*)&sum1_17) : "f"(_tmem_load_3[j_3 + 2]), "f"(_tmem_load_3[j_3 + 3]), "f"(weights_reg[96 + j_3 + 2]), "f"(weights_reg[96 + j_3 + 3]));
+                                : "+l"(*(unsigned long long*)&sum1_2) : "f"(_tmem_load_3[j_3 + 2]), "f"(_tmem_load_3[j_3 + 3]), "f"(weights_reg[96 + j_3 + 2]), "f"(weights_reg[96 + j_3 + 3]));
                         }
-                        float2 total_18 = add_f32x2_noftz(sum0_16, sum1_17);
-                        float relu_wsum_19 = (total_18.x + total_18.y) * 0.5f;
-                        float weighted_sum_20 = relu_wsum_19;
-                        int q_row_21 = q_start + 3;
-                        unsigned long long q_offset_22 = (unsigned long long)q_row_21 * (unsigned long long)stride_logits;
-                        unsigned long long out_elem_23 = q_offset_22 + (unsigned long long)kv_pos;
-                        weighted_sum_20 = ((kv_pos >= seq_start[3] && kv_pos < seq_end[3]) ? weighted_sum_20 : -CUDART_INF_F);
-                        *(reinterpret_cast<float*>(Logits + out_elem_23) + (0)) = weighted_sum_20;
+                        float2 total_2 = add_f32x2_noftz(sum0_2, sum1_2);
+                        float relu_wsum_2 = (total_2.x + total_2.y) * 0.5f;
+                        float weighted_sum_3 = relu_wsum_2;
+                        int q_row_3 = q_start + 3;
+                        unsigned long long q_offset_3 = (unsigned long long)q_row_3 * (unsigned long long)stride_logits;
+                        unsigned long long out_elem_3 = q_offset_3 + (unsigned long long)kv_pos;
+                        weighted_sum_3 = ((kv_pos >= seq_start[3] && kv_pos < seq_end[3]) ? weighted_sum_3 : -CUDART_INF_F);
+                        *(reinterpret_cast<float*>(Logits + out_elem_3) + (0)) = weighted_sum_3;
                         math_tmem_stage += 1;
                         if (math_tmem_stage == 3) { math_tmem_stage = 0; _phase_umma_full ^= 1; }
                         math_tmem_stage += 1;
@@ -1298,27 +1298,27 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
                 int ke0 = cu_seq_len_k_end[q_start_4];
                 int kv_start_acc = ((ks0 < seq_len_kv) ? ks0 : seq_len_kv);
                 int kv_end_acc = ((ke0 < seq_len_kv) ? ke0 : seq_len_kv);
-                int row_idx = ((q_start_4 + 1 < seq_len) ? q_start_4 + 1 : seq_len - 1);
-                int ks = cu_seq_len_k_start[row_idx];
-                int ke = cu_seq_len_k_end[row_idx];
-                int sk = ((ks < seq_len_kv) ? ks : seq_len_kv);
-                int se = ((ke < seq_len_kv) ? ke : seq_len_kv);
-                kv_start_acc = ((sk < kv_start_acc) ? sk : kv_start_acc);
-                kv_end_acc = ((se > kv_end_acc) ? se : kv_end_acc);
-                int row_idx_0 = ((q_start_4 + 2 < seq_len) ? q_start_4 + 2 : seq_len - 1);
-                int ks_1 = cu_seq_len_k_start[row_idx_0];
-                int ke_2 = cu_seq_len_k_end[row_idx_0];
-                int sk_3 = ((ks_1 < seq_len_kv) ? ks_1 : seq_len_kv);
-                int se_4 = ((ke_2 < seq_len_kv) ? ke_2 : seq_len_kv);
-                kv_start_acc = ((sk_3 < kv_start_acc) ? sk_3 : kv_start_acc);
-                kv_end_acc = ((se_4 > kv_end_acc) ? se_4 : kv_end_acc);
-                int row_idx_5 = ((q_start_4 + 3 < seq_len) ? q_start_4 + 3 : seq_len - 1);
-                int ks_6 = cu_seq_len_k_start[row_idx_5];
-                int ke_7 = cu_seq_len_k_end[row_idx_5];
-                int sk_8 = ((ks_6 < seq_len_kv) ? ks_6 : seq_len_kv);
-                int se_9 = ((ke_7 < seq_len_kv) ? ke_7 : seq_len_kv);
-                kv_start_acc = ((sk_8 < kv_start_acc) ? sk_8 : kv_start_acc);
-                kv_end_acc = ((se_9 > kv_end_acc) ? se_9 : kv_end_acc);
+                int row_idx_1_0 = ((q_start_4 + 1 < seq_len) ? q_start_4 + 1 : seq_len - 1);
+                int ks_2_0 = cu_seq_len_k_start[row_idx_1_0];
+                int ke_1_0 = cu_seq_len_k_end[row_idx_1_0];
+                int sk_1_0 = ((ks_2_0 < seq_len_kv) ? ks_2_0 : seq_len_kv);
+                int se_1_0 = ((ke_1_0 < seq_len_kv) ? ke_1_0 : seq_len_kv);
+                kv_start_acc = ((sk_1_0 < kv_start_acc) ? sk_1_0 : kv_start_acc);
+                kv_end_acc = ((se_1_0 > kv_end_acc) ? se_1_0 : kv_end_acc);
+                int row_idx_1_1 = ((q_start_4 + 2 < seq_len) ? q_start_4 + 2 : seq_len - 1);
+                int ks_2_1 = cu_seq_len_k_start[row_idx_1_1];
+                int ke_1_1 = cu_seq_len_k_end[row_idx_1_1];
+                int sk_1_1 = ((ks_2_1 < seq_len_kv) ? ks_2_1 : seq_len_kv);
+                int se_1_1 = ((ke_1_1 < seq_len_kv) ? ke_1_1 : seq_len_kv);
+                kv_start_acc = ((sk_1_1 < kv_start_acc) ? sk_1_1 : kv_start_acc);
+                kv_end_acc = ((se_1_1 > kv_end_acc) ? se_1_1 : kv_end_acc);
+                int row_idx_1_2 = ((q_start_4 + 3 < seq_len) ? q_start_4 + 3 : seq_len - 1);
+                int ks_2_2 = cu_seq_len_k_start[row_idx_1_2];
+                int ke_1_2 = cu_seq_len_k_end[row_idx_1_2];
+                int sk_1_2 = ((ks_2_2 < seq_len_kv) ? ks_2_2 : seq_len_kv);
+                int se_1_2 = ((ke_1_2 < seq_len_kv) ? ke_1_2 : seq_len_kv);
+                kv_start_acc = ((sk_1_2 < kv_start_acc) ? sk_1_2 : kv_start_acc);
+                kv_end_acc = ((se_1_2 > kv_end_acc) ? se_1_2 : kv_end_acc);
                 int kv_start_4 = kv_start_acc / 4 * 4;
                 unsigned int num_kv_blocks_4 = (kv_end_acc - kv_start_4 + 256 - 1) / 256;
                 int raw_end_1 = (unsigned int)kv_start_4 + num_kv_blocks_4 * 256;
@@ -1359,8 +1359,8 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
                     }
                     int _max_0 = ((coverage_end) > (clean_begin) ? (coverage_end) : (clean_begin));
                     int aligned_start_0 = (_max_0 + 3) / 4 * 4;
-                    int aligned_end_1 = clean_end / 4 * 4;
-                    if (aligned_start_0 >= aligned_end_1) {
+                    int aligned_end_0 = clean_end / 4 * 4;
+                    if (aligned_start_0 >= aligned_end_0) {
                         for (int j_8 = _max_0 + lane; j_8 < clean_end; j_8 += 32) {
                             *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_8)) + (0)) = -CUDART_INF_F;
                         }
@@ -1369,13 +1369,13 @@ kernel_cake_deepgemm_dense_mqa_76983cd8926bee02337c(const __grid_constant__ CUte
                         for (int j_9 = _max_0 + lane; j_9 < aligned_start_0; j_9 += 32) {
                             *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_9)) + (0)) = -CUDART_INF_F;
                         }
-                        for (int j_10 = aligned_end_1 + lane; j_10 < clean_end; j_10 += 32) {
+                        for (int j_10 = aligned_end_0 + lane; j_10 < clean_end; j_10 += 32) {
                             *(reinterpret_cast<float*>(Logits + (row_base + (unsigned long long)j_10)) + (0)) = -CUDART_INF_F;
                         }
                         __syncwarp();
                         if (elect_sync()) {
-                            for (int j_11 = aligned_start_0; j_11 < aligned_end_1; j_11 += 1024) {
-                                int bulk_elems_1 = ((aligned_end_1 - j_11) < (1024) ? (aligned_end_1 - j_11) : (1024));
+                            for (int j_11 = aligned_start_0; j_11 < aligned_end_0; j_11 += 1024) {
+                                int bulk_elems_1 = ((aligned_end_0 - j_11) < (1024) ? (aligned_end_0 - j_11) : (1024));
                                 {
                                     void* _cpbulk_dst_1 = reinterpret_cast<void*>(Logits + (row_base + (unsigned long long)j_11));
                                     asm volatile(

@@ -471,12 +471,12 @@ kernel_cake_dense_projection_det_gemm_7ef28d420de555e7a28d(const __grid_constant
                     #pragma unroll 1
                     for (int seg_1 = 0; seg_1 < nseg_1; seg_1++) {
                         int u_3_1 = (int)this_bid_1 / 2 - num_full;
-                        int lin0_1_1 = u_3_1 * iters_per_unit;
-                        int lin1_raw_1_1 = lin0_1_1 + iters_per_unit;
+                        int lin0_2 = u_3_1 * iters_per_unit;
+                        int lin1_raw_1_1 = lin0_2 + iters_per_unit;
                         int lin1_1_1 = ((lin1_raw_1_1 > sk_iters) ? sk_iters : lin1_raw_1_1);
-                        int t_1 = lin0_1_1 / k_iters + seg_1;
+                        int t_1 = lin0_2 / k_iters + seg_1;
                         int tb_1 = t_1 * k_iters;
-                        int kb0_1 = lin0_1_1 - tb_1;
+                        int kb0_1 = lin0_2 - tb_1;
                         int kbeg_t_1 = ((kb0_1 > 0) ? kb0_1 : 0);
                         int ke0_1 = lin1_1_1 - tb_1;
                         int kend_t_1 = ((ke0_1 > k_iters) ? k_iters : ke0_1);
@@ -673,21 +673,21 @@ kernel_cake_dense_projection_det_gemm_7ef28d420de555e7a28d(const __grid_constant
             #pragma unroll 1
             for (unsigned int _tile_iter_2 = 0; _tile_iter_2 < num_cluster_tiles; _tile_iter_2++) {
                 int u_5 = (int)this_bid_2 / 2 - num_full;
-                int lin0_2 = u_5 * iters_per_unit;
-                int lin1_raw_2 = lin0_2 + iters_per_unit;
+                int lin0_3 = u_5 * iters_per_unit;
+                int lin1_raw_2 = lin0_3 + iters_per_unit;
                 int lin1_2 = ((lin1_raw_2 > sk_iters) ? sk_iters : lin1_raw_2);
-                int n_tail_2 = (lin1_2 - 1) / k_iters - lin0_2 / k_iters + 1;
+                int n_tail_2 = (lin1_2 - 1) / k_iters - lin0_3 / k_iters + 1;
                 int n_2 = ((u_5 < 0) ? 1 : n_tail_2);
                 int nseg_2 = n_2;
                 #pragma unroll 1
                 for (int seg_2 = 0; seg_2 < nseg_2; seg_2++) {
                     int u_5_1 = (int)this_bid_2 / 2 - num_full;
-                    int lin0_2_1 = u_5_1 * iters_per_unit;
-                    int lin1_raw_2_1 = lin0_2_1 + iters_per_unit;
+                    int lin0_3_1 = u_5_1 * iters_per_unit;
+                    int lin1_raw_2_1 = lin0_3_1 + iters_per_unit;
                     int lin1_2_1 = ((lin1_raw_2_1 > sk_iters) ? sk_iters : lin1_raw_2_1);
-                    int t_2 = lin0_2_1 / k_iters + seg_2;
+                    int t_2 = lin0_3_1 / k_iters + seg_2;
                     int tb_2 = t_2 * k_iters;
-                    int kb0_2 = lin0_2_1 - tb_2;
+                    int kb0_2 = lin0_3_1 - tb_2;
                     int kbeg_t_2 = ((kb0_2 > 0) ? kb0_2 : 0);
                     int ke0_2 = lin1_2_1 - tb_2;
                     int kend_t_2 = ((ke0_2 > k_iters) ? k_iters : ke0_2);
@@ -709,11 +709,11 @@ kernel_cake_dense_projection_det_gemm_7ef28d420de555e7a28d(const __grid_constant
                     int off_m_1 = bid_m_1 * 128;
                     int off_n_1 = bid_n_1 * 256;
                     int bidx = head_1;
-                    int part_4 = ((kbeg_2 > 0) ? 1 : ((kend_2 < k_iters) ? 1 : 0));
-                    int slab = u_5_1 + tail_t_2;
                     int u_6 = (int)this_bid_2 / 2 - num_full;
                     int is_half_2 = ((u_6 >= 0) ? 1 : 0);
                     int hh_2 = ((u_6 >= 0) ? u_6 % 2 : 0);
+                    int part_4 = ((is_half_2 == 0) ? 0 : ((kbeg_2 > 0) ? 1 : ((kend_2 < k_iters) ? 1 : 0)));
+                    int slab = tail_t_2 * 3 + ((kbeg_2 > 0) ? 1 : 0) + ((kbeg_2 > iters_per_unit) ? 1 : 0);
                     int off_m_h_1 = off_m_1 + hh_2 * 128 - is_half_2 * cta_rank * 64;
                     int global_row = ((is_half_2 != 0) ? off_m_h_1 + local_row_h : off_m_h_1 + local_row);
                     int row0 = ((is_half_2 != 0) ? off_m_h_1 + warp_row0_h : off_m_h_1 + warp_row0);

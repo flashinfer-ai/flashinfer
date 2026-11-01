@@ -893,16 +893,27 @@ _ARG_NAMES = [
 ]
 
 
+# The pdl builds of the page-prefetch stages, whose binding takes the CTA cap.
+_CAPPED = {
+    "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1_pdl",
+    "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1_pdl",
+}
+
+
 def test_every_stage_binds_the_public_argument_plan():
     """The binding's argument order (seventeen buffers, thirteen scalars, the grid)
-    is the same for every stage; the host binds it through the record's
-    ``logical`` names."""
+    is the same for every stage, with ``max_ctas_per_sm`` before the grid for the
+    page-prefetch pdl builds; the host binds it through the record's ``logical``
+    names."""
     for name, record in loader.MODULES.items():
         plan = record["arg_plan"]
-        assert [key for _kind, key in plan] == _ARG_NAMES, name
+        capped = name in _CAPPED
+        cap = ["max_ctas_per_sm"] if capped else []
+        assert [key for _kind, key in plan] == _ARG_NAMES[:-3] + cap + _ARG_NAMES[-3:]
         assert [kind for kind, _key in plan] == (
-            ["buffer"] * 17 + ["parameter"] * 13 + ["grid"] * 3
+            ["buffer"] * 17 + ["parameter"] * (13 + capped) + ["grid"] * 3
         ), name
+        assert ("max_ctas_per_sm" in record["logical"]) == capped, name
 
 
 def test_registry_records_reference_the_build_manifest():
@@ -937,6 +948,30 @@ def test_registry_records_reference_the_build_manifest():
             record
         ), name
         assert set(record["knobs"]) == set(loader.KNOB_KEYS), name
+        pdl = record["knobs"]["pdl"]
+        assert record["launch"]["use_pdl"] is pdl, name
+        assert name.endswith(loader.PDL_SUFFIX) == pdl, name
+        kernel_text = (PACKAGE_DIR / f"csrc/{record['library']}_kernel.cu").read_text()
+        binding_text = (
+            PACKAGE_DIR / f"csrc/{record['library']}_binding.cu"
+        ).read_text()
+        # A pdl build waits on the preceding grid and launches with the PDL
+        # attribute; a plain build does neither.
+        assert ("ProgrammaticStreamSerialization" in binding_text) == pdl, name
+        if pdl:
+            plain = loader.MODULES[name.removesuffix(loader.PDL_SUFFIX)]
+            assert record["arches"] == [
+                arch for arch in plain["arches"] if arch in loader.PDL_POLICY["arches"]
+            ], name
+            assert {**record["knobs"], "pdl": False} == plain["knobs"], name
+            assert [
+                pair for pair in record["arg_plan"] if pair[1] != "max_ctas_per_sm"
+            ] == plain["arg_plan"], name
+            assert record["grid_rule"] == plain["grid_rule"], name
+            assert "griddepcontrol.wait" in kernel_text, name
+            assert "griddepcontrol.launch_dependents" not in kernel_text, name
+        else:
+            assert "griddepcontrol" not in kernel_text, name
         assert tuple(record["launch"]["block"]) == (loader.THREADS, 1, 1), name
         kind = record["grid_rule"]["kind"]
         assert kind in GRID_RULES, name
@@ -949,7 +984,9 @@ def test_registry_records_reference_the_build_manifest():
             "grid_y",
             "grid_z",
         }, name
-        assert set(record["logical"].values()) <= logical_names, name
+        # The CTA cap is a launch argument the host computes, not a public one.
+        cap = {"max_ctas_per_sm"} if name in _CAPPED else set()
+        assert set(record["logical"].values()) <= logical_names | cap, name
         assert record["arches"], name
         assert set(record["arches"]) <= set(loader.ARCHES), name
         assert set(record["arches"]) <= set(manifest["arch_flags"]), name
@@ -1441,6 +1478,193 @@ def test_stage_policy_only_selects_shipped_builds(arch):
 def test_stage_policy_rejects_unsupported_heads():
     with pytest.raises(ValueError):
         _stage(("sm_100a", 16, 2, 1, 1, 64, 148, False, 1, False))
+
+
+# ----------------------------------------------------------------------------------------------
+# Programmatic dependent launch (CPU): ``enable_pdl`` takes a pdl build on SM100 /
+# SM103 except where ``PDL_POLICY`` keeps the plain build: the selected stage's, or
+# for the single-KV-head clearing stages the page-prefetch stage's;
+# ``enable_pdl=False`` is the plain selection.
+
+_ER2PP = "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1"
+_CLEARING = {
+    "fp8_e4m3_clear_heads_per_cta2_zero_store_width256",
+    "fp8_e4m3_grid_order3_zero_store_width256",
+}
+_PDL_TABLE: dict[tuple[str, int, int, int, int, bool], bool] = {
+    # (arch, Hq, Hkv, num_rows, num_requests, is_prefill) -> the pdl build is taken
+    ("sm_90a", 8, 1, 32, 32, False): False,
+    ("sm_90a", 64, 8, 32, 32, False): False,
+    ("sm_100a", 8, 1, 32, 32, False): True,
+    ("sm_103a", 8, 1, 32, 32, False): True,
+    ("sm_100a", 8, 1, 128, 128, False): True,
+    ("sm_100a", 8, 1, 129, 129, False): True,
+    ("sm_100a", 8, 1, 160, 160, False): True,
+    ("sm_103a", 8, 1, 160, 160, False): True,
+    ("sm_103a", 8, 1, 186, 186, False): True,
+    ("sm_103a", 8, 1, 187, 187, False): True,
+    ("sm_100a", 8, 1, 223, 223, False): True,
+    ("sm_103a", 8, 1, 224, 224, False): True,
+    ("sm_100a", 8, 1, 160, 160, True): True,
+    ("sm_103a", 8, 1, 8192, 1, True): True,
+    ("sm_100a", 64, 8, 239, 239, False): True,
+    ("sm_103a", 64, 8, 240, 240, False): False,
+    ("sm_100a", 64, 8, 128, 8, True): True,
+    ("sm_103a", 64, 8, 516, 4, True): False,
+    ("sm_100a", 64, 8, 1024, 1, True): False,
+}
+
+
+def test_pdl_policy_table_is_well_formed():
+    policy = loader.PDL_POLICY
+    assert set(policy) == {"arches", "constants", "rule", "version"}
+    assert tuple(policy["arches"]) == ("sm_100a", "sm_103a")
+    assert loader.PDL_SUFFIX == "_pdl" and loader.KNOB_KEYS[-1] == "pdl"
+
+
+@pytest.mark.parametrize("key,expected", list(_PDL_TABLE.items()))
+def test_enable_pdl_takes_the_pdl_build_where_the_policy_admits_it(key, expected):
+    arch, hq, hkv, rows, reqs, prefill = key
+    problem = dict(
+        arch=arch,
+        num_rows=rows,
+        num_requests=reqs,
+        page_size=64,
+        num_sms=148,
+        is_prefill=prefill,
+        max_pages_per_request=33,
+        has_out_kv=False,
+        quant_policy=1,
+    )
+    plain = loader.stage_for(hq, hkv, **problem)
+    assert loader.stage_for(hq, hkv, enable_pdl=False, **problem) == plain
+    assert not plain.endswith(loader.PDL_SUFFIX)
+    chosen = loader.stage_for(hq, hkv, enable_pdl=True, **problem)
+    assert chosen == (plain + loader.PDL_SUFFIX if expected else plain)
+    assert chosen in loader.stages_for(arch)
+    assert loader.pdl_enabled(hq, hkv, **problem) is expected
+
+
+# (arch, num_sms, num_requests, max_pages_per_request, has_out_kv) of single-KV-head
+# decode -> the build a call that asks for PDL takes.
+_PDL_PICKS: dict[tuple[str, int, int, int, bool], str] = {
+    # B200 / GB200: the clear-first stage gives way to the page-prefetch stage.
+    ("sm_100a", 148, 32, 129, False): _ER2PP + "_pdl",
+    ("sm_100a", 152, 32, 33, True): _ER2PP + "_pdl",
+    # B300: so does the two-heads-per-CTA clearing stage.
+    ("sm_103a", 148, 32, 129, False): _ER2PP + "_pdl",
+    ("sm_103a", 148, 32, 16, False): _ER2PP + "_pdl",
+    # GB300: only where the prefetch serves the page row.
+    ("sm_103a", 152, 32, 33, False): _ER2PP + "_pdl",
+    ("sm_103a", 152, 32, 129, False): (
+        "fp8_e4m3_clear_heads_per_cta2_zero_store_width256_pdl"
+    ),
+    # Inside the decode window a stage without the page prefetch stays plain.
+    ("sm_100a", 148, 160, 129, False): "fp8_e4m3",
+    ("sm_103a", 148, 200, 129, False): "fp8_e4m3",
+}
+
+
+@pytest.mark.parametrize("key,expected", list(_PDL_PICKS.items()))
+def test_enable_pdl_picks_the_measured_build(key, expected):
+    arch, sms, reqs, pages, out_kv = key
+    problem = dict(
+        arch=arch,
+        num_rows=reqs,
+        num_requests=reqs,
+        page_size=64,
+        num_sms=sms,
+        is_prefill=False,
+        max_pages_per_request=pages,
+        has_out_kv=out_kv,
+        quant_policy=1,
+    )
+    assert loader.stage_for(8, 1, enable_pdl=True, **problem) == expected
+    assert loader.pdl_enabled(8, 1, **problem) is expected.endswith("_pdl")
+
+
+# (arch, num_sms, num_rows, num_requests, is_prefill) of 8/1 heads, 33-entry page
+# rows -> max_ctas_per_sm of the launch a call that asks for PDL takes.
+_CAP_TABLE: dict[tuple[str, int, int, int, bool], int] = {
+    ("sm_100a", 148, 128, 128, False): 0,
+    ("sm_100a", 148, 129, 129, False): 2,
+    ("sm_100a", 148, 160, 160, False): 3,
+    ("sm_100a", 152, 160, 160, False): 0,
+    ("sm_100a", 152, 177, 177, False): 3,
+    ("sm_103a", 148, 186, 186, False): 0,
+    ("sm_103a", 148, 187, 187, False): 3,
+    ("sm_103a", 152, 256, 256, False): 4,
+    ("sm_100a", 148, 128, 8, True): 0,
+    ("sm_100a", 148, 516, 4, True): 4,
+    ("sm_103a", 152, 1024, 1, True): 7,
+    ("sm_90a", 132, 256, 256, False): 0,
+}
+
+
+@pytest.mark.parametrize("key,expected", list(_CAP_TABLE.items()))
+def test_cta_cap_of_the_page_prefetch_pdl_builds(key, expected):
+    arch, sms, rows, reqs, prefill = key
+    problem = dict(
+        arch=arch,
+        num_rows=rows,
+        num_requests=reqs,
+        page_size=64,
+        num_sms=sms,
+        is_prefill=prefill,
+        max_pages_per_request=33,
+        has_out_kv=False,
+        quant_policy=1,
+    )
+    record = loader.MODULES[loader.stage_for(8, 1, enable_pdl=True, **problem)]
+    grid = loader.launch_grid(
+        record, num_rows=rows, num_requests=reqs, num_kv_heads=1, num_sms=sms
+    )
+    cap = loader.cta_cap(
+        record,
+        arch=arch,
+        num_sms=sms,
+        num_q_heads=8,
+        num_kv_heads=1,
+        num_rows=rows,
+        num_requests=reqs,
+        is_prefill=prefill,
+        grid=grid,
+    )
+    assert cap == expected
+    if cap:
+        assert record["stage"] in _CAPPED
+
+
+@pytest.mark.parametrize("arch", loader.ARCHES)
+def test_enable_pdl_only_selects_shipped_builds(arch):
+    shipped = set(loader.stages_for(arch))
+    for hq, hkv in loader.SUPPORTED_HEADS:
+        for reqs in (0, 1, 8, 16, 32, 128, 160, 200, 256, 512):
+            for rows in sorted({reqs, 1, 128, 239, 240, 4096, 8192}):
+                for prefill in (False, True):
+                    for pages, out_kv in ((33, False), (129, True)):
+                        for sms in (132, 148, 152):
+                            problem = dict(
+                                arch=arch,
+                                num_rows=rows,
+                                num_requests=reqs,
+                                page_size=64,
+                                num_sms=sms,
+                                is_prefill=prefill,
+                                max_pages_per_request=pages,
+                                has_out_kv=out_kv,
+                                quant_policy=1,
+                            )
+                            plain = loader.stage_for(hq, hkv, **problem)
+                            chosen = loader.stage_for(
+                                hq, hkv, enable_pdl=True, **problem
+                            )
+                            assert chosen in shipped, (arch, hq, hkv, rows, reqs)
+                            assert chosen in (plain, plain + loader.PDL_SUFFIX) or (
+                                plain in _CLEARING and chosen == _ER2PP + "_pdl"
+                            ), (arch, hq, hkv, rows, reqs, plain, chosen)
+                            if arch == "sm_90a":
+                                assert chosen == plain
 
 
 # ----------------------------------------------------------------------------------------------

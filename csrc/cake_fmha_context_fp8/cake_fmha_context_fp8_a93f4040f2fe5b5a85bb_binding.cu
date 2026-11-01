@@ -339,8 +339,8 @@ void Run(TensorView a_Q, TensorView a_K, TensorView a_V, TensorView a_O_ptr, Ten
       << KERNEL_NAME << ": requires (static_cast<int64_t>(static_cast<uint32_t>(num_q_heads)) == num_bh_units)";
   TVM_FFI_CHECK((a_heads_per_group >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (heads_per_group >= 1)";
-  TVM_FFI_CHECK((CMod(a_heads_per_group, 1LL) == 0LL), ValueError)
-      << KERNEL_NAME << ": requires (CMod(heads_per_group, 1) == 0)";
+  TVM_FFI_CHECK((0LL == 0LL), ValueError)
+      << KERNEL_NAME << ": requires (0 == 0)";
   TVM_FFI_CHECK((a_page_shift >= 4LL), ValueError)
       << KERNEL_NAME << ": requires (page_shift >= 4)";
   TVM_FFI_CHECK((a_page_shift <= 10LL), ValueError)
