@@ -334,6 +334,8 @@ def kda_det_workspace_bytes_kcp(
     backward: bool = True,
     save_transfer: Optional[bool] = None,
     C: int = 8192,
+    local_arena: Optional[str] = None,
+    lean_passes: Optional[int] = None,
 ) -> int:
     """Bytes of this rank's KCP workspace for ``H`` heads: the local arena (that of :func:`~flashinfer.cake_kda_det_train.kda_det_train_workspace_bytes`
     for a backward workspace; a forward-only one takes the KCP forward layout, 2432 B per internal token-head) plus
@@ -348,7 +350,10 @@ def kda_det_workspace_bytes_kcp(
     ``cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False, save_transfer=save_transfer)["lazy"]`` bytes more.
     Under ``exchange="ring"`` it never holds the c1 receive pool.  ``ctx`` may be a list of contexts: the bytes of
     one workspace that serves all of them (``WorkspaceDetKcp.reserve(ctxs, H)``): each pool at its largest need and
-    the largest local arena, not their sum."""
+    the largest local arena, not their sum.  ``local_arena`` / ``lean_passes`` are those of the workspace
+    (``WorkspaceDetKcp(local_arena="lean", lean_passes=...)``, opt-in: the backward's lean local arena, its tail in
+    ``lean_passes`` passes, two by default, with its small tail-count table, on the head counts it serves);
+    ``None`` keeps the arena above."""
     from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None:
@@ -360,6 +365,8 @@ def kda_det_workspace_bytes_kcp(
         backward=backward,
         save_transfer=save_transfer,
         C=C,
+        local_arena=local_arena,
+        lean_passes=lean_passes,
     )
 
 
