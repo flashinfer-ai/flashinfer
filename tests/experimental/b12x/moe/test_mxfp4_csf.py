@@ -700,7 +700,7 @@ def _pool_micro_plan(*, repacked):
         decode_config=SimpleNamespace(
             dynamic_route_mode=None, nvfp4_materialize_intermediate=False
         ),
-        weight_plan=SimpleNamespace(source_format="fp4_e8m0_k32"),
+        spec=SimpleNamespace(source_format="fp4_e8m0_k32"),
         w4a8_n64_repacked=repacked,
     )
 
