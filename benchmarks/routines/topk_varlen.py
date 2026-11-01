@@ -129,7 +129,8 @@ def testTopKVarlen(args):
     batch_size = args.batch_size
     max_seq_len = args.max_seq_len
     top_k = args.top_k
-    is_cuda_graph_compatible = False  # GVR LB uses dynamic counters; not graph-safe
+    # Honour the shared timing-mode flag instead of forcing eager execution.
+    use_cuda_graph = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
 
@@ -212,7 +213,7 @@ def testTopKVarlen(args):
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
             enable_cupti=args.use_cupti,
-            use_cuda_graph=is_cuda_graph_compatible,
+            use_cuda_graph=use_cuda_graph,
             input_args=(cur_backend, logits),
         )
 
