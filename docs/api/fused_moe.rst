@@ -845,10 +845,12 @@ accepts ``Mxfp4CsfWeights`` with compressed E8M0 scale planes. For W4A8,
 Dynamic plans above the inline token limit expand scales into reusable scratch
 before each invocation; the resident compressed weights remain unchanged.
 
-Weights whose intermediate size is 64 modulo 128 always use N64 packing. On
-SM121, BF16 weights with a 256-aligned hidden size and a 128-aligned
-intermediate size also use N64 packing. On other GPUs, these full N128-tile
-weights keep the native N128 layout and expand scales before each invocation.
+Weights whose intermediate size is 64 modulo 128 always use N64 packing. With
+``B12X_W4A8_CSF_INLINE`` enabled (the default), SiLU BF16 weights with a
+256-aligned hidden size and a 128-aligned intermediate size also use N64 packing
+on SM121. On other GPUs, and when ``B12X_W4A8_CSF_INLINE=0``, these full
+N128-tile weights keep the native N128 layout and expand scales before each
+invocation.
 
 The default limit is 1,536 planned tokens. On SM121, full N128-tile weights
 repacked for N64 execution can use inline decoding through 2,048 tokens when the

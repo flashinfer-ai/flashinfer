@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 import torch
 from b12x.moe import fused_moe as moe
-from b12x.preparation import PreparationSession, PreparedCall
+from b12x.preparation import PreparationSession, PreparedCall, require_prepared
 from ..conftest import require_b12x
 from ..quantization.test_mxfp4_csf import fixture
 
@@ -773,7 +773,7 @@ def test_pool_grows_reused_micro_scratch_for_compact_plans(enough_scratch, monke
 def test_direct_binding_rejects_compact_plans_without_prepared_launchers(
     monkeypatch,
 ):
-    """Only fused_moe.plan() builds the launchers that compact micro plans need."""
+    """Only fused_moe.plan_execution() builds the launchers that compact micro plans need."""
     from b12x.moe.fused_moe import _impl
 
     device = require_b12x()
@@ -782,7 +782,7 @@ def test_direct_binding_rejects_compact_plans_without_prepared_launchers(
     x = torch.randn(tokens, 1024, dtype=torch.bfloat16, device=device)
     ids = torch.randint(0, 8, (tokens, topk), dtype=torch.int32, device=device)
     weights = torch.full((tokens, topk), 0.5, device=device)
-    with pytest.raises(ValueError, match="fused_moe.plan"):
+    with pytest.raises(ValueError, match="plan_execution"):
         _impl.build_tp_moe_fp4_binding(
             scratch=_impl.allocate_tp_moe_workspace_pool(),
             a=x,
@@ -796,6 +796,66 @@ def test_direct_binding_rejects_compact_plans_without_prepared_launchers(
                 backend="micro", route_planner="internal", max_active_clusters=None
             ),
         )
+
+
+def test_scratch_plan_binding_rejects_compact_plans_without_prepared_launchers(
+    monkeypatch,
+):
+    """A prepared compact plan's scratch plan cannot bind without its launchers."""
+    device = require_b12x()
+    arms, _ = _prepare_arms(1024, 256, "w31", monkeypatch)
+    tokens, topk = 4, 2
+    plan = moe.plan_execution(
+        experts=arms[2],
+        capacity=moe.ExecutionCapacity(max_tokens=tokens, top_k=topk),
+        invocation={"fast_math": False},
+        routing=moe.RoutingSpec(deterministic_output=True),
+    )
+    x = torch.randn(tokens, 1024, dtype=torch.bfloat16, device=device)
+    ids = torch.randint(0, 8, (tokens, topk), dtype=torch.int32, device=device)
+    weights = torch.full((tokens, topk), 0.5, device=device)
+
+    def prepare(state):
+        buffers = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in state.scratch.scratch_specs()
+        )
+        output = torch.empty_like(x)
+        binding = state.bind(
+            a=x,
+            topk_ids=ids,
+            topk_weights=weights,
+            output=output,
+            scratch=buffers,
+            input_scales_static=True,
+        )
+        return PreparedCall(
+            run=lambda: state.run(binding), output=output, owners=(buffers, binding)
+        )
+
+    with PreparationSession(
+        device=device, autotune=False, compile_workers=0
+    ) as session:
+        session.prepare(
+            (plan.request(name="csf-compact-scratch", prepare_call=prepare),)
+        )
+        state = require_prepared(plan, "moe.decode")
+        assert state.compact_launches is not None
+        buffers = tuple(
+            torch.empty(s.shape, dtype=s.dtype, device=device)
+            for s in state.scratch.scratch_specs()
+        )
+        with pytest.raises(ValueError, match="plan_execution"):
+            state.scratch.bind(
+                scratch=buffers,
+                a=x,
+                experts=arms[2]._impl,
+                topk_weights=weights,
+                topk_ids=ids,
+                output=torch.empty_like(x),
+                input_scales_static=True,
+                fast_math=False,
+            )
 
 
 @pytest.mark.parametrize(

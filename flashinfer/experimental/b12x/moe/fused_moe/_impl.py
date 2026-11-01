@@ -962,6 +962,14 @@ class TPMoEScratchCaps:
         return self.weight_plan.w4a16_scale_format
 
 
+_COMPACT_LAUNCHERS_REQUIRED = (
+    "compact W4A8 micro execution with N64-packed weights requires the "
+    "prepared launchers from fused_moe.plan_execution(); pass that plan to "
+    "fused_moe.bind() and fused_moe.run(). Sparse bindings, direct bindings "
+    "and fused_moe.plan() scratch plans do not carry these launchers."
+)
+
+
 @dataclass(frozen=True)
 class TPMoEScratchPlan:
     caps: TPMoEScratchCaps
@@ -1009,6 +1017,7 @@ class TPMoEScratchPlan:
         output_expert_map: torch.Tensor | None = None,
         scales_expanded: bool = False,
         _w4a16_launches: object | None = None,
+        _compact_launches: object | None = None,
     ) -> "TPMoEFP4Binding":
         """Bind live tensors to this scratch plan.
 
@@ -1018,6 +1027,13 @@ class TPMoEScratchPlan:
         """
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
+        if (
+            self.launch_plan.implementation == "micro"
+            and self.launch_plan.quant_mode == "w4a8_mx"
+            and self.launch_plan.w4a8_n64_repacked
+            and _compact_launches is None
+        ):
+            raise ValueError(_COMPACT_LAUNCHERS_REQUIRED)
         weight_plan = experts.plan
         if (
             weight_plan.w4a16_compressed_scales
@@ -1174,6 +1190,7 @@ class TPMoEScratchPlan:
             binding,
             scales_expanded=bool(scales_expanded),
             w4a8_csf_inline=self.caps.w4a8_csf_inline,
+            compact_launches=_compact_launches,
         )
 
 
@@ -8116,6 +8133,11 @@ def _resolve_workspace(
         raise TypeError(
             "workspace must be a TPMoEWorkspace, TPW4A16Workspace, or TPMoEWorkspacePool"
         )
+    # Only W4A8-MX compact micro scratch depends on the source format here;
+    # other modes keep the pool's previous default sizing.
+    pool_source_format = (
+        plan.spec.source_format if plan.quant_mode == "w4a8_mx" else "modelopt_nvfp4"
+    )
 
     key = _workspace_pool_key(
         plan.implementation,
@@ -8174,7 +8196,7 @@ def _resolve_workspace(
             dynamic_tile_n=plan.execution.tile_n,
             dynamic_route_mode=plan.decode_config.dynamic_route_mode,
             nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
-            source_format=plan.spec.source_format,
+            source_format=pool_source_format,
             w4a8_n64_repacked=plan.w4a8_n64_repacked,
             pool=workspace,
             storage_key=key,
@@ -8257,7 +8279,7 @@ def _resolve_workspace(
             dynamic_tile_n=plan.execution.tile_n,
             dynamic_route_mode=plan.decode_config.dynamic_route_mode,
             nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
-            source_format=plan.spec.source_format,
+            source_format=pool_source_format,
             w4a8_n64_repacked=plan.w4a8_n64_repacked,
             pool=workspace,
             storage_key=key,
@@ -9969,12 +9991,10 @@ def build_tp_moe_fp4_binding(
         and plan.quant_mode == "w4a8_mx"
         and getattr(prepared_payload, "n64_repack", False)
     ):
-        # Compact launchers are built only by fused_moe.plan(). Reject here
-        # instead of failing later in b12x_moe_fp4.
-        raise ValueError(
-            "compact W4A8 micro execution with N64-packed weights requires "
-            "prepared launchers; bind the experts through fused_moe.plan()"
-        )
+        # Only fused_moe.plan_execution() with bind()/run() carries compact
+        # launchers. Sparse and direct bindings reach this point without
+        # them; reject here instead of failing later in b12x_moe_fp4.
+        raise ValueError(_COMPACT_LAUNCHERS_REQUIRED)
     if isinstance(workspace, TPMoEWorkspacePool):
         weight_layout = "packed"
         scale_format = "e4m3_k16"

@@ -1099,9 +1099,9 @@ class _FusedMoeState:
         )
         if self.w4a16_launches is not None:
             kwargs["_w4a16_launches"] = self.w4a16_launches
-        return replace(
-            self.scratch.bind(**kwargs), compact_launches=self.compact_launches
-        )
+        if self.compact_launches is not None:
+            kwargs["_compact_launches"] = self.compact_launches
+        return self.scratch.bind(**kwargs)
 
     def run(self, binding):
         return binding.run()
