@@ -975,6 +975,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "instantiations": {},
         "arches": [
             "sm_100a",
+            "sm_103a",
         ],
     },
     "cake_selective_state_update_6947b451e086ed2a3b90": {
@@ -3838,6 +3839,7 @@ _DIM128_STP_RING_PROGRAM = "mtp_short_ring_heads64_groups8_t1_stp"
 # single-token call of that shape with ``z`` runs it.
 _DIM128_STP_RING_Z_BATCHES: dict[tuple[str, int], tuple[int, ...]] = {
     ("sm_100a", 148): (64,),
+    ("sm_103a", 152): (64,),
 }
 _DIM128_STP_RING_Z_PROGRAM = "mtp_short_ring_heads64_groups8_t1_stp_z"
 
