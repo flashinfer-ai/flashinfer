@@ -989,6 +989,142 @@ def test_trtllm_gen_sparse_mla_dsv4(p: TestParam) -> None:
     _assert_close(out_ans, out_ref, p.dtype)
 
 
+@pytest.mark.parametrize("enable_pdl", (False, True))
+@pytest.mark.parametrize(
+    "dtype", (torch.bfloat16, torch.float8_e4m3fn), ids=("bf16", "fp8")
+)
+# Token counts at which the decode kernel splits the KV and runs the separate reduction kernel.
+# max_q_len > 1 groups the tokens into requests of max_q_len, max_q_len - 1, ..., 1 tokens.
+@pytest.mark.parametrize(
+    ("num_heads", "num_tokens", "max_q_len"),
+    (
+        (64, 8, 1),
+        (64, 48, 1),
+        (64, 72, 1),
+        (128, 4, 1),
+        (128, 16, 1),
+        (64, 24, 4),
+        (128, 10, 4),
+    ),
+)
+@torch.inference_mode()
+def test_trtllm_gen_sparse_mla_dsv4_split_kv_attention_sinks(
+    num_heads: int,
+    num_tokens: int,
+    max_q_len: int,
+    dtype: torch.dtype,
+    enable_pdl: bool,
+) -> None:
+    """Split-KV decode where the attention sinks hold a large share of the softmax mass.
+
+    In the tests above the sinks are near 0, so their softmax weight (~0.3%) is far below the
+    tolerances. Here the sink weights span ~1% to ~95% and differ a lot between neighboring
+    heads, and the scores vary enough that the per-split maxima differ. A sink term computed for
+    the wrong row or head, with the wrong max, or dropped by the split-KV reduction fails the
+    check. Each token reads a different number of entries, so rows reduce different split counts.
+    """
+    _skip_unless_sm100_or_sm103_or_sm107()
+    torch.manual_seed(TEST_SEED_BASE + 7 * num_tokens + num_heads + 1000 * max_q_len)
+    device = torch.device("cuda")
+    compressed_topk = _c4_topk(num_heads)
+    num_swa_tokens, num_compressed_tokens = 4096, 16384
+
+    def make_cache(num_cache_tokens: int, page_size: int) -> torch.Tensor:
+        return torch.randn(
+            (num_cache_tokens // page_size, 1, page_size, DSV4_HEAD_DIM), device=device
+        ).to(dtype)
+
+    swa_kv_cache = make_cache(num_swa_tokens, SWA_PAGE_SIZE)
+    compressed_kv_cache = make_cache(num_compressed_tokens, C4_PAGE_SIZE)
+    query = torch.randn((num_tokens, 1, num_heads, DSV4_HEAD_DIM), device=device).to(
+        dtype
+    )
+    swa_indices = torch.randint(
+        0, num_swa_tokens, (num_tokens, DSV4_SWA_TOPK), device=device
+    )
+    compressed_indices = torch.randint(
+        0, num_compressed_tokens, (num_tokens, compressed_topk), device=device
+    )
+    num_compressed = torch.randint(1, compressed_topk + 1, (num_tokens,), device=device)
+    is_padding = torch.arange(compressed_topk, device=device) >= num_compressed[:, None]
+    compressed_indices[is_padding] = -1
+    sparse_indices = torch.cat((swa_indices, compressed_indices), dim=1).int()
+    sparse_topk_lens = (DSV4_SWA_TOPK + num_compressed).int()
+    varlen_kwargs = {}
+    if max_q_len == 1:
+        seq_lens = torch.full(
+            (num_tokens,), num_swa_tokens, dtype=torch.int32, device=device
+        )
+    else:
+        q_lens: list[int] = []
+        while sum(q_lens) < num_tokens:
+            q_len = max_q_len - len(q_lens) % max_q_len
+            q_lens.append(min(q_len, num_tokens - sum(q_lens)))
+        seq_lens = torch.full(
+            (len(q_lens),), num_swa_tokens, dtype=torch.int32, device=device
+        )
+        varlen_kwargs = dict(
+            cum_seq_lens_q=_make_cum_seq_lens(
+                torch.tensor(q_lens, dtype=torch.int32, device=device)
+            ),
+            max_q_len=max_q_len,
+        )
+        query = query.view(num_tokens, num_heads, DSV4_HEAD_DIM)
+    # The scores have a standard deviation of ~1.5, so a row's log-sum-exp is ~6-8.
+    sm_scale = 1.5 / math.sqrt(DSV4_HEAD_DIM)
+    sinks = (6.8 + torch.linspace(-4.0, 3.0, num_heads, device=device))[
+        torch.randperm(num_heads, device=device)
+    ]
+
+    out = trtllm_batch_decode_sparse_mla_dsv4(
+        query=query,
+        swa_kv_cache=swa_kv_cache,
+        workspace_buffer=torch.zeros(WORKSPACE_SIZE, dtype=torch.uint8, device=device),
+        sparse_indices=sparse_indices,
+        compressed_kv_cache=compressed_kv_cache,
+        sparse_topk_lens=sparse_topk_lens,
+        seq_lens=seq_lens,
+        bmm1_scale=(
+            torch.tensor([sm_scale], device=device)
+            if dtype == torch.float8_e4m3fn
+            else sm_scale
+        ),
+        sinks=sinks,
+        enable_pdl=enable_pdl,
+        backend="trtllm-gen",
+        **varlen_kwargs,
+    )
+
+    kv = torch.cat(
+        (
+            swa_kv_cache.view(-1, DSV4_HEAD_DIM)[swa_indices],
+            compressed_kv_cache.view(-1, DSV4_HEAD_DIM)[
+                compressed_indices.clamp_min(0)
+            ],
+        ),
+        dim=1,
+    ).double()
+    logits = torch.einsum(
+        "thd,tkd->thk", query.view(num_tokens, num_heads, -1).double(), kv
+    )
+    logits *= sm_scale
+    is_invalid = torch.arange(kv.size(1), device=device) >= sparse_topk_lens[:, None]
+    logits.masked_fill_(is_invalid[:, None, :], float("-inf"))
+    logits = torch.cat(
+        (logits, sinks.double().view(1, num_heads, 1).expand(num_tokens, -1, 1)),
+        dim=-1,
+    )
+    probs = torch.softmax(logits, dim=-1)[..., :-1]
+    ref = torch.einsum("thk,tkd->thd", probs, kv)
+
+    out = out.view(num_tokens, num_heads, DSV4_HEAD_DIM).double()
+    assert torch.isfinite(out).all()
+    # The FP8 kernels also quantize the softmax probabilities to E4M3.
+    tolerance = 0.06 if dtype == torch.float8_e4m3fn else 0.02
+    rel_l2 = ((out - ref).norm() / ref.norm()).item()
+    assert rel_l2 <= tolerance, f"relative L2 error {rel_l2:.4f} > {tolerance}"
+
+
 @pytest.mark.parametrize("kv_layout", ("HND", "NHD"))
 @pytest.mark.parametrize(
     "dtype", (torch.bfloat16, torch.float8_e4m3fn), ids=("bf16", "fp8")
