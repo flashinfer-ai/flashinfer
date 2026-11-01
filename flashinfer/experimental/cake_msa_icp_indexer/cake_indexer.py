@@ -342,15 +342,14 @@ class MSAIcpIndexerPlan:
         chain, in the facade's own pool; ``scores`` is then unused.
 
         With ``enable_pdl`` (the default) the default chain's score plane on
-        compute capability 10.0 and 10.3 at 64 or 128 local K rows per page
-        and on 10.7 at 32 or 64 reads ``seq_lens`` and ``block_table`` and
-        starts loading the history ``index_k`` pages (those ending at or
-        before ``seq_len - decode_query_len``) before it waits on the
-        preceding kernel.  The kernel launched just before ``decode`` must
-        not write them and must either be launched without programmatic
-        dependent launch or wait on its own predecessor before it triggers;
-        ``enable_pdl=False`` removes the requirement.  The fused chain reads
-        nothing before its wait.
+        compute capability 10.0 and 10.3 at 64 or 128 local K rows per page,
+        and both chains' scorers on 10.7 at 32 or 64, read ``seq_lens`` and
+        ``block_table`` and start loading the history ``index_k`` pages
+        (those ending at or before ``seq_len - decode_query_len``) before
+        they wait on the preceding kernel.  The kernel launched just before
+        ``decode`` must not write them and must either be launched without
+        programmatic dependent launch or wait on its own predecessor before
+        it triggers; ``enable_pdl=False`` removes the requirement.
 
         ``tagged`` selects the generation-tagged rows; it needs at least two
         sparse layers between uses of one slot set (``num_sparse_layers >= 2``
