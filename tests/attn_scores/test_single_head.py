@@ -361,6 +361,8 @@ def test_top_k_from_candidates_rejects_bad_shapes() -> None:
         (candidates[..., :1], ranges, top_keys),
         (candidates, zeros(4, 2), top_keys),
         (candidates, ranges, zeros(5, 8)),
+        (candidates, ranges, zeros(4)),
+        (candidates, ranges, zeros(4, 8, 1)),
     ):
         with pytest.raises(ValueError, match="must be \\[rows, slots, 2\\]"):
             top_k_from_candidates(wrong[0], wrong[1], top_keys=wrong[2])

@@ -380,6 +380,7 @@ def top_k_from_candidates(
     if (
         candidates.shape[2:] != (2,)
         or ranges.shape != (2, rows)
+        or top_keys.dim() != 2
         or top_keys.shape[0] != rows
     ):
         raise ValueError(
