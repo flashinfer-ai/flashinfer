@@ -18,6 +18,7 @@ from collections.abc import Callable
 import functools
 
 from .._compile_cache import build_and_load_attention_kernel
+from .._scales import fake_scale
 
 import torch
 
@@ -135,7 +136,8 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         k_summary_scale: cute.Tensor | None,
         v_scale: cute.Tensor | None,
         v_mean: cute.Tensor | None,
-        sm_scale: cutlass.Float32,
+        sm_scale: cutlass.Float32 | cute.Tensor,
+        output_scale: cutlass.Float32 | cute.Tensor,
         stream: cuda_drv.CUstream,
         static_config: cutlass.Constexpr[FmhaDecodeConfig],
         static_batch_size: cutlass.Constexpr[int],
@@ -210,7 +212,12 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 row_route_offsets.iterator,
                 route_workspace.iterator,
                 route_workspace.iterator + Int32(route_metadata_base),
-                sm_scale,
+                sm_scale.iterator
+                if cutlass.const_expr(isinstance(sm_scale, cute.Tensor))
+                else sm_scale,
+                output_scale.iterator
+                if cutlass.const_expr(isinstance(output_scale, cute.Tensor))
+                else output_scale,
                 stream,
                 static_config,
                 static_seq_len_kv,
@@ -240,8 +247,12 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
                 null_f32,  # partial_stats
                 null_i32,  # split_kv_counter
                 null_f32,  # attention_sinks
-                sm_scale,
-                Float32(1.0),  # output_scale
+                sm_scale.iterator
+                if cutlass.const_expr(isinstance(sm_scale, cute.Tensor))
+                else sm_scale,
+                output_scale.iterator
+                if cutlass.const_expr(isinstance(output_scale, cute.Tensor))
+                else output_scale,
                 Int32(
                     static_seq_len_kv * static_num_kv_heads * static_head_dim
                 ),  # kv_b_stride
@@ -283,7 +294,8 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         block_table_row_stride: cutlass.Int64,
         k_page_stride: cutlass.Int64,
         v_page_stride: cutlass.Int64,
-        sm_scale: cutlass.Float32,
+        sm_scale: cutlass.Float32 | cute.Tensor,
+        output_scale: cutlass.Float32 | cute.Tensor,
         stream: cuda_drv.CUstream,
         static_config: cutlass.Constexpr[FmhaDecodeConfig],
         static_batch_size: cutlass.Constexpr[int],
@@ -324,7 +336,12 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             row_route_offsets.iterator,
             row_route_counts,
             route_metadata,
-            sm_scale,
+            sm_scale.iterator
+            if cutlass.const_expr(isinstance(sm_scale, cute.Tensor))
+            else sm_scale,
+            output_scale.iterator
+            if cutlass.const_expr(isinstance(output_scale, cute.Tensor))
+            else output_scale,
             stream,
             static_config,
             static_seq_len_kv,
@@ -452,7 +469,8 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             sage_scales_fake,
             Int32(0),
             *sage_fakes,
-            Float32(1.0),
+            fake_scale(key.scale_types[0]),
+            fake_scale(key.scale_types[1]),
         )
     else:
         page_size = key.page_size
@@ -531,7 +549,8 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             Int64(1),
             Int64(1),
             Int64(1),
-            Float32(1.0),
+            fake_scale(key.scale_types[0]),
+            fake_scale(key.scale_types[1]),
         )
 
     def compile_kernel():

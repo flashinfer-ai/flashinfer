@@ -2123,8 +2123,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: object,
-        softmax_scale: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale: cutlass.Float32 | cute.Tensor,
+        output_scale: cutlass.Float32 | cute.Tensor,
         stream: object,
         output_quant_args=None,
         max_q_len: cutlass.Int32 = 0,
@@ -2406,7 +2406,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 extra_format=cfg.extra_kv_cache_format,
             )
 
-        scale_softmax_log2 = softmax_scale * LOG2_E
         use_gmem_reduction = cutlass.const_expr(
             cfg.use_multi_ctas_kv == 1 and cfg.use_cluster_reduction != 1
         )
@@ -2488,7 +2487,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             acc_lse,
             cache_seqs,
             cu_seqlens_q,
-            scale_softmax_log2,
+            softmax_scale,
             output_scale,
             tile_sched_params,
             block_split_kvs,
@@ -2618,8 +2617,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         acc_lse: cute.Tensor,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
-        scale_softmax_log2: cutlass.Float32,
-        output_scale: cutlass.Float32,
+        softmax_scale: cutlass.Float32 | cute.Tensor,
+        output_scale: cutlass.Float32 | cute.Tensor,
         tile_sched_params: object,
         sparse_inputs: object,
         output_quant_args=None,
@@ -2637,10 +2636,18 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             # Match the PDL launch before reading live metadata or sparse scales.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
+        if cutlass.const_expr(isinstance(softmax_scale, cute.Tensor)):
+            softmax_scale = softmax_scale[0]
+        if cutlass.const_expr(isinstance(output_scale, cute.Tensor)):
+            output_scale = output_scale[0]
+        scale_softmax_log2 = softmax_scale * LOG2_E
+
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
             si, ci, sl, cl, sinks, ks = sparse_inputs
+            if cutlass.const_expr(isinstance(ks, cute.Tensor)):
+                ks = ks[0]
             request = None
             if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])

@@ -500,6 +500,96 @@ def _prims_ts_sparse_pattern_trace(
     )
 
 
+def _prims_ts_trace_scale_values(kwargs, names, *, bound):
+    """Resolve scale bindings without inspecting device-resident values."""
+    state = getattr(kwargs.get("self"), "_plan_state", None) if bound else None
+    values = {}
+    for name in names:
+        planned = getattr(state, name, None)
+        value = kwargs.get(name)
+        if value is None:
+            value = planned
+        elif state is not None and isinstance(value, torch.Tensor) != isinstance(
+            planned, torch.Tensor
+        ):
+            raise ValueError(f"{name} must retain its planned float or tensor type")
+        values[name] = value
+    return values
+
+
+class _PrimsTSScaleTraceTemplate(TraceTemplate):
+    """Describe independent scale operands and inherit bound plan defaults."""
+
+    def __init__(self, base, names, scale_types, *, bound):
+        self._base = base
+        self._scale_names = names
+        self._bound = bound
+        self._scale_suffix = "_scales_" + "".join(
+            "t" if device else "f" for device in scale_types
+        )
+        axes, inputs = dict(base.axes), dict(base.inputs)
+        axes["global_scale_size"] = Const(
+            abbrev="", value=1, description="One global FP32 attention scale."
+        )
+        for name, device in zip(names, scale_types, strict=True):
+            if device:
+                inputs[name] = Tensor(
+                    ["global_scale_size"],
+                    dtype="float32",
+                    description=(
+                        "Contiguous CUDA FP32 global scale, read on device. "
+                        + (
+                            "Omitting the run argument inherits plan()'s tensor."
+                            if bound
+                            else ""
+                        )
+                    ).rstrip(),
+                )
+        super().__init__(
+            op_type=base.op_type,
+            name_prefix=base.name_prefix + self._scale_suffix,
+            axes=axes,
+            inputs=inputs,
+            outputs=dict(base.outputs),
+            constraints=list(base.constraints),
+            tags=list(base.tags),
+            description=base.description,
+            reference=base.reference,
+            check=base.check,
+            init=base.init,
+        )
+
+    def definition_name(self, axis_values):
+        # Preserve storage-specific names such as packed NVFP4 decode.
+        return self._base.definition_name(axis_values) + self._scale_suffix
+
+    def build_fi_trace_fn(self, fi_api):
+        build = super().build_fi_trace_fn(fi_api)
+
+        def fi_trace(save_dir=None, name=None, **kwargs):
+            values = _prims_ts_trace_scale_values(
+                kwargs, self._scale_names, bound=self._bound
+            )
+            return build(save_dir=save_dir, name=name, **{**kwargs, **values})
+
+        return fi_trace
+
+
+@lru_cache(maxsize=None)
+def _prims_ts_scale_trace_variant(base, names, scale_types, *, bound):
+    if not any(scale_types):
+        return base
+    return _PrimsTSScaleTraceTemplate(base, names, scale_types, bound=bound)
+
+
+def _prims_ts_scale_trace(
+    base, kwargs, *, names=("softmax_scale", "output_scale"), bound=False
+):
+    values = _prims_ts_trace_scale_values(kwargs, names, bound=bound)
+    scale_types = tuple(isinstance(values[name], torch.Tensor) for name in names)
+    return _prims_ts_scale_trace_variant(base, names, scale_types, bound=bound)
+
+
 def _make_prims_ts_block_sparse_trace(
     *,
     sparse_format: str,
@@ -556,6 +646,7 @@ def _make_prims_ts_block_sparse_trace(
         "kv_block_size": Scalar("int32", optional=wrapper),
         "mask_type": Scalar("string", optional=True),
         "sm_scale": Scalar("float32", optional=True),
+        "output_scale": Scalar("float32", optional=True),
     }
     if wrapper:
         inputs["validate"] = Scalar(
@@ -657,14 +748,17 @@ def prims_ts_block_sparse_trace_dispatch(**kwargs):
     """Select a contiguous one-shot schema from its explicit mode arguments."""
 
     if not kwargs.get("use_block_sparse", True):
-        return _PRIMS_TS_DENSE_TRACE
+        return _prims_ts_scale_trace(
+            _PRIMS_TS_DENSE_TRACE, kwargs, names=("sm_scale", "output_scale")
+        )
     sparse_format = kwargs.get("sparse_format", "bsr")
     use_proxy_routes = kwargs.get("use_proxy_routes", False)
-    return _prims_ts_sparse_pattern_trace(
+    base = _prims_ts_sparse_pattern_trace(
         _PRIMS_TS_BLOCK_SPARSE_TRACES[(sparse_format, use_proxy_routes)],
         kwargs.get("share_pattern_across_kv_heads", False),
         bound=False,
     )
+    return _prims_ts_scale_trace(base, kwargs, names=("sm_scale", "output_scale"))
 
 
 prims_ts_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
@@ -763,6 +857,7 @@ def _make_prims_ts_paged_block_sparse_trace(
             "kv_block_size": Scalar("int32", optional=wrapper),
             "mask_type": Scalar("string", optional=True),
             "sm_scale": Scalar("float32", optional=True),
+            "output_scale": Scalar("float32", optional=True),
         }
     )
     if wrapper:
@@ -851,11 +946,12 @@ def prims_ts_paged_block_sparse_trace_dispatch(**kwargs):
     """Select the tuple or combined paged-KV block-sparse schema."""
 
     combined = isinstance(kwargs.get("paged_kv_cache"), torch.Tensor)
-    return _prims_ts_sparse_pattern_trace(
+    base = _prims_ts_sparse_pattern_trace(
         _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES[combined],
         kwargs.get("share_pattern_across_kv_heads", False),
         bound=False,
     )
+    return _prims_ts_scale_trace(base, kwargs, names=("sm_scale", "output_scale"))
 
 
 prims_ts_paged_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
@@ -901,15 +997,23 @@ def prims_ts_block_sparse_wrapper_trace_dispatch(**kwargs):
 
     state = _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparseTSWrapper")
     if not getattr(state, "use_block_sparse", True):
-        return _PRIMS_TS_DENSE_WRAPPER_TRACE
+        return _prims_ts_scale_trace(
+            _PRIMS_TS_DENSE_WRAPPER_TRACE,
+            kwargs,
+            names=("sm_scale", "output_scale"),
+            bound=True,
+        )
     route_mode = (
         state.sparse_format,  # type: ignore[attr-defined]
         state.use_proxy_routes,  # type: ignore[attr-defined]
     )
-    return _prims_ts_sparse_pattern_trace(
+    base = _prims_ts_sparse_pattern_trace(
         _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES[route_mode],
         getattr(state, "share_pattern_across_kv_heads", False),
         bound=True,
+    )
+    return _prims_ts_scale_trace(
+        base, kwargs, names=("sm_scale", "output_scale"), bound=True
     )
 
 
@@ -933,10 +1037,13 @@ def prims_ts_paged_block_sparse_wrapper_trace_dispatch(**kwargs):
         kwargs, "BlockSparsePagedTSWrapper"
     )
     combined = isinstance(kwargs.get("paged_kv_cache"), torch.Tensor)
-    return _prims_ts_sparse_pattern_trace(
+    base = _prims_ts_sparse_pattern_trace(
         _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES[combined],
         getattr(state, "share_pattern_across_kv_heads", False),
         bound=True,
+    )
+    return _prims_ts_scale_trace(
+        base, kwargs, names=("sm_scale", "output_scale"), bound=True
     )
 
 
@@ -1286,12 +1393,13 @@ def attention_ts_decode_trace_dispatch(**kwargs):
     combined, out_dtype, q_mode = _fmha_trace_variant(
         kwargs, query_param="q", cache_param="paged_kv_cache"
     )
-    return _make_attention_ts_decode_trace(
+    base = _make_attention_ts_decode_trace(
         combined=combined,
         out_dtype=out_dtype,
         q_mode=q_mode,
         encoded_page_size=_fmha_encoded_page_size(kwargs, cache_param="paged_kv_cache"),
     )
+    return _prims_ts_scale_trace(base, kwargs)
 
 
 attention_ts_decode_trace_dispatch.templates = list(  # type: ignore[attr-defined]
@@ -1637,7 +1745,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     encoded_page_size = (
         int(state.page_size) if state.page_size != storage_page_size else 0
     )
-    return _get_prims_ts_decode_wrapper_trace(
+    base = _get_prims_ts_decode_wrapper_trace(
         combined=combined,
         out_dtype=out_dtype,
         q_mode=q_mode,
@@ -1652,6 +1760,7 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         # Preserve caller permission, not whether this shape actually splits.
         split_kv=bool(dict(getattr(state, "policy", ())).get("split_kv_allowed", True)),
     )
+    return _prims_ts_scale_trace(base, kwargs, bound=True)
 
 
 prims_ts_decode_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
@@ -1757,7 +1866,7 @@ def prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs):
         isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
         kwargs.get("qo_indptr") is not None,
     )
-    return _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES[key]
+    return _prims_ts_scale_trace(_PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES[key], kwargs)
 
 
 prims_ts_decode_mla_one_shot_trace_dispatch.templates = list(  # type: ignore[attr-defined]
@@ -1995,7 +2104,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         names=required_metadata,
     )
     kv_cache = kwargs.get("kv_cache")
-    return _get_prims_ts_decode_mla_wrapper_trace(
+    base = _get_prims_ts_decode_mla_wrapper_trace(
         rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
         packed_query=packed_query,
         mask_type=str(state.mask_type),
@@ -2008,6 +2117,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
             getattr(state, "softmax_rescale_threshold_log2", 0.0)
         ),
     )
+    return _prims_ts_scale_trace(base, kwargs, bound=True)
 
 
 prims_ts_decode_mla_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
