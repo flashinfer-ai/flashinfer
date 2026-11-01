@@ -51,6 +51,7 @@ import pathlib
 import random
 import re
 import threading
+import types
 
 import pytest
 import torch
@@ -4713,6 +4714,250 @@ def test_launch_recorder_lists_the_programs_of_the_call(monkeypatch) -> None:
     assert {"fwd_prep", "fwd_o"} <= set(fwd_seq) and {"bwd_prep", "bwd_dqkg"} <= set(
         bwd_seq
     )
+
+
+# --------------------------------------------------------------------------- host launch path: launch cache, stream scope
+# Host data only (record names, grids, launch order, context entries): exact checks.
+
+
+def _harvest_launches(kcp, ctx, ops, **knobs) -> list[tuple[str, dict]]:
+    """``(program, args)`` of every launch of one forward + backward on the fake backend (``args`` without the call)."""
+    seen: list[tuple[str, dict]] = []
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            seen.append((name, {k: v for k, v in args.items() if k != "_call"}))
+            super().run(name, args)
+
+    previous = kcp.set_backend("fake", Recording())
+    try:
+        args = [ops[n] for n in LEAVES]
+        _out, saved = kcp.chunk_gdn_fwd_kcp(
+            *args, ctx, backend="fake", deterministic=False, **knobs
+        )
+        kcp.chunk_gdn_bwd_kcp(
+            *args,
+            ctx,
+            ops["dout"],
+            saved=saved,
+            backend="fake",
+            deterministic=False,
+            **knobs,
+        )
+    finally:
+        kcp.set_backend("fake", previous)
+    return seen
+
+
+def _same_launch(got: tuple, want: tuple) -> bool:
+    """Two ``(record, values, grid, is_test)`` resolutions name the same record, grid and flag and the same values
+    (the same tensor objects, equal scalars)."""
+    (r1, v1, g1, t1), (r2, v2, g2, t2) = got, want
+    if (r1, tuple(g1), t1) != (r2, tuple(g2), t2) or v1.keys() != v2.keys():
+        return False
+    return all(
+        v1[k] is v2[k] if isinstance(v2[k], torch.Tensor) else v1[k] == v2[k]
+        for k in v2
+    )
+
+
+LAUNCH_CACHE_KNOBS = (
+    {},
+    {"segments": 2},
+    {
+        "segments": 2,
+        "test_knobs": {"cols_rule": "by_chains", "fwdh_vh": 64, "dhu_vh": 128},
+    },
+    {"segments": 2, "test_knobs": {"schedule": "overlap", "fwdh_vh": 128}},
+)
+
+
+def test_launch_cache_resolves_every_launch_as_resolve_launch(monkeypatch) -> None:
+    """``_resolve_cached`` (the launch cache of the context tables) answers every launch of fake-backend forward +
+    backward runs on a context with and without an SM count -- default options, two segments, forced walk forms with
+    the by-chains merge columns, the overlap schedule; each persistent launch also with the kernels backend's ``arch``
+    grid argument, each walk's arguments also as a transfer walk of every precision mode (the test-only records) --
+    under both merge column defaults with the record, public values, grid and test flag of ``resolve_launch``, on the
+    first launch of its key (the one call of ``resolve_launch``) and on every later one, and appends
+    ``(record, grid)`` to the call's records each time."""
+    kcp, ctx, ops = _ckpt_setup()
+    part = gp.partition_kcp(torch.tensor(CKPT_CU, dtype=torch.int64), 1, "contiguous")
+    ctx_sm = gp.build_context_kcp(part, None, 0, CPU, sm_count=SM_COUNT)
+    launches: list[tuple[str, dict]] = []
+    for c in (ctx, ctx_sm):
+        for knobs in LAUNCH_CACHE_KNOBS:
+            launches += _harvest_launches(kcp, c, ops, **knobs)
+    extra = []
+    for name, args in launches:
+        grid_args = args.get("_grid_args") or {}
+        if "sm_count" in grid_args:
+            extra.append(
+                (name, {**args, "_grid_args": {**grid_args, "arch": "sm_100a"}})
+            )
+        if name in kcp.FWDH_PROGRAMS + kcp.DHU_PROGRAMS:
+            extra += [
+                ("kcp_transfer_walk", {**args, "_precision_mode": pm})
+                for pm in (0, 1, 2)
+            ]
+    launches += extra
+    names = {n for n, _ in launches}
+    assert {"kcp_affine_merge", "kcp_transfer_walk", "fwd_o", "bwd_dqkg"} <= names
+    assert names & set(kcp.FWDH_PROGRAMS) and names & set(kcp.DHU_PROGRAMS)
+    real = kcp.resolve_launch
+    assert any(real(n, dict(a))[3] for n, a in launches)  # a test-only record
+    misses: list[tuple] = []
+
+    def counting(name, args, *, cols_per_cta=8):
+        misses.append(kcp._launch_key(name, args, cols_per_cta))
+        return real(name, args, cols_per_cta=cols_per_cta)
+
+    monkeypatch.setattr(kcp, "resolve_launch", counting)
+    call = types.SimpleNamespace(tb=types.SimpleNamespace(launches={}), records=[])
+    for _round in range(2):
+        for cols in (8, 16):
+            for name, args in launches:
+                want = real(name, dict(args), cols_per_cta=cols)
+                got = kcp._resolve_cached(
+                    name, {**args, "_call": call}, cols_per_cta=cols
+                )
+                assert _same_launch(got, want), (name, cols)
+                assert call.records[-1] == (want[0], want[2]), (name, cols)
+    keys = {kcp._launch_key(n, a, c) for n, a in launches for c in (8, 16)}
+    assert len(misses) == len(set(misses)) == len(keys) == len(call.tb.launches)
+    assert len(call.records) == 4 * len(launches)
+    # no tables, or tables without a cache: resolve_launch itself (nothing cached)
+    for stub in (types.SimpleNamespace(records=[]), None):
+        name, args = launches[0]
+        before = len(misses)
+        got = kcp._resolve_cached(name, {**args, "_call": stub})
+        assert _same_launch(got, real(name, dict(args))) and len(misses) == before + 1
+
+
+def test_launch_cache_keeps_every_calls_launch_records(monkeypatch) -> None:
+    """One context on the fake backend: a run on cold launch caches, a run on warm ones and a run with the cache
+    bypassed (``resolve_launch`` per launch) record the same launches -- records and grids in order, forward and
+    backward, direct and checkpointed -- the tables cache one entry per launch key, and every run's results are within
+    the budget of the FP64 reference and of each other."""
+    kcp, ctx, ops = _ckpt_setup()
+    ref = _ckpt_reference()
+    tb = kcp._context_tables(ctx, CKPT_HEADS[1], fused_walks=1, P=2)
+    assert tb.launches == {}
+    arms, records = {}, {}
+    for arm in ("cold", "warm", "bypassed"):
+        res = {}
+        for ckpt in (False, True):
+            with monkeypatch.context() as m:
+                if arm == "bypassed":
+                    m.setattr(
+                        kcp,
+                        "_resolve_cached",
+                        lambda name, args, *, cols_per_cta=8: kcp.resolve_launch(
+                            name, args, cols_per_cta=cols_per_cta
+                        ),
+                    )
+                res[ckpt] = _ckpt_autograd(kcp, ctx, ops, ckpt=ckpt, segments=2)
+            records[(arm, ckpt)] = {
+                k: list(kcp.LAST_CALL[k]["records"]) for k in ("fwd", "bwd")
+            }
+        arms[arm] = res
+        if arm == "cold":
+            n_keys = len(tb.launches)
+            assert n_keys > 0
+    assert len(tb.launches) == n_keys  # warm and bypassed runs add no key
+    for ckpt in (False, True):
+        assert (
+            records[("cold", ckpt)]
+            == records[("warm", ckpt)]
+            == records[("bypassed", ckpt)]
+        ), ckpt
+        _arms_within_budget(
+            {arm: arms[arm][ckpt] for arm in arms},
+            ref,
+            ("out",) + CKPT_GRADS,
+            f"launch cache arms (checkpoint={ckpt})",
+        )
+    launched = {
+        (r, tuple(g)) for rec in records.values() for k in rec for r, g in rec[k]
+    }
+    assert launched <= {(r, g) for r, g, _t, _c in tb.launches.values()}
+
+
+def test_launch_scope_binds_the_stream_once_per_entry_body(monkeypatch) -> None:
+    """``cake_backend.launch_scope`` with a counting stand-in for ``tvm_ffi`` and a set current stream (CPU): a launch
+    outside every scope enters its own ``use_torch_stream()`` context; inside a scope it enters none while the current
+    stream is the bound one and its own after a stream switch; a nested scope on the same stream enters nothing, one
+    on another stream binds that stream until it exits; another thread sees no scope; an exception restores the
+    binding.  The kernels backend hands out its glue's scope; a glue without one and the fake backend none."""
+    be = _package("cake_backend")
+    kcp = _package("cake_kcp")
+    state = {"stream": (0, 11), "enters": 0, "bound": [], "launched": []}
+
+    class _Context:
+        def __enter__(self):
+            state["enters"] += 1
+            state["bound"].append(state["stream"])
+            return self
+
+        def __exit__(self, *exc):
+            state["bound"].pop()
+
+    monkeypatch.setattr(
+        be,
+        "tvm_ffi",
+        types.SimpleNamespace(use_torch_stream=lambda: _Context()),
+    )
+    monkeypatch.setattr(be, "_current_stream", lambda: state["stream"])
+    name = "fwd_prep"
+    values = {n: n for n, _axis in be._argument_plan(name) if n is not None}
+    module = types.SimpleNamespace(
+        **{
+            be.record(name)["ffi_entry"]: lambda *a: state["launched"].append(
+                state["bound"][-1] if state["bound"] else None
+            )
+        }
+    )
+
+    def launch() -> None:
+        be.run_module(name, values, grid=(1, 1, 1), device_index=0, module=module)
+
+    def enters_after(fn) -> int:
+        n = state["enters"]
+        fn()
+        return state["enters"] - n
+
+    assert enters_after(launch) == 1 and state["launched"][-1] == (0, 11)
+    with be.launch_scope():
+        assert state["enters"] == 2 and be._SCOPE.stream == (0, 11)
+        assert enters_after(launch) == 0 and enters_after(launch) == 0
+        assert state["launched"][-1] == (0, 11)
+        with be.launch_scope():
+            assert enters_after(launch) == 0
+        assert be._SCOPE.stream == (0, 11) and state["bound"] == [(0, 11)]
+        state["stream"] = (0, 22)  # a stream switch inside the scope
+        assert enters_after(launch) == 1 and state["launched"][-1] == (0, 22)
+        with be.launch_scope():  # a scope on the other stream binds it
+            assert be._SCOPE.stream == (0, 22)
+            assert enters_after(launch) == 0 and state["launched"][-1] == (0, 22)
+        assert be._SCOPE.stream == (0, 11)
+        assert enters_after(launch) == 1
+        state["stream"] = (0, 11)
+        worker = threading.Thread(target=launch)
+        assert enters_after(lambda: (worker.start(), worker.join())) == 1
+        assert enters_after(launch) == 0
+    assert getattr(be._SCOPE, "stream", None) is None and state["bound"] == []
+    with pytest.raises(RuntimeError, match="inside the scope"), be.launch_scope():
+        raise RuntimeError("inside the scope")
+    assert getattr(be._SCOPE, "stream", None) is None and state["bound"] == []
+    assert enters_after(launch) == 1
+    # the backends' scopes
+    assert kcp.FakeBackend().launch_scope(None) is None
+    assert (
+        kcp.KernelBackend(launcher=types.SimpleNamespace()).launch_scope(None) is None
+    )
+    with kcp.KernelBackend(launcher=be).launch_scope(None):
+        assert be._SCOPE.stream == (0, 11)
+        assert enters_after(launch) == 0
+    assert getattr(be._SCOPE, "stream", None) is None
 
 
 # --------------------------------------------------------------------------- numerics harness hooks (fake backend)
