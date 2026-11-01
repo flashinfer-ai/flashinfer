@@ -2318,11 +2318,14 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
     # record shows ``eye`` alone): a2a sizes neither the ring pools nor the fresh-bound ones; exchange="ring"
     # (recompute form, save_transfer=False) sizes the ring pools and c1_recv
     seen_pools: list[set[str]] = []
+    seen_sizes: list[dict[str, int]] = []
 
     class Recording(kcp.FakeBackend):
         def run(self, name, args):
             if not seen_pools or seen_pools[-1] is None:
-                seen_pools.append(set(args["_call"].ws._pools))
+                call = args["_call"]
+                seen_pools.append(set(call.ws._pools))
+                seen_sizes.append(dict(call.tb.pool_sizes(call.backward)))
             super().run(name, args)
 
     previous = kcp._BACKENDS.get("fake")
@@ -2359,12 +2362,21 @@ def test_dead_pools_are_not_sized_for_the_call() -> None:
         else:
             kcp._BACKENDS["fake"] = previous
     a2a_pools, ring_pools = seen_pools[0], seen_pools[2]
-    assert (
-        not (dead & a2a_pools) and {"c1_send", "stage_b", "carry", "eye"} <= a2a_pools
-    ), sorted(a2a_pools)
-    assert (set(kcp.RING_POOLS) | {"c1_recv", "stage_m"}) <= ring_pools, sorted(
-        ring_pools
-    )
+    # the per-call workspace sizes no empty pool (one rank exchanges nothing: c1_send, and under the ring c1_recv and
+    # the ring pools, are empty; pool() makes an empty one on demand)
+    sizes = seen_sizes[0]
+    a2a_live = {n for n in ("c1_send", "stage_b", "carry", "eye") if sizes.get(n, 1)}
+    assert not (dead & a2a_pools) and a2a_live <= a2a_pools, sorted(a2a_pools)
+    assert {"stage_b", "carry", "eye"} <= a2a_live
+    empty = {n for n in a2a_pools if sizes.get(n, 1) == 0}
+    assert not empty, sorted(empty)
+    ring_sizes = seen_sizes[1]  # seen_pools[1] is the separator (no sizes)
+    ring_live = {
+        n for n in (*kcp.RING_POOLS, "c1_recv", "stage_m") if ring_sizes.get(n, 1)
+    }
+    assert ring_live <= ring_pools and "stage_m" in ring_live, sorted(ring_pools)
+    empty = {n for n in ring_pools if ring_sizes.get(n, 1) == 0}
+    assert not empty, sorted(empty)
     # ensure(skip=...) semantics on a bare workspace
     ws4 = kcp.WorkspaceKcp()
     tb = ws4.ensure(ctx, H_qk, HV, device="cpu", backward=True, skip=kcp.RING_POOLS)
@@ -4958,6 +4970,405 @@ def test_launch_scope_binds_the_stream_once_per_entry_body(monkeypatch) -> None:
         assert be._SCOPE.stream == (0, 11)
         assert enters_after(launch) == 0
     assert getattr(be._SCOPE, "stream", None) is None
+
+
+# --------------------------------------------------------------------------- host launch path: launch memo, per-call workspace
+# The plan's launch memo (``_Tables.memo``) and the per-call workspace (no ``workspace=``): host data and allocations
+# only.  The "bypassed" arm replaces every memo method by the per-call derivation it replaced.
+
+
+def _memo_bypass(kcp, m) -> None:
+    tables = kcp._Tables
+    m.setattr(tables, "indexed_spec", lambda self, index, tiles: None)
+    m.setattr(
+        tables,
+        "walk_table",
+        lambda self, walk, device: (
+            len(walk),
+            self.dev("walk", [int(x) for x in walk], device),
+        ),
+    )
+    m.setattr(
+        tables,
+        "neg_index",
+        lambda self, device: self.dev("neg", [-1] * int(self.NSEG), device),
+    )
+    m.setattr(
+        tables,
+        "chain_tables",
+        lambda self, family, device: kcp._chain_device_tables(
+            self, self.chains[family], device
+        ),
+    )
+    m.setattr(tables, "split_lists", lambda self, coll: self.split_elems(coll))
+
+
+def _mr_harvest(kcp, part, ops, ctxs, monkeypatch, *, bypass: bool):
+    """Forward + saved-set backward of every rank of the multi-rank row (shipped options, per-call workspaces):
+    per rank the launches ``(program, args without the call)`` in order, and the global-order results."""
+    holder: dict = {}
+    seen: dict[int, list[tuple[str, dict]]] = {}
+    lock = threading.Lock()
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            comm = holder.get("comm")
+            rank = getattr(comm.local, "rank", 0) if comm is not None else 0
+            with lock:
+                seen.setdefault(rank, []).append(
+                    (name, {k: v for k, v in args.items() if k != "_call"})
+                )
+            super().run(name, args)
+
+    def rank_fn(r, comm):
+        holder["comm"] = comm
+        loc = fake.slice_local(ops, part, r)
+        args = [loc[n] for n in LEAVES]
+        out, saved = kcp.chunk_gdn_fwd_kcp(
+            *args, ctxs[r], backend="fake", deterministic=False
+        )
+        grads = kcp.chunk_gdn_bwd_kcp(
+            *args,
+            ctxs[r],
+            loc["dout"],
+            saved=saved,
+            backend="fake",
+            deterministic=False,
+        )
+        return out, grads
+
+    previous = kcp.set_backend("fake", Recording())
+    try:
+        with monkeypatch.context() as m:
+            if bypass:
+                _memo_bypass(kcp, m)
+            per_rank = _run_threaded(kcp, MR_W, rank_fn, m)
+    finally:
+        kcp.set_backend("fake", previous)
+    res = {"out": fake.gather_global(part, [o for o, _ in per_rank])}
+    for i, n in enumerate(EXPLICIT_GRADS):
+        res[n] = fake.gather_global(part, [g[i] for _, g in per_rank])
+    return seen, res
+
+
+def _same_args(a: dict, b: dict, *, same_plan: bool) -> list[str]:
+    """The keys whose values differ: plan / context int tables (int32 / int64) must be the very same tensor within
+    one plan and equal across plans; every other tensor (operands, pools, tapes, outputs, tickets) must agree in
+    dtype, shape and stride; every other value must be equal."""
+    bad = []
+    if a.keys() != b.keys():
+        return ["<keys>"]
+    for k in a:
+        x, y = a[k], b[k]
+        if isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor):
+            if x.dtype in (torch.int32, torch.int64):
+                ok = (
+                    (x is y)
+                    if same_plan
+                    else (x.dtype == y.dtype and torch.equal(x, y))
+                )
+            else:
+                ok = (x.dtype, tuple(x.shape), x.stride()) == (
+                    y.dtype,
+                    tuple(y.shape),
+                    y.stride(),
+                )
+        else:
+            ok = type(x) is type(y) and x == y
+        if not ok:
+            bad.append(k)
+    return bad
+
+
+def test_launch_memo_hands_every_launch_the_per_call_derivation(monkeypatch) -> None:
+    """The plan's launch memo (R4-4) on the multi-rank row (W = 8, exchanges and owner merges on every rank): a cold
+    run (fresh contexts), a warm run (the same contexts) and a run with every memo method bypassed (fresh contexts,
+    the per-call derivation) launch the same programs in the same order with the same arguments -- the plan's int
+    tables are the very same tensors within one plan and equal across plans, the addressing scalars and grids equal,
+    every buffer of the same dtype, shape and stride -- and give bitwise identical outputs and gradients.  Every
+    memoised addressing is ``Indexed.addressing`` of its tables."""
+    kcp, part, ops = _mr_setup()
+    ctxs = [
+        gp.build_context_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        for r in range(MR_W)
+    ]
+    cold, res_cold = _mr_harvest(kcp, part, ops, ctxs, monkeypatch, bypass=False)
+    warm, res_warm = _mr_harvest(kcp, part, ops, ctxs, monkeypatch, bypass=False)
+    ctxs_b = [
+        gp.build_context_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        for r in range(MR_W)
+    ]
+    byp, res_byp = _mr_harvest(kcp, part, ops, ctxs_b, monkeypatch, bypass=True)
+    names = {n for r in cold for n, _ in cold[r]}
+    assert {
+        "kcp_affine_merge",
+        "kcp_fwdh_offset",
+        "kcp_transfer_walk",
+        "kcp_fwdh_tape",
+    } <= names, names
+    assert names & set(kcp.DHU_PROGRAMS)
+    for r in range(MR_W):
+        assert (
+            [n for n, _ in cold[r]] == [n for n, _ in warm[r]] == [n for n, _ in byp[r]]
+        ), r
+        for i, ((n, a), (_, b), (_, c)) in enumerate(
+            zip(cold[r], warm[r], byp[r], strict=True)
+        ):
+            assert not _same_args(a, b, same_plan=True), (
+                r,
+                i,
+                n,
+                _same_args(a, b, same_plan=True),
+            )
+            assert not _same_args(b, c, same_plan=False), (
+                r,
+                i,
+                n,
+                _same_args(b, c, same_plan=False),
+            )
+    for k in res_cold:
+        assert torch.equal(res_cold[k], res_warm[k]) and torch.equal(
+            res_cold[k], res_byp[k]
+        ), k
+    specs = 0
+    for ctx in ctxs:
+        for key, tb in ctx._caches.items():
+            if not (isinstance(key, tuple) and key and key[0] == "kcp_tables"):
+                continue
+            for mk, v in tb.memo.items():
+                if mk[0] == "ix" and v.addr is not None:
+                    specs += 1
+                    assert (
+                        kcp.Indexed(torch.empty(0), v.index, v.tiles).addressing(tb.H)
+                        == v.addr
+                    )
+    for ctx in ctxs_b:  # the bypassed arm memoised no view of a pool
+        for key, tb in ctx._caches.items():
+            if isinstance(key, tuple) and key and key[0] == "kcp_tables":
+                assert not any(
+                    mk[0] in ("ix", "ixn", "walk", "chain", "neg", "split")
+                    for mk in tb.memo
+                ), key
+    assert specs > 0
+
+
+def test_per_call_workspace_shares_its_context_ticket_set() -> None:
+    """A call without ``workspace=`` takes its context's ticket set of the current stream (R4-4): the persistent
+    launches of every such call on one context see the same three zero slots; another context and a caller-held
+    workspace use their own; the slots are 128-byte aligned u32 slots and stay zero at every launch."""
+    kcp, ctx, ops = _ckpt_setup()
+    ctx2 = gp.build_context_kcp(
+        gp.partition_kcp(torch.tensor(CKPT_CU, dtype=torch.int64), 1, "contiguous"),
+        None,
+        0,
+        CPU,
+    )
+    seen: list[tuple[str, str, int, bool]] = []
+    phase = ["?"]
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            if name in kcp.TICKET_SITES:
+                t = args["ticket"]
+                seen.append(
+                    (
+                        phase[0],
+                        name,
+                        t.data_ptr(),
+                        t.dtype == torch.uint32
+                        and t.numel() == kcp.TICKET_SLOT_WORDS
+                        and t.data_ptr() % kcp.TICKET_SLOT_BYTES == 0
+                        and int(t.view(torch.int32).abs().sum()) == 0,
+                    )
+                )
+            super().run(name, args)
+
+    previous = kcp.set_backend("fake", Recording())
+    ws = kcp.WorkspaceKcp()
+    try:
+        for tag, c, w in (
+            ("a", ctx, None),
+            ("a", ctx, None),
+            ("b", ctx2, None),
+            ("w", ctx, ws),
+        ):
+            phase[0] = tag
+            _ckpt_autograd(kcp, c, ops, ckpt=False, segments=2, workspace=w)
+    finally:
+        kcp.set_backend("fake", previous)
+    assert all(ok for *_x, ok in seen), seen
+    ptr: dict[tuple[str, str], set[int]] = {}
+    for tag, site, p, _ok in seen:
+        ptr.setdefault((tag, site), set()).add(p)
+    assert {s for _t, s in ptr} == set(kcp.TICKET_SITES)
+    assert all(len(v) == 1 for v in ptr.values()), (
+        ptr
+    )  # one slot per site: the two per-call runs share it
+    for site in kcp.TICKET_SITES:
+        a, b, w = (next(iter(ptr[(t, site)])) for t in ("a", "b", "w"))
+        assert len({a, b, w}) == 3, (site, a, b, w)
+        assert w == ws.ticket(site).data_ptr()
+    shared = [
+        v
+        for k, v in ctx._caches.items()
+        if isinstance(k, tuple) and k[0] == "kcp_call_tickets"
+    ]
+    assert len(shared) == 1 and int(shared[0][0].view(torch.int32).abs().sum()) == 0
+
+
+@pytest.mark.parametrize("segments", [1, 2])
+def test_per_call_workspace_sizes_no_dead_or_empty_pool(segments) -> None:
+    """The per-call workspace (R4-4) sizes no pool its call never touches: a saved-context backward none of the
+    forward exchange's pools (``SAVED_BWD_DEAD_POOLS``), and no call an empty pool (the staging and carry planes at
+    ``P = 1``); a caller-held workspace still sizes them (its documented layout).  The end-of-call records name the
+    same pools either way, and the results are bitwise equal."""
+    kcp = _package("cake_kcp")
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_kcp(torch.tensor(cu, dtype=torch.int64), 2, "contiguous")
+    ops = _inputs(cu, H_qk, HV)
+    assert set(kcp.SAVED_BWD_DEAD_POOLS) == {"c1_send", "c1_recv", "c2_send"}
+
+    def run(workspaces):
+        held: dict[int, list[tuple[bool, set[str], dict[str, int]]]] = {}
+        lock = threading.Lock()
+        holder: dict = {}
+
+        class Recording(kcp.FakeBackend):
+            def run(self, name, args):
+                call = args["_call"]
+                comm = holder.get("comm")
+                rank = getattr(comm.local, "rank", 0)
+                with lock:
+                    calls = held.setdefault(rank, [])
+                    first = (
+                        not calls or calls[-1][0] is not call
+                    )  # what ensure() sized (before any on-demand pool)
+                    calls.append(
+                        (
+                            call,
+                            first,
+                            set(call.ws._pools),
+                            {n: t.numel() for n, t in call.ws._pools.items()},
+                        )
+                    )
+                super().run(name, args)
+
+        ctxs = [
+            gp.build_context_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+            for r in range(2)
+        ]
+        records: dict[int, dict] = {}
+
+        def rank_fn(r, comm):
+            holder["comm"] = comm
+            loc = fake.slice_local(ops, part, r)
+            args = [loc[n] for n in LEAVES]
+            kw = dict(
+                backend="fake",
+                segments=segments,
+                deterministic=False,
+                workspace=workspaces[r],
+            )
+            out, saved = kcp.chunk_gdn_fwd_kcp(*args, ctxs[r], **kw)
+            fwd_pools = dict(kcp.LAST_CALL["fwd"]["pool_bytes"])
+            grads = kcp.chunk_gdn_bwd_kcp(
+                *args, ctxs[r], loc["dout"], saved=saved, **kw
+            )
+            records[r] = {
+                "fwd": fwd_pools,
+                "bwd": dict(kcp.LAST_CALL["bwd"]["pool_bytes"]),
+            }
+            return out, grads
+
+        previous = kcp.set_backend("fake", Recording())
+        mp = pytest.MonkeyPatch()
+        try:
+            per_rank = _run_threaded(kcp, 2, rank_fn, mp)
+        finally:
+            mp.undo()
+            kcp.set_backend("fake", previous)
+        return held, records, per_rank
+
+    held_pc, rec_pc, res_pc = run([None, None])
+    held_ws, rec_ws, res_ws = run([kcp.WorkspaceKcp(), kcp.WorkspaceKcp()])
+    dead = set(kcp.SAVED_BWD_DEAD_POOLS)
+    for r in range(2):
+        for call, first, names, sizes in held_pc[r]:
+            if first:
+                assert not any(n == 0 for n in sizes.values()), sizes
+            if call.backward:
+                assert not (dead & names), sorted(dead & names)
+        bwd_ws = [
+            names for call, first, names, _s in held_ws[r] if call.backward and first
+        ]
+        assert bwd_ws and {"c1_send", "c2_send"} <= bwd_ws[0], bwd_ws[0]
+        if segments == 1:
+            fwd_ws = [
+                sizes
+                for call, first, _n, sizes in held_ws[r]
+                if first and not call.backward
+            ]
+            assert (
+                fwd_ws and fwd_ws[0].get("stage_b") == 0 and fwd_ws[0].get("carry") == 0
+            ), fwd_ws[0]
+        # LAST_CALL is one module dict both rank threads write: compare the pool names of the snapshots (every eager
+        # call ends with its exchange and staging pools released)
+        assert {k: set(v) for k, v in rec_pc[r].items()} == {
+            k: set(v) for k, v in rec_ws[r].items()
+        }, (r, rec_pc[r], rec_ws[r])
+        (o1, g1), (o2, g2) = res_pc[r], res_ws[r]
+        assert torch.equal(o1, o2) and all(
+            torch.equal(a, b) for a, b in zip(g1, g2, strict=True)
+        ), r
+
+
+def test_chunk_gdn_kcp_keyword_options_are_validated_once_per_keyword_set() -> None:
+    """``chunk_gdn_kcp`` without an ``options`` object validates its keyword options once per distinct keyword set
+    (with the value types: ``save_transfer=1`` never stands in for ``True``) and reuses that OptionsKcp; an unhashable
+    value (a ``test_knobs`` dict) is validated per call; an invalid set raises on every call."""
+    kcp, ctx, ops = _ckpt_setup()
+    kcp._KEYWORD_OPTIONS.clear()
+    seen = []
+    real = kcp._fwd_entry
+
+    def spy(*a, opts, **kw):
+        seen.append(opts)
+        return real(*a, opts=opts, **kw)
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(kcp, "_fwd_entry", spy)
+    try:
+        r1 = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
+        r2 = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
+        r3 = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2, save_transfer=True)
+        _ckpt_autograd(
+            kcp, ctx, ops, ckpt=False, segments=2, test_knobs={"schedule": "overlap"}
+        )
+        _ckpt_autograd(
+            kcp, ctx, ops, ckpt=False, segments=2, test_knobs={"schedule": "overlap"}
+        )
+        for _ in range(2):
+            with pytest.raises(TypeError, match="save_transfer must be a bool"):
+                _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2, save_transfer=1)
+        with pytest.raises(TypeError, match="unexpected option"):
+            _ckpt_autograd(kcp, ctx, ops, ckpt=False, no_such_option=1)
+    finally:
+        mp.undo()
+    assert len(seen) == 5
+    assert (
+        seen[0] is seen[1] and seen[2] is not seen[0] and seen[2].save_transfer is True
+    )
+    assert seen[3] is not seen[4] and seen[3].knob("schedule") == "overlap"
+    assert seen[0] == kcp.make_options(
+        None,
+        segments=2,
+        backend="fake",
+        **{"save_mode": "light", "boundary_mode": "saved", "graph": "off"},
+    )
+    assert len(kcp._KEYWORD_OPTIONS) == 2
+    for k in r1:
+        assert torch.equal(r1[k], r2[k]) and torch.equal(r1[k], r3[k]), k
 
 
 # --------------------------------------------------------------------------- numerics harness hooks (fake backend)

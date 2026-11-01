@@ -697,6 +697,69 @@ def test_two_caller_streams_with_cached_workspaces_are_within_budget(device) -> 
         )
 
 
+def test_per_call_workspace_ticket_slots_follow_the_caller_stream(device) -> None:
+    """Calls without ``workspace=`` on one context take the context's ticket slots of their caller stream: two
+    streams interleaving the explicit entries (A's forward, B's forward, A's backward, B's backward), twice, use two
+    distinct slot sets, keyed by the two streams, every word zero afterwards; every result is within the budget of the
+    FP64 reference and of every other result.  Under a CUDA stream capture a call gets no shared set (fresh slots)."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    cu, heads = [0, 700, 1900, 3000], (2, 6)
+    inputs = make_inputs(cu, *heads)
+    ref, _ = reference_pack(inputs, device)
+    ctx = _local_context(cu, device)
+    ops = [inputs[n].to(device) for n in OPERANDS]
+    dout = inputs["dout"].to(device)
+    streams = {key: torch.cuda.Stream(device=device) for key in ("A", "B")}
+    results = {key: [] for key in streams}
+    torch.cuda.synchronize(device)
+    for _step in range(2):
+        pending = {}
+        for key, stream in streams.items():
+            with torch.cuda.stream(stream):
+                pending[key] = gdn_api.chunk_gdn_fwd_kcp(*ops, ctx, deterministic=False)
+        for key, stream in streams.items():
+            with torch.cuda.stream(stream):
+                out, saved = pending[key]
+                grads = gdn_api.chunk_gdn_bwd_kcp(
+                    *ops, ctx, dout, saved=saved, deterministic=False
+                )
+                results[key].append(
+                    {
+                        "out": out[0],
+                        **{
+                            n: t[0]
+                            for n, t in zip(EXPLICIT_GRAD_ORDER, grads, strict=True)
+                        },
+                    }
+                )
+        torch.cuda.synchronize(device)
+
+    def ticket_sets():
+        return {
+            k: v
+            for k, v in ctx._caches.items()
+            if isinstance(k, tuple) and k[:1] == ("kcp_call_tickets",)
+        }
+
+    sets = ticket_sets()
+    assert {k[3] for k in sets} == {s.cuda_stream for s in streams.values()}, sets
+    assert len({t.data_ptr() for t, _views in sets.values()}) == len(streams)
+    for t, _views in sets.values():
+        assert bool((t.view(torch.int32) == 0).all())
+    _arms_within_budget(
+        {f"{key} step {i}": r for key, rs in results.items() for i, r in enumerate(rs)},
+        ref,
+        TENSORS,
+        "per-call workspaces on two streams",
+    )
+    graph, x = torch.cuda.CUDAGraph(), torch.zeros(1, device=device)
+    with torch.cuda.graph(graph, stream=torch.cuda.Stream(device=device)):
+        x.add_(1)
+        captured = kcp._call_tickets(ctx, device)
+    assert captured is None
+    assert ticket_sets().keys() == sets.keys()
+
+
 # --------------------------------------------------------------------------- the launch scope (one GPU)
 
 

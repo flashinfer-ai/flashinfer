@@ -458,6 +458,10 @@ BWD_DEAD_BEFORE_TAPES: tuple[str, ...] = (
     "ring_in",
 )
 BWD_DEAD_BEFORE_DQKG: tuple[str, ...] = ("carry", "b2_recv")
+# The forward exchange's pools a saved-context backward never touches (it reads the saved ``S_in`` and, under
+# ``save_transfer``, the saved c1 receive tensor; its owner merge reads b1): not sized in the per-call workspace of such a
+# backward (a caller-held workspace keeps every pool of its layout).
+SAVED_BWD_DEAD_POOLS: tuple[str, ...] = ("c1_send", "c1_recv", "c2_send")
 # The ring-exchange pools: sized only under ``exchange="ring"`` (the a2a forms never touch them; R2-L1 1a).
 RING_POOLS: tuple[str, ...] = ("ring_out", "ring_in")
 # The pools a call replaces with fresh (forward) or saved (backward) tensors under ``save_transfer``: the c1 receive
@@ -1525,6 +1529,42 @@ class Chains:
         }
 
 
+MEMO_MAX = 4096  # entries of a plan's launch memo (_Tables.memo) before it is cleared and rebuilt on use
+
+
+class _IndexedSpec:
+    """The static part of the :class:`Indexed` views a plan builds from one pair of its tables: the normalised
+    ``index`` / ``tiles`` tuples (the views' fields), the kernels' addressing of the tiles (derived at the first
+    :meth:`CallKcp.block`, by :meth:`Indexed.addressing`) and the device index table per device.  ``src`` holds the
+    keyed source tuples, so their ids cannot be reused while the entry lives."""
+
+    __slots__ = ("src", "index", "tiles", "addr", "dev")
+
+    def __init__(self, index: tuple, tiles: tuple) -> None:
+        self.src = (index, tiles)
+        self.index = tuple(int(i) for i in index)
+        self.tiles = tuple(tuple(int(t) for t in row) for row in tiles)
+        self.addr: tuple[int, int, int, int] | None = None
+        self.dev: dict[torch.device, torch.Tensor] = {}
+
+
+def _chain_device_tables(
+    tb: _Tables, ch: Chains, device: torch.device
+) -> tuple[torch.Tensor, ...]:
+    """The device tables of the merge chains ``ch`` (``chain_start`` int32; ``elem_m``, ``elem_c``, ``elem_y``,
+    ``x0_index``, ``y_final`` int64), cached by content on the head plan (:meth:`_Tables.dev`)."""
+    tag = ("chain", ch.content())
+    i64 = torch.int64
+    return (
+        tb.dev(tag + ("start",), ch.chain_start, device),
+        tb.dev(tag + ("m",), ch.elem_m, device, i64),
+        tb.dev(tag + ("c",), ch.elem_c, device, i64),
+        tb.dev(tag + ("y",), ch.elem_y, device, i64),
+        tb.dev(tag + ("x0",), ch.x0_index, device, i64),
+        tb.dev(tag + ("yf",), ch.y_final, device, i64),
+    )
+
+
 def _prefix(values) -> list[int]:
     out = [0]
     for v in values:
@@ -1564,6 +1604,12 @@ class _Tables:
         # launch key -> (record, grid, is_test, merge cols_per_cta): the launch cache of _resolve_cached (host data of
         # this plan, filled at the first launch of each key)
         self.launches: dict[tuple, tuple] = {}
+        # the launches' static pieces of this plan, derived at their first use (host data, never a kernel argument
+        # value of its own): the normalised pool tables of CallKcp.indexed with their kernel addressing and device
+        # index tables (_IndexedSpec), the walk lists' and the merge chains' device tables, the zero block's index
+        # table and the collectives' split lists.  Every device table is the one ``dev`` returns (cached by content
+        # on the head plan), so a launch receives the very tensors it received before.
+        self.memo: dict[tuple, Any] = {}
         self.H = H = int(HV)  # every pool, split and chain is per VALUE head
         self.fused_walks = int(
             fused_walks
@@ -2127,6 +2173,66 @@ class _Tables:
             cache[k] = t
         return t
 
+    def _memo_put(self, key: tuple, value: Any) -> Any:
+        # bound for callers that pass fresh tables per call; the plan's own are few
+        if len(self.memo) >= MEMO_MAX:
+            self.memo.clear()
+        self.memo[key] = value
+        return value
+
+    def indexed_spec(self, index: Any, tiles: Any) -> _IndexedSpec | None:
+        """The memo entry of an :class:`Indexed` view over the tables ``index`` / ``tiles`` -- keyed by the identity
+        of the two tuples (immutable; the entry holds them, so their ids stay theirs); ``None`` for any other type
+        (a list may change after its first use: such a view is derived per call as before)."""
+        if type(index) is not tuple or type(tiles) is not tuple:
+            return None
+        spec = self.memo.get(("ix", id(index), id(tiles)))
+        if spec is None:
+            spec = _IndexedSpec(index, tiles)
+            self._memo_put(("ix", id(index), id(tiles)), spec)
+            self._memo_put(("ixn", id(spec.index), id(spec.tiles)), spec)
+        return spec
+
+    def walk_table(
+        self, walk: Sequence[int], device: torch.device
+    ) -> tuple[int, torch.Tensor]:
+        """``(len, int32 device table)`` of the walk list ``walk`` (keyed by its content: the lists are short)."""
+        key = ("walk", tuple(walk), device)
+        hit = self.memo.get(key)
+        if hit is None:
+            values = [int(s) for s in walk]
+            hit = self._memo_put(key, (len(values), self.dev("walk", values, device)))
+        return hit
+
+    def neg_index(self, device: torch.device) -> torch.Tensor:
+        """The zero block's ``[NSEG]`` index table (every entry ``-1``) on the device."""
+        key = ("neg", device)
+        t = self.memo.get(key)
+        if t is None:
+            t = self._memo_put(key, self.dev("neg", [-1] * int(self.NSEG), device))
+        return t
+
+    def chain_tables(
+        self, family: str, device: torch.device
+    ) -> tuple[torch.Tensor, ...]:
+        """The six device tables of the plan's merge chain family ``family`` (``chain_start`` int32; ``elem_m``,
+        ``elem_c``, ``elem_y``, ``x0_index``, ``y_final`` int64), uploaded in this order at first use."""
+        key = ("chain", family, device)
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(
+                key, _chain_device_tables(self, self.chains[family], device)
+            )
+        return hit
+
+    def split_lists(self, coll: str) -> tuple[list[int], list[int]]:
+        """:meth:`split_elems` of ``coll``, derived once (the caller must not mutate the lists)."""
+        key = ("split", coll)
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(key, self.split_elems(coll))
+        return hit
+
     def seg_table(self, device: torch.device) -> torch.Tensor:
         """``seg_chunk_start`` int32 ``[NSEG + 1]`` on the device (the head plan's copy)."""
         t = self.hp.device_tables.get("seg_chunk_start")
@@ -2227,6 +2333,60 @@ def _identity_tile(
     return t
 
 
+def _ticket_slots(device: torch.device) -> torch.Tensor:
+    """Zeroed u32 ticket words, one 128-byte slot per persistent launch site (:data:`TICKET_SITES`): one slot of
+    slack, then the 128-byte-aligned view (the CUDA caching allocator hands out 512-byte-aligned blocks, offset 0;
+    the CPU allocator only 64-byte-aligned ones, offset 0 or 16 words)."""
+    words = len(TICKET_SITES) * TICKET_SLOT_WORDS
+    base = torch.zeros((words + TICKET_SLOT_WORDS,), dtype=torch.uint32, device=device)
+    skew = (-base.data_ptr() % TICKET_SLOT_BYTES) // base.element_size()
+    return base[skew : skew + words]
+
+
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+_IS_CAPTURING = getattr(torch._C, "_cuda_isCurrentStreamCapturing", None)
+
+
+def _call_tickets(
+    ctx: Any, device: torch.device
+) -> tuple[torch.Tensor, dict[str, tuple[torch.Tensor, torch.Tensor]]] | None:
+    """The ticket slots of a call without a caller-owned workspace: one zeroed set per ``(context, device, launch
+    stream)`` -- the stream the launch glue binds, torch's current stream of the current device -- kept in the
+    context's cache beside its identity tile with the slot views the calls hand to the kernels, and shared by every
+    such call on that stream.  Every persistent launch leaves its word at zero and the launches of one stream run in
+    issue order, so a later launch never meets a word in use; calls on another stream get their own set.  ``None``
+    (fresh slots per call, as before) under a CUDA stream capture -- a captured graph keeps the addresses it baked --
+    or without a context cache.
+
+    The sharing relies on every persistent launch of such a call staying on the caller's stream (the stream in this
+    key): a launch moved to a side stream would no longer be ordered with the other calls' launches and must get its
+    own slots (or be ordered with this stream by an event) before it shares this set."""
+    caches = getattr(ctx, "_caches", None)
+    if not isinstance(caches, dict):
+        return None
+    if device.type == "cuda":
+        capturing = (
+            _IS_CAPTURING()
+            if _IS_CAPTURING is not None
+            else torch.cuda.is_current_stream_capturing()
+        )
+        if capturing:
+            return None
+        index = torch.cuda.current_device()
+        stream = (
+            int(_RAW_STREAM(index))
+            if _RAW_STREAM is not None
+            else int(torch.cuda.current_stream(index).cuda_stream)
+        )
+    else:
+        index, stream = -1, 0  # the host: one ordered queue
+    key = ("kcp_call_tickets", str(device), index, stream)
+    hit = caches.get(key)
+    if hit is None:
+        hit = caches[key] = (_ticket_slots(device), {})
+    return hit
+
+
 def _context_tables(
     ctx: Any, HV: int, *, fused_walks: int = 1, P: int | None = None
 ) -> _Tables:
@@ -2275,6 +2435,8 @@ class WorkspaceKcp:
         self._tickets: torch.Tensor | None = (
             None  # u32 [len(TICKET_SITES) * 32]: one 128-byte slot per site
         )
+        # site -> (the ticket tensor, its slot view): the views of the slots in use, made once per ticket tensor
+        self._ticket_views: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self.geometry: tuple[int, int, int, int] | None = None  # (R, NC_pad, HV, T)
         if ctx is not None:
             if H_qk is None or HV is None:
@@ -2302,12 +2464,15 @@ class WorkspaceKcp:
         fused_walks: int = 1,
         P: int | None = None,
         skip: Sequence[str] = (),
+        skip_empty: bool = False,
     ) -> _Tables:
         """Size the pools for ``(ctx, HV)`` and bind the tape geometry; returns the tables (``P``: the segments
         override of the plan).  ``skip``: pool names this call never touches (:func:`_prepare` passes the ring
         pools under ``exchange="a2a"`` and the pools the call replaces with fresh / saved tensors, ``c1_recv`` and
         ``stage_m`` under ``save_transfer``); a skipped pool is not allocated, a held one is left as it is, and a
-        later ``ensure()`` without the name sizes it.  A workspace built from ``(ctx, H_qk, HV)`` sizes every pool."""
+        later ``ensure()`` without the name sizes it.  ``skip_empty``: a pool of size 0 (e.g. the staging and carry
+        planes at ``P = 1``) is not allocated either -- :meth:`pool` makes the empty tensor if a call ever asks for
+        it.  A workspace built from ``(ctx, H_qk, HV)`` sizes every pool."""
         device = (
             torch.device(device) if device is not None else torch.device(ctx.device)
         )
@@ -2319,10 +2484,17 @@ class WorkspaceKcp:
             )
         validate_heads(H_qk, HV)
         tb = self.tables(ctx, HV, fused_walks=fused_walks, P=P)
-        for name, n in tb.pool_sizes(backward).items():
+        sizes = tb.memo.get(("pool_sizes", bool(backward)))
+        if sizes is None:
+            sizes = tb._memo_put(
+                ("pool_sizes", bool(backward)), tuple(tb.pool_sizes(backward).items())
+            )
+        for name, n in sizes:
             if name in skip:
                 continue
             cur = self._pools.get(name)
+            if cur is None and n == 0 and skip_empty:
+                continue
             if cur is None or cur.numel() < n:
                 self._pools[name] = (
                     _identity_tile(ctx, n, self.state_dtype, device)
@@ -2332,14 +2504,7 @@ class WorkspaceKcp:
         if (
             self._tickets is None
         ):  # once per workspace: the kernels keep every word at zero afterwards
-            # one slot of slack, then the 128-byte-aligned view: the CUDA caching allocator hands out 512-byte-aligned
-            # blocks (offset 0), the CPU allocator only 64-byte-aligned ones (offset 0 or 16 words)
-            words = len(TICKET_SITES) * TICKET_SLOT_WORDS
-            base = torch.zeros(
-                (words + TICKET_SLOT_WORDS,), dtype=torch.uint32, device=device
-            )
-            skew = (-base.data_ptr() % TICKET_SLOT_BYTES) // base.element_size()
-            self._tickets = base[skew : skew + words]
+            self._tickets = _ticket_slots(device)
         geometry = (int(ctx.R), int(ctx.NC_pad), int(HV), int(ctx.T_r))
         if self.geometry != geometry:
             self._tapes.clear()  # another padded geometry: the tapes are reallocated on first use
@@ -2353,10 +2518,16 @@ class WorkspaceKcp:
             raise KeyError(
                 f"WorkspaceKcp: {site!r} is not a persistent launch site {TICKET_SITES}"
             )
-        if self._tickets is None:
+        tickets = self._tickets
+        if tickets is None:
             raise KeyError("WorkspaceKcp: no ticket slots yet (ensure() first)")
+        hit = self._ticket_views.get(site)
+        if hit is not None and hit[0] is tickets:
+            return hit[1]
         i = TICKET_SITES.index(site) * TICKET_SLOT_WORDS
-        return self._tickets[i : i + TICKET_SLOT_WORDS]
+        view = tickets[i : i + TICKET_SLOT_WORDS]
+        self._ticket_views[site] = (tickets, view)
+        return view
 
     def pool(self, name: str, n: int | None = None) -> torch.Tensor:
         t = self._pools.get(name)
@@ -2366,7 +2537,8 @@ class WorkspaceKcp:
                     f"WorkspaceKcp: pool {name!r} was not sized for this call (ensure() first)"
                 )
             t = self._pools[name] = _alloc((0,), self.state_dtype, self.device)
-        return t if n is None else t[:n]
+        # a pool of exactly ``n`` elements is its own first-``n`` view (same storage, offset, shape and stride)
+        return t if n is None or t.numel() == n else t[:n]
 
     def has(self, name: str) -> bool:
         return name in self._pools
@@ -2658,6 +2830,9 @@ class CallKcp:
     def indexed(
         self, pool: str, index: Sequence[int], tiles: Sequence[Sequence[int]]
     ) -> Indexed:
+        spec = self.tb.indexed_spec(index, tiles)
+        if spec is not None:  # the plan's own tables: normalised once
+            return Indexed(self.buf(pool), spec.index, spec.tiles)
         return Indexed(
             self.buf(pool),
             tuple(int(i) for i in index),
@@ -2715,16 +2890,30 @@ class CallKcp:
     def block(self, ix: Indexed | None) -> _Block:
         """The kernel's view of an :class:`Indexed` pool; ``None`` (or no slot) = the zero state: every index ``-1``
         and a never-read base pointer."""
-        nseg = int(self.tb.NSEG)
+        tb = self.tb
+        nseg = int(tb.NSEG)
         if ix is None or ix.n_slots == 0:
-            return _Block(self.buf("eye"), self.dev("neg", [-1] * nseg), self.H, 1, 1)
-        base_tile, hg, n, stride = ix.addressing(self.H)
+            return _Block(self.buf("eye"), tb.neg_index(self.device), self.H, 1, 1)
+        # a view from indexed() over the plan's own tables: its addressing and index table are derived once
+        spec = tb.memo.get(("ixn", id(ix.index), id(ix.tiles)))
+        if spec is None:
+            base_tile, hg, n, stride = ix.addressing(self.H)
+        else:
+            if spec.addr is None:
+                spec.addr = ix.addressing(self.H)
+            base_tile, hg, n, stride = spec.addr
         if len(ix.index) != nseg:
             raise ValueError(
                 f"Indexed: {len(ix.index)} segment entries, the plan has NSEG = {nseg}"
             )
         ptr = ix.pool.view(-1)[base_tile * TILE :] if base_tile else ix.pool.view(-1)
-        return _Block(ptr, self.dev("index", ix.index), int(hg), int(n), int(stride))
+        if spec is None:
+            index_t = self.dev("index", ix.index)
+        else:
+            index_t = spec.dev.get(self.device)
+            if index_t is None:
+                index_t = spec.dev[self.device] = self.dev("index", ix.index)
+        return _Block(ptr, index_t, int(hg), int(n), int(stride))
 
     # -- launches
     def kernel(self, name: str, grid: int, **args: Any) -> None:
@@ -2736,14 +2925,18 @@ class CallKcp:
         args["_grid"] = int(grid)
         self.backend.run(name, args)
 
-    def _walk_common(self, walk: Sequence[int]) -> dict[str, Any]:
+    def _walk_common(self, walk: Sequence[int]) -> tuple[int, dict[str, Any]]:
+        """``(len(walk), the walk programs' common arguments)``; the walk list's device table comes from the plan's
+        memo (:meth:`_Tables.walk_table`)."""
         tb = self.tb
-        return {
+        seg = tb.seg_table(self.device)
+        n_walk, walk_seg = tb.walk_table(walk, self.device)
+        return n_walk, {
             "num_heads": self.HV,
             "num_qk_heads": self.H_qk,
-            "seg_chunk_start": tb.seg_table(self.device),
+            "seg_chunk_start": seg,
             "num_seqs": int(tb.NSEG),
-            "walk_seg": self.dev("walk", walk),
+            "walk_seg": walk_seg,
             "chunk_bos": self.ctx.tables["chunk_bos"],
             "chunk_len": self.ctx.tables["chunk_len"],
         }
@@ -2762,9 +2955,8 @@ class CallKcp:
         the pools (``h0`` / ``out`` / ``dht`` as :class:`Indexed` or ``None``) and the program's mode scalars."""
         if len(walk) == 0:
             return
-        walk = [int(s) for s in walk]
         self.counters["walks"] += 1
-        args = self._walk_common(walk)
+        n_walk, args = self._walk_common(walk)
         if name in ("kcp_fwdh_offset", "kcp_fwdh_tape"):
             tape = name == "kcp_fwdh_tape"
             # The unused pool of a walk is the ZERO block (every index -1, a never-read base pointer): the tape
@@ -2832,8 +3024,8 @@ class CallKcp:
             raise ValueError(f"{name} is not a walk program")
         self.kernel(
             name,
-            len(walk) * self.HV,
-            _grid_args={"n_walk": len(walk), "num_heads": self.HV},
+            n_walk * self.HV,
+            _grid_args={"n_walk": n_walk, "num_heads": self.HV},
             _sm_count=int(getattr(self.ctx, "sm_count", 0) or 0),
             _fwdh_vh=self.opts.knob("fwdh_vh"),
             _dhu_vh=self.opts.knob("dhu_vh"),
@@ -2871,8 +3063,12 @@ class CallKcp:
         x0 = (
             self.buf(spec["x0"]) if spec["x0"] else y
         )  # never read when every x0_index is -1
-        tag = ("chain", ch.content())
-        i64 = torch.int64
+        # the plan's own family: its tables from the plan's memo; explicit chains (the ring's): derived per call
+        start, elem_m, elem_c, elem_y, x0_index, y_final = (
+            self.tb.chain_tables(family, self.device)
+            if chains is None
+            else _chain_device_tables(self.tb, ch, self.device)
+        )
         self.kernel(
             "kcp_affine_merge",
             ch.n_chains * (ch.ncols // cols_eff),
@@ -2882,12 +3078,12 @@ class CallKcp:
             c=c,
             x0=x0,
             y=y,
-            chain_start=self.dev(tag + ("start",), ch.chain_start),
-            elem_m=self.dev(tag + ("m",), ch.elem_m, i64),
-            elem_c=self.dev(tag + ("c",), ch.elem_c, i64),
-            elem_y=self.dev(tag + ("y",), ch.elem_y, i64),
-            x0_index=self.dev(tag + ("x0",), ch.x0_index, i64),
-            y_final=self.dev(tag + ("yf",), ch.y_final, i64),
+            chain_start=start,
+            elem_m=elem_m,
+            elem_c=elem_c,
+            elem_y=elem_y,
+            x0_index=x0_index,
+            y_final=y_final,
             ncols=int(ch.ncols),
             transpose_m=int(spec["tm"]),
             write_states=int(spec["ws"]),
@@ -3087,8 +3283,13 @@ class CallKcp:
             raise ValueError(
                 f"{tag}: split lists must have one entry per rank ({self.world})"
             )
-        send = self.buf(send_name)[: sum(send_splits)]
-        recv = self.buf(recv_name)[: sum(recv_splits)]
+        send, recv = self.buf(send_name), self.buf(recv_name)
+        n_send, n_recv = sum(send_splits), sum(recv_splits)
+        # a buffer of exactly the exchanged size is its own leading view (same storage, offset, shape, stride)
+        if send.numel() != n_send:
+            send = send[:n_send]
+        if recv.numel() != n_recv:
+            recv = recv[:n_recv]
         self.counters["collectives"] += 1
         self._sequence(tag)
         if self.world == 1 or not (dist.is_available() and dist.is_initialized()):
@@ -3154,6 +3355,9 @@ def saved_states(saved: SavedKcp) -> torch.Tensor:
 
 def _record(kind: str, call: CallKcp) -> None:
     """The launch inventory of the last forward / backward (evidence)."""
+    ws = call.ws
+    pool_bytes = ws.pool_bytes
+    tape_bytes = ws.tape_bytes
     LAST_CALL[kind] = {
         **{f"n_{k}": v for k, v in call.counters.items()},
         "sequence": list(call.sequence),
@@ -3169,9 +3373,11 @@ def _record(kind: str, call: CallKcp) -> None:
         "H_qk": call.H_qk,
         "HV": call.HV,
         "T_r": call.T_r,
-        "workspace_bytes": call.ws.bytes,
-        "pool_bytes": call.ws.pool_bytes,
-        "tape_bytes": call.ws.tape_bytes,
+        "workspace_bytes": sum(pool_bytes.values())
+        + tape_bytes
+        + ws.ticket_bytes,  # = ws.bytes
+        "pool_bytes": pool_bytes,
+        "tape_bytes": tape_bytes,
         "fresh_bytes": {k: t.numel() * t.element_size() for k, t in call.bufs.items()},
         "precision_mode": call.precision_mode,
         "transfer_walk": call.transfer_walk,
@@ -3691,7 +3897,7 @@ def _forward(
             merged_start = True
         _ring_forward(call)
     else:
-        w1 = call.a2a("c1", "c1_send", "c1_recv", *tb.split_elems("c1"))
+        w1 = call.a2a("c1", "c1_send", "c1_recv", *tb.split_lists("c1"))
         if not wait_first:
             if tb.P > 1:
                 call.merge(
@@ -3718,7 +3924,7 @@ def _forward(
             # plane exists from here to wait(c2) only, not across the whole forward
             call.fresh("c2_send")
         call.merge("fwd")  # the owner's chains: S_in slices into the c2 send layout
-        w2 = call.a2a("c2", "c2_send", "S_in", *tb.split_elems("c2"))
+        w2 = call.a2a("c2", "c2_send", "S_in", *tb.split_lists("c2"))
         call.wait(w2)
         w2 = None
         # sent: a fresh plane goes now (a workspace pool stays until FWD_DEAD_POOLS)
@@ -3922,7 +4128,7 @@ def _backward(call: CallKcp, saved: SavedKcp | None) -> None:
     ):  # adjoint hops from the document end; b2_recv filled as b2 would (bitwise)
         _ring_backward(call)
     else:
-        wb1 = call.a2a("b1", "b1_send", "b1_recv", *tb.split_elems(f"b1_{form}"))
+        wb1 = call.a2a("b1", "b1_send", "b1_recv", *tb.split_lists(f"b1_{form}"))
         call.wait(wb1)
         wb1 = None
         call.merge(
@@ -3932,7 +4138,7 @@ def _backward(call: CallKcp, saved: SavedKcp | None) -> None:
             call.release_pools(BWD_DEAD_AFTER_ADJ_MERGE)
             # the saved c1 receive tensor: the adjoint merge was its last reader
             call.drop_bound("c1_recv", saved)
-        wb2 = call.a2a("b2", "b2_send", "b2_recv", *tb.split_elems("b2"))
+        wb2 = call.a2a("b2", "b2_send", "b2_recv", *tb.split_lists("b2"))
         if not wait_first:
             if tb.P > 1:
                 call.merge("dcarry_end")  # reads the staging planes only
@@ -4182,8 +4388,10 @@ def _prepare(
     backward: bool,
     dout=None,
     fresh_pools: Sequence[str] = (),
+    saved_backward: bool = False,
 ):
-    """``fresh_pools``: the pools this call binds fresh / saved tensors for (never read from the workspace)."""
+    """``fresh_pools``: the pools this call binds fresh / saved tensors for (never read from the workspace);
+    ``saved_backward``: a backward from a saved set (it never exchanges through the forward's pools)."""
     backend = get_backend(opts.backend)
     q, k, v, g, beta, T, H_qk, HV, batched = _operands(
         q, k, v, g, beta, ctx, dtypes=backend.dtypes, layout=opts.layout
@@ -4196,8 +4404,13 @@ def _prepare(
         if not dout.is_contiguous():
             dout = dout.contiguous()
         _check(dout, "dout", (T, HV, D), backend.dtypes["dout"], device)
-    if workspace is None:
+    per_call = workspace is None
+    if per_call:
         workspace = WorkspaceKcp(state_dtype=backend.dtypes["state"])
+        # the per-call workspace's ticket slots: the context's zeroed set of this stream (fresh under a capture)
+        shared = _call_tickets(ctx, device)
+        if shared is not None:
+            workspace._tickets, workspace._ticket_views = shared
     elif not isinstance(workspace, WorkspaceKcp):
         raise TypeError("workspace must be a WorkspaceKcp")
     if workspace.state_dtype != backend.dtypes["state"]:
@@ -4209,7 +4422,13 @@ def _prepare(
         ctx, "prepare", None
     )  # the plan's device tables per (HV, sm_count, P) key, uploaded at first use
     if callable(prepare):
-        prepare(H_qk, HV, P=P)
+        caches = getattr(ctx, "_caches", None)
+        # the bundle is built once per key: later calls skip the lookup
+        done = ("kcp_prepared", H_qk, HV, P)
+        if not isinstance(caches, dict) or done not in caches:
+            prepare(H_qk, HV, P=P)
+            if isinstance(caches, dict):
+                caches[done] = True
     # Dead pools are not allocated (R2-L1 1a): the ring pools under the a2a exchange and the pools the call binds
     # fresh / saved tensors for (``c1_recv`` / ``stage_m`` under ``save_transfer``) never hold a byte of this call.
     skip = list(fresh_pools)
@@ -4219,6 +4438,11 @@ def _prepare(
             # the eager a2a forward binds a fresh c2_send plane at its first writer (the fwd merge) and drops it after
             # wait(c2); a captured forward keeps the pool (its address is baked into the graph)
             skip.append("c2_send")
+    if per_call and saved_backward:
+        # the per-call workspace of a saved-context backward: the forward exchange's pools are never touched (the
+        # saved c1 receive tensor, when there is one, is bound instead of c1_recv); a caller-held workspace keeps
+        # its documented layout (gdn_workspace_layout_kcp)
+        skip += list(SAVED_BWD_DEAD_POOLS)
     tb = workspace.ensure(
         ctx,
         H_qk,
@@ -4228,6 +4452,7 @@ def _prepare(
         fused_walks=int(opts.knob("fused_walks")),
         P=P,
         skip=skip,
+        skip_empty=per_call,  # the per-call workspace: no empty pools (made on demand by pool())
     )
     ops = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
     if dout is not None:
@@ -4803,6 +5028,7 @@ def _bwd_entry(
         backward=True,
         dout=dout,
         fresh_pools=_saved_fresh_pools(saved),
+        saved_backward=saved is not None,
     )
     if saved is not None:
         _check_saved(saved, call)
@@ -4826,6 +5052,7 @@ def _bwd_entry(
             backward=True,
             dout=dout,
             fresh_pools=_saved_fresh_pools(saved),
+            saved_backward=saved is not None,
         )
         if saved is not None:
             _check_saved(saved, call)
@@ -4946,15 +5173,12 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
             raise ValueError(
                 f"ChunkGDNFunctionKcp.backward: the forward ran in mode {getattr(fctx, 'kcp_mode', None)!r}, not {MODE!r}"
             )
-        saved = (
-            None
-            if meta is None
-            else dataclasses.replace(
-                SavedKcp.from_tensors(tensors, meta[0], meta[1], ctx),
-                # this node's own set: forgotten tensor by tensor at the last reader
-                release_in_backward=True,
-            )
-        )
+        saved = None
+        if meta is not None:
+            saved = SavedKcp.from_tensors(tensors, meta[0], meta[1], ctx)
+            # this node's own set (just built, referenced nowhere else): forgotten tensor by tensor at the last
+            # reader; a field outside the comparison, set on the fresh frozen instance (as SavedKcp.forget does)
+            object.__setattr__(saved, "release_in_backward", True)
         # the set above holds the only Python references to the saved tensors
         del tensors
         if (
@@ -4993,6 +5217,30 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
             opts=opts,
         )
         return dq, dk, dv, dg, dbeta, None, None, None, None, None, None
+
+
+# chunk_gdn_kcp's validated options per keyword set (no ``options`` object): an OptionsKcp built and checked once per
+# distinct keyword values (with their types, so ``1`` never stands in for ``True``) and shared by the calls -- never
+# handed to the caller, never mutated by the package (a recompute handle's form is a dataclasses.replace copy).
+_KEYWORD_OPTIONS: dict[tuple, OptionsKcp] = {}
+KEYWORD_OPTIONS_MAX = 64
+
+
+def _keyword_options(over: dict[str, Any], knobs: dict[str, Any]) -> OptionsKcp:
+    try:
+        key = tuple((k, type(v), v) for k, v in sorted(over.items())) + (
+            None,
+            *((k, type(v), v) for k, v in sorted(knobs.items())),
+        )
+        opts = _KEYWORD_OPTIONS.get(key)
+    except TypeError:  # an unhashable value (a test_knobs dict): validated per call
+        return make_options(None, **over, **knobs)
+    if opts is None:
+        opts = make_options(None, **over, **knobs)
+        if len(_KEYWORD_OPTIONS) >= KEYWORD_OPTIONS_MAX:
+            _KEYWORD_OPTIONS.clear()
+        _KEYWORD_OPTIONS[key] = opts
+    return opts
 
 
 def chunk_gdn_kcp(
@@ -5037,7 +5285,11 @@ def chunk_gdn_kcp(
         raise ValueError(
             "recompute_handle keeps the incoming states only: it needs save_transfer=False"
         )
-    opts = make_options(options, **over, **knobs)
+    opts = (
+        make_options(options, **over, **knobs)
+        if options is not None
+        else _keyword_options(over, knobs)
+    )
     if recompute_handle is not None:
         if opts.boundary_mode != "saved" or opts.graph != "off":
             raise ValueError(
