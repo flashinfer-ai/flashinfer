@@ -52,8 +52,18 @@ ROLES = ("dispatch", "load_a", "load_b", "mma", "schedule", "epilogue")
 SETMAXNREG = "setmaxnreg."
 
 
-def expected_block_m(num_tokens):
-    """Source tile height of a TP/EP row: 16 rows up to 512 tokens, 32 at 1024, 128 at 4096."""
+# The TP/EP rows whose sm_103a program runs another source tile height than
+# its token count's: the 48-expert shape at 128 and 512 tokens runs the 32-row
+# tile of the 1024-token program.
+SHAPE_BLOCK_M = {(48, 2304, 128): 32, (48, 2304, 512): 32}
+
+
+def expected_block_m(num_experts, intermediate, num_tokens):
+    """Source tile height of a TP/EP row: 16 rows up to 512 tokens, 32 at 1024,
+    128 at 4096, unless ``SHAPE_BLOCK_M`` names the row's own."""
+    shape = (num_experts, intermediate, num_tokens)
+    if shape in SHAPE_BLOCK_M:
+        return SHAPE_BLOCK_M[shape]
     return 128 if num_tokens >= 4096 else 32 if num_tokens >= 1024 else 16
 
 
@@ -158,7 +168,7 @@ def test_tp_ep_routes_ship_with_the_local_expert_filter_and_their_source_form():
                 num_experts, intermediate
             ), shape
             assert metadata["kernel_intermediate"] == intermediate, shape
-            assert metadata["block_m"] == expected_block_m(num_tokens), shape
+            assert metadata["block_m"] == expected_block_m(*shape), shape
             assert (
                 metadata["readiness"],
                 metadata["slot_list"],

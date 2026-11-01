@@ -354,6 +354,12 @@ PACKAGES: tuple[Package, ...] = (
         refs_with_kcp,
     ),
     Package(
+        "flashinfer.experimental.cake.cake_causal_conv1d_train_backend",
+        "flashinfer/experimental/cake/cake_causal_conv1d_train_backend",
+        "cake_jit.py",
+        refs_with_kcp,
+    ),
+    Package(
         "flashinfer.cake_gated_act_mxfp8_backend",
         "flashinfer/cake_gated_act_mxfp8_backend",
         "cake_jit.py",
@@ -422,6 +428,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.cake_dsa_indexer_det",
         "flashinfer/experimental/cake_dsa_indexer_det",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_msa_icp_indexer",
+        "flashinfer/experimental/cake_msa_icp_indexer",
         "cake_jit.py",
         refs_generic,
     ),

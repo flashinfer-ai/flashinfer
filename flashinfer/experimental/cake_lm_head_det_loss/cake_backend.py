@@ -169,6 +169,7 @@ import functools
 import math
 import re
 import struct
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, NamedTuple, Optional, Union
@@ -331,7 +332,8 @@ GEMM_SCALARS = (
 # writes slab ``s - 1`` of the FP32 workspace ``WS [k_slices - 1, rows, H]`` (``ws_slab`` = elements between
 # slabs) and the host adds the slabs into ``dX_acc`` in fixed slab order (one RN add per element per
 # slab, no atomics).  The slice count of a chunk is chosen from its row count and the SM count
-# (:func:`recommended_k_slices`).  ``WS`` of the other GEMMs is an unused 16-float dummy (``ws_slab`` 0).
+# (:func:`recommended_k_slices`) and fitted to the K steps so that every slice holds one (:func:`dx_slices_fit`).
+# ``WS`` of the other GEMMs is an unused 16-float dummy (``ws_slab`` 0).
 DX_SLICED_STAGE = "gemm_dx_s"
 # Fused weight-gradient output: the LAST chunk's ``dz_c^T @ X_c`` GEMM run in the backward (where the upstream scalar
 # gradient ``g`` is known) with the scale and the output cast fused into its epilogue, ``C = cast(g * (WS + tile))`` --
@@ -1332,6 +1334,11 @@ def _gemm_scalars(
         )
     if ks > k_iters:
         raise ValueError(f"{stage}: {ks} K slices over {k_iters} K steps")
+    if ks > 1 and dx_slices_fit(ks, k_iters) != ks:
+        raise ValueError(
+            f"{stage}: {ks} K slices of {-(-k_iters // ks)} K steps over {k_iters} K steps leave the last slice "
+            "without a K step"
+        )
     return dict(
         M=rows_c,
         m_tiles=geometry.row_tiles(rows_c, item_rows),
@@ -1369,6 +1376,16 @@ def wave_efficiency(
     return items / (-(-items // clusters) * clusters)
 
 
+def dx_slices_fit(k_slices: int, k_iters: int) -> int:
+    """The slice count that runs ``k_slices`` requested slices over ``k_iters`` K steps with every slice holding at least
+    one step (the reduction form's launch contract ``k_slice_iters * (k_slices - 1) < k_iters`` with ``k_slice_iters =
+    ceil(k_iters / k_slices)``): ``ceil(k_iters / ceil(k_iters / k_slices))`` -- ``k_slices`` itself unless the
+    ceil-sized slices cover ``K`` with fewer of them (e.g. 3 requested over 4 steps run as 2)."""
+    ks, k = max(1, int(k_slices)), max(1, int(k_iters))
+    ksi = -(-k // ks)
+    return -(-k // ksi)
+
+
 def recommended_k_slices(
     rows_c: int,
     hidden: int,
@@ -1376,10 +1393,12 @@ def recommended_k_slices(
     max_slices: int,
     geometry: "Geometry",
     resident: Optional[int] = None,
+    vocab: Optional[int] = None,
 ) -> int:
     """Slice count of the dX GEMM for a chunk of ``rows_c`` rows: the ``S`` in ``[1, max_slices]`` with the best
     wave efficiency net of ``K_SLICE_PENALTY`` per extra slab.  Deterministic in the shapes, the SM count and the
-    device's co-resident cluster count (:func:`cluster_resident`)."""
+    device's co-resident cluster count (:func:`cluster_resident`).  ``vocab`` (the dX GEMM's K = V; every planner
+    passes it) fits the count to the K steps (:func:`dx_slices_fit`); ``None`` = the wave rule alone."""
     best, best_score = (
         1,
         wave_efficiency(rows_c, hidden, num_sms, 1, geometry, resident),
@@ -1390,7 +1409,9 @@ def recommended_k_slices(
         ) - K_SLICE_PENALTY * (s - 1)
         if score > best_score + 1e-9:
             best, best_score = s, score
-    return best
+    if vocab is None:
+        return best
+    return dx_slices_fit(best, int(vocab) // int(geometry.k_block))
 
 
 def cluster_resident(
@@ -1495,9 +1516,24 @@ DW_STREAM_MODES = (
     "auto",
 )  # the normalised ``dw_stream`` modes: never / every multi-chunk call / the chunk rule (:func:`dw_stream_mode`)
 DW_STREAM_MIN_CHUNKS = 3  # the side stream pays one cross-stream join per chunk and overlaps only the chunks before a deferred last one
-_DW_STREAMS: dict[
-    int, tuple
-] = {}  # device index -> (side stream, fork event); not a tensor, outside every workspace / binding
+# the per-thread, per-device host state of the calls (:func:`_thread_state`)
+_THREAD_STATE = threading.local()
+
+
+def _thread_state(name: str) -> dict:
+    """The calling thread's per-device dict ``name`` of the calls' host state -- ``"dw_streams"`` (device index ->
+    (side stream, fork event), :func:`_dw_stream`), ``"cells"`` (device index -> (pinned int32 [1] cell, event),
+    :func:`_hidden_count_cell`), ``"arange"`` (device index -> the growing int32 constant 1, 2, ..,
+    :func:`_hidden_count_arange`) and ``"arange_streams"`` (device index -> the raw streams the constant was recorded
+    on).  None is a tensor of a workspace or a binding.  Calls of different threads on one
+    device (each on its own stream) never share a stream, an event, a cell or the constant: one thread's call cannot
+    re-record another's fork event, overwrite its count before the read, or reallocate the constant its queued
+    kernels read; one thread runs one call at a time."""
+    state = getattr(_THREAD_STATE, name, None)
+    if state is None:
+        state = {}
+        setattr(_THREAD_STATE, name, state)
+    return state
 
 
 def dw_stream_mode(dw_stream: Optional[Union[bool, str]] = None) -> str:
@@ -1533,8 +1569,8 @@ def dw_side_stream(
     rule of :data:`DW_STREAM_MIN_CHUNKS` chunks.  Kernels, buffers, launch order per kernel and numerics are unchanged
     (the dX GEMM writes the dX rows / slabs, the accumulate reads the same ``dz`` and read-modify-writes ``dW_acc``;
     each kernel keeps its own order): only the launch stream differs, so every output is bitwise the single-stream
-    path's.  The per-device stream and fork event are shared by the calls on that device (one call at a time per
-    device, as the generated launches themselves)."""
+    path's.  The side stream and its fork event are per thread and per device (:func:`_thread_state`): calls of
+    different threads on one device never share them."""
     n = int(num_chunks)
     if n <= 1:
         return False
@@ -1547,10 +1583,12 @@ def dw_side_stream(
 
 
 def _dw_stream(index: int) -> tuple:
-    """``(side stream, fork event)`` of device ``index`` (created on first use; never part of a binding or a workspace)."""
-    pair = _DW_STREAMS.get(index)
+    """The calling thread's ``(side stream, fork event)`` of device ``index`` (created on first use; never part of a
+    binding or a workspace)."""
+    streams = _thread_state("dw_streams")
+    pair = streams.get(index)
     if pair is None:
-        pair = _DW_STREAMS[index] = (
+        pair = streams[index] = (
             torch.cuda.Stream(device=index),
             torch.cuda.Event(),
         )
@@ -1597,18 +1635,13 @@ def compaction_index(
     return valid, pos, idx_full
 
 
-_HIDDEN_COUNT_CELLS: dict[
-    int, tuple
-] = {}  # device index -> (pinned int32 [1] cell, event); one pair per device, reused by every call
-_HIDDEN_COUNT_ARANGE: dict[
-    int, torch.Tensor
-] = {}  # device index -> the growing int32 constant 1, 2, ... (no kernel per call)
-
-
 def _hidden_count_cell(index: int) -> tuple:
-    pair = _HIDDEN_COUNT_CELLS.get(index)
+    """The calling thread's ``(pinned int32 [1] cell, event)`` of device ``index``: the count's copy target and the
+    event behind it, reused by the thread's calls (each reads its count before the next call)."""
+    cells = _thread_state("cells")
+    pair = cells.get(index)
     if pair is None:
-        pair = _HIDDEN_COUNT_CELLS[index] = (
+        pair = cells[index] = (
             torch.empty((1,), dtype=torch.int32, pin_memory=True),
             torch.cuda.Event(),
         )
@@ -1616,12 +1649,24 @@ def _hidden_count_cell(index: int) -> tuple:
 
 
 def _hidden_count_arange(index: int, T: int) -> torch.Tensor:
-    ar = _HIDDEN_COUNT_ARANGE.get(index)
+    """The calling thread's int32 constant ``1, 2, ..`` of device ``index`` with at least ``T`` entries (no kernel per
+    call; grown by doubling), recorded on the current stream so a replaced constant is not reused before the
+    kernels queued on it have read it.  The allocator keeps every recorded stream until the constant is freed, so
+    each stream is recorded once per constant (``"arange_streams"``), not once per call."""
+    aranges = _thread_state("arange")
+    recorded = _thread_state("arange_streams")
+    ar = aranges.get(index)
     if ar is None or ar.numel() < T:
         cap = max(int(T), 2 * (0 if ar is None else int(ar.numel())))
-        ar = _HIDDEN_COUNT_ARANGE[index] = torch.arange(
+        ar = aranges[index] = torch.arange(
             1, cap + 1, dtype=torch.int32, device=torch.device("cuda", index)
         )
+        recorded[index] = set()
+    seen = recorded[index]
+    raw = _current_raw_stream(index)
+    if raw not in seen:
+        ar.record_stream(torch.cuda.current_stream(index))
+        seen.add(raw)
     return ar
 
 
@@ -2541,11 +2586,23 @@ def make_plan(
             raise ValueError(
                 f"gemm_tuning dx k_slices={explicit_k}: the registered program serves 1 .. {int(dx_max_slices)} dX slices"
             )
+        k_iters = int(problem.vocab) // int(geometry.k_block)
+        if dx_slices_fit(explicit_k, k_iters) != explicit_k:
+            raise ValueError(
+                f"gemm_tuning dx k_slices={explicit_k}: V = {problem.vocab} has {k_iters} K steps, which "
+                f"{explicit_k} slices of {-(-k_iters // explicit_k)} steps do not all reach"
+            )
         slices = tuple(explicit_k for _ in chunks)
     elif need_dx and int(dx_max_slices) > 1:
         slices = tuple(
             recommended_k_slices(
-                rows_c, problem.hidden, num_sms, dx_max_slices, geometry, dx_resident
+                rows_c,
+                problem.hidden,
+                num_sms,
+                dx_max_slices,
+                geometry,
+                dx_resident,
+                vocab=problem.vocab,
             )
             for _, rows_c in chunks
         )
@@ -2953,6 +3010,7 @@ def lm_head_det_loss_workspace_size(
                         dx_max_slices(stages),
                         geometry,
                         resident,
+                        vocab=vocab,
                     )
                     for rows_c in rows_candidates
                 ),
@@ -3160,19 +3218,50 @@ def bind_stage(
 _FFI_DEVICES: dict[int, Any] = {}
 
 
+def _constant_cells(device: torch.device) -> dict[str, torch.Tensor]:
+    """The cells of :func:`_device_constants`, filled on the current stream."""
+    return {
+        "grad_scale": torch.ones((1,), dtype=torch.float32, device=device),
+        "unit_scale": torch.ones((1,), dtype=torch.float32, device=device),
+        "f32_dummy": torch.zeros((16,), dtype=torch.float32, device=device),
+    }
+
+
+# The constant cells of each device index (:func:`_device_constants`): the first cells stored for a device are the
+# ones every thread uses.
+_DEVICE_CELLS: dict[int, dict[str, torch.Tensor]] = {}
+
+
 @functools.lru_cache(maxsize=None)
 def _device_constants(index: int) -> dict[str, torch.Tensor]:
     """The constant cells a remembered binding binds on every call, allocated once per device:
     ``grad_scale`` / ``unit_scale`` (``[1] = 1.0``; read-only here -- the loss entry's backward
     casts through :func:`backward_loss`, the log-probability entry's cast scale is 1) and the
     unused fp32 ``WS`` of the unsliced GEMMs.  Per-call ``torch.ones`` / ``torch.zeros`` would add
-    three fill launches to every remembered forward and backward."""
+    three fill launches to every remembered forward and backward.
+
+    Every stream and thread shares the cells, so they are filled on a stream from torch's stream
+    pool, and an event recorded behind the fills is waited for before they are cached: a call on
+    another stream never reads a cell before its fill.  The wait is not a stream or device
+    synchronization (PyTorch's synchronization debug mode does not flag it, and the mode is not
+    changed), but it can also wait for other work: torch hands out its pool streams round-robin, so
+    the caller's current stream can be that same stream (the fills then queue behind the caller's
+    work), and with CUDA lazy loading a kernel's first launch can wait for the device.  The first
+    calls of threads that miss the cache together each form cells, and all return the first cells
+    stored in :data:`_DEVICE_CELLS`; the other cells were waited for and are never read, so freeing
+    them is safe.  Under a CUDA graph capture, which cannot wait, the cells are made on the
+    capturing stream."""
     device = torch.device("cuda", int(index))
-    return {
-        "grad_scale": torch.ones((1,), dtype=torch.float32, device=device),
-        "unit_scale": torch.ones((1,), dtype=torch.float32, device=device),
-        "f32_dummy": torch.zeros((16,), dtype=torch.float32, device=device),
-    }
+    if torch.cuda.is_current_stream_capturing():
+        cells = _constant_cells(device)
+    else:
+        stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(stream):
+            cells = _constant_cells(device)
+            filled = torch.cuda.Event()
+            filled.record(stream)
+        filled.synchronize()
+    return _DEVICE_CELLS.setdefault(int(index), cells)
 
 
 def _unit_scale(device: torch.device) -> torch.Tensor:
@@ -3185,6 +3274,16 @@ def _unit_scale(device: torch.device) -> torch.Tensor:
     return torch.ones((1,), dtype=torch.float32, device=device)
 
 
+def _current_raw_stream(index: int) -> int:
+    """The raw handle of torch's current stream on device ``index``."""
+    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    return (
+        getter(index)
+        if getter is not None
+        else torch.cuda.current_stream(index).cuda_stream
+    )
+
+
 def _ffi_stream_context(index: int):
     """tvm-ffi environment-stream context for torch's current stream on device ``index``."""
     import tvm_ffi
@@ -3192,13 +3291,7 @@ def _ffi_stream_context(index: int):
     device = _FFI_DEVICES.get(index)
     if device is None:
         device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
-    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    raw = (
-        getter(index)
-        if getter is not None
-        else torch.cuda.current_stream(index).cuda_stream
-    )
-    return tvm_ffi.use_raw_stream(device, raw)
+    return tvm_ffi.use_raw_stream(device, _current_raw_stream(index))
 
 
 def side_stream_schedule(
@@ -4636,6 +4729,12 @@ def _meta(t: Optional[torch.Tensor]):
     )
 
 
+def _layout(t: Optional[torch.Tensor]):
+    """``(shape, stride, dtype)``: the key of a per-step operand whose address no plan reads (the remembered launches
+    re-bind it on every call)."""
+    return None if t is None else (tuple(t.shape), tuple(t.stride()), t.dtype)
+
+
 def forward_binding_key(
     X,
     W,
@@ -4707,15 +4806,18 @@ def logprob_backward_binding_key(
     logprob_dz=False,
 ) -> tuple:
     """Cache key of a log-probability backward binding (as :func:`forward_binding_key`); ``logprob_dz`` the resolved
-    recompute form (:func:`logprob_dz_default`)."""
+    recompute form (:func:`logprob_dz_default`).  ``lse`` and ``dlogp`` are keyed by layout alone (:func:`_layout`):
+    the forward's statistic and the incoming gradient are fresh tensors on every step, so their addresses would make
+    every step whose allocations moved a miss (a new runner, its allocations and validation), while the remembered
+    launches re-bind both per call."""
     return (
         "bwd",
         "logprob",
         _meta(X),
         _meta(W),
         _meta(labels),
-        _meta(lse),
-        _meta(dlogp),
+        _layout(lse),
+        _layout(dlogp),
         int(chunk_size),
         bool(need_dx),
         bool(need_dw),
@@ -5101,7 +5203,12 @@ class BindingCache:
     ``capacity`` (default :data:`BINDING_CACHE_DEFAULT_CAPACITY`, 64 bindings) bounds what is kept; ``enabled=False``
     bypasses the cache (every call validates and binds).  :meth:`configure` changes both at runtime.  The templated
     launches of the eager output-boundary casts (:func:`_eager_launch`) are kept alongside, at most
-    :attr:`EAGER_CAPACITY` forms, and follow the same switch and :meth:`clear`."""
+    :attr:`EAGER_CAPACITY` forms, and follow the same switch and :meth:`clear`.
+
+    Threads share the cache without a lock: each ordered-dict operation is atomic, and a step that finds its key or
+    entry gone -- another thread's eviction between a lookup's ``get`` and its recency update, or between an
+    eviction's size check and its ``popitem`` -- skips that step (a looked-up binding stays valid for its call; an
+    eviction that finds the cache already within its capacity stops).  The hit / miss counters are statistics."""
 
     # templated launches of the eager output-boundary stages (:func:`_eager_launch`) kept alongside the bindings
     EAGER_CAPACITY = 64
@@ -5132,8 +5239,7 @@ class BindingCache:
                     f"to bypass it), got {capacity!r}"
                 )
             self.capacity = capacity
-            while len(self._bindings) > self.capacity:
-                self._bindings.popitem(last=False)
+            _evict(self._bindings, self.capacity)
         if enabled is not None:
             self.enabled = bool(enabled)
             if not self.enabled:
@@ -5145,7 +5251,7 @@ class BindingCache:
 
     @property
     def owned_bytes(self) -> int:
-        return sum(b.owned_bytes for b in self._bindings.values())
+        return sum(b.owned_bytes for b in _values(self._bindings))
 
     def clear(self) -> None:
         self._bindings.clear()
@@ -5156,14 +5262,19 @@ class BindingCache:
         entry = self._eager.get(form)
         if entry is None or entry[0] is not record:
             return None
-        self._eager.move_to_end(form)
+        # another thread's eviction since the get: the launch stays valid for this call (one line: a ``try`` line of
+        # its own would add a NOP to every hit)
+        # fmt: off
+        try: self._eager.move_to_end(form)  # noqa: E701, SIM105
+        except KeyError: pass  # noqa: E701
+        # fmt: on
         return entry[1]
 
     def eager_remember(self, form: tuple, record, launch: _Launch) -> None:
         self._eager.pop(form, None)
         self._eager[form] = (record, launch)
-        while len(self._eager) > self.EAGER_CAPACITY:
-            self._eager.popitem(last=False)
+        if len(self._eager) > self.EAGER_CAPACITY:
+            _evict(self._eager, self.EAGER_CAPACITY)
 
     def lookup(self, key: tuple) -> Optional[_Binding]:
         binding = self._bindings.get(key)
@@ -5171,7 +5282,12 @@ class BindingCache:
             self.misses += 1
         else:
             self.hits += 1
-            self._bindings.move_to_end(key)
+            # another thread's eviction since the get: the binding stays valid for this call (one line, as in
+            # :meth:`eager_lookup`)
+            # fmt: off
+            try: self._bindings.move_to_end(key)  # noqa: E701, SIM105
+            except KeyError: pass  # noqa: E701
+            # fmt: on
         return binding
 
     def peek(self, key: tuple) -> Optional[_Binding]:
@@ -5180,9 +5296,28 @@ class BindingCache:
     def remember(self, key: tuple, binding: _Binding) -> _Binding:
         self._bindings.pop(key, None)
         self._bindings[key] = binding
-        while len(self._bindings) > self.capacity:
-            self._bindings.popitem(last=False)
+        if len(self._bindings) > self.capacity:
+            _evict(self._bindings, self.capacity)
         return binding
+
+
+def _evict(entries: OrderedDict, capacity: int) -> None:
+    """Drop the least recently used entries of ``entries`` above ``capacity``; stop when another thread's eviction
+    emptied it first."""
+    while len(entries) > capacity:
+        try:
+            entries.popitem(last=False)
+        except KeyError:
+            return
+
+
+def _values(entries: OrderedDict) -> list:
+    """The values of ``entries`` as a list, copied again when another thread changed it during the copy."""
+    while True:
+        try:
+            return list(entries.values())
+        except RuntimeError:  # OrderedDict mutated during iteration
+            continue
 
 
 # Enabled, 64 bindings.  ``flashinfer.chunked_lm_head`` applies its environment variables through

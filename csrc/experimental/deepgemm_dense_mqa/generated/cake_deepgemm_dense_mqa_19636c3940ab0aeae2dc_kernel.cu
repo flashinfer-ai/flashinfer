@@ -651,8 +651,8 @@ kernel_cake_deepgemm_dense_mqa_19636c3940ab0aeae2dc(const __grid_constant__ CUte
                             }
                             unsigned int _max_0 = ((coverage_end) > (clean_begin) ? (coverage_end) : (clean_begin));
                             unsigned int aligned_start_0 = (_max_0 + 3) / 4 * 4;
-                            unsigned int aligned_end_1 = clean_end / 4 * 4;
-                            if (aligned_start_0 >= aligned_end_1) {
+                            unsigned int aligned_end_0 = clean_end / 4 * 4;
+                            if (aligned_start_0 >= aligned_end_0) {
                                 for (unsigned int j_4 = _max_0 + (unsigned int)lane; j_4 < clean_end; j_4 += 32) {
                                     {
                                         auto _gst_4 = row_ptr + j_4;
@@ -669,7 +669,7 @@ kernel_cake_deepgemm_dense_mqa_19636c3940ab0aeae2dc(const __grid_constant__ CUte
                                         *(reinterpret_cast<float*>(_gst_5) + (0)) = -CUDART_INF_F;
                                     }
                                 }
-                                for (unsigned int j_6 = aligned_end_1 + (unsigned int)lane; j_6 < clean_end; j_6 += 32) {
+                                for (unsigned int j_6 = aligned_end_0 + (unsigned int)lane; j_6 < clean_end; j_6 += 32) {
                                     {
                                         auto _gst_6 = row_ptr + j_6;
                                         __builtin_assume(__isGlobal(_gst_6));
@@ -678,8 +678,8 @@ kernel_cake_deepgemm_dense_mqa_19636c3940ab0aeae2dc(const __grid_constant__ CUte
                                 }
                                 __syncwarp();
                                 if (elect_sync()) {
-                                    for (unsigned int j_7 = aligned_start_0; j_7 < aligned_end_1; j_7 += 1024) {
-                                        unsigned int bulk_elems_1 = ((aligned_end_1 - j_7) < (1024) ? (aligned_end_1 - j_7) : (1024));
+                                    for (unsigned int j_7 = aligned_start_0; j_7 < aligned_end_0; j_7 += 1024) {
+                                        unsigned int bulk_elems_1 = ((aligned_end_0 - j_7) < (1024) ? (aligned_end_0 - j_7) : (1024));
                                         {
                                             void* _cpbulk_dst_7 = reinterpret_cast<void*>(row_ptr + j_7);
                                             asm volatile(
@@ -859,18 +859,18 @@ kernel_cake_deepgemm_dense_mqa_19636c3940ab0aeae2dc(const __grid_constant__ CUte
                             }
                         }
                         float2 sum0_0 = make_float2(0.0f, 0.0f);
-                        float2 sum1_1 = make_float2(0.0f, 0.0f);
+                        float2 sum1_0 = make_float2(0.0f, 0.0f);
                         #pragma unroll
                         for (int j_9 = 0; j_9 < 32; j_9 += 4) {
                             float2 doubled0_1 = add_f32x2_noftz(make_float2(_tmem_load_1[j_9], _tmem_load_1[j_9 + 1]), make_float2(fabsf(_tmem_load_1[j_9]), fabsf(_tmem_load_1[j_9 + 1])));
                             sum0_0 = fma_f32x2_rn_noftz(doubled0_1, make_float2(weights_reg[32 + j_9], weights_reg[32 + j_9 + 1]), sum0_0);
                             float2 doubled1_1 = add_f32x2_noftz(make_float2(_tmem_load_1[j_9 + 2], _tmem_load_1[j_9 + 3]), make_float2(fabsf(_tmem_load_1[j_9 + 2]), fabsf(_tmem_load_1[j_9 + 3])));
-                            sum1_1 = fma_f32x2_rn_noftz(doubled1_1, make_float2(weights_reg[32 + j_9 + 2], weights_reg[32 + j_9 + 3]), sum1_1);
+                            sum1_0 = fma_f32x2_rn_noftz(doubled1_1, make_float2(weights_reg[32 + j_9 + 2], weights_reg[32 + j_9 + 3]), sum1_0);
                         }
-                        float2 total_2 = add_f32x2_noftz(sum0_0, sum1_1);
-                        float relu_wsum_3 = (total_2.x + total_2.y) * 0.5f;
+                        float2 total_0 = add_f32x2_noftz(sum0_0, sum1_0);
+                        float relu_wsum_0 = (total_0.x + total_0.y) * 0.5f;
                         int q_row_4 = q_start_0 + 1;
-                        float in_range_result_5 = scale_kv * relu_wsum_3;
+                        float in_range_result_5 = scale_kv * relu_wsum_0;
                         {
                             float materialized_result_1 = in_range_result_5;
                             unsigned int rel_kv_1 = (unsigned int)kv_pos - dense_start[1];
@@ -884,19 +884,19 @@ kernel_cake_deepgemm_dense_mqa_19636c3940ab0aeae2dc(const __grid_constant__ CUte
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
-                        float2 sum0_6 = make_float2(0.0f, 0.0f);
-                        float2 sum1_7 = make_float2(0.0f, 0.0f);
+                        float2 sum0_1 = make_float2(0.0f, 0.0f);
+                        float2 sum1_1 = make_float2(0.0f, 0.0f);
                         #pragma unroll
                         for (int j_10 = 0; j_10 < 32; j_10 += 4) {
                             float2 doubled0_2 = add_f32x2_noftz(make_float2(_tmem_load_2[j_10], _tmem_load_2[j_10 + 1]), make_float2(fabsf(_tmem_load_2[j_10]), fabsf(_tmem_load_2[j_10 + 1])));
-                            sum0_6 = fma_f32x2_rn_noftz(doubled0_2, make_float2(weights_reg[64 + j_10], weights_reg[64 + j_10 + 1]), sum0_6);
+                            sum0_1 = fma_f32x2_rn_noftz(doubled0_2, make_float2(weights_reg[64 + j_10], weights_reg[64 + j_10 + 1]), sum0_1);
                             float2 doubled1_2 = add_f32x2_noftz(make_float2(_tmem_load_2[j_10 + 2], _tmem_load_2[j_10 + 3]), make_float2(fabsf(_tmem_load_2[j_10 + 2]), fabsf(_tmem_load_2[j_10 + 3])));
-                            sum1_7 = fma_f32x2_rn_noftz(doubled1_2, make_float2(weights_reg[64 + j_10 + 2], weights_reg[64 + j_10 + 3]), sum1_7);
+                            sum1_1 = fma_f32x2_rn_noftz(doubled1_2, make_float2(weights_reg[64 + j_10 + 2], weights_reg[64 + j_10 + 3]), sum1_1);
                         }
-                        float2 total_8 = add_f32x2_noftz(sum0_6, sum1_7);
-                        float relu_wsum_9 = (total_8.x + total_8.y) * 0.5f;
+                        float2 total_1 = add_f32x2_noftz(sum0_1, sum1_1);
+                        float relu_wsum_1 = (total_1.x + total_1.y) * 0.5f;
                         int q_row_10 = q_start_0 + 2;
-                        float in_range_result_11 = scale_kv * relu_wsum_9;
+                        float in_range_result_11 = scale_kv * relu_wsum_1;
                         {
                             float materialized_result_2 = in_range_result_11;
                             unsigned int rel_kv_2 = (unsigned int)kv_pos - dense_start[2];
@@ -907,19 +907,19 @@ kernel_cake_deepgemm_dense_mqa_19636c3940ab0aeae2dc(const __grid_constant__ CUte
                                 *(reinterpret_cast<float*>(Logits + out_elem_u32_2) + (0)) = materialized_result_2;
                             }
                         }
-                        float2 sum0_12 = make_float2(0.0f, 0.0f);
-                        float2 sum1_13 = make_float2(0.0f, 0.0f);
+                        float2 sum0_2 = make_float2(0.0f, 0.0f);
+                        float2 sum1_2 = make_float2(0.0f, 0.0f);
                         #pragma unroll
                         for (int j_11 = 0; j_11 < 32; j_11 += 4) {
                             float2 doubled0_3 = add_f32x2_noftz(make_float2(_tmem_load_3[j_11], _tmem_load_3[j_11 + 1]), make_float2(fabsf(_tmem_load_3[j_11]), fabsf(_tmem_load_3[j_11 + 1])));
-                            sum0_12 = fma_f32x2_rn_noftz(doubled0_3, make_float2(weights_reg[96 + j_11], weights_reg[96 + j_11 + 1]), sum0_12);
+                            sum0_2 = fma_f32x2_rn_noftz(doubled0_3, make_float2(weights_reg[96 + j_11], weights_reg[96 + j_11 + 1]), sum0_2);
                             float2 doubled1_3 = add_f32x2_noftz(make_float2(_tmem_load_3[j_11 + 2], _tmem_load_3[j_11 + 3]), make_float2(fabsf(_tmem_load_3[j_11 + 2]), fabsf(_tmem_load_3[j_11 + 3])));
-                            sum1_13 = fma_f32x2_rn_noftz(doubled1_3, make_float2(weights_reg[96 + j_11 + 2], weights_reg[96 + j_11 + 3]), sum1_13);
+                            sum1_2 = fma_f32x2_rn_noftz(doubled1_3, make_float2(weights_reg[96 + j_11 + 2], weights_reg[96 + j_11 + 3]), sum1_2);
                         }
-                        float2 total_14 = add_f32x2_noftz(sum0_12, sum1_13);
-                        float relu_wsum_15 = (total_14.x + total_14.y) * 0.5f;
+                        float2 total_2 = add_f32x2_noftz(sum0_2, sum1_2);
+                        float relu_wsum_2 = (total_2.x + total_2.y) * 0.5f;
                         int q_row_16 = q_start_0 + 3;
-                        float in_range_result_17 = scale_kv * relu_wsum_15;
+                        float in_range_result_17 = scale_kv * relu_wsum_2;
                         {
                             float materialized_result_3 = in_range_result_17;
                             unsigned int rel_kv_3 = (unsigned int)kv_pos - dense_start[3];

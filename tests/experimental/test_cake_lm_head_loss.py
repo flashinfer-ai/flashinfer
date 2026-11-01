@@ -1431,6 +1431,102 @@ def test_gemm_scalars_mirror_the_kernel_contract():
         gs("row_grad", g, hidden=H, vocab=V, rows_c=4096)
 
 
+def test_dx_slices_fit_every_k_step_count():
+    """``dx_slices_fit``: over every K step count and requested slice count, the fitted count is the largest count at
+    most the request whose ceil-sized slices all hold a K step (the K-sliced dX GEMM's last slice runs
+    ``k_iters - (S - 1) * ceil(k_iters / S)`` steps; at zero or fewer its slab would hold an unaccumulated tile), and
+    ``gemm_scalars`` takes exactly the fitting counts of the K-sliced form."""
+    fit = cake_backend.dx_slices_fit
+
+    def holds(s, k):
+        return s == 1 or (s - 1) * -(-k // s) < k
+
+    g = Geometry.from_record(None)
+    empty = []
+    for k in range(1, 513):
+        for ks in range(1, 9):
+            f = fit(ks, k)
+            assert 1 <= f <= ks and holds(f, k), (k, ks, f)
+            assert f == max(s for s in range(1, ks + 1) if holds(s, k)), (k, ks, f)
+            assert (f == ks) == holds(ks, k), (k, ks, f)
+            if not holds(ks, k):
+                empty.append((k, ks))
+        for ks in range(2, cake_backend.DX_K_SLICES_MAX + 1):
+            kw = dict(hidden=6144, vocab=k * g.k_block, rows_c=4096, k_slices=ks)
+            if holds(ks, k):
+                sc = cake_backend.gemm_scalars("gemm_dx_s", g, **kw)
+                last = sc["k_iters"] - (ks - 1) * sc["k_slice_iters"]
+                assert sc["k_iters"] == k and 1 <= last <= sc["k_slice_iters"], (k, ks)
+            else:
+                with pytest.raises(ValueError):
+                    cake_backend.gemm_scalars("gemm_dx_s", g, **kw)
+    # the cases of the report: 3 slices over 4 K steps (2, 2, 0) and 4 slices over 5, 6 or 9 K steps
+    assert {(4, 3), (5, 4), (6, 4), (9, 4)} <= set(empty)
+    cases = ((4, 3), (5, 4), (6, 4), (9, 4), (8, 3), (2420, 4))
+    assert [fit(ks, k) for k, ks in cases] == [2, 3, 3, 3, 3, 4]
+    # V is a multiple of vocab_multiple: of the shipped counts 1 .. DX_K_SLICES_MAX only 3 slices over V = 256 empty one
+    step = g.vocab_multiple // g.k_block
+    reachable = {
+        (k, ks)
+        for k, ks in empty
+        if k % step == 0 and ks <= cake_backend.DX_K_SLICES_MAX
+    }
+    assert reachable == {(4, 3)}
+
+
+def test_dx_slice_rule_and_pin_fit_the_k_steps():
+    """The slice rule fits its count to V's K steps on every row count, H and SM count, with the default geometry and
+    every architecture record's (the unfitted rule picks 3 slices over V = 256's four K steps on 148 and 152 SMs at
+    T = 1000, H = 6144), and both planners reject an explicit ``k_slices`` pin that leaves a slice without a K step."""
+    g = Geometry.from_record(None)
+    geometries = [g] + [Geometry.from_record(r) for r in cake_jit.MODULES.values()]
+    assert len(geometries) >= 3
+    for geo in geometries:
+        for sms in (132, 148, 152, 160):
+            resident = cake_backend.cluster_resident(None, geo.dx_cluster_ctas, sms)
+            for H in (256, 512, 1024, 2048, 4096, 6144, 7168, 8192):
+                for rows in range(1, 8193, 127):
+                    raw = recommended_k_slices(rows, H, sms, 4, geo, resident)
+                    for V in (256, 512, 768, 1024, 154880):
+                        got = recommended_k_slices(
+                            rows, H, sms, 4, geo, resident, vocab=V
+                        )
+                        assert got == cake_backend.dx_slices_fit(raw, V // geo.k_block)
+                        assert got == raw or (V == 256 and raw == 3 and got == 2)
+    for sms in (148, 152):
+        assert recommended_k_slices(1000, 6144, sms, 4, g) == 3
+        assert recommended_k_slices(1000, 6144, sms, 4, g, vocab=256) == 2
+    kw = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+    )
+    for planner in (cake_backend.make_plan, opt_in.make_plan):
+        plan = planner(_problem(1000, 6144, 256, 4096), **kw)
+        assert plan.dx_slices == (2,)
+        assert planner(_problem(1000, 6144, 512, 4096), **kw).dx_slices == (3,)
+        for k in (1, 2, 4):
+            pinned = planner(
+                _problem(1000, 6144, 256, 4096),
+                gemm_tuning={"dx": {"k_slices": k}},
+                **kw,
+            )
+            assert pinned.dx_slices == (k,)
+        with pytest.raises(ValueError, match="K steps"):
+            planner(
+                _problem(1000, 6144, 256, 4096),
+                gemm_tuning={"dx": {"k_slices": 3}},
+                **kw,
+            )
+        assert planner(
+            _problem(1000, 6144, 512, 4096), gemm_tuning={"dx": {"k_slices": 3}}, **kw
+        ).dx_slices == (3,)
+
+
 def test_instance_rules_mirror_the_launchers():
     assert (cake_backend.RASTER_RULE_MIN_HIDDEN, cake_backend.RASTER_RULE_MIN_ROWS) == (
         7168,
@@ -3277,12 +3373,24 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_and_options():
         X, W, labels, lse, dlogp, chunk_size=4096, need_dx=True, need_dw=True
     )
     assert bwd[:2] == ("bwd", "logprob") and bwd != base
-    assert bwd != logprob_backward_binding_key(
+    # lse and dlogp are fresh tensors on every step: keyed by layout, not address (one binding serves every step)
+    assert bwd == logprob_backward_binding_key(
         X, W, labels, lse, dlogp.clone(), chunk_size=4096, need_dx=True, need_dw=True
     )
-    assert bwd != logprob_backward_binding_key(
+    assert bwd == logprob_backward_binding_key(
         X, W, labels, lse.clone(), dlogp, chunk_size=4096, need_dx=True, need_dw=True
     )
+    for other in (
+        torch.zeros(4),
+        torch.zeros(8, dtype=torch.float64),
+        torch.zeros(16)[::2],
+    ):
+        assert bwd != logprob_backward_binding_key(
+            X, W, labels, other, dlogp, chunk_size=4096, need_dx=True, need_dw=True
+        )  # shape, dtype, stride
+        assert bwd != logprob_backward_binding_key(
+            X, W, labels, lse, other, chunk_size=4096, need_dx=True, need_dw=True
+        )
     assert bwd != logprob_backward_binding_key(
         X, W, labels, lse, dlogp, chunk_size=4096, need_dx=True, need_dw=False
     )
@@ -3591,13 +3699,28 @@ def test_logprob_entry_matches_unchunked():
         inp.X, inp.W, inp.labels, fr.lse, inp.dlogp, chunk_size=64, backend="reference"
     )
     assert torch.equal(dx, result["dX"]) and torch.equal(dw, result["dW"])
-    plain = cake_backend.forward_logprob(
-        inp.X, inp.W, inp.labels, chunk_size=64, backend="reference", compact_rows=False
-    )
+    # the compacted and uncompacted statistics in one thread: a multi-threaded CPU GEMM may split the rows of the two
+    # shapes differently (a different summation order); the bits are compared for one fixed order
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        one = cake_backend.forward_logprob(
+            inp.X, inp.W, inp.labels, chunk_size=64, backend="reference"
+        )
+        plain = cake_backend.forward_logprob(
+            inp.X,
+            inp.W,
+            inp.labels,
+            chunk_size=64,
+            backend="reference",
+            compact_rows=False,
+        )
+    finally:
+        torch.set_num_threads(threads)
     assert (
         tuple(plain.lse.shape) == (inp.T,)
         and plain.row_index is None
-        and torch.equal(plain.lse[inp.valid], fr.lse)
+        and torch.equal(plain.lse[inp.valid], one.lse)
     )
     with pytest.raises(
         ValueError, match="lse"
@@ -6568,6 +6691,55 @@ def test_device_logprob_entry(glm_weight):
     assert torch.all(result["dX"][~inp.valid] == 0)
 
 
+# the default plan's dX slice counts per chunk (chunk size 4096) where the unfitted rule empties a slice on the
+# 148- and 152-SM devices: 3 slices at T = 1000, H = 6144 and [4, 3] for the 4097-row plan's 1-row tail chunk
+_VOCAB_256_DEFAULT_DX_SLICES = {(1000, 6144): (2,), (4097, 6144): (4, 2)}
+
+
+@pytest.mark.parametrize(
+    "T,H", [(1000, 6144), (1000, 2048), (4096, 6144), (4097, 6144)]
+)
+@pytest.mark.parametrize(
+    "objective,entry", [("ce", "loss"), ("policy", "loss"), ("ce", "logprob")]
+)
+def test_device_vocab_256_dx_slices(objective, entry, T, H):
+    """V = 256 has four K steps: the dX GEMM's slice rule (3 slices at T = 1000, H = 6144 and on the 1-row tail chunk
+    of T = 4097 on 148 and 152 SMs before the fit) runs a fitted count, every pinned count whose slices all hold a K
+    step matches the references, and a pin of 3 slices is rejected."""
+    _require_program(entry=entry)
+    W = make_inputs(1, seed=SEED, H=H, V=256, device=CUDA, ignore_frac=0.0).W
+    inp = make_inputs(
+        T, objective=objective, seed=SEED + T, H=H, V=256, device=CUDA, W=W
+    )
+    for k in (None, 1, 2, 4):
+        tuning = None if k is None else {"dx": {"k_slices": k}}
+        result = _run(inp, 4096, entry=entry, backend="cake", gemm_tuning=tuning)
+        _check_dtypes(result, inp)
+        _check_against_references(result, inp, entry=entry)
+    kw = dict(objective=inp.objective, chunk_size=4096, entry=entry)
+    if entry == "loss":
+        kw.update(
+            loss_div=inp.loss_div if inp.objective == "ce" else None,
+            infer_logp=inp.infer_logp,
+            loss_weights=inp.loss_weights,
+        )
+    plan = prepare_lm_head_det_loss(inp.X, inp.W, inp.labels, **kw).plan
+    sms = torch.cuda.get_device_properties(CUDA).multi_processor_count
+    if (T, H) in _VOCAB_256_DEFAULT_DX_SLICES and sms in (148, 152):
+        assert plan.dx_slices == _VOCAB_256_DEFAULT_DX_SLICES[(T, H)], (
+            sms,
+            plan.dx_slices,
+        )
+    # on every device each chunk's slices of ceil(4 / S) steps all hold one of V = 256's four K steps
+    assert all(s == 1 or (s - 1) * -(-4 // s) < 4 for s in plan.dx_slices), (
+        plan.dx_slices
+    )
+    with pytest.raises(ValueError, match="K steps"):
+        _run(
+            inp, 4096, entry=entry, backend="cake", gemm_tuning={"dx": {"k_slices": 3}}
+        )
+
+
 def test_device_deterministic_three_runs(glm_weight):
     _require_program(entry="loss")
     inp = _device_inputs(4097, "policy", W=glm_weight)
@@ -8733,8 +8905,8 @@ def test_device_given_count_mismatch_stops_the_stream():
 
 
 def test_device_preload(glm_weight):
-    """``preload`` (by default, index and device) creates the per-device side stream and count cells, is repeatable,
-    and a call after it gives the same bits."""
+    """``preload`` (by default, index and device) creates the calling thread's side stream and count cell of the
+    device, is repeatable, and a call after it gives the same bits."""
     _require_program(entry="loss")
     inp = _device_inputs(4097, W=glm_weight)
     before = _run(inp, 4096, backend="cake")
@@ -8742,8 +8914,8 @@ def test_device_preload(glm_weight):
     index = torch.cuda.current_device()
     opt_in.preload(index)
     opt_in.preload(torch.device("cuda", index))
-    assert (
-        index in cake_backend._DW_STREAMS and index in cake_backend._HIDDEN_COUNT_CELLS
-    )
-    assert cake_backend._HIDDEN_COUNT_ARANGE[index].numel() >= opt_in.PRELOAD_ROWS
+    assert index in cake_backend._thread_state(
+        "dw_streams"
+    ) and index in cake_backend._thread_state("cells")
+    assert cake_backend._thread_state("arange")[index].numel() >= opt_in.PRELOAD_ROWS
     _assert_same_bits(before, _run(inp, 4096, backend="cake"))

@@ -41,7 +41,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_fp8.h>
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_REDUCE_SMEM_OFF 0
 #define SMEM_REDUCE_SMEM_STAGE_BYTES 132
 #define SMEM_REDUCE_SMEM_STRIDE 132
@@ -152,60 +151,60 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_small(__nv_bfloat16* __restric
             }
         }
         if (top_k > 0) {
-            int _vec_load_0[1];
+            int _vec_load_12[1];
             {
-                _vec_load_0[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k));
+                _vec_load_12[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k));
             }
-            first_index[0] = _vec_load_0[0];
+            first_index[0] = _vec_load_12[0];
         }
         if (top_k > 1) {
-            int _vec_load_1[1];
+            int _vec_load_13[1];
             {
-                _vec_load_1[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 1));
+                _vec_load_13[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 1));
             }
-            first_index[1] = _vec_load_1[0];
+            first_index[1] = _vec_load_13[0];
         }
         if (top_k > 2) {
-            int _vec_load_2[1];
+            int _vec_load_14[1];
             {
-                _vec_load_2[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 2));
+                _vec_load_14[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 2));
             }
-            first_index[2] = _vec_load_2[0];
+            first_index[2] = _vec_load_14[0];
         }
         if (top_k > 3) {
-            int _vec_load_3[1];
+            int _vec_load_15[1];
             {
-                _vec_load_3[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 3));
+                _vec_load_15[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 3));
             }
-            first_index[3] = _vec_load_3[0];
+            first_index[3] = _vec_load_15[0];
         }
         if (top_k > 4) {
-            int _vec_load_4[1];
+            int _vec_load_16[1];
             {
-                _vec_load_4[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 4));
+                _vec_load_16[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 4));
             }
-            first_index[4] = _vec_load_4[0];
+            first_index[4] = _vec_load_16[0];
         }
         if (top_k > 5) {
-            int _vec_load_5[1];
+            int _vec_load_19[1];
             {
-                _vec_load_5[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 5));
+                _vec_load_19[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 5));
             }
-            first_index[5] = _vec_load_5[0];
+            first_index[5] = _vec_load_19[0];
         }
         if (top_k > 6) {
-            int _vec_load_6[1];
+            int _vec_load_20[1];
             {
-                _vec_load_6[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 6));
+                _vec_load_20[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 6));
             }
-            first_index[6] = _vec_load_6[0];
+            first_index[6] = _vec_load_20[0];
         }
         if (top_k > 7) {
-            int _vec_load_7[1];
+            int _vec_load_21[1];
             {
-                _vec_load_7[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 7));
+                _vec_load_21[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 7));
             }
-            first_index[7] = _vec_load_7[0];
+            first_index[7] = _vec_load_21[0];
         }
     }
     asm volatile("" :: "r"((uint32_t)(first_index[0])), "r"((uint32_t)(first_index[1])), "r"((uint32_t)(first_index[2])), "r"((uint32_t)(first_index[3])), "r"((uint32_t)(first_index[4])), "r"((uint32_t)(first_index[5])), "r"((uint32_t)(first_index[6])), "r"((uint32_t)(first_index[7])), "r"((uint32_t)(first_shared[0])), "r"((uint32_t)(first_shared[1])), "r"((uint32_t)(first_shared[2])), "r"((uint32_t)(first_shared[3])));
@@ -243,7 +242,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_small(__nv_bfloat16* __restric
         float shared_early[8];
         if (has_shared_expert != 0) {
             int shared_early_elem = token * 7168 + cluster_thread * 8;
-            float _vec_load_0_1[8];
+            float _vec_load_0[8];
             unsigned int shared_words[4];
             if (token == token_begin) {
                 #pragma unroll
@@ -266,102 +265,102 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_small(__nv_bfloat16* __restric
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&_vec_load_0_1[_pair * 2])[0]), "=f"((&_vec_load_0_1[_pair * 2])[1])
+                    : "=f"((&_vec_load_0[_pair * 2])[0]), "=f"((&_vec_load_0[_pair * 2])[1])
                     : "r"(shared_words[_pair]));
             }
             #pragma unroll
             for (int j_1 = 0; j_1 < 8; j_1++) {
-                shared_early[j_1] = _vec_load_0_1[j_1];
+                shared_early[j_1] = _vec_load_0[j_1];
             }
         }
         int oct_index[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
         if (top_k > 0) {
-            int _vec_load_8[1];
+            int _vec_load_22[1];
             if (token == token_begin) {
-                _vec_load_8[0] = first_index[0];
+                _vec_load_22[0] = first_index[0];
             } else {
                 {
-                    _vec_load_8[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k));
+                    _vec_load_22[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k));
                 }
             }
-            oct_index[0] = _vec_load_8[0];
+            oct_index[0] = _vec_load_22[0];
         }
         if (top_k > 1) {
-            int _vec_load_10[1];
+            int _vec_load_23[1];
             if (token == token_begin) {
-                _vec_load_10[0] = first_index[1];
+                _vec_load_23[0] = first_index[1];
             } else {
                 {
-                    _vec_load_10[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 1));
+                    _vec_load_23[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 1));
                 }
             }
-            oct_index[1] = _vec_load_10[0];
+            oct_index[1] = _vec_load_23[0];
         }
         if (top_k > 2) {
-            int _vec_load_11[1];
+            int _vec_load_24[1];
             if (token == token_begin) {
-                _vec_load_11[0] = first_index[2];
+                _vec_load_24[0] = first_index[2];
             } else {
                 {
-                    _vec_load_11[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 2));
+                    _vec_load_24[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 2));
                 }
             }
-            oct_index[2] = _vec_load_11[0];
+            oct_index[2] = _vec_load_24[0];
         }
         if (top_k > 3) {
-            int _vec_load_12[1];
+            int _vec_load_25[1];
             if (token == token_begin) {
-                _vec_load_12[0] = first_index[3];
+                _vec_load_25[0] = first_index[3];
             } else {
                 {
-                    _vec_load_12[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 3));
+                    _vec_load_25[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 3));
                 }
             }
-            oct_index[3] = _vec_load_12[0];
+            oct_index[3] = _vec_load_25[0];
         }
         if (top_k > 4) {
-            int _vec_load_13[1];
+            int _vec_load_26[1];
             if (token == token_begin) {
-                _vec_load_13[0] = first_index[4];
+                _vec_load_26[0] = first_index[4];
             } else {
                 {
-                    _vec_load_13[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 4));
+                    _vec_load_26[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 4));
                 }
             }
-            oct_index[4] = _vec_load_13[0];
+            oct_index[4] = _vec_load_26[0];
         }
         if (top_k > 5) {
-            int _vec_load_14[1];
+            int _vec_load_27[1];
             if (token == token_begin) {
-                _vec_load_14[0] = first_index[5];
+                _vec_load_27[0] = first_index[5];
             } else {
                 {
-                    _vec_load_14[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 5));
+                    _vec_load_27[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 5));
                 }
             }
-            oct_index[5] = _vec_load_14[0];
+            oct_index[5] = _vec_load_27[0];
         }
         if (top_k > 6) {
-            int _vec_load_15[1];
+            int _vec_load_28[1];
             if (token == token_begin) {
-                _vec_load_15[0] = first_index[6];
+                _vec_load_28[0] = first_index[6];
             } else {
                 {
-                    _vec_load_15[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 6));
+                    _vec_load_28[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 6));
                 }
             }
-            oct_index[6] = _vec_load_15[0];
+            oct_index[6] = _vec_load_28[0];
         }
         if (top_k > 7) {
-            int _vec_load_16[1];
+            int _vec_load_29[1];
             if (token == token_begin) {
-                _vec_load_16[0] = first_index[7];
+                _vec_load_29[0] = first_index[7];
             } else {
                 {
-                    _vec_load_16[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 7));
+                    _vec_load_29[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 7));
                 }
             }
-            oct_index[7] = _vec_load_16[0];
+            oct_index[7] = _vec_load_29[0];
         }
         #pragma unroll 1
         for (int route_base = 0; route_base < route_end; route_base += 8) {
@@ -369,81 +368,81 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110_small(__nv_bfloat16* __restric
             unsigned int oct_words[32];
             float oct_scales[8];
             if (route_base + 8 < top_k) {
-                int _vec_load_17[1];
+                int _vec_load_30[1];
                 {
-                    _vec_load_17[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8));
+                    _vec_load_30[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8));
                 }
-                next_oct_index[0] = _vec_load_17[0];
+                next_oct_index[0] = _vec_load_30[0];
             }
             if (route_base + 8 + 1 < top_k) {
-                int _vec_load_18[1];
+                int _vec_load_31[1];
                 {
-                    _vec_load_18[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 1));
+                    _vec_load_31[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 1));
                 }
-                next_oct_index[1] = _vec_load_18[0];
+                next_oct_index[1] = _vec_load_31[0];
             }
             if (route_base + 8 + 2 < top_k) {
-                int _vec_load_19[1];
+                int _vec_load_32[1];
                 {
-                    _vec_load_19[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 2));
+                    _vec_load_32[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 2));
                 }
-                next_oct_index[2] = _vec_load_19[0];
+                next_oct_index[2] = _vec_load_32[0];
             }
             if (route_base + 8 + 3 < top_k) {
-                int _vec_load_20[1];
+                int _vec_load_35[1];
                 {
-                    _vec_load_20[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 3));
+                    _vec_load_35[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 3));
                 }
-                next_oct_index[3] = _vec_load_20[0];
+                next_oct_index[3] = _vec_load_35[0];
             }
             if (route_base + 8 + 4 < top_k) {
-                int _vec_load_21[1];
+                int _vec_load_36[1];
                 {
-                    _vec_load_21[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 4));
+                    _vec_load_36[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 4));
                 }
-                next_oct_index[4] = _vec_load_21[0];
+                next_oct_index[4] = _vec_load_36[0];
             }
             if (route_base + 8 + 5 < top_k) {
-                int _vec_load_22[1];
+                int _vec_load_37[1];
                 {
-                    _vec_load_22[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 5));
+                    _vec_load_37[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 5));
                 }
-                next_oct_index[5] = _vec_load_22[0];
+                next_oct_index[5] = _vec_load_37[0];
             }
             if (route_base + 8 + 6 < top_k) {
-                int _vec_load_23[1];
+                int _vec_load_38[1];
                 {
-                    _vec_load_23[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 6));
+                    _vec_load_38[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 6));
                 }
-                next_oct_index[6] = _vec_load_23[0];
+                next_oct_index[6] = _vec_load_38[0];
             }
             if (route_base + 8 + 7 < top_k) {
-                int _vec_load_24[1];
+                int _vec_load_39[1];
                 {
-                    _vec_load_24[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 7));
+                    _vec_load_39[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 7));
                 }
-                next_oct_index[7] = _vec_load_24[0];
+                next_oct_index[7] = _vec_load_39[0];
             }
             if (oct_index[0] >= 0) {
                 long long expert_elem = (long long)oct_index[0] * 7168 + (long long)(cluster_thread * 8);
-                unsigned int _vec_load_17_1[4];
+                unsigned int _vec_load_17[4];
                 {
                     uint4 _uv4_2 = *reinterpret_cast<const uint4*>(allreduce_in + expert_elem + 0);
-                    _vec_load_17_1[0 + 0] = _uv4_2.x;
-                    _vec_load_17_1[0 + 1] = _uv4_2.y;
-                    _vec_load_17_1[0 + 2] = _uv4_2.z;
-                    _vec_load_17_1[0 + 3] = _uv4_2.w;
+                    _vec_load_17[0 + 0] = _uv4_2.x;
+                    _vec_load_17[0 + 1] = _uv4_2.y;
+                    _vec_load_17[0 + 2] = _uv4_2.z;
+                    _vec_load_17[0 + 3] = _uv4_2.w;
                 }
                 #pragma unroll
                 for (int w_1 = 0; w_1 < 4; w_1++) {
-                    oct_words[w_1] = _vec_load_17_1[w_1];
+                    oct_words[w_1] = _vec_load_17[w_1];
                 }
-                float _vec_load_18_1[1];
+                float _vec_load_18[1];
                 {
                     __nv_bfloat16 _bf16_3 = *reinterpret_cast<const __nv_bfloat16*>(expert_scales + token * top_k + route_base);
-                    _vec_load_18_1[0] = __bfloat162float(_bf16_3);
+                    _vec_load_18[0] = __bfloat162float(_bf16_3);
                 }
-                oct_scales[0] = _vec_load_18_1[0];
+                oct_scales[0] = _vec_load_18[0];
             }
             if (oct_index[1] >= 0) {
                 long long expert_elem_0 = (long long)oct_index[1] * 7168 + (long long)(cluster_thread * 8);

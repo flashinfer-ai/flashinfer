@@ -34,7 +34,8 @@ and the block's Q / scale / weight boxes (identical logits and schedule words) o
 the forms the per-architecture policy list ``policy.fp4.first_tile_prefetch_forms``
 names: ``q1`` (``fp4:q1:short``; both architectures), ``le32`` (``fp4:le32:short``;
 sm_103a only -- one route, the route record binds the prefetch program on sm_103a
-and the plain warp-scan program on sm_100a) and ``qle1024``: where it is listed
+and the plain warp-scan program on sm_100a, whose ``K <= 4096`` stage bucket
+launches the warp-scan text with the prefetch) and ``qle1024``: where it is listed
 (both architectures) the FP4 ``le1024`` class ships two programs,
 ``fp4:qle1024:short`` for ``Q <= policy.fp4.first_tile_prefetch_max_queries_scan1024``
 (the CTA-scan text with the prefetch) and ``fp4:le1024:short`` above that query
@@ -62,12 +63,17 @@ rule and is applied at the catalogued count, not the device's; it is consulted
 before the ``:short`` / ``:ts`` shape gates, so a call inside both it and the
 ``:ts`` gate is named by its KV-split plan.
 
-A ``:kvsplit`` route record of the full kind may carry ``stage_buckets``
-(``{arch: [{"kv_max": K, "stages": [[stage, program], ...]}, ...]}``): a plan
-whose KV length is at most an entry's ``kv_max`` launches the first such entry's
-stages on that architecture (:func:`route_stages`) -- its partial-kind twin's
-program, with the same host call, logits and schedule words as the record's
-program; the route name, its admission and its metadata buffer are the record's.
+A ``:kvsplit`` or ``:short`` route record may carry ``stage_buckets``
+(``{arch: [{"kv_max": K, "stages": [[stage, program], ...]}, ...]}``, an entry
+optionally bounding the query count too with ``"max_queries": Q``): a plan whose
+KV length is at most an entry's ``kv_max`` (and whose query count is at most its
+``max_queries``) launches the first such entry's stages on that architecture
+(:func:`route_stages`) -- on a ``:kvsplit`` route
+of the full kind its partial-kind twin's program, on a ``:kvsplit`` route of the
+partial kind or a ``:short`` route a program of its own that no route's
+``stages`` name -- with the same host call, logits and schedule words as the
+record's program; the route name, its admission and its metadata buffer are the
+record's.
 """
 
 from __future__ import annotations
@@ -106,9 +112,20 @@ def _catalog():
 
 def _fused_qle2048_bounds():
     """``policy.fused_qle2048_max_kv``: the KV bound of the single-launch fused ``fp8:qle2048:short`` route PER
-    ARCHITECTURE (``{"sm_100a": 34048, "sm_103a": 65536}``; the one per-arch policy key -- each bound was measured on
-    its device)."""
+    ARCHITECTURE (``{"sm_100a": 34048, "sm_103a": 65536}``; each bound was measured on its device -- the FP4 scan-class
+    bounds ``fp4.fused_scan32_max_kv`` / ``fp4.fused_scan1024_max_kv`` are per-architecture maps too, :func:`_scan_bound`)."""
     return {a: int(v) for a, v in _catalog()["policy"]["fused_qle2048_max_kv"].items()}
+
+
+def _fused_qle2048_bound(arch, queries):
+    """The KV bound of ``fp8:qle2048:short`` for ``queries`` on ``arch``: ``policy.fused_qle2048_max_kv[arch]``, raised to
+    ``policy.fused_qle2048_small_q_max_kv[arch]`` for a query count up to ``policy.fused_qle2048_small_q_max_queries[arch]``
+    (the small-Q band, measured per device; 128 -- no query count of the tier -- where an architecture has none)."""
+    policy = _catalog()["policy"]
+    bound = int(policy["fused_qle2048_max_kv"][arch])
+    if queries <= int(policy["fused_qle2048_small_q_max_queries"][arch]):
+        bound = max(bound, int(policy["fused_qle2048_small_q_max_kv"][arch]))
+    return bound
 
 
 @functools.cache
@@ -171,12 +188,16 @@ def stage_programs(stage, arches):
     return dict(by_arch)
 
 
-def route_stages(record, arch, keys):
-    """The stages a route record launches on ``arch`` for the KV length ``keys`` (``kv.shape[0]``): the first
-    ``stage_buckets[arch]`` entry with ``keys <= kv_max`` (``[[stage, program], ...]``, one program name per
-    stage), else the record's ``stages``."""
+def route_stages(record, arch, keys, queries=None):
+    """The stages a route record launches on ``arch`` for the KV length ``keys`` (``kv.shape[0]``) and the query
+    count ``queries``: the first ``stage_buckets[arch]`` entry with ``keys <= kv_max`` and, where the entry spells
+    ``max_queries``, ``queries <= max_queries`` (``[[stage, program], ...]``, one program name per stage), else the
+    record's ``stages``.  An entry with ``max_queries`` never matches when ``queries`` is not given."""
     for bucket in record.get("stage_buckets", {}).get(arch, ()):
-        if keys <= int(bucket["kv_max"]):
+        bound = bucket.get("max_queries")
+        if keys <= int(bucket["kv_max"]) and (
+            bound is None or (queries is not None and queries <= int(bound))
+        ):
             return bucket["stages"]
     return record["stages"]
 
@@ -303,10 +324,14 @@ def _single_launch_precedence(arch, tier):
     return tuple(table[arch][tier])
 
 
-def _route_name_on(precision, queries, keys, num_heads, arch, *, qle2048_max_kv=None):
+def _route_name_on(
+    precision, queries, keys, num_heads, arch, *, qle2048_max_kv=None, scan_arch=False
+):
     """The route of a problem under ONE architecture's rule -- its single-launch precedence and its fused Q <= 2048 bound
-    (``qle2048_max_kv`` overrides that bound: the logical name applies the most permissive one).  Host scalars only, no
-    K-rule check (``_keys_served``)."""
+    (``qle2048_max_kv`` overrides that bound: the logical name applies the most permissive one; ``scan_arch=None`` reads
+    a per-architecture scan-class bound as its most permissive value, likewise).  Host scalars only, no K-rule check
+    (``_keys_served``)."""
+    scan_on = arch if scan_arch is False else scan_arch
     policy = _catalog()["policy"]
     if precision not in ("fp4", "fp8"):
         raise ValueError("precision must be 'fp4' or 'fp8'")
@@ -319,7 +344,7 @@ def _route_name_on(precision, queries, keys, num_heads, arch, *, qle2048_max_kv=
                 if keys <= int(fp4["fused_q1_max_kv"]):
                     return f"{prefix}:q1:short"
                 return f"{prefix}:q1"
-            scan = _fused_scan_class(queries, keys, fp4)
+            scan = _fused_scan_class(queries, keys, fp4, scan_on)
             if scan:
                 # the le1024 class is served by its first-tile-prefetch program at and below the
                 # policy's query bound and by the plain CTA-scan program above it (one class, one
@@ -359,7 +384,11 @@ def _route_name_on(precision, queries, keys, num_heads, arch, *, qle2048_max_kv=
             if family == "le_class":
                 # Q = 128 is owned by the fused-Q128 rule: above its bound it takes the
                 # two-launch pair, never the le32 class.
-                scan = 0 if queries == 128 else _fused_scan_class(queries, keys, policy)
+                scan = (
+                    0
+                    if queries == 128
+                    else _fused_scan_class(queries, keys, policy, scan_on)
+                )
                 if scan:
                     return f"{prefix}:{kind}:le{scan}:short"
             elif family == "qle":
@@ -367,7 +396,7 @@ def _route_name_on(precision, queries, keys, num_heads, arch, *, qle2048_max_kv=
                     return f"{prefix}:qle128:short"
                 if tier == "le2048":
                     bound = (
-                        _fused_qle2048_bounds()[arch]
+                        _fused_qle2048_bound(arch, queries)
                         if qle2048_max_kv is None
                         else int(qle2048_max_kv)
                     )
@@ -394,7 +423,9 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     single-launch fused Q <= 2048 program for ``128 < Q <= 2048`` and
     ``K <= policy.fused_qle2048_max_kv[arch]`` on the most permissive
     architecture -- the key is per architecture, 34048 on sm_100a and 65536 on
-    sm_103a; a device whose bound the K exceeds is served the next family or the
+    sm_103a, raised for a query count up to ``fused_qle2048_small_q_max_queries[arch]``
+    to ``fused_qle2048_small_q_max_kv[arch]`` (:func:`_fused_qle2048_bound`); a device
+    whose bound the K exceeds is served the next family or the
     two-launch tier route, :func:`served_route`); their K rule is each route
     record's ``kv_alignment`` for the device's architecture (256 for FP4, 256 or 1
     per FP8 route and architecture as the catalog publishes it) with the record's
@@ -429,14 +460,20 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     with the first-tile L2 prefetch -- and ``fp4:le1024:short`` above that query
     count), then the pair. A scan class is the smallest ``fused_scan_ceilings``
     entry covering ``ceil(Q / 4)`` and is served only while
-    ``K <= fused_scan<ceiling>_max_kv`` of that class (:func:`_fused_scan_class`).
+    ``K <= fused_scan<ceiling>_max_kv`` of that class (:func:`_fused_scan_class`;
+    a class bound may be a per-architecture map -- the FP4 ``fused_scan32_max_kv`` /
+    ``fused_scan1024_max_kv`` are ``{"sm_100a": 1048576, "sm_103a": 1048832}`` /
+    ``{"sm_100a": 65536, "sm_103a": 65792}`` -- where the logical name applies the most
+    permissive value and :func:`served_route` the device's own).
     The logical name needs one rule: every architecture must share the tier's
     precedence (``ValueError`` otherwise -- pass the device to :func:`served_route`).
     """
     arches = sorted(_catalog()["arches"])
-    union = max(_fused_qle2048_bounds().values())
+    union = max(_fused_qle2048_bound(a, queries) for a in arches)
     verdicts = {
-        a: _route_name_on(precision, queries, keys, num_heads, a, qle2048_max_kv=union)
+        a: _route_name_on(
+            precision, queries, keys, num_heads, a, qle2048_max_kv=union, scan_arch=None
+        )
         for a in arches
     }
     if len(set(verdicts.values())) != 1:
@@ -447,7 +484,15 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     return next(iter(verdicts.values()))
 
 
-def _fused_scan_class(queries, keys, bounds):
+def _scan_bound(value, arch):
+    """A ``fused_scan<ceiling>_max_kv`` value on ``arch``: a shared int, or a per-architecture map ``{arch: int}`` (each
+    bound measured on its device); ``arch=None`` reads a map as its most permissive value (the logical route name)."""
+    if isinstance(value, dict):
+        return max(int(v) for v in value.values()) if arch is None else int(value[arch])
+    return int(value)
+
+
+def _fused_scan_class(queries, keys, bounds, arch=None):
     """The in-kernel scan class that serves a 32-head call, or 0: the SMALLEST
     query-block ceiling of ``bounds["fused_scan_ceilings"]`` covering ``ceil(Q / 4)``
     when ``K <= bounds["fused_scan<ceiling>_max_kv"]``. The class is fixed by the
@@ -457,7 +502,7 @@ def _fused_scan_class(queries, keys, bounds):
     for ceiling in bounds["fused_scan_ceilings"]:
         ceiling = int(ceiling)
         if blocks <= ceiling:
-            if keys <= int(bounds[f"fused_scan{ceiling}_max_kv"]):
+            if keys <= _scan_bound(bounds[f"fused_scan{ceiling}_max_kv"], arch):
                 return ceiling
             return 0
     return 0
@@ -1233,7 +1278,7 @@ class DenseMqaPlan:
         if sequence:
             selections = [(None, sequence)]
         else:
-            stages = route_stages(self.route, arch, keys)
+            stages = route_stages(self.route, arch, keys, queries)
             selections = [(stage[0], stage_program(stage, arch)) for stage in stages]
         self.program_names = [program for _stage, program in selections]
         for stage_name, program in selections:

@@ -41,7 +41,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_fp8.h>
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_REDUCE_SMEM_OFF 0
 #define SMEM_REDUCE_SMEM_STAGE_BYTES 132
 #define SMEM_REDUCE_SMEM_STRIDE 132
@@ -159,60 +158,60 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
             }
         }
         if (top_k > 0) {
-            int _vec_load_0[1];
+            int _vec_load_19[1];
             {
-                _vec_load_0[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k));
+                _vec_load_19[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k));
             }
-            first_index[0] = _vec_load_0[0];
+            first_index[0] = _vec_load_19[0];
         }
         if (top_k > 1) {
-            int _vec_load_1[1];
+            int _vec_load_20[1];
             {
-                _vec_load_1[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 1));
+                _vec_load_20[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 1));
             }
-            first_index[1] = _vec_load_1[0];
+            first_index[1] = _vec_load_20[0];
         }
         if (top_k > 2) {
-            int _vec_load_2[1];
+            int _vec_load_21[1];
             {
-                _vec_load_2[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 2));
+                _vec_load_21[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 2));
             }
-            first_index[2] = _vec_load_2[0];
+            first_index[2] = _vec_load_21[0];
         }
         if (top_k > 3) {
-            int _vec_load_3[1];
+            int _vec_load_22[1];
             {
-                _vec_load_3[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 3));
+                _vec_load_22[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 3));
             }
-            first_index[3] = _vec_load_3[0];
+            first_index[3] = _vec_load_22[0];
         }
         if (top_k > 4) {
-            int _vec_load_4[1];
+            int _vec_load_23[1];
             {
-                _vec_load_4[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 4));
+                _vec_load_23[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 4));
             }
-            first_index[4] = _vec_load_4[0];
+            first_index[4] = _vec_load_23[0];
         }
         if (top_k > 5) {
-            int _vec_load_5[1];
+            int _vec_load_24[1];
             {
-                _vec_load_5[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 5));
+                _vec_load_24[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 5));
             }
-            first_index[5] = _vec_load_5[0];
+            first_index[5] = _vec_load_24[0];
         }
         if (top_k > 6) {
-            int _vec_load_6[1];
+            int _vec_load_25[1];
             {
-                _vec_load_6[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 6));
+                _vec_load_25[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 6));
             }
-            first_index[6] = _vec_load_6[0];
+            first_index[6] = _vec_load_25[0];
         }
         if (top_k > 7) {
-            int _vec_load_7[1];
+            int _vec_load_26[1];
             {
-                _vec_load_7[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 7));
+                _vec_load_26[0] = *reinterpret_cast<const int*>(inverse_indices + (first_token * top_k + 7));
             }
-            first_index[7] = _vec_load_7[0];
+            first_index[7] = _vec_load_26[0];
         }
     }
     asm volatile("" :: "r"((uint32_t)(first_index[0])), "r"((uint32_t)(first_index[1])), "r"((uint32_t)(first_index[2])), "r"((uint32_t)(first_index[3])), "r"((uint32_t)(first_index[4])), "r"((uint32_t)(first_index[5])), "r"((uint32_t)(first_index[6])), "r"((uint32_t)(first_index[7])), "r"((uint32_t)(first_shared[0])), "r"((uint32_t)(first_shared[1])), "r"((uint32_t)(first_shared[2])), "r"((uint32_t)(first_shared[3])));
@@ -252,7 +251,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
         float shared_early[8];
         if (has_shared_expert != 0) {
             int shared_early_elem = token * 7168 + cluster_thread * 8;
-            float _vec_load_0_1[8];
+            float _vec_load_0[8];
             unsigned int shared_words[4];
             if (token == token_begin) {
                 #pragma unroll
@@ -279,102 +278,102 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                     "cvt.f32.f16 f_hi, h_hi;\n\t"
                     "mov.b64 %0, {f_lo, f_hi};\n\t"
                     "}\n"
-                    : "=l"(*reinterpret_cast<unsigned long long*>(&_vec_load_0_1[_pair * 2]))
+                    : "=l"(*reinterpret_cast<unsigned long long*>(&_vec_load_0[_pair * 2]))
                     : "r"(shared_words[_pair]));
             }
             #pragma unroll
             for (int j_1 = 0; j_1 < 8; j_1++) {
-                shared_early[j_1] = _vec_load_0_1[j_1];
+                shared_early[j_1] = _vec_load_0[j_1];
             }
         }
         int oct_index[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
         if (top_k > 0) {
-            int _vec_load_8[1];
+            int _vec_load_27[1];
             if (token == token_begin) {
-                _vec_load_8[0] = first_index[0];
+                _vec_load_27[0] = first_index[0];
             } else {
                 {
-                    _vec_load_8[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k));
+                    _vec_load_27[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k));
                 }
             }
-            oct_index[0] = _vec_load_8[0];
+            oct_index[0] = _vec_load_27[0];
         }
         if (top_k > 1) {
-            int _vec_load_9[1];
+            int _vec_load_28[1];
             if (token == token_begin) {
-                _vec_load_9[0] = first_index[1];
+                _vec_load_28[0] = first_index[1];
             } else {
                 {
-                    _vec_load_9[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 1));
+                    _vec_load_28[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 1));
                 }
             }
-            oct_index[1] = _vec_load_9[0];
+            oct_index[1] = _vec_load_28[0];
         }
         if (top_k > 2) {
-            int _vec_load_10[1];
+            int _vec_load_29[1];
             if (token == token_begin) {
-                _vec_load_10[0] = first_index[2];
+                _vec_load_29[0] = first_index[2];
             } else {
                 {
-                    _vec_load_10[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 2));
+                    _vec_load_29[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 2));
                 }
             }
-            oct_index[2] = _vec_load_10[0];
+            oct_index[2] = _vec_load_29[0];
         }
         if (top_k > 3) {
-            int _vec_load_11[1];
+            int _vec_load_30[1];
             if (token == token_begin) {
-                _vec_load_11[0] = first_index[3];
+                _vec_load_30[0] = first_index[3];
             } else {
                 {
-                    _vec_load_11[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 3));
+                    _vec_load_30[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 3));
                 }
             }
-            oct_index[3] = _vec_load_11[0];
+            oct_index[3] = _vec_load_30[0];
         }
         if (top_k > 4) {
-            int _vec_load_12[1];
+            int _vec_load_31[1];
             if (token == token_begin) {
-                _vec_load_12[0] = first_index[4];
+                _vec_load_31[0] = first_index[4];
             } else {
                 {
-                    _vec_load_12[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 4));
+                    _vec_load_31[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 4));
                 }
             }
-            oct_index[4] = _vec_load_12[0];
+            oct_index[4] = _vec_load_31[0];
         }
         if (top_k > 5) {
-            int _vec_load_13[1];
+            int _vec_load_32[1];
             if (token == token_begin) {
-                _vec_load_13[0] = first_index[5];
+                _vec_load_32[0] = first_index[5];
             } else {
                 {
-                    _vec_load_13[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 5));
+                    _vec_load_32[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 5));
                 }
             }
-            oct_index[5] = _vec_load_13[0];
+            oct_index[5] = _vec_load_32[0];
         }
         if (top_k > 6) {
-            int _vec_load_14[1];
+            int _vec_load_33[1];
             if (token == token_begin) {
-                _vec_load_14[0] = first_index[6];
+                _vec_load_33[0] = first_index[6];
             } else {
                 {
-                    _vec_load_14[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 6));
+                    _vec_load_33[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 6));
                 }
             }
-            oct_index[6] = _vec_load_14[0];
+            oct_index[6] = _vec_load_33[0];
         }
         if (top_k > 7) {
-            int _vec_load_15[1];
+            int _vec_load_34[1];
             if (token == token_begin) {
-                _vec_load_15[0] = first_index[7];
+                _vec_load_34[0] = first_index[7];
             } else {
                 {
-                    _vec_load_15[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 7));
+                    _vec_load_34[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + 7));
                 }
             }
-            oct_index[7] = _vec_load_15[0];
+            oct_index[7] = _vec_load_34[0];
         }
         #pragma unroll 1
         for (int route_base = 0; route_base < route_end; route_base += 8) {
@@ -382,60 +381,60 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
             unsigned int oct_words[32];
             float oct_scales[8];
             if (route_base + 8 < top_k) {
-                int _vec_load_16[1];
+                int _vec_load_35[1];
                 {
-                    _vec_load_16[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8));
+                    _vec_load_35[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8));
                 }
-                next_oct_index[0] = _vec_load_16[0];
+                next_oct_index[0] = _vec_load_35[0];
             }
             if (route_base + 8 + 1 < top_k) {
-                int _vec_load_18[1];
+                int _vec_load_36[1];
                 {
-                    _vec_load_18[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 1));
+                    _vec_load_36[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 1));
                 }
-                next_oct_index[1] = _vec_load_18[0];
+                next_oct_index[1] = _vec_load_36[0];
             }
             if (route_base + 8 + 2 < top_k) {
-                int _vec_load_19[1];
+                int _vec_load_37[1];
                 {
-                    _vec_load_19[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 2));
+                    _vec_load_37[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 2));
                 }
-                next_oct_index[2] = _vec_load_19[0];
+                next_oct_index[2] = _vec_load_37[0];
             }
             if (route_base + 8 + 3 < top_k) {
-                int _vec_load_20[1];
+                int _vec_load_38[1];
                 {
-                    _vec_load_20[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 3));
+                    _vec_load_38[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 3));
                 }
-                next_oct_index[3] = _vec_load_20[0];
+                next_oct_index[3] = _vec_load_38[0];
             }
             if (route_base + 8 + 4 < top_k) {
-                int _vec_load_21[1];
+                int _vec_load_39[1];
                 {
-                    _vec_load_21[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 4));
+                    _vec_load_39[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 4));
                 }
-                next_oct_index[4] = _vec_load_21[0];
+                next_oct_index[4] = _vec_load_39[0];
             }
             if (route_base + 8 + 5 < top_k) {
-                int _vec_load_22[1];
+                int _vec_load_40[1];
                 {
-                    _vec_load_22[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 5));
+                    _vec_load_40[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 5));
                 }
-                next_oct_index[5] = _vec_load_22[0];
+                next_oct_index[5] = _vec_load_40[0];
             }
             if (route_base + 8 + 6 < top_k) {
-                int _vec_load_23[1];
+                int _vec_load_41[1];
                 {
-                    _vec_load_23[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 6));
+                    _vec_load_41[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 6));
                 }
-                next_oct_index[6] = _vec_load_23[0];
+                next_oct_index[6] = _vec_load_41[0];
             }
             if (route_base + 8 + 7 < top_k) {
-                int _vec_load_24[1];
+                int _vec_load_42[1];
                 {
-                    _vec_load_24[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 7));
+                    _vec_load_42[0] = *reinterpret_cast<const int*>(inverse_indices + (token * top_k + route_base + 8 + 7));
                 }
-                next_oct_index[7] = _vec_load_24[0];
+                next_oct_index[7] = _vec_load_42[0];
             }
             if (oct_index[0] >= 0) {
                 long long expert_elem = (long long)oct_index[0] * 7168 + (long long)(cluster_thread * 8);
@@ -451,12 +450,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 for (int w_1 = 0; w_1 < 4; w_1++) {
                     oct_words[w_1] = _vec_load_17[w_1];
                 }
-                float _vec_load_18_1[1];
+                float _vec_load_18[1];
                 {
                     __half _f16_3 = *reinterpret_cast<const __half*>(expert_scales + token * top_k + route_base);
-                    _vec_load_18_1[0] = __half2float(_f16_3);
+                    _vec_load_18[0] = __half2float(_f16_3);
                 }
-                oct_scales[0] = _vec_load_18_1[0];
+                oct_scales[0] = _vec_load_18[0];
             }
             if (oct_index[1] >= 0) {
                 long long expert_elem_0 = (long long)oct_index[1] * 7168 + (long long)(cluster_thread * 8);
@@ -673,7 +672,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 }
             }
             if (oct_index[1] >= 0) {
-                float scaled_1[8];
+                float scaled_0[8];
                 float unpack_f16_1[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -690,13 +689,13 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         : "r"(oct_words[4 + _pair]));
                 }
                 #pragma unroll
-                for (int j_4 = 0; j_4 < 8; j_4++) {
-                    scaled_1[j_4] = unpack_f16_1[j_4] * oct_scales[1];
+                for (int j_0 = 0; j_0 < 8; j_0++) {
+                    scaled_0[j_0] = unpack_f16_1[j_0] * oct_scales[1];
                 }
                 unsigned int scaled_f16_1[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
-                    __half2 _h2 = __float22half2_rn(make_float2(scaled_1[_lp*2 + 0], scaled_1[_lp*2+1 + 0]));
+                    __half2 _h2 = __float22half2_rn(make_float2(scaled_0[_lp*2 + 0], scaled_0[_lp*2+1 + 0]));
                     scaled_f16_1[_lp] = *(uint32_t*)&_h2;
                 }
                 float unpack_f16_1_1[8];
@@ -715,8 +714,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         : "r"(scaled_f16_1[_pair]));
                 }
                 #pragma unroll
-                for (int j_5 = 0; j_5 < 8; j_5++) {
-                    acc[j_5] = acc[j_5] + unpack_f16_1_1[j_5];
+                for (int j_1_1 = 0; j_1_1 < 8; j_1_1++) {
+                    acc[j_1_1] = acc[j_1_1] + unpack_f16_1_1[j_1_1];
                 }
                 unsigned int scaled_f16_1_1[4];
                 #pragma unroll
@@ -740,7 +739,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 }
             }
             if (oct_index[2] >= 0) {
-                float scaled_2[8];
+                float scaled_1[8];
                 float unpack_f16_2[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -757,13 +756,13 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         : "r"(oct_words[8 + _pair]));
                 }
                 #pragma unroll
-                for (int j_6 = 0; j_6 < 8; j_6++) {
-                    scaled_2[j_6] = unpack_f16_2[j_6] * oct_scales[2];
+                for (int j_2_1 = 0; j_2_1 < 8; j_2_1++) {
+                    scaled_1[j_2_1] = unpack_f16_2[j_2_1] * oct_scales[2];
                 }
                 unsigned int scaled_f16_2[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
-                    __half2 _h2 = __float22half2_rn(make_float2(scaled_2[_lp*2 + 0], scaled_2[_lp*2+1 + 0]));
+                    __half2 _h2 = __float22half2_rn(make_float2(scaled_1[_lp*2 + 0], scaled_1[_lp*2+1 + 0]));
                     scaled_f16_2[_lp] = *(uint32_t*)&_h2;
                 }
                 float unpack_f16_2_1[8];
@@ -782,8 +781,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         : "r"(scaled_f16_2[_pair]));
                 }
                 #pragma unroll
-                for (int j_7 = 0; j_7 < 8; j_7++) {
-                    acc[j_7] = acc[j_7] + unpack_f16_2_1[j_7];
+                for (int j_3_1 = 0; j_3_1 < 8; j_3_1++) {
+                    acc[j_3_1] = acc[j_3_1] + unpack_f16_2_1[j_3_1];
                 }
                 unsigned int scaled_f16_2_1[4];
                 #pragma unroll
@@ -807,7 +806,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 }
             }
             if (oct_index[3] >= 0) {
-                float scaled_3[8];
+                float scaled_2[8];
                 float unpack_f16_3[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -824,13 +823,13 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         : "r"(oct_words[12 + _pair]));
                 }
                 #pragma unroll
-                for (int j_8 = 0; j_8 < 8; j_8++) {
-                    scaled_3[j_8] = unpack_f16_3[j_8] * oct_scales[3];
+                for (int j_4 = 0; j_4 < 8; j_4++) {
+                    scaled_2[j_4] = unpack_f16_3[j_4] * oct_scales[3];
                 }
                 unsigned int scaled_f16_3[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
-                    __half2 _h2 = __float22half2_rn(make_float2(scaled_3[_lp*2 + 0], scaled_3[_lp*2+1 + 0]));
+                    __half2 _h2 = __float22half2_rn(make_float2(scaled_2[_lp*2 + 0], scaled_2[_lp*2+1 + 0]));
                     scaled_f16_3[_lp] = *(uint32_t*)&_h2;
                 }
                 float unpack_f16_3_1[8];
@@ -849,8 +848,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         : "r"(scaled_f16_3[_pair]));
                 }
                 #pragma unroll
-                for (int j_9 = 0; j_9 < 8; j_9++) {
-                    acc[j_9] = acc[j_9] + unpack_f16_3_1[j_9];
+                for (int j_5 = 0; j_5 < 8; j_5++) {
+                    acc[j_5] = acc[j_5] + unpack_f16_3_1[j_5];
                 }
                 unsigned int scaled_f16_3_1[4];
                 #pragma unroll
@@ -874,7 +873,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 }
             }
             if (oct_index[4] >= 0) {
-                float scaled_4[8];
+                float scaled_3[8];
                 float unpack_f16_4[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
@@ -891,16 +890,16 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         : "r"(oct_words[16 + _pair]));
                 }
                 #pragma unroll
-                for (int j_10 = 0; j_10 < 8; j_10++) {
-                    scaled_4[j_10] = unpack_f16_4[j_10] * oct_scales[4];
+                for (int j_6 = 0; j_6 < 8; j_6++) {
+                    scaled_3[j_6] = unpack_f16_4[j_6] * oct_scales[4];
                 }
                 unsigned int scaled_f16_4[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
-                    __half2 _h2 = __float22half2_rn(make_float2(scaled_4[_lp*2 + 0], scaled_4[_lp*2+1 + 0]));
+                    __half2 _h2 = __float22half2_rn(make_float2(scaled_3[_lp*2 + 0], scaled_3[_lp*2+1 + 0]));
                     scaled_f16_4[_lp] = *(uint32_t*)&_h2;
                 }
-                float unpack_f16_4_1[8];
+                float unpack_f16_5[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -912,12 +911,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         "cvt.f32.f16 f_hi, h_hi;\n\t"
                         "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_4_1[_pair * 2]))
+                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_5[_pair * 2]))
                         : "r"(scaled_f16_4[_pair]));
                 }
                 #pragma unroll
-                for (int j_11 = 0; j_11 < 8; j_11++) {
-                    acc[j_11] = acc[j_11] + unpack_f16_4_1[j_11];
+                for (int j_7 = 0; j_7 < 8; j_7++) {
+                    acc[j_7] = acc[j_7] + unpack_f16_5[j_7];
                 }
                 unsigned int scaled_f16_4_1[4];
                 #pragma unroll
@@ -941,8 +940,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 }
             }
             if (oct_index[5] >= 0) {
-                float scaled_5[8];
-                float unpack_f16_5[8];
+                float scaled_4[8];
+                float unpack_f16_6[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -954,20 +953,20 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         "cvt.f32.f16 f_hi, h_hi;\n\t"
                         "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_5[_pair * 2]))
+                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_6[_pair * 2]))
                         : "r"(oct_words[20 + _pair]));
                 }
                 #pragma unroll
-                for (int j_12 = 0; j_12 < 8; j_12++) {
-                    scaled_5[j_12] = unpack_f16_5[j_12] * oct_scales[5];
+                for (int j_8 = 0; j_8 < 8; j_8++) {
+                    scaled_4[j_8] = unpack_f16_6[j_8] * oct_scales[5];
                 }
                 unsigned int scaled_f16_5[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
-                    __half2 _h2 = __float22half2_rn(make_float2(scaled_5[_lp*2 + 0], scaled_5[_lp*2+1 + 0]));
+                    __half2 _h2 = __float22half2_rn(make_float2(scaled_4[_lp*2 + 0], scaled_4[_lp*2+1 + 0]));
                     scaled_f16_5[_lp] = *(uint32_t*)&_h2;
                 }
-                float unpack_f16_5_1[8];
+                float unpack_f16_6_1[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -979,12 +978,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         "cvt.f32.f16 f_hi, h_hi;\n\t"
                         "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_5_1[_pair * 2]))
+                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_6_1[_pair * 2]))
                         : "r"(scaled_f16_5[_pair]));
                 }
                 #pragma unroll
-                for (int j_13 = 0; j_13 < 8; j_13++) {
-                    acc[j_13] = acc[j_13] + unpack_f16_5_1[j_13];
+                for (int j_9 = 0; j_9 < 8; j_9++) {
+                    acc[j_9] = acc[j_9] + unpack_f16_6_1[j_9];
                 }
                 unsigned int scaled_f16_5_1[4];
                 #pragma unroll
@@ -1008,8 +1007,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 }
             }
             if (oct_index[6] >= 0) {
-                float scaled_6[8];
-                float unpack_f16_6[8];
+                float scaled_5[8];
+                float unpack_f16_7[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -1021,20 +1020,20 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         "cvt.f32.f16 f_hi, h_hi;\n\t"
                         "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_6[_pair * 2]))
+                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_7[_pair * 2]))
                         : "r"(oct_words[24 + _pair]));
                 }
                 #pragma unroll
-                for (int j_14 = 0; j_14 < 8; j_14++) {
-                    scaled_6[j_14] = unpack_f16_6[j_14] * oct_scales[6];
+                for (int j_10 = 0; j_10 < 8; j_10++) {
+                    scaled_5[j_10] = unpack_f16_7[j_10] * oct_scales[6];
                 }
                 unsigned int scaled_f16_6[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
-                    __half2 _h2 = __float22half2_rn(make_float2(scaled_6[_lp*2 + 0], scaled_6[_lp*2+1 + 0]));
+                    __half2 _h2 = __float22half2_rn(make_float2(scaled_5[_lp*2 + 0], scaled_5[_lp*2+1 + 0]));
                     scaled_f16_6[_lp] = *(uint32_t*)&_h2;
                 }
-                float unpack_f16_6_1[8];
+                float unpack_f16_7_1[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -1046,12 +1045,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         "cvt.f32.f16 f_hi, h_hi;\n\t"
                         "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_6_1[_pair * 2]))
+                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_7_1[_pair * 2]))
                         : "r"(scaled_f16_6[_pair]));
                 }
                 #pragma unroll
-                for (int j_15 = 0; j_15 < 8; j_15++) {
-                    acc[j_15] = acc[j_15] + unpack_f16_6_1[j_15];
+                for (int j_11 = 0; j_11 < 8; j_11++) {
+                    acc[j_11] = acc[j_11] + unpack_f16_7_1[j_11];
                 }
                 unsigned int scaled_f16_6_1[4];
                 #pragma unroll
@@ -1075,8 +1074,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 }
             }
             if (oct_index[7] >= 0) {
-                float scaled_7[8];
-                float unpack_f16_7[8];
+                float scaled_6[8];
+                float unpack_f16_8[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -1088,20 +1087,20 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         "cvt.f32.f16 f_hi, h_hi;\n\t"
                         "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_7[_pair * 2]))
+                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_8[_pair * 2]))
                         : "r"(oct_words[28 + _pair]));
                 }
                 #pragma unroll
-                for (int j_16 = 0; j_16 < 8; j_16++) {
-                    scaled_7[j_16] = unpack_f16_7[j_16] * oct_scales[7];
+                for (int j_12 = 0; j_12 < 8; j_12++) {
+                    scaled_6[j_12] = unpack_f16_8[j_12] * oct_scales[7];
                 }
                 unsigned int scaled_f16_7[4];
                 #pragma unroll
                 for (int _lp = 0; _lp < 4; _lp++) {
-                    __half2 _h2 = __float22half2_rn(make_float2(scaled_7[_lp*2 + 0], scaled_7[_lp*2+1 + 0]));
+                    __half2 _h2 = __float22half2_rn(make_float2(scaled_6[_lp*2 + 0], scaled_6[_lp*2+1 + 0]));
                     scaled_f16_7[_lp] = *(uint32_t*)&_h2;
                 }
-                float unpack_f16_7_1[8];
+                float unpack_f16_8_1[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -1113,12 +1112,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                         "cvt.f32.f16 f_hi, h_hi;\n\t"
                         "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_7_1[_pair * 2]))
+                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_8_1[_pair * 2]))
                         : "r"(scaled_f16_7[_pair]));
                 }
                 #pragma unroll
-                for (int j_17 = 0; j_17 < 8; j_17++) {
-                    acc[j_17] = acc[j_17] + unpack_f16_7_1[j_17];
+                for (int j_13 = 0; j_13 < 8; j_13++) {
+                    acc[j_13] = acc[j_13] + unpack_f16_8_1[j_13];
                 }
                 unsigned int scaled_f16_7_1[4];
                 #pragma unroll
@@ -1152,8 +1151,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
         }
         if (routed_scaling_factor != 1.0f) {
             #pragma unroll
-            for (int j_18 = 0; j_18 < 8; j_18++) {
-                acc[j_18] = acc[j_18] * routed_scaling_factor;
+            for (int j_14 = 0; j_14 < 8; j_14++) {
+                acc[j_14] = acc[j_14] * routed_scaling_factor;
             }
             unsigned int scaled_f16_8[4];
             #pragma unroll
@@ -1179,8 +1178,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
         if (has_shared_expert != 0) {
             int shared_elem = token * 7168 + cluster_thread * 8;
             #pragma unroll
-            for (int j_19 = 0; j_19 < 8; j_19++) {
-                acc[j_19] = acc[j_19] + shared_early[j_19];
+            for (int j_15 = 0; j_15 < 8; j_15++) {
+                acc[j_15] = acc[j_15] + shared_early[j_15];
             }
             unsigned int scaled_f16_9[4];
             #pragma unroll
@@ -1204,8 +1203,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
             }
         }
         #pragma unroll
-        for (int j_20 = 0; j_20 < 8; j_20++) {
-            acc[j_20] = ((acc[j_20] == 0.0f) ? 0.0f : acc[j_20]);
+        for (int j_16 = 0; j_16 < 8; j_16++) {
+            acc[j_16] = ((acc[j_16] == 0.0f) ? 0.0f : acc[j_16]);
         }
         unsigned int scaled_f16_10[4];
         #pragma unroll
@@ -1316,7 +1315,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 : "=l"(*reinterpret_cast<unsigned long long*>(&vec_load[_pair * 2]))
                 : "r"(residual_words[_pair]));
         }
-        float unpack_f16_8[8];
+        float unpack_f16_9[8];
         #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
             asm volatile(
@@ -1328,15 +1327,15 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 "cvt.f32.f16 f_hi, h_hi;\n\t"
                 "mov.b64 %0, {f_lo, f_hi};\n\t"
                 "}\n"
-                : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_8[_pair * 2]))
+                : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_9[_pair * 2]))
                 : "r"(_sysv_poll_group_0[_pair]));
         }
         float sum_value[8];
         #pragma unroll
-        for (int j_21 = 0; j_21 < 8; j_21++) {
-            sum_value[j_21] = unpack_f16_8[j_21];
+        for (int j_17 = 0; j_17 < 8; j_17++) {
+            sum_value[j_17] = unpack_f16_9[j_17];
         }
-        float unpack_f16_8_1[8];
+        float unpack_f16_9_1[8];
         #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
             asm volatile(
@@ -1348,12 +1347,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 "cvt.f32.f16 f_hi, h_hi;\n\t"
                 "mov.b64 %0, {f_lo, f_hi};\n\t"
                 "}\n"
-                : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_8_1[_pair * 2]))
+                : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_9_1[_pair * 2]))
                 : "r"(_sysv_poll_group_0[4 + _pair]));
         }
         #pragma unroll
-        for (int j_0 = 0; j_0 < 8; j_0++) {
-            sum_value[j_0] = sum_value[j_0] + unpack_f16_8_1[j_0];
+        for (int j_14_1 = 0; j_14_1 < 8; j_14_1++) {
+            sum_value[j_14_1] = sum_value[j_14_1] + unpack_f16_9_1[j_14_1];
         }
         unsigned int scaled_f16_11[4];
         #pragma unroll
@@ -1375,7 +1374,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 : "=l"(*reinterpret_cast<unsigned long long*>(&sum_value[_pair * 2]))
                 : "r"(scaled_f16_11[_pair]));
         }
-        float unpack_f16_9[8];
+        float unpack_f16_10[8];
         #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
             asm volatile(
@@ -1387,12 +1386,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 "cvt.f32.f16 f_hi, h_hi;\n\t"
                 "mov.b64 %0, {f_lo, f_hi};\n\t"
                 "}\n"
-                : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_9[_pair * 2]))
+                : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_10[_pair * 2]))
                 : "r"(_sysv_poll_group_0[8 + _pair]));
         }
         #pragma unroll
-        for (int j_1_1 = 0; j_1_1 < 8; j_1_1++) {
-            sum_value[j_1_1] = sum_value[j_1_1] + unpack_f16_9[j_1_1];
+        for (int j_15_1 = 0; j_15_1 < 8; j_15_1++) {
+            sum_value[j_15_1] = sum_value[j_15_1] + unpack_f16_10[j_15_1];
         }
         unsigned int scaled_f16_8_1[4];
         #pragma unroll
@@ -1414,7 +1413,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 : "=l"(*reinterpret_cast<unsigned long long*>(&sum_value[_pair * 2]))
                 : "r"(scaled_f16_8_1[_pair]));
         }
-        float unpack_f16_10[8];
+        float unpack_f16_11[8];
         #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
             asm volatile(
@@ -1426,12 +1425,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 "cvt.f32.f16 f_hi, h_hi;\n\t"
                 "mov.b64 %0, {f_lo, f_hi};\n\t"
                 "}\n"
-                : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_10[_pair * 2]))
+                : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_11[_pair * 2]))
                 : "r"(_sysv_poll_group_0[12 + _pair]));
         }
         #pragma unroll
-        for (int j_2_1 = 0; j_2_1 < 8; j_2_1++) {
-            sum_value[j_2_1] = sum_value[j_2_1] + unpack_f16_10[j_2_1];
+        for (int j_16_1 = 0; j_16_1 < 8; j_16_1++) {
+            sum_value[j_16_1] = sum_value[j_16_1] + unpack_f16_11[j_16_1];
         }
         unsigned int scaled_f16_9_1[4];
         #pragma unroll
@@ -1471,8 +1470,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 : "r"(norm_weight_words[_pair]));
         }
         #pragma unroll
-        for (int j_22 = 0; j_22 < 8; j_22++) {
-            vec_load[j_22] = vec_load[j_22] + sum_value[j_22];
+        for (int j_18 = 0; j_18 < 8; j_18++) {
+            vec_load[j_18] = vec_load[j_18] + sum_value[j_18];
         }
         unsigned int scaled_f16_10_1[4];
         #pragma unroll
@@ -1518,8 +1517,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
         reinterpret_cast<int4*>(residual_out + elem)[0] = reinterpret_cast<int4*>(_packed_0)[0];
         float square_sum = 0.0f;
         #pragma unroll
-        for (int j_23 = 0; j_23 < 8; j_23++) {
-            square_sum = __fmaf_rn(vec_load[j_23], vec_load[j_23], square_sum);
+        for (int j_19 = 0; j_19 < 8; j_19++) {
+            square_sum = __fmaf_rn(vec_load[j_19], vec_load[j_19], square_sum);
         }
         float _warp_reduce_21 = square_sum;
         #pragma unroll
@@ -1610,8 +1609,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
         float rstd = rsqrtf(cluster_sum / 7168.0f + epsilon);
         float norm_value[8];
         #pragma unroll
-        for (int j_24 = 0; j_24 < 8; j_24++) {
-            norm_value[j_24] = vec_load[j_24] * rstd * (vec_load_1[j_24] + weight_bias);
+        for (int j_20 = 0; j_20 < 8; j_20++) {
+            norm_value[j_20] = vec_load[j_20] * rstd * (vec_load_1[j_20] + weight_bias);
         }
         unsigned int scaled_f16_11_1[4];
         #pragma unroll
@@ -1641,7 +1640,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
         asm("max.f16 %0, %1, %2;" : "=h"(_f16_max_0) : "h"((uint16_t)(_f16x2_max_3 & 65535)), "h"((uint16_t)(_f16x2_max_3 >> 16)));
         float vector_max;
         asm("cvt.f32.f16 %0, %1;" : "=f"(vector_max) : "h"((uint16_t)(_f16_max_0)));
-        float unpack_f16_11[8];
+        float unpack_f16_12[8];
         #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
             asm volatile(
@@ -1653,7 +1652,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
                 "cvt.f32.f16 f_hi, h_hi;\n\t"
                 "mov.b64 %0, {f_lo, f_hi};\n\t"
                 "}\n"
-                : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_11[_pair * 2]))
+                : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_12[_pair * 2]))
                 : "r"(scaled_f16_11_1[_pair]));
         }
         float _rcp_31 = approx_rcp(6.0f);
@@ -1670,11 +1669,11 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o111_small(__half* __restrict__ allr
         float _rcp_35 = approx_rcp(sf_rounded * _rcp_36);
         float output_scale = ((sf_rounded != 0.0f) ? _rcp_35 : 0.0f);
         #pragma unroll
-        for (int j_25 = 0; j_25 < 8; j_25++) {
-            unpack_f16_11[j_25] = unpack_f16_11[j_25] * output_scale;
+        for (int j_21 = 0; j_21 < 8; j_21++) {
+            unpack_f16_12[j_21] = unpack_f16_12[j_21] * output_scale;
         }
         unsigned int _fp4_0[1];
-        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_0[0]) : "f"(unpack_f16_11[0]), "f"(unpack_f16_11[1]), "f"(unpack_f16_11[2]), "f"(unpack_f16_11[3]), "f"(unpack_f16_11[4]), "f"(unpack_f16_11[5]), "f"(unpack_f16_11[6]), "f"(unpack_f16_11[7]));
+        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_0[0]) : "f"(unpack_f16_12[0]), "f"(unpack_f16_12[1]), "f"(unpack_f16_12[2]), "f"(unpack_f16_12[3]), "f"(unpack_f16_12[4]), "f"(unpack_f16_12[5]), "f"(unpack_f16_12[6]), "f"(unpack_f16_12[7]));
         *(reinterpret_cast<int*>(reinterpret_cast<unsigned int*>(quant_out)) + (access_1)) = _fp4_0[0];
         if (lane % 2 == 0) {
             int scale_col = access_in_token / 2;

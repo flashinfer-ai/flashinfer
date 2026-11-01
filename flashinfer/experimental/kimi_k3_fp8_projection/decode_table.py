@@ -1318,6 +1318,40 @@ DECODE_TABLE_M_RANGES: dict[
             ),
         ),
         "50,28,4096": ((3329, 3584, {"route": "gemm", "gemm_bk": 128}),),
+        "56,6,2048": (
+            (
+                1281,
+                1536,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+            (
+                1793,
+                2048,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+        ),
+        "56,6,4096": (
+            (
+                2049,
+                2304,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+            (
+                2561,
+                2816,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+            (
+                3329,
+                3584,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+            (
+                3841,
+                4096,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+        ),
         "192,2,2048": (
             (
                 1281,

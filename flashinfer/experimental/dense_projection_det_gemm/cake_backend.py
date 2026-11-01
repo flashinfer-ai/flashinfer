@@ -149,6 +149,10 @@ WORK_STAGES = 4  # cluster-launch-control work-ring depth  [Cake L68]
 GROUP_M = 16  # CTA row tiles per raster group (even: the two CTAs of a pair are the row halves of one 256-row tile)  [Cake L69]
 SLOT_BYTES = 32 * 128  # one epilogue staging slot (TMA-store epilogue)  [Cake L95]
 SK_MIN_ITERS = 8  # stream-K: fewest K steps per unit  [Cake L72]
+# stream-K: workspace slabs per tail tile of a linearised plan on the programs that key the workspace by tile (slab =
+# tail tile * WS_PARTS + the unit's part on the tile; those programs require 2 * iters_per_unit >= k_blocks, so a
+# tile holds at most WS_PARTS units - ``tile_keyed_workspace``)  [Cake WS_PARTS]
+WS_PARTS = 3
 K_TMA_BF16 = 1024  # bf16 rows with K at or below this: TMA-store epilogue  [Cake L103]
 K_TWO_SLOTS = 0  # K at or below this: two staging slots per warp (off)  [Cake L104]
 CH_T_COLS = 32  # output rows n per transposed TMA-store box / staging chunk (round 14)  [Cake L111]
@@ -311,6 +315,21 @@ def generated_program_available(
     if template is None:
         return bool(table)
     return template in table
+
+
+def tile_keyed_workspace(arch: str, template: str) -> bool:
+    """Whether the program ``KERNELS[arch][template]`` keys its stream-K workspace by tail tile: the programs rendered
+    from the current kernel source (a registry record whose ``build.module`` is the K1 kernel module,
+    ``*.dense_projection_det_gemm``) store the partial of the unit that holds part ``j`` of tail tile ``t`` (``j``
+    counted from the unit that holds the tile's first K step) in slab ``t * WS_PARTS + j`` of a linearised plan,
+    ``t * p + j`` of the exact ``p``-way split and ``t`` of the synchronised one, and their bindings require
+    ``2 * iters_per_unit >= k_iters`` of a linearised plan.  The carried programs (no ``build`` record) key it by
+    unit (slab ``unit + t``) and take any linearised plan.  ``False`` for a template ``arch`` does not register."""
+    module = KERNELS.get(arch, {}).get(template)
+    if module is None:
+        return False
+    generator = MODULES[module].get("build", {}).get("module", "")
+    return generator.endswith(".dense_projection_det_gemm")
 
 
 def device_sm_count(device: torch.device) -> int:
@@ -1220,10 +1239,13 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # T on GB300; the knobs after it are the row's program where the form yields (the 4096 -> 48 rule carries none: the
 # architecture default program runs there), and the planner drops a rule's form where the plan carries stream-K units,
 # the single-CTA form, another tile or output class, the register epilogue or a caller-forced pipeline knob, and refuses
-# a caller-forced form there.  Five sm_100a input-gradient rows (4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024
-# and the kv_a 6144 -> 576) carry ``form`` ``w8``: the knob-free eight-warp program (``_w8``) measured faster than the
-# row's program above the pair spread at both T on GB200; the knobs after it are the row's program where the form
-# yields, and the raster group is the row's measured launch parameter.
+# a caller-forced form there.  Seven sm_100a input-gradient rows carry ``form``: 4096 -> 1024 and 5120 -> 1024 the
+# knob-free eight-warp program (``_w8``), 4096 -> 512 and the kv_a 6144 -> 576 the eight-warp program with the early
+# accumulator release and the loader-issued scheduling queries (``_w8rs``), and 5120 -> 512, 4096 -> 64 and 5120 -> 64
+# the one with the early accumulator release (``_w8r``).  Each measured faster than the row's program above the pair
+# spread at both T on GB200, except 4096 -> 64, 5120 -> 64 and the kv_a, where the form measured at least as fast as the
+# row's program there; the knobs after the form are the row's program where the form yields, and the raster group is the
+# row's measured launch parameter.
 ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 32, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 128, 6144, None): {"cta1": True},
@@ -1240,9 +1262,10 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 4096, 2048, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, True, False, False, False, 2048, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, True, False, False, False, 6144, 128, None): {"slots": 2, "pd": 2, "pro": 15},
-    # the kv_a input gradient (6144 -> 576): the knob-free eight-warp program, the row's ten-warp knobs kept as its
-    # program where the form yields; the raster group of 12 row tiles is the row's measured launch parameter
-    ('sm_100a', False, True, False, False, False, 6144, 576, None): {"form": 'w8', "group_m": 12, "slots": 1, "epi": 'tma', "pd": 2, "pro": 15, "sk": False},
+    # the kv_a input gradient (6144 -> 576): the eight-warp program with the early accumulator release and the
+    # loader-issued scheduling queries, the row's ten-warp knobs kept as its program where the form yields; the raster
+    # group of 12 row tiles is the row's measured launch parameter
+    ('sm_100a', False, True, False, False, False, 6144, 576, None): {"form": 'w8rs', "group_m": 12, "slots": 1, "epi": 'tma', "pd": 2, "pro": 15, "sk": False},
     ('sm_100a', False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
     ('sm_100a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
     ('sm_100a', False, True, False, False, True, 512, 256, None): {"cta_rows": 256, "group_m": 4, "batch_group": 4},
@@ -1390,17 +1413,17 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 17408, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_100a', False, True, False, False, False, 4096, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_100a', False, True, False, False, False, 4096, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
-    ('sm_100a', False, True, False, False, False, 4096, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
+    ('sm_100a', False, True, False, False, False, 4096, 64, None): {"form": 'w8r', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 4096, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
-    ('sm_100a', False, True, False, False, False, 4096, 512, None): {"form": 'w8', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 12, "sk": False},
+    ('sm_100a', False, True, False, False, False, 4096, 512, None): {"form": 'w8rs', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 12, "sk": False},
     ('sm_100a', False, True, False, False, False, 4096, 1024, None): {"form": 'w8', "pd": 2, "pro": 15, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 4096, 4096, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, True, False, False, False, 4096, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
     ('sm_100a', False, True, False, False, False, 5120, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_100a', False, True, False, False, False, 5120, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
-    ('sm_100a', False, True, False, False, False, 5120, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
+    ('sm_100a', False, True, False, False, False, 5120, 64, None): {"form": 'w8r', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 5120, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True},
-    ('sm_100a', False, True, False, False, False, 5120, 512, None): {"form": 'w8', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8, "sk": False},
+    ('sm_100a', False, True, False, False, False, 5120, 512, None): {"form": 'w8r', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 5120, 1024, None): {"form": 'w8', "pd": 2, "pro": 15, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_100a', False, True, False, False, False, 5120, 17408, None): {"cta_rows": 256, "ovr": True, "htail": True},
@@ -1841,12 +1864,14 @@ def stream_k_plan(
     return pair_tiles - tail, tail, units, iters_per_unit
 
 
-def check_stream_k_plan(plan: "DetGemmPlan") -> None:
+def check_stream_k_plan(plan: "DetGemmPlan", arch: Optional[str] = None) -> None:
     """Refuse a stream-K plan outside the program's launch contract (the Cake kernel's ``requires``) before it
     launches.  The programs that hand off the work inside an item's last segment (``pd`` 2, ``sk_slab`` 2,
     ``stt``) never finish an item that holds no K step: the linearised plan needs ``iters_per_unit >= 1`` and
     ``(sk_units - 1) * iters_per_unit < sk_iters``, the synchronised one at most ``tail_tiles`` collectors.  Every
-    synchronised plan needs a collector for the K steps ``[s, k_blocks)`` of its tail tiles.  A plan without
+    synchronised plan needs a collector for the K steps ``[s, k_blocks)`` of its tail tiles.  With ``arch``, a
+    linearised plan of a program that keys its workspace by tail tile (``tile_keyed_workspace``) needs
+    ``2 * iters_per_unit >= k_blocks``: a tile then holds at most ``WS_PARTS`` units, one slab each.  A plan without
     stream-K units holds every condition."""
     if not plan.sk_units:
         return
@@ -1867,6 +1892,17 @@ def check_stream_k_plan(plan: "DetGemmPlan") -> None:
                 f"dense_projection_det_gemm: {plan.template} needs every stream-K unit to hold a K step (got "
                 f"{plan.sk_units} units of {plan.iters_per_unit} over {plan.sk_iters} K steps)"
             )
+    if (
+        arch is not None
+        and not (plan.sk_sync or plan.sk_exact or plan.htail_plan)
+        and 2 * plan.iters_per_unit < plan.k_blocks
+        and tile_keyed_workspace(arch, plan.template)
+    ):
+        raise ValueError(
+            f"dense_projection_det_gemm: {plan.template} keys its stream-K workspace by tail tile and needs "
+            f"2 * iters_per_unit >= k_blocks, at most {WS_PARTS} units on a tile (got {plan.sk_units} units of "
+            f"{plan.iters_per_unit} K steps over {plan.tail_tiles} tail tiles of {plan.k_blocks} K steps)"
+        )
 
 
 def sk_sync_plan(
@@ -2084,14 +2120,17 @@ class DetGemmPlan:
 
     @property
     def ws_f32_elems(self) -> int:
-        """fp32 elements of the stream-K partial slabs (unit + tail-tile slabs); 0 without stream-K and
-        under the half-height tail plan (its items are whole-K tiles: no partial slabs, no fixup)."""
+        """fp32 elements of the stream-K partial slabs; 0 without stream-K and under the half-height tail plan (its items
+        are whole-K tiles: no partial slabs, no fixup).  A slab is ``2 * cta_rows * block_n`` elements."""
         if not self.sk_units or self.htail_plan:
             return 0
         if self.sk_sync:
             # one slab per tail tile (the first arriver of a tile stores its partial, the second adds it)  [Cake launcher]
             return self.tail_tiles * 2 * self.cta_rows * self.block_n
-        return (self.sk_units + self.tail_tiles) * 2 * self.cta_rows * self.block_n
+        # The unit-keyed programs reach slab sk_units + tail_tiles - 1, the tile-keyed ones (``tile_keyed_workspace``)
+        # WS_PARTS * tail_tiles - 1 on a linearised plan (sk_units - 1 on the exact split): room for either mapping.
+        slabs = max(self.sk_units + self.tail_tiles, WS_PARTS * self.tail_tiles)
+        return slabs * 2 * self.cta_rows * self.block_n
 
     @property
     def counters_u32(self) -> int:
@@ -2927,7 +2966,7 @@ def plan_dense_projection_det_gemm(
         form=str(key[36]),
         wave_fallback=wave_fallback,
     )
-    check_stream_k_plan(plan)
+    check_stream_k_plan(plan, arch)
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
         for allow_swap, use_rules in ((False, True), (True, False), (False, False)):
@@ -4473,6 +4512,13 @@ def plan_router_fp32_det_gemm(
     splits = int(splits)
     if splits < 1:
         raise ValueError("router_fp32_det_gemm: splits must be >= 1")
+    # one split stores straight into ``out``: the row-major store (kk / kn) writes 16-byte vectors, the
+    # transposed store (nn_t) one fp32 element at a time; more splits store into the workspace and reduce into ``out``
+    if splits == 1 and not transposed and out.data_ptr() % 16 != 0:
+        raise ValueError(
+            "router_fp32_det_gemm: out must start at a 16-byte aligned address "
+            f"(the single-split {layout} launch stores 16-byte vectors into it)"
+        )
     m_tiles = _ceil_div(M_eff, ROUTER_BLOCK_M)
     m_tiles += m_tiles % CTA_GROUP
     n_tiles = _ceil_div(N_eff, ROUTER_BLOCK_N)

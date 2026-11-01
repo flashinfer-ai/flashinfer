@@ -41,7 +41,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_fp8.h>
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_REDUCE_SMEM_OFF 0
 #define SMEM_REDUCE_SMEM_STAGE_BYTES 132
 #define SMEM_REDUCE_SMEM_STRIDE 132
@@ -761,7 +760,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_ts(__half* __restrict__ allredu
                 for (int j_12 = 0; j_12 < 8; j_12++) {
                     sum_value[j_12] = unpack_f16_4[j_12];
                 }
-                float unpack_f16_4_1[8];
+                float unpack_f16_5[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -773,12 +772,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_ts(__half* __restrict__ allredu
                         "cvt.f32.f16 f_hi, h_hi;\n\t"
                         "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_4_1[_pair * 2]))
+                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_5[_pair * 2]))
                         : "r"(_sysv_poll_group_0[4 + _pair]));
                 }
                 #pragma unroll
-                for (int j_13 = 0; j_13 < 8; j_13++) {
-                    sum_value[j_13] = sum_value[j_13] + unpack_f16_4_1[j_13];
+                for (int j_0 = 0; j_0 < 8; j_0++) {
+                    sum_value[j_0] = sum_value[j_0] + unpack_f16_5[j_0];
                 }
                 unsigned int scaled_f16_7[4];
                 #pragma unroll
@@ -800,7 +799,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_ts(__half* __restrict__ allredu
                         : "=l"(*reinterpret_cast<unsigned long long*>(&sum_value[_pair * 2]))
                         : "r"(scaled_f16_7[_pair]));
                 }
-                float unpack_f16_5[8];
+                float unpack_f16_6[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -812,12 +811,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_ts(__half* __restrict__ allredu
                         "cvt.f32.f16 f_hi, h_hi;\n\t"
                         "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_5[_pair * 2]))
+                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_6[_pair * 2]))
                         : "r"(_sysv_poll_group_0[8 + _pair]));
                 }
                 #pragma unroll
-                for (int j_14 = 0; j_14 < 8; j_14++) {
-                    sum_value[j_14] = sum_value[j_14] + unpack_f16_5[j_14];
+                for (int j_1_1 = 0; j_1_1 < 8; j_1_1++) {
+                    sum_value[j_1_1] = sum_value[j_1_1] + unpack_f16_6[j_1_1];
                 }
                 unsigned int scaled_f16_4_1[4];
                 #pragma unroll
@@ -839,7 +838,7 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_ts(__half* __restrict__ allredu
                         : "=l"(*reinterpret_cast<unsigned long long*>(&sum_value[_pair * 2]))
                         : "r"(scaled_f16_4_1[_pair]));
                 }
-                float unpack_f16_6[8];
+                float unpack_f16_7[8];
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
                     asm volatile(
@@ -851,12 +850,12 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_ts(__half* __restrict__ allredu
                         "cvt.f32.f16 f_hi, h_hi;\n\t"
                         "mov.b64 %0, {f_lo, f_hi};\n\t"
                         "}\n"
-                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_6[_pair * 2]))
+                        : "=l"(*reinterpret_cast<unsigned long long*>(&unpack_f16_7[_pair * 2]))
                         : "r"(_sysv_poll_group_0[12 + _pair]));
                 }
                 #pragma unroll
-                for (int j_15 = 0; j_15 < 8; j_15++) {
-                    sum_value[j_15] = sum_value[j_15] + unpack_f16_6[j_15];
+                for (int j_13 = 0; j_13 < 8; j_13++) {
+                    sum_value[j_13] = sum_value[j_13] + unpack_f16_7[j_13];
                 }
                 unsigned int scaled_f16_5_1[4];
                 #pragma unroll
@@ -994,8 +993,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_ts(__half* __restrict__ allredu
                 }
             }
             #pragma unroll
-            for (int j_16 = 0; j_16 < 8; j_16++) {
-                _vec_load_17[j_16] = _vec_load_17[j_16] + sum_value_1[j_16];
+            for (int j_14 = 0; j_14 < 8; j_14++) {
+                _vec_load_17[j_14] = _vec_load_17[j_14] + sum_value_1[j_14];
             }
             unsigned int scaled_f16_8[4];
             #pragma unroll
@@ -1041,8 +1040,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_ts(__half* __restrict__ allredu
             reinterpret_cast<int4*>(residual_out + elem)[0] = reinterpret_cast<int4*>(_packed_0)[0];
             float square_sum = 0.0f;
             #pragma unroll
-            for (int j_17 = 0; j_17 < 8; j_17++) {
-                square_sum = __fmaf_rn(_vec_load_17[j_17], _vec_load_17[j_17], square_sum);
+            for (int j_15 = 0; j_15 < 8; j_15++) {
+                square_sum = __fmaf_rn(_vec_load_17[j_15], _vec_load_17[j_15], square_sum);
             }
             float _warp_reduce_16 = square_sum;
             #pragma unroll
@@ -1133,8 +1132,8 @@ kernel_cake_trtllm_moe_finalize_float16_ws4_o110_ts(__half* __restrict__ allredu
             float rstd = rsqrtf(cluster_sum / 7168.0f + epsilon);
             float norm_value[8];
             #pragma unroll
-            for (int j_18 = 0; j_18 < 8; j_18++) {
-                norm_value[j_18] = _vec_load_17[j_18] * rstd * (vec_load_1[j_18] + weight_bias);
+            for (int j_16 = 0; j_16 < 8; j_16++) {
+                norm_value[j_16] = _vec_load_17[j_16] * rstd * (vec_load_1[j_16] + weight_bias);
             }
             unsigned int scaled_f16_6_1[4];
             #pragma unroll

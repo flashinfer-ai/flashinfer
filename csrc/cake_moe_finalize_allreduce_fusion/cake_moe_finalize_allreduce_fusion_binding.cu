@@ -168,9 +168,9 @@ const void* const kTwoShotDeferKernels[2][3][2] = {
       reinterpret_cast<const void*>(kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o111_tsd)}},
 };
 
-// Token counts above small_token_max that still run the small-token program at world sizes 2
-// and 4, except for top_k 4 without a shared expert, as long as the device holds one resident
-// cluster of the small-token program per token.
+// Token counts above small_token_max that still run the small-token program at world size 4,
+// and at world size 2 except for top_k 4 without a shared expert, as long as the device holds
+// one resident cluster of the small-token program per token.
 constexpr int64_t kSmallTokenExtendedMax = 71;
 
 // World sizes 4 and 8 run the two-shot program from these token counts on, tested ahead of the
@@ -264,8 +264,8 @@ int64_t byte_size(const TensorView& t) { return t.numel() * get_element_size(t);
 // Batches of at least kTwoShotMinTokensWorldSize4 tokens at world size 4 and
 // kTwoShotMinTokensWorldSize8 at world size 8 run the two-shot program (its deferred form from
 // kTwoShotDeferMinTokensWorldSize4 / kTwoShotDeferMinTokensWorldSize8 tokens). Other batches of
-// at most small_token_max tokens run the small-token program (at world sizes 2 and 4 up to
-// kSmallTokenExtendedMax tokens for every class but top_k 4 without a shared expert). Larger
+// at most small_token_max tokens run the small-token program (up to kSmallTokenExtendedMax at
+// world size 4, and at world size 2 for every class but top_k 4 without a shared expert). Larger
 // batches run the two-shot program at world size 8, the large-token program at world size 2 for
 // top_k 4 above kLargeTokenMinTokens (kLargeTokenMinTokensSharedExpert with a shared expert),
 // and the persistent program otherwise.
@@ -438,13 +438,14 @@ void cake_moe_finalize_allreduce_fusion(
       tokens >= (world_size == 8 ? kTwoShotDeferMinTokensWorldSize8
                                  : kTwoShotDeferMinTokensWorldSize4);
   const void* large_token = kLargeTokenKernels[dtype_index][ws_index][quant_index];
-  const bool small_token_extended = world_size != 8 && (top_k != 4 || v_has_shared_expert != 0);
+  const bool small_token_extended =
+      world_size == 4 || (world_size == 2 && (top_k != 4 || v_has_shared_expert != 0));
   const void* kernel = nullptr;
   if (two_shot != nullptr &&
       tokens >= (world_size == 8 ? kTwoShotMinTokensWorldSize8 : kTwoShotMinTokensWorldSize4)) {
-    // Keyed on the token count and the world size alone, ahead of the class-keyed small-token
-    // extension and its device-local capacity term. Both two-shot forms use the same workspace
-    // and messages, so a rank may run either.
+    // Keyed on the token count and the world size alone, ahead of the small-token extension
+    // (class-keyed at world size 2) and its device-local capacity term. Both two-shot forms use
+    // the same workspace and messages, so a rank may run either.
     kernel = two_shot_deferred ? two_shot_defer : two_shot;
   } else if (tokens <= small_token_max ||
              (small_token_extended && tokens <= kSmallTokenExtendedMax &&

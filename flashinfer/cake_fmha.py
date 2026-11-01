@@ -400,178 +400,185 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
     ),
     # The FP8 runtime-size programs: the m-block count is a launch argument.
     ("context_fp8", "RUNTIME_PACK8"): (
-        "cake_fmha_context_fp8_8cd3ded18158fc5ae281",
+        "cake_fmha_context_fp8_27799c2f9548e951013e",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4"): (
-        "cake_fmha_context_fp8_b6eed48edac789a57ffd",
+        "cake_fmha_context_fp8_e193fed2eff47620b919",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2"): (
-        "cake_fmha_context_fp8_ebffd1cb5bf0b3ec86c7",
+        "cake_fmha_context_fp8_f873d11e318ec3392f47",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1"): (
-        "cake_fmha_context_fp8_c678c1bfe0695d0217f3",
+        "cake_fmha_context_fp8_ab6de9d118422d291f84",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK8_PAGE64"): (
-        "cake_fmha_context_fp8_1efb60135327d438feb2",
+        "cake_fmha_context_fp8_541cc008db776c108277",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PAGE64"): (
-        "cake_fmha_context_fp8_140f0ba5b3e9586e084f",
+        "cake_fmha_context_fp8_bf040e8cb8577f37d708",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PAGE64"): (
-        "cake_fmha_context_fp8_fa4ffc06a12409f0f7ae",
+        "cake_fmha_context_fp8_e5d2537ba897c1e551a3",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PAGE64"): (
-        "cake_fmha_context_fp8_863ff233d455150998f6",
+        "cake_fmha_context_fp8_8c22dd8f00a06a0700ed",
         None,
         False,
     ),
     # The sm103a runtime-size programs: the same schedules with a 4-stage
     # K/V ring and each stage's P tile in the other stage's S columns.
     ("context_fp8", "RUNTIME_PACK8_PX"): (
-        "cake_fmha_context_fp8_d876c1030506ff5d9655",
+        "cake_fmha_context_fp8_974dea25a1bcbc06775c",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PX"): (
-        "cake_fmha_context_fp8_8871340f95e50ec01f9f",
+        "cake_fmha_context_fp8_479df0d88cefb094c3e7",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PX"): (
-        "cake_fmha_context_fp8_de159d7010cb697be4a1",
+        "cake_fmha_context_fp8_b8d0dbb525f2696d3e03",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PX"): (
-        "cake_fmha_context_fp8_2dade61a9d1412810382",
+        "cake_fmha_context_fp8_933bdbad91945bcf2d21",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK8_PAGE64_PX"): (
-        "cake_fmha_context_fp8_20dd6b5412a917f5e9e2",
+        "cake_fmha_context_fp8_1222348d842644950386",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PAGE64_PX"): (
-        "cake_fmha_context_fp8_e3473380d99065214e6e",
+        "cake_fmha_context_fp8_29cdc45592b5623137c6",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PAGE64_PX"): (
-        "cake_fmha_context_fp8_8ca24f992b6e9d15171b",
+        "cake_fmha_context_fp8_733558922a0144e96b0f",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PAGE64_PX"): (
-        "cake_fmha_context_fp8_c839dbe3811179fc89fa",
+        "cake_fmha_context_fp8_290a4ce6ad5aa95368d1",
         None,
         False,
     ),
     # The one-stage FP8 runtime-size programs: the same schedules with one
     # 128-row query stage per tile (an m-block of 128 / pack_g query tokens).
     ("context_fp8", "RUNTIME_PACK8_Q1"): (
-        "cake_fmha_context_fp8_8fb12c0b5545c8c829b8",
+        "cake_fmha_context_fp8_98519e1561f69cc77fda",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_Q1"): (
-        "cake_fmha_context_fp8_74be69270b3dbab411c2",
+        "cake_fmha_context_fp8_69371659c5de83d1c6f3",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_Q1"): (
-        "cake_fmha_context_fp8_7b57d84fc038783bb7f6",
+        "cake_fmha_context_fp8_d00439888f9ecc52cf8e",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_Q1"): (
-        "cake_fmha_context_fp8_a6345fdaae8253e1ca8c",
+        "cake_fmha_context_fp8_23ccecb73487c64c88e4",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK8_PAGE64_Q1"): (
-        "cake_fmha_context_fp8_a3c695c0a7e5cceb1cd6",
+        "cake_fmha_context_fp8_66d9c3d0a157c6288c8f",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PAGE64_Q1"): (
-        "cake_fmha_context_fp8_79b89b32f9fa054ff1e6",
+        "cake_fmha_context_fp8_09891a177f5196571b27",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PAGE64_Q1"): (
-        "cake_fmha_context_fp8_ff413ab9c9730a6d57eb",
+        "cake_fmha_context_fp8_b82165c563e4cb32b133",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PAGE64_Q1"): (
-        "cake_fmha_context_fp8_07051c2d4d7173396759",
+        "cake_fmha_context_fp8_888c8c0de1e167c1212c",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK8_PX_Q1"): (
-        "cake_fmha_context_fp8_9f092ab962d59eecbc31",
+        "cake_fmha_context_fp8_b193daaab958d4babaac",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PX_Q1"): (
-        "cake_fmha_context_fp8_db14fca362e3e3a84742",
+        "cake_fmha_context_fp8_ec3760f97265869bb4d8",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PX_Q1"): (
-        "cake_fmha_context_fp8_ca1b853b471fd2e05bdd",
+        "cake_fmha_context_fp8_55b399c09e7b9e963664",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PX_Q1"): (
-        "cake_fmha_context_fp8_f1232bb28ddc7108ca82",
+        "cake_fmha_context_fp8_e3820dae3c8125209907",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK8_PAGE64_PX_Q1"): (
-        "cake_fmha_context_fp8_67da0f645063c53d9dd6",
+        "cake_fmha_context_fp8_33898a252fbaa5722dae",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PAGE64_PX_Q1"): (
-        "cake_fmha_context_fp8_08960f96467fb1f1c2d1",
+        "cake_fmha_context_fp8_b167e399fff8871743fc",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PAGE64_PX_Q1"): (
-        "cake_fmha_context_fp8_09137ca667679fca068b",
+        "cake_fmha_context_fp8_6934061567e1564d7aa0",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PAGE64_PX_Q1"): (
-        "cake_fmha_context_fp8_84fda886cb7464ecb623",
+        "cake_fmha_context_fp8_b42343b75e9525f7d215",
         None,
         False,
     ),
     # The sm100a one-stage page-64 programs of packs 2 and 1 without the
     # short-KV chain (_CONTEXT_FP8_MULTI_WAVE_ROUTES).
     ("context_fp8", "RUNTIME_PACK2_PAGE64_Q1_MW"): (
-        "cake_fmha_context_fp8_a75b8a782142524bc162",
+        "cake_fmha_context_fp8_dd2e6e339330c40630fa",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PAGE64_Q1_MW"): (
-        "cake_fmha_context_fp8_1485f1c56ec9188ae449",
+        "cake_fmha_context_fp8_d3093a512d060fdfad20",
+        None,
+        False,
+    ),
+    # The sm100a pack-8 program for every page size that stores stage 0 as soon
+    # as its last PV is in (_CONTEXT_FP8_ONE_WAVE_ROUTES).
+    ("context_fp8", "RUNTIME_PACK8_OW"): (
+        "cake_fmha_context_fp8_c42e0614ab8103e2499a",
         None,
         False,
     ),
@@ -683,6 +690,26 @@ _CONTEXT_FP8_RUNTIME_PACKS = (8, 4, 2)
 # tiles than this ran slower (timed GB300: 1 .. 16 requests of 16 .. 128 query
 # tokens over 64 .. 128 keys, heads 32/4, 32/8 and 64/8).
 _CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES: dict[str, int] = {"sm103a": 64}
+# Per target, the one-stage programs a short-KV call of that pack (the smallest
+# of at most :data:`_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES` tiles) runs as they
+# are: the page-64 programs whose short-KV chain (the entry L2 warm-up of the
+# static first tile and the partial block's single masking pass) serves a tile
+# of one KV block (timed GB300: 1 and 2 requests of 32 query tokens over 128
+# keys, heads 32/8 and 32/16, ran faster than the two-stage program).
+_CONTEXT_FP8_SHORT_KV_ONE_STAGE_PROGRAMS: dict[str, frozenset[str]] = {
+    "sm103a": frozenset(
+        f"RUNTIME_PACK{pack}_PAGE64_PX_Q1" for pack in (*_CONTEXT_FP8_RUNTIME_PACKS, 1)
+    ),
+}
+# Per target, the query tokens at most which a short-KV call of 64-token
+# pages tries pack 2 before pack 1 when its pack-2 tiles number at least
+# _CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TILES: its page-64 tiles of two query
+# heads ran faster than those of one (timed GB300: 1 .. 8 requests of 1 .. 32
+# query tokens over 128 keys, heads 8/1 .. 64/8, with 32 or more pack-2
+# tiles); with fewer tiles pack 1 spreads the call over more SMs and some of
+# those calls ran slower with pack 2.
+_CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TOKENS: dict[str, int] = {"sm103a": 32}
+_CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TILES: dict[str, int] = {"sm103a": 32}
 # The FP8 split-KV context programs: the runtime-size schedule and arguments,
 # with the key range of the first ``split_tiles`` tiles split over work units
 # of ``split_blocks`` KV blocks (at most ``num_splits`` per tile), whose FP32
@@ -727,6 +754,29 @@ _CONTEXT_FP8_MULTI_WAVE_ROUTES: dict[str, dict[str, tuple[str, int, int]]] = {
         "RUNTIME_PACK2_PAGE64_Q1": ("RUNTIME_PACK2_PAGE64_Q1_MW", 64, 384),
         "RUNTIME_PACK1_PAGE64_Q1": ("RUNTIME_PACK1_PAGE64_Q1_MW", 64, 384),
     },
+}
+# Per target, the runtime-size programs whose launches of one tile per CTA (at
+# most as many tiles as the SMs) run the entry's program instead: the same
+# schedule, arithmetic and arguments with stage 0 stored as soon as its last PV
+# is in.  A persistent CTA's next tile overlaps that store with its first block
+# (timed B200: in those launches the early store ran 2.5 % slower); a launch of
+# one tile per CTA has no next tile (timed B200: 1 .. 2 requests of 200 .. 400
+# query tokens over 1500 keys, heads 32/4, ran 0.5 .. 0.9 us faster).
+_CONTEXT_FP8_ONE_WAVE_ROUTES: dict[str, dict[str, str]] = {
+    "sm100a": {"RUNTIME_PACK8": "RUNTIME_PACK8_OW"},
+}
+# Per target, (fewest tiles, most keys, fewest query tokens) of the launches
+# whose two-way split the one-wave program outruns: a launch whose runtime
+# program has a one-wave entry, whose tiles at that program's pack number at
+# least the first and at most the SMs, over at most the keys and more than the
+# query tokens, keeps its whole tiles where the split choice names a plan of
+# two splits.  The cost model prices those splits below the whole tiles; timed
+# B200 (1 .. 4 requests of 160 .. 200 query tokens over 1500 .. 1537 keys,
+# heads 32/4, 64/8 and 16/2, 40 .. 56 tiles): the one-wave program ran
+# 1.7 .. 3.8 % faster than the two-way split; over 1700 keys and more the split
+# ran faster, and the three-way splits as fast or faster.
+_CONTEXT_FP8_ONE_WAVE_SPLIT_BOUNDS: dict[str, tuple[int, int, int]] = {
+    "sm100a": (40, 1664, 128),
 }
 _CONTEXT_FP8_ONE_STAGE_PROGRAMS = frozenset(
     name
@@ -4517,6 +4567,22 @@ _CONTEXT_FP8_ONE_STAGE_ROWS: dict[str, float] = {
     "sm103a": 0.71,
 }
 _CONTEXT_FP8_ONE_STAGE_MIN_ROWS = 64
+# Per target, the page sizes whose one-stage programs' gain over the current
+# launch also takes the unit scaled by the tile's query rows (as the ranking
+# does, and as the split model scales the current launch's unit): the page-64
+# one-stage programs with the short-KV chain, whose tiles of fewer query rows
+# timed faster than the unscaled unit predicts (GB300).
+_CONTEXT_FP8_ONE_STAGE_ROWS_GAIN: dict[str, frozenset[int]] = {
+    "sm103a": frozenset({64}),
+}
+# Per target, the most keys of a launch of one KV block per tile that takes
+# the one-stage pack ranked fastest wherever the one-stage costs predict it
+# faster than the launch's schedule, without the split margins: with one
+# 128-key block per tile the one-stage tile drops the empty second stage's
+# products, softmax and epilogue, which the costs (fitted over 768 .. 6016
+# keys) undercount (timed B200: 32 query tokens, heads 32/32, page 64, 1 .. 4
+# requests ran 0.8 .. 1.1 us faster one-stage, predicted 0.3 us).
+_CONTEXT_FP8_ONE_BLOCK_ONE_STAGE_KEYS: dict[str, int] = {"sm100a": 128}
 
 
 def _context_fp8_tile_blocks(
@@ -4871,11 +4937,13 @@ def _context_fp8_one_stage_choice(
     pack: int,
     sm_count: int,
     current: tuple[int, tuple[int, int, int] | None],
+    page_size: int | None = None,
 ) -> int | None:
     """The pack of the one-stage launch of a call whose runtime pack is
     ``pack`` and whose launch is ``current`` (its pack and split plan, ``None``
     for whole tiles), or ``None`` where it keeps that launch (a pure function
-    of its arguments, cached).
+    of its arguments, cached).  For a page size the target names in
+    :data:`_CONTEXT_FP8_ONE_STAGE_ROWS_GAIN`, the gain takes the scaled unit.
 
     The candidates are ``pack`` and the smaller shipped packs dividing it whose
     tiles hold every query token in one stage (``max_q_len <= 128 / pack``),
@@ -4884,7 +4952,8 @@ def _context_fp8_one_stage_choice(
     (:data:`_CONTEXT_FP8_ONE_STAGE_COSTS`, its unit scaled by the tile's query
     rows, :data:`_CONTEXT_FP8_ONE_STAGE_ROWS`) is taken where predicted faster
     than ``current`` under the split cost model by the split margins (with
-    the unscaled unit).  Every
+    the unscaled unit), or at all for a launch of at most the keys of
+    :data:`_CONTEXT_FP8_ONE_BLOCK_ONE_STAGE_KEYS` (one KV block per tile).  Every
     query row meets the same KV blocks in the same order as in a whole tile
     of two stages (the blocks a tile of two stages adds above a row's keys
     are fully masked for it)."""
@@ -4935,9 +5004,14 @@ def _context_fp8_one_stage_choice(
         candidate_rank = _context_fp8_split_makespan(
             tiles, sm_count, 0, 1, 1, rank_costs
         )
+        if page_size in _CONTEXT_FP8_ONE_STAGE_ROWS_GAIN.get(target, ()):
+            candidate_time = candidate_rank
         if candidate_rank < best_rank:
             best, best_time, best_rank = candidate, candidate_time, candidate_rank
-    if best is not None and _context_fp8_split_gain(time, best_time):
+    one_block = max_kv_len <= _CONTEXT_FP8_ONE_BLOCK_ONE_STAGE_KEYS.get(target, 0)
+    if best is not None and (
+        _context_fp8_split_gain(time, best_time) or (one_block and best_time < time)
+    ):
         return best
     return None
 
@@ -5479,6 +5553,17 @@ def select_cake_fmha_context_route(
             choice = _context_fp8_split_choice(
                 target, batch_size, max_q_len, max_kv_len, num_q_heads, pack, sm_count
             )
+            bounds = _CONTEXT_FP8_ONE_WAVE_SPLIT_BOUNDS.get(target)
+            if (
+                choice is not None
+                and bounds is not None
+                and choice[1][2] == 2
+                and program in _CONTEXT_FP8_ONE_WAVE_ROUTES.get(target, {})
+                and bounds[0] <= total_bh * num_m_blocks <= sm_count
+                and max_kv_len <= bounds[1]
+                and max_q_len > bounds[2]
+            ):
+                choice = None
             candidates = [] if choice is None else [choice]
             if choice is not None and choice[0] != pack:
                 own = _context_fp8_split_plan(
@@ -5513,11 +5598,16 @@ def select_cake_fmha_context_route(
         # a shipped pack: the one-stage program of the pack the one-stage
         # choice names (:func:`_context_fp8_one_stage_choice`) and the page
         # size, where it predicts a gain over the launch chosen above.  A
-        # runtime-size call of at most the keys of that program's short-KV
-        # entry takes the entry's program, and keeps its launch where the
-        # program has none; it takes the smallest such pack whose tiles number
-        # at most :data:`_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES`, where one
-        # exists.  Else the call keeps its launch.  An exact program's tiles
+        # short-KV runtime-size call takes the smallest such pack whose tiles
+        # number at most :data:`_CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES`, where
+        # one exists (pack 2 first for a page-64 call of at most
+        # :data:`_CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TOKENS` query tokens and at
+        # least :data:`_CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TILES` pack-2 tiles).
+        # Of at most the keys of the program's short-KV entry, it takes the
+        # entry's program; where the program has none, it runs the program
+        # itself if :data:`_CONTEXT_FP8_SHORT_KV_ONE_STAGE_PROGRAMS` names it
+        # and the pack is that smallest pack, and keeps its launch otherwise.
+        # Else the call keeps its launch.  An exact program's tiles
         # hold two query stages of its pack: at a smaller pack, one stage holds
         # every query token of a tile.
         one_stage = _CONTEXT_FP8_ONE_STAGE_ROUTES.get(target)
@@ -5535,20 +5625,33 @@ def select_cake_fmha_context_route(
                 stage_pack,
                 sm_count,
                 (pack_g, split_plan),
+                page_size,
             )
             short_tiles = _CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES.get(target)
+            short_pack = None
             if short_runtime and runtime_pack is not None and short_tiles is not None:
-                one_stage_pack = next(
+                order = (1, *reversed(_CONTEXT_FP8_RUNTIME_PACKS))
+                if (
+                    page_size == 64
+                    and max_q_len
+                    <= _CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TOKENS.get(target, 0)
+                    and batch_size * (num_q_heads // 2)
+                    >= _CONTEXT_FP8_SHORT_KV_PAGE64_PACK2_TILES.get(target, 0)
+                ):
+                    order = (2, 1, *reversed(_CONTEXT_FP8_RUNTIME_PACKS[:-1]))
+                short_pack = next(
                     (
                         candidate
-                        for candidate in (1, *reversed(_CONTEXT_FP8_RUNTIME_PACKS))
+                        for candidate in order
                         if candidate <= runtime_pack
                         and runtime_pack % candidate == 0
                         and max_q_len <= 128 // candidate
                         and batch_size * (num_q_heads // candidate) <= short_tiles
                     ),
-                    one_stage_pack,
+                    None,
                 )
+                if short_pack is not None:
+                    one_stage_pack = short_pack
             one_stage_program = (
                 None
                 if one_stage_pack is None
@@ -5559,9 +5662,14 @@ def select_cake_fmha_context_route(
                 short = _CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {}).get(
                     one_stage_program
                 )
-                one_stage_program = (
-                    short[0] if short and max_kv_len <= short[1] else None
-                )
+                if short and max_kv_len <= short[1]:
+                    one_stage_program = short[0]
+                elif not (
+                    short_pack is not None
+                    and one_stage_program
+                    in _CONTEXT_FP8_SHORT_KV_ONE_STAGE_PROGRAMS.get(target, ())
+                ):
+                    one_stage_program = None
             if one_stage_pack is not None and one_stage_program is not None:
                 program = one_stage_program
                 pack_g = one_stage_pack
@@ -5605,6 +5713,17 @@ def select_cake_fmha_context_route(
             and max_kv_len <= multi_wave[2]
         ):
             program = multi_wave[0]
+        # A launch of a runtime-size program the target names a one-wave entry
+        # for, of at most one tile per SM: the entry's program
+        # (:data:`_CONTEXT_FP8_ONE_WAVE_ROUTES`).
+        one_wave = _CONTEXT_FP8_ONE_WAVE_ROUTES.get(target, {}).get(program)
+        if (
+            component == "context_fp8"
+            and one_wave is not None
+            and sm_count
+            and batch_size * (num_q_heads // pack_g) * num_m_blocks <= sm_count
+        ):
+            program = one_wave
     return CakeFmhaContextRoute(
         target=target,
         component=component,

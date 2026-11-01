@@ -40,6 +40,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.utils.checkpoint
 
 pytest.importorskip("tvm_ffi")  # cake_backend imports it at module level
 
@@ -618,3 +619,51 @@ def test_autograd_backward_alerts_and_facade_falls_back():
         warnings.simplefilter("ignore")
         fallback = run(lambda x, w: facade.cake_grouped_mm(x, w, offs, False))
     assert torch.equal(fallback[0], det[0]) and torch.equal(fallback[1], det[1])
+
+
+@pytest.mark.parametrize(
+    "early_stop", [True, False], ids=["early_stop", "no_early_stop"]
+)
+def test_facade_checkpoint_early_stop_skips_the_forward_launch(early_stop, monkeypatch):
+    """Through the facade with ``deterministic=False`` the package's wrapper launches its
+    forward after autograd saved the inputs: a non-reentrant checkpoint of one GEMM
+    launches the forward once with early stop on (the recomputation stops before it) and
+    twice with it off, with the bits of the plain call for ``Y`` and ``dX``."""
+    device = _require_device()
+    sizes = [300, 0, 1, 700]
+    offs = torch.tensor(sizes, dtype=torch.int32, device=device).cumsum(
+        0, dtype=torch.int32
+    )
+    x0 = torch.randn(sum(sizes), 256, device=device).to(torch.bfloat16)
+    w0 = (torch.randn(4, 512, 256, device=device) / 16).to(torch.bfloat16)
+    g = torch.randn(sum(sizes), 512, device=device).to(torch.bfloat16)
+    launches = []
+    fwd_op = cake_autograd._fwd_op
+
+    def counted(*args):
+        launches.append(args[3].shape)
+        fwd_op(*args)
+
+    monkeypatch.setattr(cake_autograd, "_fwd_op", counted)
+
+    def gemm(x, w):
+        return facade.cake_grouped_mm(x, w, offs, False)
+
+    def run(checkpointed):
+        launches.clear()
+        x = x0.clone().requires_grad_(True)
+        w = w0.clone().requires_grad_(True)
+        with torch.utils.checkpoint.set_checkpoint_early_stop(early_stop):
+            if checkpointed:
+                y = torch.utils.checkpoint.checkpoint(gemm, x, w, use_reentrant=False)
+            else:
+                y = gemm(x, w)
+            y.backward(g)
+        torch.cuda.synchronize()
+        return y.detach(), x.grad, len(launches)
+
+    y0, dx0, n0 = run(False)
+    y1, dx1, n1 = run(True)
+    assert n0 == 1
+    assert n1 == (1 if early_stop else 2)
+    assert torch.equal(y1, y0) and torch.equal(dx1, dx0)

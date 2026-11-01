@@ -25,8 +25,17 @@ gradient: rel-L2 1e-4), as the worst case over repeated launches, and the
 split tail's workspaces are checked at rest (zero) after the launches.  Only
 this package is imported (through ``cake_package``), so the suite also runs
 against a vendored copy of it.
+
+``cake_grouped_mm`` launches the forward after autograd saved its inputs, so the
+early stop of a non-reentrant checkpoint skips the recomputed GEMM when nothing
+after it saves a tensor.  The autograd tests count the forward launches (a
+pass-through on ``cake_autograd._fwd_op``) and, where the torch profiler records
+kernels, the CUDA kernels of checkpointed steps; the control arm is a direct
+``CakeGroupedMm.apply``, which launches inside ``forward``.
 """
 
+import collections
+import contextlib
 import functools
 import math
 
@@ -1137,46 +1146,6 @@ def test_cuda_graph_replay_with_changed_offsets(op, monkeypatch):
         assert torch.equal(buffer.view(torch.int32), snapshot[key]), key
 
 
-def test_non_reentrant_checkpoint_replays_the_forward(monkeypatch):
-    """Under ``torch.utils.checkpoint`` (non-reentrant) the forward is recomputed in
-    the backward: the same ``Y`` and ``dX`` bits as without the checkpoint, and a
-    weight gradient within the budget of the fp64 reference (512-wide k tile with a
-    split unordered tail)."""
-    device = _require_program("wgrad", torch.bfloat16)
-    _require_program("fwd")
-    _require_program("dgrad")
-    sizes = K512_E3
-    shape = _split_tail_shape(device, sizes, _form_ks("main_halves"))
-    assert shape is not None, "no candidate shape splits the tail"
-    n, k = shape
-    x0, w0, g, offs = _inputs(sizes, n, k, device, seed=13)
-
-    def run(checkpointed):
-        x = x0.clone().requires_grad_(True)
-        w = w0.clone().requires_grad_(True)
-
-        def f(a, b):
-            return pkg.cake_grouped_mm(a, b, offs, deterministic=False)
-
-        if checkpointed:
-            y = torch.utils.checkpoint.checkpoint(f, x, w, use_reentrant=False)
-        else:
-            y = f(x, w)
-        y.backward(g)
-        torch.cuda.synchronize()
-        return y.detach(), x.grad, w.grad
-
-    y_plain, dx_plain, dw_plain = run(False)
-    y_ckpt, dx_ckpt, dw_ckpt = run(True)
-    assert torch.equal(y_ckpt, y_plain)
-    assert torch.equal(dx_ckpt, dx_plain)
-    ref = _reference("wgrad", g, x0, sizes)
-    for dw in (dw_plain, dw_ckpt):
-        assert dw.dtype == torch.bfloat16
-        _assert_bf16_close(dw, ref)
-        _assert_empty_groups_zero(dw, sizes)
-
-
 def test_gradient_accumulation(monkeypatch):
     """Two backward passes accumulate into ``.grad`` on a shape whose weight gradient
     splits its unordered tail: ``x.grad`` is the bf16 sum of the two data gradients
@@ -1436,3 +1405,699 @@ def test_autograd_wrapper_matches_reference():
         pkg.cake_grouped_mm(x.float(), w, offs, deterministic=False)
     with pytest.raises(ValueError):
         cake_autograd.CakeGroupedMm.apply(x, w, offs, True)
+
+
+# ---------------------------------------------------------------------------
+# Autograd wrapper: the forward launch after the saves (checkpoint early stop)
+# ---------------------------------------------------------------------------
+
+# The small shape of the autograd tests: ragged groups with an empty and a one-row
+# group, whose weight gradient takes the 256-wide k tile (ordered: the same bits at
+# every launch, so these tests compare dW bitwise).
+SMALL_SIZES = RAGGED_E4
+SMALL_SHAPE = (512, 256)  # (N, K)
+# Forward launches of a checkpointed step of each ``_region`` (early stop on): the
+# recomputation stops after the GEMM's saves unless a later op saves a tensor.
+REGION_FORWARDS = {"silu": 2, "scale": 1, "pair": 2}
+# The MoE expert block of ``_moe_block`` and the (gate_up, down) forward launches of
+# its checkpointed step: only the down projection's recomputation is skipped, and not
+# when the routing multiply after it saves tensors.
+MOE_HIDDEN, MOE_INTER = 256, 256
+MOE_BLOCK_FORWARDS = {"block": (2, 1), "routed": (2, 2), "selective": (2, 1)}
+# Forward launches of a checkpointed step: reentrant (always recomputes); nested
+# non-reentrant (the outer stop fires at the inner checkpoint's input saves, the inner
+# one before the GEMM); nested with an outer op that saves the inner output.
+NESTED_FORWARDS = {"reentrant": 2, "nested": 1, "nested_then_save": 2}
+
+
+def _require_autograd_programs():
+    """The device, when the forward, data-gradient and bf16 weight-gradient programs are
+    all registered for it."""
+    _require_program("fwd")
+    _require_program("dgrad")
+    return _require_program("wgrad", torch.bfloat16)
+
+
+def _ordered_inputs(device, n, k, seed, sizes=SMALL_SIZES):
+    """``_inputs`` of a shape whose weight gradient takes the 256-wide k tile with its
+    ordered tail (checked on the host plan): ``dW`` has the same bits at every launch."""
+    _stage, plan = _wgrad_plan(sizes, n, k, _arch(device), cb.sm_count(device))
+    assert plan["tile_k"] == 256 and not plan["unordered_tail"], plan
+    return _inputs(sizes, n, k, device, seed=seed)
+
+
+def _tile_case(device, tile):
+    """``(sizes, (N, K))``: for ``"k512"`` a 512-wide k tile shape whose weight gradient
+    splits its unordered tail, for ``"k256"`` the ``K256_WAVE_*`` shape of the 256-wide k
+    tile (ordered)."""
+    if tile == "k256":
+        _k256_wave_stage(device)
+        return K256_WAVE_SIZES, K256_WAVE_SHAPE
+    shape = _split_tail_shape(device, K512_E3, _form_ks("main_halves"))
+    assert shape is not None, "no candidate shape splits the tail"
+    return K512_E3, shape
+
+
+def _wrapper(offs):
+    """``gemm(a, b)`` through ``cake_grouped_mm``: the forward launch after ``apply``."""
+    return lambda a, b: pkg.cake_grouped_mm(a, b, offs, deterministic=False)
+
+
+def _in_forward(offs):
+    """The control arm: ``gemm(a, b)`` through a direct ``CakeGroupedMm.apply``, which
+    launches inside ``forward``, before autograd saves the inputs."""
+    return lambda a, b: cake_autograd.CakeGroupedMm.apply(a, b, offs, False)
+
+
+def _leaves(*tensors):
+    """Fresh leaves requiring grad, cloned from ``tensors``."""
+    return [t.clone().requires_grad_(True) for t in tensors]
+
+
+def _count_launches(monkeypatch):
+    """Replace ``_fwd_op``, ``_dgrad_op`` and ``_wgrad_op`` of ``cake_autograd`` by
+    pass-throughs that record the projection ``(N, K)`` of every call (of ``w``, or of the
+    ``[E, N, K]`` weight gradient); returns ``{"fwd": [...], "dgrad": [...], "wgrad": [...]}``."""
+    calls = {"fwd": [], "dgrad": [], "wgrad": []}
+
+    def counting(op, launch):
+        def call(*args):
+            shape = args[3].shape if op == "wgrad" else args[1].shape
+            calls[op].append((int(shape[1]), int(shape[2])))
+            launch(*args)
+
+        return call
+
+    for op in calls:
+        name = f"_{op}_op"
+        monkeypatch.setattr(
+            cake_autograd, name, counting(op, getattr(cake_autograd, name))
+        )
+    return calls
+
+
+def _step(fn, leaves, grads, ckpt=None, early_stop=True, context_fn=None):
+    """One training step: ``fn(*leaves)`` plain (``ckpt`` None) or under
+    ``torch.utils.checkpoint`` (``"non_reentrant"`` / ``"reentrant"``; ``context_fn`` for
+    a selective checkpoint), the early stop on (torch's default) or off around the forward
+    and the backward, then the backward of the output(s) with ``grads``.  Returns
+    ``(outputs, leaf gradients)``, both tuples, the outputs detached."""
+    kwargs = {} if context_fn is None else {"context_fn": context_fn}
+    stop = torch.utils.checkpoint.set_checkpoint_early_stop(bool(early_stop))
+    with stop:
+        if ckpt is None:
+            out = fn(*leaves)
+        else:
+            out = torch.utils.checkpoint.checkpoint(
+                fn, *leaves, use_reentrant=ckpt == "reentrant", **kwargs
+            )
+        outs = out if isinstance(out, tuple) else (out,)
+        torch.autograd.backward(outs, grads)
+    torch.cuda.synchronize()
+    return tuple(o.detach() for o in outs), tuple(t.grad for t in leaves)
+
+
+def _assert_same_step(got, want):
+    """The outputs and gradients of two ``_step`` results are bitwise equal (None where
+    None)."""
+    pairs = zip((*got[0], *got[1]), (*want[0], *want[1]), strict=True)
+    for index, (a, b) in enumerate(pairs):
+        assert (a is None) == (b is None), index
+        assert a is None or torch.equal(a, b), index
+
+
+def _region(gemm, region):
+    """``fn(x, w)`` of a checkpointed region around ``gemm(x, w)``: ``"silu"`` (saves the
+    GEMM's output), ``"scale"`` (``* 2.0``, saves nothing) or ``"pair"`` (also returns
+    ``x.sin()``, which saves ``x`` after the GEMM)."""
+    if region == "silu":
+        return lambda a, b: torch.nn.functional.silu(gemm(a, b))
+    if region == "scale":
+        return lambda a, b: gemm(a, b) * 2.0
+    return lambda a, b: (gemm(a, b), a.sin())
+
+
+def _region_grads(region, g, x):
+    """The output gradients of a ``_region``: ``g``, and for ``"pair"`` one for ``x.sin()``."""
+    if region != "pair":
+        return (g,)
+    gen = torch.Generator(device=x.device).manual_seed(7)
+    return (g, torch.randn(x.shape, generator=gen, device=x.device).to(x.dtype))
+
+
+def _moe_block(gemm, routed):
+    """``fn(x, w1, w2[, probs])``: the MoE expert block ``down(silu(gate) * up)`` with
+    ``gate, up = gate_up(x).chunk(2)``, both projections ``gemm``; with ``routed`` its
+    output is weighted by routing probabilities."""
+
+    def block(x, w1, w2, *probs):
+        gate, up = gemm(x, w1).chunk(2, dim=-1)
+        out = gemm(torch.nn.functional.silu(gate) * up, w2)
+        return out * probs[0] if routed else out
+
+    return block
+
+
+def _cuda_kernel_names(fn):
+    """The multiset of the names of the CUDA kernels one call of ``fn`` launches, the
+    backward's (launched from the autograd thread) included (torch profiler; memcpy /
+    memset activities excluded)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    return collections.Counter(
+        e.name
+        for e in prof.events()
+        if e.device_type == torch.autograd.DeviceType.CUDA
+        and not e.name.startswith(("Memcpy", "Memset"))
+    )
+
+
+def _require_profiled_kernels(device):
+    if not _cuda_kernel_names(lambda: torch.ones(8, device=device).add_(1)):
+        pytest.skip("the torch profiler records no CUDA kernels in this environment")
+
+
+@contextlib.contextmanager
+def _torch_deterministic():
+    """``torch.use_deterministic_algorithms(True)`` inside the block, the previous setting
+    restored after it."""
+    saved = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(saved[0], warn_only=saved[1])
+
+
+@pytest.mark.parametrize("sizes", [RAGGED_E4, [0, 0]], ids=["ragged", "empty"])
+def test_wrapper_saves_inputs_before_the_forward_launch(sizes, monkeypatch):
+    """Through ``cake_grouped_mm`` autograd saves ``x``, ``w`` and ``offs`` (the inputs
+    themselves, in this order) and then the forward launches into ``Y``, saving nothing;
+    a direct ``CakeGroupedMm.apply`` launches first and saves after.  The node is
+    ``CakeGroupedMmBackward`` and ``Y`` has the forward's bits either way, also with no
+    rows (``sum_m == 0``)."""
+    device = _require_program("fwd")
+    x0, w0, _g, offs = _inputs(sizes, *SMALL_SHAPE, device, seed=40)
+    want = grouped_gemm_fwd(x0, w0, offs)
+    events = []
+    launch = cake_autograd._fwd_op
+
+    def spy(x, w, offs_, out):
+        events.append(("fwd", out.data_ptr()))
+        launch(x, w, offs_, out)
+
+    def pack(t):
+        events.append(("pack", t))
+        return t
+
+    monkeypatch.setattr(cake_autograd, "_fwd_op", spy)
+    for gemm, order in (
+        (_wrapper(offs), ["pack", "pack", "pack", "fwd"]),
+        (_in_forward(offs), ["fwd", "pack", "pack", "pack"]),
+    ):
+        x, w = _leaves(x0, w0)
+        events.clear()
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+            y = gemm(x, w)
+        torch.cuda.synchronize()
+        assert [kind for kind, _ in events] == order
+        packed = [t for kind, t in events if kind == "pack"]
+        for t, src in zip(packed, (x, w, offs), strict=True):
+            assert t.data_ptr() == src.data_ptr(), (t.shape, src.shape)
+            assert t.shape == src.shape and t.dtype == src.dtype
+        assert [p for kind, p in events if kind == "fwd"] == [y.data_ptr()]
+        assert type(y.grad_fn).__name__ == "CakeGroupedMmBackward"
+        assert torch.equal(y.detach(), want)
+
+
+@pytest.mark.parametrize("tile", ["k512", "k256"])
+@pytest.mark.parametrize(
+    "early_stop", [True, False], ids=["early_stop", "no_early_stop"]
+)
+def test_checkpoint_early_stop_skips_the_forward_launch(early_stop, tile, monkeypatch):
+    """Under ``torch.utils.checkpoint`` (non-reentrant) the wrapper launches the forward
+    once with the early stop on (torch's default: the recomputation stops at the third
+    saved input, before the launch) and twice with it off; the control arm (direct
+    ``apply``) twice either way.  ``Y`` and ``dX`` are bitwise the plain step's in both
+    arms; ``dW`` bitwise on the 256-wide k tile, and on the 512-wide one (split unordered
+    tail) within the budget of the fp64 reference with exact-zero empty groups."""
+    device = _require_autograd_programs()
+    sizes, (n, k) = _tile_case(device, tile)
+    x0, w0, g, offs = _inputs(sizes, n, k, device, seed=13)
+    calls = _count_launches(monkeypatch)
+    plain = _step(_wrapper(offs), _leaves(x0, w0), (g,))
+    assert calls["fwd"] == [(n, k)]
+    runs = {}
+    for arm, gemm, forwards in (
+        ("wrapper", _wrapper(offs), 1 if early_stop else 2),
+        ("control", _in_forward(offs), 2),
+    ):
+        calls["fwd"].clear()
+        runs[arm] = _step(
+            gemm, _leaves(x0, w0), (g,), ckpt="non_reentrant", early_stop=early_stop
+        )
+        assert calls["fwd"] == [(n, k)] * forwards, arm
+    for arm, ((y,), (dx, dw)) in runs.items():
+        assert torch.equal(y, plain[0][0]), arm
+        assert torch.equal(dx, plain[1][0]), arm
+        if tile == "k256":
+            assert torch.equal(dw, plain[1][1]), arm
+    if tile == "k512":
+        ref = _reference("wgrad", g, x0, sizes)
+        for dw in (plain[1][1], *(run[1][1] for run in runs.values())):
+            assert dw.dtype == torch.bfloat16
+            _assert_wgrad_close(dw, ref)
+            _assert_empty_groups_zero(dw, sizes)
+
+
+@pytest.mark.parametrize("tile", ["k512", "k256"])
+@pytest.mark.parametrize(
+    "early_stop", [True, False], ids=["early_stop", "no_early_stop"]
+)
+def test_checkpoint_early_stop_skips_the_forward_kernels(early_stop, tile):
+    """The device side of ``test_checkpoint_early_stop_skips_the_forward_launch``: after a
+    warm-up (programs loaded, stream workspaces and queue probe done) the CUDA kernels of
+    a checkpointed step through the wrapper are those of the plain step with the early
+    stop on, and those plus the kernels of one bare forward launch with it off."""
+    device = _require_autograd_programs()
+    _require_profiled_kernels(device)
+    sizes, (n, k) = _tile_case(device, tile)
+    x0, w0, g, offs = _inputs(sizes, n, k, device, seed=13)
+    wrapper = _wrapper(offs)
+    out = torch.empty(x0.shape[0], n, dtype=torch.bfloat16, device=device)
+    bare = lambda: cake_autograd._fwd_op(x0, w0, offs, out)
+    plain = lambda: _step(wrapper, _leaves(x0, w0), (g,))
+    checkpointed = lambda: _step(
+        wrapper, _leaves(x0, w0), (g,), ckpt="non_reentrant", early_stop=early_stop
+    )
+    for warm in (bare, plain, checkpointed):
+        warm()
+    fwd = _cuda_kernel_names(bare)
+    assert fwd, "the forward launch records no kernel"
+    want = _cuda_kernel_names(plain)
+    if not early_stop:
+        want += fwd
+    assert _cuda_kernel_names(checkpointed) == want
+
+
+@pytest.mark.parametrize("region", list(REGION_FORWARDS))
+def test_checkpoint_recomputes_the_forward_when_a_later_op_saves(region, monkeypatch):
+    """The early stop skips the recomputed GEMM only when no op after it in the region
+    saves a tensor, as for a built-in op: ``silu`` of its output saves that output (2
+    forward launches), ``* 2.0`` saves nothing (1), ``x.sin()`` after it saves ``x`` (2).
+    The outputs and gradients are bitwise the plain step's."""
+    device = _require_autograd_programs()
+    x0, w0, g, offs = _ordered_inputs(device, *SMALL_SHAPE, seed=42)
+    grads = _region_grads(region, g, x0)
+    fn = _region(_wrapper(offs), region)
+    calls = _count_launches(monkeypatch)
+    plain = _step(fn, _leaves(x0, w0), grads)
+    assert calls["fwd"] == [SMALL_SHAPE]
+    calls["fwd"].clear()
+    checkpointed = _step(fn, _leaves(x0, w0), grads, ckpt="non_reentrant")
+    assert calls["fwd"] == [SMALL_SHAPE] * REGION_FORWARDS[region]
+    _assert_same_step(checkpointed, plain)
+
+
+@pytest.mark.parametrize("region", list(REGION_FORWARDS))
+@pytest.mark.parametrize("impl", ["cake", "torch_grouped_mm"])
+def test_checkpoint_recompute_kernels_match_torch_grouped_mm(impl, region):
+    """The regions of ``test_checkpoint_recomputes_the_forward_when_a_later_op_saves``
+    through this package and through ``torch._grouped_mm`` (whose autograd saves its
+    inputs before its kernel): after a warm-up the CUDA kernels of a checkpointed step are
+    those of the plain step plus ``REGION_FORWARDS[region] - 1`` times those of one bare
+    forward GEMM, the same pattern for both."""
+    device = _require_autograd_programs()
+    _require_profiled_kernels(device)
+    x0, w0, g, offs = _ordered_inputs(device, *SMALL_SHAPE, seed=43)
+    grads = _region_grads(region, g, x0)
+    if impl == "cake":
+        gemm = _wrapper(offs)
+        out = torch.empty(
+            x0.shape[0], SMALL_SHAPE[0], dtype=torch.bfloat16, device=device
+        )
+        bare = lambda: cake_autograd._fwd_op(x0, w0, offs, out)
+    else:
+        if not hasattr(torch, "_grouped_mm"):
+            pytest.skip("this torch has no torch._grouped_mm")
+        gemm = lambda a, b: torch._grouped_mm(a, b.transpose(1, 2), offs=offs)
+        bare = lambda: gemm(x0, w0)
+    fn = _region(gemm, region)
+    plain = lambda: _step(fn, _leaves(x0, w0), grads)
+    checkpointed = lambda: _step(fn, _leaves(x0, w0), grads, ckpt="non_reentrant")
+    try:
+        for warm in (bare, plain, checkpointed):
+            warm()
+    except RuntimeError as exc:
+        if impl == "cake":
+            raise
+        pytest.skip(
+            f"torch._grouped_mm does not run this step on {_arch(device)}: {exc}"
+        )
+    fwd = _cuda_kernel_names(bare)
+    assert fwd, f"a bare {impl} forward records no kernel"
+    want = _cuda_kernel_names(plain)
+    for _ in range(REGION_FORWARDS[region] - 1):
+        want += fwd
+    assert _cuda_kernel_names(checkpointed) == want
+
+
+@pytest.mark.parametrize("variant", list(MOE_BLOCK_FORWARDS))
+def test_checkpoint_moe_block_skips_only_the_last_gemm(variant, monkeypatch):
+    """A checkpointed MoE expert block (``_moe_block``, both projections through the
+    wrapper): with the early stop on the gate / up projection is recomputed (SiLU saves
+    its output) and the down projection is not; a routing multiply whose probabilities
+    require grad saves the down projection's output, which is then recomputed too (the
+    scope of the skip, as for built-in ops); a selective checkpoint that saves the
+    ``aten.mul.Tensor`` outputs launches as the plain one.  The output and the gradients
+    of ``x``, ``w1``, ``w2`` (and of the probabilities) are bitwise the plain step's."""
+    from torch.utils.checkpoint import (
+        CheckpointPolicy,
+        create_selective_checkpoint_contexts,
+    )
+
+    device = _require_autograd_programs()
+    gate_up, down = (2 * MOE_INTER, MOE_HIDDEN), (MOE_HIDDEN, MOE_INTER)
+    x0, w1, _g, offs = _ordered_inputs(device, *gate_up, seed=44)
+    _x, w2, g, _offs = _ordered_inputs(device, *down, seed=45)
+    inputs = [x0, w1, w2]
+    if variant == "routed":
+        gen = torch.Generator(device=device).manual_seed(46)
+        probs = torch.rand(x0.shape[0], 1, generator=gen, device=device)
+        inputs.append(probs.to(torch.bfloat16))
+
+    def policy(ctx, op, *args, **kwargs):
+        if op == torch.ops.aten.mul.Tensor:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    context_fn = None
+    if variant == "selective":
+        context_fn = functools.partial(create_selective_checkpoint_contexts, policy)
+    block = _moe_block(_wrapper(offs), variant == "routed")
+    calls = _count_launches(monkeypatch)
+    plain = _step(block, _leaves(*inputs), (g,))
+    assert collections.Counter(calls["fwd"]) == {gate_up: 1, down: 1}
+    calls["fwd"].clear()
+    checkpointed = _step(
+        block, _leaves(*inputs), (g,), ckpt="non_reentrant", context_fn=context_fn
+    )
+    want = dict(zip((gate_up, down), MOE_BLOCK_FORWARDS[variant], strict=True))
+    assert collections.Counter(calls["fwd"]) == want
+    _assert_same_step(checkpointed, plain)
+
+
+@pytest.mark.parametrize("structure", list(NESTED_FORWARDS))
+def test_reentrant_and_nested_checkpoints(structure, monkeypatch):
+    """A reentrant checkpoint recomputes the forward (2 launches); a non-reentrant one
+    nested in another launches it once (the outer recomputation stops at the inner
+    checkpoint's input saves, the inner one before the launch), twice when an outer op
+    saves the inner output (``.sin()``).  The outputs and gradients are bitwise the plain
+    step's."""
+    device = _require_autograd_programs()
+    x0, w0, g, offs = _ordered_inputs(device, *SMALL_SHAPE, seed=46)
+    wrapper = _wrapper(offs)
+
+    def inner(a, b):
+        return torch.utils.checkpoint.checkpoint(wrapper, a, b, use_reentrant=False)
+
+    plain_fn, fn, ckpt = wrapper, inner, "non_reentrant"
+    if structure == "reentrant":
+        fn, ckpt = wrapper, "reentrant"
+    elif structure == "nested_then_save":
+        plain_fn = lambda a, b: wrapper(a, b).sin()
+        fn = lambda a, b: inner(a, b).sin()
+    calls = _count_launches(monkeypatch)
+    plain = _step(plain_fn, _leaves(x0, w0), (g,))
+    calls["fwd"].clear()
+    checkpointed = _step(fn, _leaves(x0, w0), (g,), ckpt=ckpt)
+    assert calls["fwd"] == [SMALL_SHAPE] * NESTED_FORWARDS[structure]
+    _assert_same_step(checkpointed, plain)
+
+
+def test_checkpointed_gradient_accumulation_and_retain_graph(monkeypatch):
+    """``test_gradient_accumulation`` with each step under a non-reentrant checkpoint: one
+    forward launch per step, ``x.grad`` the bf16 sum of the two data gradients and
+    ``w.grad`` that of the two weight gradients (bitwise), each weight gradient within the
+    budget and the empty group exact zeros.  One checkpointed graph backpropagated twice
+    (``retain_graph=True`` first): one forward launch in all through the wrapper (both
+    recomputations stop before it), three through the control arm, and ``x.grad`` twice
+    the data gradient (bitwise); a third backward raises."""
+    device = _require_autograd_programs()
+    _fresh_stream_workspaces(monkeypatch)
+    sizes, (n, k) = _tile_case(device, "k512")
+    x0, w0, g1, offs = _inputs(sizes, n, k, device, seed=14)
+    g2 = _inputs(sizes, n, k, device, seed=15)[2]
+    calls = _count_launches(monkeypatch)
+    wrapper = _wrapper(offs)
+    x, w = _leaves(x0, w0)
+    dws = []
+    w.register_hook(lambda grad: dws.append(grad.detach().clone()))
+    for g in (g1, g2):
+        y = torch.utils.checkpoint.checkpoint(wrapper, x, w, use_reentrant=False)
+        y.backward(g)
+    torch.cuda.synchronize()
+    assert calls["fwd"] == [(n, k)] * 2
+    dx1 = grouped_gemm_dgrad(g1, w0, offs)
+    dx2 = grouped_gemm_dgrad(g2, w0, offs)
+    assert torch.equal(x.grad, dx1 + dx2)
+    assert len(dws) == 2
+    for dw, g in zip(dws, (g1, g2), strict=True):
+        assert dw.dtype == torch.bfloat16
+        _assert_wgrad_close(dw, _reference("wgrad", g, x0, sizes))
+    assert torch.equal(w.grad, dws[0] + dws[1])
+    _assert_empty_groups_zero(w.grad, sizes)
+    for gemm, forwards in ((wrapper, 1), (_in_forward(offs), 3)):
+        calls["fwd"].clear()
+        x, w = _leaves(x0, w0)
+        y = torch.utils.checkpoint.checkpoint(gemm, x, w, use_reentrant=False)
+        y.backward(g1, retain_graph=True)
+        y.backward(g1)
+        torch.cuda.synchronize()
+        assert calls["fwd"] == [(n, k)] * forwards
+        assert torch.equal(x.grad, dx1 + dx1)
+        with pytest.raises(RuntimeError, match="a second time"):
+            y.backward(g1)
+
+
+@pytest.mark.parametrize("frozen", ["w", "x"])
+def test_checkpoint_with_a_frozen_operand(frozen, monkeypatch):
+    """A checkpointed step with a frozen operand launches the forward once and only the
+    gradient it needs: a frozen ``w`` the data gradient alone, also under torch's
+    deterministic mode (no alert, which a weight gradient would raise); a frozen ``x`` the
+    weight gradient alone.  The gradient has the bits of the package function."""
+    device = _require_autograd_programs()
+    x0, w0, g, offs = _ordered_inputs(device, *SMALL_SHAPE, seed=47)
+    x = x0.clone().requires_grad_(frozen != "x")
+    w = w0.clone().requires_grad_(frozen != "w")
+    calls = _count_launches(monkeypatch)
+    mode = _torch_deterministic() if frozen == "w" else contextlib.nullcontext()
+    with mode:
+        _step(_wrapper(offs), [x, w], (g,), ckpt="non_reentrant")
+    assert calls["fwd"] == [SMALL_SHAPE]
+    if frozen == "w":
+        assert calls["dgrad"] == [SMALL_SHAPE] and calls["wgrad"] == []
+        assert w.grad is None
+        assert torch.equal(x.grad, grouped_gemm_dgrad(g, w0, offs))
+    else:
+        assert calls["wgrad"] == [SMALL_SHAPE] and calls["dgrad"] == []
+        assert x.grad is None
+        assert torch.equal(w.grad, grouped_gemm_wgrad(g, x0, offs))
+
+
+@pytest.mark.parametrize("grad", [True, False], ids=["grad", "no_grad"])
+def test_wrapper_forward_cuda_graph_replay(grad):
+    """A CUDA graph captured around ``cake_grouped_mm`` (with leaves that require grad and
+    grad mode on, or under ``no_grad``) replays the forward launch the wrapper makes after
+    ``apply``: after new group boundaries (same ``sum_m``) are written into ``offs``,
+    every replay gives the bits of the eager wrapper on those boundaries."""
+    device = _require_program("fwd")
+    first, second = list(SMALL_SIZES), [1, 500, 250, 250]
+    x0, w0, _g, offs = _inputs(first, *SMALL_SHAPE, device, seed=48)
+    x = x0.clone().requires_grad_(grad)
+    w = w0.clone().requires_grad_(grad)
+    wrapper = _wrapper(offs)
+    grad_mode = contextlib.nullcontext if grad else torch.no_grad
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with grad_mode(), torch.cuda.stream(side):
+        wrapper(x, w)  # program load before the capture
+    torch.cuda.current_stream(device).wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with grad_mode(), torch.cuda.graph(graph):
+        y = wrapper(x, w)
+    assert (y.grad_fn is not None) == grad
+    for sizes in (first, second, first):
+        offs.copy_(_offs(sizes, device))
+        y.detach().fill_(float("nan"))
+        graph.replay()
+        eager = pkg.cake_grouped_mm(x0, w0, offs, deterministic=False)
+        torch.cuda.synchronize()
+        assert torch.equal(y.detach(), eager), sizes
+        _assert_bf16_close(y.detach(), _reference("fwd", x0, w0, sizes))
+
+
+@pytest.mark.parametrize("checkpointed", [False, True], ids=["plain", "checkpoint"])
+def test_wrapper_retains_the_memory_of_the_in_forward_path(checkpointed):
+    """Against the control arm (direct ``apply``), plain and under a non-reentrant
+    checkpoint, after a warm-up: the same allocated memory after the forward, a backward
+    peak no higher, and after the backward and ``del y`` the two gradients alone (dropping
+    them returns to the memory before the forward)."""
+    device = _require_autograd_programs()
+    x0, w0, g, offs = _ordered_inputs(device, *SMALL_SHAPE, seed=49)
+    ckpt = "non_reentrant" if checkpointed else None
+
+    def measure(gemm):
+        x, w = _leaves(x0, w0)
+        torch.cuda.synchronize()
+        base = torch.cuda.memory_allocated(device)
+        if checkpointed:
+            y = torch.utils.checkpoint.checkpoint(gemm, x, w, use_reentrant=False)
+        else:
+            y = gemm(x, w)
+        torch.cuda.synchronize()
+        forward = torch.cuda.memory_allocated(device) - base
+        torch.cuda.reset_peak_memory_stats(device)
+        y.backward(g)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated(device) - base
+        del y
+        kept = torch.cuda.memory_allocated(device) - base
+        grads = x.grad.untyped_storage().nbytes() + w.grad.untyped_storage().nbytes()
+        x.grad = w.grad = None
+        assert torch.cuda.memory_allocated(device) == base
+        return forward, peak, kept, grads
+
+    arms = (_wrapper(offs), _in_forward(offs))
+    for gemm in arms:  # stream workspaces and the queue probe
+        _step(gemm, _leaves(x0, w0), (g,), ckpt=ckpt)
+    new, old = (measure(gemm) for gemm in arms)
+    assert new[0] == old[0], (new, old)
+    assert new[1] <= old[1], (new, old)
+    assert new[2] == new[3] and old[2] == old[3], (new, old)
+
+
+def test_wrapper_does_not_synchronize():
+    """After a warm-up, a forward and a checkpointed step (the forward, then the backward
+    with its recomputation) through the wrapper and through the control arm run under
+    ``torch.cuda.set_sync_debug_mode("error")``, so without a host synchronisation, and
+    give the same gradients (``dW`` of the 256-wide k tile)."""
+    device = _require_autograd_programs()
+    x0, w0, g, offs = _ordered_inputs(device, *SMALL_SHAPE, seed=50)
+    arms = (_wrapper(offs), _in_forward(offs))
+    for gemm in arms:
+        _step(gemm, _leaves(x0, w0), (g,), ckpt="non_reentrant")
+    leaves = [_leaves(x0, w0) for _ in arms]
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for gemm, (x, w) in zip(arms, leaves, strict=True):
+            gemm(x, w)
+            y = torch.utils.checkpoint.checkpoint(gemm, x, w, use_reentrant=False)
+            y.backward(g)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    torch.cuda.synchronize()
+    (x_new, w_new), (x_old, w_old) = leaves
+    assert torch.equal(x_new.grad, x_old.grad)
+    assert torch.equal(w_new.grad, w_old.grad)
+
+
+def test_wrapper_under_jit_trace(monkeypatch):
+    """Under ``torch.jit.trace`` the wrapper keeps the launch inside ``forward`` (a trace
+    records ``apply`` only): the traced function replayed on a new ``x`` launches the
+    forward once and gives the eager wrapper's bits."""
+    device = _require_program("fwd")
+    x0, w0, _g, offs = _inputs(SMALL_SIZES, *SMALL_SHAPE, device, seed=51)
+    x1 = _inputs(SMALL_SIZES, *SMALL_SHAPE, device, seed=52)[0]
+    traced = torch.jit.trace(
+        lambda a, b, o: pkg.cake_grouped_mm(a, b, o, deterministic=False),
+        (x0, w0, offs),
+        check_trace=False,
+    )
+    calls = _count_launches(monkeypatch)
+    out = traced(x1, w0, offs)
+    torch.cuda.synchronize()
+    assert calls["fwd"] == [SMALL_SHAPE]
+    eager = pkg.cake_grouped_mm(x1, w0, offs, deterministic=False)
+    assert torch.equal(out, eager)
+    assert not torch.equal(eager, grouped_gemm_fwd(x0, w0, offs))
+
+
+@pytest.mark.parametrize("backend", ["eager", "inductor"])
+def test_wrapper_under_torch_compile(backend):
+    """``torch.compile`` (``backend``) of a non-reentrant checkpointed region through the
+    wrapper gives the bits of the eager checkpointed step (``Y``, ``dX``, ``dW`` of the
+    256-wide k tile); under Dynamo the wrapper keeps the launch inside ``forward``
+    (Dynamo cannot lift the deferred launch out of the checkpointed region).  Where the
+    compiled step raises, the control arm (direct ``apply``)
+    must raise the same exception type, and the case is skipped with that failure as the
+    reason (a limit the wrapper did not introduce); a failure of the wrapper alone fails."""
+    import torch._dynamo
+
+    device = _require_autograd_programs()
+    x0, w0, g, offs = _ordered_inputs(device, *SMALL_SHAPE, seed=53)
+    eager = _step(_wrapper(offs), _leaves(x0, w0), (g,), ckpt="non_reentrant")
+
+    def compiled_step(gemm):
+        def region(a, b):
+            return torch.utils.checkpoint.checkpoint(gemm, a, b, use_reentrant=False)
+
+        torch._dynamo.reset()
+        try:
+            step = torch.compile(region, backend=backend)
+            return _step(step, _leaves(x0, w0), (g,)), None
+        except Exception as exc:  # noqa: BLE001 - compared with the control arm
+            return None, exc
+        finally:
+            torch._dynamo.reset()
+
+    got, failure = compiled_step(_wrapper(offs))
+    if failure is None:
+        _assert_same_step(got, eager)
+        return
+    _, control_failure = compiled_step(_in_forward(offs))
+    assert type(control_failure) is type(failure), (
+        f"torch.compile ({backend}) fails through the wrapper only: {failure!r}; "
+        f"control arm: {control_failure!r}"
+    )
+    pytest.skip(
+        f"torch.compile ({backend}) fails the same way through CakeGroupedMm.apply: "
+        f"{type(failure).__name__}: {str(failure)[:400]}"
+    )
+
+
+def test_direct_apply_keeps_the_in_forward_launch(monkeypatch):
+    """A direct ``CakeGroupedMm.apply(x, w, offs, False)`` launches the forward inside
+    ``forward`` and gives the wrapper's bits (``Y``, ``dX``, ``dW`` of the 256-wide k
+    tile); ``apply(..., True)`` raises ``ValueError``; shape and offset errors, which the
+    wrapper now raises after autograd saved the inputs, are still ``ValueError``."""
+    device = _require_autograd_programs()
+    x0, w0, g, offs = _ordered_inputs(device, *SMALL_SHAPE, seed=54)
+    calls = _count_launches(monkeypatch)
+    wrapped = _step(_wrapper(offs), _leaves(x0, w0), (g,))
+    direct = _step(_in_forward(offs), _leaves(x0, w0), (g,))
+    assert calls["fwd"] == [SMALL_SHAPE] * 2
+    _assert_same_step(direct, wrapped)
+    x, w = _leaves(x0, w0)
+    with pytest.raises(ValueError):
+        cake_autograd.CakeGroupedMm.apply(x, w, offs, True)
+    n, k = SMALL_SHAPE
+    for bad_w, bad_offs in (
+        (w0[:, : n - 128], offs),  # N % 256 != 0
+        (w0[:, :, : k // 2], offs),  # K of w differs from x's
+        (w0, offs.to(torch.int64)),
+    ):
+        with pytest.raises(ValueError):
+            pkg.cake_grouped_mm(
+                x, bad_w.clone().requires_grad_(True), bad_offs, deterministic=False
+            )
