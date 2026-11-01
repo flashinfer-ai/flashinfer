@@ -1450,13 +1450,16 @@ def _bucket_window(window, queries, keys):
 
 
 # Per route of the shipped catalog that carries a stage bucket: the query counts the bucket test runs on it. Each
-# count names that route at the route's smallest served K, at a bucket's ``kv_max`` and at the next served K above it
-# (``kv_max`` plus the route's ``kv_alignment``) on every architecture the route has a bucket on; a route with a bucket
-# that this table does not list fails the test.
+# count names that route at the route's smallest served K (for a ``:short`` route, the first multiple of its
+# ``kv_alignment`` from ``kv_min`` up that the route serves at that count), at a bucket's ``kv_max`` and at the next
+# served K above it (``kv_max`` plus the route's ``kv_alignment``) on every architecture the route has a bucket on; a
+# route with a bucket that this table does not list fails the test.
 _BUCKET_QUERIES = {
     "fp8:h64:full:qle2048:kvsplit": (66, 128, 302, 1024),
     "fp8:h64:partial:qle128:kvsplit": (3, 37, 63),
     "fp4:le32:short": (7, 16, 36, 37, 128),
+    "fp8:q128:short": (128,),
+    "fp8:full:le32:short": (4, 16, 124),
 }
 
 
@@ -1537,6 +1540,12 @@ def test_dense_stage_bucket_program_is_bitwise_to_the_default(
             )
         else:
             low = -(-int(record["kv_min"]) // align) * align
+            while (
+                low < bound
+                and _runtime.served_route(precision, queries, low, heads, arch=arch)
+                != route
+            ):
+                low += align
         keys = {"low": low, "kv_max": bound, "above": bound + align}[side]
         served_route = _runtime.served_route(precision, queries, keys, heads, arch=arch)
         assert served_route == route, (route, queries, keys, served_route)
