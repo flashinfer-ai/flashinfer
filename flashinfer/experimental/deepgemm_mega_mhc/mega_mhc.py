@@ -1613,6 +1613,26 @@ ROUTES: list[dict[str, Any]] = [
         "program": "cake_mega_mhc_ed3f407e5a68eb65478e",
         "defines": {},
     },
+    # The raw scale mode's launches outside the deterministic mode of the plain
+    # FP8 group-128 program's regime that the FP8 group-128 tailpipe program
+    # serves on sm_107a, at the plain program's split count and launch (so the
+    # same outputs): those at the token counts of its "tokens" (inclusive ranges).
+    # Below 385 tokens that count is 32 or 64 splits, above TAIL_PIPE_MAX_SPLITS:
+    # that bound is the host rule's performance choice (mhc_infer_tail_program),
+    # not a limit of the tailpipe program.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": False,
+        "tokens": [[129, 384], [833, 1023]],
+        "program": "cake_mega_mhc_ed3f407e5a68eb65478e",
+        "defines": {},
+    },
     # The raw scale mode's launches of the plain FP8 group-128 program's regime
     # that its fp8_fast_div form (the FP8 store dividing through one reciprocal
     # per lane) serves on sm_107a: the deterministic launches the route above
