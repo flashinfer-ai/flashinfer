@@ -94,6 +94,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from .cake_backend import (
+    _TOP_SAVED_HOOKS,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_GEOMETRY,
     IGNORE_INDEX,
@@ -103,7 +104,9 @@ from .cake_backend import (
     _eager_launch,
     _ffi_stream_context,
     _mm_fp32,
+    _modes_off,
     _resolve_temperature,
+    _selective_checkpoint_modes,
     _temperature_rows,
     arch_for,
     gemm_scalars,
@@ -1799,6 +1802,24 @@ class SupportDetLogprobFunction(torch.autograd.Function):
         backend: str,
         cake,
     ):
+        if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
+            # under selective activation checkpointing: every dispatch mode popped (as in :mod:`.cake_backend`)
+            with _modes_off():
+                return SupportDetLogprobFunction.forward(
+                    ctx,
+                    X,
+                    W,
+                    support_ids,
+                    support_offsets,
+                    labels,
+                    teacher,
+                    tau,
+                    problem,
+                    outputs,
+                    check_inputs,
+                    backend,
+                    cake,
+                )
         ctx.set_materialize_grads(False)
         ctx.problem, ctx.outputs, ctx.backend, ctx.cake = (
             problem,

@@ -184,6 +184,7 @@ from typing import Any, Callable, ClassVar, NamedTuple, Optional, Union, cast
 
 import torch
 import torch.utils.checkpoint as _torch_checkpoint
+import torch.utils._python_dispatch as _torch_dispatch
 
 from .cake_jit import (
     BASE_STAGES,
@@ -1527,6 +1528,17 @@ DW_STREAM_MODES = (
     "auto",
 )  # the normalised ``dw_stream`` modes: never / every multi-chunk call / the chunk rule (:func:`dw_stream_mode`)
 DW_STREAM_MIN_CHUNKS = 3  # the side stream pays one cross-stream join per chunk and overlaps only the chunks before a deferred last one
+# ``torch.utils._python_dispatch._disable_current_modes`` (private; None on a torch without it): every active torch
+# dispatch mode popped for a block -- the per-device / per-thread state below is formed under it, and an entry runs
+# under it inside selective activation checkpointing (:func:`_selective_checkpoint_modes`)
+_DISABLE_MODES = getattr(_torch_dispatch, "_disable_current_modes", None)
+
+
+def _modes_off():
+    """A context that pops every active torch dispatch mode for its block (a no-op without the private torch API)."""
+    return contextlib.nullcontext() if _DISABLE_MODES is None else _DISABLE_MODES()
+
+
 # the per-thread, per-device host state of the calls (:func:`_thread_state`)
 _THREAD_STATE = threading.local()
 
@@ -1652,10 +1664,12 @@ def _hidden_count_cell(index: int) -> tuple:
     cells = _thread_state("cells")
     pair = cells.get(index)
     if pair is None:
-        pair = cells[index] = (
-            torch.empty((1,), dtype=torch.int32, pin_memory=True),
-            torch.cuda.Event(),
-        )
+        # thread state, not part of a call: formed outside active torch dispatch modes (see _device_constants)
+        with _modes_off():
+            pair = cells[index] = (
+                torch.empty((1,), dtype=torch.int32, pin_memory=True),
+                torch.cuda.Event(),
+            )
     return pair
 
 
@@ -1663,20 +1677,24 @@ def _hidden_count_arange(index: int, T: int) -> torch.Tensor:
     """The calling thread's int32 constant ``1, 2, ..`` of device ``index`` with at least ``T`` entries (no kernel per
     call; grown by doubling), recorded on the current stream so a replaced constant is not reused before the
     kernels queued on it have read it.  The allocator keeps every recorded stream until the constant is freed, so
-    each stream is recorded once per constant (``"arange_streams"``), not once per call."""
+    each stream is recorded once per constant (``"arange_streams"``), not once per call.  Thread state, not part of
+    a call: formed and recorded outside active torch dispatch modes (see :func:`_device_constants`; the backward's
+    recomputation of a checkpoint runs on the autograd engine's thread)."""
     aranges = _thread_state("arange")
     recorded = _thread_state("arange_streams")
     ar = aranges.get(index)
     if ar is None or ar.numel() < T:
         cap = max(int(T), 2 * (0 if ar is None else int(ar.numel())))
-        ar = aranges[index] = torch.arange(
-            1, cap + 1, dtype=torch.int32, device=torch.device("cuda", index)
-        )
+        with _modes_off():
+            ar = aranges[index] = torch.arange(
+                1, cap + 1, dtype=torch.int32, device=torch.device("cuda", index)
+            )
         recorded[index] = set()
     seen = recorded[index]
     raw = _current_raw_stream(index)
     if raw not in seen:
-        ar.record_stream(torch.cuda.current_stream(index))
+        with _modes_off():
+            ar.record_stream(torch.cuda.current_stream(index))
         seen.add(raw)
     return ar
 
@@ -3308,17 +3326,20 @@ def _device_constants(index: int) -> dict[str, torch.Tensor]:
     calls of threads that miss the cache together each form cells, and all return the first cells
     stored in :data:`_DEVICE_CELLS`; the other cells were waited for and are never read, so freeing
     them is safe.  Under a CUDA graph capture, which cannot wait, the cells are made on the
-    capturing stream."""
+    capturing stream.  The cells belong to no call, so they are made outside any active torch
+    dispatch mode: selective activation checkpointing replays a recomputation's operators against
+    its checkpointed forward's, and a first use inside a recomputation would add these."""
     device = torch.device("cuda", int(index))
-    if torch.cuda.is_current_stream_capturing():
-        cells = _constant_cells(device)
-    else:
-        stream = torch.cuda.Stream(device=device)
-        with torch.cuda.stream(stream):
+    with _modes_off():
+        if torch.cuda.is_current_stream_capturing():
             cells = _constant_cells(device)
-            filled = torch.cuda.Event()
-            filled.record(stream)
-        filled.synchronize()
+        else:
+            stream = torch.cuda.Stream(device=device)
+            with torch.cuda.stream(stream):
+                cells = _constant_cells(device)
+                filled = torch.cuda.Event()
+                filled.record(stream)
+            filled.synchronize()
     return _DEVICE_CELLS.setdefault(int(index), cells)
 
 
@@ -6900,12 +6921,13 @@ def backward_logprob_keep(
 # Gradient placement of the loss entry (:func:`set_gradient_placement`).  ``"auto"`` (the default): the loss entry forms
 # its gradient accumulators only where a backward can use them -- no gradient GEMM without an autograd graph (grad mode
 # off, ``torch.no_grad`` / ``torch.inference_mode``, the first pass of a reentrant ``torch.utils.checkpoint``, no input
-# requiring a gradient), and inside a non-reentrant ``torch.utils.checkpoint`` the checkpointed forward computes the
-# loss only while the recomputation in the backward forms the accumulators (one gradient pass per step instead of two).
-# CPU offload or other saved-tensor hooks innermost and a torch whose checkpoint lacks the hook structure read below
-# keep the fused forward.  The log-probability entry forms no gradient in its forward and is unchanged.  ``"forward"``:
-# every call with an input that requires a gradient forms them in its forward, also when no backward follows.  The
-# outputs are the same bits either way (the same kernels on the same operands, in the same order).
+# requiring a gradient), and inside a non-reentrant ``torch.utils.checkpoint`` (selective activation checkpointing
+# included) the checkpointed forward computes the loss only while the recomputation in the backward forms the
+# accumulators (one gradient pass per step instead of two).  CPU offload or other saved-tensor hooks innermost and a
+# torch whose checkpoint lacks the hook structure read below keep the fused forward.  The log-probability entry forms
+# no gradient in its forward and is unchanged.  ``"forward"``: every call with an input that requires a gradient forms
+# them in its forward, also when no backward follows.  The outputs are the same bits either way (the same kernels on
+# the same operands, in the same order).
 GRADIENT_PLACEMENTS = ("auto", "forward")
 _GRADIENT_PLACEMENT = {"mode": "auto"}
 
@@ -6935,6 +6957,44 @@ def set_gradient_placement(mode: str) -> str:
 # recomputation in the backward through ``_recomputation_hook``'s (a closure over a weak reference to that frame and the
 # graph key).  The innermost (top) hooks tell which pass a call runs in; any other hooks on top (CPU offload, ...) keep
 # the call's fused forward.  A torch whose checkpoint lacks this structure keeps the fused forward everywhere.
+#
+# Selective activation checkpointing (``context_fn`` of ``create_selective_checkpoint_contexts``) also records the
+# checkpointed forward's operators through a torch dispatch mode and replays them by position in the recomputation,
+# which must therefore run the same operators.  An entry's operators are its own -- its buffers, bindings (keyed by the
+# inputs' addresses, which a recomputation can change) and per-thread state, and the loss-only or fused forward each
+# pass takes -- so while a selective checkpoint's mode is active every det autograd Function's forward runs with ALL
+# active torch dispatch modes popped (:func:`_modes_off`): the selective checkpoint's, and any other on the stack (a
+# user mode such as ``FlopCounterMode`` then does not see the entry's operators; a tracing mode such as
+# ``FakeTensorMode`` or a ``torch.compile`` trace then gets real launches on fake inputs and fails loudly).  The call
+# then behaves as in a plain non-reentrant checkpoint.
+_DISPATCH_MODES = getattr(torch._C, "_len_torch_dispatch_stack", None)
+_SELECTIVE_MODES = tuple(
+    mode
+    for mode in (
+        getattr(_torch_checkpoint, "_CachingTorchDispatchMode", None),
+        getattr(_torch_checkpoint, "_CachedTorchDispatchMode", None),
+    )
+    if isinstance(mode, type)
+)
+_MODE_STACK = getattr(_torch_dispatch, "_get_current_dispatch_mode_stack", None)
+
+
+def _selective_checkpoint_modes() -> bool:
+    """Whether a selective activation checkpoint's dispatch mode is active (read by every det autograd Function's
+    forward under saved-tensor hooks; the forward then runs again with every active dispatch mode popped).  False on
+    a torch without the private APIs read here (the entries then behave as before)."""
+    if (
+        not _SELECTIVE_MODES
+        or _MODE_STACK is None
+        or _DISPATCH_MODES is None
+        or _DISABLE_MODES is None
+    ):
+        return False
+    return _DISPATCH_MODES() > 0 and any(
+        isinstance(mode, _SELECTIVE_MODES) for mode in _MODE_STACK()
+    )
+
+
 _CHECKPOINT_FIRST = "_checkpoint_hook.__init__.<locals>.pack_hook"
 _CHECKPOINT_RECOMPUTE = "_recomputation_hook.__init__.<locals>.pack_hook"
 _CHECKPOINT_SUPPORT: dict[str, bool] = {}
@@ -7304,8 +7364,34 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
     ):
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         # under saved-tensor hooks: a non-reentrant torch.utils.checkpoint's passes leave the gradients to the
-        # recomputation (gradient placement "auto"); the plain step (no hooks) and other hooks run the fused forward
-        if (need_dx or need_dw) and _TOP_SAVED_HOOKS(False) is not None:
+        # recomputation (gradient placement "auto"); the plain step (no hooks) and other hooks run the fused forward.
+        # Under a selective checkpoint's modes (any need_dx / need_dw): again, with the dispatch modes popped
+        if _TOP_SAVED_HOOKS(False) is not None and (
+            need_dx or need_dw or _selective_checkpoint_modes()
+        ):
+            if _selective_checkpoint_modes():
+                with _modes_off():
+                    return ChunkedLmHeadDetLossFunction.forward(
+                        ctx,
+                        X,
+                        W,
+                        labels,
+                        objective,
+                        loss_div,
+                        infer_logp,
+                        loss_weights,
+                        chunk_size,
+                        return_logp,
+                        grad_weight_dtype,
+                        deterministic,
+                        backend,
+                        compact_rows,
+                        fuse_dw_cast,
+                        dx_finalize,
+                        dw_stream,
+                        hidden_count,
+                        gemm_tuning,
+                    )
             out = _loss_forward_hooked(
                 ctx,
                 X,
@@ -7448,6 +7534,25 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
         logprob_dz,
         logprob_lbl,
     ):
+        if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
+            with _modes_off():  # under a selective checkpoint's modes: popped (see _selective_checkpoint_modes)
+                return ChunkedLmHeadDetLogprobFunction.forward(
+                    ctx,
+                    X,
+                    W,
+                    labels,
+                    chunk_size,
+                    deterministic,
+                    backend,
+                    compact_rows,
+                    fuse_dw_cast,
+                    dx_finalize,
+                    dw_stream,
+                    hidden_count,
+                    gemm_tuning,
+                    logprob_dz,
+                    logprob_lbl,
+                )
         # every switch is resolved (and validated) once here, before any launch: the backward plans its chunks on the
         # forward's valid-row index under the same switches, the forward and the backward bind with the same GEMM knobs
         compact = _resolve_compact(compact_rows)
@@ -7535,6 +7640,23 @@ class ChunkedLmHeadDetLogprobKeepFunction(torch.autograd.Function):
         gemm_tuning,
         logprob_dz,
     ):
+        if _TOP_SAVED_HOOKS(False) is not None and _selective_checkpoint_modes():
+            with _modes_off():  # under a selective checkpoint's modes: popped (see _selective_checkpoint_modes)
+                return ChunkedLmHeadDetLogprobKeepFunction.forward(
+                    ctx,
+                    X,
+                    W,
+                    labels,
+                    chunk_size,
+                    deterministic,
+                    compact_rows,
+                    fuse_dw_cast,
+                    dx_finalize,
+                    dw_stream,
+                    hidden_count,
+                    gemm_tuning,
+                    logprob_dz,
+                )
         compact = _resolve_compact(compact_rows)
         hidden = _resolve_hidden_count(hidden_count)
         tuning = _resolve_gemm_tuning(gemm_tuning)
@@ -7671,6 +7793,9 @@ def chunked_lm_head_det_loss(
     the loss only and the recomputation in the backward forms the gradient
     accumulators, so a checkpointed step runs the gradient GEMMs once (CPU
     offload or other saved-tensor hooks innermost keep the fused forward).
+    Under selective activation checkpointing the call runs with every active
+    torch dispatch mode popped (``_selective_checkpoint_modes``) and behaves
+    the same way.
     The outputs are the same bits as with ``"forward"`` (gradients formed in
     every forward).
     """

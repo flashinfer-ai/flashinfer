@@ -4254,7 +4254,37 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
         # checkpointed forward computes the loss only and saves the inputs; the recomputation runs this forward and
         # hands its result to the checkpointed call's backward.  Outside one (the plain step): the fused forward
         ckpt = None
-        if (need_dx or need_dw) and _main._TOP_SAVED_HOOKS(False) is not None:
+        if _main._TOP_SAVED_HOOKS(False) is not None and (
+            need_dx or need_dw or _main._selective_checkpoint_modes()
+        ):
+            # under a selective checkpoint's modes (any need_dx / need_dw): again, with every dispatch mode popped (as
+            # in :mod:`.cake_backend`)
+            if _main._selective_checkpoint_modes():
+                with _main._modes_off():
+                    return ChunkedLmHeadDetLossFunction.forward(
+                        ctx,
+                        X,
+                        W,
+                        labels,
+                        objective,
+                        loss_div,
+                        infer_logp,
+                        loss_weights,
+                        chunk_size,
+                        return_logp,
+                        grad_weight_dtype,
+                        deterministic,
+                        backend,
+                        compact_rows,
+                        fuse_dw_cast,
+                        dx_finalize,
+                        dw_stream,
+                        hidden_count,
+                        gemm_tuning,
+                        memory_mode,
+                        num_valid_rows,
+                        check_num_valid_rows,
+                    )
             ChunkedLmHeadDetLossFunction._setup(
                 ctx, X, grad_weight_dtype, backend, memory_mode
             )
@@ -4520,6 +4550,31 @@ class ChunkedLmHeadDetLogprobFunction(torch.autograd.Function):
         num_valid_rows,
         check_num_valid_rows,
     ):
+        if (
+            _main._TOP_SAVED_HOOKS(False) is not None
+            and _main._selective_checkpoint_modes()
+        ):
+            with _main._modes_off():  # under a selective checkpoint's modes: popped (as in :mod:`.cake_backend`)
+                return ChunkedLmHeadDetLogprobFunction.forward(
+                    ctx,
+                    X,
+                    W,
+                    labels,
+                    chunk_size,
+                    deterministic,
+                    backend,
+                    compact_rows,
+                    fuse_dw_cast,
+                    dx_finalize,
+                    dw_stream,
+                    hidden_count,
+                    gemm_tuning,
+                    logprob_dz,
+                    logprob_lbl,
+                    memory_mode,
+                    num_valid_rows,
+                    check_num_valid_rows,
+                )
         # every switch is resolved (and validated) once here, before any launch: the backward plans its chunks on the
         # forward's valid-row index under the same switches, the forward and the backward bind with the same GEMM knobs
         compact = _resolve_compact(compact_rows)
