@@ -861,6 +861,12 @@ UE8M0_DETERMINISTIC_CHAIN_TOKENS = [[1, 47], [256, 1023]]
 # and launch, so the same outputs), ahead of the fast-division routes: the
 # token counts of RAW_DETERMINISTIC_TAIL_TOKENS (inclusive ranges).
 RAW_DETERMINISTIC_TAIL_TOKENS = [[16, 47], [128, 1024]]
+# The raw scale mode's launches of the plain regime outside the deterministic
+# mode that the FP8 group-128 tailpipe program takes on VARIANT_TAIL_ARCHES (the
+# plain program's split count and launch, so the same outputs), ahead of the
+# fast-division and fast coefficient-chain routes: the token counts of
+# RAW_TAIL_TOKENS (inclusive ranges).
+RAW_TAIL_TOKENS = [[129, 384], [833, 1023]]
 
 
 def _fast_chain_program(layout, regime, arch, tokens, deterministic, ue8m0=None):
@@ -906,10 +912,12 @@ def _ue8m0_program(regime, tokens, deterministic):
 
 def _raw_tail_program(regime, tokens, deterministic):
     """The FP8 group-128 tailpipe program where the raw scale mode's launch in
-    ``regime`` on sm_107a takes it (the deterministic launches of the plain regime
-    at RAW_DETERMINISTIC_TAIL_TOKENS), else None."""
-    if regime == "bf16" and deterministic:
-        for first, last in RAW_DETERMINISTIC_TAIL_TOKENS:
+    ``regime`` on sm_107a takes it (the launches of the plain regime at
+    RAW_DETERMINISTIC_TAIL_TOKENS in the deterministic mode and at RAW_TAIL_TOKENS
+    outside it), else None."""
+    if regime == "bf16":
+        ranges = RAW_DETERMINISTIC_TAIL_TOKENS if deterministic else RAW_TAIL_TOKENS
+        for first, last in ranges:
             if first <= tokens <= last:
                 return VARIANT_PROGRAMS["fp8_group128"]["tailpipe"]
     return None
@@ -1944,11 +1952,16 @@ def test_h4096_fp8_raw_fast_div_routes_select_the_fast_div_program():
         for r in _runtime.ROUTES
         if r["program"] == tail and _runtime.route_regime(r) == "bf16"
     ]
-    assert [r["tokens"] for r in tail_routes] == (
-        [RAW_DETERMINISTIC_TAIL_TOKENS] if RAW_DETERMINISTIC_TAIL_TOKENS else []
-    )
+    assert [(r["deterministic"], r["tokens"]) for r in tail_routes] == [
+        (deterministic, tokens)
+        for deterministic, tokens in (
+            (True, RAW_DETERMINISTIC_TAIL_TOKENS),
+            (False, RAW_TAIL_TOKENS),
+        )
+        if tokens
+    ]
     for r in tail_routes:
-        assert r["deterministic"] is True and r["fp8_sf_ue8m0"] is False
+        assert r["fp8_sf_ue8m0"] is False
         assert all(_runtime.ROUTES.index(r) < _runtime.ROUTES.index(f) for f in routes)
         rest = {k: v for k, v in r.items() if k not in (*launch_keys, "fp8_sf_ue8m0")}
         assert dict(rest, program=None) == dict(route, program=None)
@@ -1956,7 +1969,12 @@ def test_h4096_fp8_raw_fast_div_routes_select_the_fast_div_program():
     assert record["arg_plan"] == base["arg_plan"]
     assert record["launch"] == base["launch"]
     assert record["compile_options"] == base["compile_options"]
-    edges = {e + d for pair in FAST_DIV_TOKENS for e in pair for d in (-1, 0, 1)}
+    edges = {
+        e + d
+        for pair in (*FAST_DIV_TOKENS, *RAW_TAIL_TOKENS)
+        for e in pair
+        for d in (-1, 0, 1)
+    }
     tokens = sorted(
         t
         for t in {*H4096_TOKENS, *H4096_RULE_TOKENS, *edges}
@@ -2093,13 +2111,20 @@ def test_h4096_fast_chain_routes_select_the_fast_chain_programs():
                         )
                         if got[0] == FAST_DIV_PROGRAM:
                             continue  # the fast-division routes (their own test)
+                        raw_tail = None
                         if ue8m0:
                             held = _ue8m0_program(other, t, deterministic)
                         elif mode.get("fp8_sf_ue8m0") is False:
-                            held = _raw_tail_program(other, t, deterministic) or kept
+                            raw_tail = _raw_tail_program(other, t, deterministic)
+                            held = raw_tail or kept
                         else:
                             held = kept
-                        assert got == (want or held, {}), (name, other, t, mode)
+                        assert got == (raw_tail or want or held, {}), (
+                            name,
+                            other,
+                            t,
+                            mode,
+                        )
                     if layout == "fp8_group128":
                         got = _runtime.select_program(
                             *key,
