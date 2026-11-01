@@ -233,6 +233,7 @@ def test_attention_ts_context_mla_partition_original_scale(paged, runtime_overri
         num_qo_heads=heads,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
+        packed_query=False,
         q_dtype=q.dtype,
         kv_dtype=cache.dtype,
         out_dtype=q.dtype,
