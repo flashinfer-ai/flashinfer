@@ -121,9 +121,13 @@ def _bounded_rand(
     return ((values - 0.5) * 0.125).to(dtype).contiguous()
 
 
-def _rank_order_sum(local: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+def _rank_order_sum(
+    local: torch.Tensor, group: dist.ProcessGroup, fp32_acc: bool
+) -> torch.Tensor:
     peers = [torch.empty_like(local) for _ in range(dist.get_world_size(group))]
     dist.all_gather(peers, local, group=group)
+    if fp32_acc:
+        return torch.stack(peers).float().sum(dim=0).to(local.dtype)
     total = peers[0]
     for peer in peers[1:]:
         total = (total.float() + peer.float()).to(local.dtype)
@@ -142,18 +146,31 @@ def _reference(
     eps: float,
     weight_bias: float,
     group: dist.ProcessGroup,
+    fp32_acc: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """With ``fp32_acc`` (the TRT-LLM kernel), the routes, the shared expert add and
+    the rank sum accumulate in FP32 and round once each; otherwise (Cake) every step
+    rounds to the activation dtype."""
     gathered = allreduce_in[inverse_indices]
-    local = torch.zeros_like(residual_in)
-    for route in range(inverse_indices.shape[1]):
-        contribution = (
-            gathered[:, route].float() * expert_scales[:, route].float().unsqueeze(-1)
-        ).to(local.dtype)
-        local = (local.float() + contribution.float()).to(local.dtype)
-    local = (local.float() * routed_scaling_factor).to(local.dtype)
-    if shared_expert_output is not None:
-        local = (local.float() + shared_expert_output.float()).to(local.dtype)
-    reduced = _rank_order_sum(local, group)
+    if fp32_acc:
+        local_f32 = (gathered.float() * expert_scales.float().unsqueeze(-1)).sum(
+            dim=1
+        ) * routed_scaling_factor
+        if shared_expert_output is not None:
+            local_f32 = local_f32 + shared_expert_output.float()
+        local = local_f32.to(residual_in.dtype)
+    else:
+        local = torch.zeros_like(residual_in)
+        for route in range(inverse_indices.shape[1]):
+            contribution = (
+                gathered[:, route].float()
+                * expert_scales[:, route].float().unsqueeze(-1)
+            ).to(local.dtype)
+            local = (local.float() + contribution.float()).to(local.dtype)
+        local = (local.float() * routed_scaling_factor).to(local.dtype)
+        if shared_expert_output is not None:
+            local = (local.float() + shared_expert_output.float()).to(local.dtype)
+    reduced = _rank_order_sum(local, group, fp32_acc)
     residual = (reduced.float() + residual_in.float()).to(local.dtype)
     residual_f32 = residual.float()
     norm = (
@@ -415,20 +432,26 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, init_method: str) ->
                     else None
                 )
                 routed_scaling_factor = 2.5 if use_shared else None
-                residual_ref, norm_ref = _reference(
-                    allreduce_in=allreduce_in,
-                    residual_in=residual_in,
-                    norm_weight=norm_weight,
-                    inverse_indices=inverse_indices,
-                    expert_scales=expert_scales,
-                    shared_expert_output=shared_expert_output,
-                    routed_scaling_factor=(
-                        1.0 if routed_scaling_factor is None else routed_scaling_factor
-                    ),
-                    eps=1e-5,
-                    weight_bias=weight_bias,
-                    group=group,
-                )
+                refs = {
+                    backend: _reference(
+                        allreduce_in=allreduce_in,
+                        residual_in=residual_in,
+                        norm_weight=norm_weight,
+                        inverse_indices=inverse_indices,
+                        expert_scales=expert_scales,
+                        shared_expert_output=shared_expert_output,
+                        routed_scaling_factor=(
+                            1.0
+                            if routed_scaling_factor is None
+                            else routed_scaling_factor
+                        ),
+                        eps=1e-5,
+                        weight_bias=weight_bias,
+                        group=group,
+                        fp32_acc=backend == "trtllm",
+                    )
+                    for backend in ("trtllm", "cake")
+                }
 
                 outputs: dict[str, tuple[torch.Tensor, ...]] = {}
                 kernel_names: list[str] | None = None
@@ -475,6 +498,7 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, init_method: str) ->
                         f"({label})"
                     )
                 for backend, result in outputs.items():
+                    residual_ref, norm_ref = refs[backend]
                     torch.testing.assert_close(
                         result[0].float(),
                         residual_ref.float(),
