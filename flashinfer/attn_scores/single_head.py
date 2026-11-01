@@ -221,7 +221,14 @@ def single_head_paged_mqa_threshold_select(
     """
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("Threshold select needs CuTe DSL 4.7 or newer")
-    from .kernels.single_head_scorer import COUNTERS, PAGE, SELECT_TILES_PER_CTA, TILE
+    from .kernels.single_head_scorer import (
+        COUNTERS,
+        PAGE,
+        SELECT_CTAS_PER_TILE,
+        SELECT_MIN_TILES,
+        SELECT_TILES_PER_CTA,
+        TILE,
+    )
 
     tiles, width = tile_requests.shape[0], block_table.shape[1]
     key_tiles = (max_context + TILE - 1) // TILE
@@ -246,11 +253,16 @@ def single_head_paged_mqa_threshold_select(
         raise ValueError(
             "candidates must hold the top_k tie slots and at least one more"
         )
-    # CTAs: the fewest whole waves (every SM the same number of CTAs) that keep
-    # each CTA's run within SELECT_TILES_PER_CTA, shared out so the first `wide`
-    # query tiles get one CTA more than the rest.
+    # CTAs per query tile: enough that each CTA's run stays within
+    # SELECT_TILES_PER_CTA, and at least SELECT_CTAS_PER_TILE while each keeps
+    # SELECT_MIN_TILES key tiles, since one CTA per SM leaves the SM idle on
+    # short contexts. Rounded up to whole waves (every SM the same number of
+    # CTAs) and shared out so the first `wide` query tiles get one CTA more.
     sms = get_device_sm_count(query.device)
-    runs = -(-key_tiles // SELECT_TILES_PER_CTA)
+    runs = max(
+        -(-key_tiles // SELECT_TILES_PER_CTA),
+        min(SELECT_CTAS_PER_TILE, key_tiles // SELECT_MIN_TILES),
+    )
     workers, wide = divmod(sms * -(-tiles * runs // sms), tiles)
     keys = (query, query_scales, key_cache, key_scales)
     tables = (row_ends, tile_requests, block_table)

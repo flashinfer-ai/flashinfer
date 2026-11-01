@@ -44,6 +44,10 @@ SMEM_RESERVED_PER_CTA = 1024  # bytes the driver keeps per CTA
 # a tile): 256 in decode, so a run covers 32K keys, and 128 in select.
 TILES_PER_CTA = 256
 SELECT_TILES_PER_CTA = 128
+# Select's CTAs per query tile, when the keys allow: at least SELECT_CTAS_PER_TILE,
+# each running over at least SELECT_MIN_TILES key tiles.
+SELECT_CTAS_PER_TILE = 16
+SELECT_MIN_TILES = 4
 # NVFP4 values (E2M1, two to a byte) come with one E4M3 scale per 16.
 SCALE_TYPE = cutlass.Float8E4M3FN
 SCALE_VECTOR = 16
