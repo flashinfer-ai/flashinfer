@@ -936,11 +936,49 @@ def _ffi_arguments(arguments) -> tuple:
     )
 
 
+def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
+    """:func:`_ffi_arguments` that keeps the export of every unchanged tensor.
+
+    A plan-cache rebind replaces only the views of the moved inputs; every
+    other argument of a rebuilt record is the same tensor object at the same
+    address as in the record it replaces.  Such a tensor reuses its previous
+    tvm-ffi export (same data pointer, shape, strides and dtype); only the
+    tensors that moved go through :func:`_ffi_arguments` again.  ``owner``
+    keeps the last export of each record ``site`` until that site is rebuilt.
+    """
+    import torch
+
+    memo = owner.__dict__.setdefault("_ffi_export_memo", {})
+    previous = memo.get(site, ())
+    exported = list(arguments)
+    kept: list = [None] * len(exported)
+    fresh = []
+    for position, value in enumerate(exported):
+        if not isinstance(value, torch.Tensor):
+            continue
+        pointer = value.data_ptr()
+        prior = previous[position] if position < len(previous) else None
+        if prior is not None and prior[0] is value and prior[1] == pointer:
+            exported[position] = prior[2]
+            kept[position] = prior
+        else:
+            fresh.append((position, value, pointer))
+    if fresh:
+        converted = _ffi_arguments([value for _, value, _ in fresh])
+        for (position, value, pointer), ffi_value in zip(fresh, converted, strict=True):
+            exported[position] = ffi_value
+            kept[position] = (value, pointer, ffi_value)
+    memo[site] = tuple(kept)
+    return tuple(exported)
+
+
 def _prepared_kernel_record(module, grid, bindings) -> tuple:
     """(native entry, positional arguments) of one ``PreparedKernel.launch``."""
     if not module._ready:
         raise RuntimeError("TMA descriptors must be initialized during preparation")
-    return module._call, _ffi_arguments(module._arguments(grid, bindings))
+    return module._call, _ffi_arguments_reusing(
+        module, None, module._arguments(grid, bindings)
+    )
 
 
 def _run_launch_records(records) -> None:
@@ -6141,10 +6179,13 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
 
         Runs on the first launch, after a plan-cache rebind (which drops the
         records) and on a hit under CUDA-graph capture (which marks the
-        composite stale).  Every descriptor re-encode is enqueued right before
-        the first kernel that reads it, and a deferred map/correction rebind is
-        applied while the first chain kernel runs.  Later calls fire the
-        stored records back to back with no host work between two launches.
+        composite stale).  Every part's descriptors are re-encoded and every
+        record is built, the main part's first, before the first record fires:
+        the host work of a rebind then precedes the call's first kernel instead
+        of holding the GPU idle between the index gather and the main kernel.
+        Every descriptor re-encode still precedes, on the stream, the first
+        kernel that reads it.  Later calls fire the stored records back to back
+        with no host work between two launches.
         """
         if self._descriptors_stale:
             # A plan-cache hit under CUDA-graph capture marks the composite;
@@ -6159,38 +6200,38 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._apply_descriptors_stale = bool(self._apply_route)
             self._apply_prefix_stale = bool(self._apply_route)
             self._descriptors_stale = False
+        main_records = _settled_launch_records(self._main)
+        # The map/correction rebinds of a plan-cache hit were deferred past the
+        # main part's settle; apply them before their records are built.
+        flush_deferred_rebind(self)
         map_first = self._map_first
-        if map_first:
-            # The map is the first chain kernel: its rebind lands before it.
-            flush_deferred_rebind(self)
         records: list = []
+        add = records.extend
 
-        def fire(part) -> None:
-            _run_launch_records(part)
-            records.extend(part)
-
-        fire(
+        add(
             [
                 (destination.copy_, (source,))
                 for destination, source in self._affine_input_refreshes
             ]
         )
         if map_first:
-            fire(self._map_records())
+            add(self._map_records())
         if self._correction_merge:
             # The index gather also places each sequence's pool offset at the
             # correction window that ends it.
-            fire(
+            add(
                 [
                     (
                         self._fused_epilogue.index_prep_merge,
-                        _ffi_arguments(
+                        _ffi_arguments_reusing(
+                            self,
+                            "index_prep_merge",
                             (
                                 *self._index_prep_arguments(),
                                 self._merge_final_positions,
                                 self._merge_final_offsets,
                                 self._fused_epilogue.pool_slot_stride,
-                            )
+                            ),
                         ),
                     )
                 ]
@@ -6199,26 +6240,25 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             # One kernel gathers every per-call index the parts consume
             # (window state indices, in-place row starts, the int64 state
             # indices of the epilogue).
-            fire(
+            add(
                 [
                     (
                         self._fused_epilogue.index_prep,
-                        _ffi_arguments(self._index_prep_arguments()),
+                        _ffi_arguments_reusing(
+                            self, "index_prep", self._index_prep_arguments()
+                        ),
                     )
                 ]
             )
         else:
-            fire([(self._gather_indices_with_torch, ())])
-        fire(_settled_launch_records(self._main))
-        # The map/correction rebinds of a plan-cache hit were deferred past
-        # the first chain kernel; apply them while it runs.
-        flush_deferred_rebind(self)
+            add([(self._gather_indices_with_torch, ())])
+        add(main_records)
         if self._fused_epilogue is None and not self._apply_route:
             # The int64 index copy is only consumed by the final-state
             # scatter, so it follows the first chain kernel.
-            fire([(self._state_indices_long.copy_, (self._state_indices,))])
+            add([(self._state_indices_long.copy_, (self._state_indices,))])
         if not map_first:
-            fire(self._map_records())
+            add(self._map_records())
         scan_grid = (
             self._num_sequences
             * int(self._main_final.shape[1])
@@ -6226,7 +6266,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             1,
             1,
         )
-        fire(
+        add(
             [
                 _prepared_kernel_record(
                     self._scan_module, scan_grid, self._scan_bindings()
@@ -6234,7 +6274,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             ]
         )
         if self._use_output_projection:
-            fire(
+            add(
                 [
                     _prepared_kernel_record(
                         self._projection_module,
@@ -6244,7 +6284,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 ]
             )
         elif self._apply_route:
-            fire(
+            add(
                 [
                     _prepared_kernel_record(
                         self._apply_module, self._apply_grid, self._apply_bindings()
@@ -6252,21 +6292,24 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 ]
             )
         else:
-            fire(_settled_launch_records(self._correction))
+            add(_settled_launch_records(self._correction))
         if not self._apply_route and not self._correction_merge:
             # The apply route's scan kernel wrote the final states into the
             # pool and the row-0 carries into the checkpoint rows.
             if self._fused_epilogue is not None:
-                fire(
+                add(
                     [
                         (
                             self._fused_epilogue.run,
-                            _ffi_arguments(self._fused_epilogue_arguments()),
+                            _ffi_arguments_reusing(
+                                self, "epilogue", self._fused_epilogue_arguments()
+                            ),
                         )
                     ]
                 )
             else:
-                fire([(self._torch_epilogue, ())])
+                add([(self._torch_epilogue, ())])
+        _run_launch_records(records)
         self._launch_records = tuple(records)
 
     def _map_records(self) -> list:
