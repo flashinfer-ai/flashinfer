@@ -2489,6 +2489,22 @@ cake_kcp = cake_package("cake_kda_det_train_kcp", "cake_kcp")
 LEVER_TENSORS = ("out", "dq", "dk", "dv", "dg", "dbeta")
 
 
+@pytest.mark.parametrize("sm", [132, 148, 152, 160, 216])
+def test_fwd_o_grid_is_the_record_rule(sm: int) -> None:
+    """The output program's host grid (:func:`cake_kcp.kcp_local_grid`) is the ``kcp_fwd_o`` record's
+    ``kcp_tile_items`` rule at every shape: one CTA per (chunk, head) tile of the padded chunk count, whatever the
+    SM count (the CTAs that start take the tiles of the CTAs that have not started)."""
+    assert cake_kcp_jit.MODULES["kcp_fwd_o"]["grid_rule"] == {"kind": "kcp_tile_items"}
+    for nc_pad in (1, 2, 5, 38, 64, 268, 400, 1000, 4090):
+        for H in (1, 3, 4, 8, 64):
+            p = types.SimpleNamespace(NC_pad=nc_pad, H=H, sm_count=sm)
+            grid = cake_kcp.kcp_local_grid("fwd_o", p)
+            assert grid == cake_kcp_jit.launch_grid(
+                "kcp_fwd_o", num_chunks_pad=nc_pad, num_heads=H, sm_count=sm
+            )
+            assert grid == (nc_pad * H, 1, 1)
+
+
 def test_round1_knobs_are_gated_and_validated(monkeypatch) -> None:
     """``schedule``, ``fused_walks`` and ``cols_rule`` are test knobs: refused
     without :func:`cake_kcp_plan.enable_test_knobs`, never public keywords (``graph`` is the exception, public
@@ -5919,7 +5935,7 @@ def test_local_stage_values_cover_the_records(H, arch, sm) -> None:
     assert (
         fwd[1][3]["chunk_bos"] is ctx.tables["chunk_bos"]
     )  # the WY program reads the context's tables
-    assert fwd[2][2] == (max(1, min(plan.NC_pad * H, sm)), 1, 1)
+    assert fwd[2][2] == (plan.NC_pad * H, 1, 1)
     assert bwd[3][2] == (plan.NC_pad // 2, H, 1)
     for kind, record, grid, _values in fwd + bwd:
         if kind == "backend":

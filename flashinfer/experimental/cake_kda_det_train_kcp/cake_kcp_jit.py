@@ -58,9 +58,11 @@ The programs are the eight launches of the KCP composition
   chains, the faster build of each on GB300);
 * ``kcp_fwd_o`` -- the chunk output stage of the forward at the rank's
   shape: ``out`` from the ``h`` / ``v_new`` tapes the forward walk writes and
-  the intra stage's ``qg`` / ``Aqk`` rows, persistent CTAs over the (chunk,
-  head) tiles (``grid_rule`` ``kcp_sm_bounded``: ``min(num_chunks_pad *
-  num_heads, ctas_per_sm * sm_count)`` CTAs, at least one);
+  the intra stage's ``qg`` / ``Aqk`` rows, one CTA per (chunk, head) tile of
+  the padded chunk count (``grid_rule`` ``kcp_tile_items``: ``num_chunks_pad *
+  num_heads`` CTAs); the CTAs that start take the tiles of the CTAs that have
+  not started (Cluster Launch Control), so a CTA another stream keeps from
+  starting costs the call its share of the SMs, not a second pass;
 * ``kcp_dav`` -- the output backward at the rank's shape: ``dAqk`` and the
   first value gradient ``dv1`` (read by the adjoint walk) from ``do_int``, the
   ``v_new`` tape and the ``Aqk`` rows, one CTA per chunk pair and head
@@ -826,8 +828,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"ctas_per_sm": 1, "kind": "kcp_sm_bounded"},
-        "kernel_symbol": "kernel_cake_kda_det_train_1214bfc28e50985bfa0c",
+        "grid_rule": {"kind": "kcp_tile_items"},
+        "kernel_symbol": "kernel_cake_kda_det_train_c811c1b52ed680d0a515_kcp",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -835,7 +837,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 222208,
             "use_pdl": False,
         },
-        "library": "cake_kda_det_train_1214bfc28e50985bfa0c",
+        "library": "cake_kda_det_train_c811c1b52ed680d0a515_kcp",
         "logical": {
             "aqk_tma": "aqk_int",
             "chunk_bos": "chunk_bos",
@@ -1384,9 +1386,9 @@ def launch_grid(
     the host lists the segments longest chain first);
     ``kcp_chains`` launches ``(n_chains * (ncols / cols_per_cta), 1, 1)`` (one
     CTA per chain and column block; ``ncols`` is a multiple of the record's
-    ``cols_per_cta``); ``kcp_sm_bounded`` the persistent grid ``(max(1,
-    min(num_chunks_pad * num_heads, ctas_per_sm * sm_count)), 1, 1)`` over the
-    (chunk, head) tiles of the rank's padded chunk count; ``kcp_pairs``
+    ``cols_per_cta``); ``kcp_tile_items`` ``(num_chunks_pad * num_heads, 1,
+    1)``, one CTA per (chunk, head) tile of the rank's padded chunk count (the
+    kernel stops at the real count it reads on the device); ``kcp_pairs``
     ``(num_chunks_pad / 2, num_heads, 1)`` (one CTA per chunk pair and head;
     ``num_chunks_pad`` is even).
     """
@@ -1408,14 +1410,12 @@ def launch_grid(
                 f"record {name}: n_chains={n_chains} must be >= 1 and ncols={ncols} a positive multiple of {cols}"
             )
         return (int(n_chains) * (int(ncols) // cols), 1, 1)
-    if kind == "kcp_sm_bounded":
-        if int(num_chunks_pad) < 1 or int(num_heads) < 1 or int(sm_count) < 1:
+    if kind == "kcp_tile_items":
+        if int(num_chunks_pad) < 1 or int(num_heads) < 1:
             raise ValueError(
-                f"record {name}: num_chunks_pad={num_chunks_pad}, num_heads={num_heads} and "
-                f"sm_count={sm_count} must be >= 1"
+                f"record {name}: num_chunks_pad={num_chunks_pad} and num_heads={num_heads} must be >= 1"
             )
-        bound = int(rule["ctas_per_sm"]) * int(sm_count)
-        return (max(1, min(int(num_chunks_pad) * int(num_heads), bound)), 1, 1)
+        return (int(num_chunks_pad) * int(num_heads), 1, 1)
     if kind == "kcp_pairs":
         if int(num_chunks_pad) < 1 or int(num_heads) < 1 or int(num_chunks_pad) % 2:
             raise ValueError(
