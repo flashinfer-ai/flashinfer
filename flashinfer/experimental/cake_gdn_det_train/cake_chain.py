@@ -44,7 +44,9 @@ it as two contiguous sequence groups (:func:`sequence_groups`), one on a
 high-priority side stream forked from the caller's stream and joined back
 before the stage returns: the forward's ``wy_tc`` and ``fwd_ho`` of the partial
 group overlap the full rounds of the other, and the adjoint ``dhu_tc2`` of the
-partial group overlaps the fused tail of the other.
+partial group of a serial plan overlaps ``tail_g2`` of the other; beside
+``tail_g3`` the ``dhu_tc2`` pass 2 of a split plan runs as two such groups of
+segments.
 
 Every launch is a record of :mod:`.cake_jit` selected by its stage and the
 device's architecture (:func:`.cake_backend.launch_stage`); the stages a plan
@@ -273,9 +275,10 @@ class ChainOptions:
     forward's ``w`` / ``u`` / ``h`` / ``v_new`` for the backward (else they are recomputed); ``host_cache`` keeps the
     chunk tables, the selection results and the per-stream workspaces between calls; ``lpt`` dispatches the
     sequences of a host-built table longest first (the same bits; ``False``: the caller's order); ``streams`` is
-    ``2`` to let a host-built table's serial scans run as two sequence groups on the caller's stream and a side stream
-    where their rule (:func:`two_stream_split`) fills the last round (the same bits), ``1`` to keep every launch on
-    the caller's stream.
+    ``2`` to let a host-built table's serial scans (the adjoint one beside ``tail_g2``) and the ``dhu_tc2`` pass 2 of
+    its split plans (beside ``tail_g3``) run as two groups on the caller's stream and a side stream where their rule
+    (:func:`two_stream_split`) fills the last round (the same bits), ``1`` to keep every launch on the caller's
+    stream.
     """
 
     scan_config: tuple[int, int] | None = None
@@ -1314,11 +1317,14 @@ def _prep_stage(
 # --------------------------------------------------------------------------- #
 # A serial scan launches one CTA per (segment, value head) and holds one CTA per SM, so its last round can leave SMs
 # idle.  Split into two contiguous groups of segments, the group that fills whole rounds runs on one stream while the
-# other group's scan overlaps the neighbouring stage (forward: wy_tc of the other group; adjoint: the tail of the
-# first group) on a second stream.  A group launch is the full launch restricted to its segments (fwd_ho through a
-# slice of its walk, dhu_tc2 through views of the segment table and of dht) or chunks (wy_tc and tail_g2 through
-# views of the chunk table and of h / dh): every CTA does the work of the CTA of the full launch that covers the same
-# (segment or chunk, value head), so the bits are the same.
+# other group's scan overlaps the neighbouring stage (forward: wy_tc of the other group; adjoint: the fused tail of
+# the first group) on a second stream.  The adjoint ``dhu_tc2`` pass 2 of a split plan (one CTA per segment, every
+# segment starting from its stitched state) is grouped the same way over its segments: a sequence's segments are
+# contiguous in the table, so group A covers the chunks before the first segment of group B.  A group launch is the
+# full launch restricted to its segments (fwd_ho through a slice of its walk, dhu_tc2 through views of the segment
+# table and of dht) or chunks (wy_tc and tail_g2 / tail_g3 through views of the chunk table and of h / dh): every CTA
+# does the work of the CTA of the full launch that covers the same (segment or chunk, value head), so the bits are
+# the same.
 
 
 def _idle_slots(ctas: int, sm_count: int) -> int:
@@ -1348,7 +1354,10 @@ def sequence_groups(
 ) -> tuple[StreamGroups | None, StreamGroups | None]:
     """The two-stream groups of a host-built table's forward and adjoint scans (``None``: one stream).  A scan is
     grouped on a serial plan (one segment per sequence, the table's walk) when :func:`two_stream_split` splits it: the
-    adjoint scan's group A is its full-round group, the forward scan's group A the rest."""
+    adjoint scan's group A is its full-round group, the forward scan's group A the rest.  The adjoint table of a split
+    plan is grouped over its segments by the same rule: group A its first ``k`` segments, the chunks before segment
+    ``k`` (used where its pass 2 runs on ``dhu_tc2`` beside ``tail_g3``; a serial adjoint scan's groups are used
+    beside ``tail_g2``)."""
     if meta.seq_lens is None:
         return None, None
     order = meta.order if meta.order is not None else range(meta.num_seqs)
@@ -1358,6 +1367,21 @@ def sequence_groups(
         k = None
         if segs.num_segments == meta.num_seqs and segs.walk is None:
             k = two_stream_split(meta.num_seqs, int(num_v_heads), int(sm_count))
+        elif adjoint and segs.segment_len > 0 and segs.num_segments > meta.num_seqs:
+            seq_chunk_start = [0]
+            for n in chunks:
+                seq_chunk_start.append(seq_chunk_start[-1] + n)
+            seg_chunk_start = _segment_lists(seq_chunk_start, int(segs.segment_len))[0]
+            k = None
+            if len(seg_chunk_start) - 1 == segs.num_segments:
+                k = two_stream_split(segs.num_segments, int(num_v_heads), int(sm_count))
+            split_chunk = 0 if k is None else seg_chunk_start[k]
+            groups.append(
+                StreamGroups(k, split_chunk)
+                if k is not None and 0 < split_chunk < meta.num_chunks
+                else None
+            )
+            continue
         split = None if k is None else (k if adjoint else meta.num_seqs - k)
         split_chunk = 0 if split is None else sum(chunks[:split])
         groups.append(
@@ -1733,8 +1757,25 @@ def gdn_chunk_det_backward(
     split_tc = not serial and _sdt_selected(
         meta, segs, num_v_heads, index, options, arch
     )
-    # two sequence groups: the tcgen05 serial scan feeding the fused tail of a value-head group of two
-    groups = meta.bwd_groups if use_tc and num_v_heads == 2 * num_heads else None
+    dbeta_bf16 = dbeta_dtype == torch.bfloat16
+    # the fused tail: tail_g2 for a value-head group of two, tail_g3 for three (unless a finalize pin), else None
+    if num_v_heads == 2 * num_heads:
+        fused_tail = "tail_g2_bf16" if dbeta_bf16 else "tail_g2"
+    else:
+        tail3 = "tail_g3_bf16" if dbeta_bf16 else "tail_g3"
+        pinned = options.finalize or forward.get("finalize_stage")
+        fused_tail = (
+            tail3
+            if num_v_heads == 3 * num_heads and not pinned and _available(tail3, arch)
+            else None
+        )
+    # two groups: the tcgen05 adjoint scan feeding the fused tail, for a serial plan beside tail_g2 and for the pass 2
+    # of a split plan beside tail_g3 (a serial plan beside tail_g3 and a split plan beside tail_g2 run one stream)
+    tail_kind = None if fused_tail is None else fused_tail.removesuffix("_bf16")
+    two_stream = (use_tc and tail_kind == "tail_g2") or (
+        split_tc and tail_kind == "tail_g3"
+    )
+    groups = meta.bwd_groups if two_stream else None
     if not (use_tc or split_tc):
         dv_local = workspaces.take(table, "b_dv_local", token_hv, v.dtype, device)
         _launch("dv_local", meta.num_chunks, num_v_heads, 1, qn, kn, do, g_cs, dv_local, meta.chunk_start,
@@ -1797,19 +1838,20 @@ def gdn_chunk_det_backward(
         _launch("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
                 seg_flag, num_v_heads, use_dht, 1)  # fmt: skip
         dht32, use_dht = dh_end, 1
-    if split_tc:
+    if split_tc and groups is None:
         # pass 2 on the tcgen05 scan: segment ``seg`` starts from dht[seg], the stitched dh_end[seg]; the first segment
         # of a sequence stores its dh0 (the register pass 2's contract)
         _launch("dhu_tc2", segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
                 meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
                 num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
-    elif not use_tc:
+    elif not (use_tc or split_tc):
         _launch(scan_stage, segs.num_segments, num_v_heads, HEAD_DIM // vb, qn, kn, w, do, dv_local, g_cs, dht32, dh,
                 dv2, dh0, dh0, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                 meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
-    dbeta_bf16 = dbeta_dtype == torch.bfloat16
-    if num_v_heads == 2 * num_heads:
-        # a value-head group of two: dqkwg, the WY pullback and the finalize as one cluster kernel
+    if fused_tail is not None:
+        # a value-head group of two / three: dqkwg, the WY pullback and the finalize as one cluster kernel (the same
+        # bits as the three stages); a finalize pin keeps the three stages of a group of three
+        tail = fused_tail
         dv = torch.empty(v.shape, dtype=v.dtype, device=device)
         dbeta = torch.empty(forward.get("beta_shape") or (total_tokens, num_v_heads),
                             dtype=torch.bfloat16 if dbeta_bf16 else torch.float32, device=device)  # fmt: skip
@@ -1820,7 +1862,6 @@ def gdn_chunk_det_backward(
             dtype=torch.float32,
             device=device,
         )
-        tail = "tail_g2_bf16" if dbeta_bf16 else "tail_g2"
         normalize = 1 if forward.get("normalize_qk", True) else 0
         if groups is None:
             _launch(tail, meta.num_chunks * num_v_heads, 1, 1, qn, kn, forward["rstd_q"], forward["rstd_k"], v_new, do,
@@ -1837,7 +1878,7 @@ def gdn_chunk_det_backward(
                         segs.seg_seq[s0:s1], meta.seq_chunk_start, num_heads, num_v_heads, use_dht,
                         1 if has_initial_state else 0, scale)  # fmt: skip
 
-            def tail_g2(c0, c1):
+            def tail_chunks(c0, c1):
                 _launch(tail, (c1 - c0) * num_v_heads, 1, 1, qn, kn, forward["rstd_q"], forward["rstd_k"], v_new, do,
                         dv2, h[c0:c1], dh[c0:c1], g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, meta.chunk_start[c0:c1],
                         meta.chunk_len[c0:c1], num_heads, num_v_heads, scale, normalize)  # fmt: skip
@@ -1851,30 +1892,10 @@ def gdn_chunk_det_backward(
                 with torch.cuda.stream(side):
                     side.wait_event(fork)
                     dhu_tc2(na, segs.num_segments)
-                tail_g2(0, ca)
+                tail_chunks(0, ca)
             finally:
                 main.wait_stream(side)  # the join
-            tail_g2(ca, meta.num_chunks)
-        return {"dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta,
-                "dinitial_state": _caller_rows(dh0, meta) if has_initial_state else None}  # fmt: skip
-    tail3 = "tail_g3_bf16" if dbeta_bf16 else "tail_g3"
-    pinned = options.finalize or forward.get("finalize_stage")
-    if num_v_heads == 3 * num_heads and not pinned and _available(tail3, arch):
-        # a value-head group of three: dqkwg, the WY pullback and the finalize as one three-CTA cluster kernel (the
-        # same bits as the three stages); a finalize pin keeps the three stages
-        dv = torch.empty(v.shape, dtype=v.dtype, device=device)
-        dbeta = torch.empty(forward.get("beta_shape") or (total_tokens, num_v_heads),
-                            dtype=torch.bfloat16 if dbeta_bf16 else torch.float32, device=device)  # fmt: skip
-        dq = torch.empty(qn.shape, dtype=qn.dtype, device=device)
-        dk = torch.empty(kn.shape, dtype=kn.dtype, device=device)
-        dg = torch.empty(
-            forward.get("g_shape") or (total_tokens, num_v_heads),
-            dtype=torch.float32,
-            device=device,
-        )
-        _launch(tail3, meta.num_chunks * num_v_heads, 1, 1, qn, kn, forward["rstd_q"], forward["rstd_k"], v_new, do,
-                dv2, h, dh, g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, meta.chunk_start, meta.chunk_len, num_heads,
-                num_v_heads, scale, 1 if forward.get("normalize_qk", True) else 0)  # fmt: skip
+            tail_chunks(ca, meta.num_chunks)
         return {"dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta,
                 "dinitial_state": _caller_rows(dh0, meta) if has_initial_state else None}  # fmt: skip
     dq_hv = workspaces.take(table, "b_dq_hv", token_hv, qn.dtype, device)

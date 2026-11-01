@@ -3163,11 +3163,17 @@ kernel_alpha_moe_w8a8_up_down(const __grid_constant__ CUtensorMap x, const __gri
                 unsigned int down_load_stage = 0;
                 int out_blocks = K / 128;
                 if (elect_sync()) {
+                    const int w2_follow_ahead = 2 * gridDim.z;
+                    const int w2_follow_from = blockIdx.z + 2 * gridDim.z;
                     #pragma unroll 1
                     for (int ob = blockIdx.z; ob < out_blocks; ob += gridDim.z) {
                         mbarrier_wait(down_empty_addr + (down_load_stage) * 8, _phase_down_empty);
                         mbarrier_arrive_expect_tx(down_full_addr + (down_load_stage) * 8, 16384);
                         tma_3d_gmem2smem(smem_w2_addr + down_load_stage * 16384, (&W2), intermediate_block * 128, ob * 128, expert, down_full_addr + (down_load_stage) * 8);
+                        int ob_follow = ob + w2_follow_ahead;
+                        if (ob >= w2_follow_from && ob_follow < out_blocks) {
+                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W2))), "r"((int)(intermediate_block * 128)), "r"((int)(ob_follow * 128)), "r"((int)(expert)) : "memory");
+                        }
                         down_load_stage += 1;
                         if (down_load_stage == 2) { down_load_stage = 0; _phase_down_empty ^= 1; }
                     }
@@ -3183,6 +3189,9 @@ kernel_alpha_moe_w8a8_up_down(const __grid_constant__ CUtensorMap x, const __gri
             unsigned int _phase_down_free = 1;
             unsigned int _phase_down_full = 0;
             if (blockIdx.x * 8 < num_tokens_post_padded[0]) {
+                int route_block_mma = blockIdx.x / (route_block_m / 8);
+                int expert_mma = expert_ids[route_block_mma];
+                const int intermediate_block_mma = blockIdx.y;
                 int k_blocks_mma = K / 128;
                 unsigned int up_stage = 0;
                 #pragma unroll 1
@@ -3218,6 +3227,15 @@ kernel_alpha_moe_w8a8_up_down(const __grid_constant__ CUtensorMap x, const __gri
                     elect_commit(up_empty_addr + (up_stage) * 8);
                     up_stage += 1;
                     if (up_stage == 4) { up_stage = 0; _phase_up_free ^= 1; _phase_up_full ^= 1; }
+                }
+                if (elect_sync()) {
+                    #pragma unroll 1
+                    for (int j_drain = 2; j_drain < 4; j_drain++) {
+                        int ob_drain = blockIdx.z + j_drain * gridDim.z;
+                        if (ob_drain < K / 128) {
+                            asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W2))), "r"((int)(intermediate_block_mma * 128)), "r"((int)(ob_drain * 128)), "r"((int)(expert_mma)) : "memory");
+                        }
+                    }
                 }
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile("barrier.sync 1, 160;" ::: "memory");

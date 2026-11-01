@@ -1690,10 +1690,11 @@ def _local_record(p: Any, stage: str, path: str) -> tuple[str, tuple[int, int, i
 
 def kcp_local_grid(stage: str, p: Any) -> tuple[int, int, int]:
     """The launch grid of the KCP-owned local record of ``stage`` (:data:`KCP_LOCAL_RECORDS`) from the plan's
-    scalars: the output program is persistent over the (chunk, head) items, ``min(NC_pad * H, sm_count)`` CTAs; the
-    ``dA_qk`` / ``dv1`` program launches one CTA per chunk pair and head, ``(NC_pad / 2, H, 1)``."""
+    scalars: the output program launches one CTA per (chunk, head) item, ``NC_pad * H`` CTAs (the CTAs that start
+    take the items of the CTAs that have not started); the ``dA_qk`` / ``dv1`` program launches one CTA per chunk pair
+    and head, ``(NC_pad / 2, H, 1)``."""
     if stage == "fwd_o":
-        return (max(1, min(int(p.NC_pad) * int(p.H), int(p.sm_count))), 1, 1)
+        return (max(1, int(p.NC_pad) * int(p.H)), 1, 1)
     if stage == "dav":
         return (int(p.NC_pad) // 2, int(p.H), 1)
     raise ValueError(f"no KCP-owned local record for stage {stage!r}")
