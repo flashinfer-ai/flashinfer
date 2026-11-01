@@ -3,8 +3,8 @@
 ``flashinfer.jit.cake_tinygemm2_wgmma`` holds seven tiles, each in the input
 views and cluster sizes the host selects, with and without the bias and with
 and without programmatic dependent launch.  Their contract is the output of
-``csrc/tinygemm2.cu`` bit for bit, so every parity test below uses
-``torch.equal``, not a tolerance.
+``csrc/tinygemm2.cu`` bit for bit, so every parity test below compares the
+raw 16-bit patterns (``+0`` and ``-0`` differ), not values within a tolerance.
 """
 
 import os
@@ -139,10 +139,11 @@ def test_tinygemm2_wgmma_bitwise_parity(
     get_tinygemm2_wgmma_op()(program, input, weight, bias, out)
     torch.cuda.synchronize()
 
-    assert torch.equal(out, out_ref), (
+    bits, bits_ref = out.view(torch.int16), out_ref.view(torch.int16)
+    assert torch.equal(bits, bits_ref), (
         f"{program}: bitwise mismatch vs csrc/tinygemm2.cu at batch={batch_size} "
         f"M={output_features} K={input_features}: "
-        f"{(out != out_ref).sum().item()} differing elements"
+        f"{(bits != bits_ref).sum().item()} differing elements"
     )
     if not wide:
         ref = F.linear(
@@ -289,4 +290,4 @@ def test_tinygemm_bf16_dispatch_matches_reference(
     out = torch.full_like(out_ref, float("nan"))
     tinygemm_bf16(input, weight, out, bias)
     torch.cuda.synchronize()
-    assert torch.equal(out, out_ref)
+    assert torch.equal(out.view(torch.int16), out_ref.view(torch.int16))
