@@ -45,6 +45,30 @@ GDNCPArch = Literal["sm_100a", "sm_103a", "sm_107a"]
 
 # Filled mechanically by the Cake exporter from the complete production builds.
 MODULES: dict[str, dict[str, Any]] = {
+    "cake_gdn_cp_036c38e9a01062ebb4fa": {
+        "sources": [
+            "gdn/gdn_cp/cake_gdn_cp_036c38e9a01062ebb4fa_kernel.cu",
+            "gdn/gdn_cp/cake_gdn_cp_036c38e9a01062ebb4fa_binding.cu",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "local_transfer"],
+            ["buffer", "local_state"],
+            ["buffer", "initial_state"],
+            ["buffer", "initial_state_workspace"],
+            ["buffer", "fixed_state"],
+            ["buffer", "output_state"],
+            ["buffer", "cu_seqlens"],
+            ["parameter", "chunk_len"],
+            ["parameter", "total_cp_chunks"],
+            ["parameter", "num_seqs"],
+            ["parameter", "num_heads"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_107a"],
+    },
     "cake_gdn_cp_0988da242f8528c9fdec": {
         "sources": [
             "gdn/gdn_cp/cake_gdn_cp_0988da242f8528c9fdec_kernel.cu",
@@ -1053,6 +1077,7 @@ KERNELS: dict[str, Any] = {
         "qk_norm": "cake_gdn_cp_58df50f20a8e6a75e788",
         "qk_norm_bf16": "cake_gdn_cp_c2f66f9e7a1e3b12cabd",
         "state_fixup_simt_row4": "cake_gdn_cp_24af0c6f4359b2acf3c1",
+        "state_fixup_simt_row4_mb3": "cake_gdn_cp_036c38e9a01062ebb4fa",
         "state_gather_bf16": "cake_gdn_cp_a3c89471a34205cf5fa6",
         "state_gather_bf16_int64": "cake_gdn_cp_8d18c9a7d634c6df6e7e",
         "state_gather_fp16": "cake_gdn_cp_1284aa3c9e3f34eb5df5",

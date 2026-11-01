@@ -241,7 +241,7 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
         mbarrier_wait(k_full_addr, 0);
         mbarrier_wait(beta_full_addr, 0);
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-        asm volatile("barrier.sync 6, 128;" ::: "memory");
+        asm volatile("barrier.sync 1, 128;" ::: "memory");
         unsigned int gram_a[32];
         unsigned int gram_b[128];
         float gram_acc[32];
@@ -367,7 +367,7 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
         if (lane == 0) {
             mbarrier_arrive(k_empty_addr);
         }
-        asm volatile("barrier.sync 6, 128;" ::: "memory");
+        asm volatile("barrier.sync 1, 128;" ::: "memory");
         int inverse_thread = warp * 32 + lane;
         if (inverse_thread < 64) {
             int diag_block = inverse_thread / 8;
@@ -421,7 +421,7 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
             }
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_inverse_addr + (unsigned int)(diag_col_base / 8 * 1024 + inverse_thread * 16 + diag_col_base % 8 * 2))), "r"(words_0[0]), "r"(words_0[1]), "r"(words_0[2]), "r"(words_0[3]) : "memory");
         }
-        asm volatile("barrier.sync 6, 128;" ::: "memory");
+        asm volatile("barrier.sync 1, 128;" ::: "memory");
         int lane_row_1 = lane & 7;
         unsigned int d_frag[2];
         unsigned int c_frag[1];
@@ -471,7 +471,7 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
         asm volatile("stmatrix.sync.aligned.m8n8.x1.shared.b16 [%0], {%1};\n"
             :: "r"(_stmatrix_addr_3), "r"(*reinterpret_cast<const uint32_t*>(&out_f16[0]))
             : "memory");
-        asm volatile("barrier.sync 6, 128;" ::: "memory");
+        asm volatile("barrier.sync 1, 128;" ::: "memory");
         if (inverse_thread < 64) {
             int lane_row_0 = lane % 16;
             unsigned int d_frag_1[4];
@@ -534,7 +534,7 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
                     : "memory");
             }
         }
-        asm volatile("barrier.sync 6, 128;" ::: "memory");
+        asm volatile("barrier.sync 1, 128;" ::: "memory");
         int inv64_x = warp / 2;
         int inv64_y = warp & 1;
         int inv64_lane_row = lane % 16;
@@ -611,7 +611,7 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
             __half2 _h2 = __float22half2_rn(make_float2(inv64_out1_acc[_lp*2 + 0], inv64_out1_acc[_lp*2+1 + 0]));
             inv64_out1_f16[_lp] = *(uint32_t*)&_h2;
         }
-        asm volatile("barrier.sync 6, 128;" ::: "memory");
+        asm volatile("barrier.sync 1, 128;" ::: "memory");
         if (inv64_x == 0) {
             int lane_row_0_1 = lane % 16;
             int lane_col_1 = lane / 16 * 8;
@@ -626,7 +626,7 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
                 :: "r"(_stmatrix_addr_8), "r"(*reinterpret_cast<const uint32_t*>(&inv64_out1_f16[0])), "r"(*reinterpret_cast<const uint32_t*>(&inv64_out1_f16[1])), "r"(*reinterpret_cast<const uint32_t*>(&inv64_out1_f16[2])), "r"(*reinterpret_cast<const uint32_t*>(&inv64_out1_f16[3]))
                 : "memory");
         }
-        asm volatile("barrier.sync 6, 128;" ::: "memory");
+        asm volatile("barrier.sync 1, 128;" ::: "memory");
         if (inv64_x == 1) {
             unsigned int inv64_red0[4];
             unsigned int inv64_red1[4];
@@ -715,7 +715,7 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
                 :: "r"(_stmatrix_addr_14), "r"(*reinterpret_cast<const uint32_t*>(&inv64_out1_f16[0])), "r"(*reinterpret_cast<const uint32_t*>(&inv64_out1_f16[1])), "r"(*reinterpret_cast<const uint32_t*>(&inv64_out1_f16[2])), "r"(*reinterpret_cast<const uint32_t*>(&inv64_out1_f16[3]))
                 : "memory");
         }
-        asm volatile("barrier.sync 6, 128;" ::: "memory");
+        asm volatile("barrier.sync 1, 128;" ::: "memory");
         unsigned int final_words[4];
         float final_values[8];
         int final_row_base = warp * 16;
