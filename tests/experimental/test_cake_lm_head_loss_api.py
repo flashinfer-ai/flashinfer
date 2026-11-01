@@ -35,6 +35,7 @@ import warnings
 
 import pytest
 import torch
+import torch.utils.checkpoint
 
 import flashinfer.chunked_lm_head as public
 from flashinfer.api_logging import ExperimentalWarning
@@ -635,3 +636,77 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
     for name, res in (("off", off), ("on", on), ("unfused", unfused), ("fused", fused)):
         for key in ("loss", "logp", "dX", "dW"):
             assert torch.equal(_bits(res[key]), _bits(base[key])), (name, key)
+
+
+def test_device_public_entry_places_the_gradients(monkeypatch):
+    """Through the public entry on the generated program, gradient placement ``"auto"`` (the backend default): a call
+    under ``torch.no_grad`` launches no dX / dW GEMM and gives the plain call's ``loss`` / ``logp`` bits; a
+    non-reentrant checkpointed step launches the plain step's dX / dW GEMMs once and gives its ``loss`` / ``logp`` /
+    ``dX`` / ``dW`` bits."""
+    _require_program()
+    _clear(monkeypatch)
+    inp = make_inputs(8700, seed=SEED + 8700, device=CUDA, ignore_frac=0.05)
+    launched: list = []
+    real_run_keys = cake_backend._run_keys
+
+    def spy_run_keys(plan, device_index, keys, run_key, *args, **kwargs):
+        def run(key):
+            launched.append(key[0])
+            return run_key(key)
+
+        return real_run_keys(plan, device_index, keys, run, *args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "_run_keys", spy_run_keys)
+    assert cake_backend.gradient_placement() == "auto"
+
+    def gradient_gemms():
+        return sum(1 for s in launched if str(s).startswith(("gemm_dx", "gemm_dw")))
+
+    def step(kind):
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        logps = []
+
+        def head(a, b):
+            loss, logp = chunked_lm_head_det_loss(
+                a,
+                b,
+                inp.labels,
+                objective="ce",
+                loss_div=inp.loss_div,
+                chunk_size=4096,
+                return_logp=True,
+            )
+            logps.append(logp)
+            return loss
+
+        launched.clear()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            if kind == "no_grad":
+                with torch.no_grad():
+                    loss = head(X, W)
+                torch.cuda.synchronize()
+                return dict(loss=loss, logp=logps[0]), gradient_gemms()
+            if kind == "plain":
+                loss = head(X, W)
+            else:
+                loss = torch.utils.checkpoint.checkpoint(
+                    head, X, W, use_reentrant=False
+                )
+            loss.backward()
+        torch.cuda.synchronize()
+        out = dict(loss=loss.detach(), logp=logps[0], dX=X.grad, dW=W.grad)
+        return out, gradient_gemms()
+
+    step("plain")  # binds
+    plain, count = step("plain")
+    assert count >= 5, launched
+    nograd, none = step("no_grad")
+    assert none == 0, launched
+    ckpt, once = step("nonreentrant")
+    assert once == count
+    for key in ("loss", "logp"):
+        assert torch.equal(_bits(nograd[key]), _bits(plain[key])), key
+    for key in ("loss", "logp", "dX", "dW"):
+        assert torch.equal(_bits(ckpt[key]), _bits(plain[key])), key

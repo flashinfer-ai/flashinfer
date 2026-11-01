@@ -4241,6 +4241,62 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
         check_num_valid_rows,
     ):
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
+        # gradient placement "auto" inside a non-reentrant torch.utils.checkpoint (as in :mod:`.cake_backend`): the
+        # checkpointed forward computes the loss only and saves the inputs; the recomputation runs this forward and
+        # hands its result to the checkpointed call's backward.  Outside one (the plain step): the fused forward
+        ckpt = None
+        if (need_dx or need_dw) and _main._TOP_SAVED_HOOKS(False) is not None:
+            ChunkedLmHeadDetLossFunction._setup(
+                ctx, X, grad_weight_dtype, backend, memory_mode
+            )
+            ckpt = _main._checkpoint_pass()
+        if ckpt is not None:
+            options = dict(
+                objective=objective,
+                loss_div=loss_div,
+                chunk_size=chunk_size,
+                grad_weight_dtype=grad_weight_dtype,
+                deterministic=deterministic,
+                backend=backend,
+                compact_rows=compact_rows,
+                fuse_dw_cast=fuse_dw_cast,
+                dx_finalize=dx_finalize,
+                dw_stream=dw_stream,
+                hidden_count=hidden_count,
+                gemm_tuning=gemm_tuning,
+                memory_mode=memory_mode,
+                num_valid_rows=num_valid_rows,
+                check_num_valid_rows=check_num_valid_rows,
+            )
+            split, handed = _main._loss_checkpoint_split(
+                ctx,
+                ckpt,
+                X,
+                W,
+                labels,
+                infer_logp,
+                loss_weights,
+                need_dx,
+                need_dw,
+                options,
+            )
+            if split:
+                ctx.save_for_backward(X, W, labels, infer_logp, loss_weights)
+                first = ckpt.first
+                result = forward_loss(
+                    X,
+                    W,
+                    labels,
+                    infer_logp=infer_logp,
+                    loss_weights=loss_weights,
+                    need_dx=need_dx and not first,
+                    need_dw=need_dw and not first,
+                    **options,
+                )
+                if not first:
+                    _main._hand_over(ctx, ckpt, handed, result)
+                ctx.mark_non_differentiable(result.logp)
+                return result.loss, result.logp
         result = forward_loss(
             X,
             W,
@@ -4265,18 +4321,15 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
             num_valid_rows=num_valid_rows,
             check_num_valid_rows=check_num_valid_rows,
         )
-        ctx.set_materialize_grads(False)
-        ctx.dx_acc, ctx.dw_acc = (
-            result.dx_acc,
-            result.dw_acc,
-        )  # saved state, never mutated
+        ChunkedLmHeadDetLossFunction._setup(
+            ctx, X, grad_weight_dtype, backend, memory_mode
+        )
         # the deferred weight gradient's operands: the last chunk's dz rows and its X rows, the latter a view of the
         # input X (or X itself with the chunk's row index when compacted) -- saved through the autograd context so an
         # in-place write to X between the forward and the backward raises PyTorch's saved-tensor version error
         # instead of yielding a stale dW.  ``memory_mode="budget"``: the picked form (``None`` = the fast form); a
         # recompute form also saves X and W likewise and keeps the row state and plan its recompute reads
-        ctx.memory_plan = mplan = result.memory_plan
-        if mplan is None or not mplan.recompute:
+        if result.memory_plan is None or not result.memory_plan.recompute:
             ctx.save_for_backward(
                 result.dz_last, result.x_last, result.x_src, result.x_idx
             )
@@ -4284,26 +4337,43 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
             ctx.save_for_backward(
                 result.dz_last, result.x_last, result.x_src, result.x_idx, X, W
             )
+        ChunkedLmHeadDetLossFunction._keep(ctx, result)
+        ctx.mark_non_differentiable(result.logp)
+        return result.loss, result.logp
+
+    @staticmethod
+    def _setup(ctx, X, grad_weight_dtype, backend, memory_mode) -> None:
+        """The call's own backward state (every forward form)."""
+        ctx.set_materialize_grads(False)
+        ctx.num_rows = int(X.shape[0])
+        ctx.grad_weight_dtype = grad_weight_dtype
+        ctx.backend = backend
+        ctx.released = False
+        # the early release of the saved state: budget mode only (its peak model assumes it)
+        ctx.early_release = _resolve_memory_mode(memory_mode) == "budget"
+        ctx.split = None
+
+    @staticmethod
+    def _keep(ctx, result) -> None:
+        """The gradient state the backward reads, from a fused forward's result."""
+        ctx.dx_acc, ctx.dw_acc = (
+            result.dx_acc,
+            result.dw_acc,
+        )  # saved state, never mutated
+        ctx.memory_plan = mplan = result.memory_plan
+        if mplan is not None and mplan.recompute:
             ctx.row_state, ctx.plan = result.row_state, result.plan
-        ctx.row_index, ctx.num_rows = (
-            result.row_index,
-            int(X.shape[0]),
+        ctx.row_index = (
+            result.row_index
         )  # compacted: dx_acc holds the rows of row_index
         ctx.row_valid = (
             result.row_valid
         )  # the fused dX finalize's valid-row mask (None otherwise)
-        ctx.grad_weight_dtype = grad_weight_dtype
-        ctx.backend = backend
         # the forward's resolved GEMM knobs: the deferred weight-gradient GEMM takes them
         ctx.gemm_tuning = result.gemm_tuning
-        ctx.released = False
-        # the early release of the saved state: budget mode only (its peak model assumes it)
-        ctx.early_release = _resolve_memory_mode(memory_mode) == "budget"
-        ctx.empty = X.shape[0] == 0 or (
+        ctx.empty = ctx.num_rows == 0 or (
             result.row_index is not None and result.row_index.numel() == 0
         )
-        ctx.mark_non_differentiable(result.logp)
-        return result.loss, result.logp
 
     @staticmethod
     def _release(ctx) -> None:
@@ -4320,6 +4390,18 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
         if ctx.released:
             raise RuntimeError(_SECOND_BACKWARD)
         keep = not ctx.early_release or _keep_graph()
+        saved = None
+        if ctx.split is not None:
+            # a checkpointed call: unpacking its inputs runs the recomputation, whose fused forward's result (or this
+            # backward's own fused forward) is the gradient state
+            inputs = ctx.saved_tensors
+            state = _main._split_state(ctx, inputs, forward_loss)
+            ChunkedLmHeadDetLossFunction._keep(ctx, state)
+            saved = (state.dz_last, state.x_last, state.x_src, state.x_idx) + (
+                tuple(inputs[:2])
+                if state.memory_plan is not None and state.memory_plan.recompute
+                else ()
+            )
         if ctx.empty:  # T == 0 or every row ignored: zero gradients without binding or launching a program
             dx = (
                 None
@@ -4343,11 +4425,13 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
                 ChunkedLmHeadDetLossFunction._release(ctx)
             return (dx, dw) + none[2:]
         mplan = ctx.memory_plan
+        if saved is None:
+            saved = ctx.saved_tensors
         if mplan is not None and mplan.recompute:
-            dz_last, x_last, x_src, x_idx, X, W = ctx.saved_tensors
+            dz_last, x_last, x_src, x_idx, X, W = saved
         else:
             mplan = None  # the fast form, or a budget form without a recompute: the weight gradient as before
-            dz_last, x_last, x_src, x_idx = ctx.saved_tensors
+            dz_last, x_last, x_src, x_idx = saved
         # the operations of :func:`backward_loss`, with the saved state released as soon as it is used
         dx = None
         if ctx.dx_acc is not None:
@@ -4777,7 +4861,9 @@ def chunked_lm_head_det_loss(
 
     With neither keyword (``memory_mode`` ``None`` or ``"fast"`` and
     ``num_valid_rows`` ``None``) the call is :mod:`.cake_backend`'s
-    ``chunked_lm_head_det_loss``.  With ``memory_mode="budget"`` a backward that
+    ``chunked_lm_head_det_loss``.  Its gradient placement
+    (:func:`.cake_backend.set_gradient_placement`) applies here too.  With
+    ``memory_mode="budget"`` a backward that
     frees the graph releases the forward's saved accumulators as soon as it
     has used them; a second backward through the same graph then raises
     (``retain_graph=True`` keeps them: the backward stays repeatable).
@@ -4815,6 +4901,44 @@ def chunked_lm_head_det_loss(
             "every gradient to its leaf's dtype, so this entry cannot return it; use forward_loss(..., need_dw=True) + "
             "backward_loss(dx_acc, dw_acc, g, grad_weight_dtype=torch.float32, row_index=..., num_rows=...) for an FP32 dW"
         )
+    if (
+        not (
+            torch.is_grad_enabled()
+            and (
+                X.requires_grad
+                or W.requires_grad
+                or (infer_logp is not None and infer_logp.requires_grad)
+                or (loss_weights is not None and loss_weights.requires_grad)
+            )
+        )
+        and _main.gradient_placement() == "auto"
+    ):
+        # no autograd graph follows (as in :mod:`.cake_backend`): the loss (and logp) only, no gradient GEMM
+        result = forward_loss(
+            X,
+            W,
+            labels,
+            objective=objective,
+            loss_div=loss_div,
+            infer_logp=infer_logp,
+            loss_weights=loss_weights,
+            chunk_size=int(chunk_size),
+            need_dx=False,
+            need_dw=False,
+            grad_weight_dtype=grad_weight_dtype,
+            deterministic=deterministic,
+            backend=backend,
+            compact_rows=compact_rows,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=dx_finalize,
+            dw_stream=dw_stream,
+            hidden_count=hidden_count,
+            gemm_tuning=gemm_tuning,
+            memory_mode=memory_mode,
+            num_valid_rows=num_valid_rows,
+            check_num_valid_rows=check_num_valid_rows,
+        )
+        return (result.loss, result.logp) if return_logp else result.loss
     loss, logp = ChunkedLmHeadDetLossFunction.apply(
         X,
         W,
