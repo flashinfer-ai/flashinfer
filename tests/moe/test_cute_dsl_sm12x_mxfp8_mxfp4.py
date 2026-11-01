@@ -216,3 +216,44 @@ def test_cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4_smoke():
         a, a_sf, b, b_sf, offsets, tok, torch.rand(rows, device="cuda"), rows
     )
     assert out.shape == (rows, 512) and not torch.isnan(out.float()).any()
+
+
+@pytest.mark.parametrize("k", [512, 1024])
+@pytest.mark.parametrize("tile_m", [64, 128])
+def test_fc2_finalize_ignores_bytes_outside_logical_scale_tensor(k: int, tile_m: int):
+    """Padded TMA rows must not read poisoned bytes outside the scale operand."""
+    skip_if_not_sm120()
+    from flashinfer.fused_moe import cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4
+
+    a, a_sf, b, b_sf, offsets, gemm_ref = make_inputs([64] * 4, 512, k)
+    assert a_sf.dtype == torch.uint8 and a_sf.is_contiguous()
+    # Preserve the logical tensor's values, shape, strides, and alignment.
+    # Extra backing storage makes an overstated descriptor read NaN scales
+    # deterministically, without depending on a neighboring allocation.
+    backing = torch.full(
+        (4 * a_sf.numel() + 512,), 0xFF, dtype=torch.uint8, device=a_sf.device
+    )
+    logical_scales = backing[: a_sf.numel()].view(a_sf.shape)
+    logical_scales.copy_(a_sf)
+    assert logical_scales.stride() == a_sf.stride()
+    assert logical_scales.data_ptr() % 16 == 0
+    rows = a.shape[0]
+    tokens = torch.arange(rows, device=a.device, dtype=torch.int32)
+    route_weights = torch.rand(rows, device=a.device)
+    actual = cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4(
+        a,
+        logical_scales,
+        b,
+        b_sf,
+        offsets,
+        tokens,
+        route_weights,
+        rows,
+        tile=(tile_m, 128, 128),
+        tune=False,
+    )
+    torch.cuda.synchronize()
+    expected = (gemm_ref.float() * route_weights[:, None]).to(actual.dtype)
+    assert torch.isfinite(actual).all()
+    diff = calc_diff(actual.float(), expected.float())
+    assert diff < 5e-3, f"calc_diff={diff:.6e}"
