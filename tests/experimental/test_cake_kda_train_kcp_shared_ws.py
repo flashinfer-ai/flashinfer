@@ -1430,10 +1430,19 @@ def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) ->
     return report
 
 
+def _bound_rank_threads(W: int) -> None:
+    """Give a spawned rank its share of the host's CPUs: each of the ``W`` ranks would
+    otherwise start as many threads as the host has, and rank 0's FP64 reference then
+    ran past the process group's ten-minute collective timeout while the other ranks
+    waited (813 s on a four-rank row that takes 22 s with the share)."""
+    torch.set_num_threads(max(1, len(os.sched_getaffinity(0)) // W))
+
+
 def _spawn_dist_entry(
     rank: int, W: int, row, port: int, result_dir: str, kind: str = "shared"
 ) -> None:
     try:
+        _bound_rank_threads(W)
         report = RANK_RUNNERS[kind](rank, W, row, port, result_dir)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
