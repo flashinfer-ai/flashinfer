@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import contextlib
+import gc
 import inspect
 import math
 import os
@@ -29,6 +30,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.utils.checkpoint
 
 from tests.test_helpers.cake_lm_head_loss_reference import (
     DEFAULT_H,
@@ -8919,3 +8921,614 @@ def test_device_preload(glm_weight):
     ) and index in cake_backend._thread_state("cells")
     assert cake_backend._thread_state("arange")[index].numel() >= opt_in.PRELOAD_ROWS
     _assert_same_bits(before, _run(inp, 4096, backend="cake"))
+
+
+# ---------------------------------------------------------------------------
+# Gradient placement (``set_gradient_placement``): no gradient GEMM without an autograd graph, and the gradient GEMMs
+# once per checkpointed step (the non-reentrant checkpoint's recomputation forms them, not the checkpointed forward)
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _placement(mode: str):
+    previous = cake_backend.set_gradient_placement(mode)
+    try:
+        yield
+    finally:
+        cake_backend.set_gradient_placement(previous)
+
+
+@contextlib.contextmanager
+def _gradient_forwards():
+    """``(need_dx, need_dw)`` of every ``forward_loss`` call of both backend modules, in order (a call with either
+    flag set runs the gradient GEMMs)."""
+    seen: list = []
+    originals = (cake_backend.forward_loss, opt_in.forward_loss)
+
+    def recording(original):
+        def forward_loss(*args, **kwargs):
+            seen.append(
+                (bool(kwargs.get("need_dx", True)), bool(kwargs.get("need_dw", True)))
+            )
+            return original(*args, **kwargs)
+
+        return forward_loss
+
+    cake_backend.forward_loss = recording(originals[0])
+    opt_in.forward_loss = recording(originals[1])
+    try:
+        yield seen
+    finally:
+        cake_backend.forward_loss, opt_in.forward_loss = originals
+
+
+def _gradient_count(seen) -> int:
+    return sum(1 for dx, dw in seen if dx or dw)
+
+
+@contextlib.contextmanager
+def _launch_record():
+    """The launch keys both backend modules run (each key as ``_run_keys`` runs it), in order."""
+    launched: list = []
+    originals = (cake_backend._run_keys, opt_in._run_keys)
+
+    def recording(original):
+        def run_keys(plan, device_index, keys, run_key, *args, **kwargs):
+            def run(key):
+                launched.append(key)
+                return run_key(key)
+
+            return original(plan, device_index, keys, run, *args, **kwargs)
+
+        return run_keys
+
+    cake_backend._run_keys = recording(originals[0])
+    opt_in._run_keys = recording(originals[1])
+    try:
+        yield launched
+    finally:
+        cake_backend._run_keys, opt_in._run_keys = originals
+
+
+def _gradient_gemm_keys(launched) -> int:
+    return sum(1 for key in launched if str(key[0]).startswith(("gemm_dx", "gemm_dw")))
+
+
+def _placement_bits(a, b) -> bool:
+    if a is None or b is None:
+        return a is b
+    return a.dtype == b.dtype and a.shape == b.shape and torch.equal(_bits(a), _bits(b))
+
+
+CHECKPOINT_KINDS = (
+    "reentrant",
+    "nonreentrant",
+    "nonreentrant_no_early_stop",
+    "nonreentrant_no_determinism_check",
+    "nested",
+    "offload_outside",
+    "copies_outside",
+    "offload_inside",
+)
+
+
+def _checkpointed(kind, fn, X, W):
+    """``fn(X, W)`` under ``torch.utils.checkpoint`` of the given kind (``plain``: no checkpoint).  ``offload_outside``:
+    the checkpoint inside ``save_on_cpu`` (the checkpoint's hooks on top); ``copies_outside``: likewise inside hooks that
+    save copies (the recomputation's inputs are copies on any device); ``offload_inside``: ``save_on_cpu`` inside the
+    checkpointed function (its hooks on top: the call keeps its fused forward)."""
+    ckpt = torch.utils.checkpoint.checkpoint
+    if kind == "plain":
+        return fn(X, W)
+    if kind == "reentrant":
+        return ckpt(fn, X, W, use_reentrant=True)
+    if kind == "nonreentrant":
+        return ckpt(fn, X, W, use_reentrant=False)
+    if kind == "nonreentrant_no_early_stop":
+        with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+            return ckpt(fn, X, W, use_reentrant=False)
+    if kind == "nonreentrant_no_determinism_check":
+        return ckpt(fn, X, W, use_reentrant=False, determinism_check="none")
+    if kind == "nested":
+        return ckpt(
+            lambda a, b: ckpt(fn, a, b, use_reentrant=False) * 1.0,
+            X,
+            W,
+            use_reentrant=False,
+        )
+    if kind == "offload_outside":
+        with torch.autograd.graph.save_on_cpu():
+            return ckpt(fn, X, W, use_reentrant=False)
+    if kind == "copies_outside":
+        with torch.autograd.graph.saved_tensors_hooks(
+            lambda t: t.detach().clone(), lambda t: t
+        ):
+            return ckpt(fn, X, W, use_reentrant=False)
+    if kind == "offload_inside":
+
+        def offloaded(a, b):
+            with torch.autograd.graph.save_on_cpu():
+                return fn(a, b)
+
+        return ckpt(offloaded, X, W, use_reentrant=False)
+    raise ValueError(kind)
+
+
+def _placement_step(inp, C, kind, *, module=None, memory=None, **switches):
+    """One step of the loss entry (``return_logp=True``) behind a ``tanh`` of ``X`` (an op that saves a tensor ahead of
+    the head) under ``kind``; returns ``loss`` / ``logp`` / ``dX`` / ``dW``.  ``memory`` (a dict, CUDA): filled with
+    the bytes the forward keeps until the backward and the step's peak, both above the bytes allocated before."""
+    be = cake_backend if module is None else module
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    logps = []
+    if memory is not None:
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+
+    def head(a, b):
+        loss, logp = be.chunked_lm_head_det_loss(
+            torch.tanh(a),
+            b,
+            inp.labels,
+            objective=inp.objective,
+            loss_div=inp.loss_div if inp.objective == "ce" else None,
+            infer_logp=inp.infer_logp,
+            loss_weights=inp.loss_weights,
+            chunk_size=C,
+            return_logp=True,
+            **switches,
+        )
+        logps.append(logp)
+        return loss * 1.0
+
+    loss = _checkpointed(kind, head, X, W)
+    if memory is not None:
+        torch.cuda.synchronize()
+        memory["kept"] = torch.cuda.memory_allocated() - base
+    loss.backward()
+    if X.is_cuda:
+        torch.cuda.synchronize()
+    if memory is not None:
+        memory["peak"] = torch.cuda.max_memory_allocated() - base
+    return dict(loss=loss.detach(), logp=logps[0].detach(), dX=X.grad, dW=W.grad)
+
+
+def _assert_step_bits(run, plain, keys=("loss", "logp", "dX", "dW")):
+    for key in keys:
+        assert _placement_bits(run[key], plain[key]), key
+
+
+def test_gradient_placement_switch():
+    """The programmatic gradient placement: default ``"auto"``, the previous value returned, a bad value refused; the
+    opt-in module reads the same setting."""
+    assert cake_backend.GRADIENT_PLACEMENTS == ("auto", "forward")
+    assert cake_backend.gradient_placement() == "auto"
+    assert cake_backend.set_gradient_placement("forward") == "auto"
+    try:
+        assert cake_backend.gradient_placement() == "forward"
+        assert opt_in._main.gradient_placement() == "forward"
+        for bad in ("fused", None, True):
+            with pytest.raises(ValueError, match="gradient placement"):
+                cake_backend.set_gradient_placement(bad)
+        assert cake_backend.gradient_placement() == "forward"
+    finally:
+        assert cake_backend.set_gradient_placement("auto") == "forward"
+
+
+def _forward_kw(kw):
+    """The keywords of an autograd entry call as ``forward_loss`` takes them (no ``return_logp``)."""
+    return {k: v for k, v in kw.items() if k != "return_logp"}
+
+
+@pytest.mark.parametrize("graph", ["no_grad", "inference_mode", "frozen_inputs"])
+@pytest.mark.parametrize("objective", ["ce", "policy"])
+def test_no_graph_runs_no_gradient_forward(objective, graph):
+    """A loss entry call no backward can follow (grad mode off, inference mode, no input requiring a gradient) runs the
+    loss-only forward; ``loss`` / ``logp`` are the fused forward's bits.  ``"forward"`` placement: the fused forward."""
+    inp = _host_inputs(200, objective)
+    kw = dict(
+        objective=objective,
+        loss_div=inp.loss_div if objective == "ce" else None,
+        infer_logp=inp.infer_logp,
+        loss_weights=inp.loss_weights,
+        chunk_size=64,
+        return_logp=True,
+        backend="reference",
+    )
+    X = inp.X.detach().requires_grad_(graph != "frozen_inputs")
+    W = inp.W.detach().requires_grad_(graph != "frozen_inputs")
+    fused = cake_backend.forward_loss(inp.X, inp.W, inp.labels, **_forward_kw(kw))
+
+    def call():
+        if graph == "no_grad":
+            with torch.no_grad():
+                return cake_backend.chunked_lm_head_det_loss(X, W, inp.labels, **kw)
+        if graph == "inference_mode":
+            with torch.inference_mode():
+                return cake_backend.chunked_lm_head_det_loss(X, W, inp.labels, **kw)
+        return cake_backend.chunked_lm_head_det_loss(X, W, inp.labels, **kw)
+
+    with _gradient_forwards() as seen:
+        loss, logp = call()
+    assert seen and _gradient_count(seen) == 0, seen
+    assert _placement_bits(loss, fused.loss) and _placement_bits(logp, fused.logp)
+    assert not loss.requires_grad
+    if graph != "frozen_inputs":
+        with _placement("forward"), _gradient_forwards() as seen:
+            loss2, logp2 = call()
+        assert _gradient_count(seen) == 1, seen
+        assert _placement_bits(loss2, fused.loss) and _placement_bits(logp2, fused.logp)
+
+
+def test_frozen_head_with_a_trainable_policy_operand_keeps_the_autograd_entry():
+    """Frozen ``X`` / ``W`` with an ``infer_logp`` / ``loss_weights`` that requires a gradient: the call keeps the
+    autograd entry (the loss stays in the graph, a backward returns no gradient for them, as before) and forms no
+    gradient."""
+    inp = _host_inputs(200, "policy")
+    for name in ("infer_logp", "loss_weights"):
+        ops = dict(infer_logp=inp.infer_logp, loss_weights=inp.loss_weights)
+        ops[name] = ops[name].detach().clone().requires_grad_(True)
+        with _gradient_forwards() as seen:
+            loss = cake_backend.chunked_lm_head_det_loss(
+                inp.X,
+                inp.W,
+                inp.labels,
+                objective="policy",
+                chunk_size=64,
+                backend="reference",
+                **ops,
+            )
+        assert seen and _gradient_count(seen) == 0, seen
+        assert loss.requires_grad and loss.grad_fn is not None, name
+        loss.backward()
+        assert ops[name].grad is None, name
+
+
+@pytest.mark.parametrize("kind", CHECKPOINT_KINDS)
+@pytest.mark.parametrize("objective", ["ce", "policy"])
+def test_checkpointed_step_forms_the_gradients_once(objective, kind):
+    """A checkpointed step runs one gradient forward, as an uncheckpointed step (the non-reentrant checkpointed forward
+    and the reentrant first pass run the loss only; the recomputation forms the gradients; with offload hooks on top
+    the call keeps its fused forward); ``loss`` / ``logp`` / ``dX`` / ``dW`` are the uncheckpointed step's bits.
+    ``"forward"`` placement: two gradient forwards, the same bits.  No frame record is left behind."""
+    inp = _host_inputs(200, objective)
+    plain = _placement_step(inp, 64, "plain", backend="reference")
+    with _gradient_forwards() as seen:
+        run = _placement_step(inp, 64, kind, backend="reference")
+    assert _gradient_count(seen) == 1, seen
+    _assert_step_bits(run, plain)
+    if kind != "offload_inside":
+        with _placement("forward"), _gradient_forwards() as seen:
+            again = _placement_step(inp, 64, kind, backend="reference")
+        assert _gradient_count(seen) == 2, seen
+        _assert_step_bits(again, plain)
+    gc.collect()
+    assert len(cake_backend._CHECKPOINT_CALLS) == 0
+
+
+def test_checkpointed_step_under_torch_deterministic_algorithms():
+    """Under torch's deterministic algorithms (this package launches no nondeterministic operation, so nothing alerts)
+    a non-reentrant checkpointed step still forms the gradients once, with the uncheckpointed step's bits, and a call
+    under ``torch.no_grad`` runs the loss-only forward."""
+    inp = make_inputs(
+        37, objective="ce", seed=SEED + 37, H=H_HOST, V=V_HOST, device="cpu"
+    )
+    plain = _placement_step(inp, 16, "plain", backend="reference")
+    was, warn_only = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    torch.use_deterministic_algorithms(True)
+    try:
+        with warnings.catch_warnings(), _gradient_forwards() as seen:
+            warnings.simplefilter("error")
+            run = _placement_step(inp, 16, "nonreentrant", backend="reference")
+            with torch.no_grad():
+                cake_backend.chunked_lm_head_det_loss(
+                    inp.X.detach().requires_grad_(True),
+                    inp.W,
+                    inp.labels,
+                    loss_div=inp.loss_div,
+                    chunk_size=16,
+                    backend="reference",
+                )
+    finally:
+        torch.use_deterministic_algorithms(was, warn_only=warn_only)
+    assert _gradient_count(seen) == 1 and len(seen) == 3, seen
+    _assert_step_bits(run, plain)
+
+
+def test_checkpointed_retained_graph_forms_the_gradients_per_backward():
+    """Two backward passes through one retained checkpointed graph: each recomputes and forms the gradients once,
+    each pair of gradients is the uncheckpointed step's bits."""
+    inp = _host_inputs(200, "policy")
+    plain = _placement_step(inp, 64, "plain", backend="reference")
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+
+    def head(a, b):
+        return cake_backend.chunked_lm_head_det_loss(
+            torch.tanh(a),
+            b,
+            inp.labels,
+            objective="policy",
+            infer_logp=inp.infer_logp,
+            loss_weights=inp.loss_weights,
+            chunk_size=64,
+            backend="reference",
+        )
+
+    with _gradient_forwards() as seen:
+        loss = torch.utils.checkpoint.checkpoint(head, X, W, use_reentrant=False)
+        first = torch.autograd.grad(loss, (X, W), retain_graph=True)
+        second = torch.autograd.grad(loss, (X, W))
+    assert _gradient_count(seen) == 2, seen
+    for grads in (first, second):
+        assert _placement_bits(grads[0], plain["dX"])
+        assert _placement_bits(grads[1], plain["dW"])
+
+
+def test_checkpointed_call_without_a_handed_result_forms_its_gradients_in_the_backward():
+    """When the recomputation cannot hand its result to the checkpointed call (its frame record dropped), the
+    checkpointed call's backward runs the fused forward itself: the same bits."""
+    inp = _host_inputs(200, "ce")
+    plain = _placement_step(inp, 64, "plain", backend="reference")
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+
+    def head(a, b):
+        return cake_backend.chunked_lm_head_det_loss(
+            torch.tanh(a),
+            b,
+            inp.labels,
+            loss_div=inp.loss_div,
+            chunk_size=64,
+            backend="reference",
+        )
+
+    loss = torch.utils.checkpoint.checkpoint(head, X, W, use_reentrant=False)
+    assert len(cake_backend._CHECKPOINT_CALLS) == 1
+    cake_backend._CHECKPOINT_CALLS.clear()
+    with _gradient_forwards() as seen:
+        loss.backward()
+    # the recomputation's fused forward and the backward's own
+    assert _gradient_count(seen) == 2, seen
+    assert _placement_bits(X.grad, plain["dX"]) and _placement_bits(W.grad, plain["dW"])
+
+
+def test_checkpointed_steps_on_concurrent_threads():
+    """Non-reentrant checkpointed steps on two threads at once: each forms the gradients once, with the uncheckpointed
+    step's bits, and no frame record is left behind."""
+    inps = [_host_inputs(200, "ce"), _host_inputs(201, "policy")]
+    plains = [_placement_step(inp, 64, "plain", backend="reference") for inp in inps]
+    barrier = threading.Barrier(2)
+    runs: list = [None, None]
+    errors: list = []
+
+    def work(i):
+        try:
+            barrier.wait()
+            for _ in range(3):
+                runs[i] = _placement_step(
+                    inps[i], 64, "nonreentrant", backend="reference"
+                )
+        except BaseException as exc:  # noqa: BLE001 -- reported below
+            errors.append(exc)
+
+    with _gradient_forwards() as seen:
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    assert not errors, errors
+    assert _gradient_count(seen) == 6, seen
+    for run, plain in zip(runs, plains, strict=True):
+        _assert_step_bits(run, plain)
+    gc.collect()
+    assert len(cake_backend._CHECKPOINT_CALLS) == 0
+
+
+@pytest.mark.parametrize("kind", ["no_grad", "nonreentrant", "reentrant"])
+def test_opt_in_count_form_places_the_gradients_alike(kind):
+    """The opt-in count form (``num_valid_rows``) follows the gradient placement: no gradient forward without a graph,
+    one per checkpointed step, the uncheckpointed step's bits."""
+    inp = _host_inputs(200, "policy")
+    count = int((inp.labels >= 0).sum())
+    plain = _placement_step(
+        inp, 64, "plain", module=opt_in, backend="reference", num_valid_rows=count
+    )
+    if kind == "no_grad":
+        with torch.no_grad(), _gradient_forwards() as seen:
+            # the plain step's head input (``tanh`` of X), trainable
+            loss, logp = opt_in.chunked_lm_head_det_loss(
+                torch.tanh(inp.X).detach().requires_grad_(True),
+                inp.W.detach().requires_grad_(True),
+                inp.labels,
+                objective="policy",
+                infer_logp=inp.infer_logp,
+                loss_weights=inp.loss_weights,
+                chunk_size=64,
+                return_logp=True,
+                backend="reference",
+                num_valid_rows=count,
+            )
+        assert seen and _gradient_count(seen) == 0, seen
+        _assert_step_bits(dict(loss=loss, logp=logp), plain, ("loss", "logp"))
+        return
+    with _gradient_forwards() as seen:
+        run = _placement_step(
+            inp, 64, kind, module=opt_in, backend="reference", num_valid_rows=count
+        )
+    assert _gradient_count(seen) == 1, seen
+    _assert_step_bits(run, plain)
+
+
+@pytest.mark.parametrize("graph", ["no_grad", "inference_mode"])
+@pytest.mark.parametrize("objective", ["ce", "policy"])
+def test_device_no_graph_launches_no_gradient_gemm(glm_weight, objective, graph):
+    """A three-chunk loss entry call under ``torch.no_grad`` / ``torch.inference_mode`` launches no dX / dW GEMM (launch
+    record); ``loss`` / ``logp`` are the fused forward's bits."""
+    _require_program(entry="loss")
+    inp = _device_inputs(12289, objective, W=glm_weight)
+    kw = dict(
+        objective=objective,
+        loss_div=inp.loss_div if objective == "ce" else None,
+        infer_logp=inp.infer_logp,
+        loss_weights=inp.loss_weights,
+        chunk_size=4096,
+    )
+    fused = cake_backend.forward_loss(inp.X, inp.W, inp.labels, **kw)
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    mode = torch.no_grad() if graph == "no_grad" else torch.inference_mode()
+    with mode, _launch_record() as launched:
+        loss, logp = cake_backend.chunked_lm_head_det_loss(
+            X, W, inp.labels, return_logp=True, **kw
+        )
+    torch.cuda.synchronize()
+    assert _gradient_gemm_keys(launched) == 0, sorted({k[0] for k in launched})
+    assert any(k[0] == "row_finalize" for k in launched)
+    assert _placement_bits(loss, fused.loss) and _placement_bits(logp, fused.logp)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "reentrant",
+        "nonreentrant",
+        "nonreentrant_no_early_stop",
+        "nonreentrant_no_determinism_check",
+        "nested",
+        "offload_outside",
+        "copies_outside",
+        "offload_inside",
+    ],
+)
+@pytest.mark.parametrize("objective", ["ce", "policy"])
+def test_device_checkpointed_step_launches_the_gradient_gemms_once(
+    glm_weight, objective, kind
+):
+    """A checkpointed three-chunk step launches as many dX / dW GEMMs as the uncheckpointed step (launch record);
+    ``loss`` / ``logp`` / ``dX`` / ``dW`` are the uncheckpointed step's bits and the ``"forward"`` placement's (which
+    launches them twice -- the reentrant first pass: its dW GEMMs only -- and once with the offload hooks innermost)."""
+    _require_program(entry="loss")
+    inp = _device_inputs(12289, objective, W=glm_weight)
+    _placement_step(inp, 4096, "plain")  # binds
+    with _launch_record() as launched:
+        plain = _placement_step(inp, 4096, "plain")
+    count = _gradient_gemm_keys(launched)
+    assert count >= 5, sorted({k[0] for k in launched})
+    with _launch_record() as launched:
+        run = _placement_step(inp, 4096, kind)
+    assert _gradient_gemm_keys(launched) == count
+    _assert_step_bits(run, plain)
+    with _placement("forward"), _launch_record() as launched:
+        again = _placement_step(inp, 4096, kind)
+    forward = _gradient_gemm_keys(launched)
+    if kind == "offload_inside":  # nothing is recomputed: one fused forward
+        assert forward == count
+    elif kind == "reentrant":
+        # the first pass runs under no_grad, where the head's input (tanh of X) is no leaf of the graph: dW only
+        assert count < forward < 2 * count, (forward, count)
+    else:
+        assert forward == 2 * count, (forward, count)
+    _assert_step_bits(again, plain)
+
+
+@pytest.mark.parametrize("objective", ["ce", "policy"])
+def test_device_checkpointed_step_memory(glm_weight, objective):
+    """A non-reentrant checkpointed three-chunk step gives the uncheckpointed step's bits under both placements; with
+    ``"auto"`` it keeps at least the FP32 ``dX`` accumulator fewer bytes from the forward to the backward than with
+    ``"forward"`` (which keeps the FP32 gradient accumulators) and peaks no higher."""
+    _require_program(entry="loss")
+    inp = _device_inputs(12289, objective, W=glm_weight)
+    plain = _placement_step(inp, 4096, "plain")
+    mem = {}
+    for mode in ("forward", "auto"):
+        with _placement(mode):
+            _placement_step(inp, 4096, "nonreentrant")  # binds
+            mem[mode] = {}
+            run = _placement_step(inp, 4096, "nonreentrant", memory=mem[mode])
+        _assert_step_bits(run, plain)
+    print(
+        f"\ncheckpoint T=12289 {objective}: kept/peak forward {mem['forward']} auto {mem['auto']}"
+    )
+    # the FP32 dX accumulator alone
+    acc = int((inp.labels >= 0).sum()) * inp.X.shape[1] * 4
+    assert mem["auto"]["kept"] + acc <= mem["forward"]["kept"], mem
+    assert mem["auto"]["peak"] <= mem["forward"]["peak"], mem
+
+
+def test_device_checkpointed_logprob_step_launches_the_gradient_gemms_once(glm_weight):
+    """The log-probability entry forms no gradient in its forward: a checkpointed step launches the uncheckpointed
+    step's dX / dW GEMMs and gives its bits."""
+    _require_program(entry="logprob")
+    inp = _device_inputs(12289, "ce", W=glm_weight)
+
+    def step(kind):
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+
+        def head(a, b):
+            logp = cake_backend.chunked_lm_head_det_logprob(
+                a, b, inp.labels, chunk_size=4096
+            )
+            return (logp * inp.dlogp).sum()
+
+        _checkpointed(kind, head, X, W).backward()
+        torch.cuda.synchronize()
+        return X.grad, W.grad
+
+    step("plain")
+    with _launch_record() as launched:
+        plain = step("plain")
+    count = _gradient_gemm_keys(launched)
+    assert count >= 5, sorted({k[0] for k in launched})
+    for kind in ("reentrant", "nonreentrant"):
+        with _launch_record() as launched:
+            run = step(kind)
+        assert _gradient_gemm_keys(launched) == count, kind
+        assert _placement_bits(run[0], plain[0]), kind
+        assert _placement_bits(run[1], plain[1]), kind
+
+
+@pytest.mark.parametrize("memory_mode", ["budget", None])
+def test_device_opt_in_forms_place_the_gradients_alike(glm_weight, memory_mode):
+    """The opt-in forms (``memory_mode="budget"`` / ``num_valid_rows``) follow the gradient placement on the device:
+    no dX / dW GEMM under ``torch.no_grad``; a non-reentrant checkpointed step launches the uncheckpointed step's
+    count; the same bits."""
+    _require_program(entry="loss")
+    inp = _device_inputs(12289, "policy", W=glm_weight)
+    sw = {}
+    if memory_mode is None:
+        sw["num_valid_rows"] = int((inp.labels >= 0).sum())
+    else:
+        sw["memory_mode"] = memory_mode
+    _placement_step(inp, 4096, "plain", module=opt_in, **sw)
+    with _launch_record() as launched:
+        plain = _placement_step(inp, 4096, "plain", module=opt_in, **sw)
+    count = _gradient_gemm_keys(launched)
+    with _launch_record() as launched:
+        run = _placement_step(inp, 4096, "nonreentrant", module=opt_in, **sw)
+    assert _gradient_gemm_keys(launched) == count
+    _assert_step_bits(run, plain)
+    with torch.no_grad(), _launch_record() as launched:
+        # the plain step's head input (``tanh`` of X)
+        loss, logp = opt_in.chunked_lm_head_det_loss(
+            torch.tanh(inp.X),
+            inp.W,
+            inp.labels,
+            objective="policy",
+            infer_logp=inp.infer_logp,
+            loss_weights=inp.loss_weights,
+            chunk_size=4096,
+            return_logp=True,
+            **sw,
+        )
+    torch.cuda.synchronize()
+    assert _gradient_gemm_keys(launched) == 0
+    _assert_step_bits(dict(loss=loss, logp=logp), plain, ("loss", "logp"))

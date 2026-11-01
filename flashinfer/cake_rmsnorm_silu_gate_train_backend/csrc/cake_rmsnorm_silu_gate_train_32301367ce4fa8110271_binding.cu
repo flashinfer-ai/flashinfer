@@ -26,7 +26,7 @@ struct CakeFastDivmod { int32_t divisor; uint32_t multiplier; uint32_t shift_rig
 static_assert(sizeof(CakeFastDivmod) == 12, "CakeFastDivmod CUDA ABI must be 12 bytes");
 static_assert(alignof(CakeFastDivmod) == 4, "CakeFastDivmod CUDA ABI must be 4-byte aligned");
 
-extern "C" __global__ void kernel_cake_rmsnorm_silu_gate_train_32301367ce4fa8110271(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ dx, __nv_bfloat16* __restrict__ dz, double* __restrict__ dw_sums, unsigned int* __restrict__ dw_done, float* __restrict__ dw, int rows, CakeFastDivmod heads, long long dy_tok, long long dy_head, long long x_tok, long long x_head, long long z_tok, long long z_head, float eps, int blocks_per_cta, int accumulate, int weight_grad);
+extern "C" __global__ void kernel_cake_rmsnorm_silu_gate_train_32301367ce4fa8110271(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ dx, __nv_bfloat16* __restrict__ dz, double* __restrict__ dw_sums, unsigned int* __restrict__ dw_done, float* __restrict__ dw, int rows, CakeFastDivmod heads, long long dy_tok, long long dy_head, long long x_tok, long long x_head, long long z_tok, long long z_head, float eps, int accumulate, int weight_grad);
 
 namespace cake_binding_kernel_cake_rmsnorm_silu_gate_train_32301367ce4fa8110271 {
 
@@ -61,7 +61,7 @@ CakeFastDivmod MakeFastDivmod(int32_t divisor) {
   return CakeFastDivmod{divisor, multiplier, log2_ceil - 1u};
 }
 
-void Run(TensorView a_dy, TensorView a_x, TensorView a_z, TensorView a_w, TensorView a_dx, TensorView a_dz, TensorView a_dw_sums, TensorView a_dw_done, TensorView a_dw, int64_t a_rows, int64_t a_heads, int64_t a_dy_tok, int64_t a_dy_head, int64_t a_x_tok, int64_t a_x_head, int64_t a_z_tok, int64_t a_z_head, double a_eps, int64_t a_blocks_per_cta, int64_t a_accumulate, int64_t a_weight_grad, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_dy, TensorView a_x, TensorView a_z, TensorView a_w, TensorView a_dx, TensorView a_dz, TensorView a_dw_sums, TensorView a_dw_done, TensorView a_dw, int64_t a_rows, int64_t a_heads, int64_t a_dy_tok, int64_t a_dy_head, int64_t a_x_tok, int64_t a_x_head, int64_t a_z_tok, int64_t a_z_head, double a_eps, int64_t a_accumulate, int64_t a_weight_grad, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_dy.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_dy, "dy");
@@ -88,9 +88,6 @@ void Run(TensorView a_dy, TensorView a_x, TensorView a_z, TensorView a_w, Tensor
   TVM_FFI_CHECK(a_heads >= 1LL && a_heads <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": fast divisor 'heads' = " << a_heads
       << " is outside [1, 2147483647]";
-  TVM_FFI_CHECK(a_blocks_per_cta >= -2147483648LL && a_blocks_per_cta <= 2147483647LL, ValueError)
-      << KERNEL_NAME << ": 'blocks_per_cta' = " << a_blocks_per_cta
-      << " is outside the i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(a_accumulate >= -2147483648LL && a_accumulate <= 2147483647LL, ValueError)
       << KERNEL_NAME << ": 'accumulate' = " << a_accumulate
       << " is outside the i32 range [-2147483648, 2147483647]";
@@ -115,8 +112,6 @@ void Run(TensorView a_dy, TensorView a_x, TensorView a_z, TensorView a_w, Tensor
       << KERNEL_NAME << ": requires (rows >= 1)";
   TVM_FFI_CHECK((a_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (heads >= 1)";
-  TVM_FFI_CHECK((a_blocks_per_cta >= 1LL), ValueError)
-      << KERNEL_NAME << ": requires (blocks_per_cta >= 1)";
   TVM_FFI_CHECK((CMod(a_dy_tok, 8LL) == 0LL), ValueError)
       << KERNEL_NAME << ": requires (CMod(dy_tok, 8) == 0)";
   TVM_FFI_CHECK((CMod(a_dy_head, 8LL) == 0LL), ValueError)
@@ -152,14 +147,13 @@ void Run(TensorView a_dy, TensorView a_x, TensorView a_z, TensorView a_w, Tensor
   int64_t v_z_tok = static_cast<int64_t>(a_z_tok);
   int64_t v_z_head = static_cast<int64_t>(a_z_head);
   float v_eps = static_cast<float>(a_eps);
-  int32_t v_blocks_per_cta = static_cast<int32_t>(a_blocks_per_cta);
   int32_t v_accumulate = static_cast<int32_t>(a_accumulate);
   int32_t v_weight_grad = static_cast<int32_t>(a_weight_grad);
-  void* kernel_args[] = {&v_dy, &v_x, &v_z, &v_w, &v_dx, &v_dz, &v_dw_sums, &v_dw_done, &v_dw, &v_rows, &v_heads, &v_dy_tok, &v_dy_head, &v_x_tok, &v_x_head, &v_z_tok, &v_z_head, &v_eps, &v_blocks_per_cta, &v_accumulate, &v_weight_grad};
+  void* kernel_args[] = {&v_dy, &v_x, &v_z, &v_w, &v_dx, &v_dz, &v_dw_sums, &v_dw_done, &v_dw, &v_rows, &v_heads, &v_dy_tok, &v_dy_head, &v_x_tok, &v_x_head, &v_z_tok, &v_z_head, &v_eps, &v_accumulate, &v_weight_grad};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(256, 1, 1);
-  config.dynamicSmemBytes = 16512;
+  config.dynamicSmemBytes = 16640;
   config.stream = stream;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_rmsnorm_silu_gate_train_32301367ce4fa8110271), kernel_args),
             "cudaLaunchKernelExC");

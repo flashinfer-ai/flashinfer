@@ -68,7 +68,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SMEM_B1_OFF 33792
 #define SMEM_SMEM_B1_STAGE_BYTES 16384
 #define SMEM_SMEM_B1_STRIDE 49152
-#define SMEM_TOTAL 197632
+#define SMEM_OG_A_OFF 197632
+#define SMEM_OG_A_STAGE_BYTES 512
+#define SMEM_OG_A_STRIDE 512
+#define SMEM_TOTAL 198144
 #define BLOCK_M 128
 #define BLOCK_N 256
 #define BLOCK_K 64
@@ -141,6 +144,12 @@ __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16
 }
 
 
+__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
+    asm volatile(
+        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
+        :: "r"(mbar_addr) : "memory");
+}
+
 
 
 
@@ -197,6 +206,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     #define mma_done_addr (mbar_base + 32)
     #define mainloop_done_addr (mbar_base + 64)
     #define epilogue_done_addr (mbar_base + 72)
+    #define order_ready_addr (mbar_base + 80)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -214,9 +224,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     const int smem_b0_addr = smem + 17408;
     __nv_bfloat16* smem_b1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
     const int smem_b1_addr = smem + 33792;
+    int* og_a = reinterpret_cast<int*>(smem_raw + 197632);
+    const int og_a_addr = smem + 197632;
 
-    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 10 barriers)
-    // Mbarriers at smem_raw[0..80)
+    // Mbarrier init (5 pipeline groups, 0 ordered-sequence groups, 11 barriers)
+    // Mbarriers at smem_raw[0..88)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -237,6 +249,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
             mbarrier_init(smem + 64, 1);
             // epilogue_done: 1 barriers, init_count=8
             mbarrier_init(smem + 72, 8);
+            // order_ready: 1 barriers, init_count=32
+            mbarrier_init(smem + 80, 32);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -246,9 +260,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 80);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 88);
     if (warp == 0) {
-        int _tmem_hold = smem + 80;
+        int _tmem_hold = smem + 88;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
@@ -309,6 +323,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                 if (tail_splits > 1) {
                     reg_end = tail_base;
                 }
+                mbarrier_wait(order_ready_addr, 0);
                 #pragma unroll 1
                 for (unsigned int t = cluster_u; t < reg_end; t += num_clusters_u) {
                     unsigned int w = t / num_clusters_u;
@@ -328,6 +343,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned int kr_n_block = rem / grid_n_u;
                     n_block = nc_n_block * (1 - rr_n_block) + (rem - kr_n_block * grid_n_u) * rr_n_block;
                     k_block = (rem - nc_n_block * grid_k_u) * (1 - rr_n_block) + kr_n_block * rr_n_block;
+                    if (num_groups <= 128) {
+                        e_u = (unsigned int)og_a[(int)e_u];
+                    }
                     int e_i = (int)e_u;
                     int end_e = offs[e_i];
                     int prev_i = e_i - 1;
@@ -403,6 +421,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         unsigned int kr_n_blockt = remt / grid_n_u;
                         n_blockt = nc_n_blockt * (1 - rr_n_blockt) + (remt - kr_n_blockt * grid_n_u) * rr_n_blockt;
                         k_blockt = (remt - nc_n_blockt * grid_k_u) * (1 - rr_n_blockt) + kr_n_blockt * rr_n_blockt;
+                        if (num_groups <= 128) {
+                            e_ut = (unsigned int)og_a[(int)e_ut];
+                        }
                         int e_it = (int)e_ut;
                         int end_et = offs[e_it];
                         int prev_it = e_it - 1;
@@ -490,6 +511,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                 if (tail_splits > 1) {
                     reg_end_m = tail_base_m;
                 }
+                mbarrier_wait(order_ready_addr, 0);
                 #pragma unroll 1
                 for (unsigned int t_m = cluster_m; t_m < reg_end_m; t_m += num_clusters_m) {
                     unsigned int w_m = t_m / num_clusters_m;
@@ -501,6 +523,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     }
                     unsigned int ts_m = w_m * num_clusters_m + p_m;
                     unsigned int e_um = ts_m / tiles_per_group_m;
+                    if (num_groups <= 128) {
+                        e_um = (unsigned int)og_a[(int)e_um];
+                    }
                     int e_im = (int)e_um;
                     int end_m = offs[e_im];
                     int prev_m = e_im - 1;
@@ -619,6 +644,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         unsigned int j_u_tm = u_tm - s_u_tm * num_tail_tm;
                         unsigned int tt_m = tail_base_m + j_u_tm;
                         unsigned int e_umt = tt_m / tiles_per_group_m;
+                        if (num_groups <= 128) {
+                            e_umt = (unsigned int)og_a[(int)e_umt];
+                        }
                         int e_imt = (int)e_umt;
                         int end_mt = offs[e_imt];
                         int prev_mt = e_imt - 1;
@@ -755,6 +783,2339 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
             if (tail_splits > 1) {
                 reg_end_e = tail_base_e;
             }
+            if (warp == 2) {
+                if (num_groups <= 128) {
+                    int og_n = num_groups;
+                    int og_m[4];
+                    int og_g[4];
+                    #pragma unroll
+                    for (int ok = 0; ok < 4; ok++) {
+                        og_m[ok] = -1;
+                        og_g[ok] = 0;
+                        int ok_e = lane + 32 * ok;
+                        if (ok_e < og_n) {
+                            og_g[ok] = ok_e;
+                            int ok_lo = 0;
+                            if (ok_e > 0) {
+                                ok_lo = offs[ok_e - 1];
+                            }
+                            og_m[ok] = offs[ok_e] - ok_lo;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_0 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_0 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_0 = 0;
+                        if (bl_pm_0 > og_m[0]) {
+                            bl_pf_0 = 1;
+                        }
+                        if (bl_pm_0 == og_m[0]) {
+                            if (bl_pg_0 < og_g[0]) {
+                                bl_pf_0 = 1;
+                            }
+                        }
+                        int bl_i_0 = lane;
+                        int bl_want_0 = 0;
+                        if (lane % 2 == (bl_i_0 >> 1) % 2) {
+                            bl_want_0 = 1;
+                        }
+                        if (bl_pf_0 == bl_want_0) {
+                            og_m[0] = bl_pm_0;
+                            og_g[0] = bl_pg_0;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_1 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_1 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_1 = 0;
+                        if (bl_pm_1 > og_m[1]) {
+                            bl_pf_1 = 1;
+                        }
+                        if (bl_pm_1 == og_m[1]) {
+                            if (bl_pg_1 < og_g[1]) {
+                                bl_pf_1 = 1;
+                            }
+                        }
+                        int bl_i_1 = lane + 32;
+                        int bl_want_1 = 0;
+                        if (lane % 2 == (bl_i_1 >> 1) % 2) {
+                            bl_want_1 = 1;
+                        }
+                        if (bl_pf_1 == bl_want_1) {
+                            og_m[1] = bl_pm_1;
+                            og_g[1] = bl_pg_1;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_2 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_2 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_2 = 0;
+                        if (bl_pm_2 > og_m[2]) {
+                            bl_pf_2 = 1;
+                        }
+                        if (bl_pm_2 == og_m[2]) {
+                            if (bl_pg_2 < og_g[2]) {
+                                bl_pf_2 = 1;
+                            }
+                        }
+                        int bl_i_2 = lane + 64;
+                        int bl_want_2 = 0;
+                        if (lane % 2 == (bl_i_2 >> 1) % 2) {
+                            bl_want_2 = 1;
+                        }
+                        if (bl_pf_2 == bl_want_2) {
+                            og_m[2] = bl_pm_2;
+                            og_g[2] = bl_pg_2;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_3 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_3 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_3 = 0;
+                        if (bl_pm_3 > og_m[3]) {
+                            bl_pf_3 = 1;
+                        }
+                        if (bl_pm_3 == og_m[3]) {
+                            if (bl_pg_3 < og_g[3]) {
+                                bl_pf_3 = 1;
+                            }
+                        }
+                        int bl_i_3 = lane + 96;
+                        int bl_want_3 = 0;
+                        if (lane % 2 == (bl_i_3 >> 1) % 2) {
+                            bl_want_3 = 1;
+                        }
+                        if (bl_pf_3 == bl_want_3) {
+                            og_m[3] = bl_pm_3;
+                            og_g[3] = bl_pg_3;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_4 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_4 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_4 = 0;
+                        if (bl_pm_4 > og_m[0]) {
+                            bl_pf_4 = 1;
+                        }
+                        if (bl_pm_4 == og_m[0]) {
+                            if (bl_pg_4 < og_g[0]) {
+                                bl_pf_4 = 1;
+                            }
+                        }
+                        int bl_i_4 = lane;
+                        int bl_want_4 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_4 >> 2) % 2) {
+                            bl_want_4 = 1;
+                        }
+                        if (bl_pf_4 == bl_want_4) {
+                            og_m[0] = bl_pm_4;
+                            og_g[0] = bl_pg_4;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_5 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_5 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_5 = 0;
+                        if (bl_pm_5 > og_m[1]) {
+                            bl_pf_5 = 1;
+                        }
+                        if (bl_pm_5 == og_m[1]) {
+                            if (bl_pg_5 < og_g[1]) {
+                                bl_pf_5 = 1;
+                            }
+                        }
+                        int bl_i_5 = lane + 32;
+                        int bl_want_5 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_5 >> 2) % 2) {
+                            bl_want_5 = 1;
+                        }
+                        if (bl_pf_5 == bl_want_5) {
+                            og_m[1] = bl_pm_5;
+                            og_g[1] = bl_pg_5;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_6 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_6 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_6 = 0;
+                        if (bl_pm_6 > og_m[2]) {
+                            bl_pf_6 = 1;
+                        }
+                        if (bl_pm_6 == og_m[2]) {
+                            if (bl_pg_6 < og_g[2]) {
+                                bl_pf_6 = 1;
+                            }
+                        }
+                        int bl_i_6 = lane + 64;
+                        int bl_want_6 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_6 >> 2) % 2) {
+                            bl_want_6 = 1;
+                        }
+                        if (bl_pf_6 == bl_want_6) {
+                            og_m[2] = bl_pm_6;
+                            og_g[2] = bl_pg_6;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_7 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_7 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_7 = 0;
+                        if (bl_pm_7 > og_m[3]) {
+                            bl_pf_7 = 1;
+                        }
+                        if (bl_pm_7 == og_m[3]) {
+                            if (bl_pg_7 < og_g[3]) {
+                                bl_pf_7 = 1;
+                            }
+                        }
+                        int bl_i_7 = lane + 96;
+                        int bl_want_7 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_7 >> 2) % 2) {
+                            bl_want_7 = 1;
+                        }
+                        if (bl_pf_7 == bl_want_7) {
+                            og_m[3] = bl_pm_7;
+                            og_g[3] = bl_pg_7;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_8 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_8 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_8 = 0;
+                        if (bl_pm_8 > og_m[0]) {
+                            bl_pf_8 = 1;
+                        }
+                        if (bl_pm_8 == og_m[0]) {
+                            if (bl_pg_8 < og_g[0]) {
+                                bl_pf_8 = 1;
+                            }
+                        }
+                        int bl_i_8 = lane;
+                        int bl_want_8 = 0;
+                        if (lane % 2 == (bl_i_8 >> 2) % 2) {
+                            bl_want_8 = 1;
+                        }
+                        if (bl_pf_8 == bl_want_8) {
+                            og_m[0] = bl_pm_8;
+                            og_g[0] = bl_pg_8;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_9 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_9 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_9 = 0;
+                        if (bl_pm_9 > og_m[1]) {
+                            bl_pf_9 = 1;
+                        }
+                        if (bl_pm_9 == og_m[1]) {
+                            if (bl_pg_9 < og_g[1]) {
+                                bl_pf_9 = 1;
+                            }
+                        }
+                        int bl_i_9 = lane + 32;
+                        int bl_want_9 = 0;
+                        if (lane % 2 == (bl_i_9 >> 2) % 2) {
+                            bl_want_9 = 1;
+                        }
+                        if (bl_pf_9 == bl_want_9) {
+                            og_m[1] = bl_pm_9;
+                            og_g[1] = bl_pg_9;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_10 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_10 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_10 = 0;
+                        if (bl_pm_10 > og_m[2]) {
+                            bl_pf_10 = 1;
+                        }
+                        if (bl_pm_10 == og_m[2]) {
+                            if (bl_pg_10 < og_g[2]) {
+                                bl_pf_10 = 1;
+                            }
+                        }
+                        int bl_i_10 = lane + 64;
+                        int bl_want_10 = 0;
+                        if (lane % 2 == (bl_i_10 >> 2) % 2) {
+                            bl_want_10 = 1;
+                        }
+                        if (bl_pf_10 == bl_want_10) {
+                            og_m[2] = bl_pm_10;
+                            og_g[2] = bl_pg_10;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_11 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_11 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_11 = 0;
+                        if (bl_pm_11 > og_m[3]) {
+                            bl_pf_11 = 1;
+                        }
+                        if (bl_pm_11 == og_m[3]) {
+                            if (bl_pg_11 < og_g[3]) {
+                                bl_pf_11 = 1;
+                            }
+                        }
+                        int bl_i_11 = lane + 96;
+                        int bl_want_11 = 0;
+                        if (lane % 2 == (bl_i_11 >> 2) % 2) {
+                            bl_want_11 = 1;
+                        }
+                        if (bl_pf_11 == bl_want_11) {
+                            og_m[3] = bl_pm_11;
+                            og_g[3] = bl_pg_11;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_12 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 4);
+                        int bl_pg_12 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 4);
+                        int bl_pf_12 = 0;
+                        if (bl_pm_12 > og_m[0]) {
+                            bl_pf_12 = 1;
+                        }
+                        if (bl_pm_12 == og_m[0]) {
+                            if (bl_pg_12 < og_g[0]) {
+                                bl_pf_12 = 1;
+                            }
+                        }
+                        int bl_i_12 = lane;
+                        int bl_want_12 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_12 >> 3) % 2) {
+                            bl_want_12 = 1;
+                        }
+                        if (bl_pf_12 == bl_want_12) {
+                            og_m[0] = bl_pm_12;
+                            og_g[0] = bl_pg_12;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_13 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 4);
+                        int bl_pg_13 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 4);
+                        int bl_pf_13 = 0;
+                        if (bl_pm_13 > og_m[1]) {
+                            bl_pf_13 = 1;
+                        }
+                        if (bl_pm_13 == og_m[1]) {
+                            if (bl_pg_13 < og_g[1]) {
+                                bl_pf_13 = 1;
+                            }
+                        }
+                        int bl_i_13 = lane + 32;
+                        int bl_want_13 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_13 >> 3) % 2) {
+                            bl_want_13 = 1;
+                        }
+                        if (bl_pf_13 == bl_want_13) {
+                            og_m[1] = bl_pm_13;
+                            og_g[1] = bl_pg_13;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_14 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 4);
+                        int bl_pg_14 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 4);
+                        int bl_pf_14 = 0;
+                        if (bl_pm_14 > og_m[2]) {
+                            bl_pf_14 = 1;
+                        }
+                        if (bl_pm_14 == og_m[2]) {
+                            if (bl_pg_14 < og_g[2]) {
+                                bl_pf_14 = 1;
+                            }
+                        }
+                        int bl_i_14 = lane + 64;
+                        int bl_want_14 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_14 >> 3) % 2) {
+                            bl_want_14 = 1;
+                        }
+                        if (bl_pf_14 == bl_want_14) {
+                            og_m[2] = bl_pm_14;
+                            og_g[2] = bl_pg_14;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_15 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 4);
+                        int bl_pg_15 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 4);
+                        int bl_pf_15 = 0;
+                        if (bl_pm_15 > og_m[3]) {
+                            bl_pf_15 = 1;
+                        }
+                        if (bl_pm_15 == og_m[3]) {
+                            if (bl_pg_15 < og_g[3]) {
+                                bl_pf_15 = 1;
+                            }
+                        }
+                        int bl_i_15 = lane + 96;
+                        int bl_want_15 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_15 >> 3) % 2) {
+                            bl_want_15 = 1;
+                        }
+                        if (bl_pf_15 == bl_want_15) {
+                            og_m[3] = bl_pm_15;
+                            og_g[3] = bl_pg_15;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_16 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_16 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_16 = 0;
+                        if (bl_pm_16 > og_m[0]) {
+                            bl_pf_16 = 1;
+                        }
+                        if (bl_pm_16 == og_m[0]) {
+                            if (bl_pg_16 < og_g[0]) {
+                                bl_pf_16 = 1;
+                            }
+                        }
+                        int bl_i_16 = lane;
+                        int bl_want_16 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_16 >> 3) % 2) {
+                            bl_want_16 = 1;
+                        }
+                        if (bl_pf_16 == bl_want_16) {
+                            og_m[0] = bl_pm_16;
+                            og_g[0] = bl_pg_16;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_17 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_17 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_17 = 0;
+                        if (bl_pm_17 > og_m[1]) {
+                            bl_pf_17 = 1;
+                        }
+                        if (bl_pm_17 == og_m[1]) {
+                            if (bl_pg_17 < og_g[1]) {
+                                bl_pf_17 = 1;
+                            }
+                        }
+                        int bl_i_17 = lane + 32;
+                        int bl_want_17 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_17 >> 3) % 2) {
+                            bl_want_17 = 1;
+                        }
+                        if (bl_pf_17 == bl_want_17) {
+                            og_m[1] = bl_pm_17;
+                            og_g[1] = bl_pg_17;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_18 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_18 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_18 = 0;
+                        if (bl_pm_18 > og_m[2]) {
+                            bl_pf_18 = 1;
+                        }
+                        if (bl_pm_18 == og_m[2]) {
+                            if (bl_pg_18 < og_g[2]) {
+                                bl_pf_18 = 1;
+                            }
+                        }
+                        int bl_i_18 = lane + 64;
+                        int bl_want_18 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_18 >> 3) % 2) {
+                            bl_want_18 = 1;
+                        }
+                        if (bl_pf_18 == bl_want_18) {
+                            og_m[2] = bl_pm_18;
+                            og_g[2] = bl_pg_18;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_19 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_19 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_19 = 0;
+                        if (bl_pm_19 > og_m[3]) {
+                            bl_pf_19 = 1;
+                        }
+                        if (bl_pm_19 == og_m[3]) {
+                            if (bl_pg_19 < og_g[3]) {
+                                bl_pf_19 = 1;
+                            }
+                        }
+                        int bl_i_19 = lane + 96;
+                        int bl_want_19 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_19 >> 3) % 2) {
+                            bl_want_19 = 1;
+                        }
+                        if (bl_pf_19 == bl_want_19) {
+                            og_m[3] = bl_pm_19;
+                            og_g[3] = bl_pg_19;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_20 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_20 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_20 = 0;
+                        if (bl_pm_20 > og_m[0]) {
+                            bl_pf_20 = 1;
+                        }
+                        if (bl_pm_20 == og_m[0]) {
+                            if (bl_pg_20 < og_g[0]) {
+                                bl_pf_20 = 1;
+                            }
+                        }
+                        int bl_i_20 = lane;
+                        int bl_want_20 = 0;
+                        if (lane % 2 == (bl_i_20 >> 3) % 2) {
+                            bl_want_20 = 1;
+                        }
+                        if (bl_pf_20 == bl_want_20) {
+                            og_m[0] = bl_pm_20;
+                            og_g[0] = bl_pg_20;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_21 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_21 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_21 = 0;
+                        if (bl_pm_21 > og_m[1]) {
+                            bl_pf_21 = 1;
+                        }
+                        if (bl_pm_21 == og_m[1]) {
+                            if (bl_pg_21 < og_g[1]) {
+                                bl_pf_21 = 1;
+                            }
+                        }
+                        int bl_i_21 = lane + 32;
+                        int bl_want_21 = 0;
+                        if (lane % 2 == (bl_i_21 >> 3) % 2) {
+                            bl_want_21 = 1;
+                        }
+                        if (bl_pf_21 == bl_want_21) {
+                            og_m[1] = bl_pm_21;
+                            og_g[1] = bl_pg_21;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_22 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_22 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_22 = 0;
+                        if (bl_pm_22 > og_m[2]) {
+                            bl_pf_22 = 1;
+                        }
+                        if (bl_pm_22 == og_m[2]) {
+                            if (bl_pg_22 < og_g[2]) {
+                                bl_pf_22 = 1;
+                            }
+                        }
+                        int bl_i_22 = lane + 64;
+                        int bl_want_22 = 0;
+                        if (lane % 2 == (bl_i_22 >> 3) % 2) {
+                            bl_want_22 = 1;
+                        }
+                        if (bl_pf_22 == bl_want_22) {
+                            og_m[2] = bl_pm_22;
+                            og_g[2] = bl_pg_22;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_23 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_23 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_23 = 0;
+                        if (bl_pm_23 > og_m[3]) {
+                            bl_pf_23 = 1;
+                        }
+                        if (bl_pm_23 == og_m[3]) {
+                            if (bl_pg_23 < og_g[3]) {
+                                bl_pf_23 = 1;
+                            }
+                        }
+                        int bl_i_23 = lane + 96;
+                        int bl_want_23 = 0;
+                        if (lane % 2 == (bl_i_23 >> 3) % 2) {
+                            bl_want_23 = 1;
+                        }
+                        if (bl_pf_23 == bl_want_23) {
+                            og_m[3] = bl_pm_23;
+                            og_g[3] = bl_pg_23;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_24 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 8);
+                        int bl_pg_24 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 8);
+                        int bl_pf_24 = 0;
+                        if (bl_pm_24 > og_m[0]) {
+                            bl_pf_24 = 1;
+                        }
+                        if (bl_pm_24 == og_m[0]) {
+                            if (bl_pg_24 < og_g[0]) {
+                                bl_pf_24 = 1;
+                            }
+                        }
+                        int bl_i_24 = lane;
+                        int bl_want_24 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_24 >> 4) % 2) {
+                            bl_want_24 = 1;
+                        }
+                        if (bl_pf_24 == bl_want_24) {
+                            og_m[0] = bl_pm_24;
+                            og_g[0] = bl_pg_24;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_25 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 8);
+                        int bl_pg_25 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 8);
+                        int bl_pf_25 = 0;
+                        if (bl_pm_25 > og_m[1]) {
+                            bl_pf_25 = 1;
+                        }
+                        if (bl_pm_25 == og_m[1]) {
+                            if (bl_pg_25 < og_g[1]) {
+                                bl_pf_25 = 1;
+                            }
+                        }
+                        int bl_i_25 = lane + 32;
+                        int bl_want_25 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_25 >> 4) % 2) {
+                            bl_want_25 = 1;
+                        }
+                        if (bl_pf_25 == bl_want_25) {
+                            og_m[1] = bl_pm_25;
+                            og_g[1] = bl_pg_25;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_26 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 8);
+                        int bl_pg_26 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 8);
+                        int bl_pf_26 = 0;
+                        if (bl_pm_26 > og_m[2]) {
+                            bl_pf_26 = 1;
+                        }
+                        if (bl_pm_26 == og_m[2]) {
+                            if (bl_pg_26 < og_g[2]) {
+                                bl_pf_26 = 1;
+                            }
+                        }
+                        int bl_i_26 = lane + 64;
+                        int bl_want_26 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_26 >> 4) % 2) {
+                            bl_want_26 = 1;
+                        }
+                        if (bl_pf_26 == bl_want_26) {
+                            og_m[2] = bl_pm_26;
+                            og_g[2] = bl_pg_26;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_27 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 8);
+                        int bl_pg_27 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 8);
+                        int bl_pf_27 = 0;
+                        if (bl_pm_27 > og_m[3]) {
+                            bl_pf_27 = 1;
+                        }
+                        if (bl_pm_27 == og_m[3]) {
+                            if (bl_pg_27 < og_g[3]) {
+                                bl_pf_27 = 1;
+                            }
+                        }
+                        int bl_i_27 = lane + 96;
+                        int bl_want_27 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_27 >> 4) % 2) {
+                            bl_want_27 = 1;
+                        }
+                        if (bl_pf_27 == bl_want_27) {
+                            og_m[3] = bl_pm_27;
+                            og_g[3] = bl_pg_27;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_28 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 4);
+                        int bl_pg_28 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 4);
+                        int bl_pf_28 = 0;
+                        if (bl_pm_28 > og_m[0]) {
+                            bl_pf_28 = 1;
+                        }
+                        if (bl_pm_28 == og_m[0]) {
+                            if (bl_pg_28 < og_g[0]) {
+                                bl_pf_28 = 1;
+                            }
+                        }
+                        int bl_i_28 = lane;
+                        int bl_want_28 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_28 >> 4) % 2) {
+                            bl_want_28 = 1;
+                        }
+                        if (bl_pf_28 == bl_want_28) {
+                            og_m[0] = bl_pm_28;
+                            og_g[0] = bl_pg_28;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_29 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 4);
+                        int bl_pg_29 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 4);
+                        int bl_pf_29 = 0;
+                        if (bl_pm_29 > og_m[1]) {
+                            bl_pf_29 = 1;
+                        }
+                        if (bl_pm_29 == og_m[1]) {
+                            if (bl_pg_29 < og_g[1]) {
+                                bl_pf_29 = 1;
+                            }
+                        }
+                        int bl_i_29 = lane + 32;
+                        int bl_want_29 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_29 >> 4) % 2) {
+                            bl_want_29 = 1;
+                        }
+                        if (bl_pf_29 == bl_want_29) {
+                            og_m[1] = bl_pm_29;
+                            og_g[1] = bl_pg_29;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_30 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 4);
+                        int bl_pg_30 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 4);
+                        int bl_pf_30 = 0;
+                        if (bl_pm_30 > og_m[2]) {
+                            bl_pf_30 = 1;
+                        }
+                        if (bl_pm_30 == og_m[2]) {
+                            if (bl_pg_30 < og_g[2]) {
+                                bl_pf_30 = 1;
+                            }
+                        }
+                        int bl_i_30 = lane + 64;
+                        int bl_want_30 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_30 >> 4) % 2) {
+                            bl_want_30 = 1;
+                        }
+                        if (bl_pf_30 == bl_want_30) {
+                            og_m[2] = bl_pm_30;
+                            og_g[2] = bl_pg_30;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_31 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 4);
+                        int bl_pg_31 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 4);
+                        int bl_pf_31 = 0;
+                        if (bl_pm_31 > og_m[3]) {
+                            bl_pf_31 = 1;
+                        }
+                        if (bl_pm_31 == og_m[3]) {
+                            if (bl_pg_31 < og_g[3]) {
+                                bl_pf_31 = 1;
+                            }
+                        }
+                        int bl_i_31 = lane + 96;
+                        int bl_want_31 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_31 >> 4) % 2) {
+                            bl_want_31 = 1;
+                        }
+                        if (bl_pf_31 == bl_want_31) {
+                            og_m[3] = bl_pm_31;
+                            og_g[3] = bl_pg_31;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_32 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_32 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_32 = 0;
+                        if (bl_pm_32 > og_m[0]) {
+                            bl_pf_32 = 1;
+                        }
+                        if (bl_pm_32 == og_m[0]) {
+                            if (bl_pg_32 < og_g[0]) {
+                                bl_pf_32 = 1;
+                            }
+                        }
+                        int bl_i_32 = lane;
+                        int bl_want_32 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_32 >> 4) % 2) {
+                            bl_want_32 = 1;
+                        }
+                        if (bl_pf_32 == bl_want_32) {
+                            og_m[0] = bl_pm_32;
+                            og_g[0] = bl_pg_32;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_33 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_33 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_33 = 0;
+                        if (bl_pm_33 > og_m[1]) {
+                            bl_pf_33 = 1;
+                        }
+                        if (bl_pm_33 == og_m[1]) {
+                            if (bl_pg_33 < og_g[1]) {
+                                bl_pf_33 = 1;
+                            }
+                        }
+                        int bl_i_33 = lane + 32;
+                        int bl_want_33 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_33 >> 4) % 2) {
+                            bl_want_33 = 1;
+                        }
+                        if (bl_pf_33 == bl_want_33) {
+                            og_m[1] = bl_pm_33;
+                            og_g[1] = bl_pg_33;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_34 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_34 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_34 = 0;
+                        if (bl_pm_34 > og_m[2]) {
+                            bl_pf_34 = 1;
+                        }
+                        if (bl_pm_34 == og_m[2]) {
+                            if (bl_pg_34 < og_g[2]) {
+                                bl_pf_34 = 1;
+                            }
+                        }
+                        int bl_i_34 = lane + 64;
+                        int bl_want_34 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_34 >> 4) % 2) {
+                            bl_want_34 = 1;
+                        }
+                        if (bl_pf_34 == bl_want_34) {
+                            og_m[2] = bl_pm_34;
+                            og_g[2] = bl_pg_34;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_35 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_35 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_35 = 0;
+                        if (bl_pm_35 > og_m[3]) {
+                            bl_pf_35 = 1;
+                        }
+                        if (bl_pm_35 == og_m[3]) {
+                            if (bl_pg_35 < og_g[3]) {
+                                bl_pf_35 = 1;
+                            }
+                        }
+                        int bl_i_35 = lane + 96;
+                        int bl_want_35 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_35 >> 4) % 2) {
+                            bl_want_35 = 1;
+                        }
+                        if (bl_pf_35 == bl_want_35) {
+                            og_m[3] = bl_pm_35;
+                            og_g[3] = bl_pg_35;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_36 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_36 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_36 = 0;
+                        if (bl_pm_36 > og_m[0]) {
+                            bl_pf_36 = 1;
+                        }
+                        if (bl_pm_36 == og_m[0]) {
+                            if (bl_pg_36 < og_g[0]) {
+                                bl_pf_36 = 1;
+                            }
+                        }
+                        int bl_i_36 = lane;
+                        int bl_want_36 = 0;
+                        if (lane % 2 == (bl_i_36 >> 4) % 2) {
+                            bl_want_36 = 1;
+                        }
+                        if (bl_pf_36 == bl_want_36) {
+                            og_m[0] = bl_pm_36;
+                            og_g[0] = bl_pg_36;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_37 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_37 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_37 = 0;
+                        if (bl_pm_37 > og_m[1]) {
+                            bl_pf_37 = 1;
+                        }
+                        if (bl_pm_37 == og_m[1]) {
+                            if (bl_pg_37 < og_g[1]) {
+                                bl_pf_37 = 1;
+                            }
+                        }
+                        int bl_i_37 = lane + 32;
+                        int bl_want_37 = 0;
+                        if (lane % 2 == (bl_i_37 >> 4) % 2) {
+                            bl_want_37 = 1;
+                        }
+                        if (bl_pf_37 == bl_want_37) {
+                            og_m[1] = bl_pm_37;
+                            og_g[1] = bl_pg_37;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_38 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_38 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_38 = 0;
+                        if (bl_pm_38 > og_m[2]) {
+                            bl_pf_38 = 1;
+                        }
+                        if (bl_pm_38 == og_m[2]) {
+                            if (bl_pg_38 < og_g[2]) {
+                                bl_pf_38 = 1;
+                            }
+                        }
+                        int bl_i_38 = lane + 64;
+                        int bl_want_38 = 0;
+                        if (lane % 2 == (bl_i_38 >> 4) % 2) {
+                            bl_want_38 = 1;
+                        }
+                        if (bl_pf_38 == bl_want_38) {
+                            og_m[2] = bl_pm_38;
+                            og_g[2] = bl_pg_38;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_39 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_39 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_39 = 0;
+                        if (bl_pm_39 > og_m[3]) {
+                            bl_pf_39 = 1;
+                        }
+                        if (bl_pm_39 == og_m[3]) {
+                            if (bl_pg_39 < og_g[3]) {
+                                bl_pf_39 = 1;
+                            }
+                        }
+                        int bl_i_39 = lane + 96;
+                        int bl_want_39 = 0;
+                        if (lane % 2 == (bl_i_39 >> 4) % 2) {
+                            bl_want_39 = 1;
+                        }
+                        if (bl_pf_39 == bl_want_39) {
+                            og_m[3] = bl_pm_39;
+                            og_g[3] = bl_pg_39;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_40 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 16);
+                        int bl_pg_40 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 16);
+                        int bl_pf_40 = 0;
+                        if (bl_pm_40 > og_m[0]) {
+                            bl_pf_40 = 1;
+                        }
+                        if (bl_pm_40 == og_m[0]) {
+                            if (bl_pg_40 < og_g[0]) {
+                                bl_pf_40 = 1;
+                            }
+                        }
+                        int bl_i_40 = lane;
+                        int bl_want_40 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_40 >> 5) % 2) {
+                            bl_want_40 = 1;
+                        }
+                        if (bl_pf_40 == bl_want_40) {
+                            og_m[0] = bl_pm_40;
+                            og_g[0] = bl_pg_40;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_41 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 16);
+                        int bl_pg_41 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 16);
+                        int bl_pf_41 = 0;
+                        if (bl_pm_41 > og_m[1]) {
+                            bl_pf_41 = 1;
+                        }
+                        if (bl_pm_41 == og_m[1]) {
+                            if (bl_pg_41 < og_g[1]) {
+                                bl_pf_41 = 1;
+                            }
+                        }
+                        int bl_i_41 = lane + 32;
+                        int bl_want_41 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_41 >> 5) % 2) {
+                            bl_want_41 = 1;
+                        }
+                        if (bl_pf_41 == bl_want_41) {
+                            og_m[1] = bl_pm_41;
+                            og_g[1] = bl_pg_41;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_42 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 16);
+                        int bl_pg_42 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 16);
+                        int bl_pf_42 = 0;
+                        if (bl_pm_42 > og_m[2]) {
+                            bl_pf_42 = 1;
+                        }
+                        if (bl_pm_42 == og_m[2]) {
+                            if (bl_pg_42 < og_g[2]) {
+                                bl_pf_42 = 1;
+                            }
+                        }
+                        int bl_i_42 = lane + 64;
+                        int bl_want_42 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_42 >> 5) % 2) {
+                            bl_want_42 = 1;
+                        }
+                        if (bl_pf_42 == bl_want_42) {
+                            og_m[2] = bl_pm_42;
+                            og_g[2] = bl_pg_42;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_43 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 16);
+                        int bl_pg_43 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 16);
+                        int bl_pf_43 = 0;
+                        if (bl_pm_43 > og_m[3]) {
+                            bl_pf_43 = 1;
+                        }
+                        if (bl_pm_43 == og_m[3]) {
+                            if (bl_pg_43 < og_g[3]) {
+                                bl_pf_43 = 1;
+                            }
+                        }
+                        int bl_i_43 = lane + 96;
+                        int bl_want_43 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_43 >> 5) % 2) {
+                            bl_want_43 = 1;
+                        }
+                        if (bl_pf_43 == bl_want_43) {
+                            og_m[3] = bl_pm_43;
+                            og_g[3] = bl_pg_43;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_44 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 8);
+                        int bl_pg_44 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 8);
+                        int bl_pf_44 = 0;
+                        if (bl_pm_44 > og_m[0]) {
+                            bl_pf_44 = 1;
+                        }
+                        if (bl_pm_44 == og_m[0]) {
+                            if (bl_pg_44 < og_g[0]) {
+                                bl_pf_44 = 1;
+                            }
+                        }
+                        int bl_i_44 = lane;
+                        int bl_want_44 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_44 >> 5) % 2) {
+                            bl_want_44 = 1;
+                        }
+                        if (bl_pf_44 == bl_want_44) {
+                            og_m[0] = bl_pm_44;
+                            og_g[0] = bl_pg_44;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_45 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 8);
+                        int bl_pg_45 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 8);
+                        int bl_pf_45 = 0;
+                        if (bl_pm_45 > og_m[1]) {
+                            bl_pf_45 = 1;
+                        }
+                        if (bl_pm_45 == og_m[1]) {
+                            if (bl_pg_45 < og_g[1]) {
+                                bl_pf_45 = 1;
+                            }
+                        }
+                        int bl_i_45 = lane + 32;
+                        int bl_want_45 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_45 >> 5) % 2) {
+                            bl_want_45 = 1;
+                        }
+                        if (bl_pf_45 == bl_want_45) {
+                            og_m[1] = bl_pm_45;
+                            og_g[1] = bl_pg_45;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_46 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 8);
+                        int bl_pg_46 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 8);
+                        int bl_pf_46 = 0;
+                        if (bl_pm_46 > og_m[2]) {
+                            bl_pf_46 = 1;
+                        }
+                        if (bl_pm_46 == og_m[2]) {
+                            if (bl_pg_46 < og_g[2]) {
+                                bl_pf_46 = 1;
+                            }
+                        }
+                        int bl_i_46 = lane + 64;
+                        int bl_want_46 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_46 >> 5) % 2) {
+                            bl_want_46 = 1;
+                        }
+                        if (bl_pf_46 == bl_want_46) {
+                            og_m[2] = bl_pm_46;
+                            og_g[2] = bl_pg_46;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_47 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 8);
+                        int bl_pg_47 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 8);
+                        int bl_pf_47 = 0;
+                        if (bl_pm_47 > og_m[3]) {
+                            bl_pf_47 = 1;
+                        }
+                        if (bl_pm_47 == og_m[3]) {
+                            if (bl_pg_47 < og_g[3]) {
+                                bl_pf_47 = 1;
+                            }
+                        }
+                        int bl_i_47 = lane + 96;
+                        int bl_want_47 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_47 >> 5) % 2) {
+                            bl_want_47 = 1;
+                        }
+                        if (bl_pf_47 == bl_want_47) {
+                            og_m[3] = bl_pm_47;
+                            og_g[3] = bl_pg_47;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_48 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 4);
+                        int bl_pg_48 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 4);
+                        int bl_pf_48 = 0;
+                        if (bl_pm_48 > og_m[0]) {
+                            bl_pf_48 = 1;
+                        }
+                        if (bl_pm_48 == og_m[0]) {
+                            if (bl_pg_48 < og_g[0]) {
+                                bl_pf_48 = 1;
+                            }
+                        }
+                        int bl_i_48 = lane;
+                        int bl_want_48 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_48 >> 5) % 2) {
+                            bl_want_48 = 1;
+                        }
+                        if (bl_pf_48 == bl_want_48) {
+                            og_m[0] = bl_pm_48;
+                            og_g[0] = bl_pg_48;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_49 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 4);
+                        int bl_pg_49 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 4);
+                        int bl_pf_49 = 0;
+                        if (bl_pm_49 > og_m[1]) {
+                            bl_pf_49 = 1;
+                        }
+                        if (bl_pm_49 == og_m[1]) {
+                            if (bl_pg_49 < og_g[1]) {
+                                bl_pf_49 = 1;
+                            }
+                        }
+                        int bl_i_49 = lane + 32;
+                        int bl_want_49 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_49 >> 5) % 2) {
+                            bl_want_49 = 1;
+                        }
+                        if (bl_pf_49 == bl_want_49) {
+                            og_m[1] = bl_pm_49;
+                            og_g[1] = bl_pg_49;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_50 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 4);
+                        int bl_pg_50 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 4);
+                        int bl_pf_50 = 0;
+                        if (bl_pm_50 > og_m[2]) {
+                            bl_pf_50 = 1;
+                        }
+                        if (bl_pm_50 == og_m[2]) {
+                            if (bl_pg_50 < og_g[2]) {
+                                bl_pf_50 = 1;
+                            }
+                        }
+                        int bl_i_50 = lane + 64;
+                        int bl_want_50 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_50 >> 5) % 2) {
+                            bl_want_50 = 1;
+                        }
+                        if (bl_pf_50 == bl_want_50) {
+                            og_m[2] = bl_pm_50;
+                            og_g[2] = bl_pg_50;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_51 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 4);
+                        int bl_pg_51 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 4);
+                        int bl_pf_51 = 0;
+                        if (bl_pm_51 > og_m[3]) {
+                            bl_pf_51 = 1;
+                        }
+                        if (bl_pm_51 == og_m[3]) {
+                            if (bl_pg_51 < og_g[3]) {
+                                bl_pf_51 = 1;
+                            }
+                        }
+                        int bl_i_51 = lane + 96;
+                        int bl_want_51 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_51 >> 5) % 2) {
+                            bl_want_51 = 1;
+                        }
+                        if (bl_pf_51 == bl_want_51) {
+                            og_m[3] = bl_pm_51;
+                            og_g[3] = bl_pg_51;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_52 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_52 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_52 = 0;
+                        if (bl_pm_52 > og_m[0]) {
+                            bl_pf_52 = 1;
+                        }
+                        if (bl_pm_52 == og_m[0]) {
+                            if (bl_pg_52 < og_g[0]) {
+                                bl_pf_52 = 1;
+                            }
+                        }
+                        int bl_i_52 = lane;
+                        int bl_want_52 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_52 >> 5) % 2) {
+                            bl_want_52 = 1;
+                        }
+                        if (bl_pf_52 == bl_want_52) {
+                            og_m[0] = bl_pm_52;
+                            og_g[0] = bl_pg_52;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_53 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_53 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_53 = 0;
+                        if (bl_pm_53 > og_m[1]) {
+                            bl_pf_53 = 1;
+                        }
+                        if (bl_pm_53 == og_m[1]) {
+                            if (bl_pg_53 < og_g[1]) {
+                                bl_pf_53 = 1;
+                            }
+                        }
+                        int bl_i_53 = lane + 32;
+                        int bl_want_53 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_53 >> 5) % 2) {
+                            bl_want_53 = 1;
+                        }
+                        if (bl_pf_53 == bl_want_53) {
+                            og_m[1] = bl_pm_53;
+                            og_g[1] = bl_pg_53;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_54 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_54 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_54 = 0;
+                        if (bl_pm_54 > og_m[2]) {
+                            bl_pf_54 = 1;
+                        }
+                        if (bl_pm_54 == og_m[2]) {
+                            if (bl_pg_54 < og_g[2]) {
+                                bl_pf_54 = 1;
+                            }
+                        }
+                        int bl_i_54 = lane + 64;
+                        int bl_want_54 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_54 >> 5) % 2) {
+                            bl_want_54 = 1;
+                        }
+                        if (bl_pf_54 == bl_want_54) {
+                            og_m[2] = bl_pm_54;
+                            og_g[2] = bl_pg_54;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_55 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_55 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_55 = 0;
+                        if (bl_pm_55 > og_m[3]) {
+                            bl_pf_55 = 1;
+                        }
+                        if (bl_pm_55 == og_m[3]) {
+                            if (bl_pg_55 < og_g[3]) {
+                                bl_pf_55 = 1;
+                            }
+                        }
+                        int bl_i_55 = lane + 96;
+                        int bl_want_55 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_55 >> 5) % 2) {
+                            bl_want_55 = 1;
+                        }
+                        if (bl_pf_55 == bl_want_55) {
+                            og_m[3] = bl_pm_55;
+                            og_g[3] = bl_pg_55;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_56 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_56 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_56 = 0;
+                        if (bl_pm_56 > og_m[0]) {
+                            bl_pf_56 = 1;
+                        }
+                        if (bl_pm_56 == og_m[0]) {
+                            if (bl_pg_56 < og_g[0]) {
+                                bl_pf_56 = 1;
+                            }
+                        }
+                        int bl_i_56 = lane;
+                        int bl_want_56 = 0;
+                        if (lane % 2 == (bl_i_56 >> 5) % 2) {
+                            bl_want_56 = 1;
+                        }
+                        if (bl_pf_56 == bl_want_56) {
+                            og_m[0] = bl_pm_56;
+                            og_g[0] = bl_pg_56;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_57 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_57 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_57 = 0;
+                        if (bl_pm_57 > og_m[1]) {
+                            bl_pf_57 = 1;
+                        }
+                        if (bl_pm_57 == og_m[1]) {
+                            if (bl_pg_57 < og_g[1]) {
+                                bl_pf_57 = 1;
+                            }
+                        }
+                        int bl_i_57 = lane + 32;
+                        int bl_want_57 = 0;
+                        if (lane % 2 == (bl_i_57 >> 5) % 2) {
+                            bl_want_57 = 1;
+                        }
+                        if (bl_pf_57 == bl_want_57) {
+                            og_m[1] = bl_pm_57;
+                            og_g[1] = bl_pg_57;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_58 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_58 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_58 = 0;
+                        if (bl_pm_58 > og_m[2]) {
+                            bl_pf_58 = 1;
+                        }
+                        if (bl_pm_58 == og_m[2]) {
+                            if (bl_pg_58 < og_g[2]) {
+                                bl_pf_58 = 1;
+                            }
+                        }
+                        int bl_i_58 = lane + 64;
+                        int bl_want_58 = 0;
+                        if (lane % 2 == (bl_i_58 >> 5) % 2) {
+                            bl_want_58 = 1;
+                        }
+                        if (bl_pf_58 == bl_want_58) {
+                            og_m[2] = bl_pm_58;
+                            og_g[2] = bl_pg_58;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_59 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_59 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_59 = 0;
+                        if (bl_pm_59 > og_m[3]) {
+                            bl_pf_59 = 1;
+                        }
+                        if (bl_pm_59 == og_m[3]) {
+                            if (bl_pg_59 < og_g[3]) {
+                                bl_pf_59 = 1;
+                            }
+                        }
+                        int bl_i_59 = lane + 96;
+                        int bl_want_59 = 0;
+                        if (lane % 2 == (bl_i_59 >> 5) % 2) {
+                            bl_want_59 = 1;
+                        }
+                        if (bl_pf_59 == bl_want_59) {
+                            og_m[3] = bl_pm_59;
+                            og_g[3] = bl_pg_59;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bs_first_0 = 0;
+                        if (og_m[1] > og_m[0]) {
+                            bs_first_0 = 1;
+                        }
+                        if (og_m[1] == og_m[0]) {
+                            if (og_g[1] < og_g[0]) {
+                                bs_first_0 = 1;
+                            }
+                        }
+                        int bs_m_0 = og_m[0];
+                        int bs_g_0 = og_g[0];
+                        og_m[0] = ((bs_first_0 == 1) ? og_m[1] : bs_m_0);
+                        og_g[0] = ((bs_first_0 == 1) ? og_g[1] : bs_g_0);
+                        og_m[1] = ((bs_first_0 == 1) ? bs_m_0 : og_m[1]);
+                        og_g[1] = ((bs_first_0 == 1) ? bs_g_0 : og_g[1]);
+                    }
+                    if (og_n > 32) {
+                        int bs_first_1 = 0;
+                        if (og_m[3] > og_m[2]) {
+                            bs_first_1 = 1;
+                        }
+                        if (og_m[3] == og_m[2]) {
+                            if (og_g[3] < og_g[2]) {
+                                bs_first_1 = 1;
+                            }
+                        }
+                        bs_first_1 = 1 - bs_first_1;
+                        int bs_m_1 = og_m[2];
+                        int bs_g_1 = og_g[2];
+                        og_m[2] = ((bs_first_1 == 1) ? og_m[3] : bs_m_1);
+                        og_g[2] = ((bs_first_1 == 1) ? og_g[3] : bs_g_1);
+                        og_m[3] = ((bs_first_1 == 1) ? bs_m_1 : og_m[3]);
+                        og_g[3] = ((bs_first_1 == 1) ? bs_g_1 : og_g[3]);
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_60 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 16);
+                        int bl_pg_60 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 16);
+                        int bl_pf_60 = 0;
+                        if (bl_pm_60 > og_m[0]) {
+                            bl_pf_60 = 1;
+                        }
+                        if (bl_pm_60 == og_m[0]) {
+                            if (bl_pg_60 < og_g[0]) {
+                                bl_pf_60 = 1;
+                            }
+                        }
+                        int bl_i_60 = lane;
+                        int bl_want_60 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_60 >> 6) % 2) {
+                            bl_want_60 = 1;
+                        }
+                        if (bl_pf_60 == bl_want_60) {
+                            og_m[0] = bl_pm_60;
+                            og_g[0] = bl_pg_60;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_61 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 16);
+                        int bl_pg_61 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 16);
+                        int bl_pf_61 = 0;
+                        if (bl_pm_61 > og_m[1]) {
+                            bl_pf_61 = 1;
+                        }
+                        if (bl_pm_61 == og_m[1]) {
+                            if (bl_pg_61 < og_g[1]) {
+                                bl_pf_61 = 1;
+                            }
+                        }
+                        int bl_i_61 = lane + 32;
+                        int bl_want_61 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_61 >> 6) % 2) {
+                            bl_want_61 = 1;
+                        }
+                        if (bl_pf_61 == bl_want_61) {
+                            og_m[1] = bl_pm_61;
+                            og_g[1] = bl_pg_61;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_62 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 16);
+                        int bl_pg_62 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 16);
+                        int bl_pf_62 = 0;
+                        if (bl_pm_62 > og_m[2]) {
+                            bl_pf_62 = 1;
+                        }
+                        if (bl_pm_62 == og_m[2]) {
+                            if (bl_pg_62 < og_g[2]) {
+                                bl_pf_62 = 1;
+                            }
+                        }
+                        int bl_i_62 = lane + 64;
+                        int bl_want_62 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_62 >> 6) % 2) {
+                            bl_want_62 = 1;
+                        }
+                        if (bl_pf_62 == bl_want_62) {
+                            og_m[2] = bl_pm_62;
+                            og_g[2] = bl_pg_62;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_63 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 16);
+                        int bl_pg_63 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 16);
+                        int bl_pf_63 = 0;
+                        if (bl_pm_63 > og_m[3]) {
+                            bl_pf_63 = 1;
+                        }
+                        if (bl_pm_63 == og_m[3]) {
+                            if (bl_pg_63 < og_g[3]) {
+                                bl_pf_63 = 1;
+                            }
+                        }
+                        int bl_i_63 = lane + 96;
+                        int bl_want_63 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_63 >> 6) % 2) {
+                            bl_want_63 = 1;
+                        }
+                        if (bl_pf_63 == bl_want_63) {
+                            og_m[3] = bl_pm_63;
+                            og_g[3] = bl_pg_63;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_64 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 8);
+                        int bl_pg_64 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 8);
+                        int bl_pf_64 = 0;
+                        if (bl_pm_64 > og_m[0]) {
+                            bl_pf_64 = 1;
+                        }
+                        if (bl_pm_64 == og_m[0]) {
+                            if (bl_pg_64 < og_g[0]) {
+                                bl_pf_64 = 1;
+                            }
+                        }
+                        int bl_i_64 = lane;
+                        int bl_want_64 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_64 >> 6) % 2) {
+                            bl_want_64 = 1;
+                        }
+                        if (bl_pf_64 == bl_want_64) {
+                            og_m[0] = bl_pm_64;
+                            og_g[0] = bl_pg_64;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_65 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 8);
+                        int bl_pg_65 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 8);
+                        int bl_pf_65 = 0;
+                        if (bl_pm_65 > og_m[1]) {
+                            bl_pf_65 = 1;
+                        }
+                        if (bl_pm_65 == og_m[1]) {
+                            if (bl_pg_65 < og_g[1]) {
+                                bl_pf_65 = 1;
+                            }
+                        }
+                        int bl_i_65 = lane + 32;
+                        int bl_want_65 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_65 >> 6) % 2) {
+                            bl_want_65 = 1;
+                        }
+                        if (bl_pf_65 == bl_want_65) {
+                            og_m[1] = bl_pm_65;
+                            og_g[1] = bl_pg_65;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_66 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 8);
+                        int bl_pg_66 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 8);
+                        int bl_pf_66 = 0;
+                        if (bl_pm_66 > og_m[2]) {
+                            bl_pf_66 = 1;
+                        }
+                        if (bl_pm_66 == og_m[2]) {
+                            if (bl_pg_66 < og_g[2]) {
+                                bl_pf_66 = 1;
+                            }
+                        }
+                        int bl_i_66 = lane + 64;
+                        int bl_want_66 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_66 >> 6) % 2) {
+                            bl_want_66 = 1;
+                        }
+                        if (bl_pf_66 == bl_want_66) {
+                            og_m[2] = bl_pm_66;
+                            og_g[2] = bl_pg_66;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_67 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 8);
+                        int bl_pg_67 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 8);
+                        int bl_pf_67 = 0;
+                        if (bl_pm_67 > og_m[3]) {
+                            bl_pf_67 = 1;
+                        }
+                        if (bl_pm_67 == og_m[3]) {
+                            if (bl_pg_67 < og_g[3]) {
+                                bl_pf_67 = 1;
+                            }
+                        }
+                        int bl_i_67 = lane + 96;
+                        int bl_want_67 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_67 >> 6) % 2) {
+                            bl_want_67 = 1;
+                        }
+                        if (bl_pf_67 == bl_want_67) {
+                            og_m[3] = bl_pm_67;
+                            og_g[3] = bl_pg_67;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_68 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 4);
+                        int bl_pg_68 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 4);
+                        int bl_pf_68 = 0;
+                        if (bl_pm_68 > og_m[0]) {
+                            bl_pf_68 = 1;
+                        }
+                        if (bl_pm_68 == og_m[0]) {
+                            if (bl_pg_68 < og_g[0]) {
+                                bl_pf_68 = 1;
+                            }
+                        }
+                        int bl_i_68 = lane;
+                        int bl_want_68 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_68 >> 6) % 2) {
+                            bl_want_68 = 1;
+                        }
+                        if (bl_pf_68 == bl_want_68) {
+                            og_m[0] = bl_pm_68;
+                            og_g[0] = bl_pg_68;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_69 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 4);
+                        int bl_pg_69 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 4);
+                        int bl_pf_69 = 0;
+                        if (bl_pm_69 > og_m[1]) {
+                            bl_pf_69 = 1;
+                        }
+                        if (bl_pm_69 == og_m[1]) {
+                            if (bl_pg_69 < og_g[1]) {
+                                bl_pf_69 = 1;
+                            }
+                        }
+                        int bl_i_69 = lane + 32;
+                        int bl_want_69 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_69 >> 6) % 2) {
+                            bl_want_69 = 1;
+                        }
+                        if (bl_pf_69 == bl_want_69) {
+                            og_m[1] = bl_pm_69;
+                            og_g[1] = bl_pg_69;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_70 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 4);
+                        int bl_pg_70 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 4);
+                        int bl_pf_70 = 0;
+                        if (bl_pm_70 > og_m[2]) {
+                            bl_pf_70 = 1;
+                        }
+                        if (bl_pm_70 == og_m[2]) {
+                            if (bl_pg_70 < og_g[2]) {
+                                bl_pf_70 = 1;
+                            }
+                        }
+                        int bl_i_70 = lane + 64;
+                        int bl_want_70 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_70 >> 6) % 2) {
+                            bl_want_70 = 1;
+                        }
+                        if (bl_pf_70 == bl_want_70) {
+                            og_m[2] = bl_pm_70;
+                            og_g[2] = bl_pg_70;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_71 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 4);
+                        int bl_pg_71 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 4);
+                        int bl_pf_71 = 0;
+                        if (bl_pm_71 > og_m[3]) {
+                            bl_pf_71 = 1;
+                        }
+                        if (bl_pm_71 == og_m[3]) {
+                            if (bl_pg_71 < og_g[3]) {
+                                bl_pf_71 = 1;
+                            }
+                        }
+                        int bl_i_71 = lane + 96;
+                        int bl_want_71 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_71 >> 6) % 2) {
+                            bl_want_71 = 1;
+                        }
+                        if (bl_pf_71 == bl_want_71) {
+                            og_m[3] = bl_pm_71;
+                            og_g[3] = bl_pg_71;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_72 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_72 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_72 = 0;
+                        if (bl_pm_72 > og_m[0]) {
+                            bl_pf_72 = 1;
+                        }
+                        if (bl_pm_72 == og_m[0]) {
+                            if (bl_pg_72 < og_g[0]) {
+                                bl_pf_72 = 1;
+                            }
+                        }
+                        int bl_i_72 = lane;
+                        int bl_want_72 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_72 >> 6) % 2) {
+                            bl_want_72 = 1;
+                        }
+                        if (bl_pf_72 == bl_want_72) {
+                            og_m[0] = bl_pm_72;
+                            og_g[0] = bl_pg_72;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_73 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_73 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_73 = 0;
+                        if (bl_pm_73 > og_m[1]) {
+                            bl_pf_73 = 1;
+                        }
+                        if (bl_pm_73 == og_m[1]) {
+                            if (bl_pg_73 < og_g[1]) {
+                                bl_pf_73 = 1;
+                            }
+                        }
+                        int bl_i_73 = lane + 32;
+                        int bl_want_73 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_73 >> 6) % 2) {
+                            bl_want_73 = 1;
+                        }
+                        if (bl_pf_73 == bl_want_73) {
+                            og_m[1] = bl_pm_73;
+                            og_g[1] = bl_pg_73;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_74 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_74 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_74 = 0;
+                        if (bl_pm_74 > og_m[2]) {
+                            bl_pf_74 = 1;
+                        }
+                        if (bl_pm_74 == og_m[2]) {
+                            if (bl_pg_74 < og_g[2]) {
+                                bl_pf_74 = 1;
+                            }
+                        }
+                        int bl_i_74 = lane + 64;
+                        int bl_want_74 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_74 >> 6) % 2) {
+                            bl_want_74 = 1;
+                        }
+                        if (bl_pf_74 == bl_want_74) {
+                            og_m[2] = bl_pm_74;
+                            og_g[2] = bl_pg_74;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_75 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_75 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_75 = 0;
+                        if (bl_pm_75 > og_m[3]) {
+                            bl_pf_75 = 1;
+                        }
+                        if (bl_pm_75 == og_m[3]) {
+                            if (bl_pg_75 < og_g[3]) {
+                                bl_pf_75 = 1;
+                            }
+                        }
+                        int bl_i_75 = lane + 96;
+                        int bl_want_75 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_75 >> 6) % 2) {
+                            bl_want_75 = 1;
+                        }
+                        if (bl_pf_75 == bl_want_75) {
+                            og_m[3] = bl_pm_75;
+                            og_g[3] = bl_pg_75;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_76 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_76 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_76 = 0;
+                        if (bl_pm_76 > og_m[0]) {
+                            bl_pf_76 = 1;
+                        }
+                        if (bl_pm_76 == og_m[0]) {
+                            if (bl_pg_76 < og_g[0]) {
+                                bl_pf_76 = 1;
+                            }
+                        }
+                        int bl_i_76 = lane;
+                        int bl_want_76 = 0;
+                        if (lane % 2 == (bl_i_76 >> 6) % 2) {
+                            bl_want_76 = 1;
+                        }
+                        if (bl_pf_76 == bl_want_76) {
+                            og_m[0] = bl_pm_76;
+                            og_g[0] = bl_pg_76;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_77 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_77 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_77 = 0;
+                        if (bl_pm_77 > og_m[1]) {
+                            bl_pf_77 = 1;
+                        }
+                        if (bl_pm_77 == og_m[1]) {
+                            if (bl_pg_77 < og_g[1]) {
+                                bl_pf_77 = 1;
+                            }
+                        }
+                        int bl_i_77 = lane + 32;
+                        int bl_want_77 = 0;
+                        if (lane % 2 == (bl_i_77 >> 6) % 2) {
+                            bl_want_77 = 1;
+                        }
+                        if (bl_pf_77 == bl_want_77) {
+                            og_m[1] = bl_pm_77;
+                            og_g[1] = bl_pg_77;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_78 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_78 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_78 = 0;
+                        if (bl_pm_78 > og_m[2]) {
+                            bl_pf_78 = 1;
+                        }
+                        if (bl_pm_78 == og_m[2]) {
+                            if (bl_pg_78 < og_g[2]) {
+                                bl_pf_78 = 1;
+                            }
+                        }
+                        int bl_i_78 = lane + 64;
+                        int bl_want_78 = 0;
+                        if (lane % 2 == (bl_i_78 >> 6) % 2) {
+                            bl_want_78 = 1;
+                        }
+                        if (bl_pf_78 == bl_want_78) {
+                            og_m[2] = bl_pm_78;
+                            og_g[2] = bl_pg_78;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_79 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_79 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_79 = 0;
+                        if (bl_pm_79 > og_m[3]) {
+                            bl_pf_79 = 1;
+                        }
+                        if (bl_pm_79 == og_m[3]) {
+                            if (bl_pg_79 < og_g[3]) {
+                                bl_pf_79 = 1;
+                            }
+                        }
+                        int bl_i_79 = lane + 96;
+                        int bl_want_79 = 0;
+                        if (lane % 2 == (bl_i_79 >> 6) % 2) {
+                            bl_want_79 = 1;
+                        }
+                        if (bl_pf_79 == bl_want_79) {
+                            og_m[3] = bl_pm_79;
+                            og_g[3] = bl_pg_79;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bs_first_2 = 0;
+                        if (og_m[2] > og_m[0]) {
+                            bs_first_2 = 1;
+                        }
+                        if (og_m[2] == og_m[0]) {
+                            if (og_g[2] < og_g[0]) {
+                                bs_first_2 = 1;
+                            }
+                        }
+                        int bs_m_2 = og_m[0];
+                        int bs_g_2 = og_g[0];
+                        og_m[0] = ((bs_first_2 == 1) ? og_m[2] : bs_m_2);
+                        og_g[0] = ((bs_first_2 == 1) ? og_g[2] : bs_g_2);
+                        og_m[2] = ((bs_first_2 == 1) ? bs_m_2 : og_m[2]);
+                        og_g[2] = ((bs_first_2 == 1) ? bs_g_2 : og_g[2]);
+                    }
+                    if (og_n > 64) {
+                        int bs_first_3 = 0;
+                        if (og_m[3] > og_m[1]) {
+                            bs_first_3 = 1;
+                        }
+                        if (og_m[3] == og_m[1]) {
+                            if (og_g[3] < og_g[1]) {
+                                bs_first_3 = 1;
+                            }
+                        }
+                        int bs_m_3 = og_m[1];
+                        int bs_g_3 = og_g[1];
+                        og_m[1] = ((bs_first_3 == 1) ? og_m[3] : bs_m_3);
+                        og_g[1] = ((bs_first_3 == 1) ? og_g[3] : bs_g_3);
+                        og_m[3] = ((bs_first_3 == 1) ? bs_m_3 : og_m[3]);
+                        og_g[3] = ((bs_first_3 == 1) ? bs_g_3 : og_g[3]);
+                    }
+                    if (og_n > 64) {
+                        int bs_first_4 = 0;
+                        if (og_m[1] > og_m[0]) {
+                            bs_first_4 = 1;
+                        }
+                        if (og_m[1] == og_m[0]) {
+                            if (og_g[1] < og_g[0]) {
+                                bs_first_4 = 1;
+                            }
+                        }
+                        int bs_m_4 = og_m[0];
+                        int bs_g_4 = og_g[0];
+                        og_m[0] = ((bs_first_4 == 1) ? og_m[1] : bs_m_4);
+                        og_g[0] = ((bs_first_4 == 1) ? og_g[1] : bs_g_4);
+                        og_m[1] = ((bs_first_4 == 1) ? bs_m_4 : og_m[1]);
+                        og_g[1] = ((bs_first_4 == 1) ? bs_g_4 : og_g[1]);
+                    }
+                    if (og_n > 64) {
+                        int bs_first_5 = 0;
+                        if (og_m[3] > og_m[2]) {
+                            bs_first_5 = 1;
+                        }
+                        if (og_m[3] == og_m[2]) {
+                            if (og_g[3] < og_g[2]) {
+                                bs_first_5 = 1;
+                            }
+                        }
+                        int bs_m_5 = og_m[2];
+                        int bs_g_5 = og_g[2];
+                        og_m[2] = ((bs_first_5 == 1) ? og_m[3] : bs_m_5);
+                        og_g[2] = ((bs_first_5 == 1) ? og_g[3] : bs_g_5);
+                        og_m[3] = ((bs_first_5 == 1) ? bs_m_5 : og_m[3]);
+                        og_g[3] = ((bs_first_5 == 1) ? bs_g_5 : og_g[3]);
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_80 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 16);
+                        int bl_pg_80 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 16);
+                        int bl_pf_80 = 0;
+                        if (bl_pm_80 > og_m[0]) {
+                            bl_pf_80 = 1;
+                        }
+                        if (bl_pm_80 == og_m[0]) {
+                            if (bl_pg_80 < og_g[0]) {
+                                bl_pf_80 = 1;
+                            }
+                        }
+                        int bl_i_80 = lane;
+                        int bl_want_80 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_80 >> 7) % 2) {
+                            bl_want_80 = 1;
+                        }
+                        if (bl_pf_80 == bl_want_80) {
+                            og_m[0] = bl_pm_80;
+                            og_g[0] = bl_pg_80;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_81 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 16);
+                        int bl_pg_81 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 16);
+                        int bl_pf_81 = 0;
+                        if (bl_pm_81 > og_m[1]) {
+                            bl_pf_81 = 1;
+                        }
+                        if (bl_pm_81 == og_m[1]) {
+                            if (bl_pg_81 < og_g[1]) {
+                                bl_pf_81 = 1;
+                            }
+                        }
+                        int bl_i_81 = lane + 32;
+                        int bl_want_81 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_81 >> 7) % 2) {
+                            bl_want_81 = 1;
+                        }
+                        if (bl_pf_81 == bl_want_81) {
+                            og_m[1] = bl_pm_81;
+                            og_g[1] = bl_pg_81;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_82 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 16);
+                        int bl_pg_82 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 16);
+                        int bl_pf_82 = 0;
+                        if (bl_pm_82 > og_m[2]) {
+                            bl_pf_82 = 1;
+                        }
+                        if (bl_pm_82 == og_m[2]) {
+                            if (bl_pg_82 < og_g[2]) {
+                                bl_pf_82 = 1;
+                            }
+                        }
+                        int bl_i_82 = lane + 64;
+                        int bl_want_82 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_82 >> 7) % 2) {
+                            bl_want_82 = 1;
+                        }
+                        if (bl_pf_82 == bl_want_82) {
+                            og_m[2] = bl_pm_82;
+                            og_g[2] = bl_pg_82;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_83 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 16);
+                        int bl_pg_83 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 16);
+                        int bl_pf_83 = 0;
+                        if (bl_pm_83 > og_m[3]) {
+                            bl_pf_83 = 1;
+                        }
+                        if (bl_pm_83 == og_m[3]) {
+                            if (bl_pg_83 < og_g[3]) {
+                                bl_pf_83 = 1;
+                            }
+                        }
+                        int bl_i_83 = lane + 96;
+                        int bl_want_83 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_83 >> 7) % 2) {
+                            bl_want_83 = 1;
+                        }
+                        if (bl_pf_83 == bl_want_83) {
+                            og_m[3] = bl_pm_83;
+                            og_g[3] = bl_pg_83;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_84 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 8);
+                        int bl_pg_84 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 8);
+                        int bl_pf_84 = 0;
+                        if (bl_pm_84 > og_m[0]) {
+                            bl_pf_84 = 1;
+                        }
+                        if (bl_pm_84 == og_m[0]) {
+                            if (bl_pg_84 < og_g[0]) {
+                                bl_pf_84 = 1;
+                            }
+                        }
+                        int bl_i_84 = lane;
+                        int bl_want_84 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_84 >> 7) % 2) {
+                            bl_want_84 = 1;
+                        }
+                        if (bl_pf_84 == bl_want_84) {
+                            og_m[0] = bl_pm_84;
+                            og_g[0] = bl_pg_84;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_85 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 8);
+                        int bl_pg_85 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 8);
+                        int bl_pf_85 = 0;
+                        if (bl_pm_85 > og_m[1]) {
+                            bl_pf_85 = 1;
+                        }
+                        if (bl_pm_85 == og_m[1]) {
+                            if (bl_pg_85 < og_g[1]) {
+                                bl_pf_85 = 1;
+                            }
+                        }
+                        int bl_i_85 = lane + 32;
+                        int bl_want_85 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_85 >> 7) % 2) {
+                            bl_want_85 = 1;
+                        }
+                        if (bl_pf_85 == bl_want_85) {
+                            og_m[1] = bl_pm_85;
+                            og_g[1] = bl_pg_85;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_86 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 8);
+                        int bl_pg_86 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 8);
+                        int bl_pf_86 = 0;
+                        if (bl_pm_86 > og_m[2]) {
+                            bl_pf_86 = 1;
+                        }
+                        if (bl_pm_86 == og_m[2]) {
+                            if (bl_pg_86 < og_g[2]) {
+                                bl_pf_86 = 1;
+                            }
+                        }
+                        int bl_i_86 = lane + 64;
+                        int bl_want_86 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_86 >> 7) % 2) {
+                            bl_want_86 = 1;
+                        }
+                        if (bl_pf_86 == bl_want_86) {
+                            og_m[2] = bl_pm_86;
+                            og_g[2] = bl_pg_86;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_87 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 8);
+                        int bl_pg_87 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 8);
+                        int bl_pf_87 = 0;
+                        if (bl_pm_87 > og_m[3]) {
+                            bl_pf_87 = 1;
+                        }
+                        if (bl_pm_87 == og_m[3]) {
+                            if (bl_pg_87 < og_g[3]) {
+                                bl_pf_87 = 1;
+                            }
+                        }
+                        int bl_i_87 = lane + 96;
+                        int bl_want_87 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_87 >> 7) % 2) {
+                            bl_want_87 = 1;
+                        }
+                        if (bl_pf_87 == bl_want_87) {
+                            og_m[3] = bl_pm_87;
+                            og_g[3] = bl_pg_87;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_88 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 4);
+                        int bl_pg_88 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 4);
+                        int bl_pf_88 = 0;
+                        if (bl_pm_88 > og_m[0]) {
+                            bl_pf_88 = 1;
+                        }
+                        if (bl_pm_88 == og_m[0]) {
+                            if (bl_pg_88 < og_g[0]) {
+                                bl_pf_88 = 1;
+                            }
+                        }
+                        int bl_i_88 = lane;
+                        int bl_want_88 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_88 >> 7) % 2) {
+                            bl_want_88 = 1;
+                        }
+                        if (bl_pf_88 == bl_want_88) {
+                            og_m[0] = bl_pm_88;
+                            og_g[0] = bl_pg_88;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_89 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 4);
+                        int bl_pg_89 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 4);
+                        int bl_pf_89 = 0;
+                        if (bl_pm_89 > og_m[1]) {
+                            bl_pf_89 = 1;
+                        }
+                        if (bl_pm_89 == og_m[1]) {
+                            if (bl_pg_89 < og_g[1]) {
+                                bl_pf_89 = 1;
+                            }
+                        }
+                        int bl_i_89 = lane + 32;
+                        int bl_want_89 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_89 >> 7) % 2) {
+                            bl_want_89 = 1;
+                        }
+                        if (bl_pf_89 == bl_want_89) {
+                            og_m[1] = bl_pm_89;
+                            og_g[1] = bl_pg_89;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_90 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 4);
+                        int bl_pg_90 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 4);
+                        int bl_pf_90 = 0;
+                        if (bl_pm_90 > og_m[2]) {
+                            bl_pf_90 = 1;
+                        }
+                        if (bl_pm_90 == og_m[2]) {
+                            if (bl_pg_90 < og_g[2]) {
+                                bl_pf_90 = 1;
+                            }
+                        }
+                        int bl_i_90 = lane + 64;
+                        int bl_want_90 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_90 >> 7) % 2) {
+                            bl_want_90 = 1;
+                        }
+                        if (bl_pf_90 == bl_want_90) {
+                            og_m[2] = bl_pm_90;
+                            og_g[2] = bl_pg_90;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_91 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 4);
+                        int bl_pg_91 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 4);
+                        int bl_pf_91 = 0;
+                        if (bl_pm_91 > og_m[3]) {
+                            bl_pf_91 = 1;
+                        }
+                        if (bl_pm_91 == og_m[3]) {
+                            if (bl_pg_91 < og_g[3]) {
+                                bl_pf_91 = 1;
+                            }
+                        }
+                        int bl_i_91 = lane + 96;
+                        int bl_want_91 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_91 >> 7) % 2) {
+                            bl_want_91 = 1;
+                        }
+                        if (bl_pf_91 == bl_want_91) {
+                            og_m[3] = bl_pm_91;
+                            og_g[3] = bl_pg_91;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_92 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_92 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_92 = 0;
+                        if (bl_pm_92 > og_m[0]) {
+                            bl_pf_92 = 1;
+                        }
+                        if (bl_pm_92 == og_m[0]) {
+                            if (bl_pg_92 < og_g[0]) {
+                                bl_pf_92 = 1;
+                            }
+                        }
+                        int bl_i_92 = lane;
+                        int bl_want_92 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_92 >> 7) % 2) {
+                            bl_want_92 = 1;
+                        }
+                        if (bl_pf_92 == bl_want_92) {
+                            og_m[0] = bl_pm_92;
+                            og_g[0] = bl_pg_92;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_93 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_93 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_93 = 0;
+                        if (bl_pm_93 > og_m[1]) {
+                            bl_pf_93 = 1;
+                        }
+                        if (bl_pm_93 == og_m[1]) {
+                            if (bl_pg_93 < og_g[1]) {
+                                bl_pf_93 = 1;
+                            }
+                        }
+                        int bl_i_93 = lane + 32;
+                        int bl_want_93 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_93 >> 7) % 2) {
+                            bl_want_93 = 1;
+                        }
+                        if (bl_pf_93 == bl_want_93) {
+                            og_m[1] = bl_pm_93;
+                            og_g[1] = bl_pg_93;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_94 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_94 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_94 = 0;
+                        if (bl_pm_94 > og_m[2]) {
+                            bl_pf_94 = 1;
+                        }
+                        if (bl_pm_94 == og_m[2]) {
+                            if (bl_pg_94 < og_g[2]) {
+                                bl_pf_94 = 1;
+                            }
+                        }
+                        int bl_i_94 = lane + 64;
+                        int bl_want_94 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_94 >> 7) % 2) {
+                            bl_want_94 = 1;
+                        }
+                        if (bl_pf_94 == bl_want_94) {
+                            og_m[2] = bl_pm_94;
+                            og_g[2] = bl_pg_94;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_95 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_95 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_95 = 0;
+                        if (bl_pm_95 > og_m[3]) {
+                            bl_pf_95 = 1;
+                        }
+                        if (bl_pm_95 == og_m[3]) {
+                            if (bl_pg_95 < og_g[3]) {
+                                bl_pf_95 = 1;
+                            }
+                        }
+                        int bl_i_95 = lane + 96;
+                        int bl_want_95 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_95 >> 7) % 2) {
+                            bl_want_95 = 1;
+                        }
+                        if (bl_pf_95 == bl_want_95) {
+                            og_m[3] = bl_pm_95;
+                            og_g[3] = bl_pg_95;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_96 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_96 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_96 = 0;
+                        if (bl_pm_96 > og_m[0]) {
+                            bl_pf_96 = 1;
+                        }
+                        if (bl_pm_96 == og_m[0]) {
+                            if (bl_pg_96 < og_g[0]) {
+                                bl_pf_96 = 1;
+                            }
+                        }
+                        int bl_i_96 = lane;
+                        int bl_want_96 = 0;
+                        if (lane % 2 == (bl_i_96 >> 7) % 2) {
+                            bl_want_96 = 1;
+                        }
+                        if (bl_pf_96 == bl_want_96) {
+                            og_m[0] = bl_pm_96;
+                            og_g[0] = bl_pg_96;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_97 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_97 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_97 = 0;
+                        if (bl_pm_97 > og_m[1]) {
+                            bl_pf_97 = 1;
+                        }
+                        if (bl_pm_97 == og_m[1]) {
+                            if (bl_pg_97 < og_g[1]) {
+                                bl_pf_97 = 1;
+                            }
+                        }
+                        int bl_i_97 = lane + 32;
+                        int bl_want_97 = 0;
+                        if (lane % 2 == (bl_i_97 >> 7) % 2) {
+                            bl_want_97 = 1;
+                        }
+                        if (bl_pf_97 == bl_want_97) {
+                            og_m[1] = bl_pm_97;
+                            og_g[1] = bl_pg_97;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_98 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_98 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_98 = 0;
+                        if (bl_pm_98 > og_m[2]) {
+                            bl_pf_98 = 1;
+                        }
+                        if (bl_pm_98 == og_m[2]) {
+                            if (bl_pg_98 < og_g[2]) {
+                                bl_pf_98 = 1;
+                            }
+                        }
+                        int bl_i_98 = lane + 64;
+                        int bl_want_98 = 0;
+                        if (lane % 2 == (bl_i_98 >> 7) % 2) {
+                            bl_want_98 = 1;
+                        }
+                        if (bl_pf_98 == bl_want_98) {
+                            og_m[2] = bl_pm_98;
+                            og_g[2] = bl_pg_98;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_99 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_99 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_99 = 0;
+                        if (bl_pm_99 > og_m[3]) {
+                            bl_pf_99 = 1;
+                        }
+                        if (bl_pm_99 == og_m[3]) {
+                            if (bl_pg_99 < og_g[3]) {
+                                bl_pf_99 = 1;
+                            }
+                        }
+                        int bl_i_99 = lane + 96;
+                        int bl_want_99 = 0;
+                        if (lane % 2 == (bl_i_99 >> 7) % 2) {
+                            bl_want_99 = 1;
+                        }
+                        if (bl_pf_99 == bl_want_99) {
+                            og_m[3] = bl_pm_99;
+                            og_g[3] = bl_pg_99;
+                        }
+                    }
+                    #pragma unroll
+                    for (int ok4 = 0; ok4 < 4; ok4++) {
+                        int ok4_s = lane + 32 * ok4;
+                        if (ok4_s < og_n) {
+                            og_a[ok4_s] = og_g[ok4];
+                        }
+                    }
+                }
+                mbarrier_arrive(order_ready_addr);
+            }
+            mbarrier_wait(order_ready_addr, 0);
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (unsigned int t_e = cluster_e; t_e < reg_end_e; t_e += num_clusters_e) {
@@ -775,6 +3136,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                 unsigned int kr_n_block_e = rem_e / grid_n_e;
                 n_block_e = nc_n_block_e * (1 - rr_n_block_e) + (rem_e - kr_n_block_e * grid_n_e) * rr_n_block_e;
                 k_block_e = (rem_e - nc_n_block_e * grid_k_e) * (1 - rr_n_block_e) + kr_n_block_e * rr_n_block_e;
+                if (num_groups <= 128) {
+                    e_ue = (unsigned int)og_a[(int)e_ue];
+                }
                 int row_n = (int)n_block_e * BLOCK_N + cta_rank * BLOCK_M + epi_tid;
                 int col0 = (int)k_block_e * TILE_K;
                 mbarrier_wait(mainloop_done_addr, _phase_mainloop_done);
@@ -879,6 +3243,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned int kr_n_block_et = rem_et / grid_n_e;
                     n_block_et = nc_n_block_et * (1 - rr_n_block_et) + (rem_et - kr_n_block_et * grid_n_e) * rr_n_block_et;
                     k_block_et = (rem_et - nc_n_block_et * grid_k_e) * (1 - rr_n_block_et) + kr_n_block_et * rr_n_block_et;
+                    if (num_groups <= 128) {
+                        e_uet = (unsigned int)og_a[(int)e_uet];
+                    }
                     int row_nt = (int)n_block_et * BLOCK_N + cta_rank * BLOCK_M + epi_tid;
                     int col0t = (int)k_block_et * TILE_K;
                     int e_kb_te = (int)e_uet;
