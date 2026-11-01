@@ -130,7 +130,6 @@ def _get_variant_name(
     enable_tvm_ffi: bool = False,
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
-    use_pdl: bool = False,
 ) -> str:
     """Generate the variant name matching compile_cute_dsl_fmha.py naming convention."""
     qk_str = _dtype_to_str(qk_dtype)
@@ -151,9 +150,8 @@ def _get_variant_name(
     lse_str = "_lse" if with_lse else ""
     skip_str = "_skipsm" if enable_skip_softmax else ""
     sink_str = "_sink" if enable_sink else ""
-    pdl_str = "_pdl" if use_pdl else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
-    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}{ffi_str}"
+    return f"cute_dsl_fmha_{dtype_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{ffi_str}"
 
 
 # =============================================================================
@@ -249,7 +247,6 @@ def get_cute_dsl_fmha_kernel(
     with_lse: bool = False,
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
-    use_pdl: bool = False,
 ):
     """Get a compiled DSL FMHA kernel function.
 
@@ -300,7 +297,6 @@ def get_cute_dsl_fmha_kernel(
         enable_tvm_ffi=enable_tvm_ffi,
         enable_skip_softmax=enable_skip_softmax,
         enable_sink=enable_sink,
-        use_pdl=use_pdl,
     )
 
     # Check for local .so directory (development mode)
@@ -442,7 +438,6 @@ def cute_dsl_fmha_ragged_prefill(
                 with_lse=lse is not None,
                 enable_skip_softmax=use_skip_softmax,
                 enable_sink=attention_sinks is not None,
-                use_pdl=enable_pdl,
             )
         except (RuntimeError, FileNotFoundError) as e:
             # Cubin variant not available / repo unreachable.
@@ -464,7 +459,6 @@ def cute_dsl_fmha_ragged_prefill(
                 lse is not None,
                 attention_sinks is not None,
                 use_skip_softmax,
-                enable_pdl,
                 q.device,
                 has_window_left=window_left != -1,
                 has_window_right=is_causal or window_right != -1,
