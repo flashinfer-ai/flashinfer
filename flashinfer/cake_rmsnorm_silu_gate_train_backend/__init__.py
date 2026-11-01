@@ -26,7 +26,9 @@ decorations and the user-facing documentation live in
 
 Numerical contract against the deterministic package: the forward is the
 deterministic package's forward kernel rendered here (it has no reduction, so
-its bits are the same); the backward is one kernel that writes ``dx`` and ``dz``
+its bits are the same), and on sm_100a / sm_103a from 2400 rows per SM a
+forward whose CTAs each walk several row blocks with the same arithmetic (the
+same bits); the backward is one kernel that writes ``dx`` and ``dz``
 exactly as the deterministic backward does, sums the weight gradient of the
 row blocks each CTA takes (its own block when the grid has a CTA for every
 block, else the chunks it claims) in FP32 runs of at most 16 rows folded into
@@ -79,15 +81,23 @@ Host design (the input layout rules are the deterministic package's):
   weight-gradient module) uses the zero-filled workspace of its (device,
   stream, backward module), allocated on first use and kept in
   ``_STREAM_WORKSPACES`` for later calls: 4104 bytes each, at most one per
-  weight-gradient dtype (two backward modules) for every stream that ran such
-  a backward.  Such eager calls also keep a reserve of 64 zero-filled
+  backward module (two per weight-gradient dtype on sm_107a, where the long
+  backward is a module of its own, else one) for every stream that ran such a
+  backward.  Such eager calls also keep a reserve of 64 zero-filled
   workspaces per device (one allocation of about 272 KiB, filled outside any
   capture), from which a call during CUDA Graph capture takes the workspace of
   its capture and capture stream for good, so a replay launches no fill kernel
   (see ``_RESERVES``; with none ready, the graph zero-fills one of its own).
-- Grids: the forward launches one CTA per block of 16 rows.  The backward
+- Grids (``cake_jit.module_for_rows`` picks the module from the rows and
+  the device's SM count): the forward launches one CTA per block of 16 rows;
+  on sm_100a and sm_103a from 2400 rows per SM it launches the long forward,
+  the fewest whole waves of 3 CTAs per SM that give no CTA more than 6 blocks
+  of 32 rows (CTA ``b`` walks the blocks ``b``, ``b + grid``, ..., loading
+  each next block while it computes the current one).  The backward
   launches ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
-  ctas_per_sm * SMs)`` with ``ctas_per_sm = 4``, so at most one wave.  When
+  ctas_per_sm * SMs)``, so at most one wave: 256-thread CTAs of 16-row blocks
+  with ``ctas_per_sm = 4``, and on sm_107a from 1024 rows per SM 128-thread
+  CTAs of 8-row blocks with ``ctas_per_sm = 8``.  When
   ``G`` is the number of row blocks, CTA ``c`` takes block ``c`` and nothing
   is claimed.  Past one wave, thread 0 of every CTA claims every block in
   chunks of consecutive blocks with a relaxed atomic add on the workspace's
@@ -101,8 +111,8 @@ Host design (the input layout rules are the deterministic package's):
   synchronizes the host or the device, and every kernel runs on the current
   torch stream.
 - Beside kernels resident on other streams (FlashInfer issue #7548; observed
-  on B200, sm_100a): each backward CTA needs 16640 bytes of dynamic shared
-  memory, so a kernel holding every SM with a small shared-memory carveout
+  on B200, sm_100a): each 256-thread backward CTA needs 16640 bytes of dynamic
+  shared memory, so a kernel holding every SM with a small shared-memory carveout
   delays the backward's start until it exits;
   :mod:`flashinfer.cake_rmsnorm_silu_gate_train` documents the remedy.
 """
@@ -123,11 +133,13 @@ from .cake_jit import (
     ARCHES,
     HEAD_DIM,
     INT32_MAX,
+    LONG_ROLES,
     ROLES,
     ROUTES,
     arch_for_capability,
     backward_ctas,
-    route_module,
+    device_sm_count,
+    module_for_rows,
     workspace_elements,
 )
 
@@ -188,11 +200,6 @@ def _arch_of_index(device_index: int) -> Optional[str]:
     return arch_for_capability(tuple(torch.cuda.get_device_capability(device_index)))
 
 
-@functools.cache
-def _sm_count_of_index(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
 def _device_arch(device: torch.device) -> str:
     if device.type != "cuda":
         raise ValueError(
@@ -222,7 +229,7 @@ def is_cake_rmsnorm_silu_gate_train_supported(
     if device.type != "cuda":
         return False
     arch = _arch_of_index(_device_index(device))
-    return arch is not None and set(ROUTES.get(arch, {})) == set(ROLES)
+    return arch is not None and set(ROLES) <= set(ROUTES.get(arch, {}))
 
 
 def _rows_shape(shape: torch.Size) -> tuple[int, int]:
@@ -378,9 +385,9 @@ def _forward(
         "z_head": z_head,
         "eps": float(eps),
     }
-    _loader.run_module(
-        route_module(arch, "fwd"), values, rows=rows, device_index=_device_index(device)
-    )
+    index = _device_index(device)
+    name = module_for_rows(arch, "fwd", rows, device_sm_count(index))
+    _loader.run_module(name, values, rows=rows, device_index=index)
     if y_user is not None:
         y_user.copy_(y)
         return y_user
@@ -400,7 +407,8 @@ def cake_rmsnorm_silu_gate_train_forward(
     ``y = BF16(((x * rstd) * weight) * silu(z))``.
 
     The deterministic package's forward kernel rendered here (it has no
-    reduction: the same bits).  The arguments are those of
+    reduction: the same bits), or on sm_100a / sm_103a from 2400 rows per SM
+    the long forward (the same bits).  The arguments are those of
     :func:`flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_forward`;
     ``deterministic`` must be ``False``.
     """
@@ -410,10 +418,14 @@ def cake_rmsnorm_silu_gate_train_forward(
 
 
 def _workspace_elements(arch: str) -> int:
-    """FP64 elements of a workspace that serves both weight-gradient dtypes."""
+    """FP64 elements of a workspace that serves every backward module of
+    ``arch`` (both weight-gradient dtypes, any row count)."""
 
+    routes = ROUTES[arch]
     return max(
-        workspace_elements(route_module(arch, role)) for role in ("bwd_bf16", "bwd_f32")
+        workspace_elements(routes[role])
+        for role in ROLES + LONG_ROLES
+        if role.startswith("bwd") and role in routes
     )
 
 
@@ -492,9 +504,9 @@ def cake_rmsnorm_silu_gate_train_reset_workspace(
 # needs one: it takes the arrival ticket, and claims row blocks past one
 # wave): one
 # per (device, stream, backward module), zero-filled once and kept for the
-# process (4104 bytes each, at most two per stream).  Every backward leaves its
-# workspace zero and the calls of one stream run in order, so they share it (no
-# allocation and no fill per call).  A call during CUDA Graph capture uses a
+# process (4104 bytes each, at most two per stream, four on sm_107a).  Every
+# backward leaves its workspace zero and the calls of one stream run in order,
+# so they share it (no allocation and no fill per call).  A call during CUDA Graph capture uses a
 # workspace of its capture instead (``_capture_workspace``), so a graph replayed
 # on another stream never shares a buffer with eager calls or other graphs.
 _STREAM_WORKSPACES: dict[tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]] = {}
@@ -723,10 +735,10 @@ def _backward(
     gv, dy_tok, dy_head = _kernel_view(grad_out, "grad_out", shape=shape, device=device)
     xv, x_tok, x_head = _kernel_view(x, "x", shape=shape, device=device)
     zv, z_tok, z_head = _kernel_view(z, "z", shape=shape, device=device)
-    name = route_module(
-        arch, "bwd_f32" if dw is not None and dw.dtype == torch.float32 else "bwd_bf16"
-    )
-    ctas = backward_ctas(name, rows, _sm_count_of_index(_device_index(device)))
+    sm_count = device_sm_count(_device_index(device))
+    role = "bwd_f32" if dw is not None and dw.dtype == torch.float32 else "bwd_bf16"
+    name = module_for_rows(arch, role, rows, sm_count)
+    ctas = backward_ctas(name, rows, sm_count)
     # Every launch, weight_grad=0 included, takes the arrival ticket (and past
     # one wave of row blocks claims its blocks from the claim counter), and
     # leaves both words zero.

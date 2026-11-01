@@ -43,9 +43,11 @@ dispatches on it here:
   node.
 * ``deterministic=False`` runs the standalone non-deterministic package
   ``flashinfer.cake_rmsnorm_silu_gate_train_backend``: the same forward kernel
-  (it has no reduction, so ``y`` has the same bits) and a one-kernel backward
-  whose ``dx`` and ``dz`` are the deterministic backward's bits.  Its CTAs
-  take row blocks (one block each when the grid has a CTA for every block;
+  (it has no reduction, so ``y`` has the same bits; on SM100 and SM103 from
+  2400 rows per SM a forward whose CTAs each walk several row blocks, also
+  the same bits) and a one-kernel backward whose ``dx`` and ``dz`` are the
+  deterministic backward's bits.  Its CTAs take row blocks (one block each
+  when the grid has a CTA for every block;
   past one wave of CTAs they claim the blocks in chunks), sum the weight
   gradient in FP32 runs of at most 16 rows folded into FP64, and add their FP64
   column sums into FP64 accumulators with atomics; the CTA that arrives last
@@ -86,7 +88,8 @@ that anything else wrote into, must be zeroed with
 ``cake_rmsnorm_silu_gate_train_reset_workspace(ws, deterministic=False)``
 before its next backward.  It is not interchangeable with the deterministic
 package's partial buffer.  Calls without a workspace use one 4104-byte buffer
-per device, stream and weight-gradient dtype, kept for later calls; the
+per device, stream and backward kernel (one per weight-gradient dtype, two
+on SM107 from 1024 rows per SM), kept for later calls; the
 autograd node retains nothing else.  They also keep a reserve of 64
 zero-filled 4104-byte buffers per device (about 272 KiB, filled outside any
 capture): a call during CUDA Graph capture takes one per capture and capture
@@ -254,8 +257,10 @@ def cake_rmsnorm_silu_gate_train_forward(
         ``True`` (default) runs the deterministic package's forward
         (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_forward`)
         with these arguments.  ``False`` runs the non-deterministic package's
-        forward program, the same kernel rendered there (the forward has no
-        reduction, so both return the same bits); it is refused while
+        forward program, the same kernel rendered there, or on SM100 / SM103
+        from 2400 rows per SM a forward whose CTAs each walk several row
+        blocks with the same arithmetic (the forward has no reduction, so
+        both return the same bits); it is refused while
         ``torch.use_deterministic_algorithms(True)`` is in effect (with
         ``warn_only=True``: a warning, then the deterministic forward).
 
@@ -428,7 +433,7 @@ def cake_rmsnorm_silu_gate_train_backward(
         :func:`cake_rmsnorm_silu_gate_train_reset_workspace` after anything else
         wrote into it).  When omitted: the deterministic package allocates its
         buffer per call; the non-deterministic backward uses one zero-filled
-        buffer per device, stream and weight-gradient dtype, kept for later
+        buffer per device, stream and backward kernel, kept for later
         calls (during CUDA Graph capture, one zero-filled buffer per capture
         and capture stream, from a reserve those calls keep).  One buffer per
         backward that may run at the same time on another stream.

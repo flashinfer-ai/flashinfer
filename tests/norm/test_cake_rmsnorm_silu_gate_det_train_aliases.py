@@ -163,12 +163,14 @@ def test_old_package_submodule_is_its_own_module(submodule: str) -> None:
 def test_old_package_is_self_contained() -> None:
     assert sorted(legacy_backend.__all__) == LEGACY_ALL
     assert not hasattr(legacy_backend, "cake_rmsnorm_silu_gate_det_train_forward")
-    # its own registry: the det forward program renamed and the one-kernel backward in both dw dtypes
+    # its own registry: the det forward program renamed, the one-kernel backward in both dw dtypes
+    # and the long-input modules
     loader = legacy_backend.cake_jit
     assert loader.MODULES and all(
         name.startswith("cake_rmsnorm_silu_gate_train_") for name in loader.MODULES
     )
-    assert {record["role"] for record in loader.MODULES.values()} == set(loader.ROLES)
+    roles = {record["role"] for record in loader.MODULES.values()}
+    assert roles == set(loader.ROLES) | set(loader.LONG_ROLES)
     old_dir = Path(legacy_backend.__file__).parent
     files = {p.name for p in old_dir.iterdir() if p.name != "__pycache__"}
     assert {

@@ -1146,3 +1146,107 @@ def test_autograd_and_checkpoint_match_the_deterministic_package(
     )
     yc.backward(dy)
     check(yc, xc.grad, zc.grad, wc.grad, "checkpoint")
+
+
+# --------------------------------------------------------------------------- the long modules' thresholds
+
+
+def _spy_launches(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    launched: list[str] = []
+    run_module = loader.run_module
+
+    def spy(name, values, *, rows, device_index):
+        launched.append(name)
+        return run_module(name, values, rows=rows, device_index=device_index)
+
+    monkeypatch.setattr(loader, "run_module", spy)
+    return launched
+
+
+def _sm_count() -> int:
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
+# Forward inputs around and past 2400 rows per SM, where sm_100a and sm_103a
+# switch to the long forward: (tokens, heads, layout); ``heads=None`` takes
+# ``2400 * SMs + tokens`` rows as one flat [rows, 128] tensor.
+LONG_FORWARD_CASES = [
+    pytest.param(-1, None, "flat", id="threshold-1"),
+    pytest.param(1, None, "flat", id="threshold+1"),
+    pytest.param(8192, 48, "contiguous", id="8192x48"),
+    pytest.param(8192, 48, "projection", id="8192x48-projection"),
+    pytest.param(8192, 48, "head_major", id="8192x48-head_major"),
+    pytest.param(32737, 48, "contiguous", id="32737x48"),
+    pytest.param(32737, 32, "contiguous", id="32737x32"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("tokens,heads,layout", LONG_FORWARD_CASES)
+def test_forward_around_the_long_threshold_matches_the_deterministic_package(
+    tokens, heads, layout, determinism_setting, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``y`` is the deterministic package's bits on both sides of the long
+    forward's threshold and past it, and the forward launches
+    ``module_for_rows``' module: the long forward from ``2400 * SMs`` rows
+    where the architecture routes one, else the forward."""
+    sms = _sm_count()
+    arch = loader.device_arch(torch.cuda.current_device())
+    if heads is None:
+        x, z, w, _ = suite.make(2400 * sms + tokens, 1, layout=layout, seed=21)
+    else:
+        x, z, w, _ = suite.make(tokens, heads, layout=layout, seed=21)
+    rows = x.numel() // D
+    launched = _spy_launches(monkeypatch)
+    y = nd_forward(x, z, w, EPS)
+    name = loader.module_for_rows(arch, "fwd", rows, sms)
+    assert launched == [name], launched
+    long = loader.ROUTES[arch].get("fwd_long")
+    assert name == (
+        long
+        if long is not None and rows >= 2400 * sms
+        else loader.route_module(arch, "fwd")
+    )
+    assert torch.equal(y, det_forward(x, z, w, EPS)), "y vs the deterministic package"
+
+
+@requires_device
+@pytest.mark.parametrize("offset", [-1, 1], ids=["threshold-1", "threshold+1"])
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+def test_backward_around_the_long_threshold_matches_the_deterministic_package(
+    offset, dw_dtype, determinism_setting, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On an architecture that routes a long backward (sm_107a: from 1024 rows
+    per SM), one row below and above the threshold: the module launched is
+    ``module_for_rows``', ``dx`` and ``dz`` are the deterministic package's
+    bits and ``dw`` lies within the budget of the deterministic ``dw`` on
+    every repeat, and the workspace is zero after every call."""
+    arch = loader.device_arch(torch.cuda.current_device())
+    role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
+    long = loader.ROUTES[arch].get(f"{role}_long")
+    if long is None:
+        pytest.skip(f"{arch} routes no long backward")
+    sms = _sm_count()
+    rows = 1024 * sms + offset
+    x, z, w, dy = suite.make(rows, 1, layout="flat", seed=22)
+    mag = suite.magnitudes(dy, x, z, EPS)
+
+    def out():
+        return torch.empty(D, dtype=dw_dtype, device=x.device)
+
+    dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())
+    ws = nd_workspace(rows, x.device)
+    launched = _spy_launches(monkeypatch)
+    for _ in range(suite.REPEATS):
+        dx, dz, dw = nd_backward(dy, x, z, w, EPS, grad_weight=out(), workspace=ws)
+        assert dw.dtype == dw_dtype
+        assert torch.equal(dx, dx_d), "dx vs the deterministic package"
+        assert torch.equal(dz, dz_d), "dz vs the deterministic package"
+        suite.assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
+        assert not bool(ws.any()), "the workspace is not zero"
+    name = long if offset > 0 else loader.route_module(arch, role)
+    assert launched == [name] * suite.REPEATS, launched

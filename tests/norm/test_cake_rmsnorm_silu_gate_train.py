@@ -462,8 +462,9 @@ def test_workspace_reused_across_shapes_without_reset():
     nbytes = workspace_bytes(1, device)
     assert ws.numel() * 8 == nbytes == workspace_bytes(10**7, device)
     arch = loader.device_arch(torch.cuda.current_device())
-    for role in ("bwd_bf16", "bwd_f32"):
-        assert loader.workspace_elements(loader.route_module(arch, role)) * 8 <= nbytes
+    for role, name in loader.ROUTES[arch].items():
+        if role.startswith("bwd"):
+            assert loader.workspace_elements(name) * 8 <= nbytes, role
     cases = (
         (1031, 48, torch.bfloat16, False),
         (7, 48, torch.float32, False),
@@ -981,17 +982,19 @@ def test_empty_and_errors():
 
 
 def test_registry_records_reference_the_build_manifest():
-    """Every role ships one module per architecture; every module record names
-    its ``build.json`` library (schema ``cake-build/1``), whose entries carry the
-    package's kernel and binding sources and the precise-arithmetic flags; the
-    backward records size their workspace from their accumulator slots."""
+    """Every role ships one module per architecture (a long role at most one);
+    every module record names its ``build.json`` library (schema
+    ``cake-build/1``), whose entries carry the package's kernel and binding
+    sources and the precise-arithmetic flags; the backward records size their
+    workspace from their accumulator slots."""
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
     assert manifest["package"] == "flashinfer.cake_rmsnorm_silu_gate_train_backend"
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     for arch in loader.ARCHES:
-        assert set(loader.ROUTES[arch]) == set(loader.ROLES), arch
+        routed = set(loader.ROUTES[arch])
+        assert set(loader.ROLES) <= routed <= set(loader.ROLES + loader.LONG_ROLES)
         for role, name in loader.ROUTES[arch].items():
             record = loader.MODULES[name]
             assert record["role"] == role and arch in record["arches"], (arch, role)
@@ -1007,6 +1010,8 @@ def test_registry_records_reference_the_build_manifest():
         assert record["launch"]["use_pdl"] is False
         if record["role"] == "fwd":
             assert record["grid_rule"]["kind"] == "row_blocks"
+        elif record["role"] == "fwd_long":
+            assert record["grid_rule"]["kind"] == "persistent_row_blocks"
         else:
             assert record["grid_rule"]["kind"] == "row_claims"
             plan = [key for _kind, key in record["arg_plan"]]
@@ -1035,7 +1040,112 @@ def test_backward_cta_rule(rows, sm_count):
         blocks = -(-rows // rule["rows_per_cta"])
         wave = rule["ctas_per_sm"] * sm_count
         assert ctas == min(blocks, wave)
-        assert loader.launch_grid(record, rows=rows, ctas=ctas) == (ctas, 1, 1)
+        grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=ctas)
+        assert grid == (ctas, 1, 1)
+
+
+# The long roles each architecture routes, with the rows per SM they run from.
+LONG_ROUTES = {
+    "sm_100a": {"fwd_long": 2400},
+    "sm_103a": {"fwd_long": 2400},
+    "sm_107a": {"bwd_bf16_long": 1024, "bwd_f32_long": 1024},
+}
+
+
+@pytest.mark.parametrize("sm_count", [148, 152, 212, 216])
+def test_long_modules_run_from_their_rows_per_sm(sm_count):
+    """``module_for_rows``: a role's long module from ``min_rows_per_sm *
+    sm_count`` rows (on the architectures that route one), the role's module
+    below that and on the others."""
+    for arch in loader.ARCHES:
+        longs = {
+            role: loader.MODULES[name]["grid_rule"]["min_rows_per_sm"]
+            for role, name in loader.ROUTES[arch].items()
+            if role in loader.LONG_ROLES
+        }
+        assert longs == LONG_ROUTES[arch], arch
+        for role in loader.ROLES:
+            base = loader.route_module(arch, role)
+            long = loader.ROUTES[arch].get(f"{role}_long")
+            for rows in (1, 48, 1024 * sm_count - 1, 2400 * sm_count - 1):
+                if long is None or rows < longs[f"{role}_long"] * sm_count:
+                    assert loader.module_for_rows(arch, role, rows, sm_count) == base
+            if long is None:
+                for rows in (2400 * sm_count, 2**31 - 1):
+                    assert loader.module_for_rows(arch, role, rows, sm_count) == base
+                continue
+            threshold = longs[f"{role}_long"] * sm_count
+            assert loader.module_for_rows(arch, role, threshold - 1, sm_count) == base
+            for rows in (threshold, threshold + 1, 2**31 - 1):
+                assert loader.module_for_rows(arch, role, rows, sm_count) == long
+            assert loader.MODULES[long]["role"] == f"{role}_long"
+
+
+# (rows, SMs, CTAs) of the long forward: 32-row blocks, the fewest whole waves
+# of 3 CTAs per SM whose CTAs walk at most 6 blocks, never more CTAs than blocks.
+LONG_FORWARD_GRIDS = [
+    (1, 148, 1),
+    (32 * 444, 148, 444),  # a block per CTA of one wave
+    (32 * 444 * 6, 148, 444),  # one wave, 6 blocks a CTA
+    (32 * 444 * 6 + 1, 148, 888),  # a block more: two waves
+    (2400 * 148, 148, 2220),  # B200 threshold: 11100 blocks, 5 waves
+    (32737 * 48, 148, 8436),  # 49106 blocks, 19 waves
+    (2400 * 152, 152, 2280),  # GB300 threshold: 11400 blocks, 5 waves
+    (32737 * 48, 152, 8208),  # 18 waves of 456
+    (2**31 - 1, 148, 25192 * 444),  # 2**26 blocks, 25192 waves
+]
+
+
+@pytest.mark.parametrize(("rows", "sm_count", "ctas"), LONG_FORWARD_GRIDS)
+def test_long_forward_grid_is_whole_waves_of_at_most_six_blocks_a_cta(
+    rows, sm_count, ctas
+):
+    name = loader.ROUTES["sm_100a"]["fwd_long"]
+    record = loader.MODULES[name]
+    assert record["grid_rule"] == {
+        "ctas_per_sm": 3,
+        "kind": "persistent_row_blocks",
+        "max_blocks_per_cta": 6,
+        "min_rows_per_sm": 2400,
+        "rows_per_block": 32,
+    }
+    grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
+    assert grid == (ctas, 1, 1)
+    blocks, wave = -(-rows // 32), 3 * sm_count
+    assert -(-blocks // ctas) <= 6
+    assert ctas == blocks or ctas % wave == 0
+    assert ctas == blocks or (ctas - wave) * 6 < blocks
+    # the grid is the long forward's whatever ``ctas`` the call passes
+    assert loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=7) == grid
+    fwd = loader.MODULES[loader.route_module("sm_100a", "fwd")]
+    assert loader.launch_grid(fwd, rows=rows, sm_count=sm_count) == (
+        -(-rows // 16),
+        1,
+        1,
+    )
+
+
+@pytest.mark.parametrize("sm_count", [208, 212, 216])
+@pytest.mark.parametrize("rows", [1, 1024, 217087, 217088, 1571376])
+def test_long_backward_cta_rule(rows, sm_count):
+    # sm_107a's long backward: 8-row blocks of 128 threads, at most 8 CTAs per
+    # SM (one wave); the workspace is the 256-thread module's.
+    for role in ("bwd_bf16", "bwd_f32"):
+        name = loader.ROUTES["sm_107a"][f"{role}_long"]
+        record = loader.MODULES[name]
+        assert record["grid_rule"] == {
+            "ctas_per_sm": 8,
+            "kind": "row_claims",
+            "min_rows_per_sm": 1024,
+            "rows_per_cta": 8,
+        }
+        assert record["launch"]["block"] == (128, 1, 1)
+        ctas = loader.backward_ctas(name, rows, sm_count)
+        assert ctas == min(-(-rows // 8), 8 * sm_count)
+        grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=ctas)
+        assert grid == (ctas, 1, 1)
+        base = loader.route_module("sm_107a", role)
+        assert loader.workspace_elements(name) == loader.workspace_elements(base)
 
 
 def test_calls_without_workspace_share_one_buffer_per_stream():
