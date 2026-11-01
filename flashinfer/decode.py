@@ -5090,9 +5090,11 @@ def trtllm_batch_decode_with_kv_cache(
         if backend == "cake":
             from .cake_fmha import (
                 CakeFmhaAlignedDecodeModule,
+                CakeFmhaAlignedHd64DecodeModule,
                 CakeFmhaDecodeProgramModule,
                 _resolve_cake_fmha_decode_module,
                 _run_cake_fmha_aligned_decode,
+                _run_cake_fmha_aligned_hd64_decode,
                 _run_cake_fmha_decode_program,
                 select_cake_fmha_decode_route,
             )
@@ -5142,6 +5144,24 @@ def trtllm_batch_decode_with_kv_cache(
                 # query dtype without LSE, so ``out`` is the whole result; it
                 # needs no workspace or counter buffer and ignores enable_pdl.
                 _run_cake_fmha_aligned_decode(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    bmm1_scale=bmm1_scale,
+                )
+                return out
+            if isinstance(cake_module, CakeFmhaAlignedHd64DecodeModule):
+                # Aligned hd64 q1 decode: the generated grouped program (one
+                # persistent CTA per (request, KV head) tile) launched with the
+                # kernel's host parameters positionally plus the grid.  The
+                # route admits only BF16 output in the query dtype without LSE,
+                # so ``out`` is the whole result; it needs no workspace or
+                # counter buffer and ignores enable_pdl.
+                _run_cake_fmha_aligned_hd64_decode(
                     cake_module,
                     query=query,
                     key_cache=k_cache,
