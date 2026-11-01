@@ -93,6 +93,10 @@ constexpr uint64_t kNarrowChunkC16TripFillDen = 10;
 constexpr uint64_t kPersistentRowsPerClusterNum = 5;
 constexpr uint64_t kPersistentRowsPerClusterDen = 2;
 constexpr uint64_t kSharedTilesRowsPerCluster = 4;
+// sm_103, 5- and 6-tile 8-CTA chunks whose CTA share exceeds 5 tiles: the
+// persistent kernel stays from 4 up to 6 rows per shared-tile cluster (296 to
+// 443 rows on GB300).
+constexpr uint64_t kFiveSixTileC8PersistentMaxRowsPerClusterSm103 = 6;
 // sm_100, 5-tile 8-CTA chunks whose fifth tile is more than 2/8 full: three
 // persistent trips take the persistent kernel from 10/9 rows per shared-tile
 // cluster on, and a fifth tile at most 279/1024 full keeps it below 15/2 rows
@@ -147,30 +151,6 @@ constexpr uint64_t kBalancedChunkEightCtaSharedMinCutDenSm103 = 32;
 constexpr uint64_t kBalancedChunkEightCtaSharedMaxCutDenSm103 = 1;
 constexpr uint64_t kBalancedChunkEightCtaPersistentMinCutDenSm103 = 10;
 constexpr uint64_t kBalancedChunkEightCtaPersistentMaxCutDenSm103 = 1;
-// sm_103: the most rows at which the 8-CTA shared-tile kernel with a cut of at
-// least 1/HighCutDen (HighCut) or under it (LowCut), and the 8-CTA persistent
-// kernel, take the balanced chunk for a whole-tile chunk of 6, 7 or 8 tiles
-// (and of 5 tiles for LowCut), on top of the rules above (kBalancedChunkAnyRows:
-// no bound; 0: no row).
-constexpr uint32_t kBalancedChunkAnyRows = std::numeric_limits<uint32_t>::max();
-constexpr uint64_t kBalancedChunkEightCtaSharedHighCutDenSm103 = 10;
-constexpr uint32_t kBalancedChunkEightCtaSharedHighCutSixTileMaxRowsSm103 = 79;
-constexpr uint32_t kBalancedChunkEightCtaSharedHighCutSevenTileMaxRowsSm103 = kBalancedChunkAnyRows;
-constexpr uint32_t kBalancedChunkEightCtaSharedHighCutEightTileMaxRowsSm103 = kBalancedChunkAnyRows;
-constexpr uint32_t kBalancedChunkEightCtaSharedLowCutFiveTileMaxRowsSm103 = kBalancedChunkAnyRows;
-constexpr uint32_t kBalancedChunkEightCtaSharedLowCutSixTileMaxRowsSm103 = kBalancedChunkAnyRows;
-constexpr uint32_t kBalancedChunkEightCtaSharedLowCutSevenTileMaxRowsSm103 = kBalancedChunkAnyRows;
-constexpr uint32_t kBalancedChunkEightCtaSharedLowCutEightTileMaxRowsSm103 = kBalancedChunkAnyRows;
-constexpr uint32_t kBalancedChunkEightCtaPersistentSixTileMaxRowsSm103 = 92;
-constexpr uint32_t kBalancedChunkEightCtaPersistentSevenTileMaxRowsSm103 = kBalancedChunkAnyRows;
-constexpr uint32_t kBalancedChunkEightCtaPersistentEightTileMaxRowsSm103 = kBalancedChunkAnyRows;
-// sm_100: the most rows at which the 8-CTA shared-tile and persistent kernels
-// take the balanced chunk for a whole-tile chunk of 6 tiles with a cut of at
-// least 1/HighCutDen (0: no row), on top of the rules above. The other 8-CTA
-// chunks have no such bound.
-constexpr uint64_t kBalancedChunkEightCtaHighCutDenSm100 = 10;
-constexpr uint32_t kBalancedChunkEightCtaSharedHighCutSixTileMaxRowsSm100 = 0;
-constexpr uint32_t kBalancedChunkEightCtaPersistentHighCutSixTileMaxRowsSm100 = 0;
 // The 4-tile row kernels of 4 and 8 CTAs take the balanced chunk, per
 // architecture, only for a whole-tile chunk of the tile count set here: one
 // count for rows in one wave of their resident clusters (OneWave) and one for
@@ -851,6 +831,12 @@ cudaError_t select_cached_route(uint32_t rows, uint32_t vocab_size, ParameterKin
     }
     use_shared_tiles = few_rows || many_rows;
   }
+  if (device_minor == 3 && !sixteen && (chunk_tiles == 5 || chunk_tiles == 6) &&
+      ceil_div(vocab_size, static_cast<uint32_t>(variant.cluster_ctas)) > 5 * kCachedTileElements &&
+      rows64 >= kSharedTilesRowsPerCluster * shared_clusters &&
+      rows64 < kFiveSixTileC8PersistentMaxRowsPerClusterSm103 * shared_clusters) {
+    use_shared_tiles = false;
+  }
   if (shared_resident > 0 && use_shared_tiles) {
     *launch = {variant, shared_tiles, rows, shared_tiles_smem,
                SoftmaxRoute::kCachedClusterSharedTiles};
@@ -859,30 +845,6 @@ cudaError_t select_cached_route(uint32_t rows, uint32_t vocab_size, ParameterKin
                SoftmaxRoute::kCachedClusterPersistent};
   }
   return cudaSuccess;
-}
-
-// sm_103: the most rows at which an 8-CTA launch of this kernel, cut and
-// whole-tile chunk takes the balanced chunk.
-uint32_t eight_cta_balanced_max_rows_sm103(bool persistent, bool high_cut, uint32_t whole_tiles) {
-  switch (whole_tiles) {
-    case 5:
-      return persistent || high_cut ? kBalancedChunkAnyRows
-                                    : kBalancedChunkEightCtaSharedLowCutFiveTileMaxRowsSm103;
-    case 6:
-      return persistent ? kBalancedChunkEightCtaPersistentSixTileMaxRowsSm103
-             : high_cut ? kBalancedChunkEightCtaSharedHighCutSixTileMaxRowsSm103
-                        : kBalancedChunkEightCtaSharedLowCutSixTileMaxRowsSm103;
-    case 7:
-      return persistent ? kBalancedChunkEightCtaPersistentSevenTileMaxRowsSm103
-             : high_cut ? kBalancedChunkEightCtaSharedHighCutSevenTileMaxRowsSm103
-                        : kBalancedChunkEightCtaSharedLowCutSevenTileMaxRowsSm103;
-    case 8:
-      return persistent ? kBalancedChunkEightCtaPersistentEightTileMaxRowsSm103
-             : high_cut ? kBalancedChunkEightCtaSharedHighCutEightTileMaxRowsSm103
-                        : kBalancedChunkEightCtaSharedLowCutEightTileMaxRowsSm103;
-    default:
-      return kBalancedChunkAnyRows;
-  }
 }
 
 // The launch: select_cached_route's kernel and the chunk each CTA covers. A CTA
@@ -899,10 +861,8 @@ uint32_t eight_cta_balanced_max_rows_sm103(bool persistent, bool high_cut, uint3
 // past it, unless the temperature is per row; the 16-CTA shared-tile and
 // persistent kernels with a cut of at least 1/10, or on sm_100 past one wave.
 // On sm_100 the 8-tile 8- and 16-CTA kernels keep it past five waves up to the
-// bounds above, unless the temperature is per row. On sm_103 the 8-CTA kernels
-// of a 5- to 8-tile chunk take it only up to the rows set above. On sm_100 the
-// 8-CTA kernels of a 6-tile chunk with a cut of at least 1/10 take it only up
-// to the rows set above. The other kernels keep whole tiles.
+// bounds above, unless the temperature is per row. The other kernels keep
+// whole tiles.
 cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
                                  bool pdl, int device, CachedLaunch* launch) {
   cudaError_t status = select_cached_route(rows, vocab_size, parameter_kind, pdl, device, launch);
@@ -968,18 +928,6 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKi
     const uint64_t max_cut_den = persistent ? kBalancedChunkEightCtaPersistentMaxCutDenSm103
                                             : kBalancedChunkEightCtaSharedMaxCutDenSm103;
     if (cut * min_cut_den < whole || cut * max_cut_den >= whole) {
-      return cudaSuccess;
-    }
-    const bool high_cut = cut * kBalancedChunkEightCtaSharedHighCutDenSm103 >= whole;
-    if (rows > eight_cta_balanced_max_rows_sm103(persistent, high_cut, whole_tiles)) {
-      return cudaSuccess;
-    }
-  }
-  if (eight_cta_chunk && device_minor == 0 && whole_tiles == 6 &&
-      cut * kBalancedChunkEightCtaHighCutDenSm100 >= whole) {
-    const bool persistent = launch->route == SoftmaxRoute::kCachedClusterPersistent;
-    if (rows > (persistent ? kBalancedChunkEightCtaPersistentHighCutSixTileMaxRowsSm100
-                           : kBalancedChunkEightCtaSharedHighCutSixTileMaxRowsSm100)) {
       return cudaSuccess;
     }
   }
