@@ -1159,8 +1159,8 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
         # 8-tile chunks, per-row temperatures included.
         (79, 81928, "none", 10272, 10272),
         (45, 81928, "per_row", 10272, 10272),
-        (296, 81928, "scalar", 10272, 10272),
-        (370, 88320, "scalar_pdl", 11040, 11040),
+        (296, 81928, "scalar", 10272, 12288),
+        (370, 88320, "scalar_pdl", 11040, 12288),
         (371, 88320, "none", 11040, 12288),
         (53, 98312, "none", 12320, 12320),
         (73, 98312, "per_row", 12320, 12320),
@@ -1174,8 +1174,8 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
         (115, 76544, "per_row", 9568, 9568),
         (116, 76544, "none", 9568, 10240),
         (79, 88328, "scalar", 11072, 11072),
-        (296, 88328, "none", 11072, 11072),
-        (370, 91904, "per_row", 12288, 11488),
+        (296, 88328, "none", 11072, 12288),
+        (370, 91904, "per_row", 12288, 12288),
         (371, 91904, "scalar_pdl", 11488, 12288),
         (53, 103176, "none", 12928, 12928),
         (73, 103176, "scalar", 12928, 12928),
@@ -1204,7 +1204,9 @@ def test_blackwell_cached_cluster_eight_cta_balanced_chunk_rows_per_arch(
 ):
     # The 8-CTA kernels of a 5- to 8-tile chunk take the balanced chunk up to
     # five waves or trips, on sm_100 up to seven unless the temperature is per
-    # row (371 rows of 88320 pass five shared-tile waves on sm_103).
+    # row (371 rows of 88320 pass five shared-tile waves on sm_103). On sm_103,
+    # 296 to 443 rows of a 5- or 6-tile chunk whose CTA share exceeds 5 tiles
+    # run the persistent kernel with whole tiles instead.
     _skip_unless_b200_or_gb300()
     torch.manual_seed(13)
     logits = torch.randn(rows, vocab_size, device="cuda")

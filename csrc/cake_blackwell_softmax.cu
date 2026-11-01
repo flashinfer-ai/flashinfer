@@ -93,6 +93,10 @@ constexpr uint64_t kNarrowChunkC16TripFillDen = 10;
 constexpr uint64_t kPersistentRowsPerClusterNum = 5;
 constexpr uint64_t kPersistentRowsPerClusterDen = 2;
 constexpr uint64_t kSharedTilesRowsPerCluster = 4;
+// sm_103, 5- and 6-tile 8-CTA chunks whose CTA share exceeds 5 tiles: the
+// persistent kernel stays from 4 up to 6 rows per shared-tile cluster (296 to
+// 443 rows on GB300).
+constexpr uint64_t kFiveSixTileC8PersistentMaxRowsPerClusterSm103 = 6;
 // sm_100, 5-tile 8-CTA chunks whose fifth tile is more than 2/8 full: three
 // persistent trips take the persistent kernel from 10/9 rows per shared-tile
 // cluster on, and a fifth tile at most 279/1024 full keeps it below 15/2 rows
@@ -826,6 +830,12 @@ cudaError_t select_cached_route(uint32_t rows, uint32_t vocab_size, ParameterKin
       few_rows = false;
     }
     use_shared_tiles = few_rows || many_rows;
+  }
+  if (device_minor == 3 && !sixteen && (chunk_tiles == 5 || chunk_tiles == 6) &&
+      ceil_div(vocab_size, static_cast<uint32_t>(variant.cluster_ctas)) > 5 * kCachedTileElements &&
+      rows64 >= kSharedTilesRowsPerCluster * shared_clusters &&
+      rows64 < kFiveSixTileC8PersistentMaxRowsPerClusterSm103 * shared_clusters) {
+    use_shared_tiles = false;
   }
   if (shared_resident > 0 && use_shared_tiles) {
     *launch = {variant, shared_tiles, rows, shared_tiles_smem,
