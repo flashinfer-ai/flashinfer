@@ -1390,6 +1390,23 @@ def test_h4096_values_and_replay(tokens, layout):
     stream.wait_stream(torch.cuda.current_stream())
 
 
+@pytest.mark.parametrize("layout", ("bf16", "nvfp4"))
+def test_h4096_tokens_past_one_round_of_the_grid(layout):
+    """64 x SMs + 1 tokens: one more 64-token m-block than the grid has CTAs, so
+    the CTAs own their m-blocks over a second round; the outputs pass the same
+    checks as at every other token count."""
+    _skip_unless_exported(4096, layout)
+    _arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    tokens = 64 * sms + 1
+    values = inputs_h4096(tokens)
+    kw = layout_kwargs(layout, values)
+    plan = prepare_mega_mhc(**values, sf_layout=layout, deterministic=False, **kw)
+    assert plan.config["num_launch_sms"] * 64 < tokens
+    plan.run()
+    torch.cuda.synchronize()
+    check_h4096_layout(plan.outputs, values, layout, **kw)
+
+
 @pytest.mark.parametrize("tokens", (1, 200, 1025))
 @pytest.mark.parametrize("layout", H4096_LAYOUTS)
 def test_h4096_graph_replay_changed_inputs_and_update_fn(tokens, layout):
