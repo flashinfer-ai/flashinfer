@@ -167,9 +167,13 @@ def quantize_write_index_k_nvfp4(
     """Quantize indexer keys to NVFP4 and write them to a paged key cache, in the
     layout :func:`single_head_paged_mqa_logits` reads.
 
-    Each key gets one E4M3 scale per 16 values, their amax over 6 (with a unit
-    global scale). It runs as one launch without host synchronization, so it can be captured in a
-    CUDA graph (run it once before capture to compile it).
+    Each key gets one E4M3 scale per 16 values: their amax over 6. There is no
+    per-tensor global scale. Write all keys of a cache at the same scale: do not
+    scale them by a factor that changes between calls, or their scores stop
+    being comparable. Values above 2688 in magnitude saturate.
+
+    It runs as one launch without host synchronization, so it can be captured
+    in a CUDA graph (run it once before capture to compile it).
 
     Parameters
     ----------
