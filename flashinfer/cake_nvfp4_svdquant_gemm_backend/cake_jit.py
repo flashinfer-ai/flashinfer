@@ -30,8 +30,8 @@ Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled once per
 architecture.  A record carries the host plan only: the program's ``library``
 stem (its ``build.json`` entries are ``<library>_<arch>``), the architectures
-it is delivered for, the tart ``module`` and ``build`` keywords it was rendered
-from, its launch record, the argument plan of its ``run`` entry, the
+it is delivered for, its ``origin`` kernel and the ``build`` keywords it was
+rendered from, its launch record, the argument plan of its ``run`` entry, the
 kernel-parameter -> logical-argument map and the ``plan`` (tile sizes, the
 scale-factor view the tensor maps expect, the grid rule and the variant).
 What to compile -- sources, digests, nvcc flags -- is recorded once in
@@ -70,9 +70,9 @@ from the rendered binding; every other field is the host plan.  Every value
 is a literal: FlashInfer's manifest checker and the exporter read this file
 with ``ast.literal_eval``.
 
-The program name ``cake_nvfp4_svdquant_gemm_<20 hex>`` is the first twenty hex
-digits of the SHA-256 of ``f"{module}\\n{json.dumps(build, sort_keys=True)}"``
-over the record's tart ``module`` and ``build`` keywords.
+The program name ``cake_nvfp4_svdquant_gemm_<20 hex>`` is a stable identifier
+fixed when the program is first exported (twenty hex digits of a SHA-256 over
+its kernel and ``build`` keywords); ``origin`` names that kernel.
 """
 
 from __future__ import annotations
@@ -257,7 +257,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic0_exact_epilogue",
+        "origin": "tactic0_exact_epilogue",
         "plan": {
             "block_m": 128,
             "block_n": 128,
@@ -324,7 +324,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic0_rank64_bias_smem",
+        "origin": "tactic0_rank64_bias_smem",
         "plan": {
             "block_m": 128,
             "block_n": 128,
@@ -393,7 +393,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "rank": "rank",
             "rank_chunks": "rank_chunks",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic25",
+        "origin": "tactic25",
         "plan": {
             "block_m": 128,
             "block_n": 128,
@@ -467,7 +467,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "rank": "rank",
             "rank_chunks": "rank_chunks",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic25_rank96_k32_tail",
+        "origin": "tactic25_rank96_k32_tail",
         "plan": {
             "block_m": 128,
             "block_n": 128,
@@ -550,7 +550,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -625,7 +625,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -700,7 +700,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -775,7 +775,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -850,7 +850,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -929,7 +929,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -1006,7 +1006,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -1081,7 +1081,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -1158,7 +1158,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -1233,7 +1233,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -1308,7 +1308,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -1375,7 +1375,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_bias",
+        "origin": "tactic14_bias",
         "plan": {
             "block_m": 128,
             "block_n": 64,
@@ -1448,7 +1448,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "origin": "tactic14_m64_bias",
         "plan": {
             "block_m": 64,
             "block_n": 64,
@@ -1515,7 +1515,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "origin": "tactic14_m64_bias",
         "plan": {
             "block_m": 64,
             "block_n": 64,
@@ -1590,7 +1590,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "origin": "tactic14_m64_bias",
         "plan": {
             "block_m": 64,
             "block_n": 64,
@@ -1666,7 +1666,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "origin": "tactic14_m64_bias",
         "plan": {
             "block_m": 64,
             "block_n": 64,
@@ -1734,7 +1734,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "origin": "tactic14_m64_bias",
         "plan": {
             "block_m": 64,
             "block_n": 64,
@@ -1807,7 +1807,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "origin": "tactic14_m64_bias",
         "plan": {
             "block_m": 64,
             "block_n": 64,
@@ -1882,7 +1882,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "origin": "tactic14_m64_bias",
         "plan": {
             "block_m": 64,
             "block_n": 64,
@@ -1958,7 +1958,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "origin": "tactic14_m64_bias",
         "plan": {
             "block_m": 64,
             "block_n": 64,
@@ -2031,7 +2031,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "origin": "tactic14_m64_bias",
         "plan": {
             "block_m": 64,
             "block_n": 64,
@@ -2124,7 +2124,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "origin": "2cta_tailsplit",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -2209,7 +2209,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "origin": "2cta_tailsplit",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -2292,7 +2292,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "origin": "2cta_tailsplit",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -2375,7 +2375,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "origin": "2cta_tailsplit",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -2458,7 +2458,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "origin": "2cta_tailsplit",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -2543,7 +2543,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "origin": "2cta_tailsplit",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -2630,7 +2630,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -2717,7 +2717,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -2803,7 +2803,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -2889,7 +2889,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -2966,7 +2966,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -3046,7 +3046,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -3126,7 +3126,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -3214,7 +3214,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "origin": "2cta_tailsplit",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -3302,7 +3302,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "origin": "2cta_tailsplit",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -3389,7 +3389,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "origin": "2cta_tailsplit",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -3466,7 +3466,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_persistent",
+        "origin": "2cta_persistent",
         "plan": {
             "block_m": 256,
             "block_n": 256,
@@ -3543,7 +3543,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "origin": "tactic14_m64_bias",
         "plan": {
             "block_m": 64,
             "block_n": 64,
@@ -3620,7 +3620,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_tactic14_m64_bias",
+        "origin": "tactic14_m64_bias",
         "plan": {
             "block_m": 64,
             "block_n": 64,
@@ -3697,7 +3697,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_swapab_splitk",
+        "origin": "swapab_splitk",
         "plan": {
             "block_m": 136,
             "block_n": 128,
@@ -3775,7 +3775,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "out": "out",
             "rank_tiles": "rank_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_swapab_splitk",
+        "origin": "swapab_splitk",
         "plan": {
             "block_m": 136,
             "block_n": 128,
@@ -3870,7 +3870,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "tok_tiles": "tok_tiles",
             "w_tiles": "w_tiles",
         },
-        "module": "tart.mm_nvfp4_svdquant.sm100_sm103.flashinfer_blackwell_nvfp4_svdquant_gemm_2cta_tailsplit",
+        "origin": "2cta_tailsplit",
         "plan": {
             "block_m": 256,
             "block_n": 256,
