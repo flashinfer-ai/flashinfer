@@ -341,7 +341,14 @@ def plan_w4a16_buffers(
     weight_layout: str | None = None,
     collect_activation_amax: bool = False,
     prefill_fused_sum: bool | None = None,
+    small_m_direct: bool = True,
 ) -> W4A16BufferPlan:
+    """Return the scratch extents one W4A16 launch of ``m`` tokens needs.
+
+    ``small_m_direct`` reserves the 256-column ``intermediate_cache2`` width
+    the small-M direct kernel needs for ModelOpt weights at ``m <= 8``.
+    Callers that have already ruled that kernel out pass ``False``.
+    """
     routed_rows = int(m) * int(topk)
     route_num_experts = (
         int(prepared.num_experts)
@@ -379,7 +386,12 @@ def plan_w4a16_buffers(
         else getattr(prepared, "weight_layout", "packed")
     )
     cache2_width = intermediate_size
-    if weight_layout == "modelopt" and int(m) <= 8 and not full_rotation:
+    if (
+        small_m_direct
+        and weight_layout == "modelopt"
+        and int(m) <= 8
+        and not full_rotation
+    ):
         # Native micro decode stores 128-word chunks of paired BF16 values.
         cache2_width = ((intermediate_size + 255) // 256) * 256
     use_prefill_fused_sum = prefill_fused_sum_eligible(
