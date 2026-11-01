@@ -3218,19 +3218,50 @@ def bind_stage(
 _FFI_DEVICES: dict[int, Any] = {}
 
 
+def _constant_cells(device: torch.device) -> dict[str, torch.Tensor]:
+    """The cells of :func:`_device_constants`, filled on the current stream."""
+    return {
+        "grad_scale": torch.ones((1,), dtype=torch.float32, device=device),
+        "unit_scale": torch.ones((1,), dtype=torch.float32, device=device),
+        "f32_dummy": torch.zeros((16,), dtype=torch.float32, device=device),
+    }
+
+
+# The constant cells of each device index (:func:`_device_constants`): the first cells stored for a device are the
+# ones every thread uses.
+_DEVICE_CELLS: dict[int, dict[str, torch.Tensor]] = {}
+
+
 @functools.lru_cache(maxsize=None)
 def _device_constants(index: int) -> dict[str, torch.Tensor]:
     """The constant cells a remembered binding binds on every call, allocated once per device:
     ``grad_scale`` / ``unit_scale`` (``[1] = 1.0``; read-only here -- the loss entry's backward
     casts through :func:`backward_loss`, the log-probability entry's cast scale is 1) and the
     unused fp32 ``WS`` of the unsliced GEMMs.  Per-call ``torch.ones`` / ``torch.zeros`` would add
-    three fill launches to every remembered forward and backward."""
+    three fill launches to every remembered forward and backward.
+
+    Every stream and thread shares the cells, so they are filled on a stream from torch's stream
+    pool, and an event recorded behind the fills is waited for before they are cached: a call on
+    another stream never reads a cell before its fill.  The wait is not a stream or device
+    synchronization (PyTorch's synchronization debug mode does not flag it, and the mode is not
+    changed), but it can also wait for other work: torch hands out its pool streams round-robin, so
+    the caller's current stream can be that same stream (the fills then queue behind the caller's
+    work), and with CUDA lazy loading a kernel's first launch can wait for the device.  The first
+    calls of threads that miss the cache together each form cells, and all return the first cells
+    stored in :data:`_DEVICE_CELLS`; the other cells were waited for and are never read, so freeing
+    them is safe.  Under a CUDA graph capture, which cannot wait, the cells are made on the
+    capturing stream."""
     device = torch.device("cuda", int(index))
-    return {
-        "grad_scale": torch.ones((1,), dtype=torch.float32, device=device),
-        "unit_scale": torch.ones((1,), dtype=torch.float32, device=device),
-        "f32_dummy": torch.zeros((16,), dtype=torch.float32, device=device),
-    }
+    if torch.cuda.is_current_stream_capturing():
+        cells = _constant_cells(device)
+    else:
+        stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(stream):
+            cells = _constant_cells(device)
+            filled = torch.cuda.Event()
+            filled.record(stream)
+        filled.synchronize()
+    return _DEVICE_CELLS.setdefault(int(index), cells)
 
 
 def _unit_scale(device: torch.device) -> torch.Tensor:
@@ -5172,7 +5203,12 @@ class BindingCache:
     ``capacity`` (default :data:`BINDING_CACHE_DEFAULT_CAPACITY`, 64 bindings) bounds what is kept; ``enabled=False``
     bypasses the cache (every call validates and binds).  :meth:`configure` changes both at runtime.  The templated
     launches of the eager output-boundary casts (:func:`_eager_launch`) are kept alongside, at most
-    :attr:`EAGER_CAPACITY` forms, and follow the same switch and :meth:`clear`."""
+    :attr:`EAGER_CAPACITY` forms, and follow the same switch and :meth:`clear`.
+
+    Threads share the cache without a lock: each ordered-dict operation is atomic, and a step that finds its key or
+    entry gone -- another thread's eviction between a lookup's ``get`` and its recency update, or between an
+    eviction's size check and its ``popitem`` -- skips that step (a looked-up binding stays valid for its call; an
+    eviction that finds the cache already within its capacity stops).  The hit / miss counters are statistics."""
 
     # templated launches of the eager output-boundary stages (:func:`_eager_launch`) kept alongside the bindings
     EAGER_CAPACITY = 64
@@ -5203,8 +5239,7 @@ class BindingCache:
                     f"to bypass it), got {capacity!r}"
                 )
             self.capacity = capacity
-            while len(self._bindings) > self.capacity:
-                self._bindings.popitem(last=False)
+            _evict(self._bindings, self.capacity)
         if enabled is not None:
             self.enabled = bool(enabled)
             if not self.enabled:
@@ -5216,7 +5251,7 @@ class BindingCache:
 
     @property
     def owned_bytes(self) -> int:
-        return sum(b.owned_bytes for b in self._bindings.values())
+        return sum(b.owned_bytes for b in _values(self._bindings))
 
     def clear(self) -> None:
         self._bindings.clear()
@@ -5227,14 +5262,19 @@ class BindingCache:
         entry = self._eager.get(form)
         if entry is None or entry[0] is not record:
             return None
-        self._eager.move_to_end(form)
+        # another thread's eviction since the get: the launch stays valid for this call (one line: a ``try`` line of
+        # its own would add a NOP to every hit)
+        # fmt: off
+        try: self._eager.move_to_end(form)  # noqa: E701, SIM105
+        except KeyError: pass  # noqa: E701
+        # fmt: on
         return entry[1]
 
     def eager_remember(self, form: tuple, record, launch: _Launch) -> None:
         self._eager.pop(form, None)
         self._eager[form] = (record, launch)
-        while len(self._eager) > self.EAGER_CAPACITY:
-            self._eager.popitem(last=False)
+        if len(self._eager) > self.EAGER_CAPACITY:
+            _evict(self._eager, self.EAGER_CAPACITY)
 
     def lookup(self, key: tuple) -> Optional[_Binding]:
         binding = self._bindings.get(key)
@@ -5242,7 +5282,12 @@ class BindingCache:
             self.misses += 1
         else:
             self.hits += 1
-            self._bindings.move_to_end(key)
+            # another thread's eviction since the get: the binding stays valid for this call (one line, as in
+            # :meth:`eager_lookup`)
+            # fmt: off
+            try: self._bindings.move_to_end(key)  # noqa: E701, SIM105
+            except KeyError: pass  # noqa: E701
+            # fmt: on
         return binding
 
     def peek(self, key: tuple) -> Optional[_Binding]:
@@ -5251,9 +5296,28 @@ class BindingCache:
     def remember(self, key: tuple, binding: _Binding) -> _Binding:
         self._bindings.pop(key, None)
         self._bindings[key] = binding
-        while len(self._bindings) > self.capacity:
-            self._bindings.popitem(last=False)
+        if len(self._bindings) > self.capacity:
+            _evict(self._bindings, self.capacity)
         return binding
+
+
+def _evict(entries: OrderedDict, capacity: int) -> None:
+    """Drop the least recently used entries of ``entries`` above ``capacity``; stop when another thread's eviction
+    emptied it first."""
+    while len(entries) > capacity:
+        try:
+            entries.popitem(last=False)
+        except KeyError:
+            return
+
+
+def _values(entries: OrderedDict) -> list:
+    """The values of ``entries`` as a list, copied again when another thread changed it during the copy."""
+    while True:
+        try:
+            return list(entries.values())
+        except RuntimeError:  # OrderedDict mutated during iteration
+            continue
 
 
 # Enabled, 64 bindings.  ``flashinfer.chunked_lm_head`` applies its environment variables through

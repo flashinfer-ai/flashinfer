@@ -14,11 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Host state of the deterministic chunked LM-head + loss backend across calls: the binding cache of the
-log-probability backward across training steps, and the per-thread state (the hidden valid-row count's pinned cell
-and event, its int32 constant, the dW side stream) under two threads on one device.
+log-probability backward across training steps and under threads that share it, the per-thread state (the hidden
+valid-row count's pinned cell and event, its int32 constant, the dW side stream) under two threads on one device, and
+the device's constant cells that every thread and stream shares.
 """
 
 import threading
+import time
+from collections import OrderedDict
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -28,6 +32,7 @@ from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
 from tests.test_helpers.cake_package import cake_package
 
 cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
+opt_in = cake_package("cake_lm_head_det_loss", "cake_backend_opt_in")
 cake_jit = cake_package("cake_lm_head_det_loss", "cake_jit")
 
 SEED = 20261031
@@ -326,3 +331,237 @@ def test_device_hidden_count_arange_two_threads_two_streams(weight, monkeypatch)
         if not torch.equal(_bits(got[name]), ref)
     ]
     assert not wrong, wrong
+
+
+@pytest.mark.parametrize("module", ["backend", "opt_in"])
+def test_binding_cache_skips_what_another_threads_eviction_removed(module):
+    """Threads share the binding cache without a lock: a lookup whose key another thread evicts between its ``get``
+    and its recency update returns the binding (or eager launch) it found, and an eviction that another thread's
+    eviction emptied between its size check and its ``popitem`` stops -- no ``KeyError`` (the races, run
+    deterministically through the cache's ordered dicts)."""
+
+    # another thread evicts the key right after this thread's get
+    class EvictedAfterGet(OrderedDict):
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            self.pop(key, None)
+            return value
+
+    # another thread's eviction empties it before this thread's popitem
+    class EmptiedBeforePop(OrderedDict):
+        def popitem(self, last=True):
+            self.clear()
+            return super().popitem(last=last)
+
+    be = {"backend": cake_backend, "opt_in": opt_in}[module]
+    binding, launch, record = object(), object(), object()
+    cache = be.BindingCache(capacity=1)
+    cache._bindings = EvictedAfterGet({("k",): binding})
+    assert cache.lookup(("k",)) is binding and cache.hits == 1
+    assert cache.lookup(("k",)) is None and cache.misses == 1
+    cache._eager = EvictedAfterGet({("f",): (record, launch)})
+    assert cache.eager_lookup(("f",), record) is launch
+    cache._bindings = EmptiedBeforePop({("a",): binding})
+    assert cache.remember(("b",), binding) is binding and len(cache) == 0
+    cache._bindings = EmptiedBeforePop({("a",): binding, ("b",): binding})
+    assert cache.configure(capacity=1) is cache and len(cache) == 0
+    cache.EAGER_CAPACITY = 1
+    cache._eager = EmptiedBeforePop({("a",): (record, launch)})
+    cache.eager_remember(("b",), record, launch)
+    assert len(cache._eager) == 0
+
+
+@pytest.mark.parametrize("module", ["backend", "opt_in"])
+def test_binding_cache_owned_bytes_while_another_thread_remembers(module):
+    """``owned_bytes`` sums a copy of the bindings: another thread that remembers a binding while it sums (run
+    deterministically from inside the read of a binding's size) raises no ``OrderedDict mutated during iteration``."""
+    be = {"backend": cake_backend, "opt_in": opt_in}[module]
+    cache = be.BindingCache(capacity=4)
+
+    class Binding:
+        def __init__(self, nbytes):
+            self.nbytes = nbytes
+
+        @property
+        def owned_bytes(self):
+            # another thread remembers a binding
+            cache.remember(("other", self.nbytes), SimpleNamespace(owned_bytes=0))
+            return self.nbytes
+
+    cache.remember(("a",), Binding(1))
+    cache.remember(("b",), Binding(2))
+    assert cache.owned_bytes == 3
+    assert len(cache) == 4
+
+
+def _forget_device_constants():
+    """Drop the device's constant cells: the next call forms them (``_DEVICE_CELLS`` does not exist before
+    the fix that added it)."""
+    cake_backend._device_constants.cache_clear()
+    getattr(cake_backend, "_DEVICE_CELLS", {}).clear()
+
+
+def _poison_free_small_blocks():
+    """Leave NaN bytes at the start of every free small block of the current stream (the caching allocator's pool of
+    allocations up to 1 MiB): 512-byte NaN cells are allocated until the pool reserves a new segment, then freed --
+    a small cell allocated next and read before its fill reads NaN."""
+    torch.cuda.synchronize()
+    key = "reserved_bytes.small_pool.current"
+    reserved = torch.cuda.memory_stats()[key]
+    junk = []
+    while torch.cuda.memory_stats()[key] == reserved:
+        junk.append(torch.full((128,), float("nan"), device=CUDA))
+    torch.cuda.current_stream().synchronize()
+    del junk
+
+
+def test_device_constant_cells_are_filled_before_another_stream_reads_them():
+    """A device's constant cells are formed once and shared by every stream: a read on another stream right after
+    they are formed sees their values, never the bytes before their fills -- with a long kernel queued ahead on the
+    stream that formed them (whose wait covers the fills only, not that kernel) and PyTorch's synchronization debug
+    mode at ``"error"`` (the wait is no synchronization it flags; the mode is not changed).  The read is a copy into
+    a buffer allocated ahead: no allocation or first kernel launch on the reading stream that could wait for the
+    device."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    index = torch.cuda.current_device()
+    _forget_device_constants()
+    _poison_free_small_blocks()
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        got = torch.full((18,), -1.0, device=CUDA)
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda._sleep(2_000_000_000)  # about a second of the forming stream
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        cells = cake_backend._device_constants(index)
+        busy = not torch.cuda.current_stream().query()
+        with torch.cuda.stream(side):
+            got[0:1].copy_(cells["grad_scale"])
+            got[1:2].copy_(cells["unit_scale"])
+            got[2:].copy_(cells["f32_dummy"])
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)
+    torch.cuda.synchronize()
+    assert busy, "the cells waited for the forming stream's queued kernel"
+    assert torch.cuda.get_sync_debug_mode() == previous
+    assert got.tolist() == [1.0, 1.0] + [0.0] * 16, got.tolist()
+    assert cake_backend._device_constants(index) is cells
+
+
+@pytest.mark.parametrize("mode", ["warn", "error"])
+def test_device_first_calls_of_two_threads_keep_the_sync_debug_mode(weight, mode):
+    """With a synchronization debug mode set, the first calls of two threads race into the constant cells' creation
+    (cleared cache; every event wait held open for 0.5 s): the package never sets the mode, the calls raise nothing
+    and give the serial call's ``loss`` / ``logp`` / ``dX`` / ``dW`` bits, and the mode is ``mode`` after both.  Three
+    chunks: the hidden valid-row count, whose one wait is an event wait (no synchronization the mode flags)."""
+    inp = make_inputs(12289, seed=SEED + 11, device=CUDA, W=weight)
+
+    def step():
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        loss, logp = cake_backend.chunked_lm_head_det_loss(
+            X, W, inp.labels, loss_div=inp.loss_div, chunk_size=4096, return_logp=True
+        )
+        loss.backward()
+        return dict(loss=loss.detach(), logp=logp.detach(), dX=X.grad, dW=W.grad)
+
+    serial = step()  # binds: the threads' calls are binding-cache hits
+    original = torch.cuda.Event.synchronize
+    seen, modes = [], []
+
+    def held_open(self):
+        seen.append(torch.cuda.get_sync_debug_mode())
+        time.sleep(0.5)
+        return original(self)
+
+    results: list = [None, None]
+    errors: list = []
+    barrier = threading.Barrier(2)
+
+    def worker(i):
+        try:
+            barrier.wait(_TIMEOUT_S)
+            results[i] = step()
+        except BaseException as exc:  # noqa: BLE001 - re-raised by the test thread
+            errors.append(exc)
+
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    _forget_device_constants()
+    torch.cuda.set_sync_debug_mode(mode)
+    set_mode = torch.cuda.set_sync_debug_mode
+    torch.cuda.set_sync_debug_mode = lambda m: (modes.append(m), set_mode(m))[1]
+    torch.cuda.Event.synchronize = held_open
+    try:
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(_TIMEOUT_S)
+        alive = any(thread.is_alive() for thread in threads)
+        after = torch.cuda.get_sync_debug_mode()
+    finally:
+        torch.cuda.Event.synchronize = original
+        torch.cuda.set_sync_debug_mode = set_mode
+        torch.cuda.set_sync_debug_mode(previous)
+    torch.cuda.synchronize()
+    level = {"warn": 1, "error": 2}[mode]
+    assert not alive, "a thread did not finish"
+    assert not errors, errors
+    assert modes == [], modes
+    assert seen and set(seen) == {level}, seen
+    assert after == level, after
+    for got in results:
+        for key in ("loss", "logp", "dX", "dW"):
+            assert torch.equal(_bits(got[key]), _bits(serial[key])), key
+
+
+def test_device_constant_cells_of_two_threads_first_calls_are_one(monkeypatch):
+    """The first calls of two threads, each on its own stream, that both miss the device's constant cells (each
+    held in its forming until the other arrives) return the same cells, the ones every later call returns: no thread
+    binds cells that are freed when its call returns while its stream's kernels still read them."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    index = torch.cuda.current_device()
+    zeros = torch.zeros
+    barrier = threading.Barrier(2)
+
+    def zeros_when_both_form(*args, **kwargs):
+        # the f32_dummy cell, formed in both threads' first calls
+        if args and args[0] == (16,):
+            barrier.wait(_TIMEOUT_S)
+        return zeros(*args, **kwargs)
+
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    results: list = [None, None]
+    errors: list = []
+
+    def worker(i):
+        try:
+            with torch.cuda.stream(streams[i]):
+                results[i] = cake_backend._device_constants(index)
+        except BaseException as exc:  # noqa: BLE001 - re-raised by the test thread
+            errors.append(exc)
+
+    torch.cuda.synchronize()
+    _forget_device_constants()
+    monkeypatch.setattr(torch, "zeros", zeros_when_both_form)
+    try:
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(_TIMEOUT_S)
+        alive = any(thread.is_alive() for thread in threads)
+    finally:
+        monkeypatch.setattr(torch, "zeros", zeros)
+    torch.cuda.synchronize()
+    assert not alive, "a thread did not finish"
+    assert not errors, errors
+    cells = cake_backend._device_constants(index)
+    assert results[0] is cells and results[1] is cells, "threads got different cells"
+    assert cells["grad_scale"].tolist() == [1.0]
+    assert cells["unit_scale"].tolist() == [1.0]
+    assert cells["f32_dummy"].tolist() == [0.0] * 16
