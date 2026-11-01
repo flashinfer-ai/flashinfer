@@ -107,7 +107,9 @@ _COMMON = dict(
     split_max=32,
     split_min_range_tiles=64,
     split_units=["l6", "narrow", "wide"],
+    split_wave_scope=None,
     l6_solo_rule=None,
+    wide_pair_snake_only=False,
     snake_default=False,
     tile_unroll_default=1,
     tile_unroll_factor=2,
@@ -728,6 +730,23 @@ def test_policy_record_round_trip_and_validation():
         dict(l6_solo_rule=[128.0, 0]),
         dict(l6_solo_rule=[128.0, 2.0]),
         dict(l6_solo_rule=[True, 2]),
+        # the scope of the two-way wave split: [ascending unit geometries, max segments >= 1, sampled only] or None
+        dict(split_wave_scope="narrow"),
+        dict(split_wave_scope=[]),
+        dict(split_wave_scope=[["narrow"], 1]),
+        dict(split_wave_scope=[["narrow"], 1, True, 0]),
+        dict(split_wave_scope=[[], 1, True]),
+        dict(split_wave_scope=["narrow", 1, True]),
+        dict(split_wave_scope=[["split_narrow"], 1, True]),
+        dict(split_wave_scope=[["wide", "narrow"], 1, True]),
+        dict(split_wave_scope=[["narrow", "narrow"], 1, True]),
+        dict(split_wave_scope=[["narrow"], 0, True]),
+        dict(split_wave_scope=[["narrow"], 1.0, True]),
+        dict(split_wave_scope=[["narrow"], True, True]),
+        dict(split_wave_scope=[["narrow"], 1, 1]),
+        # the wide CTA pair on the snake walk only (sampled calls): a bool
+        dict(wide_pair_snake_only=1),
+        dict(wide_pair_snake_only=None),
         # the units the CTA pair serves: an ascending list of unit geometries, not empty while pair_rule is set
         dict(pair_units="l6"),
         dict(pair_units=["pair_l6"]),
@@ -776,6 +795,11 @@ def test_policy_record_round_trip_and_validation():
     assert first.wide_first_rule == [192.0]
     assert first.record()["wide_first_rule"] == [192.0]
     assert DispatchPolicy.from_record(first.record()) == first
+    scoped = DispatchPolicy.from_record(
+        dict(record, split_wave_scope=(("narrow", "wide"), 2, False))
+    )
+    assert scoped.split_wave_scope == [["narrow", "wide"], 2, False]
+    assert DispatchPolicy.from_record(scoped.record()) == scoped
     bare = DispatchPolicy.from_record(dict(record, pair_rule=None, pair_units=[]))
     assert bare.pair_units == []  # no pair rule: an empty unit list is well-formed
     shifted = DispatchPolicy.from_record(dict(record, sample_shift_rule=[4096, 500]))
@@ -1727,6 +1751,179 @@ def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit(
             65536, 65536, 1, top_k=2048, arch=arch, num_sms=148, sample_tiles_max=0
         )
         assert (a.kind, a.block_q, a.pair) == (b.kind, b.block_q, b.pair), arch
+
+
+def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():
+    """sm_107a's ``split_wave_scope`` [["narrow"], 1, True]: the two-way wave split of ``split_wave_rule`` stays on sampled
+    single-segment calls of the narrow unit only (never with the sampled first threshold off, and never for the
+    hypothetical l6 split of the ``l6_solo_rule`` check); ``wide_pair_snake_only``: a sampled call runs the unpaired wide
+    program where the wide CTA pair would not walk the snake order.  On a grid of shapes in both modes every plan is the
+    plan of the record with both fields off after two substitutions: outside the kept narrow wave split, the plan of that
+    record without ``split_wave_rule``; then, sampled, a non-snake ``pair_wide`` plan becomes the plan without
+    ``pair_rule`` where that program is registered.  The other architectures leave both fields off."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    p, keys = policy_for("sm_107a"), cake_jit.PROGRAM_KEYS["sm_107a"]
+    assert p.split_wave_scope == [["narrow"], 1, True] and p.wide_pair_snake_only
+    for arch in ("sm_100a", "sm_103a"):
+        other = policy_for(arch)
+        assert other.split_wave_scope is None and not other.wide_pair_snake_only, arch
+    plain = DispatchPolicy.from_record(
+        dict(p.record(), split_wave_scope=None, wide_pair_snake_only=False)
+    )
+
+    def with_(policy, **override):
+        return DispatchPolicy.from_record(dict(policy.record(), **override))
+
+    def plan(policy, T, Tkv, S, sample, top_k=2048, grid=212):
+        return select_program(
+            policy,
+            num_queries=T,
+            num_keys=Tkv,
+            num_segments=S,
+            ratio=1,
+            top_k=top_k,
+            grid=grid,
+            sample_tiles_max=sample,
+            scan_keys=keys,
+        )
+
+    def expected(*args, **kw):
+        base = plan(plain, *args, **kw)
+        sampled = base.sample_tiles_max > 0
+        S = args[2]
+        kept = sampled and S <= 1 and base.split and base.unit == "narrow"
+        record = plain if kept else with_(plain, split_wave_rule=None)
+        cur = plan(record, *args, **kw)
+        if sampled and cur.kind == "pair_wide" and not cur.snake:
+            alt = plan(with_(record, pair_rule=None), *args, **kw)
+            if alt.scan_key in keys:
+                cur = alt
+        return base, cur
+
+    # anchors (top_k 2048, 212 SMs): one 1024-query document over 128k keys keeps its two-way narrow split sampled and
+    # takes the unpaired l6 unit unsampled
+    rule = plan(p, 1024, 131072, 1, None)
+    assert (rule.kind, rule.unit, rule.n_split) == ("split", "narrow", 2)
+    assert plan(plain, 1024, 131072, 1, 0).n_split == 2
+    assert plan(p, 1024, 131072, 1, 0).scan_key == "scan:l6:u1:s0:f0"
+    # two such documents: the narrow wave split goes in both modes (the l6 solo preference then applies)
+    assert plan(plain, 2048, 262144, 2, None).n_split == 2
+    for sample in (None, 0):
+        rule = plan(p, 2048, 262144, 2, sample)
+        assert (rule.scan_key, rule.n_split) == ("scan:l6:u1:s0:f0", 1), sample
+    # a 4096-query document over 128k keys: the wide wave split goes; sampled the call then runs the unpaired wide
+    # program (its CTA pair does not walk the snake order), unsampled the l6 unit
+    base = plan(plain, 4096, 131072, 1, None)
+    assert (base.kind, base.unit) == ("split", "wide")
+    assert plan(p, 4096, 131072, 1, None).scan_key == "scan:wide:u2:s0:f0"
+    assert plan(p, 4096, 131072, 1, 0).scan_key == "scan:l6:u1:s0:f0"
+    # a 4096-query document over 64k keys: sampled pair_wide without the snake order -> unpaired wide; unsampled unchanged
+    assert plan(plain, 4096, 65536, 1, None).scan_key == "scan:pair_wide:u2:s0:f0"
+    assert plan(p, 4096, 65536, 1, None).scan_key == "scan:wide:u2:s0:f0"
+    assert plan(p, 4096, 65536, 1, 0) == plan(plain, 4096, 65536, 1, 0)
+    # the snake pair wide program stays (one causal 64k document, sampled)
+    assert plan(p, 65536, 65536, 1, None).scan_key == "scan:pair_wide:u1:s1:f1"
+    counts = dict(kept=0, dropped=0, unpaired=0, same=0)
+    for q, k, S, top_k, sample in itertools.product(
+        (4, 64, 256, 1024, 2048, 4096, 8192),
+        (16384, 65536, 131072, 262144),
+        (1, 2, 4),
+        (256, 2048),
+        (None, 0),
+    ):
+        if q > k:
+            continue
+        args = (q * S, k * S, S, sample)
+        base, want = expected(*args, top_k=top_k)
+        got = plan(p, *args, top_k=top_k)
+        assert got == want, (args, top_k, got.scan_key, want.scan_key)
+        assert got.scan_key in keys, (args, top_k, got.scan_key)
+        if got == base:
+            counts["kept" if base.split else "same"] += 1
+        elif base.split and not got.split:
+            counts["dropped"] += 1
+        elif base.kind == "pair_wide" and got.kind == "wide":
+            counts["unpaired"] += 1
+    assert counts["kept"] and counts["dropped"] and counts["unpaired"], counts
+
+
+def test_ticket_units_bound_covers_every_segment_split_and_static_path_matches_the_grid():
+    """``ticket_units_bound`` (shape only) is at least the kernel's ``n_total`` -- the sum over segments of
+    ``ceil(l_s / block_q)``, times ``n_split`` on a split plan, ``ceil(blocks / 2)`` per segment on a CTA pair -- for every
+    segment-length vector the shape admits (random ones, and the extremal one that reaches it on the unpaired plans);
+    ``ticket_static_path`` compares it with the launched grid (half of it on a CTA pair).  Static and drawing plans both
+    occur on every architecture."""
+    import random
+
+    rng = random.Random(7042)
+
+    def n_total(c, lens):
+        bq = c.block_q
+        blocks = [-(-int(n) // bq) for n in lens]
+        if c.split:
+            return sum(blocks) * c.n_split
+        if c.pair:
+            return sum((b + 1) // 2 for b in blocks)
+        return sum(blocks)
+
+    for arch, grids in _FROZEN_GRIDS.items():
+        policy = policy_for(arch)
+        keys = cake_jit.PROGRAM_KEYS.get(arch) if cake_jit.PROGRAM_KEYS else None
+        static = drawing = 0
+        for grid, q, k, S, top_k, sample in itertools.product(
+            grids,
+            (4, 64, 300, 1024, 4096),
+            (8192, 22018, 131072),
+            (1, 3, 16),
+            (256, 2048),
+            (None, 0),
+        ):
+            if q > k:
+                continue
+            T, Tkv = q * S, k * S
+            c = select_program(
+                policy,
+                num_queries=T,
+                num_keys=Tkv,
+                num_segments=S,
+                ratio=1,
+                top_k=top_k,
+                grid=grid,
+                sample_tiles_max=sample,
+                scan_keys=keys,
+            )
+            bound = cake_policy.ticket_units_bound(c)
+            agents = c.grid_ctas // 2 if c.pair else c.grid_ctas
+            assert cake_policy.ticket_static_path(c) == (bound <= agents)
+            static += bound <= agents
+            drawing += bound > agents
+            for _ in range(16):
+                total = rng.randint(0, T)
+                cuts = sorted(rng.randint(0, total) for _ in range(S - 1))
+                lens = [b - a for a, b in zip([0, *cuts], [*cuts, total], strict=True)]
+                assert n_total(c, lens) <= bound, (arch, grid, T, S, lens)
+            extremal = [1] * (S - 1) + [T - (S - 1)]
+            assert n_total(c, extremal) <= bound
+            if not c.pair:
+                assert n_total(c, extremal) == bound, (arch, grid, T, S)
+        assert static and drawing, (arch, static, drawing)
+    # the split tail rows (4 queries over 22-42k keys) are static on every architecture
+    for arch, grids in _FROZEN_GRIDS.items():
+        keys = cake_jit.PROGRAM_KEYS.get(arch) if cake_jit.PROGRAM_KEYS else None
+        for grid in grids:
+            for Tkv in (22018, 30466, 41986):
+                c = select_program(
+                    policy_for(arch),
+                    num_queries=4,
+                    num_keys=Tkv,
+                    num_segments=1,
+                    ratio=1,
+                    top_k=2048,
+                    grid=grid,
+                    scan_keys=keys,
+                )
+                assert cake_policy.ticket_static_path(c), (arch, grid, Tkv)
 
 
 def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
@@ -3042,8 +3239,9 @@ def _assert_ticket_tail_zero(runner) -> None:
     """The ticket word reads 0 after every completed run (every completed scan launch leaves it 0; a
     backend-owned tail is zeroed once at prepare, a caller-owned one again before every run); None
     on the architectures without a tail.  The segment order behind it is not checked: an :lsf launch
-    leaves it written."""
-    if runner.ticket_tail is not None:
+    leaves it written.  A static call (``runner._tail_static``, ``cake_policy.ticket_static_path``) never touches the word,
+    which then holds whatever the buffer held: nothing to check."""
+    if runner.ticket_tail is not None and not runner._tail_static:
         words = runner.ticket_tail[:_TICKET_WORD_BYTES]
         assert not words.any(), words[:8].tolist()
 
@@ -3075,6 +3273,7 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
     if runner.ticket_tail is None:
         pytest.skip("no ticket tail on this architecture")
     assert not runner._tail_shared  # backend-owned: nothing else writes the tail
+    assert not runner._tail_static  # the call draws tickets
     torch.cuda.synchronize()
     _assert_ticket_tail_zero(runner)  # zeroed once, at prepare
     expected = runner()
@@ -3173,6 +3372,7 @@ def test_caller_owned_workspace_tail_written_between_runs_is_restored_before_the
         _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
     )
     runner = _caller_owned_runner(inputs, workspace)
+    assert not runner._tail_static  # the call draws tickets
     torch.cuda.synchronize()
     _assert_ticket_tail_zero(runner)  # zeroed at prepare as well
     expected = _cloned(runner())
@@ -3235,6 +3435,7 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
     if runners[-1].ticket_tail is None:
         pytest.skip("no ticket tail on this architecture")
     assert runners[-1]._tail_shared and not run_memsets  # zeroed by prepare only
+    assert not runners[-1]._tail_static  # the call draws tickets
     runner = runners[-1]
     runner.ticket_tail.fill_(7)
     out = runner()  # the prepared runner's own run restores a shared tail
@@ -3255,6 +3456,8 @@ def test_caller_owned_workspace_graph_replay_restores_the_tail():
         _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
     )
     runner = _caller_owned_runner(inputs, workspace)
+    # the call draws tickets: the graph carries the memset node
+    assert not runner._tail_static
     eager = _cloned(_run(inputs))
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -3284,6 +3487,79 @@ def test_caller_owned_workspace_graph_replay_restores_the_tail():
     torch.cuda.synchronize()
     _assert_ticket_tail_zero(runner)
     _judge_ok(_cloned(captured), ref.select_reference(inputs))
+
+
+def test_static_call_skips_the_tail_memset_and_never_touches_the_ticket_word():
+    """A call whose shape bounds its work units by the grid (``ticket_static_path``; 4 queries over 22018 keys) takes the
+    scan's static fast path, which never reads or writes the ticket word.  On a caller-owned workspace neither prepare,
+    a run nor the eager entry zeroes its tail: a poisoned word stays as it was and every run is bit-exact.  A drawing
+    runner on the same buffer still zeroes its own tail before its run, and a failed launch still marks the static
+    runner's tail dirty, so its next run restores it."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs_s = ref.make_random_inputs([4], [22018], top_k=2048, seed=76, device="cuda")
+    inputs_d = ref.make_random_inputs(
+        [2048, 2048], [2048, 16384], top_k=1024, seed=77, device="cuda"
+    )
+    expected_s = _cloned(_run(inputs_s))
+    expected_d = _cloned(_run(inputs_d))
+    shared = torch.empty(
+        max(_workspace_bytes(inputs_s, device), _workspace_bytes(inputs_d, device)),
+        dtype=torch.uint8,
+        device=device,
+    )
+    shared.fill_(7)  # what another kernel could leave in the buffer, the tails included
+    runner = _caller_owned_runner(inputs_s, shared)
+    assert runner._tail_static and cake_policy.ticket_static_path(runner.choice)
+    torch.cuda.synchronize()
+    word = runner.ticket_tail[:_TICKET_WORD_BYTES]
+    assert (word == 7).all()  # prepare issued no memset
+    memsets = []
+    zero = runner.ticket_tail.zero_
+    runner.ticket_tail.zero_ = lambda: (memsets.append(1), zero())[1]
+    for fill in (7, 0xFF, 1):
+        runner.ticket_tail.fill_(fill)
+        out = runner()
+        torch.cuda.synchronize()
+        assert ref.same_bits(out, expected_s), fill
+        assert (word == fill).all(), fill  # untouched by the scan
+    assert not memsets
+    out = cake_backend.dsa_indexer_det_topk(
+        inputs_s.q,
+        inputs_s.k,
+        inputs_s.w,
+        inputs_s.cu_seqlens_q,
+        inputs_s.cu_seqlens_k,
+        **inputs_s.kwargs(),
+        workspace_buffer=shared,
+    )
+    torch.cuda.synchronize()
+    # the eager entry: no memset either
+    assert ref.same_bits(out, expected_s) and (word == 1).all()
+    drawing = _caller_owned_runner(inputs_d, shared)
+    assert not drawing._tail_static
+    drawing.ticket_tail.fill_(7)
+    out = drawing()
+    torch.cuda.synchronize()
+    assert ref.same_bits(out, expected_d)
+    _assert_ticket_tail_zero(drawing)  # zeroed before its run, left 0 by its scan
+    out = runner()  # the static runner after the drawing one wrote the buffer
+    torch.cuda.synchronize()
+    assert ref.same_bits(out, expected_s) and not memsets
+    launches = runner.launches
+
+    def failing() -> None:
+        raise RuntimeError("boom")
+
+    runner.launches = (failing,)
+    with pytest.raises(RuntimeError, match="boom"):
+        runner()
+    assert runner._tail_dirty
+    runner.launches = launches
+    out = runner()
+    torch.cuda.synchronize()
+    assert memsets == [1] and not runner._tail_dirty and not word.any()
+    assert ref.same_bits(out, expected_s)
 
 
 def test_workspace_bound_is_respected():
