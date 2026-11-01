@@ -29,11 +29,15 @@ Callers that know each request's page count on the host pass that prefix sum
 so the FP8 copy holds only active pages; otherwise ``page_indptr[b]`` is
 ``b * max_pages``. There is no host synchronization, and the launch shape
 depends only on ``batch_size`` and ``max_kv_len``.
+
+Serving loops that call this once per layer per step can use
+:class:`NVFP4KVMaterializer` instead: it validates the static layout once and
+launches with caller-owned outputs, without per-call checks or allocations.
 """
 
 import functools
 import os
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -50,7 +54,12 @@ from ...cute_dsl.fp4_common import (
 )
 from ...cute_dsl.utils import get_num_sm
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
-from ...utils import backend_requirement, supported_compute_capability
+from ...utils import (
+    BackendSupportedError,
+    backend_requirement,
+    get_compute_capability,
+    supported_compute_capability,
+)
 from ..quantization_cute_dsl_utils import NVFP4_SF_VEC_SIZE, WARP_SIZE
 
 
@@ -515,6 +524,9 @@ def nvfp4_kv_materialize_fp8(
     ----
     Only E2M1 values and E4M3 block scales are multiplied. Apply the
     tensor-level K/V scales in the downstream FP8 attention kernel.
+
+    For repeated calls with one layout, such as once per layer per step,
+    :class:`NVFP4KVMaterializer` skips the per-call checks and allocations.
     """
     caches = (
         ("k_cache", k_cache),
@@ -651,3 +663,182 @@ def nvfp4_kv_materialize_fp8(
         num_blocks,
     )
     return out, fp8_block_tables
+
+
+class NVFP4KVMaterializer:
+    r"""Validate once, launch many times: :func:`nvfp4_kv_materialize_fp8` for
+    serving loops.
+
+    Frameworks materialize once per layer per prefill step, always with the same
+    layout. The functional API validates every tensor and allocates the output
+    block table on each call, which takes several times longer on the host than
+    the launch itself. This class checks the static layout and the device and
+    loads the compiled kernel at construction. :meth:`run` then launches with
+    caller-owned outputs.
+
+    :meth:`run` allocates nothing, does not synchronize with the host and
+    launches on the current CUDA stream. It can be captured in a CUDA graph and
+    replayed after new metadata is copied into the captured tensors.
+
+    Parameters
+    ----------
+    num_kv_heads : int
+        Number of KV heads per page.
+    page_size : int
+        Tokens per page. Must be divisible by 4.
+    head_dim : int
+        Head dimension. Must be divisible by 64.
+    device : Union[str, int, torch.device]
+        CUDA device that holds the tensors passed to :meth:`run`.
+    uses_shared_paged_kv_idx : bool
+        Whether K and V share page indices. ``block_tables`` is
+        ``[batch_size, max_num_pages]`` if so, else
+        ``[batch_size, 2, max_num_pages]``.
+
+    Examples
+    --------
+    >>> materializer = NVFP4KVMaterializer(num_kv_heads, page_size, head_dim)
+    >>> # Per step: one workspace and one zeroed table, shared by every layer.
+    >>> fp8_block_tables.zero_()
+    >>> for layer in layers:
+    ...     materializer.run(
+    ...         k_cache, v_cache, k_block_scales, v_block_scales,
+    ...         block_tables, seq_lens, kv_page_indptr,
+    ...         out=kv_cache_fp8, fp8_block_tables=fp8_block_tables,
+    ...     )
+    """
+
+    @flashinfer_api
+    def __init__(
+        self,
+        num_kv_heads: int,
+        page_size: int,
+        head_dim: int,
+        device: Union[str, int, torch.device] = "cuda",
+        uses_shared_paged_kv_idx: bool = True,
+    ) -> None:
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError(f"device must be a CUDA device, got {device}")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        major, minor = get_compute_capability(device)
+        capability = major * 10 + minor
+        if not nvfp4_kv_materialize_fp8.is_compute_capability_supported(capability):
+            raise BackendSupportedError(
+                f"NVFP4KVMaterializer does not support compute capability {capability}"
+            )
+        if num_kv_heads <= 0:
+            raise ValueError(f"num_kv_heads must be positive, got {num_kv_heads}")
+        if page_size <= 0 or page_size % 4 != 0:
+            raise ValueError(
+                f"page_size must be positive and divisible by 4, got {page_size}"
+            )
+        if head_dim <= 0 or head_dim % (NVFP4_SF_VEC_SIZE * 4) != 0:
+            raise ValueError(
+                f"head_dim must be positive and divisible by "
+                f"{NVFP4_SF_VEC_SIZE * 4}, got {head_dim}"
+            )
+        self.num_kv_heads = num_kv_heads
+        self.page_size = page_size
+        self.head_dim = head_dim
+        self.device = device
+        self.uses_shared_paged_kv_idx = uses_shared_paged_kv_idx
+        self._page_shape = (2, num_kv_heads, page_size, head_dim)
+        self._max_blocks = get_num_sm(device) * _BLOCKS_PER_SM
+        # Compile or load now, so that the first run() can be graph-captured.
+        self._kernel = _get_compiled_kernel(head_dim)
+
+    @flashinfer_api
+    def run(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_block_scales: torch.Tensor,
+        v_block_scales: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        *,
+        out: torch.Tensor,
+        fp8_block_tables: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Write the active pages to ``out`` and their indices to
+        ``fp8_block_tables``.
+
+        Same result as :func:`nvfp4_kv_materialize_fp8` called with the same
+        ``kv_page_indptr`` and ``out``, for the pages and table entries it writes.
+
+        Parameters
+        ----------
+        k_cache, v_cache, k_block_scales, v_block_scales, block_tables, seq_lens
+            As in :func:`nvfp4_kv_materialize_fp8`, in this object's layout.
+        kv_page_indptr : torch.Tensor
+            ``int32 [batch_size + 1]`` prefix sum of the pages each request
+            reserves in ``out``, starting at 0. Request ``b`` must get at least
+            ``ceil(seq_lens[b] / page_size)`` pages. For the functional API's
+            default layout pass ``arange(0, (batch_size + 1) * m, m)`` with
+            ``m = max_pages_per_seq``.
+        out : torch.Tensor
+            ``float8_e4m3fn [num_out_pages, 2, num_kv_heads, page_size,
+            head_dim]`` with ``num_out_pages >= kv_page_indptr[-1] + 1``. It may
+            be larger than the step needs, e.g. one workspace sized for the
+            largest step; the pages past ``kv_page_indptr[-1]`` are not written.
+            Request ``b``'s page ``j`` is written to ``kv_page_indptr[b] + j + 1``
+            and page 0 is zeroed.
+        fp8_block_tables : torch.Tensor
+            Contiguous ``int32 [batch_size, max_pages_per_seq]``.
+            ``block_tables`` must have at least ``max_pages_per_seq`` columns and
+            ``seq_lens[b] <= max_pages_per_seq * page_size``. Only the first
+            ``ceil(seq_lens[b] / page_size)`` entries of each row are written.
+            Zero the table once per step if the consumer reads the other
+            entries; every layer of a step writes the same entries.
+
+        Returns
+        -------
+        kv_cache_fp8 : torch.Tensor
+            ``out``.
+        fp8_block_tables : torch.Tensor
+            ``fp8_block_tables``.
+
+        Note
+        ----
+        The compiled kernel's launcher checks dtypes, ranks, inner strides,
+        16-byte alignment and the extents shared between arguments. Tensor
+        values (lengths, page indices, ``kv_page_indptr``) are not checked, and
+        all tensors must be on this object's device.
+        """
+        if out.shape[1:] != self._page_shape:
+            raise ValueError(
+                f"out must have shape [num_out_pages, *{self._page_shape}], "
+                f"got {tuple(out.shape)}"
+            )
+        if kv_page_indptr.shape[0] != seq_lens.shape[0] + 1:
+            raise ValueError("kv_page_indptr must have batch_size + 1 entries")
+        if block_tables.shape[-1] < fp8_block_tables.shape[1]:
+            raise ValueError(
+                f"block_tables has {block_tables.shape[-1]} columns, fewer than "
+                f"fp8_block_tables ({fp8_block_tables.shape[1]})"
+            )
+        if self.uses_shared_paged_kv_idx:
+            k_tables = v_tables = block_tables
+        else:
+            if block_tables.shape[1] != 2:
+                raise ValueError("separate K/V block_tables must have shape [B, 2, C]")
+            k_tables, v_tables = block_tables[:, 0], block_tables[:, 1]
+        num_out_pages = out.shape[0]
+        self._kernel(
+            k_cache,
+            v_cache,
+            k_block_scales,
+            v_block_scales,
+            k_tables,
+            v_tables,
+            seq_lens,
+            kv_page_indptr,
+            out,
+            fp8_block_tables,
+            num_out_pages,
+            min(num_out_pages, self._max_blocks),
+        )
+        return out, fp8_block_tables
