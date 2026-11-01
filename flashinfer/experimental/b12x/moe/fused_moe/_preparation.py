@@ -305,14 +305,19 @@ def _lower_caps(
     device: torch.device,
 ) -> TPMoEScratchCaps:
     """One config-to-Caps lowering shared by compilation, sizing and serving."""
-    inline_limit = int(query.controls.get("w4a8_csf_inline_max_tokens", 1536))
+    from . import _impl
+
+    default_inline_limit = _impl.W4A8_CSF_INLINE_DEFAULT_MAX_TOKENS
+    inline_limit = int(
+        query.controls.get("w4a8_csf_inline_max_tokens", default_inline_limit)
+    )
     if (
         weight_plan.w4a8_csf_inline
         and weight_plan.w4a8_n64_repacked
         and config.backend == "dynamic"
         and config.dynamic_tile_m == 64
         and query.intermediate_size % 128 == 0
-        and inline_limit == 1536
+        and inline_limit == default_inline_limit
         and not query.controls.get("w4a8_csf_inline_explicit_limit", False)
         and query.routed_rows <= 64 * query.num_experts
         and torch.cuda.get_device_capability(device) == (12, 1)

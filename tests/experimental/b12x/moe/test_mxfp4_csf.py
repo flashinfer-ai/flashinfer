@@ -673,3 +673,116 @@ def test_m64_prefill_admission_preserves_outputs_and_explicit_limits(
         ),
         reads_inline=reads_inline,
     )
+
+
+def test_pool_workspace_plans_with_the_n64_representation(monkeypatch):
+    """Pool allocation sizes compact micro scratch from the plan's packing."""
+    from types import SimpleNamespace
+
+    from b12x.moe.fused_moe import _impl
+
+    seen = {}
+
+    class _Planned(Exception):
+        pass
+
+    def plan_core_workspace(*args, **kwargs):
+        seen.update(kwargs)
+        raise _Planned
+
+    monkeypatch.setattr(_impl, "_plan_core_workspace", plan_core_workspace)
+    monkeypatch.setattr(_impl.torch.cuda, "is_current_stream_capturing", lambda: False)
+    plan = SimpleNamespace(
+        implementation="micro",
+        quant_mode="w4a8_mx",
+        state_E=8,
+        weight_E=8,
+        k=1024,
+        n=256,
+        num_topk=2,
+        routed_rows=8,
+        max_rows=8,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        activation="silu",
+        deterministic_output=False,
+        dynamic_physical_tiles=None,
+        dynamic_task_capacity=None,
+        max_tokens_per_launch=4,
+        execution=SimpleNamespace(tile_m=16, tile_n=128),
+        decode_config=SimpleNamespace(
+            dynamic_route_mode=None, nvfp4_materialize_intermediate=False
+        ),
+        weight_plan=SimpleNamespace(source_format="fp4_e8m0_k32"),
+        w4a8_n64_repacked=True,
+    )
+    one = torch.ones(8)
+    with pytest.raises(_Planned):
+        _impl._resolve_workspace(
+            _impl.TPMoEWorkspacePool(),
+            plan=plan,
+            a1_gscale=one,
+            a2_gscale=one,
+            input_scales_static=True,
+        )
+    assert seen["source_format"] == "fp4_e8m0_k32"
+    assert seen["w4a8_n64_repacked"] is True
+
+
+def test_direct_binding_rejects_compact_plans_without_prepared_launchers(
+    monkeypatch,
+):
+    """Only fused_moe.plan() builds the launchers that compact micro plans need."""
+    from b12x.moe.fused_moe import _impl
+
+    device = require_b12x()
+    arms, _ = _prepare_arms(1024, 256, "w31", monkeypatch)
+    tokens, topk = 4, 2
+    x = torch.randn(tokens, 1024, dtype=torch.bfloat16, device=device)
+    ids = torch.randint(0, 8, (tokens, topk), dtype=torch.int32, device=device)
+    weights = torch.full((tokens, topk), 0.5, device=device)
+    with pytest.raises(ValueError, match="fused_moe.plan"):
+        _impl.build_tp_moe_fp4_binding(
+            scratch=_impl.allocate_tp_moe_workspace_pool(),
+            a=x,
+            experts=arms[0]._impl,
+            topk_weights=weights,
+            topk_ids=ids,
+            output=torch.empty_like(x),
+            input_scales_static=True,
+            quant_mode="w4a8_mx",
+            decode_config=moe.MoeDecodeConfig(
+                backend="micro", route_planner="internal", max_active_clusters=None
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "n,capability,requested,expected",
+    [
+        (256, (12, 1), False, True),
+        (256, (12, 0), False, False),
+        (256, (12, 0), True, True),
+        (192, (12, 0), False, True),
+    ],
+)
+def test_full_n128_n64_packing_defaults_to_sm121(
+    n, capability, requested, expected, monkeypatch
+):
+    """N64 tails always pack; full N128 tiles pack by default only on SM121."""
+    from b12x.moe.fused_moe import planning
+
+    monkeypatch.delenv("B12X_W4A8_CSF_INLINE", raising=False)
+    monkeypatch.setattr(
+        planning.torch.cuda, "get_device_capability", lambda device=None: capability
+    )
+    plan = moe.plan_weights(
+        source=moe.PackedSource(format="fp4_e8m0_k32", w13_layout="w31"),
+        activation=moe.ActivationSpec(
+            mode="a8", nonlinearity="silu", io_dtype=torch.bfloat16
+        ),
+        geometry=moe.MoEGeometry(num_experts=8, hidden_size=1024, intermediate_size=n),
+    )
+    if requested:
+        plan = replace(plan, _impl=replace(plan._impl, w4a8_n64_repacked=True))
+    assert planning._w4a8_csf_inline(plan, torch.device("cuda", 0)) is expected

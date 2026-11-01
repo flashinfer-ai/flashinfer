@@ -4413,6 +4413,8 @@ def _alloc_workspace(
     dynamic_tile_n: int | None = None,
     dynamic_route_mode: str | None = None,
     nvfp4_materialize_intermediate: bool = False,
+    source_format: str = "modelopt_nvfp4",
+    w4a8_n64_repacked: bool = False,
     pool: TPMoEWorkspacePool | None = None,
     storage_key: tuple | None = None,
 ) -> TPMoEWorkspace | TPW4A16Workspace:
@@ -4439,6 +4441,8 @@ def _alloc_workspace(
         dynamic_tile_n=dynamic_tile_n,
         dynamic_route_mode=dynamic_route_mode,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+        source_format=source_format,
+        w4a8_n64_repacked=w4a8_n64_repacked,
     )
     if pool is not None:
         if storage_key is None:
@@ -8166,6 +8170,8 @@ def _resolve_workspace(
             dynamic_tile_n=plan.execution.tile_n,
             dynamic_route_mode=plan.decode_config.dynamic_route_mode,
             nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
+            source_format=plan.weight_plan.source_format,
+            w4a8_n64_repacked=plan.w4a8_n64_repacked,
             pool=workspace,
             storage_key=key,
         )
@@ -8241,6 +8247,8 @@ def _resolve_workspace(
             dynamic_tile_n=plan.execution.tile_n,
             dynamic_route_mode=plan.decode_config.dynamic_route_mode,
             nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
+            source_format=plan.weight_plan.source_format,
+            w4a8_n64_repacked=plan.w4a8_n64_repacked,
             pool=workspace,
             storage_key=key,
         )
@@ -9946,6 +9954,17 @@ def build_tp_moe_fp4_binding(
         decode_config=decode_config,
     )
     deterministic_output = plan.deterministic_output
+    if (
+        plan.implementation == "micro"
+        and plan.quant_mode == "w4a8_mx"
+        and getattr(prepared_payload, "n64_repack", False)
+    ):
+        # Compact launchers are built only by fused_moe.plan(). Reject here
+        # instead of failing later in b12x_moe_fp4.
+        raise ValueError(
+            "compact W4A8 micro execution with N64-packed weights requires "
+            "prepared launchers; bind the experts through fused_moe.plan()"
+        )
     if isinstance(workspace, TPMoEWorkspacePool):
         weight_layout = "packed"
         scale_format = "e4m3_k16"
@@ -13261,8 +13280,11 @@ W4A16_CSF_STAGE_MAX_TOKENS = int(
 
 
 # Planned token capacity limit for compact W4A8 inline scale reads.
+W4A8_CSF_INLINE_DEFAULT_MAX_TOKENS = 1536
 W4A8_CSF_INLINE_MAX_TOKENS = int(
-    os.environ.get("B12X_W4A8_CSF_INLINE_MAX_TOKENS", "1536")
+    os.environ.get(
+        "B12X_W4A8_CSF_INLINE_MAX_TOKENS", str(W4A8_CSF_INLINE_DEFAULT_MAX_TOKENS)
+    )
 )
 
 
