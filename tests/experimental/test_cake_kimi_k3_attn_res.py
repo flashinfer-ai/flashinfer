@@ -730,7 +730,7 @@ def test_packed_register_carry_cells_take_the_packed_programs():
     ``_packed_register_carry`` ahead of ``_fastmath``.  The K = 3 cells sm_100a (256, 3), (1536, 3)
     and (2048, 3) and sm_103a (256, 3), (512, 3) and (1536, 3) run it at both PDL modes (sm_103a at
     both SM counts); round 23 adds the K = 4 / 5 cells sm_100a (1536, 4) and (512, 5) and sm_103a
-    (1024, 5) at both SM counts."""
+    (1024, 5) at both SM counts; round 25 adds the sm_103a (384, 4) cell at 148 SMs."""
     cells = (
         [("sm_100a", 148, M, 3) for M in (256, 1536, 2048)]
         + [
@@ -740,6 +740,7 @@ def test_packed_register_carry_cells_take_the_packed_programs():
         ]
         + [("sm_100a", 148, 1536, 4), ("sm_100a", 148, 512, 5)]
         + [("sm_103a", sm_count, 1024, 5) for sm_count in SM_COUNTS]
+        + [("sm_103a", 148, 384, 4)]
     )
     for arch, sm_count, M, K in cells:
         for pdl in (False, True):
@@ -1493,7 +1494,7 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
 # First token count of every dense route band: the M at which ``plan_route`` changes its kernel
 # key on some architecture, SM count in SM_COUNTS or PDL setting, per K.  The bands follow the
 # route tables (the small-M table and its cluster / chunk / fast-math bands, the round-r5 cells,
-# the round-2 / round-3 / round-6 / round-20 / round-23 / round-24 cells (among them the
+# the round-2 / round-3 / round-6 / round-20 / round-23 / round-24 / round-25 cells (among them the
 # single-cell fast-math cells of K 0), the release bands, the nc / depth edges, the native and pair cells)
 # and, for K8 on sm_100a, the SM count itself (the release flips at M = SMs + 1).
 # ``test_gpu_rows_are_the_route_band_starts`` recomputes the set from the tables.
@@ -1501,7 +1502,7 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
 _ROUTE_BAND_START_ROWS = {
     0: (
         1, 9, 12, 13, 16, 17, 24, 25, 32, 33, 48, 49, 64, 65, 96, 97, 128, 129, 192, 193, 256, 257,
-        384, 385, 512, 513,
+        384, 385, 512, 513, 768, 769,
     ),
     1: (
         1, 513, 768, 769, 1024, 1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145,
