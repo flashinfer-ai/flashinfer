@@ -14,18 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Former import path of ``flashinfer.experimental.dense_projection_det_gemm``: the package was renamed.  Its modules
-# keep answering under this path as the renamed package's own module objects (one registry, one set of caches and
-# loaded libraries), so a former import names the same objects.
-import importlib
-import sys
+# Experimental Cake backend: the GLM-5.2 dense projection GEMMs for training
+# and the FP32 router-gate GEMM on SM100 / SM103 / SM107 with an explicit
+# numerical mode (flashinfer-ai/flashinfer#5677).  Every entry point of
+# ``cake_backend`` takes the keyword-only ``deterministic: bool = True``: the
+# default calls the deterministic package
+# (``flashinfer.experimental.dense_projection_det_gemm``: the same programs and
+# the same bits as before this package existed); ``deterministic=False`` selects
+# the programs of this package, which add split-K partials in the order they
+# finish.  Importing this package imports nothing: ``cake_backend``,
+# ``cake_jit`` and ``cake_build`` load on first attribute access.
 
-from flashinfer.experimental.dense_projection_det_gemm import *  # noqa: F401,F403
+__all__ = ["cake_backend", "cake_build", "cake_jit"]
 
-for _name in ("cake_backend", "cake_jit", "cake_build"):
-    _module = importlib.import_module(
-        f"flashinfer.experimental.dense_projection_det_gemm.{_name}"
-    )
-    sys.modules[f"{__name__}.{_name}"] = _module
-    globals()[_name] = _module
-del _name, _module
+
+def __getattr__(name: str):
+    if name in __all__:
+        import importlib
+
+        return importlib.import_module(f"{__name__}.{name}")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), *__all__})

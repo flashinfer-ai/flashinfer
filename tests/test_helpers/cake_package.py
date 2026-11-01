@@ -28,6 +28,7 @@ PACKAGES: dict[str, str] = {
     "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",
     "cake_lm_head_det_loss": "flashinfer.experimental.cake_lm_head_det_loss",
     "dense_projection_det_gemm": "flashinfer.experimental.dense_projection_det_gemm",
+    "dense_projection_gemm": "flashinfer.experimental.dense_projection_gemm",
     "cake_moe_grouped_det_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
     # the suite name before the deterministic-family rename (compatibility alias)
     "cake_moe_grouped_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
