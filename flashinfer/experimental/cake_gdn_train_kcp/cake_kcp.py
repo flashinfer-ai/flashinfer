@@ -2356,7 +2356,11 @@ def _call_tickets(
     such call on that stream.  Every persistent launch leaves its word at zero and the launches of one stream run in
     issue order, so a later launch never meets a word in use; calls on another stream get their own set.  ``None``
     (fresh slots per call, as before) under a CUDA stream capture -- a captured graph keeps the addresses it baked --
-    or without a context cache."""
+    or without a context cache.
+
+    The sharing relies on every persistent launch of such a call staying on the caller's stream (the stream in this
+    key): a launch moved to a side stream would no longer be ordered with the other calls' launches and must get its
+    own slots (or be ordered with this stream by an event) before it shares this set."""
     caches = getattr(ctx, "_caches", None)
     if not isinstance(caches, dict):
         return None
