@@ -398,13 +398,17 @@ def _require_contiguous_a_column_major_b(
         )
 
 
-def _require_cutlass_bf16_alignment(k: int, n: int) -> None:
-    # The kernel computes out^T, so K and N are the leading dimensions of its
+def _cutlass_bf16_is_aligned(k: int, n: int, out_dtype: torch.dtype) -> bool:
+    # The kernel computes out^T, so K and N are the contiguous dimensions of its
     # TMA operands; can_implement() rejects rows that are not 16-byte aligned.
-    if k % 8 != 0 or n % 8 != 0:
+    return k % 8 == 0 and n % (16 // out_dtype.itemsize) == 0
+
+
+def _require_cutlass_bf16_alignment(k: int, n: int, out_dtype: torch.dtype) -> None:
+    if not _cutlass_bf16_is_aligned(k, n, out_dtype):
         raise ValueError(
-            "The CUTLASS backend requires K and N to be multiples of 8 "
-            f"(16-byte aligned rows), got K={k} and N={n}."
+            "The CUTLASS backend requires K divisible by 8 and N divisible by "
+            f"{16 // out_dtype.itemsize} for {out_dtype} output, got K={k} and N={n}."
         )
 
 
@@ -429,9 +433,11 @@ def _cutlass_mm_bf16_requirement(
             "The CUTLASS backend does not support PDL. Use the TGV backend instead."
         )
     _require_contiguous_a_column_major_b(a, b, "CUTLASS")
-    _require_cutlass_bf16_alignment(a.shape[1], b.shape[1])
 
     _validate_bf16_output_dtype(out_dtype)
+    _require_cutlass_bf16_alignment(
+        a.shape[-1], b.shape[-1], out.dtype if out is not None else out_dtype
+    )
 
     return True
 
@@ -916,8 +922,10 @@ def _cutlass_bmm_bf16_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
-    _require_cutlass_bf16_alignment(A.shape[-1], B.shape[-1])
     _validate_bf16_output_dtype(out_dtype)
+    _require_cutlass_bf16_alignment(
+        A.shape[-1], B.shape[-1], out.dtype if out is not None else out_dtype
+    )
 
     return True
 
@@ -2207,6 +2215,9 @@ def get_gemm_sm100_module_cutlass_bf16():
                 inputs: List[torch.Tensor],
                 profile: OptimizationProfile,
             ) -> List[int]:
+                a, b, _, _, out, _ = inputs
+                if not _cutlass_bf16_is_aligned(a.shape[-1], b.shape[-1], out.dtype):
+                    return []
                 return list(range(module.bf16_gemm_tactic_num()))
 
             def forward(
