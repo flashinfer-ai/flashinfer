@@ -51,7 +51,9 @@ Thin experimental entry points: the contract, the host plan, the workspace,
 the launch sequences, the autograd Functions and the generated kernels live in
 the two packages, which every function imports inside its body (importing this
 module loads neither); this module forwards every keyword.  Every switch is a
-keyword argument; no environment variable is read.
+keyword argument; this module reads no environment variable (the
+non-deterministic package's ``chunk_kda`` reads ``CAKE_KDA_CKPT_HANDOFF``, the
+benchmarking override of ``checkpoint_handoff``).
 
 Operands (one packed batch of documents): ``q, k, v`` BF16 ``[1, S, H, 128]``
 (``q`` / ``k`` L2-normalized by the caller), ``g`` FP32 ``[1, S, H, 128]`` (the
@@ -394,6 +396,7 @@ def chunk_kda(
     save_mode: Optional[str] = None,
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
+    checkpoint_handoff: str = "auto",
     deterministic: bool = True,
 ) -> torch.Tensor:
     r"""Packed KDA chunked training as an autograd node (``torch.utils.checkpoint`` compatible).
@@ -401,8 +404,14 @@ def chunk_kda(
     Returns ``out`` BF16 like ``v`` with gradients to ``q, k, v, g, beta``; see :func:`chunk_kda_fwd` for the
     operands, ``save_mode``, ``arena`` and ``doc_lengths`` and :func:`chunk_kda_bwd` for the gradients.
     ``deterministic`` selects the package at the forward call; the node's backward runs the same package.
+    ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``): the non-deterministic package's checkpoint
+    hand-off (its README); the deterministic package has no hand-off and ignores it.
     """
     scale = DEFAULT_SCALE if scale is None else scale
+    if checkpoint_handoff not in ("auto", "on", "off"):
+        raise ValueError(
+            f"chunk_kda: checkpoint_handoff must be 'auto', 'on' or 'off', got {checkpoint_handoff!r}"
+        )
     if _deterministic(deterministic, "chunk_kda"):
         workspace, arena, save_mode = _det_call(
             workspace, arena, save_mode, deterministic, "chunk_kda"
@@ -432,6 +441,7 @@ def chunk_kda(
         save_mode=save_mode,
         arena=_arena_for(False, arena),
         doc_lengths=doc_lengths,
+        checkpoint_handoff=checkpoint_handoff,
         deterministic=False,
     )
 

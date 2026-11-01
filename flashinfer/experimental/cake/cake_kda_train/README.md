@@ -12,7 +12,8 @@ options, document groups (`batch_tokens`), launch sequences and byte queries
 are the deterministic package's; its README
 (`flashinfer/experimental/cake_kda_det_train/README.md`) describes them.  This
 package imports nothing from it and ships its own copies of every program.
-This README describes what differs.
+This README describes what differs, including the checkpoint hand-off of
+`chunk_kda`, which the deterministic package does not have.
 
 ## Entry points and numerical mode
 
@@ -46,6 +47,11 @@ its autograd node `ChunkKDAFunction.apply` (a trailing argument) take
 `deterministic: bool = True` too and raise `ValueError` unless it is `False`:
 a call that only swaps the import path of the deterministic package fails
 instead of changing mode.
+
+`ChunkKDAFunction.apply` takes `checkpoint_handoff` (`None`, `"auto"`, `"on"`
+or `"off"`; see below) as the positional argument after `doc_lengths`, before
+`deterministic`.  This changes the positional signature: an `apply` written
+for the previous one passes its `bool` in that slot and raises `TypeError`.
 
 - The mode of `chunk_kda` is fixed at its forward call: the autograd node's
   backward is the forward's package.
@@ -118,6 +124,99 @@ architecture back, and the deterministic `dqkg_davq_nohint` /
   saving forward and takes the saved-set pair, so checkpointed and direct
   training agree bitwise.
 
+## Checkpoint hand-off
+
+`chunk_kda(..., checkpoint_handoff="auto")` applies under
+`torch.utils.checkpoint` (reentrant or not).  The forward that torch re-runs
+inside the backward also writes the `h` / `v_new` tapes and keeps the
+forward's `w` and the segment transfers in a per-device record.  The node's
+backward takes the record and runs the tape path from it: no recurrence
+recompute, and no `wy` launch where the record carries `w`.  `out` and the
+saved set do not change.
+
+| `checkpoint_handoff` | engages |
+| --- | --- |
+| `"auto"` (default) | at the head counts of `cake_backend.HANDOFF_HEADS` (2, 4, 8, 12, 16, 32, 64) on the devices of `cake_backend.HANDOFF_VERIFIED` (architecture, SM count, Cake build toolkit): `sm_100a` and `sm_103a` with 148 or 152 SMs, `sm_107a` with 212 SMs, toolkit 13.4 |
+| `"on"` | every call it supports (tests and benchmarks) |
+| `"off"` | never |
+
+- On those devices and head counts the hand-off suite measured the
+  gradients bitwise equal to `"off"` on the tested rows: every plan family
+  its packs reach, under both checkpoint modes.  Other head counts select
+  record combinations the suite has not run.  At one head the step is
+  host-bound and the hand-off gains nothing.
+- Elsewhere `"auto"` runs as `"off"`, also when the toolkit cannot be read.
+  A new device, toolkit or registry needs the suite on that device before it
+  enters `HANDOFF_VERIFIED`.
+- The environment variable `CAKE_KDA_CKPT_HANDOFF` (`off` / `on`) is read by
+  `chunk_kda` at each call, not by `ChunkKDAFunction.apply`.  `off` turns
+  every call off; `on` turns `"auto"` into `"on"`.  An explicit `"off"` stays
+  off.
+- Row records: the registry maps each forward intra record to a twin
+  (`cake_jit.HANDOFF_TWINS`: `fwd_intra_v19` for `fwd_intra_v14`,
+  `fwd_intra_v20` for `fwd_intra`).  The twin is the same program and also
+  writes every `gk` row and the internal beta.  A recompute that launches
+  the twin keeps `gk`, `kg`, `beta_int`, and `kb` where it keeps no `w`, in
+  a row record.  Its backward launches no prep, and one fill kernel zeroes
+  the `dv2` pad rows.  A record without these rows is a tape record.
+- The recompute asks for a row record only on the devices of
+  `cake_backend.HANDOFF_ROWS_VERIFIED` (architecture, SM count, full toolkit
+  version such as `13.4.92`), at the `HANDOFF_HEADS` head counts, for a call
+  without a `workspace`, when the twin, the intra record and the light prep
+  come from one build (all prebuilt, or all built by the JIT) and the twin
+  loads.  The twin's rows equal the prep's only where one toolkit compiles
+  both to the same instructions, so the key includes the patch version.
+  The set holds `sm_100a` and `sm_103a` at 148 and 152 SMs and `sm_107a` at
+  212 SMs with toolkit `13.4.92` (B200, GB200, B300, GB300, R200).  On each,
+  the hand-off suite with row records, the twin-row test, the P8 64-head gate
+  and the hand-off parity rows passed.  Elsewhere every record is a tape
+  record.
+- Memory: a tape record holds `memory_report(...)["handoff_bytes"]` from the
+  recompute to its node's backward; a row record holds
+  `["handoff_bytes_rows"]` (772 B more per internal token-head, and 256 B
+  more where it keeps `kb`).  A recompute that asks for a tape record is
+  admitted within two tape records of the call's shape
+  (`["handoff_budget_bytes"]`); one that asks for a row record within the
+  larger of that and one row record.  A row record that does not fit becomes
+  a request for a tape record.  A tape record that does not fit first turns
+  the live row records of the device into tape records (they drop their
+  rows), and is refused if it still does not fit.  The backward that takes a record
+  allocates only the layout it runs (`["arena_bwd_tape"]`,
+  `["arena_bwd_handoff"]`: the row record's is 516 B per internal
+  token-head smaller).  With tape records the measured peak of a
+  checkpointed step rose about 4 % on the rows whose record allocates its
+  own `w` (the forward launches a WY program and the light set carries no
+  `w`), and did not change elsewhere.  A call without a `workspace`
+  allocates its backward arena in the backward.  In a loop of checkpointed
+  steps near the memory limit, other allocations can split the cached arena,
+  and the backward then runs out of memory, with the hand-off on or off.
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` avoids it.
+- The record is stamped with the inputs, their versions, the plan and the
+  stream.  Any mismatch, an arena option, `doc_lengths`, CUDA-graph capture,
+  `torch.compile`, compiled autograd or a Python dispatch mode runs the light
+  path; `save_mode="tape"` runs the tape path without the hand-off.
+  Repeated misses turn the hand-off off on the device.
+
+## Tape WY twin
+
+The tape backward (a `save_mode="tape"` saved set, or a hand-off record
+without the forward's `w`) takes `v_new` from the tape, so nothing it launches
+reads the `u` that its WY record `wy_bwd` also writes.  The registry maps
+`wy_bwd` to a twin (`cake_jit.TAPE_TWINS`: `wy_bwd_v9`, the same program
+without the `u` half; it reads neither `v` nor `beta` and writes the same `w`).
+No rule selects the twin.
+
+- The tape backward launches the twin in place of `wy_bwd`, on its grid, on
+  the devices of `cake_backend.TAPE_WY_VERIFIED` (architecture, SM count, full
+  toolkit version), when the twin and `wy_bwd` come from one build (all
+  prebuilt, or all built by the JIT) and the twin loads.  Elsewhere, and after
+  a failed load, it launches `wy_bwd`.
+- The set holds `sm_100a` at 148 and 152 SMs, `sm_103a` at 148 SMs and
+  `sm_107a` at 212 SMs with toolkit `13.4.92` (B200, GB200, B300, R200).  On
+  each, the hand-off suite, the tape-mode tests with the twin and the hand-off
+  parity rows passed, bitwise.
+- The launch count, the arena and the gradients do not change.
+
 ## Names
 
 | deterministic package (unchanged) | this package |
@@ -138,7 +237,7 @@ digest under this package's prefix.
 
 ## Registry
 
-72 records naming 70 programs from 43 kernels.  The records of the
+75 records naming 73 programs from 46 kernels.  The records of the
 deterministic package are copied under this package's prefix, with these
 changes:
 
@@ -150,31 +249,41 @@ changes:
 | `dqkg_davq`, `dqkg_int_davq` | the same programs; rules narrowed to the deterministic-pair rows, built only where those rows launch them (`dqkg_davq`: `sm_100a`; `dqkg_int_davq`: `sm_103a`) |
 | `glm_intra`, `glm_intra_v14`, `glm_intra_v18` | the same programs; rules narrowed to the deterministic-pair rows |
 | `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | not shipped (`sm_107a` runs the `S1` pairs from 16 heads) |
+| `fwd_intra_v19`, `fwd_intra_v20` | new: the checkpoint hand-off's intra twins of `fwd_intra_v14` and `fwd_intra` (all three architectures); no path selects them |
+| `wy_bwd_v9` | new: the tape WY twin of `wy_bwd`, writing `w` alone (all three architectures); no path selects it |
 
-`build.json` has 188 entries: 63 on `sm_100a`, 62 on `sm_103a` and 63 on
+`build.json` has 197 entries: 66 on `sm_100a`, 65 on `sm_103a` and 66 on
 `sm_107a`.
 
 ## Layout of this package
 
-* `cake_jit.py` -- the `MODULES` registry, `S1_RECORDS`, the paths, the stage
-  order, the optional stages and the segmented route's constants, the logical
-  vocabulary, the loader glue and `run_module`.  The derived leaves
-  `kernel_symbol`, `launch`, `arg_plan` and `logical` are rewritten by the
-  export.
+* `cake_jit.py` -- the `MODULES` registry, `S1_RECORDS`, `HANDOFF_TWINS`,
+  `TAPE_TWINS`, the paths, the stage order, the optional stages and the
+  segmented route's constants, the logical vocabulary, the loader glue and
+  `run_module`.  The derived leaves `kernel_symbol`, `launch`, `arg_plan` and
+  `logical` are rewritten by the export.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
   `cake-build/1`).  `aot/` is never tracked (`.gitignore`).
 * `cake_backend.py` -- operand checks, the host plan and its pairing check,
   the arena workspace, the saved set, the forward and backward launch
-  sequences, the autograd `Function` and the byte queries.
+  sequences, the autograd `Function`, the checkpoint hand-off, the tape WY
+  twin's rule and the byte queries.
 * `csrc/` -- the generated device and binding translation units and
   `cake_ffi_checks.h`, identity-checked by the digests in `build.json`.
 
 ## Status
 
-Tests: `tests/experimental/test_cake_kda_train.py` (the backend suite against
-the FP64 reference of `tests/test_helpers/cake_kda_det_train_reference.py`,
-and the comparison with the deterministic package) and
-`tests/experimental/test_cake_kda_train_api.py` (the facade, the mode keyword
-and the dispatch).  Benchmark: `benchmarks/bench_cake_kda_train.py`.  The
-context-parallel path is not part of this package.
+Tests:
+
+* `tests/experimental/test_cake_kda_train.py`: the backend suite against the
+  FP64 reference of `tests/test_helpers/cake_kda_det_train_reference.py`,
+  the comparison with the deterministic package, the hand-off twins'
+  records and rows, and the tape WY twin's record, rule and tape backward.
+* `tests/experimental/test_cake_kda_train_api.py`: the facade, the mode
+  keyword and the dispatch.
+* `tests/experimental/test_cake_kda_train_handoff.py`: the checkpoint
+  hand-off with tape and row records, with and without the tape WY twin.
+
+Benchmark: `benchmarks/bench_cake_kda_train.py`.  The context-parallel path
+is not part of this package.

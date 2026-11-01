@@ -26,14 +26,19 @@ fused gradient and the GLM intra program always agree on S1), the same-input com
 (every output bitwise but ``dg``; ``dg`` within the FP64 gate, its error at most ``DG_ERROR_RATIO_MAX`` times the
 deterministic package's), the worst case over repeated runs, the replay re-specified on the rows where the saved-set
 backward and the replay run different pairs, the launches of the S1 records on exactly the S1 cells, and gradient
-accumulation into a nonzero ``.grad``.  The mode keyword, the facade and the legacy names are covered by
-``test_cake_kda_train_api.py``.
+accumulation into a nonzero ``.grad``.  The checkpoint hand-off's intra twins (``cake_jit.HANDOFF_TWINS``): their
+records against their intra records, no rule selecting them, and their rows against the light prep's on a GPU.  The
+tape path's w-only WY twin (``cake_jit.TAPE_TWINS``): its record against its WY record, no rule selecting it, the
+rule that launches it, and on a GPU its ``w`` and the tape backward's gradients against the WY record's at every head
+count.  The mode keyword, the facade and the legacy names are covered by ``test_cake_kda_train_api.py``; the hand-off
+itself by ``test_cake_kda_train_handoff.py``.
 """
 
 import dataclasses
 import hashlib
 import itertools
 import json
+import os
 import re
 import types
 from pathlib import Path
@@ -410,8 +415,21 @@ RECORD_ARCHES = {
 # The deterministic package's records no cell of this package launches: the sm_107a rows from 16 heads (the only
 # rows of the builds with the L2 hints off) run the S1 pair on every backward path.
 DET_RECORDS_NOT_LAUNCHED = frozenset(("dqkg_davq_nohint", "dqkg_int_davq_nohint"))
-# The registry's size: the deterministic package's 67 records, less those, plus the seven S1 records.
-MODULE_COUNT = 67 - len(DET_RECORDS_NOT_LAUNCHED) + 7
+# The checkpoint hand-off's intra twins, intra record -> twin: new programs that also write every gk row and the
+# internal beta (``beta_int``); no path selects them, the hand-off's recompute launches one in place of its record.
+HANDOFF_TWINS = {"fwd_intra": "fwd_intra_v20", "fwd_intra_v14": "fwd_intra_v19"}
+TWIN_RECORDS = frozenset(HANDOFF_TWINS.values())
+# The tape path's w-only WY twin, WY record -> twin: a new program, the record's without the u half (no v / beta
+# operands, no u output); no path selects it, the tape backward launches it in place of its record.
+TAPE_TWINS = {"wy_bwd": "wy_bwd_v9"}
+TAPE_WY_RECORDS = frozenset(TAPE_TWINS.values())
+# The logical names of the WY record's parameters the twin does not take: u and the operands only u reads.
+TAPE_WY_DROPPED = frozenset({"v", "beta", "u"})
+# The registry's size: the deterministic package's 67 records, less those, plus the seven S1 records, the hand-off
+# twins and the tape WY twin.
+MODULE_COUNT = (
+    67 - len(DET_RECORDS_NOT_LAUNCHED) + 7 + len(TWIN_RECORDS) + len(TAPE_WY_RECORDS)
+)
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
 TWO_PASS_RECORDS = (
@@ -526,10 +544,17 @@ def _route_rule(route: str) -> dict:
 
 def test_registry_records_are_well_formed() -> None:
     # the deterministic package's records (their own copies) less the deterministic forms no cell of this package
-    # launches, plus the S1 records; two library pairs are shared (see the twins below)
-    assert set(cake_jit.MODULES) == (
-        set(det_jit.MODULES) - DET_RECORDS_NOT_LAUNCHED
-    ) | set(S1_RECORDS)
+    # launches, plus the S1 records, the hand-off twins and the tape WY twin; two library pairs are shared (see the
+    # twins below)
+    assert cake_jit.HANDOFF_TWINS == HANDOFF_TWINS
+    assert cake_jit.TAPE_TWINS == TAPE_TWINS
+    assert (
+        set(cake_jit.MODULES)
+        == (set(det_jit.MODULES) - DET_RECORDS_NOT_LAUNCHED)
+        | set(S1_RECORDS)
+        | TWIN_RECORDS
+        | TAPE_WY_RECORDS
+    )
     assert len(cake_jit.MODULES) == MODULE_COUNT
     assert len({r["library"] for r in cake_jit.MODULES.values()}) == MODULE_COUNT - 2
     assert set(cake_jit.S1_RECORDS) == S1_RECORDS and len(cake_jit.S1_RECORDS) == 7
@@ -931,9 +956,10 @@ def test_registry_records_are_well_formed() -> None:
         assert [list(pair) for pair in record["arg_plan"]] == [
             list(pair) for pair in twin["arg_plan"] if pair[1] != "q_tma"
         ], name
-    # the S1 programs are new code: libraries of their own, none shared with a deterministic program's digest
+    # the S1 programs, the hand-off twins and the tape WY twin are new code: libraries of their own, none shared with
+    # a deterministic program's digest
     det_digests = {r["library"].rsplit("_", 1)[1] for r in det_jit.MODULES.values()}
-    for name in S1_RECORDS:
+    for name in (*S1_RECORDS, *TWIN_RECORDS, *TAPE_WY_RECORDS):
         assert cake_jit.MODULES[name]["library"].rsplit("_", 1)[1] not in det_digests
     # the saving forward's token-row twins: the same stage, grid and rule leaves as the internal-row forms but the path
     for internal, rows in (
@@ -1665,6 +1691,7 @@ def test_pair_kernels_launch_one_cta_per_pair_item() -> None:
         "wy_fwd_rows",
         "wy_bwd",
         "wy_bwd_replay",
+        "wy_bwd_v9",
         "dav_serial",
         "dav_serial_replay",
     ):
@@ -1893,11 +1920,13 @@ def test_the_forward_wy_forms_the_gated_values_from_the_token_rows() -> None:
         fwd["logical"]["akk_tma"] == "akk_int"
         and bwd["logical"]["akk_tma"] == "akk_src"
     )
-    # the forward intra programs write the prep's outputs themselves (no prep launch) and read no v either
-    for name in ("fwd_intra", "fwd_intra_v14"):
+    # the forward intra programs write the prep's outputs themselves (no prep launch) and read no v either; the
+    # hand-off twins also write the internal beta
+    for name in ("fwd_intra", "fwd_intra_v14", *sorted(TWIN_RECORDS)):
         intra = set(cake_jit.MODULES[name]["logical"].values())
         assert not intra & {"v", "vb"}, name
         assert {"gk", "kb", "kg", "qg", "v_new", "write_prep"} <= intra, name
+        assert ("beta_int" in intra) is (name in TWIN_RECORDS), name
     # the segmented route's intra program computes the chunk layout from cu_seqlens and writes the five tables
     v14 = set(cake_jit.MODULES["fwd_intra_v14"]["logical"].values())
     tables = set(cake_backend.TABLE_NAMES)
@@ -1928,6 +1957,153 @@ def test_the_forward_wy_forms_the_gated_values_from_the_token_rows() -> None:
         rows_wy["logical"][next(k for k, v in bwd["logical"].items() if v == "akk_src")]
         == "akk_ext"
     )
+
+
+# rows of the three routes' intra records (the segmented route up to 256 documents: fwd_intra_v14; the serial route
+# and more than 256 documents: fwd_intra), at sizes the plans accept
+TWIN_PLAN_ROWS = [
+    ((100, 640, 77, 1000, 129), 2),
+    ((63, 1, 65), 4),
+    ((65, 200), 32),
+    ((63, 1, 65), 64),
+    ((65,) * 257, 2),
+    ((65,) * 257, 16),
+    ((129, 300, 70), 16),
+]
+
+
+def test_the_handoff_twins_are_their_intra_records_plus_beta_int() -> None:
+    """The checkpoint hand-off's intra twins (``cake_jit.HANDOFF_TWINS``): each twin is its intra record's program
+    that also writes the internal ``beta_int``: the same stage, grid, launch, entry and architectures, the record's
+    operands plus ``beta_int`` right before the grid arguments, a library of its own; no rule admits it (``_admits``
+    is false on every ``PLAN_GRID`` cell, architecture and path), ``select_record`` never returns it, and
+    ``Plan.handoff_twin`` names the twin of the plan's intra record."""
+    assert cake_jit.HANDOFF_TWINS == HANDOFF_TWINS
+    assert "beta_int" in cake_jit.LOGICAL_TENSORS
+    for parent, twin in HANDOFF_TWINS.items():
+        a, b = cake_jit.MODULES[parent], cake_jit.MODULES[twin]
+        assert a["stage"] == b["stage"] == "fwd_intra", twin
+        for key in ("grid_rule", "launch", "ffi_entry", "arches"):
+            assert b[key] == a[key], (twin, key)
+        assert b["logical"] == {**a["logical"], "beta_int": "beta_int"}, twin
+        plan_a = [list(pair) for pair in a["arg_plan"]]
+        assert [list(pair) for pair in b["arg_plan"]] == [
+            *plan_a[:-3],
+            ["buffer", "beta_int"],
+            *plan_a[-3:],
+        ], twin
+        assert b["select_rule"] == {"kind": "path_in", "paths": []}, twin
+        assert b["library"] != a["library"], twin
+    for nc_pad, n, h, sm in PLAN_GRID:
+        for arch in ARCHES:
+            nseg = cake_jit.segment_plan(n, h, sm, arch)[2]
+            for path in PATHS:
+                for twin in TWIN_RECORDS:
+                    assert not cake_jit._admits(
+                        cake_jit.MODULES[twin]["select_rule"],
+                        ctas=nc_pad * h,
+                        num_seqs=n,
+                        num_heads=h,
+                        sm_count=sm,
+                        num_segments=nseg,
+                        arch=arch,
+                        path=path,
+                    ), (twin, nc_pad, n, h, sm, arch, path)
+                name = cake_jit.select_record(
+                    "fwd_intra",
+                    num_chunks_pad=nc_pad,
+                    num_seqs=n,
+                    num_heads=h,
+                    sm_count=sm,
+                    arch=arch,
+                    path=path,
+                )
+                assert name in HANDOFF_TWINS, (name, nc_pad, n, h, sm, arch, path)
+    for (lengths, heads), arch, sm in itertools.product(
+        TWIN_PLAN_ROWS, ARCHES, (148, 152)
+    ):
+        p = cake_backend.plan(sum(lengths), len(lengths), heads, sm, arch)
+        assert p.handoff_twin == HANDOFF_TWINS[p.record("fwd_intra", "fwd")], (
+            lengths,
+            heads,
+            arch,
+            sm,
+        )
+
+
+def test_the_tape_wy_twin_is_its_wy_record_without_u() -> None:
+    """The tape path's w-only WY twin (``cake_jit.TAPE_TWINS``): its record is its WY record's without the
+    parameters of ``u`` and of the operands only ``u`` reads (``v``, ``beta``), in the record's order, with the
+    same stage, grid rule, cluster, cooperative and PDL attributes, entry and architectures, a library of its own
+    and the record's grid; no rule admits it (``_admits`` is false on every ``PLAN_GRID`` cell, architecture and
+    path), ``select_record`` never returns it, and ``Plan.tape_wy_twin`` names it exactly where the tape path
+    launches its WY record (every path that launches ``wy`` on the tape path launches that record)."""
+    assert cake_jit.TAPE_TWINS == TAPE_TWINS
+    for parent, twin in TAPE_TWINS.items():
+        a, b = cake_jit.MODULES[parent], cake_jit.MODULES[twin]
+        assert a["stage"] == b["stage"] == "wy", twin
+        for key in ("grid_rule", "ffi_entry", "arches"):
+            assert b[key] == a[key], (twin, key)
+        for key in ("cluster", "cooperative", "use_pdl"):
+            assert b["launch"][key] == a["launch"][key], (twin, key)
+        assert b["logical"] == {
+            key: value
+            for key, value in a["logical"].items()
+            if value not in TAPE_WY_DROPPED
+        }, twin
+        assert "w" in b["logical"].values() and "u" in a["logical"].values(), twin
+        assert [list(pair) for pair in b["arg_plan"]] == [
+            list(pair)
+            for pair in a["arg_plan"]
+            if a["logical"].get(pair[1]) not in TAPE_WY_DROPPED
+        ], twin
+        assert b["select_rule"] == {"kind": "path_in", "paths": []}, twin
+        assert b["library"] != a["library"], twin
+    for nc_pad, n, h, sm in PLAN_GRID:
+        for arch in ARCHES:
+            nseg = cake_jit.segment_plan(n, h, sm, arch)[2]
+            for path in PATHS:
+                for twin in TAPE_WY_RECORDS:
+                    assert not cake_jit._admits(
+                        cake_jit.MODULES[twin]["select_rule"],
+                        ctas=nc_pad * h,
+                        num_seqs=n,
+                        num_heads=h,
+                        sm_count=sm,
+                        num_segments=nseg,
+                        arch=arch,
+                        path=path,
+                    ), (twin, nc_pad, n, h, sm, arch, path)
+                name = cake_jit.select_record(
+                    "wy",
+                    num_chunks_pad=nc_pad,
+                    num_seqs=n,
+                    num_heads=h,
+                    sm_count=sm,
+                    arch=arch,
+                    path=path,
+                )
+                assert name not in TAPE_WY_RECORDS, (name, nc_pad, n, h, sm, arch, path)
+                if path == "tape":
+                    assert name in TAPE_TWINS, (name, nc_pad, n, h, sm, arch)
+    for (lengths, heads), arch, sm in itertools.product(
+        TWIN_PLAN_ROWS, ARCHES, (148, 152)
+    ):
+        p = cake_backend.plan(sum(lengths), len(lengths), heads, sm, arch)
+        assert p.dispatched("wy", "tape"), (lengths, heads, arch, sm)
+        assert p.tape_wy_twin == TAPE_TWINS[p.record("wy", "tape")], (
+            lengths,
+            heads,
+            arch,
+            sm,
+        )
+        assert p.grid("wy", "tape") == cake_jit.launch_grid(
+            p.tape_wy_twin,
+            num_chunks_pad=p.NC_pad,
+            num_seqs=p.N,
+            num_heads=heads,
+            sm_count=sm,
+        )
 
 
 def test_the_serial_walk_orders_the_documents_and_the_carry_splits_the_chain() -> None:
@@ -3285,18 +3461,18 @@ def _det_manifest_or_skip() -> dict:
 def test_copied_programs_are_the_deterministic_packages_sources(
     manifest: dict,
 ) -> None:
-    """Every record but the S1 ones is a copy of the deterministic package's record of the same name: the same
-    digest in its library name (the package prefix aside), stage, launch, operands and grid, and (outside the two
-    pair stages, whose rules route the S1 cells) the same rule and architectures; each of its libraries has the
-    deterministic library's flags and sources, byte for byte once the package name in them is replaced.  The S1
-    programs are the only new code."""
+    """Every record but the S1 ones, the hand-off twins and the tape WY twin is a copy of the deterministic
+    package's record of the same name: the same digest in its library name (the package prefix aside), stage,
+    launch, operands and grid, and (outside the two pair stages, whose rules route the S1 cells) the same rule and
+    architectures; each of its libraries has the deterministic library's flags and sources, byte for byte once the
+    package name in them is replaced.  The S1 programs and the twins are the only new code."""
     det_manifest = _det_manifest_or_skip()
     det_dir = Path(det_jit.__file__).resolve().parent
     ours = {entry["name"]: entry for entry in manifest["libraries"]}
     theirs = {entry["name"]: entry for entry in det_manifest["libraries"]}
     copied = set()
     for name, record in cake_jit.MODULES.items():
-        if name in S1_RECORDS:
+        if name in S1_RECORDS or name in TWIN_RECORDS or name in TAPE_WY_RECORDS:
             continue
         twin = det_jit.MODULES[name]
         assert record["library"] == twin["library"].replace(
@@ -3332,7 +3508,7 @@ def test_copied_programs_are_the_deterministic_packages_sources(
             copied.add(mine["name"])
     new = {
         cake_jit.library_name(name, arch)
-        for name in S1_RECORDS
+        for name in (*S1_RECORDS, *TWIN_RECORDS, *TAPE_WY_RECORDS)
         for arch in cake_jit.MODULES[name]["arches"]
     }
     assert copied == set(ours) - new and new <= set(ours)
@@ -3366,7 +3542,12 @@ def test_run_module_names_a_missing_logical_argument() -> None:
 
 
 def _expected_launches(
-    p, path: str, *, saved_tables: bool = True, tail_passes: int = 1
+    p,
+    path: str,
+    *,
+    saved_tables: bool = True,
+    tail_passes: int = 1,
+    tape_wy: str | None = None,
 ) -> list[str]:
     """The launch order of ``path`` on plan ``p`` (the records by name), spelled from the composition's rules:
     the tables (on the forward and the replay where the plan dispatches a table program; on a saved-set path only
@@ -3377,7 +3558,8 @@ def _expected_launches(
     dA / dv where the fused gradient does not host it, the adjoint recurrence, the fused gradient, GLM intra and,
     on sm_107a, the gate epilogue (the tail stages once per chunk range of a lean workspace's ``tail_passes``).
     The carry record is the row's: the overlap pair's on the forward's overlap rows, the two-level carry where its
-    rule accepts, else the chain carry."""
+    rule accepts, else the chain carry.  ``tape_wy``: the record the tape backward launches for WY in place of the
+    plan's (the tape WY twin, :func:`cake_backend._tape_wy_record`)."""
     seg = p.recur == "seg"
     seq: list[str] = []
     # the table programs where the plan dispatches them (the segmented route's intra program writes the tables
@@ -3407,7 +3589,7 @@ def _expected_launches(
     if path == "replay" and not intra_first:
         seq.append(p.record("fwd_intra", path))
     if p.dispatched("wy", path):
-        seq.append(p.record("wy", path))
+        seq.append(tape_wy if path == "tape" and tape_wy else p.record("wy", path))
     if p.dispatched("fwdh", path):
         seq.append(p.record("fwdh", path))
         if seg:
@@ -3873,7 +4055,9 @@ def test_launch_sequences_follow_the_plan(device, manifest) -> None:
             deterministic=False,
         )
         chunk_kda_bwd(q, k, v, g, beta, cu, dout, saved=saved_t, workspace=tape_ws)
-        assert launched == _expected_launches(p, "tape")
+        # the WY launch: the tape WY twin where the device's rule admits it, the plan's record elsewhere
+        tape_wy = cake_backend._tape_wy_record(p, device.index)
+        assert launched == _expected_launches(p, "tape", tape_wy=tape_wy)
         assert len(launched) == p.launch_count("tape")
         # the records of every path the workspace serves name the programs these sequences launched
         records = ws.records()
@@ -5116,7 +5300,10 @@ def test_lean_arena_serves_the_saved_states_and_the_tape_paths(
         got = chunk_kda_bwd(
             q, k, v, g, beta, cu, dout, saved=saved_t, workspace=tape_ws
         )
-        assert [n for n, _ in launched] == _expected_launches(p, "tape", tail_passes=t)
+        tape_wy = cake_backend._tape_wy_record(p, device.index)
+        assert [n for n, _ in launched] == _expected_launches(
+            p, "tape", tail_passes=t, tape_wy=tape_wy
+        )
         _check_tail_grids(launched, p, "tape", t)
         _check_bits(got, reference_grads, tag=("tape", t))
         launched.clear()
@@ -7603,3 +7790,592 @@ def test_gradients_accumulate_into_nonzero_grad(device, manifest) -> None:
         torch.cuda.synchronize(device)
         for name, a, b in zip(names, once, twice, strict=True):
             assert _bits_equal(b.grad, a.grad + a.grad), (lengths, heads, name)
+
+
+# --------------------------------------------------------------------------- the checkpoint hand-off's intra twins (device)
+
+# The twin rows: the segmented route up to 256 documents (fwd_intra_v14's twin), the serial route and more than 256
+# documents (fwd_intra's twin), and the 16-head row whose light prep writes no kb (sm_100a's paired serial rows;
+# sm_103a / sm_107a segmented above 32 chains).
+TWIN_ROWS = [
+    ((100, 640, 77, 1000, 129), 2),
+    ((65, 200), 32),
+    ((65,) * 257, 2),
+    ((129, 300, 70), 16),
+]
+# the intra programs' outputs (filled with NaN before the launch) and the light prep's rows a twin also writes
+INTRA_OUTPUTS = (
+    "aqk_ext",
+    "akk_ext",
+    "aqk_int",
+    "akk_int",
+    "gk",
+    "kb",
+    "kg",
+    "qg",
+    "v_new",
+    "beta_int",
+)
+PREP_ROWS = ("gk", "kg", "beta_int", "kb")
+
+
+def _raw_bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Bit-pattern equality of tensors of any element size (signed zeros and NaN payloads count)."""
+    if a.dtype != b.dtype or a.shape != b.shape:
+        return False
+    view = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[
+        a.element_size()
+    ]
+    return torch.equal(a.contiguous().view(view), b.contiguous().view(view))
+
+
+def _nan_alloc(shape_, dtype, dev) -> torch.Tensor:
+    """The backend's ``_alloc`` with floating-point tensors NaN-filled (integer tensors zero-filled)."""
+    if dtype.is_floating_point:
+        return torch.full(shape_, float("nan"), dtype=dtype, device=dev)
+    return torch.zeros(shape_, dtype=dtype, device=dev)
+
+
+def _twin_id(shape) -> str:
+    lengths, heads = shape
+    if len(lengths) > 8:
+        return f"n{len(lengths)}-S{sum(lengths)}-h{heads}"
+    return _shape_id(shape)
+
+
+@pytest.mark.parametrize("shape", TWIN_ROWS, ids=_twin_id)
+def test_the_twin_rows_are_the_light_prep_rows(
+    device, manifest, monkeypatch, shape
+) -> None:
+    """The intra twin of the device's plan, launched by a hand-off recompute that writes a row record, against its
+    intra record (launched by one that writes a tape record) and the light prep: every output both write is bitwise the record's (``gk`` on the
+    rows the record writes; the twin writes every row), with every floating-point output NaN-filled before each
+    launch, and the forward's ``out`` and saved set stay bitwise; the twin's ``gk`` on all internal rows, ``kg``,
+    ``beta_int`` and (where the light prep writes it) ``kb`` are bitwise, as raw bits, the light prep's of the
+    same inputs.  Integration evidence for the hand-off: its backward reads these rows in place of the prep's."""
+    lengths, heads = shape
+    S, N = sum(lengths), len(lengths)
+    inputs = make_inputs(lengths, heads, device)
+    p = cake_backend.plan(
+        S, N, heads, cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    )
+    parent, twin = p.record("fwd_intra", "fwd"), p.handoff_twin
+    if twin is None:
+        pytest.skip(f"no intra twin of {parent} on {p.arch}")
+    assert twin == HANDOFF_TWINS[parent]
+    prep = p.record("bwd_prep", p.light_path)
+    tag = (_twin_id(shape), p.arch, p.sm_count, parent, twin, prep)
+    captured: dict = {}
+
+    def launcher(name, values, *, grid, device_index):
+        stage = cake_jit.MODULES[name]["stage"]
+        watched = {"fwd_intra": INTRA_OUTPUTS, "bwd_prep": PREP_ROWS}.get(stage, ())
+        bound = set(cake_jit.MODULES[name]["logical"].values())
+        outs = {
+            n: values[n]
+            for n in watched
+            if n in bound and isinstance(values.get(n), torch.Tensor)
+        }
+        for t in outs.values():
+            if t.is_floating_point():
+                t.fill_(float("nan"))
+        cake_jit.run_module(name, values, grid=grid, device_index=device_index)
+        if stage == "fwd_intra":  # the tables the segmented intra program writes, too
+            outs.update(
+                (n, values[n])
+                for n in bound
+                if isinstance(values.get(n), torch.Tensor)
+                and not values[n].is_floating_point()
+            )
+        if outs:
+            captured[name] = {n: t.clone() for n, t in outs.items()}
+
+    monkeypatch.setattr(cake_backend, "_alloc", _nan_alloc)
+    ws = KdaWorkspace(p, device, backward=True, launcher=launcher, deterministic=False)
+    ops = [inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")]
+    common = dict(
+        scale=SCALE,
+        save_for_backward=True,
+        workspace=ws,
+        save_mode=None,
+        arena=None,
+        doc_lengths=None,
+    )
+    # private hand-off state: this test's resets leave the session's counters (the
+    # suite's evidence that its checkpointed tests took the hand-off) intact
+    monkeypatch.setattr(cake_backend, "_handoff_devices", {})
+    monkeypatch.setattr(
+        cake_backend,
+        "_handoff_rows_load_failures",
+        type(cake_backend._handoff_rows_load_failures)(),
+    )
+    results = {}
+    for with_rows in (False, True):
+        monkeypatch.setattr(cake_backend, "_HANDOFF_ROWS", with_rows)
+        cake_backend._handoff_reset()
+        request = {"task": 0, "index": device.index, "mode": "on"}
+        out, saved = cake_backend._fwd_call(*ops, handoff=request, **common)
+        assert "tensors" in request, (tag, with_rows)
+        assert ("gk" in request["tensors"]) is with_rows, (tag, with_rows)
+        results[with_rows] = (out, saved, captured.pop(twin if with_rows else parent))
+    cake_backend._handoff_reset()
+    (out0, saved0, rec0), (out1, saved1, rec1) = results[False], results[True]
+    assert _raw_bits_equal(out1, out0), tag
+    for field in dataclasses.fields(saved0):
+        a, b = getattr(saved1, field.name), getattr(saved0, field.name)
+        if isinstance(b, torch.Tensor):
+            assert _raw_bits_equal(a, b), (tag, field.name)
+        elif isinstance(b, tuple):
+            assert len(a) == len(b) and all(
+                _raw_bits_equal(x, y) for x, y in zip(a, b, strict=True)
+            ), (tag, field.name)
+        else:
+            assert a == b, (tag, field.name)
+    # the twin's outputs against its intra record's
+    assert set(rec1) == set(rec0) | {"beta_int"}, (tag, sorted(rec0), sorted(rec1))
+    for name, want in rec0.items():
+        got = rec1[name]
+        # gk: the record writes some rows of each chunk, the twin all of them
+        if name == "gk":
+            written = ~torch.isnan(want)
+            assert written.any(), tag
+            assert _raw_bits_equal(got[written], want[written]), (tag, name)
+        else:
+            assert _raw_bits_equal(got, want), (tag, name)
+    # the twin's rows against the light prep's: the light backward from the tape-record forward's saved set
+    cake_backend._bwd_call(
+        *ops,
+        inputs["dout"],
+        saved=saved0,
+        scale=SCALE,
+        workspace=ws,
+        arena=None,
+        doc_lengths=None,
+    )
+    rows = captured.pop(prep)
+    assert {"gk", "kg", "beta_int"} <= set(rows), (tag, sorted(rows))
+    for name, want in rows.items():
+        got = rec1[name]
+        differ = None
+        if got.shape == want.shape:
+            differ = int((got.view(-1) != want.view(-1)).sum())
+        assert _raw_bits_equal(got, want), (tag, name, differ)
+
+
+# --------------------------------------------------------------------------- the tape path's w-only WY twin
+
+# User tape mode (a version-2 saved set) at one head and every head count the checkpoint hand-off runs, on one pack of
+# short documents with unaligned tails (both routes, by head count), pad chunks at 64 heads, more than 256 documents
+# and the four-document 261k-token pack P8 at 32 heads; P8 at 64 heads is opt-in (``CAKE_KDA_TAPE_WY_TEST_P8_H64=1``,
+# for memory and time).
+TAPE_WY_P8 = (23496, 88510, 114974, 34413)
+TAPE_WY_P8_H64_ENV = "CAKE_KDA_TAPE_WY_TEST_P8_H64"
+TAPE_WY_ROWS = [
+    *(((100, 640, 77, 1000, 129), heads) for heads in (1, 2, 4, 8, 12, 16, 32, 64)),
+    ((63, 1, 65), 64),
+    ((65,) * 257, 2),
+    ((65,) * 257, 32),
+    (TAPE_WY_P8, 32),
+    (TAPE_WY_P8, 64),
+]
+GRAD_ORDER = ("dq", "dk", "dv", "dbeta", "dg")
+
+
+@pytest.fixture
+def private_tape_wy_state(monkeypatch):
+    """Fresh tape WY counters and failed loads for one test (restored after it), so the session's counters stay
+    intact."""
+    monkeypatch.setattr(
+        cake_backend, "_tape_wy_counts", type(cake_backend._tape_wy_counts)()
+    )
+    monkeypatch.setattr(
+        cake_backend,
+        "_tape_wy_load_failures",
+        type(cake_backend._tape_wy_load_failures)(),
+    )
+
+
+def _tape_plan(lengths, heads, device):
+    return cake_backend.plan(
+        sum(lengths),
+        len(lengths),
+        heads,
+        cake_jit.sm_count(device.index),
+        cake_jit.device_arch(device.index),
+    )
+
+
+def _wy_runs(monkeypatch) -> list:
+    """Record ``(path, record)`` of every ``wy`` launch through ``KdaWorkspace.run`` (``record``: the name that
+    replaces the plan's record, ``None`` for the plan's own)."""
+    runs: list = []
+    real_run = KdaWorkspace.run
+
+    def run(self, stage, values, *, path, **kwargs):
+        if stage == "wy":
+            runs.append((path, kwargs.get("record")))
+        return real_run(self, stage, values, path=path, **kwargs)
+
+    monkeypatch.setattr(KdaWorkspace, "run", run)
+    return runs
+
+
+@pytest.mark.parametrize("shape", TAPE_WY_ROWS, ids=_twin_id)
+def test_tape_mode_with_the_tape_wy_twin_is_bitwise_its_wy_record(
+    device, manifest, monkeypatch, shape
+) -> None:
+    """User tape mode: the tape backward with the twin forced (``_TAPE_WY = True``) launches the twin in place of
+    its WY record, on the record's grid, in the same launch sequence and count; the twin writes the record's ``w``
+    bit for bit on every internal row (pad rows included; both start NaN-filled) and leaves the arena's ``u``
+    unwritten (it takes no ``u``); and the five gradients are bitwise those of the backward that launches the record
+    (``_TAPE_WY = False``)."""
+    lengths, heads = shape
+    if tuple(lengths) == TAPE_WY_P8 and heads == 64:
+        if os.environ.get(TAPE_WY_P8_H64_ENV) != "1":
+            pytest.skip(f"opt-in: {TAPE_WY_P8_H64_ENV}=1")
+    inputs = make_inputs(lengths, heads, device)
+    p = _tape_plan(lengths, heads, device)
+    parent, twin = p.record("wy", "tape"), p.tape_wy_twin
+    assert twin == TAPE_TWINS[parent], (p.arch, parent)
+    tag = (_twin_id(shape), p.arch, p.sm_count, parent, twin)
+    q, k, v, g, beta, cu, dout = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    )
+    _, saved_t = chunk_kda_fwd(q, k, v, g, beta, cu, save_mode="tape")
+    assert saved_t.version == cake_backend.SAVED_VERSION_TAPE, tag
+    launched: list[str] = []
+    captured: dict = {}
+
+    def launcher(name, values, *, grid, device_index):
+        launched.append(name)
+        wy = cake_jit.MODULES[name]["stage"] == "wy"
+        if wy:
+            values["w"].fill_(float("nan"))
+            values["u"].fill_(float("nan"))
+        cake_jit.run_module(name, values, grid=grid, device_index=device_index)
+        if wy:
+            captured[name] = (
+                values["w"].clone(),
+                bool(torch.isnan(values["u"]).all()),
+                tuple(grid),
+            )
+
+    ws = KdaWorkspace(
+        p,
+        device,
+        backward=True,
+        save_mode="tape",
+        launcher=launcher,
+        deterministic=False,
+    )
+    grads = {}
+    for forced in (False, True):
+        monkeypatch.setattr(cake_backend, "_TAPE_WY", forced)
+        launched.clear()
+        got = chunk_kda_bwd(q, k, v, g, beta, cu, dout, saved=saved_t, workspace=ws)
+        torch.cuda.synchronize(device)
+        want = _expected_launches(p, "tape", tape_wy=twin if forced else None)
+        assert launched == want, (tag, forced, launched)
+        assert len(launched) == p.launch_count("tape"), (tag, forced)
+        grads[forced] = dict(zip(GRAD_ORDER, got, strict=True))
+        del got
+    (w0, u0_unwritten, grid0), (w1, u1_unwritten, grid1) = (
+        captured[parent],
+        captured[twin],
+    )
+    assert grid1 == grid0 == tuple(p.grid("wy", "tape")), tag
+    assert w1.shape == w0.shape == (p.R, heads, D), (tag, tuple(w1.shape))
+    differ = int((w1.view(torch.int16) != w0.view(torch.int16)).any(dim=2).sum())
+    assert _raw_bits_equal(w1, w0), (tag, "w", f"{differ} (row, head) pairs differ")
+    assert u1_unwritten and not u0_unwritten, (tag, "u")
+    for name in GRAD_ORDER:
+        assert _raw_bits_equal(grads[True][name], grads[False][name]), (tag, name)
+
+
+def test_batched_tape_mode_launches_the_tape_wy_twin_per_group(
+    device, manifest, monkeypatch
+) -> None:
+    """A batched arena (document groups): the tape backward of every group launches the twin in place of its WY
+    record when forced, and the gradients are bitwise those of the backward that launches the record."""
+    lengths, heads = (100, 640, 77, 1000, 129), 4
+    S, N = sum(lengths), len(lengths)
+    arena = cake_backend.KdaArena(batch_tokens=1000)
+    inputs = make_inputs(lengths, heads, device)
+    q, k, v, g, beta, cu, dout = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    )
+    ws = KdaWorkspace.for_problem(
+        S,
+        N,
+        heads,
+        device,
+        save_mode="tape",
+        arena=arena,
+        doc_lengths=lengths,
+        deterministic=False,
+    )
+    p = ws.plan
+    groups = len(p.batches(arena, lengths))
+    assert groups > 1, groups
+    twin = p.tape_wy_twin
+    assert twin == TAPE_TWINS[p.record("wy", "tape")], p.arch
+    _, saved_t = chunk_kda_fwd(q, k, v, g, beta, cu, workspace=ws, doc_lengths=lengths)
+    assert saved_t.version == cake_backend.SAVED_VERSION_TAPE
+    runs = _wy_runs(monkeypatch)
+    grads = {}
+    for forced in (False, True):
+        monkeypatch.setattr(cake_backend, "_TAPE_WY", forced)
+        runs.clear()
+        got = chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved_t, workspace=ws, doc_lengths=lengths
+        )
+        assert runs == [("tape", twin if forced else None)] * groups, (forced, runs)
+        grads[forced] = dict(zip(GRAD_ORDER, got, strict=True))
+    for name in GRAD_ORDER:
+        assert _raw_bits_equal(grads[True][name], grads[False][name]), name
+
+
+def test_the_tape_wy_rule(monkeypatch, private_tape_wy_state) -> None:
+    """Host only (a stand-in plan): the tape backward launches the twin in place of its WY record when the plan has
+    one, the device (architecture, SM count) has an entry in ``TAPE_WY_VERIFIED`` (else ``unverified``, the build
+    not read), the toolkit of the one build of the twin and the plan's WY record completes the key (another
+    toolkit: ``unverified``; a mixed build or an unreadable toolkit: ``unready``) and the twin loads (else
+    ``unready``); ``_TAPE_WY`` overrides all of it but the twin.  The rule counts no launch (the backward does).
+    The shipped entries name exported architectures and ``major.minor.patch`` toolkits."""
+    for key in cake_backend.TAPE_WY_VERIFIED:
+        arch, sms, toolkit = key
+        assert arch in ARCHES and sms > 0, key
+        assert re.fullmatch(r"\d+\.\d+\.\d+", toolkit), key
+    arch = ARCHES[0]
+    monkeypatch.setattr(
+        cake_backend, "TAPE_WY_VERIFIED", frozenset({(arch, 152, "9.9.1")})
+    )
+    asked: list[tuple] = []
+    state = {"toolkit": "9.9.1", "loads": True}
+
+    def toolkit_(twin, parent, arch_):
+        asked.append(("toolkit", twin, parent, arch_))
+        return state["toolkit"]
+
+    def loads_(twin, arch_):
+        asked.append(("load", twin, arch_))
+        return state["loads"]
+
+    monkeypatch.setattr(cake_backend, "_tape_wy_toolkit", toolkit_)
+    monkeypatch.setattr(cake_backend, "_tape_wy_loads", loads_)
+
+    def plan_(twin="twin", sms=152, arch_=arch):
+        return types.SimpleNamespace(
+            tape_wy_twin=twin,
+            arch=arch_,
+            sm_count=sms,
+            record=lambda stage, path: f"{stage}@{path}",
+        )
+
+    # (override, plan, toolkit, loads, record, counter, checks asked)
+    cases = (
+        (None, plan_(), "9.9.1", True, "twin", None, 2),
+        (None, plan_(sms=148), "9.9.1", True, None, "unverified", 0),
+        (None, plan_(arch_=ARCHES[1]), "9.9.1", True, None, "unverified", 0),
+        (None, plan_(), "9.9.2", True, None, "unverified", 1),
+        (None, plan_(), None, True, None, "unready", 1),
+        (None, plan_(), "9.9.1", False, None, "unready", 2),
+        (None, plan_(twin=None), "9.9.1", True, None, None, 0),
+        (False, plan_(), "9.9.1", True, None, None, 0),
+        (True, plan_(sms=148), None, False, "twin", None, 0),
+        (True, plan_(twin=None), "9.9.1", True, None, None, 0),
+    )
+    for override, p, toolkit, loads, want, counter, checks in cases:
+        tag = (override, p.arch, p.sm_count, p.tape_wy_twin, toolkit, loads)
+        cake_backend._tape_wy_reset()
+        asked.clear()
+        monkeypatch.setattr(cake_backend, "_TAPE_WY", override)
+        state.update(toolkit=toolkit, loads=loads)
+        assert cake_backend._tape_wy_record(p, 0) == want, tag
+        s = cake_backend._tape_wy_stats(0)
+        assert set(s) == set(cake_backend._TAPE_WY_COUNTERS), (tag, s)
+        assert s["launched"] == 0, (tag, s)
+        for name in ("unverified", "unready"):
+            assert s[name] == int(name == counter), (tag, s)
+        # the build is read last but one, on the twin and the plan's tape WY record; the load last
+        expected = [("toolkit", "twin", "wy@tape", p.arch), ("load", "twin", p.arch)]
+        assert asked == expected[:checks], (tag, asked)
+
+
+def test_the_tape_wy_toolkit_reads_one_build_of_the_twin_and_its_record(
+    monkeypatch,
+) -> None:
+    """Host only: the toolkit of the tape WY twin is the one build's of the twin and the tape path's WY record
+    (``_one_build_toolkit`` of the two, the rule of the hand-off's row records), cached per arguments."""
+    seen: list = []
+
+    def one_build(records, arch):
+        seen.append((tuple(records), arch))
+        return "13.4.92"
+
+    monkeypatch.setattr(cake_backend, "_one_build_toolkit", one_build)
+    cake_backend._tape_wy_toolkit.cache_clear()
+    try:
+        for _ in range(2):
+            got = cake_backend._tape_wy_toolkit("twin", "parent", "sm_100a")
+            assert got == "13.4.92"
+        assert seen == [(("twin", "parent"), "sm_100a")], seen
+    finally:
+        cake_backend._tape_wy_toolkit.cache_clear()
+
+
+def test_a_failed_tape_wy_load_is_retried_a_bounded_number_of_times(
+    monkeypatch, private_tape_wy_state
+) -> None:
+    """Host only: a failed load of the twin is counted, not kept (the next tape backward loads again) up to
+    ``_TAPE_WY_LOAD_TRIES`` failures per twin and architecture; after those the process launches the WY record
+    until ``_tape_wy_reset``.  The hand-off's failed twin loads count apart."""
+    loads: list[tuple] = []
+    state = {"fail": True}
+
+    def load(name, arch):
+        loads.append((name, arch))
+        if state["fail"]:
+            raise RuntimeError("JIT lock timeout")
+        return types.SimpleNamespace()
+
+    monkeypatch.setattr(cake_jit, "load", load)
+    monkeypatch.setattr(
+        cake_backend,
+        "_handoff_rows_load_failures",
+        type(cake_backend._handoff_rows_load_failures)(),
+    )
+    tries = cake_backend._TAPE_WY_LOAD_TRIES
+    assert tries >= 2
+    for _ in range(tries + 2):
+        assert cake_backend._tape_wy_loads("twin", "sm_100a") is False
+    assert loads == [("twin", "sm_100a")] * tries, loads
+    assert not cake_backend._handoff_rows_load_failures
+    # another architecture counts apart; a success is not counted
+    state["fail"] = False
+    assert cake_backend._tape_wy_loads("twin", "sm_103a") is True
+    assert cake_backend._tape_wy_loads("twin", "sm_100a") is False
+    assert cake_backend._handoff_rows_loads("twin", "sm_100a") is True
+    cake_backend._tape_wy_reset()
+    assert cake_backend._tape_wy_loads("twin", "sm_100a") is True
+    assert loads[tries:] == [("twin", "sm_103a")] + [("twin", "sm_100a")] * 2, loads
+
+
+class _Built:
+    """A stand-in for ``cake_build.prebuilt_path(name)``: ``is_file()`` is whether the library counts as prebuilt."""
+
+    def __init__(self, built: bool) -> None:
+        self.built = built
+
+    def is_file(self) -> bool:
+        return self.built
+
+
+@pytest.mark.parametrize(
+    "case", ("unverified", "mixed_build", "load_fails", "verified")
+)
+def test_the_tape_wy_twin_falls_back_to_its_record_where_the_rule_refuses_it(
+    device, manifest, monkeypatch, private_tape_wy_state, case
+) -> None:
+    """The rule (``_TAPE_WY`` unset) on a user tape-mode backward, this device listed in ``TAPE_WY_VERIFIED`` with
+    this build's toolkit (another patch version in the ``unverified`` case): the twin launches only with the one
+    build and a twin that loads (``verified``: counted ``launched``); otherwise the WY record launches and the
+    refusal is counted: another toolkit listed (``unverified``), the twin and the record from different builds
+    (``mixed_build``: ``unready``), the twin's load failing (``load_fails``: ``unready``, the fail-closed fallback).
+    The gradients are bitwise those of the backward that launches the record in every case."""
+    lengths, heads = (100, 640, 77, 1000, 129), 4
+    p = _tape_plan(lengths, heads, device)
+    parent, twin = p.record("wy", "tape"), p.tape_wy_twin
+    assert twin == TAPE_TWINS[parent], (p.arch, parent)
+    inputs = make_inputs(lengths, heads, device)
+    q, k, v, g, beta, cu, dout = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    )
+    _, saved_t = chunk_kda_fwd(q, k, v, g, beta, cu, save_mode="tape")
+    # the reference first: it loads the WY record before any build state is patched
+    monkeypatch.setattr(cake_backend, "_TAPE_WY", False)
+    want = chunk_kda_bwd(q, k, v, g, beta, cu, dout, saved=saved_t)
+    monkeypatch.setattr(cake_backend, "_TAPE_WY", None)
+    cake_backend._tape_wy_toolkit.cache_clear()
+    toolkit = cake_backend._tape_wy_toolkit(twin, parent, p.arch)
+    assert toolkit is not None, "this build's twin and WY record are not one build"
+    cake_backend._tape_wy_toolkit.cache_clear()
+    major, minor, patch = toolkit.split(".")
+    listed = toolkit if case != "unverified" else f"{major}.{minor}.{int(patch) + 1}"
+    monkeypatch.setattr(
+        cake_backend, "TAPE_WY_VERIFIED", frozenset({(p.arch, p.sm_count, listed)})
+    )
+    if case == "mixed_build":
+        # one of the two libraries flips its build state: the twin's where nothing is prebuilt here, else the WY
+        # record's (loaded above, so its launch does not read the flipped state)
+        twin_library = cake_jit.library_name(twin, p.arch)
+        parent_library = cake_jit.library_name(parent, p.arch)
+        real_prebuilt = cake_build.prebuilt_path
+        flipped = (
+            parent_library if real_prebuilt(twin_library).is_file() else twin_library
+        )
+
+        def prebuilt(name):
+            if name == flipped:
+                return _Built(not real_prebuilt(name).is_file())
+            return real_prebuilt(name)
+
+        monkeypatch.setattr(cake_build, "prebuilt_path", prebuilt)
+    elif case == "load_fails":
+        real_load = cake_jit.load
+
+        def load(name, arch):
+            if name == twin:
+                raise RuntimeError("the twin does not load")
+            return real_load(name, arch)
+
+        monkeypatch.setattr(cake_jit, "load", load)
+    runs = _wy_runs(monkeypatch)
+    try:
+        got = chunk_kda_bwd(q, k, v, g, beta, cu, dout, saved=saved_t)
+    finally:
+        cake_backend._tape_wy_toolkit.cache_clear()
+    verified = case == "verified"
+    assert runs == [("tape", twin if verified else None)], (case, runs)
+    s = cake_backend._tape_wy_stats(device.index)
+    assert s["launched"] == int(verified), (case, s)
+    assert s["unverified"] == int(case == "unverified"), (case, s)
+    assert s["unready"] == int(case in ("mixed_build", "load_fails")), (case, s)
+    for name, a, b in zip(GRAD_ORDER, got, want, strict=True):
+        assert _raw_bits_equal(a, b), (case, name)
+
+
+def test_the_tape_wy_rule_on_this_device(
+    device, manifest, monkeypatch, private_tape_wy_state
+) -> None:
+    """As shipped (``_TAPE_WY`` unset, nothing patched): the toolkit of the one build of the twin and the tape path's
+    WY record reads as ``major.minor.patch``; a user tape-mode backward launches the twin exactly when this device
+    with that toolkit is in ``TAPE_WY_VERIFIED`` (else ``unverified``), and its gradients are bitwise those of the
+    backward that launches the record."""
+    lengths, heads = (63, 1, 65), 2
+    p = _tape_plan(lengths, heads, device)
+    parent, twin = p.record("wy", "tape"), p.tape_wy_twin
+    assert twin == TAPE_TWINS[parent], (p.arch, parent)
+    toolkit = cake_backend._tape_wy_toolkit(twin, parent, p.arch)
+    assert re.fullmatch(r"\d+\.\d+\.\d+", toolkit or ""), toolkit
+    listed = (p.arch, p.sm_count, toolkit) in cake_backend.TAPE_WY_VERIFIED
+    inputs = make_inputs(lengths, heads, device)
+    q, k, v, g, beta, cu, dout = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    )
+    _, saved_t = chunk_kda_fwd(q, k, v, g, beta, cu, save_mode="tape")
+    monkeypatch.setattr(cake_backend, "_TAPE_WY", False)
+    want = chunk_kda_bwd(q, k, v, g, beta, cu, dout, saved=saved_t)
+    monkeypatch.setattr(cake_backend, "_TAPE_WY", None)
+    runs = _wy_runs(monkeypatch)
+    got = chunk_kda_bwd(q, k, v, g, beta, cu, dout, saved=saved_t)
+    key = (p.arch, p.sm_count, toolkit)
+    assert runs == [("tape", twin if listed else None)], (key, runs)
+    s = cake_backend._tape_wy_stats(device.index)
+    assert s == {
+        "launched": int(listed),
+        "unverified": int(not listed),
+        "unready": 0,
+    }, (key, s)
+    for name, a, b in zip(GRAD_ORDER, got, want, strict=True):
+        assert _raw_bits_equal(a, b), (key, name)

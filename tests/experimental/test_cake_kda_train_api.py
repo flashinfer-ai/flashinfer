@@ -177,9 +177,15 @@ def test_facade_exports_and_marking() -> None:
 
 def test_signatures_mirror_the_deterministic_facade() -> None:
     """Each entry takes the parameters of its deterministic facade entry, in order, kinds and defaults the same, and
-    a keyword-only ``deterministic: bool = True`` after them."""
+    a keyword-only ``deterministic: bool = True`` after them; ``chunk_kda`` also takes the keyword-only
+    ``checkpoint_handoff="auto"`` (the non-deterministic package's checkpoint hand-off) before ``deterministic``."""
     for name, det_name in NAME_MAP.items():
         params = list(inspect.signature(getattr(facade, name)).parameters.values())
+        if name == "chunk_kda":
+            handoff = params.pop(-2)
+            assert handoff.name == "checkpoint_handoff", name
+            assert handoff.kind is inspect.Parameter.KEYWORD_ONLY, name
+            assert handoff.default == "auto", name
         det_params = list(
             inspect.signature(getattr(det_api, det_name)).parameters.values()
         )
@@ -467,9 +473,10 @@ PACKAGE_CALLS = {
         *_bad_operands(), torch.zeros(4, 1, 128, dtype=torch.bfloat16), **kw
     ),
     "chunk_kda": lambda **kw: cake_backend.chunk_kda(*_bad_operands(), **kw),
-    # the autograd node: the mode is its trailing positional argument (omitted: the refused default)
+    # the autograd node: the mode is its trailing positional argument (omitted: the refused default), after the
+    # checkpoint hand-off's (None: "auto")
     "ChunkKDAFunction": lambda **kw: cake_backend.ChunkKDAFunction.apply(
-        *_bad_operands(), cake_backend.SCALE, None, None, None, None, *kw.values()
+        *_bad_operands(), cake_backend.SCALE, None, None, None, None, None, *kw.values()
     ),
 }
 
