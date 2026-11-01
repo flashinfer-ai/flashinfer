@@ -306,6 +306,7 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
     check(scores, valid)
 
 
+@sm10x_only
 @pytest.mark.parametrize("scores", ["normal", "few", "same", "special"])
 @pytest.mark.parametrize("top_k", [512, 2048, 65535])
 @torch.inference_mode()
@@ -353,6 +354,7 @@ def test_top_k_from_candidates_matches_reference_and_replay(top_k, scores) -> No
     check_top_keys(candidates, ranges, top_keys)
 
 
+@sm10x_only
 @torch.inference_mode()
 def test_top_k_from_candidates_rejects_bad_shapes() -> None:
     zeros = partial(torch.zeros, dtype=torch.int32, device="cuda")
