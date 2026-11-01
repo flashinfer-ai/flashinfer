@@ -3171,7 +3171,8 @@ class CakeSSDCombined:
     the untouched sequences stay exact and the offending tokens' outputs are
     undefined.  The ``seq_idx`` / ``chunk_indices`` / ``chunk_offsets`` triple
     (chunk-128 logical segments built by the caller; checkpoint tokens must
-    then be logical chunk ends) is accepted with ``chunk_size == 128`` only.
+    then be logical chunk ends) is accepted with ``chunk_size == 128`` and
+    ``batch == 1`` only (one packed stream, as for ``cu_seqlens``).
 
     Packed-varlen ``seq_idx`` contract (CAKE-990): ids must be non-decreasing
     along the packed token axis.  An id in ``[0, num_sequences)`` without
@@ -4402,6 +4403,17 @@ class CakeSSDCombined:
         ):
             raise ValueError(
                 f"dt_bias must have shape [{self.nheads}] and dtype bfloat16 or float32"
+            )
+        if mode_varlen and not from_cu_seqlens and batch != 1:
+            # The triple's chunk_indices / chunk_offsets and seq_idx ids
+            # address one packed token axis; every kernel geometry (seqlen,
+            # chunk count, segment bound) is that of a single [1, total]
+            # stream, so a [batch > 1, seqlen] call would run on row 0's
+            # geometry (checked after the metadata shape checks above).
+            raise ValueError(
+                "the seq_idx / chunk_indices / chunk_offsets triple describes "
+                f"a packed [1, total] stream (got batch={batch}); pass the "
+                "tokens as [1, batch * seqlen]"
             )
         # The kernels write the token-major output directly (TMA store per
         # chunk; vectorised stores for packed-varlen segments that share a

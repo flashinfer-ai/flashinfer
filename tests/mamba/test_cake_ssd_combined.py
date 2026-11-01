@@ -1136,6 +1136,36 @@ def test_cake_ssd_combined_varlen_without_initial_states_needs_a_count():
         SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
 
 
+@pytest.mark.parametrize("total,rows", ((600, 2), (1200, 4), (2048, 2)))
+def test_cake_ssd_combined_triple_refuses_batch_rows(total, rows):
+    """The ``seq_idx`` / ``chunk_indices`` / ``chunk_offsets`` triple describes
+    one packed ``[1, total]`` stream: the same tokens viewed as ``[rows, total /
+    rows]`` are refused before any launch, and the packed call made after the
+    refusal is bitwise the packed call made before it."""
+
+    _skip_unless_cake_arch()
+    constructor, tensors, arguments = _case(varlen=True, lengths=(total,))
+    runner = SSDCombined(**constructor, backend="cake")
+    expected = [value.clone() for value in runner.run(*tensors, **arguments)]
+
+    def rows_view(value):
+        return value.view(rows, total // rows, *value.shape[2:])
+
+    x, dt, A, B, C = tensors
+    split = (rows_view(x), rows_view(dt), A, rows_view(B), rows_view(C))
+    split_arguments = dict(
+        arguments, z=rows_view(arguments["z"]), seq_idx=rows_view(arguments["seq_idx"])
+    )
+    with pytest.raises(
+        ValueError, match=rf"packed \[1, total\] stream \(got batch={rows}\)"
+    ):
+        runner.run(*split, **split_arguments)
+    actual = runner.run(*tensors, **arguments)
+    torch.cuda.synchronize()
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+
+
 @pytest.mark.parametrize("table_source", ("preprocess", "caller"))
 @pytest.mark.parametrize("initial_states", (True, False), ids=("initial", "zero"))
 @pytest.mark.parametrize(
@@ -3398,6 +3428,11 @@ def _source_cake_varlen_arguments(runner, tensors):
             "triple_at_chunk_256",
             "chunk_size=256: the seq_idx / chunk_indices / chunk_offsets triple is "
             "the chunk-128 logical segmentation",
+        ),
+        (
+            "triple_batch_rows",
+            "the seq_idx / chunk_indices / chunk_offsets triple describes a packed "
+            r"\[1, total\] stream \(got batch=2\)",
         ),
     ),
 )
