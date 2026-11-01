@@ -37,20 +37,28 @@ zeroing the accumulators).  ``ROUTES[arch][role]`` names the one module a role
 runs on an architecture.
 
 Grids (:func:`launch_grid`): the forward launches one CTA per block of
-``rows_per_cta`` rows; the backward one CTA per chunk of ``blocks_per_cta``
-such blocks, where :func:`backward_chunks` fits the rows into whole waves of
-``ctas_per_sm`` CTAs per SM (one wave when it can: fewer CTAs, fewer FP64
-atomics; no partly filled last wave) but never gives a CTA more than
-``max_blocks_per_cta`` blocks, so a thread sums at most 16 terms in FP32 before
-the FP64 fold: below the deterministic backward's run length on long inputs,
-within the same error budget on every input.  No module is persistent or cooperative, and none
-waits for another grid or another CTA inside a kernel, so a kernel resident on
-another stream delays a call by its share of the SMs and never blocks it.
+``rows_per_cta`` rows; the backward launches :func:`backward_ctas` CTAs, one
+per block but at most ``ctas_per_sm`` per SM (one wave).  When the grid has
+a CTA for every block, CTA ``c`` takes block ``c`` and claims nothing;
+otherwise the CTAs claim every block from the claim counter of the
+workspace, in chunks of consecutive blocks that shrink to single blocks at
+the end, each CTA claiming its next chunk as the last block of its current
+one starts, so a CTA holds one chunk at a time and one that starts late
+takes fewer blocks.  The kernel folds each thread's FP32 sums into
+FP64 after at most 16 of its rows, so a thread sums at most 16 terms in FP32 at
+any grid: within the deterministic backward's error budget on every input.  No
+module is cooperative and no CTA waits for another inside a kernel: a kernel
+resident on another stream delays a call roughly in proportion to the SM slots
+it holds, and one that holds resources this kernel needs on every SM can still
+delay its start.
 
 The workspace of the backward is ``dw_slots * 128`` FP64 accumulators and one
-32-bit arrival word (:func:`workspace_elements` FP64 elements in all), zero
-when a launch starts and zero again when it ends: a zero-filled workspace stays
-reusable for any later call on its stream.
+8-byte word holding two 32-bit words, the arrival ticket and the claim counter
+(:func:`workspace_elements` FP64 elements in all), zero when a launch starts
+and zero again when it ends: a zero-filled workspace stays reusable for any
+later call on its stream.  Every backward launch takes the ticket, and
+claims blocks when the rows have more blocks than one wave, also one that
+computes no weight gradient, so every backward launch needs the workspace.
 
 The program name ``cake_rmsnorm_silu_gate_train_<20 hex>`` is the first twenty
 hex digits of the SHA-256 of the compact JSON ``{"build": <build keywords,
@@ -159,7 +167,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "z_tok"],
             ["parameter", "z_head"],
             ["parameter", "eps"],
-            ["parameter", "blocks_per_cta"],
             ["parameter", "accumulate"],
             ["parameter", "weight_grad"],
             ["grid", "grid_x"],
@@ -170,8 +177,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         "grid_rule": {
             "ctas_per_sm": 4,
-            "kind": "row_chunks",
-            "max_blocks_per_cta": 16,
+            "kind": "row_claims",
             "rows_per_cta": 16,
         },
         "kernel": "cake_rmsnorm_silu_gate_train_6055175bf363e85d2936",
@@ -180,13 +186,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 16512,
+            "dynamic_smem_bytes": 16640,
             "use_pdl": False,
         },
         "library": "cake_rmsnorm_silu_gate_train_6055175bf363e85d2936",
         "logical": {
             "accumulate": "accumulate",
-            "blocks_per_cta": "blocks_per_cta",
             "dw": "dw",
             "dw_done": "dw_done",
             "dw_sums": "dw_sums",
@@ -239,7 +244,6 @@ MODULES: dict[str, dict[str, Any]] = {
             ["parameter", "z_tok"],
             ["parameter", "z_head"],
             ["parameter", "eps"],
-            ["parameter", "blocks_per_cta"],
             ["parameter", "accumulate"],
             ["parameter", "weight_grad"],
             ["grid", "grid_x"],
@@ -250,8 +254,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         "grid_rule": {
             "ctas_per_sm": 4,
-            "kind": "row_chunks",
-            "max_blocks_per_cta": 16,
+            "kind": "row_claims",
             "rows_per_cta": 16,
         },
         "kernel": "cake_rmsnorm_silu_gate_train_32301367ce4fa8110271",
@@ -260,13 +263,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 16512,
+            "dynamic_smem_bytes": 16640,
             "use_pdl": False,
         },
         "library": "cake_rmsnorm_silu_gate_train_32301367ce4fa8110271",
         "logical": {
             "accumulate": "accumulate",
-            "blocks_per_cta": "blocks_per_cta",
             "dw": "dw",
             "dw_done": "dw_done",
             "dw_sums": "dw_sums",
@@ -316,7 +318,7 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (10, 7): "sm_107a",
 }
 ROLES = ("fwd", "bwd_bf16", "bwd_f32")
-GRID_KINDS = ("row_blocks", "row_chunks")
+GRID_KINDS = ("row_blocks", "row_claims")
 # Elements of one normalized row.
 HEAD_DIM = 128
 # The forward reads rows with 32-byte vector accesses (the backward with
@@ -349,45 +351,42 @@ def route_module(arch: str, role: str) -> str:
     return name
 
 
-def backward_chunks(name: str, rows: int, sm_count: int) -> tuple[int, int]:
-    """``(chunks, blocks_per_cta)`` of the backward module ``name`` for ``rows``
-    rows on a device with ``sm_count`` SMs: the CTA chunks (the grid) and the
-    row blocks of one chunk.  The rows take the fewest whole waves of
-    ``ctas_per_sm * sm_count`` CTAs whose CTAs hold at most
-    ``max_blocks_per_cta`` blocks (so a thread's FP32 run never exceeds 16
-    terms), and ``blocks_per_cta`` is the fewest blocks that fit the rows into
-    those waves, so the last wave is as full as the others."""
+def backward_ctas(name: str, rows: int, sm_count: int) -> int:
+    """CTAs of the backward module ``name`` for ``rows`` rows on a device with
+    ``sm_count`` SMs: one per block of ``rows_per_cta`` rows, at most
+    ``ctas_per_sm * sm_count`` (one wave).  Block ``c`` is CTA ``c``'s while
+    every block has a CTA; past one wave the kernel's CTAs claim every block
+    from the workspace's claim counter, so the count only bounds how many
+    CTAs share the rows."""
 
     rule = MODULES[name]["grid_rule"]
-    if rule["kind"] != "row_chunks":
+    if rule["kind"] != "row_claims":
         raise ValueError(f"module {name} is not a backward module")
     blocks = -(-int(rows) // int(rule["rows_per_cta"]))
-    wave = max(1, int(rule["ctas_per_sm"]) * int(sm_count))
-    waves = max(1, -(-blocks // (wave * int(rule["max_blocks_per_cta"]))))
-    blocks_per_cta = max(1, -(-blocks // (waves * wave)))
-    return -(-blocks // blocks_per_cta), blocks_per_cta
+    return min(blocks, max(1, int(rule["ctas_per_sm"]) * int(sm_count)))
 
 
 def workspace_elements(name: str) -> int:
     """FP64 elements of the backward module ``name``'s workspace: its
-    ``dw_slots * 128`` accumulators, then one element whose low 32 bits are the
-    arrival word."""
+    ``dw_slots * 128`` accumulators, then one element holding the two 32-bit
+    words of ``dw_done``: its first four bytes the arrival ticket, its last four
+    the claim counter."""
 
     return int(MODULES[name]["dw_slots"]) * HEAD_DIM + 1
 
 
 def launch_grid(
-    record: dict[str, Any], *, rows: int, chunks: int = 0
+    record: dict[str, Any], *, rows: int, ctas: int = 0
 ) -> tuple[int, int, int]:
-    """The grid of one module record for ``rows`` rows (``chunks``: the
-    backward's chunk count, :func:`backward_chunks`)."""
+    """The grid of one module record for ``rows`` rows (``ctas``: the
+    backward's CTA count, :func:`backward_ctas`)."""
 
     rule = record["grid_rule"]
     kind = rule["kind"]
     if kind == "row_blocks":
         return (-(-int(rows) // int(rule["rows_per_cta"])), 1, 1)
-    if kind == "row_chunks":
-        return (int(chunks), 1, 1)
+    if kind == "row_claims":
+        return (int(ctas), 1, 1)
     raise ValueError(
         f"unknown Cake SiLU-gated RMSNorm grid rule: {kind!r} (known: {GRID_KINDS})"
     )
@@ -446,13 +445,13 @@ def run_module(
 
     ``values`` maps logical names to tensors and Python scalars; the module
     record maps its kernel parameter names onto that vocabulary.  The launch
-    grid is the module's :func:`launch_grid` (the backward reads ``chunks``
+    grid is the module's :func:`launch_grid` (the backward reads ``ctas``
     from ``values``), and the kernel runs on the current torch stream.
     """
 
     record = MODULES[name]
     logical = record["logical"]
-    grid = launch_grid(record, rows=rows, chunks=int(values.get("chunks", 0)))
+    grid = launch_grid(record, rows=rows, ctas=int(values.get("ctas", 0)))
     grid_values = {"grid_x": grid[0], "grid_y": grid[1], "grid_z": grid[2]}
     args = []
     for kind, key in record["arg_plan"]:
@@ -481,7 +480,7 @@ __all__ = [
     "ROLES",
     "ROUTES",
     "arch_for_capability",
-    "backward_chunks",
+    "backward_ctas",
     "device_arch",
     "launch_grid",
     "library_name",
