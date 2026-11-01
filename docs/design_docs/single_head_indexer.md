@@ -12,7 +12,8 @@ has four parts:
 - prefill selection: `single_head_paged_mqa_threshold_select` writes only the
   keys that score at or above a threshold for each query row;
 - thresholds from a key sample: `gather_key_sample` and `thresholds_from_sample`;
-- NVFP4 keys: `quantize_write_index_qk_nvfp4` writes them to the paged cache.
+- NVFP4 keys and queries: `quantize_write_index_qk_nvfp4` writes the keys to the
+  paged cache and the queries to rows, in one launch.
 
 A Top-K kernel then takes the final Top-K from the scores, or from the selected
 keys. The selected keys feed token-sparse attention
@@ -28,7 +29,7 @@ All functions are in `flashinfer.attn_scores`.
 | `single_head_paged_mqa_threshold_select(query, key_cache, row_ends, tile_requests, block_table, *, thresholds, counters, candidates, max_context, top_k, query_scales=None, key_scales=None, arrivals=None, ranges=None)` | Keep the keys at or above the threshold of each query row, as (key, score) pairs. |
 | `gather_key_sample(key_cache, block_table, offsets, sample_ends, *, sample_keys, samples_per_run, pages_per_run, key_scales=None, sample_scales=None)` | Copy a strided random sample of the keys of each request into dense rows. |
 | `thresholds_from_sample(sample_scores, sample_top, *, thresholds, counters)` | Set the threshold of each query row from its sampled Top scores, and zero its counters. |
-| `quantize_write_index_qk_nvfp4(key, slots, key_cache, key_scales)` | Quantize BF16 or FP16 keys to NVFP4, and write them at their cache slots. |
+| `quantize_write_index_qk_nvfp4(key, slots, query, query_rows, *, key_cache, key_scales, packed_query, query_scales)` | Quantize BF16 or FP16 keys and queries to NVFP4: the keys at their cache slots, the queries at their rows. |
 
 ## Layout
 
@@ -141,12 +142,14 @@ A good threshold makes the repair rare:
    sampled Top scores, and zeroes its counters. A -1 position or a NaN score
    counts as -inf.
 
-### NVFP4 keys
+### NVFP4 keys and queries
 
-`quantize_write_index_qk_nvfp4` gives each 16 values of a key an E4M3 scale:
-their largest magnitude over 6, with a global scale of 1. It writes the 64
-packed bytes and the 8 scales of a key at its slot `s`: page `s // 64`, row
-`s % 64`. It skips negative slots.
+`quantize_write_index_qk_nvfp4` gives each 16 values of a key or query an E4M3
+scale: their largest magnitude over 6, with a global scale of 1. It writes the
+64 packed bytes and the 8 scales of a key at its slot `s`: page `s // 64`, row
+`s % 64`, and those of a query at its row `r` of `packed_query` and
+`query_scales`. It skips negative slots and rows. Keys and queries are
+quantized the same way, so their scores stay comparable.
 
 ## Limits
 
@@ -186,7 +189,7 @@ Each API records a trace template of the same name, with a reference.
 - `gather_key_sample`: BF16 and NVFP4, with pages in the first 2**31 bytes of
   the cache and after them. Slots after the sample end stay as they are.
 - `thresholds_from_sample`: -1 positions and NaN scores.
-- `quantize_write_index_qk_nvfp4`: 1, 9 and 300 keys, at shuffled slots, with
-  negative slots skipped.
+- `quantize_write_index_qk_nvfp4`: 0 to 300 keys and 0 to 300 queries, at
+  shuffled slots and rows, with negative ones skipped.
 - the checks that reject bad shapes, bad layouts off SM10x, bad counters, and
   CuTe DSL older than 4.7.
