@@ -1875,7 +1875,8 @@ def mhc_infer_num_splits(
 
 def mhc_infer_num_ctas(num_tokens: int, num_sms: int, num_splits: int) -> int:
     """CTAs to launch: every projection task and every mix warp in one round, never more than the SMs; the kernel
-    strides tasks, tokens and m-block ownership by the grid, so any grid >= m_blocks is correct and this one is fast."""
+    strides tasks, tokens and m-block ownership by the grid (CTA mb % grid owns m-block mb), so a grid below the
+    m-block count is correct too and this one is fast."""
     m_blocks = (num_tokens + 63) // 64
     return min(num_sms, max(m_blocks * num_splits, (num_tokens + 3) // 4))
 
