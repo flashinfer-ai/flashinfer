@@ -75,6 +75,11 @@ class _CutlassAutoRunner(TunableRunner):
     def _native_inputs(
         self, inputs: list[torch.Tensor], *, prepare: bool = False
     ) -> list[torch.Tensor]:
+        """Adapt public operands to native ABI slots and provision safe workspace.
+
+        Candidate queries leave prefix scratch empty; execution prepares it.
+        Rank-128 linear workspaces isolate PDL counters across streams and graphs.
+        """
         a, b, _, _, _, down = inputs[:6]
         k = a.shape[1] if self.linear else a.shape[1] * 2
         size = max(
@@ -83,8 +88,10 @@ class _CutlassAutoRunner(TunableRunner):
                 a.device, a.shape[0], b.shape[0], k, down.shape[1]
             ),
         )
-        workspace = cutlass._get_cache_buf(
-            "nvfp4_svdquant_gemm_workspace", size, a.device
+        workspace = (
+            cutlass._sm120_linear_workspace(size, a.device, down.shape[1])
+            if self.linear
+            else cutlass._get_cache_buf("nvfp4_svdquant_gemm_workspace", size, a.device)
         )
         if self.linear:
             # Native tactic queries read original operands and workspace only.

@@ -135,9 +135,15 @@ struct SvdquantGemmConfigSm120 {
   // compiled rather than dropping it is what keeps kernel ids stable, since the
   // KernelShapeSm120 enum and SVDQ_SM120_DISPATCH are written out by hand and
   // would otherwise have to be regenerated per rank.
+  //
+  // The byte-exact path stages a rank wider than one stage as consecutive stage-wide
+  // chunks (CollectiveMmaLoRaSm120::LoRaChunks), so any multiple of the stage width
+  // compiles. The row80 dedicated side slot is still sized for one chunk.
   static constexpr int kLoRaStageCapacity = cute::size<2>(MmaTileShape{}) / 4;
-  static constexpr int LoRaRank =
-      kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity ? kSvdqSm120ModuleLoRaRank : 32;
+  static constexpr bool kStagesModuleRank =
+      kSvdqSm120ModuleLoRaRank <= kLoRaStageCapacity ||
+      (!IsRow80SideSlot && kSvdqSm120ModuleLoRaRank % kLoRaStageCapacity == 0);
+  static constexpr int LoRaRank = kStagesModuleRank ? kSvdqSm120ModuleLoRaRank : 32;
   static_assert(!IsRow80SideSlot || IsRow80, "the production side slot is row80-only");
   static_assert(IsRow80 ||
                     LoRaPathSm120 == cutlass::gemm::collective::Sm120LoRaPath::kByteExactMainloop,
@@ -446,6 +452,9 @@ struct RuntimeTacticSm120 {
   int splits;  // 1 = scheduler-default decomposition; >1 = forced Split-K
   RasterOrderSm120 raster;
   int swizzle;  // power of two; 1 = default
+  // Not part of the encoded tactic: the fused linear route sets it when its
+  // prefix launches the GEMM only after XQ/SF are complete (see the collective).
+  SvdquantQuantizeBarrierSm120 quantize_barrier{};
 };
 
 // 16 legacy kernel rows + 8 legacy Stream-K kernels x splits {2,4} + 8 legacy
@@ -718,6 +727,11 @@ bool can_implement_tactic(RuntimeTacticSm120 const& rt, int m, int n, int k, int
   return gemm.can_implement(args) == cutlass::Status::kSuccess;
 }
 
+/**
+ * @brief Validate a runtime tactic, initialize caller-owned scratch, and enqueue GEMM.
+ * Operand roles follow Config::SwapAB; the optional quantize barrier is passed
+ * to the mainloop. Invalid rank, shape, or workspace raises an exception.
+ */
 template <class Config, bool CompileInlineDown>
 void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, void const* B,
                      void const* sfa, void const* sfb, float const* alpha, void const* D,
@@ -772,6 +786,7 @@ void run_tactic_impl(RuntimeTacticSm120 const& rt, void* out, void const* A, voi
   args.mainloop.layout_SFB =
       narrow_sf_layout(Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(sf_shape));
   args.mainloop.lora_rank = lora_rank;
+  args.mainloop.quantize_barrier = rt.quantize_barrier;
   bool const use_inline_down = inline_down_x != nullptr && inline_down_l2t != nullptr;
   if constexpr (!CompileInlineDown) {
     if (use_inline_down)

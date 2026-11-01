@@ -5,6 +5,7 @@ CUTLASS/Cake and SM12x CuTe DSL, plus the explicit SM120 CUTLASS backend.
 Host dispatch, JIT, workspace and compiled guard tests live in the companion
 ``test_nvfp4_svdquant_host.py`` module."""
 
+import gc
 import math
 import re
 import unittest
@@ -2190,6 +2191,67 @@ def test_sm120_m537_l2t_pack_handles_inference_tensor_mutation(k: int) -> None:
     assert torch.equal(first, torch.zeros_like(first))
     assert torch.equal(updated, torch.ones_like(updated))
     assert updated is not first
+
+
+def _clear_prepared_l2t() -> None:
+    """Remove explicit preparation and opportunistic packs between cache tests."""
+    svdquant_sm120_cutlass._SM120_PREPARED_L2T.clear()
+    svdquant_sm120_cutlass._SM120_KMAJOR_L2T_CACHE.clear()
+    svdquant_sm120_cutlass._SM120_M537_PACKED_L2T_CACHE.clear()
+
+
+def test_sm120_prepared_kmajor_l2t_serves_inference_tensors() -> None:
+    """Only prepared inference weights may reuse a cached K-major layout."""
+    _clear_prepared_l2t()
+    try:
+        with torch.inference_mode():
+            source = torch.arange(3072 * 128, dtype=torch.float32).reshape(3072, 128)
+            svdquant_sm120_cutlass.prepare_sm120_l2t(source)
+            first = svdquant_sm120_cutlass._cached_sm120_kmajor_l2t(source)
+            assert svdquant_sm120_cutlass._cached_sm120_kmajor_l2t(source) is first
+        assert torch.equal(first, svdquant_sm120_cutlass._pack_sm120_kmajor_l2t(source))
+        # Unprepared inference tensors keep repacking on every call.
+        with torch.inference_mode():
+            other = torch.zeros((3072, 128))
+            a = svdquant_sm120_cutlass._cached_sm120_kmajor_l2t(other)
+            assert svdquant_sm120_cutlass._cached_sm120_kmajor_l2t(other) is not a
+    finally:
+        _clear_prepared_l2t()
+
+
+def test_sm120_prepared_l2t_invalidates_on_mutation_and_release() -> None:
+    """Version changes bypass prepared layouts; source destruction releases them."""
+    _clear_prepared_l2t()
+    try:
+        source = torch.zeros((5120, 32), dtype=torch.int32)
+        svdquant_sm120_cutlass.prepare_sm120_l2t(source)
+        prepared = svdquant_sm120_cutlass._cached_sm120_m537_l2t(source)
+        assert (
+            prepared
+            is svdquant_sm120_cutlass._SM120_PREPARED_L2T[
+                svdquant_sm120_cutlass._prepared_l2t_key(source)
+            ][2]["m537"]
+        )
+        source.add_(1)
+        mutated = svdquant_sm120_cutlass._cached_sm120_m537_l2t(source)
+        assert mutated is not prepared
+        assert torch.equal(mutated, svdquant_sm120_cutlass._pack_sm120_m537_l2t(source))
+        del source, prepared, mutated
+        gc.collect()
+        assert not svdquant_sm120_cutlass._SM120_PREPARED_L2T
+    finally:
+        _clear_prepared_l2t()
+
+
+def test_sm120_prepare_l2t_skips_layouts_no_producer_reads() -> None:
+    """Preparation must not retain unused layout copies for rank-64 producers."""
+    _clear_prepared_l2t()
+    try:
+        source = torch.zeros((3072, 64))
+        svdquant_sm120_cutlass.prepare_sm120_l2t(source)
+        assert not svdquant_sm120_cutlass._SM120_PREPARED_L2T
+    finally:
+        _clear_prepared_l2t()
 
 
 def test_sm120_jit_module_exports_fused_k1_k2_operator() -> None:
@@ -4926,7 +4988,7 @@ def _check_linear_graph_replay(
     assert _sqnr_db(expected_fresh, captured.float()) > 40.0
 
 
-@pytest.mark.parametrize("rank", [32, 64])
+@pytest.mark.parametrize("rank", [32, 64, 128])
 @pytest.mark.parametrize(
     "shape", [(129, 256, 256), (537, 5376, 7168), (64, 3072, 3072)]
 )
@@ -4939,20 +5001,40 @@ def test_linear_rank_autotune_and_graph_replay(
     enable_pdl: bool,
     backend_name: str,
 ) -> None:
+    """Public backends must stay accurate through tuning and graph weight updates."""
     _check_linear_graph_replay(rank, shape, use_bias, enable_pdl, backend_name)
 
 
+def _small_m_variants(m: int, k: int, rank: int) -> list[int]:
+    """Select ordinary and split-K small-M variants for prefix replay tests."""
+    return [
+        variant
+        for variant, (family, _, _) in enumerate(
+            routes.sm120_producer_variants(m, k, rank)
+        )
+        if family in (routes.SM120_FAMILY_SMALL_M, routes.SM120_FAMILY_SMALL_M_SPLIT)
+    ]
+
+
 @pytest.mark.parametrize(
-    "m,k,variant",
+    "rank,m,k,variant",
     [
-        (m, k, variant)
+        (64, m, k, variant)
         for m, k in [(64, 3072), (537, 7168), (2048, 3072), (4096, 12288)]
         for variant in range(routes.sm120_producer_variant_count(m, k, 64))
+    ]
+    # Rank 128's large-M and warp-specialized families are covered by the
+    # complete-linear tests; every small-M and split-K small-M tiling is swept here.
+    + [
+        (128, m, k, variant)
+        for m, k in [(64, 3072), (537, 7168), (1024, 1536), (64, 11008), (200, 4096)]
+        for variant in _small_m_variants(m, k, 128)
     ],
 )
-def test_rank64_fused_prefix_observes_graph_weight_updates(
-    m: int, k: int, variant: int
+def test_fused_prefix_observes_graph_weight_updates(
+    rank: int, m: int, k: int, variant: int
 ) -> None:
+    """Every selected prefix must refresh quantization and LoRA columns on replay."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0):
         pytest.skip("requires SM120")
 
@@ -4960,32 +5042,46 @@ def test_rank64_fused_prefix_observes_graph_weight_updates(
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     pqs = (1 + 0.2 * torch.randn(k, device="cuda", dtype=torch.bfloat16)).abs()
     global_scale = (2688 / (x.float() * pqs.float()).abs().amax()).reshape(1)
-    l2t = torch.randn((k, 64), device="cuda", dtype=torch.bfloat16)
+    l2t = torch.randn((k, rank), device="cuda", dtype=torch.bfloat16)
     xq = torch.empty((m, k // 2), device="cuda", dtype=torch.uint8)
     sf = torch.zeros(
         ((m + 127) // 128 * 128 * (k // 16),), device="cuda", dtype=torch.uint8
     )
-    down = torch.empty((m, 64), device="cuda", dtype=torch.bfloat16)
+    down = torch.empty((m, rank), device="cuda", dtype=torch.bfloat16)
     expected_xq = torch.empty_like(xq)
     expected_sf = torch.zeros_like(sf)
-    module = backend.get_nvfp4_svdquant_sm120_module(64)
+    module = backend.get_nvfp4_svdquant_sm120_module(rank)
     family, tiling, address_policy = routes.sm120_decode_producer_variant(
-        m, k, variant, 64
+        m, k, variant, rank
     )
+    kmajor = routes.sm120_variant_reads_kmajor_l2t(m, k, variant, rank)
+    # The layout the producer reads; a K-major copy is refreshed from l2t below.
+    l2t_read = backend._pack_sm120_kmajor_l2t(l2t) if kmajor else l2t
 
     def prefix() -> None:
+        """Launch the fixed producer with the layout required by its route."""
         module.nvfp4_quantize_smooth_lora_down_dyn_sm120(
-            x, pqs, global_scale, l2t, xq, sf, down, family, *tiling, address_policy
+            x,
+            pqs,
+            global_scale,
+            l2t_read,
+            xq,
+            sf,
+            down,
+            family,
+            *tiling,
+            address_policy,
         )
 
     def check() -> None:
+        """Check packed outputs exactly and down columns against an FP32 reference."""
         module.nvfp4_quantize_smooth(
             x, pqs, global_scale, expected_xq, expected_sf, False
         )
         reference = x.float() @ l2t.float()
         assert torch.equal(xq, expected_xq)
         assert torch.equal(sf, expected_sf)
-        for rank_column in range(64):
+        for rank_column in range(rank):
             assert (
                 _sqnr_db(reference[:, rank_column], down[:, rank_column].float()) > 40
             )
@@ -5000,6 +5096,8 @@ def test_rank64_fused_prefix_observes_graph_weight_updates(
     for _ in range(2):
         x.copy_(torch.randn_like(x))
         l2t.copy_(torch.randn_like(l2t))
+        if kmajor:
+            l2t_read.copy_(backend._pack_sm120_kmajor_l2t(l2t))
         down.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize()

@@ -301,10 +301,11 @@ def test_auto_linear_measures_both_native_prefixes(auto_backend_case):
 
 
 @pytest.mark.parametrize(
-    "auto_backend_case", [(64, 128, 3072, 96), (64, 128, 3072, 128)], indirect=True
+    "auto_backend_case", [(64, 128, 3072, 96), (64, 128, 3072, 160)], indirect=True
 )
 @pytest.mark.parametrize("operation", ["gemm", "linear"])
 def test_auto_skips_native_build_for_unsupported_rank(auto_backend_case, operation):
+    """Auto dispatch must exclude unsupported native ranks without loading a module."""
     from flashinfer import autotune
 
     _, call, _, builds, _ = auto_backend_case
@@ -313,10 +314,11 @@ def test_auto_skips_native_build_for_unsupported_rank(auto_backend_case, operati
     assert not builds, "no native tactic stages this rank; do not load the module"
 
 
-@pytest.mark.parametrize("rank", [96, 128])
+@pytest.mark.parametrize("rank", [96, 160])
 def test_explicit_cutlass_rejects_unsupported_rank_before_build(
     auto_backend_case, rank
 ):
+    """Explicit CUTLASS must reject unsupported ranks before JIT compilation."""
     _, _, _, builds, _ = auto_backend_case
     m, n, k = 64, 128, 3072
     with pytest.raises(ValueError, match="Problem size is not supported"):
@@ -542,11 +544,11 @@ def test_ranks_off_the_granularity_are_refused(monkeypatch, rank):
         gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank))
 
 
-def test_fused_linear_admission_supports_ranks_32_and_64():
-    """The fused prefix has separate rank-32 and rank-64 specializations."""
-    for rank in (96, 128):
+def test_fused_linear_admission_supports_ranks_32_64_and_128():
+    """The fused prefix has separate rank-32, rank-64 and rank-128 specializations."""
+    for rank in (96, 160):
         assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(64, 3072, rank)
-    for rank in (32, 64):
+    for rank in (32, 64, 128):
         assert svdquant_sm120_cutlass._sm120_fused_linear_supported(64, 3072, rank)
 
 
@@ -560,7 +562,7 @@ def test_sm120_accepts_rank_32(monkeypatch):
 def test_fused_prefix_rank_limit_does_not_restrict_shared_gemm_validation():
     """The shared GEMM check also admits ranks with no SM120 fused prefix."""
     m, k = 64, 3072
-    for rank in (96, 128):
+    for rank in (96, 160):
         assert not svdquant_sm120_cutlass._sm120_fused_linear_supported(m, k, rank)
         assert (
             gemm_svdquant._check_mm_nvfp4_svdquant_problem(*_problem(rank=rank)) is True
@@ -1463,8 +1465,9 @@ def test_linear_runners_load_the_requested_rank(
     assert type(runners[0]).__name__ == expected_fallback
 
 
-@pytest.mark.parametrize("rank", [0, 48, 96, 128])
+@pytest.mark.parametrize("rank", [0, 48, 96, 160])
 def test_linear_rejects_unsupported_ranks_before_loading_kernels(rank: int) -> None:
+    """The linear API must reject unsupported ranks before native module lookup."""
     with pytest.raises(ValueError, match="rank"):
         svdquant_linear(
             torch.empty((1, 32), dtype=torch.bfloat16),
@@ -1840,6 +1843,50 @@ def test_rank64_offers_fused_preprocessing(m: int, k: int) -> None:
 def test_rank64_fusion_invalidates_unfused_route_cache() -> None:
     assert routes.sm120_linear_route_abi_version(64, 3072, 64) > 10
     assert routes.sm120_linear_route_abi_version(64, 3072, 32) == 10
+
+
+@pytest.mark.parametrize("m,k", [(64, 3072), (537, 7168), (4096, 12288)])
+def test_rank128_offers_small_m_after_existing_producers(m: int, k: int) -> None:
+    """New rank-128 producer families must preserve existing variant indices."""
+    variants = routes.sm120_producer_variants(m, k, 128)
+    families = [family for family, _, _ in variants]
+    small = families.index(routes.SM120_FAMILY_SMALL_M)
+    split = (
+        families.index(routes.SM120_FAMILY_SMALL_M_SPLIT)
+        if routes.SM120_FAMILY_SMALL_M_SPLIT in families
+        else len(families)
+    )
+    # Appended last, so the large-M and warp-specialized indices keep their meaning;
+    # the split-K small-M family follows every small-M variant for the same reason.
+    assert set(families[:small]) == {
+        routes.SM120_FAMILY_LARGE_M,
+        routes.SM120_FAMILY_WS_RANK128,
+    }
+    assert set(families[small:split]) == {routes.SM120_FAMILY_SMALL_M}
+    assert set(families[split:]) <= {routes.SM120_FAMILY_SMALL_M_SPLIT}
+    assert (split < len(families)) == (m <= routes.SM120_SMALL_M_SPLIT_MAX_M)
+    for variant in range(small, len(variants)):
+        assert (
+            routes.sm120_decode_producer_variant(m, k, variant, 128)
+            == variants[variant]
+        )
+        # Every rank-128 producer, small-M included, reads K-major L2T.
+        assert routes.sm120_variant_reads_kmajor_l2t(m, k, variant, 128)
+        assert not routes.sm120_variant_packs_l2t(m, k, variant, 128)
+    # Each small-M (and split-K small-M) tiling appears under policy 0 and then,
+    # appended after all of them, under policy 1 (the GEMM mainloop waits only
+    # for the quantize half).
+    for begin, end in ((small, split), (split, len(variants))):
+        family_variants = variants[begin:end]
+        if not family_variants:
+            continue
+        early = [tiling for _, tiling, policy in family_variants if policy == 0]
+        deferred = [tiling for _, tiling, policy in family_variants if policy == 1]
+        assert early and deferred == early
+        assert [policy for _, _, policy in family_variants] == [0] * len(early) + [
+            1
+        ] * len(deferred)
+    assert routes.sm120_linear_route_abi_version(m, k, 128) == 17
 
 
 # Workspace provisioning and cached tactic feasibility.
@@ -2831,8 +2878,14 @@ QUANT_HEADER: Final = (
 
 
 def _function(source: str, signature: str) -> str:
+    """Extract a C++ body for host tests, skipping braces in default arguments."""
     start = source.index(signature)
-    opening = source.index("{", start)
+    position = start + len(signature)
+    parentheses = signature.count("(") - signature.count(")")
+    while parentheses:
+        parentheses += (source[position] == "(") - (source[position] == ")")
+        position += 1
+    opening = source.index("{", position - 1)
     depth = 1
     closing = opening + 1
     while depth:
@@ -3171,8 +3224,60 @@ def _run_ubsan(tmp_path: Path, source: str) -> None:
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("rank", (32, 64))
+@pytest.mark.parametrize("cuda_version", [12040, 12050])
+@pytest.mark.parametrize("lookup_mode", [0, 1, 2])
+def test_ws_encoder_lookup_checks_both_statuses(
+    tmp_path: Path, cuda_version: int, lookup_mode: int
+) -> None:
+    """Both CUDA lookup APIs must reject call errors and unsuccessful query status."""
+    header = (
+        REPO_ROOT
+        / "include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_ws_sm120.cuh"
+    )
+    body = _function(header.read_text(), "ws_encode_fn()")
+    program = (
+        f"#define CUDA_VERSION {cuda_version}\n#define LOOKUP_MODE {lookup_mode}\n"
+    )
+    program += r"""
+#include <cassert>
+using cudaError_t = int;
+constexpr int cudaSuccess = 0;
+constexpr int cudaEnableDefault = 0;
+enum cudaDriverEntryPointQueryResult {
+  cudaDriverEntryPointSuccess, cudaDriverEntryPointSymbolNotFound
+};
+using PFN_cuTensorMapEncodeTiled_v12000 = void (*)();
+void encoder() {}
+int lookup(void** ptr, cudaDriverEntryPointQueryResult* status) {
+  *ptr = reinterpret_cast<void*>(&encoder);
+  *status = LOOKUP_MODE == 2 ? cudaDriverEntryPointSymbolNotFound
+                            : cudaDriverEntryPointSuccess;
+  return LOOKUP_MODE == 1 ? 1 : cudaSuccess;
+}
+int cudaGetDriverEntryPointByVersion(char const*, void** ptr, int, int,
+                                    cudaDriverEntryPointQueryResult* status) {
+  return lookup(ptr, status);
+}
+int cudaGetDriverEntryPoint(char const*, void** ptr, int,
+                           cudaDriverEntryPointQueryResult* status) {
+  return lookup(ptr, status);
+}
+inline PFN_cuTensorMapEncodeTiled_v12000
+"""
+    program += body
+    program += r"""
+int main() {
+  auto expected = LOOKUP_MODE == 0 ? &encoder : nullptr;
+  assert(ws_encode_fn() == expected);
+  assert(ws_encode_fn() == expected);
+}
+"""
+    _run_ubsan(tmp_path, program)
+
+
+@pytest.mark.parametrize("rank", (32, 64, 128))
 def test_dynamic_prefix_offsets_cross_int32_boundary(tmp_path: Path, rank: int) -> None:
+    """UBSan must accept production offsets exceeding signed 32-bit range."""
     # Compile the production expressions so UBSan checks C++ promotion rules,
     # without allocating multi-gigabyte CUDA tensors to reach the boundary.
     source = PRODUCER_HEADER.read_text()
@@ -3236,6 +3341,7 @@ def test_dynamic_prefix_offsets_cross_int32_boundary(tmp_path: Path, rank: int) 
             f"int row = {2147483648 // rank}, b_row = row;\n"
             "int row0 = row, row1 = row, row2 = row, row3 = row, row4 = row;\n"
             "int row5 = row, row6 = row, row7 = row, row8 = row, row9 = row;\n"
+            "int row_lo = row, row_hi = row;\n"
             f"{setup}\n"
             f"std::int64_t actual = {offset};\n"
             f"if (actual != {expected}LL) return __LINE__;\n"
@@ -3323,10 +3429,11 @@ int main() { check<false>(); check<true>(); }
     _run_ubsan(tmp_path, prelude + guard + checks)
 
 
-@pytest.fixture(scope="module", params=(32, 64))
+@pytest.fixture(scope="module", params=(32, 64, 128))
 def alignment_binary(
     request: pytest.FixtureRequest, tmp_path_factory: pytest.TempPathFactory
 ) -> Path:
+    """Compile prefix guards with stubbed launches and UBSan for each rank."""
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("requires a C++ compiler with UBSan")
@@ -3354,14 +3461,28 @@ def alignment_binary(
         root / "include/flashinfer/gemm/nvfp4_smooth_quantize_lora_down_sm120.cuh"
     ).read_text()
     large_m = _function(header, "inline cudaError_t launch_large_m_dyn_kernel(")
-    launch = large_m.index("nvfp4_smooth_quantize_lora_down_large_m_dyn_sm120_kernel<")
-    end = large_m.index("return cudaGetLastError();", launch)
-    # Execute all real geometry checks, replacing only the CUDA launch syntax.
-    large_m = large_m[:launch] + "++backend_calls;\n" + large_m[end:]
+    # Execute all real geometry checks, replacing only the two CUDA launches
+    # (the wide-rank staged-B kernel and the default kernel).
+    launch = large_m.index("if constexpr (kStagedB) {")
+    staged = _function(large_m[launch:], "if constexpr (kStagedB) {")
+    rest = large_m[launch + len(staged) :]
+    end = launch + len(staged) + rest.index("else {") + len(_function(rest, "else {"))
+    large_m = (
+        large_m[:launch]
+        + "++backend_calls;\n    return cudaGetLastError();"
+        + large_m[end:]
+    )
+    # The launcher sizes its down warps and staged-B shared memory with these.
+    wide_rank = header.index("constexpr bool large_m_stages_b(")
+    staged_bytes = header.index("constexpr int staged_b_shared_bytes(")
+    staged_bytes += len(_function(header, "constexpr int staged_b_shared_bytes("))
     functions += (
         "\nnamespace quant { using Type = std::uint16_t; constexpr int SF_VEC_SIZE = 16; }\n"
         "enum class DynAddress { Recompute };\n"
-        "template <int BlockThreads, bool LongK, int TileM, int TileK, DynAddress Policy, int Rank>\n"
+        + _function(header, "constexpr int large_m_down_warps(")
+        + "\n"
+        + header[wide_rank:staged_bytes]
+        + "\ntemplate <int BlockThreads, bool LongK, int TileM, int TileK, DynAddress Policy, int Rank>\n"
         + large_m
     )
     program = r"""
@@ -3414,6 +3535,7 @@ int get_stream(Device) { return 0; }
 const char* cudaGetErrorString(int) { return "CUDA stub"; }
 int cudaGetLastError() { return cudaSuccess; }
 namespace flashinfer::gemm {
+struct SvdquantQuantizeBarrierSm120 {};
 template<class... Args> void nvfp4_smooth_quantize(Args...) { ++backend_calls; }
 template<int Rank, class... Args> int nvfp4_smooth_quantize_lora_down_sm120(Args...) {
   ++backend_calls;
