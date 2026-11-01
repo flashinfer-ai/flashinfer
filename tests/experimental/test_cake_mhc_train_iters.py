@@ -46,6 +46,12 @@ deterministic package).  This module checks:
 * that changing the count in one process loads no module after the first
   run-time-count call, the count checks, and non-default epsilons with a
   run-time count.
+
+The cases above run at ``H = 4096``;
+``test_counts_match_fp64_at_every_hidden_size`` and
+``test_paths_agree_at_every_hidden_size`` repeat the numerics and the paths at
+the counts 1, 7, 20 and 64 at hidden 5120 and 7168 where the device's
+architecture routes them (SM100 / SM103; SM107 routes 4096 only).
 """
 
 from __future__ import annotations
@@ -80,10 +86,12 @@ backward_finish = pkg.cake_mhc_train_backward_finish
 det_backward_finish = det.cake_mhc_det_train_backward_finish
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
+STREAMS, HIDDEN, MAPPING_ROWS = 4, 4096, 24
+HIDDEN_SIZES = (4096, 5120, 7168)
 RMS_EPS, HC_EPS, SINKHORN_ITERS, SINKHORN_ITERS_MAX = 1e-5, 1e-6, 20, 64
 COUNTS = (1, 2, 5, 10, 19, 21, 30, 50, 64)
 T_COUNTS = (1, 7, 1024, 16263)
+HIDDEN_COUNTS = (1, 7, 20, 64)  # the counts of the hidden sizes other than 4096
 BF16_ATOL = BF16_RTOL = 1e-2
 FP32_REL_L2_MAX = 1e-5
 FP32_ELEM_REL_MAX = 1e-4
@@ -145,34 +153,45 @@ def _sm_count() -> int:
     return loader.sm_count(_device().index)
 
 
-def _parts(T: int) -> int:
+def _require_hidden(hidden: int) -> int:
+    """``hidden`` if the device's architecture routes every kind of it, else the case is skipped."""
+    arch = _arch()
+    sizes = tuple(loader.supported_hidden_sizes(arch)) if arch else ()
+    if hidden not in sizes:
+        pytest.skip(
+            f"hidden {hidden} has no exported route on {arch} (exported: {sizes})"
+        )
+    return hidden
+
+
+def _parts(T: int, hidden: int = HIDDEN) -> int:
     """``P``: the chunk count of the column-slab pass, the number of partials each ``dfn`` element sums."""
-    parts = loader.host_plan(T, _sm_count(), _arch())["parts"]
-    assert 1 <= parts <= 32, (T, parts)
+    parts = loader.host_plan(T, _sm_count(), _arch(), hidden)["parts"]
+    assert 1 <= parts <= 32, (T, hidden, parts)
     return parts
 
 
-def _lpt_runs(T: int) -> bool:
-    """Whether the column slab runs its two-size ``lpt`` record at ``T`` on this device."""
-    return loader.bwd_slab_atomic_program(T, _sm_count(), _arch()) == "lpt"
+def _lpt_runs(T: int, hidden: int = HIDDEN) -> bool:
+    """Whether the column slab runs its two-size ``lpt`` record at ``T`` on this device (H 4096 only)."""
+    return loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden) == "lpt"
 
 
-def _slab_parts(T: int) -> int:
+def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
     """The chunk count the column slab launches: ``slab_plan``'s ``lpt_parts`` under ``lpt``, else :func:`_parts`."""
-    if not _lpt_runs(T):
-        return _parts(T)
-    parts = loader.slab_plan(T, _sm_count(), _arch())["lpt_parts"]
-    assert 1 <= parts <= 32, (T, parts)
+    if not _lpt_runs(T, hidden):
+        return _parts(T, hidden)
+    parts = loader.slab_plan(T, _sm_count(), _arch(), hidden)["lpt_parts"]
+    assert 1 <= parts <= 32, (T, hidden, parts)
     return parts
 
 
-def _dfn_factor(T: int) -> float:
+def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
     """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T (``test_cake_mhc_train.py``'s
     ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr (both sides sum the same per-chunk
     partials), 2 max(P, P_k7) + 10 where it runs lpt (the partials are another partition's)."""
-    if not _lpt_runs(T):
-        return 2.0 * _parts(T)
-    return 2.0 * max(_slab_parts(T), _parts(T)) + 10.0
+    if not _lpt_runs(T, hidden):
+        return 2.0 * _parts(T, hidden)
+    return 2.0 * max(_slab_parts(T, hidden), _parts(T, hidden)) + 10.0
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -224,7 +243,7 @@ def _block(X, fn, scale, base, B, dY, dU, *, dtype, rms_eps, hc_eps, iters) -> d
         fnd = fn.detach().to(dtype).requires_grad_(True)
         scaled = scale.detach().to(dtype).requires_grad_(True)
         based = base.detach().to(dtype).requires_grad_(True)
-        u = Xd.reshape(T, N)
+        u = Xd.reshape(T, -1)
         r = torch.rsqrt(u.square().mean(dim=-1, keepdim=True) + rms_eps)
         z = (u * r) @ fnd.T
         pre, post, C = _coefficients(z, scaled, based, hc_eps, iters)
@@ -266,8 +285,8 @@ def _oracle(i: dict, *, dtype=F64) -> dict:
 
 def _dzp(i: dict) -> torch.Tensor:
     """The FP64 ``dz' = r dL/dz`` of the reference at the case's constants, ``[T, 24]`` (the backward of the
-    coefficients alone, so no ``[T, 16384]`` autograd graph is held)."""
-    T = i["X"].shape[0]
+    coefficients alone, so no ``[T, 4H]`` autograd graph is held)."""
+    T, n = i["X"].shape[0], STREAMS * i["X"].shape[2]
     rms_eps, hc_eps, iters = _reference_constants(i)
     fn, scale, base = (i[k].double() for k in ("fn", "scale", "base"))
     blocks = [torch.zeros((0, MAPPING_ROWS), dtype=F64, device=_device())]
@@ -277,7 +296,7 @@ def _dzp(i: dict) -> torch.Tensor:
         dY = i["dY"][lo:hi].double()
         dU = i["dU"][lo:hi].double()
         B = i["B"][lo:hi].double()
-        u = X.reshape(hi - lo, N)
+        u = X.reshape(hi - lo, n)
         r = torch.rsqrt(u.square().mean(dim=-1, keepdim=True) + rms_eps)
         with torch.enable_grad():
             z = ((u * r) @ fn.T).requires_grad_(True)
@@ -299,29 +318,29 @@ def _dfn_bound(i: dict) -> torch.Tensor:
     """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of per-chunk partials in two orders:
     ``F u * 1.02 sum_t |dz'_t| |x_t|`` with ``F`` = :func:`_dfn_factor` (``test_cake_mhc_train.py``'s
     ``_dfn_bound``)."""
-    T = i["X"].shape[0]
+    T, hidden = i["X"].shape[0], i["X"].shape[2]
     dzp = _dzp(i).abs()
-    A = torch.zeros((MAPPING_ROWS, N), dtype=F64, device=_device())
+    A = torch.zeros((MAPPING_ROWS, STREAMS * hidden), dtype=F64, device=_device())
     for lo in range(0, T, BLOCK_TOKENS):
         hi = min(T, lo + BLOCK_TOKENS)
-        A += dzp[lo:hi].T @ i["X"][lo:hi].reshape(hi - lo, N).double().abs()
-    return _dfn_factor(T) * FP32_UNIT_ROUNDOFF * ABS_SLACK * A
+        A += dzp[lo:hi].T @ i["X"][lo:hi].reshape(hi - lo, -1).double().abs()
+    return _dfn_factor(T, hidden) * FP32_UNIT_ROUNDOFF * ABS_SLACK * A
 
 
 # ----------------------------------------------------------------------------------------------------------------
 # Inputs, launches and gates
 
 
-def _make_inputs(T: int, *, seed: int = SEED) -> dict:
+def _make_inputs(T: int, *, seed: int = SEED, hidden: int = HIDDEN) -> dict:
     g = torch.Generator(device=_device()).manual_seed(seed)
 
     def randn(*shape: int, dtype: torch.dtype = F32) -> torch.Tensor:
         return torch.randn(*shape, generator=g, device=_device(), dtype=F32).to(dtype)
 
     return {
-        "X": randn(T, STREAMS, HIDDEN, dtype=BF16), "fn": (randn(MAPPING_ROWS, N) * 1e-2).contiguous(),
-        "scale": 1.0 + 0.1 * randn(3), "base": 0.1 * randn(MAPPING_ROWS), "B": randn(T, HIDDEN, dtype=BF16),
-        "dY": randn(T, STREAMS, HIDDEN, dtype=BF16), "dU": randn(T, HIDDEN, dtype=BF16),
+        "X": randn(T, STREAMS, hidden, dtype=BF16), "fn": (randn(MAPPING_ROWS, STREAMS * hidden) * 1e-2).contiguous(),
+        "scale": 1.0 + 0.1 * randn(3), "base": 0.1 * randn(MAPPING_ROWS), "B": randn(T, hidden, dtype=BF16),
+        "dY": randn(T, STREAMS, hidden, dtype=BF16), "dU": randn(T, hidden, dtype=BF16),
     }  # fmt: skip
 
 
@@ -423,7 +442,10 @@ def _assert_exact(got, want, label: str) -> None:
 def _assert_dfn_within(
     got: torch.Tensor, want: torch.Tensor, bound: torch.Tensor, label: str
 ) -> None:
-    assert got.dtype == F32 and tuple(got.shape) == (MAPPING_ROWS, N), label
+    assert got.dtype == F32 and tuple(got.shape) == tuple(want.shape), label
+    assert tuple(got.shape) == tuple(bound.shape) and got.shape[0] == MAPPING_ROWS, (
+        label
+    )
     assert torch.isfinite(got).all(), f"{label}: non-finite dfn"
     diff = (got.double() - want.double()).abs()
     over = int((diff > bound).sum())
@@ -433,16 +455,16 @@ def _assert_dfn_within(
     )
 
 
-def _check(T: int, iters: int, *, seed: int = SEED) -> dict:
+def _check(T: int, iters: int, *, seed: int = SEED, hidden: int = HIDDEN) -> dict:
     """One draw at the count: every launch against the deterministic backward and the FP64 reference."""
-    i = _make_inputs(T, seed=seed)
+    i = _make_inputs(T, seed=seed, hidden=hidden)
     i["sinkhorn_iters"] = iters
     prep = _forward(i)
     want = _snapshot(_det_backward(i, prep))
     bound = _dfn_bound(i)
     outs = _nd_repeats(i, prep)
     ref = _oracle(i)
-    label = f"T={T} sinkhorn_iters={iters}"
+    label = f"T={T} sinkhorn_iters={iters} H={hidden}"
     for repeat, out in enumerate(outs):
         what = f"{label} launch {repeat}"
         _assert_exact(out, want, f"{what} vs deterministic")
@@ -463,7 +485,22 @@ def _check(T: int, iters: int, *, seed: int = SEED) -> dict:
 @pytest.mark.parametrize("iters", COUNTS)
 @pytest.mark.parametrize("T", T_COUNTS)
 def test_counts_match_fp64(T: int, iters: int) -> None:
-    out = _check(T, iters)
+    _check_counts(T, iters, HIDDEN)
+
+
+@pytest.mark.parametrize("iters", HIDDEN_COUNTS)
+@pytest.mark.parametrize("T", T_COUNTS)
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES[1:], ids=lambda h: f"H{h}")
+def test_counts_match_fp64_at_every_hidden_size(
+    hidden: int, T: int, iters: int
+) -> None:
+    """The counts 1, 7, 20 and 64 at hidden 5120 and 7168 against the deterministic backward and the FP64 reference
+    of the size (H 4096 is ``test_counts_match_fp64``)."""
+    _check_counts(T, iters, _require_hidden(hidden))
+
+
+def _check_counts(T: int, iters: int, hidden: int) -> None:
+    out = _check(T, iters, hidden=hidden)
     # The count reaches the kernels: where the FP64 dfn of this count and of 20 lie apart at the test's tolerance,
     # every launch's dfn is nearer this count's (test_cake_mhc_det_train_iters.py's check of the record's C, on the
     # output of the non-deterministic route). A chain at its fixed point leaves the two FP64 gradients closer than
@@ -473,7 +510,7 @@ def test_counts_match_fp64(T: int, iters: int) -> None:
     if _rel_l2(ref_n, ref_20) > 4 * FP32_REL_L2_MAX:
         for repeat, o in enumerate(out["outs"]):
             assert _rel_l2(o["dfn"], ref_n) < _rel_l2(o["dfn"], ref_20), (
-                f"dfn at sinkhorn_iters={iters} launch {repeat} is nearer the count of 20's"
+                f"dfn at sinkhorn_iters={iters} H={hidden} launch {repeat} is nearer the count of 20's"
             )
 
 
@@ -522,7 +559,19 @@ def test_paths_agree(T: int, iters: int) -> None:
     point, the autograd functions with the statistics saved (the backward path) and replayed (the checkpoint path)
     and the deterministic backward on the same branch give ``dX`` / ``dscale`` / ``dbase`` bitwise and ``dfn`` within
     the bound of one another; the autograd ``U`` / ``Y`` / ``dU`` are bitwise the direct entry points'."""
-    i = _make_inputs(T, seed=SEED + 41)
+    _check_paths(T, iters, HIDDEN)
+
+
+@pytest.mark.parametrize("iters", HIDDEN_COUNTS)
+@pytest.mark.parametrize("T", (129, 2049))
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES[1:], ids=lambda h: f"H{h}")
+def test_paths_agree_at_every_hidden_size(hidden: int, T: int, iters: int) -> None:
+    """``test_paths_agree`` at hidden 5120 and 7168 and the counts 1, 7, 20 and 64."""
+    _check_paths(T, iters, _require_hidden(hidden))
+
+
+def _check_paths(T: int, iters: int, hidden: int) -> None:
+    i = _make_inputs(T, seed=SEED + 41, hidden=hidden)
     U, stats = forward_prepare(
         i["X"], i["fn"], i["scale"], i["base"], sinkhorn_iters=iters
     )
@@ -549,13 +598,13 @@ def test_paths_agree(T: int, iters: int) -> None:
         ("grad_stats", gstats, gstats_det),
     ):
         assert _same_bits(got, want), (
-            f"{name} T={T} sinkhorn_iters={iters}: differs from the deterministic package"
+            f"{name} T={T} sinkhorn_iters={iters} H={hidden}: differs from the deterministic package"
         )
     operands = (i["X"], i["dY"], dB, B, i["fn"], i["scale"], i["base"], stats, gstats)
     direct = backward_finish(*operands, sinkhorn_iters=iters, deterministic=False)
     direct_det = det_backward_finish(*operands, sinkhorn_iters=iters)
     bound = _dfn_bound({**i, "B": B, "dU": dB, "sinkhorn_iters": iters})
-    label = f"T={T} sinkhorn_iters={iters}"
+    label = f"T={T} sinkhorn_iters={iters} H={hidden}"
     _assert_exact(direct, direct_det, f"direct {label} vs deterministic")
     _assert_dfn_within(
         direct[1], direct_det[1], bound, f"dfn direct {label} vs deterministic"
