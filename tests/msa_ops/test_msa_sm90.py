@@ -451,6 +451,118 @@ def test_topk_select_matches_reference_from_inf_validity():
     assert torch.equal(out, _topk_reference(scores, None, 0, 0))
 
 
+def _ragged_proxy_inputs(reqs, width, hq=1, seed=0):
+    """One-head fp8 index cache for ``reqs`` = [(q_len, seqused_k)], queries at
+    the end of each sequence, permuted pages, a page table ``width`` columns wide
+    (a CUDA graph captures vLLM's at max_model_len)."""
+    torch.manual_seed(seed)
+    need = [-(-s // BLK_KV) for _, s in reqs]
+    npages = sum(need) + 4
+    perm = torch.randperm(npages, device="cuda").to(torch.int32)
+    page_table = torch.zeros(len(reqs), width, dtype=torch.int32, device="cuda")
+    o = 0
+    for r, n in enumerate(need):
+        page_table[r, :n] = perm[o : o + n]
+        o += n
+    q_lens = torch.tensor([ql for ql, _ in reqs], device="cuda")
+    cu_q = torch.zeros(len(reqs) + 1, dtype=torch.int32, device="cuda")
+    cu_q[1:] = q_lens.cumsum(0)
+    seqused_k = torch.tensor([s for _, s in reqs], dtype=torch.int32, device="cuda")
+    total_q = int(cu_q[-1])
+    q = (torch.randn(total_q, hq, HEAD_DIM, device="cuda") / 3).to(torch.float8_e4m3fn)
+    k = (torch.randn(npages, 1, BLK_KV, HEAD_DIM, device="cuda") / 3).to(
+        torch.float8_e4m3fn
+    )
+    return q, k, cu_q, page_table, seqused_k, max(need)
+
+
+@sm90_only
+@pytest.mark.parametrize("wide", [False, True], ids=["own-width", "8192-wide"])
+@pytest.mark.parametrize("hq,sq", [(1, 2), (1, 4), (2, 4), (4, 4)])
+def test_proxy_decode_masks_queries_straddling_a_tile_boundary(hq, sq, wide):
+    """MTP decode whose queries straddle a page boundary (seqused_k % 128 < q_len):
+    the earlier queries must not see the later keys of the second-to-last page.
+    The 8192-wide buffer is what a CUDA-graph replay hands the kernel; every
+    column past a sequence's pages must still be -inf."""
+    lens = [129, 2 * BLK_KV + sq - 1, 130, 5000, sq]
+    reqs = [(sq, s) for s in lens]
+    q, k, cu_q, page_table, seqused_k, pages = _ragged_proxy_inputs(reqs, 8192, hq=hq)
+    # Positive queries and large keys at every position some query of the
+    # sequence must not see, so a key leaking past the causal limit becomes
+    # its page's maximum instead of hiding under a larger visible one.
+    q = q.float().abs().to(torch.float8_e4m3fn)
+    kf = k.float()
+    for b, s in enumerate(lens):
+        for p in range(s - sq + 1, s):
+            kf[int(page_table[b, p // BLK_KV]), 0, p % BLK_KV] = 2.0
+    k = kf.to(torch.float8_e4m3fn)
+    width = 8192 if wide else pages
+    out = msa_proxy_score(
+        q,
+        k,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=sq,
+        max_k_tiles=width,
+    )
+    ref = _proxy_prefill_reference(q, k, cu_q, page_table, seqused_k, pages)
+    own = out[:, :pages]
+    finite = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(own), finite)
+    torch.testing.assert_close(own[finite], ref[finite], atol=1e-2, rtol=1e-2)
+    assert bool(torch.isneginf(out[:, pages:]).all())
+
+
+@sm90_only
+@pytest.mark.parametrize("use_fp32_acc", [True, False], ids=["fp32", "f16"])
+def test_proxy_score_mixed_decode_and_prefill_batch(use_fp32_acc):
+    """One scoring call over decodes beside a prefill chunk (a mixed serving step):
+    each sequence scores its own query rows, however short against
+    max_seqlen_q."""
+    reqs = [(4, 129), (4, 3000), (1, 700), (300, 300 + 1100), (4, 9000)]
+    q, k, cu_q, page_table, seqused_k, pages = _ragged_proxy_inputs(reqs, 96)
+    out = msa_proxy_score(
+        q,
+        k,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=300,
+        max_k_tiles=pages,
+        use_fp32_acc=use_fp32_acc,
+    )
+    ref = _proxy_prefill_reference(q, k, cu_q, page_table, seqused_k, pages)
+    finite = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(out), finite)
+    torch.testing.assert_close(out[finite], ref[finite], atol=1e-2, rtol=1e-2)
+
+
+@sm90_only
+@pytest.mark.parametrize("batch", [4, 48])
+def test_topk_select_wide_score_buffer_matches_reference(batch):
+    """Top-k over a max_model_len-wide score buffer whose columns past each
+    token's num_valid_pages are -inf (a CUDA-graph replay): the result is the
+    exact top-k of the token's own extent."""
+    reqs = [(4, 8 * 1024 - 37 * (r % 3)) for r in range(batch)]
+    q, k, cu_q, page_table, seqused_k, pages = _ragged_proxy_inputs(reqs, 8192)
+    scores = msa_proxy_score(
+        q,
+        k,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=4,
+        max_k_tiles=8192,
+    )
+    pos = torch.cat([torch.arange(s - ql, s, device="cuda") for ql, s in reqs])
+    nvp = (pos // BLK_KV + 1).to(torch.int32)
+    out = msa_topk_select(
+        scores, TOPK, num_valid_pages=nvp, force_begin_blocks=0, force_end_blocks=1
+    )
+    assert torch.equal(out, _topk_reference(scores[:, :pages], nvp, 0, 1))
+
+
 @sm90_only
 def test_topk_select_matches_reference_with_valid_pages_and_forced_blocks():
     """Per-token num_valid_pages clamps the candidates; forced sink / window

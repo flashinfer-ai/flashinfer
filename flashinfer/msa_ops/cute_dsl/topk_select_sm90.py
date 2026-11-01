@@ -11,6 +11,8 @@ The compile cache keys on the occupancy-derived CTA geometry, a bounded
 discrete set, so shapes never force a recompile.
 """
 
+import functools
+
 import torch
 import cutlass
 import cutlass.cute as cute
@@ -901,19 +903,38 @@ def _topk_kernel(
     # 1-D view of this thread's own column: index math is one multiply-add
     gcol = mS[(h, None, colr)]
 
+    nvp_c = T
+    fb_c = Int32(0)
+    hi_c = T
+    if cutlass.const_expr(MASK):
+        nvp_c = min(max(mNVP[colr], Int32(0)), T)
+        fb_c = min(FB, nvp_c)
+        fe_c = min(FE, nvp_c - fb_c)
+        hi_c = nvp_c - fe_c
+    # Tiles at or past nvp_c load as NEG_BIG, which the epilogue decodes to
+    # -1 just like an empty slot, so the walk stops there. Under a CUDA graph
+    # the score width is max_model_len's tile count while a token's extent is
+    # its own: reading the -inf tail cost 3-4x the kernel at 8k context.
+    Te = nvp_c
+
     # Tile group w owns t = t00 + j*step, j = 0 .. n-1.
     if cutlass.const_expr(DENSE):
         step = W
-        n = (max(T - w, Int32(0)) + Int32(W - 1)) >> LW
+        n = (max(Te - w, Int32(0)) + Int32(W - 1)) >> LW
         t00 = w
     else:
         step = 1
-        A = (T + Int32(W - 1)) >> LW
+        # Blocks are sized from this column's own extent so that every tile
+        # group shares it; sized from T, a short column fell to group 0 alone.
+        A = (Te + Int32(W - 1)) >> LW
         A = (A + Int32(TL - 1)) & Int32(-TL)
-        n = min(max(T - w * A, Int32(0)), A)
+        n = min(max(Te - w * A, Int32(0)), A)
         t00 = w * A
 
-    Tm1 = T - Int32(1)
+    # Lanes past a group's last tile still issue their register tile's loads;
+    # clamping them to the column's own extent keeps those reads on lines this
+    # column already touches instead of spreading them over the whole width.
+    Tm1 = max(Te - Int32(1), Int32(0))
 
     # The first tile lands straight in the accumulator: against an empty
     # top-16 the fold degenerates to sorting the tile, so its 16 maxima and
@@ -929,14 +950,6 @@ def _topk_kernel(
     # Forced blocks and per-token validity are folded in here rather than
     # biasing max_score in a separate pass: the scores are already in flight,
     # so this costs a few predicated selects and no extra memory traffic.
-    nvp_c = T
-    fb_c = Int32(0)
-    hi_c = T
-    if cutlass.const_expr(MASK):
-        nvp_c = min(max(mNVP[colr], Int32(0)), T)
-        fb_c = min(FB, nvp_c)
-        fe_c = min(FE, nvp_c - fb_c)
-        hi_c = nvp_c - fe_c
     for u in cutlass.range_constexpr(TL):
         ok = Int32(u) < n
         t_u = min(t00 + step * u, Tm1)
@@ -1402,6 +1415,9 @@ def _launch(
     )
 
 
+# Pure in its three ints and the hardware constants, and 40-270 us of Python
+# per evaluation: resolve each geometry once.
+@functools.lru_cache(maxsize=4096)
 def _plan(Hq, T, Nq):
     """Pick the CTA geometry (C columns x W tile groups), the tile walk order
     and the register-tile width TL from hardware costs alone.
