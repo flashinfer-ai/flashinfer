@@ -12,6 +12,8 @@ partials, where the deterministic package rounds each partial.  The output and
 the final state have the deterministic package's bits.  `dv`, `dg`, `dbeta` and the initial-state
 gradient have them too, except where the backward takes the adjoint table
 priced for `dhu_tc2` (see Chain); they then match within the same budgets.
+On `sm_107a` a call may also take a deeper split table (see Chain); the
+outputs that depend on that table then match within the same budgets too.
 
 Both the API and the backend are experimental: no compatibility guarantee.
 SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) are the supported
@@ -120,9 +122,15 @@ priced as the makespan of one CTA per (segment, value head) times the
 when it saves at least 10 us and 5 % of the priced adjoint pass (on `sm_107a`
 at least 2 us, `TC_PLAN_SELECT`), and runs it on `dhu_tc2`; a serial table
 that the two-stream rule groups keeps its form.
-The forward is unchanged.  A different adjoint table changes the bits of the
-backward outputs (other segment boundaries), so the deterministic package's
-bits need its table: pin `scan_config` / `segment_chunks`.  Then one of four
+On `sm_107a` (`CHAIN_PLAN`) each direction may then take a deeper `(64, 1)`
+split table (more segments than the chosen table), priced for the chain that
+runs it (`fwd_ho` for the forward, `dhu_tc2` for the adjoint) with R200 step
+times and fitted split costs, when it saves at least 2 us; a serial table that
+the two-stream rule groups keeps its form, and `sm_100a` / `sm_103a` keep their
+tables.  Elsewhere the forward table is the planner's.  A different table
+changes the bits of the outputs that depend on it (other segment boundaries),
+so the deterministic package's bits need its tables: pin `scan_config` /
+`segment_chunks`.  Then one of four
 tails computes `dq`, `dk`, `dv`, `dg` and `dbeta`.  The device's architecture,
 the call's value-head group `G = HV / H` and its (chunk, value head) CTAs
 select the fastest one measured on B200, GB300 and R200 (the production rows, packs,
