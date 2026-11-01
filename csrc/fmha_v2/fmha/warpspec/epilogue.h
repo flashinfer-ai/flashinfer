@@ -16,6 +16,8 @@
 #include <fmha/traits.h>
 #include <fmha/utils.h>
 
+#include <flashinfer/math.cuh>
+
 #include "fmha/hopper/arrive_wait.h"
 
 namespace fmha {
@@ -984,7 +986,7 @@ struct Tile_o_epilogue_base {
     if (has_attention_sink_) {
       // The global max needs to be scaled by the bmm1 scale if exp2f optimization is enabled.
       if constexpr (EXP2F_OPTIMIZATION) {
-        sum += exp2f(attention_sink_ * M_LOG2E - max * scale_bmm1_f_);
+        sum += exp2f(attention_sink_ * flashinfer::math::log2e_d - max * scale_bmm1_f_);
       } else {
         sum += expf(attention_sink_ - max);
       }
@@ -1156,7 +1158,7 @@ struct Tile_o_epilogue<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
       // applied to sum.
       float quant_scale_in_log2 = log2f(Traits_o::SOFTMAX_FP_QUANT_SCALE);
       if constexpr (EXP2F_OPTIMIZATION) {
-        sum += exp2f(this->attention_sink_ * M_LOG2E - max * this->scale_bmm1_f_ +
+        sum += exp2f(this->attention_sink_ * flashinfer::math::log2e_d - max * this->scale_bmm1_f_ +
                      quant_scale_in_log2);
       } else {
         sum += expf(this->attention_sink_ - max + quant_scale_in_log2);
