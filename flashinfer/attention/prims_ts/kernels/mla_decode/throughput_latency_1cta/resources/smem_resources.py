@@ -2039,9 +2039,17 @@ class SmemKvResource(MlaResource):
             if cutlass.const_expr(reuse_k):
                 # K waits advance independently of releases. Keep its payload
                 # live until the corresponding delayed PV has consumed it.
-                stage_base = self._smem_kv.subview(
-                    self.kv_stage_offset(self.consumer_release_state.index)
-                )
+                stage_idx = self.consumer_release_state.index
+                if cutlass.const_expr(self.cfg.num_ctas_per_head_dim > 1):
+                    # A V split reads its own columns' K slices, which start
+                    # v_head_dim_stages slices per lower V owner into the tile.
+                    v_partition = cta_idx_head_dim_v_for_stage(
+                        self.cta_idx_head_dim_v, stage_info
+                    )
+                    stage_idx = (
+                        stage_idx + v_partition * Int32(self.cfg.v_head_dim_stages)
+                    ) % Int32(self.cfg.kv_stages)
+                stage_base = self._smem_kv.subview(self.kv_stage_offset(stage_idx))
             if cutlass.const_expr(self.cfg.whole_kv_tile):
                 stage_base = stage_base.subview(Int32(k_subtile_idx * 16384))
             v_leading_byte_offset = (
