@@ -21,7 +21,8 @@ program in every arm; ``--no-conv`` leaves it out) followed by the KCP KDA
 step -- with CUDA events, and the slowest rank's time counting for the
 iteration (the boundary of ``benchmarks/bench_cake_kda_det_train_kcp.py``).
 
-Arms (``--arms``), every one the same packed batch split by the same partition:
+Arms (``--arms``), every one the same packed batch split by the same partition
+(``fla_cp``: by FLA's own, which gives every rank the tokens of its shard):
 
 * ``det``: the deterministic package, the objects of
   ``flashinfer.cake_kda_det_train_kcp`` (what ``deterministic=True`` of
@@ -40,7 +41,29 @@ Arms (``--arms``), every one the same packed batch split by the same partition:
   figure of the per-rank work, comparable with ``local``.  The arm fails soft:
   one untimed ``step`` runs on every rank first, and when it raises on any rank
   every rank drops the arm, the report records ``fla_error`` (the first failing
-  rank, the exception type and message) and the other arms go on.
+  rank, the exception type and message) and the other arms go on.  FLA takes
+  the operands as given (``scale=None``, no in-kernel L2 norm, gate or beta
+  sigmoid) with ``safe_gate=True``, its path for gates bounded below (they lie
+  in ``(-5, 0)``; ``--no-fla-safe-gate`` runs its general path instead).
+* ``fla_cp`` (run only when ``--arms`` names it): flash-linear-attention's
+  context-parallel KDA (its ``chunk_kda`` with the ``cp_context`` of
+  ``fla.ops.cp.build_cp_context``, built once) on FLA's own equal-token
+  partition of the same batch, after the KCP convolution of the main arms
+  (the shard's ``x`` on the ``nd`` context): FLA's context-parallel figure of
+  the KCP step (``fla`` stays the per-rank work without the exchange).
+  ``--layout contiguous`` maps to FLA's ``contiguous`` (rank ``r`` holds part
+  ``r`` of ``W``), ``zigzag`` to FLA's ``zigzag`` (parts ``r`` and ``2W-1-r``
+  of ``2W`` as ``[front; back]``, the assignment of the bench's zigzag); FLA's
+  equal parts are then the partition's near-equal ones, so every rank holds
+  the tokens of its Cake shard, in the same order.  The operands are those of
+  ``fla``, sliced from the whole batch.  It is dropped on every rank, with the
+  reason in ``fla_cp_error``, with ``zigzag_per_document``, when ``seqlen`` is
+  not a multiple of ``W`` (contiguous) / ``2W`` (zigzag), when ``fla.ops.cp``
+  is missing, and like ``fla`` when an untimed ``step`` raises on a rank: first
+  one on a one-rank group per rank (every kernel of FLA's step compiles there,
+  those FLA runs on some ranks only included), then one with the exchange.  A
+  failure inside the exchange itself can differ by rank: it leaves the ranks'
+  collectives unpaired and aborts the run.
 
 Boundaries (``--boundaries``): ``fwd`` the forward with autograd recording;
 ``bwd`` the backward of a forward run untimed before it; ``step`` forward +
@@ -51,11 +74,12 @@ backward (the deterministic benchmark's boundary); ``ckpt``
 Protocol, per boundary: one untimed call per arm (the JIT builds and the first
 exchanges happen here) and one probe call per arm (peak memory), then
 ``--groups`` groups (at least 3); in every group the arms run in the order
-det, nd, control, control, nd, det (palindromic), then the optional arms; every
-visit takes ``--warmup`` untimed and ``--samples`` timed iterations (at least
-8), each after an L2 flush, a device synchronize and a barrier; the figure of
-an arm in a group is the median of its timed iterations over its visits, the
-figure of an arm is the median over the groups.  The report gives, per
+det, nd, control, fla_cp, fla_cp, control, nd, det (palindromic; ``fla_cp``
+when it runs), then the other optional arms; every visit takes ``--warmup``
+untimed and ``--samples`` timed iterations (at least 8), each after an L2
+flush, a device synchronize and a barrier; the figure of an arm in a group is
+the median of its timed iterations over its visits, the figure of an arm is
+the median over the groups.  The report gives, per
 boundary and arm, the group medians, the overall median, p10 / p90 of the
 samples, tokens per second and the probe's peak memory (the largest over the
 ranks); the ratios ``det / nd`` (above 1: the non-deterministic arm is faster)
@@ -66,11 +90,13 @@ Before the timing, one ``step`` of ``det`` and one of ``nd`` on the same shard
 are compared: ``out``, ``dq``, ``dk``, ``dv``, ``dbeta`` (and ``y``, ``dx``,
 ``dweight`` with the convolution) must be bitwise equal; ``dg`` differs by FP32
 rounding on the ranks whose backward runs the ``S1`` pair (its rel-RMS and
-max-abs difference are reported).  The report also lists, per rank, the local
-backward records (``dqkg`` and ``glm_intra`` on the replay path) the plan of
-each package selects.  Rank 0 prints the table and writes ``--json``.  The exit
-status is 0 when every boundary's control ratio is in band and its drift is at
-most 2 %, and the bitwise comparison holds.
+max-abs difference are reported).  With ``fla_cp``, one untimed forward of it
+and of ``det`` compares ``out`` in global token order (``fla_cp_out``: rel-RMS
+and max-abs difference, recorded only).  The report also lists, per rank, the
+local backward records (``dqkg`` and ``glm_intra`` on the replay path) the plan
+of each package selects.  Rank 0 prints the table and writes ``--json``.  The
+exit status is 0 when every boundary's control ratio is in band and its drift
+is at most 2 %, and the bitwise comparison holds.
 
 Example::
 
@@ -89,6 +115,7 @@ import statistics
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -127,7 +154,7 @@ from flashinfer.experimental.cake_kda_train_kcp import (  # noqa: E402
 )
 from tests.test_helpers.cake_kda_det_train_reference import make_inputs  # noqa: E402
 
-ARMS = ("det", "nd", "control", "local", "fla")
+ARMS = ("det", "nd", "control", "local", "fla", "fla_cp")
 MAIN_ARMS = ("det", "nd", "control")
 BOUNDARIES = ("fwd", "bwd", "step", "ckpt")
 CONTROL_BAND = (0.98, 1.02)
@@ -181,8 +208,9 @@ def _fragment_key(part) -> list[list[tuple[int, int, int]]]:
 
 
 def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
-    """The whole batch on the CPU (every rank draws the same tensors), this rank's shard on the device, and one
-    partition and context per package (the two partitions must give every rank the same fragments)."""
+    """The whole batch on the CPU (every rank draws the same tensors; with the ``fla_cp`` arm its KDA operands stay
+    as ``global`` for FLA's partition), this rank's shard on the device and its fragments, and one partition and
+    context per package (the two partitions must give every rank the same fragments)."""
     lengths = split_docs(args.seqlen, args.docs)
     inputs = make_inputs(
         lengths, args.heads, device="cpu", seed=args.seed, with_dout=True
@@ -221,15 +249,20 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
     for f in fragments:
         local_cu.append(local_cu[-1] + f.length)
     local["cu_seqlens"] = torch.tensor(local_cu, dtype=torch.int32, device=device)
-    return {
+    problem: dict[str, Any] = {
         "lengths": lengths,
         "cu": cu,
         "ctx": ctx,
         "weight": weight,
         "local": local,
+        "fragments": fragments,
         "tokens_local": int(local["q"].shape[0]),
         "tokens_total": args.seqlen,
+        "fla_safe_gate": not args.no_fla_safe_gate,
     }
+    if "fla_cp" in args.arms:
+        problem["global"] = {name: inputs[name] for name in (*INPUTS, "dout")}
+    return problem
 
 
 def _leaves(problem: dict[str, Any]) -> tuple[torch.Tensor, ...]:
@@ -275,6 +308,128 @@ def _fla_arm(problem: dict[str, Any], conv: bool, device: torch.device):
     return fla_chunk_kda, None
 
 
+def _first_error(error: str | None) -> str | None:
+    """The first failing rank's ``error`` (``"rank r: ..."``) of an all-gather over the ranks, ``None`` if none."""
+    errors: list[Any] = [None] * dist.get_world_size()
+    dist.all_gather_object(errors, error)
+    return next((f"rank {r}: {e}" for r, e in enumerate(errors) if e is not None), None)
+
+
+def _fla_cp_arm(args, problem: dict[str, Any], conv: bool, device: torch.device):
+    """``(chunk_kda, view, fla_cp_error)`` of the ``fla_cp`` arm.  ``view`` is the arm's problem: this rank's buffer
+    of FLA's equal-token partition (rank ``r`` holds part ``r`` of ``W``, or parts ``r`` and ``2W-1-r`` of ``2W`` as
+    ``[front; back]`` with ``zigzag``) sliced from the whole batch (``problem["global"]``, released here), ``dout``
+    alike, the context of ``fla.ops.cp.build_cp_context`` built once, its local ``cu_seqlens`` and the global row of
+    every local row (the convolution's ``x``, ``dy``, weight and context stay the shard's).  The arm is dropped
+    (``chunk_kda`` and ``view`` are ``None``) with the reason as ``fla_cp_error``: with a layout without an FLA
+    counterpart or a ``seqlen`` FLA's parts do not divide (read from the arguments, the same on every rank); when the
+    import or the context fails on a rank, then when an untimed ``step`` raises on one (each outcome all-gathered, as
+    for ``fla``): first on a context of a one-rank group per rank that makes the rank neither first nor last with no
+    rank to merge, so that every kernel of FLA's step compiles on every rank before an exchange (FLA runs some on some
+    ranks only: the first rank merges no carried state, the last exports none); then with the exchange, which runs
+    only when every rank holds the arm and whose own failures can differ by rank (the collectives are then unpaired
+    and the run aborts)."""
+    batch = problem.pop("global")
+    world, rank = dist.get_world_size(), dist.get_rank()
+    parts = {"contiguous": world, "zigzag": 2 * world}.get(args.layout)
+    if parts is None:
+        return (
+            None,
+            None,
+            f"layout {args.layout!r} has no FLA counterpart (FLA cuts 'contiguous' or 'zigzag')",
+        )
+    if args.seqlen % parts:
+        return (
+            None,
+            None,
+            f"seqlen {args.seqlen} is not a multiple of {parts}, the equal parts of FLA's {args.layout!r} layout",
+        )
+    error = None
+    try:
+        from fla.ops.cp import build_cp_context  # type: ignore
+    except Exception as exc:  # noqa: BLE001 -- any import failure means FLA's context parallelism is absent
+        error = f"fla.ops.cp unavailable: {type(exc).__name__}: {exc}"
+    fla_chunk_kda = _fla_chunk_kda()
+    if error is None and fla_chunk_kda is None:
+        error = "fla.ops.kda.chunk_kda unavailable"
+    view = None
+    if error is None:
+        try:
+            length = args.seqlen // parts
+            pieces = (rank,) if parts == world else (rank, parts - 1 - rank)
+            spans = [(i * length, (i + 1) * length) for i in pieces]
+            cu_cpu = torch.tensor(problem["cu"], dtype=torch.int32)
+            cp_ctx = build_cp_context(
+                cu_cpu.to(device),
+                dist.group.WORLD,
+                cu_seqlens_cpu=cu_cpu,
+                layout=args.layout,
+            )
+            tokens = length * len(pieces)
+            if int(cp_ctx.cu_seqlens_cpu[-1]) != tokens:
+                raise RuntimeError(
+                    f"FLA's context holds {int(cp_ctx.cu_seqlens_cpu[-1])} local tokens, its parts {tokens}"
+                )
+            # x, dy, the weight and the nd context stay the shard's: the convolution
+            # is the main arms' program
+            local = dict(problem["local"])
+            for name in (*INPUTS, "dout"):
+                local[name] = torch.cat([batch[name][s:e] for s, e in spans]).to(device)
+            local["cu_seqlens"] = cp_ctx.cu_seqlens
+            view = {
+                **problem,
+                "ctx": {**problem["ctx"], "fla_cp": cp_ctx},
+                "local": local,
+                "rows": torch.cat([torch.arange(s, e) for s, e in spans]).to(device),
+                "tokens_local": tokens,
+            }
+        except Exception as exc:  # noqa: BLE001 -- any failure of the optional arm drops it
+            error = f"{type(exc).__name__}: {exc}"
+    error = _first_error(error)
+    if error is None:
+        # FLA runs some kernels of its step on some ranks only, so a failure to compile
+        # one would come at different points of the exchange and unpair the ranks'
+        # collectives: one untimed step without the convolution on a one-rank group,
+        # every rank neither first nor last with no rank to merge, compiles and tunes
+        # all of them on every rank first
+        try:
+            solo, _ = dist.new_subgroups(group_size=1)
+            alone = replace(
+                view["ctx"]["fla_cp"],
+                group=solo,
+                is_first_rank=False,
+                is_last_rank=False,
+                pre_num_ranks=0,
+                post_num_ranks=0,
+                is_first_by_part=(False, False),
+                is_last_by_part=(False, False),
+                pre_num_ranks_by_part=(0, 0),
+                post_num_ranks_by_part=(0, 0),
+            )
+            warm = {**view, "ctx": {**view["ctx"], "fla_cp": alone}}
+            setup, timed = _step(
+                _forward("fla_cp", warm, False, fla_chunk_kda), warm, "step"
+            )
+            timed(setup())
+            torch.cuda.synchronize(device)
+        except Exception as exc:  # noqa: BLE001 -- any failure of the optional arm drops it
+            error = f"{type(exc).__name__}: {exc}"
+        error = _first_error(error)
+    if error is None:
+        try:
+            setup, timed = _step(
+                _forward("fla_cp", view, conv, fla_chunk_kda), view, "step"
+            )
+            timed(setup())
+            torch.cuda.synchronize(device)
+        except Exception as exc:  # noqa: BLE001 -- any failure of the optional arm drops it
+            error = f"{type(exc).__name__}: {exc}"
+        error = _first_error(error)
+    if error is not None:
+        return None, None, error
+    return fla_chunk_kda, view, None
+
+
 def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
     """The module forward of ``arm``: ``(x, weight, q, k, v, g, beta) -> (y or None, out)``."""
     cu = problem["local"]["cu_seqlens"]
@@ -299,13 +454,31 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
             return y, chunk_kda(q, k, v, g, beta, cu, deterministic=False)
 
     elif arm == "fla":
+        safe_gate = problem["fla_safe_gate"]
 
         def fwd(x, w, q, k, v, g, beta):
             y = cake_causal_conv1d(x, w, cu) if conv else None
             out, _ = fla_chunk_kda(
                 *(t.unsqueeze(0) for t in (q, k, v, g, beta)),
                 scale=None,
+                safe_gate=safe_gate,
                 cu_seqlens=cu,
+            )
+            return y, out.squeeze(0)
+
+    elif arm == "fla_cp":
+        ctx, cp_ctx = problem["ctx"]["nd"], problem["ctx"]["fla_cp"]
+        safe_gate = problem["fla_safe_gate"]
+
+        def fwd(x, w, q, k, v, g, beta):
+            # the convolution of the main arms on the shard, FLA's KDA on its own
+            # partition (its cu_seqlens are the context's)
+            y = cake_causal_conv1d_kcp(x, w, ctx) if conv else None
+            out, _ = fla_chunk_kda(
+                *(t.unsqueeze(0) for t in (q, k, v, g, beta)),
+                scale=None,
+                safe_gate=safe_gate,
+                cp_context=cp_ctx,
             )
             return y, out.squeeze(0)
 
@@ -443,6 +616,39 @@ def _agreement(
     }
 
 
+def _fla_cp_agreement(
+    problem: dict[str, Any], view: dict[str, Any], fwd, device: torch.device
+) -> dict[str, float]:
+    """One untimed forward of ``fla_cp`` and of ``det``: ``fla_cp``'s ``out`` gathered in global token order (every
+    rank writes its rows at their global positions in a zero buffer, summed over the ranks: exact, one rank writes
+    each row) against ``det``'s at the global positions of every rank's fragments; the rel-RMS and max-abs difference
+    over the batch."""
+    with torch.no_grad():
+        _, out = fwd(*_leaves(view))
+        _, ref = _forward("det", problem, False)(*_leaves(problem))
+    full = out.new_zeros((problem["tokens_total"], *out.shape[1:]))
+    full[view["rows"]] = out
+    dist.all_reduce(full, op=dist.ReduceOp.SUM)
+    rows = _shard(
+        torch.arange(problem["tokens_total"]), problem["cu"], problem["fragments"]
+    )
+    a = ref.double()
+    diff = full[rows.to(device)].double() - a
+    sums = torch.stack([(diff * diff).sum(), (a * a).sum()])
+    dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+    max_abs = (
+        diff.abs().max()
+        if diff.numel()
+        else torch.zeros((), dtype=torch.float64, device=device)
+    )
+    max_abs = max_abs.reshape(1).clone()
+    dist.all_reduce(max_abs, op=dist.ReduceOp.MAX)
+    return {
+        "rel_rms": float((sums[0] / sums[1].clamp_min(1e-300)).sqrt().item()),
+        "max_abs": float(max_abs.item()),
+    }
+
+
 def _local_records(
     problem: dict[str, Any], heads: int, device: torch.device
 ) -> list[dict[str, Any]]:
@@ -494,8 +700,9 @@ def run_boundary(
     torch.cuda.synchronize(device)
     dist.barrier()
     memory = {arm: _probe_memory(steps[arm], device) for arm in arms}
-    main = [arm for arm in MAIN_ARMS if arm in steps]
-    order = main + main[::-1] + [arm for arm in arms if arm not in MAIN_ARMS]
+    # fla_cp, nd's context-parallel baseline, joins the palindrome of the main arms
+    main = [arm for arm in (*MAIN_ARMS, "fla_cp") if arm in steps]
+    order = main + main[::-1] + [arm for arm in arms if arm not in main]
     per_group: dict[str, list[float]] = {arm: [] for arm in arms}
     raw: dict[str, list[list[float]]] = {arm: [] for arm in arms}
     for _ in range(args.groups):
@@ -543,20 +750,33 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
     fla_chunk_kda, fla_error = (
         _fla_arm(problem, conv, device) if "fla" in args.arms else (None, None)
     )
+    fla_cp_chunk_kda, fla_cp_problem, fla_cp_error = (
+        _fla_cp_arm(args, problem, conv, device)
+        if "fla_cp" in args.arms
+        else (None, None, None)
+    )
+    kda = {"fla": fla_chunk_kda, "fla_cp": fla_cp_chunk_kda}
     arms = [
         arm
         for arm in ARMS
-        if arm in args.arms and (arm != "fla" or fla_chunk_kda is not None)
+        if arm in args.arms and (arm not in kda or kda[arm] is not None)
     ]
-    forwards = {arm: _forward(arm, problem, conv, fla_chunk_kda) for arm in arms}
+    # the fla_cp arm runs on its own view of the batch (FLA's partition and context)
+    problems = {arm: fla_cp_problem if arm == "fla_cp" else problem for arm in arms}
+    forwards = {arm: _forward(arm, problems[arm], conv, kda.get(arm)) for arm in arms}
     agreement = _agreement(problem, conv, device)
+    agreement["fla_cp_out"] = (
+        _fla_cp_agreement(problem, fla_cp_problem, forwards["fla_cp"], device)
+        if "fla_cp" in forwards
+        else None
+    )
     records = _local_records(problem, args.heads, device)
     boundaries = {
         boundary: run_boundary(
             args,
             problem,
             boundary,
-            {arm: _step(forwards[arm], problem, boundary) for arm in arms},
+            {arm: _step(forwards[arm], problems[arm], boundary) for arm in arms},
             device,
         )
         for boundary in args.boundaries
@@ -592,6 +812,7 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
             "heads": args.heads,
             "channels": args.channels,
             "conv": conv,
+            "fla_safe_gate": problem["fla_safe_gate"],
             "layout": args.layout,
             "world_size": world,
             "arms": arms,
@@ -602,6 +823,7 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
             "seed": args.seed,
         },
         "fla_error": fla_error,
+        "fla_cp_error": fla_cp_error,
         "bytes": nbytes,
         "agreement": agreement,
         "local_records": records,
@@ -641,6 +863,13 @@ def _print(report: dict[str, Any]) -> None:
         print(f"  rank {rank} ({rec['arch']}): det {rec['det']}  nd {rec['nd']}")
     if report["fla_error"]:
         print(f"  fla arm dropped: {report['fla_error'][:200]}")
+    if report["fla_cp_error"]:
+        print(f"  fla_cp arm dropped: {report['fla_cp_error'][:200]}")
+    if agree["fla_cp_out"] is not None:
+        print(
+            f"  fla_cp vs det: out rel_rms={agree['fla_cp_out']['rel_rms']:.3e} "
+            f"max_abs={agree['fla_cp_out']['max_abs']:.3e}"
+        )
     for boundary, res in report["boundaries"].items():
         print(f"  [{boundary}]")
         for arm, row in res["arms"].items():
@@ -675,6 +904,11 @@ def main() -> int:
         help="time the KDA step alone (no causal convolution before it)",
     )
     parser.add_argument(
+        "--no-fla-safe-gate",
+        action="store_true",
+        help="run FLA's chunk_kda (fla, fla_cp) without safe_gate, on its general path",
+    )
+    parser.add_argument(
         "--layout",
         default="contiguous",
         choices=("contiguous", "zigzag", "zigzag_per_document"),
@@ -691,7 +925,13 @@ def main() -> int:
     parser.add_argument(
         "--warmup", type=int, default=2, help="untimed iterations per visit"
     )
-    parser.add_argument("--arms", nargs="+", default=list(ARMS), choices=ARMS)
+    parser.add_argument(
+        "--arms",
+        nargs="+",
+        default=[arm for arm in ARMS if arm != "fla_cp"],
+        choices=ARMS,
+        help="arms to time (default: all but fla_cp, which runs only when named)",
+    )
     parser.add_argument("--seed", type=int, default=20261021)
     parser.add_argument(
         "--json", type=str, default=None, help="rank 0 writes the report here"
