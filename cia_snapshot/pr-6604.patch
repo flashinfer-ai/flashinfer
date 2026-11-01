@@ -1,0 +1,2550 @@
+diff --git a/benchmarks/README.md b/benchmarks/README.md
+index bd311c8c064..e8795cef245 100644
+--- a/benchmarks/README.md
++++ b/benchmarks/README.md
+@@ -100,7 +100,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
+ - Mamba (Selective State Space Models):
+     - `selective_state_update` - Selective state update for Mamba layers (generation phase). Supports both single-token prediction (STP) and multi-token prediction (MTP) via `--cache_steps`. Backends: `flashinfer` (CUDA, architecture-specific kernels for base/SM90/SM100+) and `triton` (reference).
+ - GDN (Gated Delta Net linear attention, SM90+):
+-    - `gated_delta_rule_decode` - Single-token (T=1) gated delta rule decode. `--state_layout` selects between `gated_delta_rule_decode_pretranspose` ([B, HV, V, K] state, default) and `gated_delta_rule_decode` ([B, HV, K, V] state). `--state_dtype bfloat16` selects the BF16 state kernels (head_size=128, pretranspose only). Backends: `flashinfer` (CuTe-DSL) and `triton` (reference).
++    - `gated_delta_rule_decode` - Single-token (T=1) gated delta rule decode. `--state_layout` selects between `gated_delta_rule_decode_pretranspose` ([B, HV, V, K] state, default) and `gated_delta_rule_decode` ([B, HV, K, V] state). `--state_dtype bfloat16` selects the BF16 state kernels (head_size=128, pretranspose only). Backends: `flashinfer` (CuTe-DSL, generic kernels), `triton` (reference), `rubin` (the Rubin-tuned T=1 bf16-state kernel; SM107 only) and `rubin_ugpu` (`rubin` with uGPU localization: a `ugpu_state_pool`, each die updates the half of every state in its own memory).
+     - `gated_delta_rule_mtp` - Multi-token (T>=2) gated delta rule for speculative-decoding verification, with a state pool + indices. `--state_dtype float32` uses `gated_delta_rule_mtp`; `--state_dtype bfloat16` uses the BF16 MTP kernel via `gated_delta_rule_decode_pretranspose`. Backends: `flashinfer`, `triton`.
+     - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences (uniform per-sequence length `--s_qo`). Backends: `flashinfer` (SM90 C++ / SM100 CuTe-DSL) and `fla` (flash-linear-attention Triton baseline, perf-only).
+ - KDA (SM120a):
+@@ -544,7 +544,7 @@ Applies to `gated_delta_rule_decode`, `gated_delta_rule_mtp`, and `chunk_gated_d
+ | `--update_state`              | MTP only: write the final state back (`disable_state_update=False`). BF16 state always updates in-place    |
+ | `--cache_intermediate_states` | MTP with `float32` state only: cache per-token intermediate states                                         |
+ | `--no_qk_l2norm`              | Decode/MTP: disable in-kernel Q/K L2 normalization                                                         |
+-| `--backends`                  | Decode/MTP: `flashinfer` (default), `triton`. Prefill: `flashinfer` (default), `fla` (requires `pip install flash-linear-attention`; perf-only, excluded from refcheck) |
++| `--backends`                  | Decode/MTP: `flashinfer` (default), `triton`; decode with `--state_dtype bfloat16` also `rubin` and `rubin_ugpu` (SM107). Prefill: `flashinfer` (default), `fla` (requires `pip install flash-linear-attention`; perf-only, excluded from refcheck) |
+ 
+ Notes:
+ - Refcheck compares against the torch reference in `tests/gdn/reference_delta_rule.py`.
+diff --git a/benchmarks/routines/flashinfer_benchmark_utils.py b/benchmarks/routines/flashinfer_benchmark_utils.py
+index 4dadfb48507..6eea85c81c3 100644
+--- a/benchmarks/routines/flashinfer_benchmark_utils.py
++++ b/benchmarks/routines/flashinfer_benchmark_utils.py
+@@ -1200,7 +1200,7 @@ def dtype_str_to_torch_dtype(dtype_str):
+         "9.0": ["flashinfer", "triton"],
+         "10.0": ["flashinfer", "triton"],
+         "10.3": ["flashinfer", "triton"],
+-        "10.7": ["flashinfer", "triton"],
++        "10.7": ["flashinfer", "triton", "rubin", "rubin_ugpu"],
+         "11.0": ["triton"],
+         "12.0": ["triton"],
+         "12.1": ["triton"],
+diff --git a/benchmarks/routines/gdn.py b/benchmarks/routines/gdn.py
+index fe23f3a943a..826b2bfcb46 100644
+--- a/benchmarks/routines/gdn.py
++++ b/benchmarks/routines/gdn.py
+@@ -216,9 +216,14 @@ def parse_gdn_args(line, parser):
+         required=False,
+         nargs="+",
+         default=["flashinfer"],
+-        choices=["flashinfer", "triton", "fla"],
++        choices=["flashinfer", "triton", "fla", "rubin", "rubin_ugpu"],
+         help="Kernel backends to benchmark. 'triton' is available for "
+-        "decode/MTP; 'fla' (flash-linear-attention) for prefill.",
++        "decode/MTP; 'fla' (flash-linear-attention) for prefill; 'rubin' "
++        "(the Rubin-tuned T=1 kernel, SM107 only) for decode with bfloat16 "
++        "state; 'rubin_ugpu' is 'rubin' with uGPU localization (a "
++        "ugpu_state_pool: each die updates the half of every state in its own "
++        "memory). On decode, "
++        "'flashinfer' is the generic FlashInfer kernel.",
+     )
+ 
+     args = parser.parse_args(line)
+@@ -291,8 +296,19 @@ def parse_gdn_args(line, parser):
+             raise ValueError(
+                 "The fla backend is only available for chunk_gated_delta_rule"
+             )
++        if any(x in args.backends for x in ("rubin", "rubin_ugpu")) and (
++            is_mtp or args.state_dtype != "bfloat16"
++        ):
++            raise ValueError(
++                "The rubin / rubin_ugpu backends are only available for "
++                "gated_delta_rule_decode with --state_dtype bfloat16"
++            )
+ 
+     if is_prefill:
++        if any(x in args.backends for x in ("rubin", "rubin_ugpu")):
++            raise ValueError(
++                "The rubin backend is only available for gated_delta_rule_decode"
++            )
+         if "triton" in args.backends:
+             raise ValueError(
+                 "The triton backend is only available for decode/MTP routines; "
+@@ -554,6 +570,19 @@ def _testGdnDecodeLike(args, seq_len):
+     state_writeback = True if (not is_mtp or use_bf16_state) else args.update_state
+     disable_state_update = not state_writeback
+ 
++    # uGPU localization: a copy of the pool in the [pool, HV, 2, V/2, K] layout whose
++    # halves live in the two dies' memory
++    ugpu_pool = None
++    if "rubin_ugpu" in backends:
++        from flashinfer.gdn_decode import ugpu_state_pool
++
++        ugpu_pool = ugpu_state_pool(pool_size, num_sab_heads, head_size, device)
++
++        def to_ugpu(src):
++            ugpu_pool.copy_(src.view(pool_size, num_sab_heads, 2, -1, head_size))
++
++        to_ugpu(state_pool)
++
+     if args.verbose >= 2:
+         print(f"[VVERBOSE] Mode: {'MTP' if is_mtp else 'decode'} (T={T})")
+         print(f"[VVERBOSE] {q.shape = }, {q.dtype = }")
+@@ -606,6 +635,8 @@ def run_backend(backend, state):
+             # BF16 state always goes through the pool path with pre-allocated
+             # indices: the non-pool API path synthesizes an arange index
+             # tensor per call, whose tiny kernel would pollute CUPTI timing.
++            # backend="flashinfer": the generic kernel, also on SM107 where
++            # "auto" would pick the Rubin-tuned one (see the "rubin" backend).
+             if pool_split or use_bf16_state:
+                 return gated_delta_rule_decode_pretranspose(
+                     q,
+@@ -622,9 +653,61 @@ def run_backend(backend, state):
+                     initial_state=state,
+                     initial_state_indices=initial_state_indices,
+                     output_state_indices=output_state_indices,
++                    backend="flashinfer",
+                 )[0]
+             return gated_delta_rule_decode_pretranspose(
+-                q, k, v, state, A_log, a, dt_bias, b, scale, output, use_qk_l2norm
++                q,
++                k,
++                v,
++                state,
++                A_log,
++                a,
++                dt_bias,
++                b,
++                scale,
++                output,
++                use_qk_l2norm,
++                backend="flashinfer",
++            )[0]
++        elif backend == "rubin_ugpu":
++            # Rubin kernel with uGPU localization; refcheck passes a fresh copy of
++            # the pool, timing passes state_pool itself (state then evolves in place)
++            if state is not state_pool:
++                to_ugpu(state)
++            return gated_delta_rule_decode_pretranspose(
++                q,
++                k,
++                v,
++                None,
++                A_log,
++                a,
++                dt_bias,
++                b,
++                scale,
++                output,
++                use_qk_l2norm,
++                initial_state=ugpu_pool,
++                initial_state_indices=initial_state_indices,
++                output_state_indices=output_state_indices,
++            )[0]
++        elif backend == "rubin":
++            # Rubin-tuned T=1 bf16-state kernel (SM107), via the public API
++            return gated_delta_rule_decode_pretranspose(
++                q,
++                k,
++                v,
++                None,
++                A_log,
++                a,
++                dt_bias,
++                b,
++                scale,
++                output,
++                use_qk_l2norm,
++                initial_state=state,
++                initial_state_indices=initial_state_indices,
++                output_state_indices=output_state_indices,
++                backend="rubin",
+             )[0]
+         elif backend == "triton":
+             if is_mtp:
+diff --git a/docs/api/gdn_decode.rst b/docs/api/gdn_decode.rst
+index e02751bacb2..eccb669452b 100644
+--- a/docs/api/gdn_decode.rst
++++ b/docs/api/gdn_decode.rst
+@@ -17,6 +17,32 @@ recurrent gated delta-rule update for the current decode step.
+     gated_delta_rule_mtp
+     gated_delta_rule_replayssm_commit
+ 
++Rubin T=1 bf16-state decode (SM107)
++-----------------------------------
++
++On Rubin (compute capability 10.7), ``gated_delta_rule_decode_pretranspose``
++routes T=1 calls with a bfloat16 state, K=V=128 and ``B * HV >= 512`` to a
++Rubin-tuned kernel under ``backend="auto"``. It requests each 64-row state tile
++at once into shared memory, prefetches a later tile into L2 and issues fewer
++instructions; outputs and the updated state are bitwise equal to the generic
++kernel. ``backend="rubin"`` forces it (any batch size, Rubin only) and
++``backend="flashinfer"`` keeps the generic kernel.
++
++uGPU localization: Rubin is built from two dies, each with its own SMs and
++memory. Allocate the state pool with :func:`ugpu_state_pool` (layout
++``[pool_size, HV, 2, V // 2, K]``, half ``t`` of every state in die ``t``'s
++memory) and a T=1 call on Rubin runs half ``t`` on die ``t``'s SMs, so no
++state byte crosses the die-to-die link, whatever the batch order or slot
++indices. Results are bitwise equal to the one-launch kernel. This targets
++CUDA-graph captured decode (make one eager call before capture, which creates
++the per-die green contexts); eager calls with ``B * HV < 8192`` are host-bound
++and run the two halves back to back on the current stream.
++
++.. autosummary::
++    :toctree: ../generated
++
++    ugpu_state_pool
++
+ ReplaySSM speculative verification (SM100/SM103)
+ ---------------------------------------------
+ 
+diff --git a/docs/api/green_ctx.rst b/docs/api/green_ctx.rst
+index 63fa5bc8e8c..31ff9356002 100644
+--- a/docs/api/green_ctx.rst
++++ b/docs/api/green_ctx.rst
+@@ -15,3 +15,17 @@ Green context creation
+ 
+     split_device_green_ctx
+     split_device_green_ctx_by_sm_count
++
++uGPU localization (multi-die GPUs)
++----------------------------------
++
++On GPUs built from several dies (Rubin), each die is a locality domain with its own SMs
++and memory. A kernel on a domain's green-context stream that reads memory placed in that
++domain keeps its DRAM traffic off the die-to-die link.
++
++.. autosummary::
++    :toctree: ../generated
++
++    get_locality_domain_count
++    split_device_green_ctx_by_locality_domain
++    empty_per_locality_domain
+diff --git a/flashinfer/gdn_decode.py b/flashinfer/gdn_decode.py
+index 272c90536a2..5a43a41ef71 100644
+--- a/flashinfer/gdn_decode.py
++++ b/flashinfer/gdn_decode.py
+@@ -28,12 +28,14 @@
+ - gated_delta_rule_replayssm_commit: Commit the accepted ReplaySSM prefix
+ """
+ 
++import functools
+ import os
+ from typing import Literal, Optional, Tuple
+ 
+ import torch
+ 
+ from .jit.core import logger
++from .utils import get_compute_capability
+ 
+ try:
+     from .jit import cake_gdn as _cake_gdn
+@@ -78,6 +80,128 @@ def flashinfer_api(func=None, *, trace=None):  # type: ignore[misc]
+     _gated_delta_rule_bf16_state = None
+     _gated_delta_rule_bf16_state_mtp = None
+ 
++# Rubin (SM107) T=1 BF16 state kernel - optional backend
++try:
++    from .gdn_kernels.gdn_decode_bf16_state_rubin import (
++        gated_delta_rule_t1_rubin as _gated_delta_rule_t1_rubin,
++    )
++
++    _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE = True
++except (ImportError, RuntimeError):
++    _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE = False
++    _gated_delta_rule_t1_rubin = None
++
++
++@functools.cache
++def _ugpu_streams(device_index: int):
++    """One green-context stream per locality domain of ``device_index`` and its SM count.
++
++    Cached; the first uGPU call creates them, so make one eager call before CUDA graph capture.
++    """
++    from .green_ctx import split_device_green_ctx_by_locality_domain
++
++    streams, resources = split_device_green_ctx_by_locality_domain(
++        torch.device("cuda", device_index)
++    )
++    return streams, [int(r.sm.smCount) for r in resources]
++
++
++# Eager calls below this many (batch x value-head) states are host-bound: the per-die fork / join
++# costs more host time than the die-local traffic saves, so they run the two halves back to back
++# on the current stream (each over the whole GPU). Under CUDA graph capture the per-die streams
++# are always used: replay has no host cost.
++_UGPU_EAGER_MIN_STATES = 8192
++
++
++@flashinfer_api
++def ugpu_state_pool(
++    pool_size: int,
++    num_v_heads: int,
++    head_size: int = 128,
++    device: Optional[torch.device] = None,
++) -> torch.Tensor:
++    r"""Allocate a bfloat16 GDN state pool for uGPU localization on Rubin.
++
++    Returns an uninitialized pool of shape ``[pool_size, HV, 2, V // 2, K]``
++    (``V = K = head_size``): element ``[s, h, t, r, k]`` is element ``[s, h, t * V // 2 + r,
++    k]`` of the usual ``[pool_size, HV, V, K]`` pool. Half ``t`` of every state lives in
++    locality domain (die) ``t``'s memory. Pass it as ``initial_state`` to
++    :func:`gated_delta_rule_decode_pretranspose`: on Rubin a T=1 call then runs half ``t`` of
++    every state on die ``t``'s SMs, so no state byte crosses the die-to-die link, whatever the
++    batch order and slot indices. That is for CUDA-graph captured decode (make one eager call
++    before capture); eager calls with ``B * HV < 8192`` are host-bound and run both halves
++    back to back on the current stream.
++
++    The pool comes from :func:`flashinfer.green_ctx.empty_per_locality_domain`, outside
++    PyTorch's caching allocator.
++
++    Args:
++        pool_size: Number of state slots.
++        num_v_heads: Number of value heads (HV).
++        head_size: K = V (128).
++        device: CUDA device with two locality domains (default: the current device).
++    """
++    from .green_ctx import empty_per_locality_domain
++
++    device = torch.device(device) if device is not None else torch.device("cuda")
++    parts = empty_per_locality_domain(
++        (pool_size, num_v_heads, head_size // 2, head_size), torch.bfloat16, device
++    )
++    assert parts.shape[0] == 2, "ugpu_state_pool needs exactly two locality domains"
++    return parts.permute(1, 2, 0, 3, 4)
++
++
++def _run_rubin_t1_ugpu(
++    pool: torch.Tensor, v: torch.Tensor, output: torch.Tensor, **kw
++) -> torch.Tensor:
++    """uGPU localization: half t of every state (pool[:, :, t]) on locality domain t's SMs,
++    as two launches of the Rubin T=1 kernel forked from and joined back to the current stream.
++    Each launch is the same kernel on V/2 value rows (rows are independent), so the result is
++    bitwise equal to one launch over the full pool. Small eager calls run the two launches
++    back to back on the current stream instead (see ``_UGPU_EAGER_MIN_STATES``)."""
++    half = v.shape[3] // 2
++    # int32 slot indices once for both launches
++    for name in ("initial_state_indices", "output_state_indices"):
++        if kw.get(name) is not None and kw[name].dtype != torch.int32:
++            kw[name] = kw[name].to(torch.int32)
++    with torch.cuda.device(v.device):  # streams and events of v's device
++        streams, sm_counts = _ugpu_streams(v.device.index)
++        if (
++            v.shape[0] * v.shape[2] < _UGPU_EAGER_MIN_STATES
++            and not torch.cuda.is_current_stream_capturing()
++        ):
++            for domain in range(2):
++                _gated_delta_rule_t1_rubin(
++                    initial_state_source=pool.select(2, domain),
++                    v=v.narrow(3, domain * half, half),
++                    output=output.narrow(3, domain * half, half),
++                    **kw,
++                )
++            return output
++        main = torch.cuda.current_stream()
++        fork = torch.cuda.Event()
++        fork.record(main)
++        joins = []
++        for domain in range(2):
++            stream = streams[domain]
++            stream.wait_event(fork)
++            _gated_delta_rule_t1_rubin(
++                initial_state_source=pool.select(2, domain),
++                v=v.narrow(3, domain * half, half),
++                output=output.narrow(3, domain * half, half),
++                # L2 prefetch distance for this domain's share of the SMs
++                pf_dist=sm_counts[domain] * 25 // 3,
++                stream=stream,
++                **kw,
++            )
++            done = torch.cuda.Event()
++            done.record(stream)
++            joins.append(done)
++        for done in joins:
++            main.wait_event(done)
++    return output
++
++
+ # Pretranspose decode kernel (V-major state, T=1)
+ try:
+     from .gdn_kernels.gdn_decode_pretranspose import run_pretranspose_decode
+@@ -518,7 +642,7 @@ def gated_delta_rule_decode_pretranspose(
+     output_state_indices: Optional[torch.Tensor] = None,
+     intermediate_states_buffer: Optional[torch.Tensor] = None,
+     disable_state_update: bool = False,
+-    backend: Literal["auto", "flashinfer", "cake_gdn"] = "auto",
++    backend: Literal["auto", "flashinfer", "cake_gdn", "rubin"] = "auto",
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     r"""Gated Delta Rule Decode kernel for single-token generation.
+ 
+@@ -558,7 +682,10 @@ def gated_delta_rule_decode_pretranspose(
+         Whether to apply L2 normalization to q and k.  Default: ``True``.
+     initial_state : torch.Tensor, optional
+         State pool of shape ``[pool_size, HV, V, K]`` (K-last /
+-        K-contiguous, same layout as the per-batch ``state`` argument).
++        K-contiguous, same layout as the per-batch ``state`` argument), or a
++        uGPU-localized pool ``[pool_size, HV, 2, V // 2, K]`` from
++        :func:`ugpu_state_pool` (Rubin, T=1): each die then updates the half of
++        every state that lives in its own memory, on its own SMs.
+         When provided, the kernel gathers directly from the pool using
+         ``initial_state_indices`` and writes updates back in-place,
+         eliminating the caller-side gather/scatter overhead.  Requires
+@@ -581,10 +708,16 @@ def gated_delta_rule_decode_pretranspose(
+     disable_state_update : bool
+         Skip final-state writeback for verify calls. Supported only for
+         ``T > 1``. Default: ``False``.
+-    backend : {"auto", "flashinfer", "cake_gdn"}
++    backend : {"auto", "flashinfer", "cake_gdn", "rubin"}
+         ``auto`` selects GDN non-CP only for an exact frozen manifest row and
+-        otherwise uses the existing FlashInfer implementation. Explicit
+-        ``cake_gdn`` requests fail closed when the contract is unsupported.
++        otherwise uses the existing FlashInfer implementation; on Rubin
++        (compute capability 10.7) its T=1 bf16-state calls with
++        ``B * HV >= 512`` use the Rubin-tuned kernel, which gives the same
++        bits as the generic kernel there. ``flashinfer`` always uses the
++        generic FlashInfer kernels. Explicit ``cake_gdn`` requests fail
++        closed when the contract is unsupported. ``rubin`` forces the
++        Rubin-tuned T=1 kernel and raises ``ValueError`` on other GPUs or
++        outside T=1, bfloat16 state and K=V=128.
+ 
+         **Padding / inactive sequences**: set the index to ``-1`` for any
+         batch entry that should be treated as padding.  The two backends
+@@ -616,6 +749,14 @@ def gated_delta_rule_decode_pretranspose(
+     - State layout is v-major (K-last): ``[B, HV, V, K]``.  When state is
+       bfloat16 and ``K = V = 128``, the BF16 state kernel is used (T=1 or
+       MTP for T>1); the pool+indices path routes through the MTP kernel.
++      On SM107 (Rubin), T=1 with ``B * HV >= 512`` uses the Rubin-tuned
++      kernel (``gdn_kernels/gdn_decode_bf16_state_rubin.py``) under
++      ``backend="auto"``. With a pool from :func:`ugpu_state_pool` every
++      T=1 call on Rubin runs each half of every state on its own die (two
++      per-die launches on green-context streams). This targets CUDA-graph
++      captured decode (capturable after one eager call); eager calls with
++      ``B * HV < 8192`` are host-bound and run the two halves back to back
++      on the current stream instead.
+     - Pool+indices (``initial_state`` / ``initial_state_indices``) are
+       supported on both the bf16 fast path (K=V=128) and the float32 legacy
+       path (T=1).  Both paths support ``-1`` padding indices (see
+@@ -650,7 +791,23 @@ def gated_delta_rule_decode_pretranspose(
+             f"got {output_state_indices.dtype}"
+         )
+ 
+-    if use_pool:
++    ugpu_pool = use_pool and initial_state.dim() == 5
++    if ugpu_pool:
++        pool_size = initial_state.shape[0]
++        if (
++            initial_state.shape != (pool_size, HV, 2, V // 2, K)
++            or initial_state.stride(-1) != 1
++        ):
++            raise ValueError(
++                "a 5-D initial_state must be a uGPU pool [pool_size, HV, 2, V // 2, K] "
++                f"(ugpu_state_pool), got shape {tuple(initial_state.shape)}"
++            )
++        if backend not in ("auto", "rubin"):
++            raise ValueError(
++                f'a uGPU pool needs backend "auto" or "rubin", got {backend!r}'
++            )
++        backend = "rubin"
++    elif use_pool:
+         pool_size = initial_state.shape[0]
+         assert initial_state.shape == (pool_size, HV, V, K), (
+             f"Expected initial_state shape [pool_size={pool_size}, HV={HV}, V={V}, K={K}], "
+@@ -669,9 +826,22 @@ def gated_delta_rule_decode_pretranspose(
+ 
+     # Backend: BF16 state kernel when bf16 state, K=V=128
+     state_dtype = initial_state.dtype if use_pool else state.dtype
+-    if backend not in ("auto", "flashinfer", "cake_gdn"):
++    if backend not in ("auto", "flashinfer", "cake_gdn", "rubin"):
+         raise ValueError(f"unsupported GDN backend: {backend!r}")
+-    if backend != "flashinfer":
++    if backend == "rubin":
++        if not _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE:
++            raise RuntimeError("the Rubin GDN decode kernel failed to import")
++        if get_compute_capability(q.device) != (10, 7):
++            raise ValueError(
++                'backend="rubin" needs compute capability 10.7 (Rubin), got '
++                f"{get_compute_capability(q.device)}"
++            )
++        if not (T == 1 and state_dtype == torch.bfloat16 and K == 128 and V == 128):
++            raise ValueError(
++                'backend="rubin" supports T=1 with bfloat16 state and K=V=128, got '
++                f"T={T}, state dtype {state_dtype}, K={K}, V={V}"
++            )
++    if backend not in ("flashinfer", "rubin"):
+         if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
+             if backend == "cake_gdn":
+                 raise RuntimeError("the source-only Cake GDN backend is not installed")
+@@ -739,7 +909,59 @@ def gated_delta_rule_decode_pretranspose(
+         forward_output = (
+             output if (output is not None and output.dtype == torch.bfloat16) else None
+         )
+-        if T == 1:
++        # Rubin (SM107): the Rubin-tuned T=1 kernel. It keeps the whole state tile in
++        # flight with fewer instructions and is bitwise equal to the generic T=1
++        # wide_vec kernel, which the generic dispatcher uses from B * HV >= 512.
++        use_rubin = backend == "rubin" or (
++            backend == "auto"
++            and T == 1
++            and B * HV >= 512
++            and _GDN_DECODE_BF16_STATE_RUBIN_AVAILABLE
++            and get_compute_capability(q.device) == (10, 7)
++        )
++        if ugpu_pool:
++            out = _run_rubin_t1_ugpu(
++                bf16_pool,
++                v,
++                forward_output
++                if forward_output is not None
++                else torch.empty(B, 1, HV, V, device=q.device, dtype=torch.bfloat16),
++                A_log=A_log,
++                a=a,
++                dt_bias=dt_bias,
++                softplus_beta=1.0,
++                softplus_threshold=20.0,
++                q=q,
++                k=k,
++                b=b,
++                initial_state_indices=bf16_indices,
++                output_state_indices=(
++                    None
++                    if output_state_indices is initial_state_indices
++                    else output_state_indices
++                ),
++                use_qk_l2norm_in_kernel=use_qk_l2norm,
++                scale=scale_val,
++            )
++        elif use_rubin:
++            out = _gated_delta_rule_t1_rubin(
++                A_log=A_log,
++                a=a,
++                dt_bias=dt_bias,
++                softplus_beta=1.0,
++                softplus_threshold=20.0,
++                q=q,
++                k=k,
++                v=v,
++                b=b,
++                initial_state_source=bf16_pool,
++                initial_state_indices=bf16_indices,
++                output_state_indices=output_state_indices,
++                use_qk_l2norm_in_kernel=use_qk_l2norm,
++                scale=scale_val,
++                output=forward_output,
++            )
++        elif T == 1:
+             out = _gated_delta_rule_bf16_state(
+                 A_log=A_log,
+                 a=a,
+diff --git a/flashinfer/gdn_kernels/gdn_decode_bf16_state_rubin.py b/flashinfer/gdn_kernels/gdn_decode_bf16_state_rubin.py
+new file mode 100644
+index 00000000000..4fc58b15d64
+--- /dev/null
++++ b/flashinfer/gdn_kernels/gdn_decode_bf16_state_rubin.py
+@@ -0,0 +1,1006 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++"""
++Rubin (SM107) T=1 GDN decode with BF16 state (single-token / STP).
++
++A Rubin-tuned variant of the T=1 wide_vec kernel in ``gdn_decode_bf16_state``
++(``gated_delta_rule_t1_wide_vec``). Math, FMA order and reductions are the same, so outputs and
++the updated state are bitwise equal to that kernel wherever it runs (B * HV >= 512).
++
++Why
++---
++Rubin's DRAM bandwidth is ~2.5x B200's, its instruction issue rate only ~1.8x. The generic kernel
++loads four state rows per thread, waits, computes and repeats, so on Rubin it keeps too few bytes
++in flight (its warps mostly wait on memory) and reaches ~60% of DRAM bandwidth. Requesting the
++whole tile at once fixes the waiting, but the extra bookkeeping instructions then make the kernel
++issue-bound. This kernel keeps the whole tile in flight and trims the instructions around it.
++
++How
++---
++1. Tiles of 64 V-rows (two CTAs per head, ``tile_v=64``, 16 KB each). At entry every thread issues
++   ``cp.async`` for all of its state rows into shared memory, one commit group per 4 rows, and the
++   main loop waits group by group. Thread group g owns rows g, g + 8, ..., so the copy partition
++   and the compute mapping coincide and the state needs no CTA barrier. The write-back goes
++   through the same copy partition.
++2. Each 16-lane group loads and normalizes its own q/k slice (16 B loads) and computes g/beta in
++   registers (no warp-0 precompute, no CTA barrier); a warp fence keeps ptxas from hoisting those
++   loads above the cp.async issue. The v value each lane needs is loaded at entry.
++3. A transpose-reduce sums the four row dot products across the 16-lane group with 5 shuffles
++   instead of 16 (same lane pairing, so the same bits); vn is computed in the lane that holds the
++   reduced dot product and broadcast. All row arithmetic runs as row-pair FFMA2 (two exact FMAs
++   per instruction, per-row order unchanged), and bf16 -> f32 is done by bit placement.
++4. After its stores each CTA prefetches into L2 (evict_last) the state tile and q/k/v/a/b lines of
++   the tile ``pf_dist`` positions ahead (default num_SMs * 25 // 3, about 1.2 residency
++   generations at 7 CTAs/SM), so the CTA that later runs it finds its state in L2.
++The q/k/v/a/b/o strides are compile-time constants of each build (only the batch extent is
++dynamic). Together with 1.-3. this removes ~38% of the warp-instructions of a straightforward
++whole-tile kernel without changing any arithmetic.
++
++Measured on Rubin VR200, B = 512, HQ = HK = 16, HV = 64, K = V = 128 (CUPTI, CUDA graph): 187.0 us
++with the generic kernel, 163.0 us with this one, 132.6 us (85% of the DRAM peak) when each die
++updates the half of every state in its own memory (``flashinfer.gdn_decode.ugpu_state_pool``).
++
++Scope: T = 1, BF16 state ``[pool, HV, V, K]``, K = 128, V = 128 (or 64: one half of a
++``ugpu_state_pool`` state), state update and output. Same arguments and pool / index semantics as
++``gdn_decode_bf16_state.gated_delta_rule`` at T = 1 (single or split read / write indices, -1
++padding redirected to slot 0). Compute capability 10.7 only.
++"""
++
++import math
++from typing import Optional
++
++import cuda.bindings.driver as cuda
++import cutlass
++import cutlass.cute as cute
++import torch
++from cutlass.cute.nvgpu import cpasync
++from cutlass.cute.runtime import from_dlpack
++from cutlass._mlir.dialects import llvm as _llvm
++from cutlass._mlir.dialects import nvvm as _nvvm
++from cutlass.cutlass_dsl import dsl_user_op
++
++from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
++from . import gdn_decode_bf16_state as _generic
++from .cute_dsl_cache_naming import make_kernel_name
++from .device_target import gdn_compile_options, gdn_device_target, target_arch
++from .dtype_compat import as_bf16
++from .gdn_decode_bf16_state import (
++    ELEMS_PER_LANE,
++    ILP_ROWS,
++    LANES_PER_ROW,
++    NUM_GROUPS,
++    NUM_THREADS,
++    _BF16_STATE_COMPILE_OPTS,
++    _dtype_key,
++    _mark_batch_dynamic,
++    _mark_index_dynamic,
++    _mark_slot_dynamic,
++)
++
++
++# Shared memory ahead of the state tile; see gdn_t1_rubin_kernel
++_SMEM_PAD_BYTES = 1040
++
++
++@dsl_user_op
++def _bf16x2_to_f32(w, *, loc=None, ip=None):
++    """bf16x2 word -> (f32 of the low element, f32 of the high element) by bit placement.
++
++    Exactly what cvt.f32.bf16 computes (bf16 is the top half of an f32, NaN payloads kept):
++    lo = w << 16, hi = w & 0xffff0000. One integer op per element instead of ptxas'
++    PRMT + IMAD.U32 for the high half.
++    """
++    wu = cutlass.Uint32(w)
++    lo = wu << cutlass.Uint32(16)
++    hi = wu & cutlass.Uint32(0xFFFF0000)
++    f = cutlass.Float32.mlir_type
++    return (
++        cutlass.Float32(_llvm.bitcast(f, lo.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)),
++        cutlass.Float32(_llvm.bitcast(f, hi.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)),
++    )
++
++
++@cute.jit
++def _xreduce4(x0, x1, x2, x3, lane_in_group):
++    """Sum 4 per-lane values across a 16-lane group with 5 shuffles instead of 16.
++
++    Transpose-reduce: offset-8 and offset-4 stages each exchange half of the remaining
++    values, then offsets 2 and 1 reduce the single survivor. Lane pairing at every stage
++    is the same as the xor-butterfly (lane i adds the partner i^off), so the result is
++    bitwise identical to four independent butterflies. On return the lane holds the sum
++    of value j = 2*bit3(lane) + bit2(lane).
++    """
++    b3 = (lane_in_group & 8) != 0
++    b2 = (lane_in_group & 4) != 0
++    send_a = x0 if b3 else x2
++    send_b = x1 if b3 else x3
++    keep_a = x2 if b3 else x0
++    keep_b = x3 if b3 else x1
++    a = keep_a + cute.arch.shuffle_sync_bfly(
++        send_a, offset=8, mask=-1, mask_and_clamp=31
++    )
++    b = keep_b + cute.arch.shuffle_sync_bfly(
++        send_b, offset=8, mask=-1, mask_and_clamp=31
++    )
++    send = a if b2 else b
++    keep = b if b2 else a
++    r = keep + cute.arch.shuffle_sync_bfly(send, offset=4, mask=-1, mask_and_clamp=31)
++    r = r + cute.arch.shuffle_sync_bfly(r, offset=2, mask=-1, mask_and_clamp=31)
++    r = r + cute.arch.shuffle_sync_bfly(r, offset=1, mask=-1, mask_and_clamp=31)
++    return r
++
++
++@cute.kernel
++def gdn_t1_rubin_kernel(
++    tiled_copy_h: cute.TiledCopy,
++    h0_source: cute.Tensor,
++    A_log: cute.Tensor,
++    a: cute.Tensor,
++    dt_bias: cute.Tensor,
++    q: cute.Tensor,
++    k: cute.Tensor,
++    v: cute.Tensor,
++    b_gate: cute.Tensor,
++    o: cute.Tensor,
++    h0_indices: cute.Tensor,
++    h0_out_indices: cute.Tensor,
++    softplus_beta: cutlass.Constexpr[float],
++    softplus_threshold: cutlass.Constexpr[float],
++    scale: cutlass.Constexpr[float],
++    HV: cutlass.Constexpr[int],
++    H: cutlass.Constexpr[int],
++    K: cutlass.Constexpr[int],
++    V: cutlass.Constexpr[int],
++    tile_v: cutlass.Constexpr[int],
++    num_v_tiles: cutlass.Constexpr[int],
++    use_qk_l2norm: cutlass.Constexpr[bool],
++    same_pool: cutlass.Constexpr[bool],
++    pf_dist: cutlass.Constexpr[int],
++    vec_qk: cutlass.Constexpr[bool],
++    o_hoist: cutlass.Constexpr[bool],
++    dense_rows: cutlass.Constexpr[bool],
++):
++    # vec_qk, o_hoist and dense_rows are input properties checked by the wrapper: 16 B aligned
++    # q/k rows, unit-stride output rows, dense 256 B state rows.
++    tidx, _, _ = cute.arch.thread_idx()
++    lane_in_warp = tidx % 32
++    warp_idx = cute.arch.warp_idx()
++    warp_idx = cute.arch.make_warp_uniform(warp_idx)
++
++    group_idx = tidx // LANES_PER_ROW
++    lane_in_group = tidx % LANES_PER_ROW
++    vec: cutlass.Constexpr[int] = ELEMS_PER_LANE
++
++    ROWS_PER_THREAD: cutlass.Constexpr[int] = tile_v // NUM_GROUPS
++    ITERS: cutlass.Constexpr[int] = ROWS_PER_THREAD // ILP_ROWS
++
++    batch_idx, _, _ = cute.arch.block_idx()
++    i_v = batch_idx % num_v_tiles
++    tmp = batch_idx // num_v_tiles
++    i_hv = tmp % HV
++    i_n = tmp // HV
++    i_h = i_hv // (HV // H)
++
++    cache_idx = h0_indices[i_n]
++    if cache_idx < 0:
++        cache_idx = cutlass.Int32(0)
++    if cutlass.const_expr(same_pool):
++        write_cache_idx = cache_idx
++    else:
++        write_cache_idx = h0_out_indices[i_n]
++        if write_cache_idx < 0:
++            write_cache_idx = cutlass.Int32(0)
++
++    if cutlass.const_expr(pf_dist > 0):
++        # L2 prefetch of the state tile a block ~one residency generation later will
++        # need (hint only; numerics untouched). Index loaded early, used at the end.
++        total_tiles = q.shape[0] * (HV * num_v_tiles)
++        w_pf = batch_idx + pf_dist
++        pf_ok = w_pf < total_tiles
++        if not pf_ok:
++            w_pf = batch_idx
++        # w_pf >= 0, so unsigned div/mod (shifts) instead of the signed floor-division fix-ups
++        w_pf_u = cutlass.Uint32(w_pf)
++        pf_iv = cutlass.Int32(w_pf_u % cutlass.Uint32(num_v_tiles))
++        pf_t_u = w_pf_u // cutlass.Uint32(num_v_tiles)
++        pf_t = cutlass.Int32(pf_t_u)
++        pf_hv = cutlass.Int32(pf_t_u % cutlass.Uint32(HV))
++        pf_idx = h0_indices[cutlass.Int32(pf_t_u // cutlass.Uint32(HV))]
++        if pf_idx < 0:
++            pf_idx = cutlass.Int32(0)
++
++    r_A_log = cutlass.Float32(A_log[i_hv])
++    r_dt_bias = cutlass.Float32(dt_bias[i_hv])
++
++    smem = cutlass.utils.SmemAllocator()
++    # Unused pad that keeps the state tile at byte 1152 and the CTA's shared-memory footprint at
++    # that of the tuned build: without it the per-die (uGPU) launches run ~3% slower (B = 512,
++    # HV = 64: 138.2 vs 134.0 us under CUDA graph); one launch over the whole GPU is unaffected.
++    smem.allocate_tensor(
++        cutlass.Uint8, cute.make_layout((_SMEM_PAD_BYTES,), stride=(1,)), 16
++    )
++
++    h0_slot_r = h0_source[(cutlass.Int64(cache_idx), i_hv, None, None)]
++    if cutlass.const_expr(same_pool):
++        h0_slot_w = h0_slot_r
++    else:
++        h0_slot_w = h0_source[(cutlass.Int64(write_cache_idx), i_hv, None, None)]
++
++    # ----- (1) issue every state load of this CTA up front -----
++    sH = smem.allocate_tensor(
++        cutlass.BFloat16, cute.make_layout((tile_v, K), stride=(K, 1)), 128
++    )
++    gH = cute.local_tile(h0_slot_r, (tile_v, K), (i_v, 0))
++    thr_copy = tiled_copy_h.get_slice(tidx)
++    tHg = thr_copy.partition_S(gH)  # (CPY, ROWS_PER_THREAD, 1)
++    tHs = thr_copy.partition_D(sH)
++    # The state write-back goes through the same copy partition (one per-thread base, constant
++    # row offsets; same_pool: the cp.async source registers themselves).
++    if cutlass.const_expr(same_pool):
++        tHw = tHg
++    else:
++        tHw = thr_copy.partition_S(cute.local_tile(h0_slot_w, (tile_v, K), (i_v, 0)))
++    for it in cutlass.range_constexpr(ITERS):
++        for rr in cutlass.range_constexpr(ILP_ROWS):
++            r = it * ILP_ROWS + rr
++            cute.copy(tiled_copy_h, tHg[None, r, None], tHs[None, r, None])
++        cute.arch.cp_async_commit_group()
++    # Scheduling fence: keep ptxas from hoisting the q/k/v/a/b loads below above the cp.async
++    # issue (it otherwise issues them first and the state loads only start after the q/k round
++    # trip + L2 norm).
++    cute.arch.sync_warp()
++
++    # ----- v: after _xreduce4 lane j = lane_in_group >> 2 holds row j's dot product and computes
++    # vn_j itself, so it needs only that row's v: one value per iteration -----
++    r_vj = cute.make_rmem_tensor(
++        cute.make_layout((ITERS,), stride=(1,)), cutlass.Float32
++    )
++    for it in cutlass.range_constexpr(ITERS):
++        r_vj[it] = cutlass.Float32(
++            v[
++                (
++                    i_n,
++                    0,
++                    i_hv,
++                    i_v * tile_v
++                    + (it * ILP_ROWS + (lane_in_group >> 2)) * NUM_GROUPS
++                    + group_idx,
++                )
++            ]
++        )
++
++    # ----- registers -----
++    r_h = cute.make_rmem_tensor(
++        cute.make_layout((ILP_ROWS, vec), stride=(vec, 1)), cutlass.Float32
++    )
++    r_q = cute.make_rmem_tensor(cute.make_layout((vec,), stride=(1,)), cutlass.Float32)
++    r_k = cute.make_rmem_tensor(cute.make_layout((vec,), stride=(1,)), cutlass.Float32)
++    r_q_bf16 = cute.make_rmem_tensor(
++        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
++    )
++    r_k_bf16 = cute.make_rmem_tensor(
++        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
++    )
++    r_hb0 = cute.make_rmem_tensor(
++        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
++    )
++    r_hb1 = cute.make_rmem_tensor(
++        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
++    )
++    r_hb2 = cute.make_rmem_tensor(
++        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
++    )
++    r_hb3 = cute.make_rmem_tensor(
++        cute.make_layout((vec,), stride=(1,)), cutlass.BFloat16
++    )
++
++    # ----- (2) q/k/g/beta in registers — overlaps the state loads -----
++    # Every 16-lane group loads/normalizes the 8-element q/k slice it needs and every thread
++    # computes g/beta itself: no SMEM round-trip and no CTA barrier.
++    member = lane_in_warp % LANES_PER_ROW
++    q_tile = cute.local_tile(q, (1, 1, 1, vec), (i_n, 0, i_h, member))
++    k_tile = cute.local_tile(k, (1, 1, 1, vec), (i_n, 0, i_h, member))
++    if cutlass.const_expr(vec_qk):
++        # one 16 B load per row slice
++        cute.autovec_copy(
++            cute.make_tensor(
++                cute.make_ptr(
++                    cutlass.BFloat16,
++                    q_tile.iterator.toint(),
++                    cute.AddressSpace.gmem,
++                    assumed_align=16,
++                ),
++                cute.make_layout((vec,)),
++            ),
++            r_q_bf16,
++        )
++        cute.autovec_copy(
++            cute.make_tensor(
++                cute.make_ptr(
++                    cutlass.BFloat16,
++                    k_tile.iterator.toint(),
++                    cute.AddressSpace.gmem,
++                    assumed_align=16,
++                ),
++                cute.make_layout((vec,)),
++            ),
++            r_k_bf16,
++        )
++    else:
++        cute.autovec_copy(q_tile, r_q_bf16)
++        cute.autovec_copy(k_tile, r_k_bf16)
++    # exact bf16 -> f32 conversion by bit placement
++    r_qw = cute.recast_tensor(r_q_bf16, cutlass.Uint32)
++    r_kw = cute.recast_tensor(r_k_bf16, cutlass.Uint32)
++    for m in cutlass.range_constexpr(vec // 2):
++        r_q[2 * m], r_q[2 * m + 1] = _bf16x2_to_f32(r_qw[m])
++        r_k[2 * m], r_k[2 * m + 1] = _bf16x2_to_f32(r_kw[m])
++    if cutlass.const_expr(use_qk_l2norm):
++        sum_q = cutlass.Float32(0.0)
++        sum_k = cutlass.Float32(0.0)
++        for i in cutlass.range_constexpr(vec):
++            sum_q += r_q[i] * r_q[i]
++            sum_k += r_k[i] * r_k[i]
++        for offset in [8, 4, 2, 1]:
++            sum_q += cute.arch.shuffle_sync_bfly(
++                sum_q, offset=offset, mask=-1, mask_and_clamp=31
++            )
++            sum_k += cute.arch.shuffle_sync_bfly(
++                sum_k, offset=offset, mask=-1, mask_and_clamp=31
++            )
++        inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=True) * scale
++        inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=True)
++        for i in cutlass.range_constexpr(vec):
++            r_q[i] = r_q[i] * inv_norm_q_scaled
++            r_k[i] = r_k[i] * inv_norm_k
++    else:
++        for i in cutlass.range_constexpr(vec):
++            r_q[i] = r_q[i] * scale
++
++    r_a = cutlass.Float32(a[i_n, 0, i_hv])
++    r_b = cutlass.Float32(b_gate[i_n, 0, i_hv])
++    x = r_a + r_dt_bias
++    beta_x = softplus_beta * x
++    exp_beta_x = cute.exp(beta_x, fastmath=True)
++    softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
++        cutlass.Float32(1.0) + exp_beta_x, fastmath=True
++    )
++    use_softplus = (
++        cutlass.Float32(1.0) if beta_x <= softplus_threshold else cutlass.Float32(0.0)
++    )
++    softplus_x = use_softplus * softplus_val + (cutlass.Float32(1.0) - use_softplus) * x
++    r_g = cute.exp(-cute.exp(r_A_log, fastmath=True) * softplus_x, fastmath=True)
++    r_beta = cutlass.Float32(1.0) / (
++        cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
++    )
++
++    if cutlass.const_expr(o_hoist):
++        # this lane's output pointer once (row (it * 4 + j) * 8 + g of the tile,
++        # j = lane_in_group >> 2); each iteration is then a predicated store at +32 rows * it.
++        o_t = cute.local_tile(o[(i_n, 0, i_hv, None)], (tile_v,), (i_v,))
++        o_lane = cute.make_tensor(
++            o_t.iterator + ((lane_in_group >> 2) * NUM_GROUPS + group_idx),
++            cute.make_layout((ITERS,), stride=(ILP_ROWS * NUM_GROUPS,)),
++        )
++        o_pred = (lane_in_group & 3) == 0
++
++    # ----- (3) main loop: 4 interleaved rows per iteration -----
++    for it in cutlass.range_constexpr(ITERS):
++        rl0 = (it * ILP_ROWS + 0) * NUM_GROUPS + group_idx  # row within the tile
++        rl1 = (it * ILP_ROWS + 1) * NUM_GROUPS + group_idx
++        rl2 = (it * ILP_ROWS + 2) * NUM_GROUPS + group_idx
++        rl3 = (it * ILP_ROWS + 3) * NUM_GROUPS + group_idx
++
++        # group it is complete once at most the ITERS - 1 - it groups after it are pending
++        cute.arch.cp_async_wait_group(ITERS - 1 - it)
++        # LDS.128 as 4 words per row, exact bf16 -> f32 by bit placement
++        r_w0 = cute.make_rmem_tensor(
++            cute.make_layout((1, vec // 2), stride=(vec // 2, 1)), cutlass.Uint32
++        )
++        r_w1 = cute.make_rmem_tensor(
++            cute.make_layout((1, vec // 2), stride=(vec // 2, 1)), cutlass.Uint32
++        )
++        r_w2 = cute.make_rmem_tensor(
++            cute.make_layout((1, vec // 2), stride=(vec // 2, 1)), cutlass.Uint32
++        )
++        r_w3 = cute.make_rmem_tensor(
++            cute.make_layout((1, vec // 2), stride=(vec // 2, 1)), cutlass.Uint32
++        )
++        cute.autovec_copy(
++            cute.recast_tensor(
++                cute.local_tile(sH, (1, vec), (rl0, lane_in_group)), cutlass.Uint32
++            ),
++            r_w0,
++        )
++        cute.autovec_copy(
++            cute.recast_tensor(
++                cute.local_tile(sH, (1, vec), (rl1, lane_in_group)), cutlass.Uint32
++            ),
++            r_w1,
++        )
++        cute.autovec_copy(
++            cute.recast_tensor(
++                cute.local_tile(sH, (1, vec), (rl2, lane_in_group)), cutlass.Uint32
++            ),
++            r_w2,
++        )
++        cute.autovec_copy(
++            cute.recast_tensor(
++                cute.local_tile(sH, (1, vec), (rl3, lane_in_group)), cutlass.Uint32
++            ),
++            r_w3,
++        )
++        for m in cutlass.range_constexpr(vec // 2):
++            r_h[0, 2 * m], r_h[0, 2 * m + 1] = _bf16x2_to_f32(r_w0[0, m])
++            r_h[1, 2 * m], r_h[1, 2 * m + 1] = _bf16x2_to_f32(r_w1[0, m])
++            r_h[2, 2 * m], r_h[2, 2 * m + 1] = _bf16x2_to_f32(r_w2[0, m])
++            r_h[3, 2 * m], r_h[3, 2 * m + 1] = _bf16x2_to_f32(r_w3[0, m])
++
++        # decay + s = h . k. Row-pair grouping (rows 0/1, 2/3 at column i) for every FFMA2: the
++        # packed dot products need these pairs, so doing the decay and update on them too avoids
++        # register regrouping. Same scalar FMAs (operands and per-row order over i) as the generic
++        # kernel's column-pair form, so bitwise identical.
++        s0 = cutlass.Float32(0.0)
++        s1 = cutlass.Float32(0.0)
++        s2 = cutlass.Float32(0.0)
++        s3 = cutlass.Float32(0.0)
++        for i in cutlass.range_constexpr(vec):
++            kv = r_k[i]
++            zero2 = (cutlass.Float32(0.0), cutlass.Float32(0.0))
++            r_h[0, i], r_h[1, i] = cute.arch.fma_packed_f32x2(
++                src_a=(r_h[0, i], r_h[1, i]), src_b=(r_g, r_g), src_c=zero2
++            )
++            r_h[2, i], r_h[3, i] = cute.arch.fma_packed_f32x2(
++                src_a=(r_h[2, i], r_h[3, i]), src_b=(r_g, r_g), src_c=zero2
++            )
++            s0, s1 = cute.arch.fma_packed_f32x2(
++                src_a=(r_h[0, i], r_h[1, i]), src_b=(kv, kv), src_c=(s0, s1)
++            )
++            s2, s3 = cute.arch.fma_packed_f32x2(
++                src_a=(r_h[2, i], r_h[3, i]), src_b=(kv, kv), src_c=(s2, s3)
++            )
++        sj = _xreduce4(s0, s1, s2, s3, lane_in_group)
++        # vn evaluated once in the lane that holds s_j; the broadcast then carries vn_j (bitwise
++        # the same vn as broadcasting s_j and evaluating it in every lane)
++        seg = lane_in_warp & 16
++        vnj = (r_vj[it] - sj) * r_beta
++        vn0 = cute.arch.shuffle_sync(vnj, offset=seg | 0, mask=-1, mask_and_clamp=31)
++        vn1 = cute.arch.shuffle_sync(vnj, offset=seg | 4, mask=-1, mask_and_clamp=31)
++        vn2 = cute.arch.shuffle_sync(vnj, offset=seg | 8, mask=-1, mask_and_clamp=31)
++        vn3 = cute.arch.shuffle_sync(vnj, offset=seg | 12, mask=-1, mask_and_clamp=31)
++
++        # rank-1 update + o = h . q
++        o0 = cutlass.Float32(0.0)
++        o1 = cutlass.Float32(0.0)
++        o2 = cutlass.Float32(0.0)
++        o3 = cutlass.Float32(0.0)
++        for i in cutlass.range_constexpr(vec):
++            kv = r_k[i]
++            qv = r_q[i]
++            r_h[0, i], r_h[1, i] = cute.arch.fma_packed_f32x2(
++                src_a=(kv, kv), src_b=(vn0, vn1), src_c=(r_h[0, i], r_h[1, i])
++            )
++            r_h[2, i], r_h[3, i] = cute.arch.fma_packed_f32x2(
++                src_a=(kv, kv), src_b=(vn2, vn3), src_c=(r_h[2, i], r_h[3, i])
++            )
++            o0, o1 = cute.arch.fma_packed_f32x2(
++                src_a=(r_h[0, i], r_h[1, i]), src_b=(qv, qv), src_c=(o0, o1)
++            )
++            o2, o3 = cute.arch.fma_packed_f32x2(
++                src_a=(r_h[2, i], r_h[3, i]), src_b=(qv, qv), src_c=(o2, o3)
++            )
++        oj = _xreduce4(o0, o1, o2, o3, lane_in_group)
++        if cutlass.const_expr(o_hoist):
++            if o_pred:
++                o_lane[it] = cutlass.BFloat16(oj)
++        else:
++            if (lane_in_group & 3) == 0:
++                j = lane_in_group >> 2
++                o[
++                    (
++                        i_n,
++                        0,
++                        i_hv,
++                        i_v * tile_v + (it * ILP_ROWS + j) * NUM_GROUPS + group_idx,
++                    )
++                ] = cutlass.BFloat16(oj)
++
++        # state write-back through the copy partition
++        for i in cutlass.range_constexpr(vec):
++            r_hb0[i] = cutlass.BFloat16(r_h[0, i])
++            r_hb1[i] = cutlass.BFloat16(r_h[1, i])
++            r_hb2[i] = cutlass.BFloat16(r_h[2, i])
++            r_hb3[i] = cutlass.BFloat16(r_h[3, i])
++        cute.autovec_copy(
++            r_hb0,
++            cute.make_tensor(
++                tHw[(None, it * ILP_ROWS + 0, None)].iterator, cute.make_layout((vec,))
++            ),
++        )
++        cute.autovec_copy(
++            r_hb1,
++            cute.make_tensor(
++                tHw[(None, it * ILP_ROWS + 1, None)].iterator, cute.make_layout((vec,))
++            ),
++        )
++        cute.autovec_copy(
++            r_hb2,
++            cute.make_tensor(
++                tHw[(None, it * ILP_ROWS + 2, None)].iterator, cute.make_layout((vec,))
++            ),
++        )
++        cute.autovec_copy(
++            r_hb3,
++            cute.make_tensor(
++                tHw[(None, it * ILP_ROWS + 3, None)].iterator, cute.make_layout((vec,))
++            ),
++        )
++
++    if cutlass.const_expr(pf_dist > 0):
++        # L2 prefetch (evict_last) of tile w_pf: warp 0 dispatches the small per-tile inputs
++        # (q, k rows: 2 lines each; v slice: 1 line; the a and b lines holding [n, hv]), every
++        # thread one 128 B line of the state tile.
++        if pf_ok:
++            pf_tile = cute.local_tile(
++                h0_source[(cutlass.Int64(pf_idx), pf_hv, None, None)],
++                (tile_v, K),
++                (pf_iv, 0),
++            )
++            if warp_idx == 0:
++                pf_n = cutlass.Int32(cutlass.Uint32(pf_t) // cutlass.Uint32(HV))
++                pf_h = cutlass.Int32(cutlass.Uint32(pf_hv) // cutlass.Uint32(HV // H))
++                if lane_in_warp < 2:
++                    cute.arch.prefetch(
++                        cute.local_tile(
++                            q[(pf_n, 0, pf_h, None)], (64,), (lane_in_warp,)
++                        ).iterator.llvm_ptr,
++                        cache_level="L2",
++                    )
++                if lane_in_warp >= 2 and lane_in_warp < 4:
++                    cute.arch.prefetch(
++                        cute.local_tile(
++                            k[(pf_n, 0, pf_h, None)], (64,), (lane_in_warp - 2,)
++                        ).iterator.llvm_ptr,
++                        cache_level="L2",
++                    )
++                if lane_in_warp == 4:
++                    cute.arch.prefetch(
++                        cute.local_tile(
++                            v[(pf_n, 0, pf_hv, None)], (tile_v,), (pf_iv,)
++                        ).iterator.llvm_ptr,
++                        cache_level="L2",
++                    )
++                if lane_in_warp == 5:
++                    cute.arch.prefetch(
++                        a[(pf_n, 0, None)].iterator.llvm_ptr, cache_level="L2"
++                    )
++                if lane_in_warp == 6:
++                    cute.arch.prefetch(
++                        b_gate[(pf_n, 0, None)].iterator.llvm_ptr, cache_level="L2"
++                    )
++            LINES: cutlass.Constexpr[int] = tile_v * K * 2 // 128
++            for li in cutlass.range_constexpr((LINES + NUM_THREADS - 1) // NUM_THREADS):
++                if cutlass.const_expr(li == 0):
++                    line = tidx
++                else:
++                    line = li * NUM_THREADS + tidx
++                if cutlass.const_expr(dense_rows):
++                    # uniform 64-bit tile base + line * 128 B
++                    pl_ptr = cute.make_ptr(
++                        cutlass.BFloat16,
++                        pf_tile.iterator.toint()
++                        + cutlass.Int64(line) * cutlass.Int64(128),
++                        cute.AddressSpace.gmem,
++                        assumed_align=128,
++                    )
++                else:
++                    pl_ptr = cute.local_tile(
++                        pf_tile, (1, 64), (line // 2, line % 2)
++                    ).iterator
++                if cutlass.const_expr(LINES % NUM_THREADS == 0):
++                    cute.arch.prefetch(
++                        pl_ptr.llvm_ptr,
++                        cache_level="L2",
++                        evict_priority=_nvvm.CacheEvictionPriority.EvictLast,
++                    )
++                else:
++                    if line < LINES:
++                        cute.arch.prefetch(
++                            pl_ptr.llvm_ptr,
++                            cache_level="L2",
++                            evict_priority=_nvvm.CacheEvictionPriority.EvictLast,
++                        )
++
++
++@cute.jit
++def _run_t1_rubin(
++    h0_source: cute.Tensor,
++    A_log: cute.Tensor,
++    a: cute.Tensor,
++    dt_bias: cute.Tensor,
++    q: cute.Tensor,
++    k: cute.Tensor,
++    v: cute.Tensor,
++    b_gate: cute.Tensor,
++    o: cute.Tensor,
++    h0_indices: cute.Tensor,
++    h0_out_indices: cute.Tensor,
++    softplus_beta: cutlass.Constexpr[float],
++    softplus_threshold: cutlass.Constexpr[float],
++    scale: cutlass.Constexpr[float],
++    HV: cutlass.Constexpr[int],
++    H: cutlass.Constexpr[int],
++    K: cutlass.Constexpr[int],
++    V: cutlass.Constexpr[int],
++    tile_v: cutlass.Constexpr[int],
++    use_qk_l2norm: cutlass.Constexpr[bool],
++    same_pool: cutlass.Constexpr[bool],
++    pf_dist: cutlass.Constexpr[int],
++    vec_qk: cutlass.Constexpr[bool],
++    o_hoist: cutlass.Constexpr[bool],
++    dense_rows: cutlass.Constexpr[bool],
++    io_layouts: cutlass.Constexpr,
++    stream: cuda.CUstream,
++):
++    # q/k/v/a/b/o rebuilt with this build's static strides (they are in the wrapper's cache
++    # key); only the batch extent stays dynamic. Same addresses, shorter address math.
++    (lq, sq), (lk, sk), (lv, sv), (la, sa), (lb, sb), (lo, so) = io_layouts
++    q = cute.make_tensor(q.iterator, cute.make_layout((q.shape[0],) + lq, stride=sq))
++    k = cute.make_tensor(k.iterator, cute.make_layout((k.shape[0],) + lk, stride=sk))
++    v = cute.make_tensor(v.iterator, cute.make_layout((v.shape[0],) + lv, stride=sv))
++    a = cute.make_tensor(a.iterator, cute.make_layout((a.shape[0],) + la, stride=sa))
++    b_gate = cute.make_tensor(
++        b_gate.iterator, cute.make_layout((b_gate.shape[0],) + lb, stride=sb)
++    )
++    o = cute.make_tensor(o.iterator, cute.make_layout((o.shape[0],) + lo, stride=so))
++    num_v_tiles: cutlass.Constexpr[int] = V // tile_v
++    B = cute.size(q.shape[0])
++    grid_size = B * HV * num_v_tiles
++
++    copy_atom = cute.make_copy_atom(
++        cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
++        cutlass.BFloat16,
++        num_bits_per_copy=128,
++    )
++    thr_layout = cute.make_layout(
++        (NUM_GROUPS, LANES_PER_ROW), stride=(LANES_PER_ROW, 1)
++    )
++    val_layout = cute.make_layout((1, ELEMS_PER_LANE))
++    tiled_copy_h = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
++
++    # pad + 256 B slack (see the kernel) + the state tile (+ alignment slack)
++    smem_bytes = _SMEM_PAD_BYTES + 256 + 2 * tile_v * K + 128
++
++    gdn_t1_rubin_kernel(
++        tiled_copy_h,
++        h0_source,
++        A_log,
++        a,
++        dt_bias,
++        q,
++        k,
++        v,
++        b_gate,
++        o,
++        h0_indices,
++        h0_out_indices,
++        softplus_beta,
++        softplus_threshold,
++        scale,
++        HV,
++        H,
++        K,
++        V,
++        tile_v,
++        num_v_tiles,
++        use_qk_l2norm,
++        same_pool,
++        pf_dist,
++        vec_qk,
++        o_hoist,
++        dense_rows,
++    ).launch(
++        grid=(grid_size, 1, 1),
++        block=[NUM_THREADS, 1, 1],
++        smem=smem_bytes,
++        stream=stream,
++    )
++
++
++_CUTE_DSL_MODULE = "gdn_decode_bf16_state_rubin"
++# Sources of the generated code: this file and the generic module it takes its constants from
++_KEY_FILES = (__file__, _generic.__file__)
++
++# build key -> compiled kernel (TVM-FFI callable, built or loaded through the persistent JIT cache)
++_compiled_t1_rubin: dict = {}
++# launch key (the call's raw tensor metadata) -> compiled kernel: a repeat call skips the
++# build-key derivation (layout normalization, input checks)
++_launch_t1_rubin: dict = {}
++# (device, B) -> arange(B) int32 slot indices for calls without initial_state_indices
++_default_indices: dict = {}
++
++
++def _io_layout(torch_t: torch.Tensor):
++    # (shape after the batch mode, strides) baked into the build and held in the build key.
++    # A size-1 mode is only ever indexed at 0, so its stride is normalized to the next inner
++    # mode's extent x stride (what torch's view() gives it): B=1 slices of fused tensors then share
++    # the compact layout's build instead of failing a compact-layout check, and every layout (also
++    # non-contiguous views of a fused QKV buffer) gets static strides.
++    st = list(torch_t.stride())
++    for d in reversed(range(torch_t.dim())):
++        if torch_t.shape[d] == 1:
++            st[d] = st[d + 1] * torch_t.shape[d + 1] if d + 1 < torch_t.dim() else 1
++    return tuple(torch_t.shape[1:]), tuple(st)
++
++
++def _build_t1_rubin(
++    q,
++    k,
++    v,
++    a,
++    b,
++    A_log,
++    dt_bias,
++    pool,
++    indices,
++    out_indices,
++    output,
++    same_pool,
++    use_qk_l2norm,
++    scale,
++    softplus_beta,
++    softplus_threshold,
++    tile_v,
++    pf_dist,
++    stream,
++):
++    """Check one call's inputs and return its compiled kernel (built once per build key)."""
++    B_val, T_val, H_val, K_val = q.shape
++    HV_val = v.shape[2]
++    V_val = v.shape[3]
++    assert T_val == 1, f"T=1 kernel, got T={T_val}"
++    # V = 64: one half of every state (uGPU localization runs each half on its own die)
++    assert K_val == 128 and V_val in (64, 128)
++    assert pool.dtype == torch.bfloat16
++    tile_v = min(tile_v, V_val)
++    assert tile_v in (32, 64, 128) and (tile_v // NUM_GROUPS) % ILP_ROWS == 0
++    target = gdn_device_target(q.device)
++    if (target.major, target.minor) != (10, 7):
++        raise ValueError(
++            "gated_delta_rule_t1_rubin needs compute capability 10.7 (Rubin), got "
++            f"{target.major}.{target.minor}"
++        )
++    if pf_dist is None:
++        # Cross-CTA L2 prefetch distance in tiles: ~1.2 residency generations at tile_v=64
++        # (7 CTAs/SM). At tile_v=128 (6 CTAs/SM) it overshoots; pass pf_dist explicitly there.
++        pf_dist = target.num_sms * 25 // 3
++
++    # Input properties the build specializes on
++    dense_rows = pool.stride(-1) == 1 and pool.stride(-2) == K_val
++    o_hoist = output.stride(-1) == 1
++    vec_qk = all(
++        st[-1] == 1 and all(x % 8 == 0 for x in st[:-1]) and t.data_ptr() % 16 == 0
++        for t, st in ((t, _io_layout(t)[1]) for t in (q, k))
++    )
++    io_layouts = tuple(_io_layout(t) for t in (q, k, v, a, b, output))
++    contiguous_pool = pool.is_contiguous()
++    cache_key = (
++        H_val,
++        HV_val,
++        K_val,
++        V_val,
++        contiguous_pool,
++        # a strided (e.g. padded) pool compiles with its static shape: key its size and strides
++        None if contiguous_pool else (pool.shape[0], tuple(pool.stride())),
++        tile_v,
++        pf_dist,
++        vec_qk,
++        o_hoist,
++        dense_rows,
++        io_layouts,
++        use_qk_l2norm,
++        scale,
++        softplus_beta,
++        softplus_threshold,
++        same_pool,
++        _dtype_key(A_log, dt_bias, indices),
++        target.compile_key,
++    )
++    compiled = _compiled_t1_rubin.get(cache_key)
++    if compiled is None:
++        if contiguous_pool:
++            h_ = _mark_slot_dynamic(pool)
++        else:
++            h_ = from_dlpack(pool, assumed_align=32, enable_tvm_ffi=True)
++        *codegen, target_key = cache_key
++        compiled = build_and_load_cute_dsl_kernel(
++            _CUTE_DSL_MODULE,
++            make_kernel_name("t1", target_arch(target_key), *codegen),
++            lambda: cute.compile[
++                gdn_compile_options(q.device, *_BF16_STATE_COMPILE_OPTS)
++            ](
++                _run_t1_rubin,
++                h_,
++                from_dlpack(A_log, assumed_align=32, enable_tvm_ffi=True),
++                _mark_batch_dynamic(a),
++                from_dlpack(dt_bias, assumed_align=32, enable_tvm_ffi=True),
++                _mark_batch_dynamic(q),
++                _mark_batch_dynamic(k),
++                _mark_batch_dynamic(v),
++                _mark_batch_dynamic(b),
++                _mark_batch_dynamic(output),
++                _mark_index_dynamic(indices),
++                _mark_index_dynamic(out_indices),
++                softplus_beta,
++                softplus_threshold,
++                scale,
++                HV_val,
++                H_val,
++                K_val,
++                V_val,
++                tile_v,
++                use_qk_l2norm,
++                same_pool,
++                pf_dist,
++                vec_qk,
++                o_hoist,
++                dense_rows,
++                io_layouts,
++                stream,
++            ),
++            extra_key_files=_KEY_FILES,
++        )
++        _compiled_t1_rubin[cache_key] = compiled
++    return compiled
++
++
++def gated_delta_rule_t1_rubin(
++    A_log: torch.Tensor,
++    a: torch.Tensor,
++    dt_bias: torch.Tensor,
++    softplus_beta: float = 1.0,
++    softplus_threshold: float = 20.0,
++    q: Optional[torch.Tensor] = None,
++    k: Optional[torch.Tensor] = None,
++    v: Optional[torch.Tensor] = None,
++    b: Optional[torch.Tensor] = None,
++    initial_state_source: Optional[torch.Tensor] = None,
++    initial_state_indices: Optional[torch.Tensor] = None,
++    output_state_indices: Optional[torch.Tensor] = None,
++    use_qk_l2norm_in_kernel: bool = True,
++    scale: Optional[float] = None,
++    output: Optional[torch.Tensor] = None,
++    tile_v: int = 64,
++    pf_dist: Optional[int] = None,
++    stream: Optional[torch.cuda.Stream] = None,
++) -> torch.Tensor:
++    """T=1 GDN decode with BF16 state on Rubin (compute capability 10.7): state update + output.
++
++    Same arguments and semantics as ``gdn_decode_bf16_state.gated_delta_rule`` at T=1: q/k/v
++    ``[B, 1, H|HV, 128]``, state pool ``initial_state_source`` ``[pool, HV, V=128, K=128]`` bf16
++    updated in place at ``output_state_indices`` (default: ``initial_state_indices``), output
++    ``[B, 1, HV, 128]`` bf16. Bitwise equal to that kernel's T=1 wide_vec path. V = 64 (one half
++    of a ``ugpu_state_pool`` state) is also accepted.
++
++    ``tile_v`` is the number of V-rows per CTA (32, 64 or 128, at most V; 64 is the measured
++    best) and ``pf_dist`` the L2 prefetch distance in tiles (default num_SMs * 25 // 3; 0 turns
++    the prefetch off). ``stream`` is the CUDA stream to launch on (default: the current stream of
++    q's device). Raises ``ValueError`` on any other compute capability.
++    """
++    assert q is not None and k is not None and v is not None
++    assert b is not None and initial_state_source is not None
++    q, k, v, a, b = as_bf16(q, k, v, a, b)
++    B_val = q.shape[0]
++    if scale is None:
++        scale = 1.0 / math.sqrt(q.shape[3])
++    same_pool = (
++        output_state_indices is None or output_state_indices is initial_state_indices
++    )
++    if initial_state_indices is None:
++        idx_key = (q.device, B_val)
++        initial_state_indices = _default_indices.get(idx_key)
++        if initial_state_indices is None:
++            initial_state_indices = _default_indices.setdefault(
++                idx_key, torch.arange(B_val, dtype=torch.int32, device=q.device)
++            )
++    # The kernel reads int32 slot indices (int64 indices are converted, one small copy each)
++    if initial_state_indices.dtype != torch.int32:
++        initial_state_indices = initial_state_indices.to(torch.int32)
++    if same_pool:
++        output_state_indices = initial_state_indices
++    elif output_state_indices.dtype != torch.int32:
++        output_state_indices = output_state_indices.to(torch.int32)
++    if output is None:
++        output = torch.empty(
++            B_val, 1, v.shape[2], v.shape[3], device=q.device, dtype=torch.bfloat16
++        )
++    if stream is None:
++        stream = torch.cuda.current_stream(device=q.device)
++    stream = cuda.CUstream(stream.cuda_stream)
++
++    # Everything the build depends on, read as tensor metadata without Python loops (the build
++    # key derives normalized layouts and input checks from it), so a repeat call costs about as
++    # much host time as the generic kernel's.
++    launch_key = (
++        q.device,
++        B_val == 1,
++        q.shape[1:],
++        q.stride(),
++        k.shape[1:],
++        k.stride(),
++        v.shape[1:],
++        v.stride(),
++        a.shape[1:],
++        a.stride(),
++        b.shape[1:],
++        b.stride(),
++        output.shape[1:],
++        output.stride(),
++        q.data_ptr() % 16 == 0,
++        k.data_ptr() % 16 == 0,
++        initial_state_source.shape,
++        initial_state_source.stride(),
++        initial_state_source.dtype,
++        A_log.dtype,
++        dt_bias.dtype,
++        same_pool,
++        use_qk_l2norm_in_kernel,
++        scale,
++        softplus_beta,
++        softplus_threshold,
++        tile_v,
++        pf_dist,
++    )
++    compiled = _launch_t1_rubin.get(launch_key)
++    if compiled is None:
++        compiled = _build_t1_rubin(
++            q,
++            k,
++            v,
++            a,
++            b,
++            A_log,
++            dt_bias,
++            initial_state_source,
++            initial_state_indices,
++            output_state_indices,
++            output,
++            same_pool,
++            use_qk_l2norm_in_kernel,
++            scale,
++            softplus_beta,
++            softplus_threshold,
++            tile_v,
++            pf_dist,
++            stream,
++        )
++        _launch_t1_rubin[launch_key] = compiled
++    compiled(
++        initial_state_source,
++        A_log,
++        a,
++        dt_bias,
++        q,
++        k,
++        v,
++        b,
++        output,
++        initial_state_indices,
++        output_state_indices,
++        stream,
++    )
++    return output
+diff --git a/flashinfer/green_ctx.py b/flashinfer/green_ctx.py
+index 66b5970dae4..e67f21f6008 100644
+--- a/flashinfer/green_ctx.py
++++ b/flashinfer/green_ctx.py
+@@ -14,7 +14,10 @@
+ limitations under the License.
+ """
+ 
++import math
++import weakref
+ from typing import List, Tuple
++
+ import torch
+ 
+ try:
+@@ -27,6 +30,7 @@
+         "Please install cuda-python that matches your CUDA version."
+     ) from e
+ 
++from .api_logging import flashinfer_api
+ from .cuda_utils import checkCudaErrors
+ from .utils import get_compute_capability, round_up
+ 
+@@ -293,3 +297,237 @@ def split_device_green_ctx_by_sm_count(
+                 f"Please reduce the requested SM counts or use fewer partitions."
+             ) from e
+         raise
++
++
++# ---------------------------------------------------------------------------
++# uGPU localization: locality domains (dies) of multi-die GPUs such as Rubin
++# ---------------------------------------------------------------------------
++
++
++def _indexed(dev) -> torch.device:
++    """``dev`` as a ``torch.device`` with an explicit index (``"cuda"`` -> current device)."""
++    dev = torch.device(dev)
++    if dev.index is None:
++        dev = torch.device(dev.type, torch.cuda.current_device())
++    return dev
++
++
++@flashinfer_api
++def get_locality_domain_count(dev: torch.device) -> int:
++    r"""Number of locality domains (uGPUs, one per die) of ``dev``.
++
++    Args:
++        dev: The CUDA device (``"cuda"`` without an index means the current device).
++
++    Returns:
++        The number of locality domains: 2 on Rubin VR200, 1 when the device or the
++        installed driver / cuda-python does not expose locality domains.
++    """
++    attr = getattr(
++        driver.CUdevice_attribute, "CU_DEVICE_ATTRIBUTE_LOCALITY_DOMAIN_COUNT", None
++    )
++    if attr is None:
++        return 1
++    dev = _indexed(dev)
++    try:
++        return max(
++            1,
++            int(checkCudaErrors(driver.cuDeviceGetAttribute(attr, get_cudevice(dev)))),
++        )
++    except RuntimeError:
++        return 1
++
++
++@flashinfer_api
++def split_device_green_ctx_by_locality_domain(
++    dev: torch.device, backfill: bool = True
++) -> Tuple[List[torch.Stream], List[CUdevResource]]:
++    r"""
++    Create one green context per locality domain (uGPU) of ``dev`` and return its stream
++    and ``CUdevResource``, in domain order. A kernel launched on stream ``i`` runs only on
++    domain ``i``'s SMs, so together with memory placed in that domain
++    (:func:`empty_per_locality_domain`) its DRAM traffic stays on the die.
++
++    Args:
++        dev: The device to split.
++        backfill: If ``True`` (default), each group gets ``num_SMs // num_domains`` SMs and
++            the driver completes a domain's group with SMs that belong to no domain (on
++            Rubin VR200: 100 native SMs + 6 of the 12 remaining ones per die, so all 212
++            SMs work). If ``False``, each group holds its domain's native SMs only.
++
++    Returns:
++        streams: One ``torch.Stream`` per locality domain.
++        resources: The matching ``CUdevResource`` objects (``.sm.smCount`` is the SM count).
++
++    Raises:
++        RuntimeError: if the device has fewer than two locality domains.
++    """
++    dev = _indexed(dev)
++    num_domains = get_locality_domain_count(dev)
++    if num_domains < 2:
++        raise RuntimeError(
++            f"{dev} exposes {num_domains} locality domain(s); uGPU localization needs at "
++            "least two (e.g. Rubin) and a driver / cuda-python with the locality-domain API"
++        )
++    cu_dev = get_cudevice(dev)
++    resource = get_device_resource(cu_dev)
++    params = []
++    for i in range(num_domains):
++        p = driver.CU_DEV_SM_RESOURCE_GROUP_PARAMS()
++        p.smCount = resource.sm.smCount // num_domains if backfill else 0
++        p.coscheduledSmCount = 2
++        flags = int(
++            driver.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_LOCALITY_DOMAIN_ID
++        )
++        if backfill:
++            flags |= int(
++                driver.CUdevSmResourceGroup_flags.CU_DEV_SM_RESOURCE_GROUP_BACKFILL
++            )
++        p.flags = flags
++        p.localityDomainId = i
++        params.append(p)
++    groups = checkCudaErrors(
++        driver.cuDevSmResourceSplit(num_domains, resource, 0, params)
++    )[0]
++    groups = list(groups)
++    # torch tags an external stream with the current device: make that dev
++    with torch.cuda.device(dev):
++        return create_green_ctx_streams(cu_dev, groups), groups
++
++
++class _LocalizedAllocation:
++    """Owner of an :func:`empty_per_locality_domain` mapping; torch keeps it alive."""
++
++    def __init__(self, ptr: int, nbytes: int, typestr: str):
++        self.__cuda_array_interface__ = {
++            "shape": (nbytes,),
++            "typestr": typestr,
++            "data": (ptr, False),
++            "version": 3,
++        }
++
++
++# Allocations whose tensors died while a CUDA graph was being captured: their release (which
++# synchronizes the device) waits for the next allocation or release outside capture.
++_deferred_releases: list = []
++
++
++def _release_localized(dev_index: int, ptr: int, va_bytes: int, chunks) -> None:
++    torch.cuda.synchronize(dev_index)
++    for offset, size, handle in chunks:
++        checkCudaErrors(driver.cuMemUnmap(ptr + offset, size))
++        checkCudaErrors(driver.cuMemRelease(handle))
++    checkCudaErrors(driver.cuMemAddressFree(ptr, va_bytes))
++
++
++def _release_deferred() -> None:
++    # A device synchronize during stream capture would invalidate the capture
++    if torch.cuda.is_current_stream_capturing():
++        return
++    while _deferred_releases:
++        _release_localized(*_deferred_releases.pop())
++
++
++def _unmap_localized(dev_index: int, ptr: int, va_bytes: int, chunks) -> None:
++    """Finalizer of an :func:`empty_per_locality_domain` tensor (runs from garbage collection)."""
++    _deferred_releases.append((dev_index, ptr, va_bytes, chunks))
++    _release_deferred()
++
++
++@flashinfer_api
++def empty_per_locality_domain(
++    part_shape: Tuple[int, ...], dtype: torch.dtype, dev: torch.device
++) -> torch.Tensor:
++    r"""
++    Allocate an uninitialized tensor of shape ``[num_domains, *part_shape]`` whose part ``i``
++    lives in locality domain ``i``'s memory (one virtual address range over per-domain
++    physical memory). Each part is contiguous; the stride of dim 0 is the part size rounded
++    up to the allocation granularity.
++
++    The memory comes from the CUDA driver (``cuMemCreate`` / ``cuMemMap``), not from PyTorch's
++    caching allocator: it does not count in ``torch.cuda.memory_allocated()`` and cannot be
++    reused by other tensors. It is released when the tensor and all its views are freed (after
++    a device synchronize; if that happens during CUDA graph capture, at the next allocation or
++    release outside capture).
++
++    Example: :func:`flashinfer.gdn_decode.ugpu_state_pool` builds a GDN state pool from two
++    parts, so that each die reads and writes only its own half of every state.
++
++    Args:
++        part_shape: Shape of one part.
++        dtype: Element type.
++        dev: CUDA device with at least two locality domains.
++
++    Returns:
++        The tensor.
++    """
++    dev = _indexed(dev)
++    num_domains = get_locality_domain_count(dev)
++    if num_domains < 2:
++        raise RuntimeError(
++            f"{dev} exposes {num_domains} locality domain(s); empty_per_locality_domain "
++            "needs at least two"
++        )
++    _release_deferred()
++    cu_dev = get_cudevice(dev)
++    elem = torch.tensor([], dtype=dtype).element_size()
++    part_elems = math.prod(part_shape)
++
++    def prop_for(domain: int):
++        prop = driver.CUmemAllocationProp()
++        prop.type = driver.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
++        prop.location.type = (
++            driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN
++        )
++        prop.location.localized.deviceId = int(cu_dev)
++        prop.location.localized.localityDomainId = domain
++        return prop
++
++    gran = int(
++        checkCudaErrors(
++            driver.cuMemGetAllocationGranularity(
++                prop_for(0),
++                driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
++            )
++        )
++    )
++    part_bytes = max(round_up(part_elems * elem, gran), gran)
++    va_bytes = num_domains * part_bytes
++    ptr = int(checkCudaErrors(driver.cuMemAddressReserve(va_bytes, 0, 0, 0)))
++    chunks = []
++    try:
++        for i in range(num_domains):
++            handle = checkCudaErrors(driver.cuMemCreate(part_bytes, prop_for(i), 0))
++            try:
++                checkCudaErrors(
++                    driver.cuMemMap(ptr + i * part_bytes, part_bytes, 0, handle, 0)
++                )
++            except BaseException:
++                driver.cuMemRelease(handle)
++                raise
++            chunks.append((i * part_bytes, part_bytes, handle))
++        access = driver.CUmemAccessDesc()
++        access.location.type = driver.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
++        access.location.id = int(cu_dev)
++        access.flags = driver.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
++        checkCudaErrors(driver.cuMemSetAccess(ptr, va_bytes, [access], 1))
++    except BaseException:
++        # unwind (e.g. out of memory in the second domain): nothing has used the mapping yet
++        for offset, size, handle in chunks:
++            driver.cuMemUnmap(ptr + offset, size)
++            driver.cuMemRelease(handle)
++        driver.cuMemAddressFree(ptr, va_bytes)
++        raise
++    owner = _LocalizedAllocation(ptr, va_bytes, "|u1")
++    weakref.finalize(
++        owner, _unmap_localized, dev.index, ptr, va_bytes, chunks
++    ).atexit = False
++    flat = torch.as_tensor(owner, device=dev).view(dtype)
++    inner = []
++    stride = 1
++    for size in reversed(part_shape):
++        inner.append(stride)
++        stride *= size
++    return torch.as_strided(
++        flat, (num_domains, *part_shape), (part_bytes // elem, *reversed(inner))
++    )
+diff --git a/tests/gdn/test_decode_bf16_state_rubin.py b/tests/gdn/test_decode_bf16_state_rubin.py
+new file mode 100644
+index 00000000000..c00d4826217
+--- /dev/null
++++ b/tests/gdn/test_decode_bf16_state_rubin.py
+@@ -0,0 +1,488 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++"""
++
++"""Rubin-tuned T=1 GDN decode kernel with BF16 state (gdn_decode_bf16_state_rubin), SM107 only.
++
++Where the generic dispatcher picks its wide_vec T=1 kernel (B * HV >= 512) the math and FMA order
++are identical, so outputs and the updated state must be bitwise equal. At smaller work sizes the
++generic dispatcher runs a different kernel (mtp_ilp4) with another reduction order, so there the
++comparison uses a bf16 tolerance. The build specializes on a few input properties (16 B aligned
++q/k rows, unit-stride output rows, dense state rows); the layout test runs each one's other side.
++The fp32-reference check is test_decode_delta_rule.py::test_gdn_decode_bf16_state_t1_kernel.
++"""
++
++import math
++
++import pytest
++import torch
++
++import flashinfer.gdn_decode as gdn_decode
++from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose, ugpu_state_pool
++from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule as generic
++from flashinfer.gdn_kernels.gdn_decode_bf16_state_rubin import gated_delta_rule_t1_rubin
++
++pytestmark = pytest.mark.arch_rubin
++
++D = 128
++
++
++def _inputs(B, HQ, HK, HV, pool, seed, dtype=torch.bfloat16):
++    g = torch.Generator(device="cuda").manual_seed(seed)
++
++    def r(*s, dt=dtype):
++        return torch.randn(*s, device="cuda", dtype=dt, generator=g)
++
++    return dict(
++        q=r(B, 1, HQ, D),
++        k=r(B, 1, HK, D),
++        v=r(B, 1, HV, D),
++        A_log=r(HV, dt=torch.float32),
++        a=r(B, 1, HV),
++        dt_bias=r(HV, dt=torch.bfloat16),  # the API takes bf16 / fp32 dt_bias
++        b=r(B, 1, HV),
++        state=r(pool, HV, D, D, dt=torch.bfloat16) * 0.1,
++    )
++
++
++def _call(fn, inp, state, idx, out_idx, l2norm, **extra):
++    out = torch.empty(
++        inp["q"].shape[0], 1, inp["v"].shape[2], D, device="cuda", dtype=torch.bfloat16
++    )
++    fn(
++        A_log=inp["A_log"],
++        a=inp["a"],
++        dt_bias=inp["dt_bias"],
++        q=inp["q"],
++        k=inp["k"],
++        v=inp["v"],
++        b=inp["b"],
++        initial_state_source=state,
++        initial_state_indices=idx,
++        output_state_indices=out_idx,
++        use_qk_l2norm_in_kernel=l2norm,
++        scale=1.0 / math.sqrt(D),
++        output=out,
++        **extra,
++    )
++    return out
++
++
++def _api(inp, state, idx, out_idx, backend, **extra):
++    return gated_delta_rule_decode_pretranspose(
++        q=inp["q"],
++        k=inp["k"],
++        v=inp["v"],
++        state=None,
++        A_log=inp["A_log"],
++        a=inp["a"],
++        dt_bias=inp["dt_bias"],
++        b=inp["b"],
++        scale=1.0 / math.sqrt(D),
++        use_qk_l2norm=True,
++        initial_state=state,
++        initial_state_indices=idx,
++        output_state_indices=out_idx,
++        backend=backend,
++        **extra,
++    )[0]
++
++
++def _pool(B, mode):
++    if mode == "split":
++        pool = 2 * B
++        idx = torch.arange(B, dtype=torch.int32, device="cuda")
++        out_idx = torch.arange(B, 2 * B, dtype=torch.int32, device="cuda")
++    elif mode == "shuffled":
++        pool = B + 7
++        idx = torch.randperm(pool, device="cuda")[:B].to(torch.int32)
++        out_idx = None
++    else:
++        pool = B
++        idx = torch.arange(B, dtype=torch.int32, device="cuda")
++        out_idx = None
++    return pool, idx, out_idx
++
++
++@pytest.mark.parametrize("B", [1, 4, 8, 16, 32, 64, 128, 512])
++@pytest.mark.parametrize("HQ,HK,HV", [(16, 16, 64), (16, 16, 32)])
++@pytest.mark.parametrize("l2norm", [True, False])
++@pytest.mark.parametrize("pool_mode", ["single", "split", "shuffled"])
++def test_rubin_t1_matches_generic(B, HQ, HK, HV, l2norm, pool_mode):
++    pool, idx, out_idx = _pool(B, pool_mode)
++    inp = _inputs(B, HQ, HK, HV, pool, seed=B * 7 + HV)
++    st_ref = inp["state"].clone()
++    st_new = inp["state"].clone()
++    o_ref = _call(generic, inp, st_ref, idx, out_idx, l2norm)
++    o_new = _call(gated_delta_rule_t1_rubin, inp, st_new, idx, out_idx, l2norm)
++    torch.cuda.synchronize()
++
++    if B * HV >= 512:  # the generic dispatcher runs the same wide_vec T=1 math
++        assert torch.equal(o_new, o_ref)
++        assert torch.equal(st_new, st_ref)
++    else:
++        torch.testing.assert_close(o_new.float(), o_ref.float(), atol=2e-2, rtol=2e-2)
++        torch.testing.assert_close(st_new.float(), st_ref.float(), atol=2e-2, rtol=2e-2)
++    # pool slots that are not written must stay untouched
++    touched = torch.zeros(pool, dtype=torch.bool, device="cuda")
++    touched[(out_idx if out_idx is not None else idx).long()] = True
++    assert torch.equal(st_new[~touched], inp["state"][~touched])
++
++
++@pytest.mark.parametrize(
++    "tile_v,pf_dist", [(32, None), (64, None), (128, None), (64, 0)]
++)
++def test_rubin_t1_variants_bitwise(tile_v, pf_dist):
++    """Every tile size, with and without the L2 prefetch, computes the same thing."""
++    B, HQ, HK, HV = 64, 16, 16, 64
++    inp = _inputs(B, HQ, HK, HV, B, seed=3)
++    idx = torch.arange(B, dtype=torch.int32, device="cuda")
++    st_ref = inp["state"].clone()
++    o_ref = _call(generic, inp, st_ref, idx, None, True)
++    st = inp["state"].clone()
++    o = _call(
++        gated_delta_rule_t1_rubin,
++        inp,
++        st,
++        idx,
++        None,
++        True,
++        tile_v=tile_v,
++        pf_dist=pf_dist,
++    )
++    torch.cuda.synchronize()
++    assert torch.equal(o, o_ref)
++    assert torch.equal(st, st_ref)
++
++
++def test_rubin_t1_negative_index_matches_generic():
++    """Padding rows (index -1) follow the generic kernel's redirect-to-slot-0 semantics."""
++    B, HQ, HK, HV = 16, 16, 16, 64
++    inp = _inputs(B, HQ, HK, HV, B, seed=11)
++    idx = torch.arange(B, dtype=torch.int32, device="cuda")
++    idx[3] = -1
++    st_ref = inp["state"].clone()
++    st_new = inp["state"].clone()
++    o_ref = _call(generic, inp, st_ref, idx, None, True)
++    o_new = _call(gated_delta_rule_t1_rubin, inp, st_new, idx, None, True)
++    torch.cuda.synchronize()
++    good = torch.ones(B, dtype=torch.bool, device="cuda")
++    good[3] = False
++    good[0] = (
++        False  # slot 0 is also written by the redirected padding row (race in both)
++    )
++    assert torch.equal(o_new[good], o_ref[good])
++    assert torch.equal(st_new[good], st_ref[good])
++
++
++@pytest.mark.parametrize("B", [64, 512])
++def test_rubin_t1_fused_qkv_views(B):
++    """q / k / v as views of one fused QKV buffer (each build compiles their strides): the
++    same bits as contiguous q / k / v."""
++    HQ, HK, HV = 16, 16, 64
++    inp = _inputs(B, HQ, HK, HV, B, seed=B + 5)
++    idx = torch.arange(B, dtype=torch.int32, device="cuda")
++    st_ref = inp["state"].clone()
++    o_ref = _call(gated_delta_rule_t1_rubin, inp, st_ref, idx, None, True)
++    qkv = torch.cat([inp["q"], inp["k"], inp["v"]], dim=2)  # [B, 1, HQ + HK + HV, D]
++    views = dict(
++        inp, q=qkv[:, :, :HQ], k=qkv[:, :, HQ : HQ + HK], v=qkv[:, :, HQ + HK :]
++    )
++    assert not views["q"].is_contiguous()
++    st = inp["state"].clone()
++    o = _call(gated_delta_rule_t1_rubin, views, st, idx, None, True)
++    torch.cuda.synchronize()
++    assert torch.equal(o, o_ref)
++    assert torch.equal(st, st_ref)
++
++
++def test_rubin_t1_strided_pool_sizes():
++    """vLLM-style padded pool (slot stride > HV * V * K) at two pool sizes in a row: each
++    size gets its own build and the same bits as the generic kernel."""
++    HQ, HK, HV = 16, 16, 32
++    for B in (16, 32):
++        pool = 2 * B
++        inp = _inputs(B, HQ, HK, HV, pool, seed=B + 9)
++        idx = (torch.arange(B, dtype=torch.int32, device="cuda") * 2 + 1) % pool
++        states = []
++        for _ in range(2):
++            big = torch.empty(pool, HV + 1, D, D, dtype=torch.bfloat16, device="cuda")
++            st = big[:, :HV]
++            st.copy_(inp["state"])
++            assert not st.is_contiguous()
++            states.append(st)
++        o_ref = _call(generic, inp, states[0], idx, None, True)
++        o = _call(gated_delta_rule_t1_rubin, inp, states[1], idx, None, True)
++        torch.cuda.synchronize()
++        assert torch.equal(o, o_ref)
++        assert torch.equal(states[1], states[0])
++
++
++@pytest.mark.parametrize("layout", ["unaligned_qk", "strided_output", "padded_rows"])
++def test_rubin_t1_layouts(layout):
++    """The other side of each input property the build specializes on: q / k rows that are
++    not 16 B aligned (no 16 B q / k loads), an output with a non-unit last stride, state rows
++    padded past K (no dense-row prefetch addressing). The same bits as the generic kernel."""
++    B, HQ, HK, HV = 64, 16, 16, 64
++    inp = _inputs(B, HQ, HK, HV, B, seed=17)
++    idx = torch.arange(B, dtype=torch.int32, device="cuda")
++    st_ref = inp["state"].clone()
++    o_ref = _call(generic, inp, st_ref, idx, None, True)
++    st = inp["state"].clone()
++    if layout == "unaligned_qk":
++        for name, H in (("q", HQ), ("k", HK)):
++            # rows 264 B apart: only every other row starts on a 16 B boundary
++            view = torch.empty(B, 1, H, D + 4, dtype=torch.bfloat16, device="cuda")
++            view = view[..., :D]
++            view.copy_(inp[name])
++            inp = dict(inp, **{name: view})
++    if layout == "padded_rows":
++        big = torch.empty(B, HV, D, D + 8, dtype=torch.bfloat16, device="cuda")
++        st = big[..., :D]
++        st.copy_(inp["state"])
++    out = torch.empty(B, 1, HV, D, device="cuda", dtype=torch.bfloat16)
++    if layout == "strided_output":
++        out = torch.empty(B, 1, HV, 2 * D, device="cuda", dtype=torch.bfloat16)[
++            ..., ::2
++        ]
++    gated_delta_rule_t1_rubin(
++        A_log=inp["A_log"],
++        a=inp["a"],
++        dt_bias=inp["dt_bias"],
++        q=inp["q"],
++        k=inp["k"],
++        v=inp["v"],
++        b=inp["b"],
++        initial_state_source=st,
++        initial_state_indices=idx,
++        use_qk_l2norm_in_kernel=True,
++        scale=1.0 / math.sqrt(D),
++        output=out,
++    )
++    torch.cuda.synchronize()
++    assert torch.equal(out, o_ref)
++    assert torch.equal(st, st_ref)
++
++
++def test_rubin_t1_disk_cache_round_trip(monkeypatch, tmp_path):
++    """A second process reloads the exported kernel instead of recompiling (simulated
++    in-process: clear the in-process caches, forbid cute.compile, call again)."""
++    import flashinfer.gdn_kernels.gdn_decode_bf16_state_rubin as rubin_mod
++    import flashinfer.jit.env as jit_env
++
++    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
++    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
++    monkeypatch.setattr(rubin_mod, "_compiled_t1_rubin", {})
++    monkeypatch.setattr(rubin_mod, "_launch_t1_rubin", {})
++    B, HV = 8, 64
++    inp = _inputs(B, 16, 16, HV, B, seed=23)
++    idx = torch.arange(B, dtype=torch.int32, device="cuda")
++    st1 = inp["state"].clone()
++    o1 = _call(gated_delta_rule_t1_rubin, inp, st1, idx, None, True)
++    artifacts = list(tmp_path.glob("gdn_decode_bf16_state_rubin_*_cute_dsl/*.o"))
++    assert len(artifacts) == 1, f"expected one exported artifact, got {artifacts}"
++
++    monkeypatch.setattr(rubin_mod, "_compiled_t1_rubin", {})
++    monkeypatch.setattr(rubin_mod, "_launch_t1_rubin", {})
++
++    def _no_recompile(*args, **kwargs):
++        raise AssertionError("cute.compile ran despite a valid disk artifact")
++
++    monkeypatch.setattr(rubin_mod.cute, "compile", _no_recompile)
++    st2 = inp["state"].clone()
++    o2 = _call(gated_delta_rule_t1_rubin, inp, st2, idx, None, True)
++    torch.cuda.synchronize()
++    assert torch.equal(o1, o2)
++    assert torch.equal(st1, st2)
++
++
++@pytest.mark.parametrize("B", [2048, 4096])
++def test_rubin_t1_bitwise_large_batch(B):
++    HQ, HK, HV = 16, 16, 64
++    inp = _inputs(B, HQ, HK, HV, B, seed=B)
++    idx = torch.arange(B, dtype=torch.int32, device="cuda")
++    st_ref = inp["state"].clone()
++    o_ref = _call(generic, inp, st_ref, idx, None, True)
++    st = inp["state"].clone()
++    o = _call(gated_delta_rule_t1_rubin, inp, st, idx, None, True)
++    torch.cuda.synchronize()
++    assert torch.equal(o, o_ref)
++    assert torch.equal(st, st_ref)
++
++
++@pytest.mark.parametrize("B,HV", [(4, 64), (8, 64), (16, 32), (64, 64), (512, 64)])
++@pytest.mark.parametrize("pool_mode", ["single", "split"])
++def test_rubin_api_routing(B, HV, pool_mode, monkeypatch):
++    """backend="auto" on SM107 uses the Rubin kernel exactly when B * HV >= 512, and
++    "auto", "rubin" and "flashinfer" (generic) agree bitwise there."""
++    calls = []
++    real = gdn_decode._gated_delta_rule_t1_rubin
++
++    def counting(*args, **kwargs):
++        calls.append(1)
++        return real(*args, **kwargs)
++
++    monkeypatch.setattr(gdn_decode, "_gated_delta_rule_t1_rubin", counting)
++    pool, idx, out_idx = _pool(B, pool_mode)
++    inp = _inputs(B, 16, 16, HV, pool, seed=B + HV)
++    res = {}
++    for backend in ("flashinfer", "auto", "rubin"):
++        st = inp["state"].clone()
++        n = len(calls)
++        res[backend] = (_api(inp, st, idx, out_idx, backend), st)
++        res[backend + "_routed"] = len(calls) > n
++    torch.cuda.synchronize()
++    assert not res["flashinfer_routed"]
++    assert res["rubin_routed"]
++    assert res["auto_routed"] == (B * HV >= 512)
++    if B * HV >= 512:
++        for backend in ("auto", "rubin"):
++            assert torch.equal(res[backend][0], res["flashinfer"][0])
++            assert torch.equal(res[backend][1], res["flashinfer"][1])
++    else:
++        torch.testing.assert_close(
++            res["rubin"][0].float(), res["flashinfer"][0].float(), atol=2e-2, rtol=2e-2
++        )
++
++
++@pytest.mark.parametrize("pool_mode", ["single", "split"])
++def test_rubin_api_int64_indices_fp16_inputs(pool_mode):
++    """int64 read / write indices and fp16 q / k / v / a / b: the same bits as the generic
++    path with int32 indices."""
++    B, HV = 64, 64
++    pool, idx, out_idx = _pool(B, pool_mode)
++    inp = _inputs(B, 16, 16, HV, pool, seed=21, dtype=torch.float16)
++    idx64 = idx.to(torch.int64)
++    out_idx64 = None if out_idx is None else out_idx.to(torch.int64)
++    st_ref = inp["state"].clone()
++    st = inp["state"].clone()
++    o_ref = _api(inp, st_ref, idx, out_idx, "flashinfer")
++    o = _api(inp, st, idx64, out_idx64, "rubin")
++    torch.cuda.synchronize()
++    assert torch.equal(o, o_ref)
++    assert torch.equal(st, st_ref)
++
++
++def _ugpu_pool(state):
++    """A uGPU pool [pool, HV, 2, V/2, K] holding the contents of a [pool, HV, V, K] pool."""
++    P, HV = state.shape[:2]
++    pool = ugpu_state_pool(P, HV, D, state.device)
++    pool.copy_(state.view(P, HV, 2, D // 2, D))
++    return pool
++
++
++def _as_4d(pool):
++    P, HV = pool.shape[:2]
++    return pool.reshape(P, HV, D, D)
++
++
++@pytest.mark.parametrize("B,HV", [(1, 64), (8, 64), (64, 32), (512, 64)])
++@pytest.mark.parametrize("pool_mode", ["single", "split", "shuffled"])
++@pytest.mark.parametrize("eager_per_die", [False, True])
++def test_rubin_ugpu_matches_one_launch(B, HV, pool_mode, eager_per_die, monkeypatch):
++    """A ugpu_state_pool makes the default call run each half of every state on its own die
++    (eager calls below _UGPU_EAGER_MIN_STATES: back to back on the current stream; both
++    forms checked): the same bits as one launch over an ordinary pool."""
++    if eager_per_die:
++        monkeypatch.setattr(gdn_decode, "_UGPU_EAGER_MIN_STATES", 0)
++    pool, idx, out_idx = _pool(B, pool_mode)
++    inp = _inputs(B, 16, 16, HV, pool, seed=B + HV + 3)
++    st_ref = inp["state"].clone()
++    o_ref = _api(inp, st_ref, idx, out_idx, "rubin")
++    st = _ugpu_pool(inp["state"])
++    o = _api(inp, st, idx, out_idx, "auto")
++    torch.cuda.synchronize()
++    assert torch.equal(o, o_ref)
++    assert torch.equal(_as_4d(st), st_ref)
++
++
++def test_rubin_ugpu_negative_index():
++    B, HV = 16, 64
++    inp = _inputs(B, 16, 16, HV, B, seed=13)
++    idx = torch.arange(B, dtype=torch.int32, device="cuda")
++    idx[5] = -1
++    st_ref = inp["state"].clone()
++    o_ref = _api(inp, st_ref, idx, None, "rubin")
++    st = _ugpu_pool(inp["state"])
++    o = _api(inp, st, idx, None, "auto")
++    torch.cuda.synchronize()
++    good = torch.ones(B, dtype=torch.bool, device="cuda")
++    good[5] = False
++    good[0] = False
++    assert torch.equal(o[good], o_ref[good])
++    assert torch.equal(_as_4d(st)[good], st_ref[good])
++
++
++def test_rubin_ugpu_cuda_graph():
++    """The per-die fork / join is captured into a CUDA graph and replays correctly."""
++    B, HV = 64, 64
++    inp = _inputs(B, 16, 16, HV, B, seed=5)
++    idx = torch.arange(B, dtype=torch.int32, device="cuda")
++    st_ref = inp["state"].clone()
++    for _ in range(3):
++        o_ref = _api(inp, st_ref, idx, None, "rubin")
++    st = _ugpu_pool(inp["state"])
++    out = torch.empty(B, 1, HV, D, device="cuda", dtype=torch.bfloat16)
++
++    def step():
++        gated_delta_rule_decode_pretranspose(
++            q=inp["q"],
++            k=inp["k"],
++            v=inp["v"],
++            state=None,
++            A_log=inp["A_log"],
++            a=inp["a"],
++            dt_bias=inp["dt_bias"],
++            b=inp["b"],
++            scale=1.0 / math.sqrt(D),
++            output=out,
++            use_qk_l2norm=True,
++            initial_state=st,
++            initial_state_indices=idx,
++        )
++
++    step()  # eager call: creates the per-die green contexts outside capture
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        step()
++    graph.replay()
++    graph.replay()
++    torch.cuda.synchronize()
++    assert torch.equal(out, o_ref)
++    assert torch.equal(_as_4d(st), st_ref)
++
++
++@pytest.mark.parametrize("eager_per_die", [False, True])
++def test_rubin_ugpu_on_non_current_device(eager_per_die, monkeypatch):
++    """A uGPU decode on cuda:1 while cuda:0 is current: per-die streams and events of cuda:1,
++    the same bits as one launch there."""
++    if torch.cuda.device_count() < 2:
++        pytest.skip("needs two GPUs")
++    if eager_per_die:
++        monkeypatch.setattr(gdn_decode, "_UGPU_EAGER_MIN_STATES", 0)
++    B, HV = 32, 64
++    with torch.cuda.device(1):
++        inp = _inputs(B, 16, 16, HV, B, seed=29)
++        idx = torch.arange(B, dtype=torch.int32, device="cuda")
++        st_ref = inp["state"].clone()
++        o_ref = _api(inp, st_ref, idx, None, "rubin")
++        st = _ugpu_pool(inp["state"])
++    assert st.device == torch.device("cuda:1")
++    with torch.cuda.device(0):
++        o = _api(inp, st, idx, None, "auto")
++    torch.cuda.synchronize(1)
++    assert torch.equal(o, o_ref)
++    assert torch.equal(_as_4d(st), st_ref)
+diff --git a/tests/gdn/test_decode_delta_rule.py b/tests/gdn/test_decode_delta_rule.py
+index 19f357ccc0c..337133cf0ed 100644
+--- a/tests/gdn/test_decode_delta_rule.py
++++ b/tests/gdn/test_decode_delta_rule.py
+@@ -62,6 +62,14 @@
+ except ImportError:
+     GDN_DECODE_BF16_STATE_AVAILABLE = False
+ 
++# Rubin-tuned (SM107) T=1 BF16 state kernel
++try:
++    from flashinfer.gdn_kernels.gdn_decode_bf16_state_rubin import (
++        gated_delta_rule_t1_rubin as gdn_decode_bf16_state_t1_rubin,
++    )
++except (ImportError, RuntimeError):
++    gdn_decode_bf16_state_t1_rubin = None
++
+ 
+ def _skip_if_not_sm90_or_later():
+     """Skip test if not Hopper (SM90+) or Blackwell (SM100+) architecture."""
+@@ -2020,15 +2028,22 @@ def _test_gdn_decode_bf16_state_t1_kernel(
+     alpha: bool,
+     beta: bool,
+     seed: int | None = None,
++    kernel: str = "generic",
+ ):
+     """Test BF16 state kernel for T=1.
+ 
+     Both kernel and reference use bf16 h state so the comparison is apples-to-apples.
++    ``kernel="rubin"`` runs the Rubin-tuned T=1 kernel (SM107) instead of the generic one.
+     """
+     _skip_if_not_sm90_or_later()
+ 
+     if not GDN_DECODE_BF16_STATE_AVAILABLE:
+         pytest.skip("BF16 state kernel not available")
++    if kernel == "rubin" and gdn_decode_bf16_state_t1_rubin is None:
++        pytest.skip("Rubin BF16 state kernel not available")
++    kernel_fn = (
++        gdn_decode_bf16_state_t1_rubin if kernel == "rubin" else gdn_decode_bf16_state
++    )
+ 
+     random.seed(seed)
+     torch.random.manual_seed(seed)
+@@ -2072,7 +2087,7 @@ def _test_gdn_decode_bf16_state_t1_kernel(
+     # non-pool semantics.
+     our_state = input_state_kernel.clone()
+     indices = torch.arange(batch_size, dtype=torch.int32, device=device)
+-    our_o = gdn_decode_bf16_state(
++    our_o = kernel_fn(
+         A_log=A_log,
+         a=a,
+         dt_bias=dt_bias,
+@@ -2146,7 +2161,11 @@ def _test_gdn_decode_bf16_state_t1_kernel(
+ # One B per _get_bf16_mtp_config bucket, at both HV=32 and HV=64.
+ @pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32])
+ @pytest.mark.parametrize("dtype", ["bfloat16"])
++@pytest.mark.parametrize(
++    "kernel", ["generic", pytest.param("rubin", marks=pytest.mark.arch_rubin)]
++)
+ def test_gdn_decode_bf16_state_t1_kernel(
++    kernel: str,
+     dtype: str,
+     num_q_heads: int,
+     num_k_heads: int,
+@@ -2170,9 +2189,45 @@ def test_gdn_decode_bf16_state_t1_kernel(
+         alpha,
+         beta,
+         seed,
++        kernel,
+     )
+ 
+ 
++def test_pretranspose_backend_rubin_rejected_off_sm107():
++    """backend="rubin" and the Rubin kernel itself are gated to compute capability 10.7."""
++    _skip_if_not_sm90_or_later()
++    if gdn_decode_bf16_state_t1_rubin is None:
++        pytest.skip("Rubin BF16 state kernel not available")
++    if get_compute_capability(torch.device("cuda")) == (10, 7):
++        pytest.skip("runs on GPUs other than SM107")
++    B, H, HV, K = 8, 16, 64, 128
++    device = torch.device("cuda")
++    q = torch.randn(B, 1, H, K, dtype=torch.bfloat16, device=device)
++    k = torch.randn(B, 1, H, K, dtype=torch.bfloat16, device=device)
++    v = torch.randn(B, 1, HV, K, dtype=torch.bfloat16, device=device)
++    a = torch.randn(B, 1, HV, dtype=torch.bfloat16, device=device)
++    b = torch.randn(B, 1, HV, dtype=torch.bfloat16, device=device)
++    A_log = torch.randn(HV, dtype=torch.float32, device=device)
++    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
++    state = torch.randn(B, HV, K, K, dtype=torch.bfloat16, device=device)
++    with pytest.raises(ValueError, match="10.7"):
++        gated_delta_rule_decode_pretranspose(
++            q, k, v, state, A_log, a, dt_bias, b, backend="rubin"
++        )
++    with pytest.raises(ValueError, match="10.7"):
++        gdn_decode_bf16_state_t1_rubin(
++            A_log=A_log,
++            a=a,
++            dt_bias=dt_bias,
++            q=q,
++            k=k,
++            v=v,
++            b=b,
++            initial_state_source=state,
++            initial_state_indices=torch.arange(B, dtype=torch.int32, device=device),
++        )
++
++
+ # ============================================================================
+ # Test BF16 state MTP kernel (T>=2)
+ # ============================================================================
+diff --git a/tests/utils/test_green_ctx.py b/tests/utils/test_green_ctx.py
+index 99d6dc97bc3..1e33e0e6366 100644
+--- a/tests/utils/test_green_ctx.py
++++ b/tests/utils/test_green_ctx.py
+@@ -206,3 +206,127 @@ def test_split_device_green_ctx_by_sm_count_alignment(
+                 f"Insufficient SMs on device. Total SMs available: {total_sms}, requested SM counts: {sm_counts}"
+             )
+         raise
++
++
++def _need_locality_domains(dev):
++    if green_ctx.get_locality_domain_count(dev) < 2:
++        pytest.skip("needs a GPU with at least two locality domains (uGPUs)")
++
++
++def test_split_device_green_ctx_by_locality_domain():
++    dev = torch.device("cuda:0")
++    _need_locality_domains(dev)
++    n = green_ctx.get_locality_domain_count(dev)
++    total = green_ctx.get_device_resource(green_ctx.get_cudevice(dev)).sm.smCount
++    streams, resources = green_ctx.split_device_green_ctx_by_locality_domain(dev)
++    assert len(streams) == len(resources) == n
++    assert all(r.sm.smCount == total // n for r in resources)
++    x = torch.randn(1 << 20, device=dev)
++    for s in streams:
++        with torch.cuda.stream(s):
++            y = x * 2
++        s.synchronize()
++        torch.testing.assert_close(y, x * 2)
++
++
++@pytest.mark.parametrize("part_shape", [(1,), (37, 32, 128, 128)])
++def test_empty_per_locality_domain(part_shape):
++    dev = torch.device("cuda:0")
++    _need_locality_domains(dev)
++    n = green_ctx.get_locality_domain_count(dev)
++    t = green_ctx.empty_per_locality_domain(part_shape, torch.bfloat16, dev)
++    assert t.shape == (n, *part_shape)
++    for i in range(n):
++        assert t[i].is_contiguous()
++    ref = torch.randn(n, *part_shape, device=dev).to(torch.bfloat16)
++    t.copy_(ref)
++    assert torch.equal(t, ref)
++    del t
++
++
++def test_locality_domain_helpers_accept_unindexed_device():
++    _need_locality_domains(torch.device("cuda:0"))
++    torch.cuda.set_device(0)
++    assert green_ctx.get_locality_domain_count(torch.device("cuda")) >= 2
++    t = green_ctx.empty_per_locality_domain(
++        (4, 1024), torch.float32, torch.device("cuda")
++    )
++    t.fill_(1.0)
++    assert t.sum().item() == t.numel()
++
++
++def test_split_by_locality_domain_on_non_current_device():
++    """Streams of a device other than the current one belong to that device."""
++    if torch.cuda.device_count() < 2:
++        pytest.skip("needs two GPUs")
++    dev = torch.device("cuda:1")
++    _need_locality_domains(dev)
++    with torch.cuda.device(0):
++        streams, _ = green_ctx.split_device_green_ctx_by_locality_domain(dev)
++        assert all(s.device == dev for s in streams)
++        x = torch.randn(1 << 20, device=dev)
++        with torch.cuda.stream(streams[0]):
++            y = x * 2
++        streams[0].synchronize()
++    torch.testing.assert_close(y, x * 2)
++
++
++def test_empty_per_locality_domain_freed_during_capture():
++    """A localized tensor that dies during CUDA graph capture does not synchronize the
++    device there (which would invalidate the capture); its release waits until after."""
++    import gc
++
++    dev = torch.device("cuda:0")
++    _need_locality_domains(dev)
++    torch.cuda.set_device(0)
++    t = green_ctx.empty_per_locality_domain((1 << 20,), torch.float32, dev)
++    x = torch.zeros(1, device=dev)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        x.add_(1)
++        del t
++        gc.collect()
++        assert len(green_ctx._deferred_releases) == 1
++    graph.replay()
++    torch.cuda.synchronize()
++    assert x.item() == 1
++    t2 = green_ctx.empty_per_locality_domain((16,), torch.float32, dev)
++    assert not green_ctx._deferred_releases  # released by the next allocation
++    del t2
++
++
++def test_empty_per_locality_domain_unwinds_on_failure(monkeypatch):
++    """A failing driver call after the mappings are made releases them before re-raising."""
++    dev = torch.device("cuda:0")
++    _need_locality_domains(dev)
++    real = green_ctx.driver
++    calls = {"unmap": 0, "release": 0, "free": 0}
++
++    class _Driver:
++        def __getattr__(self, name):
++            return getattr(real, name)
++
++        @staticmethod
++        def cuMemSetAccess(*args):
++            raise RuntimeError("injected cuMemSetAccess failure")
++
++        @staticmethod
++        def cuMemUnmap(*args):
++            calls["unmap"] += 1
++            return real.cuMemUnmap(*args)
++
++        @staticmethod
++        def cuMemRelease(*args):
++            calls["release"] += 1
++            return real.cuMemRelease(*args)
++
++        @staticmethod
++        def cuMemAddressFree(*args):
++            calls["free"] += 1
++            return real.cuMemAddressFree(*args)
++
++    monkeypatch.setattr(green_ctx, "driver", _Driver())
++    n = green_ctx.get_locality_domain_count(dev)
++    with pytest.raises(RuntimeError, match="injected"):
++        green_ctx.empty_per_locality_domain((1024,), torch.float32, dev)
++    assert calls == {"unmap": n, "release": n, "free": 1}

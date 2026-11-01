@@ -1,0 +1,352 @@
+diff --git a/csrc/cake_gemm_allreduce/cake_gemm_allreduce_kernels.cu b/csrc/cake_gemm_allreduce/cake_gemm_allreduce_kernels.cu
+index 9b2ef6d494e..fbc68adc776 100644
+--- a/csrc/cake_gemm_allreduce/cake_gemm_allreduce_kernels.cu
++++ b/csrc/cake_gemm_allreduce/cake_gemm_allreduce_kernels.cu
+@@ -323,9 +323,9 @@ kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws2(const __grid_constant_
+             }
+             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -547,6 +547,7 @@ kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws2(const __grid_constant_
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -680,6 +681,8 @@ kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws2(const __grid_constant_
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {
+@@ -1159,9 +1162,9 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws2(const __grid_constant_
+                 }
+             }
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -1279,6 +1282,7 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws2(const __grid_constant_
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -1412,6 +1416,8 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws2(const __grid_constant_
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {
+@@ -2123,9 +2129,9 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws2(const __grid_constant_
+                 }
+             }
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -2259,6 +2265,7 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws2(const __grid_constant_
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -2392,6 +2399,8 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws2(const __grid_constant_
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {
+@@ -3372,9 +3381,9 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws2(const __grid_constant
+                 }
+             }
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -3540,6 +3549,7 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws2(const __grid_constant
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -3673,6 +3683,8 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws2(const __grid_constant
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {
+@@ -3939,9 +3951,9 @@ kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws4(const __grid_constant_
+             }
+             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -4243,6 +4255,7 @@ kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws4(const __grid_constant_
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -4376,6 +4389,8 @@ kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws4(const __grid_constant_
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {
+@@ -4935,9 +4950,9 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws4(const __grid_constant_
+                 }
+             }
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -5055,6 +5070,7 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws4(const __grid_constant_
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -5188,6 +5204,8 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws4(const __grid_constant_
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {
+@@ -5863,9 +5881,9 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws4(const __grid_constant_
+                 }
+             }
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -5999,6 +6017,7 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws4(const __grid_constant_
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -6132,6 +6151,8 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws4(const __grid_constant_
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {
+@@ -7040,9 +7061,9 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws4(const __grid_constant
+                 }
+             }
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -7208,6 +7229,7 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws4(const __grid_constant
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -7341,6 +7363,8 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws4(const __grid_constant
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {
+@@ -7607,9 +7631,9 @@ kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws8(const __grid_constant_
+             }
+             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -8071,6 +8095,7 @@ kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws8(const __grid_constant_
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -8204,6 +8229,8 @@ kernel_cake_blackwell_gemm_allreduce_oneshot_n16_bf16_ws8(const __grid_constant_
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {
+@@ -8923,9 +8950,9 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws8(const __grid_constant_
+                 }
+             }
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -9043,6 +9070,7 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws8(const __grid_constant_
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -9176,6 +9204,8 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n32_bf16_ws8(const __grid_constant_
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {
+@@ -10011,9 +10041,9 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws8(const __grid_constant_
+                 }
+             }
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -10147,6 +10177,7 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws8(const __grid_constant_
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -10280,6 +10311,8 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n64_bf16_ws8(const __grid_constant_
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {
+@@ -11152,9 +11185,9 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws8(const __grid_constant
+                 }
+             }
+             if (warp == 0) {
+-                asm volatile("barrier.sync 9, 128;" ::: "memory");
++                asm volatile("barrier.sync 9, 192;" ::: "memory");
+             } else {
+-                asm volatile("barrier.arrive 9, 128;" ::: "memory");
++                asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             }
+             if (tid_1 == 0) {
+                 asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+@@ -11320,6 +11353,7 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws8(const __grid_constant
+                 _vec_load_1[0 + 2] = _uv4_1.z;
+                 _vec_load_1[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_1 = _vec_load_0[3];
+             unsigned int dirty_stage_bytes_1 = 0;
+             if (dirty_num_stages_1 > 0) {
+@@ -11453,6 +11487,8 @@ kernel_cake_blackwell_gemm_allreduce_twoshot_n128_bf16_ws8(const __grid_constant
+                 _vec_load_3[0 + 2] = _uv4_1.z;
+                 _vec_load_3[0 + 3] = _uv4_1.w;
+             }
++            asm volatile("tcgen05.fence::before_thread_sync;");
++            asm volatile("barrier.arrive 9, 192;" ::: "memory");
+             unsigned int dirty_num_stages_2 = _vec_load_2[3];
+             unsigned int dirty_stage_bytes_2 = 0;
+             if (dirty_num_stages_2 > 0) {

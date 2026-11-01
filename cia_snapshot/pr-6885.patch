@@ -1,0 +1,161 @@
+diff --git a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu
+index b7185c396a..66d5581886 100644
+--- a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu
++++ b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_06c1f7cb4aa36c5918bd_kernel.cu
+@@ -375,6 +375,18 @@ __global__ __launch_bounds__(THREADS)
+           }
+         }
+       }
++#pragma unroll 1
++      for (int _ = 0; _ < 6; _++) {
++        uint32_t _mbar_token_tail = mbarrier_try_wait(mma_done_addr + (load_stage) * 8, load_phase);
++        mbarrier_wait_token(mma_done_addr + (load_stage) * 8, load_phase, _mbar_token_tail);
++        load_stage += 1;
++        if (load_stage == 6) {
++          load_stage = 0;
++        }
++        if (load_stage == 0) {
++          load_phase = load_phase ^ 1;
++        }
++      }
+     }
+   }
+   // ---- Role: mma ----
+diff --git a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu
+index 60fc95093e..805ac5a91d 100644
+--- a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu
++++ b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_17f60837feb11a634b34_kernel.cu
+@@ -372,6 +372,18 @@ __global__ __launch_bounds__(THREADS)
+           }
+         }
+       }
++#pragma unroll 1
++      for (int _ = 0; _ < 6; _++) {
++        uint32_t _mbar_token_tail = mbarrier_try_wait(mma_done_addr + (load_stage) * 8, load_phase);
++        mbarrier_wait_token(mma_done_addr + (load_stage) * 8, load_phase, _mbar_token_tail);
++        load_stage += 1;
++        if (load_stage == 6) {
++          load_stage = 0;
++        }
++        if (load_stage == 0) {
++          load_phase = load_phase ^ 1;
++        }
++      }
+     }
+   }
+   // ---- Role: mma ----
+diff --git a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu
+index dac3f76d1b..bd459b0d36 100644
+--- a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu
++++ b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_18bb325baf7347c5f496_kernel.cu
+@@ -372,6 +372,18 @@ __global__ __launch_bounds__(THREADS)
+           }
+         }
+       }
++#pragma unroll 1
++      for (int _ = 0; _ < 6; _++) {
++        uint32_t _mbar_token_tail = mbarrier_try_wait(mma_done_addr + (load_stage) * 8, load_phase);
++        mbarrier_wait_token(mma_done_addr + (load_stage) * 8, load_phase, _mbar_token_tail);
++        load_stage += 1;
++        if (load_stage == 6) {
++          load_stage = 0;
++        }
++        if (load_stage == 0) {
++          load_phase = load_phase ^ 1;
++        }
++      }
+     }
+   }
+   // ---- Role: mma ----
+diff --git a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_9d5d20282a6a1082a079_kernel.cu b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_9d5d20282a6a1082a079_kernel.cu
+index 7682f06eb3..3112966a43 100644
+--- a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_9d5d20282a6a1082a079_kernel.cu
++++ b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_9d5d20282a6a1082a079_kernel.cu
+@@ -445,6 +445,18 @@ __global__ __launch_bounds__(THREADS)
+           }
+         }
+       }
++#pragma unroll 1
++      for (int _ = 0; _ < 6; _++) {
++        uint32_t _mbar_token_tail = mbarrier_try_wait(mma_done_addr + (load_stage) * 8, load_phase);
++        mbarrier_wait_token(mma_done_addr + (load_stage) * 8, load_phase, _mbar_token_tail);
++        load_stage += 1;
++        if (load_stage == 6) {
++          load_stage = 0;
++        }
++        if (load_stage == 0) {
++          load_phase = load_phase ^ 1;
++        }
++      }
+     }
+   }
+   // ---- Role: mma ----
+diff --git a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_aa1b0acc28e1e23913d9_kernel.cu b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_aa1b0acc28e1e23913d9_kernel.cu
+index cd30c07bed..ac654081f6 100644
+--- a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_aa1b0acc28e1e23913d9_kernel.cu
++++ b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_aa1b0acc28e1e23913d9_kernel.cu
+@@ -370,6 +370,18 @@ __global__ __launch_bounds__(THREADS)
+           }
+         }
+       }
++#pragma unroll 1
++      for (int _ = 0; _ < 6; _++) {
++        uint32_t _mbar_token_tail = mbarrier_try_wait(mma_done_addr + (load_stage) * 8, load_phase);
++        mbarrier_wait_token(mma_done_addr + (load_stage) * 8, load_phase, _mbar_token_tail);
++        load_stage += 1;
++        if (load_stage == 6) {
++          load_stage = 0;
++        }
++        if (load_stage == 0) {
++          load_phase = load_phase ^ 1;
++        }
++      }
+     }
+   }
+   // ---- Role: mma ----
+diff --git a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_b9a6204da826be87d972_kernel.cu b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_b9a6204da826be87d972_kernel.cu
+index 80d587a1cc..5471cb2c6f 100644
+--- a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_b9a6204da826be87d972_kernel.cu
++++ b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_b9a6204da826be87d972_kernel.cu
+@@ -445,6 +445,18 @@ __global__ __launch_bounds__(THREADS)
+           }
+         }
+       }
++#pragma unroll 1
++      for (int _ = 0; _ < 6; _++) {
++        uint32_t _mbar_token_tail = mbarrier_try_wait(mma_done_addr + (load_stage) * 8, load_phase);
++        mbarrier_wait_token(mma_done_addr + (load_stage) * 8, load_phase, _mbar_token_tail);
++        load_stage += 1;
++        if (load_stage == 6) {
++          load_stage = 0;
++        }
++        if (load_stage == 0) {
++          load_phase = load_phase ^ 1;
++        }
++      }
+     }
+   }
+   // ---- Role: mma ----
+diff --git a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_d0fc2abec5d93b9a81ec_kernel.cu b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_d0fc2abec5d93b9a81ec_kernel.cu
+index bd0d119f38..45d05c86bf 100644
+--- a/csrc/cake_all_gather_matmul/cake_all_gather_matmul_d0fc2abec5d93b9a81ec_kernel.cu
++++ b/csrc/cake_all_gather_matmul/cake_all_gather_matmul_d0fc2abec5d93b9a81ec_kernel.cu
+@@ -370,6 +370,18 @@ __global__ __launch_bounds__(THREADS)
+           }
+         }
+       }
++#pragma unroll 1
++      for (int _ = 0; _ < 6; _++) {
++        uint32_t _mbar_token_tail = mbarrier_try_wait(mma_done_addr + (load_stage) * 8, load_phase);
++        mbarrier_wait_token(mma_done_addr + (load_stage) * 8, load_phase, _mbar_token_tail);
++        load_stage += 1;
++        if (load_stage == 6) {
++          load_stage = 0;
++        }
++        if (load_stage == 0) {
++          load_phase = load_phase ^ 1;
++        }
++      }
+     }
+   }
+   // ---- Role: mma ----

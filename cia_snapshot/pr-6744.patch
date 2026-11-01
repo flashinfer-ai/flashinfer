@@ -1,0 +1,70 @@
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_709f669fe8647d61aaf0_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_709f669fe8647d61aaf0_kernel.cu
+index 41aff9d9f3e..e7897fa0c18 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_709f669fe8647d61aaf0_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_709f669fe8647d61aaf0_kernel.cu
+@@ -962,6 +962,8 @@ kernel_cake_kimi_k3_attn_res_709f669fe8647d61aaf0(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 0, 288;" ::: "memory");
+             if (warp_0 == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99f148a06e530e457f4a_kernel.cu b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99f148a06e530e457f4a_kernel.cu
+index e2441209e75..1f6dd889350 100644
+--- a/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99f148a06e530e457f4a_kernel.cu
++++ b/flashinfer/experimental/cake_kimi_k3_attn_res/csrc/cake_kimi_k3_attn_res/cake_kimi_k3_attn_res_99f148a06e530e457f4a_kernel.cu
+@@ -955,6 +955,8 @@ kernel_cake_kimi_k3_attn_res_99f148a06e530e457f4a(__nv_bfloat16* __restrict__ ou
+                     }
+                 }
+             }
++            // Only tcgen05.wait::ld completes a tcgen05.ld (a register read does not); drain before the dealloc.
++            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+             asm volatile("barrier.sync 0, 288;" ::: "memory");
+             if (warp_0 == 0) {
+                 int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
+diff --git a/tests/experimental/test_cake_kimi_k3_attn_res.py b/tests/experimental/test_cake_kimi_k3_attn_res.py
+index fc96a7d6be3..54d8d143176 100644
+--- a/tests/experimental/test_cake_kimi_k3_attn_res.py
++++ b/tests/experimental/test_cake_kimi_k3_attn_res.py
+@@ -15,6 +15,7 @@
+ """
+ 
+ import re
++from pathlib import Path
+ 
+ import pytest
+ import torch
+@@ -381,6 +382,31 @@ def test_native_ports_route_on_the_qualified_sm_counts():
+     assert plan.grid_x <= 132
+ 
+ 
++_CSRC = Path(cb.__file__).resolve().parent / "csrc"
++_NATIVE_PROGRAMS = sorted(
++    {
++        name
++        for keys in KERNELS.values()
++        for key, name in keys.items()
++        if key.startswith("native")
++    }
++)
++
++
++@pytest.mark.parametrize("name", _NATIVE_PROGRAMS)
++def test_native_programs_drain_tmem_loads_before_the_dealloc(name):
++    # The native ports read TMEM with tcgen05.ld and free the columns with tcgen05.dealloc
++    # after the cleanup barrier. A register dependency on a tcgen05.ld result does not
++    # complete the load; only tcgen05.wait::ld does (PTX ISA, tcgen05 memory consistency
++    # model), so a wait::ld must come before the barrier that precedes the dealloc.
++    (kernel,) = [s for s in MODULES[name]["sources"] if s.endswith("_kernel.cu")]
++    text = (_CSRC / kernel).read_text()
++    dealloc = text.index("tcgen05.dealloc")
++    cleanup = text.rindex("barrier.sync", 0, dealloc)
++    assert "tcgen05.ld." in text[:cleanup]
++    assert "tcgen05.wait::ld" in text[text.rindex("tcgen05.ld.", 0, cleanup) : cleanup]
++
++
+ def test_small_m_table_boundary():
+     for arch in ("sm_100a", "sm_103a"):
+         for K in range(MAX_BLOCKS + 1):

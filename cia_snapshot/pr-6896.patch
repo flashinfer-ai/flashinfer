@@ -1,0 +1,370 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 30b29daf21c..124f97b799f 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -715,7 +715,16 @@ match what the code uses today; values are strings unless noted.
+ | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
+ 
+ Release/nightly JIT-cache provider builds run sccache in server-side mode and
+-wrap the complete wheel build with a no-output watchdog. After 90 minutes with
++wrap the complete wheel build with a no-output watchdog. They build in the
++container's torch-pinned interpreter rather than a PEP 517 isolated environment
++(`scripts/build_jit_cache_wheel.py`): an isolated environment's random path
++reaches every compile command through the tvm_ffi include directory and changes
++the sccache key of each translation unit that includes tvm_ffi on every run.
++Before compiling, the same script gives every installed header one fixed mtime:
++GCC's `#pragma once` skips a header whose size, contents and mtime match an
++already included file, and torch ships byte-identical `#pragma once` headers
++(the `ATen/ops/*_native.h` stubs), so otherwise the preprocessed output of each
++torch-including translation unit depends on pip's install timing. After 90 minutes with
+ no build output, the watchdog captures system, process, compiler, and sccache
+ state; terminates the wrapped build process group (TERM, then KILL after a
+ two-minute grace period); and exits with status 124. Compiler discovery scans
+diff --git a/scripts/build_flashinfer_jit_cache_whl.sh b/scripts/build_flashinfer_jit_cache_whl.sh
+index a0095e3ea21..9f1af61df50 100755
+--- a/scripts/build_flashinfer_jit_cache_whl.sh
++++ b/scripts/build_flashinfer_jit_cache_whl.sh
+@@ -119,7 +119,8 @@ elif [ "${BUILD_TARGET}" = "shim" ]; then
+     flashinfer_jit_cache/_provider_requirements.txt
+ fi
+ 
+-# Build the wheel using the build module for better isolation
++# Build the wheel in this container's interpreter, not an isolated environment:
++# see build_jit_cache_wheel.py for why.
+ echo "Building wheel..."
+ if [ "${BUILD_TARGET}" = "provider" ]; then
+   JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS=${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS:-5400}
+diff --git a/scripts/build_jit_cache_wheel.py b/scripts/build_jit_cache_wheel.py
+index 431b5b59c84..775b4151b0f 100644
+--- a/scripts/build_jit_cache_wheel.py
++++ b/scripts/build_jit_cache_wheel.py
+@@ -1,11 +1,60 @@
+ #!/usr/bin/env python3
+-"""Build an isolated wheel, retrying interrupted dependency downloads."""
++"""Build a wheel in the current interpreter, retrying interrupted dependency downloads.
++
++The build is deliberately not isolated. The CI callers run it inside a
++throwaway container whose interpreter already holds the pinned torch, so a
++PEP 517 isolated environment adds no hermeticity. It would only install torch
++and the other build requirements a second time, into a randomly named
++``/tmp/build-env-*`` directory. That directory then appears as an include path
++(tvm_ffi) in every compile command, so each run gave every translation unit
++that includes tvm_ffi headers a new sccache key.
++
++Before compiling, the build also pins the mtime of every installed header (see
++``pin_header_mtimes``), because GCC's ``#pragma once`` otherwise makes the
++preprocessed output of torch-including translation units depend on when pip
++wrote each header.
++"""
+ 
+ import logging
++import os
+ import subprocess
++import sys
++import sysconfig
+ import time
+ from pathlib import Path
+ 
++# 1980-01-01T00:00:00Z, the earliest timestamp a ZIP archive can record.
++PINNED_HEADER_MTIME = 315532800
++HEADER_SUFFIXES = frozenset(
++    {".h", ".hh", ".hpp", ".hxx", ".cuh", ".inl", ".inc", ".ipp", ".tcc"}
++)
++
++
++class CurrentInterpreterEnv:
++    """Install build requirements into the interpreter running this script."""
++
++    python_executable = sys.executable
++
++    def install(self, requirements):
++        if not requirements:
++            return
++        # Captured so install_build_requirements can classify a failure; echoed
++        # so the build log still shows what pip did.
++        result = subprocess.run(
++            [self.python_executable, "-m", "pip", "install", *sorted(requirements)],
++            capture_output=True,
++            text=True,
++        )
++        print(result.stdout, end="", flush=True)
++        print(result.stderr, end="", file=sys.stderr, flush=True)
++        if result.returncode != 0:
++            raise subprocess.CalledProcessError(
++                result.returncode,
++                result.args,
++                output=result.stdout,
++                stderr=result.stderr,
++            )
++
+ 
+ def install_build_requirements(env, requirements):
+     """Restart pip when a network error escapes pip's own request retries."""
+@@ -40,16 +89,65 @@ def install_build_requirements(env, requirements):
+             time.sleep(delay)
+ 
+ 
++def site_package_dirs():
++    """Return the install directories of the interpreter that runs the build."""
++    paths = sysconfig.get_paths()
++    return sorted({Path(paths["purelib"]), Path(paths["platlib"])})
++
++
++def pin_header_mtimes(roots):
++    """Give every installed C/C++ header one fixed mtime; return how many changed.
++
++    GCC's ``#pragma once`` treats two different files as the same file when
++    their size, contents and mtime (whole seconds) all match, and then skips the
++    second one. pip stamps each installed file with the time it wrote it, and
++    torch ships byte-identical ``#pragma once`` headers at several paths (e.g.
++    the empty ``ATen/ops/*_native.h`` stubs that ``<ATen/ATen.h>`` includes).
++    Which of those GCC keeps therefore depends on which copies pip happened to
++    write within the same second, so two builds of one commit preprocess the
++    same translation unit differently. sccache keys cudafe++ on that output, and
++    with CUDA 12.8+ a cudafe++ miss also misses cicc and ptxas, which costs
++    minutes per translation unit. With one shared mtime GCC always keeps
++    exactly one copy of each duplicate, whatever the install timing.
++
++    A file counts as a header when it has a header suffix or sits below an
++    ``include`` directory (for extension-less headers such as ``cuda/std/*``).
++    Python sources are never touched, so bytecode caches stay valid.
++    """
++    changed = 0
++    for root in roots:
++        for dirpath, _, filenames in os.walk(root):
++            in_include = "include" in Path(dirpath).relative_to(root).parts
++            for name in filenames:
++                path = Path(dirpath, name)
++                if path.suffix in (".py", ".pyc"):
++                    continue
++                if not in_include and path.suffix not in HEADER_SUFFIXES:
++                    continue
++                if path.is_symlink() or not path.is_file():
++                    continue
++                if path.stat().st_mtime_ns == PINNED_HEADER_MTIME * 10**9:
++                    continue
++                os.utime(path, (PINNED_HEADER_MTIME, PINNED_HEADER_MTIME))
++                changed += 1
++    return changed
++
++
+ def build_wheel():
+     from build import ProjectBuilder
+-    from build.env import DefaultIsolatedEnv
+-
+-    with DefaultIsolatedEnv() as env:
+-        builder = ProjectBuilder.from_isolated_env(env, ".")
+-        install_build_requirements(env, builder.build_system_requires)
+-        install_build_requirements(env, builder.get_requires_for_build("wheel"))
+-        # Backend hooks and compilation execute once; only dependency installs retry.
+-        return builder.build("wheel", str(Path("dist").resolve()))
++
++    env = CurrentInterpreterEnv()
++    builder = ProjectBuilder(".", python_executable=env.python_executable)
++    install_build_requirements(env, builder.build_system_requires)
++    install_build_requirements(env, builder.get_requires_for_build("wheel"))
++    # After the last install, so headers pip wrote for the build requirements
++    # are pinned as well.
++    logging.info(
++        "Pinned the mtime of %d installed headers",
++        pin_header_mtimes(site_package_dirs()),
++    )
++    # Backend hooks and compilation execute once; only dependency installs retry.
++    return builder.build("wheel", str(Path("dist").resolve()))
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/scripts/jit_cache_build_common.sh b/scripts/jit_cache_build_common.sh
+index 611e1806604..bd54a5d1197 100644
+--- a/scripts/jit_cache_build_common.sh
++++ b/scripts/jit_cache_build_common.sh
+@@ -97,8 +97,9 @@ validate_jit_cache_cuda_toolchain() {
+   echo "nvcc CUDA version check passed: ${nvcc_cuda_version}"
+ }
+ 
+-# Install the matrix-selected PyTorch build environment and constrain the
+-# isolated PEP 517 build to that exact distribution.
++# Install the matrix-selected PyTorch build environment and constrain every
++# later pip install, including the wheel's build requirements, to that exact
++# distribution.
+ #
+ # Args:
+ #   $1 - Python executable used to invoke the build frontend.
+diff --git a/tests/test_build_jit_cache_wheel.py b/tests/test_build_jit_cache_wheel.py
+index 6eb27c7474d..f0cd87aac11 100644
+--- a/tests/test_build_jit_cache_wheel.py
++++ b/tests/test_build_jit_cache_wheel.py
+@@ -1,5 +1,7 @@
+ import importlib.util
++import os
+ import subprocess
++import sys
+ from pathlib import Path
+ from unittest.mock import Mock
+ 
+@@ -61,3 +63,165 @@ def test_dependency_resolution_error_is_not_retried(wheel_builder):
+ 
+     env.install.assert_called_once()
+     wheel_builder.time.sleep.assert_not_called()
++
++
++def _fake_python(tmp_path, body):
++    """A stand-in interpreter that records `-m pip install ...` invocations."""
++    log = tmp_path / "pip.log"
++    python = tmp_path / "python"
++    python.write_text(f'#!/bin/bash\necho "$*" >> "{log}"\n{body}\n')
++    python.chmod(0o755)
++    return python, log
++
++
++def test_current_interpreter_install_retries_interrupted_pip(wheel_builder, tmp_path):
++    attempts = tmp_path / "attempts"
++    python, log = _fake_python(
++        tmp_path,
++        f'echo x >> "{attempts}"\n'
++        f'if [ "$(wc -l < "{attempts}")" -lt 2 ]; then\n'
++        '  echo "ReadTimeoutError: read timed out" >&2; exit 1\n'
++        "fi",
++    )
++    env = wheel_builder.CurrentInterpreterEnv()
++    env.python_executable = str(python)
++
++    wheel_builder.install_build_requirements(env, {"torch", "ninja"})
++
++    assert log.read_text().splitlines() == ["-m pip install ninja torch"] * 2
++    wheel_builder.time.sleep.assert_called_once_with(10)
++
++
++def test_current_interpreter_install_skips_empty_requirements(wheel_builder, tmp_path):
++    python, log = _fake_python(tmp_path, "exit 1")
++    env = wheel_builder.CurrentInterpreterEnv()
++    env.python_executable = str(python)
++
++    wheel_builder.install_build_requirements(env, set())
++
++    assert not log.exists()
++
++
++def test_build_wheel_runs_in_current_interpreter(wheel_builder, monkeypatch, tmp_path):
++    """The build must not create a PEP 517 isolated env: its random path would
++    leak into compile commands and defeat sccache across runs."""
++    calls = []
++
++    class FakeBuilder:
++        build_system_requires = {"setuptools>=77", "torch"}
++
++        def __init__(self, source_dir, python_executable):
++            calls.append(("init", source_dir, python_executable))
++
++        def get_requires_for_build(self, distribution):
++            calls.append(("requires", distribution))
++            return {"nvidia-cutlass-dsl>=4.6.2a0"}
++
++        def build(self, distribution, output_directory):
++            calls.append(("build", distribution, output_directory))
++            return "dist/provider.whl"
++
++    build_module = type(sys)("build")
++    build_module.ProjectBuilder = FakeBuilder
++    monkeypatch.setitem(sys.modules, "build", build_module)
++    installs = []
++    monkeypatch.setattr(
++        wheel_builder.CurrentInterpreterEnv,
++        "install",
++        lambda self, requirements: installs.append(set(requirements)),
++    )
++    monkeypatch.setattr(wheel_builder, "site_package_dirs", lambda: ["site"])
++    monkeypatch.setattr(
++        wheel_builder,
++        "pin_header_mtimes",
++        lambda roots: calls.append(("pin", roots, len(installs))) or 0,
++    )
++    monkeypatch.chdir(tmp_path)
++
++    assert wheel_builder.build_wheel() == "dist/provider.whl"
++
++    assert calls[0] == ("init", ".", sys.executable)
++    assert installs == [{"setuptools>=77", "torch"}, {"nvidia-cutlass-dsl>=4.6.2a0"}]
++    # Headers are pinned after the last install and before compilation.
++    assert calls[-2:] == [
++        ("pin", ["site"], 2),
++        ("build", "wheel", str(tmp_path.resolve() / "dist")),
++    ]
++
++
++def test_pin_header_mtimes_only_touches_headers(wheel_builder, tmp_path):
++    site = tmp_path / "site-packages"
++    headers = [
++        site / "torch/include/ATen/ops/a_native.h",
++        site / "nvidia/cu12/include/cuda/std/atomic",
++        site / "tvm_ffi/kernel.cuh",
++    ]
++    others = [
++        site / "torch/__init__.py",
++        site / "torch/lib/libtorch.so",
++        site / "torch/include/ATen/stub.py",
++    ]
++    for index, path in enumerate(headers + others):
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text("x")
++        os.utime(path, (1_700_000_000 + index, 1_700_000_000 + index))
++    link = site / "torch/include/link.h"
++    link.symlink_to(headers[0])
++
++    assert wheel_builder.pin_header_mtimes([site]) == len(headers)
++
++    pinned = wheel_builder.PINNED_HEADER_MTIME
++    assert [path.stat().st_mtime for path in headers] == [pinned] * len(headers)
++    assert [path.stat().st_mtime for path in others] == [
++        1_700_000_000 + len(headers) + index for index in range(len(others))
++    ]
++    assert link.is_symlink()
++    assert wheel_builder.pin_header_mtimes([site]) == 0
++
++
++def _gnu_cxx():
++    for compiler in ("g++", "c++"):
++        try:
++            version = subprocess.run(
++                [compiler, "--version"], capture_output=True, text=True, check=True
++            ).stdout
++        except (OSError, subprocess.CalledProcessError):
++            continue
++        if "Free Software Foundation" in version:
++            return compiler
++    return None
++
++
++def test_pinned_mtimes_make_gcc_preprocessing_deterministic(wheel_builder, tmp_path):
++    """Reproduce the torch-header cache misses with GCC's `#pragma once`.
++
++    Two byte-identical `#pragma once` headers stand in for torch's duplicate
++    `ATen/ops/*_native.h` stubs. Their mtimes model two pip installs of the same
++    wheel: one wrote both copies within one second, the other did not.
++    """
++    compiler = _gnu_cxx()
++    if compiler is None:
++        pytest.skip("requires GCC, whose #pragma once compares mtime and contents")
++    include = tmp_path / "site-packages" / "pkg" / "include"
++    include.mkdir(parents=True)
++    duplicates = [include / "first_native.h", include / "second_native.h"]
++    for path in duplicates:
++        path.write_text("#pragma once\nint declared_in_native_header();\n")
++    source = tmp_path / "tu.cpp"
++    source.write_text('#include "first_native.h"\n#include "second_native.h"\n')
++
++    def preprocess(mtimes):
++        for path, mtime in zip(duplicates, mtimes, strict=True):
++            os.utime(path, (mtime, mtime))
++        wheel_builder.pin_header_mtimes([tmp_path / "site-packages"])
++        return subprocess.run(
++            [compiler, "-E", "-P", f"-I{include}", str(source)],
++            capture_output=True,
++            text=True,
++            check=True,
++        ).stdout
++
++    same_second = (1_700_000_000, 1_700_000_000)
++    different_seconds = (1_700_000_000, 1_700_000_001)
++    assert preprocess(same_second) == preprocess(different_seconds)
++    assert preprocess(same_second).count("declared_in_native_header") == 1

@@ -1,0 +1,641 @@
+diff --git a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_combine_kernel.cu b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_combine_kernel.cu
+index 1e053749158..b7c4e85ffbc 100644
+--- a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_combine_kernel.cu
++++ b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_combine_kernel.cu
+@@ -60,9 +60,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
+ #define THREADS 128
+ 
+ #include <math_constants.h>
++
+ extern "C" {
+ 
+-__global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_combine(
++__global__ __launch_bounds__(128) void kernel_cake_w8a8_megamoe_ep16_combine(
+     __nv_bfloat16* local_terms, __nv_bfloat16* __restrict__ output,
+     unsigned int* __restrict__ push_generation, int tokens_per_rank, int source_rank,
+     int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags,
+@@ -102,7 +103,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_combine
+                      : "memory");
+       } while (
+           static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(done_target)) >=
+-          static_cast<unsigned int>(2147483648));
++          static_cast<unsigned int>(2147483648u));
+     }
+     asm volatile("fence.acquire.sys;" ::: "memory");
+   }
+diff --git a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_fc1_kernel.cu b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_fc1_kernel.cu
+index 4f7a6a346fa..54562a93423 100644
+--- a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_fc1_kernel.cu
++++ b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_fc1_kernel.cu
+@@ -74,11 +74,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
+ #define SMEM_EPI_STAGING_STAGE_BYTES 8192
+ #define SMEM_EPI_STAGING_STRIDE 8192
+ #define SMEM_TOTAL 162816
+-#define BLOCK_M 256
+-#define BLOCK_N 32
+-#define BLOCK_K 128
+-#define NUM_STAGES 4
+-#define num_tiles grid_m
+ 
+ #include <math_constants.h>
+ 
+@@ -235,16 +230,16 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+   const int cta_rank = 0;
+ 
+   // Kernel setup ops
+-  uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_A_OFF);
+-  const int smem_a_addr = smem + SMEM_SMEM_A_OFF;
+-  uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_B_OFF);
+-  const int smem_b_addr = smem + SMEM_SMEM_B_OFF;
+-  uint8_t* smem_sfa_cp = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_SFA_CP_OFF);
+-  const int smem_sfa_cp_addr = smem + SMEM_SMEM_SFA_CP_OFF;
+-  uint8_t* smem_sfb_cp = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_SFB_CP_OFF);
+-  const int smem_sfb_cp_addr = smem + SMEM_SMEM_SFB_CP_OFF;
+-  __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_EPI_STAGING_OFF);
+-  const int epi_staging_addr = smem + SMEM_EPI_STAGING_OFF;
++  uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
++  const int smem_a_addr = smem + 1024;
++  uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 33792);
++  const int smem_b_addr = smem + 33792;
++  uint8_t* smem_sfa_cp = reinterpret_cast<uint8_t*>(smem_raw + 37888);
++  const int smem_sfa_cp_addr = smem + 37888;
++  uint8_t* smem_sfb_cp = reinterpret_cast<uint8_t*>(smem_raw + 38912);
++  const int smem_sfb_cp_addr = smem + 38912;
++  __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 154624);
++  const int epi_staging_addr = smem + 154624;
+ 
+   // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 10 barriers)
+   // Mbarriers at smem_raw[0..80)
+@@ -306,7 +301,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+       int n_out = N / 2;
+       unsigned int _phase_mainloop_done = 0;
+ #pragma unroll 1
+-      for (unsigned int tile_idx = bid; tile_idx < num_tiles; tile_idx += num_bids) {
++      for (unsigned int tile_idx = bid; tile_idx < grid_m; tile_idx += num_bids) {
+         int batch_idx = tile_expert[tile_idx];
+         int off_n_out = tile_m_local[tile_idx];
+         int expert_row_base = expert_row_offsets[batch_idx];
+@@ -320,15 +315,15 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+         float beta_sg = be * sg;
+         float alpha_sg = al * sg;
+ #pragma unroll 1
+-        for (int n_chunk = 0; n_chunk < BLOCK_N / 8; n_chunk++) {
++        for (int n_chunk = 0; n_chunk < 4; n_chunk++) {
+           int route_col = n_chunk * 8;
+           float _tmem_load_0[8];
+           tmem_ld_x8(&_tmem_load_0[0],
+-                     taddr + (unsigned int)(epi_warp * 32 + lane << 16) + (unsigned int)route_col);
++                     taddr + (unsigned int)(epi_warp * 32 << 16) + (unsigned int)route_col);
+           asm volatile("tcgen05.wait::ld.sync.aligned;");
+           float _tmem_load_1[8];
+-          tmem_ld_x8(&_tmem_load_1[0], taddr + (unsigned int)(epi_warp * 32 + lane << 16) +
+-                                           (unsigned int)BLOCK_N + (unsigned int)route_col);
++          tmem_ld_x8(&_tmem_load_1[0],
++                     taddr + (unsigned int)(epi_warp * 32 << 16) + 32 + (unsigned int)route_col);
+           asm volatile("tcgen05.wait::ld.sync.aligned;");
+ #pragma unroll
+           for (int j = 0; j < 8; j++) {
+@@ -339,16 +334,17 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+             float sig = 0.0f;
+             float _tanh_approx_0;
+             asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_0) : "f"(u * 0.5f));
+-            sig = _tanh_approx_0 * 0.5f + 0.5f;
++            sig = __fmaf_rn(_tanh_approx_0, 0.5f, 0.5f);
+             result = g * u * sig;
+-            __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(result);
++            __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)result;
+             epi_staging[expert_row * 128 + hidden_lane] = _cvt_bf16_0;
+           }
+         }
+         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
++        asm volatile("tcgen05.fence::before_thread_sync;");
+         asm volatile("barrier.sync 15, 128;" ::: "memory");
+ #pragma unroll
+-        for (int task_iter = 0; task_iter < BLOCK_N / 32; task_iter++) {
++        for (int task_iter = 0; task_iter < 1; task_iter++) {
+           int task = hidden_lane + task_iter * 128;
+           int expert_row_1 = task / 4;
+           int hidden_group = task - expert_row_1 * 4;
+@@ -368,21 +364,22 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+           int route = route_map[packed_row];
+           int active = ((route >= 0) ? 1 : 0);
+           int safe_route = ((active != 0) ? route : 0);
+-          float rw = route_weights[safe_route] * (float)active;
++          float _cvt_f32_0 = (float)active;
++          float rw = route_weights[safe_route] * _cvt_f32_0;
+           float amax = 1e-07f;
+ #pragma unroll
+           for (int c = 0; c < 4; c++) {
+-            float packed_results_f32[8];
++            float _unpack_bf16_0[8];
+ #pragma unroll
+             for (int _pair = 0; _pair < 4; _pair++) {
+-              (&packed_results_f32[_pair * 2])[0] =
++              (&_unpack_bf16_0[_pair * 2])[0] =
+                   __uint_as_float(static_cast<uint32_t>((packed_results + c * 4)[_pair]) << 16);
+-              (&packed_results_f32[_pair * 2])[1] = __uint_as_float(
++              (&_unpack_bf16_0[_pair * 2])[1] = __uint_as_float(
+                   static_cast<uint32_t>((packed_results + c * 4)[_pair]) & 0xffff0000u);
+             }
+ #pragma unroll
+             for (int j_1 = 0; j_1 < 8; j_1++) {
+-              float _fabs_0 = fabsf(packed_results_f32[j_1] * rw);
++              float _fabs_0 = fabsf(_unpack_bf16_0[j_1] * rw);
+               float _max_0 = max_noftz(amax, _fabs_0);
+               amax = _max_0;
+             }
+@@ -395,7 +392,8 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+           unsigned int _min_0 = ((scale_code) < (254) ? (scale_code) : (254));
+           scale_code = _min_0;
+           int scale_i = scale_code;
+-          float _exp2_0 = approx_exp2(127.0f - (float)scale_i);
++          float _cvt_f32_1 = (float)scale_i;
++          float _exp2_0 = approx_exp2(127.0f - _cvt_f32_1);
+           float sf_inv = _exp2_0;
+           int block_column = off_n_out / 32 + hidden_group;
+           int tile_m_out = expert_row_1 / 128;
+@@ -418,17 +416,17 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+ #pragma unroll
+           for (int c_1 = 0; c_1 < 4; c_1++) {
+             float normalized[8];
+-            float packed_results_f32_1[8];
++            float _unpack_bf16_1[8];
+ #pragma unroll
+             for (int _pair = 0; _pair < 4; _pair++) {
+-              (&packed_results_f32_1[_pair * 2])[0] =
++              (&_unpack_bf16_1[_pair * 2])[0] =
+                   __uint_as_float(static_cast<uint32_t>((packed_results + c_1 * 4)[_pair]) << 16);
+-              (&packed_results_f32_1[_pair * 2])[1] = __uint_as_float(
++              (&_unpack_bf16_1[_pair * 2])[1] = __uint_as_float(
+                   static_cast<uint32_t>((packed_results + c_1 * 4)[_pair]) & 0xffff0000u);
+             }
+ #pragma unroll
+             for (int j_2 = 0; j_2 < 8; j_2++) {
+-              normalized[j_2] = packed_results_f32_1[j_2] * rw * sf_inv;
++              normalized[j_2] = _unpack_bf16_1[j_2] * rw * sf_inv;
+             }
+             {
+               unsigned int _fp8_pk[2];
+@@ -478,7 +476,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+       unsigned int _phase_epilogue_done = 1;
+       unsigned int _phase_tma_full = 0;
+ #pragma unroll 1
+-      for (unsigned int tile_idx_1 = bid; tile_idx_1 < num_tiles; tile_idx_1 += num_bids) {
++      for (unsigned int tile_idx_1 = bid; tile_idx_1 < grid_m; tile_idx_1 += num_bids) {
+         mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
+ #pragma unroll 1
+         for (int iter_k = 0; iter_k < K_tiles; iter_k++) {
+@@ -578,7 +576,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+       unsigned int load_stage = 0;
+       unsigned int pf_first_tile = bid;
+       if (elect_sync()) {
+-        if (bid < num_tiles) {
++        if (bid < grid_m) {
+           int pf_batch_idx = tile_expert[bid];
+           int pf_packed_off = tile_m_local[bid] * 2;
+ #pragma unroll
+@@ -586,9 +584,9 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+             if (pf_k < K_tiles) {
+               mbarrier_arrive_expect_tx(tma_full_addr + (pf_k) * 8, 38400);
+               tma_4d_gmem2smem(smem_a_addr + (unsigned int)(pf_k * 38400), (&A), 0, 0, pf_k,
+-                               pf_batch_idx * (N / BLOCK_M) + pf_packed_off / BLOCK_M,
++                               pf_batch_idx * (N / 256) + pf_packed_off / 256,
+                                tma_full_addr + (pf_k) * 8);
+-              int pf_sfa_tile = pf_packed_off / BLOCK_M * K_tiles + pf_k;
++              int pf_sfa_tile = pf_packed_off / 256 * K_tiles + pf_k;
+               tma_4d_gmem2smem(smem_sfa_cp_addr + (unsigned int)(pf_k * 38400), (&SFA), 0, 0,
+                                pf_sfa_tile, pf_batch_idx, tma_full_addr + (pf_k) * 8);
+             }
+@@ -599,12 +597,12 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+       unsigned int _phase_mma_done = 1;
+       if (elect_sync()) {
+ #pragma unroll 1
+-        for (unsigned int tile_idx_2 = bid; tile_idx_2 < num_tiles; tile_idx_2 += num_bids) {
+-          if (num_bids + (int)tile_idx_2 >= num_tiles) {
++        for (unsigned int tile_idx_2 = bid; tile_idx_2 < grid_m; tile_idx_2 += num_bids) {
++          if (num_bids + (int)tile_idx_2 >= grid_m) {
+             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+           }
+           int batch_idx_1 = tile_expert[tile_idx_2];
+-          int input_batch_idx = ((0) ? batch_idx_1 / 8 : batch_idx_1);
++          int input_batch_idx = batch_idx_1;
+           int off_n_out_1 = tile_m_local[tile_idx_2];
+           int packed_off = off_n_out_1 * 2;
+ #pragma unroll 1
+@@ -618,9 +616,9 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+             }
+             if (pf_issued == 0) {
+               tma_4d_gmem2smem(smem_a_addr + load_stage * 38400, (&A), 0, 0, iter_k_1,
+-                               batch_idx_1 * (N / BLOCK_M) + packed_off / BLOCK_M,
++                               batch_idx_1 * (N / 256) + packed_off / 256,
+                                tma_full_addr + (load_stage) * 8);
+-              int pdl_sfa_tile = packed_off / BLOCK_M * K_tiles + iter_k_1;
++              int pdl_sfa_tile = packed_off / 256 * K_tiles + iter_k_1;
+               tma_4d_gmem2smem(smem_sfa_cp_addr + load_stage * 38400, (&SFA), 0, 0, pdl_sfa_tile,
+                                batch_idx_1, tma_full_addr + (load_stage) * 8);
+             }
+@@ -643,6 +641,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(
+   }
+ 
+   // Cleanup
++  asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+   __syncthreads();  // barrier before TMEM dealloc
+ 
+   if (warp == 0) {
+diff --git a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_fc2_kernel.cu b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_fc2_kernel.cu
+index d8b135e3487..9adb5529e44 100644
+--- a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_fc2_kernel.cu
++++ b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_fc2_kernel.cu
+@@ -78,11 +78,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
+ #define SMEM_EPI_STAGING_STAGE_BYTES 8192
+ #define SMEM_EPI_STAGING_STRIDE 8192
+ #define SMEM_TOTAL 181248
+-#define BLOCK_M 128
+-#define BLOCK_N 32
+-#define BLOCK_K 128
+-#define NUM_STAGES 8
+-#define num_tiles grid_m
+ 
+ #include <math_constants.h>
+ 
+@@ -214,16 +209,16 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+   const int cta_rank = 0;
+ 
+   // Kernel setup ops
+-  uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_A_OFF);
+-  const int smem_a_addr = smem + SMEM_SMEM_A_OFF;
+-  uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_B_OFF);
+-  const int smem_b_addr = smem + SMEM_SMEM_B_OFF;
+-  uint8_t* smem_sfa_cp = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_SFA_CP_OFF);
+-  const int smem_sfa_cp_addr = smem + SMEM_SMEM_SFA_CP_OFF;
+-  uint8_t* smem_sfb_cp = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_SFB_CP_OFF);
+-  const int smem_sfb_cp_addr = smem + SMEM_SMEM_SFB_CP_OFF;
+-  __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_EPI_STAGING_OFF);
+-  const int epi_staging_addr = smem + SMEM_EPI_STAGING_OFF;
++  uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
++  const int smem_a_addr = smem + 1024;
++  uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 17408);
++  const int smem_b_addr = smem + 17408;
++  uint8_t* smem_sfa_cp = reinterpret_cast<uint8_t*>(smem_raw + 21504);
++  const int smem_sfa_cp_addr = smem + 21504;
++  uint8_t* smem_sfb_cp = reinterpret_cast<uint8_t*>(smem_raw + 22016);
++  const int smem_sfb_cp_addr = smem + 22016;
++  __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
++  const int epi_staging_addr = smem + 173056;
+ 
+   // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 18 barriers)
+   // Mbarriers at smem_raw[0..144)
+@@ -292,7 +287,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+       const int epi_tid = epi_warp * 32 + lane;
+       unsigned int _phase_mainloop_done = 0;
+ #pragma unroll 1
+-      for (unsigned int tile_idx = bid; tile_idx < num_tiles; tile_idx += num_bids) {
++      for (unsigned int tile_idx = bid; tile_idx < grid_m; tile_idx += num_bids) {
+         int batch_idx = tile_expert[tile_idx];
+         int off_m = tile_m_local[tile_idx];
+         int expert_row_base = expert_row_offsets[batch_idx];
+@@ -302,7 +297,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+         int ready_tile = 0;
+         unsigned int* ready_base = reinterpret_cast<unsigned int*>(C);
+ #pragma unroll 1
+-        for (int n_chunk = 0; n_chunk < BLOCK_N / 8; n_chunk++) {
++        for (int n_chunk = 0; n_chunk < 4; n_chunk++) {
+           int row = epi_warp * 32;
+           int col = n_chunk * 8;
+           float _tmem_load_0[8];
+@@ -311,8 +306,8 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+ #pragma unroll
+           for (int j = 0; j < 8; j++) {
+             int expert_row = n_chunk * 8 + j;
+-            __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(_tmem_load_0[j]);
+-            epi_staging[expert_row * BLOCK_M + epi_tid] = _cvt_bf16_0;
++            __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)_tmem_load_0[j];
++            epi_staging[expert_row * 128 + epi_tid] = _cvt_bf16_0;
+           }
+         }
+         asm volatile("tcgen05.fence::before_thread_sync;");
+@@ -324,10 +319,10 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+         asm volatile("barrier.sync 15, 128;" ::: "memory");
+ #pragma unroll
+-        for (int copy_iter = 0; copy_iter < BLOCK_N / 8; copy_iter++) {
++        for (int copy_iter = 0; copy_iter < 4; copy_iter++) {
+           int copy_linear = epi_tid + copy_iter * 128;
+-          int expert_row_1 = copy_linear / (BLOCK_M / 8);
+-          int hidden_chunk = copy_linear % (BLOCK_M / 8);
++          int expert_row_1 = copy_linear / 16;
++          int hidden_chunk = copy_linear % 16;
+           unsigned int packed[4];
+           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&packed[0])),
+@@ -335,7 +330,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+                          "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 2])),
+                          "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 3]))
+                        : "r"(epi_staging_addr +
+-                             (unsigned int)((expert_row_1 * BLOCK_M + hidden_chunk * 8) * 2)));
++                             (unsigned int)((expert_row_1 * 128 + hidden_chunk * 8) * 2)));
+           int route = route_map[expert_row_base + expert_row_1];
+           if (route >= 0) {
+             int source_rank = route / routes_per_rank;
+@@ -360,8 +355,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+                        : "=r"(_atomic_old_0)
+                        : "l"(&completion_words[1]), "r"(static_cast<uint32_t>(1))
+                        : "memory");
+-          unsigned int arrived = _atomic_old_0;
+-          int arrived_count = (int)arrived + 1;
++          int arrived_count = (int)_atomic_old_0 + 1;
+           if (arrived_count == num_bids) {
+             completion_words[1] = 0;
+             last_arriver = 1;
+@@ -377,7 +371,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+             unsigned int* peer_words =
+                 reinterpret_cast<unsigned int*>(fc2_completion_peers.ptrs[destination]);
+             asm volatile("red.release.sys.global.add.u32 [%0], %1;" ::"l"(
+-                             (reinterpret_cast<unsigned int*>(peer_words) + (0))),
++                             reinterpret_cast<unsigned int*>(peer_words)),
+                          "r"(static_cast<unsigned int>(1))
+                          : "memory");
+           }
+@@ -393,7 +387,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+       unsigned int _phase_epilogue_done = 1;
+       unsigned int _phase_tma_full = 0;
+ #pragma unroll 1
+-      for (unsigned int tile_idx_1 = bid; tile_idx_1 < num_tiles; tile_idx_1 += num_bids) {
++      for (unsigned int tile_idx_1 = bid; tile_idx_1 < grid_m; tile_idx_1 += num_bids) {
+         mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
+ #pragma unroll 1
+         for (int iter_k = 0; iter_k < K_tiles; iter_k++) {
+@@ -463,7 +457,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+       unsigned int load_stage = 0;
+       unsigned int pf_first_tile = bid;
+       if (elect_sync()) {
+-        if (bid < num_tiles) {
++        if (bid < grid_m) {
+           int pf_batch_idx = tile_expert[bid];
+           int pf_off_m = tile_m_local[bid];
+ #pragma unroll
+@@ -471,9 +465,9 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+             if (pf_k < K_tiles) {
+               mbarrier_arrive_expect_tx(tma_full_addr + (pf_k) * 8, 21504);
+               tma_4d_gmem2smem(smem_a_addr + (unsigned int)(pf_k * 21504), (&A), 0, 0, pf_k,
+-                               pf_batch_idx * (N / BLOCK_M) + pf_off_m / BLOCK_M,
++                               pf_batch_idx * (N / 128) + pf_off_m / 128,
+                                tma_full_addr + (pf_k) * 8);
+-              int pf_sfa_tile = pf_off_m / BLOCK_M * K_tiles + pf_k;
++              int pf_sfa_tile = pf_off_m / 128 * K_tiles + pf_k;
+               tma_4d_gmem2smem(smem_sfa_cp_addr + (unsigned int)(pf_k * 21504), (&SFA), 0, 0,
+                                pf_sfa_tile, pf_batch_idx, tma_full_addr + (pf_k) * 8);
+             }
+@@ -484,8 +478,8 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+       unsigned int _phase_mma_done = 1;
+       if (elect_sync()) {
+ #pragma unroll 1
+-        for (unsigned int tile_idx_2 = bid; tile_idx_2 < num_tiles; tile_idx_2 += num_bids) {
+-          if (num_bids + (int)tile_idx_2 >= num_tiles) {
++        for (unsigned int tile_idx_2 = bid; tile_idx_2 < grid_m; tile_idx_2 += num_bids) {
++          if (num_bids + (int)tile_idx_2 >= grid_m) {
+             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+           }
+           int batch_idx_1 = tile_expert[tile_idx_2];
+@@ -501,9 +495,9 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+             }
+             if (pf_issued == 0) {
+               tma_4d_gmem2smem(smem_a_addr + load_stage * 21504, (&A), 0, 0, iter_k_1,
+-                               batch_idx_1 * (N / BLOCK_M) + off_m_1 / BLOCK_M,
++                               batch_idx_1 * (N / 128) + off_m_1 / 128,
+                                tma_full_addr + (load_stage) * 8);
+-              int pdl_sfa_tile = off_m_1 / BLOCK_M * K_tiles + iter_k_1;
++              int pdl_sfa_tile = off_m_1 / 128 * K_tiles + iter_k_1;
+               tma_4d_gmem2smem(smem_sfa_cp_addr + load_stage * 21504, (&SFA), 0, 0, pdl_sfa_tile,
+                                batch_idx_1, tma_full_addr + (load_stage) * 8);
+             }
+@@ -526,6 +520,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
+   }
+ 
+   // Cleanup
++  asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+   __syncthreads();  // barrier before TMEM dealloc
+ 
+   if (warp == 0) {
+diff --git a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_local_pack_kernel.cu b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_local_pack_kernel.cu
+index c5593310202..79cfb29767c 100644
+--- a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_local_pack_kernel.cu
++++ b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_local_pack_kernel.cu
+@@ -60,9 +60,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
+ #define THREADS 256
+ 
+ #include <math_constants.h>
++
+ extern "C" {
+ 
+-__global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_local_pack(
++__global__ __launch_bounds__(256) void kernel_cake_w8a8_megamoe_ep16_local_pack(
+     float* __restrict__ recv_weights, int* __restrict__ expert_counts, int* __restrict__ route_map,
+     int* __restrict__ inverse_rows, int* __restrict__ overflow, uint8_t* __restrict__ quantized,
+     uint8_t* __restrict__ scales_cp, unsigned int* __restrict__ push_generation,
+diff --git a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_manifest.json b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_manifest.json
+index 6b8207fa282..7080dc8239d 100644
+--- a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_manifest.json
++++ b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_manifest.json
+@@ -195,13 +195,13 @@
+       "role": "forward",
+       "forward_index": 0,
+       "file": "cake_w8a8_megamoe_ep16_publish_push_kernel.cu",
+-      "sha256": "26de0c8369bbb8a409d79dee0d22b657a62fe6ef1406d2ee2f78f80a32f4f5eb",
+-      "bytes": 14974,
+-      "lines": 396,
++      "sha256": "ebd6af1eca5d08039bff377b72b4d1272fbabd2c9f6581811290137198825c5a",
++      "bytes": 14592,
++      "lines": 393,
+       "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_publish_push",
+       "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_publish_push(__nv_bfloat16* __restrict__ source_hidden, long long* __restrict__ source_ids, float* __restrict__ source_weights, __nv_bfloat16* __restrict__ local_terms, int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ overflow, unsigned int* __restrict__ push_generation, int tokens, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, uint8_t* push_inbox, CakePeerPointerTable<uint8_t, 32> push_inbox_peers, unsigned int* push_flags, CakePeerPointerTable<unsigned int, 32> push_flags_peers);",
+-      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_publish_push(__nv_bfloat16* __restrict__ source_hidden, long long* __restrict__ source_ids, float* __restrict__ source_weights, __nv_bfloat16* __restrict__ local_terms, int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ overflow, unsigned int* __restrict__ push_generation, int tokens, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, uint8_t* push_inbox, CakePeerPointerTable<uint8_t, 32> push_inbox_peers, unsigned int* push_flags, CakePeerPointerTable<unsigned int, 32> push_flags_peers);",
+-      "kernel_attributes": "__launch_bounds__(THREADS)",
++      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(128) void kernel_cake_w8a8_megamoe_ep16_publish_push(__nv_bfloat16* __restrict__ source_hidden, long long* __restrict__ source_ids, float* __restrict__ source_weights, __nv_bfloat16* __restrict__ local_terms, int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ overflow, unsigned int* __restrict__ push_generation, int tokens, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, uint8_t* push_inbox, CakePeerPointerTable<uint8_t, 32> push_inbox_peers, unsigned int* push_flags, CakePeerPointerTable<unsigned int, 32> push_flags_peers);",
++      "kernel_attributes": "__launch_bounds__(128)",
+       "kernel_attributes_note": "entry attributes as written in the device translation unit; they may name defines of that unit (e.g. THREADS), so a binding repeats `declaration` (no attributes) and never the attributed form",
+       "arguments": {
+         "device_arguments": [
+@@ -507,13 +507,13 @@
+       "role": "forward",
+       "forward_index": 1,
+       "file": "cake_w8a8_megamoe_ep16_local_pack_kernel.cu",
+-      "sha256": "b683cee06815d6dda6048c19c98b2749b51bb5d065c08c620c4ae212a9b52b16",
+-      "bytes": 9430,
+-      "lines": 249,
++      "sha256": "2551ea9051b690fba694b763b7b6ad98361ec3950f5cc270fd465ba3ec4dfa26",
++      "bytes": 9427,
++      "lines": 250,
+       "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_local_pack",
+       "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_local_pack(float* __restrict__ recv_weights, int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ inverse_rows, int* __restrict__ overflow, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales_cp, unsigned int* __restrict__ push_generation, int tokens_per_rank, int active_rows_per_expert, int scale_tile_k128, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, uint8_t* push_inbox, CakePeerPointerTable<uint8_t, 32> push_inbox_peers, unsigned int* push_flags, CakePeerPointerTable<unsigned int, 32> push_flags_peers);",
+-      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_local_pack(float* __restrict__ recv_weights, int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ inverse_rows, int* __restrict__ overflow, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales_cp, unsigned int* __restrict__ push_generation, int tokens_per_rank, int active_rows_per_expert, int scale_tile_k128, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, uint8_t* push_inbox, CakePeerPointerTable<uint8_t, 32> push_inbox_peers, unsigned int* push_flags, CakePeerPointerTable<unsigned int, 32> push_flags_peers);",
+-      "kernel_attributes": "__launch_bounds__(THREADS)",
++      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(256) void kernel_cake_w8a8_megamoe_ep16_local_pack(float* __restrict__ recv_weights, int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ inverse_rows, int* __restrict__ overflow, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales_cp, unsigned int* __restrict__ push_generation, int tokens_per_rank, int active_rows_per_expert, int scale_tile_k128, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, uint8_t* push_inbox, CakePeerPointerTable<uint8_t, 32> push_inbox_peers, unsigned int* push_flags, CakePeerPointerTable<unsigned int, 32> push_flags_peers);",
++      "kernel_attributes": "__launch_bounds__(256)",
+       "kernel_attributes_note": "entry attributes as written in the device translation unit; they may name defines of that unit (e.g. THREADS), so a binding repeats `declaration` (no attributes) and never the attributed form",
+       "arguments": {
+         "device_arguments": [
+@@ -845,9 +845,9 @@
+       "role": "forward",
+       "forward_index": 2,
+       "file": "cake_w8a8_megamoe_ep16_fc1_kernel.cu",
+-      "sha256": "417327f06055ce6be244cee602dc7ad25eb7ececacff3768ed8ebdb5914932f4",
+-      "bytes": 27282,
+-      "lines": 655,
++      "sha256": "acafb79a8a422c34025434a927342e4def34b175a6dc58ae689cb7c66109498b",
++      "bytes": 27081,
++      "lines": 654,
+       "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_fc1",
+       "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_fc1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, uint8_t* __restrict__ C_fp8, uint8_t* __restrict__ SF_out, int* __restrict__ route_map, float* __restrict__ route_weights, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int N, int K_tiles, int grid_m, int grid_n, int rows_per_expert);",
+       "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, uint8_t* __restrict__ C_fp8, uint8_t* __restrict__ SF_out, int* __restrict__ route_map, float* __restrict__ route_weights, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int N, int K_tiles, int grid_m, int grid_n, int rows_per_expert);",
+@@ -1342,9 +1342,9 @@
+       "role": "forward",
+       "forward_index": 3,
+       "file": "cake_w8a8_megamoe_ep16_fc2_kernel.cu",
+-      "sha256": "9d9c1e1b685307691f20935f1ad22576cc116fe2ea8d12968359123a8c0ad4c7",
+-      "bytes": 21495,
+-      "lines": 538,
++      "sha256": "3052da6cb7bc6368deb51e9b4a81a8c784c55c3f50f2a83a3e9b3cbc178dbe1a",
++      "bytes": 21185,
++      "lines": 533,
+       "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_fc2",
+       "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_fc2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ C, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, int routes_per_rank, int N, int K_tiles, int grid_m, int32_t remote_pg_world, int32_t remote_pg_rank, CakePeerPointerTable<unsigned int, 32> remote_pg_flags, __nv_bfloat16* __restrict__ remote_terms, CakePeerPointerTable<__nv_bfloat16, 32> remote_terms_peers, unsigned int* fc2_completion, CakePeerPointerTable<unsigned int, 32> fc2_completion_peers);",
+       "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ C, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ expert_row_offsets, int routes_per_rank, int N, int K_tiles, int grid_m, int32_t remote_pg_world, int32_t remote_pg_rank, CakePeerPointerTable<unsigned int, 32> remote_pg_flags, __nv_bfloat16* __restrict__ remote_terms, CakePeerPointerTable<__nv_bfloat16, 32> remote_terms_peers, unsigned int* fc2_completion, CakePeerPointerTable<unsigned int, 32> fc2_completion_peers);",
+@@ -1885,13 +1885,13 @@
+       "role": "forward",
+       "forward_index": 4,
+       "file": "cake_w8a8_megamoe_ep16_combine_kernel.cu",
+-      "sha256": "d6f9fc6e9ad36d2544d523c9112df9e354ec9c882a8430265a33cdea54525411",
+-      "bytes": 6103,
+-      "lines": 168,
++      "sha256": "6df2ff07970c04c01a539d74fd27e98c836d7f1bf6b582f5787fcc17c1b7e0ce",
++      "bytes": 6101,
++      "lines": 169,
+       "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_combine",
+       "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_combine(__nv_bfloat16* local_terms, __nv_bfloat16* __restrict__ output, unsigned int* __restrict__ push_generation, int tokens_per_rank, int source_rank, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, unsigned int* fc2_completion, CakePeerPointerTable<unsigned int, 32> fc2_completion_peers);",
+-      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_combine(__nv_bfloat16* local_terms, __nv_bfloat16* __restrict__ output, unsigned int* __restrict__ push_generation, int tokens_per_rank, int source_rank, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, unsigned int* fc2_completion, CakePeerPointerTable<unsigned int, 32> fc2_completion_peers);",
+-      "kernel_attributes": "__launch_bounds__(THREADS)",
++      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(128) void kernel_cake_w8a8_megamoe_ep16_combine(__nv_bfloat16* local_terms, __nv_bfloat16* __restrict__ output, unsigned int* __restrict__ push_generation, int tokens_per_rank, int source_rank, int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int, 32> pg_flags, unsigned int* fc2_completion, CakePeerPointerTable<unsigned int, 32> fc2_completion_peers);",
++      "kernel_attributes": "__launch_bounds__(128)",
+       "kernel_attributes_note": "entry attributes as written in the device translation unit; they may name defines of that unit (e.g. THREADS), so a binding repeats `declaration` (no attributes) and never the attributed form",
+       "arguments": {
+         "device_arguments": [
+@@ -2101,13 +2101,13 @@
+       "role": "setup",
+       "forward_index": null,
+       "file": "cake_w8a8_megamoe_ep16_quantize_weights_kernel.cu",
+-      "sha256": "f76011e0bc5b73def2792920031dc55971fe4178a15c3b9b10a37da7367db3c0",
+-      "bytes": 10294,
++      "sha256": "752de857ba046a3148f645bda8f3dfa75c7d7d2e49b58fb644b0880a29e1748c",
++      "bytes": 10290,
+       "lines": 270,
+       "kernel_symbol": "kernel_cake_w8a8_megamoe_ep16_quantize_weights",
+       "declaration": "extern \"C\" __global__ void kernel_cake_w8a8_megamoe_ep16_quantize_weights(__nv_bfloat16* __restrict__ source, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales_cp, int experts, int rows, int columns, int gate_width, int interleave_gate_up, int scale_tile_n256_k128, int ktile_major_rows);",
+-      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_quantize_weights(__nv_bfloat16* __restrict__ source, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales_cp, int experts, int rows, int columns, int gate_width, int interleave_gate_up, int scale_tile_n256_k128, int ktile_major_rows);",
+-      "kernel_attributes": "__launch_bounds__(THREADS)",
++      "declaration_with_attributes": "extern \"C\" __global__ __launch_bounds__(256) void kernel_cake_w8a8_megamoe_ep16_quantize_weights(__nv_bfloat16* __restrict__ source, uint8_t* __restrict__ quantized, uint8_t* __restrict__ scales_cp, int experts, int rows, int columns, int gate_width, int interleave_gate_up, int scale_tile_n256_k128, int ktile_major_rows);",
++      "kernel_attributes": "__launch_bounds__(256)",
+       "kernel_attributes_note": "entry attributes as written in the device translation unit; they may name defines of that unit (e.g. THREADS), so a binding repeats `declaration` (no attributes) and never the attributed form",
+       "arguments": {
+         "device_arguments": [
+diff --git a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_publish_push_kernel.cu b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_publish_push_kernel.cu
+index a63276af33f..cf5bcb73cda 100644
+--- a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_publish_push_kernel.cu
++++ b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_publish_push_kernel.cu
+@@ -109,7 +109,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
+ 
+ extern "C" {
+ 
+-__global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_publish_push(
++__global__ __launch_bounds__(128) void kernel_cake_w8a8_megamoe_ep16_publish_push(
+     __nv_bfloat16* __restrict__ source_hidden, long long* __restrict__ source_ids,
+     float* __restrict__ source_weights, __nv_bfloat16* __restrict__ local_terms,
+     int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ overflow,
+@@ -138,14 +138,14 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_publish
+   const int cta_rank = 0;
+ 
+   // Kernel setup ops
+-  uint8_t* row_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_ROW_STAGE_OFF);
+-  const int row_stage_addr = smem + SMEM_ROW_STAGE_OFF;
+-  uint8_t* scales_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SCALES_STAGE_OFF);
+-  const int scales_stage_addr = smem + SMEM_SCALES_STAGE_OFF;
+-  int* ids_stage = reinterpret_cast<int*>(smem_raw + SMEM_IDS_STAGE_OFF);
+-  const int ids_stage_addr = smem + SMEM_IDS_STAGE_OFF;
+-  float* weights_stage = reinterpret_cast<float*>(smem_raw + SMEM_WEIGHTS_STAGE_OFF);
+-  const int weights_stage_addr = smem + SMEM_WEIGHTS_STAGE_OFF;
++  uint8_t* row_stage = reinterpret_cast<uint8_t*>(smem_raw + 0);
++  const int row_stage_addr = smem + 0;
++  uint8_t* scales_stage = reinterpret_cast<uint8_t*>(smem_raw + 3072);
++  const int scales_stage_addr = smem + 3072;
++  int* ids_stage = reinterpret_cast<int*>(smem_raw + 3168);
++  const int ids_stage_addr = smem + 3168;
++  float* weights_stage = reinterpret_cast<float*>(smem_raw + 3200);
++  const int weights_stage_addr = smem + 3200;
+ 
+   // === Task calls (dependency order) ===
+   int token = bid;
+@@ -208,7 +208,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_publish
+       for (int element_1 = 0; element_1 < 16; element_1++) {
+         normalized[element_1] = _vec_load_0[element_1] * inverse_scale;
+       }
+-      uint32_t _fp8_0[4];
++      unsigned int _fp8_0[4];
+       {
+         uint32_t _packed;
+         asm volatile(
+@@ -267,10 +267,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_publish
+       }
+       asm volatile(
+           "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(row_stage_addr + (unsigned int)column),
+-          "r"(*reinterpret_cast<uint32_t*>(&_fp8_0[0])),
+-          "r"(*reinterpret_cast<uint32_t*>(&_fp8_0[(0) + 1])),
+-          "r"(*reinterpret_cast<uint32_t*>(&_fp8_0[(0) + 2])),
+-          "r"(*reinterpret_cast<uint32_t*>(&_fp8_0[(0) + 3])));
++          "r"(_fp8_0[0]), "r"(_fp8_0[1]), "r"(_fp8_0[2]), "r"(_fp8_0[3]));
+       if ((quant_chunk & 1) == 0) {
+         scales_stage[quant_chunk / 2] = scale_i;
+       }
+@@ -351,22 +348,22 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_publish
+     for (int destination = 0; destination < 16; destination++) {
+       if (world > destination) {
+         if ((destination_mask >> destination & 1) != 0) {
+-          // nvlink_push: peers.ptrs[destination] + slot_offset <- smem(row_stage_addr), 3232B
+           {
+-            void* __remote =
+-                (void*)((char*)((push_inbox_peers).ptrs[destination]) + (uint64_t)(slot_offset));
++            void* _cpbulk_dst_1 = reinterpret_cast<void*>(
++                reinterpret_cast<uint8_t*>(push_inbox_peers.ptrs[destination]) +
++                (unsigned long long)slot_offset);
+             asm volatile(
+-                "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(__remote),
++                "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(_cpbulk_dst_1),
+                 "r"(row_stage_addr), "r"((uint32_t)(3232))
+                 : "memory");
+           }
+         } else {
+-          // nvlink_push: peers.ptrs[destination] + slot_offset + 3168 <- smem(ids_stage_addr), 64B
+           {
+-            void* __remote = (void*)((char*)((push_inbox_peers).ptrs[destination]) +
+-                                     (uint64_t)(slot_offset + 3168));
++            void* _cpbulk_dst_2 = reinterpret_cast<void*>(
++                reinterpret_cast<uint8_t*>(push_inbox_peers.ptrs[destination]) +
++                (unsigned long long)(slot_offset + 3168));
+             asm volatile(
+-                "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(__remote),
++                "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(_cpbulk_dst_2),
+                 "r"(ids_stage_addr), "r"((uint32_t)(64))
+                 : "memory");
+           }
+diff --git a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_quantize_weights_kernel.cu b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_quantize_weights_kernel.cu
+index aaec42c1dfc..f09b1a4e481 100644
+--- a/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_quantize_weights_kernel.cu
++++ b/flashinfer/experimental/cake_w8a8_megamoe_ep16/csrc/cake_w8a8_megamoe_ep16/cake_w8a8_megamoe_ep16_quantize_weights_kernel.cu
+@@ -92,7 +92,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
+ 
+ extern "C" {
+ 
+-__global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_quantize_weights(
++__global__ __launch_bounds__(256) void kernel_cake_w8a8_megamoe_ep16_quantize_weights(
+     __nv_bfloat16* __restrict__ source, uint8_t* __restrict__ quantized,
+     uint8_t* __restrict__ scales_cp, int experts, int rows, int columns, int gate_width,
+     int interleave_gate_up, int scale_tile_n256_k128, int ktile_major_rows) {

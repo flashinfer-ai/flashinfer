@@ -1,0 +1,606 @@
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 30b29daf21c..8ac23acf581 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -198,6 +198,19 @@ worker counts without GPU topology or measured memory capacity.
+ Run the CPU-only coordinator suite with
+ `pytest --confcutdir=tests/test_sharding tests/test_sharding/`.
+ 
++Communication-test wrappers optionally emit cache-publication completion reports
++when `UNIT_TEST_RUN_STATUS_DIR` is set to a fresh directory unique to that wrapper
++and container/rank. `test_run_status.sh` records each pytest invocation, and
++`test_run_status.py` atomically writes `script-result.json` (schema version 1,
++`complete`, `exit_code`, `tests_executed`, and `infrastructure_errors`). A small
++pytest plugin records execution and collection/internal errors inside each MPI
++or torchrun worker; launcher exit 1 alone is not evidence of an assertion failure.
++All local worker ranks must finish, and at least one test must execute, to allow
++publication. A completed run with assertion failures remains eligible, while
++crashes, timeouts, and unfinished invocations do not. With the variable unset,
++reporting is disabled. The CPU suite above covers this contract without GPU
++dependencies.
++
+ ### Skipping Tests Based on CUDA Architecture
+ 
+ Use `flashinfer.utils` functions to skip tests on unsupported GPU architectures:
+diff --git a/scripts/task_test_multi_gpu_comm_kernels.sh b/scripts/task_test_multi_gpu_comm_kernels.sh
+index 36bb2b10c50..d59a702a9f5 100755
+--- a/scripts/task_test_multi_gpu_comm_kernels.sh
++++ b/scripts/task_test_multi_gpu_comm_kernels.sh
+@@ -46,6 +46,7 @@ _run_pytest_group() {
+ 
+ # Main execution
+ main() {
++    test_status_begin
+     parse_args "$@"
+     print_test_mode_banner
+ 
+@@ -54,6 +55,7 @@ main() {
+     TORCHRUN_TEST_FILES="$(filter_files_by_test_path "$TORCHRUN_TEST_FILES")"
+     if [ -n "${TEST_PATH:-}" ] && [ -z "${MPI_TEST_FILES}${SPAWN_MANAGED_TEST_FILES}${TORCHRUN_TEST_FILES}" ]; then
+         echo "No multi-GPU files overlap TEST_PATH=${TEST_PATH}; skipping."
++        test_status_complete 0
+         exit 0
+     fi
+ 
+@@ -88,17 +90,24 @@ main() {
+         echo "Running: ${TORCHRUN_PREFIX} -m pytest ${test_file} -v --junitxml=${junit_file}"
+         echo "=========================================="
+         if [ "$DRY_RUN" != "true" ]; then
++            local receipt pytest_status=0
++            receipt=$(test_status_start)
++            local -a TEST_STATUS_PYTEST_COMMAND
++            test_status_pytest_command "${receipt}" torchrun
+             rm -f "$junit_file"
+-            if ${TORCHRUN_PREFIX} -m pytest "${test_file}" -v --junitxml="${junit_file}"; then
++            if ${TORCHRUN_PREFIX} "${TEST_STATUS_PYTEST_COMMAND[@]}" "${test_file}" -v --junitxml="${junit_file}"; then
+                 echo "PASSED: $test_file"
+             else
++                pytest_status=$?
+                 echo "FAILED: $test_file"
+                 EXIT_CODE=1
+             fi
++            test_status_finish "${receipt}" "${pytest_status}"
+         fi
+         echo ""
+     done
+ 
++    test_status_complete "$EXIT_CODE"
+     exit "$EXIT_CODE"
+ }
+ 
+diff --git a/scripts/task_test_multi_node_comm_kernels.sh b/scripts/task_test_multi_node_comm_kernels.sh
+index 856e693a0ba..6d868690bdd 100755
+--- a/scripts/task_test_multi_node_comm_kernels.sh
++++ b/scripts/task_test_multi_node_comm_kernels.sh
+@@ -25,12 +25,14 @@ TEST_FILES="tests/comm/test_mnnvl_memory.py tests/comm/test_trtllm_mnnvl_allredu
+ 
+ # Main execution
+ main() {
++    test_status_begin
+     parse_args "$@"
+     print_test_mode_banner
+ 
+     TEST_FILES="$(filter_files_by_test_path "$TEST_FILES")"
+     if [ -n "${TEST_PATH:-}" ] && [ -z "$TEST_FILES" ]; then
+         echo "No multi-node files overlap TEST_PATH=${TEST_PATH}; skipping."
++        test_status_complete 0
+         exit 0
+     fi
+ 
+@@ -50,6 +52,7 @@ main() {
+         execute_tests "$TEST_FILES"
+     fi
+ 
++    test_status_complete "$EXIT_CODE"
+     exit "$EXIT_CODE"
+ }
+ 
+diff --git a/scripts/test_run_status.py b/scripts/test_run_status.py
+new file mode 100644
+index 00000000000..20a4c13f520
+--- /dev/null
++++ b/scripts/test_run_status.py
+@@ -0,0 +1,193 @@
++"""Write optional CI completion reports for the communication-test wrappers.
++
++Each pytest invocation owns a receipt, so concurrent MPI processes and shell
++workers never overwrite one another. Only reaching the wrapper's normal end
++marks the overall operation complete. A killed invocation retains its pending
++receipt even if the legacy wrapper otherwise returns success.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from pathlib import Path
++import tempfile
++import uuid
++
++
++def write_report(path: Path, report: dict) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False) as output:
++        json.dump(report, output)
++        temporary = output.name
++    os.replace(temporary, path)
++
++
++class PytestCompletion:
++    """Observe collection and session completion inside each distributed worker."""
++
++    def __init__(self) -> None:
++        self.complete = False
++        self.errors: list[str] = []
++        self.tests_executed = 0
++
++    def pytest_collectreport(self, report) -> None:
++        if report.failed:
++            self.errors.append(f"pytest collection failed: {report.nodeid}")
++
++    def pytest_internalerror(self, excrepr) -> None:
++        self.errors.append(f"pytest internal error: {excrepr}")
++
++    def pytest_runtest_logreport(self, report) -> None:
++        if report.when == "call" and not report.skipped:
++            self.tests_executed += 1
++
++    def pytest_sessionfinish(self) -> None:
++        self.complete = True
++
++
++def local_worker_identity() -> tuple[int, int]:
++    for count_name, rank_name in (
++        ("LOCAL_WORLD_SIZE", "LOCAL_RANK"),
++        ("OMPI_COMM_WORLD_LOCAL_SIZE", "OMPI_COMM_WORLD_LOCAL_RANK"),
++        ("MPI_LOCALNRANKS", "MPI_LOCALRANKID"),
++    ):
++        if count_name in os.environ:
++            return int(os.environ[count_name]), int(os.environ[rank_name])
++    return 1, 0
++
++
++def run_pytest(receipt: Path, arguments: list[str]) -> int:
++    worker = receipt.parent / receipt.stem / f"worker-{uuid.uuid4().hex}.json"
++    write_report(worker, {"complete": False})
++    # Each CI container owns its result directory; require all local workers,
++    # including ranks that failed before they could create a pending receipt.
++    worker_count, worker_rank = local_worker_identity()
++    # Import only after writing a pending receipt, including import failures in
++    # the incomplete-run check. A segfault leaves this receipt pending too.
++    import pytest
++
++    completion = PytestCompletion()
++    status = int(pytest.main(arguments, plugins=[completion]))
++    write_report(
++        worker,
++        {
++            "complete": completion.complete,
++            "exit_code": status,
++            "infrastructure_errors": completion.errors,
++            "worker_count": worker_count,
++            "worker_rank": worker_rank,
++            "tests_executed": completion.tests_executed,
++        },
++    )
++    return status
++
++
++def complete_script(directory: Path, status: int) -> None:
++    errors = []
++    complete = True
++    test_failures = False
++    tests_executed = 0
++    for path in sorted(directory.glob("pytest-*.json")):
++        try:
++            receipt = json.loads(path.read_text())
++            if receipt["complete"] is not True:
++                complete = False
++                errors.append(f"pytest invocation did not finish: {path.name}")
++            workers = list((directory / path.stem).glob("worker-*.json"))
++            if not workers:
++                complete = False
++                errors.append(f"launcher produced no worker results: {path.name}")
++            worker_failures = False
++            expected_counts = set()
++            worker_ranks = []
++            for worker in workers:
++                outcome = json.loads(worker.read_text())
++                if outcome["complete"] is not True:
++                    complete = False
++                    errors.append(f"pytest worker did not finish: {worker.name}")
++                    continue
++                expected_counts.add(outcome["worker_count"])
++                worker_ranks.append(outcome["worker_rank"])
++                worker_errors = outcome["infrastructure_errors"]
++                count = outcome["tests_executed"]
++                if type(count) is not int or count < 0:
++                    raise ValueError("tests executed must be a nonnegative integer")
++                tests_executed += count
++                if not isinstance(worker_errors, list):
++                    raise ValueError("worker infrastructure errors must be a list")
++                errors.extend(worker_errors)
++                if outcome["exit_code"] not in (0, 1):
++                    errors.append(f"pytest infrastructure exit {outcome['exit_code']}")
++                worker_failures |= outcome["exit_code"] == 1
++            if (
++                len(expected_counts) != 1
++                or next(iter(expected_counts)) < 1
++                or sorted(worker_ranks) != list(range(next(iter(expected_counts))))
++            ):
++                complete = False
++                errors.append(f"launcher is missing expected worker ranks: {path.name}")
++            if receipt.get("exit_code") not in (0, 1) or (
++                receipt.get("exit_code") == 1 and not worker_failures
++            ):
++                errors.append(
++                    f"launcher exit is not explained by pytest assertions: {path.name}"
++                )
++            test_failures |= worker_failures
++        except (OSError, ValueError, TypeError, KeyError):
++            complete = False
++            errors.append(f"invalid pytest receipt: {path.name}")
++    if status not in (0, 1) or (status == 1 and not test_failures):
++        errors.append(f"script exit {status} is not explained by pytest assertions")
++    write_report(
++        directory / "script-result.json",
++        {
++            "schema_version": 1,
++            "complete": complete,
++            "exit_code": status,
++            "infrastructure_errors": errors,
++            "tests_executed": tests_executed,
++        },
++    )
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--directory", type=Path, required=True)
++    parser.add_argument(
++        "operation", choices=("begin", "start", "finish", "complete", "run")
++    )
++    parser.add_argument("--status", type=int, default=0)
++    parser.add_argument("--receipt", type=Path)
++    parser.add_argument("--pytest-args", nargs=argparse.REMAINDER, default=[])
++    args = parser.parse_args()
++    args.directory.mkdir(parents=True, exist_ok=True)
++    if args.operation == "begin":
++        write_report(
++            args.directory / "script-result.json",
++            {
++                "schema_version": 1,
++                "complete": False,
++                "exit_code": None,
++                "infrastructure_errors": [],
++                "tests_executed": 0,
++            },
++        )
++    elif args.operation == "start":
++        path = args.directory / f"pytest-{uuid.uuid4().hex}.json"
++        write_report(path, {"complete": False})
++        print(path)
++    elif args.operation in ("finish", "run"):
++        if args.receipt is None or args.receipt.parent != args.directory:
++            parser.error("receipt must belong to the result directory")
++        if args.operation == "run":
++            return run_pytest(args.receipt, args.pytest_args)
++        write_report(args.receipt, {"complete": True, "exit_code": args.status})
++    else:
++        complete_script(args.directory, args.status)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/test_run_status.sh b/scripts/test_run_status.sh
+new file mode 100644
+index 00000000000..fac133e8046
+--- /dev/null
++++ b/scripts/test_run_status.sh
+@@ -0,0 +1,35 @@
++#!/usr/bin/env bash
++# Optional machine-readable status reporting. With no result directory set,
++# existing local test invocations retain their behavior and incur no subprocesses.
++
++test_status_report() {
++    [ -n "${UNIT_TEST_RUN_STATUS_DIR:-}" ] || return 0
++    local helper
++    helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_run_status.py"
++    python "${helper}" --directory "${UNIT_TEST_RUN_STATUS_DIR}" "$@"
++}
++
++test_status_begin() { test_status_report begin; }
++test_status_start() { test_status_report start; }
++test_status_finish() {
++    [ -n "$1" ] || return 0
++    test_status_report finish --receipt "$1" --status "$2"
++}
++test_status_complete() { test_status_report complete --status "$1"; }
++
++# Populates an array rather than shell text, preserving paths and pytest args.
++# torchrun starts Python itself; MPI and ordinary shells need the interpreter.
++test_status_pytest_command() {
++    local receipt=$1 launcher=${2:-shell} helper
++    TEST_STATUS_PYTEST_COMMAND=(pytest)
++    if [ -n "${UNIT_TEST_RUN_STATUS_DIR:-}" ]; then
++        helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_run_status.py"
++        TEST_STATUS_PYTEST_COMMAND=("${helper}" --directory "${UNIT_TEST_RUN_STATUS_DIR}"
++            run --receipt "${receipt}" --pytest-args)
++        if [ "${launcher}" != torchrun ]; then
++            TEST_STATUS_PYTEST_COMMAND=(python "${TEST_STATUS_PYTEST_COMMAND[@]}")
++        fi
++    elif [ "${launcher}" = torchrun ]; then
++        TEST_STATUS_PYTEST_COMMAND=(-m pytest)
++    fi
++}
+diff --git a/scripts/test_utils.sh b/scripts/test_utils.sh
+index 14680684845..c779c0d3f29 100755
+--- a/scripts/test_utils.sh
++++ b/scripts/test_utils.sh
+@@ -4,6 +4,8 @@
+ 
+ # shellcheck disable=SC1091
+ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_path_scope.sh"
++# shellcheck disable=SC1091
++source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_run_status.sh"
+ 
+ # Default environment variables
+ : "${JUNIT_DIR:=$(realpath ./junit)}"
+@@ -168,6 +170,10 @@ print_test_mode_banner() {
+ }
+ 
+ run_pytest_with_file_timeout() {
++    local receipt pytest_status=0
++    receipt=$(test_status_start) || return 3
++    local -a TEST_STATUS_PYTEST_COMMAND
++    test_status_pytest_command "${receipt}"
+     local -a timeout_cmd=()
+     if [ "$PYTEST_FILE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null; then
+         if command -v timeout >/dev/null 2>&1; then
+@@ -182,7 +188,9 @@ run_pytest_with_file_timeout() {
+     fi
+ 
+     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
+-    "${timeout_cmd[@]}" ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "$@"
++    "${timeout_cmd[@]}" ${PYTEST_COMMAND_PREFIX} "${TEST_STATUS_PYTEST_COMMAND[@]}" $PYTEST_FLAGS "$@" || pytest_status=$?
++    test_status_finish "${receipt}" "${pytest_status}" || return 3
++    return "${pytest_status}"
+ }
+ 
+ is_pytest_file_timeout_exit() {
+diff --git a/tests/test_sharding/test_test_run_status.py b/tests/test_sharding/test_test_run_status.py
+new file mode 100644
+index 00000000000..4c55cb63219
+--- /dev/null
++++ b/tests/test_sharding/test_test_run_status.py
+@@ -0,0 +1,228 @@
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import sys
++
++import pytest
++
++from scripts.test_run_status import local_worker_identity
++
++
++ROOT = Path(__file__).resolve().parents[2]
++HELPER = ROOT / "scripts/test_run_status.py"
++
++
++@pytest.mark.parametrize(
++    "count_name,rank_name",
++    [
++        ("LOCAL_WORLD_SIZE", "LOCAL_RANK"),
++        ("OMPI_COMM_WORLD_LOCAL_SIZE", "OMPI_COMM_WORLD_LOCAL_RANK"),
++        ("MPI_LOCALNRANKS", "MPI_LOCALRANKID"),
++    ],
++)
++def test_worker_identity_supports_ci_mpi_launchers(monkeypatch, count_name, rank_name):
++    for name in [
++        "LOCAL_WORLD_SIZE",
++        "OMPI_COMM_WORLD_LOCAL_SIZE",
++        "MPI_LOCALNRANKS",
++        "PMI_SIZE",
++    ]:
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setenv(count_name, "4")
++    for rank in range(4):
++        monkeypatch.setenv(rank_name, str(rank))
++        assert local_worker_identity() == (4, rank)
++
++
++def test_global_pmi_size_does_not_count_other_containers(monkeypatch):
++    for name in ["LOCAL_WORLD_SIZE", "OMPI_COMM_WORLD_LOCAL_SIZE", "MPI_LOCALNRANKS"]:
++        monkeypatch.delenv(name, raising=False)
++    monkeypatch.setenv("PMI_SIZE", "4")
++    monkeypatch.setenv("PMI_RANK", "3")
++    assert local_worker_identity() == (1, 0)
++
++
++def command(directory: Path, *args: str) -> subprocess.CompletedProcess[str]:
++    return subprocess.run(
++        [sys.executable, str(HELPER), "--directory", str(directory), *args],
++        text=True,
++        capture_output=True,
++        check=True,
++    )
++
++
++def test_worker_missing_before_python_starts_prevents_publication(
++    tmp_path: Path,
++) -> None:
++    command(tmp_path, "begin")
++    receipt = command(tmp_path, "start").stdout.strip()
++    workers = tmp_path / Path(receipt).stem
++    workers.mkdir()
++    (workers / "worker-one.json").write_text(
++        json.dumps(
++            {
++                "complete": True,
++                "exit_code": 1,
++                "infrastructure_errors": [],
++                "worker_count": 2,
++                "worker_rank": 0,
++                "tests_executed": 1,
++            }
++        )
++    )
++    command(tmp_path, "finish", "--receipt", receipt, "--status", "1")
++    command(tmp_path, "complete", "--status", "1")
++    report = json.loads((tmp_path / "script-result.json").read_text())
++    assert report["complete"] is False
++    assert report["infrastructure_errors"]
++
++
++# Cover assertion failures on all three launch routes, then put each additional
++# outcome where it exercises distinct behavior rather than crossing every pair.
++@pytest.mark.parametrize(
++    "route,outcome",
++    [
++        ("torchrun", "passed"),
++        ("torchrun", "assertion"),
++        ("torchrun", "internal"),
++        ("torchrun", "crash"),
++        ("torchrun", "skip"),
++        ("mpi", "assertion"),
++        ("multi_node", "passed"),
++        ("multi_node", "assertion"),
++        ("multi_node", "collection"),
++        ("multi_node", "crash"),
++    ],
++)
++def test_communication_wrappers_report_execution_outcomes(
++    tmp_path: Path, route: str, outcome: str
++) -> None:
++    wrapper, test_path = {
++        "torchrun": (
++            "task_test_multi_gpu_comm_kernels.sh",
++            "tests/attention/test_parallel_attention.py",
++        ),
++        "mpi": (
++            "task_test_multi_gpu_comm_kernels.sh",
++            "tests/comm/test_allreduce_unified_api.py",
++        ),
++        "multi_node": (
++            "task_test_multi_node_comm_kernels.sh",
++            "tests/comm/test_mnnvl_memory.py",
++        ),
++    }[route]
++    # Run the production wrappers and shared launcher, replacing only GPU setup
++    # and distributed executables. The fake launchers run real pytest workers
++    # and normalize all worker failures to 1, as torchrun does.
++    scripts = tmp_path / "scripts"
++    scripts.mkdir()
++    for name in [
++        wrapper,
++        "test_utils.sh",
++        "test_path_scope.sh",
++        "test_run_status.sh",
++        "test_run_status.py",
++    ]:
++        shutil.copy(ROOT / "scripts" / name, scripts / name)
++    (scripts / "setup_test_env.sh").write_text("install_and_verify() { :; }\n")
++    test_file = tmp_path / test_path
++    test_file.parent.mkdir(parents=True, exist_ok=True)
++    if outcome == "collection":
++        test_file.write_text("import nonexistent_cache_contract_module\n")
++    elif outcome == "crash":
++        test_file.write_text("import os\ndef test_crash():\n    os._exit(139)\n")
++    elif outcome == "skip":
++        test_file.write_text(
++            'import pytest\n@pytest.mark.skip(reason="unsupported")\ndef test_skip():\n    pass\n'
++        )
++    elif outcome == "passed":
++        test_file.write_text("def test_success():\n    pass\n")
++    else:
++        test_file.write_text("def test_failure():\n    assert False\n")
++    if outcome == "internal":
++        (tmp_path / "conftest.py").write_text(
++            'def pytest_sessionstart(session):\n    raise RuntimeError("internal error")\n'
++        )
++    fake_bin = tmp_path / "bin"
++    fake_bin.mkdir()
++    for name in ["mpirun", "torchrun"]:
++        executable = fake_bin / name
++        executable.write_text(
++            "#!/bin/sh\n"
++            + ('shift\npython "$@"\n' if name == "torchrun" else 'shift 2\n"$@"\n')
++            + 'status=$?\n[ "$status" -eq 0 ] && exit 0\nexit 1\n'
++        )
++        executable.chmod(0o755)
++    env = dict(os.environ)
++    env.update(
++        PATH=f"{fake_bin}:{env['PATH']}",
++        PIP_CONSTRAINT=os.devnull,
++        MAX_JOBS="1",
++        MONITOR_TEST_MEMORY="false",
++        PARALLEL_TESTS="false",
++        JUNIT_DIR=str(tmp_path / "junit"),
++        UNIT_TEST_RUN_STATUS_DIR=str(tmp_path / "status"),
++        TEST_PATH=test_path,
++        PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
++        PYTEST_ADDOPTS="",
++    )
++    result = subprocess.run(
++        ["bash", str(scripts / wrapper)],
++        cwd=tmp_path,
++        env=env,
++        text=True,
++        capture_output=True,
++        timeout=20,
++    )
++    assert result.returncode in (0, 1), result.stdout + result.stderr
++    report = json.loads((tmp_path / "status/script-result.json").read_text())
++    assert report["exit_code"] == result.returncode
++    if outcome in ("passed", "assertion"):
++        assert report["complete"] is True
++        assert report["infrastructure_errors"] == []
++        assert result.returncode == (1 if outcome == "assertion" else 0)
++        assert report["tests_executed"] == 1
++    elif outcome == "skip":
++        assert report["complete"] is True
++        assert report["tests_executed"] == 0
++    else:
++        assert report["infrastructure_errors"]
++        if outcome == "crash":
++            assert report["complete"] is False
++
++
++def test_setup_failure_leaves_wrapper_report_incomplete(tmp_path: Path) -> None:
++    scripts = tmp_path / "scripts"
++    scripts.mkdir()
++    for name in [
++        "task_test_multi_node_comm_kernels.sh",
++        "test_utils.sh",
++        "test_path_scope.sh",
++        "test_run_status.sh",
++        "test_run_status.py",
++    ]:
++        shutil.copy(ROOT / "scripts" / name, scripts / name)
++    (scripts / "setup_test_env.sh").write_text("exit 1\n")
++    env = dict(os.environ)
++    env.update(
++        PIP_CONSTRAINT=os.devnull,
++        MAX_JOBS="1",
++        JUNIT_DIR=str(tmp_path / "junit"),
++        UNIT_TEST_RUN_STATUS_DIR=str(tmp_path / "status"),
++        TEST_PATH="",
++    )
++    result = subprocess.run(
++        ["bash", str(scripts / "task_test_multi_node_comm_kernels.sh")],
++        cwd=tmp_path,
++        env=env,
++        text=True,
++        capture_output=True,
++        timeout=20,
++    )
++    assert result.returncode == 1, result.stdout + result.stderr
++    report = json.loads((tmp_path / "status/script-result.json").read_text())
++    assert report["complete"] is False

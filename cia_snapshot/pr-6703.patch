@@ -1,0 +1,366 @@
+diff --git a/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_cute_manifest.json b/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_cute_manifest.json
+index a6e493c827a..2461376caed 100644
+--- a/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_cute_manifest.json
++++ b/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_cute_manifest.json
+@@ -5671,10 +5671,10 @@
+         "sha256": "d88e4987e71e51dcd69175ad6a994a18fa8603b093638c60e971c99892102455"
+       },
+       {
+-        "bytes": 287921,
++        "bytes": 288629,
+         "kind": "integration",
+         "path": "flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py",
+-        "sha256": "0ad649cdee097f7bcce5b1684439b1a35af53887b9d8869ca7180c553b643937"
++        "sha256": "050d0623e6f8a51ab15a8a10104ac21dc44bbd6cccadada1537b1cebeede3685"
+       },
+       {
+         "bytes": 454,
+@@ -5683,10 +5683,10 @@
+         "sha256": "d6f4222142ed25eb12b0c557d85a02d33eaff68b81caef95deee0347fd5ceb49"
+       },
+       {
+-        "bytes": 68334,
++        "bytes": 73035,
+         "kind": "integration",
+         "path": "tests/moe/test_cake_mxfp4_situ_moe_cute.py",
+-        "sha256": "1795ac89102c8234834ff706bcb05037c9f81e64d878d7c6d8658bc684356363"
++        "sha256": "39aa2005cddf136162470b2012a59594318f7d02ab29b0fff753c140a7e4ad78"
+       }
+     ],
+     "integration_status": "complete: kernel modules, host plan, kernel loader, tests and docs page rendered; plan parity and coverage checked",
+diff --git a/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_manifest.json b/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_manifest.json
+index 0c89eb8dfcd..6c58ced3217 100644
+--- a/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_manifest.json
++++ b/csrc/fused_moe/cake_mxfp4_situ_moe/cake_mxfp4_situ_moe_manifest.json
+@@ -5901,10 +5901,10 @@
+         "sha256": "4b86adf8db4b2fc320f6343cfcccac7bf0a16c81cdde3ab761675be4a90935ae"
+       },
+       {
+-        "bytes": 287911,
++        "bytes": 288619,
+         "kind": "integration",
+         "path": "flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py",
+-        "sha256": "95fba24e6f383126ed4ba233453ab2e54bbbdd2b354599f8b72ce3c87a8dccdf"
++        "sha256": "6576e9f7f4bd757813c9dd15f5c7c530229e0accaf660f60bf44291927f3c211"
+       },
+       {
+         "bytes": 454,
+@@ -5913,10 +5913,10 @@
+         "sha256": "d6f4222142ed25eb12b0c557d85a02d33eaff68b81caef95deee0347fd5ceb49"
+       },
+       {
+-        "bytes": 68314,
++        "bytes": 73015,
+         "kind": "integration",
+         "path": "tests/moe/test_cake_mxfp4_situ_moe.py",
+-        "sha256": "6a0489421c6d6218181a78f5b5f6e12a1c923841c67a8d4601e9eee9bfe604a0"
++        "sha256": "13a6e0fecc7a65382edd305159a161a121490d52c39b543a57e1554d33822f91"
+       }
+     ],
+     "integration_status": "complete: kernel modules, host plan, kernel loader, tests and docs page rendered; plan parity and coverage checked",
+diff --git a/flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py b/flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py
+index 84076e87331..e0c93492787 100644
+--- a/flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py
++++ b/flashinfer/fused_moe/cake/cake_mxfp4_situ_moe_plan.py
+@@ -4356,6 +4356,15 @@ class _GemmModule:
+     _unused_situ_operands = staticmethod(_unused_situ_operands)
+     cluster_split_grid = staticmethod(swapab_cluster_split_grid)
+ 
++    @staticmethod
++    def pack_g1_geom(*, items_per_group: int, grid: int, split_form: bool) -> int:
++        """The plain chain's GEMM1 launch geometry packed for the finalize kernel's late-item first-box L2 prefetch
++        (decoded device-side as ``grid = g1_geom & 4095``, ``items_per_group = g1_geom >> 12 & 4095`` and
++        ``split_form = g1_geom >> 24 & 1``); 0 is the unknown geometry (nothing prefetched, same output)."""
++        if not (0 <= int(grid) <= 4095 and 0 <= int(items_per_group) <= 4095):
++            raise ValueError(f"g1_geom field out of range: grid={grid}, items_per_group={items_per_group}")
++        return int(grid) | (int(items_per_group) << 12) | (int(bool(split_form)) << 24)
++
+     @staticmethod
+     def form_config(n_tile: int, kbps: int = 4, *, situ: bool = False, m_group: int | None = None,
+                     row_group_list: bool | None = None, sf_blocked: bool | None = None,
+diff --git a/flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py b/flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py
+index de19cc5e61d..7e318435481 100644
+--- a/flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py
++++ b/flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py
+@@ -4356,6 +4356,15 @@ class _GemmModule:
+     _unused_situ_operands = staticmethod(_unused_situ_operands)
+     cluster_split_grid = staticmethod(swapab_cluster_split_grid)
+ 
++    @staticmethod
++    def pack_g1_geom(*, items_per_group: int, grid: int, split_form: bool) -> int:
++        """The plain chain's GEMM1 launch geometry packed for the finalize kernel's late-item first-box L2 prefetch
++        (decoded device-side as ``grid = g1_geom & 4095``, ``items_per_group = g1_geom >> 12 & 4095`` and
++        ``split_form = g1_geom >> 24 & 1``); 0 is the unknown geometry (nothing prefetched, same output)."""
++        if not (0 <= int(grid) <= 4095 and 0 <= int(items_per_group) <= 4095):
++            raise ValueError(f"g1_geom field out of range: grid={grid}, items_per_group={items_per_group}")
++        return int(grid) | (int(items_per_group) << 12) | (int(bool(split_form)) << 24)
++
+     @staticmethod
+     def form_config(n_tile: int, kbps: int = 4, *, situ: bool = False, m_group: int | None = None,
+                     row_group_list: bool | None = None, sf_blocked: bool | None = None,
+diff --git a/tests/moe/test_cake_mxfp4_situ_moe.py b/tests/moe/test_cake_mxfp4_situ_moe.py
+index eb806c389de..91fcfd2273b 100644
+--- a/tests/moe/test_cake_mxfp4_situ_moe.py
++++ b/tests/moe/test_cake_mxfp4_situ_moe.py
+@@ -27,6 +27,7 @@ class between the two backends (the same Cake programs lowered twice) and, when
+ installed FlashInfer exposes the hand-written wrapper, against it.
+ """
+ 
++import ast
+ import hashlib
+ import importlib
+ import importlib.util
+@@ -730,6 +731,92 @@ def test_gemm_forms_carry_the_trace_time_constants():
+         kernels.select_gemm2(32, 8, 1)
+ 
+ 
++# --- package binding: every producer helper the plan reaches is bound ----------------
++
++_MODULE_ACCESSORS = (
++    "_routing_module",
++    "_gemm_module",
++    "_moe_sort_module",
++    "_gemm1_dense_module",
++    "_gemm2_dense_module",
++    "_gemm2_gate_module",
++    "_finalize_module",
++    "_dispatch_module",
++)
++
++
++def _accessor_of(node):
++    """The accessor name when ``node`` is a call of one of ``_MODULE_ACCESSORS``."""
++    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
++        if node.func.id in _MODULE_ACCESSORS:
++            return node.func.id
++    return None
++
++
++def _reached_helpers():
++    """``(accessor, attribute, line)`` of every attribute the plan source reaches through a
++    package-bound module accessor: ``gm = _gemm_module()`` then ``gm.<name>`` within the
++    same function, or ``_gemm_module().<name>`` directly."""
++    tree = ast.parse(Path(plan.__file__).read_text(), filename=plan.__file__)
++    reached = set()
++    for func in ast.walk(tree):
++        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
++            continue
++        bound = {}
++        for node in ast.walk(func):
++            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
++                continue
++            target, value = node.targets[0], node.value
++            if isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple):
++                pairs = list(zip(target.elts, value.elts, strict=True))
++            else:
++                pairs = [(target, value)]
++            for name, call in pairs:
++                accessor = _accessor_of(call)
++                if isinstance(name, ast.Name) and accessor is not None:
++                    bound[name.id] = accessor
++        for node in ast.walk(func):
++            if not isinstance(node, ast.Attribute):
++                continue
++            if isinstance(node.value, ast.Name) and node.value.id in bound:
++                reached.add((bound[node.value.id], node.attr, node.lineno))
++            elif _accessor_of(node.value) is not None:
++                reached.add((_accessor_of(node.value), node.attr, node.lineno))
++    return sorted(reached)
++
++
++def test_plan_reaches_only_helpers_the_package_binds():
++    """Every ``<module>.<name>`` the plan reaches through a package-bound accessor exists on
++    the binding class.  The plain chain reached ``gm.pack_g1_geom`` (the late-item L2
++    prefetch geometry of its finalize launch) while ``_GemmModule`` did not bind it: every
++    plain-chain ``plan()`` raised AttributeError on the device."""
++    reached = _reached_helpers()
++    assert ("_gemm_module", "pack_g1_geom") in {(a, n) for a, n, _line in reached}
++    missing = [
++        (accessor, name, line)
++        for accessor, name, line in reached
++        if not hasattr(getattr(plan, accessor)(), name)
++    ]
++    assert not missing, missing
++
++
++def test_gemm_module_packs_the_plain_chain_prefetch_geometry():
++    """``_GemmModule.pack_g1_geom``: launched GEMM1 CTAs in bits 0-11, work items per valid
++    group in bits 12-23, the cluster split-K form in bit 24; both counts below 4096."""
++    gm = plan._gemm_module()
++    assert gm.pack_g1_geom(items_per_group=48, grid=148, split_form=True) == (
++        148 | (48 << 12) | (1 << 24)
++    )
++    assert gm.pack_g1_geom(items_per_group=6, grid=148, split_form=False) == (
++        148 | (6 << 12)
++    )
++    assert gm.pack_g1_geom(items_per_group=0, grid=0, split_form=False) == 0
++    with pytest.raises(ValueError):
++        gm.pack_g1_geom(items_per_group=4096, grid=148, split_form=False)
++    with pytest.raises(ValueError):
++        gm.pack_g1_geom(items_per_group=48, grid=4096, split_form=False)
++
++
+ # --- GPU -----------------------------------------------------------------------------
+ 
+ 
+@@ -1315,6 +1402,27 @@ def test_chain_runs_deterministically_and_replays_under_graph_capture(
+     ) and plan.kernel_stages(p)[2].startswith("gemm2_swapab_finalize_n")
+ 
+ 
++@gpu
++@pytest.mark.parametrize("row", ["ep8_1", "ep8_16", "tp8_16"])
++def test_plain_chain_passes_the_gemm1_geometry_to_its_finalize(row):
++    """The decode rows' finalize launch receives the GEMM1 launch geometry the device-side
++    late-item L2 prefetch rule mirrors (``g1_geom``, packed by ``_GemmModule.pack_g1_geom``
++    into the bound finalize operand): the GEMM1 grid, the form's work items per valid group
++    (2 I / 128 of the shard) and the cluster split-K form.  The GEMM2 grid of these rows
++    fills the device, the precondition of the rule."""
++    layout = ROWS[row][0]
++    _inputs, p, _out = _run_row(pkg, ROWS[row])
++    assert p.decision.path == "plain"
++    sequence = p.launch_sequence()
++    assert sequence[2][1][0] == p.sm_count
++    g1 = p.decision.gemm1
++    geometry = p._gemm2_args["g1_geom"]
++    assert geometry & 4095 == sequence[1][1][0] > 0
++    shard = layout.get("intermediate_shard", INTERMEDIATE)
++    assert (geometry >> 12) & 4095 == 2 * shard // 128
++    assert (geometry >> 24) & 1 == int(bool(g1.cluster_split and g1.k_tiles >= 2))
++
++
+ def _path_row(row):
+     """``(layout, T, decision, chain)`` of a ``PATH_ROWS`` row; skips when no shipped chain runs it."""
+     layout, T = PATH_ROWS[row][0], PATH_ROWS[row][1]
+diff --git a/tests/moe/test_cake_mxfp4_situ_moe_cute.py b/tests/moe/test_cake_mxfp4_situ_moe_cute.py
+index f54474b5266..abff2fc4e36 100644
+--- a/tests/moe/test_cake_mxfp4_situ_moe_cute.py
++++ b/tests/moe/test_cake_mxfp4_situ_moe_cute.py
+@@ -27,6 +27,7 @@ class between the two backends (the same Cake programs lowered twice) and, when
+ installed FlashInfer exposes the hand-written wrapper, against it.
+ """
+ 
++import ast
+ import hashlib
+ import importlib
+ import importlib.util
+@@ -730,6 +731,92 @@ def test_gemm_forms_carry_the_trace_time_constants():
+         kernels.select_gemm2(32, 8, 1)
+ 
+ 
++# --- package binding: every producer helper the plan reaches is bound ----------------
++
++_MODULE_ACCESSORS = (
++    "_routing_module",
++    "_gemm_module",
++    "_moe_sort_module",
++    "_gemm1_dense_module",
++    "_gemm2_dense_module",
++    "_gemm2_gate_module",
++    "_finalize_module",
++    "_dispatch_module",
++)
++
++
++def _accessor_of(node):
++    """The accessor name when ``node`` is a call of one of ``_MODULE_ACCESSORS``."""
++    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
++        if node.func.id in _MODULE_ACCESSORS:
++            return node.func.id
++    return None
++
++
++def _reached_helpers():
++    """``(accessor, attribute, line)`` of every attribute the plan source reaches through a
++    package-bound module accessor: ``gm = _gemm_module()`` then ``gm.<name>`` within the
++    same function, or ``_gemm_module().<name>`` directly."""
++    tree = ast.parse(Path(plan.__file__).read_text(), filename=plan.__file__)
++    reached = set()
++    for func in ast.walk(tree):
++        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
++            continue
++        bound = {}
++        for node in ast.walk(func):
++            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
++                continue
++            target, value = node.targets[0], node.value
++            if isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple):
++                pairs = list(zip(target.elts, value.elts, strict=True))
++            else:
++                pairs = [(target, value)]
++            for name, call in pairs:
++                accessor = _accessor_of(call)
++                if isinstance(name, ast.Name) and accessor is not None:
++                    bound[name.id] = accessor
++        for node in ast.walk(func):
++            if not isinstance(node, ast.Attribute):
++                continue
++            if isinstance(node.value, ast.Name) and node.value.id in bound:
++                reached.add((bound[node.value.id], node.attr, node.lineno))
++            elif _accessor_of(node.value) is not None:
++                reached.add((_accessor_of(node.value), node.attr, node.lineno))
++    return sorted(reached)
++
++
++def test_plan_reaches_only_helpers_the_package_binds():
++    """Every ``<module>.<name>`` the plan reaches through a package-bound accessor exists on
++    the binding class.  The plain chain reached ``gm.pack_g1_geom`` (the late-item L2
++    prefetch geometry of its finalize launch) while ``_GemmModule`` did not bind it: every
++    plain-chain ``plan()`` raised AttributeError on the device."""
++    reached = _reached_helpers()
++    assert ("_gemm_module", "pack_g1_geom") in {(a, n) for a, n, _line in reached}
++    missing = [
++        (accessor, name, line)
++        for accessor, name, line in reached
++        if not hasattr(getattr(plan, accessor)(), name)
++    ]
++    assert not missing, missing
++
++
++def test_gemm_module_packs_the_plain_chain_prefetch_geometry():
++    """``_GemmModule.pack_g1_geom``: launched GEMM1 CTAs in bits 0-11, work items per valid
++    group in bits 12-23, the cluster split-K form in bit 24; both counts below 4096."""
++    gm = plan._gemm_module()
++    assert gm.pack_g1_geom(items_per_group=48, grid=148, split_form=True) == (
++        148 | (48 << 12) | (1 << 24)
++    )
++    assert gm.pack_g1_geom(items_per_group=6, grid=148, split_form=False) == (
++        148 | (6 << 12)
++    )
++    assert gm.pack_g1_geom(items_per_group=0, grid=0, split_form=False) == 0
++    with pytest.raises(ValueError):
++        gm.pack_g1_geom(items_per_group=4096, grid=148, split_form=False)
++    with pytest.raises(ValueError):
++        gm.pack_g1_geom(items_per_group=48, grid=4096, split_form=False)
++
++
+ # --- GPU -----------------------------------------------------------------------------
+ 
+ 
+@@ -1315,6 +1402,27 @@ def test_chain_runs_deterministically_and_replays_under_graph_capture(
+     ) and plan.kernel_stages(p)[2].startswith("gemm2_swapab_finalize_n")
+ 
+ 
++@gpu
++@pytest.mark.parametrize("row", ["ep8_1", "ep8_16", "tp8_16"])
++def test_plain_chain_passes_the_gemm1_geometry_to_its_finalize(row):
++    """The decode rows' finalize launch receives the GEMM1 launch geometry the device-side
++    late-item L2 prefetch rule mirrors (``g1_geom``, packed by ``_GemmModule.pack_g1_geom``
++    into the bound finalize operand): the GEMM1 grid, the form's work items per valid group
++    (2 I / 128 of the shard) and the cluster split-K form.  The GEMM2 grid of these rows
++    fills the device, the precondition of the rule."""
++    layout = ROWS[row][0]
++    _inputs, p, _out = _run_row(pkg, ROWS[row])
++    assert p.decision.path == "plain"
++    sequence = p.launch_sequence()
++    assert sequence[2][1][0] == p.sm_count
++    g1 = p.decision.gemm1
++    geometry = p._gemm2_args["g1_geom"]
++    assert geometry & 4095 == sequence[1][1][0] > 0
++    shard = layout.get("intermediate_shard", INTERMEDIATE)
++    assert (geometry >> 12) & 4095 == 2 * shard // 128
++    assert (geometry >> 24) & 1 == int(bool(g1.cluster_split and g1.k_tiles >= 2))
++
++
+ def _path_row(row):
+     """``(layout, T, decision, chain)`` of a ``PATH_ROWS`` row; skips when no shipped chain runs it."""
+     layout, T = PATH_ROWS[row][0], PATH_ROWS[row][1]

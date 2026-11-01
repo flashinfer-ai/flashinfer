@@ -1,0 +1,815 @@
+diff --git a/.github/workflows/pr-test.yml b/.github/workflows/pr-test.yml
+index 9a92e1f0fe9..708d547859b 100644
+--- a/.github/workflows/pr-test.yml
++++ b/.github/workflows/pr-test.yml
+@@ -469,6 +469,9 @@ jobs:
+               exit 1
+               ;;
+           esac
++          # Per-build compile times, summarized by the next step.
++          mkdir -p junit
++          CI_BASH_ARGS=(-e FLASHINFER_JIT_BUILD_LOG /workspace/junit/jit-builds.jsonl)
+           TEST_RUNNER_ARGS=()
+           if [ "${MATRIX_KIND}" = "h100" ]; then
+             TEST_RUNNER_ARGS+=(--workers-per-gpu 2)
+@@ -485,28 +488,41 @@ jobs:
+             # to unit_test_runner.py, whose parser takes the scope as an option (or the
+             # TEST_PATH env var, which ci/bash.sh does not forward into the container).
+             # Bare paths fail argument-preflight with "unrecognized arguments".
+-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
++            bash ci/bash.sh "${DOCKER_IMAGE}" "${CI_BASH_ARGS[@]}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}" --test-path "${TEST_TARGETS[@]}"
+           else
+-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
++            bash ci/bash.sh "${DOCKER_IMAGE}" "${CI_BASH_ARGS[@]}" "./scripts/${TEST_SCRIPT}" "${TEST_RUNNER_ARGS[@]}"
++          fi
++
++      - name: Summarize JIT build times
++        if: always() && matrix.kind != 'aot'
++        run: |
++          if command -v python3 >/dev/null; then
++            python3 scripts/summarize_jit_builds.py junit/jit-builds.jsonl || true
++            python3 scripts/summarize_jit_builds.py --markdown \
++              junit/jit-builds.jsonl >> "${GITHUB_STEP_SUMMARY}" || true
++          else
++            echo "::warning::python3 unavailable on runner; JIT build summary skipped"
+           fi
+ 
+       - name: Make JUnit XML readable
+-        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
++        if: ${{ always() && matrix.kind != 'aot' }}
+         run: |
+           if [ -d junit ]; then
+             sudo chmod -R a+rX junit
+           fi
+ 
+       - name: Upload JUnit XML and telemetry
+-        if: ${{ always() && (matrix.kind == 'h100' || startsWith(matrix.script, 'task_jit_run_tests_part')) }}
++        if: ${{ always() && matrix.kind != 'aot' }}
+         uses: actions/upload-artifact@v4
+         with:
+-          name: junit-${{ matrix.kind == 'h100' && 'h100' || matrix.script }}-${{ github.run_id }}-${{ github.run_attempt }}
++          # Targeted A10G and T4 rows run the same script, so non-H100 names add the SM.
++          name: junit-${{ matrix.kind == 'h100' && 'h100' || format('{0}-{1}', matrix.script, matrix.runner[4]) }}-${{ github.run_id }}-${{ github.run_attempt }}
+           path: |
+             junit/**/*.xml
+             junit/**/*.telemetry.json
+             junit/**/*.meta.json
+             junit/**/*.memory.csv
++            junit/jit-builds.jsonl
+           if-no-files-found: warn
+           retention-days: 30
+ 
+diff --git a/CLAUDE.md b/CLAUDE.md
+index b4063a602fc..9e938e74320 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -121,6 +121,16 @@ Caveats:
+ - The cache is per-devcontainer by design: sccache's local storage supports a
+   single server at a time, so two containers must not share one cache directory.
+ 
++GitHub PR Test GPU jobs keep a different, per-runner cache: `ci/bash.sh` mounts
++`~/.cache/flashinfer-ci/compile/$RUNNER_NAME` as the FlashInfer workspace base
++and Triton cache (`CI_COMPILE_CACHE_DIR=""` opts out; `CI_COMPILE_CACHE_MAX_MB`
++caps it). Only content-keyed artifacts survive between jobs: CuTe-DSL (with
++`FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1`), TIRx, KDA PTX, Triton and downloaded
++cubins. nvcc modules, tuning results and the generated-source tree are pruned,
++since a fresh checkout rebuilds nvcc modules anyway. Each test job's
++`FLASHINFER_JIT_BUILD_LOG` is summarized per toolchain by
++`scripts/summarize_jit_builds.py` in the job summary.
++
+ ## cuDNN linear attention
+ 
+ Use `nvidia-cudnn-frontend>=1.31.0`; KDA and GDN normalization use additive
+@@ -591,7 +601,11 @@ current device) since the artifacts are single-arch, unlike nvcc fatbins.
+ Invalidation is module-granular: a changed nvidia-cutlass-dsl version or
+ kernel-source SHA256 wipes and lazily rebuilds the module. Reference usage:
+ `flashinfer/quantization/kernels/nvfp4_quantize.py`. Disable with
+-`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`.
++`FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`. The SHA256 covers only the files a caller
++passes as `extra_key_files` (often just `__file__`); with
++`FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1` it also covers every flashinfer module
++those files transitively import (not the top-level `flashinfer/__init__.py`), for
++long-lived caches shared across commits such as CI's.
+ Task-scheduled attention shares this cache through
+ `flashinfer/attention/prims_ts/_compile_cache.py`; its keys cover compile specs,
+ options, and embedded device-capacity constants. It hashes the attention source
+@@ -693,6 +707,8 @@ match what the code uses today; values are strings unless noted.
+ |----------|---------|---------|--------|
+ | `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
+ | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
++| `FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` extends each CuTe-DSL disk-cache key from the caller's `extra_key_files` to their in-package import closure, so editing an imported helper invalidates the kernel. Changes every key, so the first run after enabling recompiles. Set by CI's persistent compile cache. |
++| `FLASHINFER_JIT_BUILD_LOG` | unset | `flashinfer/jit/core.py` | Path of a JSONL file that gets one record (`toolchain`, `name`, `seconds`) per build made through `JitSpec.build_and_load()` or a bulk `build_jit_specs()` prebuild: nvcc modules (ninja no-ops included), CuTe-DSL kernels and TIRx modules. Triton, cuTile and the cake nvcc/NVRTC side paths are not recorded. Summarize with `scripts/summarize_jit_builds.py`. |
+ | `FLASHINFER_CUDNN_FROST_PTXAS` | unset | `flashinfer/fused_moe/backends/cudnn_frost/compiler.py` | Select an external PTXAS executable path for all Frost dtypes; unset or empty uses the bundled assembler. The executable path, version, and SHA-256 participate in compiler and tactic cache identities. MoE engines snapshot this configuration at build time; call `layer.refresh_backends()` or reconstruct the layer to adopt changes. |
+ | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the check that pins flashinfer-cubin and flashinfer-jit-cache to the installed flashinfer-python. Without it, mismatched kernel wheels (typically left behind by an upgrade) are ignored with a warning at import, falling back to on-demand cubin downloads and JIT compilation until `flashinfer download-kernels` installs matching ones. Set it only when you intentionally mix versions. |
+ | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
+diff --git a/ci/bash.sh b/ci/bash.sh
+index 11f534a5573..457cac94922 100644
+--- a/ci/bash.sh
++++ b/ci/bash.sh
+@@ -81,6 +81,62 @@ else
+     echo "Shared pip cache disabled or not writable; downloads will not be reused"
+ fi
+ 
++# Keep content-keyed kernel compile caches across the jobs of this runner, so
++# tests stop recompiling every CuTe-DSL, TIRx, KDA PTX and Triton kernel per
++# job. One directory per runner: a runner runs one job at a time, so no two
++# checkouts ever share a directory concurrently. GPU jobs only.
++# CI_COMPILE_CACHE_DIR="" opts out.
++#
++# What is deliberately not kept:
++# - nvcc modules: a fresh checkout makes every source newer than its .so, so
++#   ninja rebuilds them anyway. They are pruned instead of taking disk.
++# - Tuning results (*/autotune): tests must tune from scratch.
++# - The CuTe-DSL compiler's own file cache (CUTE_DSL_CACHE_DIR), whose key
++#   is not under FlashInfer's control. FlashInfer's CuTe-DSL cache is kept,
++#   with FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1 so a kernel is also keyed on
++#   the in-package helpers it imports, not only on its own file.
++# - The TRT-LLM DeepGEMM cache (~/.tensorrt_llm/cache), keyed on shapes only.
++prune_compile_cache() {
++    local cache_dir=$1
++    [ -d "${cache_dir}" ] || return 0
++    # Containers may write as root, so the runner user may need sudo.
++    local rm_cmd=(rm -rf)
++    if [ ! -w "${cache_dir}" ] || find "${cache_dir}" ! -user "$(id -u)" -print -quit 2>/dev/null | grep -q .; then
++        rm_cmd=(sudo -n rm -rf)
++    fi
++    # GNU find/xargs (CI runners); elsewhere this quietly prunes nothing.
++    {
++        find "${cache_dir}" -path '*/cached_ops/*' -name build.ninja -printf '%h\0'
++        find "${cache_dir}" -type d \( -name autotune \
++            -o -path '*/.cache/flashinfer/*/*/generated' \) -prune -printf '%p\0'
++        find "${cache_dir}" -name flashinfer_jit.log -printf '%p\0'
++    } 2>/dev/null | xargs -0 -r "${rm_cmd[@]}" 2>/dev/null || true
++}
++
++COMPILE_CACHE_DIR=""
++if [[ ${USE_GPU} == "true" ]]; then
++    : "${CI_COMPILE_CACHE_DIR=${HOME:-/tmp}/.cache/flashinfer-ci/compile/${RUNNER_NAME:-local}}"
++    if [ -n "${CI_COMPILE_CACHE_DIR}" ] && mkdir -p "${CI_COMPILE_CACHE_DIR}" 2>/dev/null; then
++        COMPILE_CACHE_DIR=${CI_COMPILE_CACHE_DIR}
++        prune_compile_cache "${COMPILE_CACHE_DIR}"
++        CACHE_MB=$(du -sm "${COMPILE_CACHE_DIR}" 2>/dev/null | cut -f1)
++        echo "Compile cache: ${COMPILE_CACHE_DIR} (${CACHE_MB:-0} MB)"
++        if [ "${CACHE_MB:-0}" -gt "${CI_COMPILE_CACHE_MAX_MB:-40960}" ]; then
++            echo "Clearing compile cache: ${CACHE_MB} MB exceeds ${CI_COMPILE_CACHE_MAX_MB:-40960} MB"
++            rm -rf "${COMPILE_CACHE_DIR:?}" 2>/dev/null \
++                || sudo -n rm -rf "${COMPILE_CACHE_DIR:?}" 2>/dev/null || true
++            mkdir -p "${COMPILE_CACHE_DIR}" 2>/dev/null || true
++        fi
++        DOCKER_VOLUMNS="${DOCKER_VOLUMNS} -v ${COMPILE_CACHE_DIR}:/compile-cache"
++        DOCKER_ENV="${DOCKER_ENV} -e FLASHINFER_WORKSPACE_BASE=/compile-cache/flashinfer"
++        DOCKER_ENV="${DOCKER_ENV} -e FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1"
++        DOCKER_ENV="${DOCKER_ENV} -e CUTE_DSL_CACHE_DIR=/tmp/cute-dsl-cache"
++        DOCKER_ENV="${DOCKER_ENV} -e TRITON_CACHE_DIR=/compile-cache/triton"
++    else
++        echo "Compile cache disabled or not writable; kernels will not be reused"
++    fi
++fi
++
+ # Use nvidia-docker if the container is GPU.
+ if [[ ${USE_GPU} == "true" ]]; then
+     # Keep CPU-only sharding infrastructure tests out of GPU CI collection.
+@@ -124,3 +180,10 @@ ${DOCKER_BINARY} run --rm --pid=host \
+     ${DOCKER_EXTRA_PARAMS[@]} \
+     ${DOCKER_IMAGE_NAME} \
+     ${COMMAND[@]}
++DOCKER_STATUS=$?
++
++# Drop what the next job would rebuild anyway before the runner sits idle.
++if [ -n "${COMPILE_CACHE_DIR}" ]; then
++    prune_compile_cache "${COMPILE_CACHE_DIR}"
++fi
++exit "${DOCKER_STATUS}"
+diff --git a/flashinfer/jit/core.py b/flashinfer/jit/core.py
+index 20a738f68f8..23506525ad1 100644
+--- a/flashinfer/jit/core.py
++++ b/flashinfer/jit/core.py
+@@ -1,15 +1,18 @@
+ import abc
+ import dataclasses
+ import functools
++import json
+ import logging
+ import os
+ import threading
++import time
+ from contextlib import nullcontext
+ from datetime import datetime
+ from pathlib import Path
+ from typing import (
+     Any,
+     Callable,
++    ClassVar,
+     Dict,
+     Hashable,
+     List,
+@@ -105,6 +108,36 @@ def _print_once(self, log_method, msg: str, *args: Hashable) -> None:
+ logger = FlashInferJITLogger("flashinfer.jit")
+ 
+ 
++def _record_jit_build(toolchain: str, name: str, seconds: float) -> None:
++    """Append one build's wall time to ``FLASHINFER_JIT_BUILD_LOG`` as JSONL.
++
++    Lets CI attribute compile time to each toolchain. A single ``O_APPEND``
++    write of one short line keeps concurrent test processes from
++    interleaving records. Builds that find everything up to date (ninja
++    no-ops) are recorded too; their near-zero times show up as such.
++    """
++    log_path = os.environ.get("FLASHINFER_JIT_BUILD_LOG")
++    if not log_path:
++        return
++    line = json.dumps(
++        {
++            "toolchain": toolchain,
++            "name": name,
++            "seconds": round(seconds, 3),
++            "pid": os.getpid(),
++            "time": round(time.time(), 3),
++        }
++    )
++    try:
++        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
++        try:
++            os.write(fd, (line + "\n").encode())
++        finally:
++            os.close(fd)
++    except OSError as e:
++        logger.warning_once("Cannot write JIT build log %s: %s", log_path, str(e))
++
++
+ def refresh_current_compilation_context() -> CompilationContext:
+     """Refresh the cached compilation context in place.
+ 
+@@ -282,6 +315,8 @@ class JitSpec(abc.ABC):
+     """
+ 
+     name: str
++    # Label for build timing records (FLASHINFER_JIT_BUILD_LOG).
++    toolchain: ClassVar[str] = "unknown"
+ 
+     @property
+     @abc.abstractmethod
+@@ -354,9 +389,14 @@ def build_and_load(self) -> Any:
+                     spec=self,
+                 )
+ 
+-            self.build()
++            self._timed_build()
+             return self.load()
+ 
++    def _timed_build(self) -> None:
++        started = time.perf_counter()
++        self.build()
++        _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
++
+ 
+ class _HeterogeneousAOTModule:
+     """Dispatch calls across architecture-specific copies of one AOT module."""
+@@ -443,6 +483,7 @@ def _resolve_for_current_device(self) -> Any:
+ 
+ @dataclasses.dataclass
+ class JitSpecNvcc(JitSpec):
++    toolchain: ClassVar[str] = "nvcc"
+     name: str
+     sources: List[Path]
+     extra_cflags: Optional[List[str]]
+@@ -571,7 +612,7 @@ def try_load(self) -> Optional[Any]:
+ 
+     def _build_and_load_jit_fallback(self) -> Any:
+         with FileLock(self.lock_path, thread_local=False):
+-            self.build()
++            self._timed_build()
+             return self.load()
+ 
+     def build(self, verbose: Optional[bool] = None, need_lock: bool = False) -> None:
+@@ -843,6 +884,7 @@ def build_jit_specs(
+     if not lines:
+         return
+ 
++    num_modules = len(lines)
+     lines = ["ninja_required_version = 1.3"] + lines + [""]
+ 
+     tmpdir = get_tmpdir()
+@@ -850,6 +892,7 @@ def build_jit_specs(
+         ninja_path = tmpdir / "flashinfer_jit.ninja"
+         write_if_different(ninja_path, "\n".join(lines))
+         prebuild_max_jobs = os.environ.get("FLASHINFER_JIT_PREBUILD_MAX_JOBS")
++        started = time.perf_counter()
+         run_ninja(
+             jit_env.FLASHINFER_JIT_DIR,
+             ninja_path,
+@@ -860,3 +903,8 @@ def build_jit_specs(
+                 else None
+             ),
+         )
++        _record_jit_build(
++            JitSpecNvcc.toolchain,
++            f"prebuild[{num_modules} modules]",
++            time.perf_counter() - started,
++        )
+diff --git a/flashinfer/jit/cute_dsl_core.py b/flashinfer/jit/cute_dsl_core.py
+index 5043abba44c..cd36126225f 100644
+--- a/flashinfer/jit/cute_dsl_core.py
++++ b/flashinfer/jit/cute_dsl_core.py
+@@ -20,11 +20,12 @@
+ import os
+ import re
+ import shutil
++import time
+ from pathlib import Path
+ from typing import Any, Callable, Optional, Sequence
+ 
+ from . import env as jit_env
+-from .core import JitSpec, get_tmpdir, logger
++from .core import JitSpec, _record_jit_build, get_tmpdir, logger
+ 
+ _META_FILENAME = "meta.json"
+ 
+@@ -56,9 +57,108 @@ def _get_cute_dsl_version() -> str:
+     return ";".join(stack) if stack else "unknown"
+ 
+ 
++def cute_dsl_strict_cache_key() -> bool:
++    """Whether cache keys also cover the in-package import closure of key files."""
++    return os.environ.get("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "0") == "1"
++
++
++# The flashinfer package directory; only imports resolving inside it are followed.
++_PACKAGE_DIR = Path(__file__).resolve().parents[1]
++_TOP_LEVEL_INIT = _PACKAGE_DIR / "__init__.py"
++
++
++def _resolve_package_module(parts: Sequence[str]) -> Optional[Path]:
++    """File of the dotted flashinfer module ``parts`` (first part ``flashinfer``)."""
++    if not parts or parts[0] != _PACKAGE_DIR.name:
++        return None
++    base = _PACKAGE_DIR.joinpath(*parts[1:])
++    for candidate in (base.with_suffix(".py"), base / "__init__.py"):
++        if candidate.is_file():
++            return candidate
++    return None
++
++
++@functools.cache
++def _direct_package_imports(path: Path) -> tuple:
++    """Flashinfer source files ``path`` imports, including function-local imports.
++
++    Parent-package ``__init__`` files are not followed unless named by the
++    import itself: a kernel module depends on what it imports, not on
++    everything its package re-exports, and following them would pull in the
++    whole package and defeat cache reuse.
++    """
++    import ast
++
++    rel = path.relative_to(_PACKAGE_DIR.parent).with_suffix("")
++    package = list(rel.parts[:-1])  # same for ``__init__`` and plain modules
++    tree = ast.parse(path.read_bytes(), filename=str(path))
++    found = set()
++    for node in ast.walk(tree):
++        resolved_files = []
++        if isinstance(node, ast.Import):
++            resolved_files = [
++                _resolve_package_module(alias.name.split(".")) for alias in node.names
++            ]
++        elif isinstance(node, ast.ImportFrom):
++            if node.level:
++                if node.level - 1 > len(package):
++                    continue
++                base = package[: len(package) - (node.level - 1)]
++            else:
++                base = []
++            module = base + (node.module.split(".") if node.module else [])
++            for alias in node.names:
++                # ``from pkg import submodule`` depends on the submodule only;
++                # any other name is defined by ``pkg`` itself.
++                submodule = _resolve_package_module(module + [alias.name])
++                resolved_files.append(
++                    submodule
++                    if submodule is not None
++                    else _resolve_package_module(module)
++                )
++        for resolved in resolved_files:
++            # The top-level ``__init__`` re-exports the whole public API and
++            # defines no kernels; following it would key every kernel on
++            # every file in the package.
++            if resolved is not None and resolved not in (path, _TOP_LEVEL_INIT):
++                found.add(resolved)
++    return tuple(sorted(found))
++
++
++@functools.cache
++def _package_import_closure(path: Path) -> tuple:
++    """``path`` plus every flashinfer source file it transitively imports."""
++    seen = {path}
++    stack = [path]
++    while stack:
++        for dep in _direct_package_imports(stack.pop()):
++            if dep not in seen:
++                seen.add(dep)
++                stack.append(dep)
++    return tuple(sorted(seen))
++
++
++def _expand_key_files(paths: tuple) -> tuple:
++    """Key files plus, in strict mode, their in-package import closures.
++
++    Callers list the files whose content should invalidate their kernels,
++    typically just ``__file__``; helpers those files import are easy to
++    miss. Strict mode keeps a long-lived shared cache (CI) from serving a
++    kernel compiled before such a helper changed.
++    """
++    if not cute_dsl_strict_cache_key():
++        return paths
++    expanded = set(str(p) for p in paths)
++    for p in paths:
++        resolved = Path(p).resolve()
++        if resolved.suffix == ".py" and resolved.is_relative_to(_PACKAGE_DIR):
++            expanded.update(str(dep) for dep in _package_import_closure(resolved))
++    return tuple(expanded)
++
++
+ def _hash_source_files(paths: tuple) -> str:
+     sha = hashlib.sha256()
+-    for path in sorted(str(p) for p in paths):
++    for path in sorted(str(p) for p in _expand_key_files(paths)):
+         sha.update(path.encode())
+         with open(path, "rb") as f:
+             sha.update(f.read())
+@@ -96,6 +196,8 @@ class JitSpecCuteDsl(JitSpec):
+     and its module-level ``meta.json``.
+     """
+ 
++    toolchain = "cute_dsl"
++
+     def __init__(
+         self,
+         module_name: str,
+@@ -195,7 +297,9 @@ def compile_and_persist(self) -> None:
+         """
+         from filelock import FileLock
+ 
++        started = time.perf_counter()
+         self._compiled_kernel = self.compile_fn()
++        _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
+         with FileLock(self.lock_path, thread_local=False):
+             if (
+                 self.module_dir.exists()
+@@ -318,7 +422,7 @@ def build_and_load_cute_dsl_kernel(
+     # file from the hash: a weakened key could serve stale artifacts.
+     try:
+         source_sha256 = _hash_source_files(tuple(extra_key_files))
+-    except (OSError, TypeError) as e:
++    except (OSError, TypeError, SyntaxError) as e:  # SyntaxError: strict-key parse
+         logger.warning(
+             f"Cannot hash CuTe-DSL kernel sources for {module_name}/{kernel_name} "
+             f"({e}); bypassing the disk cache for this kernel."
+diff --git a/flashinfer/kda_kernels/tirx/cache.py b/flashinfer/kda_kernels/tirx/cache.py
+index 220361f6bd4..2a298aa3dd3 100644
+--- a/flashinfer/kda_kernels/tirx/cache.py
++++ b/flashinfer/kda_kernels/tirx/cache.py
+@@ -81,6 +81,8 @@ def _compiler_fingerprint():
+ 
+ 
+ class _KdaTirxSpec(JitSpec):
++    toolchain = "tirx"
++
+     def __init__(self, key, factory):
+         digest = hashlib.sha256(
+             repr((key, _compiler_fingerprint())).encode()
+diff --git a/scripts/summarize_jit_builds.py b/scripts/summarize_jit_builds.py
+new file mode 100644
+index 00000000000..02f2f7f1910
+--- /dev/null
++++ b/scripts/summarize_jit_builds.py
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++"""
++Summarize the JIT build timing log written via FLASHINFER_JIT_BUILD_LOG.
++
++Each line of the log is one JitSpec build (see ``_record_jit_build`` in
++flashinfer/jit/core.py). Builds shorter than ``--min-seconds`` are counted as
++up to date (an nvcc module whose ninja build had nothing to do, or a trivial
++compile) and left out of the totals.
++
++Usage:
++    python scripts/summarize_jit_builds.py junit/jit-builds.jsonl [--markdown]
++"""
++
++import argparse
++import json
++import sys
++from collections import defaultdict
++from pathlib import Path
++
++
++def load_records(path: Path) -> list:
++    records = []
++    with open(path) as f:
++        for line in f:
++            try:
++                records.append(json.loads(line))
++            except json.JSONDecodeError:
++                continue  # a process killed mid-write leaves a partial line
++    return records
++
++
++def summarize(records: list, min_seconds: float, top: int, markdown: bool) -> str:
++    totals: dict = defaultdict(lambda: [0, 0, 0.0])  # builds, up to date, seconds
++    for record in records:
++        entry = totals[record.get("toolchain", "unknown")]
++        if record["seconds"] < min_seconds:
++            entry[1] += 1
++        else:
++            entry[0] += 1
++            entry[2] += record["seconds"]
++    slowest = sorted(records, key=lambda r: r["seconds"], reverse=True)[:top]
++
++    if markdown:
++        lines = [
++            "### JIT builds by toolchain",
++            "",
++            f"Builds of at least {min_seconds:g} s; summed over processes, "
++            "so parallel builds add up past wall time.",
++            "",
++            "| Toolchain | Builds | Total | Up to date |",
++            "|---|---:|---:|---:|",
++        ]
++        for name, (builds, fresh, seconds) in sorted(
++            totals.items(), key=lambda item: -item[1][2]
++        ):
++            lines.append(f"| {name} | {builds} | {seconds / 60:.1f} min | {fresh} |")
++        lines += ["", f"Slowest {len(slowest)}:", "", "| Seconds | Toolchain | Name |"]
++        lines.append("|---:|---|---|")
++        for r in slowest:
++            lines.append(f"| {r['seconds']:.1f} | {r['toolchain']} | `{r['name']}` |")
++        return "\n".join(lines) + "\n"
++
++    lines = [f"JIT BUILD SUMMARY (builds >= {min_seconds:g} s, summed over processes)"]
++    for name, (builds, fresh, seconds) in sorted(
++        totals.items(), key=lambda item: -item[1][2]
++    ):
++        lines.append(
++            f"  toolchain={name} builds={builds} total_seconds={seconds:.1f} "
++            f"up_to_date={fresh}"
++        )
++    lines.append(f"SLOWEST {len(slowest)} JIT BUILDS")
++    for r in slowest:
++        lines.append(f"  {r['seconds']:8.1f}s {r['toolchain']:<10} {r['name']}")
++    return "\n".join(lines) + "\n"
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
++    parser.add_argument("log", type=Path)
++    parser.add_argument("--min-seconds", type=float, default=1.0)
++    parser.add_argument("--top", type=int, default=15)
++    parser.add_argument("--markdown", action="store_true")
++    args = parser.parse_args()
++
++    if not args.log.is_file():
++        print(f"No JIT build log at {args.log}; nothing was built or logging was off.")
++        return 0
++    records = load_records(args.log)
++    if not records:
++        print(f"JIT build log {args.log} has no records.")
++        return 0
++    sys.stdout.write(summarize(records, args.min_seconds, args.top, args.markdown))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/jit/test_jit_cache_key_and_build_log.py b/tests/jit/test_jit_cache_key_and_build_log.py
+new file mode 100644
+index 00000000000..cff6d629627
+--- /dev/null
++++ b/tests/jit/test_jit_cache_key_and_build_log.py
+@@ -0,0 +1,228 @@
++"""
++Copyright (c) 2026 by FlashInfer team.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++  http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++
++CPU-only tests for the strict CuTe-DSL cache key
++(FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY) and the JIT build timing log
++(FLASHINFER_JIT_BUILD_LOG) that CI's persistent compile cache relies on.
++"""
++
++import importlib.util
++import json
++from pathlib import Path
++
++import pytest
++
++from flashinfer.jit import core as jit_core
++from flashinfer.jit import cute_dsl_core
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++
++
++@pytest.fixture
++def fake_package(tmp_path, monkeypatch):
++    """A tiny ``flashinfer`` package tree the import walker is pointed at."""
++    pkg = tmp_path / "flashinfer"
++    files = {
++        "__init__.py": "from . import everything\n",
++        "everything.py": "X = 1\n",
++        "helpers/__init__.py": "from .reexported import THING\n",
++        "helpers/reexported.py": "THING = 1\n",
++        "helpers/math.py": "SCALE = 2\n",
++        "helpers/deep.py": "from flashinfer.helpers import math\n",
++        "kernels/__init__.py": "",
++        "kernels/kernel.py": (
++            "import os\n"
++            "from .. import version\n"
++            "from ..helpers import deep\n"
++            "from ..helpers import THING\n"
++            "def compile():\n"
++            "    from flashinfer.kernels import local_only\n"
++        ),
++        "kernels/local_only.py": "Y = 3\n",
++        "version.py": "from . import _build_meta\n",
++        "unrelated.py": "Z = 4\n",
++    }
++    for rel, text in files.items():
++        path = pkg / rel
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text(text)
++    monkeypatch.setattr(cute_dsl_core, "_PACKAGE_DIR", pkg.resolve())
++    monkeypatch.setattr(cute_dsl_core, "_TOP_LEVEL_INIT", pkg.resolve() / "__init__.py")
++    cute_dsl_core._direct_package_imports.cache_clear()
++    cute_dsl_core._package_import_closure.cache_clear()
++    yield pkg.resolve()
++    cute_dsl_core._direct_package_imports.cache_clear()
++    cute_dsl_core._package_import_closure.cache_clear()
++
++
++def test_import_closure_follows_helpers_but_not_top_level_init(fake_package):
++    closure = cute_dsl_core._package_import_closure(
++        fake_package / "kernels" / "kernel.py"
++    )
++    names = {str(p.relative_to(fake_package)) for p in closure}
++    assert names == {
++        "kernels/kernel.py",
++        "version.py",  # its missing ``_build_meta`` must not drag in __init__
++        "helpers/deep.py",
++        "helpers/math.py",  # transitively, via an absolute import
++        "helpers/__init__.py",  # THING is defined by the package itself
++        "helpers/reexported.py",
++        "kernels/local_only.py",  # function-local import
++    }
++
++
++def test_strict_key_tracks_imported_helpers(fake_package, monkeypatch):
++    kernel = str(fake_package / "kernels" / "kernel.py")
++    helper = fake_package / "helpers" / "math.py"
++
++    monkeypatch.delenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", raising=False)
++    loose_before = cute_dsl_core._hash_source_files((kernel,))
++    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
++    strict_before = cute_dsl_core._hash_source_files((kernel,))
++
++    helper.write_text("SCALE = 3\n")
++    cute_dsl_core._direct_package_imports.cache_clear()
++    cute_dsl_core._package_import_closure.cache_clear()
++
++    assert cute_dsl_core._hash_source_files((kernel,)) != strict_before
++    monkeypatch.delenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY")
++    assert cute_dsl_core._hash_source_files((kernel,)) == loose_before
++
++    # Files outside the closure never affect the key.
++    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
++    strict_after = cute_dsl_core._hash_source_files((kernel,))
++    (fake_package / "unrelated.py").write_text("Z = 5\n")
++    assert cute_dsl_core._hash_source_files((kernel,)) == strict_after
++
++
++def test_strict_key_leaves_files_outside_the_package_alone(
++    fake_package, tmp_path, monkeypatch
++):
++    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
++    outside = tmp_path / "standalone.py"
++    outside.write_text("from flashinfer.helpers import math\n")
++    assert cute_dsl_core._expand_key_files((str(outside),)) == (str(outside),)
++
++
++def test_strict_key_parse_failure_bypasses_disk_cache(fake_package, monkeypatch):
++    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
++    (fake_package / "helpers" / "math.py").write_text("def broken(:\n")
++    result = cute_dsl_core.build_and_load_cute_dsl_kernel(
++        "fake_module",
++        "fake_kernel",
++        lambda: "compiled in process",
++        extra_key_files=(str(fake_package / "kernels" / "kernel.py"),),
++    )
++    assert result == "compiled in process"
++
++
++def test_strict_closure_of_real_kernel_stays_small(monkeypatch):
++    """Guards against the closure ballooning to the whole package again."""
++    monkeypatch.setenv("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "1")
++    kernel = Path(cute_dsl_core.__file__).resolve().parents[1] / "gdn_kernels"
++    closure = cute_dsl_core._package_import_closure(kernel / "gdn_decode_mtp.py")
++    assert any(
++        p.parent.name == "gdn_kernels" and p.name != "gdn_decode_mtp.py"
++        for p in closure
++    )  # picks up at least one sibling helper
++    assert len(closure) < 100
++
++
++class _FakeSpec(jit_core.JitSpec):
++    toolchain = "fake"
++
++    def __init__(self, tmp_path):
++        self.name = "fake_module"
++        self._tmp_path = tmp_path
++        self.built = False
++
++    @property
++    def lock_path(self):
++        return self._tmp_path / "fake.lock"
++
++    @property
++    def is_compiled(self):
++        return self.built
++
++    def get_library_path(self):
++        return self._tmp_path / "fake.so"
++
++    def try_load(self):
++        return "cached" if self.built else None
++
++    def build(self):
++        self.built = True
++
++    def load(self):
++        return "built"
++
++
++def test_build_and_load_records_build_time(tmp_path, monkeypatch):
++    log = tmp_path / "builds.jsonl"
++    monkeypatch.setenv("FLASHINFER_JIT_BUILD_LOG", str(log))
++    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
++    spec = _FakeSpec(tmp_path)
++    assert spec.build_and_load() == "built"
++    assert spec.build_and_load() == "cached"  # a cache hit is not a build
++
++    records = [json.loads(line) for line in log.read_text().splitlines()]
++    assert len(records) == 1
++    assert records[0]["toolchain"] == "fake"
++    assert records[0]["name"] == "fake_module"
++    assert records[0]["seconds"] >= 0
++
++
++def test_build_log_is_off_by_default(tmp_path, monkeypatch):
++    monkeypatch.delenv("FLASHINFER_JIT_BUILD_LOG", raising=False)
++    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
++    monkeypatch.chdir(tmp_path)
++    _FakeSpec(tmp_path).build_and_load()
++    assert not list(tmp_path.glob("*.jsonl"))
++
++
++def test_toolchain_labels():
++    assert jit_core.JitSpecNvcc.toolchain == "nvcc"
++    assert cute_dsl_core.JitSpecCuteDsl.toolchain == "cute_dsl"
++
++
++def _load_summarizer():
++    spec = importlib.util.spec_from_file_location(
++        "summarize_jit_builds", REPO_ROOT / "scripts" / "summarize_jit_builds.py"
++    )
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_summary_totals_by_toolchain(tmp_path):
++    log = tmp_path / "builds.jsonl"
++    rows = [
++        {"toolchain": "nvcc", "name": "a", "seconds": 0.05},
++        {"toolchain": "nvcc", "name": "b", "seconds": 120.0},
++        {"toolchain": "cute_dsl", "name": "c", "seconds": 30.0},
++        {"toolchain": "cute_dsl", "name": "d", "seconds": 30.0},
++    ]
++    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n{truncated")
++    summarizer = _load_summarizer()
++    records = summarizer.load_records(log)
++    assert len(records) == 4  # the partial trailing line is skipped
++
++    text = summarizer.summarize(records, 1.0, 2, markdown=False)
++    assert "toolchain=nvcc builds=1 total_seconds=120.0 up_to_date=1" in text
++    assert "toolchain=cute_dsl builds=2 total_seconds=60.0 up_to_date=0" in text
++    assert text.index("toolchain=nvcc") < text.index("toolchain=cute_dsl")
++
++    table = summarizer.summarize(records, 1.0, 2, markdown=True)
++    assert "| cute_dsl | 2 | 1.0 min | 0 |" in table
