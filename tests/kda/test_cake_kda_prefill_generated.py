@@ -255,11 +255,29 @@ def test_generated_record_is_lean_and_names_its_units(name):
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run," in binding
 
 
+# The affine fold and map-fold mains read the caller's window indices: their
+# plans add these arguments after the main body's, and the affine composite
+# (``FlashKDABlackwellAffineSplitLaunch``) binds them itself.
+GATHERED_INDEX_ARGS = [
+    ["buffer", "window_table"],
+    ["parameter", "state_indices_i64"],
+    ["buffer", "gathered_row_starts"],
+    ["buffer", "gathered_final_offsets"],
+    ["parameter", "final_slot_stride"],
+]
+
+
 @requires_programs
 def test_generated_plans_bind_from_the_shipped_plans():
     """The launch classes bind by the shipped plan's names: a generated plan
-    must name a subset of them, tensors as tensors and scalars as scalars."""
+    must name a subset of them, tensors as tensors and scalars as scalars,
+    except the window-index arguments the affine composite binds itself."""
+    composite_bound = {name for _kind, name in GATHERED_INDEX_ARGS}
     for arch in registry.ARCHES:
+        folds = {
+            *registry._RENDERED_FOLD_ROUTES[arch].values(),
+            *registry._RENDERED_MAP_FOLD_ROUTES[arch].values(),
+        }
         routes = [
             *registry._RENDERED_ROUTES[arch].items(),
             *registry._RENDERED_MERGE_ROUTES[arch].items(),
@@ -279,6 +297,8 @@ def test_generated_plans_bind_from_the_shipped_plans():
             }
             for kind, name in registry._RENDERED_MODULES[program]["arg_plan"]:
                 if kind in ("grid", "workspace"):
+                    continue
+                if program in folds and name in composite_bound:
                     continue
                 where = (arch, module, program, name)
                 assert name in shipped, where
@@ -647,6 +667,13 @@ def test_merging_correction_builds_reduce_into_the_composite():
             )
 
 
+def _with_gathered_indices(plan):
+    """``plan`` with the window-index arguments before its workspace entries."""
+    body = [entry for entry in plan if entry[0] not in ("workspace", "grid")]
+    rest = [entry for entry in plan if entry[0] in ("workspace", "grid")]
+    return [*body, *GATHERED_INDEX_ARGS, *rest]
+
+
 FOLD_MODULES = ("cake_kda_bf16_15be1db8a50ee4d9fd16",)
 FOLD_BARRIER = re.compile(r"\bfold_p_ready_addr\b")
 
@@ -656,7 +683,8 @@ def test_pair_map_fold_builds_take_the_main_bodys_plan():
     """The affine apply route's main module has a pair-map fold build
     (``_RENDERED_FOLD_ROUTES``): a generated program of its own, never the
     module's routed program, with the routed program's argument plan (the
-    composite binds the pair maps to the plan's ``tape_e`` / ``norm_inv_out``)."""
+    composite binds the pair maps to the plan's ``tape_e`` / ``norm_inv_out``)
+    and the window-index arguments after it."""
     assert set(registry._RENDERED_FOLD_ROUTES) == set(registry.ARCHES)
     for arch, folding in registry._RENDERED_FOLD_ROUTES.items():
         assert sorted(folding) == list(FOLD_MODULES), arch
@@ -665,7 +693,9 @@ def test_pair_map_fold_builds_take_the_main_bodys_plan():
             assert name in GENERATED and name != routed, (arch, module)
             record = registry._RENDERED_MODULES[name]
             assert arch in record["arches"]
-            assert record["arg_plan"] == registry._RENDERED_MODULES[routed]["arg_plan"]
+            assert record["arg_plan"] == _with_gathered_indices(
+                registry._RENDERED_MODULES[routed]["arg_plan"]
+            )
             plan = {slot for _, slot in record["arg_plan"]}
             assert {"tape_e", "norm_inv_out"} <= plan, name
             text = (ROOT / record["sources"][0]).read_text()
@@ -686,7 +716,8 @@ def test_chain_map_fold_builds_take_the_main_bodys_plan():
     """The chain route's main modules have map-fold builds
     (``_RENDERED_MAP_FOLD_ROUTES``): generated programs of their own, never the
     module's routed program, with the routed program's argument plan (the
-    composite binds the map states to the plan's ``tape_e``)."""
+    composite binds the map states to the plan's ``tape_e``) and the
+    window-index arguments after it."""
     assert set(registry._RENDERED_MAP_FOLD_ROUTES) == set(registry.ARCHES)
     for arch, folding in registry._RENDERED_MAP_FOLD_ROUTES.items():
         assert sorted(folding) == list(MAP_FOLD_MODULES), arch
@@ -695,7 +726,9 @@ def test_chain_map_fold_builds_take_the_main_bodys_plan():
             assert name in GENERATED and name != routed, (arch, module)
             record = registry._RENDERED_MODULES[name]
             assert arch in record["arches"]
-            assert record["arg_plan"] == registry._RENDERED_MODULES[routed]["arg_plan"]
+            assert record["arg_plan"] == _with_gathered_indices(
+                registry._RENDERED_MODULES[routed]["arg_plan"]
+            )
             assert "tape_e" in {slot for _, slot in record["arg_plan"]}, name
             text = (ROOT / record["sources"][0]).read_text()
             assert MAP_FOLD_BARRIER.search(text), name
