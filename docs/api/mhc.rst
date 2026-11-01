@@ -61,8 +61,9 @@ carveout such a side CTA leaves room for at most 1 KB of dynamic shared memory
 next to it on its SM, so every launch that needs more waits until the side
 kernel's first CTA exits; raise the side kernel's carveout preference to avoid
 this. Under a side kernel that holds every SM, ``backward_finish`` still waits
-at some token counts up to 4096 on SM100 at hidden 4096, at every token count
-up to 4096 on SM100 at hidden 5120 and 7168, at token counts up to 1535
+at some token counts up to 4096 on SM100 at hidden 4096, at token counts
+1-896, 1921-2112, 2689-2816 and 3585-3648 on SM100 at hidden 5120, at token
+counts 1-640 and 961-1024 on SM100 at hidden 7168, at token counts up to 1535
 (hidden 5120) and 1151 (hidden 7168) on SM103, and on SM107, which keeps the
 static schedule.
 
