@@ -620,4 +620,3 @@ kernel_cake_selective_state_update_c532ecdb572d59cf6a45(const __grid_constant__ 
 }
 
 } // extern "C"
-
