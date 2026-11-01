@@ -393,6 +393,16 @@ LOCAL_PATH_FWD = cake_kcp_plan.LOCAL_PATH_FWD
 LOCAL_PATH_BWD = cake_kcp_plan.LOCAL_PATH_BWD
 LOCAL_LAYOUT_FWD = "fwd"
 LOCAL_LAYOUT_BWD = "replay"
+# The lean backward layout of a local arena sized for it (``WorkspaceDetKcp(local_arena="lean")``, opt-in): this
+# route's mode of the existing backend's arenas (registered here); the arena's ``layout_passes`` holds its tail passes
+# (absent on an arena or plan view that runs the replay layout)
+LOCAL_LAYOUT_BWD_LEAN = cake_kcp_plan.LOCAL_LAYOUT_BWD_LEAN
+cake_kcp_plan.register_lean_layout()
+# the stages of the backward's tail, once per tail range on the lean layout; the whole-sequence buffers they read by
+# chunk-relative rows (leading-axis views offset by the range's first chunk; the h / dh tapes likewise)
+TAIL_STAGES = ("dqkg", "glm_intra", "gate_epilogue")
+TAIL_ROW_BUFFERS = ("gk", "v_new", "dv2", "beta_int", "do_int", "akk_int")
+TAIL_COUNTS_ATTR = "_kcp_tail_counts"  # a lean arena's int32 table 0..L-1 (cake_kcp_plan.local_tail_count_words)
 # a forward-only local arena's layout (:func:`cake_kcp_plan.local_fwd_layout`): the forward runs on the layout its
 # arena was sized for (``KdaWorkspace.fwd_layout``), on a backward arena :data:`LOCAL_LAYOUT_FWD`
 LOCAL_LAYOUT_FWD_ONLY = cake_kcp_plan.LOCAL_LAYOUT_FWD_ONLY
@@ -645,6 +655,8 @@ class KernelBackend(Backend):
     (the output from the K1 ``h`` / ``v_new`` tapes) on the arena's forward layout (``fwd``; a forward-only arena's
     ``fwd_kcp``, :data:`LOCAL_LAYOUT_FWD_ONLY`), with the records the plan selects
     on the forward path without a saved set (:data:`LOCAL_PATH_FWD`).  A backward call runs on the ``replay`` layout
+    (on a lean arena the lean layout :data:`LOCAL_LAYOUT_BWD_LEAN`: ``kcp_dav``'s ``dA_qk`` to its sink, the tail
+    stages once per chunk range, :func:`_tail_pass_values`)
     with the records of the replay path (:data:`LOCAL_PATH_BWD`) in both modes: the replay prep (the GLM prep's rows
     and the internal ``dout`` copy ``do_int``), the intra program (``write_prep = 0``: the internal ``Aqk`` / ``Akk``
     rows), the replay's WY program, then after the K1 tape replay the KCP's ``kcp_dav`` (``dA_qk`` and the intra-chunk
@@ -731,7 +743,8 @@ class KernelBackend(Backend):
             raise ValueError(
                 f"local plan geometry (NC_pad, R) = {(p.NC_pad, p.R)} differs from the KCP context's {(ctx.NC_pad, ctx.R)}"
             )
-        views = ws.views(LOCAL_LAYOUT_BWD if call.backward else ws.fwd_layout)
+        views = ws.views(_bwd_layout(ws) if call.backward else ws.fwd_layout)
+        tail = _lean_tail(ws) if call.backward else None
         if call.host_trim:  # the call-independent part of the value dict is built once per (arena, tables, direction)
             # the template is cached on the ARENA whose views it holds (it dies with the arena), keyed by the
             # table set's identity with a WEAK reference to it (a hit needs that very table set alive); the backend
@@ -747,7 +760,7 @@ class KernelBackend(Backend):
                     del cache[stale]
                 hit = (
                     weakref.ref(call.tb),
-                    self._local_template(views, ctx, p, call.backward),
+                    self._local_template(views, ctx, p, call.backward, tail),
                 )
                 cache[key] = hit
             values: dict[str, Any] = dict(hit[1])
@@ -756,17 +769,25 @@ class KernelBackend(Backend):
             call.local_values = values
             call.scratch["views"] = views
             return
-        values = self._local_template(views, ctx, p, call.backward)
+        values = self._local_template(views, ctx, p, call.backward, tail)
         values.update(call.ops)
         values["scale"] = call.scale
         call.local_values = values
         call.scratch["views"] = views
 
     @staticmethod
-    def _local_template(views: Any, ctx: Any, p: Any, backward: bool) -> dict[str, Any]:
+    def _local_template(
+        views: Any,
+        ctx: Any,
+        p: Any,
+        backward: bool,
+        tail: tuple[int, torch.Tensor] | None = None,
+    ) -> dict[str, Any]:
         """The values of ``begin_call`` that do not depend on the call: the arena views of the layout, the context's
         four chunk tables (the existing backend's vocabulary; the KCP's segment table is a K1-K4 argument, not a
-        local one), the plan scalars of the existing backend's logical vocabulary and the ``h2d`` / ``dh2d`` views.
+        local one), the plan scalars of the existing backend's logical vocabulary and the ``h2d`` / ``dh2d`` views;
+        on the lean layout (``tail`` = its passes and the arena's tail-count table) the per-range values of the
+        tail stages (:func:`_tail_pass_values`) under ``"_kcp_tail"``.
         The operands and ``scale`` are added per call (the trimmed host path caches this part per (arena, table set,
         direction))."""
         values: dict[str, Any] = dict(vars(views))
@@ -786,6 +807,8 @@ class KernelBackend(Backend):
         values["h2d"] = views.h.view(-1, D)
         if backward:
             values["dh2d"] = views.dh.view(-1, D)
+            if tail is not None:
+                values["_kcp_tail"] = _tail_pass_values(views, ctx, p, *tail)
         return values
 
     def stage(self, name: str, call: CallDetKcp, **extra: Any) -> None:
@@ -800,6 +823,19 @@ class KernelBackend(Backend):
             values["out"] = call.out
         if call.grads is not None:
             values.update(call.grads)
+        tail_pass = extra.pop("tail_pass", None)
+        # one tail range of the lean layout: its values and grids
+        if tail_pass is not None:
+            overrides, grids = values["_kcp_tail"][tail_pass]
+            # nothing where the plan fuses the stage away (the gate epilogue)
+            if name in grids:
+                self._launch(
+                    call,
+                    p.record(name, path),
+                    grids[name],
+                    {**values, **overrides, **extra},
+                )
+            return
         if name == "bwd_prep":
             # both backward modes run the replay prep (the GLM prep's rows, the internal dout copy K2 and dav read);
             # the saved set carries no token rows: the intra program recomputes the internal rows in both modes
@@ -824,6 +860,9 @@ class KernelBackend(Backend):
                     cu_seqlens=call.ctx.cu_seqlens_local, **_scratch_tables(local)
                 )
         elif name in KCP_LOCAL_RECORDS:
+            if name == "dav" and hasattr(views, "dAqk_sink"):
+                # the lean layout: the fused gradient stores every dAqk row the tail reads, kcp_dav's go to the sink
+                extra["dAqk"] = views.dAqk_sink
             self.programs().run_record(
                 KCP_LOCAL_RECORDS[name],
                 {**values, **extra},
@@ -864,7 +903,7 @@ class KernelBackend(Backend):
         self._spec3_pending = False
         local = call.local
         p = local.plan
-        a = local.views(LOCAL_LAYOUT_FWD)
+        a = local.views(getattr(local, "fwd_layout", LOCAL_LAYOUT_FWD))
         vals = {**call.local_values, **vars(a)}
         vals.update(
             h2d=a.h.view(-1, D),
@@ -1686,6 +1725,70 @@ def _local_record(p: Any, stage: str, path: str) -> tuple[str, tuple[int, int, i
         )
         return record, grid
     return p.record(stage, path), p.grid(stage, path)
+
+
+def _bwd_layout(local: Any) -> str:
+    """The backward layout of a local arena or plan view: the lean one where it is sized for it
+    (:func:`_lean_passes`), else :data:`LOCAL_LAYOUT_BWD`."""
+    return LOCAL_LAYOUT_BWD_LEAN if _lean_passes(local) else LOCAL_LAYOUT_BWD
+
+
+def _lean_passes(local: Any) -> int | None:
+    """The tail passes of the lean layout on a local arena or plan view (its ``layout_passes`` entry), ``None`` where
+    it runs the replay layout."""
+    return getattr(local, "layout_passes", {}).get(LOCAL_LAYOUT_BWD_LEAN)
+
+
+def _lean_tail(local: Any) -> tuple[int, torch.Tensor] | None:
+    """``(tail passes, tail-count table)`` of a local arena or plan view on the lean layout, else ``None``."""
+    passes = _lean_passes(local)
+    if not passes:
+        return None
+    return int(passes), local.__dict__[TAIL_COUNTS_ATTR]
+
+
+def _tail_pass_values(
+    views: Any, ctx: Any, p: Any, passes: int, counts: torch.Tensor
+) -> tuple[tuple[dict[str, Any], dict[str, tuple[int, int, int]]], ...]:
+    """Per tail range of the lean layout (``cake_backend._tail_ranges(NC_pad, passes)``): the value overrides of the
+    tail stages and their grids.  The whole-sequence rows they read (:data:`TAIL_ROW_BUFFERS`, the ``h`` / ``dh``
+    tapes) as leading-axis views offset by the range's first chunk, the context's chunk tables as the range's slices,
+    ``seq_chunk_start`` as the one-entry slice of ``counts`` holding the range's real chunk count (``num_seqs = 0``
+    makes the fused gradient read it as its item bound; the context's ``NC`` on the host, so no call forms it), the
+    per-pass buffers as the layout sizes them (one range) and the token tensors whole (every kernel reaches them
+    through the absolute ``chunk_bos``); the grids are the plan's rules at the range's chunk count.  The same
+    kernels address the same bytes as in one pass over the replay layout."""
+    nc = int(ctx.NC)
+    out = []
+    for c0, length in cake_backend._tail_ranges(p.NC_pad, passes):
+        rows = cake_backend.BT * c0
+        real = min(max(nc - c0, 0), length)
+        overrides: dict[str, Any] = {
+            name: getattr(views, name)[rows:] for name in TAIL_ROW_BUFFERS
+        }
+        overrides.update(
+            h2d=views.h[c0:].view(-1, D),
+            dh2d=views.dh[c0:].view(-1, D),
+            chunk_bos=ctx.tables["chunk_bos"][c0 : c0 + length],
+            chunk_len=ctx.tables["chunk_len"][c0 : c0 + length],
+            seq_chunk_start=counts[real : real + 1],
+            num_seqs=0,
+            num_chunks_pad=length,
+        )
+        grids = {
+            stage: cake_jit.launch_grid(
+                p.record(stage, LOCAL_PATH_BWD),
+                num_chunks_pad=length,
+                num_seqs=p.N,
+                num_heads=p.H,
+                sm_count=p.sm_count,
+                num_segments=p.NSEG,
+            )
+            for stage in TAIL_STAGES
+            if p.dispatched(stage, LOCAL_PATH_BWD)
+        }
+        out.append((overrides, grids))
+    return tuple(out)
 
 
 def kcp_local_grid(stage: str, p: Any) -> tuple[int, int, int]:
@@ -3117,7 +3220,13 @@ class WorkspaceDetKcp:
     tensors in place of the other two, which it reads without it; a forward without one reads all three; their first
     allocation drops the graph-cache entries pinning the workspace, whose keys hold its pools).  A forward-only
     local arena takes the KCP forward layout (:data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal token-head); a
-    backward workspace sizes every pool and the existing backend's layouts.  The saved-set tensors (``S_in`` = the c2
+    backward workspace sizes every pool and the existing backend's layouts (``local_arena="replay"``, the default,
+    :data:`cake_kcp_plan.LOCAL_ARENAS`) or, under ``local_arena="lean"`` (opt-in), the KCP forward layout and the
+    lean backward layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, 3460 B per internal token-head; the tail stages per chunk
+    range) with its tail-count table (:data:`TAIL_COUNTS_ATTR`), the existing backend's layouts on the rows the lean
+    layout does not serve (H 9-15).  ``lean_passes`` sizes a lean arena for that many tail passes (``None``:
+    :data:`cake_kcp_plan.LEAN_PASSES_DEFAULT`, two; fewer passes launch fewer tail kernels for more bytes;
+    :func:`cake_kcp_plan.kda_det_workspace_bytes_kcp` takes the same arguments).  The saved-set tensors (``S_in`` = the c2
     output, the c1 receive tensor under ``save_transfer``, ``M_seg`` under ``save_transfer`` at ``P > 1``) are never
     arena slices: the calls allocate them fresh (SPEC-4).  A workspace is
     reusable across calls and layers of the same ``(ctx, H)``; a call with a larger need grows it, releasing each
@@ -3154,10 +3263,22 @@ class WorkspaceDetKcp:
         local: bool = True,
         save_mode: str = "light",
         allocate: bool = True,
+        local_arena: str | None = None,
+        lean_passes: int | None = None,
     ) -> None:
         if save_mode not in SAVE_MODES:
             raise ValueError(
                 f"WorkspaceDetKcp: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
+            )
+        # the backward arena form (cake_kcp_plan.LOCAL_ARENAS): "replay" (the default) or the opt-in "lean"
+        self.local_arena = cake_kcp_plan.check_local_arena(local_arena)
+        # the tail passes a lean arena is sized for (None: cake_kcp_plan.LEAN_PASSES_DEFAULT); fewer passes launch
+        # fewer tail kernels for more bytes
+        self.lean_passes = cake_kcp_plan.check_lean_passes(lean_passes)
+        if self.lean_passes is not None and self.local_arena != "lean":
+            raise ValueError(
+                'WorkspaceDetKcp: lean_passes needs local_arena="lean", got '
+                f"{self.local_arena!r}"
             )
         self.state_dtype = state_dtype
         self.with_local = bool(local)
@@ -3317,10 +3438,12 @@ class WorkspaceDetKcp:
             }
             # the largest layout first: every other pack then runs on a view of its arena
             local.sort(
-                key=lambda c: -plans[id(c)].arena_bytes(
+                key=lambda c: -cake_kcp_plan.local_arena_bytes(
+                    plans[id(c)],
                     backward=backward,
                     save_mode=self.save_mode,
-                    fwd_layout=cake_kcp_plan.local_fwd_layout(backward, self.save_mode),
+                    local_arena=self.local_arena,
+                    lean_passes=self.lean_passes,
                 )
             )
             for ctx in local:
@@ -3413,6 +3536,7 @@ class WorkspaceDetKcp:
         if local is not None:
             add(local.arena)
             add(local._eye_box[0])
+            add(local.__dict__.get(TAIL_COUNTS_ATTR))
             for arena in (local, *self._views.values()):
                 for t in (arena.__dict__.get(SCRATCH_TABLES_ATTR) or {}).values():
                     add(t)
@@ -3447,15 +3571,24 @@ class WorkspaceDetKcp:
             view = self._views.pop(key, None)
             if view is None:
                 plan = self._local_plan(key, device)
+                passes = self._lean_view_passes(plan, base)
                 if (
-                    plan.arena_bytes(
+                    passes is not None
+                    or plan.arena_bytes(
                         backward=base.backward,
                         save_mode=self.save_mode,
-                        fwd_layout=base.fwd_layout,
+                        fwd_layout=cake_kcp_plan.local_fwd_layout(
+                            base.backward, self.save_mode
+                        ),
                     )
                     <= base.bytes
                 ):
                     view = _plan_view(base, plan)
+                    # the lean layout at the fewest passes that fit the arena, else the replay layout (a dict of
+                    # its own: the view's attributes start as the base arena's)
+                    view.layout_passes = (
+                        {} if passes is None else {LOCAL_LAYOUT_BWD_LEAN: passes}
+                    )
                     self._views_scratch += cake_kcp_plan.local_scratch_table_bytes(plan)
                     while len(self._views) >= VIEW_CACHE_MAX:
                         self._fast.clear()
@@ -3477,14 +3610,58 @@ class WorkspaceDetKcp:
             self._views.clear()
             self._views_scratch = 0
             self.local_view = self.local = base = None
-        self.local = cake_backend.KdaWorkspace.for_problem(
-            *key,
+        passes = None
+        if kind and self.local_arena == "lean" and self.save_mode == "light":
+            passes = cake_kcp_plan.local_lean_passes(
+                self._local_plan(key, device), passes=self.lean_passes
+            )
+        if passes is None:
+            self.local = cake_backend.KdaDetWorkspace.for_problem(
+                *key,
+                device,
+                backward=kind,
+                save_mode=self.save_mode,
+                fwd_layout=cake_kcp_plan.local_fwd_layout(kind, self.save_mode),
+            )
+            return self.local
+        # the lean arena: exactly the KCP forward layout and the lean backward layout, plus its tail-count table
+        # (allocated with the arena, never by a call)
+        self.local = cake_backend.KdaDetWorkspace(
+            self._local_plan(key, device),
             device,
-            backward=kind,
+            backward=True,
             save_mode=self.save_mode,
-            fwd_layout=cake_kcp_plan.local_fwd_layout(kind, self.save_mode),
+            fwd_layout=cake_kcp_plan.LOCAL_LAYOUT_FWD_ONLY,
+            layouts=(
+                (cake_kcp_plan.LOCAL_LAYOUT_FWD_ONLY, 1),
+                (LOCAL_LAYOUT_BWD_LEAN, passes),
+            ),
+        )
+        words = cake_kcp_plan.local_tail_count_words(self.local.bytes, H)
+        setattr(
+            self.local,
+            TAIL_COUNTS_ATTR,
+            torch.arange(words, dtype=torch.int32, device=self.local.device),
         )
         return self.local
+
+    def _lean_view_passes(self, plan: Any, base: Any) -> int | None:
+        """The tail passes of a plan view of the lean arena ``base`` on the lean layout: the fewest whose arena fits
+        ``base`` (:func:`cake_kcp_plan.local_lean_passes`) with every range's chunk count inside its tail-count
+        table; ``None`` (the replay layout, if it fits) on a replay arena, under ``local_arena="replay"`` or where
+        the lean layout does not serve the plan."""
+        counts = base.__dict__.get(TAIL_COUNTS_ATTR)
+        if (
+            counts is None
+            or not _lean_passes(base)
+            or self.local_arena != "lean"
+            or self.save_mode != "light"
+        ):
+            return None
+        passes = cake_kcp_plan.local_lean_passes(plan, budget=base.bytes)
+        if passes is None or -(-int(plan.NC_pad) // passes) >= counts.numel():
+            return None
+        return passes
 
     def _grow(self, name: str, n: int, device: torch.device) -> bool:
         """Make pool ``name`` hold ``n`` elements; a :data:`cake_kcp_plan.SHARED_POOLS` pair stays one tensor.
@@ -3582,10 +3759,12 @@ class WorkspaceDetKcp:
         local = 0
         if self.local is not None:
             # the arena and the intra record's scratch table set where it writes one, its own and each plan view's
+            counts = self.local.__dict__.get(TAIL_COUNTS_ATTR)
             local = (
                 int(self.local.bytes)
                 + cake_kcp_plan.local_scratch_table_bytes(self.local.plan)
                 + self._views_scratch
+                + (0 if counts is None else counts.numel() * counts.element_size())
             )
         return kcp + local
 
@@ -4927,9 +5106,14 @@ def _backward(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
                 "dcarry_cross"
             )  # with fused_walks also the dS_out copies into the extra carry slots
     _adj_tapes(call, dcarry=dcarry, wait_first=wait_first)
-    call.stage("dqkg")
-    call.stage("glm_intra")
-    call.stage("gate_epilogue")
+    tail = (call.local_values or {}).get("_kcp_tail") if call.T_r else None
+    if not tail:
+        for name in TAIL_STAGES:
+            call.stage(name)
+    else:  # the lean layout: the tail stages once per chunk range, on that range's per-pass buffers
+        for i in range(len(tail)):
+            for name in TAIL_STAGES:
+                call.stage(name, tail_pass=i)
 
 
 # ----------------------------------------------------------------------------------------------------------------

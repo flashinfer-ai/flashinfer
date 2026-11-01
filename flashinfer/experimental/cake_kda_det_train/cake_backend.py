@@ -1268,6 +1268,31 @@ def _lean_slots(
     return tuple(slots)
 
 
+# The layouts another route registers on this module's arenas (:func:`_register_route_slots`): mode -> its slots at
+# ``(tail_passes, R, H, NC, NSEG, gate_fused)`` (the context-parallel route's lean backward layout,
+# ``cake_kda_det_train_kcp.cake_kcp_plan``).  This module registers none and runs none; a registered mode is never one
+# of its own (:data:`MODES`, :data:`LEAN_MODES`, :data:`FWD_LAYOUTS`), so their layouts and bytes do not depend on the
+# registry.  A mode keeps the one function it was registered with, so the cached :func:`_layout` of a registered
+# mode never changes (a mode looked up before its registration raised, which is not cached).
+_RouteSlots = Callable[
+    [int, int, int, int, int, bool], tuple[tuple[Occupant, ...], ...]
+]
+_ROUTE_SLOTS: dict[str, _RouteSlots] = {}
+
+
+def _register_route_slots(mode: str, slots: _RouteSlots) -> None:
+    """Register another route's layout ``mode`` (:data:`_ROUTE_SLOTS`); ``ValueError`` for a mode of this module or
+    one already registered with another function (registering the same function again does nothing)."""
+    if mode in MODES + LEAN_MODES + FWD_LAYOUTS:
+        raise ValueError(
+            f"layout mode {mode!r} belongs to this module; another route registers a mode of its own"
+        )
+    if _ROUTE_SLOTS.setdefault(mode, slots) is not slots:
+        raise ValueError(
+            f"layout mode {mode!r} is already registered with another function"
+        )
+
+
 def _slots_of(
     mode: str, tail_passes: int, R: int, H: int, NC: int, NSEG: int
 ) -> tuple[tuple[Occupant, ...], ...]:
@@ -1333,7 +1358,12 @@ def _layout(
     tail_passes: int = 1,
     gate_fused: bool = False,
 ) -> tuple[Region, ...]:
-    slots = _slots_of(mode, tail_passes, R, H, NC, NSEG)
+    route = _ROUTE_SLOTS.get(mode)
+    slots = (
+        _slots_of(mode, tail_passes, R, H, NC, NSEG)
+        if route is None
+        else route(tail_passes, R, H, NC, NSEG, gate_fused)
+    )
     if gate_fused:  # no gate epilogue: its input buffers leave the layout (an emptied slot leaves too)
         slots = tuple(
             kept
@@ -2132,7 +2162,9 @@ class KdaDetWorkspace:
     view (:meth:`batch_view`) the group's own, the fewest up to the option's that fit the arena.
     ``fwd_layout`` (:data:`FWD_LAYOUTS`, kept as :attr:`fwd_layout`) is the layout a forward-only workspace is sized
     for: ``"fwd"``, or ``"fwd_kcp"`` for the context-parallel route's forward (:data:`FWD_KCP_SLOTS`; this module's
-    forward does not fit in it); a backward workspace keeps ``"fwd"``.
+    forward does not fit in it); a backward workspace keeps ``"fwd"``.  ``layouts`` (another route's; off by default)
+    sizes the arena for exactly those ``(mode, tail passes)`` layouts (registered by that route) in place of the
+    option's; ``views`` takes each of them at its passes (kept per mode in :attr:`layout_passes`).
     """
 
     def __init__(
@@ -2147,10 +2179,27 @@ class KdaDetWorkspace:
         arena: KdaDetArena | None = None,
         doc_lengths: Sequence[int] | None = None,
         fwd_layout: str = "fwd",
+        layouts: Sequence[tuple[str, int]] | None = None,
     ) -> None:
         if save_mode not in SAVE_MODES:
             raise ValueError(
                 f"KdaDetWorkspace: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
+            )
+        if layouts is not None and (
+            not layouts
+            or arena is not None
+            or doc_lengths is not None
+            or fwd_layout not in FWD_LAYOUTS
+        ):
+            raise ValueError(
+                "KdaDetWorkspace: layouts (a non-empty sequence of (mode, tail passes)) sizes the arena without an "
+                f"arena option or doc_lengths, got layouts={layouts!r}, arena={arena}, doc_lengths={doc_lengths}, "
+                f"fwd_layout={fwd_layout!r}"
+            )
+        if layouts is not None and any(mode in LEAN_MODES for mode, _ in layouts):
+            raise ValueError(
+                f"KdaDetWorkspace: layouts takes another route's modes; {LEAN_MODES} take their tail passes from the "
+                f"arena option, got layouts={layouts!r}"
             )
         self.arena_option = KdaDetArena() if arena is None else arena
         plan.check_arena(self.arena_option, backward=backward)
@@ -2170,13 +2219,24 @@ class KdaDetWorkspace:
         # the passes of this workspace's backward tail (a group's view of a batched arena takes its own)
         self.tail_passes = self.arena_option.tail_passes
         self.launcher: Launcher = cake_jit.run_module if launcher is None else launcher
-        self.bytes = plan.arena_bytes(
-            backward=backward,
-            save_mode=save_mode,
-            arena=self.arena_option,
-            doc_lengths=self.doc_lengths,
-            fwd_layout=fwd_layout,
-        )
+        if layouts is None:
+            self.bytes = plan.arena_bytes(
+                backward=backward,
+                save_mode=save_mode,
+                arena=self.arena_option,
+                doc_lengths=self.doc_lengths,
+                fwd_layout=fwd_layout,
+            )
+        else:  # exactly the given layouts (another route's), not the option's
+            self.bytes = max(
+                plan.workspace_bytes(mode, passes) for mode, passes in layouts
+            )
+        # the tail passes of the given layouts outside LEAN_MODES, per mode (views takes them; empty by default)
+        self.layout_passes: dict[str, int] = {
+            mode: int(passes)
+            for mode, passes in (layouts or ())
+            if mode not in LEAN_MODES
+        }
         self.fwd_layout = fwd_layout
         self.zero_init = zero_init
         # The pad-chunk rows of every buffer a consumer reads are written in the same call (see the layout note),
@@ -2203,8 +2263,13 @@ class KdaDetWorkspace:
         mode = self.arena_option.mode(mode)
         ns = self._views_cache.get(mode)
         if ns is None:
-            # the tail split shapes the lean backward layouts only; every other layout has one form
-            tail = self.tail_passes if mode in LEAN_MODES else 1
+            # the lean backward layouts take the option's tail split, a layout given by ``layouts`` its passes,
+            # every other layout has one form
+            tail = (
+                self.tail_passes
+                if mode in LEAN_MODES
+                else self.layout_passes.get(mode, 1)
+            )
             need = self.plan.workspace_bytes(mode, tail)
             if need > self.bytes:
                 raise ValueError(
