@@ -1144,9 +1144,6 @@ def fp4_quantize(
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
 
-    if backend in ("cuda", "cute-dsl"):
-        _check_block_scale_quantization_support(input.device, "fp4_quantize")
-
     # Resolve exactly once here; the backends below receive the resolved
     # recipe (``None`` = off). MXFP4 has no candidate search: it never reads
     # the environment and an explicit recipe is an error. The FP8->FP4 kernels
@@ -1171,6 +1168,9 @@ def fp4_quantize(
             and input.dtype in _FP8_TO_FP4_INPUT_DTYPES
         ):
             raise nvfp4_4over6_fp8_input_error(input.dtype)
+
+    if backend in ("cuda", "cute-dsl"):
+        _check_block_scale_quantization_support(input.device, "fp4_quantize")
 
     # The quantize kernel reads global_scale as float32 on input's device. Normalize
     # so a bf16/fp16 or off-device scale isn't misread byte-wise / cross-device-read
