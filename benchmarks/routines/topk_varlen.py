@@ -203,6 +203,11 @@ def testTopKVarlen(args):
             raise ValueError(f"Unsupported backend: {backend}")
 
     backend_times = {backend: [] for backend in backends}
+    # gvr_2's streaming launcher needs a workspace on the capture stream.
+    # The timer warms a different stream, so keep this backend eager.
+    backend_cuda_graph = {
+        backend: use_cuda_graph and backend != "gvr_2" for backend in backends
+    }
     outputs = {}
     for cur_backend in backends:
         if run_refcheck:
@@ -213,7 +218,7 @@ def testTopKVarlen(args):
             dry_run_iters=args.dry_run_iters,
             repeat_iters=args.num_iters,
             enable_cupti=args.use_cupti,
-            use_cuda_graph=use_cuda_graph,
+            use_cuda_graph=backend_cuda_graph[cur_backend],
             input_args=(cur_backend, logits),
         )
 
@@ -262,6 +267,7 @@ def testTopKVarlen(args):
                 cur_res["max_seq_len"] = max_seq_len
                 cur_res["top_k"] = top_k
                 cur_res["backend"] = backend
+                cur_res["no_cuda_graph"] = not backend_cuda_graph[backend]
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
