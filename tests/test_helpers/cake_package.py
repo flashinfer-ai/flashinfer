@@ -1,6 +1,6 @@
 """The one place the CAKE backend test suites name their package.
 
-Every CAKE backend suite (``tests/experimental/test_cake_<package>.py``, ``tests/norm/test_cake_rmsnorm_det_train.py``,
+Every CAKE backend suite (``tests/experimental/test_cake_<package>.py``, ``tests/norm/test_cake_rmsnorm_det_train.py``, ``tests/norm/test_cake_rmsnorm_train.py``,
 ``tests/mhc/test_cake_mhc_det_train.py``, ``tests/experimental/test_mok_*.py``) imports its package through :func:`cake_package` and imports nothing else from
 flashinfer; the flashinfer public-API tests of a package live in its ``test_cake_<package>_api.py`` sibling.  A build
 that vendors a package under another import path runs the backend suite unchanged after pointing the entry of
@@ -15,6 +15,7 @@ from types import ModuleType
 # suite / package name -> import path of the package
 PACKAGES: dict[str, str] = {
     "cake_rmsnorm_det_train": "flashinfer.cake_rmsnorm_det_train_backend",
+    "cake_rmsnorm_train": "flashinfer.cake_rmsnorm_train_backend",
     "cake_causal_conv1d_det_train": "flashinfer.cake_causal_conv1d_det_train_backend",
     "cake_gated_act_mxfp8": "flashinfer.cake_gated_act_mxfp8_backend",
     "cake_rmsnorm_silu_gate_det_train": "flashinfer.cake_rmsnorm_silu_gate_det_train_backend",
