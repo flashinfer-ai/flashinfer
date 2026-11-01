@@ -2281,9 +2281,10 @@ def test_tc_plan_rule(arch, monkeypatch) -> None:
             sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
         )
         rec = cake_chain.tc_plan_pricing(chunks, num_v_heads, 0, bwd)
+        gain, min_saving = cake_chain.tc_plan_thresholds(arch)
         if rec["select"]:
-            assert rec["saving"] >= cake_chain.TC_PLAN_MIN_SAVING, (row, rec)
-            assert rec["best"]["T"] <= cake_chain.TC_PLAN_GAIN * rec["plan_T"], (
+            assert rec["saving"] >= min_saving, (row, rec)
+            assert rec["best"]["T"] <= gain * rec["plan_T"], (
                 row,
                 rec,
             )
@@ -2297,13 +2298,15 @@ def test_tc_plan_rule(arch, monkeypatch) -> None:
 
 @pytest.mark.parametrize("heads", [(8, 16), (8, 24)], ids=["g2", "g3"])
 def test_tc_plan_changes_only_the_adjoint_table(heads, device, monkeypatch) -> None:
-    # one 16384-token sequence (the r07 form; gates kept above the floors with TC_PLAN_GAIN = 1, no saving floor):
-    # the tc-priced adjoint table leaves the forward's bits, runs on dhu_tc2 (no dv_local stage), repeats bitwise
+    # one 16384-token sequence (the r07 form; gates kept above the floors with TC_PLAN_GAIN = 1, no saving floor; no
+    # CHAIN_PLAN tables): the tc-priced adjoint table leaves the forward's bits, runs on dhu_tc2 (no dv_local stage), repeats bitwise
     # (fixed-order cluster tails) and stays within the budgets of the planner's table; a plan pin keeps the planner
     seq_lens = (16384,)
     index = cake_chain._device_index(device)
     monkeypatch.setattr(cake_chain, "TC_PLAN_MIN_SAVING", 0.0)
     monkeypatch.setattr(cake_chain, "TC_PLAN_GAIN", 1.0)
+    monkeypatch.setattr(cake_chain, "TC_PLAN_SELECT", {})
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
     _fwd, bwd = cake_chain.scan_plans(16384, 1, heads[1], index, seq_lens)
     rec = cake_chain.tc_plan_pricing((256,), heads[1], index, bwd)
@@ -2329,6 +2332,210 @@ def test_tc_plan_changes_only_the_adjoint_table(heads, device, monkeypatch) -> N
     on = _run(inputs, seq_lens, **pins)
     monkeypatch.setattr(cake_chain, "TC_PLAN", False)
     _assert_same_bits(on, _run(inputs, seq_lens, **pins), OUTPUT_NAMES)
+
+
+# --------------------------------------------------------------------------- deeper split tables (CHAIN_PLAN)
+
+# The layouts of the bench's rows, packs, head pairs and group shapes (benchmarks/bench_cake_gdn_train.py): (sequence
+# lengths, HV); the tables do not depend on H, so the group shapes that repeat a row's layout and HV are left out.
+_PAIR_LAYOUT = (11000, 12000, 9768)
+BENCH_LAYOUTS = {
+    "r01": ((4096,) * 4, 16),
+    "r02": (_REAL_3, 16),
+    "r03": ((4096,) * 8, 16),
+    "r04": (_REAL_7, 16),
+    "r05": ((4096,) * 16, 16),
+    "r06": (_REAL_15, 16),
+    "r07": ((16384,), 16),
+    "r08": ((4096,) * 4, 32),
+    "r09": ((4096,) * 16, 32),
+    "r10": ((16384,), 32),
+    "64x4096": ((4096,) * 64, 6),
+    "A16": (_PAIR_LAYOUT, 48),
+    "P1": ((126565, 32714, 33696, 15081, 22979, 10782), 6),
+    "P3": ((128147, 131027), 6),
+    "issue": ((131071, 87531, 43385), 6),
+    "h8_hv24": (_PAIR_LAYOUT, 24),
+    "h4_hv12": (_PAIR_LAYOUT, 12),
+    "h2_hv6": (_PAIR_LAYOUT, 6),
+    "h1_hv3": (_PAIR_LAYOUT, 3),
+    "g1_16x4096_h8": ((4096,) * 16, 8),
+    "g3_4x4096_h8": ((4096,) * 4, 24),
+    "g3_16x4096_h1": ((4096,) * 16, 3),
+}
+# The layouts whose tables CHAIN_PLAN deepens on R200 (212 and 216 SMs): row -> (forward, adjoint) segment length of the
+# deeper table (None: the table without CHAIN_PLAN).  Every other layout keeps its tables.
+CHAIN_PLAN_ROWS = {
+    212: {
+        "r07": (20, 20),
+        "A16": (43, None),
+        "h2_hv6": (16, 16),
+        "h1_hv3": (16, 16),
+        "g3_16x4096_h1": (None, 16),
+    },
+    216: {
+        "r07": (20, 20),
+        "h2_hv6": (16, 15),
+        "h1_hv3": (16, 15),
+        "g3_16x4096_h1": (None, 16),
+    },
+}
+
+
+def _segments(chunks, plan) -> int:
+    if plan.segment_len <= 0 or max(chunks) <= plan.segment_len:
+        return len(chunks)
+    return sum(-(-n // plan.segment_len) for n in chunks)
+
+
+@pytest.mark.parametrize(
+    "arch, sm_count",
+    [("sm_100a", 148), ("sm_103a", 148), ("sm_103a", 152)],
+    ids=["B200", "B300", "GB300"],
+)
+def test_chain_plan_keeps_the_b200_b300_gb300_tables(
+    arch, sm_count, monkeypatch
+) -> None:
+    # CHAIN_PLAN lists sm_107a only: on B200, B300 and GB300 every bench layout keeps the tables (and the dhu_tc2
+    # pricing of its adjoint table) that it plans without CHAIN_PLAN, also with a saving floor of 0
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
+    )
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    assert arch not in cake_chain.CHAIN_PLAN
+    options = cake_chain.make_options()
+    for row, (seq_lens, num_v_heads) in BENCH_LAYOUTS.items():
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        with monkeypatch.context() as m:
+            m.setattr(cake_chain, "CHAIN_PLAN", {})
+            want = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        for table in (
+            cake_chain.CHAIN_PLAN,
+            {
+                name: {**const, "min_saving": 0.0}
+                for name, const in cake_chain.CHAIN_PLAN.items()
+            },
+        ):
+            with monkeypatch.context() as m:
+                m.setattr(cake_chain, "CHAIN_PLAN", table)
+                assert (
+                    cake_chain.host_plans(seq_lens, num_v_heads, 0, options) == want
+                ), row
+                for kind, plan in zip(("fwd", "bwd"), want[0], strict=True):
+                    rec = cake_chain.chain_plan_pricing(
+                        kind, chunks, num_v_heads, 0, plan
+                    )
+                    assert rec["select"] is False, (row, kind, rec)
+
+
+@pytest.mark.parametrize("sm_count", sorted(CHAIN_PLAN_ROWS))
+def test_chain_plan_rule_on_r200(sm_count, monkeypatch) -> None:
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
+    )
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: "sm_107a")
+    const = cake_chain.CHAIN_PLAN["sm_107a"]
+    cap = {
+        "fwd": cake_chain._prescan_capacity("fwd_h", cake_chain.SDT_CONFIG),
+        "bwd": cake_chain._prescan_capacity("dhu", cake_chain.SDT_CONFIG),
+    }
+    options = cake_chain.make_options()
+    deepened = {}
+    for row, (seq_lens, num_v_heads) in BENCH_LAYOUTS.items():
+        chunks = tuple(-(-n // 64) for n in seq_lens)
+        got, bwd_tc = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        with monkeypatch.context() as m:
+            m.setattr(cake_chain, "CHAIN_PLAN", {})
+            want, want_tc = cake_chain.host_plans(seq_lens, num_v_heads, 0, options)
+        lens = tuple(
+            None if new == old else new.segment_len
+            for new, old in zip(got, want, strict=True)
+        )
+        if lens != (None, None):
+            deepened[row] = lens
+        split = cake_chain.two_stream_split(len(chunks), num_v_heads, sm_count)
+        for kind, new, old in zip(("fwd", "bwd"), got, want, strict=True):
+            # a serial table that the two-stream rule groups keeps its form, whatever the pricing
+            grouped = _segments(chunks, old) == len(chunks) and split is not None
+            rec = cake_chain.chain_plan_pricing(kind, chunks, num_v_heads, 0, old)
+            assert (new != old) is (rec["select"] and not grouped), (row, kind, rec)
+            # a changed table: a deeper SDT_CONFIG split table within the pre-scan capacity, priced cheaper
+            if new != old:
+                assert tuple(new.config) == cake_chain.SDT_CONFIG, (row, kind, new)
+                assert 0 < new.segment_len <= cap[kind], (row, kind, new)
+                assert _segments(chunks, new) > _segments(chunks, old), (
+                    row,
+                    kind,
+                    new,
+                    old,
+                )
+                assert rec["saving"] >= const["min_saving"], (row, kind, rec)
+                assert rec["best"]["T"] <= const["gain"] * rec["plan_T"], (
+                    row,
+                    kind,
+                    rec,
+                )
+        assert bwd_tc is (want_tc or got[1] != want[1]), row
+    assert deepened == CHAIN_PLAN_ROWS[sm_count]
+    # plan pins (and a dhu_scan pin) keep the planner's tables
+    seq_lens = (16384,)
+    for pins in (
+        {"scan_config": (64, 1), "segment_chunks": 0},
+        {"segment_chunks": 64},
+        {"dhu_scan": "tc"},
+    ):
+        pinned = cake_chain.make_options(**pins)
+        planner = cake_chain.scan_plans(16384, 1, 16, 0, seq_lens, scan_config=pinned.scan_config,
+                                        segment_chunks=pinned.segment_chunks)  # fmt: skip
+        assert cake_chain.host_plans(seq_lens, 16, 0, pinned) == (
+            tuple(planner),
+            False,
+        ), pins
+
+
+@pytest.mark.parametrize(
+    "seq_lens, heads",
+    [((16384,), (8, 16)), (_PAIR_LAYOUT, (1, 3))],
+    ids=["r07", "h1-hv3"],
+)
+def test_chain_plan_tables_stay_within_the_budgets(
+    seq_lens, heads, device, monkeypatch
+) -> None:
+    # the deeper tables of CHAIN_PLAN (this architecture's constants, else sm_107a's; no saving floor): the forward runs
+    # the pre-scan, the stitch and fwd_ho on a deeper forward table, the backward the fused pre-scan and dhu_tc2 on a
+    # deeper adjoint table; the bits repeat run to run and stay within the budgets of the tables without CHAIN_PLAN;
+    # plan pins keep the planner's tables (the same bits with and without CHAIN_PLAN)
+    index = cake_chain._device_index(device)
+    arch = cake_backend.device_arch(index)
+    const = cake_chain.CHAIN_PLAN.get(arch, cake_chain.CHAIN_PLAN["sm_107a"])
+    forced = {arch: {**const, "min_saving": 0.0}}
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=313)
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", {})
+    (fwd0, bwd0), _tc = cake_chain.host_plans(seq_lens, heads[1], index)
+    base = _run(inputs, seq_lens)
+    pins = {"scan_config": tuple(fwd0.config), "segment_chunks": fwd0.segment_len}
+    base_pinned = _run(inputs, seq_lens, **pins)
+    monkeypatch.setattr(cake_chain, "CHAIN_PLAN", forced)
+    (fwd, bwd), _tc = cake_chain.host_plans(seq_lens, heads[1], index)
+    stages = _record_launches(monkeypatch)
+    runs = [_run(inputs, seq_lens) for _ in range(2)]
+    _assert_same_bits(runs[1], runs[0], OUTPUT_NAMES)
+    _assert_within_budget(runs[0], base, OUTPUT_NAMES)
+    if (fwd, bwd) == (fwd0, bwd0):
+        _assert_same_bits(runs[0], base, OUTPUT_NAMES)
+    if fwd != fwd0:
+        assert _segments(tuple(-(-n // 64) for n in seq_lens), fwd) > _segments(
+            tuple(-(-n // 64) for n in seq_lens), fwd0
+        )
+        _stage, _vb, pre, _ = cake_chain._scan_stages(
+            "fwd_h", cake_chain.SDT_CONFIG, arch
+        )
+        assert all(x in stages for x in (pre, "stitch", "fwd_ho")), stages
+    if bwd != bwd0:
+        assert all(x in stages for x in (cake_chain.SDT_PRESCAN, "dhu_tc2")), stages
+        assert "dv_local" not in stages, stages
+    _assert_same_bits(_run(inputs, seq_lens, **pins), base_pinned, OUTPUT_NAMES)
 
 
 # #7038 / #7548 form: a one-thread sleep kernel resident on a side stream for the whole call; the gate is declared
