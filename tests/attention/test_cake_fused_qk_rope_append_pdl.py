@@ -31,14 +31,19 @@ calls whose producer output changes, and under CUDA graph replay with the
 producer output changing between replays.  The captured edge from the producer
 to the kernel is programmatic exactly where the package takes a pdl build
 (SM100 / SM103 on the problems ``PDL_POLICY`` admits, the build the policy names
-for each card); every other call is a plain launch.  An FP8 launch that takes a
-CTA cap (``max_ctas_per_sm``) runs at the smallest dynamic shared memory that
-holds the kernel to that many CTAs per SM.
+for each card); every other call is a plain launch.  A launch that takes a CTA
+cap runs at the smallest dynamic shared memory that holds the kernel to that
+many CTAs per SM: an FP8 build takes it as ``max_ctas_per_sm``, a BF16 8/1
+prefill pdl build on SM100 (B200, GB200) from its own binding, which reads the
+SM count and the grid (``cta_cap`` of the SM100 library); for a BF16 build that
+is a change of the launch (the kernel would hold more CTAs without it).  A
+capped build's first call may be inside a CUDA graph capture.
 """
 
 from __future__ import annotations
 
 import ctypes
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -257,7 +262,24 @@ def _bf16_problem(case) -> Problem:
             enable_pdl=enable_pdl,
         )
 
-    return Problem(qkv, [oq, kc, vc], [oq0, kc0, vc0], call, stage, [*sources, decoy])
+    def cap(name: str) -> int:
+        # the cap the SM100 binding of a capped build takes for this launch
+        arch = bf16_loader.device_arch(0)
+        if name not in _BF16_CAPPED or arch != "sm_100a":
+            return 0
+        record = bf16_loader.MODULES[name]
+        grid = bf16_loader.launch_grid(
+            record,
+            num_rows=rows,
+            num_requests=len(case.q_lens),
+            page_size=case.page_size,
+        )
+        module = bf16_loader.load(name, arch)
+        return int(module.cta_cap(bf16_loader.sm_count(0), grid[0] * grid[1] * grid[2]))
+
+    return Problem(
+        qkv, [oq, kc, vc], [oq0, kc0, vc0], call, stage, [*sources, decoy], cap
+    )
 
 
 def _fp8_problem(case) -> Problem:
@@ -361,7 +383,7 @@ class Case:
     """A problem and the build a call that asks for PDL takes per card (B200,
     GB200, B300, GB300; never a pdl build on SM90): ``True`` the plain stage's
     twin, ``False`` the plain stage, a name that pdl build.  ``cap`` is the
-    ``max_ctas_per_sm`` of that FP8 launch per card (0: none)."""
+    ``max_ctas_per_sm`` of that launch per card (0: none)."""
 
     label: str
     route: str
@@ -379,16 +401,100 @@ class Case:
 
 
 _CARDS = ("b200", "gb200", "b300", "gb300")
+# The BF16 8/1 pdl builds whose SM100 binding takes the CTA cap (the prefill
+# builds: two preload rounds, 256-bit loads, with and without the pre-rotation sum
+# of squares), and the card of each (architecture, SM count).
+_BF16_CAPPED = (
+    "hq8_hkv1_lookup_rounds2_wide_f32_loads1_pdl",
+    "hq8_hkv1_lookup_rounds2_wide_f32_loads1_pre_rot_ss1_pdl",
+)
+_BF16_CARDS = {
+    ("sm_100a", 148): "b200",
+    ("sm_100a", 152): "gb200",
+    ("sm_103a", 148): "b300",
+    ("sm_103a", 152): "gb300",
+}
 _ON = dict.fromkeys(_CARDS, True)
 _OFF = dict.fromkeys(_CARDS, False)
 # The BF16 single-KV-head decode stage with one clearing unit per warp, and the
 # FP8 prefetching stages.
 _BF16_U1 = "hq8_hkv1_vsub3_d_lookup_rounds0_single_weight1_pdl"
 _ER2PP = "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1_pdl"
+# max_ctas_per_sm of the BF16 8/1 launches per card: 8 x 16, 4 x 64 and 32 x 8
+# prefill rows, 256 decode requests, and 1 x 128 rows of a capped build that
+# launch without a cap after the capped calls.
+_BF16_CAPS: dict[str, dict[str, int]] = {
+    "b4q64": {"b200": 2, "gb200": 0, "b300": 0, "gb300": 0},
+    "b8q16": {"b200": 0, "gb200": 1, "b300": 0, "gb300": 0},
+    "b32q8": {"b200": 0, "gb200": 0, "b300": 0, "gb300": 0},
+    "b256": {"b200": 0, "gb200": 0, "b300": 0, "gb300": 0},
+    "b256p16": {"b200": 0, "gb200": 0, "b300": 0, "gb300": 0},
+    "b1q128": {"b200": 0, "gb200": 0, "b300": 0, "gb300": 0},
+}
 CASES = [
     Case("bf16_decode_8x1_b32", "bf16", (8, 1), (1,) * 32, (2048,) * 32, _ON, seed=1),
     Case("bf16_decode_64x8_b32", "bf16", (64, 8), (1,) * 32, (2048,) * 32, _ON, seed=2),
-    Case("bf16_prefill_8x1_b4q64", "bf16", (8, 1), (64,) * 4, (500,) * 4, _ON, seed=3),
+    Case(
+        "bf16_prefill_8x1_b4q64",
+        "bf16",
+        (8, 1),
+        (64,) * 4,
+        (500,) * 4,
+        _ON,
+        seed=3,
+        cap=_BF16_CAPS["b4q64"],
+    ),
+    Case(
+        "bf16_prefill_8x1_b8q16",
+        "bf16",
+        (8, 1),
+        (16,) * 8,
+        (2048,) * 8,
+        _ON,
+        seed=21,
+        cap=_BF16_CAPS["b8q16"],
+    ),
+    Case(
+        "bf16_prefill_8x1_b32q8",
+        "bf16",
+        (8, 1),
+        (8,) * 32,
+        (2048,) * 32,
+        _ON,
+        seed=22,
+        cap=_BF16_CAPS["b32q8"],
+    ),
+    Case(
+        "bf16_decode_8x1_b256",
+        "bf16",
+        (8, 1),
+        (1,) * 256,
+        (300,) * 256,
+        _ON,
+        seed=23,
+        cap=_BF16_CAPS["b256"],
+    ),
+    Case(
+        "bf16_decode_8x1_b256_p16",
+        "bf16",
+        (8, 1),
+        (1,) * 256,
+        (300,) * 256,
+        _ON,
+        page_size=16,
+        seed=29,
+        cap=_BF16_CAPS["b256p16"],
+    ),
+    Case(
+        "bf16_prefill_8x1_b1q128",
+        "bf16",
+        (8, 1),
+        (128,),
+        (2048,),
+        _ON,
+        seed=24,
+        cap=_BF16_CAPS["b1q128"],
+    ),
     Case("bf16_prefill_64x8_q128", "bf16", (64, 8), (128,), (1000,), _ON, seed=4),
     Case(
         "bf16_decode_8x1_b512",
@@ -546,8 +652,14 @@ def _expects_pdl(case: Case) -> bool:
     return _card() is not None and case.pdl[_card()] is not False
 
 
+def _bf16_card() -> str | None:
+    """The BF16 CTA-cap card of device 0 (B200, GB200, B300 or GB300 by exact
+    architecture and SM count), ``None`` on any other device."""
+    return _BF16_CARDS.get((bf16_loader.device_arch(0), bf16_loader.sm_count(0)))
+
+
 def _expected_cap(case: Case) -> int:
-    card = _card()
+    card = _bf16_card() if case.route == "bf16" else _card()
     return 0 if card is None else case.cap.get(card, 0)
 
 
@@ -635,8 +747,7 @@ def test_enable_pdl_takes_the_pdl_build_where_measured(case):
     plain, chosen = problem.stage(False), problem.stage(True)
     assert not plain.endswith("_pdl")
     assert chosen == _expected_stage(case, plain)
-    if case.route == "fp8":
-        assert problem.cap(chosen) == _expected_cap(case)
+    assert problem.cap(chosen) == _expected_cap(case)
 
 
 @pytest.mark.parametrize("case", CASES, ids=_IDS)
@@ -813,9 +924,7 @@ def _occupancy(func, threads: int, smem: int) -> int:
     return int(blocks)
 
 
-@pytest.mark.parametrize(
-    "case", [c for c in CASES if c.route == "fp8"], ids=lambda c: c.label
-)
+@pytest.mark.parametrize("case", CASES, ids=_IDS)
 def test_a_capped_launch_holds_the_kernel_to_its_cap(producer, case):
     _arch()
     pytest.importorskip("cuda.bindings.driver")
@@ -849,9 +958,60 @@ def test_a_capped_launch_holds_the_kernel_to_its_cap(producer, case):
         assert smem == 0
         return
     unbounded = _occupancy(func, threads, 0)
+    if case.route == "bf16":
+        # a BF16 cap is a change of the launch: the kernel holds more CTAs per SM
+        # without it
+        assert unbounded > cap, (unbounded, cap)
     if unbounded <= cap:
         assert smem == 0, (unbounded, cap)
         return
     # The smallest dynamic shared memory, in 16-byte steps, that holds the
     # kernel to the cap.
     assert _occupancy(func, threads, smem) <= cap < _occupancy(func, threads, smem - 16)
+
+
+def test_the_first_capped_call_may_be_inside_graph_capture(producer):
+    """A fresh host thread has no cached CTA-cap bytes: its first capped call
+    queries the occupancy and raises the kernel's dynamic shared-memory limit
+    inside the capture, and the replays still match the plain launch."""
+    _arch()
+    capped = [c for c in CASES if c.route == "bf16" and _expected_cap(c) > 0]
+    if not capped:
+        pytest.skip(
+            f"no BF16 case launches with a CTA cap on this GPU ({_bf16_card()})"
+        )
+    case = capped[0]
+    problem = case.problem()
+    assert problem.cap(problem.stage(True)) == _expected_cap(case)
+    source = _TriggerProducer(producer, problem)
+    _prepare(problem, source, 0)
+    torch.cuda.synchronize()
+    failures: list[BaseException] = []
+
+    def capture_and_replay() -> None:
+        try:
+            torch.cuda.set_device(_device())
+            stream = torch.cuda.Stream()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                source.run()
+                problem.call(True)
+            stream.synchronize()
+            for generation in _GRAPH_GENERATIONS:
+                with torch.cuda.stream(stream):
+                    _prepare(problem, source, generation)
+                    graph.replay()
+                stream.synchronize()
+                got = problem.snapshot()
+                _check_against_plain(
+                    problem, got, f"{case.label} first capped call g{generation}"
+                )
+            del graph
+        except BaseException as error:  # re-raised on the main thread
+            failures.append(error)
+
+    worker = threading.Thread(target=capture_and_replay)
+    worker.start()
+    worker.join()
+    if failures:
+        raise failures[0]
