@@ -456,6 +456,12 @@ PACKAGES: tuple[Package, ...] = (
         refs_shipped_modules,
     ),
     Package(
+        "flashinfer.experimental.cake_gdn_train_kcp",
+        "flashinfer/experimental/cake_gdn_train_kcp",
+        "cake_jit.py",
+        refs_shipped_modules,
+    ),
+    Package(
         "flashinfer.experimental.cake_moe_grouped_det_gemm",
         "flashinfer/experimental/cake_moe_grouped_det_gemm",
         "cake_jit.py",
