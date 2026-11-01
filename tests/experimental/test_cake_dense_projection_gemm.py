@@ -1210,13 +1210,18 @@ def test_registry_is_disjoint_from_the_deterministic_package():
 
 
 def test_registered_templates_are_the_ones_the_planners_name():
-    """Every template this checkout registers is one the host plans: the transposed-store K1 programs
-    (``dense_proj_gemm_atomic_nn_n<64|128|256>[_f32]_t``) and the two router classes."""
+    """Every template this checkout registers is one the host plans -- the transposed-store K1 programs
+    (``dense_proj_gemm_atomic_nn_n<64|128|256>[_f32]_t``) and the two router classes -- or the weight gradient's
+    head/tail program, registered before the planner names it."""
     wanted = {
         cake_backend.atomic_k1_template(bn, f32)
         for bn in cake_backend.K1_BLOCK_N_CHOICES
         for f32 in (False, True)
-    } | {"router_fp32_gemm_atomic_kk", "router_fp32_gemm_atomic_nn_t"}
+    } | {
+        "router_fp32_gemm_atomic_kk",
+        "router_fp32_gemm_atomic_nn_t",
+        "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+    }
     for table in cake_jit.KERNELS.values():
         assert set(table) <= wanted, sorted(set(table) - wanted)
 
