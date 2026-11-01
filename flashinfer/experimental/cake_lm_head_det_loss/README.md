@@ -791,19 +791,19 @@ programs (`cake_support.SUPPORT_STAGES`: the validation stage per index width,
 the two row stages, the gather and scatter of the dense form, the support
 logits gather GEMM and the segment gather-accumulate dX / dW / combine kernels
 in their BF16 and FP32-accumulate modes), exported from the kernel snapshot
-named in the pull request.  `tests/experimental/test_cake_lm_head_support.py`
+named in the pull request.  `tests/experimental/test_cake_lm_head_det_support.py`
 tests the candidate-support entries (host rules and the reference backend on
 any device, the cake backend on a registered device).
 
-Tests: `tests/experimental/test_cake_lm_head_loss.py` and the public-API suite
-`tests/experimental/test_cake_lm_head_loss_api.py` (the host-layer tests
+Tests: `tests/experimental/test_cake_lm_head_det_loss.py` and the public-API suite
+`tests/experimental/test_cake_lm_head_det_loss_api.py` (the host-layer tests
 run on any device through the reference path; the device tests skip without a
 registered program or a compute capability 10.0 / 10.3 device), and the
-CPU-only `tests/experimental/test_cake_lm_head_loss_standalone.py` (a copy of
+CPU-only `tests/experimental/test_cake_lm_head_det_loss_standalone.py` (a copy of
 the package imports with `flashinfer` blocked and raises its host-side errors;
 `scripts/check_cake_build_manifests.py --vendored-gate` builds and loads the
 copy's libraries on a GPU node).  Benchmark:
-`benchmarks/bench_cake_lm_head_loss.py`.
+`benchmarks/bench_cake_lm_head_det_loss.py`.
 
 Toolchain note: the package needs CUDA 12.9 or newer.  Every `build.json`
 entry has `min_cuda` 12.9 (`common.requires.cuda_toolkit.min` is 12.9), and
