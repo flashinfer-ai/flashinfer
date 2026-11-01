@@ -178,6 +178,12 @@ The packed GDN training routes come in four combinations:
   forward or backward body, eager or captured, binds the caller's current
   stream for tvm-ffi once (`tvm_ffi.use_torch_stream()`), and a launch enters
   its own context only outside such a body or after a stream switch inside it.
+  The static launch arguments of a plan (the pool tables' kernel addressing,
+  the walk, index and merge-chain device tables, the split lists) are derived
+  once and kept with the same tables; a call without `workspace=` takes the
+  ticket words of its context for the current stream (one zeroed set per
+  stream, fresh under a CUDA stream capture) and sizes no pool it never
+  touches.
 
 ### Partition and context
 
@@ -377,9 +383,9 @@ The persistent programs (#5, #6, #8) launch no cooperative grid: a CTA that
 finishes its static tile draws the remaining work through an `atom.inc` on a
 32-bit ticket word (the `ticket` argument), which every launch leaves at zero
 again.  The host keeps one such word per launch site in the caller's
-workspace, 128-byte aligned, zeroed once when the workspace is allocated and
-never read back; a kernel resident on a side stream therefore delays one CTA,
-not the whole grid.
+workspace (a call without one: in its context, one set per stream), 128-byte
+aligned, zeroed once when the set is allocated and never read back; a kernel
+resident on a side stream therefore delays one CTA, not the whole grid.
 
 ## Layout of this package
 
