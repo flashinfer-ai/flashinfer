@@ -26,7 +26,7 @@ decorations and the user-facing documentation live in
 
 Numerical contract against the deterministic package: the forward is the
 deterministic package's forward kernel rendered here (it has no reduction, so
-its bits are the same), and on sm_100a / sm_103a from 2400 rows per SM a
+its bits are the same), and on sm_100a / sm_103a from 976 rows per SM a
 forward whose CTAs each walk several row blocks with the same arithmetic (the
 same bits); the backward is one kernel that writes ``dx`` and ``dz``
 exactly as the deterministic backward does, sums the weight gradient of the
@@ -92,10 +92,12 @@ Host design (the input layout rules are the deterministic package's):
   (see ``_RESERVES``; with none ready, the graph zero-fills one of its own).
 - Grids (``cake_jit.module_for_rows`` picks the module from the rows and
   the device's SM count): the forward launches one CTA per block of 16 rows;
-  on sm_100a and sm_103a from 2400 rows per SM it launches the long forward,
-  the fewest whole waves of 3 CTAs per SM that give no CTA more than 6 blocks
-  of 32 rows (CTA ``b`` walks the blocks ``b``, ``b + grid``, ..., loading
-  each next block while it computes the current one).  The backward
+  on sm_100a and sm_103a it launches a forward whose CTA ``b`` walks the
+  blocks ``b``, ``b + grid``, ..., loading each next block while it computes
+  the current one, in the fewest whole waves that give no CTA more than a
+  few blocks: from 976 rows per SM the mid forward (6 CTAs per SM, at most 2
+  blocks of 16 rows each), from 2400 the long forward (3 CTAs per SM, at most
+  6 blocks of 32 rows each).  The backward
   launches ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
   ctas_per_sm * SMs)``, so at most one wave: 256-thread CTAs of 16-row blocks
   with ``ctas_per_sm = 4``, and on sm_107a from 1024 rows per SM 128-thread
@@ -410,8 +412,9 @@ def cake_rmsnorm_silu_gate_train_forward(
     ``y = BF16(((x * rstd) * weight) * silu(z))``.
 
     The deterministic package's forward kernel rendered here (it has no
-    reduction: the same bits), or on sm_100a / sm_103a from 2400 rows per SM
-    the long forward (the same bits).  The arguments are those of
+    reduction: the same bits), or on sm_100a / sm_103a from 976 rows per SM
+    the mid forward and from 2400 the long forward (the same bits).  The
+    arguments are those of
     :func:`flashinfer.cake_rmsnorm_silu_gate_train.cake_rmsnorm_silu_gate_train_forward`;
     ``deterministic`` must be ``False``.
     """

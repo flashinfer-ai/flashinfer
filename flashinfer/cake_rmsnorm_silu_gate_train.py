@@ -44,7 +44,7 @@ dispatches on it here:
 * ``deterministic=False`` runs the standalone non-deterministic package
   ``flashinfer.cake_rmsnorm_silu_gate_train_backend``: the same forward kernel
   (it has no reduction, so ``y`` has the same bits; on SM100 and SM103 from
-  2400 rows per SM a forward whose CTAs each walk several row blocks, also
+  976 rows per SM a forward whose CTAs each walk several row blocks, also
   the same bits) and a one-kernel backward whose ``dx`` and ``dz`` are the
   deterministic backward's bits.  Its CTAs take row blocks (one block each
   when the grid has a CTA for every block;
@@ -273,7 +273,7 @@ def cake_rmsnorm_silu_gate_train_forward(
         (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_forward`)
         with these arguments.  ``False`` runs the non-deterministic package's
         forward program, the same kernel rendered there, or on SM100 / SM103
-        from 2400 rows per SM a forward whose CTAs each walk several row
+        from 976 rows per SM a forward whose CTAs each walk several row
         blocks with the same arithmetic (the forward has no reduction, so
         both return the same bits); it is refused while
         ``torch.use_deterministic_algorithms(True)`` is in effect (with

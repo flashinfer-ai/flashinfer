@@ -18,8 +18,9 @@ non-deterministic backward (``deterministic=False``) beside a kernel resident
 on another stream (the concurrent-launch contract of issues #7038 and #7548).
 
 The forward launches a plain grid of independent CTAs; on SM100 and SM103
-from 2400 rows per SM the long forward launches whole waves of 3 CTAs per SM
-that each walk at most 6 row blocks.  The backward launches
+from 976 rows per SM the mid forward launches whole waves of 6 CTAs per SM
+that each walk at most 2 row blocks, and from 2400 rows per SM the long
+forward whole waves of 3 CTAs per SM that each walk at most 6.  The backward launches
 at most one wave of CTAs: when the grid has a CTA for every row block, each
 CTA takes its own block; past one wave the CTAs claim every block in chunks of
 consecutive blocks from the workspace's claim counter, chunks that shrink to
@@ -51,12 +52,15 @@ the CTAs finish within about one block of each other), plus
 ``PROPORTIONAL_SLACK``.  The token counts give each CTA of the backward's
 one-wave grid 16 and 160 row blocks: ``T = 3157`` and ``31573`` on a
 148-SM B200, where the earlier fixed one-wave grid of 16 blocks per CTA ran
-1.26-1.35 times slower beside any side kernel.  The long forward beside the
-same side kernels: busy / alone is at most ``N / (N - k)``, plus the share of
-one CTA's blocks in the call (a CTA whose slot the side kernel holds walks all
-of its blocks once it starts), plus ``PROPORTIONAL_SLACK``, at the token
-counts that give its CTA slots 25 and 100 row blocks each (the threshold of
-2400 rows per SM and four times that).
+1.26-1.35 times slower beside any side kernel.  The long and mid forwards
+beside the same side kernels: busy / alone is at most ``N / (N - k)``, plus
+the share of one CTA's blocks in the call (a CTA whose slot the side kernel
+holds walks all of its blocks once it starts), plus ``PROPORTIONAL_SLACK``, at
+the token counts that give the long forward's CTA slots 25 and 100 row blocks
+each (its threshold of 2400 rows per SM and four times that) and the mid
+forward's 11 and 24 (1056 and 2304 rows per SM: the fewest whole blocks
+per slot at or above its threshold of 976 rows per SM, and the most below the
+long forward's).
 
 In the item 1 and item 2 tests every side CTA records its SM and its start
 time, and a run counts only when the side kernel held the intended SMs before
@@ -586,21 +590,24 @@ def test_backward_slows_in_proportion_to_the_sms_held(
     )
 
 
-# The long forward beside the item 1 side kernels: its CTA slots (3 per SM)
-# get 25 and 100 row blocks of 32 rows each.
+# The long and mid forwards beside the item 1 side kernels: the long forward's
+# CTA slots (3 per SM) get 25 and 100 row blocks of 32 rows each, the mid
+# forward's (6 per SM) 11 and 24 row blocks of 16 rows each.
 LONG_FORWARD_BLOCKS_PER_SLOT = (25, 100)
+MID_FORWARD_BLOCKS_PER_SLOT = (11, 24)
 
 
-def _long_forward_tokens(blocks_per_slot: int) -> tuple[int, float]:
+def _persistent_forward_tokens(role: str, blocks_per_slot: int) -> tuple[int, float]:
     """``(T, cta_share)``: the fewest tokens ``T`` whose ``T * H`` rows give
-    each CTA slot of the long forward ``blocks_per_slot`` row blocks, and the
-    share of one CTA's blocks in the call alone (blocks a CTA walks over blocks
-    a slot runs); skips where the architecture routes no long forward."""
+    each CTA slot of the forward module of ``role`` (``fwd_long`` or
+    ``fwd_mid``) ``blocks_per_slot`` row blocks, and the share of one CTA's
+    blocks in the call alone (blocks a CTA walks over blocks a slot runs);
+    skips where the architecture routes no such module."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
-    name = loader.ROUTES[arch].get("fwd_long")
+    name = loader.ROUTES[arch].get(role)
     if name is None:
-        pytest.skip(f"{arch} routes no long forward")
+        pytest.skip(f"{arch} routes no {role} module")
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
     rule = loader.MODULES[name]["grid_rule"]
     slots = int(rule["ctas_per_sm"]) * sms
@@ -613,14 +620,10 @@ def _long_forward_tokens(blocks_per_slot: int) -> tuple[int, float]:
     return tokens, -(-blocks // ctas) * slots / blocks
 
 
-@pytest.mark.parametrize(
-    "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
-)
-@pytest.mark.parametrize("blocks_per_slot", LONG_FORWARD_BLOCKS_PER_SLOT)
-def test_long_forward_slows_in_proportion_to_the_sms_held(
-    blocks_per_slot: int, ctas: int, threads: int
+def _forward_slows_in_proportion(
+    role: str, blocks_per_slot: int, ctas: int, threads: int
 ) -> None:
-    tokens, cta_share = _long_forward_tokens(blocks_per_slot)
+    tokens, cta_share = _persistent_forward_tokens(role, blocks_per_slot)
     x, z, w, _dy = _inputs(tokens)
     y = torch.empty_like(x)
 
@@ -637,13 +640,33 @@ def test_long_forward_slows_in_proportion_to_the_sms_held(
         f"blocks_per_slot={blocks_per_slot} side={ctas}x{threads} "
         f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} ratio={ratio:.3f} "
         f"ideal={ideal:.3f} cta_share={cta_share:.4f} "
-        f"excess={ratio - ideal - cta_share:.4f}"
+        f"excess={ratio - ideal - cta_share:.4f} role={role}"
     )
     _check_outputs("forward", tokens, alone, busy)
     assert ratio <= bound, (
-        f"tokens={tokens} ({blocks_per_slot} row blocks per CTA slot): long "
-        f"forward alone {alone_ms:.4f} ms, beside {ctas} x {threads} side CTAs "
+        f"tokens={tokens} ({blocks_per_slot} row blocks per CTA slot): {role} "
+        f"alone {alone_ms:.4f} ms, beside {ctas} x {threads} side CTAs "
         f"on {ctas} SMs {busy_ms:.4f} ms: ratio {ratio:.3f} > {bound:.3f} "
         f"(proportional {ideal:.3f} + one CTA's blocks {cta_share:.4f} + "
         f"{PROPORTIONAL_SLACK})"
     )
+
+
+@pytest.mark.parametrize(
+    "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
+)
+@pytest.mark.parametrize("blocks_per_slot", LONG_FORWARD_BLOCKS_PER_SLOT)
+def test_long_forward_slows_in_proportion_to_the_sms_held(
+    blocks_per_slot: int, ctas: int, threads: int
+) -> None:
+    _forward_slows_in_proportion("fwd_long", blocks_per_slot, ctas, threads)
+
+
+@pytest.mark.parametrize(
+    "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
+)
+@pytest.mark.parametrize("blocks_per_slot", MID_FORWARD_BLOCKS_PER_SLOT)
+def test_mid_forward_slows_in_proportion_to_the_sms_held(
+    blocks_per_slot: int, ctas: int, threads: int
+) -> None:
+    _forward_slows_in_proportion("fwd_mid", blocks_per_slot, ctas, threads)

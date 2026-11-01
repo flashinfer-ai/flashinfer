@@ -35,15 +35,17 @@ its FP64 column sums to ``dw_slots`` FP64 accumulators with atomics, the last
 CTA to arrive rounding the sum once into a BF16 or FP32 weight gradient and
 zeroing the accumulators).  ``ROUTES[arch][role]`` names the one module a role
 runs on an architecture.  An architecture may also route a role's long role
-(``fwd_long``, ``bwd_bf16_long``, ``bwd_f32_long``), whose module runs in the
-role's place from ``min_rows_per_sm`` rows per SM of its grid rule
-(:func:`module_for_rows`): on sm_100a and sm_103a a forward that walks
-several row blocks per CTA, loading each next block while it computes the
-current one, ``y`` the same bits; on sm_107a the backward with 128-thread
-CTAs, ``dx`` and ``dz`` the same bits.
+(``fwd_long``, ``bwd_bf16_long``, ``bwd_f32_long``) and the forward's mid role
+(``fwd_mid``), whose module runs in the role's place from ``min_rows_per_sm``
+rows per SM of its grid rule (:func:`module_for_rows`; the long role first,
+from more rows): on sm_100a and sm_103a a forward that walks several row
+blocks per CTA, loading each next block while it computes the current one,
+``y`` the same bits (the long forward 32-row blocks on 256-thread CTAs, the mid
+forward 16-row blocks on 128-thread CTAs); on sm_107a the backward with
+128-thread CTAs, ``dx`` and ``dz`` the same bits.
 
 Grids (:func:`launch_grid`): the forward launches one CTA per block of
-``rows_per_cta`` rows.  The long forward launches the fewest whole waves of
+``rows_per_cta`` rows.  The long and mid forwards launch the fewest whole waves of
 ``ctas_per_sm * SMs`` CTAs (the CTAs per SM its launch bounds are compiled
 for) whose CTAs walk at most ``max_blocks_per_cta`` blocks of
 ``rows_per_block`` rows each, and never more CTAs than blocks; CTA ``b``
@@ -63,10 +65,12 @@ on every input.  No
 module is cooperative and no CTA waits for another inside a kernel: a kernel
 resident on another stream delays a call roughly in proportion to the SM slots
 it holds, and one that holds resources this kernel needs on every SM can still
-delay its start.  A long forward CTA whose slot such a kernel holds walks all
-of its blocks once it starts; the long forward runs only from the
+delay its start.  A long or mid forward CTA whose slot such a kernel holds
+walks all of its blocks once it starts.  The long forward runs only from the
 ``min_rows_per_sm`` at which, with at most ``max_blocks_per_cta`` blocks a
-CTA, that delay is no larger than the forward's (FlashInfer issue #7548).
+CTA, that delay is no larger than the forward's; the mid forward only from
+the one at which such a call stays within the forward stall test's bound and
+ends no later than the forward's (FlashInfer issue #7548).
 
 The workspace of the backward is ``dw_slots * 128`` FP64 accumulators and one
 8-byte word holding two 32-bit words, the arrival ticket and the claim counter
@@ -212,6 +216,65 @@ MODULES: dict[str, dict[str, Any]] = {
             "z_tok": "z_tok",
         },
         "role": "fwd_long",
+    },
+    # The mid forward (sm_100a, sm_103a): the long forward's kernel on 128
+    # threads, 8 lanes per row (16-row blocks), at most 6 CTAs per SM (build
+    # {"lanes": 8, "math": "x2", "min_blocks": 6, "threads": 128}); whole
+    # waves of at most 2 blocks per CTA, from 976 rows per SM up to the long
+    # forward's.
+    "cake_rmsnorm_silu_gate_train_8bd481246a4b97382250": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "y"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 6,
+            "kind": "persistent_row_blocks",
+            "max_blocks_per_cta": 2,
+            "min_rows_per_sm": 976,
+            "rows_per_block": 16,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_8bd481246a4b97382250",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_8bd481246a4b97382250",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_8bd481246a4b97382250",
+        "logical": {
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "y": "y",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "fwd_mid",
     },
     # The backward into a BF16 weight gradient: 256 threads, 16 lanes per row,
     # 16-byte accesses, one row per thread group, the gate on packed FP32 pairs,
@@ -525,12 +588,14 @@ ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {
         "fwd": "cake_rmsnorm_silu_gate_train_05ffc12001cf81513436",
         "fwd_long": "cake_rmsnorm_silu_gate_train_e0672c312c57421abe21",
+        "fwd_mid": "cake_rmsnorm_silu_gate_train_8bd481246a4b97382250",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_6055175bf363e85d2936",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_32301367ce4fa8110271",
     },
     "sm_103a": {
         "fwd": "cake_rmsnorm_silu_gate_train_05ffc12001cf81513436",
         "fwd_long": "cake_rmsnorm_silu_gate_train_e0672c312c57421abe21",
+        "fwd_mid": "cake_rmsnorm_silu_gate_train_8bd481246a4b97382250",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_6055175bf363e85d2936",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_32301367ce4fa8110271",
     },
@@ -550,9 +615,13 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (10, 7): "sm_107a",
 }
 # The kernels of a call, routed on every architecture; ``<role>_long`` is a
-# role's long role, routed on some.
+# role's long role and ``<role>_mid`` its mid role, routed on some.
 ROLES = ("fwd", "bwd_bf16", "bwd_f32")
 LONG_ROLES = ("fwd_long", "bwd_bf16_long", "bwd_f32_long")
+MID_ROLES = ("fwd_mid",)
+# The suffixes of a role's long and mid roles in the order
+# :func:`module_for_rows` tries them (a long role runs from more rows per SM).
+TIERS = ("_long", "_mid")
 GRID_KINDS = ("row_blocks", "persistent_row_blocks", "row_claims")
 # Elements of one normalized row.
 HEAD_DIM = 128
@@ -588,15 +657,17 @@ def route_module(arch: str, role: str) -> str:
 
 def module_for_rows(arch: str, role: str, rows: int, sm_count: int) -> str:
     """The module that runs ``role`` (one of ``ROLES``) for ``rows`` rows on
-    ``arch`` with ``sm_count`` SMs: the role's long module when ``arch``
-    routes one and ``rows >= min_rows_per_sm * sm_count`` of its grid rule,
-    else :func:`route_module`."""
+    ``arch`` with ``sm_count`` SMs: the first of the role's long and mid
+    modules (``TIERS`` order) that ``arch`` routes with ``rows >=
+    min_rows_per_sm * sm_count`` of its grid rule, else :func:`route_module`."""
 
-    name = ROUTES.get(arch, {}).get(f"{role}_long")
-    if name is not None and int(rows) >= int(
-        MODULES[name]["grid_rule"]["min_rows_per_sm"]
-    ) * int(sm_count):
-        return name
+    routes = ROUTES.get(arch, {})
+    for tier in TIERS:
+        name = routes.get(f"{role}{tier}")
+        if name is not None and int(rows) >= int(
+            MODULES[name]["grid_rule"]["min_rows_per_sm"]
+        ) * int(sm_count):
+            return name
     return route_module(arch, role)
 
 
@@ -629,8 +700,8 @@ def launch_grid(
 ) -> tuple[int, int, int]:
     """The grid of one module record for ``rows`` rows on a device with
     ``sm_count`` SMs (``ctas``: the backward's CTA count,
-    :func:`backward_ctas`).  The long forward takes the fewest whole waves of
-    ``ctas_per_sm * sm_count`` CTAs whose CTAs walk at most
+    :func:`backward_ctas`).  The long and mid forwards take the fewest whole
+    waves of ``ctas_per_sm * sm_count`` CTAs whose CTAs walk at most
     ``max_blocks_per_cta`` blocks of ``rows_per_block`` rows each, and at most
     one CTA per block."""
 
@@ -750,9 +821,11 @@ __all__ = [
     "HEAD_DIM",
     "INT32_MAX",
     "LONG_ROLES",
+    "MID_ROLES",
     "MODULES",
     "ROLES",
     "ROUTES",
+    "TIERS",
     "arch_for_capability",
     "backward_ctas",
     "device_arch",

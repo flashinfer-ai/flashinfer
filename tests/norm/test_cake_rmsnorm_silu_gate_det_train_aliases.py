@@ -170,7 +170,7 @@ def test_old_package_is_self_contained() -> None:
         name.startswith("cake_rmsnorm_silu_gate_train_") for name in loader.MODULES
     )
     roles = {record["role"] for record in loader.MODULES.values()}
-    assert roles == set(loader.ROLES) | set(loader.LONG_ROLES)
+    assert roles == set(loader.ROLES) | set(loader.LONG_ROLES) | set(loader.MID_ROLES)
     old_dir = Path(legacy_backend.__file__).parent
     files = {p.name for p in old_dir.iterdir() if p.name != "__pycache__"}
     assert {
