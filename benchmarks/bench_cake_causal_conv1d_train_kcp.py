@@ -59,10 +59,10 @@ Measures (on every rank; a row reports the slowest rank and the JSON keeps every
   exchange twice).
 
 The timings interleave the modes: ``--rounds`` rounds, each timing every phase of both modes and of every baseline.
-The arm list is ``det``, ``nondet``, then the baselines that can run the row; round ``i`` (from 0) runs it rotated
-left by ``i mod n`` arms (``n`` arms) and reversed when ``i`` is odd, so round ``i`` is led by arm ``i mod n`` (even
-``i``) or arm ``(i - 1) mod n`` (odd ``i``).  With an odd ``n`` every arm leads within ``2 n`` rounds; with an even
-``n`` only the arms at even list positions lead (``det``, the first baseline, ...), never ``nondet``.
+The arm list is ``det``, ``nondet``, then the baselines that can run the row (``n`` arms).  Round ``i`` (from 0) runs
+it rotated left by ``i mod n`` arms and reversed when ``i // n`` is odd, so in every block of ``n`` rounds (rounds
+``k n`` to ``k n + n - 1``) each arm leads once and runs last once, for any ``n``; with ``n = 2`` the rounds are led
+by ``det``, ``nondet``, ``nondet``, ``det``, ...  Each row's ``round_orders`` lists the arm order of every round.
 Each value is the median over the rounds of the round's value, with its ``[min, max]`` over the rounds; ``speedup`` is
 ``det / nondet`` of the medians (above 1: the non-deterministic mode is faster), ``speedup_range`` the ``[min, max]``
 of the per-round ratios.  A check per row on every rank (exit status 1 when it fails): the non-deterministic ``y`` and
@@ -636,6 +636,7 @@ def bench_row(
         "tokens_local": _gather(p.tokens_local),
         "halo": _gather(p.halo),
         "rounds": args.rounds,
+        "round_orders": [],
         "modes": {},
     }
     # One untimed pass per mode: the JIT loads and the first exchanges.
@@ -662,7 +663,7 @@ def bench_row(
                 }[phase]
                 entries[mode][f"{phase}_{when}"] = _probe(probe, device)
     sota_entries, sota_calls = _baselines(p, args, rank, world, device)
-    # Interleaved rounds: every phase of both modes and of every baseline per round, in the arm order below.
+    # Interleaved rounds: every phase of both modes and of every baseline per round, in the balanced arm order below.
     timed = {mode: _calls(p, deterministic) for mode, deterministic in MODES.items()}
     for calls in timed.values():
         calls["record"]()
@@ -679,13 +680,13 @@ def bench_row(
     late = {mode: 0 for mode in timed}
     arms = list(timed)
     for index in range(args.rounds):
-        # The arm list rotated left by one arm per round, reversed in odd rounds: round i is led by
-        # arms[i % n] (even i) or arms[(i - 1) % n] (odd i), so with an even n only the even list
-        # positions lead (det, the first baseline, ...), with an odd n every arm leads within 2 n rounds.
+        # The arm list rotated left by i % n arms, reversed when i // n is odd: each block of n rounds has
+        # every arm lead once and run last once (n = 2: det, nondet, nondet, det, ...).
         shift = index % len(arms)
         order = arms[shift:] + arms[:shift]
-        if index % 2:
+        if (index // len(arms)) % 2:
             order.reverse()
+        result["round_orders"].append(list(order))
         spin_ms = ahead.spin_for(
             [timed[mode][phase] for mode in order for phase in PHASES]
         )
