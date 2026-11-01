@@ -357,7 +357,7 @@ The files of this package:
   context-parallel route, `kcp_fwd_o` (the output from the K1 tapes) and
   `kcp_dav` (`dA_qk` and the `dv1` K2 reads); selection by `always` or by
   `columns` on the merge's `ncols`, grids by `kcp_segments_heads`,
-  `kcp_chains`, `kcp_sm_bounded` or `kcp_pairs`), the logical vocabulary of
+  `kcp_chains`, `kcp_tile_items` or `kcp_pairs`), the logical vocabulary of
   the KCP arguments, `run_program(name, args, device_index=)`, the lowering
   of the host backend's walk and merge requests to the registry's launches,
   and `run_module` for the two chunk stages.  Its `TEST_MODULES` are
