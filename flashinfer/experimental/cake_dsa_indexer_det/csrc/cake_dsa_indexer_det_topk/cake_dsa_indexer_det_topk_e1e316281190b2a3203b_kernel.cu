@@ -55,32 +55,31 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #endif
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_SCRATCH_OFF 0
 #if CAKE_INDEXER_THREADS == 512
-#define SMEM_SCRATCH_STAGE_BYTES 40960
-#define SMEM_SCRATCH_STRIDE 40960
-#define SMEM_TOTAL 40960
+#define SMEM_SCRATCH_STAGE_BYTES 18528
+#define SMEM_SCRATCH_STRIDE 18528
+#define SMEM_TOTAL 18560
 #define THREADS 512
 #elif CAKE_INDEXER_THREADS == 256
-#define SMEM_SCRATCH_STAGE_BYTES 40960
-#define SMEM_SCRATCH_STRIDE 40960
-#define SMEM_TOTAL 40960
+#define SMEM_SCRATCH_STAGE_BYTES 9280
+#define SMEM_SCRATCH_STRIDE 9280
+#define SMEM_TOTAL 9344
 #define THREADS 256
 #elif CAKE_INDEXER_THREADS == 128
-#define SMEM_SCRATCH_STAGE_BYTES 12288
-#define SMEM_SCRATCH_STRIDE 12288
-#define SMEM_TOTAL 12288
+#define SMEM_SCRATCH_STAGE_BYTES 4640
+#define SMEM_SCRATCH_STRIDE 4640
+#define SMEM_TOTAL 4736
 #define THREADS 128
 #elif CAKE_INDEXER_THREADS == 64
-#define SMEM_SCRATCH_STAGE_BYTES 8192
-#define SMEM_SCRATCH_STRIDE 8192
-#define SMEM_TOTAL 8192
+#define SMEM_SCRATCH_STAGE_BYTES 2336
+#define SMEM_SCRATCH_STRIDE 2336
+#define SMEM_TOTAL 2432
 #define THREADS 64
 #else
-#define SMEM_SCRATCH_STAGE_BYTES 4096
-#define SMEM_SCRATCH_STRIDE 4096
-#define SMEM_TOTAL 4096
+#define SMEM_SCRATCH_STAGE_BYTES 1184
+#define SMEM_SCRATCH_STRIDE 1184
+#define SMEM_TOTAL 1280
 #define THREADS 32
 #endif
 
@@ -146,19 +145,19 @@ CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int t
     {
 #if CAKE_INDEXER_THREADS == 512
         using _block_radix_sort_0 = cub::BlockRadixSort<uint32_t, 512, 8, uint32_t, 4, true, cub::BLOCK_SCAN_WARP_SCANS, cudaSharedMemBankSizeFourByte>;
-        static_assert(sizeof(typename _block_radix_sort_0::TempStorage) <= 40960, "BlockRadixSortDescending scratch is too small for this CUB build");
+        static_assert(sizeof(typename _block_radix_sort_0::TempStorage) <= 18528, "BlockRadixSortDescending scratch is too small for this CUB build");
 #elif CAKE_INDEXER_THREADS == 256
         using _block_radix_sort_0 = cub::BlockRadixSort<uint32_t, 256, 8, uint32_t, 4, true, cub::BLOCK_SCAN_WARP_SCANS, cudaSharedMemBankSizeFourByte>;
-        static_assert(sizeof(typename _block_radix_sort_0::TempStorage) <= 40960, "BlockRadixSortDescending scratch is too small for this CUB build");
+        static_assert(sizeof(typename _block_radix_sort_0::TempStorage) <= 9280, "BlockRadixSortDescending scratch is too small for this CUB build");
 #elif CAKE_INDEXER_THREADS == 128
         using _block_radix_sort_0 = cub::BlockRadixSort<uint32_t, 128, 8, uint32_t, 4, true, cub::BLOCK_SCAN_WARP_SCANS, cudaSharedMemBankSizeFourByte>;
-        static_assert(sizeof(typename _block_radix_sort_0::TempStorage) <= 12288, "BlockRadixSortDescending scratch is too small for this CUB build");
+        static_assert(sizeof(typename _block_radix_sort_0::TempStorage) <= 4640, "BlockRadixSortDescending scratch is too small for this CUB build");
 #elif CAKE_INDEXER_THREADS == 64
         using _block_radix_sort_0 = cub::BlockRadixSort<uint32_t, 64, 8, uint32_t, 4, true, cub::BLOCK_SCAN_WARP_SCANS, cudaSharedMemBankSizeFourByte>;
-        static_assert(sizeof(typename _block_radix_sort_0::TempStorage) <= 8192, "BlockRadixSortDescending scratch is too small for this CUB build");
+        static_assert(sizeof(typename _block_radix_sort_0::TempStorage) <= 2336, "BlockRadixSortDescending scratch is too small for this CUB build");
 #else
         using _block_radix_sort_0 = cub::BlockRadixSort<uint32_t, 32, 8, uint32_t, 4, true, cub::BLOCK_SCAN_WARP_SCANS, cudaSharedMemBankSizeFourByte>;
-        static_assert(sizeof(typename _block_radix_sort_0::TempStorage) <= 4096, "BlockRadixSortDescending scratch is too small for this CUB build");
+        static_assert(sizeof(typename _block_radix_sort_0::TempStorage) <= 1184, "BlockRadixSortDescending scratch is too small for this CUB build");
 #endif
         static_assert(1024 % alignof(typename _block_radix_sort_0::TempStorage) == 0 && 0 % alignof(typename _block_radix_sort_0::TempStorage) == 0, "BlockRadixSortDescending scratch is misaligned");
         static_assert(sizeof(keys) == sizeof(uint32_t) * 8 && sizeof(vals) == sizeof(uint32_t) * 8, "BlockRadixSortDescending array extent mismatch");

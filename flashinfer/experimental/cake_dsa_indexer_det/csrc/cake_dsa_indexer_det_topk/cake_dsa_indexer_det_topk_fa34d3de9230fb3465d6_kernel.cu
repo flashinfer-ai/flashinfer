@@ -527,8 +527,8 @@ kernel_cake_dsa_indexer_det_topk_fa34d3de9230fb3465d6(const __grid_constant__ CU
                             int rel_k = unit_1 - unit_base_k;
                             int s_idx_k = rel_k % n_split;
                             int blk_1 = nb_1 - 1 - rel_k / n_split;
-                            int q0_0 = cu_seqlens_q[seg_fk];
-                            int lq_0 = cu_seqlens_q[seg_fk + 1] - q0_0;
+                            int q0_1_1 = cu_seqlens_q[seg_fk];
+                            int lq_0 = cu_seqlens_q[seg_fk + 1] - q0_1_1;
                             int lk = cu_seqlens_k[seg_fk + 1] - cu_seqlens_k[seg_fk];
                             long long off = 0;
                             if (has_offsets != 0) {
@@ -671,8 +671,8 @@ kernel_cake_dsa_indexer_det_topk_fa34d3de9230fb3465d6(const __grid_constant__ CU
                         int rel_m = unit_2 - unit_base_m;
                         int s_idx_m = rel_m % n_split;
                         int blk_2 = nb_2 - 1 - rel_m / n_split;
-                        int q0_1_1 = cu_seqlens_q[seg_fm];
-                        int lq_2_1 = cu_seqlens_q[seg_fm + 1] - q0_1_1;
+                        int q0_2_1 = cu_seqlens_q[seg_fm];
+                        int lq_2_1 = cu_seqlens_q[seg_fm + 1] - q0_2_1;
                         int lk_1 = cu_seqlens_k[seg_fm + 1] - cu_seqlens_k[seg_fm];
                         long long off_2 = 0;
                         if (has_offsets != 0) {
@@ -893,18 +893,18 @@ kernel_cake_dsa_indexer_det_topk_fa34d3de9230fb3465d6(const __grid_constant__ CU
                         int s_idx = rel_u % n_split;
                         int blk_3 = nb_3 - 1 - rel_u / n_split;
                         int u_base = blk_3 * 6;
-                        int q0_2_1 = cu_seqlens_q[seg_fu];
-                        int lq_3_1 = cu_seqlens_q[seg_fu + 1] - q0_2_1;
+                        int q0_3_1 = cu_seqlens_q[seg_fu];
+                        int lq_3_1 = cu_seqlens_q[seg_fu + 1] - q0_3_1;
                         int lk_0 = cu_seqlens_k[seg_fu + 1] - cu_seqlens_k[seg_fu];
-                        long long off_1_2 = 0;
+                        long long off_3_1 = 0;
                         if (has_offsets != 0) {
-                            off_1_2 = q_offsets[seg_fu];
+                            off_3_1 = q_offsets[seg_fu];
                         } else if (ratio == 1) {
-                            off_1_2 = (long long)lk_0 - (long long)lq_3_1;
+                            off_3_1 = (long long)lk_0 - (long long)lq_3_1;
                         }
-                        long long off_1_0 = off_1_2;
+                        long long off_1_2 = off_3_1;
                         int last_u_2 = ((blk_3 * 6 + 5) < (lq_3_1 - 1) ? (blk_3 * 6 + 5) : (lq_3_1 - 1));
-                        long long num_2 = off_1_0 + (long long)last_u_2 + 1;
+                        long long num_2 = off_1_2 + (long long)last_u_2 + 1;
                         int vis_2 = 0;
                         if (num_2 > 0) {
                             long long quotient_2 = num_2 / (long long)ratio;
