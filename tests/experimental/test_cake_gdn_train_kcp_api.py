@@ -26,6 +26,7 @@ partitions.  No kernel runs here: the compute entries run on the fake backend (t
 from __future__ import annotations
 
 import ast
+import builtins
 import dataclasses
 import importlib
 import inspect
@@ -961,6 +962,32 @@ def test_facade_routes_by_mode(monkeypatch) -> None:
     )
     with pytest.raises(TypeError, match="deterministic must be a bool"):
         facade.is_gdn_train_kcp_supported("cpu", deterministic=None)
+
+
+def test_facade_imports_each_route_once(monkeypatch) -> None:
+    """The facade imports each routed module on first use only: later calls on either route run no import and reach
+    the same module objects."""
+    facade = importlib.import_module(FACADE)
+    _route_recorders(monkeypatch)
+    calls = _facade_calls(facade).values()
+    for call in calls:  # first use of both routes
+        call()
+        call(deterministic=False)
+    imports: list = []
+    real_import = builtins.__import__
+
+    def counting_import(name, *args, **kwargs):
+        imports.append(name)
+        return real_import(name, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(builtins, "__import__", counting_import)
+        for call in calls:
+            call()
+            call(deterministic=False)
+    assert imports == [], imports
+    assert facade._pkg() is importlib.import_module(PACKAGE)
+    assert facade._det() is importlib.import_module(DET_FACADE)
 
 
 def test_facade_context_graph_replay_hint(monkeypatch) -> None:

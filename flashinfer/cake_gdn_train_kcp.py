@@ -72,6 +72,7 @@ with this module's ``ctx``.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import warnings
 from typing import Any, Optional
 
@@ -85,12 +86,15 @@ _FEATURE = "Cake context-parallel packed GDN chunked training (SM100/SM103/SM107
 DEFAULT_SCALE = 128**-0.5
 
 
+# The routed modules are imported on first use and cached: a call does not repeat the import.
+@functools.cache
 def _pkg():
     from .experimental import cake_gdn_train_kcp  # noqa: PLC0415 - the backend package, imported on first use
 
     return cake_gdn_train_kcp
 
 
+@functools.cache
 def _det():
     from . import cake_gdn_det_train_kcp  # noqa: PLC0415 - the deterministic route, imported on first use
 
