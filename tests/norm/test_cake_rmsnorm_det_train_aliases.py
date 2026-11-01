@@ -15,15 +15,16 @@ limitations under the License.
 
 Compatibility names of the Cake fused BF16 RMSNorm training package.
 
-Within each namespace (the ``flashinfer.cake_rmsnorm_det_train`` facade, its backend package and the
-``flashinfer`` top level) every compatibility name is the same object as its det
-name and stays out of ``__all__``.  The module ``flashinfer.cake_rmsnorm_train`` is the facade's
-module object, and the submodules of ``flashinfer.cake_rmsnorm_train_backend`` are the det package's
-module objects, registered in ``sys.modules`` when that package is imported; that
-package's ``__all__`` is the det package's, so a star import binds the det objects,
-and its ``dir`` lists the det names.  Both previous module paths are also attributes
-of the ``flashinfer`` package after a plain ``import flashinfer`` (checked in fresh
-interpreters).
+Within each det namespace (the ``flashinfer.cake_rmsnorm_det_train`` facade and its
+backend package) every compatibility name is the same object as its det name and
+stays out of ``__all__``.  The names before the det rename at the ``flashinfer`` top
+level, the module ``flashinfer.cake_rmsnorm_train`` and the package
+``flashinfer.cake_rmsnorm_train_backend`` are the package with the deterministic
+default and the opt-in non-deterministic weight gradient: their own objects and
+modules, with the pre-rename ``__all__``, whose default calls run the det package
+(``test_cake_rmsnorm_train_api.py`` holds the bits).  Both module paths are also
+attributes of the ``flashinfer`` package after a plain ``import flashinfer``
+(checked in fresh interpreters).
 """
 
 from __future__ import annotations
@@ -38,6 +39,8 @@ import pytest
 import flashinfer
 import flashinfer.cake_rmsnorm_det_train as facade
 import flashinfer.cake_rmsnorm_det_train_backend as backend
+import flashinfer.cake_rmsnorm_train as legacy_facade
+import flashinfer.cake_rmsnorm_train_backend as legacy_backend
 
 pytestmark = pytest.mark.cpu_only
 
@@ -86,9 +89,10 @@ def test_compatibility_name_is_the_det_object(namespace: str, old: str) -> None:
 
 
 @pytest.mark.parametrize("old", TOP_LEVEL_NAMES)
-def test_top_level_compatibility_name_is_the_det_object(old: str) -> None:
+def test_top_level_legacy_name_is_the_legacy_package_object(old: str) -> None:
     new = NAMES[old]
-    assert getattr(flashinfer, old) is getattr(flashinfer, new), (old, new)
+    assert getattr(flashinfer, old) is getattr(legacy_facade, old), old
+    assert getattr(flashinfer, old) is not getattr(flashinfer, new), (old, new)
     assert getattr(flashinfer, new) is getattr(facade, new), new
 
 
@@ -98,47 +102,80 @@ def test_det_entry_points_are_the_decorated_defs() -> None:
     assert getattr(facade, old).__name__ == new
 
 
-def test_old_facade_is_the_det_module() -> None:
-    assert importlib.import_module(OLD_FACADE) is facade
-    assert sys.modules[OLD_FACADE] is sys.modules[NEW_FACADE]
+# The ``__all__`` of the legacy facade and backend package: the names before the det rename.
+LEGACY_ALL = sorted(["ARCHES", "SUPPORTED_COMPUTE_CAPABILITIES", "route_key", *NAMES])
+
+
+def test_old_facade_is_its_own_module() -> None:
+    assert importlib.import_module(OLD_FACADE) is legacy_facade
+    assert sys.modules[OLD_FACADE] is not sys.modules[NEW_FACADE]
+    assert Path(legacy_facade.__file__).name == "cake_rmsnorm_train.py"
+    assert sorted(legacy_facade.__all__) == LEGACY_ALL
+    for name in legacy_facade.__all__:
+        assert getattr(legacy_facade, name) is getattr(
+            legacy_backend, name
+        ) or name in (
+            "cake_rmsnorm",
+            "cake_rmsnorm_train_backward",
+            "cake_rmsnorm_train_forward",
+        ), name
+    # the det names of the previous module (the det facade itself) resolve to the
+    # det facade's objects, outside ``__all__``
+    for _old, det_name in PAIRS:
+        assert det_name not in legacy_facade.__all__, det_name
+        assert getattr(legacy_facade, det_name) is getattr(facade, det_name), det_name
 
 
 @pytest.mark.parametrize("submodule", SUBMODULES)
-def test_old_package_submodule_is_the_det_module(submodule: str) -> None:
+def test_old_package_submodule_is_its_own_module(submodule: str) -> None:
     old = importlib.import_module(f"{OLD_PACKAGE}.{submodule}")
     new = importlib.import_module(f"{NEW_PACKAGE}.{submodule}")
-    assert old is new, submodule
-    assert sys.modules[f"{OLD_PACKAGE}.{submodule}"] is new, submodule
-    assert Path(new.__file__).parent == Path(backend.__file__).parent, submodule
+    assert old is not new, submodule
+    assert sys.modules[f"{OLD_PACKAGE}.{submodule}"] is old, submodule
+    assert Path(old.__file__).parent == Path(legacy_backend.__file__).parent, submodule
 
 
-def test_old_package_forwards_to_the_det_package() -> None:
-    old = importlib.import_module(OLD_PACKAGE)
-    for name in (*NAMES, *NAMES.values(), "ARCHES", "SUPPORTED_COMPUTE_CAPABILITIES"):
-        assert getattr(old, name) is getattr(backend, name), name
-    assert old.__all__ == backend.__all__
-    # The compatibility package holds Python modules only: no csrc, manifest or libraries.
-    old_dir = Path(old.__file__).parent
-    files = sorted(p.name for p in old_dir.iterdir() if p.name != "__pycache__")
-    assert files == sorted(["__init__.py", *(f"{m}.py" for m in SUBMODULES)])
+def test_old_package_is_self_contained() -> None:
+    assert sorted(legacy_backend.__all__) == LEGACY_ALL
+    # the det names of the previous package (an alias of the det backend) resolve to
+    # the det backend's objects, outside ``__all__``
+    for _old, det_name in PAIRS:
+        assert det_name not in legacy_backend.__all__, det_name
+        assert getattr(legacy_backend, det_name) is getattr(backend, det_name), det_name
+    # its own registry: the forward programs of the det package renamed, the
+    # backward records of its single kernels and of the det pairs it renders
+    modules = legacy_backend.cake_jit.MODULES
+    assert modules and all(name.startswith("cake_rmsnorm_train_") for name in modules)
+    assert all(
+        record["workspace_rule"] is None
+        or record["workspace_rule"]["kind"] in ("claim_sum_f64", "chunk_partials")
+        for record in modules.values()
+    )
+    old_dir = Path(legacy_backend.__file__).parent
+    files = {p.name for p in old_dir.iterdir() if p.name != "__pycache__"}
+    assert {
+        "__init__.py",
+        "cake_build.py",
+        "cake_jit.py",
+        "cake_windows.py",
+        "build.json",
+        "csrc",
+    } <= files
 
 
-def test_old_package_star_import_binds_the_det_objects() -> None:
-    old_names: dict = {}
-    new_names: dict = {}
-    exec(f"from {OLD_PACKAGE} import *", old_names)
-    exec(f"from {NEW_PACKAGE} import *", new_names)
-    del old_names["__builtins__"], new_names["__builtins__"]
-    assert sorted(old_names) == sorted(backend.__all__)
-    for name in backend.__all__:
-        assert old_names[name] is new_names[name] is getattr(backend, name), name
+def test_old_package_star_import_binds_its_own_objects() -> None:
+    names: dict = {}
+    exec(f"from {OLD_PACKAGE} import *", names)
+    del names["__builtins__"]
+    assert sorted(names) == LEGACY_ALL
+    for name in LEGACY_ALL:
+        assert names[name] is getattr(legacy_backend, name), name
 
 
-def test_old_package_dir_lists_the_det_names() -> None:
-    old = importlib.import_module(OLD_PACKAGE)
-    listed = set(dir(old))
-    assert set(dir(backend)) <= listed
-    assert {*NAMES, *NAMES.values(), *SUBMODULES} <= listed
+def test_old_package_dir_lists_its_own_names() -> None:
+    listed = set(dir(legacy_backend))
+    assert set(LEGACY_ALL) | set(SUBMODULES) <= listed
+    assert not set(NAMES.values()) & listed
 
 
 # Each previous import form in a fresh interpreter: the submodule path first, then the attributes of flashinfer,
@@ -148,28 +185,21 @@ FRESH = {
         "import importlib, sys\n"
         f"old = importlib.import_module('{OLD_PACKAGE}.cake_jit')\n"
         f"new = importlib.import_module('{NEW_PACKAGE}.cake_jit')\n"
-        "assert old is new\n"
-        f"assert importlib.import_module('{OLD_PACKAGE}').{PAIRS[0][0]} is importlib.import_module('{NEW_PACKAGE}').{PAIRS[0][1]}\n"
-        f"assert importlib.import_module('{OLD_FACADE}') is importlib.import_module('{NEW_FACADE}')\n"
+        "assert old is not new and old.MODULES is not new.MODULES\n"
+        f"assert importlib.import_module('{OLD_FACADE}') is not importlib.import_module('{NEW_FACADE}')\n"
     ),
     "flashinfer_attributes": (
         "import sys\nimport flashinfer\n"
-        f"assert flashinfer.{OLD_FACADE.rpartition('.')[2]} is flashinfer.{NEW_FACADE.rpartition('.')[2]}\n"
-        f"assert flashinfer.{OLD_FACADE.rpartition('.')[2]} is sys.modules['{NEW_FACADE}']\n"
+        f"assert flashinfer.{OLD_FACADE.rpartition('.')[2]} is sys.modules['{OLD_FACADE}']\n"
         f"assert flashinfer.{OLD_PACKAGE.rpartition('.')[2]} is sys.modules['{OLD_PACKAGE}']\n"
-        f"assert flashinfer.{OLD_PACKAGE.rpartition('.')[2]}.{PAIRS[0][0]} is flashinfer.{NEW_PACKAGE.rpartition('.')[2]}.{PAIRS[0][1]}\n"
-    ),
-    "old_package_registers_submodules": (
-        "import importlib, sys\n"
-        f"importlib.import_module('{OLD_PACKAGE}')\n"
-        f"for s in {SUBMODULES!r}:\n"
-        f"    assert sys.modules['{OLD_PACKAGE}.' + s] is sys.modules['{NEW_PACKAGE}.' + s], s\n"
+        f"assert flashinfer.{PAIRS[0][0]} is sys.modules['{OLD_FACADE}'].{PAIRS[0][0]}\n"
     ),
     "old_package_star_import": (
         "import importlib\n"
         f"from {OLD_PACKAGE} import *\n"
-        f"new = importlib.import_module('{NEW_PACKAGE}')\n"
-        "assert all(globals()[n] is getattr(new, n) for n in new.__all__)\n"
+        f"old = importlib.import_module('{OLD_PACKAGE}')\n"
+        "assert all(globals()[n] is getattr(old, n) for n in old.__all__)\n"
+        "assert 'cake_rmsnorm_det_train_forward' not in globals()\n"
     ),
 }
 

@@ -293,16 +293,17 @@ from .cake_rmsnorm_det_train import (
     cake_rmsnorm_det_train_forward as cake_rmsnorm_det_train_forward,
 )
 
-# The names before the det rename (the same objects).
-from .cake_rmsnorm_det_train import CakeRMSNormFunction as CakeRMSNormFunction
-from .cake_rmsnorm_det_train import cake_rmsnorm as cake_rmsnorm
-from .cake_rmsnorm_det_train import (
+# The names before the det rename: the package with the deterministic default and the
+# opt-in non-deterministic weight gradient (``deterministic=False``).
+from .cake_rmsnorm_train import CakeRMSNormFunction as CakeRMSNormFunction
+from .cake_rmsnorm_train import cake_rmsnorm as cake_rmsnorm
+from .cake_rmsnorm_train import (
     cake_rmsnorm_train_backward as cake_rmsnorm_train_backward,
 )
-from .cake_rmsnorm_det_train import (
+from .cake_rmsnorm_train import (
     cake_rmsnorm_train_backward_workspace_bytes as cake_rmsnorm_train_backward_workspace_bytes,
 )
-from .cake_rmsnorm_det_train import (
+from .cake_rmsnorm_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
 )
 from . import cake_rmsnorm_train as cake_rmsnorm_train

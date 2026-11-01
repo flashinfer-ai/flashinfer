@@ -260,6 +260,7 @@
           - "docs/api/cake_sampling.rst"
           - "docs/api/cake_fused_qk_rope*.rst"
           - "benchmarks/bench_cake_rmsnorm_det_train.py"
+          - "benchmarks/bench_cake_rmsnorm_train.py"
           - "benchmarks/bench_cake_sampling.py"
           - "benchmarks/bench_cake_fused_qk_rope*"
           - "benchmarks/bench_sampling*"
