@@ -4844,6 +4844,71 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_det_train_bwd_slab__dynl__h5120": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dY"],
+            ["buffer", "dU"],
+            ["buffer", "dzp"],
+            ["buffer", "fnTp"],
+            ["buffer", "dX"],
+            ["buffer", "tokp"],
+            ["buffer", "dfn_part"],
+            ["parameter", "T"],
+            ["parameter", "P"],
+            ["parameter", "rpc"],
+            ["buffer", "ticket"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k7_chunks",
+            "kind": "slab_chunks",
+            "slabs": 80,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_det_train_bwd_slab__dynl__h5120",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__dynl__h5120",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228480,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_slab__dynl__h5120",
+        "logical": {
+            "P": "parts",
+            "T": "rows",
+            "X": "x_flat",
+            "dU": "du",
+            "dX": "dx_flat",
+            "dY": "dy_flat",
+            "dfn_part": "dfn_part",
+            "dzp": "dzp_rows",
+            "fnTp": "fnTp",
+            "rpc": "rows_per_chunk",
+            "ticket": "ticket",
+            "tokp": "tokp",
+        },
+        "role": "bwd_slab",
+        "select_rule": {
+            "kind": "program",
+            "program": "dynl",
+            "rule": "bwd_slab_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl__h5120": {
         "arches": [
             "sm_100a",
@@ -6215,6 +6280,71 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_det_train_bwd_slab__dynl__h7168": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dY"],
+            ["buffer", "dU"],
+            ["buffer", "dzp"],
+            ["buffer", "fnTp"],
+            ["buffer", "dX"],
+            ["buffer", "tokp"],
+            ["buffer", "dfn_part"],
+            ["parameter", "T"],
+            ["parameter", "P"],
+            ["parameter", "rpc"],
+            ["buffer", "ticket"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k7_chunks",
+            "kind": "slab_chunks",
+            "slabs": 112,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_det_train_bwd_slab__dynl__h7168",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__dynl__h7168",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228480,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_det_train_bwd_slab__dynl__h7168",
+        "logical": {
+            "P": "parts",
+            "T": "rows",
+            "X": "x_flat",
+            "dU": "du",
+            "dX": "dx_flat",
+            "dY": "dy_flat",
+            "dfn_part": "dfn_part",
+            "dzp": "dzp_rows",
+            "fnTp": "fnTp",
+            "rpc": "rows_per_chunk",
+            "ticket": "ticket",
+            "tokp": "tokp",
+        },
+        "role": "bwd_slab",
+        "select_rule": {
+            "kind": "program",
+            "program": "dynl",
+            "rule": "bwd_slab_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl__h7168": {
         "arches": [
             "sm_100a",
@@ -6771,6 +6901,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_token__dot_ao8__h5120",
             "cake_mhc_det_train_bwd_token__rt64__h5120",
             "cake_mhc_det_train_bwd_slab__xrsg__h5120",
+            "cake_mhc_det_train_bwd_slab__dynl__h5120",
             "cake_mhc_det_train_bwd_slab__dynr__h5120",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl__h5120",
             "cake_mhc_det_train_bwd_reduce__wpu4_spred__h5120",
@@ -6817,6 +6948,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_token__dot_ao8__h7168",
             "cake_mhc_det_train_bwd_token__rt64__h7168",
             "cake_mhc_det_train_bwd_slab__xrsg__h7168",
+            "cake_mhc_det_train_bwd_slab__dynl__h7168",
             "cake_mhc_det_train_bwd_slab__dynr__h7168",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl__h7168",
             "cake_mhc_det_train_bwd_reduce__wpu4_spred__h7168",
@@ -7686,21 +7818,24 @@ K3_TILING = (1, 2)
 K6_CTAS_PER_SM = 2
 
 # H_TABLES: every table above, spelled explicitly for each hidden size other than 4096 and read through
-# ``_tab(name, hidden)`` (the tables above are those of record at H 4096). Each size spells every name of
-# H_TABLE_NAMES; a missing size or table is an error, never the H 4096 value. At H 5120 / 7168 the tables keep only
-# forms bitwise equivalent to their H 4096 siblings whose speed is expected to transfer in every T regime; they are not
-# yet the paired readings of those sizes. The integer sizes follow N = 4 H: the fn split launches H / 16 CTAs of 256
-# threads (H / 8 of 128 threads), the reduction 24 H / dfn_threads dfn CTAs plus its 27 parameter CTAs, the collapse
-# and the residual mixing split a token into H / 1024 sub-tokens of 1024 columns (collapse 2 per CTA; mixing 8 per CTA
-# in "w2" = 32-thread groups, 4 per CTA in "w1" = 64-thread groups), the backward prepare's one-token form has H / 32
-# threads ("t160" / "t224", one token per CTA; "production" is the two-token record), and the token owner holds one
-# 151552-B ring CTA per SM at 7168. K1: the exact "nsx_g2_ol2l" at every T, "nsx_st5_mb1" where the K units fit the
-# SM count, the cost model's P_K (no band). K2: the H 4096 regimes (the per-token work is H-free; P_K enters through
-# k1_units). K6: dot_ao8 (dot_ao8_l2l on sm_107a), the F_A form for R <= 32, no token band. K7: xrsg for T <= 4096 on
-# sm_100a, "dynr" (bitwise xrsg) above it; on sm_103a xrsg for T <= 1535 at 5120 and T <= 1151 at 7168, "dynr" above;
-# xrsg on sm_107a. K8: the H 4096 maps (every form
-# bitwise; P only chooses the speed), pt64 at every T on sm_103a at 7168. K5: the one-token form of the size at every
-# T on sm_100a / sm_103a, on sm_107a the one-token form to 8192 tokens; no persistent band.
+# ``_tab(name, hidden)`` (the tables above are those of record at H 4096). Each size spells every name of H_TABLE_NAMES;
+# a missing size or table is an error, never the H 4096 value. At H 5120 / 7168 the tables keep only forms bitwise
+# equivalent to their H 4096 siblings whose speed is expected to transfer in every T regime; apart from the sm_100a K7
+# bands and K8 P maps below, they are not yet the paired readings of those sizes. The integer sizes follow N = 4 H: the
+# fn split launches H / 16 CTAs of 256 threads (H / 8 of 128 threads), the reduction 24 H / dfn_threads dfn CTAs plus
+# its 27 parameter CTAs, the collapse and the residual mixing split a token into H / 1024 sub-tokens of 1024 columns
+# (collapse 2 per CTA; mixing 8 per CTA in "w2" = 32-thread groups, 4 per CTA in "w1" = 64-thread groups), the backward
+# prepare's one-token form has H / 32 threads ("t160" / "t224", one token per CTA; "production" is the two-token
+# record), and the token owner holds one 151552-B ring CTA per SM at 7168. K1: the exact "nsx_g2_ol2l" at every T,
+# "nsx_st5_mb1" where the K units fit the SM count, the cost model's P_K (no band). K2: the H 4096 regimes (the
+# per-token work is H-free; P_K enters through k1_units). K6: dot_ao8 (dot_ao8_l2l on sm_107a), the F_A form for R <=
+# 32, no token band. K7: on sm_100a per-size token bands to 4096 tokens -- the late-claim form "dynl" (bitwise xrsg)
+# where every sampled T of the band passed on B200 and GB200 in two sessions each (unloaded backward path on B200,
+# kernel sum on GB200, within 1.01 of xrsg's; with a 128-thread side CTA on every SM it completes where xrsg does not),
+# xrsg at the other T --, "dynr" (bitwise xrsg) above 4096; on sm_103a xrsg for T <= 1535 at 5120 and T <= 1151 at 7168,
+# "dynr" above; xrsg on sm_107a. K8: the H 4096 maps except the sm_100a P refinements measured at the size (every form
+# bitwise; P only chooses the speed), pt64 at every T on sm_103a at 7168. K5: the one-token form of the size at every T
+# on sm_100a / sm_103a, on sm_107a the one-token form to 8192 tokens; no persistent band.
 H_TABLE_NAMES = (
     "PK_BANDS", "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS", "FWD_MAP_FIT",
     "FWD_MAP_CLAIM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS",
@@ -7747,7 +7882,16 @@ H_TABLES: dict[int, dict[str, Any]] = {
         "BWD_TOKEN_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
         "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "xrsg"},
         "BWD_SLAB_BANDS": {
-            "sm_100a": ((0, 4096, "xrsg"),),
+            "sm_100a": (
+                (0, 896, "xrsg"),
+                (896, 1920, "dynl"),
+                (1920, 2112, "xrsg"),
+                (2112, 2688, "dynl"),
+                (2688, 2816, "xrsg"),
+                (2816, 3584, "dynl"),
+                (3584, 3648, "xrsg"),
+                (3648, 4096, "dynl"),
+            ),
             "sm_103a": ((0, 1535, "xrsg"),),
             "sm_107a": (),
         },
@@ -7766,9 +7910,13 @@ H_TABLES: dict[int, dict[str, Any]] = {
             "sm_100a": {
                 "s27_wcvt": (
                     ("s27_wcvt_fadd_fshfl", 0, 5),
-                    ("wpu4_spred", 6, 12),
-                    ("wpu4_fadd", 13, 19),
-                    ("wpu4_spred", 20, None),
+                    ("wpu4_spred", 6, 7),
+                    ("wpu4_fadd", 8, 8),
+                    ("wpu4_spred", 9, 13),
+                    ("wpu4_fadd", 14, 19),
+                    ("wpu4_spred", 20, 23),
+                    ("wpu4_fadd", 24, 24),
+                    ("wpu4_spred", 25, None),
                 )
             },
             "sm_103a": {},
@@ -7835,7 +7983,12 @@ H_TABLES: dict[int, dict[str, Any]] = {
         "BWD_TOKEN_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
         "BWD_SLAB_PROGRAM": {"sm_100a": "dynr", "sm_103a": "dynr", "sm_107a": "xrsg"},
         "BWD_SLAB_BANDS": {
-            "sm_100a": ((0, 4096, "xrsg"),),
+            "sm_100a": (
+                (0, 640, "xrsg"),
+                (640, 960, "dynl"),
+                (960, 1024, "xrsg"),
+                (1024, 4096, "dynl"),
+            ),
             "sm_103a": ((0, 1151, "xrsg"),),
             "sm_107a": (),
         },
@@ -7853,9 +8006,9 @@ H_TABLES: dict[int, dict[str, Any]] = {
         "BWD_REDUCE_PARTS": {
             "sm_100a": {
                 "s27_wcvt": (
-                    ("s27_wcvt_fadd_fshfl", 0, 5),
-                    ("wpu4_spred", 6, 12),
-                    ("wpu4_fadd", 13, 19),
+                    ("s27_wcvt_fadd_fshfl", 0, 4),
+                    ("wpu4_spred", 5, 13),
+                    ("wpu4_fadd", 14, 19),
                     ("wpu4_spred", 20, None),
                 )
             },
