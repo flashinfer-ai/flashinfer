@@ -209,18 +209,14 @@ _ROUND_5_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {
 
 
 # Round 6: the POLICY_ROWS cells the convergence-screen tables move (``R2_PERSISTENT_KEY_CELLS``):
-# sm_100a (4096, 4) takes the held nc3 depth-3 K = 4 program; sm_103a (1024, 4) the held packed-add
-# program at 148 SMs and the early packed-add fast-math program at 152 SMs; sm_103a (4096, 5) at 148
-# SMs the held relaxed-producer-wait program; sm_103a (512, 4) at 152 SMs the early depth-3 program.
+# sm_100a (4096, 4) takes the held nc3 depth-3 K = 4 program; sm_103a (1024, 4) the early packed-add
+# fast-math program at 152 SMs (round 26 moves its 148-SM cell, ``_ROUND_26_ROWS``); sm_103a (4096, 5)
+# at 148 SMs the held relaxed-producer-wait program; sm_103a (512, 4) at 152 SMs the early depth-3
+# program.
 _ROUND_6_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {
     ("sm_100a", 4096, 4, 148): (
         "persistent",
         "trtllm_persistent_ws288_nc3_d3_vec128_fp32x2",
-        148,
-    ),
-    ("sm_103a", 1024, 4, 148): (
-        "persistent",
-        "trtllm_persistent_ws288_nc3_d3_vec128_fp32x2_prefix_bf16_add_packed_inputs_prefix_shared_addr",
         148,
     ),
     ("sm_103a", 1024, 4, 152): (
@@ -261,11 +257,18 @@ _ROUND_23_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {
     ),
 }
 
-# Round 24: the sm_103a (512, 4) cell at 148 SMs runs the ``consumer_regs`` 232 pair program.
-_ROUND_24_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {
+# Round 26: the sm_103a (512, 4) cell at 148 SMs (round 24: the ``consumer_regs`` 232 pair program)
+# and the sm_103a (1024, 4) cell at 148 SMs (round 6: the held packed-add depth-3 program) run the
+# packed register carry of the early packed-add fast-math nc3 depth-2 program (``_rcp``).
+_ROUND_26_ROWS: dict[tuple[str, int, int, int], tuple[str, str, int]] = {
     ("sm_103a", 512, 4, 148): (
-        "pair",
-        "pair_ws384_nc2_prefix_bf16_add_fastmath_consumer_regs232_grid148",
+        "persistent",
+        "trtllm_persistent_ws288_nc3_d2_vec128_fp32x2_early_consume_prefix_bf16_add_packed_inputs_prefix_shared_addr_packed_register_carry",
+        128,
+    ),
+    ("sm_103a", 1024, 4, 148): (
+        "persistent",
+        "trtllm_persistent_ws288_nc3_d2_vec128_fp32x2_early_consume_prefix_bf16_add_packed_inputs_prefix_shared_addr_packed_register_carry",
         148,
     ),
 }
@@ -287,7 +290,7 @@ def _expected_at(sm_count: int, grid_x, schedule_id: str) -> tuple[int, str]:
 def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count):
     grid_x, schedule_id = _expected_at(sm_count, grid_x, schedule_id)
     kind, schedule_id, grid_x = (
-        _ROUND_2_ROWS | _ROUND_5_ROWS | _ROUND_6_ROWS | _ROUND_23_ROWS | _ROUND_24_ROWS
+        _ROUND_2_ROWS | _ROUND_5_ROWS | _ROUND_6_ROWS | _ROUND_23_ROWS | _ROUND_26_ROWS
     ).get((arch, M, K, sm_count), (kind, schedule_id, grid_x))
     plan = plan_route(arch, sm_count, M, K, pdl)
     assert plan.kind == kind
@@ -296,10 +299,11 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
     # kernel is always fast-math and spells it ahead of its register and grid suffixes.
     assert plan.schedule_id.removesuffix("_fastmath") == schedule_id
     assert ("_fastmath" in plan.schedule_id) is ("_fm" in plan.kernel_key)
-    # A round-6 exact cell carries its fast-math axis in its table key, not in the fast-math bands.
+    # A round-6 / round-26 exact cell carries its fast-math axis in its table key, not in the
+    # fast-math bands.
     if (
         kind in ("small_m", "persistent")
-        and (arch, M, K, sm_count) not in _ROUND_6_ROWS
+        and (arch, M, K, sm_count) not in _ROUND_6_ROWS | _ROUND_26_ROWS
     ):
         assert plan.schedule_id.endswith("_fastmath") is cb._fast_math(
             arch, M, K, kind, sm_count
@@ -329,9 +333,10 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
         (4096, 2, False),
         (4097, 2, False),
         (6144, 2, False),
-        # K4: the nc5 band M513..1023 + the pow2 cells {2048, 4096}; held at 1024..2047 and above 4096.
-        # Round 24: the (512, 4) cell runs the ``consumer_regs`` 232 pair program
-        # (``test_consumer_regs_pair_cells_take_the_384_thread_programs``).
+        # K4: the nc5 band M513..1023 + the pow2 cells {2048, 4096}; held at 1025..2047 and above 4096.
+        # Round 24 ran the (512, 4) cell on the ``consumer_regs`` 232 pair program; round 26 runs it
+        # on the early packed register-carry program
+        # (``test_packed_register_carry_cells_take_the_packed_programs``).
         (513, 4, True),
         # round 23: the (768, 4) cell runs the ``consumer_regs`` 232 pair program
         # (``test_consumer_regs_pair_cells_take_the_384_thread_programs``); its band neighbours keep
@@ -339,8 +344,9 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
         (767, 4, True),
         (769, 4, True),
         (1023, 4, True),
-        # round 6: the held packed-add depth-3 program at 148 SMs
-        (1024, 4, False),
+        # round 26: the early packed register-carry program at 148 SMs (round 6: the held packed-add
+        # depth-3 program)
+        (1024, 4, True),
         (1025, 4, False),
         (1536, 4, False),
         (2048, 4, True),
@@ -730,7 +736,8 @@ def test_packed_register_carry_cells_take_the_packed_programs():
     ``_packed_register_carry`` ahead of ``_fastmath``.  The K = 3 cells sm_100a (256, 3), (1536, 3)
     and (2048, 3) and sm_103a (256, 3), (512, 3) and (1536, 3) run it at both PDL modes (sm_103a at
     both SM counts); round 23 adds the K = 4 / 5 cells sm_100a (1536, 4) and (512, 5) and sm_103a
-    (1024, 5) at both SM counts; round 25 adds the sm_103a (384, 4) cell at 148 SMs."""
+    (1024, 5) at both SM counts; round 25 adds the sm_103a (384, 4) cell at 148 SMs; round 26 adds
+    the sm_103a (512, 4), (1024, 4) and (512, 5) cells at 148 SMs."""
     cells = (
         [("sm_100a", 148, M, 3) for M in (256, 1536, 2048)]
         + [
@@ -741,6 +748,8 @@ def test_packed_register_carry_cells_take_the_packed_programs():
         + [("sm_100a", 148, 1536, 4), ("sm_100a", 148, 512, 5)]
         + [("sm_103a", sm_count, 1024, 5) for sm_count in SM_COUNTS]
         + [("sm_103a", 148, 384, 4)]
+        + [("sm_103a", 148, M, 4) for M in (512, 1024)]
+        + [("sm_103a", 148, 512, 5)]
     )
     for arch, sm_count, M, K in cells:
         for pdl in (False, True):
@@ -784,8 +793,8 @@ def test_consumer_regs_pair_cells_take_the_384_thread_programs():
     The sm_100a (192, 4), (192, 5) and (192, 8) cells and the sm_103a (192, 4) and (192, 5) cells at
     both SM counts run it at both PDL modes; round 23 adds the sm_100a (768, 4), (768, 5) and
     (256, 8) cells and the sm_103a (768, 4), (256, 5) and (768, 5) cells at both SM counts; round 24
-    adds the sm_100a (512, 4) and (512, 8) cells and the sm_103a (512, 4) cell at 148 SMs.  No cell
-    runs the 320-thread pair program."""
+    adds the sm_100a (512, 4) and (512, 8) cells and the sm_103a (512, 4) cell at 148 SMs, which
+    round 26 moves to the packed register-carry program.  No cell runs the 320-thread pair program."""
     cells = (
         [("sm_100a", 148, 192, K) for K in (4, 5, 8)]
         + [("sm_103a", sm_count, 192, K) for sm_count in SM_COUNTS for K in (4, 5)]
@@ -796,7 +805,6 @@ def test_consumer_regs_pair_cells_take_the_384_thread_programs():
             for M, K in ((768, 4), (256, 5), (768, 5))
         ]
         + [("sm_100a", 148, 512, K) for K in (4, 8)]
-        + [("sm_103a", 148, 512, 4)]
     )
     for arch, sm_count, M, K in cells:
         for pdl in (False, True):
@@ -1364,7 +1372,7 @@ def test_shared_sources_keep_distinct_program_symbols():
     architecture may export one kernel symbol.  Each ``build.json`` entry selects its
     own through ``-DCAKE_PROGRAM_KERNEL``, equal to the symbol its device source
     defines (the literal name, or the macro at the definition with the entry's value),
-    and the 186 records' symbols are distinct per architecture."""
+    and the 184 records' symbols are distinct per architecture."""
     libraries = cake_build.libraries_by_name()
     symbols_by_arch = {}
     for library, entry in libraries.items():
@@ -1494,15 +1502,16 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
 # First token count of every dense route band: the M at which ``plan_route`` changes its kernel
 # key on some architecture, SM count in SM_COUNTS or PDL setting, per K.  The bands follow the
 # route tables (the small-M table and its cluster / chunk / fast-math bands, the round-r5 cells,
-# the round-2 / round-3 / round-6 / round-20 / round-23 / round-24 / round-25 cells (among them the
-# single-cell fast-math cells of K 0), the release bands, the nc / depth edges, the native and pair cells)
+# the round-2 / round-3 / round-6 / round-20 / round-23 / round-24 / round-25 / round-26 cells (among
+# them the single-cell fast-math cells of K 0), the release bands, the nc / depth edges, the native
+# and pair cells)
 # and, for K8 on sm_100a, the SM count itself (the release flips at M = SMs + 1).
 # ``test_gpu_rows_are_the_route_band_starts`` recomputes the set from the tables.
 # fmt: off
 _ROUTE_BAND_START_ROWS = {
     0: (
         1, 9, 12, 13, 16, 17, 24, 25, 32, 33, 48, 49, 64, 65, 96, 97, 128, 129, 192, 193, 256, 257,
-        384, 385, 512, 513, 768, 769,
+        384, 385, 512, 513, 768, 769, 1536, 1537,
     ),
     1: (
         1, 513, 768, 769, 1024, 1025, 1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145,
