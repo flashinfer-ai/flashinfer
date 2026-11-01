@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 from typing import Optional
@@ -208,6 +209,32 @@ def _output(
     return out, output_quant_scale, allocated_scale
 
 
+def _validate_delta(
+    delta: Optional[torch.Tensor],
+    device: torch.device,
+    m: int,
+    n: int,
+    output_format: str,
+) -> None:
+    if delta is None:
+        return
+    if output_format != "bf16":
+        raise ValueError("delta requires bfloat16 output")
+    if (
+        delta.device != device
+        or delta.dtype != torch.bfloat16
+        or tuple(delta.shape) != (m, n)
+        or not delta.is_contiguous()
+        or delta.data_ptr() % 16 != 0
+    ):
+        raise ValueError(
+            f"delta must be a contiguous, 16-byte aligned bfloat16 [{m}, {n}] "
+            f"tensor on {device}"
+        )
+    if n % 8 != 0:
+        raise ValueError("delta requires N to be a multiple of 8")
+
+
 def _overlap_epilogue_supported(config: PrimsTsGemmConfig) -> bool:
     # The SwiGLU store is per 32-column subtile, like the linear one, so it can
     # retire the first subtile early. Packed NVFP4 output is a direct store.
@@ -383,6 +410,7 @@ def _compile(
             scale_c,
             scale_gate,
             qkv_scale,
+            delta,
         ) = args
 
         def compile_kernel():
@@ -408,6 +436,7 @@ def _compile(
                 _adapt(scale_c, 4),
                 _adapt(scale_gate, 4),
                 _adapt(qkv_scale, 4),
+                _adapt(delta, 16),
                 options="--opt-level 2 --enable-tvm-ffi",
             )
 
@@ -443,6 +472,8 @@ def _compile(
                 f"mac{max_active_clusters}",
             )
         )
+        if config.has_delta:
+            kernel_name += "_delta"
         if debug_checks:
             kernel_name += "_dbg"
         compiled = build_and_load_cute_dsl_kernel(
@@ -523,7 +554,10 @@ def _launch(
     scale_c: Optional[torch.Tensor] = None,
     scale_gate: Optional[torch.Tensor] = None,
     qkv_scale: Optional[torch.Tensor] = None,
+    delta: Optional[torch.Tensor] = None,
 ) -> None:
+    if config.has_delta != (delta is not None):
+        raise ValueError("config.has_delta must match whether delta is passed")
     module = _load_kernel(config)
     device = a.device
     max_active_clusters = _max_active_clusters(config, module, device)
@@ -546,6 +580,7 @@ def _launch(
         scale_c,
         scale_gate,
         qkv_scale,
+        delta,
     )
     compiled = _compile(config, module, values)
     compiled(
@@ -567,6 +602,7 @@ def _launch(
         scale_c,
         scale_gate,
         qkv_scale,
+        delta,
     )
 
 
@@ -660,6 +696,7 @@ class PreparedFp4Linear:
             or self.config.head_dim != head_dim
             or self.config.is_neox != is_neox
             or self.config.has_qkv_scale != (qkv_scale is not None)
+            or self.config.has_delta
         ):
             raise ValueError("config does not match the prepared NVFP4 projection")
         self.device = device
@@ -679,6 +716,7 @@ class PreparedFp4Linear:
         self._max_active_clusters = _max_active_clusters(
             self.config, self._module, device
         )
+        self._delta_variant = None
 
         # Retain static tensor owners for the prepared projection.
         self.weight_packed = weight_packed
@@ -724,6 +762,7 @@ class PreparedFp4Linear:
         cos_sin: Optional[torch.Tensor] = None,
         positions: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
+        delta: Optional[torch.Tensor] = None,
     ):
         """Launch the prepared projection for one activation."""
         if (
@@ -775,6 +814,7 @@ class PreparedFp4Linear:
                 or tuple(positions.shape) != (m,)
             ):
                 raise ValueError("positions has an invalid prepared-QKV contract")
+        _validate_delta(delta, self.device, m, self.n, self.output_format)
 
         c, _, _ = _output(
             self.device,
@@ -819,6 +859,7 @@ class PreparedFp4Linear:
                 scale_c=self._scale_c_tensor,
                 scale_gate=self._scale_gate_tensor,
                 qkv_scale=self.qkv_scale,
+                delta=delta,
             )
             if self.output_format == "nvfp4_e2m1":
                 if self._return_quant_scale:
@@ -826,6 +867,12 @@ class PreparedFp4Linear:
                 return c, sf_c
             return c
 
+        config, module = self.config, self._module
+        if delta is not None:
+            if self._delta_variant is None:
+                delta_config = replace(self.config, has_delta=True)
+                self._delta_variant = (delta_config, _load_kernel(delta_config))
+            config, module = self._delta_variant
         values = (
             a_packed,
             self.weight_packed,
@@ -845,8 +892,9 @@ class PreparedFp4Linear:
             self._scale_c_tensor,
             self._scale_gate_tensor,
             self.qkv_scale,
+            delta,
         )
-        compiled = _compile(self.config, self._module, values)
+        compiled = _compile(config, module, values)
         compiled(
             a_packed,
             self.weight_packed,
@@ -866,6 +914,7 @@ class PreparedFp4Linear:
             self._scale_c_tensor,
             self._scale_gate_tensor,
             self.qkv_scale,
+            delta,
         )
         if self.output_format == "nvfp4_e2m1":
             if self._return_quant_scale:
@@ -1012,6 +1061,7 @@ def _fp8(
     qkv_scale: Optional[torch.Tensor] = None,
     config: Optional[PrimsTsGemmConfig] = None,
     op_name: str = "prims_ts_fp8_linear",
+    delta: Optional[torch.Tensor] = None,
 ):
     device = _validate_cuda_tensors(
         a,
@@ -1026,6 +1076,7 @@ def _fp8(
         out,
         output_quant_scale,
         qkv_scale,
+        delta,
     )
     if a.dtype != _FP8 or weight.dtype != _FP8 or a.ndim != 2 or weight.ndim != 2:
         raise ValueError("a and weight must be rank-2 torch.float8_e4m3fn tensors")
@@ -1058,6 +1109,7 @@ def _fp8(
         is_neox=is_neox,
         qkv_scale=qkv_scale,
     )
+    _validate_delta(delta, device, m, n, fmt)
     c, qscale, allocated_scale = _output(
         device, m, logical_n, fmt, out, output_quant_scale
     )
@@ -1088,7 +1140,7 @@ def _fp8(
                 "of this fp8 GEMM invocation"
             )
         _launch(
-            config,
+            replace(config, has_delta=delta is not None),
             a,
             weight,
             c,
@@ -1103,6 +1155,7 @@ def _fp8(
             scale_c=qscale,
             scale_gate=scale_gate,
             qkv_scale=qkv_scale,
+            delta=delta,
         )
     else:
         from .runner import launch_dense_gemm
@@ -1122,6 +1175,7 @@ def _fp8(
             scale_c=qscale,
             scale_gate=scale_gate,
             qkv_scale=qkv_scale,
+            delta=delta,
             **identity,
         )
     if allocated_scale:
@@ -1149,6 +1203,7 @@ def _fp4(
     is_neox: Optional[bool] = None,
     qkv_scale: Optional[torch.Tensor] = None,
     op_name: str = "prims_ts_fp4_linear",
+    delta: Optional[torch.Tensor] = None,
 ):
     device = _validate_cuda_tensors(
         a_packed,
@@ -1163,6 +1218,7 @@ def _fp4(
         out,
         output_quant_scale,
         qkv_scale,
+        delta,
     )
     if (
         a_packed.dtype != torch.uint8
@@ -1201,6 +1257,7 @@ def _fp4(
         is_neox=is_neox,
         qkv_scale=qkv_scale,
     )
+    _validate_delta(delta, device, m, n, fmt)
     c, qscale, allocated_scale = _output(
         device, m, logical_n, fmt, out, output_quant_scale
     )
@@ -1241,6 +1298,7 @@ def _fp4(
         scale_c=scale_c,
         scale_gate=scale_gate,
         qkv_scale=qkv_scale,
+        delta=delta,
     )
     if allocated_scale:
         qscale = _caller_unit_scale(device)
@@ -1264,6 +1322,7 @@ def fp8_linear(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    delta=None,
 ):
     """FP8 ``[M, K]`` times ``[N, K]`` with per-token and per-channel scales.
 
@@ -1288,6 +1347,9 @@ def fp8_linear(
             tensor; writing it does not change later calls.
         out: Optional preallocated output. BF16 shape is ``[M, N]``. FP8
             shape is ``[M, N]``.
+        delta: Optional bfloat16 ``[M, N]`` tensor added to the
+            dequantized GEMM result before the output conversion. Requires bfloat16
+            output.
 
     Returns:
         The output tensor. When ``out_dtype`` is FP8 and
@@ -1306,6 +1368,7 @@ def fp8_linear(
         qkv_scale=qkv_scale,
         config=config,
         op_name="prims_ts_fp8_linear",
+        delta=delta,
     )
 
 
@@ -1322,6 +1385,7 @@ def fp8_linear_swiglu(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    delta=None,
 ):
     """FP8 fused linear and SwiGLU with per-token and per-channel scales.
 
@@ -1345,6 +1409,9 @@ def fp8_linear_swiglu(
             the kernel uses ``1`` and the returned scale is a separate
             tensor; writing it does not change later calls.
         out: Optional preallocated output of shape ``[M, N / 2]``.
+        delta: Optional bfloat16 ``[M, N]`` tensor added to the
+            dequantized GEMM result before SwiGLU, in the interleaved weight-row
+            order. Requires bfloat16 output.
 
     Returns:
         The output tensor. When ``out_dtype`` is FP8 and
@@ -1362,6 +1429,7 @@ def fp8_linear_swiglu(
         out,
         config=config,
         op_name="prims_ts_fp8_swiglu",
+        delta=delta,
     )
 
 
@@ -1386,6 +1454,7 @@ def fp8_qkv_qknorm_rope(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    delta=None,
 ):
     """FP8 QKV projection with QK RMSNorm and RoPE.
 
@@ -1423,6 +1492,9 @@ def fp8_qkv_qknorm_rope(
             the kernel uses ``1`` and the returned scale is a separate
             tensor; writing it does not change later calls.
         out: Optional preallocated output of shape ``[M, N]``.
+        delta: Optional bfloat16 ``[M, N]`` tensor added to the
+            dequantized GEMM result before QK RMSNorm and RoPE. Requires bfloat16
+            output.
 
     Returns:
         The output tensor. When ``out_dtype`` is FP8 and
@@ -1453,6 +1525,7 @@ def fp8_qkv_qknorm_rope(
         qkv_scale,
         config,
         op_name="prims_ts_fp8_qkv",
+        delta=delta,
     )
 
 
@@ -1470,6 +1543,7 @@ def fp4_linear(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    delta=None,
 ):
     """Packed NVFP4 ``[M, K]`` times ``[N, K]``.
 
@@ -1493,6 +1567,9 @@ def fp4_linear(
             the kernel uses ``1`` and the returned scale is a separate
             tensor; writing it does not change later calls.
         out: Optional preallocated output of shape ``[M, N]``.
+        delta: Optional bfloat16 ``[M, N]`` tensor added to the
+            dequantized GEMM result before the output conversion. Requires bfloat16
+            output.
 
     Returns:
         The output tensor. When ``out_dtype`` is FP8 and
@@ -1511,6 +1588,7 @@ def fp4_linear(
         output_quant_scale,
         out,
         op_name="prims_ts_fp4_linear",
+        delta=delta,
     )
 
 
@@ -1528,6 +1606,7 @@ def fp4_linear_swiglu(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    delta=None,
 ):
     """Packed NVFP4 fused linear and SwiGLU.
 
@@ -1552,6 +1631,9 @@ def fp4_linear_swiglu(
             separate tensor; writing it does not change later calls.
         out: Optional preallocated output. BF16 and FP8 shape is
             ``[M, N / 2]``. Packed NVFP4 shape is ``[M, N / 4]``.
+        delta: Optional bfloat16 ``[M, N]`` tensor added to the
+            dequantized GEMM result before SwiGLU, in the interleaved weight-row
+            order. Requires bfloat16 output.
 
     Returns:
         The output tensor. FP8 output with no ``output_quant_scale``
@@ -1572,6 +1654,7 @@ def fp4_linear_swiglu(
         output_quant_scale,
         out,
         op_name="prims_ts_fp4_swiglu",
+        delta=delta,
     )
 
 
@@ -1597,6 +1680,7 @@ def fp4_qkv_qknorm_rope(
     out_dtype=torch.bfloat16,
     output_quant_scale=None,
     out=None,
+    delta=None,
 ):
     """Packed NVFP4 QKV projection with QK RMSNorm and RoPE.
 
@@ -1630,6 +1714,9 @@ def fp4_qkv_qknorm_rope(
         output_quant_scale: Not used. Quantized output is not supported
             for this epilogue.
         out: Optional preallocated ``[M, N]`` bfloat16 output.
+        delta: Optional bfloat16 ``[M, N]`` tensor added to the
+            dequantized GEMM result before QK RMSNorm and RoPE. Requires bfloat16
+            output.
 
     Returns:
         The ``[M, N]`` bfloat16 output tensor.
@@ -1662,4 +1749,5 @@ def fp4_qkv_qknorm_rope(
         is_neox,
         qkv_scale,
         op_name="prims_ts_fp4_qkv",
+        delta=delta,
     )
