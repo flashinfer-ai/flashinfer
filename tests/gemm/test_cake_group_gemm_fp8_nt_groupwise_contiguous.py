@@ -977,6 +977,8 @@ BLOCK_SCALED_CASES = [
     ([100, 0, 3, 69, 128, 200, 1, 64], 256, 512, 64),
     ([5, 33, 0, 0, 97, 32, 1, 129], 1024, 256, 32),
     ([200, 150, 0, 97, 32, 1, 129, 70], 1024, 512, 32),
+    ([5, 129, 0, 64, 33, 1, 70, 31], 1024, 512, 64),
+    ([40, 0, 33, 97, 1, 64, 0, 31, 50, 32, 70, 3, 0, 129, 15, 20], 256, 1536, 32),
     ([95, 97, 2, 193, 0, 100], 384, 128, 96),
     ([100, 0, 3, 69, 64, 129, 1, 97], 1024, 1024, 64),
     ([200, 150, 0, 97, 64, 1, 129, 300], 1024, 1024, 64),
@@ -1488,7 +1490,9 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
     small = functools.partial(bs_swap_small_route, arch="sm_103a")
     rule = functools.partial(bs_swap_route_for_shape, num_groups=8, arch="sm_103a")
     assert sorted(BS_SWAP_SM103_SMALL_ADMIT) == [
+        (896, 1024, 512, 64),
         (1024, 1024, 512, 32),
+        (1152, 256, 1536, 32),
         (1664, 384, 128, 128),
     ]
     for m, n, k, alignment in BS_SWAP_SM103_SMALL_ADMIT:
@@ -1500,10 +1504,10 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
                 BS_SWAP_C1_ROUTE
             )
         assert small(m, n, k, alignment=alignment, sm_count=None) is None
-        # sm_100a does not read the table: 156 and 256 tiles exceed 3 * 40.
+        # sm_100a does not read the table: 72, 156, 224 and 256 tiles exceed 3 * 20.
         assert (
             bs_swap_small_route(
-                m, n, k, alignment=alignment, arch="sm_100a", sm_count=40
+                m, n, k, alignment=alignment, arch="sm_100a", sm_count=20
             )
             is None
         )
@@ -1511,6 +1515,25 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
     for m, k in ((1536, 128), (1792, 128), (1664, 256)):
         assert rule(m, 384, k, alignment=128, sm_count=152) is None
     assert rule(1664, 384, 128, alignment=128) is None
+    # The other layouts' neighbours keep the 32-row-block program.
+    for m, k, alignment in (
+        (768, 512, 64),
+        (1024, 512, 64),
+        (896, 1024, 64),
+        (896, 512, 32),
+    ):
+        assert rule(m, 1024, k, alignment=alignment, sm_count=152) == (
+            BS_SWAP_RP32_ROUTE
+        )
+    for m, k, alignment in (
+        (1024, 1536, 32),
+        (1280, 1536, 32),
+        (1152, 1024, 32),
+        (1152, 1536, 64),
+    ):
+        assert rule(m, 256, k, alignment=alignment, sm_count=152) == (
+            BS_SWAP_RP32_ROUTE
+        )
     # One CTA per 32 x 128 tile: 52 * 3 = 156 tiles on 152 SMs.
     plan = functools.partial(
         launch_plan, scalar_output=False, block_scaled=True, sm_count=152
@@ -1520,6 +1543,11 @@ def test_block_scaled_swap_small_block_admit_on_sm_103a():
     # 32 * 8 = 256 tiles on 152 SMs.
     route, grid = plan(1024, 1024, 512, alignment=32, num_groups=8, arch="sm_103a")
     assert route == BS_SWAP_C1_ROUTE and grid == (152, 1, 1)
+    # 28 * 8 = 224 tiles on 152 SMs; 36 * 2 = 72 tiles.
+    route, grid = plan(896, 1024, 512, alignment=64, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (152, 1, 1)
+    route, grid = plan(1152, 256, 1536, alignment=32, num_groups=16, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (72, 1, 1)
 
 
 def test_block_scaled_swap_bm64_admit_on_sm_103a():
