@@ -99,7 +99,7 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
 * ``deterministic=False`` runs the standalone non-deterministic package
   (``flashinfer.cake_rmsnorm_silu_gate_train_backend``, whose compute and
   workspace entry points take ``deterministic=False`` only): the same forward
-  kernel (on SM100 and SM103 from 2400 rows per SM, a forward whose CTAs each
+  kernel (on SM100 and SM103 from 976 rows per SM, a forward whose CTAs each
   walk several row blocks: the same bits) and a one-kernel backward: ``dx``
   and ``dz`` are the deterministic backward's bits, and the CTAs take row
   blocks (each CTA its own block when
