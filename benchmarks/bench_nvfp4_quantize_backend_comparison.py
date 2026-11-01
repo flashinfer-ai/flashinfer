@@ -33,6 +33,12 @@ Usage:
     # Run only a subset of layouts (comma-separated)
     python bench_nvfp4_quantize_backend_comparison.py --layouts swizzled_128x4,swizzled_8x4
 
+    # Repeat one shape with CUDA graphs and export every timing sample in ms
+    python bench_nvfp4_quantize_backend_comparison.py \
+        --m-values 1024 --k-values 7168 --layouts swizzled_128x4 \
+        --num-iters 1000 --dry-run-iters 100 --cuda-graph --seed 42 \
+        --csv-output nvfp4_timings.csv --no-heatmap
+
     # Compare per-token MSE 4over6 with quantizer fast math disabled
     FLASHINFER_NVFP4_4OVER6=1 \
     FLASHINFER_NVFP4_4OVER6_ERR_MODE=MSE \
@@ -48,9 +54,12 @@ Requirements:
 """
 
 import argparse
+import csv
 import numpy as np
 import os
 import torch
+import warnings
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 from flashinfer import SfLayout
@@ -91,7 +100,7 @@ def get_cc():
 
 def _run_nvfp4_quantize(
     x: torch.Tensor,
-    global_sf: torch.Tensor,
+    global_sf: torch.Tensor | float,
     sf_layout: SfLayout,
     backend: str,
     per_token_activation: bool,
@@ -122,6 +131,7 @@ def verify_nvfp4_correctness(
     sf_layout: SfLayout,
     per_token_activation: bool,
     nvfp4_4over6_config: NVFP44Over6Config | None,
+    seed: int = 42,
 ) -> Tuple[bool, str, float, float]:
     """
     Verify that both backends produce correct outputs.
@@ -138,7 +148,7 @@ def verify_nvfp4_correctness(
 
     is_sf_swizzled_layout, is_sf_8x4_layout = _sf_layout_flags(sf_layout)
 
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
     x = torch.randn(m, k, device="cuda", dtype=dtype)
     global_sf = make_nvfp4_global_scale(
         x,
@@ -264,6 +274,11 @@ def bench_nvfp4_quantize(
     backend: str,
     per_token_activation: bool,
     nvfp4_4over6_config: NVFP44Over6Config | None,
+    dry_run_iters: int = 5,
+    repeat_iters: int = 30,
+    use_cuda_graph: bool = False,
+    seed: int = 42,
+    csv_output: str | None = None,
 ) -> float:
     """
     Benchmark NVFP4 quantization for a specific configuration.
@@ -271,12 +286,17 @@ def bench_nvfp4_quantize(
     Returns:
         Median execution time in milliseconds
     """
+    # Give each backend identical inputs, independent of sweep/backend order.
+    torch.manual_seed(seed)
     x = torch.randn(m, k, device="cuda", dtype=dtype)
     global_sf = make_nvfp4_global_scale(
         x,
         per_token_activation=per_token_activation,
         nvfp4_4over6_config=nvfp4_4over6_config,
     )
+    if per_token_activation and backend == "cuda":
+        # This API takes a host scalar; avoid a device .item() during capture.
+        global_sf = float(global_sf.item())
 
     def run_kernel():
         _run_nvfp4_quantize(x, global_sf, sf_layout, backend, per_token_activation)
@@ -284,14 +304,53 @@ def bench_nvfp4_quantize(
     # Warmup, including any JIT compilation before timing starts.
     run_kernel()
 
-    times = bench_gpu_time(
-        fn=run_kernel,
-        enable_cupti=True,
-        dry_run_iters=5,
-        repeat_iters=30,
-        cold_l2_cache=True,
-        use_cuda_graph=False,
-    )
+    with warnings.catch_warnings():
+        if use_cuda_graph:
+            # The event fallback cannot flush L2 between replays of this closure.
+            warnings.filterwarnings(
+                "error",
+                message=r"(?s).*Falling back to CUDA events for benchmarking\.",
+                category=UserWarning,
+            )
+        times = bench_gpu_time(
+            fn=run_kernel,
+            enable_cupti=True,
+            dry_run_iters=dry_run_iters,
+            repeat_iters=repeat_iters,
+            cold_l2_cache=True,
+            use_cuda_graph=use_cuda_graph,
+        )
+
+    if csv_output is not None:
+        metadata = {
+            "m": m,
+            "k": k,
+            "dtype": str(dtype),
+            "layout": next(
+                name for name, layout in LAYOUTS_BY_NAME.items() if layout == sf_layout
+            ),
+            "backend": backend,
+            "mode": mode_label(per_token_activation, nvfp4_4over6_config),
+            "seed": seed,
+            "dry_run_iters": dry_run_iters,
+            "num_iters": repeat_iters,
+            "use_cuda_graph": use_cuda_graph,
+            "cold_l2_cache": True,
+            # Eager timing can fall back to events, which also flush L2.
+            "requested_timer": "cupti",
+        }
+        for name in (*NVFP4_QUANT_ENV_VARS, "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH"):
+            metadata[name] = os.environ.get(name, "<unset>")
+        with open(csv_output, "a", newline="") as output:
+            writer = csv.DictWriter(
+                output, fieldnames=(*metadata, "sample_index", "time_ms")
+            )
+            if output.tell() == 0:
+                writer.writeheader()
+            writer.writerows(
+                dict(metadata, sample_index=index, time_ms=float(time_ms))
+                for index, time_ms in enumerate(times, start=1)
+            )
 
     return np.median(times)
 
@@ -338,6 +397,7 @@ def run_bandwidth_sweep(
     layout_label: str,
     per_token_activation: bool,
     nvfp4_4over6_config: NVFP44Over6Config | None,
+    **benchmark_options,
 ) -> Dict[Tuple[int, int], float]:
     """Run bandwidth benchmark sweep for CuTe-DSL backend only."""
     bandwidth_results = {}
@@ -363,6 +423,7 @@ def run_bandwidth_sweep(
                 backend="cute-dsl",
                 per_token_activation=per_token_activation,
                 nvfp4_4over6_config=nvfp4_4over6_config,
+                **benchmark_options,
             )
 
             bandwidth = compute_bandwidth_tb_per_sec(
@@ -383,6 +444,7 @@ def run_benchmark_sweep(
     layout_label: str,
     per_token_activation: bool,
     nvfp4_4over6_config: NVFP44Over6Config | None,
+    **benchmark_options,
 ) -> Tuple[Dict[Tuple[int, int], float], Dict[Tuple[int, int], float]]:
     """Run benchmark sweep for both backends with inline correctness verification."""
     cuda_times = {}
@@ -418,6 +480,7 @@ def run_benchmark_sweep(
                 sf_layout,
                 per_token_activation=per_token_activation,
                 nvfp4_4over6_config=nvfp4_4over6_config,
+                seed=benchmark_options.get("seed", 42),
             )
             if not success:
                 failures.append((m, k, verify_msg))
@@ -433,6 +496,7 @@ def run_benchmark_sweep(
                 backend="cuda",
                 per_token_activation=per_token_activation,
                 nvfp4_4over6_config=nvfp4_4over6_config,
+                **benchmark_options,
             )
             cuda_times[(m, k)] = cuda_time
 
@@ -445,6 +509,7 @@ def run_benchmark_sweep(
                 backend="cute-dsl",
                 per_token_activation=per_token_activation,
                 nvfp4_4over6_config=nvfp4_4over6_config,
+                **benchmark_options,
             )
             cute_dsl_times[(m, k)] = cute_dsl_time
 
@@ -719,7 +784,46 @@ def main():
         action="store_true",
         help="Benchmark NVFP4 per-token activation quantization.",
     )
+    parser.add_argument(
+        "--m-values", type=int, nargs="+", help="Row counts (default: built-in sweep)."
+    )
+    parser.add_argument(
+        "--k-values",
+        type=int,
+        nargs="+",
+        help="Column counts (default: built-in sweep).",
+    )
+    parser.add_argument(
+        "--num-iters", type=int, default=30, help="Measured iterations (default: 30)."
+    )
+    parser.add_argument(
+        "--dry-run-iters", type=int, default=5, help="Warmup iterations (default: 5)."
+    )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Capture and replay each call in a CUDA graph (requires CUPTI >= 13).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Input seed, reset for each backend (default: 42).",
+    )
+    parser.add_argument(
+        "--csv-output",
+        help="Write every timing sample and configuration to this CSV file.",
+    )
+    parser.add_argument(
+        "--no-heatmap", action="store_true", help="Skip heatmap generation."
+    )
     args = parser.parse_args()
+    if args.num_iters <= 0 or args.dry_run_iters < 0:
+        parser.error(
+            "--num-iters must be positive and --dry-run-iters must be nonnegative"
+        )
+    if any(value <= 0 for value in (args.m_values or []) + (args.k_values or [])):
+        parser.error("--m-values and --k-values must contain positive integers")
     nvfp4_4over6_config = current_nvfp4_4over6_config()
 
     selected_layouts: List[str] = []
@@ -737,6 +841,11 @@ def main():
     if not selected_layouts:
         print("ERROR: --layouts produced an empty selection")
         return
+    k_alignment = 64 if any(name != "linear" for name in selected_layouts) else 16
+    if any(value % k_alignment for value in args.k_values or []):
+        parser.error(
+            f"--k-values must be divisible by {k_alignment} for the selected layouts"
+        )
 
     # Check compute capability
     cc = get_cc()
@@ -756,7 +865,7 @@ def main():
     # - Swizzled layout: K must be a multiple of 64 because K/16 (SF blocks
     #   per row) must be a multiple of 4 for the swizzled padding
     # We use K values that satisfy both constraints (multiples of 64)
-    m_values = [
+    m_values = args.m_values or [
         1,
         2,
         4,
@@ -780,7 +889,7 @@ def main():
         16384,
         32768,
     ]
-    k_values = [
+    k_values = args.k_values or [
         128,
         256,
         384,
@@ -800,6 +909,19 @@ def main():
 
     print(f"\nM values: {m_values}")
     print(f"K values: {k_values}")
+    print(
+        f"Timing: CUPTI requested, CUDA graph={args.cuda_graph}, cold L2=True, "
+        f"warmup={args.dry_run_iters}, iterations={args.num_iters}, seed={args.seed}"
+    )
+    benchmark_options = {
+        "dry_run_iters": args.dry_run_iters,
+        "repeat_iters": args.num_iters,
+        "use_cuda_graph": args.cuda_graph,
+        "seed": args.seed,
+        "csv_output": args.csv_output,
+    }
+    if args.csv_output is not None:
+        Path(args.csv_output).write_text("")
     print(
         "Mode: "
         + mode_label(
@@ -832,10 +954,13 @@ def main():
                 layout_name,
                 per_token_activation=args.per_token_activation,
                 nvfp4_4over6_config=nvfp4_4over6_config,
+                **benchmark_options,
             )
             print_bandwidth_summary_table(
                 m_values, k_values, bandwidth, f"{layout_name} layout"
             )
+            if args.no_heatmap:
+                continue
             create_bandwidth_heatmap(
                 m_values,
                 k_values,
@@ -872,6 +997,7 @@ def main():
                 layout_name,
                 per_token_activation=args.per_token_activation,
                 nvfp4_4over6_config=nvfp4_4over6_config,
+                **benchmark_options,
             )
             print_summary_table(
                 m_values,
@@ -880,6 +1006,8 @@ def main():
                 cute_dsl_times,
                 f"{layout_name} layout",
             )
+            if args.no_heatmap:
+                continue
             create_heatmap(
                 m_values,
                 k_values,

@@ -14,11 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Experimental Cake backend: the GLM-5.2 dense projection GEMMs for training
-# (BF16 operands, FP32 accumulation, BF16 or FP32 output, strided views, ragged
-# token counts, batched head projections) and the FP32 router-gate GEMM through
-# split-BF16x3 tensor-core emulation, on SM100 / SM103 / SM107
-# (flashinfer-ai/flashinfer#5677).  Host planning, argument-plan binding, the
-# prepared allocation-free launches, the eager entry points, JIT registration
-# and the generated sources live in this package; there is no core entry point
-# yet (importing this package is the explicit opt-in).
+# Former import path of ``flashinfer.experimental.dense_projection_det_gemm``: the package was renamed.  Its modules
+# keep answering under this path as the renamed package's own module objects (one registry, one set of caches and
+# loaded libraries), so a former import names the same objects.
+import importlib
+import sys
+
+from flashinfer.experimental.dense_projection_det_gemm import *  # noqa: F401,F403
+
+for _name in ("cake_backend", "cake_jit", "cake_build"):
+    _module = importlib.import_module(
+        f"flashinfer.experimental.dense_projection_det_gemm.{_name}"
+    )
+    sys.modules[f"{__name__}.{_name}"] = _module
+    globals()[_name] = _module
+del _name, _module

@@ -26,9 +26,10 @@ and TAIL is the one-time cleanup and drain after LOOP exits.
 
 VC-Attention is the low-bit attention recipe of Li et al. 2026, arXiv
 2609.15810, value smoothing with a softmax cast. Names with the ``vc`` prefix
-belong to that recipe. E4M3 V is stored as residuals around each 128-token
-tile mean. The kernel restores the means inside the online softmax as
-``O += sum_t rowsum(P_t) * mu_t``, one bf16 K=16 UMMA step
+belong to its recipes, QK16 with bf16 Q and K and QK8 with centred, Hadamard
+rotated E4M3 Q and K under block scales, both with E4M3 V stored as residuals
+around each 128-token tile mean. The kernel restores the means inside the
+online softmax as ``O += sum_t rowsum(P_t) * mu_t``, one bf16 K=16 UMMA step
 per group of sixteen tiles, and casts the probabilities straight to E4M3
 codes. ``vc_resources`` holds the mean operand ring and the cast helpers.
 
@@ -73,6 +74,7 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional, TypeAlias
 
+from ..separate_reduction import merge_log2_lse
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int16, Int32, Int64
@@ -90,43 +92,48 @@ from cutlass.experimental.task_scheduling.resources import (
 from cutlass.experimental.task_scheduling.resources import consumer_work, producer_work
 
 
-_SUPPORTED_CONTEXT_PAGE_SIZES = (16, 32, 64, 128)
+_SUPPORTED_CONTEXT_PAGE_SIZES = (4, 8, 16, 32, 64, 128)
 from cutlass.pipeline import PipelineAsync, PipelineState
 from cutlass.cutlass_dsl import Boolean, Constexpr, dsl_user_op, if_generate
 
 from ..placeholder_helpers import _placeholder_smem_array, _placeholder_tmem_ptr
 from ...vc_attention import VC_MEAN_GROUP_TILES, VC_MEAN_MMA_K, VC_MEAN_OPERANDS
 from ..fmha_decode.fmha_decode_resources.helpers_common import _placeholder_local_array
-from .vc_resources import (
+from .vc_attention.vc_resources import (
     E4M3_CODES_PER_OCTAVE,
     VC_EXPCAST_CODE_BIAS,
     VC_MEAN_TILE_LBO,
     VC_MEAN_TILE_SBO,
 )
+from .vc_attention.vc_scales import VCKScaleTable, vc_flat_k_base, vc_flat_q_slot
 from ..tcgen05_compat import tcgen05_ld_32x32b_max
 from ...sage.int32_scores import (
     INT32_SCORE_BIAS,
-    fill_score_seed_tile,
-    issue_score_seed_mma,
-    score_seed_tile_bytes,
-    score_seed_words,
+    fill_sage_score_seed_tile,
+    issue_sage_score_seed_mma,
+    sage_score_seed_tile_bytes,
+    sage_score_seed_words,
 )
-from ...sage.index import sage_section_word, sage_sequence_words
+from ...sage.index import load_sage_q_scale, sage_section_word, sage_sequence_words
 from ...sage.layout import _FLOAT4_WORDS, _SageScaleLayout
 from ...sage.modes import SageKTransport, SageScoreScaling
 from .helpers import (
+    add_f16x2_to_f32x2,
+    _resolve_kv_tile_idx_context,
     bottom_right_window_left_bound,
     bottom_right_window_tile_start,
+    exp2_f16x2_word,
     expcast_e4m3_quad_relu,
     f16x2_sum4,
+    f16x2_to_f32x2,
     freeze_smem_descriptor,
+    pack_f16x2x2_to_fp8_e4m3,
     split_bf16_hi_lo_word,
     variable_window_cta_min_start,
 )
 from .sage_scales import (
     SAGE_SCORE_BLOCK_COLS,
     load_sage_k_tile,
-    load_sage_q_scale,
     load_sage_v_channels,
     prefetch_sage_k_tile,
     sage_k_block_word,
@@ -143,6 +150,9 @@ SmemDescOffsets: TypeAlias = tuple[int, int]
 TmemAddr: TypeAlias = int | Int32
 TmemPtr: TypeAlias = cutlass.Array
 
+# Keep masked scores finite: an all-masked tile must not form inf - inf.
+_SOFTMAX_MASK_VALUE = -3.4028234663852886e38  # -FLT_MAX, bits 0xff7fffff
+
 SoftmaxScalar: TypeAlias = Float32
 SoftmaxChunk: TypeAlias = cutlass.Vector
 SoftmaxChunks: TypeAlias = list[SoftmaxChunk]
@@ -158,6 +168,18 @@ _tmem_sp_pwords: dict[int, tuple] = {}
 # and the fp32 tile row sum carried from exp2_p to store_p.
 _tmem_sp_tile_scale: dict[int, Any] = {}
 _tmem_sp_tile_sum: dict[int, Any] = {}
+
+
+@cute.jit
+def _softmax_exp2_bias(row_max: Float32, scale: Float32, p_scale: Float32) -> Float32:
+    """Use a zero exponent anchor for masked rows without changing their max."""
+    return Float32(
+        cutlass.select_(
+            row_max == Float32(_SOFTMAX_MASK_VALUE),
+            p_scale,
+            (Float32(0.0) - row_max) * scale + p_scale,
+        )
+    )
 
 
 @cute.jit
@@ -196,10 +218,10 @@ def _mask_score_quad(
             setp.ne.u32 valid2, bit, 0;
             and.b32 bit, {$r0}, 0x8;
             setp.ne.u32 valid3, bit, 0;
-            @!valid0 mov.b32 {$w0}, 0xff800000;
-            @!valid1 mov.b32 {$w1}, 0xff800000;
-            @!valid2 mov.b32 {$w2}, 0xff800000;
-            @!valid3 mov.b32 {$w3}, 0xff800000;
+            @!valid0 mov.b32 {$w0}, 0xff7fffff;
+            @!valid1 mov.b32 {$w1}, 0xff7fffff;
+            @!valid2 mov.b32 {$w2}, 0xff7fffff;
+            @!valid3 mov.b32 {$w3}, 0xff7fffff;
         }
         """,
         write_only_types=[Float32, Float32, Float32, Float32],
@@ -225,46 +247,6 @@ def _pack_float4_to_fp8_e4m3(
         }""",
         write_only_types=[Int32],
         read_only_args=[v0, v1, v2, v3],
-    )
-
-
-@cute.jit
-def _f32_bits(x: Float32) -> Int32:
-    return cutlass.Vector.from_elements((x,), Float32).bitcast(Int32)[0]
-
-
-@cute.jit
-def _f32_from_bits(x: Int32) -> Float32:
-    return cutlass.Vector.from_elements((x,), Int32).bitcast(Float32)[0]
-
-
-@cute.jit
-def _exp2_fma_packed(x0: Float32, x1: Float32) -> tuple[Float32, Float32]:
-    """exp2 of two fp32 values on the FMA pipe, 2^x = 2^floor(x) * poly(x - floor(x)).
-    Same routine as ex2_emulation_f32x2_value in the SM110 GQA decode kernel."""
-    # Below -127 the result flushes to zero in e4m3 anyway.
-    x0 = cute.math.max(x0, Float32(-127.0), ftz=True)
-    x1 = cute.math.max(x1, Float32(-127.0), ftz=True)
-    # Adding 1.5 * 2^23 with round-down leaves floor(x) in the low mantissa bits.
-    bias = Float32(1.5 * 2.0**23)
-    t = cute.arch.add_packed_f32x2((x0, x1), (bias, bias), rnd="rm", ftz=False)
-    n = cute.arch.add_packed_f32x2(t, (-bias, -bias), rnd="rn", ftz=False)
-    f = cute.arch.fma_packed_f32x2(
-        n, (Float32(-1.0), Float32(-1.0)), (x0, x1), rnd="rn", ftz=False
-    )
-    # Degree-3 fit of 2^f on [0, 1).
-    c1 = Float32(0.695146143436431884765625)
-    c2 = Float32(0.227564394474029541015625)
-    c3 = Float32(0.077119089663028717041015625)
-    p = cute.arch.fma_packed_f32x2(f, (c3, c3), (c2, c2), rnd="rn", ftz=False)
-    p = cute.arch.fma_packed_f32x2(p, f, (c1, c1), rnd="rn", ftz=False)
-    p = cute.arch.fma_packed_f32x2(
-        p, f, (Float32(1.0), Float32(1.0)), rnd="rn", ftz=False
-    )
-    # The bias has zero low bits, so bits(t) << 23 is floor(x) << 23.
-    return (
-        _f32_from_bits(_f32_bits(p[0]) + (_f32_bits(t[0]) << 23)),
-        _f32_from_bits(_f32_bits(p[1]) + (_f32_bits(t[1]) << 23)),
     )
 
 
@@ -375,6 +357,11 @@ class FmhaConfig:
     # (as the TMEM-P fp8 cadence does), so the peer softmax group starts its row max
     # while this group computes P.
     fp8_psmem_early_token: bool = False
+    # K/V ring depth. 0 derives it from the shared-memory budget.
+    kv_ring_stages: int = 0
+    # K=64 per fp8 PV UMMA instruction through bit 29 of the instruction
+    # descriptor, halving the PV issue count.
+    umma_fp8_k64: bool = False
     # One TMA pipeline has one expected-transaction byte count per stage, so K
     # and V share a ring of kv_stage stages only while their dtype widths
     # match. Mixed widths set split_kv_pipelines and size one ring per side.
@@ -469,9 +456,13 @@ class FmhaConfig:
     # Keep the running row max while a tile raises it by at most this many log2 units.
     corr_skip_threshold_log2: float = 0.0
     two_cta_umma: bool = False
+    lse_mode: str = "none"
+    use_attention_sinks: bool = False
     # exp2 pairs per 16-pair softmax chunk computed on the FMA pipe.
     exp2_fma_pairs: int = 0
-    # VC-Attention mode on the 16-bit Q/K and E4M3 V kernel. V stores
+    # Softmax exp2 as one f16x2 MUFU op per score pair.
+    exp2_packed_f16x2: bool = False
+    # VC-Attention mode on the E4M3 V kernel with 16-bit or E4M3 Q/K. V stores
     # residuals around a per-tile mean and the output scale is a per-channel
     # table. In "means" mode the kernel adds each tile mean back into the
     # output with one UMMA step. In "outliers" mode the kernel skips the means
@@ -483,7 +474,7 @@ class FmhaConfig:
     # the row's ``sfQ`` word, and the epilogue scales each output column by
     # ``sfV`` and adds ``v_mean``.
     sage_scale_layout: _SageScaleLayout | None = None
-    # Stages of the load warp's ``sfK`` ring (``SageKTransport.RING``): the K
+    # Stages of the load warp's ``sfK`` ring (``SageKTransport.SMEM``): the K
     # tiles the shared K/V ring keeps in flight, so the ring never throttles
     # the K loads.
     sage_k_scale_stages: int = 4
@@ -495,6 +486,11 @@ class FmhaConfig:
     # Uniform packed plans retain the ragged tensor-map ABI but derive their
     # cumulative offsets arithmetically, avoiding dependent indptr loads on
     # every persistent work tile.
+    # VC-Attention-QK8 fixed plans also set the two lengths while
+    # has_uniform_varlen stays False. There they are the Q tokens and the K/V
+    # rows of the fixed plan, the rows including the repair tiles, and they fold
+    # the flat scale table slots at compile time so the P store addresses stay
+    # out of the loop.
     has_uniform_varlen: bool = False
     uniform_seq_len_q: int = 0
     uniform_seq_len_k: int = 0
@@ -523,7 +519,7 @@ class FmhaConfig:
     # synthetic peer0 tail slot used by the general query-paired schedule.
     causal_single_kv_tile: bool = False
     window_size_left: int = 0
-    # Number of valid K/V rows in the final fixed-length dense tile. Zero
+    # Upper bound on valid K/V rows in the final dense tile. Zero
     # means that the K/V extent is tile-aligned (or that this specialization
     # does not use the fixed dense-tail mask).
     fixed_dense_k_tail: int = 0
@@ -562,6 +558,11 @@ class FmhaConfig:
     page_table_window_entries: int = 32
 
     @property
+    def vc_qk8(self) -> bool:
+        """VC-Attention-QK8, the E4M3 Q/K recipe with per-block dequant scales."""
+        return self.vc_attention is not None and self.q_dtype.width == 8
+
+    @property
     def vc_restores_means(self) -> bool:
         """Whether the kernel adds the tile means back into O."""
         return self.vc_attention == "means"
@@ -587,10 +588,13 @@ class FmhaConfig:
         # channels and 128 query rows.
         if self.logical_head_dim_qk != 128 or self.pv_mma_tiler[1] != 128:
             raise ValueError("VC-Attention requires head_dim 128")
-        if self.q_dtype.width != 16 or self.v_dtype.width != 8:
-            raise ValueError("VC-Attention requires 16-bit Q/K and E4M3 V")
+        if self.q_dtype.width not in (8, 16) or self.v_dtype.width != 8:
+            raise ValueError("VC-Attention requires 16-bit or E4M3 Q/K and E4M3 V")
         if not self.p_in_smem:
-            raise ValueError("VC-Attention requires P staged in SMEM")
+            raise ValueError(
+                "VC-Attention requires P staged in SMEM, the dense paired D128 "
+                "schedule with a 16-bit output"
+            )
 
     @property
     def vc_mean_operand_bytes(self) -> int:
@@ -620,6 +624,16 @@ class FmhaConfig:
     # Work-tile mapping for the two peer Q/O tiles handled by each CTA:
     # query-paired maps peers to two sequence tiles in one Q head, while
     # head-paired mode maps peers to two Q heads at one sequence tile.
+    @property
+    def vc_kscale_table_bytes(self) -> int:
+        """Bytes of one softmax group's fp32 K-scale table, one word per K/V
+        tile of the K/V length the kernel was built with, 16-byte padded. The
+        table is sized at construction from ``max_kv_len``, before the fixed
+        plan lengths reach ``cfg``."""
+        max_kv_len = self.max_num_pages_per_seq_kv * self.num_tokens_per_page
+        entries = max((max_kv_len + self.kv_tile_n - 1) // self.kv_tile_n, 1)
+        return (entries * 4 + 15) // 16 * 16
+
     @property
     def smem_q_head_dim(self) -> int:
         """Q storage rounded to one 128-byte TMA fragment."""
@@ -747,7 +761,8 @@ class FmhaConfig:
         window_entries = self.page_table_window_entries
         if (
             pages_per_tile <= 0
-            or pages_per_tile > window_entries
+            # A one-tile window cannot retain distinct K/V page IDs.
+            or pages_per_tile >= window_entries
             or window_entries % pages_per_tile != 0
         ):
             return False
@@ -937,9 +952,9 @@ class FmhaConfig:
         return self.q_dtype == cutlass.Int8
 
     @property
-    def score_seed_tile_bytes(self) -> int:
+    def sage_score_seed_tile_bytes(self) -> int:
         """Return the bytes of the BF16 operand tile that seeds INT32 scores."""
-        return score_seed_tile_bytes(self.qk_mma_tiler[0], self.qk_mma_tiler[1])
+        return sage_score_seed_tile_bytes(self.qk_mma_tiler[0], self.qk_mma_tiler[1])
 
     @property
     def sage_k_tile_words(self) -> int:
@@ -1884,10 +1899,8 @@ class SmemPageOffsetsKvResource(MemoryResource):
         self._alloc = SmemAllocation(
             "smem_page_offsets_v" if page_table_is_v else "smem_page_offsets_k",
             size_bytes=total_entries * 4,
-            # Page-size 16 consumes eight page IDs per 128-token K/V tile.
-            # Align only that specialization for one 32-byte vector load;
-            # preserve the established layout for larger page sizes.
-            alignment=(32 if cfg.kv_tile_n // cfg.num_tokens_per_page == 8 else 16),
+            # Eight-ID vector loads also serve smaller pages in chunks.
+            alignment=(32 if cfg.kv_tile_n // cfg.num_tokens_per_page >= 8 else 16),
         )
         self._smem_page_offsets = _placeholder_smem_array(Int32, total_entries)
         self.cached_page_ids = TaskLocalVariable(
@@ -1946,14 +1959,22 @@ class SmemPageOffsetsKvResource(MemoryResource):
         stage_idx = self.state_src.consumer_work_stage
         group_page_idx = (tile_idx * Int32(pages_per_tile)) & Int32(window_entries - 1)
         offset = stage_idx * Int32(window_entries) + group_page_idx
-        if cutlass.const_expr(pages_per_tile == 8):
-            return self._smem_page_offsets.load(offset, vector_size=8, alignment=32)
-        if cutlass.const_expr(pages_per_tile == 4):
-            return self._smem_page_offsets.load(offset, vector_size=4, alignment=16)
-        if cutlass.const_expr(pages_per_tile == 2):
-            return self._smem_page_offsets.load(offset, vector_size=2, alignment=8)
-        return self._smem_page_offsets.load(offset, vector_size=1, alignment=4)
+        if cutlass.const_expr(pages_per_tile <= 8):
+            return self._smem_page_offsets.load(
+                offset, vector_size=pages_per_tile, alignment=pages_per_tile * 4
+            )
+        tile_page_ids = cutlass.Array(
+            Int32, pages_per_tile, space=cutlass.AddressSpace.rmem
+        )
+        for chunk in cutlass.range_constexpr(pages_per_tile // 8):
+            values = self._smem_page_offsets.load(
+                offset + Int32(chunk * 8), vector_size=8, alignment=32
+            )
+            for i in cutlass.range_constexpr(8):
+                tile_page_ids[chunk * 8 + i] = Int32(values[i])
+        return tile_page_ids
 
+    # Stage the current K/V tile page IDs into its acquired SMEM ring slot.
     @cute.jit
     def _producer_load_page_offsets(
         self,
@@ -1964,8 +1985,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
         kv_request_begin: Int32,
         kv_page_idx_ub: Int32,
     ) -> None:
-        from .helpers_paged import _resolve_kv_tile_idx_context
-
         cfg = self.cfg
         # Context's K/V tile index is kv_tile_start + loop_offset; for V the
         # producer runs one tile ahead in TAIL, so reuse the same expression
@@ -2056,8 +2075,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
         tile_offset: cutlass.Constexpr[int] = 0,
     ) -> cutlass.Array:
         """Retain one tile's page IDs after its SMEM window is released."""
-        from .helpers_paged import _resolve_kv_tile_idx_context
-
         tile_idx = _resolve_kv_tile_idx_context(
             stage_info, kv_tile_start, tile_offset=tile_offset
         )
@@ -2096,7 +2113,7 @@ class SmemSageKScalesResource(MemoryResource):
 
     A tile of one-token K blocks has too many words to keep in the softmax
     lanes' registers or to broadcast-load from global memory
-    (``SageKTransport.RING``). After each K tile's TMA load the load warp
+    (``SageKTransport.SMEM``). After each K tile's TMA load the load warp
     copies the tile's atoms from the prepared scales into the acquired stage
     with lane-parallel 16-byte ``cp.async`` copies; the pipeline's
     ``AsyncLoad`` commit completes the stage once they land. Both softmax
@@ -2159,8 +2176,6 @@ class SmemSageKScalesResource(MemoryResource):
         whole tiles, so the copy never runs past the sequence. Lane ``l``
         copies float4 ``l``, ``l + 32``, ... of the tile.
         """
-        from .helpers_paged import _resolve_kv_tile_idx_context
-
         cfg = self.cfg
         layout = cfg.sage_scale_layout
         tile_idx = _resolve_kv_tile_idx_context(stage_info, kv_tile_start)
@@ -2837,9 +2852,14 @@ class SmemPResource(MemoryResource):
     ) -> None:
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
-        # VC-Attention appends the group's bf16 [128 x 16] row-sum operand
-        # behind the P tile.
-        extra_bytes = cfg.vc_rowsum_tile_bytes if cfg.vc_restores_means else 0
+        # VC-Attention appends the group's bf16 [128 x 16] row-sum operands behind
+        # the P tile when it restores the tile means, and VC-Attention-QK8 its
+        # K-scale table behind those.
+        extra_bytes = 0
+        if cfg.vc_restores_means:
+            extra_bytes += cfg.vc_rowsum_tile_bytes
+        if cfg.vc_qk8:
+            extra_bytes += cfg.vc_kscale_table_bytes
         self._alloc = SmemAllocation(
             f"smem_p{group_idx}",
             cfg.smem_p_bytes + extra_bytes,
@@ -2851,8 +2871,15 @@ class SmemPResource(MemoryResource):
 
     @property
     def rowsum_tile_offset(self) -> int:
-        """Byte offset of the VC-Attention row-sum operand inside this allocation."""
+        """Byte offset of the VC-Attention row-sum operands inside this allocation."""
         return self.cfg.smem_p_bytes
+
+    @property
+    def kscale_table_offset(self) -> int:
+        """Byte offset of the VC-Attention-QK8 K-scale table inside this allocation,
+        behind the row-sum operand when the tile means are restored."""
+        rowsum = self.cfg.vc_rowsum_tile_bytes if self.cfg.vc_restores_means else 0
+        return self.cfg.smem_p_bytes + rowsum
 
     @property
     def row_bytes(self) -> int:
@@ -2891,6 +2918,9 @@ class TmemSPResource(MemoryResource):
     q_half: Constexpr[int] = 0
     enable_early_tile_sum: Constexpr[bool] = False
     q_offset_default: int | Int32 = field(init=False, default=0)
+    max_seq_len_kv: int | Int32 = field(init=False, default=0)
+    # Valid K/V rows of the final tile, computed once when the lengths bind.
+    k_tail_rows: int | Int32 = field(init=False, default=0)
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_k: cute.Tensor | None = field(init=False, default=None)
     seq_lens_kv: cute.Pointer | None = field(init=False, default=None)
@@ -2898,7 +2928,7 @@ class TmemSPResource(MemoryResource):
     variable_window_token_ends: cute.Tensor | None = field(init=False, default=None)
     variable_window_cta_starts: cute.Tensor | None = field(init=False, default=None)
     variable_window_q_stride: int | Int32 = field(init=False, default=0)
-    scale_softmax_log2: cute.Tensor | None = field(init=False, default=None)
+    scale_softmax_log2: Float32 | None = field(init=False, default=None)
     # Sage attention: the prepared scales and the KV head count that strides
     # their sequences. The lane's ``sfQ`` word and the address of the
     # sequence's first ``sfK`` atom are cached per work tile; each tile's
@@ -2938,16 +2968,24 @@ class TmemSPResource(MemoryResource):
     variable_window_end: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
-    # VC-Attention: the row's softmax scale in log2 units (per work tile) and
-    # the previous tile's fp32 row sum awaiting its deferred mean step.
+    # VC-Attention-QK8 dequant scales in the flat layout: Q [Hq, numel] and K/V
+    # tile [Hkv, numel], both fp32.
+    vc_q_scale: cute.Tensor | None = field(init=False, default=None)
+    vc_k_scale: cute.Tensor | None = field(init=False, default=None)
+    # VC-Attention: the row's softmax scale in log2 units (per work tile, times
+    # sfQ under QK8) and the previous tile's fp32 row sum awaiting its deferred
+    # mean step.
     vc_row_scale: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     vc_prev_tile_sum: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     vc_kept_row_sum: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    # VC-Attention-QK8: sfK of the next K/V tile, read from the SMEM table one
+    # tile ahead so no shared load sits on the row-max critical chain.
+    vc_k_scale_next: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     # Row sums of the sixteen K/V tiles of the current mean group, in the running max's
-    # units, one register array of VC_MEAN_GROUP_TILES values. The mean restore is one
-    # bf16 K=16 UMMA per group, O += sum_t rowsum(P_t) * mu_t with these sums as the A
-    # operand and the tile means as B, so each tile's sum stays live until its group
-    # closes and is rescaled by every later max correction.
+    # units. The mean restore is one bf16 K=16 UMMA per group, O += sum_t rowsum(P_t) * mu_t
+    # with these sums as the A operand and the tile means as B, so each tile's sum stays live
+    # until its group closes and is rescaled by every later max correction. One register
+    # array of VC_MEAN_GROUP_TILES values.
     vc_meansums: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def __init__(
@@ -2961,12 +2999,15 @@ class TmemSPResource(MemoryResource):
         cum_seqlen_q: cute.Tensor | None = None,
         cum_seqlen_k: cute.Tensor | None = None,
         seq_lens_kv: cute.Pointer | None = None,
+        max_seq_len_kv: int | Int32 = 0,
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_token_ends: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
         variable_window_q_stride: int | Int32 = 0,
-        scale_softmax_log2: cute.Tensor | None = None,
+        scale_softmax_log2: Float32 | None = None,
         smem_p: Optional[SmemPResource] = None,
+        vc_q_scale: cute.Tensor | None = None,
+        vc_k_scale: cute.Tensor | None = None,
         vc_repair_tiles: int = 0,
         sage_scales: cute.Pointer | None = None,
         num_kv_heads: int | Int32 = 0,
@@ -2977,7 +3018,8 @@ class TmemSPResource(MemoryResource):
 
         The repair tile count is a compile-time constant. It says how many
         K/V tiles at the end of the loop are VC-Attention outlier tiles. It is
-        zero on plans that restore the tile means.
+        zero on plans that restore the tile means. VC-Attention-QK8 plans carry
+        the fixed Q and K/V lengths on ``cfg``, which address the scale tables.
         """
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
@@ -2991,6 +3033,8 @@ class TmemSPResource(MemoryResource):
         self.cum_seqlen_q = cum_seqlen_q
         self.cum_seqlen_k = cum_seqlen_k
         self.seq_lens_kv = seq_lens_kv
+        self.max_seq_len_kv = max_seq_len_kv
+        self.k_tail_rows = Int32(0)
         self.variable_window_token_starts = variable_window_token_starts
         self.variable_window_token_ends = variable_window_token_ends
         self.variable_window_cta_starts = variable_window_cta_starts
@@ -3015,6 +3059,8 @@ class TmemSPResource(MemoryResource):
             ),
             docs="Sage ``sfK`` of each word of the current K tile.",
         )
+        self.vc_q_scale = vc_q_scale
+        self.vc_k_scale = vc_k_scale
         self._alloc = TmemAllocation(
             f"tmem_sp_q{q_half}",
             cfg.qk_mma_tiler[1] * cfg.mma_softmax_stage,
@@ -3026,12 +3072,12 @@ class TmemSPResource(MemoryResource):
         self.smem_p = smem_p
         self.old_row_max = TaskLocalVariable(
             dtype=Float32,
-            default=Float32(-Float32.inf),
+            default=Float32(_SOFTMAX_MASK_VALUE),
             docs="Softmax row maximum from the previous K/V tile.",
         )
         self.row_max = TaskLocalVariable(
             dtype=Float32,
-            default=Float32(-Float32.inf),
+            default=Float32(_SOFTMAX_MASK_VALUE),
             docs="Softmax row maximum for the current K/V tile.",
         )
         self.row_sum = TaskLocalVariable(
@@ -3097,6 +3143,11 @@ class TmemSPResource(MemoryResource):
             default=Float32(0.0),
             docs="VC-Attention V repair, row sum over the original tokens.",
         )
+        self.vc_k_scale_next = TaskLocalVariable(
+            dtype=Float32,
+            default=Float32(1.0),
+            docs="VC-Attention-QK8: K dequant scale of the next K/V tile.",
+        )
         self.vc_meansums = TaskLocalVariable(
             dtype=cutlass.Array,
             default=_placeholder_local_array(Float32, VC_MEAN_GROUP_TILES),
@@ -3115,7 +3166,7 @@ class TmemSPResource(MemoryResource):
         if self._seed_alloc is None:
             self._seed_alloc = SmemAllocation(
                 f"{self.name}_score_seed",
-                self.cfg.score_seed_tile_bytes,
+                self.cfg.sage_score_seed_tile_bytes,
                 alignment=128,
             )
         return [self._seed_alloc]
@@ -3124,15 +3175,17 @@ class TmemSPResource(MemoryResource):
     def _score_seed_words(self, context: Any) -> cutlass.Array:
         """Return the seed MMA's operand tile; the second instance reads the first's."""
         owner = self if self.score_seed_owner is None else self.score_seed_owner
-        return score_seed_words(
-            context.smem_base, owner._seed_alloc.offset, self.cfg.score_seed_tile_bytes
+        return sage_score_seed_words(
+            context.smem_base,
+            owner._seed_alloc.offset,
+            self.cfg.sage_score_seed_tile_bytes,
         )
 
     @producer_work
     @cute.jit
     def seed_scores(self, stage_info: StageInfo) -> None:
         """Write ``INT32_SCORE_BIAS`` into the acquired S stage before its K wait."""
-        issue_score_seed_mma(
+        issue_sage_score_seed_mma(
             self.tmem_ptr_s_cached.subview(self._stage_col_offset(stage_info)),
             self._score_seed_words(stage_info.context),
             self.cfg.qk_mma_tiler[0],
@@ -3483,9 +3536,9 @@ class TmemSPResource(MemoryResource):
         ):
             # The MMA task is one warp; it fills the tile it will read.
             tidx, _, _ = cute.arch.thread_idx()
-            fill_score_seed_tile(
+            fill_sage_score_seed_tile(
                 self._score_seed_words(stage_info.context),
-                self.cfg.score_seed_tile_bytes // 4,
+                self.cfg.sage_score_seed_tile_bytes // 4,
                 tidx % Int32(32),
                 32,
             )
@@ -3514,7 +3567,7 @@ class TmemSPResource(MemoryResource):
         if cutlass.const_expr(self.scale_softmax_log2 is None):
             # Safe fallback for validation-only resource construction.
             return Float32(0.0)
-        return self.scale_softmax_log2[0]
+        return self.scale_softmax_log2
 
     @consumer_work(
         work_attrs=WorkAttr.AUXILIARY,
@@ -3523,21 +3576,71 @@ class TmemSPResource(MemoryResource):
             vc_prev_tile_sum,
             vc_meansums,
             vc_kept_row_sum,
+            vc_k_scale_next,
         ),
     )
     @cute.jit
     def vc_init_row_scale(self, stage_info: StageInfo) -> tuple[Float32, ...]:
         """VC-Attention work-tile setup. Returns the softmax scale in log2 units,
-        a zero previous-tile row sum, the zeroed group row sum array and a zero kept row sum."""
-        _ = stage_info
+        a zero previous-tile row sum, the zeroed group row sum array, a zero kept row sum
+        (V repair) and tile 0's sfK.
+
+        Under VC-Attention-QK8 the row scale also carries this row's sfQ, and the
+        group's SMEM sfK table is filled with one coalesced pass. Both named
+        barrier syncs of the fill cover the group's four warps: the first keeps
+        a fast warp from refilling while a peer still reads the previous work
+        tile's entries, the second publishes the new table.
+        """
+        row_scale = self.scale_softmax_log2
+        k_scale_next = Float32(1.0)
+        if cutlass.const_expr(self.cfg.vc_qk8):
+            batch_coord, head, row = self._vc_coords(stage_info)
+            kv_head = head // self.cfg.h_r
+            q_slot = vc_flat_q_slot(
+                batch_coord,
+                row,
+                self.cfg.uniform_seq_len_q,
+                self.cfg.kv_tile_n.bit_length() - 1,
+            )
+            row_scale = row_scale * Float32(self.vc_q_scale[(head, q_slot)])
+            k_base = vc_flat_k_base(
+                batch_coord, self.cfg.uniform_seq_len_k, self.cfg.kv_tile_n
+            )
+            num_tiles = (
+                self.cfg.uniform_seq_len_k + self.cfg.kv_tile_n - 1
+            ) // self.cfg.kv_tile_n
+            k_scale_next = self._vc_k_scales.fill(
+                stage_info, self.vc_k_scale, kv_head, k_base, num_tiles
+            )
         sums = cutlass.Array(
             Float32, VC_MEAN_GROUP_TILES, space=cutlass.AddressSpace.rmem
         )
         for i in cutlass.range_constexpr(VC_MEAN_GROUP_TILES):
             sums[i] = Float32(0.0)
-        return (self.scale_softmax_log2[0], Float32(0.0), sums, Float32(0.0))
+        return (row_scale, Float32(0.0), sums, Float32(0.0), k_scale_next)
 
-    @consumer_work(returns=(old_row_max, row_max))
+    @cute.jit
+    def _vc_coords(self, stage_info: StageInfo) -> tuple[Int32, Int32, Int32]:
+        """Return ``(batch, head, q_row)`` of this softmax thread's row."""
+        seq_coord, head_coord, batch_coord = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
+        warp_id_in_sg = cute.arch.warp_idx() % len(self.cfg.softmax0_warp_ids)
+        row_in_tile = warp_id_in_sg * cute.arch.WARP_SIZE + cute.arch.lane_idx()
+        row = (
+            seq_coord * self.cfg.q_tile_m * self.cfg.work_tile_q_seq_tiles
+            + self.q_half * self.cfg.peer_q_seq_tile_stride * self.cfg.q_tile_m
+            + row_in_tile
+        )
+        head = head_coord * self.cfg.work_tile_q_heads
+        return batch_coord, head, row
+
+    @property
+    def _vc_k_scales(self) -> VCKScaleTable:
+        """This softmax group's staged ``sfK`` table (see ``vc_scales``)."""
+        return VCKScaleTable(self.cfg, self.smem_p, self.q_half)
+
+    @consumer_work(returns=(old_row_max, row_max, vc_k_scale_next))
     @cute.jit
     def vc_compute_row_max(
         self,
@@ -3545,14 +3648,26 @@ class TmemSPResource(MemoryResource):
         *,
         row_max: SoftmaxScalar,
         vc_row_scale: SoftmaxScalar,
-    ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """VC-Attention K-loop row max in log2 units."""
-        if cutlass.const_expr(self.cfg.uses_ldtm_stat):
-            return self._load_s_chunks_and_reduce_row_max(
-                stage_info, row_max, tile_scale=vc_row_scale
+        vc_k_scale_next: SoftmaxScalar,
+    ) -> tuple[SoftmaxScalar, SoftmaxScalar, Float32]:
+        """VC-Attention K-loop row max in log2 units. Under QK8 the tile maximum is
+        scaled by ``vc_row_scale * sfK[tile]`` (prefetched) and the next tile's
+        ``sfK`` is read."""
+        tile_scale = vc_row_scale
+        k_scale_after = vc_k_scale_next
+        if cutlass.const_expr(self.cfg.vc_qk8):
+            k_scale_after = self._vc_k_scales.next_scale(
+                stage_info, Int32(stage_info.loop_offset)
             )
-        s_data = self._load_s_chunks(stage_info)
-        return self._reduce_row_max(s_data, row_max, vc_row_scale)
+            tile_scale = vc_row_scale * vc_k_scale_next
+        if cutlass.const_expr(self.cfg.uses_ldtm_stat):
+            old_row_max, new_row_max = self._load_s_chunks_and_reduce_row_max(
+                stage_info, row_max, tile_scale=tile_scale
+            )
+        else:
+            s_data = self._load_s_chunks(stage_info)
+            old_row_max, new_row_max = self._reduce_row_max(s_data, row_max, tile_scale)
+        return old_row_max, new_row_max, k_scale_after
 
     @consumer_work(returns=(old_row_max, row_max))
     @cute.jit
@@ -3562,12 +3677,16 @@ class TmemSPResource(MemoryResource):
         *,
         row_max: SoftmaxScalar,
         vc_row_scale: SoftmaxScalar,
+        vc_k_scale_next: SoftmaxScalar,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
-        """VC-Attention dense tail. The tail call of the dense K/V loop with the
-        row scale routed in, so the mask is always applied."""
-        s_data = self._load_s_chunks(stage_info)
+        """VC-Attention dense tail: mask the zero-filled lanes of the partial last
+        K/V tile before the row max; under QK8 the tile's prefetched ``sfK`` scales it."""
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
+        tile_scale = vc_row_scale
+        if cutlass.const_expr(self.cfg.vc_qk8):
+            tile_scale = vc_row_scale * vc_k_scale_next
+        s_data = self._load_s_chunks(stage_info)
         neg_inf = cutlass.vector.full(
             [tmem_x],
             self.cfg.qk_acc_dtype(-Float32.inf),
@@ -3576,14 +3695,14 @@ class TmemSPResource(MemoryResource):
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             valid_in_chunk = cute.math.min(
                 cute.math.max(
-                    Int32(self.cfg.fixed_dense_k_tail) - Int32(chunk_idx * tmem_x),
+                    self.k_tail_rows - Int32(chunk_idx * tmem_x),
                     Int32(0),
                 ),
                 Int32(tmem_x),
             )
             mask = cutlass.vector.create_mask([tmem_x], [valid_in_chunk])
             s_data[chunk_idx] = cutlass.vector.where(mask, s_data[chunk_idx], neg_inf)
-        return self._reduce_row_max(s_data, row_max, vc_row_scale)
+        return self._reduce_row_max(s_data, row_max, tile_scale)
 
     @cute.jit
     def _init_work_tile_state(self, stage_info: StageInfo) -> None:
@@ -3619,9 +3738,14 @@ class TmemSPResource(MemoryResource):
         self, stage_info: StageInfo
     ) -> tuple[Float32, Float32, Float32, Int32]:
         self._init_work_tile_state(stage_info)
+        if cutlass.const_expr(self.cfg.fixed_dense_k_tail > 0):
+            # Bind after the softmax register allocation, like its TMEM addresses.
+            self.k_tail_rows = (Int32(self.max_seq_len_kv) - Int32(1)) % Int32(
+                self.cfg.kv_tile_n
+            ) + Int32(1)
         return (
-            Float32(-Float32.inf),
-            Float32(-Float32.inf),
+            Float32(_SOFTMAX_MASK_VALUE),
+            Float32(_SOFTMAX_MASK_VALUE),
             Float32(0.0),
             Int32(self.q_offset_default),
         )
@@ -3796,7 +3920,7 @@ class TmemSPResource(MemoryResource):
     ) -> cutlass.Vector:
         """Load the current K tile's ``sfK`` words and warm L1 for the next tile.
 
-        The global transport (``SageKTransport.GLOBAL``), scheduled before
+        The global transport (``SageKTransport.GMEM``), scheduled before
         the wait for the tile's scores: the wait and the TMEM load then hide
         the load latency, which the compiler would otherwise expose by
         sinking the loads next to their first use. ``section=Tail`` loads the
@@ -3824,7 +3948,7 @@ class TmemSPResource(MemoryResource):
     ) -> cutlass.Vector:
         """Read the current K tile's ``sfK`` words from its waited ring stage.
 
-        The ring transport (``SageKTransport.RING``, protocol on
+        The ring transport (``SageKTransport.SMEM``, protocol on
         ``SmemSageKScalesResource``): ``sage_k_stage_words`` is the stage's
         shared-memory byte offset; one float4 load per four words.
         """
@@ -3985,10 +4109,7 @@ class TmemSPResource(MemoryResource):
                 tile_row_max = tile_row_max * sage_q_scale
             row_max = cute.math.max(row_max, tile_row_max)
         _tmem_sp_sdata[id(self)] = s_data
-        row_max_safe = row_max
-        if row_max == -Float32.inf:
-            row_max_safe = Float32(0.0)
-        return old_row_max, row_max_safe
+        return old_row_max, row_max
 
     @cute.jit
     def _load_s_chunks_and_reduce_row_max(
@@ -4061,21 +4182,18 @@ class TmemSPResource(MemoryResource):
                         Int32(tmem_x),
                     )
                     mask = cutlass.vector.create_mask([tmem_x], [num_valid])
-                    neg_inf = cutlass.vector.full_like(
-                        s_data[chunk_idx], Float32(-Float32.inf)
+                    masked_values = cutlass.vector.full_like(
+                        s_data[chunk_idx], Float32(_SOFTMAX_MASK_VALUE)
                     )
                     s_data[chunk_idx] = cutlass.vector.where(
-                        mask, s_data[chunk_idx], neg_inf
+                        mask, s_data[chunk_idx], masked_values
                     )
                     masked_row_max = cute.math.max(
                         masked_row_max, s_data[chunk_idx].reduce("max")
                     )
                 row_max = masked_row_max
         _tmem_sp_sdata[id(self)] = s_data
-        row_max_safe = row_max
-        if row_max == -Float32.inf:
-            row_max_safe = Float32(0.0)
-        return old_row_max, row_max_safe
+        return old_row_max, row_max
 
     @cute.jit
     def _exp2_p_store(
@@ -4144,7 +4262,7 @@ class TmemSPResource(MemoryResource):
             # The paper's 2^8 P scaling is part of VC_EXPCAST_CODE_BIAS, so
             # p_scale_log2 is not added here.
             return self._exp2_p_store_expcast(scale, Float32(0.0) - row_max)
-        minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
+        minus_row_max_scale = _softmax_exp2_bias(row_max, scale, p_scale_log2)
         # The exp2 addend of a score pair; a block-scaled INT32 plan folds
         # the score bias into it per block.
         addend_pair = (minus_row_max_scale, minus_row_max_scale)
@@ -4155,6 +4273,20 @@ class TmemSPResource(MemoryResource):
             s_data = _tmem_sp_sdata[id(self)]
         else:
             s_data = _tmem_sp_sdata.pop(id(self))
+        if cutlass.const_expr(
+            self.cfg.exp2_packed_f16x2
+            and not block_scaled
+            and (self.enable_early_tile_sum or partial)
+        ):
+            return self._exp2_p_store_packed_words(
+                tmem_p_addr,
+                scale,
+                minus_row_max_scale,
+                s_data,
+                chunk_lo,
+                chunk_hi,
+                sum_in,
+            )
         if cutlass.const_expr(self.enable_early_tile_sum or partial):
             # Four packed float2 accumulators keep eight independent FADD2
             # chains, so no add waits on the MUFU result it consumes.
@@ -4312,6 +4444,96 @@ class TmemSPResource(MemoryResource):
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             result.append(s_data[chunk_idx])
         return result
+
+    @cute.jit
+    def _exp2_p_store_packed_words(
+        self,
+        tmem_p_addr: TmemAddr,
+        scale: SoftmaxScalar,
+        minus_row_max_scale: Float32,
+        s_data: list,
+        chunk_lo: cutlass.Constexpr[int],
+        chunk_hi: cutlass.Constexpr[int],
+        sum_in: Float32 | None,
+    ) -> Float32:
+        """exp2 softmax P in f16x2 words with one MUFU op per score pair. The row
+        sum adds the packed halves and the fp8 P is packed from the words. Returns
+        the tile sum."""
+        assert self.cfg.v_dtype.width == 8
+        tmem_x = self.cfg.tmem_x_load_s
+        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
+        partial = chunk_lo > 0 or chunk_hi < num_chunks
+        # Four accumulator pairs keep eight independent sum chains, each seeded
+        # by its first pair.
+        sums: list[Any] = [None] * 4
+        p_words: dict[int, tuple[Any, ...]] = {}
+        for chunk_idx in cutlass.range_constexpr(chunk_lo, chunk_hi):
+            words: tuple[Any, ...] = ()
+            for elem_idx in cutlass.range_constexpr(0, tmem_x, 2):
+                fma_pair = cute.arch.fma_packed_f32x2(
+                    (
+                        s_data[chunk_idx][elem_idx],
+                        s_data[chunk_idx][elem_idx + 1],
+                    ),
+                    (scale, scale),
+                    (minus_row_max_scale, minus_row_max_scale),
+                    rnd="rn",
+                    ftz=False,
+                )
+                word = exp2_f16x2_word(fma_pair[0], fma_pair[1])
+                pair_idx = (chunk_idx - chunk_lo) * (tmem_x // 2) + elem_idx // 2
+                if cutlass.const_expr(pair_idx < 4):
+                    sums[pair_idx] = f16x2_to_f32x2(word)
+                else:
+                    sums[pair_idx % 4] = add_f16x2_to_f32x2(sums[pair_idx % 4], word)
+                words += (word,)
+            p_words[chunk_idx] = words
+        p_packing_ratio = self.cfg.qk_acc_dtype.width // self.cfg.v_dtype.width
+        for pair_idx in cutlass.range_constexpr(
+            chunk_lo // p_packing_ratio,
+            (chunk_hi + p_packing_ratio - 1) // p_packing_ratio,
+        ):
+            word_lo = max(chunk_lo - pair_idx * p_packing_ratio, 0) * tmem_x // 4
+            word_hi = (
+                min(chunk_hi - pair_idx * p_packing_ratio, p_packing_ratio)
+                * tmem_x
+                // 4
+            )
+            frag_words: tuple[Any, ...] = ()
+            for word_idx in cutlass.range_constexpr(word_lo, word_hi):
+                flat_idx = word_idx * 4
+                chunk_words = p_words[pair_idx * p_packing_ratio + flat_idx // tmem_x]
+                half_idx = (flat_idx % tmem_x) // 2
+                frag_words += (
+                    pack_f16x2x2_to_fp8_e4m3(
+                        chunk_words[half_idx], chunk_words[half_idx + 1]
+                    ),
+                )
+            if cutlass.const_expr(self.cfg.p_in_smem):
+                _tmem_sp_pwords[id(self)] = frag_words
+            else:
+                prims.tcgen05_st(
+                    "32x32b",
+                    prims.make_tmem_ptr(
+                        tmem_p_addr + pair_idx * tmem_x + word_lo, cutlass.Int8
+                    ),
+                    cutlass.Vector.from_elements(frag_words, Int32),
+                )
+        sum_02 = cute.arch.add_packed_f32x2(sums[0], sums[2], rnd="rn", ftz=False)
+        sum_13 = cute.arch.add_packed_f32x2(sums[1], sums[3], rnd="rn", ftz=False)
+        local_sum_pair = cute.arch.add_packed_f32x2(sum_02, sum_13, rnd="rn", ftz=False)
+        tile_sum = local_sum_pair[0] + local_sum_pair[1]
+        if cutlass.const_expr(partial):
+            # Make this range's P visible before the barrier arrive that follows.
+            cute.arch.fence_view_async_tmem_store()
+            return sum_in + tile_sum
+        if cutlass.const_expr(
+            self.enable_early_tile_sum or self.cfg.has_tmem_p_pipeline
+        ):
+            cute.arch.fence_view_async_tmem_store()
+        else:
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+        return tile_sum
 
     @cute.jit
     def _exp2_p_store_expcast(
@@ -4476,7 +4698,7 @@ class TmemSPResource(MemoryResource):
         store_group_words = 4
         words_per_chunk = 2 * store_group_words
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
-        minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
+        minus_row_max_scale = _softmax_exp2_bias(row_max, scale, p_scale_log2)
         s_data = _tmem_sp_sdata.pop(id(self))
         local_sum_chains = cutlass.Array(
             Float32,
@@ -4637,7 +4859,7 @@ class TmemSPResource(MemoryResource):
         tmem_x = self.cfg.tmem_x_load_s
         num_values = self.cfg.qk_mma_tiler[1]
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
-        minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
+        minus_row_max_scale = _softmax_exp2_bias(row_max, scale, p_scale_log2)
         s_data = _tmem_sp_sdata.pop(id(self))
 
         fma_values: tuple[Any, ...] = ()
@@ -4965,23 +5187,30 @@ class TmemSPResource(MemoryResource):
         else:
             is_tail_tile = stage_info.loop_offset == stage_info.loop_end - Int32(1)
         if is_tail_tile:
-            neg_inf = cutlass.vector.full(
+            masked_values = cutlass.vector.full(
                 [tmem_x],
-                self.cfg.qk_acc_dtype(-Float32.inf),
+                self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
                 dtype=self.cfg.qk_acc_dtype,
             )
             for chunk_idx in cutlass.range_constexpr(num_chunks):
-                valid_in_chunk = cute.math.min(
-                    cute.math.max(
-                        Int32(self.cfg.fixed_dense_k_tail) - Int32(chunk_idx * tmem_x),
-                        Int32(0),
-                    ),
-                    Int32(tmem_x),
+                capacity = min(
+                    tmem_x, max(0, self.cfg.fixed_dense_k_tail - chunk_idx * tmem_x)
                 )
-                mask = cutlass.vector.create_mask([tmem_x], [valid_in_chunk])
-                s_data[chunk_idx] = cutlass.vector.where(
-                    mask, s_data[chunk_idx], neg_inf
-                )
+                if cutlass.const_expr(capacity == 0):
+                    s_data[chunk_idx] = masked_values
+                else:
+                    bits = ()
+                    for column in cutlass.range_constexpr(tmem_x):
+                        if cutlass.const_expr(column < capacity):
+                            bits += (
+                                self.k_tail_rows > Int32(chunk_idx * tmem_x + column),
+                            )
+                        else:
+                            bits += (cutlass.Boolean(False),)
+                    mask = cutlass.Vector.from_elements(bits, cutlass.Boolean)
+                    s_data[chunk_idx] = cutlass.vector.where(
+                        mask, s_data[chunk_idx], masked_values
+                    )
         return s_data
 
     @consumer_work(returns=(old_row_max, row_max))
@@ -5020,9 +5249,9 @@ class TmemSPResource(MemoryResource):
         kv_base = kv_tile_idx * self.cfg.kv_tile_n
         kv_end = kv_base + Int32(self.cfg.kv_tile_n)
         if seqlen_k < kv_end:
-            neg_inf = cutlass.vector.full(
+            masked_values = cutlass.vector.full(
                 [tmem_x],
-                self.cfg.qk_acc_dtype(-Float32.inf),
+                self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
                 dtype=self.cfg.qk_acc_dtype,
             )
             for chunk_idx in cutlass.range_constexpr(num_chunks):
@@ -5033,7 +5262,7 @@ class TmemSPResource(MemoryResource):
                 )
                 mask = cutlass.vector.create_mask([tmem_x], [valid_in_chunk])
                 s_data[chunk_idx] = cutlass.vector.where(
-                    mask, s_data[chunk_idx], neg_inf
+                    mask, s_data[chunk_idx], masked_values
                 )
         return self._reduce_row_max(s_data, row_max)
 
@@ -5136,8 +5365,10 @@ class TmemSPResource(MemoryResource):
             )
         kv_tile_abs = kv_tile_start + stage_info.loop_offset
 
-        neg_inf = cutlass.vector.full(
-            [tmem_x], self.cfg.qk_acc_dtype(-Float32.inf), dtype=self.cfg.qk_acc_dtype
+        masked_values = cutlass.vector.full(
+            [tmem_x],
+            self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
+            dtype=self.cfg.qk_acc_dtype,
         )
         all_true_mask = cutlass.vector.create_mask([tmem_x], [tmem_x])
 
@@ -5159,7 +5390,9 @@ class TmemSPResource(MemoryResource):
                 )
                 right_mask = cutlass.vector.create_mask([tmem_x], [right_oob_start_idx])
                 mask = mask & right_mask
-            s_data[chunk_idx] = cutlass.vector.where(mask, s_data[chunk_idx], neg_inf)
+            s_data[chunk_idx] = cutlass.vector.where(
+                mask, s_data[chunk_idx], masked_values
+            )
 
         return self._reduce_row_max(s_data, row_max)
 
@@ -5482,13 +5715,13 @@ class TmemSPResource(MemoryResource):
                     all_true_mask = cutlass.vector.create_mask([tmem_x], [tmem_x])
                     left_mask = left_mask_inverted ^ all_true_mask
                     mask = mask & left_mask
-                neg_inf = cutlass.vector.full(
+                masked_values = cutlass.vector.full(
                     [tmem_x],
-                    self.cfg.qk_acc_dtype(-Float32.inf),
+                    self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
                     dtype=self.cfg.qk_acc_dtype,
                 )
                 s_data[chunk_idx] = cutlass.vector.where(
-                    mask, s_data[chunk_idx], neg_inf
+                    mask, s_data[chunk_idx], masked_values
                 )
         return self._reduce_row_max(s_data, row_max)
 
@@ -5531,11 +5764,11 @@ class TmemSPResource(MemoryResource):
                     Int32(tmem_x),
                 )
                 causal_mask = cutlass.vector.create_mask([tmem_x], [num_valid])
-                neg_inf_vec = cutlass.vector.full_like(
-                    s_data[chunk_idx], Float32(-Float32.inf)
+                masked_values_vec = cutlass.vector.full_like(
+                    s_data[chunk_idx], Float32(_SOFTMAX_MASK_VALUE)
                 )
                 s_data[chunk_idx] = cutlass.vector.where(
-                    causal_mask, s_data[chunk_idx], neg_inf_vec
+                    causal_mask, s_data[chunk_idx], masked_values_vec
                 )
         return s_data
 
@@ -5603,11 +5836,8 @@ class TmemSPResource(MemoryResource):
         row_max: SoftmaxScalar,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Tail stage for softmax group 0: identity row_max, no S load."""
-        row_max_safe = row_max
-        if row_max == -Float32.inf:
-            row_max_safe = Float32(0.0)
         _ = stage_info
-        return row_max, row_max_safe
+        return row_max, row_max
 
     @consumer_work
     @cute.jit
@@ -5680,7 +5910,9 @@ class TmemSPResource(MemoryResource):
         if cutlass.const_expr(self.cfg.vc_attention):
             # VC-Attention keeps the row max in log2 units.
             scale_softmax_log2 = Float32(1.0)
-        if (row_max - old_row_max) * scale_softmax_log2 <= threshold:
+        if (old_row_max != Float32(_SOFTMAX_MASK_VALUE)) & (
+            (row_max - old_row_max) * scale_softmax_log2 <= threshold
+        ):
             frozen = old_row_max
         return frozen
 
@@ -5826,15 +6058,20 @@ class TmemStatsResource(MemoryResource):
     """Correction statistics with an AsyncAsync pipeline.
 
     Producer: Softmax writes old_max/row_max/row_sum stats. Consumer:
-    Correction reads them for O rescaling. Persistent D256 keeps the payload
-    in a small staged SMEM ring so the stats no longer alias S/P TMEM columns;
-    other schedules retain the original TMEM storage.
+    Correction reads them for O rescaling. The staged SMEM ring keeps the
+    payload disjoint from S/P TMEM columns, including while QK and correction
+    overlap in a non-persistent single-instance schedule.
     """
 
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     tmem_vec_offset: Constexpr[int] = field(init=False, default=None)
-    scale_softmax_log2: cute.Tensor | None = field(init=False, default=None)
-    output_scale: cute.Tensor | None = field(init=False, default=None)
+    scale_softmax_log2: Float32 | None = field(init=False, default=None)
+    output_scale: Float32 | cute.Tensor | None = field(init=False, default=None)
+    lse_output: cute.Tensor | None = field(init=False, default=None)
+    attention_sinks: cute.Tensor | None = field(init=False, default=None)
+    cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
+    query_seq_len: Int32 | int = field(init=False, default=0)
+    peer_idx: Constexpr[int] = field(init=False, default=0)
     tmem_addr_cached: TmemAddr | None = field(init=False, default=None)
     # Precomputed per-warp TMEM vec address (once, before persistent loop).
     tmem_vec_addr_cached: TmemAddr | None = field(init=False, default=None)
@@ -5852,8 +6089,13 @@ class TmemStatsResource(MemoryResource):
         pipeline_config: PipelineConfig,
         cfg: FmhaConfig,
         tmem_vec_offset: int,
-        scale_softmax_log2: cute.Tensor | None = None,
-        output_scale: cute.Tensor | None = None,
+        scale_softmax_log2: Float32 | None = None,
+        output_scale: Float32 | cute.Tensor | None = None,
+        lse_output: cute.Tensor | None = None,
+        attention_sinks: cute.Tensor | None = None,
+        cum_seqlen_q: cute.Tensor | None = None,
+        query_seq_len: Int32 | int = 0,
+        peer_idx: int = 0,
         **kwargs: Any,
     ) -> None:
         """Bind the correction-stat TMEM vector offset and allocation."""
@@ -5862,6 +6104,11 @@ class TmemStatsResource(MemoryResource):
         self.tmem_vec_offset = tmem_vec_offset
         self.scale_softmax_log2 = scale_softmax_log2
         self.output_scale = output_scale
+        self.lse_output = lse_output
+        self.attention_sinks = attention_sinks
+        self.cum_seqlen_q = cum_seqlen_q
+        self.query_seq_len = query_seq_len
+        self.peer_idx = peer_idx
         self._alloc = TmemAllocation(f"tmem_vec_{tmem_vec_offset}", cfg.tmem_stats_cols)
         self._smem_alloc = None
         if cfg.stats_via_smem:
@@ -5960,7 +6207,7 @@ class TmemStatsResource(MemoryResource):
         if cutlass.const_expr(self.scale_softmax_log2 is None):
             # Safe fallback for validation-only resource construction.
             return Float32(0.0)
-        return self.scale_softmax_log2[0]
+        return self.scale_softmax_log2
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns="output_scale_value")
     @cute.jit
@@ -5974,7 +6221,7 @@ class TmemStatsResource(MemoryResource):
             # VC-Attention: output_scale is the per-(batch, head, channel) V
             # residual scale table, applied per column in SmemOResource._store_o.
             return Float32(1.0)
-        return self.output_scale[0]
+        return self.output_scale
 
     @cute.jit
     def _init_work_tile_state(self, stage_info: StageInfo) -> None:
@@ -6142,8 +6389,62 @@ class TmemStatsResource(MemoryResource):
         else:
             vec_row_sum = vec_rmem[0]
             vec_old_max = vec_new_max
-        _ = stage_info
+        if cutlass.const_expr(
+            final_stats
+            and (self.lse_output is not None or self.attention_sinks is not None)
+        ):
+            scale *= self._store_final_lse(
+                stage_info, vec_new_max, vec_row_sum, scale_softmax_log2
+            )
         return vec_old_max, vec_new_max, vec_row_sum, scale
+
+    @cute.jit
+    def _store_final_lse(self, stage_info, row_max, row_sum, scale_softmax_log2):
+        # Match GmemO's logical row mapping, including paired heads/queries and
+        # cluster tiles. Correction has one thread for each physical Q row.
+        seq_tile, head_tile, batch = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
+        head = (
+            head_tile * self.cfg.work_tile_q_heads
+            + self.peer_idx * self.cfg.peer_q_head_stride
+        )
+        row = cute.arch.thread_idx()[0] % Int32(128)
+        query = (
+            seq_tile * self.cfg.work_tile_q_seq_tiles
+            + self.peer_idx * self.cfg.peer_q_seq_tile_stride
+        ) * self.cfg.q_tile_m + row
+        heads = (
+            Int32(self.lse_output.shape[-1])
+            if self.lse_output is not None
+            else Int32(self.attention_sinks.shape[0])
+        )
+        weight = Float32(1.0)
+        start = Int32(0)
+        length = Int32(self.query_seq_len)
+        if cutlass.const_expr(self.cum_seqlen_q is not None):
+            start = Int32(self.cum_seqlen_q[batch])
+            length = Int32(self.cum_seqlen_q[batch + Int32(1)]) - start
+        if query < length and head < heads:
+            flat_query = batch * length + query
+            if cutlass.const_expr(self.cum_seqlen_q is not None):
+                flat_query = start + query
+            value = Float32(-Float32.inf)
+            if row_sum > Float32(0.0):
+                value = (
+                    scale_softmax_log2 * row_max
+                    + cute.math.log2(row_sum, fastmath=True)
+                    - Float32(self.cfg.pv_p_scale_log2)
+                )
+            if cutlass.const_expr(self.attention_sinks is not None):
+                sink = Float32(self.attention_sinks[head]) * Float32(1.4426950408889634)
+                value, weight, _ = merge_log2_lse(value, sink)
+            if cutlass.const_expr(self.lse_output is not None):
+                offset = cutlass.Int64(flat_query) * cutlass.Int64(
+                    heads
+                ) + cutlass.Int64(head)
+                (self.lse_output.iterator + offset).store(value)
+        return weight
 
     @consumer_work(returns=(vec_old_max, vec_new_max, vec_row_sum, vec_scale))
     @cute.jit
@@ -6463,6 +6764,7 @@ class TmemOResource(MemoryResource):
                 else:
                     ab_format = cutlass.Float16
 
+            pv_fp8_k64 = self.cfg.v_dtype.width == 8 and self.cfg.umma_fp8_k64
             idesc_pv = prims.Tcgen05InstrDesc.build(
                 c_dtype=cutlass.Float32,
                 a_dtype=ab_format,
@@ -6479,6 +6781,7 @@ class TmemOResource(MemoryResource):
                 m_dim=self.cfg.pv_mma_tiler[0] * self.cfg.cta_group_size,
                 # V is row-major / MN-major.
                 b_major=1,
+                k_dim=1 if pv_fp8_k64 else 0,
             )
             cta_group = (
                 prims.CTAGroup.CTA_2
@@ -6504,7 +6807,7 @@ class TmemOResource(MemoryResource):
 
             k_dim_per_mma = 16
             if cutlass.const_expr(self.cfg.v_dtype.width != 16):
-                k_dim_per_mma = 32
+                k_dim_per_mma = 64 if pv_fp8_k64 else 32
             num_kphases_pv = self.cfg.pv_mma_tiler[2] // k_dim_per_mma
             inc_tmem_p = (
                 k_dim_per_mma * self.cfg.v_dtype.width // self.cfg.qk_acc_dtype.width
@@ -6774,9 +7077,9 @@ class TmemOResource(MemoryResource):
         Uses inst_idx to select O0/O1 and forwards row_sum to
         SmemO.producer_vars for the tail epilog.
 
-        With skip_correction enabled: uses vote_ballot_sync to check if
-        old_max == new_max across all threads. If true, scale=1.0 and
-        we skip the expensive TMEM load+rescale+store.
+        With skip_correction enabled, rescale only when a row with prior
+        visible keys changes its maximum. Empty histories and unchanged
+        maxima skip the TMEM load+rescale+store.
         """
         # Select O offset from captured correction-call position.
         if cutlass.const_expr(self.cfg.single_qkv_instance or inst_idx == 0):
@@ -6800,7 +7103,13 @@ class TmemOResource(MemoryResource):
         # Check if we should skip correction (when old_max == new_max)
         should_rescale = cutlass.Boolean(True)
         if cutlass.const_expr(self.cfg.enable_skip_correction):
-            vote_ballot_cnt = cute.arch.vote_ballot_sync(vec_old_max != vec_new_max)
+            # A neutral old maximum means every prior P tile was zero.
+            # The first visible tile establishes an anchor but has no old O
+            # contribution to rescale, including a late first tile in one Q peer.
+            needs_rescale = (vec_old_max != vec_new_max) & (
+                vec_old_max != Float32(_SOFTMAX_MASK_VALUE)
+            )
+            vote_ballot_cnt = cute.arch.vote_ballot_sync(needs_rescale)
             should_rescale = vote_ballot_cnt != Int32(0)
 
         scale = Float32(1.0)
@@ -6815,9 +7124,7 @@ class TmemOResource(MemoryResource):
         # MMA (Thread 0) does tcgen05.mma → tcgen05.commit on O_full.
         # Correction (Thread 1) does mbarrier.try_wait on O_full → tcgen05.ld.
         # The fence orders the prior tcgen05.commit's completion with our tcgen05.ld.
-        from cutlass.experimental import primitives as _prims
-
-        _prims.tcgen05_fence("after")
+        prims.tcgen05_fence("after")
 
         # Only rescale if old_max != new_max AND not in invalid O0 iteration
         if should_rescale and not skip_o0_invalid:

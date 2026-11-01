@@ -6,7 +6,6 @@ import torch
 import cutlass
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
-from cuda.bindings import driver
 
 from .fma_fc1_o2 import _routed_fc1_kernel as first2
 from .fma_fc1_o4 import _kernel as first4
@@ -64,6 +63,49 @@ def fc2(
     )
 
 
+@cute.jit
+def launch(
+    q,
+    sf,
+    w1,
+    s1,
+    alpha1,
+    ids,
+    mid,
+    msf,
+    gs,
+    w2,
+    s2,
+    alpha2,
+    scores,
+    out,
+    activation: cutlass.Constexpr,
+    gated: cutlass.Constexpr,
+    parameters: cutlass.Constexpr,
+    width: cutlass.Constexpr,
+    finalize: cutlass.Constexpr,
+    narrow: cutlass.Constexpr,
+    stream,
+):
+    fc1(
+        q,
+        sf,
+        w1,
+        s1,
+        alpha1,
+        ids,
+        mid,
+        msf,
+        gs,
+        activation,
+        gated,
+        parameters,
+        width,
+        stream,
+    )
+    fc2(mid, msf, w2, s2, alpha2, ids, scores, out, finalize, narrow, stream)
+
+
 def execute(inputs, config, tactic):
     from ...runtime import _COMPILED, _COMPILE_LOCK
 
@@ -72,10 +114,9 @@ def execute(inputs, config, tactic):
     q, sf, ids, scores, w1, s1, alpha1, w2, s2, alpha2, gs, mid, msf, out, narrow = (
         inputs
     )
-    name, parameters = lower_activation(config.activation)
     finalize = config.finalize.do_finalize
     key = (
-        "nvfp4-unified-v1",
+        "nvfp4-ffi-v1",
         q.device,
         q.shape,
         w1.shape,
@@ -89,12 +130,21 @@ def execute(inputs, config, tactic):
         narrow,
     )
     with torch.cuda.device(q.device):
-        stream = driver.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
-        first = tuple(
-            from_dlpack(v) for v in (q, sf, w1, s1, alpha1, ids, mid, msf, gs)
-        )
-        last = tuple(
-            from_dlpack(v) for v in (mid, msf, w2, s2, alpha2, ids, scores, out)
+        tensors = (
+            q,
+            sf,
+            w1,
+            s1,
+            alpha1,
+            ids,
+            mid,
+            msf,
+            gs,
+            w2,
+            s2,
+            alpha2,
+            scores,
+            out,
         )
         compiled = _COMPILED.get(key)
         if compiled is None:
@@ -106,25 +156,21 @@ def execute(inputs, config, tactic):
                 compiled = _COMPILED.get(key)
                 if compiled is None:
                     major, minor = torch.cuda.get_device_capability(q.device)
-                    options = f"--gpu-arch sm_{major}{minor}a"
-                    compiled = (
-                        cute.compile(
-                            fc1,
-                            *first,
-                            name,
-                            config.activation.is_gated,
-                            parameters,
-                            tactic[1],
-                            stream,
-                            options=options,
-                        ),
-                        cute.compile(
-                            fc2, *last, finalize, narrow, stream, options=options
-                        ),
+                    name, parameters = lower_activation(config.activation)
+                    compiled = cute.compile(
+                        launch,
+                        *(from_dlpack(v) for v in tensors),
+                        name,
+                        config.activation.is_gated,
+                        parameters,
+                        tactic[1],
+                        finalize,
+                        narrow,
+                        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                        options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
                     )
                     _COMPILED[key] = compiled
-        compiled[0](*first, stream)
-        compiled[1](*last, stream)
+        compiled(*tensors)
         if finalize:
             return out
         return [

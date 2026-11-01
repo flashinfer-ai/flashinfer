@@ -20,12 +20,18 @@ import json
 import os
 import re
 import shutil
+import sys
+import sysconfig
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 from . import env as jit_env
 from .core import JitSpec, _record_jit_build, get_tmpdir, logger
+from ._cute_dsl_source import (
+    _hash_source_files,
+    cute_dsl_strict_cache_key as cute_dsl_strict_cache_key,
+)
 
 _META_FILENAME = "meta.json"
 
@@ -39,134 +45,39 @@ def cute_dsl_cache_disabled() -> bool:
 def _get_cute_dsl_version() -> str:
     """Fingerprint of the CuTe-DSL compiler stack.
 
-    Covers every installed ``nvidia-cutlass-dsl*`` distribution, not just the
+    Covers TVM-FFI, Torch, Python's ABI, and every installed
+    ``nvidia-cutlass-dsl*`` distribution, not just the
     main package: the codegen backend lives in the libs packages, and the
     CUDA-family variant is encoded in the package *name* (e.g.
     ``nvidia-cutlass-dsl-libs-cu13``), so two environments with the same DSL
     version but different libs variants must not share artifacts. The system
-    CUDA toolkit/driver deliberately does not participate: ``cute.compile``
-    uses this bundled stack, not ``CUDA_HOME``.
+    CUDA toolkit does not participate: ``cute.compile`` uses the bundled stack,
+    not ``CUDA_HOME``. The active backend is not fingerprinted separately: with
+    multiple CUDA-family variants installed, a host driver change can switch
+    the selected backend without changing this fingerprint. Persistent caches
+    need a reset after such a switch.
     """
     import importlib.metadata
 
-    stack = sorted(
-        f"{dist.metadata['Name']}=={dist.version}"
-        for dist in importlib.metadata.distributions()
-        if (dist.metadata["Name"] or "").lower().startswith("nvidia-cutlass-dsl")
+    stack = []
+    for dist in importlib.metadata.distributions():
+        name = (dist.metadata["Name"] or "").lower().replace("_", "-")
+        if name in {"torch", "apache-tvm-ffi"} or name.startswith("nvidia-cutlass-dsl"):
+            # RECORD distinguishes rebuilt wheels with the same version;
+            # direct_url carries the commit of a VCS dependency override.
+            provenance = json.dumps(
+                [dist.read_text("RECORD"), dist.read_text("direct_url.json")]
+            ).encode()
+            stack.append(
+                f"{name}=={dist.version}:{hashlib.sha256(provenance).hexdigest()}"
+            )
+    return ";".join(
+        [
+            str(sys.implementation.cache_tag),
+            str(sysconfig.get_config_var("SOABI")),
+            *sorted(stack),
+        ]
     )
-    return ";".join(stack) if stack else "unknown"
-
-
-def cute_dsl_strict_cache_key() -> bool:
-    """Whether cache keys also cover the in-package import closure of key files."""
-    return os.environ.get("FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY", "0") == "1"
-
-
-# The flashinfer package directory; only imports resolving inside it are followed.
-_PACKAGE_DIR = Path(__file__).resolve().parents[1]
-# Never followed by the strict key:
-# - ``__init__.py`` re-exports the whole public API and defines no kernels;
-#   following it would key every kernel on every file in the package.
-# - ``version.py`` / ``_build_meta.py`` carry the build's git commit, which
-#   differs on every CI checkout. The package version is already part of the
-#   cache directory path (``FLASHINFER_JIT_DIR``).
-_UNKEYED_PACKAGE_FILES = ("__init__.py", "version.py", "_build_meta.py")
-
-
-def _resolve_package_module(parts: Sequence[str]) -> Optional[Path]:
-    """File of the dotted flashinfer module ``parts`` (first part ``flashinfer``)."""
-    if not parts or parts[0] != _PACKAGE_DIR.name:
-        return None
-    base = _PACKAGE_DIR.joinpath(*parts[1:])
-    for candidate in (base.with_suffix(".py"), base / "__init__.py"):
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-@functools.cache
-def _direct_package_imports(path: Path) -> tuple:
-    """Flashinfer source files ``path`` imports, including function-local imports.
-
-    Parent-package ``__init__`` files are not followed unless named by the
-    import itself: a kernel module depends on what it imports, not on
-    everything its package re-exports, and following them would pull in the
-    whole package and defeat cache reuse.
-    """
-    import ast
-
-    rel = path.relative_to(_PACKAGE_DIR.parent).with_suffix("")
-    package = list(rel.parts[:-1])  # same for ``__init__`` and plain modules
-    tree = ast.parse(path.read_bytes(), filename=str(path))
-    found = set()
-    for node in ast.walk(tree):
-        resolved_files = []
-        if isinstance(node, ast.Import):
-            resolved_files = [
-                _resolve_package_module(alias.name.split(".")) for alias in node.names
-            ]
-        elif isinstance(node, ast.ImportFrom):
-            if node.level:
-                if node.level - 1 > len(package):
-                    continue
-                base = package[: len(package) - (node.level - 1)]
-            else:
-                base = []
-            module = base + (node.module.split(".") if node.module else [])
-            for alias in node.names:
-                # ``from pkg import submodule`` depends on the submodule only;
-                # any other name is defined by ``pkg`` itself.
-                submodule = _resolve_package_module(module + [alias.name])
-                resolved_files.append(
-                    submodule
-                    if submodule is not None
-                    else _resolve_package_module(module)
-                )
-        unkeyed = {_PACKAGE_DIR / name for name in _UNKEYED_PACKAGE_FILES}
-        for resolved in resolved_files:
-            if resolved is not None and resolved != path and resolved not in unkeyed:
-                found.add(resolved)
-    return tuple(sorted(found))
-
-
-@functools.cache
-def _package_import_closure(path: Path) -> tuple:
-    """``path`` plus every flashinfer source file it transitively imports."""
-    seen = {path}
-    stack = [path]
-    while stack:
-        for dep in _direct_package_imports(stack.pop()):
-            if dep not in seen:
-                seen.add(dep)
-                stack.append(dep)
-    return tuple(sorted(seen))
-
-
-def _expand_key_files(paths: tuple) -> tuple:
-    """Key files plus, in strict mode, their in-package import closures.
-
-    Callers list the files whose content should invalidate their kernels,
-    typically just ``__file__``; helpers those files import are easy to
-    miss. Strict mode keeps a long-lived shared cache (CI) from serving a
-    kernel compiled before such a helper changed.
-    """
-    if not cute_dsl_strict_cache_key():
-        return paths
-    expanded = set(str(p) for p in paths)
-    for p in paths:
-        resolved = Path(p).resolve()
-        if resolved.suffix == ".py" and resolved.is_relative_to(_PACKAGE_DIR):
-            expanded.update(str(dep) for dep in _package_import_closure(resolved))
-    return tuple(expanded)
-
-
-def _hash_source_files(paths: tuple) -> str:
-    sha = hashlib.sha256()
-    for path in sorted(str(p) for p in _expand_key_files(paths)):
-        sha.update(path.encode())
-        with open(path, "rb") as f:
-            sha.update(f.read())
-    return sha.hexdigest()
 
 
 def _get_compile_arch() -> str:
@@ -426,7 +337,7 @@ def build_and_load_cute_dsl_kernel(
     # file from the hash: a weakened key could serve stale artifacts.
     try:
         source_sha256 = _hash_source_files(tuple(extra_key_files))
-    except (OSError, TypeError, SyntaxError) as e:  # SyntaxError: strict-key parse
+    except (OSError, TypeError, SyntaxError, ValueError) as e:
         logger.warning(
             f"Cannot hash CuTe-DSL kernel sources for {module_name}/{kernel_name} "
             f"({e}); bypassing the disk cache for this kernel."

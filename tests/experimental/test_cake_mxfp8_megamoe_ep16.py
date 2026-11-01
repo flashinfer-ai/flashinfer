@@ -670,6 +670,11 @@ def test_ep16_sparse_reference_and_repeated_result(backend) -> None:
                     assert symm.peer_pointers is None
                     assert symm.peers.dtype == torch.int64
                     assert symm.peers.numel() == 16
+            if backend != "cute_dsl":
+                # The CUDA backend keeps one row and route slot per source rank.
+                assert workspace.published_hidden.tensor.shape == (16, tokens, 3072)
+                assert workspace.published_topk_ids.tensor.shape == (16, tokens, 8)
+                assert workspace.published_topk_weights.tensor.shape == (16, tokens, 8)
 
             first_copy = None
             for repeat in range(32):

@@ -38,6 +38,7 @@ MoKBackwardMXFP8 = kernels.MoKBackwardMXFP8
 MoKForwardMXFP8 = kernels.MoKForwardMXFP8
 MoKRecomputeMXFP8 = kernels.MoKRecomputeMXFP8
 quantize_mok_mxfp8_weights = api.quantize_mok_mxfp8_weights
+mxfp8 = cake_package("cake_mok_bf16", "mxfp8")
 
 LIMITS = pytest.mark.parametrize("swiglu_limit", [None, 0.75], ids=["plain", "clamped"])
 
@@ -143,6 +144,43 @@ def test_weight_quantizer_matches_recipe():
     assert torch.equal(backward_w[2][1], expected_down[3])
     rel = (dequantize(*expected[:2]) - up.float()).norm() / up.float().norm()
     assert rel.item() < 0.05
+
+
+def _flat(value):
+    return [t for v in value for t in (_flat(v) if isinstance(v, tuple) else [v])]
+
+
+@pytest.mark.parametrize("experts_per_chunk", [1, 2, 3])
+def test_weight_quantizer_paths_are_bitwise(monkeypatch, experts_per_chunk):
+    """The fused CUDA quantizer, the chunked PyTorch path and the per-matrix
+    reference produce the same bytes, NaN / infinity / zero blocks included."""
+    require_gpu()
+    torch.manual_seed(23)
+    gate = torch.randn(5, 256, 512, device="cuda", dtype=torch.bfloat16)
+    gate[2, 9, 32:64] = float("nan")
+    gate[3, 1, :32] = float("inf")
+    gate[3, 7, 100] = -float("inf")
+    gate[4, 0, 64:96] = 0
+    gate[0, 5, :64] = 1e-30
+    gate[1, 200, 128:160] = 3.0e38
+    gate[1, 201, 160:192] = torch.tensor([448.0, 449.0, -464.0, 480.0] * 8)
+    up = torch.randn_like(gate) * 1e-3
+    down = torch.randn(5, 512, 256, device="cuda", dtype=torch.bfloat16) * 1e3
+    for matrix in (gate[1], gate[2], down[3]):
+        single = mxfp8.mxfp8_quantize(matrix)
+        assert all(
+            torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+            for a, b in zip(single, quantize(matrix), strict=True)
+        )
+    fused = quantize_mok_mxfp8_weights(gate, up, down)
+    monkeypatch.setattr(mxfp8, "triton", None)
+    monkeypatch.setattr(mxfp8, "_CHUNK_BYTES", experts_per_chunk * 256 * 512 * 4)
+    chunked = quantize_mok_mxfp8_weights(gate, up, down)
+    pairs = list(zip(_flat(fused), _flat(chunked), strict=True))
+    assert len(pairs) == 16
+    for a, b in pairs:
+        assert a.shape == b.shape and a.dtype == b.dtype
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
 @LIMITS
@@ -554,6 +592,232 @@ def test_mxfp8_training_glm_flash_local_experts(experts):
         dw_shared_down=512 * 256,
     )
     assert all(mismatches[k] <= 1e-4 * sizes[k] for k in sizes), mismatches
+
+
+class _LaunchRecorder:
+    """Stands in for a prepared kernel: records the launch keywords, launches nothing."""
+
+    def __init__(self):
+        self.calls = []
+
+    def launch(self, *, grid, **kwargs):
+        self.calls.append((grid, kwargs))
+
+    def last(self, name):
+        return next(kwargs for _, kwargs in reversed(self.calls) if name in kwargs)
+
+
+def _check_counters(kwargs, expected):
+    """Counter keywords ``expected`` (name -> numel) of one recorded fused launch:
+    CUDA, contiguous, 1-D, int32 (uint32 for ``combine_next``), the exact
+    numel, zero, 128-byte aligned, pairwise disjoint on one storage."""
+    views = {name: kwargs[name] for name in expected}
+    assert len({v.untyped_storage().data_ptr() for v in views.values()}) == 1
+    for name, numel in expected.items():
+        view = views[name]
+        assert view.is_cuda and view.is_contiguous() and view.dim() == 1, name
+        assert view.dtype == (torch.uint32 if name == "combine_next" else torch.int32)
+        assert view.numel() == numel, (name, view.numel(), numel)
+        assert torch.count_nonzero(view.view(torch.int32)).item() == 0, name
+        assert view.data_ptr() % 128 == 0, name
+    ranges = sorted(
+        (v.data_ptr(), v.data_ptr() + 4 * v.numel()) for v in views.values()
+    )
+    assert all(a[1] <= b[0] for a, b in zip(ranges, ranges[1:], strict=False))
+
+
+def test_mxfp8_launch_counters_are_one_slab_per_launch():
+    """At the launch boundary the MXFP8 launchers hand the kernels the counter
+    names, dtypes and extents they always did, as views of one zero slab per
+    launch (``combine_next`` the uint32 view of its element); a warm call
+    dispatches one ``zeros`` and one split for them and no fill, zeroing or
+    copy."""
+    require_gpu()
+    from collections import Counter
+
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    hidden, intermediate, macro, tokens, topk, mini, comm = (
+        512,
+        256,
+        768,
+        512,
+        2,
+        256,
+        4,
+    )
+    x, dy, shared, routed, scores, s = _setup(hidden, intermediate, 2027)
+    q = [quantize(w) for w in routed]
+    fwd_w = [(qq[0], qq[1]) for qq in q]
+    bwd_w = (q[0], q[1], (q[2][2], q[2][3]))
+    schedule = (s["peers"], s["schedule"], s["num_tokens"], s["counts"])
+    capacity = s["peers"].numel()
+    options = dict(device="cuda", dtype=torch.bfloat16)
+    combine = torch.zeros(tokens * topk, hidden, **options)
+    dx_peer, ds_peer = torch.zeros_like(combine), torch.zeros_like(scores)
+    forward, recompute, backward = (
+        MoKForwardMXFP8(),
+        MoKRecomputeMXFP8(),
+        MoKBackwardMXFP8(),
+    )
+    for launcher in (forward, recompute, backward):
+        launcher.module = launcher.layout_module = _LaunchRecorder()
+    backward.zero_module = backward.module
+
+    def run():
+        saved = forward(
+            x, [x.data_ptr()], combine, [combine.data_ptr()],
+            shared[0], fwd_w[0], shared[1], fwd_w[1], shared[2], fwd_w[2],
+            *schedule, topk, None, comm, macro, mini,
+        )  # fmt: skip
+        recompute(
+            x, [x.data_ptr()], shared[0], fwd_w[0], shared[1], fwd_w[1],
+            *schedule, topk, None, comm, macro, mini,
+        )  # fmt: skip
+        backward(
+            dy, [dy.data_ptr()], dx_peer, [dx_peer.data_ptr()],
+            scores, [scores.data_ptr()], ds_peer, [ds_peer.data_ptr()],
+            shared[0], bwd_w[0], shared[1], bwd_w[1], shared[2], bwd_w[2],
+            *saved[:7], x, [x.data_ptr()], *schedule,
+            topk, None, comm, macro, mini,
+        )  # fmt: skip
+
+    run()  # cold: peer tables and geometry
+    ops = []
+
+    class Mode(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            ops.append(func.overloadpacket.__name__)
+            return func(*args, **(kwargs or {}))
+
+    with Mode():
+        forward(
+            x, [x.data_ptr()], combine, [combine.data_ptr()],
+            shared[0], fwd_w[0], shared[1], fwd_w[1], shared[2], fwd_w[2],
+            *schedule, topk, None, comm, macro, mini,
+        )  # fmt: skip
+    counted = Counter(ops)
+    assert counted["zeros"] == 1 and counted["split_with_sizes"] == 1, counted
+    assert not (set(counted) & {"fill_", "zero_", "copy_"}), counted
+    run()
+    minis, macros = (capacity + mini - 1) // mini, (capacity + macro - 1) // macro
+    shared_rows, routed_rows = tokens // 256, capacity // 256
+    ib = intermediate // 256
+    _check_counters(
+        forward.module.last("x_ready"),
+        dict(
+            x_ready=minis,
+            gate_ready=(shared_rows + routed_rows) * ib,
+            hidden_ready=shared_rows + routed_rows,
+            y_ready=minis,
+            y_done=capacity // 128,
+            combine_next=1,
+        ),
+    )
+    routed_capacity = min(capacity, macro)
+    _check_counters(
+        recompute.module.last("x_ready"),
+        dict(
+            x_ready=(routed_capacity + mini - 1) // mini,
+            gate_ready=(shared_rows + routed_capacity // 256) * ib,
+            hidden_ready=shared_rows + routed_capacity // 256,
+        ),
+    )
+    _check_counters(
+        backward.module.last("dy_ready"),
+        dict(
+            dy_ready=minis,
+            dx_ready=minis,
+            replay_x=minis,
+            dh_ready=(shared_rows + routed_rows) * ib,
+            dg_ready=shared_rows + routed_rows,
+            replay_gu=routed_rows * ib,
+            replay_h=routed_rows,
+            buffers_done=macros,
+            weight_ready=macros,
+        ),
+    )
+    launch = forward.module.last("x_ready")
+    for name, weight in (("wg_q", fwd_w[0][0]), ("wg_sc", fwd_w[0][1])):
+        assert launch[name].dtype == torch.uint8
+        assert launch[name].data_ptr() == weight.data_ptr()
+    assert launch["wg_shared"].shape == (1, *shared[0].shape)
+    assert launch["wg_shared"].data_ptr() == shared[0].data_ptr()
+    assert (
+        len(forward._geometry)
+        == len(recompute._geometry)
+        == len(backward._geometry)
+        == 1
+    )
+
+
+@LIMITS
+def test_mxfp8_launchers_accept_a_precomputed_layout(swiglu_limit):
+    """The MXFP8 launchers derive the expert layout themselves (``layout=None``)
+    or read the one passed to them; both paths are bitwise equal."""
+    require_gpu()
+    clamped = swiglu_limit is not None
+    forward, recompute = MoKForwardMXFP8(clamped), MoKRecomputeMXFP8(clamped)
+    backward = MoKBackwardMXFP8(clamped)
+    tokens, hidden, intermediate, topk, mini, comm, macro = (
+        512,
+        512,
+        256,
+        2,
+        256,
+        4,
+        768,
+    )
+    x, dy, shared, routed, scores, s = _setup(hidden, intermediate, 811)
+    q = [quantize(w) for w in routed]
+    fwd_w = [(qq[0], qq[1]) for qq in q]
+    bwd_w = (q[0], q[1], (q[2][2], q[2][3]))
+    schedule = (s["peers"], s["schedule"], s["num_tokens"], s["counts"])
+    capacity = s["peers"].numel()
+    layout = kernels.expert_layout(
+        forward.layout_module, s["counts"], capacity, s["peers"]
+    )
+    options = dict(device="cuda", dtype=torch.bfloat16)
+    combine = torch.zeros(tokens * topk, hidden, **options)
+    dx_peer, ds_peer = torch.zeros_like(combine), torch.zeros_like(scores)
+    rows = min(s["actual"], macro)
+
+    def run(layout_arg):
+        combine.zero_()
+        dx_peer.zero_()
+        ds_peer.zero_()
+        saved = forward(
+            x, [x.data_ptr()], combine, [combine.data_ptr()],
+            shared[0], fwd_w[0], shared[1], fwd_w[1], shared[2], fwd_w[2],
+            *schedule, topk, swiglu_limit, comm, macro, mini, layout=layout_arg,
+        )  # fmt: skip
+        rebuilt = recompute(
+            x, [x.data_ptr()], shared[0], fwd_w[0], shared[1], fwd_w[1],
+            *schedule, topk, swiglu_limit, comm, macro, mini, layout=layout_arg,
+        )  # fmt: skip
+        result = backward(
+            dy, [dy.data_ptr()], dx_peer, [dx_peer.data_ptr()],
+            scores, [scores.data_ptr()], ds_peer, [ds_peer.data_ptr()],
+            shared[0], bwd_w[0], shared[1], bwd_w[1], shared[2], bwd_w[2],
+            *saved[:7], x, [x.data_ptr()], *schedule,
+            topk, swiglu_limit, comm, macro, mini, layout=layout_arg,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        pieces = [combine, dx_peer, ds_peer, result[0], *result[9:], saved[7]]
+        for context in (saved, rebuilt):
+            for index, transposed in ((0, True), (2, False), (4, False), (6, True)):
+                data, scales = context[index]
+                if transposed:  # [features, tokens] data, [feature tiles, token tiles]
+                    pieces += [data[:, :rows], scales[:, : rows // 128]]
+                else:
+                    pieces += [data[:rows], scales[: rows // 128]]
+            pieces += [context[index] for index in (1, 3, 5)]
+        return [piece.clone() for piece in pieces]
+
+    first = run(None)
+    for layout_arg in (None, layout, layout):
+        again = run(layout_arg)
+        assert all(torch.equal(a, b) for a, b in zip(first, again, strict=True))
 
 
 @LIMITS

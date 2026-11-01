@@ -1,6 +1,25 @@
-"""Selected packed-input and workspace preparation; no compiler or oracle dependency."""
+"""Selected packed-input and workspace preparation; no compiler or oracle dependency.
+
+``prepare_pipeline_bindings`` packs one pipeline call. The caller's
+``intermediate`` is the model's logical width (a multiple of the 32-value scale
+group); the generated programs compute the intermediate in 128-wide steps, so
+the host pads the routed weights and their scales to the next multiple of 128
+with zero weights when the logical width is not one already. The padded
+columns add exact zeros, so the result is bit-identical to the unpadded
+arithmetic, and a width that already is a multiple of 128 is packed exactly as
+before (no copy).
+
+Expert-parallel calls describe the rank's window of the global expert space:
+``num_experts`` is the number of experts this rank holds (the leading dimension
+of its weights), ``local_expert_offset`` the global id of its first expert and
+``num_global_experts`` the size of the global space. ``topk_idx`` carries
+global ids; a slot whose id falls outside the window (or is -1) routes to no
+expert on this rank, takes no row and adds nothing, so the output is the rank's
+partial sum over its local routes (zeros for a token without one).
+"""
 
 import math
+import os
 
 BLOCK_M = 128
 BLOCK_N = 128
@@ -9,6 +28,138 @@ CTA_GROUP = 2
 GRAN_OUT = 32
 ALIGN_M = 256
 DISP_NUM_EXPERTS_MAX = 384
+# The pipeline programs tile the intermediate width in 128-wide steps (two
+# 64-column store tiles per step); every scale covers 32 values.
+INTERMEDIATE_ALIGN = 128
+SF_GRAN = 32
+# Scale of the padded weight groups: float 1.0 packs to the UE8M0 byte 127.
+# The padded weights are zero, so any finite scale gives exact zero products;
+# 1.0 keeps the padded scale words away from the denormal exponents. On the
+# routes of ``SFB1_VIEW_ROUTES`` a 128-row block of padded W1 rows only is
+# left out of the SFB1 map (``sfb1_launch_view``) and reads as zero words.
+PAD_SCALE = 1.0
+PIPELINE_KEY_FIELDS = (
+    "num_tokens",
+    "num_experts",
+    "top_k",
+    "hidden",
+    "intermediate",
+    "routed_weight_dtype",
+    "activation_clamp",
+)
+# The plan's control arena (``_carve_control_arena``): a 2 MiB GPU page
+# window, 64 KiB guards, one 4 KiB page per buffer, 128-byte steps within
+# a shared page, and the knob that selects what is carved into it.
+CONTROL_ARENA_KNOB = "FLASHINFER_MEGA_MOE_CONTROL_ARENA"
+ARENA_PAGE = 2 << 20
+ARENA_GUARD = 64 << 10
+ARENA_SLOT = 4 << 10
+ARENA_SUB = 128
+
+
+def physical_intermediate(intermediate) -> int:
+    """Physical intermediate width of the generated programs for a logical width.
+
+    The logical width must be a positive multiple of the scale group (32). The
+    physical width is the next multiple of 128 (the width the programs were
+    generated for and the route key names); a logical width that already is a
+    multiple of 128 is its own physical width.
+    """
+    intermediate = int(intermediate)
+    if intermediate < SF_GRAN or intermediate % SF_GRAN:
+        raise ValueError(
+            "MegaMoE requires a positive intermediate width that is a multiple of "
+            f"{SF_GRAN} (the scale group); got {intermediate}"
+        )
+    return -(-intermediate // INTERMEDIATE_ALIGN) * INTERMEDIATE_ALIGN
+
+
+def pipeline_route_args(inputs):
+    """The route-key fields of a pipeline call.
+
+    ``intermediate`` is the physical width the programs were generated for
+    (see ``physical_intermediate``), ``routed_weight_dtype`` defaults to
+    ``"fp4"`` and a numeric ``activation_clamp`` is a float: the route key is
+    JSON text, so ``10`` and ``10.0`` would otherwise name different routes.
+    """
+    clamp = inputs.get("activation_clamp")
+    return dict(
+        num_tokens=int(inputs["num_tokens"]),
+        num_experts=int(inputs["num_experts"]),
+        top_k=int(inputs["top_k"]),
+        hidden=int(inputs["hidden"]),
+        intermediate=physical_intermediate(inputs["intermediate"]),
+        routed_weight_dtype=inputs.get("routed_weight_dtype", "fp4"),
+        activation_clamp=None if clamp is None else float(clamp),
+    )
+
+
+def expert_window(inputs):
+    """``(local_expert_offset, num_experts, num_global_experts)`` of a call.
+
+    The rank holds the global experts ``[offset, offset + num_experts)``;
+    ``local_expert_offset`` defaults to 0 and ``num_global_experts`` to
+    ``num_experts`` (a single-rank call).
+    """
+    local = int(inputs["num_experts"])
+    offset = int(inputs.get("local_expert_offset", 0))
+    global_experts = inputs.get("num_global_experts")
+    global_experts = local if global_experts is None else int(global_experts)
+    if offset < 0 or local < 1 or offset + local > global_experts:
+        raise ValueError(
+            "MegaMoE expert window: local_expert_offset >= 0 and "
+            "local_expert_offset + num_experts <= num_global_experts are required; "
+            f"got offset {offset}, {local} local experts, {global_experts} global"
+        )
+    return offset, local, global_experts
+
+
+def _check_tensor(
+    name, tensor, *, device, shape=None, numel=None, dtype=None, byte_wide=False
+):
+    import torch
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"MegaMoE input {name!r} must be a tensor")
+    if tensor.device != device:
+        raise ValueError(
+            f"MegaMoE input {name!r} must be on {device} (the device of "
+            f"x_fp8_packed); got {tensor.device}"
+        )
+    if shape is not None and tuple(tensor.shape) != tuple(shape):
+        raise ValueError(
+            f"MegaMoE input {name!r} must have shape {tuple(shape)}; "
+            f"got {tuple(tensor.shape)}"
+        )
+    if numel is not None and tensor.numel() != numel:
+        raise ValueError(
+            f"MegaMoE input {name!r} must hold {numel} elements; got {tensor.numel()}"
+        )
+    if dtype is not None and tensor.dtype != dtype:
+        raise ValueError(
+            f"MegaMoE input {name!r} must have dtype {dtype}; got {tensor.dtype}"
+        )
+    if byte_wide and tensor.element_size() != 1:
+        raise ValueError(
+            f"MegaMoE input {name!r} must be a byte tensor; got {tensor.dtype}"
+        )
+
+
+def _check_bytes(name, tensor, nbytes, *, device):
+    import torch
+
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"MegaMoE input {name!r} must be a tensor")
+    if tensor.device != device:
+        raise ValueError(
+            f"MegaMoE input {name!r} must be on {device} (the device of "
+            f"x_fp8_packed); got {tensor.device}"
+        )
+    if tensor.numel() * tensor.element_size() != nbytes:
+        raise ValueError(
+            f"MegaMoE input {name!r} must hold {nbytes} bytes; "
+            f"got {tensor.numel() * tensor.element_size()}"
+        )
 
 
 def _source_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
@@ -35,42 +186,41 @@ def _source_block_m(num_tokens: int, num_experts: int, top_k: int) -> int:
 
 
 def _mega_dispatch_reference(
-    topk_idx, num_experts: int, align_m: int = ALIGN_M, block_m: int = BLOCK_M
+    topk_idx,
+    num_experts: int,
+    align_m: int = ALIGN_M,
+    block_m: int = BLOCK_M,
+    local_expert_offset: int = 0,
 ):
     """CPU reference for the on-device dispatch: per-expert counts, 256-aligned
     row offsets, tile list, and total M. Row assignment within an expert is
     runtime-nondeterministic (atomic claim order), so pool/metadata are checked
     via token_to_permuted, not by fixed row — this returns only the
-    order-independent quantities. A negative id routes its slot to no expert
-    (a masked token) and takes no row."""
+    order-independent quantities. ``topk_idx`` holds global ids: a slot counts
+    for local expert ``id - local_expert_offset`` only when that falls in
+    ``[0, num_experts)``; a negative id (a masked token) or an id another rank
+    holds routes its slot to no expert and takes no row."""
     import torch
 
-    T, TK = topk_idx.shape
-    counts = torch.zeros(num_experts, dtype=torch.int64)
-    ids = topk_idx.cpu()
-    for t in range(T):
-        for k in range(TK):
-            expert = int(ids[t, k].item())
-            if expert >= 0:
-                counts[expert] += 1
+    ids = topk_idx.detach().reshape(-1).cpu().to(torch.int64) - int(local_expert_offset)
+    local = ids[(ids >= 0) & (ids < num_experts)]
+    counts = torch.bincount(local, minlength=num_experts)
     pad = ((counts + align_m - 1) // align_m) * align_m
-    offsets = torch.zeros(num_experts, dtype=torch.int64)
-    running = 0
-    tile_expert = []
-    tile_m_local = []
-    for e in range(num_experts):
-        offsets[e] = running
-        for tt in range(int(pad[e].item()) // block_m):
-            tile_expert.append(e)
-            tile_m_local.append(tt * block_m)
-        running += int(pad[e].item())
+    offsets = torch.cumsum(pad, 0) - pad
+    tiles = pad // block_m
+    total_m_tiles = int(tiles.sum())
+    tile_expert = torch.repeat_interleave(torch.arange(num_experts), tiles)
+    first_tile = torch.cumsum(tiles, 0) - tiles
+    tile_m_local = (
+        torch.arange(total_m_tiles) - torch.repeat_interleave(first_tile, tiles)
+    ) * block_m
     return {
         "counts": counts.to(torch.int32),
         "offsets": offsets.to(torch.int32),
-        "M_total": int(running),
-        "tile_expert": torch.tensor(tile_expert, dtype=torch.int32),
-        "tile_m_local": torch.tensor(tile_m_local, dtype=torch.int32),
-        "total_m_tiles": len(tile_expert),
+        "M_total": int(pad.sum()),
+        "tile_expert": tile_expert.to(torch.int32),
+        "tile_m_local": tile_m_local.to(torch.int32),
+        "total_m_tiles": total_m_tiles,
     }
 
 
@@ -85,6 +235,44 @@ def _interleave_gate_up(t, gran: int = 8):
     gate = t[:, :half].reshape(g, half // gran, gran, *rest)
     up = t[:, half:].reshape(g, half // gran, gran, *rest)
     return torch.stack([gate, up], dim=2).reshape(g, n, *rest).contiguous()
+
+
+def _pad_intermediate(w1, w1_sf, w2, w2_sf, logical: int, physical: int, pack: int):
+    """Zero-pad the routed weights from the logical to the physical intermediate width.
+
+    W1 rows of both halves move apart (gate ``[0, I)`` to ``[0, I_phys)``, up
+    ``[I, 2I)`` to ``[I_phys, 2 I_phys)``) before the gate/up interleave; W2
+    gains zero columns ``[I, I_phys)`` (``pack`` values per byte); both scale
+    tensors grow alike with ``PAD_SCALE`` in the padded groups. Every padded
+    intermediate column activates to exactly 0 (gate and up are 0) and every
+    padded down-projection product is exactly 0. Equal widths return the
+    caller's tensors untouched.
+    """
+    import torch
+
+    if physical == logical:
+        return w1, w1_sf, w2, w2_sf
+    experts = w1.shape[0]
+
+    def rows(t, fill):
+        out = torch.full(
+            (experts, 2 * physical, *t.shape[2:]), fill, dtype=t.dtype, device=t.device
+        )
+        out[:, :logical] = t[:, :logical]
+        out[:, physical : physical + logical] = t[:, logical:]
+        return out
+
+    def cols(t, width, fill):
+        out = torch.full((*t.shape[:-1], width), fill, dtype=t.dtype, device=t.device)
+        out[..., : t.shape[-1]] = t
+        return out
+
+    return (
+        rows(w1, 0),
+        rows(w1_sf, PAD_SCALE),
+        cols(w2, physical // pack, 0),
+        cols(w2_sf, physical // SF_GRAN, PAD_SCALE),
+    )
 
 
 def _sf_float_to_u32_words(sf_float):
@@ -129,33 +317,328 @@ def build_tile_lists(per_expert_M, num_experts: int):
     )
 
 
-def prepare_pipeline_bindings(inputs, num_sms):
-    """Pack ``inputs`` for the persistent grid of a ``num_sms``-SM catalogued route."""
+def source_schedule_form(metadata, num_tokens, num_experts, top_k, weight_fmt):
+    """``(block_m, block_readiness, slot_list)`` of a route's generated program.
+
+    A route's ``metadata`` names the source tile height (``block_m``) and the
+    readiness form (``readiness``: ``"block"`` when the program starts an
+    expert block as soon as its rows arrive, ``"grid"`` when it waits for the
+    whole dispatch). ``slot_list`` (per-expert slot lists of ``num_tokens``
+    entries, rewritten by every launch) defaults to the block-readiness form
+    except at one token, where the program folds the metadata instead. The
+    original routes carry none of these: their programs were generated with
+    the heuristic tile height and use the slot-list form at the token counts
+    listed here.
+    """
+    block_m = metadata.get("block_m")
+    block_m = (
+        _source_block_m(num_tokens, num_experts, top_k)
+        if block_m is None
+        else int(block_m)
+    )
+    if block_m not in (16, 32, 128):
+        raise ValueError(
+            f"MegaMoE source tile height {block_m} is outside the generated "
+            "programs' 16-, 32- and 128-row forms"
+        )
+    readiness = metadata.get("readiness")
+    if readiness is None:
+        slot_list = (
+            weight_fmt == "fp4" and num_tokens in (16, 128, 512, 1024, 4096)
+        ) or (weight_fmt == "fp8" and num_tokens == 16)
+        block_readiness = slot_list or num_tokens == 1
+    elif readiness in ("block", "grid"):
+        block_readiness = readiness == "block"
+        slot_list = bool(metadata.get("slot_list", block_readiness and num_tokens != 1))
+    else:
+        raise ValueError(
+            f"route metadata 'readiness' must be 'block' or 'grid'; got {readiness!r}"
+        )
+    return block_m, block_readiness, slot_list
+
+
+def source_workspace_words(
+    num_experts, num_tokens, top_k, block_m, block_readiness, total_m_tiles, k2_tiles
+):
+    """``(source_blocks, arrival_words)`` of the source-schedule workspace.
+
+    ``source_blocks`` is the program's block budget (one per expert plus the
+    token blocks). The arrival words hold two task counters and two mask words
+    per source block, plus one readiness word per source block when the
+    program starts an expert block as soon as its rows arrive; the first term
+    is the original per-tile bound. The per-expert claim scratch
+    (``expert_scatter_offsets`` without a slot list) lives outside these words,
+    in the counter storage the plan zeroes at bind.
+    """
+    source_blocks = num_experts + (num_tokens * top_k + block_m - 1) // block_m
+    arrival_words = max(
+        total_m_tiles * k2_tiles, 2 + (3 if block_readiness else 2) * source_blocks
+    )
+    return source_blocks, arrival_words
+
+
+def w1_launch_view(b1, logical_intermediate: int, expert_map: bool):
+    """``B1`` (the interleaved, padded ``[E, 2 * I_phys, K / pack]`` weight
+    bytes) as the route's program takes its W1 TMA map.
+
+    A program with the route's ``w1_expert_map`` streams W1 through a
+    per-expert three-dimensional map: it takes ``[E, 2 * I, K / pack]`` with
+    ``I`` the logical width, rows contiguous, under the padded expert pitch
+    (a strided view, no copy), so the padded gate / up rows past ``2 * I`` are
+    TMA zero fill instead of bytes streamed from memory. Every other program
+    takes the dense two-dimensional ``[E * 2 * I_phys, K / pack]`` map.
+    """
+    if not expert_map:
+        return b1.reshape(-1, b1.shape[-1])
+    return b1[:, : 2 * logical_intermediate]
+
+
+# The routes whose SFB1 map leaves the padded blocks out, as ``(num_sms,
+# num_experts, num_global_experts, physical, logical)`` intermediate widths:
+# the 152-SM (sm_103a) E384 tensor-parallel rank routes, the only routes this
+# map was validated on. Every other route binds the whole tensor.
+SFB1_VIEW_ROUTES = frozenset({(152, 384, 384, 640, 576), (152, 384, 384, 384, 288)})
+
+
+def sfb1_launch_view(
+    sfb1,
+    logical_intermediate: int,
+    *,
+    num_sms: int,
+    num_experts: int,
+    num_global_experts: int,
+):
+    """``SFB1`` (the ``[E * K / 128, 2 * I_phys]`` gate / up scale words in
+    the source-schedule row order) as the program's two-dimensional TMA map
+    takes it.
+
+    On a route of ``SFB1_VIEW_ROUTES`` the row extent ends with the last
+    128-row block that holds a logical gate / up row (a strided view, no
+    copy), so a block of padded rows only is TMA zero fill instead of words
+    read from memory. Its weights are zero too, so the zero scale words
+    (UE8M0 2^-127) still give exact zero products. A block that mixes logical
+    and padded rows stays whole: the scale permutation spreads its padded rows
+    over the block. Every other route takes the whole tensor.
+    """
+    route = (
+        int(num_sms),
+        int(num_experts),
+        int(num_global_experts),
+        sfb1.shape[-1] // 2,
+        int(logical_intermediate),
+    )
+    if route not in SFB1_VIEW_ROUTES:
+        return sfb1
+    rows = -(-2 * logical_intermediate // BLOCK_N) * BLOCK_N
+    return sfb1[:, :rows]
+
+
+def _control_arena_mode():
+    """What ``FLASHINFER_MEGA_MOE_CONTROL_ARENA`` carves into the control
+    arena, read when a call is prepared: ``"all"`` (the default) every
+    kernel-written control buffer, ``"reset"`` only the strong-op words
+    (``reset_storage``), ``"off"`` nothing (every buffer is a separate
+    allocation, as before the arena)."""
+    mode = os.environ.get(CONTROL_ARENA_KNOB, "all")
+    if mode not in ("all", "reset", "off"):
+        raise ValueError(
+            f"{CONTROL_ARENA_KNOB} must be 'all', 'reset' or 'off'; got {mode!r}"
+        )
+    return mode
+
+
+def _carve_control_arena(mode, strong, stores):
+    """``(control_slab, buffers)``: the control buffers ``mode`` selects,
+    carved by name from one plan-owned, page-aligned arena.
+
+    The kernel publishes and polls the plan's control words with strong
+    generic operations (release atomics, acquire spins, stores by every CTA)
+    while TMA streams the activations. When the caller's ``x`` (the FC1
+    ``A`` map of a route that reads the activations in place) landed in the
+    same 4 KiB page as those words, the four-token tp4ep4 row measured 1.6x
+    slower (40.6 us against ~25 us); the same bytes a page apart were fast.
+    Separate small allocations leave the words' page-mates to the caching
+    allocator's hole state, so the arena makes their placement deterministic
+    and private: a window of a zero-filled slab that starts on a 2 MiB GPU
+    page boundary, a 64 KiB guard nothing is carved from before the strong-op
+    words, after them and after the last buffer, and every buffer on its own
+    4 KiB page (the members of one slot share a page at 128-byte steps),
+    carved in order of traffic intensity. No foreign tensor can share a page
+    with a control word, and every word's offset within its 2 MiB page is
+    fixed for a route key, whatever the allocation history.
+
+    ``strong`` and ``stores`` list the slots in carve order; a slot is a list
+    of ``(name, numel, dtype, fill)`` members whose bytes read ``fill``
+    (``None`` or ``0``: the slab's zeros). The slab is sized so that a 2 MiB-
+    aligned window of the arena's size always exists inside it (4 MiB for an
+    arena of up to 2 MiB) and the arena starts at the slab's first 2 MiB
+    boundary. Mode ``"off"`` carves nothing.
+    """
     import torch
 
+    if mode == "off":
+        return None, {}
+    slots = [None, *strong, None]
+    if mode == "all":
+        slots += [*stores, None]
+
+    def round_up(n, step):
+        return -(-n // step) * step
+
+    def slot_bytes(slot):
+        if slot is None:
+            return ARENA_GUARD
+        members = (
+            round_up(numel * dtype.itemsize, ARENA_SUB) for _, numel, dtype, _ in slot
+        )
+        return round_up(sum(members), ARENA_SLOT)
+
+    arena_bytes = sum(slot_bytes(slot) for slot in slots)
+    slab_bytes = round_up(arena_bytes, ARENA_PAGE) + ARENA_PAGE
+    control_slab = torch.zeros(slab_bytes, dtype=torch.uint8, device="cuda")
+    cur = (-control_slab.data_ptr()) % ARENA_PAGE
+    assert cur + arena_bytes <= slab_bytes, (cur, arena_bytes, slab_bytes)
+    buffers = {}
+    for slot in slots:
+        if slot is None:
+            cur += ARENA_GUARD
+            continue
+        start = cur
+        for name, numel, dtype, fill in slot:
+            nbytes = numel * dtype.itemsize
+            buffers[name] = control_slab[cur : cur + nbytes].view(dtype)
+            if fill:
+                buffers[name].fill_(fill)
+            cur += round_up(nbytes, ARENA_SUB)
+        cur = start + round_up(cur - start, ARENA_SLOT)
+    return control_slab, buffers
+
+
+def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
+    """Pack ``inputs`` for the persistent grid of a ``num_sms``-SM catalogued route.
+
+    ``inputs["intermediate"]`` is the logical width; the weights and scales are
+    padded to the physical width of the route (``physical_intermediate``) when
+    the two differ, and the kernel scalars ``N1``/``K2`` name the physical width.
+    ``route_metadata`` is the catalogued route's ``metadata`` mapping: its
+    ``block_m`` and ``readiness`` size the source-schedule workspace
+    (``source_schedule_form``), ``local_expert_filter`` states that the
+    program filters global ids through the ``local_expert_offset`` kernel
+    scalar (without the filter the call must describe a single-rank window:
+    offset 0, every id below ``num_experts``), and ``w1_expert_map`` states
+    that the program streams ``B1`` through a per-expert three-dimensional TMA
+    map (``w1_launch_view``), and ``a_source`` names the storage the program's
+    FC1 ``A`` tensor map describes: ``"pool"`` (the default) the dispatch pool
+    rows, ``"x"`` the activations themselves, the contiguous
+    ``[num_tokens, hidden]`` bytes of ``x_fp8_packed`` (a program that reads
+    every routed row straight from the activations and copies no pool row).
+    Such a program ranks tokens within an expert, not slots, so a token that
+    routes to one local expert through two slots is refused, and it stages the
+    scale words with 16-byte loads, so an ``x_sf_packed`` view that does not
+    start on a 16-byte boundary is copied to one that does. Without metadata
+    (the original routes) the host uses the original heuristics.
+    """
+    import torch
+
+    metadata = {} if route_metadata is None else route_metadata
+    local_expert_filter = bool(metadata.get("local_expert_filter", False))
+    w1_expert_map = bool(metadata.get("w1_expert_map", False))
+    a_source = metadata.get("a_source", "pool")
+    if a_source not in ("x", "pool"):
+        raise ValueError(
+            f"route metadata 'a_source' must be 'x' or 'pool'; got {a_source!r}"
+        )
+    arena_mode = _control_arena_mode()
+    args = pipeline_route_args(inputs)
     E, TK, T, H, I = (
-        inputs[k]
+        args[k]
         for k in ("num_experts", "top_k", "num_tokens", "hidden", "intermediate")
     )
-    weight_fmt = inputs.get("routed_weight_dtype", "fp4")
+    logical_I = int(inputs["intermediate"])
+    weight_fmt = args["routed_weight_dtype"]
     if weight_fmt not in ("fp4", "fp8"):
         raise ValueError("routed_weight_dtype must be 'fp4' or 'fp8'")
+    pack = 2 if weight_fmt == "fp4" else 1
     if not 1 <= E <= DISP_NUM_EXPERTS_MAX or not 1 <= TK <= min(E, 32):
         raise ValueError(
             "MegaMoE requires 1..384 experts and 1..min(experts,32) routes"
         )
-    if T < 1 or H % BLOCK_K or I % BLOCK_K:
-        raise ValueError("MegaMoE requires positive T and H/I divisible by 256")
-    source_block_m = _source_block_m(T, E, TK)
-    source_blocks = E + (T * TK + source_block_m - 1) // source_block_m
+    if T < 1 or H % BLOCK_K:
+        raise ValueError("MegaMoE requires positive T and H divisible by 256")
+    assert I % INTERMEDIATE_ALIGN == 0, I
+    offset, _, global_experts = expert_window(inputs)
+    if (offset or global_experts != E) and not local_expert_filter:
+        raise ValueError(
+            "This route's program has no local expert filter: it requires "
+            "local_expert_offset 0 and num_global_experts == num_experts "
+            f"({E}); got offset {offset} and {global_experts} global experts"
+        )
+    if not isinstance(inputs["x_fp8_packed"], torch.Tensor):
+        raise TypeError("MegaMoE input 'x_fp8_packed' must be a tensor")
+    device = inputs["x_fp8_packed"].device
+    if device.type != "cuda":
+        raise ValueError(
+            f"MegaMoE inputs must be CUDA tensors; x_fp8_packed is on {device}"
+        )
+    w1, w1_sf, w2, w2_sf = (
+        inputs[k] for k in (f"w1_{weight_fmt}", "w1_sf", f"w2_{weight_fmt}", "w2_sf")
+    )
+    check = dict(device=device)
+    _check_tensor(
+        f"w1_{weight_fmt}",
+        w1,
+        shape=(E, 2 * logical_I, H // pack),
+        byte_wide=True,
+        **check,
+    )
+    _check_tensor(
+        "w1_sf",
+        w1_sf,
+        shape=(E, 2 * logical_I, H // SF_GRAN),
+        dtype=torch.float32,
+        **check,
+    )
+    _check_tensor(
+        f"w2_{weight_fmt}", w2, shape=(E, H, logical_I // pack), byte_wide=True, **check
+    )
+    _check_tensor(
+        "w2_sf", w2_sf, shape=(E, H, logical_I // SF_GRAN), dtype=torch.float32, **check
+    )
+    _check_tensor(
+        "topk_idx", inputs["topk_idx"], numel=T * TK, dtype=torch.int64, **check
+    )
+    _check_tensor(
+        "topk_weights",
+        inputs["topk_weights"],
+        numel=T * TK,
+        dtype=torch.float32,
+        **check,
+    )
+    _check_bytes("x_fp8_packed", inputs["x_fp8_packed"], T * H, **check)
+    _check_bytes("x_sf_packed", inputs["x_sf_packed"], T * H // SF_GRAN, **check)
+    ids = inputs["topk_idx"].detach().reshape(-1).cpu()
+    if int(ids.min()) < -1 or int(ids.max()) >= global_experts:
+        raise ValueError(
+            f"topk_idx must hold global expert ids in [0, {global_experts}) or -1; "
+            f"got [{int(ids.min())}, {int(ids.max())}]"
+        )
+    source_block_m, block_readiness, slot_list = source_schedule_form(
+        metadata, T, E, TK, weight_fmt
+    )
     N1, K1, N2, K2 = (2 * I, H, H, I)
     grid_n1, K1_tiles = (N1 // BLOCK_N, K1 // BLOCK_K)
-    grid_n2, K2_tiles = (N2 // BLOCK_N, K2 // BLOCK_K)
-    ref = _mega_dispatch_reference(inputs["topk_idx"], E)
-    # A batch whose every slot is -1 routes no row; its pools keep one aligned
-    # block so that their tensor maps stay valid.
+    # K2_tiles is a legacy term of the arrival-word bound and an unused kernel
+    # scalar; the physical width needs ceil(I / 256) of the 256-wide tiles.
+    grid_n2, K2_tiles = (N2 // BLOCK_N, -(-K2 // BLOCK_K))
+    ref = _mega_dispatch_reference(ids, E, local_expert_offset=offset)
+    # A batch that routes no row on this rank (every slot -1 or held by
+    # another rank) keeps one aligned block in its pools so that their tensor
+    # maps stay valid; the kernel writes zeros for every token.
     M_total = max(ref["M_total"], ALIGN_M)
     total_m_tiles = ref["total_m_tiles"]
+    source_blocks, arrival_words = source_workspace_words(
+        E, T, TK, source_block_m, block_readiness, total_m_tiles, K2_tiles
+    )
     topk_idx_i32 = inputs["topk_idx"].contiguous().view(torch.int32)
     topk_weights_flat = inputs["topk_weights"].contiguous().view(-1)
     x_fp8 = (
@@ -166,47 +649,113 @@ def prepare_pipeline_bindings(inputs, num_sms):
         .contiguous()
     )
     x_sf = inputs["x_sf_packed"].contiguous().view(torch.int32).view(torch.uint32)
-    B1 = _interleave_gate_up(inputs[f"w1_{weight_fmt}"]).contiguous().view(torch.uint8)
-    SFB1 = _sf_float_to_u32_words(_interleave_gate_up(inputs["w1_sf"])).view(
-        torch.uint32
-    )
-    B2 = inputs[f"w2_{weight_fmt}"].contiguous().view(torch.uint8)
-    SFB2 = _sf_float_to_u32_words(inputs["w2_sf"]).view(torch.uint32)
+    w1, w1_sf, w2, w2_sf = _pad_intermediate(w1, w1_sf, w2, w2_sf, logical_I, I, pack)
+    B1 = _interleave_gate_up(w1).contiguous().view(torch.uint8)
+    SFB1 = _sf_float_to_u32_words(_interleave_gate_up(w1_sf)).view(torch.uint32)
+    B2 = w2.contiguous().view(torch.uint8)
+    SFB2 = _sf_float_to_u32_words(w2_sf).view(torch.uint32)
     pool_fp8 = torch.zeros(M_total, H // 4, dtype=torch.int32, device="cuda")
+    # The FC1 ``A`` map: the pool rows the dispatch fills, or the activation
+    # bytes themselves for a program that reads the routed rows in place
+    # (``a_source`` ``"x"``): ``[T, H]``, one byte per element, row pitch
+    # ``H``, the extent its tensor map describes. ``x_fp8`` is the contiguous
+    # ``[T, H // 4]`` word view of the same bytes the dispatch reads.
+    if a_source == "x":
+        A = x_fp8.view(torch.uint8)
+        if tuple(A.shape) != (T, H) or not A.is_contiguous():
+            raise ValueError(
+                "MegaMoE input 'x_fp8_packed' must bind as a contiguous "
+                f"[{T}, {H}] byte view for a route that reads A from the "
+                f"activations; got shape {tuple(A.shape)}, strides {A.stride()}"
+            )
+        # The program ranks tokens within an expert, not slots: a token that
+        # routes to one local expert through two slots would take one row and
+        # the weight of one slot. A top-k router hands distinct experts per
+        # token; refuse the input rather than return a different sum. Masked
+        # (negative) ids and ids another rank holds take no row and may repeat.
+        local = ids.to(torch.int64).reshape(T, TK) - offset
+        unrouted = -1 - torch.arange(TK, dtype=torch.int64).reshape(1, TK)
+        local = torch.where((local >= 0) & (local < E), local, unrouted)
+        ordered = local.sort(dim=1).values
+        if bool(((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)).any()):
+            raise ValueError(
+                "MegaMoE input 'topk_idx' routes a token to one local expert "
+                "through two slots; a route that reads A from the activations "
+                "needs distinct experts per token"
+            )
+        # The program stages the scale words with 16-byte loads: hand it a
+        # word view that starts on a 16-byte boundary (a fresh allocation
+        # does; a slice of a larger buffer may not).
+        if x_sf.data_ptr() % 16:
+            x_sf = x_sf.clone()
+    else:
+        A = pool_fp8.view(torch.uint8)
     pool_sf = torch.zeros(M_total, H // 128, dtype=torch.int32, device="cuda")
-    routing_weight_pool = torch.zeros(M_total, dtype=torch.float32, device="cuda")
-    token_to_permuted = torch.full((T * TK,), -1, dtype=torch.int32, device="cuda")
-    meta_token = torch.full((M_total,), -1, dtype=torch.int32, device="cuda")
-    meta_slot = torch.full((M_total,), -1, dtype=torch.int32, device="cuda")
+    # The kernel-written control buffers in arena carve order (see
+    # ``_carve_control_arena``): the strong-op words of ``reset_storage``
+    # (counters, claim scratch, gates, arrival words), then the stores by
+    # every CTA, the CTA-0 tile lists and the dispatch scratch. A ``None``
+    # fill names a buffer every reader writes first (``PrivateSFBlockOffsets``,
+    # the slot-list ``expert_scatter_offsets``): the arena's zeros, or
+    # ``torch.empty`` outside it.
+    strong = [[("reset_storage", 2 * E + 4 + arrival_words, torch.uint32, 0)]]
+    stores = [
+        [("expert_row_offsets", E, torch.int32, 0)],
+        [("PrivateSFBlockOffsets", E, torch.uint32, None)],
+        [
+            ("tile_expert", total_m_tiles, torch.int32, -1),
+            ("tile_m_local", total_m_tiles, torch.int32, -1),
+            ("total_m_tiles_out", 1, torch.int32, 0),
+        ],
+        [("token_to_permuted", T * TK, torch.int32, -1)],
+        [("meta_token", M_total, torch.int32, -1)],
+        [("meta_slot", M_total, torch.int32, -1)],
+        [("routing_weight_pool", M_total, torch.float32, 0)],
+    ]
+    if slot_list:
+        # Slot-list dispatch: per-expert slot list [E, T] (native
+        # src_token_topk_idx), fully rewritten by every launch, never reset.
+        stores.insert(2, [("expert_scatter_offsets", E * T, torch.int32, None)])
+    control_slab, arena = _carve_control_arena(arena_mode, strong, stores)
+    spec = {
+        name: (numel, dtype, fill)
+        for slot in strong + stores
+        for name, numel, dtype, fill in slot
+    }
+
+    def control(name):
+        """The named control buffer: its arena slot, else allocated here, in
+        the order and form the buffers had before the arena."""
+        if name in arena:
+            return arena[name]
+        numel, dtype, fill = spec[name]
+        if fill is None:
+            return torch.empty(numel, dtype=dtype, device="cuda")
+        if fill == 0:
+            return torch.zeros(numel, dtype=dtype, device="cuda")
+        return torch.full((numel,), fill, dtype=dtype, device="cuda")
+
+    routing_weight_pool = control("routing_weight_pool")
+    token_to_permuted = control("token_to_permuted")
+    meta_token = control("meta_token")
+    meta_slot = control("meta_slot")
     num_sms = int(num_sms)
     # The source schedule runs one CTA per SM (NUM_CTAS) however few tiles
     # the routes fill, e.g. when -1 slots leave fewer routed tokens.
     persistent_grid = num_sms
     grid = (persistent_grid, 1, 1)
-    residual_readiness = (
-        weight_fmt == "fp4"
-        and T in (16, 128, 512, 1024, 4096)
-        or (weight_fmt == "fp8" and T == 16)
-    )
-    arrival_words = total_m_tiles * K2_tiles
-    arrival_words = max(
-        arrival_words,
-        2 + (3 if T == 1 or residual_readiness else 2) * source_blocks,
-    )
-    reset_storage = torch.zeros(
-        2 * E + 4 + arrival_words, dtype=torch.uint32, device="cuda"
-    )
+    reset_storage = control("reset_storage")
     expert_counts = reset_storage[:E].view(torch.int32)
-    expert_row_offsets = torch.zeros(E, dtype=torch.int32, device="cuda")
-    if residual_readiness:
-        # Round-7 slot-list dispatch: per-expert slot list [E, T] (native
-        # src_token_topk_idx), fully rewritten by every launch, never reset.
-        expert_scatter_offsets = torch.empty(E * T, dtype=torch.int32, device="cuda")
+    expert_row_offsets = control("expert_row_offsets")
+    if slot_list:
+        expert_scatter_offsets = control("expert_scatter_offsets")
     else:
+        # Per-expert claim scratch [E], read before it is written: zero at
+        # prepare (and at bind), zeroed again by the kernel on exit.
         expert_scatter_offsets = reset_storage[E : 2 * E].view(torch.int32)
-    tile_expert = torch.full((total_m_tiles,), -1, dtype=torch.int32, device="cuda")
-    tile_m_local = torch.full((total_m_tiles,), -1, dtype=torch.int32, device="cuda")
-    total_m_tiles_out = torch.zeros(1, dtype=torch.int32, device="cuda")
+    tile_expert = control("tile_expert")
+    tile_m_local = control("tile_m_local")
+    total_m_tiles_out = control("total_m_tiles_out")
     I_fp8 = torch.zeros(M_total, I, dtype=torch.uint8, device="cuda")
     SF_I = torch.zeros(M_total, I // GRAN_OUT, dtype=torch.uint8, device="cuda")
     expert_output = torch.zeros(M_total, H, dtype=torch.bfloat16, device="cuda")
@@ -222,7 +771,7 @@ def prepare_pipeline_bindings(inputs, num_sms):
         topk_weights=topk_weights_flat,
         x_fp8=x_fp8,
         x_sf=x_sf,
-        A=pool_fp8.view(torch.uint8),
+        A=A,
         pool_fp8=pool_fp8,
         pool_sf=pool_sf.view(torch.uint32),
         routing_weight_pool=routing_weight_pool,
@@ -267,6 +816,10 @@ def prepare_pipeline_bindings(inputs, num_sms):
         activation_clamp=float("inf")
         if inputs.get("activation_clamp") is None
         else float(inputs["activation_clamp"]),
+        # Global id of this rank's first expert: a program with the local
+        # expert filter routes ids outside [offset, offset + E) to no expert.
+        # A program whose argument plan lacks the scalar never reads it.
+        local_expert_offset=offset,
     )
     for name in ("SFB1", "SFB2"):
         original = launch_kwargs[name]
@@ -278,9 +831,15 @@ def prepare_pipeline_bindings(inputs, num_sms):
             .contiguous()
             .reshape(-1, rows)
         )
-    for name in ("B1", "B2"):
-        original = launch_kwargs[name]
-        launch_kwargs[name] = original.reshape(-1, original.shape[-1])
+    launch_kwargs["B2"] = launch_kwargs["B2"].reshape(-1, launch_kwargs["B2"].shape[-1])
+    launch_kwargs["B1"] = w1_launch_view(launch_kwargs["B1"], logical_I, w1_expert_map)
+    launch_kwargs["SFB1"] = sfb1_launch_view(
+        launch_kwargs["SFB1"],
+        logical_I,
+        num_sms=num_sms,
+        num_experts=E,
+        num_global_experts=global_experts,
+    )
     source_rows = source_blocks * 128
     source_sf1 = torch.zeros((H // 128, source_rows), dtype=torch.uint32, device="cuda")
     source_sf2 = torch.zeros((I // 128, source_rows), dtype=torch.uint32, device="cuda")
@@ -288,7 +847,7 @@ def prepare_pipeline_bindings(inputs, num_sms):
         PrivateCounters=l1_arrival[:2],
         PrivateMasks=l1_arrival[2 : 2 + 2 * source_blocks].view(torch.uint64),
         PublicExpertOutput=expert_output.view(torch.uint32),
-        PrivateSFBlockOffsets=torch.empty((E,), dtype=torch.uint32, device="cuda"),
+        PrivateSFBlockOffsets=control("PrivateSFBlockOffsets"),
         PrivateSF1=source_sf1,
         PrivateSF2=source_sf2,
         PrivateSF1Words=source_sf1.reshape(-1),
@@ -307,10 +866,15 @@ def prepare_pipeline_bindings(inputs, num_sms):
         bindings=launch_kwargs,
         reset_storage=reset_storage,
         reset_buffers=reset_buffers,
+        control_slab=control_slab,
         output=y,
         expert_output=expert_output,
         source_schedule=True,
         grid=grid,
         M_total=M_total,
         total_m_tiles=total_m_tiles,
+        intermediate=I,
+        local_expert_offset=offset,
+        num_global_experts=global_experts,
+        block_m=source_block_m,
     )
