@@ -375,6 +375,84 @@ def test_rope_cos_sin_cache(
     torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
 
 
+def _run_rope_variant(kernel, q, k, pos_ids, indptr, offsets, cos_sin_cache, inplace):
+    q, k = q.clone(), k.clone()
+    head_dim = q.shape[-1]
+    if kernel == "cos_sin_cache":
+        args = (pos_ids, q.view(q.shape[0], -1), k.view(k.shape[0], -1), head_dim)
+        if inplace:
+            flashinfer.apply_rope_with_cos_sin_cache_inplace(
+                *args, cos_sin_cache, is_neox=True
+            )
+            return q, k
+        q_out, k_out = flashinfer.apply_rope_with_cos_sin_cache(
+            *args, cos_sin_cache, is_neox=True
+        )
+        return q_out.view_as(q), k_out.view_as(k)
+    rotary_dim = head_dim // 2
+    if kernel == "pos_ids":
+        fn = (
+            flashinfer.apply_rope_pos_ids_inplace
+            if inplace
+            else flashinfer.apply_rope_pos_ids
+        )
+        out = fn(q, k, pos_ids, rotary_dim=rotary_dim, interleave=False)
+    elif kernel == "llama31_pos_ids":
+        fn = (
+            flashinfer.apply_llama31_rope_pos_ids_inplace
+            if inplace
+            else flashinfer.apply_llama31_rope_pos_ids
+        )
+        out = fn(q, k, pos_ids, rotary_dim=rotary_dim, interleave=True)
+    else:
+        fn = flashinfer.apply_rope_inplace if inplace else flashinfer.apply_rope
+        out = fn(q, k, indptr, offsets, rotary_dim=rotary_dim, interleave=False)
+    return (q, k) if inplace else out
+
+
+# The two-heads kernel is picked automatically only on SM107, and the head split only for
+# some shapes, so force each schedule and require the automatic schedule's exact output.
+@pytest.mark.parametrize(
+    "kernel", ["pos_ids", "llama31_pos_ids", "cos_sin_cache", "indptr"]
+)
+@pytest.mark.parametrize("two_heads", [False, True])
+@pytest.mark.parametrize("split", [1, 2, 3, 64])
+@pytest.mark.parametrize("num_qo_heads, num_kv_heads", [(7, 2), (8, 1), (32, 8)])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_rope_forced_launch_schedule(
+    kernel, two_heads, split, num_qo_heads, num_kv_heads, inplace
+):
+    head_dim, batch_size, qkv_len = 128, 3, 37
+    nnz = batch_size * qkv_len
+    q = torch.randn(nnz, num_qo_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    k = torch.randn(nnz, num_kv_heads, head_dim, dtype=torch.bfloat16, device="cuda")
+    offsets = torch.tensor([0, 5, 99], dtype=torch.int32, device="cuda")
+    indptr = torch.arange(
+        0, nnz + 1, qkv_len, dtype=torch.int32, device="cuda"
+    )  # 3 requests of qkv_len tokens
+    pos_ids = torch.cat(
+        [torch.arange(o, o + qkv_len, device="cuda") for o in offsets.tolist()]
+    ).to(torch.int32)
+    inv_freq = 1.0 / (
+        1e4
+        ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device="cuda") / head_dim)
+    )
+    freqs = torch.outer(torch.arange(256, device="cuda", dtype=torch.float32), inv_freq)
+    cos_sin_cache = torch.cat([freqs.cos(), freqs.sin()], dim=-1)
+    args = (kernel, q, k, pos_ids, indptr, offsets, cos_sin_cache, inplace)
+
+    q_ref, k_ref = _run_rope_variant(*args)
+    try:
+        flashinfer.rope._set_rope_launch_override(two_heads=two_heads, split=split)
+        q_out, k_out = _run_rope_variant(*args)
+        torch.cuda.synchronize()
+    finally:
+        flashinfer.rope._set_rope_launch_override()
+
+    torch.testing.assert_close(q_out, q_ref, rtol=0, atol=0)
+    torch.testing.assert_close(k_out, k_ref, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("backend", ["cuda", "cutile"])
 @parametrize_product(
     {

@@ -1183,18 +1183,35 @@ inline cudaError_t RopeResidentCtas(const void* kernel, uint32_t num_threads, ui
   return cudaSuccess;
 }
 
-// Two heads per step only pays where SM occupancy is already capped by the 1024-thread
-// resident limit (SM107); with 2048 threads/SM its extra registers cost occupancy.
+// Test-only launch override (set via rope_set_launch_override): two_heads < 0 and split == 0
+// mean automatic. A forced split launches the token-parallel split kernel with gridDim.y = split,
+// so tests can run the two-heads and strided kernels on any GPU.
+struct RopeLaunchOverride {
+  int32_t two_heads = -1;
+  uint32_t split = 0;
+};
+
+inline RopeLaunchOverride& GetRopeLaunchOverride() {
+  static RopeLaunchOverride launch_override;
+  return launch_override;
+}
+
+// Two heads per step is measured only on SM107, where the 1024-thread resident limit already
+// caps occupancy; on 2048-thread SMs its extra registers cost resident CTAs.
 inline cudaError_t RopeUseTwoHeadsPerStep(bool& two_heads) {
+  if (GetRopeLaunchOverride().two_heads >= 0) {
+    two_heads = GetRopeLaunchOverride().two_heads != 0;
+    return cudaSuccess;
+  }
   static thread_local int cached_device = -1;
   static thread_local bool cached_value = false;
   int device = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
   if (device != cached_device) {
-    int max_threads_per_sm = 0;
-    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_threads_per_sm,
-                                                cudaDevAttrMaxThreadsPerMultiProcessor, device));
-    cached_value = max_threads_per_sm <= 1024;
+    int major = 0, minor = 0;
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
+    cached_value = major == 10 && minor == 7;
     cached_device = device;
   }
   two_heads = cached_value;
@@ -1204,11 +1221,17 @@ inline cudaError_t RopeUseTwoHeadsPerStep(bool& two_heads) {
 // gridDim.y for the token-parallel pos_ids kernels; a step is one head, or a pair of heads
 // with two heads per step. With one head per step the unsplit
 // kernel (gridDim.y == 1, fewer registers) is kept unless the strided kernel, at its own
-// occupancy, models faster; `use_split_kernel` reports which kernel to launch.
+// occupancy, models faster (by > 1.1x once the unsplit grid exceeds one wave);
+// `use_split_kernel` reports which kernel to launch.
 inline cudaError_t RopeHeadSplit(uint32_t nblks, const void* split_kernel,
                                  const void* unsplit_kernel, uint32_t num_threads,
                                  uint32_t num_qo_heads, uint32_t num_kv_heads, bool two_heads,
                                  uint32_t& split, bool& use_split_kernel) {
+  if (GetRopeLaunchOverride().split > 0) {
+    split = GetRopeLaunchOverride().split;
+    use_split_kernel = true;
+    return cudaSuccess;
+  }
   auto steps = [&](uint32_t g) {
     const uint32_t heads = ceil_div(num_qo_heads + num_kv_heads, g);
     return two_heads ? ceil_div(heads, 2u) : heads;
@@ -1221,7 +1244,13 @@ inline cudaError_t RopeHeadSplit(uint32_t nblks, const void* split_kernel,
   if (!two_heads) {
     uint32_t unsplit_ctas = 0;
     FLASHINFER_CUDA_CALL(RopeResidentCtas(unsplit_kernel, num_threads, unsplit_ctas));
-    if (unsplit_ctas == 0 || RopeSplitCost(nblks, unsplit_ctas, 1, steps) <= split_cost) {
+    // Below one wave a split fills idle SMs. Past it the modelled saving is only the last
+    // partial wave, which the strided kernel's overhead can outweigh, so require > 1.1x.
+    const uint64_t unsplit_cost =
+        unsplit_ctas == 0 ? 0 : RopeSplitCost(nblks, unsplit_ctas, 1, steps);
+    const bool multi_wave = nblks > unsplit_ctas;
+    if (unsplit_ctas == 0 ||
+        (multi_wave ? unsplit_cost * 10 <= split_cost * 11 : unsplit_cost <= split_cost)) {
       split = 1;
       use_split_kernel = false;
     }
@@ -1546,7 +1575,7 @@ cudaError_t BatchQKApplyRotaryPosIdsCosSinCache(
         FLASHINFER_CUDA_CALL(RopeResidentCtas(
             two_heads ? (void*)split_kernel : (void*)unsplit_kernel, num_threads, num_ctas_0));
 
-        if ((nnz + bdy - 1) / bdy >= num_ctas_0) {
+        if ((nnz + bdy - 1) / bdy >= num_ctas_0 || GetRopeLaunchOverride().split > 0) {
           uint32_t split = 1;
           bool use_split_kernel = false;
           FLASHINFER_CUDA_CALL(RopeHeadSplit(nblks_x, (void*)split_kernel, (void*)unsplit_kernel,
@@ -1644,7 +1673,7 @@ cudaError_t BatchQKApplyRotaryPosIds(
       uint32_t num_ctas_0 = 0;
       FLASHINFER_CUDA_CALL(RopeResidentCtas(two_heads ? (void*)split_kernel : (void*)unsplit_kernel,
                                             num_threads, num_ctas_0));
-      if (nblks_x >= num_ctas_0) {
+      if (nblks_x >= num_ctas_0 || GetRopeLaunchOverride().split > 0) {
         uint32_t split = 1;
         bool use_split_kernel = false;
         FLASHINFER_CUDA_CALL(RopeHeadSplit(nblks_x, (void*)split_kernel, (void*)unsplit_kernel,
@@ -1702,6 +1731,7 @@ cudaError_t BatchQKApplyRotary(DType* q, DType* k, DType* q_rope, DType* k_rope,
         split = RopeGridSplit(nblks_x, num_ctas, mean_iters,
                               [&](uint32_t g) { return ceil_div(mean_iters, g); });
       }
+      if (GetRopeLaunchOverride().split > 0) split = GetRopeLaunchOverride().split;
       dim3 nblks(nblks_x, split);
       dim3 nthrs(bdx, bdy);
       void* args[] = {(void*)&q,
@@ -1779,6 +1809,7 @@ cudaError_t BatchQKApplyLlama31Rotary(
         split = RopeGridSplit(nblks_x, num_ctas, mean_iters,
                               [&](uint32_t g) { return ceil_div(mean_iters, g); });
       }
+      if (GetRopeLaunchOverride().split > 0) split = GetRopeLaunchOverride().split;
       dim3 nblks(nblks_x, split);
       dim3 nthrs(bdx, bdy);
       void* args[] = {(void*)&q,
