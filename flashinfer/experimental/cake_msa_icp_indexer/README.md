@@ -30,14 +30,20 @@ score and local Top16 steps with `msa_icp_decode_score_publish`: the scorer
 keeps per-split Top16 lists in a uint8 `pool` (`msa_icp_decode_pool_bytes`)
 and a list publisher merges them, giving the same receive rows.  It cuts each
 request into at most 48 splits (`cake_jit.TOPK16_SPLIT_CAP`, per
-architecture).  The facade runs it when `decode(..., pool=...)` is given.
+architecture).  The facade runs it when `decode(..., pool=...)` is given, and
+without a pool on compute capability 10.7 at P128 (TP2 and TP4) from 8 requests on, in
+a pool it allocates once (`cake_backend.fused_decode_min_batch`;
+`MSAIcpIndexerPlan.fused_decode_min_batch` is `None` on every other layout).
+There the measured end-to-end decode step is faster with the fused chain;
+below 8 requests and at P256 TP4 the score plane is faster.
 
 *The two chains of one sparse layer.*
 
 With programmatic dependent launch (`enable_pdl`), every kernel waits on its
 predecessor before it reads data an earlier kernel of the step wrote, with one
 exception: on compute capability 10.0 and 10.3 at 64 or 128 local K rows per
-page (P128 TP2, P256 TP2 and TP4), the score plane reads `seq_lens` and
+page (P128 TP2, P256 TP2 and TP4) and on 10.7 at 32 or 64 (P128 TP4 and TP2,
+P256 TP4), the score plane reads `seq_lens` and
 `block_table` and starts loading the history index-K pages (those ending at or
 before `seq_len - decode_query_len`) before its wait.  The kernel launched just
 before the score plane must not write them, and must either be launched

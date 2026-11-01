@@ -1579,6 +1579,82 @@ def test_facade_decode_defaults_to_plane_and_select_publish(
     )
 
 
+class _NoAllocTorch:
+    """``torch`` as the facade module sees it after construction: any
+    allocation raises (``decode`` must stay CUDA Graph safe)."""
+
+    def __getattr__(self, name: str) -> Any:
+        if name in ("empty", "zeros", "full", "ones", "tensor", "empty_like"):
+            raise AssertionError(f"decode allocated with torch.{name}")
+        return getattr(torch, name)
+
+
+@pytest.mark.parametrize("tagged", (False, True), ids=("legacy", "tagged"))
+@pytest.mark.parametrize("arch", ARCHES)
+@pytest.mark.parametrize(("page", "world"), LAYOUTS)
+def test_facade_decode_takes_the_fused_chain_by_rule(
+    monkeypatch, page: int, world: int, arch: str, tagged: bool
+) -> None:
+    """Without ``pool``, a decode layer runs the fused chain (list scorer ->
+    list publisher -> merge) in the facade's own pool on sm_107a at P128 W4
+    and W2 from 8 requests on, and the score plane -> select publish -> merge on
+    every other layout, architecture and smaller batch.  The pool is
+    allocated once, at construction, only on that layout (pool bytes for the
+    receive capacity); ``decode`` allocates nothing.  A caller ``pool``
+    always runs the fused chain in that pool."""
+    fake = _intercept(monkeypatch, arch, real_registry=False)
+    rule = 8 if (arch, page) == ("sm_107a", 128) and world in (2, 4) else None
+    cap = 40
+    plan = _decode_facade(page, world, capacity=cap)
+    assert plan.fused_decode_min_batch == rule
+    if rule is None:
+        assert plan._fused_pool is None
+    else:
+        own = plan._fused_pool
+        assert own.dtype == torch.uint8 and own.is_contiguous()
+        assert own.numel() == cb.decode_pool_bytes(max_decode_tokens=cap, num_heads=H)
+    comm = _meta_comm(world, cap)
+    monkeypatch.setattr(cake_indexer, "torch", _NoAllocTorch())
+    for batch in (1, 7, 8, 10):
+        a = fused_args(page, world, tagged=tagged, batch=batch)
+        t = a["index_q"].shape[0]
+        scores = _t((t, H, 32), torch.float32)
+        output = _t((t, H // world, 16), torch.int32)
+        inputs = [
+            a[k]
+            for k in (
+                "index_q",
+                "index_k",
+                "block_table",
+                "seq_lens",
+                "num_valid_pages",
+            )
+        ]
+        kwargs = dict(comm=comm, slot=1, tagged=tagged, decode_query_len=4)
+        merge = cb.merge_role(prefill=False, tagged=tagged, num_tokens=t)
+        fake.clear()
+        plan.decode(*inputs, scores, output, **kwargs)
+        fused = rule is not None and batch >= rule
+        chain = (
+            ["decode_topk", "topk16_publish"]
+            if fused
+            else ["decode_plane", "select_publish"]
+        )
+        assert fake.roles() == [*chain, merge], (batch, fake.roles())
+        assert all(launch.enable_pdl for launch in fake)
+        if fused:
+            assert _same_storage(fake[0].values["pool"], plan._fused_pool)
+            assert not any(
+                _same_storage(v, scores)
+                for launch in fake
+                for v in launch.values.values()
+            )
+        fake.clear()
+        plan.decode(*inputs, scores, output, **kwargs, pool=a["pool"])
+        assert fake.roles() == ["decode_topk", "topk16_publish", merge]
+        assert _same_storage(fake[0].values["pool"], a["pool"])
+
+
 # The per-call tensors and arguments ``decode`` still checks once its comm is
 # validated (L5 5f16464d: check_comm on the first use of a comm, then the
 # trusted publish / merge check scores, num_valid_pages, output and slot).

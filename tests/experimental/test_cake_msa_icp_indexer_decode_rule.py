@@ -9,9 +9,11 @@ Layouts (page size ``P``, world size ``W``, local K rows per page ``R = P // W``
 * sm_100a: every layout runs the base plane record at one wave.
 * sm_107a: every layout runs its own plane record at one wave.
 
-The list scorer of the fused path keeps its records and split cap.  The CPU tests pin the records and the split
-counts exactly; the GPU test checks that the plane the rule launches is bit-identical to the plane at one split and
-at one wave on the device's architecture.
+The list scorer of the fused path keeps its records and split cap.  The facade's decode without a caller pool runs
+the fused chain (list scorer and list publisher, in a pool the facade allocates) on sm_107a at P128 W4 and W2
+from 8 requests on, and the score plane everywhere else.  The CPU tests pin the records, the split counts and the chain rule
+exactly; the GPU test checks that the plane the rule launches is bit-identical to the plane at one split and at one
+wave on the device's architecture.
 """
 
 from __future__ import annotations
@@ -132,6 +134,25 @@ def test_the_rows_32_cap_starts_at_batch_14_on_sm_103a(sms) -> None:
     )
 
 
+# (arch, page size, world size) -> first decode batch of the facade's fused chain; every other layout: None.
+FUSED_RULE = {("sm_107a", 128, 4): 8, ("sm_107a", 128, 2): 8}
+
+
+@pytest.mark.parametrize("arch", list(SMS))
+@pytest.mark.parametrize(("page", "world"), LAYOUTS)
+def test_the_facade_chain_rule(arch: str, page: int, world: int) -> None:
+    if not any(arch in record["arches"] for record in cake_jit.MODULES.values()):
+        pytest.skip(f"no {arch} records in this build")
+    want = FUSED_RULE.get((arch, page, world))
+    assert cake_backend.fused_decode_min_batch(arch, page, world) == want
+    if want is not None:
+        # the rule's chain is delivered on that architecture
+        assert cake_jit.has_role("decode_topk", arch)
+        assert cake_jit.has_role("topk16_publish", arch)
+        assert cake_jit.route("decode_topk", page // world, arch)
+    assert cake_backend.FUSED_DECODE_MIN_BATCH == FUSED_RULE
+
+
 def test_the_rule_reads_no_environment(sms, monkeypatch: pytest.MonkeyPatch) -> None:
     for key in [key for key in os.environ if key.startswith("FI_CAKE_MSA_ICP")]:
         monkeypatch.delenv(key)
@@ -140,6 +161,18 @@ def test_the_rule_reads_no_environment(sms, monkeypatch: pytest.MonkeyPatch) -> 
     )
     monkeypatch.setenv("FI_CAKE_MSA_ICP_EXP_PLANE_SPLITS", "7")
     monkeypatch.setenv("FI_CAKE_MSA_ICP_EXP_R32_PLANE", "base")
+    monkeypatch.setenv("FI_CAKE_MSA_ICP_EXP_T16_MIN_BATCH", "1")
+    fused_107 = cake_jit.has_role("decode_topk", "sm_107a") and cake_jit.has_role(
+        "topk16_publish", "sm_107a"
+    )
+    assert cake_backend.fused_decode_min_batch("sm_107a", 128, 4) == (
+        8 if fused_107 else None
+    )
+    assert cake_backend.fused_decode_min_batch("sm_107a", 128, 2) == (
+        8 if fused_107 else None
+    )
+    assert cake_backend.fused_decode_min_batch("sm_107a", 256, 4) is None
+    assert cake_backend.fused_decode_min_batch("sm_103a", 128, 4) is None
     assert (
         cake_backend.plane_splits(
             "decode_plane_r32_s2k4", 32, "sm_103a", 14, sms["sm_103a"]
