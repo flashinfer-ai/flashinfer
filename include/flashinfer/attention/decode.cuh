@@ -401,12 +401,14 @@ __global__ void SingleDecodeWithKVCacheKernel(const __grid_constant__ Params par
 template <PosEncodingMode POS_ENCODING_MODE, uint32_t num_stages_smem, uint32_t tile_size_per_bdx,
           uint32_t vec_size, uint32_t bdx, uint32_t bdy, uint32_t bdz, typename AttentionVariant,
           typename Params>
-__device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& params, uint8_t smem[],
-                                                             const uint32_t bx = blockIdx.x,
-                                                             const uint32_t by = blockIdx.y,
-                                                             const uint32_t tx = threadIdx.x,
-                                                             const uint32_t ty = threadIdx.y,
-                                                             const uint32_t tz = threadIdx.z) {
+__device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(
+    const Params& params, uint8_t smem[], const uint32_t bx = blockIdx.x,
+    const uint32_t by = blockIdx.y, const uint32_t tx = threadIdx.x,
+    const uint32_t ty = threadIdx.y, const uint32_t tz = threadIdx.z,
+    const int32_t chunk_start_override = -1, const int32_t chunk_end_override = -1,
+    const int32_t output_head_base_override = -1) {
+  // Optional explicit ranges/compact output for persistent task consumers.
+  // The native caller uses compile-time default arguments and is unchanged.
   auto block = cg::this_thread_block();
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
@@ -432,9 +434,13 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   const uint32_t kv_chunk_size = *(params.kv_chunk_size_ptr);
   const uint32_t kv_len = paged_kv.get_length(batch_idx);
   const uint32_t max_chunk_size = partition_kv ? kv_chunk_size : kv_len;
-  const uint32_t chunk_start = partition_kv ? kv_tile_idx * max_chunk_size : 0;
+  const uint32_t chunk_start = chunk_start_override >= 0
+                                   ? chunk_start_override
+                                   : (partition_kv ? kv_tile_idx * max_chunk_size : 0);
   const uint32_t chunk_end =
-      partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len;
+      chunk_end_override >= 0
+          ? chunk_end_override
+          : (partition_kv ? min((kv_tile_idx + 1) * max_chunk_size, kv_len) : kv_len);
   const uint32_t chunk_size = chunk_end - chunk_start;
 
   AttentionVariant variant(params, batch_idx, smem);
@@ -607,10 +613,13 @@ __device__ __inline__ void BatchDecodeWithPagedKVCacheDevice(const Params& param
   }
 
   if (tz == 0) {
-    st.o.cast_store(o + (bx * num_qo_heads + qo_head_idx) * head_dim + tx * vec_size);
+    const uint32_t output_head_idx = output_head_base_override >= 0
+                                         ? output_head_base_override + ty
+                                         : bx * num_qo_heads + qo_head_idx;
+    st.o.cast_store(o + output_head_idx * head_dim + tx * vec_size);
     // write lse
     if (lse != nullptr) {
-      lse[bx * num_qo_heads + qo_head_idx] = st.get_lse();
+      lse[output_head_idx] = st.get_lse();
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
