@@ -109,11 +109,12 @@ with a ``deterministic: bool = True`` keyword on every entry point except
 * ``deterministic=True`` (default) runs ``flashinfer.cake_mhc_det_train``
   unchanged, for hidden sizes 4096, 5120 and 7168 (4096 on SM107).
 * ``deterministic=False`` runs the non-deterministic package
-  ``flashinfer.experimental.cake.cake_mhc_train_backend``, for hidden size 4096
-  only; its entry points raise ``ValueError`` for another hidden size. Its
-  backward has no final reduction kernel: the column-slab pass adds the ``dfn``
-  sum of every (column slab, token chunk) unit into ``dfn`` with FP32 reductions
-  and folds ``dscale`` / ``dbase`` in the same grid.
+  ``flashinfer.experimental.cake.cake_mhc_train_backend``, for the same hidden
+  sizes: 4096, 5120 and 7168 on SM100 / SM103, 4096 on SM107; its entry points
+  raise ``ValueError`` for another hidden size. Its backward has no final
+  reduction kernel: the column-slab pass adds the ``dfn`` sum of every (column
+  slab, token chunk) unit into ``dfn`` with FP32 reductions and folds
+  ``dscale`` / ``dbase`` in the same grid.
 
 Numerical contract of ``deterministic=False``: only the summation order of
 ``dfn`` varies from run to run. Each element lies within ``P`` FP32 roundings
@@ -139,11 +140,12 @@ Interaction with ``torch.use_deterministic_algorithms(True)``:
   raises ``ValueError`` unless ``deterministic=False``.
 
 Workspaces: the workspace helpers take the deterministic package's
-``hidden=`` keyword (default 4096); ``deterministic=False`` accepts 4096 only.
-The forward workspace has one layout in both modes. The
-``deterministic=False`` backward workspace is the deterministic one at the same
-offsets without the per-chunk FP32 ``dfn`` partials (``P x 24 x 16384 x 4``
-bytes), so ``cake_mhc_train_backward_workspace(T, device, deterministic=True)``
+``hidden=`` keyword (default 4096) in both modes; it accepts the hidden sizes
+of the device's architecture. The forward workspace has one layout in both
+modes. The ``deterministic=False`` backward workspace is the deterministic one
+at the same offsets without the per-chunk FP32 ``dfn`` partials
+(``P x 24 x 4H x 4`` bytes at hidden size ``H``), so
+``cake_mhc_train_backward_workspace(T, device, hidden=H, deterministic=True)``
 serves both modes and ``deterministic=False`` sizes the smaller one. When the
 deterministic mode turns a ``deterministic=False`` call with a caller-owned
 backward workspace that is too small for the deterministic layout into the
@@ -151,14 +153,14 @@ deterministic backward, the call runs on a private zeroed companion buffer of
 that workspace, never on the shared default buffer. Inside a CUDA graph
 capture a missing companion raises ``ValueError``.
 
-The default workspaces (``workspace=None``) are one buffer per device and
-power-of-two token-count bucket in each package, shared by every stream and
-every graph replay on the device: calls that can run concurrently on different
-streams pass caller-owned workspaces. ``deterministic=False`` creates no
-default buffer while the current stream of the buffer's device is capturing a
-CUDA graph (``ValueError``); warm up with the same ``deterministic`` value and
-token count before the capture. A companion is allocated zeroed outside any
-capture and every completed launch leaves its
+The default workspaces (``workspace=None``) are one buffer per device, hidden
+size and power-of-two token-count bucket in each package, shared by every
+stream and every graph replay on the device: calls that can run concurrently on
+different streams pass caller-owned workspaces. ``deterministic=False`` creates
+no default buffer while the current stream of the buffer's device is capturing
+a CUDA graph (``ValueError``); warm up with the same ``deterministic`` value,
+token count and hidden size before the capture. A companion is allocated
+zeroed outside any capture and every completed launch leaves its
 ticket words at zero, so it needs no reset; ``cake_mhc_train_reset_workspace``
 zeroes the buffer it is given.
 
