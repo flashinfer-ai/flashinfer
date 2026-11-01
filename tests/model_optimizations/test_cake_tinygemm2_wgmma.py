@@ -240,13 +240,18 @@ ROUTES = [
 ]
 
 
+@pytest.mark.parametrize("use_pdl", [False, True])
 @pytest.mark.parametrize("batch,out_features,in_features,bias,program", ROUTES)
-def test_tinygemm2_wgmma_routes(batch, out_features, in_features, bias, program):
+def test_tinygemm2_wgmma_routes(
+    batch, out_features, in_features, bias, program, use_pdl
+):
+    """PDL selects the same tile through the same windows, as its _PDL program."""
     from flashinfer.gemm.routergemm import _tinygemm2_wgmma_identifier
 
+    expected = None if program is None else program + ("_PDL" if use_pdl else "")
     assert (
-        _tinygemm2_wgmma_identifier(batch, out_features, in_features, bias, False)
-        == program
+        _tinygemm2_wgmma_identifier(batch, out_features, in_features, bias, use_pdl)
+        == expected
     )
 
 
