@@ -33,11 +33,13 @@ and :func:`route_key` (the same in both packages):
   the ``dfn`` sum of every (column slab, token chunk) unit into ``dfn`` with
   FP32 reductions and folds ``dscale`` / ``dbase`` in the same grid.  Only the
   summation order of ``dfn`` varies from run to run: each element lies within
-  ``P`` FP32 roundings of the fixed-order sum (``P <= 32`` token chunks), and
-  the FP32 reduction flushes subnormal addends and results to zero.  ``dX``,
-  ``dscale`` and ``dbase`` are bitwise the deterministic values, and so are the
-  forward, the statistics replay and ``backward_prepare`` (copies of the
-  deterministic programs).
+  ``P`` FP32 roundings of the fixed-order sum of its per-chunk partials
+  (``P <= 32`` token chunks; the chunk sizes are the host rule's per token
+  count and device, so the low-order bits can also differ from the
+  deterministic ``dfn``), and the FP32 reduction flushes subnormal addends and
+  results to zero.  ``dX``, ``dscale`` and ``dbase`` are bitwise the
+  deterministic values, and so are the forward, the statistics replay and
+  ``backward_prepare`` (copies of the deterministic programs).
 * With ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
   runs the deterministic package and warns once per process
   (``UserWarning``).  The non-deterministic package itself never falls back:
@@ -559,9 +561,12 @@ def cake_mhc_train_backward_finish(
         :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_finish`.
         ``False``: the non-deterministic backward (``dfn`` summed with FP32
         reductions in a run-to-run varying order, each element within
-        ``P <= 32`` FP32 roundings of the fixed-order sum; ``dX``, ``dscale``,
-        ``dbase`` bitwise the deterministic values; ``accumulate=True`` adds onto
-        the caller's values the same way).  Under
+        ``P <= 32`` FP32 roundings of the fixed-order sum of its per-chunk
+        partials; the chunk sizes are the host rule's per token count and
+        device, so the low-order bits can also differ from the deterministic
+        ``dfn``; ``dX``, ``dscale``, ``dbase`` bitwise the deterministic
+        values; ``accumulate=True`` adds onto the caller's values the same
+        way).  Under
         ``torch.use_deterministic_algorithms(True)`` a ``False`` call runs the
         deterministic backward (one warning per process); a caller workspace
         too small for its layout is then replaced by a private companion buffer
