@@ -823,6 +823,7 @@ class TPMoEPlan:
     max_tokens_per_launch: int
     dynamic_physical_tiles: int | None = None
     dynamic_task_capacity: int | None = None
+    w4a8_n64_repacked: bool = False
 
     @property
     def deterministic_output(self) -> bool:
@@ -961,6 +962,14 @@ class TPMoEScratchCaps:
         return self.weight_plan.w4a16_scale_format
 
 
+_COMPACT_LAUNCHERS_REQUIRED = (
+    "compact W4A8 micro execution with N64-packed weights requires the "
+    "prepared launchers from fused_moe.plan_execution(); pass that plan to "
+    "fused_moe.bind() and fused_moe.run(). Sparse bindings, direct bindings "
+    "and fused_moe.plan() scratch plans do not carry these launchers."
+)
+
+
 @dataclass(frozen=True)
 class TPMoEScratchPlan:
     caps: TPMoEScratchCaps
@@ -1008,6 +1017,7 @@ class TPMoEScratchPlan:
         output_expert_map: torch.Tensor | None = None,
         scales_expanded: bool = False,
         _w4a16_launches: object | None = None,
+        _compact_launches: object | None = None,
     ) -> "TPMoEFP4Binding":
         """Bind live tensors to this scratch plan.
 
@@ -1017,6 +1027,13 @@ class TPMoEScratchPlan:
         """
         if not isinstance(experts, B12XFP4ExpertWeights):
             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
+        if (
+            self.launch_plan.implementation == "micro"
+            and self.launch_plan.quant_mode == "w4a8_mx"
+            and self.launch_plan.w4a8_n64_repacked
+            and _compact_launches is None
+        ):
+            raise ValueError(_COMPACT_LAUNCHERS_REQUIRED)
         weight_plan = experts.plan
         if (
             weight_plan.w4a16_compressed_scales
@@ -1173,6 +1190,7 @@ class TPMoEScratchPlan:
             binding,
             scales_expanded=bool(scales_expanded),
             w4a8_csf_inline=self.caps.w4a8_csf_inline,
+            compact_launches=_compact_launches,
         )
 
 
@@ -2568,6 +2586,7 @@ def _w4a8_mx_micro_supported(
     weight_E: int,
     activation: str,
     source_format: str,
+    n64_repacked: bool = False,
 ) -> bool:
     source_format = _canonical_moe_policy_source_format(source_format)
     if source_format == "b12x_trellis":
@@ -2582,7 +2601,7 @@ def _w4a8_mx_micro_supported(
                 weight_E=weight_E,
             )
         )
-    if source_format == "fp4_e8m0_k32" and n % 128 == 64:
+    if source_format == "fp4_e8m0_k32" and (n % 128 == 64 or n64_repacked):
         return bool(
             1 <= num_tokens <= _MICRO_MAX_TOKENS
             and k % 256 == 0
@@ -2610,6 +2629,14 @@ def _w4a8_mx_micro_preferred(
         weight_E=query.num_experts,
         activation=query.activation,
         source_format=query.source_format,
+        n64_repacked=bool(query.controls.get("w4a8_n64_repacked", False)),
+    ):
+        return False
+    # Keep grouped routing beyond N128's existing tiny decode range.
+    if (
+        query.source_format == "fp4_e8m0_k32"
+        and query.intermediate_size % 128 == 0
+        and query.num_tokens > 4
     ):
         return False
     capability = (
@@ -2640,6 +2667,7 @@ def _policy_micro_supported(query: MoeDecodeQuery) -> bool:
             weight_E=query.num_experts,
             activation=query.activation,
             source_format=query.source_format,
+            n64_repacked=bool(query.controls.get("w4a8_n64_repacked", False)),
         )
     return _band_runs_direct_micro(
         num_tokens=query.num_tokens,
@@ -2658,6 +2686,8 @@ def _heuristic_dynamic_route_mode(
     *,
     planned_tile_m: int,
 ) -> str:
+    if query.controls.get("w4a8_n64_repacked", False):
+        return "grouped"
     dynamic_n = _dynamic_kernel_intermediate_size(
         query.intermediate_size,
         query.quant_mode,
@@ -2868,6 +2898,11 @@ def _heuristic_moe_decode_config(
                 device,
                 planned_tile_m=dynamic_tile_m,
             )
+    if query.controls.get("w4a8_n64_repacked", False) and dynamic_tile_m == 32:
+        dynamic_tile_m = 16
+        dynamic_route_mode = _heuristic_dynamic_route_mode(
+            query, device, planned_tile_m=dynamic_tile_m
+        )
     return MoeDecodeConfig(
         backend=backend,
         route_planner="internal",
@@ -3326,6 +3361,7 @@ def _plan_core_workspace(
     dynamic_route_mode: str | None = None,
     nvfp4_materialize_intermediate: bool = False,
     source_format: str = "modelopt_nvfp4",
+    w4a8_n64_repacked: bool = False,
     w13_layout: str = "w13",
     w4a16_weight_layout: str | None = None,
     w4a16_scale_format: str | None = None,
@@ -3848,7 +3884,7 @@ def _plan_core_workspace(
                     direct_micro_tokens * num_topk * (n // 2)
                     + direct_micro_tokens * num_topk * (n // 128) * 257,
                 )
-            if source_format == "fp4_e8m0_k32" and n % 128 == 64:
+            if source_format == "fp4_e8m0_k32" and (n % 128 == 64 or w4a8_n64_repacked):
                 from b12x.moe._shared.kernels.w4a8_compact_micro import (
                     micro_scratch_nbytes,
                 )
@@ -4394,6 +4430,8 @@ def _alloc_workspace(
     dynamic_tile_n: int | None = None,
     dynamic_route_mode: str | None = None,
     nvfp4_materialize_intermediate: bool = False,
+    source_format: str = "modelopt_nvfp4",
+    w4a8_n64_repacked: bool = False,
     pool: TPMoEWorkspacePool | None = None,
     storage_key: tuple | None = None,
 ) -> TPMoEWorkspace | TPW4A16Workspace:
@@ -4420,6 +4458,8 @@ def _alloc_workspace(
         dynamic_tile_n=dynamic_tile_n,
         dynamic_route_mode=dynamic_route_mode,
         nvfp4_materialize_intermediate=nvfp4_materialize_intermediate,
+        source_format=source_format,
+        w4a8_n64_repacked=w4a8_n64_repacked,
     )
     if pool is not None:
         if storage_key is None:
@@ -6676,6 +6716,7 @@ def plan_b12x_fp4_moe_weights(
     nvfp4_inline_scales: bool = False,
     w4a16_compressed_scales: bool = False,
     w4a8_csf_inline: bool = False,
+    w4a8_n64_repacked: bool = False,
     w13_layout: str = "w13",
     w4a16_layout: PreparedWeightLayout | str | None = None,
     trellis_bits: int | None = None,
@@ -6724,6 +6765,7 @@ def plan_b12x_fp4_moe_weights(
         nvfp4_inline_scales=bool(nvfp4_inline_scales),
         w4a16_compressed_scales=bool(w4a16_compressed_scales),
         w4a8_csf_inline=bool(w4a8_csf_inline),
+        w4a8_n64_repacked=bool(w4a8_n64_repacked),
     )
 
 
@@ -6975,7 +7017,7 @@ def prepare_b12x_fp4_moe_weights(
             params_dtype=params_dtype,
             source_format=plan.source_format,
             w13_layout=plan.w13_layout,
-            n64_repack=plan.intermediate_size % 128 == 64,
+            n64_repack=plan.intermediate_size % 128 == 64 or plan.w4a8_n64_repacked,
         )
         representation = _PreparedWeightRepresentation(
             quant_mode="w4a8_mx",
@@ -7601,7 +7643,7 @@ def plan_tp_moe_execution(
         implementation == "micro"
         and quant_mode == "w4a8_mx"
         and source_format == "fp4_e8m0_k32"
-        and n % 128 == 64
+        and (n % 128 == 64 or weight_plan.w4a8_n64_repacked)
     )
     if compact_w4a8_micro:
         if apply_router_weight_on_input:
@@ -7643,6 +7685,29 @@ def plan_tp_moe_execution(
         dynamic_physical_tiles=dynamic_physical_tiles,
         dynamic_task_capacity=dynamic_task_capacity,
         decode_config=decode_config,
+        w4a8_n64_repacked=bool(
+            quant_mode == "w4a8_mx"
+            and source_format == "fp4_e8m0_k32"
+            and (n % 128 == 64 or weight_plan.w4a8_n64_repacked)
+        ),
+    )
+
+
+def _compact_micro_scratch_nbytes(plan: TPMoEPlan) -> int:
+    """Scratch bytes a compact N64 W4A8 micro plan needs, or zero."""
+    if not (
+        plan.implementation == "micro"
+        and plan.quant_mode == "w4a8_mx"
+        and plan.w4a8_n64_repacked
+    ):
+        return 0
+    from b12x.moe._shared.kernels.w4a8_compact_micro import micro_scratch_nbytes
+
+    return micro_scratch_nbytes(
+        plan.max_rows // plan.num_topk,
+        plan.k,
+        plan.n,
+        plan.num_topk,
     )
 
 
@@ -7683,25 +7748,11 @@ def _validate_workspace(
             f"expected {(plan.implementation, plan.quant_mode, plan.weight_E, plan.k, plan.n, plan.num_topk, plan.device, plan.dtype)}, "
             f"got {actual}"
         )
-    if (
-        plan.implementation == "micro"
-        and plan.quant_mode == "w4a8_mx"
-        and plan.n % 128 == 64
-    ):
-        from b12x.moe._shared.kernels.w4a8_compact_micro import (
-            micro_scratch_nbytes,
+    required = _compact_micro_scratch_nbytes(plan)
+    if required and workspace.micro_intermediate.nbytes < required:
+        raise ValueError(
+            "compact W4A8 micro workspace is smaller than its planned capacity"
         )
-
-        required = micro_scratch_nbytes(
-            plan.max_rows // plan.num_topk,
-            plan.k,
-            plan.n,
-            plan.num_topk,
-        )
-        if workspace.micro_intermediate.nbytes < required:
-            raise ValueError(
-                "compact W4A8 micro workspace is smaller than its planned capacity"
-            )
     if plan.implementation == "w4a16":
         if not isinstance(workspace, TPW4A16Workspace):
             raise TypeError("expected a TPW4A16Workspace for the W4A16 backend")
@@ -8082,6 +8133,11 @@ def _resolve_workspace(
         raise TypeError(
             "workspace must be a TPMoEWorkspace, TPW4A16Workspace, or TPMoEWorkspacePool"
         )
+    # Only W4A8-MX compact micro scratch depends on the source format here;
+    # other modes keep the pool's previous default sizing.
+    pool_source_format = (
+        plan.spec.source_format if plan.quant_mode == "w4a8_mx" else "modelopt_nvfp4"
+    )
 
     key = _workspace_pool_key(
         plan.implementation,
@@ -8140,6 +8196,8 @@ def _resolve_workspace(
             dynamic_tile_n=plan.execution.tile_n,
             dynamic_route_mode=plan.decode_config.dynamic_route_mode,
             nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
+            source_format=pool_source_format,
+            w4a8_n64_repacked=plan.w4a8_n64_repacked,
             pool=workspace,
             storage_key=key,
         )
@@ -8152,6 +8210,12 @@ def _resolve_workspace(
         or (
             isinstance(resolved, (TPDynamicWorkspace, TPMicroWorkspace))
             and resolved.routed_rows_capacity < plan.routed_rows
+        )
+        or (
+            # The pool key omits the weight packing, so a reused micro
+            # workspace can predate a compact N64 plan with the same key.
+            isinstance(resolved, TPMicroWorkspace)
+            and resolved.micro_intermediate.nbytes < _compact_micro_scratch_nbytes(plan)
         )
         or (
             isinstance(resolved, TPW4A16Workspace)
@@ -8215,6 +8279,8 @@ def _resolve_workspace(
             dynamic_tile_n=plan.execution.tile_n,
             dynamic_route_mode=plan.decode_config.dynamic_route_mode,
             nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
+            source_format=pool_source_format,
+            w4a8_n64_repacked=plan.w4a8_n64_repacked,
             pool=workspace,
             storage_key=key,
         )
@@ -8355,6 +8421,7 @@ def plan_tp_moe_arena_layout(
             dynamic_tile_n=plan.execution.tile_n,
             dynamic_route_mode=plan.decode_config.dynamic_route_mode,
             nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
+            w4a8_n64_repacked=plan.w4a8_n64_repacked,
             source_format=source_format,
             w13_layout=w13_layout,
             w4a16_weight_layout=w4a16_weight_layout,
@@ -9041,6 +9108,7 @@ def plan_tp_moe_scratch(
         dynamic_tile_n=launch_plan.execution.tile_n,
         dynamic_route_mode=launch_plan.decode_config.dynamic_route_mode,
         nvfp4_materialize_intermediate=launch_plan.decode_config.nvfp4_materialize_intermediate,
+        w4a8_n64_repacked=launch_plan.w4a8_n64_repacked,
         source_format=caps.source_format,
         w13_layout=caps.w13_layout,
         w4a16_weight_layout=caps.w4a16_weight_layout,
@@ -9639,6 +9707,7 @@ def materialize_tp_moe_arena_workspaces(
             dynamic_tile_n=plan.execution.tile_n,
             dynamic_route_mode=plan.decode_config.dynamic_route_mode,
             nvfp4_materialize_intermediate=plan.decode_config.nvfp4_materialize_intermediate,
+            w4a8_n64_repacked=plan.w4a8_n64_repacked,
             source_format=source_format,
             w13_layout=w13_layout,
             w4a16_weight_layout=w4a16_weight_layout,
@@ -9917,6 +9986,15 @@ def build_tp_moe_fp4_binding(
         decode_config=decode_config,
     )
     deterministic_output = plan.deterministic_output
+    if (
+        plan.implementation == "micro"
+        and plan.quant_mode == "w4a8_mx"
+        and getattr(prepared_payload, "n64_repack", False)
+    ):
+        # Only fused_moe.plan_execution() with bind()/run() carries compact
+        # launchers. Sparse and direct bindings reach this point without
+        # them; reject here instead of failing later in b12x_moe_fp4.
+        raise ValueError(_COMPACT_LAUNCHERS_REQUIRED)
     if isinstance(workspace, TPMoEWorkspacePool):
         weight_layout = "packed"
         scale_format = "e4m3_k16"
@@ -13232,8 +13310,11 @@ W4A16_CSF_STAGE_MAX_TOKENS = int(
 
 
 # Planned token capacity limit for compact W4A8 inline scale reads.
+W4A8_CSF_INLINE_DEFAULT_MAX_TOKENS = 1536
 W4A8_CSF_INLINE_MAX_TOKENS = int(
-    os.environ.get("B12X_W4A8_CSF_INLINE_MAX_TOKENS", "1536")
+    os.environ.get(
+        "B12X_W4A8_CSF_INLINE_MAX_TOKENS", str(W4A8_CSF_INLINE_DEFAULT_MAX_TOKENS)
+    )
 )
 
 
