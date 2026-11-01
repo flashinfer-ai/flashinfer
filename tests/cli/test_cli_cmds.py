@@ -20,6 +20,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import click
 from packaging.version import Version
 import pytest
 
@@ -568,6 +569,50 @@ def test_get_available_jit_cache_provider_tags_installs_only_shim(monkeypatch):
         "capture_output": True,
         "text": True,
     }
+
+
+def test_get_available_jit_cache_provider_tags_nightly_and_uv_target(monkeypatch):
+    import flashinfer.__main__ as flashinfer_main
+
+    monkeypatch.setattr("flashinfer.__main__.which", lambda _name: "/usr/bin/uv")
+    monkeypatch.setattr("flashinfer.__main__.find_spec", lambda _name: None)
+    recorded = {}
+
+    def mock_run(cmd, **kwargs):
+        recorded["cmd"] = cmd
+        _write_shim_metadata(cmd[cmd.index("--target") + 1])
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(flashinfer_main.subprocess, "run", mock_run)
+
+    flashinfer_main._get_available_jit_cache_provider_tags(
+        "flashinfer-jit-cache==0.4.1+cu134",
+        "0.4.1+cu134",
+        "https://example.invalid/nightly/cu134",
+        nightly=True,
+    )
+    cmd = recorded["cmd"]
+    assert cmd[:5] == ["/usr/bin/uv", "pip", "install", "--python", sys.executable]
+    assert "--target" in cmd
+    assert "--pre" in cmd
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("Name: flashinfer-jit-cache", "Name: other-package"),
+        ("Version: 0.4.1+cu134", "Version: 0.4.2+cu134"),
+        ("==0.4.1+cu134", ">=0.4.1+cu134"),
+    ],
+)
+def test_read_jit_cache_provider_tags_rejects_invalid_shim(tmp_path, old, new):
+    from flashinfer.__main__ import _read_jit_cache_provider_tags
+
+    assert old in _SHIM_METADATA
+    _write_shim_metadata(tmp_path, _SHIM_METADATA.replace(old, new, 1))
+
+    with pytest.raises(click.ClickException, match="Could not read"):
+        _read_jit_cache_provider_tags(tmp_path, "0.4.1+cu134")
 
 
 def test_install_cubin_wheel_cmd_nightly_dry_run(monkeypatch):
