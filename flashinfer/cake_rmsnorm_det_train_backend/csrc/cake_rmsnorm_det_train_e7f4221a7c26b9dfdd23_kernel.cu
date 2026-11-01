@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_RING_OFF 1024
 #define SMEM_RING_STAGE_BYTES 196608
 #define SMEM_RING_STRIDE 196608
@@ -215,8 +214,9 @@ kernel_cake_rmsnorm_det_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x
             for (int first = bid * 4; first < T; first += num_bids * 4) {
                 int row = first + rg;
                 int slot = k % 4;
+                int _stage_full = (int)((unsigned int)k % 4);
                 int _parity_full = (int)((unsigned int)k / 4 % 2);
-                mbarrier_wait(full_addr + (slot) * 8, _parity_full);
+                mbarrier_wait(full_addr + (_stage_full) * 8, _parity_full);
                 int xaddr = ring_c + slot * 49152 + rg * 12288 + g0 * 16;
                 #pragma unroll
                 for (int c_1 = 0; c_1 < 4; c_1++) {
@@ -231,7 +231,7 @@ kernel_cake_rmsnorm_det_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x
                     }
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                mbarrier_arrive(empty_addr + (slot) * 8);
+                mbarrier_arrive(empty_addr + ((int)((unsigned int)k % 4)) * 8);
                 if (row < T) {
                     float sum0 = 0.0f;
                     #pragma unroll
@@ -386,10 +386,11 @@ kernel_cake_rmsnorm_det_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x
                 int slot_p = k_p % 4;
                 int rows_k = ((T - first_p) < (4) ? (T - first_p) : (4));
                 int sbase = ring_p + slot_p * 49152;
+                int _stage_empty = (int)((unsigned int)k_p % 4);
                 int _parity_empty = (int)((unsigned int)k_p / 4 % 2);
-                mbarrier_wait(empty_addr + (slot_p) * 8, _parity_empty);
+                mbarrier_wait(empty_addr + (_stage_empty) * 8, _parity_empty);
                 if (lane_p == 0) {
-                    mbarrier_arrive_expect_tx(full_addr + (slot_p) * 8, rows_k * 12288);
+                    mbarrier_arrive_expect_tx(full_addr + ((int)((unsigned int)k_p % 4)) * 8, rows_k * 12288);
                 }
                 if (lane_p == 0) {
                     #pragma unroll
@@ -399,7 +400,7 @@ kernel_cake_rmsnorm_det_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x
                             asm volatile(
                                 "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                 " [%0], [%1], %2, [%3], %4;"
-                                :: "r"(sbase + i_1 * 12288), "l"(reinterpret_cast<const uint8_t*>(x + src_i)), "r"((unsigned)(12288)), "r"(full_addr + (slot_p) * 8),
+                                :: "r"(sbase + i_1 * 12288), "l"(reinterpret_cast<const uint8_t*>(x + src_i)), "r"((unsigned)(12288)), "r"(full_addr + ((int)((unsigned int)k_p % 4)) * 8),
                                    "l"(0x14F0000000000000ULL) : "memory");
                         }
                     }

@@ -28,29 +28,61 @@ the gradient of both ``h`` and ``u``.
 
 All kernels use FP32 statistics and accumulation with IEEE division and
 square root (no fast-math).  Inputs and outputs are BF16; ``rstd`` and ``dw``
-are FP32.  Row-strided inputs (``x``, ``residual``, ``g``, ``g_residual``)
+are FP32.  ``w`` is BF16, or FP32 on the routes that ship the FP32-weight
+programs (the effective weight ``1 + w`` of a zero-centred model, computed by
+the caller in FP32; :func:`weight_dtypes` lists them per route).  Row-strided inputs (``x``, ``residual``, ``g``, ``g_residual``)
 are accepted when ``stride(1) == 1``, ``stride(0)`` is a multiple of eight
 elements and the storage is aligned (32 bytes for the forward inputs, 16 for
-the backward); outputs are contiguous.  The
+the backward); outputs are contiguous.  An input of more dimensions,
+``[..., H]``, is normalized row by row when its leading dimensions are
+contiguous with one another in row-major order (a ``[T, heads, H]`` slice of
+a wider buffer qualifies): the outputs take its shape, ``rstd`` its leading
+shape, ``w`` is shared by every row and ``dw`` sums them all.  The
 token count ``T`` is a runtime scalar: it may change between calls, ``T == 1``
-is supported and ``T == 0`` returns empty outputs without launching.
+is supported and ``T == 0`` returns empty outputs without launching.  Each
+route selects one of several programs from ``T``; within one program window
+a row's results do not depend on ``T`` (see "Program selection by token
+count" in the forward / backward docstrings and :func:`program_windows`).
 
-Beside kernels resident on other streams: each backward main kernel needs a
-large part of its SM's shared memory and one CTA slot, and an SM serves it only
-once it can switch to that shared-memory carveout.  A kernel on another stream
-whose CTAs hold every SM with a small carveout (for example a long-running
-kernel with little or no shared memory and the default carveout) therefore
-delays the backward's start until that kernel exits.  Kernels that hold only
-some SMs (communication kernels with 16-32 CTAs) cost the backward no more
-than the SMs they hold.  Setting ``cudaFuncAttributePreferredSharedMemoryCarveout``
-to ``cudaSharedmemCarveoutMaxShared`` on such a resident kernel, or giving it a
-large dynamic shared-memory allocation, lets the backward start beside it.  Some
-forward programs also need more shared memory than a small carveout leaves and
-wait the same way; the same remedy applies to them.  Programs that need a whole
-SM wait beside any kernel resident on every SM, whatever its carveout: the
-residual-fused H 6144 backward, and on SM107 the backward of H 1536 above 1024
-tokens, H 2048 above 256 and H 4096 above 1024, and the H 6144 forward above
-4096 tokens.  Beside those, leave some SMs free of the resident kernel.
+Beside kernels resident on other streams: a call's kernels (the forward
+kernel; the backward main kernel, then its dw reduce kernel) start on an SM
+only when one of their CTAs fits there next to the CTAs already resident.  A
+kernel on another stream that keeps a CTA on every SM therefore delays the
+call until it exits unless one CTA of each kernel fits next to it:
+
+- shared memory: the SM's 228 KB of shared memory hold every resident CTA's
+  allocation plus 1 KB reserved per CTA, within the carveout the SM runs at.
+  An SM changes its carveout only when no CTA is resident on it;
+- registers: each SM sub-partition (a quarter of the SM) holds 16 K registers
+  for the warps placed on it, a warp taking 32 times its per-thread register
+  count rounded up to a multiple of 8;
+- threads (2048 per SM on SM100 / SM103, 1024 on SM107) and CTA slots (32 per
+  SM on SM100 / SM103, 16 on SM107);
+- on SM107, named barriers: a kernel that selects its named barrier at run
+  time needs an SM with no other CTA.
+
+A resident kernel with little or no shared memory and the default carveout can
+hold its SMs at a small carveout; then every backward waits, and so do some
+forward programs.  Setting ``cudaFuncAttributePreferredSharedMemoryCarveout``
+to ``cudaSharedmemCarveoutMaxShared`` on the resident kernel removes this
+wait.  The resident kernel's own shared memory still counts, so a large
+dynamic shared-memory allocation makes more calls wait, not fewer: with the
+max-shared carveout and one resident CTA per SM, every call outside the list
+below starts while that CTA holds at most 27 KB of shared memory on SM100 /
+SM103 and at most 24 KB on SM107.  Even beside one resident CTA of 128
+threads without shared memory, these calls wait, with BF16 and FP32 weights
+alike, because one of their kernels needs a whole SM:
+
+- SM100 / SM103: the residual-fused H 6144 backward.
+- SM107: the residual-fused H 6144 backward, the backward of H 1536 above 1024
+  tokens, the backward of H 2048 above 256 tokens, the backward of H 4096
+  above 1024 tokens and the forward of H 6144 above 4096 tokens.
+
+Beside those, leave some SMs free of the resident kernel.  Kernels that hold
+only some SMs (communication kernels with 16-32 CTAs) do not delay the start
+of any call: the call runs on the other SMs and slows down by about the share
+of SMs those kernels hold.  The limits and lists above are measured on B200
+(SM100), GB300 (SM103) and R200 (SM107).
 
 Usage::
 
@@ -81,7 +113,9 @@ from .cake_rmsnorm_det_train_backend import (  # noqa: F401
     cake_rmsnorm_det_train_backward_workspace,
     cake_rmsnorm_det_train_backward_workspace_bytes,
     is_cake_rmsnorm_det_train_supported,
+    program_windows,
     route_key,
+    weight_dtypes,
 )
 
 # The three stable entry points are real ``def``s here (public-API tooling reads the
@@ -180,5 +214,7 @@ __all__ = [
     "cake_rmsnorm_det_train_backward_workspace_bytes",
     "cake_rmsnorm_det_train_forward",
     "is_cake_rmsnorm_det_train_supported",
+    "program_windows",
     "route_key",
+    "weight_dtypes",
 ]
