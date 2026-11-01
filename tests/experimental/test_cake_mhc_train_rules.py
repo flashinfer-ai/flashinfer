@@ -20,33 +20,43 @@ package with the non-deterministic backward
 
 The package is a standalone copy of the deterministic package
 (``flashinfer.cake_mhc_det_train_backend``) under the ``cake_mhc_train_``
-prefix at hidden 4096, except the ``bwd_finish`` route.  This module checks
-the registry ``cake_jit.py`` against the deterministic registry's records,
-routes and record scalars of hidden 4096 (the deterministic package also
-exports other hidden sizes, which have no copy here) on its boards of record
+prefix at its hidden sizes (4096 on every architecture, 5120 and 7168 on
+sm_100a / sm_103a), except the ``bwd_finish`` routes.  This module checks the
+registry ``cake_jit.py`` against the deterministic registry's records, routes
+and record scalars of every hidden size on its boards of record
 (``RULES_BOARDS``) and token counts of record (``RULES_T_VALUES``):
 
 * the program set is the deterministic set without its column-slab
   (``bwd_slab__*``) and final-reduction (``bwd_reduce__*``) records, renamed
-  and otherwise equal field for field, plus the four programs of this package
-  (``cake_mhc_train_fn_split_atomic__tv128_dep`` on sm_100a / sm_103a,
-  ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` on sm_107a,
+  and otherwise equal field for field, plus the programs of this package: at
+  hidden 4096 ``cake_mhc_train_fn_split_atomic__tv128_dep`` on sm_100a /
+  sm_103a, ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` on sm_107a,
   ``cake_mhc_train_bwd_slab_atomic__dynr`` and
-  ``cake_mhc_train_bwd_slab_atomic__lpt`` on all three), whose records keep
-  the launch, grid and roles of the deterministic records they replace (the
-  fn split with the static PDL attribute: it follows the token-owner pass);
+  ``cake_mhc_train_bwd_slab_atomic__lpt`` on all three; at 5120 and 7168
+  ``cake_mhc_train_fn_split_atomic__tv128_dep__h<H>`` and
+  ``cake_mhc_train_bwd_slab_atomic__dynr__h<H>`` on sm_100a / sm_103a.  Their
+  records keep the launch, grid and roles of the deterministic records they
+  replace (the fn splits with the static PDL attribute: they follow the
+  token-owner pass);
 * no record, route, record scalar or PDL edge names a deterministic library;
 * every route, the selection on every route and the PDL bands equal the
   deterministic ones, except ``bwd_finish``: the deterministic token-owner
-  records, the atomic fn split of the architecture, the column slab's two
-  forms, one per call by ``bwd_slab_atomic_program``, no reduction;
+  records, the atomic fn split of the architecture and size, the column
+  slab's form (at hidden 4096 two, one per call by
+  ``bwd_slab_atomic_program``; at 5120 and 7168 the ``dynr`` record alone, no
+  selection rule), no reduction;
 * the workspaces: ``fwd`` the deterministic one, ``bwd`` the deterministic
-  regions at the same offsets without the trailing ``dfn_part``;
-* the host rules are copies (equal outputs, not the deterministic objects),
-  but this package's own column-slab rule (``BWD_SLAB_LPT``, ``lpt_chunks``,
-  ``bwd_slab_atomic_program``, ``slab_plan``; ``host_plan`` itself is the
-  deterministic one): its geometries, its selection, its call-time lookup and
-  a workspace envelope that never runs its screen;
+  regions at the same offsets without the trailing ``dfn_part``, at every
+  hidden size;
+* the host rules are copies (equal outputs, not the deterministic objects;
+  the per-size tables the deterministic ones without the column-slab and
+  reduction tables), but this package's own column-slab rule
+  (``BWD_SLAB_LPT``, ``lpt_chunks``, ``bwd_slab_atomic_program``,
+  ``slab_plan``; ``host_plan`` itself is the deterministic one): its
+  geometries, its selection, its call-time lookup and a workspace envelope
+  that never runs its screen at hidden 4096, the one-size chunks of
+  ``k7_chunks`` at 5120 and 7168 (the two-size schedule is calibrated and
+  built at 4096 only);
 * the package is standalone: no source file imports another flashinfer package
   (the shared ``cake_build.py`` JIT fallback aside, inside a function), and a
   copy under another name imports and plans with ``flashinfer`` blocked;
@@ -89,14 +99,24 @@ det_build = cake_package("cake_mhc_det_train", "cake_build")
 PACKAGE_DIR = Path(nd.__file__).resolve().parent
 REPO = Path(__file__).resolve().parents[2]
 HIDDEN = 4096
+# The package's hidden sizes (the deterministic package's): 4096 on every architecture, 5120 and 7168 on the
+# architectures of NEW_HIDDEN_ARCHES.
+HIDDEN_SIZES = (4096, 5120, 7168)
+NEW_HIDDEN_SIZES = HIDDEN_SIZES[1:]
+NEW_HIDDEN_ARCHES = ("sm_100a", "sm_103a")
 ND_PREFIX, DET_PREFIX = "cake_mhc_train_", "cake_mhc_det_train_"
 BWD_FINISH = "bwd_finish_h4096"
-# The programs of this package and their architectures.
+# The programs of this package and their architectures (the library suffix ``__h<H>`` names a size other than 4096).
 ATOMIC = {
     "cake_mhc_train_fn_split_atomic__tv128_dep": ("sm_100a", "sm_103a"),
     "cake_mhc_train_fn_split_atomic__tv128_t128_dep": ("sm_107a",),
     "cake_mhc_train_bwd_slab_atomic__dynr": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_bwd_slab_atomic__lpt": ("sm_100a", "sm_103a", "sm_107a"),
+    **{
+        f"cake_mhc_train_{program}__h{hidden}": NEW_HIDDEN_ARCHES
+        for hidden in NEW_HIDDEN_SIZES
+        for program in ("fn_split_atomic__tv128_dep", "bwd_slab_atomic__dynr")
+    },
 }
 SLAB = "cake_mhc_train_bwd_slab_atomic__dynr"
 LPT = "cake_mhc_train_bwd_slab_atomic__lpt"
@@ -136,16 +156,21 @@ DROPPED_ROLES = ("bwd_slab", "bwd_reduce")
 # Sinkhorn counts other than the count of record: the token-owner pass runs its run-time-count record.
 RUN_TIME_ITERS = (1, 7, 64)
 T_VALUES = tuple(T for T in det.RULES_T_VALUES if T > 0)
-# The deterministic records, routes and record scalars of this package's hidden size (the deterministic package also
-# exports other hidden sizes; this package copies hidden 4096 only).
+# The deterministic records, routes and record scalars of this package's hidden sizes (every size the deterministic
+# package exports: this package copies each of them).
 DET_MODULES = {
-    name: record for name, record in det.MODULES.items() if record["hidden"] == HIDDEN
+    name: record
+    for name, record in det.MODULES.items()
+    if record["hidden"] in HIDDEN_SIZES
 }
 DET_ROUTES = {
     arch: {
         key: route
         for key, route in routes.items()
-        if key in {det.route_key(HIDDEN, kind) for kind in det.KINDS}
+        if key
+        in {
+            det.route_key(hidden, kind) for hidden in HIDDEN_SIZES for kind in det.KINDS
+        }
     }
     for arch, routes in det.ROUTES.items()
 }
@@ -207,10 +232,34 @@ def _dropped(name: str) -> bool:
     return name.startswith(DROPPED)
 
 
-def _atomic_split(arch: str) -> str:
-    """The atomic fn split of ``arch``: the form of the deterministic backward split (``FN_SPLIT_PROGRAM[arch][1]``),
-    launched as the token-owner pass's programmatic dependent (``_dep``)."""
-    return f"{ND_PREFIX}fn_split_atomic__{det.fn_split_program(arch, 1)}_dep"
+def _suffix(hidden: int) -> str:
+    """The library suffix of a hidden size: none at 4096, ``__h<H>`` at the other sizes (the deterministic
+    convention)."""
+    return "" if hidden == HIDDEN else f"__h{hidden}"
+
+
+def _atomic_split(arch: str, hidden: int = HIDDEN) -> str:
+    """The atomic fn split of ``arch`` at ``hidden``: the form of the deterministic backward split
+    (``fn_split_program(arch, 1, hidden)``), launched as the token-owner pass's programmatic dependent (``_dep``)."""
+    return (
+        f"{ND_PREFIX}fn_split_atomic__{det.fn_split_program(arch, 1, hidden)}_dep"
+        + _suffix(hidden)
+    )
+
+
+def _slab(hidden: int = HIDDEN) -> str:
+    """The column slab's ``dynr`` record of ``hidden`` (at 5120 and 7168 the only column-slab record)."""
+    return SLAB + _suffix(hidden)
+
+
+def _route_hidden(key: str) -> int:
+    """The hidden size of a route key ``<kind>_h<hidden>``."""
+    return int(key.rsplit("_h", 1)[1])
+
+
+def _arch_sizes(arch: str) -> tuple[int, ...]:
+    """The hidden sizes of ``arch``: the deterministic package's (this package routes every size it does)."""
+    return tuple(det.supported_hidden_sizes(arch))
 
 
 def _det_role(name: str) -> str:
@@ -238,12 +287,14 @@ def _torch_deterministic(mode: bool, *, warn_only: bool = False):
 def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_split() -> (
     None
 ):
-    """``MODULES`` = every deterministic record but ``bwd_slab__*`` / ``bwd_reduce__*`` and the backward fn splits
-    under the ``cake_mhc_train_`` prefix (the record equal field for field after the rename: arches, build knobs,
-    launch, arguments, rules) plus the four programs of this package; the dropped records are exactly the
-    deterministic column-slab and reduction roles, and the backward fn splits are the only other records without a
-    copy."""
-    assert DET_MODULES and HIDDEN in det.HIDDEN_SIZES
+    """``MODULES`` = every deterministic record of every hidden size but ``bwd_slab__*`` / ``bwd_reduce__*`` and the
+    backward fn splits under the ``cake_mhc_train_`` prefix (the record equal field for field after the rename:
+    arches, hidden size, build knobs, launch, arguments, rules) plus the programs of this package (``ATOMIC``); the
+    dropped records are exactly the deterministic column-slab and reduction roles, and the backward fn splits are the
+    only other records without a copy."""
+    assert tuple(det.HIDDEN_SIZES) == HIDDEN_SIZES
+    assert {record["hidden"] for record in DET_MODULES.values()} == set(HIDDEN_SIZES)
+    assert DET_MODULES == det.MODULES
     dropped = {name for name in DET_MODULES if _dropped(name)}
     assert dropped and {_det_role(name) for name in dropped} == set(DROPPED_ROLES)
     assert not [
@@ -270,26 +321,31 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
         assert record["kernel_symbol"] == f"kernel_{record['kernel']}", name
         assert record["library"] == record["kernel"], name
         assert record["library"].startswith(ND_PREFIX), name
+        assert record["library"].endswith(_suffix(record["hidden"])), name
 
 
 @pytest.mark.cpu_only
 def test_atomic_records_keep_the_deterministic_launch() -> None:
-    """The four programs: named after their library and kernel symbol; the fn splits keep the launch and fixed grid
-    of the deterministic transposed-layout split of their form but for the static PDL attribute (``use_pdl`` True:
-    they follow the token-owner pass and wait for it) and bind ``fn``, ``fnTp``, ``dfn`` and ``accumulate`` (no
-    ``fnp``, no ``want_t``); the column slab keeps the launch and grid rule of the deterministic
-    ``dynr`` record, binds its arguments without ``dfn_part`` and adds ``dfn``, ``param_partial``, ``dscale``,
-    ``dbase``, ``chunks`` and ``accumulate``.  The column slab's two records select by ``bwd_slab_atomic_program``
-    (programs ``dynr`` / ``lpt``); the ``lpt`` record is the ``dynr`` record with the ``lpt_chunks`` chunk rule, its
-    chunk scalars ``P`` / ``rpc`` bound to the ``lpt_*`` host values and ``p_big`` / ``rpc_small`` after the
-    ticket."""
+    """The programs of this package, at every hidden size: named after their library and kernel symbol (``__h<H>``
+    at 5120 and 7168); the fn splits keep the launch and fixed grid of the deterministic transposed-layout split of
+    their form and size but for the static PDL attribute (``use_pdl`` True: they follow the token-owner pass and wait
+    for it) and bind ``fn``, ``fnTp``, ``dfn`` and ``accumulate`` (no ``fnp``, no ``want_t``); the column slab keeps
+    the launch and grid rule of the deterministic ``dynr`` record of its size (``slabs`` = H / 64), binds its
+    arguments without ``dfn_part`` and adds ``dfn``, ``param_partial``, ``dscale``, ``dbase``, ``chunks`` and
+    ``accumulate``.  At hidden 4096 the column slab's two records select by ``bwd_slab_atomic_program`` (programs
+    ``dynr`` / ``lpt``); the ``lpt`` record is the ``dynr`` record with the ``lpt_chunks`` chunk rule, its chunk
+    scalars ``P`` / ``rpc`` bound to the ``lpt_*`` host values and ``p_big`` / ``rpc_small`` after the ticket.  At
+    5120 and 7168 the ``dynr`` record is the route's only column slab: no selection rule, the ``k7_chunks`` chunk
+    rule."""
     for name, arches in ATOMIC.items():
         record = nd.MODULES[name]
+        hidden = record["hidden"]
         assert tuple(record["arches"]) == arches, name
         assert record["kernel"] == record["library"] == name
         assert record["kernel_symbol"] == f"kernel_{name}"
-        assert record["hidden"] == HIDDEN and record["ffi_entry"] == "run", name
-        if record["role"] == "bwd_slab":
+        assert hidden in HIDDEN_SIZES and name.endswith(_suffix(hidden)), name
+        assert record["ffi_entry"] == "run", name
+        if record["role"] == "bwd_slab" and hidden == HIDDEN:
             assert record["select_rule"] == {
                 "kind": "program",
                 "program": name.rsplit("__", 1)[1],
@@ -300,35 +356,47 @@ def test_atomic_records_keep_the_deterministic_launch() -> None:
         assert record["workspace_rule"] == {"kind": "regions", "workspace": "bwd"}
         assert name not in nd.RECORD_SCALARS, name
     for arch in det.ARCHES:
-        split = nd.MODULES[_atomic_split(arch)]
-        assert arch in split["arches"] and split["role"] == "fn_split_bwd", arch
-        det_splits = [
-            n
-            for n in det.route_modules(arch, HIDDEN, "bwd_finish")
-            if _det_role(n) == "fn_split_bwd"
-        ]
-        assert len(det_splits) == 1, arch
-        reference = det.MODULES[det_splits[0]]
-        assert reference["launch"]["use_pdl"] is False, arch
-        assert split["launch"] == {**reference["launch"], "use_pdl": True}, arch
-        assert split["grid_rule"] == reference["grid_rule"], arch
-        form = det.fn_split_program(arch, 1)
-        assert split["grid_rule"] == {"kind": "fixed", "ctas": det.FN_SPLIT_GRID[form]}
-        assert set(split["logical"].values()) == {"fn", "fnTp", "dfn", "accumulate"}
-        assert [kind for kind, _ in split["arg_plan"]][-3:] == ["grid"] * 3
-    slab, dynr = nd.MODULES[SLAB], det.MODULES[DET_DYNR]
-    assert slab["role"] == "bwd_slab"
-    assert slab["launch"] == dynr["launch"] and slab["launch"]["use_pdl"] == "runtime"
-    assert slab["launch"]["block"][0] == 384
-    assert slab["grid_rule"] == dynr["grid_rule"]
+        for hidden in _arch_sizes(arch):
+            what = (arch, hidden)
+            split = nd.MODULES[_atomic_split(arch, hidden)]
+            assert arch in split["arches"] and split["role"] == "fn_split_bwd", what
+            assert split["hidden"] == hidden, what
+            det_splits = [
+                n
+                for n in det.route_modules(arch, hidden, "bwd_finish")
+                if _det_role(n) == "fn_split_bwd"
+            ]
+            assert len(det_splits) == 1, what
+            reference = det.MODULES[det_splits[0]]
+            assert reference["launch"]["use_pdl"] is False, what
+            assert split["launch"] == {**reference["launch"], "use_pdl": True}, what
+            assert split["grid_rule"] == reference["grid_rule"], what
+            assert split["grid_rule"] == {
+                "kind": "fixed",
+                "ctas": det.fn_split_grid(arch, 1, hidden),
+            }, what
+            assert set(split["logical"].values()) == {"fn", "fnTp", "dfn", "accumulate"}
+            assert [kind for kind, _ in split["arg_plan"]][-3:] == ["grid"] * 3
     added = {"dfn", "param_partial", "dscale", "dbase", "chunks", "accumulate"}
-    assert (
-        set(slab["logical"].values())
-        == (set(dynr["logical"].values()) - {"dfn_part"}) | added
-    )
-    kept = [entry for entry in dynr["arg_plan"] if entry != ["buffer", "dfn_part"]]
-    assert [entry for entry in slab["arg_plan"] if entry[1] not in added] == kept
-    assert slab["grid_rule"]["chunks_rule"] == "k7_chunks"
+    for hidden in HIDDEN_SIZES:
+        slab, dynr = nd.MODULES[_slab(hidden)], det.MODULES[DET_DYNR + _suffix(hidden)]
+        assert slab["role"] == "bwd_slab" and slab["hidden"] == hidden, hidden
+        assert slab["launch"] == dynr["launch"], hidden
+        assert slab["launch"]["use_pdl"] == "runtime", hidden
+        assert slab["launch"]["block"][0] == 384, hidden
+        assert slab["grid_rule"] == dynr["grid_rule"], hidden
+        assert slab["grid_rule"] == {
+            "kind": "slab_chunks",
+            "slabs": hidden // det.SLAB_D,
+            "chunks_rule": "k7_chunks",
+        }, hidden
+        assert (
+            set(slab["logical"].values())
+            == (set(dynr["logical"].values()) - {"dfn_part"}) | added
+        ), hidden
+        kept = [entry for entry in dynr["arg_plan"] if entry != ["buffer", "dfn_part"]]
+        assert [entry for entry in slab["arg_plan"] if entry[1] not in added] == kept
+    slab = nd.MODULES[SLAB]
     lpt = nd.MODULES[LPT]
     assert lpt["role"] == "bwd_slab"
     assert lpt["launch"] == slab["launch"]
@@ -402,7 +470,7 @@ def test_records_speak_the_vocabulary() -> None:
     for arch, routes in nd.ROUTES.items():
         for key, names in routes.items():
             kind = key.rsplit("_h", 1)[0]
-            assert nd.route_key(HIDDEN, kind) == key
+            assert nd.route_key(_route_hidden(key), kind) == key
             workspace = nd.WORKSPACE_OF_KIND.get(kind)
             region_names = (
                 {r["name"] for r in nd.WORKSPACE_REGIONS[workspace]} | {"dzp_rows"}
@@ -435,34 +503,42 @@ def test_records_speak_the_vocabulary() -> None:
 
 @pytest.mark.cpu_only
 def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
-    """``ROUTES``: the deterministic architectures and route keys; every route the renamed deterministic route except
-    ``bwd_finish``, which is the deterministic token-owner records (renamed, in route order), the architecture's
-    atomic fn split and the column slab's two forms (``dynr``, ``lpt``).  Every record is routed, on exactly its
-    architectures."""
+    """``ROUTES``: the deterministic architectures and route keys of every hidden size (5120 and 7168 on sm_100a /
+    sm_103a only); every route the renamed deterministic route except ``bwd_finish``, which is the deterministic
+    token-owner records (renamed, in route order), the atomic fn split of the architecture and size and the column
+    slab's forms (``dynr``, ``lpt`` at hidden 4096; the ``dynr`` record of the size at 5120 and 7168).  Every record
+    is routed, on exactly its architectures."""
     assert set(nd.ROUTES) == set(det.ROUTES) == set(det.ARCHES)
     routed: dict[str, set] = {}
     for arch in det.ARCHES:
+        sizes = _arch_sizes(arch)
+        assert sizes == (HIDDEN_SIZES if arch in NEW_HIDDEN_ARCHES else (HIDDEN,)), arch
         assert set(DET_ROUTES[arch]) == {
-            det.route_key(HIDDEN, kind) for kind in det.KINDS
+            det.route_key(hidden, kind) for hidden in sizes for kind in det.KINDS
         }
-        for det_route in DET_ROUTES[arch].values():
-            assert {det.MODULES[n]["hidden"] for n in det_route} == {HIDDEN}, arch
+        for key, det_route in DET_ROUTES[arch].items():
+            assert {det.MODULES[n]["hidden"] for n in det_route} == {
+                _route_hidden(key)
+            }, (arch, key)
         assert set(nd.ROUTES[arch]) == set(DET_ROUTES[arch]), arch
         for key, det_route in DET_ROUTES[arch].items():
             route = nd.ROUTES[arch][key]
             for name in route:
                 routed.setdefault(name, set()).add(arch)
-            if key != BWD_FINISH:
+            if not key.startswith("bwd_finish_h"):
                 assert route == _renamed(det_route), (arch, key)
                 continue
+            hidden = _route_hidden(key)
             tokens = [_renamed(n) for n in det_route if _det_role(n) == "bwd_token"]
-            assert tokens, arch
-            assert route == [*tokens, _atomic_split(arch), SLAB, LPT], arch
+            assert tokens, (arch, key)
+            slabs = [SLAB, LPT] if key == BWD_FINISH else [_slab(hidden)]
+            assert route == [*tokens, _atomic_split(arch, hidden), *slabs], (arch, key)
+            assert {nd.MODULES[n]["hidden"] for n in route} == {hidden}, (arch, key)
             assert {_det_role(n) for n in det_route} == {
                 "fn_split_bwd",
                 "bwd_token",
                 *DROPPED_ROLES,
-            }, arch
+            }, (arch, key)
     for name, arches in routed.items():
         assert arches == set(nd.MODULES[name]["arches"]), name
     assert set(nd.MODULES) == set(routed), sorted(set(nd.MODULES) ^ set(routed))
@@ -473,19 +549,20 @@ def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
 def test_selection_is_the_deterministic_selection_but_bwd_finish(
     arch: str, sm: int
 ) -> None:
-    """On every token count of record at the count of record and at run-time counts: every kind selects the renamed
-    deterministic records, except ``bwd_finish``: (the deterministic token-owner record(s) of the call renamed, the
-    atomic fn split, the column slab's form of the call -- ``lpt`` where ``lpt_chunks`` gives a geometry under the
-    table of record, else ``dynr``) -- one fn split, one column slab, no reduction."""
-    for T in T_VALUES:
+    """At every hidden size of the board's architecture, on every token count of record at the count of record and at
+    run-time counts: every kind selects the renamed deterministic records, except ``bwd_finish``: (the deterministic
+    token-owner record(s) of the call renamed, the atomic fn split of the size, the column slab's form of the call --
+    at hidden 4096 ``lpt`` where ``lpt_chunks`` gives a geometry under the table of record, else ``dynr``; the
+    ``dynr`` record of the size at 5120 and 7168) -- one fn split, one column slab, no reduction."""
+    for hidden, T in ((h, T) for h in _arch_sizes(arch) for T in T_VALUES):
         for iters in (det.SINKHORN_ITERS, *RUN_TIME_ITERS):
             for kind in det.KINDS:
-                what = (arch, sm, T, iters, kind)
+                what = (arch, sm, hidden, T, iters, kind)
                 det_names = det.selected_modules(
-                    arch, HIDDEN, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
+                    arch, hidden, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
                 )
                 names = nd.selected_modules(
-                    arch, HIDDEN, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
+                    arch, hidden, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
                 )
                 if kind != "bwd_finish":
                     assert names == tuple(_renamed(n) for n in det_names), what
@@ -496,8 +573,14 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
                 tokens = tuple(
                     _renamed(n) for n in det_names if _det_role(n) == "bwd_token"
                 )
-                slab = LPT if nd.lpt_chunks(T, sm, arch) else SLAB
-                assert names == (*tokens, _atomic_split(arch), slab), (what, names)
+                if hidden == HIDDEN:
+                    slab = LPT if nd.lpt_chunks(T, sm, arch) else SLAB
+                else:
+                    slab = _slab(hidden)
+                assert names == (*tokens, _atomic_split(arch, hidden), slab), (
+                    what,
+                    names,
+                )
                 run_time = (nd.MODULES[tokens[0]]["select_rule"] or {}).get("kind")
                 assert (run_time == "run_time_iters") == (
                     iters != det.SINKHORN_ITERS
@@ -508,10 +591,11 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
 @pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
 def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
     """``PDL_EDGES`` = the deterministic edges without ``K7->K8``, the column slab's stem
-    ``cake_mhc_train_bwd_slab_atomic`` on ``K6->K7`` (both forms); ``PDL_OFF_BANDS`` = the deterministic bands without
-    ``K7->K8``.  On every path and token count (the counts of record and every band boundary) the ``enable_pdl`` of
-    both column-slab forms equals every deterministic column-slab record's of the route, the fn split takes no
-    per-call argument (its attribute is static), and every copied record reads the deterministic value."""
+    ``cake_mhc_train_bwd_slab_atomic`` on ``K6->K7`` (every form and size); ``PDL_OFF_BANDS`` = the deterministic
+    bands without ``K7->K8`` (one table for every hidden size, as in the deterministic package).  On every path and
+    token count (the counts of record and every band boundary) the ``enable_pdl`` of the column-slab records of each
+    hidden size equals every deterministic column-slab record's of the route of that size, the fn splits take no
+    per-call argument (their attribute is static), and every copied record reads the deterministic value."""
     expected_edges = {
         _renamed(stem): edge
         for stem, edge in det.PDL_EDGES.items()
@@ -524,15 +608,24 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
         a: {edge: bands for edge, bands in edges.items() if edge != "K7->K8"}
         for a, edges in det.PDL_OFF_BANDS.items()
     } == nd.PDL_OFF_BANDS
-    assert nd.pdl_edge(nd.MODULES[SLAB]["library"]) == "K6->K7"
-    assert nd.pdl_edge(nd.MODULES[LPT]["library"]) == "K6->K7"
-    split = _atomic_split(arch)
-    det_slabs = [
-        n
-        for n in det.route_modules(arch, HIDDEN, "bwd_finish")
-        if _det_role(n) == "bwd_slab"
-    ]
-    assert det_slabs
+    sizes = _arch_sizes(arch)
+    # per hidden size: (this package's column-slab records, its atomic fn split, the deterministic column slabs)
+    slabs = {
+        hidden: (
+            [SLAB, LPT] if hidden == HIDDEN else [_slab(hidden)],
+            _atomic_split(arch, hidden),
+            [
+                n
+                for n in det.route_modules(arch, hidden, "bwd_finish")
+                if _det_role(n) == "bwd_slab"
+            ],
+        )
+        for hidden in sizes
+    }
+    for hidden, (names, _split, det_slabs) in slabs.items():
+        assert det_slabs, (arch, hidden)
+        for name in names:
+            assert nd.pdl_edge(nd.MODULES[name]["library"]) == "K6->K7", name
     boundaries = set()
     for bands in det.PDL_OFF_BANDS.get(arch, {}).get("K6->K7", {}).values():
         for above, at_most in bands:
@@ -549,10 +642,12 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
         for path in det.PDL_PATHS:
             value = nd.enable_pdl(SLAB, T, arch, path)
             assert value in (0, 1)
-            assert nd.enable_pdl(LPT, T, arch, path) == value, (T, path)
-            for name in det_slabs:
-                assert value == det.enable_pdl(name, T, arch, path), (T, path, name)
-            assert nd.enable_pdl(split, T, arch, path) == 1, (T, path)
+            for hidden, (names, split, det_slabs) in slabs.items():
+                for name in names:
+                    assert nd.enable_pdl(name, T, arch, path) == value, (T, path, name)
+                for name in det_slabs:
+                    assert value == det.enable_pdl(name, T, arch, path), (T, path, name)
+                assert nd.enable_pdl(split, T, arch, path) == 1, (T, path, hidden)
             for name in copied:
                 assert nd.enable_pdl(_renamed(name), T, arch, path) == det.enable_pdl(
                     name, T, arch, path
@@ -574,42 +669,48 @@ def _round256(n: int) -> int:
 def test_workspace_is_the_deterministic_layout_without_the_partials(
     arch: str, sm: int
 ) -> None:
-    """``fwd`` is the deterministic forward workspace; the ``bwd`` regions are the deterministic ``bwd`` regions but
-    the last (``dfn_part``, ``P x 24 x 16384`` FP32) at identical offsets, sizes, dtypes and shapes, the ticket region
-    first; the total is the deterministic total less the rounded ``dfn_part`` bytes; ``T == 0`` has no regions."""
+    """At every hidden size of the board's architecture: ``fwd`` is the deterministic forward workspace; the ``bwd``
+    regions are the deterministic ``bwd`` regions but the last (``dfn_part``, ``P x 24 x 4H`` FP32) at identical
+    offsets, sizes, dtypes and shapes, the ticket region first; the total is the deterministic total less the rounded
+    ``dfn_part`` bytes; ``T == 0`` has no regions."""
     assert set(nd.WORKSPACE_REGIONS) == set(det.WORKSPACE_REGIONS) == {"fwd", "bwd"}
     assert nd.WORKSPACE_REGIONS["fwd"] == det.WORKSPACE_REGIONS["fwd"]
     assert det.WORKSPACE_REGIONS["bwd"][-1]["name"] == "dfn_part"
     assert nd.WORKSPACE_REGIONS["bwd"] == det.WORKSPACE_REGIONS["bwd"][:-1]
     assert nd.WORKSPACE_OF_KIND == det.WORKSPACE_OF_KIND
-    for T in det.RULES_T_VALUES:
-        assert nd.workspace_regions("fwd", T, sm, arch) == det.workspace_regions(
-            "fwd", T, sm, arch
-        ), T
-        layout = nd.workspace_regions("bwd", T, sm, arch)
-        reference = det.workspace_regions("bwd", T, sm, arch)
-        assert layout["total_bytes"] == nd.workspace_bytes("bwd", T, sm, arch), T
+    for hidden, T in ((h, T) for h in _arch_sizes(arch) for T in det.RULES_T_VALUES):
+        what = (hidden, T)
+        assert nd.workspace_regions(
+            "fwd", T, sm, arch, hidden
+        ) == det.workspace_regions("fwd", T, sm, arch, hidden), what
+        layout = nd.workspace_regions("bwd", T, sm, arch, hidden)
+        reference = det.workspace_regions("bwd", T, sm, arch, hidden)
+        assert layout["total_bytes"] == nd.workspace_bytes(
+            "bwd", T, sm, arch, hidden
+        ), what
         if T == 0:
             assert layout == {"regions": {}, "total_bytes": 0}
             continue
         names = list(reference["regions"])
-        assert names[-1] == "dfn_part" and list(layout["regions"]) == names[:-1], T
+        assert names[-1] == "dfn_part" and list(layout["regions"]) == names[:-1], what
         for name, region in layout["regions"].items():
-            assert region == reference["regions"][name], (T, name)
+            assert region == reference["regions"][name], (what, name)
         assert layout["regions"]["ticket"]["offset"] == 0
         assert layout["regions"]["ticket"]["bytes"] == 4 * det.TICKET_WORDS
         part = reference["regions"]["dfn_part"]
-        parts = det.k7_chunks(T, sm)[0]
-        assert part["shape"] == (parts, 24, 16384), T
-        assert part["bytes"] == parts * 24 * 16384 * 4, T
+        parts = det.k7_chunks(T, sm, hidden=hidden)[0]
+        assert part["shape"] == (parts, 24, 4 * hidden), what
+        assert part["bytes"] == parts * 24 * 4 * hidden * 4, what
         assert layout["total_bytes"] == reference["total_bytes"] - _round256(
             part["bytes"]
-        ), T
-        assert layout["total_bytes"] % 256 == 0, T
+        ), what
+        assert layout["total_bytes"] % 256 == 0, what
     with pytest.raises(ValueError):
         nd.workspace_regions("bwd", -1, sm, arch)
     with pytest.raises(ValueError):
         nd.workspace_regions("dfn", 1, sm, arch)
+    with pytest.raises(ValueError):
+        nd.workspace_regions("bwd", 1, sm, arch, 6144)
 
 
 @pytest.mark.cpu_only
@@ -617,28 +718,39 @@ def test_workspace_is_the_deterministic_layout_without_the_partials(
 def test_workspace_envelope_covers_every_smaller_token_count(
     arch: str, sm: int
 ) -> None:
-    """``workspace_bytes_upto("bwd", T)`` is non-decreasing, at least the exact size of every token count up to ``T``
-    and at most the deterministic envelope (a buffer of the deterministic sizing serves this package); 0 at
-    ``T == 0``; the forward envelope is the deterministic one."""
-    previous = 0
-    for T in range(0, 4200):
-        envelope = nd.workspace_bytes_upto("bwd", T, sm, arch)
-        assert envelope >= previous, T
-        assert envelope >= nd.workspace_bytes("bwd", T, sm, arch), T
-        assert envelope <= det.workspace_bytes_upto("bwd", T, sm, arch), T
-        previous = envelope
-    assert nd.workspace_bytes_upto("bwd", 0, sm, arch) == 0
-    for rows in (64, 65, 1000, 2049, 8192, 16263, 20001, 65536):
-        envelope = nd.workspace_bytes_upto("bwd", rows, sm, arch)
-        assert envelope <= det.workspace_bytes_upto("bwd", rows, sm, arch), rows
-        assert nd.workspace_bytes_upto(
-            "fwd", rows, sm, arch
-        ) == det.workspace_bytes_upto("fwd", rows, sm, arch), rows
-        for T in sorted(
-            {t for t in det.RULES_T_VALUES if t <= rows}
-            | {rows, rows - 1, (rows + 1) // 2}
-        ):
-            assert envelope >= nd.workspace_bytes("bwd", T, sm, arch), (rows, T)
+    """At every hidden size of the board's architecture: ``workspace_bytes_upto("bwd", T)`` is non-decreasing, at
+    least the exact size of every token count up to ``T`` and at most the deterministic envelope (a buffer of the
+    deterministic sizing serves this package); 0 at ``T == 0``; the forward envelope is the deterministic one.  Every
+    token count below 4200 at hidden 4096, every seventh at 5120 and 7168."""
+    for hidden in _arch_sizes(arch):
+        previous = 0
+        for T in range(0, 4200, 1 if hidden == HIDDEN else 7):
+            what = (hidden, T)
+            envelope = nd.workspace_bytes_upto("bwd", T, sm, arch, hidden)
+            assert envelope >= previous, what
+            assert envelope >= nd.workspace_bytes("bwd", T, sm, arch, hidden), what
+            assert envelope <= det.workspace_bytes_upto("bwd", T, sm, arch, hidden), (
+                what
+            )
+            previous = envelope
+        assert nd.workspace_bytes_upto("bwd", 0, sm, arch, hidden) == 0
+        for rows in (64, 65, 1000, 2049, 8192, 16263, 20001, 65536):
+            what = (hidden, rows)
+            envelope = nd.workspace_bytes_upto("bwd", rows, sm, arch, hidden)
+            assert envelope <= det.workspace_bytes_upto(
+                "bwd", rows, sm, arch, hidden
+            ), what
+            assert nd.workspace_bytes_upto(
+                "fwd", rows, sm, arch, hidden
+            ) == det.workspace_bytes_upto("fwd", rows, sm, arch, hidden), what
+            for T in sorted(
+                {t for t in det.RULES_T_VALUES if t <= rows}
+                | {rows, rows - 1, (rows + 1) // 2}
+            ):
+                assert envelope >= nd.workspace_bytes("bwd", T, sm, arch, hidden), (
+                    what,
+                    T,
+                )
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -676,13 +788,17 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
     columns, with this package's backward workspace bytes."""
     for name in _SHARED_TABLES:
         assert getattr(nd, name) == getattr(det, name), name
-    # The hidden sizes: this package's one size is a deterministic size; the per-size tables of the other sizes have
-    # no copy (the tables of record above are the H 4096 ones), the per-size table names are the deterministic ones
-    # without the column-slab and reduction tables.
-    assert nd.HIDDEN_SIZES == (HIDDEN,) and HIDDEN in det.HIDDEN_SIZES
-    assert nd.H_TABLES == {} and HIDDEN not in det.H_TABLES
+    # The hidden sizes: the deterministic ones; the per-size table names are the deterministic ones without the
+    # column-slab and reduction tables, and the tables of each size other than 4096 the deterministic tables of those
+    # names (the tables of record above are the H 4096 ones).
+    assert tuple(nd.HIDDEN_SIZES) == tuple(det.HIDDEN_SIZES) == HIDDEN_SIZES
     kept = tuple(name for name in det.H_TABLE_NAMES if name not in _DROPPED_RULES)
     assert kept == nd.H_TABLE_NAMES
+    assert HIDDEN not in det.H_TABLES and set(det.H_TABLES) == set(NEW_HIDDEN_SIZES)
+    assert {
+        hidden: {name: det.H_TABLES[hidden][name] for name in nd.H_TABLE_NAMES}
+        for hidden in NEW_HIDDEN_SIZES
+    } == nd.H_TABLES
     for name in _DROPPED_RULES:
         assert hasattr(det, name) and not hasattr(nd, name), name
     for name in _OWN_RULES:
@@ -729,6 +845,118 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
             )
         assert nd.k7_chunks(T, sm) == det.k7_chunks(T, sm), T
         assert nd.k6_grid(T, sm) == det.k6_grid(T, sm), T
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
+def test_host_rules_at_the_new_hidden_sizes(arch: str, sm: int) -> None:
+    """At hidden 5120 and 7168 on every board (the rules are functions of the size's tables; sm_107a routes neither
+    size): a rules row is the deterministic row without its column-slab and reduction program columns, with this
+    package's backward workspace bytes, on every token count of record; the host plan and every copied rule give the
+    deterministic outputs; the per-size tables are read through ``_tab`` (a size it does not spell is a ``KeyError``,
+    never the H 4096 value; ``BWD_SLAB_LPT`` is no per-size table).  ``rules_table()`` holds the H 4096 rows, then
+    each other size's."""
+    dropped_columns = {"bwd_slab_program", "bwd_reduce_program", "bwd_reduce_grid"}
+    for hidden in NEW_HIDDEN_SIZES:
+        for name in nd.H_TABLE_NAMES:
+            assert nd._tab(name, hidden) is nd.H_TABLES[hidden][name], (hidden, name)
+        for layout in (0, 1):
+            assert nd.fn_split_program(arch, layout, hidden) == det.fn_split_program(
+                arch, layout, hidden
+            )
+            assert nd.fn_split_grid(arch, layout, hidden) == det.fn_split_grid(
+                arch, layout, hidden
+            )
+        assert nd.fwd_finish_program(arch, hidden) == det.fwd_finish_program(
+            arch, hidden
+        )
+        for T in det.RULES_T_VALUES:
+            what = (hidden, T)
+            row = nd.rules_row(T, sm, arch, hidden)
+            reference = det.rules_row(T, sm, arch, hidden)
+            expected = {k: v for k, v in reference.items() if k not in dropped_columns}
+            expected["bwd_workspace_bytes"] = nd.workspace_bytes(
+                "bwd", T, sm, arch, hidden
+            )
+            assert row == expected, what
+            if T == 0:
+                continue
+            assert nd.host_plan(T, sm, arch, hidden) == det.host_plan(
+                T, sm, arch, hidden
+            ), what
+            for rule in (
+                "fwd_map_program",
+                "fwd_coef_program",
+                "bwd_token_program",
+                "k5_program",
+                "k5_grid",
+            ):
+                assert getattr(nd, rule)(T, sm, arch, hidden) == getattr(det, rule)(
+                    T, sm, arch, hidden
+                ), (rule, what)
+            assert nd.k7_chunks(T, sm, hidden=hidden) == det.k7_chunks(
+                T, sm, hidden=hidden
+            ), what
+            assert nd.k6_grid(T, sm, hidden) == det.k6_grid(T, sm, hidden), what
+            assert nd.k3_grid(T, hidden) == det.k3_grid(T, hidden), what
+    for name in nd.H_TABLE_NAMES:
+        assert nd._tab(name, HIDDEN) is getattr(nd, name), name
+        with pytest.raises(KeyError):
+            nd._tab(name, 6144)
+    with pytest.raises(KeyError):
+        nd._tab("BWD_SLAB_LPT", HIDDEN)
+    # the token owner's resident CTAs per SM (G6 = min(K6_CTAS_PER_SM x SMs, ceil(T / 8))): two at 5120, one at 7168
+    assert nd._tab("K6_CTAS_PER_SM", 5120) == 2 and nd._tab("K6_CTAS_PER_SM", 7168) == 1
+    table = nd.rules_table()
+    per_size = len(set(det.RULES_T_VALUES)) * len(det.RULES_BOARDS)
+    assert [row["hidden"] for row in table] == [
+        hidden for hidden in HIDDEN_SIZES for _ in range(per_size)
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("arch", "sm"),
+    [board for board in det.RULES_BOARDS if board[0] in NEW_HIDDEN_ARCHES],
+)
+def test_launch_grids_at_the_new_hidden_sizes(arch: str, sm: int, monkeypatch) -> None:
+    """At hidden 5120 and 7168, on every token count of record, every record a call selects launches the grid of the
+    deterministic record it copies or replaces: a copy the renamed deterministic record's grid, the atomic fn split
+    the deterministic backward split's fixed grid (the rules row's ``fn_split_grid_t``: 320 / 448 CTAs), the column
+    slab ``min(SMs, H / 64 x P)`` CTAs, the deterministic ``dynr`` record's grid (the rules row's ``k7_grid``)."""
+    for module in (nd, det):
+        monkeypatch.setattr(module, "sm_count", lambda _index: sm)
+        monkeypatch.setattr(module, "device_arch", lambda _index: arch)
+    checked = 0
+    for hidden in NEW_HIDDEN_SIZES:
+        for T in T_VALUES:
+            row = det.rules_row(T, sm, arch, hidden)
+            for kind in det.KINDS:
+                what = (hidden, T, kind)
+                det_names = det.selected_modules(
+                    arch, hidden, kind, rows=T, sm_count=sm
+                )
+                for name in nd.selected_modules(
+                    arch, hidden, kind, rows=T, sm_count=sm
+                ):
+                    record = nd.MODULES[name]
+                    grid = nd.launch_grid(record, T, device_index=0)
+                    if record["role"] == "bwd_slab":
+                        assert grid == (
+                            min(sm, hidden // det.SLAB_D * row["P"]),
+                            1,
+                            1,
+                        ), (what, name)
+                        want = (row["k7_grid"], 1, 1)
+                    elif record["role"] == "fn_split_bwd":
+                        want = (row["fn_split_grid_t"], 1, 1)
+                    else:
+                        det_name = name.replace(ND_PREFIX, DET_PREFIX)
+                        assert det_name in det_names, (what, name)
+                        want = det.launch_grid(det.MODULES[det_name], T, device_index=0)
+                    assert grid == want, (what, name)
+                    checked += 1
+    assert checked
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -958,10 +1186,17 @@ def test_workspace_envelope_never_runs_the_screen(monkeypatch) -> None:
     """The workspace sizes and the rules rows never run the column slab's screen: ``host_plan``, which the envelope
     reads at every 64-token tile, carries no ``lpt`` value.  With ``lpt_chunks`` and ``_lpt_plan`` replaced by
     functions that raise and the ``host_plan`` / envelope caches cleared, the backward envelope of 16384 tokens on
-    B200 and the rules rows of record are their unpatched values."""
+    B200 and the rules rows of record, at every hidden size, are their unpatched values."""
     arch, sm, rows = "sm_100a", 148, 16384
-    want = nd.workspace_bytes_upto("bwd", rows, sm, arch)
-    rows_of_record = {T: nd.rules_row(T, sm, arch) for T in det.RULES_T_VALUES}
+    want = {
+        hidden: nd.workspace_bytes_upto("bwd", rows, sm, arch, hidden)
+        for hidden in HIDDEN_SIZES
+    }
+    rows_of_record = {
+        (hidden, T): nd.rules_row(T, sm, arch, hidden)
+        for hidden in HIDDEN_SIZES
+        for T in det.RULES_T_VALUES
+    }
 
     def screen(*_args, **_kwargs):
         raise AssertionError(
@@ -972,49 +1207,109 @@ def test_workspace_envelope_never_runs_the_screen(monkeypatch) -> None:
     monkeypatch.setattr(nd, "_lpt_plan", screen)
     nd.workspace_bytes_upto.cache_clear()
     nd.host_plan.cache_clear()
-    assert nd.workspace_bytes_upto("bwd", rows, sm, arch) == want
-    for T, row in rows_of_record.items():
-        assert nd.rules_row(T, sm, arch) == row, T
+    for hidden, nbytes in want.items():
+        assert nd.workspace_bytes_upto("bwd", rows, sm, arch, hidden) == nbytes, hidden
+    for (hidden, T), row in rows_of_record.items():
+        assert nd.rules_row(T, sm, arch, hidden) == row, (hidden, T)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
+def test_column_slab_rule_at_the_new_hidden_sizes(
+    arch: str, sm: int, monkeypatch
+) -> None:
+    """At hidden 5120 and 7168 the column slab runs its one-size ``dynr`` record at every token count (the two-size
+    schedule is calibrated and built at hidden 4096 only).  With ``lpt_chunks`` and ``_lpt_plan`` replaced by
+    functions that raise (no rule of these sizes runs the screen), at the token counts of record, of ``LPT_SWEEP``
+    and of the benchmark: ``bwd_slab_atomic_program`` is ``dynr``; ``slab_plan`` is the one-size chunks of
+    ``k7_chunks`` at the size (``P`` and the rows per chunk of the deterministic ``host_plan`` of the size: both
+    backwards sum the partials of the same chunks); on the sizes' architectures the ``bwd_finish`` selection holds the
+    size's ``dynr`` record.  A hidden size the package does not list is a ``ValueError`` (as in ``host_plan``)."""
+
+    def screen(*_args, **_kwargs):
+        raise AssertionError(
+            "a column-slab rule of hidden 5120 / 7168 ran the lpt screen"
+        )
+
+    monkeypatch.setattr(nd, "lpt_chunks", screen)
+    monkeypatch.setattr(nd, "_lpt_plan", screen)
+    checked = 0
+    for hidden in NEW_HIDDEN_SIZES:
+        for T in sorted(set(T_VALUES) | set(LPT_SWEEP) | set(BENCH_T)):
+            what = (arch, sm, hidden, T)
+            assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "dynr", what
+            plan = det.host_plan(T, sm, arch, hidden)
+            parts, _units, _grid, rows_per_chunk = nd.k7_chunks(T, sm, hidden=hidden)
+            assert (parts, rows_per_chunk) == (
+                plan["parts"],
+                plan["rows_per_chunk"],
+            ), what
+            assert nd.slab_plan(T, sm, arch, hidden) == dict(
+                zip(
+                    LPT_HOST_KEYS,
+                    (parts, rows_per_chunk, parts, rows_per_chunk),
+                    strict=True,
+                )
+            ), what
+            if arch in NEW_HIDDEN_ARCHES:
+                names = nd.selected_modules(
+                    arch, hidden, "bwd_finish", rows=T, sm_count=sm
+                )
+                slabs = [n for n in names if nd.MODULES[n]["role"] == "bwd_slab"]
+                assert slabs == [_slab(hidden)], (what, names)
+            checked += 1
+    assert checked
+    for bad in (2048, 6144):
+        with pytest.raises(ValueError, match="hidden"):
+            nd.bwd_slab_atomic_program(129, sm, arch, bad)
+        with pytest.raises(ValueError, match="hidden"):
+            nd.slab_plan(129, sm, arch, bad)
 
 
 @pytest.mark.cpu_only
 def test_route_glue_and_supported_hidden_sizes() -> None:
+    """The hidden sizes of each architecture are the deterministic package's: 4096, 5120 and 7168 on sm_100a /
+    sm_103a, 4096 on sm_107a, none on another architecture; a route applies exactly where the deterministic one
+    does; a size or architecture without a route is a ``ValueError`` of the selection."""
     for arch in det.ARCHES:
-        assert nd.supported_hidden_sizes(arch) == (HIDDEN,), arch
-        assert HIDDEN in det.supported_hidden_sizes(arch), arch
-        # the deterministic package's other hidden sizes have no route here
-        for hidden in set(det.supported_hidden_sizes(arch)) - {HIDDEN}:
+        sizes = nd.supported_hidden_sizes(arch)
+        assert sizes == _arch_sizes(arch), arch
+        assert sizes == (HIDDEN_SIZES if arch in NEW_HIDDEN_ARCHES else (HIDDEN,)), arch
+        # the sizes the architecture does not route (sm_107a: 5120 and 7168)
+        for hidden in (2048, 6144, *(h for h in HIDDEN_SIZES if h not in sizes)):
             with pytest.raises(ValueError):
                 nd.selected_modules(arch, hidden, "bwd_finish", rows=129, sm_count=148)
     assert nd.supported_hidden_sizes("sm_90a") == ()
     for kind in det.KINDS:
-        assert nd.route_key(HIDDEN, kind) == det.route_key(HIDDEN, kind)
+        for hidden in HIDDEN_SIZES:
+            assert nd.route_key(hidden, kind) == det.route_key(hidden, kind)
         for capability in ((10, 0), (10, 3), (10, 7)):
-            assert nd.route_applies(
-                device_capability=capability, hidden=HIDDEN, kind=kind
-            )
-            for hidden in (2048, *(h for h in det.HIDDEN_SIZES if h != HIDDEN)):
+            arch = nd.arch_for_capability(capability)
+            for hidden in (2048, 6144, *HIDDEN_SIZES):
+                applies = nd.route_applies(
+                    device_capability=capability, hidden=hidden, kind=kind
+                )
+                assert applies == det.route_applies(
+                    device_capability=capability, hidden=hidden, kind=kind
+                ), (capability, hidden, kind)
+                assert applies == (hidden in _arch_sizes(arch)), (capability, hidden)
+        for capability in ((9, 0), (12, 0), (10, 1)):
+            for hidden in HIDDEN_SIZES:
                 assert not nd.route_applies(
                     device_capability=capability, hidden=hidden, kind=kind
                 )
-        for capability in ((9, 0), (12, 0), (10, 1)):
-            assert not nd.route_applies(
-                device_capability=capability, hidden=HIDDEN, kind=kind
-            )
     with pytest.raises(ValueError):
         nd.route_key(HIDDEN, "bwd_reduce")
     with pytest.raises(ValueError):
         nd.selected_modules("sm_90a", HIDDEN, "bwd_finish", rows=129, sm_count=148)
-    with pytest.raises(ValueError):
-        nd.selected_modules("sm_100a", 2048, "bwd_finish", rows=129, sm_count=148)
     assert pkg.route_modules is nd.route_modules and pkg.route_key is nd.route_key
 
 
 @pytest.mark.cpu_only
 def test_library_names_and_record_scalars() -> None:
     """``library_name`` is ``<library>_<arch>`` on the record's architectures and a ``RuntimeError`` elsewhere;
-    ``RECORD_SCALARS`` is the deterministic table renamed without the backward fn splits (the forward fn split
-    ``want_t = 0``; the atomic fn splits take no ``want_t``)."""
+    ``RECORD_SCALARS`` is the deterministic table of every hidden size renamed without the backward fn splits (the
+    forward fn split of each size ``want_t = 0``; the atomic fn splits take no ``want_t``)."""
     for name, record in nd.MODULES.items():
         for arch in det.ARCHES:
             if arch in record["arches"]:
@@ -1027,7 +1322,10 @@ def test_library_names_and_record_scalars() -> None:
         for name, scalars in DET_RECORD_SCALARS.items()
         if _det_role(name) != "fn_split_bwd"
     } == nd.RECORD_SCALARS
-    assert nd.RECORD_SCALARS == {ND_PREFIX + "fn_split": {"want_t": 0}}
+    assert {
+        ND_PREFIX + "fn_split" + _suffix(hidden): {"want_t": 0}
+        for hidden in HIDDEN_SIZES
+    } == nd.RECORD_SCALARS
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1115,8 +1413,9 @@ importlib.import_module(sys.argv[2] + ".cake_build")
 out = {
     "supported_cpu": package.is_cake_mhc_train_supported(torch.device("cpu")),
     "selection": {
-        f"{arch}/{sm}": list(jit.selected_modules(arch, 4096, "bwd_finish", rows=4096, sm_count=sm))
+        f"{arch}/{sm}/{hidden}": list(jit.selected_modules(arch, hidden, "bwd_finish", rows=4096, sm_count=sm))
         for arch, sm in jit.RULES_BOARDS
+        for hidden in jit.supported_hidden_sizes(arch)
     },
     "bwd_bytes": jit.workspace_bytes("bwd", 4096, 148, "sm_100a"),
 }
@@ -1135,8 +1434,8 @@ print(json.dumps(out))
 @pytest.mark.cpu_only
 def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path: Path) -> None:
     """The package directory copied under another top-level name (the vendored gate's first step, without its
-    sources) imports, plans its routes and refuses ``deterministic=True`` in an interpreter where every
-    ``flashinfer`` import raises; no flashinfer module is loaded."""
+    sources) imports, plans its routes (every hidden size of every board) and refuses ``deterministic=True`` in an
+    interpreter where every ``flashinfer`` import raises; no flashinfer module is loaded."""
     neutral = "vendored_cake_mhc_train_backend"
     shutil.copytree(
         PACKAGE_DIR,
@@ -1155,11 +1454,16 @@ def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path: Path) -> None:
     out = json.loads(run.stdout.strip().splitlines()[-1])
     assert out["flashinfer"] == [], out["flashinfer"]
     assert out["supported_cpu"] is False
-    assert len(out["selection"]) == len(det.RULES_BOARDS)
-    for arch, sm in det.RULES_BOARDS:
-        assert out["selection"][f"{arch}/{sm}"] == list(
-            nd.selected_modules(arch, HIDDEN, "bwd_finish", rows=4096, sm_count=sm)
-        ), (arch, sm)
+    boards = [
+        (arch, sm, hidden)
+        for arch, sm in det.RULES_BOARDS
+        for hidden in _arch_sizes(arch)
+    ]
+    assert set(out["selection"]) == {f"{a}/{s}/{h}" for a, s, h in boards}
+    for arch, sm, hidden in boards:
+        assert out["selection"][f"{arch}/{sm}/{hidden}"] == list(
+            nd.selected_modules(arch, hidden, "bwd_finish", rows=4096, sm_count=sm)
+        ), (arch, sm, hidden)
     assert out["bwd_bytes"] == nd.workspace_bytes("bwd", 4096, 148, "sm_100a")
     assert out["refusal"].startswith(f"cake_mhc_train_backward_finish {_REFUSAL}")
 

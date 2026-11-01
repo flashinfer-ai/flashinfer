@@ -33,11 +33,19 @@ its handle.  This module checks:
   ``TypeError`` before anything else, and each entry point's dispatch (the two
   packages' entry points replaced by recorders) in both torch modes, with the
   one-time warning;
-* on a device: ``True`` is bitwise the deterministic package and launches
-  nothing of the backend; ``False`` launches nothing of the deterministic
-  package and gives the backend's results; under PyTorch's deterministic
-  algorithms (strict and ``warn_only``) ``False`` gives the deterministic bits
-  without an alert, the backend launching nothing;
+* on a device, at every hidden size the device's architecture routes (4096,
+  5120 and 7168 on SM100 / SM103, 4096 on SM107): ``True`` is bitwise the
+  deterministic package and launches nothing of the backend; ``False``
+  launches nothing of the deterministic package and gives the backend's
+  results; under PyTorch's deterministic algorithms (strict and
+  ``warn_only``) ``False`` gives the deterministic bits without an alert, the
+  backend launching nothing; ``False`` sizes and runs a hidden size exactly
+  where ``True`` does (a size the package does not list is refused before any
+  device query);
+* training with ``False`` composed with the model's head of the deterministic
+  package (``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head``, the
+  stream mean of the last layer): the gradients reach every leaf through the
+  head and equal the deterministic training and head's;
 * the companion workspace of that fallback: a caller backward workspace of the
   non-deterministic sizing is left untouched and the call runs on a private
   companion of the deterministic size of the token-count bucket (never the
@@ -75,6 +83,8 @@ from flashinfer.cake_mhc_det_train_backend import cake_jit as det_loader
 from flashinfer.experimental.cake.cake_mhc_train_backend import cake_jit as loader
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
+# The hidden sizes of both packages; a device case of a size runs where the device's architecture routes it.
+HIDDEN_SIZES = (4096, 5120, 7168)
 REPO = Path(__file__).resolve().parents[2]
 SEED = 2032
 BF16 = torch.bfloat16
@@ -423,7 +433,24 @@ def _sm_count() -> int:
     return loader.sm_count(_device().index)
 
 
-def _inputs(T: int, seed: int = SEED) -> dict[str, torch.Tensor]:
+def _hidden_sizes() -> tuple[int, ...]:
+    """The hidden sizes the device's architecture routes every kind of (the deterministic package's sizes there)."""
+    arch = _arch()
+    return tuple(loader.supported_hidden_sizes(arch)) if arch else ()
+
+
+@pytest.fixture(params=HIDDEN_SIZES, ids=lambda h: f"H{h}")
+def hidden(request) -> int:
+    """The hidden size of a device case (skipped where the architecture has no route of it)."""
+    if request.param not in _hidden_sizes():
+        pytest.skip(
+            f"hidden {request.param} has no exported route on {_arch()} "
+            f"(exported hidden sizes: {_hidden_sizes()})"
+        )
+    return request.param
+
+
+def _inputs(T: int, seed: int = SEED, hidden: int = 4096) -> dict[str, torch.Tensor]:
     generator = torch.Generator(device=_device()).manual_seed(seed)
 
     def randn(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
@@ -432,13 +459,13 @@ def _inputs(T: int, seed: int = SEED) -> dict[str, torch.Tensor]:
         ).to(dtype)
 
     i = {
-        "X": randn(T, 4, 4096, dtype=BF16),
-        "fn": (randn(24, 16384) * 1e-2).contiguous(),
+        "X": randn(T, 4, hidden, dtype=BF16),
+        "fn": (randn(24, 4 * hidden) * 1e-2).contiguous(),
         "scale": 1.0 + 0.1 * randn(3),
         "base": 0.1 * randn(24),
-        "B": randn(T, 4096, dtype=BF16),
-        "dY": randn(T, 4, 4096, dtype=BF16),
-        "dU": randn(T, 4096, dtype=BF16),
+        "B": randn(T, hidden, dtype=BF16),
+        "dY": randn(T, 4, hidden, dtype=BF16),
+        "dU": randn(T, hidden, dtype=BF16),
     }
     _U, i["stats"] = det_facade.cake_mhc_det_train_forward_prepare(
         i["X"], i["fn"], i["scale"], i["base"]
@@ -532,7 +559,11 @@ def _references(i: dict) -> dict:
     g = torch.Generator(device=_device()).manual_seed(SEED + 4)
     carried = {
         k: torch.randn(shape, generator=g, device=_device()) * 1e-3
-        for k, shape in (("dfn", (24, 16384)), ("dscale", (3,)), ("dbase", (24,)))
+        for k, shape in (
+            ("dfn", tuple(i["fn"].shape)),
+            ("dscale", (3,)),
+            ("dbase", (24,)),
+        )
     }
     accumulated = {k: v.clone() for k, v in carried.items()}
     det_facade.cake_mhc_det_train_backward_finish(
@@ -553,26 +584,32 @@ def _references(i: dict) -> dict:
 
 @requires_device
 @pytest.mark.parametrize("T", (7, 2049))
-def test_true_is_the_deterministic_package(T: int, monkeypatch) -> None:
+def test_true_is_the_deterministic_package(T: int, hidden: int, monkeypatch) -> None:
     """The default and ``deterministic=True``, with the backend's launches refused: the workspace sizes and buffers,
     the forward entry points, ``backward_finish`` (default and caller workspaces, ``accumulate``) and the autograd
     prepare / finish (a deterministic handle) are bitwise the deterministic package's."""
-    i = _inputs(T)
+    i = _inputs(T, hidden=hidden)
     ref = _references(i)
     dev = _device()
-    det_bytes = det_backend.cake_mhc_det_train_backward_workspace_bytes(T, dev)
+    det_bytes = det_backend.cake_mhc_det_train_backward_workspace_bytes(
+        T, dev, hidden=hidden
+    )
     with monkeypatch.context() as m:
         _refuse_launches(m, backend)
         for mode in ({}, {"deterministic": True}):
-            what = f"T={T} {mode}"
+            what = f"T={T} H={hidden} {mode}"
             assert (
-                facade.cake_mhc_train_backward_workspace_bytes(T, dev, **mode)
+                facade.cake_mhc_train_backward_workspace_bytes(
+                    T, dev, hidden=hidden, **mode
+                )
                 == det_bytes
             )
             assert facade.cake_mhc_train_forward_workspace_bytes(
-                T, dev, **mode
-            ) == det_backend.cake_mhc_det_train_forward_workspace_bytes(T, dev)
-            ws = facade.cake_mhc_train_backward_workspace(T, dev, **mode)
+                T, dev, hidden=hidden, **mode
+            ) == det_backend.cake_mhc_det_train_forward_workspace_bytes(
+                T, dev, hidden=hidden
+            )
+            ws = facade.cake_mhc_train_backward_workspace(T, dev, hidden=hidden, **mode)
             assert ws.dtype == torch.uint8 and ws.numel() == det_bytes
             assert int(torch.count_nonzero(ws)) == 0
             got = _forward_outputs(_facade_entries(), i, **mode)
@@ -603,43 +640,49 @@ def test_true_is_the_deterministic_package(T: int, monkeypatch) -> None:
 
 @requires_device
 @pytest.mark.parametrize("T", (7, 2049))
-def test_false_is_the_nondeterministic_backend(T: int, monkeypatch) -> None:
+def test_false_is_the_nondeterministic_backend(
+    T: int, hidden: int, monkeypatch
+) -> None:
     """``deterministic=False``, with the deterministic package's launches refused: the backend's workspace sizes
     (smaller than the deterministic one); the forward entry points bitwise the deterministic package's;
     ``backward_finish`` (default and caller workspaces) with the deterministic ``dX`` / ``dscale`` / ``dbase`` bits
     and a ``dfn`` within FP32 rounding of the deterministic one and of the backend's own; the autograd prepare makes
     the backend's handle and the finish follows it (``Y`` and the ``X`` / ``scale`` / ``base`` gradients the
     deterministic bits, the ``fn`` gradient within FP32 rounding)."""
-    i = _inputs(T)
+    i = _inputs(T, hidden=hidden)
     ref = _references(i)
     direct = [
         t.clone()
         for t in backend.cake_mhc_train_backward_finish(*_args(i), deterministic=False)
     ]
     dev = _device()
-    nd_bytes = loader.workspace_bytes_upto("bwd", T, _sm_count(), _arch())
+    nd_bytes = loader.workspace_bytes_upto("bwd", T, _sm_count(), _arch(), hidden)
     with monkeypatch.context() as m:
         _refuse_launches(m, det_backend)
         assert (
-            facade.cake_mhc_train_backward_workspace_bytes(T, dev, deterministic=False)
+            facade.cake_mhc_train_backward_workspace_bytes(
+                T, dev, hidden=hidden, deterministic=False
+            )
             == nd_bytes
         )
         assert nd_bytes < det_backend.cake_mhc_det_train_backward_workspace_bytes(
-            T, dev
+            T, dev, hidden=hidden
         )
         assert facade.cake_mhc_train_forward_workspace_bytes(
-            T, dev, deterministic=False
-        ) == loader.workspace_bytes_upto("fwd", T, _sm_count(), _arch())
-        ws = facade.cake_mhc_train_backward_workspace(T, dev, deterministic=False)
+            T, dev, hidden=hidden, deterministic=False
+        ) == loader.workspace_bytes_upto("fwd", T, _sm_count(), _arch(), hidden)
+        ws = facade.cake_mhc_train_backward_workspace(
+            T, dev, hidden=hidden, deterministic=False
+        )
         assert ws.dtype == torch.uint8 and ws.numel() == nd_bytes
         got = _forward_outputs(_facade_entries(), i, deterministic=False)
         for k, v in ref["forward"].items():
-            assert _same_bits(got[k], v), f"{k} T={T} deterministic=False"
+            assert _same_bits(got[k], v), f"{k} T={T} H={hidden} deterministic=False"
         for workspace in (None, ws):
             got = facade.cake_mhc_train_backward_finish(
                 *_args(i), workspace=workspace, deterministic=False
             )
-            what = f"T={T} deterministic=False workspace={workspace is not None}"
+            what = f"T={T} H={hidden} deterministic=False workspace={workspace is not None}"
             for n, k in enumerate(_OUTPUTS):
                 if k in _EXACT:
                     assert _same_bits(got[n], ref["backward"][n]), (
@@ -666,14 +709,14 @@ def test_false_is_the_nondeterministic_backend(T: int, monkeypatch) -> None:
 @requires_device
 @pytest.mark.parametrize("warn_only", (False, True), ids=("strict", "warn_only"))
 def test_torch_deterministic_mode_runs_the_deterministic_package(
-    warn_only: bool, deterministic_algorithms, monkeypatch
+    warn_only: bool, hidden: int, deterministic_algorithms, monkeypatch
 ) -> None:
     """Under ``torch.use_deterministic_algorithms(True[, warn_only=True])``, with the backend's launches refused:
     ``deterministic=False`` gives the deterministic package's workspace size and bits on every entry point (the
     forward entry points, ``backward_finish``, the autograd prepare with a deterministic handle and its backward)
     without an alert, and the process warns once."""
     T = 129
-    i = _inputs(T)
+    i = _inputs(T, hidden=hidden)
     ref = _references(i)
     dev = _device()
     monkeypatch.setattr(facade, "_DET_FALLBACK_WARNED", False)
@@ -684,8 +727,10 @@ def test_torch_deterministic_mode_runs_the_deterministic_package(
             warnings.simplefilter("always")
             warnings.simplefilter("ignore", ExperimentalWarning)
             assert facade.cake_mhc_train_backward_workspace_bytes(
-                T, dev, deterministic=False
-            ) == det_backend.cake_mhc_det_train_backward_workspace_bytes(T, dev)
+                T, dev, hidden=hidden, deterministic=False
+            ) == det_backend.cake_mhc_det_train_backward_workspace_bytes(
+                T, dev, hidden=hidden
+            )
             got = _forward_outputs(_facade_entries(), i, deterministic=False)
             for k, v in ref["forward"].items():
                 assert _same_bits(got[k], v), k
@@ -730,7 +775,7 @@ def _companions(workspace: torch.Tensor) -> list:
 
 @requires_device
 def test_fallback_runs_on_a_private_companion_workspace(
-    deterministic_algorithms, monkeypatch
+    hidden: int, deterministic_algorithms, monkeypatch
 ) -> None:
     """Under PyTorch's deterministic algorithms a ``deterministic=False`` ``backward_finish`` with a caller backward
     workspace of the non-deterministic sizing (too small for the deterministic layout) leaves that buffer untouched
@@ -739,7 +784,7 @@ def test_fallback_runs_on_a_private_companion_workspace(
     serves (also through the autograd prepare's ``backward_workspace``), a second one when the first is too small,
     and released with the caller's workspace.  A workspace of the deterministic sizing runs the deterministic
     backward in place (no companion); invalid workspaces and operands reach the deterministic checks unchanged and
-    make no companion."""
+    make no companion.  Every size above is that of the case's hidden size."""
     dev = _device()
     sm, arch = _sm_count(), _arch()
     monkeypatch.setattr(facade, "_COMPANIONS", {})
@@ -750,24 +795,28 @@ def test_fallback_runs_on_a_private_companion_workspace(
         2049,
         3000,
     )  # two token-count buckets: 129 / 200 share one, 2049 / 3000 another
-    cases = {T: _inputs(T, seed=SEED + T) for T in sequence}
+    cases = {T: _inputs(T, seed=SEED + T, hidden=hidden) for T in sequence}
     want = {T: _det_backward(i) for T, i in cases.items()}
     ref_2049 = _references(cases[2049])
     # every caller workspace exists before the deterministic algorithms turn deterministic=False allocations
     # deterministic
     nd_ws = facade.cake_mhc_train_backward_workspace(
-        max(sequence), dev, deterministic=False
+        max(sequence), dev, hidden=hidden, deterministic=False
     )
     nd_ws[256:].fill_(0xAB)
     before = nd_ws.clone()
-    det_ws = facade.cake_mhc_train_backward_workspace(2049, dev)
+    det_ws = facade.cake_mhc_train_backward_workspace(2049, dev, hidden=hidden)
     assert int(torch.count_nonzero(det_ws)) == 0
-    fresh = facade.cake_mhc_train_backward_workspace(2049, dev, deterministic=False)
+    fresh = facade.cake_mhc_train_backward_workspace(
+        2049, dev, hidden=hidden, deterministic=False
+    )
     deterministic_algorithms(True)
     for T in sequence:
-        need = det_loader.workspace_bytes("bwd", T, sm, arch)
+        need = det_loader.workspace_bytes("bwd", T, sm, arch, hidden)
         # the premise: a valid deterministic=False workspace for T, too small for the deterministic layout
-        assert loader.workspace_bytes("bwd", T, sm, arch) <= nd_ws.numel() < need, T
+        assert (
+            loader.workspace_bytes("bwd", T, sm, arch, hidden) <= nd_ws.numel() < need
+        ), T
         existing = list(_companions(nd_ws))
         serving = next((c for c in existing if c.numel() >= need), None)
         got = facade.cake_mhc_train_backward_finish(
@@ -787,7 +836,9 @@ def test_fallback_runs_on_a_private_companion_workspace(
             bucket = 1 << (T - 1).bit_length()
             assert (
                 used.numel()
-                == det_backend.cake_mhc_det_train_backward_workspace_bytes(bucket, dev)
+                == det_backend.cake_mhc_det_train_backward_workspace_bytes(
+                    bucket, dev, hidden=hidden
+                )
             ), T
         assert used.dtype == torch.uint8 and used.device == dev and used.numel() >= need
         assert used.data_ptr() not in _det_defaults(), (
@@ -828,7 +879,7 @@ def test_fallback_runs_on_a_private_companion_workspace(
     # invalid workspaces and operands pass through to the deterministic checks
     i = cases[2049]
     count = len(facade._COMPANIONS)
-    nd_bytes = loader.workspace_bytes("bwd", 2049, sm, arch)
+    nd_bytes = loader.workspace_bytes("bwd", 2049, sm, arch, hidden)
     shifted = torch.zeros(nd_bytes + 512, dtype=torch.uint8, device=dev)[
         1 : 1 + nd_bytes
     ]
@@ -863,7 +914,7 @@ def test_fallback_runs_on_a_private_companion_workspace(
 
 @requires_device
 def test_fallback_under_cuda_graph_capture(
-    deterministic_algorithms, monkeypatch
+    hidden: int, deterministic_algorithms, monkeypatch
 ) -> None:
     """Under PyTorch's deterministic algorithms a ``deterministic=False`` ``backward_finish`` captured with a caller
     workspace of the non-deterministic sizing and no companion yet is a ``ValueError`` naming the capture (nothing is
@@ -873,15 +924,17 @@ def test_fallback_under_cuda_graph_capture(
     dev = _device()
     monkeypatch.setattr(facade, "_COMPANIONS", {})
     monkeypatch.setattr(facade, "_DET_FALLBACK_WARNED", True)
-    static = _inputs(T, seed=SEED + 20)
+    static = _inputs(T, seed=SEED + 20, hidden=hidden)
     nan = float("nan")
     outs = {
-        "dX": torch.full((T, 4, 4096), nan, dtype=BF16, device=dev),
-        "dfn": torch.full((24, 16384), nan, device=dev),
+        "dX": torch.full((T, 4, hidden), nan, dtype=BF16, device=dev),
+        "dfn": torch.full((24, 4 * hidden), nan, device=dev),
         "dscale": torch.full((3,), nan, device=dev),
         "dbase": torch.full((24,), nan, device=dev),
     }
-    nd_ws = facade.cake_mhc_train_backward_workspace(T, dev, deterministic=False)
+    nd_ws = facade.cake_mhc_train_backward_workspace(
+        T, dev, hidden=hidden, deterministic=False
+    )
     before = nd_ws.clone()
     _det_backward(
         static
@@ -918,7 +971,7 @@ def test_fallback_under_cuda_graph_capture(
     torch.cuda.synchronize()
     assert len(_companions(nd_ws)) == 1 and _companions(nd_ws)[0] is companions[0]
     for r in range(3):
-        new = _inputs(T, seed=SEED + 30 + r)
+        new = _inputs(T, seed=SEED + 30 + r, hidden=hidden)
         reference = _det_backward(new)
         for k in _ARG_KEYS:
             static[k].copy_(new[k])
@@ -944,38 +997,135 @@ _WORKSPACE_HELPERS = (
 
 @pytest.mark.cpu_only
 def test_nondeterministic_workspace_helpers_reject_other_hidden_sizes() -> None:
-    """``deterministic=False`` exports hidden 4096 only: its workspace helpers raise ``ValueError`` for another
-    hidden size before any device query, in the facade and in the backend."""
+    """``deterministic=False`` lists the hidden sizes 4096, 5120 and 7168 (``cake_jit.HIDDEN_SIZES``): its workspace
+    helpers raise ``ValueError`` for another hidden size or a non-``int`` one before any device query, in the facade
+    and in the backend (the sizes of the device's architecture are ``test_hidden_sizes_follow_the_device``'s)."""
+    assert tuple(loader.HIDDEN_SIZES) == HIDDEN_SIZES
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         for name in _WORKSPACE_HELPERS:
             for module in (facade, backend):
-                for hidden in (5120, 7168):
-                    with pytest.raises(ValueError, match="supports hidden=4096 only"):
+                for hidden in (6144, 2048, 4097, 0, -4096, True, 4096.0, "4096"):
+                    with pytest.raises(ValueError, match="hidden"):
                         getattr(module, name)(
                             1, torch.device("cuda"), hidden=hidden, deterministic=False
                         )
 
 
 @requires_device
-@pytest.mark.parametrize("hidden", (5120, 7168))
-def test_hidden_sizes_follow_the_mode(hidden) -> None:
-    """``deterministic=True`` sizes the deterministic package's workspaces for each hidden size it exports;
-    ``deterministic=False`` refuses an ``X`` of another hidden size with ``ValueError``."""
-    if not det_facade.is_cake_mhc_det_train_supported(_device(), hidden):
-        pytest.skip(f"hidden {hidden} is not exported on this device")
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES[1:], ids=lambda h: f"H{h}")
+def test_hidden_sizes_follow_the_device(hidden: int) -> None:
+    """``deterministic=False`` takes a hidden size exactly where ``deterministic=True`` does: on sm_100a / sm_103a
+    5120 and 7168 size their workspaces (the forward one the deterministic package's, the backward one smaller than
+    its, both other than the H 4096 sizes) and the entry points run on them; on sm_107a (hidden 4096 only) the
+    workspace helpers and the entry points refuse them with ``ValueError``."""
+    dev = _device()
+    exported = det_facade.is_cake_mhc_det_train_supported(dev, hidden)
+    assert exported == (hidden in _hidden_sizes()) == (_arch() != "sm_107a")
+    assert (
+        facade.is_cake_mhc_train_supported(dev, hidden, deterministic=False) == exported
+    )
+    assert backend.is_cake_mhc_train_supported(dev, hidden) == exported
+    i = _inputs(7, hidden=hidden) if exported else None
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
-        for name in _WORKSPACE_HELPERS[:2]:
-            det_name = name.replace("cake_mhc_train", "cake_mhc_det_train")
-            want = getattr(det_facade, det_name)(300, _device(), hidden=hidden)
-            assert want != getattr(det_facade, det_name)(300, _device())
-            assert getattr(facade, name)(300, _device(), hidden=hidden) == want
-        X = torch.zeros(7, 4, hidden, dtype=BF16, device=_device())
-        fn = torch.zeros(24, 4 * hidden, device=_device())
-        scale = torch.ones(3, device=_device())
-        base = torch.zeros(24, device=_device())
-        with pytest.raises(ValueError):
-            facade.cake_mhc_train_forward_prepare(
-                X, fn, scale, base, deterministic=False
+        if not exported:
+            for name in _WORKSPACE_HELPERS:
+                for module in (facade, backend):
+                    with pytest.raises(ValueError):
+                        getattr(module, name)(
+                            300, dev, hidden=hidden, deterministic=False
+                        )
+            X = torch.zeros(7, 4, hidden, dtype=BF16, device=dev)
+            fn = torch.zeros(24, 4 * hidden, device=dev)
+            scale = torch.ones(3, device=dev)
+            base = torch.zeros(24, device=dev)
+            for module in (facade, backend):
+                with pytest.raises(ValueError):
+                    module.cake_mhc_train_forward_prepare(
+                        X, fn, scale, base, deterministic=False
+                    )
+            return
+        for kind in ("forward", "backward"):
+            nbytes = getattr(facade, f"cake_mhc_train_{kind}_workspace_bytes")
+            reference_nbytes = getattr(
+                det_facade, f"cake_mhc_det_train_{kind}_workspace_bytes"
             )
+            got = nbytes(300, dev, hidden=hidden, deterministic=False)
+            want = reference_nbytes(300, dev, hidden=hidden)
+            assert got != nbytes(300, dev, deterministic=False), kind
+            assert got == want if kind == "forward" else got < want, (kind, got, want)
+            ws = getattr(facade, f"cake_mhc_train_{kind}_workspace")(
+                300, dev, hidden=hidden, deterministic=False
+            )
+            assert ws.numel() == got and int(torch.count_nonzero(ws)) == 0, kind
+        got = facade.cake_mhc_train_backward_finish(*_args(i), deterministic=False)
+        want = _det_backward(i)
+        for n, k in enumerate(_OUTPUTS):
+            if k in _EXACT:
+                assert _same_bits(got[n], want[n]), f"{k} H={hidden}"
+        assert _rel_l2(got[1], want[1]) <= DFN_REL_L2_MAX
+
+
+def _head_connections(prepare, finish, i: dict, layers: list, **kwargs) -> tuple:
+    """Two connections of ``prepare`` / ``finish`` (``layers``: their ``(fn, scale, base)``; the branch ``B = U +
+    B_0``), then the model's head ``cake_mhc_det_train_head`` (the stream mean of the last connection's ``Y``) under
+    the loss ``sum(head * dU)``: ``(head output, [X.grad, *(fn, scale, base).grad per connection])``."""
+    X = i["X"].clone().requires_grad_(True)
+    params = [[p.clone().requires_grad_(True) for p in layer] for layer in layers]
+    x = X
+    for fn, scale, base in params:
+        U, handle = prepare(x, fn, scale, base, **kwargs)
+        x = finish(x, (U.float() + i["B"].float()).to(BF16), handle)
+    head = det_facade.cake_mhc_det_train_head(x)
+    (head.float() * i["dU"].float()).sum().backward()
+    return head.detach(), [X.grad, *[p.grad for layer in params for p in layer]]
+
+
+@requires_device
+@pytest.mark.parametrize("T", (7, 2049))
+@pytest.mark.parametrize("save_stats", (True, False))
+def test_nd_training_composes_with_the_stream_mean_head(
+    T: int, save_stats: bool, hidden: int
+) -> None:
+    """Training with ``deterministic=False`` feeding the deterministic package's model head
+    (``flashinfer.cake_mhc_det_train.cake_mhc_det_train_head``, ``mean_i X[:, i, :]`` of the last connection's
+    four streams), at every hidden size the device routes: two connections, the head and a loss on its output.  The
+    gradients reach every leaf through the head (finite, non-zero), the connections' handles are the backend's, and
+    the head output and the ``X`` / ``scale`` / ``base`` gradients are bitwise those of the deterministic training
+    and the same head; each ``fn`` gradient is within FP32 rounding of the deterministic one (rel-L2 <=
+    ``DFN_REL_L2_MAX``)."""
+    if not det_facade.is_cake_mhc_det_train_head_supported(_device(), hidden):
+        pytest.skip(f"the head has no program of hidden {hidden} on {_arch()}")
+    i = _inputs(T, seed=SEED + 40, hidden=hidden)
+    second = _inputs(1, seed=SEED + 41, hidden=hidden)
+    layers = [[j[k] for k in ("fn", "scale", "base")] for j in (i, second)]
+    handles = []
+
+    def nd_prepare(*args, **kwargs):
+        U, handle = facade.cake_mhc_train_prepare(*args, deterministic=False, **kwargs)
+        handles.append(handle)
+        return U, handle
+
+    head, grads = _head_connections(
+        nd_prepare, facade.cake_mhc_train_finish, i, layers, save_stats=save_stats
+    )
+    want_head, want = _head_connections(
+        det_facade.cake_mhc_det_train_prepare,
+        det_facade.cake_mhc_det_train_finish,
+        i,
+        layers,
+        save_stats=save_stats,
+    )
+    what = f"T={T} H={hidden} save_stats={save_stats}"
+    assert len(handles) == 2
+    assert all(isinstance(h, backend._MHCTrainHandle) for h in handles), what
+    assert head.shape == (T, hidden) and _same_bits(head, want_head), f"head {what}"
+    names = ["X", *(f"{k}[{c}]" for c in range(2) for k in ("fn", "scale", "base"))]
+    for name, g, w in zip(names, grads, want, strict=True):
+        assert g is not None and bool(torch.isfinite(g).all()), f"grad {name} {what}"
+        assert bool((g != 0).any()), f"grad {name} {what}: no gradient reached the leaf"
+        if name.startswith("fn"):
+            assert _rel_l2(g, w) <= DFN_REL_L2_MAX, f"grad {name} {what}"
+        else:
+            assert _same_bits(g, w), f"grad {name} {what}"

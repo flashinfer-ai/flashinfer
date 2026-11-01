@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Host plan and loader glue of the Cake four-stream mHC training kernels with
-the non-deterministic backward (hidden 4096, 4 streams; SM100 / SM103 / SM107).
+the non-deterministic backward (hidden sizes 4096, 5120 and 7168, 4 streams;
+SM100 / SM103, and SM107 at hidden 4096).
 
 This registry is a self-contained copy of the deterministic package's registry
 (``flashinfer.cake_mhc_det_train_backend.cake_jit``): every record, route, host
@@ -51,8 +52,15 @@ four programs of this package take their place:
   SMs are free.  Every unit is the dynamic form's unit of the same tokens
   (``dX`` bit for bit, the same parameter fold).
   :func:`bwd_slab_atomic_program` picks it per token count and device where
-  :func:`lpt_chunks` (calibrated per architecture by ``BWD_SLAB_LPT``) returns
-  a geometry, and ``dynr`` elsewhere.
+  :func:`lpt_chunks` (calibrated per architecture by ``BWD_SLAB_LPT`` at hidden
+  4096) returns a geometry, and ``dynr`` elsewhere.
+
+At hidden 5120 and 7168 (sm_100a, sm_103a) the atomic fn split and the dynamic
+column slab have one more record per size under the deterministic suffix
+``__h<H>`` (``cake_mhc_train_fn_split_atomic__tv128_dep__h<H>``,
+``cake_mhc_train_bwd_slab_atomic__dynr__h<H>``), and the column slab runs
+``dynr`` at every token count: ``BWD_SLAB_LPT`` is calibrated, and the ``lpt``
+form built, at hidden 4096 only.
 
 So ``bwd_finish`` is the deterministic token-owner pass, the fn split and the
 column slab: no final reduction, and the ``bwd`` workspace has no per-chunk
@@ -65,8 +73,8 @@ differ from the deterministic ``dfn`` in the low-order bits), so it lies within
 reduction flushes subnormal addends and results to zero.  ``dX``, ``dscale``,
 ``dbase`` and every other route's outputs are the deterministic package's bits.
 The deterministic package's backward fn splits (``fn_split__tv128__t``,
-``fn_split__tv128_t128__t``) have no copy here: the atomic fn splits replace
-them.
+``fn_split__tv128_t128__t``, ``fn_split__tv128__h<H>__t``) have no copy here:
+the atomic fn splits replace them.
 
 Every module below is one mechanically exported production build: a CUDA
 device translation unit plus a tvm-ffi binding compiled together for exactly
@@ -99,11 +107,12 @@ count, architecture, hidden size)`` (:func:`k1_units` with the measured P_K band
 persistent row grid of the design table, kept for the rules table), the
 deterministic package's rules verbatim, so the work partition is a pure
 function of ``(T, device)`` and the same as the deterministic package's.  The
-column slab's two-size geometry is this package's own rule (:func:`lpt_chunks`,
-with its launch values :func:`slab_plan`), still a pure function of ``(T, SM
-count, architecture)``; where it fires, the column slab's chunks differ from
-the deterministic chunks.  Which program a call launches is a rule of the same
-kind (rounds 2-7): :func:`fwd_map_program`, :func:`fwd_coef_program` and
+column slab's two-size geometry at hidden 4096 is this package's own
+rule (:func:`lpt_chunks`, with its launch values :func:`slab_plan`),
+still a pure function of ``(T, SM count, architecture)``; where
+it fires, the column slab's chunks differ from the deterministic
+chunks.  Which program a call launches is a rule of the same kind
+(rounds 2-7): :func:`fwd_map_program`, :func:`fwd_coef_program` and
 :func:`bwd_token_program` name the mapping-pass, coefficient-pass and
 token-owner forms of record per token count and board (the mapping pass's
 schedule form by its K units per CTA: ``FWD_MAP_CLAIM``), spelled on the records
@@ -112,11 +121,12 @@ as ``select_rule`` (``rows_between`` / ``units_fit`` / ``ctas_band`` /
 split's form per architecture and route (``FN_SPLIT_PROGRAM[arch] = (fnp,
 fnTp)``; the forward operand layout ``want_t = 0`` and the transposed layout of
 the backward, whose form the atomic fn split of the architecture keeps) with
-its launch grid :func:`fn_split_grid` (``FN_SPLIT_GRID`` per program: 256
-CTAs, 512 for the 128-thread form); the column-slab pass's form is
-:func:`bwd_slab_atomic_program`: ``dynr``, or ``lpt`` where :func:`lpt_chunks`
-returns a geometry; the residual mixing's program of record is per
-architecture too (``FWD_FINISH_PROGRAM`` / :func:`fwd_finish_program`, its
+its launch grid :func:`fn_split_grid` (``FN_SPLIT_GRID`` per program:
+H / 16 CTAs, 256 at hidden 4096, and H / 8 for the 128-thread form);
+the column-slab pass's form is :func:`bwd_slab_atomic_program`:
+``dynr``, or at hidden 4096 ``lpt`` where :func:`lpt_chunks` returns a
+geometry; the residual mixing's program of record is per architecture
+too (``FWD_FINISH_PROGRAM`` / :func:`fwd_finish_program`, its
 launch grid :func:`k4_grid_of_record`), and the token-owner band
 ``BWD_TOKEN_BANDS`` (sm_107a) is read by the rule itself. The backward prepare's
 CTA form is :func:`k5_program` ``(T, SM count, architecture)``
@@ -126,14 +136,18 @@ the form's one-trip grid, or the record's persistent 2-CTAs-per-SM grid inside a
 band of ``K5_GRID_BANDS`` (sm_100a ``T <= 1024``) -- the band
 record's ``grid_per_sm``.
 
-Every record names its hidden size (``hidden``: 4096, the one size of
-:data:`HIDDEN_SIZES`).  The deterministic package also exports the hidden
-sizes 5120 and 7168 (libraries ``__h<H>`` on the routes ``<kind>_h5120`` /
-``<kind>_h7168``); they have no copy here.  Every rule takes the hidden size as
-its last argument and reads its tables through ``_tab`` as the deterministic
-registry's do (``H_TABLES`` spells no size: a size other than 4096 is an
-error, never the 4096 value), and the workspace regions sized by the
-flattened token (``fnp``, ``fnTp``) are spelled in ``n = 4 H``.
+Every record names its hidden size (``hidden``, one of :data:`HIDDEN_SIZES`).
+The hidden sizes 5120 and 7168 are the deterministic package's (libraries
+``__h<H>`` on the routes ``<kind>_h5120`` / ``<kind>_h7168``, on sm_100a and
+sm_103a; sm_107a serves 4096 only), copied under the same rule as hidden 4096:
+the deterministic ``__h<H>`` records but the backward fn split, the column slab
+and the reduction, and a ``bwd_finish`` of the deterministic token-owner
+records, the atomic fn split ``__h<H>`` and the column slab ``dynr__h<H>``.
+Every rule takes the hidden size as its last argument and reads its tables
+through ``_tab`` as the deterministic registry's do (``H_TABLES`` spells every
+table for 5120 and 7168: a size it does not spell is an error, never the 4096
+value), and the workspace regions sized by the flattened token (``fnp``,
+``fnTp``) are spelled in ``n = 4 H``.
 
 Programmatic dependent launch is a launch attribute of the generated binding,
 recorded per module as ``launch.use_pdl``: ``True`` for the kernels whose device
@@ -153,6 +167,8 @@ the predecessor still runs.  The column-slab pass (both forms) keeps the
 deterministic ``K6->K7`` bands: the token-owner pass releases the fn split at
 once and the fn split releases the column-slab pass at once, so the column-slab
 pass's early launch overlaps the token-owner pass as in the deterministic route.
+As in the deterministic package, the bands were measured at hidden 4096 and
+apply at every hidden size.
 """
 
 from __future__ import annotations
@@ -3311,6 +3327,2328 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_train_fn_split__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "fn"],
+            ["buffer", "fnp"],
+            ["buffer", "fnTp"],
+            ["parameter", "want_t"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 320,
+            "kind": "fixed",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fn_split__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fn_split__h5120",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_train_fn_split__h5120",
+        "logical": {
+            "fn": "fn",
+            "fnTp": "fnTp",
+            "fnp": "fnp",
+            "want_t": "want_t",
+        },
+        "role": "fn_split_fwd",
+        "select_rule": None,
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fn_split_atomic__tv128_dep__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "fn"],
+            ["buffer", "fnTp"],
+            ["buffer", "dfn"],
+            ["parameter", "accumulate"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 320,
+            "kind": "fixed",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fn_split_atomic__tv128_dep__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fn_split_atomic__tv128_dep__h5120",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fn_split_atomic__tv128_dep__h5120",
+        "logical": {
+            "accumulate": "accumulate",
+            "dfn": "dfn",
+            "fn": "fn",
+            "fnTp": "fnTp",
+        },
+        "role": "fn_split_bwd",
+        "select_rule": None,
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_train_fwd_map__nsx_st5_mb1__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_map__nsx_st5_mb1__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx_st5_mb1__h5120",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 144384,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_train_fwd_map__nsx_st5_mb1__h5120",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "nsx_st5_mb1",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_map__nsx_g2_ol2l__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_map__nsx_g2_ol2l__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx_g2_ol2l__h5120",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_train_fwd_map__nsx_g2_ol2l__h5120",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "nsx_g2_ol2l",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__qe_mb10_tree__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_coef__qe_mb10_tree__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__qe_mb10_tree__h5120",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__qe_mb10_tree__h5120",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "qe_mb10_tree",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__st16_w4_tree__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 4,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_coef__st16_w4_tree__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st16_w4_tree__h5120",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 6400,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__st16_w4_tree__h5120",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "st16_w4_tree",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h5120",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 12800,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h5120",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "st16_lp2_as_el_qd",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__qe_mb10__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_coef__qe_mb10__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__qe_mb10__h5120",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__qe_mb10__h5120",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "qe_mb10",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__st8_lp2__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_coef__st8_lp2__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st8_lp2__h5120",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 6400,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__st8_lp2__h5120",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "st8_lp2",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__qe_mb10_pu4__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_coef__qe_mb10_pu4__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__qe_mb10_pu4__h5120",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__qe_mb10_pu4__h5120",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "qe_mb10_pu4",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__lp2_w8_adj__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_coef__lp2_w8_adj__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__lp2_w8_adj__h5120",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__lp2_w8_adj__h5120",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "lp2_w8_adj",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h5120": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h5120",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 6400,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h5120",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "st8_lp2_as_el_qd",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_collapse__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "stats"],
+            ["buffer", "u"],
+            ["parameter", "T"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "col_split": 5,
+            "grid_limit": 0,
+            "grid_per_sm": 0,
+            "kind": "rows_per_cta",
+            "rows_per_cta": 2,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_collapse__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_collapse__h5120",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_train_fwd_collapse__h5120",
+        "logical": {
+            "T": "rows",
+            "stats": "stats",
+            "u": "u",
+            "x": "x",
+        },
+        "role": "fwd_collapse",
+        "select_rule": None,
+        "workspace_rule": None,
+    },
+    "cake_mhc_train_fwd_finish__w2__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "b"],
+            ["buffer", "stats"],
+            ["buffer", "y"],
+            ["parameter", "T"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "col_split": 5,
+            "grid_limit": 0,
+            "grid_per_sm": 0,
+            "kind": "rows_per_cta",
+            "rows_per_cta": 8,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_finish__w2__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_finish__w2__h5120",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_finish__w2__h5120",
+        "logical": {
+            "T": "rows",
+            "b": "b",
+            "stats": "stats",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd_finish",
+        "select_rule": None,
+        "workspace_rule": None,
+    },
+    "cake_mhc_train_bwd_prepare__t160__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "b"],
+            ["buffer", "x"],
+            ["buffer", "stats"],
+            ["buffer", "db"],
+            ["buffer", "gstats"],
+            ["parameter", "T"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "col_split": 1,
+            "grid_limit": 0,
+            "grid_per_sm": 0,
+            "kind": "rows_per_cta",
+            "rows_per_cta": 1,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_bwd_prepare__t160__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_prepare__t160__h5120",
+        "launch": {
+            "block": (160, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 896,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_train_bwd_prepare__t160__h5120",
+        "logical": {
+            "T": "rows",
+            "b": "b",
+            "db": "db",
+            "dy": "dy",
+            "gstats": "gstats",
+            "stats": "stats",
+            "x": "x",
+        },
+        "role": "bwd_prepare",
+        "select_rule": None,
+        "workspace_rule": None,
+    },
+    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dU"],
+            ["buffer", "stats"],
+            ["buffer", "gstats"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "dzp"],
+            ["buffer", "tokp"],
+            ["buffer", "param_partial"],
+            ["parameter", "T"],
+            ["parameter", "t_pad"],
+            ["parameter", "rows_per_cta"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k6_grid",
+            "ctas_per_sm": 2,
+            "group_rows": 8,
+            "kind": "chunks",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h5120",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 111616,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h5120",
+        "logical": {
+            "T": "rows",
+            "X": "x",
+            "base": "base",
+            "dU": "du",
+            "dzp": "dzp",
+            "gstats": "gstats",
+            "hc_eps": "hc_eps",
+            "param_partial": "param_partial",
+            "rows_per_cta": "rows_per_cta",
+            "scale": "scale",
+            "stats": "stats",
+            "t_pad": "t_pad",
+            "tokp": "tokp",
+        },
+        "role": "bwd_token",
+        "select_rule": {
+            "kind": "program",
+            "program": "ao22_rae7_pd1_ntr",
+            "rule": "bwd_token_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_train_bwd_token__dot_ao8__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dU"],
+            ["buffer", "stats"],
+            ["buffer", "gstats"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "dzp"],
+            ["buffer", "tokp"],
+            ["buffer", "param_partial"],
+            ["parameter", "T"],
+            ["parameter", "t_pad"],
+            ["parameter", "rows_per_cta"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k6_grid",
+            "ctas_per_sm": 2,
+            "group_rows": 8,
+            "kind": "chunks",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_bwd_token__dot_ao8__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__dot_ao8__h5120",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 111616,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_bwd_token__dot_ao8__h5120",
+        "logical": {
+            "T": "rows",
+            "X": "x",
+            "base": "base",
+            "dU": "du",
+            "dzp": "dzp",
+            "gstats": "gstats",
+            "hc_eps": "hc_eps",
+            "param_partial": "param_partial",
+            "rows_per_cta": "rows_per_cta",
+            "scale": "scale",
+            "stats": "stats",
+            "t_pad": "t_pad",
+            "tokp": "tokp",
+        },
+        "role": "bwd_token",
+        "select_rule": {
+            "kind": "program",
+            "program": "dot_ao8",
+            "rule": "bwd_token_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_train_bwd_slab_atomic__dynr__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dY"],
+            ["buffer", "dU"],
+            ["buffer", "dzp"],
+            ["buffer", "fnTp"],
+            ["buffer", "dX"],
+            ["buffer", "tokp"],
+            ["buffer", "dfn"],
+            ["buffer", "param_partial"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "T"],
+            ["parameter", "P"],
+            ["parameter", "rpc"],
+            ["parameter", "chunks"],
+            ["parameter", "accumulate"],
+            ["buffer", "ticket"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k7_chunks",
+            "kind": "slab_chunks",
+            "slabs": 80,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_bwd_slab_atomic__dynr__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_slab_atomic__dynr__h5120",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228480,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_train_bwd_slab_atomic__dynr__h5120",
+        "logical": {
+            "P": "parts",
+            "T": "rows",
+            "X": "x_flat",
+            "accumulate": "accumulate",
+            "chunks": "chunks",
+            "dU": "du",
+            "dX": "dx_flat",
+            "dY": "dy_flat",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dscale": "dscale",
+            "dzp": "dzp_rows",
+            "fnTp": "fnTp",
+            "param_partial": "param_partial",
+            "rpc": "rows_per_chunk",
+            "ticket": "ticket",
+            "tokp": "tokp",
+        },
+        "role": "bwd_slab",
+        "select_rule": None,
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_train_fn_split__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "fn"],
+            ["buffer", "fnp"],
+            ["buffer", "fnTp"],
+            ["parameter", "want_t"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 448,
+            "kind": "fixed",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fn_split__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fn_split__h7168",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_train_fn_split__h7168",
+        "logical": {
+            "fn": "fn",
+            "fnTp": "fnTp",
+            "fnp": "fnp",
+            "want_t": "want_t",
+        },
+        "role": "fn_split_fwd",
+        "select_rule": None,
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fn_split_atomic__tv128_dep__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "fn"],
+            ["buffer", "fnTp"],
+            ["buffer", "dfn"],
+            ["parameter", "accumulate"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 448,
+            "kind": "fixed",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fn_split_atomic__tv128_dep__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fn_split_atomic__tv128_dep__h7168",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fn_split_atomic__tv128_dep__h7168",
+        "logical": {
+            "accumulate": "accumulate",
+            "dfn": "dfn",
+            "fn": "fn",
+            "fnTp": "fnTp",
+        },
+        "role": "fn_split_bwd",
+        "select_rule": None,
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_train_fwd_map__nsx_st5_mb1__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_map__nsx_st5_mb1__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx_st5_mb1__h7168",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 144384,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_train_fwd_map__nsx_st5_mb1__h7168",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "nsx_st5_mb1",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_map__nsx_g2_ol2l__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_map__nsx_g2_ol2l__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__nsx_g2_ol2l__h7168",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_train_fwd_map__nsx_g2_ol2l__h7168",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "nsx_g2_ol2l",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__qe_mb10_tree__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_coef__qe_mb10_tree__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__qe_mb10_tree__h7168",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__qe_mb10_tree__h7168",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "qe_mb10_tree",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__st16_w4_tree__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 4,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_coef__st16_w4_tree__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st16_w4_tree__h7168",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 6400,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__st16_w4_tree__h7168",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "st16_w4_tree",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h7168",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 12800,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h7168",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "st16_lp2_as_el_qd",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__qe_mb10__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_coef__qe_mb10__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__qe_mb10__h7168",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__qe_mb10__h7168",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "qe_mb10",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__st8_lp2__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_coef__st8_lp2__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st8_lp2__h7168",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 6400,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__st8_lp2__h7168",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "st8_lp2",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__qe_mb10_pu4__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_coef__qe_mb10_pu4__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__qe_mb10_pu4__h7168",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__qe_mb10_pu4__h7168",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "qe_mb10_pu4",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__lp2_w8_adj__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_coef__lp2_w8_adj__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__lp2_w8_adj__h7168",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__lp2_w8_adj__h7168",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "lp2_w8_adj",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h7168": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h7168",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 6400,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h7168",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "program",
+            "program": "st8_lp2_as_el_qd",
+            "rule": "fwd_coef_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_collapse__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "stats"],
+            ["buffer", "u"],
+            ["parameter", "T"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "col_split": 7,
+            "grid_limit": 0,
+            "grid_per_sm": 0,
+            "kind": "rows_per_cta",
+            "rows_per_cta": 2,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_collapse__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_collapse__h7168",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_train_fwd_collapse__h7168",
+        "logical": {
+            "T": "rows",
+            "stats": "stats",
+            "u": "u",
+            "x": "x",
+        },
+        "role": "fwd_collapse",
+        "select_rule": None,
+        "workspace_rule": None,
+    },
+    "cake_mhc_train_fwd_finish__w2__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "b"],
+            ["buffer", "stats"],
+            ["buffer", "y"],
+            ["parameter", "T"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "col_split": 7,
+            "grid_limit": 0,
+            "grid_per_sm": 0,
+            "kind": "rows_per_cta",
+            "rows_per_cta": 8,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_finish__w2__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_finish__w2__h7168",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_finish__w2__h7168",
+        "logical": {
+            "T": "rows",
+            "b": "b",
+            "stats": "stats",
+            "x": "x",
+            "y": "y",
+        },
+        "role": "fwd_finish",
+        "select_rule": None,
+        "workspace_rule": None,
+    },
+    "cake_mhc_train_bwd_prepare__t224__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "dy"],
+            ["buffer", "b"],
+            ["buffer", "x"],
+            ["buffer", "stats"],
+            ["buffer", "db"],
+            ["buffer", "gstats"],
+            ["parameter", "T"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "col_split": 1,
+            "grid_limit": 0,
+            "grid_per_sm": 0,
+            "kind": "rows_per_cta",
+            "rows_per_cta": 1,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_bwd_prepare__t224__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_prepare__t224__h7168",
+        "launch": {
+            "block": (224, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 1152,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_train_bwd_prepare__t224__h7168",
+        "logical": {
+            "T": "rows",
+            "b": "b",
+            "db": "db",
+            "dy": "dy",
+            "gstats": "gstats",
+            "stats": "stats",
+            "x": "x",
+        },
+        "role": "bwd_prepare",
+        "select_rule": None,
+        "workspace_rule": None,
+    },
+    "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dU"],
+            ["buffer", "stats"],
+            ["buffer", "gstats"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "dzp"],
+            ["buffer", "tokp"],
+            ["buffer", "param_partial"],
+            ["parameter", "T"],
+            ["parameter", "t_pad"],
+            ["parameter", "rows_per_cta"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k6_grid",
+            "ctas_per_sm": 1,
+            "group_rows": 8,
+            "kind": "chunks",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h7168",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 152576,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h7168",
+        "logical": {
+            "T": "rows",
+            "X": "x",
+            "base": "base",
+            "dU": "du",
+            "dzp": "dzp",
+            "gstats": "gstats",
+            "hc_eps": "hc_eps",
+            "param_partial": "param_partial",
+            "rows_per_cta": "rows_per_cta",
+            "scale": "scale",
+            "stats": "stats",
+            "t_pad": "t_pad",
+            "tokp": "tokp",
+        },
+        "role": "bwd_token",
+        "select_rule": {
+            "kind": "program",
+            "program": "ao22_rae7_pd1_ntr",
+            "rule": "bwd_token_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_train_bwd_token__dot_ao8__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dU"],
+            ["buffer", "stats"],
+            ["buffer", "gstats"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "dzp"],
+            ["buffer", "tokp"],
+            ["buffer", "param_partial"],
+            ["parameter", "T"],
+            ["parameter", "t_pad"],
+            ["parameter", "rows_per_cta"],
+            ["parameter", "hc_eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k6_grid",
+            "ctas_per_sm": 1,
+            "group_rows": 8,
+            "kind": "chunks",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_bwd_token__dot_ao8__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__dot_ao8__h7168",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 152576,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_bwd_token__dot_ao8__h7168",
+        "logical": {
+            "T": "rows",
+            "X": "x",
+            "base": "base",
+            "dU": "du",
+            "dzp": "dzp",
+            "gstats": "gstats",
+            "hc_eps": "hc_eps",
+            "param_partial": "param_partial",
+            "rows_per_cta": "rows_per_cta",
+            "scale": "scale",
+            "stats": "stats",
+            "t_pad": "t_pad",
+            "tokp": "tokp",
+        },
+        "role": "bwd_token",
+        "select_rule": {
+            "kind": "program",
+            "program": "dot_ao8",
+            "rule": "bwd_token_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_train_bwd_slab_atomic__dynr__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dY"],
+            ["buffer", "dU"],
+            ["buffer", "dzp"],
+            ["buffer", "fnTp"],
+            ["buffer", "dX"],
+            ["buffer", "tokp"],
+            ["buffer", "dfn"],
+            ["buffer", "param_partial"],
+            ["buffer", "dscale"],
+            ["buffer", "dbase"],
+            ["parameter", "T"],
+            ["parameter", "P"],
+            ["parameter", "rpc"],
+            ["parameter", "chunks"],
+            ["parameter", "accumulate"],
+            ["buffer", "ticket"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k7_chunks",
+            "kind": "slab_chunks",
+            "slabs": 112,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_bwd_slab_atomic__dynr__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_slab_atomic__dynr__h7168",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 228480,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_mhc_train_bwd_slab_atomic__dynr__h7168",
+        "logical": {
+            "P": "parts",
+            "T": "rows",
+            "X": "x_flat",
+            "accumulate": "accumulate",
+            "chunks": "chunks",
+            "dU": "du",
+            "dX": "dx_flat",
+            "dY": "dy_flat",
+            "dbase": "dbase",
+            "dfn": "dfn",
+            "dscale": "dscale",
+            "dzp": "dzp_rows",
+            "fnTp": "fnTp",
+            "param_partial": "param_partial",
+            "rpc": "rows_per_chunk",
+            "ticket": "ticket",
+            "tokp": "tokp",
+        },
+        "role": "bwd_slab",
+        "select_rule": None,
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__rt64__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["parameter", "sinkhorn_iters"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_fwd_coef__rt64__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__rt64__h5120",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__rt64__h5120",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "sinkhorn_iters": "sinkhorn_iters",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "run_time_iters",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_bwd_token__rt64__h5120": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dU"],
+            ["buffer", "stats"],
+            ["buffer", "gstats"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "dzp"],
+            ["buffer", "tokp"],
+            ["buffer", "param_partial"],
+            ["parameter", "T"],
+            ["parameter", "t_pad"],
+            ["parameter", "rows_per_cta"],
+            ["parameter", "hc_eps"],
+            ["parameter", "sinkhorn_iters"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k6_grid",
+            "ctas_per_sm": 2,
+            "group_rows": 8,
+            "kind": "chunks",
+        },
+        "hidden": 5120,
+        "kernel": "cake_mhc_train_bwd_token__rt64__h5120",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__rt64__h5120",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 71296,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_bwd_token__rt64__h5120",
+        "logical": {
+            "T": "rows",
+            "X": "x",
+            "base": "base",
+            "dU": "du",
+            "dzp": "dzp",
+            "gstats": "gstats",
+            "hc_eps": "hc_eps",
+            "param_partial": "param_partial",
+            "rows_per_cta": "rows_per_cta",
+            "scale": "scale",
+            "sinkhorn_iters": "sinkhorn_iters",
+            "stats": "stats",
+            "t_pad": "t_pad",
+            "tokp": "tokp",
+        },
+        "role": "bwd_token",
+        "select_rule": {
+            "kind": "run_time_iters",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
+    "cake_mhc_train_fwd_coef__rt64__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["parameter", "sinkhorn_iters"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_fwd_coef__rt64__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__rt64__h7168",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__rt64__h7168",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "sinkhorn_iters": "sinkhorn_iters",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "run_time_iters",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_bwd_token__rt64__h7168": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dU"],
+            ["buffer", "stats"],
+            ["buffer", "gstats"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "dzp"],
+            ["buffer", "tokp"],
+            ["buffer", "param_partial"],
+            ["parameter", "T"],
+            ["parameter", "t_pad"],
+            ["parameter", "rows_per_cta"],
+            ["parameter", "hc_eps"],
+            ["parameter", "sinkhorn_iters"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k6_grid",
+            "ctas_per_sm": 1,
+            "group_rows": 8,
+            "kind": "chunks",
+        },
+        "hidden": 7168,
+        "kernel": "cake_mhc_train_bwd_token__rt64__h7168",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__rt64__h7168",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 71296,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_bwd_token__rt64__h7168",
+        "logical": {
+            "T": "rows",
+            "X": "x",
+            "base": "base",
+            "dU": "du",
+            "dzp": "dzp",
+            "gstats": "gstats",
+            "hc_eps": "hc_eps",
+            "param_partial": "param_partial",
+            "rows_per_cta": "rows_per_cta",
+            "scale": "scale",
+            "sinkhorn_iters": "sinkhorn_iters",
+            "stats": "stats",
+            "t_pad": "t_pad",
+            "tokp": "tokp",
+        },
+        "role": "bwd_token",
+        "select_rule": {
+            "kind": "run_time_iters",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
 }
 
 # Route key -> ordered module records, per architecture.  Every route lists
@@ -3323,7 +5661,8 @@ MODULES: dict[str, dict[str, Any]] = {
 # package's, except ``bwd_finish``: the deterministic token-owner records, the
 # atomic fn split of the architecture (launched after the token-owner pass, as
 # its programmatic dependent) and the atomic column slab's two forms (``dynr``,
-# ``lpt``: one per call by ``bwd_slab_atomic_program``; no reduction record).
+# ``lpt``: one per call by ``bwd_slab_atomic_program``; no reduction record) at
+# hidden 4096, its ``dynr`` form alone (``__h<H>``) at hidden 5120 and 7168.
 # The launch order is the route order.  A record ships for the architectures of
 # its ``arches`` (the sm_103a-only forms for sm_103a alone); the device code is
 # folded over those architectures.
@@ -3382,6 +5721,90 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_fwd_coef__lp2_w8_adj",
             "cake_mhc_train_fwd_coef__rt64",
         ],
+        "bwd_finish_h5120": [
+            "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h5120",
+            "cake_mhc_train_bwd_token__dot_ao8__h5120",
+            "cake_mhc_train_bwd_token__rt64__h5120",
+            "cake_mhc_train_fn_split_atomic__tv128_dep__h5120",
+            "cake_mhc_train_bwd_slab_atomic__dynr__h5120",
+        ],
+        "bwd_prepare_h5120": [
+            "cake_mhc_train_bwd_prepare__t160__h5120",
+        ],
+        "fwd_finish_h5120": [
+            "cake_mhc_train_fwd_finish__w2__h5120",
+        ],
+        "fwd_prepare_h5120": [
+            "cake_mhc_train_fn_split__h5120",
+            "cake_mhc_train_fwd_map__nsx_st5_mb1__h5120",
+            "cake_mhc_train_fwd_map__nsx_g2_ol2l__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10_tree__h5120",
+            "cake_mhc_train_fwd_coef__st16_w4_tree__h5120",
+            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10__h5120",
+            "cake_mhc_train_fwd_coef__st8_lp2__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10_pu4__h5120",
+            "cake_mhc_train_fwd_coef__lp2_w8_adj__h5120",
+            "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h5120",
+            "cake_mhc_train_fwd_coef__rt64__h5120",
+            "cake_mhc_train_fwd_collapse__h5120",
+        ],
+        "fwd_recompute_h5120": [
+            "cake_mhc_train_fn_split__h5120",
+            "cake_mhc_train_fwd_map__nsx_st5_mb1__h5120",
+            "cake_mhc_train_fwd_map__nsx_g2_ol2l__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10_tree__h5120",
+            "cake_mhc_train_fwd_coef__st16_w4_tree__h5120",
+            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10__h5120",
+            "cake_mhc_train_fwd_coef__st8_lp2__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10_pu4__h5120",
+            "cake_mhc_train_fwd_coef__lp2_w8_adj__h5120",
+            "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h5120",
+            "cake_mhc_train_fwd_coef__rt64__h5120",
+        ],
+        "bwd_finish_h7168": [
+            "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h7168",
+            "cake_mhc_train_bwd_token__dot_ao8__h7168",
+            "cake_mhc_train_bwd_token__rt64__h7168",
+            "cake_mhc_train_fn_split_atomic__tv128_dep__h7168",
+            "cake_mhc_train_bwd_slab_atomic__dynr__h7168",
+        ],
+        "bwd_prepare_h7168": [
+            "cake_mhc_train_bwd_prepare__t224__h7168",
+        ],
+        "fwd_finish_h7168": [
+            "cake_mhc_train_fwd_finish__w2__h7168",
+        ],
+        "fwd_prepare_h7168": [
+            "cake_mhc_train_fn_split__h7168",
+            "cake_mhc_train_fwd_map__nsx_st5_mb1__h7168",
+            "cake_mhc_train_fwd_map__nsx_g2_ol2l__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10_tree__h7168",
+            "cake_mhc_train_fwd_coef__st16_w4_tree__h7168",
+            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10__h7168",
+            "cake_mhc_train_fwd_coef__st8_lp2__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10_pu4__h7168",
+            "cake_mhc_train_fwd_coef__lp2_w8_adj__h7168",
+            "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h7168",
+            "cake_mhc_train_fwd_coef__rt64__h7168",
+            "cake_mhc_train_fwd_collapse__h7168",
+        ],
+        "fwd_recompute_h7168": [
+            "cake_mhc_train_fn_split__h7168",
+            "cake_mhc_train_fwd_map__nsx_st5_mb1__h7168",
+            "cake_mhc_train_fwd_map__nsx_g2_ol2l__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10_tree__h7168",
+            "cake_mhc_train_fwd_coef__st16_w4_tree__h7168",
+            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10__h7168",
+            "cake_mhc_train_fwd_coef__st8_lp2__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10_pu4__h7168",
+            "cake_mhc_train_fwd_coef__lp2_w8_adj__h7168",
+            "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd__h7168",
+            "cake_mhc_train_fwd_coef__rt64__h7168",
+        ],
     },
     "sm_103a": {
         "bwd_finish_h4096": [
@@ -3435,6 +5858,86 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_fwd_coef__lp2_w8_adj",
             "cake_mhc_train_fwd_coef__rt64",
         ],
+        "bwd_finish_h5120": [
+            "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h5120",
+            "cake_mhc_train_bwd_token__dot_ao8__h5120",
+            "cake_mhc_train_bwd_token__rt64__h5120",
+            "cake_mhc_train_fn_split_atomic__tv128_dep__h5120",
+            "cake_mhc_train_bwd_slab_atomic__dynr__h5120",
+        ],
+        "bwd_prepare_h5120": [
+            "cake_mhc_train_bwd_prepare__t160__h5120",
+        ],
+        "fwd_finish_h5120": [
+            "cake_mhc_train_fwd_finish__w2__h5120",
+        ],
+        "fwd_prepare_h5120": [
+            "cake_mhc_train_fn_split__h5120",
+            "cake_mhc_train_fwd_map__nsx_st5_mb1__h5120",
+            "cake_mhc_train_fwd_map__nsx_g2_ol2l__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10_tree__h5120",
+            "cake_mhc_train_fwd_coef__st16_w4_tree__h5120",
+            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10__h5120",
+            "cake_mhc_train_fwd_coef__st8_lp2__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10_pu4__h5120",
+            "cake_mhc_train_fwd_coef__lp2_w8_adj__h5120",
+            "cake_mhc_train_fwd_coef__rt64__h5120",
+            "cake_mhc_train_fwd_collapse__h5120",
+        ],
+        "fwd_recompute_h5120": [
+            "cake_mhc_train_fn_split__h5120",
+            "cake_mhc_train_fwd_map__nsx_st5_mb1__h5120",
+            "cake_mhc_train_fwd_map__nsx_g2_ol2l__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10_tree__h5120",
+            "cake_mhc_train_fwd_coef__st16_w4_tree__h5120",
+            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10__h5120",
+            "cake_mhc_train_fwd_coef__st8_lp2__h5120",
+            "cake_mhc_train_fwd_coef__qe_mb10_pu4__h5120",
+            "cake_mhc_train_fwd_coef__lp2_w8_adj__h5120",
+            "cake_mhc_train_fwd_coef__rt64__h5120",
+        ],
+        "bwd_finish_h7168": [
+            "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__h7168",
+            "cake_mhc_train_bwd_token__dot_ao8__h7168",
+            "cake_mhc_train_bwd_token__rt64__h7168",
+            "cake_mhc_train_fn_split_atomic__tv128_dep__h7168",
+            "cake_mhc_train_bwd_slab_atomic__dynr__h7168",
+        ],
+        "bwd_prepare_h7168": [
+            "cake_mhc_train_bwd_prepare__t224__h7168",
+        ],
+        "fwd_finish_h7168": [
+            "cake_mhc_train_fwd_finish__w2__h7168",
+        ],
+        "fwd_prepare_h7168": [
+            "cake_mhc_train_fn_split__h7168",
+            "cake_mhc_train_fwd_map__nsx_st5_mb1__h7168",
+            "cake_mhc_train_fwd_map__nsx_g2_ol2l__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10_tree__h7168",
+            "cake_mhc_train_fwd_coef__st16_w4_tree__h7168",
+            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10__h7168",
+            "cake_mhc_train_fwd_coef__st8_lp2__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10_pu4__h7168",
+            "cake_mhc_train_fwd_coef__lp2_w8_adj__h7168",
+            "cake_mhc_train_fwd_coef__rt64__h7168",
+            "cake_mhc_train_fwd_collapse__h7168",
+        ],
+        "fwd_recompute_h7168": [
+            "cake_mhc_train_fn_split__h7168",
+            "cake_mhc_train_fwd_map__nsx_st5_mb1__h7168",
+            "cake_mhc_train_fwd_map__nsx_g2_ol2l__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10_tree__h7168",
+            "cake_mhc_train_fwd_coef__st16_w4_tree__h7168",
+            "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10__h7168",
+            "cake_mhc_train_fwd_coef__st8_lp2__h7168",
+            "cake_mhc_train_fwd_coef__qe_mb10_pu4__h7168",
+            "cake_mhc_train_fwd_coef__lp2_w8_adj__h7168",
+            "cake_mhc_train_fwd_coef__rt64__h7168",
+        ],
     },
     "sm_107a": {
         "bwd_finish_h4096": [
@@ -3486,7 +5989,10 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
     },
 }
-HIDDEN_SIZES: tuple[int, ...] = (4096,)
+# Every hidden size the registry holds records for.  An architecture serves a
+# size when all five routes of that size exist (``supported_hidden_sizes``):
+# sm_100a and sm_103a serve all three, sm_107a serves 4096.
+HIDDEN_SIZES: tuple[int, ...] = (4096, 5120, 7168)
 
 # One verified build per architecture: B200 (``sm_100a``), B300 (``sm_103a``)
 # and R200 (``sm_107a``).  Every architecture is compiled with its exact
@@ -3576,9 +6082,10 @@ PARAM_LAYOUT: dict[str, tuple[int, int]] = {
 # left them -- zero -- instead of reading them from bytes another token count's
 # layout used for partials or records.  ``fwd`` is the deterministic package's;
 # ``bwd`` is the deterministic package's without its last region, the per-chunk
-# FP32 ``dfn`` partials (``dfn_part``, ``parts x 24 x 16384``): the column slab
+# FP32 ``dfn`` partials (``dfn_part``, ``parts x 24 x n``): the column slab
 # adds into ``dfn`` itself, and every other region keeps its deterministic
-# offset, so a deterministic backward workspace also serves this package.
+# offset, so a deterministic backward workspace of the same hidden size also
+# serves this package.
 WORKSPACE_REGIONS: dict[str, list[dict[str, Any]]] = {
     "fwd": [
         {"dtype": "uint32", "name": "ticket", "shape": [64]},
@@ -3595,11 +6102,17 @@ WORKSPACE_REGIONS: dict[str, list[dict[str, Any]]] = {
     ],
 }
 # Scalar values a record fixes itself (the launch policy of a stage record):
-# the forward fn split writes the forward operand layout (``want_t = 0``).  The
-# atomic fn splits take no ``want_t``: they write the transposed layout of the
-# backward only.
+# the forward fn split of each hidden size writes the forward operand layout
+# (``want_t = 0``).  The atomic fn splits take no ``want_t``: they write the
+# transposed layout of the backward only.
 RECORD_SCALARS: dict[str, dict[str, int]] = {
     "cake_mhc_train_fn_split": {
+        "want_t": 0,
+    },
+    "cake_mhc_train_fn_split__h5120": {
+        "want_t": 0,
+    },
+    "cake_mhc_train_fn_split__h7168": {
         "want_t": 0,
     },
 }
@@ -3977,7 +6490,9 @@ FWD_FINISH_ROWS = {"production": 4, "r2": 2}
 # slower by more than 0.2 us (finish -1.1 %, checkpointed step -0.45 % on average); keep 0.985 adds a token count
 # whose checkpointed step reads +0.6 us in every group (26216), keep 0.99 one whose finish reads +1.6 us (16444).
 # Experiments that edit this table or replace lpt_chunks clear the package's _PLANS / _FAST_ROUTES: the selection and
-# slab_plan read both at call time, the route plans bind them per token count, and host_plan carries neither.
+# slab_plan read both at call time, the route plans bind them per token count, and host_plan carries neither. The table
+# is calibrated at H 4096, the one size the lpt record is built for: at H 5120 / 7168 the rules never consult it
+# (bwd_slab_atomic_program, slab_plan) and the column slab runs dynr at every token count.
 BWD_SLAB_LPT = {"sm_100a": (0.5, 0.99), "sm_103a": (0.5, 0.98), "sm_107a": (0.5, 0.97)}
 
 # FWD_FINISH_COL_SPLIT: the residual mixing's sub-tokens per token (half tokens of 2048 columns at H 4096).
@@ -3988,17 +6503,117 @@ K3_TILING = (1, 2)
 K6_CTAS_PER_SM = 2
 
 # H_TABLES: the tables of each hidden size other than 4096, read through ``_tab(name, hidden)`` as in the
-# deterministic registry (the tables above are those of record at H 4096). This package exports hidden 4096 only
-# (HIDDEN_SIZES), so it spells no other size: the deterministic package's tables of its other sizes have no copy here,
-# and a size it does not spell is an error, never the H 4096 value. H_TABLE_NAMES is the deterministic list without
-# the column-slab and final-reduction tables.
+# deterministic registry (the tables above are those of record at H 4096). H_TABLE_NAMES is the deterministic list
+# without the column-slab and final-reduction tables, and H_TABLES[H] is the deterministic H_TABLES[H] of those names
+# for H 5120 and 7168 (the forms of record of those sizes and their rationale are the deterministic registry's); a size
+# it does not spell is an error, never the H 4096 value. The column slab of those sizes has no table: it runs dynr at
+# every token count (BWD_SLAB_LPT is the H 4096 table).
 H_TABLE_NAMES = (
     "PK_BANDS", "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS", "FWD_MAP_FIT",
     "FWD_MAP_CLAIM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS",
     "K5_GRID_BANDS", "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM", "FWD_FINISH_ROWS",
     "FWD_FINISH_COL_SPLIT", "K3_TILING", "K6_CTAS_PER_SM",
 )  # fmt: skip
-H_TABLES: dict[int, dict[str, Any]] = {}
+H_TABLES: dict[int, dict[str, Any]] = {
+    5120: {
+        "PK_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
+        "FN_SPLIT_PROGRAM": {
+            "sm_100a": ("b16", "tv128"),
+            "sm_103a": ("b16", "tv128"),
+            "sm_107a": ("b16", "tv128_t128"),
+        },
+        "FN_SPLIT_GRID": {"b16": 320, "tv128": 320, "tv128_t128": 640},
+        "FWD_MAP_PRODUCTION": "nsx_g2_ol2l",
+        "FWD_MAP_BANDS": {
+            "sm_100a": ((0, None, "nsx_g2_ol2l"),),
+            "sm_103a": ((0, None, "nsx_g2_ol2l"),),
+            "sm_107a": ((0, None, "nsx_g2_ol2l"),),
+        },
+        "FWD_MAP_FIT": {
+            "sm_100a": ("nsx_g2_ol2l", "nsx_st5_mb1"),
+            "sm_103a": ("nsx_g2_ol2l", "nsx_st5_mb1"),
+            "sm_107a": ("nsx_g2_ol2l", "nsx_st5_mb1"),
+        },
+        "FWD_MAP_CLAIM": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
+        "FWD_COEF_REGIMES": {
+            "sm_100a": "round7",
+            "sm_103a": "round5",
+            "sm_107a": "round9",
+        },
+        "BWD_TOKEN_PROGRAM": {
+            "sm_100a": "dot_ao8",
+            "sm_103a": "dot_ao8",
+            "sm_107a": "dot_ao8_l2l",
+        },
+        "BWD_TOKEN_REGIMES": {
+            "sm_100a": (("ao22_rae7_pd1_ntr", 0, 32),),
+            "sm_103a": (("ao22_rae7_pd1_ntr", 0, 32),),
+            "sm_107a": (("ao22_rae7_pd1_ntr", 0, 32),),
+        },
+        "BWD_TOKEN_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
+        "K5_GRID_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
+        "K5_FORM_BANDS": {
+            "sm_100a": ((0, None, "t160"),),
+            "sm_103a": ((0, None, "t160"),),
+            "sm_107a": ((0, 8192, "t160"),),
+        },
+        "K5_FORM_ROWS": {"production": 2, "t160": 1},
+        "FWD_FINISH_PROGRAM": {"sm_100a": "w2", "sm_103a": "w2", "sm_107a": "w1"},
+        "FWD_FINISH_ROWS": {"w2": 8, "w1": 4},
+        "FWD_FINISH_COL_SPLIT": 5,
+        "K3_TILING": (2, 5),
+        "K6_CTAS_PER_SM": 2,
+    },
+    7168: {
+        "PK_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
+        "FN_SPLIT_PROGRAM": {
+            "sm_100a": ("b16", "tv128"),
+            "sm_103a": ("b16", "tv128"),
+            "sm_107a": ("b16", "tv128_t128"),
+        },
+        "FN_SPLIT_GRID": {"b16": 448, "tv128": 448, "tv128_t128": 896},
+        "FWD_MAP_PRODUCTION": "nsx_g2_ol2l",
+        "FWD_MAP_BANDS": {
+            "sm_100a": ((0, None, "nsx_g2_ol2l"),),
+            "sm_103a": ((0, None, "nsx_g2_ol2l"),),
+            "sm_107a": ((0, None, "nsx_g2_ol2l"),),
+        },
+        "FWD_MAP_FIT": {
+            "sm_100a": ("nsx_g2_ol2l", "nsx_st5_mb1"),
+            "sm_103a": ("nsx_g2_ol2l", "nsx_st5_mb1"),
+            "sm_107a": ("nsx_g2_ol2l", "nsx_st5_mb1"),
+        },
+        "FWD_MAP_CLAIM": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
+        "FWD_COEF_REGIMES": {
+            "sm_100a": "round7",
+            "sm_103a": "round5",
+            "sm_107a": "round9",
+        },
+        "BWD_TOKEN_PROGRAM": {
+            "sm_100a": "dot_ao8",
+            "sm_103a": "dot_ao8",
+            "sm_107a": "dot_ao8_l2l",
+        },
+        "BWD_TOKEN_REGIMES": {
+            "sm_100a": (("ao22_rae7_pd1_ntr", 0, 32),),
+            "sm_103a": (("ao22_rae7_pd1_ntr", 0, 32),),
+            "sm_107a": (("ao22_rae7_pd1_ntr", 0, 32),),
+        },
+        "BWD_TOKEN_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
+        "K5_GRID_BANDS": {"sm_100a": (), "sm_103a": (), "sm_107a": ()},
+        "K5_FORM_BANDS": {
+            "sm_100a": ((0, None, "t224"),),
+            "sm_103a": ((0, None, "t224"),),
+            "sm_107a": ((0, 8192, "t224"),),
+        },
+        "K5_FORM_ROWS": {"production": 2, "t224": 1},
+        "FWD_FINISH_PROGRAM": {"sm_100a": "w2", "sm_103a": "w2", "sm_107a": "w1"},
+        "FWD_FINISH_ROWS": {"w2": 8, "w1": 4},
+        "FWD_FINISH_COL_SPLIT": 7,
+        "K3_TILING": (2, 7),
+        "K6_CTAS_PER_SM": 1,
+    },
+}
 
 
 def _tab(name: str, hidden: int) -> Any:
@@ -4215,7 +6830,7 @@ def k7_chunks(
 
 def _lpt_units(
     T, geometry
-):  # -> the units in draw order (every slab's big chunks, then the small ones) as [count, tiles] runs
+):  # -> the units in draw order (every slab's big chunks, then the small ones) as [count, tiles] runs; H 4096 only
     P, rpc, p_big, rpc_small = geometry
     tiles, rb, rs, slabs = -(-T // 64), rpc // 64, rpc_small // 64, HIDDEN // SLAB_D
     big = [max(0, min(rb, tiles - p * rb)) for p in range(p_big)]
@@ -4287,7 +6902,7 @@ def _lpt_geometry(
 @functools.lru_cache(maxsize=4096)
 def _lpt_plan(
     T, sm_count, o_tiles
-):  # -> (one-size makespan, best makespan, best geometry), or None
+):  # -> (one-size makespan, best makespan, best geometry) at H 4096 (the slabs and chunks of that size), or None
     if T <= 0:
         return None
     P0, _, _, rpc0 = k7_chunks(T, sm_count)
@@ -4311,7 +6926,7 @@ def _lpt_plan(
 
 def lpt_chunks(
     T, sm_count, arch
-):  # -> the column slab's two-size geometry (P, rpc, p_big, rpc_small), or None
+):  # -> the column slab's two-size geometry (P, rpc, p_big, rpc_small) at H 4096, or None
     calibration = BWD_SLAB_LPT[arch]
     if calibration is None:
         return None
@@ -4325,9 +6940,12 @@ def lpt_chunks(
 
 def bwd_slab_atomic_program(
     T, sm_count, arch, hidden=HIDDEN
-):  # -> "lpt" where lpt_chunks gives a geometry, else "dynr"
+):  # -> "lpt" where lpt_chunks gives a geometry (H 4096), else "dynr"
+    # lpt is calibrated and built at H 4096 only: the other sizes run "dynr" at every T
     if hidden != HIDDEN:
-        raise ValueError(f"the atomic column slab supports hidden={HIDDEN} only")
+        if hidden not in HIDDEN_SIZES:
+            raise ValueError(f"hidden must be one of {HIDDEN_SIZES}, got {hidden}")
+        return "dynr"
     return "dynr" if lpt_chunks(T, sm_count, arch) is None else "lpt"
 
 
@@ -4425,19 +7043,26 @@ def host_plan(
     }
 
 
-def slab_plan(rows: int, sm_count: int, arch: str) -> dict[str, int]:
+def slab_plan(
+    rows: int, sm_count: int, arch: str, hidden: int = HIDDEN
+) -> dict[str, int]:
     """The chunks of the column slab's ``lpt`` record for ``rows`` tokens: :func:`lpt_chunks`'s two-size geometry,
-    else the one-size chunks of :func:`k7_chunks` (``lpt_big_parts == lpt_parts``).  Read at call time (not cached:
-    :func:`_lpt_plan` caches the screen) and kept out of :func:`host_plan`, which the workspace envelope reads at
-    every 64-token tile.  A geometry that is not a two-size partition of the rows is a ``ValueError``."""
+    else the one-size chunks of :func:`k7_chunks` (``lpt_big_parts == lpt_parts``).  ``lpt_chunks`` is calibrated
+    and the ``lpt`` record built at H 4096 only: at the other sizes of :data:`HIDDEN_SIZES` the chunks are the
+    one-size chunks of the size, and a size it does not list is a ``ValueError`` (as in :func:`host_plan`).  Read at
+    call time (not cached: :func:`_lpt_plan` caches the screen) and kept out of :func:`host_plan`, which the
+    workspace envelope reads at every 64-token tile.  A geometry that is not a two-size partition of the rows is a
+    ``ValueError``."""
 
-    rows, sm_count = int(rows), int(sm_count)
+    rows, sm_count, hidden = int(rows), int(sm_count), int(hidden)
     if rows <= 0:
         raise ValueError("rows must be positive")
     if sm_count <= 0:
         raise ValueError("sm_count must be positive")
-    parts, _, _, rows_per_chunk = k7_chunks(rows, sm_count)
-    geometry = lpt_chunks(rows, sm_count, arch) or (
+    if hidden not in HIDDEN_SIZES:
+        raise ValueError(f"hidden must be one of {HIDDEN_SIZES}, got {hidden}")
+    parts, _, _, rows_per_chunk = k7_chunks(rows, sm_count, hidden=hidden)
+    geometry = (lpt_chunks(rows, sm_count, arch) if hidden == HIDDEN else None) or (
         parts,
         rows_per_chunk,
         parts,
@@ -4814,8 +7439,9 @@ def selected_modules(
     :func:`fn_split_program`, :func:`fwd_map_program`, :func:`fwd_coef_program`,
     :func:`bwd_token_program` and :func:`bwd_slab_atomic_program` (the
     deterministic package's selection on every route but the column slab's,
-    this package's column-slab rule; the fn split of ``bwd_finish`` is one
-    record per architecture).
+    this package's column-slab rule at hidden 4096: the ``dynr__h<H>`` record
+    of hidden 5120 / 7168 has no ``select_rule`` and runs on every call; the fn
+    split of ``bwd_finish`` is one record per architecture and hidden size).
     """
 
     rows, sinkhorn_iters = int(rows), int(sinkhorn_iters)
@@ -5040,7 +7666,7 @@ def launch_grid(
     elif kind == "slab_chunks":
         sms, arch = sm_count(device_index), device_arch(device_index)
         if rule["chunks_rule"] == "lpt_chunks":
-            parts = slab_plan(rows, sms, arch)["lpt_parts"]
+            parts = slab_plan(rows, sms, arch, record["hidden"])["lpt_parts"]
         else:
             parts = host_plan(rows, sms, arch, record["hidden"])["parts"]
         grid_x = min(sms, int(rule["slabs"]) * parts)
