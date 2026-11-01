@@ -1355,9 +1355,15 @@ def trtllm_fp8_block_scale_moe_trace_dispatch(**kwargs):
     Returns ``None`` for ``RoutingMethodType.Unspecified`` (6), which
     suppresses trace generation.
 
-    DeepSeekV3 calls with shared experts use a separate template.
+    DeepSeekV3 calls with shared experts use a separate template; other
+    routing methods with shared experts have no template yet and return ``None``.
     """
     routing_method_type = int(kwargs.get("routing_method_type", 0))
+    if (
+        routing_method_type != 2
+        and int(kwargs.get("num_fused_shared_experts") or 0) > 0
+    ):
+        return None
     if int(kwargs.get("activation_type", 3)) == 7:
         if int(kwargs.get("fp8_quantization_type", 1)) != 2:
             raise ValueError("SwiGLUStep requires fused MXFP8 block scaling")
@@ -2590,14 +2596,14 @@ def trtllm_fp4_block_scale_moe_trace_dispatch(**kwargs):
         def trtllm_fp4_block_scale_moe(..., routing_method_type: int = 0, ...):
             ...
 
-    Returns ``None`` for ``RoutingMethodType.Unspecified`` (6).
+    Returns ``None`` for ``RoutingMethodType.Unspecified`` (6), and for
+    non-DeepSeekV3 calls with fused shared experts, which have no template yet.
     """
     routing_method_type = int(kwargs.get("routing_method_type", 0))
-    if (
-        routing_method_type == 2
-        and int(kwargs.get("num_fused_shared_experts") or 0) > 0
-    ):
-        return trtllm_fp4_block_scale_moe_ds_shared_experts_trace
+    if int(kwargs.get("num_fused_shared_experts") or 0) > 0:
+        if routing_method_type == 2:
+            return trtllm_fp4_block_scale_moe_ds_shared_experts_trace
+        return None
     return _FP4_MOE_TRACE_BY_ROUTING_TYPE.get(routing_method_type)
 
 
