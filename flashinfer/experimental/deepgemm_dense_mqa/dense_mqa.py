@@ -25,7 +25,10 @@ heads, 2 for 64 heads). The one-shot ``fp8_mqa_logits`` mirrors DeepGEMM's
 logits program (the ``q1`` and ``<tier>`` routes), or ONE logits launch that
 computes the schedule in-kernel (the ``:short`` routes: the fused single-query
 chain ``q1:short``, the warp-scan classes ``q128:short`` / ``le32:short`` and
-the CTA-scan classes ``le768:short`` (FP8) / ``le1024:short`` (FP4)). A class
+the CTA-scan classes ``le768:short`` (FP8) / ``le1024:short`` (FP4)). On sm_100a
+the stage buckets of ``fp8:q128:short`` (``K <= 4096``) and
+``fp8:full:le32:short`` (``K <= 32768``) launch the warp-scan text with a
+four-stage TMEM accumulator ring (identical logits and schedule words). A class
 is named by its query-BLOCK ceiling and served while the KV length is within
 the catalog policy's bound for that class (``fused_*_max_kv``); above the
 bound the two-launch route of the same query count serves the call. The FP4
