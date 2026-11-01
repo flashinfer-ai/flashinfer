@@ -42,14 +42,14 @@ below 8 requests and at P256 TP4 the score plane is faster.
 With programmatic dependent launch (`enable_pdl`), every kernel waits on its
 predecessor before it reads data an earlier kernel of the step wrote, with one
 exception: on compute capability 10.0 and 10.3 at 64 or 128 local K rows per
-page (P128 TP2, P256 TP2 and TP4) and on 10.7 at 32 or 64 (P128 TP4 and TP2,
-P256 TP4), the score plane reads `seq_lens` and
-`block_table` and starts loading the history index-K pages (those ending at or
-before `seq_len - decode_query_len`) before its wait.  The kernel launched just
-before the score plane must not write them, and must either be launched
-without programmatic dependent launch or wait on its own predecessor before it
-triggers its dependents.  `enable_pdl=False` removes the requirement; the fused
-chain has no such read.
+page (P128 TP2, P256 TP2 and TP4) the score plane, and on 10.7 at 32 or 64
+(P128 TP4 and TP2, P256 TP4) both the score plane and the fused chain's list
+scorer, read `seq_lens` and `block_table` and start loading the history
+index-K pages (those ending at or before `seq_len - decode_query_len`) before
+their wait.  The kernel launched just before the scorer must not write them,
+and must either be launched without programmatic dependent launch or wait on
+its own predecessor before it triggers its dependents.  `enable_pdl=False`
+removes the requirement.
 
 The caller owns every buffer and every collective step: it allocates the
 receive storage (`msa_icp_comm_layout`) in symmetric memory, exchanges the

@@ -444,7 +444,12 @@ def msa_icp_decode_score_publish(
     :func:`msa_icp_topk_select_publish`, without the score rows.
 
     ``pool`` is uint8 scratch of :func:`msa_icp_decode_pool_bytes` bytes.  The
-    other parameters are as in those two functions.
+    other parameters are as in those two functions.  With ``enable_pdl`` on
+    compute capability 10.7 with 32 or 64 local K rows per page (P128 TP4 and
+    TP2, P256 TP4), this scorer reads ``seq_lens`` and ``block_table`` and
+    starts loading the history ``index_k`` pages before it waits on the
+    preceding kernel, with the same requirement on that kernel as
+    :func:`msa_icp_decode_index_score_sharded`.
 
     This path is an option; the default decode chain (and the facade's
     ``decode`` without ``pool``) is the score plane and the select publish,
