@@ -42,8 +42,6 @@ _SMOKE_CASES = [
     (8, 768, 7168, torch.bfloat16, True, True, "cute-dsl", True),
     (17, 2304, 1536, torch.bfloat16, False, False, "cute-dsl", False),
     (8, 768, 8320, torch.bfloat16, False, False, "cute-dsl", False),
-    (33, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
-    (64, 256, 512, torch.bfloat16, True, True, "cute-dsl", False),
     (64, 4096, 2048, torch.bfloat16, False, False, "auto", True),
     (1, 2048, 3072, torch.float16, False, False, "auto", False),
     # pdl=None: untuned runs without PDL; autotuning also profiles PDL variants.
@@ -471,6 +469,42 @@ def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
     reference = F.linear(a, b, bias)
     cos_sim = F.cosine_similarity(reference.reshape(-1), out.reshape(-1), dim=0)
     assert cos_sim > 0.99
+
+
+@pytest.mark.parametrize("pdl", [False, None])
+def test_mm_bf16_cute_dsl_low_m_only(monkeypatch, pdl):
+    """backend="cute-dsl" serves M <= 32 only. Under "auto", a larger M still
+    lists its low-M runners (one large-M warm-up tunes the M <= 32 buckets)
+    and cuBLASLt only once, as its own backend."""
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.gemm import gemm_base
+
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+
+    a = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(2048, 1024, device="cuda", dtype=torch.bfloat16).T
+    with pytest.raises(ValueError, match="M <= 32"):
+        mm_bf16(a, b, pdl=pdl, backend="cute-dsl")
+
+    choose_one = AutoTuner.choose_one
+    runner_lists = []
+
+    def record(self, custom_op, runners, *args, **kwargs):
+        if custom_op.startswith("bf16_gemm"):
+            runner_lists.append(runners)
+        return choose_one(self, custom_op, runners, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "choose_one", record)
+    out = mm_bf16(a, b, pdl=pdl, backend="auto")
+    (runners,) = runner_lists
+    names = [type(runner).__name__ for runner in runners]
+    assert sum("Cublaslt" in name for name in names) == 1, names
+    assert any(isinstance(r, gemm_base._CuteDSLBf16Runner) for r in runners), names
+    torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
 
 
 if __name__ == "__main__":
