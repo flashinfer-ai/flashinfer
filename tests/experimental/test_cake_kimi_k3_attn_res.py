@@ -787,6 +787,93 @@ def test_a_packed_register_carry_key_never_falls_back_across_the_carry():
                     assert ("_packed_register_carry" in resolved.schedule_id) == packed
 
 
+# Round 28: the cells that run the cluster-launch-control token-queue programs (``_clc``) at 148 SMs
+# (B200 / B300), their keys and schedule labels.  The sm_100a (8192, 6) cell keeps its program.
+_CLC_CELLS_148 = frozenset((M, K) for M in (4096, 6144, 8192) for K in (6, 7, 8))
+_CLC_CELLS = {"sm_100a": _CLC_CELLS_148 - {(8192, 6)}, "sm_103a": _CLC_CELLS_148}
+_CLC_KEYS = {
+    6: "persistent:k6_nc4_d2_f110000000000000_clc",
+    7: "persistent:k7_nc4_d2_f110000000000000_clc",
+    8: "persistent:k8_nc5_d2_f110000000000000_clc",
+}
+_CLC_SCHEDULES = {
+    6: "trtllm_persistent_ws288_nc4_d2_vec128_fp32x2_early_consume_clc_token_queue",
+    7: "trtllm_persistent_ws288_nc4_d2_vec128_fp32x2_early_consume_clc_token_queue",
+    8: "trtllm_persistent_ws288_nc5_d2_vec128_fp32x2_early_consume_clc_token_queue",
+}
+
+
+def test_clc_cells_take_the_token_queue_programs():
+    """Round 28: a ``_clc`` key names the program of the same key without the suffix built with
+    cluster launch control token scheduling.  It launches one CTA per token (grid ``M``, grid policy
+    ``clc_token_queue``); each resident CTA computes its own token, then the token of every pending
+    CTA it cancels.  Its schedule label adds ``_clc_token_queue``.  At 148 SMs the (4096, K),
+    (6144, K) and (8192, K) cells for K 6, 7 and 8 run it at both PDL modes, less the sm_100a
+    (8192, 6) cell; no other cell, SM count or snapshot-write plan runs it."""
+    clc = {
+        (arch, sm_count, M, K)
+        for arch, sm_count, M, K, value in _r2_cells("R2_PERSISTENT_KEY_CELLS")
+        if any(
+            str(key).endswith("_clc")
+            for key in (value if isinstance(value, (list, tuple)) else (value,))
+        )
+    }
+    assert clc == {
+        (arch, 148, M, K) for arch, cells in _CLC_CELLS.items() for M, K in cells
+    }
+    for arch, cells in _CLC_CELLS.items():
+        for M, K in sorted(cells):
+            for pdl in (False, True):
+                plan = plan_route(arch, 148, M, K, pdl)
+                assert plan.kind == "persistent" and plan.fallback_from is None, plan
+                assert plan.kernel_key == _CLC_KEYS[K], (arch, M, K, pdl, plan)
+                assert plan.grid_x == M and plan.threads == cb.PERSISTENT_THREADS, plan
+                assert plan.schedule_id == _CLC_SCHEDULES[K], plan
+                assert plan.route_id.endswith(f".pdl{int(pdl)}.clc_token_queue"), plan
+                if MODULES:
+                    assert MODULES[KERNELS[arch][plan.kernel_key]]["schedule_id"] == (
+                        plan.schedule_id
+                    ), plan
+                    # the program without the suffix ships too (the cells beside these run it)
+                    assert plan.kernel_key.removesuffix("_clc") in KERNELS[arch], plan
+                others = [
+                    plan_route(arch, 148, M + 1, K, pdl),
+                    plan_route(arch, 152, M, K, pdl),
+                ]
+                if K < MAX_BLOCKS:
+                    # the snapshot write of block K (K = MAX_BLOCKS has no block to write)
+                    others.append(plan_route(arch, 148, M, K, pdl, block_write_idx=K))
+                for other in others:
+                    assert not other.kernel_key.endswith("_clc"), (arch, M, K, other)
+                    assert "_clc_token_queue" not in other.schedule_id, other
+                    if other.kind == "persistent":
+                        assert other.grid_x < M, other
+
+
+def test_a_registered_fallback_never_resolves_to_a_clc_program(monkeypatch):
+    """A ``_clc`` program covers every token only on its cell's grid of ``M`` CTAs, so the
+    registered-variant fallback never resolves to one: an unregistered ``_clc`` cell resolves to
+    the program without the suffix on that program's own grid, and an unregistered key without the
+    suffix never resolves to a ``_clc`` program, however close its fields."""
+    clc, static = _CLC_KEYS[6], _CLC_KEYS[6].removesuffix("_clc")
+    exact = cb._plan_route_exact("sm_103a", SM_COUNT, 4096, 6, False)
+    assert (exact.kernel_key, exact.grid_x) == (clc, 4096), exact
+    monkeypatch.setattr(cb, "KERNELS", {"sm_103a": {static: "m1"}})
+    resolved = cb._resolve_registered(exact, SM_COUNT, 4096)
+    assert (resolved.kernel_key, resolved.fallback_from) == (static, clc), resolved
+    assert resolved.grid_x == SM_COUNT, resolved
+    assert "_clc_token_queue" not in resolved.schedule_id, resolved
+    assert resolved.route_id.endswith(".token_or_full_sm.registered_fallback"), resolved
+    plan = cb._persistent_plan_for_key("sm_103a", SM_COUNT, 4096, 6, False, static)
+    other = "persistent:k6_nc3_d2_f010000000000000"
+    monkeypatch.setattr(cb, "KERNELS", {"sm_103a": {clc: "m1", other: "m2"}})
+    resolved = cb._resolve_registered(plan, SM_COUNT, 4096)
+    assert (resolved.kernel_key, resolved.fallback_from) == (other, static), resolved
+    monkeypatch.setattr(cb, "KERNELS", {"sm_103a": {clc: "m1"}})
+    unresolved = cb._resolve_registered(plan, SM_COUNT, 4096)
+    assert unresolved == plan, unresolved
+
+
 def test_consumer_regs_pair_cells_take_the_384_thread_programs():
     """Round 20: a ``_cr232`` pair key is the pair kernel built at ``consumer_regs`` 232 (three
     whole warpgroups, 384 threads); its schedule label adds ``_consumer_regs232`` ahead of the grid.
@@ -1331,7 +1418,7 @@ def test_registry_records_reference_the_build_manifest():
         )
         fast_math = bool(
             re.search(
-                r"_fm(_crfnone)?(_crheld)?(_rcp)?(_write)?(_cta2)?$",
+                r"_fm(_crfnone)?(_crheld)?(_rcp)?(_write)?(_cta2)?(_clc)?$",
                 record["kernel_key"],
             )
         )
@@ -1372,7 +1459,7 @@ def test_shared_sources_keep_distinct_program_symbols():
     architecture may export one kernel symbol.  Each ``build.json`` entry selects its
     own through ``-DCAKE_PROGRAM_KERNEL``, equal to the symbol its device source
     defines (the literal name, or the macro at the definition with the entry's value),
-    and the 184 records' symbols are distinct per architecture."""
+    and the 190 records' symbols are distinct per architecture."""
     libraries = cake_build.libraries_by_name()
     symbols_by_arch = {}
     for library, entry in libraries.items():
@@ -1502,9 +1589,9 @@ def test_every_common_path_route_resolves_to_a_registered_program(arch, sm_count
 # First token count of every dense route band: the M at which ``plan_route`` changes its kernel
 # key on some architecture, SM count in SM_COUNTS or PDL setting, per K.  The bands follow the
 # route tables (the small-M table and its cluster / chunk / fast-math bands, the round-r5 cells,
-# the round-2 / round-3 / round-6 / round-20 / round-23 / round-24 / round-25 / round-26 cells (among
-# them the single-cell fast-math cells of K 0), the release bands, the nc / depth edges, the native
-# and pair cells)
+# the round-2 / round-3 / round-6 / round-20 / round-23 / round-24 / round-25 / round-26 / round-28
+# cells (among them the single-cell fast-math cells of K 0 and the round-28 ``_clc`` cells of K 6, 7
+# and 8), the release bands, the nc / depth edges, the native and pair cells)
 # and, for K8 on sm_100a, the SM count itself (the release flips at M = SMs + 1).
 # ``test_gpu_rows_are_the_route_band_starts`` recomputes the set from the tables.
 # fmt: off
@@ -1537,15 +1624,15 @@ _ROUTE_BAND_START_ROWS = {
     ),
     6: (
         1, 2, 5, 17, 33, 129, 192, 193, 256, 257, 384, 385, 512, 513, 768, 769, 1024, 1025, 1536,
-        1537, 2048, 2049, 3072, 3073, 4096, 4097,
+        1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192, 8193,
     ),
     7: (
         1, 5, 17, 33, 65, 129, 192, 193, 256, 257, 385, 512, 513, 768, 769, 1024, 1025, 1536, 1537,
-        2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 12288, 12289,
+        2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192, 8193, 12288, 12289,
     ),
     8: (
         1, 3, 6, 7, 17, 65, 149, 153, 192, 193, 256, 257, 384, 385, 512, 513, 768, 769, 1024, 1025,
-        1536, 1537, 2048, 2049, 3072, 3073,
+        1536, 1537, 2048, 2049, 3072, 3073, 4096, 4097, 6144, 6145, 8192, 8193,
     ),
 }
 # fmt: on
@@ -1740,6 +1827,55 @@ def test_matches_reference(M, K, pdl):
     _check(inputs, expected)
     for k, v in read_only.items():
         assert torch.equal(inputs[k], v)
+
+
+@pytest.mark.parametrize("pdl", [False, True])
+def test_clc_program_matches_the_reference_and_its_static_program(pdl, monkeypatch):
+    """Round 28 on a 148-SM part (B200 / B300): the (4096, 6) cell launches its ``_clc`` program on
+    4096 CTAs.  Every token's output matches the FP32 reference (``out`` starts as NaN, so a token
+    no CTA computed fails), and the output and the updated prefix equal, bit for bit, those of the
+    program without the suffix launched on its own 148-CTA grid from the same state."""
+    device, arch = _device_arch()
+    M, K = 4096, 6
+    if cb.sm_count_for(device) != SM_COUNT:
+        pytest.skip("the _clc cells are routed at 148 SMs (B200 / B300)")
+    if not cb.generated_program_available(device, M, K, enable_pdl=pdl):
+        pytest.skip("program not registered for this cell")
+    inputs = _make_inputs(M, K)
+    pristine = _clone(inputs)
+    expected = _clone(inputs)
+    reference_kimi_k3_attn_res(
+        **{k: v for k, v in expected.items() if k != "num_blocks"}, num_blocks=K
+    )
+    runner = prepare_kimi_k3_attn_res(
+        **{k: v for k, v in inputs.items() if k != "num_blocks"},
+        num_blocks=K,
+        enable_pdl=pdl,
+    )
+    assert runner.plan.kernel_key == _CLC_KEYS[K] and runner.plan.grid_x == M, (
+        runner.plan
+    )
+    assert runner.plan.fallback_from is None
+    assert runner.launch() is inputs["out"]
+    torch.cuda.synchronize()
+    _check(inputs, expected)
+    static_key = _CLC_KEYS[K].removesuffix("_clc")
+    static_plan = cb._persistent_plan_for_key(arch, SM_COUNT, M, K, pdl, static_key)
+    assert static_plan.grid_x == SM_COUNT, static_plan
+    monkeypatch.setattr(cb, "plan_route", lambda *args, **kwargs: static_plan)
+    static = _clone(pristine)
+    static_runner = prepare_kimi_k3_attn_res(
+        **{k: v for k, v in static.items() if k != "num_blocks"},
+        num_blocks=K,
+        enable_pdl=pdl,
+    )
+    assert static_runner.module_name == KERNELS[arch][static_key]
+    static_runner.launch()
+    torch.cuda.synchronize()
+    for name in ("out", "prefix", "blocks"):
+        assert torch.equal(
+            static[name].view(torch.int16), inputs[name].view(torch.int16)
+        ), name
 
 
 @pytest.mark.parametrize(
