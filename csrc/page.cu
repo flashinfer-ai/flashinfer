@@ -58,6 +58,13 @@ void append_paged_kv_cache(TensorView append_key, TensorView append_value, Tenso
   CHECK_DEVICE(kv_indptr, append_key);
   CHECK_DEVICE(kv_last_page_len, append_key);
 
+  TVM_FFI_ICHECK(append_value.dtype() == append_key.dtype())
+      << "append_key and append_value must have the same dtype";
+  TVM_FFI_ICHECK(paged_k_cache.dtype() == append_key.dtype())
+      << "paged_k_cache dtype must match append_key dtype";
+  TVM_FFI_ICHECK(paged_v_cache.dtype() == append_value.dtype())
+      << "paged_v_cache dtype must match append_value dtype";
+
   QKVLayout kv_layout = QKVLayout(layout);
 
   unsigned int num_heads, page_size, head_dim;
@@ -442,6 +449,13 @@ void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
   CHECK_DEVICE(kv_indices, append_ckv);
   CHECK_DEVICE(kv_indptr, append_ckv);
   CHECK_DEVICE(kv_last_page_len, append_ckv);
+
+  TVM_FFI_ICHECK(append_kpe.dtype() == append_ckv.dtype())
+      << "append_ckv and append_kpe must have the same dtype";
+  TVM_FFI_ICHECK(ckv_cache.dtype() == append_ckv.dtype())
+      << "ckv_cache dtype must match append_ckv dtype";
+  TVM_FFI_ICHECK(kpe_cache.dtype() == append_kpe.dtype())
+      << "kpe_cache dtype must match append_kpe dtype";
 
   unsigned int page_size, ckv_dim, kpe_dim;
   page_size = ckv_cache.size(1);
