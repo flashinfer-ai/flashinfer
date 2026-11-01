@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_STAGE_BUF_OFF 1024
 #define SMEM_STAGE_BUF_STAGE_BYTES 45056
 #define SMEM_STAGE_BUF_STRIDE 45056
@@ -273,10 +272,10 @@ kernel_cake_causal_conv1d_det_train_9c1e7ee9f37e3102660e(__nv_bfloat16* __restri
     for (int k0 = 0; k0 < 2; k0++) {
         int qn = cells[4 + k0];
         if (qn < nch) {
-            int stage_t0 = qn * n_sub * 8 + (int)((unsigned int)k0 % 1) * 8;
+            int stage_t0 = qn * n_sub * 8 + 0 * 8;
             if (tid == 0) {
                 int rem = S - stage_t0;
-                int _max_3 = ((rem + 0) > (0) ? (rem + 0) : (0));
+                int _max_3 = ((rem) > (0) ? (rem) : (0));
                 int n_full = (((int)((unsigned int)_max_3 / 8)) < (n_sub) ? ((int)((unsigned int)_max_3 / 8)) : (n_sub));
                 int tail_rows = 0;
                 if (n_full < n_sub) {
@@ -320,14 +319,14 @@ kernel_cake_causal_conv1d_det_train_9c1e7ee9f37e3102660e(__nv_bfloat16* __restri
     unsigned int pk[4];
     float out[8];
     #pragma unroll 1
-    for (int k = 0; k < 1 * nch; k++) {
+    for (int k = 0; k < nch; k++) {
         int q = cells[(int)((unsigned int)k % 4)];
         if (q >= nch) {
             break;
         }
         int kn = k + 2;
         int grab = 0;
-        if (tid == 0 && (unsigned int)kn % 1 == 0) {
+        if (tid == 0 && 0 == 0) {
             grab = 1;
         }
         int pend = 0;
@@ -335,7 +334,7 @@ kernel_cake_causal_conv1d_det_train_9c1e7ee9f37e3102660e(__nv_bfloat16* __restri
             int _atomic_fetch_add_7 = atomicAdd(&work[ct], 1);
             pend = _atomic_fetch_add_7;
         }
-        int kst = (int)((unsigned int)k % 1);
+        int kst = 0;
         int ts = q * chunk + sub * 8 + kst * 8;
         int rows_k = 0;
         if (lane_on != 0) {
@@ -438,7 +437,7 @@ kernel_cake_causal_conv1d_det_train_9c1e7ee9f37e3102660e(__nv_bfloat16* __restri
                     }
                     #pragma unroll
                     for (int h = 0; h < 4; h++) {
-                        float2 p2 = fma_f32x2_rn_noftz(make_float2(wr[8 * h + 3], wr[8 * h + 4 + 3]), make_float2(win[u % 4 * 8 + 2 * h], win[u % 4 * 8 + 2 * h + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * h + 2], wr[8 * h + 4 + 2]), make_float2(win[(u % 4 + 3) % 4 * 8 + 2 * h], win[(u % 4 + 3) % 4 * 8 + 2 * h + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * h + 1], wr[8 * h + 4 + 1]), make_float2(win[(u % 4 + 2) % 4 * 8 + 2 * h], win[(u % 4 + 2) % 4 * 8 + 2 * h + 1]), mul_f32x2_noftz(make_float2(wr[8 * h + 0], wr[8 * h + 4 + 0]), make_float2(win[(u % 4 + 1) % 4 * 8 + 2 * h], win[(u % 4 + 1) % 4 * 8 + 2 * h + 1])))));
+                        float2 p2 = fma_f32x2_rn_noftz(make_float2(wr[8 * h + 3], wr[8 * h + 4 + 3]), make_float2(win[u % 4 * 8 + 2 * h], win[u % 4 * 8 + 2 * h + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * h + 2], wr[8 * h + 4 + 2]), make_float2(win[(u % 4 + 3) % 4 * 8 + 2 * h], win[(u % 4 + 3) % 4 * 8 + 2 * h + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * h + 1], wr[8 * h + 4 + 1]), make_float2(win[(u % 4 + 2) % 4 * 8 + 2 * h], win[(u % 4 + 2) % 4 * 8 + 2 * h + 1]), mul_f32x2_noftz(make_float2(wr[8 * h], wr[8 * h + 4]), make_float2(win[(u % 4 + 1) % 4 * 8 + 2 * h], win[(u % 4 + 1) % 4 * 8 + 2 * h + 1])))));
                         float2 _f32x2_mul_b_13 = make_float2(-1.442695f, -1.442695f);
                         float2 e2;
                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&e2) : "l"(*(const unsigned long long*)&p2), "l"(*(const unsigned long long*)&_f32x2_mul_b_13));
@@ -517,7 +516,7 @@ kernel_cake_causal_conv1d_det_train_9c1e7ee9f37e3102660e(__nv_bfloat16* __restri
                         }
                         #pragma unroll
                         for (int h_1 = 0; h_1 < 4; h_1++) {
-                            float2 p2_1 = fma_f32x2_rn_noftz(make_float2(wr[8 * h_1 + 3], wr[8 * h_1 + 4 + 3]), make_float2(win[u_1 % 4 * 8 + 2 * h_1], win[u_1 % 4 * 8 + 2 * h_1 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * h_1 + 2], wr[8 * h_1 + 4 + 2]), make_float2(win[(u_1 % 4 + 3) % 4 * 8 + 2 * h_1], win[(u_1 % 4 + 3) % 4 * 8 + 2 * h_1 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * h_1 + 1], wr[8 * h_1 + 4 + 1]), make_float2(win[(u_1 % 4 + 2) % 4 * 8 + 2 * h_1], win[(u_1 % 4 + 2) % 4 * 8 + 2 * h_1 + 1]), mul_f32x2_noftz(make_float2(wr[8 * h_1 + 0], wr[8 * h_1 + 4 + 0]), make_float2(win[(u_1 % 4 + 1) % 4 * 8 + 2 * h_1], win[(u_1 % 4 + 1) % 4 * 8 + 2 * h_1 + 1])))));
+                            float2 p2_1 = fma_f32x2_rn_noftz(make_float2(wr[8 * h_1 + 3], wr[8 * h_1 + 4 + 3]), make_float2(win[u_1 % 4 * 8 + 2 * h_1], win[u_1 % 4 * 8 + 2 * h_1 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * h_1 + 2], wr[8 * h_1 + 4 + 2]), make_float2(win[(u_1 % 4 + 3) % 4 * 8 + 2 * h_1], win[(u_1 % 4 + 3) % 4 * 8 + 2 * h_1 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * h_1 + 1], wr[8 * h_1 + 4 + 1]), make_float2(win[(u_1 % 4 + 2) % 4 * 8 + 2 * h_1], win[(u_1 % 4 + 2) % 4 * 8 + 2 * h_1 + 1]), mul_f32x2_noftz(make_float2(wr[8 * h_1], wr[8 * h_1 + 4]), make_float2(win[(u_1 % 4 + 1) % 4 * 8 + 2 * h_1], win[(u_1 % 4 + 1) % 4 * 8 + 2 * h_1 + 1])))));
                             float2 _f32x2_mul_b_20 = make_float2(-1.442695f, -1.442695f);
                             float2 e2_1;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&e2_1) : "l"(*(const unsigned long long*)&p2_1), "l"(*(const unsigned long long*)&_f32x2_mul_b_20));
@@ -565,10 +564,10 @@ kernel_cake_causal_conv1d_det_train_9c1e7ee9f37e3102660e(__nv_bfloat16* __restri
         __syncthreads();
         int qn_1 = cells[(int)((unsigned int)kn % 4)];
         if (qn_1 < nch) {
-            int stage_t0_1 = qn_1 * n_sub * 8 + (int)((unsigned int)(k + 2) % 1) * 8;
+            int stage_t0_1 = qn_1 * n_sub * 8 + 0 * 8;
             if (tid == 0) {
                 int rem_1 = S - stage_t0_1;
-                int _max_26 = ((rem_1 + 0) > (0) ? (rem_1 + 0) : (0));
+                int _max_26 = ((rem_1) > (0) ? (rem_1) : (0));
                 int n_full_1 = (((int)((unsigned int)_max_26 / 8)) < (n_sub) ? ((int)((unsigned int)_max_26 / 8)) : (n_sub));
                 int tail_rows_1 = 0;
                 if (n_full_1 < n_sub) {
