@@ -175,8 +175,7 @@ def test_mtp_compact_pool_reuses_compile_across_capacities(mtp_modules, batch_si
     common = _make_mtp_inputs(batch_size, HV)
     for pool_size, expected_misses in ((batch_size + 1, 1), (batch_size + 3, 0)):
         pool = (
-            torch.randn(pool_size, HV, V, K, dtype=torch.float32, device="cuda")
-            * 0.01
+            torch.randn(pool_size, HV, V, K, dtype=torch.float32, device="cuda") * 0.01
         )
         assert pool.is_contiguous()
         _check_pool_call(api, kernel, pool, common, expected_misses)
