@@ -1851,6 +1851,8 @@ class AutoTuner:
         # Namespace index of JSON results, partitioned like managed winners.
         self._protocol_record_partitions: dict[tuple, dict[str, dict[str, Any]]] = {}
         self._protocol_cache_generation = 0
+        # Bumped by load_configs(); see selection_cache_token().
+        self._selection_epoch = 0
         # Namespaces changed in this process and requiring single-writer checks.
         self._dirty_namespaces: set[str] = set()
         # File generation observed at cache-context entry or explicit load.
@@ -2016,6 +2018,36 @@ class AutoTuner:
     def _in_v2_context(self) -> bool:
         """Whether an autotune_v2 context is open on this thread."""
         return self._v2_local.active
+
+    def selection_cache_token(self) -> Optional[tuple]:
+        """Snapshot of the state that decides non-tuning ``choose_one()`` results.
+
+        Callers that memoize a ``(runner, tactic)`` decision outside the tuner
+        store this token with the decision and reuse the decision only while
+        the token compares equal. The token changes when profiling results are
+        added, configs are loaded, or the cache is cleared.
+
+        Returns ``None`` when memoized decisions must not be used: in tuning
+        mode, inside any ``autotune()`` / ``autotune_v2()`` context (those
+        carry thread-local skip_ops and bucket overrides), and while a managed
+        ``autotune_v2`` store is attached (it can change on reload).
+        """
+        if (
+            self.is_tuning_mode
+            or self._active_tuning_contexts
+            or self._managed_cache is not None
+            or self._in_v2_context
+            or _tuning_scope.get(None) is not None
+        ):
+            return None
+        return (
+            id(self),
+            self._protocol_cache_generation,
+            self._dirty_seq,
+            self._selection_epoch,
+            len(self.profiling_cache),
+            len(self._file_configs),
+        )
 
     @property
     def _isolate_legacy_configs(self) -> bool:
@@ -4637,6 +4669,7 @@ class AutoTuner:
                 self._file_config_policies.pop(key, None)
                 if len(value) > 2:
                     self._file_config_policies[key] = tuple(value[2])
+            self._selection_epoch += 1
 
         if skipped_legacy_cudnn_tactics:
             logger.warning(

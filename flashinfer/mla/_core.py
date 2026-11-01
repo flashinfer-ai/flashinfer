@@ -16,8 +16,20 @@ limitations under the License.
 
 import functools
 import os
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, List, Literal, Optional, Sequence, Tuple, Union, cast
+from typing import (
+    Any,
+    Callable,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import torch
 
@@ -40,6 +52,7 @@ from ..utils import (
     check_trtllm_gen_sm107_only_feature,
     device_support_pdl,
     get_compute_capability,
+    get_device_index,
     get_device_sm_count,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
     is_sm12x_supported,
@@ -54,6 +67,7 @@ from ._utils import (
     _check_mla_query_kv_shape,
     _check_mla_dense_page_table_shape,
     _check_mla_sparse_index_shape,
+    _round_to_seq_len_bucket,
 )
 
 
@@ -2805,6 +2819,144 @@ from ._batch_mla._wrapper import (
 _TRTLLM_GEN_MLA_MAX_BATCH = 8192
 
 
+class _MLADecodeDispatchCache:
+    """Bounded LRU of tensor-free MLA decode dispatch decisions.
+
+    Functional decode calls that go through ``AutoTuner.choose_one`` rebuild
+    every candidate runner and the tuning config on each call only to look up
+    a ``(runner, tactic)`` decision. This cache keeps that decision as plain
+    scalars ``(runner_name, tactic)`` keyed by the workload signature, so later
+    calls build only the selected runner from the caller's live tensors and
+    exact ``max_seq_len``. No tensor or runner object is stored. Each entry
+    carries ``AutoTuner.selection_cache_token()`` and is ignored once the
+    tuner state changes (new profiling results, loaded configs, cleared cache).
+    """
+
+    def __init__(self, max_entries: int = 4096) -> None:
+        self.max_entries = max_entries
+        self._entries: "OrderedDict[tuple, tuple]" = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def lookup(self, key: tuple, token: tuple) -> Optional[Tuple[str, Any]]:
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None or entry[0] != token:
+                self.misses += 1
+                return None
+            self._entries.move_to_end(key)
+            self.hits += 1
+            return entry[1]
+
+    def insert(self, key: tuple, token: tuple, decision: Tuple[str, Any]) -> None:
+        with self._lock:
+            self._entries[key] = (token, decision)
+            self._entries.move_to_end(key)
+            while len(self._entries) > self.max_entries:
+                self._entries.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self.hits = 0
+            self.misses = 0
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
+_MLA_DECODE_DISPATCH_CACHE = _MLADecodeDispatchCache()
+
+
+def clear_mla_decode_dispatch_cache() -> None:
+    """Drop all cached MLA decode dispatch decisions (and reset hit counters)."""
+    _MLA_DECODE_DISPATCH_CACHE.clear()
+
+
+def _mla_decode_dispatch_key(
+    *,
+    runner_names: Sequence[str],
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    out: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    block_tables: torch.Tensor,
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    max_seq_len: int,
+    sparse_mla_top_k: int,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    sinks: Optional[List[torch.Tensor]],
+    skip_softmax_threshold_scale_factor: Optional[float],
+    enable_pdl: bool,
+    is_var_seq: bool,
+    uses_shared_paged_kv_idx: bool,
+    return_lse: bool,
+    lse: Optional[torch.Tensor],
+    return_lse_base: Optional[str],
+    use_fp16_softmax: Optional[bool],
+    cute_dsl_impl: str,
+    has_sparse_mla_top_k_lens: bool,
+    enable_dcp: bool,
+    cp_world: int,
+    cp_rank: int,
+) -> Optional[tuple]:
+    """Tensor-free signature of everything a decode dispatch decision depends on.
+
+    It covers the inputs of ``_build_mla_decode_tuning_config`` and of each
+    runner's ``get_cache_key_extras``. ``max_seq_len`` enters as the same
+    buckets the runners use: ``_round_to_seq_len_bucket`` (trtllm-gen and
+    modular CuTe DSL) and 128-token K tiles (monolithic CuTe DSL workspace and
+    autotune bucket cap). Returns ``None`` (no caching) for device-tensor scales.
+    """
+    if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+        return None
+    if sinks is None:
+        sinks_key = None
+    else:
+        sink_list = sinks if isinstance(sinks, (list, tuple)) else [sinks]
+        sinks_key = tuple((tuple(t.shape), t.dtype) for t in sink_list)
+    seq_key = (
+        (max_seq_len + 127) // 128 if "cute-dsl" in runner_names else None,
+        _round_to_seq_len_bucket(max_seq_len),
+    )
+    return (
+        tuple(runner_names),
+        get_device_index(query.device),
+        query.dtype,
+        tuple(query.shape),
+        kv_cache.dtype,
+        tuple(kv_cache.shape[1:]),
+        out.dtype,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
+        block_tables.shape[-1],
+        qk_nope_head_dim,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        seq_key,
+        sparse_mla_top_k,
+        float(bmm1_scale),
+        float(bmm2_scale),
+        sinks_key,
+        skip_softmax_threshold_scale_factor,
+        bool(enable_pdl),
+        is_var_seq,
+        uses_shared_paged_kv_idx,
+        bool(return_lse),
+        None if lse is None else (tuple(lse.shape), lse.dtype),
+        return_lse_base,
+        use_fp16_softmax,
+        cute_dsl_impl,
+        has_sparse_mla_top_k_lens,
+        enable_dcp,
+        cp_world,
+        cp_rank,
+    )
+
+
 def _resolve_cute_dsl_workspace_sizer(
     cute_dsl_impl: str,
     sinks: Optional[Union[List[torch.Tensor], Tuple[torch.Tensor, ...], torch.Tensor]],
@@ -4087,11 +4239,10 @@ def _mla_with_kv_cache_impl(
                 )
             )
 
-        runners: List[TunableRunner] = []
-        if "trtllm-gen" in runner_names:
-            # The TRT adapter lowers tensor scales once before profiling/launch.
-            runners.append(
-                _BatchMLAPagedAttentionTrtllmGenBackend.from_functional(
+        def _make_runner(name: str) -> TunableRunner:
+            if name == "trtllm-gen":
+                # The TRT adapter lowers tensor scales once before profiling/launch.
+                return _BatchMLAPagedAttentionTrtllmGenBackend.from_functional(
                     kv_cache=kv_cache,
                     workspace_buffer=workspace_buffer,
                     sm_count=sm_count,
@@ -4112,8 +4263,6 @@ def _mla_with_kv_cache_impl(
                     return_lse_base=return_lse_base,
                     use_fp16_softmax=use_fp16_softmax,
                 )
-            )
-        if "cute-dsl" in runner_names:
             # Normalize sinks: public contract accepts Optional[List[Tensor]] for
             # legacy reasons, but cute-dsl's modular variant expects a single
             # per-head tensor or None. The list-of-1 case has been guarded by
@@ -4133,29 +4282,27 @@ def _mla_with_kv_cache_impl(
                 if resolved_impl == "monolithic"
                 else _BatchMLAPagedAttentionCuteDslModularBackend.from_functional
             )
-            runners.append(
-                cute_runner_factory(
-                    kv_cache=kv_cache,
-                    workspace_buffer=workspace_buffer,
-                    kv_lora_rank=kv_lora_rank,
-                    qk_nope_head_dim=qk_nope_head_dim,
-                    qk_rope_head_dim=qk_rope_head_dim,
-                    max_seq_len=max_seq_len,
-                    softmax_scale=bmm1_scale,
-                    output_scale=bmm2_scale,
-                    out_dtype=out.dtype,
-                    enable_pdl=enable_pdl,
-                    is_var_seq=is_var_seq,
-                    uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
-                    lse=lse,
-                    return_lse=return_lse,
-                    return_lse_base=return_lse_base,
-                    sinks=cute_dsl_sinks,
-                    cute_dsl_impl=cute_dsl_impl,
-                    enable_dcp=enable_dcp,
-                    cp_world=cp_world,
-                    cp_rank=cp_rank,
-                )
+            return cute_runner_factory(
+                kv_cache=kv_cache,
+                workspace_buffer=workspace_buffer,
+                kv_lora_rank=kv_lora_rank,
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                max_seq_len=max_seq_len,
+                softmax_scale=bmm1_scale,
+                output_scale=bmm2_scale,
+                out_dtype=out.dtype,
+                enable_pdl=enable_pdl,
+                is_var_seq=is_var_seq,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                lse=lse,
+                return_lse=return_lse,
+                return_lse_base=return_lse_base,
+                sinks=cute_dsl_sinks,
+                cute_dsl_impl=cute_dsl_impl,
+                enable_dcp=enable_dcp,
+                cp_world=cp_world,
+                cp_rank=cp_rank,
             )
 
         inputs = [query, block_tables, seq_lens, out]
@@ -4169,32 +4316,85 @@ def _mla_with_kv_cache_impl(
         if backend == "trtllm-gen" and not tuner.is_tuning_mode:
             # Explicit TRT has one implementation and only tactic -1. Keep
             # profiling inside autotune(), but inference needs no selection.
-            runner, tactic = runners[0], -1
+            runner, tactic = _make_runner("trtllm-gen"), -1
         else:
-            _, q_len, num_heads, _ = query.shape
-            tuning_config = _build_mla_decode_tuning_config(
-                kv_cache=kv_cache,
-                block_tables=block_tables,
-                workspace_buffer=workspace_buffer,
-                runner_names=runner_names,
-                q_len=q_len,
-                num_heads=num_heads,
-                kv_lora_rank=kv_lora_rank,
-                max_seq_len=max_seq_len,
-                device=query.device,
-                has_sparse_mla_top_k_lens=sparse_mla_top_k_lens is not None,
-                cute_dsl_impl=cute_dsl_impl,
-                sinks=sinks,
-                enable_dcp=enable_dcp,
-                cp_world=cp_world,
-                cp_rank=cp_rank,
-            )
-            runner, tactic = tuner.choose_one(
-                "trtllm_batch_decode_mla",
-                runners,
-                tuning_config,
-                inputs,
-            )
+            # Outside tuning, the (runner, tactic) decision depends only on the
+            # workload signature and the tuner state, so reuse it from the
+            # dispatch cache and build just the selected runner. The cache
+            # holds no tensors; the runner is built from this call's tensors.
+            token = tuner.selection_cache_token()
+            dispatch_key = None
+            decision = None
+            if token is not None:
+                dispatch_key = _mla_decode_dispatch_key(
+                    runner_names=runner_names,
+                    query=query,
+                    kv_cache=kv_cache,
+                    out=out,
+                    workspace_buffer=workspace_buffer,
+                    block_tables=block_tables,
+                    qk_nope_head_dim=qk_nope_head_dim,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                    max_seq_len=max_seq_len,
+                    sparse_mla_top_k=sparse_mla_top_k,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    sinks=sinks,
+                    skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                    enable_pdl=enable_pdl,
+                    is_var_seq=is_var_seq,
+                    uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                    return_lse=return_lse,
+                    lse=lse,
+                    return_lse_base=return_lse_base,
+                    use_fp16_softmax=use_fp16_softmax,
+                    cute_dsl_impl=cute_dsl_impl,
+                    has_sparse_mla_top_k_lens=sparse_mla_top_k_lens is not None,
+                    enable_dcp=enable_dcp,
+                    cp_world=cp_world,
+                    cp_rank=cp_rank,
+                )
+                if dispatch_key is not None:
+                    decision = _MLA_DECODE_DISPATCH_CACHE.lookup(dispatch_key, token)
+            if decision is not None:
+                runner_name, tactic = decision
+                runner = _make_runner(runner_name)
+            else:
+                runners = [_make_runner(name) for name in runner_names]
+                _, q_len, num_heads, _ = query.shape
+                tuning_config = _build_mla_decode_tuning_config(
+                    kv_cache=kv_cache,
+                    block_tables=block_tables,
+                    workspace_buffer=workspace_buffer,
+                    runner_names=runner_names,
+                    q_len=q_len,
+                    num_heads=num_heads,
+                    kv_lora_rank=kv_lora_rank,
+                    max_seq_len=max_seq_len,
+                    device=query.device,
+                    has_sparse_mla_top_k_lens=sparse_mla_top_k_lens is not None,
+                    cute_dsl_impl=cute_dsl_impl,
+                    sinks=sinks,
+                    enable_dcp=enable_dcp,
+                    cp_world=cp_world,
+                    cp_rank=cp_rank,
+                )
+                runner, tactic = tuner.choose_one(
+                    "trtllm_batch_decode_mla",
+                    runners,
+                    tuning_config,
+                    inputs,
+                )
+                # Store only if the tuner state did not change during the call.
+                if dispatch_key is not None and tuner.selection_cache_token() == token:
+                    for name, candidate in zip(runner_names, runners, strict=True):
+                        if candidate is runner:
+                            _MLA_DECODE_DISPATCH_CACHE.insert(
+                                dispatch_key, token, (name, tactic)
+                            )
+                            break
+                del runners
         if isinstance(runner, _BatchMLAPagedAttentionTrtllmGenBackend):
             runner(
                 inputs=inputs,
