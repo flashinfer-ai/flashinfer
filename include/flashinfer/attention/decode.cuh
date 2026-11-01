@@ -720,7 +720,7 @@ cudaError_t SingleDecodeWithKVCacheDispatched(Params params, typename Params::DT
         FLASHINFER_CUDA_CALL(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &num_blocks_per_sm, kernel, num_threads, smem_size));
         uint32_t max_grid_size = uint32_t(num_blocks_per_sm) * uint32_t(num_sm);
-        uint32_t max_num_kv_chunks = max_grid_size / num_kv_heads;
+        uint32_t max_num_kv_chunks = max(1u, max_grid_size / num_kv_heads);
         uint32_t kv_chunk_size = max(ceil_div(seq_len, max_num_kv_chunks), 256);
         uint32_t num_chunks = ceil_div(seq_len, kv_chunk_size);
         dim3 nblks = dim3(num_chunks, num_kv_heads);
