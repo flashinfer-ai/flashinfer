@@ -21,8 +21,6 @@ ported CUTLASS CuTe DSL Blackwell GEMM+reduce-scatter kernel.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
-import time
 from typing import Any, Literal
 
 import torch
@@ -139,39 +137,6 @@ def _as_l1_tensor(tensor: torch.Tensor) -> torch.Tensor:
     stride0, stride1 = tensor.stride()
     return tensor.as_strided(
         (tensor.shape[0], tensor.shape[1], 1), (stride0, stride1, 1)
-    )
-
-
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
-
-
-def _debug_nvshmem_teams(prefix: str, *, rank: int, world_size: int) -> None:
-    if not _env_flag("FLASHINFER_GRS_DEBUG"):
-        return
-
-    def _safe_call(fn):
-        try:
-            return fn()
-        except Exception as exc:  # pragma: no cover - debug-only path.
-            return f"{type(exc).__name__}: {exc}"
-
-    teams = {}
-    for name in ("TEAM_WORLD", "TEAM_NODE", "TEAM_SHARED"):
-        if hasattr(nvshmem.core.Teams, name):
-            team = getattr(nvshmem.core.Teams, name)
-            teams[name] = {
-                "handle": team,
-                "my_pe": _safe_call(lambda team=team: nvshmem.core.team_my_pe(team)),
-                "n_pes": _safe_call(lambda team=team: nvshmem.core.team_n_pes(team)),
-            }
-    print(
-        f"[flashinfer_grs_debug:{prefix}] "
-        f"rank={rank} torch_world_size={world_size} "
-        f"nvshmem_my_pe={_safe_call(nvshmem.core.my_pe)} "
-        f"nvshmem_n_pes={_safe_call(nvshmem.core.n_pes)} "
-        f"teams={teams}",
-        flush=True,
     )
 
 
@@ -481,7 +446,6 @@ class BlackwellGemmRSWorkspace:
 
         self.c_full = nvshmem.core.tensor((M, N), dtype=dtype)
         self.c_full.zero_()
-        _debug_nvshmem_teams("workspace", rank=self.rank, world_size=self.world_size)
         self.w_staging = (
             torch.empty((N, K_local), dtype=dtype, device=device)
             if self.config.b_layout == "staged"
@@ -706,14 +670,7 @@ def run_blackwell_gemm_rs_with_kernel(
     workspace: BlackwellGemmRSWorkspace,
     verbose: bool = False,
 ) -> torch.Tensor:
-    """Run one Blackwell CUTLASS GEMM+RS call using a supplied kernel class.
-
-    This is the bridge between FlashInfer caller tensors/workspace and the
-    CUTLASS CuTeDSL `PersistentDenseGemmKernel`.  The kernel class is injected
-    so the library does not import from benchmark files.  Once the kernel is
-    extracted into FlashInfer, this function can call that class directly and
-    grow a compile cache around it.
-    """
+    """Run one Blackwell CUTLASS GEMM+RS call using a supplied kernel class."""
     _require_world_group(group)
     _require_blackwell_deps()
     if torch.cuda.get_device_capability(X_local.device)[0] < 10:
@@ -726,18 +683,10 @@ def run_blackwell_gemm_rs_with_kernel(
     workspace.last_b_layout = effective_b_layout
     if effective_b_layout == "staged":
         workspace.get_w_staging()
-    debug_timing = _env_flag("FLASHINFER_GRS_DEBUG")
     workspace.reset()
 
-    profile_copy_ms = None
-    profile_kernel_ms = None
-    profile_compile_ms = None
     key = _compile_key(X_local, W_local, workspace, kernel_cls, effective_b_layout)
     cache_hit = workspace._compiled_key == key and workspace._compiled_gemm is not None
-    if debug_timing:
-        copy_start = torch.cuda.Event(enable_timing=True)
-        copy_end = torch.cuda.Event(enable_timing=True)
-        copy_start.record()
     if cache_hit:
         if effective_b_layout == "staged":
             stage_b_tensor(W_local, staging=workspace.get_w_staging())
@@ -751,10 +700,6 @@ def run_blackwell_gemm_rs_with_kernel(
             )
         else:
             b_tensor = make_b_tensor_nocopy(W_local)
-    if debug_timing:
-        copy_end.record()
-        torch.cuda.synchronize()
-        profile_copy_ms = copy_start.elapsed_time(copy_end)
 
     if not cache_hit:
         gemm = _make_kernel(kernel_cls, config)
@@ -768,7 +713,6 @@ def run_blackwell_gemm_rs_with_kernel(
         max_active_clusters = cutlass_utils.HardwareInfo().get_max_active_clusters(
             config.cluster_shape_mn[0] * config.cluster_shape_mn[1]
         )
-        compile_t0 = time.perf_counter()
         workspace._compiled_gemm = cute.compile(
             gemm,
             a_tensor,
@@ -781,17 +725,12 @@ def run_blackwell_gemm_rs_with_kernel(
             barrier_flag=workspace.barrier_flag,
             barrier_flag_mc=workspace.barrier_flag_mc,
         )
-        profile_compile_ms = (time.perf_counter() - compile_t0) * 1000.0
         workspace._compiled_key = key
         workspace._compiled_a_tensor = a_tensor
         workspace._compiled_b_tensor = b_tensor
     compiled_gemm = workspace._compiled_gemm
     if compiled_gemm is None:
         raise RuntimeError("Blackwell GEMM+RS compilation did not produce a kernel.")
-    if debug_timing:
-        kernel_start = torch.cuda.Event(enable_timing=True)
-        kernel_end = torch.cuda.Event(enable_timing=True)
-        kernel_start.record()
     compiled_gemm(
         a_tensor,
         b_tensor,
@@ -802,18 +741,6 @@ def run_blackwell_gemm_rs_with_kernel(
         barrier_flag=workspace.barrier_flag,
         barrier_flag_mc=workspace.barrier_flag_mc,
     )
-    if debug_timing:
-        kernel_end.record()
-        torch.cuda.synchronize()
-        profile_kernel_ms = kernel_start.elapsed_time(kernel_end)
-        print(
-            "[flashinfer_grs_debug:timing] "
-            f"rank={dist.get_rank(group)} copy_ms={profile_copy_ms:.6f} "
-            f"kernel_ms={profile_kernel_ms:.6f} "
-            f"compiled={profile_compile_ms is not None} "
-            f"compile_ms={profile_compile_ms}",
-            flush=True,
-        )
     if verbose and dist.get_rank(group) == 0:
         print(
             "[run_blackwell_gemm_rs_with_kernel] "
