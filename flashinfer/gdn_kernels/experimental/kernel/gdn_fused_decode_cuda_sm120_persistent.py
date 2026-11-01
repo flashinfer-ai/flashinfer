@@ -96,7 +96,9 @@ def _geometry_from_tensors(
     conv_width = int(conv_weight.shape[1])
     conv_state_len = int(conv_state.shape[2])
     h_q = (qkv_dim - hv * d) // (2 * d)
-    return (hidden, n_ba, qkv_dim, h_q, hv, d, conv_width, conv_state_len)
+    major, minor = torch.cuda.get_device_capability(hidden_states.device)
+    return (hidden, n_ba, qkv_dim, h_q, hv, d, conv_width, conv_state_len,
+            major * 10 + minor)
 
 
 def _get_module(geometry: tuple):
@@ -107,6 +109,14 @@ def _get_module(geometry: tuple):
         module = gen_gdn_fused_decode_module(*geometry).build_and_load()
         _modules[geometry] = module
     return module
+
+
+def _signature_cc(signature: dict) -> int:
+    cc = signature.get("cc")
+    if cc is None:
+        major, minor = torch.cuda.get_device_capability()
+        cc = major * 10 + minor
+    return int(cc)
 
 
 def geometry_key(signature: dict) -> tuple:
@@ -120,6 +130,7 @@ def geometry_key(signature: dict) -> tuple:
         int(signature["d"]),
         int(signature["conv_width"]),
         int(signature["conv_state_len"]),
+        _signature_cc(signature),
     )
 
 
@@ -270,9 +281,9 @@ def launch_count() -> int:
 
 
 def _geometry_tag(geometry: tuple) -> str:
-    hidden, n_ba, qkv_dim, h_q, hv, d, conv_width, conv_state_len = geometry
+    hidden, n_ba, qkv_dim, h_q, hv, d, conv_width, conv_state_len, cc = geometry
     return (
-        f"sm120_persistent_b_dynamic_h{hidden}_nba{n_ba}_qkv{qkv_dim}"
+        f"sm{cc}_persistent_b_dynamic_h{hidden}_nba{n_ba}_qkv{qkv_dim}"
         f"_hq{h_q}_hv{hv}_d{d}_w{conv_width}_s{conv_state_len}"
     )
 

@@ -94,7 +94,7 @@ from flashinfer.gdn_kernels.experimental import (
     gdn_fused_decode_specialized as specialized_gdn,
 )
 from flashinfer.gdn_kernels.experimental.gdn_fused_decode import gdn_fused_decode_step
-from flashinfer.utils import is_sm120a_supported
+from flashinfer.utils import is_sm12x_supported
 
 _CUDA_IMPL = "cuda_sm120_persistent"
 _CUTEDSL_IMPL = "cutedsl_sm120_pdl"
@@ -238,7 +238,7 @@ def _skip_if_no_cuda() -> None:
 def _skip_if_no_specialized() -> None:
     """Skip unless this node can run the registered specialized kernels."""
     _skip_if_no_cuda()
-    if not is_sm120a_supported(torch.device("cuda")):
+    if not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("the registered specialized fused GDN kernels target SM120")
 
 
@@ -1726,7 +1726,7 @@ def test_dispatch_serves_a_call_on_a_non_ambient_device():
     _skip_if_no_specialized()
     if torch.cuda.device_count() < 2:
         pytest.skip("needs two CUDA devices")
-    if not is_sm120a_supported(torch.device("cuda:1")):
+    if not is_sm12x_supported(torch.device("cuda:1")):
         pytest.skip("the registered specialized fused GDN kernels target SM120")
 
     B, seed = 4, 20260818
@@ -1820,7 +1820,7 @@ def test_registry_shape_and_stats():
     by_impl: dict = {}
     for row in rows:
         assert row["conv_layout"] == "SD"
-        assert row["cc"] == 120
+        assert row["cc"] in (120, 121)
         by_impl.setdefault(row["impl"], {}).setdefault(
             tuple(row[field] for field in specialized_gdn._GEOMETRY_FIELDS), set()
         ).add(row["b"])
@@ -1834,7 +1834,9 @@ def test_registry_shape_and_stats():
     if cuda_stats["distinct_kernels_for_registry"] is not None:
         # One B-dynamic CUDA module per layer geometry (the geometry is a
         # compile-time parameter; batch, scale and conv strides are not).
-        assert cuda_stats["distinct_kernels_for_registry"] == len(GEOMETRIES)
+        assert cuda_stats["distinct_kernels_for_registry"] == len(GEOMETRIES) * len(
+            {row["cc"] for row in rows}
+        )
 
 
 def test_registry_geometries_are_the_documented_surface():
