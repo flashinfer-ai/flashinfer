@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import contextlib
+import functools
 import gc
 import inspect
 import math
@@ -31,6 +32,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.utils.checkpoint
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from tests.test_helpers.cake_lm_head_loss_reference import (
     DEFAULT_H,
@@ -9622,14 +9624,57 @@ CHECKPOINT_KINDS = (
 )
 
 
+class _PassThroughMode(TorchDispatchMode):
+    """A torch dispatch mode that runs every operator unchanged."""
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        return func(*args, **(kwargs or {}))
+
+
+_MM_OPS = (
+    torch.ops.aten.mm.default,
+    torch.ops.aten.addmm.default,
+    torch.ops.aten.bmm.default,
+)
+
+
+def _selective(policy):
+    """``context_fn`` of a selective activation checkpoint: ``"recompute"`` recomputes every operator, ``"save_mm"``
+    saves the matrix products, ``"save_all"`` saves every operator."""
+    CheckpointPolicy = torch.utils.checkpoint.CheckpointPolicy
+
+    def policy_fn(ctx, func, *args, **kwargs):
+        if policy == "save_all" or (policy == "save_mm" and func in _MM_OPS):
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    return functools.partial(
+        torch.utils.checkpoint.create_selective_checkpoint_contexts, policy_fn
+    )
+
+
 def _checkpointed(kind, fn, X, W):
     """``fn(X, W)`` under ``torch.utils.checkpoint`` of the given kind (``plain``: no checkpoint).  ``offload_outside``:
     the checkpoint inside ``save_on_cpu`` (the checkpoint's hooks on top); ``copies_outside``: likewise inside hooks that
     save copies (the recomputation's inputs are copies on any device); ``offload_inside``: ``save_on_cpu`` inside the
-    checkpointed function (its hooks on top: the call keeps its fused forward)."""
+    checkpointed function (its hooks on top: the call keeps its fused forward).  ``selective_recompute`` /
+    ``selective_save_mm`` / ``selective_save_all``: a selective activation checkpoint (its dispatch modes in both
+    passes); ``dispatch_mode``: a
+    non-reentrant checkpoint under a pass-through dispatch mode (the checkpointed forward only)."""
     ckpt = torch.utils.checkpoint.checkpoint
     if kind == "plain":
         return fn(X, W)
+    if kind in ("selective_recompute", "selective_save_mm", "selective_save_all"):
+        return ckpt(
+            fn,
+            X,
+            W,
+            use_reentrant=False,
+            context_fn=_selective(kind.removeprefix("selective_")),
+        )
+    if kind == "dispatch_mode":
+        with _PassThroughMode():
+            return ckpt(fn, X, W, use_reentrant=False)
     if kind == "reentrant":
         return ckpt(fn, X, W, use_reentrant=True)
     if kind == "nonreentrant":
@@ -9942,6 +9987,43 @@ def test_checkpointed_steps_on_concurrent_threads():
     assert len(cake_backend._CHECKPOINT_CALLS) == 0
 
 
+@pytest.mark.parametrize("module", ["default", "count"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "selective_recompute",
+        "selective_save_mm",
+        "dispatch_mode",
+        "dispatch_mode_step",
+    ],
+)
+@pytest.mark.parametrize("objective", ["ce", "policy"])
+def test_selective_checkpoint_and_dispatch_modes_form_the_gradients_once(
+    objective, kind, module
+):
+    """Selective activation checkpointing replays the checkpointed forward's operators in the recomputation by
+    position; the call runs outside its dispatch modes, so the checkpointed forward computes the loss only and the
+    recomputation forms the gradients, as in a plain non-reentrant checkpoint.  Likewise under another dispatch mode
+    (``dispatch_mode``: around the checkpointed forward only; ``dispatch_mode_step``: around the forward and the
+    backward).  One gradient forward, the uncheckpointed step's bits, no frame record left.  ``count``: the opt-in
+    count form."""
+    inp = _host_inputs(200, objective)
+    kw = dict(backend="reference")
+    if module == "count":
+        kw.update(module=opt_in, num_valid_rows=int((inp.labels >= 0).sum()))
+    plain = _placement_step(inp, 64, "plain", **kw)
+    with _gradient_forwards() as seen:
+        if kind == "dispatch_mode_step":
+            with _PassThroughMode():
+                run = _placement_step(inp, 64, "nonreentrant", **kw)
+        else:
+            run = _placement_step(inp, 64, kind, **kw)
+    assert _gradient_count(seen) == 1, seen
+    _assert_step_bits(run, plain)
+    gc.collect()
+    assert len(cake_backend._CHECKPOINT_CALLS) == 0
+
+
 @pytest.mark.parametrize("kind", ["no_grad", "nonreentrant", "reentrant"])
 def test_opt_in_count_form_places_the_gradients_alike(kind):
     """The opt-in count form (``num_valid_rows``) follows the gradient placement: no gradient forward without a graph,
@@ -10049,6 +10131,129 @@ def test_device_checkpointed_step_launches_the_gradient_gemms_once(
     _assert_step_bits(again, plain)
 
 
+@pytest.mark.parametrize("memory_mode", [None, "budget"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "selective_recompute",
+        "selective_save_mm",
+        "selective_save_all",
+        "dispatch_mode",
+    ],
+)
+@pytest.mark.parametrize("objective", ["ce", "policy"])
+def test_device_selective_checkpoint_step_launches_the_gradient_gemms_once(
+    glm_weight, objective, kind, memory_mode
+):
+    """A three-chunk step under selective activation checkpointing (or a non-reentrant checkpoint under a dispatch
+    mode) launches the uncheckpointed step's dX / dW GEMMs (the recomputation forms the gradients) and gives its
+    bits."""
+    _require_program(entry="loss")
+    inp = _device_inputs(12289, objective, W=glm_weight)
+    kw = {} if memory_mode is None else dict(module=opt_in, memory_mode=memory_mode)
+    _placement_step(inp, 4096, "plain", **kw)  # binds
+    with _launch_record() as launched:
+        plain = _placement_step(inp, 4096, "plain", **kw)
+    count = _gradient_gemm_keys(launched)
+    assert count >= 5, sorted({k[0] for k in launched})
+    with _launch_record() as launched:
+        run = _placement_step(inp, 4096, kind, **kw)
+    assert _gradient_gemm_keys(launched) == count, kind
+    _assert_step_bits(run, plain)
+
+
+_SELECTIVE_FIRST_CALL_SCRIPT = """
+import functools, sys, torch
+import torch.utils.checkpoint as tuc
+sys.path.insert(0, {root!r})
+from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
+from tests.test_helpers.cake_package import cake_package
+backend = cake_package("cake_lm_head_det_loss", {module!r})
+W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W
+inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05)
+kw = dict(chunk_size={C}, backend="cake", **{switches!r})
+
+
+def head(a, b):
+    if {entry!r} == "loss":
+        return backend.chunked_lm_head_det_loss(a, b, inp.labels, loss_div=inp.loss_div, **kw)
+    return (backend.chunked_lm_head_det_logprob(a, b, inp.labels, **kw) * inp.dlogp).sum()
+
+
+def policy(ctx, func, *args, **kwargs):
+    return tuc.CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def step(selective):
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    if selective:
+        context_fn = functools.partial(tuc.create_selective_checkpoint_contexts, policy)
+        loss = tuc.checkpoint(head, X, W, use_reentrant=False, context_fn=context_fn)
+    else:
+        loss = head(X, W)
+    loss.backward()
+    torch.cuda.synchronize()
+    return [loss.detach(), X.grad, W.grad]
+
+
+if {warm!r}:  # the main thread's state formed first: the recomputation (autograd thread) forms its own
+    with torch.no_grad():
+        head(inp.X, inp.W)
+first = step(True)  # the entry's first gradient step: inside a selective checkpoint
+plain = step(False)
+for a, b in zip(first, plain):
+    assert a.dtype == b.dtype and torch.equal(a.reshape(-1).view(torch.int8), b.reshape(-1).view(torch.int8))
+print("SELECTIVE_FIRST_CALL_OK")
+"""
+
+
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize(
+    "entry,memory_mode",
+    [
+        ("loss", None),
+        ("loss", "budget"),
+        ("logprob", None),
+        ("logprob", "budget"),
+        ("logprob", "keep_logits"),
+    ],
+)
+def test_device_selective_checkpoint_first_call_of_a_process(entry, memory_mode, warm):
+    """A fresh process whose first gradient step of the entry is a selective-checkpoint step: the process-wide
+    constant cells (first used inside its recomputation) and the autograd thread's own state (the valid-row constant
+    and count cell, formed in the recomputation; ``warm``: after the main thread's were formed by a ``no_grad`` call)
+    stay outside the checkpoint's operator record.  The step runs and gives the uncheckpointed step's bits."""
+    _require_program(entry=entry)
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    T = 12289
+    script = _SELECTIVE_FIRST_CALL_SCRIPT.format(
+        root=root,
+        module="cake_backend" if memory_mode is None else "cake_backend_opt_in",
+        seed_w=SEED,
+        T=T,
+        seed=SEED + T,
+        C=4096,
+        entry=entry,
+        switches={} if memory_mode is None else dict(memory_mode=memory_mode),
+        warm=warm,
+    )
+    env = dict(
+        os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=root,
+        timeout=600,
+    )
+    assert proc.returncode == 0 and "SELECTIVE_FIRST_CALL_OK" in proc.stdout, (
+        f"fresh process failed ({proc.returncode}):\n{proc.stdout[-2000:]}\n{proc.stderr[-4000:]}"
+    )
+
+
 @pytest.mark.parametrize("objective", ["ce", "policy"])
 def test_device_checkpointed_step_memory(glm_weight, objective):
     """A non-reentrant checkpointed three-chunk step gives the uncheckpointed step's bits under both placements; with
@@ -10098,10 +10303,175 @@ def test_device_checkpointed_logprob_step_launches_the_gradient_gemms_once(glm_w
         plain = step("plain")
     count = _gradient_gemm_keys(launched)
     assert count >= 5, sorted({k[0] for k in launched})
-    for kind in ("reentrant", "nonreentrant"):
+    for kind in (
+        "reentrant",
+        "nonreentrant",
+        "selective_recompute",
+        "selective_save_mm",
+        "selective_save_all",
+        "dispatch_mode",
+    ):
         with _launch_record() as launched:
             run = step(kind)
         assert _gradient_gemm_keys(launched) == count, kind
+        assert _placement_bits(run[0], plain[0]), kind
+        assert _placement_bits(run[1], plain[1]), kind
+
+
+def _region_entry(entry, inp, X, W):
+    """The scalar a selective-checkpoint region test differentiates: one det entry on ``X`` / ``W``."""
+    if entry in ("loss", "loss_budget"):
+        mod, kw = (
+            (cake_backend, {})
+            if entry == "loss"
+            else (opt_in, dict(memory_mode="budget"))
+        )
+        return mod.chunked_lm_head_det_loss(
+            X, W, inp.labels, loss_div=inp.loss_div, chunk_size=4096, **kw
+        )
+    if entry == "support":
+        # eight distinct candidates per row, the label first (an ignored row: candidates of token 0)
+        K, T, V = 8, X.shape[0], W.shape[0]
+        base = inp.labels.clamp_min(0)[:, None]
+        ids = (base + 997 * torch.arange(K, device=X.device)[None, :]) % V
+        offsets = torch.arange(0, T * K + 1, K, device=X.device)
+        support = cake_package("cake_lm_head_det_loss", "cake_support")
+        logp = support.chunked_lm_head_det_support_logprob(
+            X, W, ids.reshape(-1), offsets, inp.labels, k_cap=K
+        )
+        return (logp * inp.dlogp).sum()
+    if entry == "keep_backend":
+        logp = cake_backend.chunked_lm_head_det_logprob_keep(
+            X, W, inp.labels, chunk_size=4096
+        )
+    else:
+        memory_mode = {
+            "logprob": None,
+            "logprob_budget": "budget",
+            "keep": "keep_logits",
+        }[entry]
+        logp = opt_in.chunked_lm_head_det_logprob(
+            X, W, inp.labels, chunk_size=4096, memory_mode=memory_mode
+        )
+    return (logp * inp.dlogp).sum()
+
+
+@pytest.mark.parametrize("kind", ["hold", "user_mode", "nested"])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "loss",
+        "loss_budget",
+        "logprob",
+        "logprob_budget",
+        "keep",
+        "keep_backend",
+        "support",
+    ],
+)
+def test_device_selective_checkpoint_region_input(glm_weight, entry, kind):
+    """The entry's input formed inside the selective-checkpoint region (``X = Hin @ P``, ``P`` trainable): a plain
+    step binds at ``X``'s address, the checkpointed forward finds that binding, and memory held between the forward
+    and the backward moves the recomputed ``X`` to another address (a binding miss in the recomputation only).  Also
+    with a user dispatch mode around the whole step (``user_mode``) and a non-reentrant checkpoint nested inside the
+    selective one (``nested``).  ``loss`` / ``dHin`` / ``dP`` / ``dW`` are the uncheckpointed step's bits."""
+    _require_program(entry="loss" if entry.startswith("loss") else "logprob")
+    inp = _device_inputs(12289, "ce", W=glm_weight)
+    H = inp.X.shape[1]
+    g = torch.Generator(device="cpu").manual_seed(SEED + 1)
+    Hin0 = (torch.randn(inp.X.shape, generator=g) * 0.5).to(torch.bfloat16).cuda()
+    P0 = (torch.randn(H, H, generator=g) / H**0.5).to(torch.bfloat16).cuda()
+
+    def region(h, p, w):
+        return _region_entry(entry, inp, torch.mm(h, p), w)
+
+    def step(selective):
+        h, p, w = (t.detach().requires_grad_(True) for t in (Hin0, P0, inp.W))
+        mode = (
+            _PassThroughMode()
+            if (selective and kind == "user_mode")
+            else contextlib.nullcontext()
+        )
+        with mode:
+            if not selective:
+                out = region(h, p, w)
+            else:
+                ctx = _selective("recompute")
+                fn = region
+                if kind == "nested":
+
+                    def fn(a, b, c):
+                        return torch.utils.checkpoint.checkpoint(
+                            region, a, b, c, use_reentrant=False
+                        )
+
+                out = torch.utils.checkpoint.checkpoint(
+                    fn, h, p, w, use_reentrant=False, context_fn=ctx
+                )
+            held = [torch.empty_like(Hin0) for _ in range(2)] if selective else []
+            out.backward()
+        torch.cuda.synchronize()
+        del held
+        return [out.detach(), h.grad, p.grad, w.grad]
+
+    step(False)  # binds
+    plain = step(False)
+    for _ in range(2):
+        # a plain step right before (results dropped): its X's block is the one the checkpointed forward's X reuses
+        step(False)
+        run = step(True)
+        for name, a, b in zip(("loss", "dHin", "dP", "dW"), run, plain, strict=True):
+            assert _placement_bits(a, b), name
+
+
+@pytest.mark.parametrize("entry", ["backend", "opt_in"])
+def test_device_checkpointed_logprob_keep_step_is_bitwise(glm_weight, entry):
+    """The kept logits (``chunked_lm_head_det_logprob_keep``; the opt-in ``memory_mode="keep_logits"``) under a
+    non-reentrant checkpoint, selective activation checkpointing and a dispatch mode (around the checkpointed forward;
+    around the whole step) give the uncheckpointed default entry's ``dX`` / ``dW`` bits."""
+    _require_program(entry="logprob")
+    inp = _device_inputs(12289, "ce", W=glm_weight)
+
+    def head_default(a, b):
+        return (
+            cake_backend.chunked_lm_head_det_logprob(a, b, inp.labels, chunk_size=4096)
+            * inp.dlogp
+        ).sum()
+
+    def head_keep(a, b):
+        if entry == "backend":
+            logp = cake_backend.chunked_lm_head_det_logprob_keep(
+                a, b, inp.labels, chunk_size=4096
+            )
+        else:
+            logp = opt_in.chunked_lm_head_det_logprob(
+                a, b, inp.labels, chunk_size=4096, memory_mode="keep_logits"
+            )
+        return (logp * inp.dlogp).sum()
+
+    def step(kind, head):
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        if kind == "dispatch_mode_step":
+            with _PassThroughMode():
+                _checkpointed("nonreentrant", head, X, W).backward()
+        else:
+            _checkpointed(kind, head, X, W).backward()
+        torch.cuda.synchronize()
+        return X.grad, W.grad
+
+    step("plain", head_keep)  # binds
+    plain = step("plain", head_default)
+    for kind in (
+        "plain",
+        "nonreentrant",
+        "selective_recompute",
+        "selective_save_mm",
+        "selective_save_all",
+        "dispatch_mode",
+        "dispatch_mode_step",
+    ):
+        run = step(kind, head_keep)
         assert _placement_bits(run[0], plain[0]), kind
         assert _placement_bits(run[1], plain[1]), kind
 

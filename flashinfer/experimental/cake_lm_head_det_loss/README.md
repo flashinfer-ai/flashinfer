@@ -87,7 +87,16 @@ aliases of the same objects.
   order and checked against the inputs' metadata and the call's options;
   without a handed result the backward runs the fused forward itself).  Other
   saved-tensor hooks innermost (CPU offload inside the checkpointed function)
-  or a torch whose checkpoint lacks those hooks keep the fused forward.
+  or a torch whose checkpoint lacks those hooks keep the fused forward.  Under
+  selective activation checkpointing (`context_fn` of
+  `create_selective_checkpoint_contexts`, whose recomputation replays the
+  checkpointed forward's operators by position) every det entry -- the loss,
+  log-probability (default, budget, kept logits) and candidate-support
+  entries -- runs its forward with all active torch dispatch modes popped,
+  the checkpoint's and any user mode on the stack (a `FlopCounterMode` does
+  not see the entry's operators; a tracing mode such as `FakeTensorMode` or a
+  `torch.compile` trace gets real launches on fake inputs and fails loudly),
+  and behaves as in a plain non-reentrant checkpoint.
   `"forward"`: every call with a trainable input forms the gradients in its
   forward (the previous behavior).  The same `loss`, `logp`, `dX` and `dW`
   bits either way; `chunked_lm_head_det_logprob` forms no gradient in its
