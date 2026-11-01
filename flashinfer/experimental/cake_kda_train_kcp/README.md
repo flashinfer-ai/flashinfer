@@ -422,11 +422,12 @@ The files of this package:
   programs (schema `cake-build/1`, one entry per `<library>_<arch>`);
   `aot/` is never tracked (`.gitignore`).
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include.
-* `csrc/cake_kda_train_<digest>_kcp_{kernel,binding}.cu` of the fifteen
-  context-parallel-only programs and `csrc/cake_kda_train_<digest>_{kernel,binding}.cu`
-  of the two chunk stages (`kcp_fwd_o`, `kcp_dav`), rendered like the
-  single-rank ones (digests in `build.json` and `build.test.json`); the units
-  of the deterministic package's programs under this package's names.
+* `csrc/cake_kda_train_<digest>_kcp_{kernel,binding}.cu` of the sixteen
+  context-parallel programs (the chunk stage `kcp_fwd_o` among them) and
+  `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the chunk stage
+  `kcp_dav`, rendered like the single-rank ones (digests in `build.json` and
+  `build.test.json`); the units of the deterministic package's programs under
+  this package's names.
 
 ## Status
 
