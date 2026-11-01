@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from argparse import BooleanOptionalAction
 from collections import defaultdict
 
 import numpy as np
@@ -198,7 +199,27 @@ def parse_sampling_args(line, parser):
         help="Kernel backends to test. Default: cuda.",
     )
 
+    parser.add_argument(
+        "--deterministic",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Use deterministic sampling (default: true).",
+    )
+    parser.add_argument(
+        "--with_softmax",
+        action="store_true",
+        help="Include float32 softmax in the timing of a *_sampling_from_probs routine.",
+    )
+
     args = parser.parse_args(line)
+    if args.with_softmax and args.routine not in {
+        "sampling_from_probs",
+        "top_k_sampling_from_probs",
+        "top_p_sampling_from_probs",
+        "top_k_top_p_sampling_from_probs",
+        "min_p_sampling_from_probs",
+    }:
+        parser.error("--with_softmax requires a sampling_from_probs routine")
 
     # Default num_rows to batch_size if not specified
     if args.num_rows is None:
@@ -378,10 +399,14 @@ def testSamplingFromProbs(args):
         print(f"[VVERBOSE] {probs.shape = }")
         print(f"[VVERBOSE] {probs.dtype = }")
 
+    sampling_input = probs.log() if args.with_softmax else probs
+
     def run_backend(backend, probs):
+        if args.with_softmax:
+            probs = torch.softmax(probs, dim=-1)
         if backend == "cuda":
             return flashinfer.sampling.sampling_from_probs(
-                probs, seed=seed, offset=offset
+                probs, deterministic=args.deterministic, seed=seed, offset=offset
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -395,7 +420,7 @@ def testSamplingFromProbs(args):
             repeat_iters=args.num_iters,
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
-            input_args=(cur_backend, probs),
+            input_args=(cur_backend, sampling_input),
         )
 
     for backend in backends:
@@ -410,6 +435,9 @@ def testSamplingFromProbs(args):
                 batch_size * vocab_size * 4  # probs read (float32)
                 + batch_size * 4  # samples write (int32)
             )
+            if args.with_softmax:
+                # Softmax reads logits and writes probabilities before sampling.
+                problem_bytes += 2 * batch_size * vocab_size * 4
             tflops = 0  # Memory-bound operation
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
 
@@ -482,7 +510,7 @@ def testSamplingFromLogits(args):
     def run_backend(backend, logits):
         if backend == "cuda":
             return flashinfer.sampling.sampling_from_logits(
-                logits, seed=seed, offset=offset
+                logits, deterministic=args.deterministic, seed=seed, offset=offset
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -581,10 +609,14 @@ def testTopKSamplingFromProbs(args):
         print(f"[VVERBOSE] {probs.dtype = }")
         print(f"[VVERBOSE] {top_k = }")
 
+    sampling_input = probs.log() if args.with_softmax else probs
+
     def run_backend(backend, probs):
+        if args.with_softmax:
+            probs = torch.softmax(probs, dim=-1)
         if backend == "cuda":
             return flashinfer.sampling.top_k_sampling_from_probs(
-                probs, top_k, seed=seed, offset=offset
+                probs, top_k, deterministic=args.deterministic, seed=seed, offset=offset
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -598,7 +630,7 @@ def testTopKSamplingFromProbs(args):
             repeat_iters=args.num_iters,
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
-            input_args=(cur_backend, probs),
+            input_args=(cur_backend, sampling_input),
         )
 
     for backend in backends:
@@ -613,6 +645,9 @@ def testTopKSamplingFromProbs(args):
                 batch_size * vocab_size * 4  # probs read (float32)
                 + batch_size * 4  # samples write (int32)
             )
+            if args.with_softmax:
+                # Softmax reads logits and writes probabilities before sampling.
+                problem_bytes += 2 * batch_size * vocab_size * 4
             tflops = 0  # Memory-bound operation
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
 
@@ -684,10 +719,14 @@ def testTopPSamplingFromProbs(args):
         print(f"[VVERBOSE] {probs.dtype = }")
         print(f"[VVERBOSE] {top_p = }")
 
+    sampling_input = probs.log() if args.with_softmax else probs
+
     def run_backend(backend, probs):
+        if args.with_softmax:
+            probs = torch.softmax(probs, dim=-1)
         if backend == "cuda":
             return flashinfer.sampling.top_p_sampling_from_probs(
-                probs, top_p, seed=seed, offset=offset
+                probs, top_p, deterministic=args.deterministic, seed=seed, offset=offset
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -701,7 +740,7 @@ def testTopPSamplingFromProbs(args):
             repeat_iters=args.num_iters,
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
-            input_args=(cur_backend, probs),
+            input_args=(cur_backend, sampling_input),
         )
 
     for backend in backends:
@@ -716,6 +755,9 @@ def testTopPSamplingFromProbs(args):
                 batch_size * vocab_size * 4  # probs read (float32)
                 + batch_size * 4  # samples write (int32)
             )
+            if args.with_softmax:
+                # Softmax reads logits and writes probabilities before sampling.
+                problem_bytes += 2 * batch_size * vocab_size * 4
             tflops = 0  # Memory-bound operation
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
 
@@ -795,13 +837,18 @@ def testTopKTopPSamplingFromProbs(args):
         print(f"[VVERBOSE] {top_p = }")
         print(f"[VVERBOSE] {filter_apply_order = }")
 
+    sampling_input = probs.log() if args.with_softmax else probs
+
     def run_backend(backend, probs):
+        if args.with_softmax:
+            probs = torch.softmax(probs, dim=-1)
         if backend == "cuda":
             return flashinfer.sampling.top_k_top_p_sampling_from_probs(
                 probs,
                 top_k,
                 top_p,
                 filter_apply_order=filter_apply_order,
+                deterministic=args.deterministic,
                 seed=seed,
                 offset=offset,
                 top_k_max=top_k_max,
@@ -818,7 +865,7 @@ def testTopKTopPSamplingFromProbs(args):
             repeat_iters=args.num_iters,
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
-            input_args=(cur_backend, probs),
+            input_args=(cur_backend, sampling_input),
         )
 
     for backend in backends:
@@ -833,6 +880,9 @@ def testTopKTopPSamplingFromProbs(args):
                 batch_size * vocab_size * 4  # probs read (float32)
                 + batch_size * 4  # samples write (int32)
             )
+            if args.with_softmax:
+                # Softmax reads logits and writes probabilities before sampling.
+                problem_bytes += 2 * batch_size * vocab_size * 4
             tflops = 0  # Memory-bound operation
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
 
@@ -924,6 +974,7 @@ def testTopKTopPSamplingFromLogits(args):
                 top_k,
                 top_p,
                 filter_apply_order=filter_apply_order,
+                deterministic=args.deterministic,
                 seed=seed,
                 offset=offset,
                 top_k_max=top_k_max,
@@ -1030,10 +1081,14 @@ def testMinPSamplingFromProbs(args):
         print(f"[VVERBOSE] {probs.dtype = }")
         print(f"[VVERBOSE] {min_p = }")
 
+    sampling_input = probs.log() if args.with_softmax else probs
+
     def run_backend(backend, probs):
+        if args.with_softmax:
+            probs = torch.softmax(probs, dim=-1)
         if backend == "cuda":
             return flashinfer.sampling.min_p_sampling_from_probs(
-                probs, min_p, seed=seed, offset=offset
+                probs, min_p, deterministic=args.deterministic, seed=seed, offset=offset
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -1047,7 +1102,7 @@ def testMinPSamplingFromProbs(args):
             repeat_iters=args.num_iters,
             enable_cupti=args.use_cupti,
             use_cuda_graph=is_cuda_graph_compatible,
-            input_args=(cur_backend, probs),
+            input_args=(cur_backend, sampling_input),
         )
 
     for backend in backends:
@@ -1062,6 +1117,9 @@ def testMinPSamplingFromProbs(args):
                 batch_size * vocab_size * 4  # probs read (float32)
                 + batch_size * 4  # samples write (int32)
             )
+            if args.with_softmax:
+                # Softmax reads logits and writes probabilities before sampling.
+                problem_bytes += 2 * batch_size * vocab_size * 4
             tflops = 0  # Memory-bound operation
             tb_per_sec = problem_bytes / (10**9 * median_time)  # in TB/sec
 
@@ -1571,7 +1629,12 @@ def testChainSpeculativeSampling(args):
     def run_backend(backend, draft_probs, draft_token_ids, target_probs):
         if backend == "cuda":
             return flashinfer.sampling.chain_speculative_sampling(
-                draft_probs, draft_token_ids, target_probs, seed=seed, offset=offset
+                draft_probs,
+                draft_token_ids,
+                target_probs,
+                deterministic=args.deterministic,
+                seed=seed,
+                offset=offset,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")

@@ -2278,6 +2278,34 @@ def test_chain_speculative_sampling(
         assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
 
 
+@pytest.mark.parametrize("vocab_size", [1024, 4097, 32000])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_chain_speculative_sampling_zero_residual(vocab_size, deterministic):
+    batch_size = 128
+    draft_probs = torch.zeros(batch_size, 1, vocab_size, device="cuda:0")
+    draft_probs[..., -1] = 1
+    target_probs = draft_probs.expand(-1, 2, -1).contiguous()
+    draft_token_ids = torch.zeros((batch_size, 1), dtype=torch.int32, device="cuda:0")
+
+    # Both distributions assign zero mass to the drafted token, forcing rejection
+    # with an empty residual. Exercise it after a successful sampling launch.
+    for _ in range(10):
+        flashinfer.sampling.sampling_from_probs(
+            draft_probs[:, 0], deterministic=deterministic, seed=42, offset=0
+        )
+        output, accepted, emitted = flashinfer.sampling.chain_speculative_sampling(
+            draft_probs,
+            draft_token_ids,
+            target_probs,
+            deterministic=deterministic,
+            seed=42,
+            offset=0,
+        )
+        assert torch.all(output == -1)
+        assert torch.all(accepted == 0)
+        assert torch.all(emitted == 0)
+
+
 @pytest.mark.parametrize(
     "vocab_size", [1023, 1024, 1025, 4095, 4096, 4097, 32000, 32001, 128256, 151937]
 )
