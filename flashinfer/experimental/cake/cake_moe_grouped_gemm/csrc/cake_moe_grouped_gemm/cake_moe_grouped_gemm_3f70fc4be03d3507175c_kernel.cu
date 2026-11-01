@@ -71,7 +71,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_PLAN_S_OFF 197632
 #define SMEM_PLAN_S_STAGE_BYTES 64
 #define SMEM_PLAN_S_STRIDE 64
-#define SMEM_TOTAL 197760
+#define SMEM_OG_A_OFF 197696
+#define SMEM_OG_A_STAGE_BYTES 512
+#define SMEM_OG_A_STRIDE 512
+#define SMEM_TOTAL 198272
 #define BLOCK_M 128
 #define BLOCK_N 256
 #define BLOCK_K 64
@@ -210,6 +213,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     #define epilogue_done_addr (mbar_base + 72)
     #define epi_free0_addr (mbar_base + 80)
     #define plan_ready_addr (mbar_base + 88)
+    #define order_ready_addr (mbar_base + 96)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -229,9 +233,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     const int smem_b1_addr = smem + 33792;
     int* plan_s = reinterpret_cast<int*>(smem_raw + 197632);
     const int plan_s_addr = smem + 197632;
+    int* og_a = reinterpret_cast<int*>(smem_raw + 197696);
+    const int og_a_addr = smem + 197696;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 12 barriers)
-    // Mbarriers at smem_raw[0..96)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 13 barriers)
+    // Mbarriers at smem_raw[0..104)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -256,6 +262,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
             mbarrier_init(smem + 80, 16);
             // plan_ready: 1 barriers, init_count=1
             mbarrier_init(smem + 88, 1);
+            // order_ready: 1 barriers, init_count=32
+            mbarrier_init(smem + 96, 32);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -265,9 +273,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 104);
     if (warp == 0) {
-        int _tmem_hold = smem + 96;
+        int _tmem_hold = smem + 104;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
@@ -328,6 +336,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                 if (tail_splits > 1) {
                     reg_end = tail_base;
                 }
+                mbarrier_wait(order_ready_addr, 0);
                 #pragma unroll 1
                 for (unsigned int t = cluster_u; t < reg_end; t += num_clusters_u) {
                     unsigned int w = t / num_clusters_u;
@@ -363,6 +372,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned int kr_n_block = rem / grid_n_u;
                     n_block = nc_n_block * (1 - rr_n_block) + (rem - kr_n_block * grid_n_u) * rr_n_block;
                     k_block = (rem - nc_n_block * grid_k_u) * (1 - rr_n_block) + kr_n_block * rr_n_block;
+                    if (num_groups <= 128) {
+                        e_u = (unsigned int)og_a[(int)e_u];
+                    }
                     int e_i = (int)e_u;
                     int end_e = offs[e_i];
                     int prev_i = e_i - 1;
@@ -438,6 +450,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         unsigned int kr_n_blockt = remt / grid_n_u;
                         n_blockt = nc_n_blockt * (1 - rr_n_blockt) + (remt - kr_n_blockt * grid_n_u) * rr_n_blockt;
                         k_blockt = (remt - nc_n_blockt * grid_k_u) * (1 - rr_n_blockt) + kr_n_blockt * rr_n_blockt;
+                        if (num_groups <= 128) {
+                            e_ut = (unsigned int)og_a[(int)e_ut];
+                        }
                         int e_it = (int)e_ut;
                         int end_et = offs[e_it];
                         int prev_it = e_it - 1;
@@ -527,6 +542,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         unsigned int kr_n_blockt_1 = remt_1 / grid_n_u;
                         n_blockt_1 = nc_n_blockt_1 * (1 - rr_n_blockt_1) + (remt_1 - kr_n_blockt_1 * grid_n_u) * rr_n_blockt_1;
                         k_blockt_1 = (remt_1 - nc_n_blockt_1 * grid_k_u) * (1 - rr_n_blockt_1) + kr_n_blockt_1 * rr_n_blockt_1;
+                        if (num_groups <= 128) {
+                            e_ut_1 = (unsigned int)og_a[(int)e_ut_1];
+                        }
                         int e_it_1 = (int)e_ut_1;
                         int end_et_1 = offs[e_it_1];
                         int prev_it_1 = e_it_1 - 1;
@@ -616,6 +634,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                 if (tail_splits > 1) {
                     reg_end_m = tail_base_m;
                 }
+                mbarrier_wait(order_ready_addr, 0);
                 #pragma unroll 1
                 for (unsigned int t_m = cluster_m; t_m < reg_end_m; t_m += num_clusters_m) {
                     unsigned int w_m = t_m / num_clusters_m;
@@ -643,6 +662,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         }
                     }
                     unsigned int e_um = ts_m / tiles_per_group_m;
+                    if (num_groups <= 128) {
+                        e_um = (unsigned int)og_a[(int)e_um];
+                    }
                     int e_im = (int)e_um;
                     int end_m = offs[e_im];
                     int prev_m = e_im - 1;
@@ -1172,6 +1194,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         unsigned int j_u_tm = u_tm - s_u_tm * num_tail_tm;
                         unsigned int tt_m = tail_base_m + j_u_tm;
                         unsigned int e_umt = tt_m / tiles_per_group_m;
+                        if (num_groups <= 128) {
+                            e_umt = (unsigned int)og_a[(int)e_umt];
+                        }
                         int e_imt = (int)e_umt;
                         int end_mt = offs[e_imt];
                         int prev_mt = e_imt - 1;
@@ -1619,6 +1644,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         int hh_tm = phm_h;
                         unsigned int tt_m_1 = (unsigned int)phm_t;
                         unsigned int e_umt_1 = tt_m_1 / tiles_per_group_m;
+                        if (num_groups <= 128) {
+                            e_umt_1 = (unsigned int)og_a[(int)e_umt_1];
+                        }
                         int e_imt_1 = (int)e_umt_1;
                         int end_mt_1 = offs[e_imt_1];
                         int prev_mt_1 = e_imt_1 - 1;
@@ -2088,6 +2116,2339 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
             if (tail_splits > 1) {
                 reg_end_e = tail_base_e;
             }
+            if (warp == 2) {
+                if (num_groups <= 128) {
+                    int og_n = num_groups;
+                    int og_m[4];
+                    int og_g[4];
+                    #pragma unroll
+                    for (int ok = 0; ok < 4; ok++) {
+                        og_m[ok] = -1;
+                        og_g[ok] = 0;
+                        int ok_e = lane + 32 * ok;
+                        if (ok_e < og_n) {
+                            og_g[ok] = ok_e;
+                            int ok_lo = 0;
+                            if (ok_e > 0) {
+                                ok_lo = offs[ok_e - 1];
+                            }
+                            og_m[ok] = offs[ok_e] - ok_lo;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_0 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_0 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_0 = 0;
+                        if (bl_pm_0 > og_m[0]) {
+                            bl_pf_0 = 1;
+                        }
+                        if (bl_pm_0 == og_m[0]) {
+                            if (bl_pg_0 < og_g[0]) {
+                                bl_pf_0 = 1;
+                            }
+                        }
+                        int bl_i_0 = lane;
+                        int bl_want_0 = 0;
+                        if (lane % 2 == (bl_i_0 >> 1) % 2) {
+                            bl_want_0 = 1;
+                        }
+                        if (bl_pf_0 == bl_want_0) {
+                            og_m[0] = bl_pm_0;
+                            og_g[0] = bl_pg_0;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_1 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_1 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_1 = 0;
+                        if (bl_pm_1 > og_m[1]) {
+                            bl_pf_1 = 1;
+                        }
+                        if (bl_pm_1 == og_m[1]) {
+                            if (bl_pg_1 < og_g[1]) {
+                                bl_pf_1 = 1;
+                            }
+                        }
+                        int bl_i_1 = lane + 32;
+                        int bl_want_1 = 0;
+                        if (lane % 2 == (bl_i_1 >> 1) % 2) {
+                            bl_want_1 = 1;
+                        }
+                        if (bl_pf_1 == bl_want_1) {
+                            og_m[1] = bl_pm_1;
+                            og_g[1] = bl_pg_1;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_2 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_2 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_2 = 0;
+                        if (bl_pm_2 > og_m[2]) {
+                            bl_pf_2 = 1;
+                        }
+                        if (bl_pm_2 == og_m[2]) {
+                            if (bl_pg_2 < og_g[2]) {
+                                bl_pf_2 = 1;
+                            }
+                        }
+                        int bl_i_2 = lane + 64;
+                        int bl_want_2 = 0;
+                        if (lane % 2 == (bl_i_2 >> 1) % 2) {
+                            bl_want_2 = 1;
+                        }
+                        if (bl_pf_2 == bl_want_2) {
+                            og_m[2] = bl_pm_2;
+                            og_g[2] = bl_pg_2;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_3 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_3 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_3 = 0;
+                        if (bl_pm_3 > og_m[3]) {
+                            bl_pf_3 = 1;
+                        }
+                        if (bl_pm_3 == og_m[3]) {
+                            if (bl_pg_3 < og_g[3]) {
+                                bl_pf_3 = 1;
+                            }
+                        }
+                        int bl_i_3 = lane + 96;
+                        int bl_want_3 = 0;
+                        if (lane % 2 == (bl_i_3 >> 1) % 2) {
+                            bl_want_3 = 1;
+                        }
+                        if (bl_pf_3 == bl_want_3) {
+                            og_m[3] = bl_pm_3;
+                            og_g[3] = bl_pg_3;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_4 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_4 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_4 = 0;
+                        if (bl_pm_4 > og_m[0]) {
+                            bl_pf_4 = 1;
+                        }
+                        if (bl_pm_4 == og_m[0]) {
+                            if (bl_pg_4 < og_g[0]) {
+                                bl_pf_4 = 1;
+                            }
+                        }
+                        int bl_i_4 = lane;
+                        int bl_want_4 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_4 >> 2) % 2) {
+                            bl_want_4 = 1;
+                        }
+                        if (bl_pf_4 == bl_want_4) {
+                            og_m[0] = bl_pm_4;
+                            og_g[0] = bl_pg_4;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_5 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_5 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_5 = 0;
+                        if (bl_pm_5 > og_m[1]) {
+                            bl_pf_5 = 1;
+                        }
+                        if (bl_pm_5 == og_m[1]) {
+                            if (bl_pg_5 < og_g[1]) {
+                                bl_pf_5 = 1;
+                            }
+                        }
+                        int bl_i_5 = lane + 32;
+                        int bl_want_5 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_5 >> 2) % 2) {
+                            bl_want_5 = 1;
+                        }
+                        if (bl_pf_5 == bl_want_5) {
+                            og_m[1] = bl_pm_5;
+                            og_g[1] = bl_pg_5;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_6 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_6 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_6 = 0;
+                        if (bl_pm_6 > og_m[2]) {
+                            bl_pf_6 = 1;
+                        }
+                        if (bl_pm_6 == og_m[2]) {
+                            if (bl_pg_6 < og_g[2]) {
+                                bl_pf_6 = 1;
+                            }
+                        }
+                        int bl_i_6 = lane + 64;
+                        int bl_want_6 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_6 >> 2) % 2) {
+                            bl_want_6 = 1;
+                        }
+                        if (bl_pf_6 == bl_want_6) {
+                            og_m[2] = bl_pm_6;
+                            og_g[2] = bl_pg_6;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_7 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_7 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_7 = 0;
+                        if (bl_pm_7 > og_m[3]) {
+                            bl_pf_7 = 1;
+                        }
+                        if (bl_pm_7 == og_m[3]) {
+                            if (bl_pg_7 < og_g[3]) {
+                                bl_pf_7 = 1;
+                            }
+                        }
+                        int bl_i_7 = lane + 96;
+                        int bl_want_7 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_7 >> 2) % 2) {
+                            bl_want_7 = 1;
+                        }
+                        if (bl_pf_7 == bl_want_7) {
+                            og_m[3] = bl_pm_7;
+                            og_g[3] = bl_pg_7;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_8 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_8 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_8 = 0;
+                        if (bl_pm_8 > og_m[0]) {
+                            bl_pf_8 = 1;
+                        }
+                        if (bl_pm_8 == og_m[0]) {
+                            if (bl_pg_8 < og_g[0]) {
+                                bl_pf_8 = 1;
+                            }
+                        }
+                        int bl_i_8 = lane;
+                        int bl_want_8 = 0;
+                        if (lane % 2 == (bl_i_8 >> 2) % 2) {
+                            bl_want_8 = 1;
+                        }
+                        if (bl_pf_8 == bl_want_8) {
+                            og_m[0] = bl_pm_8;
+                            og_g[0] = bl_pg_8;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_9 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_9 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_9 = 0;
+                        if (bl_pm_9 > og_m[1]) {
+                            bl_pf_9 = 1;
+                        }
+                        if (bl_pm_9 == og_m[1]) {
+                            if (bl_pg_9 < og_g[1]) {
+                                bl_pf_9 = 1;
+                            }
+                        }
+                        int bl_i_9 = lane + 32;
+                        int bl_want_9 = 0;
+                        if (lane % 2 == (bl_i_9 >> 2) % 2) {
+                            bl_want_9 = 1;
+                        }
+                        if (bl_pf_9 == bl_want_9) {
+                            og_m[1] = bl_pm_9;
+                            og_g[1] = bl_pg_9;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_10 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_10 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_10 = 0;
+                        if (bl_pm_10 > og_m[2]) {
+                            bl_pf_10 = 1;
+                        }
+                        if (bl_pm_10 == og_m[2]) {
+                            if (bl_pg_10 < og_g[2]) {
+                                bl_pf_10 = 1;
+                            }
+                        }
+                        int bl_i_10 = lane + 64;
+                        int bl_want_10 = 0;
+                        if (lane % 2 == (bl_i_10 >> 2) % 2) {
+                            bl_want_10 = 1;
+                        }
+                        if (bl_pf_10 == bl_want_10) {
+                            og_m[2] = bl_pm_10;
+                            og_g[2] = bl_pg_10;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_11 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_11 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_11 = 0;
+                        if (bl_pm_11 > og_m[3]) {
+                            bl_pf_11 = 1;
+                        }
+                        if (bl_pm_11 == og_m[3]) {
+                            if (bl_pg_11 < og_g[3]) {
+                                bl_pf_11 = 1;
+                            }
+                        }
+                        int bl_i_11 = lane + 96;
+                        int bl_want_11 = 0;
+                        if (lane % 2 == (bl_i_11 >> 2) % 2) {
+                            bl_want_11 = 1;
+                        }
+                        if (bl_pf_11 == bl_want_11) {
+                            og_m[3] = bl_pm_11;
+                            og_g[3] = bl_pg_11;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_12 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 4);
+                        int bl_pg_12 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 4);
+                        int bl_pf_12 = 0;
+                        if (bl_pm_12 > og_m[0]) {
+                            bl_pf_12 = 1;
+                        }
+                        if (bl_pm_12 == og_m[0]) {
+                            if (bl_pg_12 < og_g[0]) {
+                                bl_pf_12 = 1;
+                            }
+                        }
+                        int bl_i_12 = lane;
+                        int bl_want_12 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_12 >> 3) % 2) {
+                            bl_want_12 = 1;
+                        }
+                        if (bl_pf_12 == bl_want_12) {
+                            og_m[0] = bl_pm_12;
+                            og_g[0] = bl_pg_12;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_13 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 4);
+                        int bl_pg_13 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 4);
+                        int bl_pf_13 = 0;
+                        if (bl_pm_13 > og_m[1]) {
+                            bl_pf_13 = 1;
+                        }
+                        if (bl_pm_13 == og_m[1]) {
+                            if (bl_pg_13 < og_g[1]) {
+                                bl_pf_13 = 1;
+                            }
+                        }
+                        int bl_i_13 = lane + 32;
+                        int bl_want_13 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_13 >> 3) % 2) {
+                            bl_want_13 = 1;
+                        }
+                        if (bl_pf_13 == bl_want_13) {
+                            og_m[1] = bl_pm_13;
+                            og_g[1] = bl_pg_13;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_14 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 4);
+                        int bl_pg_14 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 4);
+                        int bl_pf_14 = 0;
+                        if (bl_pm_14 > og_m[2]) {
+                            bl_pf_14 = 1;
+                        }
+                        if (bl_pm_14 == og_m[2]) {
+                            if (bl_pg_14 < og_g[2]) {
+                                bl_pf_14 = 1;
+                            }
+                        }
+                        int bl_i_14 = lane + 64;
+                        int bl_want_14 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_14 >> 3) % 2) {
+                            bl_want_14 = 1;
+                        }
+                        if (bl_pf_14 == bl_want_14) {
+                            og_m[2] = bl_pm_14;
+                            og_g[2] = bl_pg_14;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_15 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 4);
+                        int bl_pg_15 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 4);
+                        int bl_pf_15 = 0;
+                        if (bl_pm_15 > og_m[3]) {
+                            bl_pf_15 = 1;
+                        }
+                        if (bl_pm_15 == og_m[3]) {
+                            if (bl_pg_15 < og_g[3]) {
+                                bl_pf_15 = 1;
+                            }
+                        }
+                        int bl_i_15 = lane + 96;
+                        int bl_want_15 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_15 >> 3) % 2) {
+                            bl_want_15 = 1;
+                        }
+                        if (bl_pf_15 == bl_want_15) {
+                            og_m[3] = bl_pm_15;
+                            og_g[3] = bl_pg_15;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_16 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_16 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_16 = 0;
+                        if (bl_pm_16 > og_m[0]) {
+                            bl_pf_16 = 1;
+                        }
+                        if (bl_pm_16 == og_m[0]) {
+                            if (bl_pg_16 < og_g[0]) {
+                                bl_pf_16 = 1;
+                            }
+                        }
+                        int bl_i_16 = lane;
+                        int bl_want_16 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_16 >> 3) % 2) {
+                            bl_want_16 = 1;
+                        }
+                        if (bl_pf_16 == bl_want_16) {
+                            og_m[0] = bl_pm_16;
+                            og_g[0] = bl_pg_16;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_17 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_17 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_17 = 0;
+                        if (bl_pm_17 > og_m[1]) {
+                            bl_pf_17 = 1;
+                        }
+                        if (bl_pm_17 == og_m[1]) {
+                            if (bl_pg_17 < og_g[1]) {
+                                bl_pf_17 = 1;
+                            }
+                        }
+                        int bl_i_17 = lane + 32;
+                        int bl_want_17 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_17 >> 3) % 2) {
+                            bl_want_17 = 1;
+                        }
+                        if (bl_pf_17 == bl_want_17) {
+                            og_m[1] = bl_pm_17;
+                            og_g[1] = bl_pg_17;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_18 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_18 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_18 = 0;
+                        if (bl_pm_18 > og_m[2]) {
+                            bl_pf_18 = 1;
+                        }
+                        if (bl_pm_18 == og_m[2]) {
+                            if (bl_pg_18 < og_g[2]) {
+                                bl_pf_18 = 1;
+                            }
+                        }
+                        int bl_i_18 = lane + 64;
+                        int bl_want_18 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_18 >> 3) % 2) {
+                            bl_want_18 = 1;
+                        }
+                        if (bl_pf_18 == bl_want_18) {
+                            og_m[2] = bl_pm_18;
+                            og_g[2] = bl_pg_18;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_19 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_19 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_19 = 0;
+                        if (bl_pm_19 > og_m[3]) {
+                            bl_pf_19 = 1;
+                        }
+                        if (bl_pm_19 == og_m[3]) {
+                            if (bl_pg_19 < og_g[3]) {
+                                bl_pf_19 = 1;
+                            }
+                        }
+                        int bl_i_19 = lane + 96;
+                        int bl_want_19 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_19 >> 3) % 2) {
+                            bl_want_19 = 1;
+                        }
+                        if (bl_pf_19 == bl_want_19) {
+                            og_m[3] = bl_pm_19;
+                            og_g[3] = bl_pg_19;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_20 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_20 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_20 = 0;
+                        if (bl_pm_20 > og_m[0]) {
+                            bl_pf_20 = 1;
+                        }
+                        if (bl_pm_20 == og_m[0]) {
+                            if (bl_pg_20 < og_g[0]) {
+                                bl_pf_20 = 1;
+                            }
+                        }
+                        int bl_i_20 = lane;
+                        int bl_want_20 = 0;
+                        if (lane % 2 == (bl_i_20 >> 3) % 2) {
+                            bl_want_20 = 1;
+                        }
+                        if (bl_pf_20 == bl_want_20) {
+                            og_m[0] = bl_pm_20;
+                            og_g[0] = bl_pg_20;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_21 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_21 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_21 = 0;
+                        if (bl_pm_21 > og_m[1]) {
+                            bl_pf_21 = 1;
+                        }
+                        if (bl_pm_21 == og_m[1]) {
+                            if (bl_pg_21 < og_g[1]) {
+                                bl_pf_21 = 1;
+                            }
+                        }
+                        int bl_i_21 = lane + 32;
+                        int bl_want_21 = 0;
+                        if (lane % 2 == (bl_i_21 >> 3) % 2) {
+                            bl_want_21 = 1;
+                        }
+                        if (bl_pf_21 == bl_want_21) {
+                            og_m[1] = bl_pm_21;
+                            og_g[1] = bl_pg_21;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_22 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_22 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_22 = 0;
+                        if (bl_pm_22 > og_m[2]) {
+                            bl_pf_22 = 1;
+                        }
+                        if (bl_pm_22 == og_m[2]) {
+                            if (bl_pg_22 < og_g[2]) {
+                                bl_pf_22 = 1;
+                            }
+                        }
+                        int bl_i_22 = lane + 64;
+                        int bl_want_22 = 0;
+                        if (lane % 2 == (bl_i_22 >> 3) % 2) {
+                            bl_want_22 = 1;
+                        }
+                        if (bl_pf_22 == bl_want_22) {
+                            og_m[2] = bl_pm_22;
+                            og_g[2] = bl_pg_22;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_23 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_23 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_23 = 0;
+                        if (bl_pm_23 > og_m[3]) {
+                            bl_pf_23 = 1;
+                        }
+                        if (bl_pm_23 == og_m[3]) {
+                            if (bl_pg_23 < og_g[3]) {
+                                bl_pf_23 = 1;
+                            }
+                        }
+                        int bl_i_23 = lane + 96;
+                        int bl_want_23 = 0;
+                        if (lane % 2 == (bl_i_23 >> 3) % 2) {
+                            bl_want_23 = 1;
+                        }
+                        if (bl_pf_23 == bl_want_23) {
+                            og_m[3] = bl_pm_23;
+                            og_g[3] = bl_pg_23;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_24 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 8);
+                        int bl_pg_24 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 8);
+                        int bl_pf_24 = 0;
+                        if (bl_pm_24 > og_m[0]) {
+                            bl_pf_24 = 1;
+                        }
+                        if (bl_pm_24 == og_m[0]) {
+                            if (bl_pg_24 < og_g[0]) {
+                                bl_pf_24 = 1;
+                            }
+                        }
+                        int bl_i_24 = lane;
+                        int bl_want_24 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_24 >> 4) % 2) {
+                            bl_want_24 = 1;
+                        }
+                        if (bl_pf_24 == bl_want_24) {
+                            og_m[0] = bl_pm_24;
+                            og_g[0] = bl_pg_24;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_25 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 8);
+                        int bl_pg_25 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 8);
+                        int bl_pf_25 = 0;
+                        if (bl_pm_25 > og_m[1]) {
+                            bl_pf_25 = 1;
+                        }
+                        if (bl_pm_25 == og_m[1]) {
+                            if (bl_pg_25 < og_g[1]) {
+                                bl_pf_25 = 1;
+                            }
+                        }
+                        int bl_i_25 = lane + 32;
+                        int bl_want_25 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_25 >> 4) % 2) {
+                            bl_want_25 = 1;
+                        }
+                        if (bl_pf_25 == bl_want_25) {
+                            og_m[1] = bl_pm_25;
+                            og_g[1] = bl_pg_25;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_26 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 8);
+                        int bl_pg_26 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 8);
+                        int bl_pf_26 = 0;
+                        if (bl_pm_26 > og_m[2]) {
+                            bl_pf_26 = 1;
+                        }
+                        if (bl_pm_26 == og_m[2]) {
+                            if (bl_pg_26 < og_g[2]) {
+                                bl_pf_26 = 1;
+                            }
+                        }
+                        int bl_i_26 = lane + 64;
+                        int bl_want_26 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_26 >> 4) % 2) {
+                            bl_want_26 = 1;
+                        }
+                        if (bl_pf_26 == bl_want_26) {
+                            og_m[2] = bl_pm_26;
+                            og_g[2] = bl_pg_26;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_27 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 8);
+                        int bl_pg_27 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 8);
+                        int bl_pf_27 = 0;
+                        if (bl_pm_27 > og_m[3]) {
+                            bl_pf_27 = 1;
+                        }
+                        if (bl_pm_27 == og_m[3]) {
+                            if (bl_pg_27 < og_g[3]) {
+                                bl_pf_27 = 1;
+                            }
+                        }
+                        int bl_i_27 = lane + 96;
+                        int bl_want_27 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_27 >> 4) % 2) {
+                            bl_want_27 = 1;
+                        }
+                        if (bl_pf_27 == bl_want_27) {
+                            og_m[3] = bl_pm_27;
+                            og_g[3] = bl_pg_27;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_28 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 4);
+                        int bl_pg_28 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 4);
+                        int bl_pf_28 = 0;
+                        if (bl_pm_28 > og_m[0]) {
+                            bl_pf_28 = 1;
+                        }
+                        if (bl_pm_28 == og_m[0]) {
+                            if (bl_pg_28 < og_g[0]) {
+                                bl_pf_28 = 1;
+                            }
+                        }
+                        int bl_i_28 = lane;
+                        int bl_want_28 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_28 >> 4) % 2) {
+                            bl_want_28 = 1;
+                        }
+                        if (bl_pf_28 == bl_want_28) {
+                            og_m[0] = bl_pm_28;
+                            og_g[0] = bl_pg_28;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_29 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 4);
+                        int bl_pg_29 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 4);
+                        int bl_pf_29 = 0;
+                        if (bl_pm_29 > og_m[1]) {
+                            bl_pf_29 = 1;
+                        }
+                        if (bl_pm_29 == og_m[1]) {
+                            if (bl_pg_29 < og_g[1]) {
+                                bl_pf_29 = 1;
+                            }
+                        }
+                        int bl_i_29 = lane + 32;
+                        int bl_want_29 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_29 >> 4) % 2) {
+                            bl_want_29 = 1;
+                        }
+                        if (bl_pf_29 == bl_want_29) {
+                            og_m[1] = bl_pm_29;
+                            og_g[1] = bl_pg_29;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_30 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 4);
+                        int bl_pg_30 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 4);
+                        int bl_pf_30 = 0;
+                        if (bl_pm_30 > og_m[2]) {
+                            bl_pf_30 = 1;
+                        }
+                        if (bl_pm_30 == og_m[2]) {
+                            if (bl_pg_30 < og_g[2]) {
+                                bl_pf_30 = 1;
+                            }
+                        }
+                        int bl_i_30 = lane + 64;
+                        int bl_want_30 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_30 >> 4) % 2) {
+                            bl_want_30 = 1;
+                        }
+                        if (bl_pf_30 == bl_want_30) {
+                            og_m[2] = bl_pm_30;
+                            og_g[2] = bl_pg_30;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_31 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 4);
+                        int bl_pg_31 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 4);
+                        int bl_pf_31 = 0;
+                        if (bl_pm_31 > og_m[3]) {
+                            bl_pf_31 = 1;
+                        }
+                        if (bl_pm_31 == og_m[3]) {
+                            if (bl_pg_31 < og_g[3]) {
+                                bl_pf_31 = 1;
+                            }
+                        }
+                        int bl_i_31 = lane + 96;
+                        int bl_want_31 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_31 >> 4) % 2) {
+                            bl_want_31 = 1;
+                        }
+                        if (bl_pf_31 == bl_want_31) {
+                            og_m[3] = bl_pm_31;
+                            og_g[3] = bl_pg_31;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_32 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_32 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_32 = 0;
+                        if (bl_pm_32 > og_m[0]) {
+                            bl_pf_32 = 1;
+                        }
+                        if (bl_pm_32 == og_m[0]) {
+                            if (bl_pg_32 < og_g[0]) {
+                                bl_pf_32 = 1;
+                            }
+                        }
+                        int bl_i_32 = lane;
+                        int bl_want_32 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_32 >> 4) % 2) {
+                            bl_want_32 = 1;
+                        }
+                        if (bl_pf_32 == bl_want_32) {
+                            og_m[0] = bl_pm_32;
+                            og_g[0] = bl_pg_32;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_33 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_33 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_33 = 0;
+                        if (bl_pm_33 > og_m[1]) {
+                            bl_pf_33 = 1;
+                        }
+                        if (bl_pm_33 == og_m[1]) {
+                            if (bl_pg_33 < og_g[1]) {
+                                bl_pf_33 = 1;
+                            }
+                        }
+                        int bl_i_33 = lane + 32;
+                        int bl_want_33 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_33 >> 4) % 2) {
+                            bl_want_33 = 1;
+                        }
+                        if (bl_pf_33 == bl_want_33) {
+                            og_m[1] = bl_pm_33;
+                            og_g[1] = bl_pg_33;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_34 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_34 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_34 = 0;
+                        if (bl_pm_34 > og_m[2]) {
+                            bl_pf_34 = 1;
+                        }
+                        if (bl_pm_34 == og_m[2]) {
+                            if (bl_pg_34 < og_g[2]) {
+                                bl_pf_34 = 1;
+                            }
+                        }
+                        int bl_i_34 = lane + 64;
+                        int bl_want_34 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_34 >> 4) % 2) {
+                            bl_want_34 = 1;
+                        }
+                        if (bl_pf_34 == bl_want_34) {
+                            og_m[2] = bl_pm_34;
+                            og_g[2] = bl_pg_34;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_35 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_35 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_35 = 0;
+                        if (bl_pm_35 > og_m[3]) {
+                            bl_pf_35 = 1;
+                        }
+                        if (bl_pm_35 == og_m[3]) {
+                            if (bl_pg_35 < og_g[3]) {
+                                bl_pf_35 = 1;
+                            }
+                        }
+                        int bl_i_35 = lane + 96;
+                        int bl_want_35 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_35 >> 4) % 2) {
+                            bl_want_35 = 1;
+                        }
+                        if (bl_pf_35 == bl_want_35) {
+                            og_m[3] = bl_pm_35;
+                            og_g[3] = bl_pg_35;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_36 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_36 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_36 = 0;
+                        if (bl_pm_36 > og_m[0]) {
+                            bl_pf_36 = 1;
+                        }
+                        if (bl_pm_36 == og_m[0]) {
+                            if (bl_pg_36 < og_g[0]) {
+                                bl_pf_36 = 1;
+                            }
+                        }
+                        int bl_i_36 = lane;
+                        int bl_want_36 = 0;
+                        if (lane % 2 == (bl_i_36 >> 4) % 2) {
+                            bl_want_36 = 1;
+                        }
+                        if (bl_pf_36 == bl_want_36) {
+                            og_m[0] = bl_pm_36;
+                            og_g[0] = bl_pg_36;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_37 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_37 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_37 = 0;
+                        if (bl_pm_37 > og_m[1]) {
+                            bl_pf_37 = 1;
+                        }
+                        if (bl_pm_37 == og_m[1]) {
+                            if (bl_pg_37 < og_g[1]) {
+                                bl_pf_37 = 1;
+                            }
+                        }
+                        int bl_i_37 = lane + 32;
+                        int bl_want_37 = 0;
+                        if (lane % 2 == (bl_i_37 >> 4) % 2) {
+                            bl_want_37 = 1;
+                        }
+                        if (bl_pf_37 == bl_want_37) {
+                            og_m[1] = bl_pm_37;
+                            og_g[1] = bl_pg_37;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_38 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_38 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_38 = 0;
+                        if (bl_pm_38 > og_m[2]) {
+                            bl_pf_38 = 1;
+                        }
+                        if (bl_pm_38 == og_m[2]) {
+                            if (bl_pg_38 < og_g[2]) {
+                                bl_pf_38 = 1;
+                            }
+                        }
+                        int bl_i_38 = lane + 64;
+                        int bl_want_38 = 0;
+                        if (lane % 2 == (bl_i_38 >> 4) % 2) {
+                            bl_want_38 = 1;
+                        }
+                        if (bl_pf_38 == bl_want_38) {
+                            og_m[2] = bl_pm_38;
+                            og_g[2] = bl_pg_38;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_39 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_39 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_39 = 0;
+                        if (bl_pm_39 > og_m[3]) {
+                            bl_pf_39 = 1;
+                        }
+                        if (bl_pm_39 == og_m[3]) {
+                            if (bl_pg_39 < og_g[3]) {
+                                bl_pf_39 = 1;
+                            }
+                        }
+                        int bl_i_39 = lane + 96;
+                        int bl_want_39 = 0;
+                        if (lane % 2 == (bl_i_39 >> 4) % 2) {
+                            bl_want_39 = 1;
+                        }
+                        if (bl_pf_39 == bl_want_39) {
+                            og_m[3] = bl_pm_39;
+                            og_g[3] = bl_pg_39;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_40 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 16);
+                        int bl_pg_40 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 16);
+                        int bl_pf_40 = 0;
+                        if (bl_pm_40 > og_m[0]) {
+                            bl_pf_40 = 1;
+                        }
+                        if (bl_pm_40 == og_m[0]) {
+                            if (bl_pg_40 < og_g[0]) {
+                                bl_pf_40 = 1;
+                            }
+                        }
+                        int bl_i_40 = lane;
+                        int bl_want_40 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_40 >> 5) % 2) {
+                            bl_want_40 = 1;
+                        }
+                        if (bl_pf_40 == bl_want_40) {
+                            og_m[0] = bl_pm_40;
+                            og_g[0] = bl_pg_40;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_41 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 16);
+                        int bl_pg_41 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 16);
+                        int bl_pf_41 = 0;
+                        if (bl_pm_41 > og_m[1]) {
+                            bl_pf_41 = 1;
+                        }
+                        if (bl_pm_41 == og_m[1]) {
+                            if (bl_pg_41 < og_g[1]) {
+                                bl_pf_41 = 1;
+                            }
+                        }
+                        int bl_i_41 = lane + 32;
+                        int bl_want_41 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_41 >> 5) % 2) {
+                            bl_want_41 = 1;
+                        }
+                        if (bl_pf_41 == bl_want_41) {
+                            og_m[1] = bl_pm_41;
+                            og_g[1] = bl_pg_41;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_42 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 16);
+                        int bl_pg_42 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 16);
+                        int bl_pf_42 = 0;
+                        if (bl_pm_42 > og_m[2]) {
+                            bl_pf_42 = 1;
+                        }
+                        if (bl_pm_42 == og_m[2]) {
+                            if (bl_pg_42 < og_g[2]) {
+                                bl_pf_42 = 1;
+                            }
+                        }
+                        int bl_i_42 = lane + 64;
+                        int bl_want_42 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_42 >> 5) % 2) {
+                            bl_want_42 = 1;
+                        }
+                        if (bl_pf_42 == bl_want_42) {
+                            og_m[2] = bl_pm_42;
+                            og_g[2] = bl_pg_42;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_43 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 16);
+                        int bl_pg_43 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 16);
+                        int bl_pf_43 = 0;
+                        if (bl_pm_43 > og_m[3]) {
+                            bl_pf_43 = 1;
+                        }
+                        if (bl_pm_43 == og_m[3]) {
+                            if (bl_pg_43 < og_g[3]) {
+                                bl_pf_43 = 1;
+                            }
+                        }
+                        int bl_i_43 = lane + 96;
+                        int bl_want_43 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_43 >> 5) % 2) {
+                            bl_want_43 = 1;
+                        }
+                        if (bl_pf_43 == bl_want_43) {
+                            og_m[3] = bl_pm_43;
+                            og_g[3] = bl_pg_43;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_44 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 8);
+                        int bl_pg_44 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 8);
+                        int bl_pf_44 = 0;
+                        if (bl_pm_44 > og_m[0]) {
+                            bl_pf_44 = 1;
+                        }
+                        if (bl_pm_44 == og_m[0]) {
+                            if (bl_pg_44 < og_g[0]) {
+                                bl_pf_44 = 1;
+                            }
+                        }
+                        int bl_i_44 = lane;
+                        int bl_want_44 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_44 >> 5) % 2) {
+                            bl_want_44 = 1;
+                        }
+                        if (bl_pf_44 == bl_want_44) {
+                            og_m[0] = bl_pm_44;
+                            og_g[0] = bl_pg_44;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_45 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 8);
+                        int bl_pg_45 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 8);
+                        int bl_pf_45 = 0;
+                        if (bl_pm_45 > og_m[1]) {
+                            bl_pf_45 = 1;
+                        }
+                        if (bl_pm_45 == og_m[1]) {
+                            if (bl_pg_45 < og_g[1]) {
+                                bl_pf_45 = 1;
+                            }
+                        }
+                        int bl_i_45 = lane + 32;
+                        int bl_want_45 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_45 >> 5) % 2) {
+                            bl_want_45 = 1;
+                        }
+                        if (bl_pf_45 == bl_want_45) {
+                            og_m[1] = bl_pm_45;
+                            og_g[1] = bl_pg_45;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_46 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 8);
+                        int bl_pg_46 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 8);
+                        int bl_pf_46 = 0;
+                        if (bl_pm_46 > og_m[2]) {
+                            bl_pf_46 = 1;
+                        }
+                        if (bl_pm_46 == og_m[2]) {
+                            if (bl_pg_46 < og_g[2]) {
+                                bl_pf_46 = 1;
+                            }
+                        }
+                        int bl_i_46 = lane + 64;
+                        int bl_want_46 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_46 >> 5) % 2) {
+                            bl_want_46 = 1;
+                        }
+                        if (bl_pf_46 == bl_want_46) {
+                            og_m[2] = bl_pm_46;
+                            og_g[2] = bl_pg_46;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_47 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 8);
+                        int bl_pg_47 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 8);
+                        int bl_pf_47 = 0;
+                        if (bl_pm_47 > og_m[3]) {
+                            bl_pf_47 = 1;
+                        }
+                        if (bl_pm_47 == og_m[3]) {
+                            if (bl_pg_47 < og_g[3]) {
+                                bl_pf_47 = 1;
+                            }
+                        }
+                        int bl_i_47 = lane + 96;
+                        int bl_want_47 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_47 >> 5) % 2) {
+                            bl_want_47 = 1;
+                        }
+                        if (bl_pf_47 == bl_want_47) {
+                            og_m[3] = bl_pm_47;
+                            og_g[3] = bl_pg_47;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_48 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 4);
+                        int bl_pg_48 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 4);
+                        int bl_pf_48 = 0;
+                        if (bl_pm_48 > og_m[0]) {
+                            bl_pf_48 = 1;
+                        }
+                        if (bl_pm_48 == og_m[0]) {
+                            if (bl_pg_48 < og_g[0]) {
+                                bl_pf_48 = 1;
+                            }
+                        }
+                        int bl_i_48 = lane;
+                        int bl_want_48 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_48 >> 5) % 2) {
+                            bl_want_48 = 1;
+                        }
+                        if (bl_pf_48 == bl_want_48) {
+                            og_m[0] = bl_pm_48;
+                            og_g[0] = bl_pg_48;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_49 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 4);
+                        int bl_pg_49 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 4);
+                        int bl_pf_49 = 0;
+                        if (bl_pm_49 > og_m[1]) {
+                            bl_pf_49 = 1;
+                        }
+                        if (bl_pm_49 == og_m[1]) {
+                            if (bl_pg_49 < og_g[1]) {
+                                bl_pf_49 = 1;
+                            }
+                        }
+                        int bl_i_49 = lane + 32;
+                        int bl_want_49 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_49 >> 5) % 2) {
+                            bl_want_49 = 1;
+                        }
+                        if (bl_pf_49 == bl_want_49) {
+                            og_m[1] = bl_pm_49;
+                            og_g[1] = bl_pg_49;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_50 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 4);
+                        int bl_pg_50 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 4);
+                        int bl_pf_50 = 0;
+                        if (bl_pm_50 > og_m[2]) {
+                            bl_pf_50 = 1;
+                        }
+                        if (bl_pm_50 == og_m[2]) {
+                            if (bl_pg_50 < og_g[2]) {
+                                bl_pf_50 = 1;
+                            }
+                        }
+                        int bl_i_50 = lane + 64;
+                        int bl_want_50 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_50 >> 5) % 2) {
+                            bl_want_50 = 1;
+                        }
+                        if (bl_pf_50 == bl_want_50) {
+                            og_m[2] = bl_pm_50;
+                            og_g[2] = bl_pg_50;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_51 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 4);
+                        int bl_pg_51 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 4);
+                        int bl_pf_51 = 0;
+                        if (bl_pm_51 > og_m[3]) {
+                            bl_pf_51 = 1;
+                        }
+                        if (bl_pm_51 == og_m[3]) {
+                            if (bl_pg_51 < og_g[3]) {
+                                bl_pf_51 = 1;
+                            }
+                        }
+                        int bl_i_51 = lane + 96;
+                        int bl_want_51 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_51 >> 5) % 2) {
+                            bl_want_51 = 1;
+                        }
+                        if (bl_pf_51 == bl_want_51) {
+                            og_m[3] = bl_pm_51;
+                            og_g[3] = bl_pg_51;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_52 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_52 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_52 = 0;
+                        if (bl_pm_52 > og_m[0]) {
+                            bl_pf_52 = 1;
+                        }
+                        if (bl_pm_52 == og_m[0]) {
+                            if (bl_pg_52 < og_g[0]) {
+                                bl_pf_52 = 1;
+                            }
+                        }
+                        int bl_i_52 = lane;
+                        int bl_want_52 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_52 >> 5) % 2) {
+                            bl_want_52 = 1;
+                        }
+                        if (bl_pf_52 == bl_want_52) {
+                            og_m[0] = bl_pm_52;
+                            og_g[0] = bl_pg_52;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_53 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_53 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_53 = 0;
+                        if (bl_pm_53 > og_m[1]) {
+                            bl_pf_53 = 1;
+                        }
+                        if (bl_pm_53 == og_m[1]) {
+                            if (bl_pg_53 < og_g[1]) {
+                                bl_pf_53 = 1;
+                            }
+                        }
+                        int bl_i_53 = lane + 32;
+                        int bl_want_53 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_53 >> 5) % 2) {
+                            bl_want_53 = 1;
+                        }
+                        if (bl_pf_53 == bl_want_53) {
+                            og_m[1] = bl_pm_53;
+                            og_g[1] = bl_pg_53;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_54 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_54 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_54 = 0;
+                        if (bl_pm_54 > og_m[2]) {
+                            bl_pf_54 = 1;
+                        }
+                        if (bl_pm_54 == og_m[2]) {
+                            if (bl_pg_54 < og_g[2]) {
+                                bl_pf_54 = 1;
+                            }
+                        }
+                        int bl_i_54 = lane + 64;
+                        int bl_want_54 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_54 >> 5) % 2) {
+                            bl_want_54 = 1;
+                        }
+                        if (bl_pf_54 == bl_want_54) {
+                            og_m[2] = bl_pm_54;
+                            og_g[2] = bl_pg_54;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_55 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_55 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_55 = 0;
+                        if (bl_pm_55 > og_m[3]) {
+                            bl_pf_55 = 1;
+                        }
+                        if (bl_pm_55 == og_m[3]) {
+                            if (bl_pg_55 < og_g[3]) {
+                                bl_pf_55 = 1;
+                            }
+                        }
+                        int bl_i_55 = lane + 96;
+                        int bl_want_55 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_55 >> 5) % 2) {
+                            bl_want_55 = 1;
+                        }
+                        if (bl_pf_55 == bl_want_55) {
+                            og_m[3] = bl_pm_55;
+                            og_g[3] = bl_pg_55;
+                        }
+                    }
+                    if (og_n > 0) {
+                        int bl_pm_56 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_56 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_56 = 0;
+                        if (bl_pm_56 > og_m[0]) {
+                            bl_pf_56 = 1;
+                        }
+                        if (bl_pm_56 == og_m[0]) {
+                            if (bl_pg_56 < og_g[0]) {
+                                bl_pf_56 = 1;
+                            }
+                        }
+                        int bl_i_56 = lane;
+                        int bl_want_56 = 0;
+                        if (lane % 2 == (bl_i_56 >> 5) % 2) {
+                            bl_want_56 = 1;
+                        }
+                        if (bl_pf_56 == bl_want_56) {
+                            og_m[0] = bl_pm_56;
+                            og_g[0] = bl_pg_56;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_57 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_57 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_57 = 0;
+                        if (bl_pm_57 > og_m[1]) {
+                            bl_pf_57 = 1;
+                        }
+                        if (bl_pm_57 == og_m[1]) {
+                            if (bl_pg_57 < og_g[1]) {
+                                bl_pf_57 = 1;
+                            }
+                        }
+                        int bl_i_57 = lane + 32;
+                        int bl_want_57 = 0;
+                        if (lane % 2 == (bl_i_57 >> 5) % 2) {
+                            bl_want_57 = 1;
+                        }
+                        if (bl_pf_57 == bl_want_57) {
+                            og_m[1] = bl_pm_57;
+                            og_g[1] = bl_pg_57;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_58 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_58 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_58 = 0;
+                        if (bl_pm_58 > og_m[2]) {
+                            bl_pf_58 = 1;
+                        }
+                        if (bl_pm_58 == og_m[2]) {
+                            if (bl_pg_58 < og_g[2]) {
+                                bl_pf_58 = 1;
+                            }
+                        }
+                        int bl_i_58 = lane + 64;
+                        int bl_want_58 = 0;
+                        if (lane % 2 == (bl_i_58 >> 5) % 2) {
+                            bl_want_58 = 1;
+                        }
+                        if (bl_pf_58 == bl_want_58) {
+                            og_m[2] = bl_pm_58;
+                            og_g[2] = bl_pg_58;
+                        }
+                    }
+                    if (og_n > 96) {
+                        int bl_pm_59 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_59 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_59 = 0;
+                        if (bl_pm_59 > og_m[3]) {
+                            bl_pf_59 = 1;
+                        }
+                        if (bl_pm_59 == og_m[3]) {
+                            if (bl_pg_59 < og_g[3]) {
+                                bl_pf_59 = 1;
+                            }
+                        }
+                        int bl_i_59 = lane + 96;
+                        int bl_want_59 = 0;
+                        if (lane % 2 == (bl_i_59 >> 5) % 2) {
+                            bl_want_59 = 1;
+                        }
+                        if (bl_pf_59 == bl_want_59) {
+                            og_m[3] = bl_pm_59;
+                            og_g[3] = bl_pg_59;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bs_first_0 = 0;
+                        if (og_m[1] > og_m[0]) {
+                            bs_first_0 = 1;
+                        }
+                        if (og_m[1] == og_m[0]) {
+                            if (og_g[1] < og_g[0]) {
+                                bs_first_0 = 1;
+                            }
+                        }
+                        int bs_m_0 = og_m[0];
+                        int bs_g_0 = og_g[0];
+                        og_m[0] = ((bs_first_0 == 1) ? og_m[1] : bs_m_0);
+                        og_g[0] = ((bs_first_0 == 1) ? og_g[1] : bs_g_0);
+                        og_m[1] = ((bs_first_0 == 1) ? bs_m_0 : og_m[1]);
+                        og_g[1] = ((bs_first_0 == 1) ? bs_g_0 : og_g[1]);
+                    }
+                    if (og_n > 32) {
+                        int bs_first_1 = 0;
+                        if (og_m[3] > og_m[2]) {
+                            bs_first_1 = 1;
+                        }
+                        if (og_m[3] == og_m[2]) {
+                            if (og_g[3] < og_g[2]) {
+                                bs_first_1 = 1;
+                            }
+                        }
+                        bs_first_1 = 1 - bs_first_1;
+                        int bs_m_1 = og_m[2];
+                        int bs_g_1 = og_g[2];
+                        og_m[2] = ((bs_first_1 == 1) ? og_m[3] : bs_m_1);
+                        og_g[2] = ((bs_first_1 == 1) ? og_g[3] : bs_g_1);
+                        og_m[3] = ((bs_first_1 == 1) ? bs_m_1 : og_m[3]);
+                        og_g[3] = ((bs_first_1 == 1) ? bs_g_1 : og_g[3]);
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_60 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 16);
+                        int bl_pg_60 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 16);
+                        int bl_pf_60 = 0;
+                        if (bl_pm_60 > og_m[0]) {
+                            bl_pf_60 = 1;
+                        }
+                        if (bl_pm_60 == og_m[0]) {
+                            if (bl_pg_60 < og_g[0]) {
+                                bl_pf_60 = 1;
+                            }
+                        }
+                        int bl_i_60 = lane;
+                        int bl_want_60 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_60 >> 6) % 2) {
+                            bl_want_60 = 1;
+                        }
+                        if (bl_pf_60 == bl_want_60) {
+                            og_m[0] = bl_pm_60;
+                            og_g[0] = bl_pg_60;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_61 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 16);
+                        int bl_pg_61 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 16);
+                        int bl_pf_61 = 0;
+                        if (bl_pm_61 > og_m[1]) {
+                            bl_pf_61 = 1;
+                        }
+                        if (bl_pm_61 == og_m[1]) {
+                            if (bl_pg_61 < og_g[1]) {
+                                bl_pf_61 = 1;
+                            }
+                        }
+                        int bl_i_61 = lane + 32;
+                        int bl_want_61 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_61 >> 6) % 2) {
+                            bl_want_61 = 1;
+                        }
+                        if (bl_pf_61 == bl_want_61) {
+                            og_m[1] = bl_pm_61;
+                            og_g[1] = bl_pg_61;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_62 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 16);
+                        int bl_pg_62 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 16);
+                        int bl_pf_62 = 0;
+                        if (bl_pm_62 > og_m[2]) {
+                            bl_pf_62 = 1;
+                        }
+                        if (bl_pm_62 == og_m[2]) {
+                            if (bl_pg_62 < og_g[2]) {
+                                bl_pf_62 = 1;
+                            }
+                        }
+                        int bl_i_62 = lane + 64;
+                        int bl_want_62 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_62 >> 6) % 2) {
+                            bl_want_62 = 1;
+                        }
+                        if (bl_pf_62 == bl_want_62) {
+                            og_m[2] = bl_pm_62;
+                            og_g[2] = bl_pg_62;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_63 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 16);
+                        int bl_pg_63 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 16);
+                        int bl_pf_63 = 0;
+                        if (bl_pm_63 > og_m[3]) {
+                            bl_pf_63 = 1;
+                        }
+                        if (bl_pm_63 == og_m[3]) {
+                            if (bl_pg_63 < og_g[3]) {
+                                bl_pf_63 = 1;
+                            }
+                        }
+                        int bl_i_63 = lane + 96;
+                        int bl_want_63 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_63 >> 6) % 2) {
+                            bl_want_63 = 1;
+                        }
+                        if (bl_pf_63 == bl_want_63) {
+                            og_m[3] = bl_pm_63;
+                            og_g[3] = bl_pg_63;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_64 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 8);
+                        int bl_pg_64 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 8);
+                        int bl_pf_64 = 0;
+                        if (bl_pm_64 > og_m[0]) {
+                            bl_pf_64 = 1;
+                        }
+                        if (bl_pm_64 == og_m[0]) {
+                            if (bl_pg_64 < og_g[0]) {
+                                bl_pf_64 = 1;
+                            }
+                        }
+                        int bl_i_64 = lane;
+                        int bl_want_64 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_64 >> 6) % 2) {
+                            bl_want_64 = 1;
+                        }
+                        if (bl_pf_64 == bl_want_64) {
+                            og_m[0] = bl_pm_64;
+                            og_g[0] = bl_pg_64;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_65 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 8);
+                        int bl_pg_65 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 8);
+                        int bl_pf_65 = 0;
+                        if (bl_pm_65 > og_m[1]) {
+                            bl_pf_65 = 1;
+                        }
+                        if (bl_pm_65 == og_m[1]) {
+                            if (bl_pg_65 < og_g[1]) {
+                                bl_pf_65 = 1;
+                            }
+                        }
+                        int bl_i_65 = lane + 32;
+                        int bl_want_65 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_65 >> 6) % 2) {
+                            bl_want_65 = 1;
+                        }
+                        if (bl_pf_65 == bl_want_65) {
+                            og_m[1] = bl_pm_65;
+                            og_g[1] = bl_pg_65;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_66 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 8);
+                        int bl_pg_66 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 8);
+                        int bl_pf_66 = 0;
+                        if (bl_pm_66 > og_m[2]) {
+                            bl_pf_66 = 1;
+                        }
+                        if (bl_pm_66 == og_m[2]) {
+                            if (bl_pg_66 < og_g[2]) {
+                                bl_pf_66 = 1;
+                            }
+                        }
+                        int bl_i_66 = lane + 64;
+                        int bl_want_66 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_66 >> 6) % 2) {
+                            bl_want_66 = 1;
+                        }
+                        if (bl_pf_66 == bl_want_66) {
+                            og_m[2] = bl_pm_66;
+                            og_g[2] = bl_pg_66;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_67 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 8);
+                        int bl_pg_67 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 8);
+                        int bl_pf_67 = 0;
+                        if (bl_pm_67 > og_m[3]) {
+                            bl_pf_67 = 1;
+                        }
+                        if (bl_pm_67 == og_m[3]) {
+                            if (bl_pg_67 < og_g[3]) {
+                                bl_pf_67 = 1;
+                            }
+                        }
+                        int bl_i_67 = lane + 96;
+                        int bl_want_67 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_67 >> 6) % 2) {
+                            bl_want_67 = 1;
+                        }
+                        if (bl_pf_67 == bl_want_67) {
+                            og_m[3] = bl_pm_67;
+                            og_g[3] = bl_pg_67;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_68 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 4);
+                        int bl_pg_68 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 4);
+                        int bl_pf_68 = 0;
+                        if (bl_pm_68 > og_m[0]) {
+                            bl_pf_68 = 1;
+                        }
+                        if (bl_pm_68 == og_m[0]) {
+                            if (bl_pg_68 < og_g[0]) {
+                                bl_pf_68 = 1;
+                            }
+                        }
+                        int bl_i_68 = lane;
+                        int bl_want_68 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_68 >> 6) % 2) {
+                            bl_want_68 = 1;
+                        }
+                        if (bl_pf_68 == bl_want_68) {
+                            og_m[0] = bl_pm_68;
+                            og_g[0] = bl_pg_68;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_69 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 4);
+                        int bl_pg_69 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 4);
+                        int bl_pf_69 = 0;
+                        if (bl_pm_69 > og_m[1]) {
+                            bl_pf_69 = 1;
+                        }
+                        if (bl_pm_69 == og_m[1]) {
+                            if (bl_pg_69 < og_g[1]) {
+                                bl_pf_69 = 1;
+                            }
+                        }
+                        int bl_i_69 = lane + 32;
+                        int bl_want_69 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_69 >> 6) % 2) {
+                            bl_want_69 = 1;
+                        }
+                        if (bl_pf_69 == bl_want_69) {
+                            og_m[1] = bl_pm_69;
+                            og_g[1] = bl_pg_69;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_70 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 4);
+                        int bl_pg_70 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 4);
+                        int bl_pf_70 = 0;
+                        if (bl_pm_70 > og_m[2]) {
+                            bl_pf_70 = 1;
+                        }
+                        if (bl_pm_70 == og_m[2]) {
+                            if (bl_pg_70 < og_g[2]) {
+                                bl_pf_70 = 1;
+                            }
+                        }
+                        int bl_i_70 = lane + 64;
+                        int bl_want_70 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_70 >> 6) % 2) {
+                            bl_want_70 = 1;
+                        }
+                        if (bl_pf_70 == bl_want_70) {
+                            og_m[2] = bl_pm_70;
+                            og_g[2] = bl_pg_70;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_71 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 4);
+                        int bl_pg_71 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 4);
+                        int bl_pf_71 = 0;
+                        if (bl_pm_71 > og_m[3]) {
+                            bl_pf_71 = 1;
+                        }
+                        if (bl_pm_71 == og_m[3]) {
+                            if (bl_pg_71 < og_g[3]) {
+                                bl_pf_71 = 1;
+                            }
+                        }
+                        int bl_i_71 = lane + 96;
+                        int bl_want_71 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_71 >> 6) % 2) {
+                            bl_want_71 = 1;
+                        }
+                        if (bl_pf_71 == bl_want_71) {
+                            og_m[3] = bl_pm_71;
+                            og_g[3] = bl_pg_71;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_72 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_72 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_72 = 0;
+                        if (bl_pm_72 > og_m[0]) {
+                            bl_pf_72 = 1;
+                        }
+                        if (bl_pm_72 == og_m[0]) {
+                            if (bl_pg_72 < og_g[0]) {
+                                bl_pf_72 = 1;
+                            }
+                        }
+                        int bl_i_72 = lane;
+                        int bl_want_72 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_72 >> 6) % 2) {
+                            bl_want_72 = 1;
+                        }
+                        if (bl_pf_72 == bl_want_72) {
+                            og_m[0] = bl_pm_72;
+                            og_g[0] = bl_pg_72;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_73 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_73 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_73 = 0;
+                        if (bl_pm_73 > og_m[1]) {
+                            bl_pf_73 = 1;
+                        }
+                        if (bl_pm_73 == og_m[1]) {
+                            if (bl_pg_73 < og_g[1]) {
+                                bl_pf_73 = 1;
+                            }
+                        }
+                        int bl_i_73 = lane + 32;
+                        int bl_want_73 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_73 >> 6) % 2) {
+                            bl_want_73 = 1;
+                        }
+                        if (bl_pf_73 == bl_want_73) {
+                            og_m[1] = bl_pm_73;
+                            og_g[1] = bl_pg_73;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_74 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_74 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_74 = 0;
+                        if (bl_pm_74 > og_m[2]) {
+                            bl_pf_74 = 1;
+                        }
+                        if (bl_pm_74 == og_m[2]) {
+                            if (bl_pg_74 < og_g[2]) {
+                                bl_pf_74 = 1;
+                            }
+                        }
+                        int bl_i_74 = lane + 64;
+                        int bl_want_74 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_74 >> 6) % 2) {
+                            bl_want_74 = 1;
+                        }
+                        if (bl_pf_74 == bl_want_74) {
+                            og_m[2] = bl_pm_74;
+                            og_g[2] = bl_pg_74;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_75 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_75 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_75 = 0;
+                        if (bl_pm_75 > og_m[3]) {
+                            bl_pf_75 = 1;
+                        }
+                        if (bl_pm_75 == og_m[3]) {
+                            if (bl_pg_75 < og_g[3]) {
+                                bl_pf_75 = 1;
+                            }
+                        }
+                        int bl_i_75 = lane + 96;
+                        int bl_want_75 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_75 >> 6) % 2) {
+                            bl_want_75 = 1;
+                        }
+                        if (bl_pf_75 == bl_want_75) {
+                            og_m[3] = bl_pm_75;
+                            og_g[3] = bl_pg_75;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_76 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_76 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_76 = 0;
+                        if (bl_pm_76 > og_m[0]) {
+                            bl_pf_76 = 1;
+                        }
+                        if (bl_pm_76 == og_m[0]) {
+                            if (bl_pg_76 < og_g[0]) {
+                                bl_pf_76 = 1;
+                            }
+                        }
+                        int bl_i_76 = lane;
+                        int bl_want_76 = 0;
+                        if (lane % 2 == (bl_i_76 >> 6) % 2) {
+                            bl_want_76 = 1;
+                        }
+                        if (bl_pf_76 == bl_want_76) {
+                            og_m[0] = bl_pm_76;
+                            og_g[0] = bl_pg_76;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_77 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_77 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_77 = 0;
+                        if (bl_pm_77 > og_m[1]) {
+                            bl_pf_77 = 1;
+                        }
+                        if (bl_pm_77 == og_m[1]) {
+                            if (bl_pg_77 < og_g[1]) {
+                                bl_pf_77 = 1;
+                            }
+                        }
+                        int bl_i_77 = lane + 32;
+                        int bl_want_77 = 0;
+                        if (lane % 2 == (bl_i_77 >> 6) % 2) {
+                            bl_want_77 = 1;
+                        }
+                        if (bl_pf_77 == bl_want_77) {
+                            og_m[1] = bl_pm_77;
+                            og_g[1] = bl_pg_77;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_78 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_78 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_78 = 0;
+                        if (bl_pm_78 > og_m[2]) {
+                            bl_pf_78 = 1;
+                        }
+                        if (bl_pm_78 == og_m[2]) {
+                            if (bl_pg_78 < og_g[2]) {
+                                bl_pf_78 = 1;
+                            }
+                        }
+                        int bl_i_78 = lane + 64;
+                        int bl_want_78 = 0;
+                        if (lane % 2 == (bl_i_78 >> 6) % 2) {
+                            bl_want_78 = 1;
+                        }
+                        if (bl_pf_78 == bl_want_78) {
+                            og_m[2] = bl_pm_78;
+                            og_g[2] = bl_pg_78;
+                        }
+                    }
+                    if (og_n > 32) {
+                        int bl_pm_79 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_79 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_79 = 0;
+                        if (bl_pm_79 > og_m[3]) {
+                            bl_pf_79 = 1;
+                        }
+                        if (bl_pm_79 == og_m[3]) {
+                            if (bl_pg_79 < og_g[3]) {
+                                bl_pf_79 = 1;
+                            }
+                        }
+                        int bl_i_79 = lane + 96;
+                        int bl_want_79 = 0;
+                        if (lane % 2 == (bl_i_79 >> 6) % 2) {
+                            bl_want_79 = 1;
+                        }
+                        if (bl_pf_79 == bl_want_79) {
+                            og_m[3] = bl_pm_79;
+                            og_g[3] = bl_pg_79;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bs_first_2 = 0;
+                        if (og_m[2] > og_m[0]) {
+                            bs_first_2 = 1;
+                        }
+                        if (og_m[2] == og_m[0]) {
+                            if (og_g[2] < og_g[0]) {
+                                bs_first_2 = 1;
+                            }
+                        }
+                        int bs_m_2 = og_m[0];
+                        int bs_g_2 = og_g[0];
+                        og_m[0] = ((bs_first_2 == 1) ? og_m[2] : bs_m_2);
+                        og_g[0] = ((bs_first_2 == 1) ? og_g[2] : bs_g_2);
+                        og_m[2] = ((bs_first_2 == 1) ? bs_m_2 : og_m[2]);
+                        og_g[2] = ((bs_first_2 == 1) ? bs_g_2 : og_g[2]);
+                    }
+                    if (og_n > 64) {
+                        int bs_first_3 = 0;
+                        if (og_m[3] > og_m[1]) {
+                            bs_first_3 = 1;
+                        }
+                        if (og_m[3] == og_m[1]) {
+                            if (og_g[3] < og_g[1]) {
+                                bs_first_3 = 1;
+                            }
+                        }
+                        int bs_m_3 = og_m[1];
+                        int bs_g_3 = og_g[1];
+                        og_m[1] = ((bs_first_3 == 1) ? og_m[3] : bs_m_3);
+                        og_g[1] = ((bs_first_3 == 1) ? og_g[3] : bs_g_3);
+                        og_m[3] = ((bs_first_3 == 1) ? bs_m_3 : og_m[3]);
+                        og_g[3] = ((bs_first_3 == 1) ? bs_g_3 : og_g[3]);
+                    }
+                    if (og_n > 64) {
+                        int bs_first_4 = 0;
+                        if (og_m[1] > og_m[0]) {
+                            bs_first_4 = 1;
+                        }
+                        if (og_m[1] == og_m[0]) {
+                            if (og_g[1] < og_g[0]) {
+                                bs_first_4 = 1;
+                            }
+                        }
+                        int bs_m_4 = og_m[0];
+                        int bs_g_4 = og_g[0];
+                        og_m[0] = ((bs_first_4 == 1) ? og_m[1] : bs_m_4);
+                        og_g[0] = ((bs_first_4 == 1) ? og_g[1] : bs_g_4);
+                        og_m[1] = ((bs_first_4 == 1) ? bs_m_4 : og_m[1]);
+                        og_g[1] = ((bs_first_4 == 1) ? bs_g_4 : og_g[1]);
+                    }
+                    if (og_n > 64) {
+                        int bs_first_5 = 0;
+                        if (og_m[3] > og_m[2]) {
+                            bs_first_5 = 1;
+                        }
+                        if (og_m[3] == og_m[2]) {
+                            if (og_g[3] < og_g[2]) {
+                                bs_first_5 = 1;
+                            }
+                        }
+                        int bs_m_5 = og_m[2];
+                        int bs_g_5 = og_g[2];
+                        og_m[2] = ((bs_first_5 == 1) ? og_m[3] : bs_m_5);
+                        og_g[2] = ((bs_first_5 == 1) ? og_g[3] : bs_g_5);
+                        og_m[3] = ((bs_first_5 == 1) ? bs_m_5 : og_m[3]);
+                        og_g[3] = ((bs_first_5 == 1) ? bs_g_5 : og_g[3]);
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_80 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 16);
+                        int bl_pg_80 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 16);
+                        int bl_pf_80 = 0;
+                        if (bl_pm_80 > og_m[0]) {
+                            bl_pf_80 = 1;
+                        }
+                        if (bl_pm_80 == og_m[0]) {
+                            if (bl_pg_80 < og_g[0]) {
+                                bl_pf_80 = 1;
+                            }
+                        }
+                        int bl_i_80 = lane;
+                        int bl_want_80 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_80 >> 7) % 2) {
+                            bl_want_80 = 1;
+                        }
+                        if (bl_pf_80 == bl_want_80) {
+                            og_m[0] = bl_pm_80;
+                            og_g[0] = bl_pg_80;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_81 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 16);
+                        int bl_pg_81 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 16);
+                        int bl_pf_81 = 0;
+                        if (bl_pm_81 > og_m[1]) {
+                            bl_pf_81 = 1;
+                        }
+                        if (bl_pm_81 == og_m[1]) {
+                            if (bl_pg_81 < og_g[1]) {
+                                bl_pf_81 = 1;
+                            }
+                        }
+                        int bl_i_81 = lane + 32;
+                        int bl_want_81 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_81 >> 7) % 2) {
+                            bl_want_81 = 1;
+                        }
+                        if (bl_pf_81 == bl_want_81) {
+                            og_m[1] = bl_pm_81;
+                            og_g[1] = bl_pg_81;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_82 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 16);
+                        int bl_pg_82 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 16);
+                        int bl_pf_82 = 0;
+                        if (bl_pm_82 > og_m[2]) {
+                            bl_pf_82 = 1;
+                        }
+                        if (bl_pm_82 == og_m[2]) {
+                            if (bl_pg_82 < og_g[2]) {
+                                bl_pf_82 = 1;
+                            }
+                        }
+                        int bl_i_82 = lane + 64;
+                        int bl_want_82 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_82 >> 7) % 2) {
+                            bl_want_82 = 1;
+                        }
+                        if (bl_pf_82 == bl_want_82) {
+                            og_m[2] = bl_pm_82;
+                            og_g[2] = bl_pg_82;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_83 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 16);
+                        int bl_pg_83 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 16);
+                        int bl_pf_83 = 0;
+                        if (bl_pm_83 > og_m[3]) {
+                            bl_pf_83 = 1;
+                        }
+                        if (bl_pm_83 == og_m[3]) {
+                            if (bl_pg_83 < og_g[3]) {
+                                bl_pf_83 = 1;
+                            }
+                        }
+                        int bl_i_83 = lane + 96;
+                        int bl_want_83 = 0;
+                        if ((lane >> 4) % 2 == (bl_i_83 >> 7) % 2) {
+                            bl_want_83 = 1;
+                        }
+                        if (bl_pf_83 == bl_want_83) {
+                            og_m[3] = bl_pm_83;
+                            og_g[3] = bl_pg_83;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_84 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 8);
+                        int bl_pg_84 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 8);
+                        int bl_pf_84 = 0;
+                        if (bl_pm_84 > og_m[0]) {
+                            bl_pf_84 = 1;
+                        }
+                        if (bl_pm_84 == og_m[0]) {
+                            if (bl_pg_84 < og_g[0]) {
+                                bl_pf_84 = 1;
+                            }
+                        }
+                        int bl_i_84 = lane;
+                        int bl_want_84 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_84 >> 7) % 2) {
+                            bl_want_84 = 1;
+                        }
+                        if (bl_pf_84 == bl_want_84) {
+                            og_m[0] = bl_pm_84;
+                            og_g[0] = bl_pg_84;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_85 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 8);
+                        int bl_pg_85 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 8);
+                        int bl_pf_85 = 0;
+                        if (bl_pm_85 > og_m[1]) {
+                            bl_pf_85 = 1;
+                        }
+                        if (bl_pm_85 == og_m[1]) {
+                            if (bl_pg_85 < og_g[1]) {
+                                bl_pf_85 = 1;
+                            }
+                        }
+                        int bl_i_85 = lane + 32;
+                        int bl_want_85 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_85 >> 7) % 2) {
+                            bl_want_85 = 1;
+                        }
+                        if (bl_pf_85 == bl_want_85) {
+                            og_m[1] = bl_pm_85;
+                            og_g[1] = bl_pg_85;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_86 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 8);
+                        int bl_pg_86 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 8);
+                        int bl_pf_86 = 0;
+                        if (bl_pm_86 > og_m[2]) {
+                            bl_pf_86 = 1;
+                        }
+                        if (bl_pm_86 == og_m[2]) {
+                            if (bl_pg_86 < og_g[2]) {
+                                bl_pf_86 = 1;
+                            }
+                        }
+                        int bl_i_86 = lane + 64;
+                        int bl_want_86 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_86 >> 7) % 2) {
+                            bl_want_86 = 1;
+                        }
+                        if (bl_pf_86 == bl_want_86) {
+                            og_m[2] = bl_pm_86;
+                            og_g[2] = bl_pg_86;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_87 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 8);
+                        int bl_pg_87 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 8);
+                        int bl_pf_87 = 0;
+                        if (bl_pm_87 > og_m[3]) {
+                            bl_pf_87 = 1;
+                        }
+                        if (bl_pm_87 == og_m[3]) {
+                            if (bl_pg_87 < og_g[3]) {
+                                bl_pf_87 = 1;
+                            }
+                        }
+                        int bl_i_87 = lane + 96;
+                        int bl_want_87 = 0;
+                        if ((lane >> 3) % 2 == (bl_i_87 >> 7) % 2) {
+                            bl_want_87 = 1;
+                        }
+                        if (bl_pf_87 == bl_want_87) {
+                            og_m[3] = bl_pm_87;
+                            og_g[3] = bl_pg_87;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_88 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 4);
+                        int bl_pg_88 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 4);
+                        int bl_pf_88 = 0;
+                        if (bl_pm_88 > og_m[0]) {
+                            bl_pf_88 = 1;
+                        }
+                        if (bl_pm_88 == og_m[0]) {
+                            if (bl_pg_88 < og_g[0]) {
+                                bl_pf_88 = 1;
+                            }
+                        }
+                        int bl_i_88 = lane;
+                        int bl_want_88 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_88 >> 7) % 2) {
+                            bl_want_88 = 1;
+                        }
+                        if (bl_pf_88 == bl_want_88) {
+                            og_m[0] = bl_pm_88;
+                            og_g[0] = bl_pg_88;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_89 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 4);
+                        int bl_pg_89 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 4);
+                        int bl_pf_89 = 0;
+                        if (bl_pm_89 > og_m[1]) {
+                            bl_pf_89 = 1;
+                        }
+                        if (bl_pm_89 == og_m[1]) {
+                            if (bl_pg_89 < og_g[1]) {
+                                bl_pf_89 = 1;
+                            }
+                        }
+                        int bl_i_89 = lane + 32;
+                        int bl_want_89 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_89 >> 7) % 2) {
+                            bl_want_89 = 1;
+                        }
+                        if (bl_pf_89 == bl_want_89) {
+                            og_m[1] = bl_pm_89;
+                            og_g[1] = bl_pg_89;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_90 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 4);
+                        int bl_pg_90 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 4);
+                        int bl_pf_90 = 0;
+                        if (bl_pm_90 > og_m[2]) {
+                            bl_pf_90 = 1;
+                        }
+                        if (bl_pm_90 == og_m[2]) {
+                            if (bl_pg_90 < og_g[2]) {
+                                bl_pf_90 = 1;
+                            }
+                        }
+                        int bl_i_90 = lane + 64;
+                        int bl_want_90 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_90 >> 7) % 2) {
+                            bl_want_90 = 1;
+                        }
+                        if (bl_pf_90 == bl_want_90) {
+                            og_m[2] = bl_pm_90;
+                            og_g[2] = bl_pg_90;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_91 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 4);
+                        int bl_pg_91 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 4);
+                        int bl_pf_91 = 0;
+                        if (bl_pm_91 > og_m[3]) {
+                            bl_pf_91 = 1;
+                        }
+                        if (bl_pm_91 == og_m[3]) {
+                            if (bl_pg_91 < og_g[3]) {
+                                bl_pf_91 = 1;
+                            }
+                        }
+                        int bl_i_91 = lane + 96;
+                        int bl_want_91 = 0;
+                        if ((lane >> 2) % 2 == (bl_i_91 >> 7) % 2) {
+                            bl_want_91 = 1;
+                        }
+                        if (bl_pf_91 == bl_want_91) {
+                            og_m[3] = bl_pm_91;
+                            og_g[3] = bl_pg_91;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_92 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 2);
+                        int bl_pg_92 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 2);
+                        int bl_pf_92 = 0;
+                        if (bl_pm_92 > og_m[0]) {
+                            bl_pf_92 = 1;
+                        }
+                        if (bl_pm_92 == og_m[0]) {
+                            if (bl_pg_92 < og_g[0]) {
+                                bl_pf_92 = 1;
+                            }
+                        }
+                        int bl_i_92 = lane;
+                        int bl_want_92 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_92 >> 7) % 2) {
+                            bl_want_92 = 1;
+                        }
+                        if (bl_pf_92 == bl_want_92) {
+                            og_m[0] = bl_pm_92;
+                            og_g[0] = bl_pg_92;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_93 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 2);
+                        int bl_pg_93 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 2);
+                        int bl_pf_93 = 0;
+                        if (bl_pm_93 > og_m[1]) {
+                            bl_pf_93 = 1;
+                        }
+                        if (bl_pm_93 == og_m[1]) {
+                            if (bl_pg_93 < og_g[1]) {
+                                bl_pf_93 = 1;
+                            }
+                        }
+                        int bl_i_93 = lane + 32;
+                        int bl_want_93 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_93 >> 7) % 2) {
+                            bl_want_93 = 1;
+                        }
+                        if (bl_pf_93 == bl_want_93) {
+                            og_m[1] = bl_pm_93;
+                            og_g[1] = bl_pg_93;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_94 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 2);
+                        int bl_pg_94 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 2);
+                        int bl_pf_94 = 0;
+                        if (bl_pm_94 > og_m[2]) {
+                            bl_pf_94 = 1;
+                        }
+                        if (bl_pm_94 == og_m[2]) {
+                            if (bl_pg_94 < og_g[2]) {
+                                bl_pf_94 = 1;
+                            }
+                        }
+                        int bl_i_94 = lane + 64;
+                        int bl_want_94 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_94 >> 7) % 2) {
+                            bl_want_94 = 1;
+                        }
+                        if (bl_pf_94 == bl_want_94) {
+                            og_m[2] = bl_pm_94;
+                            og_g[2] = bl_pg_94;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_95 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 2);
+                        int bl_pg_95 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 2);
+                        int bl_pf_95 = 0;
+                        if (bl_pm_95 > og_m[3]) {
+                            bl_pf_95 = 1;
+                        }
+                        if (bl_pm_95 == og_m[3]) {
+                            if (bl_pg_95 < og_g[3]) {
+                                bl_pf_95 = 1;
+                            }
+                        }
+                        int bl_i_95 = lane + 96;
+                        int bl_want_95 = 0;
+                        if ((lane >> 1) % 2 == (bl_i_95 >> 7) % 2) {
+                            bl_want_95 = 1;
+                        }
+                        if (bl_pf_95 == bl_want_95) {
+                            og_m[3] = bl_pm_95;
+                            og_g[3] = bl_pg_95;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_96 = __shfl_xor_sync(0xFFFFFFFF, og_m[0], 1);
+                        int bl_pg_96 = __shfl_xor_sync(0xFFFFFFFF, og_g[0], 1);
+                        int bl_pf_96 = 0;
+                        if (bl_pm_96 > og_m[0]) {
+                            bl_pf_96 = 1;
+                        }
+                        if (bl_pm_96 == og_m[0]) {
+                            if (bl_pg_96 < og_g[0]) {
+                                bl_pf_96 = 1;
+                            }
+                        }
+                        int bl_i_96 = lane;
+                        int bl_want_96 = 0;
+                        if (lane % 2 == (bl_i_96 >> 7) % 2) {
+                            bl_want_96 = 1;
+                        }
+                        if (bl_pf_96 == bl_want_96) {
+                            og_m[0] = bl_pm_96;
+                            og_g[0] = bl_pg_96;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_97 = __shfl_xor_sync(0xFFFFFFFF, og_m[1], 1);
+                        int bl_pg_97 = __shfl_xor_sync(0xFFFFFFFF, og_g[1], 1);
+                        int bl_pf_97 = 0;
+                        if (bl_pm_97 > og_m[1]) {
+                            bl_pf_97 = 1;
+                        }
+                        if (bl_pm_97 == og_m[1]) {
+                            if (bl_pg_97 < og_g[1]) {
+                                bl_pf_97 = 1;
+                            }
+                        }
+                        int bl_i_97 = lane + 32;
+                        int bl_want_97 = 0;
+                        if (lane % 2 == (bl_i_97 >> 7) % 2) {
+                            bl_want_97 = 1;
+                        }
+                        if (bl_pf_97 == bl_want_97) {
+                            og_m[1] = bl_pm_97;
+                            og_g[1] = bl_pg_97;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_98 = __shfl_xor_sync(0xFFFFFFFF, og_m[2], 1);
+                        int bl_pg_98 = __shfl_xor_sync(0xFFFFFFFF, og_g[2], 1);
+                        int bl_pf_98 = 0;
+                        if (bl_pm_98 > og_m[2]) {
+                            bl_pf_98 = 1;
+                        }
+                        if (bl_pm_98 == og_m[2]) {
+                            if (bl_pg_98 < og_g[2]) {
+                                bl_pf_98 = 1;
+                            }
+                        }
+                        int bl_i_98 = lane + 64;
+                        int bl_want_98 = 0;
+                        if (lane % 2 == (bl_i_98 >> 7) % 2) {
+                            bl_want_98 = 1;
+                        }
+                        if (bl_pf_98 == bl_want_98) {
+                            og_m[2] = bl_pm_98;
+                            og_g[2] = bl_pg_98;
+                        }
+                    }
+                    if (og_n > 64) {
+                        int bl_pm_99 = __shfl_xor_sync(0xFFFFFFFF, og_m[3], 1);
+                        int bl_pg_99 = __shfl_xor_sync(0xFFFFFFFF, og_g[3], 1);
+                        int bl_pf_99 = 0;
+                        if (bl_pm_99 > og_m[3]) {
+                            bl_pf_99 = 1;
+                        }
+                        if (bl_pm_99 == og_m[3]) {
+                            if (bl_pg_99 < og_g[3]) {
+                                bl_pf_99 = 1;
+                            }
+                        }
+                        int bl_i_99 = lane + 96;
+                        int bl_want_99 = 0;
+                        if (lane % 2 == (bl_i_99 >> 7) % 2) {
+                            bl_want_99 = 1;
+                        }
+                        if (bl_pf_99 == bl_want_99) {
+                            og_m[3] = bl_pm_99;
+                            og_g[3] = bl_pg_99;
+                        }
+                    }
+                    #pragma unroll
+                    for (int ok4 = 0; ok4 < 4; ok4++) {
+                        int ok4_s = lane + 32 * ok4;
+                        if (ok4_s < og_n) {
+                            og_a[ok4_s] = og_g[ok4];
+                        }
+                    }
+                }
+                mbarrier_arrive(order_ready_addr);
+            }
+            mbarrier_wait(order_ready_addr, 0);
             int pz_mode = 0;
             int pz_ne = 0;
             if (warp == 2) {
@@ -2095,10 +4456,14 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                 unsigned int pl_last = 0;
                 #pragma unroll 1
                 for (int pl_e = lane; pl_e < num_groups; pl_e += 32) {
-                    int pl_e1 = offs[pl_e];
+                    int pl_q = pl_e;
+                    if (num_groups <= 128) {
+                        pl_q = og_a[(int)pl_e];
+                    }
+                    int pl_e1 = offs[pl_q];
                     int pl_e0 = 0;
-                    if (pl_e > 0) {
-                        pl_e0 = offs[pl_e - 1];
+                    if (pl_q > 0) {
+                        pl_e0 = offs[pl_q - 1];
                     }
                     if (pl_e1 > pl_e0) {
                         pl_last = (unsigned int)(pl_e + 1);
@@ -2139,6 +4504,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     pl_p = pl_c_n - 1 - pl_c;
                                 }
                                 unsigned int pl_g = (pl_w * pl_c_n + pl_p) / tiles_per_group_e;
+                                if (num_groups <= 128) {
+                                    pl_g = (unsigned int)og_a[(int)pl_g];
+                                }
                                 int pl_g1 = offs[(int)pl_g];
                                 int pl_g0 = 0;
                                 if (pl_g > 0) {
@@ -2205,6 +4573,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         if (pl_r1[pk5] < pl_nwhole) {
                             unsigned int pl_t2 = pl_f * pl_c_n + pl_r1[pk5];
                             unsigned int pl_g2 = pl_t2 / tiles_per_group_e;
+                            if (num_groups <= 128) {
+                                pl_g2 = (unsigned int)og_a[(int)pl_g2];
+                            }
                             int pl_h1 = offs[(int)pl_g2];
                             int pl_h0 = 0;
                             if (pl_g2 > 0) {
@@ -2286,6 +4657,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned int kr_n_block_z = rem_z / grid_n_e;
                     n_block_z = nc_n_block_z * (1 - rr_n_block_z) + (rem_z - kr_n_block_z * grid_n_e) * rr_n_block_z;
                     k_block_z = (rem_z - nc_n_block_z * grid_k_e) * (1 - rr_n_block_z) + kr_n_block_z * rr_n_block_z;
+                    if (num_groups <= 128) {
+                        e_uz = (unsigned int)og_a[(int)e_uz];
+                    }
                     int row_nz = (int)n_block_z * BLOCK_N + cta_rank * BLOCK_M + epi_tid;
                     int out_z = (int)e_uz * stride_e + row_nz * ldc + (int)k_block_z * TILE_K + epi_half * 128;
                     {
@@ -2858,28 +5232,15 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         ts_e = (unsigned int)pz_whole;
                     }
                 }
-                unsigned int e_ue = ts_e / tiles_per_group_e;
-                unsigned int rem_e = ts_e - e_ue * tiles_per_group_e;
-                unsigned int n_block_e = 0;
-                unsigned int k_block_e = 0;
-                unsigned int rr_n_block_e = (unsigned int)raster_rows;
-                unsigned int nc_n_block_e = rem_e / grid_k_e;
-                unsigned int kr_n_block_e = rem_e / grid_n_e;
-                n_block_e = nc_n_block_e * (1 - rr_n_block_e) + (rem_e - kr_n_block_e * grid_n_e) * rr_n_block_e;
-                k_block_e = (rem_e - nc_n_block_e * grid_k_e) * (1 - rr_n_block_e) + kr_n_block_e * rr_n_block_e;
-                int row_n = (int)n_block_e * BLOCK_N + cta_rank * BLOCK_M + epi_tid;
-                int col0 = (int)k_block_e * TILE_K;
                 mbarrier_wait(mainloop_done_addr, _phase_mainloop_done);
                 asm volatile("tcgen05.fence::after_thread_sync;");
 #if CAKE_WGRAD_OUT == 32
                 float _er_f[128];
                 int er_rowf = taddr + (unsigned int)(cta_rank * 128 + epi_warp * 32 << 16) + (unsigned int)(epi_half * 128);
-                int er_outf = (int)e_ue * stride_e + row_n * ldc + col0 + epi_half * 128;
 #else
                 unsigned int _er_packed[128];
                 float _er_load[32];
                 int er_row = taddr + (unsigned int)(cta_rank * 128 + epi_warp * 32 << 16) + (unsigned int)(epi_half * 128);
-                int er_out = (int)e_ue * stride_e + row_n * ldc + col0 + epi_half * 128;
 #endif  // CAKE_WGRAD_OUT
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -3253,20 +5614,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                         :: "r"((epi_free0_addr) & 0xFEFFFFFF) : "memory");
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_33_0 = __float_as_uint(_er_f[0 + 0]);
-                    unsigned _stv8_33_1 = __float_as_uint(_er_f[0 + 1]);
-                    unsigned _stv8_33_2 = __float_as_uint(_er_f[0 + 2]);
-                    unsigned _stv8_33_3 = __float_as_uint(_er_f[0 + 3]);
-                    unsigned _stv8_33_4 = __float_as_uint(_er_f[0 + 4]);
-                    unsigned _stv8_33_5 = __float_as_uint(_er_f[0 + 5]);
-                    unsigned _stv8_33_6 = __float_as_uint(_er_f[0 + 6]);
-                    unsigned _stv8_33_7 = __float_as_uint(_er_f[0 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + er_outf + (0))), "r"(_stv8_33_0), "r"(_stv8_33_1), "r"(_stv8_33_2), "r"(_stv8_33_3), "r"(_stv8_33_4), "r"(_stv8_33_5), "r"(_stv8_33_6), "r"(_stv8_33_7) : "memory");
-#else
+#if CAKE_WGRAD_OUT == 16
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
@@ -3277,315 +5625,85 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 0], _er_load[_lp*2+1 + 0]));
                     _er_packed[_lp + 64] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_34_0 = __float_as_uint(_er_f[8 + 0]);
-                    unsigned _stv8_34_1 = __float_as_uint(_er_f[8 + 1]);
-                    unsigned _stv8_34_2 = __float_as_uint(_er_f[8 + 2]);
-                    unsigned _stv8_34_3 = __float_as_uint(_er_f[8 + 3]);
-                    unsigned _stv8_34_4 = __float_as_uint(_er_f[8 + 4]);
-                    unsigned _stv8_34_5 = __float_as_uint(_er_f[8 + 5]);
-                    unsigned _stv8_34_6 = __float_as_uint(_er_f[8 + 6]);
-                    unsigned _stv8_34_7 = __float_as_uint(_er_f[8 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 8) + (0))), "r"(_stv8_34_0), "r"(_stv8_34_1), "r"(_stv8_34_2), "r"(_stv8_34_3), "r"(_stv8_34_4), "r"(_stv8_34_5), "r"(_stv8_34_6), "r"(_stv8_34_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 2], _er_load[_lp*2+1 + 2]));
                     _er_packed[_lp + 65] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_35_0 = __float_as_uint(_er_f[16 + 0]);
-                    unsigned _stv8_35_1 = __float_as_uint(_er_f[16 + 1]);
-                    unsigned _stv8_35_2 = __float_as_uint(_er_f[16 + 2]);
-                    unsigned _stv8_35_3 = __float_as_uint(_er_f[16 + 3]);
-                    unsigned _stv8_35_4 = __float_as_uint(_er_f[16 + 4]);
-                    unsigned _stv8_35_5 = __float_as_uint(_er_f[16 + 5]);
-                    unsigned _stv8_35_6 = __float_as_uint(_er_f[16 + 6]);
-                    unsigned _stv8_35_7 = __float_as_uint(_er_f[16 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 16) + (0))), "r"(_stv8_35_0), "r"(_stv8_35_1), "r"(_stv8_35_2), "r"(_stv8_35_3), "r"(_stv8_35_4), "r"(_stv8_35_5), "r"(_stv8_35_6), "r"(_stv8_35_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 4], _er_load[_lp*2+1 + 4]));
                     _er_packed[_lp + 66] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_36_0 = __float_as_uint(_er_f[24 + 0]);
-                    unsigned _stv8_36_1 = __float_as_uint(_er_f[24 + 1]);
-                    unsigned _stv8_36_2 = __float_as_uint(_er_f[24 + 2]);
-                    unsigned _stv8_36_3 = __float_as_uint(_er_f[24 + 3]);
-                    unsigned _stv8_36_4 = __float_as_uint(_er_f[24 + 4]);
-                    unsigned _stv8_36_5 = __float_as_uint(_er_f[24 + 5]);
-                    unsigned _stv8_36_6 = __float_as_uint(_er_f[24 + 6]);
-                    unsigned _stv8_36_7 = __float_as_uint(_er_f[24 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 24) + (0))), "r"(_stv8_36_0), "r"(_stv8_36_1), "r"(_stv8_36_2), "r"(_stv8_36_3), "r"(_stv8_36_4), "r"(_stv8_36_5), "r"(_stv8_36_6), "r"(_stv8_36_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 6], _er_load[_lp*2+1 + 6]));
                     _er_packed[_lp + 67] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_37_0 = __float_as_uint(_er_f[32 + 0]);
-                    unsigned _stv8_37_1 = __float_as_uint(_er_f[32 + 1]);
-                    unsigned _stv8_37_2 = __float_as_uint(_er_f[32 + 2]);
-                    unsigned _stv8_37_3 = __float_as_uint(_er_f[32 + 3]);
-                    unsigned _stv8_37_4 = __float_as_uint(_er_f[32 + 4]);
-                    unsigned _stv8_37_5 = __float_as_uint(_er_f[32 + 5]);
-                    unsigned _stv8_37_6 = __float_as_uint(_er_f[32 + 6]);
-                    unsigned _stv8_37_7 = __float_as_uint(_er_f[32 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 32) + (0))), "r"(_stv8_37_0), "r"(_stv8_37_1), "r"(_stv8_37_2), "r"(_stv8_37_3), "r"(_stv8_37_4), "r"(_stv8_37_5), "r"(_stv8_37_6), "r"(_stv8_37_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 8], _er_load[_lp*2+1 + 8]));
                     _er_packed[_lp + 68] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_38_0 = __float_as_uint(_er_f[40 + 0]);
-                    unsigned _stv8_38_1 = __float_as_uint(_er_f[40 + 1]);
-                    unsigned _stv8_38_2 = __float_as_uint(_er_f[40 + 2]);
-                    unsigned _stv8_38_3 = __float_as_uint(_er_f[40 + 3]);
-                    unsigned _stv8_38_4 = __float_as_uint(_er_f[40 + 4]);
-                    unsigned _stv8_38_5 = __float_as_uint(_er_f[40 + 5]);
-                    unsigned _stv8_38_6 = __float_as_uint(_er_f[40 + 6]);
-                    unsigned _stv8_38_7 = __float_as_uint(_er_f[40 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 40) + (0))), "r"(_stv8_38_0), "r"(_stv8_38_1), "r"(_stv8_38_2), "r"(_stv8_38_3), "r"(_stv8_38_4), "r"(_stv8_38_5), "r"(_stv8_38_6), "r"(_stv8_38_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 10], _er_load[_lp*2+1 + 10]));
                     _er_packed[_lp + 69] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_39_0 = __float_as_uint(_er_f[48 + 0]);
-                    unsigned _stv8_39_1 = __float_as_uint(_er_f[48 + 1]);
-                    unsigned _stv8_39_2 = __float_as_uint(_er_f[48 + 2]);
-                    unsigned _stv8_39_3 = __float_as_uint(_er_f[48 + 3]);
-                    unsigned _stv8_39_4 = __float_as_uint(_er_f[48 + 4]);
-                    unsigned _stv8_39_5 = __float_as_uint(_er_f[48 + 5]);
-                    unsigned _stv8_39_6 = __float_as_uint(_er_f[48 + 6]);
-                    unsigned _stv8_39_7 = __float_as_uint(_er_f[48 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 48) + (0))), "r"(_stv8_39_0), "r"(_stv8_39_1), "r"(_stv8_39_2), "r"(_stv8_39_3), "r"(_stv8_39_4), "r"(_stv8_39_5), "r"(_stv8_39_6), "r"(_stv8_39_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 12], _er_load[_lp*2+1 + 12]));
                     _er_packed[_lp + 70] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_40_0 = __float_as_uint(_er_f[56 + 0]);
-                    unsigned _stv8_40_1 = __float_as_uint(_er_f[56 + 1]);
-                    unsigned _stv8_40_2 = __float_as_uint(_er_f[56 + 2]);
-                    unsigned _stv8_40_3 = __float_as_uint(_er_f[56 + 3]);
-                    unsigned _stv8_40_4 = __float_as_uint(_er_f[56 + 4]);
-                    unsigned _stv8_40_5 = __float_as_uint(_er_f[56 + 5]);
-                    unsigned _stv8_40_6 = __float_as_uint(_er_f[56 + 6]);
-                    unsigned _stv8_40_7 = __float_as_uint(_er_f[56 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 56) + (0))), "r"(_stv8_40_0), "r"(_stv8_40_1), "r"(_stv8_40_2), "r"(_stv8_40_3), "r"(_stv8_40_4), "r"(_stv8_40_5), "r"(_stv8_40_6), "r"(_stv8_40_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 14], _er_load[_lp*2+1 + 14]));
                     _er_packed[_lp + 71] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_41_0 = __float_as_uint(_er_f[64 + 0]);
-                    unsigned _stv8_41_1 = __float_as_uint(_er_f[64 + 1]);
-                    unsigned _stv8_41_2 = __float_as_uint(_er_f[64 + 2]);
-                    unsigned _stv8_41_3 = __float_as_uint(_er_f[64 + 3]);
-                    unsigned _stv8_41_4 = __float_as_uint(_er_f[64 + 4]);
-                    unsigned _stv8_41_5 = __float_as_uint(_er_f[64 + 5]);
-                    unsigned _stv8_41_6 = __float_as_uint(_er_f[64 + 6]);
-                    unsigned _stv8_41_7 = __float_as_uint(_er_f[64 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 64) + (0))), "r"(_stv8_41_0), "r"(_stv8_41_1), "r"(_stv8_41_2), "r"(_stv8_41_3), "r"(_stv8_41_4), "r"(_stv8_41_5), "r"(_stv8_41_6), "r"(_stv8_41_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 16], _er_load[_lp*2+1 + 16]));
                     _er_packed[_lp + 72] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_42_0 = __float_as_uint(_er_f[72 + 0]);
-                    unsigned _stv8_42_1 = __float_as_uint(_er_f[72 + 1]);
-                    unsigned _stv8_42_2 = __float_as_uint(_er_f[72 + 2]);
-                    unsigned _stv8_42_3 = __float_as_uint(_er_f[72 + 3]);
-                    unsigned _stv8_42_4 = __float_as_uint(_er_f[72 + 4]);
-                    unsigned _stv8_42_5 = __float_as_uint(_er_f[72 + 5]);
-                    unsigned _stv8_42_6 = __float_as_uint(_er_f[72 + 6]);
-                    unsigned _stv8_42_7 = __float_as_uint(_er_f[72 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 72) + (0))), "r"(_stv8_42_0), "r"(_stv8_42_1), "r"(_stv8_42_2), "r"(_stv8_42_3), "r"(_stv8_42_4), "r"(_stv8_42_5), "r"(_stv8_42_6), "r"(_stv8_42_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 18], _er_load[_lp*2+1 + 18]));
                     _er_packed[_lp + 73] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_43_0 = __float_as_uint(_er_f[80 + 0]);
-                    unsigned _stv8_43_1 = __float_as_uint(_er_f[80 + 1]);
-                    unsigned _stv8_43_2 = __float_as_uint(_er_f[80 + 2]);
-                    unsigned _stv8_43_3 = __float_as_uint(_er_f[80 + 3]);
-                    unsigned _stv8_43_4 = __float_as_uint(_er_f[80 + 4]);
-                    unsigned _stv8_43_5 = __float_as_uint(_er_f[80 + 5]);
-                    unsigned _stv8_43_6 = __float_as_uint(_er_f[80 + 6]);
-                    unsigned _stv8_43_7 = __float_as_uint(_er_f[80 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 80) + (0))), "r"(_stv8_43_0), "r"(_stv8_43_1), "r"(_stv8_43_2), "r"(_stv8_43_3), "r"(_stv8_43_4), "r"(_stv8_43_5), "r"(_stv8_43_6), "r"(_stv8_43_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 20], _er_load[_lp*2+1 + 20]));
                     _er_packed[_lp + 74] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_44_0 = __float_as_uint(_er_f[88 + 0]);
-                    unsigned _stv8_44_1 = __float_as_uint(_er_f[88 + 1]);
-                    unsigned _stv8_44_2 = __float_as_uint(_er_f[88 + 2]);
-                    unsigned _stv8_44_3 = __float_as_uint(_er_f[88 + 3]);
-                    unsigned _stv8_44_4 = __float_as_uint(_er_f[88 + 4]);
-                    unsigned _stv8_44_5 = __float_as_uint(_er_f[88 + 5]);
-                    unsigned _stv8_44_6 = __float_as_uint(_er_f[88 + 6]);
-                    unsigned _stv8_44_7 = __float_as_uint(_er_f[88 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 88) + (0))), "r"(_stv8_44_0), "r"(_stv8_44_1), "r"(_stv8_44_2), "r"(_stv8_44_3), "r"(_stv8_44_4), "r"(_stv8_44_5), "r"(_stv8_44_6), "r"(_stv8_44_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 22], _er_load[_lp*2+1 + 22]));
                     _er_packed[_lp + 75] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_45_0 = __float_as_uint(_er_f[96 + 0]);
-                    unsigned _stv8_45_1 = __float_as_uint(_er_f[96 + 1]);
-                    unsigned _stv8_45_2 = __float_as_uint(_er_f[96 + 2]);
-                    unsigned _stv8_45_3 = __float_as_uint(_er_f[96 + 3]);
-                    unsigned _stv8_45_4 = __float_as_uint(_er_f[96 + 4]);
-                    unsigned _stv8_45_5 = __float_as_uint(_er_f[96 + 5]);
-                    unsigned _stv8_45_6 = __float_as_uint(_er_f[96 + 6]);
-                    unsigned _stv8_45_7 = __float_as_uint(_er_f[96 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 96) + (0))), "r"(_stv8_45_0), "r"(_stv8_45_1), "r"(_stv8_45_2), "r"(_stv8_45_3), "r"(_stv8_45_4), "r"(_stv8_45_5), "r"(_stv8_45_6), "r"(_stv8_45_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 24], _er_load[_lp*2+1 + 24]));
                     _er_packed[_lp + 76] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_46_0 = __float_as_uint(_er_f[104 + 0]);
-                    unsigned _stv8_46_1 = __float_as_uint(_er_f[104 + 1]);
-                    unsigned _stv8_46_2 = __float_as_uint(_er_f[104 + 2]);
-                    unsigned _stv8_46_3 = __float_as_uint(_er_f[104 + 3]);
-                    unsigned _stv8_46_4 = __float_as_uint(_er_f[104 + 4]);
-                    unsigned _stv8_46_5 = __float_as_uint(_er_f[104 + 5]);
-                    unsigned _stv8_46_6 = __float_as_uint(_er_f[104 + 6]);
-                    unsigned _stv8_46_7 = __float_as_uint(_er_f[104 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 104) + (0))), "r"(_stv8_46_0), "r"(_stv8_46_1), "r"(_stv8_46_2), "r"(_stv8_46_3), "r"(_stv8_46_4), "r"(_stv8_46_5), "r"(_stv8_46_6), "r"(_stv8_46_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 26], _er_load[_lp*2+1 + 26]));
                     _er_packed[_lp + 77] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_47_0 = __float_as_uint(_er_f[112 + 0]);
-                    unsigned _stv8_47_1 = __float_as_uint(_er_f[112 + 1]);
-                    unsigned _stv8_47_2 = __float_as_uint(_er_f[112 + 2]);
-                    unsigned _stv8_47_3 = __float_as_uint(_er_f[112 + 3]);
-                    unsigned _stv8_47_4 = __float_as_uint(_er_f[112 + 4]);
-                    unsigned _stv8_47_5 = __float_as_uint(_er_f[112 + 5]);
-                    unsigned _stv8_47_6 = __float_as_uint(_er_f[112 + 6]);
-                    unsigned _stv8_47_7 = __float_as_uint(_er_f[112 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 112) + (0))), "r"(_stv8_47_0), "r"(_stv8_47_1), "r"(_stv8_47_2), "r"(_stv8_47_3), "r"(_stv8_47_4), "r"(_stv8_47_5), "r"(_stv8_47_6), "r"(_stv8_47_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 28], _er_load[_lp*2+1 + 28]));
                     _er_packed[_lp + 78] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
-#if CAKE_WGRAD_OUT == 32
-                {
-                    unsigned _stv8_48_0 = __float_as_uint(_er_f[120 + 0]);
-                    unsigned _stv8_48_1 = __float_as_uint(_er_f[120 + 1]);
-                    unsigned _stv8_48_2 = __float_as_uint(_er_f[120 + 2]);
-                    unsigned _stv8_48_3 = __float_as_uint(_er_f[120 + 3]);
-                    unsigned _stv8_48_4 = __float_as_uint(_er_f[120 + 4]);
-                    unsigned _stv8_48_5 = __float_as_uint(_er_f[120 + 5]);
-                    unsigned _stv8_48_6 = __float_as_uint(_er_f[120 + 6]);
-                    unsigned _stv8_48_7 = __float_as_uint(_er_f[120 + 7]);
-                    asm volatile(
-                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                        :: "l"((void*)(C + (er_outf + 120) + (0))), "r"(_stv8_48_0), "r"(_stv8_48_1), "r"(_stv8_48_2), "r"(_stv8_48_3), "r"(_stv8_48_4), "r"(_stv8_48_5), "r"(_stv8_48_6), "r"(_stv8_48_7) : "memory");
-#else
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 30], _er_load[_lp*2+1 + 30]));
                     _er_packed[_lp + 79] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
                 }
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-#if CAKE_WGRAD_OUT == 32
-                    : "=f"(_er_f[0]), "=f"(_er_f[1]), "=f"(_er_f[2]), "=f"(_er_f[3]), "=f"(_er_f[4]), "=f"(_er_f[5]), "=f"(_er_f[6]), "=f"(_er_f[7]), "=f"(_er_f[8]), "=f"(_er_f[9]), "=f"(_er_f[10]), "=f"(_er_f[11]), "=f"(_er_f[12]), "=f"(_er_f[13]), "=f"(_er_f[14]), "=f"(_er_f[15]), "=f"(_er_f[16]), "=f"(_er_f[17]), "=f"(_er_f[18]), "=f"(_er_f[19]), "=f"(_er_f[20]), "=f"(_er_f[21]), "=f"(_er_f[22]), "=f"(_er_f[23]), "=f"(_er_f[24]), "=f"(_er_f[25]), "=f"(_er_f[26]), "=f"(_er_f[27]), "=f"(_er_f[28]), "=f"(_er_f[29]), "=f"(_er_f[30]), "=f"(_er_f[31])
-                    : "r"(er_rowf + 256));
-#else
                     : "=f"(_er_load[0]), "=f"(_er_load[1]), "=f"(_er_load[2]), "=f"(_er_load[3]), "=f"(_er_load[4]), "=f"(_er_load[5]), "=f"(_er_load[6]), "=f"(_er_load[7]), "=f"(_er_load[8]), "=f"(_er_load[9]), "=f"(_er_load[10]), "=f"(_er_load[11]), "=f"(_er_load[12]), "=f"(_er_load[13]), "=f"(_er_load[14]), "=f"(_er_load[15]), "=f"(_er_load[16]), "=f"(_er_load[17]), "=f"(_er_load[18]), "=f"(_er_load[19]), "=f"(_er_load[20]), "=f"(_er_load[21]), "=f"(_er_load[22]), "=f"(_er_load[23]), "=f"(_er_load[24]), "=f"(_er_load[25]), "=f"(_er_load[26]), "=f"(_er_load[27]), "=f"(_er_load[28]), "=f"(_er_load[29]), "=f"(_er_load[30]), "=f"(_er_load[31])
                     : "r"(er_row + 288));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -3669,14 +5787,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 30], _er_load[_lp*2+1 + 30]));
                     _er_packed[_lp + 95] = *(uint32_t*)&_bf2;
                 }
-#endif  // CAKE_WGRAD_OUT
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-#if CAKE_WGRAD_OUT == 32
-                    : "=f"(_er_f[32]), "=f"(_er_f[33]), "=f"(_er_f[34]), "=f"(_er_f[35]), "=f"(_er_f[36]), "=f"(_er_f[37]), "=f"(_er_f[38]), "=f"(_er_f[39]), "=f"(_er_f[40]), "=f"(_er_f[41]), "=f"(_er_f[42]), "=f"(_er_f[43]), "=f"(_er_f[44]), "=f"(_er_f[45]), "=f"(_er_f[46]), "=f"(_er_f[47]), "=f"(_er_f[48]), "=f"(_er_f[49]), "=f"(_er_f[50]), "=f"(_er_f[51]), "=f"(_er_f[52]), "=f"(_er_f[53]), "=f"(_er_f[54]), "=f"(_er_f[55]), "=f"(_er_f[56]), "=f"(_er_f[57]), "=f"(_er_f[58]), "=f"(_er_f[59]), "=f"(_er_f[60]), "=f"(_er_f[61]), "=f"(_er_f[62]), "=f"(_er_f[63])
-                    : "r"(er_rowf + 288));
-#else
                     : "=f"(_er_load[0]), "=f"(_er_load[1]), "=f"(_er_load[2]), "=f"(_er_load[3]), "=f"(_er_load[4]), "=f"(_er_load[5]), "=f"(_er_load[6]), "=f"(_er_load[7]), "=f"(_er_load[8]), "=f"(_er_load[9]), "=f"(_er_load[10]), "=f"(_er_load[11]), "=f"(_er_load[12]), "=f"(_er_load[13]), "=f"(_er_load[14]), "=f"(_er_load[15]), "=f"(_er_load[16]), "=f"(_er_load[17]), "=f"(_er_load[18]), "=f"(_er_load[19]), "=f"(_er_load[20]), "=f"(_er_load[21]), "=f"(_er_load[22]), "=f"(_er_load[23]), "=f"(_er_load[24]), "=f"(_er_load[25]), "=f"(_er_load[26]), "=f"(_er_load[27]), "=f"(_er_load[28]), "=f"(_er_load[29]), "=f"(_er_load[30]), "=f"(_er_load[31])
                     : "r"(er_row + 320));
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -3760,24 +5873,12 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 30], _er_load[_lp*2+1 + 30]));
                     _er_packed[_lp + 111] = *(uint32_t*)&_bf2;
                 }
-#endif  // CAKE_WGRAD_OUT
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                     " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-#if CAKE_WGRAD_OUT == 32
-                    : "=f"(_er_f[64]), "=f"(_er_f[65]), "=f"(_er_f[66]), "=f"(_er_f[67]), "=f"(_er_f[68]), "=f"(_er_f[69]), "=f"(_er_f[70]), "=f"(_er_f[71]), "=f"(_er_f[72]), "=f"(_er_f[73]), "=f"(_er_f[74]), "=f"(_er_f[75]), "=f"(_er_f[76]), "=f"(_er_f[77]), "=f"(_er_f[78]), "=f"(_er_f[79]), "=f"(_er_f[80]), "=f"(_er_f[81]), "=f"(_er_f[82]), "=f"(_er_f[83]), "=f"(_er_f[84]), "=f"(_er_f[85]), "=f"(_er_f[86]), "=f"(_er_f[87]), "=f"(_er_f[88]), "=f"(_er_f[89]), "=f"(_er_f[90]), "=f"(_er_f[91]), "=f"(_er_f[92]), "=f"(_er_f[93]), "=f"(_er_f[94]), "=f"(_er_f[95])
-                    : "r"(er_rowf + 320));
-                asm volatile(
-                    "tcgen05.ld.sync.aligned.32x32b.x32.b32"
-                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                    : "=f"(_er_f[96]), "=f"(_er_f[97]), "=f"(_er_f[98]), "=f"(_er_f[99]), "=f"(_er_f[100]), "=f"(_er_f[101]), "=f"(_er_f[102]), "=f"(_er_f[103]), "=f"(_er_f[104]), "=f"(_er_f[105]), "=f"(_er_f[106]), "=f"(_er_f[107]), "=f"(_er_f[108]), "=f"(_er_f[109]), "=f"(_er_f[110]), "=f"(_er_f[111]), "=f"(_er_f[112]), "=f"(_er_f[113]), "=f"(_er_f[114]), "=f"(_er_f[115]), "=f"(_er_f[116]), "=f"(_er_f[117]), "=f"(_er_f[118]), "=f"(_er_f[119]), "=f"(_er_f[120]), "=f"(_er_f[121]), "=f"(_er_f[122]), "=f"(_er_f[123]), "=f"(_er_f[124]), "=f"(_er_f[125]), "=f"(_er_f[126]), "=f"(_er_f[127])
-                    : "r"(er_rowf + 352));
-#else
                     : "=f"(_er_load[0]), "=f"(_er_load[1]), "=f"(_er_load[2]), "=f"(_er_load[3]), "=f"(_er_load[4]), "=f"(_er_load[5]), "=f"(_er_load[6]), "=f"(_er_load[7]), "=f"(_er_load[8]), "=f"(_er_load[9]), "=f"(_er_load[10]), "=f"(_er_load[11]), "=f"(_er_load[12]), "=f"(_er_load[13]), "=f"(_er_load[14]), "=f"(_er_load[15]), "=f"(_er_load[16]), "=f"(_er_load[17]), "=f"(_er_load[18]), "=f"(_er_load[19]), "=f"(_er_load[20]), "=f"(_er_load[21]), "=f"(_er_load[22]), "=f"(_er_load[23]), "=f"(_er_load[24]), "=f"(_er_load[25]), "=f"(_er_load[26]), "=f"(_er_load[27]), "=f"(_er_load[28]), "=f"(_er_load[29]), "=f"(_er_load[30]), "=f"(_er_load[31])
                     : "r"(er_row + 352));
-#endif  // CAKE_WGRAD_OUT
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
-#if CAKE_WGRAD_OUT == 16
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 0], _er_load[_lp*2+1 + 0]));
@@ -3858,7 +5959,387 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_er_load[_lp*2 + 30], _er_load[_lp*2+1 + 30]));
                     _er_packed[_lp + 127] = *(uint32_t*)&_bf2;
                 }
+                if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    asm volatile(
+                        "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+                        :: "r"((epilogue_done_addr) & 0xFEFFFFFF) : "memory");
+                }
+                _phase_mainloop_done ^= 1;
 #endif  // CAKE_WGRAD_OUT == 16
+                unsigned int e_ue = ts_e / tiles_per_group_e;
+                unsigned int rem_e = ts_e - e_ue * tiles_per_group_e;
+                unsigned int n_block_e = 0;
+                unsigned int k_block_e = 0;
+                unsigned int rr_n_block_e = (unsigned int)raster_rows;
+                unsigned int nc_n_block_e = rem_e / grid_k_e;
+                unsigned int kr_n_block_e = rem_e / grid_n_e;
+                n_block_e = nc_n_block_e * (1 - rr_n_block_e) + (rem_e - kr_n_block_e * grid_n_e) * rr_n_block_e;
+                k_block_e = (rem_e - nc_n_block_e * grid_k_e) * (1 - rr_n_block_e) + kr_n_block_e * rr_n_block_e;
+                if (num_groups <= 128) {
+                    e_ue = (unsigned int)og_a[(int)e_ue];
+                }
+                int row_n = (int)n_block_e * BLOCK_N + cta_rank * BLOCK_M + epi_tid;
+                int col0 = (int)k_block_e * TILE_K;
+#if CAKE_WGRAD_OUT == 32
+                int er_outf = (int)e_ue * stride_e + row_n * ldc + col0 + epi_half * 128;
+#else
+                int er_out = (int)e_ue * stride_e + row_n * ldc + col0 + epi_half * 128;
+#endif  // CAKE_WGRAD_OUT
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_33_0 = __float_as_uint(_er_f[0 + 0]);
+                    unsigned _stv8_33_1 = __float_as_uint(_er_f[0 + 1]);
+                    unsigned _stv8_33_2 = __float_as_uint(_er_f[0 + 2]);
+                    unsigned _stv8_33_3 = __float_as_uint(_er_f[0 + 3]);
+                    unsigned _stv8_33_4 = __float_as_uint(_er_f[0 + 4]);
+                    unsigned _stv8_33_5 = __float_as_uint(_er_f[0 + 5]);
+                    unsigned _stv8_33_6 = __float_as_uint(_er_f[0 + 6]);
+                    unsigned _stv8_33_7 = __float_as_uint(_er_f[0 + 7]);
+#else
+                    const unsigned* _raw_stv8_17 = reinterpret_cast<const unsigned*>(_er_packed);
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + er_outf + (0))), "r"(_stv8_33_0), "r"(_stv8_33_1), "r"(_stv8_33_2), "r"(_stv8_33_3), "r"(_stv8_33_4), "r"(_stv8_33_5), "r"(_stv8_33_6), "r"(_stv8_33_7) : "memory");
+#else
+                        :: "l"((void*)(C + er_out)), "r"(_raw_stv8_17[0]), "r"(_raw_stv8_17[1]), "r"(_raw_stv8_17[2]), "r"(_raw_stv8_17[3]), "r"(_raw_stv8_17[4]), "r"(_raw_stv8_17[5]), "r"(_raw_stv8_17[6]), "r"(_raw_stv8_17[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_34_0 = __float_as_uint(_er_f[8 + 0]);
+                    unsigned _stv8_34_1 = __float_as_uint(_er_f[8 + 1]);
+                    unsigned _stv8_34_2 = __float_as_uint(_er_f[8 + 2]);
+                    unsigned _stv8_34_3 = __float_as_uint(_er_f[8 + 3]);
+                    unsigned _stv8_34_4 = __float_as_uint(_er_f[8 + 4]);
+                    unsigned _stv8_34_5 = __float_as_uint(_er_f[8 + 5]);
+                    unsigned _stv8_34_6 = __float_as_uint(_er_f[8 + 6]);
+                    unsigned _stv8_34_7 = __float_as_uint(_er_f[8 + 7]);
+#else
+                    const unsigned* _raw_stv8_18 = reinterpret_cast<const unsigned*>(_er_packed + (64));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 8) + (0))), "r"(_stv8_34_0), "r"(_stv8_34_1), "r"(_stv8_34_2), "r"(_stv8_34_3), "r"(_stv8_34_4), "r"(_stv8_34_5), "r"(_stv8_34_6), "r"(_stv8_34_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 256))), "r"(_raw_stv8_18[0]), "r"(_raw_stv8_18[1]), "r"(_raw_stv8_18[2]), "r"(_raw_stv8_18[3]), "r"(_raw_stv8_18[4]), "r"(_raw_stv8_18[5]), "r"(_raw_stv8_18[6]), "r"(_raw_stv8_18[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_35_0 = __float_as_uint(_er_f[16 + 0]);
+                    unsigned _stv8_35_1 = __float_as_uint(_er_f[16 + 1]);
+                    unsigned _stv8_35_2 = __float_as_uint(_er_f[16 + 2]);
+                    unsigned _stv8_35_3 = __float_as_uint(_er_f[16 + 3]);
+                    unsigned _stv8_35_4 = __float_as_uint(_er_f[16 + 4]);
+                    unsigned _stv8_35_5 = __float_as_uint(_er_f[16 + 5]);
+                    unsigned _stv8_35_6 = __float_as_uint(_er_f[16 + 6]);
+                    unsigned _stv8_35_7 = __float_as_uint(_er_f[16 + 7]);
+#else
+                    const unsigned* _raw_stv8_19 = reinterpret_cast<const unsigned*>(_er_packed + (8));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 16) + (0))), "r"(_stv8_35_0), "r"(_stv8_35_1), "r"(_stv8_35_2), "r"(_stv8_35_3), "r"(_stv8_35_4), "r"(_stv8_35_5), "r"(_stv8_35_6), "r"(_stv8_35_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 16))), "r"(_raw_stv8_19[0]), "r"(_raw_stv8_19[1]), "r"(_raw_stv8_19[2]), "r"(_raw_stv8_19[3]), "r"(_raw_stv8_19[4]), "r"(_raw_stv8_19[5]), "r"(_raw_stv8_19[6]), "r"(_raw_stv8_19[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_36_0 = __float_as_uint(_er_f[24 + 0]);
+                    unsigned _stv8_36_1 = __float_as_uint(_er_f[24 + 1]);
+                    unsigned _stv8_36_2 = __float_as_uint(_er_f[24 + 2]);
+                    unsigned _stv8_36_3 = __float_as_uint(_er_f[24 + 3]);
+                    unsigned _stv8_36_4 = __float_as_uint(_er_f[24 + 4]);
+                    unsigned _stv8_36_5 = __float_as_uint(_er_f[24 + 5]);
+                    unsigned _stv8_36_6 = __float_as_uint(_er_f[24 + 6]);
+                    unsigned _stv8_36_7 = __float_as_uint(_er_f[24 + 7]);
+#else
+                    const unsigned* _raw_stv8_20 = reinterpret_cast<const unsigned*>(_er_packed + (72));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 24) + (0))), "r"(_stv8_36_0), "r"(_stv8_36_1), "r"(_stv8_36_2), "r"(_stv8_36_3), "r"(_stv8_36_4), "r"(_stv8_36_5), "r"(_stv8_36_6), "r"(_stv8_36_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 272))), "r"(_raw_stv8_20[0]), "r"(_raw_stv8_20[1]), "r"(_raw_stv8_20[2]), "r"(_raw_stv8_20[3]), "r"(_raw_stv8_20[4]), "r"(_raw_stv8_20[5]), "r"(_raw_stv8_20[6]), "r"(_raw_stv8_20[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_37_0 = __float_as_uint(_er_f[32 + 0]);
+                    unsigned _stv8_37_1 = __float_as_uint(_er_f[32 + 1]);
+                    unsigned _stv8_37_2 = __float_as_uint(_er_f[32 + 2]);
+                    unsigned _stv8_37_3 = __float_as_uint(_er_f[32 + 3]);
+                    unsigned _stv8_37_4 = __float_as_uint(_er_f[32 + 4]);
+                    unsigned _stv8_37_5 = __float_as_uint(_er_f[32 + 5]);
+                    unsigned _stv8_37_6 = __float_as_uint(_er_f[32 + 6]);
+                    unsigned _stv8_37_7 = __float_as_uint(_er_f[32 + 7]);
+#else
+                    const unsigned* _raw_stv8_21 = reinterpret_cast<const unsigned*>(_er_packed + (16));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 32) + (0))), "r"(_stv8_37_0), "r"(_stv8_37_1), "r"(_stv8_37_2), "r"(_stv8_37_3), "r"(_stv8_37_4), "r"(_stv8_37_5), "r"(_stv8_37_6), "r"(_stv8_37_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 32))), "r"(_raw_stv8_21[0]), "r"(_raw_stv8_21[1]), "r"(_raw_stv8_21[2]), "r"(_raw_stv8_21[3]), "r"(_raw_stv8_21[4]), "r"(_raw_stv8_21[5]), "r"(_raw_stv8_21[6]), "r"(_raw_stv8_21[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_38_0 = __float_as_uint(_er_f[40 + 0]);
+                    unsigned _stv8_38_1 = __float_as_uint(_er_f[40 + 1]);
+                    unsigned _stv8_38_2 = __float_as_uint(_er_f[40 + 2]);
+                    unsigned _stv8_38_3 = __float_as_uint(_er_f[40 + 3]);
+                    unsigned _stv8_38_4 = __float_as_uint(_er_f[40 + 4]);
+                    unsigned _stv8_38_5 = __float_as_uint(_er_f[40 + 5]);
+                    unsigned _stv8_38_6 = __float_as_uint(_er_f[40 + 6]);
+                    unsigned _stv8_38_7 = __float_as_uint(_er_f[40 + 7]);
+#else
+                    const unsigned* _raw_stv8_22 = reinterpret_cast<const unsigned*>(_er_packed + (80));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 40) + (0))), "r"(_stv8_38_0), "r"(_stv8_38_1), "r"(_stv8_38_2), "r"(_stv8_38_3), "r"(_stv8_38_4), "r"(_stv8_38_5), "r"(_stv8_38_6), "r"(_stv8_38_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 288))), "r"(_raw_stv8_22[0]), "r"(_raw_stv8_22[1]), "r"(_raw_stv8_22[2]), "r"(_raw_stv8_22[3]), "r"(_raw_stv8_22[4]), "r"(_raw_stv8_22[5]), "r"(_raw_stv8_22[6]), "r"(_raw_stv8_22[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_39_0 = __float_as_uint(_er_f[48 + 0]);
+                    unsigned _stv8_39_1 = __float_as_uint(_er_f[48 + 1]);
+                    unsigned _stv8_39_2 = __float_as_uint(_er_f[48 + 2]);
+                    unsigned _stv8_39_3 = __float_as_uint(_er_f[48 + 3]);
+                    unsigned _stv8_39_4 = __float_as_uint(_er_f[48 + 4]);
+                    unsigned _stv8_39_5 = __float_as_uint(_er_f[48 + 5]);
+                    unsigned _stv8_39_6 = __float_as_uint(_er_f[48 + 6]);
+                    unsigned _stv8_39_7 = __float_as_uint(_er_f[48 + 7]);
+#else
+                    const unsigned* _raw_stv8_23 = reinterpret_cast<const unsigned*>(_er_packed + (24));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 48) + (0))), "r"(_stv8_39_0), "r"(_stv8_39_1), "r"(_stv8_39_2), "r"(_stv8_39_3), "r"(_stv8_39_4), "r"(_stv8_39_5), "r"(_stv8_39_6), "r"(_stv8_39_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 48))), "r"(_raw_stv8_23[0]), "r"(_raw_stv8_23[1]), "r"(_raw_stv8_23[2]), "r"(_raw_stv8_23[3]), "r"(_raw_stv8_23[4]), "r"(_raw_stv8_23[5]), "r"(_raw_stv8_23[6]), "r"(_raw_stv8_23[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_40_0 = __float_as_uint(_er_f[56 + 0]);
+                    unsigned _stv8_40_1 = __float_as_uint(_er_f[56 + 1]);
+                    unsigned _stv8_40_2 = __float_as_uint(_er_f[56 + 2]);
+                    unsigned _stv8_40_3 = __float_as_uint(_er_f[56 + 3]);
+                    unsigned _stv8_40_4 = __float_as_uint(_er_f[56 + 4]);
+                    unsigned _stv8_40_5 = __float_as_uint(_er_f[56 + 5]);
+                    unsigned _stv8_40_6 = __float_as_uint(_er_f[56 + 6]);
+                    unsigned _stv8_40_7 = __float_as_uint(_er_f[56 + 7]);
+#else
+                    const unsigned* _raw_stv8_24 = reinterpret_cast<const unsigned*>(_er_packed + (88));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 56) + (0))), "r"(_stv8_40_0), "r"(_stv8_40_1), "r"(_stv8_40_2), "r"(_stv8_40_3), "r"(_stv8_40_4), "r"(_stv8_40_5), "r"(_stv8_40_6), "r"(_stv8_40_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 304))), "r"(_raw_stv8_24[0]), "r"(_raw_stv8_24[1]), "r"(_raw_stv8_24[2]), "r"(_raw_stv8_24[3]), "r"(_raw_stv8_24[4]), "r"(_raw_stv8_24[5]), "r"(_raw_stv8_24[6]), "r"(_raw_stv8_24[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_41_0 = __float_as_uint(_er_f[64 + 0]);
+                    unsigned _stv8_41_1 = __float_as_uint(_er_f[64 + 1]);
+                    unsigned _stv8_41_2 = __float_as_uint(_er_f[64 + 2]);
+                    unsigned _stv8_41_3 = __float_as_uint(_er_f[64 + 3]);
+                    unsigned _stv8_41_4 = __float_as_uint(_er_f[64 + 4]);
+                    unsigned _stv8_41_5 = __float_as_uint(_er_f[64 + 5]);
+                    unsigned _stv8_41_6 = __float_as_uint(_er_f[64 + 6]);
+                    unsigned _stv8_41_7 = __float_as_uint(_er_f[64 + 7]);
+#else
+                    const unsigned* _raw_stv8_25 = reinterpret_cast<const unsigned*>(_er_packed + (32));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 64) + (0))), "r"(_stv8_41_0), "r"(_stv8_41_1), "r"(_stv8_41_2), "r"(_stv8_41_3), "r"(_stv8_41_4), "r"(_stv8_41_5), "r"(_stv8_41_6), "r"(_stv8_41_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 64))), "r"(_raw_stv8_25[0]), "r"(_raw_stv8_25[1]), "r"(_raw_stv8_25[2]), "r"(_raw_stv8_25[3]), "r"(_raw_stv8_25[4]), "r"(_raw_stv8_25[5]), "r"(_raw_stv8_25[6]), "r"(_raw_stv8_25[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_42_0 = __float_as_uint(_er_f[72 + 0]);
+                    unsigned _stv8_42_1 = __float_as_uint(_er_f[72 + 1]);
+                    unsigned _stv8_42_2 = __float_as_uint(_er_f[72 + 2]);
+                    unsigned _stv8_42_3 = __float_as_uint(_er_f[72 + 3]);
+                    unsigned _stv8_42_4 = __float_as_uint(_er_f[72 + 4]);
+                    unsigned _stv8_42_5 = __float_as_uint(_er_f[72 + 5]);
+                    unsigned _stv8_42_6 = __float_as_uint(_er_f[72 + 6]);
+                    unsigned _stv8_42_7 = __float_as_uint(_er_f[72 + 7]);
+#else
+                    const unsigned* _raw_stv8_26 = reinterpret_cast<const unsigned*>(_er_packed + (96));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 72) + (0))), "r"(_stv8_42_0), "r"(_stv8_42_1), "r"(_stv8_42_2), "r"(_stv8_42_3), "r"(_stv8_42_4), "r"(_stv8_42_5), "r"(_stv8_42_6), "r"(_stv8_42_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 320))), "r"(_raw_stv8_26[0]), "r"(_raw_stv8_26[1]), "r"(_raw_stv8_26[2]), "r"(_raw_stv8_26[3]), "r"(_raw_stv8_26[4]), "r"(_raw_stv8_26[5]), "r"(_raw_stv8_26[6]), "r"(_raw_stv8_26[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_43_0 = __float_as_uint(_er_f[80 + 0]);
+                    unsigned _stv8_43_1 = __float_as_uint(_er_f[80 + 1]);
+                    unsigned _stv8_43_2 = __float_as_uint(_er_f[80 + 2]);
+                    unsigned _stv8_43_3 = __float_as_uint(_er_f[80 + 3]);
+                    unsigned _stv8_43_4 = __float_as_uint(_er_f[80 + 4]);
+                    unsigned _stv8_43_5 = __float_as_uint(_er_f[80 + 5]);
+                    unsigned _stv8_43_6 = __float_as_uint(_er_f[80 + 6]);
+                    unsigned _stv8_43_7 = __float_as_uint(_er_f[80 + 7]);
+#else
+                    const unsigned* _raw_stv8_27 = reinterpret_cast<const unsigned*>(_er_packed + (40));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 80) + (0))), "r"(_stv8_43_0), "r"(_stv8_43_1), "r"(_stv8_43_2), "r"(_stv8_43_3), "r"(_stv8_43_4), "r"(_stv8_43_5), "r"(_stv8_43_6), "r"(_stv8_43_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 80))), "r"(_raw_stv8_27[0]), "r"(_raw_stv8_27[1]), "r"(_raw_stv8_27[2]), "r"(_raw_stv8_27[3]), "r"(_raw_stv8_27[4]), "r"(_raw_stv8_27[5]), "r"(_raw_stv8_27[6]), "r"(_raw_stv8_27[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_44_0 = __float_as_uint(_er_f[88 + 0]);
+                    unsigned _stv8_44_1 = __float_as_uint(_er_f[88 + 1]);
+                    unsigned _stv8_44_2 = __float_as_uint(_er_f[88 + 2]);
+                    unsigned _stv8_44_3 = __float_as_uint(_er_f[88 + 3]);
+                    unsigned _stv8_44_4 = __float_as_uint(_er_f[88 + 4]);
+                    unsigned _stv8_44_5 = __float_as_uint(_er_f[88 + 5]);
+                    unsigned _stv8_44_6 = __float_as_uint(_er_f[88 + 6]);
+                    unsigned _stv8_44_7 = __float_as_uint(_er_f[88 + 7]);
+#else
+                    const unsigned* _raw_stv8_28 = reinterpret_cast<const unsigned*>(_er_packed + (104));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 88) + (0))), "r"(_stv8_44_0), "r"(_stv8_44_1), "r"(_stv8_44_2), "r"(_stv8_44_3), "r"(_stv8_44_4), "r"(_stv8_44_5), "r"(_stv8_44_6), "r"(_stv8_44_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 336))), "r"(_raw_stv8_28[0]), "r"(_raw_stv8_28[1]), "r"(_raw_stv8_28[2]), "r"(_raw_stv8_28[3]), "r"(_raw_stv8_28[4]), "r"(_raw_stv8_28[5]), "r"(_raw_stv8_28[6]), "r"(_raw_stv8_28[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_45_0 = __float_as_uint(_er_f[96 + 0]);
+                    unsigned _stv8_45_1 = __float_as_uint(_er_f[96 + 1]);
+                    unsigned _stv8_45_2 = __float_as_uint(_er_f[96 + 2]);
+                    unsigned _stv8_45_3 = __float_as_uint(_er_f[96 + 3]);
+                    unsigned _stv8_45_4 = __float_as_uint(_er_f[96 + 4]);
+                    unsigned _stv8_45_5 = __float_as_uint(_er_f[96 + 5]);
+                    unsigned _stv8_45_6 = __float_as_uint(_er_f[96 + 6]);
+                    unsigned _stv8_45_7 = __float_as_uint(_er_f[96 + 7]);
+#else
+                    const unsigned* _raw_stv8_29 = reinterpret_cast<const unsigned*>(_er_packed + (48));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 96) + (0))), "r"(_stv8_45_0), "r"(_stv8_45_1), "r"(_stv8_45_2), "r"(_stv8_45_3), "r"(_stv8_45_4), "r"(_stv8_45_5), "r"(_stv8_45_6), "r"(_stv8_45_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 96))), "r"(_raw_stv8_29[0]), "r"(_raw_stv8_29[1]), "r"(_raw_stv8_29[2]), "r"(_raw_stv8_29[3]), "r"(_raw_stv8_29[4]), "r"(_raw_stv8_29[5]), "r"(_raw_stv8_29[6]), "r"(_raw_stv8_29[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_46_0 = __float_as_uint(_er_f[104 + 0]);
+                    unsigned _stv8_46_1 = __float_as_uint(_er_f[104 + 1]);
+                    unsigned _stv8_46_2 = __float_as_uint(_er_f[104 + 2]);
+                    unsigned _stv8_46_3 = __float_as_uint(_er_f[104 + 3]);
+                    unsigned _stv8_46_4 = __float_as_uint(_er_f[104 + 4]);
+                    unsigned _stv8_46_5 = __float_as_uint(_er_f[104 + 5]);
+                    unsigned _stv8_46_6 = __float_as_uint(_er_f[104 + 6]);
+                    unsigned _stv8_46_7 = __float_as_uint(_er_f[104 + 7]);
+#else
+                    const unsigned* _raw_stv8_30 = reinterpret_cast<const unsigned*>(_er_packed + (112));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 104) + (0))), "r"(_stv8_46_0), "r"(_stv8_46_1), "r"(_stv8_46_2), "r"(_stv8_46_3), "r"(_stv8_46_4), "r"(_stv8_46_5), "r"(_stv8_46_6), "r"(_stv8_46_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 352))), "r"(_raw_stv8_30[0]), "r"(_raw_stv8_30[1]), "r"(_raw_stv8_30[2]), "r"(_raw_stv8_30[3]), "r"(_raw_stv8_30[4]), "r"(_raw_stv8_30[5]), "r"(_raw_stv8_30[6]), "r"(_raw_stv8_30[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_47_0 = __float_as_uint(_er_f[112 + 0]);
+                    unsigned _stv8_47_1 = __float_as_uint(_er_f[112 + 1]);
+                    unsigned _stv8_47_2 = __float_as_uint(_er_f[112 + 2]);
+                    unsigned _stv8_47_3 = __float_as_uint(_er_f[112 + 3]);
+                    unsigned _stv8_47_4 = __float_as_uint(_er_f[112 + 4]);
+                    unsigned _stv8_47_5 = __float_as_uint(_er_f[112 + 5]);
+                    unsigned _stv8_47_6 = __float_as_uint(_er_f[112 + 6]);
+                    unsigned _stv8_47_7 = __float_as_uint(_er_f[112 + 7]);
+#else
+                    const unsigned* _raw_stv8_31 = reinterpret_cast<const unsigned*>(_er_packed + (56));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 112) + (0))), "r"(_stv8_47_0), "r"(_stv8_47_1), "r"(_stv8_47_2), "r"(_stv8_47_3), "r"(_stv8_47_4), "r"(_stv8_47_5), "r"(_stv8_47_6), "r"(_stv8_47_7) : "memory");
+#else
+                        :: "l"((void*)(C + (er_out + 112))), "r"(_raw_stv8_31[0]), "r"(_raw_stv8_31[1]), "r"(_raw_stv8_31[2]), "r"(_raw_stv8_31[3]), "r"(_raw_stv8_31[4]), "r"(_raw_stv8_31[5]), "r"(_raw_stv8_31[6]), "r"(_raw_stv8_31[7]) : "memory");
+#endif  // CAKE_WGRAD_OUT
+                }
+                {
+#if CAKE_WGRAD_OUT == 32
+                    unsigned _stv8_48_0 = __float_as_uint(_er_f[120 + 0]);
+                    unsigned _stv8_48_1 = __float_as_uint(_er_f[120 + 1]);
+                    unsigned _stv8_48_2 = __float_as_uint(_er_f[120 + 2]);
+                    unsigned _stv8_48_3 = __float_as_uint(_er_f[120 + 3]);
+                    unsigned _stv8_48_4 = __float_as_uint(_er_f[120 + 4]);
+                    unsigned _stv8_48_5 = __float_as_uint(_er_f[120 + 5]);
+                    unsigned _stv8_48_6 = __float_as_uint(_er_f[120 + 6]);
+                    unsigned _stv8_48_7 = __float_as_uint(_er_f[120 + 7]);
+#else
+                    const unsigned* _raw_stv8_32 = reinterpret_cast<const unsigned*>(_er_packed + (120));
+#endif  // CAKE_WGRAD_OUT
+                    asm volatile(
+                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+#if CAKE_WGRAD_OUT == 32
+                        :: "l"((void*)(C + (er_outf + 120) + (0))), "r"(_stv8_48_0), "r"(_stv8_48_1), "r"(_stv8_48_2), "r"(_stv8_48_3), "r"(_stv8_48_4), "r"(_stv8_48_5), "r"(_stv8_48_6), "r"(_stv8_48_7) : "memory");
+                }
+                asm volatile(
+                    "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                    : "=f"(_er_f[0]), "=f"(_er_f[1]), "=f"(_er_f[2]), "=f"(_er_f[3]), "=f"(_er_f[4]), "=f"(_er_f[5]), "=f"(_er_f[6]), "=f"(_er_f[7]), "=f"(_er_f[8]), "=f"(_er_f[9]), "=f"(_er_f[10]), "=f"(_er_f[11]), "=f"(_er_f[12]), "=f"(_er_f[13]), "=f"(_er_f[14]), "=f"(_er_f[15]), "=f"(_er_f[16]), "=f"(_er_f[17]), "=f"(_er_f[18]), "=f"(_er_f[19]), "=f"(_er_f[20]), "=f"(_er_f[21]), "=f"(_er_f[22]), "=f"(_er_f[23]), "=f"(_er_f[24]), "=f"(_er_f[25]), "=f"(_er_f[26]), "=f"(_er_f[27]), "=f"(_er_f[28]), "=f"(_er_f[29]), "=f"(_er_f[30]), "=f"(_er_f[31])
+                    : "r"(er_rowf + 256));
+                asm volatile(
+                    "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                    : "=f"(_er_f[32]), "=f"(_er_f[33]), "=f"(_er_f[34]), "=f"(_er_f[35]), "=f"(_er_f[36]), "=f"(_er_f[37]), "=f"(_er_f[38]), "=f"(_er_f[39]), "=f"(_er_f[40]), "=f"(_er_f[41]), "=f"(_er_f[42]), "=f"(_er_f[43]), "=f"(_er_f[44]), "=f"(_er_f[45]), "=f"(_er_f[46]), "=f"(_er_f[47]), "=f"(_er_f[48]), "=f"(_er_f[49]), "=f"(_er_f[50]), "=f"(_er_f[51]), "=f"(_er_f[52]), "=f"(_er_f[53]), "=f"(_er_f[54]), "=f"(_er_f[55]), "=f"(_er_f[56]), "=f"(_er_f[57]), "=f"(_er_f[58]), "=f"(_er_f[59]), "=f"(_er_f[60]), "=f"(_er_f[61]), "=f"(_er_f[62]), "=f"(_er_f[63])
+                    : "r"(er_rowf + 288));
+                asm volatile(
+                    "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                    : "=f"(_er_f[64]), "=f"(_er_f[65]), "=f"(_er_f[66]), "=f"(_er_f[67]), "=f"(_er_f[68]), "=f"(_er_f[69]), "=f"(_er_f[70]), "=f"(_er_f[71]), "=f"(_er_f[72]), "=f"(_er_f[73]), "=f"(_er_f[74]), "=f"(_er_f[75]), "=f"(_er_f[76]), "=f"(_er_f[77]), "=f"(_er_f[78]), "=f"(_er_f[79]), "=f"(_er_f[80]), "=f"(_er_f[81]), "=f"(_er_f[82]), "=f"(_er_f[83]), "=f"(_er_f[84]), "=f"(_er_f[85]), "=f"(_er_f[86]), "=f"(_er_f[87]), "=f"(_er_f[88]), "=f"(_er_f[89]), "=f"(_er_f[90]), "=f"(_er_f[91]), "=f"(_er_f[92]), "=f"(_er_f[93]), "=f"(_er_f[94]), "=f"(_er_f[95])
+                    : "r"(er_rowf + 320));
+                asm volatile(
+                    "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                    " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                    : "=f"(_er_f[96]), "=f"(_er_f[97]), "=f"(_er_f[98]), "=f"(_er_f[99]), "=f"(_er_f[100]), "=f"(_er_f[101]), "=f"(_er_f[102]), "=f"(_er_f[103]), "=f"(_er_f[104]), "=f"(_er_f[105]), "=f"(_er_f[106]), "=f"(_er_f[107]), "=f"(_er_f[108]), "=f"(_er_f[109]), "=f"(_er_f[110]), "=f"(_er_f[111]), "=f"(_er_f[112]), "=f"(_er_f[113]), "=f"(_er_f[114]), "=f"(_er_f[115]), "=f"(_er_f[116]), "=f"(_er_f[117]), "=f"(_er_f[118]), "=f"(_er_f[119]), "=f"(_er_f[120]), "=f"(_er_f[121]), "=f"(_er_f[122]), "=f"(_er_f[123]), "=f"(_er_f[124]), "=f"(_er_f[125]), "=f"(_er_f[126]), "=f"(_er_f[127])
+                    : "r"(er_rowf + 352));
+                asm volatile("tcgen05.wait::ld.sync.aligned;");
                 if (elect_sync()) {
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile(
@@ -3867,7 +6348,6 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                 }
                 _phase_mainloop_done ^= 1;
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_49_0 = __float_as_uint(_er_f[0 + 0]);
                     unsigned _stv8_49_1 = __float_as_uint(_er_f[0 + 1]);
                     unsigned _stv8_49_2 = __float_as_uint(_er_f[0 + 2]);
@@ -3876,19 +6356,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_49_5 = __float_as_uint(_er_f[0 + 5]);
                     unsigned _stv8_49_6 = __float_as_uint(_er_f[0 + 6]);
                     unsigned _stv8_49_7 = __float_as_uint(_er_f[0 + 7]);
-#else
-                    const unsigned* _raw_stv8_17 = reinterpret_cast<const unsigned*>(_er_packed);
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 256) + (0))), "r"(_stv8_49_0), "r"(_stv8_49_1), "r"(_stv8_49_2), "r"(_stv8_49_3), "r"(_stv8_49_4), "r"(_stv8_49_5), "r"(_stv8_49_6), "r"(_stv8_49_7) : "memory");
-#else
-                        :: "l"((void*)(C + er_out)), "r"(_raw_stv8_17[0]), "r"(_raw_stv8_17[1]), "r"(_raw_stv8_17[2]), "r"(_raw_stv8_17[3]), "r"(_raw_stv8_17[4]), "r"(_raw_stv8_17[5]), "r"(_raw_stv8_17[6]), "r"(_raw_stv8_17[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_50_0 = __float_as_uint(_er_f[8 + 0]);
                     unsigned _stv8_50_1 = __float_as_uint(_er_f[8 + 1]);
                     unsigned _stv8_50_2 = __float_as_uint(_er_f[8 + 2]);
@@ -3897,19 +6369,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_50_5 = __float_as_uint(_er_f[8 + 5]);
                     unsigned _stv8_50_6 = __float_as_uint(_er_f[8 + 6]);
                     unsigned _stv8_50_7 = __float_as_uint(_er_f[8 + 7]);
-#else
-                    const unsigned* _raw_stv8_18 = reinterpret_cast<const unsigned*>(_er_packed + (64));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 264) + (0))), "r"(_stv8_50_0), "r"(_stv8_50_1), "r"(_stv8_50_2), "r"(_stv8_50_3), "r"(_stv8_50_4), "r"(_stv8_50_5), "r"(_stv8_50_6), "r"(_stv8_50_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 256))), "r"(_raw_stv8_18[0]), "r"(_raw_stv8_18[1]), "r"(_raw_stv8_18[2]), "r"(_raw_stv8_18[3]), "r"(_raw_stv8_18[4]), "r"(_raw_stv8_18[5]), "r"(_raw_stv8_18[6]), "r"(_raw_stv8_18[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_51_0 = __float_as_uint(_er_f[16 + 0]);
                     unsigned _stv8_51_1 = __float_as_uint(_er_f[16 + 1]);
                     unsigned _stv8_51_2 = __float_as_uint(_er_f[16 + 2]);
@@ -3918,19 +6382,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_51_5 = __float_as_uint(_er_f[16 + 5]);
                     unsigned _stv8_51_6 = __float_as_uint(_er_f[16 + 6]);
                     unsigned _stv8_51_7 = __float_as_uint(_er_f[16 + 7]);
-#else
-                    const unsigned* _raw_stv8_19 = reinterpret_cast<const unsigned*>(_er_packed + (8));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 272) + (0))), "r"(_stv8_51_0), "r"(_stv8_51_1), "r"(_stv8_51_2), "r"(_stv8_51_3), "r"(_stv8_51_4), "r"(_stv8_51_5), "r"(_stv8_51_6), "r"(_stv8_51_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 16))), "r"(_raw_stv8_19[0]), "r"(_raw_stv8_19[1]), "r"(_raw_stv8_19[2]), "r"(_raw_stv8_19[3]), "r"(_raw_stv8_19[4]), "r"(_raw_stv8_19[5]), "r"(_raw_stv8_19[6]), "r"(_raw_stv8_19[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_52_0 = __float_as_uint(_er_f[24 + 0]);
                     unsigned _stv8_52_1 = __float_as_uint(_er_f[24 + 1]);
                     unsigned _stv8_52_2 = __float_as_uint(_er_f[24 + 2]);
@@ -3939,19 +6395,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_52_5 = __float_as_uint(_er_f[24 + 5]);
                     unsigned _stv8_52_6 = __float_as_uint(_er_f[24 + 6]);
                     unsigned _stv8_52_7 = __float_as_uint(_er_f[24 + 7]);
-#else
-                    const unsigned* _raw_stv8_20 = reinterpret_cast<const unsigned*>(_er_packed + (72));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 280) + (0))), "r"(_stv8_52_0), "r"(_stv8_52_1), "r"(_stv8_52_2), "r"(_stv8_52_3), "r"(_stv8_52_4), "r"(_stv8_52_5), "r"(_stv8_52_6), "r"(_stv8_52_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 272))), "r"(_raw_stv8_20[0]), "r"(_raw_stv8_20[1]), "r"(_raw_stv8_20[2]), "r"(_raw_stv8_20[3]), "r"(_raw_stv8_20[4]), "r"(_raw_stv8_20[5]), "r"(_raw_stv8_20[6]), "r"(_raw_stv8_20[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_53_0 = __float_as_uint(_er_f[32 + 0]);
                     unsigned _stv8_53_1 = __float_as_uint(_er_f[32 + 1]);
                     unsigned _stv8_53_2 = __float_as_uint(_er_f[32 + 2]);
@@ -3960,19 +6408,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_53_5 = __float_as_uint(_er_f[32 + 5]);
                     unsigned _stv8_53_6 = __float_as_uint(_er_f[32 + 6]);
                     unsigned _stv8_53_7 = __float_as_uint(_er_f[32 + 7]);
-#else
-                    const unsigned* _raw_stv8_21 = reinterpret_cast<const unsigned*>(_er_packed + (16));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 288) + (0))), "r"(_stv8_53_0), "r"(_stv8_53_1), "r"(_stv8_53_2), "r"(_stv8_53_3), "r"(_stv8_53_4), "r"(_stv8_53_5), "r"(_stv8_53_6), "r"(_stv8_53_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 32))), "r"(_raw_stv8_21[0]), "r"(_raw_stv8_21[1]), "r"(_raw_stv8_21[2]), "r"(_raw_stv8_21[3]), "r"(_raw_stv8_21[4]), "r"(_raw_stv8_21[5]), "r"(_raw_stv8_21[6]), "r"(_raw_stv8_21[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_54_0 = __float_as_uint(_er_f[40 + 0]);
                     unsigned _stv8_54_1 = __float_as_uint(_er_f[40 + 1]);
                     unsigned _stv8_54_2 = __float_as_uint(_er_f[40 + 2]);
@@ -3981,19 +6421,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_54_5 = __float_as_uint(_er_f[40 + 5]);
                     unsigned _stv8_54_6 = __float_as_uint(_er_f[40 + 6]);
                     unsigned _stv8_54_7 = __float_as_uint(_er_f[40 + 7]);
-#else
-                    const unsigned* _raw_stv8_22 = reinterpret_cast<const unsigned*>(_er_packed + (80));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 296) + (0))), "r"(_stv8_54_0), "r"(_stv8_54_1), "r"(_stv8_54_2), "r"(_stv8_54_3), "r"(_stv8_54_4), "r"(_stv8_54_5), "r"(_stv8_54_6), "r"(_stv8_54_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 288))), "r"(_raw_stv8_22[0]), "r"(_raw_stv8_22[1]), "r"(_raw_stv8_22[2]), "r"(_raw_stv8_22[3]), "r"(_raw_stv8_22[4]), "r"(_raw_stv8_22[5]), "r"(_raw_stv8_22[6]), "r"(_raw_stv8_22[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_55_0 = __float_as_uint(_er_f[48 + 0]);
                     unsigned _stv8_55_1 = __float_as_uint(_er_f[48 + 1]);
                     unsigned _stv8_55_2 = __float_as_uint(_er_f[48 + 2]);
@@ -4002,19 +6434,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_55_5 = __float_as_uint(_er_f[48 + 5]);
                     unsigned _stv8_55_6 = __float_as_uint(_er_f[48 + 6]);
                     unsigned _stv8_55_7 = __float_as_uint(_er_f[48 + 7]);
-#else
-                    const unsigned* _raw_stv8_23 = reinterpret_cast<const unsigned*>(_er_packed + (24));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 304) + (0))), "r"(_stv8_55_0), "r"(_stv8_55_1), "r"(_stv8_55_2), "r"(_stv8_55_3), "r"(_stv8_55_4), "r"(_stv8_55_5), "r"(_stv8_55_6), "r"(_stv8_55_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 48))), "r"(_raw_stv8_23[0]), "r"(_raw_stv8_23[1]), "r"(_raw_stv8_23[2]), "r"(_raw_stv8_23[3]), "r"(_raw_stv8_23[4]), "r"(_raw_stv8_23[5]), "r"(_raw_stv8_23[6]), "r"(_raw_stv8_23[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_56_0 = __float_as_uint(_er_f[56 + 0]);
                     unsigned _stv8_56_1 = __float_as_uint(_er_f[56 + 1]);
                     unsigned _stv8_56_2 = __float_as_uint(_er_f[56 + 2]);
@@ -4023,19 +6447,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_56_5 = __float_as_uint(_er_f[56 + 5]);
                     unsigned _stv8_56_6 = __float_as_uint(_er_f[56 + 6]);
                     unsigned _stv8_56_7 = __float_as_uint(_er_f[56 + 7]);
-#else
-                    const unsigned* _raw_stv8_24 = reinterpret_cast<const unsigned*>(_er_packed + (88));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 312) + (0))), "r"(_stv8_56_0), "r"(_stv8_56_1), "r"(_stv8_56_2), "r"(_stv8_56_3), "r"(_stv8_56_4), "r"(_stv8_56_5), "r"(_stv8_56_6), "r"(_stv8_56_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 304))), "r"(_raw_stv8_24[0]), "r"(_raw_stv8_24[1]), "r"(_raw_stv8_24[2]), "r"(_raw_stv8_24[3]), "r"(_raw_stv8_24[4]), "r"(_raw_stv8_24[5]), "r"(_raw_stv8_24[6]), "r"(_raw_stv8_24[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_57_0 = __float_as_uint(_er_f[64 + 0]);
                     unsigned _stv8_57_1 = __float_as_uint(_er_f[64 + 1]);
                     unsigned _stv8_57_2 = __float_as_uint(_er_f[64 + 2]);
@@ -4044,19 +6460,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_57_5 = __float_as_uint(_er_f[64 + 5]);
                     unsigned _stv8_57_6 = __float_as_uint(_er_f[64 + 6]);
                     unsigned _stv8_57_7 = __float_as_uint(_er_f[64 + 7]);
-#else
-                    const unsigned* _raw_stv8_25 = reinterpret_cast<const unsigned*>(_er_packed + (32));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 320) + (0))), "r"(_stv8_57_0), "r"(_stv8_57_1), "r"(_stv8_57_2), "r"(_stv8_57_3), "r"(_stv8_57_4), "r"(_stv8_57_5), "r"(_stv8_57_6), "r"(_stv8_57_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 64))), "r"(_raw_stv8_25[0]), "r"(_raw_stv8_25[1]), "r"(_raw_stv8_25[2]), "r"(_raw_stv8_25[3]), "r"(_raw_stv8_25[4]), "r"(_raw_stv8_25[5]), "r"(_raw_stv8_25[6]), "r"(_raw_stv8_25[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_58_0 = __float_as_uint(_er_f[72 + 0]);
                     unsigned _stv8_58_1 = __float_as_uint(_er_f[72 + 1]);
                     unsigned _stv8_58_2 = __float_as_uint(_er_f[72 + 2]);
@@ -4065,19 +6473,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_58_5 = __float_as_uint(_er_f[72 + 5]);
                     unsigned _stv8_58_6 = __float_as_uint(_er_f[72 + 6]);
                     unsigned _stv8_58_7 = __float_as_uint(_er_f[72 + 7]);
-#else
-                    const unsigned* _raw_stv8_26 = reinterpret_cast<const unsigned*>(_er_packed + (96));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 328) + (0))), "r"(_stv8_58_0), "r"(_stv8_58_1), "r"(_stv8_58_2), "r"(_stv8_58_3), "r"(_stv8_58_4), "r"(_stv8_58_5), "r"(_stv8_58_6), "r"(_stv8_58_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 320))), "r"(_raw_stv8_26[0]), "r"(_raw_stv8_26[1]), "r"(_raw_stv8_26[2]), "r"(_raw_stv8_26[3]), "r"(_raw_stv8_26[4]), "r"(_raw_stv8_26[5]), "r"(_raw_stv8_26[6]), "r"(_raw_stv8_26[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_59_0 = __float_as_uint(_er_f[80 + 0]);
                     unsigned _stv8_59_1 = __float_as_uint(_er_f[80 + 1]);
                     unsigned _stv8_59_2 = __float_as_uint(_er_f[80 + 2]);
@@ -4086,19 +6486,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_59_5 = __float_as_uint(_er_f[80 + 5]);
                     unsigned _stv8_59_6 = __float_as_uint(_er_f[80 + 6]);
                     unsigned _stv8_59_7 = __float_as_uint(_er_f[80 + 7]);
-#else
-                    const unsigned* _raw_stv8_27 = reinterpret_cast<const unsigned*>(_er_packed + (40));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 336) + (0))), "r"(_stv8_59_0), "r"(_stv8_59_1), "r"(_stv8_59_2), "r"(_stv8_59_3), "r"(_stv8_59_4), "r"(_stv8_59_5), "r"(_stv8_59_6), "r"(_stv8_59_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 80))), "r"(_raw_stv8_27[0]), "r"(_raw_stv8_27[1]), "r"(_raw_stv8_27[2]), "r"(_raw_stv8_27[3]), "r"(_raw_stv8_27[4]), "r"(_raw_stv8_27[5]), "r"(_raw_stv8_27[6]), "r"(_raw_stv8_27[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_60_0 = __float_as_uint(_er_f[88 + 0]);
                     unsigned _stv8_60_1 = __float_as_uint(_er_f[88 + 1]);
                     unsigned _stv8_60_2 = __float_as_uint(_er_f[88 + 2]);
@@ -4107,19 +6499,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_60_5 = __float_as_uint(_er_f[88 + 5]);
                     unsigned _stv8_60_6 = __float_as_uint(_er_f[88 + 6]);
                     unsigned _stv8_60_7 = __float_as_uint(_er_f[88 + 7]);
-#else
-                    const unsigned* _raw_stv8_28 = reinterpret_cast<const unsigned*>(_er_packed + (104));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 344) + (0))), "r"(_stv8_60_0), "r"(_stv8_60_1), "r"(_stv8_60_2), "r"(_stv8_60_3), "r"(_stv8_60_4), "r"(_stv8_60_5), "r"(_stv8_60_6), "r"(_stv8_60_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 336))), "r"(_raw_stv8_28[0]), "r"(_raw_stv8_28[1]), "r"(_raw_stv8_28[2]), "r"(_raw_stv8_28[3]), "r"(_raw_stv8_28[4]), "r"(_raw_stv8_28[5]), "r"(_raw_stv8_28[6]), "r"(_raw_stv8_28[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_61_0 = __float_as_uint(_er_f[96 + 0]);
                     unsigned _stv8_61_1 = __float_as_uint(_er_f[96 + 1]);
                     unsigned _stv8_61_2 = __float_as_uint(_er_f[96 + 2]);
@@ -4128,19 +6512,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_61_5 = __float_as_uint(_er_f[96 + 5]);
                     unsigned _stv8_61_6 = __float_as_uint(_er_f[96 + 6]);
                     unsigned _stv8_61_7 = __float_as_uint(_er_f[96 + 7]);
-#else
-                    const unsigned* _raw_stv8_29 = reinterpret_cast<const unsigned*>(_er_packed + (48));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 352) + (0))), "r"(_stv8_61_0), "r"(_stv8_61_1), "r"(_stv8_61_2), "r"(_stv8_61_3), "r"(_stv8_61_4), "r"(_stv8_61_5), "r"(_stv8_61_6), "r"(_stv8_61_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 96))), "r"(_raw_stv8_29[0]), "r"(_raw_stv8_29[1]), "r"(_raw_stv8_29[2]), "r"(_raw_stv8_29[3]), "r"(_raw_stv8_29[4]), "r"(_raw_stv8_29[5]), "r"(_raw_stv8_29[6]), "r"(_raw_stv8_29[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_62_0 = __float_as_uint(_er_f[104 + 0]);
                     unsigned _stv8_62_1 = __float_as_uint(_er_f[104 + 1]);
                     unsigned _stv8_62_2 = __float_as_uint(_er_f[104 + 2]);
@@ -4149,19 +6525,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_62_5 = __float_as_uint(_er_f[104 + 5]);
                     unsigned _stv8_62_6 = __float_as_uint(_er_f[104 + 6]);
                     unsigned _stv8_62_7 = __float_as_uint(_er_f[104 + 7]);
-#else
-                    const unsigned* _raw_stv8_30 = reinterpret_cast<const unsigned*>(_er_packed + (112));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 360) + (0))), "r"(_stv8_62_0), "r"(_stv8_62_1), "r"(_stv8_62_2), "r"(_stv8_62_3), "r"(_stv8_62_4), "r"(_stv8_62_5), "r"(_stv8_62_6), "r"(_stv8_62_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 352))), "r"(_raw_stv8_30[0]), "r"(_raw_stv8_30[1]), "r"(_raw_stv8_30[2]), "r"(_raw_stv8_30[3]), "r"(_raw_stv8_30[4]), "r"(_raw_stv8_30[5]), "r"(_raw_stv8_30[6]), "r"(_raw_stv8_30[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_63_0 = __float_as_uint(_er_f[112 + 0]);
                     unsigned _stv8_63_1 = __float_as_uint(_er_f[112 + 1]);
                     unsigned _stv8_63_2 = __float_as_uint(_er_f[112 + 2]);
@@ -4170,19 +6538,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_63_5 = __float_as_uint(_er_f[112 + 5]);
                     unsigned _stv8_63_6 = __float_as_uint(_er_f[112 + 6]);
                     unsigned _stv8_63_7 = __float_as_uint(_er_f[112 + 7]);
-#else
-                    const unsigned* _raw_stv8_31 = reinterpret_cast<const unsigned*>(_er_packed + (56));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 368) + (0))), "r"(_stv8_63_0), "r"(_stv8_63_1), "r"(_stv8_63_2), "r"(_stv8_63_3), "r"(_stv8_63_4), "r"(_stv8_63_5), "r"(_stv8_63_6), "r"(_stv8_63_7) : "memory");
-#else
-                        :: "l"((void*)(C + (er_out + 112))), "r"(_raw_stv8_31[0]), "r"(_raw_stv8_31[1]), "r"(_raw_stv8_31[2]), "r"(_raw_stv8_31[3]), "r"(_raw_stv8_31[4]), "r"(_raw_stv8_31[5]), "r"(_raw_stv8_31[6]), "r"(_raw_stv8_31[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
                 }
                 {
-#if CAKE_WGRAD_OUT == 32
                     unsigned _stv8_64_0 = __float_as_uint(_er_f[120 + 0]);
                     unsigned _stv8_64_1 = __float_as_uint(_er_f[120 + 1]);
                     unsigned _stv8_64_2 = __float_as_uint(_er_f[120 + 2]);
@@ -4191,12 +6551,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned _stv8_64_5 = __float_as_uint(_er_f[120 + 5]);
                     unsigned _stv8_64_6 = __float_as_uint(_er_f[120 + 6]);
                     unsigned _stv8_64_7 = __float_as_uint(_er_f[120 + 7]);
-#else
-                    const unsigned* _raw_stv8_32 = reinterpret_cast<const unsigned*>(_er_packed + (120));
-#endif  // CAKE_WGRAD_OUT
                     asm volatile(
                         "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-#if CAKE_WGRAD_OUT == 32
                         :: "l"((void*)(C + (er_outf + 376) + (0))), "r"(_stv8_64_0), "r"(_stv8_64_1), "r"(_stv8_64_2), "r"(_stv8_64_3), "r"(_stv8_64_4), "r"(_stv8_64_5), "r"(_stv8_64_6), "r"(_stv8_64_7) : "memory");
 #else
                         :: "l"((void*)(C + (er_out + 368))), "r"(_raw_stv8_32[0]), "r"(_raw_stv8_32[1]), "r"(_raw_stv8_32[2]), "r"(_raw_stv8_32[3]), "r"(_raw_stv8_32[4]), "r"(_raw_stv8_32[5]), "r"(_raw_stv8_32[6]), "r"(_raw_stv8_32[7]) : "memory");
@@ -4220,6 +6576,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned int kr_n_block_et = rem_et / grid_n_e;
                     n_block_et = nc_n_block_et * (1 - rr_n_block_et) + (rem_et - kr_n_block_et * grid_n_e) * rr_n_block_et;
                     k_block_et = (rem_et - nc_n_block_et * grid_k_e) * (1 - rr_n_block_et) + kr_n_block_et * rr_n_block_et;
+                    if (num_groups <= 128) {
+                        e_uet = (unsigned int)og_a[(int)e_uet];
+                    }
                     int row_nt = (int)n_block_et * BLOCK_N + cta_rank * BLOCK_M + epi_tid;
                     int col0t = (int)k_block_et * TILE_K;
                     int e_kb_te = (int)e_uet;
@@ -8608,6 +10967,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     unsigned int kr_n_block_et_1 = rem_et_1 / grid_n_e;
                     n_block_et_1 = nc_n_block_et_1 * (1 - rr_n_block_et_1) + (rem_et_1 - kr_n_block_et_1 * grid_n_e) * rr_n_block_et_1;
                     k_block_et_1 = (rem_et_1 - nc_n_block_et_1 * grid_k_e) * (1 - rr_n_block_et_1) + kr_n_block_et_1 * rr_n_block_et_1;
+                    if (num_groups <= 128) {
+                        e_uet_1 = (unsigned int)og_a[(int)e_uet_1];
+                    }
                     int row_nt_1 = (int)n_block_et_1 * BLOCK_N + cta_rank * BLOCK_M + epi_tid;
                     int col0t_1 = (int)k_block_et_1 * TILE_K;
                     int e_kb_te_1 = (int)e_uet_1;

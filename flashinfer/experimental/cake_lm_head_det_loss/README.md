@@ -71,6 +71,27 @@ aliases of the same objects.
   cast.  The saved FP32 accumulators are re-scaled, never mutated, so a
   retained graph may run the backward repeatedly (see "Saved-state release"
   below for a `memory_mode="budget"` backward that frees the graph).
+* Gradient placement (`cake_backend.set_gradient_placement(mode)`, returns the
+  previous mode; `cake_backend.gradient_placement()` reads it; default
+  `"auto"`; read once per call, it covers `chunked_lm_head_det_loss` in every
+  form, the opt-in forms included).  `"auto"`: a call no backward can follow
+  (grad mode off -- `torch.no_grad`, `torch.inference_mode`, the first pass of
+  a reentrant `torch.utils.checkpoint` -- or neither `X` nor `W` trainable)
+  computes `loss` (and `logp`) only, without a dX / dW GEMM; inside a
+  non-reentrant `torch.utils.checkpoint` (its own saved-tensor hooks
+  innermost) the checkpointed forward computes the loss only and saves its
+  inputs, and the recomputation in the backward runs the fused forward and
+  hands the gradient accumulators to the checkpointed call's backward, so a
+  checkpointed step forms them once and keeps no FP32 accumulator from the
+  forward to the backward (paired per checkpoint frame and graph by call
+  order and checked against the inputs' metadata and the call's options;
+  without a handed result the backward runs the fused forward itself).  Other
+  saved-tensor hooks innermost (CPU offload inside the checkpointed function)
+  or a torch whose checkpoint lacks those hooks keep the fused forward.
+  `"forward"`: every call with a trainable input forms the gradients in its
+  forward (the previous behavior).  The same `loss`, `logp`, `dX` and `dW`
+  bits either way; `chunked_lm_head_det_logprob` forms no gradient in its
+  forward and is unchanged.
 * `chunked_lm_head_det_logprob` returns the differentiable `logp [T]` for
   arbitrary downstream losses; its forward saves the FP32 row statistic `lse`
   and the valid-row index, and the backward recomputes each chunk's logits
@@ -448,7 +469,10 @@ reaches the backend.  A build that vendors the package without the wrapper
 sees the backend defaults.  The wrapper leaves `logprob_dz` / `logprob_lbl`
 at their backend defaults (no variable) and passes `memory_mode` (no
 variable either) and the non-switch keywords `num_valid_rows` /
-`check_num_valid_rows` through unchanged.
+`check_num_valid_rows` through unchanged.  The gradient placement of the loss
+entry is a process setting of the backend
+(`cake_backend.set_gradient_placement`, see "Public entry points"), neither a
+keyword nor a variable.
 
 | Keyword (backend default) | Variable read by `flashinfer.chunked_lm_head` | Parsing |
 | --- | --- | --- |

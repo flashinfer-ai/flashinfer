@@ -36,7 +36,7 @@
 #define CAKE_BINDING_THREADS 320
 #endif
 #ifndef CAKE_BINDING_SMEM
-#define CAKE_BINDING_SMEM 197632
+#define CAKE_BINDING_SMEM 198144
 #endif
 
 extern "C" __global__ void CAKE_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, __nv_bfloat16* __restrict__ C, int* __restrict__ offs, uint8_t* __restrict__ tensormap_workspace, float* __restrict__ tail_sums, unsigned int* __restrict__ tail_tickets, int tail_splits, int raster_rows, int num_groups, int sum_m, int N, int K, int ldc, int stride_e, unsigned int* __restrict__ wave_sync, int wave_mode);
@@ -232,6 +232,10 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_C, TensorView a_offs, Tens
   check_same_device(a_tail_tickets, a_A, "tail_tickets", "A");
   check_contiguous(a_wave_sync, "wave_sync");
   check_same_device(a_wave_sync, a_A, "wave_sync", "A");
+  TVM_FFI_CHECK((a_N >= 256LL), ValueError)
+      << KERNEL_NAME << ": requires (N >= 256)";
+  TVM_FFI_CHECK((a_K >= 512LL), ValueError)
+      << KERNEL_NAME << ": requires (K >= 512)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)

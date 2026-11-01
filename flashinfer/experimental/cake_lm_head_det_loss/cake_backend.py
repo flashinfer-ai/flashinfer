@@ -44,7 +44,11 @@ Contract
   no logits recomputation); the backward applies the incoming scalar
   gradient ``g`` and performs the single cast ``dX = bf16(g * dX_acc)``,
   ``dW = cast(g * dW_acc)`` -- never mutating the saved accumulators, so a
-  retained graph may run the backward repeatedly.  Entry (b)
+  retained graph may run the backward repeatedly.  With the gradient
+  placement ``"auto"`` (the default, :func:`set_gradient_placement`) a call no
+  backward can follow forms no accumulator, and inside a non-reentrant
+  ``torch.utils.checkpoint`` the recomputation forms them instead of the
+  checkpointed forward (the same bits).  Entry (b)
   ``chunked_lm_head_det_logprob``: the forward saves the FP32 row statistic
   ``lse[T]`` and the valid-row index, so the backward plans its chunks without
   counting the rows again (no host synchronization); the backward recomputes
@@ -155,7 +159,8 @@ Every switch of this module (``compact_rows``, ``fuse_dw_cast``,
 ``logprob_dz``, ``logprob_lbl``) is a keyword argument of the entry points
 that it affects, ``None`` selecting the documented default (the
 ``*_default()`` functions); the binding cache is configured through
-:meth:`BindingCache.configure`.  This module reads no environment variable.
+:meth:`BindingCache.configure` and the loss entry's gradient placement through
+:func:`set_gradient_placement`.  This module reads no environment variable.
 FlashInfer's public wrapper (``flashinfer.chunked_lm_head``) owns the A/B
 environment variables of the first six and passes the resolved values down;
 it leaves the log-probability arms at their defaults.
@@ -166,15 +171,19 @@ from __future__ import annotations
 import ast
 import contextlib
 import functools
+import inspect
 import math
 import re
 import struct
 import threading
+import types
+import weakref
 from collections import OrderedDict
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, NamedTuple, Optional, Union
 
 import torch
+import torch.utils.checkpoint as _torch_checkpoint
 
 from .cake_jit import (
     BASE_STAGES,
@@ -873,6 +882,8 @@ def _resolve_gemm_tuning(gemm_tuning) -> dict[str, dict[str, Any]]:
 
 
 def _tuning_key(tuning: dict[str, dict[str, Any]]) -> tuple:
+    if not tuning:  # the default (no explicit knob): every call's key
+        return ()
     return tuple(
         (op, tuple(sorted(knobs.items()))) for op, knobs in sorted(tuning.items())
     )
@@ -2242,8 +2253,8 @@ def validate_lm_head_det_inputs(
         raise ValueError("W must be a BF16 [V, H] tensor")
     if not W.is_contiguous():
         raise ValueError("W must be contiguous")
-    num_rows, hidden = (int(s) for s in X.shape)
-    vocab, w_hidden = (int(s) for s in W.shape)
+    num_rows, hidden = int(X.shape[0]), int(X.shape[1])
+    vocab, w_hidden = int(W.shape[0]), int(W.shape[1])
     if w_hidden != hidden:
         raise ValueError(
             f"W has {w_hidden} columns, X has {hidden}: the hidden sizes differ"
@@ -2463,9 +2474,7 @@ class Plan:
     @property
     def dx_ws_slabs(self) -> int:
         """FP32 ``[rows, H]`` slabs of the K-slice workspace the plan needs (largest slice count - 1)."""
-        return (
-            max((int(k) for k in self.dx_slices), default=1) - 1 if self.need_dx else 0
-        )
+        return int(max(self.dx_slices, default=1)) - 1 if self.need_dx else 0
 
     @property
     def dw_deferred(self) -> bool:
@@ -6374,8 +6383,388 @@ def backward_logprob(
 # ---------------------------------------------------------------------------
 
 
+# Gradient placement of the loss entry (:func:`set_gradient_placement`).  ``"auto"`` (the default): the loss entry forms
+# its gradient accumulators only where a backward can use them -- no gradient GEMM without an autograd graph (grad mode
+# off, ``torch.no_grad`` / ``torch.inference_mode``, the first pass of a reentrant ``torch.utils.checkpoint``, no input
+# requiring a gradient), and inside a non-reentrant ``torch.utils.checkpoint`` the checkpointed forward computes the
+# loss only while the recomputation in the backward forms the accumulators (one gradient pass per step instead of two).
+# CPU offload or other saved-tensor hooks innermost and a torch whose checkpoint lacks the hook structure read below
+# keep the fused forward.  The log-probability entry forms no gradient in its forward and is unchanged.  ``"forward"``:
+# every call with an input that requires a gradient forms them in its forward, also when no backward follows.  The
+# outputs are the same bits either way (the same kernels on the same operands, in the same order).
+GRADIENT_PLACEMENTS = ("auto", "forward")
+_GRADIENT_PLACEMENT = {"mode": "auto"}
+
+
+def gradient_placement() -> str:
+    """The gradient placement of the loss entry (default ``"auto"``, see :func:`set_gradient_placement`)."""
+    return _GRADIENT_PLACEMENT["mode"]
+
+
+def set_gradient_placement(mode: str) -> str:
+    """Set the gradient placement of the following loss entry calls of this process and return the previous one:
+    ``"auto"`` (the default) forms the loss entry's gradients only where a backward can use them and, inside a
+    non-reentrant ``torch.utils.checkpoint``, once per step (in the recomputation); ``"forward"`` forms them in every
+    forward with an input that requires a gradient.  Read once per call; a checkpointed region's recomputation follows
+    the placement its forward ran under."""
+    if mode not in GRADIENT_PLACEMENTS:
+        raise ValueError(
+            f"gradient placement must be one of {GRADIENT_PLACEMENTS}, got {mode!r}"
+        )
+    previous = _GRADIENT_PLACEMENT["mode"]
+    _GRADIENT_PLACEMENT["mode"] = mode
+    return previous
+
+
+# torch.utils.checkpoint (non-reentrant) packs the tensors an autograd Function saves through its own saved-tensor hooks:
+# the checkpointed forward through ``_checkpoint_hook``'s pack hook (a closure over the call's ``_CheckpointFrame``), the
+# recomputation in the backward through ``_recomputation_hook``'s (a closure over a weak reference to that frame and the
+# graph key).  The innermost (top) hooks tell which pass a call runs in; any other hooks on top (CPU offload, ...) keep
+# the call's fused forward.  A torch whose checkpoint lacks this structure keeps the fused forward everywhere.
+_CHECKPOINT_FIRST = "_checkpoint_hook.__init__.<locals>.pack_hook"
+_CHECKPOINT_RECOMPUTE = "_recomputation_hook.__init__.<locals>.pack_hook"
+_CHECKPOINT_SUPPORT: dict[str, bool] = {}
+_TOP_SAVED_HOOKS_C = getattr(
+    torch._C._autograd, "_top_saved_tensors_default_hooks", None
+)
+# the loss entry's forward reads it once per call with an input requiring a gradient (None: no saved-tensor hooks)
+_TOP_SAVED_HOOKS = (
+    _TOP_SAVED_HOOKS_C
+    if _TOP_SAVED_HOOKS_C is not None
+    else (lambda ignore_is_tracing: None)
+)
+
+
+def _nested_code(cls, name: str) -> Optional[types.CodeType]:
+    code = getattr(getattr(cls, "__init__", None), "__code__", None)
+    for const in getattr(code, "co_consts", ()):
+        if isinstance(const, types.CodeType) and const.co_name == name:
+            return const
+    return None
+
+
+def _checkpoint_supported() -> bool:
+    """Whether this torch's ``torch.utils.checkpoint`` has the hook structure :func:`_checkpoint_pass` reads (checked
+    once per process)."""
+    ok = _CHECKPOINT_SUPPORT.get("ok")
+    if ok is None:
+        frame = getattr(_torch_checkpoint, "_CheckpointFrame", None)
+        first = _nested_code(
+            getattr(_torch_checkpoint, "_checkpoint_hook", None), "pack_hook"
+        )
+        again = _nested_code(
+            getattr(_torch_checkpoint, "_recomputation_hook", None), "pack_hook"
+        )
+        ok = bool(
+            _TOP_SAVED_HOOKS_C is not None
+            and isinstance(frame, type)
+            and "__weakref__" in vars(frame)
+            and first is not None
+            and "frame" in first.co_freevars
+            and again is not None
+            and {"target_frame_ref", "gid"} <= set(again.co_freevars)
+        )
+        _CHECKPOINT_SUPPORT["ok"] = ok
+    return ok
+
+
+class _CheckpointPass(NamedTuple):
+    first: bool  # the checkpointed forward (False: its recomputation in a backward)
+    frame: Any  # the call's torch.utils.checkpoint frame (None: not readable)
+    graph: Any = None  # the recomputation's graph key
+
+
+def _checkpoint_pass() -> Optional[_CheckpointPass]:
+    """The non-reentrant ``torch.utils.checkpoint`` pass this call runs in, read from the top saved-tensor default
+    hooks; ``None`` outside one (no hooks, other hooks on top, or an unsupported torch)."""
+    hooks = _TOP_SAVED_HOOKS(False)
+    if hooks is None or not _checkpoint_supported():
+        return None
+    # the recomputation's pack hook is wrapped by torch._dynamo.disable
+    pack = inspect.unwrap(hooks[0])
+    if getattr(pack, "__module__", None) != _torch_checkpoint.__name__:
+        return None
+    name = getattr(pack, "__qualname__", None)
+    if name not in (_CHECKPOINT_FIRST, _CHECKPOINT_RECOMPUTE):
+        return None
+    cells = dict(zip(pack.__code__.co_freevars, pack.__closure__ or (), strict=False))
+    frame_type = _torch_checkpoint._CheckpointFrame
+    try:
+        if name == _CHECKPOINT_FIRST:
+            frame = cells["frame"].cell_contents
+            return _CheckpointPass(
+                True, frame if isinstance(frame, frame_type) else None
+            )
+        ref, graph = cells["target_frame_ref"].cell_contents, cells["gid"].cell_contents
+    except (KeyError, ValueError):
+        return _CheckpointPass(name == _CHECKPOINT_FIRST, None)
+    frame = ref() if isinstance(ref, weakref.ReferenceType) else None
+    return _CheckpointPass(
+        False, frame if isinstance(frame, frame_type) else None, graph
+    )
+
+
+def _graph_key() -> Any:
+    """The key ``torch.utils.checkpoint`` files a backward's recomputation under (its unpack hook's rule)."""
+    group = getattr(
+        getattr(_torch_checkpoint, "GraphExecGroup", None), "_get_current_group", None
+    )
+    key = group() if group is not None else None
+    return torch._C._current_graph_task_id() if key is None else key
+
+
+class _CheckpointCalls:
+    """The loss entry calls of one checkpoint frame: per call of the checkpointed forward (in order) its key and whether
+    it left its gradients to the recomputation; per graph the recomputation's call count; the state each recomputed
+    call hands to its checkpointed call's backward (the fused forward's result, taken once)."""
+
+    __slots__ = ("calls", "recomputed", "handed", "__weakref__")
+
+    def __init__(self) -> None:
+        self.calls: list = []
+        self.recomputed: dict = {}
+        self.handed: dict = {}
+
+
+_CHECKPOINT_CALLS: "weakref.WeakKeyDictionary[Any, _CheckpointCalls]" = (
+    weakref.WeakKeyDictionary()
+)
+_CHECKPOINT_LOCK = threading.Lock()
+
+
+def _checkpoint_first_call(ckpt: _CheckpointPass, key: tuple, deferred: bool):
+    """Record a call of the checkpointed forward; ``(calls, index)`` (``None``: the frame is not readable)."""
+    if ckpt.frame is None:
+        return None
+    with _CHECKPOINT_LOCK:
+        calls = _CHECKPOINT_CALLS.get(ckpt.frame)
+        if calls is None:
+            calls = _CHECKPOINT_CALLS[ckpt.frame] = _CheckpointCalls()
+        calls.calls.append((key, deferred))
+        return calls, len(calls.calls) - 1
+
+
+def _checkpoint_recomputed_call(ckpt: _CheckpointPass):
+    """The checkpointed call a call of the recomputation repeats: ``(calls, index, key, deferred)`` (``None``: unknown)."""
+    if ckpt.frame is None:
+        return None
+    with _CHECKPOINT_LOCK:
+        calls = _CHECKPOINT_CALLS.get(ckpt.frame)
+        if calls is None:
+            return None
+        index = calls.recomputed.get(ckpt.graph, 0)
+        calls.recomputed[ckpt.graph] = index + 1
+        if index >= len(calls.calls):
+            return None
+        key, deferred = calls.calls[index]
+        return calls, index, key, deferred
+
+
+def _meta_key(t: Optional[torch.Tensor]):
+    return None if t is None else (tuple(t.shape), tuple(t.stride()), t.dtype, t.device)
+
+
+def _detached(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    return t.detach() if t is not None and t.requires_grad else t
+
+
+class _SplitCall(NamedTuple):
+    """A loss entry call whose gradients the checkpoint recomputation forms (gradient placement ``"auto"``)."""
+
+    # the checkpointed call's frame record (None: not readable) and its position in the frame's calls
+    calls: Optional[_CheckpointCalls]
+    position: Optional[int]
+    result: Optional[ForwardResult]  # the recomputed call: its fused forward's result
+
+
+def _loss_call_key(
+    X, W, labels, infer_logp, loss_weights, need_dx, need_dw, options
+) -> tuple:
+    """What a recomputed call must match to take over its checkpointed call's gradients: the inputs' metadata and the
+    call's options (not their storage: hooks around the checkpoint, CPU offload for one, hand the recomputation copies)."""
+    return (
+        _meta_key(X),
+        _meta_key(W),
+        _meta_key(labels),
+        _meta_key(infer_logp),
+        _meta_key(loss_weights),
+        need_dx,
+        need_dw,
+        repr(sorted(options.items())),
+    )
+
+
+def _loss_checkpoint_split(
+    ctx,
+    ckpt: _CheckpointPass,
+    X,
+    W,
+    labels,
+    infer_logp,
+    loss_weights,
+    need_dx,
+    need_dw,
+    options,
+):
+    """For a loss entry call in the checkpoint pass ``ckpt`` (:func:`_checkpoint_pass`, not ``None``): whether the call
+    leaves its gradients to the recomputation, and (a recomputed call) the checkpointed call it hands its result to.  A
+    checkpointed call that does gets ``ctx.split`` (with the options its backward's own fused forward would take)."""
+    key = _loss_call_key(
+        X, W, labels, infer_logp, loss_weights, need_dx, need_dw, options
+    )
+    if ckpt.first:
+        split = gradient_placement() == "auto"
+        record = _checkpoint_first_call(ckpt, key, split)
+        if split:
+            calls, index = record if record is not None else (None, None)
+            ctx.split = _SplitCall(calls, index, None)
+            ctx.options, ctx.need = options, (need_dx, need_dw)
+        return split, None
+    # the recomputation follows its checkpointed call (unknown: the placement decides, as it did there)
+    record = _checkpoint_recomputed_call(ckpt)
+    if record is None:
+        return gradient_placement() == "auto", None
+    calls, index, first_key, split = record
+    return split, ((calls, index) if split and first_key == key else None)
+
+
+def _hand_over(ctx, ckpt: _CheckpointPass, handed, result):
+    """A recomputed call's fused-forward result, as the gradient state of its checkpointed call's backward (the outputs
+    and the autograd history of its inputs left out)."""
+    state = replace(
+        result,
+        loss=None,
+        logp=None,
+        x_last=_detached(result.x_last),
+        x_src=_detached(result.x_src),
+    )
+    # attributes set on the result past its fields (the opt-in budget forms' memory plan, row state, plan, inputs)
+    names = {f.name for f in fields(result)}
+    for name, value in vars(result).items():
+        if name not in names:
+            if isinstance(value, tuple):
+                value = tuple(
+                    _detached(v) if isinstance(v, torch.Tensor) else v for v in value
+                )
+            setattr(state, name, value)
+    ctx.split = _SplitCall(None, None, state)
+    if handed is not None:
+        with _CHECKPOINT_LOCK:
+            handed[0].handed[(ckpt.graph, handed[1])] = state
+
+
+def _split_state(ctx, inputs, forward):
+    """The gradient state of a call with ``ctx.split`` in its backward (after its inputs were unpacked, which ran the
+    recomputation): the recomputed call's result, else ``forward`` (the fused forward) on the inputs."""
+    split = ctx.split
+    state = split.result
+    if state is None and split.calls is not None:
+        with _CHECKPOINT_LOCK:
+            state = split.calls.handed.pop((_graph_key(), split.position), None)
+    if state is None:
+        X, W, labels, infer_logp, loss_weights = inputs
+        need_dx, need_dw = ctx.need
+        state = forward(
+            X,
+            W,
+            labels,
+            infer_logp=infer_logp,
+            loss_weights=loss_weights,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            **ctx.options,
+        )
+    return state
+
+
+def _loss_forward_hooked(
+    ctx, X, W, labels, infer_logp, loss_weights, need_dx, need_dw, options
+):
+    """The loss entry's forward under saved-tensor hooks: inside a non-reentrant ``torch.utils.checkpoint`` with the
+    gradient placement ``"auto"`` the checkpointed forward computes the loss (and logp) only and the recomputation
+    hands its fused forward's gradient state to the checkpointed call's backward (``ctx.split``); both save the call's
+    inputs.  ``None``: the fused forward (other hooks on top, an unsupported torch, the placement ``"forward"``)."""
+    ckpt = _checkpoint_pass()
+    if ckpt is None:
+        return None
+    split, handed = _loss_checkpoint_split(
+        ctx, ckpt, X, W, labels, infer_logp, loss_weights, need_dx, need_dw, options
+    )
+    if not split:
+        return None
+    ctx.set_materialize_grads(False)
+    ctx.num_rows = int(X.shape[0])
+    ctx.grad_weight_dtype = options["grad_weight_dtype"]
+    ctx.backend = options["backend"]
+    # a checkpointed call saves its inputs in both passes: the same count and metadata for checkpoint's check
+    ctx.save_for_backward(X, W, labels, infer_logp, loss_weights)
+    first = ckpt.first
+    result = forward_loss(
+        X,
+        W,
+        labels,
+        infer_logp=infer_logp,
+        loss_weights=loss_weights,
+        need_dx=need_dx and not first,
+        need_dw=need_dw and not first,
+        **options,
+    )
+    if not first:
+        _hand_over(ctx, ckpt, handed, result)
+    ctx.mark_non_differentiable(result.logp)
+    return result.loss, result.logp
+
+
+def _loss_backward_split(ctx, grad_loss):
+    """``(dX, dW)`` of a call with ``ctx.split``: its gradient state is the recomputation's (unpacking the inputs runs
+    it) or, without a handed result, this backward's own fused forward."""
+    state = _split_state(ctx, ctx.saved_tensors, forward_loss)
+    if ctx.num_rows == 0 or (
+        state.row_index is not None and state.row_index.numel() == 0
+    ):
+        dx = (
+            None
+            if state.dx_acc is None
+            else torch.zeros(
+                (ctx.num_rows, state.dx_acc.shape[1]),
+                dtype=torch.bfloat16,
+                device=state.dx_acc.device,
+            )
+        )
+        dw = (
+            None
+            if state.dw_acc is None
+            else torch.zeros(
+                state.dw_acc.shape,
+                dtype=ctx.grad_weight_dtype,
+                device=state.dw_acc.device,
+            )
+        )
+        return dx, dw
+    return backward_loss(
+        state.dx_acc,
+        state.dw_acc,
+        grad_loss,
+        grad_weight_dtype=ctx.grad_weight_dtype,
+        backend=ctx.backend,
+        row_index=state.row_index,
+        num_rows=ctx.num_rows,
+        dz_last=state.dz_last,
+        x_last=state.x_last,
+        x_src=state.x_src,
+        x_idx=state.x_idx,
+        row_valid=state.row_valid,
+        gemm_tuning=state.gemm_tuning,
+    )
+
+
 class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
-    """Entry (a): the forward produces the FP32 gradient accumulators; the backward scales and casts them."""
+    """Entry (a): the forward produces the FP32 gradient accumulators; the backward scales and casts them.
+
+    Gradient placement ``"auto"`` (:func:`set_gradient_placement`) inside a non-reentrant ``torch.utils.checkpoint``:
+    the checkpointed forward computes the loss only and saves the call's inputs; the recomputation in the backward runs
+    the fused forward, saves the same inputs and hands its result to the checkpointed call's backward (which runs the
+    fused forward itself when nothing was handed over).  The outputs are the fused forward's bits either way."""
 
     @staticmethod
     def forward(
@@ -6400,6 +6789,35 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
         gemm_tuning,
     ):
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
+        # under saved-tensor hooks: a non-reentrant torch.utils.checkpoint's passes leave the gradients to the
+        # recomputation (gradient placement "auto"); the plain step (no hooks) and other hooks run the fused forward
+        if (need_dx or need_dw) and _TOP_SAVED_HOOKS(False) is not None:
+            out = _loss_forward_hooked(
+                ctx,
+                X,
+                W,
+                labels,
+                infer_logp,
+                loss_weights,
+                need_dx,
+                need_dw,
+                dict(
+                    objective=objective,
+                    loss_div=loss_div,
+                    chunk_size=chunk_size,
+                    grad_weight_dtype=grad_weight_dtype,
+                    deterministic=deterministic,
+                    backend=backend,
+                    compact_rows=compact_rows,
+                    fuse_dw_cast=fuse_dw_cast,
+                    dx_finalize=dx_finalize,
+                    dw_stream=dw_stream,
+                    hidden_count=hidden_count,
+                    gemm_tuning=gemm_tuning,
+                ),
+            )
+            if out is not None:
+                return out
         result = forward_loss(
             X,
             W,
@@ -6445,6 +6863,7 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
         ctx.empty = X.shape[0] == 0 or (
             result.row_index is not None and result.row_index.numel() == 0
         )
+        ctx.split = None
         ctx.mark_non_differentiable(result.logp)
         return result.loss, result.logp
 
@@ -6453,6 +6872,8 @@ class ChunkedLmHeadDetLossFunction(torch.autograd.Function):
         none = (None,) * 18
         if grad_loss is None:
             return none
+        if ctx.split is not None:
+            return _loss_backward_split(ctx, grad_loss) + none[2:]
         if ctx.empty:  # T == 0 or every row ignored: zero gradients without binding or launching a program
             dx = (
                 None
@@ -6636,6 +7057,17 @@ def chunked_lm_head_det_loss(
     * ``gemm_tuning`` (default ``None`` = ``{}``, :func:`gemm_tuning_default`):
       explicit per-GEMM knobs, e.g. ``{"dx": {"tile_n": 256}}``, winning over
       the per-chunk rules for the knobs they name.
+
+    Gradient placement (:func:`set_gradient_placement`, default ``"auto"``): a
+    call that no backward can follow (grad mode off, also the first pass of a
+    reentrant ``torch.utils.checkpoint``, or no input requiring a gradient)
+    computes ``loss`` (and ``logp``) only, without a gradient GEMM; inside a
+    non-reentrant ``torch.utils.checkpoint`` the checkpointed forward computes
+    the loss only and the recomputation in the backward forms the gradient
+    accumulators, so a checkpointed step runs the gradient GEMMs once (CPU
+    offload or other saved-tensor hooks innermost keep the fused forward).
+    The outputs are the same bits as with ``"forward"`` (gradients formed in
+    every forward).
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -6647,6 +7079,43 @@ def chunked_lm_head_det_loss(
             "every gradient to its leaf's dtype, so this entry cannot return it; use forward_loss(..., need_dw=True) + "
             "backward_loss(dx_acc, dw_acc, g, grad_weight_dtype=torch.float32, row_index=..., num_rows=...) for an FP32 dW"
         )
+    if (
+        not (
+            torch.is_grad_enabled()
+            and (
+                X.requires_grad
+                or W.requires_grad
+                or (infer_logp is not None and infer_logp.requires_grad)
+                or (loss_weights is not None and loss_weights.requires_grad)
+            )
+        )
+        and _GRADIENT_PLACEMENT["mode"] == "auto"
+    ):
+        # no autograd graph follows (grad mode off -- also a reentrant checkpoint's first pass -- or no input that
+        # requires a gradient; an infer_logp / loss_weights that does keeps the autograd entry, whose forward forms no
+        # gradient when X and W are frozen): the loss (and logp) only, no gradient GEMM
+        result = forward_loss(
+            X,
+            W,
+            labels,
+            objective=objective,
+            loss_div=loss_div,
+            infer_logp=infer_logp,
+            loss_weights=loss_weights,
+            chunk_size=int(chunk_size),
+            need_dx=False,
+            need_dw=False,
+            grad_weight_dtype=grad_weight_dtype,
+            deterministic=deterministic,
+            backend=backend,
+            compact_rows=compact_rows,
+            fuse_dw_cast=fuse_dw_cast,
+            dx_finalize=dx_finalize,
+            dw_stream=dw_stream,
+            hidden_count=hidden_count,
+            gemm_tuning=gemm_tuning,
+        )
+        return (result.loss, result.logp) if return_logp else result.loss
     loss, logp = ChunkedLmHeadDetLossFunction.apply(
         X,
         W,
