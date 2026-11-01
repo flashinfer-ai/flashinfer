@@ -180,7 +180,14 @@ ROW_COST_MARGIN_PCT = {"occ": 2, "one": 0}
 # (otherwise the whole row keeps that vector bitwise).  An unsegmented rank (delivered P = 1: no compose chain, the 64-wide
 # fwdh / dhu kernels) never enters the LPT replacement and keeps P = 1 -- the walk-step model does not carry the per-segment
 # work the first products add.  Selectable through `p_rule`; P_RULE_DEFAULT names the shipped rule.
-ROW_RULES = ("row_cost", "row_cost_lpt", "rank_lpt", "fill_down", "small_one", "fill_small")
+ROW_RULES = (
+    "row_cost",
+    "row_cost_lpt",
+    "rank_lpt",
+    "fill_down",
+    "small_one",
+    "fill_small",
+)
 # "fill_down" (candidate): every rank BELOW THE CHAIN CAP (0 < NC_max_frag < WAVE_MIN_NC_MAX_FRAG) takes the smaller
 # of its "row_cost_lpt" P and its "wave_fill" P (the one-wave fill, floor(SM / (n_frag HV)), on ranks with n_frag <=
 # WAVE_N_FRAG_MAX), so two-fragment ranks drop to the one-wave P without the fill's raises; ranks above the cap keep the

@@ -54,6 +54,7 @@ import threading
 
 import pytest
 import torch
+
 # torch._dynamo (and sympy) imported once here, single-threaded: the FP64 reference's torch._compile wrappers import it
 # lazily, and a first import racing the rank threads of another test can see a partially initialised sympy (Python 3.14)
 import torch._dynamo  # noqa: F401
@@ -1221,8 +1222,10 @@ def test_faster_schedule_rules_never_raise_a_ranks_P() -> None:
         TABLE_P3_CP2_C,
         (((130, True),) * 12,) * 8,  # (4,12)-like CP8 D: 12 short fragments per rank
         (((237, True), (237, True), (100, False)),) * 4,  # Z-like: 237-chunk fragments
-        (((473, True), (473, False)),) * 4,  # above the chain cap: fill_down keeps the shipped P
-        (((119, True), (119, True)),) * 8,  # (2,6)-like CP16 Z: two short fragments per rank
+        (((473, True), (473, False)),)
+        * 4,  # above the chain cap: fill_down keeps the shipped P
+        (((119, True), (119, True)),)
+        * 8,  # (2,6)-like CP16 Z: two short fragments per rank
         ((), ((150, True), (20, False))),  # a zero-token rank
     )
     lowered = 0  # (table, HV) cases where small_one moves a shipped P > 1 to 1
@@ -1234,7 +1237,7 @@ def test_faster_schedule_rules_never_raise_a_ranks_P() -> None:
                 assert len(plans) == len(ship)
                 for seg, base, t in zip(plans, ship, table, strict=True):
                     assert seg.p_rule == rule and 1 <= seg.P <= base.P
-                    assert seg.NSEG == seg.n_frag * seg.P and seg.n_frag == len(t)
+                    assert seg.n_frag * seg.P == seg.NSEG and seg.n_frag == len(t)
             fill = tuple(
                 min(
                     base.P,
@@ -1251,19 +1254,22 @@ def test_faster_schedule_rules_never_raise_a_ranks_P() -> None:
                 for base, t in zip(ship, table, strict=True)
             )
             assert fill == tuple(
-                seg.P for seg in gp.kcp_plan_row(table, HV, SM_COUNT, p_rule="fill_down")
+                seg.P
+                for seg in gp.kcp_plan_row(table, HV, SM_COUNT, p_rule="fill_down")
             )
             small = HV <= gp.SMALL_ONE_HV_MAX and all(
                 nc <= gp.SMALL_ONE_NC_MAX for t in table for nc, _ in t
             )
             got = tuple(
-                seg.P for seg in gp.kcp_plan_row(table, HV, SM_COUNT, p_rule="small_one")
+                seg.P
+                for seg in gp.kcp_plan_row(table, HV, SM_COUNT, p_rule="small_one")
             )
             assert got == (
                 tuple(1 for _ in table) if small else tuple(seg.P for seg in ship)
             )
             both = tuple(
-                seg.P for seg in gp.kcp_plan_row(table, HV, SM_COUNT, p_rule="fill_small")
+                seg.P
+                for seg in gp.kcp_plan_row(table, HV, SM_COUNT, p_rule="fill_small")
             )
             assert both == (tuple(1 for _ in table) if small else fill)
             lowered += int(small and max(seg.P for seg in ship) > 1)

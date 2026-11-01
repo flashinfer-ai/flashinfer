@@ -1669,7 +1669,9 @@ def _assert_same_saved(back, saved) -> None:
             isinstance(b, tuple) and any(isinstance(x, torch.Tensor) for x in b)
         ):
             if isinstance(b, tuple):
-                assert len(a) == len(b) and all(x is y for x, y in zip(a, b)), f.name
+                assert len(a) == len(b) and all(
+                    x is y for x, y in zip(a, b, strict=True)
+                ), f.name
             else:
                 assert a is b, f.name
         else:
