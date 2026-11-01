@@ -64,9 +64,11 @@ before the ``:short`` / ``:ts`` shape gates, so a call inside both it and the
 ``:ts`` gate is named by its KV-split plan.
 
 A ``:kvsplit`` or ``:short`` route record may carry ``stage_buckets``
-(``{arch: [{"kv_max": K, "stages": [[stage, program], ...]}, ...]}``): a plan
-whose KV length is at most an entry's ``kv_max`` launches the first such entry's
-stages on that architecture (:func:`route_stages`) -- on a ``:kvsplit`` route
+(``{arch: [{"kv_max": K, "stages": [[stage, program], ...]}, ...]}``, an entry
+optionally bounding the query count too with ``"max_queries": Q``): a plan whose
+KV length is at most an entry's ``kv_max`` (and whose query count is at most its
+``max_queries``) launches the first such entry's stages on that architecture
+(:func:`route_stages`) -- on a ``:kvsplit`` route
 of the full kind its partial-kind twin's program, on a ``:kvsplit`` route of the
 partial kind or a ``:short`` route a program of its own that no route's
 ``stages`` name -- with the same host call, logits and schedule words as the
@@ -186,12 +188,16 @@ def stage_programs(stage, arches):
     return dict(by_arch)
 
 
-def route_stages(record, arch, keys):
-    """The stages a route record launches on ``arch`` for the KV length ``keys`` (``kv.shape[0]``): the first
-    ``stage_buckets[arch]`` entry with ``keys <= kv_max`` (``[[stage, program], ...]``, one program name per
-    stage), else the record's ``stages``."""
+def route_stages(record, arch, keys, queries=None):
+    """The stages a route record launches on ``arch`` for the KV length ``keys`` (``kv.shape[0]``) and the query
+    count ``queries``: the first ``stage_buckets[arch]`` entry with ``keys <= kv_max`` and, where the entry spells
+    ``max_queries``, ``queries <= max_queries`` (``[[stage, program], ...]``, one program name per stage), else the
+    record's ``stages``.  An entry with ``max_queries`` never matches when ``queries`` is not given."""
     for bucket in record.get("stage_buckets", {}).get(arch, ()):
-        if keys <= int(bucket["kv_max"]):
+        bound = bucket.get("max_queries")
+        if keys <= int(bucket["kv_max"]) and (
+            bound is None or (queries is not None and queries <= int(bound))
+        ):
             return bucket["stages"]
     return record["stages"]
 
@@ -1272,7 +1278,7 @@ class DenseMqaPlan:
         if sequence:
             selections = [(None, sequence)]
         else:
-            stages = route_stages(self.route, arch, keys)
+            stages = route_stages(self.route, arch, keys, queries)
             selections = [(stage[0], stage_program(stage, arch)) for stage in stages]
         self.program_names = [program for _stage, program in selections]
         for stage_name, program in selections:

@@ -1456,7 +1456,7 @@ def _bucket_window(window, queries, keys):
 _BUCKET_QUERIES = {
     "fp8:h64:full:qle2048:kvsplit": (66, 128, 302, 1024),
     "fp8:h64:partial:qle128:kvsplit": (3, 37, 63),
-    "fp4:le32:short": (7, 16, 128),
+    "fp4:le32:short": (7, 16, 36, 37, 128),
 }
 
 
@@ -1549,7 +1549,12 @@ def test_dense_stage_bucket_program_is_bitwise_to_the_default(
         served = _runtime.DenseMqaPlan(
             precision, q, kv, weights, starts, ends, **scales
         )
-        assert served.program_names == (bucket if keys <= bound else default), (
+        selected = _first_stages(
+            record, shipped["routes"][route]["stage_buckets"][arch], keys, queries
+        )
+        assert served.program_names == [
+            _runtime.stage_program(stage, arch) for stage in selected
+        ], (
             route,
             keys,
             served.program_names,
@@ -1802,16 +1807,30 @@ _SELF_BUCKET_ROUTE = "fp8:h64:partial:qle128:kvsplit"
 _SHORT_BUCKET_ROUTE = "fp4:le32:short"
 
 
+def _first_stages(record, entries, keys, queries):
+    """The stages the bucket rule selects: the first entry with ``keys <= kv_max`` whose ``max_queries`` (if any) the
+    query count ``queries`` (``None``: not given, which no ``max_queries`` entry admits) is at most; else the
+    record's ``stages``."""
+    for entry in entries:
+        cap = entry.get("max_queries")
+        if keys <= entry["kv_max"] and (
+            cap is None or (queries is not None and queries <= cap)
+        ):
+            return entry["stages"]
+    return record["stages"]
+
+
 def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
     """Host-only: a route record's ``stage_buckets`` (``{arch: [{"kv_max": K, "stages": [[stage, program],
     ...]}]}``) sits only on a ``:kvsplit`` route of the full kind whose partial-kind twin is catalogued and agrees on
     the route keys, or on a route that is its own bucket home (a ``:kvsplit`` route of the partial kind, a ``:short``
     route); each entry keeps the record's stage names and names, per stage, the twin's program on that architecture
     (a self-homed route: a program of its own) -- not the record's own -- with the same host call; ``route_stages``
-    launches the first entry with ``K <= kv_max`` and the record's ``stages`` otherwise.  The shipped buckets split
-    ``fp8:h64:full:qle2048:kvsplit`` on sm_103a at K = 8192, ``fp8:h64:partial:qle128:kvsplit`` on sm_100a at
-    K = 8192 and ``fp4:le32:short`` on sm_100a at K = 4096, served on both sides; the other architecture is unchanged;
-    a withheld route falls back to a route without buckets."""
+    launches the first entry with ``K <= kv_max`` (and, where it spells ``max_queries``, at most that many queries)
+    and the record's ``stages`` otherwise.  The shipped buckets split ``fp8:h64:full:qle2048:kvsplit`` on sm_103a at
+    K = 8192, ``fp8:h64:partial:qle128:kvsplit`` on sm_100a at K = 8192 and ``fp4:le32:short`` on sm_100a at
+    K = 4096 and, for at most 36 queries, at K = 32768, served on both sides; the other architecture is unchanged; a
+    withheld route falls back to a route without buckets."""
     catalog = _runtime._catalog()
     routes, programs, arches = catalog["routes"], catalog["programs"], catalog["arches"]
     staged = {
@@ -1851,8 +1870,15 @@ def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
                 for b in bounds
             ), (r, a)
             assert bounds == sorted(set(bounds)), (r, a)
-            for i, entry in enumerate(entries):
-                assert set(entry) == {"kv_max", "stages"}, (r, a)
+            for entry in entries:
+                assert set(entry) in (
+                    {"kv_max", "stages"},
+                    {"kv_max", "max_queries", "stages"},
+                ), (r, a)
+                cap = entry.get("max_queries")
+                assert cap is None or (
+                    isinstance(cap, int) and not isinstance(cap, bool) and cap >= 1
+                ), (r, a)
                 assert [stage for stage, _p in entry["stages"]] == stage_names, (r, a)
                 for n, (_stage, p) in enumerate(entry["stages"]):
                     default = _runtime.stage_program(rec["stages"][n], a)
@@ -1868,11 +1894,21 @@ def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
                         programs[p][k] == programs[default][k] for k in _CALL_KEYS
                     ), (r, a, p)
                 bound = entry["kv_max"]
-                assert _runtime.route_stages(rec, a, bound) is entry["stages"]
-                after = (
-                    entries[i + 1]["stages"] if i + 1 < len(entries) else rec["stages"]
+                inside = cap if cap is not None else 1
+                assert _runtime.route_stages(rec, a, bound, inside) is _first_stages(
+                    rec, entries, bound, inside
                 )
-                assert _runtime.route_stages(rec, a, bound + 1) is after
+                assert _runtime.route_stages(
+                    rec, a, bound + 1, inside
+                ) is _first_stages(rec, entries, bound + 1, inside)
+                if cap is not None:
+                    # one query more than the bound passes the entry by, as does a call without a query count
+                    assert _runtime.route_stages(
+                        rec, a, bound, cap + 1
+                    ) is _first_stages(rec, entries, bound, cap + 1)
+                    assert _runtime.route_stages(rec, a, bound) is _first_stages(
+                        rec, entries, bound, None
+                    )
     assert seen >= 1
 
     # the shipped bucket: K <= 8192 of the full-kind qle2048 KV-split route on sm_103a launches the twin's program
@@ -1931,25 +1967,30 @@ def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
     assert _runtime.program_names(_SELF_BUCKET_ROUTE, "sm_100a") == [default_100, own]
     assert _runtime.program_names(_SELF_BUCKET_ROUTE, "sm_103a") == [default_103]
 
-    # the shipped :short bucket: K <= 4096 of the FP4 le32 scan route on sm_100a launches its own program
+    # the shipped :short buckets: K <= 4096 of the FP4 le32 scan route on sm_100a, and K <= 32768 for at most 36
+    # queries, launch its own program
     rec = routes[_SHORT_BUCKET_ROUTE]
     default_100 = _runtime.stage_program(rec["stages"][0], "sm_100a")
     default_103 = _runtime.stage_program(rec["stages"][0], "sm_103a")
     (own,) = [p for _s, p in rec["stage_buckets"]["sm_100a"][0]["stages"]]
     assert rec["stage_buckets"] == {
-        "sm_100a": [{"kv_max": 4096, "stages": [["logits", own]]}]
+        "sm_100a": [
+            {"kv_max": 4096, "stages": [["logits", own]]},
+            {"kv_max": 32768, "max_queries": 36, "stages": [["logits", own]]},
+        ]
     }
-    for queries in (7, 16, 128):
-        for keys in (256, 2048, 4096, 4352, 32768):
+    for queries in (7, 16, 33, 36, 37, 128):
+        for keys in (256, 2048, 4096, 4352, 8192, 32768, 33024, 131072):
+            bucketed = keys <= 4096 or (queries <= 36 and keys <= 32768)
             for arch, expected in (
-                ("sm_100a", [own] if keys <= 4096 else [default_100]),
+                ("sm_100a", [own] if bucketed else [default_100]),
                 ("sm_103a", [default_103]),
             ):
                 route = _runtime.served_route("fp4", queries, keys, 32, arch=arch)
                 assert route == _SHORT_BUCKET_ROUTE, (queries, keys, arch, route)
                 selected = [
                     _runtime.stage_program(stage, arch)
-                    for stage in _runtime.route_stages(rec, arch, keys)
+                    for stage in _runtime.route_stages(rec, arch, keys, queries)
                 ]
                 assert selected == expected, (queries, keys, arch)
     assert _runtime.program_names(_SHORT_BUCKET_ROUTE, "sm_100a") == [default_100, own]
