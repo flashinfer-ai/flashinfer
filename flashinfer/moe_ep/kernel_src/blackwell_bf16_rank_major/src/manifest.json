@@ -17,29 +17,72 @@
     "world_size": 8
   },
   "kernel_symbols": [
-    "kernel_rank_major_input_barrier_v1",
-    "kernel_rank_major_dispatch_v1",
-    "kernel_rank_major_route_reset_exact_v1",
-    "kernel_rank_major_route_count_exact_v1",
-    "kernel_rank_major_route_finalize_exact_v1",
-    "kernel_rank_major_route_scatter_exact_v1",
+    "kernel_rank_major_stage_inputs_v1",
+    "kernel_rank_major_input_arrive_v2",
+    "kernel_rank_major_dispatch_v4",
+    "kernel_rank_major_route_fused_v1",
     "kernel_rank_major_exact_fc1_swiglu_v1",
     "kernel_trtllm_moe_bmm_tile_n64_fc2_bf16",
-    "kernel_rank_major_exact_unpermute_v1",
-    "kernel_rank_major_partial_barrier_v1",
-    "kernel_rank_major_combine_v1"
+    "kernel_rank_major_exact_unpermute_v8",
+    "kernel_rank_major_partial_arrive_v1",
+    "kernel_rank_major_combine_v3",
+    "kernel_rank_major_ll_push_v4",
+    "kernel_rank_major_ll_recv_v2",
+    "kernel_rank_major_exact_unpermute_v6",
+    "kernel_rank_major_combine_v6"
   ],
   "schema_version": 1,
-  "source_sha256": "cc75390cde89d3ba89829a4cad6d811a67565bead4b8226c779858ec89b17ac7",
+  "source_sha256": "cf3ee38bd13efac4ec0d415d7a2a9a3347b91b85f0f6070f236a6d24410b9b24",
   "stages": [
     {
       "bindings": [
-        "expert_ids",
+        "hidden_in",
+        "ids_in",
+        "weights_in",
+        "hidden_states",
+        "topk_ids",
+        "topk_weights",
+        "ids_is_int64",
+        "hidden_copy",
+        "active_tokens_per_rank"
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        128,
+        1,
+        1
+      ],
+      "name": "stage_inputs",
+      "pdl_launch": true,
+      "pdl_sync": false,
+      "scalar_bindings": [
+        [
+          "active_tokens_per_rank",
+          128
+        ]
+      ],
+      "symbol": "kernel_rank_major_stage_inputs_v1",
+      "use_pdl": false
+    },
+    {
+      "bindings": [
         "topk_ids",
         "active_tokens_per_rank",
         "pg_world",
         "pg_rank",
-        "pg_flags"
+        "pg_flags",
+        "routed_peers",
+        "route_codes_peers"
       ],
       "block": [
         32,
@@ -57,17 +100,17 @@
         1,
         1
       ],
-      "name": "input_barrier",
-      "pdl_launch": false,
-      "pdl_sync": false,
+      "name": "input_arrive",
+      "pdl_launch": true,
+      "pdl_sync": true,
       "scalar_bindings": [
         [
           "active_tokens_per_rank",
           128
         ]
       ],
-      "symbol": "kernel_rank_major_input_barrier_v1",
-      "use_pdl": false
+      "symbol": "kernel_rank_major_input_arrive_v2",
+      "use_pdl": true
     },
     {
       "bindings": [
@@ -83,7 +126,18 @@
         "topk_ids",
         "topk_ids_peers",
         "topk_weights",
-        "topk_weights_peers"
+        "topk_weights_peers",
+        "routed",
+        "expert_scatter_offsets",
+        "token_to_permuted",
+        "cta_to_expert",
+        "cta_to_mn_limit",
+        "expert_padded_row_offsets",
+        "num_non_exiting_ctas",
+        "total_padded_rows",
+        "route_map",
+        "zero_sentinel",
+        "route_codes"
       ],
       "block": [
         256,
@@ -97,128 +151,38 @@
       ],
       "dynamic_smem_bytes": 15488,
       "grid": [
-        1024,
+        1025,
         1,
         1
       ],
       "name": "dispatch",
-      "pdl_launch": false,
-      "pdl_sync": false,
+      "pdl_launch": true,
+      "pdl_sync": true,
       "scalar_bindings": [
         [
           "active_tokens_per_rank",
           128
         ]
       ],
-      "symbol": "kernel_rank_major_dispatch_v1",
-      "use_pdl": false
-    },
-    {
-      "bindings": [
-        "expert_scatter_offsets",
-        "zero_sentinel"
-      ],
-      "block": [
-        256,
-        1,
-        1
-      ],
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "dynamic_smem_bytes": 0,
-      "grid": [
-        1,
-        1,
-        1
-      ],
-      "name": "route_reset",
-      "pdl_launch": false,
-      "pdl_sync": false,
-      "scalar_bindings": [],
-      "symbol": "kernel_rank_major_route_reset_exact_v1",
-      "use_pdl": false
+      "symbol": "kernel_rank_major_dispatch_v4",
+      "use_pdl": true
     },
     {
       "bindings": [
         "recv_local_ids",
         "expert_scatter_offsets",
         "token_to_permuted",
-        "active_tokens_per_rank"
-      ],
-      "block": [
-        256,
-        1,
-        1
-      ],
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "dynamic_smem_bytes": 0,
-      "grid": [
-        32,
-        1,
-        1
-      ],
-      "name": "route_count",
-      "pdl_launch": false,
-      "pdl_sync": false,
-      "scalar_bindings": [
-        [
-          "active_tokens_per_rank",
-          128
-        ]
-      ],
-      "symbol": "kernel_rank_major_route_count_exact_v1",
-      "use_pdl": false
-    },
-    {
-      "bindings": [
-        "expert_scatter_offsets",
         "cta_to_expert",
         "cta_to_mn_limit",
         "expert_padded_row_offsets",
         "num_non_exiting_ctas",
         "total_padded_rows",
-        "route_map"
-      ],
-      "block": [
-        32,
-        1,
-        1
-      ],
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "dynamic_smem_bytes": 0,
-      "grid": [
-        1,
-        1,
-        1
-      ],
-      "name": "route_finalize",
-      "pdl_launch": false,
-      "pdl_sync": false,
-      "scalar_bindings": [],
-      "symbol": "kernel_rank_major_route_finalize_exact_v1",
-      "use_pdl": false
-    },
-    {
-      "bindings": [
-        "recv_local_ids",
-        "expert_padded_row_offsets",
         "route_map",
-        "token_to_permuted",
+        "zero_sentinel",
         "active_tokens_per_rank"
       ],
       "block": [
-        256,
+        1024,
         1,
         1
       ],
@@ -229,21 +193,21 @@
       ],
       "dynamic_smem_bytes": 0,
       "grid": [
-        32,
+        1,
         1,
         1
       ],
-      "name": "route_scatter",
+      "name": "route_fused",
       "pdl_launch": true,
-      "pdl_sync": false,
+      "pdl_sync": true,
       "scalar_bindings": [
         [
           "active_tokens_per_rank",
           128
         ]
       ],
-      "symbol": "kernel_rank_major_route_scatter_exact_v1",
-      "use_pdl": false
+      "symbol": "kernel_rank_major_route_fused_v1",
+      "use_pdl": true
     },
     {
       "bindings": [
@@ -344,11 +308,11 @@
       "dynamic_smem_bytes": 128,
       "grid": [
         1024,
-        1,
+        7,
         1
       ],
       "name": "local_unpermute",
-      "pdl_launch": false,
+      "pdl_launch": true,
       "pdl_sync": true,
       "scalar_bindings": [
         [
@@ -360,7 +324,7 @@
           128
         ]
       ],
-      "symbol": "kernel_rank_major_exact_unpermute_v1",
+      "symbol": "kernel_rank_major_exact_unpermute_v8",
       "use_pdl": true
     },
     {
@@ -385,12 +349,12 @@
         1,
         1
       ],
-      "name": "partial_barrier",
-      "pdl_launch": false,
-      "pdl_sync": false,
+      "name": "partial_arrive",
+      "pdl_launch": true,
+      "pdl_sync": true,
       "scalar_bindings": [],
-      "symbol": "kernel_rank_major_partial_barrier_v1",
-      "use_pdl": false
+      "symbol": "kernel_rank_major_partial_arrive_v1",
+      "use_pdl": true
     },
     {
       "bindings": [
@@ -399,7 +363,95 @@
         "pg_rank",
         "pg_flags",
         "local_partials",
-        "local_partials_peers"
+        "local_partials_peers",
+        "topk_ids"
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 17408,
+      "grid": [
+        128,
+        7,
+        1
+      ],
+      "name": "combine",
+      "pdl_launch": false,
+      "pdl_sync": true,
+      "scalar_bindings": [],
+      "symbol": "kernel_rank_major_combine_v3",
+      "use_pdl": true
+    },
+    {
+      "bindings": [
+        "hidden_in",
+        "ids_in",
+        "weights_in",
+        "topk_ids",
+        "ids_is_int64",
+        "active_tokens_per_rank",
+        "pg_world",
+        "pg_rank",
+        "ll_dispatch_peers",
+        "ll_control",
+        "ll_reuse_peers",
+        "ll_combine_peers"
+      ],
+      "block": [
+        288,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        32,
+        8,
+        8
+      ],
+      "name": "ll_push",
+      "pdl_launch": true,
+      "pdl_sync": false,
+      "scalar_bindings": [
+        [
+          "active_tokens_per_rank",
+          32
+        ]
+      ],
+      "symbol": "kernel_rank_major_ll_push_v4",
+      "use_pdl": false
+    },
+    {
+      "bindings": [
+        "recv_hidden",
+        "recv_local_ids",
+        "recv_weights",
+        "active_tokens_per_rank",
+        "pg_world",
+        "pg_rank",
+        "ll_dispatch",
+        "ll_control",
+        "expert_scatter_offsets",
+        "token_to_permuted",
+        "cta_to_expert",
+        "cta_to_mn_limit",
+        "expert_padded_row_offsets",
+        "num_non_exiting_ctas",
+        "total_padded_rows",
+        "route_map",
+        "zero_sentinel",
+        "row_splits"
       ],
       "block": [
         256,
@@ -411,18 +463,102 @@
         1,
         1
       ],
-      "dynamic_smem_bytes": 29696,
+      "dynamic_smem_bytes": 0,
       "grid": [
+        257,
+        1,
+        1
+      ],
+      "name": "ll_recv",
+      "pdl_launch": true,
+      "pdl_sync": true,
+      "scalar_bindings": [
+        [
+          "active_tokens_per_rank",
+          32
+        ],
+        [
+          "row_splits",
+          8
+        ]
+      ],
+      "symbol": "kernel_rank_major_ll_recv_v2",
+      "use_pdl": true
+    },
+    {
+      "bindings": [
+        "expert_output",
+        "topk_weights",
+        "token_to_permuted",
+        "ll_combine_peers",
+        "ll_control",
+        "hidden_size",
+        "active_tokens_per_rank",
+        "pg_rank"
+      ],
+      "block": [
         128,
         1,
         1
       ],
-      "name": "combine",
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        256,
+        7,
+        1
+      ],
+      "name": "ll_unpermute",
+      "pdl_launch": true,
+      "pdl_sync": true,
+      "scalar_bindings": [
+        [
+          "hidden_size",
+          7168
+        ],
+        [
+          "active_tokens_per_rank",
+          32
+        ]
+      ],
+      "symbol": "kernel_rank_major_exact_unpermute_v6",
+      "use_pdl": true
+    },
+    {
+      "bindings": [
+        "output",
+        "pg_rank",
+        "ll_combine",
+        "ll_control",
+        "topk_ids",
+        "ll_reuse"
+      ],
+      "block": [
+        160,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        32,
+        7,
+        1
+      ],
+      "name": "ll_combine",
       "pdl_launch": false,
-      "pdl_sync": false,
+      "pdl_sync": true,
       "scalar_bindings": [],
-      "symbol": "kernel_rank_major_combine_v1",
-      "use_pdl": false
+      "symbol": "kernel_rank_major_combine_v6",
+      "use_pdl": true
     }
   ]
 }

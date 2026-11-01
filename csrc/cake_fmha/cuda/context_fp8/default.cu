@@ -1093,6 +1093,9 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     return result;
 }
 
+// Page 2**30, past any pool: the page-offset role of a request without keys reads its pages here.
+__device__ const int cake_fmha_context_fp8_no_page[1] = {1073741824};
+
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
@@ -1299,6 +1302,12 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     }
                 }
 #endif  // IS_CAUSAL
+                // The block count is 0 for a request without keys, and for a causal tile whose rows see no key
+                // with max_n exactly 0 (q - kv = 2 * (m_block + 1) * TOK_PER_STAGE). Such a tile runs one block,
+                // all masked, as in the generated programs: with none, the MMA warp waits for a K/V stage that
+                // the load warp never fills. Every role clamps alike, in asm so that the compiler derives no
+                // range fact from the clamp and builds the loops as before.
+                asm("max.u32 %0, %0, 1;" : "+r"(num_n_blocks));
                 int causal_row;
                 unsigned int num_masked_iters;
                 {
@@ -2955,6 +2964,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     }
                 }
 #endif  // IS_CAUSAL
+                asm("max.u32 %0, %0, 1;" : "+r"(num_n_blocks_1));
                 int unit = bh_1 % (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int q_head_base = unit * PACK_G;
                 int row_tok = (warp % 4 * 32 + lane) / (unsigned int)PACK_G;
@@ -3114,6 +3124,8 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
 #endif  // ENABLE_SINK
                     }
                 }
+                asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
             }
         }
     }
@@ -3167,6 +3179,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     }
                 }
 #endif  // IS_CAUSAL
+                asm("max.u32 %0, %0, 1;" : "+r"(num_n_blocks_2));
                 mbarrier_wait(q_full_addr, _phase_q_full_0);
                 _phase_q_full_0 ^= 1;
                 mbarrier_wait(q_full_addr + 8, _phase_q_full_1);
@@ -3523,9 +3536,14 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     }
                 }
 #endif  // IS_CAUSAL
+                asm("max.u32 %0, %0, 1;" : "+r"(num_n_blocks_3));
                 unsigned int b_idx = bh_3 / (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int pt_base = b_idx * (unsigned int)page_row_stride;
                 int last_slot = (seqlen_kv_bh_3 - 1) / PAGE_SIZE;
+                // A request without keys reads no table slot: its 16 stores read page 2**30, past any pool, so the
+                // TMA loads fill its masked block with zeros.
+                int const* pt_k = seqlen_kv_bh_3 != 0 ? page_table_k + pt_base : cake_fmha_context_fp8_no_page;
+                int const* pt_v = seqlen_kv_bh_3 != 0 ? page_table_v + pt_base : cake_fmha_context_fp8_no_page;
                 #pragma unroll 1
                 for (unsigned int ni = 0; ni < num_n_blocks_3; ni++) {
                     unsigned int n = num_n_blocks_3 - 1 - ni;
@@ -3549,22 +3567,22 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                         int s6 = _min_6;
                         int _min_7 = (((base_tok + 112) / PAGE_SIZE) < (last_slot) ? ((base_tok + 112) / PAGE_SIZE) : (last_slot));
                         int s7 = _min_7;
-                        smem_pages[pg_idx] = page_table_k[pt_base + s0];
-                        smem_pages[pg_idx + 1] = page_table_k[pt_base + s1];
-                        smem_pages[pg_idx + 2] = page_table_k[pt_base + s2];
-                        smem_pages[pg_idx + 3] = page_table_k[pt_base + s3];
-                        smem_pages[pg_idx + 4] = page_table_k[pt_base + s4];
-                        smem_pages[pg_idx + 5] = page_table_k[pt_base + s5];
-                        smem_pages[pg_idx + 6] = page_table_k[pt_base + s6];
-                        smem_pages[pg_idx + 7] = page_table_k[pt_base + s7];
-                        smem_pages[pg_idx + 8] = page_table_v[pt_base + s0];
-                        smem_pages[pg_idx + 9] = page_table_v[pt_base + s1];
-                        smem_pages[pg_idx + 10] = page_table_v[pt_base + s2];
-                        smem_pages[pg_idx + 11] = page_table_v[pt_base + s3];
-                        smem_pages[pg_idx + 12] = page_table_v[pt_base + s4];
-                        smem_pages[pg_idx + 13] = page_table_v[pt_base + s5];
-                        smem_pages[pg_idx + 14] = page_table_v[pt_base + s6];
-                        smem_pages[pg_idx + 15] = page_table_v[pt_base + s7];
+                        smem_pages[pg_idx] = pt_k[s0];
+                        smem_pages[pg_idx + 1] = pt_k[s1];
+                        smem_pages[pg_idx + 2] = pt_k[s2];
+                        smem_pages[pg_idx + 3] = pt_k[s3];
+                        smem_pages[pg_idx + 4] = pt_k[s4];
+                        smem_pages[pg_idx + 5] = pt_k[s5];
+                        smem_pages[pg_idx + 6] = pt_k[s6];
+                        smem_pages[pg_idx + 7] = pt_k[s7];
+                        smem_pages[pg_idx + 8] = pt_v[s0];
+                        smem_pages[pg_idx + 9] = pt_v[s1];
+                        smem_pages[pg_idx + 10] = pt_v[s2];
+                        smem_pages[pg_idx + 11] = pt_v[s3];
+                        smem_pages[pg_idx + 12] = pt_v[s4];
+                        smem_pages[pg_idx + 13] = pt_v[s5];
+                        smem_pages[pg_idx + 14] = pt_v[s6];
+                        smem_pages[pg_idx + 15] = pt_v[s7];
                         mbarrier_arrive(page_full_addr + (po_stage) * 8);
                     }
                     po_stage += 1;
@@ -3646,6 +3664,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     }
                 }
 #endif  // IS_CAUSAL
+                asm("max.u32 %0, %0, 1;" : "+r"(num_n_blocks_4));
                 int unit_1 = bh_4 % (unsigned int)(NUM_Q_HEADS / PACK_G);
                 int kv_head = unit_1 * PACK_G / HEADS_PER_GROUP;
                 int tok_q0 = (unsigned int)cu_seq_lens_q[bh_4] + m_block_4 * 2 * (unsigned int)TOK_PER_STAGE;
@@ -3713,6 +3732,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
     }
 
     // Cleanup
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
     __syncthreads(); // barrier before TMEM dealloc
 
     if (warp == 0) {

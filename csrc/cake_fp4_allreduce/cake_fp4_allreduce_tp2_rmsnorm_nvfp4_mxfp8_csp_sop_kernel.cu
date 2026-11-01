@@ -63,6 +63,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TOTAL 211456
 #define THREADS 288
 #define LAUNCH_MIN_BLOCKS 1
+#ifndef CAKE_FP4_ALLREDUCE_KERNEL
+#define CAKE_FP4_ALLREDUCE_KERNEL cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop
+#endif
 
 #include <math_constants.h>
 
@@ -162,7 +165,7 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void
-cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop(uint8_t* __restrict__ xq, float* __restrict__ gs, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias)
+CAKE_FP4_ALLREDUCE_KERNEL(uint8_t* __restrict__ xq, float* __restrict__ gs, __nv_bfloat16* __restrict__ res_in, __nv_bfloat16* __restrict__ w, uint8_t* __restrict__ outq, uint8_t* __restrict__ out_sf, float* __restrict__ gs_out, __nv_bfloat16* __restrict__ res_out, uint8_t* __restrict__ os_wire, uint8_t* __restrict__ os_rs, long long* __restrict__ peer_ptrs, unsigned int* __restrict__ ctrl, int rank, int rows, int cap, float eps, float wbias)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -299,6 +302,11 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop(uint8_t* __restrict__ xq, flo
                 if (n > k) {
                     long long row64 = (long long)(r0 + warp_1 + 8 * k);
                     int ob_off = xb_off + k % 3 * 3472;
+#ifdef CAKE_FP4_ALLREDUCE_PREFETCH
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<uint8_t*>(res_in) + (row64 * 12288 + (long long)(128 * lane_2)))));
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<uint8_t*>(res_in) + (row64 * 12288 + (long long)(128 * (lane_2 + 32))))));
+                    asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(reinterpret_cast<uint8_t*>(res_in) + (row64 * 12288 + (long long)(128 * (lane_2 + 64))))));
+#endif
                     float rs = 1.0f;
                     mbarrier_wait(xb_full_addr + (warp_1) * 8, k & 1);
                     rs = gs_me;
@@ -351,15 +359,10 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop(uint8_t* __restrict__ xq, flo
                     long long v_row = v_base + (src64 * cap64 + drow) * 3072;
                     long long s_row = s_base + (src64 * cap64 + drow) * 384;
                     long long m_row = m_base + (src64 * cap64 + drow) * 16;
-                    uint32_t _sysv_poll32_group_0[1];
-                    do {
-                        asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_0[0]) : "l"(reinterpret_cast<unsigned int*>(os_rs + m_row)) : "memory");
-                    } while (
-                        (_sysv_poll32_group_0[0] == 0x80000000u)
-                    );
-                    float rs_peer = __uint_as_float(_sysv_poll32_group_0[0]);
-                    float rs_a = ((first) ? own_rs : rs_peer);
-                    float rs_b = ((first) ? rs_peer : own_rs);
+                    unsigned int rsw[1];
+                    uint32_t _sysv_u32_0;
+                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_u32_0) : "l"(reinterpret_cast<unsigned int*>(os_rs + m_row)) : "memory");
+                    rsw[0] = _sysv_u32_0;
                     float ssx = 0.0f;
                     float ssy = 0.0f;
                     #pragma unroll 1
@@ -391,8 +394,23 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop(uint8_t* __restrict__ xq, flo
                             _wire_spend_5 = ((uint32_t)(((uint32_t)((_fp4_wire_scales_0[0] & 0xFFu) == 0xFFu) | (uint32_t)(((_fp4_wire_scales_0[0] >> 8) & 0xFFu) == 0xFFu)) != 0u) << 0) | ((uint32_t)(((uint32_t)((_fp4_wire_scales_0[1] & 0xFFu) == 0xFFu) | (uint32_t)(((_fp4_wire_scales_0[1] >> 8) & 0xFFu) == 0xFFu)) != 0u) << 1);
                         } while ((_wire_vpend_5 | _wire_spend_5) != 0u);
                         if (j0 == 0) {
+                            int pending = __any_sync(0xFFFFFFFF, rsw[0] == 2147483648u);
+                            if (pending != 0) {
+                                uint32_t _sysv_poll32_group_0[1];
+                                do {
+                                    asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(_sysv_poll32_group_0[0]) : "l"(reinterpret_cast<unsigned int*>(os_rs + m_row)) : "memory");
+                                } while (
+                                    (_sysv_poll32_group_0[0] == 0x80000000u)
+                                );
+                                rsw[0] = _sysv_poll32_group_0[0];
+                            }
+                        }
+                        if (j0 == 0) {
                             mbarrier_wait(rb_full_addr + (warp_1) * 8, kd & 1);
                         }
+                        float rs_peer_f = __uint_as_float(rsw[0]);
+                        float rs_a_f = ((first) ? own_rs : rs_peer_f);
+                        float rs_b_f = ((first) ? rs_peer_f : own_rs);
                         unsigned int own[4];
                         unsigned int own_sc[1];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -468,9 +486,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop(uint8_t* __restrict__ xq, flo
                         float _cvt_f32_f16_1;
                         asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_1) : "h"((uint16_t)(_e4m3x2_to_f16x2_0 >> 16)));
                         float _mul_0;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(_cvt_f32_f16_0), "f"(rs_a));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(_cvt_f32_f16_0), "f"(rs_a_f));
                         float _mul_1;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(_cvt_f32_f16_1), "f"(rs_a));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(_cvt_f32_f16_1), "f"(rs_a_f));
                         float lo = _mul_0;
                         float hi = _mul_1;
                         if (fhi) {
@@ -634,9 +652,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop(uint8_t* __restrict__ xq, flo
                         float _cvt_f32_f16_3;
                         asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_3) : "h"((uint16_t)(_e4m3x2_to_f16x2_1 >> 16)));
                         float _mul_2;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(_cvt_f32_f16_2), "f"(rs_b));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(_cvt_f32_f16_2), "f"(rs_b_f));
                         float _mul_3;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(_cvt_f32_f16_3), "f"(rs_b));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(_cvt_f32_f16_3), "f"(rs_b_f));
                         float lo_52 = _mul_2;
                         float hi_53 = _mul_3;
                         if (fhi) {
@@ -1003,9 +1021,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop(uint8_t* __restrict__ xq, flo
                         float _cvt_f32_f16_5;
                         asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_5) : "h"((uint16_t)(_e4m3x2_to_f16x2_2 >> 16)));
                         float _mul_4;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(_cvt_f32_f16_4), "f"(rs_a));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(_cvt_f32_f16_4), "f"(rs_a_f));
                         float _mul_5;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(_cvt_f32_f16_5), "f"(rs_a));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(_cvt_f32_f16_5), "f"(rs_a_f));
                         float lo_165 = _mul_4;
                         float hi_166 = _mul_5;
                         if (fhi_156) {
@@ -1169,9 +1187,9 @@ cake_fp4_allreduce_tp2_rmsnorm_nvfp4_mxfp8_csp_sop(uint8_t* __restrict__ xq, flo
                         float _cvt_f32_f16_7;
                         asm("cvt.f32.f16 %0, %1;" : "=f"(_cvt_f32_f16_7) : "h"((uint16_t)(_e4m3x2_to_f16x2_3 >> 16)));
                         float _mul_6;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(_cvt_f32_f16_6), "f"(rs_b));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(_cvt_f32_f16_6), "f"(rs_b_f));
                         float _mul_7;
-                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(_cvt_f32_f16_7), "f"(rs_b));
+                        asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(_cvt_f32_f16_7), "f"(rs_b_f));
                         float lo_217 = _mul_6;
                         float hi_218 = _mul_7;
                         if (fhi_156) {

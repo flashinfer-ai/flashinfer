@@ -1287,6 +1287,7 @@ def get_batch_prefill_bidirectional_ranges_spec(
     dtype_idx: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
+    v_sf_swizzled: bool = False,
 ) -> dict:
     """The single source of truth for this variant's JIT contract.
 
@@ -1333,6 +1334,14 @@ def get_batch_prefill_bidirectional_ranges_spec(
     )
 
     packed_fp4_kv = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
+    if v_sf_swizzled:
+        # V scale factors in the trtllm-gen per-page swizzle; only a packed
+        # NVFP4 cache has them.
+        if not packed_fp4_kv:
+            raise ValueError("v_sf_swizzled requires a packed NVFP4 KV cache.")
+        if head_dim_vo % 64:
+            raise ValueError("v_sf_swizzled requires head_dim_vo divisible by 64.")
+        uri += "_v_sf_swizzled"
 
     tensor_names: List[str] = ["bidirectional_ranges"]
     tensor_dtypes: List[str] = ["int32_t"]
@@ -1367,6 +1376,7 @@ def get_batch_prefill_bidirectional_ranges_spec(
             "use_sliding_window": False,
             "use_logits_soft_cap": False,
             "use_fp16_qk_reduction": False,
+            "v_sf_swizzled": v_sf_swizzled,
         },
     }
 
@@ -1397,6 +1407,7 @@ def gen_batch_prefill_bidirectional_ranges_module(
     dtype_idx: torch.dtype,
     head_dim_qk: int,
     head_dim_vo: int,
+    v_sf_swizzled: bool = False,
 ) -> JitSpec:
     """Build the causal + bidirectional-ranges batch-prefill module.
 
@@ -1413,6 +1424,7 @@ def gen_batch_prefill_bidirectional_ranges_module(
         dtype_idx,
         head_dim_qk,
         head_dim_vo,
+        v_sf_swizzled,
     )
     return gen_customize_batch_prefill_module(
         spec["backend"],
@@ -2051,6 +2063,7 @@ def gen_customize_batch_prefill_module(
     use_token_head_sf: bool = False,
     paged_kv_stride_mode: BatchPrefillPagedKVStrideMode = "runtime",
     module_surface: BatchPrefillModuleSurface = "full",
+    v_sf_swizzled: bool = False,
 ) -> JitSpec:
     _validate_batch_prefill_module_mode(backend, paged_kv_stride_mode, module_surface)
     require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
@@ -2202,6 +2215,10 @@ def gen_customize_batch_prefill_module(
             # NVFP4 KV kernels need FLASHINFER_ENABLE_FP4_E2M1 (common flags) even
             # when the head_dim helper returns no arch-specific flags.
             extra_cuda_cflags = (extra_cuda_cflags or []) + common_nvcc_flags
+        if v_sf_swizzled:
+            extra_cuda_cflags = (extra_cuda_cflags or []) + [
+                "-DFLASHINFER_PAGED_V_SF_DESWIZZLE=1"
+            ]
         return gen_jit_spec(
             uri,
             source_paths,

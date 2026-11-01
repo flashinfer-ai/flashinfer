@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
@@ -44,6 +45,25 @@ def _config(**kw):
             | kw
         )
     )
+
+
+@pytest.mark.parametrize("rubin", [False, True])
+def test_route_staging_fallback_preserves_architecture_score_policy(rubin):
+    from flashinfer.moe_ep.backends.mega.kernel import routing_staging as shared
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import routing_staging
+
+    ids = torch.tensor([[0, -1, -1, -1]])
+    scores = torch.tensor([[0.25, float("nan"), float("inf"), -float("inf")]])
+    ids_out = torch.full((2, 4), -7, dtype=torch.int32)
+    scores_out = torch.full((2, 4), 123.0)
+    stage = routing_staging.stage_routes if rubin else shared.stage_routes
+    stage(ids, scores, ids_out, scores_out, workspace=SimpleNamespace())
+    expected = scores if rubin else scores.masked_fill(ids == -1, 0)
+    torch.testing.assert_close(scores_out[:1], expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.equal(ids_out[:1], ids.to(torch.int32))
+    assert (ids_out[1:] == -7).all() and (scores_out[1:] == 123).all()
+    assert torch.isnan(scores[:, 1]).all()
+    assert torch.isposinf(scores[:, 2]).all() and torch.isneginf(scores[:, 3]).all()
 
 
 def test_mxfp4_weights_have_independent_dtype_and_packing():
@@ -160,6 +180,7 @@ def _workspace():
     ws.config = _config()
     ws.device = torch.device("cpu")
     ws._destroyed = False
+    ws._tuning_state = block_scaled.AutoTuningState()
     ws._compiled = mock.Mock()
     # Model a kernel that requires launch-side clearing. Native masked BF16
     # reducers opt out via this capability; quantized combine still clears.
@@ -271,7 +292,11 @@ def test_cache_keeps_reduction_and_weighting_policy_separate(tmp_path, monkeypat
     assert lookup_knobs(**key) is None
     assert lookup_knobs(**key, allow_nondeterministic=True) == knobs
     assert (
-        lookup_knobs(**key, allow_nondeterministic=True, apply_topk_at_fc1=False)
+        lookup_knobs(
+            **key,
+            allow_nondeterministic=True,
+            apply_routing_weights_before_fc2=False,
+        )
         is None
     )
     data = json.loads(path.read_text())
@@ -308,17 +333,53 @@ def test_sm100_and_sm107_cache_entries_cannot_collide(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("ids", [[[0, 0]], [[-2, 0]], [[0, 8]], [[0, 2**32]]])
-def test_invalid_routes_rejected_before_int32_conversion(ids):
+def test_invalid_routes_rejected_before_int32_conversion(ids, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
     with pytest.raises(RuntimeError, match="unique expert"):
         validate_routing_values(torch.tensor(ids), torch.ones(1, 2), 8)
 
 
-def test_masked_routes_and_finite_score_contract():
+@pytest.mark.parametrize("score", [float("nan"), float("inf"), -float("inf")])
+def test_masked_routes_and_finite_score_contract(score, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
     validate_routing_values(torch.tensor([[-1, -1], [0, 7]]), torch.ones(2, 2), 8)
+    validate_routing_values(
+        torch.tensor([[-1, -1], [0, -1]]),
+        torch.tensor([[score, score], [1.0, score]]),
+        8,
+    )
     with pytest.raises(RuntimeError, match="finite scores"):
-        validate_routing_values(
-            torch.tensor([[0, 1]]), torch.tensor([[1.0, float("nan")]]), 8
-        )
+        validate_routing_values(torch.tensor([[0, 1]]), torch.tensor([[1.0, score]]), 8)
+
+
+@pytest.mark.parametrize("check_routes", [None, "1", "0"])
+@pytest.mark.parametrize("fused", [False, True])
+def test_routing_validation_opt_in(monkeypatch, check_routes, fused):
+    if check_routes is None:
+        monkeypatch.delenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", raising=False)
+    else:
+        monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", check_routes)
+    monkeypatch.setenv("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1")
+    ids = torch.tensor([[0, 0]])
+    scores = torch.ones(1, 2)
+    checker = mock.Mock(side_effect=RuntimeError("unique expert IDs"))
+    monkeypatch.setitem(
+        sys.modules,
+        "flashinfer.moe_ep.backends.mega.kernel.sm107.routing_validation",
+        SimpleNamespace(check_routing=checker),
+    )
+    if fused:
+        ids = mock.Mock(is_cuda=True, shape=(1, 2))
+        ids.is_contiguous.return_value = True
+
+    if check_routes in (None, "0"):
+        validate_routing_values(ids, scores, 8)
+        checker.assert_not_called()
+    else:
+        with pytest.raises(RuntimeError, match="unique expert"):
+            validate_routing_values(ids, scores, 8)
+        if fused:
+            checker.assert_called_once_with(ids, scores, 8, None)
 
 
 @pytest.mark.parametrize("name", ["fc1_alpha", "fc2_alpha", "fc1_norm_const"])
@@ -502,7 +563,9 @@ def test_no_dist_rejects_multirank(monkeypatch):
 
 
 def test_ikr_requires_early_weighting():
-    with pytest.raises(ValueError, match="apply_topk_at_fc1"):
+    with pytest.raises(ValueError, match="apply_routing_weights_before_fc2"):
         dataclasses.replace(
-            _config(), reduce_topk_in_kernel=True, apply_topk_at_fc1=False
+            _config(),
+            reduce_topk_in_kernel=True,
+            apply_routing_weights_before_fc2=False,
         )

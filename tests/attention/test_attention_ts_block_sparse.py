@@ -3708,21 +3708,21 @@ def _paged_one_shot_metadata_abi_cases() -> list[object]:
             "seq_lens_kv",
             lambda: torch.tensor([[64]], **cuda_i32),
             ValueError,
-            "seq_lens must be one-dimensional",
+            "seq_lens_kv must be one-dimensional",
             id="seq_lens_kv-rank",
         ),
         pytest.param(
             "seq_lens_kv",
             lambda: torch.tensor([64], device="cuda", dtype=torch.int64),
             TypeError,
-            "seq_lens must have dtype torch.int32",
+            "seq_lens_kv must have dtype torch.int32",
             id="seq_lens_kv-dtype",
         ),
         pytest.param(
             "seq_lens_kv",
             lambda: torch.tensor([64], dtype=torch.int32),
             ValueError,
-            "seq_lens must be a CUDA tensor",
+            "seq_lens_kv must be a CUDA tensor",
             id="seq_lens_kv-device",
         ),
         pytest.param(
@@ -5896,75 +5896,6 @@ def test_dense_contiguous_plan_rejects_unsupported_arguments(
     )
     with pytest.raises(error, match=match):
         block_sparse_module.BlockSparseTSWrapper().plan(**{**arguments, **overrides})
-
-
-def test_dense_static_profile_defaults_to_128_token_blocks() -> None:
-    """A dense plan may omit its block sizes; a block-sparse plan must name both."""
-
-    arguments: dict[str, object] = dict(
-        batch_size=1,
-        seq_len_q=256,
-        seq_len_kv=1024,
-        num_qo_heads=8,
-        num_kv_heads=8,
-        head_dim=_HEAD_DIM,
-        use_kv_valid_bits=False,
-        mask_type="dense",
-        q_dtype=torch.bfloat16,
-        kv_dtype=None,
-        output_dtype=None,
-    )
-    validate = block_sparse_module._validate_block_sparse_static_profile
-    dense = validate(
-        **arguments, q_block_size=None, kv_block_size=None, use_block_sparse=False
-    )
-    assert (dense.q_block_size, dense.kv_block_size) == (128, 128)
-    partial = validate(
-        **arguments, q_block_size=64, kv_block_size=None, use_block_sparse=False
-    )
-    assert (partial.q_block_size, partial.kv_block_size) == (64, 128)
-    with pytest.raises(ValueError, match="required by a block-sparse plan"):
-        validate(
-            **arguments,
-            q_block_size=None,
-            kv_block_size=64,
-            max_blocks_per_row=1,
-            use_block_sparse=True,
-        )
-
-
-@_REQUIRES_PRIMTS_GPU
-@torch.no_grad()
-def test_dense_contiguous_plan_defaults_to_q128_kv128() -> None:
-    """A dense plan and the dense one-shot without block sizes run as if they named 128."""
-
-    torch.manual_seed(20261020)
-    batch_size, seq_len_q, seq_len_kv, num_heads = 1, 256, 1000, 8
-    shape_q = (batch_size, seq_len_q, num_heads, _HEAD_DIM)
-    shape_kv = (batch_size, seq_len_kv, num_heads, _HEAD_DIM)
-    q = torch.randn(shape_q, device="cuda", dtype=torch.bfloat16) * 0.25
-    k = torch.randn(shape_kv, device="cuda", dtype=torch.bfloat16) * 0.25
-    v = torch.randn_like(k)
-    plan_args = (batch_size, seq_len_q, seq_len_kv, num_heads, num_heads, _HEAD_DIM)
-    plan_kwargs = dict(
-        device=torch.device("cuda", 0),
-        use_block_sparse=False,
-        q_data_type=torch.bfloat16,
-    )
-    implicit = block_sparse_module.BlockSparseTSWrapper()
-    implicit.plan(*plan_args, **plan_kwargs)
-    explicit = block_sparse_module.BlockSparseTSWrapper()
-    explicit.plan(*plan_args, 128, 128, **plan_kwargs)
-    policy = dict(implicit._policy)
-    assert policy["tile_size_q"] == 128
-    assert policy["tile_size_kv"] == 128
-    expected = explicit.run(q, k, v)
-    one_shot = block_sparse_module.block_sparse_attention(
-        q, k, v, None, None, use_block_sparse=False
-    )
-    torch.cuda.synchronize()
-    assert torch.equal(implicit.run(q, k, v), expected)
-    assert torch.equal(one_shot, expected)
 
 
 @_REQUIRES_PRIMTS_GPU

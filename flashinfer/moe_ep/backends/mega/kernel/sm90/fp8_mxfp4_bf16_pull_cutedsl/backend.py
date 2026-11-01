@@ -54,6 +54,39 @@ def _resolve_gate_up_clamp(
 class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
     """Fused Humming MXFP4 MegaMoE on Hopper."""
 
+    _autotune_output_error = (
+        "compute(output=None) is incompatible with knobs='auto' "
+        "(the collective MXFP4 sweep needs a caller output buffer)"
+    )
+    _weight_format = "MXFP4"
+    _frontend_format = "mxfp4"
+    _autotune_warning = (
+        "MXFP4 knobs='auto' runs a COLLECTIVE compile+timing sweep at "
+        "the first forward; tune offline for serving "
+        "(python -m flashinfer.moe_ep.tune --dtype sm90_mxfp4). "
+        "Rank 0 persists the winner and knobs=None performs only a "
+        "cache lookup with manifest-heuristic fallback."
+    )
+    # Format validators share the call below; their optional ABI checks differ.
+    _validate_transformed: Callable[..., None] = staticmethod(
+        validate_transformed_mega_weights
+    )
+    _validate_forward_inputs = staticmethod(validate_sm90_mxfp4_forward_inputs)
+
+    def _frontend_function(self, template: str):
+        from ......kernel_src.sm90 import pull_style_cutedsl_megakernel as pkg
+
+        return getattr(pkg, template.format(self._frontend_format))
+
+    def _format_config_kwargs(self) -> dict[str, Any]:
+        return {"compact_pull_buffer": self._kernel_config.compact_pull_buffer}
+
+    def _knob_resolver_kwargs(self) -> dict[str, Any]:
+        return {}
+
+    def _staging_kwargs(self) -> dict[str, Any]:
+        return {}
+
     supports_output_view = True
 
     def __init__(
@@ -70,11 +103,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
             import warnings
 
             warnings.warn(
-                "MXFP4 knobs='auto' runs a COLLECTIVE compile+timing sweep at "
-                "the first forward; tune offline for serving "
-                "(python -m flashinfer.moe_ep.tune --dtype sm90_mxfp4). "
-                "Rank 0 persists the winner and knobs=None performs only a "
-                "cache lookup with manifest-heuristic fallback.",
+                self._autotune_warning,
                 UserWarning,
                 stacklevel=3,
             )
@@ -121,9 +150,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
         if manual_selector:
             fused_tile = k.mma_tiler_mnk or (128, 32, 128)
         else:
-            from ......kernel_src.sm90 import pull_style_cutedsl_megakernel as pkg
-
-            tactic = pkg.resolve_hopper_mxfp4_knobs(
+            tactic = self._frontend_function("resolve_hopper_{}_knobs")(
                 k.knobs if isinstance(k.knobs, dict) else None,
                 world_size=bootstrap.world_size,
                 hidden=hidden,
@@ -133,6 +160,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
                 num_max_tokens=fleet_params.max_tokens_per_rank,
                 gate_up_clamp=_resolve_gate_up_clamp(k),
                 routing_profile=k.routing_profile,
+                **self._knob_resolver_kwargs(),
             )
             fused_tile = tactic.get("mma_tiler_mnk", (128, 32, 128))
         fused_tile_k = int(fused_tile[2])
@@ -156,18 +184,22 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
             expert_chunk_size=k.preprocess_expert_chunk_size,
         )
 
+    def _validate_transformed_kwargs(self) -> dict[str, Any]:
+        return {}
+
     def validate_transformed_weights(
         self,
         transformed_weights: TransformedMegaWeights,
         bootstrap: BootstrapConfig,
         fleet_params: FleetParams,
     ) -> None:
-        validate_transformed_mega_weights(
+        self._validate_transformed(
             transformed_weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
+            **self._validate_transformed_kwargs(),
         )
 
     def _fused_frontend_config_kwargs(
@@ -206,15 +238,12 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
             "fc1_store_offload": k.fc1_store_offload,
             "fc1_early_done_publish": k.fc1_early_done_publish,
             "fold_producer_warps": k.fold_producer_warps,
+            **self._format_config_kwargs(),
             "routing_profile": k.routing_profile,
         }
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
-            get_symm_buffer_for_hopper_mxfp4_mega_moe,
-        )
-
-        return get_symm_buffer_for_hopper_mxfp4_mega_moe(
+        return self._frontend_function("get_symm_buffer_for_hopper_{}_mega_moe")(
             **self._fused_frontend_config_kwargs(fleet_params)
         )
 
@@ -225,7 +254,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
-        validate_sm90_mxfp4_forward_inputs(
+        self._validate_forward_inputs(
             t.hidden_states,
             t.topk_ids,
             t.topk_weights,
@@ -253,6 +282,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
             quantize_input=quantize_input,
             scales=t.scales,
             safe_quantization=True,
+            **self._staging_kwargs(),
         )
 
     def compute(
@@ -265,34 +295,22 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
         k = self._kernel_config
         if output is None:
             if self._autotune_pending:
-                raise ValueError(
-                    "compute(output=None) is incompatible with knobs='auto' "
-                    "(the collective MXFP4 sweep needs a caller output buffer)"
-                )
+                raise ValueError(self._autotune_output_error)
             num_tokens = staged_tokens(workspace.topk_idx)
             if num_tokens is None:
                 raise ValueError(
                     "compute(output=None) requires stage_inputs() to stage "
-                    "this MXFP4 workspace first"
+                    f"this {self._weight_format} workspace first"
                 )
         else:
             num_tokens = output.shape[0]
 
-        launch: Callable[..., Any]
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
-            hopper_mxfp4_mega_moe,
-        )
-
-        launch = hopper_mxfp4_mega_moe
+        launch = self._frontend_function("hopper_{}_mega_moe")
 
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute together.
             # The wrapper uses rank-local median then all-rank MAX.
-            from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
-                autotune_hopper_mxfp4_mega_moe,
-            )
-
-            autotune = autotune_hopper_mxfp4_mega_moe
+            autotune = self._frontend_function("autotune_hopper_{}_mega_moe")
 
             self._autotune_winner = autotune(
                 output,
@@ -325,7 +343,9 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
         if output is not None:
             return output
         if view is None:
-            raise RuntimeError("MXFP4 zero-copy launch did not return an output view")
+            raise RuntimeError(
+                f"{self._weight_format} zero-copy launch did not return an output view"
+            )
         return view
 
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
@@ -352,24 +372,17 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
         )
 
     def _workspace_pool_request(self, fleet_params: FleetParams) -> Any:
-        k = self._kernel_config
-        if k.knobs == "auto":
+        if self._kernel_config.knobs == "auto":
             # Autotuning mutates the frontend; keep these sessions unpooled.
             return None
-        from ......kernel_src.sm90.pull_style_cutedsl_megakernel import (
-            _get_symm_buffer_for_hopper_mxfp4_mega_moe_from_resolved_config,
-            _resolve_hopper_mxfp4_mega_moe_config,
-        )
-
-        resolved_config = _resolve_hopper_mxfp4_mega_moe_config(
+        resolved_config = self._frontend_function("_resolve_hopper_{}_mega_moe_config")(
             **self._fused_frontend_config_kwargs(fleet_params)
         )
         key = self._workspace_pool_key_from_config(resolved_config)
-        return key, lambda: (
-            _get_symm_buffer_for_hopper_mxfp4_mega_moe_from_resolved_config(
-                resolved_config
-            )
+        allocate = self._frontend_function(
+            "_get_symm_buffer_for_hopper_{}_mega_moe_from_resolved_config"
         )
+        return key, lambda: allocate(resolved_config)
 
 
 __all__ = ["Sm90PullMxfp4MegaKernelBackend"]

@@ -38,6 +38,21 @@ Cake VSA
     run_cake_vsa
 
 
+Token-Sparse Attention Inputs
+-----------------------------
+
+Build cache-slot lists for token-sparse attention.
+Build grouped key unions and masks for masked dense attention.
+
+.. currentmodule:: flashinfer.token_sparse
+
+.. autosummary::
+    :toctree: ../generated
+
+    token_sparse_kv_indices
+    group_union_masks
+
+
 .. currentmodule:: flashinfer.sparse
 
 
@@ -45,9 +60,9 @@ flashinfer.msa_ops
 ==================
 
 Minimax Sparse Attention (MSA) sparse prefill, sparse decode, and top-k
-selection dispatch on compute capability 10.0/10.3/10.7 (SM100/SM103/SM107) and
-SM120/SM121 Blackwell GPUs. The proxy-score operations remain SM120/SM121
-only. On compute capability 10.0/10.3/10.7, NVFP4 K/V is served by dedicated
+selection dispatch on SM100/SM103/SM107/SM120/SM121. ``msa_proxy_score`` also
+supports SM90; only ``msa_proxy_score_fp4`` is SM120/SM121-only. On
+SM100/SM103/SM107, packed NVFP4 K/V is served by dedicated
 paged-KV prefill and decode routes that take the four regions of a packed
 NVFP4 page -- K data, K scales, V data, V scales -- as strided views of one
 allocation, for the MiniMax-M3 head geometry (head dimension 128, page size
@@ -116,3 +131,57 @@ capture the same inputs take the generic decode route.
     msa_sparse_decode_attention
     msa_topk_select
     prepare_msa_nvfp4_sparse_decode
+
+MiniMax-M3 ICP indexer
+----------------------
+
+Experimental per-rank kernels of the MiniMax-M3 index-context-parallel (ICP)
+indexer on compute capability 10.0, 10.3 and 10.7 (exact ``sm_100a``,
+``sm_103a`` and ``sm_107a`` builds). The index keys are sharded by context across
+a TP2 or TP4 group (P128 pages: rows interleaved across ranks; P256 pages:
+contiguous 128-row halves for TP2, 64-row quarters for TP4), and every rank
+holds the FP8 queries of all four index heads. Scores are raw FP32 ``q . k``
+maxima per logical 128-token block (B128); selection ranks them descending,
+puts the forced begin/end blocks first and breaks exact ties toward the lower
+block id. The entry points follow the MSA sharded-indexer contract: a device
+plan and a chunked prefill scorer, a prefill Top16 selector into carrier rows,
+a decode scorer, a decode Top16 selector that publishes into the owner ranks'
+receive rows, and the owner-side merge. The caller owns every buffer and the
+collective steps (receive-storage rendezvous, the prefill all-to-all); the
+kernels never allocate or synchronize with the host and are CUDA Graph safe.
+The receive storage is laid out by ``msa_icp_comm_layout``; zero it and its
+counters once and never reset them. Generation-tagged receive rows need at
+least two sparse layers between uses of one slot set. Version 1 supports four
+index heads.
+
+The default decode chain is the score plane
+(``msa_icp_decode_index_score_sharded``) followed by
+``msa_icp_topk_select_publish``; ``msa_icp_decode_score_publish`` fuses the two
+steps and is an option. With ``enable_pdl`` on compute capability 10.0 and
+10.3 at 64 or 128 local K rows per page, the score plane reads ``seq_lens`` and
+``block_table`` and starts loading the history index-K pages before it waits on
+the preceding kernel; that kernel must not write them and must be launched
+without programmatic dependent launch or wait on its own predecessor before it
+triggers (``enable_pdl=False`` removes this requirement). Call ``warmup()`` on
+the plan returned by ``prepare_msa_icp_indexer`` on every rank before the first
+exchange and before CUDA Graph capture: it loads every kernel into the device's
+context, so that no first launch waits on module loading while a peer's merge
+spins.
+
+.. autosummary::
+    :toctree: ../generated
+
+    prepare_msa_icp_indexer
+    msa_icp_index_score_sharded_plan
+    msa_icp_index_score_sharded_plan_device
+    msa_icp_index_score_sharded
+    msa_icp_topk_select_prefill
+    msa_icp_decode_index_score_sharded
+    msa_icp_topk_select_publish
+    msa_icp_decode_score_publish
+    msa_icp_merge_candidates
+    msa_icp_index_score_plan_storage
+    msa_icp_index_score_columns
+    msa_icp_decode_score_columns
+    msa_icp_decode_pool_bytes
+    msa_icp_comm_layout

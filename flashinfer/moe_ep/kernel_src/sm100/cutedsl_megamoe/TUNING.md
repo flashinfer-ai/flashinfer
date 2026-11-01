@@ -14,6 +14,93 @@ single GB200 node (4x GPUs, EP=4) at a DeepSeek-V3-like geometry:
 recipe (hardware, container, versions, harness invocation) is in the
 "Sweep methodology" and "Runbook" sections below.
 
+## BF16 input and output fusion
+
+BF16-activation CuTeDSL backends share a single staging launch for the
+activation, expert IDs, routing weights and full routing-capacity tail.
+The vectorized path requires contiguous CUDA tensors and 16-byte-aligned
+BF16 activation pointers. Unsupported layouts, overlapping planes and
+`FLASHINFER_MEGA_FUSED_STAGE=0` retain the Torch copies. Every captured
+invocation masks the full routing tail, including empty batches; it does
+not infer tail validity from host live-token counts.
+
+Prepared staging bindings are immutable and private to each host thread;
+only compiled code is shared. Every call rechecks tensor pointers, shapes,
+strides, dtypes and devices before reusing a binding. This avoids repeating
+eligibility checks and descriptor preparation without allowing interleaved
+calls to replace each other's launch arguments.
+
+For BF16×BF16 with the separate terminal reducer, a contiguous, aligned
+caller output is bound directly to that reducer. Its live row count bounds
+the reduction, avoiding both padded-row reduction and the workspace-to-output
+copy. Launch bindings include output shape and stride so views sharing an
+address can have different live lengths. In-kernel atomic reduction retains
+its full-capacity symmetric target. Empty, strided and unaligned caller
+outputs retain the workspace copy. Warm the required layouts before graph
+capture.
+
+### Rubin measurements (2026-10-29)
+
+Native SM107, eight Rubin GPUs, EP8, hidden 4096, intermediate 2048,
+256 experts, top-6, capacity 256, uniform routing and no shared experts.
+The BF16 intermediate and combine use early routing weights and a gate/up
+clamp of 10. GPU clocks were not locked. The baseline BF16 integration
+files match revision `9f51f1aa1415dbdd22ddbfe6aa29069196a5a2b7`.
+
+These are full public forward calls including input staging and caller
+output. Each value averages two runs; each run takes the maximum of the
+eight per-rank medians over five rounds of 40 CUDA Graph calls. Session
+order alternates by round. DeepGEMM is an unchanged control, averaged over
+the four before/after runs, with weight localization disabled. Its source
+revision is `5081f8513af57e61696de4f4f04b0e707ffb503e`, compiled for the
+compatible `sm_100f` target; FlashInfer targets native `sm_107a`.
+
+| Tokens/rank | Before (µs) | After (µs) | Latency reduction | DeepGEMM control (µs) |
+| ---: | ---: | ---: | ---: | ---: |
+| 32 | 268.27 | 263.09 | 1.93% | 206.77 |
+| 192 | 277.86 | 271.58 | 2.26% | 219.40 |
+| 256 | 278.34 | 273.59 | 1.70% | 221.64 |
+
+At 192 live tokens, every rank's profile drops from seven full-call
+launches to three: fused staging, the main kernel and terminal reduction.
+Numerical oracles and graph/eager parity pass at all measured points.
+Existing BF16/BF16×MXFP8 tests also passed at EP4 on SM107. This experiment
+did not qualify SM100/SM103 hardware. The remaining DeepGEMM gap is
+predominantly in the main compute kernel.
+
+### CPU submission follow-up (2026-10-29)
+
+Single-GPU SM107 staging-only measurements use H=4096, capacity=256,
+top-k=6, BF16 activations, int64 IDs and FP32 scores. CPU submission is
+the median of seven alternating rounds of 100 warmed calls, with CUDA
+synchronization after the timed submission interval. GPU intervals use
+40 staging calls per captured graph and 30 replays per round. Clocks are
+not locked. `copies` sets `FLASHINFER_MEGA_FUSED_STAGE=0`; `reviewed fused`
+is the implementation at `b5188e586`, and `prepared` uses thread-private
+bindings with runtime storage/layout checks.
+
+| Live rows | CPU copies (µs) | CPU reviewed fused (µs) | CPU prepared (µs) | GPU copies (µs) | GPU prepared (µs) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 22.03 | 25.16 | 14.28 | 5.83 | 1.93 |
+| 32 | 21.91 | 24.96 | 14.03 | 5.84 | 1.97 |
+| 192 | 21.95 | 24.77 | 13.84 | 6.53 | 2.13 |
+| 256 | 15.13 | 24.06 | 13.29 | 5.76 | 2.15 |
+
+An EP8 full-forward comparison at the geometry above, intermediate=2048,
+256 experts and 192 live rows keeps direct output enabled on both sides
+and changes only staging. Five alternating batches of 20 eager calls give
+maximum per-rank median CPU submission of 202.43 µs for copies versus
+184.52 µs for prepared staging. Completed batch wall time, including the
+final CUDA synchronization, is approximately flat: 648.11 versus
+645.19 µs per call, with scheduling jitter in individual rounds. Full-call
+CUDA Graph intervals are 274.54 versus 270.90 µs. These scopes do not
+measure serving latency and are distinct from the full-PR table above.
+
+A forced two-thread interleaving with native GPU buffers reproduced the
+reviewed cache's pointer swap and passed with private bindings. Another
+400 concurrent calls and same-tensor storage/shape/stride changes passed
+staging equality checks.
+
 ## Microbenchmark results (2026-07-22, e2e_pipelined p50 µs)
 
 Measured with `nvidia-cutlass-dsl==4.5.2`, using the mainloop workaround
@@ -376,18 +463,19 @@ a shape comes in:
   one compiled slot, so callers can select a decode or prefill workspace
   whose capacity has an offline winner in the same knob cache.
 
-### Caller finalization for BF16 and W4A16
+### Caller finalization for BF16, MXFP8, BF16xMXFP8 and W4A16
 
-SM100 BF16 and W4A16 MegaMoE also accept `do_finalize=False` in their kernel
-configs. Call `layer.forward_unfinalized(t)` to receive borrowed, contiguous
+SM100 BF16, MXFP8, BF16xMXFP8 and W4A16 MegaMoE also accept
+`finalize_mode=FinalizeMode.NONE` in their kernel configs. Call `layer.forward_unfinalized(t)` to receive borrowed, contiguous
 BF16 `[T * top_k, hidden]` rows, FP32 `[T, top_k]` remaining routing weights,
 and an int32 `[T, top_k]` identity route map. Consume the results on the current
 stream before the pooled workspace is reused. EP communication completes even
 on zero-token ranks; warm up on all ranks before CUDA graph capture.
 
 BF16 applies routing weights in FC1 by default and returns remaining weights of one.
+MXFP8 and BF16xMXFP8 always apply them in FC1 and return ones.
 W4A16 returns the staged routing weights by default, or ones with
-`apply_topk_in_fc1=True`. Caller finalization can use:
+`apply_routing_weights_before_fc2=True`. Caller finalization can use:
 
 ```python
 rows, weights, route_map = layer.forward_unfinalized(t)
@@ -398,25 +486,26 @@ output = (partials * weights.unsqueeze(-1)).sum(dim=1).bfloat16()
 W4A16's built-in weighted reducer uses fused multiply-add. A caller's separate
 multiply and sum can therefore round differently despite identical per-route rows.
 
-Both backends require `enable_in_kernel_fc2_reduce=False` and reject
+These backends require `enable_in_kernel_fc2_reduce=False` and reject
 `knobs="auto"` in this mode. Use `knobs=None` or an explicit knob dictionary.
 The `--no-do-finalize` offline tuning CLI remains specific to SM100 NVFP4.
 
 ### Offline tuning for unfinalized NVFP4 output
 
 Use `--no-do-finalize` to tune SM100 NVFP4 for a serving configuration with
-`do_finalize=False`. EP communication completes; `forward_unfinalized()` returns
+`finalize_mode=FinalizeMode.NONE`. EP communication completes; `forward_unfinalized()` returns
 BF16 `[T * top_k, hidden]` GEMM2 rows, FP32 `[T, top_k]` remaining weights, and
 an int32 `[T, top_k]` identity map for the caller's final reduction. All three
 results borrow workspace storage. The default `--do-finalize`
 includes finalization. Match the serving configuration's routing-weight
-placement with `--apply-topk-in-fc1` (default) or `--no-apply-topk-in-fc1`:
+placement with `--apply-routing-weights-before-fc2` (default) or
+`--no-apply-routing-weights-before-fc2`:
 
 ```bash
 torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
     --arch sm100 --dtype nvfp4 --hidden 7168 --intermediate 2048 \
     --num-experts 256 --topk 8 --max-tokens 64 2048 \
-    --no-do-finalize --no-apply-topk-in-fc1
+    --no-do-finalize --no-apply-routing-weights-before-fc2
 ```
 
 This mode requires BF16 combine and deterministic reduction. Each candidate
@@ -430,7 +519,7 @@ output; entries from the removed explicit startup tuner are ignored.
 Use the actual per-rank workspace capacities for `--max-tokens`. The cache records
 `--live-tokens` alongside capacity, so distinct workload winners at the same
 capacity can share one cache file. Serving loads the winner with
-`knobs=None` and the matching `do_finalize` / `apply_topk_in_fc1` settings,
+`knobs=None` and the matching `finalize_mode` / `apply_routing_weights_before_fc2` settings,
 falling back to the heuristic on a cache miss. Retune NVFP4 entries previously
 recorded without the correct routing-weight placement.
 
@@ -583,7 +672,8 @@ plumbed through `get_symm_buffer_for_mega_moe` and the backend configs
   large terms nearly cancel the agreement is bounded by the bf16 ULP of the
   largest TERM — validate with a row-scaled band (tests'
   `_assert_ikr_close`: K x 2^-8 x safety 8 x row max), never a flat
-  atol/rtol.  Requires `apply_topk_in_fc1=True` + bf16 combine wire.
+  atol/rtol. Requires `apply_routing_weights_before_fc2=True` + bf16 combine
+  wire.
 - `combine_dtype` — quantized cross-rank combine wire (`"mxfp8"` =
   `32e4m3xe8m0`, 2x less NVLink combine traffic; `"nvfp4"` = `16e2m1xbf16`,
   4x less).  Numerics tradeoff (wire-quantizes the per-topk fc2 outputs);
