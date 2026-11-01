@@ -16,6 +16,7 @@ from b12x.preparation.types import (
     require_prepared,
 )
 from b12x._lib.compile_plan import compile_only_launches
+from b12x.attention._shared.mla.traits import KVARN_RECORD_VARIANTS
 
 from ._scratch import (
     B12XSparseMLABinding,
@@ -132,6 +133,25 @@ def compile_cache_writer(payload, ordinal):
         slots = empty(
             tuple(payload["slots_shape"]), getattr(torch, payload["slots_dtype"])
         )
+        if payload.get("kvarn"):
+            from b12x.attention._shared.mla._kvarn_writer import (
+                _compile_kvarn_writer,
+            )
+
+            return {
+                "writer": _compile_kvarn_writer(
+                    kv_c,
+                    cache,
+                    slots,
+                    int(payload["k_bits"]),
+                    int(payload["v_bits"]),
+                    int(payload["group"]),
+                )
+            }
+        if payload.get("tail_fp8"):
+            return {
+                "writer": writer._compile_glm_next_mla_cache_writer(kv_c, cache, slots)
+            }
         if bool(payload["nvfp4"]):
             return {
                 "writer": writer._compile_nvfp4_mla_writer(
@@ -351,16 +371,96 @@ def plan(
     )
 
 
+def _validate_tail_fp8_writer_args(kv_c, kv_cache, slot_mapping):
+    """Validate the fp8-tail writer contract (fp8 content, kvarn pool stride).
+
+    Mirrors ``_validate_glm_next_mla_cache_writer_args`` but accepts the
+    kvarn pool's wider record stride (>= 528 B) instead of the fixed
+    528/304 whitelist: the stock GLM writer addresses records with a
+    runtime entry_stride, so only the whitelist rejected the 536 B pool.
+    """
+    from b12x.attention._shared.mla import kv_cache as writer
+
+    if kv_c.ndim != 2 or int(kv_c.shape[1]) != writer._GLM_NEXT_LATENT_DIM:
+        raise ValueError(
+            "kv_c must be (num_tokens, "
+            f"{writer._GLM_NEXT_LATENT_DIM}), got {tuple(kv_c.shape)}"
+        )
+    if kv_c.dtype != torch.bfloat16:
+        raise TypeError(f"kv_c must be BF16, got {kv_c.dtype}")
+    record_bytes = int(kv_cache.shape[2]) if kv_cache.ndim == 3 else -1
+    if kv_cache.ndim != 3 or record_bytes < writer._GLM_NEXT_RECORD_BYTES:
+        raise ValueError(
+            "fp8-tail kv_cache must be (num_pages, page_size, "
+            f">={writer._GLM_NEXT_RECORD_BYTES}) uint8, got {tuple(kv_cache.shape)}"
+        )
+    if kv_cache.dtype != torch.uint8:
+        raise TypeError(f"kv_cache must be uint8, got {kv_cache.dtype}")
+    if slot_mapping.ndim != 1 or slot_mapping.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise TypeError(
+            "slot_mapping must be a 1-D int32 or int64 tensor, got "
+            f"{tuple(slot_mapping.shape)} {slot_mapping.dtype}"
+        )
+    if not slot_mapping.is_contiguous():
+        raise ValueError("slot_mapping must be contiguous")
+    if int(kv_c.shape[0]) < int(slot_mapping.shape[0]):
+        raise ValueError(
+            f"kv_c must cover slot_mapping's {int(slot_mapping.shape[0])} tokens, got "
+            f"{int(kv_c.shape[0])} rows"
+        )
+    if kv_c.stride(1) != 1:
+        raise ValueError("kv_c rows must be innermost-contiguous")
+    if kv_cache.stride(2) != 1 or kv_cache.stride(1) != record_bytes:
+        raise ValueError("kv_cache must have packed semantic records")
+    if not (kv_c.is_cuda and kv_cache.is_cuda and slot_mapping.is_cuda):
+        raise ValueError("all tensors must be on CUDA")
+    if len({kv_c.device, kv_cache.device, slot_mapping.device}) != 1:
+        raise ValueError("all tensors must be on the same device")
+
+
 @dataclass(frozen=True)
 class _WriterState:
     kv_cache: torch.Tensor
     slot_mapping: torch.Tensor
     compiled: object
     nvfp4: bool
+    k_bits: int = 0
+    v_bits: int = 0
+    tail_fp8: bool = False
 
     def run(self, kv_c, kv_cache, slot_mapping):
         from b12x.attention._shared.mla import kv_cache as writer
+        from b12x.attention._shared.mla._kvarn_writer import (
+            concat_and_cache_glm_next_mla_kvarn,
+        )
 
+        if self.k_bits:
+            concat_and_cache_glm_next_mla_kvarn(
+                kv_c,
+                kv_cache,
+                slot_mapping,
+                k_bits=self.k_bits,
+                v_bits=self.v_bits,
+                group=256,
+            )
+            return
+        if self.tail_fp8:
+            # fp8 content into the kvarn pool: the stock GLM writer takes
+            # entry_stride as a runtime Int64, so only the record-width
+            # whitelist in _validate_* rejects the wider pool.
+            _validate_tail_fp8_writer_args(kv_c, kv_cache, slot_mapping)
+            if int(kv_cache.shape[1]) != int(self.kv_cache.shape[1]):
+                raise ValueError("cache-writer page size differs from preparation")
+            if slot_mapping.dtype != self.slot_mapping.dtype:
+                raise ValueError("cache-writer slot dtype differs from preparation")
+            _, args, _ = writer._glm_next_cache_writer_launch(
+                kv_c, kv_cache, slot_mapping
+            )
+            writer.run_compiled(self.compiled, args)
+            return
         writer._validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
         if (int(kv_cache.shape[-1]) == 304) != self.nvfp4:
             raise ValueError("cache-writer record format differs from preparation")
@@ -390,11 +490,22 @@ def plan_cache_writer(
     """Declare the exact GLM_NEXT paged cache-writer specialization."""
     from b12x.attention._shared.mla import kv_cache as writer
 
-    writer._validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
+    record_bytes = int(kv_cache.shape[-1])
+    # KVarN dual-rate / single-plane records: 536/648/600/400/272B per token
+    # are unambiguous vs the fp8 (528) / nvfp4 (304) GLM_NEXT records; k/v
+    # bits follow the variant (shared map with traits, incl. v_bits=0 for
+    # the single-plane record). The VarN tile is 256 records; the manager
+    # page may hold several tiles (page_size = k * 256).
+    kvarn = (
+        KVARN_RECORD_VARIANTS.get(record_bytes)
+        if int(kv_cache.shape[1]) % 256 == 0
+        else None
+    )
+    if not kvarn:
+        writer._validate_glm_next_mla_cache_writer_args(kv_c, kv_cache, slot_mapping)
     invocation = FrozenMapping(invocation)
     if invocation:
         raise ValueError("cache-writer invocation is encoded by its tensor formats")
-    record_bytes = int(kv_cache.shape[-1])
     query = SparseMlaQuery(
         mode="writer",
         dtype=_dtype_name(kv_c.dtype),
@@ -432,8 +543,42 @@ def plan_cache_writer(
         "slots_dtype": _dtype_name(slot_mapping.dtype),
         "nvfp4": record_bytes == 304,
     }
+    if kvarn:
+        import os as _os
+
+        if _os.environ.get("B12X_KVARN_DEBUG"):
+            print(
+                "[kvarn] writer plan: kv_cache",
+                tuple(kv_cache.shape),
+                "strides",
+                tuple(kv_cache.stride()),
+                "record",
+                record_bytes,
+                "slots",
+                tuple(slot_mapping.shape),
+                flush=True,
+            )
+        payload["kvarn"] = True
+        payload["k_bits"], payload["v_bits"] = kvarn
+        payload["group"] = 256
 
     def materialize(selection, device):
+        if kvarn:
+            from b12x.attention._shared.mla._kvarn_writer import (
+                _compile_kvarn_writer,
+            )
+
+            compiled = _compile_kvarn_writer(
+                kv_c, kv_cache, slot_mapping, kvarn[0], kvarn[1], 256
+            )
+            return _WriterState(
+                kv_cache,
+                slot_mapping,
+                compiled,
+                False,
+                k_bits=kvarn[0],
+                v_bits=kvarn[1],
+            )
         if record_bytes == 304:
             compiled = writer._compile_nvfp4_mla_writer(
                 kv_c, kv_c, kv_cache, slot_mapping, True, False
@@ -443,6 +588,98 @@ def plan_cache_writer(
                 kv_c, kv_cache, slot_mapping
             )
         return _WriterState(kv_cache, slot_mapping, compiled, record_bytes == 304)
+
+    return Plan(
+        contract=TUNING,
+        query=query,
+        invocation=invocation,
+        override=override,
+        _compile_jobs=lambda config, device: (
+            CompileJob.create(
+                "b12x.attention.sparse_mla._preparation:compile_cache_writer",
+                payload,
+                device.ordinal,
+            ),
+        ),
+        _memory_requirements=lambda config, device: MemoryRequirements(),
+        _materialize=materialize,
+        _device=kv_c.device,
+    )
+
+
+def plan_cache_writer_fp8_tail(
+    kv_c,
+    kv_cache,
+    slot_mapping,
+    *,
+    invocation: FrozenMapping = FrozenMapping(),
+    override: SparseMlaConfig | None = None,
+) -> Plan:
+    """Declare the fp8-tail cache-writer: fp8 content into a kvarn pool.
+
+    The stock GLM fp8 writer takes entry_stride as a runtime Int64, so it
+    writes correct 528 B-content records into a 536 B-stride kvarn pool with
+    no kernel change. The plan identity (query operation + payload) is
+    distinct from both the kvarn body plan and the stock fp8 plan, so a
+    kvarn-pool tail plan and a kvarn-pool body plan coexist as separate
+    prepared plans without compile-cache collisions.
+    """
+    from b12x.attention._shared.mla import kv_cache as writer
+
+    record_bytes = int(kv_cache.shape[-1])
+    if record_bytes < writer._GLM_NEXT_RECORD_BYTES:
+        raise ValueError(
+            "fp8-tail pool records must be at least "
+            f"{writer._GLM_NEXT_RECORD_BYTES} bytes, got {record_bytes}"
+        )
+    _validate_tail_fp8_writer_args(kv_c, kv_cache, slot_mapping)
+    invocation = FrozenMapping(invocation)
+    if invocation:
+        raise ValueError("cache-writer invocation is encoded by its tensor formats")
+    query = SparseMlaQuery(
+        mode="writer",
+        dtype=_dtype_name(kv_c.dtype),
+        kv_dtype=_dtype_name(kv_cache.dtype),
+        num_q_heads=0,
+        qk_head_dim=int(kv_c.shape[1]),
+        v_head_dim=0,
+        max_q_rows=int(kv_c.shape[0]),
+        max_width=0,
+        page_size=int(kv_cache.shape[1]),
+        model_type=2,
+        head_major_output=False,
+        scale_format=1,
+        cache_record_bytes=record_bytes,
+        fp8_rope=False,
+        latent_scale_per_token=False,
+        has_attention_sink=False,
+        cache_layout="paged_strided",
+        operation="cache_writer_fp8_tail",
+        slot_dtype=_dtype_name(slot_mapping.dtype),
+        prefill_mg_enabled=False,
+        max_batch=int(kv_c.shape[0]),
+        max_page_table_width=int(kv_cache.shape[0]),
+        physical_block_size=int(kv_cache.shape[1]),
+        physical_record_width=record_bytes,
+        num_cache_blocks=int(kv_cache.shape[0]),
+        max_physical_records=int(kv_cache.shape[0]) * int(kv_cache.shape[1]),
+    )
+    payload = {
+        "kv_c_shape": tuple(kv_c.shape),
+        "kv_c_dtype": _dtype_name(kv_c.dtype),
+        "cache_shape": tuple(kv_cache.shape),
+        "cache_dtype": _dtype_name(kv_cache.dtype),
+        "slots_shape": tuple(slot_mapping.shape),
+        "slots_dtype": _dtype_name(slot_mapping.dtype),
+        "tail_fp8": True,
+        "nvfp4": False,
+    }
+
+    def materialize(selection, device):
+        compiled = writer._compile_glm_next_mla_cache_writer(
+            kv_c, kv_cache, slot_mapping
+        )
+        return _WriterState(kv_cache, slot_mapping, compiled, False, tail_fp8=True)
 
     return Plan(
         contract=TUNING,
@@ -496,6 +733,7 @@ __all__ = [
     "compile_sparse_mla",
     "plan",
     "plan_cache_writer",
+    "plan_cache_writer_fp8_tail",
     "run",
     "state",
     "writer_state",

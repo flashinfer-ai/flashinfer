@@ -133,6 +133,57 @@ def validate_e8m0_scale_grid(
     return bytes_
 
 
+# UE8M0 0xFF is the encoding's NaN.  No MX block scale may be NaN, and a
+# clamp would silently change every dequantized weight in the block, so the
+# preparation path rejects it instead of carrying it into the kernel.
+E8M0_NAN_BYTE = 0xFF
+
+
+def validate_e8m0_scale_grid(
+    grid: torch.Tensor,
+    *,
+    name: str,
+    num_experts: int,
+    rows: int,
+    k: int,
+    sf_block: int = 32,
+) -> torch.Tensor:
+    """Validate a checkpoint-native (unswizzled) UE8M0 block-scale grid.
+
+    The grid must hold ``[num_experts, rows, k // sf_block]`` scale bytes in
+    ``uint8`` or ``float8_e8m0fnu`` storage and be contiguous.  Every finite
+    UE8M0 byte (``0x00``..``0xFE``) is preserved verbatim; ``0xFF`` (NaN) is
+    rejected.  Returns a contiguous ``uint8`` view of the same bytes.
+    """
+    if not isinstance(grid, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if grid.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+        raise TypeError(
+            f"{name} must hold UE8M0 bytes (uint8/float8_e8m0fnu), got {grid.dtype}"
+        )
+    if k % sf_block:
+        raise ValueError(
+            f"{name}: k={k} must be a multiple of the {sf_block}-element "
+            "UE8M0 block scale"
+        )
+    expected = (int(num_experts), int(rows), int(k) // sf_block)
+    if grid.dim() != 3 or tuple(grid.shape) != expected:
+        raise ValueError(
+            f"{name} must be an unswizzled per-K/{sf_block} grid with shape "
+            f"{expected}, got {tuple(grid.shape)}"
+        )
+    bytes_ = grid.view(torch.uint8)
+    if not bytes_.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    invalid = int((bytes_ == E8M0_NAN_BYTE).sum().item())
+    if invalid:
+        raise ValueError(
+            f"{name} holds {invalid} UE8M0 NaN scale byte(s) (0xFF); MX block "
+            "scales must be finite (0x00..0xFE) and are never clamped"
+        )
+    return bytes_
+
+
 def as_grouped_scale_view(
     scale_storage: torch.Tensor, rows: int, cols: int
 ) -> torch.Tensor:
@@ -605,6 +656,24 @@ def ld_global_nc_u32(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def ld_global_nc_u16(base_ptr: Int64, *, loc=None, ip=None) -> Uint32:
+    """Load 16 bits from global memory via .nc, widened to u32."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int64(base_ptr).ir_value(loc=loc, ip=ip)],
+            "{ .reg .u16 t; ld.global.nc.u16 t, [$1]; cvt.u32.u16 $0, t; }",
+            "=r,l",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def ld_global_nc_f32(base_ptr: Int64, *, loc=None, ip=None) -> Float32:
     """Load an fp32 from global memory via non-coherent cache (.nc)."""
     return Float32(
@@ -1023,6 +1092,43 @@ def ldmatrix_m8n8x4_b16(
     r2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
     r3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
     return Uint32(r0), Uint32(r1), Uint32(r2), Uint32(r3)
+
+
+@dsl_user_op
+def stmatrix_m8n8x4_b16(
+    smem_addr: Int32,
+    r0: Uint32,
+    r1: Uint32,
+    r2: Uint32,
+    r3: Uint32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Issue ``stmatrix.sync.aligned.m8n8.x4.shared.b16``.
+
+    This is the inverse of :func:`ldmatrix_m8n8x4_b16` for a matching
+    lane-address layout.  The route-128 W4A16 kernel uses it to publish one
+    cooperatively decoded N16/K16 Trellis record to SMEM for reuse by every
+    M-slice warp.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_addr).ir_value(loc=loc, ip=ip),
+            Uint32(r0).ir_value(loc=loc, ip=ip),
+            Uint32(r1).ir_value(loc=loc, ip=ip),
+            Uint32(r2).ir_value(loc=loc, ip=ip),
+            Uint32(r3).ir_value(loc=loc, ip=ip),
+        ],
+        "stmatrix.sync.aligned.m8n8.x4.shared.b16 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -1459,6 +1565,29 @@ def ld_shared_u16_zx(smem_addr: Int32, *, loc=None, ip=None) -> Uint32:
             "ld.shared.u16 $0, [$1];",
             "=r,r",
             has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def ld_shared_u16_zx_ordered(smem_addr: Int32, *, loc=None, ip=None) -> Uint32:
+    """Load a shared halfword zero-extended, ordered with other shared accesses.
+
+    Unlike ``ld_shared_u16_zx`` the load is not CSE-able: pipelined stages
+    reuse the same shared address for new data, which a pure load would read
+    once and keep.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.u16 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
             loc=loc,
@@ -2062,6 +2191,25 @@ def st_shared_u32(addr: Int32, val: Uint32, *, loc=None, ip=None):
             Uint32(val).ir_value(loc=loc, ip=ip),
         ],
         "st.shared.u32 [$0], $1;",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_shared_u16(addr: Int32, val: Uint32, *, loc=None, ip=None):
+    """Store the low 16 bits to shared memory at a 2-byte address."""
+    llvm.inline_asm(
+        None,
+        [
+            Int32(addr).ir_value(loc=loc, ip=ip),
+            Uint32(val).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .u16 t; cvt.u16.u32 t, $1; st.shared.u16 [$0], t; }",
         "r,r",
         has_side_effects=True,
         is_align_stack=False,

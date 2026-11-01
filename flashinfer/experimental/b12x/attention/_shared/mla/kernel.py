@@ -34,8 +34,12 @@ from b12x._lib.compiler import (
     run_compiled,
 )
 from b12x._lib.compile_plan import compile_only_launches_enabled
-from b12x._lib.intrinsics import shared_ptr_to_u32, st_shared_u32
+from b12x._lib.intrinsics import (
+    shared_ptr_to_u32,
+    st_shared_u32,
+)
 
+from ._kvarn_writer import kvarn_tile_stride_bytes
 from .decode_math import (
     s0_load_q_bf16_to_smem,
     s0_normalize_dsv41_kv_to_fp8,
@@ -474,6 +478,53 @@ class UnifiedDecodeKernel:
             or self.packed_glm_next
             or self.packed_glm_generic
         )
+        # KVarN dual-rate records: whole-record io staging + gmem page-tail
+        # scales in the math stages; traits carry k_bits/v_bits/group.
+        self.kvarn_mode = bool(
+            int(traits.model_type) == int(ModelType.KVARN_MLA)
+            and int(traits.scale_format) == int(ScaleFormat.KVARN_DUAL)
+        )
+        self.kvarn_record_bytes = int(traits.kv_gmem_stride) if self.kvarn_mode else 0
+        self.kvarn_k_bits = int(getattr(traits, "k_bits", 0)) if self.kvarn_mode else 0
+        self.kvarn_v_bits = int(getattr(traits, "v_bits", 0)) if self.kvarn_mode else 0
+        self.kvarn_group = int(getattr(traits, "group", 0)) if self.kvarn_mode else 0
+        # Reserved per-tile tail region (see _kvarn_writer._TILE_TAIL_BYTES):
+        # the tail can never overlap the neighbor tile's records, and
+        # tile_stride stays an exact multiple of the 8448B C4 page
+        # (256*536 + 6400 = 143616 = 17 * 8448).
+        # Tile stride is BINDING-DEPENDENT (mirrors the writer's rule in
+        # 59a8654d): the gather arena binds one KV page per tile
+        # (page == group), and those tiles carry the C4 tail region, so
+        # their stride is the layout constant (143616 for k4v4) --
+        # extend_tail_gather launches read the arena through this path.
+        # Pool bindings pack page/group tiles per page with DENSE rows
+        # (stride(1) = record_bytes): their stride is group*record_bytes
+        # (137216). Using the arena constant against the dense pool
+        # drifted every tile past the first by 6400B (~11.94 records) --
+        # the decode degeneration; using the dense stride against the
+        # arena re-introduced the same drift on the extend-tail launch.
+        if self.kvarn_mode and self.kvarn_group:
+            _tiles_per_page = int(self.page_block_size) // int(self.kvarn_group)
+            self.kvarn_tile_stride = (
+                kvarn_tile_stride_bytes(record_bytes=self.kvarn_record_bytes)
+                if _tiles_per_page <= 1
+                else int(self.kvarn_group) * int(self.kvarn_record_bytes)
+            )
+        else:
+            self.kvarn_tile_stride = 0
+        self.kvarn_k_code_bytes = (
+            (512 * self.kvarn_k_bits + 7) // 8 if self.kvarn_mode else 0
+        )
+        self.kvarn_v_code_bytes = (
+            (512 * self.kvarn_v_bits + 7) // 8 if self.kvarn_mode else 0
+        )
+        # Precision-tail decode arm: GLM fp8 math (scale_format=ARBITRARY_FP32)
+        # over records in a 536B-stride kvarn pool. The 536B gmem row stride is
+        # not 16B-aligned, so the IO arm scalar-stages the 528B fp8 content
+        # into the 528B smem row (no cp.async.bulk, no packed producer).
+        self.tail_fp8_mode = bool(
+            int(traits.model_type) == int(ModelType.KVARN_TAIL_FP8)
+        )
         # First-chunk copies may be issued before the per-token length is
         # known only when the first active chunk is fixed (no extra section).
         self.speculative_first_chunk = self.packed_io and not bool(has_extra)
@@ -492,6 +543,7 @@ class UnifiedDecodeKernel:
             vector_q
             and not self.native_h16
             and int(traits.scale_format) != int(ScaleFormat.NVFP4_E4M3)
+            and int(traits.scale_format) != int(ScaleFormat.KVARN_DUAL)
         )
         self.vector_q_hpb = 8 if self.native_h8 else int(traits.hpb)
         if self.native_dsv4_h8 or self.native_dsv4_h16:
@@ -522,6 +574,38 @@ class UnifiedDecodeKernel:
         self.math_threads = int(traits.math_threads)
         self.block_threads = 320 if self.native_h16 else int(traits.block_threads)
         self.io_threads = self.block_threads - self.math_threads
+
+    def __cache_key__(self):
+        """Compile-cache identity: instance fields carry the kvarn variant
+        (kvarn_record_bytes / k_bits / v_bits / tile_stride), but the
+        explicit-spec compile target fingerprints only the source, so all
+        kvarn variants previously shared one disk-cache entry and a warm
+        cache served one variant's kernels to another (stale record stride
+        -> garbage output). Keep this stable across processes."""
+
+        def _flat(obj):
+            import dataclasses as _dc
+
+            if _dc.is_dataclass(obj) and not isinstance(obj, type):
+                return tuple(sorted((k, _flat(v)) for k, v in _dc.asdict(obj).items()))
+            if hasattr(obj, "_asdict"):
+                return tuple(sorted((k, _flat(v)) for k, v in obj._asdict().items()))
+            if isinstance(obj, (bool, int, float, str)):
+                return obj
+            return repr(obj)
+
+        return (
+            "UnifiedDecodeKernel",
+            tuple(
+                sorted(
+                    (k, _flat(v))
+                    for k, v in vars(self).items()
+                    if k not in ("traits", "layout")
+                )
+            ),
+            _flat(self.traits),
+            _flat(self.layout),
+        )
 
     @cute.jit
     def __call__(
@@ -1219,6 +1303,11 @@ class UnifiedDecodeKernel:
                     per_token_latent_scale=t.latent_scale_per_token,
                     dsv41=t.model_type == ModelType.DSV41,
                     dsv41_fp8=self.native_dsv41_fp8,
+                    kvarn=self.kvarn_mode,
+                    kvarn_record_bytes=self.kvarn_record_bytes,
+                    kvarn_group=self.kvarn_group,
+                    kvarn_tile_stride=self.kvarn_tile_stride,
+                    tail_fp8=self.tail_fp8_mode,
                 )
                 packed_kw = dict(
                     kv_smem_stride=staged_kv_stride,
@@ -1418,6 +1507,25 @@ class UnifiedDecodeKernel:
 
             if cutlass.const_expr(self.vector_q):
                 pass
+            elif cutlass.const_expr(self.kvarn_mode):
+                # KVarN QK consumes BF16 Q (like the NVFP4 arm); the K codes
+                # are dequantized in-register with dual-rate scales.
+                s0_load_q_bf16_to_smem(
+                    q_token,
+                    q_fp8_stage,
+                    q_rope_stage,
+                    head_base_stage,
+                    Int32(self.valid_hpb),
+                    tid_sel,
+                    d_nope=t.d_nope,
+                    d_rope=t.d_rope,
+                    hpb=t.hpb,
+                    q_nope_bf16_stride=t.q_nope_stride,
+                    q_rope_stride=L.q_rope_stride,
+                    num_threads=nt_stage,
+                    barrier_id=2,
+                    barrier_threads=bt_stage,
+                )
             elif cutlass.const_expr(
                 t.scale_format == ScaleFormat.NVFP4_E4M3 and not self.native_dsv41_fp8
             ):
@@ -1723,6 +1831,16 @@ class UnifiedDecodeKernel:
                             else t.scale_format
                         ),
                         latent_scale_per_token=t.latent_scale_per_token,
+                        kvarn_k_bits=self.kvarn_k_bits,
+                        kvarn_record_bytes=self.kvarn_record_bytes,
+                        kvarn_k_code_bytes=self.kvarn_k_code_bytes,
+                        kvarn_v_code_bytes=self.kvarn_v_code_bytes,
+                        kv_cache_u8=kv_cache_u8,
+                        tok_idx_base_addr=shared_ptr_to_u32(st.token_idx.data_ptr()),
+                        kv_block_stride=stride_kv_block,
+                        kv_entry_stride=Int64(self.kvarn_record_bytes),
+                        kvarn_group=int(t.group),
+                        kvarn_page_tokens=int(self.page_block_size),
                     )
                     qk = s2_qk_rope_bf16(
                         qk,
@@ -1850,6 +1968,17 @@ class UnifiedDecodeKernel:
                         sm_p_stride=L.sm_p_full_stride,
                         latent_scale_per_token=t.latent_scale_per_token,
                         w_fp8_bufs=L.w_fp8_bufs,
+                        kvarn_k_bits=self.kvarn_k_bits,
+                        kvarn_v_bits=self.kvarn_v_bits,
+                        kvarn_record_bytes=self.kvarn_record_bytes,
+                        kvarn_k_code_bytes=self.kvarn_k_code_bytes,
+                        kvarn_v_code_bytes=self.kvarn_v_code_bytes,
+                        kv_cache_u8=kv_cache_u8,
+                        tok_idx_base_addr=shared_ptr_to_u32(st.token_idx.data_ptr()),
+                        kv_block_stride=stride_kv_block,
+                        kv_entry_stride=Int64(self.kvarn_record_bytes),
+                        kvarn_group=int(t.group),
+                        kvarn_page_tokens=int(self.page_block_size),
                     )
 
                 # S6b (XV-RoPE) is DSV4-only (V_HAS_ROPE). const_expr-elided for GLM.
@@ -2100,6 +2229,9 @@ def _sparse_mla_decode_grid_flat_launch(
     native_dsv4_h16_override: bool | None = None,
     native_dsv41_fp8_override: bool | None = None,
     vector_q_override: bool | None = None,
+    kvarn_k_bits: int = 0,
+    kvarn_v_bits: int = 0,
+    kvarn_group: int = 0,
     _prepared=None,
 ) -> None:
     q_head_dim = int(q_all.shape[-1])
@@ -2222,6 +2354,9 @@ def _sparse_mla_decode_grid_flat_launch(
         int(scale_format),
         fp8_rope=bool(fp8_rope),
         latent_scale_per_token=bool(latent_scale_per_token),
+        k_bits=int(kvarn_k_bits),
+        v_bits=int(kvarn_v_bits),
+        group=int(kvarn_group),
     )
     if native_dsv41_fp8:
         traits = replace(
@@ -2438,6 +2573,9 @@ def _sparse_mla_decode_grid_op(
     latent_scale_per_token: bool = False,
     v41_fp8_internal: bool = False,
     v41_heads_per_block: int = 16,
+    kvarn_k_bits: int = 0,
+    kvarn_v_bits: int = 0,
+    kvarn_group: int = 0,
 ) -> None:
     _sparse_mla_decode_grid_flat_launch(
         q_all,
@@ -2472,6 +2610,9 @@ def _sparse_mla_decode_grid_op(
         latent_scale_per_token,
         v41_fp8_internal,
         v41_heads_per_block,
+        kvarn_k_bits=kvarn_k_bits,
+        kvarn_v_bits=kvarn_v_bits,
+        kvarn_group=kvarn_group,
     )
 
 
@@ -2509,6 +2650,9 @@ def _sparse_mla_decode_grid_fake(
     latent_scale_per_token: bool = False,
     v41_fp8_internal: bool = False,
     v41_heads_per_block: int = 16,
+    kvarn_k_bits: int = 0,
+    kvarn_v_bits: int = 0,
+    kvarn_group: int = 0,
 ) -> None:
     return None
 
@@ -3313,6 +3457,15 @@ def run_unified_decode(
                 else prepared.native_dsv41_fp8,
                 vector_q_override=None if prepared is None else prepared.vector_q,
                 _prepared=prepared_program,
+                kvarn_k_bits=int(traits.k_bits)
+                if traits.model_type in (ModelType.KVARN_MLA, ModelType.KVARN_TAIL_FP8)
+                else 0,
+                kvarn_v_bits=int(traits.v_bits)
+                if traits.model_type in (ModelType.KVARN_MLA, ModelType.KVARN_TAIL_FP8)
+                else 0,
+                kvarn_group=int(traits.group)
+                if traits.model_type in (ModelType.KVARN_MLA, ModelType.KVARN_TAIL_FP8)
+                else 0,
             )
             if resolved_programs is not None:
                 if launched is None:
@@ -3321,6 +3474,12 @@ def run_unified_decode(
                     )
                 resolved_programs.append(launched)
             return launched
+        if traits.model_type in (ModelType.KVARN_MLA, ModelType.KVARN_TAIL_FP8):
+            args = args + (
+                int(traits.k_bits),
+                int(traits.v_bits),
+                int(traits.group),
+            )
         return torch.ops.b12x.sparse_mla_sm120_decode_grid(*args)
 
     if h_blocks_full > 0:

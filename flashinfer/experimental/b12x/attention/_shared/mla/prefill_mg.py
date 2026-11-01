@@ -63,6 +63,7 @@ from .decode_math import (
     EPILOGUE_FINAL_BF16,
     _d2_load_b_fp8,
     _exp2_approx_ftz_f32,
+    _kvarn_k_pair_bf16,
     _ld_u8_zext,
     _nvfp4_pair_bfloat2,
     _ue8m0_zext_byte_to_fp32,
@@ -70,7 +71,9 @@ from .decode_math import (
     s0_quantize_q_to_smem,
     s0_normalize_dsv41_kv_to_fp8,
     s1_qk_nope_block_scaled,
+    s1_qk_nope_kvarn_bf16_mg2,
     s6_xv_nope,
+    s6_xv_nope_kvarn_bf16,
     st_shared_f32,
     s7_epilogue,
 )
@@ -78,6 +81,7 @@ from .io_mg import io_issue_gather_dsv4_nope, io_issue_gather_glm_mg
 from .smem_mg import get_prefill_mg_shared_storage_cls, make_smem_layout_mg
 from .traits import (
     ComputeMode,
+    KVARN_RECORD_VARIANTS,
     ModelType,
     ScaleFormat,
     UnifiedMLATraits,
@@ -2188,6 +2192,25 @@ class UnifiedPrefillMGKernel:
         self.mg_n_hg = int(layout.heads_per_cta // traits.hpb)
         self.math_threads = int(traits.math_threads)
         self.block_threads = _PREFILL_BLOCK_THREADS
+        # KVarN dual-rate record (same instance fields as the decode kernel:
+        # each record width must own a compile-cache entry). The MG arm runs
+        # mg_n_hg==1 only: the 536B-class record double buffer plus the BF16
+        # Q group fits the SM120 carveout for one 16-head group per CTA.
+        self.kvarn_mode = bool(
+            int(traits.model_type) == int(ModelType.KVARN_MLA)
+            and int(traits.scale_format) == int(ScaleFormat.KVARN_DUAL)
+        )
+        self.kvarn_record_bytes = int(traits.kv_gmem_stride) if self.kvarn_mode else 0
+        self.kvarn_k_bits = int(getattr(traits, "k_bits", 0)) if self.kvarn_mode else 0
+        self.kvarn_v_bits = int(getattr(traits, "v_bits", 0)) if self.kvarn_mode else 0
+        self.kvarn_k_code_bytes = (
+            (512 * self.kvarn_k_bits + 7) // 8 if self.kvarn_mode else 0
+        )
+        self.kvarn_v_code_bytes = (
+            (512 * self.kvarn_v_bits + 7) // 8 if self.kvarn_mode else 0
+        )
+        if self.kvarn_mode and self.mg_n_hg != 1:
+            raise ValueError("MG KVarN arm supports mg_n_hg==1 only")
         # H32 register-pool policy: give the CUTLASS 4.6 DSV4 FP8 trace eight
         # more math-warp registers while returning the same amount from the IO
         # warpgroup. Keep the budget pinned to the exact topk512 specialization;
@@ -2237,6 +2260,7 @@ class UnifiedPrefillMGKernel:
         sm_scale_log2: Float32,
         latent_scale: Float32,
         stride_kv_block: Int64,
+        kvarn_row_stride: Int32,
         num_tokens: Int32,
         stream: cuda.CUstream,
     ):
@@ -2251,6 +2275,7 @@ class UnifiedPrefillMGKernel:
             sm_scale_log2,
             latent_scale,
             stride_kv_block,
+            kvarn_row_stride,
         ).launch(
             grid=(num_tokens * Int32(self.replicate_h), 1, 1),
             block=[self.block_threads, 1, 1],
@@ -2277,6 +2302,7 @@ class UnifiedPrefillMGKernel:
         sm_scale_log2: Float32,
         latent_scale: Float32,
         stride_kv_block: Int64,  # MAIN per-block byte stride
+        kvarn_row_stride: Int32,
         extra_kv_cache_u8: cute.Tensor,  # flat u8 EXTRA cache (DSV4 dual-cache)
         extra_indices: cute.Tensor,  # (T, extra_topk) int32
         extra_topk_length: cute.Tensor,  # (T,) int32 per-token EXTRA valid length
@@ -2302,6 +2328,7 @@ class UnifiedPrefillMGKernel:
             sm_scale_log2,
             latent_scale,
             stride_kv_block,
+            kvarn_row_stride,
             extra_kv_cache_u8,
             extra_indices,
             extra_topk_length,
@@ -2326,6 +2353,7 @@ class UnifiedPrefillMGKernel:
         sm_scale_log2: Float32,
         latent_scale: Float32,
         stride_kv_block: Int64,
+        kvarn_row_stride: Int32,
     ):
         # SINGLE-CACHE @cute.kernel (10 device params): the DSV4-main /
         # DSV4-BF16 / GLM MG prefill path. Threads dummy extra args (aliased to the
@@ -2342,6 +2370,7 @@ class UnifiedPrefillMGKernel:
             sm_scale_log2,
             latent_scale,
             stride_kv_block,
+            kvarn_row_stride,
             kv_cache_u8,
             indices,
             topk_length,
@@ -2363,6 +2392,7 @@ class UnifiedPrefillMGKernel:
         sm_scale_log2: Float32,
         latent_scale: Float32,
         stride_kv_block: Int64,
+        kvarn_row_stride: Int32,
         extra_kv_cache_u8: cute.Tensor,
         extra_indices: cute.Tensor,
         extra_topk_length: cute.Tensor,
@@ -2381,6 +2411,7 @@ class UnifiedPrefillMGKernel:
             sm_scale_log2,
             latent_scale,
             stride_kv_block,
+            kvarn_row_stride,
             extra_kv_cache_u8,
             extra_indices,
             extra_topk_length,
@@ -2402,6 +2433,7 @@ class UnifiedPrefillMGKernel:
         sm_scale_log2: Float32,
         latent_scale: Float32,
         stride_kv_block: Int64,
+        kvarn_row_stride: Int32,
         extra_kv_cache_u8: cute.Tensor,
         extra_indices: cute.Tensor,
         extra_topk_length: cute.Tensor,
@@ -2435,6 +2467,7 @@ class UnifiedPrefillMGKernel:
         # has_extra arm and is byte-identical.
         is_glm = cutlass.const_expr(
             t.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT, ModelType.DSV41)
+            or t.scale_format == ScaleFormat.KVARN_DUAL
         )
         is_dsv41 = cutlass.const_expr(t.model_type == ModelType.DSV41)
         has_rope = cutlass.const_expr(t.d_rope > 0)
@@ -2443,10 +2476,14 @@ class UnifiedPrefillMGKernel:
         # the 432B/288B record geometry. is_glm stays true for NVFP4 so the
         # shared GLM staging (io gather / kv_sc absence / q_rope alias) applies.
         is_nvfp4 = cutlass.const_expr(t.scale_format == ScaleFormat.NVFP4_E4M3)
+        is_kvarn = cutlass.const_expr(t.scale_format == ScaleFormat.KVARN_DUAL)
         dsv41_fp8_pv = cutlass.const_expr(
             t.model_type == ModelType.DSV41 and t.fp8_internal
         )
         q_head_dim = cutlass.const_expr(t.d_nope + t.d_rope)
+        # The block stride (stride_kv_block) is already bytes/block: the
+        # slot's block part indexes blocks directly, so the multiplier is 1.
+        kvarn_row_per_block = Int32(1)
         # Compile-time head-group count: 1 (heads==16) or 2 (heads % 32 == 0). All
         # group-1 work below const_expr-elides when n_hg==1 (single-group MG).
         n_hg = cutlass.const_expr(self.mg_n_hg)
@@ -2646,6 +2683,9 @@ class UnifiedPrefillMGKernel:
                         dsv41_fp8=dsv41_fp8_pv,
                         ratio_dst_addr=kv_ratio_addr,
                         ratio_stride=L.kv_ratio_stride,
+                        kvarn_record_bytes=self.kvarn_record_bytes,
+                        kvarn_row_stride=kvarn_row_stride,
+                        kvarn_row_per_block=kvarn_row_per_block,
                     )
                 else:
                     io_issue_gather_dsv4_nope(
@@ -2803,6 +2843,9 @@ class UnifiedPrefillMGKernel:
                                 dsv41_fp8=dsv41_fp8_pv,
                                 ratio_dst_addr=kv_ratio_addr + buf * kv_ratio_buf,
                                 ratio_stride=L.kv_ratio_stride,
+                                kvarn_record_bytes=self.kvarn_record_bytes,
+                                kvarn_row_stride=kvarn_row_stride,
+                                kvarn_row_per_block=kvarn_row_per_block,
                             )
                         else:
                             io_issue_gather_dsv4_nope(
@@ -3118,6 +3161,28 @@ class UnifiedPrefillMGKernel:
                         kv_smem_stride=L.kv_smem_stride,
                         scale_bytes_per_token=8,
                         n_hg=n_hg,
+                    )
+                elif cutlass.const_expr(is_kvarn):
+                    # KVarN QK: BF16 MMA over in-register dequant of the
+                    # dual-rate codes with the record's inline fp16 scales
+                    # (same math as the KVarN decode arm); no rope stage --
+                    # KVarN records carry no RoPE payload.
+                    qk0, qk1 = s1_qk_nope_kvarn_bf16_mg2(
+                        qk0,
+                        qk1,
+                        q_nope_bf16_g0,
+                        q_nope_bf16_g1,
+                        kv_fp8_b,
+                        warp_first_cand,
+                        lane,
+                        num_scales=t.num_scales,
+                        quant_tile=t.quant_tile,
+                        q_nope_bf16_stride=L.q_nope_bf16_stride,
+                        kv_smem_stride=L.kv_smem_stride,
+                        n_hg=n_hg,
+                        k_bits=self.kvarn_k_bits,
+                        k_code_bytes=self.kvarn_k_code_bytes,
+                        v_code_bytes=self.kvarn_v_code_bytes,
                     )
                 elif cutlass.const_expr(is_nvfp4):
                     # NVFP4 QK: native E2M1+E4M3 in-register dequant feeding the
@@ -3443,6 +3508,68 @@ class UnifiedPrefillMGKernel:
                         n_hg=n_hg,
                         row_xor=False,
                     )
+                elif cutlass.const_expr(is_kvarn):
+                    # KVarN XV-NoPE: BF16 P.V with in-register dequant of the
+                    # V codes (record-inline fp16 scale/zp), the validated
+                    # decode KVarN math. P tiles stage into the dead W_FP8
+                    # region like the NVFP4 arm; no FP8 W quant, no rope.
+                    s5_fill_sm_p_full_mg2_nvfp4(
+                        w_pre0,
+                        w_pre1,
+                        w_fp8_addr,
+                        warp_id,
+                        lane,
+                        bi=t.bi,
+                        hpb=t.hpb,
+                        sm_p_stride=L.sm_p_full_stride,
+                        num_threads=self.math_threads,
+                        barrier_id=3,
+                        n_hg=n_hg,
+                    )
+                    cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                    sm_p_g0 = w_fp8_addr
+                    sm_p_g1 = w_fp8_addr + Int32(L.sm_p_full_stride * t.hpb * 2)
+                    acc0 = s6_xv_nope_kvarn_bf16(
+                        acc0,
+                        sm_p_g0,
+                        kv_fp8_b,
+                        warp_id,
+                        lane,
+                        k_bits=self.kvarn_k_bits,
+                        v_bits=self.kvarn_v_bits,
+                        record_bytes=L.kv_smem_stride,
+                        k_code_bytes=self.kvarn_k_code_bytes,
+                        v_code_bytes=self.kvarn_v_code_bytes,
+                        n_v_chunks=t.n_v_chunks,
+                        v_chunk=t.quant_tile,
+                        bi=t.bi,
+                        n_warps=8,
+                        nt_per_warp_xv=t.nt_per_warp_xv,
+                        sm_p_stride=L.sm_p_full_stride,
+                    )
+                    cute.arch.barrier(barrier_id=3, number_of_threads=self.math_threads)
+                    if cutlass.const_expr(n_hg == 2):
+                        acc1 = s6_xv_nope_kvarn_bf16(
+                            acc1,
+                            sm_p_g1,
+                            kv_fp8_b,
+                            warp_id,
+                            lane,
+                            k_bits=self.kvarn_k_bits,
+                            v_bits=self.kvarn_v_bits,
+                            record_bytes=L.kv_smem_stride,
+                            k_code_bytes=self.kvarn_k_code_bytes,
+                            v_code_bytes=self.kvarn_v_code_bytes,
+                            n_v_chunks=t.n_v_chunks,
+                            v_chunk=t.quant_tile,
+                            bi=t.bi,
+                            n_warps=8,
+                            nt_per_warp_xv=t.nt_per_warp_xv,
+                            sm_p_stride=L.sm_p_full_stride,
+                        )
+                        cute.arch.barrier(
+                            barrier_id=3, number_of_threads=self.math_threads
+                        )
                 elif cutlass.const_expr(is_nvfp4):
                     # NVFP4 XV-NoPE: BF16 P.V with native E2M1+E4M3 V dequant
                     # (decode s6_xv_nope scale_format==2 branch). The BF16 P
@@ -3947,6 +4074,7 @@ def _sparse_mla_prefill_mg_flat_launch(
     pbs_extra: int,
     stride_extra_kv_block: int,
     row_xor: bool,
+    kvarn_row_stride: int = 0,
     *,
     active_heads: int | None = None,
     head_offset: int = 0,
@@ -3954,12 +4082,27 @@ def _sparse_mla_prefill_mg_flat_launch(
     fp8_internal: bool = False,
     prepared: object | None = None,
 ) -> None:
+    kvarn = int(model_type) == int(ModelType.KVARN_MLA)
+    # KVarN carries the record width in the (single-cache-unused) main-tiles
+    # slot: the cache reaches the op as a flat base tensor, so its shape
+    # cannot identify the 536/648/600/400 record row.
+    kvarn_bits = KVARN_RECORD_VARIANTS.get(int(num_main_tiles)) if kvarn else None
+    if kvarn and kvarn_bits is None:
+        raise ValueError(f"MG KVarN: unrecognized record width {int(num_main_tiles)}")
     traits = make_unified_traits(
         int(model_type),
         compute_mode,
         int(scale_format),
         fp8_rope=bool(fp8_rope),
         latent_scale_per_token=bool(latent_scale_per_token),
+        k_bits=kvarn_bits[0] if kvarn_bits is not None else 0,
+        v_bits=kvarn_bits[1] if kvarn_bits is not None else 0,
+        group=256 if kvarn else 0,
+        kvarn_row_stride=(
+            int(kvarn_row_stride) if kvarn_row_stride else int(kv_flat.stride(1))
+        )
+        if kvarn
+        else 0,
     )
     traits = replace(traits, fp8_internal=bool(fp8_internal))
     layout = make_smem_layout_mg(traits, int(mg_n_hg))
@@ -4042,6 +4185,7 @@ def _sparse_mla_prefill_mg_flat_launch(
         Float32(float(sm_scale) * LOG2_E),
         Float32(float(latent_scale)),
         Int64(stride_kv_block),
+        Int32(kvarn_row_stride),
     )
     if has_extra:
         # call_dual signature: ... stride_kv_block, extra_kv, extra_indices,
@@ -4069,6 +4213,17 @@ def _sparse_mla_prefill_mg_flat_launch(
         key_field("valid_hpb", int(valid_hpb)),
         key_field("pack_hilo_rows", int(pack_hilo_rows)),
         key_field("num_tiles", int(num_tiles)),
+        # Resolved record bytes (the single-cache main-tiles slot), NOT the
+        # base allocation's element count: the plan-phase probe cache is an
+        # exact-size fake tensor while the runtime binds a view over the raw
+        # pool storage, and keying the program on pool size would make the
+        # prepared launcher compile an unplanned program.
+        key_field("kvarn_record", int(num_main_tiles) if kvarn else 0),
+        key_field(
+            "kvarn_bits",
+            kvarn_bits[0] * 8 + kvarn_bits[1] if kvarn_bits is not None else 0,
+        ),
+        key_field("kvarn_group", 256 if kvarn else 0),
         key_field("page_block_size", int(page_block_size)),
         key_field("topk_bucket", _topk_bucket(topk)),
         key_field("has_sink", int(has_sink)),
@@ -4159,6 +4314,7 @@ def _sparse_mla_prefill_mg_op(
     topk: int,
     num_tiles: int,
     stride_kv_block: int,
+    kvarn_row_stride: int,
     has_sink: bool,
     compute_mode: int,
     mg_n_hg: int,
@@ -4195,10 +4351,11 @@ def _sparse_mla_prefill_mg_op(
         fp8_rope,
         False,  # has_extra
         0,  # extra_topk
-        0,  # num_main_tiles
+        num_tiles,  # num_main_tiles: single-cache slot; KVarN record bytes
         1,  # pbs_extra
         0,  # stride_extra_kv_block
         False,  # row_xor
+        kvarn_row_stride,
         latent_scale_per_token=latent_scale_per_token,
     )
 
@@ -4218,6 +4375,7 @@ def _sparse_mla_prefill_mg_fake(
     topk: int,
     num_tiles: int,
     stride_kv_block: int,
+    kvarn_row_stride: int,
     has_sink: bool,
     compute_mode: int,
     mg_n_hg: int,
@@ -4253,6 +4411,7 @@ def _sparse_mla_prefill_mg_dual_op(
     has_sink: bool,
     compute_mode: int,
     mg_n_hg: int,
+    kvarn_row_stride: int,
     model_type: int,
     scale_format: int,
     extra_topk: int,
@@ -4317,6 +4476,7 @@ def _sparse_mla_prefill_mg_dual_fake(
     has_sink: bool,
     compute_mode: int,
     mg_n_hg: int,
+    kvarn_row_stride: int,
     model_type: int,
     scale_format: int,
     extra_topk: int,
@@ -4362,6 +4522,9 @@ def run_unified_prefill_mg(
     else:
         model_type = int(model_type)
     is_glm = is_glm_model_type(model_type)
+    kvarn_row_stride = (
+        int(kv_cache.stride(1)) if model_type == int(ModelType.KVARN_MLA) else 602
+    )
     # DSV4 dual-cache (has_extra) union. all-or-none + DSV4-only (GLM has no extra
     # section). Forced BF16-QK by the caller (FI ships dual-cache as BF16 only).
     has_extra = extra_kv_cache is not None
@@ -4405,6 +4568,7 @@ def run_unified_prefill_mg(
         ModelType.GLM_NSA: _GLM_HEAD_DIM,
         ModelType.GLM_NEXT: _GLM_NEXT_HEAD_DIM,
         ModelType.DSV41: 512,
+        ModelType.KVARN_MLA: 512,
     }.get(model_type)
     if expected_qdim is None:
         raise ValueError(f"unsupported sparse MLA model_type={model_type}")
@@ -4569,6 +4733,7 @@ def run_unified_prefill_mg(
                 bool(has_sink),
                 int(compute_mode),
                 int(mg_n_hg),
+                0,
                 model_type,
                 scale_format,
                 False,
@@ -4607,8 +4772,13 @@ def run_unified_prefill_mg(
             float(latent_scale),
             int(page_block_size),
             int(topk),
-            int(num_main_tiles),
+            (
+                int(kv_cache.shape[-1])
+                if model_type == int(ModelType.KVARN_MLA)
+                else int(num_main_tiles)
+            ),
             int(stride_kv_block),
+            int(kv_cache.stride(1)) if model_type == int(ModelType.KVARN_MLA) else 602,
             bool(has_sink),
             int(compute_mode),
             int(mg_n_hg),
@@ -4633,7 +4803,11 @@ def run_unified_prefill_mg(
             float(latent_scale),
             int(page_block_size),
             int(topk),
-            int(num_main_tiles),
+            (
+                int(kv_cache.shape[-1])
+                if model_type == int(ModelType.KVARN_MLA)
+                else int(num_main_tiles)
+            ),
             int(stride_kv_block),
             bool(has_sink),
             int(compute_mode),
@@ -4643,13 +4817,16 @@ def run_unified_prefill_mg(
             bool(traits.fp8_rope),
             False,  # has_extra
             0,  # extra_topk
-            0,  # num_main_tiles
+            (
+                int(kv_cache.shape[-1]) if model_type == int(ModelType.KVARN_MLA) else 0
+            ),  # num_main_tiles
             1,  # pbs_extra
             0,  # stride_extra_kv_block
             False,  # row_xor
             active_heads=active_heads,
             head_offset=head_offset,
             latent_scale_per_token=bool(latent_scale_per_token),
+            kvarn_row_stride=kvarn_row_stride,
             fp8_internal=bool(traits.fp8_internal),
             prepared=prepared,
         )
