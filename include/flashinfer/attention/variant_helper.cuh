@@ -83,7 +83,7 @@ struct AttentionVariantBase {
   REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, { return; })
 
   REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
-    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
+    float d_rcp = (m != static_cast<T_M>(-math::inf)) ? math::ptx_rcp(d) : 0.f;
     float v_scale_val = get_v_scale(params);
     return output * d_rcp * v_scale_val;
   })
