@@ -139,6 +139,7 @@ csrc/kda/                          @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark 
 docs/api/kda.rst                   @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 flashinfer/cake_kda*               @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 flashinfer/experimental/cake/cake_kda_train/ @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+flashinfer/experimental/cake_kda_train_kcp/ @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 flashinfer/jit/cake_flash_kda*     @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 flashinfer/jit/cake_fused_kda*     @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 flashinfer/jit/cake_kda*           @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
