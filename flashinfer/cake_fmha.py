@@ -582,6 +582,30 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         None,
         False,
     ),
+    # The sm100a one-stage programs for every page size with the short-KV chain
+    # (the entry L2 warm-up of the static first tile and the partial block's
+    # single masking pass), for one-stage launches of one wave
+    # (_CONTEXT_FP8_ONE_WAVE_ROUTES).
+    ("context_fp8", "RUNTIME_PACK8_Q1_OW"): (
+        "cake_fmha_context_fp8_024e5f82f5e94b38d2ff",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_Q1_OW"): (
+        "cake_fmha_context_fp8_7421f1ee37279a2bea13",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_Q1_OW"): (
+        "cake_fmha_context_fp8_e22e25d0e0baa16f1cb7",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_Q1_OW"): (
+        "cake_fmha_context_fp8_3e5440ae1066e6902e1d",
+        None,
+        False,
+    ),
     # The FP8 split-KV programs: the runtime-size arguments, then the split plan.
     ("context_fp8", "RUNTIME_SK_PACK8"): (
         "cake_fmha_context_fp8_ee373474e6d16691cab7",
@@ -761,9 +785,27 @@ _CONTEXT_FP8_MULTI_WAVE_ROUTES: dict[str, dict[str, tuple[str, int, int]]] = {
 # is in.  A persistent CTA's next tile overlaps that store with its first block
 # (timed B200: in those launches the early store ran 2.5 % slower); a launch of
 # one tile per CTA has no next tile (timed B200: 1 .. 2 requests of 200 .. 400
-# query tokens over 1500 keys, heads 32/4, ran 0.5 .. 0.9 us faster).
+# query tokens over 1500 keys, heads 32/4, ran 0.5 .. 0.9 us faster).  The
+# one-stage programs for every page size run the same build with the short-KV
+# chain, as the page-64 ones do (timed B200: 1 .. 16 requests of 1 .. 33
+# query tokens over 16 .. 129 keys, heads 8/1 .. 32/32, 1 .. 64 tiles, ran
+# 0.35 .. 0.6 us faster).
 _CONTEXT_FP8_ONE_WAVE_ROUTES: dict[str, dict[str, str]] = {
-    "sm100a": {"RUNTIME_PACK8": "RUNTIME_PACK8_OW"},
+    "sm100a": {
+        "RUNTIME_PACK8": "RUNTIME_PACK8_OW",
+        "RUNTIME_PACK8_Q1": "RUNTIME_PACK8_Q1_OW",
+        "RUNTIME_PACK4_Q1": "RUNTIME_PACK4_Q1_OW",
+        "RUNTIME_PACK2_Q1": "RUNTIME_PACK2_Q1_OW",
+        "RUNTIME_PACK1_Q1": "RUNTIME_PACK1_Q1_OW",
+    },
+}
+# Per target, the most tiles of a one-wave launch of the one-stage programs the
+# entries name that takes its one-wave program (fewer than the SMs): as for the
+# page-64 programs (_CONTEXT_FP8_MULTI_WAVE_ROUTES), the chain ran slower in
+# launches of packs 1 and 2 of more tiles (timed B200: 4 requests of 17 query
+# tokens over 128 keys, heads 32/32, 128 tiles of pack 1, ran 0.08 us slower).
+_CONTEXT_FP8_ONE_WAVE_TILES: dict[str, dict[str, int]] = {
+    "sm100a": {"RUNTIME_PACK2_Q1": 64, "RUNTIME_PACK1_Q1": 64},
 }
 # Per target, (fewest tiles, most keys, fewest query tokens) of the launches
 # whose two-way split the one-wave program outruns: a launch whose runtime
@@ -786,6 +828,12 @@ _CONTEXT_FP8_ONE_STAGE_PROGRAMS = frozenset(
     name
     for routes in _CONTEXT_FP8_MULTI_WAVE_ROUTES.values()
     for name, _, _ in routes.values()
+)
+_CONTEXT_FP8_ONE_STAGE_PROGRAMS |= frozenset(
+    name
+    for routes in _CONTEXT_FP8_ONE_WAVE_ROUTES.values()
+    for program, name in routes.items()
+    if program in _CONTEXT_FP8_ONE_STAGE_PROGRAMS
 )
 # Units of one split tile at most (the kernel's MAX_SPLITS), and the FP32
 # partial bytes of one split unit: O of both 128-row stages, then the row max
@@ -4583,6 +4631,13 @@ _CONTEXT_FP8_ONE_STAGE_ROWS_GAIN: dict[str, frozenset[int]] = {
 # keys) undercount (timed B200: 32 query tokens, heads 32/32, page 64, 1 .. 4
 # requests ran 0.8 .. 1.1 us faster one-stage, predicted 0.3 us).
 _CONTEXT_FP8_ONE_BLOCK_ONE_STAGE_KEYS: dict[str, int] = {"sm100a": 128}
+# Targets whose runtime-size launches of whole tiles in one wave (at most as
+# many tiles as the SMs) that the one-stage costs leave on their launch take
+# the one-stage program of their own pack wherever its tiles (one or more
+# m-blocks of one query stage per head group) also fit one wave: the launch
+# takes as long as its longest tile, and a one-stage tile runs one query
+# stage over the KV blocks its rows meet, half the rows of a two-stage tile.
+_CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS = frozenset({"sm100a"})
 
 
 def _context_fp8_tile_blocks(
@@ -4938,12 +4993,17 @@ def _context_fp8_one_stage_choice(
     sm_count: int,
     current: tuple[int, tuple[int, int, int] | None],
     page_size: int | None = None,
+    runtime: bool = False,
 ) -> int | None:
     """The pack of the one-stage launch of a call whose runtime pack is
     ``pack`` and whose launch is ``current`` (its pack and split plan, ``None``
     for whole tiles), or ``None`` where it keeps that launch (a pure function
     of its arguments, cached).  For a page size the target names in
     :data:`_CONTEXT_FP8_ONE_STAGE_ROWS_GAIN`, the gain takes the scaled unit.
+    A ``runtime`` launch (of a runtime-size program at ``pack``) of whole
+    tiles in one wave on a target of
+    :data:`_CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS` that the costs below leave
+    on its launch takes ``pack`` where its one-stage tiles fit one wave.
 
     The candidates are ``pack`` and the smaller shipped packs dividing it whose
     tiles hold every query token in one stage (``max_q_len <= 128 / pack``),
@@ -5013,6 +5073,20 @@ def _context_fp8_one_stage_choice(
         _context_fp8_split_gain(time, best_time) or (one_block and best_time < time)
     ):
         return best
+    if (
+        runtime
+        and plan is None
+        and current_pack == pack
+        and target in _CONTEXT_FP8_ONE_WAVE_ONE_STAGE_TARGETS
+        and len(blocks) <= sm_count
+        and len(
+            _context_fp8_tile_blocks(
+                batch_size, max_q_len, max_kv_len, num_q_heads, pack, 1
+            )
+        )
+        <= sm_count
+    ):
+        return pack
     return None
 
 
@@ -5626,6 +5700,7 @@ def select_cake_fmha_context_route(
                 sm_count,
                 (pack_g, split_plan),
                 page_size,
+                runtime_pack is not None,
             )
             short_tiles = _CONTEXT_FP8_SHORT_KV_ONE_STAGE_TILES.get(target)
             short_pack = None
@@ -5721,7 +5796,11 @@ def select_cake_fmha_context_route(
             component == "context_fp8"
             and one_wave is not None
             and sm_count
-            and batch_size * (num_q_heads // pack_g) * num_m_blocks <= sm_count
+            and batch_size * (num_q_heads // pack_g) * num_m_blocks
+            <= min(
+                sm_count,
+                _CONTEXT_FP8_ONE_WAVE_TILES.get(target, {}).get(program, sm_count),
+            )
         ):
             program = one_wave
     return CakeFmhaContextRoute(
