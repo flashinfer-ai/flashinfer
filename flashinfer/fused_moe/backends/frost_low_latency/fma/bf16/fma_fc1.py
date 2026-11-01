@@ -10,6 +10,7 @@ from flashinfer.fused_moe.backends.frost_low_latency.fma.activations import (
     apply_activation,
 )
 from flashinfer.fused_moe.backends.frost_low_latency.fma.fp4_weight import (
+    accumulate_mxfp4,
     scaled_values,
     weight_scale,
 )
@@ -73,6 +74,156 @@ def _reduce_values(values, column, values_per_lane: cutlass.Constexpr):
 
 
 @cute.jit
+def _accumulate_route_rows(
+    x,
+    weights,
+    block_scales,
+    up,
+    gate,
+    route,
+    row,
+    expert,
+    h: cutlass.Constexpr,
+    i: cutlass.Constexpr,
+    k: cutlass.Constexpr,
+    outputs: cutlass.Constexpr,
+    gated: cutlass.Constexpr,
+    native_fp4: cutlass.Constexpr,
+    scale_block_size: cutlass.Constexpr,
+    integer_weights: cutlass.Constexpr,
+    values_per_lane: cutlass.Constexpr,
+    defer_extreme: cutlass.Constexpr,
+):
+    lane = cute.arch.lane_idx()
+    branches = 2 if gated else 1
+    word_type = (
+        cutlass.Uint32 if x.element_type == cutlass.Float8E4M3FN else cutlass.Uint64
+    )
+    xp = cute.recast_ptr(x.iterator, dtype=word_type)
+    weight_word_type = (
+        (cutlass.Uint16 if values_per_lane == 4 else cutlass.Uint32)
+        if weights.element_type == cutlass.Uint8
+        else (
+            cutlass.Uint32
+            if weights.element_type == cutlass.Float8E4M3FN
+            else cutlass.Uint64
+        )
+    )
+    wp = cute.recast_ptr(weights.iterator, dtype=weight_word_type)
+    rare = cutlass.Boolean(False)
+    # Adjacent values per lane give coalesced word loads.
+    # Accumulate in FP32; each format's rounding boundary is applied below.
+    for group in range(cute.ceil_div(h, 32 * values_per_lane)):
+        col = group * 32 + lane
+        if cutlass.const_expr(values_per_lane == 4) or col < h // values_per_lane:
+            xv = _load_values(
+                xp,
+                (route // k) * (h // 4) + col * (values_per_lane // 4),
+                x.element_type,
+                values_per_lane,
+            )
+            for o in cutlass.range_constexpr(outputs):
+                offset = (expert * branches * i + row + o) * (
+                    h // values_per_lane
+                ) + col
+                if cutlass.const_expr(weights.element_type == cutlass.Uint8):
+                    scale = weight_scale(
+                        block_scales[
+                            expert,
+                            row + o,
+                            col // (scale_block_size // values_per_lane),
+                        ],
+                        scale_block_size,
+                        integer_weights,
+                    )
+                    uv = scaled_values(
+                        wp[offset],
+                        scale,
+                        native_fp4,
+                        scale_block_size,
+                        integer_weights,
+                        values_per_lane,
+                        defer_extreme,
+                    )
+                    if cutlass.const_expr(gated):
+                        gate_scale = weight_scale(
+                            block_scales[
+                                expert,
+                                row + o + i,
+                                col // (scale_block_size // values_per_lane),
+                            ],
+                            scale_block_size,
+                            integer_weights,
+                        )
+                        gv = scaled_values(
+                            wp[offset + i * (h // values_per_lane)],
+                            gate_scale,
+                            native_fp4,
+                            scale_block_size,
+                            integer_weights,
+                            values_per_lane,
+                            defer_extreme,
+                        )
+                else:
+                    uv = _quad(wp[offset], weights.element_type)
+                    if cutlass.const_expr(gated):
+                        gv = _quad(
+                            wp[offset + i * (h // values_per_lane)],
+                            weights.element_type,
+                        )
+                if cutlass.const_expr(
+                    weights.element_type == cutlass.Uint8
+                    and scale_block_size == 32
+                    and not integer_weights
+                    and not defer_extreme
+                ):
+                    # Reuse the scales already loaded for this reduction.
+                    # E8M0 255 decodes to NaN and does not set this flag.
+                    rare = rare | (scale >= cutlass.Float32(2.0**126))
+                    if cutlass.const_expr(gated):
+                        rare = rare | (gate_scale >= cutlass.Float32(2.0**126))
+                if cutlass.const_expr(
+                    weights.element_type == cutlass.Uint8
+                    and scale_block_size == 32
+                    and not integer_weights
+                    and defer_extreme
+                ):
+                    deferred = scale >= cutlass.Float32(2.0**126)
+                    if cutlass.const_expr(gated):
+                        deferred = deferred | (gate_scale >= cutlass.Float32(2.0**126))
+                    if deferred:
+                        if scale >= cutlass.Float32(2.0**126):
+                            for c in cutlass.range_constexpr(values_per_lane):
+                                up[c, o] = accumulate_mxfp4(
+                                    up[c, o], xv[c], uv[c], scale
+                                )
+                        else:
+                            for c in cutlass.range_constexpr(values_per_lane):
+                                up[c, o] = up[c, o] + xv[c] * uv[c]
+                        if cutlass.const_expr(gated):
+                            if gate_scale >= cutlass.Float32(2.0**126):
+                                for c in cutlass.range_constexpr(values_per_lane):
+                                    gate[c, o] = accumulate_mxfp4(
+                                        gate[c, o], xv[c], gv[c], gate_scale
+                                    )
+                            else:
+                                for c in cutlass.range_constexpr(values_per_lane):
+                                    gate[c, o] = gate[c, o] + xv[c] * gv[c]
+                    else:
+                        # Keep normal scales in the original interleaved loop.
+                        for c in cutlass.range_constexpr(values_per_lane):
+                            up[c, o] = up[c, o] + xv[c] * uv[c]
+                            if cutlass.const_expr(gated):
+                                gate[c, o] = gate[c, o] + xv[c] * gv[c]
+                else:
+                    for c in cutlass.range_constexpr(values_per_lane):
+                        up[c, o] = up[c, o] + xv[c] * uv[c].to(cutlass.Float32)
+                        if cutlass.const_expr(gated):
+                            gate[c, o] = gate[c, o] + xv[c] * gv[c].to(cutlass.Float32)
+    return rare
+
+
+@cute.jit
 def _single_route_body(
     x: cute.Tensor,
     weights: cute.Tensor,
@@ -102,87 +253,61 @@ def _single_route_body(
     # Widen before forming the expert stride in 64-bit weight words.
     expert = ids[route // k, route % k].to(cutlass.Int64)
     up = cute.make_rmem_tensor((values_per_lane, outputs), cutlass.Float32)
-    branches = 2 if gated else 1
     gate = cute.make_rmem_tensor((values_per_lane, outputs), cutlass.Float32)
     up.fill(0.0)
     gate.fill(0.0)
     if expert >= 0 and expert < cute.size(weights, mode=[0]):
-        word_type = (
-            cutlass.Uint32 if x.element_type == cutlass.Float8E4M3FN else cutlass.Uint64
+        rare = _accumulate_route_rows(
+            x,
+            weights,
+            block_scales,
+            up,
+            gate,
+            route,
+            row,
+            expert,
+            h,
+            i,
+            k,
+            outputs,
+            gated,
+            native_fp4,
+            scale_block_size,
+            integer_weights,
+            values_per_lane,
+            False,
         )
-        xp = cute.recast_ptr(x.iterator, dtype=word_type)
-        weight_word_type = (
-            (cutlass.Uint16 if values_per_lane == 4 else cutlass.Uint32)
-            if weights.element_type == cutlass.Uint8
-            else (
-                cutlass.Uint32
-                if weights.element_type == cutlass.Float8E4M3FN
-                else cutlass.Uint64
-            )
-        )
-        wp = cute.recast_ptr(weights.iterator, dtype=weight_word_type)
-        # Adjacent values per lane give coalesced word loads.
-        # Accumulate in FP32; each format's rounding boundary is applied below.
-        for group in range(cute.ceil_div(h, 32 * values_per_lane)):
-            col = group * 32 + lane
-            if cutlass.const_expr(values_per_lane == 4) or col < h // values_per_lane:
-                xv = _load_values(
-                    xp,
-                    (route // k) * (h // 4) + col * (values_per_lane // 4),
-                    x.element_type,
+        if cutlass.const_expr(
+            weights.element_type == cutlass.Uint8
+            and scale_block_size == 32
+            and not integer_weights
+        ):
+            # Every lane has reconverged after the reduction loop. Discard
+            # the private ordinary-path accumulators before safe recomputation;
+            # no reduction, activation, or output observes extreme overflow.
+            if cute.arch.vote_ballot_sync(rare) != 0:
+                up.fill(0.0)
+                gate.fill(0.0)
+                _accumulate_route_rows(
+                    x,
+                    weights,
+                    block_scales,
+                    up,
+                    gate,
+                    route,
+                    row,
+                    expert,
+                    h,
+                    i,
+                    k,
+                    outputs,
+                    gated,
+                    native_fp4,
+                    scale_block_size,
+                    integer_weights,
                     values_per_lane,
+                    True,
                 )
-                for o in cutlass.range_constexpr(outputs):
-                    offset = (expert * branches * i + row + o) * (
-                        h // values_per_lane
-                    ) + col
-                    if cutlass.const_expr(weights.element_type == cutlass.Uint8):
-                        scale = weight_scale(
-                            block_scales[
-                                expert,
-                                row + o,
-                                col // (scale_block_size // values_per_lane),
-                            ],
-                            scale_block_size,
-                            integer_weights,
-                        )
-                        uv = scaled_values(
-                            wp[offset],
-                            scale,
-                            native_fp4,
-                            scale_block_size,
-                            integer_weights,
-                            values_per_lane,
-                        )
-                        if cutlass.const_expr(gated):
-                            gate_scale = weight_scale(
-                                block_scales[
-                                    expert,
-                                    row + o + i,
-                                    col // (scale_block_size // values_per_lane),
-                                ],
-                                scale_block_size,
-                                integer_weights,
-                            )
-                            gv = scaled_values(
-                                wp[offset + i * (h // values_per_lane)],
-                                gate_scale,
-                                native_fp4,
-                                scale_block_size,
-                                integer_weights,
-                                values_per_lane,
-                            )
-                    else:
-                        uv = _quad(wp[offset], weights.element_type)
-                        if cutlass.const_expr(gated):
-                            gv = _quad(
-                                wp[offset + i * (h // values_per_lane)],
-                                weights.element_type,
-                            )
-                    for c in cutlass.range_constexpr(values_per_lane):
-                        up[c, o] = up[c, o] + xv[c] * uv[c].to(cutlass.Float32)
-                        if cutlass.const_expr(gated):
-                            gate[c, o] = gate[c, o] + xv[c] * gv[c].to(cutlass.Float32)
     for o in cutlass.range_constexpr(outputs):
         u = _reduce_values(up, o, values_per_lane)
         g = cutlass.Float32(0.0)

@@ -132,6 +132,28 @@ def _int4_quad(word):
 
 
 @cute.jit
+def mxfp4_decode_scale(scale):
+    # The two largest E8M0 values can overflow FP32 when multiplied by E2M1.
+    # Leave those values unscaled for accumulate_mxfp4 instead.
+    result = scale
+    if scale >= cutlass.Float32(2.0**126):
+        result = cutlass.Float32(1.0)
+    return result
+
+
+@cute.jit
+def accumulate_mxfp4(acc, activation, value, scale):
+    # Called only for unscaled E2M1 values at the two largest E8M0 scales.
+    # BF16/FP16 * E2M1 is exact in FP32 whenever the final product can be
+    # finite. Keep the scale in the FMA, avoiding an overflowing weight.
+    return cute.arch.inline_ptx(
+        "{ .reg .f32 product; mul.rn.f32 product, {$r0}, {$r1}; fma.rn.f32 {$w0}, product, {$r2}, {$r3}; }",
+        write_only_types=[cutlass.Float32],
+        read_only_args=[activation, value, scale, acc],
+    )
+
+
+@cute.jit
 def scaled_values(
     word,
     scale,
@@ -139,7 +161,12 @@ def scaled_values(
     scale_block_size: cutlass.Constexpr,
     integer_weights: cutlass.Constexpr,
     values_per_lane: cutlass.Constexpr,
+    defer_extreme: cutlass.Constexpr = True,
 ):
+    if cutlass.const_expr(
+        scale_block_size == 32 and not integer_weights and defer_extreme
+    ):
+        scale = mxfp4_decode_scale(scale)
     if cutlass.const_expr(values_per_lane == 4):
         return scaled_quad(word, scale, native, scale_block_size, integer_weights)
     # Native FP4 conversion consumes a 16-bit packed word even when the
