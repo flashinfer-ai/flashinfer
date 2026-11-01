@@ -852,13 +852,24 @@ def test_k1_planner_keeps_rows_it_cannot_serve_on_the_deterministic_program(
 # ---------------------------------------------------------------------------
 
 
-def _segments(m_pairs, n_tiles, k_iters, units):
+def _span_first(span, steps, spans, head_spans=0, head_steps=0):
+    """The program's first step of span ``span``: the head spans share the first ``head_steps`` steps evenly, the
+    others the rest (every span alike when ``head_spans`` is 0)."""
+    if span < head_spans:
+        return span * head_steps // head_spans
+    return head_steps + (span - head_spans) * (steps - head_steps) // (
+        spans - head_spans
+    )
+
+
+def _segments(m_pairs, n_tiles, k_iters, units, head_spans=0, head_steps=0):
     """Each tile's segments ``(k_first, k_end)`` in K blocks, in K order, tile ``pair * n_tiles + column``: span
-    ``s`` runs the (row-tile pair, K block) steps ``[s * steps / spans, (s + 1) * steps / spans)``, pair-major."""
+    ``s`` runs the (row-tile pair, K block) steps ``[first(s), first(s + 1))`` (:func:`_span_first`), pair-major."""
     steps, spans = m_pairs * k_iters, units // n_tiles
     per_tile = [[] for _ in range(m_pairs * n_tiles)]
     for span in range(spans):
-        first, last = span * steps // spans, (span + 1) * steps // spans
+        first = _span_first(span, steps, spans, head_spans, head_steps)
+        last = _span_first(span + 1, steps, spans, head_spans, head_steps)
         step = first
         while step < last:
             pair, k_first = divmod(step, k_iters)
@@ -892,6 +903,124 @@ def test_router_partition_helpers_match_the_segments(m_pairs, n_tiles, k_iters):
             )
             if cake_backend.router_at_most_two_partials(m_pairs, n_tiles, units):
                 assert max(len(segs) for segs in per_tile) <= 2
+    for spec in (
+        "H0.5x3",
+        "H0.5x4",
+        "H0.47x3",
+        "H0.9x2",
+        "H0.1x1",
+        "H1x4p44",
+        "H1x6p44",
+        "H0.75x4p3",
+    ):
+        for sm_count in (148, 152, 216):
+            units, head_spans, head_steps = cake_backend.router_partition_of(
+                spec, m_pairs, n_tiles, k_iters, sm_count
+            )
+            assert units % n_tiles == 0 and 0 < head_spans < units // n_tiles
+            assert (
+                cake_backend.router_units_of(spec, m_pairs, n_tiles, k_iters, sm_count)
+                == units
+            )
+            if not cake_backend.router_partition_fits(
+                m_pairs, n_tiles, k_iters, units, head_spans, head_steps
+            ):
+                continue
+            per_tile = _segments(
+                m_pairs, n_tiles, k_iters, units, head_spans, head_steps
+            )
+            assert all(sum(e - f for f, e in segs) == k_iters for segs in per_tile)
+            part = any(len(segs) > 1 for segs in per_tile)
+            assert (
+                cake_backend.router_has_part_tiles(
+                    m_pairs, n_tiles, k_iters, units, head_spans, head_steps
+                )
+                == part
+            )
+
+
+def test_router_head_tail_partition():
+    """``"H<f>x<k>"``: one head unit per CTA pair over about the fraction ``f`` of the (row-tile pair, K block)
+    steps, then ``k`` tail units per CTA pair over the rest; each count a multiple of the column tile count."""
+    # hidden 5120 (20 row-tile pairs x 2 column tiles), T = 16231 (508 K blocks): 10160 steps
+    assert cake_backend.router_partition_of("H0.5x4", 20, 2, 508, 216) == (
+        540,
+        54,
+        5080,
+    )
+    assert cake_backend.router_partition_of("H0.5x3", 20, 2, 508, 216) == (
+        432,
+        54,
+        5080,
+    )
+    assert cake_backend.router_partition_of("H0.5x4", 20, 2, 508, 152) == (
+        380,
+        38,
+        5080,
+    )
+    assert cake_backend.router_partition_of("H0.5x3", 20, 2, 508, 152) == (
+        304,
+        38,
+        5080,
+    )
+    # hidden 4096 / 6144 at T = 16172 (506 K blocks)
+    assert cake_backend.router_partition_of("H0.5x4", 16, 2, 506, 216) == (
+        540,
+        54,
+        4048,
+    )
+    assert cake_backend.router_partition_of("H0.5x4", 24, 2, 506, 216) == (
+        540,
+        54,
+        6072,
+    )
+    # the head share stays at least one step per head span and leaves one per tail span
+    assert cake_backend.router_partition_of("H0.001x1", 20, 2, 508, 216) == (
+        216,
+        54,
+        54,
+    )
+    assert cake_backend.router_partition_of("H0.999x1", 20, 2, 508, 216) == (
+        216,
+        54,
+        10106,
+    )
+    assert cake_backend.router_head_tail("H0.5x4") == (0.5, 4)
+    assert [
+        cake_backend.router_head_tail(s) for s in ("waves", "S2", 6, "H0.5", "Hx4")
+    ] == [None] * 5
+    # "H<f>x<k>p<h>": h head units, each about f of a pair's even share of the steps; hidden 4096 (16 row-tile
+    # pairs), T = 16172 (506 K blocks): 8096 steps, 44 of the 76 CTA pairs at 152 SMs -> 1 * 8096 * 44 / 76 = 4687
+    # head steps, then 4 tail units per CTA pair
+    assert cake_backend.router_partition_of("H1x4p44", 16, 2, 506, 152) == (
+        348,
+        22,
+        4687,
+    )
+    # hidden 6144 (24 row-tile pairs): 12144 steps -> 7031 head steps; 6 tail units per CTA pair
+    assert cake_backend.router_partition_of("H1x6p44", 24, 2, 506, 152) == (
+        500,
+        22,
+        7031,
+    )
+    # one head unit per CTA pair (or more requested): the "H<f>x<k>" partition
+    for h in (76, 77, 500):
+        assert cake_backend.router_partition_of(
+            f"H0.5x3p{h}", 20, 2, 508, 152
+        ) == cake_backend.router_partition_of("H0.5x3", 20, 2, 508, 152)
+    assert cake_backend.router_head_tail("H1x4p44") == (1.0, 4)
+    assert cake_backend.router_head_pairs("H1x4p44") == 44
+    assert [
+        cake_backend.router_head_pairs(s) for s in ("H0.5x4", "waves", 6, "H1x4p")
+    ] == [None] * 4
+    # a token count too short for the partition: at most one unit per (tile, K block) step
+    units, head_spans, head_steps = cake_backend.router_partition_of(
+        "H0.5x4", 20, 2, 4, 216
+    )
+    assert not cake_backend.router_partition_fits(
+        20, 2, 4, units, head_spans, head_steps
+    )
+    assert cake_backend.router_partition_fits(20, 2, 508, 540, 54, 5080)
 
 
 def test_router_waves_partition():
@@ -928,30 +1057,53 @@ def test_router_units_policy(monkeypatch):
                 is None
             )
         assert cake_backend.router_units("kn", arch=arch, sm_count=sms, **fwd) is None
-        # weight gradient: hidden 4096 and 6144 run the deterministic plan
+    # weight gradient at T = 16231 (508 K blocks), inside the token windows (test_router_wgrad_token_windows):
+    # hidden 5120 "H0.5x3" on sm_100a / sm_103a (76 head + 228 tail units); hidden 4096 and 6144 and sm_107a: the
+    # deterministic plan
+    for arch in ("sm_100a", "sm_103a"):
         for hidden in (4096, 6144):
+            assert cake_backend.ROUTER_RULES[(arch, "nn_t", hidden, 256)] is None
             assert (
-                cake_backend.router_units(
-                    "nn_t", arch=arch, sm_count=sms, M=hidden, N=256, K=16231
+                cake_backend.router_partition(
+                    "nn_t", arch=arch, sm_count=152, M=hidden, N=256, K=16231
                 )
                 is None
             )
-    # weight gradient, hidden 5120: the "waves" partition (whole waves of the CTA pairs of the device) on sm_100a /
-    # sm_103a; sm_107a measured, missed (the partition would be 432 units)
     for arch in ("sm_100a", "sm_103a"):
+        assert cake_backend.router_partition(
+            "nn_t", arch=arch, sm_count=152, **wgrad5120
+        ) == (304, 38, 20 * 508 // 2)
+    for hidden in (4096, 5120, 6144):
+        assert cake_backend.ROUTER_RULES[("sm_107a", "nn_t", hidden, 256)] is None
         assert (
-            cake_backend.router_units("nn_t", arch=arch, sm_count=152, **wgrad5120)
-            == 380
+            cake_backend.router_partition(
+                "nn_t", arch="sm_107a", sm_count=216, M=hidden, N=256, K=16231
+            )
+            is None
         )
-    assert cake_backend.ROUTER_RULES[("sm_107a", "nn_t", 5120, 256)] is None
-    assert (
-        cake_backend.router_units("nn_t", arch="sm_107a", sm_count=216, **wgrad5120)
-        is None
-    )
-    assert (
-        cake_backend.router_units("nn_t", arch="sm_100a", sm_count=148, **wgrad5120)
-        is None
-    )
+    # another SM count than the verdicts were measured on: the deterministic program
+    assert cake_backend.ROUTER_SM_COUNT == {
+        "sm_100a": 152,
+        "sm_103a": 152,
+        "sm_107a": 216,
+    }
+    for sms in (212, 217):
+        assert (
+            cake_backend.router_units("nn_t", arch="sm_107a", sm_count=sms, **wgrad5120)
+            is None
+        )
+    for arch in ("sm_100a", "sm_103a"):
+        for sms in (148, 153):
+            assert (
+                cake_backend.router_units("nn_t", arch=arch, sm_count=sms, **wgrad5120)
+                is None
+            )
+    # few tokens at hidden 5120: the "waves" partition (100 tokens, 4 K blocks: three waves of the 76 CTA pairs, at
+    # most one unit per (tile, K block) step -> 160 units)
+    for arch in ("sm_100a", "sm_103a"):
+        assert cake_backend.router_partition(
+            "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=100
+        ) == (160, 0, 0)
     # a row without a verdict (another hidden size or expert count) runs the deterministic program
     assert (
         cake_backend.router_units(
@@ -986,13 +1138,32 @@ def test_router_units_policy(monkeypatch):
         )
         == 11 * 48
     )
-    # verdicts: per (arch, layout, hidden, experts); a forward verdict must keep two partials at most
+    # explicit splits do not depend on the SM count floor
+    assert (
+        cake_backend.router_units(
+            "nn_t", arch="sm_107a", sm_count=212, splits=3, **wgrad
+        )
+        == 3 * 48
+    )
+    # verdicts: per (arch, layout, hidden, experts); a forward verdict must keep two partials at most and cannot be
+    # a head/tail partition
     monkeypatch.setitem(
         cake_backend.ROUTER_RULES, ("sm_100a", "nn_t", 6144, 256), "pairs"
     )
     assert (
-        cake_backend.router_units("nn_t", arch="sm_100a", sm_count=148, **wgrad) == 74
+        cake_backend.router_units("nn_t", arch="sm_100a", sm_count=152, **wgrad) == 76
     )
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES, ("sm_100a", "nn_t", 6144, 256), "H0.5x3"
+    )
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_100a", sm_count=152, **wgrad
+    ) == (304, 38, 24 * 508 // 2)
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES, ("sm_103a", "kk", 6144, 256), "H0.5x4"
+    )
+    with pytest.raises(ValueError, match="weight gradient"):
+        cake_backend.router_units("kk", arch="sm_103a", sm_count=152, **fwd)
     monkeypatch.setitem(
         cake_backend.ROUTER_RULES, ("sm_103a", "kk", 6144, 256), "forward"
     )
@@ -1001,6 +1172,60 @@ def test_router_units_policy(monkeypatch):
     monkeypatch.setitem(cake_backend.ROUTER_RULES, ("sm_103a", "kk", 6144, 256), "S3")
     with pytest.raises(ValueError, match="more than two partials"):
         cake_backend.router_units("kk", arch="sm_103a", sm_count=152, **fwd)
+
+
+# the token windows of the router weight gradient (256 experts), (arch, hidden) -> ((first, last, spec), ...); every
+# other token count runs the deterministic program
+ROUTER_WGRAD_WINDOWS = {
+    ("sm_100a", 5120): ((1, 128, "waves"), (10240, 32768, "H0.5x3")),
+    ("sm_103a", 5120): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
+}
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_router_wgrad_token_windows(arch):
+    """The weight gradient runs a partition only inside its token windows: at the first and the last token count of a
+    window, not one token outside it, not above 32768 tokens, and around the few-token "waves" windows; a head/tail
+    window only on the measured SM count (:data:`ROUTER_SM_COUNT`, not one SM more or fewer), a "waves" window on
+    every SM count where :func:`router_waves` gives a partition.  The deterministic program at every other token
+    count and SM count and on every hidden size without a window."""
+    measured = cake_backend.ROUTER_SM_COUNT[arch]
+    sm_counts = sorted({148, 208, 212, 216, measured - 1, measured, measured + 1})
+    for hidden in (4096, 5120, 6144):
+        windows = ROUTER_WGRAD_WINDOWS.get((arch, hidden), ())
+        assert cake_backend.ROUTER_RULES[(arch, "nn_t", hidden, 256)] == (
+            windows or None
+        )
+        tokens = {64, 128, 129, 192, 193, 224, 1024, 8192, 32768, 32769, 65536}
+        for first, last, _ in windows:
+            tokens |= {first - 1, first, last, last + 1}
+        m_pairs = hidden // 256
+        for T in sorted(t for t in tokens if t > 0):
+            spec = next((s for a, b, s in windows if a <= T <= b), None)
+            k_iters = -(-T // 32)
+            for sms in sm_counts:
+                got = cake_backend.router_partition(
+                    "nn_t", arch=arch, sm_count=sms, M=hidden, N=256, K=T
+                )
+                if spec == "waves":
+                    units = cake_backend.router_waves(m_pairs, 2, k_iters, sms)
+                    if units is not None:
+                        units = cake_backend.router_units_of(
+                            units, m_pairs, 2, k_iters, sms
+                        )
+                    want = None if units is None else (units, 0, 0)
+                elif spec is None or sms != measured:
+                    want = None
+                else:
+                    want = cake_backend.router_partition_of(
+                        spec, m_pairs, 2, k_iters, sms
+                    )
+                assert got == want, (hidden, T, sms)
+    if arch == "sm_100a":
+        # the smallest measured "waves" count
+        assert cake_backend.router_partition(
+            "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=64
+        ) == (80, 0, 0)
 
 
 def test_k2_planner_plans_the_stream_k_router(monkeypatch):
@@ -1032,7 +1257,10 @@ def test_k2_planner_plans_the_stream_k_router(monkeypatch):
     assert plan.units == 68 and plan.part_tiles and plan.reproducible
     # the weight gradient of hidden 6144: the deterministic plan
     assert cake_backend.plan_atomic_router(*wgrad, **kw)[0] is None
-    # hidden 5120: the "waves" partition (40 tiles, 129 K blocks: 3 waves of the 76 pairs)
+    # a "waves" verdict at hidden 5120 (40 tiles, 129 K blocks: 3 waves of the 76 pairs)
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES, ("sm_103a", "nn_t", 5120, 256), "waves"
+    )
     X5 = torch.zeros(T, 5120)
     plan, _ = cake_backend.plan_atomic_router(G.t(), X5, torch.zeros(N, 5120), **kw)
     assert (plan.layout, plan.template, plan.swapped) == (
@@ -1044,6 +1272,123 @@ def test_k2_planner_plans_the_stream_k_router(monkeypatch):
     assert plan.units == 3 * 76 and plan.part_tiles and not plan.reproducible
     dgrad = (G, W, torch.zeros(T, K))
     assert cake_backend.plan_atomic_router(*dgrad, **kw)[0] is None
+    assert plan.head_spans == 0 and plan.head_steps == 0
+
+
+def test_k2_planner_plans_the_head_tail_router(monkeypatch):
+    """A head/tail verdict (``"H0.5x4"`` on sm_107a, set here for hidden 4096, 5120 and 6144; sm_100a / sm_103a at
+    hidden 5120) runs the head/tail program: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` with
+    the partition's ``head_spans`` / ``head_steps``, which the launch passes to the program; without that template
+    registered the row runs the deterministic program."""
+    arch, T, N = "sm_107a", 16231, 256
+    kw = dict(arch=arch, sm_count=216)
+    for hidden in (4096, 5120, 6144):
+        monkeypatch.setitem(
+            cake_backend.ROUTER_RULES, (arch, "nn_t", hidden, 256), "H0.5x4"
+        )
+    G = torch.zeros(T, N)
+    monkeypatch.setitem(cake_jit.KERNELS, arch, {})  # whatever this checkout registers
+    _register(
+        monkeypatch, arch, "router_fp32_gemm_atomic_kk", "router_fp32_gemm_atomic_nn_t"
+    )
+    X5 = torch.zeros(T, 5120)
+    plan, reason = cake_backend.plan_atomic_router(
+        G.t(), X5, torch.zeros(N, 5120), **kw
+    )
+    assert plan is None and reason == (
+        "router_fp32_gemm_atomic_nn_t_ht_c3_nreg is not registered for sm_107a"
+    )
+    _register(monkeypatch, arch, "router_fp32_gemm_atomic_nn_t_ht_c3_nreg")
+    for hidden, m_pairs in ((4096, 16), (5120, 20), (6144, 24)):
+        X = torch.zeros(T, hidden)
+        out = torch.zeros(N, hidden)
+        plan, _ = cake_backend.plan_atomic_router(G.t(), X, out, **kw)
+        assert (plan.layout, plan.template, plan.swapped) == (
+            "nn_t",
+            "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+            True,
+        )
+        assert (plan.M, plan.N, plan.K, plan.m_tiles, plan.n_tiles, plan.k_iters) == (
+            hidden,
+            N,
+            T,
+            2 * m_pairs,
+            2,
+            508,
+        )
+        assert (plan.units, plan.head_spans, plan.head_steps) == (
+            540,
+            54,
+            m_pairs * 254,
+        )
+        assert plan.grid == (1080, 1, 1) and plan.part_tiles and not plan.reproducible
+        values = cake_backend._k2_values(plan, A="a", parts="b", out=out)
+        assert (values["units"], values["head_spans"], values["head_steps"]) == (
+            540,
+            54,
+            m_pairs * 254,
+        )
+    # an explicit split count runs the stream-K program with spans alike
+    plan, _ = cake_backend.plan_atomic_router(
+        G.t(), X5, torch.zeros(N, 5120), splits=3, **kw
+    )
+    assert plan.template == "router_fp32_gemm_atomic_nn_t" and plan.head_spans == 0
+    # fewer SMs: the deterministic program
+    plan, reason = cake_backend.plan_atomic_router(
+        G.t(), X5, torch.zeros(N, 5120), arch=arch, sm_count=212
+    )
+    assert plan is None and "planner" in reason
+    # sm_100a / sm_103a, hidden 5120: three tail units per pair (76 head + 228 tail units on 152 SMs)
+    for gb in ("sm_100a", "sm_103a"):
+        monkeypatch.setitem(cake_jit.KERNELS, gb, {})
+        _register(
+            monkeypatch,
+            gb,
+            "router_fp32_gemm_atomic_kk",
+            "router_fp32_gemm_atomic_nn_t",
+            "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+        )
+        plan, _ = cake_backend.plan_atomic_router(
+            G.t(), X5, torch.zeros(N, 5120), arch=gb, sm_count=152
+        )
+        assert (plan.template, plan.units, plan.head_spans, plan.head_steps) == (
+            "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+            304,
+            38,
+            20 * 254,
+        )
+        assert plan.grid == (608, 1, 1) and plan.part_tiles
+
+
+def test_k2_values_feed_every_registered_router_program():
+    """The keyword arguments of a K2 launch name every argument of every registered router program's argument plan
+    (the head/tail program's ``head_spans`` / ``head_steps`` included)."""
+    out = torch.zeros(256, 5120)
+    plan = cake_backend.AtomicRouterPlan(
+        M=5120, N=256, K=16231, a_mn=True, b_mn=True, swapped=True, layout="nn_t", m_tiles=40,
+        n_tiles=2, k_iters=508, units=540, template="router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+        head_spans=54, head_steps=5080,
+    )  # fmt: skip
+    values = cake_backend._k2_values(plan, A="a", parts="b", out=out)
+    names = [
+        n for n, r in cake_jit.MODULES.items() if r["template"].startswith("router_")
+    ]
+    for name in names:
+        plan_args = cake_jit.arg_plan_of(cake_jit.MODULES[name])
+        arguments = cake_backend._order_atomic_arguments(
+            name, plan_args, values, plan.grid
+        )
+        assert len(arguments) == len(plan_args), name
+        if cake_jit.MODULES[name]["template"].endswith(
+            cake_backend.ROUTER_HEAD_TAIL_SUFFIX
+        ):
+            assert [a for _, a in plan_args][-5:] == [
+                "head_spans",
+                "head_steps",
+                "grid_x",
+                "grid_y",
+                "grid_z",
+            ]
 
 
 def test_k2_out_fill_is_one_driver_memset_with_a_zero_fallback(monkeypatch):
@@ -1210,9 +1555,9 @@ def test_registry_is_disjoint_from_the_deterministic_package():
 
 
 def test_registered_templates_are_the_ones_the_planners_name():
-    """Every template this checkout registers is one the host plans -- the transposed-store K1 programs
-    (``dense_proj_gemm_atomic_nn_n<64|128|256>[_f32]_t``) and the two router classes -- or the weight gradient's
-    head/tail program, registered before the planner names it."""
+    """Every template this checkout registers is one the host plans: the transposed-store K1 programs
+    (``dense_proj_gemm_atomic_nn_n<64|128|256>[_f32]_t``), the two router classes and the weight gradient's
+    head/tail program."""
     wanted = {
         cake_backend.atomic_k1_template(bn, f32)
         for bn in cake_backend.K1_BLOCK_N_CHOICES
@@ -1220,7 +1565,7 @@ def test_registered_templates_are_the_ones_the_planners_name():
     } | {
         "router_fp32_gemm_atomic_kk",
         "router_fp32_gemm_atomic_nn_t",
-        "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+        "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX,
     }
     for table in cake_jit.KERNELS.values():
         assert set(table) <= wanted, sorted(set(table) - wanted)
@@ -1719,16 +2064,25 @@ def router_rule(monkeypatch):
         else:
             key = (arch, "nn_t", int(B.shape[1]), int(A.shape[0]))
         monkeypatch.setitem(cake_backend.ROUTER_RULES, key, spec)
+        # a forced verdict applies on this device whatever its SM count
+        sm_count = det_backend.device_facts(A.device).sm_count
+        monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
         cake_backend.clear_convenience_caches()
 
     yield force
     cake_backend.clear_convenience_caches()
 
 
-def _router_prepare(A, B, out, splits, arch):
+def _router_prepare(A, B, out, splits, arch, spec=None):
     _require_template(
         arch,
-        "router_fp32_gemm_atomic_" + ("nn_t" if A.stride(0) == 1 else "kk"),
+        "router_fp32_gemm_atomic_"
+        + ("nn_t" if A.stride(0) == 1 else "kk")
+        + (
+            cake_backend.ROUTER_HEAD_TAIL_SUFFIX
+            if cake_backend.router_head_tail(spec)
+            else ""
+        ),
     )
     prepared = cake_backend.prepare_router_fp32_gemm(
         A, B, out, splits=splits, deterministic=False
@@ -1743,7 +2097,14 @@ def _router_segment_reference(A, B, plan):
     order, and the bound of a reordering of that sum (``0`` for at most two partials: either order rounds alike)."""
     K = int(A.shape[1])
     partials = {}
-    per_tile = _segments(plan.m_pairs, plan.n_tiles, plan.k_iters, plan.units)
+    per_tile = _segments(
+        plan.m_pairs,
+        plan.n_tiles,
+        plan.k_iters,
+        plan.units,
+        plan.head_spans,
+        plan.head_steps,
+    )
     for k0, k1 in sorted({seg for segs in per_tile for seg in segs}):
         lo, hi = (
             k0 * cake_backend.ROUTER_BLOCK_K,
@@ -1779,6 +2140,10 @@ def _router_segment_reference(A, B, plan):
         ("fwd", 1, None),
         ("fwd", 2, None),
         ("wgrad", None, "pairs"),
+        ("wgrad", None, "H0.5x3"),
+        ("wgrad", None, "H0.5x4"),
+        ("wgrad", None, "H1x4p44"),
+        ("wgrad", None, "H1x6p44"),
         ("wgrad", 1, None),
         ("wgrad", 4, None),
         ("wgrad", 11, None),
@@ -1791,13 +2156,41 @@ def test_gpu_router_d11_gate(op, splits, spec, router_rule):
     of each segment: a whole tile is their bits, two partials their sum (either order rounds alike), more within the
     reordering bound of their K-order sum.  One unit per tile (``splits=1``) is the deterministic program's
     one-split result.  The profiler shows this package's program."""
+    _router_gate(op, splits, spec, router_rule, ROUTER_T, 6144, SEED + 20)
+
+
+@pytest.mark.parametrize("T", [1000, 16172, 16231, 16384])
+@pytest.mark.parametrize("spec", ["H1x4p44", "H1x5p44", "H1x4p80"])
+def test_gpu_router_head_units_at_hidden_4096(spec, T, router_rule):
+    """The head/tail partitions with fewer head units than CTA pairs (``"H<f>x<k>p<h>"``: the hidden 4096 verdicts of
+    ``sm_103a`` and ``sm_100a``; 80 head units are more than a 152-SM part's CTA pairs, so there the partition is
+    ``"H1x4"``'s) at hidden 4096, 256 experts, the measured token counts and a short one: the gate of
+    :func:`test_gpu_router_d11_gate`, on the partition :func:`cake_backend.router_partition_of` gives the device."""
+    plan = _router_gate("wgrad", None, spec, router_rule, T, 4096, SEED + 24)
+    sm_count = det_backend.device_facts(torch.device("cuda")).sm_count
+    m_pairs = plan.m_tiles // 2
+    partition = cake_backend.router_partition_of(
+        spec, m_pairs, plan.n_tiles, plan.k_iters, sm_count
+    )
+    assert (plan.units, plan.head_spans, plan.head_steps) == partition
+    if cake_backend.router_head_pairs(spec) >= sm_count // 2:
+        assert partition == cake_backend.router_partition_of(
+            spec.split("p")[0], m_pairs, plan.n_tiles, plan.k_iters, sm_count
+        )
+    else:
+        assert plan.head_spans == cake_backend.router_head_pairs(spec) // plan.n_tiles
+
+
+def _router_gate(op, splits, spec, router_rule, T, hidden, seed):
+    """:func:`test_gpu_router_d11_gate` on ``T`` tokens of hidden size ``hidden``; returns the launch's plan."""
     device, arch = _atomic_device_or_skip()
-    X, W, G = _router_inputs(ROUTER_T, device, SEED + 20)
+    X, W, G = _router_inputs(T, device, seed, K=hidden)
     A, B, out = _router_case(op, X, W, G)
     if spec is not None:
         router_rule(op, A, B, spec)
-    prepared = _router_prepare(A, B, out, splits, arch)
+    prepared = _router_prepare(A, B, out, splits, arch, spec)
     plan = prepared.plan
+    assert bool(plan.head_spans) == bool(cake_backend.router_head_tail(spec))
     if op == "fwd":
         assert plan.reproducible
     ref = A.double() @ B.double()
@@ -1825,6 +2218,7 @@ def test_gpu_router_d11_gate(op, splits, spec, router_rule):
         det_out = torch.empty_like(out)
         cake_backend.router_fp32_gemm(A, B, det_out, splits=1)
         assert torch.equal(out, det_out)
+    return plan
 
 
 def _top8_rows_differ(out, ref, tie_ulps=16):
@@ -1918,7 +2312,14 @@ def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
             continue
         assert spec is not None
         assert isinstance(prepared, cake_backend.PreparedAtomicRouterGemm)
-        assert prepared.plan.units == plan.units
+        assert (prepared.plan.template, prepared.plan.units) == (
+            plan.template,
+            plan.units,
+        )
+        assert (prepared.plan.head_spans, prepared.plan.head_steps) == (
+            plan.head_spans,
+            plan.head_steps,
+        )
         _assert_ran(prepared.launch, prepared.module_name)
         torch.cuda.synchronize()
         assert _rel_fro(out, A.double() @ B.double()) <= ROUTER_REL_FRO_MAX
@@ -1928,6 +2329,59 @@ def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
     )
     if not ran:
         pytest.skip(f"no verdict of {arch} applies on {sm_count} SMs")
+
+
+def test_gpu_router_token_windows_run_at_their_edges():
+    """Unforced (``deterministic=False``, no split count): at the first and the last token count of every token window
+    of a router weight-gradient row of this architecture (the smallest measured count, 64, for a window that starts
+    at one token) the prepared launch runs the partition the planner gives -- a head/tail window on the measured SM
+    count, a "waves" window where :func:`cake_backend.router_waves` gives a partition -- and meets the gate; one
+    token outside the window, or on another SM count, it runs the deterministic launch."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    measured = sm_count == cake_backend.ROUTER_SM_COUNT.get(arch)
+    atomic = cake_backend.PreparedAtomicRouterGemm
+    ran = 0
+    for (rule_arch, layout, hidden, _experts), rule in sorted(
+        cake_backend.ROUTER_RULES.items(), key=lambda kv: kv[0]
+    ):
+        if rule_arch != arch or layout != "nn_t" or not isinstance(rule, tuple):
+            continue
+        for first, last, spec in rule:
+            for T, inside in (
+                (first - 1, False),
+                (max(first, 64), True),
+                (last, True),
+                (last + 1, False),
+            ):
+                if T < 1:
+                    continue
+                X, W, G = _router_inputs(T, device, SEED + 92, K=hidden)
+                A, B, out = _router_case("wgrad", X, W, G)
+                part = cake_backend.router_partition(
+                    "nn_t", arch=arch, sm_count=sm_count, M=hidden, N=256, K=T
+                )
+                prepared = cake_backend.prepare_router_fp32_gemm(
+                    A, B, out, deterministic=False
+                )
+                if not inside:
+                    assert part is None, (hidden, T)
+                elif spec != "waves" and measured:
+                    assert part is not None, (hidden, T)
+                if part is None:
+                    assert not isinstance(prepared, atomic), (hidden, T)
+                    continue
+                assert isinstance(prepared, atomic), (hidden, T)
+                plan = prepared.plan
+                got = (plan.units, plan.head_spans, plan.head_steps)
+                assert got == part, (hidden, T)
+                _assert_ran(prepared.launch, prepared.module_name)
+                torch.cuda.synchronize()
+                assert _rel_fro(out, A.double() @ B.double()) <= ROUTER_REL_FRO_MAX
+                ran += 1
+    print(f"ROUTER_WINDOW_EDGES {arch} sm_count={sm_count}: {ran} launches ran")
+    if not ran:
+        pytest.skip(f"no router token window of {arch} applies on {sm_count} SMs")
 
 
 @pytest.mark.parametrize("op, splits", [("fwd", 2), ("wgrad", 4)])

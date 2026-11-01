@@ -33,7 +33,7 @@ deterministic already.*
 | K1 weight gradient (`projection_wgrad`, `nn` layouts) | the rows of `K1_SPLIT_RULES`: split-K over the ragged token count -- every split writes its FP32 partial tile to a workspace slot; the last split of a tile to arrive (a per-tile ticket counter) adds the other slots in arrival order and rounds once into `out`, then returns the counter to zero.  Every other row: deterministic program |
 | K2 forward (`router_forward`, `kk`) | deterministic program (its four splits) on every row; an explicit `splits` of 1 or 2 runs this package's stream-K program (at most two partials per element) |
 | K2 input gradient (`router_dgrad`, `kn`) | deterministic program (one split) |
-| K2 weight gradient (`router_wgrad`, `nn_t`) | the rows of `ROUTER_RULES` with a partition: stream-K over the K blocks -- whole tiles store the one-split result, tiles split between units TMA reduce-add into `out` (zeroed before the program, on the same stream).  Every other row: deterministic program (its six splits) |
+| K2 weight gradient (`router_wgrad`, `nn_t`) | the rows of `ROUTER_RULES` with a partition: stream-K over the K blocks, in spans alike or in long head spans and short tail spans (the head/tail program) -- whole tiles store the one-split result, tiles split between units TMA reduce-add into `out` (zeroed before the program, on the same stream).  Every other row: deterministic program (its six splits) |
 | BF16x3 split (`split_fp32_to_bf16x3_`) | the deterministic stage (exact) |
 
 *Table: the routing of `deterministic=False` (`cake_backend.ROUTES`).*
@@ -63,25 +63,25 @@ A planner decides, per row and device, whether `deterministic=False` runs this p
 parameters; a row it leaves runs the deterministic program (`plan_dense_projection_gemm` / `plan_router_fp32_gemm`
 say which).  Only measured rows carry a program: a row runs this package's program where that program was faster
 than the deterministic package's shipped plan of the row in every measurement run: a one-sided paired sign test
-(p < 0.05) with a median time ratio below 0.99, both in eager launches and in CUDA graph replays, at token counts
-16172 to 16384, and no more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another
-stream.  A `None` entry is a measured row that missed; a row without an entry was not measured.  Both run the
-deterministic program.
+(p < 0.05) with a median time ratio below 0.99, both in eager launches and in CUDA graph replays, and no more than
+3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream.  A `None` entry is a measured
+row that missed; a row without an entry was not measured.  Both run the deterministic program.
 
 | table | key | value |
 |---|---|---|
 | `K1_SPLIT_RULES` | `(arch, L, M, N, out_dtype)`: the transposed-store launch `out[l, n, m]` (`M` = the stored inner extent, `d_in` of a weight gradient; `N` = its rows, `d_out`), `out_dtype` `"bf16"` / `"f32"` | `(block_n, num_splits)` (this package's program) or `None` (the deterministic program) |
 | `K1_MIN_SM_COUNT` | `arch` | the fewest SMs for the K1 verdicts of the architecture (`sm_100a` / `sm_103a`: 148, `sm_107a`: 216) |
 | `K1_RULE_MIN_SM_COUNT` | a key of `K1_SPLIT_RULES` | the fewest SMs for that row's verdict where it is above `K1_MIN_SM_COUNT` (`sm_103a` `4096 -> 48`: 152) |
-| `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`) or `"nn_t"` (weight gradient, `hidden` = the launch's `M`), `experts` = the launch's `N` | a partition spec (`"waves"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"` or a unit count) or `None` (the deterministic program) |
+| `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`) or `"nn_t"` (weight gradient, `hidden` = the launch's `M`), `experts` = the launch's `N` | `None` (the deterministic program), token windows `((min_tokens, max_tokens, spec), ...)` (the spec of the window that holds the token count -- `K` of the weight gradient, `M` of the forward; every other token count: the deterministic program) or a spec alone (every token count: a plan a test or a measurement forces).  A spec is `"waves"`, `"H<f>x<k>"`, `"H<f>x<k>p<h>"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"` or a unit count |
+| `ROUTER_SM_COUNT` | `arch` | the SM count of the router verdicts of the architecture (`sm_100a` / `sm_103a`: 152, `sm_107a`: 216); a device with any other SM count runs the deterministic program, except in a `"waves"` window (the condition of `router_waves`) |
 
 *Table: the rule tables.*
 
 | architecture | K1 weight gradient `d_in -> d_out` (`block_n`, `num_splits`), BF16 and FP32 out unless marked | K2 forward | K2 weight gradient |
 |---|---|---|---|
-| `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | hidden 5120, 256 experts: `"waves"`; hidden 4096 / 6144: deterministic (6 splits) |
-| `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | hidden 5120, 256 experts: `"waves"`; hidden 4096 / 6144: deterministic (6 splits) |
-| `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1`; `5120 -> 1024` (256, 1) `p = 1`.  `4096 -> 64` BF16, `4096 -> 128`, `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed) | deterministic (4 splits) | deterministic (6 splits); hidden 5120 measured, missed (432 `"waves"` units lose next to a kernel holding 32 SMs) |
+| `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token windows of the last table: on 152 SMs hidden 5120 `"H0.5x3"`; hidden 5120 `"waves"` on every SM count where it applies.  Every other token count and SM count, and hidden 4096 and 6144: deterministic (6 splits) |
+| `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token windows of the last table: on 152 SMs hidden 5120 `"H0.5x3"`; hidden 5120 `"waves"` on every SM count where it applies.  Every other token count and SM count, hidden 4096 (`"H1x4p44"` up to 7.6 % slower when launched before a resident kernel) and hidden 6144: deterministic (6 splits) |
+| `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1`; `5120 -> 1024` (256, 1) `p = 1`.  `4096 -> 64` BF16, `4096 -> 128`, `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed) | deterministic (4 splits) | deterministic (6 splits); hidden 4096 measured, missed (`"H0.5x4"` loses next to a kernel holding 16 SMs that starts during it); hidden 6144: `"H0.5x4"` leaves the backward pass no faster |
 
 *Table: the rows that run this package's programs.  `4096 -> 128` misses on `sm_100a` / `sm_103a` next to a kernel
 holding 32 SMs (its 128 CTAs no longer fit the free SMs) and on `sm_107a` at 16384 tokens; on `sm_107a`,
@@ -94,8 +94,41 @@ token counts run the deterministic program).*
 `"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
 units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six
 splits fill their last wave below 80 % (`w / ceil(w)`, `w = 6 * tiles / pairs`); otherwise the row runs the
-deterministic program.  At hidden 5120 and 16k tokens that is 380 units on 152 SMs; on 148 SMs the deterministic
-plan's last wave is 81 % full and the row runs the deterministic program.
+deterministic program.  At hidden 5120 on 152 SMs that is 80 units at 64 tokens (at most one unit per (tile,
+K block) step) and 380 units at 16k tokens; on 148 SMs the deterministic plan's last wave is 81 % full and the row
+runs the deterministic program.
+
+`"H<f>x<k>"` (`router_partition_of`, the weight gradient only) runs the head/tail program
+`router_fp32_gemm_atomic_nn_t_ht_c3_nreg`: one head unit per CTA pair, whose spans share about the fraction `f` of
+the (row-tile pair, K block) steps, then `k` tail units per CTA pair over the rest (each count a multiple of the
+column tile count).  Every pair starts a long head span at once; the short tail spans go to the pairs that finish
+first, so a kernel holding SMs on another stream delays a short span rather than a long one.  At 152 SMs `"H0.5x3"`
+is 76 head and 228 tail units, at 216 SMs `"H0.5x4"` 108 head and 432 tail units; a token count too short for one
+step per span runs the deterministic program.
+`"H<f>x<k>p<h>"` starts only `h` head units (at most one per CTA pair), each about `f` of a pair's even share of the
+steps; the other pairs start on the tail spans, so a kernel holding the SMs of up to `pairs - h` CTA pairs delays no
+head span.  At 152 SMs `"H1x5p44"` is 44 head and 380 tail units.
+
+| row of `ROUTER_RULES` (weight gradient, 256 experts) | token window | measured at (tokens) | part | time / deterministic plan, alone | worst next to a resident kernel: same launch order / router launched first |
+|---|---|---|---|---|---|
+| `sm_100a` hidden 5120 `"waves"` | 1 to 128 | 64, 128 | GB200, 152 SMs | x0.691-0.884 | x0.864 / x0.846 |
+| `sm_100a` hidden 5120 `"H0.5x3"` | 10240 to 32768 | 10240, 12288, 16172, 16231, 16384, 32768 | GB200, 152 SMs | x0.750-0.883 | x1.003 / x1.011 |
+| `sm_103a` hidden 5120 `"waves"` | 1 to 192 | 64, 128, 192 | GB300, 152 SMs | x0.706-0.919 | x1.005 / x0.917 |
+| `sm_103a` hidden 5120 `"H0.5x3"` | 16172 to 32768 | 16172, 16231, 16384, 32768 | GB300, 152 SMs | x0.820-0.875 | x0.984 / x1.020 |
+
+*Table: the token windows of the router weight gradient (eager launches and CUDA graph replays, one long-lived process
+and a fresh process per token count; the resident kernel holds 8, 16 or 32 SMs).  The `"waves"` rows are the FI-main
+`"waves"` plan (same kernel text, measured on this package's host path).  On GB200 the hidden 5120 rows from 10240
+tokens up ran at the GPU's software power cap: after each of their 12 runs `nvidia-smi` read `clocks_throttle_reasons`
+0x4, at SM clocks of 1380-1912 MHz (2062 MHz maximum); the arms of each row were measured interleaved, in paired groups.
+Inside the `"H0.5x3"` windows cuBLAS FP32 in `CUBLAS_FP32_EMULATED_BF16X9_MATH` (the benchmark's `bf16x9` arm) took
+x1.516-1.594 (GB200) and x1.534-1.610 (GB300) of the partition's time.  The head/tail windows hold only on the SM count
+of their part (`ROUTER_SM_COUNT`), the `"waves"` windows on every SM count where `"waves"` applies (`router_waves`);
+every other token count and SM count runs the deterministic plan.  Hidden 5120 on `sm_100a` / `sm_103a` ran `"waves"` at
+every token count before these windows: below 64 tokens the `"waves"` windows keep it without a measurement; between the
+two windows and above 32768 tokens the row now runs the deterministic plan -- there `"waves"` was more than 3 % slower
+than that plan next to a resident kernel at every measured token count from 224 to 10240 (x1.046-1.156 on GB200 at 224
+to 12288 tokens, x1.059-1.167 on GB300 at 224 to 10240 tokens), and above 32768 tokens nothing was measured.*
 
 `prepare_*` and `plan_*` take `splits` (and, for K1, `block_n`) to force a plan, for tests and measurements; the K2
 forward takes at most two splits.  `benchmarks/bench_cake_dense_projection_gemm.py` prints, per row, the
@@ -139,7 +172,7 @@ left it as an alias of the renamed modules.  The names keep their spelling and, 
 | `GemmPlan`, `PreparedGemm` | `DetGemmPlan`, `PreparedDetGemm` | read through; `deterministic=False` plans `AtomicGemmPlan`, `PreparedAtomicGemm` |
 | `RouterPlan`, `PreparedRouterGemm` | `RouterDetPlan`, `PreparedRouterDetGemm` | read through; `deterministic=False` plans `AtomicRouterPlan`, `PreparedAtomicRouterGemm` |
 | every other module name (`ROW_RULES`, `stream_k_plan`, `wgrad_views`, ...) | the same name | read through to the deterministic package |
-| program templates `dense_proj_gemm_*`, `router_fp32_gemm_<layout>`, `split_fp32_bf16x3` | `dense_proj_det_gemm_*`, `router_fp32_det_gemm_<layout>`, `split_fp32_det_bf16x3` | this package's templates are new: `dense_proj_gemm_atomic_nn_n<64\|128\|256>[_f32]_t`, `router_fp32_gemm_atomic_{kk,nn_t}` |
+| program templates `dense_proj_gemm_*`, `router_fp32_gemm_<layout>`, `split_fp32_bf16x3` | `dense_proj_det_gemm_*`, `router_fp32_det_gemm_<layout>`, `split_fp32_det_bf16x3` | this package's templates are new: `dense_proj_gemm_atomic_nn_n<64\|128\|256>[_f32]_t`, `router_fp32_gemm_atomic_{kk,nn_t,nn_t_ht_c3_nreg}` |
 
 *Table: the names before #8046, their deterministic names, and what this path offers
 (`cake_backend.DETERMINISTIC_NAMES`).*

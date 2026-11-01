@@ -41,10 +41,11 @@ Every entry point takes the keyword-only argument ``deterministic: bool = True``
     runs the deterministic program).  Two splits add ``own + other``, one add of two values, so a two-split row
     repeats bit for bit; three or more add in the order the splits finish;
   - the K2 weight gradient (and a forward given an explicit split count): a stream-K partition of the (tile, K
-    block) steps into ``units`` spans (:func:`router_units` reads the measured verdicts of :data:`ROUTER_RULES`;
-    every other row runs the deterministic program); a segment that covers its tile's whole K range stores the
-    deterministic program's one-split bits, any other adds its partial into ``out`` with a TMA reduce-add (``out``
-    is zeroed on the launch's stream first).  A forward partition gives every element at most two partials,
+    block) steps into ``units`` spans, alike or a head/tail partition of long head spans and short tail spans
+    (:func:`router_partition` reads the measured verdicts and token windows of :data:`ROUTER_RULES`; every other row
+    and token count runs the deterministic program); a segment that covers its tile's whole K range stores the
+    deterministic program's one-split bits, any other adds its partial into ``out`` with a TMA reduce-add (``out`` is
+    zeroed on the launch's stream first).  A forward partition gives every element at most two partials,
     ``0 + a + b == 0 + b + a``, so a forward recomputed under activation checkpointing gives the same logits and the
     same top-k.
 
@@ -184,7 +185,7 @@ def _resolve_deterministic(deterministic: bool, api: str) -> bool:
 
 #: The program family each operation runs with ``deterministic=False``: ``"atomic"`` -- this package's planner and
 #: programs (the planner keeps every row without a measured verdict on the deterministic program, see
-#: :func:`k1_plan` / :func:`router_units`) -- or ``"det"`` -- the deterministic package's programs in both modes.  K1
+#: :func:`k1_plan` / :func:`router_partition`) -- or ``"det"`` -- the deterministic package's programs in both modes.  K1
 #: operations are keyed by the operand layouts of the launched GEMM (``kk`` forward, ``kn`` input gradient, ``nn``
 #: weight gradient; ``nk`` has no training use), K2 by the layout class of ``router_layout_class``.
 ROUTES: dict[str, str] = {
@@ -598,30 +599,67 @@ def _k1_values(
 # K2 planner: the stream-K partition and the measured verdicts
 # ---------------------------------------------------------------------------
 
-#: Per-row verdicts of the router, ``(arch, layout, hidden, experts) -> spec``: ``layout`` ``"kk"`` (the forward,
+#: Per-row verdicts of the router, ``(arch, layout, hidden, experts) -> rule``: ``layout`` ``"kk"`` (the forward,
 #: ``hidden = K``) or ``"nn_t"`` (the swapped weight gradient, ``hidden`` = the launch's ``M``), ``experts`` = the
-#: launch's ``N``.  A partition spec -- ``"waves"`` (:func:`router_waves`) or one of :func:`router_units_of`
-#: (``"forward"``, ``"pairs"``, ``"tiles"``, ``"S<n>"`` or a unit count) -- runs this package's program; ``None`` runs
-#: the deterministic program (its production split count).  A row carries a spec only where that partition was
-#: measured faster than the deterministic package's shipped plan: a one-sided paired sign test (p < 0.05) with a
-#: median time ratio below 0.99, in eager launches and in CUDA graph replays, at token counts 16172 and 16231, and no
-#: more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream.  A ``None`` entry
-#: is a measured row that missed; a row without an entry was not measured.  Both run the deterministic program.
+#: launch's ``N``.  A partition spec -- ``"waves"`` (:func:`router_waves`), a head/tail spec ``"H<f>x<k>"`` or
+#: ``"H<f>x<k>p<h>"`` (the weight gradient's head/tail program, :func:`router_partition_of`) or one of
+#: :func:`router_units_of` (``"forward"``,
+#: ``"pairs"``, ``"tiles"``, ``"S<n>"`` or a unit count) -- runs this package's program; ``None`` runs the
+#: deterministic program (its production split count).  A rule is ``None``, token windows ``((min_tokens,
+#: max_tokens, spec), ...)`` -- the spec of the window that holds the launch's token count (``K`` of the weight
+#: gradient, ``M`` of the forward); every other token count runs the deterministic program -- or a spec alone, at
+#: every token count (the plan a test or a measurement forces; no row ships one).  A window carries a spec only where
+#: that partition was faster than the deterministic package's shipped plan in every measurement run at the token
+#: counts measured in it (one long-lived process and a fresh process per token count): a one-sided paired sign test
+#: (p < 0.05) with a median time ratio below 0.99, in eager launches and in CUDA graph replays, and no more than 3 %
+#: slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream -- in the same launch order, and
+#: also with this partition launched before that kernel against the deterministic plan launched after it.  A window
+#: ends at a measured token count; one that starts at a single token keeps the plan below its smallest measured count
+#: (64 tokens) unmeasured.  A token count outside the windows was not measured or missed, a ``None`` entry is a
+#: measured row that missed, a row without an entry was not measured: all of them run the deterministic program, and
+#: so does every window but a ``"waves"`` one on a device whose SM count is not the measured one,
+#: :data:`ROUTER_SM_COUNT`.
 # fmt: off
-ROUTER_RULES: dict[tuple[str, str, int, int], Optional[Union[str, int]]] = {
+ROUTER_RULES: dict[
+    tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]
+] = {
     # the forward: no partition replay-safe under recompute (at most two partials per element) holds its margin next
     # to a resident kernel; the deterministic plan (four splits) on every architecture
     ("sm_100a", "kk", 4096, 256): None, ("sm_100a", "kk", 5120, 256): None, ("sm_100a", "kk", 6144, 256): None,
     ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
     ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
-    # the weight gradient: the "waves" partition where the deterministic plan's last wave is sparse (hidden 5120 on
-    # sm_100a / sm_103a); hidden 4096 and 6144 keep the deterministic plan (fuller waves: the margin does not survive a
-    # resident kernel); on sm_107a hidden 5120 loses next to a kernel holding 32 SMs at 16172 tokens (CUDA graphs)
-    ("sm_100a", "nn_t", 4096, 256): None, ("sm_100a", "nn_t", 5120, 256): "waves", ("sm_100a", "nn_t", 6144, 256): None,
-    ("sm_103a", "nn_t", 4096, 256): None, ("sm_103a", "nn_t", 5120, 256): "waves", ("sm_103a", "nn_t", 6144, 256): None,
+    # the weight gradient, measured on 152-SM GB200 (sm_100a) / GB300 (sm_103a) and 216-SM R200 (sm_107a) parts.
+    # Hidden 5120: "waves" at few tokens (faster than the deterministic plan at 64 and 128 tokens, and on sm_103a at
+    # 192; more than 3 % slower than it next to a resident kernel at every measured count from 224 to 10240 tokens),
+    # then the head/tail program with one head unit per CTA pair over half of the steps and three tail units per pair
+    # ("H0.5x3", 76 head and 228 tail units on 152 SMs; windows measured at 10240 and 12288 (sm_100a), 16172, 16231,
+    # 16384 and 32768 tokens; more than 3 % slower next to a resident kernel at 8192 tokens on sm_100a, at 10240 and
+    # 12288 on sm_103a).
+    # Hidden 4096 on sm_103a keeps the deterministic plan: "H1x4p44" (four tail units) was up to 7.6 % slower than
+    # that plan at 16172 to 16384 tokens when launched before a kernel holding SMs on another stream.  Hidden 6144
+    # keeps the deterministic plan: on sm_100a no partition was faster in every run in CUDA graphs; on sm_103a the
+    # closest one ("H1x5p44", x0.973-0.983 alone) left the backward pass (input and weight gradient) no faster.
+    # sm_107a keeps the deterministic plan: at hidden 4096 "H0.5x4" was up to 7 % slower than that plan when a kernel
+    # holding 16 SMs on another stream started during it (the kernel takes SMs the head spans wait for), at hidden
+    # 6144 it left the backward pass no faster, and at hidden 5120 it was measured on one part only
+    ("sm_100a", "nn_t", 4096, 256): None,
+    ("sm_100a", "nn_t", 5120, 256): ((1, 128, "waves"), (10240, 32768, "H0.5x3")),
+    ("sm_100a", "nn_t", 6144, 256): None,
+    ("sm_103a", "nn_t", 4096, 256): None,
+    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
+    ("sm_103a", "nn_t", 6144, 256): None,
     ("sm_107a", "nn_t", 4096, 256): None, ("sm_107a", "nn_t", 5120, 256): None, ("sm_107a", "nn_t", 6144, 256): None,
 }
 # fmt: on
+#: The SM count the verdicts of :data:`ROUTER_RULES` were measured on, per architecture (152-SM GB200 / GB300, 216-SM
+#: R200): on a device with any other SM count a router row runs the deterministic program, except in a ``"waves"``
+#: window, which keeps the condition of :func:`router_waves` on every SM count (the plan of these rows before the
+#: windows).  An explicit ``splits`` is not affected.
+ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 216}
+#: The template suffix of the weight gradient's head/tail program (``router_fp32_gemm_atomic_nn_t`` + suffix): the
+#: head/tail partition on three TMEM chunk buffers, with register reallocation between its warpgroups.
+ROUTER_HEAD_TAIL_SUFFIX = "_ht_c3_nreg"
+_ROUTER_HEAD_TAIL_SPEC = re.compile(r"H(\d+(?:\.\d+)?)x(\d+)(?:p(\d+))?")
 #: The forward's largest explicit split count: an element of the forward takes at most two partials, so a forward
 #: recomputed under activation checkpointing repeats bit for bit (``0 + a + b == 0 + b + a``).
 ROUTER_FORWARD_MAX_SPLITS = 2
@@ -656,7 +694,10 @@ def router_units_of(
     """The unit count of a partition spec on a device of ``sm_count`` SMs (CTA pairs ``sm_count // 2``): ``"tiles"``
     (one unit per tile), ``"pairs"`` (one per CTA pair), ``"forward"`` (one per CTA pair, at most one per tile),
     ``"S<n>"`` (``n`` units per tile) or a count, rounded down to a multiple of the column tile count (the units of a
-    span run its column tiles), at least ``n_tiles`` and at most one unit per (tile, K block) step."""
+    span run its column tiles), at least ``n_tiles`` and at most one unit per (tile, K block) step; a head/tail spec
+    ``"H<f>x<k>"`` / ``"H<f>x<k>p<h>"``: the units of :func:`router_partition_of`."""
+    if router_head_tail(spec) is not None:
+        return router_partition_of(spec, m_pairs, n_tiles, k_iters, sm_count)[0]
     tiles, pairs = m_pairs * n_tiles, int(sm_count) // 2
     if isinstance(spec, int):
         count = spec
@@ -673,11 +714,103 @@ def router_units_of(
     return max(n_tiles, min(count, tiles * k_iters) // n_tiles * n_tiles)
 
 
-def router_has_part_tiles(m_pairs: int, n_tiles: int, k_iters: int, units: int) -> bool:
+def router_head_tail(spec: Union[str, int, None]) -> Optional[tuple[float, int]]:
+    """``(f, k)`` of a head/tail partition spec ``"H<f>x<k>"`` or ``"H<f>x<k>p<h>"``, else ``None``."""
+    if isinstance(spec, str):
+        match = _ROUTER_HEAD_TAIL_SPEC.fullmatch(spec)
+        if match:
+            return float(match.group(1)), int(match.group(2))
+    return None
+
+
+def router_head_pairs(spec: Union[str, int, None]) -> Optional[int]:
+    """``h`` of a head/tail partition spec ``"H<f>x<k>p<h>"`` (the head units), else ``None`` (one head unit per CTA
+    pair)."""
+    if isinstance(spec, str):
+        match = _ROUTER_HEAD_TAIL_SPEC.fullmatch(spec)
+        if match and match.group(3) is not None:
+            return int(match.group(3))
+    return None
+
+
+def router_partition_of(
+    spec: Union[str, int], m_pairs: int, n_tiles: int, k_iters: int, sm_count: int
+) -> tuple[int, int, int]:
+    """``(units, head_spans, head_steps)`` of a partition spec on a device of ``sm_count`` SMs (CTA pairs
+    ``sm_count // 2``).  A head/tail spec ``"H<f>x<k>"``: one head unit per CTA pair, then ``k`` tail units per CTA
+    pair (each count rounded down to a multiple of the column tile count, at least ``n_tiles``); the ``head_spans``
+    head spans share the first ``head_steps`` of the ``m_pairs * k_iters`` (row-tile pair, K block) steps, about the
+    fraction ``f`` (at least one step per head span, at least one per tail span left), the tail spans the rest.  Every
+    pair starts a long head span at once and the short tail spans go to the pairs that finish first, so a kernel
+    holding SMs on another stream delays a short span, not a long one.  ``"H<f>x<k>p<h>"``: ``h`` head units instead
+    (at most one per CTA pair, rounded down to a multiple of the column tile count, at least ``n_tiles``), each span
+    about ``f`` of a pair's even share of the steps (the heads share about ``f * h / pairs`` of them); the other pairs
+    start on the tail spans, so a kernel holding the SMs of up to ``pairs - h`` CTA pairs on another stream delays no
+    head span.  Any other spec: :func:`router_units_of`'s units with every span alike (``head_spans = head_steps =
+    0``)."""
+    head_tail = router_head_tail(spec)
+    if head_tail is None:
+        return router_units_of(spec, m_pairs, n_tiles, k_iters, sm_count), 0, 0
+    fraction, per_pair = head_tail
+    pairs, steps = int(sm_count) // 2, m_pairs * k_iters
+    all_pairs = max(n_tiles, pairs // n_tiles * n_tiles)
+    head_pairs = router_head_pairs(spec)
+    if head_pairs is None:
+        head_units, head_share = all_pairs, round(fraction * steps)
+    else:
+        head_units = max(n_tiles, min(head_pairs, pairs) // n_tiles * n_tiles)
+        head_share = round(fraction * steps * head_units / all_pairs)
+    units = head_units + max(n_tiles, per_pair * pairs // n_tiles * n_tiles)
+    head_spans, spans = head_units // n_tiles, units // n_tiles
+    head_steps = min(max(head_share, head_spans), steps - (spans - head_spans))
+    return units, head_spans, head_steps
+
+
+def router_partition_fits(
+    m_pairs: int,
+    n_tiles: int,
+    k_iters: int,
+    units: int,
+    head_spans: int,
+    head_steps: int,
+) -> bool:
+    """Whether the program can run a partition: at most one unit per (tile, K block) step and, for a head/tail
+    partition, at least one step per span."""
+    steps, spans = m_pairs * k_iters, units // n_tiles
+    if units > m_pairs * n_tiles * k_iters:
+        return False
+    return head_spans == 0 or (
+        head_spans <= head_steps and steps - head_steps >= spans - head_spans
+    )
+
+
+def _router_span_first(
+    span: int, steps: int, spans: int, head_spans: int, head_steps: int
+) -> int:
+    """The first (row-tile pair, K block) step of span ``span``: the head spans share the first ``head_steps`` steps
+    evenly, the others the rest (every span alike when ``head_spans`` is 0), as the program cuts them."""
+    if span < head_spans:
+        return span * head_steps // head_spans
+    return head_steps + (span - head_spans) * (steps - head_steps) // (
+        spans - head_spans
+    )
+
+
+def router_has_part_tiles(
+    m_pairs: int,
+    n_tiles: int,
+    k_iters: int,
+    units: int,
+    head_spans: int = 0,
+    head_steps: int = 0,
+) -> bool:
     """Whether a launch adds into ``out`` anywhere (then ``out`` is zeroed before the program): some span of the
     partition starts inside a row-tile pair."""
     steps, spans = m_pairs * k_iters, units // n_tiles
-    return any(span * steps // spans % k_iters for span in range(1, spans))
+    return any(
+        _router_span_first(span, steps, spans, head_spans, head_steps) % k_iters
+        for span in range(1, spans)
+    )
 
 
 def router_at_most_two_partials(m_pairs: int, n_tiles: int, units: int) -> bool:
@@ -695,7 +828,7 @@ def _router_grid(M: int, N: int, K: int) -> tuple[int, int, int]:
     return m_tiles, _ceil_div(N, ROUTER_BLOCK_N), _ceil_div(K, ROUTER_BLOCK_K)
 
 
-def router_units(
+def router_partition(
     layout: str,
     *,
     arch: str,
@@ -704,19 +837,24 @@ def router_units(
     K: int,
     sm_count: int,
     splits: Optional[int] = None,
-) -> Optional[int]:
-    """Unit count of this package's K2 launch of the layout class ``layout`` (``kk``, ``kn``, ``nn_t``) for
-    ``[M, N] = [M, K] @ [K, N]`` (the launched, possibly swapped GEMM) on a device of ``sm_count`` SMs, or ``None``:
-    the launch runs the deterministic program.
+) -> Optional[tuple[int, int, int]]:
+    """``(units, head_spans, head_steps)`` of this package's K2 launch of the layout class ``layout`` (``kk``,
+    ``kn``, ``nn_t``) for ``[M, N] = [M, K] @ [K, N]`` (the launched, possibly swapped GEMM) on a device of
+    ``sm_count`` SMs (:func:`router_partition_of`; ``head_spans`` 0: every span alike), or ``None``: the launch runs
+    the deterministic program.
 
     * ``kn`` (input gradient): ``None``.
     * a caller's ``splits``: ``splits`` units per tile (``1``: every tile stored whole, the deterministic program's
       one-split bits -- the control of a measurement); the forward takes at most
       :data:`ROUTER_FORWARD_MAX_SPLITS`.
-    * otherwise the row's verdict in :data:`ROUTER_RULES`; a row without one runs the deterministic program.
+    * otherwise the row's verdict in :data:`ROUTER_RULES`: the spec of its token window that holds the launch's token
+      count (``K`` of the weight gradient, ``M`` of the forward), on a device of :data:`ROUTER_SM_COUNT` SMs (a
+      ``"waves"`` window on every device where :func:`router_waves` gives a partition); a row, token count or SM
+      count without one, or a head/tail partition the token count cannot hold (:func:`router_partition_fits`), runs
+      the deterministic program.
 
-    A forward partition must give every element at most two partials (:func:`router_at_most_two_partials`):
-    ``ValueError`` otherwise."""
+    A forward partition must give every element at most two partials (:func:`router_at_most_two_partials`) and
+    cannot be a head/tail partition: ``ValueError`` otherwise."""
     if layout not in ("kk", "nn_t"):
         return None
     m_tiles, n_tiles, k_iters = _router_grid(M, N, K)
@@ -736,26 +874,63 @@ def router_units(
             )
         spec = f"S{s}"
     else:
-        hidden = K if layout == "kk" else M
-        spec = ROUTER_RULES.get((arch, layout, int(hidden), int(N)))
-        if spec == "waves":
+        hidden, tokens = (K, M) if layout == "kk" else (M, K)
+        rule = ROUTER_RULES.get((arch, layout, int(hidden), int(N)))
+        if isinstance(rule, tuple):  # token windows (min_tokens, max_tokens, spec)
+            spec = next((s for lo, hi, s in rule if lo <= int(tokens) <= hi), None)
+        else:
+            spec = rule
+        if spec == "waves":  # its own SM-count condition, on every SM count
             spec = router_waves(m_pairs, n_tiles, k_iters, sm_count)
+        elif int(sm_count) != ROUTER_SM_COUNT.get(arch):
+            return None
         if spec is None:
             return None
-    units = router_units_of(spec, m_pairs, n_tiles, k_iters, sm_count)
+    if layout == "kk" and router_head_tail(spec) is not None:
+        raise ValueError(
+            f"router_fp32_gemm(deterministic=False): the head/tail partition {spec!r} is the weight gradient's; "
+            "the forward takes at most two partials per element"
+        )
+    units, head_spans, head_steps = router_partition_of(
+        spec, m_pairs, n_tiles, k_iters, sm_count
+    )
     if layout == "kk" and not router_at_most_two_partials(m_pairs, n_tiles, units):
         raise ValueError(
             f"router_fp32_gemm(deterministic=False): the forward partition {spec!r} ({units} units over "
             f"{m_pairs * n_tiles} tiles) gives an element more than two partials"
         )
-    return units
+    if not router_partition_fits(
+        m_pairs, n_tiles, k_iters, units, head_spans, head_steps
+    ):
+        return None
+    return units, head_spans, head_steps
+
+
+def router_units(
+    layout: str,
+    *,
+    arch: str,
+    M: int,
+    N: int,
+    K: int,
+    sm_count: int,
+    splits: Optional[int] = None,
+) -> Optional[int]:
+    """The unit count of :func:`router_partition` (same arguments), or ``None``: the launch runs the deterministic
+    program."""
+    partition = router_partition(
+        layout, arch=arch, M=M, N=N, K=K, sm_count=sm_count, splits=splits
+    )
+    return None if partition is None else partition[0]
 
 
 @dataclass(frozen=True)
 class AtomicRouterPlan:
     """The host plan of one K2 launch of this package (the launched, possibly swapped GEMM ``[M, N] = [M, K] @
     [K, N]``): ``m_tiles / 2 x n_tiles`` tiles of ``256 x 128``, their ``k_iters`` K blocks cut into ``units``
-    stream-K spans (``2 * units`` CTAs); with part tiles the launch zeroes ``out`` before the program."""
+    stream-K spans (``2 * units`` CTAs; the first ``head_spans`` spans share the first ``head_steps`` steps on the
+    head/tail program, every span alike when ``head_spans`` is 0); with part tiles the launch zeroes ``out`` before
+    the program."""
 
     M: int
     N: int
@@ -769,6 +944,8 @@ class AtomicRouterPlan:
     k_iters: int
     units: int
     template: str
+    head_spans: int = 0
+    head_steps: int = 0
 
     @property
     def m_pairs(self) -> int:
@@ -787,7 +964,12 @@ class AtomicRouterPlan:
         """Whether some segment adds into ``out`` (the launch zeroes ``out`` before its program runs); computed once
         per plan."""
         return router_has_part_tiles(
-            self.m_pairs, self.n_tiles, self.k_iters, self.units
+            self.m_pairs,
+            self.n_tiles,
+            self.k_iters,
+            self.units,
+            self.head_spans,
+            self.head_steps,
         )
 
     @property
@@ -826,8 +1008,9 @@ def plan_atomic_router(
     the launch runs the deterministic program, and ``reason`` says why -- another layout class, a view the reduce-add
     program cannot address (an ``out`` off a 16-byte boundary or with a row stride not a multiple of 4 elements runs
     the deterministic path, which serves or refuses it as that package does), a template this checkout does not
-    register for ``arch``, or the planner (:func:`router_units`).  An explicit ``splits`` (``1`` included) runs
-    this package's program when the view and the registry allow it."""
+    register for ``arch``, or the planner (:func:`router_partition`).  An explicit ``splits`` (``1`` included) runs
+    this package's program when the view and the registry allow it; a head/tail partition runs the head/tail program
+    (``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`)."""
     if (
         A.dtype != torch.float32
         or B.dtype != torch.float32
@@ -874,11 +1057,16 @@ def plan_atomic_router(
     template = cake_jit.TEMPLATE_PREFIXES[1] + ("nn_t" if swapped else "kk")
     if template not in cake_jit.KERNELS.get(arch, {}):
         return None, f"{template} is not registered for {arch}"
-    units = router_units(
+    partition = router_partition(
         layout, arch=arch, M=M_eff, N=N_eff, K=K, sm_count=sm_count, splits=splits
     )
-    if units is None:
+    if partition is None:
         return None, "the planner keeps the row on the deterministic program"
+    units, head_spans, head_steps = partition
+    if head_spans:
+        template += ROUTER_HEAD_TAIL_SUFFIX
+        if template not in cake_jit.KERNELS.get(arch, {}):
+            return None, f"{template} is not registered for {arch}"
     m_tiles, n_tiles, k_iters = _router_grid(M_eff, N_eff, K)
     plan = AtomicRouterPlan(
         M=M_eff,
@@ -893,6 +1081,8 @@ def plan_atomic_router(
         k_iters=k_iters,
         units=units,
         template=template,
+        head_spans=head_spans,
+        head_steps=head_steps,
     )
     return plan, ""
 
@@ -916,7 +1106,8 @@ def _k2_values(
     plan: AtomicRouterPlan, *, A: Any, parts: Any, out: torch.Tensor
 ) -> dict[str, Any]:
     """The keyword arguments of a K2 launch of this package (ordered by the program's argument plan): ``out`` is
-    passed twice, as the store pointer and as the reduce-add map ``D``."""
+    passed twice, as the store pointer and as the reduce-add map ``D``; ``head_spans`` / ``head_steps`` are read by the
+    head/tail program only."""
     return dict(
         A=A,
         B=parts,
@@ -929,6 +1120,8 @@ def _k2_values(
         k_iters=plan.k_iters,
         ldo=int(out.stride(0)),
         units=plan.units,
+        head_spans=plan.head_spans,
+        head_steps=plan.head_steps,
     )
 
 
@@ -2005,8 +2198,8 @@ def router_wgrad(
 ) -> torch.Tensor:
     """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store;
     ``splits`` defaults to the deterministic package's production count (6), or with ``deterministic=False`` to the
-    partition of the row's verdict in :data:`ROUTER_RULES` (:func:`router_units`; a row without one runs the
-    deterministic program)."""
+    partition of the row's verdict in :data:`ROUTER_RULES` (:func:`router_partition`; a row or token count without
+    one runs the deterministic program)."""
     if _resolve_deterministic(deterministic, "router_wgrad"):
         return _det_entry("router_wgrad")(G, X, out, **_splits_kw(splits))
     if out is None:
