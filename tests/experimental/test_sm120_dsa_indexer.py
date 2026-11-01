@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Correctness tests of the experimental SM120 DSA indexer top-k backend
-# (dsa_indexer_topk(..., backend="sm120")), ragged (prefill) and paged
+# (dsa_indexer_det_topk(..., backend="sm120")), ragged (prefill) and paged
 # (decode) forms, FP8 and MXFP4.
 #
 # The inputs are small integers and powers of two, so every product and sum
@@ -27,7 +27,7 @@ import pytest
 import torch
 
 from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.dsa_indexer import dsa_indexer_topk
+from flashinfer.dsa_indexer import dsa_indexer_det_topk
 from flashinfer.experimental import sm120_dsa_indexer as sm120
 from flashinfer.utils import get_compute_capability
 
@@ -189,7 +189,7 @@ def test_ragged(fp4, heads, top_k, seg_q, seg_k, offsets, ratio, zero_frac):
         if offsets is None
         else torch.tensor(offsets, dtype=torch.int64, device=dev)
     )
-    idx, sc = dsa_indexer_topk(
+    idx, sc = dsa_indexer_det_topk(
         q.data,
         k.data,
         w,
@@ -239,7 +239,7 @@ def test_ragged_indices_only(fp4, heads, top_k, seg_q, seg_k):
     cu_k = torch.tensor([0, *torch.tensor(seg_k).cumsum(0).tolist()], dtype=torch.int32)
 
     def run(**kw):
-        return dsa_indexer_topk(
+        return dsa_indexer_det_topk(
             q.data,
             k.data,
             w,
@@ -285,7 +285,7 @@ def test_ragged_cuda_graph(fp4, heads, top_k, monkeypatch):
         cu_k.copy_(torch.tensor([0, *torch.tensor(seg_k).cumsum(0).tolist()]))
 
     def run():
-        dsa_indexer_topk(
+        dsa_indexer_det_topk(
             q.data,
             k.data,
             w,
@@ -349,7 +349,7 @@ def test_ragged_scratch_bound():
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    dsa_indexer_topk(
+    dsa_indexer_det_topk(
         q,
         k,
         w,
@@ -383,7 +383,7 @@ def _ragged_call(fp4, heads, top_k, seg_q, seg_k, seed, **kw):
         )
         for x in (seg_q, seg_k)
     ]
-    idx, sc = dsa_indexer_topk(
+    idx, sc = dsa_indexer_det_topk(
         q.data,
         k.data,
         w,
@@ -438,7 +438,7 @@ def test_ragged_validation():
         args = dict(top_k=16, backend="sm120", k_scale=ks)
         args.update(kw)
         cq = args.pop("cu_q", cu_q)
-        return dsa_indexer_topk(args.pop("q", q), k, w, cq, cu_k, **args)
+        return dsa_indexer_det_topk(args.pop("q", q), k, w, cq, cu_k, **args)
 
     with pytest.raises(ValueError, match="top_k"):
         call(top_k=0)
@@ -504,7 +504,7 @@ def _decode_inputs(fp4, B, next_n, heads, lens, gen, dev):
 
 
 def _run_decode(q, w, ctx, paged, top_k, **kw):
-    return dsa_indexer_topk(
+    return dsa_indexer_det_topk(
         q.data,
         paged.cache,
         w,
@@ -764,7 +764,7 @@ def test_paged_validation():
     with pytest.raises(ValueError, match="next_n"):
         _run_decode(q, w, ctx, paged, 512)
     with pytest.raises(ValueError, match="block_table and context_lens"):
-        dsa_indexer_topk(
+        dsa_indexer_det_topk(
             q.data, paged.cache, w, None, None, backend="sm120", context_lens=ctx
         )
     q, w, ctx = _decode_inputs(False, 1, 1, 32, [1000], gen, dev)

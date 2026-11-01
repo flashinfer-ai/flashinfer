@@ -408,21 +408,21 @@ kernel_cake_kimi_k3_fp8_projection_cebb88d477f4ba24b460(const __grid_constant__ 
                     int sfw_unit0 = n_tile / 2 * sf_k_tiles * 2 + n_tile % 2;
                     int sfx_unit0 = m_tile * sf_k_tiles;
                     int work_n = work + ws;
-                    int tile_0 = work_n / split;
-                    int rank_1 = work_n - tile_0 * split;
-                    int k_begin_2 = num_k_iters * rank_1 / split;
-                    int k_end_3 = num_k_iters * (rank_1 + 1) / split;
-                    int k_count_4 = k_end_3 - k_begin_2;
-                    int n_tile_n = tile_0 % n_tiles;
-                    int m_tile_n = tile_0 / n_tiles;
+                    int tile_1 = work_n / split;
+                    int rank_0 = work_n - tile_1 * split;
+                    int k_begin_0 = num_k_iters * rank_0 / split;
+                    int k_end_0 = num_k_iters * (rank_0 + 1) / split;
+                    int k_count_0 = k_end_0 - k_begin_0;
+                    int n_tile_n = tile_1 % n_tiles;
+                    int m_tile_n = tile_1 / n_tiles;
                     int w_tile0_n = n_tile_n * (2 * num_k_iters);
                     int x_row_n = m_tile_n * 64;
                     int sfw_unit0_n = n_tile_n / 2 * sf_k_tiles * 2 + n_tile_n % 2;
                     #pragma unroll 1
                     for (int i = 0; i < k_count; i++) {
                         int iter_k = k_begin + i;
-                        int k_pfi = k_begin_2 + (iter_k + 4 - (k_begin + k_count));
-                        if (iter_k + 4 >= k_begin + k_count && n_items > it + 1 && k_pfi < k_begin_2 + k_count_4) {
+                        int k_pfi = k_begin_0 + (iter_k + 4 - (k_begin + k_count));
+                        if (iter_k + 4 >= k_begin + k_count && n_items > it + 1 && k_pfi < k_begin_0 + k_count_0) {
                             asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W))), "r"((int)(0)), "r"((int)(0)), "r"((int)(w_tile0_n + k_pfi * 2)) : "memory");
                             asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFW))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfw_unit0_n + k_pfi * 4)) : "memory");
                             asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFW))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfw_unit0_n + k_pfi * 4 + 2)) : "memory");
@@ -484,10 +484,10 @@ kernel_cake_kimi_k3_fp8_projection_cebb88d477f4ba24b460(const __grid_constant__ 
             #pragma unroll 1
             for (int it_m = 0; it_m < n_items_m; it_m++) {
                 int work_m = w0_m + it_m * ws_m;
-                int tile_1 = work_m / split;
-                int rank_2 = work_m - tile_1 * split;
-                int k_begin_1 = num_k_iters * rank_2 / split;
-                int k_end_1 = num_k_iters * (rank_2 + 1) / split;
+                int tile_2 = work_m / split;
+                int rank_1 = work_m - tile_2 * split;
+                int k_begin_1 = num_k_iters * rank_1 / split;
+                int k_end_1 = num_k_iters * (rank_1 + 1) / split;
                 int k_count_1 = k_end_1 - k_begin_1;
                 mbarrier_wait(epilogue_done_addr, _phase_epilogue_done);
                 #pragma unroll 1
@@ -559,13 +559,13 @@ kernel_cake_kimi_k3_fp8_projection_cebb88d477f4ba24b460(const __grid_constant__ 
             #pragma unroll 1
             for (int it_e = 0; it_e < n_items_e; it_e++) {
                 int work_e = w0_e + it_e * ws_e;
-                int tile_2 = work_e / split;
-                int rank_3 = work_e - tile_2 * split;
-                int k_begin_3 = num_k_iters * rank_3 / split;
-                int k_end_2 = num_k_iters * (rank_3 + 1) / split;
-                int k_count_2 = k_end_2 - k_begin_3;
-                int n_tile_e = tile_2 % n_tiles;
-                int m_tile_e = tile_2 / n_tiles;
+                int tile_3 = work_e / split;
+                int rank_2 = work_e - tile_3 * split;
+                int k_begin_2 = num_k_iters * rank_2 / split;
+                int k_end_2 = num_k_iters * (rank_2 + 1) / split;
+                int k_count_2 = k_end_2 - k_begin_2;
+                int n_tile_e = tile_3 % n_tiles;
+                int m_tile_e = tile_3 / n_tiles;
                 int feature = n_tile_e * 128 + lane_row;
                 int tok0 = m_tile_e * 64;
                 unsigned long long col = (unsigned long long)feature;
@@ -592,19 +592,19 @@ kernel_cake_kimi_k3_fp8_projection_cebb88d477f4ba24b460(const __grid_constant__ 
                 _phase_mainloop_done ^= 1;
                 unsigned int epi_base = smem_epi_addr + (unsigned int)(epi_group * 16384);
                 if (split == 1) {
-                    unsigned int slot_rel = (unsigned int)(epi_group * 16384);
-                    unsigned int slot_addr = smem_epi_addr + slot_rel;
+                    unsigned int slot_rel_0 = (unsigned int)(epi_group * 16384);
+                    unsigned int slot_addr_0 = smem_epi_addr + slot_rel_0;
                     if (epi_warp == 0) {
                         asm volatile("cp.async.bulk.wait_group.read 1;");
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync %0, 128;" :: "r"(2 + epi_group) : "memory");
                     #pragma unroll
-                    for (int t = 0; t < 32; t++) {
+                    for (int t_0 = 0; t_0 < 32; t_0++) {
                         {
-                            __nv_bfloat16 _bval_0 = __float2bfloat16_rn(_tmem_load_0[t]);
+                            __nv_bfloat16 _bval_0 = __float2bfloat16_rn(_tmem_load_0[t_0]);
                             uint16_t _bits_0 = *(uint16_t*)&_bval_0;
-                            uint32_t _addr_0 = static_cast<uint32_t>(smem_epi_addr + (slot_rel + (unsigned int)(t * 256 + lane_row * 2)));
+                            uint32_t _addr_0 = static_cast<uint32_t>(smem_epi_addr + (slot_rel_0 + (unsigned int)(t_0 * 256 + lane_row * 2)));
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_0), "h"(_bits_0) : "memory");
                         }
                     }
@@ -612,12 +612,12 @@ kernel_cake_kimi_k3_fp8_projection_cebb88d477f4ba24b460(const __grid_constant__ 
                     asm volatile("barrier.sync %0, 128;" :: "r"(2 + epi_group) : "memory");
                     if (epi_warp == 0) {
                         if (elect_sync()) {
-                            tma_store_2d((&OUT), n_tile_e * 128, tok0 + tok_g0, slot_addr);
+                            tma_store_2d((&OUT), n_tile_e * 128, tok0 + tok_g0, slot_addr_0);
                             asm volatile("cp.async.bulk.commit_group;");
                         }
                     }
-                    unsigned int slot_rel_0 = (unsigned int)(epi_group * 16384 + 8192);
-                    unsigned int slot_addr_1 = smem_epi_addr + slot_rel_0;
+                    unsigned int slot_rel_1 = (unsigned int)(epi_group * 16384 + 8192);
+                    unsigned int slot_addr_1 = smem_epi_addr + slot_rel_1;
                     if (epi_warp == 0) {
                         asm volatile("cp.async.bulk.wait_group.read 1;");
                     }
@@ -627,7 +627,7 @@ kernel_cake_kimi_k3_fp8_projection_cebb88d477f4ba24b460(const __grid_constant__ 
                         {
                             __nv_bfloat16 _bval_1 = __float2bfloat16_rn(_tmem_load_0[32 + t_1]);
                             uint16_t _bits_1 = *(uint16_t*)&_bval_1;
-                            uint32_t _addr_1 = static_cast<uint32_t>(smem_epi_addr + (slot_rel_0 + (unsigned int)(t_1 * 256 + lane_row * 2)));
+                            uint32_t _addr_1 = static_cast<uint32_t>(smem_epi_addr + (slot_rel_1 + (unsigned int)(t_1 * 256 + lane_row * 2)));
                             asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_1), "h"(_bits_1) : "memory");
                         }
                     }
@@ -640,26 +640,26 @@ kernel_cake_kimi_k3_fp8_projection_cebb88d477f4ba24b460(const __grid_constant__ 
                         }
                     }
                 } else {
-                    unsigned long long pbase = (unsigned long long)(tile_2 * split + rank_3) * 8192 + (unsigned long long)lane_row + (unsigned long long)tok_g0 * 128;
+                    unsigned long long pbase = (unsigned long long)(tile_3 * split + rank_2) * 8192 + (unsigned long long)lane_row + (unsigned long long)tok_g0 * 128;
                     #pragma unroll
-                    for (int t_2 = 0; t_2 < 64; t_2++) {
-                        partials[pbase + (unsigned long long)(t_2 * 128)] = _tmem_load_0[t_2];
+                    for (int t = 0; t < 64; t++) {
+                        partials[pbase + (unsigned long long)(t * 128)] = _tmem_load_0[t];
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
                     if (tid == 64) {
-                        asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(counters) + (tile_2 * 2))), "r"(static_cast<unsigned int>(1)) : "memory");
+                        asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(counters) + (tile_3 * 2))), "r"(static_cast<unsigned int>(1)) : "memory");
                         {
                         unsigned int _acquire_observed;
                         do {
-                        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(counters) + (tile_2 * 2))) : "memory");
+                        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(counters) + (tile_3 * 2))) : "memory");
                         } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>((unsigned int)split)) >= static_cast<unsigned int>(1));
                         }
                     }
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
-                    int t_first = rank_3 * tok_per_cta;
+                    int t_first = rank_2 * tok_per_cta;
                     int t_last = ((64) < (t_first + tok_per_cta) ? (64) : (t_first + tok_per_cta));
-                    unsigned long long rbase = (unsigned long long)(tile_2 * split) * 8192 + (unsigned long long)lane_row;
+                    unsigned long long rbase = (unsigned long long)(tile_3 * split) * 8192 + (unsigned long long)lane_row;
                     #pragma unroll
                     for (int tb = 0; tb < 64; tb += 8) {
                         if (t_first < tb + 8 && t_last > tb && tok_g0 <= tb && tb < tok_g0 + 64) {
@@ -702,10 +702,10 @@ kernel_cake_kimi_k3_fp8_projection_cebb88d477f4ba24b460(const __grid_constant__ 
                         }
                     }
                     if (tid == 64) {
-                        unsigned int finished = atomicAdd(&counters[tile_2 * 2 + 1], 1);
+                        unsigned int finished = atomicAdd(&counters[tile_3 * 2 + 1], 1);
                         if ((int)finished == split - 1) {
-                            counters[(unsigned long long)(tile_2 * 2)] = 0;
-                            counters[(unsigned long long)(tile_2 * 2 + 1)] = 0;
+                            counters[(unsigned long long)(tile_3 * 2)] = 0;
+                            counters[(unsigned long long)(tile_3 * 2 + 1)] = 0;
                         }
                     }
                 }
@@ -733,12 +733,12 @@ kernel_cake_kimi_k3_fp8_projection_cebb88d477f4ba24b460(const __grid_constant__ 
             #pragma unroll 1
             for (int it_q = 0; it_q < n_items_q; it_q++) {
                 int work_q = w0_q + it_q * ws_q;
-                int tile_3 = work_q / split;
-                int rank_4 = work_q - tile_3 * split;
-                int k_begin_4 = num_k_iters * rank_4 / split;
-                int k_end_4 = num_k_iters * (rank_4 + 1) / split;
-                int k_count_3 = k_end_4 - k_begin_4;
-                int m_tile_q = tile_3 / n_tiles;
+                int tile_4 = work_q / split;
+                int rank_3 = work_q - tile_4 * split;
+                int k_begin_3 = num_k_iters * rank_3 / split;
+                int k_end_3 = num_k_iters * (rank_3 + 1) / split;
+                int k_count_3 = k_end_3 - k_begin_3;
+                int m_tile_q = tile_4 / n_tiles;
                 int tok0_q = m_tile_q * 64;
                 #pragma unroll 1
                 for (int i_2 = 0; i_2 < k_count_3; i_2++) {
@@ -993,24 +993,24 @@ kernel_cake_kimi_k3_fp8_projection_cebb88d477f4ba24b460(const __grid_constant__ 
                 #pragma unroll 1
                 for (int it_x = 0; it_x < n_items_x; it_x++) {
                     int work_x = w0_x + it_x * ws_x;
-                    int tile_4 = work_x / split;
-                    int rank_5 = work_x - tile_4 * split;
-                    int k_begin_5 = num_k_iters * rank_5 / split;
-                    int k_end_5 = num_k_iters * (rank_5 + 1) / split;
-                    int k_count_5 = k_end_5 - k_begin_5;
-                    int m_tile_x = tile_4 / n_tiles;
+                    int tile_5 = work_x / split;
+                    int rank_4 = work_x - tile_5 * split;
+                    int k_begin_4 = num_k_iters * rank_4 / split;
+                    int k_end_4 = num_k_iters * (rank_4 + 1) / split;
+                    int k_count_4 = k_end_4 - k_begin_4;
+                    int m_tile_x = tile_5 / n_tiles;
                     int x_row_x = m_tile_x * 64;
                     #pragma unroll 1
-                    for (int i_3 = 0; i_3 < k_count_5; i_3++) {
-                        int k_group_x = (k_begin_5 + i_3) * 2;
+                    for (int i_3 = 0; i_3 < k_count_4; i_3++) {
+                        int k_group_x = (k_begin_4 + i_3) * 2;
                         if (i_3 == 0) {
-                            if (k_begin_5 < k_begin_5 + k_count_5) {
-                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile.L2::cache_hint [%0, {%1, %2, %3}], %4;" :: "l"((uint64_t)((&XB))), "r"((int)(0)), "r"((int)(x_row_x)), "r"((int)(k_begin_5 * 2)), "l"(0x12F0000000000000ULL) : "memory");
-                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile.L2::cache_hint [%0, {%1, %2, %3}], %4;" :: "l"((uint64_t)((&XB))), "r"((int)(0)), "r"((int)(x_row_x)), "r"((int)(k_begin_5 * 2 + 1)), "l"(0x12F0000000000000ULL) : "memory");
+                            if (k_begin_4 < k_begin_4 + k_count_4) {
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile.L2::cache_hint [%0, {%1, %2, %3}], %4;" :: "l"((uint64_t)((&XB))), "r"((int)(0)), "r"((int)(x_row_x)), "r"((int)(k_begin_4 * 2)), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile.L2::cache_hint [%0, {%1, %2, %3}], %4;" :: "l"((uint64_t)((&XB))), "r"((int)(0)), "r"((int)(x_row_x)), "r"((int)(k_begin_4 * 2 + 1)), "l"(0x12F0000000000000ULL) : "memory");
                             }
                         }
-                        int k_px = k_begin_5 + i_3 + 1;
-                        if (k_px < k_begin_5 + k_count_5) {
+                        int k_px = k_begin_4 + i_3 + 1;
+                        if (k_px < k_begin_4 + k_count_4) {
                             asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile.L2::cache_hint [%0, {%1, %2, %3}], %4;" :: "l"((uint64_t)((&XB))), "r"((int)(0)), "r"((int)(x_row_x)), "r"((int)(k_px * 2)), "l"(0x12F0000000000000ULL) : "memory");
                             asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile.L2::cache_hint [%0, {%1, %2, %3}], %4;" :: "l"((uint64_t)((&XB))), "r"((int)(0)), "r"((int)(x_row_x)), "r"((int)(k_px * 2 + 1)), "l"(0x12F0000000000000ULL) : "memory");
                         }

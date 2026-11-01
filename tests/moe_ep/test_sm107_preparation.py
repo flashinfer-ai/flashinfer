@@ -28,6 +28,7 @@ def _buffers(capacity, hidden, topk, dtype):
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("norm", [1.0, 0.3, 0.7, 2.0])
 def test_nvfp4_fused_staging_matches_torch(monkeypatch, dtype, norm):
+    """Check normalized NVFP4 bytes and validated routes against Torch staging."""
     from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.staging import (
         stage_mega_moe_inputs,
     )
@@ -48,7 +49,9 @@ def test_nvfp4_fused_staging_matches_torch(monkeypatch, dtype, norm):
         scores = torch.rand(live, topk, device="cuda")
         for enabled, out in (("0", expected), ("1", actual)):
             monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", enabled)
-            stage_mega_moe_inputs(x, scores, ids, *out, input_norm_const=norm)
+            stage_mega_moe_inputs(
+                x, scores, ids, *out, input_norm_const=norm, num_experts=16
+            )
         torch.cuda.synchronize()
         if live:
             torch.testing.assert_close(
@@ -126,6 +129,7 @@ def test_routing_check_rebinds_inputs_and_replays(
         validate_routing_values,
     )
 
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
     monkeypatch.setenv("FLASHINFER_SM107_PREP_TVM_FFI", ffi)
     monkeypatch.setenv("FLASHINFER_SM107_FUSED_ROUTE_CHECK", fused)
     tokens, topk = shape
@@ -236,7 +240,7 @@ def test_routing_check_reuses_kernel_across_row_counts(
 @pytest.mark.parametrize("prequantized", [False, True])
 @pytest.mark.parametrize("fused", ["0", "1"])
 @pytest.mark.parametrize("score_dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_staging_zeroes_masked_scores(
+def test_staging_preserves_masked_scores(
     monkeypatch, kind, prequantized, fused, score_dtype
 ):
     from flashinfer.moe_ep import MoEEpTensors
@@ -283,12 +287,14 @@ def test_staging_zeroes_masked_scores(
         ids[0] = -1
         scores[:, column] = value
         scores[0] = value
-        expected = scores.float().masked_fill(ids == -1, 0)
+        expected = scores.float()
         for launch in (stage, graph.replay):
             ws.topk_weights.fill_(123)
             launch()
             torch.cuda.synchronize()
-            torch.testing.assert_close(ws.topk_weights[:live], expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                ws.topk_weights[:live], expected, rtol=0, atol=0, equal_nan=True
+            )
             assert torch.equal(ws.topk_idx[:live], ids.to(torch.int32))
             assert (ws.topk_idx[live:] == -1).all()
             assert (
@@ -308,7 +314,9 @@ def test_route_staging_rebinds_and_replays(
 
     monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1")
     monkeypatch.setenv("FLASHINFER_SM107_PREP_TVM_FFI", ffi)
-    monkeypatch.setattr(routing_staging, "_COMPILED", {})
+    from flashinfer.moe_ep.backends.mega.kernel import routing_staging as shared_staging
+
+    monkeypatch.setattr(shared_staging, "_COMPILED", {})
     topk, capacity = 6, 1032
     workspace = SimpleNamespace()
     ids_out = torch.full((capacity, topk), -7, device="cuda", dtype=torch.int32)
@@ -326,7 +334,7 @@ def test_route_staging_rebinds_and_replays(
     scores.fill_(1)
     routing_staging.stage_routes(ids, scores, ids_out, scores_out, workspace=workspace)
     torch.cuda.synchronize()
-    assert len(routing_staging._COMPILED) == 1
+    assert len(shared_staging._COMPILED) == 1
 
     def unexpected_compile(*args, **kwargs):
         pytest.fail("A new row count must reuse the warmed route-staging kernel")
@@ -358,9 +366,10 @@ def test_route_staging_rebinds_and_replays(
                 assert torch.equal(ids_out[:live], ids.to(torch.int32))
                 torch.testing.assert_close(
                     scores_out[:live],
-                    scores.float().masked_fill(ids == -1, 0),
+                    scores.float(),
                     rtol=0,
                     atol=0,
+                    equal_nan=True,
                 )
                 assert (ids_out[live:] == -7).all()
                 assert (scores_out[live:] == -7).all()
@@ -376,6 +385,7 @@ def test_route_staging_rebinds_and_replays(
 @pytest.mark.parametrize("hidden,topk", [(512, 6), (2880, 6), (7168, 6), (512, 129)])
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
 def test_mxfp8_fused_staging_matches_torch(monkeypatch, kind, hidden, topk, id_dtype):
+    """Compare fused and fallback staging bytes, masked scores, and inactive tails."""
     from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
         _data_dtype,
         stage_mega_moe_inputs,
@@ -410,7 +420,9 @@ def test_mxfp8_fused_staging_matches_torch(monkeypatch, kind, hidden, topk, id_d
         scores[:, 0] = float("nan")
         for enabled, out in (("0", expected), ("1", actual)):
             monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", enabled)
-            stage_mega_moe_inputs(x, scores, ids, *out, kind=kind)
+            stage_mega_moe_inputs(
+                x, scores, ids, *out, kind=kind, num_experts=max(128, topk)
+            )
         torch.cuda.synchronize()
         for index in (0, 1):
             torch.testing.assert_close(
@@ -420,7 +432,10 @@ def test_mxfp8_fused_staging_matches_torch(monkeypatch, kind, hidden, topk, id_d
                 atol=0,
             )
         assert torch.equal(actual[2], expected[2])
-        assert torch.equal(actual[3][:live], expected[3][:live])
+        for out in (actual, expected):
+            torch.testing.assert_close(
+                out[3][:live], scores, rtol=0, atol=0, equal_nan=True
+            )
 
 
 @pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2"])
@@ -493,3 +508,292 @@ def test_mxfp8_fused_staging_keeps_scale_policies_separate(kind):
         assert torch.equal(q.view(torch.uint8), expected.view(torch.uint8))
         assert (sf.view(torch.uint8) == int(normal)).all()
         assert torch.equal(ids_out, ids) and torch.equal(scores_out, scores)
+
+
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("ffi", [False, True])
+def test_shared_route_staging_keeps_score_policies_separate(id_dtype, ffi):
+    from flashinfer.moe_ep.backends.mega.kernel.routing_staging import stage_routes
+
+    ids = torch.tensor([[0, -1, -1, -1]], device="cuda", dtype=id_dtype)
+    scores = torch.tensor(
+        [[0.25, float("nan"), float("inf"), -float("inf")]], device="cuda"
+    )
+    ids_out = torch.empty_like(ids, dtype=torch.int32)
+    scores_out = torch.empty_like(scores)
+    workspace = SimpleNamespace()
+    for options in ({}, {"zero_masked_scores": False}, {}):
+
+        def stage():
+            stage_routes(
+                ids,
+                scores,
+                ids_out,
+                scores_out,
+                workspace=workspace,
+                use_tvm_ffi=ffi,
+                **options,
+            )
+
+        stage()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            stage()
+        scores_out.fill_(123)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = scores if options else scores.masked_fill(ids == -1, 0)
+        torch.testing.assert_close(scores_out, expected, rtol=0, atol=0, equal_nan=True)
+        assert torch.equal(ids_out, ids.to(torch.int32))
+        graph.reset()
+    assert torch.isnan(scores[:, 1]).all()
+    assert torch.isposinf(scores[:, 2]).all() and torch.isneginf(scores[:, 3]).all()
+
+
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+def test_shared_staging_keeps_default_score_policy(id_dtype):
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import fused_quant_stage
+
+    x = torch.ones(8, 512, device="cuda", dtype=torch.bfloat16)
+    ids = torch.tensor([0, -1, -1, -1], device="cuda", dtype=id_dtype).repeat(8, 1)
+    scores = torch.tensor(
+        [0.25, float("nan"), float("inf"), -float("inf")], device="cuda"
+    ).repeat(8, 1)
+    q = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    sf = torch.empty(8, 16, device="cuda", dtype=torch.float8_e8m0fnu)
+    ids_out, scores_out = torch.empty_like(ids), torch.empty_like(scores)
+    for options in ({}, {"zero_masked_scores": False}, {}):
+        fused_quant_stage(
+            x,
+            ids,
+            scores,
+            q,
+            sf,
+            ids_out,
+            scores_out,
+            quant_type="mxfp8_e4m3",
+            **options,
+        )
+        torch.cuda.synchronize()
+        expected = scores
+        if not options and id_dtype == torch.int32:
+            expected = scores.masked_fill(ids == -1, 0)
+        torch.testing.assert_close(scores_out, expected, rtol=0, atol=0, equal_nan=True)
+        assert torch.equal(ids_out, ids)
+    assert torch.isnan(scores[:, 1]).all()
+    assert torch.isposinf(scores[:, 2]).all() and torch.isneginf(scores[:, 3]).all()
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+@pytest.mark.parametrize("tail_fused", ["0", "1"])
+@pytest.mark.parametrize("capacity", [129, 4096])
+def test_quantized_staging_graph_masks_dirty_tail(
+    monkeypatch, kind, tail_fused, capacity
+):
+    """Replay varying live lengths and capacities without stale tails or recompiles."""
+    import cutlass.cute as cute
+
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
+        _data_dtype,
+        stage_mega_moe_inputs as stage_mx,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs as stage_nv,
+    )
+
+    monkeypatch.setenv("FLASHINFER_SM107_FUSED_TAIL_MASK", tail_fused)
+    hidden, topk = 256, 6
+    x = torch.randn(capacity, hidden, device="cuda", dtype=torch.bfloat16)
+    ids = torch.arange(topk, device="cuda", dtype=torch.int64).repeat(capacity, 1)
+    scores = torch.ones(capacity, topk, device="cuda")
+    ids[::2, 0] = -1
+    scores[::2, 0] = float("nan")
+    out = (
+        _buffers(capacity, hidden, topk, torch.int32)
+        if kind == "nvfp4"
+        else (
+            torch.empty(capacity, hidden, device="cuda", dtype=_data_dtype(kind)),
+            torch.empty(
+                capacity, hidden // 32, device="cuda", dtype=torch.float8_e8m0fnu
+            ),
+            torch.empty(capacity, topk, device="cuda", dtype=torch.int32),
+            torch.empty(capacity, topk, device="cuda"),
+        )
+    )
+
+    def stage(live, limit=capacity):
+        """Stage a live prefix into the requested output capacity."""
+        stage_inputs = stage_nv if kind == "nvfp4" else stage_mx
+        kwargs = {} if kind == "nvfp4" else {"kind": kind}
+        stage_inputs(
+            x[:live],
+            scores[:live],
+            ids[:live],
+            *(t[:limit] for t in out),
+            num_experts=16,
+            **kwargs,
+        )
+
+    stage(8)
+    torch.cuda.synchronize()
+
+    def unexpected_compile(*args, **kwargs):
+        pytest.fail("Changing live rows must reuse the warmed staging kernel")
+
+    monkeypatch.setattr(cute, "compile", unexpected_compile)
+    captures = []
+    try:
+        half = capacity // 2 + 1
+        for limit, live in (
+            (capacity, 1),
+            (half, 17),
+            (capacity, capacity),
+            (half, 0),
+            (capacity, 64),
+        ):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                stage(live, limit)
+            captures.append((limit, live, graph))
+        for limit, live, graph in (*reversed(captures), *captures):
+            # Model a different layer or a larger graph using the same buffer.
+            out[2].fill_(7)
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out[2][:live], ids[:live].to(torch.int32))
+            assert (out[2][live:limit] == -1).all()
+            assert (out[2][limit:] == 7).all()
+            torch.testing.assert_close(
+                out[3][:live], scores[:live], rtol=0, atol=0, equal_nan=True
+            )
+    finally:
+        for _, _, graph in captures:
+            graph.reset()
+
+
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3"])
+@pytest.mark.parametrize("check_routes", [None, "0", "1"])
+def test_fused_staging_routing_check_policy(monkeypatch, kind, check_routes):
+    from unittest.mock import Mock
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as shared
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs as stage_mx,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs as stage_nv,
+    )
+
+    monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1")
+    monkeypatch.setenv("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1")
+    if check_routes is None:
+        monkeypatch.delenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", raising=False)
+    else:
+        monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", check_routes)
+    stage = Mock(wraps=shared.fused_quant_stage)
+    monkeypatch.setattr(shared, "fused_quant_stage", stage)
+    x = torch.ones(8, 128, device="cuda", dtype=torch.bfloat16)
+    ids = torch.tensor([0, -1], device="cuda", dtype=torch.int32).repeat(8, 1)
+    scores = torch.tensor([1.0, float("nan")], device="cuda").repeat(8, 1)
+    out = (
+        _buffers(8, 128, 2, torch.int32)
+        if kind == "nvfp4"
+        else (
+            torch.empty_like(x, dtype=torch.float8_e4m3fn),
+            torch.empty(8, 4, device="cuda", dtype=torch.float8_e8m0fnu),
+            torch.empty_like(ids),
+            torch.empty_like(scores),
+        )
+    )
+    (stage_nv if kind == "nvfp4" else stage_mx)(x, scores, ids, *out, num_experts=8)
+    torch.cuda.synchronize()
+    stage.assert_called_once()
+    assert stage.call_args.kwargs["num_experts"] == (8 if check_routes == "1" else None)
+    torch.testing.assert_close(out[3], scores, rtol=0, atol=0, equal_nan=True)
+
+
+def _invalid_staged_route(case, kind):
+    """Require eager or captured staging to trap a route corrupted after warmup."""
+    # A device assertion invalidates the CUDA context, so each case needs its
+    # own process. Values can also become invalid after CUDA graph capture.
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs as stage_mx,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.nvfp4_nvfp4_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs as stage_nv,
+    )
+
+    x = torch.randn(2, 128, device="cuda", dtype=torch.bfloat16)
+    ids = torch.tensor([[0, 1], [-1, -1]], device="cuda", dtype=torch.int64)
+    scores = torch.tensor([[0.5, 0.5], [float("nan"), float("inf")]], device="cuda")
+    out = (
+        _buffers(4, 128, 2, torch.int32)
+        if kind == "nvfp4"
+        else (
+            torch.empty(4, 128, device="cuda", dtype=torch.float8_e4m3fn),
+            torch.empty(4, 4, device="cuda", dtype=torch.float8_e8m0fnu),
+            torch.empty(4, 2, device="cuda", dtype=torch.int32),
+            torch.empty(4, 2, device="cuda"),
+        )
+    )
+
+    def stage():
+        """Stage live values before checking mutated routes on graph replay."""
+        stage_inputs = stage_nv if kind == "nvfp4" else stage_mx
+        stage_inputs(x, scores, ids, *out, num_experts=8)
+
+    stage()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        stage()
+    if case == "bounds":
+        ids[0, 0] = 8
+    elif case == "negative":
+        ids[0, 0] = -2
+    elif case == "int64_wrap":
+        ids[0, 0] = 2**32
+    elif case == "duplicate":
+        ids[0, 0] = 1
+    elif case == "nan":
+        scores[0, 0] = float("nan")
+    elif case == "inf":
+        scores[0, 0] = float("inf")
+    try:
+        if case in ("bounds", "negative"):
+            stage()
+        else:
+            graph.replay()
+        torch.cuda.synchronize()
+    except RuntimeError as exc:
+        # CuTe cf.assert prints its diagnostic and traps (launch failure);
+        # CUDA __assertfail reports a device-side assertion instead.
+        assert any(
+            message in str(exc)
+            for message in ("device-side assert", "unspecified launch failure")
+        )
+    else:
+        raise AssertionError(f"Invalid {case} routing was accepted")
+
+
+@pytest.mark.parametrize(
+    "case", ["bounds", "negative", "int64_wrap", "duplicate", "nan", "inf"]
+)
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3"])
+def test_fused_staging_rejects_invalid_routes(monkeypatch, case, kind):
+    """Isolate each expected device assertion in a fresh spawned CUDA process."""
+    import multiprocessing
+
+    monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1")
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
+    monkeypatch.setenv("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1")
+    process = multiprocessing.get_context("spawn").Process(
+        target=_invalid_staged_route, args=(case, kind)
+    )
+    process.start()
+    try:
+        process.join(timeout=180)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join()

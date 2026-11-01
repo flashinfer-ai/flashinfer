@@ -1308,7 +1308,9 @@ def _forced_tile_config(n: int) -> Optional[str]:
 # N exactly -- the indexer band's slab (QsaSpec.index_band: 13312 + 640 = 13952 = 109 x 128 columns at the 24/2 geometry, whose
 # 218 64-row tiles overflow every served part) is the case, and it takes the SAME 128-row swap-AB names the 32/2 slab does (109
 # CTAs: the half-wave launch a band padded to 768 columns would make, with no pad in the weight).  An N that 128 divides but 256
-# does not whose 64-row tiles FIT one wave keeps today's resolution (the narrow and one-wave branches are unmeasured off the 256 grid).
+# does not whose 64-row tiles FIT one wave keeps today's resolution at these row counts (the narrow and one-wave branches are
+# unmeasured off the 256 grid).  PAST ``SMALL_M_MAX`` the 128 grid is the large-M rule's (``large_m_tile_config`` below: the GEMM
+# engine's own baseline pick, so the band slab rides the JIT route at every row count).
 SMALL_M_MAX = 128
 _SMALL_M_SPLIT_K_MAX = 8
 _SMALL_M_CTA_K_ELEMS = 64  # the catalog's 128-byte K tile at 2 bytes per element
@@ -1363,8 +1365,9 @@ def small_m_tile_config(
     ctas_128 = -(-n // 128)
     if n % 256 and ctas_64 <= sm_count:
         # An N that 128 divides but 256 does not, whose 64-row tiles FIT one wave: the narrow and the one-wave branches below were
-        # measured on 256-multiples only, so it keeps today's resolution (the graph route; under ``capture_safe`` the typed refusal
-        # at compile).  The one served off-grid N -- the indexer band's slab, ``QsaSpec.index_band``: 13312 + 640 = 13952 = 109 x 128
+        # measured on 256-multiples only, so it keeps today's resolution at decode row counts (the graph route; under ``capture_safe``
+        # the typed refusal at compile; past ``SMALL_M_MAX`` the large-M rule names the engine's baseline for the 128 grid).  The one
+        # served off-grid N -- the indexer band's slab, ``QsaSpec.index_band``: 13312 + 640 = 13952 = 109 x 128
         # -- overflows the wave on every served part (218 64-row tiles) and takes the overflow branch's 128-row tiles, which divide
         # it exactly (no partial tile).
         return None
@@ -1401,21 +1404,120 @@ def small_m_tile_config(
     return "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_swapAB"
 
 
-def _auto_tile_name(m: int, n: int, k: int, *, dtype: torch.dtype, a_major: str, b_major: str, block_scale: bool, alpha: bool) -> Optional[str]:
+# The LARGE-M rule, past the small-M route: the indexer band's slab (N 13312 + 640 = 13952 = 109 x 128 at the 24/2 geometry; 14336 + 640
+# = 14976 = 117 x 128 at 24/4) at prefill / extend / chunked row counts.  The 256 grid is the forced tile's (`_forced_tile_config`) and
+# the 128 grid up to 128 rows is the small-M route's; between them the band slab past 128 rows had NO name, which made it the GRAPH
+# route -- the plan the backend's ranked list serves, whose first execute per (device, stream) creates a cuDNN handle (never inside a
+# CUDA-graph capture) and whose compile needs the opt-in flag.  The graph route runs a FROST GEMM JIT of its own: the engine's
+# `plan_config` / `plan_configs` (gemm/frost/sm100/compiler.py) take `_baseline_config` = `select_config(M, N, 1, K=K)` +
+# `preferred_strategy` + `_auto_split_k`, then `planning.select_strategies`, which returns that baseline wherever no cost profile
+# claims the shape.  So the rule below names THAT pick -- the kernel the graph route runs for the same (M, N, K, dtype, SM count) --
+# and names it only where the identity holds: `preferred_strategy` is the identity for a dense bf16 / f16 chain on the sm100 family
+# (pipeline "sm100", MMA K 32 = the catalog's own spelling), the planner's cost profiles decline the shape (`_planner_may_replan`: the
+# planner envelope `tile_config` publishes, so this resolver imports no graph-route module), and `_auto_split_k` leaves the pick unsplit
+# (`_auto_split_k_slices`).  The name moves the ROUTE (JIT-only: no ranked list, no
+# backend plan, no cuDNN handle at execute, capture-safe, flag-free) and not the kernel.  The pick follows the part's SM count (at
+# M 2048 x N 13952: 128x224 cluster2x1 on 212 SMs, 128x224 cluster2x4 on 204), so a recorded plan name replays within ONE SM-count
+# class -- the small-M route's existing rule.  Shape-only, no device sync: `_Projection.resolves_a_jit_tile` reads it at declaration.
+
+
+def _planner_may_replan(m: int, n: int, k: int) -> bool:
+    """Whether the GEMM engine's device-aware planner could serve ``[m, k] x [k, n]`` with a strategy OTHER than its baseline pick:
+    ``planning.select_strategies`` ranks candidates only under a cost profile, and a profile claims a shape only inside the planner
+    envelope the catalog module publishes (``tile_config.planner_may_claim``: ``PLANNER_MN_BOUNDS`` on both M and N, ``PLANNER_K_BOUNDS``;
+    the block's chain is batch 1) -- read THERE, never from the planner module, which a JIT-only deployment of this driver does not carry
+    (an import of it at declaration would be a bare ``ModuleNotFoundError``, not a typed decline).  A shape outside the envelope is served
+    by the baseline alone (the planner's ``[baseline]``)."""
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.tile_config import planner_may_claim
+
+    return planner_may_claim(m, n, k, batch=1)
+
+
+def _auto_split_k_slices(m: int, n: int, k: int, cfg, sm_count: int, elem_bits: int = 16) -> int:
+    """The split-K slice count the engine's ``_auto_split_k`` (``gemm/frost/sm100/compiler.py``) layers onto ``cfg`` for a dense
+    ``[m, k] x [k, n]`` GEMM of ``elem_bits``-bit operands at ``sm_count`` SMs -- its arithmetic mirrored on the shape alone: a pick
+    already split is kept; a shallow K (under 2048 bytes) is never split; an output grid of at least one wave is never split; else the
+    slice count is one full wave of CTAs, floored by the per-slice K floor, the reducer's 32-slice unroll and the grid.z limit, and one
+    or two slices are not worth the reducer.  1 = the pick runs unsplit.  The compiler's remaining exit (``_splitk_reject_reason`` on a
+    two-slice probe) never fires for a plain dense bf16 / f16 chain and could only keep the pick unsplit, so this mirror is conservative:
+    it never reads "unsplit" where the compiler would split."""
+    if cfg.split_k_slices != 1:
+        return int(cfg.split_k_slices)
+    if k * elem_bits < 2048 * 8:
+        return 1
+    output_tiles = -(-m // cfg.cta_tile_m) * -(-n // cfg.cta_tile_n)
+    if output_tiles >= sm_count:
+        return 1
+    cta_k_elems = cfg.cta_tile_k_bytes * 8 // elem_bits
+    num_k_tiles = -(-k // cta_k_elems)
+    min_k_tiles_per_slice = max(-(-64 // cta_k_elems), 2)
+    slices = min(sm_count // output_tiles, num_k_tiles // min_k_tiles_per_slice, 32, 65535)
+    return slices if slices > 2 else 1
+
+
+def large_m_tile_config(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    dtype: torch.dtype,
+    a_major: str = "k",
+    b_major: str = "k",
+    block_scale: bool = False,
+    alpha: bool = False,
+    sm_count: Optional[int] = None,
+) -> Optional[str]:
+    """The GEMM engine's OWN baseline pick (``tile_config.select_config``) for a dense bf16 / f16 K-major ``[m, k] x [k, n]``
+    projection past ``SMALL_M_MAX`` whose N the 128 grid divides and the 256 grid does not -- the indexer band's slabs -- or None
+    where the graph route's plan could differ from that pick (a shape the planner's cost profiles claim, or one ``_auto_split_k``
+    would split), so that every name given here is the kernel the graph route runs for the same shape on the same part (the
+    comment block above).  Declines like the small-M route (a non-positive extent, a dtype other than bf16 / f16, a block-scale or
+    alpha plan, an MN-major operand, an extent the TMA 16-byte rule refuses) and at ``m <= SMALL_M_MAX`` (the small-M route's
+    rows).  ``sm_count`` is the target's SM count (the active device when None); the pick follows it, so a recorded plan name
+    replays within one SM-count class."""
+    if m <= SMALL_M_MAX or n <= 0 or k <= 0 or block_scale or alpha:
+        return None
+    if dtype not in (torch.bfloat16, torch.float16):
+        return None
+    if a_major != "k" or b_major != "k":
+        return None
+    if n % 8 or k % 8:
+        return None
+    if n % 128 or n % 256 == 0:
+        # the 256 grid is the forced tile's (`_forced_tile_config`); an N off the 128 grid keeps the graph route
+        return None
+    if _planner_may_replan(m, n, k):
+        return None
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost.tile_config import _sm_count, select_config
+
+    sm = sm_count if sm_count is not None else _sm_count()
+    # the call `_baseline_config` makes for this chain: one GEMM, no block scale, a K-major B of 2-byte elements, no forced CTA group
+    cfg = select_config(m, n, 1, K=k, sm_count=sm)
+    if _auto_split_k_slices(m, n, k, cfg, sm) != 1:
+        return None
+    return cfg.name
+
+
+def _auto_tile_name(
+    m: int, n: int, k: int, *, dtype: torch.dtype, a_major: str, b_major: str, block_scale: bool, alpha: bool, sm_count: Optional[int] = None
+) -> Optional[str]:
     """``tile_config="auto"``: the small-M route where it applies (:func:`small_m_tile_config`; on the ``sm100`` compiler family
     only -- its names are the tcgen05 tree's catalog, so a process on the ``sm120`` family keeps the family-aware fallback below),
-    else the forced 256-wide tile where 256 divides N (:func:`_forced_tile_config`), else None (the graph heuristic's own tile).
-    A None here IS the graph route: ``build_proj_gemm(capture_safe=True)`` declines it typed, and the block sets ``capture_safe`` on a
-    projection stage only where this resolver names a tile for the stage's own shape (``_Projection.resolves_a_jit_tile``) -- the
-    indexer band's slab (N 13952, off the 256 grid) resolves here at ``m <= SMALL_M_MAX`` only, so a band declaration past 128 rows
-    keeps the graph route and its documented capture refusal."""
+    else the large-M rule past it (:func:`large_m_tile_config`, the same family: the engine's own baseline pick for a dense bf16 / f16
+    K-major projection on the 128 grid off the 256 grid -- the indexer band's slab past 128 rows), else the forced 256-wide tile where
+    256 divides N (:func:`_forced_tile_config`), else None (the graph heuristic's own tile).  A None here IS the graph route:
+    ``build_proj_gemm(capture_safe=True)`` declines it typed, and the block sets ``capture_safe`` on a projection stage only where this
+    resolver names a tile for the stage's own shape (``_Projection.resolves_a_jit_tile``) -- so the indexer band's slab (N 13952, off
+    the 256 grid) resolves at every row count: the small-M route's 128-row swap-AB tile at ``m <= SMALL_M_MAX``, the engine's baseline
+    past it.  ``sm_count`` (appended) is the target's SM count for a host query of another part; None reads the active device."""
     from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gemm.frost import arch_family
 
-    name = (
-        small_m_tile_config(m, n, k, dtype=dtype, a_major=a_major, b_major=b_major, block_scale=block_scale, alpha=alpha)
-        if arch_family.active_family() == "sm100"
-        else None
-    )
+    name = None
+    if arch_family.active_family() == "sm100":
+        kw = dict(dtype=dtype, a_major=a_major, b_major=b_major, block_scale=block_scale, alpha=alpha, sm_count=sm_count)
+        name = small_m_tile_config(m, n, k, **kw)
+        if name is None:
+            name = large_m_tile_config(m, n, k, **kw)
     return name if name is not None else _forced_tile_config(n)
 
 
@@ -1621,9 +1723,10 @@ def build_proj_gemm(
             f"{label}: capture_safe=True needs the forced-tile JIT route, and pin_frost=False is the graph route by request (its first execute "
             "per stream creates a cuDNN handle, which cannot happen inside a CUDA-graph capture); drop one of the two"
         )
-    # The tile the JIT route runs: the small-M route at m <= SMALL_M_MAX on a dense bf16 / f16 K-major plan, else the forced
-    # 256-wide config when it divides N, an explicit name as given, else None (the graph heuristic's own tile -- no JIT
-    # unless a split or an MMA K width is pinned below).
+    # The tile the JIT route runs: the small-M route at m <= SMALL_M_MAX on a dense bf16 / f16 K-major plan, past it the large-M
+    # rule's name on the 128 grid off the 256 grid (the engine's own baseline pick -- the kernel the graph route runs for that shape),
+    # else the forced 256-wide config when it divides N, an explicit name as given, else None (the graph heuristic's own tile -- no
+    # JIT unless a split or an MMA K width is pinned below).
     name = (
         _auto_tile_name(m, n, k, dtype=dtype, a_major=a_major, b_major=b_major, block_scale=block_scale, alpha=alpha) if tile_config == "auto" else tile_config
     )
@@ -2014,7 +2117,9 @@ def _capture_safe_graph_route_message(label: str, m: int, k: int, n: int, tile_c
         f"{label}: capture_safe=True needs the forced-tile JIT route, but this plan resolves to the graph route ({resolved}; m={m}, k={k}, "
         f"n={n}, tile_config={tile_config!r}): the graph route creates a cuDNN handle at the first execute per stream, which cannot happen "
         f"inside a CUDA-graph capture -- use an N that 256 divides (the forced tile {_FORCED_TILE_NAME!r}), a shape the small-M route "
-        f"names a tile for (m <= {SMALL_M_MAX} on a dense bf16 / f16 K-major projection), or name a tile_config explicitly"
+        f"names a tile for (m <= {SMALL_M_MAX} on a dense bf16 / f16 K-major projection), a 128-grid N past {SMALL_M_MAX} rows the "
+        "large-M rule names the engine's baseline for (the same dense projection, a shape the engine's planner does not re-plan), or "
+        "name a tile_config explicitly"
     )
 
 

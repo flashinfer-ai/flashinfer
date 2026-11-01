@@ -171,7 +171,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :type max_active_clusters: int
         :param page_size: The page size
         :type page_size: int
-        :param skip_correction_threshold: Threshold to skip correction
+        :param skip_correction_threshold: Finite log2 threshold to skip correction;
+            must not exceed log2(448), the FP8 E4M3 probability limit.
         :type skip_correction_threshold: float
         :param is_persistent: Whether to use persistent kernel mode
         :type is_persistent: bool
@@ -214,6 +215,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.mma_qk_tiler_mn = mma_qk_tiler_mn
         self.mma_pv_tiler_mn = mma_pv_tiler_mn
         self.max_active_clusters = max_active_clusters
+        # A skipped update keeps the old maximum, so P can reach 2**threshold.
+        # Bound it by E4M3's maximum to keep numerator and denominator consistent.
+        if not math.isfinite(skip_correction_threshold) or (
+            skip_correction_threshold > math.log2(448.0)
+        ):
+            raise ValueError(
+                "skip_correction_threshold must be finite and <= log2(448) "
+                "to keep probabilities within FP8 E4M3 range"
+            )
         self.skip_correction_threshold = skip_correction_threshold
         self.is_persistent = is_persistent
         self.page_size = page_size
@@ -3542,6 +3552,16 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         row_max_new = cute.arch.fmax(row_max_new, other_row_max)
         row_max = other_row_max
         row_sum = other_row_sum
+
+        # Skipping correction rolls back the maximum in the metadata sent to
+        # the correction warp. Apply that decision before computing the factor
+        # used by row_sum, including the final tile, so numerator and denominator
+        # use the same normalization. Preserve the default threshold-zero body.
+        if cutlass.const_expr(self.skip_correction_threshold > 0):
+            if (
+                row_max_new - row_max
+            ) * softmax_params.softmax_scale_log2 <= self.skip_correction_threshold:
+                row_max_new = row_max
 
         # find correction factor (uses inherited row_max from peer = prev global max)
         correction_factor = cute.math.exp2(

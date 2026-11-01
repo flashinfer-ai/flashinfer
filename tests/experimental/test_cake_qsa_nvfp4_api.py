@@ -240,6 +240,23 @@ def test_omitted_backend_takes_the_auto_route(monkeypatch):
     assert [tag for tag, _, _ in calls] == [want]
 
 
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_omitted_backend_sends_fp8_and_bf16_to_the_existing_implementation(
+    monkeypatch, kv_dtype
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device required")
+    calls = _patch_both_backends(monkeypatch)
+    t = torch.empty(0, device="cuda")
+    kv = t.to(kv_dtype)
+    with _quiet():
+        result = public_api.qsa_sparse_paged_attention(
+            t, kv, kv, t, t, t, False, output_gate=t
+        )
+    assert result == "existing"
+    assert [tag for tag, _, _ in calls] == ["existing"]
+
+
 def test_omitted_backend_on_a_cpu_tensor_takes_the_existing_implementation(monkeypatch):
     calls = _patch_both_backends(monkeypatch)
     t = torch.empty(0)
@@ -526,7 +543,7 @@ def test_wide_grid_is_multi_wave_with_long_streams():
     128 single-split grid of 256 CTAs is wide too, which selects nothing there (the tcgen05
     decode has one split-form record).  On sm_120a the bound is the stream alone
     (``long_stream``): at 188 SMs (376 resident CTAs) rows 32 (3 splits, 11 tiles per CTA),
-    64 (2 splits, 17) and 128 (1 split, 33) are wide within one wave, rows 1-16 (at most 7
+    64 and 128 (1 split, 33 tiles) are wide within one wave, rows 1-16 (at most 7
     tiles per CTA) are not; the stream bound is inclusive at 11 tiles."""
     sm_count, arch = 108, "sm_80"
     tiles = cake_backend.num_tiles(2051)
@@ -590,7 +607,7 @@ def test_wide_grid_is_multi_wave_with_long_streams():
         rows: cake_backend.num_splits(rows, 2, 2051, 188, "sm_120a")
         for rows in (1, 2, 4, 8, 16, 32, 64, 128)
     }
-    assert [splits_188[rows] for rows in (16, 32, 64, 128)] == [5, 3, 2, 1]
+    assert [splits_188[rows] for rows in (16, 32, 64, 128)] == [5, 3, 1, 1]
     for rows in (1, 2, 4, 8, 16):
         splits = splits_188[rows]
         assert -(-tiles // splits) < 11, rows

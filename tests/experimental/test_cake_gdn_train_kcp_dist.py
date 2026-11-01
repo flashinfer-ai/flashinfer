@@ -10,48 +10,72 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Multi-GPU rows of the context-parallel (KCP) packed GDN training route (``cake_gdn_train.cake_kcp``): ``W`` ranks over
-NCCL, each holding the fragments of one partition of a packed batch, compared with the exact FP64 per-document
-recurrence of the same operands and with one another.  Per row and rank the test checks
+Multi-GPU rows of the non-deterministic context-parallel (KCP) packed GDN training package
+(``flashinfer.experimental.cake_gdn_train_kcp``, ``cake_kcp``; every compute entry is called with
+``deterministic=False``): ``W`` ranks over NCCL, each holding the fragments of one partition of a packed batch, compared
+with the exact FP64 per-document recurrence of the same operands.  The package keeps the deterministic twin's contract
+and accuracy budgets; its results are not bitwise equal to the deterministic route's and bitwise equality between two
+of its own runs is not part of its contract, so every comparison of two results of this package is a budget check;
+what stays exact is structural (zero gradients, collective counts, byte counts, launch records).  Per row:
 
-* vs FP64 (rank 0, the outputs reassembled to the global order): ``out, dq, dk, dv`` as stored BF16, ``dg, dbeta`` FP32;
-  the correctness rows (regime ``normal``) by the elementwise clause ``|cand - ref| <= 1e-2 + 1e-2 |ref|`` with zero
-  mismatches on every tensor; the accuracy rows (regimes A1-A4) by the per-(row, CP, tensor) budgets of
-  ``cake_gdn_train_kcp_g1_budgets.json`` (rel-RMS <= budget and max-abs <= budget + one storage ulp of |ref| at the
-  worst element, all six tensors; their elementwise counts are recorded as information); rel-RMS / max-abs recorded
-  for every tensor;
-* bitwise (G3): repeat; saved == replay (``boundary_mode``); ``save_mode`` light == full; autograd == explicit;
-  ``torch.utils.checkpoint(use_reentrant=False)`` == direct; ``save_transfer`` True == False; ring == a2a where the
-  partition allows the ring; strided packed-QKV views == contiguous operands (``layout`` tma and copy);
-  ``.backward()`` twice accumulates exactly twice the gradient;
-* semantics (G4): zero-gradient leak (``dout`` zero outside one document -> exactly zero gradients on the others) and
-  independence (the other documents' operands replaced -> one document's outputs bitwise unchanged);
-* contracts (G10): #7039 retained bytes after a checkpointed forward (``graph="off"``), the exchange byte counts against
-  ``gdn_kcp_comm_bytes``, CUDA-graph capture of forward + backward (no steady-state D2H / sync), the #7038 side-stream
-  ratio of the backward (asserted for the kernel backend; reported for the torch emulation).
+* vs FP64: every rank judges its own tokens against the FP64 reference of the documents it holds and the partial sums
+  are combined over the group (the verdict of the reassembled tensor).  ``out, dq, dk, dv`` as stored BF16, ``dg,
+  dbeta`` FP32; the correctness rows (regime ``normal``) by the elementwise clause ``|cand - ref| <= 1e-2 + 1e-2 |ref|``
+  with zero mismatches; the accuracy rows (regimes A1-A4) by the per-(row, CP, tensor) budgets of the deterministic
+  package's ``cake_gdn_det_train_kcp_g1_budgets.json`` (rel-RMS <= budget and max-abs <= budget + one storage ulp of
+  |ref| at the worst element).  No budget is derived from this package's output.
+* every arm (repeat, saved / replay, light / full, autograd / explicit, checkpoint / direct with its kept-tape and
+  recompute-handle forms, ``save_transfer``, ring / a2a, strided / contiguous, CUDA-graph replay) within the FP64
+  budgets on its own and, against its partner arm, within the same budget constants; ``.backward()`` twice: half the
+  accumulated gradient against the FP64 gradient;
+* worst case: ``N_REPEAT`` forward + backward runs per row, all recorded, the worst run per tensor gated;
+* semantics (G4): the zero-gradient leak stays exact (``dout`` zero outside one document -> exactly zero gradients on
+  the others); independence (the other documents' operands replaced) within the budget constants;
+* contracts (G10, as in the deterministic rows): retained bytes after a checkpointed forward, the exchange bytes against
+  ``gdn_comm_bytes_kcp``, CUDA-graph capture (replay events; asserted for the kernel backend), no synchronizing call in
+  context preparation or the ``"auto"`` checkpoint form, the side-stream ratio (reported);
+* the collectives of one backward (counted by ``torch.distributed`` name): exactly the deterministic route's set
+  (``b1``, ``b2``) and no ``all_reduce`` / ``reduce_scatter`` of parameters;
+* the host of every rank (``socket.gethostname``); under Slurm the group spans the hosts the step's task layout gives
+  its ranks (the cross-host rows of a multi-node step);
+* the deterministic route (``flashinfer.cake_gdn_det_train_kcp``) on the same operands in the same process: both routes
+  within the same FP64 budgets and their difference within the same budget constants (FP64 is the reference).
+
+``test_poisoned_workspace_pairs``: one ``WorkspaceKcp`` reused across two rows of different token layouts on one group,
+every pool and tape of the workspace filled with NaN in between; both rows within the FP64 budgets.  The convolution
+halo row C7 (``cake_causal_conv1d_kcp`` through this package's context) and the whole-layer checkpoint rows
+(``RecomputeHandleKcp``: the recompute exchanges nothing; out / dx / dweight / dg / dbeta within the budget constants of
+the plain checkpoint and the direct pass and within the correctness clause of the FP64 layer oracle; the backward's
+collectives are the deterministic layer's) run under Slurm.
 
 Two launch forms: ``torch.multiprocessing.spawn`` (``pytest`` on a node with >= ``W`` GPUs) and one process per Slurm
 task (``SLURM_PROCID`` / ``SLURM_NTASKS``: the WORLD group is initialised once per process, every row runs on a
-sub-group of its ``W`` lowest ranks; the other ranks skip the row).  ``KCP_TEST_BACKEND`` selects ``kernels`` |
-``fake`` (default: ``kernels`` when the package's ``build.json`` lists the programs, else ``fake``);
-``KCP_TEST_ROWS`` selects rows by name (comma list; ``all``) or by stage (``int1`` CP <= 4, ``int3`` CP8, ``int4`` CP16);
-``KCP_TEST_RESULT_DIR`` receives one JSON per row.
+sub-group of its ``W`` lowest ranks; the other ranks skip the row).  Environment: ``KCP_TEST_BACKEND`` (``kernels`` |
+``fake``; default ``kernels`` when the package's ``build.json`` lists the programs, else ``fake``), ``KCP_TEST_ROWS``
+(row or pair names, comma list; ``all``; or a stage: ``int1`` CP <= 4, ``int3`` CP8, ``int4`` CP16),
+``KCP_TEST_RESULT_DIR`` (one JSON per row), ``KCP_TEST_MODE`` (``full`` | ``forward``), ``KCP_TEST_REPEATS`` (raises
+``N_REPEAT`` above 3), ``KCP_TEST_PORT_DIR`` (the Slurm rendezvous port file), ``KCP_TEST_DEBUG_RETAINED``.
 Operands come from the seeded CPU generator (bitwise identical on every rank and host).
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as _dt
 import gc
 import importlib
+import inspect
 import json
 import math
 import os
+import re
 import socket
 import statistics
+import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 
 import pytest
@@ -59,16 +83,35 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-PACKAGE = "flashinfer.experimental.cake_gdn_train"
+from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
+
+PACKAGE = "flashinfer.experimental.cake_gdn_train_kcp"
+DET_PACKAGE = "flashinfer.experimental.cake_gdn_det_train_kcp"
+DET_API = (
+    "flashinfer.cake_gdn_det_train_kcp"  # the deterministic route's public objects
+)
+FACADE = "flashinfer.cake_gdn_train_kcp"  # the mode-dispatching facade (deterministic=False -> this package)
 
 
 def _mod(sub: str | None = None):
     try:
         from tests.test_helpers.cake_package import cake_package
 
-        return cake_package("cake_gdn_train", sub)
+        return cake_package("cake_gdn_train_kcp", sub)
     except (ImportError, KeyError):
         return importlib.import_module(PACKAGE if sub is None else f"{PACKAGE}.{sub}")
+
+
+def _det_mod(sub: str | None = None):
+    """A module of the deterministic package (its ``LAST_CALL`` for the collective comparison)."""
+    try:
+        from tests.test_helpers.cake_package import cake_package
+
+        return cake_package("cake_gdn_det_train_kcp", sub)
+    except (ImportError, KeyError):
+        return importlib.import_module(
+            DET_PACKAGE if sub is None else f"{DET_PACKAGE}.{sub}"
+        )
 
 
 kcp = _mod("cake_kcp")
@@ -82,6 +125,7 @@ GRADS = (
     "dg",
     "dbeta",
 )  # autograd order of the leaves (q, k, v, g, beta)
+LAYER_TENSORS = ("out", "dx", "dw", "dg", "dbeta")
 ATOL = RTOL = 1e-2
 STATE_REL_RMS_MAX = 1e-2  # forward-only mode: S_in (FP32, owner-merged) vs the FP64 cut state, per crossing-in fragment
 WORLD_TIMEOUT_S = 300  # NCCL / rendezvous timeout of the WORLD group (printed at init)
@@ -90,12 +134,23 @@ C_CONV = 10240
 ALLOC_GRANULE = 512  # the caching allocator rounds every block to 512 B
 SIDE_STREAM_RATIO_MAX = 1.10  # #7038; the per-row ratio is recorded, never a gate (the module-timing protocol decides)
 SIDE_STREAM_ITERS = 7
+F64 = torch.float64
+# (a) forward + backward runs per row; the worst run per tensor is gated (KCP_TEST_REPEATS may raise the count)
+N_REPEAT = max(3, int(os.environ.get("KCP_TEST_REPEATS") or 3))
+# owner chains (the exchange families of the host tables) of the long-chain rows: longer than this on every owning rank
+OWNER_FAMILIES = ("fwd", "adj_b1", "adj_c1")
+LONG_CHAIN_MIN = 3
+# (b) collectives that would reduce parameters across the group: never issued by the route
+PARAM_REDUCTIONS = ("all_reduce", "reduce_scatter_tensor")
+# (d) the identity tile is a constant written once when the pool is sized (not scratch): it is not poisoned
+POISON_EXEMPT_POOLS = ("eye",)
+STAGES = ("int1", "int3", "int4")
 
 
 def _reference():
-    """The FP64 reference: the FlashInfer test helper once it ships, else the session harness on PYTHONPATH."""
+    """The FP64 reference: the FlashInfer test helper (read only), else the session harness on PYTHONPATH."""
     try:
-        from tests.test_helpers import cake_gdn_train_reference as ref  # type: ignore[attr-defined]
+        from tests.test_helpers import cake_gdn_det_train_kcp_reference as ref  # type: ignore[attr-defined]
 
         return ref
     except ImportError:
@@ -103,16 +158,25 @@ def _reference():
 
 
 def _inputs():
-    """The seeded operand generator (``make_inputs(cu, H_qk, HV, *, regime, seed, token_range)``)."""
-    try:
-        from tests.test_helpers import cake_gdn_train_inputs as gen  # type: ignore[attr-defined]
+    """The seeded operand generator (``make_inputs(cu, H_qk, HV, *, regime, seed, token_range)``): the inputs helper,
+    else the reference helper (the same generator, bitwise), else the session harness on PYTHONPATH."""
+    for name in (
+        "tests.test_helpers.cake_gdn_det_train_kcp_inputs",
+        "tests.test_helpers.cake_gdn_det_train_kcp_reference",
+    ):
+        try:
+            mod = importlib.import_module(name)
+        except ImportError:
+            continue
+        if hasattr(mod, "make_inputs"):
+            return mod
+    return importlib.import_module("gdn_inputs")
 
-        return gen
-    except ImportError:
-        return importlib.import_module("gdn_inputs")
 
-
-BUDGETS_FILE = Path(__file__).resolve().parent / "cake_gdn_train_kcp_g1_budgets.json"
+# the deterministic package's budget table, read only: the same budgets judge this package
+BUDGETS_FILE = (
+    Path(__file__).resolve().parent / "cake_gdn_det_train_kcp_g1_budgets.json"
+)
 STORAGE = {
     "out": "bf16",
     "dq": "bf16",
@@ -124,9 +188,9 @@ STORAGE = {
 
 
 def _budgets() -> dict:
-    """The accuracy budgets of the multi-rank rows (the file beside this test): per (row, CP, tensor) the rel-RMS and
-    max-abs budget = 1.10 x max(single-rank local-path error of this package, FLA tf32x3 error at the FLA layout of
-    record), declared before the rows ran and vendored unchanged."""
+    """The accuracy budgets of the multi-rank rows (the deterministic package's table, unchanged): per (row, CP,
+    tensor) the rel-RMS and max-abs budget = 1.10 x max(single-rank local-path error of the deterministic package, FLA
+    tf32x3 error at the FLA layout of record), declared before the rows ran."""
     with open(BUDGETS_FILE) as fh:
         return json.load(fh)
 
@@ -145,59 +209,337 @@ def _budget_cell(row: Row) -> tuple[dict, int] | None:
     return cells[str(cp)], cp
 
 
-def _judge(
-    report: dict,
-    row: Row,
-    name: str,
-    cand: torch.Tensor,
-    ref: torch.Tensor,
-    ref_mod,
-    budget: tuple[dict, int] | None,
-) -> None:
-    """Rank-0 verdict of one reassembled tensor against FP64, written to ``report["metrics"][name]`` and folded into
-    ``report["pass"]``.  Correctness rows (regime ``normal``): the elementwise clause, zero elements beyond
-    ``ATOL + RTOL |ref|``.  Accuracy rows (regimes A1-A4): the row's budget cell (``_budget_cell``): rel-RMS within the
-    budget and max-abs within the budget plus one storage ulp of |ref| at the worst element (the reference module's
-    ``judge_tensor``), on all six tensors; the elementwise count is recorded as information.  Finiteness gates every
-    row; an accuracy row without a budget cell cannot pass."""
-    err = cand - ref
-    excess = err.abs() - (ATOL + RTOL * ref.abs())
-    mism = int((excess > 0).sum())
-    elementwise = row.regime == "normal"
-    m = {
-        "mismatch": mism,
-        "rel_rms": float(
-            err.pow(2).mean().sqrt() / ref.pow(2).mean().sqrt().clamp_min(1e-300)
-        ),
-        "max_abs": float(err.abs().max()) if err.numel() else 0.0,
-        "ref_rms": float(ref.pow(2).mean().sqrt()) if ref.numel() else 0.0,
-        "finite": bool(torch.isfinite(cand).all()),
-        "gated": elementwise,  # the elementwise count is the verdict of the correctness rows only
-        "verdict": "elementwise" if elementwise else "budget",
+# ----------------------------------------------------------------------------------------------------------------
+# the distributed judge: every rank compares its local tokens, the partial sums combine over the group
+
+
+def _partial(ref_mod, cand: torch.Tensor, ref: torch.Tensor) -> dict:
+    """This rank's share of one comparison: the reference module's error metrics and elementwise count on the local
+    elements (FP64), as sums that combine across ranks."""
+    m = ref_mod.error_metrics(cand, ref)
+    e = ref_mod.elementwise_mismatch(cand, ref, ATOL, RTOL)
+    n = int(m["numel"])
+    return {
+        "n": n,
+        "sq_err": float(m["rms"]) ** 2 * n,
+        "sq_ref": float(m["ref_rms"]) ** 2 * n,
+        "max_abs": float(m["max_abs"]),
+        "ref_max_abs": float(m["ref_max_abs"]),
+        "nonfinite": int(m["nonfinite"]),
+        "mismatch": int(e["mismatch"]),
+        "worst": m["worst"],
     }
-    if elementwise:
-        ok = m["finite"] and mism == 0
-    elif budget is None:
-        m["budget"] = None
+
+
+def _combine(parts: list) -> dict:
+    """The metrics of the whole tensor from the ranks' partials (``error_metrics`` keys; ``worst`` carries its rank)."""
+    ps = [p for p in parts if p is not None]
+    n = sum(p["n"] for p in ps)
+    sq_err = sum(p["sq_err"] for p in ps)
+    sq_ref = sum(p["sq_ref"] for p in ps)
+    rms = math.sqrt(sq_err / n) if n else 0.0
+    ref_rms = math.sqrt(sq_ref / n) if n else 0.0
+    worst = None
+    for r, p in enumerate(parts):
+        w = None if p is None else p["worst"]
+        if w is None:
+            continue
+        if worst is None or math.isnan(w["err"]) or w["err"] > worst["err"]:
+            worst = {**w, "rank": r}
+    return {
+        "rel_rms": rms / ref_rms if ref_rms > 0 else (math.inf if rms > 0 else 0.0),
+        "max_abs": max((p["max_abs"] for p in ps), default=0.0),
+        "rms": rms,
+        "ref_rms": ref_rms,
+        "ref_max_abs": max((p["ref_max_abs"] for p in ps), default=0.0),
+        "numel": n,
+        "nonfinite": sum(p["nonfinite"] for p in ps),
+        "mismatch": sum(p["mismatch"] for p in ps),
+        "worst": worst,
+    }
+
+
+def _verdict(row: Row, name: str, met: dict, budget, ref_mod) -> dict:
+    """The verdict of one combined comparison.  Correctness rows (regime ``normal``): the elementwise clause, zero
+    elements beyond ``ATOL + RTOL |ref|``.  Accuracy rows: the row's budget cell (``_budget_cell``): rel-RMS within the
+    budget and max-abs within the budget plus one storage ulp of |ref| at the worst element (the reference module's
+    ``judge_tensor``); the elementwise count is recorded.  Finiteness gates every row; an accuracy row without a
+    budget cell cannot pass.  The same rule judges a comparison against FP64 and one between two arms (the partner arm
+    in the place of the reference)."""
+    v = {
+        k: met[k]
+        for k in ("rel_rms", "max_abs", "ref_rms", "numel", "nonfinite", "mismatch")
+    }
+    v["worst"] = met["worst"]
+    if met["numel"] == 0:
+        v["verdict"] = "empty"
+        ok = True
+    elif row.regime == "normal":
+        v["verdict"] = "elementwise"
+        ok = met["nonfinite"] == 0 and met["mismatch"] == 0
+    elif budget is None or name not in budget[0]["tensors"]:
+        v["verdict"] = "budget"
+        v["budget"] = None
         ok = False
     else:
         cell, cp = budget
         b = cell["tensors"][name]
-        m["budget"] = ref_mod.judge_tensor(
-            ref_mod.error_metrics(cand, ref),
-            b["budget_rel_rms"],
-            b["budget_max_abs"],
-            b["storage"],
+        j = ref_mod.judge_tensor(
+            met, b["budget_rel_rms"], b["budget_max_abs"], b["storage"]
         )
-        m["budget"]["cp_of_cell"] = cp
-        ok = m["finite"] and bool(m["budget"]["pass_u1"])
-    report["metrics"][name] = m
-    report["pass"] &= ok
+        j["cp_of_cell"] = cp
+        v["verdict"] = "budget"
+        v["budget"] = j
+        ok = met["nonfinite"] == 0 and bool(j["pass_u1"])
+    v["ok"] = bool(ok)
+    return v
+
+
+def _severity(v: dict) -> tuple:
+    """Order of verdicts for the worst run: failed first, then non-finite, budget ratio, mismatches, max-abs."""
+    b = v.get("budget") or {}
+    ratio = max(
+        float(b.get("ratio_rel") or 0.0),
+        float(b.get("ratio_max_u1") or b.get("ratio_max") or 0.0),
+    )
+    return (
+        not v["ok"],
+        int(v.get("nonfinite", 0)),
+        ratio,
+        int(v.get("mismatch", 0)) if v.get("verdict") == "elementwise" else 0,
+        float(v.get("max_abs", 0.0)),
+    )
+
+
+class _Judge:
+    """FP64 and cross-arm comparisons of one row: each ``fp64`` / ``cross`` call adds this rank's partials at once
+    (the arm's tensors can go), ``finish`` gathers them once over the group and every rank derives the same verdicts.
+    Keys: ``fp64:<arm>:<tensor>`` and ``cross:<arm>:<tensor>``."""
+
+    def __init__(self, row: Row, ref_mod, budget) -> None:
+        self.row, self.ref_mod, self.budget = row, ref_mod, budget
+        self.parts: dict[str, dict] = {}
+        self.gated: dict[str, bool] = {}
+
+    def _add(self, key: str, cand: torch.Tensor, ref: torch.Tensor, gate: bool):
+        self.parts[key] = _partial(self.ref_mod, cand, ref)
+        self.gated[key] = bool(gate)
+
+    def fp64(
+        self, arm: str, res: dict, refs: dict, names=TENSORS, *, half=False, gate=True
+    ):
+        """``res`` against the FP64 reference; ``half``: half of an accumulated (two-backward) gradient, exact in
+        every float format, against the FP64 gradient."""
+        for n in names:
+            cand = res[n].detach().to(F64) * 0.5 if half else res[n]
+            self._add(f"fp64:{arm}:{n}", cand, refs[n], gate)
+
+    def cross(self, arm: str, a: dict, b: dict, names=TENSORS, *, gate=True):
+        """Arm ``a`` against its partner ``b`` within the same budget constants (``b`` in the reference's place)."""
+        for n in names:
+            self._add(f"cross:{arm}:{n}", a[n], b[n], gate)
+
+    def finish(self, group, W: int) -> dict[str, dict]:
+        mine = dict(self.parts)
+        if W > 1:
+            every: list = [None] * W
+            dist.all_gather_object(every, (mine, self.gated), group=group)
+        else:
+            every = [(mine, self.gated)]
+        keys: list[str] = []
+        gated: dict[str, bool] = {}
+        for p, gt in every:
+            for key in p:
+                if key not in gated:
+                    keys.append(key)
+                gated[key] = gated.get(key, True) and gt[key]
+        out: dict[str, dict] = {}
+        for key in keys:
+            met = _combine([p.get(key) for p, _ in every])
+            v = _verdict(
+                self.row, key.rsplit(":", 1)[1], met, self.budget, self.ref_mod
+            )
+            v["gated"] = gated[key]
+            # a key missing on a rank: that rank skipped the comparison (fails the verdict)
+            v["ranks"] = sum(1 for p, _ in every if key in p)
+            if v["ranks"] != len(every):
+                v["ok"] = False
+            out[key] = v
+        return out
+
+
+def _worst_of_runs(verdicts: dict, n_runs: int, names=TENSORS) -> dict:
+    """(a) the runs ``run0 .. run{n-1}`` per tensor: every verdict recorded, the worst one named and gated."""
+    out = {}
+    for n in names:
+        runs = {
+            f"run{i}": verdicts[f"fp64:run{i}:{n}"]
+            for i in range(n_runs)
+            if f"fp64:run{i}:{n}" in verdicts
+        }
+        worst = max(runs, key=lambda k: _severity(runs[k])) if runs else None
+        out[n] = {
+            "worst_run": worst,
+            "worst": runs.get(worst),
+            "ok": bool(len(runs) == n_runs and runs[worst]["ok"]),
+            "runs": {
+                k: {
+                    "ok": v["ok"],
+                    "rel_rms": v["rel_rms"],
+                    "max_abs": v["max_abs"],
+                    "mismatch": v["mismatch"],
+                }
+                for k, v in runs.items()
+            },
+        }
+    return out
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# rows (C1-C9 correctness rows, A1-A4 accuracy rows, the no-leak rows; the int4 stage = the CP16 rows of G4: at least
-# one correctness row at W = 16, here the C6 zigzag row and the A1 contiguous row at the (2, 6) head pair)
+# collectives by name (b), hosts (c)
+
+
+class _NamedCounter(CollectiveCounter):
+    """:class:`CollectiveCounter` that also counts the calls per phase by ``torch.distributed`` name
+    (``record()["named"][phase][name]``)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.named: dict[str, dict[str, int]] = {}
+
+    def __enter__(self) -> "_NamedCounter":
+        super().__enter__()
+        for name in list(self._saved):
+            inner = getattr(dist, name)
+
+            def shim(*a, _inner=inner, _name=name, **kw):
+                table = self.named.setdefault(self.phase, {})
+                table[_name] = table.get(_name, 0) + 1
+                return _inner(*a, **kw)
+
+            setattr(dist, name, shim)
+        return self
+
+    def record(self) -> dict:
+        return {
+            **super().record(),
+            "named": {p: dict(t) for p, t in self.named.items()},
+        }
+
+
+def _coll_tags(sequence) -> list[str]:
+    """The collective entries of a call's issue sequence (``a2a:<tag>`` / ``ring:<tag>``), in order."""
+    return [str(s) for s in sequence if str(s).startswith(("a2a:", "ring:"))]
+
+
+def _no_param_reduction(*records: dict) -> bool:
+    return all(
+        not table.get(name, 0)
+        for rec in records
+        for table in rec.get("named", {}).values()
+        for name in PARAM_REDUCTIONS
+    )
+
+
+def _expand_tasks_per_node(s: str) -> list[int]:
+    """``SLURM_*TASKS_PER_NODE`` (``4(x2),3``) -> ``[4, 4, 3]`` (``[]`` when unparsable)."""
+    out: list[int] = []
+    for item in s.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        m = re.match(r"^(\d+)(?:\(x(\d+)\))?$", item)
+        if not m:
+            return []
+        out += [int(m.group(1))] * int(m.group(2) or 1)
+    return out
+
+
+def _expected_node_index(W: int) -> list[int] | None:
+    """The step node of each rank ``0 .. W-1`` under the step's task layout (``block``, Slurm's default, or
+    ``cyclic``); ``None`` outside Slurm or for another distribution."""
+    if os.environ.get("SLURM_PROCID") is None:
+        return None
+    tpn = _expand_tasks_per_node(
+        os.environ.get("SLURM_STEP_TASKS_PER_NODE")
+        or os.environ.get("SLURM_TASKS_PER_NODE")
+        or ""
+    )
+    if not tpn or sum(tpn) < W:
+        return None
+    mode = re.split(r"[:,]", os.environ.get("SLURM_DISTRIBUTION") or "block")[0]
+    idx: list[int] = []
+    if mode == "block":
+        for node, n in enumerate(tpn):
+            idx += [node] * n
+    elif mode == "cyclic":
+        left, node = list(tpn), 0
+        while len(idx) < sum(tpn):
+            if left[node] > 0:
+                idx.append(node)
+                left[node] -= 1
+            node = (node + 1) % len(tpn)
+    else:
+        return None
+    return idx[:W]
+
+
+def _host_map(group, W: int) -> dict:
+    """(c) ``socket.gethostname()`` of every rank of the group (one ``all_gather_object``).  Under Slurm the ranks
+    share a host exactly when the step's task layout puts them on one node (a multi-node step with an unknown layout
+    fails: a cross-host row must be shown to span its hosts); outside Slurm the group is one host."""
+    host = socket.gethostname()
+    hosts: list = [None] * W
+    if W > 1:
+        dist.all_gather_object(hosts, host, group=group)
+    else:
+        hosts = [host]
+    nnodes = int(
+        os.environ.get("SLURM_STEP_NUM_NODES") or os.environ.get("SLURM_NNODES") or 1
+    )
+    idx = _expected_node_index(W)
+    rec: dict = {
+        "hosts": hosts,
+        "distinct_hosts": len(set(hosts)),
+        "slurm_nnodes": nnodes,
+        "expected_node_index": idx,
+    }
+    if idx is not None:
+        ok = all(
+            (idx[a] == idx[b]) == (hosts[a] == hosts[b])
+            for a in range(W)
+            for b in range(W)
+        )
+        rec["expected_distinct_hosts"] = len(set(idx))
+        nodes = _expand_hostlist(
+            os.environ.get("SLURM_STEP_NODELIST")
+            or os.environ.get("SLURM_NODELIST")
+            or ""
+        )
+        # reported: the node names of the step against the host names (naming may differ by domain suffix)
+        rec["nodelist_names_match"] = (
+            all(
+                str(hosts[r]).split(".")[0] == nodes[idx[r]].split(".")[0]
+                for r in range(W)
+            )
+            if nodes and max(idx) < len(nodes)
+            else None
+        )
+    elif os.environ.get("SLURM_PROCID") is not None and nnodes > 1:
+        ok = False
+        rec["reason"] = (
+            "multi-node step with an unknown task layout (SLURM_STEP_TASKS_PER_NODE / SLURM_DISTRIBUTION)"
+        )
+    else:
+        ok = len(set(hosts)) == 1
+    rec["cross_host"] = len(set(hosts)) > 1
+    rec["ok"] = bool(ok)
+    return rec
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# rows (C1-C9 correctness rows, A1-A4 accuracy rows, the no-leak rows, the long-chain rows; the int4 stage = the
+# CP16 rows: the C6 zigzag row, the A1 contiguous row at the (2, 6) head pair and the long-chain two-document row)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -210,6 +552,7 @@ class Row:
     regime: str = "normal"
     leak: bool = False  # run the zero-gradient leak / independence checks
     stage: str = "int1"  # int1 (CP <= 4, small), int3 (CP8 / large), int4 (CP16)
+    long_chains: bool = False  # long owner chains (checked on the CPU: test_long_chain_rows_have_long_owner_chains)
 
 
 def _c5_fragments() -> list[list[tuple[int, int, int]]]:
@@ -251,13 +594,94 @@ ROWS = [
         regime="A3",
         stage="int3",
     ),
-    Row("C6", (65553,), (16, 48), 8, "zigzag", stage="int3"),
+    Row("C6", (65553,), (16, 48), 8, "zigzag", stage="int3", long_chains=True),
     Row("C8", (10240, 8192, 2085), (16, 48), 8, "contiguous", stage="int3"),
-    Row("A1", (32801,), (2, 6), 8, "contiguous", regime="A1", stage="int3"),
+    # A1 / A1-cp16: the adversarial regime's mild gates carry state across every rank of the owner chains
+    Row(
+        "A1",
+        (32801,),
+        (2, 6),
+        8,
+        "contiguous",
+        regime="A1",
+        stage="int3",
+        long_chains=True,
+    ),
     Row("A2", (40000,), (2, 6), 8, "contiguous", regime="A2", stage="int3"),
     Row("A4", (131071,), (2, 6), 8, "contiguous", regime="A4", stage="int3"),
-    Row("C6-cp16", (65553,), (16, 48), 16, "zigzag", stage="int4"),
-    Row("A1-cp16", (32801,), (2, 6), 16, "contiguous", regime="A1", stage="int4"),
+    # long-chain rows: two documents, every one cut into 2 W pieces (owner chains of 2 W - 1 crossing fragments)
+    Row(
+        "LC-D8",
+        (20001, 12003),
+        (2, 6),
+        8,
+        "zigzag_per_document",
+        stage="int3",
+        long_chains=True,
+    ),
+    Row("C6-cp16", (65553,), (16, 48), 16, "zigzag", stage="int4", long_chains=True),
+    Row(
+        "A1-cp16",
+        (32801,),
+        (2, 6),
+        16,
+        "contiguous",
+        regime="A1",
+        stage="int4",
+        long_chains=True,
+    ),
+    Row(
+        "LC-D16",
+        (20001, 12003),
+        (2, 6),
+        16,
+        "zigzag_per_document",
+        stage="int4",
+        long_chains=True,
+    ),
+]
+
+
+def _row_by_name(name: str) -> Row:
+    for r in ROWS:
+        if r.name == name:
+            return r
+    raise KeyError(name)
+
+
+@dataclasses.dataclass(frozen=True)
+class PoisonPair:
+    """(d) two rows of one group size and different token layouts that share one workspace, the second after the
+    first (the first is the larger where the heads agree, so its pools are reused)."""
+
+    name: str
+    first: str
+    second: str
+    stage: str
+
+    @property
+    def rows(self) -> tuple[Row, Row]:
+        return _row_by_name(self.first), _row_by_name(self.second)
+
+    @property
+    def W(self) -> int:
+        return self.rows[0].W
+
+
+POISON_PAIRS = [
+    PoisonPair(
+        "P2", "C1-cp2", "leak-D", "int1"
+    ),  # contiguous 5 docs -> zigzag_per_document 3 docs
+    PoisonPair(
+        "P4z", "C2-C", "C2-Z", "int1"
+    ),  # contiguous -> zigzag, one document (zigzag and zigzag_per_document coincide for one document)
+    PoisonPair("P4r", "C4a", "C4b", "int1"),  # ragged -> ragged with an empty rank
+    PoisonPair(
+        "P8", "A2", "LC-D8", "int3"
+    ),  # contiguous (A2 budgets) -> zigzag_per_document
+    PoisonPair(
+        "P16", "A1-cp16", "LC-D16", "int4"
+    ),  # contiguous (A1 CP8 budgets) -> zigzag_per_document
 ]
 
 
@@ -265,20 +689,39 @@ def _selected_rows() -> list[Row]:
     sel = os.environ.get("KCP_TEST_ROWS", "int1")
     if sel == "all":
         return list(ROWS)
-    if sel in ("int1", "int3", "int4"):
+    if sel in STAGES:
         return [r for r in ROWS if r.stage == sel]
     names = {s.strip() for s in sel.split(",") if s.strip()}
     rows = [r for r in ROWS if r.name in names]
-    missing = names - {r.name for r in rows}
+    missing = names - {r.name for r in rows} - {p.name for p in POISON_PAIRS}
     if missing:
         raise ValueError(f"KCP_TEST_ROWS names unknown rows {sorted(missing)}")
     return rows
+
+
+def _selected_poison_pairs() -> list[PoisonPair]:
+    sel = os.environ.get("KCP_TEST_ROWS", "int1")
+    if sel == "all":
+        return list(POISON_PAIRS)
+    if sel in STAGES:
+        return [p for p in POISON_PAIRS if p.stage == sel]
+    names = {s.strip() for s in sel.split(",") if s.strip()}
+    return [p for p in POISON_PAIRS if p.name in names or {p.first, p.second} <= names]
 
 
 def _row_id(row: Row) -> str:
     return (
         f"{row.name}-w{row.W}-h{row.heads[0]}x{row.heads[1]}-{row.layout.split(':')[0]}"
     )
+
+
+def _pair_id(pair: PoisonPair) -> str:
+    return f"{pair.name}-{pair.first}+{pair.second}-w{pair.W}"
+
+
+def _report_file(obj, kind: str) -> str:
+    ident = _pair_id(obj) if isinstance(obj, PoisonPair) else _row_id(obj)
+    return ident + {"full": ".json", "fwd": "-fwd.json", "poison": "-poison.json"}[kind]
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -312,17 +755,23 @@ def _ragged(cu: list[int], t_r: list[int]) -> list[list[tuple[int, int, int]]]:
     return nested
 
 
-def _partition(row: Row):
+def _partition_with(fn, row: Row):
+    """``fn(cu, W, layout=... | fragments=...)``: this package's ``partition_kcp`` or the deterministic route's
+    ``partition_det_kcp`` (the same partition of the row)."""
     cu = _cu(row.lengths)
     if row.layout.startswith("ragged:"):
         t_r = [int(x) for x in row.layout.split(":")[1].split(",")]
         assert len(t_r) == row.W and sum(t_r) == cu[-1]
-        return plan.kcp_partition(cu, row.W, fragments=_ragged(cu, t_r)), cu
+        return fn(cu, row.W, fragments=_ragged(cu, t_r)), cu
     if row.layout.startswith("explicit:"):
         make, lengths = EXPLICIT[row.layout.split(":")[1]]
         assert tuple(lengths) == tuple(row.lengths)
-        return plan.kcp_partition(cu, row.W, fragments=make()), cu
-    return plan.kcp_partition(cu, row.W, layout=row.layout), cu
+        return fn(cu, row.W, fragments=make()), cu
+    return fn(cu, row.W, layout=row.layout), cu
+
+
+def _partition(row: Row):
+    return _partition_with(plan.partition_kcp, row)
 
 
 def _programs_exported() -> bool:
@@ -408,20 +857,76 @@ def _global_inputs(row: Row, cu: list[int], device, *, seed=None):
     }
 
 
-def _to_global(
-    part, rank_tensors: list[torch.Tensor], cu: list[int], total: int
-) -> torch.Tensor:
-    ref = rank_tensors[0]
-    g = torch.zeros((total,) + tuple(ref.shape[1:]), dtype=ref.dtype, device=ref.device)
-    for r, t in enumerate(rank_tensors):
-        pos = 0
-        for f in part.fragments[r]:
-            if f.length:
-                g[cu[f.doc] + f.off : cu[f.doc] + f.off + f.length] = t[
-                    pos : pos + f.length
-                ]
-            pos += f.length
-    return g
+def _local_reference(
+    row: Row, part, cu: list[int], rank: int, device, *, forward_only: bool = False
+) -> dict[str, torch.Tensor]:
+    """The FP64 reference on this rank's tokens (fragment order): the exact recurrence of every document the rank
+    holds (each from the zero state, operands bitwise the global ones), sliced to the rank's fragments.  ``out`` and
+    the five gradients, or ``out`` alone with ``forward_only``."""
+    ref_mod, gen = _reference(), _inputs()
+    H_qk, HV = row.heads
+    frags = [f for f in part.fragments[rank] if f.length > 0]
+    names = ("out",) if forward_only else TENSORS
+    per_doc: dict[int, dict[str, torch.Tensor]] = {}
+    for d in sorted({f.doc for f in frags}):
+        n = cu[d + 1] - cu[d]
+        got = gen.make_inputs(
+            cu, H_qk, HV, regime=row.regime, token_range=(cu[d], cu[d + 1])
+        )
+        ops = {
+            k_: got[k_].reshape((-1,) + tuple(got[k_].shape[2:])).to(device)
+            for k_ in ("q", "k", "v", "g", "beta", "dout")
+        }
+        cu_d = torch.tensor([0, n], dtype=torch.int64)
+        if forward_only:
+            o = ref_mod.gdn_exact_forward(
+                ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], cu_d, scale=SCALE
+            )
+            per_doc[d] = {"out": o[0] if isinstance(o, tuple) else o}
+        else:
+            r = ref_mod.gdn_exact_with_grads(
+                ops["q"],
+                ops["k"],
+                ops["v"],
+                ops["g"],
+                ops["beta"],
+                ops["dout"],
+                cu_d,
+                scale=SCALE,
+            )
+            per_doc[d] = {nm: r[nm] for nm in names}
+        del ops, got
+    shapes = {
+        "out": (HV, 128),
+        "dq": (H_qk, 128),
+        "dk": (H_qk, 128),
+        "dv": (HV, 128),
+        "dg": (HV,),
+        "dbeta": (HV,),
+    }
+    out = {}
+    for nm in names:
+        pieces = [
+            per_doc[f.doc][nm][f.off : f.off + f.length].to(device=device, dtype=F64)
+            for f in frags
+        ]
+        out[nm] = (
+            torch.cat(pieces, 0)
+            if pieces
+            else torch.zeros((0,) + shapes[nm], dtype=F64, device=device)
+        )
+    del per_doc
+    return out
+
+
+def _local_to_global(part, cu: list[int], rank: int) -> torch.Tensor:
+    """Global token index of every local token of ``rank`` (fragment order), CPU int64."""
+    pieces = [
+        torch.arange(cu[f.doc] + f.off, cu[f.doc] + f.off + f.length)
+        for f in part.fragments[rank]
+        if f.length
+    ]
+    return torch.cat(pieces) if pieces else torch.zeros(0, dtype=torch.int64)
 
 
 def _doc_mask_local(part, cu: list[int], rank: int, doc: int, device) -> torch.Tensor:
@@ -445,10 +950,6 @@ def _packed_views(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     kv.copy_(k)
     vv.copy_(v)
     return buf, qv, kv, vv
-
-
-def _eq(a: dict, b: dict, names=TENSORS) -> bool:
-    return all(torch.equal(a[n], b[n]) for n in names)
 
 
 def _rounded(nbytes: int) -> int:
@@ -569,7 +1070,7 @@ def _live_blocks_since(mark: int, device, *, skip=()) -> list[dict]:
             if (
                 "/torch/" in fn
                 and "checkpoint" not in fn
-                and "cake_gdn_train" not in fn
+                and "cake_gdn_train_kcp" not in fn
             ):
                 continue
             frames.append(f"{fn.rsplit('/', 1)[-1]}:{f.get('line')} {f.get('name')}")
@@ -590,6 +1091,94 @@ def _test_mode() -> str:
     return mode
 
 
+def _new_report(obj, rank: int, W: int, backend: str, device, mode: str) -> dict:
+    return {
+        "row": dataclasses.asdict(obj),
+        "pass": True,
+        "failing": [],
+        "mode": mode,
+        "package": PACKAGE,
+        "rank": rank,
+        "world": W,
+        "backend": backend,
+        "host": socket.gethostname(),
+        "device": str(device),
+        "device_name": torch.cuda.get_device_name(device)
+        if device.type == "cuda"
+        else "cpu",
+        "nccl": ".".join(str(x) for x in torch.cuda.nccl.version())
+        if W > 1 and torch.cuda.is_available()
+        else None,
+        "torch": torch.__version__,
+        "utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "n_repeat": N_REPEAT,
+        "flags": {},
+        "gated": [],
+        "reported": [],
+        "metrics": {},
+        "judged": {},
+        "info_by_rank": None,
+        "seconds": None,
+    }
+
+
+def _fold(
+    report: dict,
+    flag_list: list,
+    verdicts: dict,
+    *,
+    backend: str = "kernels",
+    kernel_only=(),
+    info_only=(),
+) -> None:
+    """Fold the ranks' exact flags (all ranks must hold) and the judged verdicts into ``report["pass"]``."""
+    keys: list[str] = []
+    for fl in flag_list:
+        for key in fl:
+            if key not in keys:
+                keys.append(key)
+    for key in keys:
+        ok = all(bool(fl.get(key, False)) for fl in flag_list)
+        report["flags"][key] = ok
+        if key in info_only or (key in kernel_only and backend != "kernels"):
+            report["reported"].append(key)
+        else:
+            report["gated"].append(key)
+            report["pass"] &= ok
+            if not ok:
+                report["failing"].append(key)
+    report["judged"] = verdicts
+    for key, v in verdicts.items():
+        if v["gated"]:
+            report["pass"] &= bool(v["ok"])
+            if not v["ok"]:
+                report["failing"].append(key)
+        else:
+            report["reported"].append(key)
+
+
+def _gate(report: dict, key: str, ok: bool) -> None:
+    report["flags"][key] = bool(ok)
+    report["gated"].append(key)
+    report["pass"] &= bool(ok)
+    if not ok:
+        report["failing"].append(key)
+
+
+def _finish_report(report: dict, group, W: int, rank: int, result_dir, kind, obj):
+    """The group-wide verdict and rank 0's JSON."""
+    if W > 1:
+        verdict: list = [None] * W
+        dist.all_gather_object(verdict, report["pass"], group=group)
+        report["pass"] = all(verdict)
+        dist.barrier(group=group)
+    if rank == 0 and result_dir:
+        os.makedirs(result_dir, exist_ok=True)
+        with open(os.path.join(result_dir, _report_file(obj, kind)), "w") as fh:
+            json.dump(report, fh, indent=1, default=str)
+    return report
+
+
 def _run_rank_fwd(
     rank: int,
     W: int,
@@ -599,22 +1188,39 @@ def _run_rank_fwd(
     result_dir: str | None,
     backend: str,
 ) -> dict:
-    """Forward-only body of one rank (INT1): the forward's bitwise forms, ``out`` against the FP64 forward and the
-    crossing-in fragments' ``S_in`` against the FP64 cut states; nothing of the backward runs."""
+    """Forward-only body of one rank (INT1): the forward's arms against FP64 and against one another within the
+    budgets, and the crossing-in fragments' ``S_in`` against the FP64 cut states; nothing of the backward runs."""
     H_qk, HV = row.heads
     part, cu = _partition(row)
-    ctx = plan.build_kcp_context(part, group, rank, device)
+    ctx = plan.build_context_kcp(part, group, rank, device)
     total = cu[-1]
     ops = _local_inputs(row, part, cu, rank, device)
     q, k, v, g, beta = (ops[n] for n in ("q", "k", "v", "g", "beta"))
-    ws = kcp.KcpWorkspace()
+    ws = kcp.WorkspaceKcp()
     base = {"backend": backend}
     t_start = time.time()
+    ref_mod = _reference()
+    refs = _local_reference(row, part, cu, rank, device, forward_only=True)
+    judge = _Judge(row, ref_mod, _budget_cell(row))
+    OUT = ("out",)
 
     def fwd(qq=q, kk=k, vv=v, **opts):
-        return kcp.chunk_gdn_kcp_fwd(
-            qq, kk, vv, g, beta, ctx, workspace=ws, **{**base, **opts}
+        return kcp.chunk_gdn_fwd_kcp(
+            qq,
+            kk,
+            vv,
+            g,
+            beta,
+            ctx,
+            workspace=ws,
+            deterministic=False,
+            **{**base, **opts},
         )
+
+    def arm(name: str, o: torch.Tensor, partner=None, partner_name=None) -> None:
+        judge.fp64(name, {"out": o}, refs, OUT)
+        if partner is not None:
+            judge.cross(f"{name}_vs_{partner_name}", {"out": o}, {"out": partner}, OUT)
 
     flags: dict[str, bool] = {}
     info: dict[str, object] = {}
@@ -625,20 +1231,19 @@ def _run_rank_fwd(
         if k_ not in ("sequence", "pool_bytes", "fresh_bytes", "merges")
     }
     info["fwd_sequence"] = list(kcp.LAST_CALL["fwd"]["sequence"])
-    flags["repeat"] = torch.equal(out, fwd()[0])
-    flags["save_transfer_eq"] = torch.equal(out, fwd(save_transfer=False)[0])
-    flags["light_eq_full"] = torch.equal(out, fwd(save_mode="full")[0])
-    flags["saved_eq_replay"] = torch.equal(out, fwd(boundary_mode="replay")[0])
+    arm("run0", out)
+    for i in range(1, N_REPEAT):
+        arm(f"run{i}", fwd()[0], out, "run0")
+    arm("no_save_transfer", fwd(save_transfer=False)[0], out, "run0")
+    arm("full", fwd(save_mode="full")[0], out, "run0")
+    arm("replay", fwd(boundary_mode="replay")[0], out, "run0")
     ring_eligible = W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS
     info["ring_eligible"] = ring_eligible
-    flags["ring_eq_a2a"] = (not ring_eligible) or torch.equal(
-        out, fwd(exchange="ring", save_transfer=False)[0]
-    )
+    if ring_eligible:
+        arm("ring", fwd(exchange="ring", save_transfer=False)[0], out, "run0")
     _buf, qs, ks, vs = _packed_views(q, k, v)
-    flags["strided_eq_contiguous"] = torch.equal(out, fwd(qs, ks, vs)[0])
-    flags["copy_layout_eq_contiguous"] = torch.equal(
-        out, fwd(qs, ks, vs, layout="copy")[0]
-    )
+    arm("strided", fwd(qs, ks, vs)[0], out, "run0")
+    arm("copy_layout", fwd(qs, ks, vs, layout="copy")[0], out, "run0")
     # the carried states: S_in per crossing-in fragment (in_slot order) with its global cut
     s_in = (
         kcp.saved_states(saved)
@@ -646,74 +1251,39 @@ def _run_rank_fwd(
         else out.new_zeros((0, HV, 128, 128), dtype=torch.float32)
     )
     cuts = [None] * int(ctx.n_in)
-    for f in (
-        ctx.fragments[rank] if isinstance(ctx.fragments[0], tuple) else ctx.fragments
-    ):
+    # a rank without tokens has no fragments (an empty tuple): it must still reach the collectives below
+    frags = ctx.fragments
+    if frags and isinstance(frags[0], tuple):
+        frags = frags[rank]
+    for f in frags:
         if f.length > 0 and f.off > 0:
             cuts[int(ctx.in_slot[f.slot])] = int(cu[f.doc] + f.off)
     info["s_in_cuts"] = cuts
-    # gather
-    objs_out: list = [None] * W
+    host = _host_map(group, W)
+    flags["host_map"] = host["ok"]
+    verdicts = judge.finish(group, W)
     objs_s: list = [None] * W
     objs_cuts: list = [None] * W
     flag_list: list = [None] * W
     info_list: list = [None] * W
     if W > 1:
-        dist.all_gather_object(objs_out, out.cpu(), group=group)
         dist.all_gather_object(objs_s, s_in.cpu(), group=group)
         dist.all_gather_object(objs_cuts, cuts, group=group)
         dist.all_gather_object(flag_list, flags, group=group)
         dist.all_gather_object(info_list, info, group=group)
     else:
-        objs_out, objs_s, objs_cuts, flag_list, info_list = (
-            [out.cpu()],
-            [s_in.cpu()],
-            [cuts],
-            [flags],
-            [info],
-        )
-    report = {
-        "row": dataclasses.asdict(row),
-        "mode": "forward",
-        "rank": rank,
-        "world": W,
-        "backend": backend,
-        "host": socket.gethostname(),
-        "device": str(device),
-        "device_name": torch.cuda.get_device_name(device)
-        if device.type == "cuda"
-        else "cpu",
-        "nccl": ".".join(str(x) for x in torch.cuda.nccl.version())
-        if torch.cuda.is_available()
-        else None,
-        "torch": torch.__version__,
-        "utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "pass": True,
-        "flags": {},
-        "gated": [],
-        "reported": [],
-        "metrics": {},
-        "states": [],
-        "info_by_rank": info_list,
-    }
-    for key in flag_list[0]:
-        ok = all(bool(fl[key]) for fl in flag_list)
-        report["flags"][key] = ok
-        report["gated"].append(key)
-        report["pass"] &= ok
+        objs_s, objs_cuts, flag_list, info_list = [s_in.cpu()], [cuts], [flags], [info]
+    report = _new_report(row, rank, W, backend, device, "forward")
+    report["hosts"] = host
+    report["info_by_rank"] = info_list
+    report["states"] = []
+    _fold(report, flag_list, verdicts)
+    report["metrics"] = {"out": verdicts.get("fp64:run0:out")}
+    report["repeats"] = _worst_of_runs(verdicts, N_REPEAT, OUT)
+    _gate(report, "worst_run_out", report["repeats"]["out"]["ok"])
     if rank == 0 and total > 0:
-        ref_mod = _reference()
         glob = _global_inputs(row, cu, device)
         cu_t = torch.tensor(cu, dtype=torch.int64)
-        ref_out = ref_mod.gdn_exact_forward(
-            glob["q"], glob["k"], glob["v"], glob["g"], glob["beta"], cu_t, scale=SCALE
-        )
-        ref_out = ref_out[0] if isinstance(ref_out, tuple) else ref_out
-        cand = _to_global(part, [t.to(device) for t in objs_out], cu, total).to(
-            torch.float64
-        )
-        ref = ref_out.to(device=device, dtype=torch.float64).reshape(cand.shape)
-        _judge(report, row, "out", cand, ref, ref_mod, _budget_cell(row))
         all_cuts = sorted({c for cs in objs_cuts for c in cs if c is not None})
         if all_cuts:
             states = ref_mod.cut_states(
@@ -730,12 +1300,8 @@ def _run_rank_fwd(
                 for slot, c in enumerate(cs):
                     if c is None:
                         continue
-                    cand_s = st[slot].to(device=device, dtype=torch.float64)
-                    ref_s = (
-                        states[c]
-                        .to(device=device, dtype=torch.float64)
-                        .reshape(cand_s.shape)
-                    )
+                    cand_s = st[slot].to(device=device, dtype=F64)
+                    ref_s = states[c].to(device=device, dtype=F64).reshape(cand_s.shape)
                     e = cand_s - ref_s
                     rel = float(
                         e.pow(2).mean().sqrt()
@@ -754,18 +1320,12 @@ def _run_rank_fwd(
                         "finite": bool(torch.isfinite(cand_s).all()),
                     }
                     report["states"].append(entry)
-                    report["pass"] &= entry["finite"] and rel <= STATE_REL_RMS_MAX
+                    ok = entry["finite"] and rel <= STATE_REL_RMS_MAX
+                    report["pass"] &= ok
+                    if not ok:
+                        report["failing"].append(f"state:{r_}:{slot}")
     report["seconds"] = round(time.time() - t_start, 2)
-    if W > 1:
-        verdict: list = [None] * W
-        dist.all_gather_object(verdict, report["pass"], group=group)
-        report["pass"] = all(verdict)
-        dist.barrier(group=group)
-    if rank == 0 and result_dir:
-        os.makedirs(result_dir, exist_ok=True)
-        with open(os.path.join(result_dir, _row_id(row) + "-fwd.json"), "w") as fh:
-            json.dump(report, fh, indent=1, default=str)
-    return report
+    return _finish_report(report, group, W, rank, result_dir, "fwd", row)
 
 
 def _kept_record(T_r: int) -> dict:
@@ -808,25 +1368,40 @@ def _run_rank(
     result_dir: str | None,
     backend: str,
 ) -> dict:
-    """The body of one rank: every mode of the KCP forward / backward, gathered to rank 0 and compared there."""
+    """The body of one rank: every mode of the KCP forward / backward against FP64 and against its partner arm
+    within the budgets (judged over the group), the exact contracts, the collectives, the hosts, the deterministic
+    route on the same operands."""
     H_qk, HV = row.heads
     part, cu = _partition(row)
-    ctx = plan.build_kcp_context(part, group, rank, device)
+    ctx = plan.build_context_kcp(part, group, rank, device)
     total = cu[-1]
     ops = _local_inputs(row, part, cu, rank, device)
     q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
-    ws = kcp.KcpWorkspace()
+    ws = kcp.WorkspaceKcp()
     base = {"backend": backend}
     t_start = time.time()
+    ref_mod = _reference()
+    refs = _local_reference(row, part, cu, rank, device)
+    judge = _Judge(row, ref_mod, _budget_cell(row))
+    kernels = backend == "kernels"
 
     def saved_pass(qq=q, kk=k, vv=v, gg=g, bb=beta, dd=dout, **opts) -> dict:
         o = {**base, **opts}
-        fwd_opts = dict(o)
-        out, saved = kcp.chunk_gdn_kcp_fwd(
-            qq, kk, vv, gg, bb, ctx, workspace=ws, **fwd_opts
+        out, saved = kcp.chunk_gdn_fwd_kcp(
+            qq, kk, vv, gg, bb, ctx, workspace=ws, deterministic=False, **o
         )
-        dq, dk, dv, dbeta, dg = kcp.chunk_gdn_kcp_bwd(
-            qq, kk, vv, gg, bb, ctx, dd, saved=saved, workspace=ws, **o
+        dq, dk, dv, dbeta, dg = kcp.chunk_gdn_bwd_kcp(
+            qq,
+            kk,
+            vv,
+            gg,
+            bb,
+            ctx,
+            dd,
+            saved=saved,
+            workspace=ws,
+            deterministic=False,
+            **o,
         )
         return {
             "out": out,
@@ -843,7 +1418,9 @@ def _run_rank(
         o = {**base, **opts}
 
         def fn(*a):
-            return kcp.chunk_gdn_kcp(*a, ctx, workspace=workspace, **o)
+            return kcp.chunk_gdn_kcp(
+                *a, ctx, workspace=workspace, deterministic=False, **o
+            )
 
         if ckpt:
             from torch.utils.checkpoint import checkpoint
@@ -858,6 +1435,12 @@ def _run_rank(
             "out": out.detach(),
             **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
         }
+
+    def arm(name: str, r_: dict, partner=None, partner_name=None, *, gate=True):
+        """One arm within the FP64 budgets and, against its partner, within the same budget constants."""
+        judge.fp64(name, r_, refs, gate=gate)
+        if partner is not None:
+            judge.cross(f"{name}_vs_{partner_name}", r_, partner, gate=gate)
 
     flags: dict[str, bool] = {}
     info: dict[str, object] = {}
@@ -874,47 +1457,63 @@ def _run_rank(
     }
     info["fwd_sequence"] = list(kcp.LAST_CALL["fwd"]["sequence"])
     info["bwd_sequence"] = list(kcp.LAST_CALL["bwd"]["sequence"])
-    flags["repeat"] = _eq(res, saved_pass())
-    flags["saved_eq_replay"] = _eq(res, saved_pass(boundary_mode="replay"))
-    flags["light_eq_full"] = _eq(res, saved_pass(save_mode="full"))
+    # (a) the worst case over N_REPEAT forward + backward runs: run0 above and the repeats, each against FP64 (the
+    # worst run per tensor gated below) and against run0 within the budget constants
+    arm("run0", res)
+    for i in range(1, N_REPEAT):
+        arm(f"run{i}", saved_pass(), res, "run0")
+    arm("replay", saved_pass(boundary_mode="replay"), res, "run0")
+    arm("full", saved_pass(save_mode="full"), res, "run0")
     res_auto = autograd_pass(False)
-    flags["autograd_eq_saved"] = _eq(res, res_auto)
+    arm("autograd", res_auto, res, "run0")
     res_ckpt = autograd_pass(True)
-    flags["ckpt_eq_direct"] = _eq(res_auto, res_ckpt)
-    flags["ckpt_full_eq_direct"] = _eq(res_auto, autograd_pass(True, save_mode="full"))
-    flags["ckpt_replay_eq_direct"] = _eq(
-        res_auto, autograd_pass(True, boundary_mode="replay")
+    arm("ckpt", res_ckpt, res_auto, "autograd")
+    arm("ckpt_full", autograd_pass(True, save_mode="full"), res_auto, "autograd")
+    arm(
+        "ckpt_replay",
+        autograd_pass(True, boundary_mode="replay"),
+        res_auto,
+        "autograd",
     )
-    # reuse_recompute_tapes: the checkpoint backward binds the forward tapes torch's recompute just wrote instead
-    # of replaying #1 and the tape walk; bitwise the direct and the switch-off checkpoint gradients; the kept path
-    # is proven from the backward's launch inventory (a rank without tokens has no tapes and runs the replay form);
-    # the registry is empty afterwards; the per-rank peak of the checkpointed call with the switch is not above the
-    # switch-off peak (G8 evidence; the row of record is the memory trace)
+    # reuse_recompute_tapes: the checkpoint backward binds the forward tapes torch's recompute just wrote instead of
+    # replaying #1 and the tape walk; within the budgets of the direct and the switch-off checkpoint gradients; the
+    # kept path is proven from the backward's launch inventory (a rank without tokens has no tapes and runs the replay
+    # form); the registry is empty afterwards; the per-rank peak with the switch is not above the switch-off peak
     KEPT = {"reuse_recompute_tapes": True}
     # both states are named (res_ckpt above is the default's)
     OFF = {"reuse_recompute_tapes": False}
     T_r_here = int(q.shape[0])
     res_ckpt_off = autograd_pass(True, **OFF)
+    arm("ckpt_off", res_ckpt_off, res_auto, "autograd")
     kept_stats0 = dict(kcp.KEPT_STATS)
     res_kept = autograd_pass(True, **KEPT)
     info["kept"] = _kept_record(T_r_here)
-    flags["kept_eq_direct"] = _eq(res_auto, res_kept)
-    flags["kept_eq_ckpt_light"] = _eq(res_ckpt_off, res_kept) and _eq(
-        res_ckpt, res_kept
-    )
+    arm("kept", res_kept, res_auto, "autograd")
+    judge.cross("kept_vs_ckpt_off", res_kept, res_ckpt_off)
+    judge.cross("kept_vs_ckpt", res_kept, res_ckpt)
+    del res_kept, res_ckpt_off
     flags["kept_path_taken"] = bool(info["kept"]["path_ok"])
     res_kept_nt = autograd_pass(True, save_transfer=False, **KEPT)
     info["kept_no_transfer"] = _kept_record(T_r_here)
     # the direct reference inside the stats window names the replay form: under the shipped default a direct
     # backward looks the registry up and counts a "miss" (by design), which would break the miss = 0 expectation
-    flags["kept_no_transfer_eq_direct"] = _eq(
-        autograd_pass(False, save_transfer=False, **OFF), res_kept_nt
-    ) and bool(info["kept_no_transfer"]["path_ok"])
-    res_kept_twice = autograd_pass(True, twice=True, **KEPT)
-    flags["kept_twice_accumulates"] = all(
-        torch.equal(res_kept_twice[n], res_auto[n] + res_auto[n]) for n in GRADS
+    arm(
+        "kept_no_transfer",
+        res_kept_nt,
+        autograd_pass(False, save_transfer=False, **OFF),
+        "direct_no_transfer",
     )
-    kept_delta = {k: kcp.KEPT_STATS[k] - kept_stats0[k] for k in kept_stats0}
+    del res_kept_nt
+    flags["kept_no_transfer_path_taken"] = bool(info["kept_no_transfer"]["path_ok"])
+    # two backwards: half the accumulated gradient against the FP64 gradient
+    judge.fp64(
+        "kept_twice_half",
+        autograd_pass(True, twice=True, **KEPT),
+        refs,
+        GRADS,
+        half=True,
+    )
+    kept_delta = {k_: kcp.KEPT_STATS[k_] - kept_stats0[k_] for k_ in kept_stats0}
     info["kept_stats_delta"] = kept_delta
     n_kept_bwd = 4  # three kept passes, one of them with two backwards
     expect = (
@@ -923,8 +1522,191 @@ def _run_rank(
         else {"put": 0, "take": 0, "miss": n_kept_bwd}
     )
     flags["kept_registry_empty"] = kcp.kept_registry_size() == 0 and all(
-        kept_delta[k] == v_ for k, v_ in expect.items()
+        kept_delta[k_] == v_ for k_, v_ in expect.items()
     )
+
+    # issue #7074 (2) + G10: the "auto" form (the shipped default) in a region the GDN node closes takes the kept path
+    # on a rank with tokens (the frame proof "dead"; a rank without tokens replays as before), is within the budgets
+    # of the direct result, and its checkpointed forward + backward make no synchronizing CUDA call
+    AUTO = {"reuse_recompute_tapes": "auto"}
+    auto_stats0 = dict(kcp.KEPT_STATS)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        res_auto_form = autograd_pass(True, **AUTO)
+        flags["auto_no_sync"] = True
+    except RuntimeError as exc:  # a synchronizing call in the "auto" pass
+        info["auto_no_sync_error"] = str(exc)[:200]
+        flags["auto_no_sync"] = False
+        res_auto_form = None
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    if res_auto_form is None:
+        res_auto_form = autograd_pass(True, **AUTO)
+    info["auto_form"] = _kept_record(T_r_here)
+    info["auto_form"]["hand_off_reason"] = kcp.LAST_CALL["fwd"].get("hand_off_reason")
+    arm("auto_form", res_auto_form, res_auto, "autograd")
+    del res_auto_form
+    # a rank with tokens hands off on the frame proof ("dead"); a rank without tokens has no tapes and switches the
+    # hand-off off before the "auto" decision, as every form does there (recorded "off", the replay form)
+    flags["auto_path_taken"] = bool(info["auto_form"]["path_ok"]) and (
+        info["auto_form"]["hand_off_reason"] == ("dead" if T_r_here > 0 else "off")
+        or not kcp.torch_release_verified()
+    )
+    auto_delta = {k_: kcp.KEPT_STATS[k_] - auto_stats0[k_] for k_ in auto_stats0}
+    info["auto_stats_delta"] = auto_delta
+    n_auto = 1 if (T_r_here > 0 and kcp.torch_release_verified()) else 0
+    flags["auto_registry_empty"] = kcp.kept_registry_size() == 0 and all(
+        auto_delta[k_] == v_
+        for k_, v_ in {"put": n_auto, "take": n_auto, "miss": 0}.items()
+    )
+
+    # issue #7818: a RecomputeHandleKcp carries this rank's incoming states S_in from the checkpointed forward to
+    # torch's recompute, which then issues no collective and waits on none (counted by phase through shims on
+    # torch.distributed; the recompute phase is marked by the checkpoint's context_fn).  Out and the five gradients
+    # are within the budgets of the plain checkpoint (same options) and of the direct pass; the original forward and
+    # the backward exchange exactly as the plain checkpoint does; a second backward reuses the entry; the handle
+    # retains exactly S_in.  The plain checkpoint's per-phase counts are recorded as the reproduction of the issue.
+    def handle_pass(handle: bool, *, twice: bool = False, workspace=ws, **opts):
+        leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+        o = {**base, "save_transfer": False, **opts}
+        hd = kcp.RecomputeHandleKcp() if handle else None
+
+        def fn(q_, k_, v_, g_, b_, h_):
+            return kcp.chunk_gdn_kcp(
+                q_,
+                k_,
+                v_,
+                g_,
+                b_,
+                ctx,
+                workspace=workspace,
+                recompute_handle=h_,
+                deterministic=False,
+                **o,
+            )
+
+        from torch.utils.checkpoint import checkpoint
+
+        with _NamedCounter() as cc:
+            rphase = RecomputePhase(cc)
+            out = checkpoint(
+                fn,
+                *leaves,
+                hd,
+                use_reentrant=False,
+                context_fn=lambda: (contextlib.nullcontext(), rphase),
+            )
+            # torch's early stop ends the recompute inside the node's apply, after the forward recorded itself
+            modes = [kcp.LAST_CALL["fwd"].get("recompute_handle")]
+            P_used = int(kcp.LAST_CALL["fwd"].get("P", 0) or 0)
+            cc.phase = "bwd"
+            out.backward(dout, retain_graph=twice)
+            modes.append(kcp.LAST_CALL["fwd"].get("recompute_handle"))
+            if twice:
+                out.backward(dout)
+                modes.append(kcp.LAST_CALL["fwd"].get("recompute_handle"))
+        rec = {
+            **cc.record(),
+            "modes": modes,
+            "P": P_used,
+            "handle_bytes": hd.nbytes() if hd is not None else 0,
+        }
+        return {
+            "out": out.detach(),
+            **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
+        }, rec
+
+    handle_info: dict[str, object] = {}
+    res_plain, rec_plain = handle_pass(False)
+    res_h, rec_h = handle_pass(True)
+    handle_info["plain"], handle_info["handle"] = rec_plain, rec_h
+    arm("plain_ckpt", res_plain, res_auto, "autograd")
+    arm("handle", res_h, res_plain, "plain_ckpt")
+    judge.cross("handle_vs_autograd", res_h, res_auto)
+    del res_plain, res_h
+    flags["handle_recompute_no_comm"] = (
+        rec_h["calls"].get("recompute", 0) == 0
+        and rec_h["waits"].get("recompute", 0) == 0
+    )
+    flags["handle_orig_bwd_comm_unchanged"] = all(
+        rec_h[t].get(ph, 0) == rec_plain[t].get(ph, 0)
+        for t in ("calls", "waits")
+        for ph in ("orig", "bwd")
+    )
+    flags["handle_modes"] = rec_h["modes"] == ["capture", "replay"]
+    # the ring exchange (where the partition allows it): its recompute skips the hops as well
+    if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
+        res_pr, rec_pr = handle_pass(False, exchange="ring")
+        res_hr, rec_hr = handle_pass(True, exchange="ring")
+        handle_info["ring"] = {"plain": rec_pr, "handle": rec_hr}
+        arm("ring_plain_ckpt", res_pr, res_auto, "autograd")
+        arm("ring_handle", res_hr, res_pr, "ring_plain_ckpt")
+        del res_pr, res_hr
+        flags["handle_ring_recompute_no_comm"] = (
+            rec_hr["calls"].get("recompute", 0) == 0
+            and rec_hr["waits"].get("recompute", 0) == 0
+            and rec_hr["modes"] == ["capture", "replay"]
+        )
+    res_h2, rec_h2 = handle_pass(True, twice=True)
+    handle_info["twice"] = rec_h2
+    judge.fp64("handle_twice_half", res_h2, refs, GRADS, half=True)
+    del res_h2
+    flags["handle_twice_counts"] = rec_h2["calls"].get("recompute", 0) == 0 and rec_h2[
+        "modes"
+    ] == ["capture", "replay", "replay"]
+    s_in_query = int(
+        kcp.gdn_saved_bytes_kcp(
+            ctx,
+            H_qk=H_qk,
+            HV=HV,
+            save_mode="light",
+            save_transfer=False,
+            with_conv=False,
+        )
+    )
+    handle_info["s_in_query_bytes"] = s_in_query
+    flags["handle_bytes_eq_query"] = rec_h["handle_bytes"] == s_in_query
+    # retained after the checkpointed forward (per-call workspace, after a warm-up of the same form): exactly the
+    # handle's S_in, where the plain checkpoint retains nothing (retained_zero below)
+    handle_pass(True, workspace=None)
+    torch.cuda.synchronize(device)
+    gc.collect()
+    leaves_h = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+    hd_r = kcp.RecomputeHandleKcp()
+
+    def fn_r(q_, k_, v_, g_, b_, h_):
+        return kcp.chunk_gdn_kcp(
+            q_,
+            k_,
+            v_,
+            g_,
+            b_,
+            ctx,
+            recompute_handle=h_,
+            save_transfer=False,
+            deterministic=False,
+            **base,
+        )
+
+    from torch.utils.checkpoint import checkpoint as _checkpoint
+
+    before_h = _alloc_stats(device)
+    out_h = _checkpoint(fn_r, *leaves_h, hd_r, use_reentrant=False)
+    torch.cuda.synchronize(device)
+    after_h = _alloc_stats(device)
+    retained_h = int(
+        after_h["requested"]
+        - before_h["requested"]
+        - out_h.numel() * out_h.element_size()
+    )
+    handle_info["retained_bytes"] = retained_h
+    flags["handle_retained_eq_s_in"] = retained_h == hd_r.nbytes() == s_in_query
+    out_h.backward(dout)
+    del out_h, leaves_h, hd_r
+    handle_info["plain_recompute_calls"] = rec_plain["calls"].get("recompute", 0)
+    handle_info["plain_recompute_waits"] = rec_plain["waits"].get("recompute", 0)
+    info["recompute_handle"] = handle_info
 
     def _ckpt_peak(**o) -> int:
         torch.cuda.synchronize(device)
@@ -939,25 +1721,44 @@ def _run_rank(
     info["ckpt_peak_bytes"] = peaks
     flags["kept_peak_le_off"] = peaks["on"] <= peaks["off"]
     res_recompute = saved_pass(save_transfer=False)
-    flags["save_transfer_eq"] = _eq(res, res_recompute)
+    arm("no_save_transfer", res_recompute, res, "run0")
     ring_eligible = W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS
     info["ring_eligible"] = ring_eligible
-    flags["ring_eq_a2a"] = (not ring_eligible) or _eq(
-        res_recompute, saved_pass(exchange="ring", save_transfer=False)
-    )
-    res_host = saved_pass(group_reduce="host")
-    info["host_reduce_eq_fused"] = _eq(
-        res, res_host
-    )  # reported: both forms are fixed-order FP32 + one rounding
-    # strided packed-QKV views: zero-copy (layout="tma") and the copy adapter, both bitwise the contiguous call
+    if ring_eligible:
+        arm(
+            "ring",
+            saved_pass(exchange="ring", save_transfer=False),
+            res_recompute,
+            "no_save_transfer",
+        )
+    del res_recompute
+    # reported, as in the deterministic rows: the host group reduce
+    arm("host_reduce", saved_pass(group_reduce="host"), res, "run0", gate=False)
+    # strided packed-QKV views: zero-copy (layout="tma") and the copy adapter, both against the contiguous call
     _buf, qs, ks, vs = _packed_views(q, k, v)
-    flags["strided_eq_contiguous"] = _eq(res, saved_pass(qs, ks, vs))
-    flags["copy_layout_eq_contiguous"] = _eq(res, saved_pass(qs, ks, vs, layout="copy"))
-    # gradient accumulation: .backward() twice == exactly twice the gradient (x + x is exact in every float format)
-    res_twice = autograd_pass(False, twice=True)
-    flags["backward_twice_accumulates"] = all(
-        torch.equal(res_twice[n], res_auto[n] + res_auto[n]) for n in GRADS
+    arm("strided", saved_pass(qs, ks, vs), res, "run0")
+    arm("copy_layout", saved_pass(qs, ks, vs, layout="copy"), res, "run0")
+    del _buf, qs, ks, vs
+    # gradient accumulation: .backward() twice -> half the accumulated gradient against the FP64 gradient
+    judge.fp64(
+        "backward_twice_half", autograd_pass(False, twice=True), refs, GRADS, half=True
     )
+    # G10 (issue #7074): preparing a fresh context of this rank's layout -- the host plan, its table uploads and the
+    # per-key device tables -- makes no synchronizing CUDA call (pinned asynchronous copies)
+    torch.cuda.synchronize(device)
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        fresh_ctx = plan.build_context_kcp(part, group, rank, device)
+        fresh_ctx.prepare(H_qk, HV)
+        flags["prepare_no_sync"] = True
+    except RuntimeError as exc:  # "called a synchronizing CUDA operation"
+        info["prepare_no_sync_error"] = str(exc)[:200]
+        flags["prepare_no_sync"] = False
+        fresh_ctx = None
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    del fresh_ctx
+    torch.cuda.synchronize(device)
     # #7039: retained bytes after a checkpointed forward (graph off), per-call and caller-held workspace forms.
     # the plan's per-key device tables are uploaded first (ctx.prepare + one warm-up call of the
     # same form) so they are not counted; graph="replay" keeps a static pool and is reported, not asserted.
@@ -975,7 +1776,7 @@ def _run_rank(
         leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
 
         def fn(*a, _wsp=wsp, _o=form_opts):
-            return kcp.chunk_gdn_kcp(*a, ctx, workspace=_wsp, **_o)
+            return kcp.chunk_gdn_kcp(*a, ctx, workspace=_wsp, deterministic=False, **_o)
 
         from torch.utils.checkpoint import checkpoint
 
@@ -1055,10 +1856,19 @@ def _run_rank(
         sb: dict[str, int] = {"T_r": int(q.shape[0])}
         for mode in ("light", "full"):
             sb[f"{mode}_query"] = int(
-                kcp.gdn_kcp_saved_bytes(ctx, H_qk=H_qk, HV=HV, save_mode=mode)
+                kcp.gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, save_mode=mode)
             )
-            _, s_obj = kcp.chunk_gdn_kcp_fwd(
-                q, k, v, g, beta, ctx, workspace=ws, save_mode=mode, **base
+            _, s_obj = kcp.chunk_gdn_fwd_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                workspace=ws,
+                save_mode=mode,
+                deterministic=False,
+                **base,
             )
             sb[f"{mode}_actual"] = int(s_obj.bytes())
             del s_obj
@@ -1079,13 +1889,13 @@ def _run_rank(
     moved["b1_dm"] = {"send": 4 * sum(s), "recv": 4 * sum(r)}
     info["moved_bytes"] = moved
     try:
-        query = kcp.gdn_kcp_comm_bytes(ctx, H_qk=H_qk, HV=HV, C=C_CONV)
+        query = kcp.gdn_comm_bytes_kcp(ctx, H_qk=H_qk, HV=HV, C=C_CONV)
         info["query_bytes"] = {
             c: query[c] for c in ("c1", "c2", "b1", "b2", "b1_design") if c in query
         }
         # save_transfer=False: "b1" = the plan's split tables (maps paired with the crossing-IN slots; what the
         # collective moves) must equal the b1_dm split sums; "b1_design" is the per-rank lower bound
-        query_dm = kcp.gdn_kcp_comm_bytes(
+        query_dm = kcp.gdn_comm_bytes_kcp(
             ctx, H_qk=H_qk, HV=HV, C=C_CONV, save_transfer=False
         )
         info["query_bytes_dm"] = {
@@ -1102,29 +1912,34 @@ def _run_rank(
             and int(query_dm["b1"]["send"]) == moved["b1_dm"]["send"]
             and int(query_dm["b1"]["recv"]) == moved["b1_dm"]["recv"]
         )
-    except (
-        ImportError,
-        AttributeError,
-        KeyError,
-        TypeError,
-    ) as exc:  # the byte module is another lane's deliverable
+    except (ImportError, AttributeError, KeyError, TypeError) as exc:
         info["query_bytes"] = f"unavailable: {type(exc).__name__}: {exc}"
         flags["bytes_match_query"] = False
     # G10: CUDA-graph capture of forward + backward (pointer-stable operands, caller-held workspace): the third call
-    # of a key replays the captured graph and must be bitwise the eager result.  The backward's key includes the
-    # saved tensors, which change once (the eager forward's fresh tensors -> the captured forward's static tensors),
-    # so the backward reaches its replay one call after the forward: four forward + backward calls are made and the
-    # per-call events are recorded (forward: eager, capture, replay, replay; backward: eager, eager, capture, replay).
+    # of a key replays the captured graph.  The backward's key includes the saved tensors, which change once (the
+    # eager forward's fresh tensors -> the captured forward's static tensors), so the backward reaches its replay one
+    # call after the forward: four forward + backward calls are made and the per-call events are recorded (forward:
+    # eager, capture, replay, replay; backward: eager, eager, capture, replay).  The replayed result is judged within
+    # the budgets against FP64 and against run0 (gated with the capture on the kernel backend).
     graph_info: dict[str, object] = {}
     try:
         kcp.graph_cache_clear()
         g_res = None
         events: list[list[str]] = []
         for _ in range(4):
-            out, saved = kcp.chunk_gdn_kcp_fwd(
-                q, k, v, g, beta, ctx, workspace=ws, graph="replay", **base
+            out, saved = kcp.chunk_gdn_fwd_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                workspace=ws,
+                graph="replay",
+                deterministic=False,
+                **base,
             )
-            grads = kcp.chunk_gdn_kcp_bwd(
+            grads = kcp.chunk_gdn_bwd_kcp(
                 q,
                 k,
                 v,
@@ -1135,6 +1950,7 @@ def _run_rank(
                 saved=saved,
                 workspace=ws,
                 graph="replay",
+                deterministic=False,
                 **base,
             )
             g_res = {
@@ -1159,28 +1975,44 @@ def _run_rank(
         graph_info["bwd_fallback"] = kcp.LAST_CALL["bwd"].get("graph_fallback")
         graph_info["stats"] = dict(kcp.GRAPH_STATS)
         graph_ok = (
-            graph_info["fwd_event"] == "replay"
-            and graph_info["bwd_event"] == "replay"
-            and _eq(res, g_res)
+            graph_info["fwd_event"] == "replay" and graph_info["bwd_event"] == "replay"
         )
         torch.cuda.synchronize(device)
         kcp.graph_cache_clear()
     except Exception as exc:  # noqa: BLE001 - recorded; the gate decides below
         graph_info["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
         graph_ok = False
+        g_res = None
         kcp.graph_cache_clear()
+    # every rank adds the same keys (a failed capture compares zeros: the verdict fails instead of a missing key)
+    g_cmp = (
+        g_res if g_res is not None else {n: torch.zeros_like(res[n]) for n in TENSORS}
+    )
+    arm("graph_replay", g_cmp, res, "run0", gate=kernels)
+    del g_res, g_cmp
     info["graph"] = graph_info
     flags["graph_capture"] = bool(graph_ok)
     # #7038: the backward's time with a resident one-thread kernel on a side stream, over its time alone
     ratio = _side_stream_ratio(
-        lambda: kcp.chunk_gdn_kcp_bwd(
-            q, k, v, g, beta, ctx, dout, saved=res["saved"], workspace=ws, **base
+        lambda: kcp.chunk_gdn_bwd_kcp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            dout,
+            saved=res["saved"],
+            workspace=ws,
+            deterministic=False,
+            **base,
         ),
         device,
     )
     info["side_stream"] = ratio
     flags["side_stream_ratio"] = ratio["ratio"] <= SIDE_STREAM_RATIO_MAX
-    # no-leak rows: zero gradients outside the selected document and independence of its outputs
+    # no-leak rows: exactly zero gradients outside the selected document; its outputs independent of the others'
+    # operands within the budget constants (and within the FP64 budgets on its tokens)
     if row.leak and total > 0:
         n_docs = len(cu) - 1
         doc = 1 if n_docs > 1 else 0
@@ -1192,6 +2024,7 @@ def _run_rank(
             bool(torch.equal(res_sel[n][others], torch.zeros_like(res_sel[n][others])))
             for n in GRADS
         )
+        del res_sel
         gen = _inputs()
         alt = _local_inputs(
             row,
@@ -1204,8 +2037,15 @@ def _run_rank(
         res_alt = saved_pass(
             alt["q"], alt["k"], alt["v"], alt["g"], alt["beta"], alt["dout"]
         )
-        flags["independence"] = all(
-            torch.equal(res_alt[n][mask], res[n][mask]) for n in TENSORS
+        judge.cross(
+            "independence",
+            {n: res_alt[n][mask] for n in TENSORS},
+            {n: res[n][mask] for n in TENSORS},
+        )
+        judge.fp64(
+            "independence_doc",
+            {n: res_alt[n][mask] for n in TENSORS},
+            {n: refs[n][mask] for n in TENSORS},
         )
         flags["independence_changed_others"] = (
             bool(others.any())
@@ -1214,15 +2054,100 @@ def _run_rank(
             )
             or not bool(others.any())
         )
-    # gather
-    gathered = {}
-    for n in TENSORS:
-        objs: list = [None] * W
-        if W > 1:
-            dist.all_gather_object(objs, res[n].cpu(), group=group)
-        else:
-            objs = [res[n].cpu()]
-        gathered[n] = objs
+        del res_alt, alt
+    # (b) the collectives of one backward (saved set of run0), by torch.distributed name and by issue tag: exactly
+    # the deterministic route's (b1, b2 as all_to_all_single where any fragment crosses), no parameter reduction
+    with _NamedCounter() as cc_nd:
+        cc_nd.phase = "bwd"
+        kcp.chunk_gdn_bwd_kcp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            dout,
+            saved=res["saved"],
+            workspace=ws,
+            deterministic=False,
+            **base,
+        )
+    coll_nd = {
+        "named": cc_nd.record()["named"].get("bwd", {}),
+        "tags": _coll_tags(kcp.LAST_CALL["bwd"]["sequence"]),
+    }
+    # (f) the deterministic route (flashinfer.cake_gdn_det_train_kcp objects, its own partition / context /
+    # workspace of the same row) and this route through the facade (deterministic=False) on the same operands
+    det_api = importlib.import_module(DET_API)
+    det_kcp = _det_mod("cake_kcp")
+    api = importlib.import_module(FACADE)
+    det_part, _ = _partition_with(det_api.partition_det_kcp, row)
+    det_ctx = det_api.build_context_det_kcp(det_part, group, rank, device)
+    det_ws = det_api.WorkspaceDetKcp()
+    d_out, d_saved = det_api.chunk_gdn_det_fwd_kcp(
+        q, k, v, g, beta, det_ctx, workspace=det_ws, **base
+    )
+    with _NamedCounter() as cc_det:
+        cc_det.phase = "bwd"
+        d_grads = det_api.chunk_gdn_det_bwd_kcp(
+            q, k, v, g, beta, det_ctx, dout, saved=d_saved, workspace=det_ws, **base
+        )
+    coll_det = {
+        "named": cc_det.record()["named"].get("bwd", {}),
+        "tags": _coll_tags(det_kcp.LAST_CALL["bwd"]["sequence"]),
+    }
+    res_det = {
+        "out": d_out,
+        **dict(zip(("dq", "dk", "dv", "dbeta", "dg"), d_grads, strict=True)),
+    }
+    f_out, f_saved = api.chunk_gdn_fwd_kcp(
+        q, k, v, g, beta, ctx, workspace=ws, deterministic=False, **base
+    )
+    f_grads = api.chunk_gdn_bwd_kcp(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        dout,
+        saved=f_saved,
+        workspace=ws,
+        deterministic=False,
+        **base,
+    )
+    res_facade = {
+        "out": f_out,
+        **dict(zip(("dq", "dk", "dv", "dbeta", "dg"), f_grads, strict=True)),
+    }
+    info["routes"] = {
+        "det_saved": type(d_saved).__name__,
+        "facade_saved": type(f_saved).__name__,
+    }
+    flags["facade_routes_nondet"] = (
+        type(f_saved).__name__ == "SavedKcp" and type(d_saved).__name__ == "SavedDetKcp"
+    )
+    judge.fp64("det_route", res_det, refs)
+    judge.fp64("facade_nondet", res_facade, refs)
+    judge.cross("facade_nondet_vs_det", res_facade, res_det)
+    judge.cross("run0_vs_det", res, res_det)
+    del res_det, res_facade, d_out, d_saved, d_grads, f_out, f_saved, f_grads, det_ws
+    info["collectives"] = {"nondet": coll_nd, "det": coll_det}
+    flags["bwd_collectives_eq_det"] = coll_nd == coll_det
+    flags["bwd_collectives_b1_b2"] = coll_nd["tags"] in (
+        [],
+        ["a2a:b1", "a2a:b2"],
+    ) and set(coll_nd["named"]) <= {"all_to_all_single"}
+    flags["bwd_collectives_issued"] = W == 1 or coll_nd["named"].get(
+        "all_to_all_single", 0
+    ) == len(coll_nd["tags"])
+    flags["bwd_no_param_reduction"] = _no_param_reduction(
+        {"named": {"bwd": coll_nd["named"]}}
+    )
+    # (c) the hosts of the group
+    host = _host_map(group, W)
+    flags["host_map"] = host["ok"]
+    verdicts = judge.finish(group, W)
     flag_list: list = [None] * W
     info_list: list = [None] * W
     if W > 1:
@@ -1230,70 +2155,26 @@ def _run_rank(
         dist.all_gather_object(info_list, info, group=group)
     else:
         flag_list, info_list = [flags], [info]
-    report: dict = {
-        "row": dataclasses.asdict(row),
-        "rank": rank,
-        "world": W,
-        "backend": backend,
-        "host": socket.gethostname(),
-        "device": str(device),
-        "device_name": torch.cuda.get_device_name(device),
-        "nccl": ".".join(map(str, torch.cuda.nccl.version())) if W > 1 else None,
-        "torch": torch.__version__,
-        "utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "pass": True,
-        "flags": {},
-        "gated": [],
-        "reported": [],
-        "metrics": {},
-        "info_by_rank": info_list,
-        "seconds": None,
-    }
-    # gates: bitwise / semantics / retained / bytes on every backend; graph capture is a gate of the kernel backend
-    # (the torch emulation reports it); the per-row side-stream ratio is recorded on every backend -- the #7038 gate
-    # of record is the module-timing protocol (slowest-rank median over >= 3 groups on an exclusive node)
-    kernel_only = {"graph_capture"}
-    info_only = {"side_stream_ratio"}
-    for key in flags:
-        ok = all(f[key] for f in flag_list)
-        report["flags"][key] = ok
-        if key in info_only or (key in kernel_only and backend != "kernels"):
-            report["reported"].append(key)
-        else:
-            report["gated"].append(key)
-            report["pass"] &= ok
-    if rank == 0 and total > 0:
-        ref_mod = _reference()
-        glob = _global_inputs(row, cu, device)
-        cu_t = torch.tensor(cu, dtype=torch.int64)
-        refs = ref_mod.gdn_exact_with_grads(
-            glob["q"],
-            glob["k"],
-            glob["v"],
-            glob["g"],
-            glob["beta"],
-            glob["dout"],
-            cu_t,
-            scale=SCALE,
-        )
-        budget = _budget_cell(row)
-        for n in TENSORS:
-            cand = _to_global(part, [t.to(device) for t in gathered[n]], cu, total).to(
-                torch.float64
-            )
-            ref = refs[n].to(device=device, dtype=torch.float64).reshape(cand.shape)
-            _judge(report, row, n, cand, ref, ref_mod, budget)
+    report = _new_report(row, rank, W, backend, device, "full")
+    report["hosts"] = host
+    report["info_by_rank"] = info_list
+    # gates: exact flags and judged verdicts on every backend; graph capture is a gate of the kernel backend (the
+    # torch emulation reports it); the per-row side-stream ratio is recorded on every backend -- the #7038 gate of
+    # record is the module-timing protocol (slowest-rank median over >= 3 groups on an exclusive node)
+    _fold(
+        report,
+        flag_list,
+        verdicts,
+        backend=backend,
+        kernel_only={"graph_capture"},
+        info_only={"side_stream_ratio"},
+    )
+    report["metrics"] = {n: verdicts.get(f"fp64:run0:{n}") for n in TENSORS}
+    report["repeats"] = _worst_of_runs(verdicts, N_REPEAT)
+    for n in TENSORS:
+        _gate(report, f"worst_run_{n}", report["repeats"][n]["ok"])
     report["seconds"] = round(time.time() - t_start, 2)
-    if W > 1:
-        verdict: list = [None] * W
-        dist.all_gather_object(verdict, report["pass"], group=group)
-        report["pass"] = all(verdict)
-        dist.barrier(group=group)
-    if rank == 0 and result_dir:
-        os.makedirs(result_dir, exist_ok=True)
-        with open(os.path.join(result_dir, _row_id(row) + ".json"), "w") as fh:
-            json.dump(report, fh, indent=1, default=str)
-    return report
+    return _finish_report(report, group, W, rank, result_dir, "full", row)
 
 
 def _side_stream_ratio(bwd, device: torch.device) -> dict:
@@ -1343,6 +2224,110 @@ def _side_stream_ratio(bwd, device: torch.device) -> dict:
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# (d) a poisoned workspace reused across changed token layouts
+
+
+def _poison(ws) -> dict:
+    """Fill every floating tensor the workspace holds (its pools and its tape arena) with NaN; the identity tile
+    (``POISON_EXEMPT_POOLS``) and the ticket words (u32, zero by the kernels' contract) are not scratch."""
+    names: list[str] = []
+    nbytes = 0
+    for kind, table in (("pool", ws._pools), ("tape", ws._tapes)):
+        for name, t in table.items():
+            if kind == "pool" and name in POISON_EXEMPT_POOLS:
+                continue
+            if not t.is_floating_point() or t.numel() == 0:
+                continue
+            t.fill_(float("nan"))
+            names.append(f"{kind}:{name}")
+            nbytes += t.numel() * t.element_size()
+    torch.cuda.synchronize()
+    return {"tensors": len(names), "bytes": nbytes, "names": sorted(names)}
+
+
+def _run_rank_poison(
+    rank: int,
+    W: int,
+    pair: PoisonPair,
+    group,
+    device: torch.device,
+    result_dir: str | None,
+    backend: str,
+) -> dict:
+    """(d) one ``WorkspaceKcp`` for both rows of the pair: the first row's forward + backward, every pool and tape it
+    left NaN, the workspace sized for the second row (pools kept where large enough, the second row's tapes bound),
+    every pool and tape NaN again, then the second row's forward + backward.  Both rows within the FP64 budgets."""
+    ws = kcp.WorkspaceKcp()
+    ref_mod = _reference()
+    t_start = time.time()
+    flags: dict[str, bool] = {}
+    info: dict[str, object] = {}
+    verdicts: dict[str, dict] = {}
+    for i, row in enumerate(pair.rows):
+        H_qk, HV = row.heads
+        part, cu = _partition(row)
+        ctx = plan.build_context_kcp(part, group, rank, device)
+        ops = _local_inputs(row, part, cu, rank, device)
+        q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
+        refs = _local_reference(row, part, cu, rank, device)
+        if i == 1:
+            p_left = _poison(ws)
+            held = {name: t.data_ptr() for name, t in ws._pools.items()}
+            ws.ensure(ctx, H_qk, HV, device=device)
+            for name in kcp.FWD_TAPES + kcp.BWD_TAPES:
+                ws.tape(name)
+            p_bound = _poison(ws)
+            info["poison"] = {
+                "left_by_first": p_left,
+                "before_second": p_bound,
+                "pools_kept_from_first": sorted(
+                    n for n, t in ws._pools.items() if held.get(n) == t.data_ptr()
+                ),
+            }
+            flags["poisoned"] = p_bound["bytes"] > 0
+        out, saved = kcp.chunk_gdn_fwd_kcp(
+            q, k, v, g, beta, ctx, workspace=ws, deterministic=False, backend=backend
+        )
+        dq, dk, dv, dbeta, dg = kcp.chunk_gdn_bwd_kcp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            dout,
+            saved=saved,
+            workspace=ws,
+            deterministic=False,
+            backend=backend,
+        )
+        res = {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
+        judge = _Judge(row, ref_mod, _budget_cell(row))
+        judge.fp64(f"{'second' if i else 'first'}_{row.name}", res, refs)
+        verdicts.update(judge.finish(group, W))
+        del res, out, saved, dq, dk, dv, dbeta, dg, ops, refs
+    host = _host_map(group, W)
+    flags["host_map"] = host["ok"]
+    flag_list: list = [None] * W
+    info_list: list = [None] * W
+    if W > 1:
+        dist.all_gather_object(flag_list, flags, group=group)
+        dist.all_gather_object(info_list, info, group=group)
+    else:
+        flag_list, info_list = [flags], [info]
+    report = _new_report(pair, rank, W, backend, device, "poison")
+    report["rows"] = [dataclasses.asdict(r) for r in pair.rows]
+    report["hosts"] = host
+    report["info_by_rank"] = info_list
+    _fold(report, flag_list, verdicts)
+    report["seconds"] = round(time.time() - t_start, 2)
+    return _finish_report(report, group, W, rank, result_dir, "poison", pair)
+
+
+_BODIES = {"full": _run_rank, "fwd": _run_rank_fwd, "poison": _run_rank_poison}
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # launch forms
 
 
@@ -1353,7 +2338,7 @@ def _free_port() -> int:
 
 
 def _spawn_entry(
-    rank: int, W: int, row: Row, port: int, result_dir: str, backend: str
+    rank: int, W: int, obj, port: int, result_dir: str, backend: str, kind: str
 ) -> None:
     """One spawned rank (the verdict travels through rank 0's report file)."""
     device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
@@ -1364,7 +2349,7 @@ def _spawn_entry(
             os.environ.setdefault("MASTER_PORT", str(port))
             dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
         group = dist.group.WORLD if W > 1 else None
-        report = _run_rank(rank, W, row, group, device, result_dir, backend)
+        report = _BODIES[kind](rank, W, obj, group, device, result_dir, backend)
         if not report["pass"]:
             raise AssertionError(
                 f"rank {rank}: {json.dumps(report, default=str)[:4000]}"
@@ -1375,9 +2360,25 @@ def _spawn_entry(
             dist.destroy_process_group()
 
 
-def _expand_hostlist(s: str) -> list[str]:
-    import re
+def _spawn_row(obj, backend: str, kind: str) -> None:
+    """``obj`` (a row or a poison pair) on ``obj.W`` spawned ranks of this node; rank 0's report decides."""
+    with tempfile.TemporaryDirectory(prefix="cake_gdn_train_kcp_dist_") as tmp:
+        result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
+        mp.start_processes(
+            _spawn_entry,
+            args=(obj.W, obj, _free_port(), result_dir, backend, kind),
+            nprocs=obj.W,
+            join=True,
+            start_method="spawn",
+        )
+        with open(os.path.join(result_dir, _report_file(obj, kind))) as fh:
+            report = json.load(fh)
+    assert report["pass"], json.dumps(
+        {k: v for k, v in report.items() if k != "info_by_rank"}, default=str
+    )[:6000]
 
+
+def _expand_hostlist(s: str) -> list[str]:
     out: list[str] = []
     for item in re.findall(r"[^,\[\]]+(?:\[[^\]]*\])?", s):
         m = re.match(r"^([^\[]*)\[([^\]]*)\](.*)$", item)
@@ -1418,7 +2419,8 @@ def _slurm_rendezvous(rank: int, world: int) -> tuple[str, int]:
         os.environ.get("W", tempfile.gettempdir()), "tmp"
     )
     os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, f"kcp_test_port.{job}.{step}")
+    # a name of its own: the deterministic suite's port file of the same step is never read
+    path = os.path.join(d, f"kcp_train_test_port.{job}.{step}")
     if rank == 0:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1457,8 +2459,8 @@ class _Slurm:
             addr, port = _slurm_rendezvous(self.rank, self.world)
             os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = addr, str(port)
             # bounded: a rendezvous that never completes (a port collision with a live socket) or a failed row
-            # must fail the step instead of holding its block; the longest legitimate collective wait (rank 0's
-            # FP64 oracle of the largest row) stays well below it
+            # must fail the step instead of holding its block; the longest legitimate collective wait (the FP64
+            # oracle of the largest row on the rank holding most of it) stays well below it
             dist.init_process_group(
                 "nccl",
                 rank=self.rank,
@@ -1467,7 +2469,7 @@ class _Slurm:
                 timeout=_dt.timedelta(seconds=WORLD_TIMEOUT_S),
             )
         print(
-            f"[kcp_dist] init timeout {WORLD_TIMEOUT_S} s; "
+            f"[kcp_train_dist] init timeout {WORLD_TIMEOUT_S} s; "
             f"rank {self.rank}/{self.world} local {local} host {socket.gethostname()} device {self.device} "
             f"{torch.cuda.get_device_name(self.device)} flashinfer={_mod().__file__} MASTER={os.environ.get('MASTER_ADDR')}:{os.environ.get('MASTER_PORT')}",
             flush=True,
@@ -1495,7 +2497,8 @@ _SLURM: _Slurm | None = None
 @pytest.fixture(scope="session")
 def slurm():
     global _SLURM
-    if os.environ.get("SLURM_PROCID") is None:
+    # no CUDA device (a CPU-only Slurm step): the spawn path's skips apply instead of a WORLD init that needs a device
+    if os.environ.get("SLURM_PROCID") is None or not torch.cuda.is_available():
         yield None
         return
     if _SLURM is None:
@@ -1513,8 +2516,9 @@ def _skip_unless_runnable(W: int, backend: str) -> None:
         pytest.skip("the KCP programs are not exported in the package's build.json yet")
 
 
-def _slurm_row(row: Row, slurm, backend: str, body) -> None:
-    """One row under Slurm: sub-group of the row's ranks, WORLD-wide verdict (see :func:`test_multi_gpu_rows`)."""
+def _slurm_row(row, slurm, backend: str, body) -> None:
+    """One row (or poison pair) under Slurm: sub-group of the row's ranks; the verdict is WORLD-wide, so every rank
+    (member or not) passes or fails the same row and ``-x`` and the session teardown keep the collectives aligned."""
     W = row.W
     if slurm.world < W:
         pytest.skip(f"row needs {W} ranks, the step has {slurm.world}")
@@ -1527,15 +2531,22 @@ def _slurm_row(row: Row, slurm, backend: str, body) -> None:
         pytest.skip("the KCP programs are not exported in the package's build.json yet")
     report = None
     if slurm.rank < W:
-        report = body(
-            slurm.rank,
-            W,
-            row,
-            group,
-            slurm.device,
-            os.environ.get("KCP_TEST_RESULT_DIR"),
-            backend,
-        )
+        try:
+            report = body(
+                slurm.rank,
+                W,
+                row,
+                group,
+                slurm.device,
+                os.environ.get("KCP_TEST_RESULT_DIR"),
+                backend,
+            )
+        except Exception:
+            # a body that raises leaves the row's collectives on the other ranks unmatched; the step then ends at
+            # the WORLD timeout before pytest's summary, so the cause is printed here
+            traceback.print_exc()
+            sys.stderr.flush()
+            raise
     ok = report is None or bool(report["pass"])
     if slurm.world > 1:
         verdicts: list = [None] * slurm.world
@@ -1552,7 +2563,8 @@ def _slurm_row(row: Row, slurm, backend: str, body) -> None:
 
 @pytest.mark.parametrize("row", _selected_rows(), ids=_row_id)
 def test_forward_rows(row: Row, slurm) -> None:
-    """INT1 forward-only rows (``KCP_TEST_MODE=forward``): #1-#5, ``out`` vs FP64, ``S_in`` vs the FP64 cut states."""
+    """INT1 forward-only rows (``KCP_TEST_MODE=forward``): #1-#5, ``out`` vs FP64 and across arms within the budgets,
+    ``S_in`` vs the FP64 cut states."""
     if _test_mode() != "forward":
         pytest.skip("KCP_TEST_MODE=forward selects the forward-only rows")
     backend = _backend_name()
@@ -1576,67 +2588,37 @@ def test_forward_rows(row: Row, slurm) -> None:
 
 @pytest.mark.parametrize("row", _selected_rows(), ids=_row_id)
 def test_multi_gpu_rows(row: Row, slurm) -> None:
+    """Every forward / backward mode of the row against FP64 and across arms within the budgets, the worst of
+    ``N_REPEAT`` runs, the exact contracts, the backward's collectives, the hosts, the deterministic route on the
+    same operands (see the module docstring)."""
     if _test_mode() != "full":
         pytest.skip("KCP_TEST_MODE=forward: the forward-only rows run instead")
     backend = _backend_name()
     if slurm is not None:
-        W = row.W
-        if slurm.world < W:
-            pytest.skip(f"row needs {W} ranks, the step has {slurm.world}")
-        group = slurm.group(
-            W
-        )  # collective over WORLD: every rank calls it, members and non-members alike
-        if slurm.world > 1:
-            dist.barrier()
-        if backend == "kernels" and not _programs_exported():
-            pytest.skip(
-                "the KCP programs are not exported in the package's build.json yet"
-            )
-        report = None
-        if slurm.rank < W:
-            report = _run_rank(
-                slurm.rank,
-                W,
-                row,
-                group,
-                slurm.device,
-                os.environ.get("KCP_TEST_RESULT_DIR"),
-                backend,
-            )
-        # the verdict is WORLD-wide: every rank (member or not) passes or fails the same row, so ``-x`` and the
-        # session teardown keep the collectives aligned across ranks
-        ok = report is None or bool(report["pass"])
-        if slurm.world > 1:
-            verdicts: list = [None] * slurm.world
-            dist.all_gather_object(verdicts, ok)
-            ok = all(verdicts)
-        if slurm.rank >= W:
-            if not ok:
-                pytest.fail(f"rank {slurm.rank}: row failed on its {W} member ranks")
-            pytest.skip(f"rank {slurm.rank} is not part of the row's {W}-rank group")
-        assert ok, json.dumps(
-            {k: v for k, v in report.items() if k != "info_by_rank"}, default=str
-        )[:6000]
+        _slurm_row(row, slurm, backend, _run_rank)
         return
     _skip_unless_runnable(row.W, backend)
-    with tempfile.TemporaryDirectory(prefix="cake_gdn_kcp_dist_") as tmp:
-        result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
-        mp.start_processes(
-            _spawn_entry,
-            args=(row.W, row, _free_port(), result_dir, backend),
-            nprocs=row.W,
-            join=True,
-            start_method="spawn",
-        )
-        with open(os.path.join(result_dir, _row_id(row) + ".json")) as fh:
-            report = json.load(fh)
-    assert report["pass"], report
+    _spawn_row(row, backend, "full")
+
+
+@pytest.mark.parametrize("pair", _selected_poison_pairs(), ids=_pair_id)
+def test_poisoned_workspace_pairs(pair: PoisonPair, slurm) -> None:
+    """(d) one ``WorkspaceKcp`` reused across the pair's two token layouts on one group, every pool and tape NaN in
+    between: both rows within the FP64 budgets."""
+    if _test_mode() != "full":
+        pytest.skip("KCP_TEST_MODE=forward: the forward-only rows run instead")
+    backend = _backend_name()
+    if slurm is not None:
+        _slurm_row(pair, slurm, backend, _run_rank_poison)
+        return
+    _skip_unless_runnable(pair.W, backend)
+    _spawn_row(pair, backend, "poison")
 
 
 def test_accuracy_budget_cells_cover_the_accuracy_rows() -> None:
-    """Every accuracy row (regime != ``normal``) maps to a budget cell with all six tensors (finite, positive budgets,
-    the declared storage per tensor); the rows at a CP of record use their own CP, the CP16 row ``A1-cp16`` (no CP16
-    cell) the A1 CP8 cell.  CPU-only."""
+    """Every accuracy row (regime != ``normal``) maps to a budget cell of the deterministic package's table with all
+    six tensors (finite, positive budgets, the declared storage per tensor); the rows at a CP of record use their own
+    CP, the CP16 row ``A1-cp16`` (no CP16 cell) the A1 CP8 cell.  CPU-only."""
     table = _budgets()
     assert table["status"] == "FINAL" and table["cells"] == 216
     rows = [r for r in ROWS if r.regime != "normal"]
@@ -1658,8 +2640,7 @@ def test_public_api_cannot_select_test_programs() -> None:
     """The precision policy: the shipped record is ``precision_mode=0`` / ``transfer_walk="tf32_hilo"``;
     the test-only records (1 ``_three_mma``, 2 ``_plain_tf32``, ``"bf16x3"``) are refused unless ``test_knobs`` names
     the same value; nothing in the environment changes that (there is no environment hook)."""
-    from flashinfer.experimental.cake_gdn_train import cake_options
-
+    cake_options = _mod("cake_options")
     for mode in (1, 2):
         with pytest.raises(ValueError):
             cake_options.make_options(precision_mode=mode)
@@ -1673,12 +2654,57 @@ def test_public_api_cannot_select_test_programs() -> None:
     assert o.precision_mode == 2
 
 
+def test_long_chain_rows_have_long_owner_chains() -> None:
+    """The long-chain rows cover ``zigzag``, ``zigzag_per_document`` and ``contiguous`` at CP 8 and 16, and their owner
+    chains (families ``OWNER_FAMILIES`` of the host tables) are longer than ``LONG_CHAIN_MIN`` on every rank that owns
+    one (some rank does).  CPU-only."""
+    rows = [r for r in ROWS if r.long_chains]
+    assert {r.layout for r in rows} == {"zigzag", "zigzag_per_document", "contiguous"}
+    assert {r.regime for r in rows} >= {"normal", "A1"}  # A1: state crosses the ranks
+    assert {r.W for r in rows} == {8, 16}
+    assert all(len(r.lengths) in (1, 2) for r in rows)
+    for row in rows:
+        H_qk, HV = row.heads
+        part, _ = _partition(row)
+        owned = 0
+        for r in range(row.W):
+            ctx = plan.build_context_kcp(
+                part, None, r, torch.device("cpu"), 4, sm_count=148
+            )
+            tb = kcp.WorkspaceKcp().tables(ctx, HV)
+            for fam in OWNER_FAMILIES:
+                ch = tb.chains[fam]
+                lengths = [
+                    ch.chain_start[i + 1] - ch.chain_start[i]
+                    for i in range(ch.n_chains)
+                ]
+                if not lengths:
+                    continue
+                owned += 1
+                assert max(lengths) > LONG_CHAIN_MIN, (row.name, r, fam, lengths)
+        assert owned > 0, row.name
+
+
+def test_poison_pairs_change_the_layout() -> None:
+    """(d) the rows of every poison pair share a group size and differ in their fragment tables.  CPU-only."""
+    for pair in POISON_PAIRS:
+        a, b = pair.rows
+        assert a.W == b.W, pair.name
+        assert pair.stage in STAGES, pair.name
+        pa, pb = _partition(a)[0], _partition(b)[0]
+        frags = lambda p: [  # noqa: E731
+            [(f.doc, f.off, f.length) for f in fr] for fr in p.fragments
+        ]
+        assert frags(pa) != frags(pb), pair.name
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # C7: the convolution halo row.  The user calls FlashInfer's ``cake_causal_conv1d_kcp(x_local, weight, ctx)`` with
 # THIS package's context: the conv package reads the halo plan (``ctx.halo``, ``ctx.halo_tables``), the local
 # ``cu_seqlens`` and the process group by duck typing.  The row's partition: document 0 = [1, 2, 300] on ranks 0,
 # 1 and 3 (the three history rows of rank 3's first outputs come from TWO predecessor ranks), rank 2 holds no token
 # (an empty predecessor), document 1 = [200] on rank 3 (a document start inside the continuing rank); C = 10,240.
+# The bitwise checks of this row are the convolution package's own (its single-rank form and its repeat).
 
 CONV_C = 10240
 CONV_WIDTH = 4
@@ -1697,11 +2723,18 @@ EXPLICIT["c7"] = (_c7_fragments, (303, 200))
 C7_ROW = Row("C7", (303, 200), (2, 6), 4, "explicit:c7", stage="conv")
 
 
-def _conv_reference(x: torch.Tensor, w: torch.Tensor, cu: list[int], dy: torch.Tensor):
+def _conv_reference(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    cu: list[int],
+    dy: torch.Tensor,
+    *,
+    round_dx: bool = True,
+):
     """FP64 oracle of the unpartitioned width-4 depthwise causal convolution + SiLU with the conv package's KCP
     semantics (``weight[c, 3]`` multiplies the current token; zero history at a document start; the SiLU
-    derivative on the unrounded preactivation): BF16 ``y`` and ``dx`` (one rounding each), FP64 ``dpre`` for the
-    per-rank ``dweight`` partials."""
+    derivative on the unrounded preactivation): BF16 ``y``, ``dx`` (BF16, one rounding; FP64 without
+    ``round_dx``), FP64 ``dpre`` and the taps for the per-rank ``dweight`` partials."""
     S, _ = x.shape
     xf, wd = x.double(), w.double()
     doc = torch.zeros(S, dtype=torch.int64, device=x.device)
@@ -1733,9 +2766,9 @@ def _conv_reference(x: torch.Tensor, w: torch.Tensor, cu: list[int], dy: torch.T
     s = torch.sigmoid(pre)
     y = (pre * s).to(torch.bfloat16)
     dpre = dy.double() * s * (1 + pre * (1 - s))
-    dx = sum(
-        wd[:, k][None, :] * shifted_up(dpre, halo - k) for k in range(CONV_WIDTH)
-    ).to(torch.bfloat16)
+    dx = sum(wd[:, k][None, :] * shifted_up(dpre, halo - k) for k in range(CONV_WIDTH))
+    if round_dx:
+        dx = dx.to(torch.bfloat16)
     taps = [shifted(xf, halo - k) for k in range(CONV_WIDTH)]
     return y, dx, dpre, taps
 
@@ -1767,23 +2800,18 @@ def _run_rank_conv(
     backend: str,
 ) -> dict:
     """C7 on one rank: ``y`` / ``dx`` / ``dweight`` of the rank's tokens against the FP64 oracle of the whole pack,
-    ``y`` bitwise equal to the single-rank conv of the whole pack on the rank's tokens, repeat bitwise, and the
-    halo-row gradients delivered to the predecessor ranks (rank 0 / 1: 1 / 2 tokens of document 0)."""
+    ``y`` bitwise equal to the conv package's single-rank conv of the whole pack on the rank's tokens, its repeat
+    bitwise, and the halo-row gradients delivered to the predecessor ranks (rank 0 / 1: 1 / 2 tokens of document 0)."""
     from flashinfer import cake_causal_conv1d_train as conv
 
     part, cu = _partition(row)
-    ctx = plan.build_kcp_context(part, group, rank, device)
+    ctx = plan.build_context_kcp(part, group, rank, device)
     total = cu[-1]
     gen = torch.Generator(device="cpu").manual_seed(43567)
     x_all = (torch.randn(total, CONV_C, generator=gen) * 0.5).to(torch.bfloat16)
     w = (torch.randn(CONV_C, CONV_WIDTH, generator=gen) * 0.5).float()
     dy_all = (torch.randn(total, CONV_C, generator=gen) * 0.5).to(torch.bfloat16)
-    pieces = [
-        torch.arange(cu[f.doc] + f.off, cu[f.doc] + f.off + f.length)
-        for f in part.fragments[rank]
-        if f.length
-    ]
-    l2g = torch.cat(pieces) if pieces else torch.zeros(0, dtype=torch.int64)
+    l2g = _local_to_global(part, cu, rank)
     x_local = x_all[l2g].to(device).requires_grad_(True)
     w_dev = w.to(device).requires_grad_(True)
     dy_local = dy_all[l2g].to(device)
@@ -1824,16 +2852,17 @@ def _run_rank_conv(
         flags["empty_rank"] = y.numel() == 0 and dx.numel() == 0
     report = {
         "row": dataclasses.asdict(row),
+        "pass": all(flags.values()),
         "rank": rank,
         "world": W,
         "backend": "conv",
         "mode": "conv",
+        "package": PACKAGE,
         "host": socket.gethostname(),
         "device": str(device),
         "device_name": torch.cuda.get_device_name(device),
         "torch": torch.__version__,
         "utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "pass": all(flags.values()),
         "flags": flags,
         "gated": sorted(flags),
         "reported": [],
@@ -1859,11 +2888,313 @@ def _run_rank_conv(
 
 def test_conv_halo_row(slurm) -> None:
     """C7: FlashInfer's ``cake_causal_conv1d_kcp`` through this package's context (duck typing): ``y`` / ``dx`` /
-    ``dweight`` vs FP64 on every rank, ``y`` bitwise the single-rank conv, history rows from two predecessor ranks,
-    an empty predecessor and a document start.  Runs under Slurm with >= 4 ranks."""
+    ``dweight`` vs FP64 on every rank, ``y`` bitwise the conv package's single-rank conv, history rows from two
+    predecessor ranks, an empty predecessor and a document start.  Runs under Slurm with >= 4 ranks."""
     if slurm is None:
         pytest.skip("the conv halo row runs under Slurm (4 ranks)")
     conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
     if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(C7_ROW, slurm, "conv", _run_rank_conv)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Whole-layer checkpoint rows (issue #7818): KCP convolution -> packed q | k | v views -> caller L2 norm of q, k ->
+# chunk_gdn_kcp (deterministic=False), one checkpointed region per layer with one RecomputeHandleKcp.  Gated: the GDN
+# part of the recompute exchanges nothing (with a convolution that takes the handle the whole recompute exchanges
+# nothing; before that, exactly the convolution's own forward collectives remain, the whole-layer zero is reported as
+# pending); the original forward and the backward exchange as in the plain checkpoint; the direct backward's
+# collectives by name are the deterministic layer's (b1, b2 and the convolution's halo), no parameter reduction;
+# out / dx / dweight / dg / dbeta of the handle checkpoint within the budget constants of the plain checkpoint and
+# of the direct pass, and every form within the correctness clause of the FP64 layer oracle.  Runs under Slurm.
+
+LAYER_ROWS = [
+    Row("L4", (303, 200), (2, 6), 4, "explicit:c7", stage="layer"),
+    Row(
+        "L8",
+        (10240, 8192, 2085, 333),
+        (16, 48),
+        8,
+        "zigzag_per_document",
+        stage="layer",
+    ),
+    Row(
+        "L8r",
+        (10240, 8192, 2085, 333),
+        (16, 48),
+        8,
+        "ragged:5000,0,1,3000,2849,4000,3000,3000",
+        stage="layer",
+    ),
+]
+
+
+def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
+    """The caller's per-head L2 norm of ``[T, H, 128]`` BF16 (FP32 math, one rounding): deterministic, so the
+    checkpoint recompute reproduces it bit for bit."""
+    xf = x.float()
+    return (xf / torch.sqrt((xf * xf).sum(-1, keepdim=True) + 1e-6)).to(torch.bfloat16)
+
+
+def _l2_normalize_f64(x: torch.Tensor) -> torch.Tensor:
+    """The same L2 norm in FP64 without the rounding (the oracle's derivative)."""
+    return x / torch.sqrt((x * x).sum(-1, keepdim=True) + 1e-6)
+
+
+def _layer_reference(
+    row: Row, part, cu: list[int], rank: int, device, x_all, w_all, conv
+) -> dict[str, torch.Tensor]:
+    """FP64 oracle of the whole layer on this rank's tokens: the exact GDN of the layer's own BF16 operands (the conv
+    package's single-rank convolution of the whole pack -- bitwise the KCP convolution on every rank's tokens, the C7
+    row's gate -- through the caller's L2 norm), its FP64 gradients carried back through the FP64 L2 norm and the FP64
+    convolution + SiLU; ``dw`` is this rank's partial (the weight leaf is per rank)."""
+    ref_mod = _reference()
+    H_qk, HV = row.heads
+    total = cu[-1]
+    sel = _local_to_global(part, cu, rank).to(device)
+    x_dev, w_dev = x_all.to(device), w_all.to(device)
+    cu_dev = torch.tensor(cu, dtype=torch.int32, device=device)
+    with torch.no_grad():
+        y = conv.cake_causal_conv1d(x_dev, w_dev, cu_dev)
+    qkv = y.view(total, 2 * H_qk + HV, 128)
+    q = _l2_normalize(qkv[:, :H_qk])
+    k = _l2_normalize(qkv[:, H_qk : 2 * H_qk])
+    v = qkv[:, 2 * H_qk :].contiguous()
+    glob = _global_inputs(row, cu, device)
+    gdn = ref_mod.gdn_exact_with_grads(
+        q,
+        k,
+        v,
+        glob["g"],
+        glob["beta"],
+        glob["dout"],
+        torch.tensor(cu, dtype=torch.int64),
+        scale=SCALE,
+    )
+    del glob, q, k, v
+    y64 = y.detach().to(F64).requires_grad_(True)
+    y3 = y64.view(total, 2 * H_qk + HV, 128)
+    outs = (
+        _l2_normalize_f64(y3[:, :H_qk]),
+        _l2_normalize_f64(y3[:, H_qk : 2 * H_qk]),
+        y3[:, 2 * H_qk :],
+    )
+    (dy64,) = torch.autograd.grad(
+        outs, (y64,), (gdn["dq"].to(F64), gdn["dk"].to(F64), gdn["dv"].to(F64))
+    )
+    del outs, y3, y64
+    _, dx64, dpre, taps = _conv_reference(x_dev, w_dev, cu, dy64, round_dx=False)
+    dw = torch.stack([(dpre[sel] * tap[sel]).sum(0) for tap in taps], dim=1)
+    out = {
+        "out": gdn["out"][sel].to(F64),
+        "dx": dx64[sel],
+        "dw": dw,
+        "dg": gdn["dg"][sel].to(F64),
+        "dbeta": gdn["dbeta"][sel].to(F64),
+    }
+    del gdn, dx64, dpre, taps, dy64
+    return out
+
+
+def _run_rank_layer(
+    rank: int,
+    W: int,
+    row: Row,
+    group,
+    device: torch.device,
+    result_dir: str | None,
+    backend: str,
+) -> dict:
+    from flashinfer import cake_causal_conv1d_train as conv
+
+    H_qk, HV = row.heads
+    C = (2 * H_qk + HV) * 128
+    part, cu = _partition(row)
+    ctx = plan.build_context_kcp(part, group, rank, device)
+    gen = torch.Generator(device="cpu").manual_seed(78180)
+    x_all = (torch.randn(cu[-1], C, generator=gen) * 0.5).to(torch.bfloat16)
+    w_all = (torch.randn(C, CONV_WIDTH, generator=gen) * 0.5).float()
+    l2g = _local_to_global(part, cu, rank)
+    x_local = x_all[l2g].to(device)
+    ops = _local_inputs(row, part, cu, rank, device)
+    g, beta, dout = ops["g"], ops["beta"], ops["dout"]
+    conv_takes_handle = (
+        "recompute_handle" in inspect.signature(conv.cake_causal_conv1d_kcp).parameters
+    )
+
+    def layer(x, w, g_, b_, h):
+        ckw = {"recompute_handle": h} if (h is not None and conv_takes_handle) else {}
+        y = conv.cake_causal_conv1d_kcp(x, w, ctx, **ckw)
+        qkv = y.view(y.shape[0], 2 * H_qk + HV, 128)
+        q = _l2_normalize(qkv[:, :H_qk])
+        k = _l2_normalize(qkv[:, H_qk : 2 * H_qk])
+        v = qkv[:, 2 * H_qk :]
+        return kcp.chunk_gdn_kcp(
+            q,
+            k,
+            v,
+            g_,
+            b_,
+            ctx,
+            recompute_handle=h,
+            save_transfer=False,
+            backend=backend,
+            deterministic=False,
+        )
+
+    def leaves_of():
+        return [
+            x_local.detach().clone().requires_grad_(True),
+            w_all.to(device).requires_grad_(True),
+            g.detach().clone().requires_grad_(True),
+            beta.detach().clone().requires_grad_(True),
+        ]
+
+    def run(mode: str):
+        leaves = leaves_of()
+        hd = kcp.RecomputeHandleKcp() if mode == "handle" else None
+        from torch.utils.checkpoint import checkpoint
+
+        with _NamedCounter() as cc:
+            if mode == "direct":
+                out = layer(*leaves, None)
+            else:
+                rphase = RecomputePhase(cc)
+                out = checkpoint(
+                    layer,
+                    *leaves,
+                    hd,
+                    use_reentrant=False,
+                    context_fn=lambda: (contextlib.nullcontext(), rphase),
+                )
+            cc.phase = "bwd"
+            out.backward(dout)
+        tensors = [out.detach()] + [lf.grad for lf in leaves]
+        return dict(zip(LAYER_TENSORS, tensors, strict=True)), {
+            **cc.record(),
+            "handle_bytes": hd.nbytes() if hd is not None else 0,
+            "handle_keys": sorted(hd.entries) if hd is not None else [],
+        }
+
+    # the convolution's own forward collectives (its halo exchange), for the pending whole-layer count
+    with CollectiveCounter() as cc_conv:
+        conv.cake_causal_conv1d_kcp(x_local, w_all.to(device), ctx)
+    conv_fwd = cc_conv.record()
+    t0 = time.time()
+    res_d, rec_d = run("direct")
+    res_p, rec_p = run("plain")
+    res_h, rec_h = run("handle")
+    # (b) the deterministic layer (its own context of the same partition; the convolution reads it by duck typing):
+    # the direct backward's collectives by name
+    det_api = importlib.import_module(DET_API)
+    det_part, _ = _partition_with(det_api.partition_det_kcp, row)
+    det_ctx = det_api.build_context_det_kcp(det_part, group, rank, device)
+    det_leaves = leaves_of()
+    with _NamedCounter() as cc_det:
+        y_d = conv.cake_causal_conv1d_kcp(det_leaves[0], det_leaves[1], det_ctx)
+        qkv_d = y_d.view(y_d.shape[0], 2 * H_qk + HV, 128)
+        out_det = det_api.chunk_gdn_det_kcp(
+            _l2_normalize(qkv_d[:, :H_qk]),
+            _l2_normalize(qkv_d[:, H_qk : 2 * H_qk]),
+            qkv_d[:, 2 * H_qk :],
+            det_leaves[2],
+            det_leaves[3],
+            det_ctx,
+            save_transfer=False,
+            backend=backend,
+        )
+        cc_det.phase = "bwd"
+        out_det.backward(dout)
+    rec_det = cc_det.record()
+    del det_leaves, y_d, qkv_d, out_det
+    flags: dict[str, bool] = {
+        "layer_orig_bwd_comm_unchanged": all(
+            rec_h[t].get(ph, 0) == rec_p[t].get(ph, 0)
+            for t in ("calls", "waits")
+            for ph in ("orig", "bwd")
+        ),
+        "layer_bwd_collectives_eq_det": rec_d["named"].get("bwd", {})
+        == rec_det["named"].get("bwd", {}),
+        "layer_no_param_reduction": _no_param_reduction(rec_d, rec_p, rec_h),
+    }
+    rc_calls = rec_h["calls"].get("recompute", 0)
+    rc_waits = rec_h["waits"].get("recompute", 0)
+    if conv_takes_handle:
+        flags["layer_recompute_no_comm"] = rc_calls == 0 and rc_waits == 0
+    else:
+        # only the convolution's own halo exchange is left in the recompute: the GDN part exchanges nothing
+        flags["layer_gdn_recompute_no_comm"] = rc_calls == conv_fwd["calls"].get(
+            "orig", 0
+        ) and rc_waits == conv_fwd["waits"].get("orig", 0)
+    # (g) the FP64 layer oracle and the cross-form budget checks
+    ref_mod = _reference()
+    refs = _layer_reference(row, part, cu, rank, device, x_all, w_all, conv)
+    judge = _Judge(row, ref_mod, None)
+    for name, r_ in (("direct", res_d), ("plain_ckpt", res_p), ("handle", res_h)):
+        judge.fp64(name, r_, refs, LAYER_TENSORS)
+    judge.cross("handle_vs_plain_ckpt", res_h, res_p, LAYER_TENSORS)
+    judge.cross("handle_vs_direct", res_h, res_d, LAYER_TENSORS)
+    del refs, res_d, res_p, res_h
+    host = _host_map(group, W)
+    flags["host_map"] = host["ok"]
+    verdicts = judge.finish(group, W)
+    report = {
+        "row": dataclasses.asdict(row),
+        "pass": True,
+        "failing": [],
+        "rank": rank,
+        "world": W,
+        "backend": backend,
+        "mode": "layer",
+        "package": PACKAGE,
+        "host": socket.gethostname(),
+        "hosts": host,
+        "device": str(device),
+        "device_name": torch.cuda.get_device_name(device),
+        "torch": torch.__version__,
+        "utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "flags": {},
+        "gated": [],
+        "reported": []
+        if conv_takes_handle
+        else ["layer_recompute_no_comm (pending: conv recompute_handle)"],
+        "judged": {},
+        "info_by_rank": [
+            {
+                "rank": rank,
+                "T_r": int(x_local.shape[0]),
+                "conv_takes_handle": conv_takes_handle,
+                "conv_fwd_collectives": conv_fwd,
+                "direct": rec_d,
+                "plain": rec_p,
+                "handle": rec_h,
+                "det_direct": rec_det,
+                "plain_recompute_calls": rec_p["calls"].get("recompute", 0),
+                "handle_recompute_calls": rc_calls,
+                "handle_recompute_waits": rc_waits,
+            }
+        ],
+        "seconds": None,
+        "C": C,
+    }
+    _fold(report, [flags], verdicts)
+    report["seconds"] = round(time.time() - t0, 2)
+    if result_dir:
+        os.makedirs(result_dir, exist_ok=True)
+        with open(
+            os.path.join(result_dir, f"{row.name}-layer-rank{rank}.json"), "w"
+        ) as fh:
+            json.dump(report, fh, indent=1, default=str)
+    return report
+
+
+@pytest.mark.parametrize("row", LAYER_ROWS, ids=_row_id)
+def test_layer_checkpoint_rows(row: Row, slurm) -> None:
+    """#7818 whole-layer rows: KCP convolution + L2 norm + chunk_gdn_kcp (deterministic=False) in one checkpointed
+    region with one recompute handle (see the block comment above).  Runs under Slurm with >= the row's ranks."""
+    if slurm is None:
+        pytest.skip("the layer rows run under Slurm")
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
+    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+        pytest.skip("the conv package does not support this device")
+    _slurm_row(row, slurm, _backend_name(), _run_rank_layer)

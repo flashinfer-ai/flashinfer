@@ -1,151 +1,73 @@
-# Experimental MiniMax-M3 ICP decode indexer chain (Cake backend)
+# Experimental MiniMax-M3 ICP indexer kernels (Cake backend)
 
-Both this API and its Cake backend are experimental and may change without
-backward compatibility. Calling the API explicitly opts into the experimental
-feature and emits FlashInfer's experimental API warning. There is no automatic
-backend selection and no stable API changes its behaviour.
+This API and its Cake backend are experimental and may change without
+backward compatibility. Calling it emits FlashInfer's experimental API
+warning; no stable API selects it automatically.
 
-`flashinfer.msa_ops.prepare_msa_icp_indexer(...)` serves one decode step of
-the index-context-parallel (ICP) indexer of MiniMax-M3 sparse attention on
-compute capability 10.0 and 10.3. The index keys of a sequence are sharded by
-rows across the `world_size` (2 or 4) ranks of a process group: every
-128-token page (or 256-token page for two ranks) holds `rows_per_rank` FP8
-key rows per rank inside a compound page of configurable pitch. For every
-decode token and index head the chain
+The `flashinfer.msa_ops.msa_icp_*` entry points and the
+`prepare_msa_icp_indexer` facade are the per-rank kernels of the
+index-context-parallel (ICP) indexer of MiniMax-M3 sparse attention on compute
+capability 10.0, 10.3 and 10.7. They follow the MSA sharded-indexer contract,
+so a serving engine can switch providers without changing its cache layout or
+buffers. The API reference is `docs/api/sparse.rst` ("MiniMax-M3 ICP
+indexer").
 
-1. **scores** the token's FP8 query against this rank's rows of every visible
-   page (FP8 products, FP32 accumulation, `-inf` for rows the token may not
-   see) and keeps the exact top-16 pages of the row under the canonical key
-   (score descending, global block id ascending, `+0.0 == -0.0`) -- the
-   **fused scorer** program, one CTA per (request, split) streaming the page
-   fragments with TMA into tensor-core MMAs, the top-16 kept in the epilogue
-   as compact candidate lists in a per-row pool;
-2. **merges** the row's lists into the rank-local top-16, **pushes** the 16
-   words into the owner rank's symmetric pool and, on the rows whose head this
-   rank owns, **polls** the peers' words and writes the merged global block
-   ids ascending with a `-1` tail, the forced (newest) block injected once and
-   `n_ordinary` ordinary slots -- the **exchange merge** program, one CTA per
-   (token, head) row.
+| Step | Prefill / mixed | Decode |
+|---|---|---|
+| Plan | `msa_icp_index_score_sharded_plan_device`, once per query window and step | -- |
+| Score | `msa_icp_index_score_sharded` per query chunk into caller score scratch | `msa_icp_decode_index_score_sharded` into caller score rows |
+| Local Top16 | `msa_icp_topk_select_prefill` into the caller's carrier `[H, T, 33]` | `msa_icp_topk_select_publish` into the owner ranks' receive rows |
+| Exchange | the caller's one all-to-all per layer | (in the publish: peer stores) |
+| Merge | `msa_icp_merge_candidates(prefill=True)` | `msa_icp_merge_candidates` (legacy or tagged rows) |
 
-## Usage
+The decode column is the default chain.  Its score plane cuts each request
+into one wave of the scorer (SMs x resident CTAs per SM / batch, at most 128
+splits); on compute capability 10.3 at P128 TP4 the plane runs a
+four-CTA-per-SM program and, from 14 requests on, at most 32 splits
+(`cake_backend.plane_splits`).  The scores do not depend on the split count.
+An optional fused chain replaces the
+score and local Top16 steps with `msa_icp_decode_score_publish`: the scorer
+keeps per-split Top16 lists in a uint8 `pool` (`msa_icp_decode_pool_bytes`)
+and a list publisher merges them, giving the same receive rows.  It cuts each
+request into at most 48 splits (`cake_jit.TOPK16_SPLIT_CAP`, per
+architecture).  The facade runs it when `decode(..., pool=...)` is given, and
+without a pool on compute capability 10.7 at P128 (TP2 and TP4) from 8 requests on, in
+a pool it allocates once (`cake_backend.fused_decode_min_batch`;
+`MSAIcpIndexerPlan.fused_decode_min_batch` is `None` on every other layout).
+There the measured end-to-end decode step is faster with the fused chain;
+below 8 requests and at P256 TP4 the score plane is faster.
 
-```python
-import torch.distributed as dist
-from flashinfer.msa_ops import (
-    create_msa_icp_indexer_workspace,
-    destroy_msa_icp_indexer_workspace,
-    prepare_msa_icp_indexer,
-)
+*The two chains of one sparse layer.*
 
-# Collective, once per decode engine (not inside CUDA Graph capture).
-workspace = create_msa_icp_indexer_workspace(
-    world_size=dist.get_world_size(), rank=dist.get_rank(), tokens_cap=max_tokens, device=device
-)
+With programmatic dependent launch (`enable_pdl`), every kernel waits on its
+predecessor before it reads data an earlier kernel of the step wrote, with one
+exception: on compute capability 10.0 and 10.3 at 64 or 128 local K rows per
+page (P128 TP2, P256 TP2 and TP4) and on 10.7 at 32 or 64 (P128 TP4 and TP2,
+P256 TP4), the score plane reads `seq_lens` and
+`block_table` and starts loading the history index-K pages (those ending at or
+before `seq_len - decode_query_len`) before its wait.  The kernel launched just
+before the score plane must not write them, and must either be launched
+without programmatic dependent launch or wait on its own predecessor before it
+triggers its dependents.  `enable_pdl=False` removes the requirement; the fused
+chain has no such read.
 
-runner = prepare_msa_icp_indexer(
-    index_q, index_k, block_table, query_start_loc, seq_lens, positions, active_rows,
-    forced_column, forced_block, n_ordinary,
-    workspace=workspace, query_len=4, out=out, candidates=candidates,
-)
-out = runner()                 # no allocation, no host synchronization, capturable
-torch.cuda.synchronize()
-assert workspace.status_value() == 0   # outside any capture; non-zero is fatal for the step
+The caller owns every buffer and every collective step: it allocates the
+receive storage (`msa_icp_comm_layout`) in symmetric memory, exchanges the
+peer addresses into `recv_bases`, zeroes the storage and the generation
+counters once, rotates the three slot sets, and runs the prefill all-to-all.
+The kernels never allocate, never read a device value on the host and run on
+the current stream, so every call can be captured in a CUDA Graph once its
+programs are loaded (`MSAIcpIndexerPlan.warmup()`).
 
-destroy_msa_icp_indexer_workspace(workspace)   # collective, after the last launch completed
-```
+Run `warmup()` on every rank before the first decode or prefill exchange and
+before CUDA Graph capture.  It builds or loads every program of the device's
+architecture and loads each kernel into the device's context.  Under CUDA lazy
+module loading, a kernel loaded at its first launch can stall behind a peer's
+merge that already spins on its rows, until the spin limit stops it.
 
-Tensor contract (all on one CUDA device, read on device only):
-
-| tensor | dtype / shape | meaning |
-| --- | --- | --- |
-| `index_q` | fp8_e4m3fn `[T, 4, 128]` contiguous | queries of this rank's `T = request_count * query_len` decode tokens |
-| `index_k` | fp8_e4m3fn `[num_pages, rows_per_rank, 128]` view, `stride(0)` = page pitch (16-byte multiple), dense fragment | this rank's rows of every physical page |
-| `block_table` | int32 `[request_count, columns]` | physical page ids, live prefix first; `columns` bounds every request |
-| `query_start_loc` | int32 `[request_count + 1]` | token offsets (`[0] == 0`, `[-1] == T`, at most `query_len` tokens per request) |
-| `seq_lens` | int32 `[request_count]` | visible history length including the decode tokens |
-| `positions` | int64 `[T]` | causal position of each token |
-| `active_rows` | uint8 `[T]` | inactive tokens score nothing and produce pad lists |
-| `forced_column` | int32 `[T]` | column of the forced block inside this rank's readable window, else `-1` |
-| `forced_block` | int32 `[T]` | global id of the forced (newest) block, `-1` for none |
-| `n_ordinary` | int32 `[T]` | ordinary slots (at most 15 whenever a forced block exists) |
-| `out` | int32 `[T, 4 // world_size, 16]` | merged ids of the heads this rank owns, ascending, `-1` tail |
-| `candidates` | fp32 `[T, 4, 16, 2]` | rank-local merged lists (score, int32 id bits), best first, `(-inf, -1)` padded |
-
-Preparation validates the tensors from their metadata, decides the **split
-count** (`cake_backend.default_split_count`: the largest split that keeps
-every scorer CTA resident at once on the device's SMs) and the **pool / merge
-geometry** (`cake_backend.pool_geometry`: the merge CTA's warps and entries
-per thread covering every request the block table admits), binds both
-generated programs and returns a runner. One launch covers all `T` tokens of
-`index_q` (every per-token tensor is exactly `[T]` and `T <= tokens_cap` of
-the workspace); there is no launch-window parameter. The programs for the
-index geometry (`query_len`, `rows_per_rank`, page size) and the resulting
-merge geometry must be registered in this checkout (`cake_jit.PROGRAMS`);
-otherwise preparation raises `NotImplementedError` instead of entering
-another kernel.
-
-## Workspace, exchange and status
-
-The workspace (`cake_workspace.MSAIcpIndexerWorkspace`) owns the symmetric
-transport pool -- two parity halves of `tokens_cap * (4 // world_size)` rows
-times `world_size` source regions of 16 words, allocated through PyTorch
-symmetric memory so every peer's half is mapped into this rank's address
-space -- plus the per-row generation words, the status word and the per-CTA
-timestamps of the merge launch. Creation and destruction are collectives over
-the group and are not allowed inside CUDA Graph capture. The per-peer base
-pointers form the peer table the host binding passes to the merge by value.
-
-Every rank of the group launches the chain for the same step; the generation
-words advance per launch and keep the ranks in step, so a prepared runner (or
-a CUDA Graph capturing it) is replayed step after step without host work.
-After a step completes, read `workspace.status_value()` outside any capture.
-Non-zero is fatal for the step: 1 = NaN among the ordinary candidate scores,
-2 = a row's list layout exceeded the pool stride, 4 = the merge's refine loop
-made no progress, 8 = a poll passed `timeout_us` (default 50 ms; the missing
-peer words merged as absent), 16 = `n_ordinary == 16` together with a forced
-block. Call `workspace.reset()` before reusing the workspace after a non-zero
-status.
-
-Single-process tests emulate the ranks: `MSAIcpIndexerWorkspace.emulated(...)`
-builds the ranks' pools as plain device tensors, and the merge is driven as
-its serialised halves (`runner.launch_merge(PHASE_PUSH_ONLY)` on every rank,
-then `PHASE_POLL_ONLY`). The kernels see device pointers either way.
-
-## Numerics and validation
-
-The scorer multiplies FP8 E4M3 values exactly and accumulates in FP32; the
-canonical key ranks the exact FP32 scores, so the local lists and the merged
-output are bit-exact against the CPU oracle in
-`tests/test_helpers/cake_msa_icp_inputs.py` (full-page FP32 scores, canonical
-top-16, merge with forced-block injection). The tests
-(`tests/experimental/test_cake_msa_icp_indexer.py`) check the registry and
-the planning helpers on the CPU, the emulated chain on one device (oracle,
-replay, CUDA Graph, no allocation) and the public API over NCCL on two or
-four devices. `benchmarks/bench_cake_msa_icp_indexer.py` times the chain
-with CUPTI under `torchrun`.
-
-## Files
-
-- `cake_jit.py` -- program registry (`PROGRAMS`, expanded from one table row
-  per record plus the per-family constants, `ARG_PLANS`, `POLICY`; written by
-  the generator, the tabular form pending its regeneration) and the
-  per-architecture JIT specs.
-- `cake_backend.py` -- validation, planning, binding, the runner.
-- `cake_workspace.py` -- the symmetric-memory workspace.
-- `csrc/cake_msa_icp_indexer/` (repository root) -- the generated device and
-  host-binding sources plus their shared headers; receipt-bound, do not edit.
-- The 12 scorer records build three kernel texts, one per `rows_per_rank`:
-  `cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_kernel.cu` (32),
-  `cake_msa_icp_indexer_cd26681ee2375382ee29_kernel.cu` (64) and
-  `cake_msa_icp_indexer_a1d2b2946134a90f832e_kernel.cu` (128). A record's
-  `compile_flags` fix `BLOCK_Q` (`4 * query_len`) and its kernel symbol
-  (`-DCAKE_PROGRAM_KERNEL`). This fold is a hand edit of the exported clones
-  pending its regeneration by the exporter.
-- The 26 records build two host bindings, one per role:
-  `cake_msa_icp_indexer_a8101e4dbbf1639b3bbd_binding.cu` (scorer) and
-  `cake_msa_icp_indexer_6c9de96daa7d9ac678d6_binding.cu` (merge). A record's
-  `compile_flags` select its kernel symbol and host-shim namespace
-  (`-DCAKE_PROGRAM_KERNEL`, `-DCAKE_PROGRAM_SHIM`) and the launch constants
-  its own binding carried as literals (`-DBLOCK_Q`, `-DCAKE_BIND_*`). This
-  fold is a hand edit of the exported bindings pending its regeneration by
-  the exporter.
+The package is a vendorable Cake package: `build.json` lists every
+`<program>_<arch>` library with its sources and flags, `cake_build.py` builds
+or loads them, and `cake_jit.py` is the registry that routes each call by
+role, local K rows per page and the device's exact architecture. The exporter
+writes `csrc/`, `build.json`, `cake_build.py` and the derived fields of
+`cake_jit.py`.

@@ -22,7 +22,7 @@ from .api_logging import flashinfer_experimental_api
 
 # Thin experimental entry points; validation of the backend contract, the
 # host dispatch and workspace policy, launch binding and JIT registration live
-# in flashinfer.experimental.cake_dsa_indexer (backend="cake") and
+# in flashinfer.experimental.cake_dsa_indexer_det (backend="cake") and
 # flashinfer.experimental.sm120_dsa_indexer (backend="sm120").
 
 _FEATURE = (
@@ -32,7 +32,7 @@ _FEATURE = (
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def dsa_indexer_topk(
+def dsa_indexer_det_topk(
     q: torch.Tensor,
     k: torch.Tensor,
     w: torch.Tensor,
@@ -66,7 +66,7 @@ def dsa_indexer_topk(
 
     with FP32 products, accumulation and score arithmetic (no BF16 intermediate
     rounding; the reduction scheme is fixed and documented in
-    ``flashinfer/experimental/cake_dsa_indexer/README.md``).  Every row selects
+    ``flashinfer/experimental/cake_dsa_indexer_det/README.md``).  Every row selects
     the exact global top ``min(top_k, visible)`` keys of its visible prefix,
     ranked by score descending then key id descending (``+0.0 == -0.0`` for
     ranking), and returns them in ascending id order with aligned scores.
@@ -111,9 +111,12 @@ def dsa_indexer_topk(
         it must bound every segment's keys, and lets a call of short segments
         skip the long-row launches.
     workspace_buffer : Optional[torch.Tensor]
-        Scratch of at least :func:`dsa_indexer_topk_workspace_size` bytes for
+        Scratch of at least :func:`dsa_indexer_det_topk_workspace_size` bytes for
         the call's geometry (uint8, 8-byte aligned); allocated through the
-        caching allocator when omitted.
+        caching allocator when omitted.  A caller-owned buffer may be shared
+        with other calls and kernels between runs: on the ticket architectures
+        the backend then zeroes the buffer's ticket word before every run,
+        while its own workspace is zeroed once at prepare.
     indices, scores : Optional[torch.Tensor]
         Caller-owned ``[T, top_k]`` int32 / float32 outputs; allocated when
         omitted.
@@ -262,8 +265,8 @@ def dsa_indexer_topk(
             raise ValueError("backend='cake' needs cu_seqlens_q and cu_seqlens_k")
         if not return_scores and scores is not None:
             raise ValueError("scores given with return_scores=False")
-        from .experimental.cake_dsa_indexer.cake_backend import (
-            dsa_indexer_topk as cake_dsa_indexer_topk,
+        from .experimental.cake_dsa_indexer_det.cake_backend import (
+            dsa_indexer_det_topk as cake_dsa_indexer_topk,
         )
 
         indices, cake_scores = cake_dsa_indexer_topk(
@@ -286,7 +289,7 @@ def dsa_indexer_topk(
     raise ValueError("DSA indexer top-k supports backend='cake' or 'sm120'")
 
 
-def dsa_indexer_topk_workspace_size(
+def dsa_indexer_det_topk_workspace_size(
     num_queries: int,
     num_keys: int,
     num_segments: int,
@@ -295,7 +298,7 @@ def dsa_indexer_topk_workspace_size(
     ratio: int = 1,
     device: Optional[torch.device] = None,
 ) -> int:
-    r"""Explicit workspace bound of :func:`dsa_indexer_topk` in bytes for one call geometry.
+    r"""Explicit workspace bound of :func:`dsa_indexer_det_topk` in bytes for one call geometry.
 
     The host dispatch picks the scan program (unit geometry, key-range split,
     CTA pair) from ``T = num_queries``, ``Tkv = num_keys``, ``S =
@@ -309,10 +312,15 @@ def dsa_indexer_topk_workspace_size(
     ``NotImplementedError`` while no generated program is registered for the
     device's architecture.
     """
-    from .experimental.cake_dsa_indexer.cake_backend import (
-        dsa_indexer_workspace_size as cake_dsa_indexer_workspace_size,
+    from .experimental.cake_dsa_indexer_det.cake_backend import (
+        dsa_indexer_det_workspace_size as cake_dsa_indexer_workspace_size,
     )
 
     return cake_dsa_indexer_workspace_size(
         num_queries, num_keys, num_segments, top_k=top_k, ratio=ratio, device=device
     )
+
+
+# Previous names of the entry points above: aliases of the same objects.
+dsa_indexer_topk = dsa_indexer_det_topk
+dsa_indexer_topk_workspace_size = dsa_indexer_det_topk_workspace_size

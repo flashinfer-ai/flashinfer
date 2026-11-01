@@ -91,6 +91,39 @@ __device__ __forceinline__ uint32_t cake_fmha_qmul4_portable(
   return output;
 }
 
+// Native Blackwell QMUL4 (PTX ISA 9.4 mul.rn.satfinite.e4m3x4.e2m1p4x4.e4m3x4, assembled by ptxas from CUDA 13.4 on
+// for sm_100a / sm_103a): byte k of the result is the E2M1 value in the low nibble of byte k of src times the E4M3
+// scale byte k, the exact product rounded once to E4M3 (nearest even, saturating to +-448, 0x7F for a NaN scale).
+// The portable chain below computes the same exact product in f16 and the same single rounding, so both give the
+// same bytes for every input.
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4)) && \
+    defined(__CUDA_ARCH_SPECIFIC__) && (__CUDA_ARCH_SPECIFIC__ == 1000 || __CUDA_ARCH_SPECIFIC__ == 1030)
+#define CAKE_FMHA_NATIVE_QMUL4 1
+#else
+#define CAKE_FMHA_NATIVE_QMUL4 0
+#endif
+
+#if CAKE_FMHA_NATIVE_QMUL4
+template <int kVariant>
+__device__ __forceinline__ uint32_t cake_fmha_qmul4(uint32_t src, uint32_t scale) {
+  static_assert(kVariant >= 0 && kVariant <= 4, "native Cake FMHA QMUL4 covers variants 0..4");
+  uint32_t scales = scale;
+  if constexpr (kVariant >= 1) {
+    // variants 1..4 multiply all four lanes by scale byte kVariant - 1
+    asm("prmt.b32 %0, %1, 0, %2;" : "=r"(scales) : "r"(scale), "n"((kVariant - 1) * 0x1111));
+  }
+  uint32_t output;
+  asm("mul.rn.satfinite.e4m3x4.e2m1p4x4.e4m3x4 %0, %1, %2;" : "=r"(output) : "r"(src), "r"(scales));
+  return output;
+}
+#else
+template <int kVariant>
+__device__ __forceinline__ uint32_t cake_fmha_qmul4(uint32_t src, uint32_t scale) {
+  return cake_fmha_qmul4_portable<kVariant>(src, scale);
+}
+#endif
+
 #define CAKE_FMHA_INF CUDART_INF_F
 #define TMEM_NCOLS 224
 #define TMEM_TMEM_S0_OFFSET 0
@@ -960,14 +993,28 @@ __device__ __forceinline__ void tma_3d_gmem2smem(
 }
 
 
+// The K/V block scales are read once too: evict-first like the data.
+__device__ __forceinline__ void tma_3d_gmem2smem_evict_first(
+    int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cta.global"
+        ".mbarrier::complete_tx::bytes.L2::cache_hint"
+        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
+           "r"(mbar_addr), "l"(0x12F0000000000000ull) : "memory");
+}
+
+
 __device__ __forceinline__ void tma_5d_gmem2smem(
     int dst, const void *tmap_ptr, int x, int y, int z, int w, int v, int mbar_addr) {
+    // The paged K/V data is read once: it enters L2 as evict-first (the .L2::cache_hint policy 0x12F0000000000000,
+    // the EVICT_FIRST cache-policy descriptor).
     asm volatile(
         "cp.async.bulk.tensor.5d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7];"
+        ".mbarrier::complete_tx::bytes.L2::cache_hint"
+        " [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
         :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w), "r"(v),
-           "r"(mbar_addr) : "memory");
+           "r"(mbar_addr), "l"(0x12F0000000000000ull) : "memory");
 }
 
 
@@ -995,7 +1042,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) void
-kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* Kp, CakeFmhaTensorMap const* Vp, CakeFmhaTensorMap const* Ksf, CakeFmhaTensorMap const* Vsf, uint8_t* __restrict__ O, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, float* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split)
+kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* Kp, CakeFmhaTensorMap const* Vp, CakeFmhaTensorMap const* Ksf, CakeFmhaTensorMap const* Vsf, uint8_t* __restrict__ O, int* __restrict__ page_table, int* __restrict__ seq_lens_kv, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, float* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split, float bmm1_scalar, float bmm2_scalar)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1178,7 +1225,7 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
         asm volatile("setmaxnreg.inc.sync.aligned.u32 184;");
         { // softmax_main
             float log2e_mult_s = ((bmm1_is_log2 != 0) ? 1.0f : 1.4426950408889634f);
-            float softmax_scale_log2 = bmm1_scale_ptr[0] * log2e_mult_s;
+            float softmax_scale_log2 = ((bmm1_scale_ptr != nullptr) ? bmm1_scale_ptr[0] : bmm1_scalar) * log2e_mult_s;
             const int tmem_row_base_v = warp % 4 * 32;
             const int warp_in_wg = warp % 4;
             const int wg_tid = (unsigned int)(warp_in_wg * 32) + lane;
@@ -1190,6 +1237,7 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
             unsigned int _phase_s_full_0_0 = 0;
             unsigned int _phase_corr_empty_1_0 = 1;
             unsigned int _phase_corr_empty_0_0 = 1;
+            unsigned int p_store_count_s[2] = {0u, 0u};
             #pragma unroll 1
             for (unsigned int tile_idx_s = blockIdx.x; tile_idx_s < total_tiles_s; tile_idx_s += gridDim.x) {
                 mbarrier_wait(stats_empty_addr, _phase_stats_empty_0);
@@ -1266,34 +1314,33 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                         }
                         int my_block_s = split_start_block_s + cta_n_blocks_s - 1 - 2 * pair_s - is_inst1;
                         int ldtm_row_base_s = (unsigned int)(warp_in_wg * 32) + lane / 4;
-                        int mask_x_odd_s = ((lane % 2 == 0) ? 112 : 48);
                         int block_base_s = my_block_s * BLOCK_N;
                         int kv_row0_s = ldtm_row_base_s;
                         int kv_row1_s = ldtm_row_base_s + 8;
                         int kv_row2_s = ldtm_row_base_s + 16;
                         int kv_row3_s = ldtm_row_base_s + 24;
-                        if (seqlen_kv_s <= block_base_s + (kv_row0_s ^ 80)) {
+                        if (seqlen_kv_s <= block_base_s + kv_row0_s) {
                             sv[0] = -3.4028235e+38f;
                         }
-                        if (seqlen_kv_s <= block_base_s + (kv_row0_s ^ mask_x_odd_s)) {
+                        if (seqlen_kv_s <= block_base_s + kv_row0_s) {
                             sv[1] = -3.4028235e+38f;
                         }
-                        if (seqlen_kv_s <= block_base_s + (kv_row1_s ^ 80)) {
+                        if (seqlen_kv_s <= block_base_s + kv_row1_s) {
                             sv[2] = -3.4028235e+38f;
                         }
-                        if (seqlen_kv_s <= block_base_s + (kv_row1_s ^ mask_x_odd_s)) {
+                        if (seqlen_kv_s <= block_base_s + kv_row1_s) {
                             sv[3] = -3.4028235e+38f;
                         }
-                        if (seqlen_kv_s <= block_base_s + (kv_row2_s ^ 80)) {
+                        if (seqlen_kv_s <= block_base_s + kv_row2_s) {
                             sv[4] = -3.4028235e+38f;
                         }
-                        if (seqlen_kv_s <= block_base_s + (kv_row2_s ^ mask_x_odd_s)) {
+                        if (seqlen_kv_s <= block_base_s + kv_row2_s) {
                             sv[5] = -3.4028235e+38f;
                         }
-                        if (seqlen_kv_s <= block_base_s + (kv_row3_s ^ 80)) {
+                        if (seqlen_kv_s <= block_base_s + kv_row3_s) {
                             sv[6] = -3.4028235e+38f;
                         }
-                        if (seqlen_kv_s <= block_base_s + (kv_row3_s ^ mask_x_odd_s)) {
+                        if (seqlen_kv_s <= block_base_s + kv_row3_s) {
                             sv[7] = -3.4028235e+38f;
                         }
                         float pair_max_s[2];
@@ -1377,11 +1424,6 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                         tmem_st_x4_f32(my_tmem_stats, stats_pair_s);
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        if (is_inst1 != 0) {
-                            mbarrier_arrive(corr_scale_1_addr);
-                        } else {
-                            mbarrier_arrive(corr_scale_0_addr);
-                        }
                         #pragma unroll
                         for (int c_3 = 0; c_3 < 2; c_3++) {
                             if (is_inst1 != 0) {
@@ -1449,9 +1491,19 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                                                    "f"(exp_vals_s[6]), "f"(exp_vals_s[7]));
                             regs_p_s[1] = _packed;
                         }
+                        // P is single-buffered per instance: the P.V MMA that read this buffer last must be complete
+                        // before it is overwritten (its commit arrives on o_done).
+                        if (p_store_count_s[is_inst1] != 0) {
+                            mbarrier_wait((is_inst1 != 0) ? o_done_1_addr : o_done_0_addr, (p_store_count_s[is_inst1] - 1) & 1);
+                        }
+                        p_store_count_s[is_inst1] += 1;
                         int mtx_idx_s = lane / 8;
                         int thr_row_idx_s = lane % 8;
-                        int seg_col_idx_s = warp_in_wg * 2 + mtx_idx_s ^ thr_row_idx_s;
+                        // The PV MMA reads P through a 128B-swizzle descriptor: the hardware XORs each 16-byte chunk with the
+                        // absolute shared-address row phase ((address >> 7) % 8). The P buffers start 640 bytes into a
+                        // 1024-byte swizzle atom, so the store applies that phase rather than the tile-relative row.
+                        int p_row_phase_s = ((((is_inst1 != 0) ? smem_p1_addr : smem_p0_addr) >> 7) + thr_row_idx_s) % 8;
+                        int seg_col_idx_s = warp_in_wg * 2 + mtx_idx_s ^ p_row_phase_s;
                         int stsm_offset_s = thr_row_idx_s * 128 + seg_col_idx_s * 16;
                         const void* _stmatrix_b8_ptr_5 = reinterpret_cast<const void*>(reinterpret_cast<uint8_t*>(my_p_base) + stsm_offset_s);
                         uint64_t _stmatrix_b8_addr64_5;
@@ -1462,6 +1514,13 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             :: "r"(_stmatrix_b8_addr_5), "r"(regs_p_s[0]), "r"(regs_p_s[1])
                             : "memory");
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                        // corr_scale releases this pair's statistics and P together: the correction warps answer it with
+                        // o_free, after which the MMA warp issues the P.V MMA that reads P.
+                        if (is_inst1 != 0) {
+                            mbarrier_arrive(corr_scale_1_addr);
+                        } else {
+                            mbarrier_arrive(corr_scale_0_addr);
+                        }
                         float prior_sum0_s = ((is_inst1 != 0) ? row_sum_pair1[0] : row_sum_pair0[0]);
                         float prior_sum1_s = ((is_inst1 != 0) ? row_sum_pair1[1] : row_sum_pair0[1]);
                         float2 _f2_11 = make_float2(exp_vals_s[0], exp_vals_s[1]);
@@ -1516,8 +1575,8 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // correction_main
             float log2e_mult_c = ((bmm1_is_log2 != 0) ? 1.0f : 1.4426950408889634f);
-            float softmax_scale_log2_1 = bmm1_scale_ptr[0] * log2e_mult_c;
-            float output_scale = bmm2_scale_ptr[0];
+            float softmax_scale_log2_1 = ((bmm1_scale_ptr != nullptr) ? bmm1_scale_ptr[0] : bmm1_scalar) * log2e_mult_c;
+            float output_scale = ((bmm2_scale_ptr != nullptr) ? bmm2_scale_ptr[0] : bmm2_scalar);
             const int tmem_row_base_v_1 = warp % 4 * 32;
             const int corr_row = tmem_row_base_v_1 << 16;
             const int corr_tid = warp % 4 * 32 + lane;
@@ -1857,7 +1916,16 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     part_vals[5] = o0_hi_epi[1] * pscale0_o + o1_hi_epi[1] * pscale1_o;
                     part_vals[6] = o0_hi_epi[2] * pscale0_e + o1_hi_epi[2] * pscale1_e;
                     part_vals[7] = o0_hi_epi[3] * pscale0_o + o1_hi_epi[3] * pscale1_o;
-                    int corr_x_odd = ((lane % 2 == 0) ? 112 : 48);
+                    // A tile with no KV token of its batch in this split's block range (seq_lens[b] == 0, or a
+                    // split past the end of a shorter sequence) is empty: partial O 0, max -inf, sum 0, so the
+                    // reduce skips it and a zero-length batch gets zero output.
+                    const bool tile_empty_c = seqlen_kv <= split_start_block * BLOCK_N;
+                    if (tile_empty_c) {
+                        #pragma unroll
+                        for (int e_c = 0; e_c < 8; e_c++) {
+                            part_vals[e_c] = 0.0f;
+                        }
+                    }
                     int corr_row_e = (unsigned int)tmem_row_base_v_1 + lane / 4;
                     int q_even = col_pair_base_c;
                     int q_odd = col_pair_base_c + 1;
@@ -1865,27 +1933,27 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     int po_even = ((head_base + q_even) * num_splits + split_c) * HEAD_DIM;
                     int po_odd = ((head_base + q_odd) * num_splits + split_c) * HEAD_DIM;
                     if (q_even < group_ratio_rt) {
-                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e ^ 80))) + (0)) = part_vals[0];
-                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 8 ^ 80))) + (0)) = part_vals[2];
-                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 16 ^ 80))) + (0)) = part_vals[4];
-                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 24 ^ 80))) + (0)) = part_vals[6];
+                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e))) + (0)) = part_vals[0];
+                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 8))) + (0)) = part_vals[2];
+                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 16))) + (0)) = part_vals[4];
+                        *(reinterpret_cast<float*>(partial_O + (po_even + (corr_row_e + 24))) + (0)) = part_vals[6];
                     }
                     if (q_odd < group_ratio_rt) {
-                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e ^ corr_x_odd))) + (0)) = part_vals[1];
-                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 8 ^ corr_x_odd))) + (0)) = part_vals[3];
-                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 16 ^ corr_x_odd))) + (0)) = part_vals[5];
-                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 24 ^ corr_x_odd))) + (0)) = part_vals[7];
+                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e))) + (0)) = part_vals[1];
+                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 8))) + (0)) = part_vals[3];
+                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 16))) + (0)) = part_vals[5];
+                        *(reinterpret_cast<float*>(partial_O + (po_odd + (corr_row_e + 24))) + (0)) = part_vals[7];
                     }
                     if (corr_tid < 4) {
                         int st_even = (head_base + q_even) * num_splits + split_c;
                         int st_odd = (head_base + q_odd) * num_splits + split_c;
                         if (q_even < group_ratio_rt) {
-                            *(reinterpret_cast<float*>(partial_max + st_even) + (0)) = fm0 * softmax_scale_log2_1;
-                            *(reinterpret_cast<float*>(partial_sum + st_even) + (0)) = local_sum_pair[0];
+                            *(reinterpret_cast<float*>(partial_max + st_even) + (0)) = tile_empty_c ? -CAKE_FMHA_INF : fm0 * softmax_scale_log2_1;
+                            *(reinterpret_cast<float*>(partial_sum + st_even) + (0)) = tile_empty_c ? 0.0f : local_sum_pair[0];
                         }
                         if (q_odd < group_ratio_rt) {
-                            *(reinterpret_cast<float*>(partial_max + st_odd) + (0)) = fm1 * softmax_scale_log2_1;
-                            *(reinterpret_cast<float*>(partial_sum + st_odd) + (0)) = local_sum_pair[1];
+                            *(reinterpret_cast<float*>(partial_max + st_odd) + (0)) = tile_empty_c ? -CAKE_FMHA_INF : fm1 * softmax_scale_log2_1;
+                            *(reinterpret_cast<float*>(partial_sum + st_odd) + (0)) = tile_empty_c ? 0.0f : local_sum_pair[1];
                         }
                     }
                     asm volatile("barrier.sync 10, 128;" ::: "memory");
@@ -1937,6 +2005,13 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     float2 out_hi23_f2 = fma_f32x2_rn_ftz(_f2_56, final_scale0_pair_f2, o1_hi23_scaled_f2_1);
                     out_vals[6] = out_hi23_f2.x;
                     out_vals[7] = out_hi23_f2.y;
+                    // seq_lens[b] == 0: the tile holds no KV token, so the output is zero.
+                    if (seqlen_kv <= split_start_block * BLOCK_N) {
+                        #pragma unroll
+                        for (int e_c = 0; e_c < 8; e_c++) {
+                            out_vals[e_c] = 0.0f;
+                        }
+                    }
                     unsigned int regs_o[2];
                     {
                         uint32_t _packed;
@@ -2354,7 +2429,7 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                                     int vpg_l = pg_l[pg_i_l / (PAGE_SIZE / 16)];
                                     int vsub_l = pg_i_l % (PAGE_SIZE / 16) * 16;
                                     tma_5d_gmem2smem(task_dst_l + pg_i_l * 2048, Vp, 0, vsub_l, 0, kv_head_idx_l, vpg_l, pk_full_addr + (pk_slot_l) * 8);
-                                    tma_3d_gmem2smem(task_dst_l + 16384 + pg_i_l * 128, Vsf, vsub_l * 8, kv_head_idx_l, vpg_l, pk_full_addr + (pk_slot_l) * 8);
+                                    tma_3d_gmem2smem_evict_first(task_dst_l + 16384 + pg_i_l * 128, Vsf, vsub_l * 8, kv_head_idx_l, vpg_l, pk_full_addr + (pk_slot_l) * 8);
                                 }
                             } else {
                                 #pragma unroll
@@ -2362,7 +2437,7 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                                     int kpg_l = pg_l[pg_i_l_1 / (PAGE_SIZE / 16)];
                                     int ksub_l = pg_i_l_1 % (PAGE_SIZE / 16) * 16;
                                     tma_5d_gmem2smem(task_dst_l + pg_i_l_1 * 2048, Kp, 0, ksub_l, 0, kv_head_idx_l, kpg_l, pk_full_addr + (pk_slot_l) * 8);
-                                    tma_3d_gmem2smem(task_dst_l + 16384 + pg_i_l_1 * 128, Ksf, ksub_l * 8, kv_head_idx_l, kpg_l, pk_full_addr + (pk_slot_l) * 8);
+                                    tma_3d_gmem2smem_evict_first(task_dst_l + 16384 + pg_i_l_1 * 128, Ksf, ksub_l * 8, kv_head_idx_l, kpg_l, pk_full_addr + (pk_slot_l) * 8);
                                 }
                             }
                         }
@@ -2468,32 +2543,32 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                                     unsigned int dst_word1 = 0;
                                     if (ldsm_stage_1 % 4 == 0) {
                                         {
-                                            dst_word0 = cake_fmha_qmul4_portable<1>(k_src_word0[slot_1], ksf_words0[scale_slot]);
+                                            dst_word0 = cake_fmha_qmul4<1>(k_src_word0[slot_1], ksf_words0[scale_slot]);
                                         }
                                         {
-                                            dst_word1 = cake_fmha_qmul4_portable<1>(k_src_word1[slot_1], ksf_words1[scale_slot]);
+                                            dst_word1 = cake_fmha_qmul4<1>(k_src_word1[slot_1], ksf_words1[scale_slot]);
                                         }
                                     } else if (ldsm_stage_1 % 4 == 1) {
                                         {
-                                            dst_word0 = cake_fmha_qmul4_portable<2>(k_src_word0[slot_1], ksf_words0[scale_slot]);
+                                            dst_word0 = cake_fmha_qmul4<2>(k_src_word0[slot_1], ksf_words0[scale_slot]);
                                         }
                                         {
-                                            dst_word1 = cake_fmha_qmul4_portable<2>(k_src_word1[slot_1], ksf_words1[scale_slot]);
+                                            dst_word1 = cake_fmha_qmul4<2>(k_src_word1[slot_1], ksf_words1[scale_slot]);
                                         }
                                     } else {
                                         if (ldsm_stage_1 % 4 == 2) {
                                             {
-                                                dst_word0 = cake_fmha_qmul4_portable<3>(k_src_word0[slot_1], ksf_words0[scale_slot]);
+                                                dst_word0 = cake_fmha_qmul4<3>(k_src_word0[slot_1], ksf_words0[scale_slot]);
                                             }
                                             {
-                                                dst_word1 = cake_fmha_qmul4_portable<3>(k_src_word1[slot_1], ksf_words1[scale_slot]);
+                                                dst_word1 = cake_fmha_qmul4<3>(k_src_word1[slot_1], ksf_words1[scale_slot]);
                                             }
                                         } else {
                                             {
-                                                dst_word0 = cake_fmha_qmul4_portable<4>(k_src_word0[slot_1], ksf_words0[scale_slot]);
+                                                dst_word0 = cake_fmha_qmul4<4>(k_src_word0[slot_1], ksf_words0[scale_slot]);
                                             }
                                             {
-                                                dst_word1 = cake_fmha_qmul4_portable<4>(k_src_word1[slot_1], ksf_words1[scale_slot]);
+                                                dst_word1 = cake_fmha_qmul4<4>(k_src_word1[slot_1], ksf_words1[scale_slot]);
                                             }
                                         }
                                     }
@@ -2540,10 +2615,10 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                                     unsigned int dst_word0_1 = 0;
                                     unsigned int dst_word1_1 = 0;
                                     {
-                                        dst_word0_1 = cake_fmha_qmul4_portable<0>(v_src_word0[slot_3], vsf_words[scale_slot_1]);
+                                        dst_word0_1 = cake_fmha_qmul4<0>(v_src_word0[slot_3], vsf_words[scale_slot_1]);
                                     }
                                     {
-                                        dst_word1_1 = cake_fmha_qmul4_portable<0>(v_src_word1[slot_3], vsf_words[scale_slot_1]);
+                                        dst_word1_1 = cake_fmha_qmul4<0>(v_src_word1[slot_3], vsf_words[scale_slot_1]);
                                     }
                                     unsigned int store_words_1[2];
                                     store_words_1[0] = dst_word0_1;

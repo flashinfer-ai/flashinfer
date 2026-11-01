@@ -4,15 +4,20 @@
 
 Imports torch, FlashInfer's own probes and the Qwen 3.5 package's light gates only -- never the kernels, the CuTe DSL or the
 vendored cuDNN Frontend tree -- so a serving stack's init-time dispatch question (:func:`qwen_3_8_block_support`) costs nothing
-when the answer is no.  The decode form's decline table and the indexer facts are READ off the vendored serving envelope once
-every lighter gate has passed, and the indexer rules this module mirrors from that tree are re-read against it then
-(:func:`check_vendored_rules`).
+when the answer is no.  The three forms -- ``decode`` (the in-block indexer's DECODE step), ``extend`` and ``prefill`` (its EXTEND
+step: a uniform chunk behind a cached prefix; ``prefill`` = the same step at an empty prefix) -- are ONE vendored declaration form
+(``QsaSpec(index_source="indexer")`` over the pools) and are served together: the decode envelope's decline table and the indexer
+facts are READ off the vendored serving envelope once every lighter gate has passed, and the indexer rules this module mirrors from
+that tree are re-read against it then (:func:`check_vendored_rules`).
 
 ONE geometry gate, :meth:`Qwen38BlockGeometry.unsupported_reason`, serves both callers -- the probe and ``api.prepare`` (through
-:func:`require_served`) -- so a geometry the probe advertises is one the decode form's declaration admits, and a geometry it
-declines is a typed ``NotImplementedError`` at plan time before any vendored declaration is built (the geometry gate itself runs
-before any vendored import; the projection-route gate after it, :func:`proj_route_reason`, asks the vendored tile rule's host
-arithmetic and declines the TP 2 / TP 4 shards).
+:func:`require_served`) -- so a geometry the probe advertises is one the forms' declaration admits, and a geometry it declines is
+a typed ``NotImplementedError`` at plan time before any vendored declaration is built (the geometry gate itself runs before any
+vendored import; the projection-route gate after it, :func:`proj_route_reason`, asks the vendored tile rule's host arithmetic and
+declines the TP 2 / TP 4 shards).  One FlashInfer-side rows bound remains, on EVERY form, at this pin -- the launch-grid bound of ONE
+run, :data:`EXTEND_ROWS_GRID_MAX` rows (:func:`extend_rows_grid_reason`): the vendored indexer's query compress -- the DECODE step's and
+the EXTEND step's share the launch -- runs with the run's row count as a CUDA grid dimension, so a longer run is declined typed before any
+vendored code.
 """
 
 from __future__ import annotations
@@ -30,9 +35,14 @@ FEATURE = "Qwen 3.8 Flash-Next gated attention block (bf16)"
 SUPPORTED_CC: Tuple[int, int] = _s35.SUPPORTED_CC
 HEAD_DIM = _s35.HEAD_DIM
 CUTEDSL_REQUIRED = _s35.CUTEDSL_REQUIRED
-#: the forms this package serves: DECODE only (prefill / extend of the indexer are a later cuDNN Frontend PR's)
-FORMS: Tuple[str, ...] = ("decode",)
+#: the forms this package serves (``ALL_FORMS``' order): ``prefill`` / ``extend`` = the in-block indexer's EXTEND step over the pools (a
+#: uniform ``[batch, T]`` chunk behind a cached prefix; ``prefill`` is the same vendored form at an empty prefix, ``seq_lens[b] == T``),
+#: ``decode`` = its DECODE step -- ONE vendored declaration form (``QsaSpec(index_source="indexer")`` with ``kv_source="paged"``), so the
+#: three are served together by the one geometry gate (the 4c8e24355 pin; before it the two prefill forms declined by name)
+FORMS: Tuple[str, ...] = ("prefill", "extend", "decode")
 ALL_FORMS: Tuple[str, ...] = ("prefill", "extend", "decode")
+#: the forms that run the EXTEND step (``index_select_form="extend"`` pinned on the vendored declaration)
+EXTEND_FORMS: Tuple[str, ...] = ("prefill", "extend")
 PAGE_SIZES: Tuple[int, ...] = _s35.PAGE_SIZES
 PAGE_SIZE_ALIGN = _s35.PAGE_SIZE_ALIGN
 #: the cache spellings: FlashInfer's NHD / HND (5-D or a (k, v) pair) and the serving stacks' UNIFIED row ``[num_pages, page_size, H_kv, 2 * D]``
@@ -62,21 +72,56 @@ INDEX_STATE_ROWS_EXTRA = 3  # the raw-key ring needs cap >= S_q + 3 rows per blo
 INDEX_PAGE_SIZES: Tuple[int, ...] = (
     PAGE_SIZES  # the pages the paged scorer addresses (a power-of-two count of compressed rows)
 )
-#: the capture-safe projection route: the band slab GEMM runs the 128-row swap-AB tile at ``batch x q_len <= 128`` rows (past it the
-#: graph route, which creates its handle eagerly and cannot live in a CUDA graph) -- the vendored ``kernels/proj_gemm.SMALL_M_MAX``
+# The in-block indexer's STEP FORMS over the pools and the EXTEND step's rows, mirrored from the vendored tree's DSL-free modules
+# (``gated_attention_block.api`` constants, ``gated_attention_block.cache_write_contract``) and the envelope's ``index_select_forms`` /
+# ``index_extend_ring_rows_min`` / ``index_extend_select_budget_bytes`` / ``index_compress_roundings`` rows (the 4c8e24355 pin): the
+# vocabulary of the vendored ``index_select_form`` declaration knob (``"auto"`` = the DECODE step inside the decode scorer's query-row
+# envelope ``q_len x next_pow2(index_heads) <= INDEX_QUERY_ROWS_MAX`` and the EXTEND step past it; the two pins) -- this package pins
+# ``"extend"`` on the ``extend`` / ``prefill`` forms and leaves the decode form at ``"auto"`` (the light gate confines it to the decode step);
+# the EXTEND step's ring floor (``cap >= block_size - 1 = 3`` rows per ring block: the straddling block reads at most three positions below
+# the chunk; the DECODE step's ``cap >= q_len + 3`` does not apply) -- ONE spelling with ``INDEX_STATE_ROWS_EXTRA`` (asserted by the tripwire);
+# the select-window budget (the fp32 compact-logits scratch ONE scorer launch may write: ``ceil(batch x T / R)`` windows of ``R = min(batch x T,
+# max(16, budget // (n_blocks_max x 4)))`` rows -- a module constant published in the envelope, never a knob); and the rounding conventions of
+# ``Qwen38BlockGeometry.index_compress_rounding`` (``"single"`` the reference chain, ``"hf"`` the HF / vLLM-prepare rounding points).
+INDEX_SELECT_FORM_AUTO = "auto"
+INDEX_SELECT_FORM_DECODE = "decode"
+INDEX_SELECT_FORM_EXTEND = "extend"
+INDEX_SELECT_FORMS: Tuple[str, ...] = ("auto", "decode", "extend")
+INDEX_EXTEND_RING_ROWS_MIN = 3  # the EXTEND step's ring floor: cap >= block_size - 1 rows per ring block (vLLM's cap 4 satisfies it)
+INDEX_EXTEND_SELECT_BUDGET_BYTES = (
+    512 << 20
+)  # the select-window budget (bytes of fp32 logits scratch per scorer launch)
+INDEX_COMPRESS_ROUNDINGS: Tuple[str, ...] = ("single", "hf")
+INDEX_COMPRESS_ROUNDING_DEFAULT = "single"
+#: the validated decode capture envelope: the band slab GEMM runs the small-M route's 128-row swap-AB tile at ``batch x q_len <= 128``
+#: rows -- the vendored ``kernels/proj_gemm.SMALL_M_MAX`` (re-read by the tripwire).  Past 128 rows the slab takes the GEMM engine's own
+#: baseline tile for its shape on the SAME JIT-only route since the 6b21be0e0 pin (the projection driver's large-M rule, re-read by the
+#: tripwire too: ``band_slab_jit_tile_past_small_m``), so no FlashInfer-side PROJECTION rows bound exists on any form -- the ``extend`` /
+#: ``prefill`` forms take any ``batch x T`` the vendored block serves up to the launch-grid bound below (the previous pin's
+#: ``EXTEND_ROWS_MAX`` / ``extend_proj_slab_rows`` row is retired).
 DECODE_CAPTURE_ROWS_MAX = 128
+#: the FlashInfer-side bound of ONE run's rows (``batch_size x q_len_per_req``) on EVERY form at this pin: the vendored indexer's query
+#: compress (the DECODE step's and the EXTEND step's execute in ``gated_attention_block/api.py`` -> ``kernels/qsa_compress.run_qsa_compress`` over the
+#: ``[rows, index_heads, index_head_dim]`` view of the band) launches with the run's ROW COUNT as the grid's y dimension (one grid row per
+#: query token, the heads along x), and CUDA caps a grid's y at 65,535 -- a run of more rows would pass every other gate and fail at launch.
+#: Not a projection fact (the band slab names a tile at every row count) and not an envelope row (never among :data:`DECLINE_KEYS`, which
+#: the tripwire reads off the envelope): the compressor's grid is flattened in cuDNN Frontend first, then a re-vendor lifts this bound.
+#: The remedy: several uniform chunks of at most this many rows per run (extend / prefill), several decode steps, or a smaller batch.
+EXTEND_ROWS_GRID_MAX = 65535
+#: the FlashInfer-side decline row of that bound (the key keeps its first name; the row is EVERY form's): published under each form
+#: record's ``declines`` beside the vendored rows (:func:`extend_rows_grid_text`); ``api.prepare`` raises it typed, with the run's numbers,
+#: before any vendored code
+EXTEND_GRID_ROWS_KEY = "indexer_extend_grid_rows"
 #: the FlashInfer-side decline (not an envelope row): a tensor-parallel shard whose dense projection is off the capture-safe
 #: small-M route of the vendored projection GEMM on the device (the probe lists it under this key; ``prepare`` raises it typed)
 PROJ_SLAB_ROUTE_KEY = "proj_slab_route"
-#: the second FlashInfer-side decline row: the e4m3 compressed-key cache.  The vendored tree SERVES it at decode (the paged scorer's e4m3
-#: read arm; ``decode.index_cache_dtypes`` reads ``(bf16, e4m3)`` and the tree's own ``indexer_e4m3_cache`` decline row is retired), but
-#: this entry's e4m3 cache surface (the cache dtype on the probe, the plan key, the stack's cast at prefill) is a follow-up, so the entry
-#: declines it by name and ``index_cache_dtypes`` lists what THIS entry serves.
-INDEX_CACHE_E4M3_KEY = "indexer_e4m3_cache"
-INDEX_CACHE_DTYPES_SERVED: Tuple[torch.dtype, ...] = (torch.bfloat16,)
-INDEX_CACHE_E4M3_REASON = (
-    "index_cache_dtype=torch.float8_e4m3fn: this entry serves the paged compressed-key cache in bf16; the vendored tree serves the e4m3 cache at "
-    "decode (the paged scorer's e4m3 read arm), and this entry's e4m3 cache surface is a follow-up -- declare index_cache_dtype=None"
+#: the compressed-key cache dtypes this entry serves on EVERY form (``Qwen38BlockGeometry.index_cache_dtype``; ``None`` = bf16): the
+#: vendored tree's e4m3 arms -- the compress kernels' e4m3 store (the prefill / extend writers and the decode step), the paged scorer's
+#: e4m3 read arm (decode), the extend step's gather + MXFP8 scorer arm -- are served since the 4c8e24355 pin (one cache, one chain: a
+#: decode step reads what a chunk wrote).  The FlashInfer-side ``indexer_e4m3_cache`` decline row of the previous pins is retired.
+INDEX_CACHE_DTYPES_SERVED: Tuple[torch.dtype, ...] = (
+    torch.bfloat16,
+    torch.float8_e4m3fn,
 )
 #: the decline keys of the README's Errors table every re-vendor must keep publishing under ``decode.declines``
 DECLINE_KEYS: Tuple[str, ...] = (
@@ -89,11 +134,44 @@ DECLINE_KEYS: Tuple[str, ...] = (
     "indexer_shared_list",
     "shared_list_rows",
     "fuse_prepare_rope_tables_unfused",
+    # the EXTEND step's rows (the 4c8e24355 pin): the texts the vendored declaration raises on the extend / prefill forms
+    "indexer_extend_fuse_prepare",
+    "indexer_extend_ring_slots",
+    "indexer_extend_rope_tables_only",
+    "indexer_extend_ring_rows",
+    "indexer_extend_chunk_rows",
 )
 INDEX_LIST_FORMS: Tuple[Optional[str], ...] = (None, "per_row", "shared")
-_FOLLOW_UP = (
-    "the Qwen 3.8 block serves the DECODE form only: the prefill / extend forms of the in-block indexer (the prompt's compressed keys "
-    "written into the paged cache, the ring primed from the prompt) are a later cuDNN Frontend PR's and will be vendored then"
+# The sparse core's BODY knob, mirrored from the vendored tree (``sdpa.fwd.sparse_tile_rules``, the DSL-free home of the ``tile_form``
+# vocabulary, the two bodies' ``kernel_template`` names and the placement rule since the 977757763 pin -- ``sdpa.fwd.heuristics``
+# re-exports them) and re-read against it by :func:`check_vendored_rules`.  The block-sparse decode step on cc 10.7 has two bodies: the
+# tcgen05 core (``sparse_d256_f16``) and, since the 7301fad21 pin, the LEAN decode tile (``sparse_lean_d256_f16``: ``mma.sync`` +
+# ``cp.async``, one CTA of ``128 x N_MT`` threads per (sequence, KV head, chunk) -- 128 threads per m16 tile, the step's rows riding
+# inside the CTA --, no TMEM / TMA / cluster).  ``"auto"`` (this entry's default) takes the lean tile on cc 10.7 when ``batch x H_kv <=
+# SPARSE_TILE_LEAN_MAX_UNITS`` CTAs per chunk (the bound's unit since the 977757763 pin: the lean grid's own, so the step width is NOT in
+# the bound) at every served ``q_len`` 1..4 where the body admits the step -- under the in-block indexer the list is per row, which the
+# lean body serves at ``q_len_per_req == 1`` only, so for this entry that is ``batch <= 2`` at ``q_len_per_req 1`` on two KV heads -- and
+# the tcgen05 core everywhere else; a performance-only knob: the same function under either body within the tree's fixed-order-sum
+# budget, never bitwise across the bodies.
+SPARSE_TILE_FORM_AUTO = "auto"
+SPARSE_TILE_FORMS: Tuple[str, ...] = ("auto", "lean", "tcgen05")
+SPARSE_TILE_TCGEN05 = "sparse_d256_f16"  # the tcgen05 core's kernel_template (the readback of ``plan.sparse_tile`` on that body)
+SPARSE_TILE_LEAN = "sparse_lean_d256_f16"  # the lean decode tile's kernel_template
+SPARSE_TILE_LEAN_MAX_UNITS = 4  # the AUTO placement bound on cc 10.7, in CTAs per chunk (``batch x H_kv``: B <= 2 on two KV heads, at every served q_len)
+# The bound's UNIT as behaviour, mirrored from the vendored placement rule and re-read by :func:`check_vendored_rules`: what
+# ``sparse_decode_lean_tile_selected`` answers on cc 10.7 at ``top_k`` 512 over two KV heads per ``(batch, q_len)`` cell -- True iff
+# ``batch x 2 <= 4``, whatever the step width.  A tree that counted ``batch x H_kv x q_len`` (the 7301fad21 pin) reads the (1, 3), (1, 4)
+# and (2, 4) cells False, so the tripwire fires on the previous unit.  The rule's reading, not this entry's route: under the in-block
+# indexer's per-row list the lean body admits ``q_len_per_req == 1`` only (:func:`sparse_tile` reads the route cell by cell).
+SPARSE_TILE_LEAN_RULE_CELLS: Tuple[Tuple[int, int, bool], ...] = (
+    (1, 1, True),
+    (1, 3, True),
+    (1, 4, True),
+    (2, 1, True),
+    (2, 4, True),
+    (3, 1, False),
+    (4, 1, False),
+    (4, 4, False),
 )
 
 
@@ -186,16 +264,62 @@ def proj_route_reason(
     return None
 
 
+def extend_rows_grid_text() -> str:
+    """The probe's text of the :data:`EXTEND_GRID_ROWS_KEY` row (no batch, no chunk): the bound and the remedy."""
+    return (
+        f"one run of any form holds at most {EXTEND_ROWS_GRID_MAX} rows (batch_size x q_len_per_req) at this pin: the vendored "
+        "indexer's query compress (the decode step's and the extend step's) launches with the run's row count as a CUDA grid "
+        f"dimension, which CUDA caps at {EXTEND_ROWS_GRID_MAX} -- run a longer chunk as several uniform chunks of at most that many "
+        "rows per run (runs grouped by their length), a wider decode step as several decode steps, or a smaller batch"
+    )
+
+
+def extend_rows_grid_reason(
+    geometry, form: str, batch_size: int, q_len_per_req: int
+) -> Optional[str]:
+    """Why one ``form`` run of ``batch_size x q_len_per_req`` rows is past the compressor's launch-grid bound at this pin, or None.
+
+    The vendored indexer's query compress -- the decode step's and the extend step's share the launch -- runs with the run's row count as
+    the grid's y dimension (one grid row per query token, the geometry's ``index_heads`` along x), which CUDA caps at
+    :data:`EXTEND_ROWS_GRID_MAX` = 65,535 -- so a run of more rows would pass every other gate and fail at launch.  The text names the
+    bound, the rows and the remedy (several uniform chunks -- several decode steps on the decode form -- of at most that many rows per run
+    at this batch, or a smaller batch).  Device-free and free of vendored imports: a light gate (``api.prepare`` raises it typed before
+    any vendored code on every form; the probe publishes the row's generic text, :func:`extend_rows_grid_text`)."""
+    rows = int(batch_size) * int(q_len_per_req)
+    if rows <= EXTEND_ROWS_GRID_MAX:
+        return None
+    per_seq = EXTEND_ROWS_GRID_MAX // int(batch_size)
+    return (
+        f"batch_size={batch_size} x q_len_per_req={q_len_per_req} = {rows} rows in one {form} run exceed {EXTEND_ROWS_GRID_MAX} (the "
+        f"{EXTEND_GRID_ROWS_KEY} row: at this pin the vendored indexer's query compress launches with the run's row count as a CUDA grid "
+        f"dimension -- one grid row per query token, the {int(geometry.index_heads)} indexer heads along the other --, which CUDA caps at "
+        f"{EXTEND_ROWS_GRID_MAX}) -- run it as several "
+        + ("decode steps" if form == "decode" else "uniform chunks")
+        + f" of at most {EXTEND_ROWS_GRID_MAX} rows per run "
+        + (
+            f"(q_len_per_req <= {per_seq} at this batch)"
+            if per_seq >= 1
+            else "(this batch alone exceeds the bound)"
+        )
+        + ", or a smaller batch"
+    )
+
+
 @dataclass(frozen=True)
 class Qwen38BlockGeometry:
     """The QSA sub-layer's shape at THIS tensor-parallel rank: the Qwen 3.5 fields first (Qwen3.8-Flash-Next at TP 1: ``d_model=2560,
     num_qo_heads=24, num_kv_heads=2``; ``12 / 1`` at TP 2, ``6 / 1`` at TP 4 -- the indexer is replicated on every rank), then the indexer
     appended: ``index_heads x index_head_dim`` query heads over ``index_kv_heads`` raw key head, ``block_size``-token blocks, ``top_k``
     blocks per row (the 2048-token budget = 512 blocks of 4), the indexer norms' epsilon, the list form (``None`` -> ``"per_row"``,
-    the decode indexer's function; ``"shared"`` is declined by name) and the indexer cache's dtype (``None`` = the activation dtype;
-    ``torch.float8_e4m3fn`` declined until the paged scorer's e4m3 read arm lands).  The constructor checks the FORM of the fields;
-    :meth:`unsupported_reason` is the kernels' envelope (``head_dim`` 256, ``d_model`` a multiple of the projection tile, ``rope_dim`` in
-    :data:`ROPE_DIMS`, the indexer rows mirrored from the vendored tree)."""
+    the decode indexer's function; ``"shared"`` is declined by name), the indexer cache's dtype (``None`` = the activation dtype, bf16;
+    ``torch.float8_e4m3fn`` = the e4m3 compressed-key cache, served on every form since the 4c8e24355 pin) and, appended last, the
+    indexer writers' rounding convention ``index_compress_rounding`` (:data:`INDEX_COMPRESS_ROUNDINGS`: ``"single"``, the reference --
+    fp32 through the pooled mean, the RMSNorm and the RoPE, one rounding at the store --, or ``"hf"``, the HF / vLLM-prepare ROUNDING POINTS
+    -- the pooled key rounded before its norm, the normed row before its rotation, the rotation's three operations each rounded -- for a
+    stack whose cache mixes rows another writer rounded that way; NOT bitwise that writer: the fp32 reduction orders differ); a frozen
+    field, so it is part of every plan's key and a compile key of every indexer writer of the plan (the chunk / prefill compress, the decode
+    step's recipes).  The constructor checks the FORM of the fields; :meth:`unsupported_reason` is the kernels' envelope (``head_dim`` 256,
+    ``d_model`` a multiple of the projection tile, ``rope_dim`` in :data:`ROPE_DIMS`, the indexer rows mirrored from the vendored tree)."""
 
     d_model: int
     num_qo_heads: int
@@ -216,8 +340,10 @@ class Qwen38BlockGeometry:
         None  # None -> "per_row" (the served form at decode); "per_row" explicit; "shared" declined by name
     )
     index_cache_dtype: Optional[torch.dtype] = (
-        None  # None = the activation dtype; torch.float8_e4m3fn declined until the e4m3 cache arm lands
+        None  # None = the activation dtype (bf16); torch.float8_e4m3fn = the e4m3 compressed-key cache (served on every form)
     )
+    # appended (the 4c8e24355 pin): the indexer writers' rounding convention -- "single" (the reference) or "hf" (the HF / vLLM rounding points)
+    index_compress_rounding: str = INDEX_COMPRESS_ROUNDING_DEFAULT
 
     def __post_init__(self):
         for name in (
@@ -267,6 +393,11 @@ class Qwen38BlockGeometry:
             raise ValueError(
                 f"Qwen38BlockGeometry: index_cache_dtype must be None or a torch.dtype, got {self.index_cache_dtype!r}"
             )
+        if self.index_compress_rounding not in INDEX_COMPRESS_ROUNDINGS:
+            raise ValueError(
+                f"Qwen38BlockGeometry: index_compress_rounding must be one of {INDEX_COMPRESS_ROUNDINGS} ('single' = the reference chain, "
+                f"one rounding at the store; 'hf' = the HF / vLLM-prepare rounding points), got {self.index_compress_rounding!r}"
+            )
 
     @property
     def group(self) -> int:
@@ -302,6 +433,13 @@ class Qwen38BlockGeometry:
         return "per_row" if self.index_list_form is None else self.index_list_form
 
     @property
+    def resolved_index_cache_dtype(self) -> torch.dtype:
+        """The paged compressed-key cache's dtype: ``index_cache_dtype``, or bf16 (the activation dtype) for ``None``."""
+        return (
+            torch.bfloat16 if self.index_cache_dtype is None else self.index_cache_dtype
+        )
+
+    @property
     def decode_max_q_len(self) -> int:
         """Query rows per sequence the decode indexer's scorer serves at this head count: ``INDEX_QUERY_ROWS_MAX // next_pow2(index_heads)``
         (16 at 4 heads); a longer step is a typed decline."""
@@ -334,13 +472,12 @@ class Qwen38BlockGeometry:
             return tk
         if (
             self.index_cache_dtype is not None
-            and self.index_cache_dtype != torch.bfloat16
+            and self.index_cache_dtype not in INDEX_CACHE_DTYPES_SERVED
         ):
-            if self.index_cache_dtype == torch.float8_e4m3fn:
-                return INDEX_CACHE_E4M3_REASON
             return (
-                f"index_cache_dtype={self.index_cache_dtype}: the paged compressed-key cache is served in bf16 by this entry (the vendored tree "
-                "serves bf16 and e4m3) -- declare index_cache_dtype=None"
+                f"index_cache_dtype={self.index_cache_dtype}: the paged compressed-key cache is served in bf16 (index_cache_dtype=None) or "
+                "torch.float8_e4m3fn (the vendored compress kernels' e4m3 store arm, the paged scorer's and the extend gather's e4m3 read arms) "
+                "-- declare one of those"
             )
         if self.index_list_form == "shared":
             return (
@@ -378,6 +515,7 @@ class Qwen38BlockGeometry:
                 index_norm_eps=self.index_norm_eps,
                 index_cache_dtype=self.index_cache_dtype,
                 index_list_form=self.index_list_form,
+                index_compress_rounding=self.index_compress_rounding,
             ),
         )
 
@@ -442,6 +580,23 @@ class Qwen38BlockSupport:
     index_page_sizes: Tuple[int, ...] = ()
     fuse_prepare_default: bool = False
     pdl_default: bool = False
+    # appended (the lean decode tile): the sparse core's bodies this part serves by ``kernel_template`` (the tcgen05 core everywhere the form
+    # is served; the lean tile too on cc 10.7) and whether ``sparse_tile_form="auto"`` consults the lean placement rule on this part
+    # (``True`` on cc 10.7: the measured part); the per-cell reading (which body a ``[batch, q_len]`` step takes) is :func:`sparse_tile`
+    sparse_tiles: Tuple[str, ...] = ()
+    sparse_tile_lean_default: bool = False
+    # appended (the 4c8e24355 pin; the in-block indexer's EXTEND step): the step forms the vendored declaration knob takes, the EXTEND
+    # step's ring floor (``cap >= 3``), its select-window budget (bytes) and the indexer writers' rounding conventions -- READ off the
+    # envelope (``()`` / ``0`` where the tree was not read)
+    index_select_forms: Tuple[str, ...] = ()
+    index_extend_ring_rows_min: int = 0
+    index_extend_select_budget_bytes: int = 0
+    index_compress_roundings: Tuple[str, ...] = ()
+    # appended (this pin's one FlashInfer-side rows bound): the rows ONE run of ANY form may hold (``batch_size x q_len_per_req``) -- the
+    # vendored indexer's query compress (the decode step's and the extend step's) launches with the run's row count as a CUDA grid
+    # dimension (``EXTEND_ROWS_GRID_MAX``; the ``indexer_extend_grid_rows`` row of every form record); lifted by a re-vendor once the
+    # compressor's grid is flattened
+    extend_rows_grid_max: int = EXTEND_ROWS_GRID_MAX
 
     def form(self, name: str) -> Qwen38BlockFormSupport:
         if name not in ALL_FORMS:
@@ -474,8 +629,6 @@ def _frost_decode_table(
             f"kv_cache_dtype={kv_cache_dtype} is not served under the in-block indexer (served: {d.kv_cache_dtypes})",
         )
     declines = dict(d.declines)
-    # the FlashInfer-side e4m3 cache row (the tree serves that dtype; this entry does not yet): present on every device
-    declines[INDEX_CACHE_E4M3_KEY] = INDEX_CACHE_E4M3_REASON
     route = proj_route_reason(geometry, device, dtype)
     if (
         route is not None
@@ -492,8 +645,8 @@ def _frost_decode_table(
         index_list_forms=tuple(d.index_list_forms),
         index_list_form_default=str(d.index_list_form_default),
         index_cache_dtypes=tuple(
-            t for t in d.index_cache_dtypes if t in INDEX_CACHE_DTYPES_SERVED
-        ),  # what THIS entry serves (the tree also serves e4m3: INDEX_CACHE_E4M3_KEY)
+            d.index_cache_dtypes
+        ),  # bf16 and e4m3: served by the tree and by this entry on every form
         index_head_dims=tuple(int(x) for x in d.index_head_dims),
         index_kv_heads=tuple(int(x) for x in d.index_kv_heads),
         index_block_sizes=tuple(int(x) for x in d.index_block_sizes),
@@ -503,6 +656,52 @@ def _frost_decode_table(
         index_page_sizes=tuple(int(x) for x in d.index_page_sizes),
         fuse_prepare_default=bool(d.fuse_prepare_default),
         pdl_default=bool(d.pdl_default),
+        sparse_tiles=tuple(str(x) for x in d.sparse_tiles),
+        sparse_tile_lean_default=bool(d.sparse_tile_lean_default),
+        index_select_forms=tuple(str(x) for x in d.index_select_forms),
+        index_extend_ring_rows_min=int(d.index_extend_ring_rows_min),
+        index_extend_select_budget_bytes=int(d.index_extend_select_budget_bytes),
+        index_compress_roundings=tuple(str(x) for x in d.index_compress_roundings),
+    )
+
+
+def sparse_tile(
+    device,
+    geometry: Qwen38BlockGeometry,
+    *,
+    batch_size: int,
+    q_len_per_req: int = 1,
+    dtype: torch.dtype = torch.bfloat16,
+    sparse_tile_form: str = SPARSE_TILE_FORM_AUTO,
+    decode_split_kv: Optional[int] = None,
+    kv_cache_dtype: Optional[torch.dtype] = None,
+    device_cc_override: Optional[Tuple[int, int]] = None,
+) -> Optional[str]:
+    """Which BODY of the sparse core a ``[batch_size, q_len_per_req]`` decode step at ``geometry`` takes on ``device`` under
+    ``sparse_tile_form`` -- :data:`SPARSE_TILE_LEAN` / :data:`SPARSE_TILE_TCGEN05` (the ``kernel_template`` ``plan.sparse_tile`` reads
+    back), or ``None`` where no body of the sparse core runs (e4m3 pools) or where the explicit body does not admit the step (the plan
+    is then the typed decline).  READ off the vendored envelope's own per-cell rule (``DecodeEnvelope.sparse_tile``: one copy of the
+    placement arithmetic, never re-spelled here); imports the vendored tree.  ``device_cc_override`` (appended) stands in for the
+    device's compute capability for a device-free reading (the host tests ask the cc 10.7 rule from a CPU host)."""
+    from ..qwen_3_5_block._cudnn_frost.gated_attention_block import (
+        GatedAttentionBlockFwd,
+    )
+
+    if sparse_tile_form not in SPARSE_TILE_FORMS:
+        raise ValueError(
+            f"sparse_tile_form must be one of {SPARSE_TILE_FORMS}, got {sparse_tile_form!r}"
+        )
+    check_vendored_rules()
+    cc = device_cc_override if device_cc_override is not None else device_cc(device)
+    env = GatedAttentionBlockFwd.serving_envelope(
+        geometry.frost(), dtype, torch.device(device), device_cc=cc
+    )
+    return env.decode.sparse_tile(
+        int(q_len_per_req),
+        int(batch_size),
+        sparse_tile_form=sparse_tile_form,
+        decode_split_kv=decode_split_kv,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 
@@ -539,12 +738,27 @@ def qwen_3_8_block_support(
                 reason=f"the vendored cuDNN Frontend tree could not answer: {type(exc).__name__}: {exc}",
                 declines={},
             )
+        declines = dict(table["declines"])
+        if "index_sources" in table:
+            # the ONE FlashInfer-side row of every form record where the tree was read: the launch-grid bound of one run at this pin
+            # (EXTEND_GRID_ROWS_KEY: 65,535 rows -- the decode step's and the extend step's query compress share the launch; a per-run
+            # fact, never the verdict)
+            declines[EXTEND_GRID_ROWS_KEY] = extend_rows_grid_text()
         decode = Qwen38BlockFormSupport(
-            "decode", bool(table["served"]), table["reason"], table["declines"]
+            "decode", bool(table["served"]), table["reason"], declines
         )
-    prefill = Qwen38BlockFormSupport("prefill", False, _FOLLOW_UP)
-    extend = Qwen38BlockFormSupport("extend", False, _FOLLOW_UP)
-    served_forms = ("decode",) if decode.served else ()
+    # the extend / prefill forms are the SAME vendored declaration form (the EXTEND step of the in-block indexer over the pools): served
+    # iff the decode envelope is, with the ONE decline table (the five indexer_extend_* rows and the launch-grid row among its keys).  No
+    # projection rows bound since the 6b21be0e0 pin (the band slab rides the JIT-only route at every row count: the tripwire re-reads the
+    # rule)
+    extend_declines = dict(decode.declines)
+    prefill = Qwen38BlockFormSupport(
+        "prefill", decode.served, decode.reason, extend_declines
+    )
+    extend = Qwen38BlockFormSupport(
+        "extend", decode.served, decode.reason, extend_declines
+    )
+    served_forms = FORMS if decode.served else ()
     appended = {
         k: table[k]
         for k in (
@@ -562,6 +776,12 @@ def qwen_3_8_block_support(
             "index_page_sizes",
             "fuse_prepare_default",
             "pdl_default",
+            "sparse_tiles",
+            "sparse_tile_lean_default",
+            "index_select_forms",
+            "index_extend_ring_rows_min",
+            "index_extend_select_budget_bytes",
+            "index_compress_roundings",
         )
         if k in table
     }
@@ -592,9 +812,29 @@ def check_vendored_rules() -> Dict[str, Any]:
     (``index_head_dims``, ``index_kv_heads``, ``index_block_sizes``, ``index_top_k_range``, ``index_query_rows_max``,
     ``index_state_rows_extra``, ``index_page_sizes``), the scorer's row rule as BEHAVIOUR (``validate_params`` over q_len 1 .. 20 at
     4 heads against ``decode_max_q_len``), the capture-safe row bound (``kernels.proj_gemm.SMALL_M_MAX``), the projection route's verdicts
-    (``small_m_tile_config``: the 24 / 2 slab on it, the shard slabs off it) and, behaviourally, every
+    (``small_m_tile_config``: the 24 / 2 slab on it, the shard slabs off it), the lift of the extend forms' rows bound as BEHAVIOUR (the
+    driver's ``_auto_tile_name`` names a JIT tile for the 24 / 2 slab PAST the small-M route -- 512 and 2048 rows at every served SM count,
+    the large-M rule of the 6b21be0e0 pin; a tree without it would put a chunk past 128 rows on the graph route the vendored root refuses),
+    the sparse core's body knob (the ``tile_form`` vocabulary,
+    the two bodies' ``kernel_template`` names, the AUTO placement bound, its UNIT as the placement rule's reading over ``(batch, q_len)``
+    cells -- CTAs per chunk, the step width outside the bound -- and the envelope's cc 10.7 reading: both bodies served, the lean rule
+    consulted), the EXTEND step's rows (the ``index_select_form`` vocabulary, the ring floor -- ONE spelling with ``index_state_rows_extra``
+    --, the select-window budget and the rounding conventions, each read off the envelope AND off the tree's DSL-free module constants) and,
+    behaviourally, every
     decline key the README's Errors table names present in ``decode.declines``.  Once per process (the probe's vendored read,
     ``api.prepare``); returns the tree's constants.  Raises ``RuntimeError`` naming every drifted fact."""
+    from ..qwen_3_5_block._cudnn_frost.gated_attention_block import (
+        INDEX_COMPRESS_ROUNDING_DEFAULT as _TREE_ROUNDING_DEFAULT,
+    )
+    from ..qwen_3_5_block._cudnn_frost.gated_attention_block import (
+        INDEX_COMPRESS_ROUNDINGS as _TREE_ROUNDINGS,
+    )
+    from ..qwen_3_5_block._cudnn_frost.gated_attention_block import (
+        QSA_EXTEND_SELECT_BUDGET_BYTES as _TREE_BUDGET,
+    )
+    from ..qwen_3_5_block._cudnn_frost.gated_attention_block import (
+        QSA_INDEX_SELECT_FORMS as _TREE_SELECT_FORMS,
+    )
     from ..qwen_3_5_block._cudnn_frost.gated_attention_block import (
         GatedAttentionBlockFwd,
     )
@@ -603,6 +843,9 @@ def check_vendored_rules() -> Dict[str, Any]:
     )
     from ..qwen_3_5_block._cudnn_frost.gated_attention_block.kernels import (
         proj_gemm,
+    )
+    from ..qwen_3_5_block._cudnn_frost.sdpa.fwd import (  # the DSL-free home of the tile_form vocabulary and the placement rule (the heuristics re-export them)
+        sparse_tile_rules as _rules,
     )
 
     _s35.check_vendored_rules()
@@ -619,6 +862,64 @@ def check_vendored_rules() -> Dict[str, Any]:
         "index_state_rows_extra": int(env.index_state_rows_extra),
         "index_page_sizes": tuple(int(x) for x in env.index_page_sizes),
         "decode_capture_rows_max": int(proj_gemm.SMALL_M_MAX),
+        # the extend forms' rows bound LIFTED (the 6b21be0e0 pin): the band slab (N 13952, K 2560) names a JIT tile past the small-M route
+        # through the driver's own resolver, at every served SM count -- the premise of serving any chunk length on the extend / prefill forms
+        "band_slab_jit_tile_past_small_m": tuple(
+            proj_gemm._auto_tile_name(
+                m,
+                g.n_qkvg,
+                g.d_model,
+                dtype=torch.bfloat16,
+                a_major="k",
+                b_major="k",
+                block_scale=False,
+                alpha=False,
+                sm_count=sm,
+            )
+            is not None
+            for m in (512, 2048)
+            for sm in (148, 204, 212)
+        ),
+        # the sparse core's body knob (the lean decode tile): the vocabulary, the two bodies' kernel_template names, the AUTO placement
+        # bound, its unit as the rule's own reading over (batch, q_len) cells (cc 10.7, the Flash-Next top_k, two KV heads), and the
+        # envelope's reading of the cc 10.7 part (both bodies served, the AUTO pin consulting the lean rule there)
+        "sparse_tile_forms": tuple(_rules.SPARSE_TILE_FORMS),
+        "sparse_tile_names": (
+            str(_rules.SPARSE_TILE_TCGEN05),
+            str(_rules.SPARSE_TILE_LEAN),
+        ),
+        "sparse_tile_lean_max_units": int(_rules.LEAN_SPARSE_MAX_UNITS),
+        "sparse_tile_lean_rule_cells": tuple(
+            (
+                b,
+                q,
+                bool(
+                    _rules.sparse_decode_lean_tile_selected(
+                        batch=b,
+                        h_kv=g.num_kv_heads,
+                        s_q=q,
+                        top_k=g.top_k,
+                        device_cc=SUPPORTED_CC,
+                    )
+                ),
+            )
+            for b, q, _ in SPARSE_TILE_LEAN_RULE_CELLS
+        ),
+        "sparse_tiles_cc107": tuple(str(x) for x in env.sparse_tiles),
+        "sparse_tile_lean_default_cc107": bool(env.sparse_tile_lean_default),
+        # the EXTEND step's rows (the 4c8e24355 pin): the envelope's four fields and the tree's DSL-free constants behind them -- one spelling
+        "index_select_forms": tuple(str(x) for x in env.index_select_forms),
+        "index_select_forms_tree": tuple(str(x) for x in _TREE_SELECT_FORMS),
+        "index_extend_ring_rows_min": int(env.index_extend_ring_rows_min),
+        "index_extend_ring_rows_min_is_the_ring_extra": int(
+            env.index_extend_ring_rows_min
+        )
+        == int(env.index_state_rows_extra),
+        "index_extend_select_budget_bytes": int(env.index_extend_select_budget_bytes),
+        "index_extend_select_budget_bytes_tree": int(_TREE_BUDGET),
+        "index_compress_roundings": tuple(str(x) for x in env.index_compress_roundings),
+        "index_compress_roundings_tree": tuple(str(x) for x in _TREE_ROUNDINGS),
+        "index_compress_rounding_default_tree": str(_TREE_ROUNDING_DEFAULT),
     }
     mirrored: Dict[str, Any] = {
         "index_head_dims": (INDEX_HEAD_DIM,),
@@ -629,6 +930,23 @@ def check_vendored_rules() -> Dict[str, Any]:
         "index_state_rows_extra": INDEX_STATE_ROWS_EXTRA,
         "index_page_sizes": INDEX_PAGE_SIZES,
         "decode_capture_rows_max": DECODE_CAPTURE_ROWS_MAX,
+        "band_slab_jit_tile_past_small_m": (True,) * 6,
+        "sparse_tile_forms": SPARSE_TILE_FORMS,
+        "sparse_tile_names": (SPARSE_TILE_TCGEN05, SPARSE_TILE_LEAN),
+        "sparse_tile_lean_max_units": SPARSE_TILE_LEAN_MAX_UNITS,
+        "sparse_tile_lean_rule_cells": SPARSE_TILE_LEAN_RULE_CELLS,
+        "sparse_tiles_cc107": (SPARSE_TILE_TCGEN05, SPARSE_TILE_LEAN),
+        "sparse_tile_lean_default_cc107": True,
+        "index_select_forms": INDEX_SELECT_FORMS,
+        "index_select_forms_tree": INDEX_SELECT_FORMS,
+        "index_extend_ring_rows_min": INDEX_EXTEND_RING_ROWS_MIN,
+        "index_extend_ring_rows_min_is_the_ring_extra": INDEX_EXTEND_RING_ROWS_MIN
+        == INDEX_STATE_ROWS_EXTRA,
+        "index_extend_select_budget_bytes": INDEX_EXTEND_SELECT_BUDGET_BYTES,
+        "index_extend_select_budget_bytes_tree": INDEX_EXTEND_SELECT_BUDGET_BYTES,
+        "index_compress_roundings": INDEX_COMPRESS_ROUNDINGS,
+        "index_compress_roundings_tree": INDEX_COMPRESS_ROUNDINGS,
+        "index_compress_rounding_default_tree": INDEX_COMPRESS_ROUNDING_DEFAULT,
     }
     drift = [
         f"{k}: support.py has {mirrored[k]!r}, the vendored tree {facts[k]!r}"
@@ -690,8 +1008,7 @@ def require_served(
     """The plan-time gate: a typed ``NotImplementedError`` naming the form, the device, the DSL version, the dtype or the geometry."""
     if form not in ALL_FORMS:
         raise ValueError(f"form must be one of {ALL_FORMS}, got {form!r}")
-    if form not in FORMS:
-        raise NotImplementedError(f"qwen_3_8_block ({form}): {_FOLLOW_UP}")
+    # every form of ALL_FORMS is served by the one gate since the 4c8e24355 pin (FORMS == ALL_FORMS; no second check)
     reason = (
         geometry.unsupported_reason()
         or dtype_reason(dtype)

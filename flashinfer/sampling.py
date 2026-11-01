@@ -23,7 +23,7 @@ import torch
 from .api_logging import flashinfer_api
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
-from .topk import _ROW_STATES_NBYTES
+from .topk import _get_row_states_buffer
 from .trace.templates.sampling import (
     chain_speculative_sampling_trace,
     min_p_sampling_trace,
@@ -166,7 +166,8 @@ def _blackwell_softmax_cached_kernel_for_testing(
     """Return the cached-cluster kernel the C++ dispatcher would launch, without
     launching it: (cluster CTAs, max tiles, 1 if it is a PDL twin, its resident
     clusters on this device, the resident clusters of the 4-tile kernel twice its
-    size or 0 past 16 CTAs), or () for the other routes."""
+    size or 0 past 16 CTAs, the per-CTA chunk in elements), or () for the other
+    routes."""
     if not logits.is_cuda:
         raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
     device_index = logits.device.index
@@ -2235,9 +2236,8 @@ def top_k_renorm_probs(
     top_p_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
-    row_states_buffer = torch.zeros(
-        _ROW_STATES_NBYTES, dtype=torch.uint8, device=probs.device
+    row_states_buffer = _get_row_states_buffer(
+        "top_k_renorm_probs_row_states", probs.device
     )
 
     return get_sampling_module().top_k_renorm_probs(
@@ -2306,9 +2306,8 @@ def top_k_mask_logits(
     top_k_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
-    row_states_buffer = torch.zeros(
-        _ROW_STATES_NBYTES, dtype=torch.uint8, device=logits.device
+    row_states_buffer = _get_row_states_buffer(
+        "top_k_mask_logits_row_states", logits.device
     )
 
     return get_sampling_module().top_k_mask_logits(

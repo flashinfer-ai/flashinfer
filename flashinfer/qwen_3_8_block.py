@@ -1,23 +1,26 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental: the Qwen 3.8 Flash-Next gated attention block (bf16) on SM107 -- the DECODE step with the in-block indexer.
+"""Experimental: the Qwen 3.8 Flash-Next gated attention block (bf16) on SM107 -- the in-block indexer's DECODE step and its EXTEND
+step (chunked prefill through the serving caches).
 
-The whole Qwen 3.8 Flash-Next sparse-attention sub-layer at decode, from the post-layernorm hidden states to the attention output,
-in ONE call over the serving stack's own caches: the QKV + gate + indexer projection, QK-RMSNorm with partial RoPE, the paged-KV
-write-through, the in-block indexer -- the raw-key ring and the paged compressed-key cache written for the block the step completes,
-the paged scorer over every complete block, the per-row top-k --, block-sparse GQA attention at head dim 256 over the selected 4-token
-blocks and the open tail, the sigmoid gate, the out projection.
+The whole Qwen 3.8 Flash-Next sparse-attention sub-layer, from the post-layernorm hidden states to the attention output, in ONE call
+over the serving stack's own caches: the QKV + gate + indexer projection, QK-RMSNorm with partial RoPE, the paged-KV write-through, the
+in-block indexer -- the raw-key ring and the paged compressed-key cache written for the blocks the step or the chunk completes, the
+selection over every complete block, the per-row top-k --, block-sparse GQA attention at head dim 256 over the selected 4-token blocks
+and the open tail, the sigmoid gate, the out projection.
 
 * ``qwen_3_8_block_bf16_decode``: a uniform ``[batch, q_len]`` decode step (``q_len = 1 + drafts``, up to 16 at four indexer heads);
-* ``prepare_qwen_3_8_block_bf16("decode", ...)``: the plan behind it (one per shape bucket; refused under capture);
+* ``prepare_qwen_3_8_block_bf16("decode" | "extend" | "prefill", ...)``: the plan behind a form (one per shape bucket; refused under
+  capture) -- ``"extend"`` is a uniform ``[batch, T]`` chunk of every sequence behind its cached prefix (the indexer's EXTEND step: the
+  block selects for the chunk's rows and writes the pools, the paged compressed-key cache and the ring), ``"prefill"`` the same plan
+  form at an empty prefix (one vendored form, two names);
 * ``Qwen38BlockWrapper``: the same in FlashInfer's ``plan()`` / ``run()`` idiom over a caller-owned workspace.
 
 A sibling of :mod:`flashinfer.qwen_3_5_block` (the dense Qwen 3.5 block): the same vendored cuDNN Frontend tree, the same cache roots,
-the same capture rules; the geometry, the weights and the plan carry the indexer appended.  DECODE only: the prefill / extend forms of
-the indexer are a later cuDNN Frontend PR's and decline by name.  Every entry point is experimental (API and backend): calling one is the
-opt-in.  The kernels are CuTe DSL (Rubin, cc 10.7, ``nvidia-cutlass-dsl >= 4.8.0``) vendored from cuDNN Frontend; everything
-backend-specific lives under ``flashinfer.experimental.qwen_3_8_block`` (its ``README.md`` is the feature page).  Nothing here imports
-the kernels or the DSL at import time.
+the same capture rules; the geometry, the weights and the plan carry the indexer appended.  Every entry point is experimental (API and
+backend): calling one is the opt-in.  The kernels are CuTe DSL (Rubin, cc 10.7, ``nvidia-cutlass-dsl >= 4.8.0``) vendored from cuDNN
+Frontend; everything backend-specific lives under ``flashinfer.experimental.qwen_3_8_block`` (its ``README.md`` is the feature page).
+Nothing here imports the kernels or the DSL at import time.
 """
 
 from __future__ import annotations
@@ -105,19 +108,30 @@ def qwen_3_8_block_support(
     dtype : torch.dtype
         The activation / weight / pool dtype (``torch.bfloat16`` is the only served value of the bf16 entry points).
     kv_cache_dtype : Optional[torch.dtype]
-        The pools' dtype a stack intends to bind (``None`` = ``dtype``); a dtype the decode form does not serve under the indexer
+        The pools' dtype a stack intends to bind (``None`` = ``dtype``); a dtype the forms do not serve under the indexer
         (``torch.float8_e4m3fn`` today) reads as ``decode.served=False`` with the vendored decline text.
 
     Returns
     -------
     Qwen38BlockSupport
-        ``served``, ``reason``, the device and CuTe DSL facts, the served ``forms`` (at most ``("decode",)``; the prefill / extend
-        records say why they are not), one record per form with the typed declines it can raise at plan time, the validated page
-        sizes and cache spellings, the decode envelope (``decode_max_q_len``, ``decode_capture_rows_max``), the served ``rope_dims``,
+        ``served``, ``reason``, the device and CuTe DSL facts, the served ``forms`` (``("prefill", "extend", "decode")`` where the geometry
+        is served: the three forms are ONE vendored declaration form and are served together), one record per form with the typed
+        declines it can raise at plan time (one table for the three forms: the vendored rows, the five ``indexer_extend_*`` rows among
+        them, plus the FlashInfer-side ``indexer_extend_grid_rows`` row -- one run's launch-grid bound at this pin), the
+        validated page sizes and cache spellings, the decode envelope (``decode_max_q_len``, ``decode_capture_rows_max``), the rows one
+        run of any form may hold (``extend_rows_grid_max``, 65535 at this pin: the vendored indexer's query compress -- the decode step's
+        and the extend step's -- launches with the run's row count as a CUDA grid dimension), the served
+        ``rope_dims``,
         the indexer facts READ off the vendored envelope (``index_sources``, ``index_list_forms``, ``index_cache_dtypes``,
         ``index_head_dims``, ``index_kv_heads``, ``index_block_sizes``, ``index_top_k_range``, ``index_query_rows_max``,
-        ``index_state_rows_extra``, ``index_page_sizes``, ``kv_cache_dtypes``, ``fuse_prepare_default``, ``pdl_default``) and
-        ``source`` (the vendored cuDNN Frontend commit / version the kernels come from).  The geometry verdict is the one
+        ``index_state_rows_extra``, ``index_page_sizes``, ``kv_cache_dtypes``, ``fuse_prepare_default``, ``pdl_default``, and -- the
+        sparse core's two bodies -- ``sparse_tiles`` (the bodies this part serves by ``kernel_template``: ``"sparse_d256_f16"``, the tcgen05
+        core, everywhere; ``"sparse_lean_d256_f16"``, the lean decode tile, on cc 10.7) and ``sparse_tile_lean_default`` (whether
+        ``sparse_tile_form="auto"`` consults the lean placement rule on this part; the per-cell reading is
+        ``flashinfer.experimental.qwen_3_8_block.support.sparse_tile``), and -- the EXTEND step -- ``index_select_forms``,
+        ``index_extend_ring_rows_min`` (3: the ring floor of the extend / prefill forms), ``index_extend_select_budget_bytes`` and
+        ``index_compress_roundings`` (``("single", "hf")``: the values of ``Qwen38BlockGeometry.index_compress_rounding``)) and ``source``
+        (the vendored cuDNN Frontend commit / version the kernels come from).  The geometry verdict is the one
         ``prepare_qwen_3_8_block_bf16`` applies (one shared gate).
     """
     from .experimental.qwen_3_8_block import support as _impl
@@ -260,26 +274,54 @@ def prepare_qwen_3_8_block_bf16(
     index_state_cache: Optional[torch.Tensor] = None,
     index_state_block_table: Optional[torch.Tensor] = None,
     position_tables: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    rope_position_tables_only: bool = True,
-    ring_slots: bool = False,
+    rope_position_tables_only: Optional[bool] = None,
+    ring_slots: Optional[bool] = None,
     fuse_prepare: Optional[bool] = None,
     use_pdl: Optional[bool] = None,
     kv_cache_dtype: Optional[torch.dtype] = None,
+    sparse_tile_form: str = "auto",
 ) -> "Qwen38BlockPlan":
-    """Declare, check and compile the block for one DECODE shape bucket, outside CUDA-graph capture.
+    """Declare, check and compile the block for one shape bucket of ``form``, outside CUDA-graph capture.
 
-    The plan compiles in: ``batch_size``, ``q_len_per_req`` (1 .. 16 at four indexer heads), ``page_size`` (16 / 32 / 64 / 128) and the
-    pools' layout, page count and strides (read from ``kv_cache``), the block table's columns and row stride (from ``block_table`` when
-    given -- the sparse core binds the whole table, so ``max_pages`` must be its width), ``max_seq_len``, the split, the side caches'
-    FORM (the compressed-key cache's rows per page, the ring's capacity ``cap >= q_len_per_req + 3``; never their strides), the two
-    input-contract flags and the knobs.  Typed errors: ``NotImplementedError`` for a form other than ``"decode"``, a device, DSL
-    version, dtype, geometry, page size, step width or pool dtype the kernels do not serve (named), ``ValueError`` for a malformed
-    argument (named), ``RuntimeError`` under capture.
+    The plan compiles in: the form, ``batch_size``, ``q_len_per_req`` (decode: 1 .. 16 at four indexer heads; extend / prefill: the
+    chunk's rows, any ``T`` with ``T <= max_pages x page_size``, at any batch; on every form within ``batch_size x q_len_per_req <= 65535``
+    rows per run at this pin -- the vendored indexer's query compress launches with the run's row count as a CUDA grid dimension; a
+    longer chunk is several runs, a wider decode step several steps or a smaller batch), ``page_size`` (16 / 32 / 64 / 128) and
+    the pools' layout, page count and strides (read from ``kv_cache``), the block table's columns and row stride (from ``block_table``
+    when given -- the sparse core binds the whole table, so ``max_pages`` must be its width), ``max_seq_len``, the split, the side caches'
+    FORM (the compressed-key cache's rows per page, the ring's capacity -- decode: ``cap >= q_len_per_req + 3``; extend / prefill:
+    ``cap >= 3``, and a run then binds a ring of EXACTLY that capacity; never their strides), the two input-contract flags and the knobs.
+    Typed errors: ``NotImplementedError`` for a device, DSL version, dtype, geometry, page size, step width, chunk rows, a run of more
+    than 65,535 rows (any form) or pool dtype the kernels do not serve (named), ``ValueError`` for a malformed argument (named),
+    ``RuntimeError`` under capture.
+
+    **The extend / prefill forms** (the in-block indexer's EXTEND step; one vendored form, two names): a UNIFORM chunk of
+    ``q_len_per_req = T`` rows of every live sequence behind its cached prefix ``P = seq_lens[b] - T`` -- ``"prefill"`` is the same plan run
+    at ``P = 0`` (``seq_lens[b] == T``) for every live sequence.  The block selects for the chunk's rows over the prefix's compressed
+    keys plus the chunk's own complete blocks and WRITES the serving caches: the chunk's K / V rows into the pools (``slot_mapping``), its
+    complete 4-token blocks into the paged compressed-key cache (through the main block table) and its last ``cap`` raw keys into the ring
+    (``index_state_slot_mapping``: the stack's circular slots ``block x cap + pos % cap`` for the sequence's last ``cap`` tokens, ``-1``
+    elsewhere) -- so a decode step reads what the chunk wrote, under ONE rounding convention (``Qwen38BlockGeometry.index_compress_rounding``).
+    The form REQUIRES ``ring_slots=True`` and ``rope_position_tables_only=False`` (``None`` reads them; an explicit ``False`` / ``True`` is the
+    vendored typed decline ``indexer_extend_ring_slots`` / ``indexer_extend_rope_tables_only``) and ``fuse_prepare`` ``None`` / ``False``
+    (``True`` is ``indexer_extend_fuse_prepare``); ``rope_cos`` / ``rope_sin`` (per token) and ``index_state_slot_mapping`` are required at
+    ``run``; ``seq_lens`` are the lengths AFTER the chunk.  Device-value contract (not checked on the host): ``seq_lens[b] in {0} u [T,
+    max_pages x page_size]`` -- ``0`` is a dead / padding sequence (``out`` rows exactly 0, nothing written), a live sequence shorter than
+    ``T`` and one past the table's reach are REPORTED in the plan's workspace (``-2`` / ``-3``) and never raised; the ring INPUT contract:
+    positions ``4 floor(P / 4) .. P - 1`` already sit in the ring (the stack's own rule, or the block's previous chunk / step).  Mixed
+    steps (decodes + prefills) are one decode plan and one extend plan per layer, run back to back; ragged chunks are several runs
+    grouped by their length.  One run holds any ``batch_size x q_len_per_req`` the vendored block serves up to 65,535 rows (the launch-grid
+    bound of this pin, ``support.EXTEND_ROWS_GRID_MAX``: the vendored indexer's query compress launches with the run's row count as a CUDA
+    grid dimension; a longer run is the typed decline ``indexer_extend_grid_rows`` before any vendored code): past 128 rows the indexer-band
+    slab's projection takes the GEMM engine's own baseline tile for its shape on the same JIT-only route (the 6b21be0e0 pin: capture-safe,
+    no cuDNN handle; ``plan.declaration["proj_tile"]`` names it).  A CUDA-graph capture of these forms takes the run AFTER one eager warm-up
+    on the capture stream (the first run uploads the select window plan's constants).
 
     Parameters
     ----------
     form : str
-        ``"decode"`` (``"prefill"`` / ``"extend"`` decline by name: a later cuDNN Frontend PR vendors the indexer's prefill forms).
+        ``"decode"`` (the DECODE step), ``"extend"`` (a uniform chunk behind a cached prefix) or ``"prefill"`` (the same form at an empty
+        prefix).
     geometry : Qwen38BlockGeometry
     device : torch.device or str
     weights : Qwen38BlockWeights
@@ -296,49 +338,73 @@ def prepare_qwen_3_8_block_bf16(
     kv_layout : str
         ``"NHD"``, ``"HND"`` or ``"UNIFIED"``.
     q_len_per_req : int
-        Query rows per sequence (``1 + drafts``); at most ``INDEX_QUERY_ROWS_MAX // next_pow2(index_heads)`` = 16 at four heads.
+        Decode: query rows per sequence (``1 + drafts``); at most ``INDEX_QUERY_ROWS_MAX // next_pow2(index_heads)`` = 16 at four heads,
+        and ``batch_size x q_len_per_req <= 65535`` (the launch-grid bound of one run at this pin, as on the extend / prefill forms).
+        Extend / prefill: the chunk's rows ``T`` (uniform over the batch), with ``T <= max_pages x page_size`` and
+        ``batch_size x T <= 65535`` (the launch-grid bound of one run at this pin; a longer chunk is several runs).
     max_pages : Optional[int]
         Table columns a step may address (default and, with ``block_table``, required: the table's width).
     block_table : Optional[torch.Tensor]
         The ``[>= batch_size, max_pages]`` int32 table the steps will bind (its row stride is compiled in); its leading rows are the sample.
     max_seq_len : Optional[int]
-        The logical KV bound ``kv_len <= max_seq_len <= max_pages * page_size``.
+        The logical KV bound ``kv_len <= max_seq_len <= max_pages * page_size`` (on the extend forms also ``T <= max_seq_len``).
     decode_split_kv : Optional[int]
         The split-KV of the sparse tile -- ``None`` = the fill rule, an int the explicit split; a performance knob (the same function).
     workspace_buffer : Optional[torch.Tensor]
-        A caller-owned uint8 buffer of at least ``plan.workspace_size`` bytes (the serving idiom: ONE buffer for every bucket, sized at the
-        largest); the plan allocates (and zeroes) its own when ``None``.
+        A caller-owned uint8 buffer of at least ``plan.workspace_size`` bytes (the serving idiom: ONE buffer for every bucket, sized at
+        the MAXIMUM of :func:`qwen_3_8_block_workspace_size` over every bucket the stack will plan -- not at the largest batch: under
+        ``sparse_tile_form="auto"`` a smaller batch can take the lean body, whose split-KV slab is wider than the core's at a larger
+        batch); the plan allocates (and zeroes) its own when ``None``.
     index_kv_cache : torch.Tensor
-        REQUIRED: the paged compressed-key cache ``[num_pages, page_size / 4, 1, 128]`` bf16 whose page axis is the MAIN block table's (one
-        row per complete 4-token block; the step writes the block it completes, the scorer reads every complete block).
+        REQUIRED: the paged compressed-key cache ``[num_pages, page_size / 4, 1, 128]`` in ``geometry.index_cache_dtype`` (bf16, or
+        ``torch.float8_e4m3fn``) whose page axis is the MAIN block table's (one row per complete 4-token block; the step or the chunk writes
+        the blocks it completes, the selection reads every complete block).
     index_state_cache : torch.Tensor
-        REQUIRED: the raw-key ring ``[num_ring_blocks, cap, 1, 128]`` bf16, ``cap >= q_len_per_req + 3`` (block 0 the null block of a padded
-        entry); a run may bind a ring of another capacity that meets the rule.
+        REQUIRED: the raw-key ring ``[num_ring_blocks, cap, 1, 128]`` bf16 (block 0 the null block of a padded entry).  Decode: ``cap >=
+        q_len_per_req + 3``, and a run may bind a ring of another capacity that meets the rule.  Extend / prefill: ``cap >= 3`` (a serving
+        stack's 4), and a run binds a ring of EXACTLY the planned capacity (the ring write compiled it in).
     index_state_block_table : Optional[torch.Tensor]
         A sample ``[>= batch_size, 1]`` int32 ring table (form only; a zeros sample when ``None``).
     position_tables : (torch.Tensor, torch.Tensor)
         REQUIRED: ``(cos_pos, sin_pos)`` from :func:`qwen_3_8_block_rope_position_tables`, ``[1, >= max_pages x page_size, rope_dim]`` bf16,
         held by the plan: what its ``run`` binds unless handed a pair of its own (``position_tables=``, checked against the plan).
-    rope_position_tables_only : bool
-        ``True`` (default): every rotation reads the position tables at the row's device-derived position and ``run`` takes
-        ``rope_cos=None, rope_sin=None``; ``False``: the per-token tables are required at ``run`` (the unfused arm's form; bitwise).
-    ring_slots : bool
-        ``True``: ``run(index_state_slot_mapping=)`` names the ring WRITE rows (a stack's own circular-buffer slots ``block x cap + pos % cap``,
-        ``-1`` = no write); ``False``: the rows derive from the ring table and ``seq_lens`` in the kernel.  Bitwise; a compile key.
+    rope_position_tables_only : Optional[bool]
+        ``None`` (default) = the form's default.  Decode: ``True`` -- every rotation reads the position tables at the row's device-derived
+        position and ``run`` takes ``rope_cos=None, rope_sin=None``; ``False`` -- the per-token tables are required at ``run`` (the unfused
+        arm's form; bitwise).  Extend / prefill: ``False`` is REQUIRED (the per-token tables at ``run``); an explicit ``True`` is the vendored
+        typed decline ``indexer_extend_rope_tables_only``.
+    ring_slots : Optional[bool]
+        ``None`` (default) = the form's default.  Decode: ``False`` -- the ring rows derive from the ring table and ``seq_lens`` in the
+        kernel; ``True`` -- ``run(index_state_slot_mapping=)`` names the ring WRITE rows (a stack's own circular-buffer slots ``block x cap +
+        pos % cap``, ``-1`` = no write); bitwise, a compile key.  Extend / prefill: ``True`` is REQUIRED (the chunk's last ``cap`` raw keys
+        land at the stack's slots); an explicit ``False`` is the vendored typed decline ``indexer_extend_ring_slots``.
     fuse_prepare : Optional[bool]
-        ``None`` = the vendored MEASURED default (one prepare launch on cc 10.7); ``False`` = the four-launch twin; both bitwise.  ``False``
-        with ``rope_position_tables_only=True`` is a typed decline (the unfused query norm reads per-token rows).
+        Decode: ``None`` = the vendored MEASURED default (one prepare launch on cc 10.7); ``False`` = the four-launch twin; both bitwise.
+        ``False`` with ``rope_position_tables_only=True`` is a typed decline (the unfused query norm reads per-token rows).  Extend /
+        prefill: ``None`` (reads ``False``) or ``False``; ``True`` is the vendored typed decline ``indexer_extend_fuse_prepare``.
     use_pdl : Optional[bool]
         ``None`` = the vendored default (off on the sparse chain today); ``True`` is a typed decline until the vendored tree serves it.
     kv_cache_dtype : Optional[torch.dtype]
         ``None`` = bf16 pools; ``torch.float8_e4m3fn`` is a typed decline until the sparse core's in-kernel dequant arm lands.
+    sparse_tile_form : str
+        WHICH BODY of the sparse core serves the step: ``"auto"`` (default) = the vendored placement rule -- on cc 10.7 the LEAN decode
+        tile (``mma.sync`` + ``cp.async``, one CTA of ``128 x N_MT`` threads, no TMEM / TMA / cluster) at ``batch_size x H_kv <= 4`` CTAs
+        per chunk -- the bound's unit: the step's rows ride inside the CTA, so ``q_len_per_req`` is not in it -- at every served step width
+        the body admits (under the in-block indexer the list is per row, which the lean tile serves at ``q_len_per_req == 1`` only:
+        ``batch_size <= 2`` at ``q_len_per_req 1`` on two KV heads), the tcgen05 core
+        everywhere else --, ``"lean"`` / ``"tcgen05"`` pin a body (an explicit body the step does not admit is a typed decline naming the
+        arm).  Performance-only: the same function under either body within the vendored tree's budget, never bitwise ACROSS the bodies
+        (bitwise within each); the body that compiled reads back in ``plan.sparse_tile`` (``"sparse_lean_d256_f16"`` / ``"sparse_d256_f16"``).
+        A vocabulary other than these three is a ``ValueError`` before any vendored code.
 
     Returns
     -------
     Qwen38BlockPlan
         ``plan.run(...)`` launches it; ``plan.workspace_size``, ``plan.declaration`` (the compiled-in facts, the stages, the knob
-        readbacks ``fuse_prepare`` / ``use_pdl`` / ``pdl_stages``, ``index_list_form``, ``n_blocks_max``, ``topk_knobs``, the
-        launch count statement, the cache roots) and ``plan.supports(...)`` describe it.
+        readbacks ``fuse_prepare`` / ``use_pdl`` / ``pdl_stages`` / ``sparse_tile_form`` / ``sparse_tile``, ``index_list_form``,
+        ``n_blocks_max``, ``topk_knobs``, the launch count statement, the cache roots; on the extend forms ``index_select_form`` /
+        ``index_select_form_resolved`` (``"extend"``), ``index_compress_rounding``, ``n_windows`` / ``window_rows`` / ``select_budget_bytes``
+        (the select window plan), ``ring_cap_exact`` and ``capture_warm_up_required``) and ``plan.supports(...)`` describe it.
     """
     from .experimental.qwen_3_8_block import api as _impl
 
@@ -367,6 +433,7 @@ def prepare_qwen_3_8_block_bf16(
         fuse_prepare=fuse_prepare,
         use_pdl=use_pdl,
         kv_cache_dtype=kv_cache_dtype,
+        sparse_tile_form=sparse_tile_form,
     )
 
 
@@ -397,8 +464,11 @@ def qwen_3_8_block_bf16_decode(
     plan: Optional["Qwen38BlockPlan"] = None,
     block_ids_out: Optional[torch.Tensor] = None,
     block_lens_out: Optional[torch.Tensor] = None,
+    sparse_tile_form: str = "auto",
 ) -> torch.Tensor:
     """The decode form: ``batch`` sequences x ``q_len_per_req`` new tokens each over the paged caches, the selection made in the block.
+    One step holds at most 65,535 rows (``batch x q_len_per_req``) at this pin -- the launch-grid bound shared with the extend / prefill
+    forms (the step's query compress launches with the run's row count as a CUDA grid dimension); a wider step is the typed decline.
 
     Per step the block projects the step's rows (the Q / GATE / K / V bands and the indexer band), norms and rotates them, writes the K / V
     rows into the pools at ``slot_mapping`` and the raw indexer key into the ring, pools / norms / rotates the compressed key of the block a
@@ -454,6 +524,9 @@ def qwen_3_8_block_bf16_decode(
     block_ids_out, block_lens_out : Optional[torch.Tensor]
         Optional ``[batch * q_len_per_req, top_k]`` / ``[batch * q_len_per_req]`` int32 buffers that receive the block's own selection
         (the ids strictly descending then ``-1``; the valid-prefix length) -- tests, A/B, a reuse stack; nothing on the step reads them.
+    sparse_tile_form : str
+        The sparse core's body knob of the bucket's cached plan (as in :func:`prepare_qwen_3_8_block_bf16`; a plan-cache key); ignored
+        when ``plan`` is given (that plan's body runs).
 
     Returns
     -------
@@ -487,6 +560,7 @@ def qwen_3_8_block_bf16_decode(
         plan=plan,
         block_ids_out=block_ids_out,
         block_lens_out=block_lens_out,
+        sparse_tile_form=sparse_tile_form,
     )
 
 
@@ -503,10 +577,17 @@ def qwen_3_8_block_workspace_size(
     decode_split_kv: Optional[int] = None,
     fuse_prepare: Optional[bool] = None,
     ring_cap: Optional[int] = None,
+    sparse_tile_form: str = "auto",
 ) -> int:
-    """The workspace bytes a decode plan of this shape bucket needs, with no plan kept: what a serving stack sizes its ONE shared
-    workspace with at init (before its memory profiling, when the caches do not exist yet), at the largest ``(batch_size,
-    q_len_per_req)`` bucket it will plan.  The bucket is declared on stand-in samples and its kernels compiled (the carve includes
+    """The workspace bytes a plan of this shape bucket needs, with no plan kept: what a serving stack sizes its ONE shared
+    workspace with at init (before its memory profiling, when the caches do not exist yet) -- as the MAXIMUM of this query over
+    EVERY ``(form, batch_size, q_len_per_req)`` bucket it will plan, with the knobs it will plan them with (the extend / prefill
+    buckets carve the EXTEND step's slots too: the dense kbar ``[batch, max_pages x page_size / 4, 128]`` and the select window's fp32
+    scratch, which dominate at a long reach).  The largest batch is not the
+    largest workspace: under ``sparse_tile_form="auto"`` an admissible batch 1 or 2 bucket (``top_k >= 8``) takes the lean body, whose split-KV partial slab
+    (split 65 at the default k) is wider than the tcgen05 core's at batch 4 (at the 24 / 2 geometry, q_len 1, page 16, 512 pages,
+    ring_cap 4: about 3.3 MB at batch 2 against about 1.8 MB at batch 4), so a buffer sized from the largest batch alone is rejected
+    by the smaller bucket's plan with the typed workspace error.  The bucket is declared on stand-in samples and its kernels compiled (the carve includes
     the projection engines' scratch; the compile is served from the in-process memo or the compiled-plan cache after the first
     process).  The carve depends on the bucket, ``max_pages x page_size`` (the block table's reach) and the split -- never on the
     caches' page count or strides -- so the number equals the compiled plan's ``workspace_size``.  Typed errors as
@@ -515,13 +596,17 @@ def qwen_3_8_block_workspace_size(
     Parameters
     ----------
     form : str
-        ``"decode"``.
+        ``"decode"``, ``"extend"`` or ``"prefill"``.
     geometry : Qwen38BlockGeometry
     device : torch.device or str
     page_size, batch_size, q_len_per_req, max_pages, decode_split_kv, fuse_prepare
         The bucket's facts, as in :func:`prepare_qwen_3_8_block_bf16` (``max_pages`` required: the table's columns).
     ring_cap : Optional[int]
-        The ring's rows per block (default ``q_len_per_req + 3``, the minimum).
+        The ring's rows per block (default: the form's floor -- ``q_len_per_req + 3`` on decode, 3 on extend / prefill; the carve does
+        not depend on it).
+    sparse_tile_form : str
+        The sparse core's body knob the plan will be made with (as in :func:`prepare_qwen_3_8_block_bf16`): the carve is the body's --
+        the lean tile's split writes a wider partial slab than the core's -- so size the workspace with the knob the plans use.
 
     Returns
     -------
@@ -541,23 +626,26 @@ def qwen_3_8_block_workspace_size(
         decode_split_kv=decode_split_kv,
         fuse_prepare=fuse_prepare,
         ring_cap=ring_cap,
+        sparse_tile_form=sparse_tile_form,
     )
 
 
 class Qwen38BlockWrapper:
     """Plan-and-run wrapper for the Qwen 3.8 Flash-Next gated attention block: one instance per (layer group, shape bucket),
-    FlashInfer's ``plan()`` / ``run()`` idiom over a caller-owned workspace -- the serving idiom (one workspace sized at the largest
-    bucket serves every bucket and every layer run in turn on one stream).
+    FlashInfer's ``plan()`` / ``run()`` idiom over a caller-owned workspace -- the serving idiom (one workspace sized at the maximum of
+    :func:`qwen_3_8_block_workspace_size` over every bucket the stack plans serves every bucket and every layer run in turn on one
+    stream; under ``"auto"`` the largest batch is not the largest workspace).
 
     .. warning::
         ``Qwen38BlockWrapper`` is experimental: it provides no compatibility guarantees and may change or be removed
         without deprecation.  Calling ``plan`` or ``run`` is the opt-in and needs no environment variable; the
         implementation lives in ``flashinfer.experimental.qwen_3_8_block``.
 
-    SM107 (Rubin, cc 10.7) only, bf16, the DECODE form only.  ``plan`` runs outside CUDA-graph capture (it compiles the kernels and sizes
-    the workspace; a workspace smaller than ``plan_info.workspace_size`` is a typed ``ValueError`` naming the size); the first ``run``
-    after ``plan`` may already be captured.  One wrapper is a single-writer resource: do not ``plan`` while a captured or in-flight ``run``
-    may read its buffers.  Re-plan when the shape bucket changes: a plan is exactly one bucket.
+    SM107 (Rubin, cc 10.7) only, bf16; the ``decode``, ``extend`` and ``prefill`` forms.  ``plan`` runs outside CUDA-graph capture (it
+    compiles the kernels and sizes the workspace; a workspace smaller than ``plan_info.workspace_size`` is a typed ``ValueError`` naming
+    the size); on the decode form the first ``run`` after ``plan`` may already be captured, on the extend / prefill forms a capture takes
+    the run after ONE eager warm-up on the capture stream.  One wrapper is a single-writer resource: do not ``plan`` while a captured or
+    in-flight ``run`` may read its buffers.  Re-plan when the shape bucket changes: a plan is exactly one bucket.
     """
 
     #: Mechanical identification: the decorators only mark ``plan`` and ``run``.
@@ -609,19 +697,20 @@ class Qwen38BlockWrapper:
         index_state_cache: Optional[torch.Tensor] = None,
         index_state_block_table: Optional[torch.Tensor] = None,
         position_tables: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        rope_position_tables_only: bool = True,
-        ring_slots: bool = False,
+        rope_position_tables_only: Optional[bool] = None,
+        ring_slots: Optional[bool] = None,
         fuse_prepare: Optional[bool] = None,
         use_pdl: Optional[bool] = None,
         kv_cache_dtype: Optional[torch.dtype] = None,
+        sparse_tile_form: str = "auto",
     ) -> None:
         """Plan one shape bucket over this wrapper's workspace, outside CUDA-graph capture.
 
         Parameters
         ----------
         form : str
-            ``"decode"``.
-        weights, w_o, kv_cache, page_size, batch_size, q_len_per_req, max_pages, block_table, max_seq_len, decode_split_kv, index_kv_cache, index_state_cache, index_state_block_table, position_tables, rope_position_tables_only, ring_slots, fuse_prepare, use_pdl, kv_cache_dtype
+            ``"decode"``, ``"extend"`` or ``"prefill"``.
+        weights, w_o, kv_cache, page_size, batch_size, q_len_per_req, max_pages, block_table, max_seq_len, decode_split_kv, index_kv_cache, index_state_cache, index_state_block_table, position_tables, rope_position_tables_only, ring_slots, fuse_prepare, use_pdl, kv_cache_dtype, sparse_tile_form
             As in :func:`prepare_qwen_3_8_block_bf16` (``weights`` / ``w_o`` are samples: shape and dtype).
         """
         from .experimental.qwen_3_8_block import api as _impl
@@ -652,6 +741,7 @@ class Qwen38BlockWrapper:
             fuse_prepare=fuse_prepare,
             use_pdl=use_pdl,
             kv_cache_dtype=kv_cache_dtype,
+            sparse_tile_form=sparse_tile_form,
         )
 
     @flashinfer_experimental_api(feature=_FEATURE)
@@ -675,12 +765,15 @@ class Qwen38BlockWrapper:
         block_ids_out: Optional[torch.Tensor] = None,
         block_lens_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run the planned decode step on the current CUDA stream (capturable from the first run).
+        """Run the planned step or chunk on the current CUDA stream (the decode form capturable from the first run; the extend / prefill
+        forms after one eager warm-up on the capture stream).
 
         Parameters
         ----------
         hidden_states, rope_cos, rope_sin, weights, w_o, kv_cache, slot_mapping, block_table, seq_lens, index_kv_cache, index_state_cache, index_state_block_table, index_state_slot_mapping, out, block_ids_out, block_lens_out
-            The decode form's arguments, as in :func:`qwen_3_8_block_bf16_decode`.
+            The form's arguments, as in :func:`qwen_3_8_block_bf16_decode`; on the extend / prefill forms ``rope_cos`` / ``rope_sin``
+            (per token, ``[batch x T, rope_dim]``) and ``index_state_slot_mapping`` are required, ``seq_lens`` are the lengths AFTER the
+            chunk, and the ring's capacity must equal the plan's.
 
         Returns
         -------

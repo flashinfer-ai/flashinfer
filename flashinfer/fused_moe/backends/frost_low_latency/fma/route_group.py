@@ -212,3 +212,11 @@ def _kernel(
         if lane == 0:
             for o in cutlass.range_constexpr(columns):
                 mid[leader, row + o] = mid.element_type(0.0)
+
+
+# Custom activation limits may stringify with a '+' that NVVM rejects in names.
+_kernel.set_name_prefix(
+    "flashinfer_fma_route_group_fc1",
+    keep_mangled_name=False,
+    remove_cutlass_symbol=True,
+)

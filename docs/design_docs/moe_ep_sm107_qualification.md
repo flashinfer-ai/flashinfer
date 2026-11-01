@@ -70,30 +70,30 @@ topology. See the [NVSHMEM environment variable reference](https://docs.nvidia.c
 | Graphs and pooling | Warm up eagerly on every rank before capture; sequential, stream-ordered use of a shared workspace |
 | Determinism | In-kernel FC2 reduction is opt-in and requires early routing weights; repeatability must be characterized separately |
 
-Scores for masked (`-1`) routes may be NaN or infinite. Staging writes zero
-for those scores without modifying the caller's routing tensors.
+Scores for masked (`-1`) routes may be NaN or infinite. Staging preserves
+them; dispatch and reduction exclude masked routes. Caller tensors are unchanged.
 
-Prequantized inputs use a route-staging kernel to copy IDs, convert scores to
-FP32 and zero masked scores. Activation and scale bytes are copied unchanged.
+Prequantized inputs use a route-staging kernel to copy IDs and convert scores to
+FP32. Activation and scale bytes are copied unchanged.
 Eligible BF16 inputs use fused quantization and staging for NVFP4 or MXFP8;
 unsupported layouts and score dtypes retain the Torch path. Set
-`FLASHINFER_MEGA_FUSED_STAGE=0` to use Torch staging. Routing validation remains
-separate and runs before either staging path by default.
+`FLASHINFER_MEGA_FUSED_STAGE=0` to use Torch staging. When enabled, routing
+validation runs inside eligible NVFP4 or MXFP8 staging launches; other paths
+retain separate checks.
 
-Set `FLASHINFER_SM107_MEGA_CHECK_ROUTES=0` to skip routing value checks when
-the caller guarantees valid routing. This skips ID-range, duplicate-ID and
-finite-score checks; it does not sanitize non-finite scores on active routes.
-Metadata checks, staging and masked-score zeroing remain active. Set the
+Routing value checks are off by default; the caller is responsible for valid
+routing. Set `FLASHINFER_SM107_MEGA_CHECK_ROUTES=1` to check ID ranges, duplicate
+IDs and finite scores. Neither setting sanitizes non-finite scores on active
+routes. Metadata checks and staging remain active. Set the
 variable before warmup and graph capture; existing graphs must be recaptured
 to change their validation behavior.
 
-Routing value checks use device assertions so they remain active on graph
-replay without a host synchronization. Invalid routing can invalidate the
+When enabled, routing value checks use device assertions so they remain active
+on graph replay without a host synchronization. Invalid routing can invalidate the
 worker's CUDA context, as with other invalid CUDA indexing operations.
-Use separate worker processes for negative device-assertion tests. Valid
-masked routes are supported; their combine slots are cleared each launch.
-This clearing and routing validation have a performance cost that belongs
-in the measured kernel and full-forward spans respectively.
+Use separate worker processes for negative device-assertion tests. Separate
+BF16, NVFP4 and MXFP8 reducers mask invalid routes without clearing combine
+slots. In-kernel reduction still initializes its accumulation output.
 
 The shim rounds physical token capacity up by at most three rows to keep
 four-int router loads in bounds. The public live-token limit is unchanged.

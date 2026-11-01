@@ -47,6 +47,19 @@ regardless). Both are performance-only (`out` and the pools are bitwise the plai
 `plan.declaration`: `cache_write_in_norm_rope`, `use_pdl` (the resolved switch), `use_pdl_requested` (`None` = the default),
 `use_pdl_effective` and `pdl_stages`; `"_CacheWrite"` is absent from `stages` where the write-through is folded in.
 
+## Members served
+
+One block, members by geometry: the kernels serve every GQA geometry at head dim 256 that passes the geometry gate
+(`Qwen35BlockGeometry.unsupported_reason`: `d_model % 256 == 0`, `rope_dim` 64 or 128), and the tests pin the family's rows -- the
+Qwen3.5-397B shards (32 / 2 at `d_model` 4096; 24 / 2 at 2560 for the 27B-class shards) and the **Qwen3.8-27B dense attention layer**
+(`d_model` 5120, 24 query / 4 KV heads x 256, `rope_dim` 64, `qk_norm_eps` 1e-6; `n_qkvg` 14336, GQA group 6), the geometry row cuDNN
+Frontend `4c8e24355` pins in its own layout contract and family table. For that member the three forms are validated here at the shapes
+a serving stack hands over: decode `q_len` 1 at page 16 and 4 at page 32 (batch 1 and 4, a padded entry among them, contexts to 2048
+keys) on the packed decode tile's claimed routes, extend as a 512-token step with an empty prefix and as a 512-token chunk behind a
+512-row cached prefix, the dense prefill at 512 tokens, and the packed K|V pool of "Arguments and layouts" -- the row
+`qwen_3_5_block_support(...)` advertises, with every declination around it (another `rope_dim`, another head dim, a `d_model` off the
+projection tile, a step past 32 decode rows) typed by name. No performance number is claimed for it in this draft.
+
 ## A step, vLLM-shaped
 
 ```python
@@ -57,13 +70,15 @@ from flashinfer.qwen_3_5_block import (
 )
 
 geometry = Qwen35BlockGeometry(d_model=4096, num_qo_heads=32, num_kv_heads=2)   # Qwen3.5-397B at TP 1; 16 / 1 at TP 2, 8 / 1 at TP 4, ...
+# the Qwen3.8-27B dense attention layer: Qwen35BlockGeometry(d_model=5120, num_qo_heads=24, num_kv_heads=4) -- see "Members served"
 assert qwen_3_5_block_support(torch.device("cuda"), geometry).served               # the init-time dispatch predicate (never raises)
 
 # load time: the merged qkv_proj weight (rows [q_proj (per-head [q_h | gate_h]) | k_proj | v_proj]) -> the block's bands
 weights = qwen_3_5_block_pack_weights(layer.qkv_proj.weight, layer.q_norm.weight, layer.k_norm.weight, geometry)
 w_o = layer.o_proj.weight                                                           # [d_model, H_q * 256], used as is
 
-# per step: the cache the stack allocated (FlashInfer NHD 5-D [num_pages, 2, page_size, H_kv, 256]; HND or a (k, v) pair also bind)
+# per step: the cache the stack allocated (FlashInfer NHD 5-D [num_pages, 2, page_size, H_kv, 256]; HND, a (k, v) pair, or the stack's
+# packed K|V pool [num_pages, H_kv, page_size, 512] as kv_layout="UNIFIED" also bind)
 cos, sin = qwen_3_5_block_rope_tables(positions, rotary_emb.cos_sin_cache)        # or the tables the stack already holds
 out = qwen_3_5_block_bf16_decode(hidden_states, cos, sin, weights, w_o, geometry=geometry,
                                  kv_cache=kv_cache, slot_mapping=slot_mapping,
@@ -78,11 +93,15 @@ out = qwen_3_5_block_bf16_extend(hidden_states, cos, sin, weights, w_o, geometry
 ## Arguments and layouts
 
 - **`kv_cache`**: FlashInfer's 5-D `[num_pages, 2, page_size, H_kv, D]` (`kv_layout="NHD"`) or `[num_pages, 2, H_kv, page_size, D]`
-  (`"HND"`) buffer, or a `(k_cache, v_cache)` pair of 4-D tensors in those layouts; bf16. The block binds its
-  `[num_pages, H_kv, page_size, D]` views by strides (no copy, no repack); `D` must be contiguous, every other stride a
-  16-byte multiple, the base 16-byte aligned. `page_size` is a positive multiple of 16 (16 / 32 / 64 / 128 validated) and is
-  read from the cache's shape by the functional entry points. The pools' page count, layout and strides are compiled into a
-  plan: another cache is another plan.
+  (`"HND"`) buffer, a `(k_cache, v_cache)` pair of 4-D tensors in those layouts, or -- `kv_layout="UNIFIED"` -- the serving stack's
+  packed K|V pool: ONE `[num_pages, H_kv, page_size, 2 x D]` tensor per layer with K in columns `[0, D)` and V in `[D, 2D)` of every
+  row (the 24 / 4 model family's `[pages, 4, 16 or 32, 512]` bf16 cache), bound as its two half views `kv[..., :D]` / `kv[..., D:]`
+  (both with strides `(H_kv x page_size x 2D, page_size x 2D, 2D, 1)` on a contiguous pool; the vendored tree's `unified` pool
+  layout); bf16. The block binds its `[num_pages, H_kv, page_size, D]` views by strides (no copy, no repack); `D` must be
+  contiguous, every other stride a 16-byte multiple, the base 16-byte aligned. `page_size` is a positive multiple of 16
+  (16 / 32 / 64 / 128 validated) and is read from the cache's shape by the functional entry points. The pools' page count, layout
+  and strides are compiled into a plan: another cache is another plan. The Qwen 3.8 sibling package spells its own stack's
+  NHD-ordered row `[num_pages, page_size, H_kv, 2 x D]` with the same word: the same binding, each stack's own axis order.
 - **`block_table`**: the dense `[batch, max_pages]` int32 table as vLLM holds it (row `0` = the NULL block of a padded
   entry); any row stride (a row slice of a wider table binds as a view) -- the row stride is compiled in, so plan with the
   table the steps will bind. The CSR triple (`kv_indptr`, `kv_indices`, `kv_last_page_len`) is not accepted.
@@ -102,6 +121,14 @@ out = qwen_3_5_block_bf16_extend(hidden_states, cos, sin, weights, w_o, geometry
   the same function under every value.
 - Every VALUE in the index tensors is device data (never read on the host); only the FORM is checked, host-side and
   typed, before any launch.
+
+The three cache spellings (`qwen_3_5_block_support(...).kv_layouts` / `.kv_layout_shapes`):
+
+| `kv_layout` | the cache tensor | the block's two views |
+|---|---|---|
+| `"NHD"` | `[num_pages, 2, page_size, H_kv, D]`, or a `(k, v)` pair of `[num_pages, page_size, H_kv, D]` | `kv[:, 0]` / `kv[:, 1]`, the page and head axes swapped by strides |
+| `"HND"` | `[num_pages, 2, H_kv, page_size, D]`, or a `(k, v)` pair of `[num_pages, H_kv, page_size, D]` | `kv[:, 0]` / `kv[:, 1]` |
+| `"UNIFIED"` | `[num_pages, H_kv, page_size, 2 x D]`, the packed K\|V pool | `kv[..., :D]` / `kv[..., D:]` |
 
 ## Capture and replay
 
@@ -131,6 +158,7 @@ out = qwen_3_5_block_bf16_extend(hidden_states, cos, sin, weights, w_o, geometry
 |---|---|
 | not cc 10.7; `nvidia-cutlass-dsl` absent, below 4.8.0 or without the Rubin target; f16 / fp8 on the bf16 entry; `head_dim != 256`, `d_model % 256`, `rope_dim` not 64 / 128, more than 32 decode rows | `NotImplementedError` naming the device / version / feature (and `qwen_3_5_block_support` reports it without raising) |
 | a malformed tensor (dtype, rank, shape, strides, alignment, device), a page size off the contract, a call outside the plan's capacities, a token count off the small-capacity plans' multiple | `ValueError` naming the operand and the expected form |
+| a `UNIFIED` cache that is not ONE 4-D `[num_pages, H_kv, page_size, 2 x D]` tensor (a 5-D buffer or a `(k, v)` pair under that spelling, another trailing shape, another dtype, a head dim that is not contiguous, a stride or a base off the 16-byte rule), or a cache of another layout / page count than the plan's pools | `ValueError` naming the operand and the expected form -- for a 5-D buffer or a pair, the spelling it binds under |
 | `prepare` / `plan` under capture; a functional entry point under capture on a bucket without a cached plan; `clear_plan_cache()` under capture | `RuntimeError` naming the remedy |
 
 No silent fallback: an unserved case never runs a slower path.
@@ -149,8 +177,8 @@ page sizes); the first probe on a served device and the first plan re-read them 
 - bf16 activations, weights and pools; `head_dim = 256`; `d_model % 256 == 0`; `rope_dim` 64 (the Qwen3.5 value) or 128
   (`qwen_3_5_block_support(...).rope_dims`: the fused norm + RoPE projection rotates whole 64-column epilogue-subtile pairs below
   the head dim, and the norm + RoPE kernels of the lowered decode chain shuffle 16 x a power-of-two elements -- 32 / 256 fail the
-  first rule, 192 the second); GQA groups as the Qwen3.5 shards have them
-  (32 / 2, 24 / 2, 16 / 1, 8 / 1, 4 / 1 ...); the decode envelope `q_len_per_req <= 4` claimed (the packed 16- / 32-column decode
+  first rule, 192 the second); GQA groups as the Qwen3.5 shards and the Qwen3.8-27B dense layer have them
+  (32 / 2, 24 / 2, 24 / 4, 16 / 1, 8 / 1, 4 / 1 ...); the decode envelope `q_len_per_req <= 4` claimed (the packed 16- / 32-column decode
   tile), up to 32 routed and declared -- the 64-column tile in one or two token units, the paged prefill tile with the group packed
   where the step fills the part (`batch x num_kv_heads >= 64`), the unpacked tile past a group's packed routes;
   `plan.declaration["decode_route"]` names the kernel, its width, token units and KV streams -- and a typed decline past it; no LSE
@@ -189,31 +217,65 @@ is filtered: FlashInfer's `ExperimentalWarning` is this API's single opt-in sign
 ## Where the kernels come from
 
 The backend is a subset of the cuDNN Frontend Python package vendored byte-faithfully under `_cudnn_frost/`
-(114 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
+(161 files: the block's forward and its serving launches -- the fused norm + RoPE projection fork and the lowered small-M decode
 chain's norm + RoPE pass and cache write --, the FROST SDPA adapter with its configuration tables (the shared d128-family table and the
 two backward configuration tables the forward configs import at module level: geometry and validators, no backward kernel) and its
 SM107 prefill / decode tiles and SM100 split combine, the FROST GEMM compiler and its kernel templates, the `tile_dsl` helpers, and --
-since the Qwen 3.8 Flash-Next sibling package `../qwen_3_8_block/` shares this tree -- the block-sparse d256 core with its paged
-indexer kernels (the fused prepare, the compress step, the paged scorer, the decode top-k) and their DSL-free hosts (the `QSA`
-selection package), ten files the dense forms of this package never run; every file keeps its NVIDIA SPDX header, MIT or
-Apache-2.0), with only the import roots rewritten and six declared patches (P0-P2, exact text, replace the nanobind extension's
-seams, P3 rewords twenty-four comment lines that named internal hosts, file paths or workflow vocabulary, P5-P6 prune what the subset
+since the Qwen 3.8 Flash-Next sibling package `../qwen_3_8_block/` shares this tree -- the block-sparse d256 core with its two bodies
+(the tcgen05 core and the lean decode tile, plus the visible-set helper they share), its paged indexer kernels (the fused prepare, the
+compress step, the paged scorer, the decode top-k, and -- the indexer's EXTEND step since the `4c8e24355` pin -- the dense kbar gather
+and the canonical-order kernel) with their DSL-free hosts (the `QSA` selection package) and the `deepseek_sparse_attention/` indexer
+scorer + top-k subtree that EXTEND step scores through (38 files: `indexer_forward/`, `indexer_top_k/`, `score_recompute/`, `utils/`),
+fifty-four files the dense forms of this package never run, and the packed forms' THD-origins module; every file keeps its NVIDIA SPDX
+header, MIT or Apache-2.0), with only the import roots rewritten and six declared patches (P0-P2, exact text, replace the nanobind extension's
+seams, P3 rewords twenty-three comment lines that named internal hosts, file paths or workflow vocabulary, P5-P6 prune what the subset
 does not carry -- the `gemm` package's lazy exports and the sm120 arch family; P4, which carried the cache-write launcher's
 one-device check ahead of its upstream landing, is retired now that the pinned commit carries it; all listed in
 `_cudnn_frost/VENDOR.md`; per-file digests in `_cudnn_frost/VENDOR_MANIFEST.json`).
 Pinned revision: cuDNN Frontend
-`f2aa360e5` on its `develop` branch (1.32.0: everything of the previous pins `d8b0a7ed5` / `b4664a2d4` -- the Rubin decode levers, the
+`6b21be0e0` on its `develop` branch (1.33.0: everything of the previous pins `4c8e24355` / `977757763` / `7301fad21` / `f2aa360e5` / `d8b0a7ed5` / `b4664a2d4` -- the Rubin decode levers, the
 independent K / V paged-pool layouts, the split-prefix scheduling of paged packed attention, the decode step's measured defaults on cc 10.7
 (programmatic dependent launch on the decode tile's routes, the paged write-through folded into the norm + RoPE launch below 128 rows), the
 in-block QSA indexer's DECODE step over the pools that the Qwen 3.8 sibling binds: the indexer band on the small-M projection route, the
 fused prepare with the paged side-cache arms, the paged scorer, the decode top-k and the decode-grid split combine of the block-sparse
 core --, plus, on `develop`: the block-sparse decode schedule's split rule (the wave rule), the programmatic-dependent-launch sites of
 the block-sparse chain (served under the caller-list form, off by default), the e4m3 compressed-key cache arms of the compress and
-scorer kernels (served by the tree; the sibling entry declines that dtype by name until its own surface lands), the DSL-free front door
-`_tupledict.py`, and the `QSA` selection package (the paged scorer's DSL-free hosts moved there from `gated_attention_block/`).
+scorer kernels (served by the tree, and by the Qwen 3.8 sibling's forms since the 4c8e24355 pin; the e4m3 KV pool stays a named decline), the DSL-free front door
+`_tupledict.py`, and the `QSA` selection package (the paged scorer's DSL-free hosts moved there from `gated_attention_block/`); since the
+`7301fad21` pin, the LEAN decode tile of the block-sparse core (`sdpa/fwd/kernels/sm107/sparse_lean_d256_f16.py`, behind the sibling entry's
+`sparse_tile_form` knob with its measured AUTO default on cc 10.7) with the visible-set helper it shares with the tcgen05 core, the
+packed forms' THD-origins module (`sdpa/fwd/kernels/thd_origins.py`: the per-role physical origins of a packed declaration, which this
+package's Python binder does not gather -- the shim's origin flags read False and such a plan is declined by name) and the SDPA stack's
+other `develop` changes between those pins (the d192 / d576 dense forms, the paged FP8 THD origins, the sm107 FP8 D64 arm: none of them on
+this package's routes); and, at the `977757763` pin, the lean tile's placement bound counted in the lean grid's own unit (`B x H_kv <= 4`
+CTAs per chunk at every served step width; the rule lives in the DSL-free `sdpa/fwd/sparse_tile_rules.py`, the one file this pin adds to
+the closure, re-exported by the heuristics), the lean kernel's `cudnn_` name prefix, the SDPA stack's `develop` changes between `7301fad21`
+and `977757763` (the native SM107 FP8 D192 / D256 forms and split sinks, the native D576 THD forms, the paged D128 native pipeline, the
+prepared THD host's ordered binding and physical origins: none of them on this package's routes -- the extension's three new binder
+capability flags they bring, the quantized split sink and the native D576 packed forms, read False in the shim and are declined by name
+through this package's Python binder) and the FROST GEMM compiler's MoE-side change (qualified bulk reductions in the combine; the kernel
+templates of the closure byte-identical); at the `4c8e24355` pin, the in-block indexer's EXTEND step over the pools that the Qwen 3.8
+sibling binds as its `extend` / `prefill` forms (the chunk compress with the ring read-only, the dense kbar gather and the canonical-order
+kernel -- the two files `gated_attention_block/kernels/qsa_kbar_gather.py` / `qsa_canonical_list.py` this pin adds --, the compact-logits
+scorer + fused radix top-k of the `deepseek_sparse_attention/` subtree it scores through -- 38 files this pin adds, vendored by the import
+trace of that route --, the `index_select_form` declaration knob, the `QsaSpec.index_compress_rounding` attribute naming every indexer
+writer's rounding points, the cache-write stage's ring arm), the staged rounding mode of the fused split-combine store and the DSL-free
+sparse tile rules it reads, the batch-1 gate-layout declaration fix, the FP8-projection mode of the dense serving forms (declared by the
+tree, not exposed by either package), the SDPA stack's `develop` changes between `977757763` and `4c8e24355` (the mixed-precision fp8 KV
+pools, the ragged Q lengths of the padded decode leg, the non-paged d128 split origins and the per-role origin caps: none of them on these
+packages' routes -- the extension's five new binder capability flags they bring read False in the shim and are declined by name through
+this package's Python binder, whose vendored reference frame implementation moved with them) and two SDPA host modules the changed
+adapters then imported (`sdpa/layout.py`, `sdpa/native_sm80.py`); and, at this pin (`6b21be0e0`), the projection GEMM driver's large-M
+rule (the indexer-band slab of the Qwen 3.8 sibling takes the GEMM engine's own baseline tile for its shape past 128 rows on the same
+JIT-only route, capture-safe and flag-free -- the sibling's `extend` / `prefill` forms at any chunk length; the rule reads the planner
+envelope the tile catalog now publishes, so the graph-route planner stays out of the closure), the GEMM engine's operand-transpose
+normalization with its layout helper `gemm/frost/layouts.py` (the one file this pin adds: a module-level dependency of the engine's graph
+analyzer and recipe), the SDPA stack's 32-bit offset widening (its graph validator; the sm120 backward kernels it touched are not vendored)
+and a docstring note on the measured cost of the fused store's staged rounding mode (`sdpa/fwd/sparse_gqa_sm107.py`).
 The dense forms of this package are unchanged by the re-vendor (their files are byte-identical to the previous pin's except the block's
-`api.py` / package roots, the SDPA adapter's configuration and heuristics tables and the shared `tile_dsl` helpers, which carry the
-changes above; the GEMM compiler and its templates are byte-identical).
+`api.py` and its projection GEMM driver, the graph IR and its GEMM validator, the GEMM engine's compiler / dtypes / graph analyzer / recipe
+/ tile catalog, and the sparse adapter's docstring -- 10 changed files in all, none of them a kernel; every kernel, `tile_dsl` helper and
+template is byte-identical to the previous pin's).
 `qwen_3_5_block_support(...).source` reports the pin at runtime. The deployed process never imports the
 `cudnn` package nor the cuDNN library: the one native piece of that route, the SDPA launch binder, is served in Python
 (`_sdpa_binder.py`, built on cuDNN Frontend's own retired Python binder implementation vendored from its test tree). The
@@ -237,7 +299,12 @@ plan and workspace retained, `clear_plan_cache()` their release), cached steps u
 declines at plan time and at run time, the compiled-plan cache's location and reload path, the weight packer at TP 1 / 2 / 4 / 8
 (bitwise the cuDNN Frontend loader), the RoPE table helper, the plan cache's ownership contract on CPU (an eager-only plan freed
 at eviction, a captured one retained and revived, a cold bucket under capture refused) and the import-isolation test (the
-`cudnn` package blocked).
+`cudnn` package blocked). The Qwen3.8-27B dense member (24 / 4 at `d_model` 5120, `test_dense_27b.py`): decode `q_len` 1 at page 16
+and 4 at page 32 at batch 1 and 4 (a padded entry among them, contexts to 2048 keys) on the packed decode tile's claimed routes, a
+512-token extend step with an empty prefix and a 512-token chunk behind a 512-row cached prefix, the dense prefill at 512 tokens, the
+probe's verdict and the typed declines around the geometry; the packed K|V pool (`kv_layout="UNIFIED"`) bitwise the two-tensor HND
+pool holding the same bytes on the decode and the extend forms, its half views' identity and strides, and every malformed packed
+pool refused by name.
 Validated on an SM107 (cc 10.7) GPU with `nvidia-cutlass-dsl` 4.8.0 and torch 2.14 in a Python environment without the
 cudnn-frontend package; the public and internal CI matrices have no SM107 runner, so the GPU tests skip there and the CPU tests
 (support, weights, RoPE, plan cache, isolation) run everywhere. The CI image policy now pins `nvidia-cutlass-dsl` 4.8.0;

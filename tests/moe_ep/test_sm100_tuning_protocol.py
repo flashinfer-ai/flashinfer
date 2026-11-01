@@ -276,6 +276,7 @@ def test_standard_grid_is_complete_unique_and_fixed_numerics(kind):
 
 
 def test_genphase_grid_retains_geometries_hints_and_constraints():
+    """Keep each admitted geometry and scheduling hint under knob constraints."""
     cfg = Sm100GenphaseMoeConfig(
         num_total_experts=8,
         max_tokens_per_rank=128,
@@ -287,7 +288,7 @@ def test_genphase_grid_retains_geometries_hints_and_constraints():
     )
     candidates = tuning.sm100_genphase_candidates(cfg, sm_count=148, live_tokens=4)
     assert len(candidates) == 12
-    for tile, cluster in tuning._GEOMETRIES:
+    for tile, cluster in cfg.admitted_geometries:
         hints = {
             c["schedule_policy"][1]
             for c in candidates

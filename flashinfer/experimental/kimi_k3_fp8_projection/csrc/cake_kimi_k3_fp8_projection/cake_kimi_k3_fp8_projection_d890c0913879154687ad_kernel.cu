@@ -543,10 +543,10 @@ kernel_cake_kimi_k3_fp8_projection_d890c0913879154687ad(const __grid_constant__ 
                 unsigned int epi_base = smem_epi_addr + (unsigned int)(epi_group * 8192);
                 if (split == 1) {
                     #pragma unroll
-                    for (int t = 0; t < 16; t++) {
+                    for (int t_0 = 0; t_0 < 16; t_0++) {
                         {
-                            uint32_t _addr_0 = static_cast<uint32_t>(smem_epi_addr + (unsigned int)(epi_group * 8192 + t * 512 + lane_row * 4));
-                            asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_0), "f"(_tmem_load_0[t]) : "memory");
+                            uint32_t _addr_0 = static_cast<uint32_t>(smem_epi_addr + (unsigned int)(epi_group * 8192 + t_0 * 512 + lane_row * 4));
+                            asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_0), "f"(_tmem_load_0[t_0]) : "memory");
                         }
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
@@ -554,113 +554,113 @@ kernel_cake_kimi_k3_fp8_projection_d890c0913879154687ad(const __grid_constant__ 
                     if (store_vec == 8) {
                         #pragma unroll
                         for (int j = 0; j < 2; j++) {
-                            int idx8 = j * 128 + epi_tid;
-                            int row8 = idx8 >> 4;
-                            int f8 = (idx8 & 15) * 8;
-                            unsigned int words8[8];
+                            int idx = j * 128 + epi_tid;
+                            int row = idx >> 4;
+                            int f = (idx & 15) * 8;
+                            unsigned int words[8];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&words8[0])), "=r"(*reinterpret_cast<uint32_t*>(&words8[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words8[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words8[(0) + 3]))
-                                : "r"(epi_base + (unsigned int)(row8 * 512 + f8 * 4)));
+                                : "=r"(*reinterpret_cast<uint32_t*>(&words[0])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words[(0) + 3]))
+                                : "r"(epi_base + (unsigned int)(row * 512 + f * 4)));
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&words8[4])), "=r"(*reinterpret_cast<uint32_t*>(&words8[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words8[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words8[(4) + 3]))
-                                : "r"(epi_base + (unsigned int)(row8 * 512 + f8 * 4 + 16)));
-                            float vals8[8];
+                                : "=r"(*reinterpret_cast<uint32_t*>(&words[4])), "=r"(*reinterpret_cast<uint32_t*>(&words[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words[(4) + 3]))
+                                : "r"(epi_base + (unsigned int)(row * 512 + f * 4 + 16)));
+                            float vals[8];
                             #pragma unroll
                             for (int q = 0; q < 8; q++) {
-                                float v8 = 0.0f;
-                                unsigned int _bit_cast_src_1 = words8[q];
-                                v8 = reinterpret_cast<float*>(&_bit_cast_src_1)[0];
-                                vals8[q] = v8;
+                                float v = 0.0f;
+                                unsigned int _bit_cast_src_1 = words[q];
+                                v = reinterpret_cast<float*>(&_bit_cast_src_1)[0];
+                                vals[q] = v;
                             }
-                            int tok8 = tok0 + tok_g0 + row8;
-                            int feat8 = n_tile_e * 128 + f8;
-                            if (tok_g0 + row8 >= 0 && tok_g0 + row8 < 16 && tok8 < M && feat8 < n_valid) {
-                                unsigned int _packed_0[4];
+                            int tok_w = tok0 + tok_g0 + row;
+                            int feat = n_tile_e * 128 + f;
+                            if (tok_g0 + row >= 0 && tok_g0 + row < 16 && tok_w < M && feat < n_valid) {
+                                unsigned int packed[4];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals8[_lp*2 + 0], vals8[_lp*2+1 + 0]));
-                                    _packed_0[_lp] = *(uint32_t*)&_bf2;
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 0], vals[_lp*2+1 + 0]));
+                                    packed[_lp] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals8[_lp*2 + 2], vals8[_lp*2+1 + 2]));
-                                    _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 2], vals[_lp*2+1 + 2]));
+                                    packed[_lp + 1] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals8[_lp*2 + 4], vals8[_lp*2+1 + 4]));
-                                    _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 4], vals[_lp*2+1 + 4]));
+                                    packed[_lp + 2] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals8[_lp*2 + 6], vals8[_lp*2+1 + 6]));
-                                    _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals[_lp*2 + 6], vals[_lp*2+1 + 6]));
+                                    packed[_lp + 3] = *(uint32_t*)&_bf2;
                                 }
-                                reinterpret_cast<int4*>(out + ((unsigned long long)tok8 * (unsigned long long)ldo + (unsigned long long)feat8))[0] = reinterpret_cast<int4*>(_packed_0)[0];
+                                reinterpret_cast<int4*>(out + ((unsigned long long)tok_w * (unsigned long long)ldo + (unsigned long long)feat))[0] = reinterpret_cast<int4*>(packed)[0];
                             }
                         }
                     } else if (store_vec == 4) {
                         #pragma unroll
                         for (int j_1 = 0; j_1 < 4; j_1++) {
-                            int idx4 = j_1 * 128 + epi_tid;
-                            int row4 = idx4 >> 5;
-                            int f4 = (idx4 & 31) * 4;
-                            unsigned int words4[4];
+                            int idx_1 = j_1 * 128 + epi_tid;
+                            int row_1 = idx_1 >> 5;
+                            int f_1 = (idx_1 & 31) * 4;
+                            unsigned int words_1[4];
                             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&words4[0])), "=r"(*reinterpret_cast<uint32_t*>(&words4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words4[(0) + 3]))
-                                : "r"(epi_base + (unsigned int)(row4 * 512 + f4 * 4)));
-                            float vals4[4];
+                                : "=r"(*reinterpret_cast<uint32_t*>(&words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 3]))
+                                : "r"(epi_base + (unsigned int)(row_1 * 512 + f_1 * 4)));
+                            float vals_1[4];
                             #pragma unroll
                             for (int q_1 = 0; q_1 < 4; q_1++) {
-                                float v4 = 0.0f;
-                                unsigned int _bit_cast_src_2 = words4[q_1];
-                                v4 = reinterpret_cast<float*>(&_bit_cast_src_2)[0];
-                                vals4[q_1] = v4;
+                                float v_1 = 0.0f;
+                                unsigned int _bit_cast_src_2 = words_1[q_1];
+                                v_1 = reinterpret_cast<float*>(&_bit_cast_src_2)[0];
+                                vals_1[q_1] = v_1;
                             }
-                            int tok4 = tok0 + tok_g0 + row4;
-                            int feat4 = n_tile_e * 128 + f4;
-                            if (tok_g0 + row4 >= 0 && tok_g0 + row4 < 16 && tok4 < M && feat4 < n_valid) {
-                                unsigned int _packed_1[2];
+                            int tok_w_1 = tok0 + tok_g0 + row_1;
+                            int feat_1 = n_tile_e * 128 + f_1;
+                            if (tok_g0 + row_1 >= 0 && tok_g0 + row_1 < 16 && tok_w_1 < M && feat_1 < n_valid) {
+                                unsigned int packed_1[2];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals4[_lp*2 + 0], vals4[_lp*2+1 + 0]));
-                                    _packed_1[_lp] = *(uint32_t*)&_bf2;
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_1[_lp*2 + 0], vals_1[_lp*2+1 + 0]));
+                                    packed_1[_lp] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals4[_lp*2 + 2], vals4[_lp*2+1 + 2]));
-                                    _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_1[_lp*2 + 2], vals_1[_lp*2+1 + 2]));
+                                    packed_1[_lp + 1] = *(uint32_t*)&_bf2;
                                 }
-                                reinterpret_cast<int2*>(out + ((unsigned long long)tok4 * (unsigned long long)ldo + (unsigned long long)feat4))[0] = reinterpret_cast<int2*>(_packed_1)[0];
+                                reinterpret_cast<int2*>(out + ((unsigned long long)tok_w_1 * (unsigned long long)ldo + (unsigned long long)feat_1))[0] = reinterpret_cast<int2*>(packed_1)[0];
                             }
                         }
                     } else {
                         #pragma unroll
                         for (int j_2 = 0; j_2 < 8; j_2++) {
-                            int idx2 = j_2 * 128 + epi_tid;
-                            int row2 = idx2 >> 6;
-                            int f2 = (idx2 & 63) * 2;
-                            unsigned int words2[2];
-                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&words2[0])) : "r"(epi_base + (unsigned int)(row2 * 512 + f2 * 4)));
-                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&words2[1])) : "r"(epi_base + (unsigned int)(row2 * 512 + f2 * 4 + 4)));
-                            float vals2[2];
+                            int idx_2 = j_2 * 128 + epi_tid;
+                            int row_2 = idx_2 >> 6;
+                            int f_2 = (idx_2 & 63) * 2;
+                            unsigned int words_2[2];
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&words_2[0])) : "r"(epi_base + (unsigned int)(row_2 * 512 + f_2 * 4)));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&words_2[1])) : "r"(epi_base + (unsigned int)(row_2 * 512 + f_2 * 4 + 4)));
+                            float vals_2[2];
                             #pragma unroll
                             for (int q_2 = 0; q_2 < 2; q_2++) {
-                                float v2 = 0.0f;
-                                unsigned int _bit_cast_src_3 = words2[q_2];
-                                v2 = reinterpret_cast<float*>(&_bit_cast_src_3)[0];
-                                vals2[q_2] = v2;
+                                float v_2 = 0.0f;
+                                unsigned int _bit_cast_src_3 = words_2[q_2];
+                                v_2 = reinterpret_cast<float*>(&_bit_cast_src_3)[0];
+                                vals_2[q_2] = v_2;
                             }
-                            int tok2 = tok0 + tok_g0 + row2;
-                            int feat2 = n_tile_e * 128 + f2;
-                            if (tok_g0 + row2 >= 0 && tok_g0 + row2 < 16 && tok2 < M && feat2 < n_valid) {
-                                unsigned int _packed_2[1];
+                            int tok_w_2 = tok0 + tok_g0 + row_2;
+                            int feat_2 = n_tile_e * 128 + f_2;
+                            if (tok_g0 + row_2 >= 0 && tok_g0 + row_2 < 16 && tok_w_2 < M && feat_2 < n_valid) {
+                                unsigned int packed_2[1];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals2[_lp*2 + 0], vals2[_lp*2+1 + 0]));
-                                    _packed_2[_lp] = *(uint32_t*)&_bf2;
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals_2[_lp*2 + 0], vals_2[_lp*2+1 + 0]));
+                                    packed_2[_lp] = *(uint32_t*)&_bf2;
                                 }
-                                reinterpret_cast<unsigned*>(out + ((unsigned long long)tok2 * (unsigned long long)ldo + (unsigned long long)feat2))[0] = reinterpret_cast<unsigned*>(_packed_2)[0];
+                                reinterpret_cast<unsigned*>(out + ((unsigned long long)tok_w_2 * (unsigned long long)ldo + (unsigned long long)feat_2))[0] = reinterpret_cast<unsigned*>(packed_2)[0];
                             }
                         }
                     }
@@ -668,8 +668,8 @@ kernel_cake_kimi_k3_fp8_projection_d890c0913879154687ad(const __grid_constant__ 
                 } else {
                     unsigned long long pbase = (unsigned long long)(tile_2 * split + rank_2) * 2048 + (unsigned long long)lane_row + (unsigned long long)tok_g0 * 128;
                     #pragma unroll
-                    for (int t_1 = 0; t_1 < 16; t_1++) {
-                        partials[pbase + (unsigned long long)(t_1 * 128)] = _tmem_load_0[t_1];
+                    for (int t = 0; t < 16; t++) {
+                        partials[pbase + (unsigned long long)(t * 128)] = _tmem_load_0[t];
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync 1, 128;" ::: "memory");
@@ -811,45 +811,45 @@ kernel_cake_kimi_k3_fp8_projection_d890c0913879154687ad(const __grid_constant__ 
                         absmax_all[it_2] = _reg_array_reduce_0;
                     }
                     #pragma unroll
+                    for (int it_1_0 = 0; it_1_0 < 2; it_1_0++) {
+                        float o_sh_1_0 = __shfl_xor_sync(0xFFFFFFFF, absmax_all[it_1_0], 1);
+                        absmax_all[it_1_0] = max_noftz(absmax_all[it_1_0], o_sh_1_0);
+                    }
+                    #pragma unroll
+                    for (int it_1_1 = 0; it_1_1 < 2; it_1_1++) {
+                        float o_sh_1_1 = __shfl_xor_sync(0xFFFFFFFF, absmax_all[it_1_1], 2);
+                        absmax_all[it_1_1] = max_noftz(absmax_all[it_1_1], o_sh_1_1);
+                    }
+                    #pragma unroll
+                    for (int it_1_2 = 0; it_1_2 < 2; it_1_2++) {
+                        float o_sh_1_2 = __shfl_xor_sync(0xFFFFFFFF, absmax_all[it_1_2], 4);
+                        absmax_all[it_1_2] = max_noftz(absmax_all[it_1_2], o_sh_1_2);
+                    }
+                    #pragma unroll
+                    for (int it_1_3 = 0; it_1_3 < 2; it_1_3++) {
+                        float o_sh_1_3 = __shfl_xor_sync(0xFFFFFFFF, absmax_all[it_1_3], 8);
+                        absmax_all[it_1_3] = max_noftz(absmax_all[it_1_3], o_sh_1_3);
+                    }
+                    #pragma unroll
                     for (int it_3 = 0; it_3 < 2; it_3++) {
-                        float o_sh = __shfl_xor_sync(0xFFFFFFFF, absmax_all[it_3], 1);
-                        absmax_all[it_3] = max_noftz(absmax_all[it_3], o_sh);
-                    }
-                    #pragma unroll
-                    for (int it_4 = 0; it_4 < 2; it_4++) {
-                        float o_sh_1 = __shfl_xor_sync(0xFFFFFFFF, absmax_all[it_4], 2);
-                        absmax_all[it_4] = max_noftz(absmax_all[it_4], o_sh_1);
-                    }
-                    #pragma unroll
-                    for (int it_5 = 0; it_5 < 2; it_5++) {
-                        float o_sh_2 = __shfl_xor_sync(0xFFFFFFFF, absmax_all[it_5], 4);
-                        absmax_all[it_5] = max_noftz(absmax_all[it_5], o_sh_2);
-                    }
-                    #pragma unroll
-                    for (int it_6 = 0; it_6 < 2; it_6++) {
-                        float o_sh_3 = __shfl_xor_sync(0xFFFFFFFF, absmax_all[it_6], 8);
-                        absmax_all[it_6] = max_noftz(absmax_all[it_6], o_sh_3);
-                    }
-                    #pragma unroll
-                    for (int it_7 = 0; it_7 < 2; it_7++) {
-                        int unit = (it_7 * 8 + qwarp) * 2 + half;
+                        int unit = (it_3 * 8 + qwarp) * 2 + half;
                         int tok_local = unit >> 1;
                         int kb = unit & 1;
                         int tok = tok0_q + tok_local;
-                        float vals[8];
+                        float vals_3[8];
                         #pragma unroll
                         for (int j_6 = 0; j_6 < 4; j_6++) {
-                            unsigned int lo_bits = words_all[4 * it_7 + j_6] << 16;
-                            unsigned int hi_bits = words_all[4 * it_7 + j_6] & 4294901760u;
+                            unsigned int lo_bits = words_all[4 * it_3 + j_6] << 16;
+                            unsigned int hi_bits = words_all[4 * it_3 + j_6] & 4294901760u;
                             float lo = 0.0f;
                             float hi = 0.0f;
                             lo = reinterpret_cast<float*>(&lo_bits)[0];
                             hi = reinterpret_cast<float*>(&hi_bits)[0];
-                            vals[2 * j_6] = lo;
-                            vals[2 * j_6 + 1] = hi;
+                            vals_3[2 * j_6] = lo;
+                            vals_3[2 * j_6 + 1] = hi;
                         }
                         float absmax;
-                        asm("max.f32 %0, %1, %2;" : "=f"(absmax) : "f"(absmax_all[it_7]), "f"(1e-04f));
+                        asm("max.f32 %0, %1, %2;" : "=f"(absmax) : "f"(absmax_all[it_3]), "f"(1e-04f));
                         float scale = absmax / 448.0f;
                         unsigned int scale_bits = __as_u32(scale);
                         unsigned int exponent = scale_bits >> 23 & 255;
@@ -863,15 +863,15 @@ kernel_cake_kimi_k3_fp8_projection_d890c0913879154687ad(const __grid_constant__ 
                         const float2 _scale2_2 = {inverse, inverse};
                         #pragma unroll
                         for (int _ls = 0; _ls < 4; _ls++)
-                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(vals)[_ls], _scale2_2);
+                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(vals_3)[_ls], _scale2_2);
                         uint16_t p0;
-                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(p0) : "f"(vals[1]), "f"(vals[0]));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(p0) : "f"(vals_3[1]), "f"(vals_3[0]));
                         uint16_t p1;
-                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(p1) : "f"(vals[3]), "f"(vals[2]));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(p1) : "f"(vals_3[3]), "f"(vals_3[2]));
                         uint16_t p2;
-                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(p2) : "f"(vals[5]), "f"(vals[4]));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(p2) : "f"(vals_3[5]), "f"(vals_3[4]));
                         uint16_t p3;
-                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(p3) : "f"(vals[7]), "f"(vals[6]));
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(p3) : "f"(vals_3[7]), "f"(vals_3[6]));
                         unsigned int w0_1 = (unsigned int)p0 | (unsigned int)p1 << 16;
                         unsigned int w1 = (unsigned int)p2 | (unsigned int)p3 << 16;
                         unsigned int panel = x_stage + (unsigned int)kb * 4096;

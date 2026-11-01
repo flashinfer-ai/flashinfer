@@ -1,7 +1,7 @@
 """FP8 DSA lightning indexer top-k on SM120: ragged (prefill) and paged (decode)."""
 
 import torch
-from flashinfer.dsa_indexer import dsa_indexer_topk
+from flashinfer.dsa_indexer import dsa_indexer_det_topk
 
 dev, H, D, top_k = "cuda", 64, 128, 2048
 
@@ -17,7 +17,7 @@ cu_q, cu_k = (
     )
     for s in (seg_q, seg_k)
 )
-idx, scores = dsa_indexer_topk(
+idx, scores = dsa_indexer_det_topk(
     q, k, w, cu_q, cu_k, top_k=top_k, backend="sm120", k_scale=k_scale
 )
 
@@ -48,7 +48,7 @@ context_lens = torch.tensor(
 )
 q_dec = torch.randn(B, 1, H, D, device=dev).to(torch.float8_e4m3fn)
 w_dec = torch.randn(B, H, device=dev) * D**-0.5
-idx, scores = dsa_indexer_topk(
+idx, scores = dsa_indexer_det_topk(
     q_dec,
     cache,
     w_dec,

@@ -7416,13 +7416,34 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     supported_activation_classes_by_quant: ClassVar[
         dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
     ] = {
-        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
-        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (
+            SwiGLU,
+            GeGLU,
+            SiTU,
+            ReLU2,
+            SiLU,
+        ),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (
+            SwiGLU,
+            GeGLU,
+            SiTU,
+            ReLU2,
+            SiLU,
+        ),
         (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
-        (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2),
-        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor): (SwiGLU, ReLU2),
+        (QuantFormat.BF16, QuantFormat.BF16): (SwiGLU, ReLU2, SiLU),
+        (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor): (
+            SwiGLU,
+            ReLU2,
+            SiLU,
+        ),
         (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
-        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (
+            SwiGLU,
+            GeGLU,
+            ReLU2,
+            SiLU,
+        ),
     }
 
     def _check_support(self) -> None:
@@ -9476,9 +9497,10 @@ class _CudnnGroupedGemmRunnerBase(MoERunner):
 
     Every expert segment is padded to ``_segment_alignment`` rows; padding rows
     are computed but never read back. Stage buffers hold the token bucket's
-    worst-case row count and every stage covers all of it: cuDNN's grouped GEMM
-    takes segment starts only, so the last expert's segment runs to the end of
-    the buffer.
+    worst-case row count and every stage covers all of it: the cuDNN grouped
+    GEMM offsets (``_cudnn_moe_first_token_offset``: segment starts, or explicit
+    boundaries ending at the buffer's row count) run the last expert's segment
+    to the end of the buffer.
     """
 
     supported_routing_modes = (

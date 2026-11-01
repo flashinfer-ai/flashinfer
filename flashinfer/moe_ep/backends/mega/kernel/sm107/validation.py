@@ -74,7 +74,7 @@ def validate_input_norm_const(value, *, name="input_norm_const") -> None:
 
 
 def validate_nvfp4_scalars(values, *, num_local_experts, device) -> None:
-    """Check local-expert FP32 vectors without host reads or graph breaks."""
+    """Validate FP32 expert vectors, allowing strided inputs for the copy path."""
     for name, value in values.items():
         if value is None:
             continue
@@ -82,10 +82,9 @@ def validate_nvfp4_scalars(values, *, num_local_experts, device) -> None:
             not isinstance(value, torch.Tensor)
             or value.shape != (num_local_experts,)
             or value.dtype != torch.float32
-            or not value.is_contiguous()
         ):
             raise MoEEpConfigError(
-                f"{name} must be a contiguous float32 vector of {num_local_experts} local experts"
+                f"{name} must be a float32 vector of {num_local_experts} local experts"
             )
         if not value.is_cuda or value.device != device:
             raise MoEEpConfigError(
@@ -179,14 +178,14 @@ def validate_forward_metadata(
 def validate_routing_values(
     topk_ids, topk_weights, num_experts: int, *, workspace=None
 ) -> None:
-    """Device assertions run before dispatch unless explicitly disabled.
+    """Check routing values when FLASHINFER_SM107_MEGA_CHECK_ROUTES=1.
 
     Duplicate valid routes violate the router's workspace capacity proof.
     -1 is a masked slot whose score is ignored; all other IDs must be in range
     and have finite scores. A failed CUDA assertion invalidates that worker's
     CUDA context, as with invalid indices in other CUDA indexing operations.
     """
-    if os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1") == "0":
+    if os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0") == "0":
         return
     if (
         topk_ids.is_cuda

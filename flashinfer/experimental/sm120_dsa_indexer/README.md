@@ -1,6 +1,6 @@
 # SM120 DSA indexer top-k
 
-Experimental `backend="sm120"` of `flashinfer.dsa_indexer.dsa_indexer_topk`.
+Experimental `backend="sm120"` of `flashinfer.dsa_indexer.dsa_indexer_det_topk`.
 It computes the DeepSeek Sparse Attention lightning indexer's scores and their
 exact top-k on SM12x GPUs, in two forms: ragged (prefill) and paged (decode),
 each in FP8 or MXFP4. Naming the backend is the opt-in; `backend="auto"` never

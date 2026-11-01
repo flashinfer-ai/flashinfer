@@ -37,6 +37,7 @@ import pytest
 import torch
 
 from flashinfer import utils
+from tests.test_helpers.cake_profiler import cuda_kernel_names
 
 _FP8_MAX = 448.0
 _GROUP = 128
@@ -157,6 +158,16 @@ CONTRACT_CASES = [
     ),
     ("hot_expert_m64_e8_k512_top3_bal0", 64, 256, 512, 8, 3, 8, False, 0.0, 2.5, 28010),
     ("width_n1024_m8_e4_k256_top2", 8, 1024, 256, 4, 2, 8, False, 1.0, 2.5, 28011),
+]
+
+# Plans the host dispatch runs on the CTA-pair variant, at K <= 512 and K >= 1024.
+# (label, M, N, K, E, top_k, block_m, shared_expert, balancedness, scaling, seed)
+PAIR_CASES = [
+    ("pair_m4_k384_e16_top4_bm16", 4, 256, 384, 16, 4, 16, False, 0.8, 2.5, 28020),
+    ("pair_m8_k512_e64_top8", 8, 256, 512, 64, 8, 8, False, 0.8, 1.0, 28021),
+    ("pair_m8_k2048_e64_top8", 8, 256, 2048, 64, 8, 8, False, 0.8, 1.0, 28022),
+    ("pair_m32_k1024_e32_top4_bm16", 32, 256, 1024, 32, 4, 16, False, 0.8, 2.5, 28023),
+    ("pair_m16_k4096_e16_top4_bm16", 16, 256, 4096, 16, 4, 16, False, 0.8, 2.5, 28024),
 ]
 
 
@@ -361,8 +372,8 @@ def _launch(case, *, out=None, num_tokens_post_padded=None):
 
 @pytest.mark.parametrize(
     "label,m,n,k,num_experts,top_k,block_m,shared_expert,balancedness,scaling_factor,seed",
-    CONTRACT_CASES,
-    ids=[case[0] for case in CONTRACT_CASES],
+    CONTRACT_CASES + PAIR_CASES,
+    ids=[case[0] for case in CONTRACT_CASES + PAIR_CASES],
 )
 def test_alphamoe_sm100_matches_reference(
     label,
@@ -510,3 +521,45 @@ def test_alphamoe_sm100_validates_tma_and_output_alignment():
     torch.cuda.synchronize()
     expected = _reference(case)
     assert torch.equal(out, expected)
+
+
+# Busy 8-row route subtiles up to which M <= 8 runs the four-CTA quad variants
+# (QuadClusterCapacity in csrc/alphamoe_sm100.cu), measured per device class by
+# SM count: 74 on GB300 (152 SMs), 71 on B200 (148 SMs). Past it the CTA pair
+# runs.
+_QUAD_CLUSTER_CAPACITY = {148: 71, 152: 74}
+
+
+@pytest.mark.parametrize(
+    "m,top_k,block_m",
+    [
+        (7, 10, 8),
+        (8, 9, 8),
+        (2, 37, 8),
+        (5, 15, 8),
+        (5, 7, 16),
+        (4, 9, 16),
+        (1, 37, 16),
+        (2, 19, 16),
+    ],
+)
+def test_alphamoe_sm100_m8_quad_cluster_capacity(m, top_k, block_m):
+    """M <= 8 at K >= 4096 runs the quad while its busy subtiles fit the device.
+
+    With more experts than routes, the plan's bound on busy 8-row subtiles is
+    m * top_k * block_m / 8. The quad variants run up to the device's measured
+    capacity and the pair above it, so a failed occupancy query (no cap) fails
+    here.
+    """
+    _skip_if_not_sm100_sm103()
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms not in _QUAD_CLUSTER_CAPACITY:
+        pytest.skip(f"no measured quad cluster capacity for {sms} SMs")
+    seed = 29700 + m * top_k + block_m
+    case = _make_case(m, 256, 7168, 257, top_k, block_m, False, 0.8, 1.0, seed)
+    names = cuda_kernel_names(lambda: _launch(case))
+    quad = any("w8a8_i2" in x or "w8a8_im" in x for x in names)
+    pair = any("w8a8_p2" in x or "w8a8_pl" in x for x in names)
+    bound = m * top_k * block_m // 8
+    assert quad != pair, names
+    assert quad == (bound <= _QUAD_CLUSTER_CAPACITY[sms]), (sms, bound, names)

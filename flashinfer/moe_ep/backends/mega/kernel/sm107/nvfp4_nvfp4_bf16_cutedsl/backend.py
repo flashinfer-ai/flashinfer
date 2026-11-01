@@ -52,6 +52,14 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config = config
 
+    @classmethod
+    def create(cls, config):
+        if config.kernel_variant == "auto":
+            from ..variant_selection import RubinVariantBackend
+
+            return RubinVariantBackend(config, cls)
+        return cls(config)
+
     def coordinate_workspace_replacement(
         self, workspace: Sm107BlockScaledSymmBuffer
     ) -> bool:
@@ -233,7 +241,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         )
 
     def _scalar_values(self, t=None):
-        """Resolve per-call tensors, then config defaults; staging fills None with one."""
+        """Resolve per-call scalar tensors ahead of configuration defaults."""
         values = {}
         for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
             override = getattr(t, name, None)
@@ -245,12 +253,9 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
     def stage_inputs(
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
-        validate_routing_values(
-            t.topk_ids,
-            t.topk_weights,
-            workspace.config.num_total_experts,
-            workspace=workspace,
-        )
+        """Stage NVFP4 inputs, fusing eligible route checks with quantization."""
+        if self._kernel_config.knobs == "auto":
+            workspace._tuning_inputs = (t, quantize_input)
         self._stage_scalars(t, workspace)
         if quantize_input:
             staged = stage_mega_moe_inputs(
@@ -262,9 +267,18 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
                 workspace.topk_idx,
                 workspace.topk_weights,
                 input_norm_const=self._kernel_config.input_norm_const,
+                num_experts=workspace.config.num_total_experts,
+                workspace=workspace,
             )
             workspace.note_staged_tokens(staged)
             return
+
+        validate_routing_values(
+            t.topk_ids,
+            t.topk_weights,
+            workspace.config.num_total_experts,
+            workspace=workspace,
+        )
 
         num_tokens = t.hidden_states.shape[0]
         capacity = workspace.x.shape[0]
@@ -295,14 +309,19 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
 
         Contiguous fp32 ``[E_local]`` tensors on the workspace device are BOUND as
         the launch arguments (``workspace.bind_scalars``): no per-call DtoD copies
-        into the pooled workspace tensors (3 launches per MoE layer). Any other
-        value is copied into the workspace tensor and ``None`` resets it to ones,
-        as before; the launch then uses the workspace tensor."""
+        into the pooled workspace tensors (3 launches per MoE layer). ``None``
+        binds a separate, stable ones tensor, preserving defaults after other
+        layers or captured graphs modify the workspace's mutable scalar tensors.
+        Other layouts retain the workspace-copy path."""
         values = self._scalar_values(t)
         bind = hasattr(workspace, "bind_scalars")
+        default = getattr(workspace, "_default_scalar", None)
         bound = {}
         for name, value in values.items():
             target = getattr(workspace, name)
+            if bind and value is None and default is not None:
+                bound[name] = default
+                continue
             if (
                 bind
                 and isinstance(value, torch.Tensor)

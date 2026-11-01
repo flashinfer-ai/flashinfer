@@ -243,7 +243,7 @@ def dsa_indexer_topk(
     return_scores: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """The ragged form (see flashinfer.dsa_indexer.dsa_indexer_topk)."""
+    """The ragged form (see flashinfer.dsa_indexer.dsa_indexer_det_topk)."""
     fp4 = q_scale is not None
     if fp4:
         if q.dtype not in (torch.uint8, torch.int8) or k.dtype not in (
@@ -384,7 +384,7 @@ def dsa_indexer_topk_paged(
     return_scores: bool = True,
     enable_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """The paged form (see flashinfer.dsa_indexer.dsa_indexer_topk).
+    """The paged form (see flashinfer.dsa_indexer.dsa_indexer_det_topk).
 
     q ``[B, next_n, H, 128]`` e4m3, or packed MXFP4 ``[B, next_n, H, 64]`` with
     ``q_scale [B, next_n, H]``; ``context_lens [B, next_n]``; ``max_context_len``

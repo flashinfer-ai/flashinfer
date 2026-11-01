@@ -47,6 +47,25 @@ def _config(**kw):
     )
 
 
+@pytest.mark.parametrize("rubin", [False, True])
+def test_route_staging_fallback_preserves_architecture_score_policy(rubin):
+    from flashinfer.moe_ep.backends.mega.kernel import routing_staging as shared
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import routing_staging
+
+    ids = torch.tensor([[0, -1, -1, -1]])
+    scores = torch.tensor([[0.25, float("nan"), float("inf"), -float("inf")]])
+    ids_out = torch.full((2, 4), -7, dtype=torch.int32)
+    scores_out = torch.full((2, 4), 123.0)
+    stage = routing_staging.stage_routes if rubin else shared.stage_routes
+    stage(ids, scores, ids_out, scores_out, workspace=SimpleNamespace())
+    expected = scores if rubin else scores.masked_fill(ids == -1, 0)
+    torch.testing.assert_close(scores_out[:1], expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.equal(ids_out[:1], ids.to(torch.int32))
+    assert (ids_out[1:] == -7).all() and (scores_out[1:] == 123).all()
+    assert torch.isnan(scores[:, 1]).all()
+    assert torch.isposinf(scores[:, 2]).all() and torch.isneginf(scores[:, 3]).all()
+
+
 def test_mxfp4_weights_have_independent_dtype_and_packing():
     cfg = _config(quant_kind="mxfp4_mxfp8", intermediate=128)
     assert cfg.torch_act_data_dtype == torch.float8_e4m3fn
@@ -314,13 +333,15 @@ def test_sm100_and_sm107_cache_entries_cannot_collide(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("ids", [[[0, 0]], [[-2, 0]], [[0, 8]], [[0, 2**32]]])
-def test_invalid_routes_rejected_before_int32_conversion(ids):
+def test_invalid_routes_rejected_before_int32_conversion(ids, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
     with pytest.raises(RuntimeError, match="unique expert"):
         validate_routing_values(torch.tensor(ids), torch.ones(1, 2), 8)
 
 
 @pytest.mark.parametrize("score", [float("nan"), float("inf"), -float("inf")])
-def test_masked_routes_and_finite_score_contract(score):
+def test_masked_routes_and_finite_score_contract(score, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1")
     validate_routing_values(torch.tensor([[-1, -1], [0, 7]]), torch.ones(2, 2), 8)
     validate_routing_values(
         torch.tensor([[-1, -1], [0, -1]]),
@@ -333,7 +354,7 @@ def test_masked_routes_and_finite_score_contract(score):
 
 @pytest.mark.parametrize("check_routes", [None, "1", "0"])
 @pytest.mark.parametrize("fused", [False, True])
-def test_routing_validation_opt_out(monkeypatch, check_routes, fused):
+def test_routing_validation_opt_in(monkeypatch, check_routes, fused):
     if check_routes is None:
         monkeypatch.delenv("FLASHINFER_SM107_MEGA_CHECK_ROUTES", raising=False)
     else:
@@ -351,7 +372,7 @@ def test_routing_validation_opt_out(monkeypatch, check_routes, fused):
         ids = mock.Mock(is_cuda=True, shape=(1, 2))
         ids.is_contiguous.return_value = True
 
-    if check_routes == "0":
+    if check_routes in (None, "0"):
         validate_routing_values(ids, scores, 8)
         checker.assert_not_called()
     else:

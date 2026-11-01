@@ -54,7 +54,11 @@ Cake stage policy mirrored in
 :func:`flashinfer.cake_fused_qk_rope_fp8_append_backend.stage_for` - every
 build writes bit-identical outputs.  The call is CUDA-graph capturable: every
 launch argument is a by-value scalar or a tensor pointer, no host
-synchronisation, workspace or extra kernel is involved.
+synchronisation, workspace or extra kernel is involved.  With
+``enable_pdl=True`` the call launches a build that waits for the preceding
+kernel on the stream (programmatic dependent launch) where the backend's
+``PDL_POLICY`` admits it; see the ``enable_pdl`` parameter for what the caller
+must guarantee.
 """
 
 from __future__ import annotations
@@ -101,6 +105,8 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
     out_v: Optional[torch.Tensor] = None,
     q_scale: Optional[torch.Tensor] = None,
     split_k_flag: Optional[torch.Tensor] = None,
+    *,
+    enable_pdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Fused Q/K RMSNorm + NeoX RoPE + FP8 quantization + paged K/V append in one launch.
 
@@ -151,6 +157,18 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
     split_k_flag : torch.Tensor, optional
         I32 ``[B, num_kv_heads]`` output buffer; every element is written (0 valid,
         -1 invalid metadata), no host-side clear is needed.
+    enable_pdl : bool
+        Launch with programmatic dependent launch (PDL), so the kernel may start
+        while the immediately preceding kernel on the stream is still running.
+        The kernel then waits for that kernel to complete before it reads ``qkv``
+        and before any store, so ``qkv`` may be written by that kernel.
+        ``q_indptr``, ``seq_lens``, ``page_indices``, ``cos_sin_cache``, the norm
+        weights and the scales ``k_scale``, ``v_scale`` and ``q_scale_inv`` are
+        read before that wait: no kernel that may still be running when this
+        kernel launches may write them.  PDL is used only on SM100 / SM103 and
+        only where it was measured to help (``PDL_POLICY`` of the backend
+        package); every other call launches plainly.  The outputs are bitwise
+        identical either way.  Default ``False``.
 
     Returns
     -------
@@ -179,6 +197,7 @@ def cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache(
         out_v=out_v,
         q_scale=q_scale,
         split_k_flag=split_k_flag,
+        enable_pdl=enable_pdl,
     )
 
 

@@ -235,12 +235,15 @@ def prepare_qwen_3_5_block_bf16(
     w_o : torch.Tensor
         ``[d_model, H_q * head_dim]``.
     kv_cache : torch.Tensor or (torch.Tensor, torch.Tensor)
-        The paged cache the steps will bind (5-D ``[num_pages, 2, ...]`` or a ``(k, v)`` pair; see ``kv_layout``).
+        The paged cache the steps will bind (5-D ``[num_pages, 2, ...]``, a ``(k, v)`` pair, or the stack's packed K|V pool; see
+        ``kv_layout``).
     page_size : int
         A positive multiple of 16 (16 / 32 / 64 / 128 validated).
     batch_size : int
     kv_layout : str
-        ``"NHD"`` (``[num_pages, 2, page_size, H_kv, D]``) or ``"HND"`` (``[num_pages, 2, H_kv, page_size, D]``).
+        ``"NHD"`` (``[num_pages, 2, page_size, H_kv, D]``), ``"HND"`` (``[num_pages, 2, H_kv, page_size, D]``) or ``"UNIFIED"`` (the
+        serving stack's packed K|V pool: ONE ``[num_pages, H_kv, page_size, 2 x D]`` tensor with K at ``[..., :D]`` and V at
+        ``[..., D:]`` of every row, bound as its two half views).
     seq_len : Optional[int]
         prefill: the uniform sequence length.
     token_capacity : Optional[int]
@@ -330,11 +333,12 @@ def qwen_3_5_block_bf16_prefill(
         ``[d_model, H_q * head_dim]``.
     geometry : Qwen35BlockGeometry
     kv_cache : torch.Tensor or (torch.Tensor, torch.Tensor)
-        The paged cache (see ``kv_layout``); the page size is read from its shape.
+        The paged cache (see ``kv_layout``: a 5-D buffer, a ``(k, v)`` pair, or the packed K|V pool); the page size is read from
+        its shape.
     slot_mapping : torch.Tensor
         ``[batch * seq]`` int32 / int64 flat slots (``page * page_size + offset``); a negative slot writes nothing.
     kv_layout : str
-        ``"NHD"`` or ``"HND"``.
+        ``"NHD"``, ``"HND"`` or ``"UNIFIED"`` (as in :func:`prepare_qwen_3_5_block_bf16`).
     out : Optional[torch.Tensor]
         Caller-owned output of ``hidden_states``' shape (allocated when ``None``).
     workspace_buffer : Optional[torch.Tensor]

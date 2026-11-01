@@ -197,3 +197,151 @@ def test_module_records_match_the_binding() -> None:
         assert set(record["arches"]) <= {"sm_100a", "sm_103a"}
         for source in record["sources"]:
             assert (source_dir / source).is_file(), source
+
+
+def _program_table(binding: str, name: str) -> list[str | None]:
+    """Entries of one [dtype][world size index][quant epilogue] table of the binding, in
+    order (float16 then bfloat16; world sizes 2, 4, 8; o110 then o111)."""
+    start = binding.index(f"const void* const {name}[2][3][2] = {{")
+    body = binding[start : binding.index("};", start)]
+    entries = re.findall(r"reinterpret_cast<const void\*>\((\w+)\)|(nullptr)", body)
+    assert len(entries) == 12, (name, entries)
+    return [kernel or None for kernel, _ in entries]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("table", "suffix", "world_sizes"),
+    [
+        ("kSmallKernels", "_small", (2, 4, 8)),
+        ("kKernels", "", (2, 4)),
+        ("kLargeTokenKernels", "_lt", (2,)),
+        ("kTwoShotKernels", "_ts", (4, 8)),
+        ("kTwoShotDeferKernels", "_tsd", (4, 8)),
+    ],
+)
+def test_program_tables_list_one_program_kind(
+    table: str, suffix: str, world_sizes: tuple[int, ...]
+) -> None:
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    entries = iter(_program_table(binding, table))
+    for dtype in ("float16", "bfloat16"):
+        for world_size in (2, 4, 8):
+            for output_profile in ("110", "111"):
+                expected = (
+                    f"kernel_cake_trtllm_moe_finalize_{dtype}_ws{world_size}"
+                    f"_o{output_profile}{suffix}"
+                    if world_size in world_sizes
+                    else None
+                )
+                assert next(entries) == expected
+
+
+@pytest.mark.cpu_only
+def test_program_tables_cover_the_module_records() -> None:
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    tabled = [
+        kernel
+        for table in (
+            "kSmallKernels",
+            "kKernels",
+            "kLargeTokenKernels",
+            "kTwoShotKernels",
+            "kTwoShotDeferKernels",
+        )
+        for kernel in _program_table(binding, table)
+        if kernel is not None
+    ]
+    assert len(tabled) == len(set(tabled))
+    assert set(tabled) == {
+        record["kernel"] for record in cake_moe_finalize_comm.MODULES.values()
+    }
+
+
+def _small_token_test(binding: str) -> tuple[str, str]:
+    """The binding's small_token_extended class term and the condition of the branch
+    that runs the small-token program, as Python expressions over the call's world_size,
+    top_k, v_has_shared_expert, tokens and small_token_max, the binding's constant
+    kSmallTokenExtendedMax and the device's small-token cluster capacity (capacity)."""
+    extended = re.search(r"const bool small_token_extended =\s*([^;]+);", binding)
+    branch = re.search(
+        r"\} else if \((tokens <= small_token_max \|\|.*?)\) \{", binding, re.S
+    )
+    assert extended is not None and branch is not None
+    expressions = tuple(
+        " ".join(match.group(1).split())
+        .replace("cluster_capacity(small_token)", "capacity")
+        .replace("&&", "and")
+        .replace("||", "or")
+        for match in (extended, branch)
+    )
+    names = {
+        "world_size",
+        "top_k",
+        "v_has_shared_expert",
+        "tokens",
+        "small_token_max",
+        "small_token_extended",
+        "kSmallTokenExtendedMax",
+        "capacity",
+        "and",
+        "or",
+    }
+    for expression in expressions:
+        assert set(re.findall(r"[A-Za-z_]\w*", expression)) <= names, expression
+        assert set(re.sub(r"[\w\s]|==|!=|<=|\(|\)", "", expression)) == set()
+    return expressions
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("small_token_max", [16, 64])
+def test_small_token_extension_covers_every_class_at_world_size_4(
+    small_token_max: int,
+) -> None:
+    """Above small_token_max, up to kSmallTokenExtendedMax tokens within the small-token
+    program's cluster capacity run the small-token program at world size 4 for every
+    class, at world size 2 for every class but top_k 4 without a shared expert, and
+    never at world size 8."""
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    extended_max = re.findall(
+        r"^constexpr int64_t kSmallTokenExtendedMax = (\d+);$", binding, re.M
+    )
+    assert extended_max == ["71"]
+    extended_expression, branch_expression = _small_token_test(binding)
+    extended_code = compile(extended_expression, "small_token_extended", "eval")
+    branch_code = compile(branch_expression, "small_token_branch", "eval")
+    for world_size in (2, 4, 8):
+        for top_k in (4, 8):
+            for use_shared in (False, True):
+                scope: dict[str, object] = {
+                    "world_size": world_size,
+                    "top_k": top_k,
+                    "v_has_shared_expert": int(use_shared),
+                    "small_token_max": small_token_max,
+                    "kSmallTokenExtendedMax": 71,
+                }
+                extended = world_size == 4 or (
+                    world_size == 2 and (top_k != 4 or use_shared)
+                )
+                scope["small_token_extended"] = eval(
+                    extended_code, {"__builtins__": {}}, scope
+                )
+                assert scope["small_token_extended"] == extended
+                for capacity in (0, small_token_max + 1, 70, 71, 148):
+                    for tokens in range(1, 80):
+                        scope.update(tokens=tokens, capacity=capacity)
+                        expected = tokens <= small_token_max or (
+                            extended and tokens <= 71 and tokens <= capacity
+                        )
+                        assert (
+                            eval(branch_code, {"__builtins__": {}}, scope) == expected
+                        ), (world_size, top_k, use_shared, capacity, tokens)
