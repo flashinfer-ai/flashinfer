@@ -5408,9 +5408,29 @@ def test_attention_ts_context_empty_mla_chunk(dtype):
     torch.testing.assert_close(out[:65], torch.zeros_like(out[:65]), atol=0, rtol=0)
     assert torch.isneginf(stats[:65, :, 0]).all()
     assert (stats[:65, :, 1] == 0).all()
-    scores = torch.einsum("qhd,khd->qhk", q[65:].float(), k.float()) / math.sqrt(192)
-    expected = torch.einsum("qhk,khd->qhd", scores.softmax(-1), v.float())
-    torch.testing.assert_close(out[65:].float(), expected, atol=0.01, rtol=0.02)
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        scores = torch.einsum("qhd,khd->qhk", q[65:].float(), k.float()) / math.sqrt(
+            192
+        )
+        expected = torch.einsum("qhk,khd->qhd", scores.softmax(-1), v.float())
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+    # FP8 PV rounds probabilities even when the output dtype is BF16.
+    fp8 = dtype == torch.float8_e4m3fn
+    atol, rtol = (0.13, 0.05) if fp8 else (0.01, 0.02)
+    actual = out[65:].float()
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    if fp8:
+        relative_l2 = torch.linalg.vector_norm(
+            actual - expected
+        ) / torch.linalg.vector_norm(expected)
+        assert relative_l2 < 0.05
+    maximum = scores.amax(-1)
+    denominator = (scores - maximum[..., None]).exp().sum(-1)
+    expected_stats = torch.stack((maximum, denominator), -1)
+    torch.testing.assert_close(stats[65:], expected_stats, atol=0.002, rtol=0.002)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
