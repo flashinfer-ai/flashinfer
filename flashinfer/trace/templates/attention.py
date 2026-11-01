@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1694,9 +1695,51 @@ prims_ts_decode_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-de
 )
 
 
+def _with_prims_ts_mla_kv_bounds(
+    template: TraceTemplate, *, enabled: bool, packed_query: bool
+) -> TraceTemplate:
+    """Describe explicit per-query prefixes rather than bottom-right causality."""
+    if enabled:
+        template.name_prefix += "_kv_bounds"
+        template.axes["use_kv_bounds"] = Const(abbrev="", value=1)
+        template.axes["num_kv_bounds"] = Var(description="Number of logical Q tokens.")
+        template.inputs["kv_bounds"] = Tensor(
+            ["num_kv_bounds"],
+            dtype="int32",
+            description=(
+                "Per-query KV prefix counts, shared by all heads. Nondecreasing "
+                "within each request and in [0, seq_lens_kv[request]]. Overrides mask_type."
+            ),
+        )
+        template.constraints.append(
+            "num_kv_bounds == total_q"
+            if packed_query
+            else "num_kv_bounds == batch_size * seq_len_q"
+        )
+        template.constraints = [
+            "min(seq_lens_kv) >= 0" if item == "min(seq_lens_kv) >= 1" else item
+            for item in template.constraints
+        ]
+        if "min(seq_lens_kv) >= 0" not in template.constraints:
+            template.constraints.append("min(seq_lens_kv) >= 0")
+        if "causal" in template.axes:
+            template.axes["causal"] = Const(abbrev="", value=0)
+        template.tags = [tag for tag in template.tags if not tag.startswith("mask:")]
+        template.tags.append("mask:kv_prefix")
+        template.description += (
+            " Explicit kv_bounds replaces dense/causal visibility. Zero prefixes "
+            "produce zero output and, when requested, softmax stats (-inf, 0)."
+        )
+    return template
+
+
 @lru_cache(maxsize=None)
 def _make_prims_ts_decode_mla_one_shot_trace(
-    *, rank4_cache: bool, packed_query: bool, store_softmax_stats: bool = False
+    *,
+    rank4_cache: bool,
+    packed_query: bool,
+    store_softmax_stats: bool = False,
+    use_kv_bounds: bool = False,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
@@ -1778,8 +1821,12 @@ def _make_prims_ts_decode_mla_one_shot_trace(
         ],
         tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
     )
-    return _with_prims_ts_softmax_stats(
-        template, enabled=store_softmax_stats, one_shot=True
+    return _with_prims_ts_mla_kv_bounds(
+        _with_prims_ts_softmax_stats(
+            template, enabled=store_softmax_stats, one_shot=True
+        ),
+        enabled=use_kv_bounds,
+        packed_query=packed_query,
     )
 
 
@@ -1798,6 +1845,7 @@ def prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs):
         rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
         packed_query=kwargs.get("qo_indptr") is not None,
         store_softmax_stats=bool(kwargs.get("store_softmax_stats", False)),
+        use_kv_bounds=kwargs.get("kv_bounds") is not None,
     )
 
 
@@ -1817,6 +1865,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
     store_softmax_stats: bool = False,
+    use_kv_bounds: bool = False,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
@@ -1965,7 +2014,11 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             *threshold_tags,
         ],
     )
-    return _with_prims_ts_softmax_stats(template, enabled=store_softmax_stats)
+    return _with_prims_ts_mla_kv_bounds(
+        _with_prims_ts_softmax_stats(template, enabled=store_softmax_stats),
+        enabled=use_kv_bounds,
+        packed_query=packed_query,
+    )
 
 
 # Finite examples support trace discovery and schema-consistency tests. Bound
@@ -1999,6 +2052,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
     store_softmax_stats: bool = False,
+    use_kv_bounds: bool = False,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen MLA plan identity."""
 
@@ -2012,6 +2066,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         store_softmax_stats=store_softmax_stats,
+        use_kv_bounds=use_kv_bounds,
     )
 
 
@@ -2029,10 +2084,12 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
     if state is None:
         raise RuntimeError("plan() must be called before run()")
     packed_query = bool(state.packed_query)
+    use_kv_bounds = bool(getattr(state, "use_kv_bounds", False))
     required_metadata = (
         "block_tables",
         "seq_lens_kv",
         *(("qo_indptr",) if packed_query else ()),
+        *(("kv_bounds",) if use_kv_bounds else ()),
     )
     _require_bound_trace_tensors(
         kwargs,
@@ -2053,6 +2110,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
             getattr(state, "softmax_rescale_threshold_log2", 0.0)
         ),
         store_softmax_stats=bool(getattr(state, "store_softmax_stats", False)),
+        use_kv_bounds=use_kv_bounds,
     )
 
 

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -104,6 +105,7 @@ class MlaConfig(Nvfp4KVConfig):
     # Causal is bottom-right aligned for speculative decode. Dense keeps only
     # the ordinary per-batch KV-tail predicate.
     mask_type: str = MaskType.CAUSAL.value
+    use_kv_bounds: bool = False
     # Threshold skip correction in log2 units (binades; 0 disables it): freeze
     # the running row max while a K tile raises it by at most this
     # compile-time amount and skip that tile's O rescale.  E4M3 P then uses

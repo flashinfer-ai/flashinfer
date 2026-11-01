@@ -199,6 +199,17 @@ shape, dtype, stride, capacity, page-ID, offset, aliasing and lifetime condition
 Output/LSE/workspace must be disjoint from inputs and live buffers. Update live
 metadata only between completed launches/replays and remain within plan bounds.
 
+### Per-query KV prefixes for MLA decode
+
+MLA decode supports `plan(use_kv_bounds=True)` with per-run `kv_bounds`:
+contiguous CUDA int32 counts shaped `[B * SQ]` for fixed Q or `[total_q]` for
+packed Q. Counts are shared across a token's heads, replace dense/causal
+visibility, and must be nondecreasing within each request and no larger than
+that request's `seq_lens_kv`. Zero local lengths and prefixes return zero O
+and optional `(-inf, 0)` statistics. Bounds are per-run metadata, not retained
+plan values. See the [MLA contract](kernels/mla_decode/README.md) for validation,
+empty-cache, and workspace details.
+
 ### Merge-compatible softmax statistics
 
 Contiguous/paged prefill, paged FMHA decode, and paged MLA decode accept

@@ -136,6 +136,31 @@ scratch includes the matching raw-state exchange.
 Statistics require an exact maximum (`softmax_rescale_threshold_log2=0`), which
 is the dense default. Nonzero deferred-max tuning with statistics enabled is
 rejected before allocation; stats-disabled tuning is unchanged. Sparse/NVFP4
-entry points do not expose this option. As in the ordinary dense API, zero-KV
+entry points do not expose this option. Without per-query bounds, zero-KV
 requests are inactive and preserve caller buffers. Fully masked active rows
 export `(-inf, 0)`; an all-empty packed-Q launch remains a no-op.
+
+## Per-query local-KV prefixes
+
+Dense MLA `plan(use_kv_bounds=True)` specializes a graph-live `kv_bounds` input.
+It is a contiguous, 4-byte-aligned CUDA int32 vector with one count per logical
+query token: `[B*SQ]` for fixed Q and `[total_q]` for packed Q. All heads of a
+token share its bound. Bounds must be nondecreasing within each request and
+lie in `[0, seq_lens_kv[b]]`; they replace both dense and bottom-right causal
+visibility, rather than intersecting the selected mask. The raw local-KV
+length still determines producer/reducer split partitioning, preserving FP8
+probability quantization across the same split/instance streams.
+
+Supply bounds exactly when enabled, including with `validate=False`. Validation
+checks structure and values outside capture; trusted runs perform no host
+readback. Retain the vector and mutate its contents between completed launches
+or graph replays. A zero prefix writes zero O, optional LSE `-inf`, and optional
+merge statistics `(-inf, 0)`. A bounds-only neutral initialization launch also
+covers requests with zero local KV when the ordinary task schedule skips them.
+Unbounded zero-KV behavior is unchanged. The static K/V capacity remains
+positive; the one-shot API defaults it to one for an all-empty bounded rank.
+
+Per-query prefixes add no scratch and do not alter the public return type.
+Sparse/NVFP4 entry points remain outside this option's scope. The bounds
+specialization is independent of LSE/statistics; existing constraints on
+statistics and nonzero rescale thresholds still apply.

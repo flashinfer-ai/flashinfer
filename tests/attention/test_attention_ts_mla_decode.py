@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -367,6 +368,7 @@ def _fp8_request_reference(
     splits_kv: int,
     softmax_rescale_threshold_log2: float = 0.0,
     freeze: bool = True,
+    visible_kv_len: int | None = None,
 ) -> torch.Tensor:
     """Model E4M3 P across split-local KV instruction streams.
 
@@ -391,6 +393,14 @@ def _fp8_request_reference(
         + q_stored[:, _LATENT_DIM:] @ cache_stored[:, _LATENT_DIM:].T
     )
     num_qo_heads, seq_len = scores.shape
+    visible = seq_len if visible_kv_len is None else visible_kv_len
+    if not 0 <= visible <= seq_len:
+        raise ValueError("visible_kv_len must be within the raw KV sequence")
+    if visible == 0:
+        return torch.zeros(
+            (num_qo_heads, _LATENT_DIM), dtype=torch.float32, device=scores.device
+        )
+    # Mask inside raw-KV split streams; trimming K changes FP8 quantization.
     num_tiles = (seq_len + tile_size_kv - 1) // tile_size_kv
     tiles_per_group = splits_kv * num_insts_kv
     groups_per_split = (num_tiles + tiles_per_group - 1) // tiles_per_group
@@ -417,7 +427,9 @@ def _fp8_request_reference(
     for stream_idx, tile_indices in enumerate(stream_tiles):
         for tile_idx in tile_indices:
             begin = tile_idx * tile_size_kv
-            end = min(begin + tile_size_kv, seq_len)
+            if begin >= visible:
+                continue
+            end = min(begin + tile_size_kv, visible)
             tile_scores = scores[:, begin:end]
             local_max = tile_scores.max(dim=-1).values
             new_max = (
@@ -1268,6 +1280,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "mask_type",
         "lse_mode",
         "store_softmax_stats",
+        "use_kv_bounds",
         "workspace_buffer",
         "validate",
         "tuning",
@@ -1287,6 +1300,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "block_tables",
         "seq_lens_kv",
         "qo_indptr",
+        "kv_bounds",
     ):
         assert request_metadata not in plan_parameters
 
@@ -1299,6 +1313,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "seq_lens_kv",
         "qo_indptr",
         "max_q_len",
+        "kv_bounds",
         "softmax_scale",
         "output_scale",
         "out",
@@ -1313,7 +1328,10 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
     assert plan_parameters["store_softmax_stats"].default is False
+    assert plan_parameters["use_kv_bounds"].default is False
     assert run_parameters["softmax_stats"].default is None
+    assert run_parameters["kv_bounds"].default is None
+    assert run_parameters["kv_bounds"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 @pytest.mark.parametrize("split_kv", (1, 4, 64))
@@ -1466,7 +1484,7 @@ def test_mla_stats_preserves_persisted_launch_optional_argument_slots(packed, wi
         max_q_len=3,
         softmax_stats=stats,
     )
-    assert result is output and len(calls) == 1 and len(calls[0]) == 17
+    assert result is output and len(calls) == 1 and len(calls[0]) == 18
     args = calls[0]
     assert args[12:16] == (0.25, 0.75, None, 3)
     assert args[16].data_ptr() == stats.data_ptr()
@@ -1514,10 +1532,11 @@ def test_mla_stats_compile_and_reload_use_the_same_optional_argument_order():
     )
 
     for kernel in (MlaDecodeTs, ThroughputLatencyMlaDecodeTs):
-        assert tuple(inspect.signature(kernel.__call__).parameters)[-3:] == (
+        assert tuple(inspect.signature(kernel.__call__).parameters)[-4:] == (
             "output_quant_args",
             "max_q_len",
             "softmax_stats",
+            "kv_bounds",
         )
     tree = ast.parse(inspect.getsource(mla_decode_module._get_compiled_mla_decode))
     calls = [
@@ -1530,9 +1549,10 @@ def test_mla_stats_compile_and_reload_use_the_same_optional_argument_order():
     ]
     assert len(calls) == 1
     call = calls[0]
-    assert ast.unparse(call.args[-3]) == "output_quant_args"
-    assert ast.unparse(call.args[-2]) == "cutlass.Int32(0)"
-    assert ast.unparse(call.args[-1]) == "stats_fake"
+    assert ast.unparse(call.args[-4]) == "output_quant_args"
+    assert ast.unparse(call.args[-3]) == "cutlass.Int32(0)"
+    assert ast.unparse(call.args[-2]) == "stats_fake"
+    assert ast.unparse(call.args[-1]) == "bounds_fake"
     assert {kw.arg for kw in call.keywords} == {"options"}
 
 
@@ -1635,6 +1655,7 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
         max_kv_len=64,
         kv_lora_rank=_LATENT_DIM,
         qk_rope_head_dim=_ROPE_DIM,
+        use_kv_bounds=False,
     )
     for required_name in ("block_tables", "seq_lens_kv", "qo_indptr"):
         incomplete_kwargs = dict(kwargs)
@@ -1744,9 +1765,11 @@ def test_attention_ts_mla_run_requires_plan():
 
 
 @pytest.mark.parametrize("store_softmax_stats", (False, True))
+@pytest.mark.parametrize("use_kv_bounds", (False, True))
 def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
     monkeypatch,
     store_softmax_stats,
+    use_kv_bounds,
 ):
     """Leave validation outside compiled and captured MLA run regions."""
 
@@ -1768,10 +1791,12 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         compiled=object(),
         lse_mode="none",
         store_softmax_stats=store_softmax_stats,
+        use_kv_bounds=use_kv_bounds,
     )
     runtime = _empty_mla_runtime()
     sentinel = torch.empty(1)
     stats = torch.empty((1, 1, 8, 2)) if store_softmax_stats else None
+    bounds = torch.ones(1, dtype=torch.int32) if use_kv_bounds else None
 
     def fail_validation(*args, **kwargs):
         pytest.fail("validate=False must bypass explicit runtime validators")
@@ -1782,6 +1807,7 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
 
     def launch(*args, **kwargs):
         assert kwargs["softmax_stats"] is stats
+        assert kwargs["kv_bounds"] is bounds
         return sentinel
 
     monkeypatch.setattr(mla_decode_module, "_prepare_mla_runtime", prepare_runtime)
@@ -1789,10 +1815,19 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         mla_decode_module, "_validate_mla_run_metadata", fail_validation
     )
     monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", launch)
+    monkeypatch.setattr(torch.Tensor, "tolist", fail_validation)
 
     tensor = torch.empty((1, 1, 8, _LATENT_DIM + _ROPE_DIM))
     assert (
-        wrapper.run(tensor, tensor, tensor, tensor, validate=False, softmax_stats=stats)
+        wrapper.run(
+            tensor,
+            tensor,
+            tensor,
+            tensor,
+            validate=False,
+            softmax_stats=stats,
+            kv_bounds=bounds,
+        )
         is sentinel
     )
     with pytest.raises(TypeError, match="validate must be a bool"):

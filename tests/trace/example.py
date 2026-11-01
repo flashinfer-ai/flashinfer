@@ -92,6 +92,7 @@ prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_sq4_maxq4_maxk2048_wl
 prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_causal_plan_seq_lens_sq4_maxq4_maxk2048_wl-1_pf1_um1_h32_kv4_d128_sps4_ps32.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_one_shot_softmax_stats_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
+prims_ts_decode_mla_one_shot_softmax_stats_kv_bounds_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
@@ -2887,6 +2888,22 @@ with contextlib.suppress(Exception):
         mask_type="causal",
         store_softmax_stats=True,
         softmax_stats=torch.empty((*_pmla_q.shape[:-1], 2), device=device),
+    )
+    _attention_ts_mla_decode.fi_trace(
+        query=_pmla_q,
+        kv_cache=_pmla_cache,
+        block_tables=_pmla_block_tables,
+        seq_lens_kv=_pmla_seq_lens,
+        max_q_len=_pmla_SQ,
+        max_kv_len=_pmla_SK,
+        kv_lora_rank=_pmla_CKV,
+        qk_rope_head_dim=_pmla_KPE,
+        mask_type="causal",
+        store_softmax_stats=True,
+        softmax_stats=torch.empty((*_pmla_q.shape[:-1], 2), device=device),
+        kv_bounds=torch.arange(
+            _pmla_SK - _pmla_SQ + 1, _pmla_SK + 1, dtype=torch.int32, device=device
+        ).repeat(_pmla_B),
     )
 
     _attention_ts_mla_decode(
