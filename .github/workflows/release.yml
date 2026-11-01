@@ -584,9 +584,15 @@ jobs:
 
       - name: Update wheel index
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
         run: |
+          RELEASE_ID=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq .id)
+          gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}/assets?per_page=100" \
+            --jq '.[] | {name, created_at}' | jq -s . > release-assets.json
           python3 scripts/update_whl_index.py \
+            --release-assets release-assets.json \
             --dist-dir dist \
             --output-dir flashinfer-whl \
             --release-tag "${RELEASE_TAG}"
