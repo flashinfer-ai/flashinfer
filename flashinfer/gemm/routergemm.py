@@ -1624,6 +1624,285 @@ def get_tinygemm2_tcgen05_op():
     return tinygemm2_tcgen05_op
 
 
+# tinygemm2_wgmma: generated sm_90a wgmma programs (flashinfer.jit.cake_tinygemm2_wgmma)
+# with the reference's output bits.  They keep the reference's four K chains (the
+# 256-wide input chunk j on chain j % 4), the K16 order within a chain and its +0
+# start, and sum the chains and the bias in the reference's order with the same
+# flushing adds, so a routed call returns exactly what the reference returns.
+# Seven tiles, as (batch rows, output features) per CTA:
+#
+# * PACKED_U4 and PACKED_S8 pack the four chains of 16 output features into one
+#   M64 wgmma; PACKED_U4 issues four input slices per ring stage (four stages),
+#   PACKED_S8 one (eight stages).
+# * ACCUMULATORS_CN16 and ACCUMULATORS_CN32 keep one accumulator per chain for
+#   64 output features and 16 or 32 batch rows.
+# * CLUSTER_S2U4, CLUSTER_S8U8 and CLUSTER_R2 run each chain that has a chunk
+#   inside the input on its own CTA of a cluster of min(4, ceil(K / 256)) CTAs and
+#   sum the chains in rank 0; CLUSTER_S8U8 serves inputs over 768 (a cluster of
+#   four) and CLUSTER_R2 (32 output features) inputs up to 256 (one CTA).
+#
+# The packed tiles and ACCUMULATORS_CN32 load the four chains' boxes of an input
+# slice with one tensor-map copy when the input is a multiple of 1024 (the _BOX3D
+# programs); the cluster tiles read the input through 64-wide blocks when it is a
+# multiple of 64, and CLUSTER_S2U4 through its _2D programs otherwise.
+_TINYGEMM2_WGMMA_TILES = {
+    "PACKED_U4": (8, 16),
+    "PACKED_S8": (8, 16),
+    "ACCUMULATORS_CN16": (16, 64),
+    "ACCUMULATORS_CN32": (32, 64),
+    "CLUSTER_S2U4": (8, 16),
+    "CLUSTER_S8U8": (8, 16),
+    "CLUSTER_R2": (16, 32),
+}
+_WGMMA_BOX3D_TILES = ("PACKED_U4", "PACKED_S8", "ACCUMULATORS_CN32")
+_WGMMA_CLUSTER_TILES = ("CLUSTER_S2U4", "CLUSTER_S8U8", "CLUSTER_R2")
+
+
+class _WgmmaWindow(NamedTuple):
+    """Shapes one sm_90a tile serves: every bound inclusive."""
+
+    tile: str
+    min_batch: int
+    max_batch: int
+    bias: bool
+    min_output_features: int
+    max_output_features: int
+    min_input_features: int
+    max_input_features: int
+
+    def admits(
+        self, batch: int, out_features: int, in_features: int, bias: bool
+    ) -> bool:
+        return (
+            self.min_batch <= batch <= self.max_batch
+            and self.bias == bias
+            and self.min_output_features <= out_features <= self.max_output_features
+            and self.min_input_features <= in_features <= self.max_input_features
+        )
+
+
+# The windows where a tile measured at least 3% faster than the reference kernel
+# on H100 at every measured shape (9 batches, 7 output and 8 input feature counts,
+# with and without a bias, in each input view the host may select), in every one
+# of up to four measurements; the first window admitting a shape selects its
+# tile, and every other shape keeps the reference.  The bounds are the measured
+# values: a shape between two measured values is served only when a window spans
+# both.  The packed tiles serve inputs that are multiples of 64 only: off that
+# step they measured at parity.
+_TINYGEMM2_WGMMA_WINDOWS: Tuple[_WgmmaWindow, ...] = (
+    _WgmmaWindow("CLUSTER_S2U4", 1, 16, False, 16, 512, 256, 720),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 64, False, 16, 128, 256, 720),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 64, False, 16, 512, 256, 256),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 8, False, 16, 4096, 256, 256),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 16, False, 16, 2048, 256, 256),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 32, False, 16, 1024, 256, 256),
+    _WgmmaWindow("CLUSTER_R2", 64, 64, False, 1024, 4096, 256, 256),
+    _WgmmaWindow("CLUSTER_R2", 32, 64, False, 2048, 4096, 256, 256),
+    _WgmmaWindow("CLUSTER_R2", 13, 64, False, 2880, 4096, 256, 256),
+    _WgmmaWindow("ACCUMULATORS_CN16", 64, 64, False, 512, 2048, 720, 720),
+    _WgmmaWindow("CLUSTER_S2U4", 2, 4, False, 16, 4096, 256, 720),
+    _WgmmaWindow("ACCUMULATORS_CN16", 32, 64, False, 1024, 2048, 720, 720),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 8, False, 2048, 4096, 256, 720),
+    _WgmmaWindow("ACCUMULATORS_CN16", 13, 32, False, 2048, 4096, 720, 720),
+    _WgmmaWindow("ACCUMULATORS_CN32", 64, 64, False, 2048, 4096, 720, 720),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 8, False, 16, 16, 256, 2048),
+    _WgmmaWindow("PACKED_U4", 16, 16, False, 16, 512, 1024, 1024),
+    _WgmmaWindow("PACKED_U4", 1, 4, False, 16, 512, 1024, 1024),
+    _WgmmaWindow("PACKED_U4", 1, 8, False, 16, 128, 1024, 1024),
+    _WgmmaWindow("PACKED_U4", 8, 32, False, 128, 512, 1024, 1024),
+    _WgmmaWindow("PACKED_U4", 32, 64, False, 128, 128, 1024, 4096),
+    _WgmmaWindow("PACKED_S8", 64, 64, False, 512, 512, 1024, 14336),
+    _WgmmaWindow("PACKED_S8", 32, 32, False, 1024, 1024, 1024, 14336),
+    _WgmmaWindow("ACCUMULATORS_CN16", 64, 64, False, 1024, 2048, 720, 14336),
+    _WgmmaWindow("PACKED_S8", 13, 16, False, 2048, 2048, 1024, 14336),
+    _WgmmaWindow("ACCUMULATORS_CN16", 16, 64, False, 2048, 2048, 720, 1024),
+    _WgmmaWindow("PACKED_S8", 1, 7, False, 2880, 4096, 1024, 1024),
+    _WgmmaWindow("PACKED_S8", 2, 8, False, 2880, 2880, 1024, 4096),
+    _WgmmaWindow("ACCUMULATORS_CN16", 13, 32, False, 2880, 4096, 720, 14336),
+    _WgmmaWindow("ACCUMULATORS_CN32", 64, 64, False, 2880, 4096, 720, 14336),
+    _WgmmaWindow("ACCUMULATORS_CN16", 1, 32, False, 4096, 4096, 1024, 2048),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 16, False, 16, 128, 2048, 2048),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 64, False, 16, 16, 2048, 2048),
+    _WgmmaWindow("PACKED_U4", 1, 4, False, 512, 512, 1024, 2048),
+    _WgmmaWindow("PACKED_U4", 2, 32, False, 512, 512, 2048, 2880),
+    _WgmmaWindow("PACKED_U4", 8, 16, False, 512, 1024, 2048, 2048),
+    _WgmmaWindow("PACKED_S8", 1, 1, False, 2048, 2048, 2048, 2048),
+    _WgmmaWindow("PACKED_S8", 7, 8, False, 2048, 4096, 2048, 2048),
+    _WgmmaWindow("ACCUMULATORS_CN16", 32, 64, False, 2048, 2048, 720, 14336),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 4, False, 2880, 2880, 256, 2048),
+    _WgmmaWindow("CLUSTER_S8U8", 1, 16, False, 16, 128, 2880, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 1, 64, False, 16, 16, 2880, 14336),
+    _WgmmaWindow("PACKED_U4", 13, 16, False, 512, 1024, 2048, 4096),
+    _WgmmaWindow("PACKED_S8", 1, 8, False, 2880, 4096, 2880, 4096),
+    _WgmmaWindow("PACKED_U4", 7, 32, False, 512, 512, 2048, 4096),
+    _WgmmaWindow("PACKED_U4", 32, 32, False, 512, 512, 1024, 14336),
+    _WgmmaWindow("PACKED_U4", 13, 16, False, 1024, 1024, 2048, 14336),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 4, False, 2880, 2880, 4096, 7168),
+    _WgmmaWindow("PACKED_S8", 4, 8, False, 2880, 2880, 1024, 7168),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 16, True, 16, 2048, 256, 720),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 64, True, 16, 128, 256, 720),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 64, True, 16, 512, 256, 256),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 32, True, 16, 1024, 256, 256),
+    _WgmmaWindow("CLUSTER_R2", 64, 64, True, 1024, 4096, 256, 256),
+    _WgmmaWindow("CLUSTER_R2", 32, 64, True, 2048, 4096, 256, 256),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 8, True, 16, 4096, 256, 720),
+    _WgmmaWindow("CLUSTER_R2", 13, 64, True, 2880, 4096, 256, 256),
+    _WgmmaWindow("ACCUMULATORS_CN16", 64, 64, True, 512, 2048, 720, 1024),
+    _WgmmaWindow("ACCUMULATORS_CN16", 32, 64, True, 1024, 2048, 720, 1024),
+    _WgmmaWindow("ACCUMULATORS_CN16", 13, 32, True, 2880, 4096, 720, 14336),
+    _WgmmaWindow("ACCUMULATORS_CN32", 64, 64, True, 2048, 4096, 720, 720),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 8, True, 16, 16, 256, 2048),
+    _WgmmaWindow("CLUSTER_S2U4", 16, 16, True, 16, 128, 256, 2048),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 1, True, 16, 128, 256, 2048),
+    _WgmmaWindow("ACCUMULATORS_CN16", 13, 32, True, 2048, 4096, 1024, 1024),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 8, True, 2880, 2880, 256, 2048),
+    _WgmmaWindow("ACCUMULATORS_CN32", 64, 64, True, 2880, 4096, 720, 14336),
+    _WgmmaWindow("ACCUMULATORS_CN16", 1, 32, True, 4096, 4096, 1024, 2048),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 16, True, 16, 128, 2048, 2048),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 64, True, 16, 16, 2048, 2048),
+    _WgmmaWindow("PACKED_S8", 64, 64, True, 512, 512, 2048, 14336),
+    _WgmmaWindow("PACKED_U4", 16, 16, True, 1024, 1024, 2048, 14336),
+    _WgmmaWindow("PACKED_S8", 32, 32, True, 1024, 1024, 2048, 14336),
+    _WgmmaWindow("ACCUMULATORS_CN16", 64, 64, True, 1024, 2048, 720, 14336),
+    _WgmmaWindow("PACKED_S8", 13, 16, True, 2048, 2048, 2048, 14336),
+    _WgmmaWindow("ACCUMULATORS_CN16", 32, 64, True, 2048, 2048, 720, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 1, 16, True, 16, 128, 2880, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 1, 64, True, 16, 16, 2880, 14336),
+    _WgmmaWindow("PACKED_U4", 13, 16, True, 1024, 1024, 2880, 14336),
+    _WgmmaWindow("PACKED_S8", 1, 8, True, 2880, 4096, 2880, 2880),
+    _WgmmaWindow("PACKED_U4", 32, 32, True, 128, 512, 4096, 4096),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 8, True, 2880, 2880, 4096, 4096),
+    _WgmmaWindow("PACKED_S8", 1, 8, True, 4096, 4096, 2880, 4096),
+    _WgmmaWindow("CLUSTER_S2U4", 1, 1, True, 2880, 2880, 256, 7168),
+    _WgmmaWindow("PACKED_U4", 32, 32, True, 512, 512, 14336, 14336),
+)
+
+
+@functools.cache
+def _tinygemm2_wgmma_enabled(
+    disabled: str, compute_capability: Tuple[int, int]
+) -> bool:
+    if disabled == "1" or compute_capability != (9, 0):
+        return False
+    return version_at_least(torch.version.cuda, "12.8")
+
+
+@functools.cache
+def _tinygemm2_wgmma_identifier(
+    batch: int, out_features: int, in_features: int, has_bias: bool, use_pdl: bool
+) -> Optional[str]:
+    """The program of the first window admitting the shape, or ``None``:
+    evaluated once per shape, so a call does not scan the windows."""
+    for window in _TINYGEMM2_WGMMA_WINDOWS:
+        if window.admits(batch, out_features, in_features, has_bias):
+            tile = window.tile
+            break
+    else:
+        return None
+    if tile.startswith("PACKED") and in_features % 64 != 0:
+        return None
+    program = tile
+    if tile in _WGMMA_BOX3D_TILES and in_features % 1024 == 0:
+        program += "_BOX3D"
+    if tile in _WGMMA_CLUSTER_TILES:
+        if in_features % 64 != 0:
+            if tile != "CLUSTER_S2U4":
+                return None
+            program += "_2D"
+        cluster = min(4, -(-in_features // 256))
+        if (tile == "CLUSTER_S8U8" and cluster != 4) or (
+            tile == "CLUSTER_R2" and cluster != 1
+        ):
+            return None
+        program += f"_C{cluster}"
+    return program + ("" if has_bias else "_NOBIAS") + ("_PDL" if use_pdl else "")
+
+
+def _tinygemm2_wgmma_program(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    has_bias: bool,
+    use_pdl: bool,
+) -> Optional[str]:
+    """The identifier of the generated sm_90a program serving the call, or ``None``."""
+    if not _tinygemm2_wgmma_enabled(
+        os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_WGMMA", "0"),
+        get_compute_capability(input.device),
+    ):
+        return None
+    batch, in_features = input.shape
+    # The programs read the weight and the activations through tensor maps: 16-byte
+    # aligned bases and rows.
+    if (
+        batch == 0
+        or in_features % 8 != 0
+        or input.data_ptr() % 16 != 0
+        or weight.data_ptr() % 16 != 0
+    ):
+        return None
+    return _tinygemm2_wgmma_identifier(
+        batch, weight.shape[0], in_features, has_bias, use_pdl
+    )
+
+
+def _tinygemm2_wgmma_tile(program: str) -> str:
+    """The tile of a program identifier."""
+    for tile in sorted(_TINYGEMM2_WGMMA_TILES, key=len, reverse=True):
+        if program.startswith(tile):
+            return tile
+    raise ValueError(f"no tinygemm2_wgmma tile for {program}")
+
+
+@functools.cache
+def get_tinygemm2_wgmma_op():
+    from ..jit import cake_tinygemm2_wgmma as programs
+
+    @register_custom_op(
+        "flashinfer::tinygemm2_wgmma_op",
+        mutates_args=["out"],
+    )
+    def tinygemm2_wgmma_op(
+        program: str,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        out: torch.Tensor,
+    ) -> None:
+        record = getattr(programs, program)
+        tile = _tinygemm2_wgmma_tile(program)
+        rows, features = _TINYGEMM2_WGMMA_TILES[tile]
+        batch, in_features = input.shape
+        out_features = weight.shape[0]
+        # A cluster program launches one CTA per chain with a chunk inside the input.
+        cluster = min(4, -(-in_features // 256)) if tile in _WGMMA_CLUSTER_TILES else 1
+        target = record.target_for(get_compute_capability(input.device))
+        # The generated binding's arguments by name (``CakeProgram.args`` orders
+        # them).  A program without the bias never reads ``bias``; ``out`` stands
+        # in for it.
+        values = {
+            "W": weight,
+            "X": input,
+            "out": out,
+            "bias": out if bias is None else bias,
+            "M": out_features,
+            "N": batch,
+            "K": in_features,
+            "grid_x": cluster * ((batch + rows - 1) // rows),
+            "grid_y": (out_features + features - 1) // features,
+            "grid_z": 1,
+        }
+        if set(record.args) != set(values):
+            raise RuntimeError(
+                f"the generated {record.name} binding takes {list(record.args)}; "
+                f"the host spells {sorted(values)}"
+            )
+        entry = record.entry(target)
+        with torch.cuda.device(input.device), tvm_ffi.use_torch_stream():
+            entry(*[values[name] for name in record.args])
+
+    return tinygemm2_wgmma_op
+
+
 def _tinygemm_bf16_cake(
     program: str,
     input: torch.Tensor,
@@ -1633,8 +1912,11 @@ def _tinygemm_bf16_cake(
     *,
     backend: Literal["cake"],
 ) -> None:
-    """Launches the generated tcgen05 program ``program`` (the Cake backend)."""
-    get_tinygemm2_tcgen05_op()(program, input, weight, bias, out)
+    """Launches the generated tcgen05 or wgmma program ``program`` (the Cake backend)."""
+    if get_compute_capability(input.device) == (9, 0):
+        get_tinygemm2_wgmma_op()(program, input, weight, bias, out)
+    else:
+        get_tinygemm2_tcgen05_op()(program, input, weight, bias, out)
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
@@ -1695,8 +1977,15 @@ def tinygemm_bf16(
     generated tcgen05 programs whose outputs are bit-identical to the
     reference's (``flashinfer.jit.cake_tinygemm2_tcgen05``).  Set
     ``FLASHINFER_DISABLE_TINYGEMM2_TCGEN05=1`` to keep the kernels above.
+
+    On SM90 (H100/H200 class) devices, the shapes the measured windows name
+    dispatch to ``tinygemm2_wgmma``: generated wgmma programs whose outputs are
+    bit-identical to the reference's (``flashinfer.jit.cake_tinygemm2_wgmma``).
+    Set ``FLASHINFER_DISABLE_TINYGEMM2_WGMMA=1`` to keep the reference kernel.
     """
-    program = _tinygemm2_tcgen05_program(input, weight, out, bias is not None, use_pdl)
+    program = _tinygemm2_wgmma_program(
+        input, weight, bias is not None, use_pdl
+    ) or _tinygemm2_tcgen05_program(input, weight, out, bias is not None, use_pdl)
     if program is not None:
         _tinygemm_bf16_cake(program, input, weight, bias, out, backend="cake")
     elif bias is None:
