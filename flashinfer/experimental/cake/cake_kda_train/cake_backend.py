@@ -149,6 +149,60 @@ reduce in a fixed order and use no atomic adds.  The checkpoint replay
 (``saved=None``) and a saved-set backward can select different pairs on some
 rows (:data:`cake_jit.S1_RECORDS`); their ``dg`` then differ by FP32 rounding,
 and every other gradient is bitwise the same.
+
+Checkpoint hand-off (``chunk_kda(..., checkpoint_handoff="auto" | "on" |
+"off")``).  Under ``torch.utils.checkpoint`` (reentrant or not) the forward
+that torch re-runs inside the backward keeps its light saved set and launches
+and also writes the ``h`` / ``v_new`` tapes, keeps the forward's ``w`` (where
+the plan launches a WY program) and the segment transfers.  It publishes them
+in a per-device record keyed by the saved ``Aqk`` and stamped with the inputs
+(pointer, shape, stride, dtype; versions through aliases the record holds),
+the plan, the stream and the graph task.  The node's backward takes the record
+when every stamp matches and runs the tape path from it (the light path's prep
+record; no ``wy`` where the record carries ``w``); otherwise it drops the
+record and runs the light path.  ``"auto"`` (the default) engages at the head
+counts of :data:`HANDOFF_HEADS` on the (architecture, SM count, Cake build
+toolkit) devices of :data:`HANDOFF_VERIFIED`, ``"on"`` on every call it
+supports, ``"off"`` never; ``CAKE_KDA_CKPT_HANDOFF`` (``off`` / ``on``, read
+by :func:`chunk_kda` at each call) turns every call off or ``"auto"`` into
+``"on"``.  A per-device byte budget (two
+records of the call's shape) admits a record before its writes; untaken
+records are dropped at the end of the graph task (or by the next forward
+outside any backward), and repeated misses turn the hand-off off on the
+device.  The original forward, an arena option, ``doc_lengths``, the tape
+saved set, CUDA-graph capture, ``torch.compile``, compiled autograd and Python
+dispatch modes take the light path.
+
+Row records.  The registry maps each forward intra record to a twin
+(:data:`cake_jit.HANDOFF_TWINS`: the same program built to also write every
+``gk`` row and the internal ``beta``; no rule selects it).  A recompute may
+launch the twin instead, and its record then also keeps ``gk``, ``kg``,
+``beta_int`` and, where the backward still launches ``wy``, ``kb``: a row
+record (a record of the tapes alone is a tape record).  The backward from a
+row record launches no prep: the record supplies its outputs, and one fill
+kernel zeroes the ``dv2`` pad rows the prep would zero.  The recompute asks
+for a row record on the (architecture, SM count, full toolkit version) devices
+of :data:`HANDOFF_ROWS_VERIFIED` (none yet) at the head counts of
+:data:`HANDOFF_HEADS`, without a caller workspace, when the twin, its parent
+and the light prep come from one build (all prebuilt, or all JIT-built with
+nothing prebuilt) and the twin loads; otherwise it asks for a tape record.  A
+recompute that asks for a tape record is admitted within two tape records of
+the call's shape, one that asks for a row record within the larger of that and
+one row record.  A recompute whose row record does not fit asks for a tape
+record; a tape record that does not fit first turns the live row records of
+the device into tape records (it drops their rows).  A taken record's backward runs on
+a per-call arena of its one layout (``bwd_tape``, or :data:`HANDOFF_LAYOUT`
+without the ``gk`` and ``beta_int`` slots).
+
+Tape WY twin.  The tape backward (a version-2 saved set, or a hand-off record
+without the forward's ``w``) takes ``v_new`` from the tape, so nothing it
+launches reads the ``u`` its WY record also writes.  The registry maps that
+record to a twin (:data:`cake_jit.TAPE_TWINS`: the same program without the
+``u`` half, writing the same ``w``; no rule selects it), which the tape
+backward launches in its place on the (architecture, SM count, full toolkit
+version) devices of :data:`TAPE_WY_VERIFIED` (none yet), when the twin and the
+WY record come from one build and the twin loads; otherwise it launches the
+WY record.  The launch count, the arena and the gradients do not change.
 """
 
 from __future__ import annotations
@@ -157,6 +211,10 @@ import collections
 import contextlib
 import dataclasses
 import functools
+import os
+import re
+import subprocess
+import sys
 import threading
 import types
 import weakref
@@ -193,6 +251,10 @@ MODES = ("fwd", "fwd_tape", "bwd", "bwd_tape", "replay", "replay_tape")
 # replay-only buffers, with the tail stages split into ``tail_passes`` chunk ranges (per-pass buffers sized for one
 # range).  Not in :data:`MODES`: a lean workspace serves no replay.
 LEAN_MODES = ("bwd_lean", "bwd_tape_lean")
+# The backward layout of a checkpoint hand-off row record: ``bwd_tape`` without the ``gk`` and ``beta_int`` slots (the
+# record supplies both; 516 B less per internal token-head).  Not in :data:`MODES`: the hand-off's per-call workspace
+# is sized for it alone, and a caller's backward arena holds it.
+HANDOFF_LAYOUT = "bwd_handoff"
 # The forward layouts a forward-only workspace (``backward=False``) can be sized for (:class:`KdaWorkspace`
 # ``fwd_layout``): the forward's own and the context-parallel route's (``fwd_kcp``, :data:`FWD_KCP_SLOTS`; light
 # only, not in :data:`MODES`: this module's forward never runs on it).
@@ -534,6 +596,49 @@ class Plan:
         """The path of the backward from this plan's own light saved set: ``"light_states"`` when the forward
         saves the segment-boundary states (:attr:`seg_save`), else ``"light"``."""
         return "light_states" if self.seg_save else "light"
+
+    @property
+    def handoff_keeps_w(self) -> bool:
+        """Whether a checkpoint hand-off record of this plan carries the forward's ``w`` (its backward then launches
+        no ``wy``): the light set carries it (:attr:`light_saves_wu`), or the saving forward launches a WY program
+        (``wy_fwd`` on the ``fwd`` path; the fused serial recurrence ``fwdh_wy_rows`` writes no ``w``)."""
+        return self.light_saves_wu or self.dispatched("wy_fwd", "fwd")
+
+    @property
+    def handoff_twin(self) -> str | None:
+        """The intra record a hand-off recompute that writes a row record launches in place of the saving
+        forward's (:data:`cake_jit.HANDOFF_TWINS` of ``record("fwd_intra", "fwd")``: the same program that also
+        writes every ``gk`` row and the internal ``beta``), ``None`` where the twin is not delivered for this
+        architecture."""
+        twin = cake_jit.HANDOFF_TWINS.get(self.record("fwd_intra", "fwd"))
+        record = None if twin is None else cake_jit.MODULES.get(twin)
+        return twin if record is not None and self.arch in record["arches"] else None
+
+    @property
+    def tape_wy_twin(self) -> str | None:
+        """The WY record a tape backward of this plan may launch in place of its own (:data:`cake_jit.TAPE_TWINS`
+        of ``record("wy", "tape")``: the same program without the ``u`` half, which nothing on the tape path reads),
+        ``None`` where the tape path launches no WY program or the twin is not delivered for this architecture.
+        Whether a call launches it is :func:`_tape_wy_record`'s rule."""
+        if not self.dispatched("wy", "tape"):
+            return None
+        twin = cake_jit.TAPE_TWINS.get(self.record("wy", "tape"))
+        record = None if twin is None else cake_jit.MODULES.get(twin)
+        return twin if record is not None and self.arch in record["arches"] else None
+
+    def handoff_bytes(self, rows: bool = False) -> int:
+        """Device bytes one checkpoint hand-off record of this plan adds to the light saved set
+        (:func:`_handoff_bytes`); ``rows``: a row record (``kb`` too where :attr:`handoff_keeps_w` is false)."""
+        return _handoff_bytes(
+            self.NC_pad,
+            self.R,
+            self.H,
+            self.NSEG,
+            self.S,
+            fwd_w=self.dispatched("wy_fwd", "fwd") and not self.light_saves_wu,
+            rows=rows,
+            kb=rows and not self.handoff_keeps_w,
+        )
 
     def stages(self, path: str) -> tuple[str, ...]:
         """The stages ``path`` launches on this plan, in registry order (the tables included; ``seg_carry`` on the
@@ -952,6 +1057,36 @@ def seg_states_saved(S: int, NSEG: int) -> bool:
     return int(NSEG) > 0 and int(S) >= SEG_SAVE_MIN_TOKENS_PER_SEG * int(NSEG)
 
 
+def _handoff_bytes(
+    NC_pad: int,
+    R: int,
+    H: int,
+    NSEG: int,
+    S: int,
+    *,
+    fwd_w: bool,
+    rows: bool = False,
+    kb: bool = False,
+) -> int:
+    """Device bytes of one checkpoint hand-off record beyond the light saved set: the ``h`` tape BF16 ``[NC_pad,
+    H, 128, 128]`` and ``v_new`` BF16 ``[R, H, 128]``, the forward's ``w`` BF16 ``[R, H, 128]`` where the record
+    allocates it (``fwd_w``: the forward launches a WY program and the light set carries no ``w``) and, on the
+    segmented route when the light set saves no states, the forward's ``seg_state`` FP32 ``[2, NSEG, H, 128,
+    128]`` (the record keeps its transfer half; the light set's own ``seg_state`` serves otherwise).  A row
+    record (``rows``) adds ``gk`` FP32 and ``kg`` BF16 ``[R, H, 128]`` and ``beta_int`` FP32 ``[R, H]`` (772 B per
+    internal token-head) and, with ``kb``, ``kb`` BF16 ``[R, H, 128]`` (256 B more)."""
+    total = NC_pad * H * D * D * 2 + R * H * D * 2
+    if fwd_w:
+        total += R * H * D * 2
+    if NSEG and not seg_states_saved(S, NSEG):
+        total += 2 * NSEG * H * D * D * 4
+    if rows:
+        total += R * H * (D * 4 + D * 2 + 4)
+    if kb:
+        total += R * H * D * 2
+    return total
+
+
 def arena_for_budget(
     p: Plan,
     arena_budget_bytes: int,
@@ -1214,6 +1349,8 @@ SLOTS: dict[str, tuple[tuple[Occupant, ...], ...]] = {
     "replay_tape": BWD_TAPE_SLOTS,
     "fwd_kcp": FWD_KCP_SLOTS,
 }
+# the backward from a hand-off row record: the record's gk and beta_int replace the arena's (no prep writes them)
+SLOTS[HANDOFF_LAYOUT] = _without(_without(SLOTS["bwd_tape"], "gk"), "beta_int")
 # The lean layouts' per-pass buffer kinds: the token kinds sized for one tail range of ``R_b = 64 * ceil(NC_pad /
 # tail_passes)`` internal rows instead of ``R``; their sub-offsets count in ``R_b * H`` bytes.
 PASS_KINDS: dict[str, str] = {"F32p": "F32", "A32p": "A32", "V32p": "V32"}
@@ -1323,7 +1460,7 @@ def _slots_of(
         return _lean_slots(tape, tail_passes, R, H, NC, NSEG)
     if mode not in SLOTS:
         raise ValueError(
-            f"layout mode must be one of {MODES + LEAN_MODES + FWD_LAYOUTS[1:]}, got {mode!r}"
+            f"layout mode must be one of {MODES + LEAN_MODES + FWD_LAYOUTS[1:] + (HANDOFF_LAYOUT,)}, got {mode!r}"
         )
     if tail_passes != 1:
         raise ValueError(
@@ -1779,7 +1916,17 @@ def memory_report(
     the group with the most segments; a group gathers its blocks of the saved states only where they are not one
     run of them, at most three per segment) and
     ``arena_floor_batched`` (one document per group under the lean four-pass layouts: ``2820 * R_min * H + 3 * P *
-    H * 64 KiB``, ``R_min`` the internal rows of the longest document; 2052 for the tape forms)."""
+    H * 64 KiB``, ``R_min`` the internal rows of the longest document; 2052 for the tape forms).
+    ``handoff_bytes`` is one checkpoint hand-off record of the problem (:func:`_handoff_bytes`; reported for every
+    ``save_mode``, used by light calls only): the bytes a recompute under ``torch.utils.checkpoint`` adds until its
+    backward takes the record (a tape record); ``handoff_bytes_rows`` one row record (``None`` where the problem's
+    forward intra record has no twin on the architecture); ``handoff_budget_bytes`` the per-device budget a
+    recompute that asks for a tape record admits records within (two tape records).  A recompute that asks for a
+    row record (:func:`_handoff_wants_rows`: the call's own workspace, a :data:`HANDOFF_ROWS_VERIFIED` device, a
+    :data:`HANDOFF_HEADS` head count) is admitted within the larger of ``handoff_budget_bytes`` and
+    ``handoff_bytes_rows``; this report does not read the device or the build, so it does not say whether one does.
+    ``arena_bwd_tape`` / ``arena_bwd_handoff`` are the per-call arena of a backward that took a tape / row record
+    (the ``bwd_tape`` / :data:`HANDOFF_LAYOUT` layout alone)."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"memory_report: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
@@ -1878,6 +2025,40 @@ def memory_report(
         saved_blocks = 2
     else:
         saved_blocks = 3 if seg_states_saved(S, num_segments) else 0
+    # one checkpoint hand-off record: the tapes, the forward's w where the record allocates it, the transfers; a
+    # row record adds gk / kg / beta_int and kb where the record keeps no w (Plan.handoff_keeps_w)
+    plan_arch = cake_jit.ARCHES[0] if arch is None else arch
+    scalars: dict[str, Any] = {
+        "num_chunks_pad": nc_pad,
+        "num_seqs": num_docs,
+        "num_heads": H,
+        "sm_count": sms,
+        "arch": plan_arch,
+        "path": "fwd",
+    }
+    fwd_wy = cake_jit.select_record("wy_fwd", **scalars) is not None
+    wu_saved = _light_prep_saves(nc_pad, num_docs, H, sms, arch)[1]
+    handoff = _handoff_bytes(
+        nc_pad, rows, H, num_segments, S, fwd_w=fwd_wy and not wu_saved
+    )
+    twin = cake_jit.HANDOFF_TWINS.get(cake_jit.select_record("fwd_intra", **scalars))
+    twin_record = None if twin is None else cake_jit.MODULES.get(twin)
+    handoff_rows = None
+    if twin_record is not None and plan_arch in twin_record["arches"]:
+        handoff_rows = _handoff_bytes(
+            nc_pad,
+            rows,
+            H,
+            num_segments,
+            S,
+            fwd_w=fwd_wy and not wu_saved,
+            rows=True,
+            kb=not (wu_saved or fwd_wy),
+        )
+    arena_bwd_tape = _mode_bytes(rows, H, nc_pad, num_segments, "bwd_tape", 1, gf)
+    arena_bwd_handoff = _mode_bytes(
+        rows, H, nc_pad, num_segments, HANDOFF_LAYOUT, 1, gf
+    )
     return {
         "save_mode": save_mode,
         "sm_count": sms,
@@ -1930,6 +2111,13 @@ def memory_report(
         + out_f
         + saved
         + out_b,  # the default arena: lean serves no replay
+        # one checkpoint hand-off record (light calls under torch.utils.checkpoint), a tape and a row record, the
+        # device's budget for this shape's tape records and the per-call arenas of a backward that took a record
+        "handoff_bytes": handoff,
+        "handoff_bytes_rows": handoff_rows,
+        "handoff_budget_bytes": _HANDOFF_BUDGET_RECORDS * handoff,
+        "arena_bwd_tape": arena_bwd_tape,
+        "arena_bwd_handoff": arena_bwd_handoff,
     }
 
 
@@ -2225,12 +2413,8 @@ class KdaWorkspace:
         # the passes of this workspace's backward tail (a group's view of a batched arena takes its own)
         self.tail_passes = self.arena_option.tail_passes
         self.launcher: Launcher = cake_jit.run_module if launcher is None else launcher
-        self.bytes = plan.arena_bytes(
-            backward=backward,
-            save_mode=save_mode,
-            arena=self.arena_option,
-            doc_lengths=self.doc_lengths,
-            fwd_layout=fwd_layout,
+        self.bytes = self._arena_size(
+            plan, backward=backward, save_mode=save_mode, fwd_layout=fwd_layout
         )
         self.fwd_layout = fwd_layout
         self.zero_init = zero_init
@@ -2251,6 +2435,18 @@ class KdaWorkspace:
         self._batch_views: dict[tuple[int, int, int], KdaWorkspace] = {}
         self._doc_cache: dict[tuple[int, ...], _Packing] = {}
         self._doc_graphs: set[tuple[int, ...]] = set()
+
+    def _arena_size(
+        self, plan: Plan, *, backward: bool, save_mode: str, fwd_layout: str
+    ) -> int:
+        """The arena bytes of this workspace (:meth:`Plan.arena_bytes` of its options)."""
+        return plan.arena_bytes(
+            backward=backward,
+            save_mode=save_mode,
+            arena=self.arena_option,
+            doc_lengths=self.doc_lengths,
+            fwd_layout=fwd_layout,
+        )
 
     def views(self, mode: str) -> types.SimpleNamespace:
         """The buffer views of layout ``mode`` on this arena (``ValueError`` when the arena is too small for it);
@@ -2532,16 +2728,41 @@ class KdaWorkspace:
         path: str,
         launch: int = 0,
         grid: tuple[int, int, int] | None = None,
+        record: str | None = None,
     ) -> None:
         """Launch the record of ``stage`` on ``path`` (its ``launch``-th launch) with the logical argument
-        ``values``; ``grid`` replaces the plan's grid (the tail split's per-range grids)."""
-        name = self.plan.record(stage, path)
+        ``values``; ``grid`` replaces the plan's grid (the tail split's per-range grids); ``record`` replaces the
+        plan's record name only (the hand-off's intra twin, the tape path's w-only WY twin: the parent's grid rule
+        and grid)."""
+        name = self.plan.record(stage, path) if record is None else record
         self.launcher(
             name,
             values,
             grid=self.plan.grid(stage, path, launch) if grid is None else grid,
             device_index=self.device_index,
         )
+
+
+class _HandoffWorkspace(KdaWorkspace):
+    """The per-call backward workspace of a call that took a checkpoint hand-off record: its arena holds the one
+    layout that backward runs, ``layout`` (``"bwd_tape"`` for a tape record, :data:`HANDOFF_LAYOUT` for a row
+    record), instead of the larger of the saved-set and replay layouts (:meth:`KdaWorkspace.views` refuses every
+    other layout as too large).  Default arena option, ``save_mode="tape"``."""
+
+    def __init__(self, plan: Plan, device: torch.device | str, *, layout: str) -> None:
+        if layout not in ("bwd_tape", HANDOFF_LAYOUT):
+            raise ValueError(
+                f"_HandoffWorkspace: layout must be 'bwd_tape' or {HANDOFF_LAYOUT!r}, got {layout!r}"
+            )
+        self.layout = layout  # read by _arena_size during the base constructor
+        super().__init__(
+            plan, device, backward=True, save_mode="tape", deterministic=False
+        )
+
+    def _arena_size(
+        self, plan: Plan, *, backward: bool, save_mode: str, fwd_layout: str
+    ) -> int:
+        return plan.workspace_bytes(self.layout)
 
 
 # The workspaces of the calls made without one (the default entry), per (device, stream, problem, arena option and,
@@ -2568,12 +2789,19 @@ def _entry_acquire(
     save_mode: str,
     arena: KdaArena | None,
     doc_lengths: Sequence[int] | None,
+    layout: str | None = None,
 ) -> tuple[KdaWorkspace, tuple[Any, ...] | None]:
     """The workspace of one call without a workspace argument, with its arena storage allocated, and its pool key
     (``None``: a workspace of this call alone, under CUDA-graph capture, whose device allocations belong to the
-    graph; a batched arena is refused there, :meth:`KdaWorkspace.batches`)."""
-    if torch.cuda.is_current_stream_capturing():
-        ws = KdaWorkspace.for_problem(
+    graph; a batched arena is refused there, :meth:`KdaWorkspace.batches`).  ``layout`` (a backward that took a
+    checkpoint hand-off record): a :class:`_HandoffWorkspace` of that one layout, pooled apart."""
+
+    def build() -> KdaWorkspace:
+        if layout is not None:
+            at = _device_index(device)
+            p = plan(S, N, H, cake_jit.sm_count(at), cake_jit.device_arch(at))
+            return _HandoffWorkspace(p, device, layout=layout)
+        return KdaWorkspace.for_problem(
             S,
             N,
             H,
@@ -2584,7 +2812,9 @@ def _entry_acquire(
             doc_lengths=doc_lengths,
             deterministic=False,
         )
-        return ws, None
+
+    if torch.cuda.is_current_stream_capturing():
+        return build(), None
     index = _device_index(device)
     option = KdaArena() if arena is None else arena
     lengths = (
@@ -2602,22 +2832,13 @@ def _entry_acquire(
         save_mode,
         option,
         lengths,
+        layout,
     )
     with _entry_lock:
         free = _entry_pool.get(key)
         ws = free.pop() if free else None
     if ws is None:
-        ws = KdaWorkspace.for_problem(
-            S,
-            N,
-            H,
-            device,
-            backward=backward,
-            save_mode=save_mode,
-            arena=option,
-            doc_lengths=doc_lengths,
-            deterministic=False,
-        )
+        ws = build()
     else:
         if doc_lengths is not None and lengths is None:
             # checked per call, as a new workspace checks them (unused off the batched option)
@@ -2658,9 +2879,12 @@ def _workspace(
     save_mode: str | None = None,
     arena: KdaArena | None = None,
     doc_lengths: Sequence[int] | None = None,
+    layout: str | None = None,
 ) -> Iterator[KdaWorkspace]:
     """The workspace of one call: the caller's (checked against the problem) or, without one, the call's own,
-    whose device memory lives for the call alone (:func:`_entry_acquire`)."""
+    whose device memory lives for the call alone (:func:`_entry_acquire`; ``layout``: the one-layout workspace of a
+    backward that took a checkpoint hand-off record, :class:`_HandoffWorkspace`).  A caller's workspace serves as
+    it is."""
     if workspace is None:
         ws, key = _entry_acquire(
             S,
@@ -2671,6 +2895,7 @@ def _workspace(
             save_mode="light" if save_mode is None else save_mode,
             arena=arena,
             doc_lengths=doc_lengths,
+            layout=layout,
         )
         try:
             yield ws
@@ -2865,6 +3090,7 @@ def _fwd_intra(
     write_ext: int,
     write_int: int,
     write_prep: int,
+    record: str | None = None,
 ) -> None:
     """The intra-chunk program: ``Aqk`` / ``Akk`` on the internal rows (``write_int``: where a later program of the
     path reads them, :meth:`Plan.internal_rows`) and on the token rows
@@ -2872,7 +3098,9 @@ def _fwd_intra(
     ``qg`` and the ``v_new`` pad rows: the forward); the replay (``write_prep = 0``) has them from its own prep and
     passes the same buffers untouched.  The segmented route's record up to 256 documents (``fwd_intra_v14``) also
     computes the chunk layout from ``cu_seqlens`` and writes the chunk tables and the block table: it is the first
-    launch of its call and no table program runs there."""
+    launch of its call and no table program runs there.  ``record`` (a hand-off recompute that writes a row record: the plan
+    record's twin, :attr:`Plan.handoff_twin`) launches in place of the plan's record on its grid; the twin also writes every
+    ``gk`` row and ``beta_int``."""
     ws.run(
         "fwd_intra",
         {
@@ -2882,6 +3110,7 @@ def _fwd_intra(
             "write_prep": int(write_prep),
         },
         path=path,
+        record=record,
     )
 
 
@@ -3106,18 +3335,20 @@ def _saved_rows(
     u: torch.Tensor | None,
 ) -> None:
     """Point the call's ``qg`` / ``w`` / ``u`` (and the transposed views of ``w``) at the version-4 saved
-    tensors where given."""
+    tensors where given.  ``w`` alone (``u`` stays the arena's) is the checkpoint hand-off's: the recompute's
+    per-call ``w``, and the ``w`` its tape backward reads (no ``u`` there)."""
     if qg is not None:
         values["qg"] = qg
-    if w is not None or u is not None:
-        if w is None or u is None:
-            raise ValueError("the saved w and u come together")
+    if u is not None and w is None:
+        raise ValueError("the saved u comes with w")
+    if w is not None:
         values.update(
             w=w,
-            u=u,
             w_t=w.view(p.NC_pad, p.H, D, BT),
             w_tk=w.view(p.NC_pad * D, p.H, BT),
         )
+        if u is not None:
+            values["u"] = u
 
 
 def _forward_launches(
@@ -3145,12 +3376,16 @@ def _forward_launches(
     qg: torch.Tensor | None = None,
     w: torch.Tensor | None = None,
     u: torch.Tensor | None = None,
+    rows: dict[str, torch.Tensor] | None = None,
+    intra: str | None = None,
 ) -> None:
     """The launches of one forward on ``ws`` (the whole problem, or one document group through its view, its
     ``cu_seqlens`` slice, its tables and its tape slices; the token tensors always whole): the intra program (the
     GLM prep folded in), WY where the plan dispatches it, the state recurrence.  ``qg`` / ``w`` / ``u`` are the
     light saving forward's per-call tensors (version 4): the same writes as into the arena's slots, another
-    destination, and every consumer of the call reads them there."""
+    destination, and every consumer of the call reads them there.  ``rows`` / ``intra`` (a hand-off recompute of
+    the whole problem that writes a row record): per-call ``gk`` / ``kg`` / ``beta_int`` (and ``kb``) in place of the arena's,
+    written by the intra twin ``intra`` and read there by the later launches, likewise."""
     p = ws.plan
     values = _values(
         ws,
@@ -3171,6 +3406,8 @@ def _forward_launches(
         scale=scale,
     )
     _saved_rows(values, p, qg=qg, w=w, u=u)
+    if rows:
+        values.update(rows)
     _fwd_intra(
         ws,
         values,
@@ -3178,6 +3415,7 @@ def _forward_launches(
         write_ext=write_ext,
         write_int=1 if p.internal_rows(path) else 0,
         write_prep=1,
+        record=intra,
     )
     if p.dispatched("wy_fwd", path):
         ws.run("wy_fwd", values, path=path)
@@ -3253,6 +3491,40 @@ def chunk_kda_fwd(
     on the sign of exact zeros).  ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`).
     """
     _require_deterministic_false(deterministic, "chunk_kda_fwd")
+    return _fwd_call(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        scale=scale,
+        save_for_backward=save_for_backward,
+        workspace=workspace,
+        save_mode=save_mode,
+        arena=arena,
+        doc_lengths=doc_lengths,
+    )
+
+
+def _fwd_call(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    scale: float,
+    save_for_backward: bool,
+    workspace: KdaWorkspace | None,
+    save_mode: str | None,
+    arena: KdaArena | None,
+    doc_lengths: Sequence[int] | None,
+    handoff: dict[str, Any] | None = None,
+) -> tuple[torch.Tensor, KdaChunkSaved | None]:
+    """:func:`chunk_kda_fwd` after its mode check; ``handoff`` is the autograd node's checkpoint hand-off request
+    (:func:`_forward`; a call without a caller workspace may write a row record)."""
     q, k, v, g, beta, S, N, H, batched = _operands(q, k, v, g, beta, cu_seqlens)
     with _workspace(
         workspace,
@@ -3277,6 +3549,8 @@ def chunk_kda_fwd(
             save_for_backward=save_for_backward,
             save_mode=save_mode,
             doc_lengths=doc_lengths,
+            handoff=handoff,
+            own_ws=workspace is None,
         )
     return _ranked(out, batched), saved
 
@@ -3294,9 +3568,22 @@ def _forward(
     save_for_backward: bool,
     save_mode: str | None,
     doc_lengths: Sequence[int] | None,
+    handoff: dict[str, Any] | None = None,
+    own_ws: bool = False,
 ) -> tuple[torch.Tensor, KdaChunkSaved | None]:
     """:func:`chunk_kda_fwd` on the call's workspace, the operands without their batch axis: ``out`` ``[S, H, 128]``
-    and the saved set."""
+    and the saved set.
+
+    ``handoff`` (the autograd node's checkpoint recompute, :func:`_handoff_request`): where the call saves a light
+    set of the whole problem on the default arena option, the request's mode engages (:func:`_handoff_engages`)
+    and the device's byte budget admits a record, the same launches also write the ``h`` / ``v_new`` tapes into
+    per-call tensors (``write_tapes = 1`` on the ``fwd`` records: ``out`` and the saved set are unchanged) and keep
+    the forward's ``w`` (the light set's, else a per-call tensor where the plan launches a WY program; ``u`` stays
+    in the arena) and the segment transfers (the light set's ``seg_state[1]`` under the size rule, else a per-call
+    ``seg_state``) in ``handoff["tensors"]``; otherwise the request stays unfilled.  A row record
+    (:func:`_handoff_wants_rows`; ``own_ws``: the call runs on its own workspace) launches the intra twin instead of the
+    plan's intra record and keeps its per-call ``gk`` / ``kg`` / ``beta_int`` (and ``kb`` where the record keeps
+    no ``w``) too."""
     p = ws.plan
     S, N, H = p.S, p.N, p.H
     save_mode = ws.save_mode if save_mode is None else save_mode
@@ -3309,7 +3596,26 @@ def _forward(
     # that hands no tape to a saved set allocates them per call; a light workspace holds them in the arena.  The
     # launch order and the operands are the same.
     tape_ws = (not tape) and ws.save_mode == "tape"
-    mode = "fwd_tape" if (tape or tape_ws) else "fwd"
+    # the checkpoint hand-off, admitted before any extra write (its tapes live outside the arena, as in tape mode):
+    # the record's kind ("rows" / "tape"), or None (no record)
+    kind = None
+    if (
+        handoff is not None
+        and save_for_backward
+        and not tape
+        and doc_lengths is None
+        and ws.arena_option == KdaArena()
+        and _handoff_engages(p, handoff["mode"], ws.device_index)
+    ):
+        wants_rows = _handoff_wants_rows(p, ws.device_index, own_ws)
+        kind = _handoff_admit(
+            ws.device_index,
+            handoff["task"],
+            p.handoff_bytes(),
+            p.handoff_bytes(rows=True) if wants_rows else None,
+        )
+    ho = kind is not None
+    mode = "fwd_tape" if (tape or tape_ws or ho) else "fwd"
     seg = p.recur == "seg"
     # light (version 4): the segment-boundary states become per-call saved tensors when the size rule holds
     save_states = seg and save_for_backward and not tape and p.seg_save
@@ -3323,10 +3629,10 @@ def _forward(
         aqk_ext = _alloc((S, H, BT), torch.bfloat16, ws.device)
         akk_ext = _alloc((S, H, BT), torch.bfloat16, ws.device)
     # the whole problem's per-call tape (tape mode: the saved set owns h / v_new; a light call on a tape
-    # workspace recomputes them into per-call buffers too) and its saved states (the carry's output and the
-    # recurrence's offsets / transfers under the size rule; the tape's transfers)
+    # workspace recomputes them into per-call buffers too; the hand-off's record owns them) and its saved states
+    # (the carry's output and the recurrence's offsets / transfers under the size rule; the tape's transfers)
     h = v_new = None
-    if tape or tape_ws:
+    if tape or tape_ws or ho:
         h = _alloc((p.NC_pad, H, D, D), torch.bfloat16, ws.device)
         v_new = _alloc((p.R, H, D), torch.bfloat16, ws.device)
     # light (version 4): the fold's qg goes to a per-call saved tensor (the light backward's prep writes none),
@@ -3350,10 +3656,39 @@ def _forward(
             seg_m = seg_state[1]
         else:  # the groups' transfers come out of their arena blocks
             seg_m = _alloc((p.NSEG, H, D, D), torch.float32, ws.device)
+    # the hand-off record's own w (the forward launches a WY program and the light set carries no w; u stays in
+    # the arena) and seg_state (the light set saves no states; the record keeps the transfer half)
+    w_ho = seg_ho = None
+    if ho and w_saved is None and p.dispatched("wy_fwd", path):
+        w_ho = _alloc((p.R, H, D), torch.bfloat16, ws.device)
+    if ho and seg and not save_states:
+        seg_ho = _alloc((2, p.NSEG, H, D, D), torch.float32, ws.device)
+    # a row record's prep rows, written by the intra twin in place of the arena's slots (and read there by the
+    # forward's later launches): gk and beta_int on every internal row, kg, and kb where the backward still
+    # launches wy (the record keeps no w)
+    rows_ho: dict[str, torch.Tensor] = {}
+    intra = None
+    if kind == "rows":
+        intra = p.handoff_twin
+        rows_ho = {
+            "gk": _alloc((p.R, H, D), torch.float32, ws.device),
+            "kg": _alloc((p.R, H, D), torch.bfloat16, ws.device),
+            "beta_int": _alloc((p.R, H), torch.float32, ws.device),
+        }
+        if not p.handoff_keeps_w:
+            rows_ho["kb"] = _alloc((p.R, H, D), torch.bfloat16, ws.device)
+    # tests: a record byte no launch writes shows in the gradients
+    if ho and _HANDOFF_POISON:
+        for t in (h, v_new, w_ho, seg_ho, *rows_ho.values()):
+            if t is not None:
+                t.fill_(float("nan"))
+    w_fwd = w_saved if w_ho is None else w_ho
+    seg_fwd = seg_state if seg_ho is None else seg_ho
     common: dict[str, Any] = {
         "path": path,
         "write_ext": 1 if save_for_backward else 0,
-        "write_tapes": 1 if tape else 0,
+        # the saved set's version decides the saved tensors; write_tapes only gates the tape stores
+        "write_tapes": 1 if (tape or ho) else 0,
         "out": out,
         "q": q,
         "k": k,
@@ -3372,17 +3707,30 @@ def _forward(
             tables,
             h=a.h if h is None else h,
             v_new=a.v_new if v_new is None else v_new,
-            seg_state=(a.seg_state if seg_state is None else seg_state)
-            if seg
-            else None,
+            seg_state=(a.seg_state if seg_fwd is None else seg_fwd) if seg else None,
             hseg=(a.hseg if hseg is None else hseg) if seg else None,
             aqk_ext=a.aqk_int if aqk_ext is None else aqk_ext,
             akk_ext=a.aqk_int if akk_ext is None else akk_ext,
             qg=qg_saved,
-            w=w_saved,
+            w=w_fwd,
             u=u_saved,
+            rows=rows_ho,
+            intra=intra,
             **common,
         )
+        if ho:
+            handoff.update(
+                tensors={
+                    "h": h,
+                    "v_new": v_new,
+                    "w": w_fwd,
+                    "seg_m": seg_fwd[1] if seg else None,
+                    **rows_ho,
+                },
+                nbytes=p.handoff_bytes(rows=kind == "rows"),
+                key=_handoff_key(p, scale),
+                stream=torch.cuda.current_stream(ws.device_index).cuda_stream,
+            )
     else:
         views_b = [
             (batch, ws.batch_view(batch, tape=row_slices)) for batch in packing.batches
@@ -3519,6 +3867,9 @@ def _backward_launches(
     w: torch.Tensor | None = None,
     u: torch.Tensor | None = None,
     nc_vec: torch.Tensor | None = None,
+    prep_path: str | None = None,
+    rows: dict[str, torch.Tensor] | None = None,
+    wy_record: str | None = None,
 ) -> None:
     """The launches of one backward on ``ws`` (the whole problem, or one document group through its view, its
     ``cu_seqlens`` slice, its tables, its tape slices, its slices of the saved ``qg`` / ``w`` / ``u``, its blocks of
@@ -3526,7 +3877,14 @@ def _backward_launches(
     gradients always whole): the replay's intra recompute, the prep, WY, the recurrence recompute, dA / dv, the
     adjoint recurrence and the tail (once, or per range of a lean workspace's ``tail_passes``, a group view's own),
     each where the path and the plan dispatch it.  ``seg_m`` is the forward's transfers where they do not come from
-    ``seg_state[1]`` (a tape set's ``seg_m``, a group's blocks of the saved ``seg_state[1]``)."""
+    ``seg_state[1]`` (a tape set's ``seg_m``, a group's blocks of the saved ``seg_state[1]``).  ``prep_path`` (the
+    checkpoint hand-off's tape backward: the light path) selects the prep record; a tape backward given ``w``
+    launches no ``wy``; ``wy_record`` (a tape backward's: the w-only twin of its WY record, :func:`_tape_wy_record`)
+    launches in place of the plan's WY record, on its grid.  ``rows`` (a hand-off row record's ``gk`` / ``kg`` /
+    ``beta_int`` and ``kb`` where it has one) replace the prep's outputs: no prep launch, and one fill kernel zeroes
+    the ``dv2`` rows from the first pad chunk the plan can have (``64 * ceil(S / 64)``) on, which the prep would zero
+    (the pad chunks trail the real ones, and the adjoint recurrence writes every row of every real chunk
+    afterwards)."""
     p = ws.plan
     b = views
     # The operand sources of the backward programs: the saved Aqk / Akk token rows and the user's dout on the
@@ -3557,6 +3915,8 @@ def _backward_launches(
         scale=scale,
     )
     _saved_rows(values, p, qg=qg, w=w, u=u)
+    if rows is not None:
+        values.update(rows)
 
     # The replay recomputes the internal Aqk / Akk rows with the intra program (write_prep = 0: the prep buffers are
     # the replay prep's; the token-row pointers are unused, write_ext = 0): before the prep where the intra program
@@ -3574,16 +3934,29 @@ def _backward_launches(
     intra_first = replay and not p.dispatched("table", path)
     if intra_first:
         replay_intra()
-    # prep's pad-row zero-fill target: the saved v_new already carries its pads
-    ws.run(
-        "bwd_prep",
-        {**values, "v_new": b.v_new_scratch if tape else v_new},
-        path=path,
-    )
+    # tests: dv2 NaN-filled before the prep or the zero fill, so a dv2 row neither writes and a later launch reads
+    # shows in the gradients (the same fill on both kinds of hand-off record and without one)
+    if _HANDOFF_POISON:
+        b.dv2.fill_(float("nan"))
+    if rows is None:
+        # prep's pad-row zero-fill target: the saved v_new already carries its pads.  The checkpoint hand-off's
+        # tape backward runs the light path's prep record (prep_path: no qg, the set's qg serves; no kb on the
+        # nokb rows)
+        ws.run(
+            "bwd_prep",
+            {**values, "v_new": b.v_new_scratch if tape else v_new},
+            path=path if prep_path is None else prep_path,
+        )
+    else:
+        # a row record carries the prep's outputs; one fill kernel zeroes the dv2 pad rows the prep zeroes (+0.0,
+        # as the prep)
+        b.dv2[BT * -(-p.S // BT) :].zero_()
     if replay and not intra_first:
         replay_intra()
-    if p.dispatched("wy", path):
-        ws.run("wy", values, path=path)
+    # a tape backward given w (the hand-off record's: the forward's) launches no wy (u is dead on the tape path);
+    # one without it launches wy_record (the w-only twin) where given
+    if p.dispatched("wy", path) and not (tape and w is not None):
+        ws.run("wy", values, path=path, record=wy_record)
     if not tape:  # h / v_new come from the saved set in tape mode (wy still runs for w)
         _forward_recurrence(
             ws, values, path=path, seg_state=seg_state, hseg=hseg, write_tapes=1
@@ -3664,6 +4037,44 @@ def chunk_kda_bwd(
     of the deterministic package's forward has the same format and is read as it is.
     """
     _require_deterministic_false(deterministic, "chunk_kda_bwd")
+    return _bwd_call(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        dout,
+        saved=saved,
+        scale=scale,
+        workspace=workspace,
+        arena=arena,
+        doc_lengths=doc_lengths,
+    )
+
+
+def _bwd_call(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    dout: torch.Tensor,
+    *,
+    saved: KdaChunkSaved | None,
+    scale: float,
+    workspace: KdaWorkspace | None,
+    arena: KdaArena | None,
+    doc_lengths: Sequence[int] | None,
+    handoff: _HandoffRecord | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`chunk_kda_bwd` after its mode check; ``handoff`` is a checkpoint hand-off record the autograd node
+    took (:func:`_handoff_take`), accepted or refused here before any workspace is acquired
+    (:func:`_handoff_accept`).  An accepted record runs the tape path (:func:`_backward`): without a caller
+    workspace on a per-call arena of its one layout (``bwd_tape``, or :data:`HANDOFF_LAYOUT` for a row record),
+    on a caller's workspace as it is (a backward arena holds both layouts).  A refused record leaves the call
+    exactly as without one."""
     q, k, v, g, beta, S, N, H, batched = _operands(q, k, v, g, beta, cu_seqlens)
     dout = _squeeze_batch(dout, "dout", 3)
     _check(dout, "dout", (S, H, D), torch.bfloat16, v.device)
@@ -3687,6 +4098,17 @@ def chunk_kda_bwd(
     lean_tape = (
         option.lean and saved is not None and saved.version == SAVED_VERSION_TAPE
     )
+    # the hand-off's verdict before the workspace: an accepted record's own per-call arena is its one layout
+    accepted = None
+    if handoff is not None:
+        index = _device_index(v.device)
+        p = plan(S, N, H, cake_jit.sm_count(index), cake_jit.device_arch(index))
+        accepted = _handoff_accept(
+            handoff, p, saved, option, doc_lengths, scale, index=index
+        )
+    layout = None
+    if accepted is not None and workspace is None:
+        layout = HANDOFF_LAYOUT if accepted.with_rows else "bwd_tape"
     with _workspace(
         workspace,
         S,
@@ -3697,6 +4119,7 @@ def chunk_kda_bwd(
         save_mode="tape" if lean_tape else None,
         arena=arena,
         doc_lengths=doc_lengths,
+        layout=layout,
     ) as ws:
         grads = _backward(
             ws,
@@ -3710,6 +4133,7 @@ def chunk_kda_bwd(
             saved=saved,
             scale=scale,
             doc_lengths=doc_lengths,
+            handoff=accepted,
         )
     return tuple(_ranked(x, batched) for x in grads)
 
@@ -3727,9 +4151,21 @@ def _backward(
     saved: KdaChunkSaved | None,
     scale: float,
     doc_lengths: Sequence[int] | None,
+    handoff: _Accepted | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """:func:`chunk_kda_bwd` on the call's workspace, the operands without their batch axis: ``(dq, dk, dv, dbeta,
-    dg)``."""
+    dg)``.
+
+    ``handoff`` (a checkpoint hand-off record :func:`_handoff_accept` accepted for this call: a light set of the
+    whole problem on the default arena option, the record's plan key and tensors): the tape path, ``h`` / ``v_new``
+    / ``w`` / the transfers from the record, ``qg`` and the tables from the light set, no ``wy`` where the record
+    carries ``w``, no recurrence recompute.  A tape record runs in the ``bwd_tape`` layout with the prep record
+    of the light path (it writes ``gk`` / ``kg`` / ``beta_int`` and the ``dv2`` pad rows, and ``kb`` on the rows
+    that still launch ``wy``); a row record in the :data:`HANDOFF_LAYOUT` layout with the record's ``gk`` /
+    ``kg`` / ``beta_int`` (and ``kb``), no prep and the ``dv2`` pad-row fill kernel.
+
+    A tape backward that launches ``wy`` (a version-2 set, a hand-off record without ``w``) launches the WY
+    record's w-only twin instead where :func:`_tape_wy_record` admits it (counted ``launched``)."""
     p = ws.plan
     S, N, H = p.S, p.N, p.H
     seg = p.recur == "seg"
@@ -3827,6 +4263,15 @@ def _backward(
         path = "tape"
     else:
         path = "light_states" if light_states else "light"
+    # The checkpoint hand-off (accepted by _bwd_call before the workspace): the tape path from the record.
+    ho = None if handoff is None else handoff.rec
+    rows_ho = None
+    if ho is not None:
+        path, tape, light_states = "tape", True, False
+        if handoff.with_rows:
+            rows_ho = {"gk": ho.gk, "kg": ho.kg, "beta_int": ho.beta_int}
+            if ho.kb is not None:
+                rows_ho["kb"] = ho.kb
     # A tape-mode workspace (arena sized for the tape layouts) recomputes h / v_new into per-call buffers
     # whenever the saved set does not carry them (a version-4 saved set, the replay), as its forward does; a
     # light one recomputes them inside the arena.  The launch order and the operands are the same.  The replay
@@ -3835,6 +4280,8 @@ def _backward(
     mode = "bwd_tape" if (tape or tape_ws) else "bwd"
     if replay:
         mode = {"bwd": "replay", "bwd_tape": "replay_tape"}[mode]
+    if rows_ho is not None:
+        mode = HANDOFF_LAYOUT
     packing = ws._packing(doc_lengths)
     dq = _alloc((S, H, D), torch.bfloat16, ws.device)
     dk = _alloc((S, H, D), torch.bfloat16, ws.device)
@@ -3843,13 +4290,22 @@ def _backward(
     dbeta = _alloc((S, H), torch.bfloat16, ws.device)
     # the version-4 rows the light paths read from the set (the groups of a batched option take their slices)
     light_rows = not (replay or tape)
-    qg_saved = saved.qg if light_rows else None
-    w_saved = saved.w if light_rows else None
+    # the hand-off's tape backward reads the set's qg and the record's w (the forward's; None where it has none)
+    qg_saved = saved.qg if (light_rows or ho is not None) else None
+    w_saved = ho.w if ho is not None else (saved.w if light_rows else None)
     u_saved = saved.u if light_rows else None
+    # the tape path's WY launch (no w from the record): the w-only twin of its record where the rule admits it
+    # (nothing on the tape path reads u), else the record itself
+    wy_record = None
+    if tape and w_saved is None and p.dispatched("wy", "tape"):
+        wy_record = _tape_wy_record(p, ws.device_index)
+        if wy_record is not None:
+            _tape_wy_note(ws.device_index, "launched")
     common: dict[str, Any] = {
         "path": path,
         "replay": replay,
         "tape": tape,
+        "wy_record": wy_record,
         "Aqk": None if replay else saved.Aqk,
         "Akk": None if replay else saved.Akk,
         "q": q,
@@ -3872,7 +4328,9 @@ def _backward(
             else saved.tables
         )
         b = ws.views(mode)
-        if tape:
+        if ho is not None:
+            h, v_new = ho.h, ho.v_new
+        elif tape:
             h, v_new = saved.h, saved.v_new
         elif tape_ws:
             h = _alloc((p.NC_pad, H, D, D), torch.bfloat16, ws.device)
@@ -3890,10 +4348,14 @@ def _backward(
             if seg
             else None,
             hseg=(saved.hseg if light_states else b.hseg) if seg else None,
-            seg_m=saved.seg_m if (tape and seg) else None,
+            seg_m=ho.seg_m
+            if ho is not None
+            else (saved.seg_m if (tape and seg) else None),
             qg=qg_saved,
             w=w_saved,
             u=u_saved,
+            prep_path=None if handoff is None else handoff.light_path,
+            rows=rows_ho,
             **common,
         )
     else:
@@ -3955,6 +4417,835 @@ def _backward(
 
 
 # ----------------------------------------------------------------------------------------------------------------
+# Checkpoint hand-off: the forward torch re-runs inside the backward (torch.utils.checkpoint, reentrant or not) hands
+# the tapes of its light call to the node's backward through a per-device side channel.  The saved set and the
+# autograd context stay as they are (non-reentrant checkpoint runs the original node's backward on the original
+# context with the recomputed saved tensors), so nothing else can carry them.
+
+HANDOFF_MODES = ("auto", "on", "off")
+# the benchmarking override of the chunk_kda keyword, read at each call: "off" turns every call off, "on" turns
+# "auto" into "on" (an explicit "off" stays off); unset, empty or "auto": no override
+HANDOFF_ENV = "CAKE_KDA_CKPT_HANDOFF"
+# "auto" engages on these (plan architecture, SM count, Cake build toolkit "major.minor") devices, where the hand-off
+# suite measured the gradients bitwise equal to "off" on every plan family its packs reach, both checkpoint modes, ...
+HANDOFF_VERIFIED = frozenset(
+    {
+        ("sm_100a", 148, "13.4"),
+        ("sm_100a", 152, "13.4"),
+        ("sm_103a", 148, "13.4"),
+        ("sm_103a", 152, "13.4"),
+        ("sm_107a", 212, "13.4"),
+    }
+)
+# ... at the head counts that suite runs: other head counts select record combinations it has not run, and one head
+# is host-bound (the record's host work cancels its kernel savings).  A new device, toolkit or registry needs the
+# suite again on each device before it enters either set.
+HANDOFF_HEADS = frozenset({2, 4, 8, 12, 16, 32, 64})
+# Row records (the recompute launches the intra twin, the backward no prep) on these (architecture, SM count, full
+# toolkit version "major.minor.patch") devices, at the HANDOFF_HEADS head counts, with the call's own workspace.  The
+# twin's rows equal the prep's only where one toolkit compiles both to the same instructions, so the key names the
+# toolkit of the one build the twin, its intra record and the light prep come from (:func:`_handoff_rows_toolkit`).
+# A device enters with the passing evidence of that device and toolkit: the hand-off suite with row records, the
+# twin-row test, the P8 64-head gate and the hand-off parity rows.  Elsewhere the records are tape records.
+HANDOFF_ROWS_VERIFIED: frozenset[tuple[str, int, str]] = frozenset(
+    {
+        ("sm_100a", 148, "13.4.92"),
+        ("sm_100a", 152, "13.4.92"),
+        ("sm_103a", 148, "13.4.92"),
+        ("sm_103a", 152, "13.4.92"),
+        ("sm_107a", 212, "13.4.92"),
+    }
+)
+# tests and diagnostics only: False makes every record a tape record; True makes it a row record wherever the plan
+# has an intra twin (the device, workspace and build checks skipped; the byte budget still applies); None: the rule
+_HANDOFF_ROWS: bool | None = None
+# the per-device byte budget: this many tape records of the publishing call's shape, or for a call that asks for a
+# row record the larger of that and one row record of the shape (admitted before the extra writes)
+_HANDOFF_BUDGET_RECORDS = 2
+# failed loads of an intra twin (per twin and architecture) after which a process asks for no row record with it
+_HANDOFF_ROWS_LOAD_TRIES = 3
+# misses in a row (records dropped untaken or refused by their backward) that turn the hand-off off on a device; a
+# full window of outcomes with at least as many misses as hits does too
+_HANDOFF_MAX_MISSES = 8
+_HANDOFF_WINDOW = 32
+# tests only: NaN-fill the record's per-call tensors before the recompute's launches, so a byte the forward does not
+# write and the tape backward reads shows in the gradients
+_HANDOFF_POISON = False
+# the torch bindings the recompute check reads (missing or unusable ones turn the hand-off off) and the pack hooks
+# of torch.utils.checkpoint's recompute and of a region's original forward
+_GRAPH_TASK_ID = getattr(torch._C, "_current_graph_task_id", None)
+_TOP_HOOKS = getattr(
+    getattr(torch._C, "_autograd", None), "_top_saved_tensors_default_hooks", None
+)
+_CHECKPOINT_MODULE = "torch.utils.checkpoint"
+_RECOMPUTE_PACK = "_recomputation_hook.__init__.<locals>.pack_hook"
+_ORIGINAL_PACK = "_checkpoint_hook.__init__.<locals>.pack_hook"
+
+
+@dataclasses.dataclass(eq=False)
+class _HandoffRecord:
+    """One recompute's hand-off: a strong reference to its saved ``Aqk`` (no other tensor can take its address while
+    the record lives) and its version; the stamp of the node's inputs (pointer, shape, stride, dtype, device),
+    ``detach()`` aliases of them (each shares its input's version counter) and their versions; the plan key, the
+    stream, the graph task and whether its end-of-task drop is queued; the tensors the tape backward reads (``w`` /
+    ``seg_m`` ``None`` where the plan has none).  A row record also holds the intra twin's ``gk`` / ``kg`` /
+    ``beta_int`` and, where it keeps no ``w``, ``kb`` (all ``None`` in a tape record, also one demoted to it:
+    :func:`_handoff_admit`); ``nbytes`` counts them."""
+
+    aqk: torch.Tensor | None
+    aqk_version: int
+    stamp: tuple
+    aliases: tuple[torch.Tensor, ...]
+    versions: tuple[int, ...]
+    key: tuple
+    stream: int
+    task: int
+    nbytes: int
+    h: torch.Tensor | None
+    v_new: torch.Tensor | None
+    w: torch.Tensor | None
+    seg_m: torch.Tensor | None
+    queued: bool = False
+    gk: torch.Tensor | None = None
+    kg: torch.Tensor | None = None
+    beta_int: torch.Tensor | None = None
+    kb: torch.Tensor | None = None
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _Accepted:
+    """A record :func:`_handoff_accept` accepted for one backward: the record, whether it is a row record and the
+    light path of the call (the prep record of a tape record's backward)."""
+
+    rec: _HandoffRecord
+    with_rows: bool
+    light_path: str
+
+
+@dataclasses.dataclass
+class _HandoffDevice:
+    """One device's records by their ``Aqk`` data pointer, their bytes, the misses in a row, the last
+    :data:`_HANDOFF_WINDOW` outcomes (``True``: a hit), whether the hand-off is off and the counters
+    (:func:`_handoff_stats`)."""
+
+    records: dict[int, _HandoffRecord] = dataclasses.field(default_factory=dict)
+    live_bytes: int = 0
+    misses_in_a_row: int = 0
+    outcomes: collections.deque = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=_HANDOFF_WINDOW)
+    )
+    disabled: bool = False
+    stats: collections.Counter = dataclasses.field(default_factory=collections.Counter)
+
+
+_handoff_devices: dict[int, _HandoffDevice] = {}
+_handoff_lock = threading.Lock()
+
+
+def _handoff_mode(checkpoint_handoff: str) -> str:
+    """The call's mode: ``checkpoint_handoff`` under :data:`HANDOFF_ENV`; ``ValueError`` for another value of
+    either."""
+    if checkpoint_handoff not in HANDOFF_MODES:
+        raise ValueError(
+            f"checkpoint_handoff must be one of {HANDOFF_MODES}, got {checkpoint_handoff!r}"
+        )
+    raw = os.environ.get(HANDOFF_ENV, "")
+    env = raw.strip().lower()
+    if env and env not in HANDOFF_MODES:
+        raise ValueError(
+            f"{HANDOFF_ENV}={raw!r}: expected one of {HANDOFF_MODES} (or unset)"
+        )
+    if env == "off" or checkpoint_handoff == "off":
+        return "off"
+    return "on" if env == "on" else checkpoint_handoff
+
+
+def _handoff_task() -> int | None:
+    """The id of the autograd graph task this thread runs (a checkpoint recompute runs inside the backward; a forward
+    outside any backward sees -1), ``None`` when the torch binding is missing or unusable."""
+    try:
+        task = _GRAPH_TASK_ID()
+    except Exception:  # also a missing binding (None)
+        return None
+    return task if isinstance(task, int) and not isinstance(task, bool) else None
+
+
+def _handoff_hooks() -> str | None:
+    """This thread's innermost default saved-tensor hooks: ``"none"`` (the reentrant checkpoint's recompute),
+    ``"recompute"`` (the non-reentrant checkpoint's recompute), ``"original"`` (a checkpoint region's original
+    forward, also an inner region's forward that an outer recompute re-runs: no backward takes its record) or
+    ``"other"`` (a caller's hooks); ``None`` when the torch binding is missing or unusable."""
+    if _TOP_HOOKS is None:
+        return None
+    try:
+        try:
+            top = _TOP_HOOKS(True)  # ignore_is_tracing
+        except TypeError:  # a torch whose binding takes no argument
+            top = _TOP_HOOKS()
+        if top is None:
+            return "none"
+        module = getattr(top[0], "__module__", None)
+        name = getattr(top[0], "__qualname__", None)
+    except Exception:
+        return None
+    if module == _CHECKPOINT_MODULE and name == _RECOMPUTE_PACK:
+        return "recompute"
+    if module == _CHECKPOINT_MODULE and name == _ORIGINAL_PACK:
+        return "original"
+    return "other"
+
+
+def _handoff_blocked() -> bool:
+    """The refusals the stamps cannot see: CUDA-graph capture (a replay would read a dropped record),
+    ``torch.compile`` tracing and compiled autograd (this module has no dynamo handling).  A state that cannot be
+    read blocks too, including a compiled-autograd module whose flags are missing or not ``bool``."""
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return True
+        is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", None)
+        if is_compiling is not None and is_compiling():
+            return True
+        # compiled autograd can only be on once its module is imported (no import here: it would load dynamo)
+        ca = sys.modules.get("torch._dynamo.compiled_autograd")
+        if ca is not None:
+            for name in ("in_compiled_autograd_region", "compiled_autograd_enabled"):
+                value = getattr(ca, name, None)
+                if not isinstance(value, bool) or value:
+                    return True
+    except Exception:
+        return True
+    return False
+
+
+def _handoff_dispatch_modes() -> bool:
+    """Whether a Python dispatch mode is active (a selective-checkpoint policy, a fake, tracing or debug mode): the
+    recompute's extra allocations would put a policy that hands out the forward's cached ``aten.empty`` outputs in
+    order out of step.  A stack that cannot be read counts as active."""
+    try:
+        return int(torch._C._len_torch_dispatch_stack()) > 0
+    except Exception:
+        return True
+
+
+def _handoff_stamp(tensors: Sequence[torch.Tensor]) -> tuple:
+    """Pointer, shape, stride, dtype and device of each tensor (the versions travel through the record's aliases: a
+    tensor the backward unpacks through checkpoint's hooks need not share its input's version counter)."""
+    return tuple(
+        (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, t.device)
+        for t in tensors
+    )
+
+
+def _handoff_key(p: Plan, scale: float) -> tuple:
+    """The plan key a record must share with its backward: the problem, the architecture and SM count of the plan,
+    the scale and the saved set's version."""
+    return (p.S, p.N, p.H, p.arch, p.sm_count, float(scale), SAVED_VERSION)
+
+
+@functools.cache
+def _handoff_toolkit(arch: str) -> str | None:
+    """``"major.minor"`` of the Cake build toolkit of ``arch``'s libraries (``cake_build.record_cuda_version``: the
+    prebuilt sidecar, else FlashInfer's JIT toolkit), ``None`` when it cannot be read ("auto" then stays off)."""
+    try:
+        from . import cake_build
+
+        major, minor = cake_build.record_cuda_version(arch)
+        return f"{int(major)}.{int(minor)}"
+    except Exception:
+        return None
+
+
+def _handoff_engages(p: Plan, mode: str, index: int) -> bool:
+    """Whether the request's mode engages on plan ``p``: ``"on"`` always, ``"auto"`` at a :data:`HANDOFF_HEADS`
+    head count on a :data:`HANDOFF_VERIFIED` (architecture, SM count, toolkit) device; an ``"auto"`` call at those
+    head counts on another device counts ``unverified`` (:func:`_handoff_request` makes no ``"auto"`` request at
+    other head counts)."""
+    if mode == "on":
+        return True
+    if mode != "auto" or p.H not in HANDOFF_HEADS:
+        return False
+    if (p.arch, p.sm_count, _handoff_toolkit(p.arch)) in HANDOFF_VERIFIED:
+        return True
+    _handoff_note(index, "unverified")
+    return False
+
+
+@functools.cache
+def _handoff_rows_toolkit(twin: str, parent: str, prep: str, arch: str) -> str | None:
+    """The full toolkit version (``"major.minor.patch"``) of the one build of ``arch`` that serves the intra twin
+    ``twin``, the plan's intra record ``parent`` and the light prep record ``prep`` (whose outputs the twin
+    replaces), :func:`_one_build_toolkit`.  Cached per arguments: the build state of a process does not change."""
+    return _one_build_toolkit((twin, parent, prep), arch)
+
+
+def _one_build_toolkit(records: Sequence[str], arch: str) -> str | None:
+    """The full toolkit version (``"major.minor.patch"``) of the one build of ``arch`` that serves every record of
+    ``records``: all their libraries prebuilt (``aot/``: the builder's sidecar ``cuda`` of the first), or none of
+    them and no library of the package prebuilt (FlashInfer's JIT: its ``nvcc --version``).  ``None`` for a mixed
+    state, a version that cannot be read or any other exception (a record not delivered for ``arch`` too)."""
+    try:
+        from . import cake_build
+
+        names = [cake_jit.library_name(r, arch) for r in records]
+        built = [cake_build.prebuilt_path(name).is_file() for name in names]
+        if all(built):
+            info = cake_build._prebuilt_info(cake_build.prebuilt_path(names[0]), arch)
+            return _full_version(info["cuda"])
+        if any(built) or any(
+            cake_build.prebuilt_path(name).is_file()
+            for name in cake_build.libraries_by_name()
+        ):
+            return None
+        return _jit_nvcc_version()
+    except Exception:
+        return None
+
+
+def _full_version(text: str) -> str | None:
+    """``"major.minor.patch"`` of a dotted version (``"13.4.92"``), ``None`` without three numeric parts."""
+    parts = str(text).split(".")
+    if len(parts) < 3 or not all(part.isdigit() for part in parts[:3]):
+        return None
+    return ".".join(str(int(part)) for part in parts[:3])
+
+
+def _jit_nvcc_version() -> str | None:
+    """``"major.minor.patch"`` of the ``nvcc`` FlashInfer's JIT compiles with (``V13.4.92`` in its ``--version``
+    text; FlashInfer's own version reads the release, ``13.4``, alone)."""
+    from flashinfer.jit.cpp_ext import get_cuda_path
+
+    nvcc = os.path.join(get_cuda_path(), "bin", "nvcc")
+    text = subprocess.run(
+        [nvcc, "--version"], capture_output=True, text=True, check=True, timeout=60
+    ).stdout
+    match = re.search(r"\bV(\d+\.\d+\.\d+)\b", text)
+    return None if match is None else _full_version(match.group(1))
+
+
+# failed loads per (twin, architecture) (:func:`_handoff_rows_loads`; under _handoff_lock)
+_handoff_rows_load_failures: collections.Counter = collections.Counter()
+
+
+def _handoff_rows_loads(twin: str, arch: str) -> bool:
+    """Whether the intra twin ``twin`` loads on ``arch`` (:func:`_counted_load`): a failure is counted, not kept,
+    up to :data:`_HANDOFF_ROWS_LOAD_TRIES` failures per twin and architecture in a process."""
+    return _counted_load(
+        twin, arch, _handoff_rows_load_failures, _HANDOFF_ROWS_LOAD_TRIES, _handoff_lock
+    )
+
+
+def _counted_load(
+    name: str,
+    arch: str,
+    failures: collections.Counter,
+    tries: int,
+    lock: threading.Lock,
+) -> bool:
+    """Whether record ``name`` loads on ``arch`` (``cake_jit.load``, which keeps a loaded module).  A failure (a JIT
+    lock timeout, an allocation failure while compiling, a broken build) is counted in ``failures`` (under
+    ``lock``), not kept: a later call tries again, up to ``tries`` failures per record and architecture."""
+    key = (name, arch)
+    with lock:
+        if failures[key] >= tries:
+            return False
+    try:
+        cake_jit.load(name, arch)
+    except Exception:
+        with lock:
+            failures[key] += 1
+        return False
+    return True
+
+
+def _handoff_wants_rows(p: Plan, index: int, own_ws: bool) -> bool:
+    """Whether an engaged recompute of plan ``p`` asks for a row record (:data:`_HANDOFF_ROWS` first): the plan has
+    an intra twin (:attr:`Plan.handoff_twin`), the call runs on its own workspace (``own_ws``: a caller's workspace
+    keeps tape records), ``p.H`` is a :data:`HANDOFF_HEADS` head count, the device's (architecture, SM count) has an
+    entry in :data:`HANDOFF_ROWS_VERIFIED` and the toolkit of the one build of the twin, the plan's intra record and
+    its light prep completes the key (:func:`_handoff_rows_toolkit`; else ``rows_unverified``), and the twin loads
+    (:func:`_handoff_rows_loads`).  A mixed build, an unreadable toolkit or a failed load count ``rows_unready``."""
+    if _HANDOFF_ROWS is not None:
+        return _HANDOFF_ROWS and p.handoff_twin is not None
+    twin = p.handoff_twin
+    if twin is None or not own_ws or p.H not in HANDOFF_HEADS:
+        return False
+    # the build is read only for a listed (architecture, SM count)
+    if not any(key[:2] == (p.arch, p.sm_count) for key in HANDOFF_ROWS_VERIFIED):
+        _handoff_note(index, "rows_unverified")
+        return False
+    parent, prep = p.record("fwd_intra", "fwd"), p.record("bwd_prep", p.light_path)
+    toolkit = _handoff_rows_toolkit(twin, parent, prep, p.arch)
+    if toolkit is None:
+        _handoff_note(index, "rows_unready")
+        return False
+    if (p.arch, p.sm_count, toolkit) not in HANDOFF_ROWS_VERIFIED:
+        _handoff_note(index, "rows_unverified")
+        return False
+    if not _handoff_rows_loads(twin, p.arch):
+        _handoff_note(index, "rows_unready")
+        return False
+    return True
+
+
+def _handoff_fits(rec: _HandoffRecord, p: Plan) -> bool:
+    """Whether the record's tensors are the ones plan ``p``'s tape backward reads (``w`` exactly where the plan's
+    record keeps it, the transfers exactly on the segmented route) and, for a tape record without ``w`` (the
+    backward then launches ``wy``), whether the light path's prep record writes the ``kb`` that ``wy`` reads; a
+    row record (``gk`` set) needs the plan's intra twin, ``gk`` / ``kg`` / ``beta_int`` of the plan's shapes and
+    ``kb`` exactly where it keeps no ``w``; a tape record holds none of the four."""
+
+    def shaped(t: torch.Tensor | None, shape: tuple[int, ...], dtype) -> bool:
+        return (
+            t is not None
+            and tuple(t.shape) == shape
+            and t.dtype == dtype
+            and t.is_contiguous()
+        )
+
+    prep = cake_jit.MODULES[p.record("bwd_prep", p.light_path)]["logical"]
+    seg = p.recur == "seg"
+    rows = (p.R, p.H, D)
+    if rec.gk is None:
+        kind_ok = all(t is None for t in (rec.kg, rec.beta_int, rec.kb)) and (
+            rec.w is not None or "kb" in prep.values()
+        )
+    else:
+        kind_ok = (
+            p.handoff_twin is not None
+            and shaped(rec.gk, rows, torch.float32)
+            and shaped(rec.kg, rows, torch.bfloat16)
+            and shaped(rec.beta_int, (p.R, p.H), torch.float32)
+            and (rec.kb is not None) == (not p.handoff_keeps_w)
+            and (rec.kb is None or shaped(rec.kb, rows, torch.bfloat16))
+        )
+    return (
+        shaped(rec.h, (p.NC_pad, p.H, D, D), torch.bfloat16)
+        and shaped(rec.v_new, rows, torch.bfloat16)
+        and (rec.w is not None) == p.handoff_keeps_w
+        and (rec.w is None or shaped(rec.w, rows, torch.bfloat16))
+        and (rec.seg_m is not None) == seg
+        and (rec.seg_m is None or shaped(rec.seg_m, (p.NSEG, p.H, D, D), torch.float32))
+        and kind_ok
+    )
+
+
+def _handoff_accept(
+    rec: _HandoffRecord,
+    p: Plan,
+    saved: KdaChunkSaved | None,
+    option: KdaArena,
+    doc_lengths: Sequence[int] | None,
+    scale: float,
+    *,
+    index: int,
+) -> _Accepted | None:
+    """The backward's verdict on a record its node took, before any workspace is acquired: accepted (a hit) when
+    the call reads a version-4 light set whose path (``light`` / ``light_states`` by its states) is plan ``p``'s
+    light path, without ``doc_lengths``, on the default arena option, with the record's plan key and tensors
+    (:func:`_handoff_fits`); otherwise the record's tensors are freed now (the callers' frames still hold it), a
+    miss, and the call runs as without a record."""
+    path = None
+    if saved is not None and saved.version == SAVED_VERSION:
+        path = (
+            "light_states" if (p.recur == "seg" and saved.hseg is not None) else "light"
+        )
+    ok = (
+        path is not None
+        and path == p.light_path
+        and doc_lengths is None
+        and option == KdaArena()
+        and rec.key == _handoff_key(p, scale)
+        and _handoff_fits(rec, p)
+    )
+    if not ok:
+        _handoff_release(rec)
+    _handoff_count(index, hit=ok)
+    return _Accepted(rec, rec.gk is not None, path) if ok else None
+
+
+def _handoff_release(rec: _HandoffRecord) -> None:
+    """Clear the record's tensor references (a dropped or refused record: its tapes are freed even while a frame
+    still holds the record)."""
+    rec.aqk = rec.h = rec.v_new = rec.w = rec.seg_m = None
+    rec.gk = rec.kg = rec.beta_int = rec.kb = None
+    rec.aliases = ()
+
+
+def _handoff_demote_locked(dev: _HandoffDevice, rec: _HandoffRecord) -> None:
+    """Turn a live row record into a tape record: drop its ``gk`` / ``kg`` / ``beta_int`` / ``kb`` and their
+    bytes (``demoted``).  What stays is a tape record of the twin's recompute: its ``h`` / ``v_new`` / ``w`` /
+    transfers are the twin's forward's, which writes them as the plan's intra record does; its backward runs the
+    light path's prep (which writes ``kb`` wherever the record keeps no ``w``: the prep without ``kb`` serves only
+    rows whose record keeps ``w``)."""
+    extra = sum(
+        t.numel() * t.element_size()
+        for t in (rec.gk, rec.kg, rec.beta_int, rec.kb)
+        if t is not None
+    )
+    rec.gk = rec.kg = rec.beta_int = rec.kb = None
+    rec.nbytes -= extra
+    dev.live_bytes -= extra
+    dev.stats["demoted"] += 1
+
+
+def _handoff_outcome_locked(dev: _HandoffDevice, *, hit: bool) -> None:
+    """Count a hit or a miss; :data:`_HANDOFF_MAX_MISSES` misses in a row, or a full outcome window with at least
+    as many misses as hits, turn the hand-off off on the device."""
+    dev.outcomes.append(hit)
+    if hit:
+        dev.stats["hits"] += 1
+        dev.misses_in_a_row = 0
+    else:
+        dev.stats["misses"] += 1
+        dev.misses_in_a_row += 1
+    window_full = len(dev.outcomes) == dev.outcomes.maxlen
+    if dev.misses_in_a_row >= _HANDOFF_MAX_MISSES or (
+        window_full and 2 * sum(dev.outcomes) <= len(dev.outcomes)
+    ):
+        dev.disabled = True
+
+
+def _handoff_drop_locked(dev: _HandoffDevice, key: int) -> None:
+    """Drop an untaken record (a miss)."""
+    rec = dev.records.pop(key)
+    dev.live_bytes -= rec.nbytes
+    _handoff_release(rec)
+    _handoff_outcome_locked(dev, hit=False)
+
+
+def _handoff_count(index: int, *, hit: bool) -> None:
+    """Count the backward's verdict on a record it took."""
+    with _handoff_lock:
+        dev = _handoff_devices.setdefault(index, _HandoffDevice())
+        _handoff_outcome_locked(dev, hit=hit)
+
+
+def _handoff_note(index: int, counter: str) -> None:
+    """Count a refusal (``unverified``, ``refused_hooks``, ``refused_blocked``, ``refused_disabled``)."""
+    with _handoff_lock:
+        _handoff_devices.setdefault(index, _HandoffDevice()).stats[counter] += 1
+
+
+def _handoff_request(ctx: Any, mode: str, v: torch.Tensor) -> dict[str, Any] | None:
+    """The autograd node's hand-off request to its forward (``None``: no record): mode ``"on"``, or ``"auto"`` with
+    ``v`` at a :data:`HANDOFF_HEADS` head count (checked first: no torch state is read where ``"auto"`` never
+    engages; a malformed ``v`` fails the operand checks after it), an input whose gradient is needed, inside a
+    backward's graph task (an original forward and the reentrant checkpoint's no-grad first pass see -1) under a
+    checkpoint recompute's saved-tensor hooks (the non-reentrant recompute's, or none: the reentrant recompute; an
+    inner region's original forward that an outer recompute re-runs has the region's pack hook), no capture /
+    compile / Python dispatch mode, the device's hand-off not turned off.  :func:`_forward` checks the call (a light
+    set on the default arena option, no ``doc_lengths``), the mode on the plan (:func:`_handoff_engages`) and the
+    byte budget.  Refusals inside a backward are counted (``refused_*``)."""
+    device = v.device
+    if (
+        mode == "off"
+        or (mode == "auto" and (v.dim() < 2 or v.shape[-2] not in HANDOFF_HEADS))
+        or device.type != "cuda"
+        or not any(ctx.needs_input_grad[:5])
+    ):
+        return None
+    # no grad-mode check: torch runs a Function's forward with grad mode off (chunk_kda passes "off" under no_grad)
+    task = _handoff_task()
+    if task is None or task == -1:
+        return None
+    index = _device_index(device)
+    dev = _handoff_devices.get(index)
+    if dev is not None and dev.disabled:
+        _handoff_note(index, "refused_disabled")
+        return None
+    if _handoff_hooks() not in ("none", "recompute"):
+        _handoff_note(index, "refused_hooks")
+        return None
+    if _handoff_blocked() or _handoff_dispatch_modes():
+        _handoff_note(index, "refused_blocked")
+        return None
+    return {"task": task, "index": index, "mode": mode}
+
+
+def _handoff_admit(
+    index: int, task: int, tape_bytes: int, row_bytes: int | None
+) -> str | None:
+    """Admission before the recompute's extra writes: the record's kind (``"rows"``, ``"tape"``) or ``None`` (no
+    record).  First drop the records of other graph tasks whose end-of-task drop could not be queued (misses; a
+    queued record stays: a reentrant region's record is taken in a nested task).  The budget is
+    :data:`_HANDOFF_BUDGET_RECORDS` tape records of this shape (``tape_bytes`` each) or, for a call that asks for a
+    row record (``row_bytes``; ``None`` where it asks for none), the larger of that and one row record.  A row
+    record is admitted when the live records plus it fit.  Otherwise, and for a call that asks for a tape record, a
+    tape record is admitted when the live records plus it fit; where they do not, every live row record of the
+    device first becomes a tape record (:func:`_handoff_demote_locked`, ``demoted``), and a tape record that still
+    does not fit is refused (``refused_budget``)."""
+    with _handoff_lock:
+        dev = _handoff_devices.setdefault(index, _HandoffDevice())
+        if dev.disabled:
+            return None
+        for key in [
+            k for k, r in dev.records.items() if r.task != task and not r.queued
+        ]:
+            _handoff_drop_locked(dev, key)
+        budget = _HANDOFF_BUDGET_RECORDS * tape_bytes
+        if row_bytes is not None:
+            budget = max(budget, row_bytes)
+            if dev.live_bytes + row_bytes <= budget:
+                return "rows"
+        if dev.live_bytes + tape_bytes > budget:
+            for rec in dev.records.values():
+                if rec.gk is not None:
+                    _handoff_demote_locked(dev, rec)
+        if dev.live_bytes + tape_bytes <= budget:
+            return "tape"
+        dev.stats["refused_budget"] += 1
+        return None
+
+
+def _handoff_sweep_idle(device: torch.device) -> None:
+    """At a forward outside any backward (graph task -1), drop every record of the device (misses).  A record lives
+    from its recompute to its node's backward within one backward pass, so a record left here belongs to a backward
+    that failed before its end-of-task drop ran (torch runs a graph task's final callbacks only when it completes).
+    A backward running at the same time on another thread loses its records too (misses: the light path)."""
+    if device.type != "cuda":
+        return
+    dev = _handoff_devices.get(_device_index(device))
+    if dev is None or not dev.records:
+        return
+    task = _handoff_task()
+    if task is not None and task != -1:
+        return
+    with _handoff_lock:
+        for key in list(dev.records):
+            _handoff_drop_locked(dev, key)
+
+
+def _handoff_task_end(index: int, task: int) -> None:
+    """The end-of-task drop: the records of graph task ``task`` no backward took (misses).  Never raises (it runs in
+    the engine's final callbacks)."""
+    with contextlib.suppress(Exception), _handoff_lock:
+        dev = _handoff_devices.get(index)
+        if dev is not None:
+            for key in [k for k, r in dev.records.items() if r.task == task]:
+                _handoff_drop_locked(dev, key)
+
+
+def _handoff_publish(
+    request: dict[str, Any], aqk: torch.Tensor, inputs: Sequence[torch.Tensor]
+) -> None:
+    """Publish the record the forward filled into ``request`` under ``aqk``'s data pointer, with its end-of-task
+    drop queued on the graph task (``queue_callback``; where that fails, the next admission of another task sweeps
+    the record)."""
+    index, task = request["index"], request["task"]
+    rec = _HandoffRecord(
+        aqk=aqk,
+        aqk_version=aqk._version,
+        stamp=_handoff_stamp(inputs),
+        aliases=tuple(t.detach() for t in inputs),
+        versions=tuple(t._version for t in inputs),
+        key=request["key"],
+        stream=request["stream"],
+        task=task,
+        nbytes=request["nbytes"],
+        **request["tensors"],
+    )
+    with contextlib.suppress(Exception):
+        torch.autograd.Variable._execution_engine.queue_callback(
+            functools.partial(_handoff_task_end, index, task)
+        )
+        rec.queued = True
+    with _handoff_lock:
+        dev = _handoff_devices.setdefault(index, _HandoffDevice())
+        key = aqk.data_ptr()
+        if key in dev.records:
+            _handoff_drop_locked(dev, key)
+        dev.records[key] = rec
+        dev.live_bytes += rec.nbytes
+        dev.stats["published"] += 1
+        if rec.gk is not None:
+            dev.stats["published_rows"] += 1
+        dev.stats["max_live_records"] = max(
+            dev.stats["max_live_records"], len(dev.records)
+        )
+
+
+def _handoff_take(
+    inputs: Sequence[torch.Tensor], aqk: torch.Tensor
+) -> _HandoffRecord | None:
+    """The record this node's recompute published (popped by the saved ``Aqk``'s data pointer; ``None`` without
+    one) when its stamps match: the same ``Aqk`` storage, view and version, no in-place change of an input since
+    the recompute (read through the record's aliases), the inputs' pointers, shapes, strides and dtypes, the
+    current stream, no capture / compile.  A mismatch drops the record (a miss); :func:`_handoff_accept` checks
+    the call, the plan key and the tensors."""
+    index = _device_index(aqk.device)
+    dev = _handoff_devices.get(index)
+    if dev is None or not dev.records:
+        return None
+    key = aqk.data_ptr()
+    with _handoff_lock:
+        rec = dev.records.pop(key, None)
+        if rec is None:
+            return None
+        dev.live_bytes -= rec.nbytes
+    try:
+        ok = (
+            rec.aqk.untyped_storage().data_ptr() == aqk.untyped_storage().data_ptr()
+            and rec.aqk.data_ptr() == key
+            and tuple(rec.aqk.shape) == tuple(aqk.shape)
+            and tuple(rec.aqk.stride()) == tuple(aqk.stride())
+            and rec.aqk.dtype == aqk.dtype
+            and rec.aqk._version == rec.aqk_version
+            and all(
+                a._version == v for a, v in zip(rec.aliases, rec.versions, strict=True)
+            )
+            and rec.stamp == _handoff_stamp(inputs)
+            and rec.stream == torch.cuda.current_stream(index).cuda_stream
+            and not _handoff_blocked()
+        )
+    except Exception:
+        ok = False
+    if not ok:
+        _handoff_release(rec)
+        _handoff_count(index, hit=False)
+        return None
+    return rec
+
+
+_HANDOFF_COUNTERS = (
+    "published",
+    "hits",
+    "misses",
+    "refused_budget",
+    "refused_hooks",
+    "refused_blocked",
+    "refused_disabled",
+    "unverified",
+    "max_live_records",
+    # row records: those published, recomputes that asked for a tape record because of the device / toolkit or the
+    # build (_handoff_wants_rows), live row records turned into tape records by the budget (_handoff_admit)
+    "published_rows",
+    "rows_unverified",
+    "rows_unready",
+    "demoted",
+)
+
+
+def _handoff_stats(index: int) -> dict[str, Any]:
+    """The hand-off counters (:data:`_HANDOFF_COUNTERS`) and live records of device ``index`` (diagnostics, tests
+    and the benchmarks' engagement checks)."""
+    with _handoff_lock:
+        dev = _handoff_devices.get(index) or _HandoffDevice()
+        return {
+            **{name: dev.stats[name] for name in _HANDOFF_COUNTERS},
+            "live_records": len(dev.records),
+            "live_bytes": dev.live_bytes,
+            "disabled": dev.disabled,
+        }
+
+
+def _handoff_reset() -> None:
+    """Drop every record and counter and turn the hand-off back on (diagnostics and tests)."""
+    with _handoff_lock:
+        for dev in _handoff_devices.values():
+            for rec in dev.records.values():
+                _handoff_release(rec)
+        _handoff_devices.clear()
+        _handoff_rows_load_failures.clear()
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# The tape path's w-only WY twin: the tape backward (a version-2 saved set, or a checkpoint hand-off record without
+# the forward's w) takes v_new from the tape, so nothing it launches reads the u its WY record also writes.  Its twin
+# (cake_jit.TAPE_TWINS, Plan.tape_wy_twin) is that program without the u half: the same w from fewer bytes (no v,
+# beta or u traffic).
+
+# The tape backward launches the twin on these (architecture, SM count, full toolkit version "major.minor.patch")
+# devices, where the twin and the tape path's WY record come from one build (the twin writes the record's w bit for
+# bit where one toolkit compiles both to the same instructions; :func:`_tape_wy_toolkit`) and the twin loads.  A
+# device enters with the passing evidence of that device and toolkit: the hand-off suite, the tape-mode tests with
+# the twin and the hand-off parity rows, bitwise.  Elsewhere the tape backward launches its WY record.
+TAPE_WY_VERIFIED: frozenset[tuple[str, int, str]] = frozenset(
+    {
+        ("sm_100a", 148, "13.4.92"),
+        ("sm_100a", 152, "13.4.92"),
+        ("sm_103a", 148, "13.4.92"),
+        ("sm_107a", 212, "13.4.92"),
+    }
+)
+# tests and diagnostics only: False launches the tape path's WY record everywhere; True its twin wherever the plan
+# has one (the device, build and load checks skipped); None: the rule
+_TAPE_WY: bool | None = None
+# failed loads of the twin (per twin and architecture) after which a process launches the WY record
+_TAPE_WY_LOAD_TRIES = 3
+# the tape backward's twin launches and refusals per device (:func:`_tape_wy_stats`)
+_TAPE_WY_COUNTERS = ("launched", "unverified", "unready")
+_tape_wy_lock = threading.Lock()
+# failed loads per (twin, architecture) and the counters per (device, counter), under _tape_wy_lock
+_tape_wy_load_failures: collections.Counter = collections.Counter()
+_tape_wy_counts: collections.Counter = collections.Counter()
+
+
+@functools.cache
+def _tape_wy_toolkit(twin: str, parent: str, arch: str) -> str | None:
+    """The full toolkit version of the one build of ``arch`` that serves the tape WY twin ``twin`` and the tape
+    path's WY record ``parent`` (:func:`_one_build_toolkit`).  Cached per arguments."""
+    return _one_build_toolkit((twin, parent), arch)
+
+
+def _tape_wy_loads(twin: str, arch: str) -> bool:
+    """Whether the tape WY twin loads on ``arch`` (:func:`_counted_load`): up to :data:`_TAPE_WY_LOAD_TRIES`
+    failures per twin and architecture in a process."""
+    return _counted_load(
+        twin, arch, _tape_wy_load_failures, _TAPE_WY_LOAD_TRIES, _tape_wy_lock
+    )
+
+
+def _tape_wy_note(index: int, counter: str) -> None:
+    """Count a twin launch or a refusal (:data:`_TAPE_WY_COUNTERS`) on device ``index``."""
+    with _tape_wy_lock:
+        _tape_wy_counts[(index, counter)] += 1
+
+
+def _tape_wy_record(p: Plan, index: int) -> str | None:
+    """The record a tape backward of plan ``p`` launches for its WY stage in place of the plan's
+    (``record("wy", "tape")``), ``None`` for the plan's own (:data:`_TAPE_WY` first): the twin
+    (:attr:`Plan.tape_wy_twin`) where the device's (architecture, SM count) has an entry in
+    :data:`TAPE_WY_VERIFIED` (else ``unverified``, the build not read), the toolkit of the one build of the twin and
+    the plan's WY record completes the key (another toolkit: ``unverified``; a mixed build or an unreadable
+    toolkit: ``unready``) and the twin loads (else ``unready``).  Each refusal launches the WY record, which writes
+    the same ``w``."""
+    twin = p.tape_wy_twin
+    if _TAPE_WY is not None:
+        return twin if _TAPE_WY else None
+    if twin is None:
+        return None
+    # the build is read only for a listed (architecture, SM count)
+    if not any(key[:2] == (p.arch, p.sm_count) for key in TAPE_WY_VERIFIED):
+        _tape_wy_note(index, "unverified")
+        return None
+    toolkit = _tape_wy_toolkit(twin, p.record("wy", "tape"), p.arch)
+    if toolkit is None:
+        _tape_wy_note(index, "unready")
+        return None
+    if (p.arch, p.sm_count, toolkit) not in TAPE_WY_VERIFIED:
+        _tape_wy_note(index, "unverified")
+        return None
+    if not _tape_wy_loads(twin, p.arch):
+        _tape_wy_note(index, "unready")
+        return None
+    return twin
+
+
+def _tape_wy_stats(index: int) -> dict[str, int]:
+    """The tape WY counters (:data:`_TAPE_WY_COUNTERS`) of device ``index``: the tape backwards that launched the
+    twin and the refusals of the rule (diagnostics, tests and the benchmarks' engagement checks)."""
+    with _tape_wy_lock:
+        return {name: _tape_wy_counts[(index, name)] for name in _TAPE_WY_COUNTERS}
+
+
+def _tape_wy_reset() -> None:
+    """Drop the tape WY counters and failed loads (diagnostics and tests)."""
+    with _tape_wy_lock:
+        _tape_wy_counts.clear()
+        _tape_wy_load_failures.clear()
+
+
+# ----------------------------------------------------------------------------------------------------------------
 # autograd
 
 
@@ -3982,13 +5273,16 @@ def _saved_extra(
 class ChunkKDAFunction(torch.autograd.Function):
     """:func:`chunk_kda` as an autograd node: the forward saves the inputs and the saved set, the backward runs
     :func:`chunk_kda_bwd` from them.  Under ``torch.utils.checkpoint`` (``use_reentrant=False``) the forward is
-    re-run in the backward and the saved set recomputed; no special casing.  The node keeps nothing but the saved
+    re-run in the backward and the saved set recomputed; the re-run forward may also hand its tapes to the backward
+    (the checkpoint hand-off, the module docstring).  The node keeps nothing but the saved
     tensors alive: the caller's workspace is held through a weak reference, so a workspace the caller dropped
     after the forward (a per-call one, or any workspace of a checkpointed forward whose frame is gone) is freed,
     and the backward then allocates its own (:func:`chunk_kda_bwd` without ``workspace``).  The trailing argument
     ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`): an ``apply`` that swaps only the
     import path of the deterministic package's Function fails instead of changing mode; the node records it and
-    its backward passes it on."""
+    its backward passes it on.  ``checkpoint_handoff`` is the positional argument before it (``None``: ``"auto"``;
+    a ``bool`` there raises ``TypeError``: an ``apply`` written without the slot); :func:`chunk_kda` applies the
+    environment override and passes ``"off"`` under ``no_grad``."""
 
     @staticmethod
     def forward(
@@ -4004,10 +5298,28 @@ class ChunkKDAFunction(torch.autograd.Function):
         save_mode,
         arena,
         doc_lengths,
+        checkpoint_handoff=None,
         deterministic=True,
     ):
+        if isinstance(checkpoint_handoff, bool):
+            # an apply written for the signature without the slot passes its deterministic flag here
+            raise TypeError(
+                "ChunkKDAFunction: the positional argument after doc_lengths is checkpoint_handoff (None, "
+                f"'auto', 'on' or 'off'), got {checkpoint_handoff!r}; deterministic follows it: pass None, False"
+            )
         _require_deterministic_false(deterministic, "ChunkKDAFunction")
-        out, saved = chunk_kda_fwd(
+        mode = "auto" if checkpoint_handoff is None else checkpoint_handoff
+        if mode not in HANDOFF_MODES:
+            raise ValueError(
+                f"ChunkKDAFunction: checkpoint_handoff must be None or one of {HANDOFF_MODES}, got "
+                f"{checkpoint_handoff!r}"
+            )
+        # a forward outside any backward drops the records a failed backward left
+        if _handoff_devices:
+            _handoff_sweep_idle(v.device)
+        # the checkpoint recompute's request (None outside a backward's graph task: the original forward)
+        request = _handoff_request(ctx, mode, v)
+        out, saved = _fwd_call(
             q,
             k,
             v,
@@ -4020,8 +5332,10 @@ class ChunkKDAFunction(torch.autograd.Function):
             save_mode=save_mode,
             arena=arena,
             doc_lengths=doc_lengths,
-            deterministic=deterministic,
+            handoff=request,
         )
+        if request is not None and "tensors" in request:
+            _handoff_publish(request, saved.Aqk, (q, k, v, g, beta, cu_seqlens))
         extra, ctx.extra_fields = _saved_extra(saved)
         ctx.save_for_backward(
             q,
@@ -4072,7 +5386,10 @@ class ChunkKDAFunction(torch.autograd.Function):
                 dout.contiguous()
             )  # autograd may hand over an expanded or permuted gradient
         workspace = None if ctx.workspace_ref is None else ctx.workspace_ref()
-        dq, dk, dv, dbeta, dg = chunk_kda_bwd(
+        _require_deterministic_false(ctx.deterministic, "chunk_kda_bwd")
+        # the checkpoint recompute's record of this node (None without one, or when a stamp mismatches)
+        record = _handoff_take((q, k, v, g, beta, cu_seqlens), Aqk)
+        dq, dk, dv, dbeta, dg = _bwd_call(
             q,
             k,
             v,
@@ -4085,9 +5402,9 @@ class ChunkKDAFunction(torch.autograd.Function):
             workspace=workspace,
             arena=None if workspace is not None else ctx.arena,
             doc_lengths=ctx.doc_lengths,
-            deterministic=ctx.deterministic,
+            handoff=record,
         )
-        return dq, dk, dv, dg, dbeta, None, None, None, None, None, None, None
+        return dq, dk, dv, dg, dbeta, None, None, None, None, None, None, None, None
 
 
 def chunk_kda(
@@ -4103,6 +5420,7 @@ def chunk_kda(
     save_mode: str | None = None,
     arena: KdaArena | None = None,
     doc_lengths: Sequence[int] | None = None,
+    checkpoint_handoff: str = "auto",
     deterministic: bool = True,
 ) -> torch.Tensor:
     """The autograd entry: ``out`` with gradients to ``q, k, v, g, beta``.
@@ -4119,10 +5437,15 @@ def chunk_kda(
     ``None``: the workspace's option, off without one) is the lower-memory arena option; the node records it, so
     the backward's own workspace (a per-call or checkpointed forward) takes the same option.  ``doc_lengths``
     (the documents' token counts, host integers) is required under a batched option and recorded by the node.
+    ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``) and ``CAKE_KDA_CKPT_HANDOFF``: the checkpoint
+    hand-off (the module docstring).
     ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`); the node's backward is this
     package's.
     """
     _require_deterministic_false(deterministic, "chunk_kda")
+    mode = _handoff_mode(checkpoint_handoff)
+    if not torch.is_grad_enabled():
+        mode = "off"  # no node is recorded: no backward would take a record
     return ChunkKDAFunction.apply(
         q,
         k,
@@ -4135,6 +5458,7 @@ def chunk_kda(
         save_mode,
         arena,
         doc_lengths,
+        mode,
         False,
     )
 
@@ -4165,6 +5489,11 @@ __all__ = [
     "FWD_LAYOUTS",
     "FWD_SLOTS",
     "FWD_TAPE_SLOTS",
+    "HANDOFF_HEADS",
+    "HANDOFF_LAYOUT",
+    "HANDOFF_MODES",
+    "HANDOFF_ROWS_VERIFIED",
+    "HANDOFF_VERIFIED",
     "KIND_SHAPE",
     "LEAN_MODES",
     "MAX_DOCS",
@@ -4177,6 +5506,7 @@ __all__ = [
     "SEG_SAVE_MIN_TOKENS_PER_SEG",
     "SLOTS",
     "TABLE_NAMES",
+    "TAPE_WY_VERIFIED",
     "ChunkKDAFunction",
     "KdaArena",
     "KdaChunkSaved",
