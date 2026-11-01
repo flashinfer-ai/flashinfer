@@ -18,9 +18,10 @@ non-deterministic backward (``deterministic=False``) beside a kernel resident
 on another stream (the concurrent-launch contract of issues #7038 and #7548).
 
 The forward launches a plain grid of independent CTAs; on SM100 and SM103
-from 976 rows per SM the mid forward launches whole waves of 6 CTAs per SM
-that each walk at most 2 row blocks, and from 2400 rows per SM the long
-forward whole waves of 3 CTAs per SM that each walk at most 6.  The backward launches
+up to 10 rows per SM the short forward launches one 256-thread CTA per row
+block (fewer CTAs than SMs), from 976 rows per SM the mid forward whole waves
+of 6 CTAs per SM that each walk at most 2 row blocks, and from 2400 rows per
+SM the long forward whole waves of 3 CTAs per SM that each walk at most 6.  The backward launches
 at most one wave of CTAs (on SM100 and SM103 from 1280 rows per SM the long
 backward 5 CTAs per SM, a quarter more than an SM holds at once, its fifth on
 an SM starting as one of the first four leaves): when the grid has a CTA for
@@ -65,7 +66,21 @@ the token counts that give the long forward's CTA slots 25 and 100 row blocks
 each (its threshold of 2400 rows per SM and four times that) and the mid
 forward's 11 and 24 (1056 and 2304 rows per SM: the fewest whole blocks
 per slot at or above its threshold of 976 rows per SM, and the most below the
-long forward's).
+long forward's).  The short forward at 1 and 10 rows per SM keeps its speed
+beside the one-thread kernel, starts beside the all-SM kernel with the
+max-shared carveout, and beside a side kernel that holds ``k`` SMs (the item 1
+side kernels and 16 CTAs of 1024 threads with the max-shared carveout) ends no
+later than the deterministic forward beside the same side kernel: the busy
+median is at most the deterministic forward's busy median times ``1 +
+PROPORTIONAL_SLACK``, or at most ``SHORT_EXTRA_MS`` above it: one tick of
+the event timer (about 1 microsecond on SM103) and a half, the calls taking
+a few microseconds.  The two forwards' alone / busy pairs alternate round by
+round over the same stretch of time, which does not make a slow stretch of the
+host or the GPU fall on both alike: a measurement counts only when each
+forward's alone median is at most ``SHORT_MAX_ALONE_SPREAD`` times its fastest
+alone sample of that measurement, else it is taken again, at most
+``SHORT_EXTRA_ATTEMPTS`` more times, and the bound applies to the first
+measurement that counts (to the last one when none does).
 
 In the item 1 and item 2 tests every side CTA records its SM and its start
 time, and a run counts only when the side kernel held the intended SMs before
@@ -88,6 +103,7 @@ from tests.test_helpers.cake_package import cake_package
 
 pkg = cake_package("cake_rmsnorm_silu_gate_train")
 loader = cake_package("cake_rmsnorm_silu_gate_train", "cake_jit")
+det_pkg = cake_package("cake_rmsnorm_silu_gate_det_train")
 forward = functools.partial(
     pkg.cake_rmsnorm_silu_gate_train_forward, deterministic=False
 )
@@ -453,6 +469,38 @@ def _paired_medians(call, spin: _Spin, runs: int):
     )
 
 
+def _interleaved_paired_medians(calls, spin: _Spin, runs: int):
+    """Per call of ``calls``, the medians of ``runs`` alone / beside-``spin``
+    pairs and the pairs, the calls' pairs taken round by round (their order
+    alternating)."""
+    side = torch.cuda.Stream()
+    for call in calls:
+        for _ in range(WARMUP):
+            _spin_timed(call)
+    alone = [[] for _ in calls]
+    busy = [[] for _ in calls]
+    for r in range(runs):
+        order = range(len(calls)) if r % 2 == 0 else reversed(range(len(calls)))
+        for i in order:
+            alone[i].append(_spin_timed(calls[i]))
+            timed = _beside(calls[i], spin, side)
+            if timed is None:
+                pytest.skip(
+                    f"the side kernel did not hold {spin.ctas} distinct SMs "
+                    f"before the call in {ALL_SM_TRIES} launches"
+                )
+            busy[i].append(timed)
+    return [
+        (
+            statistics.median(t for t, _ in alone[i]),
+            statistics.median(t for t, _ in busy[i]),
+            alone[i],
+            busy[i],
+        )
+        for i in range(len(calls))
+    ]
+
+
 def _dw_reference(dy, x, z):
     """``(dw64, mag)``: the FP64 weight gradient of the BF16 inputs and
     ``sum |a * n|`` per column, the scale of its rounding (the backend suite's
@@ -680,3 +728,159 @@ def test_mid_forward_slows_in_proportion_to_the_sms_held(
     blocks_per_slot: int, ctas: int, threads: int
 ) -> None:
     _forward_slows_in_proportion("fwd_mid", blocks_per_slot, ctas, threads)
+
+
+# The short forward: the rows per SM of its two token counts (one row and its
+# threshold of 10 rows per SM), and the side kernels of the item 1 test beside
+# it, the issue's three with the default carveout and 16 CTAs of 1024 threads
+# with the max-shared carveout.
+SHORT_FORWARD_ROWS_PER_SM = (1, 10)
+SHORT_FORWARD_SIDES = ((1, 128, None), (16, 640, None), (32, 640, None)) + (
+    (16, 1024, CARVEOUT_MAX_SHARED),
+)
+SHORT_EXTRA_MS = 0.0015
+# A held measurement counts when each forward's alone median is at most this
+# many times its fastest alone sample in that measurement; otherwise it is taken
+# again, at most SHORT_EXTRA_ATTEMPTS more times.  The largest median-to-fastest
+# ratio was 1.43 in 170 held measurements on a GB300 node running only this
+# test file (20 runs on 2 GPUs), 1.43 in 80 more on that node with pytest,
+# pre-commit and compute-sanitizer work on its other GPUs (10 runs), and 1.38
+# in 160 on a B200 node (20 runs).  With compile and compute-sanitizer work on
+# the other GPUs of a second GB300 node, one measurement had alone medians of
+# 0.0103 and 0.0113 ms and failed the bound.
+SHORT_MAX_ALONE_SPREAD = 1.7
+SHORT_EXTRA_ATTEMPTS = 2
+
+
+def _short_forward_tokens(rows_per_sm: int) -> int:
+    """The most tokens ``T`` (at least one) whose ``T * H`` rows stay within
+    ``rows_per_sm`` rows per SM, where the architecture routes the short
+    forward (skips elsewhere)."""
+    device_index = torch.cuda.current_device()
+    arch = loader.device_arch(device_index)
+    name = loader.ROUTES[arch].get("fwd_short")
+    if name is None:
+        pytest.skip(f"{arch} routes no fwd_short module")
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    tokens = max(1, rows_per_sm * sms // H)
+    assert loader.module_for_rows(arch, "fwd", tokens * H, sms) == name
+    return tokens
+
+
+@pytest.mark.parametrize("rows_per_sm", SHORT_FORWARD_ROWS_PER_SM)
+def test_short_forward_keeps_its_speed_beside_a_resident_kernel(
+    rows_per_sm: int,
+) -> None:
+    tokens = _short_forward_tokens(rows_per_sm)
+    x, z, w, _dy = _inputs(tokens)
+    y = torch.empty_like(x)
+
+    def call():
+        return (forward(x, z, w, EPS, out=y),)
+
+    side = torch.cuda.Stream()
+    for _ in range(WARMUP):
+        _timed(call, side=None)
+    alone, busy = [], []
+    for _ in range(RUNS):
+        alone.append(_timed(call, side=None))
+        busy.append(_timed(call, side=side))
+    alone_ms = statistics.median(t for t, _ in alone)
+    busy_ms = statistics.median(t for t, _ in busy)
+    print(
+        f"STALL stage=short_forward tokens={tokens} heads={H} "
+        f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
+        f"ratio={busy_ms / alone_ms:.3f} extra_ms={busy_ms - alone_ms:.4f}"
+    )
+    _check_outputs("forward", tokens, alone, busy)
+    assert _keeps_its_speed(alone_ms, busy_ms), (
+        f"short forward tokens={tokens}: {busy_ms:.4f} ms beside a resident "
+        f"kernel vs {alone_ms:.4f} ms alone"
+    )
+
+
+@pytest.mark.parametrize("rows_per_sm", SHORT_FORWARD_ROWS_PER_SM)
+def test_short_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
+    rows_per_sm: int,
+) -> None:
+    tokens = _short_forward_tokens(rows_per_sm)
+    x, z, w, _dy = _inputs(tokens)
+    y = torch.empty_like(x)
+
+    def call():
+        return (forward(x, z, w, EPS, out=y),)
+
+    alone_ms, busy_ms, alone, busy = _paired_medians(
+        call, _spin(CARVEOUT_MAX_SHARED), ALL_SM_RUNS
+    )
+    print(
+        f"ALL_SM stage=short_forward tokens={tokens} heads={H} "
+        f"carveout=max_shared alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
+        f"extra_ms={busy_ms - alone_ms:.4f}"
+    )
+    _check_outputs("forward", tokens, alone, busy)
+    assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
+        f"tokens={tokens}: short forward alone {alone_ms:.4f} ms, beside an "
+        f"all-SM kernel with the max-shared carveout {busy_ms:.4f} ms (at most "
+        f"{MAX_ALL_SM_EXTRA_MS} ms more)"
+    )
+
+
+@pytest.mark.parametrize(
+    "ctas,threads,carveout",
+    SHORT_FORWARD_SIDES,
+    ids=["1x128", "16x640", "32x640", "16x1024-max_shared"],
+)
+@pytest.mark.parametrize("rows_per_sm", SHORT_FORWARD_ROWS_PER_SM)
+def test_short_forward_ends_no_later_than_the_forward_beside_held_sms(
+    rows_per_sm: int, ctas: int, threads: int, carveout: int | None
+) -> None:
+    tokens = _short_forward_tokens(rows_per_sm)
+    x, z, w, _dy = _inputs(tokens)
+    y = torch.empty_like(x)
+    y_det = torch.empty_like(x)
+
+    def call():
+        return (forward(x, z, w, EPS, out=y),)
+
+    def call_det():
+        return (
+            det_pkg.cake_rmsnorm_silu_gate_det_train_forward(x, z, w, EPS, out=y_det),
+        )
+
+    spin = _spin(carveout, ctas=ctas, threads=threads)
+    side = f"{ctas}x{threads}" + ("s" if carveout is not None else "")
+    attempts = 1 + SHORT_EXTRA_ATTEMPTS
+    for attempt in range(1, attempts + 1):
+        short_medians, det_medians = _interleaved_paired_medians(
+            (call, call_det), spin, PROPORTIONAL_RUNS
+        )
+        alone_ms, busy_ms, alone, busy = short_medians
+        det_alone_ms, det_busy_ms, det_alone, det_busy = det_medians
+        alone_min_ms = min(t for t, _ in alone)
+        det_alone_min_ms = min(t for t, _ in det_alone)
+        spread = max(alone_ms / alone_min_ms, det_alone_ms / det_alone_min_ms)
+        counts = spread <= SHORT_MAX_ALONE_SPREAD
+        print(
+            f"HELD stage=short_forward tokens={tokens} heads={H} side={side} "
+            f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
+            f"det_alone_ms={det_alone_ms:.4f} det_busy_ms={det_busy_ms:.4f} "
+            f"busy_vs_det={busy_ms / det_busy_ms:.3f} "
+            f"alone_min_ms={alone_min_ms:.4f} det_alone_min_ms={det_alone_min_ms:.4f} "
+            f"alone_spread={spread:.3f} attempt={attempt}/{attempts} "
+            f"counts={int(counts)}"
+        )
+        _check_outputs("forward", tokens, alone + det_alone, busy + det_busy)
+        if counts:
+            break
+    assert (
+        busy_ms <= det_busy_ms * (1 + PROPORTIONAL_SLACK)
+        or busy_ms - det_busy_ms <= SHORT_EXTRA_MS
+    ), (
+        f"tokens={tokens}: beside {ctas} x {threads} side CTAs ({side}) the short "
+        f"forward took {busy_ms:.4f} ms, the deterministic forward "
+        f"{det_busy_ms:.4f} ms (at most {1 + PROPORTIONAL_SLACK:.2f} times or "
+        f"{SHORT_EXTRA_MS} ms more; measurement {attempt} of at most {attempts}, "
+        f"alone spread {spread:.3f}, "
+        + ("counted)" if counts else f"none counted: above {SHORT_MAX_ALONE_SPREAD})")
+    )
