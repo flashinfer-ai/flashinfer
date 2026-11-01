@@ -120,12 +120,13 @@ itself: the serial table or a `(64, 1)` split table of any segment length,
 priced as the makespan of one CTA per (segment, value head) times the
 `dhu_tc2` step time plus the pre-scan and stitch terms.  It takes that table
 when it saves at least 10 us and 5 % of the priced adjoint pass (on `sm_107a`
-at least 2 us, `TC_PLAN_SELECT`), and runs it on `dhu_tc2`; a serial table
-that the two-stream rule groups keeps its form.
+at least 2 us, with no percentage floor, `TC_PLAN_SELECT`), and runs it on
+`dhu_tc2`; a serial table that the two-stream rule groups keeps its form.
 On `sm_107a` (`CHAIN_PLAN`) each direction may then take a deeper `(64, 1)`
 split table (more segments than the chosen table), priced for the chain that
 runs it (`fwd_ho` for the forward, `dhu_tc2` for the adjoint) with R200 step
-times and fitted split costs, when it saves at least 2 us; a serial table that
+times and fitted split costs, when it saves at least 2 us and prices at most
+0.95 of the chosen table; a serial table that
 the two-stream rule groups keeps its form, and `sm_100a` / `sm_103a` keep their
 tables.  Elsewhere the forward table is the planner's.  A different table
 changes the bits of the outputs that depend on it (other segment boundaries),
