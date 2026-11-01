@@ -138,6 +138,13 @@ _SPLIT_PACK = {
     for routes in cake_api._CONTEXT_FP8_SPLIT_ROUTES.values()
     for (pack, _), identifier in routes.items()
 }
+# the two-split programs: the pack of the split-KV program a launch of two units
+# per split tile leaves
+_SPLIT_PACK |= {
+    identifier: _SPLIT_PACK[split]
+    for routes in cake_api._CONTEXT_FP8_TWO_SPLIT_ROUTES.values()
+    for split, identifier in routes.items()
+}
 
 
 # one-stage program identifier -> its pack
@@ -214,6 +221,11 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
             )
     for target, one_wave in cake_api._CONTEXT_FP8_ONE_WAVE_ROUTES.items():
         for identifier in one_wave.values():
+            served.setdefault(("context_fp8", identifier), set()).add(
+                _TARGET_ARCH[target]
+            )
+    for target, two_split in cake_api._CONTEXT_FP8_TWO_SPLIT_ROUTES.items():
+        for identifier in two_split.values():
             served.setdefault(("context_fp8", identifier), set()).add(
                 _TARGET_ARCH[target]
             )
@@ -849,7 +861,8 @@ _SM_COUNT = {"sm100a": 148, "sm103a": 152}
 
 def test_cake_fmha_context_fp8_split_routes_mirror_the_runtime_routes() -> None:
     """Every runtime-size program has the split-KV program of its pack and page
-    size on the same targets, and no other split-KV program exists."""
+    size on the same targets, and the only other split-KV program is the
+    sm100a two-split build of the pack-1 page-64 one."""
 
     runtime = cake_api._CONTEXT_FP8_RUNTIME_ROUTES
     assert set(cake_api._CONTEXT_FP8_SPLIT_ROUTES) == set(runtime)
@@ -858,7 +871,49 @@ def test_cake_fmha_context_fp8_split_routes_mirror_the_runtime_routes() -> None:
             key: "RUNTIME_SK" + identifier.removeprefix("RUNTIME").removesuffix("_PX")
             for key, identifier in routes.items()
         }
+    assert cake_api._CONTEXT_FP8_TWO_SPLIT_ROUTES == {
+        "sm100a": {"RUNTIME_SK_PACK1_PAGE64": "RUNTIME_SK_PACK1_PAGE64_S2"}
+    }
     assert frozenset(_SPLIT_PACK) == cake_api._CONTEXT_FP8_SPLIT_PROGRAMS
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_context_fp8_two_split_route(monkeypatch, request, target) -> None:
+    """sm100a: a split-KV launch of RUNTIME_SK_PACK1_PAGE64 whose plan has two
+    units per split tile (16 requests of 256 query tokens over 2048 keys,
+    heads 32/32) takes RUNTIME_SK_PACK1_PAGE64_S2, for host and device scales;
+    a plan of more units per split tile (1 request of 32 query tokens over
+    2048 keys, heads 32/32) keeps RUNTIME_SK_PACK1_PAGE64; sm103a keeps it
+    for both."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    sm_count = _SM_COUNT[target]
+    monkeypatch.setattr(cake_api, "_context_split_sm_count", lambda device: sm_count)
+    _clear_split_caches()
+    request.addfinalizer(_clear_split_caches)
+    meta = torch.device("meta")
+    workspace = torch.empty(1 << 28, dtype=torch.uint8, device="meta")
+    for batch, q_len, kv_len, two_units in (
+        (16, 256, 2048, True),
+        (1, 32, 2048, False),
+    ):
+        choice = cake_api._context_fp8_split_choice(
+            target, batch, q_len, kv_len, 32, 1, sm_count
+        )
+        row = ("context_fp8", batch, q_len, kv_len, 32, 32, 64, True, None)
+        for device_scales in (False, True):
+            kwargs = _context_kwargs(row, device="meta", device_scales=device_scales)
+            kwargs["workspace_buffer"] = workspace
+            route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
+            if target != "sm100a":
+                assert route.program != "RUNTIME_SK_PACK1_PAGE64_S2", route
+                continue
+            assert choice is not None and choice[0] == 1, choice
+            assert (choice[1][2] == 2) is two_units, choice
+            assert route.program == (
+                "RUNTIME_SK_PACK1_PAGE64_S2" if two_units else "RUNTIME_SK_PACK1_PAGE64"
+            ), (batch, q_len, kv_len, route)
+            assert (route.pack_g, route.device_scales) == (1, device_scales)
 
 
 def test_cake_fmha_context_fp8_tile_blocks_follow_the_program_tile_order() -> None:
@@ -4370,6 +4425,132 @@ def test_cake_context_one_wave_program_matches_the_runtime_program_bitwise(
     assert served_programs[-1] == "RUNTIME_PACK8", served_programs[-1]
     assert torch.equal(_bits(runtime), _bits(out)), (
         f"max abs difference {(runtime.float() - out.float()).abs().max().item()}"
+    )
+
+
+_TWO_SPLIT_CASES = [
+    # 16 requests of 256 query tokens over 2048 keys, heads 32/32 (512 tiles)
+    ((256,) * 16, (2048,) * 16, True),
+    # 2 requests (64 tiles, one wave)
+    ((256, 256), (2048, 2048), True),
+    # ragged, separate K / V tables: tiles of one unit among the split ones
+    ((256, 200, 37, 256) * 4, (2048, 1900, 600, 2048) * 4, False),
+]
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("q_lens", "kv_lens", "shared"),
+    _TWO_SPLIT_CASES,
+    ids=[
+        f"b{len(c[0])}_q{max(c[0])}_k{max(c[1])}_s{int(c[2])}" for c in _TWO_SPLIT_CASES
+    ],
+)
+def test_cake_context_two_split_program_matches_the_split_program_bitwise(
+    monkeypatch, served_programs, q_lens, kv_lens, shared
+) -> None:
+    """sm100a: the two-split program (RUNTIME_SK_PACK1_PAGE64_S2, a split-KV
+    launch of two units per split tile) writes the same output bytes as
+    RUNTIME_SK_PACK1_PAGE64 (the same plan, arithmetic and order of every sum;
+    the merging unit's own term from its TMEM O), within the FP8 contract
+    tolerance of an FP32 reference, for host and device scales, and the
+    counters read zero after each launch."""
+
+    device = torch.device("cuda")
+    sm_count = get_device_sm_count(device)
+    if cake_api._cake_fmha_target(device) != "sm100a" or sm_count != 148:
+        pytest.skip("the two-split program ships for sm100a (planned at 148 SMs)")
+    hq = hkv = 32
+    page_size = 64
+    batch = len(q_lens)
+    max_q, max_kv = max(q_lens), max(kv_lens)
+    choice = cake_api._context_fp8_split_choice(
+        "sm100a", batch, max_q, max_kv, hq, 1, sm_count
+    )
+    assert choice is not None and choice[0] == 1 and choice[1][2] == 2, choice
+    generator = torch.Generator(device="cpu").manual_seed(20261101 + batch)
+    pages = (max_kv + page_size - 1) // page_size
+    total_pages = 2 * batch * pages
+    query = torch.randn((sum(q_lens), hq, 128), generator=generator).to(
+        device=device, dtype=torch.float8_e4m3fn
+    )
+    key = torch.randn((total_pages, hkv, page_size, 128), generator=generator).to(
+        device=device, dtype=torch.float8_e4m3fn
+    )
+    value = torch.randn((total_pages, hkv, page_size, 128), generator=generator).to(
+        device=device, dtype=torch.float8_e4m3fn
+    )
+    order = torch.randperm(total_pages, generator=generator).to(torch.int32)
+    tables_k = order[: batch * pages].view(batch, pages).to(device)
+    tables_v = (
+        tables_k if shared else order[batch * pages :].view(batch, pages).to(device)
+    )
+    block_tables = tables_k if shared else torch.stack((tables_k, tables_v), dim=1)
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    cum_q = torch.cat(
+        (torch.zeros(1, dtype=torch.int32), torch.tensor(q_lens).cumsum(0).int())
+    ).to(device)
+    cum_kv = torch.cat(
+        (torch.zeros(1, dtype=torch.int32), torch.tensor(kv_lens).cumsum(0).int())
+    ).to(device)
+    workspace = torch.zeros(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    counter = torch.zeros(
+        get_trtllm_gen_multi_ctas_kv_counter_bytes(batch, hq, sm_count),
+        dtype=torch.uint8,
+        device=device,
+    )
+    bmm1, bmm2 = _QUANT_SCALES
+
+    def run(device_scales=False):
+        scales = (bmm1, bmm2)
+        if device_scales:
+            scales = tuple(
+                torch.tensor(scale, dtype=torch.float32, device=device)
+                for scale in scales
+            )
+        out = torch.full_like(query, float("nan"))
+        prefill.trtllm_batch_context_with_kv_cache(
+            query,
+            (key, value),
+            workspace,
+            block_tables,
+            seq_lens,
+            max_q,
+            max_kv,
+            *scales,
+            batch,
+            cum_q,
+            cum_kv,
+            out=out,
+            kv_layout="HND",
+            uses_shared_paged_kv_idx=shared,
+            multi_ctas_kv_counter_buffer=counter,
+            backend="cake",
+        )
+        torch.cuda.synchronize()
+        assert not counter.any()
+        return out
+
+    out = run()
+    assert served_programs[-1] == "RUNTIME_SK_PACK1_PAGE64_S2", served_programs[-1]
+    again = run()
+    device_out = run(device_scales=True)
+    assert served_programs[-2:] == ["RUNTIME_SK_PACK1_PAGE64_S2"] * 2
+    assert torch.equal(_bits(again), _bits(out))
+    assert torch.equal(_bits(device_out), _bits(out))
+    expected = (
+        _reference_context(
+            query, key, value, tables_k, tables_v, q_lens, kv_lens, scale=bmm1
+        )
+        * bmm2
+    )
+    torch.testing.assert_close(out.float(), expected, atol=0.1, rtol=0.1)
+    with monkeypatch.context() as patch:
+        patch.setattr(cake_api, "_CONTEXT_FP8_TWO_SPLIT_ROUTES", {})
+        split = run()
+        assert served_programs[-1] == "RUNTIME_SK_PACK1_PAGE64", served_programs[-1]
+    assert torch.equal(_bits(split), _bits(out)), (
+        f"max abs difference {(split.float() - out.float()).abs().max().item()}"
     )
 
 

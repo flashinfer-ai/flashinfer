@@ -608,42 +608,49 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
     ),
     # The FP8 split-KV programs: the runtime-size arguments, then the split plan.
     ("context_fp8", "RUNTIME_SK_PACK8"): (
-        "cake_fmha_context_fp8_ee373474e6d16691cab7",
+        "cake_fmha_context_fp8_2b603161717df80f5fad",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_SK_PACK4"): (
-        "cake_fmha_context_fp8_074b1da06353ee6d95c6",
+        "cake_fmha_context_fp8_65810993ed3b69e0ec02",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_SK_PACK2"): (
-        "cake_fmha_context_fp8_2208354a624a713e3455",
+        "cake_fmha_context_fp8_af67d1eeceafba84dcfa",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_SK_PACK1"): (
-        "cake_fmha_context_fp8_a93f4040f2fe5b5a85bb",
+        "cake_fmha_context_fp8_1a415e1054807d030032",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_SK_PACK8_PAGE64"): (
-        "cake_fmha_context_fp8_617e3a6b50380cf6e0a5",
+        "cake_fmha_context_fp8_795ed70e65c7e13a5f23",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_SK_PACK4_PAGE64"): (
-        "cake_fmha_context_fp8_1ea3c441ffa379d0978f",
+        "cake_fmha_context_fp8_77d3ca81fef2a7f7b7cc",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_SK_PACK2_PAGE64"): (
-        "cake_fmha_context_fp8_c76354901ca9c86f4fec",
+        "cake_fmha_context_fp8_7fa02b4209c5bbac7b59",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_SK_PACK1_PAGE64"): (
-        "cake_fmha_context_fp8_9697d1fcd36a1f4a023e",
+        "cake_fmha_context_fp8_f96322ad196e7e677281",
+        None,
+        False,
+    ),
+    # The sm100a pack-1 page-64 split-KV program for the plans of two units per
+    # split tile (_CONTEXT_FP8_TWO_SPLIT_ROUTES).
+    ("context_fp8", "RUNTIME_SK_PACK1_PAGE64_S2"): (
+        "cake_fmha_context_fp8_2f52275266d147049a48",
         None,
         False,
     ),
@@ -750,8 +757,22 @@ _CONTEXT_FP8_SPLIT_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
     }
     for target, routes in _CONTEXT_FP8_RUNTIME_ROUTES.items()
 }
+# Per target, the split-KV program a launch whose plan has two units per split
+# tile at most takes instead: the same schedule, arguments and launch whose
+# merging unit takes its own term from its TMEM O and only the other unit's
+# partial from global memory, with the loops over the two units unrolled (the
+# same arithmetic and order of every sum).  Timed on B200, heads 32/32, page
+# 64: 16 requests of 192 .. 256 query tokens over 2048 .. 4096 keys ran
+# 0.9 .. 1.4 % faster, 2 requests of 32 over 2048 keys 4.6 % faster.
+_CONTEXT_FP8_TWO_SPLIT_ROUTES: dict[str, dict[str, str]] = {
+    "sm100a": {"RUNTIME_SK_PACK1_PAGE64": "RUNTIME_SK_PACK1_PAGE64_S2"},
+}
 _CONTEXT_FP8_SPLIT_PROGRAMS = frozenset(
     name for routes in _CONTEXT_FP8_SPLIT_ROUTES.values() for name in routes.values()
+) | frozenset(
+    name
+    for routes in _CONTEXT_FP8_TWO_SPLIT_ROUTES.values()
+    for name in routes.values()
 )
 # The FP8 one-stage context programs: the runtime-size schedule, arguments and
 # P placement of each target with one 128-row query stage per tile (an m-block
@@ -5777,6 +5798,17 @@ def select_cake_fmha_context_route(
                 num_m_blocks = (max_q_len + tok_per_stage - 1) // tok_per_stage
                 total_bh = batch_size * (num_q_heads // pack_g)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
+        # A split-KV launch whose plan has two units per split tile at most, of
+        # a program the target names a two-split entry for: the entry's program
+        # (:data:`_CONTEXT_FP8_TWO_SPLIT_ROUTES`).
+        two_split = _CONTEXT_FP8_TWO_SPLIT_ROUTES.get(target, {}).get(program)
+        if (
+            component == "context_fp8"
+            and two_split is not None
+            and split_plan is not None
+            and split_plan[2] <= 2
+        ):
+            program = two_split
         # A launch of a one-stage program the target names a multi-wave entry
         # for, of more tiles than the entry's over at most its keys: the
         # entry's program (:data:`_CONTEXT_FP8_MULTI_WAVE_ROUTES`).
@@ -5847,6 +5879,12 @@ class CakeFmhaContextProgramModule:
         # (:func:`_context_fp8_launch_split_plan`), its partials in the caller's
         # workspace and its tile counters after the counter buffer's first word.
         self.split = route.program in _CONTEXT_FP8_SPLIT_PROGRAMS
+        # a two-split program merges two units per split tile at most
+        self.two_split = route.program in {
+            name
+            for routes in _CONTEXT_FP8_TWO_SPLIT_ROUTES.values()
+            for name in routes.values()
+        }
 
     def cake_paged_attention_context(
         self,
@@ -5951,6 +5989,7 @@ class CakeFmhaContextProgramModule:
             if (
                 plan is None
                 or counter.numel() < 1 + plan[0]
+                or (self.two_split and plan[2] > 2)
                 or not _context_fp8_split_workspace_supported(
                     workspace_buffer, query, plan
                 )
