@@ -374,7 +374,13 @@ def chunked_lm_head_det_loss(
     Gradients are produced only for inputs that require them (a frozen ``X``
     or ``W`` skips its GEMM).  The saved accumulators are re-scaled, never
     mutated, so a retained graph may run the backward repeatedly.  ``T == 0``
-    gives loss 0, an empty ``logp`` and zero gradients.
+    gives loss 0, an empty ``logp`` and zero gradients.  Under the backend's
+    default gradient placement (``cake_backend.set_gradient_placement``,
+    ``"auto"``) a call no backward can follow (grad mode off, also the first
+    pass of a reentrant ``torch.utils.checkpoint``) computes the loss only,
+    and inside a non-reentrant ``torch.utils.checkpoint`` the recomputation
+    forms the gradient accumulators instead of the checkpointed forward (one
+    gradient pass per step); every output is bitwise the same.
 
     A call with neither ``memory_mode`` nor ``num_valid_rows`` runs the
     backend's default entry (``cake_backend``) after this function's argument
