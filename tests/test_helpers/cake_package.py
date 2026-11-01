@@ -42,6 +42,8 @@ PACKAGES: dict[str, str] = {
     # ``cake_kda_train`` stays the deterministic compatibility package's key above
     "cake.cake_kda_train": "flashinfer.experimental.cake.cake_kda_train",
     "cake_kda_det_train_kcp": "flashinfer.experimental.cake_kda_det_train_kcp",
+    # its non-deterministic counterpart (deterministic=False)
+    "cake_kda_train_kcp": "flashinfer.experimental.cake_kda_train_kcp",
     "cake_gdn_det_train_kcp": "flashinfer.experimental.cake_gdn_det_train_kcp",
     "cake_gdn_train_kcp": "flashinfer.experimental.cake_gdn_train_kcp",
     "cake_kimi_k3_attn_res": "flashinfer.experimental.cake_kimi_k3_attn_res",

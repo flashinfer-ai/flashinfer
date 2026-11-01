@@ -89,6 +89,7 @@
           - "flashinfer/experimental/cake/cake_kda_train/**"
           - "flashinfer/experimental/cake_kda_det_train/**"
           - "flashinfer/experimental/cake_kda_det_train_kcp/**"
+          - "flashinfer/experimental/cake_kda_train_kcp/**"
           - "flashinfer/experimental/kda_prefill_wrapper/**"
           - "flashinfer/experimental/b12x/sequence/_shared/kda_math.py"
           - "tests/experimental/**/test_*gdn*"
