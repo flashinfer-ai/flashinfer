@@ -687,6 +687,13 @@ __device__ __noinline__ void rank_major_route_cta_ids(int active_tokens_per_rank
     for (int elem = tid; elem < 7168; elem += 256) {
         zero_sentinel[elem] = 0.0f;
     }
+#if __CUDA_ARCH__ == 1070
+    for (int e = tid; e < 256; e += 256) {
+        // sm_107a: zero the FC1 -> FC2 per-group completion counters (the unused tail of cta_to_mn_limit; at most
+        // T + 31 < 256 groups are active) before this forward's FC1 starts.
+        cta_to_mn_limit[256 + e] = 0;
+    }
+#endif
     __syncthreads();
     const int owner_begin = pg_rank * 32;
     const int rows_total = 8 * active_tokens_per_rank;
@@ -973,6 +980,13 @@ kernel_rank_major_route_fused_v1(int* __restrict__ recv_local_ids, int* __restri
     for (int elem = tid; elem < 7168; elem += 1024) {
         zero_sentinel[elem] = 0.0f;
     }
+#if __CUDA_ARCH__ == 1070
+    for (int e = tid; e < 256; e += 1024) {
+        // sm_107a: zero the FC1 -> FC2 per-group completion counters (the unused tail of cta_to_mn_limit; at most
+        // T + 31 < 256 groups are active) before this forward's FC1 starts.
+        cta_to_mn_limit[256 + e] = 0;
+    }
+#endif
     __syncthreads();
     const int routes_per_rank = active_tokens_per_rank * 8;
     const int active_routes = 8 * routes_per_rank;
@@ -1192,12 +1206,21 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
             mbarrier_init(smem + 56, 1);
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
+#if __CUDA_ARCH__ == 1070
+            // b_full: 5 barriers, init_count=8 (sm_107a: every load_b warp of both CTAs arrives, see load_b)
+            mbarrier_init(smem + 80, 8);
+            mbarrier_init(smem + 88, 8);
+            mbarrier_init(smem + 96, 8);
+            mbarrier_init(smem + 104, 8);
+            mbarrier_init(smem + 112, 8);
+#else
             // b_full: 5 barriers, init_count=2
             mbarrier_init(smem + 80, 2);
             mbarrier_init(smem + 88, 2);
             mbarrier_init(smem + 96, 2);
             mbarrier_init(smem + 104, 2);
             mbarrier_init(smem + 112, 2);
+#endif
             // b_free: 5 barriers, init_count=1
             mbarrier_init(smem + 120, 1);
             mbarrier_init(smem + 128, 1);
@@ -1572,11 +1595,25 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                     asm volatile("st.shared.b32 [%0], %1;" :: "r"(epi_staging_addr + (unsigned int)(smem_element_104 * 2)), "r"((packed_pair[0])));
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");
+#if __CUDA_ARCH__ == 1070
+                    if (warp == 0) {
+                        if (elect_sync()) {
+                            tma_store_4d(compact_intermediate, m_tile * 64, padding_rows, 1073741824, n_tile * 64 - (unsigned int)padding_rows + 1073741824, epi_staging_addr);
+                            // sm_107a: once the tile's store has completed, count it in the group's completion counter
+                            // (cta_to_mn_limit[256 + group]); FC2 starts a group's B loads when all K / 64 slices are in.
+                            asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+                            asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+                            asm volatile("fence.proxy.async.global;" ::: "memory");
+                            asm volatile("red.release.gpu.global.add.u32 [%0], 1;" :: "l"(cta_idx_y_to_mn_limit + 256 + n_tile) : "memory");
+                        }
+                    }
+#else
                     if (warp == 0) {
                         if (elect_sync()) {
                             tma_store_4d(compact_intermediate, m_tile * 64, padding_rows, 1073741824, n_tile * 64 - (unsigned int)padding_rows + 1073741824, epi_staging_addr);
                         }
                     }
+#endif
                     asm volatile("cp.async.bulk.commit_group;");
                     asm volatile("barrier.sync 4, 128;" ::: "memory");
                     asm volatile(
@@ -1948,6 +1985,11 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
         { // load_b_main
             asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
             asm volatile("griddepcontrol.wait;" ::: "memory");
+#if __CUDA_ARCH__ == 1070
+            // sm_107a: let FC2 launch as soon as every FC1 CTA has passed griddepcontrol.wait (FC2 waits per group on
+            // the epilogue's completion counters instead of on the whole FC1 grid).
+            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+#endif
             unsigned int stage_2 = 0;
             unsigned int work_stage_3 = 0;
             unsigned int m_tile_3 = blockIdx.x;
@@ -1960,6 +2002,57 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
             #pragma unroll 1
             for (unsigned int _tile_iter_3 = 0; _tile_iter_3 < gridDim.x / 2 * gridDim.y; _tile_iter_3++) {
                 if (n_tile_3 < (unsigned int)num_non_exiting_ctas[0]) {
+#if __CUDA_ARCH__ == 1070
+                    // sm_107a: the tile's padding rows (its last (64 - mn_limit % 64) % 64 rows, route_map entry 0) only
+                    // feed output columns that the epilogue's store clips, and an MMA output column depends only on its own
+                    // B row. Gathering them would make every CTA read recv_hidden row 0 at the same k-step (an L2 hot
+                    // spot), so all-padding 4-row groups are not loaded (expect_tx counts the issued bytes) and a padding
+                    // row of a partly valid group re-reads the group's first row.
+                    // A warp whose groups are all padding issues nothing, but it still waits on b_free every k-step, so
+                    // every load_b warp of both CTAs arrives on the leader's b_full (init count 8) with the bytes it
+                    // issued: the stage cannot be consumed again before each warp has arrived, so no warp can fall a
+                    // whole b_free phase behind and miss the parity it waits for.
+                    const int pb_mn = cta_idx_y_to_mn_limit[n_tile_3];
+                    const int pb_valid = 64 - (64 - pb_mn % 64) % 64;
+                    const int pb_r0 = cta_rank * 32 + warp_local * 4;
+                    const int pb_r1 = cta_rank * 32 + (4 + warp_local) * 4;
+                    const bool pb_a = pb_r0 < pb_valid;
+                    const bool pb_b = pb_r1 < pb_valid;
+                    const uint32_t pb_own = (pb_a ? 1024u : 0u) + (pb_b ? 1024u : 0u);
+                    int route_base = n_tile_3 * 64 + pb_r0;
+                    if (pb_a) {
+                        routed[0] = route_map[route_base];
+                        routed[1] = pb_r0 + 1 < pb_valid ? route_map[route_base + 1] : routed[0];
+                        routed[2] = pb_r0 + 2 < pb_valid ? route_map[route_base + 2] : routed[0];
+                        routed[3] = pb_r0 + 3 < pb_valid ? route_map[route_base + 3] : routed[0];
+                    }
+                    int route_base_0 = n_tile_3 * 64 + pb_r1;
+                    if (pb_b) {
+                        routed[4] = route_map[route_base_0];
+                        routed[5] = pb_r1 + 1 < pb_valid ? route_map[route_base_0 + 1] : routed[4];
+                        routed[6] = pb_r1 + 2 < pb_valid ? route_map[route_base_0 + 2] : routed[4];
+                        routed[7] = pb_r1 + 3 < pb_valid ? route_map[route_base_0 + 3] : routed[4];
+                    }
+                    #pragma unroll 1
+                    for (int iter_k_1 = 0; iter_k_1 < (K + 128 - 1) / 128; iter_k_1++) {
+                        mbarrier_wait(b_free_addr + (stage_2) * 8, _phase_b_free);
+                        if (elect_sync()) {
+                            int dst = smem_b_addr + stage_2 * 8192;
+                            if (pb_a) {
+                                tma_gather4_gmem2smem_mc_cta2(dst + warp_local * 512, recv_hidden, iter_k_1 * 128, routed[0], routed[1], routed[2], routed[3], ((b_full_addr + (stage_2) * 8) & 0xFEFFFFFF), cta_mask_1);
+                                tma_gather4_gmem2smem_mc_cta2(dst + 4096 + warp_local * 512, recv_hidden, iter_k_1 * 128 + 64, routed[0], routed[1], routed[2], routed[3], ((b_full_addr + (stage_2) * 8) & 0xFEFFFFFF), cta_mask_1);
+                            }
+                            if (pb_b) {
+                                tma_gather4_gmem2smem_mc_cta2(dst + (4 + warp_local) * 512, recv_hidden, iter_k_1 * 128, routed[4], routed[5], routed[6], routed[7], ((b_full_addr + (stage_2) * 8) & 0xFEFFFFFF), cta_mask_1);
+                                tma_gather4_gmem2smem_mc_cta2(dst + 4096 + (4 + warp_local) * 512, recv_hidden, iter_k_1 * 128 + 64, routed[4], routed[5], routed[6], routed[7], ((b_full_addr + (stage_2) * 8) & 0xFEFFFFFF), cta_mask_1);
+                            }
+                        }
+                        if (elect_sync()) {
+                            asm volatile(
+                                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                                :: "r"((b_full_addr + (stage_2) * 8) & 0xFEFFFFFF), "r"(pb_own) : "memory");
+                        }
+#else
                     int route_base = n_tile_3 * 64 + (unsigned int)(cta_rank * 32) + (unsigned int)(warp_local * 4);
                     routed[0] = route_map[route_base];
                     routed[1] = route_map[route_base + 1];
@@ -1987,6 +2080,7 @@ kernel_rank_major_exact_fc1_swiglu_v1(FlashInferTensorMap const* weights, FlashI
                                     :: "r"((b_full_addr + (stage_2) * 8) & 0xFEFFFFFF), "r"((uint32_t)(8192)) : "memory");
                             }
                         }
+#endif
                         stage_2 += 1;
                         if (stage_2 == 5) { stage_2 = 0; _phase_b_free ^= 1; }
                     }
@@ -2519,7 +2613,10 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
         { // epilogue_main
             asm volatile("barrier.sync 6, 192;" ::: "memory");
             asm volatile("setmaxnreg.dec.sync.aligned.u32 168;");
+#if __CUDA_ARCH__ == 1070
+#else
             asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
             int num_cluster_tiles = gridDim.x / 2 * gridDim.y;
             unsigned int acc_stage = 0;
             unsigned int work_stage = 0;
@@ -3257,7 +3354,10 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
     if (warp == 6) {
         { // load_b_main
             asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
+#if __CUDA_ARCH__ == 1070
+#else
             asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
             int num_k_tiles_2 = (K + 128 - 1) / 128;
             int num_cluster_tiles_3 = gridDim.x / 2 * gridDim.y;
             unsigned int stage_2 = 0;
@@ -3272,6 +3372,21 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
                 if (n_tile_3 < (unsigned int)num_non_exiting_ctas[0]) {
                     int mn_limit_1 = cta_idx_y_to_mn_limit[n_tile_3];
                     int padding_rows_1 = (64 - mn_limit_1 % 64) % 64;
+#if __CUDA_ARCH__ == 1070
+                    // sm_107a: wait until FC1 has stored every K / 64 slice of this group (see the FC1 epilogue).
+                    if (elect_sync()) {
+                        const int* g3_flag = cta_idx_y_to_mn_limit + 256 + n_tile_3;
+                        unsigned int g3_v;
+                        #pragma unroll 1
+                        while (true) {
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(g3_v) : "l"(g3_flag) : "memory");
+                            if (g3_v >= (unsigned int)(K / 64)) break;
+                            __nanosleep(100);
+                        }
+                        asm volatile("fence.proxy.async.global;" ::: "memory");
+                    }
+                    __syncwarp();
+#endif
                     #pragma unroll 1
                     for (int iter_k_2 = 0; iter_k_2 < num_k_tiles_2; iter_k_2++) {
                         mbarrier_wait(b_free_addr + (stage_2) * 8, _phase_b_free);
@@ -3362,7 +3477,10 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
         { // work_id_main
             asm volatile("barrier.sync 6, 192;" ::: "memory");
             asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
+#if __CUDA_ARCH__ == 1070
+#else
             asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
             unsigned int _phase_throttle_full = 0;
             unsigned int _phase_drain_full = 0;
             unsigned int _phase_work_empty = 1;
@@ -4116,6 +4234,13 @@ __device__ __noinline__ void rank_major_route_cta_ll(int active_tokens_per_rank,
     for (int elem = tid; elem < 7168; elem += 256) {
         zero_sentinel[elem] = 0.0f;
     }
+#if __CUDA_ARCH__ == 1070
+    for (int e = tid; e < 256; e += 256) {
+        // sm_107a: zero the FC1 -> FC2 per-group completion counters (the unused tail of cta_to_mn_limit; at most
+        // T + 31 < 256 groups are active) before this forward's FC1 starts.
+        cta_to_mn_limit[256 + e] = 0;
+    }
+#endif
     __syncthreads();
     const int owner_begin = pg_rank * 32;
     // pass 1: per-expert row counters; token_to_permuted holds (1 << 30 | local << 16 | row) until pass 3
