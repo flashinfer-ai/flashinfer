@@ -1517,9 +1517,8 @@ def test_registry_records_reference_the_build_manifest() -> None:
 # The per-element dw bound at the largest row counts of the long-chunk windows: every element of dw within
 # atol = rtol = 1e-4 of the FP64 sum of the same products (g, x and the FP32 rstd the forward returned), where an FP32
 # chunk sum over many rows accumulates the most rounding: H = 5120 at 40960 and 65536 rows; H = 256 above the
-# compensated-sum edges (81920 rows), at the key rows of a 65536-token batch (262144), above the sm_103a / sm_107a
-# hi / lo edge (1179649 rows), at the query rows of a 65536-token batch (1572864) and above the sm_100a hi / lo edge
-# (1572865).
+# compensated-sum edges (81920 rows), at the key rows of a 65536-token batch (262144), at 1179649 rows, at the query
+# rows of a 65536-token batch (1572864, the last row of the compensated ring) and above the hi / lo edge (1572865).
 # A few seeds per case; BF16 and FP32 weight.
 DW_ELEMENT_TOL = 1e-4
 LARGE_ROW_DW_CASES = (
