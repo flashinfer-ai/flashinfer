@@ -3115,43 +3115,45 @@ PROGRAMS: dict[str, str] = {
     "mtp_short_ring_heads64_groups8_t2_jr_hb": "cake_selective_state_update_df2ae3087dbfec1d66dd",
     "stp_dim128_fp32": "cake_selective_state_update_0c4d07dba49698124934",
     "stp_dim128_fp32_l2_prefetch": "cake_selective_state_update_eb7ec508e23e9f9cc884",
-    "stp_dim128_hpc1_mb4": "cake_selective_state_update_1620e61f3308698efb02",
-    "stp_dim128_hpc1_s2w4": "cake_selective_state_update_53bfeb43fd704ac3d6c5",
-    "stp_dim128_hpc1_s2w4_lean": "cake_selective_state_update_1b1cd93b17f356ca2dfe",
-    "stp_dim128_hpc2_lean": "cake_selective_state_update_cfaa7ed6d28c5e210f1f",
-    "stp_dim128_hpc2_s2w4_mb5_lean": "cake_selective_state_update_0d056c8f4ac55933266e",
+    "stp_dim128_hpc1_mb4": "cake_selective_state_update_7ab7cbeaf65c297a0cd4",
+    "stp_dim128_hpc1_s2w4": "cake_selective_state_update_6a35b78c0cc07eb16a80",
+    "stp_dim128_hpc1_s2w4_lean": "cake_selective_state_update_5af69b39671b262169c7",
+    "stp_dim128_hpc2_lean": "cake_selective_state_update_806c3e6f80be1350cefd",
+    "stp_dim128_hpc2_s2w4_mb5_lean": "cake_selective_state_update_f86b733fcb4c4107ffeb",
+    "stp_dim128_hpc2_s2w4_mb5_lean_l2h": "cake_selective_state_update_5c1b54534ab7cdab6d48",
     "stp_dim128_z_balanced_lean": "cake_selective_state_update_a746af67567a508fa3c2",
-    "stp_dim128_z_gated": "cake_selective_state_update_c50c0d087342726cb2c9",
-    "stp_hd64_paired_hpc1": "cake_selective_state_update_85985e28d97736821e4c",
-    "stp_hd64_paired_hpc1_bf16_i32": "cake_selective_state_update_8ede1128580d84e2f75c",
-    "stp_hd64_paired_hpc1_ratio8": "cake_selective_state_update_1fda6b386a87bbfe2c03",
-    "stp_hd64_paired_hpc1_ratio8_bf16_i32": "cake_selective_state_update_66f42b672ba733b5afd1",
-    "stp_hd64_paired_hpc1_ratio8_s4w2": "cake_selective_state_update_fa4d8236383f6cfa5858",
-    "stp_hd64_paired_hpc1_ratio8_s4w2_bf16_i32": "cake_selective_state_update_d0caa4515bbe78db52f9",
-    "stp_hd64_paired_hpc1_ratio8_s4w2_lean": "cake_selective_state_update_5b534b81cdee477c1feb",
-    "stp_hd64_paired_hpc1_ratio8_s4w2_lean_bf16_i32": "cake_selective_state_update_b07c2a52beccd1a47a41",
-    "stp_hd64_paired_hpc1_s4w2": "cake_selective_state_update_6b625e5aa92cae6c618d",
-    "stp_hd64_paired_hpc1_s4w2_bf16_i32": "cake_selective_state_update_ebfde0cc1cfa338d7aaf",
-    "stp_hd64_paired_hpc1_s4w2_lean": "cake_selective_state_update_75d6c61d14a99c37b5a3",
-    "stp_hd64_paired_hpc1_s4w2_lean_bf16_i32": "cake_selective_state_update_a38772ef81c782c2ddcf",
-    "stp_hd64_paired_hpc2": "cake_selective_state_update_d3991bda62384e60d45d",
-    "stp_hd64_paired_hpc2_bf16_i32": "cake_selective_state_update_bf3b407276910455ace8",
-    "stp_hd64_paired_hpc2_lean": "cake_selective_state_update_e7d7d58d9c8c459c5f85",
-    "stp_hd64_paired_hpc2_lean_bf16_i32": "cake_selective_state_update_51e0af2f05c4f6e5880f",
-    "stp_hd64_paired_hpc2_mb2_lean": "cake_selective_state_update_6947b451e086ed2a3b90",
-    "stp_hd64_paired_hpc2_mb2_lean_bf16_i32": "cake_selective_state_update_069ad267429cac3e0710",
-    "stp_hd64_paired_hpc2_ratio8_s2w4_lean": "cake_selective_state_update_425d23b976b2c934449b",
-    "stp_hd64_paired_hpc2_ratio8_s2w4_lean_bf16_i32": "cake_selective_state_update_e6b877dd79b4a59b8825",
-    "stp_hd64_paired_hpc2_s2w4_lean": "cake_selective_state_update_e9c1044201dcdb724f52",
-    "stp_hd64_paired_hpc2_s2w4_lean_bf16_i32": "cake_selective_state_update_b4f79470cd2af6081722",
-    "stp_hd64_paired_hpc2_s2w4_mb5_lean": "cake_selective_state_update_bf9d8f51eaa98a9b55e0",
-    "stp_hd64_paired_hpc2_s2w4_mb5_lean_bf16_i32": "cake_selective_state_update_7a283e0596e5009db58a",
-    "stp_hd64_paired_hpc4_lean": "cake_selective_state_update_f8ebb15623f0fd11be1a",
-    "stp_hd64_paired_hpc4_lean_bf16_i32": "cake_selective_state_update_c70704cfda5f53df5935",
-    "stp_hd64_paired_hpc4_s2w4_lean": "cake_selective_state_update_215e5b54ac3db1884c38",
-    "stp_hd64_paired_hpc4_s2w4_lean_bf16_i32": "cake_selective_state_update_c417c072b913bfb0b080",
-    "stp_hd64_paired_hpc4_s4w2_lean": "cake_selective_state_update_b1306a044543e22b04f3",
-    "stp_hd64_paired_hpc4_s4w2_lean_bf16_i32": "cake_selective_state_update_ffc75b2432b6aa1e1b7d",
+    "stp_dim128_z_gated": "cake_selective_state_update_74c4ca614de59aa45284",
+    "stp_hd64_paired_hpc1": "cake_selective_state_update_08383dac4b95aae27e59",
+    "stp_hd64_paired_hpc1_bf16_i32": "cake_selective_state_update_b15cd9904a1cd9385453",
+    "stp_hd64_paired_hpc1_ratio8": "cake_selective_state_update_0179849a7c102947d3f7",
+    "stp_hd64_paired_hpc1_ratio8_bf16_i32": "cake_selective_state_update_7a69f6bf13fd68d9f9d6",
+    "stp_hd64_paired_hpc1_ratio8_s4w2": "cake_selective_state_update_799c76365fc6f7b5a919",
+    "stp_hd64_paired_hpc1_ratio8_s4w2_bf16_i32": "cake_selective_state_update_dc2ff44d4e8456e2e940",
+    "stp_hd64_paired_hpc1_ratio8_s4w2_lean": "cake_selective_state_update_14669f00f124fef882fe",
+    "stp_hd64_paired_hpc1_ratio8_s4w2_lean_bf16_i32": "cake_selective_state_update_cbc91785a58a621955aa",
+    "stp_hd64_paired_hpc1_s4w2": "cake_selective_state_update_934ac7f2795766081c5e",
+    "stp_hd64_paired_hpc1_s4w2_bf16_i32": "cake_selective_state_update_642dbdbf02e04e2d1621",
+    "stp_hd64_paired_hpc1_s4w2_lean": "cake_selective_state_update_b1d4aebb02fae185e7bb",
+    "stp_hd64_paired_hpc1_s4w2_lean_bf16_i32": "cake_selective_state_update_17ecbced9802ef7ab114",
+    "stp_hd64_paired_hpc2": "cake_selective_state_update_5d32a7e043700ab4e89b",
+    "stp_hd64_paired_hpc2_bf16_i32": "cake_selective_state_update_92451c2e1e3dfbe783a9",
+    "stp_hd64_paired_hpc2_lean": "cake_selective_state_update_6742be9ae8070e6eadd1",
+    "stp_hd64_paired_hpc2_lean_bf16_i32": "cake_selective_state_update_642d54f88c3099f73fb1",
+    "stp_hd64_paired_hpc2_mb2_lean": "cake_selective_state_update_b1081360e832ed7de79d",
+    "stp_hd64_paired_hpc2_mb2_lean_bf16_i32": "cake_selective_state_update_fdc0450fc96bae6bb0c0",
+    "stp_hd64_paired_hpc2_ratio8_s2w4_lean": "cake_selective_state_update_479d164840aa35c1c35a",
+    "stp_hd64_paired_hpc2_ratio8_s2w4_lean_bf16_i32": "cake_selective_state_update_40f5efa45b3fe0a4431c",
+    "stp_hd64_paired_hpc2_s2w4_lean": "cake_selective_state_update_3df0cec21d1c9412eac0",
+    "stp_hd64_paired_hpc2_s2w4_lean_bf16_i32": "cake_selective_state_update_1d979e9b7b0dc4121da9",
+    "stp_hd64_paired_hpc2_s2w4_mb5_lean": "cake_selective_state_update_1c4956af704fce1dbf98",
+    "stp_hd64_paired_hpc2_s2w4_mb5_lean_bf16_i32": "cake_selective_state_update_2ea842277bee7d5a1291",
+    "stp_hd64_paired_hpc2_s2w4_mb5_lean_l2h": "cake_selective_state_update_c532ecdb572d59cf6a45",
+    "stp_hd64_paired_hpc4_lean": "cake_selective_state_update_aeadcd66a24ca13a6351",
+    "stp_hd64_paired_hpc4_lean_bf16_i32": "cake_selective_state_update_b6b9a371a140ce799ced",
+    "stp_hd64_paired_hpc4_s2w4_lean": "cake_selective_state_update_09384558bfd3192c2e3b",
+    "stp_hd64_paired_hpc4_s2w4_lean_bf16_i32": "cake_selective_state_update_45646265abe1ace4d899",
+    "stp_hd64_paired_hpc4_s4w2_lean": "cake_selective_state_update_3d52d0234c2e57c87bfc",
+    "stp_hd64_paired_hpc4_s4w2_lean_bf16_i32": "cake_selective_state_update_1f8698b0ee763b80dd86",
     "stp_hd64_rows_bf16_dt4_od": "cake_selective_state_update_650060655f4353a908df",
     "stp_hd64_rows_bf16_dt4_od_bf16_i32": "cake_selective_state_update_092088eb41a05061f1ce",
     "stp_hd64_rows_bf16_dt4_xa_bf16_i32": "cake_selective_state_update_79b7ad05a6250777090c",
@@ -4055,6 +4057,28 @@ _LEAN_BAND_HUNDREDTHS: dict[str, dict[str, tuple[int, int]]] = {
 }
 
 
+# The L2 read-ahead builds (``<lean build>_l2h``: the producer warms L2 with the state tiles of the CTA's later heads
+# right after its first stages; output and state bitwise the lean build's), per (architecture, SM count): the lean
+# build -> the ``(batch_size, nheads, ngroups)`` launches that run its read-ahead build instead (the measured shapes).
+_L2H_SHAPES: dict[tuple[str, int], dict[str, frozenset[tuple[int, int, int]]]] = {
+    ("sm_100a", 148): {
+        "stp_dim128_hpc2_s2w4_mb5_lean": frozenset({(257, 128, 8)}),
+        "stp_hd64_paired_hpc2_s2w4_mb5_lean": frozenset({(320, 128, 8)}),
+    },
+}
+
+
+def l2h_program(
+    build: str, batch_size: int, nheads: int, ngroups: int, sm_count: int, arch: str
+) -> str:
+    """The build a launch of ``build`` runs: its L2 read-ahead build (``<build>_l2h``) at a launch shape
+    ``_L2H_SHAPES`` lists for the architecture at its SM count, else ``build``."""
+    shapes = _L2H_SHAPES.get((arch, sm_count), {}).get(build, frozenset())
+    if (batch_size, nheads, ngroups) in shapes:
+        return f"{build}_l2h"
+    return build
+
+
 def lean_program(program: str, arch: str, ctas: int = 0, sm_count: int = 0) -> str:
     """The build that runs a launch of ``program`` on ``arch``: its ``_lean`` build (``<program>_lean``, the raw ABI
     suffix kept last) when the architecture lists the program in ``_LEAN_PROGRAMS``, or when the launch's ``ctas`` on
@@ -4348,7 +4372,14 @@ def _plan_stp_rows(
     # ``p_split`` CTAs per work tile of ``heads_per_cta`` program heads of one (batch, group).
     ctas = batch_size * ngroups * head_tiles * p_split
     return RoutePlan(
-        lean_program(program, arch, ctas, sms),
+        l2h_program(
+            lean_program(program, arch, ctas, sms),
+            batch_size,
+            nheads,
+            ngroups,
+            sms,
+            arch,
+        ),
         (),
         (ctas, 1, 1),
         bindings,
@@ -5149,6 +5180,7 @@ __all__ = [
     "hd64_split_program",
     "hd64_unsplit_program",
     "jit_spec",
+    "l2h_program",
     "lean_program",
     "mtp_short_program",
     "plan_route",
