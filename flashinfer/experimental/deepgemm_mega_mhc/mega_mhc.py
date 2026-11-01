@@ -1609,7 +1609,7 @@ ROUTES: list[dict[str, Any]] = [
         "sf_layout": "fp8_group128",
         "fp8_sf_ue8m0": False,
         "deterministic": True,
-        "tokens": [[16, 47], [128, 1023]],
+        "tokens": [[16, 47], [128, 1024]],
         "program": "cake_mega_mhc_ed3f407e5a68eb65478e",
         "defines": {},
     },

@@ -860,7 +860,7 @@ UE8M0_DETERMINISTIC_CHAIN_TOKENS = [[1, 47], [256, 1023]]
 # group-128 tailpipe program takes on VARIANT_TAIL_ARCHES (the same 16 splits
 # and launch, so the same outputs), ahead of the fast-division routes: the
 # token counts of RAW_DETERMINISTIC_TAIL_TOKENS (inclusive ranges).
-RAW_DETERMINISTIC_TAIL_TOKENS = [[16, 47], [128, 1023]]
+RAW_DETERMINISTIC_TAIL_TOKENS = [[16, 47], [128, 1024]]
 
 
 def _fast_chain_program(layout, regime, arch, tokens, deterministic, ue8m0=None):
