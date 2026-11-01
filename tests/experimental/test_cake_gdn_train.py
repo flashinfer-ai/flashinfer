@@ -2281,9 +2281,10 @@ def test_tc_plan_rule(arch, monkeypatch) -> None:
             sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
         )
         rec = cake_chain.tc_plan_pricing(chunks, num_v_heads, 0, bwd)
+        gain, min_saving = cake_chain.tc_plan_thresholds(arch)
         if rec["select"]:
-            assert rec["saving"] >= cake_chain.TC_PLAN_MIN_SAVING, (row, rec)
-            assert rec["best"]["T"] <= cake_chain.TC_PLAN_GAIN * rec["plan_T"], (
+            assert rec["saving"] >= min_saving, (row, rec)
+            assert rec["best"]["T"] <= gain * rec["plan_T"], (
                 row,
                 rec,
             )
@@ -2304,6 +2305,7 @@ def test_tc_plan_changes_only_the_adjoint_table(heads, device, monkeypatch) -> N
     index = cake_chain._device_index(device)
     monkeypatch.setattr(cake_chain, "TC_PLAN_MIN_SAVING", 0.0)
     monkeypatch.setattr(cake_chain, "TC_PLAN_GAIN", 1.0)
+    monkeypatch.setattr(cake_chain, "TC_PLAN_SELECT", {})
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
     _fwd, bwd = cake_chain.scan_plans(16384, 1, heads[1], index, seq_lens)
     rec = cake_chain.tc_plan_pricing((256,), heads[1], index, bwd)

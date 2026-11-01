@@ -105,6 +105,7 @@ __all__ = [
     "TC_PLAN",
     "TC_PLAN_GAIN",
     "TC_PLAN_MIN_SAVING",
+    "TC_PLAN_SELECT",
     "TC_PLAN_STEP",
     "ChainOptions",
     "ChunkGatedDeltaRuleFunction",
@@ -127,6 +128,7 @@ __all__ = [
     "scan_plans",
     "sdt_pricing",
     "tc_plan_pricing",
+    "tc_plan_thresholds",
     "sequence_groups",
     "stage_set",
     "tail_form",
@@ -1458,10 +1460,19 @@ def _sdt_selected(meta: ChunkMeta, segs: SegmentTable, num_v_heads: int, device_
 TC_PLAN = True
 TC_PLAN_GAIN = 0.95
 TC_PLAN_MIN_SAVING = 10.0
+# (gain, min_saving) of an architecture in place of (TC_PLAN_GAIN, TC_PLAN_MIN_SAVING) (:func:`tc_plan_thresholds`).
+# R200 measured the priced table against the planner's (backward, det-vs-nondet bench): faster at 4.2-5.6 us priced
+# savings (r07 -3.2 %, (2, 6) -2.6 %, P1 -0.9 %), slower at 0.9 us ((8, 24) +0.35 %).
+TC_PLAN_SELECT = {"sm_107a": (1.0, 2.0)}
 # The dhu_tc2 step time (microseconds) at low and full residency that prices these tables, measured (CUPTI kernel
 # durations of L = 64 tables, 3 to 288 CTAs: B200 2.32-2.44, GB300 2.15-2.26 per step); an architecture not listed takes
 # the dhu_tc2 record's t_lat / t_full.
 TC_PLAN_STEP = {"sm_100a": (2.35, 2.44), "sm_103a": (2.17, 2.25)}
+
+
+def tc_plan_thresholds(arch: str) -> tuple[float, float]:
+    """``(gain, min_saving)`` that select the tc-priced adjoint table on ``arch``."""
+    return TC_PLAN_SELECT.get(arch, (TC_PLAN_GAIN, TC_PLAN_MIN_SAVING))
 
 
 def _tc_table_price(
@@ -1552,8 +1563,8 @@ def _tc_plan_memo(
     rec.update(plan_T=plan_t, best=best, saving=plan_t - best["T"])
     rec["select"] = bool(
         best["segment_len"] != (0 if serial else plan.segment_len)
-        and plan_t - best["T"] >= TC_PLAN_MIN_SAVING
-        and best["T"] <= TC_PLAN_GAIN * plan_t
+        and plan_t - best["T"] >= _min_saving
+        and best["T"] <= _gain * plan_t
     )
     rec["segment_len"] = best["segment_len"]
     return rec
@@ -1564,6 +1575,8 @@ def tc_plan_pricing(
 ) -> dict:
     """The adjoint table priced for ``dhu_tc2`` against the planner's ``plan`` for a host layout of ``chunks`` (chunks
     per sequence); ``select`` is the answer and ``segment_len`` the table (0: serial).  See above."""
+    arch = cake_backend.device_arch(int(device_index))
+    gain, min_saving = tc_plan_thresholds(arch)
     return dict(
         _tc_plan_memo(
             tuple(int(c) for c in chunks),
@@ -1571,9 +1584,9 @@ def tc_plan_pricing(
             int(device_index),
             plan,
             _device_props(int(device_index)),
-            cake_backend.device_arch(int(device_index)),
-            TC_PLAN_GAIN,
-            TC_PLAN_MIN_SAVING,
+            arch,
+            gain,
+            min_saving,
         )  # fmt: skip
     )
 
