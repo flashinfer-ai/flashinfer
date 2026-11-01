@@ -2791,6 +2791,7 @@ def _mtp_kernel_name(
     disable_state_update: bool,
     use_pool_indexing: bool,
     pool_strides_key,
+    pool_capacity_key: Optional[int],
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -2817,6 +2818,7 @@ def _mtp_kernel_name(
         disable_state_update,
         use_pool_indexing,
         pool_strides_key,
+        pool_capacity_key,
         scale,
         use_qk_l2norm,
         tile_v,
@@ -2842,6 +2844,7 @@ def _get_compiled_mtp_kernel(
     disable_state_update: bool,
     use_pool_indexing: bool,
     pool_strides_key,
+    pool_capacity_key: Optional[int],
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -2869,6 +2872,7 @@ def _get_compiled_mtp_kernel_inline(
     disable_state_update: bool,
     use_pool_indexing: bool,
     pool_strides_key,
+    pool_capacity_key: Optional[int],
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
@@ -2929,8 +2933,8 @@ def run_mtp_decode(
         h0_source: Initial state as either a compact [pool_size * HV, V, K]
             view or a strided [pool_size, HV, V, K] pool when
             use_pool_indexing=True. The 4D pool's leading stride must be a
-            multiple of vec_size FP32 elements. Capacity is dynamic; strides
-            remain specialized.
+            multiple of vec_size FP32 elements. Its capacity and strides
+            remain specialized; the compact 3D view keeps a dynamic capacity.
         intermediate_states: Reshaped intermediate state cache, or dummy tensor.
         A_log: Log decay parameter [HV].
         a: Input-dependent decay [B, T, HV].
@@ -3029,10 +3033,12 @@ def run_mtp_decode(
         )
         return
 
-    # Keep all 4D pool strides in both the memory and disk cache keys. A static
-    # slot stride preserves address-generation optimizations across capacities.
+    # Static 4D layouts preserve steady-state performance. Key capacity
+    # separately from strides so a different shape cannot reuse an incompatible
+    # in-memory callable or disk artifact.
     if use_pool_indexing:
         pool_strides_key = tuple(int(stride) for stride in h0_source.stride())
+        pool_capacity_key = int(h0_source.shape[0])
         assert pool_strides_key[0] % vec_size == 0, (
             "initial_state stride(0) must be a multiple of "
             f"{vec_size} FP32 elements for {vec_size * 32}-bit state copies, "
@@ -3040,6 +3046,7 @@ def run_mtp_decode(
         )
     else:
         pool_strides_key = None
+        pool_capacity_key = None
 
     # Dynamic layouts still specialize on the inferred unit-stride dimension.
     # Strided gate/input views must not reuse a contiguous tensor's ABI.
@@ -3079,6 +3086,7 @@ def run_mtp_decode(
             disable_state_update,
             use_pool_indexing,
             pool_strides_key,
+            pool_capacity_key,
             scale,
             use_qk_l2norm,
             tile_v,
@@ -3103,6 +3111,7 @@ def run_mtp_decode(
             disable_state_update,
             use_pool_indexing,
             pool_strides_key,
+            pool_capacity_key,
             scale,
             use_qk_l2norm,
             tile_v,
@@ -3175,14 +3184,8 @@ def run_mtp_decode(
         stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
         if use_pool_indexing:
-            # Capacity is absent from the cache key, so it must also be dynamic
-            # in the compiled ABI. Inner dimensions and all strides stay static.
-            h0_source_tensor = cute.runtime.make_fake_tensor(
-                cute.Float32,
-                shape=(cute.sym_int(), HV, V, K),
-                stride=pool_strides_key,
-                assumed_align=16,
-            )
+            # Capacity and strides are both static and included in the cache key.
+            h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
         else:
             # 3D flat pool [pool*HV, V, K], compact.
             h0_source_tensor = from_dlpack(

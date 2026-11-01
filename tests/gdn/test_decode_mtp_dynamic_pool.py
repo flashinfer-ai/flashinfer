@@ -27,6 +27,7 @@ pytestmark = [pytest.mark.long_running, pytest.mark.gpu_exclusive]
 
 
 def _skip_if_not_sm90_or_later() -> None:
+    """Skip devices outside the supported GDN decode architectures."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     cc = get_compute_capability(torch.device("cuda"))
@@ -35,6 +36,7 @@ def _skip_if_not_sm90_or_later() -> None:
 
 
 def _load_mtp_modules():
+    """Load the MTP API and kernel, skipping only a missing optional CuTe DSL."""
     pytest.importorskip("cutlass")
     api = importlib.import_module("flashinfer.gdn_decode")
     kernel = importlib.import_module("flashinfer.gdn_kernels.gdn_decode_mtp")
@@ -42,11 +44,13 @@ def _load_mtp_modules():
 
 
 def _clear_mtp_compile_caches(kernel) -> None:
+    """Clear both in-process specialization caches between tests."""
     kernel._get_compiled_mtp_kernel.cache_clear()
     kernel._get_compiled_mtp_kernel_inline.cache_clear()
 
 
 def _skip_if_low_vram(required_bytes: int) -> None:
+    """Leave allocation headroom for the large-offset test and its reference."""
     import gc
 
     gc.collect()
@@ -61,6 +65,7 @@ def _skip_if_low_vram(required_bytes: int) -> None:
 
 @pytest.fixture
 def mtp_modules(monkeypatch):
+    """Isolate specialization counts and disable disk-cache hits by default."""
     _skip_if_not_sm90_or_later()
     api, kernel = _load_mtp_modules()
     monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
@@ -72,6 +77,7 @@ def mtp_modules(monkeypatch):
 
 
 def _make_mtp_inputs(batch_size, num_v_heads):
+    """Build deterministic MTP inputs with nontrivial pool-slot indices."""
     B, T, H, HV, K, V = batch_size, 2, 1, num_v_heads, 128, 128
     device = torch.device("cuda")
     torch.manual_seed(0)
@@ -132,14 +138,15 @@ def _check_pool_call(api, kernel, pool, common, expected_misses):
 
 
 @pytest.mark.parametrize("batch_size", [1, 65], ids=["inline", "warp-specialized"])
-def test_mtp_pool_reuses_compile_across_capacities(mtp_modules, batch_size):
-    """Capacity is dynamic, but changing the slot stride specializes again."""
+def test_mtp_pool_specializes_capacity_and_slot_stride(mtp_modules, batch_size):
+    """Each capacity/stride pair compiles once and is reused on subsequent calls."""
     api, kernel = mtp_modules
     HV, V, K = 2, 128, 128
     common = _make_mtp_inputs(batch_size, HV)
     inner_strides = None
     for pool_size, page_gap, expected_misses in (
         (batch_size + 1, 2, 1),
+        (batch_size + 3, 2, 1),
         (batch_size + 3, 2, 0),
         (batch_size + 3, 3, 1),
         (batch_size + 1, 2, 0),
@@ -158,6 +165,21 @@ def test_mtp_pool_reuses_compile_across_capacities(mtp_modules, batch_size):
         padding_before = storage[:, 1:].clone()
         _check_pool_call(api, kernel, pool, common, expected_misses)
         torch.testing.assert_close(storage[:, 1:], padding_before, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("batch_size", [1, 65], ids=["inline", "warp-specialized"])
+def test_mtp_compact_pool_reuses_compile_across_capacities(mtp_modules, batch_size):
+    """The compact 3D path must retain its existing dynamic-capacity ABI."""
+    api, kernel = mtp_modules
+    HV, V, K = 2, 128, 128
+    common = _make_mtp_inputs(batch_size, HV)
+    for pool_size, expected_misses in ((batch_size + 1, 1), (batch_size + 3, 0)):
+        pool = (
+            torch.randn(pool_size, HV, V, K, dtype=torch.float32, device="cuda")
+            * 0.01
+        )
+        assert pool.is_contiguous()
+        _check_pool_call(api, kernel, pool, common, expected_misses)
 
 
 @pytest.mark.parametrize("batch_size", [1, 65], ids=["inline", "warp-specialized"])
@@ -193,10 +215,10 @@ def test_mtp_pool_cache_keeps_inner_strides_static(mtp_modules, batch_size):
 
 
 @pytest.mark.parametrize("batch_size", [1, 65], ids=["inline", "warp-specialized"])
-def test_mtp_pool_reloads_disk_cache_across_capacities(
+def test_mtp_pool_reloads_disk_cache_for_each_capacity(
     mtp_modules, batch_size, monkeypatch, tmp_path
 ):
-    """A persisted specialization must accept a new capacity without recompiling."""
+    """Each capacity has its own artifact, reused after clearing the memory cache."""
     from flashinfer.jit import env as jit_env
 
     api, kernel = mtp_modules
@@ -204,29 +226,38 @@ def test_mtp_pool_reloads_disk_cache_across_capacities(
     monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path)
     HV, V, K = 2, 128, 128
     common = _make_mtp_inputs(batch_size, HV)
-    storage = (
-        torch.randn(batch_size + 1, 2, HV, V, K, dtype=torch.float32, device="cuda")
-        * 0.01
-    )
-    _check_pool_call(api, kernel, storage[:, 0], common, expected_misses=1)
+    for pool_size, artifact_count in ((batch_size + 1, 2), (batch_size + 3, 3)):
+        storage = (
+            torch.randn(pool_size, 2, HV, V, K, dtype=torch.float32, device="cuda")
+            * 0.01
+        )
+        _check_pool_call(api, kernel, storage[:, 0], common, expected_misses=1)
+        # One compact reference plus one strided specialization per capacity.
+        assert len(list(tmp_path.glob("gdn_decode_mtp_*/*.o"))) == artifact_count
     artifacts = sorted(tmp_path.glob("gdn_decode_mtp_*/*.o"))
-    assert len(artifacts) == 2  # Strided pool and compact reference.
 
     _clear_mtp_compile_caches(kernel)
     build_and_load = kernel.build_and_load_cute_dsl_kernel
 
     def load_only(module_name, kernel_name, compile_fn, **kwargs):
+        """Require actual disk reloads without falling back to compilation."""
+
         def unexpected_compile():
             pytest.fail(f"Expected a disk-cache hit for {kernel_name}")
 
         return build_and_load(module_name, kernel_name, unexpected_compile, **kwargs)
 
     monkeypatch.setattr(kernel, "build_and_load_cute_dsl_kernel", load_only)
-    storage = (
-        torch.randn(batch_size + 3, 2, HV, V, K, dtype=torch.float32, device="cuda")
-        * 0.01
-    )
-    _check_pool_call(api, kernel, storage[:, 0], common, expected_misses=1)
+    for pool_size, expected_misses in (
+        (batch_size + 3, 1),
+        (batch_size + 1, 1),
+        (batch_size + 3, 0),
+    ):
+        storage = (
+            torch.randn(pool_size, 2, HV, V, K, dtype=torch.float32, device="cuda")
+            * 0.01
+        )
+        _check_pool_call(api, kernel, storage[:, 0], common, expected_misses)
     assert sorted(tmp_path.glob("gdn_decode_mtp_*/*.o")) == artifacts
 
 
