@@ -51,6 +51,11 @@ struct SageQuantParams {
   // Hardware information.
   int smCount{};
   cudaStream_t stream{};
+  // Opt-in input layout. Outputs are always densely packed. The default
+  // selects the original packed-addressing kernel specialization.
+  bool stridedInput{false};
+  int64_t qkInputTokenStride{0};
+  int64_t vInputTokenStride{0};
 };
 
 void invokeSageQuant(SageQuantParams const& params);
