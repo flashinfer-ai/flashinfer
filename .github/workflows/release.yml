@@ -431,6 +431,23 @@ jobs:
 
           # Save to file for multi-line output
           echo "$NOTES" > /tmp/release_notes.md
+
+          # GitHub caps a release body at 125,000 characters, and a large
+          # delta exceeds it (v0.7.3rc1 generated 205 KB / 1,282 entries).
+          # Keep whole lines up to the cap and point at the full compare view.
+          MAX_NOTES_BYTES=120000
+          if [ "$(wc -c < /tmp/release_notes.md)" -gt "$MAX_NOTES_BYTES" ]; then
+            echo "Release notes exceed ${MAX_NOTES_BYTES} bytes; truncating at a line boundary"
+            if [ -n "$PREV_TAG" ]; then
+              FULL_URL="https://github.com/${REPOSITORY}/compare/${PREV_TAG}...${RELEASE_TAG}"
+            else
+              FULL_URL="https://github.com/${REPOSITORY}/commits/${RELEASE_TAG}"
+            fi
+            head -c "$MAX_NOTES_BYTES" /tmp/release_notes.md | sed '$d' > /tmp/release_notes.trimmed.md
+            printf '\n\n_Auto-generated notes truncated to fit the GitHub release body limit. Full changelog: %s_\n' \
+              "$FULL_URL" >> /tmp/release_notes.trimmed.md
+            mv /tmp/release_notes.trimmed.md /tmp/release_notes.md
+          fi
           echo "notes_file=/tmp/release_notes.md" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release (empty first)
@@ -446,9 +463,6 @@ jobs:
             gh release delete "${RELEASE_TAG}" --yes
           fi
 
-          # Read release notes from file
-          NOTES=$(cat "${NOTES_FILE}")
-
           # The GitHub API never infers pre-release status from the tag name
           # (that is web-UI only), so flag PEP 440 pre-release suffixes
           # explicitly -- otherwise an rc publishes as a full release and can
@@ -462,7 +476,7 @@ jobs:
           # Create new release without assets first
           gh release create "${RELEASE_TAG}" \
             --title "Release v${RELEASE_VERSION}" \
-            --notes "$NOTES" \
+            --notes-file "${NOTES_FILE}" \
             $PRERELEASE_FLAG
 
       - name: Download flashinfer-python artifact
