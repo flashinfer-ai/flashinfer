@@ -980,6 +980,24 @@ def test_exchange_scheme_ring_is_refused_beyond_two_hops() -> None:
     )
 
 
+def _assert_same_saved(back, saved) -> None:
+    """Field-by-field identity of two saved sets: tensors (and tensor tuples) by object identity, every other field by
+    ``==``.  (The dataclass ``__eq__`` of Python >= 3.13 compares the fields one by one without the tuple identity
+    shortcut, so a tensor field would be compared element-wise.)"""
+    for f in dataclasses.fields(saved):
+        a, b = getattr(back, f.name), getattr(saved, f.name)
+        if isinstance(b, torch.Tensor) or (
+            isinstance(b, tuple) and any(isinstance(x, torch.Tensor) for x in b)
+        ):
+            if isinstance(b, tuple):
+                assert len(a) == len(b), f.name
+                assert all(x is y for x, y in zip(a, b, strict=True)), f.name
+            else:
+                assert a is b, f.name
+        else:
+            assert a == b, (f.name, a, b)
+
+
 def test_saved_set_round_trips_through_tensors_and_meta() -> None:
     kcp = _mod("cake_kcp")
     S_in = torch.zeros(4)
@@ -1008,7 +1026,7 @@ def test_saved_set_round_trips_through_tensors_and_meta() -> None:
     back = kcp.SavedDetKcp.from_tensors(
         saved.tensors(), saved.flags(), saved.meta(), None
     )
-    assert back == saved
+    _assert_same_saved(back, saved)
     assert back.tape("h_tape") is tapes[kcp.FWD_TAPES.index("h_tape")]
     assert saved.bytes == 4 * 4 + 4 * len(kcp.FWD_TAPES)
     light_tapes = tuple(torch.zeros(2) for _ in kcp.LIGHT_TAPES)  # empty
@@ -1018,7 +1036,8 @@ def test_saved_set_round_trips_through_tensors_and_meta() -> None:
     back_light = kcp.SavedDetKcp.from_tensors(
         light.tensors(), light.flags(), light.meta(), None
     )
-    assert back_light == light and back_light.tapes == ()
+    _assert_same_saved(back_light, light)
+    assert back_light.tapes == ()
     with pytest.raises(KeyError):
         light.tape("akk")
     with pytest.raises(KeyError):
