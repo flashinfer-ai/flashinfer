@@ -687,26 +687,34 @@ single_head_paged_mqa_logits_trace = TraceTemplate(
 )
 
 
-quantize_write_index_k_nvfp4_trace = TraceTemplate(
-    op_type="quantize_write_index_k_nvfp4",
+quantize_write_index_qk_nvfp4_trace = TraceTemplate(
+    op_type="quantize_write_index_qk_nvfp4",
     description=(
-        "Indexer keys quantized to NVFP4 (E4M3 scale per 16 values) and written "
-        "at their slots of a 64-key paged cache."
+        "Indexer keys and queries quantized to NVFP4 (E4M3 scale per 16 values) in "
+        "one launch: keys at their slots of a 64-key paged cache, queries at their "
+        "rows."
     ),
     axes={
         "tokens": Var(description="Keys to write."),
-        "dim": Const(description="Key dimension."),
+        "queries": Var(description="Queries to write."),
+        "dim": Const(description="Key and query dimension."),
         "slots": Var(description="Slot mapping entries, one or more per key."),
+        "query_slots": Var(description="Query row entries, one or more per query."),
         "pages": Var(description="Key cache pages."),
+        "rows": Var(description="Packed query rows."),
         "page_size": Const(description="Keys per page."),
-        "packed_dim": Const(description="Packed NVFP4 bytes per key."),
-        "scales": Const(description="E4M3 scales per key, one per 16 values."),
+        "packed_dim": Const(description="Packed NVFP4 bytes per key or query."),
+        "scales": Const(description="E4M3 scales per key or query, one per 16 values."),
     },
     inputs={
         "key": Tensor(["tokens", "dim"]),
         "slots": Tensor(["slots"]),
+        "query": Tensor(["queries", "dim"]),
+        "query_rows": Tensor(["query_slots"]),
         "key_cache": Tensor(["pages", "page_size", "packed_dim"]),
         "key_scales": Tensor(["pages", "page_size", "scales"]),
+        "packed_query": Tensor(["rows", "packed_dim"]),
+        "query_scales": Tensor(["rows", "scales"]),
     },
     outputs={
         "key_cache": Tensor(
@@ -716,6 +724,12 @@ quantize_write_index_k_nvfp4_trace = TraceTemplate(
             ["pages", "page_size", "scales"],
             dtype="float8_e4m3fn",
             param="key_scales",
+        ),
+        "packed_query": Tensor(
+            ["rows", "packed_dim"], dtype="uint8", param="packed_query"
+        ),
+        "query_scales": Tensor(
+            ["rows", "scales"], dtype="float8_e4m3fn", param="query_scales"
         ),
     },
     tags=["arch:sm100", "arch:sm103"],

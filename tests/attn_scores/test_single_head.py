@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""single_head_paged_mqa_logits and quantize_write_index_k_nvfp4 against exact
+"""single_head_paged_mqa_logits and quantize_write_index_qk_nvfp4 against exact
 references over random paged BF16 or NVFP4 keys."""
 
 import pytest
@@ -9,7 +9,7 @@ import torch
 
 from flashinfer import nvfp4_kv_dequantize
 from flashinfer.attn_scores import (
-    quantize_write_index_k_nvfp4,
+    quantize_write_index_qk_nvfp4,
     single_head_paged_mqa_logits,
 )
 
@@ -134,62 +134,110 @@ def e2m1(x: torch.Tensor) -> torch.Tensor:
     return (grid[distance.argmin(-1)] * x.sign()).float()
 
 
-@pytest.mark.parametrize("tokens", [1, 9, 300])
-@torch.inference_mode()
-def test_quantize_write_index_k_nvfp4_matches_reference(tokens: int) -> None:
-    """Each written key's blocks of 16 are scaled by an E4M3 amax / 6 and
-    rounded to E2M1; slots are shuffled, negative ones skipped, and nothing
-    else is written."""
-    torch.manual_seed(tokens)
-    pages = -(-tokens // 64) + 2
-    spread = 4 ** torch.randn(tokens, 1, device="cuda")
-    key = (torch.randn(tokens, 128, device="cuda") * spread).bfloat16()
-    key[0, :16] = 0  # a zero block: scale 0
-    slots = torch.randperm(64 * pages, device="cuda")[:tokens]
-    slots[1::5] = -1
-    key_cache = torch.full((pages, 64, 64), 7, dtype=torch.uint8, device="cuda")
-    key_scales = torch.full_like(key_cache[..., :8], 7).view(torch.float8_e4m3fn)
-    quantize_write_index_k_nvfp4(key, slots, key_cache, key_scales)
-
-    blocks = key.float().view(tokens, 8, 16)
+def nvfp4_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """x's NVFP4 scales (amax / 6 of each 16 values, in E4M3) and its values
+    after quantizing, as float32."""
+    blocks = x.float().view(len(x), 8, 16)
     scale = (blocks.abs().amax(-1) / 6).to(torch.float8_e4m3fn).float()
     inverse = torch.where(scale > 0, 1 / scale, 0)
-    expected = (e2m1(blocks * inverse[..., None]) * scale[..., None]).flatten(1)
-    live = slots >= 0
-    rows, scale_rows = key_cache.view(-1, 64), key_scales.view(-1, 8)
-    torch.testing.assert_close(
-        scale_rows[slots[live]].float(), scale[live], rtol=0, atol=0
+    return scale, (e2m1(blocks * inverse[..., None]) * scale[..., None]).flatten(1)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "queries"), [(1, 9), (9, 300), (300, 1), (0, 5), (5, 0)]
+)
+@torch.inference_mode()
+def test_quantize_write_index_qk_nvfp4_matches_reference(
+    tokens: int, queries: int
+) -> None:
+    """Each written key and query has its blocks of 16 scaled by an E4M3 amax / 6
+    and rounded to E2M1. Slots and rows are shuffled, negative ones are skipped,
+    and nothing else is written."""
+    torch.manual_seed(tokens + queries)
+    pages, rows = -(-tokens // 64) + 2, queries + 7
+    spread = 4 ** torch.randn(tokens + queries, 1, device="cuda")
+    x = (torch.randn(tokens + queries, 128, device="cuda") * spread).bfloat16()
+    x[0, :16] = 0  # a zero block: scale 0
+    key, query = x.split([tokens, queries])
+    slots = torch.randperm(64 * pages, device="cuda")[:tokens]
+    slots[1::5] = -1
+    query_rows = torch.randperm(rows, device="cuda")[:queries]
+    query_rows[1::4] = -1
+    key_cache = torch.full((pages, 64, 64), 7, dtype=torch.uint8, device="cuda")
+    key_scales = torch.full_like(key_cache[..., :8], 7).view(torch.float8_e4m3fn)
+    packed_query = torch.full((rows, 64), 7, dtype=torch.uint8, device="cuda")
+    query_scales = torch.full_like(packed_query[:, :8], 7).view(torch.float8_e4m3fn)
+    quantize_write_index_qk_nvfp4(
+        key,
+        slots,
+        query,
+        query_rows,
+        key_cache=key_cache,
+        key_scales=key_scales,
+        packed_query=packed_query,
+        query_scales=query_scales,
     )
-    got = dequantize(rows[slots[live]], scale_rows[slots[live]]).float()
-    torch.testing.assert_close(got, expected[live], rtol=0, atol=0)
-    untouched = torch.ones(64 * pages, dtype=torch.bool, device="cuda")
-    untouched[slots[live]] = False
-    assert bool((rows[untouched] == 7).all())
+    for values, at, written, scales in (
+        (key, slots, key_cache.view(-1, 64), key_scales.view(-1, 8)),
+        (query, query_rows, packed_query, query_scales),
+    ):
+        live = at >= 0
+        if len(values):  # nvfp4_kv_dequantize takes no empty input
+            scale, expected = nvfp4_reference(values)
+            torch.testing.assert_close(
+                scales[at[live]].float(), scale[live], rtol=0, atol=0
+            )
+            got = dequantize(written[at[live]], scales[at[live]]).float()
+            torch.testing.assert_close(got, expected[live], rtol=0, atol=0)
+        untouched = torch.ones(len(written), dtype=torch.bool, device="cuda")
+        untouched[at[live]] = False
+        assert bool((written[untouched] == 7).all())
 
 
 @torch.inference_mode()
-def test_quantize_write_index_k_nvfp4_rejects_bad_inputs(monkeypatch) -> None:
+def test_quantize_write_index_qk_nvfp4_rejects_bad_inputs(monkeypatch) -> None:
     key = torch.zeros(1, 128, dtype=torch.bfloat16, device="cuda")
     slots = torch.zeros(1, dtype=torch.int64, device="cuda")
-    key_cache = torch.zeros(4, 64, 64, dtype=torch.uint8, device="cuda")
-    key_scales = torch.zeros(4, 64, 8, dtype=torch.float8_e4m3fn, device="cuda")
-    run = quantize_write_index_k_nvfp4
-    with pytest.raises(ValueError, match="key_scales must be"):
-        run(key, slots, key_cache, key_scales[:3])
+    outputs = dict(
+        key_cache=torch.zeros(4, 64, 64, dtype=torch.uint8, device="cuda"),
+        key_scales=torch.zeros(4, 64, 8, dtype=torch.float8_e4m3fn, device="cuda"),
+        packed_query=torch.zeros(4, 64, dtype=torch.uint8, device="cuda"),
+        query_scales=torch.zeros(4, 8, dtype=torch.float8_e4m3fn, device="cuda"),
+    )
+
+    def run(key=key, slots=slots, query=key, query_rows=slots, **changed):
+        quantize_write_index_qk_nvfp4(
+            key, slots, query, query_rows, **(outputs | changed)
+        )
+
     for wrong in (
-        (key.float(), slots, key_cache, key_scales),
-        (key, slots.int(), key_cache, key_scales),
-        (key, slots, key_cache.bfloat16(), key_scales),
-        (key, slots, key_cache, key_scales.float()),
+        dict(key=key[:, :64]),
+        dict(query=key[:, :64]),
+        dict(slots=slots[:0]),
     ):
-        with pytest.raises(ValueError, match="must be BF16 or FP16"):
-            run(*wrong)
+        with pytest.raises(ValueError, match="Keys and queries must be"):
+            run(**wrong)
+    for name in outputs:
+        with pytest.raises(ValueError, match="key_cache must be"):
+            run(**{name: outputs[name][:3, :8]})
+    for wrong in (
+        dict(key=key.float()),
+        dict(query=key.float()),
+        dict(slots=slots.int()),
+        dict(query_rows=slots.int()),
+        dict(key_cache=outputs["key_cache"].bfloat16()),
+        dict(packed_query=outputs["packed_query"].bfloat16()),
+        dict(key_scales=outputs["key_scales"].float()),
+        dict(query_scales=outputs["query_scales"].float()),
+    ):
+        with pytest.raises(ValueError, match="key and query must be BF16 or FP16"):
+            run(**wrong)
     monkeypatch.setattr(
         "flashinfer.attn_scores.single_head.get_compute_capability",
         lambda device: (9, 0),
     )
     with pytest.raises(ValueError, match="requires SM10x"):
-        run(key, slots, key_cache, key_scales)
+        run()
 
 
 @torch.inference_mode()

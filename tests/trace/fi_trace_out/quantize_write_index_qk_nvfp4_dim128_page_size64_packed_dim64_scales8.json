@@ -1,9 +1,9 @@
 {
-  "name": "quantize_write_index_k_nvfp4_dim128_page_size64_packed_dim64_scales8",
-  "description": "Indexer keys quantized to NVFP4 (E4M3 scale per 16 values) and written at their slots of a 64-key paged cache.",
-  "op_type": "quantize_write_index_k_nvfp4",
+  "name": "quantize_write_index_qk_nvfp4_dim128_page_size64_packed_dim64_scales8",
+  "description": "Indexer keys and queries quantized to NVFP4 (E4M3 scale per 16 values) in one launch: keys at their slots of a 64-key paged cache, queries at their rows.",
+  "op_type": "quantize_write_index_qk_nvfp4",
   "tags": [
-    "fi_api:flashinfer.attn_scores.single_head.quantize_write_index_k_nvfp4",
+    "fi_api:flashinfer.attn_scores.single_head.quantize_write_index_qk_nvfp4",
     "arch:sm100",
     "arch:sm103"
   ],
@@ -12,18 +12,30 @@
       "type": "var",
       "description": "Keys to write."
     },
+    "queries": {
+      "type": "var",
+      "description": "Queries to write."
+    },
     "dim": {
       "type": "const",
       "value": 128,
-      "description": "Key dimension."
+      "description": "Key and query dimension."
     },
     "slots": {
       "type": "var",
       "description": "Slot mapping entries, one or more per key."
     },
+    "query_slots": {
+      "type": "var",
+      "description": "Query row entries, one or more per query."
+    },
     "pages": {
       "type": "var",
       "description": "Key cache pages."
+    },
+    "rows": {
+      "type": "var",
+      "description": "Packed query rows."
     },
     "page_size": {
       "type": "const",
@@ -33,12 +45,12 @@
     "packed_dim": {
       "type": "const",
       "value": 64,
-      "description": "Packed NVFP4 bytes per key."
+      "description": "Packed NVFP4 bytes per key or query."
     },
     "scales": {
       "type": "const",
       "value": 8,
-      "description": "E4M3 scales per key, one per 16 values."
+      "description": "E4M3 scales per key or query, one per 16 values."
     }
   },
   "inputs": {
@@ -55,6 +67,19 @@
       ],
       "dtype": "int64"
     },
+    "query": {
+      "shape": [
+        "queries",
+        "dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "query_rows": {
+      "shape": [
+        "query_slots"
+      ],
+      "dtype": "int64"
+    },
     "key_cache": {
       "shape": [
         "pages",
@@ -67,6 +92,20 @@
       "shape": [
         "pages",
         "page_size",
+        "scales"
+      ],
+      "dtype": "float8_e4m3fn"
+    },
+    "packed_query": {
+      "shape": [
+        "rows",
+        "packed_dim"
+      ],
+      "dtype": "uint8"
+    },
+    "query_scales": {
+      "shape": [
+        "rows",
         "scales"
       ],
       "dtype": "float8_e4m3fn"
@@ -90,6 +129,22 @@
       ],
       "dtype": "float8_e4m3fn",
       "param": "key_scales"
+    },
+    "packed_query": {
+      "shape": [
+        "rows",
+        "packed_dim"
+      ],
+      "dtype": "uint8",
+      "param": "packed_query"
+    },
+    "query_scales": {
+      "shape": [
+        "rows",
+        "scales"
+      ],
+      "dtype": "float8_e4m3fn",
+      "param": "query_scales"
     }
   },
   "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"

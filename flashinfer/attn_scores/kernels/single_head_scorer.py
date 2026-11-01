@@ -51,13 +51,13 @@ PACKED_DIM, MXF4_K = DIM // 2, DIM // 2
 SCALES_PER_KEY = DIM // SCALE_VECTOR
 SCALE_WORDS = SCALES_PER_KEY // 4
 E2M1_MAX = 6.0
-# index_k_write_kernel: KEY_LANES lanes quantize a key, LANE_VALUES values each,
-# so LANES_PER_SCALE lanes share a scale; a CTA of TILE threads writes
-# WRITE_KEYS_PER_CTA keys.
+# index_qk_write_kernel: KEY_LANES lanes quantize a key or query, LANE_VALUES
+# values each, so LANES_PER_SCALE lanes share a scale; a CTA of TILE threads
+# writes WRITE_ROWS_PER_CTA keys or queries.
 KEY_LANES = 16
 LANE_VALUES = DIM // KEY_LANES
 LANES_PER_SCALE = SCALE_VECTOR // LANE_VALUES
-WRITE_KEYS_PER_CTA = TILE // KEY_LANES
+WRITE_ROWS_PER_CTA = TILE // KEY_LANES
 
 
 @cute.jit
@@ -586,34 +586,45 @@ class PagedScorer:
 
 
 @cute.kernel
-def index_k_write_kernel(
+def index_qk_write_kernel(
     key: cute.Tensor,
     slots: cute.Tensor,
+    query: cute.Tensor,
+    query_rows: cute.Tensor,
     key_cache: cute.Tensor,
     key_scales: cute.Tensor,
+    packed_query: cute.Tensor,
+    query_scales: cute.Tensor,
 ):
-    """Quantize key i to NVFP4 (an E4M3 scale per 16 values, their amax over 6,
-    and 64 packed E2M1 bytes as 16 words) and write it at slot slots[i];
-    negative slots are not written. Lanes 16 h .. 16 h + 15 of warp w take key
-    2 w + h, lane l quantizing values 8 l .. 8 l + 7: lane pairs share a scale.
-    The E4M3 path of rmsnorm_fp4quant (flashinfer/cute_dsl), with a unit global
-    scale, so the largest value maps to about 6."""
+    """Quantize row i to NVFP4 (an E4M3 scale per 16 values, their amax over 6,
+    and 64 packed E2M1 bytes as 16 words): key i at slot slots[i] of the key
+    cache, then query j = i - keys at row query_rows[j] of packed_query and
+    query_scales. Negative slots and rows are not written. Lanes 16 h .. 16 h + 15
+    of warp w take row 2 w + h, lane l quantizing values 8 l .. 8 l + 7: lane
+    pairs share a scale. The E4M3 path of rmsnorm_fp4quant (flashinfer/cute_dsl),
+    with a unit global scale, so the largest value maps to about 6."""
     lane = cute.arch.lane_idx()
     part = lane % KEY_LANES
     i = (
-        cute.arch.block_idx()[0] * WRITE_KEYS_PER_CTA
+        cute.arch.block_idx()[0] * WRITE_ROWS_PER_CTA
         + (cute.arch.warp_idx() * 32 + lane) // KEY_LANES
     )
-    key_cache = cute.recast_tensor(key_cache, cutlass.Int32)  # packed values as words
-    key_scales = cute.recast_tensor(key_scales, cutlass.Uint8)
+    keys = key.shape[0]
     slot = cutlass.Int64(-1)
     values = cute.make_rmem_tensor((LANE_VALUES,), cutlass.Float32)
     values.fill(0.0)
-    if i < key.shape[0]:  # past the keys, a lane still joins its pair's shuffle
+    if i < keys:  # past the rows, a lane still joins its pair's shuffle
         slot = slots[i].to(cutlass.Int64)
         loaded = cute.make_rmem_tensor((LANE_VALUES,), key.element_type)
         loaded.store(cute.local_tile(key[i, None], (LANE_VALUES,), (part,)).load())
         values.store(loaded.load().to(cutlass.Float32))
+    else:
+        if i - keys < query.shape[0]:
+            slot = query_rows[i - keys].to(cutlass.Int64)
+            loaded = cute.make_rmem_tensor((LANE_VALUES,), query.element_type)
+            row = query[i - keys, None]
+            loaded.store(cute.local_tile(row, (LANE_VALUES,), (part,)).load())
+            values.store(loaded.load().to(cutlass.Float32))
     amax = cutlass.Float32(0.0)
     for j in cutlass.range_constexpr(LANE_VALUES):
         amax = fmax_f32(amax, fabs_f32(values[j]))
@@ -624,10 +635,19 @@ def index_k_write_kernel(
         inverse = fdiv_rn(cutlass.Float32(1.0), fp8_e4m3_to_f32(scale))
     packed = cvt_e2m1x8_f32(*(values[j] * inverse for j in range(LANE_VALUES)))
     if slot >= 0:
-        page, row = slot // PAGE, slot % PAGE
-        key_cache[page, row, part] = packed.to(cutlass.Int32)
-        if part % 2 == 0:
-            key_scales[page, row, part // 2] = scale.to(cutlass.Uint8)
+        if i < keys:
+            words = cute.recast_tensor(key_cache, cutlass.Int32)
+            scales = cute.recast_tensor(key_scales, cutlass.Uint8)
+            page, row = slot // PAGE, slot % PAGE
+            words[page, row, part] = packed.to(cutlass.Int32)
+            if part % 2 == 0:
+                scales[page, row, part // 2] = scale.to(cutlass.Uint8)
+        else:
+            words = cute.recast_tensor(packed_query, cutlass.Int32)
+            scales = cute.recast_tensor(query_scales, cutlass.Uint8)
+            words[slot, part] = packed.to(cutlass.Int32)
+            if part % 2 == 0:
+                scales[slot, part // 2] = scale.to(cutlass.Uint8)
 
 
 # One scorer per query rows per request and key format, so each compiles once.

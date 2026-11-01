@@ -11,7 +11,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..cute_dsl.availability import is_cute_dsl_experimental_available
 from ..trace.templates.attn_scores import (
-    quantize_write_index_k_nvfp4_trace,
+    quantize_write_index_qk_nvfp4_trace,
     single_head_paged_mqa_logits_trace,
 )
 from ..utils import get_compute_capability, get_device_sm_count
@@ -157,20 +157,27 @@ def _score(rows: int, keys: tuple, args: tuple) -> None:
     function(*args)
 
 
-@flashinfer_api(trace=quantize_write_index_k_nvfp4_trace)
-def quantize_write_index_k_nvfp4(
+@flashinfer_api(trace=quantize_write_index_qk_nvfp4_trace)
+def quantize_write_index_qk_nvfp4(
     key: torch.Tensor,
     slots: torch.Tensor,
+    query: torch.Tensor,
+    query_rows: torch.Tensor,
+    *,
     key_cache: torch.Tensor,
     key_scales: torch.Tensor,
+    packed_query: torch.Tensor,
+    query_scales: torch.Tensor,
 ) -> None:
-    """Quantize indexer keys to NVFP4 and write them to a paged key cache, in the
-    layout :func:`single_head_paged_mqa_logits` reads.
+    """Quantize indexer keys and queries to NVFP4 in one launch: the keys into a
+    paged key cache and the queries into rows, the layouts
+    :func:`single_head_paged_mqa_logits` reads.
 
-    Each key gets one E4M3 scale per 16 values: their amax over 6. There is no
-    per-tensor global scale. Write all keys of a cache at the same scale: do not
-    scale them by a factor that changes between calls, or their scores stop
-    being comparable. Values above 2688 in magnitude saturate.
+    Each key and query gets one E4M3 scale per 16 values: their amax over 6.
+    There is no per-tensor global scale, so queries and keys are quantized the
+    same way. Write all keys of a cache at the same scale: do not scale them by
+    a factor that changes between calls, or their scores stop being comparable.
+    Values above 2688 in magnitude saturate.
 
     It runs as one launch without host synchronization, so it can be captured
     in a CUDA graph (run it once before capture to compile it).
@@ -182,15 +189,24 @@ def quantize_write_index_k_nvfp4(
     slots : torch.Tensor
         int64 ``[tokens]``: each key's cache slot ``s``. Negative slots are
         skipped.
+    query : torch.Tensor
+        BF16 or FP16 ``[queries, 128]``.
+    query_rows : torch.Tensor
+        int64 ``[queries]``: each query's row ``r``. Negative rows are skipped.
     key_cache : torch.Tensor
         uint8 ``[pages, 64, 64]``, output: a key's 64 packed E2M1 bytes go to
         ``key_cache[s // 64, s % 64]``.
     key_scales : torch.Tensor
         float8_e4m3fn ``[pages, 64, 8]``, output: a key's 8 scales go to
         ``key_scales[s // 64, s % 64]``.
+    packed_query : torch.Tensor
+        uint8 ``[rows, 64]``, output: a query's 64 packed E2M1 bytes go to row
+        ``r``.
+    query_scales : torch.Tensor
+        float8_e4m3fn ``[rows, 8]``, output: a query's 8 scales go to row ``r``.
     """
     if not is_cute_dsl_experimental_available():
-        raise RuntimeError("quantize_write_index_k_nvfp4 needs CuTe DSL 4.7 or newer")
+        raise RuntimeError("quantize_write_index_qk_nvfp4 needs CuTe DSL 4.7 or newer")
     from ..cute_dsl.launch import launch
     from .kernels import single_head_scorer
     from .kernels.single_head_scorer import (
@@ -199,39 +215,52 @@ def quantize_write_index_k_nvfp4(
         PAGE,
         SCALES_PER_KEY,
         TILE,
-        WRITE_KEYS_PER_CTA,
+        WRITE_ROWS_PER_CTA,
     )
 
-    if key.shape[1] != DIM or key_cache.shape[1:] != (PAGE, PACKED_DIM):
-        raise ValueError(
-            f"Keys must be [tokens, {DIM}] and the cache [pages, {PAGE}, {PACKED_DIM}]"
-        )
     if (
-        key_scales.shape != (key_cache.shape[0], PAGE, SCALES_PER_KEY)
+        key.shape[1:] != (DIM,)
+        or query.shape[1:] != (DIM,)
         or slots.shape[0] < key.shape[0]
+        or query_rows.shape[0] < query.shape[0]
     ):
         raise ValueError(
-            f"key_scales must be [pages, {PAGE}, {SCALES_PER_KEY}] for the pages of "
-            "key_cache, with a slot per key"
+            f"Keys and queries must be [tokens, {DIM}], with a slot or row each"
         )
+    if (
+        key_cache.shape[1:] != (PAGE, PACKED_DIM)
+        or key_scales.shape != (key_cache.shape[0], PAGE, SCALES_PER_KEY)
+        or packed_query.shape[1:] != (PACKED_DIM,)
+        or query_scales.shape != (packed_query.shape[0], SCALES_PER_KEY)
+    ):
+        raise ValueError(
+            f"key_cache must be [pages, {PAGE}, {PACKED_DIM}] and key_scales "
+            f"[pages, {PAGE}, {SCALES_PER_KEY}]; packed_query [rows, {PACKED_DIM}] "
+            f"and query_scales [rows, {SCALES_PER_KEY}]"
+        )
+    scale_dtypes = (torch.float8_e4m3fn, torch.uint8)
     if (
         key.dtype not in (torch.bfloat16, torch.float16)
-        or slots.dtype != torch.int64
-        or key_cache.dtype != torch.uint8
-        or key_scales.dtype not in (torch.float8_e4m3fn, torch.uint8)
+        or query.dtype not in (torch.bfloat16, torch.float16)
+        or {slots.dtype, query_rows.dtype} != {torch.int64}
+        or {key_cache.dtype, packed_query.dtype} != {torch.uint8}
+        or key_scales.dtype not in scale_dtypes
+        or query_scales.dtype not in scale_dtypes
     ):
         raise ValueError(
-            "key must be BF16 or FP16, slots int64, key_cache uint8 and key_scales "
-            "float8_e4m3fn"
+            "key and query must be BF16 or FP16, slots and query_rows int64, "
+            "key_cache and packed_query uint8, and the scales float8_e4m3fn"
         )
     if get_compute_capability(key.device)[0] != 10:
-        raise ValueError("quantize_write_index_k_nvfp4 requires SM10x")
-    if key.shape[0]:
+        raise ValueError("quantize_write_index_qk_nvfp4 requires SM10x")
+    rows = key.shape[0] + query.shape[0]
+    if rows:
+        args = (key, slots, query, query_rows, key_cache, key_scales)
         launch(
-            single_head_scorer.index_k_write_kernel,
-            (-(-key.shape[0] // WRITE_KEYS_PER_CTA), 1),
+            single_head_scorer.index_qk_write_kernel,
+            (-(-rows // WRITE_ROWS_PER_CTA), 1),
             TILE,
-            (key, slots, key_cache, key_scales),
+            (*args, packed_query, query_scales),
             (),
             module="single_head_scorer",
             key_files=(single_head_scorer.__file__,),
