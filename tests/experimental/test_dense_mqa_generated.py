@@ -1460,6 +1460,7 @@ _BUCKET_QUERIES = {
     "fp4:le32:short": (7, 16, 36, 37, 128),
     "fp8:q128:short": (128,),
     "fp8:full:le32:short": (4, 16, 124),
+    "fp8:qle2048:short": (129, 136, 137),
 }
 
 
