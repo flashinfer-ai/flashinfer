@@ -4,7 +4,8 @@
     {
       "archs": [
         "sm_100a",
-        "sm_103a"
+        "sm_103a",
+        "sm_107a"
       ],
       "ffi_entry": "run",
       "setup_ffi_entry": "setup_tma",

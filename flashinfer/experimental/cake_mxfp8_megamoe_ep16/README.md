@@ -1,8 +1,9 @@
 # MXFP8 MegaMoE EP16
 
 This directory contains experimental JIT-only CUDA and CuTe-DSL backends for a
-fixed MXFP8 MegaMoE configuration on SM100 and SM103 devices (compute
-capability 10.0 or 10.3).
+fixed MXFP8 MegaMoE configuration on SM100, SM103 and SM107 devices (compute
+capability 10.0, 10.3 or 10.7). The CuTe-DSL backend supports SM100 and SM103
+only; SM107 uses the CUDA backend.
 
 The public entry points are
 `flashinfer.moe_ep.CakeMxfp8MegaMoeEp16` and
@@ -26,7 +27,8 @@ output = session.run(
 Omit `backend` or pass `backend="cuda"` for the CUDA implementation. Every rank
 in the process group must choose the same backend. This agreement is checked
 collectively before symmetric workspace allocation. There is no automatic
-backend selection or fallback.
+backend selection or fallback. On SM107, `backend="cute_dsl"` raises after
+this agreement.
 
 CuTe-DSL requires the appropriate FlashInfer CUDA extra (`cu12` or `cu13`) and
 its CUTLASS DSL dependency. The CuTe modules are loaded lazily only when this
@@ -52,8 +54,9 @@ forward path.
 
 The JIT loader builds one module per admitted architecture that is also a
 FlashInfer build target (`FLASHINFER_CUDA_ARCH_LIST` or the visible devices):
-`sm_100a` and `sm_103a`. The manifest lists the sources and launch facts; it
-does not re-verify digests at import time.
+`sm_100a`, `sm_103a` and `sm_107a`. The `sm_107a` target needs CUDA 13.4 or
+newer. The manifest lists the sources and launch facts; it does not re-verify
+digests at import time.
 
 ## Supported contract
 
@@ -64,17 +67,18 @@ does not re-verify digests at import time.
 - BF16 activations and outputs with MXFP8 expert weights
 - immutable routing prepared with the session, with at most 64 routes assigned
   to any expert across all ranks
-- compute capability 10.0 or 10.3 and NVSHMEM symmetric memory
+- compute capability 10.0, 10.3 or 10.7 and NVSHMEM symmetric memory
 
 The top-k reducer waits for every route term of the forward. Routing outside
 this contract (for example routing changed in place after the session is
 created) leaves route terms unwritten and hangs the forward on all ranks.
 
 End-to-end EP16 correctness and performance were measured on 16 GB300 GPUs
-(SM103). The SM100 target is admitted from the same source: the device text
-has no architecture-dependent code and uses only instructions shared by both
-targets; it is compile-proven on B200, and the 16-rank test has not been run
-there.
+(SM103) and, for the CUDA backend, on 16 R200 GPUs (SM107, four nodes of one
+NVL72 domain). The SM100 target is admitted from the same source: the device
+text has no architecture-dependent code and uses only instructions shared by
+all three targets; it is compile-proven on B200, and the 16-rank test has not
+been run there.
 
 CUDA session construction materializes eight fixed-address TMA descriptors with
 one setup kernel. CuTe-DSL prepares tensor-map dimensions and strides on the

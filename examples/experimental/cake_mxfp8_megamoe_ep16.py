@@ -66,8 +66,8 @@ def main() -> None:
     device_index = _select_device_index(os.environ, torch.cuda.device_count())
     torch.cuda.set_device(device_index)
     device = torch.device("cuda", device_index)
-    if torch.cuda.get_device_capability(device) != (10, 3):
-        raise RuntimeError("This example requires SM103 GPUs")
+    if torch.cuda.get_device_capability(device) not in ((10, 3), (10, 7)):
+        raise RuntimeError("This example requires SM103 or SM107 GPUs")
     dist.init_process_group("nccl", device_id=device, timeout=timedelta(minutes=10))
     try:
         if dist.get_world_size() != 16:

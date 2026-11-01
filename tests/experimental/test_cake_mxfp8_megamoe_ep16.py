@@ -296,7 +296,7 @@ def test_cute_source_key_changes_for_each_dependency(tmp_path) -> None:
 def test_generated_source_closure() -> None:
     csrc_root, manifest = _read_manifest()
     sequence = manifest["sequences"][0]
-    assert sequence["archs"] == ["sm_100a", "sm_103a"]
+    assert sequence["archs"] == ["sm_100a", "sm_103a", "sm_107a"]
     units = sequence["translation_units"]
     assert len(units["devices"]) == 2 and len(units["headers"]) == 1
     assert sequence["setup_ffi_entry"] == "setup_tma"
@@ -318,7 +318,9 @@ def test_generated_source_closure() -> None:
     (
         ("10.3a", ((10, 3),)),
         ("10.0a", ((10, 0),)),
+        ("10.7a", ((10, 7),)),
         ("10.0 10.3", ((10, 0), (10, 3))),
+        ("10.0a 10.3a 10.7a", ((10, 0), (10, 3), (10, 7))),
         ("9.0a 12.0f", ()),
     ),
 )
@@ -326,6 +328,7 @@ def test_loader_targets_follow_flashinfer_cuda_arch_list(
     monkeypatch, arch_list, expected
 ) -> None:
     monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", arch_list)
+    monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
     assert _jit.supported_capabilities() == expected
     for capability in expected:
         assert _jit.require_supported_capability(capability) == capability
@@ -336,11 +339,63 @@ def test_loader_targets_follow_flashinfer_cuda_arch_list(
         _jit.require_supported_capability((9, 0))
 
 
+def test_sm107a_target_requires_cuda_13_4(monkeypatch) -> None:
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a 10.7a")
+    monkeypatch.setattr(
+        _jit, "is_cuda_version_at_least", lambda version: version != "13.4"
+    )
+    assert _jit.supported_capabilities() == ((10, 0), (10, 3))
+    with pytest.raises(RuntimeError, match="requires CUDA 13.4 or newer"):
+        _jit.require_supported_capability((10, 7))
+    assert _jit.require_supported_capability((10, 3)) == (10, 3)
+
+
+def test_cute_dsl_backend_keeps_sm100_and_sm103_targets(monkeypatch) -> None:
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a 10.7a")
+    monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
+    assert _jit.CUTE_DSL_CAPABILITIES == ((10, 0), (10, 3))
+    for capability in _jit.CUTE_DSL_CAPABILITIES:
+        assert _jit.require_cute_dsl_capability(capability) == capability
+    assert _jit.require_supported_capability((10, 7)) == (10, 7)
+    with pytest.raises(RuntimeError, match="backend='cute_dsl' requires"):
+        _jit.require_cute_dsl_capability((10, 7))
+
+
+def test_cute_dsl_backend_is_rejected_on_sm107_after_agreement(monkeypatch) -> None:
+    gathered = []
+
+    def all_gather_object(output, selected, *, group):
+        output[:] = [selected] * 16
+        gathered.append(selected)
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 16)
+    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 7))
+    monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.7a")
+
+    with pytest.raises(RuntimeError, match="backend='cute_dsl' requires"):
+        _CakeMxfp8MegaMoeEp16Session(
+            None, None, process_group=object(), backend="cute_dsl"
+        )
+    # Every rank agrees on the backend before the capability check raises.
+    assert gathered == ["cute_dsl"]
+
+
 @pytest.mark.parametrize(
-    "capability,arch", (((10, 0), "compute_100a"), ((10, 3), "compute_103a"))
+    "capability,arch",
+    (
+        ((10, 0), "compute_100a"),
+        ((10, 3), "compute_103a"),
+        ((10, 7), "compute_107a"),
+    ),
 )
 def test_jit_spec_is_exact_per_capability(monkeypatch, capability, arch) -> None:
-    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a 10.7a")
+    monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
     _jit.gen_cake_mxfp8_megamoe_ep16_module.cache_clear()
     spec = _jit.gen_cake_mxfp8_megamoe_ep16_module(capability)
     assert spec.name.endswith(_jit.device_arch(capability))
@@ -358,6 +413,16 @@ def test_cute_compile_program_takes_variant_and_architecture() -> None:
             node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
         }
         assert [a.arg for a in functions["compile_program"].args.args] == parameters
+        targets = [
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and [getattr(t, "id", "") for t in node.targets] == ["CAKE_TARGET_ARCHES"]
+        ]
+        assert len(targets) == 1
+        assert list(ast.literal_eval(targets[0])) == [
+            _jit.device_arch(capability) for capability in _jit.CUTE_DSL_CAPABILITIES
+        ]
     fused = ast.parse(_jit.cute_dsl_source("fused").read_text())
     guards = [
         node
@@ -605,8 +670,8 @@ def test_ep16_sparse_reference_and_repeated_result(backend) -> None:
         device_index = local_rank
     torch.cuda.set_device(device_index)
     device = torch.device("cuda", torch.cuda.current_device())
-    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
-        pytest.skip("requires SM100 or SM103")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("requires SM100, SM103 or SM107")
 
     initialized_here = not dist.is_initialized()
     if initialized_here:
@@ -626,6 +691,15 @@ def test_ep16_sparse_reference_and_repeated_result(backend) -> None:
         with pytest.raises(ValueError, match="backend must be 'cuda' or 'cute_dsl'"):
             CakeMxfp8MegaMoeEp16(None, None, backend="invalid" if rank == 0 else "cuda")
         dist.barrier()
+        if backend == "cute_dsl" and torch.cuda.get_device_capability(device) == (
+            10,
+            7,
+        ):
+            # SM107 runs the CUDA backend only; every rank rejects CuTe-DSL.
+            with pytest.raises(RuntimeError, match="backend='cute_dsl' requires"):
+                CakeMxfp8MegaMoeEp16(None, None, backend=backend)
+            dist.barrier()
+            return
         w13, w2 = _make_sparse_expert_weights(rank, device)
         weights = preprocess_cake_mxfp8_megamoe_ep16_weights(w13, w2)
         del w13, w2

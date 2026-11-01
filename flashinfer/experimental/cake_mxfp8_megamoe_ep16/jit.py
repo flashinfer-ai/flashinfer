@@ -20,7 +20,8 @@ limitations under the License.
 # code, no __CUDA_ARCH__ dependence) compiled as one exact-architecture module
 # per admitted target. Targets follow FlashInfer's compilation context
 # (FLASHINFER_CUDA_ARCH_LIST or the visible devices), restricted to the
-# capabilities the kernels are built for.
+# capabilities the kernels are built for. The sm_107a target needs CUDA 13.4
+# or newer.
 
 from __future__ import annotations
 
@@ -37,7 +38,9 @@ from ...jit.core import (
     logger,
     sm100a_nvcc_flags,
     sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
 )
+from ...jit.cpp_ext import is_cuda_version_at_least
 
 _OPERATOR_DIR = "cake_mxfp8_megamoe_ep16"
 _MANIFEST = "cake_mxfp8_megamoe_ep16_manifest.json"
@@ -45,8 +48,13 @@ _SCHEMA = "flashinfer.experimental.source_closure.v2"
 _ARCH_FLAGS: dict[tuple[int, int], tuple[str, list[str]]] = {
     (10, 0): ("sm_100a", sm100a_nvcc_flags),
     (10, 3): ("sm_103a", sm103a_nvcc_flags),
+    (10, 7): ("sm_107a", sm107a_nvcc_flags),
 }
+# Capabilities whose target needs a newer CUDA toolkit than FlashInfer's minimum.
+_MIN_CUDA: dict[tuple[int, int], str] = {(10, 7): "13.4"}
 SUPPORTED_CAPABILITIES = tuple(sorted(_ARCH_FLAGS))
+# The CuTe-DSL backend keeps its SM100/SM103 targets; SM107 runs the CUDA backend.
+CUTE_DSL_CAPABILITIES = ((10, 0), (10, 3))
 
 
 def _get_csrc_root() -> Path:
@@ -116,8 +124,13 @@ def supported_capabilities() -> tuple[tuple[int, int], ...]:
     return tuple(
         capability
         for capability in SUPPORTED_CAPABILITIES
-        if (capability[0], f"{capability[1]}a") in targets
+        if (capability[0], f"{capability[1]}a") in targets and _has_min_cuda(capability)
     )
+
+
+def _has_min_cuda(capability: tuple[int, int]) -> bool:
+    minimum = _MIN_CUDA.get(capability)
+    return minimum is None or is_cuda_version_at_least(minimum)
 
 
 def require_supported_capability(capability: tuple[int, int]) -> tuple[int, int]:
@@ -131,6 +144,11 @@ def require_supported_capability(capability: tuple[int, int]) -> tuple[int, int]
         raise RuntimeError(
             f"Cake MXFP8 MegaMoE EP16 requires compute capability {supported}, got {capability[0]}.{capability[1]}"
         )
+    if not _has_min_cuda(capability):
+        raise RuntimeError(
+            f"Cake MXFP8 MegaMoE EP16 on compute capability {capability[0]}.{capability[1]} "
+            f"requires CUDA {_MIN_CUDA[capability]} or newer"
+        )
     if capability not in supported_capabilities():
         raise RuntimeError(
             f"Cake MXFP8 MegaMoE EP16 is not a build target for compute capability "
@@ -139,8 +157,23 @@ def require_supported_capability(capability: tuple[int, int]) -> tuple[int, int]
     return capability
 
 
+def require_cute_dsl_capability(capability: tuple[int, int]) -> tuple[int, int]:
+    """Return ``capability`` when the CuTe-DSL backend is built for it, else raise."""
+
+    capability = require_supported_capability(capability)
+    if capability not in CUTE_DSL_CAPABILITIES:
+        supported = " or ".join(
+            f"{major}.{minor}" for major, minor in CUTE_DSL_CAPABILITIES
+        )
+        raise RuntimeError(
+            f"Cake MXFP8 MegaMoE EP16 backend='cute_dsl' requires compute capability "
+            f"{supported}, got {capability[0]}.{capability[1]}; use backend='cuda'"
+        )
+    return capability
+
+
 def device_arch(capability: tuple[int, int]) -> str:
-    """The exact CUDA architecture name (``sm_100a`` / ``sm_103a``) of an admitted capability."""
+    """The exact CUDA architecture name (``sm_100a`` / ``sm_103a`` / ``sm_107a``) of an admitted capability."""
 
     return _ARCH_FLAGS[require_supported_capability(capability)][0]
 
@@ -197,11 +230,13 @@ def cute_dsl_source(role: str) -> Path:
 
 
 __all__ = [
+    "CUTE_DSL_CAPABILITIES",
     "SUPPORTED_CAPABILITIES",
     "cute_dsl_source",
     "device_arch",
     "gen_cake_mxfp8_megamoe_ep16_module",
     "load_cake_mxfp8_megamoe_ep16_module",
+    "require_cute_dsl_capability",
     "require_supported_capability",
     "supported_capabilities",
 ]

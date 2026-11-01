@@ -72,7 +72,9 @@ def _import_source(path: Path) -> ModuleType:
 @functools.cache
 def _load_kernels(device_index: int, return_all_cta: bool) -> tuple[Any, Any]:
     with torch.cuda.device(device_index):
-        arch = _jit.device_arch(torch.cuda.get_device_capability())
+        arch = _jit.device_arch(
+            _jit.require_cute_dsl_capability(torch.cuda.get_device_capability())
+        )
         # The generated host functions select the architecture explicitly. Do not
         # let the JIT cache label the same object with an incompatible target.
         requested = os.environ.get("CUTE_DSL_ARCH")

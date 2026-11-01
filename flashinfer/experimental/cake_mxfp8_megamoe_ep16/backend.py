@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Cake MXFP8 MegaMoE backend for EP16 on SM100 and SM103 devices.
+# Cake MXFP8 MegaMoE backend for EP16 on SM100, SM103 and SM107 devices.
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from ...comm.torch_symmetric_memory import _enable_symm_mem_for_group
 from ...moe_ep.cake_mxfp8_megamoe_ep16 import CakeMxfp8MegaMoeEp16Weights
 from .jit import (
     load_cake_mxfp8_megamoe_ep16_module,
+    require_cute_dsl_capability,
     require_supported_capability,
 )
 
@@ -426,7 +427,7 @@ class _Workspace:
 
 
 class CakeMxfp8MegaMoeEp16:
-    """Prepared EP16 MXFP8 MegaMoE session for SM100 and SM103 devices.
+    """Prepared EP16 MXFP8 MegaMoE session for SM100, SM103 and SM107 devices.
 
     The route supports 512 experts, hidden size 3072, intermediate size 5120,
     top-k 8, 16/32/64 tokens per rank, and up to 64 routes per expert. Routing
@@ -434,7 +435,8 @@ class CakeMxfp8MegaMoeEp16:
     owns all symmetric memory and scratch storage. A session must be used
     serially from one CUDA stream. :meth:`run` submits without allocating, and
     CUDA Graph capture is not supported. ``backend="cute_dsl"`` explicitly
-    selects the CuTe-DSL implementation; ``"cuda"`` remains the default.
+    selects the CuTe-DSL implementation on SM100 and SM103; ``"cuda"`` remains
+    the default and is the only backend on SM107.
     """
 
     def __init__(
@@ -454,10 +456,13 @@ class CakeMxfp8MegaMoeEp16:
         if world_size != _WORLD_SIZE:
             raise ValueError(f"Cake MXFP8 MegaMoE requires EP16, got EP{world_size}")
         device = torch.device("cuda", torch.cuda.current_device())
-        require_supported_capability(torch.cuda.get_device_capability(device))
+        capability = require_supported_capability(
+            torch.cuda.get_device_capability(device)
+        )
         _validate_collective_backend(backend, process_group=self._group)
         self._backend = backend
         if backend == "cute_dsl":
+            require_cute_dsl_capability(capability)
             from .cute_dsl import create_runner
 
         self._validate_weights(weights, device=device)
