@@ -49,6 +49,63 @@ _FP8 = torch.float8_e4m3fn
 _GRAPH_OWNERS: list[tuple[object, ...]] = []
 
 
+@pytest.mark.parametrize("store_stats", (False, True))
+@pytest.mark.parametrize("packed_query", (False, True))
+@pytest.mark.parametrize("use_kv_bounds", (False, True))
+def test_attention_ts_mla_launch_preserves_persistent_cache_abi(
+    store_stats, packed_query, use_kv_bounds
+):
+    from flashinfer.attention.prims_ts.mla_decode import _launch_mla_decode
+
+    shape = (2, 8, 576) if packed_query else (2, 1, 8, 576)
+    query = torch.empty(shape)
+    output = torch.empty((*shape[:-1], 512))
+    stats = torch.empty((*shape[:-1], 2)) if store_stats else None
+    bounds = torch.full((2,), 32, dtype=torch.int32) if use_kv_bounds else None
+    runtime = SimpleNamespace(
+        query=query,
+        out=output,
+        normalized_cache=torch.empty((2, 32, 576)),
+        sparse_inputs=None,
+        extra_cache=None,
+        output_quant_args=None,
+        softmax_scale=1.0,
+        output_scale=1.0,
+    )
+    workspace = SimpleNamespace(lse=torch.empty((2, 1, 8)), kernel_workspace=None)
+    calls = []
+
+    def compiled(*args):
+        # Reloaded TVM-FFI functions have no keyword arguments or defaults.
+        assert len(args) == 18
+        assert args[-4] is None
+        assert args[-3] == 1
+        if store_stats:
+            assert args[-2].data_ptr() == stats.data_ptr()
+            assert args[-2].shape == (16, 2)
+        else:
+            assert args[-2] is None
+        assert args[-1] is bounds
+        calls.append(args)
+
+    result = _launch_mla_decode(
+        runtime,
+        block_tables=torch.zeros((2, 1), dtype=torch.int32),
+        seq_lens_kv=torch.full((2,), 32, dtype=torch.int32),
+        qo_indptr=torch.arange(3, dtype=torch.int32) if packed_query else None,
+        packed_query=packed_query,
+        kv_lora_rank=512,
+        split_kv=1,
+        workspace=workspace,
+        compiled=compiled,
+        max_q_len=1,
+        softmax_stats=stats,
+        kv_bounds=bounds,
+    )
+    assert result is output
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize(
     "wrapper_type",
     (
