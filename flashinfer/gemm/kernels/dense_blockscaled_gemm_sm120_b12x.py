@@ -257,6 +257,7 @@ class DenseGemmKernel:
         load_path: Literal["tma", "cpasync"] = "tma",
         swap_ab: bool = False,
         enable_iket: bool = False,
+        use_tma_store: bool = True,
     ):
         self.acc_dtype = cutlass.Float32
         self.sf_vec_size = sf_vec_size
@@ -286,6 +287,9 @@ class DenseGemmKernel:
         self.use_m1_non_tma_sfa = use_m1_non_tma_sfa
         self.load_path = load_path
         self.swap_ab = swap_ab
+        self.use_tma_store = use_tma_store
+        if not use_tma_store and split_k_slices != 1:
+            raise ValueError("Non-TMA output stores require split_k_slices=1")
         # IKET is a compile-time diagnostic. Every marker is guarded with
         # const_expr so the default specialization contains no tracing ops.
         self.enable_iket = enable_iket
@@ -575,11 +579,15 @@ class DenseGemmKernel:
             1,
             internal_type=cutlass.Int16,
         )
-        tma_atom_c, tma_tensor_c = self._make_tma_store_atoms_and_tensors(
-            c,
-            self.epi_smem_layout_staged,
-            self.epi_tile,
-        )
+        if cutlass.const_expr(self.use_tma_store):
+            tma_atom_c, tma_tensor_c = self._make_tma_store_atoms_and_tensors(
+                c,
+                self.epi_smem_layout_staged,
+                self.epi_tile,
+            )
+        else:
+            # No output descriptor is valid for a non-aligned row stride.
+            tma_atom_c, tma_tensor_c = tma_atom_a, c
         if cutlass.const_expr(self.svdquant_enabled):
             svdquant_a = svdquant_l1 if self.swap_ab else svdquant_d
             svdquant_b = svdquant_d if self.swap_ab else svdquant_l1
@@ -1073,7 +1081,7 @@ class DenseGemmKernel:
                 cpasync.prefetch_descriptor(tma_atom_sfa)
             if cutlass.const_expr(self.load_path == "tma"):
                 cpasync.prefetch_descriptor(tma_atom_sfb)
-            if cutlass.const_expr(not self.use_m1_non_tma_c):
+            if cutlass.const_expr(self.use_tma_store and not self.use_m1_non_tma_c):
                 cpasync.prefetch_descriptor(tma_atom_c)
             if cutlass.const_expr(svdquant_d is not None):
                 cpasync.prefetch_descriptor(tma_atom_svdquant_a)
@@ -1981,16 +1989,19 @@ class DenseGemmKernel:
                         gC_mnl_slice, self.epi_tile
                     )
 
-                    bSG_sD, bSG_gD = cpasync.tma_partition(
-                        tma_atom_c,
-                        0,
-                        cute.make_layout(1),
-                        sepi_for_tma_partition,
-                        tcgc_for_tma_partition,
-                    )
-
-                    epi_rest_m = bSG_gD.shape[1][0]
-                    epi_rest_n = bSG_gD.shape[1][1]
+                    if cutlass.const_expr(self.use_tma_store):
+                        bSG_sD, bSG_gD = cpasync.tma_partition(
+                            tma_atom_c,
+                            0,
+                            cute.make_layout(1),
+                            sepi_for_tma_partition,
+                            tcgc_for_tma_partition,
+                        )
+                        epi_rest_m = bSG_gD.shape[1][0]
+                        epi_rest_n = bSG_gD.shape[1][1]
+                    else:
+                        epi_rest_m = self.tile_shape_mnk[0] // self.epi_tile[0]
+                        epi_rest_n = self.tile_shape_mnk[1] // self.epi_tile[1]
                     epi_tile_m = self.epi_tile[0]
                     epi_tile_n = self.epi_tile[1]
                     mma_tile_m = self.tile_shape_mnk[0] // cute.size(tRS_rAcc, mode=[1])
@@ -2180,8 +2191,9 @@ class DenseGemmKernel:
                                 # The TMA store issued from this sC buffer,
                                 # possibly by the previous work tile, may
                                 # still be reading it.
-                                if warp_idx == 0:
-                                    tma_store_pipeline.producer_acquire()
+                                if cutlass.const_expr(self.use_tma_store):
+                                    if warp_idx == 0:
+                                        tma_store_pipeline.producer_acquire()
                                 self.epilog_sync_barrier.arrive_and_wait()
                                 cute.copy(
                                     tiled_copy_r2s,
@@ -2195,7 +2207,44 @@ class DenseGemmKernel:
                                 self.epilog_sync_barrier.arrive_and_wait()
 
                                 # Copy from shared memory to global memory
-                                if cutlass.const_expr(self.use_m1_non_tma_c):
+                                if cutlass.const_expr(not self.use_tma_store):
+                                    # Retain the shared epilogue and its tile barriers;
+                                    # only the global store needs tail predication.
+                                    threads = (
+                                        self.num_mma_warps * self.num_threads_per_warp
+                                    )
+                                    for i in cutlass.range_constexpr(
+                                        (
+                                            self.epi_tile[0] * self.epi_tile[1]
+                                            + threads
+                                            - 1
+                                        )
+                                        // threads
+                                    ):
+                                        linear = Int32(tidx) + Int32(i * threads)
+                                        row = linear // Int32(self.epi_tile[1])
+                                        col = linear % Int32(self.epi_tile[1])
+                                        m_coord = (
+                                            tile_coord_mnl[0]
+                                            * Int32(self.tile_shape_mnk[0])
+                                            + Int32(epi_m * self.epi_tile[0])
+                                            + row
+                                        )
+                                        n_coord = (
+                                            tile_coord_mnl[1]
+                                            * Int32(self.tile_shape_mnk[1])
+                                            + Int32(epi_n * self.epi_tile[1])
+                                            + col
+                                        )
+                                        if (
+                                            row < Int32(self.epi_tile[0])
+                                            and m_coord < Int32(directC_mnl.shape[0])
+                                            and n_coord < Int32(directC_mnl.shape[1])
+                                        ):
+                                            directC_mnl[
+                                                (m_coord, n_coord, tile_coord_mnl[2])
+                                            ] = sC[(row, col, epi_buffer)]
+                                elif cutlass.const_expr(self.use_m1_non_tma_c):
                                     for n_iter in cutlass.range_constexpr(
                                         (
                                             self.epi_tile[1]
@@ -2253,7 +2302,7 @@ class DenseGemmKernel:
                         tile_sched.advance_to_next_work()
                         work_tile = tile_sched.get_current_work()
 
-            if cutlass.const_expr(not self.swap_ab):
+            if cutlass.const_expr(not self.swap_ab and self.use_tma_store):
                 # Drain outstanding TMA stores: writes are visible to PDL
                 # dependent grids only if they complete before
                 # griddepcontrol_launch_dependents.
