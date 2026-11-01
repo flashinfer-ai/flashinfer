@@ -2810,6 +2810,201 @@ def local_scratch_table_bytes(plan) -> int:
     return int(plan.table_words()) * 4 if intra_writes_tables(plan) else 0
 
 
+# The local arena of a backward workspace (``cake_kcp.WorkspaceKcp`` ``local_arena``): ``"replay"`` (the default)
+# is the existing backend's replay layout (4488 B per internal token-head) with its forward layout; ``"lean"`` (opt-in)
+# runs the backward on this route's lean layout (:data:`LOCAL_LAYOUT_BWD_LEAN`, registered on the existing backend:
+# 3460 B per internal token-head plus the per-pass set where it does not fit; the fused gradient, GLM intra and the
+# gate epilogue once per range of ``ceil(NC_pad / passes)`` chunks) and the forward on :data:`LOCAL_LAYOUT_FWD_ONLY`.
+# The same kernels on the same bytes: the gradients are bitwise those of ``"replay"``.  Under ``"lean"`` a row whose
+# replay fused-gradient record does not store ``dAqk`` itself (H 9-15: ``dqkg_int``, whose ``dAqk`` comes from
+# ``kcp_dav``) keeps the replay layout.  A forward-only workspace takes :data:`LOCAL_LAYOUT_FWD_ONLY` either way.
+LOCAL_ARENAS = ("replay", "lean")
+LOCAL_ARENA_DEFAULT = "replay"
+# The lean backward layout (a mode of the existing backend's arenas that this module registers there, never one of its
+# own).  The KCP backward (the replay prep and intra / WY programs, its K1 / K2 walks, its ``kcp_dav``, then the fused
+# gradient, GLM intra and the gate epilogue) with the tail split into ``passes`` chunk ranges as in the existing
+# backend's lean layouts.  The fused-gradient records of the rows it serves (:data:`LEAN_DQKG_RECORDS`) store ``dAqk``
+# themselves, every row ``kcp_dav`` writes, so ``kcp_dav``'s ``dAqk`` goes to a dead sink over ``u`` (lifetime
+# [4, 4]) and the whole-sequence ``dAqk`` leaves the layout; ``aqk_int`` (read last by ``kcp_dav`` at 4) rides beside
+# the sink under the ``dh`` tape, and ``dv1`` (written by ``kcp_dav`` at 4, read by the adjoint walks at 5) takes
+# ``kb``'s bytes.  The walks keep no segment state in the arena, so the layout has no state blocks.  Whole-sequence
+# buffers: 3460 B per internal token-head (the live set at the adjoint tape walk, step 5).  The per-pass set (the
+# existing backend's ``_PASS_OCCUPANTS`` without the gate buffers where GLM intra fuses the epilogue) is packed
+# first-fit into the bytes of the three whole-sequence slots dead before the tail (qg / kg 512, w 256, kb / dv1 256);
+# what does not fit goes to an overflow slot.  The rows ``kcp_dav`` reads and writes in one slot (``aqk_int`` and
+# the sink) are disjoint bytes.
+LOCAL_LAYOUT_BWD_LEAN = "replay_kcp_lean"
+_LEAN_WHOLE = (
+    (("gk", "F32", 0, (1, 7)),),
+    (("akk_int", "A16", 0, (1, 6)),),
+    (("do_int", "B16", 0, (1, 6)),),
+    (("v_new", "B16", 0, (1, 6)),),  # pad rows at 1, real rows at 3
+    (("dv2", "B16", 0, (1, 6)),),  # pad rows at 1, real rows at 5
+    (("h", "TAPE", 0, (3, 6)),),
+    (
+        ("u", "B16", 0, (2, 3)),
+        ("dAqk_sink", "A32", 0, (4, 4)),
+        ("aqk_int", "A16", 256, (1, 4)),
+        ("dh", "TAPE", 0, (5, 6)),
+    ),
+    (("qg", "B16", 0, (1, 5)), ("kg", "B16", 256, (1, 5))),
+    (("w", "B16", 0, (2, 5)),),
+    (("kb", "B16", 0, (1, 2)), ("dv1", "B16", 0, (4, 5))),
+    (("beta_int", "V32", 0, (1, 7)),),
+)
+# the per-pass hosts of the lean layout: (first occupant of the slot, its bytes per internal token-head)
+_LEAN_HOSTS = (("qg", 512), ("w", 256), ("kb", 256))
+# the replay fused-gradient records that store the whole dAqk (the rows kcp_dav writes) themselves: this package's
+# records of the deterministic package's two (its forms in ``cake_jit.S1_RECORDS`` read the same buffers but ``q``)
+LEAN_DQKG_RECORDS = ("dqkg_int_davq", "dqkg_int_davq_v24", "dqkg_int_davq_nohint_v24")
+LEAN_MAX_PASSES = 8  # the tail passes a lean arena may be sized for (from four on the per-pass set fits on sm_100a)
+# the tail passes of a lean arena without ``lean_passes``: two keep about three quarters of the four-pass saving for
+# one more launch per tail stage instead of three
+LEAN_PASSES_DEFAULT = 2
+# The int32 [L] table 0, 1, ..., L - 1 a lean arena holds beside its bytes: the item bound of a tail range with n real
+# chunks is the one-entry slice [n, n + 1] (the fused gradient reads ``seq_chunk_start[num_seqs]`` with
+# ``num_seqs = 0``), so no call forms or uploads it.  L covers the chunk count of every plan of ``H`` heads whose h
+# tape (``NC_pad * H * 32 KiB``) fits the arena.
+TAIL_COUNT_TAPE_BYTES = CHUNK * 512  # the h tape's bytes per chunk-head
+
+
+def _lean_slots(passes: int, R: int, H: int, NC: int, NSEG: int, gate_fused: bool):
+    """The slots of :data:`LOCAL_LAYOUT_BWD_LEAN` at ``passes`` tail passes (the existing backend's slot form; see the
+    note above it).  ``NSEG`` is unused: the layout has no state blocks."""
+    from ..cake.cake_kda_train import cake_backend
+
+    R_b = cake_backend.BT * -(-NC // passes)
+    unit_w, unit_p = R * H, R_b * H
+    capacity = {host: per * unit_w for host, per in _LEAN_HOSTS}
+    used = {host: 0 for host, _per in _LEAN_HOSTS}
+    extra: dict[str, list] = {host: [] for host, _per in _LEAN_HOSTS}
+    overflow: list = []
+    over_used = 0
+    for name, kind, _sub, life in cake_backend._PASS_OCCUPANTS:
+        if gate_fused and name in cake_backend._GATE_BUFFERS:
+            continue
+        nbytes = cake_backend._kind_bytes(kind, R, H, NC, 0, R_b)[0]
+        for host, _per in _LEAN_HOSTS:
+            if used[host] + nbytes <= capacity[host]:
+                extra[host].append((name, kind, used[host] // unit_p, life))
+                used[host] += nbytes
+                break
+        else:
+            overflow.append((name, kind, over_used // unit_p, life))
+            over_used += nbytes
+    slots = [slot + tuple(extra.get(slot[0][0], ())) for slot in _LEAN_WHOLE]
+    if overflow:
+        slots.append(tuple(overflow))
+    return tuple(slots)
+
+
+def register_lean_layout():
+    """Register :data:`LOCAL_LAYOUT_BWD_LEAN` on the existing backend's arenas (``cake_backend._register_route_slots``;
+    idempotent) and return that backend module."""
+    from ..cake.cake_kda_train import cake_backend
+
+    cake_backend._register_route_slots(LOCAL_LAYOUT_BWD_LEAN, _lean_slots)
+    return cake_backend
+
+
+def check_local_arena(local_arena: str | None) -> str:
+    """``local_arena`` resolved (``None``: :data:`LOCAL_ARENA_DEFAULT`); ``ValueError`` outside :data:`LOCAL_ARENAS`."""
+    out = LOCAL_ARENA_DEFAULT if local_arena is None else local_arena
+    if out not in LOCAL_ARENAS:
+        raise ValueError(
+            f"local_arena must be one of {LOCAL_ARENAS}, got {local_arena!r}"
+        )
+    return out
+
+
+def local_lean_serves(plan) -> bool:
+    """Whether the lean layout serves ``plan`` (a ``cake_backend.Plan``): its replay fused-gradient record stores
+    the whole ``dAqk`` itself (:data:`LEAN_DQKG_RECORDS`)."""
+    return plan.record("dqkg", LOCAL_PATH_BWD) in LEAN_DQKG_RECORDS
+
+
+def local_lean_bytes(plan, passes: int) -> int:
+    """Bytes of a lean arena of ``plan`` at ``passes`` tail passes: the larger of the KCP forward layout and the lean
+    backward layout."""
+    register_lean_layout()
+    return max(
+        int(plan.workspace_bytes(LOCAL_LAYOUT_FWD_ONLY)),
+        int(plan.workspace_bytes(LOCAL_LAYOUT_BWD_LEAN, int(passes))),
+    )
+
+
+def check_lean_passes(lean_passes: int | None) -> int | None:
+    """``lean_passes`` (the tail passes a lean arena is sized for) validated: ``None`` or an int in ``1..``
+    :data:`LEAN_MAX_PASSES`; ``ValueError`` otherwise."""
+    if lean_passes is None:
+        return None
+    if (
+        isinstance(lean_passes, bool)
+        or not isinstance(lean_passes, int)
+        or not 1 <= lean_passes <= LEAN_MAX_PASSES
+    ):
+        raise ValueError(
+            f"lean_passes must be None or an int in 1..{LEAN_MAX_PASSES}, got {lean_passes!r}"
+        )
+    return lean_passes
+
+
+def local_lean_passes(
+    plan, budget: int | None = None, passes: int | None = None
+) -> int | None:
+    """The tail passes of ``plan`` on a lean arena: without ``budget`` ``passes`` (:func:`check_lean_passes`; ``None``:
+    :data:`LEAN_PASSES_DEFAULT`) -- an arena sized for that many passes, fewer launches for more bytes; with ``budget``
+    (an arena's bytes) the fewest passes in ``1..`` :data:`LEAN_MAX_PASSES` whose arena (:func:`local_lean_bytes`)
+    fits it, ``None`` when none does; ``None`` where the lean layout does not serve the plan
+    (:func:`local_lean_serves`)."""
+    if not local_lean_serves(plan):
+        return None
+    if budget is None:
+        out = check_lean_passes(passes)
+        return LEAN_PASSES_DEFAULT if out is None else out
+    return next(
+        (
+            b
+            for b in range(1, LEAN_MAX_PASSES + 1)
+            if local_lean_bytes(plan, b) <= int(budget)
+        ),
+        None,
+    )
+
+
+def local_arena_bytes(
+    plan,
+    *,
+    backward: bool,
+    save_mode: str = "light",
+    local_arena: str | None = None,
+    lean_passes: int | None = None,
+) -> int:
+    """The local arena (``cake_backend.KdaWorkspace.bytes``) a workspace allocates for ``plan``: the lean arena at
+    :func:`local_lean_passes` (``lean_passes``; ``None``: :data:`LEAN_PASSES_DEFAULT`) where ``local_arena`` is
+    ``"lean"`` and the lean layout serves a light backward workspace, else the existing backend's arena of
+    :func:`local_fwd_layout`."""
+    if (
+        backward
+        and save_mode == "light"
+        and check_local_arena(local_arena) == "lean"
+        and local_lean_serves(plan)
+    ):
+        return local_lean_bytes(plan, local_lean_passes(plan, passes=lean_passes))
+    return int(
+        plan.arena_bytes(
+            backward=backward,
+            save_mode=save_mode,
+            fwd_layout=local_fwd_layout(backward, save_mode),
+        )
+    )
+
+
+def local_tail_count_words(arena_bytes: int, H: int) -> int:
+    """Entries of a lean arena's tail-count table (see :data:`TAIL_COUNT_TAPE_BYTES`); 4 B each."""
+    return int(arena_bytes) // (TAIL_COUNT_TAPE_BYTES * int(H)) + 1
+
+
 def kda_workspace_bytes_kcp(
     ctx: ContextKcp | Sequence[ContextKcp],
     *,
@@ -2818,11 +3013,16 @@ def kda_workspace_bytes_kcp(
     backward: bool = True,
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     C: int = 8192,
+    local_arena: str | None = None,
+    lean_passes: int | None = None,
 ) -> int:
-    """Caller-held workspace bytes of one rank: the existing backend's local arena for ``(T_r, n_frag, H)``
-    (``kda_train_workspace_bytes``; zero on a rank without tokens; a forward-only light workspace,
-    ``backward=False``, takes the KCP forward layout :data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal token-head)
-    with the intra record's scratch table set where it writes one (:func:`local_scratch_table_bytes`), plus the KCP
+    """Caller-held workspace bytes of one rank: the local arena for ``(T_r, n_frag, H)`` (zero on a rank without
+    tokens; the existing backend's arena, ``kda_train_workspace_bytes``, or for a backward workspace under
+    ``local_arena="lean"`` (opt-in; the default ``None`` is ``"replay"``) the lean arena of :func:`local_arena_bytes`
+    plus its tail-count table, ``4 * local_tail_count_words(arena, H)`` bytes, where the lean layout serves the row;
+    a forward-only light
+    workspace, ``backward=False``, takes the KCP forward layout :data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal
+    token-head) with the intra record's scratch table set where it writes one (:func:`local_scratch_table_bytes`), plus the KCP
     arena of transient buffers (:func:`kcp_arena_layout`; CONSISTENCY-6, SPEC-4: saved-set tensors are counted by
     :func:`kda_saved_bytes_kcp`).  A forward-only workspace has two states: these bytes after its forwards with a saved
     set (the training forward) under ``save_transfer`` -- pass the forward's value: without it such a forward also
@@ -2832,13 +3032,21 @@ def kda_workspace_bytes_kcp(
 
     A sequence of contexts gives the bytes of one workspace that serves all of them (``WorkspaceKcp.reserve``):
     each pool at its largest need over the contexts (each :data:`SHARED_POOLS` pair one storage of the larger), the
-    largest local arena, and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
-    ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context."""
+    largest local arena (the first of the largest in list order, with its tail-count table where it is a lean one, as
+    ``reserve`` binds it), and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
+    ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context.
+    ``lean_passes``: the tail passes a lean arena is sized for (``WorkspaceKcp(lean_passes=...)``; ``None``:
+    :data:`LEAN_PASSES_DEFAULT`)."""
     _check_save_mode(save_mode)
+    check_lean_passes(lean_passes)
+    lean = (
+        check_local_arena(local_arena) == "lean" and backward and save_mode == "light"
+    )
     ctxs = list(ctx) if isinstance(ctx, (list, tuple)) else [ctx]
     if not ctxs:
         raise ValueError("kda_workspace_bytes_kcp: no context given")
     arena = 0
+    counts = 0  # the tail-count table of the largest arena where it is a lean one
     scratch: dict[tuple[int, int], int] = {}
     for c in ctxs:
         if c.T_r <= 0:
@@ -2847,9 +3055,12 @@ def kda_workspace_bytes_kcp(
             cake_backend,
         )  # the existing backend's arena rule; imported here so the metadata module stays torch-only
 
-        arena = max(
-            arena,
-            int(
+        p = cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count)
+        if lean and local_lean_serves(p):
+            a = local_lean_bytes(p, local_lean_passes(p, passes=lean_passes))
+            t = 4 * local_tail_count_words(a, H)
+        else:
+            a = int(
                 cake_backend.workspace_bytes(
                     c.T_r,
                     c.n_frag,
@@ -2859,11 +3070,13 @@ def kda_workspace_bytes_kcp(
                     sm_count=c.sm_count,
                     fwd_layout=local_fwd_layout(backward, save_mode),
                 )
-            ),
-        )
+            )
+            t = 0
+        if a > arena:
+            arena, counts = a, t
         # the scratch table set where the intra record writes one (the rule is architecture-independent; the
         # buffer size follows the same segment-count convention as the arena bytes above)
-        if intra_writes_tables(cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count)):
+        if intra_writes_tables(p):
             scratch[(int(c.T_r), int(c.n_frag))] = int(
                 cake_backend.tables_bytes(c.T_r, c.n_frag, int(H), sm_count=c.sm_count)
             )
@@ -2887,7 +3100,7 @@ def kda_workspace_bytes_kcp(
             if key.startswith("pool.")
         }
         pools = _pools_arena(need, backward=backward, save_transfer=save_transfer)
-    return arena + sum(scratch.values()) + pools
+    return arena + counts + sum(scratch.values()) + pools
 
 
 # ----------------------------------------------------------------------------------------------------------------

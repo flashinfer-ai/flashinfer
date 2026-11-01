@@ -522,11 +522,15 @@ def kda_workspace_bytes_kcp(
     backward: bool = True,
     save_transfer: Optional[bool] = None,
     C: int = 8192,
+    local_arena: Optional[str] = None,
+    lean_passes: Optional[int] = None,
     deterministic: bool = True,
 ) -> int:
     """Bytes of this rank's KCP workspace for ``H`` heads on the package ``deterministic`` selects (the same for both
     values); see :func:`flashinfer.cake_kda_det_train_kcp.kda_det_workspace_bytes_kcp`.  ``ctx`` may be a list of
-    contexts (one workspace that serves all of them)."""
+    contexts (one workspace that serves all of them).  ``local_arena`` / ``lean_passes`` are those of the workspace
+    (``WorkspaceKcp`` / ``WorkspaceDetKcp`` ``(local_arena="lean", lean_passes=...)``, opt-in: the backward's lean
+    local arena, its tail in ``lean_passes`` passes, two by default); ``None`` keeps the replay arena."""
     det = _deterministic(deterministic, "kda_workspace_bytes_kcp")
     plan = _det_plan() if det else _nd_plan()
     if save_transfer is None:
@@ -539,6 +543,8 @@ def kda_workspace_bytes_kcp(
         backward=backward,
         save_transfer=save_transfer,
         C=C,
+        local_arena=local_arena,
+        lean_passes=lean_passes,
     )
 
 
