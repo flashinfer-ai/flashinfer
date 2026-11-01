@@ -1048,8 +1048,18 @@ def test_backward_cta_rule(rows, sm_count):
 # The long and mid roles each architecture routes, with the rows per SM they
 # run from.
 TIER_ROUTES = {
-    "sm_100a": {"fwd_long": 2400, "fwd_mid": 976},
-    "sm_103a": {"fwd_long": 2400, "fwd_mid": 976},
+    "sm_100a": {
+        "fwd_long": 2400,
+        "fwd_mid": 976,
+        "bwd_bf16_long": 1280,
+        "bwd_f32_long": 1280,
+    },
+    "sm_103a": {
+        "fwd_long": 2400,
+        "fwd_mid": 976,
+        "bwd_bf16_long": 1280,
+        "bwd_f32_long": 1280,
+    },
     "sm_107a": {"bwd_bf16_long": 1024, "bwd_f32_long": 1024},
 }
 
@@ -1082,7 +1092,7 @@ def test_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
         for role, name in loader.ROUTES[arch].items():
             assert loader.MODULES[name]["role"] == role
         edges = {1, 48, 2**31 - 1}
-        for start in (976, 1024, 2400):
+        for start in (1280, 976, 1024, 2400):
             edges |= {start * sm_count - 1, start * sm_count, start * sm_count + 1}
         for role in loader.ROLES:
             for rows in sorted(edges):
@@ -1099,6 +1109,12 @@ def test_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
         (2400 * sm_count, "fwd_long"),
     ):
         assert loader.module_for_rows("sm_100a", "fwd", rows, sm_count) == routes[role]
+    # the backward on sm_100a: the backward, then the long backward from 1280
+    # rows per SM
+    for role in ("bwd_bf16", "bwd_f32"):
+        for rows, tier in ((1280 * sm_count - 1, ""), (1280 * sm_count, "_long")):
+            got = loader.module_for_rows("sm_100a", role, rows, sm_count)
+            assert got == routes[role + tier], (role, rows)
 
 
 # (rows, SMs, CTAs) of the long forward: 32-row blocks, the fewest whole waves
@@ -1209,6 +1225,35 @@ def test_long_backward_cta_rule(rows, sm_count):
         assert grid == (ctas, 1, 1)
         base = loader.route_module("sm_107a", role)
         assert loader.workspace_elements(name) == loader.workspace_elements(base)
+
+
+@pytest.mark.parametrize("sm_count", [148, 152, 160])
+@pytest.mark.parametrize(
+    "rows", [1, 1280 * 148 - 1, 1280 * 148, 2048 * 48, 32737 * 48, 2**31 - 1]
+)
+def test_bulk_long_backward_cta_rule(rows, sm_count):
+    # sm_100a's and sm_103a's long backward: the backward's 256-thread CTAs of
+    # 16-row blocks, at most 5 CTAs per SM (a quarter more than an SM holds at
+    # once), from 1280 rows per SM; the workspace is the backward's.
+    for arch in ("sm_100a", "sm_103a"):
+        for role in ("bwd_bf16", "bwd_f32"):
+            name = loader.ROUTES[arch][f"{role}_long"]
+            base = loader.route_module(arch, role)
+            record = loader.MODULES[name]
+            assert record["arches"] == ["sm_100a", "sm_103a"]
+            assert record["grid_rule"] == {
+                "ctas_per_sm": 5,
+                "kind": "row_claims",
+                "min_rows_per_sm": 1280,
+                "rows_per_cta": 16,
+            }
+            assert record["launch"] == loader.MODULES[base]["launch"]
+            assert record["dw_slots"] == loader.MODULES[base]["dw_slots"]
+            ctas = loader.backward_ctas(name, rows, sm_count)
+            assert ctas == min(-(-rows // 16), 5 * sm_count)
+            grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=ctas)
+            assert grid == (ctas, 1, 1)
+            assert loader.workspace_elements(name) == loader.workspace_elements(base)
 
 
 def test_calls_without_workspace_share_one_buffer_per_stream():

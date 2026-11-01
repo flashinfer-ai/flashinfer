@@ -1227,27 +1227,54 @@ def test_forward_around_the_long_threshold_matches_the_deterministic_package(
     assert torch.equal(y, det_forward(x, z, w, EPS)), "y vs the deterministic package"
 
 
+# The rows per SM from which each architecture runs the long backward.
+LONG_BACKWARD_ROWS_PER_SM = {"sm_100a": 1280, "sm_103a": 1280, "sm_107a": 1024}
+# Backward inputs around and past the long backward's threshold: (tokens,
+# heads, layout); ``heads=None`` takes ``threshold * SMs + tokens`` rows as one
+# flat [rows, 128] tensor.
+LONG_BACKWARD_CASES = [
+    pytest.param(-1, None, "flat", id="threshold-1"),
+    pytest.param(1, None, "flat", id="threshold+1"),
+    pytest.param(1031, 48, "contiguous", id="1031x48"),
+    pytest.param(2048, 48, "contiguous", id="2048x48"),
+    pytest.param(4097, 48, "projection", id="4097x48-projection"),
+    pytest.param(4097, 48, "head_major", id="4097x48-head_major"),
+    pytest.param(32737, 48, "contiguous", id="32737x48"),
+]
+
+
 @requires_device
-@pytest.mark.parametrize("offset", [-1, 1], ids=["threshold-1", "threshold+1"])
+@pytest.mark.parametrize("tokens,heads,layout", LONG_BACKWARD_CASES)
 @pytest.mark.parametrize(
     "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
 )
 def test_backward_around_the_long_threshold_matches_the_deterministic_package(
-    offset, dw_dtype, determinism_setting, monkeypatch: pytest.MonkeyPatch
+    tokens,
+    heads,
+    layout,
+    dw_dtype,
+    determinism_setting,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """On an architecture that routes a long backward (sm_107a: from 1024 rows
-    per SM), one row below and above the threshold: the module launched is
-    ``module_for_rows``', ``dx`` and ``dz`` are the deterministic package's
-    bits and ``dw`` lies within the budget of the deterministic ``dw`` on
-    every repeat, and the workspace is zero after every call."""
+    """Around and past the long backward's threshold
+    (``LONG_BACKWARD_ROWS_PER_SM``): the module launched is
+    ``module_for_rows``' (the long backward from the threshold, the backward
+    below it), ``dx`` and ``dz`` are the deterministic package's bits and
+    ``dw`` lies within the budget of the deterministic ``dw`` on every repeat,
+    and the workspace is zero after every call."""
     arch = loader.device_arch(torch.cuda.current_device())
     role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
     long = loader.ROUTES[arch].get(f"{role}_long")
     if long is None:
         pytest.skip(f"{arch} routes no long backward")
+    start = LONG_BACKWARD_ROWS_PER_SM[arch]
+    assert loader.MODULES[long]["grid_rule"]["min_rows_per_sm"] == start
     sms = _sm_count()
-    rows = 1024 * sms + offset
-    x, z, w, dy = suite.make(rows, 1, layout="flat", seed=22)
+    if heads is None:
+        x, z, w, dy = suite.make(start * sms + tokens, 1, layout="flat", seed=22)
+    else:
+        x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=22)
+    rows = x.numel() // D
     mag = suite.magnitudes(dy, x, z, EPS)
 
     def out():
@@ -1263,5 +1290,6 @@ def test_backward_around_the_long_threshold_matches_the_deterministic_package(
         assert torch.equal(dz, dz_d), "dz vs the deterministic package"
         suite.assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
         assert not bool(ws.any()), "the workspace is not zero"
-    name = long if offset > 0 else loader.route_module(arch, role)
+    name = long if rows >= start * sms else loader.route_module(arch, role)
+    assert loader.module_for_rows(arch, role, rows, sms) == name
     assert launched == [name] * suite.REPEATS, launched
