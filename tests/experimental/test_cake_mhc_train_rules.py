@@ -34,7 +34,8 @@ and record scalars of every hidden size on its boards of record
   ``cake_mhc_train_bwd_slab_atomic__dynr`` and
   ``cake_mhc_train_bwd_slab_atomic__lpt`` on all three; at 5120 and 7168
   ``cake_mhc_train_fn_split_atomic__tv128_dep__h<H>`` and
-  ``cake_mhc_train_bwd_slab_atomic__dynr__h<H>`` on sm_100a / sm_103a.  Their
+  ``cake_mhc_train_bwd_slab_atomic__dynr__h<H>`` on sm_100a / sm_103a and
+  ``cake_mhc_train_bwd_slab_atomic__lpt__h<H>`` on sm_100a.  Their
   records keep the launch, grid and roles of the deterministic records they
   replace (the fn splits with the static PDL attribute: they follow the
   token-owner pass);
@@ -42,21 +43,23 @@ and record scalars of every hidden size on its boards of record
 * every route, the selection on every route and the PDL bands equal the
   deterministic ones, except ``bwd_finish``: the deterministic token-owner
   records, the atomic fn split of the architecture and size, the column
-  slab's form (at hidden 4096 two, one per call by
-  ``bwd_slab_atomic_program``; at 5120 and 7168 the ``dynr`` record alone, no
-  selection rule), no reduction;
+  slab's form (two, one per call by ``bwd_slab_atomic_program``: at hidden
+  4096 on every architecture, at 5120 and 7168 on sm_100a; on sm_103a at 5120
+  and 7168 the ``dynr`` record alone, which the rule names at every token
+  count), no reduction;
 * the workspaces: ``fwd`` the deterministic one, ``bwd`` the deterministic
   regions at the same offsets without the trailing ``dfn_part``, at every
   hidden size;
 * the host rules are copies (equal outputs, not the deterministic objects;
   the per-size tables the deterministic ones without the column-slab and
   reduction tables), but this package's own column-slab rule
-  (``BWD_SLAB_LPT``, ``lpt_chunks``, ``bwd_slab_atomic_program``,
-  ``slab_plan``; ``host_plan`` itself is the deterministic one): its
-  geometries, its selection, its call-time lookup and a workspace envelope
-  that never runs its screen at hidden 4096, the one-size chunks of
-  ``k7_chunks`` at 5120 and 7168 (the two-size schedule is calibrated and
-  built at 4096 only);
+  (``BWD_SLAB_LPT``, ``BWD_SLAB_LPT_HIDDEN``, ``lpt_chunks``,
+  ``bwd_slab_atomic_program``, ``slab_plan``; ``host_plan`` itself is the
+  deterministic one): its geometries and its selection at every hidden size
+  (where the size's table calibrates the architecture: every architecture at
+  4096, sm_100a at 5120 and 7168; elsewhere the one-size chunks of
+  ``k7_chunks`` without running the screen), its call-time lookup and a
+  workspace envelope that never runs its screen;
 * the package is standalone: no source file imports another flashinfer package
   (the shared ``cake_build.py`` JIT fallback aside, inside a function), and a
   copy under another name imports and plans with ``flashinfer`` blocked;
@@ -104,8 +107,9 @@ HIDDEN = 4096
 HIDDEN_SIZES = (4096, 5120, 7168)
 NEW_HIDDEN_SIZES = HIDDEN_SIZES[1:]
 NEW_HIDDEN_ARCHES = ("sm_100a", "sm_103a")
+# The architectures of the two-size column slab's records at 5120 and 7168 (the sizes' lpt calibrations).
+NEW_HIDDEN_LPT_ARCHES = ("sm_100a",)
 ND_PREFIX, DET_PREFIX = "cake_mhc_train_", "cake_mhc_det_train_"
-BWD_FINISH = "bwd_finish_h4096"
 # The programs of this package and their architectures (the library suffix ``__h<H>`` names a size other than 4096).
 ATOMIC = {
     "cake_mhc_train_fn_split_atomic__tv128_dep": ("sm_100a", "sm_103a"),
@@ -116,6 +120,10 @@ ATOMIC = {
         f"cake_mhc_train_{program}__h{hidden}": NEW_HIDDEN_ARCHES
         for hidden in NEW_HIDDEN_SIZES
         for program in ("fn_split_atomic__tv128_dep", "bwd_slab_atomic__dynr")
+    },
+    **{
+        f"cake_mhc_train_bwd_slab_atomic__lpt__h{hidden}": NEW_HIDDEN_LPT_ARCHES
+        for hidden in NEW_HIDDEN_SIZES
     },
 }
 SLAB = "cake_mhc_train_bwd_slab_atomic__dynr"
@@ -148,6 +156,18 @@ LPT_FIRES = (
                       16164: (10, 2176, 7, 320), 16263: (8, 2304, 7, 192)}),
     ("sm_107a", 212, {1024: (4, 320, 3, 64), 2048: (4, 640, 3, 128), 2560: (4, 832, 3, 64), 3072: (4, 960, 3, 192),
                       3584: (4, 1152, 3, 128)}),
+)  # fmt: skip
+# At hidden 5120 and 7168, the token counts the two-size rule of the size is pinned at (the benchmark token counts and
+# 24576), and per board and size the geometries the table of record (BWD_SLAB_LPT_HIDDEN) picks there: on B200 the
+# token counts its comment names (H 5120 1024 / 8192 / 15566 / 15590 / 16263 / 32768; H 7168 1024 / 2048 / 3072 /
+# 15288 / 24576); nowhere on the boards without a calibration of the size (sm_103a, sm_107a).
+LPT_HIDDEN_T = tuple(sorted({*BENCH_T, 24576}))
+LPT_FIRES_HIDDEN = (
+    ("sm_100a", 148, 5120, {1024: (9, 128, 7, 64), 8192: (13, 704, 11, 256), 15566: (13, 1408, 11, 64),
+                            15590: (13, 1408, 11, 64), 16263: (13, 1472, 11, 64), 32768: (13, 2816, 11, 896)}),
+    ("sm_100a", 148, 7168, {1024: (2, 896, 1, 128), 2048: (7, 384, 5, 64), 3072: (7, 576, 5, 128),
+                            15288: (10, 1664, 9, 320), 24576: (11, 2560, 9, 768)}),
+    *((arch, sm, hidden, {}) for arch, sm in det.RULES_BOARDS if arch != "sm_100a" for hidden in NEW_HIDDEN_SIZES),
 )  # fmt: skip
 # The deterministic programs this package does not copy: the column slab and the final reduction (the backward fn
 # splits, whose libraries the forward does not share, have no copy either).
@@ -248,8 +268,26 @@ def _atomic_split(arch: str, hidden: int = HIDDEN) -> str:
 
 
 def _slab(hidden: int = HIDDEN) -> str:
-    """The column slab's ``dynr`` record of ``hidden`` (at 5120 and 7168 the only column-slab record)."""
+    """The column slab's ``dynr`` record of ``hidden``."""
     return SLAB + _suffix(hidden)
+
+
+def _lpt(hidden: int = HIDDEN) -> str:
+    """The column slab's two-size ``lpt`` record of ``hidden``."""
+    return LPT + _suffix(hidden)
+
+
+def _slabs(arch: str, hidden: int = HIDDEN) -> list[str]:
+    """The column slab's records on the ``bwd_finish`` route of ``arch`` at ``hidden``, in route order: the ``dynr``
+    record, then the ``lpt`` record where the architecture has one of the size (on sm_103a at 5120 and 7168 the
+    ``dynr`` record alone)."""
+    return [_slab(hidden)] + ([_lpt(hidden)] if arch in ATOMIC[_lpt(hidden)] else [])
+
+
+def _lpt_table(hidden: int = HIDDEN) -> dict:
+    """The two-size rule's calibration per architecture at ``hidden``: ``BWD_SLAB_LPT`` at 4096,
+    ``BWD_SLAB_LPT_HIDDEN[hidden]`` at 5120 and 7168 (the dictionaries ``lpt_chunks`` reads at call time)."""
+    return nd.BWD_SLAB_LPT if hidden == HIDDEN else nd.BWD_SLAB_LPT_HIDDEN[hidden]
 
 
 def _route_hidden(key: str) -> int:
@@ -332,11 +370,13 @@ def test_atomic_records_keep_the_deterministic_launch() -> None:
     for it) and bind ``fn``, ``fnTp``, ``dfn`` and ``accumulate`` (no ``fnp``, no ``want_t``); the column slab keeps
     the launch and grid rule of the deterministic ``dynr`` record of its size (``slabs`` = H / 64), binds its
     arguments without ``dfn_part`` and adds ``dfn``, ``param_partial``, ``dscale``, ``dbase``, ``chunks`` and
-    ``accumulate``.  At hidden 4096 the column slab's two records select by ``bwd_slab_atomic_program`` (programs
-    ``dynr`` / ``lpt``); the ``lpt`` record is the ``dynr`` record with the ``lpt_chunks`` chunk rule, its chunk
-    scalars ``P`` / ``rpc`` bound to the ``lpt_*`` host values and ``p_big`` / ``rpc_small`` after the ticket.  At
-    5120 and 7168 the ``dynr`` record is the route's only column slab: no selection rule, the ``k7_chunks`` chunk
-    rule."""
+    ``accumulate``.  At every hidden size the column slab's records select by ``bwd_slab_atomic_program`` (programs
+    ``dynr`` / ``lpt``; on sm_103a at 5120 and 7168, whose route holds the ``dynr`` record alone, the rule names
+    ``dynr`` at every token count); the ``lpt`` record of a size is its ``dynr`` record with the ``lpt_chunks`` chunk
+    rule, its chunk scalars ``P`` / ``rpc`` bound to the ``lpt_*`` host values and ``p_big`` / ``rpc_small`` after
+    the ticket, on the architectures the size's table calibrates (``BWD_SLAB_LPT`` at 4096, ``BWD_SLAB_LPT_HIDDEN``
+    at 5120 and 7168: a calibration without the record would select no column slab, a record without one would
+    never run)."""
     for name, arches in ATOMIC.items():
         record = nd.MODULES[name]
         hidden = record["hidden"]
@@ -345,10 +385,10 @@ def test_atomic_records_keep_the_deterministic_launch() -> None:
         assert record["kernel_symbol"] == f"kernel_{name}"
         assert hidden in HIDDEN_SIZES and name.endswith(_suffix(hidden)), name
         assert record["ffi_entry"] == "run", name
-        if record["role"] == "bwd_slab" and hidden == HIDDEN:
+        if record["role"] == "bwd_slab":
             assert record["select_rule"] == {
                 "kind": "program",
-                "program": name.rsplit("__", 1)[1],
+                "program": name.removesuffix(_suffix(hidden)).rsplit("__", 1)[1],
                 "rule": "bwd_slab_atomic_program",
             }, name
         else:
@@ -396,24 +436,30 @@ def test_atomic_records_keep_the_deterministic_launch() -> None:
         ), hidden
         kept = [entry for entry in dynr["arg_plan"] if entry != ["buffer", "dfn_part"]]
         assert [entry for entry in slab["arg_plan"] if entry[1] not in added] == kept
-    slab = nd.MODULES[SLAB]
-    lpt = nd.MODULES[LPT]
-    assert lpt["role"] == "bwd_slab"
-    assert lpt["launch"] == slab["launch"]
-    assert lpt["grid_rule"] == {**slab["grid_rule"], "chunks_rule": "lpt_chunks"}
-    assert lpt["arg_plan"][:-4] == slab["arg_plan"][:-4] + [
-        ["parameter", "p_big"],
-        ["parameter", "rpc_small"],
-    ]
-    assert slab["arg_plan"][-5] == ["buffer", "ticket"]
-    assert lpt["arg_plan"][-4:] == slab["arg_plan"][-4:]
-    assert lpt["logical"] == {
-        **slab["logical"],
-        "P": "lpt_parts",
-        "rpc": "lpt_rows_per_chunk",
-        "p_big": "lpt_big_parts",
-        "rpc_small": "lpt_small_rows_per_chunk",
-    }
+    for hidden in HIDDEN_SIZES:
+        slab, lpt = nd.MODULES[_slab(hidden)], nd.MODULES[_lpt(hidden)]
+        assert lpt["role"] == "bwd_slab" and lpt["hidden"] == hidden, hidden
+        assert set(lpt["arches"]) <= set(slab["arches"]), hidden
+        table = _lpt_table(hidden)
+        assert set(table) == set(det.ARCHES), hidden
+        assert set(lpt["arches"]) == {
+            arch for arch, calibration in table.items() if calibration is not None
+        }, hidden
+        assert lpt["launch"] == slab["launch"], hidden
+        assert lpt["grid_rule"] == {**slab["grid_rule"], "chunks_rule": "lpt_chunks"}
+        assert lpt["arg_plan"][:-4] == slab["arg_plan"][:-4] + [
+            ["parameter", "p_big"],
+            ["parameter", "rpc_small"],
+        ], hidden
+        assert slab["arg_plan"][-5] == ["buffer", "ticket"], hidden
+        assert lpt["arg_plan"][-4:] == slab["arg_plan"][-4:], hidden
+        assert lpt["logical"] == {
+            **slab["logical"],
+            "P": "lpt_parts",
+            "rpc": "lpt_rows_per_chunk",
+            "p_big": "lpt_big_parts",
+            "rpc_small": "lpt_small_rows_per_chunk",
+        }, hidden
 
 
 @pytest.mark.cpu_only
@@ -506,8 +552,8 @@ def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
     """``ROUTES``: the deterministic architectures and route keys of every hidden size (5120 and 7168 on sm_100a /
     sm_103a only); every route the renamed deterministic route except ``bwd_finish``, which is the deterministic
     token-owner records (renamed, in route order), the atomic fn split of the architecture and size and the column
-    slab's forms (``dynr``, ``lpt`` at hidden 4096; the ``dynr`` record of the size at 5120 and 7168).  Every record
-    is routed, on exactly its architectures."""
+    slab's forms of the size (``dynr``, ``lpt``; on sm_103a at 5120 and 7168 ``dynr`` alone).  Every record is
+    routed, on exactly its architectures."""
     assert set(nd.ROUTES) == set(det.ROUTES) == set(det.ARCHES)
     routed: dict[str, set] = {}
     for arch in det.ARCHES:
@@ -531,7 +577,7 @@ def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
             hidden = _route_hidden(key)
             tokens = [_renamed(n) for n in det_route if _det_role(n) == "bwd_token"]
             assert tokens, (arch, key)
-            slabs = [SLAB, LPT] if key == BWD_FINISH else [_slab(hidden)]
+            slabs = _slabs(arch, hidden)
             assert route == [*tokens, _atomic_split(arch, hidden), *slabs], (arch, key)
             assert {nd.MODULES[n]["hidden"] for n in route} == {hidden}, (arch, key)
             assert {_det_role(n) for n in det_route} == {
@@ -552,8 +598,8 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
     """At every hidden size of the board's architecture, on every token count of record at the count of record and at
     run-time counts: every kind selects the renamed deterministic records, except ``bwd_finish``: (the deterministic
     token-owner record(s) of the call renamed, the atomic fn split of the size, the column slab's form of the call --
-    at hidden 4096 ``lpt`` where ``lpt_chunks`` gives a geometry under the table of record, else ``dynr``; the
-    ``dynr`` record of the size at 5120 and 7168) -- one fn split, one column slab, no reduction."""
+    the size's ``lpt`` record where ``lpt_chunks`` gives a geometry of the size under the table of record, else its
+    ``dynr`` record) -- one fn split, one column slab, no reduction."""
     for hidden, T in ((h, T) for h in _arch_sizes(arch) for T in T_VALUES):
         for iters in (det.SINKHORN_ITERS, *RUN_TIME_ITERS):
             for kind in det.KINDS:
@@ -573,10 +619,11 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
                 tokens = tuple(
                     _renamed(n) for n in det_names if _det_role(n) == "bwd_token"
                 )
-                if hidden == HIDDEN:
-                    slab = LPT if nd.lpt_chunks(T, sm, arch) else SLAB
-                else:
-                    slab = _slab(hidden)
+                slab = (
+                    _lpt(hidden)
+                    if nd.lpt_chunks(T, sm, arch, hidden=hidden)
+                    else _slab(hidden)
+                )
                 assert names == (*tokens, _atomic_split(arch, hidden), slab), (
                     what,
                     names,
@@ -612,7 +659,7 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
     # per hidden size: (this package's column-slab records, its atomic fn split, the deterministic column slabs)
     slabs = {
         hidden: (
-            [SLAB, LPT] if hidden == HIDDEN else [_slab(hidden)],
+            _slabs(arch, hidden),
             _atomic_split(arch, hidden),
             [
                 n
@@ -774,7 +821,13 @@ _DROPPED_RULES = (
     "BWD_REDUCE_PARTS", "BWD_REDUCE_GRID", "bwd_slab_program", "bwd_reduce_program", "bwd_reduce_grid",
 )  # fmt: skip
 # This package's own column-slab rule, absent from the deterministic registry.
-_OWN_RULES = ("BWD_SLAB_LPT", "lpt_chunks", "bwd_slab_atomic_program", "slab_plan")
+_OWN_RULES = (
+    "BWD_SLAB_LPT",
+    "BWD_SLAB_LPT_HIDDEN",
+    "lpt_chunks",
+    "bwd_slab_atomic_program",
+    "slab_plan",
+)
 
 
 @pytest.mark.cpu_only
@@ -783,9 +836,9 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
     """The constants and tables of the host rules equal the deterministic ones; the rule functions are this
     package's own objects with the deterministic outputs on every token count of record; the deterministic
     column-slab and reduction rules are absent and ``PROGRAM_RULES`` drops them for this package's column-slab rule
-    (``bwd_slab_atomic_program``, with ``BWD_SLAB_LPT``, ``lpt_chunks`` and ``slab_plan``: none of them in the
-    deterministic registry); a rules row is the deterministic row without its column-slab and reduction program
-    columns, with this package's backward workspace bytes."""
+    (``bwd_slab_atomic_program``, with ``BWD_SLAB_LPT``, ``BWD_SLAB_LPT_HIDDEN``, ``lpt_chunks`` and ``slab_plan``:
+    none of them in the deterministic registry); a rules row is the deterministic row without its column-slab and
+    reduction program columns, with this package's backward workspace bytes."""
     for name in _SHARED_TABLES:
         assert getattr(nd, name) == getattr(det, name), name
     # The hidden sizes: the deterministic ones; the per-size table names are the deterministic ones without the
@@ -854,8 +907,8 @@ def test_host_rules_at_the_new_hidden_sizes(arch: str, sm: int) -> None:
     size): a rules row is the deterministic row without its column-slab and reduction program columns, with this
     package's backward workspace bytes, on every token count of record; the host plan and every copied rule give the
     deterministic outputs; the per-size tables are read through ``_tab`` (a size it does not spell is a ``KeyError``,
-    never the H 4096 value; ``BWD_SLAB_LPT`` is no per-size table).  ``rules_table()`` holds the H 4096 rows, then
-    each other size's."""
+    never the H 4096 value; the column slab's ``BWD_SLAB_LPT`` / ``BWD_SLAB_LPT_HIDDEN`` are no per-size tables of
+    ``_tab``).  ``rules_table()`` holds the H 4096 rows, then each other size's."""
     dropped_columns = {"bwd_slab_program", "bwd_reduce_program", "bwd_reduce_grid"}
     for hidden in NEW_HIDDEN_SIZES:
         for name in nd.H_TABLE_NAMES:
@@ -903,8 +956,10 @@ def test_host_rules_at_the_new_hidden_sizes(arch: str, sm: int) -> None:
         assert nd._tab(name, HIDDEN) is getattr(nd, name), name
         with pytest.raises(KeyError):
             nd._tab(name, 6144)
-    with pytest.raises(KeyError):
-        nd._tab("BWD_SLAB_LPT", HIDDEN)
+    for name in ("BWD_SLAB_LPT", "BWD_SLAB_LPT_HIDDEN"):
+        for hidden in HIDDEN_SIZES:
+            with pytest.raises(KeyError):
+                nd._tab(name, hidden)
     # the token owner's resident CTAs per SM (G6 = min(K6_CTAS_PER_SM x SMs, ceil(T / 8))): two at 5120, one at 7168
     assert nd._tab("K6_CTAS_PER_SM", 5120) == 2 and nd._tab("K6_CTAS_PER_SM", 7168) == 1
     table = nd.rules_table()
@@ -923,7 +978,10 @@ def test_launch_grids_at_the_new_hidden_sizes(arch: str, sm: int, monkeypatch) -
     """At hidden 5120 and 7168, on every token count of record, every record a call selects launches the grid of the
     deterministic record it copies or replaces: a copy the renamed deterministic record's grid, the atomic fn split
     the deterministic backward split's fixed grid (the rules row's ``fn_split_grid_t``: 320 / 448 CTAs), the column
-    slab ``min(SMs, H / 64 x P)`` CTAs, the deterministic ``dynr`` record's grid (the rules row's ``k7_grid``)."""
+    slab's ``dynr`` record ``min(SMs, H / 64 x P)`` CTAs, the deterministic ``dynr`` record's grid (the rules row's
+    ``k7_grid``), and its ``lpt`` record, where the call selects it, ``min(SMs, H / 64 x lpt_parts)`` CTAs over the
+    size's slabs (:func:`test_forced_geometry_is_read_at_call_time` checks that ``launch_grid`` reads the record's
+    hidden size)."""
     for module in (nd, det):
         monkeypatch.setattr(module, "sm_count", lambda _index: sm)
         monkeypatch.setattr(module, "device_arch", lambda _index: arch)
@@ -941,7 +999,11 @@ def test_launch_grids_at_the_new_hidden_sizes(arch: str, sm: int, monkeypatch) -
                 ):
                     record = nd.MODULES[name]
                     grid = nd.launch_grid(record, T, device_index=0)
-                    if record["role"] == "bwd_slab":
+                    if record["role"] == "bwd_slab" and name == _lpt(hidden):
+                        assert nd.lpt_chunks(T, sm, arch, hidden=hidden), (what, name)
+                        parts = nd.slab_plan(T, sm, arch, hidden)["lpt_parts"]
+                        want = (min(sm, hidden // det.SLAB_D * parts), 1, 1)
+                    elif record["role"] == "bwd_slab":
                         assert grid == (
                             min(sm, hidden // det.SLAB_D * row["P"]),
                             1,
@@ -960,22 +1022,24 @@ def test_launch_grids_at_the_new_hidden_sizes(arch: str, sm: int, monkeypatch) -
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# The column slab's two-size rule (this package's own: BWD_SLAB_LPT, lpt_chunks, bwd_slab_atomic_program, slab_plan)
+# The column slab's two-size rule (this package's own: BWD_SLAB_LPT, BWD_SLAB_LPT_HIDDEN, lpt_chunks,
+# bwd_slab_atomic_program, slab_plan)
 
 
 def _clear_plans() -> None:
-    """Drop the package's cached route plans (an experiment that edits ``BWD_SLAB_LPT`` or replaces ``lpt_chunks``
-    clears them on entry and exit)."""
+    """Drop the package's cached route plans (an experiment that edits ``BWD_SLAB_LPT`` / ``BWD_SLAB_LPT_HIDDEN`` or
+    replaces ``lpt_chunks`` clears them on entry and exit)."""
     pkg._PLANS.clear()
     pkg._FAST_ROUTES.clear()
 
 
-def _units(T: int, geometry: tuple) -> list[int]:
-    """The tile count of each unit of ``geometry`` in the kernel's draw order: unit ``u < 64 p_big`` is big chunk
-    ``u % p_big``, unit ``64 p_big + v`` small chunk ``v % (P - p_big)``; each chunk clipped to the T tokens."""
+def _units(T: int, geometry: tuple, hidden: int = HIDDEN) -> list[int]:
+    """The tile count of each unit of ``geometry`` at ``hidden`` (``S = H / 64`` slabs) in the kernel's draw order:
+    unit ``u < S p_big`` is big chunk ``u % p_big``, unit ``S p_big + v`` small chunk ``v % (P - p_big)``; each chunk
+    clipped to the T tokens."""
     P, rpc, p_big, rpc_small = geometry
     tiles, rb, rs, small = -(-T // 64), rpc // 64, rpc_small // 64, P - p_big
-    slabs = HIDDEN // det.SLAB_D
+    slabs = hidden // det.SLAB_D
     big_tiles = [
         max(0, min(rb, tiles - (u % p_big) * rb)) for u in range(slabs * p_big)
     ]
@@ -995,45 +1059,65 @@ def _makespan(units: list[int], sm: int, o_tiles: float) -> float:
     return max(loads)
 
 
+# (arch, sm, hidden, calibration): every hidden size of the board's architecture under its table of record, and under
+# the kernel test's screen where the architecture has the size's lpt record (elsewhere a screen that fires would
+# select no column slab).
+_TWO_SIZE_CASES = [
+    pytest.param(
+        arch, sm, hidden, calibration, id=f"{arch}-{sm}-H{hidden}-{calibration}"
+    )
+    for arch, sm in det.RULES_BOARDS
+    for hidden in det.supported_hidden_sizes(arch)
+    for calibration in (
+        ("record", "screen") if arch in ATOMIC[_lpt(hidden)] else ("record",)
+    )
+]
+
+
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("calibration", ("record", "screen"))
-@pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
-def test_two_size_rule(arch: str, sm: int, calibration: str) -> None:
-    """At every token count of record and of ``LPT_SWEEP``, under the table of record and under the kernel test's
-    screen ``(1.0, 0.99)`` on the board's architecture: ``None`` never fires; ``bwd_slab_atomic_program`` is ``lpt``
-    exactly where ``lpt_chunks`` gives a geometry, and the selection holds that one column-slab record; ``slab_plan``
-    is the geometry, else the one-size chunks of ``host_plan``.  A geometry is 64-token multiples, ``1 <= p_big <= P
-    <= 32``, big chunks within six tiles under the one-size chunks, covering the tokens: two sizes (the big chunks
-    leave tokens, a smaller small chunk) or one (``p_big = P``, the last chunk holding tokens); its list-scheduling
-    makespan (a scheduler of this test) is at most ``keep`` times the one-size chunks'.  The firing token counts are
-    printed; under the screen the rule fires on B200 (148 SMs)."""
-    value = nd.BWD_SLAB_LPT[arch] if calibration == "record" else LPT_SCREEN
+@pytest.mark.parametrize(("arch", "sm", "hidden", "calibration"), _TWO_SIZE_CASES)
+def test_two_size_rule(arch: str, sm: int, hidden: int, calibration: str) -> None:
+    """At every token count of record and of ``LPT_SWEEP``, at every hidden size of the board's architecture, under
+    the size's table of record (``BWD_SLAB_LPT`` at 4096, ``BWD_SLAB_LPT_HIDDEN`` at 5120 and 7168) and under the
+    kernel test's screen ``(1.0, 0.99)`` where the architecture has the size's ``lpt`` record: ``None`` never fires;
+    ``bwd_slab_atomic_program`` is ``lpt`` exactly where ``lpt_chunks`` gives a geometry, and the selection holds that
+    one column-slab record of the size; ``slab_plan`` is the geometry, else the one-size chunks of ``host_plan``.  A
+    geometry is 64-token multiples, ``1 <= p_big <= P <= 32``, big chunks within six tiles under the one-size chunks,
+    covering the tokens: two sizes (the big chunks leave tokens, a smaller small chunk) or one (``p_big = P``, the
+    last chunk holding tokens); its list-scheduling makespan over the size's ``H / 64`` slabs (a scheduler of this
+    test) is at most ``keep`` times the one-size chunks'.  The firing token counts are printed; under the screen the
+    rule fires on B200 (148 SMs) at every size."""
+    table = _lpt_table(hidden)
+    value = table[arch] if calibration == "record" else LPT_SCREEN
     fired, counted = [], 0
     with pytest.MonkeyPatch.context() as patch:
-        patch.setitem(nd.BWD_SLAB_LPT, arch, value)
+        patch.setitem(table, arch, value)
         _clear_plans()
         try:
             for T in sorted(set(T_VALUES) | set(LPT_SWEEP)):
                 counted += 1
-                what = (arch, sm, calibration, T)
-                geometry = nd.lpt_chunks(T, sm, arch)
+                what = (arch, sm, hidden, calibration, T)
+                geometry = nd.lpt_chunks(T, sm, arch, hidden=hidden)
                 if value is None:
                     assert geometry is None, what
-                program = nd.bwd_slab_atomic_program(T, sm, arch)
+                program = nd.bwd_slab_atomic_program(T, sm, arch, hidden)
                 assert program == ("lpt" if geometry else "dynr"), what
                 names = nd.selected_modules(
-                    arch, HIDDEN, "bwd_finish", rows=T, sm_count=sm
+                    arch, hidden, "bwd_finish", rows=T, sm_count=sm
                 )
                 slabs = [n for n in names if nd.MODULES[n]["role"] == "bwd_slab"]
-                assert slabs == [LPT if geometry else SLAB], (what, names)
-                plan = nd.host_plan(T, sm, arch)
+                assert slabs == [_lpt(hidden) if geometry else _slab(hidden)], (
+                    what,
+                    names,
+                )
+                plan = nd.host_plan(T, sm, arch, hidden)
                 one = (
                     plan["parts"],
                     plan["rows_per_chunk"],
                     plan["parts"],
                     plan["rows_per_chunk"],
                 )
-                values = nd.slab_plan(T, sm, arch)
+                values = nd.slab_plan(T, sm, arch, hidden)
                 assert tuple(values[k] for k in LPT_HOST_KEYS) == (geometry or one), (
                     what
                 )
@@ -1051,21 +1135,21 @@ def test_two_size_rule(arch: str, sm: int, calibration: str) -> None:
                 else:
                     assert rpc_small == rpc and (P - 1) * rpc < T, what
                 o_tiles, keep = value
-                assert _makespan(_units(T, geometry), sm, o_tiles) <= keep * _makespan(
-                    _units(T, one), sm, o_tiles
-                ), what
+                assert _makespan(
+                    _units(T, geometry, hidden), sm, o_tiles
+                ) <= keep * _makespan(_units(T, one, hidden), sm, o_tiles), what
         finally:
             _clear_plans()
     print(
-        f"lpt_chunks {arch} / {sm} SMs at {calibration} {value}: fires at {len(fired)} of {counted} token counts; at "
-        f"the counts of record {[(T, g) for T, g in fired if T in T_VALUES]}",
+        f"lpt_chunks {arch} / {sm} SMs H {hidden} at {calibration} {value}: fires at {len(fired)} of {counted} token "
+        f"counts; at the counts of record {[(T, g) for T, g in fired if T in T_VALUES]}",
         flush=True,
     )
     if value is None:
         assert not fired
     if calibration == "screen" and (arch, sm) == ("sm_100a", 148):
         assert fired, (
-            "the screen fires at no token count on B200: the lpt record is never exercised"
+            f"the screen fires at no token count on B200 at H {hidden}: the lpt record is never exercised"
         )
 
 
@@ -1084,6 +1168,37 @@ def test_two_size_rule_fires_where_calibrated(arch: str, sm: int, fires: dict) -
     assert {T for T, program in programs.items() if program == "lpt"} == set(fires)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("arch", "sm", "hidden", "fires"), LPT_FIRES_HIDDEN)
+def test_two_size_rule_fires_where_calibrated_at_the_new_hidden_sizes(
+    arch: str, sm: int, hidden: int, fires: dict
+) -> None:
+    """At hidden 5120 and 7168 under the table of record (``BWD_SLAB_LPT_HIDDEN``) the two-size schedule runs exactly
+    at the token counts of ``LPT_FIRES_HIDDEN`` with these geometries, ``slab_plan`` the geometry there (on B200 the
+    token counts the table's comment names; nowhere on the boards the size's table does not calibrate, which have no
+    ``lpt`` record of the size).  The screen's plans are cached per hidden size: after the H 4096 plan of the same
+    token count, SM count and ``o_tiles``, the size's plan is its own."""
+    _clear_plans()
+    try:
+        got = {T: nd.lpt_chunks(T, sm, arch, hidden=hidden) for T in LPT_HIDDEN_T}
+        programs = {
+            T: nd.bwd_slab_atomic_program(T, sm, arch, hidden) for T in LPT_HIDDEN_T
+        }
+    finally:
+        _clear_plans()
+    assert {T: tuple(g) for T, g in got.items() if g is not None} == fires
+    assert {T for T, program in programs.items() if program == "lpt"} == set(fires)
+    assert bool(fires) == (arch in ATOMIC[_lpt(hidden)]), (arch, hidden)
+    for T, geometry in fires.items():
+        assert nd.slab_plan(T, sm, arch, hidden) == dict(
+            zip(LPT_HOST_KEYS, geometry, strict=True)
+        ), T
+        o_tiles = float(_lpt_table(hidden)[arch][0])
+        at_4096 = nd._lpt_plan(T, sm, o_tiles)
+        plan = nd._lpt_plan(T, sm, o_tiles, hidden=hidden)
+        assert plan[2] == geometry and plan != at_4096, (T, plan, at_4096)
+
+
 def _heap_makespan(units: list[int], sm: int, o_tiles: float) -> float:
     """The kernel test's list scheduling, unit by unit on a heap of SM loads; the largest load."""
     loads = [(0.0, k) for k in range(min(sm, len(units)))]
@@ -1097,88 +1212,116 @@ def _heap_makespan(units: list[int], sm: int, o_tiles: float) -> float:
 def test_two_size_makespan_runs_are_the_unit_by_unit_schedule() -> None:
     """``_lpt_makespan`` over the runs of ``_lpt_units`` (the SMs of one load level take a run's units together) is bit
     for bit the unit-by-unit list scheduling of every candidate geometry the screen ranks and of the one-size chunks,
-    on 1 to 216 SMs and at integer and non-integer ``o_tiles``; the runs hold every unit in the kernel's draw order."""
+    on 1 to 216 SMs and at integer and non-integer ``o_tiles``, over the ``H / 64`` slabs of every hidden size (fewer
+    token and SM counts at 5120 and 7168); the runs hold every unit in the kernel's draw order."""
     checked = 0
-    for T in (64, 2049, 4096, 8192, 14928, 15566, 16114, 16263, 32768, 65536):
-        for sm in (1, 7, 148, 216):
-            P0, _, _, rpc0 = nd.k7_chunks(T, sm)
-            rt = rpc0 // 64
-            geometries = [(P0, rpc0, P0, rpc0)]
-            for rb in range(max(1, rt - 6), rt + 1):
-                for S in range(1, 6):
-                    geometry = nd._lpt_geometry(T, rb, S)
-                    if geometry is not None:
-                        geometries.append(geometry)
-            for geometry in geometries:
-                units = _units(T, geometry)
-                runs = nd._lpt_units(T, geometry)
-                assert [t for count, t in runs for _ in range(count)] == units, (
+    cases = [
+        *(
+            (HIDDEN, T, sm)
+            for T in (64, 2049, 4096, 8192, 14928, 15566, 16114, 16263, 32768, 65536)
+            for sm in (1, 7, 148, 216)
+        ),
+        *(
+            (hidden, T, sm)
+            for hidden in NEW_HIDDEN_SIZES
+            for T in (2049, 15566, 24576)
+            for sm in (7, 148)
+        ),
+    ]
+    for hidden, T, sm in cases:
+        P0, _, _, rpc0 = nd.k7_chunks(T, sm, hidden=hidden)
+        rt = rpc0 // 64
+        geometries = [(P0, rpc0, P0, rpc0)]
+        for rb in range(max(1, rt - 6), rt + 1):
+            for S in range(1, 6):
+                geometry = nd._lpt_geometry(T, rb, S)
+                if geometry is not None:
+                    geometries.append(geometry)
+        for geometry in geometries:
+            units = _units(T, geometry, hidden)
+            runs = nd._lpt_units(T, geometry, hidden=hidden)
+            assert [t for count, t in runs for _ in range(count)] == units, (
+                hidden,
+                T,
+                geometry,
+            )
+            for o_tiles in (1.0, 0.3):
+                got = nd._lpt_makespan(runs, sm, o_tiles)
+                assert got == _heap_makespan(units, sm, o_tiles), (
+                    hidden,
                     T,
+                    sm,
                     geometry,
+                    o_tiles,
                 )
-                for o_tiles in (1.0, 0.3):
-                    got = nd._lpt_makespan(runs, sm, o_tiles)
-                    assert got == _heap_makespan(units, sm, o_tiles), (
-                        T,
-                        sm,
-                        geometry,
-                        o_tiles,
-                    )
-                    checked += 1
+                checked += 1
     assert checked > 1000
 
 
 @pytest.mark.cpu_only
-def test_forced_geometry_is_read_at_call_time(monkeypatch) -> None:
-    """``lpt_chunks`` is a module global read at call time: a replacement that forces a geometry at one token count
-    moves ``slab_plan``, ``bwd_slab_atomic_program``, the selection and the ``lpt`` record's launch grid
-    (``min(SMs, 64 P)``) there, never the ``dynr`` record's; a forced geometry that does not cover the tokens is a
-    ``ValueError``; without the replacement the table decides (``None``: ``dynr`` and the one-size chunks)."""
+@pytest.mark.parametrize("hidden", HIDDEN_SIZES, ids=lambda h: f"H{h}")
+def test_forced_geometry_is_read_at_call_time(monkeypatch, hidden: int) -> None:
+    """``lpt_chunks`` is a module global read at call time, at every hidden size (on B200, whose routes hold the
+    ``lpt`` record of each size): a replacement that forces a geometry at one token count moves ``slab_plan``,
+    ``bwd_slab_atomic_program``, the selection and the size's ``lpt`` record's launch grid (``min(SMs, H / 64 x P)``)
+    there, never the ``dynr`` record's; a forced geometry that does not cover the tokens is a ``ValueError``; without
+    the replacement the size's table decides (``None``: ``dynr`` and the one-size chunks).  Each of these asks the
+    rule at the size (the replacement records the hidden size it is asked at): at 80 / 112 slabs both forced grids
+    are the SM count, so only that record shows that ``launch_grid`` reads the record's hidden size."""
     arch, sm, T = "sm_100a", 148, 2049
     monkeypatch.setattr(nd, "sm_count", lambda _index: sm)
     monkeypatch.setattr(nd, "device_arch", lambda _index: arch)
-    rule, forced = nd.lpt_chunks, {}
-    monkeypatch.setattr(
-        nd,
-        "lpt_chunks",
-        lambda t, s, a: forced[t] if t in forced else rule(t, s, a),
-    )
-    plan = nd.host_plan(T, sm, arch)
+    rule, forced, seen = nd.lpt_chunks, {}, []
+
+    def forcing(t, s, a, hidden=HIDDEN):
+        seen.append(hidden)
+        return forced[t] if t in forced else rule(t, s, a, hidden=hidden)
+
+    monkeypatch.setattr(nd, "lpt_chunks", forcing)
+    slab, lpt = _slab(hidden), _lpt(hidden)
+    slabs = hidden // det.SLAB_D
+    plan = nd.host_plan(T, sm, arch, hidden)
     one = (plan["parts"], plan["rows_per_chunk"], plan["parts"], plan["rows_per_chunk"])
-    dynr_grid = (min(sm, 64 * plan["parts"]), 1, 1)
-    # one small chunk (5 chunks); one round of units below the SM count (2 chunks: grid 128 on 148 SMs)
+    dynr_grid = (min(sm, slabs * plan["parts"]), 1, 1)
+    # one small chunk (5 chunks); one round of units below the SM count at H 4096 (2 chunks: grid 128 on 148 SMs)
     for geometry in ((5, 448, 4, 320), (2, 1280, 1, 832)):
         forced[T] = geometry
-        assert nd.slab_plan(T, sm, arch) == dict(
+        seen.clear()
+        assert nd.slab_plan(T, sm, arch, hidden) == dict(
             zip(LPT_HOST_KEYS, geometry, strict=True)
         )
-        assert nd.bwd_slab_atomic_program(T, sm, arch) == "lpt"
-        names = nd.selected_modules(arch, HIDDEN, "bwd_finish", rows=T, sm_count=sm)
-        assert names[-1] == LPT and SLAB not in names, names
-        assert nd.launch_grid(nd.MODULES[LPT], T, device_index=0) == (
-            min(sm, 64 * geometry[0]),
+        assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "lpt"
+        names = nd.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
+        assert names[-1] == lpt and slab not in names, names
+        assert seen and set(seen) == {hidden}, seen
+        seen.clear()
+        assert nd.launch_grid(nd.MODULES[lpt], T, device_index=0) == (
+            min(sm, slabs * geometry[0]),
             1,
             1,
         )
-        assert nd.launch_grid(nd.MODULES[SLAB], T, device_index=0) == dynr_grid
-        assert nd.slab_plan(T + 64, sm, arch) != dict(
+        assert seen == [hidden], seen
+        assert nd.launch_grid(nd.MODULES[slab], T, device_index=0) == dynr_grid
+        assert nd.slab_plan(T + 64, sm, arch, hidden) != dict(
             zip(LPT_HOST_KEYS, geometry, strict=True)
         )
     forced[T] = (2, 512, 1, 64)  # 576 tokens: not a partition of 2049
     with pytest.raises(ValueError, match="not a two-size geometry"):
-        nd.slab_plan(T, sm, arch)
+        nd.slab_plan(T, sm, arch, hidden)
     with pytest.raises(ValueError, match="not a two-size geometry"):
-        nd.launch_grid(nd.MODULES[LPT], T, device_index=0)
+        nd.launch_grid(nd.MODULES[lpt], T, device_index=0)
     del forced[T]
-    assert nd.bwd_slab_atomic_program(T, sm, arch) == (
-        "lpt" if rule(T, sm, arch) else "dynr"
+    assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == (
+        "lpt" if rule(T, sm, arch, hidden=hidden) else "dynr"
     )
-    monkeypatch.setitem(nd.BWD_SLAB_LPT, arch, None)
-    assert nd.bwd_slab_atomic_program(T, sm, arch) == "dynr"
-    names = nd.selected_modules(arch, HIDDEN, "bwd_finish", rows=T, sm_count=sm)
-    assert names[-1] == SLAB and LPT not in names, names
-    assert nd.slab_plan(T, sm, arch) == dict(zip(LPT_HOST_KEYS, one, strict=True))
-    assert nd.launch_grid(nd.MODULES[LPT], T, device_index=0) == dynr_grid
+    monkeypatch.setitem(_lpt_table(hidden), arch, None)
+    assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "dynr"
+    names = nd.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
+    assert names[-1] == slab and lpt not in names, names
+    assert nd.slab_plan(T, sm, arch, hidden) == dict(
+        zip(LPT_HOST_KEYS, one, strict=True)
+    )
+    assert nd.launch_grid(nd.MODULES[lpt], T, device_index=0) == dynr_grid
 
 
 @pytest.mark.cpu_only
@@ -1213,64 +1356,69 @@ def test_workspace_envelope_never_runs_the_screen(monkeypatch) -> None:
         assert nd.rules_row(T, sm, arch, hidden) == row, (hidden, T)
 
 
+# (arch, sm, hidden): the boards and sizes other than 4096 whose architecture has no lpt record of the size (sm_103a:
+# no calibration of these sizes yet; sm_107a: no route of these sizes).
+_ONE_SIZE_CASES = [
+    pytest.param(arch, sm, hidden, id=f"{arch}-{sm}-H{hidden}")
+    for arch, sm in det.RULES_BOARDS
+    for hidden in NEW_HIDDEN_SIZES
+    if arch not in ATOMIC[_lpt(hidden)]
+]
+
+
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
-def test_column_slab_rule_at_the_new_hidden_sizes(
-    arch: str, sm: int, monkeypatch
+@pytest.mark.parametrize(("arch", "sm", "hidden"), _ONE_SIZE_CASES)
+def test_column_slab_rule_without_a_calibration_of_the_size(
+    arch: str, sm: int, hidden: int, monkeypatch
 ) -> None:
-    """At hidden 5120 and 7168 the column slab runs its one-size ``dynr`` record at every token count (the two-size
-    schedule is calibrated and built at hidden 4096 only).  With ``lpt_chunks`` and ``_lpt_plan`` replaced by
-    functions that raise (no rule of these sizes runs the screen), at the token counts of record, of ``LPT_SWEEP``
-    and of the benchmark: ``bwd_slab_atomic_program`` is ``dynr``; ``slab_plan`` is the one-size chunks of
-    ``k7_chunks`` at the size (``P`` and the rows per chunk of the deterministic ``host_plan`` of the size: both
-    backwards sum the partials of the same chunks); on the sizes' architectures the ``bwd_finish`` selection holds the
-    size's ``dynr`` record.  A hidden size the package does not list is a ``ValueError`` (as in ``host_plan``)."""
+    """At hidden 5120 and 7168 on an architecture without the size's ``lpt`` record the size's table is ``None`` and
+    the column slab runs its one-size ``dynr`` record at every token count.  With ``_lpt_plan`` replaced by a
+    function that raises (the rule never runs the screen there), at the token counts of record, of ``LPT_SWEEP`` and
+    of ``LPT_HIDDEN_T``: ``lpt_chunks`` is ``None`` and ``bwd_slab_atomic_program`` ``dynr``; ``slab_plan`` is the
+    one-size chunks of ``k7_chunks`` at the size (``P`` and the rows per chunk of the deterministic ``host_plan`` of
+    the size: both backwards sum the partials of the same chunks); where the architecture routes the size the
+    ``bwd_finish`` selection holds the size's ``dynr`` record."""
 
     def screen(*_args, **_kwargs):
         raise AssertionError(
-            "a column-slab rule of hidden 5120 / 7168 ran the lpt screen"
+            f"the column-slab rule of hidden {hidden} on {arch} ran the lpt screen"
         )
 
-    monkeypatch.setattr(nd, "lpt_chunks", screen)
+    assert _lpt_table(hidden)[arch] is None, (arch, hidden)
     monkeypatch.setattr(nd, "_lpt_plan", screen)
     checked = 0
-    for hidden in NEW_HIDDEN_SIZES:
-        for T in sorted(set(T_VALUES) | set(LPT_SWEEP) | set(BENCH_T)):
-            what = (arch, sm, hidden, T)
-            assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "dynr", what
-            plan = det.host_plan(T, sm, arch, hidden)
-            parts, _units, _grid, rows_per_chunk = nd.k7_chunks(T, sm, hidden=hidden)
-            assert (parts, rows_per_chunk) == (
-                plan["parts"],
-                plan["rows_per_chunk"],
-            ), what
-            assert nd.slab_plan(T, sm, arch, hidden) == dict(
-                zip(
-                    LPT_HOST_KEYS,
-                    (parts, rows_per_chunk, parts, rows_per_chunk),
-                    strict=True,
-                )
-            ), what
-            if arch in NEW_HIDDEN_ARCHES:
-                names = nd.selected_modules(
-                    arch, hidden, "bwd_finish", rows=T, sm_count=sm
-                )
-                slabs = [n for n in names if nd.MODULES[n]["role"] == "bwd_slab"]
-                assert slabs == [_slab(hidden)], (what, names)
-            checked += 1
+    for T in sorted(set(T_VALUES) | set(LPT_SWEEP) | set(LPT_HIDDEN_T)):
+        what = (arch, sm, hidden, T)
+        assert nd.lpt_chunks(T, sm, arch, hidden=hidden) is None, what
+        assert nd.bwd_slab_atomic_program(T, sm, arch, hidden) == "dynr", what
+        plan = det.host_plan(T, sm, arch, hidden)
+        parts, _units, _grid, rows_per_chunk = nd.k7_chunks(T, sm, hidden=hidden)
+        assert (parts, rows_per_chunk) == (
+            plan["parts"],
+            plan["rows_per_chunk"],
+        ), what
+        assert nd.slab_plan(T, sm, arch, hidden) == dict(
+            zip(
+                LPT_HOST_KEYS,
+                (parts, rows_per_chunk, parts, rows_per_chunk),
+                strict=True,
+            )
+        ), what
+        if arch in NEW_HIDDEN_ARCHES:
+            names = nd.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
+            slabs = [n for n in names if nd.MODULES[n]["role"] == "bwd_slab"]
+            assert slabs == [_slab(hidden)], (what, names)
+        checked += 1
     assert checked
-    for bad in (2048, 6144):
-        with pytest.raises(ValueError, match="hidden"):
-            nd.bwd_slab_atomic_program(129, sm, arch, bad)
-        with pytest.raises(ValueError, match="hidden"):
-            nd.slab_plan(129, sm, arch, bad)
 
 
 @pytest.mark.cpu_only
 def test_route_glue_and_supported_hidden_sizes() -> None:
     """The hidden sizes of each architecture are the deterministic package's: 4096, 5120 and 7168 on sm_100a /
     sm_103a, 4096 on sm_107a, none on another architecture; a route applies exactly where the deterministic one
-    does; a size or architecture without a route is a ``ValueError`` of the selection."""
+    does; a size or architecture without a route is a ``ValueError`` of the selection, and a size the package does
+    not list one of the column slab's rules (``lpt_chunks``, ``bwd_slab_atomic_program``, ``slab_plan``; as in
+    ``host_plan``)."""
     for arch in det.ARCHES:
         sizes = nd.supported_hidden_sizes(arch)
         assert sizes == _arch_sizes(arch), arch
@@ -1279,6 +1427,13 @@ def test_route_glue_and_supported_hidden_sizes() -> None:
         for hidden in (2048, 6144, *(h for h in HIDDEN_SIZES if h not in sizes)):
             with pytest.raises(ValueError):
                 nd.selected_modules(arch, hidden, "bwd_finish", rows=129, sm_count=148)
+        for bad in (2048, 6144):
+            with pytest.raises(ValueError, match="hidden"):
+                nd.lpt_chunks(129, 148, arch, hidden=bad)
+            with pytest.raises(ValueError, match="hidden"):
+                nd.bwd_slab_atomic_program(129, 148, arch, bad)
+            with pytest.raises(ValueError, match="hidden"):
+                nd.slab_plan(129, 148, arch, bad)
     assert nd.supported_hidden_sizes("sm_90a") == ()
     for kind in det.KINDS:
         for hidden in HIDDEN_SIZES:

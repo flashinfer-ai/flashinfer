@@ -460,6 +460,54 @@
     },
     {
       "arch": "sm_100a",
+      "closure_sha256": "d51fc1dc6fc8418d2ce7b423a9016bc1de2b9396f838b0201a9992e64feb471c",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+      "min_cuda": "12.8",
+      "name": "cake_mhc_train_bwd_slab_atomic__lpt__h5120_sm_100a",
+      "nvcc_flags": [
+        "--prec-div=true",
+        "--prec-sqrt=true",
+        "--ftz=false",
+        "--ptxas-options=--maxrregcount=160"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_mhc_train_bwd_slab_atomic__lpt__h5120_sm_100a.so",
+      "sha256": {
+        "csrc/cake_mhc_train_bwd_slab_atomic__lpt__h5120_binding.cu": "f56c026bcbd5a7e831640ab301f6747db0689d828743eb996ff927ec057f40a7",
+        "csrc/cake_mhc_train_bwd_slab_atomic__lpt__h5120_kernel.cu": "0269a0556e30e7b36f69f9d45712cc9b48215b4b38dd03ad4db8acbd1e42499d"
+      },
+      "sources": [
+        "csrc/cake_mhc_train_bwd_slab_atomic__lpt__h5120_kernel.cu",
+        "csrc/cake_mhc_train_bwd_slab_atomic__lpt__h5120_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "closure_sha256": "9f5a69ec54ef35f0c1c85e329d8eaa289c981cf3c26d193e2b172aa5ea9bf321",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+      "min_cuda": "12.8",
+      "name": "cake_mhc_train_bwd_slab_atomic__lpt__h7168_sm_100a",
+      "nvcc_flags": [
+        "--prec-div=true",
+        "--prec-sqrt=true",
+        "--ftz=false",
+        "--ptxas-options=--maxrregcount=160"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_mhc_train_bwd_slab_atomic__lpt__h7168_sm_100a.so",
+      "sha256": {
+        "csrc/cake_mhc_train_bwd_slab_atomic__lpt__h7168_binding.cu": "239d2f15cfef780c148081afdfb0808a062881ab27f618fcd7a04f3a1d18ea5e",
+        "csrc/cake_mhc_train_bwd_slab_atomic__lpt__h7168_kernel.cu": "f53eb93eeddb8aae35b9dcda44a581d92e42bda52c0d97c198d8c23a1efeefc0"
+      },
+      "sources": [
+        "csrc/cake_mhc_train_bwd_slab_atomic__lpt__h7168_kernel.cu",
+        "csrc/cake_mhc_train_bwd_slab_atomic__lpt__h7168_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_100a",
       "closure_sha256": "3a279b9b5996dccc9872c3a4556bca9fc3321ce5f11a750f2e6cc466ffc8e1a4",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",

@@ -57,10 +57,12 @@ throughout, never a source of tolerances.  This module checks:
   for one token count: one size, one small chunk, several, small chunks past
   ``T``, empty small chunks, 32 chunks, one round of units, a short odd row,
   with and without ``accumulate``, and the screen's best geometry at 16263
-  tokens): the ``lpt`` record launches over ``min(SMs, 64 P)`` CTAs, ``dX`` /
-  ``dscale`` / ``dbase`` bitwise the deterministic package's on two launches
-  (fresh outputs, then a poisoned caller workspace), ``dfn`` within the bound,
-  the ticket word back to 0;
+  tokens; at hidden 5120 and 7168, where the device's route holds the size's
+  ``lpt`` record, a subset of these and the screen's best geometry at a
+  measured token count of the size): the ``lpt`` record launches over
+  ``min(SMs, H / 64 x P)`` CTAs, ``dX`` / ``dscale`` / ``dbase`` bitwise the
+  deterministic package's on two launches (fresh outputs, then a poisoned
+  caller workspace), ``dfn`` within the bound, the ticket word back to 0;
 * the forward entry points (forward prepare, statistics replay, residual
   mixing, backward prepare) bitwise the deterministic package's, and every
   launch one of this package's records (the deterministic package launches
@@ -145,8 +147,8 @@ backward_prepare = functools.partial(
 det_backward_finish = det.cake_mhc_det_train_backward_finish
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-# HIDDEN / N: the hidden size and flattened token of the cases that take no ``hidden`` (the two-size column-slab
-# schedule and the argument checks run at H 4096 only).
+# HIDDEN / N: the hidden size and flattened token of the cases that take no ``hidden`` (the argument checks run at
+# H 4096 only).
 STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
 # The package's hidden sizes; a case of a size runs where the device's architecture routes it (:func:`_require_hidden`).
 HIDDEN_SIZES = (4096, 5120, 7168)
@@ -282,6 +284,20 @@ def _require_hidden(hidden: int) -> int:
     return hidden
 
 
+def _require_lpt(hidden: int) -> int:
+    """Skip a case of the two-size column slab at ``hidden`` where the device's ``bwd_finish`` route of the size holds
+    no ``lpt`` record (sm_103a at 5120 and 7168: no calibration of these sizes yet); never on B200, whose routes hold
+    it at every size."""
+    _require_hidden(hidden)
+    name = LPT + _suffix(hidden)
+    if name not in loader.route_modules(_arch(), hidden, "bwd_finish"):
+        assert _arch() != "sm_100a", (
+            f"the sm_100a route of hidden {hidden} holds no {name}"
+        )
+        pytest.skip(f"hidden {hidden} has no two-size column slab on {_arch()}")
+    return hidden
+
+
 def _hidden_cases(Ts: tuple, new_Ts: tuple) -> list:
     """``(hidden, T)`` parameters: the token counts ``Ts`` at hidden 4096, ``new_Ts`` at 5120 and 7168 (each case
     skipped where the architecture has no route of its size)."""
@@ -312,8 +328,9 @@ def _parts(T: int, hidden: int = HIDDEN) -> int:
 
 
 def _lpt_runs(T: int, hidden: int = HIDDEN) -> bool:
-    """Whether the column slab runs its two-size ``lpt`` record at ``T`` on this device (read at call time, so a
-    replaced ``cake_jit.lpt_chunks`` counts; never at hidden 5120 and 7168)."""
+    """Whether the column slab runs its two-size ``lpt`` record of ``hidden`` at ``T`` on this device (read at call
+    time, so a replaced ``cake_jit.lpt_chunks`` counts; at hidden 5120 and 7168 only where the size's table
+    calibrates the architecture)."""
     return loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden) == "lpt"
 
 
@@ -1193,15 +1210,17 @@ def test_run_to_run(hidden: int, T: int) -> None:
 @pytest.fixture
 def forced_lpt():
     """``forced[T] = (P, rpc, p_big, rpc_small)``: the geometry ``cake_jit.lpt_chunks`` returns at ``T`` instead of
-    the host rule's (every other token count keeps the rule), with the package's route-plan caches cleared on entry
-    and exit (a plan binds the selection and the chunk scalars of its token count)."""
+    the host rule's at every hidden size (every other token count keeps the rule), with the package's route-plan
+    caches cleared on entry and exit (a plan binds the selection and the chunk scalars of its token count)."""
     forced: dict[int, tuple[int, int, int, int]] = {}
     rule = loader.lpt_chunks
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(
             loader,
             "lpt_chunks",
-            lambda T, sm, arch: forced[T] if T in forced else rule(T, sm, arch),
+            lambda T, sm, arch, hidden=HIDDEN: (
+                forced[T] if T in forced else rule(T, sm, arch, hidden=hidden)
+            ),
         )
         pkg._PLANS.clear()
         pkg._FAST_ROUTES.clear()
@@ -1212,62 +1231,80 @@ def forced_lpt():
             pkg._FAST_ROUTES.clear()
 
 
-# (T, forced geometry or None for the screen's best geometry on this device, accumulate)
+# (hidden, T, forced geometry or None for the screen's best geometry on this device, accumulate)
 _FORCED_CASES = (
-    *((2049, geometry, False) for geometry in LPT_FORCED),
-    (257, (3, 128, 2, 64), False),  # 5 tiles: 2 x 2 tiles, then one token
-    (2049, LPT_FORCED[2], True),
-    (2049, LPT_FORCED[6], True),
-    (16263, None, False),
+    *((HIDDEN, 2049, geometry, False) for geometry in LPT_FORCED),
+    (HIDDEN, 257, (3, 128, 2, 64), False),  # 5 tiles: 2 x 2 tiles, then one token
+    (HIDDEN, 2049, LPT_FORCED[2], True),
+    (HIDDEN, 2049, LPT_FORCED[6], True),
+    (HIDDEN, 16263, None, False),
+    # hidden 5120 and 7168 (80 / 112 column slabs): one small chunk, an empty small chunk, the short odd row, 32
+    # chunks under accumulate, and the screen's best geometry at a token count the size's kernel-level pairs measured
+    *(
+        (hidden, T, geometry, accumulate)
+        for hidden in HIDDEN_SIZES[1:]
+        for T, geometry, accumulate in (
+            (2049, LPT_FORCED[1], False),
+            (2049, LPT_FORCED[4], False),
+            (257, (3, 128, 2, 64), False),
+            (2049, LPT_FORCED[6], True),
+        )
+    ),
+    (5120, 15566, None, False),
+    (7168, 15288, None, False),
 )
 
 
 def _forced_id(case: tuple) -> str:
-    T, geometry, accumulate = case
+    hidden, T, geometry, accumulate = case
     shape = "screen" if geometry is None else "x".join(str(v) for v in geometry)
-    return f"T{T}-{shape}" + ("-accumulate" if accumulate else "")
+    return f"H{hidden}-T{T}-{shape}" + ("-accumulate" if accumulate else "")
 
 
 @pytest.mark.parametrize(
-    ("T", "geometry", "accumulate"),
+    ("hidden", "T", "geometry", "accumulate"),
     _FORCED_CASES,
     ids=[_forced_id(case) for case in _FORCED_CASES],
 )
 def test_two_size_schedule_at_forced_geometries(
-    forced_lpt, monkeypatch, T: int, geometry, accumulate: bool
+    forced_lpt, monkeypatch, hidden: int, T: int, geometry, accumulate: bool
 ) -> None:
-    """The column slab's ``lpt`` record at a forced geometry (``geometry`` None: the screen's best two-size geometry
-    at ``T`` on this device, ``_lpt_plan`` at ``o_tiles = 1``, also where the table of record is ``None``): the
-    selection's column slab is the ``lpt`` record, the only column slab ``backward_finish`` loads, launched over
-    ``min(SMs, 64 P)`` CTAs with ``slab_plan`` = the geometry.  On two launches -- fresh outputs on the default
+    """The column slab's ``lpt`` record of ``hidden`` (at 5120 and 7168 where the device's route holds it) at a forced
+    geometry (``geometry`` None: the screen's best two-size geometry of the size at ``T`` on this device,
+    ``_lpt_plan`` at ``o_tiles = 1``, also where the table of record is ``None``): the selection's column slab is the
+    ``lpt`` record, the only column slab ``backward_finish`` loads, launched over
+    ``min(SMs, H / 64 x P)`` CTAs with ``slab_plan`` = the geometry.  On two launches -- fresh outputs on the default
     workspace, then NaN outputs (the carried-in values under ``accumulate``) on a caller workspace whose non-ticket
     bytes are 0xFF -- ``dX``, ``dscale``, ``dbase`` are bitwise the deterministic backward's, every ``dfn`` element
-    lies within ``_dfn_factor(T) u (|carried| + sum_t |dz'_t| |x_t|)`` and the ticket region is zero; the largest
-    ratio to the bound is printed."""
+    lies within ``_dfn_factor(T, hidden) u (|carried| + sum_t |dz'_t| |x_t|)`` and the ticket region is zero; the
+    largest ratio to the bound is printed."""
+    _require_lpt(hidden)
     arch, sm, index = _arch(), _sm_count(), _device().index
+    slab, lpt = SLAB + _suffix(hidden), LPT + _suffix(hidden)
     if geometry is None:
-        plan = loader._lpt_plan(T, sm, 1.0)
-        assert plan is not None, (T, sm)
+        plan = loader._lpt_plan(T, sm, 1.0, hidden=hidden)
+        assert plan is not None, (T, sm, hidden)
         geometry = plan[2]
     forced_lpt[T] = geometry
     P = geometry[0]
-    assert loader.slab_plan(T, sm, arch) == dict(
+    assert loader.slab_plan(T, sm, arch, hidden) == dict(
         zip(LPT_HOST_KEYS, geometry, strict=True)
     )
-    selection = loader.selected_modules(arch, HIDDEN, "bwd_finish", rows=T, sm_count=sm)
-    assert selection[-1] == LPT and SLAB not in selection, selection
-    assert loader.launch_grid(loader.MODULES[LPT], T, device_index=index) == (
-        min(sm, 64 * P),
+    selection = loader.selected_modules(arch, hidden, "bwd_finish", rows=T, sm_count=sm)
+    assert selection[-1] == lpt and slab not in selection, selection
+    assert loader.launch_grid(loader.MODULES[lpt], T, device_index=index) == (
+        min(sm, hidden // loader.SLAB_D * P),
         1,
         1,
     )
-    i = _make_inputs(T, seed=SEED + 71)
+    n = STREAMS * hidden
+    i = _make_inputs(T, hidden=hidden, seed=SEED + 71)
     prep = _forward(i)
     carried = None
     if accumulate:
         g = torch.Generator(device=_device()).manual_seed(SEED + 72)
         carried = {
-            "dfn": torch.randn((MAPPING_ROWS, N), generator=g, device=_device()) * 1e-3,
+            "dfn": torch.randn((MAPPING_ROWS, n), generator=g, device=_device()) * 1e-3,
             "dscale": torch.randn((3,), generator=g, device=_device()) * 1e-3,
             "dbase": torch.randn((MAPPING_ROWS,), generator=g, device=_device()) * 1e-3,
         }
@@ -1275,12 +1312,14 @@ def test_two_size_schedule_at_forced_geometries(
     def outputs(poisoned: bool) -> dict:
         if carried is not None:
             return {k: v.clone() for k, v in carried.items()}
-        return _poisoned_outputs(T) if poisoned else {}
+        return _poisoned_outputs(T, hidden) if poisoned else {}
 
     want = _snapshot(_det_backward(i, prep, accumulate=accumulate, **outputs(False)))
-    factor = _dfn_factor(T)
+    factor = _dfn_factor(T, hidden)
     bound = _dfn_bound(i, factor, carried=None if carried is None else carried["dfn"])
-    ws = pkg.cake_mhc_train_backward_workspace(T, _device(), deterministic=False)
+    ws = pkg.cake_mhc_train_backward_workspace(
+        T, _device(), hidden=hidden, deterministic=False
+    )
     loaded: list[str] = []
     load = loader.load
 
@@ -1291,7 +1330,9 @@ def test_two_size_schedule_at_forced_geometries(
     monkeypatch.setattr(loader, "load", recording_load)
     figures = []
     for launch in range(2):
-        label = f"T={T} lpt {geometry} accumulate={accumulate} launch {launch}"
+        label = (
+            f"T={T} H={hidden} lpt {geometry} accumulate={accumulate} launch {launch}"
+        )
         kwargs = {"accumulate": accumulate, **outputs(launch == 1)}
         if launch:
             _poison_workspace(ws)
@@ -1307,9 +1348,9 @@ def test_two_size_schedule_at_forced_geometries(
         )
     assert loaded == list(selection), loaded
     print(
-        f"dfn T={T} lpt {geometry} (P_k7 {_parts(T)}, F {factor:g}) accumulate={accumulate}: largest |nd - det| / "
-        f"bound over two launches {max(f['max_ratio'] for f in figures):.3e}, elements differing up to "
-        f"{max(f['differ'] for f in figures)} of {MAPPING_ROWS * N}",
+        f"dfn T={T} H={hidden} lpt {geometry} (P_k7 {_parts(T, hidden)}, F {factor:g}) accumulate={accumulate}: "
+        f"largest |nd - det| / bound over two launches {max(f['max_ratio'] for f in figures):.3e}, elements "
+        f"differing up to {max(f['differ'] for f in figures)} of {MAPPING_ROWS * n}",
         flush=True,
     )
 
@@ -1398,9 +1439,11 @@ def test_forward_entry_points_are_the_deterministic_programs(
 def test_benchmark_token_counts_at_the_new_hidden_sizes(hidden: int, T: int) -> None:
     """At hidden 5120 and 7168 on the 19 benchmark token counts (their copies of the deterministic programs are
     renders of their own; H 4096 is the cases above): the forward entry points and the backward prepare give the
-    deterministic package's bits, and one ``backward_finish`` gives its ``dX`` / ``dscale`` / ``dbase`` bits and a
-    ``dfn`` within the bound of :func:`test_matches_the_deterministic_backward`, the ticket region of a caller
-    workspace back to zero."""
+    deterministic package's bits, and one ``backward_finish`` (the column slab's form of the call: ``lpt`` where the
+    size's table fires on this device; on B200 at the token counts its kernel-level pairs measured, H 5120 15566 /
+    15590 / 16263 and H 7168 15288, and at those the screen picks that no pair has measured yet, 1024 at both sizes
+    and 2048 / 3072 at 7168) gives its ``dX`` / ``dscale`` / ``dbase`` bits and a ``dfn`` within the bound of
+    :func:`test_matches_the_deterministic_backward`, the ticket region of a caller workspace back to zero."""
     _require_hidden(hidden)
     i = _make_inputs(T, hidden=hidden, seed=SEED + 14)
     want = _snapshot(_reference_forward_outputs(i))
@@ -1423,7 +1466,8 @@ def test_benchmark_token_counts_at_the_new_hidden_sizes(hidden: int, T: int) -> 
         f"dfn {label} vs deterministic",
     )
     print(
-        f"dfn {label} P={_parts(T, hidden)}: largest |nd - det| / bound {figures['max_ratio']:.3e}",
+        f"dfn {label} P={_slab_parts(T, hidden)} lpt={_lpt_runs(T, hidden)}: largest |nd - det| / bound "
+        f"{figures['max_ratio']:.3e}",
         flush=True,
     )
 
@@ -1435,7 +1479,7 @@ def test_launches_are_this_packages_records(monkeypatch, hidden: int) -> None:
     records for the local architecture and the call's hidden size, and the deterministic package launches nothing
     (its launch paths refuse); ``backward_finish`` loads exactly its ``bwd_finish`` selection, in launch order: one
     token-owner record, the atomic fn split of the architecture and size and the column slab's form of the call
-    (``bwd_slab_atomic_program``; the size's ``dynr`` record at 5120 and 7168)."""
+    (``bwd_slab_atomic_program``: the size's ``dynr`` or ``lpt`` record)."""
     _require_hidden(hidden)
 
     def refuse(*_args, **_kwargs):
@@ -1469,7 +1513,6 @@ def test_launches_are_this_packages_records(monkeypatch, hidden: int) -> None:
         + _suffix(hidden)
     )
     program = loader.bwd_slab_atomic_program(T, sm, arch, hidden)
-    assert program == "dynr" or hidden == HIDDEN, (program, hidden)
     assert selection[-1] == {"dynr": SLAB, "lpt": LPT}[program] + _suffix(hidden), (
         program,
         selection,
