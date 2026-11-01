@@ -32,6 +32,7 @@ from flashinfer.gemm.gemm_base import (
 def _test_mm_fp4(
     m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
 ):
+    """Compare a supported FP4 GEMM backend with a dequantized reference."""
     use_nvfp4 = fp4_type == "nvfp4"
 
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -186,6 +187,7 @@ _CUTEDSL_LOW_LATENCY_MODEL_CASES = [
 def test_mm_fp4(
     m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
 ):
+    """Check explicit FP4 backends across the curated smoke and model shapes."""
     # Non-auto backends
     _test_mm_fp4(
         m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
