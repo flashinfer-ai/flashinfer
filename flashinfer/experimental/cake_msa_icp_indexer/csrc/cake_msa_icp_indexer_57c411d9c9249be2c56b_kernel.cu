@@ -220,7 +220,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(192) void
-kernel_cake_msa_icp_indexer_821db17698295956517d(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, int* __restrict__ block_table, int* __restrict__ seq_lens, int* __restrict__ num_valid_pages, unsigned long long* __restrict__ pool, int bt_stride, int pool_row_stride, int num_heads, int query_len, int columns, int splits, int rank, int world, int page_size, int init_blocks, int local_blocks)
+kernel_cake_msa_icp_indexer_57c411d9c9249be2c56b(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, int* __restrict__ block_table, int* __restrict__ seq_lens, int* __restrict__ num_valid_pages, unsigned long long* __restrict__ pool, int bt_stride, int pool_row_stride, int num_heads, int query_len, int columns, int splits, int rank, int world, int page_size, int init_blocks, int local_blocks)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -333,7 +333,7 @@ kernel_cake_msa_icp_indexer_821db17698295956517d(const __grid_constant__ CUtenso
             if (split < ncols) {
                 n_blk = (ncols - split + splits - 1) / splits;
             }
-            int n_tiles = n_blk / 1;
+            int n_tiles = n_blk;
             int w = (int)warp;
             int lane_0 = (int)lane;
             int j = lane_0 / num_heads;
@@ -1629,7 +1629,7 @@ kernel_cake_msa_icp_indexer_821db17698295956517d(const __grid_constant__ CUtenso
             if (split_1 < ncols_1) {
                 n_blk_1 = (ncols_1 - split_1 + splits - 1) / splits;
             }
-            int n_tiles_1 = n_blk_1 / 1;
+            int n_tiles_1 = n_blk_1;
             int lane_0_1 = (int)lane;
             int bt_base = b_1 * bt_stride;
             int ids = 0;
@@ -1703,7 +1703,7 @@ kernel_cake_msa_icp_indexer_821db17698295956517d(const __grid_constant__ CUtenso
             if (split_2 < ncols_2) {
                 n_blk_2 = (ncols_2 - split_2 + splits - 1) / splits;
             }
-            int n_tiles_2 = n_blk_2 / 1;
+            int n_tiles_2 = n_blk_2;
             unsigned int _phase_q_full_0 = 0;
             unsigned int _phase_k_full = 0;
             unsigned int _phase_acc_empty = 1;
