@@ -328,9 +328,10 @@ class QkvNormRopeExchangeOverlap:
     rows publishes one readiness word per destination, a call with ``>= 16384`` rows launches the producer once per
     destination run; SM90: a call with ``<= 4096`` rows publishes one readiness word per destination and a call
     with ``>= 16384`` rows runs the persistent producer grid over every SM -- ``reserved_sms_large_m = 16384``, no
-    reserved SMs --, the per-destination launch gate off; SM107: every gate off).  One (architecture, world size)
-    cell differs from these tables (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH_WORLD``): a group of 8 ranks
-    on SM90 publishes one readiness word per destination for every row count (``words_capacity_small_m = all``).  A
+    reserved SMs --, the per-destination launch gate off; SM107: no per-architecture gate).  Three (architecture,
+    world size) cells differ from these tables (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH_WORLD``): a group
+    of 8 ranks on SM90 and groups of 2 and 4 ranks on SM107 publish one readiness word per destination for every row
+    count (``words_capacity_small_m = all``).  A
     fourth gate, ``pair_off_large_m``, is off on every architecture: switched on, a 256-column call with at least
     ``N`` rows per rank runs the single-CTA producer instead of the 2-CTA pair tile (tile order unchanged; that
     producer must be delivered for the architecture -- no delivered Blackwell route ships it today, so the session
@@ -338,8 +339,8 @@ class QkvNormRopeExchangeOverlap:
     builds no pair tile and refuses the gate).  The environment variable
     ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (``auto`` / ``off`` /
     ``words_capacity_small_m=N|all,reserved_sms_large_m=N,per_dest_large_m=N,pair_off_large_m=N``, ``0`` = never)
-    overrides them for a session, rank-uniformly (``words_capacity_small_m=4096`` on SM90 with 8 ranks restores the
-    previous plan).
+    overrides them for a session, rank-uniformly (``words_capacity_small_m=4096`` on SM90 with 8 ranks and
+    ``words_capacity_small_m=0`` on SM107 restore the previous plans).
     ``describe()`` reports the resolved build (``producer_variant``), scale
     (``group_m_scale``) and gates (``shape_gates``), each with its value, source, environment variable and default,
     and every prepared row's verdict (``prepared_row_plans``, including ``reserved_sms`` and ``part_grids``).  The
