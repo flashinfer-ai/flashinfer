@@ -111,7 +111,7 @@ FURTHER_RECORDS = {
         {"short_rows": True, "epi_warp": True, "spec_uh": True},
     ),
     REDUCE_GENERAL_RECORD: ("reduce", cake_jit.ARCHES, {"general_splits": True}),
-    REDUCE_TWO_SPLITS_RECORD: ("reduce", ("sm_100a",), {"two_splits": True}),
+    REDUCE_TWO_SPLITS_RECORD: ("reduce", cake_jit.ARCHES, {"two_splits": True}),
 }
 
 ATOL = RTOL = 0.1
@@ -732,7 +732,8 @@ def general_reduce_record(monkeypatch):
 
 @pytest.fixture
 def two_splits_reduce_record(monkeypatch, general_reduce_record):
-    """Registers the SM100 two-split combine record beside the general one."""
+    """Registers the two-split combine record for both architectures beside the
+    general one."""
     return _register_further(monkeypatch, REDUCE_TWO_SPLITS_RECORD)
 
 
@@ -1320,22 +1321,24 @@ def test_split_row_range(row_splits, want):
     assert split_row_range(row_splits) == want
 
 
-@pytest.mark.parametrize("num_sms", [148, 152])
+@pytest.mark.parametrize(
+    "arch,num_sms", [("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 152)]
+)
 def test_select_reduce_record_picks_two_splits_for_short_contiguous_plans(
-    spec_records, two_splits_reduce_record, num_sms
+    spec_records, two_splits_reduce_record, arch, num_sms
 ):
-    assert ("sm_100a", num_sms // CLUSTER_PAIR) in REDUCE_TWO_SPLITS_TARGETS
+    assert (arch, num_sms // CLUSTER_PAIR) in REDUCE_TWO_SPLITS_TARGETS
     plan, rows = _reduce_inputs([256, 300], num_sms)
     assert plan.max_splits == 2 and rows == [1] * 6 + [2] * 6
-    assert select_decode_record(plan, "sm_100a") == SHORT_SPEC_RECORD
+    assert select_decode_record(plan, arch) == SHORT_SPEC_RECORD
     kwargs = dict(num_sms=num_sms, row_splits=rows)
-    assert select_reduce_record(plan, "sm_100a", **kwargs) == REDUCE_TWO_SPLITS_RECORD
-    # Without the device facts, on another architecture or cluster count, the
-    # plan keeps the default combine.
-    assert select_reduce_record(plan, "sm_100a") == "reduce"
-    assert select_reduce_record(plan, "sm_103a", **kwargs) == "reduce"
+    assert select_reduce_record(plan, arch, **kwargs) == REDUCE_TWO_SPLITS_RECORD
+    # Without the device facts, or on another cluster count (the 148-SM SM103
+    # part included), the plan keeps the default combine.
+    assert select_reduce_record(plan, arch) == "reduce"
+    assert select_reduce_record(plan, arch, num_sms=132, row_splits=rows) == "reduce"
     assert (
-        select_reduce_record(plan, "sm_100a", num_sms=132, row_splits=rows) == "reduce"
+        select_reduce_record(plan, "sm_103a", num_sms=148, row_splits=rows) == "reduce"
     )
 
 

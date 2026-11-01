@@ -132,9 +132,11 @@ REDUCE_GENERAL_MIN_SPLITS = 3  # KV splits of the plan's most split row
 # of two splits form one contiguous range of query rows; it is launched over
 # that range alone (``split_row_range``), with its row pointers offset to the
 # range's first row. The cluster count is the one the plan requests, ``num_sms
-# // CLUSTER_PAIR``: 74 on B200, 76 on GB200.
+# // CLUSTER_PAIR``: 74 on B200, 76 on GB200 and GB300.
 REDUCE_TWO_SPLITS_RECORD = "reduce_two_splits"
-REDUCE_TWO_SPLITS_TARGETS = frozenset({("sm_100a", 74), ("sm_100a", 76)})
+REDUCE_TWO_SPLITS_TARGETS = frozenset(
+    {("sm_100a", 74), ("sm_100a", 76), ("sm_103a", 76)}
+)
 SHORT_DECODE_RECORDS = frozenset(
     {SHORT_RECORD, SHORT_EPI_RECORD, SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD}
 )
