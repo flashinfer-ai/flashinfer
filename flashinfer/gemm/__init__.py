@@ -31,6 +31,10 @@ from .gemm_base import (
     group_gemm_fp8_nt_groupwise_contiguous as group_gemm_fp8_nt_groupwise_contiguous,
 )
 from .gemm_base import fp8_blockscale_gemm_sm90 as fp8_blockscale_gemm_sm90
+from .w8a16_fp8 import w8a16_fp8_gemm as w8a16_fp8_gemm
+from .w8a16_fp8 import (
+    w8a16_fp8_gemm_workspace_bytes as w8a16_fp8_gemm_workspace_bytes,
+)
 from .cake_grouped_fp8_gemm import (
     PreparedGroupGemmFp8NtGroupwiseContiguous as PreparedGroupGemmFp8NtGroupwiseContiguous,
 )
@@ -228,6 +232,8 @@ __all__ = (
         "mm_M1_16_K7168_N896",
         "mm_M1_16_K7168_N896_bf16",
         "tinygemm_bf16",
+        "w8a16_fp8_gemm",
+        "w8a16_fp8_gemm_workspace_bytes",
     ]
     + _cute_dsl_kernels
     + _cuda_tile_kernels
