@@ -2196,6 +2196,11 @@ class KdaDetWorkspace:
                 f"arena option or doc_lengths, got layouts={layouts!r}, arena={arena}, doc_lengths={doc_lengths}, "
                 f"fwd_layout={fwd_layout!r}"
             )
+        if layouts is not None and any(mode in LEAN_MODES for mode, _ in layouts):
+            raise ValueError(
+                f"KdaDetWorkspace: layouts takes another route's modes; {LEAN_MODES} take their tail passes from the "
+                f"arena option, got layouts={layouts!r}"
+            )
         self.arena_option = KdaDetArena() if arena is None else arena
         plan.check_arena(self.arena_option, backward=backward)
         self.doc_lengths = (

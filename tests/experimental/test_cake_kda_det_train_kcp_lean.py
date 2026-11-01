@@ -221,6 +221,17 @@ def test_single_rank_layouts_keep_their_bytes() -> None:
         cake_backend.KdaDetWorkspace(p, "cpu", layouts=())
 
 
+def test_single_rank_workspace_refuses_its_lean_modes_in_layouts() -> None:
+    """``layouts`` holds another route's modes only: a single-rank lean mode (its tail passes come from the arena
+    option, not from ``layouts``) is refused at any passes, alone or beside a route layout."""
+    p = cake_backend.plan(sum(PROXY_PACK), len(PROXY_PACK), 64, 148, "sm_100a")
+    for mode in cake_backend.LEAN_MODES:
+        for passes in (1, 2, 4):
+            for layouts in (((mode, passes),), ((LEAN, 2), (mode, passes))):
+                with pytest.raises(ValueError, match="take their tail passes"):
+                    cake_backend.KdaDetWorkspace(p, "cpu", layouts=layouts)
+
+
 def test_route_layout_registration_rules() -> None:
     """``cake_backend._register_route_slots``: importing the KCP module registered the lean layout with this module's
     slot function (registering it again changes nothing); a mode of the single-rank module (:data:`MODES`,
