@@ -21,10 +21,12 @@ reciprocal RMS ``rstd`` (``[T]``).  Backward: one fused pass produces
 ``dx = BF16(r * g * w - x * r^3 * mean(g * w * x))`` and the FP32 weight
 gradient ``dw = sum_t g * x * r`` through a fixed row-chunk partition and a
 fixed-order reduction, so ``dw`` is bitwise reproducible for a given token
-count on a given architecture.  The optional residual-add fusion computes
-``h_new = BF16(h + u)`` first, normalizes ``h_new``, and in the backward adds
-the gradient flowing directly through ``h_new`` so that one ``dx`` tensor is
-the gradient of both ``h`` and ``u``.
+count on devices with the same SM count (the partition spreads the rows over
+``ctas_per_sm`` x SM count CTAs; devices of one architecture with different SM
+counts can give different ``dw`` bits).  The optional residual-add fusion
+computes ``h_new = BF16(h + u)`` first, normalizes ``h_new``, and in the
+backward adds the gradient flowing directly through ``h_new`` so that one
+``dx`` tensor is the gradient of both ``h`` and ``u``.
 
 All kernels use FP32 statistics and accumulation with IEEE division and
 square root (no fast-math).  Inputs and outputs are BF16; ``rstd`` and ``dw``

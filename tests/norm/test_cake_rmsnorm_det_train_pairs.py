@@ -549,6 +549,113 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
     )
 
 
+# --------------------------------------------------------------------------- the accuracy guard (no device)
+
+# The SM counts of devices per architecture at or above the guard's: the measured boards (B200 148, GB300 152,
+# R200 212 and 216) and a device of the same architecture with more SMs (GB200 152, a 160-SM GB300).
+BOARD_SMS = {"sm_100a": (148, 152), "sm_103a": (152, 160), "sm_107a": (212, 216)}
+# The accuracy edges: H = 5120 plain -> block-compensated, H = 256 ring -> compensated-dot ring.
+ACCURACY_EDGES = {
+    "sm_100a": {"h5120": 6144, "h256": 80896},
+    "sm_103a": {"h5120": 5120, "h256": 139264},
+    "sm_107a": {"h5120": 19968, "h256": 70656},
+}
+
+
+def _backward_routes(arch: str) -> list[str]:
+    return [route for route in loader.ROUTES[arch] if route.startswith("bwd")]
+
+
+def _launched_library(arch: str, route: str, rows: int) -> str:
+    """The main program a backward call of ``rows`` tokens launches on device 0."""
+    hidden, kind, residual, w_dtype = _route_parts(route)
+    selection = pkg._backward_selection_rows(arch, hidden, residual, rows, w_dtype, 0)
+    names = loader.selected_modules(
+        arch, hidden, kind, residual, rows=selection, w_dtype=w_dtype
+    )
+    mains = [n for n in names if loader.MODULES[n].get("workspace_rule") is not None]
+    assert len(mains) == 1, (arch, route, rows, names)
+    return loader.MODULES[mains[0]]["library"]
+
+
+def test_accuracy_guard_names_the_measured_sm_counts_and_edges() -> None:
+    """The guard's tables: the smallest measured SM count per architecture and, for the BF16 and FP32-weight H = 5120
+    and H = 256 backward routes alone, the edge where the route's compensated programs start."""
+    assert windows.ACCURACY_MIN_SMS == {"sm_100a": 148, "sm_103a": 152, "sm_107a": 212}
+    assert set(windows.ACCURACY_EDGES) == set(loader.ROUTES)
+    for arch, edges in ACCURACY_EDGES.items():
+        assert windows.ACCURACY_EDGES[arch] == {
+            f"bwd{w32}_{width}": edge
+            for width, edge in edges.items()
+            for w32 in ("", "_w32")
+        }, arch
+        for route, edge in windows.ACCURACY_EDGES[arch].items():
+            assert edge in _edges(windows.PROGRAM_WINDOWS[arch][route]), (arch, route)
+
+
+@pytest.mark.parametrize("arch", sorted(BOARD_SMS))
+def test_accuracy_guard_runs_the_compensated_programs_below_the_measured_sm_count(
+    arch: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a device with fewer SMs than ``ACCURACY_MIN_SMS`` (the SM count patched) every call of a guarded route
+    launches a program of the windows above its edge; the other routes select by the call's rows."""
+    for sms in (windows.ACCURACY_MIN_SMS[arch] - 1, 16):
+        monkeypatch.setattr(loader, "sm_count", lambda _index, sms=sms: sms)
+        for route in _backward_routes(arch):
+            hidden, _kind, residual, w_dtype = _route_parts(route)
+            edge = windows.ACCURACY_EDGES[arch].get(route)
+            route_windows = windows.PROGRAM_WINDOWS[arch][route]
+            compensated = {
+                lib
+                for low, _high, lib in route_windows
+                if edge is not None and low >= edge
+            }
+            for rows in ROWS:
+                selection = pkg._backward_selection_rows(
+                    arch, hidden, residual, rows, w_dtype, 0
+                )
+                if edge is None:
+                    assert selection == rows, (arch, route, rows)
+                    continue
+                assert selection == max(rows, edge + 1), (arch, route, rows)
+                assert _launched_library(arch, route, rows) in compensated, (
+                    sms,
+                    arch,
+                    route,
+                    rows,
+                )
+
+
+@pytest.mark.parametrize("arch", sorted(BOARD_SMS))
+def test_accuracy_guard_keeps_the_selection_at_the_measured_sm_counts(
+    arch: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At or above ``ACCURACY_MIN_SMS`` every backward call selects by its own rows (the measured windows)."""
+    for sms in BOARD_SMS[arch]:
+        assert sms >= windows.ACCURACY_MIN_SMS[arch]
+        monkeypatch.setattr(loader, "sm_count", lambda _index, sms=sms: sms)
+        for route in _backward_routes(arch):
+            hidden, _kind, residual, w_dtype = _route_parts(route)
+            for rows in ROWS:
+                assert (
+                    pkg._backward_selection_rows(
+                        arch, hidden, residual, rows, w_dtype, 0
+                    )
+                    == rows
+                ), (sms, arch, route, rows)
+                (library,) = [
+                    lib
+                    for low, high, lib in windows.PROGRAM_WINDOWS[arch][route]
+                    if low < rows and (high is None or rows <= high)
+                ]
+                assert _launched_library(arch, route, rows) == library, (
+                    sms,
+                    arch,
+                    route,
+                    rows,
+                )
+
+
 # --------------------------------------------------------------------------- the chunk formula (no device)
 
 
@@ -838,3 +945,42 @@ def test_workspace_puts_the_counters_first_and_grows_with_the_rows(hidden: int) 
     workspace = pkg.cake_rmsnorm_det_train_backward_workspace(65536, hidden, device)
     assert workspace.dtype == torch.uint8 and workspace.numel() == sizes[-1]
     assert torch.count_nonzero(workspace[: loader.COUNTERS_BYTES]) == 0
+
+
+@pytest.mark.skipif(
+    not _supported(),
+    reason="needs an SM100 / SM103 / SM107 device with exported routes",
+)
+@pytest.mark.parametrize("hidden", (5120, 256))
+def test_workspace_holds_the_compensated_programs_below_the_measured_sm_count(
+    hidden: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the SM count below ``ACCURACY_MIN_SMS`` the workspace for ``rows`` tokens holds the layout of the
+    compensated program the guard launches at that row count."""
+    if not pkg.is_cake_rmsnorm_det_train_supported(_device(), hidden):
+        pytest.skip(f"hidden={hidden} has no exported route on this device")
+    device = _device()
+    arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
+    monkeypatch.setattr(
+        loader, "sm_count", lambda _index: windows.ACCURACY_MIN_SMS[arch] - 1
+    )
+    for w_dtype in loader.weight_dtypes(arch, hidden, "bwd", False):
+        route = loader.route_key(hidden, "bwd", False, w_dtype)
+        for rows in (1, 129, 4097, 16384):
+            selection = pkg._backward_selection_rows(
+                arch, hidden, False, rows, w_dtype, 0
+            )
+            names = loader.selected_modules(
+                arch, hidden, "bwd", False, rows=selection, w_dtype=w_dtype
+            )
+            (main,) = [
+                n for n in names if loader.MODULES[n].get("workspace_rule") is not None
+            ]
+            owner = pkg._workspace_record(arch, hidden, False, rows, w_dtype)
+            layout = loader.workspace_layout(
+                loader.MODULES[main], rows, device_index=0, capacity_record=owner
+            )
+            size = pkg.cake_rmsnorm_det_train_backward_workspace_bytes(
+                rows, hidden, device
+            )
+            assert size >= layout["total_bytes"], (route, rows)

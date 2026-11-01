@@ -428,6 +428,43 @@ def test_backward_programs_switch_on_row_count(hidden: int) -> None:
     )
 
 
+@pytest.mark.parametrize("hidden", (5120, 256))
+@pytest.mark.parametrize("rows", (1, 129, 4097))
+@pytest.mark.parametrize("below", (1, 0))
+def test_backward_below_the_measured_sm_count_runs_the_compensated_programs(
+    hidden: int, rows: int, below: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a device with fewer SMs than ``cake_windows.ACCURACY_MIN_SMS`` (emulated: the host's SM count patched to one
+    below it, or to 16, which shrinks the chunk table and the grids with it) the H = 5120 / H = 256 backward launches
+    a compensated program at every row count, and forward + backward match the FP64 reference."""
+
+    _skip_unless_hidden(hidden)
+    arch = loader.arch_for_capability(_capability())
+    edge = windows.ACCURACY_EDGES[arch][loader.route_key(hidden, "bwd", False)]
+    compensated = {
+        library
+        for low, _high, library in loader.program_windows(arch, hidden, "bwd", False)
+        if low >= edge
+    }
+    sms = windows.ACCURACY_MIN_SMS[arch] - 1 if below else 16
+    monkeypatch.setattr(loader, "sm_count", lambda _index: sms)
+    launched: list[str] = []
+    run_module = loader.run_module
+
+    def record(name, *args, **kwargs):
+        launched.append(name)
+        return run_module(name, *args, **kwargs)
+
+    monkeypatch.setattr(loader, "run_module", record)
+    _check_case(hidden, rows)
+    mains = [
+        loader.MODULES[name]["library"]
+        for name in launched
+        if loader.MODULES[name].get("workspace_rule") is not None
+    ]
+    assert len(mains) == 1 and mains[0] in compensated, (sms, rows, mains)
+
+
 # --------------------------------------------------------------------------- the program windows
 
 
