@@ -195,15 +195,15 @@ ROUTES = [
     (13, 1024, 2048, False, "PACKED_U4_BOX3D_NOBIAS"),
     (16, 2880, 2880, False, "ACCUMULATORS_CN16_NOBIAS"),
     (64, 4096, 3072, False, "ACCUMULATORS_CN32_BOX3D_NOBIAS"),
-    (16, 1024, 1024, False, None),
-    (8, 2048, 2048, False, "PACKED_S8_BOX3D_NOBIAS"),
+    (16, 1024, 1024, False, "PACKED_U4_BOX3D_NOBIAS"),
+    (8, 2048, 2048, False, "PACKED_U4_BOX3D_NOBIAS"),
     (8, 4096, 4096, False, "PACKED_S8_BOX3D_NOBIAS"),
     (16, 4096, 3072, False, "ACCUMULATORS_CN16_NOBIAS"),
     (64, 4096, 4096, False, "ACCUMULATORS_CN32_BOX3D_NOBIAS"),
     (4, 128, 256, False, "CLUSTER_S2U4_C1_NOBIAS"),
     (10, 768, 2000, False, None),
     (13, 1024, 1032, False, None),
-    (13, 1024, 1088, False, None),
+    (13, 1024, 1088, False, "PACKED_U4_NOBIAS"),
     (5, 64, 4000, False, None),
     (5, 64, 4032, False, "CLUSTER_S8U8_C4_NOBIAS"),
     (3, 64, 1000, False, None),
@@ -217,19 +217,19 @@ ROUTES = [
     (4, 2880, 2880, True, "PACKED_S8"),
     (7, 128, 4096, True, "CLUSTER_S8U8_C4"),
     (8, 128, 7168, True, "CLUSTER_S8U8_C4"),
-    (8, 1024, 1024, True, None),
-    (13, 1024, 2048, True, None),
+    (8, 1024, 1024, True, "PACKED_U4_BOX3D"),
+    (13, 1024, 2048, True, "PACKED_U4_BOX3D"),
     (16, 2880, 2880, True, "ACCUMULATORS_CN16"),
     (64, 4096, 3072, True, "ACCUMULATORS_CN32_BOX3D"),
-    (16, 1024, 1024, True, None),
-    (8, 2048, 2048, True, None),
-    (8, 4096, 4096, True, "PACKED_S8_BOX3D"),
+    (16, 1024, 1024, True, "PACKED_U4_BOX3D"),
+    (8, 2048, 2048, True, "PACKED_U4_BOX3D"),
+    (8, 4096, 4096, True, "ACCUMULATORS_CN16"),
     (16, 4096, 3072, True, "ACCUMULATORS_CN16"),
     (64, 4096, 4096, True, "ACCUMULATORS_CN32_BOX3D"),
     (4, 128, 256, True, "CLUSTER_S2U4_C1"),
     (10, 768, 2000, True, None),
     (13, 1024, 1032, True, None),
-    (13, 1024, 1088, True, None),
+    (13, 1024, 1088, True, "PACKED_U4"),
     (5, 64, 4000, True, None),
     (5, 64, 4032, True, "CLUSTER_S8U8_C4"),
     (3, 64, 1000, True, None),
@@ -240,13 +240,18 @@ ROUTES = [
 ]
 
 
+@pytest.mark.parametrize("use_pdl", [False, True])
 @pytest.mark.parametrize("batch,out_features,in_features,bias,program", ROUTES)
-def test_tinygemm2_wgmma_routes(batch, out_features, in_features, bias, program):
+def test_tinygemm2_wgmma_routes(
+    batch, out_features, in_features, bias, program, use_pdl
+):
+    """PDL selects the same tile through the same windows, as its _PDL program."""
     from flashinfer.gemm.routergemm import _tinygemm2_wgmma_identifier
 
+    expected = None if program is None else program + ("_PDL" if use_pdl else "")
     assert (
-        _tinygemm2_wgmma_identifier(batch, out_features, in_features, bias, False)
-        == program
+        _tinygemm2_wgmma_identifier(batch, out_features, in_features, bias, use_pdl)
+        == expected
     )
 
 
@@ -257,7 +262,12 @@ def test_tinygemm2_wgmma_routes(batch, out_features, in_features, bias, program)
         (2, 16, 256),
         (4, 2880, 2880),
         (8, 128, 7168),
+        (8, 1024, 1024),
         (13, 1024, 2048),
+        (13, 1024, 1088),
+        (16, 1024, 1024),
+        (8, 2048, 2048),
+        (8, 4096, 4096),
         (16, 2880, 2880),
         (64, 4096, 3072),
     ],

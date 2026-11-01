@@ -369,7 +369,11 @@ kernel_cake_tinygemm2_wgmma_76f9a62b2dbe2c3083db(const __grid_constant__ CUtenso
                     int sl_0 = st_1;
                     int kb_0 = (sl_0 / 4 * 16 + sl_0 % 4) * 64;
                     unsigned int dst_0 = sw_addr + (unsigned int)(st_1 % 8 * 12288);
-                    tma_3d_gmem2smem(dst_0 + 0, (&W), kb_0, m0, 0, full_addr + ((int)((unsigned int)st_1 % 8)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(dst_0 + 0), "l"((&W)), "r"(kb_0), "r"(m0), "r"(0),
+                           "r"(full_addr + ((int)((unsigned int)st_1 % 8)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                 }
             }
             if (elect_sync()) {
@@ -390,7 +394,11 @@ kernel_cake_tinygemm2_wgmma_76f9a62b2dbe2c3083db(const __grid_constant__ CUtenso
                     int sl_1 = st_3;
                     int kb_1 = (sl_1 / 4 * 16 + sl_1 % 4) * 64;
                     unsigned int dst_1 = sw_addr + (unsigned int)(st_3 % 8 * 12288);
-                    tma_3d_gmem2smem(dst_1 + 0, (&W), kb_1, m0, 0, full_addr + ((int)((unsigned int)st_3 % 8)) * 8);
+                    asm volatile(
+                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                        :: "r"(dst_1 + 0), "l"((&W)), "r"(kb_1), "r"(m0), "r"(0),
+                           "r"(full_addr + ((int)((unsigned int)st_3 % 8)) * 8), "l"(0x12F0000000000000ULL) : "memory");
                     int slx_1 = st_3;
                     int kbx_1 = (slx_1 / 4 * 16 + slx_1 % 4) * 64;
                     unsigned int dstx_1 = sx_addr + (unsigned int)(st_3 % 8 * 12288);
@@ -403,7 +411,7 @@ kernel_cake_tinygemm2_wgmma_76f9a62b2dbe2c3083db(const __grid_constant__ CUtenso
     // Kernel teardown ops
     __syncthreads();
     int el_0 = tid;
-    if (el_0 < 128) {
+    if (tid < 128 && el_0 < 128) {
         int col_0 = el_0 / 16;
         int row_0 = el_0 % 16;
         float c0_0 = red[row_0 * 8 + col_0];
