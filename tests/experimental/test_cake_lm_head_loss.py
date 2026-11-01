@@ -24,7 +24,7 @@ import subprocess
 import sys
 import threading
 import warnings
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -178,14 +178,15 @@ def _run(
     scale=None,
     compact_rows=None,
     fuse_dw_cast=None,
+    keep=False,
     **switches,
 ):
     """One forward + backward through the backend's autograd entry points (``backend="cake"`` runs the generated
     program; the public module ``flashinfer.chunked_lm_head`` is a pass-through to these two functions, tested in
     ``test_cake_lm_head_loss_api.py``).  ``switches``: the remaining switch keywords (``dx_finalize``, ``dw_stream``,
     ``hidden_count``, ``gemm_tuning``; ``logprob_dz`` / ``logprob_lbl`` of the log-probability entry), passed
-    through; ``memory_mode`` / ``num_valid_rows`` / ``check_num_valid_rows`` call the opt-in module's entry points.
-    Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the leaves."""
+    through; ``memory_mode`` / ``num_valid_rows`` / ``check_num_valid_rows`` call the opt-in module's entry points;
+    ``keep`` calls the log-probability entry with the kept logits (``chunked_lm_head_det_logprob_keep``).  Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the leaves."""
     X = inp.X.detach().requires_grad_(train_x)
     W = inp.W.detach().requires_grad_(train_w)
     be = opt_in if _OPT_IN_KEYWORDS & switches.keys() else cake_backend
@@ -209,7 +210,12 @@ def _run(
         if train_x or train_w:
             (loss if scale is None else loss * scale).backward()
     else:
-        logp = be.chunked_lm_head_det_logprob(
+        entry_fn = (
+            cake_backend.chunked_lm_head_det_logprob_keep
+            if keep
+            else be.chunked_lm_head_det_logprob
+        )
+        logp = entry_fn(
             X,
             W,
             inp.labels,
@@ -4554,6 +4560,242 @@ def test_logprob_arm_switches_belong_to_the_logprob_entry():
     assert cake_backend.logprob_lbl_default() is True
 
 
+def test_logprob_keep_plan_keys_and_memory():
+    """The kept-logits plan of the log-probability entry (``logprob_keep``): the forward runs the plain ``gemm_logits``
+    per chunk (never the label-column arm), the backward recomputes nothing -- the recompute path's keys without its
+    logits GEMMs: ``row_grad`` over each chunk's kept logits, then the dX / weight-gradient GEMMs, the chunk's ``X``
+    rows gathered for the weight gradient only -- and the dW side stream forks after ``row_grad``; the arms are off
+    whatever their switches; the loss entry and a plan without a registered program reject it; the kept form is its
+    own plan class (``_KeptPlan``, the same fields), so the default plan and cache keys are unchanged;
+    ``memory_report`` counts the kept logits."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    common = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        dx_finalize=True,
+        arch="sm_100a",
+    )
+    problem = _problem(8700, 6144, 154880, 4096, entry="logprob")
+    plain = cake_backend.make_plan(problem, valid_rows=8265, **common)
+    keep = cake_backend.make_plan(
+        problem,
+        valid_rows=8265,
+        logprob_dz=True,
+        logprob_lbl=True,
+        logprob_keep=True,
+        **common,
+    )
+    assert keep.logprob_keep and not (keep.logprob_dz or keep.logprob_lbl)
+    assert type(keep) is cake_backend._KeptPlan and type(plain) is cake_backend.Plan
+    assert plain.logprob_keep is False
+    assert "logprob_keep" not in {f.name for f in fields(cake_backend.Plan)}
+    assert fields(keep) == fields(plain)
+    assert type(replace(keep, hidden_count=True)) is cake_backend._KeptPlan
+    assert keep.chunks == plain.chunks and keep.num_chunks == 3
+    assert cake_backend.forward_keys(keep) == cake_backend.forward_keys(plain)
+    assert {k[0] for k in cake_backend.forward_keys(keep)} >= {"gemm_logits"}
+    bwd = cake_backend.recompute_keys(keep)
+    assert list(bwd) == [
+        k for k in cake_backend.recompute_keys(plain) if k[0] != "gemm_logits_nostats"
+    ]
+    assert [k for k in bwd if k[0] == "row_grad"] == [("row_grad", i) for i in range(3)]
+    assert [k for k in bwd if k[0] == "gather_rows"] == [("gather_rows", "d_in")] + [
+        ("gather_rows", i) for i in range(3)
+    ]
+    assert {"gemm_logits", "row_grad"} <= set(keep.stages)
+    assert not {"gemm_logits_nostats", "gemm_logits_dz", "gemm_logits_lbl"} & set(
+        keep.stages
+    )
+    _, forks, sides = cake_backend.side_stream_schedule(keep, bwd, "1")
+    assert sorted(forks) == [i for i, k in enumerate(bwd) if k[0] == "row_grad"]
+    assert len(sides) == 2
+    # a frozen W: no weight gradient, so no chunk gather (the kept logits replace the logits GEMM's X operand)
+    frozen = cake_backend.make_plan(
+        problem, valid_rows=8265, logprob_keep=True, **dict(common, need_dw=False)
+    )
+    rk = cake_backend.recompute_keys(frozen)
+    assert [k for k in rk if k[0] == "gather_rows"] == [("gather_rows", "d_in")]
+    assert [k for k in rk if k[0] == "row_grad"] == [("row_grad", i) for i in range(3)]
+    with pytest.raises(ValueError, match="log-probability"):
+        cake_backend.make_plan(
+            _problem(8700, 6144, 154880, 4096), logprob_keep=True, **common
+        )
+    with pytest.raises(ValueError, match="arch required"):
+        cake_backend.make_plan(problem, logprob_keep=True, **dict(common, arch=None))
+    # the default cache keys take no kept-logits element (the kept entry points append ``"keep"`` themselves)
+    for fn in (forward_binding_key, logprob_backward_binding_key):
+        assert "logprob_keep" not in inspect.signature(fn).parameters
+    # memory: the chunks after the first are a new saved buffer, chunk 0 stays in the chunk buffer; the default
+    # report (main's memory_report, unchanged) has no kept-logits key
+    V = 154880
+    for hidden in (False, True):
+        rep0 = memory_report(
+            8700, 6144, V, 4096, entry="logprob", valid_rows=8265, hidden_count=hidden
+        )
+        assert "saved_logits_bytes" not in rep0
+        assert "saved_logits" not in rep0["accumulators"]
+        rep1 = cake_backend.kept_memory_report(rep0, keep)
+        assert rep1["saved_logits_bytes"] == 8265 * V * 2
+        assert rep1["accumulators"]["saved_logits"] == (8265 - 4096) * V * 2
+        assert (
+            rep1["accumulator_bytes"] - rep0["accumulator_bytes"]
+            == (8265 - 4096) * V * 2
+        )
+        assert rep1["temporary"] == rep0["temporary"]
+        assert {
+            k: v
+            for k, v in rep1.items()
+            if k not in ("saved_logits_bytes", "accumulators", "accumulator_bytes")
+        } == {
+            k: v
+            for k, v in rep0.items()
+            if k not in ("accumulators", "accumulator_bytes")
+        }
+    assert "logprob_keep" not in inspect.signature(memory_report).parameters
+
+
+def test_logprob_keep_entry_points_and_opt_in_mode(monkeypatch):
+    """The kept logits have their own entry points (``chunked_lm_head_det_logprob_keep``, ``forward_logprob_keep`` /
+    ``backward_logprob_keep``); the default entry points take no kept-logits keyword.  The kept autograd entry runs
+    the default entry wherever no backward can follow -- grad mode off (``torch.no_grad``, ``torch.inference_mode``),
+    no input requiring a gradient -- and on the reference backend; the explicit pair and the prepared runner of the
+    kept plan belong to the ``cake`` backend.  The opt-in form ``memory_mode="keep_logits"`` belongs to the
+    log-probability entry without ``num_valid_rows`` and runs the kept entry; elsewhere it is a ``ValueError``."""
+    default_params = inspect.signature(
+        cake_backend.chunked_lm_head_det_logprob
+    ).parameters
+    assert (
+        inspect.signature(cake_backend.chunked_lm_head_det_logprob_keep).parameters
+        == default_params
+    )
+    for fn in (
+        cake_backend.chunked_lm_head_det_logprob,
+        cake_backend.forward_logprob,
+        cake_backend.backward_logprob,
+    ):
+        params = inspect.signature(fn).parameters
+        assert "logprob_keep" not in params and "logits" not in params, fn.__name__
+    assert "logits" not in {f.name for f in fields(cake_backend.ForwardResult)}
+    param = inspect.signature(prepare_lm_head_det_loss).parameters["logprob_keep"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY and param.default is False
+    inp = _host_inputs(37)
+    with pytest.raises(ValueError, match="log-probability"):
+        prepare_lm_head_det_loss(
+            inp.X,
+            inp.W,
+            inp.labels,
+            loss_div=inp.loss_div,
+            chunk_size=16,
+            backend="reference",
+            logprob_keep=True,
+        )
+    with pytest.raises(ValueError, match="cake backend"):
+        prepare_lm_head_det_loss(
+            inp.X,
+            inp.W,
+            inp.labels,
+            chunk_size=16,
+            entry="logprob",
+            backend="reference",
+            logprob_keep=True,
+        )
+    with pytest.raises(ValueError, match="cake backend"):
+        cake_backend.forward_logprob_keep(
+            inp.X, inp.W, inp.labels, chunk_size=16, backend="reference"
+        )
+    with pytest.raises(ValueError, match="cake backend"):
+        cake_backend.backward_logprob_keep(
+            inp.X,
+            inp.W,
+            inp.labels,
+            torch.zeros(37, dtype=torch.float32, device=DEV),
+            inp.dlogp,
+            (inp.X,),
+            chunk_size=16,
+            backend="reference",
+        )
+    # the reference backend: the default entry, the same outputs
+    ref = _run(inp, 16, entry="logprob")
+    kept = _run(inp, 16, entry="logprob", keep=True)
+    for key in ("logp", "dX", "dW"):
+        assert torch.equal(kept[key], ref[key]), key
+    # where no backward can follow, the default entry (the label-column forward); else the kept Function
+    calls = []
+
+    def default_spy(*args, **kw):
+        calls.append(("default", kw))
+        return torch.zeros(())
+
+    def keep_spy(*args):
+        calls.append(("keep", args))
+        return torch.zeros(())
+
+    monkeypatch.setattr(cake_backend, "chunked_lm_head_det_logprob", default_spy)
+    monkeypatch.setattr(
+        cake_backend.ChunkedLmHeadDetLogprobKeepFunction, "apply", keep_spy
+    )
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    X0, W0 = inp.X.detach(), inp.W.detach()
+    cases = (
+        ("grad", X, W, contextlib.nullcontext, "cake", "keep"),
+        ("X only", X, W0, contextlib.nullcontext, "cake", "keep"),
+        ("W only", X0, W, contextlib.nullcontext, "cake", "keep"),
+        ("no_grad", X, W, torch.no_grad, "cake", "default"),
+        ("inference_mode", X, W, torch.inference_mode, "cake", "default"),
+        ("frozen", X0, W0, contextlib.nullcontext, "cake", "default"),
+        ("reference", X, W, contextlib.nullcontext, "reference", "default"),
+    )
+    for tag, x, w, ctx, backend, expect in cases:
+        calls.clear()
+        with ctx():
+            cake_backend.chunked_lm_head_det_logprob_keep(
+                x, w, inp.labels, chunk_size=16, backend=backend
+            )
+        assert [c[0] for c in calls] == [expect], tag
+        if expect == "default":
+            assert calls[0][1]["backend"] == backend, tag
+            assert calls[0][1]["chunk_size"] == 16, tag
+    monkeypatch.undo()
+    # the opt-in form
+    # main's resolver (every entry's) rejects it; the log-probability entry maps that rejection to the kept form
+    with pytest.raises(ValueError, match="memory_mode must be"):
+        opt_in._resolve_memory_mode("keep_logits")
+    assert opt_in._resolve_memory_mode(None) == "fast"
+    assert not hasattr(opt_in, "_resolve_logprob_memory_mode")
+    with pytest.raises(ValueError, match="memory_mode must be"):
+        _run(inp, 16, entry="loss", memory_mode="keep_logits")
+    with pytest.raises(ValueError, match="memory_mode must be"):
+        _run(inp, 16, entry="logprob", memory_mode="keep")
+    n = int(inp.valid.sum())
+    with pytest.raises(ValueError, match="num_valid_rows"):
+        _run(inp, 16, entry="logprob", memory_mode="keep_logits", num_valid_rows=n)
+    with pytest.raises(ValueError, match="cake backend"):
+        _run(inp, 16, entry="logprob", memory_mode="keep_logits")
+    seen = {}
+
+    def spy(*args, **kw):
+        seen.update(kw)
+        return torch.zeros(())
+
+    monkeypatch.setattr(opt_in._main, "chunked_lm_head_det_logprob_keep", spy)
+    opt_in.chunked_lm_head_det_logprob(
+        inp.X,
+        inp.W,
+        inp.labels,
+        chunk_size=16,
+        backend="cake",
+        memory_mode="keep_logits",
+    )
+    assert seen["backend"] == "cake" and seen["chunk_size"] == 16
+    assert set(seen) <= set(default_params)
+
+
 def test_hidden_count_eligibility_rules(monkeypatch, toolchain_check_uncached):
     """A compacted call runs the hidden valid-row count only with a registered program that carries the gather kernel
     and the device-count form of chunk 0's logits GEMM (its raster height at the buffer extent is a launch scalar), a
@@ -8055,6 +8297,374 @@ def test_device_logprob_arms_are_bitwise(glm_weight):
         if gate:
             _check_against_references(first, inp, entry="logprob")
         del on, off, first
+
+
+def test_device_logprob_keep_is_bitwise(glm_weight):
+    """The kept logits against the default log-probability path on the generated program: the kept autograd entry
+    (``chunked_lm_head_det_logprob_keep``, first call and remembered binding; also through the opt-in
+    ``memory_mode="keep_logits"``) and the explicit pair (``forward_logprob_keep`` keeps one BF16 ``[rows_c, V]`` view
+    per chunk, ``backward_logprob_keep`` on the forward's row index and on a recount) give bitwise the same ``logp`` / ``dX`` / ``dW`` over one-, two- and
+    many-chunk calls, compacted and uncompacted calls, every row valid, the hidden valid-row count on and off, the
+    dW side stream, the unfused dW cast and dX finalize, labels at and beyond the last vocabulary column and an ``X``
+    with a padded leading stride; the kept bindings are their own (``_KeptBinding``, keys ending in ``"keep"``) and
+    the kept backward bindings launch no logits GEMM; with one trainable input (a frozen ``X``: no ``dX``; a frozen
+    ``W``: no ``dW`` and no chunk row gather) the kept path gives bitwise the default path's gradient."""
+    _require_program(entry="logprob")
+    V = int(glm_weight.shape[0])
+    edge_labels = [-1, -7, V - 1, 0, V, V + 5, 2 * V]
+    cases = [
+        # (T, chunk, ignored fraction, switches, X pitch padding, label edits)
+        (1500, 4096, 0.05, {}, 0, False),
+        (1500, 4096, 0.0, {}, 0, False),
+        (1500, 4096, 0.05, dict(compact_rows=False), 0, False),
+        (6000, 4096, 0.05, {}, 0, False),
+        (8700, 4096, 0.05, {}, 0, False),
+        (8700, 4096, 0.05, dict(hidden_count=False), 0, False),
+        (8700, 4096, 0.0, {}, 0, False),
+        (3100, 1024, 0.5, dict(dw_stream=True), 0, False),
+        (1500, 4096, 0.05, {}, 8, False),
+        (2500, 2048, 0.05, dict(compact_rows=False), 0, True),
+        (5000, 2048, 0.05, dict(fuse_dw_cast=False, dx_finalize=False), 0, True),
+    ]
+    logits_gemm = {
+        s
+        for s in cake_backend.GEMM_STAGES
+        if cake_backend.base_stage(s) in cake_backend.LOGITS_BASES
+    }
+    for T, C, ignore, switches, ld_pad, edit in cases:
+        inp = make_inputs(
+            T,
+            seed=SEED + 90 + T,
+            device=CUDA,
+            W=glm_weight,
+            ignore_frac=ignore,
+            ld_pad=ld_pad,
+        )
+        if edit:
+            labels = inp.labels.clone()
+            labels[: len(edge_labels)] = torch.tensor(edge_labels, device=CUDA)
+            inp = replace(inp, labels=labels)
+        case = (T, C, ignore, switches, ld_pad, edit)
+        with _cache(True) as cache:
+            cache.clear()
+            base = [
+                _run(inp, C, entry="logprob", backend="cake", **switches)
+                for _ in range(2)
+            ]
+            keep = [
+                _run(inp, C, entry="logprob", backend="cake", keep=True, **switches)
+                for _ in range(2)
+            ]
+            forms = {
+                (key[0], b.plan.logprob_keep) for key, b in cache._bindings.items()
+            }
+            for key, b in cache._bindings.items():
+                kept_binding = isinstance(b, cake_backend._KeptBinding)
+                assert kept_binding == b.plan.logprob_keep == (key[-1] == "keep"), case
+            for b in cache._bindings.values():
+                if b.plan.logprob_keep and b.backward_order:
+                    assert not {k[0] for k in b.backward_order} & logits_gemm, case
+        assert forms == {
+            ("fwd", True),
+            ("fwd", False),
+            ("bwd", True),
+            ("bwd", False),
+        }, (case, forms)
+        mode = _run(
+            inp,
+            C,
+            entry="logprob",
+            backend="cake",
+            memory_mode="keep_logits",
+            **switches,
+        )
+        for key in ("logp", "dX", "dW"):
+            for i, out in enumerate((*keep, mode)):
+                assert torch.equal(out[key], base[0][key]), (case, key, i)
+            assert torch.equal(base[1][key], base[0][key]), (case, key)
+        fwd_kw = {
+            k: v for k, v in switches.items() if k in ("compact_rows", "hidden_count")
+        }
+        dlogp = torch.where(inp.valid, inp.dlogp, torch.zeros_like(inp.dlogp))
+        bwd_kw = {k: v for k, v in switches.items() if k != "hidden_count"}
+        for tag in ("index", "recount"):
+            fr = cake_backend.forward_logprob_keep(
+                inp.X, inp.W, inp.labels, chunk_size=C, **fwd_kw
+            )
+            rows = int((inp.labels >= 0).sum()) if fr.row_index is not None else T
+            assert len(fr.logits) == len(plan_chunks(rows, C)), case
+            assert [int(v.shape[0]) for v in fr.logits] == [
+                r for _, r in plan_chunks(rows, C)
+            ], case
+            assert all(v.dtype == torch.bfloat16 and v.shape[1] == V for v in fr.logits)
+            assert torch.equal(fr.logp, base[0]["logp"]), case
+            extra = dict(row_index=fr.row_index) if tag == "index" else {}
+            dx, dw = cake_backend.backward_logprob_keep(
+                inp.X,
+                inp.W,
+                inp.labels,
+                fr.lse,
+                dlogp,
+                fr.logits,
+                chunk_size=C,
+                **bwd_kw,
+                **extra,
+            )
+            assert torch.equal(dx, base[0]["dX"]), (case, tag)
+            assert torch.equal(dw, base[0]["dW"]), (case, tag)
+        assert torch.all(keep[0]["logp"][~inp.valid] == 0)
+        assert torch.all(keep[0]["dX"][~inp.valid] == 0)
+        del base, keep, mode, fr
+    # one trainable input: the kept backward without dX (need_dx False) and without dW (need_dw False; no chunk row
+    # gather, only the dlogp rows), first call and remembered binding
+    for T, C, ignore, switches in (
+        (1500, 4096, 0.05, {}),
+        (8700, 4096, 0.05, {}),
+        (8700, 4096, 0.05, dict(hidden_count=False)),
+        (2500, 2048, 0.05, dict(compact_rows=False)),
+        (3100, 1024, 0.5, dict(dw_stream=True)),
+        (5000, 2048, 0.05, dict(fuse_dw_cast=False, dx_finalize=False)),
+    ):
+        inp = make_inputs(
+            T, seed=SEED + 190 + T, device=CUDA, W=glm_weight, ignore_frac=ignore
+        )
+        for train_x, train_w in ((False, True), (True, False)):
+            case = (T, C, ignore, switches, train_x, train_w)
+            frozen = dict(train_x=train_x, train_w=train_w)
+            with _cache(True) as cache:
+                cache.clear()
+                base = _run(
+                    inp, C, entry="logprob", backend="cake", **frozen, **switches
+                )
+                keep = [
+                    _run(
+                        inp,
+                        C,
+                        entry="logprob",
+                        backend="cake",
+                        keep=True,
+                        **frozen,
+                        **switches,
+                    )
+                    for _ in range(2)
+                ]
+                kept = [
+                    b
+                    for key, b in cache._bindings.items()
+                    if key[0] == "bwd" and isinstance(b, cake_backend._KeptBinding)
+                ]
+                assert len(kept) == 1, case
+                plan = kept[0].plan
+                assert (plan.need_dx, plan.need_dw) == (train_x, train_w), case
+                order = kept[0].backward_order
+                assert not {k[0] for k in order} & logits_gemm, case
+                chunk_gathers = [
+                    k for k in order if k[0] == "gather_rows" and isinstance(k[1], int)
+                ]
+                assert bool(chunk_gathers) == (train_w and plan.compact), case
+                assert [k for k in order if k[0] == "row_grad"] == [
+                    ("row_grad", i) for i in range(plan.num_chunks)
+                ], case
+            for out in keep:
+                assert torch.equal(out["logp"], base["logp"]), case
+                if train_x:
+                    assert torch.equal(out["dX"], base["dX"]), case
+                    assert out["dW"] is None, case
+                else:
+                    assert torch.equal(out["dW"], base["dW"]), case
+                    assert out["dX"] is None, case
+            del base, keep
+
+
+def test_device_logprob_keep_lifetimes(glm_weight, monkeypatch):
+    """Where the kept logits live and what they cost: a kept-entry call no backward can follow (``torch.no_grad``,
+    ``torch.inference_mode``, frozen inputs) is the default call -- the same launches (the label-column forward),
+    bitwise the same ``logp``, no kept binding; the first backward through a retained graph spends the kept logits and
+    a second one recomputes (both bitwise the default path's); a non-reentrant and a reentrant
+    ``torch.utils.checkpoint`` give the default gradients; the bytes held from the forward to the backward grow by
+    the kept bindings' ``memory["saved_logits_bytes"]`` (chunk 0 lives in the chunk buffer the default forward frees), the
+    step peak by no more than that, and nothing stays allocated after the backward; a kept views tuple of the wrong
+    plan is a ``ValueError``; the prepared runner of a kept plan does not launch it."""
+    _require_program(entry="logprob")
+    C, T = 4096, 8700
+    inp = make_inputs(T, seed=SEED + 97, device=CUDA, W=glm_weight, ignore_frac=0.05)
+    T_v = int(inp.valid.sum())
+    V = int(glm_weight.shape[0])
+    ref = _run(inp, C, entry="logprob", backend="cake")
+
+    def leaves(x=True, w=True):
+        return inp.X.detach().requires_grad_(x), inp.W.detach().requires_grad_(w)
+
+    def call(X, W, keep=True):
+        fn = (
+            cake_backend.chunked_lm_head_det_logprob_keep
+            if keep
+            else cake_backend.chunked_lm_head_det_logprob
+        )
+        return fn(X, W, inp.labels, chunk_size=C)
+
+    launched = []
+    run_keys = cake_backend._run_keys
+
+    def recording(plan, device_index, keys, run_key, *args, **kw):
+        def run(key):
+            launched.append(key)
+            return run_key(key)
+
+        return run_keys(plan, device_index, keys, run, *args, **kw)
+
+    monkeypatch.setattr(cake_backend, "_run_keys", recording)
+    lbl = {
+        s
+        for s in cake_backend.GEMM_STAGES
+        if cake_backend.base_stage(s) == cake_backend.LOGPROB_LBL_STAGE
+    }
+    with _cache(True) as cache:
+        # no backward can follow: the default call (its launches, the label-column forward), nothing kept
+        for tag, ctx, x, w in (
+            ("no_grad", torch.no_grad, True, True),
+            ("inference_mode", torch.inference_mode, True, True),
+            ("frozen", contextlib.nullcontext, False, False),
+        ):
+            cache.clear()
+            X, W = leaves(x, w)
+            runs = {}
+            # the second pair: remembered bindings
+            for keep in (False, True, False, True):
+                launched.clear()
+                with ctx():
+                    lp = call(X, W, keep=keep)
+                torch.cuda.synchronize()
+                assert torch.equal(lp, ref["logp"]), (tag, keep)
+                assert lp.grad_fn is None, (tag, keep)
+                runs[keep] = list(launched)
+            assert runs[True] == runs[False] and runs[True], tag
+            assert any(k[0] in lbl for k in runs[True]) == any(
+                b.plan.logprob_lbl for b in cache._bindings.values()
+            ), tag
+            assert not any(
+                isinstance(b, cake_backend._KeptBinding)
+                for b in cache._bindings.values()
+            ), tag
+            assert all(key[-1] != "keep" for key in cache._bindings), tag
+        # one trainable input: the kept backward without dX (no X gradient) or without dW (no chunk gather)
+        for x, w in ((False, True), (True, False)):
+            base = _run(inp, C, entry="logprob", backend="cake", train_x=x, train_w=w)
+            X, W = leaves(x, w)
+            lp = call(X, W)
+            assert lp.grad_fn.kept is True
+            lp.backward(inp.dlogp)
+            assert torch.equal(lp.detach(), ref["logp"]), (x, w)
+            if x:
+                assert torch.equal(X.grad, base["dX"]) and W.grad is None
+            else:
+                assert torch.equal(W.grad, base["dW"]) and X.grad is None
+            del lp, base
+        # a retained graph: the first backward spends the kept logits, the second recomputes
+        cache.clear()
+        X, W = leaves()
+        lp = call(X, W)
+        node = lp.grad_fn
+        assert len(node.saved_tensors) == 5 + len(plan_chunks(T_v, C))
+        assert node.kept is True  # kept, not yet spent
+        lp.backward(inp.dlogp, retain_graph=True)
+        assert node.kept is False  # spent
+        assert torch.equal(X.grad, ref["dX"]) and torch.equal(W.grad, ref["dW"])
+        X.grad = W.grad = None
+        lp.backward(inp.dlogp)
+        assert torch.equal(X.grad, ref["dX"]) and torch.equal(W.grad, ref["dW"])
+        del lp, node
+        # checkpointed: both the non-reentrant and the reentrant form
+        for reentrant in (False, True):
+            X, W = leaves()
+            lp = torch.utils.checkpoint.checkpoint(call, X, W, use_reentrant=reentrant)
+            lp.backward(inp.dlogp)
+            assert torch.equal(lp.detach(), ref["logp"]), reentrant
+            assert torch.equal(X.grad, ref["dX"]), reentrant
+            assert torch.equal(W.grad, ref["dW"]), reentrant
+            del lp
+        monkeypatch.undo()
+        # memory, after both forms are bound
+        for _ in range(2):
+            _run(inp, C, entry="logprob", backend="cake")
+            _run(inp, C, entry="logprob", backend="cake", keep=True)
+
+        def step(keep):
+            X, W = leaves()
+            gc.collect()
+            torch.cuda.synchronize()
+            start = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            lp = call(X, W, keep=keep)
+            torch.cuda.synchronize()
+            held = torch.cuda.memory_allocated() - start
+            lp.backward(inp.dlogp)
+            del lp
+            torch.cuda.synchronize()
+            peak = torch.cuda.max_memory_allocated() - start
+            grads = sum(t.numel() * t.element_size() for t in (X.grad, W.grad))
+            left = torch.cuda.memory_allocated() - start - grads
+            return held, peak, left
+
+        held0, peak0, left0 = step(False)
+        held1, peak1, left1 = step(True)
+        reports = [
+            b.memory
+            for b in cache._bindings.values()
+            if isinstance(b, cake_backend._KeptBinding)
+        ]
+        assert reports and all(r["saved_logits_bytes"] == T_v * V * 2 for r in reports)
+        assert not any(
+            "saved_logits_bytes" in b.memory
+            for b in cache._bindings.values()
+            if not isinstance(b, cake_backend._KeptBinding)
+        )
+    saved = T_v * V * 2
+    slack = 8 << 20  # allocator rounding of a few tensors
+    assert abs((held1 - held0) - saved) <= slack, (held0, held1, saved)
+    assert peak1 - peak0 <= saved + slack, (peak0, peak1, saved)
+    assert abs(left1 - left0) <= slack and left1 <= slack, (left0, left1)
+    # a kept views tuple that does not match the plan
+    fr = cake_backend.forward_logprob_keep(inp.X, inp.W, inp.labels, chunk_size=C)
+    dlogp = torch.where(inp.valid, inp.dlogp, torch.zeros_like(inp.dlogp))
+    for bad in (fr.logits[:-1], (fr.logits[0].view(torch.int16),) + fr.logits[1:]):
+        with pytest.raises(ValueError, match="kept chunk view"):
+            cake_backend.backward_logprob_keep(
+                inp.X,
+                inp.W,
+                inp.labels,
+                fr.lse,
+                dlogp,
+                bad,
+                chunk_size=C,
+                row_index=fr.row_index,
+            )
+    # the explicit pair: one backward per kept views tuple (row_grad overwrote them), a second is a ValueError
+    fr = cake_backend.forward_logprob_keep(inp.X, inp.W, inp.labels, chunk_size=C)
+    kw = dict(chunk_size=C, row_index=fr.row_index)
+    dx, dw = cake_backend.backward_logprob_keep(
+        inp.X, inp.W, inp.labels, fr.lse, dlogp, fr.logits, **kw
+    )
+    assert torch.equal(dx, ref["dX"]) and torch.equal(dw, ref["dW"])
+    for again in (fr.logits, tuple(fr.logits), list(fr.logits)):
+        with pytest.raises(ValueError, match="consumed by an earlier backward"):
+            cake_backend.backward_logprob_keep(
+                inp.X, inp.W, inp.labels, fr.lse, dlogp, again, **kw
+            )
+    del fr, dx, dw
+    runner = prepare_lm_head_det_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        chunk_size=C,
+        entry="logprob",
+        need_dx=False,
+        need_dw=False,
+        logprob_keep=True,
+    )
+    assert runner.plan.logprob_keep
+    with pytest.raises(NotImplementedError, match="eager entry points"):
+        runner.forward()
 
 
 def test_device_host_count_early_launch_is_bitwise(glm_weight, monkeypatch):
