@@ -67,6 +67,20 @@ than the deterministic package's shipped plan of the row in every measurement ru
 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream.  A `None` entry is a measured
 row that missed; a row without an entry was not measured.  Both run the deterministic program.
 
+The K1 verdicts were measured at 16172 to 16384 tokens.  Those of `K1_SPLIT_RULES` hold at every token count their split
+count fits (`num_splits * 64 <= T + 63`); the tables of `K1_SPLIT_RULES_BY_SM` hold only at 16172 to 16384 tokens
+(`K1_SPLIT_RULES_BY_SM_TOKENS`).  The router verdicts hold only inside token windows (`ROUTER_RULES`; the last table
+below) and pass a stricter rule: measured in one long-lived process and in a fresh process per token count, and no more
+than 3 % slower than the deterministic plan next to such a kernel both in the same launch order and with the router
+partition launched before that kernel against the deterministic plan launched after it.  Every other token count of a
+router row runs the deterministic program.  The K1 verdicts hold from the floor of `K1_MIN_SM_COUNT` /
+`K1_RULE_MIN_SM_COUNT` up (a part with more SMs than the measured ones takes them without a measurement, a part with
+fewer runs the deterministic program); the tables of `K1_SPLIT_RULES_BY_SM` hold for exactly 208 and 212 SMs.  The
+router windows hold only on the SM count they were measured on (`ROUTER_SM_COUNT`: 152 on `sm_100a` / `sm_103a`, 216 on
+`sm_107a`); every other SM count runs the deterministic plan, except in the `"waves"` windows, which keep the earlier SM
+condition of `"waves"` (the deterministic plan's last wave below 80 % full).  The measured parts have 148 and 152 SMs
+(`sm_100a` / `sm_103a` K1), 152 SMs (`sm_100a` / `sm_103a` router) and 216 SMs (`sm_107a`).
+
 | table | key | value |
 |---|---|---|
 | `K1_SPLIT_RULES` | `(arch, L, M, N, out_dtype)`: the transposed-store launch `out[l, n, m]` (`M` = the stored inner extent, `d_in` of a weight gradient; `N` = its rows, `d_out`), `out_dtype` `"bf16"` / `"f32"` | `(block_n, num_splits)` (this package's program) or `None` (the deterministic program) |
