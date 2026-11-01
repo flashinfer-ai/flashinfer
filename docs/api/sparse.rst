@@ -157,8 +157,11 @@ index heads.
 The default decode chain is the score plane
 (``msa_icp_decode_index_score_sharded``) followed by
 ``msa_icp_topk_select_publish``; ``msa_icp_decode_score_publish`` fuses the two
-steps and is an option. With ``enable_pdl`` on compute capability 10.0 and
-10.3 at 64 or 128 local K rows per page, the score plane reads ``seq_lens`` and
+steps and is an option. The plan's ``decode`` runs the fused chain when given a
+``pool``, and without one on compute capability 10.7 at P128 (TP2 and TP4) from 8 requests
+on, in a pool the plan allocates once (``fused_decode_min_batch``). With
+``enable_pdl`` on compute capability 10.0 and 10.3 at 64 or 128 local K rows per
+page, and on 10.7 at 32 or 64, the score plane reads ``seq_lens`` and
 ``block_table`` and starts loading the history index-K pages before it waits on
 the preceding kernel; that kernel must not write them and must be launched
 without programmatic dependent launch or wait on its own predecessor before it
