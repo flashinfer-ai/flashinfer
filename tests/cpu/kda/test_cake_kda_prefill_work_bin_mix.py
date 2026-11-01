@@ -11,9 +11,11 @@ A work-binned launch that takes its module's turnover build
 (``_RENDERED_WORK_BIN_MIX_ROUTES``) instead where the bin-mix rule admits its
 bin table (``_work_bin_mix_plan``) on an architecture of
 ``WORK_BIN_MIX_ARCHES``: the plan words follow the table in ``seq_order`` and
-a zeroed give ring rides in ``chunk_state`` / ``zero_workspace``.  Every other
-launch, and every launch on another architecture, keeps the turnover build
-unchanged.  A launch the driver refuses as a too large cooperative grid
+a zeroed give ring rides in ``chunk_state`` / ``zero_workspace``.  On an
+architecture of ``WORK_BIN_MIX_SPAN_ARCHES`` the plan must also shorten the
+launch's longest bin and give no single chunk to a helper with a longer task
+than the owner's shorter task.  Every other launch, and every launch on
+another architecture, keeps the turnover build unchanged.  A launch the driver refuses as a too large cooperative grid
 switches the plan for good to the turnover build with its own bindings.
 
 The device queries are stubbed (SM100a / SM103a, 148 or 152 SMs), the tensors
@@ -44,10 +46,13 @@ REFUSED = RuntimeError(
 PARTS = (("sm_100a", (10, 0), 148), ("sm_103a", (10, 3), 152))
 PART_IDS = ["sm100a-148", "sm103a-152"]
 # The parts whose admitted launches take the bin-mix build.
-MIX_PARTS = (PARTS[0],)
-MIX_PART_IDS = PART_IDS[:1]
-# Launches the rule admits on a 152-SM sm_103a part that ran slower there
-# with the bin-mix build than with the turnover build: (lengths, heads).
+MIX_PARTS = PARTS
+MIX_PART_IDS = PART_IDS
+# Launches the rule admits on a 152-SM sm_103a part whose plan fails the span
+# check there; each ran slower on that part with the bin-mix build than with
+# the turnover build: (lengths, heads).  The first two give a single chunk to a
+# helper with a longer task than the owner's shorter task; the others leave the
+# longest bin as long as before.
 SM103A_REFUSED_ROWS = [
     pytest.param(
         [
@@ -75,6 +80,38 @@ SM103A_REFUSED_ROWS = [
         id="short-mixed-19-h12",
     ),
     pytest.param([88] * 9 + [107] * 3, 16, id="12x88-107-h16"),
+    pytest.param(
+        [116, 76, 76, 116, 116, 116] + [76] * 6 + [116] + [76] * 4,
+        10,
+        id="5x116-12x76-h10",
+    ),
+    pytest.param([88] * 12 + [116] + [88] * 10, 8, id="1x116-22x88-h8"),
+    pytest.param([256] * 3 + [128] * 14, 12, id="3x256-14x128-h12"),
+    pytest.param(
+        [110, 107, 106, 229, 107, 101, 103, 99, 102, 97, 230, 97, 101, 229, 104, 104],
+        12,
+        id="probe-16-h12",
+    ),
+    pytest.param(
+        [114, 104, 110, 152, 142, 114, 252, 160, 147, 120, 149], 16, id="probe-11-h16"
+    ),
+    pytest.param(
+        [176, 182, 243, 80, 91, 100, 100, 136, 187, 235, 202, 83, 150, 120],
+        16,
+        id="random-14-h16",
+    ),
+    pytest.param(
+        [106, 100, 103, 108, 107, 227, 105, 240, 105, 256, 108, 100, 102, 240],
+        16,
+        id="probe-14-h16",
+    ),
+    pytest.param([200, 200] + [103] * 8 + [200] + [103] * 2, 16, id="3x200-10x103-h16"),
+]
+# The span check refuses these too, and the GPU tests' mixed bin-mix row
+# (tests/kda BIN_MIX_ROWS), whose plan gives single chunks to helpers with
+# longer tasks than the owner's shorter task.
+SM103A_SPAN_REFUSED_ROWS = SM103A_REFUSED_ROWS + [
+    pytest.param([256, 224, 192, 160] * 4, 12, id="mixed16-h12"),
 ]
 # The loader's turnover tables, before any test stubs them.
 TURN = {
@@ -106,7 +143,8 @@ def _bins(table, bins):
 
 
 def test_rule_constants():
-    assert runtime.WORK_BIN_MIX_ARCHES == ("sm_100a",)
+    assert runtime.WORK_BIN_MIX_ARCHES == ("sm_100a", "sm_103a")
+    assert runtime.WORK_BIN_MIX_SPAN_ARCHES == ("sm_103a",)
     assert runtime.WORK_BIN_MIX_MAGIC == MAGIC
     assert runtime.WORK_BIN_MIX_MAX_GIVE == 8
     assert runtime.WORK_BIN_MIX_SLOTS == 8
@@ -245,17 +283,15 @@ def test_program_lookup(monkeypatch):
     assert runtime._work_bin_mix_program(program, "sm_103a") is None
 
 
-def test_program_lookup_refuses_sm103a_even_where_a_loader_names_a_build(
-    monkeypatch,
-):
+def test_program_lookup_on_sm103a(monkeypatch):
     module, program = _turnover_pair("sm_103a")
     monkeypatch.setattr(
         registry,
         "_RENDERED_WORK_BIN_MIX_ROUTES",
         {"sm_100a": {}, "sm_103a": {module: BIN_MIX}},
     )
-    assert "sm_103a" not in runtime.WORK_BIN_MIX_ARCHES
-    assert runtime._work_bin_mix_program(program, "sm_103a") is None
+    assert runtime._work_bin_mix_program(program, "sm_103a") == BIN_MIX
+    assert runtime._work_bin_mix_program(program, "sm_100a") is None
 
 
 def test_shipped_loader_names_the_unbounded_direct_bin_mix_build():
@@ -530,23 +566,17 @@ def _launch_table(part, lengths, heads):
 
 
 @pytest.mark.parametrize("named", [True, False], ids=["mix-named", "mix-unnamed"])
-@pytest.mark.parametrize(
-    "lengths,heads",
-    [
-        pytest.param([64] * 16, 12, id="bs16x64-h12"),
-        pytest.param([128] * 16, 12, id="bs16x128-h12"),
-        pytest.param([256] * 16, 12, id="bs16x256-h12"),
-        *SM103A_REFUSED_ROWS,
-    ],
-)
-def test_sm103a_admitted_tables_keep_the_turnover_build(planner, lengths, heads, named):
-    # The rule admits the launch's own table on a 152-SM part, yet an
-    # sm_103a launch keeps the turnover build, its table alone and its
-    # bindings, whether or not the loader names a bin-mix build there.
+@pytest.mark.parametrize("lengths,heads", SM103A_SPAN_REFUSED_ROWS)
+def test_sm103a_span_check_keeps_the_turnover_build(planner, lengths, heads, named):
+    # The rule admits the launch's own table on a 152-SM part, yet its plan
+    # fails the span check of an sm_103a launch: the launch keeps the
+    # turnover build, its table alone and its bindings, whether or not the
+    # loader names a bin-mix build there.
     planner.configure("sm_103a", mix=named)
     plan = _launch(_prepare(lengths, heads))
     table, bins, after = _launch_table(planner, lengths, heads)
     assert runtime._work_bin_mix_plan(table, bins, tuple(lengths), heads) is not None
+    assert runtime._work_bin_mix_plan(table, bins, tuple(lengths), heads, True) is None
     assert after == ()
     assert not plan.work_bin_mix, plan.schedule
     assert BIN_MIX not in {kernel.name for kernel in _Kernel.made}
@@ -556,10 +586,65 @@ def test_sm103a_admitted_tables_keep_the_turnover_build(planner, lengths, heads,
     assert plan.grid == (bins, 1, 1)
 
 
+@pytest.mark.parametrize(
+    "lengths,heads",
+    [
+        pytest.param([64] * 16, 12, id="bs16x64-h12"),
+        pytest.param([128] * 16, 12, id="bs16x128-h12"),
+        pytest.param([256] * 16, 12, id="bs16x256-h12"),
+        pytest.param([170] * 20, 8, id="bs20x170-h8"),
+        pytest.param([144] * 18, 10, id="bs18x144-h10"),
+        pytest.param([270] * 14, 16, id="bs14x270-h16"),
+    ],
+)
+def test_sm103a_span_check_keeps_shortening_plans(planner, lengths, heads):
+    # A plan that shortens the longest bin without a single-chunk give to a
+    # longer helper passes the span check unchanged: the sm_103a launch takes
+    # the bin-mix build with the rule's plan words after its table.
+    planner.configure("sm_103a")
+    plan = _launch(_prepare(lengths, heads))
+    table, bins, after = _launch_table(planner, lengths, heads)
+    words = runtime._work_bin_mix_plan(table, bins, tuple(lengths), heads)
+    assert words is not None
+    assert runtime._work_bin_mix_plan(table, bins, tuple(lengths), heads, True) == words
+    assert after == words
+    assert plan.work_bin_mix, plan.schedule
+    assert plan.module.name == BIN_MIX
+    assert plan.schedule.endswith("_turnover_bin_mix"), plan.schedule
+
+
+def test_sm103a_span_check_keeps_the_refused_grid_plan(planner):
+    # The GPU tests' refused bin-mix launch (32 x 128 tokens at 12 heads on a
+    # table built for twice the part's SMs) shortens its longest bin: on
+    # sm_103a it takes the bin-mix build too.
+    planner.configure("sm_103a")
+    planner.sm_count *= 2
+    plan = _launch(_prepare([128] * 32, 12))
+    assert plan.work_bin_mix, plan.schedule
+    assert plan.module.name == BIN_MIX
+    assert plan.schedule.endswith("_turnover_bin_mix"), plan.schedule
+
+
+@pytest.mark.parametrize("lengths,heads", SM103A_SPAN_REFUSED_ROWS)
+def test_sm100a_keeps_the_rule_without_the_span_check(planner, lengths, heads):
+    # On a 148-SM sm_100a part the same launches follow the rule alone: the
+    # plan words after the table are the rule's, the bin-mix build runs
+    # exactly where the rule admits the part's own table.
+    planner.configure("sm_100a")
+    plan = _launch(_prepare(lengths, heads))
+    table, bins, after = _launch_table(planner, lengths, heads)
+    words = runtime._work_bin_mix_plan(table, bins, tuple(lengths), heads)
+    assert after == (words or ())
+    assert plan.work_bin_mix == (words is not None), plan.schedule
+    if words is not None:
+        assert plan.module.name == BIN_MIX
+        assert plan.schedule.endswith("_turnover_bin_mix"), plan.schedule
+
+
 def test_sm103a_refused_row_takes_the_build_on_sm100a(planner):
-    # The architecture gate alone moves the launch: on a 148-SM sm_100a part
-    # the same 12 x 88 / 107-token row at 16 heads takes the bin-mix build
-    # with the rule's plan words after its table.
+    # The span check alone moves the launch: on a 148-SM sm_100a part the
+    # same 12 x 88 / 107-token row at 16 heads takes the bin-mix build with
+    # the rule's plan words after its table.
     lengths, heads = [88] * 9 + [107] * 3, 16
     planner.configure("sm_100a")
     plan = _launch(_prepare(lengths, heads))

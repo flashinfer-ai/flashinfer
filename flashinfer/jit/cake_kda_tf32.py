@@ -2501,7 +2501,7 @@ _RENDERED_MODULES = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "arches": ["sm_100a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_kda_prefill_65f6e405db23dc7177bb": {
         "sources": [
@@ -5155,7 +5155,9 @@ _RENDERED_WORK_BIN_MIX_ROUTES: dict[str, dict[str, str]] = {
     "sm_100a": {
         "cake_kda_bf16_893740628d53688ac269": "cake_kda_prefill_5c9df07c556846d1c6eb",
     },
-    "sm_103a": {},
+    "sm_103a": {
+        "cake_kda_bf16_893740628d53688ac269": "cake_kda_prefill_5c9df07c556846d1c6eb",
+    },
 }
 
 MODULES = {
