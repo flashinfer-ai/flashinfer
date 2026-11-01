@@ -199,7 +199,7 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
 
     __syncthreads();
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int sab_head = blockIdx.x % num_sab_heads;
     int block_in_seq = blockIdx.x / num_sab_heads;
     int seq_idx = blockIdx.y;
@@ -445,17 +445,10 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
         asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};\n"
             : "=f"(dc_acc[0]), "=f"(dc_acc[1]), "=f"(dc_acc[2]), "=f"(dc_acc[3])
             : "r"(d_frag[0]), "r"(d_frag[1]), "r"(c_frag[0]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
-        #if __CUDA_ARCH__ >= 1000
         const float2 _scale2_2 = {-1.0f, -1.0f};
         #pragma unroll
         for (int _ls = 0; _ls < 2; _ls++)
             mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(dc_acc)[_ls], _scale2_2);
-        #else
-        #pragma unroll
-        for (int _ls = 0; _ls < 4; _ls++) {
-            dc_acc[_ls] = dc_acc[_ls] * -1.0f;
-        }
-        #endif
         #pragma unroll
         for (int _lp = 0; _lp < 2; _lp++) {
             __half2 _h2 = __float22half2_rn(make_float2(dc_acc[_lp*2 + 0], dc_acc[_lp*2+1 + 0]));
@@ -505,17 +498,10 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
                 : "=f"(dc_acc_3[4]), "=f"(dc_acc_3[(4) + 1]), "=f"(dc_acc_3[(4) + 2]), "=f"(dc_acc_3[(4) + 3])
                 : "r"(d_frag_1[0]), "r"(d_frag_1[1]), "r"(d_frag_1[2]), "r"(d_frag_1[3]), "r"(c_frag_2[2]), "r"(c_frag_2[(2) + 1]), "f"(0.0f), "f"(0.0f), "f"(0.0f), "f"(0.0f));
-            #if __CUDA_ARCH__ >= 1000
             const float2 _scale2_4 = {-1.0f, -1.0f};
             #pragma unroll
             for (int _ls = 0; _ls < 4; _ls++)
                 mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(dc_acc_3)[_ls], _scale2_4);
-            #else
-            #pragma unroll
-            for (int _ls = 0; _ls < 8; _ls++) {
-                dc_acc_3[_ls] = dc_acc_3[_ls] * -1.0f;
-            }
-            #endif
             #pragma unroll
             for (int _lp = 0; _lp < 4; _lp++) {
                 __half2 _h2 = __float22half2_rn(make_float2(dc_acc_3[_lp*2 + 0], dc_acc_3[_lp*2+1 + 0]));
@@ -581,17 +567,10 @@ kernel_cake_gdn_cp_ce1c179ef0e27da84479(const __grid_constant__ CUtensorMap K, f
                 : "+f"(inv64_dc_acc[4]), "+f"(inv64_dc_acc[(4) + 1]), "+f"(inv64_dc_acc[(4) + 2]), "+f"(inv64_dc_acc[(4) + 3])
                 : "r"(inv64_d[0]), "r"(inv64_d[1]), "r"(inv64_d[2]), "r"(inv64_d[3]), "r"(inv64_c[2]), "r"(inv64_c[(2) + 1]));
         }
-        #if __CUDA_ARCH__ >= 1000
         const float2 _scale2_6 = {-1.0f, -1.0f};
         #pragma unroll
         for (int _ls = 0; _ls < 4; _ls++)
             mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(inv64_dc_acc)[_ls], _scale2_6);
-        #else
-        #pragma unroll
-        for (int _ls = 0; _ls < 8; _ls++) {
-            inv64_dc_acc[_ls] = inv64_dc_acc[_ls] * -1.0f;
-        }
-        #endif
         unsigned int inv64_dc_f16[4];
         #pragma unroll
         for (int _lp = 0; _lp < 4; _lp++) {
