@@ -32,7 +32,9 @@ same bits); the backward is one kernel that writes ``dx`` and ``dz``
 exactly as the deterministic backward does, sums the weight gradient of the
 row blocks each CTA takes (its own block when the grid has a CTA for every
 block, else the chunks it claims) in FP32 runs of at most 16 rows folded into
-FP64, and adds each CTA's FP64 column sums into
+FP64 (a CTA of a few blocks adds its runs across its warps in FP32 and
+converts once: at most 16 FP32 roundings a term either way), and adds each
+CTA's FP64 column sums into
 FP64 accumulators of the workspace with atomics; the CTA that arrives last
 rounds the sum once into ``dw`` and zeroes the workspace.  The claimed blocks,
 and so the FP32 runs, and the order of the FP64 additions depend on
@@ -100,20 +102,21 @@ Host design (the input layout rules are the deterministic package's):
   CTAs of 8-row blocks with ``ctas_per_sm = 8``.  When
   ``G`` is the number of row blocks, CTA ``c`` takes block ``c`` and nothing
   is claimed.  Past one wave, thread 0 of every CTA claims every block in
-  chunks of consecutive blocks with a relaxed atomic add on the workspace's
-  claim counter, from a table of halving rounds that ends in one-block
-  chunks: its first chunk as the CTA starts and each next one as the last
-  block of its current chunk starts, so a CTA holds one chunk at a time, a CTA
-  that starts late takes fewer blocks, and a CTA that becomes resident after
-  the table ran out leaves without a row.  Each thread folds its FP32 sums
-  into FP64 after at most 16
-  of its rows.  No kernel is cooperative and no CTA waits for another; no call
-  synchronizes the host or the device, and every kernel runs on the current
-  torch stream.
+  chunks of consecutive blocks with a relaxed atomic increment on the
+  workspace's claim counter, from a table of halving rounds that ends in
+  one-block chunks: its first chunk as the CTA starts and each next one as the
+  last block of its current chunk starts, so a CTA holds one chunk at a time,
+  a CTA that starts late takes fewer blocks, and a CTA that becomes resident
+  after the table ran out leaves without a row.  Each thread folds its FP32
+  sums into FP64 after at most 16 of its rows (a CTA of a few blocks adds them
+  across its warps in FP32 first and converts once).  No kernel is
+  cooperative and no CTA waits for another; no call synchronizes the host or
+  the device, and every kernel runs on the current torch stream.
 - Beside kernels resident on other streams (FlashInfer issue #7548; observed
-  on B200, sm_100a): each 256-thread backward CTA needs 16640 bytes of dynamic
-  shared memory, so a kernel holding every SM with a small shared-memory carveout
-  delays the backward's start until it exits;
+  on B200, sm_100a): each 256-thread backward CTA needs 20736 bytes of dynamic
+  shared memory (each 128-thread CTA of the long backward on sm_107a 10496), so
+  a kernel holding every SM with a small shared-memory carveout delays the
+  backward's start until it exits;
   :mod:`flashinfer.cake_rmsnorm_silu_gate_train` documents the remedy.
 """
 

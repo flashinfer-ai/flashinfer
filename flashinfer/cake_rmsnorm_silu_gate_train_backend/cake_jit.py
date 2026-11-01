@@ -56,8 +56,10 @@ workspace, in chunks of consecutive blocks that shrink to single blocks at
 the end, each CTA claiming its next chunk as the last block of its current
 one starts, so a CTA holds one chunk at a time and one that starts late
 takes fewer blocks.  The kernel folds each thread's FP32 sums into
-FP64 after at most 16 of its rows, so a thread sums at most 16 terms in FP32 at
-any grid: within the deterministic backward's error budget on every input.  No
+FP64 after at most 16 of its rows (a CTA of a few blocks adds them across its
+warps in FP32 first and converts once), so a term passes through at most 16
+FP32 roundings at any grid: within the deterministic backward's error budget
+on every input.  No
 module is cooperative and no CTA waits for another inside a kernel: a kernel
 resident on another stream delays a call roughly in proportion to the SM slots
 it holds, and one that holds resources this kernel needs on every SM can still
@@ -260,7 +262,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 16640,
+            "dynamic_smem_bytes": 20736,
             "use_pdl": False,
         },
         "library": "cake_rmsnorm_silu_gate_train_6055175bf363e85d2936",
@@ -336,7 +338,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 8448,
+            "dynamic_smem_bytes": 10496,
             "use_pdl": False,
         },
         "library": "cake_rmsnorm_silu_gate_train_95cdf33593373841cd45",
@@ -413,7 +415,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 16640,
+            "dynamic_smem_bytes": 20736,
             "use_pdl": False,
         },
         "library": "cake_rmsnorm_silu_gate_train_32301367ce4fa8110271",
@@ -489,7 +491,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 8448,
+            "dynamic_smem_bytes": 10496,
             "use_pdl": False,
         },
         "library": "cake_rmsnorm_silu_gate_train_931f86526ebac3565c37",

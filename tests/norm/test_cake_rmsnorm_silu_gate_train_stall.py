@@ -35,7 +35,7 @@ or at most ``MAX_EXTRA_MS`` above it.  The alone and busy calls alternate in
 pairs, so host launch gaps and clock drift hit both arms alike.
 
 The backward beside a kernel resident on every SM (issue #7548, item 2): each
-CTA of the backward needs 16640 bytes of dynamic shared memory, so a side
+CTA of the backward needs 20736 bytes of dynamic shared memory, so a side
 kernel holding every SM with the default carveout delays its start until the
 side kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_silu_gate_train`).
 The documented remedy is checked here: with the side kernel's preferred
