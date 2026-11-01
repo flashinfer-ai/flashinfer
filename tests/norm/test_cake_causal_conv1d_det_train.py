@@ -858,8 +858,10 @@ def test_main_grid_literal_table() -> None:
 
 # The default backward route's program per ``(arch, S, C)`` below C = 512
 # (``cake_jit.selected_modules``): the ``stage_pair`` fallback of each arch,
-# except on sm_107a for 256 <= C < 512 from S = 262144 tokens, where the
-# ``vec=8, min_blocks=2`` program (four-token copy stages) runs.  The rows are
+# except on sm_100a and sm_103a for 264 <= C < 512, where its
+# ``straddle_rows`` build (the row-group program) runs, and on sm_107a for
+# 256 <= C < 512 from S = 262144 tokens, where the ``vec=8, min_blocks=2``
+# program (four-token copy stages) runs.  The rows are
 # the kernel module's rules-test rows on both sides of the token and channel
 # boundaries; C = 512 is the first channel-selected program of every arch.
 BWD_FALLBACK = {
@@ -868,18 +870,21 @@ BWD_FALLBACK = {
     "sm_107a": "cake_causal_conv1d_det_train_b4f7ff5a3dd9ddd2f41c",
 }
 BWD_R200_ST4 = "cake_causal_conv1d_det_train_9a07bcaa0223632640ee"
+BWD_ROW_GROUP = "cake_causal_conv1d_det_train_8f872e5b653a26ab365d"
 BWD_AT_512 = {
     "sm_100a": "cake_causal_conv1d_det_train_37e428406a0cc4a8ca1b",
     "sm_103a": "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
     "sm_107a": "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
 }
 BWD_SELECTION_TOKENS = (250340, 262143, 262144, 300007)
-BWD_SELECTION_CHANNELS = (128, 248, 255, 256, 384, 504, 511, 512)
+BWD_SELECTION_CHANNELS = (128, 248, 255, 256, 264, 384, 504, 511, 512)
 
 
 def _bwd_selection_of_record(arch: str, S: int, C: int) -> str:
     if C >= 512:
         return BWD_AT_512[arch]
+    if arch in ("sm_100a", "sm_103a") and C >= 264:
+        return BWD_ROW_GROUP
     if arch == "sm_107a" and S >= 262144 and C >= 256:
         return BWD_R200_ST4
     return BWD_FALLBACK[arch]
@@ -898,6 +903,11 @@ def test_backward_selection_literal_table() -> None:
         "tokens": {"sm_107a": 262144},
     }
     assert loader.MODULES[BWD_R200_ST4]["arches"] == ["sm_107a"]
+    assert loader.select_rule(loader.MODULES[BWD_ROW_GROUP]) == {
+        "channels": {"sm_100a": 264, "sm_103a": 264},
+        "kind": "channels_at_least",
+    }
+    assert loader.MODULES[BWD_ROW_GROUP]["arches"] == ["sm_100a", "sm_103a"]
     for arch in loader.ARCHES:
         for S in BWD_SELECTION_TOKENS:
             for C in BWD_SELECTION_CHANNELS:

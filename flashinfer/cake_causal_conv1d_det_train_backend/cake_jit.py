@@ -123,10 +123,14 @@ hashes it so the split programs replaced the cooperative ones under new names);
 the default route's fallback is built with ``vec=8, copy="tma2d",
 stage_pair=True`` (eight channels, 16-byte vectors, per thread; 2-D TMA row
 copies; each eight-token copy stage consumed as two four-token halves, the
-dweight fold buffer in the stage ring) on sm_100a and sm_103a and with
+dweight fold buffer in the stage ring) on sm_100a and sm_103a, where for
+264 <= C < 512 its build with ``straddle_rows=True`` runs instead (the
+channel counts of one channel tile whose vectors are no multiple of 32: one
+bulk copy per sub-tile and stage of each sub-tile's contiguous rows instead
+of a copy loop per warp; ``dx`` and ``dweight`` bitwise the fallback's), and with
 ``min_blocks=2`` (two CTAs per SM) beside those on sm_107a, where for
 256 <= C < 512 from S = 262144 tokens the build of ``vec=8, min_blocks=2``
-(four-token copy stages, no ``stage_pair``) runs instead, and the backwards
+(four-token copy stages, no ``stage_pair``) runs instead, and the other backwards
 the ``channels_at_least`` rules select, builds of ``vec=8, copy="tma2d",
 stage_tokens=8, min_blocks=2`` (eight-token stages, two CTAs per SM): as is
 on sm_100a from C = 512 and on sm_103a from 768, with ``fold_overlap=True,
@@ -2157,6 +2161,91 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 5,
         },
     },
+    # Rendered by the exporter from the family adapter's scaffold: the backward
+    # with vec 8, copy tma2d, stage_pair, straddle_rows
+    # (3 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_det_train_8f872e5b653a26ab365d": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 3,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_100a": 1,
+                "sm_103a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_det_train_8f872e5b653a26ab365d",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_8f872e5b653a26ab365d",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 66560,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_8f872e5b653a26ab365d",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
+        "role": "bwd",
+        "select_rule": {
+            "channels": {
+                "sm_100a": 264,
+                "sm_103a": 264,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
     # The reduce program every backward route shares: the second launch of a
     # backward call.  Launched programmatically dependent on the main program
     # (``use_pdl``: the binding sets the programmatic-stream-serialization
@@ -2436,6 +2525,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "bwd": [
             "cake_causal_conv1d_det_train_9bfa65707a49df6a48ce",
             "cake_causal_conv1d_det_train_37e428406a0cc4a8ca1b",
+            "cake_causal_conv1d_det_train_8f872e5b653a26ab365d",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_det_train_2d91e5f926238453c78c",
@@ -2468,6 +2558,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_det_train_9bfa65707a49df6a48ce",
             "cake_causal_conv1d_det_train_37e428406a0cc4a8ca1b",
             "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
+            "cake_causal_conv1d_det_train_8f872e5b653a26ab365d",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_det_train_2d91e5f926238453c78c",
