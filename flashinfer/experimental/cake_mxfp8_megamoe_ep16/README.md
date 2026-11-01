@@ -2,8 +2,7 @@
 
 This directory contains experimental JIT-only CUDA and CuTe-DSL backends for a
 fixed MXFP8 MegaMoE configuration on SM100, SM103 and SM107 devices (compute
-capability 10.0, 10.3 or 10.7). The CuTe-DSL backend supports SM100 and SM103
-only; SM107 uses the CUDA backend.
+capability 10.0, 10.3 or 10.7).
 
 The public entry points are
 `flashinfer.moe_ep.CakeMxfp8MegaMoeEp16` and
@@ -27,8 +26,7 @@ output = session.run(
 Omit `backend` or pass `backend="cuda"` for the CUDA implementation. Every rank
 in the process group must choose the same backend. This agreement is checked
 collectively before symmetric workspace allocation. There is no automatic
-backend selection or fallback. On SM107, `backend="cute_dsl"` raises after
-this agreement.
+backend selection or fallback.
 
 CuTe-DSL requires the appropriate FlashInfer CUDA extra (`cu12` or `cu13`) and
 its CUTLASS DSL dependency. The CuTe modules are loaded lazily only when this
@@ -49,8 +47,12 @@ forward path.
   route-term words, which the reducer waits on. The host binding selects the
   symbol by token count.
 - the ordered route reducer and the tvm-ffi binding;
-- `cute/`: the CuTe-DSL fused kernel (`compile_program(return_all_cta, arch)`)
-  and reducer (`compile_program(arch)`).
+- `cute/`: the CuTe-DSL programs, one per architecture: the fused kernel with
+  the CTA-0 return (`..._fused_<arch>.py`, 16 and 64 tokens per rank) and with
+  the all-CTA return (`..._fused_return_all_cta_<arch>.py`, 32 tokens per
+  rank), and the reducer (`..._topk_reduce_<arch>.py`). Each defines
+  `compile_program(*options, ranks, aligned)` for its own architecture and a
+  host check of the launch arguments.
 
 The JIT loader builds one module per admitted architecture that is also a
 FlashInfer build target (`FLASHINFER_CUDA_ARCH_LIST` or the visible devices):
@@ -73,16 +75,19 @@ The top-k reducer waits for every route term of the forward. Routing outside
 this contract (for example routing changed in place after the session is
 created) leaves route terms unwritten and hangs the forward on all ranks.
 
-End-to-end EP16 correctness and performance were measured on 16 GB300 GPUs
-(SM103) and, for the CUDA backend, on 16 R200 GPUs (SM107, four nodes of one
-NVL72 domain). The SM100 target is admitted from the same source: the device
-text has no architecture-dependent code and uses only instructions shared by
-all three targets; it is compile-proven on B200, and the 16-rank test has not
-been run there.
+End-to-end EP16 correctness and performance were measured for both backends on
+16 GB300 GPUs (SM103) and on 16 R200 GPUs (SM107, four nodes of one NVL72
+domain). Both backends return bitwise-identical outputs there; the CuTe-DSL
+forward takes about 5% to 7% longer than the CUDA forward at 16 to 64 tokens per
+rank. The SM100 target is admitted from the same source: the device text has no
+architecture-dependent code and uses only instructions shared by all three
+targets; it is compile-proven on B200, and the 16-rank test has not been run
+there.
 
 CUDA session construction materializes eight fixed-address TMA descriptors with
-one setup kernel. CuTe-DSL prepares tensor-map dimensions and strides on the
-host and passes descriptors by value through the compiled host entry.
+one setup kernel. The CuTe-DSL host entry encodes the tensor maps from the bound
+tensors and passes them by value; its host check validates the bound geometry
+once at session construction.
 
 Both implementations synchronize before session construction returns. Each
 forward then uses exactly two kernels: the first publishes and dispatches BF16

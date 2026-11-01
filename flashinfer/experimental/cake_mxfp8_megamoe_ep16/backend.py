@@ -435,8 +435,7 @@ class CakeMxfp8MegaMoeEp16:
     owns all symmetric memory and scratch storage. A session must be used
     serially from one CUDA stream. :meth:`run` submits without allocating, and
     CUDA Graph capture is not supported. ``backend="cute_dsl"`` explicitly
-    selects the CuTe-DSL implementation on SM100 and SM103; ``"cuda"`` remains
-    the default and is the only backend on SM107.
+    selects the CuTe-DSL implementation; ``"cuda"`` remains the default.
     """
 
     def __init__(

@@ -204,15 +204,23 @@ for kwargs in ({}, {"backend": "cuda"}):
     subprocess.run([sys.executable, "-c", code], check=True, env=env, timeout=120)
 
 
-def test_cute_peer_arguments_preserve_all_address_bits() -> None:
+def test_cute_peer_tables_preserve_all_address_bits() -> None:
     from flashinfer.experimental.cake_mxfp8_megamoe_ep16.cute_dsl import (
-        _peer_arguments,
+        _peer_table,
     )
 
     active = (1, 2**63 - 1, 2**63, 2**64 - 1, *range(5, 17))
     pointers = active + (0,) * 16
-    packed = _peer_arguments(SimpleNamespace(peer_pointers=pointers))
-    assert packed == (1, 2**63 - 1, -(2**63), -1, *range(5, 17), *((0,) * 16))
+    table = _peer_table(SimpleNamespace(peer_pointers=pointers))
+    assert table.dtype == torch.int64 and table.device.type == "cpu"
+    assert tuple(table.tolist()) == (
+        1,
+        2**63 - 1,
+        -(2**63),
+        -1,
+        *range(5, 17),
+        *((0,) * 16),
+    )
     assert pointers == active + (0,) * 16
 
 
@@ -232,16 +240,17 @@ def test_cute_peer_arguments_preserve_all_address_bits() -> None:
         (1,) * 16 + (False,) + (0,) * 15,
     ),
 )
-def test_cute_peer_arguments_reject_invalid_tables(pointers) -> None:
+def test_cute_peer_tables_reject_invalid_tables(pointers) -> None:
     from flashinfer.experimental.cake_mxfp8_megamoe_ep16.cute_dsl import (
-        _peer_arguments,
+        _peer_table,
     )
 
     with pytest.raises(ValueError):
-        _peer_arguments(SimpleNamespace(peer_pointers=pointers))
+        _peer_table(SimpleNamespace(peer_pointers=pointers))
 
 
-def test_cute_source_key_covers_kernel_and_adapter_dependencies() -> None:
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+def test_cute_source_key_covers_kernel_and_adapter_dependencies(arch) -> None:
     from flashinfer.experimental.cake_mxfp8_megamoe_ep16 import cute_dsl
     from flashinfer.jit import cute_dsl_core
 
@@ -249,8 +258,9 @@ def test_cute_source_key_covers_kernel_and_adapter_dependencies() -> None:
     flashinfer_root = package.parent.parent
     generated = package / "csrc" / "cake_mxfp8_megamoe_ep16" / "cute"
     expected = {
-        generated / "cake_mxfp8_megamoe_ep16_fused.py",
-        generated / "cake_mxfp8_megamoe_ep16_topk_reduce.py",
+        generated / f"cake_mxfp8_megamoe_ep16_fused_{arch}.py",
+        generated / f"cake_mxfp8_megamoe_ep16_fused_return_all_cta_{arch}.py",
+        generated / f"cake_mxfp8_megamoe_ep16_topk_reduce_{arch}.py",
         package / "cute_dsl.py",
         package / "backend.py",
         package / "jit.py",
@@ -258,7 +268,7 @@ def test_cute_source_key_covers_kernel_and_adapter_dependencies() -> None:
         flashinfer_root / "moe_ep" / "cake_mxfp8_megamoe_ep16.py",
         Path(cute_dsl_core.__file__).resolve(),
     }
-    actual = tuple(Path(path) for path in cute_dsl._source_files())
+    actual = tuple(Path(path) for path in cute_dsl._source_files(arch))
     assert len(actual) == len(set(actual))
     assert set(actual) == expected
     assert all(path.is_file() for path in actual)
@@ -269,7 +279,7 @@ def test_cute_source_key_changes_for_each_dependency(tmp_path) -> None:
     from flashinfer.jit.cute_dsl_core import _hash_source_files
 
     flashinfer_root = Path(cute_dsl.__file__).resolve().parents[2]
-    sources = cute_dsl._source_files()
+    sources = cute_dsl._source_files("sm_103a")
     original_key = _hash_source_files(sources)
     copies = []
     for name in sources:
@@ -350,39 +360,14 @@ def test_sm107a_target_requires_cuda_13_4(monkeypatch) -> None:
     assert _jit.require_supported_capability((10, 3)) == (10, 3)
 
 
-def test_cute_dsl_backend_keeps_sm100_and_sm103_targets(monkeypatch) -> None:
+def test_cute_dsl_backend_targets_every_supported_capability(monkeypatch) -> None:
     monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a 10.7a")
     monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
-    assert _jit.CUTE_DSL_CAPABILITIES == ((10, 0), (10, 3))
+    assert _jit.CUTE_DSL_CAPABILITIES == ((10, 0), (10, 3), (10, 7))
     for capability in _jit.CUTE_DSL_CAPABILITIES:
         assert _jit.require_cute_dsl_capability(capability) == capability
-    assert _jit.require_supported_capability((10, 7)) == (10, 7)
-    with pytest.raises(RuntimeError, match="backend='cute_dsl' requires"):
-        _jit.require_cute_dsl_capability((10, 7))
-
-
-def test_cute_dsl_backend_is_rejected_on_sm107_after_agreement(monkeypatch) -> None:
-    gathered = []
-
-    def all_gather_object(output, selected, *, group):
-        output[:] = [selected] * 16
-        gathered.append(selected)
-
-    monkeypatch.setattr(dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
-    monkeypatch.setattr(dist, "get_world_size", lambda group: 16)
-    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 7))
-    monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
-    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.7a")
-
-    with pytest.raises(RuntimeError, match="backend='cute_dsl' requires"):
-        _CakeMxfp8MegaMoeEp16Session(
-            None, None, process_group=object(), backend="cute_dsl"
-        )
-    # Every rank agrees on the backend before the capability check raises.
-    assert gathered == ["cute_dsl"]
+    with pytest.raises(RuntimeError, match="requires compute capability"):
+        _jit.require_cute_dsl_capability((9, 0))
 
 
 @pytest.mark.parametrize(
@@ -403,36 +388,39 @@ def test_jit_spec_is_exact_per_capability(monkeypatch, capability, arch) -> None
     assert len(spec.sources) == 3
 
 
-def test_cute_compile_program_takes_variant_and_architecture() -> None:
-    for role, parameters in (
-        ("fused", ["return_all_cta", "arch"]),
-        ("topk_reduce", ["arch"]),
-    ):
-        tree = ast.parse(_jit.cute_dsl_source(role).read_text())
-        functions = {
-            node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
-        }
-        assert [a.arg for a in functions["compile_program"].args.args] == parameters
-        targets = [
-            node.value
-            for node in tree.body
-            if isinstance(node, ast.Assign)
-            and [getattr(t, "id", "") for t in node.targets] == ["CAKE_TARGET_ARCHES"]
-        ]
-        assert len(targets) == 1
-        assert list(ast.literal_eval(targets[0])) == [
-            _jit.device_arch(capability) for capability in _jit.CUTE_DSL_CAPABILITIES
-        ]
-    fused = ast.parse(_jit.cute_dsl_source("fused").read_text())
-    guards = [
-        node
-        for node in ast.walk(fused)
-        if isinstance(node, ast.If)
-        and isinstance(node.test, ast.Call)
-        and getattr(node.test.func, "attr", "") == "const_expr"
-        and getattr(node.test.args[0], "id", "") == "return_all_cta"
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+@pytest.mark.parametrize("role", ("fused", "fused_return_all_cta", "topk_reduce"))
+def test_cute_program_targets_one_architecture(role, arch) -> None:
+    from flashinfer.experimental.cake_mxfp8_megamoe_ep16 import cute_dsl
+
+    tree = ast.parse(_jit.cute_dsl_source(role, arch).read_text())
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    compile_program = functions["compile_program"].args
+    assert compile_program.vararg.arg == "options"
+    assert [a.arg for a in compile_program.kwonlyargs] == ["ranks", "aligned"]
+    ranks = ast.literal_eval(compile_program.kw_defaults[0])
+    expected = (
+        cute_dsl._REDUCE_RANKS if role == "topk_reduce" else cute_dsl._FUSED_RANKS
+    )
+    assert len(ranks) == len(expected)
+    assert len([name for name in functions if name.startswith("check_launch_")]) == 1
+    kernels = [
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and any(ast.unparse(d) == "cute.kernel" for d in node.decorator_list)
     ]
-    assert guards and all(node.orelse for node in guards)
+    symbol = f"kernel_cake_mxfp8_megamoe_ep16_{role}"
+    assert kernels == [symbol if arch == "sm_100a" else f"{symbol}_{arch}"]
+    targets = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and [getattr(t, "id", "") for t in node.targets] == ["CAKE_TARGET_ARCH"]
+    ]
+    assert len(targets) == 1 and ast.literal_eval(targets[0]) == arch
 
 
 def test_jit_resolves_flashinfer_headers() -> None:
@@ -691,15 +679,6 @@ def test_ep16_sparse_reference_and_repeated_result(backend) -> None:
         with pytest.raises(ValueError, match="backend must be 'cuda' or 'cute_dsl'"):
             CakeMxfp8MegaMoeEp16(None, None, backend="invalid" if rank == 0 else "cuda")
         dist.barrier()
-        if backend == "cute_dsl" and torch.cuda.get_device_capability(device) == (
-            10,
-            7,
-        ):
-            # SM107 runs the CUDA backend only; every rank rejects CuTe-DSL.
-            with pytest.raises(RuntimeError, match="backend='cute_dsl' requires"):
-                CakeMxfp8MegaMoeEp16(None, None, backend=backend)
-            dist.barrier()
-            return
         w13, w2 = _make_sparse_expert_weights(rank, device)
         weights = preprocess_cake_mxfp8_megamoe_ep16_weights(w13, w2)
         del w13, w2

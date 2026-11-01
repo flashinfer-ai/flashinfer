@@ -208,9 +208,21 @@
         "--use_fast_math"
       ],
       "cute_dsl": {
-        "flag": "return_all_cta",
-        "fused": "csrc/cake_mxfp8_megamoe_ep16/cute/cake_mxfp8_megamoe_ep16_fused.py",
-        "topk_reduce": "csrc/cake_mxfp8_megamoe_ep16/cute/cake_mxfp8_megamoe_ep16_topk_reduce.py"
+        "fused": {
+          "sm_100a": "csrc/cake_mxfp8_megamoe_ep16/cute/cake_mxfp8_megamoe_ep16_fused_sm_100a.py",
+          "sm_103a": "csrc/cake_mxfp8_megamoe_ep16/cute/cake_mxfp8_megamoe_ep16_fused_sm_103a.py",
+          "sm_107a": "csrc/cake_mxfp8_megamoe_ep16/cute/cake_mxfp8_megamoe_ep16_fused_sm_107a.py"
+        },
+        "fused_return_all_cta": {
+          "sm_100a": "csrc/cake_mxfp8_megamoe_ep16/cute/cake_mxfp8_megamoe_ep16_fused_return_all_cta_sm_100a.py",
+          "sm_103a": "csrc/cake_mxfp8_megamoe_ep16/cute/cake_mxfp8_megamoe_ep16_fused_return_all_cta_sm_103a.py",
+          "sm_107a": "csrc/cake_mxfp8_megamoe_ep16/cute/cake_mxfp8_megamoe_ep16_fused_return_all_cta_sm_107a.py"
+        },
+        "topk_reduce": {
+          "sm_100a": "csrc/cake_mxfp8_megamoe_ep16/cute/cake_mxfp8_megamoe_ep16_topk_reduce_sm_100a.py",
+          "sm_103a": "csrc/cake_mxfp8_megamoe_ep16/cute/cake_mxfp8_megamoe_ep16_topk_reduce_sm_103a.py",
+          "sm_107a": "csrc/cake_mxfp8_megamoe_ep16/cute/cake_mxfp8_megamoe_ep16_topk_reduce_sm_107a.py"
+        }
       },
       "delivered_revision": "426d028e18a270b60a1ac72306b29754bf087c67"
     }

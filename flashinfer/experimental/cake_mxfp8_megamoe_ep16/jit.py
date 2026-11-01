@@ -53,8 +53,9 @@ _ARCH_FLAGS: dict[tuple[int, int], tuple[str, list[str]]] = {
 # Capabilities whose target needs a newer CUDA toolkit than FlashInfer's minimum.
 _MIN_CUDA: dict[tuple[int, int], str] = {(10, 7): "13.4"}
 SUPPORTED_CAPABILITIES = tuple(sorted(_ARCH_FLAGS))
-# The CuTe-DSL backend keeps its SM100/SM103 targets; SM107 runs the CUDA backend.
-CUTE_DSL_CAPABILITIES = ((10, 0), (10, 3))
+# The CuTe-DSL backend has one generated program per admitted architecture.
+CUTE_DSL_CAPABILITIES = SUPPORTED_CAPABILITIES
+_CUTE_DSL_ROLES = ("fused", "fused_return_all_cta", "topk_reduce")
 
 
 def _get_csrc_root() -> Path:
@@ -221,11 +222,17 @@ def load_cake_mxfp8_megamoe_ep16_module(*, device: Any = None) -> Any:
     )
 
 
-def cute_dsl_source(role: str) -> Path:
-    """Path of a generated CuTe DSL device source (``fused`` or ``topk_reduce``)."""
+def cute_dsl_source(role: str, arch: str) -> Path:
+    """Path of the generated CuTe DSL program of ``role`` for ``arch``.
 
+    ``role`` is ``fused`` (CTA-0 return), ``fused_return_all_cta`` (all-CTA
+    return) or ``topk_reduce``; ``arch`` is ``sm_100a``, ``sm_103a`` or ``sm_107a``.
+    """
+
+    if role not in _CUTE_DSL_ROLES:
+        raise ValueError(f"unknown CuTe DSL program role {role!r}")
     csrc_root, manifest = _read_manifest()
-    relative = manifest["sequences"][0]["cute_dsl"][role]
+    relative = manifest["sequences"][0]["cute_dsl"][role][arch]
     return csrc_root / Path(*Path(relative).parts[1:])
 
 
