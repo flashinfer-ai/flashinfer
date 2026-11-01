@@ -2108,8 +2108,9 @@ def cudnn_batch_prefill_with_kv_cache(
     k_scale : Optional[torch.Tensor]
         Key calibration scale, with the same contract as ``q_scale``.
     v_scale : Optional[torch.Tensor]
-        Value calibration scale, with the same scalar forms as ``q_scale``.
-        On the graph path it scales O without changing LSE.
+        Value calibration scale. On the graph path, FP16/BF16 also accept
+        tensors broadcastable to O, including noncontiguous views. FP8 retains
+        the scalar forms of ``q_scale``. Scaling O does not change LSE.
     batch_offsets_q : Optional[torch.Tensor]
         Cumulative per-request start offsets into the packed query tensor,
         shape ``(batch_size + 1,)``, int32, on GPU, in the units given by
@@ -2300,7 +2301,7 @@ def cudnn_batch_prefill_with_kv_cache(
         if half_scales:
             # sdpa has no FP8 descale inputs. Fold Q/K calibration into the
             # score scale; device scalars stay on device and change on replay.
-            for calibration in (scale, q_scale, k_scale, v_scale):
+            for calibration in (scale, q_scale, k_scale):
                 if isinstance(calibration, torch.Tensor) and (
                     calibration.dtype != torch.float32
                     or calibration.numel() != 1
@@ -2404,7 +2405,9 @@ def cudnn_batch_prefill_with_kv_cache(
         ):
             # Match the wrapper's FA2 contract: scale O, leaving Stats intact.
             out.mul_(
-                v_scale.reshape(()) if isinstance(v_scale, torch.Tensor) else v_scale
+                v_scale.reshape(())
+                if isinstance(v_scale, torch.Tensor) and v_scale.numel() == 1
+                else v_scale
             )
         return result
     else:

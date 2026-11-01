@@ -916,13 +916,11 @@ def test_paged_query_lengths_are_independent_of_storage_offsets(
     if backend == "auto":
         if (
             not prefill._cudnn_supports_paged_auto()
-            or torch.cuda.get_device_capability() != (10, 0)
+            or torch.cuda.get_device_capability() not in {(10, 0), (10, 7)}
         ):
-            pytest.skip("requires the qualified SM100 paged-auto runtime")
+            pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
         # Exercise bounded declarations without depending on a heuristic winner.
-        monkeypatch.setattr(
-            flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: True
-        )
+        monkeypatch.setattr(flashinfer.prefill, "_paged_auto_cudnn", lambda *a: True)
     # A previous test's cached graph must not bypass this provider control.
     monkeypatch.setattr(
         prefill,
@@ -1042,10 +1040,10 @@ def test_paged_query_lengths_are_independent_of_storage_offsets(
 @pytest.mark.parametrize("metadata_device", ["cpu", "cuda"])
 def test_paged_auto_device_lengths_do_not_add_readback(metadata_device):
     if (
-        torch.cuda.get_device_capability() != (10, 0)
+        torch.cuda.get_device_capability() not in ((10, 0), (10, 7))
         or not prefill._cudnn_supports_paged_auto()
     ):
-        pytest.skip("requires the qualified SM100 paged-auto runtime")
+        pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
     device = torch.device("cuda")
     q = torch.randn(128, 16, 128, device=device, dtype=torch.bfloat16)
     k = torch.randn(512, 4, 16, 128, device=device, dtype=q.dtype)
@@ -1099,6 +1097,99 @@ def test_paged_auto_device_lengths_do_not_add_readback(metadata_device):
     out, lse = w.run(q, (k, v), return_lse=True)
     torch.testing.assert_close(out, ref_o, atol=0.02, rtol=0.02)
     torch.testing.assert_close(lse, ref_lse, atol=0.004, rtol=0.004)
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("q_length, expected_backend", [(128, "cudnn"), (129, "fa2")])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_paged_auto_sm107_short_prefix_boundary(
+    q_length, expected_backend, use_cuda_graph
+):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("requires native SM107")
+    if not prefill._cudnn_supports_paged_auto():
+        pytest.skip("requires the qualified paged-auto cuDNN runtime")
+    # Exercise the real auto wrapper on both sides of the new boundary. A
+    # missing cuDNN admission must fail here, not turn into a skipped test.
+    torch.manual_seed(7)
+    device = torch.device("cuda")
+    q = torch.randn(q_length, 16, 128, device=device, dtype=torch.bfloat16)
+    k = torch.randn(512, 4, 16, 128, device=device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    qo = torch.tensor([0, q_length], dtype=torch.int32)
+    ip = torch.tensor([0, 512], dtype=torch.int32)
+    ix = torch.arange(512, dtype=torch.int32).roll(17)
+    last = torch.tensor([16], dtype=torch.int32)
+    graph_buffers = (
+        dict(
+            qo_indptr_buf=torch.empty_like(qo, device=device),
+            paged_kv_indptr_buf=torch.empty_like(ip, device=device),
+            paged_kv_indices_buf=torch.empty_like(ix, device=device),
+            paged_kv_last_page_len_buf=torch.empty_like(last, device=device),
+            max_total_num_rows=q_length,
+        )
+        if use_cuda_graph
+        else {}
+    )
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, device=device, dtype=torch.uint8),
+        "HND",
+        backend="auto",
+        use_cuda_graph=use_cuda_graph,
+        **graph_buffers,
+    )
+    wrapper.plan(
+        qo,
+        ip,
+        ix,
+        last,
+        16,
+        4,
+        128,
+        16,
+        causal=True,
+        q_data_type=q.dtype,
+        max_token_per_sequence=q_length,
+        max_sequence_kv=8192,
+    )
+    assert wrapper._backend == expected_backend
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[:2], device=device, dtype=torch.float32)
+
+    def run():
+        wrapper.run(q, (k, v), out=out, lse=lse, return_lse=True, lse_base="ln")
+
+    def check():
+        # CPU reference avoids depending on a second GPU attention provider.
+        expected, stats = _reference(
+            q.cpu(),
+            k.transpose(1, 2).cpu(),
+            v.transpose(1, 2).cpu(),
+            qo,
+            ip,
+            ix,
+            last,
+            causal=True,
+            scale=128**-0.5,
+        )
+        torch.testing.assert_close(out.cpu().float(), expected, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(lse.cpu(), stats, atol=0.004, rtol=0.004)
+        assert wrapper._backend == expected_backend
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run()
+        q.mul_(0.75)
+        v.mul_(0.5)
+        out.fill_(torch.nan)
+        lse.fill_(torch.nan)
+        graph.replay()
+        check()
+    finally:
+        graph.reset()
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
@@ -1377,6 +1468,72 @@ def test_prefill_scales_capture_replay(paged, scale_type, dtype):
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scale_kind", ["head", "token", "strided"])
+def test_prefill_broadcast_v_scale_capture_replay(paged, dtype, scale_kind):
+    if not prefill._cudnn_supports_direct_seqlens(dtype, mixed=paged):
+        pytest.skip("requires direct cuDNN cumulative sequence lengths")
+    q, k, v, qo, ip, ix, last = _paged_inputs()
+    q, k, v = (tensor.to(dtype) for tensor in (q, k, v))
+    workspace = torch.empty(128 << 20, device=q.device, dtype=torch.uint8)
+    kwargs = dict(causal=True, q_data_type=dtype)
+    if paged:
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, "NHD", backend="cudnn"
+        )
+        wrapper.plan(qo, ip, ix, last, 8, 2, 128, 16, **kwargs)
+        inputs = (q, (k, v))
+    else:
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            workspace, backend="cudnn"
+        )
+        wrapper.plan(
+            qo, torch.tensor([0, 33, 50], dtype=torch.int32), 8, 2, 128, **kwargs
+        )
+        keys, values = (
+            torch.cat([t[ix[:3]].flatten(0, 1)[:33], t[ix[3:]].flatten(0, 1)[:17]])
+            for t in (k, v)
+        )
+        inputs = (q, keys, values)
+    shape = (
+        (5, 1, 1)
+        if scale_kind == "token"
+        else (16 if scale_kind == "strided" else 8, 1)
+    )
+    v_scale = torch.linspace(
+        0.25, 1.25, torch.Size(shape).numel(), device=q.device
+    ).reshape(shape)
+    if scale_kind == "strided":
+        v_scale = v_scale[::2]
+        assert not v_scale.is_contiguous()
+
+    def run():
+        return wrapper.run(*inputs, v_scale=v_scale, return_lse=True, lse_base="ln")
+
+    def check(out, lse):
+        reference, stats = _reference(
+            q, k, v, qo, ip, ix, last, causal=True, scale=128**-0.5
+        )
+        torch.testing.assert_close(
+            out.float(), reference * v_scale, atol=0.015, rtol=0.015
+        )
+        torch.testing.assert_close(lse, stats, atol=0.003, rtol=0.003)
+
+    out, lse = run()
+    check(out, lse)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = run()
+    q.neg_()
+    v_scale.mul_(0.5)
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    graph.replay()
+    check(out, lse)
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize(
     "q_lengths,kv_lengths",
     [([128], [8192]), ([1024, 1536], [1024, 1536]), ([128, 1536], [1024, 1536])],
@@ -1384,10 +1541,10 @@ def test_prefill_scales_capture_replay(paged, scale_type, dtype):
 )
 def test_paged_auto_preserves_runtime_scales(q_lengths, kv_lengths):
     if (
-        torch.cuda.get_device_capability() != (10, 0)
+        torch.cuda.get_device_capability() not in ((10, 0), (10, 7))
         or not prefill._cudnn_supports_paged_auto()
     ):
-        pytest.skip("requires the qualified SM100 paged-auto runtime")
+        pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
     torch.manual_seed(19)
     counts = [length // 16 for length in kv_lengths]
     q = torch.randn(sum(q_lengths), 16, 128, device="cuda", dtype=torch.bfloat16)
@@ -1922,9 +2079,7 @@ def test_paged_auto_fallback_refreshes_retained_capture(
     # refreshing a retained FA2 schedule, while eager wrappers may switch freely.
     initially_cudnn = capture_backend == "cudnn"
     admitted = [initially_cudnn]
-    monkeypatch.setattr(
-        flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: admitted[0]
-    )
+    monkeypatch.setattr(flashinfer.prefill, "_paged_auto_cudnn", lambda *a: admitted[0])
     q, k, v, qo, ip, ix, last = _paged_inputs()
     ix = ix.cuda()
     out = torch.empty_like(q)
@@ -2030,9 +2185,9 @@ def test_paged_auto_capture_reserves_initialized_page_capacity(
 ):
     if (
         not prefill._cudnn_supports_paged_auto()
-        or torch.cuda.get_device_capability() != (10, 0)
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 7))
     ):
-        pytest.skip("requires the qualified SM100 paged-auto runtime")
+        pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
     # Check backend viability even when default heuristics prefer FROST.
     if backend_only:
         monkeypatch.setattr(
@@ -2040,9 +2195,7 @@ def test_paged_auto_capture_reserves_initialized_page_capacity(
         )
     # Select the provider independently of evolving performance heuristics.
     admitted = [True]
-    monkeypatch.setattr(
-        flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: admitted[0]
-    )
+    monkeypatch.setattr(flashinfer.prefill, "_paged_auto_cudnn", lambda *a: admitted[0])
     q = torch.randn(64, 8, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(page_capacity, 16, 2, 128, device=q.device, dtype=q.dtype)
     v = torch.randn_like(k)
@@ -2124,13 +2277,11 @@ def test_paged_auto_query_capacity_switch_preserves_capture(
 ):
     if (
         not prefill._cudnn_supports_paged_auto()
-        or torch.cuda.get_device_capability() != (10, 0)
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 7))
     ):
-        pytest.skip("requires the qualified SM100 paged-auto runtime")
+        pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
     # Exercise capacity changes independently of evolving performance heuristics.
-    monkeypatch.setattr(
-        flashinfer.prefill, "_blackwell_paged_auto_cudnn", lambda *a: True
-    )
+    monkeypatch.setattr(flashinfer.prefill, "_paged_auto_cudnn", lambda *a: True)
     torch.manual_seed(43)
     q = torch.randn(128, 8, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(256, 16, 2, 128, device="cuda", dtype=q.dtype)
