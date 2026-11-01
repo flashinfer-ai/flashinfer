@@ -1958,8 +1958,10 @@ def tinygemm_bf16(
         Enable Programmatic Dependent Launch (stream serialization).  When
         ``True``, the kernel uses ``cudaGridDependencySynchronize()`` to overlap
         DMA with the preceding kernel's compute.  Only enable when ALL preceding
-        stream operations also use PDL, otherwise the kernel hangs.  Defaults to
-        ``False``.
+        stream operations also use PDL, otherwise the kernel hangs.  The kernel
+        may read ``weight`` and ``bias`` before that dependency wait, so the
+        preceding kernel must not write them; only ``input`` may be its output.
+        Defaults to ``False``.
 
     Notes
     -----
