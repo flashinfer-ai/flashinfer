@@ -324,14 +324,15 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: on parts of exactly that SM count under the same rule, in two jobs on different parts, at 16172 to 16384 tokens).
 #: Such a part takes the table of its own SM count only, and only at the token counts of
 #: :data:`K1_SPLIT_RULES_BY_SM_TOKENS`; a part without one, and every other token count, runs every K1 row on the
-#: deterministic program.  The sm_107a tables were measured on 208-SM and 212-SM R200 parts.  On 208 SMs the rows whose
-#: deterministic program is a stream-K launch (``4096 -> 32`` and ``4096 -> 64`` BF16, ``5120 -> 32`` BF16,
-#: ``6144 -> 32``, ``8192 -> 128``) stay on it: launches of that program next to a kernel holding SMs on another stream
-#: did not complete there, so those rows have no measured verdict; on 212 SMs the same happened to ``4096 -> 64``,
-#: ``5120 -> 32`` and ``6144 -> 32`` BF16.  On 212 SMs ``6144 -> 32`` FP32 takes two splits (three are not faster than
-#: the deterministic plan in every run) and ``4096 -> 4096`` FP32 256-wide tiles at one split (128 CTAs), where the
-#: 216-SM candidate (128-wide tiles, 216 CTAs) misses next to a kernel holding 32 SMs.  On 208 SMs ``4096 -> 4096`` FP32
-#: and ``5120 -> 1024`` BF16 are not faster than the deterministic plan in every run (a part at a lower SM clock).
+#: deterministic program.  The sm_107a tables were measured on 208-SM and 212-SM R200 parts.  Rows whose deterministic
+#: program is a stream-K launch that did not complete next to a kernel holding SMs on another stream have no measured
+#: verdict and stay on it, on 208 and on 212 SMs: ``4096 -> 32`` and ``4096 -> 64`` BF16, ``5120 -> 32`` BF16 and
+#: ``6144 -> 32``.  On 212 SMs ``4096 -> 4096`` FP32 takes 256-wide tiles at one split (256 tiles on a grid of one CTA
+#: per SM), where 128-wide tiles at one split (512 tiles on the same grid, the candidate that missed on 216 SMs) were
+#: more than 3 % slower than the deterministic plan in some graph replays behind a kernel holding 8 to 32 SMs.  Not
+#: faster than the deterministic plan in every run on 208 SMs (one of the parts runs at a lower SM clock):
+#: ``8192 -> 128``, ``4096 -> 4096`` FP32 and ``5120 -> 1024`` BF16; the last also runs the deterministic program on 212
+#: SMs, where it is 1.3 to 2.5 % faster.
 # fmt: off
 K1_SPLIT_RULES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]]
@@ -352,7 +353,7 @@ K1_SPLIT_RULES_BY_SM: dict[
         ("sm_107a", 1, 8192, 128, "bf16"): None, ("sm_107a", 1, 8192, 128, "f32"): None,
     },
     ("sm_107a", 212): {
-        ("sm_107a", 1, 4096, 32, "bf16"): (64, 4), ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
+        ("sm_107a", 1, 4096, 32, "bf16"): None, ("sm_107a", 1, 4096, 32, "f32"): (64, 3),
         ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
         ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
         ("sm_107a", 1, 4096, 512, "bf16"): None, ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
@@ -362,8 +363,8 @@ K1_SPLIT_RULES_BY_SM: dict[
         ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
         ("sm_107a", 1, 5120, 64, "f32"): (64, 3),
         ("sm_107a", 1, 5120, 512, "f32"): (128, 1),
-        ("sm_107a", 1, 5120, 1024, "bf16"): (256, 1), ("sm_107a", 1, 5120, 1024, "f32"): (256, 1),
-        ("sm_107a", 1, 6144, 32, "bf16"): None, ("sm_107a", 1, 6144, 32, "f32"): (64, 2),
+        ("sm_107a", 1, 5120, 1024, "bf16"): None, ("sm_107a", 1, 5120, 1024, "f32"): (256, 1),
+        ("sm_107a", 1, 6144, 32, "bf16"): None, ("sm_107a", 1, 6144, 32, "f32"): None,
         ("sm_107a", 1, 8192, 128, "bf16"): (128, 2), ("sm_107a", 1, 8192, 128, "f32"): (128, 2),
     },
 }

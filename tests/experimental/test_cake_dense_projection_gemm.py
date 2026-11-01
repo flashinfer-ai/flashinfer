@@ -532,7 +532,7 @@ SM_COUNTS = {"sm_100a": 148, "sm_103a": 152, "sm_107a": 216}
         ("sm_103a", 152, 32),
         ("sm_103a", 148, 28),
         ("sm_107a", 216, 34),
-        ("sm_107a", 212, 32),
+        ("sm_107a", 212, 26),
         ("sm_107a", 208, 20),
         ("sm_107a", 210, 0),
     ],
@@ -540,7 +540,7 @@ SM_COUNTS = {"sm_100a": 148, "sm_103a": 152, "sm_107a": 216}
 def test_k1_planners_take_the_measured_rows(arch, sm_count, rows):
     """The verdicts of the three architectures take 28 / 32 / 34 of the 124 weight-gradient rows (the MLA head rows,
     ``L = 64``, run the deterministic program), at token counts near 16k; on 148 SMs sm_103a leaves ``4096 -> 48`` to
-    the deterministic program (28 rows).  The per-SM-count sm_107a tables take 32 rows on 212 SMs and 20 on 208 SMs;
+    the deterministic program (28 rows).  The per-SM-count sm_107a tables take 26 rows on 212 SMs and 20 on 208 SMs;
     an SM count below 216 without a table takes none."""
     taken = 0
     for d_in, d_out in WGRAD_SHAPES:
@@ -636,13 +636,11 @@ def test_k1_planner_choices():
         64,
         4,
     )
-    assert cake_backend.k1_plan(arch="sm_107a", M=4096, N=32, sm_count=212, **kw) == (
-        64,
-        4,
-    )
-    assert (
-        cake_backend.k1_plan(arch="sm_107a", M=4096, N=32, sm_count=208, **kw) is None
-    )
+    for sms in (208, 212):
+        assert (
+            cake_backend.k1_plan(arch="sm_107a", M=4096, N=32, sm_count=sms, **kw)
+            is None
+        )
     assert (
         cake_backend.k1_plan(arch="sm_107a", M=4096, N=32, sm_count=210, **kw) is None
     )
@@ -656,21 +654,23 @@ def test_k1_planner_choices():
         assert p107(4096, 32, sms, out_f32=True) == (64, 3)
         # 4096 -> 512 BF16 was measured and missed on every SM count
         assert p107(4096, 512, sms) is None
-        # 4096 -> 64, 5120 -> 32, 6144 -> 32 BF16: no verdict (their deterministic program did not complete)
-        for M, N in ((4096, 64), (5120, 32), (6144, 32)):
+        # 4096 -> 32, 4096 -> 64, 5120 -> 32 BF16 and 6144 -> 32: no verdict (their deterministic program did not
+        # complete)
+        for M, N in ((4096, 32), (4096, 64), (5120, 32), (6144, 32)):
             assert p107(M, N, sms) is None
     # 4096 -> 4096 FP32: 256-wide tiles at one split on 212 SMs; the deterministic program on 208 and 216
     assert p107(4096, 4096, 212, out_f32=True) == (256, 1)
     assert p107(4096, 4096, 208, out_f32=True) is None
     assert p107(4096, 4096, 216, out_f32=True) is None
-    # 6144 -> 32 FP32: two splits on 212 SMs, three on 216, the deterministic program on 208
-    assert p107(6144, 32, 212, out_f32=True) == (64, 2)
+    # 6144 -> 32 FP32: three splits on 216 SMs, the deterministic program on 208 and 212
+    assert p107(6144, 32, 212, out_f32=True) is None
     assert p107(6144, 32, 216, out_f32=True) == (64, 3)
     assert p107(6144, 32, 208, out_f32=True) is None
     assert p107(8192, 128, 212) == (128, 2)
     assert p107(8192, 128, 208) is None
-    # 5120 -> 1024 BF16: one split of 256-wide tiles on 212 and 216 SMs; on 208 it misses
-    assert p107(5120, 1024, 212) == (256, 1)
+    # 5120 -> 1024 BF16: one split of 256-wide tiles on 216 SMs; on 208 it misses, on 212 it runs the deterministic
+    # program as well
+    assert p107(5120, 1024, 212) is None
     assert p107(5120, 1024, 216) == (256, 1)
     assert p107(5120, 1024, 208) is None
     assert (
@@ -844,6 +844,13 @@ def test_k1_per_sm_count_tables_hold_only_at_their_token_counts(sm_count):
             assert cake_backend.k1_plan(K=T, **kw) is None, (M, N, dt, T)
         routed += want is not None
     assert routed > 0
+    if sm_count == 212:
+        # 4096 -> 32 BF16 has no verdict on 212 SMs (its deterministic program did not complete next to a resident
+        # kernel in long-lived processes): the deterministic program at every token count
+        kw = dict(arch="sm_107a", L=1, M=4096, N=32, out_f32=False, sm_count=212)
+        assert table[("sm_107a", 1, 4096, 32, "bf16")] is None
+        for T in (16171, 16172, 16231, 16384, 16385):
+            assert cake_backend.k1_plan(K=T, **kw) is None, T
 
 
 def test_k1_216_sm_routing_is_the_record_table():
