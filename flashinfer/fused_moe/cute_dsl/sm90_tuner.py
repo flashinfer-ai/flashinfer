@@ -58,6 +58,7 @@ from .hopper.contiguous_grouped_gemm_finalize_fusion import (
 from .hopper.utils import TORCH_TO_CUTLASS_DTYPE
 from .moe_utils import (
     get_max_num_permuted_tokens,
+    SM90_CUTE_DSL_MOE_ACTIVATION_TYPES,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
     validate_cute_dsl_moe_swiglu_config,
@@ -204,7 +205,11 @@ class CuteDslFusedMoESm90Runner(TunableRunner):
         self.local_expert_offset = local_expert_offset
         self.use_fused_finalize = use_fused_finalize
         self.enable_pdl = enable_pdl
-        activation, self.gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        activation, self.gated = normalize_cute_dsl_moe_activation_type(
+            activation_type,
+            SM90_CUTE_DSL_MOE_ACTIVATION_TYPES,
+            backend="the SM90 CuTe-DSL MoE",
+        )
         validate_cute_dsl_moe_swiglu_config(swiglu_alpha, swiglu_beta, swiglu_limit)
         validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
         self.activation_type = int(activation)
