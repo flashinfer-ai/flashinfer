@@ -29,12 +29,11 @@ import torch
 from flashinfer.api_logging import ExperimentalWarning
 from flashinfer.dsa_indexer import dsa_indexer_det_topk
 from flashinfer.experimental import sm120_dsa_indexer as sm120
-from flashinfer.utils import get_compute_capability
+from flashinfer.utils import is_sm120f_supported
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or get_compute_capability(torch.device("cuda"))[0] != 12,
-    reason="backend='sm120' requires an SM12x GPU",
+    not torch.cuda.is_available() or not is_sm120f_supported(torch.device("cuda")),
+    reason="backend='sm120' requires an SM12x GPU and CUDA 12.9 or newer",
 )
 
 _D = 128
