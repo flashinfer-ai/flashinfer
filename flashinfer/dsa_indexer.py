@@ -215,9 +215,9 @@ def dsa_indexer_det_topk(
             raise ValueError(
                 "q_causal_offsets, ratio and max_seqlen_k apply to the ragged form only"
             )
-        from .experimental.sm120_dsa_indexer import dsa_indexer_topk_paged
+        from .experimental.sm120_dsa_indexer import dsa_indexer_det_topk_paged
 
-        return dsa_indexer_topk_paged(
+        return dsa_indexer_det_topk_paged(
             q,
             k,
             w,
@@ -238,7 +238,7 @@ def dsa_indexer_det_topk(
         if cu_seqlens_q is None or cu_seqlens_k is None:
             raise ValueError("the ragged form needs cu_seqlens_q and cu_seqlens_k")
         from .experimental.sm120_dsa_indexer import (
-            dsa_indexer_topk as sm120_dsa_indexer_topk,
+            dsa_indexer_det_topk as sm120_dsa_indexer_topk,
         )
 
         return sm120_dsa_indexer_topk(

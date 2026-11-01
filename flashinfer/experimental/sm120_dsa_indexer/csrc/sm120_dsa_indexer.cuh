@@ -16,7 +16,7 @@
 
 // SM120 DSA indexer: scoring and exact top-k, the ragged (prefill) form and
 // the pieces the decode form shares (backend="sm120" of
-// flashinfer.dsa_indexer.dsa_indexer_topk).
+// flashinfer.dsa_indexer.dsa_indexer_det_topk).
 //
 //   s[t, j] = k_scale[j] * sum_h w[t, h] * relu(q[t, h, :] . k[j, :])
 //

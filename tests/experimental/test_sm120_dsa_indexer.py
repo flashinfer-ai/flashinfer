@@ -773,7 +773,7 @@ def test_paged_validation():
     with pytest.raises(ValueError, match="top_k"):
         _run_decode(q, w, ctx, paged, 0)
     with pytest.raises(ValueError, match="capacity"):
-        sm120.dsa_indexer_topk_paged(
+        sm120.dsa_indexer_det_topk_paged(
             q.data,
             paged.cache,
             w,

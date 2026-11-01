@@ -225,7 +225,7 @@ def ragged_scratch_bytes(
     return scan + rows + 4 * ctas * res
 
 
-def dsa_indexer_topk(
+def dsa_indexer_det_topk(
     q: torch.Tensor,
     k: torch.Tensor,
     w: torch.Tensor,
@@ -368,7 +368,7 @@ def dsa_indexer_topk(
     return indices, scores
 
 
-def dsa_indexer_topk_paged(
+def dsa_indexer_det_topk_paged(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     w: torch.Tensor,

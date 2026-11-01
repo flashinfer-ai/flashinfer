@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SM120 backend of :func:`flashinfer.dsa_indexer.dsa_indexer_topk`: FP8 or
+"""SM120 backend of :func:`flashinfer.dsa_indexer.dsa_indexer_det_topk`: FP8 or
 MXFP4 DSA indexer scores, bit-identical to DeepGEMM's MQA logits, and their
 exact top-k. See README.md; tracking issue flashinfer-ai/flashinfer#7084."""
 
 from ._api import (  # noqa: F401
-    dsa_indexer_topk,
-    dsa_indexer_topk_paged,
+    dsa_indexer_det_topk,
+    dsa_indexer_det_topk_paged,
     ragged_scratch_bytes,
 )
