@@ -17,7 +17,9 @@ Stall regression of the Cake SiLU-gated RMSNorm training forward and the
 non-deterministic backward (``deterministic=False``) beside a kernel resident
 on another stream (the concurrent-launch contract of issues #7038 and #7548).
 
-The forward launches a plain grid of independent CTAs.  The backward launches
+The forward launches a plain grid of independent CTAs; on SM100 and SM103
+from 2400 rows per SM the long forward launches whole waves of 3 CTAs per SM
+that each walk at most 6 row blocks.  The backward launches
 at most one wave of CTAs: when the grid has a CTA for every row block, each
 CTA takes its own block; past one wave the CTAs claim every block in chunks of
 consecutive blocks from the workspace's claim counter, chunks that shrink to
@@ -33,7 +35,7 @@ or at most ``MAX_EXTRA_MS`` above it.  The alone and busy calls alternate in
 pairs, so host launch gaps and clock drift hit both arms alike.
 
 The backward beside a kernel resident on every SM (issue #7548, item 2): each
-CTA of the backward needs 16640 bytes of dynamic shared memory, so a side
+CTA of the backward needs 20736 bytes of dynamic shared memory, so a side
 kernel holding every SM with the default carveout delays its start until the
 side kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_silu_gate_train`).
 The documented remedy is checked here: with the side kernel's preferred
@@ -49,7 +51,12 @@ the CTAs finish within about one block of each other), plus
 ``PROPORTIONAL_SLACK``.  The token counts give each CTA of the backward's
 one-wave grid 16 and 160 row blocks: ``T = 3157`` and ``31573`` on a
 148-SM B200, where the earlier fixed one-wave grid of 16 blocks per CTA ran
-1.26-1.35 times slower beside any side kernel.
+1.26-1.35 times slower beside any side kernel.  The long forward beside the
+same side kernels: busy / alone is at most ``N / (N - k)``, plus the share of
+one CTA's blocks in the call (a CTA whose slot the side kernel holds walks all
+of its blocks once it starts), plus ``PROPORTIONAL_SLACK``, at the token
+counts that give its CTA slots 25 and 100 row blocks each (the threshold of
+2400 rows per SM and four times that).
 
 In the item 1 and item 2 tests every side CTA records its SM and its start
 time, and a run counts only when the side kernel held the intended SMs before
@@ -525,16 +532,22 @@ def _claim_tokens(blocks_per_cta: int) -> tuple[int, float]:
     """``(T, block_share)``: the most tokens ``T`` whose ``T * H`` rows give
     each CTA of the BF16 weight-gradient backward's one-wave grid
     (``backward_ctas``) at most ``blocks_per_cta`` row blocks, and the grid over
-    the row blocks, which bounds one row block's share of the call alone."""
+    the row blocks of the module those rows run (on sm_107a the long backward
+    from 1024 rows per SM), which bounds one row block's share of the call
+    alone."""
     device_index = torch.cuda.current_device()
-    name = loader.route_module(loader.device_arch(device_index), "bwd_bf16")
+    arch = loader.device_arch(device_index)
+    name = loader.route_module(arch, "bwd_bf16")
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
     wave = loader.backward_ctas(name, loader.INT32_MAX, sms)
     rows_per_cta = int(loader.MODULES[name]["grid_rule"]["rows_per_cta"])
     tokens = blocks_per_cta * wave * rows_per_cta // H
+    name = loader.module_for_rows(arch, "bwd_bf16", tokens * H, sms)
+    rows_per_cta = int(loader.MODULES[name]["grid_rule"]["rows_per_cta"])
     blocks = -(-(tokens * H) // rows_per_cta)
-    assert loader.backward_ctas(name, tokens * H, sms) == wave
-    return tokens, wave / blocks
+    ctas = loader.backward_ctas(name, tokens * H, sms)
+    assert ctas == loader.backward_ctas(name, loader.INT32_MAX, sms)
+    return tokens, ctas / blocks
 
 
 @pytest.mark.parametrize(
@@ -570,4 +583,67 @@ def test_backward_slows_in_proportion_to_the_sms_held(
         f"{alone_ms:.4f} ms, beside {ctas} x {threads} side CTAs on {ctas} SMs "
         f"{busy_ms:.4f} ms: ratio {ratio:.3f} > {bound:.3f} (proportional "
         f"{ideal:.3f} + one row block {block_share:.4f} + {PROPORTIONAL_SLACK})"
+    )
+
+
+# The long forward beside the item 1 side kernels: its CTA slots (3 per SM)
+# get 25 and 100 row blocks of 32 rows each.
+LONG_FORWARD_BLOCKS_PER_SLOT = (25, 100)
+
+
+def _long_forward_tokens(blocks_per_slot: int) -> tuple[int, float]:
+    """``(T, cta_share)``: the fewest tokens ``T`` whose ``T * H`` rows give
+    each CTA slot of the long forward ``blocks_per_slot`` row blocks, and the
+    share of one CTA's blocks in the call alone (blocks a CTA walks over blocks
+    a slot runs); skips where the architecture routes no long forward."""
+    device_index = torch.cuda.current_device()
+    arch = loader.device_arch(device_index)
+    name = loader.ROUTES[arch].get("fwd_long")
+    if name is None:
+        pytest.skip(f"{arch} routes no long forward")
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    rule = loader.MODULES[name]["grid_rule"]
+    slots = int(rule["ctas_per_sm"]) * sms
+    rows_per_block = int(rule["rows_per_block"])
+    tokens = -(-(blocks_per_slot * slots * rows_per_block) // H)
+    rows = tokens * H
+    assert loader.module_for_rows(arch, "fwd", rows, sms) == name
+    (ctas, _, _) = loader.launch_grid(loader.MODULES[name], rows=rows, sm_count=sms)
+    blocks = -(-rows // rows_per_block)
+    return tokens, -(-blocks // ctas) * slots / blocks
+
+
+@pytest.mark.parametrize(
+    "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
+)
+@pytest.mark.parametrize("blocks_per_slot", LONG_FORWARD_BLOCKS_PER_SLOT)
+def test_long_forward_slows_in_proportion_to_the_sms_held(
+    blocks_per_slot: int, ctas: int, threads: int
+) -> None:
+    tokens, cta_share = _long_forward_tokens(blocks_per_slot)
+    x, z, w, _dy = _inputs(tokens)
+    y = torch.empty_like(x)
+
+    def call():
+        return (forward(x, z, w, EPS, out=y),)
+
+    spin = _spin(None, ctas=ctas, threads=threads)
+    alone_ms, busy_ms, alone, busy = _paired_medians(call, spin, PROPORTIONAL_RUNS)
+    ideal = spin.sms / (spin.sms - ctas)
+    bound = ideal + cta_share + PROPORTIONAL_SLACK
+    ratio = busy_ms / alone_ms
+    print(
+        f"HELD stage=forward tokens={tokens} heads={H} "
+        f"blocks_per_slot={blocks_per_slot} side={ctas}x{threads} "
+        f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} ratio={ratio:.3f} "
+        f"ideal={ideal:.3f} cta_share={cta_share:.4f} "
+        f"excess={ratio - ideal - cta_share:.4f}"
+    )
+    _check_outputs("forward", tokens, alone, busy)
+    assert ratio <= bound, (
+        f"tokens={tokens} ({blocks_per_slot} row blocks per CTA slot): long "
+        f"forward alone {alone_ms:.4f} ms, beside {ctas} x {threads} side CTAs "
+        f"on {ctas} SMs {busy_ms:.4f} ms: ratio {ratio:.3f} > {bound:.3f} "
+        f"(proportional {ideal:.3f} + one CTA's blocks {cta_share:.4f} + "
+        f"{PROPORTIONAL_SLACK})"
     )
