@@ -1,5 +1,8 @@
 {
-  "arch": "sm_100a",
+  "archs": [
+    "sm_100a",
+    "sm_107a"
+  ],
   "compile_flags": [
     "--use_fast_math"
   ],

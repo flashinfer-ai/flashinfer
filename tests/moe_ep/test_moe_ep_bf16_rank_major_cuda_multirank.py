@@ -1,6 +1,7 @@
-"""Real BF16 rank-major MegaMoE regression tests; minimum arch SM100 (B200).
+"""Real BF16 rank-major MegaMoE regression tests on SM100 (B200) or SM107 (R200).
 
-Run on one x86_64 node with eight B200 GPUs::
+Run with eight ranks, one GPU per rank: one node with eight B200 GPUs, or two
+nodes with four R200 GPUs each in one NVLink domain::
 
     bash tests/moe_ep/run_tests.sh bf16-rank-major
 
@@ -18,7 +19,6 @@ the comment above them.
 from __future__ import annotations
 
 import os
-import platform
 from datetime import timedelta
 
 import pytest
@@ -46,7 +46,7 @@ from flashinfer.moe_ep.kernel_src.blackwell_bf16_rank_major.session import (
     BlackwellBf16RankMajorSession,
 )
 
-pytestmark = [pytest.mark.gpu_8, pytest.mark.arch_blackwell]
+pytestmark = [pytest.mark.gpu_8]
 
 _WORLD = 8
 _CAPACITY = 128
@@ -55,25 +55,23 @@ _INTERMEDIATE = 2048
 _EXPERTS = 256
 _LOCAL_EXPERTS = _EXPERTS // _WORLD
 _TOP_K = 8
+_CAPABILITIES = ((10, 0), (10, 7))
 
 
 @pytest.fixture(scope="module")
 def problem():
     if int(os.environ.get("WORLD_SIZE", "0")) != _WORLD:
         pytest.skip("requires torchrun with exactly eight ranks")
-    if platform.machine() != "x86_64" or torch.cuda.device_count() != _WORLD:
-        pytest.skip("requires one x86_64 node with eight visible B200 GPUs")
-    for device in range(_WORLD):
-        if torch.cuda.get_device_capability(device) != (
-            10,
-            0,
-        ) or "B200" not in torch.cuda.get_device_name(device):
-            pytest.skip("requires eight B200 GPUs (SM100)")
+    local_world = int(os.environ["LOCAL_WORLD_SIZE"])
+    if torch.cuda.device_count() < local_world:
+        pytest.skip("requires one visible GPU per local rank")
+    # Every rank of a node sees the same GPUs, so the node's ranks skip together.
+    for device in range(local_world):
+        if torch.cuda.get_device_capability(device) not in _CAPABILITIES:
+            pytest.skip("requires SM100 (B200) or SM107 (R200) GPUs")
 
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
-    assert int(os.environ["LOCAL_WORLD_SIZE"]) == _WORLD
-    assert rank == local_rank, "this test requires a single node"
     torch.cuda.set_device(local_rank)
     # Use the validated peer-memory transport for this eight-rank backend.
     symm_mem.set_backend("NVSHMEM")
@@ -81,6 +79,9 @@ def problem():
         dist.init_process_group("nccl", timeout=timedelta(minutes=10))
     assert dist.get_world_size() == _WORLD
     assert dist.get_rank() == rank
+    capabilities = [None] * _WORLD
+    dist.all_gather_object(capabilities, torch.cuda.get_device_capability())
+    assert len(set(capabilities)) == 1, f"mixed GPU architectures: {capabilities}"
 
     # The independent reference must use FP32 accumulation, not TF32 products.
     old_tf32_override = os.environ.pop("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", None)
