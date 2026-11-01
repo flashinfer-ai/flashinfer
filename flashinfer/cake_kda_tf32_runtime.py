@@ -5290,6 +5290,36 @@ def _affine_window_row_starts(
     return seq_ids, local_rows
 
 
+def _affine_window_table(
+    num_parts, first_parts, part_seq_ids, part_local_rows, merge_final_positions
+):
+    """The gathered-index main body's window table: four int64 per window.
+
+    Window ``w``: the sequence whose caller state index is its pool slot (-1:
+    the window starts no sequence), the row-table entry and the rows before the
+    window that make its checkpoint row start (with rows in place the caller's
+    entry of its sequence and its local rows; otherwise the main windows' own
+    row offsets, entry ``w``), and the position of its sequence's final pool
+    offset on the merging route (-1 elsewhere).
+    """
+    table = [[-1, w, 0, -1] for w in range(num_parts)]
+    if part_seq_ids is not None:
+        for w in range(num_parts):
+            table[w][1] = part_seq_ids[w]
+            table[w][2] = part_local_rows[w]
+    for seq, window in enumerate(first_parts):
+        table[window][0] = seq
+        if merge_final_positions is not None:
+            table[window][3] = merge_final_positions[seq]
+    return [value for row in table for value in row]
+
+
+def _gathers_window_indices(launch) -> bool:
+    """``launch``'s body reads the window indices from caller tensors (``window_table``)."""
+    plan = getattr(getattr(launch, "module", None), "_arg_plan", ())
+    return any(name == "window_table" for _kind, name in plan)
+
+
 class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
     """PR #4779 split-sequence affine prefix over direct-M128 windows.
 
@@ -5621,6 +5651,13 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             host_i64["merge_final_positions"] = [
                 end - 2 if end >= 2 else num_parts - 1 for end in part_offsets[1:]
             ]
+        host_i64["window_table"] = _affine_window_table(
+            num_parts,
+            host_i64["first_parts"],
+            host_i64.get("part_seq_ids"),
+            host_i64.get("part_local_rows"),
+            host_i64.get("merge_final_positions"),
+        )
         uploaded_i32 = _upload_int_batch(q.device, host_i32, torch.int32)
         uploaded_i64 = _upload_int_batch(q.device, host_i64, torch.int64)
         if self._correction_merge:
@@ -5803,6 +5840,37 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             state_slot_stride=initial_state.stride(0),
             use_state_indices=1,
         )
+        # A gathered-index main body reads each window's pool slot and row
+        # start from the caller's state indices and row table through the
+        # window table, and publishes the row starts and merge offsets the
+        # later passes read: the composite then launches no index gather
+        # (the chain route without the merging correction keeps it for the
+        # epilogue's int64 indices).
+        self._gathered_indices = _gathers_window_indices(self._main)
+        self._index_gather_launched = not (
+            self._gathered_indices and (self._apply_route or self._correction_merge)
+        )
+        if self._gathered_indices:
+            rows_in_place = state_checkpoints is not None and self._checkpoint_in_place
+            published = torch.empty((num_parts,), dtype=torch.int64, device=q.device)
+            self._main.args.update(
+                state_indices_addr=state_indices.data_ptr(),
+                state_indices_i64=int(state_indices.dtype == torch.int64),
+                window_table=uploaded_i64["window_table"],
+                gathered_row_starts=self._part_row_starts
+                if rows_in_place
+                else published,
+                gathered_final_offsets=self._merge_final_offsets
+                if self._correction_merge
+                else published,
+                final_slot_stride=int(final_state.stride(0)),
+            )
+            if rows_in_place:
+                self._main.args["checkpoint_cu_starts_addr"] = (
+                    self._checkpoint_start.data_ptr()
+                )
+            self._main.__dict__.pop("_launch_records", None)
+            self.schedule += "_gathered_indices"
         self._main.args["initial_state_f32"] = self._initial_pool_pointer
         if self._chain_map_fold:
             # The map-fold build writes every tail window's BF16 map state
@@ -6216,7 +6284,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         )
         if map_first:
             add(self._map_records())
-        if self._correction_merge:
+        if not self._index_gather_launched:
+            # The gathered-index main body reads the caller's indices itself.
+            pass
+        elif self._correction_merge:
             # The index gather also places each sequence's pool offset at the
             # correction window that ends it.
             add(
