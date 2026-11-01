@@ -19,8 +19,10 @@ Program selection by token count of the Cake BF16 RMSNorm training kernels
 table ``cake_jit.program_windows`` derives from the registry's ``MODULES`` and
 ``ROUTES`` at call time; ``EDGES`` the measured outcome at every window edge;
 ``NOTES`` the contract of the outputs across the windows; ``SECTIONS`` the text
-the host module appends to the forward and backward docstrings.  The package
-tests hold the table to the registry and the edges to the outputs.
+the host module appends to the forward and backward docstrings;
+``ACCURACY_MIN_SMS`` and ``ACCURACY_EDGES`` the backward accuracy guard (see
+``NOTES``).  The package tests hold the table to the registry and the edges to
+the outputs.
 """
 
 from __future__ import annotations
@@ -814,6 +816,32 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
 
 EDGE_CLASSES = ["same", "ulp", "dx", "unmeasured"]
 
+# The backward accuracy guard (see NOTES): per architecture the smallest SM count the accuracy
+# edges were measured on, and per route the edge above which it runs compensated programs.  On
+# a device with fewer SMs a backward call of such a route selects its programs as if ``T`` were
+# the edge plus one (its launch keeps ``T``).
+ACCURACY_MIN_SMS: dict[str, int] = {"sm_100a": 148, "sm_103a": 152, "sm_107a": 212}
+ACCURACY_EDGES: dict[str, dict[str, int]] = {
+    "sm_100a": {
+        "bwd_h256": 80896,
+        "bwd_w32_h256": 80896,
+        "bwd_h5120": 6144,
+        "bwd_w32_h5120": 6144,
+    },
+    "sm_103a": {
+        "bwd_h256": 139264,
+        "bwd_w32_h256": 139264,
+        "bwd_h5120": 5120,
+        "bwd_w32_h5120": 5120,
+    },
+    "sm_107a": {
+        "bwd_h256": 70656,
+        "bwd_w32_h256": 70656,
+        "bwd_h5120": 19968,
+        "bwd_w32_h5120": 19968,
+    },
+}
+
 NOTES = """
 Each route -- one architecture, hidden size and direction -- ships several programs of
 one kernel and selects one per call from the token count ``T``: the program whose window
@@ -837,7 +865,15 @@ on GB300 (sm_103a) at most two ulps on up to 17.3 % (27.8 %), ``y`` on up to 2.0
 identical: the H = 6144 route, which switched between the base backward kernel and the
 bulk-copy one with ``dx`` differing on about 1-2 % of the rows, now runs the bulk-copy
 kernel at every ``T`` on every architecture.  ``dw`` sums every row and depends on ``T``
-by definition; for a fixed ``T`` on one architecture it is bitwise reproducible.
+by definition; for a fixed ``T`` it is bitwise reproducible on devices with the same SM
+count.  The backward splits the rows over ``ctas_per_sm`` x SM count CTAs, so devices of
+one architecture with different SM counts (B200 with 148 and GB200 with 152 SMs, R200
+boards with 212 and 216 SMs) cut different chunk tables and can give different ``dw``
+bits.  The H = 5120 and H = 256 backward routes switch from plain to compensated ``dw``
+sums at accuracy edges (``ACCURACY_EDGES``) measured on B200 (148 SMs), GB300 (152 SMs)
+and R200 (212 and 216 SMs).  A device with fewer SMs than ``ACCURACY_MIN_SMS`` gives
+each CTA more rows to sum at the same ``T``; there these routes select their programs as
+if ``T`` were the edge plus one, so their compensated programs run at every ``T``.
 Measured on B200 (sm_100a), GB300 (sm_103a) and R200 (sm_107a).
 """
 
@@ -866,7 +902,15 @@ on GB300 (sm_103a) at most two ulps on up to 17.3 % (27.8 %), ``y`` on up to 2.0
 identical: the H = 6144 route, which switched between the base backward kernel and the
 bulk-copy one with ``dx`` differing on about 1-2 % of the rows, now runs the bulk-copy
 kernel at every ``T`` on every architecture.  ``dw`` sums every row and depends on ``T``
-by definition; for a fixed ``T`` on one architecture it is bitwise reproducible.
+by definition; for a fixed ``T`` it is bitwise reproducible on devices with the same SM
+count.  The backward splits the rows over ``ctas_per_sm`` x SM count CTAs, so devices of
+one architecture with different SM counts (B200 with 148 and GB200 with 152 SMs, R200
+boards with 212 and 216 SMs) cut different chunk tables and can give different ``dw``
+bits.  The H = 5120 and H = 256 backward routes switch from plain to compensated ``dw``
+sums at accuracy edges (``ACCURACY_EDGES``) measured on B200 (148 SMs), GB300 (152 SMs)
+and R200 (212 and 216 SMs).  A device with fewer SMs than ``ACCURACY_MIN_SMS`` gives
+each CTA more rows to sum at the same ``T``; there these routes select their programs as
+if ``T`` were the edge plus one, so their compensated programs run at every ``T``.
 Measured on B200 (sm_100a), GB300 (sm_103a) and R200 (sm_107a).
 
 The windows per architecture and route, ``(above, at_most]`` and the program (the first
@@ -977,7 +1021,15 @@ on GB300 (sm_103a) at most two ulps on up to 17.3 % (27.8 %), ``y`` on up to 2.0
 identical: the H = 6144 route, which switched between the base backward kernel and the
 bulk-copy one with ``dx`` differing on about 1-2 % of the rows, now runs the bulk-copy
 kernel at every ``T`` on every architecture.  ``dw`` sums every row and depends on ``T``
-by definition; for a fixed ``T`` on one architecture it is bitwise reproducible.
+by definition; for a fixed ``T`` it is bitwise reproducible on devices with the same SM
+count.  The backward splits the rows over ``ctas_per_sm`` x SM count CTAs, so devices of
+one architecture with different SM counts (B200 with 148 and GB200 with 152 SMs, R200
+boards with 212 and 216 SMs) cut different chunk tables and can give different ``dw``
+bits.  The H = 5120 and H = 256 backward routes switch from plain to compensated ``dw``
+sums at accuracy edges (``ACCURACY_EDGES``) measured on B200 (148 SMs), GB300 (152 SMs)
+and R200 (212 and 216 SMs).  A device with fewer SMs than ``ACCURACY_MIN_SMS`` gives
+each CTA more rows to sum at the same ``T``; there these routes select their programs as
+if ``T`` were the edge plus one, so their compensated programs run at every ``T``.
 Measured on B200 (sm_100a), GB300 (sm_103a) and R200 (sm_107a).
 
 The windows per architecture and route, ``(above, at_most]`` and the program (the first
@@ -1042,6 +1094,8 @@ its own windows.
 SECTIONS: dict[str, str] = {"fwd": FORWARD_SECTION, "bwd": BACKWARD_SECTION}
 
 __all__ = [
+    "ACCURACY_EDGES",
+    "ACCURACY_MIN_SMS",
     "BACKWARD_SECTION",
     "EDGES",
     "EDGE_CLASSES",

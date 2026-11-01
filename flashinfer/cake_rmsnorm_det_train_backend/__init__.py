@@ -367,6 +367,35 @@ def _workspace_record(
     )
 
 
+def _backward_selection_rows(
+    arch: str,
+    hidden: int,
+    residual: bool,
+    rows: int,
+    w_dtype: str,
+    device_index: int,
+) -> int:
+    """The row count a backward call of ``rows`` tokens selects its programs by.
+
+    The routes of ``cake_windows.ACCURACY_EDGES`` switch from plain to
+    compensated ``dw`` sums at an accuracy edge measured on devices with at
+    least ``cake_windows.ACCURACY_MIN_SMS[arch]`` SMs.  A device with fewer SMs
+    gives each CTA more rows to sum at the same token count, so there such a
+    route selects its programs as if the call had the edge plus one rows: its
+    compensated programs run at every token count.  The launch keeps ``rows``.
+    """
+
+    edge = _windows.ACCURACY_EDGES.get(arch, {}).get(
+        route_key(hidden, "bwd", residual, w_dtype)
+    )
+    if (
+        edge is None
+        or _loader.sm_count(device_index) >= _windows.ACCURACY_MIN_SMS[arch]
+    ):
+        return rows
+    return max(rows, int(edge) + 1)
+
+
 def cake_rmsnorm_det_train_backward_workspace_bytes(
     rows: int, hidden: int, device: torch.device, *, residual: bool = False
 ) -> int:
@@ -400,12 +429,17 @@ def cake_rmsnorm_det_train_backward_workspace_bytes(
     total = 0
     for w_dtype in weight_dtypes(arch, hidden, "bwd", residual) or ("bf16",):
         owner = _workspace_record(arch, hidden, residual, max(rows, 1), w_dtype)
+        selection = _backward_selection_rows(
+            arch, hidden, residual, max(rows, 1), w_dtype, device_index
+        )
         for record in _backward_module_records(arch, hidden, residual, w_dtype):
             if record.get("workspace_rule") is None:
                 continue
-            # A module selected only above ``rows`` tokens never runs on this buffer.
+            # A module selected only above ``rows`` tokens (the accuracy guard's
+            # selection rows on a device below its SM count) never runs on this
+            # buffer.
             select = record.get("select_rule") or {}
-            if select.get("kind") == "rows_between" and max(rows, 1) <= int(
+            if select.get("kind") == "rows_between" and selection <= int(
                 select["above"]
             ):
                 continue
@@ -671,7 +705,10 @@ def cake_rmsnorm_det_train_backward(
     Returns
     -------
     ``(dx, dw)`` with ``dw`` in FP32; the caller decides whether to cast it.
-    For a fixed token count and architecture ``dw`` is bitwise reproducible.
+    For a fixed token count ``dw`` is bitwise reproducible on devices with the
+    same SM count: the rows are split over ``ctas_per_sm`` x SM count CTAs, so
+    devices of one architecture with different SM counts can give different
+    ``dw`` bits.
     """
 
     if not deterministic:
@@ -747,8 +784,11 @@ def cake_rmsnorm_det_train_backward(
         dw_result.zero_()
         return dx_result, dw_result
     owner = _workspace_record(arch, hidden, has_residual, rows, w_dtype)
+    selection = _backward_selection_rows(
+        arch, hidden, has_residual, rows, w_dtype, _device_index(device)
+    )
     names = selected_modules(
-        arch, hidden, "bwd", has_residual, rows=rows, w_dtype=w_dtype
+        arch, hidden, "bwd", has_residual, rows=selection, w_dtype=w_dtype
     )
     launched = [
         _loader.MODULES[name]
