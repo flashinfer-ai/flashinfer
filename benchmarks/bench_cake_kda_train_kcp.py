@@ -32,6 +32,12 @@ Arms (``--arms``), every one the same packed batch split by the same partition
   partition and context;
 * ``control``: the ``nd`` path again (the same programs; its ratio to ``nd``
   measures the protocol's own noise and must stay within the control band);
+* ``nd_off`` (run only when ``--arms`` names it): the ``nd`` path with the
+  checkpoint hand-off off (``checkpoint_handoff="off"``); ``nd`` and
+  ``control`` run the mode of ``--ckpt-handoff`` (default: the environment
+  variable ``CAKE_KDA_KCP_CKPT_HANDOFF`` when set, else ``"auto"``), so
+  ``nd_off / nd`` is the hand-off's gain on ``ckpt`` (and ~1 on the other
+  boundaries, where it never engages);
 * ``local``: the single-rank non-deterministic Cake kernels
   (``flashinfer.cake_kda_train.chunk_kda`` with ``deterministic=False``, after
   the single-rank convolution) on the rank's shard as if it were a batch of its
@@ -75,7 +81,8 @@ Protocol, per boundary: one untimed call per arm (the JIT builds and the first
 exchanges happen here) and one probe call per arm (peak memory), then
 ``--groups`` groups (at least 3); in every group the arms run in the order
 det, nd, control, fla_cp, fla_cp, control, nd, det (palindromic; ``fla_cp``
-when it runs), then the other optional arms; every visit takes ``--warmup``
+when it runs; ``nd_off`` right after ``nd`` and before ``control`` when it
+runs), then the other optional arms; every visit takes ``--warmup``
 untimed and ``--samples`` timed iterations (at least 8), each after an L2
 flush, a device synchronize and a barrier; the figure of an arm in a group is
 the median of its timed iterations over its visits, the figure of an arm is
@@ -90,7 +97,10 @@ Before the timing, one ``step`` of ``det`` and one of ``nd`` on the same shard
 are compared: ``out``, ``dq``, ``dk``, ``dv``, ``dbeta`` (and ``y``, ``dx``,
 ``dweight`` with the convolution) must be bitwise equal; ``dg`` differs by FP32
 rounding on the ranks whose backward runs the ``S1`` pair (its rel-RMS and
-max-abs difference are reported).  With ``fla_cp``, one untimed forward of it
+max-abs difference are reported).  With ``nd_off``, one ``ckpt`` step of
+``nd`` and one of ``nd_off`` are compared too: ``out``, ``dq``, ``dk``,
+``dv``, ``dg``, ``dbeta`` (and the convolution's) must be bitwise equal
+(``handoff``: the package's hand-off counters of each step are recorded).  With ``fla_cp``, one untimed forward of it
 and of ``det`` compares ``out`` in global token order (``fla_cp_out``: rel-RMS
 and max-abs difference, recorded only).  The report also lists, per rank, the
 local backward records (``dqkg`` and ``glm_intra`` on the replay path) the plan
@@ -154,7 +164,7 @@ from flashinfer.experimental.cake_kda_train_kcp import (  # noqa: E402
 )
 from tests.test_helpers.cake_kda_det_train_reference import make_inputs  # noqa: E402
 
-ARMS = ("det", "nd", "control", "local", "fla", "fla_cp")
+ARMS = ("det", "nd", "control", "nd_off", "local", "fla", "fla_cp")
 MAIN_ARMS = ("det", "nd", "control")
 BOUNDARIES = ("fwd", "bwd", "step", "ckpt")
 CONTROL_BAND = (0.98, 1.02)
@@ -163,6 +173,10 @@ L2_FLUSH_BYTES = 256 << 20
 WIDTH = 4
 INPUTS = ("q", "k", "v", "g", "beta")
 BITWISE = ("out", "dq", "dk", "dv", "dbeta", "y", "dx", "dweight")
+HANDOFF_BITWISE = ("out", "dq", "dk", "dv", "dg", "dbeta", "y", "dx", "dweight")
+HANDOFF_ENV = "CAKE_KDA_KCP_CKPT_HANDOFF"  # the default of --ckpt-handoff (the nd and control arms)
+# arms that run only when --arms names them
+OPT_IN_ARMS = ("nd_off", "fla_cp")
 RECORD_STAGES = ("dqkg", "glm_intra")
 
 Step = tuple[Callable[[], Any], Callable[[Any], Any]]
@@ -259,6 +273,7 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
         "tokens_local": int(local["q"].shape[0]),
         "tokens_total": args.seqlen,
         "fla_safe_gate": not args.no_fla_safe_gate,
+        "ckpt_handoff": args.ckpt_handoff,
     }
     if "fla_cp" in args.arms:
         problem["global"] = {name: inputs[name] for name in (*INPUTS, "dout")}
@@ -440,12 +455,15 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
             y = cake_causal_conv1d_kcp(x, w, ctx) if conv else None
             return y, chunk_kda_det_kcp(q, k, v, g, beta, ctx)
 
-    elif arm in ("nd", "control"):
+    elif arm in ("nd", "control", "nd_off"):
         ctx = problem["ctx"]["nd"]
+        mode = "off" if arm == "nd_off" else problem["ckpt_handoff"]
 
         def fwd(x, w, q, k, v, g, beta):
             y = cake_causal_conv1d_kcp(x, w, ctx) if conv else None
-            return y, chunk_kda_kcp(q, k, v, g, beta, ctx, deterministic=False)
+            return y, chunk_kda_kcp(
+                q, k, v, g, beta, ctx, checkpoint_handoff=mode, deterministic=False
+            )
 
     elif arm == "local":
 
@@ -616,6 +634,77 @@ def _agreement(
     }
 
 
+def _handoff_counts() -> dict[str, int]:
+    return dict(nd_kcp.HANDOFF_STATS)
+
+
+def _handoff_delta(before: dict[str, int]) -> dict[str, int]:
+    """The package's hand-off counters since ``before`` (this rank; nonzero entries only)."""
+    after = _handoff_counts()
+    return {
+        k: after[k] - before.get(k, 0) for k in after if after[k] != before.get(k, 0)
+    }
+
+
+def _handoff_agreement(
+    problem: dict[str, Any], conv: bool, device: torch.device
+) -> dict[str, Any]:
+    """One ``ckpt`` step of ``nd`` (the ``--ckpt-handoff`` mode) and one of ``nd_off`` on the same shard: every
+    output and gradient bitwise (``dg`` included: the same package), and the hand-off counters of each step (rank 0's;
+    ``engaged`` = some rank's ``nd`` step kept and read a tape set)."""
+    results: dict[str, dict[str, torch.Tensor]] = {}
+    counts: dict[str, dict[str, int]] = {}
+    local = problem["local"]
+    for arm in ("nd", "nd_off"):
+        x, w, q, k, v, g, beta = xs = _leaves(problem)
+        before = _handoff_counts()
+        y, out = checkpoint(_forward(arm, problem, conv), *xs, use_reentrant=False)
+        outs, grads = [out], [local["dout"]]
+        if y is not None:
+            outs.append(y)
+            grads.append(local["dy"])
+        torch.autograd.backward(outs, grads)
+        torch.cuda.synchronize(device)
+        counts[arm] = _handoff_delta(before)
+        res = {
+            "out": out.detach(),
+            "dq": q.grad,
+            "dk": k.grad,
+            "dv": v.grad,
+            "dg": g.grad,
+            "dbeta": beta.grad,
+        }
+        if conv:
+            res.update(y=y.detach(), dx=x.grad, dweight=w.grad)
+        results[arm] = res
+    on, off = results["nd"], results["nd_off"]
+    names = [n for n in HANDOFF_BITWISE if n in on]
+    equal = torch.tensor(
+        [
+            int(on[n] is not None and off[n] is not None and torch.equal(on[n], off[n]))
+            for n in names
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(equal, op=dist.ReduceOp.MIN)
+    engaged = torch.tensor(
+        [int(counts["nd"].get("bound", 0) > 0), int(bool(counts["nd_off"]))],
+        dtype=torch.int64,
+        device=device,
+    )
+    dist.all_reduce(engaged, op=dist.ReduceOp.MAX)
+    bitwise = {n: bool(e) for n, e in zip(names, equal.tolist(), strict=True)}
+    return {
+        "mode": problem["ckpt_handoff"],
+        "bitwise": bitwise,
+        "bitwise_ok": all(bitwise.values()),
+        "engaged": bool(engaged[0].item()),
+        "off_engaged": bool(engaged[1].item()),
+        "counts_rank0": counts,
+    }
+
+
 def _fla_cp_agreement(
     problem: dict[str, Any], view: dict[str, Any], fwd, device: torch.device
 ) -> dict[str, float]:
@@ -700,8 +789,10 @@ def run_boundary(
     torch.cuda.synchronize(device)
     dist.barrier()
     memory = {arm: _probe_memory(steps[arm], device) for arm in arms}
-    # fla_cp, nd's context-parallel baseline, joins the palindrome of the main arms
-    main = [arm for arm in (*MAIN_ARMS, "fla_cp") if arm in steps]
+    # fla_cp, nd's context-parallel baseline, and nd_off (nd without the checkpoint hand-off, right after nd) join
+    # the palindrome of the main arms
+    main = [arm for arm in ("det", "nd", "nd_off", "control", "fla_cp") if arm in steps]
+    stats_before = _handoff_counts()
     order = main + main[::-1] + [arm for arm in arms if arm not in main]
     per_group: dict[str, list[float]] = {arm: [] for arm in arms}
     raw: dict[str, list[list[float]]] = {arm: [] for arm in arms}
@@ -715,6 +806,7 @@ def run_boundary(
             per_group[arm].append(statistics.median(visits[arm]))
             raw[arm].append(visits[arm])
     medians = {arm: statistics.median(per_group[arm]) for arm in arms}
+    handoff_stats = _handoff_delta(stats_before)
     tokens = problem["tokens_total"]
     rows = {}
     for arm in arms:
@@ -741,6 +833,7 @@ def run_boundary(
         "control_ok": CONTROL_BAND[0] <= control <= CONTROL_BAND[1],
         "drift": drift,
         "drift_ok": drift <= DRIFT_LIMIT,
+        "handoff_stats_rank0": handoff_stats,
     }
 
 
@@ -770,6 +863,9 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
         if "fla_cp" in forwards
         else None
     )
+    agreement["handoff"] = (
+        _handoff_agreement(problem, conv, device) if "nd_off" in arms else None
+    )
     records = _local_records(problem, args.heads, device)
     boundaries = {
         boundary: run_boundary(
@@ -794,6 +890,7 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
         "nd": {
             "workspace": kda_workspace_bytes_kcp(ctx_nd, H=H, C=C, deterministic=False),
             "saved": kda_saved_bytes_kcp(ctx_nd, H=H, C=C, deterministic=False),
+            "handoff": nd_kcp.kda_handoff_bytes_kcp(ctx_nd, H=H),
             "comm": kda_comm_bytes_kcp(ctx_nd, H=H, C=C, deterministic=False),
         },
     }
@@ -813,6 +910,7 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
             "channels": args.channels,
             "conv": conv,
             "fla_safe_gate": problem["fla_safe_gate"],
+            "ckpt_handoff": args.ckpt_handoff,
             "layout": args.layout,
             "world_size": world,
             "arms": arms,
@@ -865,6 +963,13 @@ def _print(report: dict[str, Any]) -> None:
         print(f"  fla arm dropped: {report['fla_error'][:200]}")
     if report["fla_cp_error"]:
         print(f"  fla_cp arm dropped: {report['fla_cp_error'][:200]}")
+    if agree.get("handoff") is not None:
+        ho = agree["handoff"]
+        bad_ho = [n for n, ok in ho["bitwise"].items() if not ok]
+        print(
+            f"  nd ({ho['mode']}) vs nd_off ckpt: bitwise {'ok' if ho['bitwise_ok'] else 'MISMATCH ' + ','.join(bad_ho)}; "
+            f"hand-off engaged={ho['engaged']} off_engaged={ho['off_engaged']} counts(rank0)={ho['counts_rank0']}"
+        )
     if agree["fla_cp_out"] is not None:
         print(
             f"  fla_cp vs det: out rel_rms={agree['fla_cp_out']['rel_rms']:.3e} "
@@ -881,6 +986,8 @@ def _print(report: dict[str, Any]) -> None:
             )
         ratios = "  ".join(f"{k} = {v:.4f}" for k, v in res["ratios"].items())
         print(f"    {ratios}")
+        if res.get("handoff_stats_rank0"):
+            print(f"    hand-off counters (rank 0): {res['handoff_stats_rank0']}")
         print(
             f"    control/nd = {res['control_ratio']:.4f} (band {report['control_band']}) -> "
             f"{'ok' if res['control_ok'] else 'OUT OF BAND'}; drift(nd) = {res['drift']:.4f} -> "
@@ -928,9 +1035,15 @@ def main() -> int:
     parser.add_argument(
         "--arms",
         nargs="+",
-        default=[arm for arm in ARMS if arm != "fla_cp"],
+        default=[arm for arm in ARMS if arm not in OPT_IN_ARMS],
         choices=ARMS,
-        help="arms to time (default: all but fla_cp, which runs only when named)",
+        help="arms to time (default: all but nd_off and fla_cp, which run only when named)",
+    )
+    parser.add_argument(
+        "--ckpt-handoff",
+        default=os.environ.get(HANDOFF_ENV, "").strip().lower() or "auto",
+        choices=("auto", "on", "off"),
+        help=f"checkpoint_handoff of the nd and control arms (default: ${HANDOFF_ENV}, else auto)",
     )
     parser.add_argument("--seed", type=int, default=20261021)
     parser.add_argument(
@@ -941,6 +1054,10 @@ def main() -> int:
         parser.error("the protocol takes at least 3 groups and 8 samples per visit")
     if not set(MAIN_ARMS) <= set(args.arms):
         parser.error("the det, nd and control arms are required")
+    if args.ckpt_handoff not in ("auto", "on", "off"):
+        parser.error(
+            f"${HANDOFF_ENV}={args.ckpt_handoff!r}: expected auto, on or off (or unset)"
+        )
     if torch.are_deterministic_algorithms_enabled():
         parser.error(
             "torch's deterministic algorithms are enabled: deterministic=False would run the deterministic package"
@@ -953,8 +1070,14 @@ def main() -> int:
             Path(args.json).write_text(json.dumps(report, indent=2) + "\n")
     dist.barrier()
     dist.destroy_process_group()
-    ok = report["agreement"]["bitwise_ok"] and all(
-        res["control_ok"] and res["drift_ok"] for res in report["boundaries"].values()
+    handoff = report["agreement"].get("handoff")
+    ok = (
+        report["agreement"]["bitwise_ok"]
+        and (handoff is None or handoff["bitwise_ok"])
+        and all(
+            res["control_ok"] and res["drift_ok"]
+            for res in report["boundaries"].values()
+        )
     )
     return 0 if ok else 1
 

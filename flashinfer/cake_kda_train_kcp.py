@@ -479,11 +479,16 @@ def chunk_kda_kcp(
     *,
     recompute_handle: Optional[Any] = None,
     checkpoint_keep: Optional[str] = None,
+    checkpoint_handoff: str = "auto",
     deterministic: bool = True,
     **options: Any,
 ) -> torch.Tensor:
     r"""Autograd-enabled context-parallel packed KDA chunked training step of this rank's fragments (the forward of
     :func:`chunk_kda_fwd_kcp`; the backward of :func:`chunk_kda_bwd_kcp` from its saved set).
+
+    ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``): the non-deterministic package's checkpoint hand-off
+    (its README: under ``torch.utils.checkpoint`` the forward keeps its tape set and the backward skips the local
+    recompute; every result is unchanged); the deterministic package has no hand-off and ignores it.
 
     ``recompute_handle`` / ``checkpoint_keep``: the checkpoint recompute without the forward state exchange, as for
     :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_kcp` (a ``RecomputeHandleKcp`` or any object with an
@@ -496,6 +501,10 @@ def chunk_kda_kcp(
     torch.Tensor
         BF16 ``out`` like ``v`` (this rank's tokens).
     """
+    if checkpoint_handoff not in ("auto", "on", "off"):
+        raise ValueError(
+            f"chunk_kda_kcp: checkpoint_handoff must be 'auto', 'on' or 'off', got {checkpoint_handoff!r}"
+        )
     if _deterministic(deterministic, "chunk_kda_kcp"):
         return _det_kcp().chunk_kda_det_kcp(
             q,
@@ -525,6 +534,7 @@ def chunk_kda_kcp(
         workspace=workspace,
         recompute_handle=recompute_handle,
         checkpoint_keep=checkpoint_keep,
+        checkpoint_handoff=checkpoint_handoff,
         deterministic=False,
         **options,
     )

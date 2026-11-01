@@ -2438,6 +2438,41 @@ def _check_save_mode(save_mode: str) -> None:
 # ``save_transfer=False`` --, ``"transfer"`` also the owner's c1 receive tensor (``save_transfer=True``).
 CHECKPOINT_KEEPS = ("states", "transfer")
 
+# Checkpoint hand-off (``cake_kcp.chunk_kda_kcp(..., checkpoint_handoff=)``): under ``torch.utils.checkpoint`` the
+# forward of both checkpoint passes keeps the local tape set ``KCP_HANDOFF_BUFFERS`` in its saved set, and the backward
+# reads it instead of re-running the intra program, WY and the K1 tape walk.  ``"auto"`` (the default) engages at the
+# head counts of :data:`KCP_HANDOFF_HEADS` on the (architecture, SM count, Cake build toolkit "major.minor") devices
+# of :data:`KCP_HANDOFF_VERIFIED`, where the hand-off rows measured the output and every gradient bitwise equal to
+# ``"off"``; ``"on"`` engages on every call it supports, ``"off"`` never.  A new device, toolkit or head count needs
+# those rows again before it enters either set.
+KCP_HANDOFF_MODES = ("auto", "on", "off")
+KCP_HANDOFF_DEFAULT = "auto"
+KCP_HANDOFF_VERIFIED: frozenset[tuple[str, int, str]] = frozenset(
+    {
+        ("sm_103a", 148, "13.4"),
+        ("sm_103a", 152, "13.4"),
+        ("sm_107a", 212, "13.4"),
+    }
+)
+KCP_HANDOFF_HEADS: frozenset[int] = frozenset({4, 16, 64})
+# the tape set, in saved-set order: the h tape BF16 [NC_pad, H, 128, 128], v_new and w BF16 [R, H, 128], the internal
+# Aqk / Akk rows BF16 [R, H, 64]
+KCP_HANDOFF_BUFFERS = ("h", "v_new", "w", "aqk_int", "akk_int")
+
+
+def kda_handoff_bytes_kcp(ctx: ContextKcp, *, H: int = 64) -> int:
+    """Bytes of the checkpoint hand-off's tape set on this rank (:data:`KCP_HANDOFF_BUFFERS`)::
+
+    NC_pad * H * 32768                                         # the h tape
+    + R * H * (256 + 256 + 128 + 128)                          # v_new, w, aqk_int, akk_int
+
+    1280 B per internal token-head.  A forward that keeps the set keeps no carry plane (only the tape replay it
+    replaces reads the plane): :func:`kda_saved_bytes_kcp` with ``checkpoint_handoff=True`` is the saved set of such
+    a forward.  Under non-reentrant checkpoint the set lives inside the original forward call (freed on return) and
+    from the recompute to the end of that node's backward."""
+    H = int(H)
+    return ctx.NC_pad * H * 32768 + ctx.R * H * 768
+
 
 def _check_checkpoint_keep(
     checkpoint_keep: str | None, save_transfer: bool | None
@@ -2470,6 +2505,7 @@ def kda_saved_bytes_kcp(
     C: int = 8192,
     saved_carry: bool = True,
     checkpoint_keep: str | None = None,
+    checkpoint_handoff: bool = False,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kda_saved_bytes_kcp(ctx, ...)``)::
 
@@ -2506,7 +2542,10 @@ def kda_saved_bytes_kcp(
     The tier fixes ``save_transfer`` (``False`` / ``True``; ``None``, the default, is ``SAVE_TRANSFER_DEFAULT``
     without a tier; an explicit value that contradicts the tier raises ``ValueError``, as the entry point does);
     ``save_mode`` and ``saved_carry`` are not read.  The saved set itself is released by the checkpoint as before
-    (#7039)."""
+    (#7039).
+
+    ``checkpoint_handoff=True`` (without ``checkpoint_keep``): the saved set of a forward that keeps the checkpoint
+    hand-off's tape set -- plus :func:`kda_handoff_bytes_kcp`, without the carry plane term."""
     _check_save_mode(save_mode)
     save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
     H, C = int(H), int(C)
@@ -2527,12 +2566,14 @@ def kda_saved_bytes_kcp(
         total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * STATE_TILE_BYTES
         if hp.P > 1:
             total += hp.NSEG * s
-    if saved_carry and hp.P > 1:
+    if saved_carry and hp.P > 1 and not checkpoint_handoff:
         total += (ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)) * s
     if with_conv:
         total += ctx.halo.n_hist_rows * C * 2
     if save_mode == "tape":
         total += ctx.NC_pad * H * 32768 + ctx.R * H * 256
+    if checkpoint_handoff:
+        total += kda_handoff_bytes_kcp(ctx, H=H)
     return total
 
 
@@ -3218,6 +3259,12 @@ __all__ = [
     "partition_kcp",
     "kcp_plan",
     "kda_saved_bytes_kcp",
+    "kda_handoff_bytes_kcp",
+    "KCP_HANDOFF_BUFFERS",
+    "KCP_HANDOFF_DEFAULT",
+    "KCP_HANDOFF_HEADS",
+    "KCP_HANDOFF_MODES",
+    "KCP_HANDOFF_VERIFIED",
     "kda_workspace_bytes_kcp",
     "near_equal",
     "owner_of_head",

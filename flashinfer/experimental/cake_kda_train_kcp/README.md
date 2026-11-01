@@ -356,6 +356,30 @@ nesting level -- a mismatch hangs or corrupts data, and no rank checks the
 others.  The phase comes from `torch._C._current_graph_task_id()`; a torch
 without it refuses the handle.
 
+Checkpoint hand-off (`chunk_kda_kcp(..., checkpoint_handoff="auto" | "on" |
+"off")`): under `torch.utils.checkpoint` (reentrant or not) the forward of
+both passes keeps its tape set -- the `h` tape, `v_new`, `w` and the internal
+`Aqk` / `Akk` rows its own launches write -- in the saved set, and the
+backward reads it instead of re-running the intra program, WY, the K1 tape
+walk and, at `P > 1`, the offset re-walk and the carry merges.  The launch list
+of the forward and every collective are unchanged; the outputs and gradients
+are bitwise those of `"off"` on the verified rows.  Non-reentrant checkpoint
+drops the original forward's set at its return and keeps the recompute's until
+the node's backward: `kda_handoff_bytes_kcp(ctx, H=...)` (1280 B per internal
+token-head per rank) in both places; `kda_saved_bytes_kcp(..., checkpoint_handoff=True)`
+is the recompute's saved set (no carry plane).  `"auto"` (the default) engages
+at the head counts of `KCP_HANDOFF_HEADS` on the (architecture, SM count,
+toolkit) devices of `KCP_HANDOFF_VERIFIED`; `"on"` wherever the call supports
+it; `"off"` never.  The call keeps the light set outside a checkpoint pass,
+with `graph="replay"`, `spec3_probe`, `boundary_mode="replay"`, inside a
+CUDA-graph capture, under `torch.compile` tracing and under a Python dispatch
+mode (a selective-checkpoint policy).  The rule reads the saved-tensor hooks,
+the graph task and the call's static keys only, so both passes of a
+checkpoint take the same branch; the choice is rank-local and moves no
+collective.  It combines with a recompute handle.  `kcp_handoff_stats()`
+counts the forwards that kept a set, the backwards that read one and the
+refused requests by reason.
+
 One halo exchange for a layer's q / k / v convolutions:
 `cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)` returns the
 three outputs bitwise equal to three `cake_causal_conv1d_kcp` calls (outputs,
