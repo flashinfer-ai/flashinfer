@@ -1173,14 +1173,11 @@ _PAIRED_ROWS_CASES = (
     (("dim128_hpc2", 48, 64, 8, 128, 128, 0), False, "stp_dim128_hpc2"),
     (("dim128_hpc1", 32, 16, 16, 128, 128, 0), False, "stp_dim128_hpc1_s2w4"),
     (("dim128_hpc1_mb4", 40, 16, 16, 128, 128, 0), False, "stp_dim128_hpc1_mb4"),
-    # Batch 64: the z-gated one-token ring on B200, the persistent build on GB300.
+    # Batch 64: the z-gated one-token ring on B200 and GB300.
     (
         ("dim128_z", 64, 64, 8, 128, 128, 0),
         True,
-        {
-            "sm_100a": "mtp_short_ring_heads64_groups8_t1_stp_z",
-            "sm_103a": "stp_dim128_z_balanced",
-        },
+        "mtp_short_ring_heads64_groups8_t1_stp_z",
     ),
     (("dim128_z_b16", 16, 64, 8, 128, 128, 0), True, "stp_dim128_z_gated"),
     (("dim128_z_hpc1", 32, 16, 16, 128, 128, 0), True, "stp_dim128_z_gated"),
@@ -2409,22 +2406,24 @@ def test_stp_ring_route_keeps_the_single_token_programs_off_its_layout(
 
 
 # The same ring with the gate ``z`` (64 heads in 8 groups): BF16 single-token calls of that shape with ``z`` take
-# it at the measured batch on sm_100a at 148 SMs.
+# it at the measured batch on sm_100a at 148 SMs and sm_103a at 152 SMs.
 _STP_RING_Z = "mtp_short_ring_heads64_groups8_t1_stp_z"
 
 
 def test_stp_ring_programs_follow_the_measured_shapes() -> None:
-    """The z-gated ring runs 64 heads in 8 groups with ``z`` at batch 64, on sm_100a at 148 SMs alone; a call of
-    64 heads without ``z`` keeps the 64-head ring's intervals."""
-    devices = (("sm_103a", 152), ("sm_103a", 148), ("sm_100a", 152), ("sm_100a", 132))
+    """The z-gated ring runs 64 heads in 8 groups with ``z`` at batch 64, on sm_100a at 148 SMs and sm_103a at
+    152 SMs alone; a call of 64 heads without ``z`` keeps the 64-head ring's intervals (none on sm_103a)."""
+    devices = (("sm_103a", 148), ("sm_100a", 152), ("sm_100a", 132))
     for batch_size in range(1, 4097):
         program = cake.dim128_stp_ring_program
-        gated = program(batch_size, 64, 8, 148, "sm_100a", True)
-        assert gated == (_STP_RING_Z if batch_size == 64 else None)
+        for arch, sm_count in (("sm_100a", 148), ("sm_103a", 152)):
+            gated = program(batch_size, 64, 8, sm_count, arch, True)
+            assert gated == (_STP_RING_Z if batch_size == 64 else None)
         ring = cake.dim128_stp_ring(batch_size, 64, 8, 148, "sm_100a")
         assert program(batch_size, 64, 8, 148, "sm_100a", False) == (
             _STP_RING if ring else None
         )
+        assert program(batch_size, 64, 8, 152, "sm_103a", False) is None
         for arch, sm_count in devices:
             assert program(batch_size, 64, 8, sm_count, arch, False) is None
             assert program(batch_size, 64, 8, sm_count, arch, True) is None
@@ -2874,7 +2873,6 @@ def test_registry_names_every_program() -> None:
         paired_rows,
         **{
             _STP_RING: b200,
-            _STP_RING_Z: b200,
             _JR_RING: b200,
             _JR_HB_RING: gb300,
         },
