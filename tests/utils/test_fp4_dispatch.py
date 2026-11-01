@@ -71,6 +71,132 @@ def test_fp4_explicit_recipe_rejected_before_unsupported_arch(monkeypatch, backe
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "name,backend,kwargs,error",
+    [
+        pytest.param(
+            "fp4_quantize",
+            "cute-dsl",
+            {"sf_vec_size": 32},
+            "CuTe-DSL backend does not support sf_vec_size=32",
+            id="direct-cute-parameter-pair",
+        ),
+        pytest.param(
+            "nvfp4_quantize",
+            "cute-dsl",
+            {"sf_vec_size": 32},
+            "CuTe-DSL backend only supports sf_vec_size=16, got 32",
+            id="nvfp4-cute-global-sf-vec-size",
+        ),
+        pytest.param(
+            "nvfp4_quantize",
+            "cute-dsl",
+            {"per_token_activation": True, "expanded_idx_to_permuted_idx": object()},
+            "CuTe-DSL per-token NVFP4 quantization does not support expanded_idx_to_permuted_idx",
+            id="nvfp4-cute-per-token-expanded-idx",
+        ),
+        pytest.param(
+            "nvfp4_quantize",
+            "cuda",
+            {"expanded_idx_to_permuted_idx": object()},
+            "expanded_idx_to_permuted_idx is only supported with per_token_activation=True",
+            id="nvfp4-cuda-global-expanded-idx",
+        ),
+        pytest.param(
+            "nvfp4_quantize",
+            "cuda",
+            {"sf_vec_size": 32, "nvfp4_4over6": fp4.NVFP44Over6Config()},
+            "nvfp4_4over6 applies to NVFP4 only",
+            id="nvfp4-cuda-global-explicit-mxfp4-recipe",
+        ),
+    ],
+)
+def test_pure_quantizer_parameters_rejected_before_unsupported_arch(
+    monkeypatch, name, backend, kwargs, error
+):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    capability_query = Mock(return_value=(9, 0))
+    monkeypatch.setattr(utils, "get_compute_capability", capability_query)
+    copy = Mock(side_effect=AssertionError("CUDA copy must not run"))
+    scale_to = Mock(side_effect=AssertionError("global_scale.to must not run"))
+    x = SimpleNamespace(device=torch.device("cuda:3"), dtype=torch.bfloat16, cuda=copy)
+    if name == "fp4_quantize":
+        kwargs = {"global_scale": SimpleNamespace(to=scale_to), **kwargs}
+
+    with pytest.raises(ValueError, match=error):
+        _quantize(name, x, backend, kwargs)
+
+    capability_query.assert_not_called()
+    copy.assert_not_called()
+    scale_to.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "name,backend,from_env",
+    [
+        pytest.param("fp4_quantize", "cute-dsl", True, id="direct-cute-environment"),
+        pytest.param("nvfp4_quantize", "cute-dsl", True, id="nvfp4-cute-environment"),
+        pytest.param("nvfp4_quantize", "cuda", False, id="nvfp4-cuda-explicit"),
+        pytest.param(
+            "nvfp4_quantize", "cuda", True, id="nvfp4-cuda-environment-control"
+        ),
+    ],
+)
+def test_fp8_recipe_validation_before_unsupported_arch(
+    monkeypatch, name, backend, from_env
+):
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    capability_query = Mock(return_value=(9, 0))
+    monkeypatch.setattr(utils, "get_compute_capability", capability_query)
+    copy = Mock(side_effect=AssertionError("CUDA copy must not run"))
+    x = SimpleNamespace(
+        device=torch.device("cuda:3"), dtype=torch.float8_e4m3fn, cuda=copy
+    )
+    kwargs = {} if from_env else {"nvfp4_4over6": fp4.NVFP44Over6Config()}
+    legacy_cuda_env = backend == "cuda" and from_env
+    exception = RuntimeError if legacy_cuda_env else ValueError
+    error = (
+        "nvfp4_quantize requires SM100 or newer; got SM90"
+        if legacy_cuda_env
+        else "requires fp16 or bf16 input"
+    )
+
+    with pytest.raises(exception, match=error):
+        _quantize(name, x, backend, kwargs)
+
+    if legacy_cuda_env:
+        capability_query.assert_called_once_with(torch.device("cuda:0"))
+    else:
+        capability_query.assert_not_called()
+    copy.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "backend,recipe", [("cuda", None), ("cute-dsl", fp4.NVFP44Over6Config())]
+)
+def test_per_token_host_scale_rejected_before_unsupported_arch(
+    monkeypatch, backend, recipe
+):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    capability_query = Mock(return_value=(9, 0))
+    monkeypatch.setattr(utils, "get_compute_capability", capability_query)
+
+    with pytest.raises(ValueError, match="does not match the requested NVFP4"):
+        fp4.nvfp4_quantize(
+            SimpleNamespace(),
+            1.0,
+            per_token_activation=True,
+            backend=backend,
+            nvfp4_4over6=recipe,
+        )
+
+    capability_query.assert_not_called()
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("capability", [(8, 9), (9, 0)])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 @pytest.mark.parametrize("name,kwargs", _CASES)
@@ -186,10 +312,15 @@ def test_wrapper_rejects_unsupported_launch_device(monkeypatch, name, backend, k
         side_effect=lambda device: (9, 0) if device == target else (10, 0)
     )
     monkeypatch.setattr(utils, "get_compute_capability", capability_query)
+    item_read = Mock(side_effect=AssertionError("Tensor.item must not run"))
+    monkeypatch.setattr(torch.Tensor, "item", item_read)
+    if name == "nvfp4_quantize" and kwargs.get("per_token_activation"):
+        kwargs = {"nvfp4_4over6": None, **kwargs}
     x = SimpleNamespace(device=torch.device("cuda:3"), is_cuda=True)
     with pytest.raises(RuntimeError, match=f"{name} requires SM100 or newer; got SM90"):
         _quantize(name, x, backend, kwargs)
     capability_query.assert_called_once_with(target)
+    item_read.assert_not_called()
 
 
 @pytest.mark.cpu_only
