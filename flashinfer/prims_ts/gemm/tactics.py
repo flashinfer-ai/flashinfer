@@ -23,6 +23,15 @@ _FUSED_QKNORM_AB_STAGES = 4
 _NVFP4_AB_STAGES = 5
 _STAGE_CHOICES = (5, 6)
 _CLUSTERS = ((2, 2), (4, 4))
+_SM107_FP8_STAGE_CHOICES = (5, 6, 7, 8)
+_SM107_FP8_CLUSTERS = ((2, 2), (2, 4), (4, 4))
+_LOADABLE_AB_STAGES = (1, 2, 4, 5, 6)
+_SM107_FP8_LOADABLE_AB_STAGES = (1, 2, 4, 5, 6, 7, 8)
+# Measured on SM107: deeper NVFP4 pipelines did not help.
+_SM107_NVFP4_STAGE_CHOICES = (4, 5, 6)
+_SM107_SMEM_BYTES = 334848
+# Kept free for the epilogue
+_SM107_EPILOGUE_SMEM_BYTES = 16 * 1024
 MAX_PROFILED_TACTICS = 1024
 
 # cluster_m, cluster_n, tile_n, tile_k, tmem_overlap, ab_stages, mma_k,
@@ -49,8 +58,54 @@ def derived_ab_stages(
     return stages
 
 
-def stage_candidates(derived: int) -> tuple[int, ...]:
-    """Derived count plus the nearest smaller and larger known counts."""
+def default_fp8_mma_k(arch: int) -> int:
+    """FP8 MMA instruction K used when ``fp8_mma_k`` is unset."""
+    return 64 if arch == 107 else 32
+
+
+def _is_sm107_fp8(arch: int, operand_format: str) -> bool:
+    return arch == 107 and operand_format == "fp8_e4m3"
+
+
+def _is_sm107_nvfp4(arch: int, operand_format: str) -> bool:
+    return arch == 107 and operand_format == "nvfp4_e2m1"
+
+
+def _nvfp4_stage_bytes(tile_n: int, tile_k: int) -> int:
+    """A, B and their E4M3 block scales for one stage of one CTA."""
+    a_bytes = 128 * tile_k // 2
+    b_bytes = (tile_n // 2) * tile_k // 2
+    sfa_bytes = 128 * tile_k // 16
+    sfb_bytes = ((tile_n + 127) // 128) * 128 * tile_k // 16
+    return a_bytes + b_bytes + sfa_bytes + sfb_bytes
+
+
+def loadable_ab_stages(arch: int, operand_format: str) -> tuple[int, ...]:
+    """Stage counts ``_load_kernel`` accepts for an explicit ``ab_stages``."""
+    if arch == 107 and operand_format in ("fp8_e4m3", "nvfp4_e2m1"):
+        return _SM107_FP8_LOADABLE_AB_STAGES
+    return _LOADABLE_AB_STAGES
+
+
+def _clusters(arch: int, operand_format: str) -> tuple[tuple[int, int], ...]:
+    if arch == 107:
+        return _SM107_FP8_CLUSTERS
+    return _CLUSTERS
+
+
+def stage_candidates(
+    derived: int, arch: int = 0, operand_format: str = ""
+) -> tuple[int, ...]:
+    """Derived count plus its nearest known neighbours; all choices on SM107."""
+    sm107_choices = None
+    if _is_sm107_fp8(arch, operand_format):
+        sm107_choices = _SM107_FP8_STAGE_CHOICES
+    elif _is_sm107_nvfp4(arch, operand_format):
+        sm107_choices = _SM107_NVFP4_STAGE_CHOICES
+    if sm107_choices is not None:
+        if derived not in sm107_choices:
+            return (derived,)
+        return (derived, *(s for s in sm107_choices if s != derived))
     if derived not in _STAGE_CHOICES:
         return (derived,)
     index = _STAGE_CHOICES.index(derived)
@@ -136,9 +191,11 @@ def tactic_is_legal(
     # accumulator with a TMA output buffer.
     if use_tma_store and (output_format == "nvfp4_e2m1" or overlap):
         return False
-    if warps not in (4, 8) or mma_k not in (64, 96):
+    if warps not in (4, 8) or mma_k not in (64, 96, 128):
         return False
     if epilogue != "linear" and warps != 8:
+        return False
+    if epilogue == "qkv_qknorm_rope" and tile_n != 256:
         return False
     if operand_format == "nvfp4_e2m1":
         if tile_n not in (128, 256):
@@ -147,7 +204,20 @@ def tactic_is_legal(
         if mma_k == 96:
             if arch != 103 or tile_k != 256:
                 return False
-        elif tile_k not in (256, 512):
+        else:
+            if mma_k == 128 and arch != 107:
+                return False
+            if tile_k not in (256, 512):
+                return False
+        # Eight TMA-store warps stage twice the output tile.
+        epilogue_smem = _SM107_EPILOGUE_SMEM_BYTES * (
+            2 if use_tma_store and warps == 8 else 1
+        )
+        if (
+            arch == 107
+            and stages * _nvfp4_stage_bytes(tile_n, tile_k)
+            > _SM107_SMEM_BYTES - epilogue_smem
+        ):
             return False
     elif operand_format == "fp8_e4m3":
         if tile_n not in (32, 64, 128, 256) or tile_k not in (128, 256) or mma_k != 64:
@@ -173,20 +243,26 @@ def tactic_is_legal(
     # QKV's derived depth is 4, which is outside _STAGE_CHOICES. The candidate
     # list is the limit; an earlier membership test would drop that epilogue.
     derived = derived_ab_stages(operand_format, epilogue, mma_k, tile_n, tile_k)
-    return stages in stage_candidates(derived)
+    return stages in stage_candidates(derived, arch, operand_format)
 
 
-def _tile_ns() -> tuple[int, ...]:
+def _tile_ns(arch: int, operand_format: str) -> tuple[int, ...]:
+    if _is_sm107_nvfp4(arch, operand_format):
+        return (256, 128)
     return (256,)
 
 
 def _mma_ks(arch: int, operand_format: str) -> tuple[int, ...]:
     if arch == 103 and operand_format == "nvfp4_e2m1":
         return (64, 96)
+    if arch == 107 and operand_format == "nvfp4_e2m1":
+        return (64, 128)
     return (64,)
 
 
-def _tile_ks(operand_format: str, mma_k: int) -> tuple[int, ...]:
+def _tile_ks(arch: int, operand_format: str, mma_k: int) -> tuple[int, ...]:
+    if _is_sm107_nvfp4(arch, operand_format):
+        return (256, 512)
     if operand_format == "nvfp4_e2m1":
         return (256,)
     return (128,)
@@ -269,36 +345,37 @@ def _with_derived_stages(
 
 
 def _neighbors(
+    arch: int,
     operand_format: str,
     epilogue: str,
     base: Tactic,
 ) -> Iterator[Tactic]:
     """One-axis steps around the default, so the cap still covers every axis."""
-    for cluster_m, cluster_n in _CLUSTERS:
+    for cluster_m, cluster_n in _clusters(arch, operand_format):
         if (cluster_m, cluster_n) != (base[0], base[1]):
             yield _replace(base, cluster_m=cluster_m, cluster_n=cluster_n)
-    for tile_n in _tile_ns():
+    for tile_n in _tile_ns(arch, operand_format):
         if tile_n != base[2]:
             yield _with_derived_stages(
                 operand_format, epilogue, _replace(base, tile_n=tile_n, overlap=False)
             )
-    for mma_k in (64, 96):
+    for mma_k in _mma_ks(arch, operand_format):
         if mma_k == base[6]:
             continue
-        for tile_k in _tile_ks(operand_format, mma_k):
+        for tile_k in _tile_ks(arch, operand_format, mma_k):
             candidate = _with_derived_stages(
                 operand_format,
                 epilogue,
                 _replace(base, tile_k=tile_k, mma_k=mma_k, overlap=False),
             )
             yield candidate
-    for tile_k in _tile_ks(operand_format, base[6]):
+    for tile_k in _tile_ks(arch, operand_format, base[6]):
         if tile_k != base[3]:
             yield _with_derived_stages(
                 operand_format, epilogue, _replace(base, tile_k=tile_k, overlap=False)
             )
     derived = derived_ab_stages(operand_format, epilogue, base[6], base[2], base[3])
-    for stages in stage_candidates(derived):
+    for stages in stage_candidates(derived, arch, operand_format):
         if stages != base[5]:
             yield _replace(base, stages=stages)
     yield _replace(base, use_clc=not base[7])
@@ -319,14 +396,14 @@ def _product(
     operand_format: str,
     epilogue: str,
 ) -> Iterator[Tactic]:
-    for cluster_m, cluster_n in _CLUSTERS:
-        for tile_n in _tile_ns():
+    for cluster_m, cluster_n in _clusters(arch, operand_format):
+        for tile_n in _tile_ns(arch, operand_format):
             for mma_k in _mma_ks(arch, operand_format):
-                for tile_k in _tile_ks(operand_format, mma_k):
+                for tile_k in _tile_ks(arch, operand_format, mma_k):
                     derived = derived_ab_stages(
                         operand_format, epilogue, mma_k, tile_n, tile_k
                     )
-                    for stages in stage_candidates(derived):
+                    for stages in stage_candidates(derived, arch, operand_format):
                         # for use_clc in (True, False):
                         for use_clc in (True,):
                             for warps in _warps():
@@ -364,7 +441,7 @@ def legal_tactics(
             selected.append(tactic)
             seen.add(tactic)
 
-    for tactic in _neighbors(operand_format, epilogue, default):
+    for tactic in _neighbors(arch, operand_format, epilogue, default):
         add(tactic)
     for tactic in _product(arch, operand_format, epilogue):
         if len(selected) >= MAX_PROFILED_TACTICS:
