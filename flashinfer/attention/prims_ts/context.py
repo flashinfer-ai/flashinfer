@@ -205,6 +205,7 @@ class _ContextPlanState:
     lse_mode: str = "none"
     use_attention_sinks: bool = False
     sage: Optional[SagePreparedScales] = None
+    softmax_scale: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -244,6 +245,7 @@ class _PagedContextPlanState:
     policy: tuple[tuple[str, object], ...]
     lse_mode: str = "none"
     use_attention_sinks: bool = False
+    softmax_scale: Optional[float] = None
 
 
 _ContextScheduler = Literal[
@@ -2161,6 +2163,7 @@ def _get_compiled_context(
         max_q_len: cutlass.Int32,
         runtime_max_seq_len_k: cutlass.Int32,
         static_vc_repair_tiles: cutlass.Constexpr[int],
+        stats_scale: cutlass.Float32 | None,
     ) -> None:
         """Adapt torch TVM-FFI tensors to the FmhaTs host entry point."""
 
@@ -2188,6 +2191,7 @@ def _get_compiled_context(
                 lse_output=lse,
                 attention_sinks=attention_sinks,
                 softmax_stats=softmax_stats,
+                stats_scale=stats_scale,
             )
         else:
             fmha(
@@ -2212,6 +2216,7 @@ def _get_compiled_context(
                 attention_sinks=attention_sinks,
                 sage_scales=sage_scales,
                 softmax_stats=softmax_stats,
+                stats_scale=stats_scale,
             )
 
     # Describe row-major symbolic extents; assumed_align is in bytes.
@@ -2400,6 +2405,7 @@ def _get_compiled_context(
                 cutlass.Int32(0),
                 cutlass.Int32(0),
                 compile_spec.vc.repair_tiles if vc_attention else 0,
+                scale_fake if compile_spec.store_softmax_stats else None,
                 options=_COMPILE_OPTIONS,
             ),
             extra=(max_active_clusters,),
@@ -2518,6 +2524,7 @@ def _get_compiled_paged_context(
         static_max_active_clusters: cutlass.Constexpr[int],
         max_q_len: cutlass.Int32,
         runtime_max_kv_len: cutlass.Int32,
+        stats_scale: cutlass.Float32 | None,
     ) -> None:
         fmha(
             q,
@@ -2536,6 +2543,7 @@ def _get_compiled_paged_context(
             lse_output=lse,
             attention_sinks=attention_sinks,
             softmax_stats=softmax_stats,
+            stats_scale=stats_scale,
         )
 
     # Describe compact metadata or Q/O storage with byte-aligned pointers.
@@ -2624,6 +2632,7 @@ def _get_compiled_paged_context(
                 max_active_clusters,
                 cutlass.Int32(0),
                 cutlass.Int32(0),
+                scale_fake if compile_spec.store_softmax_stats else None,
                 options=_COMPILE_OPTIONS,
             ),
             extra=(max_active_clusters,),
@@ -3530,6 +3539,7 @@ class BatchPrefillTSWrapper:
             softmax_stats,
             max_q_len,
             max_kv_len,
+            softmax_scale if geometry.store_softmax_stats else None,
         )
         return (out, lse) if return_lse else out
 
@@ -3814,6 +3824,7 @@ class BatchPrefillPagedTSWrapper:
             softmax_stats,
             max_q_len,
             max_kv_len,
+            softmax_scale if geometry.store_softmax_stats else None,
         )
         return (out, lse) if return_lse else out
 

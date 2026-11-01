@@ -749,6 +749,7 @@ def build_context_task_manager(
     attention_sinks: cute.Tensor | None = None,
     softmax_stats: cute.Tensor | None = None,
     g_block_tables: cute.Pointer | None = None,
+    stats_scale: Float32 | None = None,
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
@@ -1353,6 +1354,7 @@ def build_context_task_manager(
         lse_output=lse_output,
         attention_sinks=attention_sinks,
         softmax_stats=softmax_stats,
+        stats_scale=stats_scale,
         cum_seqlen_q=cum_seqlen_q,
         query_seq_len=variable_window_q_stride,
         peer_idx=0,
@@ -1455,6 +1457,7 @@ def build_context_task_manager(
             lse_output=lse_output,
             attention_sinks=attention_sinks,
             softmax_stats=softmax_stats,
+            stats_scale=stats_scale,
             cum_seqlen_q=cum_seqlen_q,
             query_seq_len=variable_window_q_stride,
             peer_idx=1,
@@ -2940,6 +2943,7 @@ def build_fmha_task_manager(
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
     exhaustive_deadlock_race_check: bool | None = None,
+    stats_scale: Float32 | None = None,
 ) -> Tuple[
     TaskManager,
     list[MemoryResource],
@@ -3035,6 +3039,7 @@ def build_fmha_task_manager(
         lse_output=lse_output,
         attention_sinks=attention_sinks,
         softmax_stats=softmax_stats,
+        stats_scale=stats_scale,
         g_block_tables=g_block_tables,
         block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
@@ -3474,6 +3479,7 @@ class FmhaTs:
         lse_output: cute.Tensor | None = None,
         attention_sinks: cute.Tensor | None = None,
         softmax_stats: cute.Tensor | None = None,
+        stats_scale: Float32 | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -3871,6 +3877,7 @@ class FmhaTs:
                 attention_sinks,
                 softmax_stats,
                 dense_tail_capacity=capacity,
+                stats_scale=stats_scale,
             ).launch(
                 grid=grid,
                 block=[block_size, 1, 1],
@@ -3932,6 +3939,7 @@ class FmhaTs:
         attention_sinks: cute.Tensor | None = None,
         softmax_stats: cute.Tensor | None = None,
         dense_tail_capacity: cutlass.Constexpr[int] = 0,
+        stats_scale: Float32 | None = None,
     ) -> None:
         """Warp-specialised persistent FMHA TS kernel.
 
@@ -4019,6 +4027,7 @@ class FmhaTs:
             lse_output=lse_output,
             attention_sinks=attention_sinks,
             softmax_stats=softmax_stats,
+            stats_scale=stats_scale,
             q_offset=q_offset,
             tma_mu_desc=tma_mu_desc.get_ptr() if cfg.vc_restores_means else None,
             vc_q_scale=vc_q_scale if cfg.vc_qk8 else None,
