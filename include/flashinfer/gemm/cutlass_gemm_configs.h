@@ -158,6 +158,11 @@ enum class CutlassTileConfigSM120 {
   CtaShape128x128x256B,
   CtaShape256x128x128B,
   CtaShape128x256x128B,
+
+  // Small-M tiles used by the SM120/SM121 per-tensor FP8 GEMM (Pingpong schedule).
+  CtaShape16x64x128B,
+  CtaShape32x64x128B,
+  CtaShape64x64x128B,
 };
 
 enum class MainloopScheduleType {
