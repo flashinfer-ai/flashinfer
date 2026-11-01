@@ -28,6 +28,7 @@ from ...gemm.gemm_base import (
     _check_cudnn_plan_build_not_capturing,
     _gemm_workspace_at_least,
     _get_real_fp4_shape_from_packed_uint8,
+    _retain_cudnn_graph_if_capturing,
 )
 from ...utils import _get_cache_buf, get_compute_capability
 
@@ -391,6 +392,7 @@ def _run_cudnn_moe_grouped_gemm(
     workspace = _gemm_workspace_at_least(
         _get_cache_buf("grouped_mm_workspace", DEFAULT_WORKSPACE_SIZE, a.device), ws
     )
+    _retain_cudnn_graph_if_capturing(graph)
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
@@ -671,6 +673,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
         _get_cache_buf("grouped_mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device),
         ws,
     )
+    _retain_cudnn_graph_if_capturing(graph)
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
@@ -778,6 +781,7 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
     workspace = _gemm_workspace_at_least(
         _get_cache_buf("grouped_mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device), ws
     )
+    _retain_cudnn_graph_if_capturing(graph)
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
