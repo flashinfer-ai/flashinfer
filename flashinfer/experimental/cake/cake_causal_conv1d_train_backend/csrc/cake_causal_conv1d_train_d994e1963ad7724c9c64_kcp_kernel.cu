@@ -1642,23 +1642,38 @@ kernel_cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp(__nv_bfloat16* __restri
         red[tid * 32 + i_5] = acc[i_5];
     }
     __syncthreads();
-    int c0_0 = (ct * ct_vec + v) * 8;
-    if (sub == 0 && c0_0 < C) {
-        float tot[32];
+    int cb0 = ct * ct_vec * 8;
+    if (n_sub == 1) {
         #pragma unroll
-        for (int i_6 = 0; i_6 < 32; i_6++) {
-            tot[i_6] = red[v * 32 + i_6];
-        }
-        #pragma unroll 1
-        for (int s_2 = 1; s_2 < n_sub; s_2++) {
-            #pragma unroll
-            for (int i_7 = 0; i_7 < 32; i_7++) {
-                tot[i_7] = tot[i_7] + red[(s_2 * ct_vec + v) * 32 + i_7];
+        for (int k8 = 0; k8 < 8; k8++) {
+            int q1 = tid + k8 * 128;
+            if (cb0 + q1 < C) {
+                float u4[4];
+                #pragma unroll
+                for (int k_2 = 0; k_2 < 4; k_2++) {
+                    u4[k_2] = red[q1 * 4 + k_2];
+                }
+                asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(cb0 + q1) * 4])), "f"(u4[0]), "f"(u4[1]), "f"(u4[2]), "f"(u4[3]) : "memory");
             }
         }
-        #pragma unroll
-        for (int j_16 = 0; j_16 < 8; j_16++) {
-            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(c0_0 + j_16) * 4])), "f"(tot[j_16 * 4]), "f"(tot[j_16 * 4 + 1]), "f"(tot[j_16 * 4 + 2]), "f"(tot[j_16 * 4 + 3]) : "memory");
+    } else {
+        #pragma unroll 1
+        for (int q = tid; q < ct_vec * 8; q += 128) {
+            if (cb0 + q < C) {
+                float t4[4];
+                #pragma unroll
+                for (int k_3 = 0; k_3 < 4; k_3++) {
+                    t4[k_3] = red[q * 4 + k_3];
+                }
+                #pragma unroll 1
+                for (int s_2 = 1; s_2 < n_sub; s_2++) {
+                    #pragma unroll
+                    for (int k_4 = 0; k_4 < 4; k_4++) {
+                        t4[k_4] = t4[k_4] + red[s_2 * ct_vec * 32 + q * 4 + k_4];
+                    }
+                }
+                asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(cb0 + q) * 4])), "f"(t4[0]), "f"(t4[1]), "f"(t4[2]), "f"(t4[3]) : "memory");
+            }
         }
     }
     __threadfence();

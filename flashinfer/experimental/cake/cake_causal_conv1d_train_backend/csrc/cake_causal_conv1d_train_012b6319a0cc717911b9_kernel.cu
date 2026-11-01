@@ -1368,6 +1368,7 @@ kernel_cake_causal_conv1d_train_012b6319a0cc717911b9(__nv_bfloat16* __restrict__
         red[tid * 32 + i_5] = acc[i_5];
     }
     __syncthreads();
+#if __CUDA_ARCH__ == 1000
     int c0_0 = (ct * ct_vec + v) * 8;
     if (sub == 0 && c0_0 < C) {
         float tot[32];
@@ -1385,6 +1386,56 @@ kernel_cake_causal_conv1d_train_012b6319a0cc717911b9(__nv_bfloat16* __restrict__
         #pragma unroll
         for (int j_6 = 0; j_6 < 8; j_6++) {
             asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(c0_0 + j_6) * 4])), "f"(tot[j_6 * 4]), "f"(tot[j_6 * 4 + 1]), "f"(tot[j_6 * 4 + 2]), "f"(tot[j_6 * 4 + 3]) : "memory");
+#elif __CUDA_ARCH__ == 1030
+    int cb0 = ct * ct_vec * 8;
+    #pragma unroll 1
+    for (int q = tid; q < ct_vec * 8; q += 128) {
+        if (sub <= n_sub && cb0 + q < C) {
+            int vq = q >> 3;
+            int jq = q & 7;
+            float t4[4];
+            float u4[4];
+            const void* _smem_load_ptr_88 = reinterpret_cast<const void*>(red + (vq * 32 + jq * 4));
+            uint32_t _smem_load_addr_88 = static_cast<uint32_t>(__cvta_generic_to_shared(_smem_load_ptr_88));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&t4[0])), "=r"(*reinterpret_cast<uint32_t*>(&t4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&t4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&t4[(0) + 3]))
+                : "r"(_smem_load_addr_88));
+            #pragma unroll 1
+            for (int s_1 = 1; s_1 < n_sub; s_1++) {
+                int rq = s_1 * ct_vec + vq;
+                const void* _smem_load_ptr_89 = reinterpret_cast<const void*>(red + (rq * 32 + jq * 4));
+                uint32_t _smem_load_addr_89 = static_cast<uint32_t>(__cvta_generic_to_shared(_smem_load_ptr_89));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&u4[0])), "=r"(*reinterpret_cast<uint32_t*>(&u4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&u4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&u4[(0) + 3]))
+                    : "r"(_smem_load_addr_89));
+                #pragma unroll
+                for (int k_2 = 0; k_2 < 4; k_2++) {
+                    t4[k_2] = t4[k_2] + u4[k_2];
+                }
+            }
+            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(cb0 + q) * 4])), "f"(t4[0]), "f"(t4[1]), "f"(t4[2]), "f"(t4[3]) : "memory");
+#else
+    int cb0 = ct * ct_vec * 8;
+    #pragma unroll 1
+    for (int q = tid; q < ct_vec * 8; q += 128) {
+        if (sub <= n_sub && cb0 + q < C) {
+            int vq = q >> 3;
+            int jq = q & 7;
+            float t4[4];
+            #pragma unroll
+            for (int k_2 = 0; k_2 < 4; k_2++) {
+                t4[k_2] = red[vq * 32 + jq * 4 + k_2];
+            }
+            #pragma unroll 1
+            for (int s_1 = 1; s_1 < n_sub; s_1++) {
+                int rq = s_1 * ct_vec + vq;
+                #pragma unroll
+                for (int k_3 = 0; k_3 < 4; k_3++) {
+                    t4[k_3] = t4[k_3] + red[rq * 32 + jq * 4 + k_3];
+                }
+            }
+            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(cb0 + q) * 4])), "f"(t4[0]), "f"(t4[1]), "f"(t4[2]), "f"(t4[3]) : "memory");
+#endif
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");

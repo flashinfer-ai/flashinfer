@@ -1292,27 +1292,34 @@ kernel_cake_causal_conv1d_train_a79ed3e33712abf525ad(__nv_bfloat16* __restrict__
     }
     #pragma unroll
     for (int i_6 = 0; i_6 < 32; i_6++) {
-        red[(tid >> 5) * 4096 + i_6 * 32 + (tid & 31)] = acc[i_6];
+        red[(tid >> 5) * 4096 + i_6 * 32 + (tid & 31 ^ i_6 & 28)] = acc[i_6];
     }
     __syncthreads();
-    int c0_0 = (ct * ct_vec + v) * 8;
-    if (sub == 0 && c0_0 < C) {
-        float tot[32];
-        #pragma unroll
-        for (int i_7 = 0; i_7 < 32; i_7++) {
-            tot[i_7] = red[(v >> 5) * 4096 + i_7 * 32 + (v & 31)];
-        }
-        #pragma unroll 1
-        for (int s_1 = 1; s_1 < n_sub; s_1++) {
-            int ts = s_1 * ct_vec + v;
+    int cb0 = ct * ct_vec * 8;
+    #pragma unroll 1
+    for (int q_1 = tid; q_1 < ct_vec * 8; q_1 += 128) {
+        if (sub <= n_sub && cb0 + q_1 < C) {
+            int vq = q_1 >> 3;
+            int jq = q_1 & 7;
+            float t4[4];
+            float u4[4];
             #pragma unroll
-            for (int i_8 = 0; i_8 < 32; i_8++) {
-                tot[i_8] = tot[i_8] + red[(ts >> 5) * 4096 + i_8 * 32 + (ts & 31)];
+            for (int k_2 = 0; k_2 < 4; k_2++) {
+                t4[k_2] = red[(vq >> 5) * 4096 + (jq * 4 + k_2) * 32 + (vq & 31 ^ jq * 4)];
             }
-        }
-        #pragma unroll
-        for (int j_4 = 0; j_4 < 8; j_4++) {
-            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(c0_0 + j_4) * 4])), "f"(tot[j_4 * 4]), "f"(tot[j_4 * 4 + 1]), "f"(tot[j_4 * 4 + 2]), "f"(tot[j_4 * 4 + 3]) : "memory");
+            #pragma unroll 1
+            for (int s_1 = 1; s_1 < n_sub; s_1++) {
+                int rq = s_1 * ct_vec + vq;
+                #pragma unroll
+                for (int k_3 = 0; k_3 < 4; k_3++) {
+                    u4[k_3] = red[(rq >> 5) * 4096 + (jq * 4 + k_3) * 32 + (rq & 31 ^ jq * 4)];
+                }
+                #pragma unroll
+                for (int k_4 = 0; k_4 < 4; k_4++) {
+                    t4[k_4] = t4[k_4] + u4[k_4];
+                }
+            }
+            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(cb0 + q_1) * 4])), "f"(t4[0]), "f"(t4[1]), "f"(t4[2]), "f"(t4[3]) : "memory");
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");

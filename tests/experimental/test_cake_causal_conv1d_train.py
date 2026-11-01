@@ -29,7 +29,8 @@ case over the repeats is recorded.  The fp32 policy keeps the perf-size precisio
 
 The workspace contract: a caller-owned zeroed workspace and the package's per-(device, stream) workspace read
 back all zero after every launch, over changed shapes and routes; NaN-poisoned outputs are fully overwritten;
-CUDA Graph capture / replay with and without a caller-owned workspace; two streams with two workspaces at once;
+CUDA Graph capture / replay with and without a caller-owned workspace, one package buffer per capture and stream
+shared by the capture's backward calls; two streams with two workspaces at once;
 the backward is ONE ordinary launch (no reduce program) and keeps its speed beside a kernel resident on another
 stream (FlashInfer issues #7038 / #7548).  Autograd, non-reentrant activation checkpointing (2 x forward +
 backward) and gradient accumulation; the ``deterministic`` keyword and torch's deterministic mode.
@@ -1307,6 +1308,72 @@ def test_cuda_graph_replays_with_bwd_grid_mult(kind, bwd_grid_mult) -> None:
             bwd_grid_mult=bwd_grid_mult,
         )
         assert replays == GRAPH_REPLAYS * len(cases)
+
+
+def test_capture_zeroes_one_backward_workspace_per_capture_and_stream(
+    monkeypatch,
+) -> None:
+    """Without a caller workspace, the backward calls that one CUDA Graph capture records on one stream share one
+    zeroed package buffer (one fill per capture and stream), and a second capture gets a buffer of its own; replays
+    of both graphs into NaN-filled outputs keep ``dx`` bitwise the eager one and the gradients within budget, and
+    the buffer reads back zero after the replays."""
+
+    pytest.importorskip("cuda.bindings")
+    device = _device()
+    launched = []
+    run_module = pkg.run_module
+
+    def record_launch(name, values, *, device_index, grid=None):
+        launched.append(values["acc"].untyped_storage().data_ptr())
+        return run_module(name, values, device_index=device_index, grid=grid)
+
+    # the largest workspace first, so the later calls of a capture fit in the first call's buffer
+    shapes = ((4097, 1280, (1000, 0, 3, 3094)), (65, 256, (64, 1)), (1000, 512, "perf"))
+    problems = [_inputs(S, C, docs, key=41) for S, C, docs in shapes]
+    eager = [_backward(x, w, cu, dy)[0] for x, w, cu, dy in problems]
+    refs = [reference_backward(x, w, cu, dy) for x, w, cu, dy in problems]
+    side = torch.cuda.Stream(device=device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        for x, w, cu, dy in problems:
+            _backward(x, w, cu, dy)
+    torch.cuda.current_stream(device).wait_stream(side)
+    torch.cuda.synchronize(device)
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    captured = []
+    for _capture in range(2):
+        outs = [
+            (
+                torch.empty_like(x),
+                torch.empty(x.shape[1], WIDTH, dtype=w.dtype, device=device),
+            )
+            for x, w, _, _ in problems
+        ]
+        graph = torch.cuda.CUDAGraph()
+        launched.clear()
+        with torch.cuda.graph(graph, stream=side):
+            for (x, w, cu, dy), (dx, dw) in zip(problems, outs, strict=True):
+                _backward(x, w, cu, dy, dx=dx, dweight=dw)
+        torch.cuda.synchronize(device)
+        assert len(launched) == len(shapes) and len(set(launched)) == 1, launched
+        captured.append((graph, outs, launched[0]))
+    assert captured[0][2] != captured[1][2], "two captures share a package workspace"
+    for graph, outs, _ in captured:
+        for replay in range(GRAPH_REPLAYS):
+            for dx, dw in outs:
+                dx.fill_(float("nan"))
+                dw.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize(device)
+            for (dx, dw), dx_eager, refs_i, shape in zip(
+                outs, eager, refs, shapes, strict=True
+            ):
+                label = f"capture replay {replay} {shape}"
+                assert torch.equal(dx, dx_eager), label
+                _check_grads(dx, dw, None, refs_i, policy="bf16", label=label)
+    held = pkg._CAPTURE_WORKSPACES.get((device.index, side.cuda_stream))
+    assert held is not None and held[1].untyped_storage().data_ptr() == captured[1][2]
+    assert int(torch.count_nonzero(held[1])) == 0
 
 
 def test_two_streams_with_two_workspaces() -> None:
