@@ -975,6 +975,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "instantiations": {},
         "arches": [
             "sm_100a",
+            "sm_103a",
         ],
     },
     "cake_selective_state_update_6947b451e086ed2a3b90": {
