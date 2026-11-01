@@ -462,6 +462,79 @@ def test_zero_length_plans_keep_semantic_fixup_and_skip_empty_grids(
     assert empty.cp_grid[0] == 0
 
 
+def _sm107_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    num_sms: int,
+) -> gdn_cp.GDNCPPrefillPlan:
+    monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: "sm_107a")
+    monkeypatch.setattr(
+        gdn_cp.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=num_sms),
+    )
+    total = sum(seq_lens)
+    device = SimpleNamespace()
+    q = SimpleNamespace(shape=(total, heads, 128), device=device, dtype=torch.float16)
+    k = SimpleNamespace(shape=(total, heads, 128))
+    v = SimpleNamespace(shape=(total, heads, 128))
+    return gdn_cp._build_plan(
+        q, k, v, num_seqs=len(seq_lens), max_seqlen=max(seq_lens, default=0)
+    )
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "heads", "num_sms", "expected"),
+    [
+        # More than 2 CTAs per SM over sequences of one length: 3 CTAs per SM.
+        ((16384,), 16, 212, "state_fixup_simt_row4_mb3"),
+        ((8192, 8192), 16, 212, "state_fixup_simt_row4_mb3"),
+        ((2048,) * 4, 8, 212, "state_fixup_simt_row4_mb3"),
+        ((1024,) * 8, 8, 212, "state_fixup_simt_row4_mb3"),
+        ((16384,), 14, 216, "state_fixup_simt_row4_mb3"),
+        # At most 2 CTAs per SM: the default build.
+        ((16384,), 8, 212, "state_fixup_simt_row4"),
+        ((8192, 8192), 4, 212, "state_fixup_simt_row4"),
+        ((16384,), 14, 224, "state_fixup_simt_row4"),
+        ((4096,), 13, 208, "state_fixup_simt_row4"),
+        # Unequal sequences keep the default build at any grid: 8 heads over
+        # 6144 + 2048 tokens is 512 CTAs, where the 3-CTA build is slower.
+        ((6144, 2048), 8, 212, "state_fixup_simt_row4"),
+        ((2048, 6144), 16, 212, "state_fixup_simt_row4"),
+        ((0, 64, 0), 64, 148, "state_fixup_simt_row4"),
+    ],
+)
+def test_sm107_fixup_takes_three_ctas_per_sm_past_two_over_equal_sequences(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    num_sms: int,
+    expected: str,
+) -> None:
+    plan = _sm107_plan(monkeypatch, seq_lens, heads, num_sms)
+    assert plan.fixup_kernel == expected
+    assert plan.fixup_grid == (len(seq_lens) * heads * 32, 1, 1)
+    assert gdn_cp_jit.has_gdn_cp_kernel(expected, "sm_107a")
+
+
+def test_sm107_fixup_gate_needs_the_shipped_three_cta_program(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert gdn_cp_jit.has_gdn_cp_kernel("state_fixup_simt_row4_mb3", "sm_107a")
+    for arch in ("sm_100a", "sm_103a"):
+        assert not gdn_cp_jit.has_gdn_cp_kernel("state_fixup_simt_row4_mb3", arch)
+    shipped = gdn_cp_jit.program_for("state_fixup_simt_row4", "sm_107a")
+    mb3 = gdn_cp_jit.program_for("state_fixup_simt_row4_mb3", "sm_107a")
+    assert mb3 != shipped
+    records = gdn_cp_jit.MODULES
+    assert records[mb3]["arg_plan"] == records[shipped]["arg_plan"]
+    assert records[mb3]["arches"] == ["sm_107a"]
+    monkeypatch.setattr(gdn_cp, "has_gdn_cp_kernel", lambda _name, _arch: False)
+    plan = _sm107_plan(monkeypatch, (16384,), 16, 212)
+    assert plan.fixup_kernel == "state_fixup_simt_row4"
+
+
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 @pytest.mark.parametrize("io_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_qk_l2norm_in_kernel", [False, True])
