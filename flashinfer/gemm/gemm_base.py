@@ -398,6 +398,16 @@ def _require_contiguous_a_column_major_b(
         )
 
 
+def _require_cutlass_bf16_alignment(k: int, n: int) -> None:
+    # The kernel computes out^T, so K and N are the leading dimensions of its
+    # TMA operands; can_implement() rejects rows that are not 16-byte aligned.
+    if k % 8 != 0 or n % 8 != 0:
+        raise ValueError(
+            "The CUTLASS backend requires K and N to be multiples of 8 "
+            f"(16-byte aligned rows), got K={k} and N={n}."
+        )
+
+
 @supported_compute_capability([100, 103, 107])
 def _cutlass_mm_bf16_requirement(
     a: torch.Tensor,
@@ -419,6 +429,7 @@ def _cutlass_mm_bf16_requirement(
             "The CUTLASS backend does not support PDL. Use the TGV backend instead."
         )
     _require_contiguous_a_column_major_b(a, b, "CUTLASS")
+    _require_cutlass_bf16_alignment(a.shape[1], b.shape[1])
 
     _validate_bf16_output_dtype(out_dtype)
 
@@ -905,6 +916,7 @@ def _cutlass_bmm_bf16_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     backend: Literal["cudnn", "cutlass", "cutile", "tgv", "auto"] = "cudnn",
 ):
+    _require_cutlass_bf16_alignment(A.shape[-1], B.shape[-1])
     _validate_bf16_output_dtype(out_dtype)
 
     return True
