@@ -343,11 +343,26 @@ def test_accumulators_are_sized_from_the_rule(kind, C) -> None:
             pkg._accumulator_layout(variant, C, n_ch_tiles)
 
 
+def _owner_tiles(record: dict, arch: str, C: int) -> int:
+    """The largest channel tile count a backward ``record`` launches with at ``C`` on ``arch``, whatever ``S``:
+    the split's, or its route's :data:`cake_jit.TILE_OVERRIDES` row's when that has more."""
+
+    geometry = record["grid_rule"]["geometry"]
+    _, _, n_ch_tiles = cake_jit.channel_split(C, geometry=geometry, role="bwd")
+    entry = cake_jit.TILE_OVERRIDES.get(arch, {}).get(
+        (cake_jit.record_route(record, arch), C)
+    )
+    if entry is not None:
+        n_ch_tiles = max(n_ch_tiles, -(-(C // geometry["vec"]) // entry[0]))
+    return n_ch_tiles
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ARCHES)
 def test_backward_workspace_serves_every_backward_program(arch) -> None:
-    """The public backward workspace is the largest layout over every backward program of the architecture, so one
-    zeroed buffer serves whichever program and route a call selects; the capacity owner is an FP64 bias program
+    """The public backward workspace is the largest layout over every backward program of the architecture, each
+    at the largest tile count it may launch with (its split, or its route's ``TILE_OVERRIDES`` row), so one zeroed
+    buffer serves whichever program, plan and route a call selects; the capacity owner is an FP64 bias program
     (8 bytes x slots x 5 taps per channel, 40 with one copy)."""
 
     owner = cake_jit.workspace_record(arch)
@@ -360,19 +375,121 @@ def test_backward_workspace_serves_every_backward_program(arch) -> None:
         len(cake_jit.route_modules(arch, kind))
         for kind in cake_jit.backward_kinds(arch)
     )
-    for C in CHANNELS:
+    overridden = {C for _, C in cake_jit.TILE_OVERRIDES.get(arch, {})}
+    for C in sorted(set(CHANNELS) | overridden):
         nbytes = cake_jit.backward_workspace_bytes(arch, C)
-        for record in owners:
-            _, _, n_ch_tiles = cake_jit.channel_split(
-                C, geometry=record["grid_rule"]["geometry"], role="bwd"
-            )
-            assert (
-                cake_jit.accumulator_layout(record, C, n_ch_tiles)["total_bytes"]
-                <= nbytes
-            ), (arch, C)
-        per_channel = 8 * cake_jit.accumulator_words_per_channel(owner)
-        assert nbytes == _align16(_align16(per_channel * C) + 4 * cake_jit.channel_split(
-            C, geometry=owner["grid_rule"]["geometry"], role="bwd")[2])  # fmt: skip
+        layouts = [
+            cake_jit.accumulator_layout(record, C, _owner_tiles(record, arch, C))
+            for record in owners
+        ]
+        assert nbytes == max(layout["total_bytes"] for layout in layouts), (arch, C)
+        if C not in overridden:
+            per_channel = 8 * cake_jit.accumulator_words_per_channel(owner)
+            assert nbytes == _align16(_align16(per_channel * C) + 4 * cake_jit.channel_split(
+                C, geometry=owner["grid_rule"]["geometry"], role="bwd")[2])  # fmt: skip
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# The narrower channel tiles of the backward (``TILE_OVERRIDES``).
+
+
+@pytest.mark.cpu_only
+def test_tile_overrides_are_backward_rows() -> None:
+    """Every row of the rendered table names an exported architecture, one of its backward routes, a channel count
+    of the package and a ``ct_vec`` that is a whole number of warps no wider than a CTA, over a closed ``S`` range."""
+
+    assert set(cake_jit.TILE_OVERRIDES) <= set(ARCHES)
+    for arch, rows in cake_jit.TILE_OVERRIDES.items():
+        for (route, C), (ct_vec, s_min, s_max) in rows.items():
+            label = (arch, route, C)
+            assert route in cake_jit.backward_kinds(arch), label
+            assert C > 0 and C % cake_jit.CHANNEL_MULTIPLE == 0, label
+            assert 0 < s_min <= s_max, label
+            for name in cake_jit.route_modules(arch, route):
+                threads = cake_jit.MODULES[name]["grid_rule"]["geometry"]["threads"]
+                assert ct_vec % 32 == 0 and 0 < ct_vec <= threads, label
+
+
+@pytest.mark.cpu_only
+def test_tile_override_bounds_and_plan() -> None:
+    """A row's ``ct_vec`` applies from ``S_min`` through ``S_max`` (both included) and to no other token count,
+    route or architecture; ``plan`` of a backward record given its architecture and route then plans ``(ct_vec,
+    threads // ct_vec, ceil(C / vec / ct_vec))``, and :func:`cake_jit.channel_split`'s split outside the range, for
+    the forward role, under ``legacy`` and without the architecture or the route."""
+
+    for arch, rows in cake_jit.TILE_OVERRIDES.items():
+        for (route, C), (ct_vec, s_min, s_max) in rows.items():
+            label = (arch, route, C)
+            assert cake_jit.tile_override(arch, route, C, s_min - 1) is None, label
+            assert cake_jit.tile_override(arch, route, C, s_min) == ct_vec, label
+            assert cake_jit.tile_override(arch, route, C, s_max) == ct_vec, label
+            assert cake_jit.tile_override(arch, route, C, s_max + 1) is None, label
+            for other in ARCHES:
+                if (route, C) not in cake_jit.TILE_OVERRIDES.get(other, {}):
+                    assert cake_jit.tile_override(other, route, C, s_min) is None
+            for name in cake_jit.route_modules(arch, route):
+                geometry = cake_jit.MODULES[name]["grid_rule"]["geometry"]
+                threads, vec = geometry["threads"], geometry["vec"]
+                split = dict(
+                    zip(
+                        ("ct_vec", "n_sub", "n_ch_tiles"),
+                        cake_jit.channel_split(C, geometry=geometry, role="bwd"),
+                        strict=True,
+                    )
+                )
+                wanted = {
+                    "ct_vec": ct_vec,
+                    "n_sub": threads // ct_vec,
+                    "n_ch_tiles": -(-(C // vec) // ct_vec),
+                }
+                for S in (s_min, s_max):
+                    got = cake_jit.plan(
+                        S, C, 3, geometry=geometry, role="bwd", arch=arch, route=route
+                    )
+                    assert {k: got[k] for k in wanted} == wanted, (label, S)
+                for S in (s_min - 1, s_max + 1):
+                    got = cake_jit.plan(
+                        S, C, 3, geometry=geometry, role="bwd", arch=arch, route=route
+                    )
+                    assert {k: got[k] for k in split} == split, (label, S)
+                for kwargs in (
+                    {"role": "bwd"},
+                    {"role": "bwd", "arch": arch},
+                    {"role": "bwd", "route": route},
+                    {"role": "fwd", "arch": arch, "route": route},
+                ):
+                    got = cake_jit.plan(s_min, C, 3, geometry=geometry, **kwargs)
+                    want = cake_jit.channel_split(
+                        C, geometry=geometry, role=kwargs["role"]
+                    )
+                    assert (got["ct_vec"], got["n_sub"], got["n_ch_tiles"]) == want, (
+                        label,
+                        kwargs,
+                    )
+                got = cake_jit.plan(
+                    s_min, C, 3, geometry=geometry, legacy=True, arch=arch, route=route
+                )
+                want = cake_jit.channel_split(C, geometry=geometry, legacy=True)
+                assert (got["ct_vec"], got["n_sub"], got["n_ch_tiles"]) == want, label
+
+
+@pytest.mark.cpu_only
+def test_backward_workspace_covers_every_override_row() -> None:
+    """The public workspace of a row's ``C`` holds the layout of every program of the row's route at the row's tile
+    count (one ticket per tile), whatever ``S``."""
+
+    for arch, rows in cake_jit.TILE_OVERRIDES.items():
+        for (route, C), (_, s_min, _) in rows.items():
+            nbytes = cake_jit.backward_workspace_bytes(arch, C)
+            for name in cake_jit.route_modules(arch, route):
+                record = cake_jit.MODULES[name]
+                geometry = record["grid_rule"]["geometry"]
+                tiles = cake_jit.plan(
+                    s_min, C, 3, geometry=geometry, role="bwd", arch=arch, route=route
+                )["n_ch_tiles"]
+                assert tiles == cake_jit.override_tiles(arch, route, C, geometry)
+                layout = cake_jit.accumulator_layout(record, C, tiles)
+                assert layout["total_bytes"] <= nbytes, (arch, route, C, name)
 
 
 # ----------------------------------------------------------------------------------------------------------------

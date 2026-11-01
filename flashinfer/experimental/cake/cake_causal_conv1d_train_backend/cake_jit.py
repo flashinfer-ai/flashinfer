@@ -2884,6 +2884,116 @@ def _lane_use(channel_vectors: int, width: int, threads: int) -> float:
     )
 
 
+# The narrower channel tiles of the backward programs, ``{arch: {(route, C):
+# (ct_vec, S_min, S_max)}}``: at exactly these channel counts, on these routes
+# and at ``S_min <= S <= S_max`` a backward call runs ``ct_vec``-vector tiles
+# instead of :func:`channel_split`'s wider ones (:func:`tile_override`).  More
+# tiles split the tail of a launch: each tile's accumulator words take the adds
+# of fewer CTAs, and more tiles' last CTAs share the finish.  ``dx`` does not
+# depend on the tiling; ``dweight`` / ``dbias`` add in another partition.  The
+# workspace takes one ticket per tile (:func:`backward_workspace_bytes` covers
+# the largest tile count of every row, whatever ``S``).  Written by the exporter
+# from the backward kernel generator's table; every other channel count, route,
+# ``S`` and architecture keeps :func:`channel_split`.
+TILE_OVERRIDES: dict[str, dict[tuple[str, int], tuple[int, int, int]]] = {
+    "sm_100a": {
+        ("bwd_bias", 768): (32, 62585, 500680),
+        ("bwd_bias_fp32g", 768): (32, 31292, 500680),
+        ("bwd_dt", 768): (32, 62585, 500680),
+        ("bwd_fp32g", 768): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 1536): (32, 31292, 500680),
+        ("bwd_dt", 1536): (32, 31292, 125170),
+        ("bwd_fp32g", 1536): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 2048): (32, 31292, 500680),
+        ("bwd_fp32g", 2048): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 2560): (32, 31292, 125170),
+        ("bwd_fp32g", 2560): (32, 31292, 125170),
+        ("bwd", 3072): (32, 31292, 125170),
+        ("bwd_bias", 3072): (64, 31292, 500680),
+        ("bwd_bias_fp32g", 3072): (64, 31292, 500680),
+        ("bwd_dt", 3072): (64, 31292, 500680),
+        ("bwd_fp32g", 3072): (64, 31292, 500680),
+    },
+    "sm_103a": {
+        ("bwd", 768): (32, 62585, 500680),
+        ("bwd_bias", 768): (32, 62585, 500680),
+        ("bwd_bias_fp32g", 768): (32, 31292, 500680),
+        ("bwd_dt", 768): (32, 62585, 500680),
+        ("bwd_fp32g", 768): (32, 62585, 500680),
+        ("bwd", 1536): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 1536): (32, 31292, 500680),
+        ("bwd_dt", 1536): (32, 31292, 500680),
+        ("bwd_fp32g", 1536): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 2048): (32, 31292, 500680),
+        ("bwd_fp32g", 2048): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 2560): (32, 31292, 250340),
+        ("bwd_fp32g", 2560): (32, 31292, 250340),
+        ("bwd", 3072): (32, 31292, 500680),
+        ("bwd_bias", 3072): (64, 31292, 500680),
+        ("bwd_bias_fp32g", 3072): (32, 31292, 500680),
+        ("bwd_dt", 3072): (32, 31292, 500680),
+        ("bwd_fp32g", 3072): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 4096): (32, 31292, 500680),
+        ("bwd_fp32g", 4096): (32, 31292, 500680),
+    },
+    "sm_107a": {
+        ("bwd_dt", 768): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 1024): (32, 250340, 500680),
+        ("bwd_bias_fp32g", 1536): (32, 31292, 500680),
+        ("bwd_dt", 1536): (32, 31292, 125170),
+        ("bwd_fp32g", 1536): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 2048): (32, 31292, 500680),
+        ("bwd_dt", 2048): (32, 31292, 62585),
+        ("bwd_fp32g", 2048): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 2560): (32, 62585, 500680),
+        ("bwd_dt", 2560): (32, 62585, 500680),
+        ("bwd_fp32g", 2560): (32, 62585, 500680),
+        ("bwd", 3072): (32, 31292, 62585),
+        ("bwd_bias_fp32g", 3072): (32, 31292, 500680),
+        ("bwd_dt", 3072): (64, 31292, 500680),
+        ("bwd_fp32g", 3072): (32, 31292, 500680),
+        ("bwd", 4096): (32, 31292, 62585),
+        ("bwd_bias", 4096): (32, 62585, 125170),
+        ("bwd_bias_fp32g", 4096): (64, 31292, 500680),
+        ("bwd_dt", 4096): (32, 31292, 125170),
+        ("bwd_fp32g", 4096): (64, 31292, 500680),
+    },
+}
+
+
+def tile_override(arch: str, route: str, C: int, S: int) -> int | None:
+    """The ``ct_vec`` of :data:`TILE_OVERRIDES` for a backward call of ``route``
+    on ``arch`` with ``C`` channels and ``S`` tokens (``S_min <= S <= S_max``,
+    both bounds included), else ``None`` (:func:`channel_split` plans it)."""
+
+    entry = TILE_OVERRIDES.get(arch, {}).get((route, int(C)))
+    if entry is None:
+        return None
+    ct_vec, s_min, s_max = entry
+    return int(ct_vec) if int(s_min) <= int(S) <= int(s_max) else None
+
+
+def _override_split(
+    ct_vec: int, C: int, geometry: dict[str, int]
+) -> tuple[int, int, int]:
+    """``(ct_vec, n_sub, n_ch_tiles)`` of an override's ``ct_vec``: ``threads //
+    ct_vec`` token sub-tiles and ``ceil(C / vec / ct_vec)`` channel tiles."""
+
+    threads, vec = int(geometry["threads"]), int(geometry["vec"])
+    return ct_vec, threads // ct_vec, _ceil_div(int(C) // vec, ct_vec)
+
+
+def override_tiles(arch: str, route: str, C: int, geometry: dict[str, int]) -> int:
+    """The channel tiles of the :data:`TILE_OVERRIDES` row of ``(arch, route,
+    C)`` under ``geometry`` (0 without a row), whatever ``S``: the workspace
+    bound of the row's launches."""
+
+    entry = TILE_OVERRIDES.get(arch, {}).get((route, int(C)))
+    if entry is None:
+        return 0
+    return _override_split(int(entry[0]), C, geometry)[2]
+
+
 def plan(
     S: int,
     C: int,
@@ -2892,6 +3002,8 @@ def plan(
     geometry: dict[str, int],
     role: str | None = None,
     legacy: bool = False,
+    arch: str | None = None,
+    route: str | None = None,
 ) -> dict[str, int]:
     """The kernel's launch scalars for one problem under a record's build geometry and role.
 
@@ -2905,7 +3017,11 @@ def plan(
     geometry and the role: the host never reads ``cu_seqlens``, and the kernel
     derives its token ranges from ``S`` and the grid.  The ``flags`` scalar of
     the ``dtype_flags`` programs is not a plan value: the host derives it from
-    the tensors of the call.
+    the tensors of the call.  Given the backward record's ``arch`` and
+    ``route`` (:func:`record_route`), a row of :data:`TILE_OVERRIDES`
+    (:func:`tile_override`) replaces the split by ``(ct_vec, threads //
+    ct_vec, ceil(C / vec / ct_vec))``; without them, for the forward role and
+    under ``legacy`` the split is :func:`channel_split`'s.
     """
 
     S, C, num_docs = int(S), int(C), int(num_docs)
@@ -2914,6 +3030,10 @@ def plan(
     ct_vec, n_sub, n_ch_tiles = channel_split(
         C, geometry=geometry, role=role, legacy=legacy
     )
+    if role == "bwd" and not legacy and arch is not None and route is not None:
+        override = tile_override(arch, route, C, S)
+        if override is not None:
+            ct_vec, n_sub, n_ch_tiles = _override_split(override, C, geometry)
     return {
         "S": S,
         "C": C,
@@ -3239,15 +3359,18 @@ def backward_workspace_bytes(arch: str, C: int) -> int:
 
     The largest :func:`accumulator_layout` over every backward program of every
     backward route of the architecture (each planned with its own geometry and
-    role), so one zeroed buffer serves whichever program a call selects.  It
-    depends on ``C`` and the architecture only (not on ``S``, the SM count or
-    the grid).
+    role, at the larger of :func:`channel_split`'s tile count and its route's
+    :func:`override_tiles`), so one zeroed buffer serves whichever program and
+    plan a call selects.  It depends on ``C`` and the architecture only (not on
+    ``S``, the SM count or the grid).
     """
 
     nbytes = 0
     for owner in workspace_owners(arch):
-        _, _, n_ch_tiles = channel_split(
-            C, geometry=owner["grid_rule"]["geometry"], role=owner["role"]
+        geometry = owner["grid_rule"]["geometry"]
+        _, _, n_ch_tiles = channel_split(C, geometry=geometry, role=owner["role"])
+        n_ch_tiles = max(
+            n_ch_tiles, override_tiles(arch, record_route(owner, arch), C, geometry)
         )
         nbytes = max(
             nbytes, int(accumulator_layout(owner, C, n_ch_tiles)["total_bytes"])
