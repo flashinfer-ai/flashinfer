@@ -789,10 +789,11 @@ once per destination run of its tile table (the first launch carrying the
 folded rendezvous); on SM90 a call with at most 4096 rows per rank publishes one
 readiness word per destination, a call with at least 16384 rows per rank runs the
 persistent producer grid over every SM (no reserved SMs), and the per-destination
-launch gate is off; on SM107 every gate is off.  One cell differs from these
+launch gate is off; SM107 has no per-architecture gate.  Three cells differ from these
 per-architecture tables (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH_WORLD``):
-a group of 8 ranks on SM90 publishes one readiness word per destination for
-every row count (``words_capacity_small_m = all``).  A fourth gate,
+a group of 8 ranks on SM90 and groups of 2 and 4 ranks on SM107 publish one
+readiness word per destination for every row count
+(``words_capacity_small_m = all``).  A fourth gate,
 ``pair_off_large_m``, is off on every architecture: switched on
 (``pair_off_large_m=N``) it runs a 256-column call with at least ``N`` rows per
 rank on the single-CTA producer instead of the 2-CTA pair tile (the tile order
@@ -803,7 +804,8 @@ naming the gate -- and is refused on SM90, which builds no pair tile.  The
 environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (``auto`` / ``off`` /
 ``words_capacity_small_m=N|all,reserved_sms_large_m=N,per_dest_large_m=N,pair_off_large_m=N``)
 overrides them per session, rank-uniformly (``words_capacity_small_m=4096`` on
-SM90 with 8 ranks restores the previous plan); ``describe()`` reports the resolved
+SM90 with 8 ranks and ``words_capacity_small_m=0`` on SM107 restore the previous
+plans); ``describe()`` reports the resolved
 build (``producer_variant``), scale (``group_m_scale``) and gates
 (``shape_gates``) with their sources, and every prepared row's verdict
 (``prepared_row_plans``, including its ``reserved_sms``).  The first three gates
