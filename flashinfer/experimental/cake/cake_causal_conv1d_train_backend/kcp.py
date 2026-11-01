@@ -41,8 +41,12 @@ reductions; the last CTA of each channel tile (a ticket on its ``work``
 counter) stores the rank-local FP32 ``dweight`` partial and zeroes the tile's
 accumulators and counter.  ``acc`` / ``work`` are the package's cached
 backward workspace of the device and current stream (zero before and after
-every launch; inside a CUDA Graph capture one zeroed buffer per capture and
-stream, shared by the capture's backward calls on that stream).
+every launch; inside a CUDA Graph capture with a nonzero capture id one zeroed
+buffer per capture and stream, shared by the capture's backward calls on that
+stream, with another fill node when a call needs a larger buffer, and kept
+alive after its graph is freed until a later capture on that stream replaces
+it; with capture id 0, also without ``cuda.bindings``, each captured call
+zeroes a buffer of its own).
 
 Numerics: ``y`` and ``hist`` are the det KCP forward's bits; ``dx`` is the det
 KCP backward's bits (same per-thread FP32 steps, same tail fold, one BF16

@@ -69,10 +69,15 @@ Host design (the knobs are keywords; no environment variable):
   which returns it zeroed) serves every later backward call of one stream;
   when omitted the package keeps one zeroed buffer per (device, current
   stream), grown as needed and never zeroed again.  Inside a CUDA Graph
-  capture an omitted workspace is a zeroed buffer of that capture and stream:
-  the capture's first backward call on the stream zeroes it (one fill node),
-  its later calls on that stream reuse it (grown when one needs more), and no
-  eager call or other capture shares it.
+  capture with a nonzero CUDA capture id (``cudaStreamGetCaptureInfo``) an
+  omitted workspace is a zeroed buffer of that capture and stream: the
+  capture's first backward call on the stream zeroes it (one fill node) and
+  its later calls on that stream reuse it; a call that needs more bytes
+  zeroes a larger one (another fill node) that replaces it.  No eager call
+  and no other capture shares it.  The buffer stays alive after its graph is
+  freed, until a later capture on that stream replaces it.  When the capture
+  id is 0 (also when ``cuda.bindings`` is not importable), every captured
+  backward call allocates and zeroes a buffer of its own.
   Its size depends on ``C`` (and the route), not on ``S``.  Two backward
   launches that may run at once (two streams, two graphs replayed
   concurrently) need two buffers: never share one between them.
@@ -146,10 +151,14 @@ _FORWARD_WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
 _BACKWARD_WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
 # The backward workspaces of the calls that pass none inside a CUDA Graph capture:
 # (device index, capture stream handle) -> (CUDA capture id, zeroed uint8 buffer).
-# The capture's first such call on the stream zeroes the buffer (the only fill
-# node it records there); every launch leaves it zero and the stream orders the
-# launches, so the later calls of the same capture and stream reuse it.  Another
-# capture (another id) replaces the entry with its own buffer.
+# The capture's first such call on the stream zeroes the buffer (a fill node);
+# every launch leaves it zero and the stream orders the launches, so the later
+# calls of the same capture and stream reuse it.  A call that needs more bytes
+# zeroes a larger buffer (another fill node) that replaces the entry.  Another
+# capture (another id) replaces the entry with its own buffer; until then the
+# entry keeps the buffer alive, also after its graph is freed.  A call whose
+# capture id is 0 (no ``cuda.bindings``) adds no entry: it zeroes a buffer of
+# its own.
 _CAPTURE_WORKSPACES: dict[tuple[int, int], tuple[int, torch.Tensor]] = {}
 # The byte layout of a backward launch per accumulator rule, C and channel tile count (a pure function of them),
 # computed once: it is on the host path of every backward call before its launch.
@@ -804,13 +813,15 @@ def _backward_accumulators(
     A caller-owned ``workspace`` (1-D uint8, contiguous, 16-byte aligned, on
     ``device``, at least ``layout["total_bytes"]`` bytes, ZERO before its first
     launch: allocate it with :func:`cake_causal_conv1d_train_backward_workspace`)
-    is used as is.  Without one: inside a CUDA Graph capture the zeroed buffer
-    of that capture and stream (``_CAPTURE_WORKSPACES``: its zeroing is
-    captured once, with the capture's first backward call on the stream, so the
-    graph shares no accumulators with eager calls or other graphs, and its
-    later calls on the stream reuse it; a larger zeroed one replaces it when it
-    is too small); else the zeroed buffer this module keeps for the device and
-    the current stream, replaced by a larger zeroed one when it is too small.
+    is used as is.  Without one: inside a CUDA Graph capture with a nonzero
+    capture id the zeroed buffer of that capture and stream
+    (``_CAPTURE_WORKSPACES``: zeroed by the capture's first backward call on
+    the stream, so the graph shares no accumulators with eager calls or other
+    graphs, and reused by its later calls on the stream; a larger zeroed one,
+    another fill node, replaces it when it is too small); inside a capture with
+    capture id 0, a fresh zeroed buffer per call; else the zeroed buffer this
+    module keeps for the device and the current stream, replaced by a larger
+    zeroed one when it is too small.
     Every launch leaves the bytes it uses zero, so a zeroed buffer stays zero
     whatever ``C`` or route the next call has.  ``acc`` is a ``float32`` /
     ``float64`` view of ``layout["acc_elems"]`` words at offset 0, ``work`` a
@@ -1003,8 +1014,10 @@ def cake_causal_conv1d_train_backward(
         later call of one stream; never share one between two launches that may
         run at once).  When omitted the package uses a zeroed buffer it keeps per
         (device, current stream), or inside a CUDA Graph capture one zeroed
-        buffer per capture and stream (one fill node, shared by the capture's
-        backward calls on that stream).
+        buffer per capture and stream, shared by the capture's backward calls
+        on that stream (one fill node, and another for a larger buffer when a
+        call needs more bytes).  With capture id 0 (also without
+        ``cuda.bindings``) each captured call zeroes a buffer of its own.
     dx, dweight, dbias : torch.Tensor, optional
         Preallocated outputs: BF16 of ``x``'s shape, ``[C, 4]`` and ``[C]``
         (FP32 or BF16 each; the parameter's dtype when omitted), contiguous.
