@@ -5,18 +5,20 @@ indexer gives the scores that pick these keys. The DSA indexer has many heads
 (`fp8_paged_mqa_logits`, `fp4_paged_mqa_logits`). The kernels in
 `flashinfer.attn_scores.single_head` serve an indexer with one query head and no
 head weights: a score is the dot product of a query row and a key. The module
-has four parts:
+has five parts:
 
 - decode scores: `single_head_paged_mqa_logits` scores 1 to 8 query rows of a
   request against all its keys;
 - prefill selection: `single_head_paged_mqa_threshold_select` writes only the
   keys that score at or above a threshold for each query row;
+- Top-K from the selection: `top_k_from_candidates` writes the Top-K keys of
+  each query row from its selected keys;
 - thresholds from a key sample: `gather_key_sample` and `thresholds_from_sample`;
 - NVFP4 keys and queries: `quantize_write_index_qk_nvfp4` writes the keys to the
   paged cache and the queries to rows, in one launch.
 
-A Top-K kernel then takes the final Top-K from the scores, or from the selected
-keys. The selected keys feed token-sparse attention
+For decode, a Top-K kernel takes the Top-K from the scores. The Top-K keys feed
+token-sparse attention
 ([token_sparse_attention.md](token_sparse_attention.md)).
 
 ## Public API
@@ -27,6 +29,7 @@ All functions are in `flashinfer.attn_scores`.
 | --- | --- |
 | `single_head_paged_mqa_logits(query, key_cache, block_table, context_lengths, *, requests, scores, query_scales=None, key_scales=None)` | Write the FP32 score of each query row with each key of its request. |
 | `single_head_paged_mqa_threshold_select(query, key_cache, row_ends, tile_requests, block_table, *, thresholds, counters, candidates, max_context, top_k, query_scales=None, key_scales=None, arrivals=None, ranges=None)` | Keep the keys at or above the threshold of each query row, as (key, score) pairs. |
+| `top_k_from_candidates(candidates, ranges, *, top_keys)` | Write the Top-K keys of each query row from the pairs in its range. |
 | `gather_key_sample(key_cache, block_table, offsets, sample_ends, *, sample_keys, samples_per_run, pages_per_run, key_scales=None, sample_scales=None)` | Copy a strided random sample of the keys of each request into dense rows. |
 | `thresholds_from_sample(sample_scores, sample_top, *, thresholds, counters)` | Set the threshold of each query row from its sampled Top scores, and zero its counters. |
 | `quantize_write_index_qk_nvfp4(key, slots, query, query_rows, *, key_cache, key_scales, packed_query, query_scales)` | Quantize BF16 or FP16 keys and queries to NVFP4: the keys at their cache slots, the queries at their rows. |
@@ -96,6 +99,20 @@ candidates fit the `capacity` slots, and its candidates and ties reach
 Then the exact Top-`top_k` keys of the row are among its slots. Here, 2 + 2
 reaches 4, so the Top-4 keys are keys 3 and 0 and the two ties.
 
+### Top-K from the selection
+
+```text
+candidates:  [rows, slots, 2] int32  the select's (key, score bits) pairs
+ranges:      [2, rows] int32         the select's ranges
+top_keys:    [rows, top_k] int32     output: the Top-K keys of each row
+```
+
+`top_k_from_candidates` reads the pairs of row r in slots `ranges[0, r]` to
+`ranges[1, r] - 1`, and writes the keys of the `top_k` largest scores to
+`top_keys[r]`, in no set order. If the scores at the cutoff are equal, it takes
+any of them. A row of at most `top_k` pairs gets all its keys, then -1. In the
+example, the row's 4 pairs give the keys 0, 2, 3 and 4.
+
 ## How it works
 
 ### Decode scores
@@ -130,6 +147,26 @@ fit: it scores the keys of the tile again, and selects again at the
 finds. So any threshold gives the same exact result. The threshold only sets
 how often the repair runs.
 
+### Top-K from the selection
+
+The select stores scores that keep the order of the row's scores, so the Top-K
+of the stored scores is the Top-K of the scores. A CTA of 256 threads takes a
+row. It finds the row's `top_k`-th largest score, the threshold, on the score
+bits flipped so that their unsigned order is float order, one digit at a time:
+
+1. It counts the top 11 bits of each score in 2048 bins in shared memory. A scan
+   of the bins finds the bin that holds the threshold.
+2. It reads the scores again, from L2, and counts the next 11 bits of the scores
+   in that bin. A scan finds the bin that holds the threshold, and so on for the
+   last 10 bits. It stops when it needs all the scores of a bin.
+3. It reads the pairs again. The keys above the threshold go to the first
+   positions of the row. The keys equal to the threshold go to the last
+   positions, until the row has `top_k` keys.
+
+For each 64 pairs, a warp gets its positions from ballots, and reserves them
+with one shared-memory atomic. Thus its stores are coalesced. Many equal scores
+need no other path: step 2 then counts all the digits.
+
 ### Thresholds from a sample
 
 A good threshold makes the repair rare:
@@ -161,13 +198,14 @@ quantized the same way, so their scores stay comparable.
   need SM10x. Off SM10x, `single_head_paged_mqa_logits` runs the Triton kernel,
   which takes only BF16 queries and keys, with contiguous rows.
 - `gather_key_sample` takes sample rows of whole 128-key tiles.
+- `top_k_from_candidates` takes `top_k` below 65536.
 
 ## CUDA graphs
 
 No kernel synchronizes with the host. Run each one once before capture, because
-the CuTe-DSL kernels compile on first use. Queries, keys, pages, lengths and
-thresholds can change between replays. Zero the `arrivals` of the select once:
-every call leaves them at zero.
+the CuTe-DSL kernels compile on first use. Queries, keys, pages, lengths,
+thresholds and ranges can change between replays. Zero the `arrivals` of the
+select once: every call leaves them at zero.
 
 ## Tracing
 
@@ -186,6 +224,13 @@ Each API records a trace template of the same name, with a reference.
 - selection: BF16 and NVFP4; `top_k` 64, 512 and 2048; with and without the
   repair; query and key lengths that end on a page or in a key tile, and tiles
   with runs of several CTAs, some short and some empty; a CUDA graph replay.
+  After the repair, `top_k_from_candidates` must give the Top-K keys of each
+  row's scores.
+- `top_k_from_candidates`: `top_k` 512, 2048 and 65535; random ranges, empty,
+  shorter than `top_k`, one pair longer, and of all the slots; normal scores, a
+  few values, all equal, and zeros of both signs, infinities and NaNs; a CUDA
+  graph replay with new ranges. The selected scores must be the largest of the
+  row.
 - `gather_key_sample`: BF16 and NVFP4, with pages in the first 2**31 bytes of
   the cache and after them. Slots after the sample end stay as they are.
 - `thresholds_from_sample`: -1 positions and NaN scores.

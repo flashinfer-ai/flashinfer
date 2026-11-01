@@ -846,3 +846,29 @@ thresholds_from_sample_trace = TraceTemplate(
     },
     tags=["arch:sm100", "arch:sm103"],
 )
+
+
+top_k_from_candidates_trace = TraceTemplate(
+    op_type="top_k_from_candidates",
+    description=(
+        "Each query row's exact Top-K keys among the (key, score bits) candidate "
+        "and tie pairs that single-head threshold select stored in its range of "
+        "slots."
+    ),
+    axes={
+        "rows": Var(description="Query rows."),
+        "slots": Var(description="Tie slots, then candidate slots."),
+        "pair": Const(description="Key index and score bits."),
+        "range": Const(description="A row's first and past-last Top-K slot."),
+        "top_k": Var(description="Keys per row."),
+    },
+    inputs={
+        "candidates": Tensor(["rows", "slots", "pair"]),
+        "ranges": Tensor(["range", "rows"]),
+        "top_keys": Tensor(["rows", "top_k"]),
+    },
+    outputs={
+        "top_keys": Tensor(["rows", "top_k"], dtype="int32", param="top_keys"),
+    },
+    tags=["arch:sm100", "arch:sm103"],
+)

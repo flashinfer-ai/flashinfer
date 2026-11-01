@@ -148,6 +148,7 @@ single_head_paged_mqa_logits_page_size64_dim64.json
 single_head_paged_mqa_threshold_select_page_size64_dim128_counters2_pair2.json
 thresholds_from_sample_counters2.json
 token_sparse_kv_indices_top_k2048_lists2.json
+top_k_from_candidates_pair2_range2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -3498,6 +3499,7 @@ from flashinfer.attn_scores import (
     single_head_paged_mqa_logits,
     single_head_paged_mqa_threshold_select,
     thresholds_from_sample,
+    top_k_from_candidates,
 )
 
 single_head_paged_mqa_logits.fi_trace(
@@ -3567,4 +3569,11 @@ thresholds_from_sample.fi_trace(
     sample_top=torch.empty(256, 64, dtype=torch.int32),
     thresholds=torch.empty(256),
     counters=torch.empty(256, 2, dtype=torch.int32),
+)
+
+top_k_from_candidates.fi_trace(
+    save_dir=SAVE_DIR,
+    candidates=torch.empty(256, 4096, 2, dtype=torch.int32),
+    ranges=torch.empty(2, 256, dtype=torch.int32),
+    top_keys=torch.empty(256, 2048, dtype=torch.int32),
 )

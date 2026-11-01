@@ -28,6 +28,7 @@ from ...cute_dsl.fp4_common import (
     fmax_f32,
     fp8_e4m3_to_f32,
 )
+from ...topk_varlen.kernels import block_scan
 from ..single_head_shapes import CTAS_PER_SM, DIM, MAX_ROWS, PAGE, TILE
 
 # Keys come in block-table pages of PAGE keys and are scored in tiles of TILE
@@ -78,6 +79,16 @@ LANE_VALUES = DIM // KEY_LANES
 LANES_PER_SCALE = SCALE_VECTOR // LANE_VALUES
 WRITE_ROWS_PER_CTA = TILE // KEY_LANES
 THRESHOLD_ROWS_PER_CTA = 4  # thresholds_kernel: a warp per row
+# candidate_top_k_kernel: a CTA of TOP_K_THREADS threads per row finds the
+# row's top_k-th largest score one digit of its 32 ordered bits at a time, in
+# TOP_K_DIGITS (shift, bits) from the top, counting a digit in up to TOP_K_BINS
+# bins. A thread loads TOP_K_LOADS scores at a time to count them, then
+# TOP_K_BATCH pairs at a time to write their keys.
+TOP_K_THREADS = 256
+TOP_K_LOADS = 8
+TOP_K_BATCH = 2
+TOP_K_DIGITS = ((21, 11), (10, 11), (0, 10))
+TOP_K_BINS = 1 << 11
 
 
 @dsl_user_op
@@ -1193,6 +1204,266 @@ def thresholds_kernel(
             thresholds[row] = least
         if lane < COUNTERS:
             counters[row, lane] = 0
+
+
+@cute.jit
+def ordered_bits(bits: cutlass.Uint32) -> cutlass.Uint32:
+    """A float's 32 bits, flipped so that their unsigned order is float order
+    (as PagedScorer.ordered)."""
+    flip = cutlass.Uint32(cutlass.Int32(bits) >> 31) | cutlass.Uint32(0x80000000)
+    return bits ^ flip
+
+
+@cute.jit
+def pivot_bin(
+    bins: cute.Tensor,
+    sums: cute.Tensor,
+    found: cute.Tensor,
+    need: cutlass.Int32,
+    per: cutlass.Constexpr[int],
+    thread: cutlass.Int32,
+):
+    """The bin holding the need-th largest count of TOP_K_THREADS * per bins,
+    counting from the top, the count still needed from it, and its count.
+    Thread t sums the t-th run of per bins from the top, and a scan gives the
+    counts above each run."""
+    first = (TOP_K_THREADS - 1 - thread) * per
+    mine = cutlass.Int32(0)
+    for b in cutlass.range_constexpr(per):
+        mine += bins[first + b]
+    below, _ = block_scan.block_prefix_sum_kernel(
+        mine, sums, thread, TOP_K_THREADS, TOP_K_THREADS // 32
+    )
+    above = below - mine
+    if above < need and need <= below:
+        for b in cutlass.range_constexpr(per - 1, -1, -1):
+            here = bins[first + b]
+            if above < need and need <= above + here:
+                found[0] = first + b
+                found[1] = need - above
+                found[2] = here
+            above += here
+    cute.arch.barrier()
+    result = (found[0], found[1], found[2])
+    cute.arch.barrier()
+    return result
+
+
+@cute.jit
+def count_top_digits(
+    words: cute.Tensor,
+    bins: cute.Tensor,
+    first: cutlass.Int32,
+    count: cutlass.Int32,
+):
+    """Count the top digit of the scores of pairs first, first +
+    TOP_K_THREADS, ... (TOP_K_LOADS of them) below `count`. The loads come
+    first, so that they overlap."""
+    loaded = cute.make_rmem_tensor((TOP_K_LOADS,), cutlass.Int32)
+    for j in cutlass.range_constexpr(TOP_K_LOADS):
+        if first + j * TOP_K_THREADS < count:
+            loaded[j] = words[2 * (first + j * TOP_K_THREADS) + 1]
+    for j in cutlass.range_constexpr(TOP_K_LOADS):
+        if first + j * TOP_K_THREADS < count:
+            digit = ordered_bits(cutlass.Uint32(loaded[j])) >> TOP_K_DIGITS[0][0]
+            cute.arch.atomic_add(
+                (bins.iterator + digit.to(cutlass.Int32)).llvm_ptr,
+                cutlass.Int32(1),
+                scope="cta",
+            )
+
+
+@cute.jit
+def count_digit(
+    words: cute.Tensor,
+    bins: cute.Tensor,
+    first: cutlass.Int32,
+    count: cutlass.Int32,
+    bin_bits: tuple,
+    shift: cutlass.Constexpr[int],
+    width: cutlass.Constexpr[int],
+):
+    """Count the digit at `shift` of the ordered bits of the scores of pairs
+    first, first + TOP_K_THREADS, ... (TOP_K_LOADS of them) below `count` that
+    are in the threshold's bin. `bin_bits` is (prefix, mask, flip): the bin
+    holds scores of one sign, so their ordered bits are their bits ^ flip, and
+    a score is in it if its bits under `mask` are `prefix`. The loads come
+    first, so that they overlap."""
+    prefix, mask, flip = bin_bits
+    loaded = cute.make_rmem_tensor((TOP_K_LOADS,), cutlass.Int32)
+    for j in cutlass.range_constexpr(TOP_K_LOADS):
+        loaded[j] = cutlass.Int32(prefix ^ 0x80000000)  # not in the bin
+        if first + j * TOP_K_THREADS < count:
+            loaded[j] = words[2 * (first + j * TOP_K_THREADS) + 1]
+    for j in cutlass.range_constexpr(TOP_K_LOADS):
+        bits = cutlass.Uint32(loaded[j])
+        if bits & mask == prefix:
+            digit = ((bits ^ flip) >> shift) & ((1 << width) - 1)
+            cute.arch.atomic_add(
+                (bins.iterator + digit.to(cutlass.Int32)).llvm_ptr,
+                cutlass.Int32(1),
+                scope="cta",
+            )
+
+
+@cute.jit
+def write_keys(
+    pairs: cute.Tensor,
+    out: cute.Tensor,
+    taken: cute.Tensor,
+    first: cutlass.Int32,
+    count: cutlass.Int32,
+    threshold: tuple,
+    lane: cutlass.Int32,
+    checked: cutlass.Constexpr[bool],
+):
+    """Write the keys of pairs first, first + TOP_K_THREADS, ... (TOP_K_BATCH
+    of them, those below `count` if `checked`) above the threshold to the next
+    positions of `out`, and those equal to it to the last `need` positions,
+    while some are free. `threshold` is (prefix, mask, need, top_k): a score is
+    above or at the threshold if its ordered bits under `mask` are above or at
+    `prefix`. The warp reserves its positions with one atomic on `taken`: above
+    the threshold in the high 32 bits, at it in the low 32 bits."""
+    prefix, mask, need, top_k = threshold
+    batch = cute.make_rmem_tensor((TOP_K_BATCH,), cutlass.Int64)
+    above = cute.make_rmem_tensor((TOP_K_BATCH,), cutlass.Uint32)
+    equal = cute.make_rmem_tensor((TOP_K_BATCH,), cutlass.Uint32)
+    for j in cutlass.range_constexpr(TOP_K_BATCH):
+        if cutlass.const_expr(checked):
+            batch[j] = cutlass.Int64(-1)  # ordered bits 0: never above
+            if first + j * TOP_K_THREADS < count:
+                batch[j] = pairs[first + j * TOP_K_THREADS]
+        else:
+            batch[j] = pairs[first + j * TOP_K_THREADS]
+    total = cutlass.Int64(0)
+    for j in cutlass.range_constexpr(TOP_K_BATCH):
+        bits = ordered_bits(cutlass.Uint32(batch[j] >> 32)) & mask
+        above[j] = cutlass.Uint32(cute.arch.vote_ballot_sync(bits > prefix))
+        if cutlass.const_expr(checked):
+            tie = first + j * TOP_K_THREADS < count and bits == prefix
+            equal[j] = cutlass.Uint32(cute.arch.vote_ballot_sync(tie))
+        else:
+            equal[j] = cutlass.Uint32(cute.arch.vote_ballot_sync(bits == prefix))
+        total += (cutlass.Int64(cute.arch.popc(above[j])) << 32) + cutlass.Int64(
+            cute.arch.popc(equal[j])
+        )
+    reserved = cutlass.Int64(0)
+    if lane == 0 and total != 0:
+        reserved = cute.arch.atomic_add(taken.iterator.llvm_ptr, total, scope="cta")
+    reserved = cute.arch.shuffle_sync(reserved, 0)
+    position, rank = (reserved >> 32).to(cutlass.Int32), reserved.to(cutlass.Int32)
+    lower, mine = cute.arch.lanemask_lt(), cutlass.Uint32(1) << lane
+    for j in cutlass.range_constexpr(TOP_K_BATCH):
+        key = batch[j].to(cutlass.Int32)
+        slot = position + cutlass.Int32(cute.arch.popc(above[j] & lower))
+        if above[j] & mine != 0:
+            out[slot] = key
+        position += cutlass.Int32(cute.arch.popc(above[j]))
+    if rank < need and total.to(cutlass.Int32) != 0:  # few pairs are equal
+        for j in cutlass.range_constexpr(TOP_K_BATCH):
+            tie_rank = rank + cutlass.Int32(cute.arch.popc(equal[j] & lower))
+            if equal[j] & mine != 0 and tie_rank < need:
+                out[top_k - need + tie_rank] = batch[j].to(cutlass.Int32)
+            rank += cutlass.Int32(cute.arch.popc(equal[j]))
+
+
+@cute.kernel
+def candidate_top_k_kernel(
+    candidates: cute.Tensor,
+    ranges: cute.Tensor,
+    top_keys: cute.Tensor,
+):
+    """Write the keys of row r's top_k largest scores among its (key, score
+    bits) pairs in slots ranges[0, r] to ranges[1, r] - 1 of candidates[r] to
+    top_keys[r]. A row of at most top_k pairs gets all its keys, then -1.
+
+    A CTA takes a row, in two steps:
+
+    1. Find the row's top_k-th largest score, the threshold, one digit of its
+       ordered bits at a time. Count the top digit of the row's scores, and
+       find the bin that holds the threshold. Then read the scores again (from
+       L2), and count the next digit of those in that bin, and so on. Stop
+       when the whole bin is needed.
+    2. Read the pairs again. Write the keys above the threshold to positions 0
+       up, and the first `need` keys equal to it to the last positions.
+
+    A warp reserves positions with one shared-memory atomic for a batch of
+    pairs, so its stores are coalesced."""
+    thread, row = cute.arch.thread_idx()[0], cute.arch.block_idx()[0]
+    lane, warp = cute.arch.lane_idx(), cute.arch.warp_idx()
+    slots, top_k = candidates.shape[1], top_keys.shape[1]
+    shared = utils.SmemAllocator()
+    bins = shared.allocate_tensor(cutlass.Int32, cute.make_layout(TOP_K_BINS), 16)
+    runs = shared.allocate_tensor(cutlass.Int32, cute.make_layout(TOP_K_THREADS), 16)
+    found = shared.allocate_tensor(cutlass.Int32, cute.make_layout(4), 16)
+    # Positions taken above and at the threshold (high and low 32 bits).
+    taken = shared.allocate_tensor(cutlass.Int64, cute.make_layout(1), 8)
+    out = top_keys[row, None]
+    start = cutlass.min(cutlass.max(ranges[0, row], 0), slots)
+    count = cutlass.min(cutlass.max(ranges[1, row], start), slots) - start
+    # The row's pairs from its first slot on, as (key, score bits) words and as
+    # 8-byte pairs (the key in the low half).
+    first_pair = row.to(cutlass.Int64) * slots + start
+    words = cute.make_tensor(
+        candidates.iterator + first_pair * 2, cute.make_layout(2 * slots)
+    )
+    pairs = cute.make_tensor(
+        cute.recast_ptr(candidates.iterator, dtype=cutlass.Int64) + first_pair,
+        cute.make_layout(slots),
+    )
+    if count <= top_k:  # every key, then -1
+        for i in cutlass.range(thread, top_k, TOP_K_THREADS):
+            key = cutlass.Int32(-1)
+            if i < count:
+                key = words[2 * i]
+            out[i] = key
+    else:
+        top_shift, top_width = TOP_K_DIGITS[0]
+        per = TOP_K_BINS // TOP_K_THREADS
+        for b in cutlass.range_constexpr(per):
+            bins[b * TOP_K_THREADS + thread] = 0
+        if thread == 0:
+            taken[0] = cutlass.Int64(0)
+        cute.arch.barrier()
+        # 1. The threshold's top digit, then its others among the scores of its
+        # bin.
+        for chunk in cutlass.range(0, count, TOP_K_THREADS * TOP_K_LOADS):
+            count_top_digits(words, bins, chunk + thread, count)
+        cute.arch.barrier()
+        pivot, need, here = pivot_bin(bins, runs, found, top_k, per, thread)
+        prefix = cutlass.Uint32(pivot) << top_shift
+        mask = cutlass.Uint32((1 << top_width) - 1) << top_shift
+        # The bin holds scores of one sign: their ordered bits are bits ^ flip.
+        flip = cutlass.select_(
+            pivot >= 1 << (top_width - 1),
+            cutlass.Uint32(0x80000000),
+            cutlass.Uint32(0xFFFFFFFF),
+        )
+        for shift, width in TOP_K_DIGITS[1:]:
+            if need < here:  # only part of the bin is needed
+                per = (1 << width) // TOP_K_THREADS
+                for b in cutlass.range_constexpr(per):
+                    bins[b * TOP_K_THREADS + thread] = 0
+                cute.arch.barrier()
+                bin_bits = ((prefix ^ flip) & mask, mask, flip)
+                for chunk in cutlass.range(0, count, TOP_K_THREADS * TOP_K_LOADS):
+                    count_digit(
+                        words, bins, chunk + thread, count, bin_bits, shift, width
+                    )
+                cute.arch.barrier()
+                pivot, need, here = pivot_bin(bins, runs, found, need, per, thread)
+                prefix |= cutlass.Uint32(pivot) << shift
+                mask |= cutlass.Uint32((1 << width) - 1) << shift
+        # 2. The keys above the threshold, and `need` equal to it: whole
+        # batches, then the last one.
+        threshold = (prefix, mask, need, top_k)
+        step = TOP_K_THREADS * TOP_K_BATCH
+        whole = count - count % step
+        for chunk in cutlass.range(32 * warp, whole, step):
+            write_keys(pairs, out, taken, chunk + lane, count, threshold, lane, False)
+        if whole < count:
+            last = whole + 32 * warp + lane
+            write_keys(pairs, out, taken, last, count, threshold, lane, True)
 
 
 # One scorer per mode, query rows per job and key format, so each compiles once.

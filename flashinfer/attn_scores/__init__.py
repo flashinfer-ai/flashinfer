@@ -26,6 +26,7 @@ from .single_head import (
     single_head_paged_mqa_logits,
     single_head_paged_mqa_threshold_select,
     thresholds_from_sample,
+    top_k_from_candidates,
 )
 
 __all__ = [
@@ -40,4 +41,5 @@ __all__ = [
     "single_head_paged_mqa_threshold_select",
     "thresholds_from_sample",
     "gather_key_sample",
+    "top_k_from_candidates",
 ]

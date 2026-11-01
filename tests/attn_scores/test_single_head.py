@@ -17,6 +17,7 @@ from flashinfer.attn_scores import (
     single_head_paged_mqa_logits,
     single_head_paged_mqa_threshold_select,
     thresholds_from_sample,
+    top_k_from_candidates,
 )
 
 SM10X = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
@@ -34,6 +35,35 @@ def rows_of(nvfp4: bool, rows: int) -> tuple[torch.Tensor, torch.Tensor | None]:
     scales = 2.0 ** torch.randint(-3, 2, (rows, 8), device="cuda")
     values = torch.randint(256, (rows, 64), device="cuda").byte()
     return values, scales.to(torch.float8_e4m3fn)
+
+
+def ordered(bits: torch.Tensor) -> torch.Tensor:
+    """int32 score bits as int64 values in the order of their floats, as the
+    kernels order them (-0 below +0, NaN with the sign bit below -inf, other
+    NaN above +inf)."""
+    bits = bits.long() & 0xFFFFFFFF
+    return torch.where(bits >= 2**31, bits ^ 0xFFFFFFFF, bits | 2**31)
+
+
+def check_top_keys(
+    candidates: torch.Tensor, ranges: torch.Tensor, top_keys: torch.Tensor
+) -> None:
+    """Each row's keys are distinct keys of the pairs in its range, then -1, and
+    their scores are the row's top_k largest (ties at the cutoff in any
+    order)."""
+    top_k = top_keys.shape[1]
+    for row, (first, last) in enumerate(ranges.T.tolist()):
+        keys, bits = candidates[row, first:last].long().unbind(1)
+        count = min(top_k, last - first)
+        assert bool((top_keys[row, count:] == -1).all())
+        if count:
+            chosen = top_keys[row, :count].long()
+            order = keys.argsort()
+            where = torch.searchsorted(keys[order], chosen).clamp(max=len(keys) - 1)
+            assert torch.equal(keys[order][where], chosen)
+            assert chosen.unique().numel() == count
+            mine = ordered(bits[order][where]).sort().values
+            assert torch.equal(mine, ordered(bits).topk(count).values.sort().values)
 
 
 def dequantize(values: torch.Tensor, scales: torch.Tensor | None) -> torch.Tensor:
@@ -156,7 +186,8 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
     """Causal 128-row tiles, odd ones reversed; rows 2 mod 8 score 0 (ties past
     the tie slots), rows 5 mod 8 NaN. Counts are exact, and each written slot
     holds a distinct key of its class with its score (less the threshold). The
-    repair reselects each row that misses at or below its Top-K cutoff."""
+    repair reselects each row that misses at or below its Top-K cutoff, and
+    top_k_from_candidates then writes each row's Top-K keys."""
     torch.manual_seed(0)
     nvfp4, width = keys == "nvfp4", max(context_lens)
     capacity, blocks = max(width // 2, top_k - 1), -(-width // 64)
@@ -186,6 +217,7 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
     repairs = dict(arrivals=arrivals, ranges=ranges) if repair else {}
     counters = torch.empty(rows, 2, dtype=torch.int32, device="cuda")
     candidates = torch.empty(rows, top_k + capacity, 2, dtype=torch.int32).cuda()
+    top_keys = torch.empty(rows, top_k, dtype=torch.int32, device="cuda")
 
     def run() -> None:
         thresholds.copy_(requested)
@@ -202,6 +234,8 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
             key_scales=key_scales,
             **repairs,
         )
+        if repair:
+            top_k_from_candidates(candidates, ranges, top_keys=top_keys)
 
     def reference() -> tuple[torch.Tensor, torch.Tensor]:
         keys = dequantize(key_cache.flatten(0, 1), None if scales is None else scales)
@@ -246,6 +280,15 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
             stored = bits.int().view(torch.float32)
             exact = torch.where(score <= 2 * threshold, score - threshold, score)
             torch.testing.assert_close(stored, exact, rtol=0, atol=0, equal_nan=True)
+        if repair:  # the Top-K keys, from the candidates and of the scores
+            check_top_keys(candidates, ranges, top_keys)
+            count = valid.sum(1).clamp(max=top_k)
+            for row in range(rows):
+                row_scores = scores[row, valid[row]]
+                if bool(row_scores.isfinite().all()):
+                    chosen = top_keys[row, : int(count[row])].long()
+                    best = row_scores.topk(int(count[row])).values.sort().values
+                    assert torch.equal(scores[row, chosen].sort().values, best)
 
     scores, valid = reference()
     median = scores.nan_to_num(0).masked_fill(~valid, 0).median(1).values
@@ -261,6 +304,74 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
     requested.copy_(scores.nan_to_num(0).masked_fill(~valid, 0).median(1).values)
     graph.replay()
     check(scores, valid)
+
+
+@pytest.mark.parametrize("scores", ["normal", "few", "same", "special"])
+@pytest.mark.parametrize("top_k", [512, 2048, 65535])
+@torch.inference_mode()
+def test_top_k_from_candidates_matches_reference_and_replay(top_k, scores) -> None:
+    """Rows of distinct keys with random ranges: empty, shorter than top_k, one
+    pair longer, and up to every slot. Scores are normal, from a few values
+    (many equal to the top_k-th), all the same, or with zeros of both signs,
+    infinities and NaNs. A CUDA graph replay then uses new
+    ranges."""
+    torch.manual_seed(0)
+    rows, slots = 200, 3 * top_k + 2048
+    # Distinct keys in each row: an odd stride through 2**20, from a random key.
+    offsets = torch.randint(0, 1 << 20, (rows, 1), device="cuda")
+    keys = ((torch.arange(slots, device="cuda") * 7919 + offsets) % (1 << 20)).int()
+    if scores == "normal":
+        values = torch.randn(rows, slots, device="cuda")
+    elif scores == "few":
+        values = torch.randint(0, 7, (rows, slots), device="cuda") * 0.5
+    elif scores == "same":
+        values = torch.full((rows, slots), 1.5, device="cuda")
+    else:
+        special = torch.tensor([0.0, -0.0, torch.inf, -torch.inf, torch.nan, 1.0])
+        values = special.cuda()[torch.randint(0, 6, (rows, slots), device="cuda")]
+        values[::2] = values[::2].neg()  # NaNs of both signs
+    candidates = torch.stack((keys, values.view(torch.int32)), 2).contiguous()
+    ranges = torch.empty(2, rows, dtype=torch.int32, device="cuda")
+    top_keys = torch.empty(rows, top_k, dtype=torch.int32, device="cuda")
+
+    def new_ranges() -> None:
+        first = torch.randint(0, slots // 2, (rows,), device="cuda")
+        count = torch.randint(0, slots - slots // 2, (rows,), device="cuda")
+        count[:4] = torch.tensor([0, top_k - 1, top_k, top_k + 1])
+        first[4], count[4] = 0, slots
+        ranges.copy_(torch.stack((first, first + count)))
+
+    new_ranges()
+    top_k_from_candidates(candidates, ranges, top_keys=top_keys)
+    check_top_keys(candidates, ranges, top_keys)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        top_k_from_candidates(candidates, ranges, top_keys=top_keys)
+    new_ranges()
+    top_keys.fill_(-7)
+    graph.replay()
+    check_top_keys(candidates, ranges, top_keys)
+
+
+@torch.inference_mode()
+def test_top_k_from_candidates_rejects_bad_shapes() -> None:
+    zeros = partial(torch.zeros, dtype=torch.int32, device="cuda")
+    candidates, ranges, top_keys = zeros(4, 16, 2), zeros(2, 4), zeros(4, 8)
+    for wrong in (
+        (candidates[..., :1], ranges, top_keys),
+        (candidates, zeros(4, 2), top_keys),
+        (candidates, ranges, zeros(5, 8)),
+    ):
+        with pytest.raises(ValueError, match="must be \\[rows, slots, 2\\]"):
+            top_k_from_candidates(wrong[0], wrong[1], top_keys=wrong[2])
+    for wrong in (
+        (candidates.long(), ranges, top_keys),
+        (candidates, ranges, zeros(8, 4).T),
+    ):
+        with pytest.raises(ValueError, match="contiguous int32"):
+            top_k_from_candidates(wrong[0], wrong[1], top_keys=wrong[2])
+    with pytest.raises(ValueError, match="below 65536"):
+        top_k_from_candidates(candidates, ranges, top_keys=zeros(4, 1 << 16))
 
 
 @sm10x_only
@@ -643,8 +754,8 @@ def test_gather_key_sample_rejects_bad_shapes() -> None:
 
 @torch.inference_mode()
 def test_sample_helpers_need_cute_dsl_4_7(monkeypatch) -> None:
-    """Without CuTe DSL 4.7 the sample helpers say so, like the other CuTe
-    single-head APIs, before they import the CuTe scorer."""
+    """Without CuTe DSL 4.7 the sample and Top-K helpers say so, like the other
+    CuTe single-head APIs, before they import the CuTe scorer."""
     monkeypatch.setattr(
         single_head, "is_cute_dsl_experimental_available", lambda: False
     )
@@ -665,4 +776,10 @@ def test_sample_helpers_need_cute_dsl_4_7(monkeypatch) -> None:
             zeros(4, 8, dtype=torch.int32),
             thresholds=zeros(4),
             counters=zeros(4, 2, dtype=torch.int32),
+        )
+    with pytest.raises(RuntimeError, match="needs CuTe DSL 4.7"):
+        top_k_from_candidates(
+            zeros(4, 16, 2, dtype=torch.int32),
+            zeros(2, 4, dtype=torch.int32),
+            top_keys=zeros(4, 8, dtype=torch.int32),
         )

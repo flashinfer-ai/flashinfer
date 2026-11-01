@@ -16,6 +16,7 @@ from ..trace.templates.attn_scores import (
     single_head_paged_mqa_logits_trace,
     single_head_paged_mqa_threshold_select_trace,
     thresholds_from_sample_trace,
+    top_k_from_candidates_trace,
 )
 from ..utils import get_compute_capability, get_device_sm_count
 
@@ -335,6 +336,71 @@ def single_head_paged_mqa_threshold_select(
     tables = (row_ends, tile_requests, block_table)
     outputs = (thresholds, counters, arrivals, ranges, candidates)
     _score("select", TILE, keys, (*tables, *outputs, max_context, workers, wide, top_k))
+
+
+@flashinfer_api(trace=top_k_from_candidates_trace)
+def top_k_from_candidates(
+    candidates: torch.Tensor,
+    ranges: torch.Tensor,
+    *,
+    top_keys: torch.Tensor,
+) -> None:
+    """Write each query row's exact Top-K keys from the candidates and ties that
+    :func:`single_head_paged_mqa_threshold_select` stored in its range of slots.
+
+    The select stores scores that keep the order of the row's scores, so the
+    keys of the row's ``top_k`` largest stored scores are the keys of its
+    ``top_k`` largest scores. A CTA takes a row: it finds the ``top_k``-th
+    largest score from counts of the score bits, then writes the keys above it
+    and those equal to it. It runs as one launch without host synchronization,
+    so it can be captured in a CUDA graph (run it once before capture to compile
+    it).
+
+    Parameters
+    ----------
+    candidates : torch.Tensor
+        int32 ``[rows, slots, 2]``: the select's (key, score bits) pairs.
+    ranges : torch.Tensor
+        int32 ``[2, rows]``: the select's ranges, the first and past-last slot
+        of each row's pairs.
+    top_keys : torch.Tensor
+        int32 ``[rows, top_k]``, output: the keys of the row's ``top_k``
+        largest scores, in no set order, and any of those equal to the
+        ``top_k``-th. A row of at most ``top_k`` pairs gets all its keys, then
+        -1.
+    """
+    if not is_cute_dsl_experimental_available():
+        raise RuntimeError("top_k_from_candidates needs CuTe DSL 4.7 or newer")
+    from ..cute_dsl.launch import launch
+    from ..topk_varlen.kernels import block_scan
+    from .kernels import single_head_scorer
+    from .kernels.single_head_scorer import TOP_K_THREADS
+
+    rows = candidates.shape[0]
+    if (
+        candidates.shape[2:] != (2,)
+        or ranges.shape != (2, rows)
+        or top_keys.shape[0] != rows
+    ):
+        raise ValueError(
+            "candidates must be [rows, slots, 2], ranges [2, rows], and "
+            "top_keys [rows, top_k]"
+        )
+    args = (candidates, ranges, top_keys)
+    if not all(t.dtype == torch.int32 and t.is_contiguous() for t in args):
+        raise ValueError("candidates, ranges and top_keys must be contiguous int32")
+    if top_keys.shape[1] >= 1 << 16:
+        raise ValueError("top_k must be below 65536")
+    if rows and top_keys.shape[1]:
+        launch(
+            single_head_scorer.candidate_top_k_kernel,
+            (rows, 1),
+            TOP_K_THREADS,
+            args,
+            (),
+            module="single_head_top_k",
+            key_files=(single_head_scorer.__file__, block_scan.__file__),
+        )
 
 
 @flashinfer_api(trace=quantize_write_index_qk_nvfp4_trace)
