@@ -117,6 +117,7 @@ from ...sage.int32_scores import (
 from ...sage.index import load_sage_q_scale, sage_section_word, sage_sequence_words
 from ...sage.layout import _FLOAT4_WORDS, _SageScaleLayout
 from ...sage.modes import SageKTransport, SageScoreScaling
+from .helpers_paged import _load_block_table_row_bounds, _load_runtime_seq_len_kv
 from .helpers import (
     add_f16x2_to_f32x2,
     _resolve_kv_tile_idx_context,
@@ -1424,8 +1425,6 @@ class GmemQKVResource(MemoryResource):
                 if cutlass.const_expr(self.cfg.has_uniform_varlen):
                     seqlen_k = Int32(self.cfg.uniform_seq_len_k)
                 else:
-                    from .helpers_paged import _load_runtime_seq_len_kv
-
                     seqlen_k = _load_runtime_seq_len_kv(
                         self.seqlens_kv, self.max_seq_len_kv, batch_coord
                     )
@@ -1448,11 +1447,9 @@ class GmemQKVResource(MemoryResource):
                     kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
                     kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
                 else:
-                    from .helpers_paged import _load_block_table_row_bounds
-
                     kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                         Int32(self.block_table_row_stride),
-                        self.cfg,
+                        self.cfg.num_tokens_per_page,
                         seqlen_k,
                         batch_coord,
                     )
@@ -1536,16 +1533,12 @@ class GmemQKVResource(MemoryResource):
             kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
             kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
         else:
-            from .helpers_paged import _load_runtime_seq_len_kv
-
             cached_seqlen_kv = _load_runtime_seq_len_kv(
                 self.seqlens_kv, self.max_seq_len_kv, batch_coord
             )
-            from .helpers_paged import _load_block_table_row_bounds
-
             kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                 Int32(self.block_table_row_stride),
-                self.cfg,
+                self.cfg.num_tokens_per_page,
                 cached_seqlen_kv,
                 batch_coord,
             )

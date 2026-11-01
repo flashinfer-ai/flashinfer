@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Literal, Optional, Union, cast
 
 import torch
 
-from ._compile_cache import build_and_load_attention_kernel
+from ._compile_cache import build_and_load_attention_kernel, cache_compiled
 
 from flashinfer.api_logging import flashinfer_experimental_api
 from flashinfer.utils import (
@@ -1564,7 +1564,7 @@ def _make_decode_compile_spec(
     )
 
 
-@functools.cache
+@cache_compiled
 def _get_compiled_decode(
     compile_spec: _DecodeCompileSpec,
 ):

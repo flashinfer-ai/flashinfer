@@ -1930,6 +1930,7 @@ def test_sparse_d576_forced_split(split, head_dim_split, topk):
     """Forced splits (incl. empty and one-tile splits, V head-dim splits) and
     the direct store agree with the reference, natural-log LSE included."""
     # Keep this accuracy case callable by the parallel prebuilder.
+    mla_decode_module._cached_sparse_mla_plan.cache_clear()
     with pytest.MonkeyPatch.context() as monkeypatch:
         monkeypatch.setattr(
             sparse_policy,
@@ -1942,6 +1943,8 @@ def test_sparse_d576_forced_split(split, head_dim_split, topk):
         w = _d576_plan(6, 64, topk)
         out, lse = w.run(q, kv, indices, lengths, softmax_scale=_D576_SCALE)
         _check_d576(q, kv, indices, lengths, out, lse)
+
+    mla_decode_module._cached_sparse_mla_plan.cache_clear()
 
 
 def test_sparse_d576_split_policy():
