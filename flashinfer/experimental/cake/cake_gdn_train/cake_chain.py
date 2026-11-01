@@ -52,7 +52,9 @@ it as two contiguous sequence groups (:func:`sequence_groups`), one on a
 high-priority side stream forked from the caller's stream and joined back
 before the stage returns: the forward's ``wy_tc`` and ``fwd_ho`` of the partial
 group overlap the full rounds of the other, and the adjoint ``dhu_tc2`` of the
-partial group overlaps the fused tail of the other.
+partial group overlaps the fused tail of the other.  On an architecture of
+``SPLIT_R_FORM`` the ``dhu_tc2`` pass 2 of a split adjoint plan beside
+``tail_g3`` runs the same way over its segments (:func:`split_r_form`).
 
 Every launch is a record of :mod:`.cake_jit` selected by its stage and the
 device's architecture (:func:`.cake_backend.launch_stage`); the stages a plan
@@ -103,6 +105,7 @@ __all__ = [
     "TAIL_TILE_FLOATS",
     "TAIL_WORKSPACE_TILES",
     "CHAIN_PLAN",
+    "SPLIT_R_FORM",
     "TC_PLAN",
     "TC_PLAN_GAIN",
     "TC_PLAN_MIN_SAVING",
@@ -130,6 +133,7 @@ __all__ = [
     "make_options",
     "scan_plans",
     "sdt_pricing",
+    "split_r_form",
     "tc_plan_pricing",
     "tc_plan_thresholds",
     "sequence_groups",
@@ -416,6 +420,10 @@ def make_options(
         int(streams),
         tail,
     )
+
+
+# the options of a call without plan pins (what ``make_options()`` returns), shared by such calls
+_DEFAULT_OPTIONS = ChainOptions()
 
 
 # --------------------------------------------------------------------------- #
@@ -1181,6 +1189,18 @@ def scan_plans(total_tokens, num_seqs, num_v_heads, device_index, seq_lens=None,
 WORKSPACE_SHAPES_PER_ROLE = 4
 
 
+# The handle of the current stream of a device without building a ``torch.cuda.Stream`` (that costs microseconds of
+# host time per call); ``torch.cuda.current_stream`` where this PyTorch build lacks the getter.
+_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _stream_key(device_index: int) -> tuple[int, int]:
+    """(device, handle of its current stream): the key of the per-stream workspaces."""
+    if _RAW_STREAM is not None:
+        return device_index, _RAW_STREAM(device_index)
+    return device_index, torch.cuda.current_stream(device_index).cuda_stream
+
+
 class Workspaces:
     def __init__(self):
         self.tables: dict = {}
@@ -1194,8 +1214,7 @@ class Workspaces:
         by ``torch.zeros`` on that stream, then reused without a memset, since every launch leaves it zero.  The
         stream is read at the launch, so launches that may run concurrently (other streams, a CUDA graph capture on
         its capture stream) take distinct buffers."""
-        key = (device_index, torch.cuda.current_stream(device_index).cuda_stream)
-        buffers = self.zeroed.setdefault(key, {})
+        buffers = self.zeroed.setdefault(_stream_key(device_index), {})
         buffer = buffers.get(role)
         if (
             buffer is None
@@ -1206,8 +1225,7 @@ class Workspaces:
         return buffer[:rows]
 
     def table(self, device_index: int) -> dict:
-        key = (device_index, torch.cuda.current_stream(device_index).cuda_stream)
-        return self.tables.setdefault(key, {})
+        return self.tables.setdefault(_stream_key(device_index), {})
 
     def take(self, table, role, shape, dtype, device):
         key = (tuple(shape), dtype)
@@ -1719,6 +1737,64 @@ def chain_plan_pricing(
 
 
 # --------------------------------------------------------------------------- #
+# the split adjoint plan beside tail_g3 on two streams (the R form over segments), per architecture
+# --------------------------------------------------------------------------- #
+# On an architecture of ``SPLIT_R_FORM``, a call of a value-head group of three whose backward tail is ``tail_g3`` runs
+# the ``dhu_tc2`` pass 2 of a split adjoint plan as two groups of segments where :func:`two_stream_split` groups them
+# (:func:`sequence_groups` with ``split_adjoint``): the caller's stream runs group A (the full rounds), then the fused
+# tail of its chunks while a side stream runs group B (the partial round), then the tail of the rest.  The
+# deterministic package runs the same form on every split table beside ``tail_g3``.  On a host-built table without
+# plan pins (and without a ``dhu_scan`` pin), a planner's split adjoint table that this form groups, with its pass 2 on
+# ``dhu_tc2`` (the ``sdt_pricing`` rule), keeps its form: ``TC_PLAN`` and ``CHAIN_PLAN`` do not replace it (their
+# pricing does not credit the overlap with the tail), as a serial table that the two-stream rule groups keeps its form.
+# Measured on R200 (212 SMs, one process, sustained protocol): the backward of the (16, 48) head pair on this form of
+# its planner table (94-chunk segments, 6 segments, groups of 4 + 2) took 1.3261 ms in the deterministic package,
+# against 1.3454 ms on this package's tc-priced table (46-chunk segments, 13 segments, one stream).  The architectures
+# not listed run one stream there.
+SPLIT_R_FORM: tuple[str, ...] = ("sm_107a",)
+
+
+def _split_r_groups(arch: str, group: int | None, options: ChainOptions) -> bool:
+    """Whether a call on ``arch`` of value-head group ``group`` groups the segments of a split adjoint table (the R
+    form beside ``tail_g3``; :func:`sequence_groups` with ``split_adjoint``)."""
+    return (
+        arch in SPLIT_R_FORM
+        and group == 3
+        and tail_form(1, 3, options.tail, arch=arch) == "tail_g3"
+    )
+
+
+def split_r_form(
+    chunks,
+    num_v_heads: int,
+    group: int | None,
+    device_index: int,
+    plan: ScanPlan,
+    options: ChainOptions,
+) -> bool:
+    """Whether a host layout of ``chunks`` (chunks per sequence) keeps the planner's adjoint table ``plan`` for the R
+    form of a split plan beside ``tail_g3`` (see above): the device's architecture in ``SPLIT_R_FORM``, a value-head
+    group ``group`` of three with ``tail_g3`` as its tail, no plan or ``dhu_scan`` pin, a split ``SDT_CONFIG`` table
+    whose pass 2 the ``sdt_pricing`` rule runs on ``dhu_tc2`` and whose segments :func:`two_stream_split` groups.
+    Both stream counts keep the same table (``streams=1`` runs it on one stream: the same bits)."""
+    index = int(device_index)
+    arch = cake_backend.device_arch(index)
+    if not _split_r_groups(arch, group, options):
+        return False
+    if options.pins != (None, None) or options.dhu_scan is not None:
+        return False
+    seg_len = int(plan.segment_len)
+    if tuple(plan.config) != SDT_CONFIG or seg_len <= 0 or max(chunks) <= seg_len:
+        return False
+    if not (_available("dhu_tc2", arch) and _available(SDT_PRESCAN, arch)):
+        return False
+    segments = sum(max(1, -(-int(n) // seg_len)) for n in chunks)
+    if two_stream_split(segments, int(num_v_heads), _device_props(index)[0]) is None:
+        return False
+    return bool(sdt_pricing(tuple(chunks), seg_len, int(num_v_heads), index)["select"])
+
+
+# --------------------------------------------------------------------------- #
 # prep selection: prep_tma (TMA-staged q / k, one CTA per (chunk, key head)) or the plain prep
 # --------------------------------------------------------------------------- #
 # The rule: CTAs = chunks x H and slots = ctas_per_sm x SMs; the plain prep (grid (chunks, HV)) runs where prep_tma's
@@ -1772,10 +1848,13 @@ def _prep_stage(
 # A serial scan launches one CTA per (segment, value head) and holds one CTA per SM, so its last round can leave SMs
 # idle.  Split into two contiguous groups of segments, the group that fills whole rounds runs on one stream while the
 # other group's scan overlaps the neighbouring stage (forward: wy_tc of the other group; adjoint: the tail of the
-# first group) on a second stream.  A group launch is the full launch restricted to its segments (fwd_ho through a
-# slice of its walk, dhu_tc2 through views of the segment table and of dht) or chunks (wy_tc and tail_g2 through
-# views of the chunk table and of h / dh): every CTA does the work of the CTA of the full launch that covers the same
-# (segment or chunk, value head), so the bits are the same.
+# first group) on a second stream.  On an architecture of ``SPLIT_R_FORM`` the adjoint ``dhu_tc2`` pass 2 of a split
+# plan beside ``tail_g3`` (one CTA per (segment, value head), every segment starting from its stitched state) is grouped
+# the same way over its segments: a sequence's segments are contiguous in the table, so group A covers the chunks
+# before the first segment of group B.  A group launch is the full launch restricted to its segments (fwd_ho through a
+# slice of its walk, dhu_tc2 through views of the segment table and of dht) or chunks (wy_tc and the fused tails
+# through views of the chunk table and of h / dh): every CTA does the work of the CTA of the full launch that covers
+# the same (segment or chunk, value head), so the bits are the same.
 
 
 def _idle_slots(ctas: int, sm_count: int) -> int:
@@ -1801,11 +1880,13 @@ def two_stream_split(num_segments: int, num_v_heads: int, sm_count: int) -> int 
 
 
 def sequence_groups(
-    meta: ChunkMeta, num_v_heads: int, sm_count: int
+    meta: ChunkMeta, num_v_heads: int, sm_count: int, *, split_adjoint: bool = False
 ) -> tuple[StreamGroups | None, StreamGroups | None]:
     """The two-stream groups of a host-built table's forward and adjoint scans (``None``: one stream).  A scan is
     grouped on a serial plan (one segment per sequence, the table's walk) when :func:`two_stream_split` splits it: the
-    adjoint scan's group A is its full-round group, the forward scan's group A the rest."""
+    adjoint scan's group A is its full-round group, the forward scan's group A the rest.  With ``split_adjoint`` (the
+    R form of :func:`split_r_form`) the adjoint table of a split plan is grouped over its segments by the same rule:
+    group A its first ``k`` segments, the chunks before segment ``k``."""
     if meta.seq_lens is None:
         return None, None
     order = meta.order if meta.order is not None else range(meta.num_seqs)
@@ -1815,6 +1896,25 @@ def sequence_groups(
         k = None
         if segs.num_segments == meta.num_seqs and segs.walk is None:
             k = two_stream_split(meta.num_seqs, int(num_v_heads), int(sm_count))
+        elif (
+            adjoint
+            and split_adjoint
+            and segs.segment_len > 0
+            and segs.num_segments > meta.num_seqs
+        ):
+            seq_chunk_start = [0]
+            for n in chunks:
+                seq_chunk_start.append(seq_chunk_start[-1] + n)
+            seg_chunk_start = _segment_lists(seq_chunk_start, int(segs.segment_len))[0]
+            if len(seg_chunk_start) - 1 == segs.num_segments:
+                k = two_stream_split(segs.num_segments, int(num_v_heads), int(sm_count))
+            split_chunk = 0 if k is None else seg_chunk_start[k]
+            groups.append(
+                StreamGroups(k, split_chunk)
+                if k is not None and 0 < split_chunk < meta.num_chunks
+                else None
+            )
+            continue
         split = None if k is None else (k if adjoint else meta.num_seqs - k)
         split_chunk = 0 if split is None else sum(chunks[:split])
         groups.append(
@@ -2227,10 +2327,12 @@ def _backward(
     split_tc = not serial and (
         meta.bwd_tc or _sdt_selected(meta, segs, num_v_heads, index, options, arch)
     )
-    # two sequence groups (R form): the tcgen05 serial scan feeding a fused tail, for the groups R_FORM_GROUPS names
+    # two groups (R form): the tcgen05 serial scan feeding a fused tail, for the groups R_FORM_GROUPS names, and the
+    # dhu_tc2 pass 2 of a split plan feeding tail_g3 (its segments; grouped on an architecture of SPLIT_R_FORM only)
     groups = (
         meta.bwd_groups
-        if use_tc and form != "unfused" and num_v_heads // num_heads in R_FORM_GROUPS
+        if (use_tc and form != "unfused" and num_v_heads // num_heads in R_FORM_GROUPS)
+        or (split_tc and form == "tail_g3")
         else None
     )
     if not (use_tc or split_tc):
@@ -2295,13 +2397,13 @@ def _backward(
         _launch("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
                 seg_flag, num_v_heads, use_dht, 1)  # fmt: skip
         dht32, use_dht = dh_end, 1
-    if split_tc:
+    if split_tc and groups is None:
         # pass 2 on the tcgen05 scan: segment ``seg`` starts from dht[seg], the stitched dh_end[seg]; the first segment
         # of a sequence stores its dh0 (the register pass 2's contract)
         _launch("dhu_tc2", segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
                 meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
                 num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
-    elif not use_tc:
+    elif not (use_tc or split_tc):
         _launch(scan_stage, segs.num_segments, num_v_heads, HEAD_DIM // vb, qn, kn, w, do, dv_local, g_cs, dht32, dh,
                 dv2, dh0, dh0, meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq,
                 meta.seq_chunk_start, num_heads, num_v_heads, use_dht, 1 if has_initial_state else 0, scale)  # fmt: skip
@@ -2376,8 +2478,9 @@ def _backward(
         if groups is None:
             tail(0, meta.num_chunks)
         else:
-            # R form: the caller's stream runs dhu_tc2 of group A (the full rounds), then the tail of A while the side
-            # stream runs dhu_tc2 of group B (the partial round), then joins it and runs the tail of B
+            # R form: the caller's stream runs dhu_tc2 of group A (the full rounds; sequences, or the segments of a
+            # split plan's pass 2), then the tail of A while the side stream runs dhu_tc2 of group B (the partial
+            # round), then joins it and runs the tail of B
             na, ca = groups.split, groups.split_chunk
 
             def dhu_tc2(s0, s1):
@@ -2551,11 +2654,36 @@ def host_plans(
     options: ChainOptions | None = None,
     *,
     total_tokens: int | None = None,
+    group: int | None = None,
 ) -> tuple[tuple[ScanPlan, ScanPlan], bool]:
     """The forward and adjoint tables of a host layout (``seq_lens``, tokens per sequence) on device ``device_index``
     and whether the adjoint table is priced for ``dhu_tc2`` (``ChunkMeta.bwd_tc``): the planner's tables, the adjoint
     table priced for ``dhu_tc2`` (``TC_PLAN``) and the deeper split tables of ``CHAIN_PLAN``; plan pins (and a
-    ``dhu_scan`` pin) keep the planner's tables.  Host work only."""
+    ``dhu_scan`` pin) keep the planner's tables.  ``group`` is the call's value-head group ``HV / H`` (``None``: a
+    group the R form of :func:`split_r_form` does not serve), the one input besides the layout that changes a table:
+    on an architecture of ``SPLIT_R_FORM`` a group of three keeps a planner's split adjoint table that the R form
+    groups.  Host work only."""
+    return _host_plans(
+        seq_lens,
+        num_v_heads,
+        device_index,
+        options,
+        total_tokens=total_tokens,
+        group=group,
+    )[:2]
+
+
+def _host_plans(
+    seq_lens,
+    num_v_heads: int,
+    device_index: int,
+    options: ChainOptions | None = None,
+    *,
+    total_tokens: int | None = None,
+    group: int | None = None,
+) -> tuple[tuple[ScanPlan, ScanPlan], bool, bool]:
+    """:func:`host_plans` and whether the adjoint table is the planner's table kept for the R form
+    (:func:`split_r_form`)."""
     options = options or ChainOptions()
     seq_lens = tuple(int(n) for n in seq_lens)
     index = int(device_index)
@@ -2563,17 +2691,23 @@ def host_plans(
         total_tokens = sum(seq_lens)
     plans = scan_plans(int(total_tokens), len(seq_lens), int(num_v_heads), index, seq_lens,
                        scan_config=options.scan_config, segment_chunks=options.segment_chunks)  # fmt: skip
-    bwd_tc = False
+    bwd_tc = kept = False
     if TC_PLAN and options.pins == (None, None) and options.dhu_scan is None:
         chunks = tuple(-(-int(n) // CHUNK) for n in seq_lens)
         bwd = plans[1]
         # a serial planner table that the two-stream rule groups keeps its form (the R form overlaps its scan with the
-        # tail, which the pricing does not credit), with one stream too: both stream counts plan the same tables
-        grouped = (
-            bwd.segment_len <= 0 or max(chunks) <= bwd.segment_len
-        ) and two_stream_split(
-            len(chunks), int(num_v_heads), _device_props(int(index))[0]
-        ) is not None
+        # tail, which the pricing does not credit), with one stream too: both stream counts plan the same tables; so
+        # does a split planner table of the R form beside tail_g3 (SPLIT_R_FORM)
+        kept = group is not None and split_r_form(
+            chunks, int(num_v_heads), group, index, bwd, options
+        )
+        grouped = kept or (
+            (bwd.segment_len <= 0 or max(chunks) <= bwd.segment_len)
+            and two_stream_split(
+                len(chunks), int(num_v_heads), _device_props(int(index))[0]
+            )
+            is not None
+        )
         priced = (
             None
             if grouped
@@ -2592,7 +2726,7 @@ def host_plans(
             for kind in ("fwd", "bwd"):
                 plan = plans[0] if kind == "fwd" else plans[1]
                 serial = plan.segment_len <= 0 or max(chunks) <= plan.segment_len
-                if serial and stream_split is not None:
+                if (serial and stream_split is not None) or (kind == "bwd" and kept):
                     continue
                 deeper = chain_plan_pricing(kind, chunks, int(num_v_heads), index, plan)
                 if not deeper["select"]:
@@ -2602,7 +2736,7 @@ def host_plans(
                     plans = (table, plans[1])
                 else:
                     plans, bwd_tc = (plans[0], table), True
-    return plans, bwd_tc
+    return plans, bwd_tc, kept
 
 
 def _chunk_meta(
@@ -2613,9 +2747,10 @@ def _chunk_meta(
     index: int,
     num_v_heads,
     options: ChainOptions,
+    group: int | None = None,
 ) -> ChunkMeta:
-    """The chunk and segment tables of one call on device ``index``: a ``host_cache`` hit on the layout's key, else
-    planned (the layout's sequence lengths are derived only then)."""
+    """The chunk and segment tables of one call on device ``index`` (``group``: its value-head group ``HV / H``): a
+    ``host_cache`` hit on the layout's key, else planned (the layout's sequence lengths are derived only then)."""
     total_tokens = int(batch) * int(seq_len)
     if cu_seqlens is None:
         layout: tuple[Any, ...] = ("equal", int(batch), int(seq_len))
@@ -2642,6 +2777,9 @@ def _chunk_meta(
         options.streams,
         TC_PLAN,
         tuple(sorted(CHAIN_PLAN)),
+        group,
+        options.tail,
+        SPLIT_R_FORM,
     )
     if options.host_cache:
         meta = _META_FRONT.get(key)
@@ -2653,15 +2791,20 @@ def _chunk_meta(
         # a layout reaches the table cache only after this check, so a cache hit is a checked layout
         _check_offsets(layout, total_tokens)
         seq_lens = tuple(b - a for a, b in zip(layout[:-1], layout[1:], strict=True))
-    plans, bwd_tc = host_plans(
-        seq_lens, int(num_v_heads), int(index), options, total_tokens=total_tokens
-    )
+    plans, bwd_tc, _kept = _host_plans(seq_lens, int(num_v_heads), int(index), options, total_tokens=total_tokens,
+                                       group=group)  # fmt: skip
     meta = _host_chunk_meta(seq_lens, plans, int(index), options.lpt)
     if bwd_tc:
         meta = replace(meta, bwd_tc=True)
     if options.streams == 2:
+        split_adjoint = _split_r_groups(
+            cake_backend.device_arch(int(index)), group, options
+        )
         fwd_groups, bwd_groups = sequence_groups(
-            meta, int(num_v_heads), _device_props(int(index))[0]
+            meta,
+            int(num_v_heads),
+            _device_props(int(index))[0],
+            split_adjoint=split_adjoint,
         )
         if fwd_groups is not None or bwd_groups is not None:
             meta = replace(meta, fwd_groups=fwd_groups, bwd_groups=bwd_groups)
@@ -2682,9 +2825,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         num_v_heads = v.shape[2]
         index = _tensor_index(q)
         arch = cake_backend.device_arch(index)
-        meta = _chunk_meta(
-            cu_seqlens, cu_seqlens_cpu, batch, seq_len, index, num_v_heads, options
-        )
+        meta = _chunk_meta(cu_seqlens, cu_seqlens_cpu, batch, seq_len, index, num_v_heads, options,
+                           num_v_heads // num_heads)  # fmt: skip
         fwd = _forward(q, k, v, g, beta, meta=meta, arch=arch, scale=scale, initial_state=initial_state,
                        output_final_state=output_final_state, normalize_qk=use_qk_l2norm_in_kernel,
                        options=options)  # fmt: skip
@@ -2797,7 +2939,8 @@ def chunk_gated_delta_rule(
     Every launch is fixed-order, so PyTorch's deterministic algorithms (``torch.use_deterministic_algorithms(True)``)
     change nothing.  ``tail`` pins the backward tail (:class:`ChainOptions`).
     """
-    _require_nondeterministic(deterministic, "chunk_gated_delta_rule")
+    if deterministic is not False:
+        _require_nondeterministic(deterministic, "chunk_gated_delta_rule")
     if (
         q.dtype != torch.bfloat16
         or k.dtype != torch.bfloat16
@@ -2805,9 +2948,16 @@ def chunk_gated_delta_rule(
     ):
         raise NotImplementedError("q/k/v must be bfloat16")
     _check_inputs(q, k, v, g, beta, initial_state, cu_seqlens, cu_seqlens_cpu)
-    options = make_options(scan_config=scan_config, segment_chunks=segment_chunks, finalize=finalize,
-                           warmup_log2=warmup_log2, save_state=save_state, host_cache=host_cache,
-                           dhu_scan=dhu_scan, prep=prep, lpt=lpt, streams=streams, tail=tail)  # fmt: skip
+    if (
+        scan_config is None and segment_chunks is None and finalize is None and warmup_log2 is None
+        and save_state is True and host_cache is True and dhu_scan is None and prep is None and lpt is True
+        and type(streams) is int and streams == 2 and tail is None
+    ):  # fmt: skip
+        options = _DEFAULT_OPTIONS  # no pins: the validation of make_options has nothing to check
+    else:
+        options = make_options(scan_config=scan_config, segment_chunks=segment_chunks, finalize=finalize,
+                               warmup_log2=warmup_log2, save_state=save_state, host_cache=host_cache,
+                               dhu_scan=dhu_scan, prep=prep, lpt=lpt, streams=streams, tail=tail)  # fmt: skip
     if g.dtype != torch.float32:
         g = g.float()
     if scale is None:
