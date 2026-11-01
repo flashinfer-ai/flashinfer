@@ -163,7 +163,8 @@ def _parts(T: int, hidden: int = HIDDEN) -> int:
 
 
 def _lpt_runs(T: int, hidden: int = HIDDEN) -> bool:
-    """Whether the column slab runs its two-size ``lpt`` record at ``T`` on this device (H 4096 only)."""
+    """Whether the column slab runs its two-size ``lpt`` record of ``hidden`` at ``T`` on this device (at hidden 5120
+    and 7168 only where the size's table calibrates the architecture)."""
     return loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden) == "lpt"
 
 
