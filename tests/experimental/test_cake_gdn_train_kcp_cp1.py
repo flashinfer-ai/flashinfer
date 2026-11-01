@@ -695,3 +695,84 @@ def test_two_caller_streams_with_cached_workspaces_are_within_budget(device) -> 
             TENSORS,
             f"stream {key}",
         )
+
+
+# --------------------------------------------------------------------------- the launch scope (one GPU)
+
+
+def test_launch_scope_enters_one_stream_context_per_entry_body(
+    device, monkeypatch
+) -> None:
+    """The kernels backend's launch path on a caller stream: an autograd forward + backward, direct and under a
+    non-reentrant checkpoint, enters ``tvm_ffi.use_torch_stream()`` once per entry body (the launch scope) instead
+    of once per launch, launches the same records on the same grids as with the scope off (one context per launch),
+    and both arms' results are within the budget of the FP64 reference and of each other."""
+    from torch.utils.checkpoint import checkpoint
+
+    be = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_backend")
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    real = be.tvm_ffi
+    entered = [0]
+
+    class _Counting:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        @staticmethod
+        def use_torch_stream(*args, **kwargs):
+            entered[0] += 1
+            return real.use_torch_stream(*args, **kwargs)
+
+    monkeypatch.setattr(be, "tvm_ffi", _Counting())
+    cu, heads = [0, 700, 1900, 3000], (2, 6)
+    inputs = make_inputs(cu, *heads)
+    ref, _ = reference_pack(inputs, device)
+    ctx = _local_context(cu, device)
+    stream = torch.cuda.Stream(device=device)
+    torch.cuda.synchronize(device)
+    results, launches, contexts = {}, {}, {}
+    for arm in ("scope", "per-launch"):
+        if arm == "per-launch":
+            monkeypatch.setattr(
+                kcp.KernelBackend, "launch_scope", lambda self, call: None
+            )
+        for ckpt in (False, True):
+            entered[0] = 0
+            with torch.cuda.stream(stream):
+                leaves = [
+                    inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS
+                ]
+
+                def layer(q, k, v, g, beta):
+                    return gdn_api.chunk_gdn_kcp(
+                        q, k, v, g, beta, ctx, deterministic=False
+                    )
+
+                out = (
+                    checkpoint(layer, *leaves, use_reentrant=False)
+                    if ckpt
+                    else layer(*leaves)
+                )
+                grads = torch.autograd.grad(out, leaves, inputs["dout"].to(device))
+            stream.synchronize()
+            results[(arm, ckpt)] = {
+                "out": out.detach()[0],
+                **{n: t.detach()[0] for n, t in zip(GRAD_NAMES, grads, strict=True)},
+            }
+            launches[(arm, ckpt)] = {
+                k: [(r, tuple(g)) for r, g in kcp.LAST_CALL[k]["records"]]
+                for k in ("fwd", "bwd")
+            }
+            contexts[(arm, ckpt)] = entered[0]
+    for ckpt in (False, True):
+        bodies = 3 if ckpt else 2  # forward, (the checkpoint's recompute,) backward
+        n_launches = sum(len(v) for v in launches[("per-launch", ckpt)].values())
+        assert launches[("scope", ckpt)] == launches[("per-launch", ckpt)], ckpt
+        assert contexts[("scope", ckpt)] == bodies, (ckpt, contexts)
+        assert contexts[("per-launch", ckpt)] >= n_launches > bodies, (ckpt, contexts)
+        _arms_within_budget(
+            {arm: results[(arm, ckpt)] for arm in ("scope", "per-launch")},
+            ref,
+            TENSORS,
+            f"launch scope (checkpoint={ckpt})",
+        )

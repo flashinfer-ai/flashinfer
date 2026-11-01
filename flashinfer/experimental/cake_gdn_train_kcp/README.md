@@ -173,6 +173,11 @@ The packed GDN training routes come in four combinations:
   Gradient accumulation (`.backward()` twice) accumulates.
 * No cooperative launch anywhere in the package; every program is a plain
   stream-ordered launch.
+* Host launch path: the record, grid and merge columns of a launch are
+  resolved once per launch key and kept with the context's tables; each
+  forward or backward body, eager or captured, binds the caller's current
+  stream for tvm-ffi once (`tvm_ffi.use_torch_stream()`), and a launch enters
+  its own context only outside such a body or after a stream switch inside it.
 
 ### Partition and context
 

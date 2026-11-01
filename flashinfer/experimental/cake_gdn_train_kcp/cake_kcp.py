@@ -1070,6 +1070,11 @@ class Backend:
     def end_call(self, call: CallKcp) -> None:
         """Hook at the end of a call."""
 
+    def launch_scope(self, call: CallKcp) -> Any:
+        """The context manager the forward / backward body of ``call`` runs in (its launches, eagerly or inside a
+        capture), or ``None`` (the default): no scope."""
+        return None
+
     @staticmethod
     def transpose_tiles(
         *,
@@ -1195,6 +1200,56 @@ def resolve_launch(
     return str(record), values, grid, is_test
 
 
+def _launch_key(name: str, args: dict[str, Any], cols_per_cta: int) -> tuple:
+    """Every input :func:`resolve_launch` reads besides the launch's tensors: the program, the static knobs, the grid
+    rule's arguments (in the call site's order), the walk-form inputs, the merge's columns and the caller's grid x.
+
+    The launch cache is valid only because :func:`resolve_launch` derives the record, the grid, the test flag and the
+    merge's ``cols_per_cta`` from these scalars alone and reads nothing from the launch's tensors: an input added to
+    :func:`resolve_launch` (a new grid-rule argument, for example) must be added to this key as well."""
+    grid_args = args.get("_grid_args")
+    return (
+        name,
+        args.get("_precision_mode"),
+        args.get("_transfer_walk"),
+        tuple(grid_args.items()) if grid_args else None,
+        args.get("_sm_count"),
+        args.get("_fwdh_vh"),
+        args.get("_dhu_vh"),
+        args.get("ncols"),
+        args.get("cols_per_cta"),
+        args.get("_grid"),
+        int(cols_per_cta),
+    )
+
+
+def _resolve_cached(
+    name: str, args: dict[str, Any], *, cols_per_cta: int = 8
+) -> tuple[str, dict[str, Any], tuple[int, int, int], bool]:
+    """:func:`resolve_launch` through the launch cache of the call's tables (``_Tables.launches``, one per context
+    plan): the record, the grid, the test flag and the merge's ``cols_per_cta`` of a launch key are resolved once;
+    every launch rebuilds its public values and appends ``(record, grid)`` to the call's records as
+    :func:`resolve_launch` does."""
+    call = args.get("_call")
+    cache = getattr(getattr(call, "tb", None), "launches", None)
+    if cache is None:
+        return resolve_launch(name, args, cols_per_cta=cols_per_cta)
+    key = _launch_key(name, args, cols_per_cta)
+    hit = cache.get(key)
+    if hit is None:
+        record, values, grid, is_test = resolve_launch(
+            name, args, cols_per_cta=cols_per_cta
+        )
+        cache[key] = (record, grid, is_test, values.get("cols_per_cta"))
+        return record, values, grid, is_test
+    record, grid, is_test, cols = hit
+    values = _public_args(args)
+    if cols is not None:
+        values["cols_per_cta"] = cols
+    call.records.append((record, grid))
+    return record, values, grid, is_test
+
+
 class KernelBackend(Backend):
     """The shipped backend: the exported programs through the package's launch glue (:mod:`.cake_backend`
     ``run_module(record, values, *, grid, device_index, module=None)``, imported at the first launch so this module
@@ -1250,7 +1305,7 @@ class KernelBackend(Backend):
                 **args,
                 "_grid_args": {**grid_args, "arch": be.device_arch(device_index)},
             }
-        record, values, grid, is_test = resolve_launch(
+        record, values, grid, is_test = _resolve_cached(
             name, args, cols_per_cta=self.cols_per_cta
         )
         module = None
@@ -1265,6 +1320,12 @@ class KernelBackend(Backend):
         be.run_module(
             record, values, grid=grid, device_index=device_index, module=module
         )
+
+    def launch_scope(self, call: CallKcp) -> Any:
+        """The launch glue's stream scope (``cake_backend.launch_scope``: one ``tvm_ffi.use_torch_stream()`` context
+        for the body's launches instead of one per launch); ``None`` when the glue has no scope."""
+        scope = getattr(self.launcher(), "launch_scope", None)
+        return None if scope is None else scope()
 
 
 class FakeBackend(Backend):
@@ -1290,7 +1351,7 @@ class FakeBackend(Backend):
     def run(self, name: str, args: dict[str, Any]) -> None:
         mod = self.module()
         call: CallKcp = args["_call"]
-        record, values, grid, _is_test = resolve_launch(name, args)
+        record, values, grid, _is_test = _resolve_cached(name, args)
         run_module = getattr(mod, "run_module", None)
         if (
             run_module is not None
@@ -1500,6 +1561,9 @@ class _Tables:
         self, ctx: Any, HV: int, *, fused_walks: int = 1, P: int | None = None
     ) -> None:
         self.ctx = ctx
+        # launch key -> (record, grid, is_test, merge cols_per_cta): the launch cache of _resolve_cached (host data of
+        # this plan, filled at the first launch of each key)
+        self.launches: dict[tuple, tuple] = {}
         self.H = H = int(HV)  # every pool, split and chain is per VALUE head
         self.fused_walks = int(
             fused_walks
@@ -4254,6 +4318,17 @@ def chunk_gdn_fwd_kcp(
     )
 
 
+def _in_launch_scope(call: CallKcp, body: Any, *args: Any, **kw: Any) -> Any:
+    """``body(*args, **kw)`` -- a forward or backward body, eagerly or inside a capture -- in the backend's launch
+    scope of ``call`` (:meth:`Backend.launch_scope`), entered where the body's launches run (inside the capture
+    when there is one), so the scope binds their stream; without a scope the body runs as it is."""
+    scope = call.backend.launch_scope(call)
+    if scope is None:
+        return body(*args, **kw)
+    with scope:
+        return body(*args, **kw)
+
+
 def _fwd_entry(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -4317,8 +4392,13 @@ def _fwd_entry(
             "fwd",
             entry,
             call,
-            lambda: _fwd_body(
-                call, save=save, autograd_node=autograd_node, executable=executable
+            lambda: _in_launch_scope(
+                call,
+                _fwd_body,
+                call,
+                save=save,
+                autograd_node=autograd_node,
+                executable=executable,
             ),
         )
         if res is not None:
@@ -4370,7 +4450,9 @@ def _fwd_entry(
             call.device,
         )
     call.scratch["recompute_handle"] = handle_mode
-    out, saved = _fwd_body(
+    out, saved = _in_launch_scope(
+        call,
+        _fwd_body,
         call,
         save=save,
         hand_off=hand_off and call.T_r > 0,
@@ -4725,7 +4807,9 @@ def _bwd_entry(
     if saved is not None:
         _check_saved(saved, call)
     if entry is not None and entry.seen > 0 and entry.disabled is None:
-        res = _graph_capture("bwd", entry, call, lambda: _bwd_body(call, saved))
+        res = _graph_capture(
+            "bwd", entry, call, lambda: _in_launch_scope(call, _bwd_body, call, saved)
+        )
         if res is not None:
             entry.result = (res, batched)
             return tuple(_ranked(t.detach(), batched) for t in res)
@@ -4745,7 +4829,7 @@ def _bwd_entry(
         )
         if saved is not None:
             _check_saved(saved, call)
-    grads = _bwd_body(call, saved)
+    grads = _in_launch_scope(call, _bwd_body, call, saved)
     _record("bwd", call)
     if opts.graph != "off":
         _graph_eager("bwd", entry)
