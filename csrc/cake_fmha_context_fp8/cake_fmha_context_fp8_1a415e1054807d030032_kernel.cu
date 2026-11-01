@@ -370,7 +370,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, uint8_t* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2, int scale_source, CakeFastDivmod num_m_blocks, unsigned int full_sections, CakeFastDivmod num_bh_units, int num_q_heads, CakeFastDivmod heads_per_group, int page_shift, CakeFastDivmod split_tiles, unsigned int split_blocks, unsigned int num_splits, float* __restrict__ partial_o, float* __restrict__ partial_ml, unsigned int* __restrict__ tile_counters)
+kernel_cake_fmha_context_fp8_1a415e1054807d030032(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, uint8_t* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2, int scale_source, CakeFastDivmod num_m_blocks, unsigned int full_sections, CakeFastDivmod num_bh_units, int num_q_heads, CakeFastDivmod heads_per_group, int page_shift, CakeFastDivmod split_tiles, unsigned int split_blocks, unsigned int num_splits, float* __restrict__ partial_o, float* __restrict__ partial_ml, unsigned int* __restrict__ tile_counters)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -604,7 +604,7 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                 int seqlen_q_bh = cu_seq_lens_q[b_idx + 1] - cu_seq_lens_q[b_idx];
                 unsigned int num_n_blocks = (seqlen_kv_bh + BLOCK_N - 1) / BLOCK_N;
                 int tile_kv_shift = seqlen_kv_bh - seqlen_q_bh;
-                unsigned int tile_max_n = (m_block * 2 + 2) * 64 + (unsigned int)tile_kv_shift;
+                unsigned int tile_max_n = (m_block * 2 + 2) * 128 + (unsigned int)tile_kv_shift;
                 if (tile_max_n < (unsigned int)seqlen_kv_bh) {
                     num_n_blocks = (tile_max_n + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                 }
@@ -626,8 +626,8 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                 int causal_row;
                 unsigned int num_masked_iters;
                 int kv_shift = seqlen_kv_bh - seqlen_q_bh;
-                causal_row = (m_block * 2 + stage) * 64 + (unsigned int)((warp % 4 * 32 + lane) / 2) + (unsigned int)kv_shift;
-                int causal_row_min = (m_block * 2 + stage) * 64 + (unsigned int)kv_shift;
+                causal_row = (m_block * 2 + stage) * 128 + (unsigned int)(warp % 4 * 32 + lane) + (unsigned int)kv_shift;
+                int causal_row_min = (m_block * 2 + stage) * 128 + (unsigned int)kv_shift;
                 unsigned int n_block_no_mask_limit = (causal_row_min + 1) / BLOCK_N;
                 int masked_blocks = (int)us_hi - (int)n_block_no_mask_limit;
                 if (masked_blocks < 0) {
@@ -2426,7 +2426,7 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                 int seqlen_q_bh_1 = cu_seq_lens_q[b_idx_1 + 1] - cu_seq_lens_q[b_idx_1];
                 unsigned int num_n_blocks_1 = (seqlen_kv_bh_1 + BLOCK_N - 1) / BLOCK_N;
                 int tile_kv_shift_1 = seqlen_kv_bh_1 - seqlen_q_bh_1;
-                unsigned int tile_max_n_1 = (m_block_1 * 2 + 2) * 64 + (unsigned int)tile_kv_shift_1;
+                unsigned int tile_max_n_1 = (m_block_1 * 2 + 2) * 128 + (unsigned int)tile_kv_shift_1;
                 if (tile_max_n_1 < (unsigned int)seqlen_kv_bh_1) {
                     num_n_blocks_1 = (tile_max_n_1 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                 }
@@ -2445,9 +2445,9 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                         us_blocks_1 = us_hi_1;
                     }
                 }
-                int q_head_base = unit_1 * 2;
-                int row_tok = (warp % 4 * 32 + lane) / 2;
-                int row_head = q_head_base + (warp % 4 * 32 + lane) % 2;
+                int q_head_base = unit_1;
+                int row_tok = warp % 4 * 32 + lane;
+                int row_head = q_head_base;
                 int tok_base = cu_seq_lens_q[b_idx_1];
                 mbarrier_arrive(p_full_addr);
                 mbarrier_arrive(p_full_addr + 8);
@@ -2530,7 +2530,7 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                         } else {
                             final_scale = 0.0f;
                         }
-                        int q_tok0 = (m_block_1 * 2 + (unsigned int)stage_1) * 64;
+                        int q_tok0 = (m_block_1 * 2 + (unsigned int)stage_1) * 128;
                         if (q_tok0 < seqlen_q_bh_1) {
                             int row_valid = warp % 4 * 32 + lane < 128 && seqlen_q_bh_1 > q_tok0 + row_tok;
                             long long o_tok = tok_base + q_tok0 + row_tok;
@@ -2613,7 +2613,7 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                         int p_soff = pstage * BLOCK_M;
                         float p_sum = sScale[crow + p_soff + 2 * BLOCK_M];
                         float p_max = sScale[crow + p_soff + 4 * BLOCK_M];
-                        int p_tok0 = (m_block_1 * 2 + (unsigned int)pstage) * 64;
+                        int p_tok0 = (m_block_1 * 2 + (unsigned int)pstage) * 128;
                         if (p_tok0 < seqlen_q_bh_1) {
                             int p_valid = crow < 128 && seqlen_q_bh_1 > p_tok0 + row_tok;
                             unsigned int p_base_2 = (ticket_1 * 2 + (unsigned int)pstage) * 16384 + (unsigned int)crow * 4;
@@ -2655,8 +2655,8 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                     unsigned int merge_now = merge_flag[0];
                     if (merge_now != 0) {
                         asm volatile("fence.acquire.gpu;" ::: "memory");
-                        int mv_tok0 = m_block_1 * 2 * 64;
-                        int mv_tok1 = mv_tok0 + 64;
+                        int mv_tok0 = m_block_1 * 2 * 128;
+                        int mv_tok1 = mv_tok0 + 128;
                         unsigned int mv_ok0 = 0;
                         if (mv_tok0 < seqlen_q_bh_1) {
                             if (crow < 128 && seqlen_q_bh_1 > mv_tok0 + row_tok) {
@@ -2721,7 +2721,7 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                         unsigned int cons_n = 0;
                         #pragma unroll
                         for (int cst = 0; cst < 2; cst++) {
-                            int c_tok0 = (m_block_1 * 2 + (unsigned int)cst) * 64;
+                            int c_tok0 = (m_block_1 * 2 + (unsigned int)cst) * 128;
                             unsigned int c_ok = ((cst == 0) ? mv_ok0 : mv_ok1);
                             float sm_max = -CUDART_INF_F;
                             #pragma unroll 1
@@ -2927,7 +2927,7 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                 int seqlen_q_bh_2 = cu_seq_lens_q[b_idx_2 + 1] - cu_seq_lens_q[b_idx_2];
                 unsigned int num_n_blocks_2 = (seqlen_kv_bh_2 + BLOCK_N - 1) / BLOCK_N;
                 int tile_kv_shift_2 = seqlen_kv_bh_2 - seqlen_q_bh_2;
-                unsigned int tile_max_n_2 = (m_block_2 * 2 + 2) * 64 + (unsigned int)tile_kv_shift_2;
+                unsigned int tile_max_n_2 = (m_block_2 * 2 + 2) * 128 + (unsigned int)tile_kv_shift_2;
                 if (tile_max_n_2 < (unsigned int)seqlen_kv_bh_2) {
                     num_n_blocks_2 = (tile_max_n_2 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                 }
@@ -3226,7 +3226,7 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
             unsigned int max_rounds_3 = total_units_3 + 1;
             unsigned int po_stage = 0;
             unsigned int po_shift;
-            po_shift = 6;
+            po_shift = (unsigned int)page_shift;
             unsigned int _phase_work_id_full_0_3 = 0;
             unsigned int _phase_page_empty = 1;
             #pragma unroll 1
@@ -3270,7 +3270,7 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                 int seqlen_q_bh_3 = cu_seq_lens_q[b_idx_3 + 1] - cu_seq_lens_q[b_idx_3];
                 unsigned int num_n_blocks_3 = (seqlen_kv_bh_3 + BLOCK_N - 1) / BLOCK_N;
                 int tile_kv_shift_3 = seqlen_kv_bh_3 - seqlen_q_bh_3;
-                unsigned int tile_max_n_3 = (m_block_3 * 2 + 2) * 64 + (unsigned int)tile_kv_shift_3;
+                unsigned int tile_max_n_3 = (m_block_3 * 2 + 2) * 128 + (unsigned int)tile_kv_shift_3;
                 if (tile_max_n_3 < (unsigned int)seqlen_kv_bh_3) {
                     num_n_blocks_3 = (tile_max_n_3 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                 }
@@ -3381,7 +3381,7 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                         int seqlen_q_bh_4 = cu_seq_lens_q[b_idx_4 + 1] - cu_seq_lens_q[b_idx_4];
                         unsigned int num_n_blocks_4 = (seqlen_kv_bh_4 + BLOCK_N - 1) / BLOCK_N;
                         int tile_kv_shift_4 = seqlen_kv_bh_4 - seqlen_q_bh_4;
-                        unsigned int tile_max_n_4 = (m_block_4 * 2 + 2) * 64 + (unsigned int)tile_kv_shift_4;
+                        unsigned int tile_max_n_4 = (m_block_4 * 2 + 2) * 128 + (unsigned int)tile_kv_shift_4;
                         if (tile_max_n_4 < (unsigned int)seqlen_kv_bh_4) {
                             num_n_blocks_4 = (tile_max_n_4 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                         }
@@ -3425,7 +3425,7 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
             unsigned int load_kv_stage = 0;
             unsigned int load_po_stage = 0;
             unsigned int ld_shift;
-            ld_shift = 6;
+            ld_shift = (unsigned int)page_shift;
             unsigned int page_mask = (1 << ld_shift) - 1;
             int chunk_page0 = 0 >> ld_shift;
             int chunk_page1 = 16 >> ld_shift;
@@ -3480,7 +3480,7 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                 int seqlen_q_bh_5 = cu_seq_lens_q[b_idx_5 + 1] - cu_seq_lens_q[b_idx_5];
                 unsigned int num_n_blocks_5 = (seqlen_kv_bh_5 + BLOCK_N - 1) / BLOCK_N;
                 int tile_kv_shift_5 = seqlen_kv_bh_5 - seqlen_q_bh_5;
-                unsigned int tile_max_n_5 = (m_block_5 * 2 + 2) * 64 + (unsigned int)tile_kv_shift_5;
+                unsigned int tile_max_n_5 = (m_block_5 * 2 + 2) * 128 + (unsigned int)tile_kv_shift_5;
                 if (tile_max_n_5 < (unsigned int)seqlen_kv_bh_5) {
                     num_n_blocks_5 = (tile_max_n_5 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                 }
@@ -3499,11 +3499,11 @@ kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec(const __grid_constant__ CUtens
                         us_blocks_4 = us_hi_4;
                     }
                 }
-                uint32_t group_head = (heads_per_group.divisor != 1) ? (__umulhi((uint32_t)(unit_5 * 2), heads_per_group.multiplier) >> heads_per_group.shift_right) : (uint32_t)(unit_5 * 2);
-                uint32_t group_rank = (uint32_t)(unit_5 * 2) - group_head * (uint32_t)(heads_per_group.divisor);
+                uint32_t group_head = (heads_per_group.divisor != 1) ? (__umulhi((uint32_t)(unit_5), heads_per_group.multiplier) >> heads_per_group.shift_right) : (uint32_t)(unit_5);
+                uint32_t group_rank = (uint32_t)(unit_5) - group_head * (uint32_t)(heads_per_group.divisor);
                 int kv_head = group_head;
-                int tok_q0 = (unsigned int)cu_seq_lens_q[b_idx_5] + m_block_5 * 2 * 64;
-                int tok_q1 = tok_q0 + 64;
+                int tok_q0 = (unsigned int)cu_seq_lens_q[b_idx_5] + m_block_5 * 2 * 128;
+                int tok_q1 = tok_q0 + 128;
                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
                 _phase_q_empty_0 ^= 1;
                 if (elect_sync()) {
