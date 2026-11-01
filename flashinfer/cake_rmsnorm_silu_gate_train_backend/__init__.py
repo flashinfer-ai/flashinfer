@@ -83,13 +83,13 @@ Host design (the input layout rules are the deterministic package's):
   weight-gradient module) uses the zero-filled workspace of its (device,
   stream, backward module), allocated on first use and kept in
   ``_STREAM_WORKSPACES`` for later calls: 4104 bytes each, at most one per
-  backward module (two per weight-gradient dtype on sm_107a, where the long
-  backward is a module of its own, else one) for every stream that ran such a
-  backward.  Such eager calls also keep a reserve of 64 zero-filled
-  workspaces per device (one allocation of about 272 KiB, filled outside any
-  capture), from which a call during CUDA Graph capture takes the workspace of
-  its capture and capture stream for good, so a replay launches no fill kernel
-  (see ``_RESERVES``; with none ready, the graph zero-fills one of its own).
+  backward module (two per weight-gradient dtype: the backward and the long
+  backward) for every stream that ran such a backward.  Such eager calls also
+  keep a reserve of 64 zero-filled workspaces per device (one allocation of
+  about 272 KiB, filled outside any capture), from which a call during CUDA
+  Graph capture takes the workspace of its capture and capture stream for
+  good, so a replay launches no fill kernel (see ``_RESERVES``; with none
+  ready, the graph zero-fills one of its own).
 - Grids (``cake_jit.module_for_rows`` picks the module from the rows and
   the device's SM count): the forward launches one CTA per block of 16 rows;
   on sm_100a and sm_103a it launches a forward whose CTA ``b`` walks the
@@ -99,9 +99,13 @@ Host design (the input layout rules are the deterministic package's):
   blocks of 16 rows each), from 2400 the long forward (3 CTAs per SM, at most
   6 blocks of 32 rows each).  The backward
   launches ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
-  ctas_per_sm * SMs)``, so at most one wave: 256-thread CTAs of 16-row blocks
-  with ``ctas_per_sm = 4``, and on sm_107a from 1024 rows per SM 128-thread
-  CTAs of 8-row blocks with ``ctas_per_sm = 8``.  When
+  ctas_per_sm * SMs)``: 256-thread CTAs of 16-row blocks with
+  ``ctas_per_sm = 4`` (one wave); on sm_100a and sm_103a from 1280 rows per
+  SM the same CTAs, whose thread 0 warms the next block of packed rows in L2
+  with one bulk prefetch a tensor, with ``ctas_per_sm = 5``, a quarter more
+  than an SM holds at once (an SM starts its fifth CTA as one of its first
+  four leaves); and on sm_107a from 1024 rows per SM 128-thread CTAs of 8-row
+  blocks with ``ctas_per_sm = 8`` (one wave).  When
   ``G`` is the number of row blocks, CTA ``c`` takes block ``c`` and nothing
   is claimed.  Past one wave, thread 0 of every CTA claims every block in
   chunks of consecutive blocks with a relaxed atomic increment on the
@@ -804,9 +808,9 @@ def cake_rmsnorm_silu_gate_train_backward(
     r"""SiLU-gated RMSNorm backward of this package: ``dx``, ``dz`` and the
     weight gradient.
 
-    One kernel of at most one wave of CTAs (one row block each when the grid
-    has a CTA for every block; past one wave they claim the blocks in chunks
-    from the workspace's claim counter): ``dx`` and ``dz`` are
+    One kernel of at most ``ctas_per_sm`` CTAs per SM (one row block each when
+    the grid has a CTA for every block; past one wave they claim the blocks in
+    chunks from the workspace's claim counter): ``dx`` and ``dz`` are
     the deterministic backward's bits, and each CTA adds its FP64 column sums
     into the FP64 accumulators of the workspace with atomics; the CTA that
     arrives last rounds the sum once into ``dw`` (adding ``grad_weight``'s value

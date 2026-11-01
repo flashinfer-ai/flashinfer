@@ -91,7 +91,8 @@ that anything else wrote into, must be zeroed with
 before its next backward.  It is not interchangeable with the deterministic
 package's partial buffer.  Calls without a workspace use one 4104-byte buffer
 per device, stream and backward kernel (one per weight-gradient dtype, two
-on SM107 from 1024 rows per SM), kept for later calls; the
+from 1024 rows per SM on SM107 and from 1280 on SM100 and SM103), kept for
+later calls; the
 autograd node retains nothing else.  They also keep a reserve of 64
 zero-filled 4104-byte buffers per device (about 272 KiB, filled outside any
 capture): a call during CUDA Graph capture takes one per capture and capture
@@ -111,10 +112,12 @@ large dynamic shared-memory allocation, lets the backward start beside it.  The
 deterministic backward also waits for such a kernel when that kernel has no
 shared memory and the default or the maximum-L1 carveout; both forwards start
 beside it whatever its carveout.  The non-deterministic backward launches at
-most one wave of CTAs.  When the grid has a CTA for every row block, CTA ``c``
-takes block ``c``; past one wave the CTAs claim every block in chunks from the
-workspace's claim counter, each CTA its next chunk as the last block of its
-current one starts, so a CTA that starts late takes fewer blocks.
+most one wave of CTAs, or on SM100 and SM103 from 1280 rows per SM 5 CTAs per
+SM, a quarter more than an SM holds at once.  When the grid has a CTA for every
+row block, CTA ``c`` takes block ``c``; past one wave the CTAs claim every
+block in chunks from the workspace's claim counter, each CTA its next chunk as
+the last block of its current one starts, so a CTA that starts late takes
+fewer blocks (none when every chunk was claimed before it started).
 
 Usage::
 

@@ -137,7 +137,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_rmsnorm_silu_gate_train_6055175bf363e85d2936(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ dx, __nv_bfloat16* __restrict__ dz, double* __restrict__ dw_sums, unsigned int* __restrict__ dw_done, __nv_bfloat16* __restrict__ dw, int rows, CakeFastDivmod heads, long long dy_tok, long long dy_head, long long x_tok, long long x_head, long long z_tok, long long z_head, float eps, int accumulate, int weight_grad)
+kernel_cake_rmsnorm_silu_gate_train_26c869703d0ab9e4a39d(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ z, __nv_bfloat16* __restrict__ w, __nv_bfloat16* __restrict__ dx, __nv_bfloat16* __restrict__ dz, double* __restrict__ dw_sums, unsigned int* __restrict__ dw_done, float* __restrict__ dw, int rows, CakeFastDivmod heads, long long dy_tok, long long dy_head, long long x_tok, long long x_head, long long z_tok, long long z_head, float eps, int accumulate, int weight_grad)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1860,10 +1860,10 @@ kernel_cake_rmsnorm_silu_gate_train_6055175bf363e85d2936(__nv_bfloat16* __restri
                 dw_total = dw_total + part_3;
                 dw_sums[384 + tid] = 0.0;
                 if (accumulate != 0) {
-                    __nv_bfloat16 prev = atomicAdd(&dw[tid], -0.0f);
-                    dw_total = dw_total + (double)(float)prev;
+                    float prev = atomicAdd(&dw[tid], -0.0f);
+                    dw_total = dw_total + (double)prev;
                 }
-                dw[tid] = (__nv_bfloat16)(float)dw_total;
+                dw[tid] = (float)dw_total;
             }
         }
     }

@@ -21,7 +21,10 @@ The forward launches a plain grid of independent CTAs; on SM100 and SM103
 from 976 rows per SM the mid forward launches whole waves of 6 CTAs per SM
 that each walk at most 2 row blocks, and from 2400 rows per SM the long
 forward whole waves of 3 CTAs per SM that each walk at most 6.  The backward launches
-at most one wave of CTAs: when the grid has a CTA for every row block, each
+at most one wave of CTAs (on SM100 and SM103 from 1280 rows per SM the long
+backward 5 CTAs per SM, a quarter more than an SM holds at once, its fifth on
+an SM starting as one of the first four leaves): when the grid has a CTA for
+every row block, each
 CTA takes its own block; past one wave the CTAs claim every block in chunks of
 consecutive blocks from the workspace's claim counter, chunks that shrink to
 single blocks at the end, each CTA its next chunk as the last block of its
@@ -47,11 +50,13 @@ gradients) and the forward start beside it and cost at most
 
 The backward beside a side kernel that holds ``k`` of the ``N`` SMs (issue
 #7548, item 1): busy / alone is at most the proportional ``N / (N - k)``, plus
-the share of one row block in the call (the last chunks are single blocks, so
-the CTAs finish within about one block of each other), plus
-``PROPORTIONAL_SLACK``.  The token counts give each CTA of the backward's
-one-wave grid 16 and 160 row blocks: ``T = 3157`` and ``31573`` on a
-148-SM B200, where the earlier fixed one-wave grid of 16 blocks per CTA ran
+the share of one row block of an SM's resident CTAs in the call (the last
+chunks are single blocks, so the CTAs finish within about one block of each
+other), plus ``PROPORTIONAL_SLACK``.  The token counts give each CTA of the
+backward's one-wave grid 16, 32 and 160 row blocks: ``T = 3157``, ``6314`` and
+``31573`` on a 148-SM B200 (on SM100 and SM103 the first runs the backward,
+below the long backward's 1280 rows per SM, the others the long
+backward), where the earlier fixed one-wave grid of 16 blocks per CTA ran
 1.26-1.35 times slower beside any side kernel.  The long and mid forwards
 beside the same side kernels: busy / alone is at most ``N / (N - k)``, plus
 the share of one CTA's blocks in the call (a CTA whose slot the side kernel
@@ -217,7 +222,10 @@ CARVEOUT_MAX_SHARED = 100
 # 1 x 128, 16 x 640 and 32 x 640, beside the backward at the token counts that
 # give each CTA of its one-wave grid this many row blocks.
 PROPORTIONAL_SIDES = ((1, 128), (16, 640), (32, 640))
-PROPORTIONAL_BLOCKS_PER_CTA = (16, 160)
+PROPORTIONAL_BLOCKS_PER_CTA = (16, 32, 160)
+# CTAs of the backward an SM holds at once: 1024 threads (its launch bounds,
+# 64 registers a thread).
+BACKWARD_THREADS_PER_SM = 1024
 PROPORTIONAL_RUNS = 7
 # The noise margin of busy / alone over N / (N - k) plus one row block's
 # share.  Measured with this backward beside these tests' side kernels (1 x
@@ -535,10 +543,10 @@ def test_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
 def _claim_tokens(blocks_per_cta: int) -> tuple[int, float]:
     """``(T, block_share)``: the most tokens ``T`` whose ``T * H`` rows give
     each CTA of the BF16 weight-gradient backward's one-wave grid
-    (``backward_ctas``) at most ``blocks_per_cta`` row blocks, and the grid over
-    the row blocks of the module those rows run (on sm_107a the long backward
-    from 1024 rows per SM), which bounds one row block's share of the call
-    alone."""
+    (``backward_ctas``) at most ``blocks_per_cta`` row blocks, and the CTAs of
+    the module those rows run (the long backward from its threshold) that the
+    SMs hold at once over its row blocks, which bounds one row block's share
+    of the call alone."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
     name = loader.route_module(arch, "bwd_bf16")
@@ -551,7 +559,9 @@ def _claim_tokens(blocks_per_cta: int) -> tuple[int, float]:
     blocks = -(-(tokens * H) // rows_per_cta)
     ctas = loader.backward_ctas(name, tokens * H, sms)
     assert ctas == loader.backward_ctas(name, loader.INT32_MAX, sms)
-    return tokens, ctas / blocks
+    threads = int(loader.MODULES[name]["launch"]["block"][0])
+    resident = min(ctas, BACKWARD_THREADS_PER_SM // threads * sms)
+    return tokens, resident / blocks
 
 
 @pytest.mark.parametrize(
