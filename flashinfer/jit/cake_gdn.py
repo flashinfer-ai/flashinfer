@@ -1123,6 +1123,54 @@ def select_cake_gdn_prefill_variant(
         # did before the twin existed; only a missing base fails closed below.
         gate_stream_full = False
         schedule_attr = _seq_schedule_attr(gate_stream_full=False)
+    if (
+        arch == "sm_107a"
+        and dvsplit
+        and not single_chunk
+        and not enable_checkpoints
+        and not use_state_indices
+        and not low_precision_state
+        and not _has_variant(
+            arch=arch,
+            domain="prefill",
+            schedule_attr=schedule_attr,
+            specializations=specializations,
+        )
+    ):
+        # sm_107a only.  DV-split is a physical-schedule choice (the tiles fit
+        # the active clusters), not part of the contract.  sm_107a's 212
+        # clusters put keys with 2 * num_seqs * max(Hq, Hv) in (148, 212] on
+        # DV-split where sm_100a runs full-DV (sm_103a only above 160; it
+        # fails closed on (148, 160]), and the non-gatepipe4
+        # DV-split schedules ship no (-1, 0, -1) geometry (Hv / Hq and Hv both
+        # not powers of two): e.g. FP16 I/O, FP32 initial + final state,
+        # ungated Hq2/Hv6 x 16 sequences.  On sm_107a a key the DV-split
+        # schedule does not ship runs the full-DV base record of the same key
+        # when one is shipped.
+        full_dv_schedule_attr = cake_gdn_prefill_seq_schedule(
+            arch,
+            _prefill_schedule_attr(
+                dvsplit=False,
+                use_initial_state=use_initial_state,
+                io_dtype=io_dtype,
+                state_dtype=state_dtype,
+                single_chunk=False,
+                gatepipe4=False,
+                fullgrid_vhold=False,
+                sm100a_state_inp_late=False,
+                sm103a_role_rebalanced=False,
+                gate_stream_full=False,
+            ),
+            use_state_indices=False,
+        )
+        if _has_variant(
+            arch=arch,
+            domain="prefill",
+            schedule_attr=full_dv_schedule_attr,
+            specializations=specializations,
+        ):
+            dvsplit = False
+            schedule_attr = full_dv_schedule_attr
     record = _variant_for(
         arch=arch,
         domain="prefill",

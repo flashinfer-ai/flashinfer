@@ -1355,8 +1355,10 @@ def chunk_gated_delta_rule(
         ``(HEAD_GROUP_LOG2, IS_GQA, NUM_O_HEADS_LOG2)`` geometry set of each
         contract is enumerated by
         :func:`flashinfer.jit.cake_gdn.cake_gdn_prefill_geometries` from
-        ``csrc/gdn/cake/manifest.json``; an unlisted geometry, schedule or
-        architecture raises ``CakeGDNUnsupportedError``. The BF16-I/O
+        ``csrc/gdn/cake/manifest.json``; on SM107 a DV-split key whose
+        geometry only the full-DV set lists runs the full-DV record, and an
+        unlisted geometry, schedule or architecture raises
+        ``CakeGDNUnsupportedError``. The BF16-I/O
         FP32-state initial+final contract covers the Qwen3-Next / Qwen3.5
         per-rank geometries for TP1, TP2, TP4 and TP8 in both physical
         schedules (DV-split and full-DV).
