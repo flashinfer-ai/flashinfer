@@ -99,6 +99,30 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
+    "cake_gdn_cp_24af0c6f4359b2acf3c1": {
+        "sources": [
+            "gdn/gdn_cp/cake_gdn_cp_24af0c6f4359b2acf3c1_kernel.cu",
+            "gdn/gdn_cp/cake_gdn_cp_24af0c6f4359b2acf3c1_binding.cu",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "local_transfer"],
+            ["buffer", "local_state"],
+            ["buffer", "initial_state"],
+            ["buffer", "initial_state_workspace"],
+            ["buffer", "fixed_state"],
+            ["buffer", "output_state"],
+            ["buffer", "cu_seqlens"],
+            ["parameter", "chunk_len"],
+            ["parameter", "total_cp_chunks"],
+            ["parameter", "num_seqs"],
+            ["parameter", "num_heads"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_107a"],
+    },
     "cake_gdn_cp_28b5fee38bf967a68cd8": {
         "sources": [
             "gdn/gdn_cp/cake_gdn_cp_28b5fee38bf967a68cd8_kernel.cu",
@@ -846,7 +870,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_y"],
             ["grid", "grid_z"],
         ],
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_gdn_cp_e19f8702607bd4d78e49": {
         "sources": [
@@ -1028,7 +1052,7 @@ KERNELS: dict[str, Any] = {
         "normalized_final_state_bf16": "cake_gdn_cp_29c857ce26576248b1c8",
         "qk_norm": "cake_gdn_cp_58df50f20a8e6a75e788",
         "qk_norm_bf16": "cake_gdn_cp_c2f66f9e7a1e3b12cabd",
-        "state_fixup_simt_row4": "cake_gdn_cp_dc9fd29403170907f3a6",
+        "state_fixup_simt_row4": "cake_gdn_cp_24af0c6f4359b2acf3c1",
         "state_gather_bf16": "cake_gdn_cp_a3c89471a34205cf5fa6",
         "state_gather_bf16_int64": "cake_gdn_cp_8d18c9a7d634c6df6e7e",
         "state_gather_fp16": "cake_gdn_cp_1284aa3c9e3f34eb5df5",
