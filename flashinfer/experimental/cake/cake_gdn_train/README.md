@@ -128,7 +128,11 @@ runs it (`fwd_ho` for the forward, `dhu_tc2` for the adjoint) with R200 step
 times and fitted split costs, when it saves at least 2 us and prices at most
 0.95 of the chosen table; a serial table that
 the two-stream rule groups keeps its form, and `sm_100a` / `sm_103a` keep their
-tables.  Elsewhere the forward table is the planner's.  A different table
+tables.  On `sm_107a` (`SPLIT_R_FORM`) a value-head group of three with the
+`tail_g3` tail also keeps the planner's `(64, 1)` split adjoint table when the
+`dhu_tc2` pricing runs its pass 2 and the two-stream rule groups its segments
+(the R form below; the deterministic package's table and groups).
+Elsewhere the forward table is the planner's.  A different table
 changes the bits of the outputs that depend on it (other segment boundaries),
 so the deterministic package's bits need its tables: pin `scan_config` /
 `segment_chunks`.  Then one of four
@@ -202,7 +206,10 @@ order (longest first unless `lpt=False`).  The adjoint `dhu_tc2` scan of a
 value-head group of two runs the first `k` sequences on the caller's stream,
 then their fused tail while a side stream scans the rest.  The forward runs
 `wy_tc` and `fwd_ho` of the first `n - k` sequences on the side stream; once
-that `wy_tc` is done, the caller's stream runs those of the last `k`.  The side
+that `wy_tc` is done, the caller's stream runs those of the last `k`.  On
+`sm_107a` the `dhu_tc2` pass 2 of a split adjoint table beside `tail_g3` runs
+the same way over its segments (`n` segments, the first `k` on the caller's
+stream).  The side
 stream is a stream of PyTorch's pool with the device's greatest priority, one
 per caller stream; it is forked from the caller's stream with events and joined
 before the stage returns (also when a launch raises), so the call can be
