@@ -1917,7 +1917,8 @@ def _backward_finish(
     slab = _loader.slab_plan(rows, sm, arch, hidden=hidden)
     # The atomic fn split writes the transposed operand layout and, without
     # accumulate, zeroes dfn.  The column-slab pass (the dynr record over the
-    # one-size chunks or the lpt record over the host rule's two-size chunks)
+    # one-size chunks or the lpt record over the host rule's two-size chunks,
+    # or their slab-fastest _os copies where bwd_slab_order names "slab")
     # describes the ``[T, 4, H]`` tensors as ``[T, 4H]``, reads the first
     # ``T`` rows of the padded ``dz'`` record, draws its work units from the
     # workspace's self-resetting ticket word, adds into dfn and folds dscale /
