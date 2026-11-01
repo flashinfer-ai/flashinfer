@@ -25,8 +25,8 @@ from flashinfer.attention.prims_ts import (
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="Requires SM100/SM103",
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)),
+    reason="Requires SM100/SM103/SM107",
 )
 
 

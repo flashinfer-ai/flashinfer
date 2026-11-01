@@ -17,9 +17,10 @@ from cutlass.pipeline import PipelineState
 
 from ..helpers.gather import gather4_quad
 from ..helpers.nvfp4_kv import (
-    convert_nvfp4x8,
+    convert_nvfp4x8_prepared,
     nvfp4_row_bytes,
     nvfp4_scale_byte_offset,
+    prepare_nvfp4_scale,
     publish_nvfp4_kv,
     store_shared_u32x4,
     swizzle_byte_offset,
@@ -177,14 +178,16 @@ def convert_k_and_exchange_v(
             k4 = load_shared_words(
                 kraw.toint(Int32) + Int32(i * stride) + lane * Int32(8), 2
             )
-            sf = Int32(
-                shared_byte_view(kraw, 8 * stride)[
-                    Int32(i * stride + 256 + rope_dim)
-                    + nvfp4_scale_byte_offset(lane, rope_dim)
-                ]
+            sf = prepare_nvfp4_scale(
+                Int32(
+                    shared_byte_view(kraw, 8 * stride)[
+                        Int32(i * stride + 256 + rope_dim)
+                        + nvfp4_scale_byte_offset(lane, rope_dim)
+                    ]
+                )
             )
-            a, b = convert_nvfp4x8(k4[0], sf)
-            c, d = convert_nvfp4x8(k4[1], sf)
+            a, b = convert_nvfp4x8_prepared(k4[0], sf)
+            c, d = convert_nvfp4x8_prepared(k4[1], sf)
         # FP8 panel TMA already populated K. Only NVFP4 needs a K write;
         # both formats reuse these registers for local/remote V publication.
         if cutlass.const_expr(not fp8):
