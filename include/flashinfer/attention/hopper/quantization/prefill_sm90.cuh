@@ -31,6 +31,7 @@
 #include "kernel_traits.cuh"
 #include "mainloop_load.cuh"
 #include "mainloop_mma.cuh"
+#include "mainloop_paged_tma.cuh"
 #include "mainloop_sparse_load.cuh"
 
 namespace flashinfer {
@@ -388,6 +389,71 @@ cudaError_t BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched(Params& params
   return cudaSuccess;
 }
 
+template <typename KernelTraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL,
+          bool SAME_SCHEDULE_FOR_ALL_HEADS, int PAGE_SIZE, typename Params>
+cudaError_t BatchFP8PrefillWithPagedKVCacheTmaKernelTraitsDispatched(Params& params,
+                                                                     cudaStream_t stream) {
+  using DTypeO = typename KernelTraits::DTypeO;
+  using IdType = typename KernelTraits::IdType;
+
+  using CollectiveMainloop = FP8PagedTmaCollectiveMainloop<typename Params::AdditionalParams,
+                                                           KernelTraits, CAUSAL, PAGE_SIZE>;
+  using CollectiveEpilogue = FP8CollectiveEpilogue<KernelTraits>;
+  using Scheduler =
+      std::conditional_t<SAME_SCHEDULE_FOR_ALL_HEADS, BatchPrefillTileScheduler<IdType>,
+                         BatchPrefillPersistentTileScheduler<IdType>>;
+
+  typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
+      {params.q_ptr,
+       get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM,
+                       params.q_stride_n, params.q_stride_h),
+       params.k_ptr, params.k_stride_n, params.k_stride_h, params.k_page_stride, params.v_ptr,
+       params.v_stride_n, params.v_stride_h, params.v_page_stride, params.kv_indices,
+       static_cast<int32_t>(params.num_kv_heads), params.num_pages, params.window_left,
+       params.additional_params});
+  typename CollectiveEpilogue::Params epilogue_params =
+      CollectiveEpilogue::to_underlying_arguments({
+          static_cast<DTypeO*>(params.o_ptr),
+          get_gmem_layout(params.nnz_qo, params.num_qo_heads, KernelTraits::HEAD_DIM,
+                          params.o_stride_n, params.o_stride_h),
+          static_cast<float*>(params.lse_ptr),
+          get_lse_gmem_layout(params.nnz_qo, params.num_qo_heads),
+      });
+
+  typename Scheduler::Arguments scheduler_args = {
+      params.work_indptr,
+      params.head_indices,
+      params.qo_tile_indices,
+      params.qo_indptr,
+      params.kv_indptr,
+      params.qo_lens,
+      params.kv_lens,
+      params.batch_indices,
+      cutlass::FastDivmod(params.num_qo_heads / params.num_kv_heads),
+      params.num_qo_heads};
+  typename Scheduler::Params scheduler_params = Scheduler::to_underlying_arguments(scheduler_args);
+
+  auto kernel =
+      (void*)FP8PrefillWithKVCacheKernel<CollectiveMainloop, CollectiveEpilogue, KernelTraits,
+                                         LEFT_SLIDING_WINDOW, CAUSAL, Scheduler>;
+  int smem_size = sizeof(typename KernelTraits::SharedStorage);
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+  int device;
+  cudaGetDevice(&device);
+  int multiprocessor_count;
+  FLASHINFER_CUDA_CALL(
+      cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
+  dim3 grid_dims = Scheduler::get_grid_dim(scheduler_args, multiprocessor_count);
+  static constexpr int cta_size = KernelTraits::NUM_WARPS * 32;
+  dim3 block_dims(cta_size);
+  void* args[] = {&mainloop_params, &epilogue_params, &scheduler_params};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, grid_dims, block_dims, args, smem_size, stream));
+
+  return cudaSuccess;
+}
+
 template <uint32_t HEAD_DIM, MaskMode MASK_MODE, bool LEFT_SLIDING_WINDOW,
           typename AttentionVariant, typename Params>
 cudaError_t SingleFP8PrefillWithKVCacheDispatched(Params& params, cudaStream_t stream) {
@@ -461,16 +527,41 @@ cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched(Params& params, bool enabl
         LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
   } else {
     // HEAD_DIM == 256;
-    // NOTE: Use smaller CTA_KV=64 for sparse paged loading to reduce page table lookup overhead
-    // (FP8 transpose requires minimum 64x64 blocks, so CTA_KV cannot be smaller than 64)
-    BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched<
-        FP8AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM,
-                                 /*CTA_Q_=*/128,
-                                 /*CTA_KV_=*/64,
-                                 /*NUM_STAGES_=*/2, typename Params::DTypeQ,
-                                 typename Params::DTypeKV, typename Params::DTypeO,
-                                 typename Params::IdType, AttentionVariant>,
-        LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+    if (params.page_size == 16 || params.page_size == 32 || params.page_size == 64) {
+      // TMA removes the per-thread paged gather overhead and makes the dense kernel's 128-row KV
+      // tile profitable. The larger tile changes floating-point accumulation order, so output is
+      // numerically equivalent to the 64-row cp.async path rather than bitwise identical.
+      using TmaTraits = FP8AttentionKernelTraits<
+          /*USE_TMA_LOAD_KV=*/true, HEAD_DIM,
+          /*CTA_Q_=*/128,
+          /*CTA_KV_=*/128,
+          /*NUM_STAGES_=*/2, typename Params::DTypeQ, typename Params::DTypeKV,
+          typename Params::DTypeO, typename Params::IdType, AttentionVariant>;
+      if (params.page_size == 16) {
+        BatchFP8PrefillWithPagedKVCacheTmaKernelTraitsDispatched<
+            TmaTraits, LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, 16>(params,
+                                                                                     stream);
+      } else if (params.page_size == 32) {
+        BatchFP8PrefillWithPagedKVCacheTmaKernelTraitsDispatched<
+            TmaTraits, LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, 32>(params,
+                                                                                     stream);
+      } else {
+        BatchFP8PrefillWithPagedKVCacheTmaKernelTraitsDispatched<
+            TmaTraits, LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS, 64>(params,
+                                                                                     stream);
+      }
+    } else {
+      // FP8 transpose requires at least a 64x64 tile; unsupported page sizes retain the existing
+      // predicated cp.async gather.
+      BatchFP8PrefillWithPagedKVCacheKernelTraitsDispatched<
+          FP8AttentionKernelTraits</*USE_TMA_LOAD_KV=*/false, HEAD_DIM,
+                                   /*CTA_Q_=*/128,
+                                   /*CTA_KV_=*/64,
+                                   /*NUM_STAGES_=*/2, typename Params::DTypeQ,
+                                   typename Params::DTypeKV, typename Params::DTypeO,
+                                   typename Params::IdType, AttentionVariant>,
+          LEFT_SLIDING_WINDOW, CAUSAL, SAME_SCHEDULE_FOR_ALL_HEADS>(params, stream);
+    }
   }
   cudaError_t status = cudaGetLastError();
   return status;
