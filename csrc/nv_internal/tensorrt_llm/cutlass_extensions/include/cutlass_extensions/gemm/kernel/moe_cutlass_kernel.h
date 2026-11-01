@@ -520,12 +520,18 @@ struct MoeFCGemm {
       // Compute position within threadblock
       int thread_idx = threadIdx.x;
 
-      // Construct iterators to A and B operands
-      typename Mma::IteratorA iterator_A(
-          LayoutA(ldm_A), ptr_A, {problem_size.m(), problem_size.k()}, thread_idx, tb_offset_A);
+      // Construct iterators to A and B operands.
+      // The Params objects are named locals (not temporaries) so they outlive the iterators:
+      // iterators may hold a `Params const&`, and a temporary would dangle after this
+      // statement (observed as illegal addresses with clang -O2/-O3, see #6212).
+      // Brace-init: with parentheses these would parse as function declarations.
+      typename Mma::IteratorA::Params params_A{LayoutA(ldm_A)};
+      typename Mma::IteratorA iterator_A(params_A, ptr_A, {problem_size.m(), problem_size.k()},
+                                         thread_idx, tb_offset_A);
 
+      typename Mma::IteratorB::Params params_B{LayoutB(ldm_B)};
       typename Mma::IteratorB iterator_B(
-          LayoutB(ldm_B), ptr_B, {problem_size.k() * kInterleave, problem_size.n() / kInterleave},
+          params_B, ptr_B, {problem_size.k() * kInterleave, problem_size.n() / kInterleave},
           thread_idx, tb_offset_B);
 
       typename Mma::FragmentC accumulators;
@@ -560,10 +566,10 @@ struct MoeFCGemm {
       if constexpr (use_dq_gemm<Mma>::value) {
         typename MatrixCoord::Index scale_row_extent =
             isFinegrained(Mma::QuantOp) ? gemm_k / 64 : 1;
+        typename Mma::IteratorScale::Params params_scale{LayoutScaleZero(ldm_Scale)};
         typename Mma::IteratorScale iterator_scale =
             initialize_scale<typename Mma::IteratorScale, Mma::QuantOp>(
-                LayoutScaleZero(ldm_Scale),
-                reinterpret_cast<typename Mma::IteratorScale::Pointer>(ptr_Scale),
+                params_scale, reinterpret_cast<typename Mma::IteratorScale::Pointer>(ptr_Scale),
                 reinterpret_cast<typename Mma::IteratorScale::Pointer>(ptr_Zero),
                 {scale_row_extent, problem_size.n()}, thread_idx, tb_offset_scale,
                 params.group_size);
