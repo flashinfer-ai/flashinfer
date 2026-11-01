@@ -553,7 +553,7 @@ def test_end_to_end_is_the_composed_chain(heads, group_reduce) -> None:
     route's FP32 group sum of the per-value-head partials (``group_reduce="host"``: the head-order sum; ``"fused"`` at
     one value head per Q/K head, where the fused sum is that partial)."""
     H_qk, HV = heads
-    if group_reduce == "fused" and HV != H_qk:
+    if group_reduce == "fused" and H_qk != HV:
         pytest.skip(
             "the fused FP32 group sum of the emulation is not the head-order sum of its partials"
         )
@@ -766,7 +766,9 @@ def test_norm_tapes_are_not_retained() -> None:
         if saved is None:
             continue
         assert all(tuple(t.shape) != (T, H_qk, 128) for t in saved.tensors())
-        _o, saved_off = kcp.chunk_gdn_det_fwd_kcp(*_ops(ops), ctx, backend="fake", **opts)
+        _o, saved_off = kcp.chunk_gdn_det_fwd_kcp(
+            *_ops(ops), ctx, backend="fake", **opts
+        )
         assert saved.bytes - saved_off.bytes == 8 * T * H_qk
         terms = gbytes.gdn_det_saved_layout_kcp(
             ctx,
@@ -859,7 +861,9 @@ def test_saved_set_v2_round_trip_and_refusals() -> None:
     assert kcp.KCP_SAVED_VERSION == 2 and saved.version == 2
     assert saved.qk_l2norm is True and saved.flags() == (True, False, True)
     assert saved.tensors()[-1] is saved.qk_rstd and saved.meta()["qk_l2norm"] is True
-    back = kcp.SavedDetKcp.from_tensors(saved.tensors(), saved.flags(), saved.meta(), ctx)
+    back = kcp.SavedDetKcp.from_tensors(
+        saved.tensors(), saved.flags(), saved.meta(), ctx
+    )
     assert back == saved and back.qk_rstd is saved.qk_rstd
     bwd = dict(backend="fake")
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
@@ -1080,7 +1084,9 @@ def test_workspace_layout_counts_the_norm_rows() -> None:
             ), (kw, ph)
         assert not any(k.endswith((".qn", ".kn", ".qk_rstd")) for k in off)
     with pytest.raises(TypeError):
-        gbytes.gdn_det_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=1)
+        gbytes.gdn_det_workspace_bytes_kcp(
+            ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=1
+        )
 
 
 def test_emulation_threads_the_flag() -> None:

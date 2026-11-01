@@ -1149,7 +1149,9 @@ def _run_rank(
     qkv_leaf = _buf.detach().clone().requires_grad_(True)
     g_leaf, b_leaf = (x.detach().clone().requires_grad_(True) for x in (g, beta))
     pq, pk, pv = kcp.packed_qkv_views_det_kcp(qkv_leaf, H_qk=H_qk, HV=HV)
-    out_split = kcp.chunk_gdn_det_kcp(pq, pk, pv, g_leaf, b_leaf, ctx, workspace=ws, **base)
+    out_split = kcp.chunk_gdn_det_kcp(
+        pq, pk, pv, g_leaf, b_leaf, ctx, workspace=ws, **base
+    )
     out_split.backward(dout)
     ga = qkv_leaf.grad
     res_split = {
