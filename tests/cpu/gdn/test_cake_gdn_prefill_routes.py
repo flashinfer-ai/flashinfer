@@ -144,3 +144,74 @@ def test_every_shipped_base_record_the_rule_routes_has_its_sm107a_twin_record():
             assert twin_record["tma_abi"] == record["tma_abi"] == "grid_constant"
             checked += 1
     assert checked > 0
+
+
+_GATESTREAM_SM107A = (
+    "prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full_sm107a_i64meta_"
+)
+_INITIAL_SM107A = "prefill_flashinfer_blackwell_gdn_prefill_initial_sm107a_i64meta_"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("num_q_heads", "num_v_heads", "num_seqs", "seq_len", "suffix"),
+    (
+        # Qwen3-Next TP8 and Qwen3.5 TP2/TP4/TP8 per-rank FP32-state splits whose
+        # full-DV CTAs own at least two short tiles: the gate-stream twin, as in Cake.
+        (2, 4, 64, 256, "b00507dd0f31"),
+        (8, 32, 16, 512, "12da800ed86f"),
+        (8, 32, 32, 512, "12da800ed86f"),
+        (8, 32, 64, 256, "12da800ed86f"),
+        (4, 16, 16, 512, "6fefb73716fe"),
+        (4, 16, 32, 512, "6fefb73716fe"),
+        (4, 16, 64, 256, "6fefb73716fe"),
+        (2, 8, 32, 512, "41cbb32105a5"),
+        (2, 8, 64, 256, "41cbb32105a5"),
+    ),
+)
+def test_sm107a_fp32_state_gate_stream_twin_per_head_split(
+    num_q_heads, num_v_heads, num_seqs, seq_len, suffix
+):
+    common = dict(
+        io_dtype="bfloat16",
+        state_dtype="float32",
+        num_seqs=num_seqs,
+        total_seq_len=num_seqs * seq_len,
+        max_seq_len=seq_len,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+        use_initial_state=True,
+        store_final_state=True,
+        checkpoint_every_n_tokens=0,
+        use_state_indices=False,
+        gates_present=True,
+    )
+    route = cake_gdn.select_cake_gdn_prefill_variant(arch="sm_107a", **common)
+    assert route.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+    assert route.variant_name == _GATESTREAM_SM107A + suffix
+    assert route.metadata_i64
+    # The twin reuses the shipped gate-stream body and its base's launch parameters.
+    records = {r["name"]: r for r in cake_gdn._manifest()["variants"]}
+    twin = records[route.variant_name]
+    (base,) = (
+        r
+        for name, r in records.items()
+        if name.startswith(_INITIAL_SM107A)
+        and r["specializations"] == twin["specializations"]
+    )
+    assert twin["host_binding"]["params"] == base["host_binding"]["params"]
+    assert twin["host_binding"]["template"] == base["host_binding"]["template"]
+    shipped = {
+        r["host_binding"]["cuda_symbol"]: r["outputs"]
+        for name, r in records.items()
+        if name.startswith(_GATESTREAM_SM107A)
+    }
+    assert len(shipped) == 1
+    assert twin["outputs"] == next(iter(shipped.values()))
+    # Long sequences keep the base body (mean length above 512 tokens).
+    long = cake_gdn.select_cake_gdn_prefill_variant(
+        arch="sm_107a",
+        **{**common, "total_seq_len": num_seqs * 2048, "max_seq_len": 2048},
+    )
+    assert long.variant_name == base["name"]

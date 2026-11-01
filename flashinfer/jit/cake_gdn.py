@@ -1117,9 +1117,10 @@ def select_cake_gdn_prefill_variant(
     ):
         # The gate-stream twin is a performance specialization of the base body: the exporter
         # ships it for the head geometries its representative rows reach (the Hq16/Hv32,
-        # Hq8/Hv16 and Hq4/Hv8 families).  A key whose twin is not in the manifest runs its
-        # base record, exactly as the route did before the twin existed; only a missing base
-        # fails closed below.
+        # Hq8/Hv16 and Hq4/Hv8 families; on sm_107a the FP32-state twin also covers the
+        # Qwen3-Next / Qwen3.5 TP2/TP4/TP8 splits Hq2/Hv4, Hq8/Hv32, Hq4/Hv16 and Hq2/Hv8).
+        # A key whose twin is not in the manifest runs its base record, exactly as the route
+        # did before the twin existed; only a missing base fails closed below.
         gate_stream_full = False
         schedule_attr = _seq_schedule_attr(gate_stream_full=False)
     record = _variant_for(

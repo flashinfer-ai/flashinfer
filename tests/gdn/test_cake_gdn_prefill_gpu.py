@@ -540,6 +540,44 @@ def test_public_cake_gdn_prefill_matches_independent_recurrence(kwargs):
             )
 
 
+@pytest.mark.parametrize(
+    ("heads", "num_seqs"),
+    (((2, 4), 64), ((8, 32), 16), ((4, 16), 32), ((2, 8), 32)),
+    ids=lambda value: (
+        f"h{value[0]}_hv{value[1]}" if isinstance(value, tuple) else f"b{value}"
+    ),
+)
+def test_public_cake_gdn_prefill_fp32_state_short_tiles_match_independent_recurrence(
+    heads, num_seqs
+):
+    # The vLLM FP32-state contract with several short full-DV tiles per CTA: on
+    # sm_107a these keys run the gate-stream twin (the epilogue warp streams the
+    # successor tile's gate/beta prologue); elsewhere the base body or its twin
+    # where shipped.  Output and final state match the reference recurrence.
+    num_q_heads, num_v_heads = heads
+    case = _make_case(
+        seq_lens=(128,) * num_seqs,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+    )
+    initial_state = case["initial_state"].clone()
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    route = _public_route(case)
+    assert route.route_id == "flashinfer.gdn_prefill.noncp.full_dv", route.route_id
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) == "sm_107a":
+        assert "_initial_gatestream_full_sm107a_i64meta_" in route.variant_name, (
+            route.variant_name
+        )
+    out, state = _launch(case)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), expected_out.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
 def _carry_segment(case, start, stop, initial_state):
     """``case`` cut to tokens ``[start, stop)`` of its one sequence, started from ``initial_state``."""
 
