@@ -540,6 +540,132 @@ def test_public_cake_gdn_prefill_matches_independent_recurrence(kwargs):
             )
 
 
+# sm_107a keys whose DV-split schedule ships no record (2 * num_seqs * Hv <= 212)
+# while the full-DV schedule ships the key: (io_dtype, Hq, Hv, seq_lens,
+# initial + final state, gates).  Every FP16-I/O FP32 initial + final ungated
+# head pair with Hv / Hq and Hv both not powers of two -- (-1, 0, -1) -- at
+# 2 * num_seqs * Hv in (148, 212] (sm_107a only) and at small num_seqs, with
+# equal and unequal lengths; and the no-state Hq16/Hv64 single sequence
+# -- (2, 0, 6) -- in both I/O dtypes, gated and ungated.
+_SM107A_DVSPLIT_KEYS_WITHOUT_A_RECORD = (
+    (torch.float16, 1, 3, (200,), True, False),
+    (torch.float16, 1, 3, tuple(64 + 7 * i for i in range(35)), True, False),
+    (torch.float16, 1, 6, tuple(40 + 11 * i for i in range(16)), True, False),
+    (torch.float16, 1, 12, (128,) * 8, True, False),
+    (torch.float16, 1, 24, (33, 130, 257, 64), True, False),
+    (torch.float16, 1, 48, (300, 77), True, False),
+    (torch.float16, 2, 6, (128,) * 16, True, False),
+    (torch.float16, 2, 12, (90, 300, 65, 128, 211, 64, 150, 99), True, False),
+    (torch.float16, 2, 24, (256,), True, False),
+    (torch.float16, 2, 48, (200, 200), True, False),
+    (torch.float16, 4, 12, (70, 190, 129), True, False),
+    (torch.float16, 4, 24, (128,) * 4, True, False),
+    (torch.float16, 4, 48, (96, 160), True, False),
+    (torch.float16, 8, 24, (500, 70), True, False),
+    (torch.float16, 8, 48, (129,), True, False),
+    (torch.float16, 16, 48, (256, 190), True, False),
+    (torch.float16, 1, 5, (100,) * 8, True, False),
+    (
+        torch.float16,
+        2,
+        10,
+        (150, 70, 260, 128, 65, 200, 90, 128, 140, 100),
+        True,
+        False,
+    ),
+    (torch.float16, 3, 9, (128,) * 11, True, False),
+    (torch.bfloat16, 16, 64, (300,), False, False),
+    (torch.bfloat16, 16, 64, (300,), False, True),
+    (torch.float16, 16, 64, (300,), False, False),
+    (torch.float16, 16, 64, (300,), False, True),
+)
+
+
+@pytest.mark.parametrize(
+    ("io_dtype", "num_q_heads", "num_v_heads", "seq_lens", "state", "gates"),
+    _SM107A_DVSPLIT_KEYS_WITHOUT_A_RECORD,
+    ids=lambda value: (
+        str(value).replace("torch.", "")
+        if isinstance(value, torch.dtype)
+        else f"b{len(value)}_t{sum(value)}"
+        if isinstance(value, tuple)
+        else str(value)
+    ),
+)
+def test_public_cake_gdn_prefill_sm107a_dvsplit_key_without_a_record_runs_full_dv(
+    io_dtype, num_q_heads, num_v_heads, seq_lens, state, gates
+):
+    # On sm_107a the tile rule puts these keys on DV-split, whose schedule
+    # ships no record for them; the call runs the key's full-DV record and
+    # matches the reference recurrence.
+    major, minor = torch.cuda.get_device_capability()
+    arch = cake_gdn.arch_for_compute_capability(major, minor)
+    if arch != "sm_107a":
+        pytest.skip("the DV-split -> full-DV fallback is sm_107a only")
+    num_seqs = len(seq_lens)
+    assert 2 * num_seqs * num_v_heads <= cake_gdn._ARCH_ACTIVE_CLUSTERS[arch]
+    case = _make_case(
+        seq_lens=seq_lens,
+        io_dtype=io_dtype,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+        gates=gates,
+    )
+    route = cake_gdn.select_cake_gdn_prefill_variant(
+        arch=arch,
+        io_dtype={torch.bfloat16: "bfloat16", torch.float16: "float16"}[io_dtype],
+        state_dtype="float32",
+        num_seqs=num_seqs,
+        total_seq_len=sum(seq_lens),
+        max_seq_len=max(seq_lens),
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+        use_initial_state=state,
+        store_final_state=state,
+        checkpoint_every_n_tokens=0,
+        use_state_indices=False,
+        gates_present=gates,
+        host_seq_lens=seq_lens,
+    )
+    assert route.route_id == "flashinfer.gdn_prefill.noncp.full_dv", route
+    assert "_dvsplit_" not in route.variant_name, route
+    reference_case = dict(case)
+    if not gates:
+        ones = torch.ones(
+            (sum(seq_lens), num_v_heads), dtype=torch.float32, device="cuda"
+        )
+        reference_case.update(g=ones, beta=ones)
+    initial_state = case["initial_state"].clone() if state else None
+    expected_out, expected_state, _ = _reference(reference_case, initial_state)
+    result = chunk_gated_delta_rule(
+        q=case["q"],
+        k=case["k"],
+        v=case["v"],
+        g=case["g"],
+        beta=case["beta"],
+        scale=case["scale"],
+        initial_state=case["initial_state"] if state else None,
+        output_final_state=state,
+        cu_seqlens=case["cu_seqlens"],
+        use_qk_l2norm_in_kernel=False,
+        output=case["output"],
+        output_state=case["output_state"] if state else None,
+        use_cp=False,
+        backend="cake_gdn",
+        max_seqlen=max(seq_lens),
+        cu_seqlens_cpu=_host_cu_seqlens(seq_lens),
+    )
+    torch.cuda.synchronize()
+    out = result[0] if state else result
+    torch.testing.assert_close(out.float(), expected_out.float(), atol=1e-2, rtol=1e-2)
+    if state:
+        torch.testing.assert_close(
+            result[1].float(), expected_state.float(), atol=1e-2, rtol=1e-2
+        )
+
+
 @pytest.mark.parametrize(
     ("heads", "num_seqs"),
     (((2, 4), 64), ((8, 32), 16), ((4, 16), 32), ((2, 8), 32)),
