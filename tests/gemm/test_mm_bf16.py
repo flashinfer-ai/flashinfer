@@ -171,6 +171,69 @@ def test_mm_bf16_autotune_weight_layouts(monkeypatch, backend, padded):
     torch.testing.assert_close(out, a @ b, rtol=2e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize("n,k", [(1, 2560), (12, 5120)])
+def test_mm_bf16_autotune_unaligned_n(monkeypatch, n, k):
+    """Tuning auto must skip CUTLASS, not abort, when N breaks its 16-byte rows.
+
+    N=1 is an MoE shared_expert_gate, N=12 a linear-attention in_proj_ba at TP8.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("The CUTLASS BF16 backend is used on SM100-family.")
+
+    monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+    torch.manual_seed(0)
+    a = torch.randn(64, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    with autotune(True, tuning_buckets=[1, 32, 64]):
+        mm_bf16(a, w.T, backend="auto")
+    for m in (1, 32, 64):
+        out = mm_bf16(a[:m], w.T, backend="auto")
+        reference = (a[:m].float() @ w.float().T).to(torch.bfloat16)
+        torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize("pdl", [False, True])
+def test_mm_bf16_tgv_single_element_output(pdl):
+    """M = N = 1: the 1x1 output's batch dim also has stride 1."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("tgv", cc_num):
+        pytest.skip("TGV backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(1, 2560, device="cuda", dtype=torch.bfloat16)
+    out = mm_bf16(a, w.T, pdl=pdl, backend="tgv")
+    reference = (a.float() @ w.float().T).to(torch.bfloat16)
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "n,k,out_dtype,supported",
+    [
+        (12, 2560, torch.bfloat16, False),
+        (16, 2564, torch.bfloat16, False),
+        (12, 2560, torch.float32, True),
+    ],
+)
+def test_mm_bf16_cutlass_alignment(n, k, out_dtype, supported):
+    """CUTLASS needs K % 8 == 0 and 16-byte output rows; reject others up front."""
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    cc_num = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_backend_supported("cutlass", cc_num):
+        pytest.skip("cutlass backend not supported on current compute capability.")
+
+    torch.manual_seed(0)
+    a = torch.randn(16, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    if not supported:
+        with pytest.raises(ValueError, match="CUTLASS backend requires K divisible"):
+            mm_bf16(a, w.T, out_dtype=out_dtype, backend="cutlass")
+        return
+    out = mm_bf16(a, w.T, out_dtype=out_dtype, backend="cutlass")
+    torch.testing.assert_close(out, a.float() @ w.float().T, rtol=2e-2, atol=5e-2)
+
+
 @pytest.mark.parametrize("backend", ["tinygemm", "tgv"])
 @pytest.mark.parametrize("pdl_wins", [False, True])
 def test_mm_bf16_pdl_none_tunes_both_pdl_variants(
