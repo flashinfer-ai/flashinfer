@@ -770,6 +770,29 @@ _CAKE_GDN_CP_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 # ``max_seqlen`` admitted to the band.
 _CAKE_GDN_CP_SM107A_MAX_PARALLEL_STATES = 52
 _CAKE_GDN_CP_SM107A_MIN_MAX_SEQLEN = 4096
+# The band admits FP16 I/O only.  With BF16 I/O the SM107 CP program adds the
+# token-serial BF16 state repair recurrences (``_recurrence_requirements`` in
+# ``cake_gdn_cp_backend``), so the route costs about 25 us per token on R200
+# (51-433 ms per call at 4096-16384 tokens).
+_CAKE_GDN_CP_SM107A_IO_DTYPES = (torch.float16,)
+# BF16 I/O with FP32 initial+final state on SM107 (``use_cp="auto"``): the
+# (longest sequence, parallel states) bands where the non-CP Cake kernel is
+# slower than the default route on R200.  ``backend="cake_gdn"`` fails closed
+# there.  A row is in a band when its longest sequence is at least the first
+# value and ``num_seqs * num_sab_heads`` is at most the second.
+_CAKE_GDN_SM107A_FP32_STATE_FAIL_CLOSED_BANDS = ((8192, 32), (4096, 8))
+
+
+def _cake_gdn_sm107a_fp32_state_fails_closed(
+    *, num_seqs: int, num_sab_heads: int, max_seqlen: int
+) -> bool:
+    parallel_states = num_seqs * num_sab_heads
+    return any(
+        max_seqlen >= min_max_seqlen and parallel_states <= max_parallel_states
+        for min_max_seqlen, max_parallel_states in (
+            _CAKE_GDN_SM107A_FP32_STATE_FAIL_CLOSED_BANDS
+        )
+    )
 
 
 def _cake_gdn_cp_sm107a_plan_pays(
@@ -1839,6 +1862,7 @@ def chunk_gated_delta_rule(
         cake_cp_domain_matches
         and use_cp == "auto"
         and _device_capability == (10, 7)
+        and q.dtype in _CAKE_GDN_CP_SM107A_IO_DTYPES
         and num_seqs * num_sab_heads <= _CAKE_GDN_CP_SM107A_MAX_PARALLEL_STATES
         and cp_max_seqlen >= _CAKE_GDN_CP_SM107A_MIN_MAX_SEQLEN
         and _cake_gdn_cp_sm107a_plan_pays(
@@ -2108,6 +2132,29 @@ def chunk_gated_delta_rule(
     # against the existing prefill kernels. Keep them opt-in until automatic
     # dispatch has a performance-qualified domain.
     if backend == "cake_gdn":
+        if (
+            use_cp == "auto"
+            and _device_capability == (10, 7)
+            and q.dtype == torch.bfloat16
+            and initial_state is not None
+            and initial_state.dtype == torch.float32
+            and output_final_state
+            and _cake_gdn_sm107a_fp32_state_fails_closed(
+                num_seqs=num_seqs,
+                num_sab_heads=num_sab_heads,
+                max_seqlen=_cake_gdn_cp_band_max_seqlen(
+                    max_seqlen,
+                    total_seq_len,
+                    num_seqs,
+                    cu_seqlens_cpu=cu_seqlens_cpu,
+                ),
+            )
+        ):
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                "Cake GDN BF16 prefill with FP32 state is not qualified on SM107 "
+                "for long sequences with few parallel states; use the default "
+                "backend"
+            )
         return _run_cake_gdn_prefill(
             q=q,
             k=k,
