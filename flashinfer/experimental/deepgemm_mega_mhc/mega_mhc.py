@@ -1254,6 +1254,63 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "use_pdl": True,
         },
     },
+    "cake_mega_mhc_ce7c2081bb8a20c11ef6": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_ce7c2081bb8a20c11ef6_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_ce7c2081bb8a20c11ef6_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_ce7c2081bb8a20c11ef6",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp8"],
+            ["buffer", "y_fp8_sf"],
+            ["parameter", "fp8_sf_ue8m0"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 208896,
+            "cooperative": True,
+            "use_pdl": True,
+        },
+    },
 }
 ROUTES: list[dict[str, Any]] = [
     {
@@ -1442,6 +1499,23 @@ ROUTES: list[dict[str, Any]] = [
         "defines": {},
     },
     # The deterministic launches of this regime that the FP8 group-128 UE8M0
+    # tailpipe program's fast coefficient-chain form serves on sm_107a (the same
+    # 16 splits and launch, so the same outputs): those at the token counts of its
+    # "tokens" (inclusive ranges).
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": True,
+        "deterministic": True,
+        "tokens": [[1, 47], [256, 1023]],
+        "program": "cake_mega_mhc_c74bb9bb0a67abd4c72a",
+        "defines": {},
+    },
+    # The deterministic launches of this regime that the FP8 group-128 UE8M0
     # tailpipe program serves on sm_107a (the same 16 splits and launch, so the
     # same outputs): those at the token counts of its "tokens" (inclusive ranges).
     {
@@ -1455,6 +1529,22 @@ ROUTES: list[dict[str, Any]] = [
         "deterministic": True,
         "tokens": [[1024, 3328]],
         "program": "cake_mega_mhc_9823742e18a9ffa6515b",
+        "defines": {},
+    },
+    # The launches of this regime that the FP8 group-128 UE8M0 program's fast
+    # coefficient-chain form serves on sm_107a: those of the route's
+    # "deterministic" mode at the token counts of its "tokens" (inclusive ranges).
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": True,
+        "deterministic": False,
+        "tokens": [[128, 384]],
+        "program": "cake_mega_mhc_ce7c2081bb8a20c11ef6",
         "defines": {},
     },
     {
@@ -1506,10 +1596,27 @@ ROUTES: list[dict[str, Any]] = [
         "program": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
         "defines": {},
     },
+    # The raw scale mode's deterministic launches of the plain FP8 group-128
+    # program's regime that the FP8 group-128 tailpipe program serves on sm_107a
+    # (the same 16 splits and launch, so the same outputs): those at the token
+    # counts of its "tokens" (inclusive ranges).
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": True,
+        "tokens": [[16, 47], [128, 1023]],
+        "program": "cake_mega_mhc_ed3f407e5a68eb65478e",
+        "defines": {},
+    },
     # The raw scale mode's launches of the plain FP8 group-128 program's regime
     # that its fp8_fast_div form (the FP8 store dividing through one reciprocal
-    # per lane) serves on sm_107a: every deterministic launch and the token
-    # counts of "tokens" (inclusive ranges).
+    # per lane) serves on sm_107a: the deterministic launches the route above
+    # leaves and the token counts of "tokens" (inclusive ranges).
     {
         "hidden": 4096,
         "num_splits": "runtime",
