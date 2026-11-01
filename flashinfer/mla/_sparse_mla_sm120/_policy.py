@@ -301,9 +301,7 @@ def profile_selection(metadata, device, precision: str) -> Optional[PlannedCall]
         family=_MODEL_TYPE_TO_FAMILY[m.model],
     )
     profile = _cpb.get_ordinary_profile(request, device)
-    tuner = AutoTuner.get()
-    stack = tuner._get_skip_ops_stack()
-    allowed = tuner.is_tuning_mode and not (stack and "sparse_mla_sm120" in stack[-1])
+    allowed = AutoTuner.get().tuning_enabled("sparse_mla_sm120")
     if (
         profile is None
         and allowed
