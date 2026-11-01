@@ -172,6 +172,7 @@ MTP_BASELINE = {
     "disable_state_update": False,
     "use_pool_indexing": False,
     "pool_strides_key": None,
+    "pool_capacity_key": None,
     "scale": 0.08838834764831845,
     "use_qk_l2norm": True,
     "tile_v": 64,
@@ -423,6 +424,7 @@ def test_pretranspose_name_varies_with_every_argument(param, alternate):
         ("disable_state_update", True),
         ("use_pool_indexing", True),
         ("pool_strides_key", (262144, 16384, 128, 1)),
+        ("pool_capacity_key", 128),
         ("scale", 0.0625),
         ("use_qk_l2norm", False),
         ("tile_v", 128),
@@ -440,6 +442,24 @@ def test_mtp_name_varies_with_every_argument(param, alternate):
     kwargs = dict(MTP_BASELINE)
     kwargs[param] = alternate
     assert _mtp_kernel_name(**kwargs) != baseline, f"_mtp_kernel_name ignores {param!r}"
+
+
+@pytest.mark.parametrize("variant", ["inline", "warp"])
+@pytest.mark.parametrize("stride_dim", range(4))
+def test_mtp_name_specializes_each_pool_stride(variant, stride_dim):
+    """Each static stride must distinguish persisted MTP specializations."""
+    kwargs = dict(
+        MTP_BASELINE,
+        variant=variant,
+        use_pool_indexing=True,
+        pool_strides_key=(2 * 32 * 128 * 128, 128 * 128, 128, 1),
+        pool_capacity_key=128,
+    )
+    baseline = _mtp_kernel_name(**kwargs)
+    strides = list(kwargs["pool_strides_key"])
+    strides[stride_dim] *= 2
+    kwargs["pool_strides_key"] = tuple(strides)
+    assert _mtp_kernel_name(**kwargs) != baseline
 
 
 @pytest.mark.parametrize(
