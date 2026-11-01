@@ -1202,7 +1202,11 @@ def resolve_launch(
 
 def _launch_key(name: str, args: dict[str, Any], cols_per_cta: int) -> tuple:
     """Every input :func:`resolve_launch` reads besides the launch's tensors: the program, the static knobs, the grid
-    rule's arguments (in the call site's order), the walk-form inputs, the merge's columns and the caller's grid x."""
+    rule's arguments (in the call site's order), the walk-form inputs, the merge's columns and the caller's grid x.
+
+    The launch cache is valid only because :func:`resolve_launch` derives the record, the grid, the test flag and the
+    merge's ``cols_per_cta`` from these scalars alone and reads nothing from the launch's tensors: an input added to
+    :func:`resolve_launch` (a new grid-rule argument, for example) must be added to this key as well."""
     grid_args = args.get("_grid_args")
     return (
         name,
