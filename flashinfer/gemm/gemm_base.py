@@ -86,6 +86,7 @@ from .kernels.utils import (
     _select_sm107_mm_mxfp8_cute_dsl_tactic,
 )
 from ..utils import (
+    device_support_pdl,
     get_device_index,
     get_device_sm_count,
     get_native_fp4_dtype,
@@ -12548,6 +12549,7 @@ def fp8_blockscale_gemm_sm90(
     weight_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """
     Perform FP8 block-scaled GEMM with automatic swapAB optimization.
@@ -12577,6 +12579,10 @@ def fp8_blockscale_gemm_sm90(
         Output tensor of shape (M, N). If None, will be allocated.
     out_dtype : torch.dtype, optional
         Output data type. Default is torch.bfloat16.
+    enable_pdl : bool, optional
+        Launch the activation quantization and the GEMM with programmatic
+        dependent launch (PDL), so each kernel can start while the previous
+        kernel in the stream drains. Defaults to True on SM90 and newer.
     Returns
     -------
     torch.Tensor
@@ -12754,7 +12760,9 @@ def fp8_blockscale_gemm_sm90(
         workspace = torch.empty(workspace_size, dtype=torch.uint8, device=input.device)
         runner.configure_workspace(workspace)
 
-    runner.run_gemm(input, weight, out, input_scale, weight_scale)
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
+    runner.run_gemm(input, weight, out, input_scale, weight_scale, enable_pdl)
     return out
 
 
