@@ -183,6 +183,13 @@ def chunk_kda_det_fwd_kcp(
     **options
         Further KCP options (``save_transfer``, ``exchange``, ``head_groups``, ``offset_class``, ``graph``),
         forwarded.
+        The raw gate mode of :func:`~flashinfer.cake_kda_det_train.chunk_kda_det_fwd` (keywords
+        ``use_gate_in_kernel``, ``A_log``, ``dt_bias``, ``lower_bound``, forwarded like the options) applies to this
+        rank's shard: with ``use_gate_in_kernel=True`` ``g`` is the rank's raw gate (BF16, any view under the
+        single-rank stride rule, never copied), ``A_log`` FP32 ``[H]`` and ``dt_bias`` FP32 ``[H * 128]`` or
+        ``[H, 128]`` are the full parameters (the same tensors on every rank) and ``lower_bound`` is required
+        (``-5 <= lower_bound < 0``); the workspace must be of the same mode
+        (``WorkspaceDetKcp(use_gate_in_kernel=True)``).
 
     Returns
     -------
@@ -221,7 +228,7 @@ def chunk_kda_det_bwd_kcp(
     save_mode: str = "light",
     workspace: Optional[Any] = None,
     **options: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     r"""Context-parallel packed KDA chunked training backward of this rank's fragments.
 
     Parameters
@@ -235,11 +242,17 @@ def chunk_kda_det_bwd_kcp(
     scale, save_mode, workspace, **options
         As for :func:`chunk_kda_det_fwd_kcp`; the backward reads its own options, among them ``spec3_probe``: the
         debug probe of the first saved-mode backward, ``"off"`` by default, ``"record"``, ``"warn"`` or
-        ``"assert"`` (the same value on every rank).
+        ``"assert"`` (the same value on every rank); and the forward's raw gate keywords.
 
     Returns
     -------
-    ``(dq, dk, dv, dbeta, dg)`` of this rank's tokens: BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.
+    Five tensors in the explicit gate mode (``use_gate_in_kernel=False``): ``(dq, dk, dv, dbeta, dg)`` of this
+    rank's tokens, BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.  Seven tensors in raw gate mode
+    (``use_gate_in_kernel=True``): ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the
+    rank's raw gate, ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 (``dt_bias``'s shape) this rank's partial sums --
+    the gradients through its own tokens.  Sum them over the context-parallel group like the gradients of any
+    replicated parameter, or with :func:`reduce_gate_param_grads_det_kcp` for a bitwise reproducible sum (an NCCL
+    all-reduce does not fix its summation order).
     """
     from .experimental.cake_kda_det_train_kcp import cake_kcp
 
@@ -300,6 +313,10 @@ def chunk_kda_det_kcp(
         ``save_transfer`` must agree with the tier (``"states"`` -> ``False``, ``"transfer"`` -> ``True``); a
         contradicting value raises ``ValueError``.  The retained bytes are ``kda_det_saved_bytes_kcp(ctx, H=...,
         checkpoint_keep=..., with_conv=False)``.
+    **options
+        As for :func:`chunk_kda_det_fwd_kcp`, the raw gate keywords included: in raw gate mode the gradients go to
+        the raw gate (BF16), ``A_log`` and ``dt_bias`` (FP32; this rank's partial sums, see
+        :func:`chunk_kda_det_bwd_kcp`), and a recompute handle's entry records the mode and ``lower_bound``.
 
     Returns
     -------
@@ -336,6 +353,7 @@ def kda_det_workspace_bytes_kcp(
     C: int = 8192,
     local_arena: Optional[str] = None,
     lean_passes: Optional[int] = None,
+    use_gate_in_kernel: bool = False,
 ) -> int:
     """Bytes of this rank's KCP workspace for ``H`` heads: the local arena (that of :func:`~flashinfer.cake_kda_det_train.kda_det_train_workspace_bytes`
     for a backward workspace; a forward-only one takes the KCP forward layout, 2432 B per internal token-head) plus
@@ -353,7 +371,9 @@ def kda_det_workspace_bytes_kcp(
     the largest local arena, not their sum.  ``local_arena`` / ``lean_passes`` are those of the workspace
     (``WorkspaceDetKcp(local_arena="lean", lean_passes=...)``, opt-in: the backward's lean local arena, its tail in
     ``lean_passes`` passes, two by default, with its small tail-count table, on the head counts it serves);
-    ``None`` keeps the arena above."""
+    ``None`` keeps the arena above.  ``use_gate_in_kernel``: the workspace's gate mode
+    (``WorkspaceDetKcp(use_gate_in_kernel=True)``: the raw mode's local arena, the replay arena; the pools do not
+    change)."""
     from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None:
@@ -367,7 +387,22 @@ def kda_det_workspace_bytes_kcp(
         C=C,
         local_arena=local_arena,
         lean_passes=lean_passes,
+        use_gate_in_kernel=use_gate_in_kernel,
     )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def reduce_gate_param_grads_det_kcp(
+    ctx: Any, dA_log: torch.Tensor, ddt_bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The raw gate mode's full ``(dA_log, ddt_bias)`` from every rank's partial sums (:func:`chunk_kda_det_bwd_kcp`),
+    bitwise reproducible: one all-gather on ``ctx.group``, then an FP32 sum in rank order on every rank, so every
+    rank gets the same bits under every schedule.  An NCCL all-reduce gives the same sum to FP32 rounding but does
+    not fix its summation order.  A collective: every rank of ``ctx.group`` calls it.  With ``world_size == 1``
+    copies of the inputs; with ``world_size > 1`` and no initialized process group it raises ``RuntimeError``."""
+    from .experimental.cake_kda_det_train_kcp import cake_kcp
+
+    return cake_kcp.reduce_gate_param_grads_det_kcp(ctx, dA_log, ddt_bias)
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -474,4 +509,5 @@ __all__ = [
     "kda_det_saved_bytes_kcp",
     "kda_det_workspace_bytes_kcp",
     "partition_det_kcp",
+    "reduce_gate_param_grads_det_kcp",
 ]

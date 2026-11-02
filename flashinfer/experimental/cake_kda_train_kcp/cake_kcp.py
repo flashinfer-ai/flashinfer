@@ -4006,9 +4006,41 @@ _OPTION_KEYS = (
     "graph",
 )  # spec3_probe, graph: public keywords
 
+# The deterministic package's keywords of modes this package does not run, at the value each takes when the mode
+# is off: the raw gate (``use_gate_in_kernel`` with ``A_log`` / ``dt_bias`` / ``lower_bound``, FlashInfer #7816) and
+# the in-kernel q / k L2 norm (``use_qk_l2norm_in_kernel``, #7817).
+_MODE_OFF = {
+    "use_gate_in_kernel": False,
+    "A_log": None,
+    "dt_bias": None,
+    "lower_bound": None,
+    "use_qk_l2norm_in_kernel": False,
+}
+
+
+def _refuse_modes(kwargs: dict[str, Any]) -> None:
+    """Pop the :data:`_MODE_OFF` keywords from ``kwargs``.  The off value (``False`` / ``None``, by identity) is this
+    package's mode, so a call that spells it out runs unchanged; any other value raises ``ValueError``: this package
+    runs the explicit FP32 gate without the in-kernel norm, and a call never changes mode silently."""
+    given = {key: kwargs.pop(key) for key in _MODE_OFF if key in kwargs}
+    on = [key for key, value in given.items() if value is not _MODE_OFF[key]]
+    gate = [key for key in on if key != "use_qk_l2norm_in_kernel"]
+    if gate:
+        raise ValueError(
+            f"{', '.join(f'{key}={given[key]!r}' for key in gate)}: the raw gate mode (use_gate_in_kernel=True with "
+            "A_log, dt_bias and lower_bound) runs on the deterministic package only; pass deterministic=True "
+            "(flashinfer.cake_kda_train_kcp) or call flashinfer.experimental.cake_kda_det_train_kcp"
+        )
+    if on:
+        raise ValueError(
+            f"use_qk_l2norm_in_kernel={given['use_qk_l2norm_in_kernel']!r}: the in-kernel q / k L2 norm is not "
+            "available with deterministic=False; normalize q and k before the call"
+        )
+
 
 def _options(kwargs: dict[str, Any]) -> OptionsKcp:
-    """Validate the entry points' ``**options`` (unknown keywords are a ``TypeError``); ``_kcp_test_knobs`` goes
+    """Validate the entry points' ``**options`` (unknown keywords are a ``TypeError``, a mode of :data:`_MODE_OFF`
+    other than off a ``ValueError``: :func:`_refuse_modes`); ``_kcp_test_knobs`` goes
     through the plan module's validator (``precision_mode``) and, for the test knob ``transfer_walk`` (K3's
     ``tf32_hilo`` / ``bf16x3`` programs of ``build.test.json``: the TF32 hi/lo walk and the full-width BF16x3 form),
     through the same environment gate here, so the public API can never select a non-zero ``precision_mode`` or a
@@ -4023,6 +4055,7 @@ def _options(kwargs: dict[str, Any]) -> OptionsKcp:
             )
         return pre
     kwargs = dict(kwargs)
+    _refuse_modes(kwargs)
     raw = kwargs.pop("_kcp_test_knobs", None)
     transfer_walk: str | None = (
         None  # unset: the shipped walk (the hi/lo walk under precision_mode)

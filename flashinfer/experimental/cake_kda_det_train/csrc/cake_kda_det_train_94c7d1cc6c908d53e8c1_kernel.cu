@@ -617,9 +617,9 @@ kernel_cake_kda_det_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorM
                         }
                     }
                     __syncthreads();
-                    int excl_1 = warp_tot[warp_t] + incl_t_0 - base_r;
-                    int tile_total_2 = blk[0];
-                    int dfix = nseg - tile_total_2;
+                    int excl_0 = warp_tot[warp_t] + incl_t_0 - base_r;
+                    int tile_total_0 = blk[0];
+                    int dfix = nseg - tile_total_0;
                     if (dfix > 0) {
                         if (tid_t < num_seqs) {
                             int rank_r = 0;

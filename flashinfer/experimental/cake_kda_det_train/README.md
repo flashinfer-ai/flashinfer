@@ -33,6 +33,16 @@ dq, dk, dv, dbeta, dg = chunk_kda_det_bwd(q, k, v, g, beta, cu_seqlens, dout,
 dq, dk, dv, dbeta, dg = chunk_kda_det_bwd(q, k, v, g, beta, cu_seqlens, dout)         # checkpoint replay
 ws = kda_det_train_workspace(S, num_docs, H, device, backward=True, save_mode="light")  # caller-owned
 ws = kda_det_train_workspace(S, num_docs, H, device, arena=kda_det_train_arena(tail_passes=4))  # lower-memory arena
+
+# raw gate mode: the kernels activate the gate (FLA's use_gate_in_kernel keywords)
+out = chunk_kda_det(q, k, v, raw, beta, cu_seqlens, use_gate_in_kernel=True,
+                A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0)    # grads to raw, A_log, dt_bias
+out, saved = chunk_kda_det_fwd(q, k, v, raw, beta, cu_seqlens, use_gate_in_kernel=True,
+                           A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0)
+dq, dk, dv, dbeta, draw, dA_log, ddt_bias = chunk_kda_det_bwd(
+    q, k, v, raw, beta, cu_seqlens, dout, saved=saved, use_gate_in_kernel=True,
+    A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0)
+ws = kda_det_train_workspace(S, num_docs, H, device, use_gate_in_kernel=True)  # a raw-mode workspace
 ```
 
 ### Contract
@@ -40,16 +50,17 @@ ws = kda_det_train_workspace(S, num_docs, H, device, arena=kda_det_train_arena(t
 | operand | shape | dtype | notes |
 |---|---|---|---|
 | `q`, `k`, `v` | `[1, S, H, 128]` | BF16 | contiguous; `q` / `k` L2-normalized by the caller (eps 1e-6) and stored as BF16 |
-| `g` | `[1, S, H, 128]` | FP32 | preactivated natural-log decay, `g = -5 * sigmoid(exp(A_log) * (raw_gate + dt_bias))` |
+| `g` | `[1, S, H, 128]` | FP32 | `use_gate_in_kernel=False` (the default): preactivated natural-log decay, `g = lower_bound * sigmoid(exp(A_log) * (raw_gate + dt_bias))` formed by the caller; `use_gate_in_kernel=True`: the raw gate, BF16 (see "Raw gate mode") |
 | `beta` | `[1, S, H]` | BF16 | after the sigmoid |
 | `cu_seqlens` | `[num_docs + 1]` | int32 | device prefix sums, first 0, last `S`; zero-length documents allowed |
 | `out`, `dout` | `[1, S, H, 128]` | BF16 | laid out like `v` |
 | `dq`, `dk`, `dv`, `dbeta` | like the inputs | BF16 | gradients at the inputs' storage boundary (no L2-norm backward) |
-| `dg` | like `g` | FP32 | |
+| `dg` | like `g` | FP32 | `use_gate_in_kernel=False`; BF16 in raw gate mode, plus `dA_log` / `ddt_bias` |
 
 * The leading batch axis of 1 is optional on every operand; the outputs take
   the rank of the inputs.  Every operand must be contiguous: a strided view is
-  refused with `ValueError`, never copied.
+  refused with `ValueError`, never copied.  The one exception is the raw gate
+  of raw gate mode, which may be a strided view (below).
 * `scale` defaults to `128 ** -0.5`.  Each document starts from a zero state;
   no final state is produced.
 * The host reads no tensor contents (no `.item()`, `.tolist()` or implicit
@@ -71,6 +82,55 @@ ws = kda_det_train_workspace(S, num_docs, H, device, arena=kda_det_train_arena(t
   including `S < 64` and document lengths that are not multiples of 64.  The
   host refuses a problem outside these limits before any launch.
 
+### Raw gate mode (`use_gate_in_kernel=True`)
+
+`chunk_kda_det`, `chunk_kda_det_fwd` and `chunk_kda_det_bwd` take FLA's keyword-only
+`use_gate_in_kernel=False, A_log=None, dt_bias=None, lower_bound=None`.  With
+`use_gate_in_kernel=True` the caller passes the raw gate instead of the
+activated one, and the kernels form `lower_bound * sigmoid(exp(A_log) *
+(raw + dt_bias))` themselves: no FP32 gate is written or read, and the
+backward returns the raw gate's gradient and the two parameter gradients.
+
+| operand / result | shape | dtype | notes |
+|---|---|---|---|
+| `g` (the raw gate) | `[1, S, H, 128]` | BF16 | any view with strides `(s_t, s_h, 1)` in elements: `s_h >= 128` when `H > 1`, `s_t >= (H - 1) * s_h + 128` when `S > 1`, `s_h` and `s_t` multiples of 8, a 16-byte aligned address; never copied (for example a column slice `proj[:, c0:c0 + 128 * H].view(S, H, 128)` of a fused projection with `c0 % 8 == 0`) |
+| `A_log` | `[H]` | FP32 | contiguous |
+| `dt_bias` | `[H * 128]` or `[H, 128]` | FP32 | contiguous |
+| `lower_bound` | host float | | required; finite, `-5.0 <= lower_bound < 0.0` (as an FP32 value) |
+| `dg` | like `g` | BF16 | the raw gate's gradient, contiguous |
+| `dA_log` | `[H]` | FP32 | |
+| `ddt_bias` | like `dt_bias` | FP32 | |
+
+* `chunk_kda_det_bwd` returns `(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)` in raw
+  gate mode and the 5-tuple otherwise; `chunk_kda_det` passes gradients to `g`,
+  `A_log` and `dt_bias`.  With `use_gate_in_kernel=False`, passing any of
+  `A_log`, `dt_bias` or `lower_bound` raises `ValueError`; with `True`,
+  `lower_bound=None` raises (no kernel implements an unbounded softplus
+  gate), and so do an FP32 `g` and a view outside the stride rule.
+* The forward activates the gate in the intra-chunk program's prefix pass and
+  the backward prep repeats it; the GLM intra program forms the raw gate's
+  gradient in its drain and writes the per-chunk `(hi, lo)` partials of
+  `dA_log` / `ddt_bias` into two FP32 `[NC_pad, H, 128, 2]` buffers that each
+  backward allocates outside the arena; one `param_finalize` launch (one CTA
+  per head) reduces them in an order fixed by the global chunk index alone.
+  No gate epilogue runs on any architecture and no atomics are used: the
+  reproducibility statements of the default mode (repeats, the saved-set and
+  replay paths, the arena options, autograd and `torch.utils.checkpoint`)
+  hold for `dg`, `dA_log` and `ddt_bias` too, and a strided raw view gives
+  the bits of its contiguous copy.
+* The mode is part of the plan (`cake_backend.plan(..., gate="raw")`), the
+  workspace (`kda_det_train_workspace(..., use_gate_in_kernel=True)`; a call in
+  the other mode is refused with `ValueError`, in both directions) and the
+  saved set (`KdaDetChunkSaved.gate`, `.lower_bound`; a backward in the other
+  mode or with another `lower_bound` is refused).
+* Memory: the forward's arena layouts are the same in both modes; the
+  backward's drop the gate epilogue's `dg_int` / `db_int` on every
+  architecture (`kda_det_train_workspace_bytes(..., use_gate_in_kernel=True)`).
+  The backward's outputs are `dq, dk, dv, dg` BF16, `dbeta` BF16, `dA_log` and
+  `ddt_bias` (`cake_backend.output_bytes(S, H, backward=True, gate="raw")`), and
+  the partials add `2 * NC_pad * H * 128 * 8` bytes for the duration of the
+  call (`cake_backend.memory_report(..., gate="raw")["bwd_partials"]`).
+
 ### Saved set (`KdaDetChunkSaved`)
 
 `chunk_kda_det_fwd(..., save_for_backward=True)` returns a frozen dataclass:
@@ -81,6 +141,7 @@ ws = kda_det_train_workspace(S, num_docs, H, device, arena=kda_det_train_arena(t
 | `Aqk`, `Akk` | BF16 `[S, H, 64]` on the token rows: row `t` holds the 64 chunk-local columns of its chunk (zeros above the diagonal and past the chunk end) |
 | `tables` | `(chunk_bos, chunk_len, seq_chunk_start, seq_order[, seg_table])`: int32 views of one device buffer (`NC_pad`, `NC_pad`, `num_docs + 1`, `num_docs` and, on the segmented route, the block table's `NSEG + 2 * num_docs + 1` entries), or `None` (the backward rebuilds them from `cu_seqlens`) |
 | `S`, `H`, `num_docs`, `scale` | the problem the set belongs to |
+| `gate`, `lower_bound` | the gate mode of the forward that wrote the set: `"g"` and `None` (the default), or `"raw"` and the FP32 lower bound as a host float (raw gate mode); metadata only, the tensors and the version are the same in both modes |
 | `h`, `v_new` | version 2 only: the forward's state tape BF16 `[NC_pad, H, 128, 128]` and `v_new` BF16 `[R, H, 128]` on the internal layout |
 | `seg_m` | version 2 on the segmented route: the segment transfers FP32 `[NSEG, H, 128, 128]` the backward's reverse carry reads; `None` on the serial route |
 | `hseg` | version 4 on the segmented route when `S >= 384 * NSEG`: the carried initial state of every segment, FP32 `[NSEG, H, 128, 128]` (the backward's recurrence recompute walks from it: pass 2 alone); `None` otherwise |
@@ -169,7 +230,9 @@ the arena between calls (the pad rows every consumer reads are written in the
 same call by their producer).  `backward=False` sizes the arena for the
 forward layout only; `save_mode="tape"` sizes it for the tape layouts (smaller
 arenas: `h` and `v_new` live in the saved set) and makes `"tape"` the default
-of the calls on it.
+of the calls on it.  A workspace serves one gate mode (`KdaDetWorkspace.gate`,
+from its plan; `use_gate_in_kernel=True` in `kda_det_train_workspace` makes a
+raw-mode one); a call in the other mode is refused with `ValueError`.
 
 ### Lower-memory arena (`KdaDetArena`)
 
@@ -210,16 +273,18 @@ heads) with `ValueError` when a backward workspace is built and in the byte
 queries; it serves the contract's head counts 1, 2, 4, 8, 16, 32 and 64.
 
 `tail_passes = B` runs the chunk-parallel tail stages of the backward (the
-fused gradient `dqkg`, the GLM intra program and, on `sm_100a`,
-the gate epilogue `gate_epilogue`: the last launch steps of the backward's
+fused gradient `dqkg`, the GLM intra program and, on `sm_100a` in the default
+gate mode, the gate epilogue `gate_epilogue`: the last launch steps of the backward's
 lifetime tables) once per range of `ceil(NC_pad / B)` chunks.  Each pass takes views of the
 whole-sequence buffers (`gk`, `v_new`, `dv2`, `beta_int`, the `h` / `dh`
 tapes) offset to the range's first chunk, the range's slices of the chunk
 tables and the per-pass buffers (`dq_f`, `dk_f`, `dg_f`, `db_f`, `dAkk`,
-`dAqk` and, on `sm_100a`, the gate epilogue's `dg_int`, `db_int`), which are
-sized for one range; the token tensors
+`dAqk` and, on `sm_100a` in the default gate mode, the gate epilogue's `dg_int`,
+`db_int`), which are sized for one range; the token tensors
 (`q`, `k`, `v`, `dout`, the saved `Aqk` / `Akk`, the gradients) are passed
 whole, every kernel reaching them through the absolute `chunk_bos` offsets.
+In raw gate mode the per-call parameter partials are offset to the range's
+first chunk too, and `param_finalize` runs once after the last range.
 The same kernels address the same bytes as in one pass, so the gradients are
 bitwise those of the default arena; the cost is `B - 1` more launches per tail
 stage and the speed lost to their smaller grids.
@@ -241,14 +306,16 @@ shared with the state blocks.  Two passes give
 `slack` is the ceil slack of the last range (the per-pass buffers are sized
 for `R_b = 64 * ceil(NC_pad / tail_passes)` rows; it is zero when
 `tail_passes` divides `NC_pad`); passes above four buy nothing more.  On
-`sm_103a` / `sm_107a`, where the GLM intra program hosts the gate epilogue, its inputs
+`sm_103a` / `sm_107a`, where the GLM intra program hosts the gate epilogue, and
+in raw gate mode on every architecture, its inputs
 `dg_int` (512 B) and `db_int` (4 B) leave the lean layouts: one
 pass gives 4104 (tape 3336), the per-pass set is 2052 and two passes give
 `2820 * R * H + max(3 * block, 258 * R * H)` (3078; tape 2310); the default
 layouts are unchanged (the two buffers share slots there).  Against the
 default's 4488 the light constants are about 8 % (one pass), 26 % (two
 passes; 31 % on `sm_103a` / `sm_107a`) and 37 % (four or more) smaller.  The table
-gives the constants (`sm_100a`; `sm_103a` / `sm_107a` where they differ);
+gives the constants (`sm_100a` in the default gate mode; `sm_103a` / `sm_107a`
+and the raw gate mode where they differ);
 the state blocks and the slack come on top where the formulas say so:
 
 | arena | light: B per internal token-head | tape: B per internal token-head | checkpoint replay (`saved=None`) |
@@ -356,7 +423,7 @@ that refuse an option skip it).
 
 ## Kernel structure of one training step
 
-The host resolves one plan per `(S, num_docs, H, sm_count, arch)`: which
+The host resolves one plan per `(S, num_docs, H, sm_count, arch, gate)`: which
 record of each stage runs on each path and with which grid.  The paths are
 `fwd` (the forward with `save_for_backward`: its programs read the saved
 `Aqk` / `Akk` token rows where a form for them ships and the intra program
@@ -497,7 +564,11 @@ on `sm_107a` (the intra-chunk terms, the GLM gate chain and the gate epilogue's
 token-row `dg` / `dbeta` in one launch: no `gate_epilogue` stage there;
 `glm_intra_v18` is the same program with every named-barrier slot an
 immediate, so two of its CTAs share an SM on `sm_107a`) or `glm_intra` and
-`gate_epilogue` (the token-row `dg` and `dbeta`) on `sm_100a`.
+`gate_epilogue` (the token-row `dg` and `dbeta`) on `sm_100a`.  In raw gate
+mode the intra program and the prep read the raw gate and activate it, the
+GLM intra program is `glm_intra_raw` on every architecture (the raw gate's
+`dg`, `dbeta` and the per-chunk parameter partials; no `gate_epilogue`), and
+`param_finalize` closes the backward.
 
 Launches per call (148 SMs; the table programs of a saved-set path count only
 when the set carries no tables), on `sm_100a`:
@@ -516,11 +587,19 @@ launch fewer on every backward path, and the 16-head rows are segmented
 (`P = 9`): 1 document, 16 heads (16 chains) 5 / 10 / 7 / 7 / 11; 4 documents,
 16 heads (64 chains: the set carries `w` / `u`, no `wy` launch on the light
 paths) 5 / 9 / 7 / 7 / 11; 64 heads 3 / 5 / - / 5 / 7; 2 heads and 4 heads
-5 / 10 / 7 / 7 / 11 (`P = 38` at 4 heads).  On `sm_107a` the gate epilogue
-launches as on `sm_100a`: 1 document, 16 heads (segmented, `P = 9`) 5 / 11 /
-8 / 8 / 12; 4 documents, 16 heads 5 / 10 / 8 / 8 / 12; 64 heads 4 / 6 / - /
-6 / 8 (its 64-column saving forward reads the saved token rows through
-`wy_fwd_rows` + `fwdh_o_v1_rows`); 2 heads and 4 heads 5 / 11 / 8 / 8 / 12.
+5 / 10 / 7 / 7 / 11 (`P = 38` at 4 heads).  On `sm_107a` the GLM intra
+program (`glm_intra_v18`) hosts it as well (the registry ships
+`gate_epilogue` for `sm_100a` alone), one launch fewer on every backward
+path: 1 document, 16 heads (segmented, `P = 9`) 5 / 10 / 7 / 7 / 11; 4
+documents, 16 heads 5 / 9 / 7 / 7 / 11; 64 heads 4 / 5 / - / 5 / 7 (its
+64-column saving forward reads the saved token rows through `wy_fwd_rows` +
+`fwdh_o_v1_rows`); 2 heads and 4 heads 5 / 10 / 7 / 7 / 11.
+
+In raw gate mode no gate epilogue launches on any architecture and
+`param_finalize` launches once at the end of every backward path (after the
+last tail range and the last document group): the backward counts of
+`sm_100a` are those above, the backward counts of `sm_103a` / `sm_107a` are
+one higher, and the forward counts are the same in both modes.
 
 The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
 `grid_rule`) and are evaluated by `cake_jit.select_record` / `launch_grid` /
@@ -533,9 +612,11 @@ backward from the plan's own light saved set).
 
 ### Programs by stage
 
-67 records naming 65 programs from 39 kernels (`fwdh_v3` and `fwdh_p3` are
+75 records naming 73 programs from 44 kernels, 8 of them the raw gate
+mode's (`fwdh_v3` and `fwdh_p3` are
 one program, the two passes of the segmented walk; `bwd_prep_g8_noqg` and
-`bwd_prep_g8_noqg_nokb` are two keyword forms of one kernel; four records
+`bwd_prep_g8_noqg_nokb` are two keyword forms of one kernel, and the four
+raw prep records four keyword forms of another; four records
 ship on some of the architectures only: `glm_intra_v14`, `glm_intra_v18`, `glm_intra` and
 `gate_epilogue`; `wy_bwd` and `wy_fwd_rows`
 are one program, the WY representation from the saved `Akk` on the backward
@@ -544,24 +625,31 @@ and on the saving forward's overlap and paired serial rows; `fwdh_p3_o_ov`,
 the programmatic-stream-serialization attribute).  Rules: "serial" `H > 8`
 except the 16-head rows of `sm_103a` / `sm_107a`, "segmented" `H <= 8` and
 those rows; "64-column form" `num_docs * H * 4 > 4 * sm_count`,
-"32-column form" otherwise; "few chains" `num_docs * H <= 4`.
+"32-column form" otherwise; "few chains" `num_docs * H <= 4`.  The stages
+`fwd_intra`, `bwd_prep`, `glm_intra`, `gate_epilogue` and `param_finalize`
+(`cake_jit.GATE_STAGES`) select among the records of the call's gate mode
+(a record's `gate`, `"g"` when absent): the raw mode's records are named
+with a `_raw` suffix, take the rule of their default-mode twin and read the
+raw gate in place of the activated one; every other stage launches the same
+record in both modes.
 
 | stage | records | dispatch |
 |---|---|---|
 | `table` | `table_v3`, `table_v2`, `table` | up to 256 documents one CTA per 256 chunks: `table_v2` on the serial route (forward, replay, and a saved-set path whose set carries no tables), `table_v3` on the segmented route (the block table too) on a saved-set path whose set carries no tables alone (the forward and the replay there launch no table program: `fwd_intra_v14` writes the tables); above, `table` (one CTA) on every path that builds the tables |
 | `seg_table` | `seg_table` | segmented route above 256 documents, after `table` (below, `fwd_intra_v14` or `table_v3` writes the block table) |
-| `fwd_intra` | `fwd_intra_v14`, `fwd_intra` | forward (the GLM prep's outputs too: `write_prep = 1`), and the replay (the intra-chunk rows alone); `fwd_intra_v14` on the segmented route up to 256 documents (the first launch of its call: it computes the chunk layout from `cu_seqlens` and writes the chunk tables and the block table), `fwd_intra` on the serial route and above 256 documents |
+| `fwd_intra` | `fwd_intra_v14`, `fwd_intra`; raw: `fwd_intra_v14_raw`, `fwd_intra_raw` | forward (the GLM prep's outputs too: `write_prep = 1`), and the replay (the intra-chunk rows alone); `fwd_intra_v14` on the segmented route up to 256 documents (the first launch of its call: it computes the chunk layout from `cu_seqlens` and writes the chunk tables and the block table), `fwd_intra` on the serial route and above 256 documents |
 | `wy_fwd` | `wy_fwd`, `wy_fwd_rows` | forward, unless the fused recurrence (`fwdh_wy*`) runs; `wy_fwd_rows` (the saved `Akk` token rows, the `wy_bwd` program) on the overlap rows and the 32-column serial rows of `fwd` (on `sm_107a` its 64-column serial rows too), `wy_fwd` elsewhere |
 | `wy` | `wy_bwd`, `wy_bwd_replay` | backward (`_replay` on the replay), unless a fused recompute forms the WY representation (`fwdh_wy_bwd*`, `fwdh_p3_wy`) or the light set carries `w` / `u` (the paired serial 16-head rows of `sm_100a`, the segmented 16-head rows of `sm_103a` / `sm_107a` above 32 chains: neither light path) |
 | `fwdh` | `fwdh_wy`, `fwdh_wy_rows`, `fwdh_o_v1`, `fwdh_o_v1_rows`, `fwdh_o_v2`, `fwdh_o_v2_rows`, `fwdh_v3`, `fwdh_wy_bwd`, `fwdh_wy_bwd_replay`, `fwdh_v1`, `fwdh_v1_sm107`, `fwdh_v2`, `fwdh_v2h` | forward: serial `fwdh_wy_rows` (`fwd`: the saved token rows) / `fwdh_wy` (`fwd_nosave`) from 32 heads (`sm_107a`: at 32 only), else by form `fwdh_o_v1` (64 columns: `fwd_nosave`, and `fwd` on `sm_100a` / `sm_103a`) / `fwdh_o_v1_rows` (64 columns on `fwd` on `sm_107a`: `fwdh_v35` reading the saved `Aqk` token rows), `fwdh_o_v2` (32 columns, `fwd_nosave`) / `fwdh_o_v2_rows` (32 columns on `fwd`: `fwdh_v35` reading the saved `Aqk` token rows); segmented `fwdh_v3` pass 1 (both forward paths, `light`, replay). Backward recompute (`light`, replay): `fwdh_wy_bwd*` on the 64-column form from 64 heads, `fwdh_v1` (`fwdh_v1_sm107` on `sm_107a`) below, `fwdh_v2` / `fwdh_v2h` (from 16 heads on `sm_100a` / `sm_103a`; `sm_107a` keeps `fwdh_v2`, its 16-head rows being segmented) on the 32-column form |
 | `seg_carry` | `seg_carry`, `seg_carry_ov`, `seg_carry_v8` | segmented route: between the forward passes (where pass 1 runs) and, in reverse, between the adjoint passes; `seg_carry_ov` (the release flags) on the forward paths of the rows with `NSEG * H >= 3.0 * sm_count` (`sm_100a` / `sm_103a`) or `>= 2.3 * sm_count` (`sm_107a`), at most 8192 segment-heads; on the other launches `seg_carry_v8` (the two-level carry; grid rule `carry_groups`) with at most two heads where `cake_jit.carry_choice` admits the problem, `seg_carry` elsewhere |
 | `fwdh_p3` | `fwdh_p3_o`, `fwdh_p3_o_ov`, `fwdh_p3_o_ov_id`, `fwdh_p3_o_ov_rows`, `fwdh_p3_o_ov_id_rows`, `fwdh_p3_wy`, `fwdh_p3` | segmented pass 2: `fwdh_p3_o` on the forward paths (the output fused), `fwdh_p3_o_ov` / `fwdh_p3_o_ov_id` (PDL launch; the release order up to 2 heads, the chain-major order above) where `seg_carry_ov` runs on `fwd_nosave` and their token-row twins `fwdh_p3_o_ov_rows` / `fwdh_p3_o_ov_id_rows` (the saved `Aqk`) on `fwd`, `fwdh_p3_wy` on `light_states` with at most 32 chains (the WY representation fused), `fwdh_p3` otherwise (`light`, replay, `light_states` above 32 chains) |
-| `bwd_prep` | `bwd_prep_g8_noqg`, `bwd_prep_g8_noqg_nokb`, `bwd_prep_g8`, `bwd_prep_g8_replay` | backward; one CTA per chunk and head: `_noqg` on the light paths (the saved `qg`), `_noqg_nokb` on the light paths of the rows whose set carries `w` / `u` (the paired serial 16-head rows of `sm_100a`, the segmented 16-head rows of `sm_103a` / `sm_107a` above 32 chains: no `k * beta`), `bwd_prep_g8` on `tape`, `_replay` on the replay (it keeps the internal `dout` copy) |
+| `bwd_prep` | `bwd_prep_g8_noqg`, `bwd_prep_g8_noqg_nokb`, `bwd_prep_g8`, `bwd_prep_g8_replay`; raw: the four `_raw` twins | backward; one CTA per chunk and head: `_noqg` on the light paths (the saved `qg`), `_noqg_nokb` on the light paths of the rows whose set carries `w` / `u` (the paired serial 16-head rows of `sm_100a`, the segmented 16-head rows of `sm_103a` / `sm_107a` above 32 chains: no `k * beta`), `bwd_prep_g8` on `tape`, `_replay` on the replay (it keeps the internal `dout` copy) |
 | `dav` | `dav_serial`, `dav_serial_replay` | serial rows below 16 heads (`dA_qk` alone, no `dv1` output); the `_replay` form on the replay; none elsewhere (the fused gradient hosts `dA_qk`) |
 | `dhu` | `dhu_v1`, `dhu_v1_replay`, `dhu_v1_wt`, `dhu_v1_wt_replay`, `dhu_v2t`, `dhu_v2t_replay`, `dhu_v3_f`, `dhu_v3_f_wt`, `dhu_v3_f_replay`, `dhu_v3p_f`, `dhu_v3p_f_wt`, `dhu_v3p_f_replay`, `dhu_v3r_f`, `dhu_v3r_f_wt`, `dhu_v3r_f_replay`, `dhu_v3s_f`, `dhu_v3s_f_wt`, `dhu_v3s_f_replay` | serial 64-column form: `dhu_v1_wt*` behind the fused recompute (from 64 heads on `light` / replay), `dhu_v1*` otherwise; 32-column form: `dhu_v2t*`; segmented, two launches each, every form accumulating `dv1`: few chains `dhu_v3s_f` (`light`, `tape`), `dhu_v3s_f_wt` (`light_states`), `dhu_v3s_f_replay`; above four chains `dhu_v3_f*` (TMA tapes) when `NSEG * H < 4 * sm_count` (`<=` at `H <= 4`) -- on `sm_103a` `dhu_v3p_f*` (the form prefetching the next chunk's tiles) below `4 * sm_count` and `dhu_v3_f*` at the boundary alone -- else `dhu_v3r_f*`: the plain form on `light` / `tape` (and `light_states` above 32 chains), `_wt` on `light_states` with at most 32 chains, `_replay` on the replay |
 | `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq`, `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | backward; `_davq` from 16 serial heads and on every segmented row (hosts `dA_qk`), `_int` on the replay; on `sm_107a` from 16 heads the `_nohint` builds of the two `_davq` forms (the L2 prefetch and evict-first hints off; the hinted builds elsewhere); reads `q` / `k` / `v` on the token rows |
-| `glm_intra` | `glm_intra_v14`, `glm_intra_v18`, `glm_intra` | backward; reads `k` / `q` on the token rows; `glm_intra_v14` on `sm_103a` and `glm_intra_v18` on `sm_107a` (the gate epilogue fused: they write the token-row `dg` / `dbeta` themselves; `glm_intra_v18` names every named-barrier slot with an immediate, so two CTAs share an SM on `sm_107a`), `glm_intra` on `sm_100a` |
-| `gate_epilogue` | `gate_epilogue` | backward on `sm_100a` (the GLM intra programs of `sm_103a` / `sm_107a` host it) |
+| `glm_intra` | `glm_intra_v14`, `glm_intra_v18`, `glm_intra` | backward; reads `k` / `q` on the token rows; `glm_intra_v14` on `sm_103a` and `glm_intra_v18` on `sm_107a` (the gate epilogue fused: they write the token-row `dg` / `dbeta` themselves; `glm_intra_v18` names every named-barrier slot with an immediate, so two CTAs share an SM on `sm_107a`), `glm_intra` on `sm_100a`; raw gate mode: `glm_intra_raw` on every architecture (the raw gate's gradient formed in its drain: it writes the token-row `dg` / `dbeta` and the per-chunk partials of `dA_log` / `ddt_bias`) |
+| `gate_epilogue` | `gate_epilogue` | backward on `sm_100a` in the default gate mode (the GLM intra programs of `sm_103a` / `sm_107a` host it; none in raw gate mode) |
+| `param_finalize` | `param_finalize` | raw gate mode alone: once per backward call on every path, after the last tail range and document group (grid rule `heads`: one CTA per head); `dA_log` / `ddt_bias` from the per-chunk partials of the real chunks |
 
 ## Context-parallel training (KCP)
 
@@ -583,8 +671,8 @@ README.
   `run_module(name, values, grid=, device_index=)`.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
-  `cake-build/1`): one entry per `<library>_<arch>` (the 65 programs on the
-  architectures each ships on: 61 on all three, `glm_intra_v14` on `sm_103a`,
+  `cake-build/1`): one entry per `<library>_<arch>` (the 73 programs on the
+  architectures each ships on: 69 on all three, `glm_intra_v14` on `sm_103a`,
   `glm_intra_v18` on `sm_107a`, `glm_intra` and `gate_epilogue` on `sm_100a`) with its two translation units, digests, nvcc flags
   (`--use_fast_math`), closure digest and `aot/<name>.so` path.
   `cake_build.load_library(name)` loads the prebuilt library when `aot/` holds
@@ -612,8 +700,11 @@ Tests: `tests/experimental/test_cake_kda_det_train.py` (the backend suite: impor
 only this package through `tests/test_helpers/cake_package`; the registry and
 plan tests run everywhere, the kernel tests skip without a compute capability
 10.0 / 10.3 / 10.7 device) against the exact FP64 per-document recurrence of
-`tests/test_helpers/cake_kda_det_train_reference.py`, and
-`tests/experimental/test_cake_kda_det_train_api.py` (the public entry points;
+`tests/test_helpers/cake_kda_det_train_reference.py`,
+`tests/experimental/test_cake_kda_det_train_raw_gate_accuracy.py` (the raw gate
+mode's accuracy against the activated-gate paths, both measured against the
+FP64 reference) and `tests/experimental/test_cake_kda_det_train_api.py` (the
+public entry points;
 `tests/experimental/test_cake_kda_det_train_names.py` checks the previous names).
 Benchmark: `benchmarks/bench_cake_kda_det_train.py`.  The context-parallel
 path has its own package, `flashinfer/experimental/cake_kda_det_train_kcp`.

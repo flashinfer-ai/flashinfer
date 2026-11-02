@@ -2446,10 +2446,16 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
         "qg",
         "w",
         "u",
+        "gate",
+        "lower_bound",
         "deterministic",
     ]
     for name in ("h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u"):
         assert KdaChunkSaved.__dataclass_fields__[name].default is None, name
+    # the deterministic package's gate-mode fields (#7816), at its defaults: this package's forward writes the
+    # explicit gate and its backward refuses a raw-mode set
+    assert KdaChunkSaved.__dataclass_fields__["gate"].default == "g"
+    assert KdaChunkSaved.__dataclass_fields__["lower_bound"].default is None
     # the mode of the forward that wrote the set: this package's forward writes False (the deterministic package's
     # sets have the same format, and the backward reads either)
     assert KdaChunkSaved.__dataclass_fields__["deterministic"].default is False

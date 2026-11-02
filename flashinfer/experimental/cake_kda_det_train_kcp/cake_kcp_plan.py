@@ -3010,6 +3010,7 @@ def kda_det_workspace_bytes_kcp(
     C: int = 8192,
     local_arena: str | None = None,
     lean_passes: int | None = None,
+    use_gate_in_kernel: bool = False,
 ) -> int:
     """Caller-held workspace bytes of one rank: the local arena for ``(T_r, n_frag, H)`` (zero on a rank without
     tokens; the existing backend's arena, ``kda_det_train_workspace_bytes``, or for a backward workspace under
@@ -3031,9 +3032,22 @@ def kda_det_workspace_bytes_kcp(
     ``reserve`` binds it), and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
     ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context.
     ``lean_passes``: the tail passes a lean arena is sized for (``WorkspaceDetKcp(lean_passes=...)``; ``None``:
-    :data:`LEAN_PASSES_DEFAULT`)."""
+    :data:`LEAN_PASSES_DEFAULT`).  ``use_gate_in_kernel``: the workspace's gate mode
+    (``WorkspaceDetKcp(use_gate_in_kernel=)``): the raw mode's local arena is planned in the raw mode (its backward
+    layout carries no gate epilogue buffers on any architecture) and is the replay arena (``local_arena="lean"`` is
+    refused in this mode, as by the workspace); the pools do not depend on it."""
     _check_save_mode(save_mode)
     check_lean_passes(lean_passes)
+    if not isinstance(use_gate_in_kernel, bool):
+        raise ValueError(
+            f"use_gate_in_kernel must be a bool, got {use_gate_in_kernel!r}"
+        )
+    gate = "raw" if use_gate_in_kernel else "g"
+    if gate == "raw" and check_local_arena(local_arena) == "lean":
+        raise NotImplementedError(
+            'kda_det_workspace_bytes_kcp: use_gate_in_kernel=True runs on the replay local arena; local_arena="lean" '
+            "is not supported in the raw gate mode"
+        )
     lean = (
         check_local_arena(local_arena) == "lean" and backward and save_mode == "light"
     )
@@ -3050,7 +3064,7 @@ def kda_det_workspace_bytes_kcp(
             cake_backend,
         )  # the existing backend's arena rule; imported here so the metadata module stays torch-only
 
-        p = cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count)
+        p = cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count, gate=gate)
         if lean and local_lean_serves(p):
             a = local_lean_bytes(p, local_lean_passes(p, passes=lean_passes))
             t = 4 * local_tail_count_words(a, H)
@@ -3064,6 +3078,7 @@ def kda_det_workspace_bytes_kcp(
                     save_mode=save_mode,
                     sm_count=c.sm_count,
                     fwd_layout=local_fwd_layout(backward, save_mode),
+                    gate=gate,
                 )
             )
             t = 0
