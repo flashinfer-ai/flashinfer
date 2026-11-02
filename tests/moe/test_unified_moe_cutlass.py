@@ -120,7 +120,10 @@ def test_cutlass_bf16_config_architectures_and_registration():
     assert CutlassHummingConfig.supported(90)
     for arch in (100, 103, 107, 110, 120, 121):
         assert CutlassNvfp4Config.supported(arch)
+    for arch in (100, 103, 107, 110):
         assert CutlassMxfp8Mxfp4Config.supported(arch)
+    for arch in (120, 121):
+        assert not CutlassMxfp8Mxfp4Config.supported(arch)
     for arch in (100, 103, 107):
         assert CutlassMxfp8Config.supported(arch)
     assert not CutlassBf16Config.supported(80)
@@ -2858,9 +2861,26 @@ def _is_cutlass_mxfp8_runtime_supported() -> bool:
     return False
 
 
+def _is_cutlass_mxfp8_mxfp4_runtime_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    device = torch.device("cuda")
+    major, minor = get_compute_capability(device)
+    arch = major * 10 + minor
+    if not CutlassMxfp8Mxfp4Config.supported(arch):
+        return False
+    if arch in (100, 103):
+        return is_sm100a_supported(device)
+    if arch == 107:
+        return is_sm100f_supported(device)
+    if arch == 110:
+        return is_sm110a_supported(device)
+    return False
+
+
 cutlass_mxfp8_mxfp4_required = pytest.mark.skipif(
-    not _is_cutlass_nvfp4_runtime_supported(),
-    reason="requires SM100/SM110/SM12x CUTLASS MXFP8xMXFP4 GPU and CUDA toolkit",
+    not _is_cutlass_mxfp8_mxfp4_runtime_supported(),
+    reason="requires SM100/SM103/SM107/SM110 CUTLASS MXFP8xMXFP4 GPU and CUDA toolkit",
 )
 
 cutlass_mxfp8_required = pytest.mark.skipif(
