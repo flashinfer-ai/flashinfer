@@ -3957,7 +3957,7 @@ def _run_rank_l2n(
     flags["l2n_saved_bytes_on_minus_off"] = (
         saved_on_b - saved_off_b == rstd_bytes == q_on - q_off
     )
-    del refs, res
+    del res
 
     # the WORLD-wide verdict: the ranks' exact flags (a rank without tokens holds the per-row flags it can) and the
     # judged verdicts (the worst of the N_REPEAT runs named per tensor)
