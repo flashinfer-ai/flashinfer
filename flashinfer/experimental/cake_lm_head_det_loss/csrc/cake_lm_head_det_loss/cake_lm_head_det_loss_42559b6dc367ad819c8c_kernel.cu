@@ -403,8 +403,13 @@ kernel_cake_lm_head_det_loss_42559b6dc367ad819c8c(const __grid_constant__ CUtens
                             mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int init_flag = ((mm_k == 0) ? 1 : 0);
+#if __CUDA_ARCH__ == 1070
+                            int _mma_a_lo_0 = (((smem_v0_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 2048;
+                            int _mma_b_lo_0 = (((smem_v0_addr_0) >> 4) & 0x7FFF) + (mma_tma_stage) * 2048;
+#else
                             int _mma_a_lo_0 = (((smem_v0_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 2048;
                             int _mma_b_lo_0 = (((smem_v0_addr_0) >> 4) & 0x3FFF) + (mma_tma_stage) * 2048;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
