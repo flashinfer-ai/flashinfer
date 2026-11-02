@@ -71,6 +71,12 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   critical path, with separate coefficients for wide blocks, fitted on measured
   schedules of the 110-SM board (0.5% slower than the measured best on average
   over 21 token counts, 3.9% at worst at 320 tokens, from the block rule).
+  The model is fitted with 384 experts; with 256 (DeepSeek-V4-Flash, K=4096) it
+  misranks the near-tied one-wave schedules by up to 22%, so that shape takes a
+  measured split per token range up to 3072 tokens and the smallest block that
+  holds the tokens in one wave (`MEASURED_SPLITS`: 0.1% from the best on average,
+  3.2% at worst). Timings for these fits are medians over buffer placements: the
+  same schedule moves by up to 10% with the DRAM placement of its buffers.
 
 Compared to the SM100 programs this backend also accepts other hidden sizes
 (multiples of 64), 1..1024 experts, top-k up to 32 slots, no bias, token masks

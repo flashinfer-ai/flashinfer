@@ -23,6 +23,8 @@ from flashinfer.mega_gate import prepare_mega_gate
 DUPLICATE_HASH = 23333
 SCALE = 1.5
 PRODUCTION = dict(hidden=5120, num_experts=384, num_topk=6)
+V4_FLASH = dict(hidden=4096, num_experts=256, num_topk=6)
+"""DeepSeek-V4-Flash's router: two 128-expert groups per token block."""
 TOKEN_COUNTS = (
     1,
     2,
@@ -62,7 +64,7 @@ def _skip_unless_sm120():
 # ----------------------------------------------------------------- CPU only
 
 
-@pytest.mark.parametrize("num_sms", [48, 170, 188])
+@pytest.mark.parametrize("num_sms", [48, 110, 170, 188])
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_schedule_invariants(num_sms, deterministic):
     for num_experts in (96, 128, 256, 260, 384, 512, 1024):
@@ -115,6 +117,33 @@ def test_schedule_invariants(num_sms, deterministic):
                 assert config.num_ctas(num_tokens, num_sms) <= num_sms
                 workers = config.num_worker_groups(num_tokens, num_sms)
                 assert 1 <= workers <= config.num_token_blocks(num_tokens)
+
+
+def test_measured_splits_take_the_smallest_one_wave_block():
+    for (num_sms, hidden, num_experts), ranges in heuristics.MEASURED_SPLITS.items():
+        num_groups = -(-num_experts // heuristics.EXPERTS_PER_CTA)
+        bound = 0
+        for max_tokens, split in ranges:
+            assert max_tokens > bound
+            for num_tokens in range(bound + 1, max_tokens + 1):
+                config = heuristics.select_config(
+                    num_tokens, hidden, num_experts, num_sms
+                )
+                assert config.num_split_k == split
+                worker_groups = num_sms // (num_groups * split)
+                blocks = config.num_token_blocks(num_tokens)
+                assert blocks <= worker_groups  # one wave
+                smaller = [
+                    b
+                    for b in heuristics.BLOCK_TOKENS_CHOICES
+                    if b < config.block_tokens
+                ]
+                assert all(-(-num_tokens // b) > worker_groups for b in smaller)
+                deterministic = heuristics.select_config(
+                    num_tokens, hidden, num_experts, num_sms, deterministic=True
+                )
+                assert deterministic.num_split_k == 1
+            bound = max_tokens
 
 
 def test_enable_pdl_is_sm12x_only():
@@ -345,16 +374,21 @@ def test_replica_counts(num_tokens, ep_rank):
 
 @pytest.mark.parametrize(
     "block_tokens,num_split_k,num_tokens",
-    [(16, 8, 300), (32, 8, 600), (64, 8, 900), (64, 4, 700)],
+    [(16, 8, 300), (32, 8, 600), (64, 8, 900), (64, 4, 1000)],
 )
-def test_cooperative_gate_over_several_blocks(block_tokens, num_split_k, num_tokens):
+@pytest.mark.parametrize(
+    "shape,num_shared", [(PRODUCTION, 1), (V4_FLASH, 0)], ids=["E384", "E256"]
+)
+def test_cooperative_gate_over_several_blocks(
+    block_tokens, num_split_k, num_tokens, shape, num_shared
+):
     """Cooperative gates of 1-3 tokens per CTA (and a per-token gate) whose CTAs rank
     several blocks: the exchange is reused block after block."""
     _skip_unless_sm120()
-    config = heuristics.make_config(block_tokens, num_split_k, 384)
+    config = heuristics.make_config(block_tokens, num_split_k, shape["num_experts"])
     assert config.cooperative_gate == (block_tokens <= 3 * config.num_logical_ctas)
     plan = _run_case(
-        num_tokens, **PRODUCTION, num_shared=1, with_mask=True, config=config
+        num_tokens, **shape, num_shared=num_shared, with_mask=True, config=config
     )
     assert plan.route["num_worker_groups"] < config.num_token_blocks(num_tokens)
 
@@ -364,6 +398,19 @@ def test_cooperative_gate_over_several_blocks(block_tokens, num_split_k, num_tok
 def test_production_shape(num_tokens, physical):
     _skip_unless_sm120()
     _run_case(num_tokens, **PRODUCTION, physical=physical)
+
+
+@pytest.mark.parametrize(
+    "num_tokens", [1, 6, 40, 120, 240, 280, 800, 960, 1120, 4096, 8192]
+)
+@pytest.mark.parametrize(
+    "physical,with_mask", [(False, False), (True, True)], ids=["plain", "mapped-masked"]
+)
+def test_v4_flash_shape(num_tokens, physical, with_mask):
+    """Decode and prefill token counts of DeepSeek-V4-Flash deployments (256 experts
+    and top-6 admit no shared slot), with and without a physical map and a mask."""
+    _skip_unless_sm120()
+    _run_case(num_tokens, **V4_FLASH, physical=physical, with_mask=with_mask)
 
 
 @pytest.mark.parametrize(

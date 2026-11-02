@@ -12,7 +12,9 @@ token block grows with the token count so that a call has about four blocks
 of one CTA's critical path (``estimated_us``). Both were derived from every
 candidate schedule measured on the target board, the 110-SM RTX PRO 5000
 (K=5120, E=384, top-6): over 21 token counts from 1 to 16384 the pick is 0.7%
-slower than the measured best on average and 2.9% at worst. Deterministic
+slower than the measured best on average and 2.9% at worst. Shapes the model
+misranks (K=4096, E=256) take a measured split per token range and the smallest
+block holding the tokens in one wave (``MEASURED_SPLITS``). Deterministic
 requests never split K, which keeps every token's logits independent of the
 token count (batch invariance).
 """
@@ -152,6 +154,37 @@ WIDE_COST_PER_TAIL_TOKEN = 1.48
 WIDE_COST_PER_TAIL_TOKEN_SPLIT = 0.9614
 
 
+# Measured split-K by token count for router shapes the cost model below misranks:
+# (num_sms, hidden, experts) -> ((up to this many tokens, split-K), ...). Up to a few
+# thousand tokens the fastest schedule holds every token in one wave of worker groups, with
+# the smallest block that does so at its split (``one_wave_block_tokens``); which split wins
+# (a shorter K loop against more CTAs and a larger block per CTA) is a near-tie the model,
+# fitted with 384 experts, gets wrong by up to 22% with 256. The entries are the fastest
+# one-wave split at 44 measured token counts (the median over 15 buffer placements: a
+# schedule's time moves by up to 10% with the DRAM placement of its buffers), merged where
+# a split stays within 3% of the best. Against every schedule measured at 43 token counts
+# up to 3072 they are 0.1% slower than the best on average and 3.2% at worst (the cost
+# model: 5.3% and 22%). Above the last bound the best schedules take several waves and the
+# cost model picks.
+MEASURED_SPLITS: dict[tuple[int, int, int], tuple[tuple[int, int], ...]] = {
+    # DeepSeek-V4-Flash on the 110-SM RTX PRO 5000 (V4.1-Flash, 5120 x 384, is the
+    # model's own fit: 0.4% from the best on average there).
+    (110, 4096, 256): ((48, 16), (576, 8), (1536, 4), (3072, 2)),
+}
+
+
+def one_wave_block_tokens(
+    num_tokens: int, num_groups: int, num_sms: int, split: int
+) -> int | None:
+    """The smallest block that holds ``num_tokens`` tokens in one wave of the worker groups
+    of a split (None if even the largest block takes more)."""
+    num_worker_groups = num_sms // (num_groups * split)
+    for block_tokens in BLOCK_TOKENS_CHOICES:
+        if ceil_div(num_tokens, block_tokens) <= num_worker_groups:
+            return block_tokens
+    return None
+
+
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
@@ -287,9 +320,10 @@ def select_config(
     num_sms: int,
     deterministic: bool = False,
 ) -> MegaGateConfig:
-    """Pick the schedule for ``num_tokens`` tokens on a ``num_sms``-SM device: the block
-    size rule and the modelled best split up to 512 tokens, the modelled best wide block
-    and split above."""
+    """Pick the schedule for ``num_tokens`` tokens on a ``num_sms``-SM device: for a
+    measured shape (``MEASURED_SPLITS``) its split and the smallest one-wave block; else
+    the block size rule and the modelled best split up to 512 tokens, the modelled best
+    wide block and split above."""
     if hidden <= 0 or hidden % BLOCK_K:
         raise ValueError(f"hidden must be a positive multiple of {BLOCK_K}")
     if not 0 < num_experts <= MAX_EXPERTS:
@@ -299,6 +333,18 @@ def select_config(
         raise ValueError("every expert group of a token block needs its own SM")
     num_k_blocks = hidden // BLOCK_K
     num_tokens = max(num_tokens, 1)
+
+    if not deterministic:
+        for max_tokens, split in MEASURED_SPLITS.get(
+            (num_sms, hidden, num_experts), ()
+        ):
+            if num_tokens <= max_tokens:
+                block_tokens = one_wave_block_tokens(
+                    num_tokens, num_groups, num_sms, split
+                )
+                if block_tokens is not None:
+                    return make_config(block_tokens, split, num_experts)
+                break
 
     block_choices = (
         WIDE_BLOCK_TOKENS
