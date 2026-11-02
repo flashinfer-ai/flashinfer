@@ -75,7 +75,7 @@ def indexer_scores(
         E4M3 ``[pages, 64, 8]`` for NVFP4 keys, paged like the keys. None for
         BF16.
     """
-    from .attn_scores.single_head_shapes import DIM, MAX_ROWS, PAGE
+    from .attn_scores.sdsa_shapes import DIM, MAX_ROWS, PAGE
 
     max_context = scores.shape[1]
     batch, width = requests.shape[0], block_table.shape[1]
@@ -113,9 +113,9 @@ def indexer_scores(
                 "Queries, keys, scores, lengths, requests and the block table "
                 "must have contiguous rows"
             )
-        from .triton.kernels.single_head_scorer import single_head_scorer_kernel
+        from .triton.kernels.sdsa_indexer import sdsa_scorer_kernel
 
-        single_head_scorer_kernel[(batch, -(-max_context // PAGE))](
+        sdsa_scorer_kernel[(batch, -(-max_context // PAGE))](
             query,
             query.stride(0),
             key_cache,
@@ -132,7 +132,7 @@ def indexer_scores(
         return
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("indexer_scores needs CuTe DSL 4.7 or newer")
-    from .attn_scores.kernels.single_head_scorer import CTAS_PER_SM, TILE, TILES_PER_CTA
+    from .attn_scores.kernels.sdsa_indexer import CTAS_PER_SM, TILE, TILES_PER_CTA
 
     # CTAs per request group: two per SM in all, and enough that a CTA's run over
     # the whole capacity fits the TILES_PER_CTA tiles whose pages it stages (the
@@ -151,8 +151,8 @@ def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
     per job. `keys` is (query, query_scales, key_cache, key_scales), and `args`
     holds the kernel's other arguments."""
     from .cute_dsl.launch import argument_kind, compiled
-    from .attn_scores.kernels import single_head_scorer
-    from .attn_scores.kernels.single_head_scorer import (
+    from .attn_scores.kernels import sdsa_indexer
+    from .attn_scores.kernels.sdsa_indexer import (
         DIM,
         PACKED_DIM,
         PAGE,
@@ -198,13 +198,13 @@ def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
         raise ValueError("Queries, lengths, tables and outputs must be contiguous")
     args = (*keys, *args)
     function = compiled(
-        single_head_scorer.scorers(mode, rows, nvfp4),
-        "single_head_scorer",
+        sdsa_indexer.scorers(mode, rows, nvfp4),
+        "sdsa_indexer",
         f"{mode}_{rows}_{'nvfp4' if nvfp4 else 'bf16'}",
         (),
         query.device,
         tuple(map(argument_kind, args)),
-        (single_head_scorer.__file__,),
+        (sdsa_indexer.__file__,),
     )
     function(*args)
 
@@ -284,7 +284,7 @@ def indexer_threshold_select(
     """
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("Threshold select needs CuTe DSL 4.7 or newer")
-    from .attn_scores.kernels.single_head_scorer import (
+    from .attn_scores.kernels.sdsa_indexer import (
         COUNTERS,
         PAGE,
         SELECT_CTAS_PER_TILE,
@@ -380,8 +380,8 @@ def top_k_from_candidates(
         raise RuntimeError("top_k_from_candidates needs CuTe DSL 4.7 or newer")
     from .cute_dsl.launch import launch
     from .topk_varlen.kernels import block_scan
-    from .attn_scores.kernels import single_head_scorer
-    from .attn_scores.kernels.single_head_scorer import TOP_K_THREADS
+    from .attn_scores.kernels import sdsa_indexer
+    from .attn_scores.kernels.sdsa_indexer import TOP_K_THREADS
 
     rows = candidates.shape[0]
     if (
@@ -401,13 +401,13 @@ def top_k_from_candidates(
         raise ValueError("top_k must be below 65536")
     if rows and top_keys.shape[1]:
         launch(
-            single_head_scorer.candidate_top_k_kernel,
+            sdsa_indexer.candidate_top_k_kernel,
             (rows, 1),
             TOP_K_THREADS,
             args,
             (),
-            module="single_head_top_k",
-            key_files=(single_head_scorer.__file__, block_scan.__file__),
+            module="sdsa_top_k",
+            key_files=(sdsa_indexer.__file__, block_scan.__file__),
         )
 
 
@@ -462,8 +462,8 @@ def quantize_write_index_qk_nvfp4(
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("quantize_write_index_qk_nvfp4 needs CuTe DSL 4.7 or newer")
     from .cute_dsl.launch import launch
-    from .attn_scores.kernels import single_head_scorer
-    from .attn_scores.kernels.single_head_scorer import (
+    from .attn_scores.kernels import sdsa_indexer
+    from .attn_scores.kernels.sdsa_indexer import (
         DIM,
         PACKED_DIM,
         PAGE,
@@ -511,13 +511,13 @@ def quantize_write_index_qk_nvfp4(
     if rows:
         args = (key, slots, query, query_rows, key_cache, key_scales)
         launch(
-            single_head_scorer.index_qk_write_kernel,
+            sdsa_indexer.index_qk_write_kernel,
             (-(-rows // WRITE_ROWS_PER_CTA), 1),
             TILE,
             (*args, packed_query, query_scales),
             (),
-            module="single_head_scorer",
-            key_files=(single_head_scorer.__file__,),
+            module="sdsa_indexer",
+            key_files=(sdsa_indexer.__file__,),
         )
 
 
@@ -569,8 +569,8 @@ def gather_key_sample(
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("gather_key_sample needs CuTe DSL 4.7 or newer")
     from .cute_dsl.launch import launch
-    from .attn_scores.kernels import single_head_scorer
-    from .attn_scores.kernels.single_head_scorer import PAGE, SCALES_PER_KEY, TILE
+    from .attn_scores.kernels import sdsa_indexer
+    from .attn_scores.kernels.sdsa_indexer import PAGE, SCALES_PER_KEY, TILE
 
     requests, capacity, width = sample_keys.shape
     if capacity % TILE or (key_scales is None) != (sample_scales is None):
@@ -597,13 +597,13 @@ def gather_key_sample(
     args = (key_cache, key_scales, block_table, offsets, sample_ends, sample_keys)
     if requests and capacity:
         launch(
-            single_head_scorer.key_sample_kernel,
+            sdsa_indexer.key_sample_kernel,
             (requests, capacity // TILE),
             TILE,
             (*args, sample_scales),
             (samples_per_run, PAGE * pages_per_run, width),
-            module="single_head_scorer",
-            key_files=(single_head_scorer.__file__,),
+            module="sdsa_indexer",
+            key_files=(sdsa_indexer.__file__,),
         )
 
 
@@ -636,8 +636,8 @@ def thresholds_from_sample(
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("thresholds_from_sample needs CuTe DSL 4.7 or newer")
     from .cute_dsl.launch import launch
-    from .attn_scores.kernels import single_head_scorer
-    from .attn_scores.kernels.single_head_scorer import COUNTERS, THRESHOLD_ROWS_PER_CTA
+    from .attn_scores.kernels import sdsa_indexer
+    from .attn_scores.kernels.sdsa_indexer import COUNTERS, THRESHOLD_ROWS_PER_CTA
 
     rows, rank = sample_top.shape
     if {sample_scores.shape[0], thresholds.shape[0], counters.shape[0]} != {rows}:
@@ -646,11 +646,11 @@ def thresholds_from_sample(
         raise ValueError(f"counters must be [rows, {COUNTERS}]")
     if rows:
         launch(
-            single_head_scorer.thresholds_kernel,
+            sdsa_indexer.thresholds_kernel,
             (-(-rows // THRESHOLD_ROWS_PER_CTA), 1),
             32 * THRESHOLD_ROWS_PER_CTA,
             (sample_scores, sample_top, thresholds, counters),
             (rank,),
-            module="single_head_scorer",
-            key_files=(single_head_scorer.__file__,),
+            module="sdsa_indexer",
+            key_files=(sdsa_indexer.__file__,),
         )

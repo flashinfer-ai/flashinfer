@@ -29,10 +29,10 @@ from ...cute_dsl.fp4_common import (
     fp8_e4m3_to_f32,
 )
 from ...topk_varlen.kernels import block_scan
-from ..single_head_shapes import CTAS_PER_SM, DIM, MAX_ROWS, PAGE, TILE
+from ..sdsa_shapes import CTAS_PER_SM, DIM, MAX_ROWS, PAGE, TILE
 
 # Keys come in block-table pages of PAGE keys and are scored in tiles of TILE
-# keys (PAGES_PER_TILE pages); see single_head_shapes.
+# keys (PAGES_PER_TILE pages); see sdsa_shapes.
 PAGES_PER_TILE = TILE // PAGE
 # Decode's warps: STORE_WARPS store scores (32 TMEM lanes each), then one issues
 # the MMAs and one loads the keys.

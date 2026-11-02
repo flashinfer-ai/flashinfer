@@ -3,7 +3,7 @@ import triton.language as tl  # type: ignore[import]
 
 
 @triton.jit
-def single_head_scorer_kernel(
+def sdsa_scorer_kernel(
     query_ptr,
     query_stride,
     key_ptr,

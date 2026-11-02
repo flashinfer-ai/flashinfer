@@ -213,7 +213,7 @@ Each API records a trace template of the same name, with a reference.
 
 ## Validation
 
-`tests/attn_scores/test_single_head.py` covers:
+`tests/attn_scores/test_sdsa.py` covers:
 
 - decode scores: BF16, BF16 through the Triton kernel, NVFP4, and NVFP4 keys and
   scales in one cache; 1, 3 and 8 rows for each request; lengths that end on a
