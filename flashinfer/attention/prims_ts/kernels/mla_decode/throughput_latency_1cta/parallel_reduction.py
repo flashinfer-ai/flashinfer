@@ -406,8 +406,9 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             output_acc[elem_i] = Float32(0.0)
         # Scratch strides remain static for the prepared capacity. Form the
         # 64-bit row base once to avoid repeated address linearization.
-        # A full prefix keeps the unrolled path without one branch per slot;
-        # a shorter prefix uses a runtime loop and never reads padding.
+        # Runtime counts up to the largest window stay on an unrolled path;
+        # only counts above it use the runtime chunk loop. Padding slots are
+        # never read: predicated slots clamp to the last live split.
         acc_row_ptr = acc_output.iterator.raw_ptr() + _split_o_row_base_offset(
             cfg,
             batch_idx,
