@@ -28,7 +28,8 @@ finiteness and a relative-RMS sanity bound; mismatch counts recorded as
 evidence), the six head pairs (16, 48), (8, 24), (4, 12),
 (2, 6), (1, 3), (4, 4), the degenerate one-token / zero-token packs, the packed
 QKV strided view against the contiguous input, plain ``split`` views of a packed QKV row against the packed views and
-contiguous operands with their hooks and ``retain_grad`` (issue #8367), and the explicit forward /
+contiguous operands with their hooks and ``retain_grad`` and the gradient layout of each form (issue #8367; a
+CUDA-graph replay alternating the packed and plain views keeps each its own layout), and the explicit forward /
 backward entries against autograd (output order ``dq, dk, dv, dbeta, dg``,
 saved-context against replay), and two caller streams with cached workspaces.  The multi-rank rows and the
 runtime contracts live in ``test_cake_gdn_train_kcp_dist.py``; the CPU plan, table, byte-query and fake-backend tests in
@@ -440,8 +441,9 @@ def test_plain_split_views_keep_hooks_and_are_within_budget(
         got = _split_view_pass(form, row0, g0, b0, dout, ctx, heads, ckpt=ckpt, **o)
         delta = {n: kcp.PACKED_SPLIT_STATS[n] - before[n] for n in before}
         assert delta == split, (form, delta)
+        # one packed dQKV row only for the split that hands it on; plain views get three contiguous gradients
         assert kcp.LAST_CALL["bwd"]["grad_layout"] == (
-            "separate" if form == "contiguous" else "packed"
+            "packed" if form == "packed" else "separate"
         ), form
         _check_contract(got["res"], inputs)
         arms[form] = got["res"]

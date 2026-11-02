@@ -50,8 +50,8 @@ collectives are the deterministic layer's) run under Slurm.
 
 Packed QKV (#7817): under ``layout="tma"`` the backward of strided packed views writes one packed dQKV row, and
 ``packed_qkv_views_kcp`` hands it to a packed leaf without a concatenation (both within the budgets of the contiguous
-call); plain ``split`` views of the leaf, direct and checkpointed, keep torch's split backward and their hooks and
-``retain_grad`` (issue #8367; within the same budgets).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
+call); plain ``split`` views of the leaf, direct and checkpointed, get three contiguous gradients and keep torch's
+split backward and their hooks and ``retain_grad`` (issue #8367; within the same budgets).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
 (``use_qk_l2norm_in_kernel=True``) on raw rows, every form within the FP64 budgets of the norm-off rows and of its
 partner, the deterministic package with the norm within the same constants, the token-local program outputs exact
 (see the block comment before ``V1_LIBRARIES``).
@@ -1896,6 +1896,10 @@ def _run_rank(
         )
         arm(f"plain_split_{tag}", res_plain, res_auto, "autograd")
         flags[f"plain_split_{tag}_hooks_fire"] = hooks_ok
+        # three contiguous gradients (one packed row only for packed_qkv_views_kcp's split)
+        flags[f"plain_split_{tag}_grad_layout_separate"] = (
+            kcp.LAST_CALL["bwd"]["grad_layout"] == "separate"
+        )
         del res_plain
     del _buf, qs, ks, vs
     # gradient accumulation: .backward() twice -> half the accumulated gradient against the FP64 gradient
@@ -3953,6 +3957,9 @@ def _run_rank_l2n(
         )
         arm(f"plain_split_{tag}", res_plain, res_auto, "autograd")
         flags[f"l2n_plain_split_{tag}_hooks_fire"] = hooks_ok
+        flags[f"l2n_plain_split_{tag}_grad_layout_separate"] = (
+            kcp.LAST_CALL["bwd"]["grad_layout"] == "separate"
+        )
         del res_plain
     del buf, qs, ks, vs, res_auto
 
