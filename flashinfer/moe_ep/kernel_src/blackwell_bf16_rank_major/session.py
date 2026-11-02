@@ -1,4 +1,4 @@
-"""Runtime owner for the capacity-bounded SM100 BF16 rank-major MoE-EP DAG."""
+"""Runtime owner for the capacity-bounded SM100/SM107 BF16 rank-major MoE-EP DAG."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -43,6 +44,11 @@ _LL_SLOT_WORDS = _LL_HEADER_WORDS + _LL_ROW_WORDS
 _DESCRIPTOR_BYTES = 128
 _FC1_WEIGHT_BOX_DIM = (64, 128, 2, 1)
 _SOURCE_NAME = "flashinfer_blackwell_moe_ep_layer_sm100.cu"
+# One source, compiled for the architecture of the device that opens the session.
+_ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 7): "sm_107a"}
+_ARCHS = tuple(_ARCH_BY_CAPABILITY.values())
+# nvcc releases older than this cannot target the architecture.
+_MIN_NVCC_BY_ARCH = {"sm_107a": (13, 4)}
 _STAGE_NAMES = (
     "stage_inputs",
     "input_arrive",
@@ -420,8 +426,10 @@ def _load_manifest() -> tuple[dict[str, Any], Path]:
     }
     if manifest.get("schema_version") != 1:
         raise RuntimeError("Blackwell BF16 rank-major manifest schema must be 1")
-    if manifest.get("arch") != "sm_100a":
-        raise RuntimeError("Blackwell BF16 rank-major manifest arch must be sm_100a")
+    if manifest.get("archs") != list(_ARCHS):
+        raise RuntimeError(
+            f"Blackwell BF16 rank-major manifest archs must be {list(_ARCHS)}"
+        )
     if manifest.get("compile_flags") != ["--use_fast_math"]:
         raise RuntimeError(
             "Blackwell BF16 rank-major compile flags must be ['--use_fast_math']"
@@ -523,25 +531,60 @@ def _nvcc() -> Path:
     return Path(candidate).resolve()
 
 
-def _compile_cubin(source_path: Path, manifest: dict[str, Any]) -> Path:
+def _arch_for_capability(capability: tuple[int, int]) -> str:
+    major, minor = capability
+    arch = _ARCH_BY_CAPABILITY.get((major, minor))
+    if arch is None:
+        raise RuntimeError(
+            "Blackwell BF16 rank-major session requires SM100 or SM107, got compute "
+            f"capability {(major, minor)}"
+        )
+    return arch
+
+
+def _nvcc_release(nvcc: Path) -> tuple[int, int]:
+    process = subprocess.run(
+        [str(nvcc), "--version"], text=True, capture_output=True, check=False
+    )
+    match = re.search(r"release (\d+)\.(\d+)", process.stdout)
+    if process.returncode != 0 or match is None:
+        raise RuntimeError(
+            f"cannot read the CUDA release of {nvcc}:\n{process.stdout}{process.stderr}"
+        )
+    return int(match.group(1)), int(match.group(2))
+
+
+def _compile_cubin(source_path: Path, manifest: dict[str, Any], arch: str) -> Path:
     from flashinfer.jit import env as jit_env
 
+    if arch not in _ARCHS:
+        raise RuntimeError(f"Blackwell BF16 rank-major cannot target {arch}")
     nvcc = _nvcc()
+    minimum = _MIN_NVCC_BY_ARCH.get(arch)
+    if minimum is not None:
+        release = _nvcc_release(nvcc)
+        if release < minimum:
+            raise RuntimeError(
+                f"Blackwell BF16 rank-major {arch} needs nvcc "
+                f"{minimum[0]}.{minimum[1]} or newer, got {release[0]}.{release[1]} "
+                f"({nvcc})"
+            )
     digest = hashlib.sha256()
     digest.update(source_path.read_bytes())
     digest.update(json.dumps(manifest, sort_keys=True).encode())
     digest.update(str(nvcc).encode())
+    digest.update(arch.encode())
     key = digest.hexdigest()[:20]
     build_dir = jit_env.FLASHINFER_JIT_DIR / f"blackwell_bf16_rank_major_{key}"
     build_dir.mkdir(parents=True, exist_ok=True)
-    cubin_path = build_dir / "blackwell_bf16_rank_major_sm100.cubin"
+    cubin_path = build_dir / f"blackwell_bf16_rank_major_{arch}.cubin"
     with FileLock(build_dir / "build.lock", thread_local=False):
         if not cubin_path.is_file():
             temporary = build_dir / f"kernel.{os.getpid()}.tmp.cubin"
             command = [
                 str(nvcc),
                 "-cubin",
-                "-arch=sm_100a",
+                f"-arch={arch}",
                 "--std=c++17",
                 "-O3",
                 *manifest["compile_flags"],
@@ -853,11 +896,9 @@ class BlackwellBf16RankMajorSession:
         self._rank = rank
         self._device_index = torch.cuda.current_device()
         self._device = torch.device("cuda", self._device_index)
-        if torch.cuda.get_device_capability(self._device) != (10, 0):
-            raise RuntimeError(
-                "Blackwell BF16 rank-major session requires SM100, got compute capability "
-                f"{torch.cuda.get_device_capability(self._device)}"
-            )
+        self._arch = _arch_for_capability(
+            torch.cuda.get_device_capability(self._device)
+        )
         name = _group_name(process_group)
         self._hidden_states = _alloc_symmetric(
             (_TOKENS_PER_RANK, _HIDDEN_SIZE),
@@ -998,7 +1039,7 @@ class BlackwellBf16RankMajorSession:
         self._stage_by_name = {
             stage["name"]: stage for stage in self._manifest["stages"]
         }
-        cubin_path = _compile_cubin(source_path, self._manifest)
+        cubin_path = _compile_cubin(source_path, self._manifest, self._arch)
         torch.distributed.barrier(group=process_group)
         self._library = _KernelLibrary(
             cubin_path, self._manifest["stages"], self._device_index
