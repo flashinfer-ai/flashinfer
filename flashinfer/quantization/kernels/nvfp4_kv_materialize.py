@@ -235,10 +235,15 @@ class NVFP4KVMaterializeKernel:
         batch_size = Int32(mSeqLens.shape[0])
         sf_per_page = num_heads * page_size * Int32(self.blocks_per_row)
         zero = Uint32(0)
+        # Pages past kv_page_indptr[-1] are never written. Read the bound on the
+        # device so a larger out adds no work and graph replays see new metadata.
+        num_live_pages = Int32(mPageIndptr[batch_size]) + Int32(1)
+        if num_live_pages > num_out_pages:
+            num_live_pages = num_out_pages
         # Each CTA owns one output page at a time; its threads walk the page's
         # scale blocks, so page lookup happens once per page, not per block.
         out_page = bidx
-        while out_page < num_out_pages:
+        while out_page < num_live_pages:
             if out_page == Int32(0):
                 e = tidx
                 while e < sf_per_page:
@@ -717,6 +722,7 @@ class NVFP4KVMaterializer:
         device: Union[str, int, torch.device] = "cuda",
         uses_shared_paged_kv_idx: bool = True,
     ) -> None:
+        """Check the layout and device, and compile or load the kernel."""
         device = torch.device(device)
         if device.type != "cuda":
             raise ValueError(f"device must be a CUDA device, got {device}")
@@ -783,7 +789,8 @@ class NVFP4KVMaterializer:
             ``float8_e4m3fn [num_out_pages, 2, num_kv_heads, page_size,
             head_dim]`` with ``num_out_pages >= kv_page_indptr[-1] + 1``. It may
             be larger than the step needs, e.g. one workspace sized for the
-            largest step; the pages past ``kv_page_indptr[-1]`` are not written.
+            largest step; the kernel stops at ``kv_page_indptr[-1]``, so the
+            pages past it are neither written nor visited.
             Request ``b``'s page ``j`` is written to ``kv_page_indptr[b] + j + 1``
             and page 0 is zeroed.
         fp8_block_tables : torch.Tensor
