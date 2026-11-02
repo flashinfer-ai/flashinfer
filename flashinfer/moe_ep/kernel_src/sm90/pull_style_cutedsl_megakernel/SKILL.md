@@ -158,9 +158,10 @@ not picked them up):
   index incremental. `src/src/ptx_helpers.py` adds
   `red_add_relaxed_gpu_s32_raw`. `megamoe_kernel_fp8.py` takes ctor kwargs
   `dispatch_pull_batch` / `dispatch_pull_rotate`. `epilogue_fp8_swapab.py`
-  and the MX `run_wgmma_task_tile` take `n_half` as a runtime value, so with
-  `token_back_mode='epi_warps'` the two epilogue warpgroups share one code
-  copy (the calls share `fc1_args` / `store_args` / `fc2_args`).
+  and the MX `run_wgmma_task_tile` take `n_half` as a runtime value, so for
+  packed FP4 with `token_back_mode='epi_warps'` the two epilogue warpgroups
+  share one code copy (the calls share `fc1_args` / `store_args` /
+  `fc2_args`); FP8 keeps one copy per half and compiles as before.
   Dispatch-side token-back (`reuse_dispatch_warps` / `standalone_warps`)
   keeps one copy per half: that path shows run-to-run output differences on
   main as well, which the shared copy made far more frequent; the cause is
@@ -178,7 +179,7 @@ not picked them up):
   `_choose_pull_token`, `_dispatch_pull_batched` and the `pull_batch > 1`
   branch at the pull call site; drop `cutlass.Constexpr` from the
   epilogue's `n_half` parameters and keep the per-half copies under
-  `_token_back_by_dispatch`.
+  `_token_back_by_dispatch` or a scale mode other than `mxfp4_hybrid`.
 - Paired BF16 FC2 stores for K128 MXFP4 tiles (2026-10-27, measured on
   H2560/I640/E512/top10/EP2 in October):
   `src/moe_hopper_fp8/mxfp4_policy.py` resolves `paired_stores` for tile K

@@ -2235,13 +2235,17 @@ class SwapABFp8GluEpilogue:
                         fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
                         fc1_offload_mbox=fc1_offload_mbox,
                     )
-                    if cutlass.const_expr(self._token_back_by_dispatch):
+                    if cutlass.const_expr(
+                        self._token_back_by_dispatch
+                        or self.fp8_scale_mode != "mxfp4_hybrid"
+                    ):
                         # Dispatch-side token-back (reuse / standalone warps)
                         # shows run-to-run output differences on main, and the
                         # shared runtime-half copy made them far more frequent.
                         # The cause is open (no register spills; reuse of the
                         # WGMMA A registers in flight is not ruled out), so this
-                        # layout keeps main's code: one copy per half.
+                        # layout keeps main's code: one copy per half. So does
+                        # FP8 (per-tensor, blockwise): only packed FP4 shares one.
                         if n_half == cutlass.Int32(0):
                             (
                                 ab_consumer_state,
@@ -2370,8 +2374,11 @@ class SwapABFp8GluEpilogue:
                         epi_wg_order_barrier=epi_wg_order_barrier,
                         epi_wg_order_state=epi_wg_order_state,
                     )
-                    if cutlass.const_expr(self._token_back_by_dispatch):
-                        # Per-half copies for dispatch-side token-back, as for FC1 above.
+                    if cutlass.const_expr(
+                        self._token_back_by_dispatch
+                        or self.fp8_scale_mode != "mxfp4_hybrid"
+                    ):
+                        # Per-half copies as for FC1 above.
                         if n_half == cutlass.Int32(0):
                             (
                                 ab_consumer_state,
