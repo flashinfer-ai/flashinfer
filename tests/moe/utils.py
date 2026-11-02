@@ -50,6 +50,10 @@ from flashinfer.tllm_enums import (
     RoutingMethodType,
 )
 from flashinfer.utils import get_compute_capability
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    _UNSET,
+)
 
 
 def quant_id(quant: QuantConfig) -> str:
@@ -777,7 +781,7 @@ def _block_scale_ramp(size: int, block: int, device) -> torch.Tensor:
     return torch.pow(2.0, exponents.float()).to(torch.bfloat16)
 
 
-def _fp4_quantize_per_expert(weight, global_scale, sf_vec_size):
+def _fp4_quantize_per_expert(weight, global_scale, sf_vec_size, nvfp4_4over6=_UNSET):
     """Quantize ``[E, rows, k]`` weights one expert at a time.
 
     Swizzled scale factors pad each expert's rows to a multiple of 128, as
@@ -794,6 +798,7 @@ def _fp4_quantize_per_expert(weight, global_scale, sf_vec_size):
                 global_scale=global_scale,
                 sf_vec_size=sf_vec_size,
                 is_sf_swizzled_layout=True,
+                nvfp4_4over6=nvfp4_4over6,
             )
             for expert in weight
         ),
@@ -816,6 +821,7 @@ def create_moe_tensors(
     interleave_gated_weights: bool = True,
     use_nontrivial_alphas: bool = True,
     vary_block_scales: bool = False,
+    nvfp4_4over6: NVFP44Over6Config | None = _UNSET,
 ):
     """Create properly quantized MoE tensors for testing.
 
@@ -830,11 +836,12 @@ def create_moe_tensors(
         nvfp4_quantize,
     )
     from flashinfer.quantization.nvfp4_quantization_utils import (
-        current_nvfp4_4over6_config,
+        resolve_nvfp4_4over6,
         make_nvfp4_global_scale,
     )
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
+    recipe = resolve_nvfp4_4over6(nvfp4_4over6)
     torch.manual_seed(seed)
     sf_vec_size = 16
 
@@ -847,7 +854,7 @@ def create_moe_tensors(
         x_global_scale = make_nvfp4_global_scale(
             x_bf16,
             per_token_activation=True,
-            nvfp4_4over6_config=current_nvfp4_4over6_config(),
+            nvfp4_4over6_config=recipe,
         )
         x_quantized, x_sf, x_per_token_scale = nvfp4_quantize(
             x_bf16,
@@ -856,6 +863,7 @@ def create_moe_tensors(
             sf_vec_size=sf_vec_size,
             backend="cuda",
             per_token_activation=True,
+            nvfp4_4over6=recipe,
         )
         x_ref = e2m1_and_ufp8sf_scale_to_float(
             x_quantized.cpu(),
@@ -873,6 +881,7 @@ def create_moe_tensors(
             global_scale=a1_gs,
             sf_vec_size=sf_vec_size,
             is_sf_swizzled_layout=False,
+            nvfp4_4over6=recipe,
         )
         x_ref = e2m1_and_ufp8sf_scale_to_float(
             x_quantized.cpu(),
@@ -915,7 +924,9 @@ def create_moe_tensors(
         if gated and interleave_gated_weights
         else w1_bf16
     )
-    w1_q, w1_sf_flat = _fp4_quantize_per_expert(w1_for_quant, w1_gs, sf_vec_size)
+    w1_q, w1_sf_flat = _fp4_quantize_per_expert(
+        w1_for_quant, w1_gs, sf_vec_size, nvfp4_4over6=recipe
+    )
     w1_weight_sf = convert_sf_to_mma_layout(
         w1_sf_flat,
         m=fc1_rows,
@@ -950,7 +961,11 @@ def create_moe_tensors(
     w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
     w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
     w2_q_flat, w2_sf_flat = fp4_quantize(
-        w2_flat, global_scale=w2_gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=True
+        w2_flat,
+        global_scale=w2_gs,
+        sf_vec_size=sf_vec_size,
+        is_sf_swizzled_layout=True,
+        nvfp4_4over6=recipe,
     )
     w2_q = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2)
     w2_weight_sf = convert_sf_to_mma_layout(
@@ -968,6 +983,10 @@ def create_moe_tensors(
         w2_alpha = torch.ones(num_local_experts, device=device, dtype=torch.float32)
 
     fc2_input_scale = torch.tensor([1.0], device=device, dtype=torch.float32)
+    if use_per_token_activation and nvfp4_4over6 is not _UNSET:
+        fc2_input_scale = make_nvfp4_global_scale(
+            x_bf16, per_token_activation=True, nvfp4_4over6_config=recipe
+        )
 
     return {
         "x": x_quantized,
