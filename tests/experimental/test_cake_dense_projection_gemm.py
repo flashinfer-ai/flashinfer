@@ -1266,8 +1266,9 @@ def test_router_units_policy(monkeypatch):
         assert cake_backend.router_units("kn", arch=arch, sm_count=sms, **fwd) is None
     # weight gradient at T = 16231 (508 K blocks), inside the token windows (test_router_wgrad_token_windows):
     # sm_100a hidden 4096 "H1x5p44" (44 head units, then 5 tail units per CTA pair), hidden 5120 "H0.5x3" on sm_100a /
-    # sm_103a (76 head + 228 tail units) and "H0.5x4" on sm_107a (108 head + 432 tail units); hidden 6144, sm_103a
-    # hidden 4096 and sm_107a hidden 4096: the deterministic plan
+    # sm_103a (76 head + 228 tail units) and "H0.5x4" on sm_107a (108 head + 432 tail units on 216 SMs; 106 + 424 on
+    # 212 and 104 + 416 on 208, ROUTER_RULES_BY_SM); hidden 6144, sm_103a hidden 4096 and sm_107a hidden 4096: the
+    # deterministic plan
     for arch in ("sm_100a", "sm_103a"):
         assert cake_backend.ROUTER_RULES[(arch, "nn_t", 6144, 256)] is None
         assert (
@@ -1296,21 +1297,36 @@ def test_router_units_policy(monkeypatch):
     assert cake_backend.router_partition(
         "nn_t", arch="sm_107a", sm_count=216, **wgrad5120
     ) == (540, 54, 20 * 508 // 2)
+    for sms, pairs in ((212, 106), (208, 104)):
+        assert cake_backend.router_partition(
+            "nn_t", arch="sm_107a", sm_count=sms, **wgrad5120
+        ) == (5 * pairs, pairs // 2, 20 * 508 // 2)
     for hidden in (4096, 6144):
         assert cake_backend.ROUTER_RULES[("sm_107a", "nn_t", hidden, 256)] is None
-        assert (
-            cake_backend.router_partition(
-                "nn_t", arch="sm_107a", sm_count=216, M=hidden, N=256, K=16231
+        for sms in (208, 212, 216):
+            assert (
+                cake_backend.router_partition(
+                    "nn_t", arch="sm_107a", sm_count=sms, M=hidden, N=256, K=16231
+                )
+                is None
             )
-            is None
-        )
-    # another SM count than the verdicts were measured on: the deterministic program
+    # the forward of the parts with a table of their own: the deterministic plan
+    for sms in (208, 212):
+        for hidden in (4096, 5120, 6144):
+            assert (
+                cake_backend.router_units(
+                    "kk", arch="sm_107a", sm_count=sms, M=16231, N=256, K=hidden
+                )
+                is None
+            )
+    # another SM count than the verdicts were measured on, without a table of its own: the deterministic program
     assert cake_backend.ROUTER_SM_COUNT == {
         "sm_100a": 152,
         "sm_103a": 152,
         "sm_107a": 216,
     }
-    for sms in (212, 217):
+    assert set(cake_backend.ROUTER_RULES_BY_SM) == ROUTER_BY_SM_PARTS
+    for sms in (207, 209, 211, 213, 215, 217):
         assert (
             cake_backend.router_units("nn_t", arch="sm_107a", sm_count=sms, **wgrad5120)
             is None
@@ -1405,30 +1421,55 @@ ROUTER_WGRAD_WINDOWS = {
     ("sm_103a", 5120): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
     ("sm_107a", 5120): ((16172, 16384, "H0.5x4"),),
 }
+# the parts with a router table of their own (ROUTER_RULES_BY_SM) and their weight-gradient windows,
+# (arch, sm_count, hidden) -> ((first, last, spec), ...)
+ROUTER_BY_SM_PARTS = {("sm_107a", 208), ("sm_107a", 212)}
+ROUTER_WGRAD_WINDOWS_BY_SM = {
+    ("sm_107a", 208, 5120): ((16172, 16384, "H0.5x4"),),
+    ("sm_107a", 212, 5120): ((16172, 16384, "H0.5x4"),),
+}
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_router_wgrad_token_windows(arch):
     """The weight gradient runs a partition only inside its token windows: at the first and the last token count of a
     window, not one token outside it, not above 32768 tokens, and around the few-token "waves" windows; a head/tail
-    window only on the measured SM count (:data:`ROUTER_SM_COUNT`, not one SM more or fewer), a "waves" window on
-    every SM count where :func:`router_waves` gives a partition.  The deterministic program at every other token
-    count and SM count and on every hidden size without a window."""
+    window only on the SM count of its table (:data:`ROUTER_SM_COUNT` for :data:`ROUTER_RULES`, the part's own for
+    :data:`ROUTER_RULES_BY_SM`; not one SM more or fewer), a "waves" window on every SM count where
+    :func:`router_waves` gives a partition.  The deterministic program at every other token count and SM count and
+    on every hidden size without a window."""
     measured = cake_backend.ROUTER_SM_COUNT[arch]
-    sm_counts = sorted({148, 208, 212, 216, measured - 1, measured, measured + 1})
+    own = {sms for a, sms in ROUTER_BY_SM_PARTS if a == arch}
+    assert {sms for a, sms in cake_backend.ROUTER_RULES_BY_SM if a == arch} == own
+    sm_counts = {148, 208, 212, 216, measured - 1, measured, measured + 1}
+    for sms in own:
+        sm_counts |= {sms - 1, sms, sms + 1}
     for hidden in (4096, 5120, 6144):
-        windows = ROUTER_WGRAD_WINDOWS.get((arch, hidden), ())
-        assert cake_backend.ROUTER_RULES[(arch, "nn_t", hidden, 256)] == (
-            windows or None
-        )
+        main = ROUTER_WGRAD_WINDOWS.get((arch, hidden), ())
+        assert cake_backend.ROUTER_RULES[(arch, "nn_t", hidden, 256)] == (main or None)
         tokens = {64, 128, 129, 192, 193, 224, 1024, 8192, 32768, 32769, 65536}
-        for first, last, _ in windows:
+        for first, last, _ in main + sum(
+            (ROUTER_WGRAD_WINDOWS_BY_SM.get((arch, sms, hidden), ()) for sms in own),
+            (),
+        ):
             tokens |= {first - 1, first, last, last + 1}
         m_pairs = hidden // 256
-        for T in sorted(t for t in tokens if t > 0):
-            spec = next((s for a, b, s in windows if a <= T <= b), None)
-            k_iters = -(-T // 32)
-            for sms in sm_counts:
+        for sms in sorted(sm_counts):
+            if sms in own:
+                windows = ROUTER_WGRAD_WINDOWS_BY_SM.get((arch, sms, hidden), ())
+                table = cake_backend.ROUTER_RULES_BY_SM[(arch, sms)]
+                assert table[(arch, "nn_t", hidden, 256)] == (windows or None)
+                assert cake_backend.router_rules(arch, sms) == (table, True)
+                holds = True
+            else:
+                windows, holds = main, sms == measured
+                assert cake_backend.router_rules(arch, sms) == (
+                    cake_backend.ROUTER_RULES,
+                    holds,
+                )
+            for T in sorted(t for t in tokens if t > 0):
+                spec = next((s for a, b, s in windows if a <= T <= b), None)
+                k_iters = -(-T // 32)
                 got = cake_backend.router_partition(
                     "nn_t", arch=arch, sm_count=sms, M=hidden, N=256, K=T
                 )
@@ -1439,7 +1480,7 @@ def test_router_wgrad_token_windows(arch):
                             units, m_pairs, 2, k_iters, sms
                         )
                     want = None if units is None else (units, 0, 0)
-                elif spec is None or sms != measured:
+                elif spec is None or not holds:
                     want = None
                 else:
                     want = cake_backend.router_partition_of(
@@ -1454,6 +1495,47 @@ def test_router_wgrad_token_windows(arch):
         assert cake_backend.router_partition(
             "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=64
         ) == (80, 0, 0)
+
+
+def test_router_per_sm_count_tables_decide_only_their_own_sm_count(monkeypatch):
+    """A part whose SM count has a table in :data:`ROUTER_RULES_BY_SM` takes that table only (every row of
+    :data:`ROUTER_RULES` of its architecture has an entry there, no ``"waves"`` window, closed windows); one SM more or
+    fewer runs the deterministic program, and the measured SM count of :data:`ROUTER_RULES` decides as before."""
+    for (arch, sms), table in cake_backend.ROUTER_RULES_BY_SM.items():
+        assert sms != cake_backend.ROUTER_SM_COUNT[arch]
+        assert set(table) == {k for k in cake_backend.ROUTER_RULES if k[0] == arch}
+        for (key_arch, layout, _hidden, _experts), rule in table.items():
+            assert key_arch == arch
+            if rule is None:
+                continue
+            assert layout == "nn_t" and isinstance(rule, tuple)
+            for first, last, spec in rule:
+                assert 1 <= first <= last <= 32768
+                assert cake_backend.router_head_tail(spec) is not None
+    wgrad = dict(M=6144, N=256, K=16231)
+    key = ("sm_107a", "nn_t", 6144, 256)
+    tables = dict(cake_backend.ROUTER_RULES_BY_SM)
+    tables[("sm_107a", 210)] = {key: ((16172, 16384, "H0.5x3"),)}
+    monkeypatch.setattr(cake_backend, "ROUTER_RULES_BY_SM", tables)
+    # 105 CTA pairs: 104 head units (a multiple of the two column tiles), 3 * 105 tail units rounded down to 314
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_107a", sm_count=210, **wgrad
+    ) == (104 + 314, 52, 24 * 508 // 2)
+    for sms in (209, 211, 216):
+        assert (
+            cake_backend.router_partition("nn_t", arch="sm_107a", sm_count=sms, **wgrad)
+            is None
+        )
+    # a row without an entry in the part's table runs the deterministic program, whatever ROUTER_RULES says
+    monkeypatch.setitem(cake_backend.ROUTER_RULES, key, "H0.5x4")
+    tables[("sm_107a", 210)] = {}
+    assert (
+        cake_backend.router_partition("nn_t", arch="sm_107a", sm_count=210, **wgrad)
+        is None
+    )
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_107a", sm_count=216, **wgrad
+    ) == (540, 54, 24 * 508 // 2)
 
 
 def test_k2_planner_plans_the_stream_k_router(monkeypatch):
@@ -1561,11 +1643,28 @@ def test_k2_planner_plans_the_head_tail_router(monkeypatch):
         G.t(), X5, torch.zeros(N, 5120), splits=3, **kw
     )
     assert plan.template == "router_fp32_gemm_atomic_nn_t" and plan.head_spans == 0
-    # fewer SMs: the deterministic program
+    # fewer SMs without a table of their own: the deterministic program
     plan, reason = cake_backend.plan_atomic_router(
-        G.t(), X5, torch.zeros(N, 5120), arch=arch, sm_count=212
+        G.t(), X5, torch.zeros(N, 5120), arch=arch, sm_count=214
     )
     assert plan is None and "planner" in reason
+    # 212 and 208 SMs: the tables of their own (ROUTER_RULES_BY_SM), hidden 5120 "H0.5x4" on 106 / 104 CTA pairs
+    for sms, pairs in ((212, 106), (208, 104)):
+        plan, _ = cake_backend.plan_atomic_router(
+            G.t(), X5, torch.zeros(N, 5120), arch=arch, sm_count=sms
+        )
+        assert plan.template == "router_fp32_gemm_atomic_nn_t_ht_c3_nreg"
+        assert (plan.units, plan.head_spans, plan.head_steps) == (
+            5 * pairs,
+            pairs // 2,
+            20 * 254,
+        )
+        assert plan.grid == (10 * pairs, 1, 1)
+        X4 = torch.zeros(T, 4096)
+        plan, reason = cake_backend.plan_atomic_router(
+            G.t(), X4, torch.zeros(N, 4096), arch=arch, sm_count=sms
+        )
+        assert plan is None and "planner" in reason
     # sm_100a / sm_103a, hidden 5120: three tail units per pair (76 head + 228 tail units on 152 SMs)
     for gb in ("sm_100a", "sm_103a"):
         monkeypatch.setitem(cake_jit.KERNELS, gb, {})
@@ -2349,9 +2448,12 @@ def router_rule(monkeypatch):
         else:
             key = (arch, "nn_t", int(B.shape[1]), int(A.shape[0]))
         monkeypatch.setitem(cake_backend.ROUTER_RULES, key, spec)
-        # a forced verdict applies on this device whatever its SM count
+        # a forced verdict applies on this device whatever its SM count (also on a part with a table of its own)
         sm_count = det_backend.device_facts(A.device).sm_count
         monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
+        tables = dict(cake_backend.ROUTER_RULES_BY_SM)
+        tables.pop((arch, sm_count), None)
+        monkeypatch.setattr(cake_backend, "ROUTER_RULES_BY_SM", tables)
         cake_backend.clear_convenience_caches()
 
     yield force
@@ -2582,8 +2684,9 @@ def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
         torch.cuda.synchronize()
         _k1_check(out, G.double().t() @ X.double(), f"{M} {N} {dt}")
         ran += 1
+    rules, _ = cake_backend.router_rules(arch, sm_count)
     for (rule_arch, layout, hidden, _experts), spec in sorted(
-        cake_backend.ROUTER_RULES.items(), key=lambda kv: kv[0]
+        rules.items(), key=lambda kv: kv[0]
     ):
         if rule_arch != arch:
             continue
@@ -2625,11 +2728,11 @@ def test_gpu_router_token_windows_run_at_their_edges():
     token outside the window, or on another SM count, it runs the deterministic launch."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
-    measured = sm_count == cake_backend.ROUTER_SM_COUNT.get(arch)
+    rules, measured = cake_backend.router_rules(arch, sm_count)
     atomic = cake_backend.PreparedAtomicRouterGemm
     ran = 0
     for (rule_arch, layout, hidden, _experts), rule in sorted(
-        cake_backend.ROUTER_RULES.items(), key=lambda kv: kv[0]
+        rules.items(), key=lambda kv: kv[0]
     ):
         if rule_arch != arch or layout != "nn_t" or not isinstance(rule, tuple):
             continue
