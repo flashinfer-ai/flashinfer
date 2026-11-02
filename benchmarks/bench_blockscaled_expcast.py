@@ -16,6 +16,8 @@ and direct error versus blockscaled exp2. Regular Q/K are cast to BF16.
 Compiler defaults: registers 192/96/32, threshold 2^-8, P offset +8,
 full-tile P publication, dtype-derived KV stages, scale 1/sqrt(D), no PDL.
 Timing: 5 warmups, 30 measured iterations, CUDA Graph, CUPTI/event fallback.
+Warm-cache policy for both backends (no L2 flush or tensor rotation).
+Each CSV row records the actual timing_backend and cold_l2_cache=False.
 TFLOP/s counts QK and PV GEMMs only (4*B*Hq*D*attended_pairs), accounting
 for bottom-right causal masking. Compilation/quantization/reference are excluded.
 Edit constants below; results go to profiling/expcast-b200/expcast_configs_gqa.csv. See EXPCAST.md.
@@ -47,7 +49,7 @@ from flashinfer.cute_dsl.attention.fmha.fmha_blockscaled import (
     BlackwellFusedMultiHeadBlockScaledAttentionForward,
 )
 from flashinfer.cute_dsl.attention.fmha.quantize import quantize_blockscaled_qk
-from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.testing import utils as timing_utils
 
 CASES = [
     (8192, 8192),
@@ -111,6 +113,27 @@ def scheduling_override(original_init, persistent):
         original_init(self, *args, **kwargs)
 
     return init
+
+
+def benchmark_time(run):
+    """Use one cache policy and record whether CUPTI fell back to graph events."""
+    # Observe the actual fallback instead of inferring it from installed packages.
+    with patch.object(
+        timing_utils,
+        "bench_gpu_time_with_cudagraph",
+        wraps=timing_utils.bench_gpu_time_with_cudagraph,
+    ) as graph_timer:
+        times = timing_utils.bench_gpu_time(
+            run,
+            dry_run_iters=WARMUP_ITERS,
+            repeat_iters=REPEAT_ITERS,
+            enable_cupti=True,
+            use_cuda_graph=True,
+            # The zero-argument callable captures tensors. Disable both flushing
+            # and rotation so CUPTI and graph fallback use the same cache policy.
+            cold_l2_cache=False,
+        )
+    return times, "cuda_graph" if graph_timer.called else "cupti"
 
 
 def main():
@@ -300,13 +323,7 @@ def main():
                                     .sqrt()
                                     .clamp_min(1e-12)
                                 ).item()
-                                times = bench_gpu_time(
-                                    run,
-                                    dry_run_iters=WARMUP_ITERS,
-                                    repeat_iters=REPEAT_ITERS,
-                                    enable_cupti=True,
-                                    use_cuda_graph=True,
-                                )
+                                times, timing_backend = benchmark_time(run)
                                 median_ms = statistics.median(times)
                                 pairs = q_len * kv_len
                                 if causal:
@@ -338,6 +355,8 @@ def main():
                                     "warmup_iters": WARMUP_ITERS,
                                     "repeat_iters": REPEAT_ITERS,
                                     "use_cuda_graph": True,
+                                    "timing_backend": timing_backend,
+                                    "cold_l2_cache": False,
                                     "accuracy_ref": "fp16_qk_pv",
                                     "out_rel_rmse": rel_rmse,
                                     "out_max_abs": out_max_abs,
