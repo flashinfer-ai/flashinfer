@@ -24,6 +24,7 @@ The selection rules were ported from the CUTLASS C++ implementation this port
 replaced and validated against it shape by shape.
 """
 
+import functools
 import math
 from typing import Dict, Optional, Tuple
 
@@ -131,7 +132,9 @@ def _sm100_streamk_substitute(m: int, n: int, k: int, num_sms: int) -> Tuple[int
     # (splits + 0.5) * m * n fp32 words; the ratio to one k-tile-wave's MMA work is
     # a constant of the machine (about 1/400 per byte-per-FLOP here).
     reduce_per_split = 4.0 * m * n / (clusters * 2.0 * 128 * 128 * 128 * 2.0) * 400.0
-    for s in range(2, 9):
+    # Slicing needs K to be whole k-tiles: a slice covers k // splits elements, and a
+    # K that is not a multiple of 128 would lose its tail (the plain tiles handle it).
+    for s in range(2, 9) if k % 128 == 0 else ():
         if ktiles % s != 0 or ktiles // s < 8:
             continue
         c = _tiles(units * s, clusters) * (ktiles // s) + reduce_per_split * (s + 0.5)
@@ -376,19 +379,41 @@ def _get_reduce_kernel(
 _PLAN_CACHE: Dict[Tuple, Tuple] = {}
 
 
-def _sm100_plan(
-    algo: int, m: int, n: int, k: int, num_sms: int, target: Tuple[int, int]
-) -> Tuple:
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+@functools.cache
+def _max_active_clusters(device_index: int, cluster_size: int) -> int:
+    """Clusters of ``cluster_size`` CTAs resident at once on device ``device_index``
+    (the persistent grid size), asked of the DSL's occupancy probe for that device.
+    Per device: the shared helper of ``flashinfer.cute_dsl.utils`` probes device 0 and
+    caches by cluster size alone.  Falls back to one CTA per SM when the probe fails
+    (a spawned process without a current driver context, say): the kernel's CTAs
+    never wait on one another, so a grid beyond the resident capacity only serializes."""
+    import cutlass.utils
+
+    try:
+        with torch.cuda.device(device_index):
+            return cutlass.utils.HardwareInfo(device_index).get_max_active_clusters(
+                cluster_size
+            )
+    except Exception:  # noqa: BLE001 -- the probe is best effort, the bound is safe
+        return max(
+            get_device_sm_count(torch.device("cuda", device_index)) // cluster_size, 1
+        )
+
+
+def _sm100_plan(algo: int, m: int, n: int, k: int, device: torch.device) -> Tuple:
     """(algo, splits, swizzle, raster_along_m, max active clusters) of a Blackwell
     call.  A pure function of the shape and the device, cached: the cost model is
-    most of the host cost of a call otherwise.  The occupancy query reads the
-    current CUDA device, so the caller runs this under ``target``'s device."""
-    key = ("sm100", target, algo, m, n, k, num_sms)
+    most of the host cost of a call otherwise."""
+    device_index = _device_index(device)
+    key = ("sm100", device_index, algo, m, n, k)
     plan = _PLAN_CACHE.get(key)
     if plan is not None:
         return plan
-    from ..cute_dsl.utils import get_max_active_clusters
-
+    num_sms = get_device_sm_count(device)
     if algo == 0:
         algo = sm100_pick_algo(m, n, k, num_sms)
     splits = 1
@@ -410,7 +435,7 @@ def _sm100_plan(
         splits,
         sm100_pick_swizzle(m, n, k),
         sm100_raster_along_m(m, n, mma_tiler, two_sm),
-        get_max_active_clusters(cluster[0] * cluster[1]),
+        _max_active_clusters(device_index, cluster[0] * cluster[1]),
     )
     _PLAN_CACHE[key] = plan
     return plan
@@ -421,19 +446,19 @@ def w8a16_fp8_gemm_workspace_bytes(
 ) -> int:
     """Scratch bytes a call needs (0 = none): the fp32 partials of a Blackwell
     split-K run (``splits * m * n * 4``) or of a Hopper split tail (one
-    ``tile_a x tile_w`` fp32 block per tail slice).  A pure function of the
-    shape and the device's SM count; ``algo`` as :func:`launch_w8a16_fp8_gemm`."""
+    ``tile_a x tile_w`` fp32 block per tail slice plus the tail tiles' arrival
+    counters, :func:`_sm90_workspace_layout`).  A pure function of the shape and
+    the device's SM count; ``algo`` as :func:`launch_w8a16_fp8_gemm`."""
     num_sms = get_device_sm_count(device)
     if get_compute_capability(device)[0] == 9:
         tile_algo, _body_items, tail_splits, tail_tiles, _group = _sm90_plan(
             algo, m, n, k, num_sms
         )
         tile_w, tile_a = _SM90_TILES[tile_algo]
-        return tail_tiles * tail_splits * tile_a * tile_w * 4
-    with torch.cuda.device(device):
-        _algo, splits, _swizzle, _raster, _clusters = _sm100_plan(
-            algo, m, n, k, num_sms, _target(device)
-        )
+        if tail_tiles == 0:
+            return 0
+        return _sm90_workspace_layout(tail_tiles, tail_splits, tile_a, tile_w)[2]
+    _algo, splits, _swizzle, _raster, _clusters = _sm100_plan(algo, m, n, k, device)
     return splits * m * n * 4 if splits > 1 else 0
 
 
@@ -454,9 +479,8 @@ def launch_w8a16_fp8_gemm(
     architecture's table (0 = the model's choice).  ``workspace``: a buffer of at
     least :func:`w8a16_fp8_gemm_workspace_bytes` bytes, or None to allocate when
     needed."""
-    # The DSL resolves its compile target and the occupancy query reads the
-    # current CUDA device: run the call under act's device, which need not be the
-    # current one.
+    # The DSL resolves its compile target from the current CUDA device: run the
+    # call under act's device, which need not be the current one.
     with torch.cuda.device(act.device):
         if _target(act.device)[0] == 9:
             _w8a16_fp8_gemm_sm90(act, weight, weight_scale, bias, out, algo, workspace)
@@ -480,14 +504,18 @@ def _w8a16_fp8_gemm_sm100(
     m, k = act.shape
     n = weight.shape[0]
     target = _target(act.device)
-    plan = _sm100_plan(algo, m, n, k, get_device_sm_count(act.device), target)
+    plan = _sm100_plan(algo, m, n, k, act.device)
     algo, splits, swizzle_size, raster_along_m, max_active_clusters = plan
     # Split-K: the 256x128 tile over `splits` K-slices writing fp32 partials, then
     # the reduce.  The GEMM's `out` is then the partials buffer and the kernel does
     # no scale / bias.
     partials = None
     if splits > 1:
-        partials = _scratch(workspace, (splits, m, n), torch.float32, act.device)
+        if workspace is None:
+            workspace = torch.empty(
+                splits * m * n * 4, dtype=torch.uint8, device=act.device
+            )
+        partials = _scratch(workspace, (splits, m, n), torch.float32)
     k_slice = k // splits
     has_bias = bias is not None
     act_ctype = cutlass.BFloat16 if act.dtype == torch.bfloat16 else cutlass.Float16
@@ -791,18 +819,19 @@ def _get_sm90_kernel(
 
 _SM90_TAIL_WORKSPACE_CAP = 64 << 20
 _SM90_TAIL_MAX_SPLITS = 16
-_TAIL_COUNTERS: Dict[torch.device, torch.Tensor] = {}
 
 
-def _sm90_tail_counters(device: torch.device, count: int) -> torch.Tensor:
-    """Per-device 64-bit arrival counters for the tail tiles.  They only grow (every
-    finished tile advances its counter by one ``TAIL_COUNTER_STRIDE``, so a counter is
-    always at a stride boundary between calls); grown when a call needs more."""
-    buf = _TAIL_COUNTERS.get(device)
-    if buf is None or buf.numel() < count:
-        buf = torch.zeros(max(count, 1024), dtype=torch.int64, device=device)
-        _TAIL_COUNTERS[device] = buf
-    return buf
+def _sm90_workspace_layout(
+    tail_tiles: int, tail_splits: int, tile_a: int, tile_w: int
+) -> Tuple[int, int, int]:
+    """(partials bytes, counters offset, total bytes) of a Hopper call with a tail:
+    the fp32 partial blocks first, then one 64-bit arrival counter per tail tile at
+    the next 16-byte boundary.  The counters belong to the call's workspace, not to
+    the device: two calls in flight on different streams (or two graphs replayed
+    together) with their own buffers never count on each other's tiles."""
+    partial_bytes = tail_tiles * tail_splits * tile_a * tile_w * 4
+    counters_offset = (partial_bytes + 15) // 16 * 16
+    return partial_bytes, counters_offset, counters_offset + tail_tiles * 8
 
 
 def sm90_tail_plan(
@@ -900,12 +929,24 @@ def _w8a16_fp8_gemm_sm90(
     tile_w, tile_a = _SM90_TILES[tile_algo]
     has_tail = tail_tiles > 0
     tail_blocks = tail_tiles * tail_splits
-    partials = (
-        _scratch(workspace, (tail_blocks, tile_a, tile_w), torch.float32, act.device)
-        if has_tail
-        else weight_scale  # any valid pointer when unused
-    )
-    counters = _sm90_tail_counters(act.device, tail_tiles) if has_tail else weight_scale
+    if has_tail:
+        _partial_bytes, counters_offset, total_bytes = _sm90_workspace_layout(
+            tail_tiles, tail_splits, tile_a, tile_w
+        )
+        if workspace is None:
+            workspace = torch.empty(total_bytes, dtype=torch.uint8, device=act.device)
+        partials = _scratch(workspace, (tail_blocks, tile_a, tile_w), torch.float32)
+        counters = _scratch(workspace, (tail_tiles,), torch.int64, counters_offset)
+        # The arrival counters start every call at zero (a stride boundary of the
+        # kernel's monotonic scheme): one memset on the call's stream, so the counters
+        # of a call are ordered with its kernel and a caller's reused buffer holds
+        # nothing the kernel trusts.
+        counters.zero_()
+    else:
+        # Unused by the kernel, which still builds its workspace TMA descriptor and
+        # declares 16- and 8-byte alignment: ``out`` is always 16-byte aligned (a
+        # scalar ``weight_scale`` view need only be 4-byte aligned).
+        partials = counters = out
     has_bias = bias is not None
     act_ctype = cutlass.BFloat16 if act.dtype == torch.bfloat16 else cutlass.Float16
     bias_tensor = bias if has_bias else weight_scale  # any valid pointer when unused
@@ -954,17 +995,16 @@ def _w8a16_fp8_gemm_sm90(
 
 
 def _scratch(
-    workspace: Optional[torch.Tensor], shape: Tuple, dtype: torch.dtype, device
+    workspace: torch.Tensor, shape: Tuple, dtype: torch.dtype, offset: int = 0
 ) -> torch.Tensor:
-    """A ``shape`` tensor of ``dtype`` carved from the caller's ``workspace`` (its
-    leading bytes; the caller sized it with :func:`w8a16_fp8_gemm_workspace_bytes`)
-    or freshly allocated when none was passed."""
+    """A ``shape`` tensor of ``dtype`` carved from ``workspace`` at byte ``offset``
+    (the caller sized the buffer with :func:`w8a16_fp8_gemm_workspace_bytes`)."""
     numel = 1
     for d in shape:
         numel *= d
-    if workspace is None:
-        return torch.empty(shape, dtype=dtype, device=device)
-    return workspace.view(torch.uint8).flatten()[: numel * 4].view(dtype).view(shape)
+    nbytes = numel * torch.empty((), dtype=dtype).element_size()
+    flat = workspace.view(torch.uint8).flatten()
+    return flat[offset : offset + nbytes].view(dtype).view(shape)
 
 
 def cute_gmem():

@@ -110,3 +110,86 @@ def test_launch_runs_under_the_activation_device(monkeypatch):
     act = FakeAct()
     dispatch.launch_w8a16_fp8_gemm(act, act, act, None, act, 0, None)
     assert seen == {"device": FakeAct.device, "entered": True, "inside": True}
+
+
+# ---------------------------------------------------------------------------
+# The Blackwell scheduler's multiply-and-shift division: the bound under which
+# it is used, mirrored in Python
+# ---------------------------------------------------------------------------
+
+
+def _magic(d: int, x_max: int, shift: int) -> int:
+    """``_fast_divmod_magic`` of the Blackwell kernel, in Python."""
+    magic = ((1 << shift) + d - 1) // d
+    return 0 if x_max * d >= (1 << shift) else magic
+
+
+def _divmod(x: int, d: int, magic: int, shift: int):
+    if magic == 0:
+        q = x // d
+    else:
+        q = (x * magic) >> shift
+    return q, x - q * d
+
+
+def test_fast_divmod_exact_inside_its_bound_and_disabled_outside():
+    pytest.importorskip("cutlass")
+    from flashinfer.gemm.kernels.cute_dsl.w8a16_fp8_gemm_sm100 import (
+        _FAST_DIVMOD_SHIFT as shift,
+    )
+
+    import random
+
+    rng = random.Random(0)
+    for _ in range(20000):
+        d = rng.randint(1, 1 << 20)
+        x_max = rng.randint(1, (1 << shift) // d)  # x_max * d < 2^shift
+        magic = _magic(d, x_max, shift)
+        assert magic != 0
+        for x in (0, 1, d - 1, d, d + 1, x_max - 1, rng.randint(0, x_max - 1)):
+            assert _divmod(x, d, magic, shift) == divmod(x, d), (x, d)
+    # The admitted bounds reach past the proven domain (a 1sm128x128 problem with
+    # 134403328 weight rows has 1050026 cluster tiles): there the fast path is
+    # disabled and the exact division runs.
+    d, x_max = 1050026, 2 * 1050026
+    assert _magic(d, x_max, shift) == 0
+    bad = ((1 << shift) + d - 1) // d
+    assert _divmod(d - 1, d, bad, shift) != divmod(d - 1, d)  # the hazard it avoids
+    assert _divmod(d - 1, d, 0, shift) == divmod(d - 1, d)
+
+
+def test_max_active_clusters_is_probed_per_device(monkeypatch):
+    """Priming the occupancy answer on device 0 must not serve device 1: the probe
+    is constructed for, and cached by, the device asked about."""
+    cutlass_utils = pytest.importorskip("cutlass.utils")
+    constructed = []
+
+    class FakeInfo:
+        def __init__(self, device_id):
+            constructed.append(device_id)
+            self.device_id = device_id
+
+        def get_max_active_clusters(self, cluster_size):
+            return (100 + self.device_id) // cluster_size
+
+    class FakeDeviceCtx:
+        def __init__(self, device):
+            pass
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(cutlass_utils, "HardwareInfo", FakeInfo)
+    monkeypatch.setattr(torch.cuda, "device", FakeDeviceCtx)
+    dispatch._max_active_clusters.cache_clear()
+    try:
+        assert dispatch._max_active_clusters(0, 2) == 50
+        assert dispatch._max_active_clusters(0, 2) == 50  # cached
+        assert dispatch._max_active_clusters(1, 2) == 50  # (100 + 1) // 2
+        assert dispatch._max_active_clusters(1, 1) == 101
+        assert constructed == [0, 1, 1]
+    finally:
+        dispatch._max_active_clusters.cache_clear()

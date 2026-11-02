@@ -77,7 +77,8 @@ class W8A16SplitKReduce:
         scale = cute.make_tensor(scale_ptr, cute.make_layout((1,)))
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        idx = bidx * _THREADS + tidx
+        # 64-bit: the admitted outputs reach 2^40 elements, past a 32-bit index.
+        idx = bidx.to(cutlass.Int64) * _THREADS + tidx
         if idx < mn_vecs:
             acc = partials[(None, idx, 0)].load()
             for s in cutlass.range_constexpr(1, self.splits):

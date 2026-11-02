@@ -121,7 +121,8 @@ def _w8a16_fp8_gemm_impl_fake(
 @functools.cache
 def _workspace_bytes(m: int, n: int, k: int, device_index: int, algo: int) -> int:
     """Bytes of workspace this problem needs on this device (0 = none): the fp32
-    partials of a split-K run, when the variant (forced or chosen) splits K."""
+    partials of a split-K run (and, on Hopper, the split tiles' arrival
+    counters), when the variant (forced or chosen) splits K."""
     device = torch.device("cuda", device_index)
     _check_arch(device)
     return _dispatch.w8a16_fp8_gemm_workspace_bytes(m, n, k, device, algo)

@@ -43,23 +43,36 @@ from .w8a16_fp8_gemm_sm100_utils import (
 
 
 _FAST_DIVMOD_SHIFT = 40
+# x * d below this bound makes the multiply-and-shift exact (see _fast_divmod_magic).
+_FAST_DIVMOD_LIMIT = 1 << _FAST_DIVMOD_SHIFT
 
 
 @cute.jit
-def _fast_divmod_magic(d: cutlass.Int32) -> cutlass.Int64:
-    """ceil(2^40 / d): with it, x // d == (x * magic) >> 40 exactly for every
-    0 <= x < 2^20 and 1 <= d < 2^20 (x * d < 2^40 bounds the rounding error below one
-    quotient step).  Work items and cluster counts are far below 2^20."""
+def _fast_divmod_magic(d: cutlass.Int32, x_max: cutlass.Int32) -> cutlass.Int64:
+    """The multiplier for ``_fast_divmod`` by ``d`` over dividends below ``x_max``:
+    ceil(2^40 / d), with which x // d == (x * magic) >> 40 exactly whenever
+    x * d < 2^40 (the rounding error is x * (magic * d - 2^40) / (d * 2^40), below
+    one quotient step under that bound).  0 when the bound does not hold for every
+    dividend: ``_fast_divmod`` then divides exactly.  Work items and cluster counts
+    are far below 2^20 on any real problem; the admitted bounds reach beyond."""
     d64 = d.to(cutlass.Int64)
-    return (cutlass.Int64(1 << _FAST_DIVMOD_SHIFT) + d64 - 1) // d64
+    magic = (cutlass.Int64(_FAST_DIVMOD_LIMIT) + d64 - 1) // d64
+    if x_max.to(cutlass.Int64) * d64 >= _FAST_DIVMOD_LIMIT:
+        magic = cutlass.Int64(0)
+    return magic
 
 
 @cute.jit
 def _fast_divmod(x: cutlass.Int32, d: cutlass.Int32, magic: cutlass.Int64):
     """(x // d, x % d) by a 64-bit multiply and shift instead of an integer division
     (~40 dependent instructions each on the GPU; the tile derivation runs it on every
-    warp at kernel start and in the scheduler per tile)."""
-    q = ((x.to(cutlass.Int64) * magic) >> _FAST_DIVMOD_SHIFT).to(cutlass.Int32)
+    warp at kernel start and in the scheduler per tile).  ``magic == 0`` (the bound of
+    ``_fast_divmod_magic`` not met) selects the exact division."""
+    q = cutlass.Int32(0)
+    if magic == 0:
+        q = x // d
+    else:
+        q = ((x.to(cutlass.Int64) * magic) >> _FAST_DIVMOD_SHIFT).to(cutlass.Int32)
     return q, x - q * d
 
 
@@ -644,9 +657,11 @@ class Sm100W8A16Fp8GemmKernel:
 
         # Magic multipliers for the two dynamic divisors of the tile derivation (see
         # _fast_divmod): computed once per launch, on the host.
-        _, _, major_clusters, _, total_clusters, _ = self._grid_dims(c)
-        fd_total = _fast_divmod_magic(total_clusters)
-        fd_major = _fast_divmod_magic(major_clusters)
+        _, _, major_clusters, _, total_clusters, total_work = self._grid_dims(c)
+        # Dividends: the work item index (below total_work) and the cluster tile
+        # index within a slice (below total_clusters).
+        fd_total = _fast_divmod_magic(total_clusters, total_work)
+        fd_major = _fast_divmod_magic(major_clusters, total_clusters)
         self.kernel(
             tiled_mma,
             tma_atom_a,

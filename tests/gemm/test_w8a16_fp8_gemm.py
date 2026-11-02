@@ -859,3 +859,136 @@ def test_w8a16_fp8_gemm_caller_workspace_reuse(algo, dtype):
         assert torch.isnan(obuf[:pad_el]).all() and torch.isnan(obuf[-pad_el:]).all()
         _check_against_reference(out, act, w_fp8, sc, bias, (algo, dtype, mi))
     assert (buf[:pad] == 0x7F).all() and (buf[-pad:] == 0x7F).all()
+
+
+# ---------------------------------------------------------------------------
+# K tails under a forced stream-K, concurrent streams with their own workspaces,
+# graph replay, and a minimally aligned scalar scale
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "algo", [a for a in _ALGOS_SM100 + _ALGOS_SM90 if "streamk" in a]
+)
+@pytest.mark.parametrize("m,n", [(1, 128), (300, 1024), (77, 136)])
+def test_w8a16_fp8_gemm_streamk_medium_k_tail(algo, m, n):
+    """A forced stream-K variant on a K that is not a multiple of the tile depth
+    (2064 = 16 x 128 + 16 = 32 x 64 + 16): the launcher's split substitute must not
+    slice such a K, and no decomposition may drop the 16-element tail.  The weight is
+    zero except on the tail columns, so every output equals the tail's dot product."""
+    _skip_unless_arch(algo)
+    dev = torch.device("cuda")
+    k = 2064
+    act = torch.ones(m, k, device=dev, dtype=torch.bfloat16)
+    w = torch.zeros(n, k, device=dev)
+    w[:, 2048:] = 1.0
+    w_fp8 = w.to(torch.float8_e4m3fn)
+    scale = torch.ones(1, device=dev)
+    out = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
+    assert torch.equal(out, torch.full((m, n), 16.0, device=dev, dtype=out.dtype))
+    # And a random problem of the same shape against the reference.
+    torch.manual_seed(0)
+    act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    out = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
+    _check_against_reference(out, act, w_fp8, scale, None, (algo, m, n, k))
+
+
+def _tail_algo_and_shape(dev):
+    """A forced variant and a shape on which this architecture splits K and needs a
+    workspace (Hopper: a stream-K tail; Blackwell: split-K)."""
+    algo = {9: "128x256_streamk", 10: "2sm256x128_splitk"}[_major()]
+    return algo, _shape_needing_workspace(algo, dev)
+
+
+def test_w8a16_fp8_gemm_two_streams_own_workspaces():
+    """Two streams, each running the same split problem on its own workspace and
+    output, interleaved and unsynchronized until the end: the slices of a tile may
+    only ever count arrivals of their own call (the counters live in the call's
+    workspace), so neither stream can release the other's tiles early."""
+    dev = torch.device("cuda")
+    algo, (m, n, k) = _tail_algo_and_shape(dev)
+    torch.manual_seed(0)
+    act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    ref = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
+    need = w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
+    assert need > 0
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    wss = [torch.full((need,), 0x7F, dtype=torch.uint8, device=dev) for _ in streams]
+    outs = [[] for _ in streams]
+    rounds = 24
+    for s in streams:
+        s.wait_stream(torch.cuda.current_stream())
+    for _ in range(rounds):
+        for i, s in enumerate(streams):
+            with torch.cuda.stream(s):
+                o = torch.empty(m, n, device=dev, dtype=act.dtype)
+                w8a16_fp8_gemm(act, w_fp8, scale, algo=algo, out=o, workspace=wss[i])
+                outs[i].append(o)
+    torch.cuda.synchronize()
+    for i in range(len(streams)):
+        for r, o in enumerate(outs[i]):
+            assert torch.equal(o, ref), (algo, i, r)
+
+
+def test_w8a16_fp8_gemm_graph_replay_two_graphs():
+    """One split call captured into a CUDA graph per stream, each with its own
+    workspace, the two graphs replayed repeatedly and interleaved on their streams.
+    Replay must reproduce the result every time: whatever the kernel keeps in the
+    workspace (partials, arrival counters) is re-established inside the graph."""
+    dev = torch.device("cuda")
+    algo, (m, n, k) = _tail_algo_and_shape(dev)
+    torch.manual_seed(0)
+    act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    ref = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
+    need = w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
+    graphs, outs, streams = [], [], []
+    for _ in range(2):
+        s = torch.cuda.Stream()
+        ws = torch.full((need,), 0x7F, dtype=torch.uint8, device=dev)
+        out = torch.empty(m, n, device=dev, dtype=act.dtype)
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            # Warm-up on the side stream (compiles, allocates), then capture.
+            w8a16_fp8_gemm(act, w_fp8, scale, algo=algo, out=out, workspace=ws)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, stream=s):
+                w8a16_fp8_gemm(act, w_fp8, scale, algo=algo, out=out, workspace=ws)
+        graphs.append(g)
+        outs.append(out)
+        streams.append(s)
+    torch.cuda.synchronize()
+    for rep in range(12):
+        for out in outs:
+            out.fill_(float("nan"))
+        for g, s in zip(graphs, streams, strict=True):
+            with torch.cuda.stream(s):
+                g.replay()
+        torch.cuda.synchronize()
+        for i, out in enumerate(outs):
+            assert torch.equal(out, ref), (algo, rep, i)
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_w8a16_fp8_gemm_scalar_scale_minimally_aligned(split):
+    """A legal scale is any one-element fp32 view, so it may be only 4-byte aligned
+    (an odd element of a larger buffer); nothing in the launch may declare more for
+    it, with or without a workspace in use."""
+    dev = torch.device("cuda")
+    if split:
+        algo, (m, n, k) = _tail_algo_and_shape(dev)
+    else:
+        algo, (m, n, k) = {9: "128x256", 10: "2sm256x128"}[_major()], (256, 1024, 2048)
+    torch.manual_seed(0)
+    act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
+    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+    ref = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
+    buf = torch.zeros(3, device=dev, dtype=torch.float32)
+    buf[1] = scale[0]
+    for view in (buf[1:2], buf[1]):
+        assert view.data_ptr() % 16 == 4
+        out = w8a16_fp8_gemm(act, w_fp8, view, algo=algo)
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref)
