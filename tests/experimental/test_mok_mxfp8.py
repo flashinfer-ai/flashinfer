@@ -177,6 +177,12 @@ def test_weight_quantizer_paths_are_bitwise(monkeypatch, experts_per_chunk):
             torch.equal(a.view(torch.uint8), b.view(torch.uint8))
             for a, b in zip(single, quantize(matrix), strict=True)
         )
+    # One layout at a time runs the per-layout kernel; both run the dual kernel.
+    both = mxfp8.mxfp8_quantize(gate)
+    normal = mxfp8.mxfp8_quantize(gate, return_transposed=False)[:2]
+    transposed = mxfp8.mxfp8_quantize(gate, return_normal=False)[2:]
+    for a, b in zip(both, normal + transposed, strict=True):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
     fused = quantize_mok_mxfp8_weights(gate, up, down)
     monkeypatch.setattr(mxfp8, "triton", None)
     monkeypatch.setattr(mxfp8, "_CHUNK_BYTES", experts_per_chunk * 256 * 512 * 4)

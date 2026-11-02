@@ -74,8 +74,9 @@ backward takes `(data, scales, data_t, scales_t)` for gate and up and the
 transposed `(data_t, scales_t)` pair for down. `quantize_mok_mxfp8_weights`
 produces both sets (E4M3 data, UE8M0 scales for 32-element blocks along the
 reduction dimension, tensor-core scale tiles `[E * rows / 128, cols / 128, 32,
-16]`). On CUDA tensors it launches one fused Triton kernel per operand
-layout, without host synchronization, so it can be captured in a CUDA Graph;
+16]`). On CUDA tensors it launches one fused Triton kernel per operand that
+reads the BF16 weights once and writes both layouts, without host
+synchronization, so it can be captured in a CUDA Graph;
 without Triton, PyTorch operations produce the same bytes. MXFP8 weight
 gradients are BF16 (or the FP32 accumulators).
 
