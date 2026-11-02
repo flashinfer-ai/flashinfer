@@ -1043,3 +1043,41 @@ def test_sm120_sequence_programs_share_one_text_per_atom_variant():
         if p.suffix == ".cu" and f"{generated}/{p.name}" not in referenced
     )
     assert not orphans, f"generated units not referenced by the catalog: {orphans}"
+
+
+def test_sm120_every_program_record_is_launched_by_a_route():
+    """Host-only: every program record is launched by a route.
+
+    A default route's sequence or stage program, a device route's sequence, or
+    a scheduler module (not standalone) that such a sequence starts with; so a
+    device route that leaves the catalog leaves no program record behind, and
+    ``policy.threads.metadata_dyn`` is set exactly when a ``dyn`` route ships.
+    """
+    catalog = _runtime._catalog()
+    programs = catalog["programs"]
+    launched = set()
+    for record in catalog["routes"].values():
+        if record["sequence"]:
+            launched.add(record["sequence"])
+        launched.update(name for _stage, name in record.get("stages") or ())
+    launched.update(record["sequence"] for record in catalog["device_routes"].values())
+    assert launched <= set(programs), sorted(launched - set(programs))
+    first = {
+        programs[name]["sources"][0]
+        for name in launched
+        if programs[name]["kind"] == "sequence"
+    }
+    schedulers = {
+        name
+        for name, record in programs.items()
+        if record["kind"] == "module"
+        and record.get("standalone") is False
+        and record["sources"][0] in first
+    }
+    left = sorted(set(programs) - launched - schedulers)
+    assert not left, f"program records no route launches: {left}"
+    dyn = any(
+        _runtime.route_schedule(record)["kind"] == "dyn"
+        for record in catalog["device_routes"].values()
+    )
+    assert ("metadata_dyn" in catalog["policy"]["threads"]) == dyn
