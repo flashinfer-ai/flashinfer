@@ -4150,6 +4150,9 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c10_
             float max_here = -CUDART_INF_F;
             #pragma unroll
             for (int j_1 = 0; j_1 < 8; j_1++) {
+                // With -use_fast_math this divide is one MUFU.RCP per tile and one FMUL per
+                // element, bitwise equal to a hoisted reciprocal. Here the RCP issues after
+                // the tile loads instead of waiting on the temperature load before them.
                 float scaled = cache[tile_1 * 8 + j_1] / temperature;
                 cache[tile_1 * 8 + j_1] = scaled;
                 max_here = max_noftz(max_here, scaled);
@@ -5007,6 +5010,9 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c12_
             float max_here = -CUDART_INF_F;
             #pragma unroll
             for (int j_1 = 0; j_1 < 8; j_1++) {
+                // With -use_fast_math this divide is one MUFU.RCP per tile and one FMUL per
+                // element, bitwise equal to a hoisted reciprocal. Here the RCP issues after
+                // the tile loads instead of waiting on the temperature load before them.
                 float scaled = cache[tile_1 * 8 + j_1] / temperature;
                 cache[tile_1 * 8 + j_1] = scaled;
                 max_here = max_noftz(max_here, scaled);
