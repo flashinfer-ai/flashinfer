@@ -19,6 +19,7 @@ limitations under the License.
 import ast
 import inspect
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -520,16 +521,55 @@ def test_launch_epoch_guard_prevents_grid_counter_overflow(grid_ctas) -> None:
         _validate_launch_epoch(_max_launch_epoch(grid_ctas) + 1, grid_ctas)
 
 
-def test_cute_dsl_grid_and_epoch_are_independent_of_the_cuda_grid() -> None:
+@pytest.mark.parametrize(
+    "arch,clusters", (("sm_100a", 72), ("sm_103a", 72), ("sm_107a", 104))
+)
+def test_cute_dsl_grid_matches_each_program_schedule(arch, clusters) -> None:
     from flashinfer.experimental.cake_mxfp8_megamoe_ep16 import cute_dsl
 
-    # The CuTe-DSL programs keep their own 144-CTA grid on every architecture.
-    assert cute_dsl._FUSED_GRID == (144, 1, 1)
-    assert cute_dsl.FUSED_GRID_CTAS == 144
-    assert _max_launch_epoch(cute_dsl.FUSED_GRID_CTAS) == 14913079
+    assert set(cute_dsl.FUSED_GRID_CTAS) == {a for a, _ in _jit._ARCH_FLAGS.values()}
+    grid_ctas = cute_dsl.FUSED_GRID_CTAS[arch]
+    assert grid_ctas == 2 * clusters
+    assert _max_launch_epoch(grid_ctas) == {144: 14913079, 208: 10324439}[grid_ctas]
+    # Each fused program fixes its static schedule: the FC work items and the
+    # weight prefetch stride by the cluster count of the grid it is launched on.
+    for role in ("fused", "fused_return_all_cta"):
+        text = _jit.cute_dsl_source(role, arch).read_text()
+        strides = re.findall(r"\(\((?:prefetch_)?item(?:_\d+)? \* (\d+)\) \+ ", text)
+        assert len(strides) == 6 and set(strides) == {str(clusters)}
+    # The CuTe-DSL grid follows its programs, not the CUDA module's define.
     source = Path(cute_dsl.__file__).read_text()
     assert "fused_grid_ctas" not in source
     assert "CAKE_MEGAMOE_GRID_CLUSTERS" not in source
+
+
+@pytest.mark.parametrize("backend", ("cuda", "cute_dsl"))
+@pytest.mark.parametrize("capability,grid_ctas", (((10, 3), 144), ((10, 7), 208)))
+def test_session_refuses_a_device_with_fewer_sms_than_the_fused_grid(
+    monkeypatch, backend, capability, grid_ctas
+) -> None:
+    def all_gather_object(output, selected, *, group):
+        output[:] = [selected] * 16
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 16)
+    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=grid_ctas - 1),
+    )
+    monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a 10.7a")
+
+    # Both backends need every CTA of the cooperative grid resident, one per SM.
+    with pytest.raises(RuntimeError, match=f"needs {grid_ctas} co-resident CTAs"):
+        _CakeMxfp8MegaMoeEp16Session(
+            None, None, process_group=object(), backend=backend
+        )
 
 
 def test_interleave_gate_up_16() -> None:
