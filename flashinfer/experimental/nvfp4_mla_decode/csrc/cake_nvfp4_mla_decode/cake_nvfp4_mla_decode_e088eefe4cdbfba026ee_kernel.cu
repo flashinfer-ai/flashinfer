@@ -40,134 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 480
-#define TMEM_TMEM_ACC_OFFSET 0
-#define TMEM_TMEM_SFA0_OFFSET 320
-#define TMEM_TMEM_SFA1_OFFSET 328
-#define TMEM_TMEM_SFA2_OFFSET 336
-#define TMEM_TMEM_SFA3_OFFSET 344
-#define TMEM_TMEM_SFB0_OFFSET 352
-#define TMEM_TMEM_SFB1_OFFSET 360
-#define TMEM_TMEM_SFB2_OFFSET 368
-#define TMEM_TMEM_SFB3_OFFSET 376
-#define TMEM_TMEM_SFB4_OFFSET 384
-#define TMEM_TMEM_SFB5_OFFSET 392
-#define TMEM_TMEM_SFB6_OFFSET 400
-#define TMEM_TMEM_SFB7_OFFSET 408
-#define TMEM_TMEM_Q_OFFSET 416
-#define NUM_RAW_PIPE_STAGES 3
-#define NUM_V_PIPE_STAGES 2
-#define NUM_P_PIPE_STAGES 2
-#define NUM_S_PIPE_STAGES 2
-#define NUM_SF_PIPE_STAGES 2
-#define SMEM_SMEM_Q0_OFF 1024
-#define SMEM_SMEM_Q0_STAGE_BYTES 4096
-#define SMEM_SMEM_Q0_STRIDE 4096
-#define SMEM_SMEM_Q1_OFF 5120
-#define SMEM_SMEM_Q1_STAGE_BYTES 4096
-#define SMEM_SMEM_Q1_STRIDE 4096
-#define SMEM_SMEM_Q2_OFF 9216
-#define SMEM_SMEM_Q2_STAGE_BYTES 4096
-#define SMEM_SMEM_Q2_STRIDE 4096
-#define SMEM_SMEM_Q3_OFF 13312
-#define SMEM_SMEM_Q3_STAGE_BYTES 4096
-#define SMEM_SMEM_Q3_STRIDE 4096
-#define SMEM_SMEM_QS_OFF 17408
-#define SMEM_SMEM_QS_STAGE_BYTES 2048
-#define SMEM_SMEM_QS_STRIDE 2048
-#define SMEM_SMEM_K0H0_OFF 19456
-#define SMEM_SMEM_K0H0_STAGE_BYTES 2048
-#define SMEM_SMEM_K0H0_STRIDE 28672
-#define SMEM_SMEM_K1H0_OFF 23552
-#define SMEM_SMEM_K1H0_STAGE_BYTES 2048
-#define SMEM_SMEM_K1H0_STRIDE 28672
-#define SMEM_SMEM_K2H0_OFF 27648
-#define SMEM_SMEM_K2H0_STAGE_BYTES 2048
-#define SMEM_SMEM_K2H0_STRIDE 28672
-#define SMEM_SMEM_K3H0_OFF 31744
-#define SMEM_SMEM_K3H0_STAGE_BYTES 2048
-#define SMEM_SMEM_K3H0_STRIDE 28672
-#define SMEM_SMEM_K0H1_OFF 21504
-#define SMEM_SMEM_K0H1_STAGE_BYTES 2048
-#define SMEM_SMEM_K0H1_STRIDE 28672
-#define SMEM_SMEM_K1H1_OFF 25600
-#define SMEM_SMEM_K1H1_STAGE_BYTES 2048
-#define SMEM_SMEM_K1H1_STRIDE 28672
-#define SMEM_SMEM_K2H1_OFF 29696
-#define SMEM_SMEM_K2H1_STAGE_BYTES 2048
-#define SMEM_SMEM_K2H1_STRIDE 28672
-#define SMEM_SMEM_K3H1_OFF 33792
-#define SMEM_SMEM_K3H1_STAGE_BYTES 2048
-#define SMEM_SMEM_K3H1_STRIDE 28672
-#define SMEM_SMEM_KQ0H0_OFF 19456
-#define SMEM_SMEM_KQ0H0_STAGE_BYTES 4096
-#define SMEM_SMEM_KQ0H0_STRIDE 28672
-#define SMEM_SMEM_KQ1H0_OFF 23552
-#define SMEM_SMEM_KQ1H0_STAGE_BYTES 4096
-#define SMEM_SMEM_KQ1H0_STRIDE 28672
-#define SMEM_SMEM_KQ2H0_OFF 27648
-#define SMEM_SMEM_KQ2H0_STAGE_BYTES 4096
-#define SMEM_SMEM_KQ2H0_STRIDE 28672
-#define SMEM_SMEM_KQ3H0_OFF 31744
-#define SMEM_SMEM_KQ3H0_STAGE_BYTES 4096
-#define SMEM_SMEM_KQ3H0_STRIDE 28672
-#define SMEM_SMEM_KQ0H1_OFF 21504
-#define SMEM_SMEM_KQ0H1_STAGE_BYTES 4096
-#define SMEM_SMEM_KQ0H1_STRIDE 28672
-#define SMEM_SMEM_KQ1H1_OFF 25600
-#define SMEM_SMEM_KQ1H1_STAGE_BYTES 4096
-#define SMEM_SMEM_KQ1H1_STRIDE 28672
-#define SMEM_SMEM_KQ2H1_OFF 29696
-#define SMEM_SMEM_KQ2H1_STAGE_BYTES 4096
-#define SMEM_SMEM_KQ2H1_STRIDE 28672
-#define SMEM_SMEM_KQ3H1_OFF 33792
-#define SMEM_SMEM_KQ3H1_STAGE_BYTES 4096
-#define SMEM_SMEM_KQ3H1_STRIDE 28672
-#define SMEM_SMEM_KO0H0_OFF 35840
-#define SMEM_SMEM_KO0H0_STAGE_BYTES 2048
-#define SMEM_SMEM_KO0H0_STRIDE 28672
-#define SMEM_SMEM_KO1H0_OFF 39936
-#define SMEM_SMEM_KO1H0_STAGE_BYTES 2048
-#define SMEM_SMEM_KO1H0_STRIDE 28672
-#define SMEM_SMEM_KO0H1_OFF 37888
-#define SMEM_SMEM_KO0H1_STAGE_BYTES 2048
-#define SMEM_SMEM_KO0H1_STRIDE 28672
-#define SMEM_SMEM_KO1H1_OFF 41984
-#define SMEM_SMEM_KO1H1_STAGE_BYTES 2048
-#define SMEM_SMEM_KO1H1_STRIDE 28672
-#define SMEM_SMEM_KS_OFF 44032
-#define SMEM_SMEM_KS_STAGE_BYTES 4096
-#define SMEM_SMEM_KS_STRIDE 28672
-#define SMEM_SMEM_RAW_FLAT_OFF 19456
-#define SMEM_SMEM_RAW_FLAT_STAGE_BYTES 86016
-#define SMEM_SMEM_RAW_FLAT_STRIDE 86016
-#define SMEM_SMEM_V0_OFF 105472
-#define SMEM_SMEM_V0_STAGE_BYTES 16384
-#define SMEM_SMEM_V0_STRIDE 32768
-#define SMEM_SMEM_V1_OFF 121856
-#define SMEM_SMEM_V1_STAGE_BYTES 16384
-#define SMEM_SMEM_V1_STRIDE 32768
-#define SMEM_SMEM_P_OFF 171008
-#define SMEM_SMEM_P_STAGE_BYTES 8192
-#define SMEM_SMEM_P_STRIDE 8192
-#define SMEM_ROW_STATE_OFF 187392
-#define SMEM_ROW_STATE_STAGE_BYTES 512
-#define SMEM_ROW_STATE_STRIDE 512
-#define SMEM_SMEM_XCHG_MAX_OFF 187904
-#define SMEM_SMEM_XCHG_MAX_STAGE_BYTES 512
-#define SMEM_SMEM_XCHG_MAX_STRIDE 512
-#define SMEM_SMEM_XCHG_SUM_OFF 188416
-#define SMEM_SMEM_XCHG_SUM_STAGE_BYTES 512
-#define SMEM_SMEM_XCHG_SUM_STRIDE 512
-#define SMEM_SMEM_PAGES_OFF 188928
-#define SMEM_SMEM_PAGES_STAGE_BYTES 128
-#define SMEM_SMEM_PAGES_STRIDE 128
-#define SMEM_SMEM_EPI_OFF 189440
-#define SMEM_SMEM_EPI_STAGE_BYTES 32768
-#define SMEM_SMEM_EPI_STRIDE 32768
-#define SMEM_TOTAL 222208
-#define THREADS 512
 #define SKIP_XFORM 0
 #define LAZY_RESCALE 1
 #define IDENTITY_PAGES 0
@@ -846,7 +718,7 @@ kernel_cake_nvfp4_mla_decode_e088eefe4cdbfba026ee(const __grid_constant__ CUtens
                             if (!(_thresh_mask_2 & (1u << 30))) sv0[30] = -CUDART_INF_F;
                             if (!(_thresh_mask_2 & (1u << 31))) sv0[31] = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                            float2 _reg_reduce_max2_5 = {-CAKE_INF, -CAKE_INF};
+                            float2 _reg_reduce_max2_5 = {-CUDART_INF_F, -CUDART_INF_F};
                             _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(sv0[0], sv0[1]));
                             _reg_reduce_max2_5.y = max_noftz(_reg_reduce_max2_5.y, max_noftz(sv0[2], sv0[3]));
                             _reg_reduce_max2_5.x = max_noftz(_reg_reduce_max2_5.x, max_noftz(sv0[4], sv0[5]));
@@ -929,7 +801,7 @@ kernel_cake_nvfp4_mla_decode_e088eefe4cdbfba026ee(const __grid_constant__ CUtens
                             if (!(_thresh_mask_6 & (1u << 29))) sv1[29] = -CUDART_INF_F;
                             if (!(_thresh_mask_6 & (1u << 30))) sv1[30] = -CUDART_INF_F;
                             if (!(_thresh_mask_6 & (1u << 31))) sv1[31] = -CUDART_INF_F;
-                            float2 _reg_reduce_max2_9 = {-CAKE_INF, -CAKE_INF};
+                            float2 _reg_reduce_max2_9 = {-CUDART_INF_F, -CUDART_INF_F};
                             _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv1[0], sv1[1]));
                             _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(sv1[2], sv1[3]));
                             _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv1[4], sv1[5]));
@@ -986,7 +858,7 @@ kernel_cake_nvfp4_mla_decode_e088eefe4cdbfba026ee(const __grid_constant__ CUtens
 #if __CUDA_ARCH__ == 1030
                         tile_max = max_noftz(pm0, pm1);
 #else
-                        float2 _reg_reduce_max2_7 = {-CAKE_INF, -CAKE_INF};
+                        float2 _reg_reduce_max2_7 = {-CUDART_INF_F, -CUDART_INF_F};
                         _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(sv0[0], sv0[1]));
                         _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(sv0[2], sv0[3]));
                         _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(sv0[4], sv0[5]));
@@ -1004,7 +876,7 @@ kernel_cake_nvfp4_mla_decode_e088eefe4cdbfba026ee(const __grid_constant__ CUtens
                         _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(sv0[28], sv0[29]));
                         _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(sv0[30], sv0[31]));
                         float _reg_array_reduce_6 = row_max_reduce(_reg_reduce_max2_7);
-                        float2 _reg_reduce_max2_9 = {-CAKE_INF, -CAKE_INF};
+                        float2 _reg_reduce_max2_9 = {-CUDART_INF_F, -CUDART_INF_F};
                         _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv1[0], sv1[1]));
                         _reg_reduce_max2_9.y = max_noftz(_reg_reduce_max2_9.y, max_noftz(sv1[2], sv1[3]));
                         _reg_reduce_max2_9.x = max_noftz(_reg_reduce_max2_9.x, max_noftz(sv1[4], sv1[5]));
