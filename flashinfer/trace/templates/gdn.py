@@ -951,6 +951,9 @@ gdn_mtp_trace = TraceTemplate(
         "replayssm_beta": Tensor(
             ["pool_size", "num_v_heads", "seq_len"], dtype="float32", optional=True
         ),
+        "verify_parents": Tensor(
+            ["batch_size", "seq_len"], dtype="int32", optional=True
+        ),
     },
     outputs={
         "output": Tensor(
