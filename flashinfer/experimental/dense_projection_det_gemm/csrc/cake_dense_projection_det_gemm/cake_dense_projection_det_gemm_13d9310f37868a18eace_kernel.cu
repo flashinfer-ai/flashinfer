@@ -122,9 +122,9 @@ kernel_cake_dense_projection_det_gemm_13d9310f37868a18eace(const __grid_constant
     }
 
     __syncwarp();
+
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-
     // TMEM alloc (512 columns, 512 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 152);
     if (warp == 1) {
