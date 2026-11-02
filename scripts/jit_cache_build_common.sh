@@ -86,36 +86,55 @@ _kill_process_tree() {
   kill "$pid" 2>/dev/null || true
 }
 
+# Collect the status of items that have finished, without blocking. Works on the
+# caller's `pids` (items still counted as running) and `failed` variables: bash
+# forgets finished jobs in `jobs`, so the pids are tracked here. A pid is waited
+# for exactly once, so its status is never lost or read twice.
+_reap_finished_items() {
+  local pid alive=()
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    if kill -0 "$pid" 2>/dev/null; then
+      alive+=("$pid")
+    else
+      wait "$pid" || failed=1
+    fi
+  done
+  pids=(${alive[@]+"${alive[@]}"})
+}
+
 # Run "FUNCTION ITEM" for every ITEM, at most CONCURRENCY at a time, as a pool: a
 # finished item frees its slot for the next one. Output of different items
 # interleaves, so FUNCTION should prefix its own lines. On the first failure,
 # including one after the last item has started, the running items are killed
-# with their descendants and no more start.
+# with their descendants and no more start. Finished items are polled every
+# 0.2 s, which is negligible against builds that take minutes.
 #
 # Args: $1 - CONCURRENCY (>= 1), $2 - function name, $3... - items.
-# Returns 0 when every item succeeded, else 1. Needs bash >= 4.3 (wait -n).
+# Returns 0 when every item succeeded, else 1.
 run_bounded_parallel() {
   local limit=$1 fn=$2
   shift 2
-  local item pid failed=0
+  local item pid failed=0 pids=()
   for item in "$@"; do
-    while (( $(jobs -rp | wc -l) >= limit )); do
-      wait -n || failed=1
-      (( failed )) && break
+    while :; do
+      _reap_finished_items
+      (( failed )) && break 2
+      (( ${#pids[@]} < limit )) && break
+      sleep 0.2
     done
-    (( failed )) && break
     "$fn" "$item" &
+    pids+=($!)
   done
   # Drain what is still running, stopping it at the first failure.
-  while (( $(jobs -rp | wc -l) > 0 )); do
-    if (( failed )); then
-      for pid in $(jobs -rp); do _kill_process_tree "$pid"; done
-      break
-    fi
-    wait -n || failed=1
+  while (( ${#pids[@]} > 0 && ! failed )); do
+    sleep 0.2
+    _reap_finished_items
   done
-  # Reaps the rest; a status not yet collected counts too.
-  for pid in $(jobs -p); do
+  if (( failed )); then
+    for pid in ${pids[@]+"${pids[@]}"}; do _kill_process_tree "$pid"; done
+  fi
+  # Reaps the killed items.
+  for pid in ${pids[@]+"${pids[@]}"}; do
     wait "$pid" || failed=1
   done
   return $failed

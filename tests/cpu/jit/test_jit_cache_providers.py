@@ -1096,7 +1096,7 @@ set -eo pipefail
 source "{common_script}"
 fake_build() {{
   echo "start $1" >> "{log}"
-  if [ "$1" = "{fail_item}" ]; then sleep 0.1; return 1; fi
+  if [ "$1" = "{fail_item}" ]; then return 1; fi
   sleep {ok_delay}
   echo "end $1" >> "{log}"
 }}
@@ -1157,6 +1157,18 @@ def test_run_bounded_parallel_reports_failure_and_stops_starting_items(tmp_path)
 
     assert status == "failed"
     assert "start c" not in events
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _bash_supports_wait_n(), reason="needs bash >= 4.3")
+def test_run_bounded_parallel_does_not_start_items_after_a_finished_failure(tmp_path):
+    # The pool never fills, so nothing waits on the item that failed at once:
+    # only a check before each launch can notice it.
+    items = ["bad"] + [f"ok{i}" for i in range(8)]
+    status, events = _run_bounded_parallel(tmp_path, 16, items, fail_item="bad")
+
+    assert status == "failed"
+    assert "start ok7" not in events
 
 
 @pytest.mark.cpu_only
