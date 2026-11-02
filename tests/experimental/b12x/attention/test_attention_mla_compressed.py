@@ -395,12 +395,29 @@ def test_declared_decode_capacity_matches_reference_under_graph_replay(
     rows: int,
     width: int,
 ) -> None:
+    """Replay a declared decode capacity and compare it with the reference.
+
+    Live indices span several split-KV chunks and end inside one, so the
+    replayed output depends on the cross-chunk merge, a partially masked
+    chunk and fully masked trailing chunks.
+    """
     device = require_b12x()
     clear_mla_caches()
-    live_width = 32
+    split_cap = math.ceil(width / 64)
+    # 2.5 of 6 chunks at width 384 and 5.5 of 11 chunks at width 704.
+    live_width = {384: 160, 704: 352}[width]
+    split_cfg = compressed_sparse_mla_split_config_for_contract(
+        rows=rows,
+        width=width,
+        max_chunks=split_cap,
+        decode_row_capacity=rows,
+    )
+    assert split_cfg.chunk_size < live_width
+    assert live_width % split_cfg.chunk_size != 0
+    assert live_width < (split_cfg.num_chunks - 1) * split_cfg.chunk_size
     q = _make_q(rows=rows, seed=6130 + rows, device=device)
     swa_cache_bytes = _make_cache(
-        tokens=64,
+        tokens=live_width,
         page_size=COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
         seed=6131 + rows,
         device=device,
@@ -427,7 +444,6 @@ def test_declared_decode_capacity_matches_reference_under_graph_replay(
         dtype=torch.float32,
         device=device,
     )
-    split_cap = math.ceil(width / 64)
     from b12x.attention import compressed_sparse_mla
     from tests.experimental.b12x.attention._prepared_compressed_test_utils import (
         prepare_compressed_binding,
