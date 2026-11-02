@@ -114,7 +114,7 @@ def auto_backend_case(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRe
     monkeypatch.setattr(backend, "DEFAULT_WORKSPACE_SIZE", 16)
     monkeypatch.setattr(
         backend,
-        "_get_cache_buf",
+        "_get_stream_cache_buf",
         lambda _, size, device: torch.empty(size, dtype=torch.uint8),
     )
 
@@ -381,7 +381,7 @@ def test_auto_keeps_other_architectures_on_existing_backends(
     )
     monkeypatch.setattr(
         gemm_svdquant,
-        "_get_cache_buf",
+        "_get_stream_cache_buf",
         lambda *args: torch.empty(16, dtype=torch.uint8),
     )
     with autotune(True):
@@ -441,7 +441,7 @@ def test_auto_native_adapter_rechecks_actual_workspace(workspace_case, monkeypat
     ):
         monkeypatch.setattr(backend, name, lambda *args: case.runner)
     monkeypatch.setattr(backend, "_sm120_max_workspace_bytes", lambda *args: 64)
-    monkeypatch.setattr(backend, "_get_cache_buf", lambda *args: case.inputs[-1])
+    monkeypatch.setattr(backend, "_get_stream_cache_buf", lambda *args: case.inputs[-1])
     values = case.inputs[:9] + ([case.inputs[12]] if linear else [])
     assert adapter.validate_tactic(values, case.large_tactic)
     case.inputs[-1] = case.inputs[-1][:16]
@@ -1099,7 +1099,7 @@ def test_sm120_linear_always_reaches_the_tuner(monkeypatch, m, n, k):
     monkeypatch.setattr(gemm_svdquant.torch, "empty", fake_empty)
     monkeypatch.setattr(
         svdquant_sm120_cutlass,
-        "_get_cache_buf",
+        "_get_stream_cache_buf",
         lambda *args, **kwargs: torch.zeros(16, dtype=torch.uint8),
     )
     monkeypatch.setattr(
@@ -1195,7 +1195,7 @@ def test_empty_linear_returns_before_gpu_preparation(
         "device_support_pdl",
         "_normalize_nvfp4_quantize_smooth_inputs",
         "_sm120_max_workspace_bytes",
-        "_get_cache_buf",
+        "_get_stream_cache_buf",
         "_cached_sm120_linear_runners",
         "_choose_sm120_linear_runner",
     ):
@@ -1268,7 +1268,7 @@ def test_table_miss_packs_m537_l2t_only_inside_fused_runner(
     monkeypatch.setattr(gemm_svdquant.torch, "empty", fake_empty)
     monkeypatch.setattr(
         svdquant_sm120_cutlass,
-        "_get_cache_buf",
+        "_get_stream_cache_buf",
         # Not the string "workspace": the entry point reads this buffer's dtype
         # on its way to a route.
         lambda *args, **kwargs: _FakeTensor((1 << 20,), dtype=torch.uint8),
@@ -1395,7 +1395,7 @@ def test_linear_normalizes_inputs_before_tuning_and_launch(
     )
     monkeypatch.setattr(
         svdquant_sm120_cutlass,
-        "_get_cache_buf",
+        "_get_stream_cache_buf",
         lambda *args: torch.empty(16, dtype=torch.uint8),
     )
 
@@ -2397,7 +2397,7 @@ def test_public_dispatch_checks_tactics_that_bypass_cache_validation(
     )
     monkeypatch.setattr(backend, "DEFAULT_WORKSPACE_SIZE", 16)
     case.inputs[-1] = case.inputs[-1][:workspace_bytes]
-    monkeypatch.setattr(backend, "_get_cache_buf", lambda *args: case.inputs[-1])
+    monkeypatch.setattr(backend, "_get_stream_cache_buf", lambda *args: case.inputs[-1])
     monkeypatch.setattr(
         backend, "_cached_sm120_linear_runners", lambda *args: [case.runner]
     )

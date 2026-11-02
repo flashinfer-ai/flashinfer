@@ -287,8 +287,9 @@ def _get_stream_cache_buf(
     (flashinfer-ai/flashinfer#3618). PyTorch draws stream handles from a fixed
     per-device pool, which bounds the number of buffers.
 
-    Not for use during CUDA graph capture: a captured kernel replays on
-    whatever stream replays the graph, so the capture stream is not its owner.
+    Under CUDA graph capture the key is the capture stream, so graphs captured
+    on one stream share the buffer. That is safe only for stateless scratch and
+    only if those graphs never replay concurrently.
     """
     key = (name, device, torch.cuda.current_stream(device).cuda_stream)
     buf = _stream_cache_buf.get(key)

@@ -21,7 +21,7 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ..utils import _get_cache_buf, get_native_fp4_dtype
+from ..utils import _get_stream_cache_buf, get_native_fp4_dtype
 
 from .gemm_base import (
     CUDNN_AVAILABLE,
@@ -600,7 +600,7 @@ def _compute_cudnn(
         if out.dtype != out_dtype:
             raise TypeError(f"out dtype {out.dtype} != requested out_dtype {out_dtype}")
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "mm_bf16_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
