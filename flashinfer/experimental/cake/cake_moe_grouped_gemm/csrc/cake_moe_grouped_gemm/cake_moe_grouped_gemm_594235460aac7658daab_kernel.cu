@@ -51,7 +51,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_WGRAD_OUT 16
 #endif
 #ifndef CAKE_PROGRAM_KERNEL
-#define CAKE_PROGRAM_KERNEL kernel_cake_moe_grouped_gemm_ddc17fe20df2ced66912
+#define CAKE_PROGRAM_KERNEL kernel_cake_moe_grouped_gemm_594235460aac7658daab
 #endif
 
 #define CAKE_INF CUDART_INF_F
@@ -71,7 +71,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_OG_A_OFF 197632
 #define SMEM_OG_A_STAGE_BYTES 512
 #define SMEM_OG_A_STRIDE 512
-#define SMEM_TOTAL 198144
+#define SMEM_KS_S_OFF 198144
+#define SMEM_KS_S_STAGE_BYTES 64
+#define SMEM_KS_S_STRIDE 64
+#define SMEM_TOTAL 198272
 #define BLOCK_M 128
 #define BLOCK_N 256
 #define BLOCK_K 64
@@ -212,6 +215,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     #define epilogue_done_addr (mbar_base + 72)
     #define epi_free0_addr (mbar_base + 80)
     #define order_ready_addr (mbar_base + 88)
+    #define ks_ready_addr (mbar_base + 96)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -231,9 +235,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     const int smem_b1_addr = smem + 33792;
     int* og_a = reinterpret_cast<int*>(smem_raw + 197632);
     const int og_a_addr = smem + 197632;
+    int* ks_s = reinterpret_cast<int*>(smem_raw + 198144);
+    const int ks_s_addr = smem + 198144;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 12 barriers)
-    // Mbarriers at smem_raw[0..96)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 13 barriers)
+    // Mbarriers at smem_raw[0..104)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -258,6 +264,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
             mbarrier_init(smem + 80, 16);
             // order_ready: 1 barriers, init_count=32
             mbarrier_init(smem + 88, 32);
+            // ks_ready: 1 barriers, init_count=1
+            mbarrier_init(smem + 96, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -267,9 +275,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 104);
     if (warp == 0) {
-        int _tmem_hold = smem + 96;
+        int _tmem_hold = smem + 104;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
@@ -419,17 +427,44 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     units_h = num_tail_h * (unsigned int)tail_splits;
                 }
                 unsigned int num_whole_h = whole_end_h - tail_base * 2;
+                unsigned int ks_end_h = num_whole_h + units_h;
+                if (units_h > 0) {
+                    if (units_h <= cluster_u) {
+                        ks_end_h = num_whole_h + cluster_u + 1;
+                    }
+                }
                 #pragma unroll 1
-                for (unsigned int v_h = cluster_u; v_h < num_whole_h + units_h; v_h += num_clusters_u) {
+                for (unsigned int v_h = cluster_u; v_h < ks_end_h; v_h += num_clusters_u) {
                     unsigned int hs_h = tail_base * 2 + v_h;
                     int s_h = 0;
                     int splits_h = 1;
                     if (v_h >= num_whole_h) {
                         unsigned int u_h = v_h - num_whole_h;
+                        mbarrier_wait(ks_ready_addr, 0);
+                        int ks_mode_h = ks_s[0];
+                        int ks_own_h = ks_s[1];
+                        if (ks_mode_h == 1) {
+                            if (u_h >= num_clusters_u) {
+                                break;
+                            }
+                            if (ks_own_h < 0) {
+                                break;
+                            }
+                        }
+                        if (ks_mode_h == 0) {
+                            if (u_h >= units_h) {
+                                break;
+                            }
+                        }
                         unsigned int s_u_h = u_h / num_tail_h;
                         hs_h = tail_base_h + (u_h - s_u_h * num_tail_h);
                         s_h = (int)s_u_h;
                         splits_h = tail_splits;
+                        if (ks_mode_h == 1) {
+                            hs_h = tail_base_h + (unsigned int)ks_own_h;
+                            s_h = 0;
+                            splits_h = 1;
+                        }
                     }
                     unsigned int t_h = hs_h / 2;
                     unsigned int e_uh = t_h / tiles_per_group;
@@ -1065,17 +1100,44 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     units_mh = num_tail_mh * (unsigned int)tail_splits;
                 }
                 unsigned int num_whole_mh = whole_end_mh - tail_base_m * 2;
+                unsigned int ks_end_mh = num_whole_mh + units_mh;
+                if (units_mh > 0) {
+                    if (units_mh <= cluster_m) {
+                        ks_end_mh = num_whole_mh + cluster_m + 1;
+                    }
+                }
                 #pragma unroll 1
-                for (unsigned int v_m = cluster_m; v_m < num_whole_mh + units_mh; v_m += num_clusters_m) {
+                for (unsigned int v_m = cluster_m; v_m < ks_end_mh; v_m += num_clusters_m) {
                     unsigned int hs_m = tail_base_m * 2 + v_m;
                     int s_mh = 0;
                     int splits_mh = 1;
                     if (v_m >= num_whole_mh) {
                         unsigned int u_mh = v_m - num_whole_mh;
+                        mbarrier_wait(ks_ready_addr, 0);
+                        int ks_mode_mh = ks_s[0];
+                        int ks_own_mh = ks_s[1];
+                        if (ks_mode_mh == 1) {
+                            if (u_mh >= num_clusters_m) {
+                                break;
+                            }
+                            if (ks_own_mh < 0) {
+                                break;
+                            }
+                        }
+                        if (ks_mode_mh == 0) {
+                            if (u_mh >= units_mh) {
+                                break;
+                            }
+                        }
                         unsigned int s_u_mh = u_mh / num_tail_mh;
                         hs_m = tail_base_mh + (u_mh - s_u_mh * num_tail_mh);
                         s_mh = (int)s_u_mh;
                         splits_mh = tail_splits;
+                        if (ks_mode_mh == 1) {
+                            hs_m = tail_base_mh + (unsigned int)ks_own_mh;
+                            s_mh = 0;
+                            splits_mh = 1;
+                        }
                     }
                     int e_imh = (int)(hs_m / 2 / tiles_per_group_m);
                     if (num_groups <= 128) {
@@ -3501,6 +3563,143 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                 mbarrier_arrive(order_ready_addr);
             }
             mbarrier_wait(order_ready_addr, 0);
+            if (warp == 2) {
+                unsigned int kp_c_n = num_clusters_e;
+                unsigned int kp_tb = total_tiles_e * 2 / kp_c_n * kp_c_n;
+                unsigned int kp_nt = total_tiles_e * 2 - kp_tb;
+                unsigned int kp_nw_h = kp_tb - tail_base_e * 2;
+                int kp_mode = 0;
+                int kp_own = -1;
+                int kp_ok = 0;
+                if (tail_splits > 1) {
+                    if (kp_c_n <= 128) {
+                        kp_ok = 1;
+                    }
+                }
+                if (kp_ok == 1) {
+                    unsigned int kp_ld[4];
+                    unsigned int kp_r1[4];
+                    unsigned int kp_mx = 0;
+                    #pragma unroll
+                    for (int kp_k = 0; kp_k < 4; kp_k++) {
+                        kp_ld[kp_k] = 0;
+                        kp_r1[kp_k] = 0;
+                        unsigned int kp_c = (unsigned int)(lane + 32 * kp_k);
+                        if (kp_c < kp_c_n) {
+                            #pragma unroll 1
+                            for (unsigned int kp_w = 0; kp_w < full_waves_e; kp_w++) {
+                                unsigned int kp_p = kp_c;
+                                if (kp_w % 2 == 1) {
+                                    kp_p = kp_c_n - 1 - kp_c;
+                                }
+                                unsigned int kp_g = (kp_w * kp_c_n + kp_p) / tiles_per_group_e;
+                                if (num_groups <= 128) {
+                                    kp_g = (unsigned int)og_a[(int)kp_g];
+                                }
+                                int kp_g1 = offs[(int)kp_g];
+                                int kp_g0 = 0;
+                                if (kp_g > 0) {
+                                    kp_g0 = offs[(int)kp_g - 1];
+                                }
+                                int kp_kb = (kp_g1 - kp_g0 + (BLOCK_K - 1)) / BLOCK_K;
+                                if (kp_kb < 1) {
+                                    kp_kb = 1;
+                                }
+                                kp_kb = 2 * kp_kb;
+                                kp_ld[kp_k] = kp_ld[kp_k] + (unsigned int)kp_kb;
+                            }
+                            #pragma unroll 1
+                            for (unsigned int kp_v = kp_c; kp_v < kp_nw_h; kp_v += kp_c_n) {
+                                unsigned int kp_gv = (tail_base_e * 2 + kp_v) / 2 / tiles_per_group_e;
+                                if (num_groups <= 128) {
+                                    kp_gv = (unsigned int)og_a[(int)kp_gv];
+                                }
+                                int kp_v1 = offs[(int)kp_gv];
+                                int kp_v0 = 0;
+                                if (kp_gv > 0) {
+                                    kp_v0 = offs[(int)kp_gv - 1];
+                                }
+                                int kp_kbv = (kp_v1 - kp_v0 + (BLOCK_K - 1)) / BLOCK_K;
+                                if (kp_kbv < 1) {
+                                    kp_kbv = 1;
+                                }
+                                kp_ld[kp_k] = kp_ld[kp_k] + (unsigned int)kp_kbv;
+                            }
+                            if (kp_ld[kp_k] > kp_mx) {
+                                kp_mx = kp_ld[kp_k];
+                            }
+                        }
+                    }
+                    unsigned int kp_lmax;
+                    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(kp_lmax) : "r"(kp_mx));
+                    #pragma unroll 1
+                    for (int kp_src = 0; kp_src < 32; kp_src++) {
+                        #pragma unroll
+                        for (int kp_k3 = 0; kp_k3 < 4; kp_k3++) {
+                            unsigned int kp_sv = __shfl_sync(0xFFFFFFFF, kp_ld[kp_k3], kp_src);
+                            unsigned int kp_cv = (unsigned int)(kp_src + 32 * kp_k3);
+                            if (kp_cv < kp_c_n) {
+                                #pragma unroll
+                                for (int kp_k4 = 0; kp_k4 < 4; kp_k4++) {
+                                    if (kp_sv < kp_ld[kp_k4]) {
+                                        kp_r1[kp_k4] = kp_r1[kp_k4] + 1;
+                                    }
+                                    if (kp_sv == kp_ld[kp_k4]) {
+                                        if (kp_cv < (unsigned int)(lane + 32 * kp_k4)) {
+                                            kp_r1[kp_k4] = kp_r1[kp_k4] + 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    unsigned int kp_over = 0;
+                    unsigned int kp_own_r = 0;
+                    #pragma unroll
+                    for (int kp_k5 = 0; kp_k5 < 4; kp_k5++) {
+                        if ((unsigned int)(lane + 32 * kp_k5) < kp_c_n) {
+                            if (kp_r1[kp_k5] < kp_nt) {
+                                unsigned int kp_ti = kp_tb + kp_r1[kp_k5];
+                                kp_ti = kp_ti / 2;
+                                unsigned int kp_gt = kp_ti / tiles_per_group_e;
+                                if (num_groups <= 128) {
+                                    kp_gt = (unsigned int)og_a[(int)kp_gt];
+                                }
+                                int kp_t1 = offs[(int)kp_gt];
+                                int kp_t0 = 0;
+                                if (kp_gt > 0) {
+                                    kp_t0 = offs[(int)kp_gt - 1];
+                                }
+                                int kp_kbt = (kp_t1 - kp_t0 + (BLOCK_K - 1)) / BLOCK_K;
+                                if (kp_kbt < 1) {
+                                    kp_kbt = 1;
+                                }
+                                int kp_tol = (kp_kbt + tail_splits - 1) / tail_splits;
+                                if (kp_ld[kp_k5] + (unsigned int)kp_kbt > kp_lmax + (unsigned int)kp_tol) {
+                                    kp_over = 1;
+                                }
+                            }
+                        }
+                        unsigned int kp_sr = __shfl_sync(0xFFFFFFFF, kp_r1[kp_k5], (int)(cluster_e % 32));
+                        if (cluster_e / 32 == (unsigned int)kp_k5) {
+                            kp_own_r = kp_sr;
+                        }
+                    }
+                    unsigned int kp_over_w;
+                    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(kp_over_w) : "r"(kp_over));
+                    if (kp_over_w == 0) {
+                        kp_mode = 1;
+                        if (kp_own_r < kp_nt) {
+                            kp_own = (int)kp_own_r;
+                        }
+                    }
+                }
+                if (elect_sync()) {
+                    ks_s[0] = kp_mode;
+                    ks_s[1] = kp_own;
+                    mbarrier_arrive(ks_ready_addr);
+                }
+            }
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (unsigned int t_e = cluster_e; t_e < reg_end_e; t_e += num_clusters_e) {
@@ -4833,19 +5032,47 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                 units_eh = num_tail_eh * (unsigned int)tail_splits;
             }
             unsigned int num_whole_eh = whole_end_eh - tail_base_e * 2;
+            unsigned int ks_end_eh = num_whole_eh + units_eh;
+            if (units_eh > 0) {
+                if (units_eh <= cluster_e) {
+                    ks_end_eh = num_whole_eh + cluster_e + 1;
+                }
+            }
             #pragma unroll 1
-            for (unsigned int v_e = cluster_e; v_e < num_whole_eh + units_eh; v_e += num_clusters_e) {
+            for (unsigned int v_e = cluster_e; v_e < ks_end_eh; v_e += num_clusters_e) {
                 unsigned int j_eh = 0;
                 int s_eh = 0;
                 int splits_eh = 1;
                 unsigned int hs_e = tail_base_e * 2 + v_e;
                 if (v_e >= num_whole_eh) {
                     unsigned int u_eh = v_e - num_whole_eh;
+                    mbarrier_wait(ks_ready_addr, 0);
+                    int ks_mode_eh = ks_s[0];
+                    int ks_own_eh = ks_s[1];
+                    if (ks_mode_eh == 1) {
+                        if (u_eh >= num_clusters_e) {
+                            break;
+                        }
+                        if (ks_own_eh < 0) {
+                            break;
+                        }
+                    }
+                    if (ks_mode_eh == 0) {
+                        if (u_eh >= units_eh) {
+                            break;
+                        }
+                    }
                     unsigned int s_u_eh = u_eh / num_tail_eh;
                     j_eh = u_eh - s_u_eh * num_tail_eh;
                     hs_e = tail_base_eh + j_eh;
                     s_eh = (int)s_u_eh;
                     splits_eh = tail_splits;
+                    if (ks_mode_eh == 1) {
+                        j_eh = (unsigned int)ks_own_eh;
+                        hs_e = tail_base_eh + j_eh;
+                        s_eh = 0;
+                        splits_eh = 1;
+                    }
                 }
                 unsigned int t_eh = hs_e / 2;
                 unsigned int e_ueh = t_eh / tiles_per_group_e;
