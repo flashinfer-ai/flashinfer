@@ -532,11 +532,12 @@ def _nvcc() -> Path:
 
 
 def _arch_for_capability(capability: tuple[int, int]) -> str:
-    arch = _ARCH_BY_CAPABILITY.get(tuple(capability))
+    major, minor = capability
+    arch = _ARCH_BY_CAPABILITY.get((major, minor))
     if arch is None:
         raise RuntimeError(
             "Blackwell BF16 rank-major session requires SM100 or SM107, got compute "
-            f"capability {tuple(capability)}"
+            f"capability {(major, minor)}"
         )
     return arch
 
