@@ -39,6 +39,7 @@ _SUBMODULE_OF = {
     "chunk_kda_det_bwd_kcp": "cake_kcp",
     "chunk_kda_det_fwd_kcp": "cake_kcp",
     "chunk_kda_det_kcp": "cake_kcp",
+    "reduce_gate_param_grads_det_kcp": "cake_kcp",
     "ContextDetKcp": "cake_kcp_plan",
     "FragmentDetKcp": "cake_kcp_plan",
     "PartitionDetKcp": "cake_kcp_plan",
@@ -79,4 +80,5 @@ __all__ = [
     "kda_det_saved_bytes_kcp",  # noqa: F822 - resolved by __getattr__
     "kda_det_workspace_bytes_kcp",  # noqa: F822 - resolved by __getattr__
     "partition_det_kcp",  # noqa: F822 - resolved by __getattr__
+    "reduce_gate_param_grads_det_kcp",  # noqa: F822 - resolved by __getattr__
 ]

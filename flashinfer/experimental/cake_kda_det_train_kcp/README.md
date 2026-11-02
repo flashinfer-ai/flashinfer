@@ -18,7 +18,7 @@ The names before the det rename stay bound to the same objects:
 `chunk_kda_kcp_bwd`, `kcp_partition`, `build_kcp_context`,
 `kcp_workspace_bytes`, `kcp_saved_bytes`, `kcp_comm_bytes`,
 `KcpRecomputeHandle`, `KcpContext`, `KcpPartition`, `KcpOptions`,
-`KcpSaved`, `KcpWorkspace`), the modules
+`KcpSaved`, `KcpWorkspace`, `kcp_reduce_gate_param_grads`), the modules
 `flashinfer.experimental.cake_kda_train.cake_kcp` / `cake_kcp_plan` /
 `cake_kcp_jit` (the same module objects) and the previous names inside
 `cake_kcp` and `cake_kcp_plan`.
@@ -33,6 +33,7 @@ The names before the det rename stay bound to the same objects:
 | `kcp_workspace_bytes` | `kda_det_workspace_bytes_kcp` |
 | `kcp_saved_bytes` | `kda_det_saved_bytes_kcp` |
 | `kcp_comm_bytes` | `kda_det_comm_bytes_kcp` |
+| `kcp_reduce_gate_param_grads` | `reduce_gate_param_grads_det_kcp` |
 | `KcpRecomputeHandle` | `RecomputeHandleDetKcp` |
 | `KcpWorkspace` | `WorkspaceDetKcp` |
 | `KcpSaved` | `SavedDetKcp` |
@@ -330,6 +331,122 @@ out = torch.utils.checkpoint.checkpoint(layer, xq, xk, xv, g, beta, RecomputeHan
 Per layer the halo collectives drop from 3 / 3 / 3 (original forward /
 recompute / backward, without handles) or 3 / 0 / 3 (with handles) to 1 / 1 / 1
 or 1 / 0 / 1.
+
+Raw gate mode on the KCP route (issue #7816): the three KDA entry points take
+the single-rank keywords `use_gate_in_kernel=True, A_log=, dt_bias=,
+lower_bound=` with the same operand rules (`g` is the rank's raw BF16 gate,
+any view under the stride rule of "Raw gate mode" in the single-rank README,
+`flashinfer/experimental/cake_kda_det_train/README.md`, never copied;
+`A_log` / `dt_bias` are the full parameters, the same tensors on every rank).
+
+```python
+from flashinfer.cake_kda_det_train_kcp import WorkspaceDetKcp, reduce_gate_param_grads_det_kcp
+
+ws = WorkspaceDetKcp(use_gate_in_kernel=True)                     # the workspace's mode, fixed
+out_local, saved = chunk_kda_det_fwd_kcp(q_local, k_local, v_local, raw_local, beta_local, ctx,
+                                         workspace=ws, use_gate_in_kernel=True, A_log=A_log,
+                                         dt_bias=dt_bias, lower_bound=-5.0)
+dq, dk, dv, dbeta, draw, dA_log_r, ddt_bias_r = chunk_kda_det_bwd_kcp(
+    q_local, k_local, v_local, raw_local, beta_local, ctx, dout_local, saved=saved, workspace=ws,
+    use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0)
+dA_log, ddt_bias = reduce_gate_param_grads_det_kcp(ctx, dA_log_r, ddt_bias_r)   # optional, see below
+```
+
+* The local stages run the raw records of the rank's plan (the intra and prep
+  programs activate the gate, the raw GLM intra program writes `draw` and the
+  per-chunk partials, one `param_finalize` launch reduces them; no gate
+  epilogue).  The `gk` rows the K1 / K2 / K3 walks read are the explicit
+  path's bits for the same activated gate, so every KCP program, collective
+  and exchanged byte is the explicit path's; no full-size FP32 gate or gate
+  gradient exists on the route.
+* `dA_log` / `ddt_bias` of a rank are its partial sums: the gradients through
+  its own tokens, reduced on the rank in an order fixed by its local chunks
+  (bitwise repeatable, the same under every exchange, schedule, graph replay
+  and recompute).  The full gradient is their sum over `ctx.group`; a
+  training framework sums them as it sums the gradients of any parameter
+  replicated across the context-parallel ranks.  An NCCL all-reduce gives
+  that sum to FP32 rounding but does not fix its summation order (it changes
+  with the algorithm, topology and message size), so it is not bitwise
+  reproducible; `reduce_gate_param_grads_det_kcp(ctx, dA_log, ddt_bias)` is:
+  one `all_gather_into_tensor` of the `H + 128 H` values, then an FP32 sum in
+  rank order on every rank (the same bits everywhere).
+* The mode is fixed per workspace (`WorkspaceDetKcp(use_gate_in_kernel=True)`:
+  its local arena is the replay arena planned in raw mode, whose backward
+  layouts carry no gate epilogue buffers; the KCP pools do not change;
+  `local_arena="lean"` is refused in raw mode), recorded in the saved set
+  (`SavedDetKcp.gate`, `.lower_bound`) and in a recompute handle's
+  fingerprint; a call in the other mode, a backward with another
+  `lower_bound` and a recompute of another mode are refused with
+  `ValueError`.  `kda_det_workspace_bytes_kcp(ctx, H=..., use_gate_in_kernel=True)`
+  sizes it; `kda_det_saved_bytes_kcp` and `kda_det_comm_bytes_kcp` do not
+  depend on the mode.
+* The backward allocates the raw gate's BF16 gradient, the partials (two FP32
+  `[NC_pad, H, 128, 2]` buffers of the rank's chunks, for the duration of the
+  call) and the two parameter gradients; a rank without tokens returns zero
+  parameter gradients.
+
+In-kernel Q / K L2 norm on the KCP route (issue #7817): the three KDA entry
+points, `WorkspaceDetKcp` and the workspace and saved byte queries take the
+keyword-only `use_qk_l2norm_in_kernel=False`.  With `True` the local stages
+normalize `q` and `k` per token and per 128-channel head (FP32 sum of squares,
+`r = 1 / sqrt(ss + 1e-6)`, `x_hat = bf16(x * r)`; `v` is not normalized) and
+the GLM intra programs fuse the FP32 pullback into the BF16 `dq` / `dk`, so
+`q_local` / `k_local` are the rank's raw rows and the gradients are theirs.
+
+```python
+ws = WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)                # the workspace's mode, fixed
+out_local, saved = chunk_kda_det_fwd_kcp(q_raw, k_raw, v_local, g_local, beta_local, ctx,
+                                         workspace=ws, use_qk_l2norm_in_kernel=True)
+dq_raw, dk_raw, dv, dbeta, dg = chunk_kda_det_bwd_kcp(
+    q_raw, k_raw, v_local, g_local, beta_local, ctx, dout_local, saved=saved, workspace=ws,
+    use_qk_l2norm_in_kernel=True)
+```
+
+* `q_raw` / `k_raw` may be strided views, such as columns of a packed
+  projection or convolution output `[S_local, (2 H + HV) * 128]`: innermost
+  stride 1, head stride 128 elements, token stride a multiple of 8 elements
+  and at least `H * 128` (no overlapping rows), base address 16-byte aligned
+  (the single-rank rule).  They are never copied; any other view raises
+  `ValueError`.  Without the flag `q` / `k` must stay contiguous.  `v` keeps
+  its rules.  Every rank checks the metadata (shape, dtype, device, the three
+  strides), a rank with zero or one token too, so all ranks refuse a view
+  alike.  The base-address alignment is the one per-rank check: it is a
+  property of each rank's own storage, checked where the rank has tokens.
+* The normalization is token-local: the halo, the context, the KCP programs,
+  every collective and its byte count are those of the flag-off route.
+* The saved set keeps the raw `q` / `k` (the caller's tensors) and adds the
+  FP32 rstd `SavedDetKcp.qk_rstd` `[2, S_local, H]` (plane 0 q, plane 1 k;
+  empty on a rank without tokens): `kda_det_saved_bytes_kcp(...,
+  use_qk_l2norm_in_kernel=True)` is `8 * S_local * H` bytes more.  The
+  normalized q / k are never saved: the backward rebuilds them bitwise from
+  the raw rows and the rstd into a per-call buffer (`512 * S_local * H` bytes
+  for the duration of the backward), and a checkpoint recompute writes its
+  rstd afresh, so a recompute handle's entry and bytes do not change.
+* The mode is fixed per workspace (the replay local arena of that mode;
+  `local_arena="lean"` is refused with it), recorded in the saved set
+  (`SavedDetKcp.qk_l2norm`), the graph validity key and a recompute handle's
+  fingerprint; a call, a saved set or a recompute of the other mode is
+  refused with `ValueError`.
+* With `use_qk_l2norm_in_kernel=False` (the default) every launch, saved
+  tensor, key, fingerprint and byte is unchanged.
+* The local programs of the mode are the single-rank backend's (its plan mode
+  `l2n="fused"`: the first q / k reader normalizes, the GLM intra program
+  pulls back; a saved-mode backward reads the saved rstd).  Until the
+  single-rank registry selects a record of the mode for every such stage of
+  the forward and replay paths over a fixed grid of problem sizes (at most
+  and above 256 documents, few and many heads, the architecture's SM
+  counts), each delivered and exported for the device's architecture, with
+  exactly one normalizing first reader on the replay, and its forward and
+  replay layouts carry the normalized slot views `qn_int` / `kn_int`, a
+  call, a `WorkspaceDetKcp` and the byte queries with the flag on raise
+  `NotImplementedError` before any workspace build, plan, launch or
+  collective.  The check reads rank-independent inputs only (the
+  architecture of the context's device, the registry's selection over that
+  grid and its exports, the flags and gate mode, the static layout tables),
+  so every rank, one without tokens or with a misaligned view too, raises
+  the same error with the same message.  The saved byte query takes the
+  call's `use_gate_in_kernel` for this check.  With the flag off the byte
+  queries make no CUDA call for it.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,

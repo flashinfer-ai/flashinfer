@@ -36,6 +36,14 @@ a ``bool`` (``TypeError``):
 * With ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
   runs the deterministic package and warns once per process.
 
+Raw gate mode (``use_gate_in_kernel=True`` with ``A_log``, ``dt_bias`` and
+``lower_bound``; FlashInfer #7816) runs on the deterministic package only: the
+entries forward the keywords to it, ``chunk_kda_bwd`` then returns seven tensors
+(``dA_log`` / ``ddt_bias`` added), and the workspace and its byte query take
+``use_gate_in_kernel``.  ``deterministic=False`` raises ``ValueError`` for it
+(also for a saved set of that mode); the off values (``use_gate_in_kernel=False``,
+``A_log`` / ``dt_bias`` / ``lower_bound`` ``None``) are accepted in both modes.
+
 The mode of :func:`chunk_kda` is fixed at its forward call: the autograd node's
 backward is the forward's package.  Both packages write the saved set in the
 same format, so either backward reads it.  A workspace serves its own package:
@@ -175,6 +183,16 @@ def _deterministic(deterministic: bool, entry: str) -> bool:
     return False
 
 
+def _gate_mode(use_gate_in_kernel: bool) -> str:
+    """The packages' gate mode of ``use_gate_in_kernel``: ``"raw"`` for ``True``, ``"g"`` for ``False``
+    (``ValueError`` for a non-bool, as the deterministic facade)."""
+    if not isinstance(use_gate_in_kernel, bool):
+        raise ValueError(
+            f"use_gate_in_kernel must be a bool, got {use_gate_in_kernel!r}"
+        )
+    return "raw" if use_gate_in_kernel else "g"
+
+
 def _arena_for(det: bool, arena: Any) -> Any:
     """``arena`` as the routed package's arena type: an arena option of the other package becomes the same option of
     this one (the two types have the same fields); ``None`` and the routed package's own pass through."""
@@ -227,6 +245,10 @@ def chunk_kda_fwd(
     save_mode: Optional[str] = None,
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
+    use_gate_in_kernel: bool = False,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
     deterministic: bool = True,
 ) -> tuple[torch.Tensor, Optional[Any]]:
     r"""Packed KDA chunked training forward.
@@ -256,6 +278,10 @@ def chunk_kda_fwd(
         option, a differing option on a given workspace is refused.
     doc_lengths : sequence of int, optional
         The documents' token counts in ``cu_seqlens`` order (host integers), required under a batched option.
+    use_gate_in_kernel, A_log, dt_bias, lower_bound
+        The raw gate mode (``g`` the raw BF16 gate, activated in the kernels); see
+        :func:`flashinfer.cake_kda_det_train.chunk_kda_det_fwd`.  ``deterministic=True`` only: ``deterministic=False``
+        raises ``ValueError`` unless they are off (``False`` / ``None``).
     deterministic : bool
         ``True`` runs the deterministic package, ``False`` the non-deterministic one (see the module docstring).
         The forward programs of the two are the same: bitwise the same ``out`` and saved set.
@@ -282,6 +308,10 @@ def chunk_kda_fwd(
             save_mode=save_mode,
             arena=arena,
             doc_lengths=doc_lengths,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
         )
     return _nd().chunk_kda_fwd(
         q,
@@ -296,6 +326,10 @@ def chunk_kda_fwd(
         save_mode=save_mode,
         arena=_arena_for(False, arena),
         doc_lengths=doc_lengths,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
         deterministic=False,
     )
 
@@ -315,8 +349,12 @@ def chunk_kda_bwd(
     workspace: Optional[Any] = None,
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
+    use_gate_in_kernel: bool = False,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
     deterministic: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     r"""Packed KDA chunked training backward.
 
     Parameters
@@ -338,13 +376,18 @@ def chunk_kda_bwd(
         workspace's option, a differing one is refused.  A lean arena serves no checkpoint replay.
     doc_lengths : sequence of int, optional
         The documents' token counts in ``cu_seqlens`` order (host integers), required under a batched option.
+    use_gate_in_kernel, A_log, dt_bias, lower_bound
+        The forward's raw gate mode (see :func:`chunk_kda_fwd`); ``deterministic=True`` only.  With
+        ``deterministic=False`` they must be off, and a saved set of the raw gate mode is refused (``ValueError``).
     deterministic : bool
         ``True`` runs the deterministic package, ``False`` the non-deterministic one (see the module docstring).
 
     Returns
     -------
     ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
-    like the inputs.  Bitwise reproducible for the same inputs and path in both modes.
+    like the inputs.  Bitwise reproducible for the same inputs and path in both modes.  In raw gate mode
+    (``deterministic=True`` only) ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, as
+    :func:`flashinfer.cake_kda_det_train.chunk_kda_det_bwd` returns them.
     """
     scale = DEFAULT_SCALE if scale is None else scale
     if _deterministic(deterministic, "chunk_kda_bwd"):
@@ -364,6 +407,10 @@ def chunk_kda_bwd(
             workspace=workspace,
             arena=arena,
             doc_lengths=doc_lengths,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
         )
     return _nd().chunk_kda_bwd(
         q,
@@ -378,6 +425,10 @@ def chunk_kda_bwd(
         workspace=workspace,
         arena=_arena_for(False, arena),
         doc_lengths=doc_lengths,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
         deterministic=False,
     )
 
@@ -396,6 +447,10 @@ def chunk_kda(
     save_mode: Optional[str] = None,
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
+    use_gate_in_kernel: bool = False,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
     checkpoint_handoff: str = "auto",
     deterministic: bool = True,
 ) -> torch.Tensor:
@@ -405,7 +460,9 @@ def chunk_kda(
     operands, ``save_mode``, ``arena`` and ``doc_lengths`` and :func:`chunk_kda_bwd` for the gradients.
     ``deterministic`` selects the package at the forward call; the node's backward runs the same package.
     ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``): the non-deterministic package's checkpoint
-    hand-off (its README); the deterministic package has no hand-off and ignores it.
+    hand-off (its README); the deterministic package has no hand-off and ignores it.  ``use_gate_in_kernel``,
+    ``A_log``, ``dt_bias``, ``lower_bound``: the raw gate mode (gradients to the raw gate ``g``, BF16, and to
+    ``A_log`` / ``dt_bias``, FP32), ``deterministic=True`` only (see :func:`chunk_kda_fwd`).
     """
     scale = DEFAULT_SCALE if scale is None else scale
     if checkpoint_handoff not in ("auto", "on", "off"):
@@ -428,6 +485,10 @@ def chunk_kda(
             save_mode=save_mode,
             arena=arena,
             doc_lengths=doc_lengths,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
         )
     return _nd().chunk_kda(
         q,
@@ -441,6 +502,10 @@ def chunk_kda(
         save_mode=save_mode,
         arena=_arena_for(False, arena),
         doc_lengths=doc_lengths,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
         checkpoint_handoff=checkpoint_handoff,
         deterministic=False,
     )
@@ -481,18 +546,22 @@ def kda_train_workspace(
     save_mode: str = "light",
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
+    use_gate_in_kernel: bool = False,
     deterministic: bool = True,
 ) -> Any:
     """A caller-owned workspace of the package ``deterministic`` selects (one arena of internal intermediates) for
     ``S`` tokens in ``num_docs`` documents with ``H`` heads on ``device``, reused by every call of the same
     ``deterministic`` that receives it; see :func:`flashinfer.cake_kda_det_train.kda_det_train_workspace` for
-    ``backward``, ``save_mode``, ``arena`` and ``doc_lengths``.  The two packages' workspaces have the same size."""
+    ``backward``, ``save_mode``, ``arena``, ``doc_lengths`` and ``use_gate_in_kernel`` (the gate mode of the calls
+    it serves; ``True`` with ``deterministic=False`` raises ``ValueError``).  The two packages' workspaces have the
+    same size."""
     det = _deterministic(deterministic, "kda_train_workspace")
     kwargs = dict(
         backward=backward,
         save_mode=save_mode,
         arena=_arena_for(det, arena),
         doc_lengths=doc_lengths,
+        gate=_gate_mode(use_gate_in_kernel),
     )
     if det:
         return _det().KdaDetWorkspace.for_problem(S, num_docs, H, device, **kwargs)
@@ -512,10 +581,12 @@ def kda_train_workspace_bytes(
     sm_count: Optional[int] = None,
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
+    use_gate_in_kernel: bool = False,
     deterministic: bool = True,
 ) -> int:
     """Bytes :func:`kda_train_workspace` allocates for the problem (the same for both values of
-    ``deterministic``); see :func:`flashinfer.cake_kda_det_train.kda_det_train_workspace_bytes`."""
+    ``deterministic``); see :func:`flashinfer.cake_kda_det_train.kda_det_train_workspace_bytes`
+    (``use_gate_in_kernel``: the gate mode; ``True`` with ``deterministic=False`` raises ``ValueError``)."""
     det = _deterministic(deterministic, "kda_train_workspace_bytes")
     return (_det() if det else _nd()).workspace_bytes(
         S,
@@ -526,6 +597,7 @@ def kda_train_workspace_bytes(
         sm_count=sm_count,
         arena=_arena_for(det, arena),
         doc_lengths=doc_lengths,
+        gate=_gate_mode(use_gate_in_kernel),
     )
 
 
