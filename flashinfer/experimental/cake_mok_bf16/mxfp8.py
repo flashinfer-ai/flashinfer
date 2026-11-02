@@ -243,7 +243,7 @@ def _quantize_both_triton(matrices):
         rows // 128,
         cols // 128,
         _SCALE_FACTOR,
-        num_warps=8,
+        num_warps=4,  # 0.38 ms vs 0.75 ms (8) / 0.63 ms (2) per [36, 2048, 4096] on R200
     )
     return data, scales, data_t, scales_t
 
