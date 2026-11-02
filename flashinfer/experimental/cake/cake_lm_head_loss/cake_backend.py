@@ -2524,9 +2524,10 @@ def set_zero_weight_min_rows(rows: int) -> int:
 
 # The smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip
 # (:func:`set_zero_dlogp_min_rows`, no environment variable; ``None`` = never).  The skip orders the rows on the device
-# and adds its count cells (a fixed handful of small launches per call, no host synchronization), so below the floor a
-# call keeps the shipped backward.
-ZERO_DLOGP_MIN_ROWS_DEFAULT: Optional[int] = 0
+# (one partition launch per call, no host synchronization) at the start of the backward, where the GPU waits for the
+# host; a backward of one default chunk is too short to repay that host time, so the default floor is one row above
+# one default chunk and a smaller call keeps the shipped backward.
+ZERO_DLOGP_MIN_ROWS_DEFAULT: Optional[int] = DEFAULT_CHUNK_SIZE + 1
 _ZERO_DLOGP_MIN_ROWS: dict[str, Optional[int]] = {"rows": ZERO_DLOGP_MIN_ROWS_DEFAULT}
 
 
@@ -3462,8 +3463,9 @@ def make_plan(
     ``logprob_lbl`` (a log-probability plan of a record that registers them) run the entry's logits GEMM arms
     (:attr:`Plan.logprob_dz`, :attr:`Plan.logprob_lbl`).  ``logprob_keep`` (a log-probability plan, a registered
     program): the kept-logits plan (:class:`_KeptPlan`), which runs neither arm.  ``dcnt`` (a log-probability plan
-    with the dz arm, a registered program): the zero-gradient row skip's ``_dcnt`` forms (:attr:`Plan.dcnt`); off when
-    a chunk takes a form without one (a weight-gradient TMA epilogue, the swapped dX tile)."""
+    with the dz arm, a registered program): the zero-gradient row skip's ``_dcnt`` forms (:attr:`Plan.dcnt`), the
+    last chunk's bf16 fused cast in its shipped form instead of the TMA epilogue (:func:`dw_cast_tma_rule`); off when a
+    chunk takes a form without one (an explicitly pinned weight-gradient TMA epilogue or swapped dX tile)."""
     if (logprob_dz or logprob_lbl or logprob_keep) and problem.entry != "logprob":
         raise ValueError("the logits GEMM arms belong to the log-probability entry")
     if logprob_keep:
@@ -3520,15 +3522,30 @@ def make_plan(
             )
             for i, (_, rows_c) in enumerate(chunks)
         )
+    # the zero-gradient row skip's counted forms: none for an explicitly pinned swapped dX tile or weight-gradient TMA
+    # epilogue (the swap rule itself serves the cross-entropy loss only)
+    dcnt = bool(
+        dcnt
+        and arch is not None
+        and problem.entry == "logprob"
+        and logprob_dz
+        and not logprob_keep
+        and not hidden_count
+        and not any(
+            v.dx_swab or v.dw_epi_store not in (None, "redsm") for v in variants
+        )
+    )
     if (
         variants
+        and not dcnt
         and need_dw
         and fuse_dw_cast
         and not (problem.entry == "loss" and problem.grad_weight_dtype == torch.float32)
         and "epi_store" not in tuning.get("dw", {})
         and dw_cast_tma_rule(len(chunks), chunks[-1][1], arch)
     ):
-        # the deferred last chunk's bf16 cast takes the TMA epilogue; an explicit ``epi_store`` keeps the shipped cast
+        # the deferred last chunk's bf16 cast takes the TMA epilogue; an explicit ``epi_store`` keeps the shipped cast,
+        # and so does a counted plan (the shipped cast has the counted form, the TMA one has none; the same dW bits)
         variants = variants[:-1] + (replace(variants[-1], dw_cast_tma=True),)
     hidden_group: Optional[int] = None
     if hidden_count:
@@ -3540,18 +3557,6 @@ def make_plan(
             problem.hidden, min(int(problem.chunk), int(problem.num_rows)), arch
         )
         hidden_group = None if raster is None else raster[0]
-    dcnt = bool(
-        dcnt
-        and arch is not None
-        and problem.entry == "logprob"
-        and logprob_dz
-        and not logprob_keep
-        and not hidden_count
-        and not any(
-            v.dx_swab or v.dw_epi_store not in (None, "redsm") or v.dw_cast_tma
-            for v in variants
-        )
-    )
     return (_KeptPlan if logprob_keep else Plan)(
         problem,
         chunks,
@@ -5540,7 +5545,8 @@ def prepare_lm_head_loss(
         if record is not None
         else None
     )
-    plan = make_plan(
+    plan_of = functools.partial(
+        make_plan,
         problem,
         need_dx=need_dx,
         need_dw=need_dw,
@@ -5565,11 +5571,11 @@ def prepare_lm_head_loss(
         dx_slice_policy=slice_policy,
         dx_red_min_rows=red_min_rows,
         logprob_keep=keep,
-        dcnt=dcnt is not None,
     )
+    plan = plan_of(dcnt=dcnt is not None)
     if plan.dcnt and any(s not in stages for s in plan.stages):
-        # a record without the counted forms: every row computed
-        plan = replace(plan, dcnt=False)
+        # a record without the counted forms: the shipped plan, every row computed
+        plan = plan_of(dcnt=False)
     missing = [s for s in plan.stages if s not in stages]
     if missing:
         raise NotImplementedError(
@@ -5854,7 +5860,8 @@ def logprob_backward_binding_key(
 ) -> tuple:
     """Cache key of a log-probability backward binding (as :func:`forward_binding_key`, the dX slice rule's settings
     ``dx_rule`` included); ``logprob_dz`` the resolved recompute form (:func:`logprob_dz_default`), ``zero_dlogp``
-    whether the call runs the zero-gradient row skip (:func:`zero_dlogp_partition`).  ``lse`` (the
+    whether the call is eligible for the zero-gradient row skip (:func:`zero_dlogp_partition`; the remembered plan
+    tells whether it runs its counted forms).  ``lse`` (the
     forward's statistic) and ``dlogp`` enter by layout only (:func:`_layout`): the binding slots both per call and
     no plan reads their addresses, so a backward whose ``lse`` / ``dlogp`` the caching allocator placed elsewhere --
     each forward allocates a fresh ``lse`` -- runs from the remembered binding instead of binding again."""
@@ -7731,11 +7738,12 @@ def _zero_dlogp_skip(
     need_dx: bool,
     fused_dx: bool,
 ) -> bool:
-    """Whether a log-probability backward that reuses the forward's row index runs the zero-gradient row skip: a
-    compacted call (``row_index`` given) of at least :func:`zero_dlogp_min_rows` rows on the ``cake`` backend, with the
-    ``dz`` arm and, when it produces ``dX``, the fused dX finalize (which writes the skipped rows' exact zeros), on a
-    record that registers the counted dz arm (:data:`LOGPROB_DZ_DCNT_STAGE`) and the partition kernel
-    (:data:`ZERO_DLOGP_PARTITION_STAGE`)."""
+    """Whether a log-probability backward that reuses the forward's row index is eligible for the zero-gradient row
+    skip: a compacted call (``row_index`` given) of at least :func:`zero_dlogp_min_rows` rows on the ``cake`` backend,
+    with the ``dz`` arm and, when it produces ``dX``, the fused dX finalize (which writes the skipped rows' exact zeros),
+    on a record that registers the counted dz arm (:data:`LOGPROB_DZ_DCNT_STAGE`) and the partition kernel
+    (:data:`ZERO_DLOGP_PARTITION_STAGE`).  An eligible call runs the skip when its plan has the counted forms
+    (:attr:`Plan.dcnt`), and the backward without it otherwise."""
     floor = zero_dlogp_min_rows()
     if (
         floor is None
@@ -7796,7 +7804,9 @@ def backward_logprob(
     rows, on a record with the ``_dcnt`` forms): the chunk loop takes the valid rows whose ``dlogp`` is nonzero first and
     its dz, dX and dW GEMMs bound their work by the per-chunk device count of those rows (no host synchronization;
     capturable).  The rows of a zero ``dlogp`` get exact-zero ``dX`` rows and add nothing to ``dW``; ``dX`` of every
-    other row is the same; ``dW`` sums the same nonzero products over the live rows in the new row order (FP32)."""
+    other row is the same; ``dW`` sums the same nonzero products over the live rows in the new row order (FP32).  The
+    call's plan decides: a plan whose chunks take a form without a counted one (an explicitly pinned swapped dX tile or
+    weight-gradient TMA epilogue) runs the backward without the skip, rows in the forward's order."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_inputs(
@@ -7823,7 +7833,9 @@ def backward_logprob(
     )  # resolved once per call
     compact = bool(T and _resolve_compact(compact_rows))
     hc = None
-    skip = False  # the zero-gradient row skip (resolved below for a call that reuses the forward's row index)
+    # the zero-gradient row skip: eligible for a call that reuses the forward's row index (resolved below), run when
+    # the call's plan has its counted forms (``order_rows``)
+    skip = False
     scan = counts = None
     if row_index is not _RECOUNT:
         # the forward's valid-row index: the plan is known without a count (the valid-row mask of the fused dX finalize
@@ -7865,10 +7877,6 @@ def backward_logprob(
         )
     _check_output(lse, "lse", (rows,), torch.float32)
     dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
-    if skip:
-        row_index, lse, scan, counts = zero_dlogp_partition(
-            labels, dlogp, row_index, lse, problem.chunk
-        )
     cache = BINDING_CACHE
     key = None
     valid_count = None if row_index is None else rows
@@ -7885,6 +7893,18 @@ def backward_logprob(
         return finalize_dx(
             dx, None, row_index, row_valid, T, backend=backend, scan=scan
         )
+
+    def order_rows(counted: bool) -> None:
+        # the plan decides the skip: its counted forms order the rows (one partition launch); a plan without them runs
+        # the shipped backward over the forward's row order (no partition, the fused finalize's valid-row mask)
+        nonlocal skip, row_index, lse, scan, counts, row_valid
+        skip = skip and counted
+        if skip:
+            row_index, lse, scan, counts = zero_dlogp_partition(
+                labels, dlogp, row_index, lse, problem.chunk
+            )
+        elif row_valid is None and row_index is not None and fused_dx:
+            row_valid = labels >= 0
 
     if backend == "cake" and cache.enabled:
         key = logprob_backward_binding_key(
@@ -7907,6 +7927,8 @@ def backward_logprob(
         )
         binding = cache.lookup(key)
         if binding is not None:
+            # the key of an eligible call remembers the plan it took (counted, or the shipped one)
+            order_rows(binding.plan.dcnt)
             dx, dw = binding.backward_logprob(
                 X, W, labels, lse, dlogp, row_index, hc, stream_mode, fill_side, counts
             )
@@ -7931,15 +7953,22 @@ def backward_logprob(
         dw_stream=stream_mode,
         logprob_dz=dz_arm,
         dx_rule=rule,
-        dcnt=counts,
+        # an eligible call plans with the counted forms; the counts follow the plan (the runner binds this slot, the
+        # call launches from its binding with the counts of the rows it ordered)
+        dcnt=torch.empty(
+            (-(-rows // problem.chunk),), dtype=torch.int32, device=X.device
+        )
+        if skip
+        else None,
     )
-    if hc is not None:
+    order_rows(runner.plan.dcnt)
+    if hc is not None or skip:
         binding = _Binding.from_runner(runner, hc)
         del runner
         if key is not None:
             cache.remember(key, binding)
         dx, dw = binding.backward_logprob(
-            X, W, labels, lse, dlogp, row_index, hc, stream_mode, fill_side
+            X, W, labels, lse, dlogp, row_index, hc, stream_mode, fill_side, counts
         )
         return finish_dx(dx), dw
     dx, dw = runner.backward()

@@ -6590,6 +6590,66 @@ def test_plan_runs_the_counted_forms():
     assert key(zero_dlogp=True) != key() == key(zero_dlogp=False)
 
 
+def test_plan_counts_the_short_last_chunk_of_a_long_call():
+    """A log-probability call whose last chunk takes the TMA-epilogue bf16 cast in the shipped plan (61779 valid rows:
+    fifteen chunks of 4096 and one of 339, the T = 65031 timing row) keeps the counted forms: its counted plan casts
+    the last chunk through the counted shipped cast, every other chunk's forms unchanged, and no chunk takes the
+    swapped dX tile (the swap rule serves the cross-entropy loss only).  An explicitly pinned weight-gradient TMA
+    epilogue, or swapped dX tile, keeps the shipped plan."""
+    g = cake_backend.Geometry.from_record(
+        {"geometry": {"hidden": 6144, "vocab": 154880}}
+    )
+    common = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        dx_finalize=True,
+        logprob_dz=True,
+    )
+    rows = 15 * 4096 + 339
+    problem = _keep_problem(65031, 6144, 154880, 4096, entry="logprob")
+    for arch in ("sm_100a", "sm_103a"):
+        kw = dict(common, arch=arch)
+        plain = cake_backend.make_plan(problem, valid_rows=rows, **kw)
+        plan = cake_backend.make_plan(problem, valid_rows=rows, dcnt=True, **kw)
+        assert plain.num_chunks == 16 and plain.chunks[-1] == (15 * 4096, 339)
+        assert not plain.dcnt and plain.variants[-1].dw_cast_tma
+        assert plain.dw_cast_stage == "gemm_dw_cast_bf16_tma"
+        assert plan.dcnt, arch
+        assert plan.chunks == plain.chunks and plan.dx_slices == plain.dx_slices
+        assert not any(v.dx_swab or v.dw_cast_tma for v in plain.variants[:-1])
+        assert not any(v.dx_swab or v.dw_cast_tma for v in plan.variants)
+        assert plan.variants[:-1] == plain.variants[:-1]
+        assert (
+            dataclasses.replace(plan.variants[-1], dw_cast_tma=True)
+            == plain.variants[-1]
+        )
+        assert plan.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
+        for i in range(plan.num_chunks):
+            assert plan.recompute_stage(i) == "gemm_logits_dz_dcnt"
+            assert plan.dx_stage_of(i).endswith("_dcnt") == (
+                plan.dx_slices_of(i) > 1
+            ), plan.dx_stage_of(i)
+        assert all(s.endswith("_dcnt") for s in plan.stages if s.startswith("gemm_dw"))
+        assert {s.removesuffix("_dcnt") for s in plan.stages} == (
+            set(plain.stages) - {"gemm_dw_cast_bf16_tma"}
+        ) | {"gemm_dw_cast_bf16"}
+        pins = [{"dw": {"epi_store": "tma"}}]
+        if arch in cake_backend.DX_SWAB_ARCHES:
+            pins.append({"dx": {"swap_ab": True, "tile_n": 512}})
+        for pin in pins:
+            pinned = dict(kw, gemm_tuning=pin)
+            shipped = cake_backend.make_plan(problem, valid_rows=rows, **pinned)
+            counted = cake_backend.make_plan(
+                problem, valid_rows=rows, dcnt=True, **pinned
+            )
+            assert not counted.dcnt and counted == shipped, pin
+
+
 ZERO_DLOGP_DEVICE_CASES = [
     (4097, "none"),
     (4097, "one"),
@@ -6681,6 +6741,140 @@ def test_device_zero_dlogp_skip_runs_the_partition_kernel(glm_weight, monkeypatc
     assert _same_bits(kernel["dW"], torch_order["dW"])
     for run in (kernel, torch_order):
         assert not bool(_bits(run["dX"][zero | ~valid]).any())
+
+
+def _logprob_bwd_plans():
+    """The plans of the remembered log-probability backward bindings, oldest first."""
+    return [
+        (b.plan, b.backward_run)
+        for k, b in cake_backend.BINDING_CACHE._bindings.items()
+        if k[:2] == ("bwd", "logprob")
+    ]
+
+
+def test_device_zero_dlogp_plan_without_counted_forms_runs_the_shipped_backward(
+    glm_weight, monkeypatch
+):
+    """An eligible backward whose plan has no counted forms (forced here: ``make_plan`` resolves ``dcnt`` off, as it
+    does for an explicitly pinned swapped dX tile or weight-gradient TMA epilogue) launches no partition -- binding
+    (first call) and from the remembered binding (second call) -- and runs the backward without the skip: the plan and
+    launch sequence of the backward with the skip off, the same ``logp`` and ``dW`` bits, ``dX`` within its unordered
+    K-slice reduction, the zero rows' ``dX`` zeros."""
+    _require_program(entry="logprob")
+    base = _device_inputs(8117, "ce", W=glm_weight)
+    zero = _zero_dlogp_set(base, ("random", 0.3))
+    inp = _with_zero_dlogp(base, zero, negative_zero=False)
+    make_plan = cake_backend.make_plan
+
+    def uncounted(*args, **kwargs):
+        return make_plan(*args, **dict(kwargs, dcnt=False))
+
+    def refused(*args, **kwargs):
+        raise AssertionError(
+            "a backward whose plan has no counted forms ran the partition"
+        )
+
+    cake_backend.BINDING_CACHE.clear()
+    monkeypatch.setattr(cake_backend, "make_plan", uncounted)
+    monkeypatch.setattr(cake_backend, "zero_dlogp_partition", refused)
+    with _zero_dlogp_floor(0):
+        runs = [_logprob_call(inp), _logprob_call(inp)]
+    with _zero_dlogp_floor(None):
+        plain = _logprob_call(inp)
+    (eligible, eligible_run), (shipped, shipped_run) = _logprob_bwd_plans()
+    assert not eligible.dcnt and eligible == shipped and eligible_run == shipped_run
+    valid = inp.labels >= 0
+    live = valid & ~zero
+    scale = float(plain["dX"][live].float().abs().max())
+    for run in runs:
+        for key in ("logp", "dW"):
+            assert _same_bits(run[key], plain[key]), key
+        assert not bool(run["dX"][zero | ~valid].float().any())
+        dx_diff = float(
+            (run["dX"][live].float() - plain["dX"][live].float()).abs().max()
+        )
+        assert dx_diff <= scale * 2**-7, (dx_diff, scale)
+
+
+def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
+    glm_weight, monkeypatch
+):
+    """A backward whose last chunk the shipped plan casts through the TMA-epilogue bf16 cast (two chunks, the second of
+    about 650 rows) keeps the skip: the partition runs (binding and remembered binding), the remembered plan casts the
+    last chunk through the counted shipped cast, and the results pass the skip suite's checks against the backward
+    without the skip and the FP64 oracle."""
+    _require_program(entry="logprob")
+    _module_name, record = cake_backend.record_for(CUDA)
+    base = _device_inputs(5000, "ce", W=glm_weight)
+    zero = _zero_dlogp_set(base, ("random", 0.5))
+    inp = _with_zero_dlogp(base, zero)
+    partition = cake_backend.zero_dlogp_partition
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(int(args[2].numel()))
+        return partition(*args, **kwargs)
+
+    cake_backend.BINDING_CACHE.clear()
+    monkeypatch.setattr(cake_backend, "zero_dlogp_partition", counted)
+    with _zero_dlogp_floor(0):
+        nd = _logprob_call(inp)
+        again = _logprob_call(inp)
+    with _zero_dlogp_floor(None):
+        plain = _logprob_call(inp)
+    valid = inp.labels >= 0
+    rows = int(valid.sum())
+    assert calls == [rows, rows]
+    (skip_plan, _), (shipped, _) = _logprob_bwd_plans()
+    assert skip_plan.dcnt and not shipped.dcnt
+    assert skip_plan.num_chunks == 2 and skip_plan.chunks[-1][1] == rows - 4096
+    tma = cake_backend.dw_cast_tma_rule(2, rows - 4096, record["arch"])
+    assert shipped.dw_cast_stage == (
+        "gemm_dw_cast_bf16_tma" if tma else "gemm_dw_cast_bf16"
+    )
+    assert skip_plan.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
+    live = valid & ~zero
+    assert _same_bits(nd["logp"], plain["logp"])
+    scale = float(plain["dX"][live].float().abs().max())
+    for run in (nd, again):
+        assert not bool(_bits(run["dX"][zero | ~valid]).any())
+        dx_diff = float(
+            (run["dX"][live].float() - plain["dX"][live].float()).abs().max()
+        )
+        assert dx_diff <= scale * 2**-7, (dx_diff, scale)
+        _check_against_references(run, inp, entry="logprob", ceiling=True)
+
+
+def test_device_zero_dlogp_default_floor_is_one_row_above_a_chunk(
+    glm_weight, monkeypatch
+):
+    """The default floor is one row above a default 4096-row chunk: a backward of 4096 valid rows runs without the skip,
+    one of 4097 valid rows runs it (the zero rows' ``dX`` zeros either way)."""
+    _require_program(entry="logprob")
+    assert (
+        cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT
+        == cake_backend.DEFAULT_CHUNK_SIZE + 1
+        == 4097
+    )
+    partition = cake_backend.zero_dlogp_partition
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(int(args[2].numel()))
+        return partition(*args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "zero_dlogp_partition", counted)
+    with _zero_dlogp_floor(cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT):
+        for T in (4097, 4098):
+            base = _device_inputs(T, "ce", W=glm_weight, ignore_frac=0.0)
+            labels = base.labels.clone()
+            # one ignored row: a compacted call of T - 1 valid rows
+            labels[T // 2] = -100
+            base = dataclasses.replace(base, labels=labels)
+            zero = _zero_dlogp_set(base, ("random", 0.3))
+            run = _logprob_call(_with_zero_dlogp(base, zero, negative_zero=False))
+            assert not bool(run["dX"][zero].float().any()), T
+    assert calls == [4097]
 
 
 def test_device_zero_dlogp_rows_repeat(glm_weight):
