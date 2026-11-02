@@ -914,7 +914,9 @@ class _NoCollectives:
     """``torch.distributed`` as the KCP modules see it in :func:`test_l2n_refusal_messages_are_pinned`: the queries
     pass through, any other attribute (a collective, a group constructor) raises :class:`_Stop`."""
 
-    _QUERIES = frozenset({"is_available", "is_initialized", "get_rank", "get_world_size"})
+    _QUERIES = frozenset(
+        {"is_available", "is_initialized", "get_rank", "get_world_size"}
+    )
 
     def __getattr__(self, name: str):
         if name in self._QUERIES:
@@ -1041,7 +1043,13 @@ def test_l2n_refusal_messages_are_pinned(capable, monkeypatch) -> None:
         "allocate the WorkspaceDetKcp with use_qk_l2norm_in_kernel=True"
     )
     for name, entry in entries(ops, ctx).items():
-        raises(entry, {"workspace": lean_off, **L2N}, ValueError, mode, f"lean_flag_off_workspace/{name}")
+        raises(
+            entry,
+            {"workspace": lean_off, **L2N},
+            ValueError,
+            mode,
+            f"lean_flag_off_workspace/{name}",
+        )
     # a rank without tokens: the same q / k metadata refusals with the same messages (the base address is per rank;
     # an empty v / g / beta has no element a stride addresses; the shape message names the rank's token count)
     for row, bad, kind, message in _refusal_rows(0, H):
