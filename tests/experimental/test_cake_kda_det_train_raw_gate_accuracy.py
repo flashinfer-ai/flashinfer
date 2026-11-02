@@ -206,7 +206,9 @@ def arm_explicit(inputs: dict, gate_fn: GateFn) -> dict:
     q, k, v, raw, beta, a_log, dt_bias = leaves
     g = gate_fn(raw, a_log, dt_bias)
     assert g.dtype == torch.float32 and g.shape == raw.shape, (g.dtype, g.shape)
-    out = cake_backend.chunk_kda_det(q, k, v, g.contiguous(), beta, inputs["cu_seqlens"])
+    out = cake_backend.chunk_kda_det(
+        q, k, v, g.contiguous(), beta, inputs["cu_seqlens"]
+    )
     out.backward(inputs["dout"])
     return _results(out, leaves)
 

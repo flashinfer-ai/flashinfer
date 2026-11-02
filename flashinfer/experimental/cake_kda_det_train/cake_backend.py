@@ -148,7 +148,7 @@ import threading
 import types
 import weakref
 from collections.abc import Callable, Iterator, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -784,11 +784,32 @@ def _plan_arch(arch: str | None) -> str:
     return cake_jit.ARCHES[0]
 
 
+def _gates() -> tuple[str, ...]:
+    """The gate modes the rendered records serve: ``cake_jit.GATES`` (``"g"``, ``"raw"``) of a render that carries
+    the raw-gate records, ``("g",)`` of one that does not (its ``select_record`` has no ``gate`` class)."""
+    return tuple(getattr(cake_jit, "GATES", ("g",)))
+
+
 def _check_gate(gate: str) -> str:
-    """``gate`` when it is a gate mode of ``cake_jit.GATES`` (``"g"``, ``"raw"``), else ``ValueError``."""
-    if gate not in cake_jit.GATES:
-        raise ValueError(f"gate must be one of {cake_jit.GATES}, got {gate!r}")
+    """``gate`` when it is a gate mode of the rendered records (:func:`_gates`), else ``ValueError``: ``"raw"``
+    is refused by a render without the raw-gate records."""
+    gates = _gates()
+    if gate not in gates:
+        raise ValueError(
+            f"gate must be one of {gates}, got {gate!r}"
+            + ("" if gate != "raw" else " (this build renders no raw-gate records)")
+        )
     return gate
+
+
+def _select_record(stage: str, gate: str, **scalars: Any) -> str | None:
+    """``cake_jit.select_record`` of ``stage`` in gate class ``gate`` (checked by :func:`_check_gate`).  The
+    default ``"g"`` calls it without ``gate``, which every render accepts; ``"raw"`` passes ``gate``, which only a
+    render with the raw-gate records (``cake_jit.GATES``) takes."""
+    if _check_gate(gate) == "g":
+        return cake_jit.select_record(stage, **scalars)
+    select: Callable[..., str | None] = cake_jit.select_record
+    return select(stage, gate=gate, **scalars)
 
 
 def plan(
@@ -841,9 +862,7 @@ def _plan(
     # the saved-state path exists on the segmented route only (the serial route has no segment states)
     records = {
         path: {
-            stage: cake_jit.select_record(
-                stage, **scalars, arch=arch, path=path, gate=gate
-            )
+            stage: _select_record(stage, gate, **scalars, arch=arch, path=path)
             for stage in _PATH_STAGES[path]
         }
         for path in PATHS
@@ -909,15 +928,15 @@ def _gate_fused(arch: str | None, gate: str = "g") -> bool:
     reads the raw class, which has no gate epilogue: True on every architecture."""
     arch = cake_jit.ARCHES[0] if arch is None else arch
     return (
-        cake_jit.select_record(
+        _select_record(
             "gate_epilogue",
+            gate,
             num_chunks_pad=2,
             num_seqs=1,
             num_heads=1,
             sm_count=1,
             arch=arch,
             path="light",
-            gate=_check_gate(gate),
         )
         is None
     )
@@ -4370,7 +4389,17 @@ def _backward(
     return dq, dk, dv, dbeta, dg
 
 
-def _check_saved_gate(saved: KdaDetChunkSaved, gp: _GateParams | None) -> None:
+class _GateSaved(Protocol):
+    """What :func:`_check_saved_gate` reads of a saved set (``KdaDetChunkSaved``, and the KCP saved set)."""
+
+    @property
+    def gate(self) -> str: ...
+
+    @property
+    def lower_bound(self) -> float | None: ...
+
+
+def _check_saved_gate(saved: _GateSaved, gp: _GateParams | None) -> None:
     """``ValueError`` when the saved set's gate mode or (raw mode) the FP32 bits of its ``lower_bound`` differ from
     the call's: the set's tensors were formed from the other gate."""
     gate = "g" if gp is None else "raw"
