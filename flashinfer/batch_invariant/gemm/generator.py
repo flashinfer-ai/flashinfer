@@ -7,7 +7,7 @@ A GEMM kernel is generated from three typed parts, and nothing else:
   per-element order;
 * the **mainloop block** (:class:`MainloopBlock`): the tcgen05 K pipeline (``blocks/mainloop.py``), opaque to the
   engine below one instruction; its instruction variant is a function of the knobs and is the single hardware
-  assumption (A2) the full-space GPU test discharges;
+  assumption (A2) the GPU configuration-agreement tests discharge;
 * the **knobs** (:class:`Knobs`): tile M/N, 1-/2-CTA MMA, cluster shape, raster order, swizzle, grid size and the
   in-CTA chunk fold. They choose which CTA owns which output tile, the pipeline depth and the launch geometry;
   they cannot reach the reduction or the epilogue arithmetic. The enumerated knob product filtered by the kernel's
@@ -187,7 +187,8 @@ def enumerate_space(
     b_major: str = "n",
 ) -> List[Knobs]:
     """The configuration space for a shape and class: the knob product the kernel body accepts (``can_implement``)
-    for ``chunks`` (the class's chunk count). This is the set R3 is claimed over and the full-space test covers."""
+    for ``chunks`` (the class's chunk count). This is the set R3 is claimed over; the GPU configuration-agreement tests
+    check the dispatcher's candidates and sampled records of it against each other."""
     from .blocks.operands import can_implement
 
     return [

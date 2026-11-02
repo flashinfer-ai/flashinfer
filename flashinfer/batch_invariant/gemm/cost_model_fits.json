@@ -1,5 +1,13 @@
 {
   "sm_100": {
+    "_meta": {
+      "part": "SM100, 148 SMs",
+      "date": "2026-10-31",
+      "driver": "615.71.09",
+      "cuda": "13.2",
+      "cutlass_dsl": "4.8.1",
+      "method": "Least-squares fit of the model's constants to CUPTI kernel timings (L2 flushed before every iteration, median of 30 after 5 warm-ups) of every record of the 888-record configuration space at 22 row counts (1 .. 32768) x 12 (N, K) weight shapes, both weight layouts. The sweep harness and the fitting script are not part of this package."
+    },
     "cl4_ns": 8.706448361036513,
     "cluster_pen": 0.015834343690646197,
     "epi_gbps": 1022.2913740099442,
@@ -29,6 +37,14 @@
     "two_cta_gain": 1.0
   },
   "sm_107": {
+    "_meta": {
+      "part": "SM107, 204 SMs",
+      "date": "2026-10-31",
+      "driver": "620.17",
+      "cuda": "13.2",
+      "cutlass_dsl": "4.8.1",
+      "method": "Least-squares fit of the model's constants to CUPTI kernel timings (L2 flushed before every iteration, median of 30 after 5 warm-ups) of every record of the 888-record configuration space at 22 row counts (1 .. 32768) x 12 (N, K) weight shapes, both weight layouts. The sweep harness and the fitting script are not part of this package."
+    },
     "cl4_ns": 31.32737148705333,
     "cluster_pen": 0.01379972780948768,
     "epi_gbps": 1892.4458070593626,

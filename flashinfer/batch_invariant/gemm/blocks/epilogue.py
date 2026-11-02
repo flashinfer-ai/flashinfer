@@ -34,12 +34,12 @@ def tmem_store_atom_for(load_atom: cute.CopyAtom, elem_ty) -> cute.CopyAtom:
     """The ``tcgen05.st`` copy atom of the same shape as a ``tcgen05.ld`` atom (``get_tmem_load_op``'s pick for the epilogue tile):
     the same data-path lanes, bit width and repetition, so a fragment loaded with the one is stored back to the same TMEM
     coordinates with the other (``Ld32x32bOp(x32)`` -> ``St32x32bOp(x32)``, ``Ld16x256bOp(x8)`` -> ``St16x256bOp(x8)``, ...).
-    The atom type prints as ``!cute_nvgpu.atom.tmem_load<f32, 32 DP, 32 bit, x32>``; its trait class names the shape."""
-    trait = type(load_atom._trait).__name__  # e.g. "Ld32x32bTrait"
-    assert trait.startswith("Ld") and trait.endswith("Trait"), trait
-    rep = int(str(load_atom._trait.value.type).rsplit("x", 1)[1].rstrip(">"))
-    st_cls = getattr(tcgen05.copy, "St" + trait[2:-5] + "Op")
-    return cute.make_copy_atom(st_cls(tcgen05.copy.Repetition(rep)), elem_ty)
+    Built from the atom's op (``load_atom.op``: the op class names the shape, ``repeat`` its repetition)."""
+    op = load_atom.op
+    name = type(op).__name__  # e.g. "Ld32x32bOp"
+    assert name.startswith("Ld") and name.endswith("Op"), name
+    st_cls = getattr(tcgen05.copy, "St" + name[2:])
+    return cute.make_copy_atom(st_cls(op.repeat), elem_ty)
 
 
 @cute.jit

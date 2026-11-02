@@ -138,6 +138,7 @@ def _load_fits() -> Dict[str, Fit]:
     if os.path.exists(FITS_PATH):
         with open(FITS_PATH) as f:
             for name, d in json.load(f).items():
+                # a family's entry: its constants plus a `_meta` provenance block (part, date, driver, method)
                 out[name] = Fit(
                     **{k: v for k, v in d.items() if k in Fit.__dataclass_fields__}
                 )

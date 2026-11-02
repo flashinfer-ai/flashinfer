@@ -310,6 +310,42 @@ def test_cta_chunk_fold_equals_workspace_split(M, N, K):
 
 
 @needs_device
+def test_workspace_split_at_large_m():
+    """The split class with its partials in the workspace at M beyond the hardware's grid.y limit (the fixup kernel strides
+    over rows): bit-equal to the in-CTA chunk fold and to its own sub-batch."""
+    M, N, K = 70000, 128, 8192
+    C = chunks_for(N, K)
+    assert C == 4
+    a, b = rnd_bf16(M, K, 111), rnd_bf16(K, N, 112)
+    ws_rec = Knobs((128, 64), (1, 1), False, True, "m", 1)
+    cta_rec = Knobs((128, 64), (1, 1), False, True, "m", 1, 0, True)
+    full = bits(mm_bf16_batch_invariant(a, b, config=ws_rec, chunks=C))
+    assert torch.equal(
+        full, bits(mm_bf16_batch_invariant(a, b, config=cta_rec, chunks=C))
+    )
+    assert torch.equal(
+        bits(mm_bf16_batch_invariant(a[:1000], b, config=ws_rec, chunks=C)), full[:1000]
+    )
+    ws = torch.empty(C * M * N + 4, dtype=torch.float32, device="cuda")
+    assert torch.equal(
+        bits(
+            mm_bf16_batch_invariant(
+                a, b, config=ws_rec, chunks=C, workspace=ws[: C * M * N]
+            )
+        ),
+        full,
+    )
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="workspace"):
+        mm_bf16_batch_invariant(
+            a[:16], b, config=ws_rec, chunks=C, workspace=ws[1 : 1 + C * 16 * N]
+        )  # 4-byte offset
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="workspace"):
+        mm_bf16_batch_invariant(
+            a[:16], b, config=ws_rec, chunks=C, workspace=ws[: 2 * C * 16 * N : 2]
+        )  # strided
+
+
+@needs_device
 def test_persistent_grid_size_does_not_change_bits():
     """R2 for the SM count: a smaller persistent grid is what a smaller part, an SM carveout, MPS or a green context
     produce; it only decides which CTA computes which tile (and, for the split class, which chunk)."""

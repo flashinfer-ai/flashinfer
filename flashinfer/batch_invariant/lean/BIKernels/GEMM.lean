@@ -13,7 +13,8 @@ Two consistency classes:
 What is modelled: the per-element dataflow, the split kernel's index-addressed workspace, and the batched launch
 (rows -> per-row kernel). What is *not* modelled, and is covered by the hardware tests: that the tile shape / cluster
 / raster of the kernel leaves `mma16`'s per-element step sequence untouched (the configuration-agreement test over the
-dispatcher's candidates).
+dispatcher's candidates), and that the kernel's first K step, issued without an accumulator input, equals `mma16 zero`
+(the two can differ only in the sign of an all-zero result).
 -/
 namespace BIK.GEMM
 

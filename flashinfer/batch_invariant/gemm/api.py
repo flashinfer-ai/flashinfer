@@ -134,22 +134,19 @@ def mm_bf16_batch_invariant(
     if config is None:
         config = default_config(M, N, K, C, b_major, *part_of(a.device))
     from .blocks.compile import get_compiled_gemm
+    from .fixup import MAX_GRID_Y, get_fixup
 
-    kernel = get_compiled_gemm(config, b_major, C)
-    if C == 1:
-        # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors with l = 1
-        kernel(a.unsqueeze(-1), b.t().unsqueeze(-1), out.unsqueeze(-1))
-        return out
-    # the fixed-chunk split: the batch index is the K chunk; the partials in an fp32 workspace, or in TMEM (cta_chunks)
+    kernel = get_compiled_gemm(config, b_major, C, sm_count_of(a.device))
+    # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk (1 for the unsplit class and the in-CTA
+    # fold's output); every stride handed over is a multiple of the declared 16-byte alignment, the size-1 l stride included
     Kc = K // C
     a3 = a.as_strided((M, Kc, C), (a.stride(0), 1, Kc))
     bt = b.t()  # (N, K) view with strides (1, N) or (K, 1)
     b3 = bt.as_strided((N, Kc, C), (bt.stride(0), bt.stride(1), Kc * bt.stride(1)))
-    if config.cta_chunks:
-        kernel(a3, b3, out.unsqueeze(-1))
+    if C == 1 or config.cta_chunks:
+        kernel(a3, b3, out.as_strided((M, N, 1), (out.stride(0), 1, N)))
         return out
-    from .fixup import get_fixup
-
+    # the fixed-chunk split with the partials in an fp32 workspace, folded in chunk order by the fixup kernel
     if workspace is None:
         ws = torch.empty(C, M, N, dtype=torch.float32, device=a.device)
     else:
@@ -157,14 +154,16 @@ def mm_bf16_batch_invariant(
             workspace.dtype != torch.float32
             or workspace.device != a.device
             or workspace.numel() < C * M * N
+            or not workspace.is_contiguous()
+            or workspace.data_ptr() % 16
         ):
             raise unsupported(
                 CLASS,
                 "the given workspace",
-                f"an fp32 tensor on A's device of at least {C * M * N} elements",
+                f"a contiguous, 16-byte-aligned fp32 tensor on A's device of at least {C * M * N} elements",
             )
         ws = workspace.reshape(-1)[: C * M * N].view(C, M, N)
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     kernel(a3, b3, ws)
-    get_fixup(C, "bf16")(ws, out, M, N)
+    get_fixup(C, "bf16")(ws, out, M, N, min(M, MAX_GRID_Y))
     return out

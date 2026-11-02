@@ -19,7 +19,8 @@ def all_valid_configs(
     M: int, N: int, K: int, chunks: int = 1, b_major: str = "n"
 ) -> List[GemmConfig]:
     """The configuration space for this shape and class: the generator's knob product filtered by the kernel's own
-    ``can_implement``. This is what the full-space GPU test covers."""
+    ``can_implement``: the set R3 is claimed over. The GPU configuration-agreement tests check the dispatcher's candidates
+    and sampled records of it against each other bit for bit."""
     return enumerate_space(M, N, K, chunks=chunks, b_major=b_major)
 
 
@@ -33,7 +34,9 @@ def chunks_for(N: int, K: int) -> int:
     part. Budget: the fp32 partial round trip (8 * C * M * N bytes) stays below a quarter of the A traffic
     (2 * M * K bytes), i.e. C <= K / (16 N); K / C must be a whole number of 16-wide MMA steps (so every chunk is
     exactly a ``kchunk`` fold of the specification) and >= SPLIT_MIN_KC; and no split at all when N alone gives
-    enough CTAs. Mirrored by ``BIK.GEMM.chunksFor`` in Lean (checked by the generated conformance cases)."""
+    enough CTAs. Because the rule takes no M, a narrow weight runs the chunked class at every M, large prefills included
+    (the fp32 partial round trip is then a bounded fraction of the operand traffic). Mirrored by ``BIK.GEMM.chunksFor``
+    in Lean (checked by the generated conformance cases)."""
     if -(-N // 32) >= SPLIT_MIN_CTAS:
         return 1
     budget = K // (16 * N)

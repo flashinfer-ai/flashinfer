@@ -25,15 +25,16 @@ criterion of every test in `tests/batch_invariant`.
 
 | API | Selection | Classes and fingerprint | Supported inputs |
 |---|---|---|---|
-| `mm_bf16` | `backend="auto", batch_invariant=True` | `gemm.bf16.kfold` (one fp32 fold over the K steps) or `gemm.bf16.kchunk[C]` (K cut into `C` chunks, a function of the weight shape alone); `fingerprint("mm_bf16", N=, K=)` | bf16 `a (M, K)` row-major and bf16 `b (K, N)` row-major or the transpose of a row-major `(N, K)` weight, `K` and `N` multiples of 8, any `M`; bf16 output; no bias; `pdl` accepted (plain stream order). SM100 / SM103 / SM107 |
+| `mm_bf16` | `backend="auto", batch_invariant=True` | `gemm.bf16.kfold` (one fp32 fold over the K steps) or `gemm.bf16.kchunk[C]` (K cut into `C` chunks, a function of the weight shape alone, so a narrow weight runs it at every M); `fingerprint("mm_bf16", N=, K=)` | bf16 `a (M, K)` row-major and bf16 `b (K, N)` row-major or the transpose of a row-major `(N, K)` weight, `K` and `N` multiples of 8, any `M`; bf16 output; no bias; `pdl` accepted (plain stream order). SM100 / SM103 / SM107 |
 
 ## How to check the proofs
 
 `lean/` holds one Lean 4 project (no Mathlib). Per class it models the dataflow as terms over opaque, correctly rounded
 primitives and proves that every implementation of the class the kernels may run (for example a split reduction with its
-index-addressed workspace, or a pipelined loop with any stage count) is the class's term; that no configuration or
-carried state reaches an output element (R3, instantiated on the whole enumerated configuration space); and the
-launch-model statements of R1 and R2. What Lean cannot state is the hardware hypothesis that the instruction variants a
+index-addressed workspace, or a pipelined loop with any stage count) is the class's term, and the launch-model
+statements of R1 and R2. The model gives a configuration no way to reach an output element (R3 is immediate in it, and
+is instantiated on the whole enumerated configuration space); that the kernel realises the model is what the engine's
+lowering trace and the GPU configuration-agreement tests establish. What Lean cannot state is the hardware hypothesis that the instruction variants a
 configuration space selects compute the same per-element function; the GPU configuration-agreement tests check it bit
 for bit.
 

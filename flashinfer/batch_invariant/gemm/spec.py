@@ -40,7 +40,9 @@ IDENTITY_NOTE = (
     f"MMA{MMA_K}(D, 0, 0) == D: the zero-filled K remainder (whole padded steps of the last K-block, TMA zero fill of "
     "both operands) adds products that are all +0; every configuration issues the same padded steps (the inner radix "
     "is fixed), so this corner cannot separate two configurations (R3); the fingerprint hashes the raw K so a padded "
-    "and an unpadded K are distinct specifications"
+    "and an unpadded K are distinct specifications. The kernel's first K step runs the instruction without an accumulator "
+    "input (D = the step's products) where the specification writes MMA(+0, ...): the two can differ only in the sign of "
+    "an all-zero result (every configuration does the same, so R3 holds; the chunked class's add(+0, P) normalises it)"
 )
 
 
