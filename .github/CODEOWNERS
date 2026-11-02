@@ -18,7 +18,7 @@
 # ── Attention ──
 csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 csrc/xqa/                      @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
-flashinfer/attention.py        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
+flashinfer/attention/        @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 include/flashinfer/attention/  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
