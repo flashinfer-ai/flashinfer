@@ -541,6 +541,35 @@ def test_paged_chunking_is_equivalent():
     assert torch.equal(whole[inside], chunked[inside])
 
 
+@pytest.mark.parametrize("next_n", [1, 2])
+def test_paged_request_ranges(next_n, monkeypatch):
+    """A batch whose logits pass ``MAX_LAUNCH_LOGITS`` runs one launch per range of requests (the last one short)
+    with the same bits as one launch, and a plan over that many logits is refused."""
+    heads, page, batch = 64, 64, 37
+    _skip_unless_route(heads, page, next_n)
+    q, kv_cache, _kv, _scale, weights, ctx_2d, block_table, max_len = _inputs(
+        heads, page, next_n, batch, 1024
+    )
+    if not _admitted(q, ctx_2d, max_len, heads, page, next_n):
+        pytest.skip(f"batch {batch} at max_context_len {max_len} is not admitted")
+    whole = fp8_paged_mqa_logits(
+        q, kv_cache, weights, ctx_2d, block_table, None, max_len
+    ).clone()
+    # Ten requests of logits per launch: four ranges, the last one short.
+    stride = _runtime.paged_logits_stride(max_len)
+    monkeypatch.setattr(_runtime, "MAX_LAUNCH_LOGITS", 10 * next_n * stride)
+    split = fp8_paged_mqa_logits(
+        q, kv_cache, weights, ctx_2d, block_table, None, max_len
+    )
+    torch.cuda.synchronize()
+    inside = (
+        torch.arange(max_len, device=q.device)[None, :] < ctx_2d.reshape(-1)[:, None]
+    )
+    assert torch.equal(split[inside], whole[inside])
+    with pytest.raises(ValueError, match="request ranges"):
+        _validation_plan(q, kv_cache, weights, ctx_2d, block_table, max_len)
+
+
 def test_paged_host_helpers_and_rejections():
     assert _runtime.metadata_shape(148) == (149, 2)
     assert _runtime.paged_route_name(64, 64, 2) == "paged:fp8:h64:p64:n2"
