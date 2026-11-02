@@ -2123,6 +2123,31 @@ class TestCuteDslFusedMoeFunctional:
         )
 
     @pytest.mark.parametrize(
+        "quant_mode,use_per_token_activation",
+        [
+            pytest.param("w4a4", False, id="w4a4-per-tensor"),
+            pytest.param("w4a4", True, id="w4a4-per-token"),
+        ],
+    )
+    def test_fp16_output_numerical_accuracy(
+        self,
+        quant_mode: str,
+        use_per_token_activation: bool,
+    ):
+        self._run_numerical_accuracy(
+            ActivationType.Swiglu,
+            num_tokens=515,
+            top_k=8,
+            hidden_size=1024,
+            intermediate_size=2048,
+            num_experts=256,
+            quant_mode=quant_mode,
+            use_per_token_activation=use_per_token_activation,
+            use_fused_finalize=True,
+            output_dtype=torch.float16,
+        )
+
+    @pytest.mark.parametrize(
         "quant_mode,use_per_token_activation,use_fused_finalize,hidden_sizes",
         [
             pytest.param("w4a4", False, True, (256, 384), id="w4a4-per-tensor"),
@@ -2190,6 +2215,7 @@ class TestCuteDslFusedMoeFunctional:
         quant_mode: str,
         use_per_token_activation: bool,
         use_fused_finalize: bool,
+        output_dtype: torch.dtype = torch.bfloat16,
     ):
         from flashinfer import cute_dsl_fused_moe
 
@@ -2225,11 +2251,12 @@ class TestCuteDslFusedMoeFunctional:
             activation_type=activation_type,
             use_fused_finalize=use_fused_finalize,
             quant_mode=quant_mode,
+            output_dtype=output_dtype,
             **api_inputs,
         )
 
         assert result.shape == (num_tokens, hidden_size)
-        assert result.dtype == torch.bfloat16
+        assert result.dtype == output_dtype
         assert not torch.isnan(result).any()
         assert not torch.isinf(result).any()
 
