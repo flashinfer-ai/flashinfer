@@ -125,13 +125,14 @@ def _schedule_meta_reference(ctx_2d, num_sms, split_kv):
 
 
 def _skip_unless_route(heads, page, next_n):
+    """Skip unavailable hardware or routes, while propagating CUDA query failures."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA device required")
-    try:
-        from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
+    from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
 
+    try:
         dense_mqa.device_arch(torch.device("cuda"))
-    except RuntimeError as error:
+    except dense_mqa.UncataloguedArchitectureError as error:
         pytest.skip(str(error))
     if not _runtime.paged_route_available(heads, page, next_n):
         pytest.skip(
@@ -148,8 +149,56 @@ def _catalogued_device_arch():
 
     try:
         return dense_mqa.device_arch(torch.device("cuda"))
-    except RuntimeError:
+    except dense_mqa.UncataloguedArchitectureError:
         return None
+
+
+@pytest.fixture
+def catalogued_device_queries(monkeypatch):
+    """Provide catalogued CUDA device facts without querying a physical device."""
+    from flashinfer import utils
+    from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(utils, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(utils, "get_device_sm_count", lambda device: 148)
+    monkeypatch.setattr(dense_mqa, "device_facts", dense_mqa.device_facts.__wrapped__)
+    return dense_mqa, utils
+
+
+@pytest.mark.parametrize(
+    "query", ["current_device", "get_compute_capability", "get_device_sm_count"]
+)
+def test_paged_device_helpers_propagate_cuda_query_failures(
+    monkeypatch, catalogued_device_queries, query
+):
+    """A CUDA query failure must fail tests instead of becoming an architecture skip."""
+    _dense_mqa, utils = catalogued_device_queries
+
+    def fail_query(*args):
+        """Emulate a runtime failure from one CUDA device query."""
+        raise RuntimeError("sentinel CUDA device query failure")
+
+    target = torch.cuda if query == "current_device" else utils
+    monkeypatch.setattr(target, query, fail_query)
+    with pytest.raises(RuntimeError, match="sentinel CUDA device query failure"):
+        _catalogued_device_arch()
+    with pytest.raises(RuntimeError, match="sentinel CUDA device query failure"):
+        _skip_unless_route(32, 64, 1)
+
+
+def test_paged_device_helpers_skip_uncatalogued_architecture(
+    monkeypatch, catalogued_device_queries
+):
+    """Unsupported hardware remains an intentional skip, distinct from a failed CUDA query."""
+    dense_mqa, utils = catalogued_device_queries
+    monkeypatch.setattr(utils, "get_compute_capability", lambda device: (12, 0))
+    with pytest.raises(dense_mqa.UncataloguedArchitectureError, match="no exported"):
+        dense_mqa.device_facts(0)
+    assert _catalogued_device_arch() is None
+    with pytest.raises(pytest.skip.Exception, match="no exported"):
+        _skip_unless_route(32, 64, 1)
 
 
 def _admitted(q, ctx_2d, max_len, heads, page, next_n):

@@ -107,6 +107,7 @@ FUSED_QLE2048_MAX_Q = 2048
 
 @functools.cache
 def _catalog():
+    """Load the generated route catalog and require its supported schema version."""
     catalog = json.loads(Path(__file__).with_name("dense_mqa_catalog.json").read_text())
     if catalog.get("schema") != CATALOG_SCHEMA:
         raise RuntimeError(
@@ -133,9 +134,13 @@ def _fused_qle2048_bound(arch, queries):
     return bound
 
 
+class UncataloguedArchitectureError(RuntimeError):
+    """The CUDA device architecture has no exported programs in this catalog."""
+
+
 @functools.cache
 def device_facts(device_index):
-    """``(arch, sm_count)`` of one CUDA device through FlashInfer's cached device queries."""
+    """Return ``(arch, sm_count)``; distinguish uncatalogued hardware from CUDA query failures."""
     import torch
 
     from flashinfer.utils import get_compute_capability, get_device_sm_count
@@ -145,7 +150,7 @@ def device_facts(device_index):
     arch = _ARCHES.get(capability)
     catalogued = sorted(_catalog()["arches"])
     if arch is None or arch not in catalogued:
-        raise RuntimeError(
+        raise UncataloguedArchitectureError(
             f"Dense MQA has no exported programs for compute capability "
             f"{capability}; catalogued architectures: {catalogued}"
         )
@@ -298,6 +303,7 @@ def block_q(num_heads=NUM_HEADS):
 
 
 def _route_prefix(precision, num_heads):
+    """Build the route-key prefix, qualifying nondefault head counts explicitly."""
     return precision if num_heads == NUM_HEADS else f"{precision}:h{num_heads}"
 
 
@@ -1098,6 +1104,7 @@ class DenseMqaPlan:
         sm_count=None,
         enforce_admission=True,
     ):
+        """Validate and bind operands without launching a generated program."""
         import torch
 
         arch, num_sms = _resolve_device(q, sm_count)
@@ -1137,7 +1144,11 @@ class DenseMqaPlan:
                 available = False
         if not available:
             try:
-                route = route_name(precision, queries, keys, num_heads)
+                route = (
+                    served_route(precision, queries, keys, num_heads, arch=arch)
+                    if enforce_admission
+                    else route_name(precision, queries, keys, num_heads)
+                )
             except ValueError:
                 route = None
             if route in _catalog()["routes"] and keys >= route_kv_min(route):
