@@ -1321,8 +1321,55 @@ constexpr TileN8Fc2 SelectSm100aTileN8Fc2(const Shape& shape) {
   return TileN8Fc2::kNone;
 }
 
-// sm_103a lists no tile-N8 FC2 rows: every sm_103a row runs its schedule's FC2 program.
-constexpr TileN8Fc2 SelectSm103aTileN8Fc2(const Shape&) { return TileN8Fc2::kNone; }
+// The sm_103a rows of each tile-N8 FC2 program.
+constexpr TileN8Fc2 SelectSm103aTileN8Fc2(const Shape& shape) {
+  const int32_t t = shape.num_tokens;
+  if (IsGeometry(shape, 2048, 512, 512, 10)) {
+    if (TokensIn(t, 1, 2, 3, 4, 5, 13, 20, 21, 22, 26, 27, 29)) return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 23, 24, 25, 28, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2048, 1536, 60, 4)) {
+    if (TokensIn(t, 1, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                 25, 26, 27, 28, 29, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2560, 768, 384, 4)) {
+    if (TokensIn(t, 2, 3, 4, 5, 6, 7, 9, 11, 21, 23, 24, 26, 27, 29, 30, 32))
+      return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 1, 8, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 25, 28, 31))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2048, 768, 128, 8)) {
+    if (TokensIn(t, 3, 4, 10, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                 31, 32))
+      return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 1, 2, 5, 6, 7, 8, 9, 11, 12, 20)) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 4096, 1536, 128, 8)) {
+    if (t >= 1 && t <= 32) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 2048, 512, 256, 8)) {
+    if (TokensIn(t, 1, 2, 3, 4, 5, 7, 11, 12, 16, 17, 23, 24, 25, 28, 29))
+      return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 6, 8, 9, 10, 13, 14, 15, 18, 19, 20, 21, 22, 26, 27, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 4096, 1024, 512, 10)) {
+    if (t >= 1 && t <= 32) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 3072, 1536, 256, 8)) {
+    if (t >= 1 && t <= 32) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 6144, 3072, 128, 4)) {
+    if (TokensIn(t, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 22, 25,
+                 26, 27, 28, 29, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 4096, 512, 512, 10)) {
+    if (TokensIn(t, 1, 6, 7, 8, 11)) return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 3, 9, 10, 15)) return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 3072, 768, 256, 8)) {
+    if (TokensIn(t, 1, 3)) return TileN8Fc2::kK256Stage6;
+    if (TokensIn(t, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+                 25, 26, 27, 28, 29, 30, 31, 32))
+      return TileN8Fc2::kK512Stage5;
+  } else if (IsGeometry(shape, 3072, 384, 256, 8)) {
+    if (TokensIn(t, 2, 4, 5, 6, 9)) return TileN8Fc2::kK256Stage6;
+  }
+  return TileN8Fc2::kNone;
+}
 
 constexpr TileN8Fc2 SelectTileN8Fc2(Target target, const Shape& shape) {
   return target == Target::kSm100a ? SelectSm100aTileN8Fc2(shape) : SelectSm103aTileN8Fc2(shape);
@@ -1374,10 +1421,10 @@ static_assert(TileN8Fc2RowCount(Target::kSm100a, TileN8Fc2::kK256Stage6) == 34);
 static_assert(TileN8Fc2RowCount(Target::kSm100a, TileN8Fc2::kExpertGather) == 16);
 static_assert(TileN8Fc2RowCount(Target::kSm100a, TileN8Fc2::kK256Stage9) == 3);
 static_assert(TileN8Fc2RowCount(Target::kSm100a, TileN8Fc2::kK512Stage5) == 249);
-static_assert(TileN8Fc2RowCount(Target::kSm103a, TileN8Fc2::kK256Stage6) == 0);
+static_assert(TileN8Fc2RowCount(Target::kSm103a, TileN8Fc2::kK256Stage6) == 77);
 static_assert(TileN8Fc2RowCount(Target::kSm103a, TileN8Fc2::kExpertGather) == 0);
 static_assert(TileN8Fc2RowCount(Target::kSm103a, TileN8Fc2::kK256Stage9) == 0);
-static_assert(TileN8Fc2RowCount(Target::kSm103a, TileN8Fc2::kK512Stage5) == 0);
+static_assert(TileN8Fc2RowCount(Target::kSm103a, TileN8Fc2::kK512Stage5) == 252);
 static_assert(SelectTileN8Fc2(Target::kSm100a, {3, 3072, 384, 256, 256, 8}) ==
               TileN8Fc2::kK256Stage6);
 static_assert(SelectTileN8Fc2(Target::kSm100a, {4, 3072, 1536, 256, 256, 8}) ==
@@ -1386,8 +1433,10 @@ static_assert(SelectTileN8Fc2(Target::kSm100a, {25, 3072, 768, 256, 256, 8}) ==
               TileN8Fc2::kK256Stage9);
 static_assert(SelectTileN8Fc2(Target::kSm100a, {27, 2048, 512, 256, 256, 8}) ==
               TileN8Fc2::kK512Stage5);
-static_assert(SelectTileN8Fc2(Target::kSm103a, {3, 2560, 768, 384, 384, 4}) == TileN8Fc2::kNone);
-static_assert(SelectTileN8Fc2(Target::kSm103a, {15, 2560, 768, 384, 384, 4}) == TileN8Fc2::kNone);
+static_assert(SelectTileN8Fc2(Target::kSm103a, {3, 2560, 768, 384, 384, 4}) ==
+              TileN8Fc2::kK256Stage6);
+static_assert(SelectTileN8Fc2(Target::kSm103a, {15, 2560, 768, 384, 384, 4}) ==
+              TileN8Fc2::kK512Stage5);
 
 struct Invocation {
   Shape shape;
