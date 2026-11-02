@@ -72,6 +72,7 @@ def rubin_bootstrap(request):
             ("mxfp8_e4m3", "inference", False),
             ("mxfp8_e5m2", "inference", False),
             ("mxfp4_mxfp8", "inference", False),
+            ("mxfp4", "inference", False),
             ("nvfp4", "genphase", False),
             ("nvfp4", "inference", True),
         ]
@@ -79,7 +80,7 @@ def rubin_bootstrap(request):
     ]
     + [
         (kind, "genphase", False, (512, 256, 8, 96, 128), "native")
-        for kind in ("mxfp8_e4m3", "mxfp4_mxfp8")
+        for kind in ("mxfp8_e4m3", "mxfp4", "mxfp4_mxfp8")
     ]
     + [("mxfp4_mxfp8", "genphase", False, (512, 256, 8, 96, 128), "prequantized")]
     + [

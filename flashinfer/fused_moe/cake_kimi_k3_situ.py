@@ -54,6 +54,8 @@ _MID_Q8I_TOKENS = (4096,)
 # memory and reserve a block of rows per CTA (1024 routed pairs per CTA; the
 # "large_q8i_p1024" selector) -- the 16384-token row of sm_100a today.  Every
 # other large row keeps the production routing kernels (256 pairs per CTA).
+# The same route's finalize issues the 8-bit partial-row loads of all 16 routed
+# slots of a token before it dequantizes and accumulates them in slot order.
 _LARGE_P1024_ARCHES = ("sm_100a",)
 _LARGE_P1024_TOKENS = (16384,)
 # Architectures and token counts whose large route fuses the quantization with the
@@ -212,7 +214,7 @@ _SELECTORS = {
         _generic(
             128,
             fc2="fc2:n128_q8i",
-            finalize="finalize:n128_q8i",
+            finalize="finalize:n128_q8i_mlp16",
             extra={
                 "route_histogram": "route_histogram:n128_p1024",
                 "route_scatter": "route_scatter:n128_p1024",

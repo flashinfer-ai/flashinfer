@@ -756,8 +756,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     if (0 < k_iters_m) {
                         mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_0 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_1 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_0 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_1 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -796,8 +801,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     if (1 < k_iters_m) {
                         mbarrier_wait(tma_full_addr + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 8, ((mma_tma_stage + 1 < 4) ? _phase_tma_full : _phase_tma_full ^ 1));
                         asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_2 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
                         int _smem_desc_lo_3 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
+#else
+                        int _smem_desc_lo_2 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
+                        int _smem_desc_lo_3 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -836,8 +846,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     if (2 < k_iters_m) {
                         mbarrier_wait(tma_full_addr + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 8, _phase_tma_full ^ (unsigned int)(mma_tma_stage + 2 >= 4));
                         asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_4 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
                         int _smem_desc_lo_5 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
+#else
+                        int _smem_desc_lo_4 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
+                        int _smem_desc_lo_5 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -876,8 +891,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     if (3 < k_iters_m) {
                         mbarrier_wait(tma_full_addr + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 8, _phase_tma_full ^ (unsigned int)(mma_tma_stage + 3 >= 4));
                         asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_6 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
                         int _smem_desc_lo_7 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
+#else
+                        int _smem_desc_lo_6 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
+                        int _smem_desc_lo_7 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -916,8 +936,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     mbarrier_wait(epilogue_done_addr, _phase_epi_free0);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     if (0 < k_iters_m) {
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_8 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_9 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_8 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_9 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -957,8 +982,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         if (mma_tma_stage == 4) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                     }
                     if (1 < k_iters_m) {
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_10 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_11 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_10 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_11 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -998,8 +1028,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         if (mma_tma_stage == 4) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                     }
                     if (2 < k_iters_m) {
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_12 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_13 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_12 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_13 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1039,8 +1074,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                         if (mma_tma_stage == 4) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                     }
                     if (3 < k_iters_m) {
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_14 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_15 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_14 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_15 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1083,8 +1123,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     for (int iter_k_m = 4; iter_k_m < k_iters_m; iter_k_m++) {
                         mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_16 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_17 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_16 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_17 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1104,8 +1149,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "@leader tcgen05.mma.cta_group::2.kind::f16.collector::a::fill [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_16), "r"(_smem_desc_lo_17), "r"(tmem_accum), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_18 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_19 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_18 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_19 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1125,8 +1175,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "@leader tcgen05.mma.cta_group::2.kind::f16.collector::a::lastuse [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_18), "r"(_smem_desc_lo_19), "r"((tmem_accum + (256))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_20 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_21 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_20 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_21 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1146,8 +1201,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "@leader tcgen05.mma.cta_group::2.kind::f16.collector::a::fill [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_20), "r"(_smem_desc_lo_21), "r"(tmem_accum), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_22 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_23 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_22 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_23 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1167,8 +1227,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "@leader tcgen05.mma.cta_group::2.kind::f16.collector::a::lastuse [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_22), "r"(_smem_desc_lo_23), "r"((tmem_accum + (256))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_24 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_25 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_24 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_25 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1188,8 +1253,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "@leader tcgen05.mma.cta_group::2.kind::f16.collector::a::fill [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_24), "r"(_smem_desc_lo_25), "r"(tmem_accum), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_26 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_27 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_26 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_27 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1209,8 +1279,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "@leader tcgen05.mma.cta_group::2.kind::f16.collector::a::lastuse [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_26), "r"(_smem_desc_lo_27), "r"((tmem_accum + (256))), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_28 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_29 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_28 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_29 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1230,8 +1305,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "@leader tcgen05.mma.cta_group::2.kind::f16.collector::a::fill [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_28), "r"(_smem_desc_lo_29), "r"(tmem_accum), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_30 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _smem_desc_lo_31 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                        int _smem_desc_lo_30 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _smem_desc_lo_31 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1296,8 +1376,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             if (0 < n_steps_tm) {
                                 mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                                 int _smem_desc_lo_32 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                 int _smem_desc_lo_33 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                int _smem_desc_lo_32 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _smem_desc_lo_33 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1336,8 +1421,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             if (1 < n_steps_tm) {
                                 mbarrier_wait(tma_full_addr + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 8, ((mma_tma_stage + 1 < 4) ? _phase_tma_full : _phase_tma_full ^ 1));
                                 asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                                 int _smem_desc_lo_34 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
                                 int _smem_desc_lo_35 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
+#else
+                                int _smem_desc_lo_34 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
+                                int _smem_desc_lo_35 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
+#endif
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1376,8 +1466,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             if (2 < n_steps_tm) {
                                 mbarrier_wait(tma_full_addr + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 8, _phase_tma_full ^ (unsigned int)(mma_tma_stage + 2 >= 4));
                                 asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                                 int _smem_desc_lo_36 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
                                 int _smem_desc_lo_37 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
+#else
+                                int _smem_desc_lo_36 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
+                                int _smem_desc_lo_37 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
+#endif
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1416,8 +1511,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             if (3 < n_steps_tm) {
                                 mbarrier_wait(tma_full_addr + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 8, _phase_tma_full ^ (unsigned int)(mma_tma_stage + 3 >= 4));
                                 asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                                 int _smem_desc_lo_38 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
                                 int _smem_desc_lo_39 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
+#else
+                                int _smem_desc_lo_38 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
+                                int _smem_desc_lo_39 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
+#endif
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1456,8 +1556,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             mbarrier_wait(epilogue_done_addr, _phase_epi_free0);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             if (0 < n_steps_tm) {
+#if __CUDA_ARCH__ == 1070
                                 int _smem_desc_lo_40 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                 int _smem_desc_lo_41 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                int _smem_desc_lo_40 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _smem_desc_lo_41 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1497,8 +1602,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                 if (mma_tma_stage == 4) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                             }
                             if (1 < n_steps_tm) {
+#if __CUDA_ARCH__ == 1070
                                 int _smem_desc_lo_42 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                 int _smem_desc_lo_43 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                int _smem_desc_lo_42 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _smem_desc_lo_43 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1538,8 +1648,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                 if (mma_tma_stage == 4) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                             }
                             if (2 < n_steps_tm) {
+#if __CUDA_ARCH__ == 1070
                                 int _smem_desc_lo_44 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                 int _smem_desc_lo_45 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                int _smem_desc_lo_44 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _smem_desc_lo_45 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1579,8 +1694,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                 if (mma_tma_stage == 4) { mma_tma_stage = 0; _phase_tma_full ^= 1; }
                             }
                             if (3 < n_steps_tm) {
+#if __CUDA_ARCH__ == 1070
                                 int _smem_desc_lo_46 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                 int _smem_desc_lo_47 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                int _smem_desc_lo_46 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _smem_desc_lo_47 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1623,8 +1743,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             for (int iter_k_mt = 4; iter_k_mt < n_steps_tm; iter_k_mt++) {
                                 mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
                                 int _mma_a_lo_0 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                 int _mma_b_lo_0 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                int _mma_a_lo_0 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _mma_b_lo_0 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1659,8 +1784,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_accum), "r"(1) : "memory");
+#if __CUDA_ARCH__ == 1070
                                 int _mma_a_lo_1 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                 int _mma_b_lo_1 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                int _mma_a_lo_1 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                int _mma_b_lo_1 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1744,8 +1874,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                 mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 if (hh_tm == 0) {
+#if __CUDA_ARCH__ == 1070
                                     int _smem_desc_lo_48 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                     int _smem_desc_lo_49 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                    int _smem_desc_lo_48 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                    int _smem_desc_lo_49 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1786,8 +1921,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                 mbarrier_wait(tma_full_addr + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 8, ((mma_tma_stage + 1 < 4) ? _phase_tma_full : _phase_tma_full ^ 1));
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 if (hh_tm == 0) {
+#if __CUDA_ARCH__ == 1070
                                     int _smem_desc_lo_50 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
                                     int _smem_desc_lo_51 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
+#else
+                                    int _smem_desc_lo_50 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
+                                    int _smem_desc_lo_51 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 1 < 4) ? mma_tma_stage + 1 : (unsigned int)0)) * 3072;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1828,8 +1968,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                 mbarrier_wait(tma_full_addr + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 8, _phase_tma_full ^ (unsigned int)(mma_tma_stage + 2 >= 4));
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 if (hh_tm == 0) {
+#if __CUDA_ARCH__ == 1070
                                     int _smem_desc_lo_52 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
                                     int _smem_desc_lo_53 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
+#else
+                                    int _smem_desc_lo_52 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
+                                    int _smem_desc_lo_53 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 2 >= 4) ? mma_tma_stage + 2 - 4 : mma_tma_stage + 2)) * 3072;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1870,8 +2015,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                 mbarrier_wait(tma_full_addr + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 8, _phase_tma_full ^ (unsigned int)(mma_tma_stage + 3 >= 4));
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 if (hh_tm == 0) {
+#if __CUDA_ARCH__ == 1070
                                     int _smem_desc_lo_54 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
                                     int _smem_desc_lo_55 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
+#else
+                                    int _smem_desc_lo_54 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
+                                    int _smem_desc_lo_55 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (((mma_tma_stage + 3 >= 4) ? mma_tma_stage + 3 - 4 : mma_tma_stage + 3)) * 3072;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1912,8 +2062,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             if (0 < n_steps_tm_1) {
                                 if (hh_tm == 1) {
+#if __CUDA_ARCH__ == 1070
                                     int _smem_desc_lo_56 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                     int _smem_desc_lo_57 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                    int _smem_desc_lo_56 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                    int _smem_desc_lo_57 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1955,8 +2110,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                             if (1 < n_steps_tm_1) {
                                 if (hh_tm == 1) {
+#if __CUDA_ARCH__ == 1070
                                     int _smem_desc_lo_58 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                     int _smem_desc_lo_59 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                    int _smem_desc_lo_58 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                    int _smem_desc_lo_59 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1998,8 +2158,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                             if (2 < n_steps_tm_1) {
                                 if (hh_tm == 1) {
+#if __CUDA_ARCH__ == 1070
                                     int _smem_desc_lo_60 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                     int _smem_desc_lo_61 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                    int _smem_desc_lo_60 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                    int _smem_desc_lo_61 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2041,8 +2206,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                             if (3 < n_steps_tm_1) {
                                 if (hh_tm == 1) {
+#if __CUDA_ARCH__ == 1070
                                     int _smem_desc_lo_62 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                     int _smem_desc_lo_63 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                    int _smem_desc_lo_62 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                    int _smem_desc_lo_63 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2087,8 +2257,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                 mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 if (hh_tm == 0) {
+#if __CUDA_ARCH__ == 1070
                                     int _smem_desc_lo_64 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                     int _smem_desc_lo_65 = ((((smem_b0_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                    int _smem_desc_lo_64 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                    int _smem_desc_lo_65 = ((((smem_b0_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2125,8 +2300,13 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                     :: "r"(_smem_desc_lo_64), "r"(_smem_desc_lo_65), "r"(tmem_accum), "r"(1) : "memory");
                                 }
                                 if (hh_tm == 1) {
+#if __CUDA_ARCH__ == 1070
                                     int _smem_desc_lo_66 = ((((smem_a_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                                     int _smem_desc_lo_67 = ((((smem_b1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#else
+                                    int _smem_desc_lo_66 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                                    int _smem_desc_lo_67 = ((((smem_b1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+#endif
                                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"

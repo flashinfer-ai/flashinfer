@@ -58,20 +58,20 @@ from . import cake_build
 # and ``main``, ``main_wave`` and the ordered fp32 ``tail_reduce`` of the
 # 256-wide k tile.  The 512-wide k tile's weight-gradient routes bind the
 # builds of the deterministic package's k512 forms -- ``main``, ``main_wave``,
-# ``main_halves`` (with the planned tile walk; on sm_107a with the slack tail
-# placement too), ``main_wave_halves`` (waves synchronised every eight) and, on
-# sm_107a, ``main_halves_k256t`` (with the slack tail placement) -- whose split
-# tail is added in place: every unit of a split tail tile adds its fp32
-# accumulator into the tile's fp32 sum in ``tail_sums`` with unordered
-# reductions and counts its arrival on the tile's tickets in ``tail_tickets``;
-# the last unit rounds the sum once, stores it and clears the sum and the
-# tickets.  Those routes have no ``tail_reduce`` stage and launch one kernel.
-# Every whole tile is reduced in a fixed order by one CTA pair, as in the
-# deterministic package; only a split tail tile's units are added in an order
-# the launch does not fix.  With the slack tail placement the kernel plans each
-# launch's tail on the device: when every tail tile fits in the room the full
-# waves leave on the least-loaded clusters, each runs whole on one of them (no
-# sum or ticket is touched), else the tail splits as above.
+# ``main_halves`` (with the planned tile walk and the slack tail placement),
+# ``main_wave_halves`` (waves synchronised every eight) and, on sm_107a,
+# ``main_halves_k256t`` (with the slack tail placement) -- whose split tail is
+# added in place: every unit of a split tail tile adds its fp32 accumulator
+# into the tile's fp32 sum in ``tail_sums`` with unordered reductions and
+# counts its arrival on the tile's tickets in ``tail_tickets``; the last unit
+# rounds the sum once, stores it and clears the sum and the tickets.  Those
+# routes have no ``tail_reduce`` stage and launch one kernel.  Every whole tile
+# is reduced in a fixed order by one CTA pair, as in the deterministic package;
+# only a split tail tile's units are added in an order the launch does not fix.
+# With the slack tail placement the kernel plans each launch's tail on the
+# device: when every tail tile fits in the room the full waves leave on the
+# least-loaded clusters, each runs whole on one of them (no sum or ticket is
+# touched), else the tail splits as above.
 #
 # The host chooses among the stages a route serves by ``HOST_PLAN_CONSTANTS``,
 # with the deterministic package's rules and constants (``cake_backend``,
@@ -178,32 +178,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
         "arches": ["sm_107a"],
-    },
-    "cake_moe_grouped_gemm_3f70fc4be03d3507175c": {
-        "library": "cake_moe_grouped_gemm_3f70fc4be03d3507175c",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "A"],
-            ["tma_buffer", "B"],
-            ["buffer", "C"],
-            ["buffer", "offs"],
-            ["buffer", "tensormap_workspace"],
-            ["buffer", "tail_sums"],
-            ["buffer", "tail_tickets"],
-            ["parameter", "tail_splits"],
-            ["parameter", "raster_rows"],
-            ["parameter", "num_groups"],
-            ["parameter", "sum_m"],
-            ["parameter", "N"],
-            ["parameter", "K"],
-            ["parameter", "ldc"],
-            ["parameter", "stride_e"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_moe_grouped_gemm_4f40b5f07baf6e086fdd": {
         "library": "cake_moe_grouped_gemm_4f40b5f07baf6e086fdd",
@@ -347,7 +321,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
-        "arches": ["sm_107a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
     "cake_moe_grouped_gemm_6db26c5927b4738a8b8f": {
         "library": "cake_moe_grouped_gemm_6db26c5927b4738a8b8f",
@@ -708,11 +682,6 @@ ROUTES: dict[str, dict[str, Any]] = {
                 "specializations": {},
             },
             {
-                "name": "main_halves",
-                "program": "cake_moe_grouped_gemm_3f70fc4be03d3507175c",
-                "specializations": {},
-            },
-            {
                 "name": "main_wave_halves",
                 "program": "cake_moe_grouped_gemm_037c741e69a0ccc696e0",
                 "specializations": {},
@@ -762,11 +731,6 @@ ROUTES: dict[str, dict[str, Any]] = {
             {
                 "name": "main_halves",
                 "program": "cake_moe_grouped_gemm_6be356d4d7ce990aa413",
-                "specializations": {"WGRAD_OUT": 32},
-            },
-            {
-                "name": "main_halves",
-                "program": "cake_moe_grouped_gemm_3f70fc4be03d3507175c",
                 "specializations": {"WGRAD_OUT": 32},
             },
             {

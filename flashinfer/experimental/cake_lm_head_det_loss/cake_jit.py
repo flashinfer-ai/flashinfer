@@ -164,6 +164,125 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "gemm_logits_mcnt_tau": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["parameter", "row0"],
+        ["buffer", "temperature"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_logits_mcnt_tau_tma": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["parameter", "row0"],
+        ["buffer", "temperature"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_logits_dz_tau": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["buffer", "labels"],
+        ["buffer", "lse"],
+        ["buffer", "dlogp"],
+        ["parameter", "row0"],
+        ["parameter", "d_off"],
+        ["buffer", "temperature"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_logits_dz_tau_tma": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["buffer", "labels"],
+        ["buffer", "lse"],
+        ["buffer", "dlogp"],
+        ["parameter", "row0"],
+        ["parameter", "d_off"],
+        ["buffer", "temperature"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "gemm_logits_lbl_tau": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["buffer", "WS"],
+        ["parameter", "ws_slab"],
+        ["parameter", "ldc"],
+        ["parameter", "k_slices"],
+        ["parameter", "k_slice_iters"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["buffer", "labels"],
+        ["parameter", "row0"],
+        ["buffer", "temperature"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "row_finalize": [
         ["buffer", "stats"],
         ["buffer", "z"],
@@ -181,6 +300,28 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "num_tiles"],
         ["parameter", "mode"],
         ["parameter", "loss_div"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
+    "row_finalize_tau": [
+        ["buffer", "stats"],
+        ["buffer", "z"],
+        ["buffer", "labels"],
+        ["buffer", "infer_logp"],
+        ["buffer", "loss_weights"],
+        ["buffer", "d_in"],
+        ["buffer", "lse"],
+        ["buffer", "logp"],
+        ["buffer", "d"],
+        ["buffer", "term"],
+        ["parameter", "rows_c"],
+        ["parameter", "row0"],
+        ["parameter", "V"],
+        ["parameter", "num_tiles"],
+        ["parameter", "mode"],
+        ["parameter", "loss_div"],
+        ["buffer", "temperature"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
@@ -537,9 +678,41 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_logits_mcnt_tau": [
+                "0e73160b377b74dcd49f",
+                "gemm_logits_mcnt_tau",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_dz_tau": [
+                "91c52039389b3bb39d02",
+                "gemm_logits_dz_tau",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_lbl_tau": [
+                "50511cd3af59dabb9d80",
+                "gemm_logits_lbl_tau",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
             "row_finalize": [
                 "61ea8de378a85bd5c55c",
                 "row_finalize",
+                "b256_c1",
+                "rows_c/8",
+                1,
+                1,
+            ],
+            "row_finalize_tau": [
+                "741898f996fe5b9c113d",
+                "row_finalize_tau",
                 "b256_c1",
                 "rows_c/8",
                 1,
@@ -910,9 +1083,41 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_logits_mcnt_tau": [
+                "cf1e24bef995a2fec2f3",
+                "gemm_logits_mcnt_tau_tma",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_dz_tau": [
+                "cdf6cb4552b6385ac483",
+                "gemm_logits_dz_tau_tma",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "gemm_logits_lbl_tau": [
+                "42559b6dc367ad819c8c",
+                "gemm_logits_lbl_tau",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
             "row_finalize": [
                 "61ea8de378a85bd5c55c",
                 "row_finalize",
+                "b256_c1",
+                "rows_c/8",
+                1,
+                1,
+            ],
+            "row_finalize_tau": [
+                "741898f996fe5b9c113d",
+                "row_finalize_tau",
                 "b256_c1",
                 "rows_c/8",
                 1,
@@ -1335,6 +1540,17 @@ MODULES: dict[str, dict[str, Any]] = _expand_registry(_REGISTRY, _ARG_PLANS, _LA
 #                          memory: chunk 0's GEMM of the hidden valid-row count
 #                          path, its stores bounded by min(count, M) while M is
 #                          the buffer extent min(chunk, T).
+# ``gemm_logits_lbl_tau``  the temperature forms of the log-probability entry
+# ``gemm_logits_dz_tau``   (a per-token FP32 ``temperature[row0 + r]``, the
+# ``gemm_logits_mcnt_tau`` compact row like ``labels`` / ``lse``): each BF16-
+# ``row_finalize_tau``     rounded logit is divided once, q = RN(f32(z) / tau_t)
+#                          (IEEE division), before the statistics and the
+#                          ``dz`` arm's exp; the ``dz`` arm also divides its
+#                          row's ``dlogp_t`` once, dt = RN(dlogp_t / tau_t);
+#                          ``row_finalize_tau`` divides the label logit the
+#                          same way (``logp = z_y / tau_t - lse``).  The other
+#                          kernels are unchanged: temperature reaches dX and
+#                          dW only through ``dz``.
 #
 # A record registers the subset its program uses; the host refuses an entry
 # point whose stages are missing.
@@ -1385,7 +1601,11 @@ STAGES = (
 # ``_tma`` the TMA-epilogue form of a GEMM's stores (the bf16 fused weight-
 # gradient cast of a multi-chunk call's last chunk reads the old FP32 sum and
 # stores the bf16 tile as TMA sub-tiles: the same per-element arithmetic),
-# ``_gn`` the 2-D blocked raster of the weight-gradient accumulate / fp32 fused cast.  The
+# ``_gn`` the 2-D blocked raster of the weight-gradient accumulate / fp32 fused cast, ``_tau`` the
+# temperature form of the log-probability entry's logits GEMM arms, of the device-count logits GEMM with the statistics
+# and of ``row_finalize`` (a per-token FP32 temperature operand; selected by the call's ``temperature``, not by a
+# rule; ``row_finalize_tau`` is a form of a row kernel; the ``_tau`` names are not in ``STAGES``, see
+# ``STAGES_WITH_TEMPERATURE`` below).  The
 # call geometry (``H`` / ``V``) and the rules' numeric outputs -- the slice
 # count, the raster height ``group_m``, the block width ``group_n`` -- are
 # launch scalars of these kernels (``cake_backend.gemm_scalars``), so one
@@ -1425,6 +1645,25 @@ ROW_STAGES = (
     "scale_cast_bf16",
     "scale_cast_f32",
     "scale_cast_scatter_bf16",
+)
+
+# The temperature forms (``_tau``) of the log-probability entry: the logits GEMM arms and the device-count logits GEMM
+# with the statistics (``TEMPERATURE_GEMM_STAGES``) and ``row_finalize`` (``TEMPERATURE_ROW_STAGES``).  They stay out
+# of ``STAGES`` / ``GEMM_STAGES`` / ``ROW_STAGES``, the tables a call without a temperature reads per launch; a call
+# with a temperature reads ``STAGES_WITH_TEMPERATURE``, every stage name in launch order (the GEMM forms after the
+# logits GEMMs, ``row_finalize_tau`` after ``row_finalize``).
+TEMPERATURE_GEMM_STAGES = (
+    "gemm_logits_mcnt_tau",
+    "gemm_logits_dz_tau",
+    "gemm_logits_lbl_tau",
+)
+TEMPERATURE_ROW_STAGES = ("row_finalize_tau",)
+STAGES_WITH_TEMPERATURE = (
+    *STAGES[: STAGES.index("row_finalize")],
+    *TEMPERATURE_GEMM_STAGES,
+    "row_finalize",
+    *TEMPERATURE_ROW_STAGES,
+    *STAGES[STAGES.index("row_finalize") + 1 :],
 )
 
 
@@ -1477,6 +1716,20 @@ def registered_stages(name: str) -> tuple[str, ...]:
     present = tuple(stage for stage in STAGES if stage in MODULES[name])
     declared = tuple(MODULES[name].get("stages", present))
     if tuple(s for s in STAGES if s in declared) != present:
+        raise ValueError(
+            f"registry record {name!r} declares stages {declared} but carries {present}"
+        )
+    return present
+
+
+def registered_stages_with_temperature(name: str) -> tuple[str, ...]:
+    """:func:`registered_stages` over :data:`STAGES_WITH_TEMPERATURE`: the stages record ``name`` registers including
+    its temperature forms, in launch order (the stage lists of a call with a temperature)."""
+    present = tuple(
+        stage for stage in STAGES_WITH_TEMPERATURE if stage in MODULES[name]
+    )
+    declared = tuple(MODULES[name].get("stages", present))
+    if tuple(s for s in STAGES_WITH_TEMPERATURE if s in declared) != present:
         raise ValueError(
             f"registry record {name!r} declares stages {declared} but carries {present}"
         )

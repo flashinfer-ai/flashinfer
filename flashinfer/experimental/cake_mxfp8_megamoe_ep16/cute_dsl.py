@@ -46,6 +46,8 @@ _FUSED_RANKS: tuple[int, ...] = (1, 1, 1, 3, 2, 3, 3, 1, 3, 2, 3, 3, 1, 1)
 _FUSED_RANKS += (1,) * 14
 _REDUCE_RANKS = (1, 1)
 _FUSED_GRID = (144, 1, 1)  # 72 two-CTA clusters, all co-resident
+# The CuTe-DSL programs' own grid size; it bounds their launch epoch.
+FUSED_GRID_CTAS = _FUSED_GRID[0]
 _REDUCE_THREADS = 128  # eight hidden columns per thread
 _PEER_CAPACITY = 32
 
@@ -283,7 +285,7 @@ class _Runner:
         launch_epoch: int,
         out: torch.Tensor,
     ) -> None:
-        _backend._validate_launch_epoch(launch_epoch)
+        _backend._validate_launch_epoch(launch_epoch, FUSED_GRID_CTAS)
         if out.data_ptr() != self._output.data_ptr():
             raise ValueError("CuTe-DSL output must alias the session workspace")
         tensors = (hidden_states, topk_ids, topk_weights)

@@ -428,15 +428,15 @@ def test_backward_programs_switch_on_row_count(hidden: int) -> None:
     )
 
 
-@pytest.mark.parametrize("hidden", (5120, 256))
+@pytest.mark.parametrize("hidden", (6144, 5120, 4096, 2048, 1536, 256))
 @pytest.mark.parametrize("rows", (1, 129, 4097))
 @pytest.mark.parametrize("below", (1, 0))
 def test_backward_below_the_measured_sm_count_runs_the_compensated_programs(
     hidden: int, rows: int, below: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """On a device with fewer SMs than ``cake_windows.ACCURACY_MIN_SMS`` (emulated: the host's SM count patched to one
-    below it, or to 16, which shrinks the chunk table and the grids with it) the H = 5120 / H = 256 backward launches
-    a compensated program at every row count, and forward + backward match the FP64 reference."""
+    below it, or to 16, which shrinks the chunk table and the grids with it) every backward route with a compensated
+    program launches one at every row count, and forward + backward match the FP64 reference."""
 
     _skip_unless_hidden(hidden)
     arch = loader.arch_for_capability(_capability())
@@ -1553,14 +1553,20 @@ def test_registry_records_reference_the_build_manifest() -> None:
 
 # The per-element dw bound at the largest row counts of the long-chunk windows: every element of dw within
 # atol = rtol = 1e-4 of the FP64 sum of the same products (g, x and the FP32 rstd the forward returned), where an FP32
-# chunk sum over many rows accumulates the most rounding: H = 5120 at 40960 and 65536 rows; H = 256 above the
-# compensated-sum edges (81920 rows), at the key rows of a 65536-token batch (262144), at 1179649 rows, at the query
-# rows of a 65536-token batch (1572864, the last row of the compensated ring) and above the hi / lo edge (1572865).
-# A few seeds per case; BF16 and FP32 weight.
+# chunk sum over many rows accumulates the most rounding: H = 1536 / 2048 / 4096 / 6144 at 65536 rows (their
+# compensated forms) and one row above each architecture's accuracy edge of the route
+# (``test_dw_above_the_accuracy_edge_meets_the_per_element_bound``); H = 5120 at 40960 and 65536 rows; H = 256 above
+# the compensated-sum edges (81920 rows), at the key rows of a 65536-token batch (262144), at 1179649 rows, at the
+# query rows of a 65536-token batch (1572864, the last row of the compensated ring) and above the hi / lo edge
+# (1572865).  A few seeds per case; BF16 and FP32 weight.
 DW_ELEMENT_TOL = 1e-4
 LARGE_ROW_DW_CASES = (
+    (1536, 65536),
+    (2048, 65536),
+    (4096, 65536),
     (5120, 40960),
     (5120, 65536),
+    (6144, 65536),
     (256, 81920),
     (256, 262144),
     (256, 1179649),
@@ -1587,6 +1593,24 @@ def _dw_fp64(g: torch.Tensor, x: torch.Tensor, rstd: torch.Tensor) -> torch.Tens
 def test_large_row_dw_meets_the_per_element_bound(
     hidden: int, rows: int, fp32_weight: bool, seed: int
 ) -> None:
+    _check_large_row_dw(hidden, rows, fp32_weight, seed)
+
+
+@pytest.mark.parametrize("hidden", (1536, 2048, 4096, 5120, 6144))
+@pytest.mark.parametrize("fp32_weight", (False, True))
+@pytest.mark.parametrize("seed", (0, 1, 2))
+def test_dw_above_the_accuracy_edge_meets_the_per_element_bound(
+    hidden: int, fp32_weight: bool, seed: int
+) -> None:
+    """One row above the route's accuracy edge on this architecture (``cake_windows.ACCURACY_EDGES``), the first
+    row count of its compensated window, dw meets the per-element bound."""
+    _skip_unless_hidden(hidden)
+    arch = loader.arch_for_capability(_capability())
+    edge = windows.ACCURACY_EDGES[arch][loader.route_key(hidden, "bwd", False)]
+    _check_large_row_dw(hidden, edge + 1, fp32_weight, seed)
+
+
+def _check_large_row_dw(hidden: int, rows: int, fp32_weight: bool, seed: int) -> None:
     if fp32_weight:
         _skip_unless_fp32_routes(hidden, False)
     else:
