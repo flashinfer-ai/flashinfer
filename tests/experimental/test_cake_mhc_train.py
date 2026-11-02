@@ -47,19 +47,23 @@ throughout, never a source of tolerances.  This module checks:
   ``dbase`` bitwise; ``|dfn - dfn_det| <= F u (|carried| + 1.02 sum_t |dz'_t|
   |x_t|)`` per element (``u = 2^-24``; the FP64 absolute-value contraction of
   the reference bounds the magnitude of every partial sum either order forms):
-  ``F = 2 P`` where the column slab runs ``dynr`` (both sides sum the same
-  per-chunk partials, ``P`` roundings each) and ``F = 2 max(P, P_k7) + 10``
-  where it runs ``lpt`` (the partials are another partition's; see
-  :func:`_dfn_factor`), the largest ratio printed; run to run, ``dX`` /
-  ``dscale`` / ``dbase`` identical and the ``dfn`` bits that differ counted and
-  printed (never asserted);
+  ``F = 2 P`` where the column slab runs ``dynr`` or its slab-fastest copy
+  ``dynr_os`` (both sides sum the same per-chunk partials, ``P`` roundings
+  each) and ``F = 2 max(P, P_k7) + 10`` where it runs ``lpt`` or ``lpt_os``
+  (the partials are another partition's; see :func:`_dfn_factor`), the largest
+  ratio printed, also with the unit order forced to each of ``"chunk"`` and
+  ``"slab"`` where the device's route holds that order's records (no ``_os``
+  record on sm_107a); run to run, ``dX`` / ``dscale`` / ``dbase`` identical
+  and the ``dfn`` bits that differ counted and printed (never asserted);
 * the two-size schedule at forced geometries (``cake_jit.lpt_chunks`` replaced
   for one token count: one size, one small chunk, several, small chunks past
   ``T``, empty small chunks, 32 chunks, one round of units, a short odd row,
   with and without ``accumulate``, and the screen's best geometry at 16263
   tokens; at hidden 5120 and 7168, where the device's route holds the size's
   ``lpt`` record, a subset of these and the screen's best geometry at a
-  measured token count of the size): the ``lpt`` record launches over
+  measured token count of the size), in each unit order whose record the
+  device's route holds (no ``lpt_os`` on sm_107a): the ``lpt`` record
+  (``lpt_os`` with the slab-fastest order forced) launches over
   ``min(SMs, H / 64 x P)`` CTAs, ``dX`` / ``dscale`` / ``dbase`` bitwise the
   deterministic package's on two launches (fresh outputs, then a poisoned
   caller workspace), ``dfn`` within the bound, the ticket word back to 0;
@@ -193,6 +197,11 @@ _EXACT = ("dX", "dscale", "dbase")  # bitwise the deterministic package's
 _ALERT = "does not have a deterministic implementation"
 SLAB = "cake_mhc_train_bwd_slab_atomic__dynr"
 LPT = "cake_mhc_train_bwd_slab_atomic__lpt"
+# The slab-fastest copies of the column slab's two forms (program keys ``dynr_os`` / ``lpt_os``).
+SLAB_OS = "cake_mhc_train_bwd_slab_atomic__dynr_os"
+LPT_OS = "cake_mhc_train_bwd_slab_atomic__lpt_os"
+# The column-slab record of each program key (the size suffix appended at 5120 and 7168).
+SLAB_RECORDS = {"dynr": SLAB, "lpt": LPT, "dynr_os": SLAB_OS, "lpt_os": LPT_OS}
 # The lpt record's chunk scalars (cake_jit.slab_plan), in kernel-parameter order (P, rpc, p_big, rpc_small).
 LPT_HOST_KEYS = (
     "lpt_parts",
@@ -284,17 +293,25 @@ def _require_hidden(hidden: int) -> int:
     return hidden
 
 
-def _require_lpt(hidden: int) -> int:
-    """Skip a case of the two-size column slab at ``hidden`` where the device's ``bwd_finish`` route of the size holds
-    no ``lpt`` record (sm_103a at 5120 and 7168: no calibration of these sizes yet); never on B200, whose routes hold
-    it at every size."""
+def _require_lpt(hidden: int, order: str = "chunk") -> int:
+    """Skip a case of the two-size column slab at ``hidden`` in the unit order ``order`` where the device's
+    ``bwd_finish`` route of the size holds no such record (``lpt``, or ``lpt_os`` for ``"slab"``): where the size's
+    table has no two-size calibration of the architecture (sm_103a at 5120 and 7168), or for ``"slab"`` where its
+    ``BWD_SLAB_ORDER`` of the size has no ``"slab"`` band (sm_107a); a calibrated size without the record fails."""
     _require_hidden(hidden)
-    name = LPT + _suffix(hidden)
+    name = (LPT_OS if order == "slab" else LPT) + _suffix(hidden)
     if name not in loader.route_modules(_arch(), hidden, "bwd_finish"):
-        assert _arch() != "sm_100a", (
-            f"the sm_100a route of hidden {hidden} holds no {name}"
+        table = (
+            loader.BWD_SLAB_LPT
+            if hidden == HIDDEN
+            else loader.BWD_SLAB_LPT_HIDDEN[hidden]
         )
-        pytest.skip(f"hidden {hidden} has no two-size column slab on {_arch()}")
+        calibrated = table[_arch()] is not None
+        slab_band = any(o == "slab" for _, o in loader.BWD_SLAB_ORDER[hidden][_arch()])
+        assert not (calibrated and (order == "chunk" or slab_band)), (
+            f"the {_arch()} route of hidden {hidden} holds no {name}"
+        )
+        pytest.skip(f"hidden {hidden} has no {name} on {_arch()}")
     return hidden
 
 
@@ -328,14 +345,16 @@ def _parts(T: int, hidden: int = HIDDEN) -> int:
 
 
 def _lpt_runs(T: int, hidden: int = HIDDEN) -> bool:
-    """Whether the column slab runs its two-size ``lpt`` record of ``hidden`` at ``T`` on this device (read at call
-    time, so a replaced ``cake_jit.lpt_chunks`` counts; at hidden 5120 and 7168 only where the size's table
-    calibrates the architecture)."""
-    return loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden) == "lpt"
+    """Whether the column slab runs a two-size record of ``hidden`` (``lpt`` or its slab-fastest copy ``lpt_os``) at
+    ``T`` on this device (read at call time, so a replaced ``cake_jit.lpt_chunks`` counts; at hidden 5120 and 7168
+    only where the size's table calibrates the architecture)."""
+    program = loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden)
+    return program.startswith("lpt")
 
 
 def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
-    """The chunk count the column slab launches: ``slab_plan``'s ``lpt_parts`` under ``lpt``, else :func:`_parts`."""
+    """The chunk count the column slab launches: ``slab_plan``'s ``lpt_parts`` under ``lpt`` / ``lpt_os``, else
+    :func:`_parts`."""
     if not _lpt_runs(T, hidden):
         return _parts(T, hidden)
     parts = loader.slab_plan(T, _sm_count(), _arch(), hidden)["lpt_parts"]
@@ -345,11 +364,11 @@ def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
 
 def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
     """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T.  F = 2 P where the column slab runs
-    dynr: both sides sum the same per-chunk partials, at most P roundings each.  Under lpt the partials are another
-    partition's.  Every chunk starts on a 64-token tile and each tile's leading-piece product starts a fresh
-    accumulator, so those products are bitwise the same on both sides.  Each side then differs from the exact sum of
-    those products and the trailing terms by its own compensated summation of its tiles (2u), the rounding of
-    acc - comp (u) and the FP32
+    dynr or dynr_os: both sides sum the same per-chunk partials, at most P roundings each (the unit order changes
+    only the order of the additions).  Under lpt or lpt_os the partials are another partition's.  Every chunk starts
+    on a 64-token tile and each tile's leading-piece product starts a fresh accumulator, so those products are
+    bitwise the same on both sides.  Each side then differs from the exact sum of those products and the trailing
+    terms by its own compensated summation of its tiles (2u), the rounding of acc - comp (u) and the FP32
     accumulation of the trailing dz' pieces (at most 2^-8 of each term) over 16-tile groups (at most 128 accumulate
     steps of at most 2u each: about 1.1u).  That is about 4.1u per side.  The cross-chunk roundings are P on this
     side and at most P_k7 on the deterministic side.  So F = 2 max(P, P_k7) + 10 >= P + P_k7 + 8.2, which also
@@ -1133,14 +1152,9 @@ def test_single_cast_cancellation(T: int) -> None:
 # Against the deterministic backward
 
 
-@pytest.mark.parametrize(("hidden", "T"), _hidden_cases(T_COMPARE, T_COMPARE_NEW))
-def test_matches_the_deterministic_backward(hidden: int, T: int) -> None:
-    """On the same inputs as the deterministic backward: ``dX``, ``dscale``, ``dbase`` bitwise; every ``dfn`` element
-    within ``F u sum_t |dz'_t| |x_t|`` (``F`` = :func:`_dfn_factor`: ``2 P`` under ``dynr``, ``2 max(P, P_k7) + 10``
-    where the column slab runs ``lpt`` at ``T`` on this device).  The launches alternate between the default workspace
-    with fresh outputs and one caller workspace (non-ticket bytes 0xFF before each launch) with NaN-filled outputs;
-    the largest ratio to the bound and the differing bits are printed."""
-    _require_hidden(hidden)
+def _matches_the_deterministic_backward(hidden: int, T: int) -> None:
+    """:func:`test_matches_the_deterministic_backward` at ``(hidden, T)`` under the tables read at call time."""
+    program = loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden)
     i = _make_inputs(T, hidden=hidden, seed=SEED + 1)
     prep = _forward(i)
     want = _snapshot(_det_backward(i, prep))
@@ -1151,7 +1165,7 @@ def test_matches_the_deterministic_backward(hidden: int, T: int) -> None:
     )
     figures = []
     for repeat in range(REPEATS):
-        label = f"T={T} H={hidden} P={parts} launch {repeat}"
+        label = f"T={T} H={hidden} {program} P={parts} launch {repeat}"
         kwargs = {}
         if repeat % 2:
             _poison_workspace(ws)
@@ -1166,8 +1180,8 @@ def test_matches_the_deterministic_backward(hidden: int, T: int) -> None:
             )
         )
     print(
-        f"dfn T={T} H={hidden} P={parts}: vs the deterministic backward over {REPEATS} launches: largest |nd - det| / "
-        f"bound {max(f['max_ratio'] for f in figures):.3e}, elements differing up to "
+        f"dfn T={T} H={hidden} {program} P={parts}: vs the deterministic backward over {REPEATS} launches: largest "
+        f"|nd - det| / bound {max(f['max_ratio'] for f in figures):.3e}, elements differing up to "
         f"{max(f['differ'] for f in figures)} of {want['dfn'].numel()} "
         f"(largest {max(f['max_ulp'] for f in figures)} ulp)"
         + (
@@ -1177,6 +1191,58 @@ def test_matches_the_deterministic_backward(hidden: int, T: int) -> None:
         ),
         flush=True,
     )
+
+
+@pytest.mark.parametrize(("hidden", "T"), _hidden_cases(T_COMPARE, T_COMPARE_NEW))
+def test_matches_the_deterministic_backward(hidden: int, T: int) -> None:
+    """On the same inputs as the deterministic backward: ``dX``, ``dscale``, ``dbase`` bitwise; every ``dfn`` element
+    within ``F u sum_t |dz'_t| |x_t|`` (``F`` = :func:`_dfn_factor`: ``2 P`` under ``dynr`` / ``dynr_os``,
+    ``2 max(P, P_k7) + 10`` where the column slab runs ``lpt`` / ``lpt_os`` at ``T`` on this device).  The launches
+    alternate between the default workspace with fresh outputs and one caller workspace (non-ticket bytes 0xFF before
+    each launch) with NaN-filled outputs; the largest ratio to the bound and the differing bits are printed."""
+    _require_hidden(hidden)
+    _matches_the_deterministic_backward(hidden, T)
+
+
+@pytest.fixture
+def forced_order():
+    """``force(hidden, order)``: ``cake_jit.BWD_SLAB_ORDER`` of the device's architecture at ``hidden`` set to
+    ``order`` (``"chunk"`` or ``"slab"``) at every token count, with the package's route-plan caches cleared on entry,
+    after each edit and after the restore (a plan binds the selection of its token count)."""
+    with pytest.MonkeyPatch.context() as patch:
+
+        def force(hidden: int, order: str) -> None:
+            patch.setitem(loader.BWD_SLAB_ORDER[hidden], _arch(), ((None, order),))
+            pkg._PLANS.clear()
+            pkg._FAST_ROUTES.clear()
+
+        pkg._PLANS.clear()
+        pkg._FAST_ROUTES.clear()
+        try:
+            yield force
+        finally:
+            patch.undo()
+            pkg._PLANS.clear()
+            pkg._FAST_ROUTES.clear()
+
+
+@pytest.mark.parametrize("order", ("chunk", "slab"))
+@pytest.mark.parametrize(("hidden", "T"), _hidden_cases((2049, 16263), (2049, 16263)))
+def test_matches_the_deterministic_backward_in_each_unit_order(
+    forced_order, hidden: int, T: int, order: str
+) -> None:
+    """:func:`test_matches_the_deterministic_backward` with the size's unit order forced to ``order`` at every token
+    count: the chunk-order records (``dynr`` / ``lpt``) and the slab-fastest ones (``dynr_os`` / ``lpt_os``) both run
+    where the device's route holds them, whichever order the table of record picks on this device (skipped where the
+    route holds no record of the order: the ``"slab"`` cases on sm_107a)."""
+    _require_hidden(hidden)
+    forced_order(hidden, order)
+    program = loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden)
+    assert program.endswith("_os") == (order == "slab"), program
+    name = SLAB_RECORDS[program] + _suffix(hidden)
+    if name not in loader.route_modules(_arch(), hidden, "bwd_finish"):
+        pytest.skip(f"hidden {hidden} has no {name} on {_arch()}")
+    _matches_the_deterministic_backward(hidden, T)
 
 
 @pytest.mark.parametrize(("hidden", "T"), _hidden_cases((2049, 16263), (2049, 16263)))
@@ -1261,26 +1327,38 @@ def _forced_id(case: tuple) -> str:
     return f"H{hidden}-T{T}-{shape}" + ("-accumulate" if accumulate else "")
 
 
+@pytest.mark.parametrize("order", ("chunk", "slab"))
 @pytest.mark.parametrize(
     ("hidden", "T", "geometry", "accumulate"),
     _FORCED_CASES,
     ids=[_forced_id(case) for case in _FORCED_CASES],
 )
 def test_two_size_schedule_at_forced_geometries(
-    forced_lpt, monkeypatch, hidden: int, T: int, geometry, accumulate: bool
+    forced_lpt,
+    forced_order,
+    monkeypatch,
+    hidden: int,
+    T: int,
+    geometry,
+    accumulate: bool,
+    order: str,
 ) -> None:
-    """The column slab's ``lpt`` record of ``hidden`` (at 5120 and 7168 where the device's route holds it) at a forced
-    geometry (``geometry`` None: the screen's best two-size geometry of the size at ``T`` on this device,
-    ``_lpt_plan`` at ``o_tiles = 1``, also where the table of record is ``None``): the selection's column slab is the
-    ``lpt`` record, the only column slab ``backward_finish`` loads, launched over
+    """The column slab's ``lpt`` record of ``hidden`` (under ``order="slab"`` its slab-fastest copy ``lpt_os``; where
+    the device's route holds the record, see :func:`_require_lpt`), with the size's unit order forced to ``order`` at
+    every token count, at a forced geometry (``geometry`` None: the screen's best two-size geometry of the size at
+    ``T`` on this device, ``_lpt_plan`` at ``o_tiles = 1``, also where the table of record is ``None``): the
+    selection's column slab is that record, the only column slab ``backward_finish`` loads, launched over
     ``min(SMs, H / 64 x P)`` CTAs with ``slab_plan`` = the geometry.  On two launches -- fresh outputs on the default
     workspace, then NaN outputs (the carried-in values under ``accumulate``) on a caller workspace whose non-ticket
     bytes are 0xFF -- ``dX``, ``dscale``, ``dbase`` are bitwise the deterministic backward's, every ``dfn`` element
     lies within ``_dfn_factor(T, hidden) u (|carried| + sum_t |dz'_t| |x_t|)`` and the ticket region is zero; the
     largest ratio to the bound is printed."""
-    _require_lpt(hidden)
+    _require_lpt(hidden, order)
     arch, sm, index = _arch(), _sm_count(), _device().index
-    slab, lpt = SLAB + _suffix(hidden), LPT + _suffix(hidden)
+    forced_order(hidden, order)
+    suffix = "_os" if order == "slab" else ""
+    slab = SLAB_RECORDS["dynr" + suffix] + _suffix(hidden)
+    lpt = SLAB_RECORDS["lpt" + suffix] + _suffix(hidden)
     if geometry is None:
         plan = loader._lpt_plan(T, sm, 1.0, hidden=hidden)
         assert plan is not None, (T, sm, hidden)
@@ -1330,9 +1408,7 @@ def test_two_size_schedule_at_forced_geometries(
     monkeypatch.setattr(loader, "load", recording_load)
     figures = []
     for launch in range(2):
-        label = (
-            f"T={T} H={hidden} lpt {geometry} accumulate={accumulate} launch {launch}"
-        )
+        label = f"T={T} H={hidden} {order} order lpt {geometry} accumulate={accumulate} launch {launch}"
         kwargs = {"accumulate": accumulate, **outputs(launch == 1)}
         if launch:
             _poison_workspace(ws)
@@ -1348,7 +1424,8 @@ def test_two_size_schedule_at_forced_geometries(
         )
     assert loaded == list(selection), loaded
     print(
-        f"dfn T={T} H={hidden} lpt {geometry} (P_k7 {_parts(T, hidden)}, F {factor:g}) accumulate={accumulate}: "
+        f"dfn T={T} H={hidden} {order} order lpt {geometry} (P_k7 {_parts(T, hidden)}, F {factor:g}) "
+        f"accumulate={accumulate}: "
         f"largest |nd - det| / bound over two launches {max(f['max_ratio'] for f in figures):.3e}, elements "
         f"differing up to {max(f['differ'] for f in figures)} of {MAPPING_ROWS * n}",
         flush=True,
@@ -1442,7 +1519,8 @@ def test_benchmark_token_counts_at_the_new_hidden_sizes(hidden: int, T: int) -> 
     deterministic package's bits, and one ``backward_finish`` (the column slab's form of the call: ``lpt`` where the
     size's table fires on this device; on B200 at the token counts its kernel-level pairs measured, H 5120 15566 /
     15590 / 16263 and H 7168 15288, and at those the screen picks that no pair has measured yet, 1024 at both sizes
-    and 2048 / 3072 at 7168) gives its ``dX`` / ``dscale`` / ``dbase`` bits and a ``dfn`` within the bound of
+    and 2048 / 3072 at 7168; else ``dynr``; each as its ``_os`` copy where the size's ``BWD_SLAB_ORDER`` band is
+    ``"slab"``) gives its ``dX`` / ``dscale`` / ``dbase`` bits and a ``dfn`` within the bound of
     :func:`test_matches_the_deterministic_backward`, the ticket region of a caller workspace back to zero."""
     _require_hidden(hidden)
     i = _make_inputs(T, hidden=hidden, seed=SEED + 14)
@@ -1479,7 +1557,7 @@ def test_launches_are_this_packages_records(monkeypatch, hidden: int) -> None:
     records for the local architecture and the call's hidden size, and the deterministic package launches nothing
     (its launch paths refuse); ``backward_finish`` loads exactly its ``bwd_finish`` selection, in launch order: one
     token-owner record, the atomic fn split of the architecture and size and the column slab's form of the call
-    (``bwd_slab_atomic_program``: the size's ``dynr`` or ``lpt`` record)."""
+    (``bwd_slab_atomic_program``: the size's ``dynr``, ``lpt``, ``dynr_os`` or ``lpt_os`` record)."""
     _require_hidden(hidden)
 
     def refuse(*_args, **_kwargs):
@@ -1513,7 +1591,7 @@ def test_launches_are_this_packages_records(monkeypatch, hidden: int) -> None:
         + _suffix(hidden)
     )
     program = loader.bwd_slab_atomic_program(T, sm, arch, hidden)
-    assert selection[-1] == {"dynr": SLAB, "lpt": LPT}[program] + _suffix(hidden), (
+    assert selection[-1] == SLAB_RECORDS[program] + _suffix(hidden), (
         program,
         selection,
     )
