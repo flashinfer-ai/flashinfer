@@ -306,7 +306,7 @@ MULTI_RECORDS = {
         "cake_mhc_det_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 68, 53
+N_RECORDS, N_LIBRARIES = 69, 54
 RECORD_SCALARS = {
     "cake_mhc_det_train_fn_split": {"want_t": 0},
     "cake_mhc_det_train_fn_split__tv128__t": {"want_t": 1},
