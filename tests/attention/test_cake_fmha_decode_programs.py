@@ -13,7 +13,9 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import importlib
+import json
 import operator
+import subprocess
 import sys
 import types
 from types import SimpleNamespace
@@ -1254,6 +1256,33 @@ def test_cake_fmha_decode_smallm_split_count_follows_the_device(
     assert _select(_row_kwargs("smallm_kv60008_q8_p64")).program is None
 
 
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_decode_smallm_split_count_follows_the_streams_partition(
+    monkeypatch, decode_target, target
+) -> None:
+    """A launch on a stream of an SM partition (a green context) plans its
+    split on the partition's SMs: 32 SMs split one tile 32 ways (the JIT
+    member: no program has that split) and never take the nine-CTA cluster
+    program; the whole device keeps the pinned programs."""
+
+    decode_target(target)
+    rows = ("smallm_kv8200_q8_p64", "smallm_kv60008_q8_p64", "smallm_kv1032_q8_p64")
+    for row in rows:
+        route = _select(_row_kwargs(row))
+        assert route.program == ("decode_smallm", SHAPE_ROWS[row][-1][target]), row
+    monkeypatch.setattr(
+        cake_api, "_smallm_launch_sm_count", lambda device, count=None: 32
+    )
+    monkeypatch.setattr(cake_api, "_SMALLM_SM_PARTITIONS", True)
+    for row in rows:
+        route = _select(_row_kwargs(row))
+        assert route.component == "decode_native_bf16_hd256_smallm", row
+        assert route.program is None and route.num_split == 32, (row, route)
+    # Two tiles share the partition: 16 splits each.
+    route = _select(_row_kwargs("smallm_kv60008_q8_p64", **_TWO_KV_HEADS))
+    assert route.program is None and route.num_split == 16, route
+
+
 @pytest.mark.parametrize("mutation", ("uint32_tables", "lse", "device_scales"))
 def test_cake_fmha_decode_smallm_scale_table_and_lse_forms(
     decode_target, mutation
@@ -1557,6 +1586,146 @@ def test_cake_decode_smallm_program_without_a_counter_buffer(served_programs) ->
     for _ in range(3):
         assert torch.equal(_bits(_run_decode(without)), _bits(expected))
     assert not with_buffer.counter.any()
+
+
+# A launch inside an SM partition: one process per run (a split planned on
+# more SMs than the partition holds never completes), under a watchdog.
+_PARTITION_SMS = 32
+_PARTITION_ROWS = (
+    "smallm_kv8200_q8_p64",
+    "smallm_kv60008_q8_p64",
+    "smallm_kv1032_q8_p64",
+)
+_PARTITION_CHILD = """
+import importlib.util, sys
+green = None
+if sys.argv[4] == "torch_before_import":
+    import torch
+    torch.zeros(1, device="cuda")
+    try:
+        from torch.cuda.green_contexts import GreenContext
+        green = GreenContext.create(num_sms=int(sys.argv[2]), device_id=0)
+    except Exception as error:
+        green = error
+spec = importlib.util.spec_from_file_location("cake_decode_programs", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+module._smallm_partition_child(
+    int(sys.argv[2]), sys.argv[3].split(","), sys.argv[4], green
+)
+"""
+
+
+def _smallm_partition_child(sms, rows, api, green=None):
+    """Run each small-M row on a stream of an ``sms``-SM green context made by
+    ``api`` (FlashInfer's green-context helpers, torch's green contexts, or a
+    torch green context ``green`` created before FlashInfer was imported; the
+    inputs live in the primary context), with no partition setting of the
+    module, and print one JSON record per row: the served route, the
+    partition's SM count, the error against the FP32 reference.  The JIT
+    member is built before the launch's watchdog starts."""
+
+    import faulthandler
+
+    faulthandler.dump_traceback_later(1500, exit=True)
+    try:
+        if api == "flashinfer":
+            from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
+
+            streams, resources = split_device_green_ctx_by_sm_count(
+                torch.device("cuda:0"), [sms]
+            )
+            stream, partition = streams[0], int(resources[0].sm.smCount)
+        else:
+            if isinstance(green, Exception):
+                raise green
+            if green is None:
+                from torch.cuda.green_contexts import GreenContext
+
+                green = GreenContext.create(num_sms=sms, device_id=0)
+            stream, partition = green.Stream(), sms
+    except Exception as error:  # noqa: BLE001 - any failure means no partition
+        print(json.dumps({"skip": f"no green context: {error!r}"}), flush=True)
+        return
+    served = []
+    resolve = cake_api._resolve_cake_fmha_decode_module
+
+    def spy(device, route):
+        served.append(route)
+        resolved = resolve(device, route)  # builds the JIT member, untimed
+        faulthandler.dump_traceback_later(120, exit=True)  # the launch's watchdog
+        return resolved
+
+    cake_api._resolve_cake_fmha_decode_module = spy
+    for row in rows:
+        case = _bf16_case(row, seed=20261102)
+        torch.cuda.synchronize()
+        served.clear()
+        with torch.cuda.stream(stream):
+            launch_sms = cake_api._smallm_launch_sm_count(torch.device("cuda"))
+            got = _run_decode(case)
+            stream.synchronize()
+        faulthandler.dump_traceback_later(1500, exit=True)
+        reference = _bf16_reference(case, [0])[0]
+        print(
+            json.dumps(
+                {
+                    "row": row,
+                    "partition": partition,
+                    "launch_sms": launch_sms,
+                    "served": [(r.program, r.num_split) for r in served],
+                    "tiles": SHAPE_ROWS[row][2] * SHAPE_ROWS[row][6],
+                    "max_abs": (got.float() - reference).abs().max().item(),
+                    "close": torch.allclose(
+                        got.float(), reference, atol=1e-2, rtol=1e-2
+                    ),
+                }
+            ),
+            flush=True,
+        )
+
+
+@_GPU
+@pytest.mark.parametrize("api", ("flashinfer", "torch", "torch_before_import"))
+def test_cake_decode_smallm_in_an_sm_partition_completes(api) -> None:
+    """On a stream of a 32-SM green context (FlashInfer's or torch's, also one
+    created before FlashInfer was imported, with no partition setting) the
+    small-M rows plan at most 32 splits per tile and
+    complete (the full device's 65- and 152-way programs
+    would wait forever for CTAs the partition cannot hold, and its nine-CTA
+    cluster would not launch), matching the FP32 reference."""
+
+    _require_full_device()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _PARTITION_CHILD,
+            __file__,
+            str(_PARTITION_SMS),
+            ",".join(_PARTITION_ROWS),
+            api,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    records = [
+        json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")
+    ]
+    if records and "skip" in records[0]:
+        pytest.skip(records[0]["skip"])
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert [r["row"] for r in records] == list(_PARTITION_ROWS), result.stderr[-4000:]
+    device_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    for record in records:
+        partition = record["partition"]
+        assert _PARTITION_SMS <= partition < device_sms, record
+        assert record["launch_sms"] == partition, record
+        ((program, num_split),) = record["served"]
+        assert program != ["decode_smallm", "N64_P64_Q8_C9"], record
+        assert num_split >= 1 and record["tiles"] * num_split <= partition, record
+        assert record["close"], record
 
 
 # --- BF16 boundaries (host-only) ---------------------------------------------
