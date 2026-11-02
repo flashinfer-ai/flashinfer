@@ -57,10 +57,17 @@ the chunks one pre-scan CTA covers) are the records' ``scan`` constants; the
 ``prep_tma`` dispatch window are those
 records' ``select`` tables.
 
-The chain is deterministic: no atomics, no data-dependent ordering, and the two
-groups of a two-stream stage write disjoint outputs, so the outputs and
-gradients are bitwise run to run for one layout and one plan, with one or two
-streams.
+Where the ``dhu_tc2`` adjoint scan feeds ``tail_g2_bf16`` on one stream and
+takes at most half the SMs, the backward runs them as the wavefront pair
+``dhu_tc2_wavefront`` / ``tail_g2_bf16_wavefront`` (:func:`wavefront_engaged`): the tail of
+a chunk starts once the scan has stored it, counted per tile in a workspace;
+the same math and the same bits.
+
+The chain is deterministic: no atomic on a value (the wavefront pair's ready
+counts are atomic counters whose order no value depends on), no data-dependent
+ordering, and the two groups of a two-stream stage write disjoint outputs, so
+the outputs and gradients are bitwise run to run for one layout and one plan,
+with one or two streams.
 The plan pins that tests and tuning use are explicit keyword arguments of
 :func:`chunk_gated_delta_rule_det` (``scan_config``, ``segment_chunks``,
 ``finalize``, ``warmup_log2``, ``dhu_scan``, ``prep``, ``lpt``, ``streams``);
@@ -114,6 +121,8 @@ __all__ = [
     "stage_set",
     "two_stream_split",
     "use_prep_tma",
+    "wavefront_engaged",
+    "wavefront_order",
 ]
 
 CHUNK: int = int(cake_jit.CHUNK)
@@ -165,6 +174,9 @@ _FINALIZE_ARGS = ("qn", "kn", "rstd_q", "rstd_k", "dq_hv", "dk_hv", "dk2", "dg1"
 _TAIL_ARGS = ("qn", "kn", "rstd_q", "rstd_k", "v_new", "do", "dv2", "h", "dh", "g_cs", "v", "A", "beta", "dq_out",
               "dk_out", "dg_out", "dv_out", "dbeta_out", "chunk_start", "chunk_len", "num_heads", "num_v_heads", "scale",
               "normalize_qk")  # fmt: skip
+# the wavefront pair: dhu_tc2 / tail_g2_bf16 with the ready counts (and the tail's chunk order)
+_DHU_TC2_WAVEFRONT_ARGS = _DHU_TC2_ARGS + ("ready",)
+_TAIL_WAVEFRONT_ARGS = _TAIL_ARGS + ("ready", "tile_order")
 _META_ARGS = ("cu_seqlens", "chunk_start", "chunk_len", "seq_chunk_start", "fwd_seg_chunk_start", "fwd_seg_seq",
               "fwd_seq_seg_start", "bwd_seg_chunk_start", "bwd_seg_seq", "bwd_seq_seg_start", "num_seqs",
               "num_chunks_max", "total_tokens", "fwd_segment_len", "bwd_segment_len", "fwd_num_segments_max",
@@ -180,6 +192,7 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "stitch": _STITCH_ARGS,
     "dv_local": _DV_LOCAL_ARGS,
     "dhu_tc2": _DHU_TC2_ARGS,
+    "dhu_tc2_wavefront": _DHU_TC2_WAVEFRONT_ARGS,
     "dqkwg": _DQKWG_ARGS,
     "wy_bwd": _WY_BWD_ARGS,
     "wy_bwd_bf16": _WY_BWD_ARGS,
@@ -187,6 +200,7 @@ LAUNCH_ARGS: dict[str, tuple[str, ...]] = {
     "finalize_mlp": _FINALIZE_ARGS,
     "tail_g2": _TAIL_ARGS,
     "tail_g2_bf16": _TAIL_ARGS,
+    "tail_g2_bf16_wavefront": _TAIL_WAVEFRONT_ARGS,
     "tail_g3": _TAIL_ARGS,
     "tail_g3_bf16": _TAIL_ARGS,
     "dhu_pre_dvl_r64k1": _DHU_PRE_DVL_ARGS,
@@ -438,7 +452,8 @@ class ChunkMeta:
     """The chunk and segment tables of one layout.  ``order`` (host route): table sequence ``vs`` is the caller's
     sequence ``order[vs]``, its chunks at their original token offsets (``None``: the caller's order);
     ``order_index`` holds it on the device as ``[order, inverse]`` for the state rows.  ``fwd_groups`` /
-    ``bwd_groups``: the two-stream sequence groups of the forward / adjoint scan (``None``: one stream)."""
+    ``bwd_groups``: the two-stream sequence groups of the forward / adjoint scan (``None``: one stream).
+    ``bwd_wavefront``: the table's side of the wavefront rule holds (:func:`_wavefront_table`)."""
 
     chunk_start: torch.Tensor
     chunk_len: torch.Tensor
@@ -452,6 +467,7 @@ class ChunkMeta:
     order_index: torch.Tensor | None = None
     fwd_groups: StreamGroups | None = None
     bwd_groups: StreamGroups | None = None
+    bwd_wavefront: bool = False
 
 
 @dataclass(frozen=True)
@@ -1413,6 +1429,111 @@ def _side_stream(device_index: int, main: torch.cuda.Stream) -> torch.cuda.Strea
 
 
 # --------------------------------------------------------------------------- #
+# the wavefront pair: dhu_tc2 -> tail_g2_bf16 overlapped through per-tile ready counts
+# --------------------------------------------------------------------------- #
+# Where the tcgen05 adjoint scan (a serial plan's, or a split plan's pass 2) feeds tail_g2_bf16 on one stream, the
+# tail of a chunk can start as soon as the scan CTA of its segment has stored that chunk's dh and dv2.  The pair
+# ``dhu_tc2_wavefront`` / ``tail_g2_bf16_wavefront`` does that with the same math: the scan adds one to a ready count per (chunk,
+# value head) for each of its 64 store threads after their stores (one gpu fence per two chunks) and counts its CTAs
+# in at entry; the tail visits the chunks in the order the scan finishes them (the k-th chunk from every segment's end,
+# segments interleaved: :func:`wavefront_order`) and waits for the count of its tile to reach 64 before it reads dh and
+# dv2.  The counts live in a workspace zeroed before the scan.  Every tile reads the values the plain tail reads, so
+# the bits are the same.  The tail runs on the side stream after ``cuStreamWaitValue32`` on the entry count, so it
+# starts only once every scan CTA has started, and the rule asks the scan to take at most half the SMs, so the waiting
+# tail never holds the SMs the scan needs; the caller's stream joins the side stream before the backward returns.  A
+# CUDA graph does not order its two branches (the side branch's wait could run ahead of the scan it waits for), so a
+# capture records the plain launches.  The rule: a host-built table, an architecture of ``WAVEFRONT_ARCHS`` with the
+# pair's records and at least ``WAVEFRONT_MIN_V_HEADS`` value heads, ``2 x segments x HV <= SMs``
+# (:func:`wavefront_engaged`; this side is decided once per table, :func:`_wavefront_table`), and on the call the
+# adjoint scan on ``dhu_tc2`` on the caller's stream (no two-stream groups) beside the ``tail_g2_bf16`` tail.
+WAVEFRONT_ARCHS = ("sm_100a", "sm_103a")
+# sm_100a: the host path of a call with fewer value heads outlasts its GPU work, so the pair's host cost is not hidden
+WAVEFRONT_MIN_V_HEADS = {"sm_100a": 32}
+_WAVEFRONT_EVENTS: dict[tuple[int, int], tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+
+
+def wavefront_engaged(num_segments: int, num_v_heads: int, sm_count: int) -> bool:
+    """The rule's occupancy side: the scan's ``segments x HV`` CTAs take at most half of the ``sm_count`` SMs."""
+    return 2 * int(num_segments) * int(num_v_heads) <= int(sm_count)
+
+
+def wavefront_order(seg_chunk_start) -> list[int]:
+    """The chunks in the order the adjoint scan finishes them: step ``k`` holds the ``k``-th chunk from the end of
+    every segment (segments in table order) that has one."""
+    sc = [int(x) for x in seg_chunk_start]
+    lens = [b - a for a, b in zip(sc[:-1], sc[1:], strict=True)]
+    return [
+        sc[s + 1] - 1 - k
+        for k in range(max(lens, default=0))
+        for s in range(len(lens))
+        if k < lens[s]
+    ]
+
+
+def _wavefront_table(meta: ChunkMeta, num_v_heads: int, device_index: int) -> bool:
+    """The table's side of the wavefront rule: a host-built table on an architecture of ``WAVEFRONT_ARCHS`` with the
+    pair's records and at least ``WAVEFRONT_MIN_V_HEADS`` value heads, and an adjoint scan of at most half the SMs."""
+    if meta.seq_lens is None:
+        return False
+    arch = cake_backend.device_arch(device_index)
+    if arch not in WAVEFRONT_ARCHS or num_v_heads < WAVEFRONT_MIN_V_HEADS.get(arch, 0):
+        return False
+    if not (
+        _available("dhu_tc2_wavefront", arch)
+        and _available("tail_g2_bf16_wavefront", arch)
+    ):
+        return False
+    return wavefront_engaged(
+        meta.bwd_segments.num_segments, num_v_heads, _device_props(device_index)[0]
+    )
+
+
+def _wavefront_walk(
+    seq_lens: tuple[int, ...], order: tuple[int, ...] | None, segment_len: int
+) -> list[int]:
+    """:func:`wavefront_order` of a host-built table's adjoint segments, from the host layout."""
+    seq_chunk_start = [0]
+    for seq in order if order is not None else range(len(seq_lens)):
+        seq_chunk_start.append(seq_chunk_start[-1] - (-seq_lens[seq] // CHUNK))
+    return wavefront_order(_segment_lists(seq_chunk_start, segment_len)[0])
+
+
+@lru_cache(maxsize=256)
+def _wavefront_order_tensor(
+    seq_lens: tuple[int, ...],
+    order: tuple[int, ...] | None,
+    segment_len: int,
+    device_index: int,
+) -> torch.Tensor:
+    """:func:`_wavefront_walk` on the device, built once per table."""
+    table = torch.tensor(
+        _wavefront_walk(seq_lens, order, segment_len), dtype=torch.int32
+    )
+    return table.pin_memory().to(torch.device("cuda", device_index), non_blocking=True)
+
+
+def _wavefront_events(
+    device_index: int, main: torch.cuda.Stream
+) -> tuple[torch.cuda.Event, torch.cuda.Event]:
+    """The fork and join events of the pair on the caller's stream ``main``: one pair per (device, caller stream)."""
+    key = (device_index, main.cuda_stream)
+    events = _WAVEFRONT_EVENTS.get(key)
+    if events is None:
+        events = _WAVEFRONT_EVENTS[key] = (torch.cuda.Event(), torch.cuda.Event())
+    return events
+
+
+@cache
+def _wait_entry(device_index: int):
+    """``tail_g2_bf16_wavefront``'s ``wait_geq`` (``cuStreamWaitValue32`` GEQ on word 0 of the counts) on the device."""
+    arch = cake_backend.device_arch(device_index)
+    name = cake_backend.stage_record("tail_g2_bf16_wavefront", arch)
+    return getattr(
+        cake_backend.load(name, arch), cake_backend.record(name)["wait_entry"]
+    )
+
+
+# --------------------------------------------------------------------------- #
 # forward
 # --------------------------------------------------------------------------- #
 def _wy_outputs(kn, v, total_tokens, num_v_heads):
@@ -1776,6 +1897,15 @@ def gdn_chunk_det_backward(
         split_tc and tail_kind == "tail_g3"
     )
     groups = meta.bwd_groups if two_stream else None
+    # the wavefront pair (see its section): the table's side of the rule is decided with the table; a CUDA graph
+    # capture records the plain launches
+    wavefront = (
+        meta.bwd_wavefront
+        and fused_tail == "tail_g2_bf16"
+        and (use_tc or split_tc)
+        and groups is None
+        and not torch.cuda.is_current_stream_capturing()
+    )
     if not (use_tc or split_tc):
         dv_local = workspaces.take(table, "b_dv_local", token_hv, v.dtype, device)
         _launch("dv_local", meta.num_chunks, num_v_heads, 1, qn, kn, do, g_cs, dv_local, meta.chunk_start,
@@ -1804,7 +1934,7 @@ def gdn_chunk_det_backward(
     else:
         dht32, use_dht = dh0, 0
     scan_stage, vb, pre, pre_threads = _scan_stages("dhu", segs.scan_config, arch)
-    if use_tc and groups is None:
+    if use_tc and groups is None and not wavefront:
         # dv_local fused into the tcgen05 serial scan: the same dh / dv2 / dh0 (seg_state is not read)
         _launch("dhu_tc2", segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
                 meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start, num_heads,
@@ -1838,7 +1968,7 @@ def gdn_chunk_det_backward(
         _launch("stitch", meta.num_seqs, num_v_heads, STITCH_VSPLIT, seg_state, dht32, dh_end, segs.seq_seg_start,
                 seg_flag, num_v_heads, use_dht, 1)  # fmt: skip
         dht32, use_dht = dh_end, 1
-    if split_tc and groups is None:
+    if split_tc and groups is None and not wavefront:
         # pass 2 on the tcgen05 scan: segment ``seg`` starts from dht[seg], the stitched dh_end[seg]; the first segment
         # of a sequence stores its dh0 (the register pass 2's contract)
         _launch("dhu_tc2", segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
@@ -1863,7 +1993,35 @@ def gdn_chunk_det_backward(
             device=device,
         )
         normalize = 1 if forward.get("normalize_qk", True) else 0
-        if groups is None:
+        if wavefront:
+            # the adjoint scan (serial, or the pass 2 from the stitched dht) on the caller's stream and the tail of its
+            # tiles as they are stored on the side stream, after every scan CTA has started
+            flags = workspaces.take(table, "b_wavefront_ready", (2 + meta.num_chunks * num_v_heads,), torch.int32,
+                                    device)  # fmt: skip
+            flags.zero_()
+            flags = flags.view(torch.uint32)  # the pair's u32 counts
+            order = _wavefront_order_tensor(
+                meta.seq_lens, meta.order, int(segs.segment_len), index
+            )
+            main = torch.cuda.current_stream(index)
+            side = _side_stream(index, main)
+            fork, join = _wavefront_events(index, main)
+            fork.record(main)
+            _launch("dhu_tc2_wavefront", segs.num_segments, num_v_heads, 1, qn, kn, w, do, g_cs, dht32, dh, dv2, dh0, dh0,
+                    meta.chunk_start, meta.chunk_len, segs.seg_chunk_start, segs.seg_seq, meta.seq_chunk_start,
+                    num_heads, num_v_heads, use_dht, 1 if has_initial_state else 0, scale, flags)  # fmt: skip
+            try:
+                with torch.cuda.stream(side):
+                    side.wait_event(fork)
+                    _wait_entry(index)(flags, segs.num_segments * num_v_heads)
+                    _launch("tail_g2_bf16_wavefront", meta.num_chunks * num_v_heads, 1, 1, qn, kn, forward["rstd_q"],
+                            forward["rstd_k"], v_new, do, dv2, h, dh, g_cs, v, A, beta32, dq, dk, dg, dv, dbeta,
+                            meta.chunk_start, meta.chunk_len, num_heads, num_v_heads, scale, normalize, flags,
+                            order)  # fmt: skip
+            finally:
+                join.record(side)  # the join
+                main.wait_event(join)
+        elif groups is None:
             _launch(tail, meta.num_chunks * num_v_heads, 1, 1, qn, kn, forward["rstd_q"], forward["rstd_k"], v_new, do,
                     dv2, h, dh, g_cs, v, A, beta32, dq, dk, dg, dv, dbeta, meta.chunk_start, meta.chunk_len, num_heads,
                     num_v_heads, scale, normalize)  # fmt: skip
@@ -2095,6 +2253,8 @@ def _chunk_meta(
         )
         if fwd_groups is not None or bwd_groups is not None:
             meta = replace(meta, fwd_groups=fwd_groups, bwd_groups=bwd_groups)
+    if _wavefront_table(meta, int(num_v_heads), int(index)):
+        meta = replace(meta, bwd_wavefront=True)
     if options.host_cache:
         if len(_META_FRONT) >= _META_FRONT_LIMIT:
             del _META_FRONT[next(iter(_META_FRONT))]
