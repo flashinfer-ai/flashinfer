@@ -2205,8 +2205,13 @@ class AutoTuner:
         self, runner: TunableRunner, tactic: Any, custom_op: str, source: str
     ) -> bool:
         """False iff batch-invariant autotuning rejects this cached tactic."""
-        if not _batch_invariant or runner.is_batch_invariant_tactic(tactic):
+        if not _batch_invariant:
             return True
+        try:
+            if runner.is_batch_invariant_tactic(tactic):
+                return True
+        except Exception:  # noqa: BLE001 -- a malformed cached tactic is a miss
+            pass
         key = (custom_op, runner.__class__.__name__, f"{source}:batch_invariant")
         if key not in self._logged_invalid_tactic:
             self._logged_invalid_tactic.add(key)

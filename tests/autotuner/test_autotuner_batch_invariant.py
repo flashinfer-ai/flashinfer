@@ -121,6 +121,27 @@ def test_cached_non_invariant_tactic_is_a_miss(batch_invariant):
     assert tuner.choose_one("bi_mem", [runner], config, inputs)[1] == 2
 
 
+class ShapedRunner(SplitRunner):
+    """Classifies by a tuple slot, like the MXFP8 runner, so a tactic of the
+    wrong shape (an edited cache file, a stale format) raises."""
+
+    def is_batch_invariant_tactic(self, tactic):
+        if tactic == -1:
+            return True
+        return int(tactic[4]) == 1
+
+
+def test_malformed_cached_tactic_is_a_miss(batch_invariant):
+    tuner = reset_autotuner()
+    runner = ShapedRunner()
+    inputs = _inputs()
+    config = TuningConfig()
+    key = AutoTuner._get_cache_key("bi_malformed", runner, (inputs[0].shape,), config)
+    for cached in ((1, 2), 7, None):  # IndexError, TypeError, TypeError
+        tuner.profiling_cache[key] = (cached, None)
+        assert tuner.choose_one("bi_malformed", [runner], config, inputs)[1] == -1
+
+
 def test_cached_non_invariant_tactic_is_reprofiled(fake_profile, batch_invariant):
     tuner = reset_autotuner()
     runner = SplitRunner()
