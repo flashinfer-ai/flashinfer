@@ -405,3 +405,18 @@ use the staged pipeline. The selection stays inside the compiled launcher, so
 switching counts or crossing this span bound requires no additional JIT. The
 window origin follows the CTA, including splits that start inside an aligned
 32-ID region. Scratch-buffer sizing and ownership do not depend on this choice.
+
+### FP8 KV cache with BF16 output
+
+FP8 E4M3 Q/K/V can produce FP16, BF16, or FP8 output. BF16 output is packed
+from the floating-point accumulator directly, including split-KV reduction.
+It does not pass through an FP8 output tensor. Callers using this FP8 Q/K/V
+path with BF16 model activations must quantize Q first.
+
+For scales produced by GPU preprocessing, call `plan(use_device_scales=True)`
+and pass one-element float32 CUDA tensors as `softmax_scale` and
+`output_scale` to `run()`. BMM1 uses the
+regular attention scale multiplied by the Q and K dequantization scales;
+BMM2 uses the V dequantization scale. Values must be finite and positive.
+The kernel reads the tensors on each launch, so changing their contents in
+place is supported during CUDA graph replay without host synchronization.
