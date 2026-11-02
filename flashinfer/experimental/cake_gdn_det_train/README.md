@@ -90,9 +90,12 @@ each (chunk, value head) tile in a workspace once it has stored that tile's
 `dh` and `dv2`, and the tail visits the chunks in the order the scan finishes
 them and waits for each count before it reads the tile.  The tail runs on the
 side stream once every scan CTA has started.  The pair runs on `sm_103a`, and
-on `sm_100a` with at least 32 value heads.  A CUDA graph does
-not order its two branches, so under a capture the backward records the
-separate launches.  The tail reads the values it reads without the pair: the
+on `sm_100a` with at least 32 value heads.  On `sm_100a` the pair also runs
+the second pass of a split plan whose `segments x HV` CTAs outnumber the SMs,
+at any value-head count: the pre-scan and the stitch run before the fork, and
+the tail starts once the last scan CTA of the second round has started.  A
+CUDA graph does not order its two branches, so under a capture the backward
+records the separate launches.  The tail reads the values it reads without the pair: the
 same bits.
 
 On the host-table route the long sequences start first.  The tables list the
