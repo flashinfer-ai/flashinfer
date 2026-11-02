@@ -81,7 +81,9 @@ def rstd(ss: torch.Tensor) -> torch.Tensor:
 def qk_l2norm(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``(q_hat BF16 [..., 128] contiguous, rstd FP32 [...])`` of BF16 rows ``x`` (any strides)."""
     if x.shape[-1] != HEAD_DIM or x.dtype != BF16:
-        raise ValueError(f"qk_l2norm: BF16 rows [..., {HEAD_DIM}] expected, got {x.dtype} {tuple(x.shape)}")
+        raise ValueError(
+            f"qk_l2norm: BF16 rows [..., {HEAD_DIM}] expected, got {x.dtype} {tuple(x.shape)}"
+        )
     r = rstd(sum_of_squares(x))
     return (x.to(F32) * r[..., None]).to(BF16).contiguous(), r.contiguous()
 
@@ -122,7 +124,14 @@ def kda_exact_l2n_with_grads(
     leaves = [x.detach().to(dtype).requires_grad_(True) for x in (q, k, v, g, beta)]
     q64, k64, v64, g64, b64 = leaves
     o = kda_exact_forward(
-        _normalize64(q64), _normalize64(k64), v64, g64, b64, cu_seqlens, scale, dtype=dtype
+        _normalize64(q64),
+        _normalize64(k64),
+        v64,
+        g64,
+        b64,
+        cu_seqlens,
+        scale,
+        dtype=dtype,
     )
     grads = torch.autograd.grad(o, leaves, dout.to(dtype))
     return o.detach(), dict(zip(GRAD_NAMES, (x.detach() for x in grads), strict=True))
@@ -150,7 +159,14 @@ def kda_exact_raw_l2n_with_grads(
     q64, k64, v64, raw64, beta64, a64, b64 = leaves
     g64 = raw_gate(raw64, a64, b64, lower_bound, dtype)
     o = kda_exact_forward(
-        _normalize64(q64), _normalize64(k64), v64, g64, beta64, cu_seqlens, scale, dtype=dtype
+        _normalize64(q64),
+        _normalize64(k64),
+        v64,
+        g64,
+        beta64,
+        cu_seqlens,
+        scale,
+        dtype=dtype,
     )
     grads = torch.autograd.grad(o, leaves, dout.to(dtype))
     return o.detach(), dict(

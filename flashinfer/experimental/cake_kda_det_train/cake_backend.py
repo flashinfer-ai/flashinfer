@@ -3254,7 +3254,9 @@ def _check_qk_raw(
         raise ValueError(f"{name}: expected torch.bfloat16, got {x.dtype}")
     if x.device != device:
         raise ValueError(f"{name}: on {x.device}, expected {device}")
-    if x.numel() == 0:  # no token (the context-parallel route's T_r = 0): nothing is addressed
+    if (
+        x.numel() == 0
+    ):  # no token (the context-parallel route's T_r = 0): nothing is addressed
         return x
     s_t, s_h, s_d = (int(s) for s in x.stride())
     if s_d != 1:
@@ -4173,7 +4175,9 @@ def _forward(
         slot views where ``None``)."""
         if l2n == "off":
             return None
-        if qn is None:  # the slot views: token layout for the fallback, placeholders of the fused program
+        if (
+            qn is None
+        ):  # the slot views: token layout for the fallback, placeholders of the fused program
             qn = a.qn_int[:S] if fallback else a.qn_int
             kn = a.kn_int[:S] if fallback else a.kn_int
         return _l2n_values(
@@ -4469,7 +4473,9 @@ def _backward_launches(
         values.update(gate_values)
     if l2n_values:
         values.update(l2n_values)
-        if hasattr(b, "qn_int"):  # the replay's fused intra program's CTA-private rows (contract v1.1)
+        if hasattr(
+            b, "qn_int"
+        ):  # the replay's fused intra program's CTA-private rows (contract v1.1)
             values.update(qn_int=b.qn_int, kn_int=b.kn_int)
     _saved_rows(values, p, qg=qg, w=w, u=u)
 
@@ -4515,7 +4521,9 @@ def _backward_launches(
     if ws.tail_passes == 1:
         ws.run("dqkg", values, path=path)
         ws.run("glm_intra", values, path=path)
-        if p.dispatched("qk_pullback", path):  # the fallback route's token-local pullback
+        if p.dispatched(
+            "qk_pullback", path
+        ):  # the fallback route's token-local pullback
             ws.run("qk_pullback", values, path=path)
         if p.dispatched(
             "gate_epilogue", path

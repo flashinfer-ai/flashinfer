@@ -161,7 +161,9 @@ def _saved(S: int, H: int, **fields):
 
 def test_saved_set_fields_and_their_checks() -> None:
     S, H = 3, 2
-    fields = {f.name: f.default for f in dataclasses.fields(cake_backend.KdaDetChunkSaved)}
+    fields = {
+        f.name: f.default for f in dataclasses.fields(cake_backend.KdaDetChunkSaved)
+    }
     assert fields["qk_rstd"] is None and fields["qk_l2norm"] is False
     for version in (cake_backend.SAVED_VERSION, cake_backend.SAVED_VERSION_TAPE):
         assert cake_backend._EXTRA_FIELDS[version][-1] == "qk_rstd"
@@ -173,7 +175,9 @@ def test_saved_set_fields_and_their_checks() -> None:
     cake_backend._check_saved_l2n(off, "off", S, H, CPU)
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel=True; this backward"):
         cake_backend._check_saved_l2n(on, "off", S, H, CPU)
-    with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel=False; this backward"):
+    with pytest.raises(
+        ValueError, match="use_qk_l2norm_in_kernel=False; this backward"
+    ):
         cake_backend._check_saved_l2n(off, "fused", S, H, CPU)
     with pytest.raises(ValueError, match="carries none|has none"):
         cake_backend._check_saved_l2n(_saved(S, H, qk_l2norm=True), "fused", S, H, CPU)
@@ -215,9 +219,13 @@ def _rows(mode: str, **kwargs) -> dict[str, dict]:
     return {r["buffer"]: r for r in cake_backend.lifetime_table(mode, **kwargs)}
 
 
-@pytest.mark.parametrize("mode", ["fwd", "fwd_tape", "fwd_kcp", "replay", "replay_tape"])
+@pytest.mark.parametrize(
+    "mode", ["fwd", "fwd_tape", "fwd_kcp", "replay", "replay_tape"]
+)
 @pytest.mark.parametrize("l2n", ["fused", "fallback"])
-def test_layouts_carry_transient_qn_kn_int_on_the_u_w_slots(mode: str, l2n: str) -> None:
+def test_layouts_carry_transient_qn_kn_int_on_the_u_w_slots(
+    mode: str, l2n: str
+) -> None:
     """Contract v1.1: the fused intra program's CTA-private internal rows qn_int / kn_int ride at sub-offset 0 of the
     u / w slots of the forward and replay layouts, lifetime (0, 1), bytes unchanged; the saved-set backward layouts
     have none."""
@@ -231,14 +239,16 @@ def test_layouts_carry_transient_qn_kn_int_on_the_u_w_slots(mode: str, l2n: str)
         assert (r["first_write"], r["last_read"]) == (0, 1)
     # the same bytes: the layout's per-token-head size does not grow
     R, H, NC = 128, 2, 2
-    assert cake_backend._mode_bytes(R, H, NC, 0, mode, 1, True, l2n) == cake_backend._mode_bytes(
-        R, H, NC, 0, mode, 1, True, "off"
-    )
+    assert cake_backend._mode_bytes(
+        R, H, NC, 0, mode, 1, True, l2n
+    ) == cake_backend._mode_bytes(R, H, NC, 0, mode, 1, True, "off")
 
 
 @pytest.mark.parametrize("mode", ["bwd", "bwd_tape"])
 def test_saved_set_backward_layouts_have_no_internal_qn(mode: str) -> None:
-    assert "qn_int" not in _rows(mode, l2n="fused") and "kn_int" not in _rows(mode, l2n="fused")
+    assert "qn_int" not in _rows(mode, l2n="fused") and "kn_int" not in _rows(
+        mode, l2n="fused"
+    )
 
 
 @pytest.mark.parametrize("mode", ["bwd", "replay", "bwd_tape", "replay_tape"])
@@ -265,21 +275,32 @@ def test_gate_fused_on_every_arch_in_l2n_modes() -> None:
 # registry
 
 
-def test_select_record_refuses_a_mode_without_records(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_select_record_refuses_a_mode_without_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A non-optional l2n stage whose records do not serve the call's mode is refused, never silently routed to
     another class; an optional stage selects nothing."""
-    scalars = dict(num_chunks_pad=2, num_seqs=1, num_heads=1, sm_count=148, arch=cake_jit.ARCHES[0])
+    scalars = dict(
+        num_chunks_pad=2, num_seqs=1, num_heads=1, sm_count=148, arch=cake_jit.ARCHES[0]
+    )
     for stage in ("fwd_intra", "bwd_prep", "glm_intra"):
         path = "fwd" if stage == "fwd_intra" else "light"
-        if any("fused" in cake_jit.MODULES[n].get("l2n", ["off"]) for n in cake_jit.records_of_stage(stage)):
+        if any(
+            "fused" in cake_jit.MODULES[n].get("l2n", ["off"])
+            for n in cake_jit.records_of_stage(stage)
+        ):
             continue  # the class ships: covered by the plan tests
-        with pytest.raises(ValueError, match="no record serves the in-kernel Q/K L2 norm mode"):
+        with pytest.raises(
+            ValueError, match="no record serves the in-kernel Q/K L2 norm mode"
+        ):
             cake_jit.select_record(stage, **scalars, path=path, l2n="fused")
     for stage in ("qk_l2norm", "qk_apply", "qk_pullback"):
         path = "fwd" if stage == "qk_l2norm" else "light"
         if cake_jit.records_of_stage(stage):
             continue
-        assert cake_jit.select_record(stage, **scalars, path=path, l2n="fallback") is None
+        assert (
+            cake_jit.select_record(stage, **scalars, path=path, l2n="fallback") is None
+        )
     with pytest.raises(ValueError, match="l2n 'on' is not one of"):
         cake_jit.select_record("dqkg", **scalars, path="light", l2n="on")
 
@@ -309,8 +330,13 @@ def test_l2n_classes_and_the_l2n_in_rule(monkeypatch: pytest.MonkeyPatch) -> Non
     }
     for name, rec in fake.items():
         monkeypatch.setitem(cake_jit.MODULES, name, rec)
-    scalars = dict(num_chunks_pad=2, num_seqs=1, num_heads=1, sm_count=148, arch=cake_jit.ARCHES[0])
-    sel = lambda path, mode: cake_jit.select_record("qk_l2norm", **scalars, path=path, l2n=mode)  # noqa: E731
+    scalars = dict(
+        num_chunks_pad=2, num_seqs=1, num_heads=1, sm_count=148, arch=cake_jit.ARCHES[0]
+    )
+
+    def sel(path: str, mode: str) -> str | None:
+        return cake_jit.select_record("qk_l2norm", **scalars, path=path, l2n=mode)
+
     assert sel("fwd", "off") == "x_plain" and sel("replay", "off") == "x_plain"
     assert sel("fwd", "fused") == "x_l2n" and sel("fwd_nosave", "fused") == "x_l2n"
     assert sel("replay", "fused") == "x_plain"
@@ -318,7 +344,11 @@ def test_l2n_classes_and_the_l2n_in_rule(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_tokens_grid_rule(monkeypatch: pytest.MonkeyPatch) -> None:
-    record = {"stage": "qk_l2norm", "grid_rule": {"kind": "tokens"}, "select_rule": {"kind": "always"}}
+    record = {
+        "stage": "qk_l2norm",
+        "grid_rule": {"kind": "tokens"},
+        "select_rule": {"kind": "always"},
+    }
     monkeypatch.setitem(cake_jit.MODULES, "qk_l2norm_test", record)
     common = dict(num_chunks_pad=4, num_seqs=1, num_heads=3, sm_count=148)
     assert cake_jit.launch_grid("qk_l2norm_test", **common, num_tokens=129) == (3, 3, 1)
@@ -345,7 +375,10 @@ def test_l2n_values_bind_normalized_rows_under_q_and_k() -> None:
     assert (v["read_rstd"], v["write_rstd"]) == (1, 0)
     # contract v1.1: the internal rows default to the token rows (no record reads them there), write_qkn to 1
     assert v["qn_int"] is qn and v["kn_int"] is kn and v["write_qkn"] == 1
-    qi, ki = torch.empty(64, H, D, dtype=torch.bfloat16), torch.empty(64, H, D, dtype=torch.bfloat16)
+    qi, ki = (
+        torch.empty(64, H, D, dtype=torch.bfloat16),
+        torch.empty(64, H, D, dtype=torch.bfloat16),
+    )
     v = cake_backend._l2n_values(
         q, k, qn, kn, rstd, read_rstd=0, write_rstd=1, write_qkn=0, qn_int=qi, kn_int=ki
     )
@@ -373,12 +406,17 @@ def test_internal_rows_scatter_to_token_rows() -> None:
         rows[64 * c : 64 * c + ln[c], :, :] = tok[bos[c] : bos[c] + ln[c], None, None]
     out = torch.full((S, H, D), -2.0)
     cake_backend._internal_to_tokens(
-        rows, torch.tensor(bos, dtype=torch.int32), torch.tensor(ln, dtype=torch.int32), out
+        rows,
+        torch.tensor(bos, dtype=torch.int32),
+        torch.tensor(ln, dtype=torch.int32),
+        out,
     )
     assert torch.equal(out[:, 0, 0], tok)
 
 
-def test_record_hook_clones_and_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_record_hook_clones_and_is_off_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     assert cake_backend._l2n_record is None
     x = torch.arange(4.0)
     cake_backend._record_l2n("fwd", qn=x)  # no hook: nothing recorded, no error
@@ -389,10 +427,14 @@ def test_record_hook_clones_and_is_off_by_default(monkeypatch: pytest.MonkeyPatc
     assert store["bwd.qn"].data_ptr() != x.data_ptr()
 
 
-def test_autograd_node_returns_one_gradient_slot_per_input(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_autograd_node_returns_one_gradient_slot_per_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import inspect
 
-    n_inputs = len(inspect.signature(cake_backend.ChunkKDADetFunction.forward).parameters) - 1
+    n_inputs = (
+        len(inspect.signature(cake_backend.ChunkKDADetFunction.forward).parameters) - 1
+    )
     seen = {}
 
     def fake_bwd(*args, **kwargs):
@@ -402,7 +444,17 @@ def test_autograd_node_returns_one_gradient_slot_per_input(monkeypatch: pytest.M
     monkeypatch.setattr(cake_backend, "chunk_kda_det_bwd", fake_bwd)
     t = torch.zeros(1)
     ctx = types.SimpleNamespace(
-        saved_tensors=(t, t, t, t, t, t, t, t, t),  # q k v g beta cu_seqlens Aqk Akk qk_rstd
+        saved_tensors=(
+            t,
+            t,
+            t,
+            t,
+            t,
+            t,
+            t,
+            t,
+            t,
+        ),  # q k v g beta cu_seqlens Aqk Akk qk_rstd
         gate="g",
         lower_bound=None,
         qk_l2norm=True,
@@ -439,9 +491,7 @@ def _edge_rows(H: int = 3) -> torch.Tensor:
     (``ss = 0``: ``r = 1000``), signed zeros, BF16 subnormals, a row whose ``ss`` overflows FP32 (``r = 0``), one
     large channel among tiny ones."""
     g = torch.Generator().manual_seed(7817)
-    rows = [
-        torch.randn(64, H, D, generator=g) * s for s in (1e-3, 1.0, 30.0, 3e3)
-    ]
+    rows = [torch.randn(64, H, D, generator=g) * s for s in (1e-3, 1.0, 30.0, 3e3)]
     special = torch.zeros(6, H, D)
     special[1] = -0.0
     special[2] = torch.tensor(2.0**-130)  # BF16 subnormal
@@ -453,7 +503,9 @@ def _edge_rows(H: int = 3) -> torch.Tensor:
 
 
 def _bits(x: torch.Tensor) -> torch.Tensor:
-    return x.contiguous().view(torch.int16 if x.dtype == torch.bfloat16 else torch.int32)
+    return x.contiguous().view(
+        torch.int16 if x.dtype == torch.bfloat16 else torch.int32
+    )
 
 
 def test_kda_reference_is_bitwise_the_shared_gdn_reference() -> None:
@@ -462,7 +514,9 @@ def test_kda_reference_is_bitwise_the_shared_gdn_reference() -> None:
     gdn = _cake_l2n()
     assert not gdn.flush_denormal_active()
     x = _edge_rows()
-    assert torch.equal(_bits(kda_l2n.sum_of_squares(x)), _bits(gdn.sum_of_squares(x.float())))
+    assert torch.equal(
+        _bits(kda_l2n.sum_of_squares(x)), _bits(gdn.sum_of_squares(x.float()))
+    )
     qn_k, r_k = kda_l2n.qk_l2norm(x)
     qn_g, r_g = gdn.qk_l2norm_ref(x)
     assert torch.equal(_bits(r_k), _bits(r_g)) and torch.equal(_bits(qn_k), _bits(qn_g))
@@ -523,7 +577,10 @@ def test_l2n_plans_need_l2n_records(arch: str) -> None:
     """A mode whose records the build does not ship is refused at planning (no silent route)."""
     for mode in ("fused", "fallback"):
         ships = all(
-            any(mode in cake_jit.MODULES[n].get("l2n", ["off"]) for n in cake_jit.records_of_stage(stage))
+            any(
+                mode in cake_jit.MODULES[n].get("l2n", ["off"])
+                for n in cake_jit.records_of_stage(stage)
+            )
             for stage in ("fwd_intra", "bwd_prep", "glm_intra")
         )
         if ships:
@@ -531,7 +588,9 @@ def test_l2n_plans_need_l2n_records(arch: str) -> None:
             assert p.l2n == mode and p.gate_fused
             assert p.dispatched("qk_pullback", "light") == (mode == "fallback")
         else:
-            with pytest.raises(ValueError, match="no record serves the in-kernel Q/K L2 norm mode"):
+            with pytest.raises(
+                ValueError, match="no record serves the in-kernel Q/K L2 norm mode"
+            ):
                 cake_backend.plan(256, 1, 2, 148, arch, l2n=mode)
     with pytest.raises(ValueError, match="l2n must be one of"):
         cake_backend.plan(256, 1, 2, 148, arch, l2n="on")
@@ -541,7 +600,6 @@ def test_l2n_plans_need_l2n_records(arch: str) -> None:
 # device rows (skip without an exported device or without the l2n records of its architecture)
 
 from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
-    GRAD_NAMES,
     LOWER_BOUND,
     elementwise_gate,
     error_metrics,
@@ -550,7 +608,9 @@ from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
 )
 from tests.test_helpers import cake_kda_det_train_reference_l2n as ref_l2n  # noqa: E402
 
-ATOL = RTOL = 1e-2  # the package's declared elementwise gate (test_cake_kda_det_train.py)
+ATOL = RTOL = (
+    1e-2  # the package's declared elementwise gate (test_cake_kda_det_train.py)
+)
 SHAPES_L2N = (
     ((64,), 1),
     ((1000, 37, 300), 4),
@@ -569,14 +629,19 @@ def _l2n_device(mode: str = "fused") -> torch.device:
         pytest.skip("not an exported compute capability")
     for stage in ("fwd_intra", "bwd_prep", "glm_intra"):
         if not any(
-            mode in cake_jit.MODULES[n].get("l2n", ["off"]) and arch in cake_jit.MODULES[n]["arches"]
+            mode in cake_jit.MODULES[n].get("l2n", ["off"])
+            and arch in cake_jit.MODULES[n]["arches"]
             for n in cake_jit.records_of_stage(stage)
         ):
-            pytest.skip(f"this build ships no l2n={mode!r} record of {stage} for {arch}")
+            pytest.skip(
+                f"this build ships no l2n={mode!r} record of {stage} for {arch}"
+            )
     return torch.device("cuda", index)
 
 
-def _raw_qk(lengths, H: int, device, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+def _raw_qk(
+    lengths, H: int, device, seed: int = 0
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Raw (not normalized) BF16 q / k of a few magnitudes per token (the caller's projections)."""
     S = int(sum(lengths))
     gen = torch.Generator().manual_seed(7817 + seed + 31 * S + H)
@@ -611,16 +676,32 @@ def _g(inputs: dict, raw_gate: bool) -> torch.Tensor:
 def _fwd(inputs, raw_gate=False, **kwargs):
     i = inputs
     return cake_backend.chunk_kda_det_fwd(
-        i["q"], i["k"], i["v"], _g(i, raw_gate), i["beta"], i["cu_seqlens"],
-        use_qk_l2norm_in_kernel=True, **_gate_kw(i, raw_gate), **kwargs,
+        i["q"],
+        i["k"],
+        i["v"],
+        _g(i, raw_gate),
+        i["beta"],
+        i["cu_seqlens"],
+        use_qk_l2norm_in_kernel=True,
+        **_gate_kw(i, raw_gate),
+        **kwargs,
     )
 
 
 def _bwd(inputs, saved, raw_gate=False, **kwargs):
     i = inputs
     return cake_backend.chunk_kda_det_bwd(
-        i["q"], i["k"], i["v"], _g(i, raw_gate), i["beta"], i["cu_seqlens"], i["dout"], saved=saved,
-        use_qk_l2norm_in_kernel=True, **_gate_kw(i, raw_gate), **kwargs,
+        i["q"],
+        i["k"],
+        i["v"],
+        _g(i, raw_gate),
+        i["beta"],
+        i["cu_seqlens"],
+        i["dout"],
+        saved=saved,
+        use_qk_l2norm_in_kernel=True,
+        **_gate_kw(i, raw_gate),
+        **kwargs,
     )
 
 
@@ -632,7 +713,9 @@ def l2n_hook(monkeypatch: pytest.MonkeyPatch) -> dict:
 
 
 @pytest.mark.parametrize("raw_gate", [False, True], ids=["g", "raw"])
-@pytest.mark.parametrize("shape", SHAPES_L2N, ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}")
+@pytest.mark.parametrize(
+    "shape", SHAPES_L2N, ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}"
+)
 def test_l2n_matches_the_exact_reference(shape, raw_gate: bool) -> None:
     """Accuracy with use_qk_l2norm_in_kernel=True against the exact FP64 recurrence whose q / k are normalized in
     FP64 inside the graph (``dq`` / ``dk`` the raw rows' gradients): the declared elementwise gate on ``out`` and
@@ -647,13 +730,29 @@ def test_l2n_matches_the_exact_reference(shape, raw_gate: bool) -> None:
     i = inputs
     if raw_gate:
         ref_out, ref = ref_l2n.kda_exact_raw_l2n_with_grads(
-            i["q"], i["k"], i["v"], i["g"], i["beta"], i["A_log"], i["dt_bias"], i["dout"],
-            i["cu_seqlens"], cake_backend.SCALE, LOWER_BOUND,
+            i["q"],
+            i["k"],
+            i["v"],
+            i["g"],
+            i["beta"],
+            i["A_log"],
+            i["dt_bias"],
+            i["dout"],
+            i["cu_seqlens"],
+            cake_backend.SCALE,
+            LOWER_BOUND,
         )
         names = ("dq", "dk", "dv", "dbeta", "dg", "dA_log", "ddt_bias")
     else:
         ref_out, ref = ref_l2n.kda_exact_l2n_with_grads(
-            i["q"], i["k"], i["v"], i["g"], i["beta"], i["dout"], i["cu_seqlens"], cake_backend.SCALE
+            i["q"],
+            i["k"],
+            i["v"],
+            i["g"],
+            i["beta"],
+            i["dout"],
+            i["cu_seqlens"],
+            cake_backend.SCALE,
         )
         names = ("dq", "dk", "dv", "dbeta", "dg")
     candidates = {"out": out, **dict(zip(names, grads, strict=True))}
@@ -668,7 +767,9 @@ def test_l2n_matches_the_exact_reference(shape, raw_gate: bool) -> None:
 
 
 @pytest.mark.parametrize("raw_gate", [False, True], ids=["g", "raw"])
-@pytest.mark.parametrize("shape", SHAPES_L2N[1:4], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}")
+@pytest.mark.parametrize(
+    "shape", SHAPES_L2N[1:4], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}"
+)
 def test_l2n_forward_rows_equal_the_reference_and_every_backward_route(
     shape, raw_gate: bool, l2n_hook: dict
 ) -> None:
@@ -683,35 +784,52 @@ def test_l2n_forward_rows_equal_the_reference_and_every_backward_route(
     kn_ref, rk_ref = ref_l2n.qk_l2norm(k)
     out, saved = _fwd(inputs, raw_gate)
     fwd = {n: l2n_hook[f"fwd.{n}"].cpu() for n in ("qn", "kn", "qk_rstd")}
-    assert _bits(fwd["qn"]).equal(_bits(qn_ref)) and _bits(fwd["kn"]).equal(_bits(kn_ref))
+    assert _bits(fwd["qn"]).equal(_bits(qn_ref)) and _bits(fwd["kn"]).equal(
+        _bits(kn_ref)
+    )
     assert _bits(fwd["qk_rstd"]).equal(_bits(torch.stack((rq_ref, rk_ref))))
     assert _bits(saved.qk_rstd.cpu()).equal(_bits(fwd["qk_rstd"]))
     grads = _bwd(inputs, saved, raw_gate)
     paths = {l2n_hook["bwd.path"]: [g.clone() for g in grads]}
     for name in ("qn", "kn"):
-        assert _bits(l2n_hook[f"bwd.{name}"].cpu()).equal(_bits(fwd[name])), (name, l2n_hook["bwd.path"])
+        assert _bits(l2n_hook[f"bwd.{name}"].cpu()).equal(_bits(fwd[name])), (
+            name,
+            l2n_hook["bwd.path"],
+        )
     replay = _bwd(inputs, None, raw_gate)
     assert l2n_hook["bwd.path"] == "replay"
     for name in ("qn", "kn", "qk_rstd"):
-        assert _bits(l2n_hook[f"bwd.{name}"].cpu()).equal(_bits(fwd[name])), ("replay", name)
+        assert _bits(l2n_hook[f"bwd.{name}"].cpu()).equal(_bits(fwd[name])), (
+            "replay",
+            name,
+        )
     out_t, saved_t = _fwd(inputs, raw_gate, save_mode="tape")
     grads_t = _bwd(inputs, saved_t, raw_gate)
     assert l2n_hook["bwd.path"] == "tape"
     for name in ("qn", "kn"):
-        assert _bits(l2n_hook[f"bwd.{name}"].cpu()).equal(_bits(fwd[name])), ("tape", name)
+        assert _bits(l2n_hook[f"bwd.{name}"].cpu()).equal(_bits(fwd[name])), (
+            "tape",
+            name,
+        )
     ref = list(paths.values())[0]
     for tag, other in (("replay", replay), ("tape", grads_t)):
         for a, b in zip(ref, other, strict=True):
             assert _bits(a).equal(_bits(b)), tag
     assert _bits(out_t).equal(_bits(out))
     out2, saved2 = _fwd(inputs, raw_gate)
-    assert _bits(out2).equal(_bits(out)) and _bits(saved2.qk_rstd).equal(_bits(saved.qk_rstd))
+    assert _bits(out2).equal(_bits(out)) and _bits(saved2.qk_rstd).equal(
+        _bits(saved.qk_rstd)
+    )
     for a, b in zip(ref, _bwd(inputs, saved2, raw_gate), strict=True):
         assert _bits(a).equal(_bits(b)), "repeat"
 
 
-@pytest.mark.parametrize("shape", SHAPES_L2N[1:3], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}")
-def test_l2n_checkpoint_recompute_is_bitwise_the_first_forward(shape, l2n_hook: dict) -> None:
+@pytest.mark.parametrize(
+    "shape", SHAPES_L2N[1:3], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}"
+)
+def test_l2n_checkpoint_recompute_is_bitwise_the_first_forward(
+    shape, l2n_hook: dict
+) -> None:
     """Under torch.utils.checkpoint the recompute's rstd / qn / kn and every gradient equal the plain autograd
     run's bit for bit."""
     device = _l2n_device()
@@ -723,11 +841,24 @@ def test_l2n_checkpoint_recompute_is_bitwise_the_first_forward(shape, l2n_hook: 
         leaves = [inputs[n].detach().clone().requires_grad_(True) for n in names]
 
         def f(*xs):
-            return cake_backend.chunk_kda_det(*xs, inputs["cu_seqlens"], use_qk_l2norm_in_kernel=True)
+            return cake_backend.chunk_kda_det(
+                *xs, inputs["cu_seqlens"], use_qk_l2norm_in_kernel=True
+            )
 
-        out = torch.utils.checkpoint.checkpoint(f, *leaves, use_reentrant=False) if ckpt else f(*leaves)
+        out = (
+            torch.utils.checkpoint.checkpoint(f, *leaves, use_reentrant=False)
+            if ckpt
+            else f(*leaves)
+        )
         out.backward(inputs["dout"])
-        return out.detach(), [x.grad for x in leaves], {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in l2n_hook.items()}
+        return (
+            out.detach(),
+            [x.grad for x in leaves],
+            {
+                k: v.clone() if isinstance(v, torch.Tensor) else v
+                for k, v in l2n_hook.items()
+            },
+        )
 
     out_a, grads_a, rec_a = run(False)
     out_b, grads_b, rec_b = run(True)
@@ -738,7 +869,9 @@ def test_l2n_checkpoint_recompute_is_bitwise_the_first_forward(shape, l2n_hook: 
         assert _bits(rec_a[key]).equal(_bits(rec_b[key])), key
 
 
-@pytest.mark.parametrize("shape", SHAPES_L2N[1:3], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}")
+@pytest.mark.parametrize(
+    "shape", SHAPES_L2N[1:3], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}"
+)
 def test_l2n_packed_views_equal_their_contiguous_copies(shape) -> None:
     """Contract C11: q / k as column slices of one packed projection output give the bits of their contiguous
     copies (forward, saved rstd and every gradient); no copy is made of the views."""
@@ -749,15 +882,23 @@ def test_l2n_packed_views_equal_their_contiguous_copies(shape) -> None:
     packed = torch.zeros(S, 3 * H * D + 8, dtype=torch.bfloat16, device=device)
     packed[:, 8 : 8 + H * D] = inputs["q"].reshape(S, -1)
     packed[:, 8 + H * D : 8 + 2 * H * D] = inputs["k"].reshape(S, -1)
-    viewed = dict(inputs, q=packed[:, 8 : 8 + H * D].view(S, H, D), k=packed[:, 8 + H * D : 8 + 2 * H * D].view(S, H, D))
+    viewed = dict(
+        inputs,
+        q=packed[:, 8 : 8 + H * D].view(S, H, D),
+        k=packed[:, 8 + H * D : 8 + 2 * H * D].view(S, H, D),
+    )
     out_a, saved_a = _fwd(inputs)
     out_b, saved_b = _fwd(viewed)
-    assert _bits(out_a).equal(_bits(out_b)) and _bits(saved_a.qk_rstd).equal(_bits(saved_b.qk_rstd))
+    assert _bits(out_a).equal(_bits(out_b)) and _bits(saved_a.qk_rstd).equal(
+        _bits(saved_b.qk_rstd)
+    )
     for a, b in zip(_bwd(inputs, saved_a), _bwd(viewed, saved_b), strict=True):
         assert _bits(a).equal(_bits(b))
 
 
-@pytest.mark.parametrize("shape", SHAPES_L2N[1:3], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}")
+@pytest.mark.parametrize(
+    "shape", SHAPES_L2N[1:3], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}"
+)
 def test_l2n_fused_equals_the_fallback_route(shape) -> None:
     """The force-fallback knob (an explicit fallback plan / workspace): forward, saved rstd and every gradient bit
     for bit the fused route's."""
@@ -770,8 +911,12 @@ def test_l2n_fused_equals_the_fallback_route(shape) -> None:
     assert ws.l2n == "fallback" and ws.plan.dispatched("qk_pullback", "light")
     out_a, saved_a = _fwd(inputs)
     out_b, saved_b = _fwd(inputs, workspace=ws)
-    assert _bits(out_a).equal(_bits(out_b)) and _bits(saved_a.qk_rstd).equal(_bits(saved_b.qk_rstd))
-    for a, b in zip(_bwd(inputs, saved_a), _bwd(inputs, saved_b, workspace=ws), strict=True):
+    assert _bits(out_a).equal(_bits(out_b)) and _bits(saved_a.qk_rstd).equal(
+        _bits(saved_b.qk_rstd)
+    )
+    for a, b in zip(
+        _bwd(inputs, saved_a), _bwd(inputs, saved_b, workspace=ws), strict=True
+    ):
         assert _bits(a).equal(_bits(b))
     for a, b in zip(_bwd(inputs, None), _bwd(inputs, None, workspace=ws), strict=True):
         assert _bits(a).equal(_bits(b)), "replay"
@@ -786,11 +931,20 @@ def test_l2n_refusals_on_device() -> None:
     out, saved = _fwd(inputs)
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
         cake_backend.chunk_kda_det_bwd(
-            i["q"].contiguous(), i["k"].contiguous(), i["v"], i["g"], i["beta"], i["cu_seqlens"], i["dout"], saved=saved
+            i["q"].contiguous(),
+            i["k"].contiguous(),
+            i["v"],
+            i["g"],
+            i["beta"],
+            i["cu_seqlens"],
+            i["dout"],
+            saved=saved,
         )
     ws_off = cake_backend.KdaDetWorkspace.for_problem(sum(lengths), 2, H, device)
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
         _fwd(inputs, workspace=ws_off)
-    bad_q = torch.zeros(sum(lengths), H, 2 * D, dtype=torch.bfloat16, device=device)[:, :, ::2]
+    bad_q = torch.zeros(sum(lengths), H, 2 * D, dtype=torch.bfloat16, device=device)[
+        :, :, ::2
+    ]
     with pytest.raises(ValueError, match="never copied"):
         _fwd(dict(inputs, q=bad_q))
