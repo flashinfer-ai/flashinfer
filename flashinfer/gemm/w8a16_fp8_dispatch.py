@@ -106,7 +106,8 @@ def _sm100_split_k(m: int, n: int, k: int, num_sms: int) -> int:
 
 
 def _sm100_use_stream_k(m: int, n: int, k: int, num_sms: int) -> bool:
-    """"""
+    """Whether CUTLASS's heuristic would pick stream-K here (a long K, a grid of two
+    or three waves with a short last one), which routes to _sm100_streamk_substitute."""
     if k % 128 != 0 or k // 128 < 64:
         return False
     clusters = num_sms // 2 if num_sms > 1 else 1

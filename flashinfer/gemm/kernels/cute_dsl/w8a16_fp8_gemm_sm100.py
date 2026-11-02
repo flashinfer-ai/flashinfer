@@ -198,7 +198,6 @@ class Sm100W8A16Fp8GemmKernel:
             self.num_a_tmem_cols,
         ) = self._compute_stages_and_tmem_cols(
             tiled_mma,
-            self.mma_tiler,
             self.cta_tile_shape_mnk,
             self.epi_tile,
             self.a_dtype,
@@ -255,7 +254,6 @@ class Sm100W8A16Fp8GemmKernel:
         sA_transform: Optional[cute.Tensor],
         accumulators: cute.Tensor,
         transform_tidx: cutlass.Int32,
-        transform_group_idx: cutlass.Int32,
     ):
         if cutlass.const_expr(self.transform_a_source == tcgen05.OperandSource.TMEM):
             tmem_ptr_transform = cute.recast_ptr(
@@ -1020,7 +1018,8 @@ class Sm100W8A16Fp8GemmKernel:
         tensor_c: cute.Tensor,
         tile_info_pipeline: pipeline.PipelineAsync,
     ):
-        """Scheduler warp: hands (cta_coord_m, activation offset, valid, rows left) ery other warp through the tile_info pipeline."""
+        """Scheduler warp: hands (cta_coord_m, activation offset, valid, rows left)
+        to every other warp through the tile_info pipeline."""
         cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
         tile_info_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_tile_info_stage
@@ -1290,7 +1289,6 @@ class Sm100W8A16Fp8GemmKernel:
             sA_transform,
             accumulators,
             transform_local_tidx,
-            transform_group_idx,
         )
         tile_info_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
@@ -1383,8 +1381,6 @@ class Sm100W8A16Fp8GemmKernel:
         acc_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_acc_stage
         )
-        # Debug wait accounting (cycles): inputs (transformed A + B stages), a free
-        # accumulator stage, k-tiles seen, and the warp's total.
         while work_tile.is_valid_tile:
             tCtAcc = accumulators[(None, None, None, acc_producer_state.index)]
             b_load2mma_consumer_state.reset_count()
@@ -1914,7 +1910,6 @@ class Sm100W8A16Fp8GemmKernel:
     @staticmethod
     def _compute_stages_and_tmem_cols(
         tiled_mma: cute.TiledMma,
-        mma_tiler_mnk: tuple[int, int, int],
         cta_tile_shape_mnk: tuple[int, int, int],
         epi_tile: cute.Tile,
         a_dtype: type[cutlass.Numeric],

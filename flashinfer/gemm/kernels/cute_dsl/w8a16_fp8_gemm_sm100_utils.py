@@ -1,12 +1,14 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Conversion helpers for the SM100 W8A16 (e4m3 weight x 16-bit activation) GEMM.
+"""Device helpers of the W8A16 (e4m3 weight x 16-bit activation) GEMM kernels.
 
-The transform warps of ``w8a16_fp8_gemm_sm100.py`` run these on the weight
-fragments between the TMA load and ``tcgen05.mma``.  Numerical contract (same as
-``include/flashinfer/gemm/w8a16_convert.cuh``): exact for every finite e4m3 code,
-denormals included.  The two e4m3fn NaN encodings (0x7F, 0xFF) are not handled: the
+e4m3 -> bf16 / fp16 conversion for the weight fragments (the Blackwell transform
+warps convert whole 32-bit words between the TMA load and ``tcgen05.mma``; the
+Hopper consumers load pairs from shared memory and convert them into the MMA
+operand registers), and the 64-bit acquire / release counter operations and
+fences of the Hopper split tail.  Numerical contract of the conversion: exact for
+every finite e4m3 code, denormals included.  The two e4m3fn NaN encodings (0x7F, 0xFF) are not handled: the
 ALU bf16 path turns them into +-480, the native ``cvt`` paths into NaN.  Callers
 hand the kernel a finite weight; the Python op documents this.
 """
@@ -15,7 +17,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
-from cutlass.cutlass_dsl import Uint16, Uint32, Uint64, dsl_user_op
+from cutlass.cutlass_dsl import Uint32, Uint64, dsl_user_op
 
 # ``cvt.rn.bf16x2.e4m3x2`` (PTX ISA 9.2, sm_100+) converts a pair in one instruction;
 # it needs CUDA 13.2 or newer.  Older toolkits take the four-instruction ALU chain.
@@ -165,129 +167,6 @@ def _asm_for_pair(mma_dtype: type[cutlass.Numeric], native_cvt: bool) -> str:
 
 
 @dsl_user_op
-def convert_e4m3_pairs(
-    pairs: cute.TensorSSA,
-    mma_dtype: type[cutlass.Numeric],
-    native_cvt: bool = True,
-    *,
-    loc=None,
-    ip=None,
-) -> cute.TensorSSA:
-    """Convert e4m3 pairs (``Uint16`` SSA, each holding two consecutive weights) to
-    ``mma_dtype`` values in the same order, one pair per asm statement, straight from
-    the 16-bit register the pair was loaded into.  The Hopper mainloop loads its A
-    fragment as 16-bit units (two consecutive k of one row); converting whole 32-bit
-    words would first have the compiler pack bytes into words, which doubled the ALU
-    work of the conversion."""
-    count = cute.size(pairs.shape)
-    half_type = ir.VectorType.get([count], Uint16.mlir_type, loc=loc)
-    halves_vector = llvm.bitcast(
-        half_type, pairs.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
-    )
-    asm = _asm_for_pair(mma_dtype, native_cvt)
-    out_words: list[ir.Value] = []
-    for idx in range(count):
-        half = vector.extract(halves_vector, [], [idx], loc=loc, ip=ip)
-        half32 = llvm.zext(Uint32.mlir_type, half, loc=loc, ip=ip)
-        word = llvm.inline_asm(
-            Uint32.mlir_type,
-            [half32],
-            asm,
-            "=r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-        out_words.append(word)
-    out_words_type = ir.VectorType.get([count], Uint32.mlir_type, loc=loc)
-    out_words_vector = vector.from_elements(out_words_type, out_words, loc=loc, ip=ip)
-    result_type = ir.VectorType.get([2 * count], mma_dtype.mlir_type, loc=loc)
-    result_vector = llvm.bitcast(result_type, out_words_vector, loc=loc, ip=ip)
-    return cute.TensorSSA(result_vector, (2 * count,), mma_dtype)
-
-
-# Load one e4m3 pair (a 16-bit unit at shared address $1) and convert it to one bf16x2
-# / f16x2 word ($0) in a single statement.
-_E4M3X2_SMEM_TO_BF16X2_ALU = """
-{
-    .reg .b32 s, k;
-    ld.shared.u16 s, [$1];
-    mov.b32 k, 0x7B807B80;
-    prmt.b32 s, s, 0, 0x9180;
-    shl.b32 s, s, 4;
-    and.b32 s, s, 0x87F087F0;
-    mul.rn.bf16x2 $0, s, k;
-}
-"""
-_E4M3X2_SMEM_TO_BF16X2_NATIVE = """
-{
-    .reg .b16 h;
-    ld.shared.u16 h, [$1];
-    cvt.rn.bf16x2.e4m3x2 $0, h;
-}
-"""
-_E4M3X2_SMEM_TO_F16X2 = """
-{
-    .reg .b16 h;
-    ld.shared.u16 h, [$1];
-    cvt.rn.f16x2.e4m3x2 $0, h;
-}
-"""
-
-
-def _asm_for_pair_smem(mma_dtype: type[cutlass.Numeric], native_cvt: bool) -> str:
-    if mma_dtype is cutlass.BFloat16:
-        return (
-            _E4M3X2_SMEM_TO_BF16X2_NATIVE
-            if native_cvt and _HAS_NATIVE_E4M3_BF16_CVT
-            else _E4M3X2_SMEM_TO_BF16X2_ALU
-        )
-    if mma_dtype is cutlass.Float16:
-        return _E4M3X2_SMEM_TO_F16X2
-    raise ValueError(f"W8A16 converts e4m3 to bf16 or fp16, not {mma_dtype}")
-
-
-@dsl_user_op
-def load_convert_e4m3_units(
-    addrs: list,
-    mma_dtype: type[cutlass.Numeric],
-    native_cvt: bool = True,
-    *,
-    loc=None,
-    ip=None,
-) -> cute.TensorSSA:
-    """Load the e4m3 pairs at the shared-memory addresses ``addrs`` (``Int32`` each, a
-    16-bit unit of two consecutive weights) and convert them to ``mma_dtype``; the
-    result holds ``2 * len(addrs)`` values in order.  The Hopper mainloop computes the
-    swizzled unit addresses of its fragment once per thread and loads through this, one
-    load-and-convert statement per unit, instead of a copy whose per-load swizzle
-    arithmetic the compiler could not hoist."""
-    asm = _asm_for_pair_smem(mma_dtype, native_cvt)
-    count = len(addrs)
-    out_words: list[ir.Value] = []
-    for addr in addrs:
-        word = llvm.inline_asm(
-            Uint32.mlir_type,
-            [addr.ir_value(loc=loc, ip=ip)],
-            asm,
-            "=r,r",
-            has_side_effects=True,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-        out_words.append(word)
-    out_words_type = ir.VectorType.get([count], Uint32.mlir_type, loc=loc)
-    out_words_vector = vector.from_elements(out_words_type, out_words, loc=loc, ip=ip)
-    result_type = ir.VectorType.get([2 * count], mma_dtype.mlir_type, loc=loc)
-    result_vector = llvm.bitcast(result_type, out_words_vector, loc=loc, ip=ip)
-    return cute.TensorSSA(result_vector, (2 * count,), mma_dtype)
-
-
-@dsl_user_op
 def load_e4m3_unit(addr: cutlass.Int32, *, loc=None, ip=None) -> cutlass.Uint32:
     """``ld.shared.u16`` of the e4m3 pair at shared address ``addr`` into a zero-extended
     32-bit register (the pair converter's input)."""
@@ -369,36 +248,6 @@ def bulk_store_complete_fence(*, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
-def atomic_add_acq_rel_gpu(
-    addr: cutlass.Int64, value: cutlass.Int32, *, loc=None, ip=None
-) -> cutlass.Int32:
-    """``atom.acq_rel.gpu.global.add.s32`` on the global int32 at ``addr``; returns the
-    old value."""
-    old = _asm_op(
-        Uint32.mlir_type,
-        [addr.ir_value(loc=loc, ip=ip), value.ir_value(loc=loc, ip=ip)],
-        "atom.acq_rel.gpu.global.add.s32 $0, [$1], $2;",
-        "=r,l,r",
-        loc=loc,
-        ip=ip,
-    )
-    return cutlass.Int32(old)
-
-
-@dsl_user_op
-def ld_acquire_gpu_s32(addr: cutlass.Int64, *, loc=None, ip=None) -> cutlass.Int32:
-    val = _asm_op(
-        Uint32.mlir_type,
-        [addr.ir_value(loc=loc, ip=ip)],
-        "ld.acquire.gpu.global.s32 $0, [$1];",
-        "=r,l",
-        loc=loc,
-        ip=ip,
-    )
-    return cutlass.Int32(val)
-
-
-@dsl_user_op
 def atomic_add_acq_rel_gpu_u64(
     addr: cutlass.Int64, value: cutlass.Int64, *, loc=None, ip=None
 ) -> cutlass.Int64:
@@ -429,68 +278,16 @@ def ld_acquire_gpu_u64(addr: cutlass.Int64, *, loc=None, ip=None) -> cutlass.Int
 
 
 @dsl_user_op
-def st_relaxed_gpu_s32(
-    addr: cutlass.Int64, value: cutlass.Int32, *, loc=None, ip=None
-) -> None:
-    _asm_op(
-        None,
-        [addr.ir_value(loc=loc, ip=ip), value.ir_value(loc=loc, ip=ip)],
-        "st.relaxed.gpu.global.s32 [$0], $1;",
-        "l,r",
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def nanosleep(ns: int, *, loc=None, ip=None) -> None:
     _asm_op(None, [], f"nanosleep.u32 {int(ns)};", "", loc=loc, ip=ip)
 
 
-@dsl_user_op
-def clock_lo(tag: int, *, loc=None, ip=None) -> cutlass.Int32:
-    """``%clock`` (SM cycle counter, low 32 bits); debug-mode wait accounting only.
-    ``tag`` distinguishes call sites (see ``global_timer_lo``)."""
-    val = _asm_op(
-        Uint32.mlir_type,
-        [],
-        f"mov.u32 $0, %clock; // {int(tag)}",
-        "=r",
-        loc=loc,
-        ip=ip,
-    )
-    return cutlass.Int32(val)
-
-
-@dsl_user_op
-def global_timer_lo(tag: int, *, loc=None, ip=None) -> cutlass.Int32:
-    """Low 32 bits of ``%globaltimer`` (nanoseconds); debug-mode timelines only.
-    ``tag`` is unused by the asm: it makes every call site a distinct op (a no-argument
-    user op is reused across call sites, and a value then escapes its region)."""
-    val = llvm.inline_asm(
-        Uint32.mlir_type,
-        [],
-        "{ .reg .u64 t; mov.u64 t, %globaltimer; cvt.u32.u64 $0, t; }",
-        "=r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return cutlass.Int32(val)
-
-
 __all__ = [
-    "atomic_add_acq_rel_gpu",
+    "atomic_add_acq_rel_gpu_u64",
     "bulk_store_complete_fence",
     "convert_e4m3_fragment",
-    "convert_e4m3_pairs",
     "convert_e4m3_words",
-    "global_timer_lo",
-    "load_convert_e4m3_units",
-    "ld_acquire_gpu_s32",
+    "ld_acquire_gpu_u64",
     "load_e4m3_unit",
     "nanosleep",
-    "st_relaxed_gpu_s32",
 ]

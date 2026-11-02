@@ -542,7 +542,6 @@ class Sm90W8A16Fp8GemmKernel:
                 order_bar,
                 sA,
                 storage.sA.data_ptr(),
-                a_smem_layout_staged,
                 sB,
                 sC,
                 sW,
@@ -649,7 +648,6 @@ class Sm90W8A16Fp8GemmKernel:
         order_bar: cute.Pointer,
         sA: cute.Tensor,
         sA_base: cute.Pointer,
-        a_smem_layout_staged: cute.ComposedLayout,
         sB: cute.Tensor,
         sC: cute.Tensor,
         sW: cute.Tensor,
@@ -701,7 +699,8 @@ class Sm90W8A16Fp8GemmKernel:
         # within the k-block, r0 = warp * 16 + lane / 4 of its 64 rows, c0 = (lane % 4)
         # * 2.  Their byte offsets within the stage's K_SW64 layout (64-byte rows,
         # Swizzle<2, 4, 3>: bits [5:4] ^= bits [8:7]) are computed once per thread; the
-        # loop adds the stage base and loads through load_convert_e4m3_units.
+        # loop adds the stage base, loads each pair with load_e4m3_unit and converts
+        # the loaded words with convert_e4m3_words.
         assert tile_k == 64, "the hand-swizzled A addressing assumes 64-byte rows"
         lane = ctid % 32
         wg_rows0 = 0 if self.pingpong else (ctid // 128) * 64
