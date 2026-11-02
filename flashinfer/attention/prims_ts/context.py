@@ -192,6 +192,7 @@ class _ContextPlanState:
 
     geometry: _ContextPlanGeometry
     softmax_scale: GlobalScale
+    scale_softmax_log2: GlobalScale
     output_scale: GlobalScale
     empty_i32: torch.Tensor
     variable_window_padded_starts: Optional[torch.Tensor]
@@ -237,6 +238,7 @@ class _PagedContextPlanState:
 
     geometry: _PagedContextPlanGeometry
     softmax_scale: GlobalScale
+    scale_softmax_log2: GlobalScale
     output_scale: GlobalScale
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
@@ -3028,7 +3030,7 @@ class BatchPrefillTSWrapper:
         resources and invalidates previous graphs; finish their launches first.
         lse_mode='base2' enables final LSE stores, and use_attention_sinks enables
         a per-run sink binding. Each global scale independently accepts a positive
-        host float or a contiguous CUDA FP32 tensor of shape (1,) on this device.
+        host float or a contiguous CUDA FP32 tensor of shape () or (1,) on this device.
         Tensor values must remain finite and positive; metadata validation never
         reads them back. Types specialize the kernel, while values and addresses
         do not. Softmax scales use natural-exponential units for either type.
@@ -3151,6 +3153,7 @@ class BatchPrefillTSWrapper:
         self._plan_state = _ContextPlanState(
             geometry=geometry,
             softmax_scale=softmax_scale,
+            scale_softmax_log2=_context_softmax_operand(softmax_scale),
             output_scale=output_scale,
             empty_i32=empty_i32,
             variable_window_padded_starts=variable_window_padded_starts,
@@ -3212,7 +3215,7 @@ class BatchPrefillTSWrapper:
         wrapper-owned fallback scratch. Scale overrides must match each planned
         float/tensor kind, even with validate=False; None inherits the default.
         softmax_scale is the effective QK scale in natural-exponential units,
-        and output_scale scales V/output. CUDA FP32 scales have shape (1,).
+        and output_scale scales V/output. CUDA FP32 scales have shape () or (1,).
         Keep tensor buffers alive and update their contents before replay;
         captured floats remain fixed. Scale values and addresses are not JIT keys.
 
@@ -3373,10 +3376,15 @@ class BatchPrefillTSWrapper:
             runtime_window_starts = state.empty_i32
             runtime_window_ends = state.empty_i32
             runtime_window_cta_starts = state.empty_i32
-        softmax_scale = resolve_scale(
-            softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
+        scale_softmax_log2 = (
+            state.scale_softmax_log2
+            if softmax_scale is None
+            else _context_softmax_operand(
+                resolve_scale(
+                    softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
+                )
+            )
         )
-        scale_softmax_log2 = _context_softmax_operand(softmax_scale)
         output_scale = resolve_scale(
             output_scale, state.output_scale, "output_scale", geometry.device
         )
@@ -3495,7 +3503,7 @@ class BatchPrefillPagedTSWrapper:
         resources and invalidates previous graphs; finish their launches first.
         lse_mode='base2' enables final LSE stores, and use_attention_sinks enables
         a per-run sink binding. Each global scale independently accepts a positive
-        host float or a contiguous CUDA FP32 tensor of shape (1,) on this device.
+        host float or a contiguous CUDA FP32 tensor of shape () or (1,) on this device.
         Tensor values must remain finite and positive; metadata validation never
         reads them back. Types specialize the kernel, while values and addresses
         do not. Softmax scales use natural-exponential units for either type.
@@ -3557,6 +3565,7 @@ class BatchPrefillPagedTSWrapper:
         self._plan_state = _PagedContextPlanState(
             geometry=geometry,
             softmax_scale=softmax_scale,
+            scale_softmax_log2=_context_softmax_operand(softmax_scale),
             output_scale=output_scale,
             compiled=compiled,
             policy=policy,
@@ -3619,7 +3628,7 @@ class BatchPrefillPagedTSWrapper:
 
         Scale overrides independently retain each planned float/tensor kind, even
         with validate=False; None inherits the default. CUDA FP32 scale tensors
-        have shape (1,) and must remain finite and positive. Softmax units match
+        have shape () or (1,) and must remain finite and positive. Softmax units match
         the contiguous wrapper. Keep captured scale buffers alive and update
         their contents before replay; captured floats remain fixed.
         Enabled attention_sinks is a compact CUDA FP32 [Hq]
@@ -3662,10 +3671,15 @@ class BatchPrefillPagedTSWrapper:
                 max_q_len = geometry.max_q_len
             if max_kv_len is None:
                 max_kv_len = geometry.max_kv_len
-        softmax_scale = resolve_scale(
-            softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
+        scale_softmax_log2 = (
+            state.scale_softmax_log2
+            if softmax_scale is None
+            else _context_softmax_operand(
+                resolve_scale(
+                    softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
+                )
+            )
         )
-        scale_softmax_log2 = _context_softmax_operand(softmax_scale)
         output_scale = resolve_scale(
             output_scale, state.output_scale, "output_scale", geometry.device
         )
@@ -3761,11 +3775,11 @@ def batch_prefill(
         need not be ordered.
     softmax_scale : float or torch.Tensor, optional
         Softmax scale in natural-exponential units; defaults to the inverse
-        square root of head size. Tensor scales are contiguous CUDA FP32 (1,)
+        square root of head size. Tensor scales are contiguous CUDA FP32 () or (1,)
         buffers on Q's device, with finite positive values.
     output_scale : float or torch.Tensor
         Scale applied to the attention output, independently using a host float
-        or a CUDA FP32 (1,) buffer with finite positive values.
+        or a CUDA FP32 () or (1,) buffer with finite positive values.
     out_dtype : torch.dtype, optional
         Output dtype; defaults to ``out.dtype`` when ``out`` is provided,
         otherwise the query dtype.
@@ -3939,11 +3953,11 @@ def batch_prefill_with_paged_kv_cache(
         Left sliding-window extent, or ``-1`` to disable the window.
     softmax_scale : float or torch.Tensor, optional
         Softmax scale in natural-exponential units; defaults to the inverse
-        square root of head size. Tensor scales are contiguous CUDA FP32 (1,)
+        square root of head size. Tensor scales are contiguous CUDA FP32 () or (1,)
         buffers on Q's device, with finite positive values.
     output_scale : float or torch.Tensor
         Scale applied to the attention output, independently using a host float
-        or a CUDA FP32 (1,) buffer with finite positive values.
+        or a CUDA FP32 () or (1,) buffer with finite positive values.
     out_dtype : torch.dtype, optional
         Output dtype; defaults to ``out.dtype`` when ``out`` is provided,
         otherwise the query dtype.

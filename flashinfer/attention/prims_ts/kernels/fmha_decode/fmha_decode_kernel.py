@@ -2628,24 +2628,6 @@ def _run_decode_gen_active(
     dynamic branch.
     """
 
-    # Device scales may still be produced by the preceding PDL grid.
-    if cutlass.const_expr(
-        cfg.use_pdl
-        and (
-            isinstance(scale_softmax_log2, cute.Pointer)
-            or isinstance(output_scale, cute.Pointer)
-        )
-    ):
-        prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
-
-    # Device scales are produced in regular units by GPU preprocessing.
-    if cutlass.const_expr(isinstance(scale_softmax_log2, cute.Pointer)):
-        scale_softmax_log2 = cute.make_tensor(scale_softmax_log2, cute.make_layout(1))[
-            0
-        ] * Float32(math.log2(math.e))
-    if cutlass.const_expr(isinstance(output_scale, cute.Pointer)):
-        output_scale = cute.make_tensor(output_scale, cute.make_layout(1))[0]
-
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
     bias_static_sliding_kv_tma = (
@@ -2749,9 +2731,15 @@ def _run_decode_gen_active(
     ) = _build_decode_gen_schedule(
         cfg,
         total_kv_tiles,
-        scale_softmax_log2=scale_softmax_log2,
+        scale_softmax_log2=(
+            Float32(1.0)
+            if isinstance(scale_softmax_log2, cute.Pointer)
+            else scale_softmax_log2
+        ),
         o_ptr=o_iter,
-        output_scale=output_scale,
+        output_scale=(
+            Float32(1.0) if isinstance(output_scale, cute.Pointer) else output_scale
+        ),
         partial_o_ptr=g_partial_o,
         partial_stats_ptr=g_partial_stats,
         split_kv_counter_ptr=g_split_kv_counter,
@@ -2895,6 +2883,31 @@ def _run_decode_gen_active(
             Int32(tmem_alloc_cols),
             cfg,
         )
+    # Scales are first consumed by the task bodies. Bind their device values
+    # after the producer acquire so resource initialization can overlap it.
+    if cutlass.const_expr(isinstance(scale_softmax_log2, cute.Pointer)):
+        resolved_softmax_scale = cute.make_tensor(
+            scale_softmax_log2, cute.make_layout(1)
+        )[0] * Float32(math.log2(math.e))
+        for resource in task_manager.resources:
+            if cutlass.const_expr(
+                isinstance(
+                    resource,
+                    (
+                        TmemSResource,
+                        SmemPResource,
+                        TmemOResource,
+                        TmemSoftmaxGlobalResource,
+                        TmemCorrResource,
+                    ),
+                )
+            ):
+                resource.scale_softmax_log2 = resolved_softmax_scale
+    if cutlass.const_expr(isinstance(output_scale, cute.Pointer)):
+        resolved_output_scale = cute.make_tensor(output_scale, cute.make_layout(1))[0]
+        for resource in task_manager.resources:
+            if cutlass.const_expr(isinstance(resource, TmemCorrResource)):
+                resource.output_scale = resolved_output_scale
     task_manager.run()
 
     # Every peer async-stores into an owner CTA's distributed SMEM and charges
@@ -3244,6 +3257,20 @@ def decode_gen_kernel(
     q_token_base = Int32(0)
     q_tile_is_active = cutlass.Boolean(True)
     if cutlass.const_expr(not cfg.use_persistent_scheduler):
+        if cutlass.const_expr(
+            cfg.use_pdl
+            and (
+                (
+                    cfg.use_variable_seqlens_q
+                    and not isinstance(g_cu_seqlens_q, UniformQueryOffsets)
+                )
+                or use_variable_seqlens_kv
+                or (use_native_paged_kv and not use_static_native_seqlens_kv)
+            )
+        ):
+            # Static tile pruning reads producer-owned Q/KV metadata here;
+            # persistent schedules defer those reads until TaskManager runs.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(cfg.use_variable_seqlens_q):
             q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
         q_token_base = _q_group_token_base(cfg, q_group_idx)
@@ -3252,8 +3279,6 @@ def decode_gen_kernel(
             use_variable_seqlens_kv
             or (use_native_paged_kv and not use_static_native_seqlens_kv)
         ):
-            if cutlass.const_expr(cfg.use_pdl):
-                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
             q_tile_is_active = q_tile_is_active & (
                 Int32(g_seqlens_kv[b_idx]) > Int32(0)
             )

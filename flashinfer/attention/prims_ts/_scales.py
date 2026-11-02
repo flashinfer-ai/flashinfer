@@ -38,14 +38,15 @@ def normalize_scale(value: object, name: str, device: torch.device) -> GlobalSca
             value.device.type != "cuda"
             or value.device != device
             or value.dtype != torch.float32
-            or value.shape != (1,)
+            or value.numel() != 1
+            or value.ndim > 1
             or not value.is_contiguous()
         ):
             raise ValueError(
-                f"{name} must be a contiguous CUDA float32 tensor of shape (1,) "
+                f"{name} must be a contiguous CUDA float32 tensor of shape () or (1,) "
                 f"on {device}"
             )
-        return value
+        return value.view(1) if value.ndim == 0 else value
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise TypeError(
             f"{name} must be a positive Python scalar or CUDA float32 tensor"
@@ -74,7 +75,9 @@ def resolve_scale(
     device: torch.device,
 ) -> GlobalScale:
     """Resolve a run override while preserving the eagerly compiled signature."""
-    resolved = normalize_scale(planned if value is None else value, name, device)
+    if value is None:
+        return planned
+    resolved = normalize_scale(value, name, device)
     if isinstance(resolved, torch.Tensor) != isinstance(planned, torch.Tensor):
         raise TypeError(
             f"{name} must have the same scalar/tensor type as plan(); "

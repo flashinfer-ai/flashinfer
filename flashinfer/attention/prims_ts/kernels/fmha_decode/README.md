@@ -216,7 +216,7 @@ earliest visible key in a query group are not loaded, so recycled storage outsid
 the window cannot introduce NaNs into PV. The first partially visible page is
 retained. `softmax_scale` defaults to
 `1 / sqrt(D)` and `output_scale` defaults to 1. Each independently accepts a
-positive finite Python number or a contiguous CUDA FP32 tensor of shape `(1,)`.
+positive finite Python number or a contiguous CUDA FP32 tensor of shape `()` or `(1,)`.
 Plan defaults select the operand types; `run()` inherits omitted values and
 requires same-type overrides. This applies to the reusable wrapper, prepared
 plan, and one-shot APIs. QToken-KV-block sparse uses the equivalent names

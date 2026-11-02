@@ -1295,6 +1295,7 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
             packed_query=False, mask_type="dense", vc=None, qk_dtype=torch.bfloat16
         ),
         softmax_scale=torch.empty(1),
+        scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         empty_i32=empty_i32,
         variable_window_padded_starts=None,
@@ -1337,6 +1338,7 @@ def test_attention_ts_context_paged_run_rejects_non_bool_validate() -> None:
     wrapper._plan_state = context_module._PagedContextPlanState(
         geometry=SimpleNamespace(device=torch.device("cpu"), out_dtype=torch.float32),
         softmax_scale=torch.empty(1),
+        scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         compiled=lambda *_: None,
         policy=(),
@@ -5771,3 +5773,95 @@ def test_attention_ts_paged_context_compile_reuse_across_batch_and_q_sizes(
     assert first_state is not None
     assert second_state is not None
     assert first_state.compiled is second_state.compiled
+
+
+@_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("paged", (False, True))
+def test_context_global_scales_graph_replay(paged):
+    """A mixed signature keeps a 0-D calibration scale live under capture."""
+    common = dict(
+        q_lengths=(64,),
+        k_lengths=(128,),
+        num_qo_heads=2,
+        num_kv_heads=2,
+        mask_type="dense",
+        seed=17,
+    )
+    if paged:
+        case = _make_paged_context_case(
+            **common,
+            head_dim=128,
+            qk_dtype=torch.bfloat16,
+            v_dtype=_FP8,
+            out_dtype=torch.bfloat16,
+        )
+        reference = case.reference
+        scale = torch.tensor(reference.output_scale, device="cuda")
+        wrapper = BatchPrefillPagedTSWrapper()
+        metadata = _plan_paged_wrapper(
+            wrapper, replace(case, reference=replace(reference, output_scale=scale))
+        )
+        args = (
+            reference.q,
+            case.k_cache,
+            case.v_cache,
+            metadata.qo_indptr,
+            metadata.block_tables,
+            metadata.seq_lens_kv,
+        )
+        name = "output_scale"
+    else:
+        reference = _make_context_case(
+            **common,
+            qkv_dtype=_FP8,
+            packed_query=False,
+            out_dtype=torch.bfloat16,
+        )
+        scale = torch.tensor(reference.softmax_scale, device="cuda")
+        wrapper = BatchPrefillTSWrapper()
+        _plan_wrapper(wrapper, replace(reference, softmax_scale=scale))
+        args = (reference.q, reference.k, reference.v)
+        name = "softmax_scale"
+
+    def check(expected):
+        torch.testing.assert_close(
+            out.float(), _context_reference(expected), atol=2e-2, rtol=5e-2
+        )
+
+    out = wrapper.run(*args)
+    check(reference)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(*args, out=out, validate=False)
+    changed = getattr(reference, name) * 1.5
+    scale.fill_(changed)
+    graph.replay()
+    check(replace(reference, **{name: changed}))
+    override = torch.tensor([changed * 0.5], device="cuda")
+    wrapper.run(*args, out=out, validate=False, **{name: override})
+    check(replace(reference, **{name: changed * 0.5}))
+    wrapper.run(*args, out=out, validate=False)
+    check(replace(reference, **{name: changed}))
+    with pytest.raises(TypeError, match="same scalar/tensor type"):
+        wrapper.run(*args, validate=False, **{name: changed})
+
+
+@_REQUIRES_CONTEXT_GPU
+def test_global_scale_tensor_shape_contract():
+    """Scalar views preserve graph addresses; matrices and vectors are rejected."""
+    from flashinfer.attention.prims_ts._scales import normalize_scale
+
+    scalar = torch.tensor(0.5, device="cuda")
+    vector = normalize_scale(scalar, name="softmax_scale", device=scalar.device)
+    assert vector.shape == (1,)
+    assert vector.data_ptr() == scalar.data_ptr()
+    scalar.fill_(0.75)
+    torch.testing.assert_close(vector, scalar.view(1))
+    for invalid in (
+        torch.ones(1),
+        torch.ones(1, device="cuda", dtype=torch.float64),
+        torch.ones(2, device="cuda"),
+        torch.ones(1, 1, device="cuda"),
+    ):
+        with pytest.raises(ValueError, match="CUDA float32 tensor"):
+            normalize_scale(invalid, name="softmax_scale", device=scalar.device)

@@ -18,7 +18,7 @@ These are architectural/model recipes; the API takes capability and format
 parameters. NVFP4 has embedded block16 E4M3 scales and no global storage scale.
 Only the primary pool may use per-tensor FP8 in a mixed recipe. Its
 `kv_cache_scale`, `softmax_scale`, and `output_scale` independently accept a
-positive finite Python number or a contiguous CUDA FP32 tensor of shape `(1,)`.
+positive finite Python number or a contiguous CUDA FP32 tensor of shape `()` or `(1,)`.
 `kv_cache_scale` describes the per-tensor FP8 primary storage, while the other
 two multiply QK logits and the complete attention output. Other primary formats
 require the identity storage descale and do not accept a device `kv_cache_scale`.

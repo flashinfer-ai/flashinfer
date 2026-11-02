@@ -2476,6 +2476,11 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 split_kv,
                 cute.fast_divmod_create_divisor(split_kv * Int32(cfg.num_insts_kv)),
             )
+        # Host FP32 scales enter the device kernel in log2 units. Device
+        # buffers retain natural units until they are loaded by the kernel.
+        if cutlass.const_expr(not isinstance(softmax_scale, cute.Tensor)):
+            softmax_scale = softmax_scale * LOG2_E
+
         self.dense_kernel(
             tma_desc_q_latent,
             tma_desc_q_rope,
@@ -2640,10 +2645,11 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
         if cutlass.const_expr(isinstance(softmax_scale, cute.Tensor)):
-            softmax_scale = softmax_scale[0]
+            scale_softmax_log2 = softmax_scale[0] * LOG2_E
+        else:
+            scale_softmax_log2 = softmax_scale
         if cutlass.const_expr(isinstance(output_scale, cute.Tensor)):
             output_scale = output_scale[0]
-        scale_softmax_log2 = softmax_scale * LOG2_E
 
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices

@@ -774,7 +774,7 @@ Where applicable, their public interfaces use `q_dtype` / `k_dtype` / `v_dtype` 
 ### Global scale operands
 
 Each global scale independently accepts a positive finite Python number or a
-contiguous CUDA FP32 tensor of shape `(1,)` on the attention device. Tensor
+contiguous CUDA FP32 tensor of shape `()` or `(1,)` on the attention device. Tensor
 contents must be positive and finite; metadata validation never reads those
 contents back to the host. Callers maintain that value contract. QK scales use
 natural-exponential units for both types; conversion to base two is internal.
@@ -823,11 +823,15 @@ scale tensors; callers retain any tensors supplied as run-time overrides.
 v_descale = torch.ones(1, dtype=torch.float32, device=device)
 wrapper.plan(
     device, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size,
-    max_kv_len, softmax_scale=head_dim**-0.5, output_scale=v_descale,
+    max_kv_len, max_q_len=max_q_len, q_dtype=dtype, packed_query=True,
+    mask_type="causal", workspace_buffer=workspace,
+    softmax_scale=head_dim**-0.5, output_scale=v_descale,
 )
 # The attention run inherits v_descale. A preceding GPU quantizer can update
 # its contents for each input, including inside the captured graph.
-out = wrapper.run(q, paged_kv_cache, seq_lens_kv, block_tables)
+out = wrapper.run(
+    q, (k_cache, v_cache), seq_lens_kv, block_tables, qo_indptr=qo_indptr,
+)
 ```
 
 ### Runtime split-KV policy

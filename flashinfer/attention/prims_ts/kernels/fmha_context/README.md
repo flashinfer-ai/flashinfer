@@ -158,7 +158,7 @@ For request `b`, bottom-right causal row `i` can see through
 `Sk[b] - Sq[b] + i`. With `window_left=W>0`, the row retains that key and at
 most `W` preceding keys. `softmax_scale` defaults to `1 / sqrt(Dqk)` and
 `output_scale` defaults to 1. Each independently accepts a Python number or a
-contiguous CUDA FP32 tensor of shape `(1,)`. Values must be positive and finite;
+contiguous CUDA FP32 tensor of shape `()` or `(1,)`. Values must be positive and finite;
 tensor values are a caller obligation and are never read on the host. Planning
 infers types from these defaults; `run()` inherits omitted operands and accepts
 same-type overrides. The contract applies to contiguous, paged, Sage, and VC

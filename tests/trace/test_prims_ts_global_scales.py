@@ -161,3 +161,14 @@ def test_prims_ts_float_scale_trace_keeps_values_runtime(family):
         }
     api.__self__._plan_state.output_scale = 2.5
     assert fi_trace(api, **kwargs) == inherited
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_prims_ts_scalar_tensor_trace(bound):
+    """Scalar-shaped scales retain the normalized device-operand schema."""
+    scalar = torch.empty((), device="meta", dtype=torch.float32)
+    api, kwargs, names = _trace_case("decode", bound, (scalar, 1.0))
+    definition = fi_trace(api, **kwargs)
+    assert definition["inputs"][names[0]]["shape"] == ["global_scale_size"]
+    assert definition["axes"]["global_scale_size"]["value"] == 1
+    assert definition == fi_trace(api, **{**kwargs, names[0]: scalar.view(1)})

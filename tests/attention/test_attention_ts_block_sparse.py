@@ -5980,3 +5980,146 @@ def test_dense_contiguous_run_matches_reference(case: _Case) -> None:
     assert torch.equal(actual, one_shot)
     tolerance = 2e-2 if case.dtype is torch.bfloat16 else 1e-2
     torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+def _global_scale_case(kind, sm_scale, output_scale):
+    torch.manual_seed(911)
+    q = torch.randn((1, 16, 1, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn((1, 128, 1, 128), device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    indptr = torch.tensor([[[0, 1, 2]]], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    plan_args = dict(
+        device=q.device,
+        q_data_type=q.dtype,
+        sm_scale=sm_scale,
+        output_scale=output_scale,
+    )
+    if kind == "paged":
+        wrapper = block_sparse_module.BlockSparsePagedTSWrapper()
+        wrapper.plan(
+            1,
+            16,
+            128,
+            1,
+            1,
+            128,
+            8,
+            64,
+            64,
+            max_blocks_per_row=1,
+            use_kv_valid_bits=False,
+            **plan_args,
+        )
+        # Allocate canonical HND strides, including the singleton head axis.
+        k_cache = torch.empty((2, 1, 64, 128), device=k.device, dtype=k.dtype)
+        v_cache = torch.empty_like(k_cache)
+        k_cache.copy_(k.view(2, 64, 1, 128).transpose(1, 2))
+        v_cache.copy_(v.view(2, 64, 1, 128).transpose(1, 2))
+        tables = torch.tensor([[0, 1]], device="cuda", dtype=torch.int32)
+        lengths = torch.tensor([128], device="cuda", dtype=torch.int32)
+        run_args = (q, (k_cache, v_cache), tables, lengths, indptr, indices)
+    else:
+        wrapper = block_sparse_module.BlockSparseTSWrapper()
+        route_args = {"max_blocks_per_row": 1} if kind == "sparse" else {}
+        wrapper.plan(
+            1,
+            16,
+            128,
+            1,
+            1,
+            128,
+            8,
+            64,
+            use_block_sparse=kind == "sparse",
+            **route_args,
+            **plan_args,
+        )
+        run_args = (q, k, v, indptr, indices) if kind == "sparse" else (q, k, v)
+    return wrapper, run_args, (q, k, v)
+
+
+def _global_scale_reference(kind, inputs, sm_scale, output_scale):
+    q, k, v = (x[0, :, 0].float() for x in inputs)
+    logits = q @ k.T * sm_scale
+    if kind != "dense":
+        allowed = torch.arange(16, device=q.device)[:, None] // 8 == (
+            torch.arange(128, device=q.device)[None, :] // 64
+        )
+        logits.masked_fill_(~allowed, -torch.inf)
+    return (logits.softmax(-1) @ v * output_scale)[None, :, None]
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("kind", ("dense", "sparse", "paged"))
+@torch.no_grad()
+def test_block_sparse_global_scales_graph_replay(kind):
+    sm_scale = 0.0625
+    output_scale = torch.tensor(1.75, device="cuda")
+    wrapper, args, inputs = _global_scale_case(kind, sm_scale, output_scale)
+    out = wrapper.run(*args)
+    expected = _global_scale_reference(kind, inputs, sm_scale, 1.75)
+    torch.testing.assert_close(out.float(), expected, atol=5e-3, rtol=5e-3)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(*args, out=out, validate=False)
+    output_scale.fill_(0.75)
+    graph.replay()
+    expected = _global_scale_reference(kind, inputs, sm_scale, 0.75)
+    torch.testing.assert_close(out.float(), expected, atol=5e-3, rtol=5e-3)
+    kwargs = dict(
+        q_block_size=8, kv_block_size=64, sm_scale=sm_scale, output_scale=output_scale
+    )
+    if kind == "paged":
+        eager = prims_ts.block_sparse_attention_with_paged_kv_cache(
+            *args, max_seq_len_kv=128, **kwargs
+        )
+    else:
+        eager = prims_ts.block_sparse_attention(
+            *((*args, None, None) if kind == "dense" else args),
+            use_block_sparse=kind == "sparse",
+            **kwargs,
+        )
+    torch.testing.assert_close(eager.float(), expected, atol=5e-3, rtol=5e-3)
+    with pytest.raises(TypeError, match="same scalar/tensor type"):
+        wrapper.run(*args, output_scale=0.75, validate=False)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("device_output", (False, True))
+@torch.no_grad()
+def test_sage_global_scales_include_restored_mean(device_output):
+    from tests.attention.test_attention_ts_sage import _SageCase, _random_inputs
+
+    case = _SageCase(
+        "global_mean",
+        batch_size=1,
+        seq_len_q=64,
+        seq_len_kv=256,
+        num_qo_heads=1,
+        num_kv_heads=1,
+        q_block_size=64,
+        kv_block_size=64,
+        kv_tile=256,
+        sage=prims_ts.SageAttentionConfig(v_mean=True),
+    )
+    q, k, v, params, _ = _random_inputs(case)
+    # Dequantized V is exactly its channel mean, independent of P rounding.
+    v = torch.zeros(v.shape, device=v.device).to(v.dtype)
+    output_scale = torch.tensor(1.75, device="cuda") if device_output else 1.75
+    result = prims_ts.block_sparse_attention(
+        q,
+        k,
+        v,
+        None,
+        None,
+        use_block_sparse=False,
+        q_block_size=64,
+        kv_block_size=64,
+        sm_scale=0.0625,
+        output_scale=output_scale,
+        sage=params,
+        sage_config=case.sage,
+    )
+    expected = (params.v_mean[:, None] * 1.75).expand_as(result).to(result.dtype)
+    torch.testing.assert_close(result, expected, atol=2e-3, rtol=8e-3)

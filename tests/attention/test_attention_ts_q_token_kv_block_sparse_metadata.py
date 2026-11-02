@@ -5009,3 +5009,202 @@ def test_sparse_d192_fp16_output(dtype):
     _check_current_block_budget_case(
         4, 192, False, 4128, 512, True, dtype, output_dtype=torch.float16
     )
+
+
+def _global_scale_qtoken_case(
+    scales, *, group_size=1, packed=False, split_kv=False, dtype=torch.bfloat16
+):
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    rows = 2 if packed else group_size
+    shape = (rows, 8, 128) if packed else (1, 1, rows, 8, 128)
+    q = (torch.randn(shape, device="cuda", generator=generator) * 0.5).to(dtype)
+    k = (torch.randn((2, 1, 16, 128), device="cuda", generator=generator) * 0.5).to(
+        dtype
+    )
+    v = torch.randn(k.shape, device="cuda", generator=generator).to(dtype)
+    table = torch.tensor([[0, 1]], dtype=torch.int32, device="cuda")
+    blocks = (
+        torch.arange(4, dtype=torch.int32, device="cuda").expand(rows, 4).contiguous()
+    )
+    requests = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    positions = torch.arange(15, 15 + rows, dtype=torch.int64, device="cuda")
+    offsets = (
+        torch.arange(rows + 1, dtype=torch.int32, device="cuda") if packed else None
+    )
+    out = torch.empty_like(q, dtype=torch.bfloat16)
+    workspace = torch.empty(
+        get_q_token_kv_block_sparse_workspace_size(
+            q,
+            k,
+            table,
+            block_topk=4,
+            group_size=group_size,
+            max_seq_len_kv=32,
+            out_dtype=out.dtype,
+            split_kv=split_kv,
+            qo_indptr=offsets,
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        rows if packed else 1,
+        8,
+        1,
+        128,
+        4,
+        16,
+        4,
+        32,
+        device=q.device,
+        workspace_buffer=workspace,
+        group_size=group_size,
+        packed_query=packed,
+        split_kv=split_kv,
+        q_dtype=dtype,
+        out_dtype=out.dtype,
+        sm_scale=scales[0],
+        v_scale=scales[1],
+    )
+
+    def run(**kwargs):
+        wrapper.run(
+            q,
+            (k, v),
+            table,
+            blocks,
+            requests,
+            positions,
+            qo_indptr=offsets,
+            out=out,
+            **kwargs,
+        )
+
+    def check(sm_scale, output_scale):
+        for row in range(rows):
+            length = 16 + row
+            keys = k[:, 0].reshape(-1, 128)[:length].float()
+            vals = v[:, 0].reshape(-1, 128)[:length].float()
+            scores = q.reshape(rows, 8, 128)[row].float() @ keys.T
+            if dtype == torch.float8_e4m3fn:
+                # One tile: round P to E4M3 while retaining the FP32 denominator.
+                scale = torch.tensor(sm_scale * math.log2(math.e), device="cuda")
+                maximum = scores.amax(-1, keepdim=True)
+                bias = torch.addcmul(
+                    torch.full_like(maximum, math.log2(448.0)), maximum, -scale
+                )
+                probabilities = torch.addcmul(bias, scores, scale).exp2()
+                weights = probabilities.to(dtype).float() / probabilities.sum(
+                    -1, keepdim=True
+                )
+                expected = weights @ vals * output_scale
+                torch.testing.assert_close(
+                    out.reshape(rows, 8, 128)[row].float(),
+                    expected,
+                    atol=0.01,
+                    rtol=0.03,
+                )
+            else:
+                expected = (scores * sm_scale).softmax(-1) @ vals * output_scale
+                torch.testing.assert_close(
+                    out.reshape(rows, 8, 128)[row].float(),
+                    expected,
+                    atol=0.02,
+                    rtol=0.05,
+                )
+
+    return wrapper, run, check, offsets, out
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+def test_qtoken_global_scales_graph_replay():
+    scale = torch.tensor(0.125, device="cuda")
+    _, run, check, _, _ = _global_scale_qtoken_case(
+        (scale, 0.75),
+        group_size=4,
+        dtype=torch.float8_e4m3fn,
+    )
+    run()
+    check(0.125, 0.75)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    scale.fill_(0.1875)
+    graph.replay()
+    check(0.1875, 0.75)
+    run(sm_scale=torch.tensor([0.0625], device="cuda"))
+    check(0.0625, 0.75)
+    run()
+    check(0.1875, 0.75)
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize("capture", (False, True), ids=("eager", "graph"))
+@pytest.mark.parametrize("updated_scale", (0, 1), ids=("qk", "v"))
+def test_qtoken_persistent_direct_q1_pdl_scales(updated_scale, capture):
+    from tests.test_helpers.pdl import late_store
+
+    values = (0.125, 0.75)
+    scales = tuple(torch.tensor(value, device="cuda") for value in values)
+    wrapper, run, check, _, _ = _global_scale_qtoken_case(scales)
+    run()
+    check(*values)
+    assert wrapper._prepared_plan._attention_plan._direct_q1_inputs
+    assert wrapper._prepared_plan._attention_plan._compiled_reducer is None
+    scale = scales[updated_scale]
+    late_store(scale, values[updated_scale])
+    torch.cuda.synchronize()
+
+    def produce_and_run():
+        late_store(scale, values[updated_scale])
+        run()
+
+    graph = None
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            produce_and_run()
+    for _ in range(3):
+        scale.fill_(values[updated_scale] * 4)
+        if graph is None:
+            produce_and_run()
+        else:
+            graph.replay()
+        check(*values)
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize("capture", (False, True), ids=("eager", "graph"))
+def test_qtoken_direct_q1_pdl_query_offsets(capture):
+    from tests.test_helpers.pdl import late_store
+
+    wrapper, run, check, offsets, out = _global_scale_qtoken_case(
+        (0.125, 0.75),
+        packed=True,
+        split_kv=True,
+    )
+    run()
+    check(0.125, 0.75)
+    assert wrapper._prepared_plan._attention_plan._direct_q1_inputs
+    late_store(offsets[2:], 2)
+    torch.cuda.synchronize()
+
+    def produce_and_run():
+        late_store(offsets[2:], 2)
+        run()
+
+    graph = None
+    if capture:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            produce_and_run()
+    for _ in range(3):
+        # The stale offset makes the second route empty, so an early read prunes it.
+        offsets[2:].fill_(1)
+        out.fill_(torch.nan)
+        if graph is None:
+            produce_and_run()
+        else:
+            graph.replay()
+        check(0.125, 0.75)

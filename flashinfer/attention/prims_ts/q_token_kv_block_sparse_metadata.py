@@ -534,7 +534,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         must use the same value. Change it only by replanning outside capture.
 
         ``sm_scale`` and ``v_scale`` independently accept host floats or CUDA
-        FP32 tensors of shape (1,). They establish the compiled argument kinds
+        FP32 tensors of shape () or (1,). They establish the compiled argument kinds
         and default run values. Softmax scales are in natural units. Device
         values must remain finite and positive and may change during replay.
         """
@@ -704,7 +704,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         ``v_scale`` are live launch scalars, so frameworks may update Q/K and V
         dequantization scales without rebuilding the capacity plan. Each scale
         independently accepts a host float or a contiguous CUDA FP32 tensor
-        of shape (1,) on the planned device. Run overrides must preserve the
+        of shape () or (1,) on the planned device. Run overrides must preserve the
         respective plan-time type; omitted operands inherit the plan defaults.
         Tensor values must remain finite and positive, without host readback.
 
@@ -741,11 +741,12 @@ class QTokenKvBlockSparsePagedTSWrapper:
             for fixed Q; each route must stay within one request and contain
             at most the planned ``group_size`` tokens.
         sm_scale : float or torch.Tensor, optional
-            Softmax scale, defaulting to ``head_dim**-0.5``. Include Q/K
-            dequantization scales here when using FP8 inputs.
+            Softmax scale. Omitted values inherit ``plan()``'s scale, which
+            defaults to ``head_dim**-0.5``. Include Q/K dequantization scales
+            here when using FP8 inputs.
         v_scale : float or torch.Tensor, optional
             Value-cache dequantization scale applied to the output,
-            defaulting to one.
+            inheriting ``plan()``'s scale when omitted. The plan defaults to one.
         out : torch.Tensor, optional
             Caller-owned output with Q's logical shape and the planned output
             dtype. When omitted, the wrapper retains and reuses its output.

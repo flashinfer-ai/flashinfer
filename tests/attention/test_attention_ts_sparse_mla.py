@@ -858,7 +858,7 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
     torch.cuda.synchronize()
     check()
     invalid_scales = dict(scales, softmax_scale=torch.ones((), device=q.device))
-    with pytest.raises(TypeError, match="Python int or float"):
+    with pytest.raises(TypeError, match="same scalar/tensor type"):
         w.run(
             q,
             primary,
@@ -2092,3 +2092,111 @@ def test_sparse_d576_capture_without_eager_run():
 def test_sparse_d576_rejects_d512_plan_options(option, match):
     with pytest.raises(ValueError, match=match):
         _d576_plan(2, 64, 64, **option)
+
+
+@pytest.mark.parametrize("family,split", [("keep", 1), ("2cta", 2)])
+def test_sparse_mla_global_scales_graph_replay(family, split, monkeypatch):
+    """Global tensor scales preserve independent FP8 and NVFP4 source scaling."""
+    kinds = (True, False, True)
+    monkeypatch.setattr(
+        mla_decode_module,
+        "select_sparse_mla_profile",
+        lambda **_: sparse_policy.SparseMlaProfile(
+            family=family,
+            tile_size_q=64 if family == "keep" else 128,
+            split_kv=split,
+            gather_issue_warps=1 if family == "2cta" else 4,
+            balanced_registers=family == "2cta",
+        ),
+    )
+    torch.manual_seed(127)
+    rows, heads, topk = 2, 128, 129
+    query = (torch.randn(rows, heads, 512, device="cuda") * 0.2).to(torch.float8_e4m3fn)
+    primary, primary_ref = make_tensor_fp8_cache(2, 64)
+    extra, extra_ref = make_nvfp4_cache(2, 32)
+    indices = torch.randint(64, (rows, topk), device="cuda", dtype=torch.int32)
+    extra_indices = torch.randint(32, (rows, topk), device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([97, topk], device="cuda", dtype=torch.int32)
+    extra_lengths = torch.tensor([topk, 71], device="cuda", dtype=torch.int32)
+    indices[:, 3] = -1
+    extra_indices[:, 7] = -1
+    offsets = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
+    sinks = torch.linspace(-2, 1, heads, device="cuda")
+    values = (0.17, 0.75, 0.5)
+    scales = tuple(
+        torch.tensor(value, device="cuda") if kind else value
+        for value, kind in zip(values, kinds, strict=True)
+    )
+    plan = dict(
+        device=query.device,
+        batch_size=1,
+        num_qo_heads=heads,
+        max_topk=topk,
+        max_extra_topk=topk,
+        packed_query=True,
+        max_q_len=rows,
+        q_dtype=query.dtype,
+        kv_cache_format="fp8",
+        extra_kv_cache_format="nvfp4",
+        return_lse=True,
+        use_attention_sinks=True,
+        tuning=MLAAttentionTuning(0.0),
+    )
+    wrapper = BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(
+        **plan,
+        softmax_scale=scales[0],
+        output_scale=scales[1],
+        kv_cache_scale=scales[2],
+    )
+    out = torch.empty(rows, heads, 512, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(rows, heads, device="cuda", dtype=torch.float32)
+    inputs = dict(
+        extra_kv_cache=extra,
+        extra_indices=extra_indices,
+        extra_lengths=extra_lengths,
+        qo_indptr=offsets,
+        attention_sinks=sinks,
+    )
+
+    def run():
+        wrapper.run(
+            query, primary, indices, lengths, out=out, lse=lse, validate=False, **inputs
+        )
+
+    def check(current):
+        ref, ref_lse, bound = _reference(
+            query,
+            primary_ref * current[2],
+            extra_ref,
+            indices,
+            extra_indices,
+            lengths=lengths,
+            extra_lengths=extra_lengths,
+            attention_sinks=sinks,
+            softmax_scale=current[0],
+            output_scale=current[1],
+        )
+        assert ((out.double() - ref).abs() <= bound).all()
+        torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+
+    run()
+    check(values)
+    graph = torch.cuda.CUDAGraph()
+    previous_sync_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        with torch.cuda.graph(graph):
+            run()
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_sync_mode)
+    changed = tuple(
+        value * (1.5 if kind else 1.0)
+        for value, kind in zip(values, kinds, strict=True)
+    )
+    for scale, kind, value in zip(scales, kinds, changed, strict=True):
+        if kind:
+            scale.fill_(value)
+    graph.replay()
+    check(changed)
+    torch.cuda.synchronize()

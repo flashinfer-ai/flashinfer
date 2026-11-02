@@ -2089,7 +2089,7 @@ def _get_compiled_decode(
             compiled_reducer = build_and_load_attention_kernel(
                 "decode",
                 "reducer",
-                compile_spec,
+                replace(compile_spec, scale_types=(False, False)),
                 _COMPILE_OPTIONS,
                 lambda: cute.compile(
                     reduction_tensor_adapter,
@@ -2712,7 +2712,7 @@ class PrimsTSBatchDecodePlan:
 
         Omitted scales inherit the preparation defaults. Each override must
         retain its planned host-float or CUDA FP32 tensor type. Tensor scales
-        have shape (1,), reside on the query device, and must remain finite and
+        have shape () or (1,), reside on the query device, and must remain finite and
         positive; validation checks metadata without reading device values.
 
         ``attention_sinks`` is a compact CUDA float32 ``[Hq]`` vector of
@@ -3988,7 +3988,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     softmax_scale, output_scale : float or torch.Tensor, optional
         Independent QK and V/output multipliers, defaulting to ``head_dim**-0.5``
         and one. Each operand is a host float or a contiguous CUDA FP32 tensor
-        of shape (1,) on the query device. Types select the compiled signature;
+        of shape () or (1,) on the query device. Types select the compiled signature;
         values are retained as run defaults. Softmax uses natural units. Tensor
         contents must stay finite and positive and may change during replay.
 
@@ -4116,7 +4116,7 @@ class BatchDecodePagedTSWrapper:
         kernels; users never supply the count.
 
         ``softmax_scale`` and ``output_scale`` independently accept host floats
-        or contiguous CUDA FP32 tensors of shape ``(1,)``. Their types select
+        or contiguous CUDA FP32 tensors of shape ``()`` or ``(1,)``. Their types select
         the compiled signature; run() inherits these defaults. Device values
         must be finite and positive and may change in place during graph replay.
         Softmax scales use natural, not base-2, units.
@@ -4439,7 +4439,7 @@ class BatchDecodePagedTSWrapper:
         not log2, units (default 1/sqrt(D)); output_scale is the V/output scale
         (default 1). Omitted scales inherit plan() values. Each override must
         keep its planned float/tensor type. Tensor scales are contiguous CUDA
-        FP32 shape (1,) inputs on the plan device; their finite-positive values
+        FP32 shape () or (1,) inputs on the plan device; their finite-positive values
         are a caller precondition and are never read back to the host. Scale
         metadata and argument types are checked in both validation modes.
 
@@ -4667,7 +4667,7 @@ def batch_decode_with_paged_kv_cache(
     softmax_scale, output_scale : float or torch.Tensor, optional
         Independent QK and value/output multipliers, defaulting to
         ``head_dim**-0.5`` and one. Each may be a host float or a contiguous CUDA
-        FP32 tensor of shape (1,) on the query device. Softmax uses natural
+        FP32 tensor of shape () or (1,) on the query device. Softmax uses natural
         units. Tensor values must be finite and positive; they are read only
         by the kernel, without device-to-host synchronization.
     out : torch.Tensor, optional
