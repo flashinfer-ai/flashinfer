@@ -106,6 +106,10 @@ context-parallel-only programs (`kcp_*`); the kernel symbol of a library is
   `layout="copy"` makes a contiguous copy first; its time is part of the
   measured module when reported.  Strided and contiguous inputs give bitwise
   the same results.
+* When `q` / `k` / `v` are head views of one packed row, take them with
+  `packed_qkv_views_det_kcp` for full backward speed: plain `split` views of
+  the row give the same gradients, but the backward is about 1.1 ms (33-36 %)
+  slower at `(16, 48)` and 32,768 tokens (**Packed Q/K/V** below).
 * `scale` defaults to `128 ** -0.5`.
 * The host reads no tensor contents (no `.item()`, `.tolist()`, no implicit
   synchronization): every table is built on the CPU from the partition
@@ -244,6 +248,36 @@ row, and the split's backward returns that row as the gradient of `qkv`: no
 concatenation and no copy between the GDN backward and the convolution's
 backward.  The gradient values are bitwise those of separate operands
 (`LAST_CALL["bwd"]["grad_layout"]` is `"packed"` or `"separate"`).
+
+Callers whose `q` / `k` / `v` are head views of one packed row get the full
+backward speed only through `packed_qkv_views_det_kcp`.  Its conditions: `qkv`
+is `[..., T, (2 H_qk + HV) * 128]` with a dense channel axis
+(`qkv.stride(-1) == 1`), and `q` / `k` / `v` are its three head views in that
+order.  Plain views of the same row
+(`qkv.split((H_qk * 128, H_qk * 128, HV * 128), -1)`, then
+`.view(T, heads, 128)`) give bitwise the same results, and the backward still
+writes one packed row, but torch's split backward then concatenates `dq` /
+`dk` / `dv` into a new row.  Measured cost of the plain
+views (the #8367 repro: `(H_qk, HV) = (16, 48)`, 32,768 tokens in five
+documents, one-rank context, forward and backward to the packed row; CUDA-event
+ms, median of 60 = 3 rounds of 20 after 5 warm-up calls; PyTorch 2.14.1+cu130,
+CUDA 13.0 runtime; both GPUs 152 SMs):
+
+| GPU | in-kernel L2 norm | forward split / packed | backward split / packed | backward split - packed |
+|---|---|---|---|---|
+| GB200 (sm_100a) | off | 1.470 / 1.490 | 4.097 / 3.006 | +1.091 (1.363x) |
+| GB200 (sm_100a) | on | 1.658 / 1.676 | 4.388 / 3.296 | +1.092 (1.331x) |
+| GB300 (sm_103a) | off | 1.440 / 1.452 | 4.021 / 2.948 | +1.074 (1.364x) |
+| GB300 (sm_103a) | on | 1.602 / 1.619 | 4.308 / 3.239 | +1.070 (1.330x) |
+
+The three views are the outputs of one custom autograd node.  Hooks and
+`retain_grad` on them fire as on any autograd output.  Its backward returns
+the incoming packed row itself when `dq` / `dk` / `dv` are the head views of
+one row of `qkv`'s shape and dtype (`PACKED_SPLIT_STATS["aliased"]`), and
+concatenates them otherwise (`PACKED_SPLIT_STATS["concatenated"]`): a missing
+gradient counts as zeros, and a hook that returns a new gradient also makes it
+concatenate.  Autograd refuses an in-place change to the views while `qkv`
+requires grad.  Plain `split` views keep torch's own autograd path and hooks.
 
 ```
 gdn_det_comm_bytes_kcp(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1_send, b2_recv, halo_fwd, halo_bwd}}
