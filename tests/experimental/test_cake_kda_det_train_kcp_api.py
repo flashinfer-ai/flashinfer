@@ -228,6 +228,7 @@ def test_recompute_handle_keywords_are_forwarded(
         "save_mode": "light",
         "boundary_mode": "saved",
         "workspace": None,
+        "use_qk_l2norm_in_kernel": False,  # issue #7817: forwarded explicitly
     }
     assert (
         calls
@@ -257,6 +258,7 @@ def test_recompute_handle_keywords_are_forwarded(
                     "with_conv": True,
                     "C": 8192,
                     "checkpoint_keep": "states",
+                    "use_qk_l2norm_in_kernel": False,
                 },
             ),
             (

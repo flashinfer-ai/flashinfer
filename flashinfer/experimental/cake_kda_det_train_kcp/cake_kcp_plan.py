@@ -103,6 +103,8 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import functools
+import inspect
 import operator
 import weakref
 from collections.abc import Mapping, Sequence
@@ -2469,6 +2471,7 @@ def kda_det_saved_bytes_kcp(
     C: int = 8192,
     saved_carry: bool = True,
     checkpoint_keep: str | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kda_det_saved_bytes_kcp(ctx, ...)``)::
 
@@ -2478,6 +2481,7 @@ def kda_det_saved_bytes_kcp(
     + [save_transfer] * [P > 1] * NSEG * s                     # M_seg of the segmented fragments (home rank)
     + [saved_carry] * [P > 1] * (n_frag * (P - 1) + max(n_in, n_out)) * s   # the forward's carry plane (shipped)
     + [with_conv] * sum_cont hist_valid * C * 2                # the hist row pool (BF16)
+    + [use_qk_l2norm_in_kernel] * 8 * T_r * H                   # the FP32 rstd qk_rstd [2, T_r, H]
     save_mode="tape": + NC_pad * H * 32768 + R * H * 256       # the forward's h tape and v_new
 
     ``save_transfer`` defaults to :data:`SAVE_TRANSFER_DEFAULT` (``True`` since an earlier revision);
@@ -2505,8 +2509,17 @@ def kda_det_saved_bytes_kcp(
     The tier fixes ``save_transfer`` (``False`` / ``True``; ``None``, the default, is ``SAVE_TRANSFER_DEFAULT``
     without a tier; an explicit value that contradicts the tier raises ``ValueError``, as the entry point does);
     ``save_mode`` and ``saved_carry`` are not read.  The saved set itself is released by the checkpoint as before
-    (#7039)."""
+    (#7039).
+
+    ``use_qk_l2norm_in_kernel`` (issue #7817): the saved set of the in-kernel Q / K L2 norm adds the per-token FP32
+    rstd of q and k (``SavedDetKcp.qk_rstd``, empty on a rank without tokens; the raw q / k are the caller's tensors,
+    not counted here).  A recompute handle's entry does not change: the recompute writes its rstd afresh.  While the
+    single-rank programs of the mode are absent it raises ``NotImplementedError`` as the workspace does
+    (:func:`require_qk_l2norm`)."""
     _check_save_mode(save_mode)
+    l2n = check_qk_l2norm(use_qk_l2norm_in_kernel)
+    if l2n:  # the refusal of every rank alike, as the workspace bytes (gate mode "g")
+        require_qk_l2norm(QK_L2NORM_FORM_DEFAULT, "g", qk_l2norm_arch())
     save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
     H, C = int(H), int(C)
     hp = ctx.heads(H)
@@ -2532,6 +2545,8 @@ def kda_det_saved_bytes_kcp(
         total += ctx.halo.n_hist_rows * C * 2
     if save_mode == "tape":
         total += ctx.NC_pad * H * 32768 + ctx.R * H * 256
+    if l2n:
+        total += 2 * ctx.T_r * H * 4
     return total
 
 
@@ -2863,9 +2878,19 @@ LEAN_PASSES_DEFAULT = 2
 TAIL_COUNT_TAPE_BYTES = CHUNK * 512  # the h tape's bytes per chunk-head
 
 
-def _lean_slots(passes: int, R: int, H: int, NC: int, NSEG: int, gate_fused: bool):
+def _lean_slots(
+    passes: int,
+    R: int,
+    H: int,
+    NC: int,
+    NSEG: int,
+    gate_fused: bool,
+    l2n: str = "off",
+):
     """The slots of :data:`LOCAL_LAYOUT_BWD_LEAN` at ``passes`` tail passes (the existing backend's slot form; see the
-    note above it).  ``NSEG`` is unused: the layout has no state blocks."""
+    note above it).  ``NSEG`` is unused: the layout has no state blocks.  ``l2n``: the plan's in-kernel Q / K L2 norm
+    mode (the slot functions' seventh argument): the KCP never runs this layout with the norm (a lean workspace
+    refuses it), so the slots are the flag-off occupants' in every mode."""
     from ..cake_kda_det_train import cake_backend
 
     R_b = cake_backend.BT * -(-NC // passes)
@@ -3000,6 +3025,212 @@ def local_tail_count_words(arena_bytes: int, H: int) -> int:
     return int(arena_bytes) // (TAIL_COUNT_TAPE_BYTES * int(H)) + 1
 
 
+# In-kernel Q / K L2 norm (``use_qk_l2norm_in_kernel=True``, issue #7817).  The mode runs the existing backend's
+# programs on the local stages, in the l2n modes of its plan.  Its plan, arena and byte queries take a mode
+# ``l2n``: ``"off"`` (the flag-off plan, unchanged), ``"fused"`` (the form the flag maps to) or ``"fallback"`` (a test
+# form, reached only through an explicit workspace; :data:`QK_L2NORM_FORMS`).  Fused: the first q / k reader of a path
+# is the ``_l2n`` twin of its flag-off record (the forward's intra program; the backward's replay prep, or its intra
+# program where the plan runs that first): it reads the raw rows ``q_raw`` / ``k_raw``, normalizes them (an intra
+# program into its CTA-private internal rows ``qn_int`` / ``kn_int``, the ``u`` / ``w`` slot views), writes the
+# token-layout ``qn`` / ``kn`` on a backward (``write_qkn``; never on a forward, whose later programs read none) and
+# computes the FP32 rstd ``qk_rstd`` ``[2, T_r, H]`` (plane 0 q, plane 1 k) or reads it (``read_rstd`` /
+# ``write_rstd``); every later reader binds ``q`` / ``k`` = ``qn`` / ``kn``, and the GLM intra twin fuses the FP32
+# pullback into the final dq / dk store.  Fallback: a separate normalization (``qk_l2norm``, or ``qk_apply`` from a
+# given rstd) before the first reader, the plain records, the GLM intra program's capture form and a separate pullback
+# (``qk_pullback``) after it.  The KCP programs, the collectives and their bytes do not change.
+# :data:`QK_L2NORM_RECORDS` are, per form and gate mode, the records of the existing backend's registry that the
+# route's stages of the mode can select on its two local paths (the forward's ``fwd_nosave``, the backward's
+# ``replay``) for any problem; an entry of several names is met by any one of them (the replay prep: the ``_l2n`` twin
+# where the prep reads q / k first, the plain record serving the mode where the intra program runs first).  Until all
+# serve, every call, workspace and byte query with the flag on raises ``NotImplementedError`` (:data:`QK_L2NORM_PENDING`)
+# before any workspace build, plan or collective, decided from rank-independent inputs only (:func:`qk_l2norm_missing`,
+# :func:`require_qk_l2norm`), so every rank -- one without tokens too -- raises the same error.
+QK_L2NORM_PENDING = "use_qk_l2norm_in_kernel=True on the KCP route requires the single-rank in-kernel Q/K L2 norm programs"
+QK_L2NORM_FORMS = ("fused", "fallback")
+QK_L2NORM_FORM_DEFAULT = "fused"
+QK_L2NORM_RECORDS: dict[tuple[str, str], tuple[tuple[str, ...], ...]] = {
+    ("fused", "g"): (
+        ("fwd_intra_l2n",),
+        ("fwd_intra_v14_l2n",),
+        ("bwd_prep_g8_replay_l2n", "bwd_prep_g8_replay"),
+        ("glm_intra_l2n",),
+    ),
+    ("fused", "raw"): (
+        ("fwd_intra_raw_l2n",),
+        ("fwd_intra_v14_raw_l2n",),
+        ("bwd_prep_g8_replay_raw_l2n", "bwd_prep_g8_replay_raw"),
+        ("glm_intra_raw_l2n",),
+    ),
+    ("fallback", "g"): (
+        ("qk_l2norm",),
+        ("qk_l2norm_apply",),
+        ("fwd_intra",),
+        ("fwd_intra_v14",),
+        ("bwd_prep_g8_replay",),
+        ("glm_intra_l2n_capture",),
+        ("qk_pullback",),
+    ),
+    ("fallback", "raw"): (
+        ("qk_l2norm",),
+        ("qk_l2norm_apply",),
+        ("fwd_intra_raw",),
+        ("fwd_intra_v14_raw",),
+        ("bwd_prep_g8_replay_raw",),
+        ("glm_intra_raw_l2n_capture",),
+        ("qk_pullback",),
+    ),
+}
+# the existing backend's layouts of the local arena in the mode (the backward workspace's forward layout, the
+# forward-only one, the backward's replay layout) and the slot views every one of them must carry: the intra
+# programs normalize into ``qn_int`` / ``kn_int`` on the forward and the replay alike, with no stand-in
+QK_L2NORM_LAYOUTS = ("fwd", LOCAL_LAYOUT_FWD_ONLY, "replay")
+QK_L2NORM_SLOTS = ("qn_int", "kn_int")
+
+
+def check_qk_l2norm(use_qk_l2norm_in_kernel: bool) -> bool:
+    """``use_qk_l2norm_in_kernel`` validated: a ``bool``; any other value raises ``ValueError``."""
+    if not isinstance(use_qk_l2norm_in_kernel, bool):
+        raise ValueError(
+            f"use_qk_l2norm_in_kernel must be a bool, got {use_qk_l2norm_in_kernel!r}"
+        )
+    return use_qk_l2norm_in_kernel
+
+
+def qk_l2norm_mode(on: bool, form: str | None = None) -> str:
+    """The existing backend's mode ``l2n`` of a workspace: ``"off"`` without the flag; with it ``form`` (``None``:
+    :data:`QK_L2NORM_FORM_DEFAULT`, the form of the flag).  ``ValueError`` for a form outside
+    :data:`QK_L2NORM_FORMS` or a form without the flag."""
+    if not on:
+        if form is not None:
+            raise ValueError(
+                f"an in-kernel Q/K L2 norm form ({form!r}) needs use_qk_l2norm_in_kernel=True"
+            )
+        return "off"
+    out = QK_L2NORM_FORM_DEFAULT if form is None else form
+    if out not in QK_L2NORM_FORMS:
+        raise ValueError(
+            f"the in-kernel Q/K L2 norm form must be one of {QK_L2NORM_FORMS}, got {form!r}"
+        )
+    return out
+
+
+def qk_l2norm_plan_kwargs(mode: str) -> dict[str, Any]:
+    """The keywords of mode ``mode`` (:func:`qk_l2norm_mode`) for the existing backend's plan, arena and byte
+    queries: none for ``"off"`` (the flag-off calls, unchanged), else ``l2n=mode``."""
+    return {} if mode == "off" else {"l2n": mode}
+
+
+@functools.cache
+def _takes(fn: Any, name: str) -> bool:
+    """Whether callable ``fn`` takes a parameter ``name`` (its ``inspect.signature``, read once per callable)."""
+    return name in inspect.signature(fn).parameters
+
+
+@functools.cache
+def _cuda_arch(index: int) -> str | None:
+    """The exported architecture of CUDA device ``index``, ``None`` when no record targets it (fixed per process)."""
+    from ..cake_kda_det_train import cake_jit
+
+    return cake_jit.arch_for_capability(torch.cuda.get_device_capability(index))
+
+
+def qk_l2norm_arch(device: torch.device | str | None = None) -> str | None:
+    """The architecture :func:`qk_l2norm_missing` checks the records for: the exported architecture of CUDA device
+    ``device`` (``None``: the current CUDA device where there is one, the device the existing backend's plan takes
+    by default); ``None`` on a CPU device, on a host without CUDA and on a device no record targets (the records are
+    then checked for every architecture they list).  A property of the device model, the same on every rank of a
+    homogeneous group."""
+    if device is None:
+        if not torch.cuda.is_available():
+            return None
+        return _cuda_arch(torch.cuda.current_device())
+    dev = torch.device(device)
+    if dev.type != "cuda":
+        return None
+    index = dev.index if dev.index is not None else torch.cuda.current_device()
+    return _cuda_arch(index)
+
+
+def _record_missing(name: str, mode: str, arch: str | None) -> str | None:
+    """Why record ``name`` of the existing backend's registry cannot serve mode ``mode`` on ``arch`` (``None``: on
+    every architecture it lists), ``None`` when it can: absent, its ``l2n`` modes (absent: ``["off"]``) lack the
+    mode, its ``arches`` lack the architecture, or ``build.json`` has no library of it for the architecture."""
+    from ..cake_kda_det_train import cake_build, cake_jit
+
+    record = cake_jit.MODULES.get(name)
+    if record is None:
+        return f"no record {name}"
+    if mode not in record.get("l2n", ("off",)):
+        return f"record {name} does not serve l2n={mode!r}"
+    arches = tuple(record["arches"])
+    for a in arches if arch is None else (arch,):
+        if a not in arches:
+            return f"record {name} is not delivered for {a}"
+        if cake_jit.library_name(name, a) not in cake_build.libraries_by_name():
+            return f"record {name} has no exported library for {a}"
+    return None
+
+
+def qk_l2norm_missing(
+    mode: str = QK_L2NORM_FORM_DEFAULT, gate: str = "g", arch: str | None = None
+) -> str | None:
+    """Why the KCP local stages cannot run mode ``mode`` in gate mode ``gate`` (``"g"`` / ``"raw"``) on architecture
+    ``arch`` (``None``: every architecture a record lists; :func:`qk_l2norm_arch`) yet, ``None`` once they can
+    (always for ``"off"``).  Decided from rank-independent inputs only -- the existing backend's signatures, its
+    registry records (their ``l2n`` modes and ``arches``), its ``build.json`` libraries and its static layout tables
+    -- never from a rank's tokens or plan, so every rank gets the same answer: its entry points do not take
+    ``use_qk_l2norm_in_kernel``; its plan or layout table has no such mode; an entry of :data:`QK_L2NORM_RECORDS` has
+    no record that serves the mode, is delivered for the architecture and is exported for it; or a layout of
+    :data:`QK_L2NORM_LAYOUTS` lacks the :data:`QK_L2NORM_SLOTS` views."""
+    if mode == "off":
+        return None
+    from ..cake_kda_det_train import cake_backend, cake_jit
+
+    if not _takes(cake_backend.chunk_kda_det_fwd, "use_qk_l2norm_in_kernel"):
+        return "the single-rank backend does not take use_qk_l2norm_in_kernel"
+    if (
+        not _takes(cake_backend.plan, "l2n")
+        or not _takes(cake_backend.lifetime_table, "l2n")
+        or mode not in getattr(cake_jit, "L2N_MODES", ())
+    ):
+        return f"the single-rank plan has no in-kernel Q/K L2 norm mode {mode!r}"
+    absent = []
+    for names in QK_L2NORM_RECORDS[(mode, gate)]:
+        reasons = [_record_missing(name, mode, arch) for name in names]
+        if all(reasons):
+            absent.append(" / ".join(str(r) for r in reasons))
+    if absent:
+        return f"the single-rank registry: {'; '.join(absent)}"
+    for layout in QK_L2NORM_LAYOUTS:
+        try:
+            kw: dict[str, Any] = {"gate": gate, "l2n": mode}
+            rows = cake_backend.lifetime_table(layout, **kw)
+        except ValueError as exc:
+            return f"the single-rank layout {layout!r} has no l2n={mode!r} ({exc})"
+        buffers = {row["buffer"] for row in rows}
+        lacking = " / ".join(slot for slot in QK_L2NORM_SLOTS if slot not in buffers)
+        if lacking:
+            return f"the single-rank layout {layout!r} has no {lacking} views"
+    return None
+
+
+def require_qk_l2norm(mode: str, gate: str = "g", arch: str | None = None) -> None:
+    """Raise ``NotImplementedError`` (:data:`QK_L2NORM_PENDING` and the reason of :func:`qk_l2norm_missing`) while the
+    KCP local stages cannot run mode ``mode`` (nothing for ``"off"``).  Every entry with the flag on calls it before
+    it builds a workspace, plans an arena or issues a collective; its inputs are rank-independent, so every rank
+    raises the same error with the same message."""
+    missing = qk_l2norm_missing(mode, gate, arch)
+    if missing is not None:
+        raise NotImplementedError(f"{QK_L2NORM_PENDING} ({missing})")
+
+
+def qk_l2norm_intra_first(plan, path: str = LOCAL_PATH_BWD) -> bool:
+    """Whether the first q / k reader of a backward on ``path`` of ``plan`` (a ``cake_backend.Plan`` of the fused
+    mode) is its intra program, the ``_l2n`` twin the existing backend runs before the prep there, rather than its
+    prep (the fallback mode's plain records read the normalized rows of the separate normalization: ``False``)."""
+    return str(plan.record("fwd_intra", path)).endswith("_l2n")
+
+
 def kda_det_workspace_bytes_kcp(
     ctx: ContextDetKcp | Sequence[ContextDetKcp],
     *,
@@ -3011,6 +3242,7 @@ def kda_det_workspace_bytes_kcp(
     local_arena: str | None = None,
     lean_passes: int | None = None,
     use_gate_in_kernel: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
     """Caller-held workspace bytes of one rank: the local arena for ``(T_r, n_frag, H)`` (zero on a rank without
     tokens; the existing backend's arena, ``kda_det_train_workspace_bytes``, or for a backward workspace under
@@ -3035,19 +3267,36 @@ def kda_det_workspace_bytes_kcp(
     :data:`LEAN_PASSES_DEFAULT`).  ``use_gate_in_kernel``: the workspace's gate mode
     (``WorkspaceDetKcp(use_gate_in_kernel=)``): the raw mode's local arena is planned in the raw mode (its backward
     layout carries no gate epilogue buffers on any architecture) and is the replay arena (``local_arena="lean"`` is
-    refused in this mode, as by the workspace); the pools do not depend on it."""
+    refused in this mode, as by the workspace); the pools do not depend on it.  ``use_qk_l2norm_in_kernel``: the
+    workspace's in-kernel Q / K L2 norm mode (``WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)``, issue #7817): the
+    local arena is planned in the form of the flag (``l2n="fused"``, :func:`qk_l2norm_plan_kwargs`: on sm_100a a backward
+    layout without the gate epilogue's buffers) and is the replay arena (``local_arena="lean"`` is refused in this
+    mode, as by the workspace); the pools do not depend on it.  The mode's per-call tensors (the backward's normalized
+    q / k, the rstd of a call without a saved set) are not workspace bytes.  While the single-rank programs of the
+    mode are absent it raises ``NotImplementedError`` before any plan, as the workspace does (:func:`require_qk_l2norm`)."""
     _check_save_mode(save_mode)
     check_lean_passes(lean_passes)
     if not isinstance(use_gate_in_kernel, bool):
         raise ValueError(
             f"use_gate_in_kernel must be a bool, got {use_gate_in_kernel!r}"
         )
+    l2n = check_qk_l2norm(use_qk_l2norm_in_kernel)
     gate = "raw" if use_gate_in_kernel else "g"
     if gate == "raw" and check_local_arena(local_arena) == "lean":
         raise NotImplementedError(
             'kda_det_workspace_bytes_kcp: use_gate_in_kernel=True runs on the replay local arena; local_arena="lean" '
             "is not supported in the raw gate mode"
         )
+    if l2n and check_local_arena(local_arena) == "lean":
+        # as WorkspaceDetKcp: the lean layout's support of the mode follows the single-rank layout of its programs
+        raise NotImplementedError(
+            'kda_det_workspace_bytes_kcp: use_qk_l2norm_in_kernel=True runs on the replay local arena; local_arena="lean" '
+            "is not supported with the in-kernel Q/K L2 norm yet"
+        )
+    mode = qk_l2norm_mode(l2n)
+    # before any plan: the refusal of every rank alike (rank-independent inputs only)
+    require_qk_l2norm(mode, gate, qk_l2norm_arch())
+    l2n_kw = qk_l2norm_plan_kwargs(mode)
     lean = (
         check_local_arena(local_arena) == "lean" and backward and save_mode == "light"
     )
@@ -3064,7 +3313,7 @@ def kda_det_workspace_bytes_kcp(
             cake_backend,
         )  # the existing backend's arena rule; imported here so the metadata module stays torch-only
 
-        p = cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count, gate=gate)
+        p = cake_backend.plan(c.T_r, c.n_frag, int(H), c.sm_count, gate=gate, **l2n_kw)
         if lean and local_lean_serves(p):
             a = local_lean_bytes(p, local_lean_passes(p, passes=lean_passes))
             t = 4 * local_tail_count_words(a, H)
@@ -3079,6 +3328,7 @@ def kda_det_workspace_bytes_kcp(
                     sm_count=c.sm_count,
                     fwd_layout=local_fwd_layout(backward, save_mode),
                     gate=gate,
+                    **l2n_kw,
                 )
             )
             t = 0
