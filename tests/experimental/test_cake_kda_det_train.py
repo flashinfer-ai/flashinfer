@@ -976,14 +976,23 @@ def test_the_raw_gate_records_mirror_the_g_records() -> None:
         "db_part",
         "seq_chunk_start",
         "num_seqs",
+        "part2",
+        "seg_cap",
+        "ticket",
         "dA_log",
         "ddt_bias",
         "num_heads",
     }
+    # one CTA per (head, segment of 128 chunks)
     for h in (1, 4, 64):
-        assert cake_jit.launch_grid(
-            RAW_FINALIZE, num_chunks_pad=6, num_seqs=3, num_heads=h, sm_count=148
-        ) == (h, 1, 1)
+        for nc_pad, segments in ((6, 1), (128, 1), (130, 2), (4096, 32)):
+            assert cake_jit.launch_grid(
+                RAW_FINALIZE,
+                num_chunks_pad=nc_pad,
+                num_seqs=3,
+                num_heads=h,
+                sm_count=148,
+            ) == (h, segments, 1)
     # the twin records are named for their g-mode program; every g record of a gate stage has its raw counterpart
     # but the gate epilogue (the raw drain is fused on every architecture)
     for stage in ("fwd_intra", "bwd_prep"):
