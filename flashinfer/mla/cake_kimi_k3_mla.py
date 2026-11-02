@@ -27,8 +27,10 @@ carry that row stride.  ``out`` rows are dense (512 BF16 elements apart); ``bloc
 ``seq_lens`` and ``cum_seq_lens_q`` are contiguous int32.
 
 ``backend="auto"`` selects these programs for the qualified one-token decode contract only
-(SM100 / SM103, FP8 query and cache, ``kv_lora_rank=512`` / ``qk_rope_head_dim=64``, page 64,
-:data:`AUTO_QUALIFIED_HEADS` heads, dense ``[B, 1, H, 576]`` query) through the pure predicate
+(FP8 query and cache, ``kv_lora_rank=512`` / ``qk_rope_head_dim=64``, page 64,
+:data:`AUTO_QUALIFIED_HEADS` heads, dense ``[B, 1, H, 576]`` query), and within it only for the
+(batch, ``max_seq_len``) cells measured faster than the incumbents on the device
+(:data:`AUTO_ADMITTED_CELLS`, per architecture and SM count), through the pure predicate
 :func:`cake_kimi_k3_mla_auto_reason` followed by the guarded program build
 :func:`cake_kimi_k3_mla_auto_prepare`; every other call, and a build that fails, keeps the
 previous dispatch, and ``FLASHINFER_DISABLE_CAKE_AUTO=1`` (:data:`AUTO_DISABLE_ENV`) turns the
@@ -709,6 +711,36 @@ def run_cake_kimi_k3_mla_fp8_paged_attention(
 AUTO_QUALIFIED_HEADS: tuple[int, ...] = (12,)
 # Kill switch: any value other than "" / "0" keeps ``backend="auto"`` on its previous dispatch.
 AUTO_DISABLE_ENV = "FLASHINFER_DISABLE_CAKE_AUTO"
+# The one-token decode cells ``backend="auto"`` routes here, per (architecture, SM count): batch ->
+# the ``max_seq_len`` values (page-table width x 64) at which these programs were measured faster
+# than trtllm-gen, CuTe DSL and the previous ``auto`` dispatch on that device (12 heads, FP8 query
+# and cache, page 64; paired cold-L2 CUPTI medians, the lower 95 % confidence bound of each ratio
+# above the A/A noise band, outputs within the test tolerance).  Only these exact cells are
+# admitted: no interpolation between them and no extrapolation to other batch sizes, sequence
+# lengths, SM counts or architectures, which keep the previous dispatch.  An architecture or SM
+# count without an entry has not been measured yet.
+_KV_ALL = frozenset((512, 1024, 2048, 4096, 8192, 16384, 32768))
+AUTO_ADMITTED_CELLS: dict[tuple[str, int], dict[int, frozenset[int]]] = {
+    # B200 (sm_100a, 148 SMs).
+    ("sm_100a", 148): {
+        2: frozenset((32768,)),
+        4: frozenset((16384, 32768)),
+        8: frozenset((16384, 32768)),
+        16: frozenset((4096, 8192, 16384, 32768)),
+        32: frozenset((2048, 4096, 8192, 16384, 32768)),
+        64: frozenset((4096, 8192, 16384, 32768)),
+        128: _KV_ALL,
+        256: _KV_ALL,
+    },
+}
+
+
+def cake_kimi_k3_mla_auto_cell_admitted(
+    arch: str, sm_count: int, batch: int, max_seq_len: int
+) -> bool:
+    """Whether :data:`AUTO_ADMITTED_CELLS` lists this one-token decode cell for the device."""
+    cells = AUTO_ADMITTED_CELLS.get((arch, int(sm_count)), {})
+    return int(max_seq_len) in cells.get(int(batch), ())
 
 
 def cake_kimi_k3_mla_contract_reason(
@@ -856,7 +888,9 @@ def cake_kimi_k3_mla_auto_reason(
     ``seq_lens`` of ``B`` rows and the aligned table width the previous dispatch requires, a
     contiguous workspace that holds the plan, ``out`` absent or a dense BF16 ``[B, 1, H, 512]``
     buffer, every tensor on the query's device, programs generated for the device (SM100 /
-    SM103), the sources and nvcc present, and :data:`AUTO_DISABLE_ENV` unset.
+    SM103), a (batch, ``max_seq_len``) cell that :data:`AUTO_ADMITTED_CELLS` lists for the
+    device's architecture and SM count, the sources and nvcc present, and
+    :data:`AUTO_DISABLE_ENV` unset.
     ``enable_pdl=None`` (auto-detect) is not a PDL request: the Cake programs run without PDL,
     as on the explicit route; ``enable_pdl=True`` is declined.  A ``multi_ctas_kv_counter_buffer``
     (the trtllm-gen counter hint, best-effort under ``auto``) does not disqualify the call and
@@ -880,6 +914,12 @@ def cake_kimi_k3_mla_auto_reason(
     arch = _arch_name(compute_capability)
     if arch not in supported_arches():
         return f"no generated programs for {arch}"
+    if not cake_kimi_k3_mla_auto_cell_admitted(arch, sm_count, batch, max_seq_len):
+        return (
+            f"auto is measured faster only for listed cells; batch={batch}, "
+            f"max_seq_len={int(max_seq_len)} on {arch} with {int(sm_count)} SMs is not one "
+            "(AUTO_ADMITTED_CELLS)"
+        )
     if not cake_kimi_k3_mla_is_available():
         return "generated sources or an nvcc toolchain are not available"
     reason = cake_kimi_k3_mla_contract_reason(
@@ -1030,10 +1070,12 @@ def cake_kimi_k3_mla_auto_prepare(
 
 
 __all__ = [
+    "AUTO_ADMITTED_CELLS",
     "AUTO_DISABLE_ENV",
     "AUTO_QUALIFIED_HEADS",
     "AttentionPlan",
     "KimiK3MlaFp8PagedAttention",
+    "cake_kimi_k3_mla_auto_cell_admitted",
     "cake_kimi_k3_mla_auto_prepare",
     "cake_kimi_k3_mla_auto_reason",
     "cake_kimi_k3_mla_contract_reason",

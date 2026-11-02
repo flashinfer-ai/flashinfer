@@ -2990,7 +2990,8 @@ def _cake_auto_selected_message() -> str:
         "paged MLA decode programs for their qualified contract (SM100 / SM103, float8_e4m3fn "
         "query and cache, kv_lora_rank 512 + qk_rope_head_dim 64, page size 64, "
         f"{', '.join(str(h) for h in AUTO_QUALIFIED_HEADS)} heads, one query token per "
-        "request); set "
+        "request, the (batch, max_seq_len) cells measured faster on this device: "
+        "flashinfer.mla.cake_kimi_k3_mla.AUTO_ADMITTED_CELLS); set "
         f"{AUTO_DISABLE_ENV}=1 to keep the previous dispatch"
     )
 
@@ -3736,7 +3737,11 @@ def _mla_with_kv_cache_impl(
         12 heads, one query token per request, shared paged-KV indices with
         the aligned table width the previous dispatch requires, host-float
         scales and none of sparse top-k, sinks, LSE, DCP, skip-softmax, FP16
-        softmax, ``enable_pdl=True`` or the multi-CTA counter; set
+        softmax, ``enable_pdl=True`` or the multi-CTA counter, and only for the
+        (batch, ``max_seq_len``) cells measured faster than TRTLLM-GEN and
+        CuTe DSL on the device's architecture and SM count
+        (``flashinfer.mla.cake_kimi_k3_mla.AUTO_ADMITTED_CELLS``; other cells,
+        SM counts and architectures keep the previous dispatch); set
         ``FLASHINFER_DISABLE_CAKE_AUTO=1`` to keep the previous dispatch. A
         failing Cake probe, admission check or program build never raises
         under ``"auto"``: the call keeps the previous dispatch. Otherwise
@@ -4011,7 +4016,8 @@ def _mla_with_kv_cache_impl(
 
     # SM100 / SM103 ``auto``: the Cake Kimi-K3 FP8 paged MLA decode programs take their
     # qualified contract (FP8 e4m3 query and cache, kv_lora_rank 512 + qk_rope_head_dim 64,
-    # page size 64, 12 heads, one query token per request); every other call keeps the
+    # page size 64, 12 heads, one query token per request) in the (batch, max_seq_len) cells
+    # measured faster on the device (AUTO_ADMITTED_CELLS); every other call keeps the
     # previous dispatch.  Admission (a host-side predicate, then the guarded build of the
     # programs the plan launches) never raises here, and it sees the caller's ``enable_pdl``
     # before the TRT / CuTe block auto-detects PDL support.

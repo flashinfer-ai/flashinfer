@@ -5,7 +5,8 @@ packed variable-Q / MTP (cum_seq_lens_q) and incremental prefill on the paged FP
 reuse, ragged KV), plus CUDA-Graph replay with a changed page table, row-strided query / cache
 views on a row-tile route and on the wide route, the route selection and the split planners.
 The ``backend="auto"`` cases check that the public dispatcher selects these programs for the
-qualified 12-head one-token decode and that the result matches the explicit route's tolerance.
+12-head one-token decode cells that ``AUTO_ADMITTED_CELLS`` lists for the device (and keeps the
+incumbent elsewhere) and that the result matches the explicit route's tolerance.
 """
 
 import math
@@ -304,26 +305,52 @@ def cake_auto_calls(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("kv_lens", [[1, 200, 64], [4096, 777, 65]])
-def test_decode_q1_auto_selects_cake(cake_auto_calls, kv_lens):
-    """backend="auto" routes the qualified 12-head decode here and matches the explicit tolerance."""
+def _spread_kv_lens(batch, kv_len):
+    """kv lengths of a measured grid cell: the first request holds kv_len, the others a bit less."""
+    return [kv_len] + [kv_len - (i * 37) % min(kv_len, 300) for i in range(1, batch)]
+
+
+def _cell_admitted_here(batch, max_seq_len):
+    from flashinfer.mla.cake_kimi_k3_mla import cake_kimi_k3_mla_auto_cell_admitted
+    from flashinfer.utils import get_device_sm_count
+
+    device = torch.device("cuda")
+    major, minor = get_compute_capability(device)
+    return cake_kimi_k3_mla_auto_cell_admitted(
+        f"sm_{major}{minor}a", get_device_sm_count(device), batch, max_seq_len
+    )
+
+
+# Two cells measured faster on B200 (sm_100a, 148 SMs) and one measured slower there (16 x 2048).
+@pytest.mark.parametrize("batch,kv_len", [(2, 32768), (128, 512), (16, 2048)])
+def test_decode_q1_auto_follows_the_measured_cells(cake_auto_calls, batch, kv_len):
+    """backend="auto" routes a 12-head decode here exactly when AUTO_ADMITTED_CELLS lists its cell for the
+    device, and then matches the explicit tolerance; any other cell keeps the incumbent."""
     _skip_unless_sm100_family()
     device = torch.device("cuda")
     case = _make_case(
-        len(kv_lens), [1] * len(kv_lens), kv_lens, 12, seed=645001, device=device
+        batch, [1] * batch, _spread_kv_lens(batch, kv_len), 12, seed=645001, device=device
     )
+    admitted = _cell_admitted_here(batch, int(case["block_tables"].shape[1]) * PAGE)
     out = _run(case, fixed_q_len=1, backend="auto")
-    assert len(cake_auto_calls) == 1, (
-        f"auto did not select Cake: {_auto_decline_reason(case)}"
-    )
-    _check(out, _reference(case), atol=1e-2, rtol=1e-2)
+    if admitted:
+        assert len(cake_auto_calls) == 1, (
+            f"auto did not select Cake: {_auto_decline_reason(case)}"
+        )
+        _check(out, _reference(case), atol=1e-2, rtol=1e-2)
+    else:
+        assert not cake_auto_calls, "auto selected Cake for an unlisted cell"
+        assert bool(torch.isfinite(out.float()).all())
 
 
 def test_decode_sink_key_rows_auto(cake_auto_calls):
     """The sink-row case of test_decode_sink_key_rows reached through backend="auto"."""
     _skip_unless_sm100_family()
     device = torch.device("cuda")
-    kv_lens = [770, 768, 785, 802, 812, 738, 889, 741]
+    # A cell measured faster on B200 (128 x 512); skipped where the table lists no such cell.
+    kv_lens = _spread_kv_lens(128, 512)
+    if not _cell_admitted_here(128, 512):
+        pytest.skip("AUTO_ADMITTED_CELLS lists no 128 x 512 cell for this device")
     num_heads = 12
     case = _make_case(
         len(kv_lens), [1] * len(kv_lens), kv_lens, num_heads, seed=645011, device=device
@@ -345,11 +372,12 @@ def test_decode_sink_key_rows_auto(cake_auto_calls):
     assert float(rel.max()) <= 0.05
 
 
-def test_auto_admission_matches_the_launcher_contract(cake_auto_calls):
+def test_auto_admission_matches_the_launcher_contract(cake_auto_calls, monkeypatch):
     """The predicate mirrors the launcher: strided query rows pass; non-dense output rows, a short workspace and an
     odd page-table width (which the incumbent dispatch rejected before this route existed) do not."""
     _skip_unless_sm100_family()
     from flashinfer.mla.cake_kimi_k3_mla import (
+        AUTO_ADMITTED_CELLS,
         cake_kimi_k3_mla_auto_reason,
         cake_kimi_k3_mla_is_available,
         workspace_bytes,
@@ -360,9 +388,17 @@ def test_auto_admission_matches_the_launcher_contract(cake_auto_calls):
     # 32-page table (even width): admitted. The 33-page variant below is declined.
     case = _make_case(3, [1, 1, 1], [500, 2048, 64], 12, seed=645008, device=device)
     major, minor = get_compute_capability(device)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    # The contract mechanics, not the measured table: admit this test's cells (3 x 2048 and the
+    # 33-page 3 x 2112 variant) on the running device.
+    monkeypatch.setitem(
+        AUTO_ADMITTED_CELLS,
+        (f"sm_{major}{minor}a", sm_count),
+        {3: frozenset({2048, 2112})},
+    )
     request = dict(
         compute_capability=(major, minor),
-        sm_count=torch.cuda.get_device_properties(device).multi_processor_count,
+        sm_count=sm_count,
         query=case["query"].reshape(3, 1, 12, QK_DIM),
         kv_cache=case["kv_cache"],
         block_tables=case["block_tables"],

@@ -2786,6 +2786,11 @@ def cake_auto_request(monkeypatch):
         cake_kimi, "cake_kimi_k3_mla_auto_prepare", lambda **kwargs: None
     )
     monkeypatch.setattr(cake_kimi, "_auto_build_failures", {})
+    # The dispatch tests run on a mocked sm_100a device with 148 SMs; admit their one cell
+    # (batch 2, max_seq_len 256) so they do not depend on the measured table.
+    monkeypatch.setattr(
+        cake_kimi, "AUTO_ADMITTED_CELLS", {("sm_100a", 148): {2: frozenset({256})}}
+    )
     return dict(
         query=_fp8_empty(2, 1, 12, 576),
         kv_cache=_fp8_empty(8, 64, 576),
@@ -2918,6 +2923,54 @@ def test_cake_kimi_k3_auto_reason_names_the_miss(cake_auto_request, monkeypatch)
     assert "not available" in _auto_reason(request)
 
 
+def test_cake_kimi_k3_auto_reason_admits_only_listed_cells(cake_auto_request):
+    """Outside the listed (architecture, SM count, batch, max_seq_len) cells auto keeps the incumbent."""
+    request = cake_auto_request
+    assert _auto_reason(request) is None
+    assert "AUTO_ADMITTED_CELLS" in _auto_reason(
+        request, max_seq_len=512, block_tables=torch.zeros(2, 8, dtype=torch.int32)
+    )
+    assert "AUTO_ADMITTED_CELLS" in _auto_reason(
+        request,
+        query=_fp8_empty(4, 1, 12, 576),
+        block_tables=torch.zeros(4, 4, dtype=torch.int32),
+        seq_lens=torch.ones(4, dtype=torch.int32),
+    )
+    assert "AUTO_ADMITTED_CELLS" in _auto_reason(request, sm_count=132)
+    assert "AUTO_ADMITTED_CELLS" in _auto_reason(request, compute_capability=(10, 3))
+
+
+def test_cake_kimi_k3_auto_admitted_cells_are_the_measured_b200_set():
+    """The shipped table: the B200 (sm_100a, 148 SMs) cells of the measured grid, exact points only."""
+    admitted = cake_kimi.cake_kimi_k3_mla_auto_cell_admitted
+    grid_kv = (512, 1024, 2048, 4096, 8192, 16384, 32768)
+    expected = {
+        2: (32768,),
+        4: (16384, 32768),
+        8: (16384, 32768),
+        16: (4096, 8192, 16384, 32768),
+        32: (2048, 4096, 8192, 16384, 32768),
+        64: (4096, 8192, 16384, 32768),
+        128: grid_kv,
+        256: grid_kv,
+    }
+    b200 = cake_kimi.AUTO_ADMITTED_CELLS[("sm_100a", 148)]
+    assert {b: tuple(sorted(kv)) for b, kv in b200.items()} == expected
+    assert sum(len(kv) for kv in expected.values()) == 32
+    for (arch, sm_count), cells in cake_kimi.AUTO_ADMITTED_CELLS.items():
+        assert arch in ("sm_100a", "sm_103a") and sm_count > 0
+        assert all(b in (1, 2, 4, 8, 16, 32, 64, 128, 256) for b in cells)
+        assert all(set(kv) <= set(grid_kv) for kv in cells.values())
+    # Exact cells only: no interpolation, no other batch, SM count or architecture.
+    assert admitted("sm_100a", 148, 16, 4096) and admitted("sm_100a", 148, 16, 8192)
+    assert not admitted("sm_100a", 148, 16, 6144)
+    assert not admitted("sm_100a", 148, 1, 32768)
+    assert not admitted("sm_100a", 148, 3, 32768)
+    assert not admitted("sm_100a", 148, 256, 65536)
+    assert not admitted("sm_100a", 132, 256, 4096)
+    assert not admitted("sm_107a", 148, 256, 4096)
+
+
 def test_auto_selects_cake_kimi_k3_for_the_qualified_decode(
     cake_auto_request, incumbent_dispatch, cake_kimi_launch, monkeypatch, caplog
 ):
@@ -3005,6 +3058,8 @@ _EXPECTED_WARNING = {
         ("prepare_raises", ["trtllm-gen", "cute-dsl"]),
         ("page_32", ["trtllm-gen", "cute-dsl"]),
         ("bf16", ["trtllm-gen", "cute-dsl"]),
+        ("unmeasured_cell", ["trtllm-gen", "cute-dsl"]),
+        ("unmeasured_sm_count", ["trtllm-gen", "cute-dsl"]),
         ("sm_120", None),  # resolved to XQA by the architecture policy
     ],
 )
@@ -3046,6 +3101,11 @@ def test_auto_keeps_the_incumbent_outside_the_qualified_contract(
     elif variant == "bf16":
         case["query"] = torch.empty(2, 1, 12, 576, dtype=torch.bfloat16)
         case["kv_cache"] = torch.empty(8, 64, 576, dtype=torch.bfloat16)
+    elif variant == "unmeasured_cell":
+        case["block_tables"] = torch.zeros(2, 8, dtype=torch.int32)
+        case["max_seq_len"] = 512
+    elif variant == "unmeasured_sm_count":
+        monkeypatch.setattr(core, "get_device_sm_count", lambda device: 132)
     elif variant == "sm_120":
         # SM120 dense decode resolves to XQA by the architecture policy before any Cake
         # admission; the admission predicate must never be consulted there.

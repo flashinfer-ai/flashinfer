@@ -878,7 +878,12 @@ contract only: `float8_e4m3fn` query and cache, `kv_lora_rank=512` with
 passed), shared paged-KV indices with the aligned table width the previous `auto`
 dispatch requires (so the inputs it rejected still raise the same error),
 host-float scales, and none of sparse top-k, sinks, LSE, DCP, skip-softmax, FP16
-softmax or `enable_pdl=True`; the trtllm-gen `multi_ctas_kv_counter_buffer`
+softmax or `enable_pdl=True`. Within that contract it admits only the (batch,
+`max_seq_len`) cells measured faster than TRTLLM-GEN, CuTe DSL and the previous
+`auto` dispatch on the device's architecture and SM count
+(`flashinfer.mla.cake_kimi_k3_mla.AUTO_ADMITTED_CELLS`): exact cells, no
+interpolation; an unlisted cell, SM count or architecture keeps the previous
+dispatch. The trtllm-gen `multi_ctas_kv_counter_buffer`
 hint, best-effort under `auto` already (unused whenever the tuner picks CuTe
 DSL), does not disqualify a call and stays unused. `enable_pdl=None` (the
 auto-detect default) is admitted and the Cake programs then run without PDL: an
