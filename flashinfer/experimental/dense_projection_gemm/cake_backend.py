@@ -702,16 +702,19 @@ ROUTER_RULES: dict[
     # that plan at 16172 to 16384 tokens when launched before a kernel holding SMs on another stream.  Hidden 6144
     # keeps the deterministic plan: on sm_100a no partition was faster in every run in CUDA graphs; on sm_103a the
     # closest one ("H1x5p44", x0.973-0.983 alone) left the backward pass (input and weight gradient) no faster.
-    # sm_107a keeps the deterministic plan: at hidden 4096 "H0.5x4" was up to 7 % slower than that plan when a kernel
-    # holding 16 SMs on another stream started during it (the kernel takes SMs the head spans wait for), at hidden
-    # 6144 it left the backward pass no faster, and at hidden 5120 it was measured on one part only
+    # sm_107a: hidden 5120 "H0.5x4" (four tail units, 108 head and 432 tail units on 216 SMs; measured on two parts at
+    # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
+    # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
+    # the head spans wait for), at 6144 it left the backward pass no faster
     ("sm_100a", "nn_t", 4096, 256): ((10240, 16384, "H1x5p44"),),
     ("sm_100a", "nn_t", 5120, 256): ((1, 128, "waves"), (10240, 32768, "H0.5x3")),
     ("sm_100a", "nn_t", 6144, 256): None,
     ("sm_103a", "nn_t", 4096, 256): None,
     ("sm_103a", "nn_t", 5120, 256): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
     ("sm_103a", "nn_t", 6144, 256): None,
-    ("sm_107a", "nn_t", 4096, 256): None, ("sm_107a", "nn_t", 5120, 256): None, ("sm_107a", "nn_t", 6144, 256): None,
+    ("sm_107a", "nn_t", 4096, 256): None,
+    ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+    ("sm_107a", "nn_t", 6144, 256): None,
 }
 # fmt: on
 #: The SM count the verdicts of :data:`ROUTER_RULES` were measured on, per architecture (152-SM GB200 / GB300, 216-SM
