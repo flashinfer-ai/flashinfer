@@ -45,10 +45,14 @@ forward 16-row blocks on 128-thread CTAs); on sm_100a and sm_103a from
 1280 rows per SM a backward whose thread 0 warms the next row block of
 packed rows in L2 with one bulk prefetch a tensor, launched with 5 CTAs per
 SM, and on sm_107a from 1024 the backward with 128-thread CTAs, ``dx`` and
-``dz`` the same bits.
+``dz`` the same bits.  An architecture may also route the forward's short
+role (``fwd_short``), whose module runs in the role's place up to
+``max_rows_per_sm`` rows per SM of its grid rule (tried before the long and
+mid roles): on sm_100a and sm_103a the long forward's kernel on 256-thread
+CTAs with 16 threads to a row, one 16-row block per CTA, ``y`` the same bits.
 
-Grids (:func:`launch_grid`): the forward launches one CTA per block of
-``rows_per_cta`` rows.  The long and mid forwards launch the fewest whole waves of
+Grids (:func:`launch_grid`): the forward and the short forward launch one
+CTA per block of ``rows_per_cta`` rows.  The long and mid forwards launch the fewest whole waves of
 ``ctas_per_sm * SMs`` CTAs (the CTAs per SM its launch bounds are compiled
 for) whose CTAs walk at most ``max_blocks_per_cta`` blocks of
 ``rows_per_block`` rows each, and never more CTAs than blocks; CTA ``b``
@@ -76,7 +80,9 @@ walks all of its blocks once it starts.  The long forward runs only from the
 ``min_rows_per_sm`` at which, with at most ``max_blocks_per_cta`` blocks a
 CTA, that delay is no larger than the forward's; the mid forward only from
 the one at which such a call stays within the forward stall test's bound and
-ends no later than the forward's (FlashInfer issue #7548).
+ends no later than the forward's, and the short forward only up to the
+``max_rows_per_sm`` at which its grid has fewer CTAs than the SMs and such a
+call still ends no later than the forward's (FlashInfer issue #7548).
 
 The workspace of the backward is ``dw_slots * 128`` FP64 accumulators and one
 8-byte word holding two 32-bit words, the arrival ticket and the claim counter
@@ -282,6 +288,62 @@ MODULES: dict[str, dict[str, Any]] = {
             "z_tok": "z_tok",
         },
         "role": "fwd_mid",
+    },
+    # The short forward (sm_100a, sm_103a): the long forward's kernel on 256
+    # threads, 16 lanes per row (16-row blocks), launch bounds for 4 CTAs per
+    # SM (build {"lanes": 16, "math": "x2", "min_blocks": 4, "threads": 256}),
+    # one block per CTA, up to 10 rows per SM.
+    "cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "z"],
+            ["buffer", "w"],
+            ["buffer", "y"],
+            ["parameter", "rows"],
+            ["parameter", "heads"],
+            ["parameter", "x_tok"],
+            ["parameter", "x_head"],
+            ["parameter", "z_tok"],
+            ["parameter", "z_head"],
+            ["parameter", "eps"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "row_blocks",
+            "max_rows_per_sm": 10,
+            "rows_per_cta": 16,
+        },
+        "kernel": "cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683",
+        "kernel_symbol": "kernel_cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683",
+        "logical": {
+            "eps": "eps",
+            "heads": "heads",
+            "rows": "rows",
+            "w": "w",
+            "x": "x",
+            "x_head": "x_head",
+            "x_tok": "x_tok",
+            "y": "y",
+            "z": "z",
+            "z_head": "z_head",
+            "z_tok": "z_tok",
+        },
+        "role": "fwd_short",
     },
     # The backward into a BF16 weight gradient: 256 threads, 16 lanes per row,
     # 16-byte accesses, one row per thread group, the gate on packed FP32 pairs,
@@ -754,6 +816,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd": "cake_rmsnorm_silu_gate_train_05ffc12001cf81513436",
         "fwd_long": "cake_rmsnorm_silu_gate_train_e0672c312c57421abe21",
         "fwd_mid": "cake_rmsnorm_silu_gate_train_8bd481246a4b97382250",
+        "fwd_short": "cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_58f1ac96c476c73ec5c8",
         "bwd_bf16_long": "cake_rmsnorm_silu_gate_train_9f2f4d1f2b85a7469a7d",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_26c869703d0ab9e4a39d",
@@ -763,6 +826,7 @@ ROUTES: dict[str, dict[str, str]] = {
         "fwd": "cake_rmsnorm_silu_gate_train_05ffc12001cf81513436",
         "fwd_long": "cake_rmsnorm_silu_gate_train_e0672c312c57421abe21",
         "fwd_mid": "cake_rmsnorm_silu_gate_train_8bd481246a4b97382250",
+        "fwd_short": "cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_58f1ac96c476c73ec5c8",
         "bwd_bf16_long": "cake_rmsnorm_silu_gate_train_9f2f4d1f2b85a7469a7d",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_26c869703d0ab9e4a39d",
@@ -784,10 +848,12 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
     (10, 7): "sm_107a",
 }
 # The kernels of a call, routed on every architecture; ``<role>_long`` is a
-# role's long role and ``<role>_mid`` its mid role, routed on some.
+# role's long role, ``<role>_mid`` its mid role and ``<role>_short`` its short
+# role, routed on some.
 ROLES = ("fwd", "bwd_bf16", "bwd_f32")
 LONG_ROLES = ("fwd_long", "bwd_bf16_long", "bwd_f32_long")
 MID_ROLES = ("fwd_mid",)
+SHORT_ROLES = ("fwd_short",)
 # The suffixes of a role's long and mid roles in the order
 # :func:`module_for_rows` tries them (a long role runs from more rows per SM).
 TIERS = ("_long", "_mid")
@@ -826,11 +892,18 @@ def route_module(arch: str, role: str) -> str:
 
 def module_for_rows(arch: str, role: str, rows: int, sm_count: int) -> str:
     """The module that runs ``role`` (one of ``ROLES``) for ``rows`` rows on
-    ``arch`` with ``sm_count`` SMs: the first of the role's long and mid
-    modules (``TIERS`` order) that ``arch`` routes with ``rows >=
-    min_rows_per_sm * sm_count`` of its grid rule, else :func:`route_module`."""
+    ``arch`` with ``sm_count`` SMs: the role's short module when ``arch``
+    routes one and ``rows <= max_rows_per_sm * sm_count`` of its grid rule,
+    else the first of the role's long and mid modules (``TIERS`` order) that
+    ``arch`` routes with ``rows >= min_rows_per_sm * sm_count`` of its grid
+    rule, else :func:`route_module`."""
 
     routes = ROUTES.get(arch, {})
+    short = routes.get(f"{role}_short")
+    if short is not None and int(rows) <= int(
+        MODULES[short]["grid_rule"]["max_rows_per_sm"]
+    ) * int(sm_count):
+        return short
     for tier in TIERS:
         name = routes.get(f"{role}{tier}")
         if name is not None and int(rows) >= int(
@@ -994,6 +1067,7 @@ __all__ = [
     "MODULES",
     "ROLES",
     "ROUTES",
+    "SHORT_ROLES",
     "TIERS",
     "arch_for_capability",
     "backward_ctas",

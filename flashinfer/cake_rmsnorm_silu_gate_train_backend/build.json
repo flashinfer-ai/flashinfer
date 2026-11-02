@@ -407,6 +407,52 @@
     },
     {
       "arch": "sm_100a",
+      "closure_sha256": "d8e88f189a34391a9737edb48dafb59929663149fc6ebc734a650deeb72f9f85",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+      "min_cuda": "12.9",
+      "name": "cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_sm_100a",
+      "nvcc_flags": [
+        "--prec-div=true",
+        "--prec-sqrt=true",
+        "--ftz=false"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_sm_100a.so",
+      "sha256": {
+        "csrc/cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_binding.cu": "79724a91aec360c638f7fdec597e1cceca690ef9bd8924cc5e4bb2abda71ef96",
+        "csrc/cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_kernel.cu": "a7e797f82b1196fd6204b51669da3c4a8afe7e8790ad917b126f2dc40e50e935"
+      },
+      "sources": [
+        "csrc/cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_kernel.cu",
+        "csrc/cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "closure_sha256": "a4894c489851125636fe2ca06420757203c764198c59286ece5d89c32bceda32",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+      "min_cuda": "12.9",
+      "name": "cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_sm_103a",
+      "nvcc_flags": [
+        "--prec-div=true",
+        "--prec-sqrt=true",
+        "--ftz=false"
+      ],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_sm_103a.so",
+      "sha256": {
+        "csrc/cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_binding.cu": "79724a91aec360c638f7fdec597e1cceca690ef9bd8924cc5e4bb2abda71ef96",
+        "csrc/cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_kernel.cu": "a7e797f82b1196fd6204b51669da3c4a8afe7e8790ad917b126f2dc40e50e935"
+      },
+      "sources": [
+        "csrc/cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_kernel.cu",
+        "csrc/cake_rmsnorm_silu_gate_train_bdd3c5da2cfd30997683_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_100a",
       "closure_sha256": "a9795366b1e46f416f723211402e1da530547b8154f92ba1d7952b6991469bdf",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",

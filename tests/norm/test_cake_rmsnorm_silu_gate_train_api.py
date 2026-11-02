@@ -1148,7 +1148,7 @@ def test_autograd_and_checkpoint_match_the_deterministic_package(
     check(yc, xc.grad, zc.grad, wc.grad, "checkpoint")
 
 
-# --------------------------------------------------------------------------- the long and mid modules' thresholds
+# --------------------------------------------------------------------------- the short, long and mid modules' thresholds
 
 
 def _spy_launches(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -1169,15 +1169,22 @@ def _sm_count() -> int:
     ).multi_processor_count
 
 
-# The rows per SM from which sm_100a and sm_103a run the mid and the long
-# forward.
+# The rows per SM up to which sm_100a and sm_103a run the short forward, and
+# from which they run the mid and the long forward.
+SHORT_FORWARD_ROWS_PER_SM = 10
 MID_FORWARD_ROWS_PER_SM = 976
 LONG_FORWARD_ROWS_PER_SM = 2400
-# Forward inputs around and past the mid and the long forward's thresholds:
-# (tokens, heads, layout); ``heads=None`` takes ``threshold * SMs + tokens``
-# rows (the mid threshold for ``flat-mid``, the long one for ``flat``) as one
-# flat [rows, 128] tensor.
+# Forward inputs around and past the short, the mid and the long forward's
+# thresholds: (tokens, heads, layout); ``heads=None`` takes ``threshold * SMs
+# + tokens`` rows (the short threshold for ``flat-short``, the mid one for
+# ``flat-mid``, the long one for ``flat``) as one flat [rows, 128] tensor.
 LONG_FORWARD_CASES = [
+    pytest.param(1, 48, "contiguous", id="1x48"),
+    pytest.param(13, 7, "contiguous", id="13x7"),
+    pytest.param(13, 48, "projection", id="13x48-projection"),
+    pytest.param(21, 48, "head_major", id="21x48-head_major"),
+    pytest.param(0, None, "flat-short", id="short-threshold"),
+    pytest.param(1, None, "flat-short", id="short-threshold+1"),
     pytest.param(-1, None, "flat-mid", id="mid-threshold-1"),
     pytest.param(1, None, "flat-mid", id="mid-threshold+1"),
     pytest.param(2048, 48, "contiguous", id="2048x48"),
@@ -1202,13 +1209,16 @@ def test_forward_around_the_long_threshold_matches_the_deterministic_package(
 ) -> None:
     """``y`` is the deterministic package's bits on both sides of the mid and
     the long forward's thresholds and past them, and the forward launches
-    ``module_for_rows``' module: where the architecture routes them, the long
-    forward from ``2400 * SMs`` rows and the mid forward from
+    ``module_for_rows``' module: where the architecture routes them, the short
+    forward up to ``SHORT_FORWARD_ROWS_PER_SM * SMs`` rows, the long forward
+    from ``2400 * SMs`` rows and the mid forward from
     ``MID_FORWARD_ROWS_PER_SM * SMs`` rows below that, else the forward."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
     if heads is None:
-        start = MID_FORWARD_ROWS_PER_SM if layout == "flat-mid" else 2400
+        start = {"flat-short": SHORT_FORWARD_ROWS_PER_SM, "flat-mid": 976}.get(
+            layout, LONG_FORWARD_ROWS_PER_SM
+        )
         x, z, w, _ = suite.make(start * sms + tokens, 1, layout="flat", seed=21)
     else:
         x, z, w, _ = suite.make(tokens, heads, layout=layout, seed=21)
@@ -1219,7 +1229,9 @@ def test_forward_around_the_long_threshold_matches_the_deterministic_package(
     assert launched == [name], launched
     routes = loader.ROUTES[arch]
     want = loader.route_module(arch, "fwd")
-    if "fwd_long" in routes and rows >= LONG_FORWARD_ROWS_PER_SM * sms:
+    if "fwd_short" in routes and rows <= SHORT_FORWARD_ROWS_PER_SM * sms:
+        want = routes["fwd_short"]
+    elif "fwd_long" in routes and rows >= LONG_FORWARD_ROWS_PER_SM * sms:
         want = routes["fwd_long"]
     elif "fwd_mid" in routes and rows >= MID_FORWARD_ROWS_PER_SM * sms:
         want = routes["fwd_mid"]
