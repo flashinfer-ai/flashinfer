@@ -37,6 +37,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import importlib.util
+import inspect
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -245,7 +246,12 @@ class Kernel:
         binding = _import_source(
             f"{__name__}._generated_{name}_binding", source_path(units["binding"])
         )
-        program = device.compile_program()
+        # the dense GEMM programs are shared by the PDL and _nopdl modules: they take the launch attribute at
+        # compile time; the other programs keep their fixed attribute
+        if "use_pdl" in inspect.signature(device.compile_program).parameters:
+            program = device.compile_program(use_pdl=self.use_pdl)
+        else:
+            program = device.compile_program()
         return binding.Kernel(program)
 
     @property
@@ -327,6 +333,7 @@ def select_gemm1(
     *,
     pdl_trigger_after_wait: bool | None = None,
     weight_l2_hint: bool | None = None,
+    cluster_split: bool = False,
 ) -> Kernel:
     """The swap-AB GEMM1 SiTU form the plan selected.
 
@@ -334,13 +341,16 @@ def select_gemm1(
     is the module's griddepcontrol placement (the plan's ``pdl and dep_prefetch``) --
     the split chain's narrow forms exist under both placements; ``weight_l2_hint`` is
     the module's weight-stream L2 policy (the plan's ``swap_weight_l2_hint``) -- the
-    n16 / n32 forms exist under both.
+    n16 / n32 forms exist under both; ``cluster_split`` selects the 2-CTA cluster
+    split-K ``_cs`` twin of a narrow plain form (the plan's cluster-split decision) --
+    the n8 / n16 / n32 forms exist as the single-CTA raster and as the twin.
     """
     form: dict[str, Any] = dict(
         kind="gemm1_swapab",
         n_tile=int(n_tile),
         kbps=int(kbps),
         row_group_list=bool(row_group_list),
+        cluster_split=bool(cluster_split),
     )
     if pdl_trigger_after_wait is not None:
         form["pdl_trigger_after_wait"] = bool(pdl_trigger_after_wait)
@@ -356,16 +366,27 @@ def select_gemm2(
     *,
     late_dep_wait: bool | None = None,
     weight_l2_hint: bool | None = None,
+    sched_chunk_major: int = 0,
 ) -> Kernel:
     """The swap-AB GEMM2 finalize form the plan selected.
 
     ``late_dep_wait`` is the module's griddepcontrol placement (the plan's
     ``pdl and dep_prefetch``); ``weight_l2_hint`` its weight-stream L2 policy (the
-    plan's ``swap_weight_l2_hint``; the n16 / n32 forms exist under both).
+    plan's ``swap_weight_l2_hint``; the n16 / n32 forms exist under both);
+    ``sched_chunk_major`` the finalize scheduler raster (the plan's
+    ``GemmForm.sched_chunk_major``): ``0`` = the row-group-major raster, ``B >= 1``
+    the chunk-major raster blocked ``B`` weight chunks per row group (``_cm<B>``) --
+    the n192 2-CTA form exists under both.
     """
     form: dict[str, Any] = dict(
-        kind="gemm2_swapab", n_tile=int(n_tile), kbps=int(kbps), m_group=int(m_group)
+        kind="gemm2_swapab",
+        n_tile=int(n_tile),
+        kbps=int(kbps),
+        m_group=int(m_group),
+        sched_chunk_major=bool(sched_chunk_major),
     )
+    if sched_chunk_major:
+        form["sched_m_block"] = int(sched_chunk_major)
     if late_dep_wait is not None:
         form["late_dep_wait"] = bool(late_dep_wait)
     if weight_l2_hint is not None:

@@ -33,8 +33,8 @@ TOKENS = [1, 63, 64, 65, 128, 257, 1023, 4097]
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    major, _minor = get_compute_capability(torch.device("cuda:0"))
-    return major in (9, 10, 12)
+    major, minor = get_compute_capability(torch.device("cuda:0"))
+    return (major, minor) in ((9, 0), (10, 0), (10, 3), (12, 0), (12, 1))
 
 
 def synthetic_inputs(tokens: int, seed: int, device: torch.device):
@@ -91,7 +91,7 @@ def fp32_oracle(
 
 @pytest.mark.skipif(
     not _supported(),
-    reason="requires a CUDA GPU with compute capability 9.0, 10.x or 12.x",
+    reason="requires a CUDA GPU with compute capability 9.0, 10.0, 10.3, 12.0 or 12.1",
 )
 @pytest.mark.parametrize("tokens", TOKENS)
 def test_minimax_h3_dense_attention_matches_fp32_oracle(tokens: int) -> None:
@@ -110,7 +110,7 @@ def test_minimax_h3_dense_attention_matches_fp32_oracle(tokens: int) -> None:
 
 @pytest.mark.skipif(
     not _supported(),
-    reason="requires a CUDA GPU with compute capability 9.0, 10.x or 12.x",
+    reason="requires a CUDA GPU with compute capability 9.0, 10.0, 10.3, 12.0 or 12.1",
 )
 def test_minimax_h3_dense_attention_preallocated_output() -> None:
     device = torch.device("cuda:0")
@@ -125,7 +125,7 @@ def test_minimax_h3_dense_attention_preallocated_output() -> None:
 
 @pytest.mark.skipif(
     not _supported(),
-    reason="requires a CUDA GPU with compute capability 9.0, 10.x or 12.x",
+    reason="requires a CUDA GPU with compute capability 9.0, 10.0, 10.3, 12.0 or 12.1",
 )
 def test_minimax_h3_dense_attention_repeated_launches_reuse_workspace() -> None:
     """Back-to-back launches of different sizes share the per-device workspace.

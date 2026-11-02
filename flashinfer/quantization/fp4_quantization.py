@@ -348,13 +348,9 @@ def get_fp4_quantization_module(backend: str = "100"):
             out_sf_size = _compute_swizzled_layout_sf_size(
                 m, k // sf_vec_size, 8 if is_sf_8x4_layout else 128
             )
-            out_sf_size_padded = out_sf_size
         else:
             out_sf_size = m * k // sf_vec_size
-            out_sf_size_padded = round_up(m, 16) * k // sf_vec_size
-        out_sf = torch.empty(
-            (out_sf_size_padded,), dtype=torch.uint8, device=input.device
-        )
+        out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
         module.fp4_quantize(
             input,
             global_scale,
@@ -368,7 +364,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             enable_pdl,
             nvfp4_4over6_code,
         )
-        return out_val, out_sf[:out_sf_size]
+        return out_val, out_sf
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
     def _fake_fp4_quantize_sm100(
@@ -458,6 +454,20 @@ def get_fp4_quantization_module(backend: str = "100"):
         return unswizzled_sf.new_empty(
             [unswizzled_sf.shape[0] * unswizzled_sf.shape[1] // 16], dtype=torch.uint8
         )
+
+    @register_custom_op(
+        "flashinfer::block_scale_interleave_sm100_out", mutates_args=("out",)
+    )
+    def block_scale_interleave_sm100_out(
+        unswizzled_sf: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        module.block_scale_interleave_sm100(unswizzled_sf, out)
+
+    @register_fake_op("flashinfer::block_scale_interleave_sm100_out")
+    def _fake_block_scale_interleave_sm100_out(
+        unswizzled_sf: torch.Tensor, out: torch.Tensor
+    ) -> None:
+        pass
 
     @register_custom_op(
         "flashinfer::fp4_batched_quantize_sm100",
@@ -680,11 +690,11 @@ def get_fp4_quantization_module(backend: str = "100"):
         when requested, and an optional global scale can be applied.
 
         Args:
-            input (torch.Tensor): Input tensor of shape [B, M, K] with dtype torch.float16,
-                torch.bfloat16, or an FP8-quantized dtype supported by the kernel.
-            mask (torch.Tensor): mask tensor of shape [B] with dtype torch.int32.
-            global_scale (torch.Tensor, optional): Global scale factor of shape [1] and
-                dtype float32.
+            input (torch.Tensor): Input tensor of shape [B, M, 2 * K] (gate half, then up
+                half) with dtype torch.float16 or torch.bfloat16.
+            mask (torch.Tensor): valid row count per group, shape [B], dtype torch.int32.
+            global_scale (torch.Tensor, optional): Global scale factor, one per group,
+                of shape [B] and dtype float32.
             nvfp4_4over6_code (int, optional): Packed NVFP4 4over6 recipe (see
                 flashinfer.quantization.nvfp4_4over6_code). ``-1`` lets the
                 kernel read the legacy FLASHINFER_NVFP4_4OVER6* environment
@@ -928,6 +938,7 @@ def get_fp4_quantization_module(backend: str = "100"):
     return SimpleNamespace(
         fp4_quantize_sm100=fp4_quantize_sm100,
         block_scale_interleave_sm100=block_scale_interleave_sm100,
+        block_scale_interleave_sm100_out=block_scale_interleave_sm100_out,
         e2m1_and_ufp8sf_scale_to_float_sm100=e2m1_and_ufp8sf_scale_to_float_sm100,
         mxfp4_dequantize_host=mxfp4_dequantize_host,
         fp4_batched_quantize_sm100=fp4_batched_quantize_sm100,
@@ -1353,7 +1364,9 @@ def _fp4_quantize_cute_dsl(
 
 
 @flashinfer_api
-def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
+def block_scale_interleave(
+    unswizzled_sf: torch.Tensor, *, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     r"""Swizzle a block-scale tensor for FP4 layouts.
 
     Reorders an unswizzled FP4 block-scale tensor to optimize memory access
@@ -1364,6 +1377,10 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     ----------
     unswizzled_sf : torch.Tensor
         Input scale-factor tensor with dtype ``uint8`` or ``bfloat16``.
+    out : Optional[torch.Tensor]
+        Preallocated contiguous, flat swizzled output on the input device,
+        with the same dtype and padded size. Reusing it preserves its address
+        across CUDA Graph captures and replay.
 
     Returns
     -------
@@ -1380,6 +1397,8 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     ------
     AssertionError
         If the input dtype is not ``uint8`` or ``bfloat16``.
+    ValueError
+        If ``out`` has an incompatible device, dtype, size, or layout.
     """
     # TODO(shuw): check input dtype is uint8
     assert (
@@ -1388,6 +1407,27 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
 
     major, minor = get_compute_capability(unswizzled_sf.device)
     device_arch = f"{major * 10 + minor}"
+
+    if out is not None:
+        num_experts = unswizzled_sf.shape[0] if unswizzled_sf.ndim == 3 else 1
+        size = num_experts * _compute_swizzled_layout_sf_size(
+            unswizzled_sf.shape[-2], unswizzled_sf.shape[-1], 128
+        )
+        if (
+            out.device != unswizzled_sf.device
+            or out.dtype != unswizzled_sf.dtype
+            or out.shape != (size,)
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "block_scale_interleave out must be a contiguous flat tensor "
+                f"of shape ({size},), dtype {unswizzled_sf.dtype}, "
+                f"on {unswizzled_sf.device}"
+            )
+        get_fp4_quantization_module(device_arch).block_scale_interleave_sm100_out(
+            unswizzled_sf, out
+        )
+        return out
 
     return get_fp4_quantization_module(device_arch).block_scale_interleave_sm100(
         unswizzled_sf,
@@ -2218,9 +2258,11 @@ def scaled_fp4_grouped_quantize(
     a : torch.Tensor
         Input tensor of shape ``[B, M, K]`` with dtype fp16/bf16.
     mask : torch.Tensor
-        Mask tensor applied before quantization.
+        Valid row count per group, shape ``[B]``, dtype ``int32``. Only the
+        first ``mask[b]`` rows of group ``b`` are quantized; the entries of
+        ``x_q`` and ``sf`` for the remaining rows are unspecified.
     a_global_sf : torch.Tensor
-        Global scale factor of shape ``[1]`` with dtype ``float32``.
+        Global scale factor, one per group: shape ``[B]``, dtype ``float32``.
     nvfp4_4over6 : NVFP44Over6Config or None
         NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
 

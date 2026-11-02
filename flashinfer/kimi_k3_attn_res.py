@@ -96,12 +96,17 @@ def prepare_kimi_k3_attn_res(
 
     Notes
     -----
-    Dense token-major inputs with ``delta`` and ``output_norm_weight`` and no
-    snapshot write take the persistent TMEM path; other variants take the
-    one-CTA-per-token program.  The checkout registers the programs of the
-    measured token counts ``M`` in {1, 2, 4, ..., 16384} and block counts of the
-    Kimi-K3 evaluation; a call whose program is not registered raises
-    ``NotImplementedError`` (see :func:`generated_program_available`).
+    Dense token-major calls with ``delta`` and ``output_norm_weight`` and at
+    most the snapshot write of block ``num_blocks`` take the generated programs
+    of the dense path; every other call takes the one-CTA-per-token bootstrap
+    program.  The checkout registers the programs of the measured token counts
+    ``M`` in {1, 2, 4, ..., 16384} and block counts of the evaluation grid; a
+    dense call whose table variant is not registered runs the closest
+    registered variant of the same program family and block count
+    (``RoutePlan.fallback_from`` records the table key).  Only a snapshot write
+    without a registered write variant and a bootstrap variant without a
+    program raise ``NotImplementedError`` (see
+    :func:`generated_program_available`).
     """
     if backend == "cake":
         from .experimental.cake_kimi_k3_attn_res.cake_backend import (

@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -99,6 +100,8 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8(
     int bmm1_is_log2,
     int num_splits,
     int blocks_per_split,
+    float bmm1_scalar,
+    float bmm2_scalar,
     unsigned int grid_x,
     unsigned int grid_y,
     unsigned int grid_z,
@@ -124,6 +127,8 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_nvfp4(
     int bmm1_is_log2,
     int num_splits,
     int blocks_per_split,
+    float bmm1_scalar,
+    float bmm2_scalar,
     unsigned int grid_x,
     unsigned int grid_y,
     unsigned int grid_z,
@@ -160,10 +165,12 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8_reduce(
     uint8_t* O,
     float* bmm2_scale_ptr,
     int num_split,
+    float bmm2_scalar,
     unsigned int grid_x,
     unsigned int grid_y,
     unsigned int grid_z,
-    cudaStream_t stream
+    cudaStream_t stream,
+    bool use_pdl
 );
 
 extern "C" cudaError_t cake_fmha_launch_context_bf16(
@@ -342,9 +349,9 @@ extern "C" cudaError_t cake_fmha_launch_compat_v1(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16(
-    CakeFmhaTensorMap const* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Qt,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -367,9 +374,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_mtp_n32(
-    CakeFmhaTensorMap const* Q,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Q,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -391,9 +398,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_mtp_n32(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_mtp_n64(
-    CakeFmhaTensorMap const* Q,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Q,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -415,9 +422,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_mtp_n64(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_fp16(
-    CakeFmhaTensorMap const* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Qt,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __half* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -440,9 +447,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_fp16(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_fp16_mtp_n32(
-    CakeFmhaTensorMap const* Q,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Q,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __half* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -464,9 +471,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_fp16_mtp_n32(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_fp16_mtp_n64(
-    CakeFmhaTensorMap const* Q,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Q,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __half* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -488,9 +495,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_fp16_mtp_n64(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_fp8(
-    CakeFmhaTensorMap const* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Qt,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     uint8_t* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -515,8 +522,8 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_fp8(
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16q(
     uint32_t* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -541,8 +548,8 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16q(
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_fp16q(
     uint32_t* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __half* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -566,9 +573,34 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_fp16q(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd64(
-    CakeFmhaTensorMap const* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Qt,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
+    __nv_bfloat16* O_ptr,
+    int* page_table,
+    int* seq_lens_kv,
+    float* partial_o,
+    float* partial_stats,
+    uint32_t* tile_counters,
+    uint32_t* queue_counters,
+    int max_pages_per_seq,
+    float softmax_scale_log2,
+    int num_q_heads,
+    int num_kv_heads,
+    int group_ratio,
+    int batch_size,
+    int q_len,
+    uint32_t max_items,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
+extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd64_g16(
+    CUtensorMap const& Qt,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -591,9 +623,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd64(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd256_p16(
-    CakeFmhaTensorMap const* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Qt,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -616,9 +648,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd256_p16(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd256_p32(
-    CakeFmhaTensorMap const* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Qt,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -641,9 +673,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd256_p32(
 );
 
 extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd256_p64(
-    CakeFmhaTensorMap const* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Qt,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     int* page_table,
     int* seq_lens_kv,
@@ -665,81 +697,10 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16_hd256_p64(
     cudaStream_t stream
 );
 
-extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16(
-    CakeFmhaTensorMap const* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
-    __nv_bfloat16* O_ptr,
-    float* LSE_ptr,
-    int* page_table,
-    int* causal_seqlens_kv_global,
-    int max_pages_per_seq,
-    int max_local_seq_len,
-    float softmax_scale_log2,
-    int cp_rank,
-    int num_q_heads,
-    int num_kv_heads,
-    int batch_size,
-    unsigned int grid_x,
-    unsigned int grid_y,
-    unsigned int grid_z,
-    cudaStream_t stream
-);
-
-extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_v4(
-    CakeFmhaTensorMap const* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
-    __nv_bfloat16* partial_O_ptr,
-    float* partial_LSE_ptr,
-    __nv_bfloat16* O_ptr,
-    float* LSE_ptr,
-    int* split_completion,
-    int* page_table,
-    int* causal_seqlens_kv_global,
-    int max_pages_per_seq,
-    int max_local_seq_len,
-    float softmax_scale_log2,
-    int cp_rank,
-    int num_q_heads,
-    int num_kv_heads,
-    int batch_size,
-    unsigned int grid_x,
-    unsigned int grid_y,
-    unsigned int grid_z,
-    cudaStream_t stream
-);
-
-extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_fp8(
-    CakeFmhaTensorMap const* Qt,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
-    __nv_bfloat16* partial_O_ptr,
-    float* partial_LSE_ptr,
-    __nv_bfloat16* O_ptr,
-    float* LSE_ptr,
-    int* split_completion,
-    int* page_table,
-    int* seq_lens_kv,
-    int* causal_seqlens_kv_global,
-    int max_pages_per_seq,
-    int max_local_seq_len,
-    float softmax_scale_log2,
-    float output_scale,
-    int cp_rank,
-    int num_q_heads,
-    int num_kv_heads,
-    int batch_size,
-    unsigned int grid_x,
-    unsigned int grid_y,
-    unsigned int grid_z,
-    cudaStream_t stream
-);
-
 extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_balanced(
-    CakeFmhaTensorMap const* Q,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Q,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     float* LSE_ptr,
     int* page_table,
@@ -764,9 +725,9 @@ extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_balanced(
 );
 
 extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_fp8_balanced(
-    CakeFmhaTensorMap const* Q,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Q,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     float* LSE_ptr,
     int* page_table,
@@ -792,9 +753,9 @@ extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_fp8_balanced(
 );
 
 extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_fp8_d256_balanced(
-    CakeFmhaTensorMap const* Q,
-    CakeFmhaTensorMap const* K,
-    CakeFmhaTensorMap const* V,
+    CUtensorMap const& Q,
+    CUtensorMap const& K,
+    CUtensorMap const& V,
     __nv_bfloat16* O_ptr,
     float* LSE_ptr,
     int* page_table,

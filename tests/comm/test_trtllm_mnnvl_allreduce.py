@@ -18,6 +18,7 @@ from flashinfer.norm import rmsnorm
 
 # Test helpers
 from tests.test_helpers.comm import (
+    _get_rank_info_from_env,
     init_torch_distributed_from_mpi,
 )
 from tests.test_helpers.utils_fp4 import (
@@ -37,6 +38,16 @@ def fp8_quant(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 def dequant(x: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return (x.to(torch.float32) * scale).to(dtype)
+
+
+def _set_device_from_launcher_local_rank() -> None:
+    """Select this rank's GPU from the launcher's node-local rank.
+
+    ``rank % device_count`` is wrong when ranks are spread across nodes, and
+    torch's default NCCL backend binds the process group to LOCAL_RANK's GPU.
+    """
+    _, _, local_rank = _get_rank_info_from_env()
+    torch.cuda.set_device(local_rank % torch.cuda.device_count())
 
 
 def _mnnvl_nvfp4_supported_on_all_ranks(device: torch.device) -> bool:
@@ -88,6 +99,7 @@ def row_linear_residual_norm_fusion_forward(
     fusion: bool,
     reference_output: tuple[torch.Tensor, ...],
     workspace: trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace,
+    strategy: trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy = trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
 ):
     tensor_parallel_rank = mapping.tp_rank
     dist.barrier()
@@ -116,7 +128,7 @@ def row_linear_residual_norm_fusion_forward(
                     workspace,
                     eps,
                     launch_with_pdl=use_pdl,
-                    strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
+                    strategy=strategy,
                 )
             )
 
@@ -129,7 +141,7 @@ def row_linear_residual_norm_fusion_forward(
                 input,
                 workspace,
                 launch_with_pdl=use_pdl,
-                strategy=trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
+                strategy=strategy,
             )
             return (output.view(shape),)
 
@@ -333,12 +345,31 @@ def _inject_sentinel_trigger_patterns(x_full: torch.Tensor) -> None:
         view16[: pattern_i16.numel()] = pattern_i16
 
 
+def _inject_large_magnitude(x_full: torch.Tensor, residual: torch.Tensor) -> None:
+    """Place a few activations with |x| > 255.94 in the reduced row.
+
+    sqrt(fp16 max) = 255.94: squaring such a value in fp16 overflows to inf,
+    while the values themselves (and their all-reduce sum) stay far below
+    65504. Residual-stream activations of this size occur in real models
+    (e.g. Qwen3.5-27B fp16 at the final norm). Columns are spread over the
+    row so several threads see one. Column 5 only exceeds the limit after
+    the residual add.
+    """
+    hidden = x_full.shape[-1]
+    for col, value in ((1, 300.0), (hidden // 2, -600.0), (hidden - 3, 1000.0)):
+        x_full[:, :, col] = 0.0
+        x_full[0, :, col] = value
+    x_full[:, :, 5] = 0.0
+    residual[:, 5] = 300.0
+
+
 def prepare_test_data(
     seq_len: int,
     hidden_size: int,
     dtype: torch.dtype,
     fusion: bool,
     inject_sentinel_patterns: bool = False,
+    inject_large_magnitude: bool = False,
 ):
     # Use torch.distributed for communication between ranks
     rank = dist.get_rank()
@@ -350,6 +381,8 @@ def prepare_test_data(
         norm_weight = torch.randn((hidden_size,), dtype=dtype)
         if inject_sentinel_patterns:
             _inject_sentinel_trigger_patterns(x_full)
+        if inject_large_magnitude:
+            _inject_large_magnitude(x_full, residual)
     else:
         x_full = None
         residual = None
@@ -392,6 +425,8 @@ def run_mnnvl_ar_full(
     legacy_api: bool = False,
     inject_sentinel_patterns: bool = False,
     workspace_max_num_tokens: Optional[int] = None,
+    inject_large_magnitude: bool = False,
+    strategy: trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy = trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.AUTO,
 ):
     """Core test logic for MNNVL AllReduce operations.
 
@@ -403,12 +438,16 @@ def run_mnnvl_ar_full(
         hidden_size: Hidden dimension size
         explicit_workspace_bytes: If provided, use this workspace size instead of default
         workspace_max_num_tokens: Workspace capacity override
+        inject_large_magnitude: Salt the reduced row with |x| > 255.94 (fp16 square overflow)
+        strategy: Kernel strategy for the refactored API (AUTO picks by message size)
     """
 
     gpus_per_node = torch.cuda.device_count()
 
     if gpus_per_node == 0:
         pytest.skip("MNNVL allreduce test requires at least one CUDA device per node")
+
+    _set_device_from_launcher_local_rank()
 
     # Initialize torch.distributed (safe to call if already initialized)
     init_torch_distributed_from_mpi()
@@ -426,9 +465,6 @@ def run_mnnvl_ar_full(
         gpus_per_node=gpus_per_node,
         tp_size=world_size,
     )
-
-    # Set CUDA device based on rank
-    torch.cuda.set_device(mapping.local_rank)
 
     # Create TorchDistBackend for workspace creation (non-MPI based)
     comm_backend = TorchDistBackend()
@@ -479,6 +515,7 @@ def run_mnnvl_ar_full(
                 dtype,
                 fusion,
                 inject_sentinel_patterns=inject_sentinel_patterns,
+                inject_large_magnitude=inject_large_magnitude,
             )
             test_data.append(
                 (seq_len, x_local, residual, norm_weight, reference_output)
@@ -517,6 +554,7 @@ def run_mnnvl_ar_full(
                     fusion,
                     reference_output,
                     workspace,
+                    strategy=strategy,
                 )
 
             # Synchronize before next test using torch.distributed barrier
@@ -803,6 +841,7 @@ def test_mnnvl_allreduce_quant_unified(
     if torch.cuda.device_count() == 0:
         pytest.skip("MNNVL quant test requires CUDA")
 
+    _set_device_from_launcher_local_rank()
     init_torch_distributed_from_mpi()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -815,7 +854,6 @@ def test_mnnvl_allreduce_quant_unified(
         gpus_per_node=torch.cuda.device_count(),
         tp_size=world_size,
     )
-    torch.cuda.set_device(mapping.local_rank)
     is_fp4 = pattern in (
         comm.AllReduceFusionPattern.kARResidualRMSNormFP4Quant,
         comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
@@ -928,6 +966,7 @@ def test_mnnvl_nvfp4_rejects_fp32(
     if torch.cuda.device_count() == 0:
         pytest.skip("MNNVL quant test requires CUDA")
 
+    _set_device_from_launcher_local_rank()
     init_torch_distributed_from_mpi()
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -940,7 +979,6 @@ def test_mnnvl_nvfp4_rejects_fp32(
         gpus_per_node=torch.cuda.device_count(),
         tp_size=world_size,
     )
-    torch.cuda.set_device(mapping.local_rank)
     workspace = trtllm_mnnvl_ar.MNNVLAllReduceFusionWorkspace(
         mapping,
         max_num_tokens=4,
@@ -1052,4 +1090,41 @@ def test_mnnvl_allreduce_sentinel_patterns(
         hidden_size,
         legacy_api=False,
         inject_sentinel_patterns=True,
+    )
+
+
+# Regression guard for the fp16 sum-of-squares overflow in the fused RMSNorm:
+# the one-shot kernel used to square in the input dtype, so a single activation
+# with |x| > 255.94 made the row's rsqrt 0 and the whole normalized token 0.
+# randn inputs never reach that range, hence the salted rows. bf16 is the
+# control (its range matches fp32); two-shot already squared in fp32.
+@pytest.mark.parametrize("seq_lens", [[1], [4, 27]])
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.ONESHOT,
+        trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy.TWOSHOT,
+    ],
+    ids=["oneshot", "twoshot"],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("hidden_size", [2880, 5120, 8192])
+def test_mnnvl_allreduce_rmsnorm_large_magnitude(
+    monkeypatch,
+    seq_lens: list[int],
+    strategy: trtllm_mnnvl_ar.MNNVLAllreduceFusionStrategy,
+    dtype: torch.dtype,
+    hidden_size: int,
+):
+    """Regression test: fused allreduce+RMSNorm must not zero a token whose
+    activations exceed sqrt(fp16 max)."""
+    run_mnnvl_ar_full(
+        monkeypatch,
+        seq_lens,
+        True,
+        dtype,
+        hidden_size,
+        legacy_api=False,
+        inject_large_magnitude=True,
+        strategy=strategy,
     )

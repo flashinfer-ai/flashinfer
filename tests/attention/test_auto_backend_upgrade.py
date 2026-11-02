@@ -39,6 +39,61 @@ from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 DTYPE = torch.bfloat16
 
 
+@pytest.mark.parametrize(
+    "order,cudnn_available,work_items,graph,expected,expected_counts",
+    [
+        ("cudnn,cutlass", True, 131073, False, "cudnn", 0),
+        ("cutlass,cudnn", True, 131072, False, "cutlass", 1),
+        ("cutlass,cudnn", True, 131073, False, "cudnn", 1),
+        ("cudnn,cutlass", False, 131072, False, "cutlass", 1),
+        ("cudnn,cutlass", False, 131073, False, None, 1),
+        ("cutlass", False, 1, True, None, 0),
+        ("cutlass,cudnn", True, 1, True, "cudnn", 0),
+        ("cutlass,cutlass", False, 131073, False, None, 1),
+    ],
+)
+def test_lazy_cutlass_work_count_preserves_eligibility(
+    monkeypatch, order, cudnn_available, work_items, graph, expected, expected_counts
+):
+    import flashinfer.prefill as prefill_mod
+
+    monkeypatch.setenv("FLASHINFER_RAGGED_AUTO_BACKEND_ORDER", order)
+    monkeypatch.setattr(prefill_mod, "is_sm100a_supported", lambda _: True)
+    monkeypatch.setattr(
+        prefill_mod, "_cudnn_supports_direct_seqlens", lambda _: cudnn_available
+    )
+    counts = []
+
+    def count_work():
+        counts.append(work_items)
+        return work_items
+
+    options = dict(
+        has_custom_mask=False,
+        window_left=-1,
+        logits_soft_cap=0.0,
+        has_multi_item_scoring=False,
+        has_sinks=False,
+        cudnn_indptr_is_int32=True,
+        cuda_graph_enabled=graph,
+        cutlass_indptr_is_int32=True,
+    )
+    args = (torch.device("cuda"), "NHD", 128, 128, DTYPE, DTYPE, DTYPE, 0)
+    assert (
+        prefill_mod._blackwell_ragged_auto_upgrade(
+            *args, cutlass_work_items=work_items, **options
+        )
+        == expected
+    )
+    assert (
+        prefill_mod._blackwell_ragged_auto_upgrade(
+            *args, cutlass_work_items=count_work, **options
+        )
+        == expected
+    )
+    assert len(counts) == expected_counts
+
+
 def _cutlass_upgrade_arch() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -900,16 +955,24 @@ def _plan_single_token(backend, qo_indptr, kv_indptr, h_qo, h_kv, d):
     return wrapper
 
 
+def _single_token_rows_with_empty(h_qo, h_kv, d, batch=8, seed=99):
+    """Like _single_token_rows, but the third request has no query tokens."""
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d, batch, seed)
+    qo_indptr = qo_indptr.clone()
+    qo_indptr[3:] -= 1  # request 2 contributes zero tokens
+    return q[: batch - 1], k, v, qo_indptr, kv_indptr
+
+
 @requires_cudnn_upgrade
-def test_auto_declines_single_token_gqa_rows():
-    """cuDNN's s_q == 1 kernel packs a kv group's q heads and writes the LSE only
-    for the first of them (cuDNN 9.26/9.27), so `auto` keeps single-token GQA
-    steps off cuDNN; the results, LSE included, match fa2. MHA single-token rows
-    are unaffected and may still take cuDNN."""
+def test_auto_takes_cudnn_for_single_token_gqa_rows():
+    """cuDNN < 9.27 mis-stores a ragged Stats tensor for s_q == 1 GQA (NVBug
+    6783545), but the plan serves the packed LSE through the unragged
+    (b, h, 1, 1) declaration when every request has exactly one token, so
+    `auto` keeps cuDNN for these rows and the LSE matches fa2. MHA likewise."""
     h_qo, h_kv, d = 32, 8, 128
     q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
     w = _plan_single_token("auto", qo_indptr, kv_indptr, h_qo, h_kv, d)
-    assert w._backend != "cudnn"
+    assert w._backend == "cudnn"
     out, lse = w.run(q, k, v, return_lse=True)
     wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
     out_fa2, lse_fa2 = wf.run(q, k, v, return_lse=True)
@@ -925,27 +988,39 @@ def test_auto_declines_single_token_gqa_rows():
 
 
 @requires_cudnn_upgrade
-def test_explicit_cudnn_refuses_single_token_gqa_lse():
+def test_single_token_gqa_with_empty_rows_stays_off_cudnn_lse():
+    """The one single-token GQA shape cuDNN < 9.27 cannot serve with an LSE is
+    a batch mixing zero-length and one-token requests (the unragged (b, h, 1, 1)
+    Stats form is no longer the packed layout). `auto` keeps those steps off
+    cuDNN, and explicit cudnn refuses the LSE while still serving the output."""
+    from flashinfer.cudnn.prefill import _cudnn_single_token_gqa_ragged_stats_broken
+
+    if not _cudnn_single_token_gqa_ragged_stats_broken():
+        pytest.skip("cuDNN >= 9.27 stores the ragged Stats correctly")
     h_qo, h_kv, d = 32, 8, 128
-    q, k, v, qo_indptr, kv_indptr = _single_token_rows(h_qo, h_kv, d)
+    q, k, v, qo_indptr, kv_indptr = _single_token_rows_with_empty(h_qo, h_kv, d)
+    w = _plan_single_token("auto", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    assert w._backend != "cudnn"
+    out, lse = w.run(q, k, v, return_lse=True)
+    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
+    out_fa2, lse_fa2 = wf.run(q, k, v, return_lse=True)
+    _assert_close_to_fa2(out, lse, out_fa2, lse_fa2, "auto on single-token GQA + empty")
     w = _plan_single_token("cudnn", qo_indptr, kv_indptr, h_qo, h_kv, d)
-    with pytest.raises(NotImplementedError, match="single-token"):
+    with pytest.raises(NotImplementedError, match="zero-length"):
         w.run(q, k, v, return_lse=True)
     # the output itself is correct, so the no-LSE call is allowed
     out = w.run(q, k, v)
-    wf = _plan_single_token("fa2", qo_indptr, kv_indptr, h_qo, h_kv, d)
     out_fa2 = wf.run(q, k, v)
     torch.testing.assert_close(out.float(), out_fa2.float(), atol=2e-2, rtol=2e-2)
 
 
 @requires_cudnn_upgrade
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,  # a build/execute failure is not the known LSE bug
-    reason="cuDNN s_q==1 GQA kernel writes the ragged Stats only for the first head "
-    "of each kv group (cuDNN 9.26/9.27, NVBug 6783545); drop the guards above when this passes",
-)
 def test_cudnn_single_token_gqa_lse_is_correct():
+    """The low-level packed LSE is correct for single-token GQA rows on every
+    supported cuDNN: below 9.27 the ragged Stats store is broken for this
+    kernel (NVBug 6783545), so the packed buffer is bound as the unragged
+    (b, h, 1, 1) Stats form instead (byte-identical when every request has
+    one token); 9.27+ stores the ragged form correctly."""
     from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 
     h_qo, h_kv, d = 32, 8, 128
@@ -973,3 +1048,16 @@ def test_cudnn_single_token_gqa_lse_is_correct():
     _, lse_fa2 = wf.run(q, k, v, return_lse=True)
     assert torch.isfinite(lse).all()
     torch.testing.assert_close(lse, lse_fa2, atol=1e-2, rtol=1e-2)
+
+
+@requires_cudnn_upgrade
+def test_cudnn_auto_plan_does_not_count_cutlass_work(monkeypatch):
+    import flashinfer.prefill as prefill_mod
+
+    monkeypatch.setenv("FLASHINFER_RAGGED_AUTO_BACKEND_ORDER", "cudnn,cutlass")
+
+    def unexpected_count(*args):
+        raise AssertionError("cuDNN auto plan counted CUTLASS work")
+
+    monkeypatch.setattr(prefill_mod, "_cutlass_plan_work_items", unexpected_count)
+    assert _plan_only("auto", 2, 32, 128, 8, 8, 128, 128) == "cudnn"

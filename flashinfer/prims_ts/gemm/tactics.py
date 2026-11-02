@@ -156,8 +156,15 @@ def tactic_is_legal(
         return False
     if overlap and not (
         operand_format == "nvfp4_e2m1"
-        and output_format == "bf16"
-        and epilogue == "linear"
+        and (
+            (epilogue == "linear" and output_format == "bf16")
+            or (epilogue == "swiglu" and output_format in ("bf16", "nvfp4_e2m1"))
+            or (
+                epilogue == "qkv_qknorm_rope"
+                and output_format == "bf16"
+                and mma_k == 64
+            )
+        )
         and tile_n == 256
         and tile_k == 256
         and warps == 8
@@ -298,7 +305,9 @@ def _neighbors(
     for warps in _warps():
         if warps != base[8]:
             yield _replace(base, warps=warps, overlap=False)
-    if epilogue == "linear":
+    if epilogue in ("linear", "swiglu") or (
+        epilogue == "qkv_qknorm_rope" and base[6] == 64
+    ):
         yield _replace(
             base, overlap=True, warps=8, tile_n=256, tile_k=base[3], use_tma_store=False
         )

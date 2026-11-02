@@ -1021,8 +1021,8 @@ def run_fused_kda_decode_multitoken(
         raise ValueError("x must have a contiguous channel dimension of 3 * H * 128")
     num_heads = x.shape[1] // (3 * _D)
     hidden_size = num_heads * _D
-    if num_heads not in (12, 24, 32, 48, 96):
-        raise ValueError("H must be one of 12, 24, 32, 48, or 96")
+    if num_heads not in (12, 16, 24, 32, 48, 64, 96):
+        raise ValueError("H must be one of 12, 16, 24, 32, 48, 64, or 96")
     if weight.shape != (3, _W, hidden_size) or not weight.is_contiguous():
         raise ValueError("weight must be contiguous with shape [3, 4, H * 128]")
     if (

@@ -60,20 +60,22 @@ batched_gemm/
 | Scheduling         | Static HW grid; dynamic persistent CLC scheduling                         |
 | Clustering         | `cluster_m` = 1 or 2 (multi-CTA barrier routing)                          |
 | Scale-factor paths | TMA route, LDGSTS gather, TMA.GATHER4, compact STTM, fused UTCCP          |
-| Activation         | fused gated activation (SwiGLU, GeGLU, SILU, ReLU²) or none               |
+| Activation         | fused gated (SwiGLU, GeGLU, SiTU), elementwise (SiLU, ReLU²), or none      |
 | Epilogue           | per-channel bias, clamp, fused quantization                               |
 | Partial tiles      | TMA-OOB optimization with `mn_limit` predication                          |
 | Perf features      | programmatic dependent launch (PDL)                                       |
 
 The table above describes the standalone batched GEMM kernel. The Python MoE
 backend in `flashinfer/fused_moe/backends/prims_ts` maps a smaller curated set of
-FC1/FC2 configurations from `flashinfer/prims_ts/moe/prims_ts_moe_configs.json`
-and reuses the TRT-LLM routing/finalize code.
+FC1/FC2 configurations from architecture-specific package resources:
+`flashinfer/prims_ts/moe/prims_ts_moe_configs.json` for SM100/SM103 and
+`prims_ts_moe_configs_sm107.json` for SM107. It reuses the TRT-LLM
+routing/finalize code.
 
 ## MoE Integration Parity Gaps
 
 PrimsTS MoE is intended to track the TRT-LLM Gen MoE backend, but it is not at
-feature parity yet. The current integration is limited to SM100/SM103, shuffled
+feature parity yet. The current integration is limited to SM100/SM103/SM107, shuffled
 `WeightLayout.MajorK` or `WeightLayout.BlockMajorK` weights, and the following
 dtype families:
 

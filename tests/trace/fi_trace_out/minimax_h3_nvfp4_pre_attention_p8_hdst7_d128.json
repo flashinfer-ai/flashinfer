@@ -1,12 +1,13 @@
 {
   "name": "minimax_h3_nvfp4_pre_attention_p8_hdst7_d128",
-  "description": "BF16 RMSNorm and indexed AdaLN with dynamic NVFP4 activation quantization, prepacked NVFP4 (W4A4) QKV GEMM, Q/K RMSNorm and split-half NeoX RoPE, followed by destination-major E2M1 and swizzled E4M3 block-16 packing.",
+  "description": "BF16 RMSNorm and indexed AdaLN with dynamic NVFP4 activation quantization, prepacked NVFP4 (W4A4) QKV GEMM, Q/K RMSNorm and split-half NeoX RoPE, followed by the destination-major output: E2M1 nibble pairs with swizzled E4M3 block-16 scales (out_format nvfp4) or float8_e4m3fn under one per-tensor scale per kind (out_format e4m3).",
   "op_type": "minimax_h3_nvfp4_pre_attention",
   "tags": [
     "fi_api:flashinfer.cake_minimax_h3.MiniMaxH3Nvfp4PreAttention.run",
     "stage:pre_attention",
     "status:verified",
-    "dtype:nvfp4"
+    "dtype:nvfp4",
+    "dtype:e4m3"
   ],
   "axes": {
     "M": {
@@ -56,9 +57,8 @@
       "value": 128
     },
     "packed_head_dim": {
-      "type": "const",
-      "value": 64,
-      "description": "E2M1 nibble-pair bytes per head row."
+      "type": "var",
+      "description": "Bytes per packed head row: 64 (nvfp4 E2M1 nibble pairs) or 128 (e4m3)."
     },
     "weight_scale_elements": {
       "type": "var"
@@ -157,7 +157,16 @@
         "1"
       ],
       "dtype": "float32",
-      "description": "Float32 NVFP4 global encode scale shared by Q/K/V outputs."
+      "optional": true,
+      "description": "Float32 NVFP4 global encode scale shared by Q/K/V outputs (out_format nvfp4); absent for e4m3."
+    },
+    "qkv_scales": {
+      "shape": [
+        "qkv_kinds"
+      ],
+      "dtype": "float32",
+      "optional": true,
+      "description": "Float32 per-tensor scales of Q, K and V for out_format e4m3 (out_q = e4m3(value / qkv_scales[kind])); absent for nvfp4."
     },
     "out_q": {
       "shape": [
@@ -168,7 +177,7 @@
         "packed_head_dim"
       ],
       "dtype": "uint8",
-      "description": "Caller-owned destination-major E2M1 nibble-pair output."
+      "description": "Caller-owned destination-major output: uint8 E2M1 nibble pairs (nvfp4) or float8_e4m3fn (e4m3)."
     },
     "out_sf": {
       "shape": [
@@ -176,7 +185,8 @@
         "output_scale_stride"
       ],
       "dtype": "uint8",
-      "description": "Caller-owned destination-major swizzled-128x4 E4M3 scale output."
+      "optional": true,
+      "description": "Caller-owned destination-major swizzled-128x4 E4M3 scale output (out_format nvfp4); absent for e4m3."
     },
     "debug_q_bf16": {
       "shape": [
@@ -224,6 +234,7 @@
         "output_scale_stride"
       ],
       "dtype": "uint8",
+      "optional": true,
       "param": "out_sf"
     }
   },

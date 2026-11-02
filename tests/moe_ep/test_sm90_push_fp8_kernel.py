@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from ._sm90_push_fp8_reference import dequant_weight_128x128, reference_moe
+from flashinfer.testing import is_compute_sanitizer_active
 
 pytestmark = pytest.mark.usefixtures("isolated_deep_gemm_cache")
 
@@ -735,6 +736,11 @@ def test_ep1_soak() -> None:
             pending.clear()
 
 
+@pytest.mark.skipif(
+    is_compute_sanitizer_active(),
+    reason="the test makes a kernel execute its `trap;` guard on purpose, "
+    "which compute-sanitizer reports as errors",
+)
 @requires_sm90
 def test_ep1_pool_overflow_traps() -> None:
     code = r"""
@@ -768,6 +774,11 @@ print("UNEXPECTED-SURVIVAL")
     _assert_device_trap(result, "sm90_push: pool overflow")
 
 
+@pytest.mark.skipif(
+    is_compute_sanitizer_active(),
+    reason="the test makes a kernel execute its `trap;` guard on purpose, "
+    "which compute-sanitizer reports as errors",
+)
 @requires_sm90
 def test_ep1_wait_prefix_capacity_corruption_traps() -> None:
     code = r"""
@@ -801,6 +812,11 @@ print("UNEXPECTED-SURVIVAL")
     _assert_device_trap(result, "sm90_push: accumulated row count")
 
 
+@pytest.mark.skipif(
+    is_compute_sanitizer_active(),
+    reason="the test makes a kernel execute its `trap;` guard on purpose, "
+    "which compute-sanitizer reports as errors",
+)
 @requires_sm90
 @pytest.mark.parametrize(
     "case,marker",

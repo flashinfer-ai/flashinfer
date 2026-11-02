@@ -356,10 +356,10 @@ def test_dsv41_writer_rejects_unpacked_footer(append, issue, sm12x):
     with pytest.raises(RuntimeError, match="packed|payload"):
         if append:
             module.sparse_mla_sm120_dsv41_fp4_quantize_append(
-                latent, torch.arange(6, device="cuda", dtype=torch.int32), cache
+                latent, torch.arange(6, device="cuda", dtype=torch.int32), cache, False
             )
         else:
-            module.sparse_mla_sm120_dsv41_fp4_quantize_pack(latent, cache)
+            module.sparse_mla_sm120_dsv41_fp4_quantize_pack(latent, cache, False)
     assert torch.all(storage == 91)
 
 
@@ -371,20 +371,22 @@ def test_dsv41_writer_pitched_footer_pack_append_graph(sm12x):
             torch.randn(2 * page_size, 512, device="cuda", dtype=torch.bfloat16) * 0.1
         )
         expected = torch.empty(2, page_size, 288, device="cuda", dtype=torch.uint8)
-        module.sparse_mla_sm120_dsv41_fp4_quantize_pack(latent, expected)
+        module.sparse_mla_sm120_dsv41_fp4_quantize_pack(latent, expected, False)
         backing = torch.full(
             (2, page_size * 288 + 16), 91, device="cuda", dtype=torch.uint8
         )
         cache = backing[:, : page_size * 288].view(2, page_size, 1, 288)
         slots = torch.arange(2 * page_size, device="cuda", dtype=torch.int32)
-        module.sparse_mla_sm120_dsv41_fp4_quantize_pack(latent, cache)
+        module.sparse_mla_sm120_dsv41_fp4_quantize_pack(latent, cache, False)
         assert torch.equal(cache.squeeze(2), expected)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            module.sparse_mla_sm120_dsv41_fp4_quantize_append(latent, slots, cache)
+            module.sparse_mla_sm120_dsv41_fp4_quantize_append(
+                latent, slots, cache, False
+            )
         latent.mul_(0.5)
         graph.replay()
-        module.sparse_mla_sm120_dsv41_fp4_quantize_pack(latent, expected)
+        module.sparse_mla_sm120_dsv41_fp4_quantize_pack(latent, expected, False)
         assert torch.equal(cache.squeeze(2), expected)
         assert torch.all(backing[:, page_size * 288 :] == 91)
 
@@ -619,10 +621,10 @@ def test_dsv41_fp8_writer_rejects_unpacked_footer(append, issue, sm12x):
     with pytest.raises(RuntimeError, match="packed|payload"):
         if append:
             module.sparse_mla_sm120_dsv41_fp8_quantize_append(
-                latent, torch.arange(6, device="cuda", dtype=torch.int32), cache
+                latent, torch.arange(6, device="cuda", dtype=torch.int32), cache, False
             )
         else:
-            module.sparse_mla_sm120_dsv41_fp8_quantize_pack(latent, cache)
+            module.sparse_mla_sm120_dsv41_fp8_quantize_pack(latent, cache, False)
     assert torch.all(storage == 91)
 
 
@@ -683,7 +685,7 @@ def test_dsv41_fp8_writer_pitched_footer_pack_append_graph(sm12x):
         cache = backing[:, : page_size * _FP8_BPT].view(2, page_size, 1, _FP8_BPT)
         slots = torch.arange(2 * page_size, device="cuda", dtype=torch.int32)
         _get_sparse_mla_sm120_decode_module().sparse_mla_sm120_dsv41_fp8_quantize_pack(
-            latent, cache
+            latent, cache, False
         )
         assert torch.equal(cache.squeeze(2), expected)
         graph = torch.cuda.CUDAGraph()

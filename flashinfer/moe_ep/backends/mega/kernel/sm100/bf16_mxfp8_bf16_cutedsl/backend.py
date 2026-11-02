@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ......config import BootstrapConfig, FleetParams
+from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import bf16_mxfp8_cutedsl_runtime_requirements
@@ -50,6 +50,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     def __init__(self, config: Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
         super().__init__(config)
         self._kernel_config = config
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._autotune_pending = config.knobs == "auto"
 
     def runtime_requirements(self, bootstrap: BootstrapConfig) -> frozenset[str]:
@@ -101,13 +102,32 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             num_experts=fleet_params.num_experts,
         )
 
+    supports_live_token_tuning = True
+    _knob_cache_module = (
+        "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.knob_cache"
+    )
+
+    def _tuning_key(self, fleet_params: FleetParams) -> dict[str, Any]:
+        k = self._kernel_config
+        return dict(
+            dtype=k.kind,
+            world_size=self.ep_world_size,
+            hidden=fleet_params.token_hidden_size,
+            intermediate=k.intermediate_size,
+            num_experts=fleet_params.num_experts,
+            topk=k.top_k,
+            max_tokens=fleet_params.max_tokens_per_rank,
+            enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+        )
+
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
         from ......kernel_src.sm100.cutedsl_megamoe import (
             get_symm_buffer_for_bf16_mxfp8_mega_moe,
         )
 
         config = self._kernel_config
-        return get_symm_buffer_for_bf16_mxfp8_mega_moe(
+        workspace = get_symm_buffer_for_bf16_mxfp8_mega_moe(
             fleet_params.num_experts,
             fleet_params.max_tokens_per_rank,
             config.top_k,
@@ -118,8 +138,21 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             kind=config.kind,
             gate_up_clamp=_clamp(config),
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
-            knobs=config.knobs if isinstance(config.knobs, dict) else None,
+            use_persistent_finalize_kernel=config.resolved_finalize_mode
+            is FinalizeMode.PERSISTENT,
+            use_custom_finalize=config.finalize_mode is FinalizeMode.NONE,
+            num_valid_tokens_tensor=config.num_valid_tokens_tensor,
+            knobs=self._workspace_knobs(fleet_params),
         )
+        if config.finalize_mode is FinalizeMode.NONE:
+            workspace._unfinalized_route_map = torch.arange(
+                fleet_params.max_tokens_per_rank * config.top_k,
+                dtype=torch.int32,
+                device=workspace.topk_idx.device,
+            ).view(fleet_params.max_tokens_per_rank, config.top_k)
+            # The kernel folds routing weights into FC1.
+            workspace._unfinalized_weights = torch.ones_like(workspace.topk_weights)
+        return workspace
 
     def validate_forward(
         self,
@@ -167,6 +200,8 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             staged_tokens,
         )
 
+        if self.supports_unfinalized_output:
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         if output is not None:
             num_tokens = output.shape[0]
         else:
@@ -184,7 +219,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             num_tokens = staged
 
         if self._autotune_pending:
-            autotune_bf16_mxfp8_mega_moe(
+            self._autotune_winner = autotune_bf16_mxfp8_mega_moe(
                 output,
                 transformed_weights[0],
                 transformed_weights[1],
@@ -204,12 +239,51 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         )
         return output if output is not None else view
 
+    def compute_unfinalized(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            MegaMoEBf16Mxfp8Inputs,
+            staged_tokens,
+        )
+
+        if not self.supports_unfinalized_output:
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
+        num_tokens = staged_tokens(workspace.topk_idx)
+        if num_tokens is None:
+            raise ValueError("compute_unfinalized() requires stage_inputs() first")
+        # Launch the full padded buffer even when this rank has no live tokens.
+        workspace._frontend.run(
+            MegaMoEBf16Mxfp8Inputs(
+                workspace.x,
+                workspace.topk_idx,
+                workspace.topk_weights,
+                transformed_weights[0][0],
+                transformed_weights[0][1],
+                transformed_weights[1][0],
+                transformed_weights[1][1],
+                workspace.output_activation,
+                workspace.num_valid_tokens,
+            ),
+            num_tokens=None,
+        )
+        partials, _root, _region = workspace._frontend.custom_finalize_workspace()
+        return (
+            partials[:num_tokens].view(
+                num_tokens * self._kernel_config.top_k, workspace.hidden
+            ),
+            workspace._unfinalized_weights[:num_tokens],
+            workspace._unfinalized_route_map[:num_tokens],
+        )
+
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         config = self._kernel_config
         if config.knobs == "auto":
             return None
 
-        from ......core.kernel.workspace_pool import knobs_pool_key
+        from ......core.kernel.workspace_pool import epilogue_pool_key, knobs_pool_key
 
         return (
             "sm100_bf16_mxfp8_bf16_cutedsl",
@@ -225,7 +299,9 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             config.kind,
             _clamp(config),
             config.enable_in_kernel_fc2_reduce,
-            knobs_pool_key(config.knobs),
+            config.resolved_finalize_mode,
+            epilogue_pool_key(config.num_valid_tokens_tensor),
+            knobs_pool_key(self._workspace_knobs(fleet_params)),
         )
 
     def _forget_workspace_state(self, workspace) -> None:

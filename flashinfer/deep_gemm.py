@@ -805,9 +805,6 @@ pytypes_to_ctypes = {
 }
 
 
-RUNTIME_CACHE = {}
-
-
 class SM100FP8GemmRuntime:
     def __init__(self, path: str, symbol: str) -> None:
         self.path = path
@@ -948,17 +945,27 @@ static void __instantiate_kernel() {{
         return cbd.cuLaunchKernelEx(config, kernel, (arg_values, arg_types), 0)
 
 
+RUNTIME_CACHE: Dict[str, SM100FP8GemmRuntime] = {}
+
+
+def _load_runtime(cubin_name: str) -> SM100FP8GemmRuntime:
+    # RUNTIME_CACHE is keyed by the KERNEL_MAP name (no ".cubin" suffix), so a
+    # cubin is fetched and its module loaded once per process.
+    if cubin_name in RUNTIME_CACHE:
+        return RUNTIME_CACHE[cubin_name]
+    symbol, sha256 = KERNEL_MAP[cubin_name]
+    file_name = cubin_name + ".cubin"
+    artifact_path = get_deepgemm_artifact_path()
+    get_artifact(artifact_path + "/" + file_name, sha256)
+    path = FLASHINFER_CUBIN_DIR / artifact_path / file_name
+    assert path.exists()
+    RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
+    return RUNTIME_CACHE[cubin_name]
+
+
 def load_all():
     for cubin_name in KERNEL_MAP:
-        if cubin_name in RUNTIME_CACHE:
-            continue
-        symbol, sha256 = KERNEL_MAP[cubin_name]
-        cubin_name = cubin_name + ".cubin"
-        artifact_path = get_deepgemm_artifact_path()
-        get_artifact(artifact_path + "/" + cubin_name, sha256)
-        path = FLASHINFER_CUBIN_DIR / artifact_path / cubin_name
-        assert path.exists()
-        RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
+        _load_runtime(cubin_name)
 
 
 def load(name: str, code: str) -> SM100FP8GemmRuntime:
@@ -966,16 +973,7 @@ def load(name: str, code: str) -> SM100FP8GemmRuntime:
     cubin_name = f"kernel.{name}.{hash_to_hex(signature)}"
     if cubin_name not in KERNEL_MAP:
         raise ValueError(f"cubin not registered: {cubin_name}")
-    if cubin_name in RUNTIME_CACHE:
-        return RUNTIME_CACHE[cubin_name]
-    symbol, sha256 = KERNEL_MAP[cubin_name]
-    cubin_name = cubin_name + ".cubin"
-    artifact_path = get_deepgemm_artifact_path()
-    get_artifact(artifact_path + "/" + cubin_name, sha256)
-    path = FLASHINFER_CUBIN_DIR / artifact_path / cubin_name
-    assert path.exists()
-    RUNTIME_CACHE[cubin_name] = SM100FP8GemmRuntime(str(path), symbol)
-    return RUNTIME_CACHE[cubin_name]
+    return _load_runtime(cubin_name)
 
 
 def m_grouped_fp8_gemm_nt_contiguous_static_kwargs_gen(

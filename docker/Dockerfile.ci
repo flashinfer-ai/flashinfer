@@ -61,6 +61,18 @@ RUN apt-get update && apt-get install -y \
 
 RUN pip3 install pre-commit
 
+# sccache for the JIT/AOT compiles; a devcontainer activates it by exporting
+# FLASHINFER_{CXX,NVCC}_LAUNCHER. Sourcing the CI helper keeps the pinned
+# version shared with the jit-cache wheel builds.
+COPY scripts/jit_cache_build_common.sh /install/jit_cache_build_common.sh
+RUN bash -c 'source /install/jit_cache_build_common.sh \
+    && install_sccache "${SCCACHE_VERSION}" "$(uname -m)"'
+
+# Docker creates missing mount parents as root, so a volume on
+# ~/.cache/sccache would leave ~/.cache unwritable and break the JIT cache.
+RUN mkdir -p "/home/${USERNAME}/.cache/sccache" \
+    && chown -R "${USER_UID}:${USER_GID}" "/home/${USERNAME}/.cache"
+
 USER ${USERNAME}
 WORKDIR /home/${USERNAME}
 ENV PYTHONUSERBASE="/home/${USERNAME}/.local"

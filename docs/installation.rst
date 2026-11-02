@@ -6,7 +6,7 @@ Installation
 Python Package
 --------------
 FlashInfer is available as a Python package, built on top of `PyTorch <https://pytorch.org/>`_ to
-easily integrate with your python applications.
+easily integrate with your Python applications.
 
 Prerequisites
 ^^^^^^^^^^^^^

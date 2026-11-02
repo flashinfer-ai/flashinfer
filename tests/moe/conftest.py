@@ -49,3 +49,32 @@ def _disable_prims_ts_exhaustive_checker_in_moe_integration_tests(monkeypatch):
 def moe_gemm_backend():
     """Use TRT-LLM unless a focused test explicitly requests both backends."""
     return MoeGemmBackend.TRTLLM
+
+
+@pytest.fixture
+def frost_metadata_only(monkeypatch):
+    """Isolate logical catalog tests from CUDA binding and device cache state."""
+    from flashinfer.fused_moe.backends.cudnn_frost import device, runtime
+    from flashinfer.fused_moe.backends.cudnn_frost.bf16 import fc2
+    from flashinfer.fused_moe.backends.cudnn_frost.bf16 import runtime as bf16
+    from flashinfer.fused_moe.backends.cudnn_frost.mxfp8 import runtime as mxfp8
+    from flashinfer.fused_moe.backends.cudnn_frost.mxfp8_mxfp4 import runtime as mixed
+    from flashinfer.fused_moe.backends.cudnn_frost.nvfp4 import runtime as nvfp4
+
+    runtimes = (bf16, mxfp8, mixed, nvfp4)
+    device_facts = device.device_facts
+    device_facts.cache_clear()
+    for module in runtimes:
+        module.clear_artifact_cache()
+    # BF16 imports the binding function directly; block-scaled runtimes use
+    # the shared module. Neither route should specialize a logical test pool.
+    for module in (runtime, bf16, fc2):
+        monkeypatch.setattr(module, "discovery_binding", lambda kernel: kernel)
+    facts = device.DeviceFacts("sm_107a", 334848, 117440512, (84,) * 16)
+    monkeypatch.setattr(device, "device_facts", lambda _: facts)
+    try:
+        yield
+    finally:
+        for module in runtimes:
+            module.clear_artifact_cache()
+        device_facts.cache_clear()

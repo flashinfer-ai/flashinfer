@@ -705,7 +705,8 @@ class TestBgmvMoeStreams:
         side.synchronize()
         torch.testing.assert_close(on_side, eager, atol=1e-3, rtol=1e-2)
 
-        # Pointer tables are host-side work and live outside the capture; the
+        # The pointer tables live outside the capture, but `fill_w_ptr` writes
+        # them with small device kernels on the current (default) stream. The
         # zero-fills and the two kernels are what a prepared pipeline records.
         device = data["x"].device
         w_ptr_a = torch.zeros(1, num_experts, dtype=torch.int64, device=device)
@@ -744,6 +745,10 @@ class TestBgmvMoeStreams:
             )
 
         graph = torch.cuda.CUDAGraph()
+        # `side` is a non-blocking stream: order it behind the pointer-table
+        # writes issued on the default stream above, or the warm-up shrink
+        # kernel can read a not-yet-written (zero) weight pointer and fault.
+        side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             pipeline()  # warm the JIT module outside capture
             side.synchronize()

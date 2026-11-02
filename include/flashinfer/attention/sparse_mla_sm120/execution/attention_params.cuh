@@ -95,6 +95,8 @@ struct AttentionParams {
   int page_size;
   bool extra_fp4;
   float lse_scale = 1.f;
+  size_t row_stride_bytes = 0;        // Inline-scale main row pitch; footer rows are packed.
+  size_t extra_row_stride_bytes = 0;  // Inline-scale extra row pitch.
 };
 
 }  // namespace flashinfer::sparse_mla_sm120::execution

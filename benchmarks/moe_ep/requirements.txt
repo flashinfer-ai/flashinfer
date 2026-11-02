@@ -1,0 +1,7 @@
+# Optional packages of the MoE expert-parallel benchmarks (bench_moe_ep.py,
+# bench_moe_ep_comm.py); each benchmark runs without them and warns.
+#
+# CUPTI kernel-span timing; without it, times fall back to CUDA events.
+cupti-python>=13.4
+# Demangles the C++ kernel names that --kernel_breakdown reports.
+cxxfilt

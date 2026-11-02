@@ -81,6 +81,21 @@ def test_every_token_count_selects_an_exported_template():
                 )
                 assert workers >= 1 and launch_ctas >= 1
                 assert (not deterministic) or template["num_split_k"] == 1
+                if deterministic and M <= 16:
+                    # The deterministic route of at most 16 tokens runs the paired-CTA 32-token block (one tile of
+                    # 3 x 2 CTAs, worker stride 1; a template outside DeepGEMM's own selector).
+                    assert (
+                        template["block_tokens"],
+                        template["num_mma_ctas"],
+                        launch_ctas,
+                        workers,
+                    ) == (32, 2, 6, 1)
+                if deterministic and M == 33:
+                    # The held-out 33-token deterministic count keeps the single-CTA 16-token block.
+                    assert (template["block_tokens"], template["num_mma_ctas"]) == (
+                        16,
+                        1,
+                    )
     for M, deterministic, physical in EXPORTED_ROWS:
         unmapped = deterministic or not physical
         index_100, _, _ = _runtime.select_template(

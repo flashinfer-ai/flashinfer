@@ -58,6 +58,15 @@ struct CeResources {
   cudaEvent_t flag_done;
   cudaEvent_t add_done[kCeMaxPieces];
   cudaEvent_t copied[2 * (kMaxWorldSize - 1) * kCeMaxPieces];
+
+  // The pipelined ring's own landing slots and flags (see
+  // ce_ring_all_reduce_piped), carved from the SM120 region after binary_flags.
+  // Null where that region is absent. Bit h of slow_hops marks the hop from
+  // rank h to rank h+1 as crossing the CPU interconnect.
+  char* piped_scratch[kMaxWorldSize];
+  int32_t* piped_flags[kMaxWorldSize];
+  size_t piped_slot_bytes;
+  uint32_t slow_hops;
 };
 
 // Announce to one peer that this rank's copy into its slot has landed.
@@ -103,6 +112,16 @@ __global__ void ce_add_kernel(uint4* out, const uint4* a, const uint4* b, int64_
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < num_packs;
        i += stride) {
     out[i] = packed_add_u4<T>(a[i], b[i]);
+  }
+}
+
+// out = a over whole 16-byte packs: the pipelined ring's all-gather landing
+// copy, on the SMs so it never queues behind the ring's peer copies.
+__global__ void ce_copy_kernel(uint4* out, const uint4* a, int64_t num_packs) {
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < num_packs;
+       i += stride) {
+    out[i] = a[i];
   }
 }
 
@@ -278,6 +297,219 @@ cudaError_t ce_ring_all_reduce_flat(const T* input, T* output, int64_t numel,
   const int hs = ce_handshake_slot(world_size);
   ce_publish_flag_kernel<<<1, 1, 0, stream>>>(flag_at(prev, hs), views.ce_send_counters + hs);
   ce_wait_flag_kernel<<<1, 1, 0, stream>>>(flag_at(rank, hs), views.ce_wait_counters + hs);
+  return cudaGetLastError();
+}
+
+// Landing slot of the pipelined ring: no chunk exceeds twice the even share
+// (ce_piped_geometry caps the weights to keep it so), plus one pack of rounding.
+inline size_t ce_piped_slot_bytes(size_t max_payload_bytes, int world_size) {
+  return (2 * max_payload_bytes / static_cast<size_t>(world_size) + 16u + 127u) &
+         ~static_cast<size_t>(127u);
+}
+
+// The pipelined ring's per-rank region: one flag per step and piece, then one
+// landing slot per step. Disjoint from everything the other schedules touch.
+inline size_t ce_piped_flag_bytes(int world_size) {
+  return static_cast<size_t>(2 * (world_size - 1) * kCeMaxPieces) * 128u;
+}
+inline size_t ce_piped_region_bytes(size_t max_payload_bytes, int world_size) {
+  return ce_piped_flag_bytes(world_size) + static_cast<size_t>(2 * (world_size - 1)) *
+                                               ce_piped_slot_bytes(max_payload_bytes, world_size);
+}
+
+// Chunk c of the pipelined ring covers packs [start[c], start[c+1]) and is sent
+// as `pieces[c]` sub-chunks.
+struct CePipedGeometry {
+  int64_t start[kMaxWorldSize + 1];
+  int pieces[kMaxWorldSize];
+};
+
+// Where the payload goes on the ring 0 -> 1 -> ... -> N-1 -> 0.
+//
+// Every hop carries all chunks but one in each phase: hop h -> h+1 skips chunk
+// h+1 in the reduce-scatter (it starts at h+1) and chunk h+2 in the all-gather
+// (it ends at h+1). On an even split each hop moves 2(N-1)/N of the payload, so
+// a hop that crosses the CPU interconnect -- slower than the switch-local and
+// root-complex hops around it -- paces the whole ring. Making the chunks the
+// slow hops skip larger takes bytes off those hops and puts them on the others:
+// with two such hops at N = 8, chunks four times the rest move 1.6 of the
+// payload over each instead of 1.75.
+//
+// A big chunk then travels the ring as `depth` pieces, so it streams through
+// the fast hops instead of holding each one for its whole length; the other
+// chunks go as one piece, since a piece costs a flag round trip and a copy
+// launch whatever its size. With no slow hop -- or with every chunk skipped by
+// one -- there is nothing to shift and every chunk is an even share in `depth`
+// pieces.
+//
+// Pure function of its arguments: every rank must derive the same geometry,
+// and a rank that derives another uses other slots and the group hangs.
+inline bool ce_piped_geometry(int64_t packs, int world_size, uint32_t slow_hops, int depth,
+                              CePipedGeometry* g) {
+  if (depth < 1 || depth > kCeMaxPieces || world_size < 3 || world_size > kMaxWorldSize) {
+    return false;
+  }
+  bool big[kMaxWorldSize] = {};
+  int num_big = 0;
+  for (int h = 0; h < world_size; ++h) {
+    if ((slow_hops >> h) & 1u) {
+      big[(h + 1) % world_size] = true;
+      big[(h + 2) % world_size] = true;
+    }
+  }
+  for (int c = 0; c < world_size; ++c) num_big += big[c] ? 1 : 0;
+  const bool even = num_big == 0 || num_big == world_size;
+  // Cap the weight so a big chunk stays within twice the even share, the slot
+  // size above: w / (B*w + N - B) <= 2 / N holds for every w once N <= 2B.
+  int w_big = depth;
+  if (!even && world_size > 2 * num_big) {
+    const int cap = 2 * (world_size - num_big) / (world_size - 2 * num_big);
+    if (w_big > cap) w_big = cap;
+  }
+  int64_t weight[kMaxWorldSize];
+  int64_t total = 0;
+  for (int c = 0; c < world_size; ++c) {
+    weight[c] = even ? 1 : (big[c] ? w_big : 1);
+    g->pieces[c] = even || big[c] ? depth : 1;
+    total += weight[c];
+  }
+  int64_t acc = 0;
+  for (int c = 0; c < world_size; ++c) {
+    g->start[c] = packs * acc / total;
+    acc += weight[c];
+  }
+  g->start[world_size] = packs;
+  for (int c = 0; c < world_size; ++c) {
+    if (g->start[c + 1] - g->start[c] < g->pieces[c]) return false;
+  }
+  return true;
+}
+
+// SM120 pipelined ring with stream publication.
+//
+// The single-piece memop ring (ce_ring_all_reduce_flat<T, true>) pays the flag
+// round trip and the add on the critical path of every step: a step's copy
+// waits for the add of the whole chunk it forwards. Here each chunk travels as
+// pieces, and piece p of step k+1 waits only for piece p of step k, so the
+// other pieces keep the engine busy meanwhile. The all-gather forwards from the
+// landing slot rather than from the output, and that copy is issued before the
+// landing copy into the output, so the next hop depends on the arrival alone.
+//
+// Chunk sizes follow the fabric -- see ce_piped_geometry.
+//
+// There is no end-of-call handshake, and that is safe because of the one
+// property every step keeps: a copy at step k waits for this rank's step k-1
+// arrival of the same piece, hence for the previous rank's step k-1 copy. So
+// `r issued step k` implies `r-1 issued step k-1`, within a call. Two
+// consequences cover every landing slot and flag of `next` that this rank
+// writes in the following call of this schedule:
+//  * a write at step k >= N-1 implies, N-1 hops back, that `next` has issued
+//    its own copies of that call, so it finished every earlier call;
+//  * a write at step k <= N-2 follows this rank's completion of the previous
+//    call, whose last arrival implies, N-2 hops further back, that `next`
+//    issued step N-1 of it, which waits for its last reduce-scatter add: all
+//    slots and flags up to step N-2 have been consumed.
+// Calls of the other schedules in between change neither: they never touch
+// this region. The flat ring keeps its handshake because its all-gather slots
+// are shared with the island schedule, whose slot geometry differs.
+template <typename T>
+cudaError_t ce_ring_all_reduce_piped(const T* input, T* output, int64_t numel, int rank,
+                                     int world_size, const CeResources& ce, int depth, int threads,
+                                     cudaStream_t stream) {
+  constexpr int kPackElems = PackTraits<T>::kPackElems;
+  if (!ce.memop_enabled) return cudaErrorInvalidValue;
+  for (int peer = 0; peer < world_size; ++peer) {
+    if (ce.piped_flags[peer] == nullptr || ce.piped_scratch[peer] == nullptr) {
+      return cudaErrorInvalidValue;
+    }
+  }
+  CePipedGeometry g;
+  if (!ce_piped_geometry(numel / kPackElems, world_size, ce.slow_hops, depth, &g)) {
+    return cudaErrorInvalidValue;
+  }
+  const int steps = 2 * (world_size - 1);
+  const int next = (rank + 1) % world_size;
+
+  auto flag_at = [&](int peer, int k, int p) {
+    return reinterpret_cast<int32_t*>(reinterpret_cast<char*>(ce.piped_flags[peer]) +
+                                      (static_cast<size_t>(k) * kCeMaxPieces + p) * 128u);
+  };
+  auto slot_at = [&](int peer, int k, int64_t pack) {
+    return ce.piped_scratch[peer] + static_cast<size_t>(k) * ce.piped_slot_bytes +
+           static_cast<size_t>(pack) * 16u;
+  };
+  // Piece p of chunk c: packs [lo, hi) relative to the chunk's start.
+  auto piece = [&](int c, int p, int64_t* lo, int64_t* hi) {
+    const int64_t len = g.start[c + 1] - g.start[c];
+    *lo = len * p / g.pieces[c];
+    *hi = len * (p + 1) / g.pieces[c];
+  };
+  auto chunk_at = [&](int k, bool send) {
+    const int n = world_size;
+    if (k < n - 1) return (((rank - k - (send ? 0 : 1)) % n) + n) % n;
+    const int kk = k - (n - 1);
+    return (((rank + (send ? 1 : 0) - kk) % n) + n) % n;
+  };
+
+  // Piece p of the chunk sent at step k. Step 0 reads the caller's input, the
+  // all-gather after its first step forwards what landed at step k-1, and every
+  // other step sends the partial or final sum this rank wrote to the output.
+  auto send = [&](int k, int p) -> cudaError_t {
+    const int c = chunk_at(k, true);
+    int64_t lo, hi;
+    piece(c, p, &lo, &hi);
+    const void* src;
+    if (k == 0) {
+      src = input + (g.start[c] + lo) * kPackElems;
+    } else if (k >= world_size) {
+      src = slot_at(rank, k - 1, lo);
+    } else {
+      src = output + (g.start[c] + lo) * kPackElems;
+    }
+    if (k > 0) FI_CE_CHECK(cudaStreamWaitEvent(ce.copy_stream, ce.add_done[p]));
+    FI_CE_CHECK(cudaMemcpyAsync(slot_at(next, k, lo), src, static_cast<size_t>(hi - lo) * 16u,
+                                cudaMemcpyDeviceToDevice, ce.copy_stream));
+    // The default stream write fences the copy before it.
+    return ce_binary_write(ce.copy_stream, flag_at(next, k, p), 1);
+  };
+
+  FI_CE_CHECK(cudaEventRecord(ce.input_ready, stream));
+  FI_CE_CHECK(cudaStreamWaitEvent(ce.copy_stream, ce.input_ready));
+  for (int p = 0; p < g.pieces[chunk_at(0, true)]; ++p) FI_CE_CHECK(send(0, p));
+
+  for (int k = 0; k < steps; ++k) {
+    const bool reduce_phase = k < world_size - 1;
+    const int c = chunk_at(k, false);
+    for (int p = 0; p < g.pieces[c]; ++p) {
+      int64_t lo, hi;
+      piece(c, p, &lo, &hi);
+      const int64_t packs = hi - lo;
+      const unsigned grid =
+          static_cast<unsigned>(packs < threads ? 1 : (packs + threads - 1) / threads);
+      const unsigned add_grid = grid > 64u ? 64u : grid;
+      auto* out = reinterpret_cast<uint4*>(output + (g.start[c] + lo) * kPackElems);
+      const auto* landed = reinterpret_cast<const uint4*>(slot_at(rank, k, lo));
+      FI_CE_CHECK(ce_binary_wait_clear(stream, flag_at(rank, k, p)));
+      if (reduce_phase) {
+        ce_add_kernel<T><<<add_grid, threads, 0, stream>>>(
+            out, reinterpret_cast<const uint4*>(input + (g.start[c] + lo) * kPackElems), landed,
+            packs);
+        FI_CE_CHECK(cudaEventRecord(ce.add_done[p], stream));
+        if (k + 1 < steps) FI_CE_CHECK(send(k + 1, p));
+      } else {
+        // Forward first: issuing the next hop ahead of the landing copy keeps
+        // it off that kernel's launch in the captured graph.
+        FI_CE_CHECK(cudaEventRecord(ce.add_done[p], stream));
+        if (k + 1 < steps) FI_CE_CHECK(send(k + 1, p));
+        ce_copy_kernel<<<add_grid, threads, 0, stream>>>(out, landed, packs);
+      }
+    }
+  }
+
+  // Join, as in the flat ring: capture requires it, and eager callers read the
+  // output after this returns.
+  FI_CE_CHECK(cudaEventRecord(ce.copy_done, ce.copy_stream));
+  FI_CE_CHECK(cudaStreamWaitEvent(stream, ce.copy_done));
   return cudaGetLastError();
 }
 

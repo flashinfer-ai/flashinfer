@@ -18,6 +18,8 @@
 // Cake kernel schedules and shared by the quantized pre-attention and FC1+SwiGLU translation units:
 //   norm_adaln_quant_fp8:   RMSNorm(x) * w, shift + n * (1 + scale), per-token E4M3 (scale = amax / 448)
 //   norm_adaln_quant_nvfp4: the same normalization, block-16 NVFP4 (FlashInfer fp4_quantize semantics)
+// Both kernels index a fixed 9-row [9, 5376] AdaLN table (idx outside [0, 9) zeroes the activation); the
+// hosts reject any other row count because a shorter table would be read past its end.
 // Each kernel lives in its own namespace; its helper ``#define`` block is undefined again after the namespace.
 #pragma once
 

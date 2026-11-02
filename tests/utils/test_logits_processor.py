@@ -3,6 +3,7 @@ import pytest
 import torch
 
 import flashinfer
+from tests.test_helpers.sampling import required_num_trials
 from flashinfer.logits_processor import (
     LogitsPipe,
     MinP,
@@ -85,12 +86,12 @@ class TestLogitsPipeCompilation:
     @pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
     def test_probs_sample_freq(self, vocab_size, distribution, zero_ratio):
         set_random_seed(42)
-        num_trials = 5000000
 
         logits = distribution((1, vocab_size), "cuda:0")
         zero_indices = torch.randperm(vocab_size)[: int(vocab_size * zero_ratio)]
         logits[:, zero_indices] = -float("inf")
         probs = torch.softmax(logits, dim=-1)
+        num_trials = required_num_trials(probs)
 
         pipe_compiled = LogitsPipe(
             [Sample()], compile=True, input_type=TensorType.PROBS
@@ -147,10 +148,10 @@ class TestLogitsPipeCompilation:
     )
     def test_logits_sample_freq(self, vocab_size, distribution):
         set_random_seed(42)
-        num_trials = 5000000
 
         logits = distribution((1, vocab_size), "cuda:0")
         probs = torch.softmax(logits, dim=-1)
+        num_trials = required_num_trials(probs)
 
         pipe_compiled = LogitsPipe(
             [Sample()], compile=True, input_type=TensorType.LOGITS
@@ -206,7 +207,6 @@ class TestLogitsPipeCompilation:
             pytest.skip("k should be less than vocab_size")
 
         set_random_seed(42)
-        num_trials = 5000000
 
         logits = distribution((1, vocab_size), "cuda:0")
         probs = torch.softmax(logits, dim=-1)
@@ -216,6 +216,7 @@ class TestLogitsPipeCompilation:
         mask = (probs >= pivot.unsqueeze(-1)).int()
         masked_probs = probs.clone()
         masked_probs[mask == 0] = 0
+        num_trials = required_num_trials(masked_probs)
 
         pipe_compiled = LogitsPipe(
             [TopK(), Sample()], compile=True, input_type=TensorType.PROBS
@@ -276,7 +277,6 @@ class TestLogitsPipeCompilation:
     @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
     def test_probs_top_p_sample_freq(self, vocab_size, distribution, p):
         set_random_seed(42)
-        num_trials = 5000000
         eps = 1e-4
 
         logits = distribution((1, vocab_size), "cuda:0")
@@ -288,6 +288,7 @@ class TestLogitsPipeCompilation:
         mask.scatter_add_(1, indices, (cdf > (1 - p) - eps).int())
         masked_probs = probs.clone()
         masked_probs[mask == 0] = 0
+        num_trials = required_num_trials(masked_probs)
 
         pipe_compiled = LogitsPipe(
             [TopP(), Sample()],
@@ -348,7 +349,6 @@ class TestLogitsPipeCompilation:
     @pytest.mark.parametrize("p", [0.05, 0.1, 0.2, 0.7, 1])
     def test_probs_min_p_sample_freq(self, vocab_size, distribution, p):
         set_random_seed(42)
-        num_trials = 5000000
 
         logits = distribution((1, vocab_size), "cuda:0")
         probs = torch.softmax(logits, dim=-1)
@@ -361,6 +361,7 @@ class TestLogitsPipeCompilation:
         mask.scatter_add_(1, indices, (sorted_prob >= scaled_p).int())
         masked_probs = probs.clone()
         masked_probs[mask == 0] = 0
+        num_trials = required_num_trials(masked_probs)
 
         pipe_compiled = LogitsPipe(
             [MinP(), Sample()],
@@ -422,7 +423,6 @@ class TestLogitsPipeCompilation:
     @pytest.mark.parametrize("p", [0.1, 0.5])
     def test_probs_top_k_top_p_joint_sample_freq(self, vocab_size, distribution, p):
         set_random_seed(42)
-        num_trials = 5000000
         eps = 1e-4
 
         if p == 0.1:
@@ -447,6 +447,7 @@ class TestLogitsPipeCompilation:
         mask = torch.minimum(mask_top_k, mask_top_p)
         masked_probs = probs.clone()
         masked_probs[mask == 0] = 0
+        num_trials = required_num_trials(masked_probs)
 
         pipe_compiled = LogitsPipe(
             [
@@ -507,7 +508,6 @@ class TestLogitsPipeCompilation:
     @pytest.mark.parametrize("p", [0.1, 0.5])
     def test_logits_top_k_top_p_joint_sample_freq(self, vocab_size, distribution, p):
         set_random_seed(42)
-        num_trials = 5000000
         eps = 1e-4
 
         if p == 0.1:
@@ -532,6 +532,7 @@ class TestLogitsPipeCompilation:
         mask = torch.minimum(mask_top_k, mask_top_p)
         masked_probs = probs.clone()
         masked_probs[mask == 0] = 0
+        num_trials = required_num_trials(masked_probs)
 
         pipe_compiled = LogitsPipe(
             [

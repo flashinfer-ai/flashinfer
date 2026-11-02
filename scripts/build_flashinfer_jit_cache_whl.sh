@@ -119,7 +119,8 @@ elif [ "${BUILD_TARGET}" = "shim" ]; then
     flashinfer_jit_cache/_provider_requirements.txt
 fi
 
-# Build the wheel using the build module for better isolation
+# Build the wheel in this container's interpreter, not an isolated environment:
+# see build_jit_cache_wheel.py for why.
 echo "Building wheel..."
 if [ "${BUILD_TARGET}" = "provider" ]; then
   JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS=${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS:-5400}
@@ -132,9 +133,9 @@ if [ "${BUILD_TARGET}" = "provider" ]; then
     --timeout-seconds "${JIT_CACHE_NO_OUTPUT_TIMEOUT_SECONDS}" \
     --term-grace-seconds "${JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS}" \
     --diagnostics-file "${WATCHDOG_DIAGNOSTICS_FILE}" \
-    -- python -m build --wheel
+    -- python "${SCRIPT_DIR}/build_jit_cache_wheel.py"
 else
-  python -m build --wheel
+  python "${SCRIPT_DIR}/build_jit_cache_wheel.py"
 fi
 
 echo ""

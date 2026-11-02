@@ -22,6 +22,10 @@ import flashinfer
 from flashinfer.utils import is_sm90a_supported
 
 
+# H100 CI peak GPU memory: 73.5 GiB.
+pytestmark = pytest.mark.gpu_exclusive
+
+
 @pytest.mark.parametrize("seq_len", [11, 99, 1763, 9999, 32767])
 @pytest.mark.parametrize("num_qo_heads", [1, 4, 8])
 @pytest.mark.parametrize("num_kv_heads", [1, 4, 8])

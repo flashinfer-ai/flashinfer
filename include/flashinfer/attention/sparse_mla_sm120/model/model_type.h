@@ -46,12 +46,23 @@
 //            geometry matches GLM53_NOPE while the scale placement matches
 //            DSV4. The 528B payload collides with GLM53_NOPE's, so this type
 //            can only be selected explicitly, never inferred from widths.
+//   DSV4_1_INLINE: DSV4_1 geometry and scales stored as FlashMLA's V4.1
+//            inline-scale records (its ABI as of 2026.09.30): each token's 16
+//            UE8M0 scale bytes follow its 512 data bytes, and the indices
+//            address records as rows of the whole cache. The record is the
+//            smem row, so one 528B bulk copy brings data and scales.
 //
 // DOTS3_SWA is the sliding-window family: its candidate list is a 513-token
 // positional window rather than a genuine top-k. It is the first model whose
 // d_v diverges from 512 (it is 1024), so it opts out of the shared D_V assert
 // in kv_cache_traits.cuh.
-enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA, DSV4_1 };
+enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA, DSV4_1, DSV4_1_INLINE };
+
+// DeepSeek-V4.1 in either scale placement. The two share every kernel route;
+// only the cache addressing and the smem scale location differ.
+constexpr bool is_dsv41(ModelType mt) {
+  return mt == ModelType::DSV4_1 || mt == ModelType::DSV4_1_INLINE;
+}
 
 // Prefill kernel variants selected by the Python dispatch planner
 // (flashinfer/mla/_sparse_mla_sm120/_policy.py, KernelVariant; the values must

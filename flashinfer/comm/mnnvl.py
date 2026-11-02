@@ -20,7 +20,7 @@ import socket
 
 from dataclasses import dataclass
 import sys
-from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 import pynvml
 
 logger = logging.getLogger(__name__)
@@ -194,6 +194,8 @@ class _MnnvlAllocationRecord:
     start_address: int
     rank_stride: int
     address_offset: int
+    # CUmemAllocationHandleType the allocation is shared through.
+    handle_type: Any
     mapped: bool = True
 
 
@@ -234,6 +236,18 @@ class MnnvlMemory:  # type: ignore[no-redef]
     @property
     def mapped(self) -> bool:
         return MnnvlMemory.allocated_map[self.ptr].mapped
+
+    @property
+    def fabric_handles(self) -> bool:
+        """True if the allocation is shared through FABRIC handles, False for
+        POSIX file descriptors."""
+        return MnnvlMemory.allocated_map[self.ptr].handle_type == _FABRIC_HANDLE
+
+    @property
+    def local_mem_handle(self) -> int:
+        """This rank's ``CUmemGenericAllocationHandle`` backing the allocation."""
+        record = MnnvlMemory.allocated_map[self.ptr]
+        return int(record.mem_handles[record.comm_rank])
 
     def as_torch_strided_tensor(self, dtype):
         num_segments = MnnvlMemory.comm.Get_size()
@@ -276,75 +290,54 @@ class MnnvlMemory:  # type: ignore[no-redef]
         MnnvlMemory.comm = comm
         return comm
 
-    _fabric_supported: bool | None = None
-
     @staticmethod
-    def _probe_fabric_supported(dev_id: int) -> bool:
-        """Return True if this rank's GPU supports FABRIC handles and is part of a fabric cluster."""
-        try:
-            return is_mnnvl_fabric_supported(dev_id)
-        except Exception:
-            return False
+    def uses_fabric_handles(comm: CommBackend, dev_id: int) -> bool:
+        """Return True if MNNVL memory shared over ``comm`` starts with FABRIC
+        handles.
 
-    @staticmethod
-    def _resolve_fabric_support(comm: CommBackend, dev_id: int) -> bool:
-        """AND-reduce per-rank FABRIC support and cache the result.
-
-        All ranks must take the same handle-exchange path or the collective deadlocks.
+        Collective over ``comm``. This is the precheck of
+        :func:`choose_mnnvl_handle_type`: a FABRIC allocation that fails on a
+        single host still falls back to POSIX file descriptors (see
+        :func:`allocate_mnnvl_handles`), so :attr:`fabric_handles` of an
+        allocation tells what it uses.
         """
-        if MnnvlMemory._fabric_supported is not None:
-            return MnnvlMemory._fabric_supported
-
-        local_supported = MnnvlMemory._probe_fabric_supported(dev_id)
-        agreed = all_ranks_agree(comm, local_supported)
-
-        if agreed != local_supported:
-            logger.warning(
-                "[MnnvlMemory] FABRIC support probe disagrees across ranks "
-                f"(local={local_supported}); falling back to "
-                f"{'FABRIC' if agreed else 'POSIX fd'} on all ranks to keep the "
-                "handle-exchange path consistent."
-            )
-
-        MnnvlMemory._fabric_supported = agreed
-        return agreed
+        return choose_mnnvl_handle_type(comm, dev_id)[0] == _FABRIC_HANDLE
 
     @staticmethod
-    def get_allocation_prop(dev_id: int):
+    def get_allocation_prop(dev_id: int, handle_type: Any):
         location = cuda.CUmemLocation()
         location.type = cuda.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
         location.id = dev_id
         allocation_prop = cuda.CUmemAllocationProp()
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
         allocation_prop.location = location
-
-        use_fabric = (
-            MnnvlMemory._fabric_supported
-            if MnnvlMemory._fabric_supported is not None
-            else MnnvlMemory._probe_fabric_supported(dev_id)
-        )
-
-        if use_fabric:
-            allocation_prop.requestedHandleTypes = (
-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-            )
-        else:
-            allocation_prop.requestedHandleTypes = (
-                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-            )
+        allocation_prop.requestedHandleTypes = handle_type
         return allocation_prop
 
     @staticmethod
     def get_allocation_granularity(dev_id: int):
+        """Return the recommended granularity of both FABRIC and POSIX file
+        descriptor allocations, so an allocation keeps its size when it falls
+        back from one handle type to the other."""
         if MnnvlMemory.allocation_granularity != 0:
             return MnnvlMemory.allocation_granularity
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
         option = cuda.CUmemAllocationGranularity_flags(
             cuda.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
         )
-        granularity = checkCudaErrors(
-            cuda.cuMemGetAllocationGranularity(prop=allocation_prop, option=option)
-        )
+        granularity = 1
+        for handle_type in (_FABRIC_HANDLE, _POSIX_FD_HANDLE):
+            allocation_prop = MnnvlMemory.get_allocation_prop(dev_id, handle_type)
+            try:
+                handle_granularity = checkCudaErrors(
+                    cuda.cuMemGetAllocationGranularity(
+                        prop=allocation_prop, option=option
+                    )
+                )
+            except RuntimeError:
+                # The driver does not support this handle type.
+                continue
+            # Granularities are powers of two, so the larger is a multiple of both.
+            granularity = max(granularity, handle_granularity)
         MnnvlMemory.allocation_granularity = granularity
         return MnnvlMemory.allocation_granularity
 
@@ -355,93 +348,34 @@ class MnnvlMemory:  # type: ignore[no-redef]
         start_address: int,
         rank_stride: int,
         address_offset: int,
-    ) -> List[Any]:
+    ) -> Tuple[List[Any], Any]:
+        """Back and map every rank's segment; return the handles and their type.
+
+        Collective over ``comm``.
+        """
         dev = checkCudaErrors(cuda.cuCtxGetDevice())
         dev_id = int(dev)
         assert dev_id == MnnvlMemory.dev_id, (
             f"Different dev_id found dev_id={dev_id} but "
             f"MnnvlMemory.dev_id={MnnvlMemory.dev_id}"
         )
-        comm_rank = comm.Get_rank()
-        comm_size = comm.Get_size()
-        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id)
-        allocated_mem_handle = checkCudaErrors(
-            cuda.cuMemCreate(aligned_size, allocation_prop, flags=0)
+        mem_handles, handle_type = allocate_mnnvl_handles(
+            comm,
+            dev_id,
+            lambda handle_type: (
+                MnnvlMemory.get_allocation_prop(dev_id, handle_type),
+                aligned_size,
+            ),
         )
-        exported_fabric_handle = checkCudaErrors(
-            cuda.cuMemExportToShareableHandle(
-                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
-            )
-        )
-        if (
-            allocation_prop.requestedHandleTypes
-            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        ):
-            # tuple (FABRIC) here, list[int] (POSIX fds) below -- widen to Sequence.
-            all_handles_data: Sequence[Any] = comm.allgather(
-                exported_fabric_handle.data
-            )
-        else:
-            # The exchange returns our own exported_fd (not a dup) at our rank's
-            # slot; the mapping loop's finally closes it along with received fds.
-            exported_fd = int(exported_fabric_handle)
-            try:
-                local_host = socket.gethostname()
-                all_hosts = comm.allgather(local_host)
-                if len(set(all_hosts)) != 1:
-                    raise RuntimeError(
-                        "[MnnvlMemory] POSIX fd exchange via SCM_RIGHTS requires all "
-                        "ranks to share the same host, but got differing hostnames: "
-                        f"{all_hosts}. Multi-node MNNVL requires a fabric-capable GPU "
-                        "setup (CU_MEM_HANDLE_TYPE_FABRIC)."
-                    )
-                all_handles_data = exchange_fds(comm, exported_fd)
-            except BaseException:
-                os.close(exported_fd)
-                raise
-        # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
-        # can use buf = memoryview(data) to import if using plain buffer for data.
 
         madesc = cuda.CUmemAccessDesc()
-        madesc.location = allocation_prop.location
+        madesc.location = MnnvlMemory.get_allocation_prop(dev_id, handle_type).location
         madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-
-        mem_handles = [None] * comm_size
-        try:
-            for i, remote_handle_data in enumerate(all_handles_data):
-                rank_ptr = start_address + rank_stride * i + address_offset
-                if i == comm_rank:
-                    # Local memory mapping
-                    mem_handles[i] = allocated_mem_handle
-                    checkCudaErrors(
-                        cuda.cuMemMap(
-                            rank_ptr, aligned_size, 0, allocated_mem_handle, 0
-                        )
-                    )
-                else:
-                    # Fabric memory mapping
-                    imported_mem_handle = checkCudaErrors(
-                        cuda.cuMemImportFromShareableHandle(
-                            remote_handle_data, allocation_prop.requestedHandleTypes
-                        )
-                    )
-                    mem_handles[i] = imported_mem_handle
-                    checkCudaErrors(
-                        cuda.cuMemMap(rank_ptr, aligned_size, 0, imported_mem_handle, 0)
-                    )
-
-                checkCudaErrors(
-                    cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1)
-                )
-        finally:
-            if (
-                allocation_prop.requestedHandleTypes
-                == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-            ):
-                for shareable_fd in all_handles_data:
-                    os.close(int(shareable_fd))
-
-        return mem_handles
+        for i, mem_handle in enumerate(mem_handles):
+            rank_ptr = start_address + rank_stride * i + address_offset
+            checkCudaErrors(cuda.cuMemMap(rank_ptr, aligned_size, 0, mem_handle, 0))
+            checkCudaErrors(cuda.cuMemSetAccess(rank_ptr, aligned_size, [madesc], 1))
+        return mem_handles, handle_type
 
     @staticmethod
     def new_mnnvl_memory_address(mapping: Mapping, size: int):
@@ -479,7 +413,6 @@ class MnnvlMemory:  # type: ignore[no-redef]
         assert all(x == size for x in all_rank_allocate_sizes), (
             "Not all rank allocating same size."
         )
-        MnnvlMemory._resolve_fabric_support(comm, dev_id)
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
@@ -494,7 +427,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
             <= MnnvlMemory.current_rank_stride
         )
 
-        mem_handles = MnnvlMemory._create_and_map_handles(
+        mem_handles, handle_type = MnnvlMemory._create_and_map_handles(
             comm,
             aligned_size,
             MnnvlMemory.current_start_address,
@@ -512,6 +445,7 @@ class MnnvlMemory:  # type: ignore[no-redef]
             start_address=MnnvlMemory.current_start_address,
             rank_stride=MnnvlMemory.current_rank_stride,
             address_offset=MnnvlMemory.current_mem_offset,
+            handle_type=handle_type,
         )
         MnnvlMemory.address_refcnt[MnnvlMemory.current_start_address] = (
             MnnvlMemory.address_refcnt.get(MnnvlMemory.current_start_address, 0) + 1
@@ -670,6 +604,212 @@ def all_ranks_support_mnnvl(
     return all_ranks_agree(comm, local_supported)
 
 
+_FABRIC_HANDLE = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+_POSIX_FD_HANDLE = (
+    cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+)
+_IMEX_HINT = (
+    "FABRIC handles need IMEX channel 0 (/dev/nvidia-caps-imex-channels/channel0; pass it "
+    "into containers with --device or NVIDIA_IMEX_CHANNELS=0) and, across hosts, the "
+    "nvidia-imex service on every node of the NVLink domain."
+)
+
+
+# Warn about a FABRIC fallback once per process; later fallbacks log at debug level.
+_fabric_fallback_warned = False
+
+
+def _local_fabric_status(dev_id: int) -> Tuple[Optional[str], bytes]:
+    """Return why this GPU cannot use FABRIC handles (``None`` if it can) and
+    its NVML fabric cluster UUID (empty unless the fabric state is completed)."""
+    try:
+        supported = checkCudaErrors(
+            cuda.cuDeviceGetAttribute(
+                cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+                dev_id,
+            )
+        )
+    except RuntimeError as exc:
+        return f"querying the FABRIC handle attribute failed: {exc}", b""
+    if not supported:
+        return "the driver does not support FABRIC handles", b""
+    try:
+        pynvml.nvmlInit()
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
+            fabric_info = pynvml.c_nvmlGpuFabricInfoV_t()
+            pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric_info))
+        finally:
+            pynvml.nvmlShutdown()
+    except pynvml.NVMLError:
+        return None, b""
+    if fabric_info.state < pynvml.NVML_GPU_FABRIC_STATE_COMPLETED:
+        return None, b""
+    return None, bytes(fabric_info.clusterUuid)
+
+
+def choose_mnnvl_handle_type(comm: CommBackend, dev_id: int) -> Tuple[Any, bool]:
+    """Choose FABRIC handles or POSIX file descriptors for MNNVL memory shared
+    over ``comm``; return the handle type and whether the group is on a single
+    host.
+
+    Collective over ``comm``; every rank gets the same answer, which depends
+    only on what the ranks report now. On one host, FABRIC is chosen when
+    every GPU reports FABRIC support and POSIX file descriptors otherwise.
+    Across hosts, every GPU must support FABRIC handles and report the same
+    non-zero NVML fabric cluster UUID; otherwise this raises with each rank's
+    reason, since file descriptors cannot cross hosts.
+    """
+    reason, cluster_uuid = _local_fabric_status(dev_id)
+    status = comm.allgather((socket.gethostname(), reason, cluster_uuid))
+    if len({host for host, _, _ in status}) == 1:
+        if all(reason is None for _, reason, _ in status):
+            return _FABRIC_HANDLE, True
+        return _POSIX_FD_HANDLE, True
+    problems = []
+    for rank, (host, reason, uuid) in enumerate(status):
+        if reason is not None:
+            problems.append(f"rank {rank} on {host}: {reason}")
+        elif not any(uuid):
+            problems.append(
+                f"rank {rank} on {host}: the GPU is not in a completed NVLink "
+                "fabric cluster (NVML clusterUuid unset)"
+            )
+    if not problems and len({uuid for _, _, uuid in status}) > 1:
+        problems = [
+            f"rank {rank} on {host}: NVLink fabric cluster {uuid.hex()}"
+            for rank, (host, _, uuid) in enumerate(status)
+        ]
+        problems.insert(0, "the ranks are in different NVLink domains")
+    if problems:
+        raise RuntimeError(
+            "[MNNVL] memory shared across hosts needs FABRIC handles within one "
+            "NVLink domain:\n  " + "\n  ".join(problems) + "\n" + _IMEX_HINT
+        )
+    return _FABRIC_HANDLE, False
+
+
+def _create_and_import_handles(
+    comm: CommBackend, prop: Any, size: int
+) -> Tuple[Optional[List[Any]], List[Optional[str]]]:
+    """Make one attempt to back ``size`` bytes on every rank and import every
+    peer's allocation.
+
+    Collective over ``comm``. Returns the per-rank allocation handles (this
+    rank's own at its index) and each rank's error, which is ``None`` on
+    success. When any rank fails, the handles are ``None`` and everything this
+    rank created or imported is released, so the caller can retry.
+    """
+    rank, size_of_group = comm.Get_rank(), comm.Get_size()
+    handle_type = prop.requestedHandleTypes
+    local_handle = None
+    exported = None
+    error = None
+    try:
+        local_handle = checkCudaErrors(cuda.cuMemCreate(size, prop, 0))
+        exported = checkCudaErrors(
+            cuda.cuMemExportToShareableHandle(local_handle, handle_type, 0)
+        )
+    except RuntimeError as exc:
+        error = f"creating or exporting the allocation failed: {exc}"
+    errors = list(comm.allgather(error))
+    if any(errors):
+        if exported is not None and handle_type == _POSIX_FD_HANDLE:
+            os.close(int(exported))
+        if local_handle is not None:
+            checkCudaErrors(cuda.cuMemRelease(local_handle))
+        return None, errors
+
+    if handle_type == _FABRIC_HANDLE:
+        shareable: Sequence[Any] = comm.allgather(exported.data)
+    else:
+        # The exchange returns this rank's own fd (not a dup) at its index, so
+        # closing every returned fd below closes it exactly once.
+        try:
+            shareable = exchange_fds(comm, int(exported))
+        except BaseException:
+            os.close(int(exported))
+            checkCudaErrors(cuda.cuMemRelease(local_handle))
+            raise
+    handles: List[Any] = [None] * size_of_group
+    handles[rank] = local_handle
+    error = None
+    try:
+        for peer in range(size_of_group):
+            if peer != rank:
+                try:
+                    handles[peer] = checkCudaErrors(
+                        cuda.cuMemImportFromShareableHandle(
+                            shareable[peer], handle_type
+                        )
+                    )
+                except RuntimeError as exc:
+                    error = f"importing the allocation of rank {peer} failed: {exc}"
+                    break
+    finally:
+        if handle_type == _POSIX_FD_HANDLE:
+            for fd in shareable:
+                os.close(int(fd))
+    errors = list(comm.allgather(error))
+    if any(errors):
+        for handle in handles:
+            if handle is not None:
+                checkCudaErrors(cuda.cuMemRelease(handle))
+        return None, errors
+    return handles, errors
+
+
+def _format_rank_errors(errors: Sequence[Optional[str]]) -> str:
+    return "\n".join(
+        f"  rank {rank}: {error}" for rank, error in enumerate(errors) if error
+    )
+
+
+def allocate_mnnvl_handles(
+    comm: CommBackend,
+    dev_id: int,
+    make_prop: Callable[[Any], Tuple[Any, int]],
+) -> Tuple[List[Any], Any]:
+    """Back MNNVL memory on every rank and import every peer's allocation.
+
+    ``make_prop(handle_type)`` returns the ``CUmemAllocationProp`` and the size
+    to allocate with that handle type. Collective over ``comm``. Returns the
+    per-rank allocation handles (this rank's own at its index) and the handle
+    type used: the one :func:`choose_mnnvl_handle_type` picks or, when FABRIC
+    handles fail on a single host (e.g. without an IMEX channel), POSIX file
+    descriptors. Each call decides on its own, so every allocation over a host
+    without usable FABRIC handles tries them first.
+    """
+    global _fabric_fallback_warned
+    handle_type, single_host = choose_mnnvl_handle_type(comm, dev_id)
+    prop, size = make_prop(handle_type)
+    handles, errors = _create_and_import_handles(comm, prop, size)
+    if handles is not None:
+        return handles, handle_type
+    failure = _format_rank_errors(errors)
+    if handle_type == _FABRIC_HANDLE and single_host:
+        log = logger.debug if _fabric_fallback_warned else logger.warning
+        _fabric_fallback_warned = True
+        log(
+            "[MNNVL] FABRIC handles failed on this host; using POSIX file "
+            "descriptors instead:\n%s\n%s",
+            failure,
+            _IMEX_HINT,
+        )
+        handle_type = _POSIX_FD_HANDLE
+        prop, size = make_prop(handle_type)
+        handles, errors = _create_and_import_handles(comm, prop, size)
+        if handles is not None:
+            return handles, handle_type
+        failure = _format_rank_errors(errors)
+    kind = "FABRIC" if handle_type == _FABRIC_HANDLE else "POSIX file descriptor"
+    hint = "\n" + _IMEX_HINT if handle_type == _FABRIC_HANDLE else ""
+    raise RuntimeError(
+        f"[MNNVL] allocating memory shared through {kind} handles failed:\n"
+        f"{failure}{hint}"
+    )
+
+
 @dataclass(frozen=True)
 class HandleExchanger:
     """Exchanges CUDA shareable memory handles across ranks.
@@ -683,19 +823,6 @@ class HandleExchanger:
     rank: int
     size: int
     handle_type: "cuda.CUmemAllocationHandleType"
-
-
-def make_handle_exchanger(
-    comm: CommBackend, rank: int, size: int, dev_id: int
-) -> HandleExchanger:
-    """Pick FABRIC vs POSIX-fd handles based on the device's fabric support."""
-    if is_mnnvl_fabric_supported(dev_id):
-        handle_type = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-    else:
-        handle_type = (
-            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        )
-    return HandleExchanger(comm=comm, rank=rank, size=size, handle_type=handle_type)
 
 
 def _handle_is_fabric(ex: HandleExchanger) -> bool:
@@ -940,18 +1067,29 @@ class SymmDeviceMemory:
 
     def _create_and_map_handles(self, comm: CommBackend) -> None:
         """Create physical backing and map it at the reserved addresses."""
-        # Create handle exchanger
-        self._exchanger = make_handle_exchanger(
-            comm, self.group_rank, self.group_size, self.device_idx
-        )
-
         self._verify_cuda_context()
 
-        # Compute allocation size and get allocation properties
-        allocation_prop, mc_prop = self._get_allocation_prop(self.buf_size)
+        # Allocate and exchange the unicast buffers; this settles the handle
+        # type, which the multicast object then shares.
+        mc_props: Dict[Any, Any] = {}
 
-        # Allocate, exchange, and map unicast buffers
-        self._allocate_unicast_buffers(allocation_prop)
+        def make_prop(handle_type):
+            allocation_prop, mc_props[handle_type] = self._get_allocation_prop(
+                self.buf_size, handle_type
+            )
+            return allocation_prop, self.allocation_size
+
+        self.uc_handles, handle_type = allocate_mnnvl_handles(
+            comm, self.device_idx, make_prop
+        )
+        self._exchanger = HandleExchanger(
+            comm=comm,
+            rank=self.group_rank,
+            size=self.group_size,
+            handle_type=handle_type,
+        )
+        mc_prop = mc_props[handle_type]
+        self._map_unicast_buffers()
 
         # Setup multicast object, exchange handles, map and bind memory
         if self._enable_multicast:
@@ -1001,10 +1139,10 @@ class SymmDeviceMemory:
         except Exception as e:
             logger.warning("Error checking CUDA context: %s", e)
 
-    def _get_allocation_prop(self, buf_size: int):
+    def _get_allocation_prop(self, buf_size: int, handle_type: Any):
         """Compute allocation size and return allocation/multicast properties."""
         allocation_prop = cuda.CUmemAllocationProp()
-        allocation_prop.requestedHandleTypes = self._exchanger.handle_type
+        allocation_prop.requestedHandleTypes = handle_type
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
         allocation_prop.location = cuda.CUmemLocation()
         allocation_prop.location.type = (
@@ -1032,7 +1170,7 @@ class SymmDeviceMemory:
             mc_prop = cuda.CUmulticastObjectProp()
             mc_prop.numDevices = self.group_size
             mc_prop.size = self.allocation_size
-            mc_prop.handleTypes = self._exchanger.handle_type
+            mc_prop.handleTypes = handle_type
 
             # Get multicast granularity and adjust allocation size
             self._mc_granularity = checkCudaErrors(
@@ -1045,44 +1183,8 @@ class SymmDeviceMemory:
 
         return allocation_prop, mc_prop
 
-    def _allocate_unicast_buffers(self, allocation_prop):
-        """Allocate local UC memory, exchange handles with peers, and map memory."""
-        # Initialize UC handles list
-        self.uc_handles = [0] * self.group_size
-
-        # Allocate local GPU memory
-        self.uc_handles[self.group_rank] = checkCudaErrors(
-            cuda.cuMemCreate(self.allocation_size, allocation_prop, 0)
-        )
-
-        # Export local handle to shareable handle
-        local_shareable_uc_handle = checkCudaErrors(
-            cuda.cuMemExportToShareableHandle(
-                self.uc_handles[self.group_rank],
-                self._exchanger.handle_type,
-                0,
-            )
-        )
-
-        # All-gather shareable handles. For POSIX fds, entry[group_rank] is our
-        # own local_shareable_uc_handle (not a dup), so the cleanup loop below
-        # closes it exactly once — no separate cleanup of local_shareable_uc_handle.
-        all_shareable_uc_handles = handle_allgather(
-            self._exchanger, local_shareable_uc_handle
-        )
-        cuda.cuCtxSynchronize()
-
-        # Import remote handles
-        for p in range(self.group_size):
-            if p != self.group_rank:
-                self.uc_handles[p] = checkCudaErrors(
-                    cuda.cuMemImportFromShareableHandle(
-                        all_shareable_uc_handles[p],
-                        self._exchanger.handle_type,
-                    )
-                )
-            handle_cleanup(self._exchanger, all_shareable_uc_handles[p])
-
+    def _map_unicast_buffers(self):
+        """Map every rank's unicast buffer at the reserved addresses."""
         # Reserve address space for UC pointers
         if not self.uc_ptrs:
             self.uc_ptrs = [0] * self.group_size

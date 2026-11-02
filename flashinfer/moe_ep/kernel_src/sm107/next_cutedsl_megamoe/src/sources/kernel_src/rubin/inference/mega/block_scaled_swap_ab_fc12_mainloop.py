@@ -3,6 +3,7 @@
 from typing import ClassVar, Optional, Tuple
 
 import cutlass
+from .....helpers.ptx_helpers import barrier_sync_unaligned
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
@@ -1061,7 +1062,7 @@ class BlockScaledSwapAbFc12Mainloop(KernelComponent):
         fragment_a = tiled_mma.make_fragment_A(self.a_smem_tensor)
         fragment_b = tiled_mma.make_fragment_B(self.b_smem_tensor)
 
-        tmem_allocator.wait_for_alloc()
+        barrier_sync_unaligned(self.tmem_allocation_barrier_id, 32 * (1 + self.num_accumulator_consumer_warps_per_cta))
         accumulator_pointer = tmem_allocator.retrieve_ptr(self.acc_dtype)
         accumulator_layout = cute.make_layout(self.accumulator_shape, stride=self.accumulator_stride)
         accumulator_base = cute.make_tensor(accumulator_pointer, accumulator_layout)

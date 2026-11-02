@@ -32,4 +32,36 @@ struct Dsv41Bf16Smem {
 };
 static_assert(sizeof(Dsv41Bf16Smem) == 86784);
 
+// Cache addressing for the scalar BF16 gathers. DSV4_1 splits an index into a
+// footer page and a slot at the runtime page size; DSV4_1_INLINE indices are
+// flat rows of inline records at the row pitch `stride`.
+template <ModelType MT>
+struct Dsv41Bf16Cache {
+  static_assert(is_dsv41(MT));
+  static constexpr bool INLINE = KVCacheTraits<MT>::SCALE_IN_KV_SMEM;
+  using Fp8 = Dsv41Fp8LayoutT<INLINE>;
+  using Fp4 = Dsv41Fp4LayoutT<INLINE>;
+
+  // Returns the page (footer) or record (inline) holding `index`, and its
+  // slot there for the layouts' offset helpers.
+  __device__ __forceinline__ static const uint8_t* locate(const uint8_t* cache, int index, int pbs,
+                                                          size_t stride, bool power_of_two,
+                                                          size_t& slot) {
+    if constexpr (INLINE) {
+      slot = 0;
+      return cache + (size_t)index * stride;
+    } else {
+      const int page = power_of_two ? (index >> (__ffs(pbs) - 1)) : (index / pbs);
+      slot = size_t(index - page * pbs);
+      return cache + (size_t)page * stride;
+    }
+  }
+  __device__ __forceinline__ static size_t data_offset(bool fp4, size_t slot) {
+    return Fp4::template selected_data_offset<Fp8>(fp4, slot);
+  }
+  __device__ __forceinline__ static size_t scale_offset(bool fp4, int pbs, size_t slot) {
+    return Fp4::template selected_scale_offset<Fp8>(fp4, size_t(pbs), slot);
+  }
+};
+
 }  // namespace flashinfer::sparse_mla_sm120::kernels::dsv41_bf16

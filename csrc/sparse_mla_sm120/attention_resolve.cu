@@ -50,7 +50,7 @@ void decode_resources(ExecutionPlan& p) {
   } else {
     p.block_threads = DecodeTileCfg<MT>::BASE_BLOCK_THREADS;
     p.shared_bytes = Fp8DecodeSharedLayout<MT>::TOTAL_BYTES;
-    if constexpr (MT == ModelType::DSV4_1) {
+    if constexpr (is_dsv41(MT)) {
       if (p.implementation == Implementation::MixedCache) {
         p.block_threads = kernels::dsv41_fp8::Dsv41MixedCacheDecodeResources::BLOCK_THREADS;
         p.shared_bytes = Fp8DecodeSharedLayout<MT, true>::TOTAL_BYTES;
@@ -73,7 +73,7 @@ void prefill_resources(ExecutionPlan& p) {
     using Resources = Fp8PrefillResources<MT, QkComputeMode::FP8, void>;
     p.block_threads = Resources::BLOCK_THREADS;
     p.shared_bytes = Resources::SHARED_BYTES;
-    if constexpr (MT == ModelType::DSV4_1) {
+    if constexpr (is_dsv41(MT)) {
       if (p.metadata.extra_fp4) {
         using MixedResources =
             Fp8PrefillResources<MT, QkComputeMode::FP8,
@@ -95,8 +95,8 @@ void prefill_resources(ExecutionPlan& p) {
 
 ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute requested,
                                 int requested_cpb, DeviceCaps caps) {
-  TVM_FFI_ICHECK(m.model >= 0 && m.model <= 5 && m.tokens > 0 && m.heads > 0 &&
-                 m.heads <= DecodeMaxHeads && m.topk > 0)
+  TVM_FFI_ICHECK(m.model >= 0 && m.model <= int(ModelType::DSV4_1_INLINE) && m.tokens > 0 &&
+                 m.heads > 0 && m.heads <= DecodeMaxHeads && m.topk > 0)
       << "unsupported sparse-MLA attention metadata";
   TVM_FFI_ICHECK(m.extra_topk >= 0 && m.topk <= INT_MAX - 64 - m.extra_topk &&
                  m.tokens <= INT_MAX / 8 && (!m.has_extra_lengths || m.extra_topk > 0))
@@ -116,24 +116,25 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
       << "invalid main page stride";
   TVM_FFI_ICHECK(m.indices_stride >= size_t(m.topk) && m.lse_stride >= size_t(m.heads))
       << "invalid indices/LSE stride";
-  TVM_FFI_ICHECK(!m.extra_fp4 || (mt == ModelType::DSV4_1 && dual))
-      << "extra FP4 requires DSV41 dual cache";
-  TVM_FFI_ICHECK(!dual || mt == ModelType::DSV4 || mt == ModelType::DSV4_1)
+  TVM_FFI_ICHECK(!m.extra_fp4 || (is_dsv41(mt) && dual)) << "extra FP4 requires DSV41 dual cache";
+  TVM_FFI_ICHECK(!dual || mt == ModelType::DSV4 || is_dsv41(mt))
       << "sparse-MLA has no dual-cache form";
-  TVM_FFI_ICHECK(!dual || (main_page_supported(mt, m.extra_page_size) &&
-                           m.extra_indices_stride >= size_t(m.extra_topk) &&
-                           m.extra_page_stride_bytes >=
-                               size_t(m.extra_page_size) *
-                                   (m.extra_fp4 ? Dsv41Fp4Layout::BYTES_PER_TOKEN : bpt) &&
-                           m.extra_page_stride_bytes % 16 == 0))
+  const size_t extra_bpt = m.extra_fp4 ? Dsv41Fp4Layout::BYTES_PER_TOKEN : bpt;
+  TVM_FFI_ICHECK(
+      !dual ||
+      (main_page_supported(mt, m.extra_page_size) &&
+       m.extra_indices_stride >= size_t(m.extra_topk) && m.extra_row_stride_bytes >= extra_bpt &&
+       (inline_scale ? m.extra_row_stride_bytes % 16 == 0
+                     : m.extra_row_stride_bytes == extra_bpt) &&
+       m.extra_page_stride_bytes >= size_t(m.extra_page_size) * m.extra_row_stride_bytes &&
+       m.extra_page_stride_bytes % 16 == 0))
       << "invalid extra page layout";
   TVM_FFI_ICHECK(mt != ModelType::DOTS3_SWA ||
                  m.topk >= DecodeTileCfg<ModelType::DOTS3_SWA>::WINDOW)
       << "sparse-MLA DOTS3 requires topk >= 513";
   TVM_FFI_ICHECK(requested != NumericRoute::NVFP4) << "wrong module for NVFP4";
-  TVM_FFI_ICHECK(
-      requested != NumericRoute::FullBF16 ||
-      (mt == ModelType::DSV4_1 && ((m.variant == 0 && m.tokens <= 64) || m.variant == 1)))
+  TVM_FFI_ICHECK(requested != NumericRoute::FullBF16 ||
+                 (is_dsv41(mt) && ((m.variant == 0 && m.tokens <= 64) || m.variant == 1)))
       << "full BF16 requires DSV41 decode or SG prefill";
   ExecutionPlan p{};
   p.metadata = m;
@@ -168,6 +169,7 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
       RES(DSV4);
       RES(DOTS3_SWA);
       RES(DSV4_1);
+      RES(DSV4_1_INLINE);
     }
 #undef RES
   } else if (requested == NumericRoute::FullBF16) {
@@ -187,12 +189,15 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
         << "invalid sparse-MLA prefill variant/topk/indices";
     TVM_FFI_ICHECK(!dual || m.extra_indices_stride == size_t(m.extra_topk))
         << "prefill extra indices must be dense";
-    TVM_FFI_ICHECK(!inline_scale || m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes)
+    // DSV4_1_INLINE indices already address rows of the whole cache, so its
+    // pages may be padded; the other inline formats address page slots.
+    TVM_FFI_ICHECK(!inline_scale || mt == ModelType::DSV4_1_INLINE ||
+                   m.page_stride_bytes == size_t(m.page_size) * m.row_stride_bytes)
         << "inline prefill requires contiguous pages";
     TVM_FFI_ICHECK(has_prefill_heads(mt, m.variant, m.heads))
         << "unsupported sparse-MLA prefill heads";
     if (m.variant == 1) {
-      TVM_FFI_ICHECK(!dual || mt == ModelType::DSV4_1) << "unsupported SG dual cache";
+      TVM_FFI_ICHECK(!dual || is_dsv41(mt)) << "unsupported SG dual cache";
       p.implementation = m.extra_fp4 ? Implementation::MixedCache : Implementation::SG;
       p.head_blocks = (m.heads + 15) / 16;
     } else if (m.variant == 4) {
@@ -226,6 +231,7 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
       RES(DSV4);
       RES(DOTS3_SWA);
       RES(DSV4_1);
+      RES(DSV4_1_INLINE);
     }
 #undef RES
   }
@@ -246,11 +252,11 @@ ffi::Module resolve_descriptor(ffi::Array<int64_t> values, int64_t numeric, int6
 ffi::Array<int64_t> candidates(int64_t model, int64_t heads, int64_t topk, int64_t page, bool dual,
                                int64_t extra_page, ffi::String precision) {
   ffi::Array<int64_t> result;
-  if (model < 0 || model > int(ModelType::DSV4_1) || heads < 1 || heads > DecodeMaxHeads ||
+  if (model < 0 || model > int(ModelType::DSV4_1_INLINE) || heads < 1 || heads > DecodeMaxHeads ||
       topk < 1 || topk > INT_MAX - 128 || page < 1 || page > INT_MAX || extra_page < 0 ||
       extra_page > INT_MAX)
     return result;
-  if (precision != "default" && model != int(ModelType::DSV4_1)) return result;
+  if (precision != "default" && !is_dsv41(static_cast<ModelType>(model))) return result;
   const auto format = cache_format_info(static_cast<ModelType>(model));
   const auto numeric = precision == "bf16"  ? NumericRoute::FullBF16
                        : precision == "fp8" ? NumericRoute::FP8
@@ -272,7 +278,8 @@ ffi::Array<int64_t> candidates(int64_t model, int64_t heads, int64_t topk, int64
                       false,
                       false,
                       false,
-                      0};
+                      0,
+                      dual ? size_t(format.bytes_per_token) : 0};
   for (int variant = 0; variant <= int(PrefillVariant::SWAPAB); ++variant) {
     m.variant = variant;
     try {
@@ -307,7 +314,7 @@ ffi::Map<int64_t, int64_t> metadata_candidates(ffi::Array<int64_t> values, int64
 }
 
 ffi::Map<ffi::String, int64_t> format_info(int64_t model) {
-  TVM_FFI_ICHECK(model >= 0 && model <= int(ModelType::DSV4_1));
+  TVM_FFI_ICHECK(model >= 0 && model <= int(ModelType::DSV4_1_INLINE));
   const auto f = cache_format_info(static_cast<ModelType>(model));
   return {
       {"query_dim", f.query_dim},
@@ -331,7 +338,7 @@ ffi::Map<ffi::String, int64_t> format_info(int64_t model) {
 }
 
 ffi::Array<int64_t> decode_head_counts(int64_t model) {
-  TVM_FFI_ICHECK(model >= 0 && model <= int(ModelType::DSV4_1));
+  TVM_FFI_ICHECK(model >= 0 && model <= int(ModelType::DSV4_1_INLINE));
   ffi::Array<int64_t> result;
   for (int heads = 1; heads <= DecodeMaxHeads; ++heads) {
     int specialized = 0;
@@ -346,6 +353,7 @@ ffi::Array<int64_t> decode_head_counts(int64_t model) {
       MODEL(GLM53_NOPE);
       MODEL(DOTS3_SWA);
       MODEL(DSV4_1);
+      MODEL(DSV4_1_INLINE);
     }
 #undef MODEL
     if (specialized != 0) result.push_back(specialized);
@@ -354,7 +362,7 @@ ffi::Array<int64_t> decode_head_counts(int64_t model) {
 }
 
 ffi::Array<int64_t> main_page_sizes(int64_t model) {
-  TVM_FFI_ICHECK(model >= 0 && model <= int(ModelType::DSV4_1));
+  TVM_FFI_ICHECK(model >= 0 && model <= int(ModelType::DSV4_1_INLINE));
   ffi::Array<int64_t> result;
   const auto mt = static_cast<ModelType>(model);
   if (runtime_page(mt)) return result;  // any positive page size
@@ -363,14 +371,15 @@ ffi::Array<int64_t> main_page_sizes(int64_t model) {
 }
 
 int64_t resolve_format(int64_t query_dim, ffi::String scale) {
-  for (int model = 0; model <= int(ModelType::DSV4_1); ++model) {
+  for (int model = 0; model <= int(ModelType::DSV4_1_INLINE); ++model) {
     const auto mt = static_cast<ModelType>(model);
     const auto f = cache_format_info(mt);
     const bool selected = mt == ModelType::DSV3_2 ? (scale == "auto" || scale == "pow2_fp32")
                           : mt == ModelType::GLM_NSA || mt == ModelType::GLM53_NOPE
                               ? scale == "arbitrary_fp32"
-                          : mt == ModelType::DSV4_1 ? scale == "ue8m0_g32"
-                                                    : scale == "auto";
+                          : mt == ModelType::DSV4_1        ? scale == "ue8m0_g32"
+                          : mt == ModelType::DSV4_1_INLINE ? scale == "ue8m0_g32_inline"
+                                                           : scale == "auto";
     if (f.query_dim == query_dim && selected) return model;
   }
   TVM_FFI_THROW(ValueError) << "unsupported d_qk=" << query_dim

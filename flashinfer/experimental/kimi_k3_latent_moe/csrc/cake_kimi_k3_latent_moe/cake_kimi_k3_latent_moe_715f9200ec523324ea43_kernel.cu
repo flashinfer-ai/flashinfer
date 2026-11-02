@@ -319,6 +319,12 @@ kernel_cake_kimi_k3_latent_moe_715f9200ec523324ea43(const __grid_constant__ CUte
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
                 }
+                #pragma unroll
+                for (int _ = 0; _ < 9; _++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 9) { load_stage = 0; _phase_mma_done ^= 1; }
+                }
             }
         }
     }

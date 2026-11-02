@@ -1,17 +1,17 @@
 # Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
-"""Cheap NVFP4 auto-admission; source and shortlist checks live in the runner."""
+"""Cheap NVFP4 input geometry checks for ordinary MoELayer candidates."""
 
 import torch
 
 from .....fused_moe.api import QuantFormat, RoutingInputMode
 from ..activations import activation_name
-from ..support import quantized_moe_geometry
+from ..support import SUPPORTED_ARCH_NUMBERS, moe_geometry
 
 
 def is_eligible(config, act, arch):
     x = act.hidden_states_q
     if not (
-        arch == 107
+        arch in SUPPORTED_ARCH_NUMBERS
         and config.quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
         and config.quant.output == QuantFormat.BF16
         and act.routing_input_mode == RoutingInputMode.PackedPrecomputed
@@ -23,10 +23,4 @@ def is_eligible(config, act, arch):
         activation_name(config.activation)
     except NotImplementedError:
         return False
-    return quantized_moe_geometry(config, act, hidden_size=2 * x.shape[1])
-
-
-def create_runner(config, device):
-    from .moe import automatic_candidate
-
-    return automatic_candidate(config, device)
+    return moe_geometry(config, act, hidden_size=2 * x.shape[1])

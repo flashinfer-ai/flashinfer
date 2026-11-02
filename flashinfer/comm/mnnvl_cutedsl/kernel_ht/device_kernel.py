@@ -43,6 +43,13 @@ from ..cute_dsl_primitives import (
     store_global_u32x4,
     store_shared_u32x4,
 )
+from ..dynamic_fp8_epilogue import (
+    abs_max_f32x8,
+    store_dynamic_fp8_output,
+    store_token_scale,
+    token_scale_from_amax,
+)
+from ..static_fp8_epilogue import store_rmsnorm_output
 
 SMEM_ALIGNMENT = 1024
 
@@ -71,6 +78,7 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         add_residual: bool,
         write_residual_output: bool,
         enable_pdl: bool,
+        dynamic_fp8: bool = False,
     ) -> None:
         if tp not in (2, 4, 8, 16):
             raise ValueError("tp must be 2, 4, 8, or 16")
@@ -130,6 +138,8 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         self.include_shared_expert = include_shared_expert
         self.add_residual = add_residual
         self.write_residual_output = write_residual_output
+        # FP8 output with a per-token scale written to output_scale[token].
+        self.dynamic_fp8 = dynamic_fp8
         self.enable_pdl = enable_pdl
         self.metadata_chunks = (top_k + WARP_SIZE - 1) // WARP_SIZE
         self.metadata_slots = max(top_k, 1)
@@ -216,6 +226,91 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
             barrier_0.arrive_and_wait()
 
     @cute.jit
+    def _dynamic_fp8_token_scale(
+        self,
+        thread_max: Float32,
+        norm_warp_max: cute.Tensor,
+        stage_slot: Int32,
+        rms_group_warp: Int32,
+        rms_group: Int32,
+    ) -> Float32:
+        """Per-token E4M3 scale from the amax over one RMS group's threads.
+
+        Each stage slot owns ``rms_warps_per_token`` shared maxima. A slot is
+        rewritten only after the next token's sum-of-squares barriers, which
+        every reader of the previous token has already passed.
+        """
+        warp_max = cute.arch.warp_reduction_max(thread_max)
+        slot_base = stage_slot * self.rms_warps_per_token
+        if cute.arch.lane_idx() == 0:
+            cute.arch.store(
+                (norm_warp_max + slot_base + rms_group_warp).llvm_ptr, warp_max
+            )
+        self._rms_arrive_and_wait(rms_group)
+        token_max = Float32(0.0)
+        for slot in cutlass.range_constexpr(self.rms_warps_per_token):
+            token_max = cute.arch.fmax(
+                token_max,
+                cute.arch.load((norm_warp_max + slot_base + slot).llvm_ptr, Float32),
+            )
+        return token_scale_from_amax(token_max)
+
+    @cute.jit
+    def _store_dynamic_fp8_from_shared(
+        self,
+        rows: cute.Tensor,
+        stage_slot: Int32,
+        rms_pack_base: Int32,
+        rms_pack_stride: Int32,
+        inv_rms: Float32,
+        gamma_values: list,
+        norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        scale_out: cute.Tensor,
+        norm_warp_max: cute.Tensor,
+        rms_group_warp: Int32,
+        rms_group: Int32,
+        token: Int64,
+    ) -> None:
+        """Dynamic E4M3 epilogue of the pipelined RMS path.
+
+        The pre-norm row stays staged in shared memory, so both passes reload
+        it there and recompute the same FP32 norm.
+        """
+        thread_max = Float32(0.0)
+        for item in cutlass.range_constexpr(self.rms_vectors_per_thread):
+            pack = rms_pack_base + item * rms_pack_stride
+            prenorm = packed_u32x4_to_bf16x8(
+                load_shared_u32x4(
+                    rows.iterator + stage_slot * self.hidden + pack * VEC_BF16
+                )
+            ).to(Float32)
+            thread_max = abs_max_f32x8(
+                prenorm * inv_rms * gamma_values[item], thread_max
+            )
+        token_scale = self._dynamic_fp8_token_scale(
+            thread_max, norm_warp_max, stage_slot, rms_group_warp, rms_group
+        )
+        if rms_group_warp == 0 and cute.arch.lane_idx() == 0:
+            store_token_scale(scale_out, token, token_scale)
+        inverse_scale = Float32(1.0) / token_scale
+        token_pack = token * self.packs_per_token
+        for item in cutlass.range_constexpr(self.rms_vectors_per_thread):
+            pack = rms_pack_base + item * rms_pack_stride
+            prenorm = packed_u32x4_to_bf16x8(
+                load_shared_u32x4(
+                    rows.iterator + stage_slot * self.hidden + pack * VEC_BF16
+                )
+            ).to(Float32)
+            store_dynamic_fp8_output(
+                prenorm * inv_rms * gamma_values[item],
+                norm_output,
+                Int64((token_pack + pack) * VEC_BF16),
+                inverse_scale,
+                norm_output_bf16,
+            )
+
+    @cute.jit
     def __call__(
         self,
         routed_output: cute.Tensor,
@@ -228,6 +323,8 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         prenorm_mailbox: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         ready_counter_peer_addresses: cute.Tensor,
         ready_counters: cute.Tensor,
         processed_counters: cute.Tensor,
@@ -249,6 +346,7 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
             consumer_progress: cute.struct.MemRange[Int32, self.consumer_warps]
             norm_warp_sums: cute.struct.MemRange[Float32, self.rms_warp_sum_slots]
             norm_inv_rms: cute.struct.MemRange[Float32, self.rms_stage_slots]
+            norm_warp_max: cute.struct.MemRange[Float32, self.rms_warp_sum_slots]
             rows: cute.struct.Align[
                 cute.struct.MemRange[BFloat16, cute.cosize(smem_layout)],
                 SMEM_ALIGNMENT,
@@ -266,6 +364,8 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
             prenorm_mailbox,
             residual_output,
             norm_output,
+            norm_output_bf16,
+            output_scale,
             ready_counter_peer_addresses,
             ready_counters,
             processed_counters,
@@ -294,6 +394,8 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         prenorm_mailbox: cute.Tensor,
         residual_output: cute.Tensor,
         norm_output: cute.Tensor,
+        norm_output_bf16: cute.Tensor | None,
+        output_scale: cute.Tensor | None,
         ready_counter_peer_addresses: cute.Tensor,
         ready_counters: cute.Tensor,
         processed_counters: cute.Tensor,
@@ -320,6 +422,7 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         consumer_progress = storage.consumer_progress.data_ptr()
         norm_warp_sums = storage.norm_warp_sums.data_ptr()
         norm_inv_rms = storage.norm_inv_rms.data_ptr()
+        norm_warp_max = storage.norm_warp_max.data_ptr()
         if tidx < self.consumer_warps:
             cute.arch.store((consumer_progress + tidx).llvm_ptr, Int32(0))
         cute.arch.sync_threads()
@@ -680,9 +783,26 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                             inv_rms = cute.arch.load(
                                 (norm_inv_rms + stage_slot).llvm_ptr, Float32
                             )
+                            if cutlass.const_expr(self.dynamic_fp8):
+                                self._store_dynamic_fp8_from_shared(
+                                    rows,
+                                    stage_slot,
+                                    rms_pack_base,
+                                    rms_pack_stride,
+                                    inv_rms,
+                                    gamma_values,
+                                    norm_output,
+                                    norm_output_bf16,
+                                    output_scale,
+                                    norm_warp_max,
+                                    rms_group_warp,
+                                    rms_group,
+                                    stage_token,
+                                )
+                            # The dynamic FP8 epilogue above replaces these stores.
                             norm_packed = []
                             for item in cutlass.range_constexpr(
-                                self.rms_vectors_per_thread
+                                0 if self.dynamic_fp8 else self.rms_vectors_per_thread
                             ):
                                 pack = rms_pack_base + item * rms_pack_stride
                                 prenorm = packed_u32x4_to_bf16x8(
@@ -697,18 +817,16 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                                 )
                                 norm_packed.append(bf16x8_to_packed_u32x4(result))
                             for item in cutlass.range_constexpr(
-                                self.rms_vectors_per_thread
+                                0 if self.dynamic_fp8 else self.rms_vectors_per_thread
                             ):
                                 pack = rms_pack_base + item * rms_pack_stride
                                 linear_pack = token_pack + pack
-                                store_global_u32x4(
-                                    Int64(
-                                        (
-                                            norm_output.iterator
-                                            + linear_pack * VEC_BF16
-                                        ).toint()
-                                    ),
+                                store_rmsnorm_output(
                                     norm_packed[item],
+                                    norm_output,
+                                    Int64(linear_pack * VEC_BF16),
+                                    output_scale,
+                                    norm_output_bf16,
                                 )
                     copy_wave += rms_wave_stride * self.rms_pipeline_stages
                     copy_token = copy_wave * self.tp + cta_slot
@@ -828,8 +946,45 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                         if cutlass.const_expr(self.weight_bias != 0.0):
                             gamma_value = gamma_value + Float32(self.weight_bias)
                         gamma_values.append(gamma_value)
+                    if cutlass.const_expr(self.dynamic_fp8):
+                        thread_max = Float32(0.0)
+                        for item in cutlass.range_constexpr(
+                            self.rms_vectors_per_thread
+                        ):
+                            thread_max = abs_max_f32x8(
+                                prenorm_fragments[item, None].load().to(Float32)
+                                * inv_rms
+                                * gamma_values[item],
+                                thread_max,
+                            )
+                        token_scale = self._dynamic_fp8_token_scale(
+                            thread_max,
+                            norm_warp_max,
+                            rms_group,
+                            rms_group_warp,
+                            rms_group,
+                        )
+                        if rms_group_warp == 0 and lane == 0:
+                            store_token_scale(output_scale, copy_token, token_scale)
+                        inverse_scale = Float32(1.0) / token_scale
+                        for item in cutlass.range_constexpr(
+                            self.rms_vectors_per_thread
+                        ):
+                            pack = rms_pack_base + item * rms_pack_stride
+                            store_dynamic_fp8_output(
+                                prenorm_fragments[item, None].load().to(Float32)
+                                * inv_rms
+                                * gamma_values[item],
+                                norm_output,
+                                Int64((token_pack + pack) * VEC_BF16),
+                                inverse_scale,
+                                norm_output_bf16,
+                            )
+                    # The dynamic FP8 epilogue above replaces these stores.
                     norm_packed = []
-                    for item in cutlass.range_constexpr(self.rms_vectors_per_thread):
+                    for item in cutlass.range_constexpr(
+                        0 if self.dynamic_fp8 else self.rms_vectors_per_thread
+                    ):
                         pack = rms_pack_base + item * rms_pack_stride
                         linear_pack = token_pack + pack
                         prenorm_for_norm = (
@@ -839,14 +994,17 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
                             BFloat16
                         )
                         norm_packed.append(bf16x8_to_packed_u32x4(result))
-                    for item in cutlass.range_constexpr(self.rms_vectors_per_thread):
+                    for item in cutlass.range_constexpr(
+                        0 if self.dynamic_fp8 else self.rms_vectors_per_thread
+                    ):
                         pack = rms_pack_base + item * rms_pack_stride
                         linear_pack = token_pack + pack
-                        store_global_u32x4(
-                            Int64(
-                                (norm_output.iterator + linear_pack * VEC_BF16).toint()
-                            ),
+                        store_rmsnorm_output(
                             norm_packed[item],
+                            norm_output,
+                            Int64(linear_pack * VEC_BF16),
+                            output_scale,
+                            norm_output_bf16,
                         )
                     copy_wave += self.cta_groups * self.rms_token_groups
                     copy_token = copy_wave * self.tp + cta_slot

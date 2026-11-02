@@ -115,6 +115,8 @@ static inline ActType activationTypeToGatedActType(ActivationType actType) {
   switch (actType) {
     case ActivationType::Swiglu:
       return ActType::SwiGlu;
+    case ActivationType::SwigluStep:
+      return ActType::SwiGluStep;
     case ActivationType::Geglu:
       return ActType::GeGlu;
     case ActivationType::Situ:
@@ -448,13 +450,13 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
       mUsePerTokenScalingGemm2(usePerTokenScalingGemm2),
       mUsePerChannelScalingGemm1(usePerChannelScalingGemm1),
       mUsePerChannelScalingGemm2(usePerChannelScalingGemm2),
-      mPermuteGemm1(PermuteGemm1::Runner(
+      mPermuteGemm1(Gemm1Runner(
           dtypeAct, dtypeWeights, usePerTokenScalingGemm2 ? btg::Dtype::Bfloat16 : dtypeAct,
           useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
           gemm1BiasType, usePerTokenScalingGemm1, usePerChannelScalingGemm1)),
-      mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
-                           tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm2,
-                           usePerChannelScalingGemm2)) {
+      mGemm2(Gemm2Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
+                         tileTokensDim, useShuffledMatrix, weightLayout, usePerTokenScalingGemm2,
+                         usePerChannelScalingGemm2)) {
   auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
   auto const& gemm2PassingIndices = mGemm2.getPassingConfigIndices();
 
@@ -745,6 +747,9 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     FLASHINFER_CHECK(
         workspace.token_scales_fc2 != nullptr,
         "workspace.token_scales_fc2 must be provided When using explicit quantization.");
+    // One NVFP4RecipeSpec per launch feeds both the runtime globalScaleInv and the
+    // compile-time e4m3Max, so they cannot desync.
+    auto const recipe = tensorrt_llm::kernels::resolveNVFP4Recipe(args.nvfp4_4over6_code);
     auto const sfLayoutB = mGemm2.mRunner.getSfLayoutB(config.gemm2Config);
     auto sfLayout = QuantizationSFLayout::LINEAR;
     switch (sfLayoutB) {
@@ -758,13 +763,6 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         FLASHINFER_CHECK(false, "Unsupported FC2 block scale layout ",
                          btg::sfLayoutToString(sfLayoutB));
     }
-
-    // One NVFP4RecipeSpec per launch feeds both the runtime globalScaleInv and the
-    // compile-time e4m3Max, so they cannot desync.
-    // TODO(aleozlx, #5141): thread a caller-supplied recipe code through the
-    // trtllm_fp4_block_scale_moe FFI; until then this runner resolves from the env.
-    auto const recipe =
-        tensorrt_llm::kernels::resolveNVFP4Recipe(tensorrt_llm::kernels::kNVFP44Over6FromEnv);
     invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
         args.num_tokens * totalExpertsPerToken, args.intermediate_size,
         reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), recipe.globalScaleInv(),

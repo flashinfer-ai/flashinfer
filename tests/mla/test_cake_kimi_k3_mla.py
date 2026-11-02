@@ -203,6 +203,44 @@ def test_mtp_variable_q(num_heads, q_lens, kv_lens):
     _check(out, _reference(case), atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "num_heads,kv_lens",
+    [
+        (12, [770]),  # one request: the 16-row tile, 7 KV tiles, three splits
+        (
+            12,
+            [770, 768, 785, 802, 812, 738, 889, 741],
+        ),  # the Kimi-K3 layer-91 band (11-14 pages)
+        (96, [6000, 5000]),  # 96-row tile, always-exact path
+        (96, [9000]),  # two-CTA wide route
+    ],
+)
+def test_decode_sink_key_rows(num_heads, kv_lens):
+    """A sink key ~150 octaves above every other key for most heads of a row tile, flat scores for the others.
+
+    The lazy E4M3 reference of the row-tile programs is re-referenced per tile for every column of an exceeding
+    warpgroup; before the bounded-drop rule a sink-less column's later move pulled the sink columns ~120 octaves
+    down and the FP32 rescale overflowed (Inf / NaN rows in Kimi-K3 serving).  The output must be finite and match
+    the FP32 reference.
+    """
+    _skip_unless_sm100_family()
+    device = torch.device("cuda")
+    case = _make_case(
+        len(kv_lens), [1] * len(kv_lens), kv_lens, num_heads, seed=645011, device=device
+    )
+    sink_heads = [h for h in range(num_heads) if h % 4 != 3]
+    for b in range(len(kv_lens)):
+        page = int(case["block_tables"][b, 0].item())
+        case["kv_cache"][page, 0] = _fp8(torch.full((QK_DIM,), 2.0, device=device))
+        case["query"][b, sink_heads] = _fp8(torch.full((QK_DIM,), 1.25, device=device))
+    out = _run(case, fixed_q_len=1)
+    _check(out, _reference(case), atol=0.1, rtol=0.1)
+    rel = (out.float() - _reference(case).float()).norm(dim=-1) / _reference(
+        case
+    ).float().norm(dim=-1).clamp_min(1e-6)
+    assert float(rel.max()) <= 0.05
+
+
 def test_incremental_prefill_prefix_reuse():
     _skip_unless_sm100_family()
     device = torch.device("cuda")
@@ -473,7 +511,33 @@ def test_plan_is_shared_across_calls_of_one_shape():
     narrow = plan_attention(
         batch=1, max_q_len=1, num_heads=12, max_seq_len=40000, sm_count=148
     )
-    assert not narrow.wide and narrow.main_kind == "main_rt16"
+    assert not narrow.wide and narrow.main_kind == "main_rt16_late"
+
+
+def test_late_trigger_route_follows_the_main_grid():
+    from flashinfer.mla.cake_kimi_k3_mla import (
+        LATE_TRIGGER_MIN_MAIN_CTAS,
+        plan_attention,
+    )
+
+    # Main CTAs on 152 SMs: 16, 32, and 128 with one split (no reducer).
+    for batch, max_seq_len, kind in (
+        (1, 4096, "main_rt16"),
+        (8, 1024, "main_rt16_late"),
+        (128, 1024, "main_rt16"),
+    ):
+        plan = plan_attention(
+            batch=batch,
+            max_q_len=1,
+            num_heads=12,
+            max_seq_len=max_seq_len,
+            sm_count=152,
+        )
+        ctas = plan.grid_main[0] * plan.grid_main[1] * plan.grid_main[2]
+        assert plan.main_kind == kind
+        assert (kind == "main_rt16_late") == (
+            plan.num_split > 1 and ctas >= LATE_TRIGGER_MIN_MAIN_CTAS
+        )
 
 
 def test_every_kernel_key_resolves_on_the_running_architecture():
@@ -491,12 +555,12 @@ def test_every_kernel_key_resolves_on_the_running_architecture():
             "arg_plan",
             "arches",
         }
-    # A per-architecture key names one program per supported architecture and nothing else.
+    # A per-architecture key names, for each supported architecture, a program generated for it.
     for _key, entry in KERNELS.items():
         if isinstance(entry, dict):
             assert set(entry) == supported_arches()
             assert all(
-                MODULES[name]["arches"] == [name_arch]
+                name_arch in MODULES[name]["arches"]
                 for name_arch, name in entry.items()
             )
 

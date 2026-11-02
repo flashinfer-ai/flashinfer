@@ -32,6 +32,8 @@ import torch
 
 from flashinfer.utils import is_sm100a_supported
 
+from tests.prims_ts.dsl_version import requires_dsl_4_8_for_c_partition_offset
+
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     uniform_pipeline_stage_overrides,
     ActKind,
@@ -52,33 +54,20 @@ pytestmark = [
 ]
 
 
-@pytest.fixture(autouse=True)
-def _skip_sm107_gpu_kernels(request):
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7):
-        return
-    class_name = request.cls.__name__ if request.cls is not None else ""
-    test_name = getattr(request.node, "originalname", request.node.name)
-    if class_name in {"TestFp4Fc1GPU", "TestFp4Fc1SfbTmaRouteCluster2"} or (
-        class_name in {"TestFp4Fc1SfGather", "TestFp4Fc1HT"}
-        and test_name.endswith("_gpu")
-    ):
-        pytest.skip("Prims-TS FP4 FC1 supports SM100 and SM103, not SM107")
-
-
 # FP4 FC1 LowLatency base config (rows 0-23).
 FP4_FC1_LL = dict(
     route_act=1,
     act_kind=1,  # FC1, TMA route, SwiGLU
-    route_sfs_act=0,  # NONE: SF uses padded R128c4 layout (default, working)
+    route_sfs_act=int(
+        RouteImpl.AUTO
+    ),  # AUTO: preserve the format-specific default SF transport
     sf_layout_b=1,
-    cluster_m=1,
-    tile_m=128,
+    umma_cta_count=1,
     mma_m=128,
     mma_k=64,
     dtype_a=int(DType.E2M1),
     dtype_b=int(DType.E2M1),
     dtype_c=int(DType.BF16),
-    sf_bits=8,
     epilogue_regs=128,
     mma_regs=48,
     load_regs=48,
@@ -86,7 +75,7 @@ FP4_FC1_LL = dict(
     copy_sf_regs=48,
     workid_regs=48,
     padding_regs=48,
-    gather_regs=48,
+    load_b_regs=48,
     use_unroll_loop_2x_for_mma=0,
     use_max_tmem_overlap=0,
     batch_mode=int(BatchMode.BATCH_M),
@@ -106,8 +95,12 @@ def _run_fp4_fc1(
     swap_ab=False,
     act_kind=1,
     problem_n=None,
-    route_sfs_act=0,
-    cluster_m=1,
+    route_sfs_act=int(RouteImpl.AUTO),
+    umma_cta_count=1,
+    cluster_dim_x=0,
+    cluster_dim_y=1,
+    fallback_cluster_dim_x=0,
+    fallback_cluster_dim_y=1,
     mma_m=128,
     epi_tile_n=None,
     sf_layout_b=1,
@@ -118,6 +111,14 @@ def _run_fp4_fc1(
     gemm1_beta_value=None,
     scale_c_value=1.0,
     scale_gate_value=1.0,
+    dtype_c=int(DType.BF16),
+    sf_layout_c=int(SfLayout.R128c4),
+    use_tma_store=0,
+    use_shuffled_matrix=0,
+    require_mixed_cga_runtime=False,
+    data_distribution="default",
+    c_row_stride=None,
+    c_partition_offset=0,
 ):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         reference_check,
@@ -133,8 +134,9 @@ def _run_fp4_fc1(
         if k
         not in (
             "act_kind",
+            "dtype_c",
             "route_sfs_act",
-            "cluster_m",
+            "umma_cta_count",
             "mma_m",
             "sf_layout_b",
             "use_unroll_loop_2x_for_mma",
@@ -157,8 +159,15 @@ def _run_fp4_fc1(
         batch_mode=int(BatchMode.BATCH_N if swap_ab else BatchMode.BATCH_M),
         transpose_mma_output=int(swap_ab),
         act_kind=act_kind,
+        dtype_c=dtype_c,
+        sf_layout_c=sf_layout_c,
+        use_tma_store=use_tma_store,
         route_sfs_act=route_sfs_act,
-        cluster_m=cluster_m,
+        umma_cta_count=umma_cta_count,
+        cluster_dim_x=cluster_dim_x,
+        cluster_dim_y=cluster_dim_y,
+        fallback_cluster_dim_x=fallback_cluster_dim_x,
+        fallback_cluster_dim_y=fallback_cluster_dim_y,
         mma_m=mma_m,
         sf_layout_b=sf_layout_b,
         use_unroll_loop_2x_for_mma=unroll,
@@ -170,7 +179,12 @@ def _run_fp4_fc1(
         scale_gate_value=scale_gate_value,
         gemm1_alpha_value=gemm1_alpha_value,
         gemm1_beta_value=gemm1_beta_value,
+        use_shuffled_matrix=use_shuffled_matrix,
         gemm1_clamp_limit_value=gemm1_clamp_limit_value,
+        require_mixed_cga_runtime=require_mixed_cga_runtime,
+        data_distribution=data_distribution,
+        c_row_stride=c_row_stride,
+        c_partition_offset=c_partition_offset,
         **base,
     )
     assert result, f"FP4 FC1 failed: tile_n={tile_n}, tile_k={tile_k}, swap={swap_ab}"
@@ -209,9 +223,8 @@ class TestFp4Fc1Validation:
             batch_mode=int(BatchMode.BATCH_N),
             transpose_mma_output=1,
             route_act=int(RouteImpl.TMA),
-            route_sfs_act=int(RouteImpl.NONE),
+            route_sfs_act=int(RouteImpl.AUTO),
             act_kind=int(ActKind.SWIGLU),
-            tile_m=128,
             tile_k=512,
             mma_k=64,
             dtype_a=int(DType.E2M1),
@@ -223,19 +236,37 @@ class TestFp4Fc1Validation:
             use_early_exit=1,
         )
 
-        tile8 = make_config(tile_n=8, mma_n=8, mma_m=128, cluster_m=1, **common)
+        tile8 = make_config(tile_n=8, mma_n=8, mma_m=128, umma_cta_count=1, **common)
         compute_warp_layout(tile8)
-        assert tile8.num_load_b_warps == 2
-        assert tile8.num_load_sfb_warps == 2
-        assert tile8.num_padding_warps == 3
-        assert tile8.threads_per_cta == 20 * 32
+        assert tile8.warp_layout.num_load_b_warps == 2
+        assert tile8.warp_layout.num_load_sfb_warps == 2
+        assert tile8.warp_layout.num_padding_warps == 3
+        assert tile8.warp_layout.threads_per_cta == 20 * 32
 
-        tile16 = make_config(tile_n=16, mma_n=16, mma_m=256, cluster_m=2, **common)
+        tile16 = make_config(tile_n=16, mma_n=16, mma_m=256, umma_cta_count=2, **common)
         compute_warp_layout(tile16)
-        assert tile16.num_load_b_warps == 2
-        assert tile16.num_load_sfb_warps == 4
-        assert tile16.num_padding_warps == 1
-        assert tile16.threads_per_cta == 20 * 32
+        assert tile16.warp_layout.num_load_b_warps == 2
+        assert tile16.warp_layout.num_load_sfb_warps == 4
+        assert tile16.warp_layout.num_padding_warps == 1
+        assert tile16.warp_layout.threads_per_cta == 20 * 32
+
+    def test_batch_m_shuffled_matrix_requires_complete_shuffle_fragment(self):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            make_config,
+            validate_config,
+        )
+
+        cfg = make_config(
+            **FP4_FC1_LL,
+            tile_n=16,
+            mma_n=16,
+            epi_tile_n=16,
+            tile_k=256,
+            num_stages_tmem_acc=1,
+            use_shuffled_matrix=1,
+        )
+        with pytest.raises(ValueError, match="whole shuffle blocks"):
+            validate_config(cfg, problem_mnk=(128, 128, 256))
 
 
 class TestFp4Fc1GPU:
@@ -246,6 +277,14 @@ class TestFp4Fc1GPU:
 
     def test_tile8_swiglu_noswap(self):
         _run_fp4_fc1(tile_n=8, swap_ab=False, act_kind=1)
+
+    def test_tile8_swiglu_noswap_all_zero_inputs(self):
+        _run_fp4_fc1(
+            tile_n=8,
+            swap_ab=False,
+            act_kind=1,
+            data_distribution="allZeros",
+        )
 
     def test_tile8_swiglu_bias_m(self):
         _run_fp4_fc1(tile_n=8, swap_ab=False, act_kind=1, bias_type=1)
@@ -333,6 +372,29 @@ class TestFp4Fc1GPU:
     def test_tile16_swiglu_noswap(self):
         _run_fp4_fc1(tile_n=16, swap_ab=False, act_kind=1)
 
+    def test_tile32_noact_noswap_shuffled(self):
+        """Batch-M restores logical columns from shared shuffled weights."""
+        _run_fp4_fc1(
+            tile_n=32,
+            problem_n=128,
+            swap_ab=False,
+            act_kind=0,
+            use_shuffled_matrix=1,
+        )
+
+    @pytest.mark.parametrize("dtype_c", (DType.BF16, DType.FP16))
+    def test_tile32_swiglu_noswap_shuffled_tma(self, dtype_c):
+        """One shuffled input fragment feeds the narrower gated TMA output."""
+        _run_fp4_fc1(
+            tile_n=32,
+            problem_n=128,
+            swap_ab=False,
+            act_kind=int(ActKind.SWIGLU),
+            dtype_c=int(dtype_c),
+            use_tma_store=1,
+            use_shuffled_matrix=1,
+        )
+
     def test_tile8_noact_swap(self):
         _run_fp4_fc1(tile_n=8, swap_ab=True, act_kind=0, pipeline_stages=9)
 
@@ -388,6 +450,106 @@ class TestFp4Fc1GPU:
         diff = (out_fp4.float() - out_bf16.float()).abs()
         tolerance = max(0.75, out_bf16.float().abs().max().item() * 0.35)
         assert diff.max().item() < tolerance
+
+    @requires_dsl_4_8_for_c_partition_offset
+    @pytest.mark.parametrize(
+        "tile_n,epi_tile_n,use_tma_store,sf_layout_c,umma_cta_count,mma_m",
+        (
+            (8, 8, 1, SfLayout.R128c4, 1, 128),
+            (32, 32, 0, SfLayout.R8c4, 1, 128),
+            (64, 32, 1, SfLayout.R8c4, 1, 128),
+            (64, 64, 1, SfLayout.R8c4, 2, 256),
+        ),
+    )
+    @pytest.mark.parametrize(
+        "act_kind",
+        (ActKind.RELU2, ActKind.SILU),
+        ids=("relu2", "silu"),
+    )
+    def test_eltwise_swap_epilogue_quant(
+        self,
+        tile_n,
+        epi_tile_n,
+        use_tma_store,
+        sf_layout_c,
+        umma_cta_count,
+        mma_m,
+        act_kind,
+    ):
+        """Non-gated elementwise activation emits packed E2M1 C and scales."""
+        _run_fp4_fc1(
+            tile_n=tile_n,
+            epi_tile_n=epi_tile_n,
+            pipeline_stages=5,
+            tile_scheduler=int(umma_cta_count == 2),
+            num_tokens=130,
+            problem_n=128,
+            swap_ab=True,
+            act_kind=int(act_kind),
+            dtype_c=int(DType.E2M1),
+            sf_layout_c=int(sf_layout_c),
+            use_tma_store=use_tma_store,
+            use_shuffled_matrix=1,
+            scale_c_value=0.5,
+            scale_gate_value=0.25,
+            umma_cta_count=umma_cta_count,
+            mma_m=mma_m,
+            c_row_stride=192,
+            c_partition_offset=32,
+        )
+
+    def test_eltwise_swap_epilogue_quant_tma_ring_partial_tile(self):
+        """Calls past the token limit must not overwrite an in-flight C stage.
+
+        Four epilogue calls per tile share the two-stage scratch ring, and the
+        persistent scheduler keeps that scratch separate from A/B, so the ring
+        relies on wait_group(1) alone. Each expert's single tile holds 40
+        tokens: calls 0 and 1 store, and call 3 then rewrites call 1's stage.
+        """
+        _run_fp4_fc1(
+            tile_n=128,
+            epi_tile_n=32,
+            tile_scheduler=int(TileScheduler.PERSISTENT),
+            num_experts=32,
+            num_tokens=32 * 40,
+            problem_n=128,
+            swap_ab=True,
+            act_kind=int(ActKind.RELU2),
+            dtype_c=int(DType.E2M1),
+            use_tma_store=1,
+            umma_cta_count=2,
+            mma_m=256,
+        )
+
+    def test_tile32_swiglu_noswap_epilogue_quant_direct_gpu(self):
+        """Batch-M quantizes row-local hidden-N blocks through direct STG."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        base = {k: v for k, v in FP4_FC1_LL.items() if k not in ("act_kind", "dtype_c")}
+        result = reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            problem_n=128,
+            problem_k=1024,
+            tile_n=32,
+            mma_n=32,
+            epi_tile_n=32,
+            tile_k=256,
+            **uniform_pipeline_stage_overrides(5),
+            tile_scheduler=0,
+            num_stages_tmem_acc=1,
+            act_kind=int(ActKind.SWIGLU),
+            dtype_c=int(DType.E2M1),
+            sf_layout_c=int(SfLayout.R128c4),
+            use_tma_store=0,
+            use_tma_oob_opt=1,
+            seed=123,
+            **base,
+        )
+        assert result, "batch-M direct-STG E2M1 FC1 output quantization failed"
 
     def test_tile8_swiglu_swap_epilogue_quant_per_token_sfb(self):
         """NVFP4 FC1 applies per-token SFB before bias in the E2M1 epilogue."""
@@ -582,7 +744,8 @@ class TestFp4Fc1SfGather:
             **self._BASE,
         )
 
-    def test_sf_tma_gather4_k512_gpu(self):
+    @pytest.mark.parametrize("num_tokens", [256, 129])
+    def test_sf_tma_gather4_k512_gpu(self, num_tokens):
         """SF TMA gather4 at tile_k=512: GPU correctness."""
         base = {
             k: v
@@ -595,7 +758,7 @@ class TestFp4Fc1SfGather:
 
         result = reference_check(
             num_experts=2,
-            num_tokens=256,
+            num_tokens=num_tokens,
             top_k=1,
             tile_n=8,
             mma_n=8,
@@ -611,6 +774,52 @@ class TestFp4Fc1SfGather:
             **base,
         )
         assert result, "FP4 FC1 SF TMA gather4 at tile_k=512 failed"
+
+    @pytest.mark.arch_rubin
+    def test_sf_tma_gather4_k512_swap_mma_k128_gpu(self):
+        """Swap-AB TMA-gathered SFB with mma_k=128 (FP4_FC1_LowLatency_TRTLLM).
+
+        Two vec4 words share each MMA scale base, so the LINEAR LDS+STTM copy
+        must still walk two uint128 vectors per 32-SF row and stay inside its
+        32-column TMEM stage. Several routed rows per tile exercise rows > 0.
+        """
+        base = {
+            k: v
+            for k, v in self._BASE.items()
+            if k
+            not in (
+                "act_kind",
+                "batch_mode",
+                "transpose_mma_output",
+                "mma_k",
+                "sf_layout_b",
+            )
+        }
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            tile_n=8,
+            mma_n=8,
+            epi_tile_n=8,
+            tile_k=512,
+            mma_k=128,
+            sm_arch=107,
+            **uniform_pipeline_stage_overrides(5),
+            tile_scheduler=0,
+            num_stages_tmem_acc=1,
+            batch_mode=int(BatchMode.BATCH_N),
+            transpose_mma_output=1,
+            act_kind=0,
+            route_sfs_act=int(RouteImpl.TMA),
+            sf_layout_b=int(SfLayout.LINEAR),
+            **base,
+        )
+        assert result, "swap-AB SF TMA gather4 with mma_k=128 failed"
 
     def test_sf_ldgsts_gather_validation(self):
         """SF LDGSTS gather: schedule validation passes."""
@@ -673,9 +882,11 @@ class TestFp4Fc1SfGather:
             act_kind=0,
         )
 
-    def test_sf_tma_gather4_swap_k512_gpu(self):
+    @pytest.mark.parametrize("num_tokens", [256, 129])
+    def test_sf_tma_gather4_swap_k512_gpu(self, num_tokens):
         """SwapAB SF TMA gather4 at tile_k=512: covers routed SFB via TMA."""
         _run_fp4_fc1(
+            num_tokens=num_tokens,
             tile_n=8,
             tile_k=512,
             pipeline_stages=5,
@@ -688,6 +899,129 @@ class TestFp4Fc1SfGather:
 class TestFp4Fc1HT:
     """FP4 FC1 HighThroughput: 2-CTA cluster with routed activation SF."""
 
+    @pytest.mark.timeout(240)
+    @pytest.mark.parametrize("dtype_c", (DType.BF16, DType.FP16))
+    def test_ht_tile256_k256_batch_m_16bit_tma_multi_work_gpu(self, dtype_c):
+        """Gated 16-bit output survives persistent multi-work TMA scratch reuse."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=2048,
+            top_k=1,
+            problem_n=8192,
+            problem_k=256,
+            batch_mode=int(BatchMode.BATCH_M),
+            transpose_mma_output=0,
+            use_shuffled_matrix=1,
+            route_act=int(RouteImpl.TMA),
+            route_sfs_act=int(RouteImpl.LDGSTS),
+            act_kind=int(ActKind.SWIGLU),
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(dtype_c),
+            sf_layout_a=int(SfLayout.LINEAR),
+            sf_layout_b=int(SfLayout.R128c4),
+            umma_cta_count=2,
+            tile_n=256,
+            tile_k=256,
+            mma_m=256,
+            mma_n=256,
+            mma_k=64,
+            epi_tile_n=64,
+            num_stages_a=5,
+            num_stages_b=5,
+            num_stages_smem_sfa=6,
+            num_stages_smem_sfb=6,
+            num_stages_tmem_acc=1,
+            num_stages_tmem_sfa=5,
+            num_stages_tmem_sfb=1,
+            num_stages_c_smem=1,
+            tile_scheduler=int(TileScheduler.PERSISTENT),
+            use_tma_oob_opt=1,
+            use_tma_store=1,
+            num_load_a_warps=8,
+            num_load_sfa_warps=4,
+            fuse_sf_copy_to_mma=1,
+            use_max_tmem_overlap=1,
+            use_early_exit=1,
+            bias_type=int(BiasType.NONE),
+            has_gemm1_clamp_limit=1,
+            epilogue_regs=96,
+            mma_regs=80,
+            load_regs=80,
+            load_sf_regs=80,
+            load_a_regs=64,
+            load_sfa_regs=80,
+            copy_sf_regs=80,
+            workid_regs=80,
+            padding_regs=80,
+        )
+        assert result, f"batch-M tileN-256 {dtype_c.name} FC1 TMA output failed"
+
+    def test_ht_tile256_k256_batch_m_epilogue_quant_gpu(self):
+        """Batch-M uses two hidden-N epilogue groups and distinct TMA scratch."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            problem_n=512,
+            problem_k=1024,
+            batch_mode=int(BatchMode.BATCH_M),
+            transpose_mma_output=0,
+            use_shuffled_matrix=1,
+            route_act=int(RouteImpl.TMA),
+            route_sfs_act=int(RouteImpl.LDGSTS),
+            act_kind=int(ActKind.SWIGLU),
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(DType.E2M1),
+            sf_layout_a=int(SfLayout.LINEAR),
+            sf_layout_b=int(SfLayout.R128c4),
+            sf_layout_c=int(SfLayout.R128c4),
+            umma_cta_count=2,
+            tile_n=256,
+            tile_k=256,
+            mma_m=256,
+            mma_n=256,
+            mma_k=64,
+            epi_tile_n=64,
+            num_stages_a=5,
+            num_stages_b=5,
+            num_stages_smem_sfa=6,
+            num_stages_smem_sfb=6,
+            num_stages_tmem_acc=1,
+            num_stages_tmem_sfa=5,
+            num_stages_tmem_sfb=1,
+            num_stages_c_smem=1,
+            tile_scheduler=int(TileScheduler.PERSISTENT),
+            use_tma_oob_opt=1,
+            use_tma_store=1,
+            num_load_a_warps=8,
+            num_load_sfa_warps=4,
+            fuse_sf_copy_to_mma=1,
+            use_max_tmem_overlap=1,
+            use_early_exit=1,
+            bias_type=int(BiasType.NONE),
+            has_gemm1_clamp_limit=1,
+            epilogue_regs=96,
+            mma_regs=80,
+            load_regs=80,
+            load_sf_regs=80,
+            load_a_regs=64,
+            load_sfa_regs=80,
+            copy_sf_regs=80,
+            workid_regs=80,
+            padding_regs=80,
+        )
+        assert result, "batch-M tileN-256 E2M1 FC1 output quantization failed"
+
     def test_ht_tile64_k256_ldgsts_validation(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
             build_batched_gemm_task_manager,
@@ -697,7 +1031,14 @@ class TestFp4Fc1HT:
             k: v
             for k, v in TestFp4Fc1SfGather._BASE.items()
             if k
-            not in ("cluster_m", "mma_m", "sf_layout_b", "use_unroll_loop_2x_for_mma")
+            not in (
+                "batch_mode",
+                "umma_cta_count",
+                "mma_m",
+                "sf_layout_b",
+                "transpose_mma_output",
+                "use_unroll_loop_2x_for_mma",
+            )
         }
         for unroll in (0,):
             build_batched_gemm_task_manager(
@@ -712,9 +1053,11 @@ class TestFp4Fc1HT:
                 tile_scheduler=1,
                 num_stages_tmem_acc=2,
                 route_sfs_act=2,
-                cluster_m=2,
+                umma_cta_count=2,
                 mma_m=256,
                 sf_layout_b=2,
+                batch_mode=int(BatchMode.BATCH_N),
+                transpose_mma_output=1,
                 use_unroll_loop_2x_for_mma=unroll,
                 **base,
             )
@@ -728,7 +1071,7 @@ class TestFp4Fc1HT:
                 pipeline_stages=6,
                 tile_scheduler=1,
                 route_sfs_act=2,
-                cluster_m=2,
+                umma_cta_count=2,
                 mma_m=256,
                 epi_tile_n=32,
                 sf_layout_b=2,
@@ -744,7 +1087,14 @@ class TestFp4Fc1HT:
         base = {
             k: v
             for k, v in TestFp4Fc1SfGather._BASE.items()
-            if k not in ("cluster_m", "mma_m", "sf_layout_b")
+            if k
+            not in (
+                "batch_mode",
+                "umma_cta_count",
+                "mma_m",
+                "sf_layout_b",
+                "transpose_mma_output",
+            )
         }
         build_batched_gemm_task_manager(
             num_experts=2,
@@ -758,9 +1108,11 @@ class TestFp4Fc1HT:
             tile_scheduler=1,
             num_stages_tmem_acc=2,
             route_sfs_act=2,
-            cluster_m=2,
+            umma_cta_count=2,
             mma_m=256,
             sf_layout_b=2,
+            batch_mode=int(BatchMode.BATCH_N),
+            transpose_mma_output=1,
             **base,
         )
 
@@ -772,12 +1124,92 @@ class TestFp4Fc1HT:
             pipeline_stages=6,
             tile_scheduler=1,
             route_sfs_act=2,
-            cluster_m=2,
+            umma_cta_count=2,
             mma_m=256,
             epi_tile_n=32,
             sf_layout_b=2,
             swap_ab=True,
         )
+
+    def test_ht_tile64_k256_ldgsts_mixed_cga(self):
+        """Mixed CGA with TMA activation and LDGSTS routed-SF barriers."""
+        _run_fp4_fc1(
+            tile_n=64,
+            tile_k=256,
+            pipeline_stages=6,
+            tile_scheduler=1,
+            route_sfs_act=2,
+            umma_cta_count=2,
+            cluster_dim_x=4,
+            cluster_dim_y=2,
+            fallback_cluster_dim_x=2,
+            fallback_cluster_dim_y=1,
+            mma_m=256,
+            epi_tile_n=32,
+            sf_layout_b=2,
+            swap_ab=True,
+            problem_n=8192,
+            require_mixed_cga_runtime=True,
+        )
+
+    def test_ht_tile256_k256_epilogue_quant_gpu(self):
+        """Eight epilogue warps stage distinct E2M1 TMA-store scratch groups."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        result = reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            problem_n=512,
+            problem_k=1024,
+            batch_mode=int(BatchMode.BATCH_N),
+            transpose_mma_output=1,
+            route_act=int(RouteImpl.TMA),
+            route_sfs_act=int(RouteImpl.LDGSTS),
+            act_kind=int(ActKind.SWIGLU),
+            dtype_a=int(DType.E2M1),
+            dtype_b=int(DType.E2M1),
+            dtype_c=int(DType.E2M1),
+            sf_layout_a=int(SfLayout.R128c4),
+            sf_layout_b=int(SfLayout.LINEAR),
+            sf_layout_c=int(SfLayout.R128c4),
+            umma_cta_count=2,
+            tile_n=256,
+            tile_k=256,
+            mma_m=256,
+            mma_n=256,
+            mma_k=64,
+            epi_tile_n=64,
+            num_stages_a=5,
+            num_stages_b=5,
+            num_stages_smem_sfa=6,
+            num_stages_smem_sfb=6,
+            num_stages_tmem_acc=1,
+            num_stages_tmem_sfa=5,
+            num_stages_tmem_sfb=6,
+            tile_scheduler=int(TileScheduler.PERSISTENT),
+            use_tma_oob_opt=1,
+            use_tma_store=1,
+            num_load_b_warps=8,
+            num_load_sfb_warps=4,
+            fuse_sf_copy_to_mma=1,
+            use_max_tmem_overlap=1,
+            use_early_exit=1,
+            bias_type=int(BiasType.NONE),
+            has_gemm1_clamp_limit=1,
+            epilogue_regs=96,
+            mma_regs=80,
+            load_regs=80,
+            load_sf_regs=80,
+            load_b_regs=64,
+            load_sfb_regs=80,
+            copy_sf_regs=80,
+            workid_regs=80,
+            padding_regs=80,
+        )
+        assert result, "tileN-256 E2M1 FC1 output quantization failed"
 
     def test_ht_tile256_k256_ldgplussts_rejected(self):
         """LDG+STS route-SF parsing is explicit but not implemented in TS."""
@@ -789,7 +1221,7 @@ class TestFp4Fc1HT:
             build_batched_gemm_task_manager,
         )
 
-        with pytest.raises(ValueError, match="LDG_PLUS_STS"):
+        with pytest.raises(ValueError, match="Unsupported route"):
             build_batched_gemm_task_manager(
                 num_experts=2,
                 num_tokens=256,
@@ -797,9 +1229,8 @@ class TestFp4Fc1HT:
                 batch_mode=int(BatchMode.BATCH_N),
                 transpose_mma_output=1,
                 route_act=int(RouteImpl.TMA),
-                route_sfs_act=int(RouteImpl.LDG_PLUS_STS),
+                route_sfs_act=3,
                 act_kind=1,
-                tile_m=128,
                 tile_n=256,
                 tile_k=256,
                 epi_tile_m=128,
@@ -807,15 +1238,15 @@ class TestFp4Fc1HT:
                 mma_m=256,
                 mma_n=256,
                 mma_k=64,
-                cluster_m=2,
+                umma_cta_count=2,
                 dtype_a=int(DType.E2M1),
                 dtype_b=int(DType.E2M1),
                 dtype_c=int(DType.BF16),
-                sf_bits=8,
                 **uniform_pipeline_stage_overrides(4),
                 tile_scheduler=1,
                 num_stages_tmem_acc=1,
                 sf_layout_b=int(SfLayout.R128c4),
+                fuse_sf_copy_to_mma=1,
                 use_max_tmem_overlap=1,
                 epilogue_regs=144,
                 mma_regs=88,
@@ -827,7 +1258,7 @@ class TestFp4Fc1HT:
 
 
 class TestFp4Fc1SfbTmaRouteCluster2:
-    """The two routed-SFB (routeSfsAct=tma) cluster_m=2 benchmark configs.
+    """The two routed-SFB (routeSfsAct=tma) umma_cta_count=2 benchmark configs.
 
     These are the swapAB FC1 SwiGLU shapes that motivated routing operand B's
     scale factors through TMA gather4 (Linear SMEM SFB) under a 2-CTA cluster,
@@ -853,13 +1284,12 @@ class TestFp4Fc1SfbTmaRouteCluster2:
             transpose_mma_output=1,
             bias_type=int(BiasType.M),
             has_gemm1_clamp_limit=1,
-            cluster_m=2,
+            umma_cta_count=2,
             dtype_a=int(DType.E2M1),
             dtype_b=int(DType.E2M1),
             dtype_c=int(DType.E2M1),
             epi_tile_n=32,
             tile_k=512,
-            tile_m=128,
             mma_m=256,
             mma_k=64,
             route_act=int(RouteImpl.TMA),
@@ -910,3 +1340,111 @@ class TestFp4Fc1SfbTmaRouteCluster2:
             **base,
         )
         assert result, "routed-SFB tma cluster2 tile_n=64 (256 tokens) failed"
+
+    def test_tile_n64_num_tokens256_mixed_cga(self):
+        """All-TMA FC1 with both 4x1 preferred and 2x1 fallback CGAs."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+        cfg = self._base()
+        cfg.update(
+            cluster_dim_x=4,
+            cluster_dim_y=1,
+            fallback_cluster_dim_x=2,
+            fallback_cluster_dim_y=1,
+            require_mixed_cga_runtime=True,
+        )
+        result = reference_check(
+            num_tokens=256,
+            tile_n=64,
+            mma_n=64,
+            **uniform_pipeline_stage_overrides(4, tmem_acc_stages=2),
+            **cfg,
+        )
+        assert result, "all-TMA FC1 tile_n=64 mixed CGA failed"
+
+    def test_tile_n64_num_tokens256_fixed_4x1(self):
+        """All-TMA FC1 with a fixed 4x1 CGA."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+        cfg = self._base()
+        cfg.update(cluster_dim_x=4, cluster_dim_y=1)
+        result = reference_check(
+            num_tokens=256,
+            tile_n=64,
+            mma_n=64,
+            **uniform_pipeline_stage_overrides(4, tmem_acc_stages=2),
+            **cfg,
+        )
+        assert result, "all-TMA FC1 tile_n=64 fixed 4x1 CGA failed"
+
+
+@pytest.mark.parametrize("dtype", ["nvfp4", "fp8"])
+@pytest.mark.parametrize("overlap", [False, True])
+@pytest.mark.parametrize("use_tma_store", [0, 1])
+@pytest.mark.parametrize("sf_layout", [int(SfLayout.R8c4), int(SfLayout.R128c4)])
+def test_batch_m_quantized_output(dtype, overlap, use_tma_store, sf_layout):
+    """Quantized BatchM output across persistent reuse and the N256 overlap path."""
+    if dtype == "fp8" and sf_layout != int(SfLayout.R8c4):
+        pytest.skip("Plain FP8 output has no block-scale layout")
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_run import reference_check
+
+    nvfp4 = dtype == "nvfp4"
+    dtype_kind = int(DType.E2M1 if nvfp4 else DType.E4M3)
+    cfg = dict(
+        batch_mode=int(BatchMode.BATCH_M),
+        transpose_mma_output=0,
+        dtype_a=dtype_kind,
+        dtype_b=dtype_kind,
+        dtype_c=dtype_kind,
+        tile_n=256 if overlap else 128,
+        tile_k=256 if nvfp4 else 128,
+        mma_m=256,
+        mma_n=256 if overlap else 128,
+        mma_k=64 if nvfp4 else 32,
+        umma_cta_count=2,
+        epi_tile_m=128,
+        epi_tile_n=64,
+        tile_scheduler=1,
+        num_stages_tmem_acc=1 if overlap else 2,
+        use_max_tmem_overlap=int(overlap),
+        fuse_sf_copy_to_mma=int(overlap and nvfp4),
+        use_unroll_loop_2x_for_mma=0,
+        act_kind=int(ActKind.SWIGLU),
+        route_act=0,
+        use_tma_store=use_tma_store,
+        use_global_scales=1,
+        sf_layout_b=int(SfLayout.R128c4),
+        sf_layout_c=sf_layout,
+        **uniform_pipeline_stage_overrides(2),
+    )
+    ok, quant = reference_check(
+        num_experts=3,
+        num_tokens=769,
+        top_k=2,
+        problem_n=512,
+        problem_k=512,
+        repeat_launches=3,
+        scale_c_value=0.75 if nvfp4 else 1024.0,
+        seed=317,
+        return_output=True,
+        **cfg,
+    )
+    ok_ref, bf16 = reference_check(
+        num_experts=3,
+        num_tokens=769,
+        top_k=2,
+        problem_n=512,
+        problem_k=512,
+        repeat_launches=3,
+        scale_c_value=0.75 if nvfp4 else 1024.0,
+        seed=317,
+        return_output=True,
+        **(cfg | {"dtype_c": int(DType.BF16)}),
+    )
+    assert ok and ok_ref
+    # reference_check poisons C with NaN and never writes the padded-token tail.
+    stored = torch.isfinite(quant.float()) & torch.isfinite(bf16.float())
+    assert stored.all(dim=1).sum() >= 769 * 2, "not every routed row was stored"
+    quant, bf16 = quant.float()[stored], bf16.float()[stored]
+    relative_rmse = ((quant - bf16).square().mean() / bf16.square().mean()).sqrt()
+    assert relative_rmse < (0.2 if nvfp4 else 0.05)

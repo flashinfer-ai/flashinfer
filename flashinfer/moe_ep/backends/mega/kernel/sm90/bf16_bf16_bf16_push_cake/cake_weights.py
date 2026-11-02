@@ -68,11 +68,16 @@ def preprocess_mega_weights(
     intermediate_size: int,
     hidden_size: int,
     num_local_experts: int,
+    wcx: bool = False,
 ) -> Any:
     """Interleave canonical bf16 ``w13`` gate/up rows for the fused FC1 kernel.
 
     Accepts canonical bf16 weights only: this backend never quantizes, so a
-    pre-quantized :class:`MoEWeightPack` (with scales) is rejected.
+    pre-quantized :class:`MoEWeightPack` (with scales) is rejected.  With
+    ``wcx`` (the layer's runner resolves WCX on: ``wcx_max_tokens`` > 0 with the
+    FC2 early-start pair, see ``wcx_resolves_on``) the lossless compressed (WCX)
+    copies used by the decode rounds are attached as well (dual format); a
+    layer that cannot be encoded keeps the bf16 path only.
     """
     import torch
 
@@ -112,6 +117,13 @@ def preprocess_mega_weights(
         raise MoEEpConfigError(
             "sm90_bf16_bf16_bf16_push_cake w13 and w2 must be on the same CUDA device"
         )
-    return make_sm90_cake_bf16_weights(
+    transformed = make_sm90_cake_bf16_weights(
         weights.w13.contiguous(), weights.w2.contiguous()
     )
+    if wcx:
+        from ......kernel_src.sm90.cake_bf16_megamoe.shim.cake_weights import (
+            encode_sm90_cake_wcx,
+        )
+
+        transformed = encode_sm90_cake_wcx(transformed)
+    return transformed

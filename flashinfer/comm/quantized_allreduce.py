@@ -518,7 +518,7 @@ def quantized_all_reduce(
             a new tensor.
 
     Returns:
-        AllReduced output tensor (same shape/dtype as input).
+        All-reduced output tensor (same shape/dtype as input).
     """
     if inp.dtype != torch.bfloat16:
         raise ValueError(f"Expected bfloat16, got {inp.dtype}")

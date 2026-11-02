@@ -8,7 +8,6 @@ or cuDNN Frost graph compiler is needed in the deployed process.
 from __future__ import annotations
 
 import functools
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +26,11 @@ from ..runtime import (
     _load_kernel as _load_kernel,
     _load_source as _load_source,
     _read_source as _read_source,
+    _read_manifest as _read_manifest,
+    bind_kernel as bind_kernel,
+    cache_discovery,
+    discovery_binding as discovery_binding,
+    source_binding as source_binding,
     _tactic_digest as _tactic_digest,
     _validate_abi as _validate_abi,
     artifact_root as artifact_root,
@@ -45,6 +49,9 @@ class CudnnFrostGroupedGemm1Kernel:
     contract: dict[str, Any]
     tactic_metadata: dict[str, Any]
     launch_tail: tuple[str, ...]
+    source_parameters: dict | None = None
+    template_path: Path | None = None
+    source_identity: str = ""
 
     @property
     def activation(self):
@@ -59,17 +66,26 @@ class CudnnFrostGroupedGemm1Kernel:
         return self.tactic_metadata.get("swap_ab", False)
 
     @property
+    def quantizes_output(self) -> bool:
+        return False
+
+    @property
     def tactic(self) -> tuple[str, str, str]:
         """Stable identity suitable for FlashInfer's persisted autotuner."""
 
         return (
             "cudnn_frost-grouped-swiglu-v2",
             self.artifact_id,
-            _tactic_digest(self.source_sha256),
+            _tactic_digest(self.source_identity or self.source_sha256),
         )
 
 
 def _artifact_roots() -> tuple[Path, ...]:
+    return _cached_artifact_roots()
+
+
+@functools.cache
+def _cached_artifact_roots() -> tuple[Path, ...]:
     packaged = artifact_root("bf16")
     return (packaged,) if packaged.is_dir() else ()
 
@@ -78,12 +94,7 @@ def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
     path = root / _MANIFEST
     if not path.is_file():
         return []
-    payload = json.loads(path.read_text())
-    if payload.get("schema_version") != 2:
-        raise RuntimeError(f"{path}: unsupported cuDNN Frost manifest schema")
-    kernels = payload.get("kernels")
-    if not isinstance(kernels, list):
-        raise RuntimeError(f"{path}: 'kernels' must be a list")
+    kernels = _read_manifest(path)["kernels"]
 
     result: list[CudnnFrostGroupedGemm1Kernel] = []
     seen: set[str] = set()
@@ -98,6 +109,11 @@ def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
         activation = contract_activation(raw.get("contract", {}))
         if activation not in ACTIVATIONS or op != f"grouped_gemm1_{activation}":
             raise RuntimeError(f"Invalid FC1 activation contract: {artifact_id}")
+        if any(
+            raw["contract"].get(key) != "bfloat16"
+            for key in ("token_dtype", "weight_dtype", "output_dtype")
+        ):
+            raise RuntimeError(f"invalid BF16 numerical contract: {artifact_id}")
         _validate_abi(raw, op)
         source_path, actual = _read_source(root, raw)
         workspace_bytes = int(raw.get("workspace_bytes", -1))
@@ -127,12 +143,13 @@ def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
                 contract=dict(raw.get("contract", {})),
                 tactic_metadata=dict(raw.get("tactic", {})),
                 launch_tail=launch_tail,
+                **source_binding(root, raw, actual),
             )
         )
-    return result
+    return [bound for k in result if (bound := discovery_binding(k)) is not None]
 
 
-@functools.lru_cache(maxsize=8)
+@cache_discovery
 def _discover(
     roots: tuple[Path, ...],
 ) -> tuple[CudnnFrostGroupedGemm1Kernel, ...]:
@@ -144,6 +161,7 @@ def _discover(
 
 
 def clear_artifact_cache() -> None:
+    """Clear shared discovery caches for future builds and explicit refreshes."""
     global _artifact_cache_version
 
     from ..shortlist import _read
@@ -151,6 +169,8 @@ def clear_artifact_cache() -> None:
     from .moe import _selected_kernels_cached
 
     _artifact_cache_version += 1
+    artifact_root.cache_clear()
+    _cached_artifact_roots.cache_clear()
     _discover.cache_clear()
     discover_fc2.cache_clear()
     _selected_kernels_cached.cache_clear()
@@ -199,7 +219,7 @@ def _validate_common(
     if any(not t.is_contiguous() for t in tensors):
         raise ValueError("all grouped GEMM1 tensors must be contiguous")
     if any(t.dtype != torch.bfloat16 for t in tensors[:3]):
-        raise ValueError("the v2 grouped GEMM1 ABI requires BF16 tokens and weights")
+        raise ValueError("the grouped GEMM1 ABI requires BF16 tokens and weights")
     return s, n, k, e, groups
 
 

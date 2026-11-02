@@ -37,6 +37,7 @@ from flashinfer.diffusion_ops import (
     minimax_h3_fc1_swiglu,
     minimax_h3_fc1_swiglu_mxfp8,
     minimax_h3_fc1_swiglu_nvfp4,
+    prepare_minimax_h3_fc1_swiglu_weight_mxfp8,
     prepare_minimax_h3_fc1_weight_mxfp8,
     prepare_minimax_h3_fc1_weight_nvfp4,
 )
@@ -47,10 +48,13 @@ from flashinfer.diffusion_ops.minimax_h3_fc1_swiglu import (
     MINIMAX_H3_FFN,
     MINIMAX_H3_HIDDEN,
     MXFP8_BLOCK,
+    MXFP8_FC1_SCALE_TILE_BYTES,
+    MXFP8_FC1_SWIGLU_SCALE_TILE_BYTES,
     MXFP8_SF_COLS,
     NVFP4_BLOCK,
     NVFP4_PACKED_COLS,
     NVFP4_SF_COLS,
+    _combined_weight_scale_tiles,
     _unswizzle_sf_128x4,
     minimax_h3_nvfp4_alpha,
     minimax_h3_nvfp4_global_scale,
@@ -446,10 +450,16 @@ def run_nvfp4_case(rows: int, model, prepared, device) -> Dict[str, float]:
 
 
 def prepare_mxfp8(model):
-    """Prepared weight plus its FP32 dequantization (from FlashInfer's own quantization)."""
-    w_q, w_tiles = prepare_minimax_h3_fc1_weight_mxfp8(model["fc1_weight"])
+    """Prepared weight (the standalone operator's 112-row scale sub-tile layout) plus its FP32
+    dequantization (from FlashInfer's own quantization)."""
+    w_q, w_tiles = prepare_minimax_h3_fc1_swiglu_weight_mxfp8(model["fc1_weight"])
+    assert w_tiles.numel() == MXFP8_FC1_SWIGLU_SCALE_TILE_BYTES
     fi_q, fi_sf = flashinfer_mxfp8_activation(model["fc1_weight"])
     assert torch.equal(w_q.view(torch.uint8), fi_q.view(torch.uint8))
+    # The fused MLP operator's prepare quantizes identically; only the tile order differs.
+    mlp_q, mlp_tiles = prepare_minimax_h3_fc1_weight_mxfp8(model["fc1_weight"])
+    assert torch.equal(mlp_q.view(torch.uint8), w_q.view(torch.uint8))
+    assert mlp_tiles.numel() == MXFP8_FC1_SCALE_TILE_BYTES
     return w_q, w_tiles, mxfp8_dequantize(fi_q, fi_sf)
 
 
@@ -551,6 +561,71 @@ def test_minimax_h3_fc1_swiglu_invalid_index_rows_are_zero(table_rows, model, de
     assert (out[: len(bad)] == 0).all()
     assert (out[len(bad) :] != 0).any()
     assert_within_budget(out, reference_bf16(x, model, idx), "bf16 invalid-index probe")
+
+
+def test_minimax_h3_fc1_weight_scale_tile_layouts():
+    """The two MXFP8 FC1 weight scale layouts: 128-row tiles for the fused MLP operator and
+    112-row sub-tiles (the NVFP4 layout) for the standalone operator's 256x448 GEMM tile."""
+    generator = torch.Generator().manual_seed(4613)
+    sf = torch.randint(
+        1,
+        255,
+        (MINIMAX_H3_FC1_ROWS, MXFP8_SF_COLS),
+        dtype=torch.uint8,
+        generator=generator,
+    )
+    gate, up = sf[:MINIMAX_H3_FFN], sf[MINIMAX_H3_FFN:]
+    k_sets = MXFP8_SF_COLS // 4
+    assert MXFP8_FC1_SCALE_TILE_BYTES == 4816896
+    assert MXFP8_FC1_SWIGLU_SCALE_TILE_BYTES == 5505024
+    for n_rows, expected_bytes in (
+        (128, MXFP8_FC1_SCALE_TILE_BYTES),
+        (112, MXFP8_FC1_SWIGLU_SCALE_TILE_BYTES),
+    ):
+        tiles = _combined_weight_scale_tiles(sf, n_rows)
+        n_tiles = MINIMAX_H3_FFN // n_rows
+        assert tiles.numel() == expected_bytes == n_tiles * k_sets * 2 * 512
+        # Undo the [tile][k_set][half] order and the 128x4 swizzle: rows [0, n) of block t are
+        # gate rows [n t, n (t + 1)), rows [n, 2n) the matching up rows, rows [2n, 256) zero.
+        swizzled = (
+            tiles.reshape(n_tiles, k_sets, 2, 512).permute(0, 2, 1, 3).reshape(-1)
+        )
+        combined = _unswizzle_sf_128x4(swizzled, n_tiles * 256, MXFP8_SF_COLS)
+        combined = combined.reshape(n_tiles, 256, MXFP8_SF_COLS)
+        assert torch.equal(combined[:, :n_rows], gate.reshape(n_tiles, n_rows, -1))
+        assert torch.equal(
+            combined[:, n_rows : 2 * n_rows], up.reshape(n_tiles, n_rows, -1)
+        )
+        assert not bool(combined[:, 2 * n_rows :].any())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_minimax_h3_fc1_swiglu_mxfp8_rejects_mlp_layout_scale_tiles(model, device):
+    """Tiles prepared for the fused MLP operator (128-row tiles, 112 * 42 * 1024 bytes) fail the
+    standalone operator's exact-size check with a message naming the right prepare (no launch)."""
+    x, idx = make_inputs(8, device)
+    w_q = torch.zeros(
+        (MINIMAX_H3_FC1_ROWS, MINIMAX_H3_HIDDEN),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    mlp_layout_tiles = torch.zeros(
+        MXFP8_FC1_SCALE_TILE_BYTES, dtype=torch.uint8, device=device
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"fc1_scale_tiles must hold exactly 5505024 bytes .*"
+        r"prepare_minimax_h3_fc1_swiglu_weight_mxfp8.*got 4816896",
+    ):
+        minimax_h3_fc1_swiglu_mxfp8(
+            x,
+            model["x_norm_weight"],
+            model["adaln_scale"],
+            model["adaln_shift"],
+            idx,
+            w_q,
+            mlp_layout_tiles,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
