@@ -542,7 +542,7 @@ def _decode_cp_a2a_lse_reduce_token_init(
     batch: int,
     heads: int,
     cp_size: int,
-    head_dim: int = 128,
+    head_dim: int = 512,
     workspace_bytes: int = 16,
     cp_rank: int = 0,
     lse_mode: str = "base2",

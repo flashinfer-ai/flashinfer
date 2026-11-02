@@ -72,7 +72,8 @@ def _get_workspace_state(workspace: torch.Tensor) -> _WorkspaceState:
             "workspace was not created by decode_cp_a2a_lse_reduce_create_workspace"
         )
 
-    stream_id = int(torch.cuda.current_stream(workspace.device).cuda_stream)
+    # Raw-stream lookup avoids constructing a torch.cuda.Stream on every call.
+    stream_id = torch._C._cuda_getCurrentRawStream(workspace.device.index)
     if state.stream_id is None:
         state.stream_id = stream_id
     elif state.stream_id != stream_id:
