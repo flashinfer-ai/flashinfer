@@ -40,15 +40,20 @@ through the autograd entry, CUDA events) of the forget gate's two forms on the
 same raw operands (BF16 raw gate, FP32 ``A_log`` / ``dt_bias``, lower bound
 -5), interleaved in one process (the arm order alternates per step):
 
-* ``R``: the raw gate mode, ``chunk_kda_det(raw, use_gate_in_kernel=True, ...)``
-  (``R_strided``: the raw gate as a column slice of a fused projection);
+* ``R``: the raw gate mode, ``chunk_kda_det(raw, use_gate_in_kernel=True, ...)``;
 * ``E_T``: a torch FP32 gate with autograd, then ``chunk_kda_det(g)``;
 * ``E_F``: flash-linear-attention's gate with autograd, then ``chunk_kda_det(g)``
   (where it imports).
 
+The ``_strided`` arms (``R_strided``, ``E_T_strided``, ``E_F_strided``) take
+the raw gate as a column slice of a fused projection (the leaf is the
+projection, so each step also runs the slice's backward into it).
+
 Per arm: the median step time and its interquartile range, the paired ratio
 against each explicit arm with the upper end of its 95 % t-interval (over the
-per-step log-ratios), the peak memory of one step above the inputs
+per-step log-ratios; ``matched`` when both arms read the raw gate in the same
+layout: ``R`` against ``E_T`` / ``E_F``, ``R_strided`` against
+``E_T_strided`` / ``E_F_strided``), the peak memory of one step above the inputs
 (``max_memory_allocated`` after ``reset_peak_memory_stats``), the memory the
 forward keeps for the backward, the arena bytes and the backend launch count (with
 ``--kernel-times STEPS``: the per-kernel and per-stage GPU time and the actual
@@ -58,7 +63,8 @@ profiler's CUPTI kernel activity), under ``--ckpt`` (``torch.utils.checkpoint``)
 ``--batch-tokens`` tokens)::
 
     python benchmarks/bench_cake_kda_det_train.py --seqlen 16384 --docs 1 3 16 --heads 4 \
-        --gate-arms R R_strided E_T E_F --ckpt off on --save-mode light tape \
+        --gate-arms R R_strided E_T E_F E_T_strided E_F_strided \
+        --ckpt off on --save-mode light tape \
         --arena default lean4 batched --json gate.json
 """
 
@@ -93,9 +99,37 @@ from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
 )
 
 BOUNDARIES = ("fwd", "bwd", "ckpt")
-GATE_ARMS = ("R", "R_strided", "E_T", "E_F")
-EXPLICIT_GATE_ARMS = ("E_T", "E_F")
+GATE_ARMS = ("R", "R_strided", "E_T", "E_F", "E_T_strided", "E_F_strided")
+RAW_GATE_ARMS = ("R", "R_strided")
+EXPLICIT_GATE_ARMS = ("E_T", "E_F", "E_T_strided", "E_F_strided")
+STRIDED_SUFFIX = "_strided"
 ARENAS = ("default", "lean4", "batched")
+
+
+def gate_arm_kind(arm: str) -> tuple[str, bool]:
+    """``(form, strided)`` of a gate arm: ``("E_F", True)`` for ``E_F_strided``."""
+    if arm.endswith(STRIDED_SUFFIX):
+        return arm[: -len(STRIDED_SUFFIX)], True
+    return arm, False
+
+
+def gate_ratio_pairs(arms) -> list[tuple[str, str, bool]]:
+    """The ``(raw arm, explicit arm, matched)`` ratios of ``arms`` (in ``GATE_ARMS`` order): every raw arm against
+    every explicit arm of the same layout (``matched``, the gated comparison), and ``R_strided`` also against the
+    contiguous explicit arms (reported)."""
+    present = [a for a in GATE_ARMS if a in arms]
+    pairs = []
+    for arm in present:
+        if arm not in RAW_GATE_ARMS:
+            continue
+        strided = gate_arm_kind(arm)[1]
+        for base in present:
+            if base not in EXPLICIT_GATE_ARMS:
+                continue
+            matched = gate_arm_kind(base)[1] == strided
+            if matched or strided:
+                pairs.append((arm, base, matched))
+    return pairs
 
 
 def split_docs(seqlen: int, docs: int) -> tuple[int, ...]:
@@ -282,31 +316,40 @@ def gate_steps(
     proj = torch.zeros(S, 8 + H * D + 8, dtype=torch.bfloat16, device=dout.device)
     proj[:, 8 : 8 + H * D] = inputs["g"].reshape(S, H * D)
     fla = None
-    if "E_F" in arms:
+    fla_arms = [a for a in arms if gate_arm_kind(a)[0] == "E_F"]
+    if fla_arms:
         # the adapted external gate, value-checked against the torch FP32 gate on this row's operands (the same
         # check as the accuracy protocol's): a mis-adapted call would time another computation
         fla, fla_info = fla_kda_gate(LOWER_BOUND)
         reason = fla_info.get("unavailable")
         if fla is not None:
             reason = check_fla_gate(fla, inputs, LOWER_BOUND)
+        if reason is None and "E_F_strided" in arms:
+            # the same check on the projection's column slice (a stride the adapter mishandles fails here)
+            reason = check_fla_gate(
+                fla, {**inputs, "g": proj[:, 8 : 8 + H * D].view(S, H, D)}, LOWER_BOUND
+            )
+            reason = None if reason is None else f"strided slice: {reason}"
         if reason is not None:
             fla = None
-            skipped["E_F"] = f"flash-linear-attention's gate: {reason}"
+            for arm in fla_arms:
+                skipped[arm] = f"flash-linear-attention's gate: {reason}"
 
     def make(arm):
+        form, strided = gate_arm_kind(arm)
         leaves = [inputs[n].detach().clone().requires_grad_(True) for n in names]
-        if arm == "R_strided":
+        if strided:
             leaf = proj.detach().clone().requires_grad_(True)
             leaves[3] = leaf
-        gate_fn = {"E_T": _torch_gate, "E_F": fla}.get(arm)
+        gate_fn = {"E_T": _torch_gate, "E_F": fla}.get(form)
 
         def forward():
             q, k, v, raw, beta, a_log, dt_bias = leaves
-            if arm == "R_strided":
+            if strided:
                 raw = raw[:, 8 : 8 + H * D].view(S, H, D)
 
             def fn(q, k, v, raw, beta, a_log, dt_bias):
-                if arm in ("R", "R_strided"):
+                if form == "R":
                     return cake_backend.chunk_kda_det(
                         q,
                         k,
@@ -351,7 +394,7 @@ def gate_steps(
             skipped[arm] = f"{exc}"
             continue
         except Exception as exc:  # the external gate's own failures leave its arm out
-            if arm != "E_F":
+            if gate_arm_kind(arm)[0] != "E_F":
                 raise
             skipped[arm] = f"{exc!r}"
             continue
@@ -547,34 +590,29 @@ def run_gate_row(
             step.clear()
     tq = t_quantile(0.975, iters - 1) if iters > 1 else float("nan")
     row["ratios"] = {}
-    for arm in steps:
-        if arm not in ("R", "R_strided"):
-            continue
-        for base_arm in EXPLICIT_GATE_ARMS:
-            if base_arm not in steps:
-                continue
-            logs = [
-                math.log(a / b)
-                for a, b in zip(times[arm], times[base_arm], strict=True)
-            ]
-            mean = sum(logs) / len(logs)
-            sd = (
-                math.sqrt(sum((x - mean) ** 2 for x in logs) / (len(logs) - 1))
-                if len(logs) > 1
-                else float("nan")
-            )
-            row["ratios"][f"{arm}/{base_arm}"] = {
-                "median_ratio": statistics.median(
-                    a / b for a, b in zip(times[arm], times[base_arm], strict=True)
-                ),
-                "geomean_ratio": math.exp(mean),
-                "ci95_upper": math.exp(mean + tq * sd / math.sqrt(len(logs))),
-                "ci95_lower": math.exp(mean - tq * sd / math.sqrt(len(logs))),
-                "peak_bytes_delta": row["arms"][arm]["peak_step_bytes"]
-                - row["arms"][base_arm]["peak_step_bytes"],
-                "retained_bytes_delta": row["arms"][arm]["retained_after_forward_bytes"]
-                - row["arms"][base_arm]["retained_after_forward_bytes"],
-            }
+    for arm, base_arm, matched in gate_ratio_pairs(steps):
+        logs = [
+            math.log(a / b) for a, b in zip(times[arm], times[base_arm], strict=True)
+        ]
+        mean = sum(logs) / len(logs)
+        sd = (
+            math.sqrt(sum((x - mean) ** 2 for x in logs) / (len(logs) - 1))
+            if len(logs) > 1
+            else float("nan")
+        )
+        row["ratios"][f"{arm}/{base_arm}"] = {
+            "matched": matched,
+            "median_ratio": statistics.median(
+                a / b for a, b in zip(times[arm], times[base_arm], strict=True)
+            ),
+            "geomean_ratio": math.exp(mean),
+            "ci95_upper": math.exp(mean + tq * sd / math.sqrt(len(logs))),
+            "ci95_lower": math.exp(mean - tq * sd / math.sqrt(len(logs))),
+            "peak_bytes_delta": row["arms"][arm]["peak_step_bytes"]
+            - row["arms"][base_arm]["peak_step_bytes"],
+            "retained_bytes_delta": row["arms"][arm]["retained_after_forward_bytes"]
+            - row["arms"][base_arm]["retained_after_forward_bytes"],
+        }
     return row
 
 
@@ -591,7 +629,8 @@ def _print_gate_row(row: dict) -> None:
         )
     for name, r in row.get("ratios", {}).items():
         cells.append(
-            f"{name} x{r['median_ratio']:.3f} (CI95 upper {r['ci95_upper']:.3f})"
+            f"{name}{'' if r['matched'] else ' (layouts differ)'} x{r['median_ratio']:.3f} "
+            f"(CI95 upper {r['ci95_upper']:.3f})"
         )
     for arm, why in row.get("skipped", {}).items():
         cells.append(f"{arm} skipped: {why}")
