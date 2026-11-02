@@ -60,8 +60,9 @@ backend are experimental: no compatibility guarantee.
   norm.  The raw gate mode (`use_gate_in_kernel=True` with `A_log`, `dt_bias`
   and `lower_bound`, FlashInfer #7816) runs on the deterministic package only,
   and the in-kernel L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) is not
-  available here: the entry points and `kda_workspace_bytes_kcp` raise
-  `ValueError` for them.  The off values (`use_gate_in_kernel=False`, `A_log` /
+  available here: the entry points, `kda_workspace_bytes_kcp` and (for the
+  norm) `kda_saved_bytes_kcp` raise `ValueError` for them, naming
+  `deterministic=True`.  The off values (`use_gate_in_kernel=False`, `A_log` /
   `dt_bias` / `lower_bound` `None`, `use_qk_l2norm_in_kernel=False`) are
   accepted, so a call that spells them out runs unchanged.
 

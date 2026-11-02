@@ -4033,8 +4033,9 @@ def _refuse_modes(kwargs: dict[str, Any]) -> None:
         )
     if on:
         raise ValueError(
-            f"use_qk_l2norm_in_kernel={given['use_qk_l2norm_in_kernel']!r}: the in-kernel q / k L2 norm is not "
-            "available with deterministic=False; normalize q and k before the call"
+            f"use_qk_l2norm_in_kernel={given['use_qk_l2norm_in_kernel']!r}: the in-kernel q / k L2 norm runs on the "
+            "deterministic package only; pass deterministic=True (flashinfer.cake_kda_train_kcp) or call "
+            "flashinfer.experimental.cake_kda_det_train_kcp"
         )
 
 
