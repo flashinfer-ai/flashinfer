@@ -19,6 +19,9 @@
 #   Multiple scoped commands for the same commit are aggregated (union of
 #   paths). A new commit with its own scoped commands replaces the previous
 #   scope; a new commit without any inherits the most recent scope.
+#   A bare `@flashinfer-bot run` (full suite) clears the scope, so auto-CI
+#   stays off until someone scopes again. The full suite only ever runs
+#   when someone asks for it with `@flashinfer-bot run`.
 #   The scope is published as ci/test-scope-N commit statuses on the HEAD SHA,
 #   exactly as ci-bot-commands.yml does, so pr-test.yml reads it the same way.
 #
@@ -311,10 +314,15 @@ jobs:
       #     scope entirely.
       #   - A new commit with NO scoped commands inherits the most recent
       #     scope — the scope carries forward until explicitly overridden.
+      #   - A bare `@flashinfer-bot run` (full suite) also overrides the
+      #     scope. It is never auto-triggered: once it is the most recent
+      #     command, auto-CI stays off until someone scopes again.
       #
-      # If no scoped run was ever requested, scope_args is empty,
-      # has_scope is false, and the workflow skips publish-scope and
-      # label application — CI is not auto-triggered without a scope.
+      # If no scoped run was ever requested, or the most recent command was a
+      # bare `run`, scope_args is empty, has_scope is false, and the workflow
+      # skips publish-scope and label application — auto-CI never starts the
+      # full suite. A manual `@flashinfer-bot run` is handled by
+      # ci-bot-commands.yml, independent of this workflow.
       - name: Detect previous scoped run from comments
         id: scope
         if: >-
@@ -373,6 +381,9 @@ jobs:
           CURRENT_SHA=""
           LAST_SCOPE=""         # most recent commit's aggregated scope (carries forward)
           PENDING_SCOPE=""      # scope being built for the current commit
+          # Marker for a bare `@flashinfer-bot run`. Not a valid test path, so
+          # it cannot be confused with a real scope.
+          FULL_SUITE="<full-suite>"
           while IFS= read -r encoded; do
             [[ -z "$encoded" ]] && continue
             EVENT=$(echo "$encoded" | base64 -d | jq -r '.event // ""')
@@ -399,26 +410,36 @@ jobs:
             COMMENT_BODY=$(echo "$encoded" | base64 -d | jq -r '.body // ""')
             COMMENT_LOGIN=$(echo "$encoded" | base64 -d | jq -r '.actor.login // .user.login // ""')
 
-            MATCH=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' \
+            # Match `run` with or without paths, so a bare `@flashinfer-bot run`
+            # (full suite) is seen too. `([[:space:]]|$)` keeps `run` from
+            # matching `running`, as in ci-bot-commands.yml.
+            CMD_LINE=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' \
               | awk '
                   /^[[:space:]]*```/ { if (!f) { f = 1; d = "b" } else if (d == "b") { f = 0 }; next }
                   /^[[:space:]]*~~~/ { if (!f) { f = 1; d = "t" } else if (d == "t") { f = 0 }; next }
                   !f
                 ' \
-              | grep -iEm1 '^[[:space:]]*@flashinfer-bot[[:space:]]+run[[:space:]]+\S' \
-              | sed -E 's/^[[:space:]]*@[Ff]lashinfer-bot[[:space:]]+run[[:space:]]+//' \
-              | sed -E 's/[[:space:]]+$//') || MATCH=""
+              | grep -iEm1 '^[[:space:]]*@flashinfer-bot[[:space:]]+run([[:space:]]|$)') || CMD_LINE=""
 
-            if [[ -n "$MATCH" ]]; then
-              if is_authorized "$COMMENT_LOGIN"; then
-                if [[ -n "$PENDING_SCOPE" ]]; then
-                  PENDING_SCOPE="$PENDING_SCOPE $MATCH"
-                else
-                  PENDING_SCOPE="$MATCH"
-                fi
-              else
-                echo "Skipping scope from unauthorized commenter: $COMMENT_LOGIN"
-              fi
+            [[ -n "$CMD_LINE" ]] || continue
+
+            if ! is_authorized "$COMMENT_LOGIN"; then
+              echo "Skipping run command from unauthorized commenter: $COMMENT_LOGIN"
+              continue
+            fi
+
+            MATCH=$(printf '%s' "$CMD_LINE" \
+              | sed -E 's/^[[:space:]]*@flashinfer-bot[[:space:]]+run[[:space:]]*//I; s/[[:space:]]+$//')
+
+            if [[ -z "$MATCH" ]]; then
+              # Bare `@flashinfer-bot run` asks for the full suite and clears
+              # any scope (ci-bot-commands.yml publishes an empty scope). Record
+              # it so an older narrow scope is not re-applied over it.
+              PENDING_SCOPE="$FULL_SUITE"
+            elif [[ -n "$PENDING_SCOPE" && "$PENDING_SCOPE" != "$FULL_SUITE" ]]; then
+              PENDING_SCOPE="$PENDING_SCOPE $MATCH"
+            else
+              PENDING_SCOPE="$MATCH"
             fi
           done <<< "$TIMELINE"
 
@@ -427,7 +448,13 @@ jobs:
             LAST_SCOPE="$PENDING_SCOPE"
           fi
 
-          if [[ -z "$LAST_SCOPE" ]]; then
+          if [[ "$LAST_SCOPE" == "$FULL_SUITE" ]]; then
+            # Never auto-trigger the full suite. A full run has to be asked for
+            # with `@flashinfer-bot run` each time.
+            echo "Most recent run command requested the full suite; skipping auto-trigger (scope required)"
+            echo "scope_args=" >> "$GITHUB_OUTPUT"
+            echo "has_scope=false" >> "$GITHUB_OUTPUT"
+          elif [[ -z "$LAST_SCOPE" ]]; then
             echo "No previous scoped run found; skipping auto-trigger (scope required)"
             echo "scope_args=" >> "$GITHUB_OUTPUT"
             echo "has_scope=false" >> "$GITHUB_OUTPUT"
@@ -441,9 +468,10 @@ jobs:
       # ci-bot-commands.yml exactly so pr-test.yml reads it the same way.
       # Uses the validated-and-chunked output from experimental_test_scope.py.
       #
-      # This step runs even when scope_args is empty — it clears any stale
-      # scope statuses left by a previous ci-bot-commands run on this SHA,
-      # ensuring pr-test.yml sees a clean slate and runs the full suite.
+      # Runs only when a scope was found: auto-CI never starts the full suite.
+      # If the scope fails validation or chunking, stale scope statuses are
+      # cleared and the step fails, so the label step is skipped and no CI
+      # starts.
       - name: Publish test scope
         id: publish-scope
         if: >-
@@ -454,10 +482,10 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           SCOPE_ARGS: ${{ steps.scope.outputs.scope_args }}
         run: |
-          # Helper: clear all existing ci/test-scope-N statuses on this SHA so
-          # pr-test.yml sees no scope and runs the full suite. Fails the step
-          # if the lookup or any clearing POST fails — we must not apply the
-          # run-ci label while stale narrow-scope statuses might remain.
+          # Helper: clear all existing ci/test-scope-N statuses on this SHA, so
+          # a run-ci label applied by hand later does not pick up a stale
+          # narrow scope. Fails the step if the lookup or any clearing POST
+          # fails.
           clear_stale_scopes() {
             local MAX
             MAX=$(gh api "/repos/${{ github.repository }}/commits/${HEAD_SHA}/status" \
@@ -482,8 +510,8 @@ jobs:
 
           # Validate and chunk the scope paths using the same script as
           # ci-bot-commands.yml. If validation fails, clear any stale scope
-          # statuses and fall back to the full suite rather than blocking —
-          # the author can always re-scope with @flashinfer-bot run <paths>.
+          # statuses and abort: never fall back to the full suite. The author
+          # can re-scope with @flashinfer-bot run <paths>.
           if ! SCOPE=$(python3 scripts/pr_checks/experimental_test_scope.py \
                 --targets "$SCOPE_ARGS" --root tests/ --no-check-exists --test-path \
                 2>/tmp/scope_err); then
