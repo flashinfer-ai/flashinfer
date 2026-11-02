@@ -580,18 +580,27 @@ def test_registry_records_are_well_formed() -> None:
                 for n in names
                 if stage in GATE_STAGES
             ), (stage, gate)
-            kinds = [cake_jit.MODULES[n]["select_rule"]["kind"] for n in names]
             if not names:
                 assert stage in OPTIONAL_STAGES and stage in GATE_STAGES, (stage, gate)
-            elif len(names) == 1 and stage in OPTIONAL_STAGES:
-                assert kinds[0] not in ("always", "otherwise"), (stage, gate)
-            elif len(names) == 1:
-                assert kinds == ["always"], (stage, gate)
-            else:
-                assert "always" not in kinds and kinds.count("otherwise") <= 1, (
-                    stage,
-                    gate,
-                )
+            # and per in-kernel Q/K L2 norm mode (a record serves the modes its ``l2n`` lists, ``["off"]`` when
+            # absent); an l2n mode's class may still be empty (its records ship later; planning refuses the mode)
+            for mode in cake_jit.L2N_MODES:
+                mnames = [
+                    n for n in names if mode in cake_jit.MODULES[n].get("l2n", ["off"])
+                ]
+                kinds = [cake_jit.MODULES[n]["select_rule"]["kind"] for n in mnames]
+                if not mnames:
+                    assert mode != "off" or not names, (stage, gate, mode)
+                elif len(mnames) == 1 and stage in OPTIONAL_STAGES:
+                    assert kinds[0] not in ("always", "otherwise"), (stage, gate, mode)
+                elif len(mnames) == 1:
+                    assert kinds == ["always"], (stage, gate, mode)
+                else:
+                    assert "always" not in kinds and kinds.count("otherwise") <= 1, (
+                        stage,
+                        gate,
+                        mode,
+                    )
     assert cake_jit.records_of_stage("gate_epilogue", "raw") == ()
     assert cake_jit.records_of_stage("param_finalize") == ()
     with pytest.raises(ValueError, match="gate"):
@@ -1016,7 +1025,12 @@ def test_the_raw_gate_records_mirror_the_g_records() -> None:
         assert cake_jit.records_of_stage(stage, "raw") == tuple(
             RAW_TWIN_RECORDS[n] for n in g_names
         ), stage
-    assert cake_jit.records_of_stage("glm_intra", "raw") == (RAW_GLM_INTRA,)
+    # flag off (the in-kernel Q/K L2 norm's raw capture form serves the fallback mode alone)
+    assert tuple(
+        n
+        for n in cake_jit.records_of_stage("glm_intra", "raw")
+        if "off" in cake_jit.MODULES[n].get("l2n", ["off"])
+    ) == (RAW_GLM_INTRA,)
     assert cake_jit.records_of_stage("param_finalize", "raw") == (RAW_FINALIZE,)
 
 
