@@ -1307,7 +1307,10 @@ def test_softmax_rescale_threshold_log2_rejected(dtype, threshold):
         (48, "nvfp4", 4, 2048),
         (96, "nvfp4", 4, 2048),
         (96, "fp8", 160, 2048),
-    ],
+    ]
+    # Long-list H12/H16 decode grids from a quarter wave up: split, just past
+    # one wave and persistent eight-issuer Swap-AB on 148-212 SM devices.
+    + [(12, "fp8", 64, 2048), (12, "fp8", 160, 2048), (16, "fp8", 320, 2048)],
 )
 def test_d576_sparse_graph(heads, precision, rows, topk, prefix=False):
     """Native352 cache mapping, tails, holes and live graph inputs on both families."""

@@ -257,6 +257,40 @@ def choose_fp8_profile(rows, heads, query_length, capacity, sm_count, rope_dim):
             paired_correction=True,
             page_pipeline_stages=2,
         )
+    if (
+        rope_dim == 64
+        and 8 < heads <= 16
+        and capacity >= 2048
+        and (rows >= 8 * sm_count or query_length <= 8 and rows * 4 > sm_count)
+    ):
+        # Long D576 lists keep M16 Swap-AB with eight issuers, twelve retained
+        # stages and separate K/V streams once each CTA owns a long KV range:
+        # on prefill-sized grids (GB300 top-k 2048, H12 prefill 8k:
+        # 1637 -> 1374 us) and on decode grids from a quarter wave up, where
+        # the one-stream schedule below would split at most twice. Each row is
+        # one M16 head tile. Up to one wave, split by the whole number of CTAs
+        # per SM left over; just past one wave, split twice so the tail wave
+        # is half as long; beyond that, CLC persistence balances the waves.
+        # H12 top-k 2048, 32k context, one query per request, us:
+        #   GB300 (152 SMs) rows 64: 41.8 -> 38.0, 128: 65.6 -> 56.5,
+        #                   160: 92.3 -> 81.1, 320: 132.2 -> 123.0
+        #   VR200 (212 SMs) rows 64: 30.8 -> 27.5, 128: 45.4 -> 38.6,
+        #                   224: 73.3 -> 67.7, 424: 81.8 -> 76.6
+        if rows <= sm_count:
+            splits, scheduler = sm_count // rows, "nonpersistent"
+        elif rows * 2 < 3 * sm_count:
+            splits, scheduler = 2, "nonpersistent"
+        else:
+            splits, scheduler = 1, "clc"
+        return SparseMlaProfile(
+            family="swap",
+            split_kv=splits,
+            scheduler=scheduler,
+            gather_issue_warps=8,
+            balanced_registers=True,
+            reuse_kv=True,
+            reuse_kv_stages=12,
+        )
     # These short-Q regions favor one KV stream with retained tiles and a
     # split grid near one device wave. The Q<=8 cutoff is empirical; the
     # kernel also supports prefill. Powers of two are policy, not a KV ABI.
@@ -313,20 +347,6 @@ def choose_fp8_profile(rows, heads, query_length, capacity, sm_count, rope_dim):
         # device wave, share KV across H128 even for short selected lists.
         # BF16's CLC choice below is a separately qualified schedule.
         return SparseMlaProfile(family="2cta", scheduler="static", gather_issue_warps=1)
-    if rope_dim == 64 and 8 < heads <= 16 and capacity >= 2048 and rows >= 8 * sm_count:
-        # Long D576 lists keep M16 Swap-AB on prefill-sized grids: eight
-        # issuers, twelve retained stages and CLC persistence gather fast
-        # enough that M64 head padding no longer pays (GB300 top-k 2048, H12
-        # prefill 8k: 1637 -> 1374 us).
-        return SparseMlaProfile(
-            family="swap",
-            split_kv=1,
-            scheduler="clc",
-            gather_issue_warps=8,
-            balanced_registers=True,
-            reuse_kv=True,
-            reuse_kv_stages=12,
-        )
     if (
         heads <= 16
         and capacity >= 512
