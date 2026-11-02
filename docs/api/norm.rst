@@ -180,7 +180,10 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
   weight-gradient column sums into FP64 accumulators of the workspace in the
   order they finish. The claimed blocks, and so the FP32 partial sums, and that
   order depend on scheduling: the weight gradient can differ between calls,
-  always within the deterministic backward's error bound. The workspace
+  always within the deterministic backward's error bound. On SM100 and SM103
+  up to 256 rows the backward is one thread-block cluster of 16 CTAs that adds
+  the CTAs' partial sums in a fixed order on chip: the same bits on every
+  call, within the same bound, and no workspace. The workspace
   (``cake_rmsnorm_silu_gate_train_backward_workspace(..., deterministic=False)``,
   a few KiB whatever the token count) is zero after every call: zero it once
   and reuse it, one per concurrently running stream. A buffer that anything
