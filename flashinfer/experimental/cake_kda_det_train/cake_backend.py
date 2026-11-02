@@ -1747,10 +1747,35 @@ def output_bytes(S: int, H: int, *, backward: bool, gate: str = "g") -> int:
     return 3 * S * H * D * 2 + S * H * 2 + S * H * D * 4
 
 
+# ``param_finalize``'s chunks per segment (the ``per_cta`` of its ``head_chunk_blocks`` grid rule: one CTA per head and
+# segment, ``seg_cap = ceil(NC_pad / 128)`` segments, at least one).
+FINALIZE_SEGMENT = 128
+
+
+def _finalize_segments(NC_pad: int) -> int:
+    """``param_finalize``'s ``seg_cap`` for ``NC_pad`` chunks: its grid's ``y`` and ``part2``'s segment extent."""
+    return max(1, -(-int(NC_pad) // FINALIZE_SEGMENT))
+
+
+def _raw_finalize_scratch(NC_pad: int, H: int, device: torch.device) -> dict[str, Any]:
+    """``param_finalize``'s per-call scratch for ``NC_pad`` partial rows and ``H`` heads: ``part2`` FP32
+    ``[H, seg_cap, 128, 4]`` (every slot it reads is written by the same launch), the per-head u32 ``ticket``
+    ``[H]`` (zero; the last CTA of each head sets it back to zero) and ``seg_cap`` (:func:`_finalize_segments`).
+    The single-rank and KCP backwards both take their scratch here; :func:`_raw_partials_bytes` counts it."""
+    seg_cap = _finalize_segments(NC_pad)
+    return {
+        "part2": _alloc((int(H), seg_cap, D, 4), torch.float32, device),
+        "seg_cap": seg_cap,
+        "ticket": torch.zeros((int(H),), dtype=torch.int32, device=device).view(torch.uint32),
+    }
+
+
 def _raw_partials_bytes(NC_pad: int, H: int) -> int:
     """The raw backward's per-call parameter partials ``dA_part`` / ``db_part``: FP32 ``[NC_pad, H, 128, 2]`` each
-    (the per-chunk ``(hi, lo)`` pairs of the GLM intra program), outside the arena, freed with the call."""
-    return 2 * int(NC_pad) * int(H) * D * 2 * 4
+    (the per-chunk ``(hi, lo)`` pairs of the GLM intra program), plus ``param_finalize``'s FP32 per-segment scratch
+    ``part2`` ``[H, seg_cap, 128, 4]`` and its u32 ticket ``[H]``, outside the arena, freed with the call."""
+    part2 = int(H) * _finalize_segments(NC_pad) * D * 4 * 4
+    return 2 * int(NC_pad) * int(H) * D * 2 * 4 + part2 + 4 * int(H)
 
 
 def lifetime_table(
@@ -4426,8 +4451,18 @@ def _param_finalize(
     seq_chunk_start: torch.Tensor,
     num_seqs: int,
 ) -> None:
-    """The raw mode's ``param_finalize`` launch (once per backward, grid ``(H, 1, 1)``): ``dA_log`` / ``ddt_bias``
-    from the per-chunk partials of the chunks ``[0, seq_chunk_start[num_seqs])``."""
+    """The raw mode's ``param_finalize`` launch (once per backward, grid ``(H, seg_cap, 1)``: one CTA per head and
+    segment of :data:`FINALIZE_SEGMENT` chunks of the partials' ``NC_pad`` rows): ``dA_log`` / ``ddt_bias`` from the
+    per-chunk partials of the chunks ``[0, seq_chunk_start[num_seqs])``.  The per-segment scratch ``part2`` and the
+    per-head ticket (zero; the last CTA of each head sets it back to zero) are this call's."""
+    H = ws.plan.H
+    seg_cap = _finalize_segments(raw_out["dA_part"].shape[0])
+    grid = ws.plan.grid("param_finalize", path, 0)
+    if tuple(grid) != (H, seg_cap, 1):
+        raise ValueError(
+            f"param_finalize: plan grid {tuple(grid)} != (H, seg_cap, 1) = {(H, seg_cap, 1)} for "
+            f"{raw_out['dA_part'].shape[0]} partial rows"
+        )
     ws.run(
         "param_finalize",
         {
@@ -4435,9 +4470,10 @@ def _param_finalize(
             "db_part": raw_out["db_part"],
             "seq_chunk_start": seq_chunk_start,
             "num_seqs": int(num_seqs),
+            **_raw_finalize_scratch(raw_out["dA_part"].shape[0], H, ws.device),
             "dA_log": raw_out["dA_log"],
             "ddt_bias": raw_out["ddt_bias"],
-            "num_heads": ws.plan.H,
+            "num_heads": H,
         },
         path=path,
     )
