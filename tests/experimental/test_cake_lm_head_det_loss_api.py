@@ -343,6 +343,225 @@ def test_public_api_memory_and_count_keywords(monkeypatch):
             public.chunked_lm_head_det_preload("cpu")
 
 
+def test_public_api_temperature_keywords(monkeypatch):
+    """The log-probability entry takes ``temperature`` (default ``None``, the same as ``1.0``: no temperature) and
+    ``check_temperature`` (default ``False``) as documented keyword-only arguments, with no environment variable.
+    Without a temperature it calls the backend entry (or, with ``memory_mode`` or ``num_valid_rows``, the opt-in
+    module's entry) exactly as it does without these keywords; with one it calls that module's
+    ``chunked_lm_head_det_logprob_temperature`` and passes both unchanged (a tensor as the same object).  The backend
+    entries keep their signatures; the loss entry has neither keyword; ``chunked_lm_head_det_preload`` takes
+    ``temperature`` (default ``False``: the temperature forms are not loaded) and passes it down."""
+    _clear(monkeypatch)
+    params = inspect.signature(chunked_lm_head_det_logprob).parameters
+    for name, default in (("temperature", None), ("check_temperature", False)):
+        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert params[name].default == default and type(params[name].default) is type(
+            default
+        ), name
+        assert name in chunked_lm_head_det_logprob.__doc__, name
+    loss_params = inspect.signature(chunked_lm_head_det_loss).parameters
+    assert "temperature" not in loss_params and "check_temperature" not in loss_params
+    for module in (cake_backend, public._cake_backend_opt_in()):
+        assert (
+            "temperature"
+            not in inspect.signature(module.chunked_lm_head_det_logprob).parameters
+        )
+        tau_params = inspect.signature(
+            module.chunked_lm_head_det_logprob_temperature
+        ).parameters
+        assert tau_params["check_temperature"].default is False
+    preload = inspect.signature(public.chunked_lm_head_det_preload).parameters
+    assert preload["temperature"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert preload["temperature"].default is False
+    assert "temperature" in public.chunked_lm_head_det_preload.__doc__
+    assert not any("TEMPERATURE" in k for k in vars(public) if k.endswith("_ENV"))
+    seen = {}
+
+    def spy(name):
+        def call(*args, **kw):
+            seen[name] = (args, kw)
+            return torch.zeros(())
+
+        return call
+
+    backend = public._cake_backend()
+    monkeypatch.setattr(backend, "chunked_lm_head_det_logprob", spy("logprob"))
+    monkeypatch.setattr(
+        backend, "chunked_lm_head_det_logprob_temperature", spy("logprob_tau")
+    )
+    opt_in = public._cake_backend_opt_in()
+    monkeypatch.setattr(opt_in, "chunked_lm_head_det_logprob", spy("opt_in_logprob"))
+    monkeypatch.setattr(
+        opt_in, "chunked_lm_head_det_logprob_temperature", spy("opt_in_logprob_tau")
+    )
+    monkeypatch.setattr(opt_in, "preload", spy("preload"))
+    X, W, labels = _host_call()
+    tau = torch.full((4,), 0.7)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        chunked_lm_head_det_logprob(X, W, labels)
+        assert "temperature" not in seen["logprob"][1]
+        assert "check_temperature" not in seen["logprob"][1]
+        assert "logprob_tau" not in seen
+        plain = seen.pop("logprob")
+        chunked_lm_head_det_logprob(X, W, labels, temperature=None)
+        assert seen.pop("logprob") == plain
+        chunked_lm_head_det_logprob(X, W, labels, temperature=1.0)
+        assert seen["logprob_tau"][1]["temperature"] == 1.0
+        assert {
+            k: v for k, v in seen["logprob_tau"][1].items() if "temperature" not in k
+        } == plain[1]
+        chunked_lm_head_det_logprob(
+            X, W, labels, temperature=tau, check_temperature=True
+        )
+        assert seen["logprob_tau"][1]["temperature"] is tau
+        assert seen["logprob_tau"][1]["check_temperature"] is True
+        chunked_lm_head_det_logprob(X, W, labels, temperature=0.7)
+        assert seen["logprob_tau"][1]["temperature"] == 0.7
+        assert "logprob" not in seen
+        for kw in (
+            dict(memory_mode="budget"),
+            dict(memory_mode="fast"),
+            dict(num_valid_rows=3),
+        ):
+            seen.pop("opt_in_logprob_tau", None)
+            chunked_lm_head_det_logprob(
+                X, W, labels, temperature=tau, check_temperature=True, **kw
+            )
+            assert seen["opt_in_logprob_tau"][1]["temperature"] is tau, kw
+            assert seen["opt_in_logprob_tau"][1]["check_temperature"] is True, kw
+            seen.pop("opt_in_logprob_tau")
+            chunked_lm_head_det_logprob(X, W, labels, temperature=0.7, **kw)
+            assert seen["opt_in_logprob_tau"][1]["temperature"] == 0.7, kw
+            assert seen["opt_in_logprob_tau"][1]["check_temperature"] is False, kw
+            seen.pop("opt_in_logprob_tau")
+            seen.pop("opt_in_logprob", None)
+            chunked_lm_head_det_logprob(X, W, labels, **kw)
+            assert "temperature" not in seen["opt_in_logprob"][1], kw
+            assert "opt_in_logprob_tau" not in seen, kw
+        public.chunked_lm_head_det_preload(0, temperature=True)
+        args, kw = seen["preload"]
+        assert kw.get("temperature") is True and 0 in (*args, kw.get("device"))
+        public.chunked_lm_head_det_preload(0)
+        assert not seen["preload"][1].get("temperature", False)
+
+
+def test_public_api_temperature_refuses_keep_logits(monkeypatch):
+    """With ``memory_mode="keep_logits"`` the public entry passes a temperature to the opt-in module's temperature
+    entry, which rejects a scalar other than 1.0 and a per-token tensor with a ``ValueError`` before any launch."""
+    _clear(monkeypatch)
+    inp = make_inputs(
+        37,
+        seed=SEED + 37,
+        H=256,
+        V=512,
+        device=torch.device("cpu"),
+        ignore_frac=0.2,
+        temperature="hetero",
+    )
+    for temperature in (0.5, inp.temperature):
+        with pytest.raises(ValueError, match="takes no temperature"):
+            chunked_lm_head_det_logprob(
+                inp.X,
+                inp.W,
+                inp.labels,
+                chunk_size=16,
+                memory_mode="keep_logits",
+                temperature=temperature,
+            )
+
+
+def test_public_api_temperature_with_deterministic_false(monkeypatch):
+    """The det-free entries with ``deterministic=False``: the non-deterministic package has no temperature path, so
+    ``chunked_lm_head_logprob`` raises ``ValueError`` (not ``TypeError``) for a temperature other than ``None`` or a
+    scalar whose FP32 value is 1.0, before either package is reached; those two run the package's call without a
+    temperature.  Under torch's deterministic algorithms the call runs the deterministic entry, which gets the
+    temperature.  ``chunked_lm_head_preload(temperature=True)`` follows the same rule."""
+    _clear(monkeypatch)
+    nd_calls, det_calls = [], []
+
+    class _Package:
+        def __getattr__(self, name):
+            if name.startswith("__"):
+                raise AttributeError(name)
+            return lambda *a, **k: nd_calls.append((name, a, k)) or name
+
+    def _det(name):
+        return lambda *a, **k: det_calls.append((name, a, k)) or "det"
+
+    monkeypatch.setattr(public, "_nd_backend", lambda: _Package())
+    monkeypatch.setattr(public, "_nd_backend_opt_in", lambda: _Package())
+    monkeypatch.setattr(public, "_det_logprob", _det("logprob"))
+    monkeypatch.setattr(public, "_det_preload", _det("preload"))
+    monkeypatch.setattr(public, "_DET_FALLBACK_WARNED", set())
+    X, W, labels = _host_call()
+    tau = torch.full((X.shape[0],), 0.7)
+    nd_only = "deterministic=False\\) takes no temperature"
+    for temperature in (0.7, 2, 1.0 + 1e-6, tau, torch.tensor(1.0), True):
+        for opt_in in ({}, {"memory_mode": "budget"}):
+            with pytest.raises(ValueError, match=nd_only):
+                public.chunked_lm_head_logprob(
+                    X, W, labels, deterministic=False, temperature=temperature, **opt_in
+                )
+    with pytest.raises(ValueError, match=nd_only):
+        public.chunked_lm_head_preload("cuda:0", deterministic=False, temperature=True)
+    assert not nd_calls and not det_calls
+    # None and the scalars whose FP32 value is 1.0 are the call without a temperature
+    for temperature in (None, 1.0, 1, 1.0 + 1e-9):
+        got = public.chunked_lm_head_logprob(
+            X,
+            W,
+            labels,
+            deterministic=False,
+            temperature=temperature,
+            check_temperature=True,
+        )
+        assert got == "chunked_lm_head_logprob"
+        ((_, args, kw),) = nd_calls
+        nd_calls.clear()
+        assert args == (X, W, labels) and kw["deterministic"] is False
+        assert "temperature" not in kw and "check_temperature" not in kw
+    public.chunked_lm_head_preload("cuda:0", deterministic=False)
+    assert nd_calls == [("preload", ("cuda:0",), {})]
+    nd_calls.clear()
+    assert not det_calls
+    # deterministic=True: the deterministic preload, with the temperature libraries only when asked
+    public.chunked_lm_head_preload("cuda:0")
+    public.chunked_lm_head_preload("cuda:0", temperature=True)
+    assert det_calls == [
+        ("preload", ("cuda:0",), {}),
+        ("preload", ("cuda:0",), {"temperature": True}),
+    ]
+    det_calls.clear()
+    # torch's deterministic algorithms: the deterministic entry serves the temperature
+    was, was_warn = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    torch.use_deterministic_algorithms(True)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            public.chunked_lm_head_logprob(
+                X,
+                W,
+                labels,
+                deterministic=False,
+                temperature=tau,
+                check_temperature=True,
+            )
+            public.chunked_lm_head_preload(
+                "cuda:0", deterministic=False, temperature=True
+            )
+    finally:
+        torch.use_deterministic_algorithms(was, warn_only=was_warn)
+    (logprob, preload) = det_calls
+    assert logprob[0] == "logprob" and logprob[1] == (X, W, labels)
+    assert logprob[2]["temperature"] is tau and logprob[2]["check_temperature"] is True
+    assert preload == ("preload", ("cuda:0",), {"temperature": True})
+    assert not nd_calls
+
+
 def test_compact_rows_default_env(monkeypatch):
     _clear(monkeypatch)
     assert _knobs()["compact_rows"] is True  # unset: the backend's default
@@ -639,6 +858,61 @@ def test_device_env_switches_reach_the_backend(monkeypatch):
     for name, res in (("off", off), ("on", on), ("unfused", unfused), ("fused", fused)):
         for key in ("loss", "logp", "dX", "dW"):
             assert torch.equal(_bits(res[key]), _bits(base[key])), (name, key)
+
+
+def test_device_temperature_through_the_public_entry(monkeypatch):
+    """Through the public entry on the generated program: a heterogeneous per-token temperature and a scalar give the
+    bits (integer views) of the backend entry with the same argument, ``temperature=1.0`` the bits of the call
+    without the keyword (default ``None``); ``chunked_lm_head_det_preload(temperature=True)`` loads the temperature forms and a call after it
+    gives the same bits."""
+    _require_program()
+    _clear(monkeypatch)
+    name, _ = cake_backend.record_for(CUDA)
+    tau_stages = cake_backend.TEMPERATURE_STAGES
+    if not set(tau_stages) <= set(
+        cake_backend.registered_stages_with_temperature(name)
+    ):
+        pytest.skip("the registered program has no temperature forms")
+    inp = make_inputs(
+        4097, seed=SEED + 4097, device=CUDA, ignore_frac=0.05, temperature="hetero"
+    )
+
+    def run(fn, **kw):
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            kw.setdefault("backend", "cake")
+            logp = fn(X, W, inp.labels, chunk_size=4096, **kw)
+        logp.backward(inp.dlogp)
+        torch.cuda.synchronize()
+        return dict(logp=logp.detach(), dX=X.grad, dW=W.grad)
+
+    def same(a, b, case):
+        for key in ("logp", "dX", "dW"):
+            assert torch.equal(_bits(a[key]), _bits(b[key])), (case, key)
+
+    for value in (inp.temperature, 0.7):
+        same(
+            run(chunked_lm_head_det_logprob, temperature=value),
+            run(
+                cake_backend.chunked_lm_head_det_logprob_temperature, temperature=value
+            ),
+            type(value).__name__,
+        )
+    plain = run(chunked_lm_head_det_logprob)
+    same(plain, run(chunked_lm_head_det_logprob, temperature=1.0), "one")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        public.chunked_lm_head_det_preload(temperature=True)
+    same(
+        run(
+            cake_backend.chunked_lm_head_det_logprob_temperature,
+            temperature=inp.temperature,
+        ),
+        run(chunked_lm_head_det_logprob, temperature=inp.temperature),
+        "after preload",
+    )
 
 
 def test_device_public_entry_places_the_gradients(monkeypatch):

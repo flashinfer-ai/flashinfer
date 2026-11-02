@@ -129,6 +129,9 @@ assert {
     "backward_logprob",
     "chunked_lm_head_det_loss",
     "chunked_lm_head_det_logprob",
+    "forward_logprob_temperature",
+    "backward_logprob_temperature",
+    "chunked_lm_head_det_logprob_temperature",
 }.issubset(public), sorted(public)
 assert isinstance(cake_jit.MODULES, dict) and cake_jit.STAGES  # registry loaded
 
@@ -168,6 +171,12 @@ calls = [
     lambda: opt_in.memory_plan("loss", num_rows=T, rows=T + 1, hidden=H, vocab=V, chunk=T),
     # preload needs a CUDA device
     lambda: opt_in.preload("cpu"),
+    # the log-probability forward: a temperature must be positive and finite
+    lambda: cb.forward_logprob_temperature(bf16(T, H), bf16(V, H), labels, backend="reference", temperature=0.0),
+    # the autograd entry: a per-token temperature is an FP32 [T] tensor
+    lambda: cb.chunked_lm_head_det_logprob_temperature(
+        bf16(T, H), bf16(V, H), labels, backend="reference", temperature=torch.ones(T + 1)
+    ),
 ]
 
 with warnings.catch_warnings(record=True) as rec:
@@ -197,8 +206,8 @@ def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path):
     """A copy of the package under another top-level name imports in a ``python -I``
     subprocess with ``flashinfer`` blocked (meta-path finder plus
     ``sys.modules["flashinfer"] = None``), resolves the backend's public names and
-    the loader's ``__all__``, raises the host-side ``ValueError`` of ten entry
-    points on CPU operands without emitting a warning of any kind, and loads no
+    the loader's ``__all__``, raises the host-side ``ValueError`` of twelve entry
+    point calls on CPU operands without emitting a warning of any kind, and loads no
     ``flashinfer`` module."""
     root = tmp_path / "site"
     shutil.copytree(
