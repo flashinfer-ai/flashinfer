@@ -373,9 +373,9 @@ def _moe_core_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     weight_dtype: Optional[str] = None,
-    clamped_relu2_limit: Optional[torch.Tensor] = None,
     gemm1_k_steps: Optional[int] = None,
     gemm2_k_steps: Optional[int] = None,
     gemm1_use_clc_scheduler: bool = True,
@@ -799,8 +799,8 @@ def _moe_core_impl(
                 swiglu_limit=swiglu_limit,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
-                gated=gated,
                 clamped_relu2_limit=clamped_relu2_limit,
+                gated=gated,
             )
 
         localized_memset_done = None
@@ -859,8 +859,8 @@ def _moe_core_impl(
             swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
-            gated=gated,
             clamped_relu2_limit=clamped_relu2_limit,
+            gated=gated,
             **gemm1_options,
         )
     if use_per_token_activation:
@@ -1258,9 +1258,9 @@ class CuteDslMoEWrapper:
                 swiglu_limit=swiglu_limit,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
+                clamped_relu2_limit=clamped_relu2_limit,
                 use_per_token_activation=False,
                 quant_mode=quant_mode,
-                clamped_relu2_limit=clamped_relu2_limit,
                 swap_ab=swap_ab,
             )
             if quant_mode == "w4a4":
@@ -1279,9 +1279,9 @@ class CuteDslMoEWrapper:
                     swiglu_limit=swiglu_limit,
                     situ_beta=situ_beta,
                     situ_linear_beta=situ_linear_beta,
+                    clamped_relu2_limit=clamped_relu2_limit,
                     use_per_token_activation=True,
                     quant_mode=quant_mode,
-                    clamped_relu2_limit=clamped_relu2_limit,
                     swap_ab=swap_ab,
                 )
 
@@ -1395,8 +1395,8 @@ class CuteDslMoEWrapper:
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
-            nvfp4_4over6=nvfp4_4over6,
             clamped_relu2_limit=self.clamped_relu2_limit,
+            nvfp4_4over6=nvfp4_4over6,
             gemm1_k_steps=gemm1_k_steps,
             gemm2_k_steps=gemm2_k_steps,
             gemm1_use_clc_scheduler=gemm1_use_clc_scheduler,
@@ -1664,12 +1664,12 @@ def _cute_dsl_fused_moe_impl(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     localized_memset_stream: Optional[torch.cuda.Stream] = None,
     localized_weights: Optional[list] = None,
     localized_streams: Optional[list] = None,
     sm_count: Optional[int] = None,
-    clamped_relu2_limit: Optional[torch.Tensor] = None,
     gemm1_k_steps: Optional[int] = None,
     gemm2_k_steps: Optional[int] = None,
     gemm1_use_clc_scheduler: bool = True,
@@ -1715,12 +1715,12 @@ def _cute_dsl_fused_moe_impl(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        clamped_relu2_limit=clamped_relu2_limit,
         nvfp4_4over6=nvfp4_4over6,
         localized_memset_stream=localized_memset_stream,
         localized_weights=localized_weights,
         localized_streams=localized_streams,
         sm_count=sm_count,
-        clamped_relu2_limit=clamped_relu2_limit,
         gemm1_k_steps=gemm1_k_steps,
         gemm2_k_steps=gemm2_k_steps,
         gemm1_use_clc_scheduler=gemm1_use_clc_scheduler,
@@ -2030,10 +2030,10 @@ def cute_dsl_fused_moe(
             swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            clamped_relu2_limit=clamped_relu2_limit,
             use_per_token_activation=use_per_token_activation,
             quant_mode=quant_mode,
             use_cuda_graph=autotune_use_cuda_graph,
-            clamped_relu2_limit=clamped_relu2_limit,
             swap_ab=swap_ab,
         )
         if localized_weights is None:

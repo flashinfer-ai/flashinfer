@@ -82,6 +82,7 @@ def _run_blockscaled_gemm(
     swiglu_limit,
     situ_beta,
     situ_linear_beta,
+    clamped_relu2_limit,
     use_fused_finalize,
     enable_pdl,
     activation_dtype,
@@ -98,7 +99,6 @@ def _run_blockscaled_gemm(
     sm_count=None,
     publish_routing_before_signal=False,
     activation_cache_policy: str = "normal",
-    clamped_relu2_limit=None,
 ):
     cache_policies = {
         "normal": 0,
@@ -331,10 +331,10 @@ def launch_gather_gemm(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
     gated: bool = True,
     k_steps: Optional[int] = None,
     use_clc_scheduler: bool = True,
-    clamped_relu2_limit: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Gather input inside FC1 with the swap-AB weight layout."""
     _check_gemm_inputs(a, b, a_dtype, b_dtype, a_per_token_scale, k_steps)
@@ -499,6 +499,7 @@ def launch_gather_gemm(
         swiglu_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        clamped_relu2_limit=clamped_relu2_limit,
         use_fused_finalize=False,
         enable_pdl=enable_pdl,
         activation_dtype=a_dtype_cutlass,
@@ -515,7 +516,6 @@ def launch_gather_gemm(
         activation_cache_policy="evict_last",
         use_clc_scheduler=use_clc_scheduler,
         sm_count=sm_count,
-        clamped_relu2_limit=clamped_relu2_limit,
     )
     return out, out_scale
 
@@ -619,6 +619,7 @@ def launch_finalize_gemm(
         swiglu_limit=0.0,
         situ_beta=None,
         situ_linear_beta=None,
+        clamped_relu2_limit=None,
         use_fused_finalize=use_fused_finalize,
         enable_pdl=enable_pdl,
         activation_dtype=a_dtype_cutlass,

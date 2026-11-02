@@ -518,6 +518,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        clamped_relu2_limit: Optional[torch.Tensor] = None,
         use_per_token_activation: bool = False,
         quant_mode: str = "w4a4",
         use_cuda_graph: bool = False,
@@ -525,7 +526,6 @@ class CuteDslFusedMoERunner(TunableRunner):
         localized_streams: Optional[list] = None,
         localized_sm_count: Optional[int] = None,
         localized_memset_stream: Optional[torch.cuda.Stream] = None,
-        clamped_relu2_limit: Optional[torch.Tensor] = None,
         swap_ab: bool = False,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)

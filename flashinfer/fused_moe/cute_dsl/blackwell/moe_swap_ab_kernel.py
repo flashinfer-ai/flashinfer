@@ -854,6 +854,7 @@ class Sm100BlockScaledMoeEpilogue:
         output_sf_tensor,
         alpha,
         norm_const,
+        clamped_relu2_params,
         per_token_scale,
         token_mapping,
         channel_start,
@@ -867,7 +868,6 @@ class Sm100BlockScaledMoeEpilogue:
         release_acc: cutlass.Constexpr = False,
         acc_pipeline=None,
         acc_state=None,
-        clamped_relu2_params=None,
     ):
         warp = (tidx // 32) % 4
         lane = tidx % 32
@@ -1034,6 +1034,7 @@ class Sm100BlockScaledMoeEpilogue:
         output_sf_tensor,
         alpha,
         norm_const,
+        clamped_relu2_params,
         per_token_scale,
         token_mapping,
         channel_start,
@@ -1045,7 +1046,6 @@ class Sm100BlockScaledMoeEpilogue:
         acc_state,
         channel_stride: cutlass.Constexpr,
         channel_tiles: cutlass.Constexpr,
-        clamped_relu2_params=None,
     ):
         # Treat all channel tiles as one virtual accumulator column range.
         # The actual scale footprint, rounded to a 32-column transpose slab,
@@ -1069,6 +1069,7 @@ class Sm100BlockScaledMoeEpilogue:
                     output_sf_tensor,
                     alpha,
                     norm_const,
+                    clamped_relu2_params,
                     per_token_scale,
                     token_mapping,
                     channel_start + channel_tile * channel_stride,
@@ -1082,7 +1083,6 @@ class Sm100BlockScaledMoeEpilogue:
                     step + 1 == self.overlap_activation_steps,
                     acc_pipeline,
                     acc_state,
-                    clamped_relu2_params,
                 )
             elif cutlass.const_expr(step + 1 == self.overlap_activation_steps):
                 cute.arch.fence_view_async_tmem_load()
@@ -1299,6 +1299,7 @@ class Sm100BlockScaledMoeEpilogue:
                             None,
                             alpha,
                             None,
+                            None,
                             per_token_scale,
                             token_mapping,
                             channel_start,
@@ -1338,6 +1339,7 @@ class Sm100BlockScaledMoeEpilogue:
         output_sf_tensor,
         alpha,
         norm_const,
+        clamped_relu2_params,
         per_token_scale,
         token_mapping,
         token_final_scales,
@@ -1349,7 +1351,6 @@ class Sm100BlockScaledMoeEpilogue:
         acc_pipeline=None,
         acc_state=None,
         tma_output=None,
-        clamped_relu2_params=None,
     ):
         lane = tidx % 32
         if cutlass.const_expr(self.bulk_tokens > 0):
@@ -1403,6 +1404,7 @@ class Sm100BlockScaledMoeEpilogue:
                         output_sf_tensor,
                         alpha,
                         norm_const,
+                        None,
                         per_token_scale,
                         token_mapping,
                         channel_start,
@@ -1433,6 +1435,7 @@ class Sm100BlockScaledMoeEpilogue:
                         output_sf_tensor,
                         alpha,
                         norm_const,
+                        clamped_relu2_params,
                         per_token_scale,
                         token_mapping,
                         channel_start,
@@ -1443,7 +1446,6 @@ class Sm100BlockScaledMoeEpilogue:
                         token_start,
                         cutlass.Int32(0),
                         alpha,
-                        clamped_relu2_params=clamped_relu2_params,
                     )
 
 
@@ -3385,6 +3387,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                         output_sf,
                         alpha[expert],
                         norm,
+                        clamped_relu2_params,
                         per_token_scale,
                         token_mapping,
                         channel_start,
@@ -3396,7 +3399,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                         consumer,
                         self.mma_m,
                         self.channel_tiles,
-                        clamped_relu2_params,
                     )
                 else:
                     for channel_tile in cutlass.range_constexpr(self.channel_tiles):
@@ -3419,6 +3421,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                             output_sf,
                             alpha[expert],
                             norm,
+                            clamped_relu2_params,
                             per_token_scale,
                             token_mapping,
                             token_final_scales,
@@ -3430,7 +3433,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                             acc_pipe,
                             consumer,
                             tma_output,
-                            clamped_relu2_params,
                         )
                 cute.arch.fence_view_async_tmem_load()
                 if cutlass.const_expr(not self.overlap_acc):

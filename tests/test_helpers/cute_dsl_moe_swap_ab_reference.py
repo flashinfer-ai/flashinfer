@@ -806,6 +806,7 @@ def cute_dsl_moe_reference(
     swiglu_limit=None,
     situ_beta=None,
     situ_linear_beta=None,
+    clamped_relu2_limit=None,
     nvfp4_4over6_config=None,
     disable_fp4_quant_fast_math=False,
     a_dtype="float4_e2m1fn",
@@ -813,7 +814,6 @@ def cute_dsl_moe_reference(
     sf_vec_size=16,
     swap_ab=True,
     mma_k_plans=(None, None),
-    clamped_relu2_limit=None,
 ):
     """Evaluate unfused swap-AB MoE from the exact prepared kernel operands.
 

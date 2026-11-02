@@ -2661,8 +2661,8 @@ def _moe_bf16_run_experts(
     activation_type=3,
     situ_beta=None,
     situ_linear_beta=None,
-    use_shuffled_weight=True,
     clamped_relu2_limit=None,
+    use_shuffled_weight=True,
 ):
     """Un-quantized (bf16) MoE expert computation."""
     # Keep enum values local so the serialized reference needs only PyTorch.
@@ -5035,10 +5035,10 @@ def _cute_dsl_fused_moe_reference(
     quant_mode="w4a4",
     situ_beta=None,
     situ_linear_beta=None,
+    clamped_relu2_limit=None,
     per_token_scale=None,
     local_expert_offset=0,
     swap_ab=False,
-    clamped_relu2_limit=None,
     **_unused,
 ):
     """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
