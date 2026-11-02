@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <flashinfer/math.cuh>
 #include <flashinfer/trtllm/fmha/fmhaRunner.cuh>
 #include <flashinfer/utils.cuh>
 #include <iostream>
@@ -285,7 +286,7 @@ void trtllm_paged_attention_launcher(
   runner_params.outputScalePtr = bmm2_scale_ptr;
   runner_params.mScaleSfKv = 1.0f;  // which should be fused into bmm1_scale(k)/bmm2_scale(v/o)
   runner_params.kvSfScalePtr = nullptr;
-  runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
+  runner_params.scaleSoftmaxLog2 = bmm1_scale * flashinfer::math::log2e_d;
   runner_params.scaleSoftmaxLog2Ptr = bmm1_scale_log2_ptr;
   runner_params.oSfPtr = out_scale_factor;
   runner_params.dsv4InvRopeCosSinCachePtr = dsv4_inv_rope_cos_sin_cache;
@@ -925,7 +926,7 @@ void trtllm_ragged_attention_launcher(
   // outputScale. if they are not nullptr, then scaleSoftmaxLog2 and outputScale will be ignored
   runner_params.outputScale = bmm2_scale;
   runner_params.outputScalePtr = bmm2_scale_ptr;
-  runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
+  runner_params.scaleSoftmaxLog2 = bmm1_scale * flashinfer::math::log2e_d;
   runner_params.scaleSoftmaxLog2Ptr = bmm1_scale_log2_ptr;
   runner_params.mScaleSfO = o_sf_scale;
   // FlashInfer does not expose chunked attention; zero disables it. The downstream chunked paths

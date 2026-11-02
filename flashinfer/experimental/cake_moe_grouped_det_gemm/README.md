@@ -99,6 +99,15 @@ programs always reduce in a fixed order, so `deterministic=False` currently
 runs the same deterministic programs; `grouped_det_gemm_wgrad(..., out_dtype=torch.float32)`
 gives an fp32 weight gradient. `CakeGroupedDetMm` calls the three programs as
 plain functions; no torch custom op is registered.
+The wrapper launches the forward GEMM after `CakeGroupedDetMm.apply` returns,
+that is after autograd saved `x`, `w` and `offs`, as for a built-in op. Under
+`torch.utils.checkpoint(..., use_reentrant=False)` with early stop on (the
+default), the recomputation therefore stops before this GEMM when these are
+the last saves of the innermost checkpointed region; a later save in that
+region (of its output or of any other tensor) makes it run, with the same
+bits. A direct `CakeGroupedDetMm.apply(x, w, offs, True)` launches inside
+`forward` and is always recomputed, as is the wrapper under `torch.jit.trace`
+and `torch.compile`.
 
 ## Host plan
 

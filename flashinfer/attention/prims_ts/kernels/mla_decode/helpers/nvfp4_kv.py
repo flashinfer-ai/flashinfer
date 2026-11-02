@@ -24,8 +24,11 @@ Both families gather the same records, then consume ordinary FP8 MMA tiles.
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
+from cutlass.base_dsl.arch import Arch
+from cutlass.cutlass_dsl import BaseDSL
 from cutlass.experimental import cuda, primitives as prims
 
+from ......cute_dsl.availability import is_rubin_cute_dsl_available
 from ...tensor_map import create_tensor_map_tiled_from_view
 from .gather import _address, gather4, select_gather_map
 from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
@@ -160,6 +163,17 @@ def store_shared_u32x4(dst, offset, a, b, c, d):
     )
 
 
+@cute.jit
+def store_shared_u32x2(dst, offset, a, b):
+    """Store two packed 32-bit words at dst + byte offset with one 8-byte SMEM store.
+
+    The destination must be 8-byte aligned."""
+    cute.arch.inline_ptx(
+        "st.shared.v2.b32 [{$r0}], {{$r1}, {$r2}};",
+        read_only_args=[_address(dst, Int32) + offset, a, b],
+    )
+
+
 # ===========================================================================
 # Primary-pool FP8 selection
 # ===========================================================================
@@ -212,15 +226,80 @@ def nvfp4_row_bytes(rope_dim: int) -> int:
     return NVFP4_DATA_BYTES + rope_dim + NVFP4_SCALE_BYTES
 
 
+def use_sm107_nvfp4_converter() -> bool:
+    """Whether the compile target is SM107, which uses the f16x2 converter.
+
+    ptxas rejects the packed E4M3 x E2M1 multiply for SM107 and for the
+    sm_100f family target, which SM107 compiles through on CuTe DSL < 4.8
+    (``CUTE_DSL_ARCH=sm_100f``). Every other target keeps the original
+    converter.
+    """
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    if arch == Arch.sm_100f:
+        return True
+    return is_rubin_cute_dsl_available() and Arch.sm_107 <= arch <= Arch.sm_107f
+
+
+@cute.jit
+def prepare_nvfp4_scale(scale: Int32) -> Int32:
+    """Return the ``convert_nvfp4x8`` scale operand for one block16 scale.
+
+    ``scale`` is a zero-extended E4M3 byte; prepare it once per sixteen-value
+    block. Other targets get the byte unchanged. On SM107 it becomes the f16x2
+    pair (scale, scale), built on the FMA pipe: a non-negative E4M3 byte at
+    bit 7 of an f16 lane encodes scale * 2^-8 exactly, E4M3 subnormals
+    included, and one HMUL2 by 256 restores it. The per-value conversions are
+    ALU-pipe F2FP instructions, so a per-word E4M3 -> f16 scale convert would
+    compete with them. CuTe DSL has no plain f16x2 multiply primitive, hence
+    the inline PTX.
+    """
+    if cutlass.const_expr(not use_sm107_nvfp4_converter()):
+        return scale
+    return cute.arch.inline_ptx(
+        "{ .reg .b32 k;\n  mov.b32 k, 0x5C005C00;\n  mul.rn.f16x2 {$w0}, {$r0}, k;\n}",
+        write_only_types=[Int32],
+        read_only_args=[scale * Int32(0x00800080)],
+    )
+
+
 @cute.jit
 def convert_nvfp4x8(word: Int32, scale: Int32):
     """Convert eight packed E2M1 values with one E4M3 block-scale byte.
 
-    ``word`` contains eight consecutive four-bit values; ``scale`` stores the
-    E4M3 byte in its low eight bits. Return two words containing eight E4M3
-    bytes, rounded once with saturation for ordinary FP8 MMA. No tensor-wide
-    NVFP4 scale is applied.
+    ``word`` contains eight consecutive four-bit values; ``scale`` is the
+    ``prepare_nvfp4_scale`` operand (the E4M3 byte in its low eight bits except
+    on SM107). Return two words containing eight E4M3 bytes, rounded once with
+    saturation for ordinary FP8 MMA. No tensor-wide NVFP4 scale is applied.
     """
+    if cutlass.const_expr(use_sm107_nvfp4_converter()):
+        # The f16x2 sequence of _cvt_e2m1_word_to_e4m3_words, with the scale
+        # pair prepared once per block by prepare_nvfp4_scale instead of once
+        # per word. E2M1 x E4M3 has at most six significant bits and stays
+        # inside the f16 range, so the only rounding is the final E4M3
+        # convert, matching the packed multiply.
+        return cute.arch.inline_ptx(
+            "{ .reg .b8 b0, b1, b2, b3;\n"
+            "  .reg .b32 h0, h1, h2, h3;\n"
+            "  .reg .b16 e0, e1, e2, e3;\n"
+            "  mov.b32 {b0, b1, b2, b3}, {$r0};\n"
+            "  cvt.rn.f16x2.e2m1x2 h0, b0;\n"
+            "  cvt.rn.f16x2.e2m1x2 h1, b1;\n"
+            "  cvt.rn.f16x2.e2m1x2 h2, b2;\n"
+            "  cvt.rn.f16x2.e2m1x2 h3, b3;\n"
+            "  mul.rn.f16x2 h0, h0, {$r1};\n"
+            "  mul.rn.f16x2 h1, h1, {$r1};\n"
+            "  mul.rn.f16x2 h2, h2, {$r1};\n"
+            "  mul.rn.f16x2 h3, h3, {$r1};\n"
+            "  cvt.rn.satfinite.e4m3x2.f16x2 e0, h0;\n"
+            "  cvt.rn.satfinite.e4m3x2.f16x2 e1, h1;\n"
+            "  cvt.rn.satfinite.e4m3x2.f16x2 e2, h2;\n"
+            "  cvt.rn.satfinite.e4m3x2.f16x2 e3, h3;\n"
+            "  mov.b32 {$w0}, {e0, e1};\n"
+            "  mov.b32 {$w1}, {e2, e3};\n"
+            "}",
+            write_only_types=[Int32, Int32],
+            read_only_args=[word, scale],
+        )
     if cutlass.const_expr(not _has_packed_e4m3_e2m1_mul()):
         # Older DSL builds lack packed multiply even with a newer system
         # toolkit. Convert dense nibbles directly instead of unpacking to
@@ -380,8 +459,9 @@ def convert_nvfp4_panel(
             scale_byte = cutlass.Array(scales, dtype=cutlass.Uint8)[
                 swizzle_byte_offset(row * 32 + scale_index, 32)
             ]
-            a, b = convert_nvfp4x8(packed[0], Int32(scale_byte))
-            c, d = convert_nvfp4x8(packed[1], Int32(scale_byte))
+            sf = prepare_nvfp4_scale(Int32(scale_byte))
+            a, b = convert_nvfp4x8(packed[0], sf)
+            c, d = convert_nvfp4x8(packed[1], sf)
             store_shared_u32x4(dst, byte, a, b, c, d)
 
 
@@ -623,7 +703,11 @@ def convert_nvfp4_record(
     raw=None,
     raw_empty=None,
 ):
-    """Snapshot two16-value rows per lane, then write conflict-free panels."""
+    """Snapshot two 16-value rows per lane, then write conflict-free panels.
+
+    The E4M3 RoPE tail needs no conversion. On SM107 it moves as 8-byte pieces
+    with rope_dim // 8 lanes per row, so one warp access covers several rows
+    instead of two bytes per lane per row."""
     row_bytes = nvfp4_row_bytes(rope_dim)
     if cutlass.const_expr(raw is None):
         raw = dst
@@ -634,6 +718,17 @@ def convert_nvfp4_record(
     first_row = thread_idx >> Int32(5)
     column = lane * Int32(16)
     sf_column = nvfp4_scale_byte_offset(lane, rope_dim)
+    # SM107 moves the RoPE tail as 8-byte pieces covering several rows per
+    # warp access; other targets copy two bytes per lane per row.
+    row_vector_rope = rope_dim and use_sm107_nvfp4_converter()
+    if cutlass.const_expr(row_vector_rope):
+        # A warp owns rows first_row + 8k, k < 16. RoPE group g covers k in
+        # [g * rope_rows, (g + 1) * rope_rows): D576's 64-byte RoPE takes
+        # eight lanes per row, so one access moves four rows.
+        rope_lanes = max(rope_dim // 8, 1)
+        rope_rows = 32 // rope_lanes
+        rope_row = first_row + (lane // Int32(rope_lanes)) * Int32(8)
+        rope_column = (lane % Int32(rope_lanes)) * Int32(8)
     for chunk in cutlass.range_constexpr(8):
         row0 = first_row + Int32(chunk * 16)
         row1 = row0 + Int32(8)
@@ -652,7 +747,7 @@ def convert_nvfp4_record(
             row1 * Int32(row_bytes) + Int32(NVFP4_DATA_BYTES + rope_dim) + sf_column
         ]
         scales[chunk] = Int32(sf0) | (Int32(sf1) << Int32(8))
-        if cutlass.const_expr(rope_dim):
+        if cutlass.const_expr(rope_dim and not row_vector_rope):
             rope0 = cutlass.Pointer(
                 raw
                 + row0 * Int32(row_bytes)
@@ -668,6 +763,14 @@ def convert_nvfp4_record(
                 dtype=cutlass.Uint16,
             ).load()
             rope[chunk] = Int32(rope0) | (Int32(rope1) << Int32(16))
+    if cutlass.const_expr(row_vector_rope):
+        for group in cutlass.range_constexpr(16 // rope_rows):
+            row = rope_row + Int32(group * rope_rows * 8)
+            words = cutlass.Pointer(
+                raw + row * Int32(row_bytes) + Int32(NVFP4_DATA_BYTES) + rope_column,
+                dtype=Int32,
+            ).load(count=2, alignment=8)
+            rope[group * 2], rope[group * 2 + 1] = words[0], words[1]
     if cutlass.const_expr(raw_empty is not None):
         # Raw storage is disjoint from every expanded destination. Each
         # warp snapshots all of its bytes before its release-arrival. The
@@ -684,7 +787,7 @@ def convert_nvfp4_record(
     for chunk in cutlass.range_constexpr(8):
         for pair in cutlass.range_constexpr(2):
             row = first_row + Int32(chunk * 16 + pair * 8)
-            sf = (scales[chunk] >> Int32(pair * 8)) & Int32(255)
+            sf = prepare_nvfp4_scale((scales[chunk] >> Int32(pair * 8)) & Int32(255))
             a, b = convert_nvfp4x8(packed[chunk * 4 + pair * 2], sf)
             c, d = convert_nvfp4x8(packed[chunk * 4 + pair * 2 + 1], sf)
             store_shared_u32x4(
@@ -695,7 +798,7 @@ def convert_nvfp4_record(
                 c,
                 d,
             )
-            if cutlass.const_expr(rope_dim):
+            if cutlass.const_expr(rope_dim and not row_vector_rope):
                 packed_rope = cutlass.Uint16(
                     (rope[chunk] >> Int32(pair * 16)) & Int32(65535)
                 )
@@ -705,6 +808,15 @@ def convert_nvfp4_record(
                     + swizzle_byte_offset(row * Int32(64) + lane * Int32(2), 64),
                     dtype=cutlass.Uint16,
                 ).store(packed_rope)
+    if cutlass.const_expr(row_vector_rope):
+        for group in cutlass.range_constexpr(16 // rope_rows):
+            row = rope_row + Int32(group * rope_rows * 8)
+            store_shared_u32x2(
+                dst + Int32(4 * stage_bytes),
+                swizzle_byte_offset(row * Int32(64) + rope_column, 64),
+                rope[group * 2],
+                rope[group * 2 + 1],
+            )
 
 
 @cute.jit
