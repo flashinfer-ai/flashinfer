@@ -1314,7 +1314,8 @@ def resolve_launch(
             and grid_args
             and record in getattr(jit, "L2N_RECORD_PLANS", {})
         ):
-            grid = tuple(int(x) for x in jit.launch_grid(record, **grid_args))
+            gx, gy, gz = (int(x) for x in jit.launch_grid(record, **grid_args))
+            grid = (gx, gy, gz)
         if call is not None:
             call.records.append((record, grid))
         return record, values, grid, False

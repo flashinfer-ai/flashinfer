@@ -1130,7 +1130,7 @@ def emulate_forward(
         if rk.lt.NC:
             run_module("fwd_o", {**rk.common(), **tp, "o": o, "num_seqs": rk.wt.NSEG})
         outs.append(o)
-    keep = FULL_SAVED if save_mode == "full" else LIGHT_SAVED
+    keep: tuple[str, ...] = FULL_SAVED if save_mode == "full" else LIGHT_SAVED
     if ranks and ranks[0].qk_l2norm:
         keep = keep + (
             "qk_rstd",
