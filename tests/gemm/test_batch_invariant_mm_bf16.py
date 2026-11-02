@@ -110,7 +110,8 @@ def test_fingerprint_is_a_function_of_the_weight_shape():
 def test_chunk_rule_takes_no_m():
     import inspect
 
-    assert list(inspect.signature(chunks_for).parameters) == ["N", "K"]
+    params = list(inspect.signature(chunks_for).parameters)
+    assert params == ["N", "K", "in_fmt"] and "M" not in params
     assert chunks_for(4096, 4096) == 1 and chunks_for(8192, 8192) == 1
     assert chunks_for(0, 4096) == 1  # an empty weight: no split, as in Lean
     assert (

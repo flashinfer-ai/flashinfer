@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""The Lean coupling of the class ``gemm.bf16`` (``flashinfer/batch_invariant/lean/``).
+"""The Lean coupling of the classes ``gemm.bf16`` and ``gemm.e4m3`` / ``gemm.e5m2`` (``flashinfer/batch_invariant/lean/``).
 
 Device-free (every CI job): the committed ``Cases.lean`` is byte for byte what the Python spec and engine emit, so a
 change to the dataflow, the lowering, a knob constraint or the chunk rule that was not propagated to the Lean cases
@@ -18,7 +18,7 @@ import subprocess
 import pytest
 
 from flashinfer.batch_invariant import lean_cases
-from flashinfer.gemm.batch_invariant.spec import MMA_K
+from flashinfer.gemm.batch_invariant.spec import MMA_K, MMA_K_OF
 
 LAKE = shutil.which("lake") or os.path.expanduser("~/.elan/bin/lake")
 needs_lake = pytest.mark.skipif(
@@ -69,34 +69,38 @@ def test_lean_model_matches_python_engine_and_spec():
     lean = {}
     for line in r.stdout.splitlines():
         tag = line.split(" ", 1)[0]
-        if tag == "gemm":
+        if tag in ("gemm", "gemm32"):
             _, steps, C, sx = line.split(" ", 3)
-            lean[("gemm", int(steps), int(C))] = sx
-        elif tag == "gemmloop":
+            lean[(tag, int(steps), int(C))] = sx
+        elif tag in ("gemmloop", "gemm32loop"):
             _, nblk, sx = line.split(" ", 2)
-            lean[("gemmloop", int(nblk))] = sx
-        elif tag == "gemmout":
+            lean[(tag, int(nblk))] = sx
+        elif tag in ("gemmout", "gemm32out"):
             _, steps, fmt, sx = line.split(" ", 3)
-            lean[("gemmout", int(steps), fmt)] = sx
-        elif tag == "chunks":
+            lean[(tag, int(steps), fmt)] = sx
+        elif tag in ("chunks", "chunks32"):
             _, N, K, C = line.split(" ")
-            lean[("chunks", int(N), int(K))] = int(C)
+            lean[(tag, int(N), int(K))] = int(C)
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
-    for K, C, sx in lean_cases.spec_cases():
-        assert lean[("gemm", K // MMA_K, C)] == sx, (K, C)
-        checked += 1
-    for nblk, sx in lean_cases.loop_cases()[1]:
-        assert lean[("gemmloop", nblk)] == sx, nblk
-        checked += 1
-    for K, fmt, sx in lean_cases.out_cases():
-        assert lean[("gemmout", K // MMA_K, fmt)] == sx, (K, fmt)
-        checked += 1
-    for N, K, C in lean_cases.chunk_table():
-        assert lean[("chunks", N, K)] == C, (N, K)
-        checked += 1
-    assert checked == len(lean) >= 20
+    # the bf16 class at the mma16 step and the fp8 classes at the mma32 step (one Lean step for e4m3 and e5m2)
+    for in_fmt, p in (("bf16", ""), (lean_cases.FP8_FMT, "32")):
+        mk = MMA_K_OF[in_fmt]
+        for K, C, sx in lean_cases.spec_cases(in_fmt):
+            assert lean[(f"gemm{p}", K // mk, C)] == sx, (in_fmt, K, C)
+            checked += 1
+        for nblk, sx in lean_cases.loop_cases(in_fmt)[1]:
+            assert lean[(f"gemm{p}loop", nblk)] == sx, (in_fmt, nblk)
+            checked += 1
+        for K, fmt, sx in lean_cases.out_cases(in_fmt):
+            assert lean[(f"gemm{p}out", K // mk, fmt)] == sx, (in_fmt, K, fmt)
+            checked += 1
+        for N, K, C in lean_cases.chunk_table(in_fmt):
+            assert lean[(f"chunks{p}", N, K)] == C, (in_fmt, N, K)
+            checked += 1
+    assert MMA_K_OF["bf16"] == MMA_K
+    assert checked == len(lean) >= 40
 
 
 @needs_lake
