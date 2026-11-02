@@ -762,7 +762,7 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                     causal_prefix = kv_len_b - Q_LEN;
                 }
                 int global_q_pos = causal_prefix + q_row_idx;
-                int visible_local_keys = global_q_pos + 1;
+                int visible_local_keys = ((global_q_pos + 1) < (kv_len_b) ? (global_q_pos + 1) : (kv_len_b));
                 int win_start = 0;
                 int num_n_blocks_total = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks = ((num_n_blocks_total + num_n_blocks_total % 2) > (4) ? (num_n_blocks_total + num_n_blocks_total % 2) : (4));
@@ -1120,7 +1120,7 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                     causal_prefix_1 = kv_len_b_1 - Q_LEN;
                 }
                 int global_q_pos_1 = causal_prefix_1 + q_row_idx_1;
-                int visible_local_keys_1 = global_q_pos_1 + 1;
+                int visible_local_keys_1 = ((global_q_pos_1 + 1) < (kv_len_b_1) ? (global_q_pos_1 + 1) : (kv_len_b_1));
                 int win_start_1 = 0;
                 int num_n_blocks_total_1 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_1 = ((num_n_blocks_total_1 + num_n_blocks_total_1 % 2) > (4) ? (num_n_blocks_total_1 + num_n_blocks_total_1 % 2) : (4));
@@ -1463,7 +1463,7 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                     causal_prefix_2 = kv_len_b_2 - Q_LEN;
                 }
                 int global_q_pos_2 = causal_prefix_2 + q_row_idx_2;
-                int visible_local_keys_2 = global_q_pos_2 + 1;
+                int visible_local_keys_2 = ((global_q_pos_2 + 1) < (kv_len_b_2) ? (global_q_pos_2 + 1) : (kv_len_b_2));
                 int win_start_2 = 0;
                 int num_n_blocks_total_2 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_2 = ((num_n_blocks_total_2 + num_n_blocks_total_2 % 2) > (4) ? (num_n_blocks_total_2 + num_n_blocks_total_2 % 2) : (4));
@@ -2029,7 +2029,7 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                     causal_prefix_3 = kv_len_b_3 - Q_LEN;
                 }
                 int global_q_pos_3 = causal_prefix_3 + q_row_idx_3;
-                int visible_local_keys_3 = global_q_pos_3 + 1;
+                int visible_local_keys_3 = ((global_q_pos_3 + 1) < (kv_len_b_3) ? (global_q_pos_3 + 1) : (kv_len_b_3));
                 int win_start_3 = 0;
                 int pt_base_p = batch_idx_3 * max_pages_per_seq;
                 int num_n_blocks_total_3 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
@@ -2269,7 +2269,7 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                     causal_prefix_4 = kv_len_b_4 - Q_LEN;
                 }
                 int global_q_pos_4 = causal_prefix_4 + q_row_idx_4;
-                int visible_local_keys_4 = global_q_pos_4 + 1;
+                int visible_local_keys_4 = ((global_q_pos_4 + 1) < (kv_len_b_4) ? (global_q_pos_4 + 1) : (kv_len_b_4));
                 int win_start_4 = 0;
                 int num_n_blocks_total_4 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_4 = ((num_n_blocks_total_4 + num_n_blocks_total_4 % 2) > (4) ? (num_n_blocks_total_4 + num_n_blocks_total_4 % 2) : (4));
@@ -2314,14 +2314,14 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)ni % 5)) * 8, 32768);
 #endif
                         int ldst = smem_kv_addr + (unsigned int)(kv_stage * 32768);
-                        int page_ids[4];
+                        int pg_k_lo[4];
                         int page_addr_1 = smem_page_offsets_addr + (unsigned int)(page_stage_k * 128) + (unsigned int)(ni % 4 * 8 * 4);
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&page_ids[0])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids[(0) + 3]))
+                            : "=r"(*reinterpret_cast<uint32_t*>(&pg_k_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k_lo[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k_lo[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_k_lo[(0) + 3]))
                             : "r"(page_addr_1));
                         #pragma unroll
                         for (int page_i = 0; page_i < 4; page_i++) {
-                            int page_id = page_ids[page_i];
+                            int page_id = pg_k_lo[page_i];
                             #pragma unroll
                             for (int head_dim_half = 0; head_dim_half < 2; head_dim_half++) {
                                 int byte_offset = head_dim_half * 16384 + page_i * 2048;
@@ -2364,6 +2364,13 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&pg_v[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v[(0) + 3]))
                             : "r"(page_addr_2));
+                        int keys_left = visible_local_keys_4 - ((split_start_block_1 + ni_1) * 8 + 4) * 16;
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++) {
+                            if (j * 16 >= keys_left) {
+                                pg_v[j] = 1073741824;
+                            }
+                        }
                     }
                     int page_group_done = ((ni_1 % 4 == 3) ? 1 : 0);
                     page_group_done = page_group_done | ((ni_1 + 1 == cta_n_blocks_4) ? 1 : 0);
@@ -2380,14 +2387,21 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)ni_1 % 5)) * 8, 32768);
 #endif
                         int vdst = smem_kv_addr + (unsigned int)(stage * 32768);
-                        int page_ids_1[4];
+                        int pg_v_lo[4];
                         int page_addr_3 = smem_page_offsets_addr + (unsigned int)(page_stage_v * 128) + (unsigned int)(ni_1 % 4 * 8 * 4);
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&page_ids_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_1[(0) + 3]))
+                            : "=r"(*reinterpret_cast<uint32_t*>(&pg_v_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v_lo[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v_lo[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_v_lo[(0) + 3]))
                             : "r"(page_addr_3));
+                        int keys_left_1 = visible_local_keys_4 - (split_start_block_1 + ni_1) * 8 * 16;
+                        #pragma unroll
+                        for (int j_1 = 0; j_1 < 4; j_1++) {
+                            if (j_1 * 16 >= keys_left_1) {
+                                pg_v_lo[j_1] = 1073741824;
+                            }
+                        }
                         #pragma unroll
                         for (int page_i_1 = 0; page_i_1 < 4; page_i_1++) {
-                            int page_id_1 = page_ids_1[page_i_1];
+                            int page_id_1 = pg_v_lo[page_i_1];
                             #pragma unroll
                             for (int head_dim_half_1 = 0; head_dim_half_1 < 2; head_dim_half_1++) {
                                 int byte_offset_1 = head_dim_half_1 * 16384 + page_i_1 * 2048;
@@ -2449,14 +2463,14 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)(ni_1 + K_LOOKAHEAD) % 5)) * 8, 32768);
 #endif
                         int kdst = smem_kv_addr + (unsigned int)(k_stage * 32768);
-                        int page_ids_2[4];
+                        int pg_nk_lo[4];
                         int page_addr_5 = smem_page_offsets_addr + (unsigned int)(page_stage_nk * 128) + (unsigned int)(next_ni % 4 * 8 * 4);
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&page_ids_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_2[(0) + 3]))
+                            : "=r"(*reinterpret_cast<uint32_t*>(&pg_nk_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk_lo[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk_lo[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pg_nk_lo[(0) + 3]))
                             : "r"(page_addr_5));
                         #pragma unroll
                         for (int page_i_2 = 0; page_i_2 < 4; page_i_2++) {
-                            int page_id_2 = page_ids_2[page_i_2];
+                            int page_id_2 = pg_nk_lo[page_i_2];
                             #pragma unroll
                             for (int head_dim_half_2 = 0; head_dim_half_2 < 2; head_dim_half_2++) {
                                 int byte_offset_2 = head_dim_half_2 * 16384 + page_i_2 * 2048;
@@ -2498,6 +2512,13 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[0])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v[(0) + 3]))
                             : "r"(page_addr_6));
+                        int keys_left_2 = visible_local_keys_4 - ((split_start_block_1 + tail_ni) * 8 + 4) * 16;
+                        #pragma unroll
+                        for (int j_2 = 0; j_2 < 4; j_2++) {
+                            if (j_2 * 16 >= keys_left_2) {
+                                tpg_v[j_2] = 1073741824;
+                            }
+                        }
                     }
                     int page_group_done_tail = ((tail_ni % 4 == 3) ? 1 : 0);
                     page_group_done_tail = page_group_done_tail | ((tail_ni + 1 == cta_n_blocks_4) ? 1 : 0);
@@ -2514,14 +2535,21 @@ kernel_cake_fmha_decode_bf16_eb613495c94cae21226f(const __grid_constant__ CUtens
                         mbarrier_arrive_expect_tx(kv_full_addr + ((int)((unsigned int)tail_ni % 5)) * 8, 32768);
 #endif
                         int tvdst = smem_kv_addr + (unsigned int)(tstage * 32768);
-                        int page_ids_3[4];
+                        int tpg_v_lo[4];
                         int page_addr_7 = smem_page_offsets_addr + (unsigned int)(page_stage_tv * 128) + (unsigned int)(tail_ni % 4 * 8 * 4);
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&page_ids_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&page_ids_3[(0) + 3]))
+                            : "=r"(*reinterpret_cast<uint32_t*>(&tpg_v_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v_lo[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v_lo[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&tpg_v_lo[(0) + 3]))
                             : "r"(page_addr_7));
+                        int keys_left_3 = visible_local_keys_4 - (split_start_block_1 + tail_ni) * 8 * 16;
+                        #pragma unroll
+                        for (int j_3 = 0; j_3 < 4; j_3++) {
+                            if (j_3 * 16 >= keys_left_3) {
+                                tpg_v_lo[j_3] = 1073741824;
+                            }
+                        }
                         #pragma unroll
                         for (int page_i_3 = 0; page_i_3 < 4; page_i_3++) {
-                            int page_id_3 = page_ids_3[page_i_3];
+                            int page_id_3 = tpg_v_lo[page_i_3];
                             #pragma unroll
                             for (int head_dim_half_3 = 0; head_dim_half_3 < 2; head_dim_half_3++) {
                                 int byte_offset_3 = head_dim_half_3 * 16384 + page_i_3 * 2048;
