@@ -20,7 +20,7 @@ import cutlass.utils as cutlass_utils
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import from_dlpack
 
-from ._disk_cache_sm90 import load_or_compile
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 # ---------------------------------------------------------------------------
 # MSA stage-2 block selection.
@@ -1711,14 +1711,18 @@ def _compile(key, max_score, topk_idx, nvp):
     if key[0] == "fill":
         args = (_launch_fill, _kf_stream(), _dyn(max_score, 2), _dyn(topk_idx, 2))
         args += (_dyn(nvp, 0), key[1])
+        name = f"fill_mask{int(key[1])}_{key[2]}"
     else:
         args = (_launch, _kf_stream(), _dyn(max_score, 2), _dyn(topk_idx, 2))
         args += (_dyn(nvp, 0), Int32(0), Int32(0)) + key[:6]
-    return load_or_compile(
+        lw, dense, tl, filt, c, mask, dtype = key
+        name = f"lw{lw}_dense{int(dense)}_tl{tl}_filt{int(filt)}_c{c}"
+        name += f"_mask{int(mask)}_{dtype}"
+    return build_and_load_cute_dsl_kernel(
         "msa_topk_select_sm90",
-        key,
+        name,
         lambda: cute.compile(*args, options="--enable-tvm-ffi"),
-        __file__,
+        (__file__,),
     )
 
 

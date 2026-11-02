@@ -23,7 +23,7 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync, warpgroup, OperandMajorMode
 
 from . import sparse_prefill_sm90
-from ._disk_cache_sm90 import load_or_compile
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .sparse_prefill_sm90 import _SLOT_KEY, _p_half
 
 D = 128  # head_dim
@@ -1208,22 +1208,23 @@ def run(
         if use_fp8:
             vshape = (npg, hkv, D, PG)
             key = (hq, hkv, 8, softmax_scale, q.dtype, kv.dtype)
+            name = f"vt8_hq{hq}_hkv{hkv}_scale{softmax_scale}_{q.dtype}_{kv.dtype}"
             args = (MsaSparseAttnFp8(hq, hkv, softmax_scale=softmax_scale),)
             args += (_I64(0),) * 8
         else:
             vshape = None
             key = (hq, hkv, softmax_scale, q.dtype, kv.dtype)
+            name = f"v16_hq{hq}_hkv{hkv}_scale{softmax_scale}_{q.dtype}_{kv.dtype}"
             args = (MsaSparseAttn(hq, hkv, softmax_scale=softmax_scale),)
             args += (_I64(0),) * 7
         args += (_I32(0),) * 4 + (_stream(),)
         fn = _CACHE.get(key)
         if fn is None:
-            fn = _CACHE[key] = load_or_compile(
+            fn = _CACHE[key] = build_and_load_cute_dsl_kernel(
                 "msa_sparse_prefill_single_sm90",
-                key,
+                name,
                 lambda: cute.compile(*args, options="--enable-tvm-ffi"),
-                __file__,
-                sparse_prefill_sm90.__file__,
+                (__file__, sparse_prefill_sm90.__file__),
             )
         plan = (fn, vshape, (tq, npg, nb, mpg))
         _PLAN[sig] = plan

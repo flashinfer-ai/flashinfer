@@ -53,7 +53,7 @@ import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync, warpgroup, OperandMajorMode
 
-from ._disk_cache_sm90 import load_or_compile
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 D = 128  # head_dim
 PG = 128  # page / KV block size
@@ -901,11 +901,11 @@ def run(
             # runtime values, so placeholders stand in for them.
             args = (MsaSparseAttnFp8(hq, hkv, nt, softmax_scale=softmax_scale),)
             args += (_I64(0),) * 9 + (_I32(0),) * 5 + (_stream(),)
-            fn = _CACHE[key] = load_or_compile(
+            fn = _CACHE[key] = build_and_load_cute_dsl_kernel(
                 "msa_sparse_prefill_sm90",
-                key,
+                f"hq{hq}_hkv{hkv}_nt{nt}_scale{softmax_scale}_{q.dtype}_{kv.dtype}",
                 lambda: cute.compile(*args, options="--enable-tvm-ffi"),
-                __file__,
+                (__file__,),
             )
         plan = (fn, (tq, npg, nb, mpg, ngrp), (npg, hkv, D, PG))
         _PLAN[sig] = plan

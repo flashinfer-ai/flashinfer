@@ -19,7 +19,7 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 
-from ._disk_cache_sm90 import load_or_compile
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 
 # ---------------------------------------------------------------------------
@@ -992,9 +992,10 @@ def run(
             ).mark_layout_dynamic(leading_dim=0),
         )
         sizes = (total_q, nkt, batch_size, nkchunk, n_mtiles)
-        op = load_or_compile(
+        op = build_and_load_cute_dsl_kernel(
             "msa_proxy_score_prefill_sm90",
-            key,
+            f"hq{hq}_pg{k.shape[2]}_d{k.shape[3]}_tmaq{int(use_tma_q)}_fold{fold}"
+            f"_f32acc{int(use_fp32_acc)}_{q.dtype}_{k.dtype}_{max_score.dtype}",
             lambda: cute.compile(
                 kern,
                 _kf_stream(),
@@ -1002,7 +1003,7 @@ def run(
                 *map(cutlass.Int32, sizes),
                 options="--enable-tvm-ffi",
             ),
-            __file__,
+            (__file__,),
         )
         _CACHE[key] = op
     op(

@@ -16,7 +16,7 @@ import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass.cute.runtime import from_dlpack
 
-from ._disk_cache_sm90 import load_or_compile
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 HD = 128  # head dim
 PG = 128  # page size == kv block size
@@ -307,11 +307,12 @@ def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
         ).mark_layout_dynamic(leading_dim=2)
         args = (_msa_host, mQ, mK, mCu, mPT, mSK, mO, stream)
         args += (Hkv, KPS, KHS, G, SQ, tpb)
-        fn = load_or_compile(
+        fn = build_and_load_cute_dsl_kernel(
             "msa_proxy_score_decode_bf16_sm90",
-            key,
+            f"hkv{Hkv}_kps{KPS}_khs{KHS}_g{G}_sq{SQ}_tpb{tpb}"
+            f"_{q.dtype}_{k.dtype}_{max_score.dtype}",
             lambda: cute.compile(*args, options="--enable-tvm-ffi"),
-            __file__,
+            (__file__,),
         )
         _COMPILED[key] = fn
     fn(q, k, cu_seqlens_q, page_table, seqused_k, max_score, stream)

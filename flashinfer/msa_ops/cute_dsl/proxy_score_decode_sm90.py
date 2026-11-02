@@ -16,7 +16,7 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute.runtime import from_dlpack
 
-from ._disk_cache_sm90 import load_or_compile
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 PAGE = 128
 HALF = 64
@@ -442,11 +442,12 @@ def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
         ).mark_layout_dynamic(leading_dim=2)
         args = (_msa_host, _kf_stream(), mK, mQ, mPage, mSeq, mOut, nsplit)
         args += (nq, Hq, sq, log2_hq, TN, batch_fast, _NSTAGE)
-        fn = load_or_compile(
+        fn = build_and_load_cute_dsl_kernel(
             "msa_proxy_score_decode_sm90",
-            key,
+            f"hq{Hq}_sq{sq}_bf{int(batch_fast)}_ns{_NSTAGE}"
+            f"_{k.dtype}_{q.dtype}_{max_score.dtype}",
             lambda: cute.compile(*args, options="--enable-tvm-ffi"),
-            __file__,
+            (__file__,),
         )
         _CACHE[key] = fn
     fn(_kf_stream(), k, q, page_table, seqused_k, max_score, nsplit)
