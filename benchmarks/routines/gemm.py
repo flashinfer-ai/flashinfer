@@ -281,6 +281,20 @@ def parse_gemm_args(line, parser):
     }
     if args.routine in default_backends and not has_backends_arg:
         args.backends = list(default_backends[args.routine])
+    # Masked / ragged grouped GEMMs: the default backend depends on the dtype
+    # (masked has no cudnn path at all; grouped_mm's cudnn has no mxfp4).
+    if args.routine == "masked_grouped_gemm" and not has_backends_arg:
+        args.backends = [
+            {"fp8_e4m3": "deepgemm", "nvfp4": "cute-dsl", "mxfp8": "cute-dsl"}.get(
+                args.input_dtype, "cutile"
+            )
+        ]
+    if (
+        args.routine == "grouped_mm"
+        and not has_backends_arg
+        and args.input_dtype == "mxfp4"
+    ):
+        args.backends = ["cutile"]
     if args.routine == "router_gemm" and not has_input_dtype_arg:
         args.input_dtype = "bfloat16"
     if args.verbose >= 1:
@@ -297,6 +311,13 @@ def to_float8(x, dtype=torch.float8_e4m3fn):
     return x_scl_sat.to(dtype), scale.float().reciprocal()
 
 
+def _log_dropped_backend(backend, e, reason):
+    """A whitelisted backend that is dropped is always a [WARNING]: shape
+    limits, missing kernels and compiler failures all raise ValueError, so
+    the exception type cannot tell an expected limit from a broken backend."""
+    print(f"[WARNING] {backend} backend {reason}: {type(e).__name__}: {e}")
+
+
 def _drop_failing_backends(backends, trial):
     """Probe-and-drop: call ``trial(backend)`` once per backend and remove the
     backends whose launch raises (shape, layout or dtype limits that a
@@ -306,9 +327,7 @@ def _drop_failing_backends(backends, trial):
         try:
             trial(backend)
         except Exception as e:
-            print(
-                f"[INFO] {backend} backend does not support this configuration: {type(e).__name__}: {e}"
-            )
+            _log_dropped_backend(backend, e, "does not support this configuration")
             backends.remove(backend)
     return backends
 
@@ -552,12 +571,9 @@ def testGemmFp8NtGroupwise(args):
             cur_res["k"] = k
             cur_res["tile_size"] = tile_size
             cur_res["scale_major_mode"] = scale_major_mode
-            # Recorded only off the default path, so existing rows keep their
-            # problem key (these columns were blank for this routine before).
-            if scale_granularity_m != 1:
-                cur_res["scale_granularity_m"] = scale_granularity_m
-            if input_dtype != torch.float8_e4m3fn:
-                cur_res["input_dtype"] = input_dtype
+            # input_dtype is left to the CSV writer, which fills it from
+            # --input_dtype (fp8_e4m3 / fp8_e5m2) like every other routine.
+            cur_res["scale_granularity_m"] = scale_granularity_m
             cur_res["out_dtype"] = out_dtype
             cur_res["mma_sm"] = mma_sm
             cur_res["backend"] = backend
@@ -2977,7 +2993,9 @@ def _bench_and_report(
 ):
     """Shared timing / refcheck / CSV tail of the routines below.
 
-    run_fns:   backend -> zero-argument callable launching the op.
+    run_fns:   backend -> callable launching the op. Its operands are keyword
+               defaults; timing passes them back as input_args so the
+               CUDA-graph path can rotate copies and keep L2 cold.
     refchecks: backend -> callable(output) returning the cosine similarity of
                the backend's valid output against its reference, or None.
     """
@@ -3016,6 +3034,7 @@ def _bench_and_report(
             enable_cupti=args.use_cupti,
             use_cuda_graph=not args.no_cuda_graph,
             cold_l2_cache=True,
+            input_args=run_fns[backend].__defaults__ or (),
         )
 
     for backend in backends:
@@ -3124,7 +3143,7 @@ def testRouterGemm(args):
     b = torch.randn(n, k, device=device, dtype=torch.bfloat16).t()  # column-major
     out = torch.empty(m, n, device=device, dtype=out_dtype)
 
-    def run():
+    def run(a=a, b=b, out=out):
         router_gemm(a, b, out, launch_with_pdl=args.enable_pdl)
         return out
 
@@ -3145,7 +3164,7 @@ def testRouterGemm(args):
         problem_flops,
         problem_bytes,
         {
-            "input_dtype": str(torch.bfloat16),
+            "input_dtype": "bfloat16",
             "out_dtype": str(out_dtype),
             "enable_pdl": args.enable_pdl,
         },
@@ -3208,7 +3227,7 @@ def testGroupGemmMxfp4NtGroupwise(args):
     for g, part in enumerate(a_scale_parts):
         a_scale[sf_offsets[g] : sf_offsets[g] + part.shape[0]] = part.view(torch.uint8)
 
-    def run():
+    def run(a=a, b=b, a_scale=a_scale, b_scale=b_scale, m_indptr=m_indptr):
         return flashinfer.gemm.group_gemm_mxfp8_mxfp4_nt_groupwise(
             a,
             b,
@@ -3270,15 +3289,14 @@ _ELEMENT_BYTES = {
 }
 
 
-def _make_masked_m(num_groups, expected_m, max_m, seed, device):
+def _make_masked_m(num_groups, expected_m, max_m, seed, device, align=1):
     """DeepGEMM-style per-group valid rows (0.7-1.3 x expected_m), rounded up
-    to 128 (the cuTile scale-tile granularity) so every backend sees the same
-    mask, and clamped to max_m."""
+    to ``align`` and clamped to max_m."""
     import random
 
     rng = random.Random(seed)
     counts = [
-        min(max_m, (int(expected_m * rng.uniform(0.7, 1.3)) + 127) // 128 * 128)
+        min(max_m, -(-int(expected_m * rng.uniform(0.7, 1.3)) // align) * align)
         for _ in range(num_groups)
     ]
     return torch.tensor(counts, dtype=torch.int32, device=device)
@@ -3391,7 +3409,19 @@ def testMaskedGroupedGemm(args):
         print("[ERROR] No backends to test. Exiting.")
         return []
 
-    masked_m = _make_masked_m(G, expected_m, max_m, args.random_seed, device)
+    # cuTile's block-scaled kernels take whole 128-row scale tiles, so a line
+    # that requests them rounds the shared mask up to 128; other lines run the
+    # requested rows. Keyed on --backends, not the arch-filtered list, so a
+    # line runs the same mask on every GPU.
+    align = 128 if "cutile" in args.backends and dtype != "bfloat16" else 1
+    masked_m = _make_masked_m(
+        G, expected_m, max_m, args.random_seed, device, align=align
+    )
+    if align > 1:
+        print(
+            f"[INFO] masked_m rounded up to {align} rows for cutile {dtype}: "
+            f"mean {masked_m.float().mean().item():.1f} rows per group vs --expected_m {expected_m}"
+        )
     run_fns, refchecks = {}, {}
 
     for backend in list(backends):
@@ -3412,7 +3442,7 @@ def testMaskedGroupedGemm(args):
                     a_s, b_s, max_m, n, k, G, sfa_groups=G
                 )
 
-                def run_deepgemm(a_q=a_q, b_q=b_q, a_s=a_s, b_s=b_s):
+                def run_deepgemm(a_q=a_q, b_q=b_q, a_s=a_s, b_s=b_s, masked_m=masked_m):
                     return flashinfer.gemm.batch_deepgemm_fp8_nt_groupwise(
                         a_q,
                         b_q,
@@ -3496,6 +3526,7 @@ def testMaskedGroupedGemm(args):
                     sf_dtype=sf_dtype,
                     c_dtype=c_dtype,
                     sf_vec_size=sf_vec_size,
+                    masked_m=masked_m,
                 ):
                     flashinfer.gemm.grouped_gemm_nt_masked(
                         (a_t, sfa_t),
@@ -3518,7 +3549,7 @@ def testMaskedGroupedGemm(args):
                 )
                 ref = torch.einsum("gmk,gnk->gmn", a_q.float(), b_q.float())
 
-                def run_cutile_bf16(a_q=a_q, b_q=b_q):
+                def run_cutile_bf16(a_q=a_q, b_q=b_q, masked_m=masked_m):
                     return flashinfer.gemm.masked_bmm(
                         a_q, b_q, masked_m, transpose_b=True, backend="cutile"
                     )
@@ -3530,7 +3561,7 @@ def testMaskedGroupedGemm(args):
                 )
                 ref = torch.einsum("gmk,gnk->gmn", a_deq, b_deq)
 
-                def run_cutile(a_q=a_q, b_q=b_q, a_s=a_s, b_s=b_s):
+                def run_cutile(a_q=a_q, b_q=b_q, a_s=a_s, b_s=b_s, masked_m=masked_m):
                     return flashinfer.gemm.masked_scaled_bmm(
                         a_q,
                         b_q,
@@ -3545,8 +3576,8 @@ def testMaskedGroupedGemm(args):
                 run_fns[backend] = run_cutile
             refchecks[backend] = lambda o, ref=ref: _masked_cos_sim(ref, o, masked_m)
         except Exception as e:
-            print(
-                f"[INFO] {backend} backend could not build inputs for this configuration: {type(e).__name__}: {e}"
+            _log_dropped_backend(
+                backend, e, "could not build inputs for this configuration"
             )
             backends.remove(backend)
 
@@ -3640,7 +3671,7 @@ def testGroupedMm(args):
             ref = bf16_reference
             if backend == "cudnn" and dtype == "bfloat16":
 
-                def run_bf16():
+                def run_bf16(a_bf16=a_bf16, b_bf16=b_bf16, m_indptr=m_indptr):
                     return flashinfer.grouped_mm_bf16(
                         a_bf16, b_bf16, m_indptr, out_dtype=out_dtype
                     )
@@ -3651,7 +3682,7 @@ def testGroupedMm(args):
                 b_q, b_inv = to_float8(b_bf16)
                 alpha = (a_inv * b_inv).float().reshape(1)
 
-                def run_fp8(a_q=a_q, b_q=b_q, alpha=alpha):
+                def run_fp8(a_q=a_q, b_q=b_q, alpha=alpha, m_indptr=m_indptr):
                     return flashinfer.grouped_mm_fp8(
                         a_q, b_q, m_indptr, alpha=alpha, out_dtype=out_dtype
                     )
@@ -3663,7 +3694,7 @@ def testGroupedMm(args):
                 a_s = a_s.reshape(-1, k // 32)
                 b_s = b_s.reshape(G, -1, k // 32)
 
-                def run_mxfp8(a_q=a_q, b_q=b_q, a_s=a_s, b_s=b_s):
+                def run_mxfp8(a_q=a_q, b_q=b_q, a_s=a_s, b_s=b_s, m_indptr=m_indptr):
                     return flashinfer.grouped_mm_mxfp8(
                         a_q, b_q, a_s, b_s, m_indptr, out_dtype=out_dtype
                     )
@@ -3691,7 +3722,9 @@ def testGroupedMm(args):
                     [1.0 / (a_gsf * b_gsf)], dtype=torch.float32, device=device
                 )
 
-                def run_fp4(a_q=a_q, b_q=b_q, a_s=a_s, b_s=b_s, alpha=alpha):
+                def run_fp4(
+                    a_q=a_q, b_q=b_q, a_s=a_s, b_s=b_s, alpha=alpha, m_indptr=m_indptr
+                ):
                     return flashinfer.grouped_mm_fp4(
                         a_q,
                         b_q,
@@ -3706,7 +3739,7 @@ def testGroupedMm(args):
                 run_fns[backend] = run_fp4
             elif backend == "cutile" and dtype == "bfloat16":
 
-                def run_ragged_bf16():
+                def run_ragged_bf16(a_bf16=a_bf16, b_bf16=b_bf16, m_indptr=m_indptr):
                     return flashinfer.gemm.ragged_bmm(
                         a_bf16,
                         b_bf16,
@@ -3731,7 +3764,9 @@ def testGroupedMm(args):
                     [a_deq[g * m : (g + 1) * m] @ b_deq[g].T for g in range(G)]
                 )
 
-                def run_ragged_scaled(a_q=a_q, b_q=b_q, a_s=a_s, b_s=b_s):
+                def run_ragged_scaled(
+                    a_q=a_q, b_q=b_q, a_s=a_s, b_s=b_s, m_indptr=m_indptr
+                ):
                     return flashinfer.gemm.ragged_scaled_bmm(
                         a_q, b_q, a_s, b_s, m_indptr, m, dtype, backend="cutile"
                     )
@@ -3739,8 +3774,8 @@ def testGroupedMm(args):
                 run_fns[backend] = run_ragged_scaled
             refchecks[backend] = lambda o, ref=ref: _cos_sim(ref, o)
         except Exception as e:
-            print(
-                f"[INFO] {backend} backend could not build inputs for this configuration: {type(e).__name__}: {e}"
+            _log_dropped_backend(
+                backend, e, "could not build inputs for this configuration"
             )
             backends.remove(backend)
 
@@ -3812,7 +3847,7 @@ def testMmNvfp4Svdquant(args):
     out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
 
     def make_run(backend):
-        def run():
+        def run(xq=xq, wq=wq, x_sf=x_sf, w_sf=w_sf, alpha=alpha, d=d, l1=l1, out=out):
             return flashinfer.mm_nvfp4_svdquant(
                 xq,
                 wq,
@@ -3976,7 +4011,7 @@ def testFusedLinear(args):
             q_norm=q_norm, k_norm=k_norm, cos_sin=cos_sin, positions=positions
         )
 
-    def run():
+    def run(operands=operands, rope_args=rope_args):
         gemm = flashinfer.gemm
         if epilogue == "qkv_qknorm_rope":
             fn = (
