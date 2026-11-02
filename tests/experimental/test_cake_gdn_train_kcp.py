@@ -4637,9 +4637,10 @@ def _mr_reference() -> dict[str, torch.Tensor]:
     return _REFERENCES[key]
 
 
-def _mr_run(kcp, part, ops, monkeypatch, *, sm_count: int = SM_COUNT):
-    """Forward + saved-set backward of every rank of the multi-rank row on the shipped options: the global-order
-    results, the per-rank calls (forward, backward) and the launched programs per call."""
+def _mr_run(kcp, part, ops, monkeypatch, *, sm_count: int = SM_COUNT, knobs=None):
+    """Forward + saved-set backward of every rank of the multi-rank row on the shipped options (plus ``knobs`` on both
+    entries): the global-order results, the per-rank calls (forward, backward) and the launched programs per call."""
+    knobs = dict(knobs or {})
     holder: dict = {}
     calls, launched, rec = _call_recorder(kcp, lambda: holder.get("comm"))
     # group None: the stand-in collective ignores the group (the rank is the calling thread's)
@@ -4653,7 +4654,7 @@ def _mr_run(kcp, part, ops, monkeypatch, *, sm_count: int = SM_COUNT):
         loc = fake.slice_local(ops, part, r)
         args = [loc[n] for n in LEAVES]
         out, saved = kcp.chunk_gdn_fwd_kcp(
-            *args, ctxs[r], backend="fake", deterministic=False
+            *args, ctxs[r], backend="fake", deterministic=False, **knobs
         )
         grads = kcp.chunk_gdn_bwd_kcp(
             *args,
@@ -4662,6 +4663,7 @@ def _mr_run(kcp, part, ops, monkeypatch, *, sm_count: int = SM_COUNT):
             saved=saved,
             backend="fake",
             deterministic=False,
+            **knobs,
         )
         return out, grads
 
@@ -4693,11 +4695,17 @@ def test_multi_rank_row_is_within_budget(monkeypatch) -> None:
     )
 
 
-def test_launch_recorder_lists_the_programs_of_the_call(monkeypatch) -> None:
+@pytest.mark.parametrize("l2n", (False, True), ids=("norm_off", "l2n"))
+def test_launch_recorder_lists_the_programs_of_the_call(monkeypatch, l2n) -> None:
     """Every call's launch log (``CallKcp.sequence``, recorded in ``LAST_CALL``) lists exactly the programs the
-    backend ran, in order, on every rank of the W = 8 row and on one rank without an exchange."""
+    backend ran, in order, on every rank of the W = 8 row and on one rank without an exchange.  With
+    ``use_qk_l2norm_in_kernel=True`` (#7817) the same holds; the forward runs #1_l2n and the backward #8_l2n in the
+    places of #1 / #8, and every other launch -- this package's plan (``P_RULE_DEFAULT`` on every rank), its walks,
+    merges and exchanges -- is the norm-off launch log's: the option replaces those two programs and nothing else of
+    this route."""
+    knobs = {"use_qk_l2norm_in_kernel": True} if l2n else {}
     kcp, part, ops = _mr_setup()
-    _res, _ctxs, calls, launched = _mr_run(kcp, part, ops, monkeypatch)
+    _res, ctxs, calls, launched = _mr_run(kcp, part, ops, monkeypatch, knobs=knobs)
     for r in range(MR_W):
         assert len(calls[r]) >= 2, (
             r,
@@ -4706,15 +4714,33 @@ def test_launch_recorder_lists_the_programs_of_the_call(monkeypatch) -> None:
         for call in calls[r]:
             ran = launched[id(call)]
             assert ran == [n for n in call.sequence if n in kcp.PROGRAMS], r
+    if l2n:
+        assert all(ctx.p_rule == gp.P_RULE_DEFAULT for ctx in ctxs)
+        _res_off, _ctxs_off, calls_off, launched_off = _mr_run(
+            kcp, part, ops, monkeypatch
+        )
+        sib = kcp.L2N_SIBLING_OF
+        for r in range(MR_W):
+            on = [launched[id(c)] for c in calls[r]]
+            off = [[sib.get(n, n) for n in launched_off[id(c)]] for c in calls_off[r]]
+            assert on == off, r
+            assert any("fwd_prep_l2n" in seq for seq in on), r
+            assert any("bwd_dqkg_l2n" in seq for seq in on), r
+            assert not any({"fwd_prep", "bwd_dqkg"} & set(seq) for seq in on), r
     # one rank, no exchange: the recorded launches are the call's sequence too, and LAST_CALL carries it
     kcp1, ctx, ops1 = _ckpt_setup()
     calls1, launched1, rec = _call_recorder(kcp1)
     previous = kcp1.set_backend("fake", rec)
     try:
         out, saved = kcp1.chunk_gdn_fwd_kcp(
-            *(ops1[n] for n in LEAVES), ctx, backend="fake", deterministic=False
+            *(ops1[n] for n in LEAVES),
+            ctx,
+            backend="fake",
+            deterministic=False,
+            **knobs,
         )
         fwd_seq = list(kcp1.LAST_CALL["fwd"]["sequence"])
+        fwd_l2n = bool(kcp1.LAST_CALL["fwd"]["qk_l2norm"])
         kcp1.chunk_gdn_bwd_kcp(
             *(ops1[n] for n in LEAVES),
             ctx,
@@ -4722,6 +4748,7 @@ def test_launch_recorder_lists_the_programs_of_the_call(monkeypatch) -> None:
             saved=saved,
             backend="fake",
             deterministic=False,
+            **knobs,
         )
         bwd_seq = list(kcp1.LAST_CALL["bwd"]["sequence"])
     finally:
@@ -4730,9 +4757,9 @@ def test_launch_recorder_lists_the_programs_of_the_call(monkeypatch) -> None:
     fwd_call, bwd_call = calls1[0]
     assert launched1[id(fwd_call)] == [n for n in fwd_seq if n in kcp1.PROGRAMS]
     assert launched1[id(bwd_call)] == [n for n in bwd_seq if n in kcp1.PROGRAMS]
-    assert {"fwd_prep", "fwd_o"} <= set(fwd_seq) and {"bwd_prep", "bwd_dqkg"} <= set(
-        bwd_seq
-    )
+    prep, dqkg = ("fwd_prep_l2n", "bwd_dqkg_l2n") if l2n else ("fwd_prep", "bwd_dqkg")
+    assert {prep, "fwd_o"} <= set(fwd_seq) and {"bwd_prep", dqkg} <= set(bwd_seq)
+    assert fwd_l2n == l2n
 
 
 # --------------------------------------------------------------------------- host launch path: launch cache, stream scope
