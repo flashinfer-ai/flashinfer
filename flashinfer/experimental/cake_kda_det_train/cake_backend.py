@@ -3384,7 +3384,7 @@ def _internal_to_tokens(
     out: torch.Tensor,
 ) -> None:
     """Scatter the internal rows ``rows [64 * NC, H, 128]`` (row ``64 c + i`` of chunk ``c``) of the real tokens
-    (``i < chunk_len[c]``) to their token rows ``chunk_bos[c] + i`` of ``out [S, H, 128]`` (the test hook only)."""
+    (``i < chunk_len[c]``) to their token rows ``chunk_bos[c] + i`` of ``out [S, H, 128]`` (a test helper)."""
     nc = int(chunk_bos.numel())
     r = torch.arange(nc * BT, device=rows.device)
     c, i = r // BT, r % BT
@@ -3988,7 +3988,6 @@ def _forward_launches(
     u: torch.Tensor | None = None,
     gate_values: dict[str, Any] | None = None,
     l2n_values: dict[str, Any] | None = None,
-    after_intra: Callable[[], None] | None = None,
 ) -> None:
     """The launches of one forward on ``ws`` (the whole problem, or one document group through its view, its
     ``cu_seqlens`` slice, its tables and its tape slices; the token tensors always whole): the intra program (the
@@ -3998,9 +3997,7 @@ def _forward_launches(
     operands (:func:`_raw_values`; ``g`` is then ``None``): the plan's raw intra record reads them.
     ``l2n_values`` are the in-kernel Q/K L2 norm's (:func:`_l2n_values`; ``q`` / ``k`` then name the normalized
     rows): the fused intra record reads the raw rows and writes ``qn`` / ``kn`` (and the rstd per ``write_rstd``),
-    the fallback's plain intra record reads the ``qn`` / ``kn`` its ``qk_l2norm`` launch wrote.  ``after_intra``
-    runs on the host right after the intra launch is enqueued (the test hook's copy of the arena's ``qn`` / ``kn``,
-    before WY overwrites the slots)."""
+    the fallback's plain intra record reads the ``qn`` / ``kn`` its ``qk_l2norm`` launch wrote."""
     p = ws.plan
     values = _values(
         ws,
@@ -4033,8 +4030,6 @@ def _forward_launches(
         write_int=1 if p.internal_rows(path) else 0,
         write_prep=1,
     )
-    if after_intra is not None:
-        after_intra()
     if p.dispatched("wy_fwd", path):
         ws.run("wy_fwd", values, path=path)
     _forward_recurrence(
@@ -4228,7 +4223,9 @@ def _forward(
     # qk_l2norm writes token-layout qn / kn (the first S rows of the slots, or per-call under a batched arena) and
     # the plain intra program reads them as q / k.
     fallback = l2n == "fallback"
-    # the test hook's token-layout copies of the forward's normalized rows (only when the hook is on)
+    # the test hook's token-layout rows of the forward's normalization (only when the hook is on): the fused intra
+    # program writes them itself (write_qkn = 1 into qn_tok / kn_tok; a fused program may keep its normalized rows
+    # on chip and write no qn_int / kn_int, so the slots are not read back); q / k stay bound as without the hook
     hook = _l2n_record is not None and l2n != "off"
     qn_tok = kn_tok = None
     fallback_rows: dict[str, torch.Tensor] = {}
@@ -4248,7 +4245,7 @@ def _forward(
         ):  # the slot views: token layout for the fallback, placeholders of the fused program
             qn = a.qn_int[:S] if fallback else a.qn_int
             kn = a.kn_int[:S] if fallback else a.kn_int
-        return _l2n_values(
+        lv = _l2n_values(
             q,
             k,
             qn,
@@ -4260,6 +4257,9 @@ def _forward(
             qn_int=a.qn_int,
             kn_int=a.kn_int,
         )
+        if hook and not fallback:
+            lv.update(qn=qn_tok, kn=kn_tok, write_qkn=1)
+        return lv
 
     def qk_l2norm(lv: dict[str, Any] | None) -> None:
         """The fallback's token-local normalization of the whole problem, once, before the intra program(s); the
@@ -4271,18 +4271,6 @@ def _forward(
                     lv["qn"].clone(),
                     lv["kn"].clone(),
                 )
-
-    def record_rows(a: types.SimpleNamespace, tables_a: tuple[torch.Tensor, ...]):
-        """The hook's copy of the fused intra program's internal rows into token layout (right after the intra
-        launch, before WY overwrites the slots)."""
-        if not hook or fallback:
-            return None
-
-        def copy_rows() -> None:
-            _internal_to_tokens(a.qn_int, tables_a[0], tables_a[1], qn_tok)
-            _internal_to_tokens(a.kn_int, tables_a[0], tables_a[1], kn_tok)
-
-        return copy_rows
 
     qn = kn = None
     seg_state = hseg = seg_m = None
@@ -4314,7 +4302,6 @@ def _forward(
         lv = l2n_values(a, None, None)
         if fallback:
             qn, kn = lv["qn"], lv["kn"]
-        record = record_rows(a, tables)
         qk_l2norm(lv)
         _forward_launches(
             ws,
@@ -4333,7 +4320,6 @@ def _forward(
             w=w_saved,
             u=u_saved,
             l2n_values=lv,
-            after_intra=record,
             **common,
         )
     else:
@@ -4395,7 +4381,6 @@ def _forward(
                 w=None if w_saved is None else w_saved[rows_b],
                 u=None if u_saved is None else u_saved[rows_b],
                 l2n_values=l2n_values(a, qn, kn),
-                after_intra=record_rows(a, tables_b),
                 **common,
             )
             if run is not None:  # one run: contiguous copies of the halves

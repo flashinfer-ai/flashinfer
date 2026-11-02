@@ -848,7 +848,10 @@ def test_l2n_forward_rows_equal_the_reference_and_every_backward_route(
 ) -> None:
     """Lead requirements (2) / (3): the forward's rstd / qn / kn are bitwise the shared reference's; the backward's
     qn / kn (light / light_states, tape, replay table route or intra-first, checkpoint recompute) are bitwise the
-    forward's; the replay's rstd is the saved one; repeats are bitwise."""
+    forward's; the replay's rstd is the saved one; repeats are bitwise.  The hook rows (``write_qkn``) validate the
+    qn / kn / rstd formation; v35 production applies rstd after the MMA and never forms a BF16 qn, so its
+    correctness is covered by out / grad (``test_l2n_matches_the_exact_reference``,
+    ``test_l2n_hook_leaves_out_and_every_gradient_bitwise_unchanged``) and R-L3-2."""
     device = _l2n_device()
     lengths, H = shape
     inputs = _l2n_inputs(lengths, H, device, raw_gate=raw_gate)
@@ -895,6 +898,46 @@ def test_l2n_forward_rows_equal_the_reference_and_every_backward_route(
     )
     for a, b in zip(ref, _bwd(inputs, saved2, raw_gate), strict=True):
         assert _bits(a).equal(_bits(b)), "repeat"
+
+
+@pytest.mark.parametrize("raw_gate", [False, True], ids=["g", "raw"])
+@pytest.mark.parametrize(
+    "shape", SHAPES_L2N[1:4], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}"
+)
+def test_l2n_hook_leaves_out_and_every_gradient_bitwise_unchanged(
+    shape, raw_gate: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The test hook (``_l2n_record``; the fused intra program then also writes the token-layout qn / kn,
+    ``write_qkn = 1``) does not perturb the computation: on the same inputs, ``out`` and every gradient of each
+    backward route the hook rows cover (light, tape, replay) are bitwise the hook-off ones."""
+    device = _l2n_device()
+    lengths, H = shape
+    inputs = _l2n_inputs(lengths, H, device, raw_gate=raw_gate)
+
+    def run(route: str) -> list[torch.Tensor]:
+        out, saved = _fwd(
+            inputs, raw_gate, **({"save_mode": "tape"} if route == "tape" else {})
+        )
+        grads = _bwd(inputs, None if route == "replay" else saved, raw_gate)
+        torch.cuda.synchronize(device)
+        return [out.clone(), *(g.clone() for g in grads)]
+
+    for route in ("light", "tape", "replay"):
+        monkeypatch.setattr(cake_backend, "_l2n_record", None)
+        off = run(route)
+        store: dict = {}
+        monkeypatch.setattr(cake_backend, "_l2n_record", store)
+        on = run(route)
+        monkeypatch.setattr(cake_backend, "_l2n_record", None)
+        assert "fwd.qn" in store and "bwd.qn" in store, route  # the hook was on
+        if route == "light":
+            assert store["bwd.path"] not in ("tape", "replay"), store["bwd.path"]
+        else:
+            assert store["bwd.path"] == route, (route, store["bwd.path"])
+        for i, (a, b) in enumerate(zip(off, on, strict=True)):
+            name = "out" if i == 0 else f"grad[{i - 1}]"
+            assert a.dtype == b.dtype and a.shape == b.shape, (route, name)
+            assert torch.equal(_bits(a), _bits(b)), (route, name)
 
 
 @pytest.mark.parametrize(
