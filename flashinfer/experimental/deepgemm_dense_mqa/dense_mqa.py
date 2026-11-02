@@ -94,6 +94,9 @@ BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
 BLOCK_KV = 256
 HEAD_DIM = 128
+# The most FP32 logits one launch of a 32-head FP8 program writes: its stores form 32-bit element offsets, so
+# fp8_mqa_logits launches a longer prefill chunk per range of query rows.
+MAX_LAUNCH_LOGITS = 1 << 32
 # Query ceiling of the single-launch fused Q <= 128 route (``fp8:qle128:short``): the ``le128`` tier's token ceiling
 # (32 scan lanes x BLOCK_Q); its KV bound is the catalog policy ``fused_qle128_max_kv``.
 FUSED_QLE128_MAX_Q = 128
@@ -1215,6 +1218,16 @@ class DenseMqaPlan:
         )
         stride = logits_stride(keys)
         padded_rows = (queries + bq - 1) // bq * bq
+        if (
+            precision == "fp8"
+            and num_heads == NUM_HEADS
+            and padded_rows * stride > MAX_LAUNCH_LOGITS
+        ):
+            raise ValueError(
+                f"the {NUM_HEADS}-head FP8 programs address at most {MAX_LAUNCH_LOGITS} logits per launch "
+                f"(Q = {queries}, logits_stride = {stride}); split the queries into row ranges "
+                "(fp8_mqa_logits does)"
+            )
         if output is None:
             rows = padded_rows if precision == "fp4" else queries
             output = torch.empty((rows, stride), dtype=torch.float32, device=q.device)[
@@ -1333,6 +1346,8 @@ def fp8_mqa_logits(
     outside each row's window) and the ``clean_logits`` flag is accepted for
     signature parity without changing the result.
     ``max_seqlen_k`` must be 0 (no narrowing of the returned view).
+    A 32-head call whose ``[Q, logits_stride(K)]`` logits pass ``MAX_LAUNCH_LOGITS`` elements runs one
+    launch per range of query rows.
     ``sm_count`` is the CTA budget (default: the device's SM count). Rows below
     the query block (``Q < BLOCK_Q``) are padded here where the route's program
     needs a whole block, and a KV-scale buffer whose storage is shorter than
@@ -1391,6 +1406,29 @@ def fp8_mqa_logits(
         )
         w_storage[:queries] = weights
         q, weights = q_storage, w_storage
+    stride = logits_stride(keys)
+    if (
+        num_heads == NUM_HEADS
+        and (queries + bq - 1) // bq * bq * stride > MAX_LAUNCH_LOGITS
+    ):
+        # One launch per range of whole query blocks; a short last range ends at Q and starts one block earlier.
+        rows = MAX_LAUNCH_LOGITS // stride // bq * bq
+        output = torch.empty((queries, stride), dtype=torch.float32, device=q.device)
+        for start in range(0, queries, rows):
+            start = min(start, queries - bq)
+            stop = min(queries, start + rows)
+            DenseMqaPlan(
+                "fp8",
+                q[start:stop],
+                kv_values,
+                weights[start:stop],
+                ks[start:stop],
+                ke[start:stop],
+                kv_scales=kv_scales,
+                output=output[start:stop],
+                sm_count=sm_count,
+            ).run()
+        return output[:, :keys]
     plan = DenseMqaPlan(
         "fp8", q, kv_values, weights, ks, ke, kv_scales=kv_scales, sm_count=sm_count
     )
