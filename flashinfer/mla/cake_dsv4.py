@@ -148,8 +148,9 @@ CTA). They take the query in the cache's NVFP4 row format, so the host packs it
 into the workspace with the NVFP4 cache pack kernel first (``packed_query``
 region, :func:`cake_dsv4_workspace_layout` ``with_prefill=True``), read the
 pools through 32-byte-pitch data-row and scale-row tensor maps, and write the
-final BF16 output and base-2 LSE directly (no split, no merge); the LSE lands
-in the same ``lse`` region as the decode family's.
+final BF16 output and base-2 LSE directly (no split, no merge), so their
+workspace carve has one split (no ``partial_O`` region); the LSE lands in the
+same ``lse`` region as the decode family's.
 """
 
 from __future__ import annotations
@@ -686,7 +687,11 @@ def get_cake_dsv4_workspace_bytes(
     ``align128(num_query_tokens * num_heads * 4)`` is appended, then the
     prefill bodies' packed-query region ``align128(num_query_tokens * num_heads
     * 384)`` and two ``align128(num_query_tokens * 4)`` length regions (the
-    bound covers the decode family and the prefill bodies alike).
+    bound covers the decode family and the prefill bodies alike). A call with
+    ``num_query_tokens >= 128`` runs the prefill bodies, which write the final
+    output and LSE directly and need only the one-split carve
+    ``cake_dsv4_workspace_layout(num_query_tokens, num_heads, 1, with_lse=True,
+    with_prefill=True).total_bytes``.
     """
     if dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError(f"unsupported CAKE DSv4 dtype: {dtype}")
@@ -3163,8 +3168,14 @@ def run_cake_dsv4_nvfp4(
         )
     raw = _workspace_bytes(workspace_buffer)
     prefill = num_query_tokens >= _NVFP4_PREFILL_MIN_TOKENS
+    # The prefill bodies write the final O and LSE directly, so their carve has one
+    # split (no partial_O) whatever the decode plan would split into.
     layout = cake_dsv4_workspace_layout(
-        num_query_tokens, num_heads, num_splits, with_lse=True, with_prefill=prefill
+        num_query_tokens,
+        num_heads,
+        1 if prefill else num_splits,
+        with_lse=True,
+        with_prefill=prefill,
     )
     _require_workspace_bytes(raw, layout.total_bytes)
     lse_offset, lse_bytes = layout.lse

@@ -270,18 +270,30 @@ def _run(case, *, out=None, main_lens="given", extra_lens="given", dense: bool =
     return result.reshape(case["rows"], case["heads"], _HEAD_DIM)
 
 
-def _lse(case) -> torch.Tensor:
-    plan = cake._nvfp4_plan(
-        num_query_tokens=case["rows"],
-        num_heads=case["heads"],
-        sparse_topk=case["topk"],
-        extra_topk=case["extra_topk"],
-        sm_count=torch.cuda.get_device_properties(
-            torch.device("cuda")
-        ).multi_processor_count,
+def _route_layout(rows: int, heads: int, topk: int, extra_topk: int):
+    """The workspace carve of one route call: one split for the prefill bodies
+    (they write the final O and LSE), the decode plan's splits below 128 rows."""
+    prefill = rows >= cake._NVFP4_PREFILL_MIN_TOKENS
+    if prefill:
+        splits = 1
+    else:
+        splits = cake._nvfp4_plan(
+            num_query_tokens=rows,
+            num_heads=heads,
+            sparse_topk=topk,
+            extra_topk=extra_topk,
+            sm_count=torch.cuda.get_device_properties(
+                torch.device("cuda")
+            ).multi_processor_count,
+        ).num_splits
+    return cake.cake_dsv4_workspace_layout(
+        rows, heads, splits, with_lse=True, with_prefill=prefill
     )
-    layout = cake.cake_dsv4_workspace_layout(
-        case["rows"], case["heads"], plan.num_splits, with_lse=True, with_prefill=True
+
+
+def _lse(case) -> torch.Tensor:
+    layout = _route_layout(
+        case["rows"], case["heads"], case["topk"], case["extra_topk"]
     )
     offset, _ = layout.lse
     return (
@@ -403,3 +415,81 @@ def test_nvfp4_route_switches_to_the_prefill_bodies_at_128_rows(monkeypatch):
     out = _run(large)
     assert calls == [128]
     _check(large, out)
+
+
+@pytest.mark.parametrize("heads", [16, 64, 128])
+@pytest.mark.parametrize("rows", [128, 4096, 65536, 1 << 20])
+def test_nvfp4_prefill_workspace_has_no_split_regions(rows, heads):
+    """The prefill carve is one split: no partial_O, and only the packed query
+    grows with the head count beyond the per-(token, head) LSE regions."""
+    layout = cake.cake_dsv4_workspace_layout(
+        rows, heads, 1, with_lse=True, with_prefill=True
+    )
+    assert layout.partial_o[1] == 0
+    assert layout.partial_lse[0] == layout.partial_o[0]
+    per_row = rows * heads
+    expected = (
+        layout.partial_lse[0]
+        + cake._align_up(per_row * 4)  # partial_lse of the one split
+        + cake._align_up(per_row * 4)  # final LSE
+        + cake._align_up(per_row * 384)  # packed NVFP4 query
+        + 2 * cake._align_up(rows * 4)  # filled length vectors
+    )
+    assert layout.total_bytes == expected
+    for topk, extra_topk in ((128, 0), (512, 512), (2048, 0)):
+        bound = get_cake_dsv4_workspace_bytes(
+            rows,
+            heads,
+            topk,
+            torch.bfloat16,
+            kv_cache_format="nvfp4",
+            extra_topk=extra_topk,
+        )
+        assert layout.total_bytes <= bound
+
+
+@pytest.mark.parametrize(
+    "spec, sm_count",
+    [
+        # A device size on which the decode plan splits this shape in two: the
+        # prefill carve must not follow it.
+        pytest.param(
+            dict(heads=32, topk=768, extra_topk=768, q_lens=(256, 256)),
+            208,
+            id="h32-k768-dual-512-tokens-split-plan",
+        ),
+        pytest.param(
+            dict(heads=128, topk=512, extra_topk=512, q_lens=(2048, 2048)),
+            None,
+            id="h128-k512-dual-4096-tokens",
+        ),
+    ],
+)
+def test_nvfp4_prefill_runs_in_the_one_split_workspace(spec, sm_count, monkeypatch):
+    """The route runs in exactly the one-split carve, whatever the decode plan
+    would split into, and one byte less is rejected before any launch."""
+    _require_cake_arch()
+    if sm_count is not None:
+        monkeypatch.setattr(cake, "_nvfp4_sm_count", lambda device: sm_count)
+    case = _case(seed=6, pool_pages=96, **spec)
+    rows, heads = case["rows"], case["heads"]
+    need = _route_layout(rows, heads, spec["topk"], spec["extra_topk"]).total_bytes
+    if sm_count is not None:
+        plan = cake._nvfp4_plan(
+            num_query_tokens=rows,
+            num_heads=heads,
+            sparse_topk=spec["topk"],
+            extra_topk=spec["extra_topk"],
+            sm_count=sm_count,
+        )
+        assert plan.num_splits > 1
+        decode = cake.cake_dsv4_workspace_layout(
+            rows, heads, plan.num_splits, with_lse=True, with_prefill=True
+        )
+        assert need < decode.total_bytes
+    case["workspace"] = torch.zeros(need - 1, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="workspace"):
+        _run(case)
+    case["workspace"] = torch.zeros(need, dtype=torch.uint8, device="cuda")
+    out = _run(case)
+    _check(case, out)
