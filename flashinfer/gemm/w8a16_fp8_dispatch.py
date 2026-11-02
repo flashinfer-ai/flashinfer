@@ -44,7 +44,6 @@ class _Sm100Tile(NamedTuple):
     mma_tiler: Tuple[int, int, int]  # (weight rows, activation rows, k) per MMA tile
     two_sm: bool  # 2SM MMA
     cluster: Tuple[int, int]
-    a_in_smem: bool  # transformed weight kept in smem
 
 
 class _Sm100Plan(NamedTuple):
@@ -67,13 +66,13 @@ class _Sm90Plan(NamedTuple):
     group: int  # activation tiles per L2 group (1 = ungrouped)
 
 
-# Blackwell tile configurations by algo code.
+# Blackwell tile configurations by algo code.  Code 3 is reserved (a retired
+# 256x256 tile with its transformed weight in smem).
 _SM100_TILES: Dict[int, _Sm100Tile] = {
-    1: _Sm100Tile((256, 128, 128), True, (2, 1), False),  # 2sm256x128
-    2: _Sm100Tile((128, 128, 128), False, (1, 1), False),  # 1sm128x128
-    3: _Sm100Tile((256, 256, 64), True, (2, 1), True),  # 2sm256x256, A in smem
-    4: _Sm100Tile((256, 192, 128), True, (2, 1), False),  # 2sm256x192
-    7: _Sm100Tile((256, 160, 128), True, (2, 1), False),  # 2sm256x160
+    1: _Sm100Tile((256, 128, 128), True, (2, 1)),  # 2sm256x128
+    2: _Sm100Tile((128, 128, 128), False, (1, 1)),  # 1sm128x128
+    4: _Sm100Tile((256, 192, 128), True, (2, 1)),  # 2sm256x192
+    7: _Sm100Tile((256, 160, 128), True, (2, 1)),  # 2sm256x160
 }
 _SM100_SPLITK = 5
 _SM100_STREAMK = 6
@@ -337,7 +336,7 @@ def _get_sm100_kernel(
     partial_output: bool = False,
     splits: int = 1,
 ):
-    mma_tiler, two_sm, cluster, a_in_smem = _SM100_TILES[algo]
+    mma_tiler, two_sm, cluster = _SM100_TILES[algo]
     # Bytes of weight each transform thread converts per step: a whole stage when K
     # is one k-tile (no pipelining to overlap), 32 otherwise (as the W4A16 kernel).
     transform_fragment_size = 128 if k == mma_tiler[2] else 32
@@ -366,7 +365,6 @@ def _get_sm100_kernel(
         mma_tiler_mnk=mma_tiler,
         use_2cta_instrs=two_sm,
         cluster_shape_mn=cluster,
-        a_in_smem=a_in_smem,
         has_bias=has_bias,
         swizzle_size=swizzle_size,
         raster_along_m=raster_along_m,
@@ -657,10 +655,11 @@ class _Sm90Tile(NamedTuple):
 
 
 # Tile configurations by algo code.
+# Codes 1 and 4 are reserved (a retired hand-written kernel and a retired 128x160
+# tile).
 _SM90_TILES: Dict[int, _Sm90Tile] = {
     2: _Sm90Tile(2, 128, 256, False, 11.37),
     3: _Sm90Tile(3, 128, 192, False, 9.00),
-    4: _Sm90Tile(4, 128, 160, False, None),
     5: _Sm90Tile(5, 128, 128, False, 7.45),
     6: _Sm90Tile(6, 64, 256, True, 6.15),
     9: _Sm90Tile(9, 64, 128, True, 4.50),
@@ -681,9 +680,8 @@ _SM90_MAX_PARTIALS_BYTES = 64 << 20
 
 
 def _sm90_tile_of(algo: int) -> _Sm90Tile:
-    """The cost-model tile a code runs on (policies map to their base tile); a code
-    with no cost entry (128x160, or an unknown code) is costed as the first
-    candidate."""
+    """The cost-model tile a code runs on (policies map to their base tile); an
+    unknown code is costed as the first candidate."""
     base = _SM90_STREAMK_TILE.get(algo, _SM90_SPLITK_TILE.get(algo, algo))
     t = _SM90_TILES.get(base)
     if t is None or t.ns_per_k is None:

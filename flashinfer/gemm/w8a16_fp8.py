@@ -227,11 +227,11 @@ def _check_dims(m: int, n: int, k: int) -> None:
 # Blackwell variants selectable through ``algo`` (``_SM100_TILES`` in
 # w8a16_fp8_dispatch.py).  The stream-K code is a policy: a wave-fill cost model
 # over the plain 2SM tiles (256x128, 256x160, 256x192) and split-K on 256x128.
+# Code 3 is reserved.
 W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
     "auto": 0,
     "2sm256x128": 1,
     "1sm128x128": 2,
-    "2sm256x256": 3,
     "2sm256x192": 4,
     "2sm256x128_splitk": 5,
     "2sm256x128_streamk": 6,
@@ -241,12 +241,11 @@ W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
 
 # Hopper kernel variants selectable through ``algo`` (weight rows x activation rows per
 # CTA tile, plus the stream-K and split-K decompositions; ``_SM90_TILES`` in
-# w8a16_fp8_dispatch.py).  Code 1 is reserved.
+# w8a16_fp8_dispatch.py).  Codes 1 and 4 are reserved.
 W8A16_FP8_GEMM_ALGOS_SM90: dict[str, int] = {
     "auto": 0,
     "128x256": 2,
     "128x192": 3,
-    "128x160": 4,
     "128x128": 5,
     "64x256": 6,
     "128x256_streamk": 7,

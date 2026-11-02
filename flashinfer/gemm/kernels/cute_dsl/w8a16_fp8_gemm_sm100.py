@@ -11,8 +11,8 @@ its B operand (kernel N = M, the activation rows), so C[N, M] column-major is
 conversion cannot ride in registers in front of the MMA: two transform warpgroups
 convert the TMA-landed weight tile in registers
 (``w8a16_fp8_gemm_sm100_utils.convert_e4m3_fragment``) and store the 16-bit copy to
-TMEM, or to smem for the tile whose two accumulator stages take all of TMEM
-(``a_in_smem``).  The MMA warp issues tcgen05.mma with A from there and B from smem.
+TMEM, in the columns the accumulator stages leave.  The MMA warp issues tcgen05.mma
+with A from TMEM and B from smem.
 The epilogue applies the per-tensor scale (fp32, read on device) and the optional
 per-N bias in fp32 and stores through TMA, which clips a partial last activation
 tile of the final output; only a split-K partial tile that is not whole stores
@@ -82,8 +82,8 @@ class _TmemBudget(NamedTuple):
 
     acc_stages: int  # accumulator stages (1 or 2)
     acc_cols: int  # TMEM columns of all accumulator stages
-    a_cols_per_stage: int  # TMEM columns of one transformed-A stage (0: A in smem)
-    transform_limit: int  # transform stages TMEM allows (-1: A in smem)
+    a_cols_per_stage: int  # TMEM columns of one transformed-A stage
+    transform_limit: int  # transform stages TMEM allows
 
 
 def _aligned_tile_bytes(
@@ -129,7 +129,6 @@ class Sm100W8A16Fp8GemmKernel:
         mma_tiler_mnk: tuple[int, int, int],
         use_2cta_instrs: bool,
         cluster_shape_mn: tuple[int, int],
-        a_in_smem: bool,
         has_bias: bool,
         swizzle_size: int,
         raster_along_m: bool,
@@ -145,7 +144,6 @@ class Sm100W8A16Fp8GemmKernel:
         self.mma_tiler = mma_tiler_mnk
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
-        self.a_in_smem = a_in_smem
         self.has_bias = has_bias
         self.swizzle_size = swizzle_size
         self.raster_along_m = raster_along_m
@@ -186,11 +184,13 @@ class Sm100W8A16Fp8GemmKernel:
     def _setup_attributes(self) -> cute.TiledMma:
         """Derive the MMA, pipeline depths and smem / TMEM layouts; returns the
         tiled MMA the launch builds its TMA atoms and kernel on."""
-        self.transform_a_source = (
-            tcgen05.OperandSource.SMEM
-            if self.a_in_smem
-            else mixed_input_utils.get_transform_a_source(self.a_major_mode)
-        )
+        # The transformed weight lives in TMEM: the kernel has no smem-A path, and the
+        # helper agrees for the K-major weight the launcher always passes.
+        self.transform_a_source = tcgen05.OperandSource.TMEM
+        assert (
+            mixed_input_utils.get_transform_a_source(self.a_major_mode)
+            == tcgen05.OperandSource.TMEM
+        ), "the transformed A operand must be TMEM-resident (K-major weight)"
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.mma_dtype,
             self.a_major_mode,
@@ -240,7 +240,6 @@ class Sm100W8A16Fp8GemmKernel:
             self.b_dtype,
             self.c_dtype,
             self.c_layout,
-            self.transform_a_source,
             self.smem_buffer_align_bytes,
         )
         self.num_load2trans_stage = stages.load2trans
@@ -296,21 +295,18 @@ class Sm100W8A16Fp8GemmKernel:
         copy_atom_a_transform: cute.CopyAtom,
         sA_input: cute.Tensor,
         a_smem_layout_transform: cute.ComposedLayout,
-        sA_transform: Optional[cute.Tensor],
         accumulators: cute.Tensor,
         transform_tidx: cutlass.Int32,
     ):
-        if cutlass.const_expr(self.transform_a_source == tcgen05.OperandSource.TMEM):
-            tmem_ptr_transform = cute.recast_ptr(
-                accumulators.iterator + self.num_acc_tmem_cols,
-                dtype=self.mma_dtype,
-            )
-            transform_destination = cute.make_tensor(
-                tmem_ptr_transform,
-                tiled_mma.make_fragment_A(a_smem_layout_transform.outer).layout,
-            )
-        else:
-            transform_destination = sA_transform
+        # The transformed A stages sit in TMEM right after the accumulator columns.
+        tmem_ptr_transform = cute.recast_ptr(
+            accumulators.iterator + self.num_acc_tmem_cols,
+            dtype=self.mma_dtype,
+        )
+        transform_destination = cute.make_tensor(
+            tmem_ptr_transform,
+            tiled_mma.make_fragment_A(a_smem_layout_transform.outer).layout,
+        )
 
         _, dst_copy_a, tAsA_input, tAsA_transform = (
             mixed_input_utils.transform_partition(
@@ -326,9 +322,9 @@ class Sm100W8A16Fp8GemmKernel:
         # A stage's per-thread A is converted in two halves, one after the other, so a
         # half's registers (16 B of e4m3 per block, 32 B of 16-bit values) bound the
         # register use.  The partition is (copy, M-blocks, K-blocks, blocks, stages);
-        # into TMEM the per-thread blocks sit in mode 3 (the 32x32b store repeats),
-        # into smem the cotiled copy puts them in mode 1 and mode 3 is 1, so halve
-        # whichever mode divides.  ``_transform_tile`` picks a half with a static index.
+        # the per-thread blocks sit in mode 3 (the 32x32b TMEM store repeats) or, when
+        # that mode is 1, in mode 1, so halve whichever mode divides.
+        # ``_transform_tile`` picks a half with a static index.
         split_mode = 3 if cute.size(tAsA_input, mode=[3]) % 2 == 0 else 1
         num_transform_blocks = cute.size(tAsA_input, mode=[split_mode])
         assert num_transform_blocks % 2 == 0, (
@@ -450,12 +446,7 @@ class Sm100W8A16Fp8GemmKernel:
                 # The raw stage goes back to the TMA producer once the converts have
                 # consumed it; the transformed stores are fenced before the commit.
                 a_load2trans_pipeline.consumer_release(a_load2trans_consumer_state)
-                if cutlass.const_expr(
-                    self.transform_a_source == tcgen05.OperandSource.TMEM
-                ):
-                    cute.arch.fence_view_async_tmem_store()
-                else:
-                    cute.arch.fence_proxy("async.shared", space="cta")
+                cute.arch.fence_view_async_tmem_store()
                 trans2mma_pipeline.producer_commit(trans2mma_producer_state)
             a_load2trans_consumer_state.advance()
             trans2mma_producer_state.advance()
@@ -819,14 +810,6 @@ class Sm100W8A16Fp8GemmKernel:
             byte_alignment=self.smem_buffer_align_bytes,
             swizzle=b_smem_layout.inner,
         )
-        sA_transform = None
-        if cutlass.const_expr(self.transform_a_source == tcgen05.OperandSource.SMEM):
-            sA_transform = smem.allocate_tensor(
-                element_type=self.mma_dtype,
-                layout=a_smem_layout_transform.outer,
-                byte_alignment=self.smem_buffer_align_bytes,
-                swizzle=a_smem_layout_transform.inner,
-            )
         sBias = storage.bias_tile.get_tensor(
             cute.make_layout((self.cta_tile_shape_mnk[0], 2))
         )
@@ -975,7 +958,6 @@ class Sm100W8A16Fp8GemmKernel:
                 fd_total,
                 k_tile_cnt,
                 sA_input,
-                sA_transform,
                 sTile_info,
                 tCtAcc_fake,
                 tensor_c,
@@ -999,7 +981,6 @@ class Sm100W8A16Fp8GemmKernel:
                 fd_total,
                 is_leader_cta,
                 k_tile_cnt,
-                sA_transform,
                 sTile_info,
                 tCrB,
                 tCtAcc_fake,
@@ -1288,7 +1269,6 @@ class Sm100W8A16Fp8GemmKernel:
         fd_total: cutlass.Int64,
         k_tile_cnt: cutlass.Int32,
         sA_input: cute.Tensor,
-        sA_transform: Optional[cute.Tensor],
         sTile_info: cute.Tensor,
         tCtAcc_fake: cute.Tensor,
         tensor_c: cute.Tensor,
@@ -1321,7 +1301,6 @@ class Sm100W8A16Fp8GemmKernel:
             copy_atom_a_transform,
             sA_input,
             a_smem_layout_transform,
-            sA_transform,
             accumulators,
             transform_local_tidx,
         )
@@ -1377,7 +1356,6 @@ class Sm100W8A16Fp8GemmKernel:
         fd_total: cutlass.Int64,
         is_leader_cta: cutlass.Boolean,
         k_tile_cnt: cutlass.Int32,
-        sA_transform: Optional[cute.Tensor],
         sTile_info: cute.Tensor,
         tCrB: cute.Tensor,
         tCtAcc_fake: cute.Tensor,
@@ -1391,16 +1369,13 @@ class Sm100W8A16Fp8GemmKernel:
         cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
         accumulators = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-        if cutlass.const_expr(self.transform_a_source == tcgen05.OperandSource.TMEM):
-            tmem_ptr_transform = cute.recast_ptr(
-                accumulators.iterator + self.num_acc_tmem_cols, dtype=self.mma_dtype
-            )
-            tCrA = cute.make_tensor(
-                tmem_ptr_transform,
-                tiled_mma.make_fragment_A(a_smem_layout_transform.outer).layout,
-            )
-        else:
-            tCrA = tiled_mma.make_fragment_A(sA_transform)
+        tmem_ptr_transform = cute.recast_ptr(
+            accumulators.iterator + self.num_acc_tmem_cols, dtype=self.mma_dtype
+        )
+        tCrA = cute.make_tensor(
+            tmem_ptr_transform,
+            tiled_mma.make_fragment_A(a_smem_layout_transform.outer).layout,
+        )
         tile_info_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
         )
@@ -1944,32 +1919,23 @@ class Sm100W8A16Fp8GemmKernel:
     def _tmem_budget(
         tiled_mma: cute.TiledMma,
         cta_tile_shape_mnk: tuple[int, int, int],
-        transform_a_source: tcgen05.OperandSource,
     ) -> "_TmemBudget":
-        """Accumulator stages and TMEM columns: two accumulator stages when the
-        accumulator leaves room (the epilogue of one tile then overlaps the mainloop
-        of the next), one otherwise; with A in TMEM the transform stages take the
-        columns the accumulators leave."""
+        """Accumulator stages and TMEM columns: two accumulator stages (the epilogue
+        of one tile then overlaps the mainloop of the next); the transform stages
+        take the columns the accumulators leave."""
         # One accumulator stage is the CTA tile's 128 lanes x N fp32 columns.  Counted
         # exactly, not rounded up to a power of two as the TMEM *allocation* is: the
         # 160- and 192-wide tiles would otherwise be charged 256 columns a stage and
         # fall back to a single stage, exposing the whole epilogue after every tile.
         assert cta_tile_shape_mnk[0] == 128, "the accumulator spans all 128 TMEM lanes"
-        a_in_tmem = transform_a_source == tcgen05.OperandSource.TMEM
         acc_cols_per_stage = cta_tile_shape_mnk[1]
         tmem_columns = cute.arch.get_max_tmem_alloc_cols("sm_100")
-        acc_stages = tmem_columns // acc_cols_per_stage
-        if a_in_tmem:
-            acc_stages = 2 if acc_cols_per_stage < 256 else 1
+        acc_stages = 2
         elts_per_col = 32 // tiled_mma.op.a_dtype.width
-        a_cols_per_stage = cute.round_up(
-            cta_tile_shape_mnk[2] // elts_per_col if a_in_tmem else 0, 4
-        )
+        a_cols_per_stage = cute.round_up(cta_tile_shape_mnk[2] // elts_per_col, 4)
         acc_cols = cute.round_up(acc_stages * acc_cols_per_stage, 4)
-        transform_limit = (
-            (tmem_columns - acc_cols) // a_cols_per_stage if a_in_tmem else -1
-        )
-        if a_in_tmem and transform_limit <= 0:
+        transform_limit = (tmem_columns - acc_cols) // a_cols_per_stage
+        if transform_limit <= 0:
             raise ValueError("Not enough TMEM capacity for selected tile size")
         return _TmemBudget(acc_stages, acc_cols, a_cols_per_stage, transform_limit)
 
@@ -1982,7 +1948,6 @@ class Sm100W8A16Fp8GemmKernel:
         b_dtype: type[cutlass.Numeric],
         c_dtype: type[cutlass.Numeric],
         c_layout: utils.LayoutEnum,
-        transform_a_source: tcgen05.OperandSource,
         smem_buffer_align_bytes: int,
         acc_stages: int,
     ) -> "_SmemBytes":
@@ -1999,9 +1964,10 @@ class Sm100W8A16Fp8GemmKernel:
         c_layout_one = sm100_utils.make_smem_layout_epi(c_dtype, c_layout, epi_tile, 1)
         c_bytes = cute.size_in_bytes(c_dtype, c_layout_one) * c_stages
         carveout = barrier_bytes * acc_stages + c_bytes + tile_info_bytes + bias_bytes
-        # Per-stage operand tiles: the whole weight tile (rows x K) as loaded and,
-        # under the SMEM transform source, again in the MMA dtype; this CTA's share
-        # of the activation tile (the MMA's CTA pair splits the activation rows).
+        # Per-stage operand tiles: the whole weight tile (rows x K) as loaded, and this
+        # CTA's share of the activation tile (the MMA's CTA pair splits the activation
+        # rows).  The transformed weight lives in TMEM: its stage costs smem only
+        # the barrier.
         weight_rows, act_rows, tile_k = cta_tile_shape_mnk
         act_rows_per_cta = act_rows // cute.size(tiled_mma.thr_id)
         align = smem_buffer_align_bytes
@@ -2009,10 +1975,6 @@ class Sm100W8A16Fp8GemmKernel:
         b_load = _aligned_tile_bytes(b_dtype, act_rows_per_cta, tile_k, align)
         ab_load = a_load + b_load + 2 * barrier_bytes
         a_transform = barrier_bytes
-        if transform_a_source == tcgen05.OperandSource.SMEM:
-            a_transform += _aligned_tile_bytes(
-                tiled_mma.op.a_dtype, weight_rows, tile_k, align
-            )
         return _SmemBytes(
             carveout,
             ab_load,
@@ -2032,7 +1994,6 @@ class Sm100W8A16Fp8GemmKernel:
         b_dtype: type[cutlass.Numeric],
         c_dtype: type[cutlass.Numeric],
         c_layout: utils.LayoutEnum,
-        transform_a_source: tcgen05.OperandSource,
         smem_buffer_align_bytes: int,
     ) -> "_Sm100Stages":
         """Fit the load, transform, accumulator and epilogue pipelines into smem and
@@ -2042,10 +2003,7 @@ class Sm100W8A16Fp8GemmKernel:
         the activation (B) pipeline alone: the TMA latency of a first-touch k-tile
         exceeds several stages' worth of MMA time, while two epilogue stages are all
         the epilogue overlaps."""
-        a_in_tmem = transform_a_source == tcgen05.OperandSource.TMEM
-        tmem = Sm100W8A16Fp8GemmKernel._tmem_budget(
-            tiled_mma, cta_tile_shape_mnk, transform_a_source
-        )
+        tmem = Sm100W8A16Fp8GemmKernel._tmem_budget(tiled_mma, cta_tile_shape_mnk)
         smem = Sm100W8A16Fp8GemmKernel._smem_stage_bytes(
             tiled_mma,
             cta_tile_shape_mnk,
@@ -2054,18 +2012,13 @@ class Sm100W8A16Fp8GemmKernel:
             b_dtype,
             c_dtype,
             c_layout,
-            transform_a_source,
             smem_buffer_align_bytes,
             tmem.acc_stages,
         )
         smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         free = smem_capacity - smem.carveout
         trans2mma_by_smem = free // (smem.ab_load + smem.a_transform)
-        trans2mma_stages = (
-            min(tmem.transform_limit, trans2mma_by_smem)
-            if a_in_tmem
-            else trans2mma_by_smem
-        )
+        trans2mma_stages = min(tmem.transform_limit, trans2mma_by_smem)
         load2trans_stages = (free - trans2mma_stages * smem.a_transform) // smem.ab_load
         if load2trans_stages < 2 or trans2mma_stages < 2 or tmem.acc_stages < 1:
             raise ValueError("Not enough SMEM or TMEM capacity for selected tile size")

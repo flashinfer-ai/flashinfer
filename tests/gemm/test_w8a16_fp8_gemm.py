@@ -110,9 +110,8 @@ def test_w8a16_fp8_gemm(m, n, k, dtype, bias):
     "algo",
     [
         None,
-        # Blackwell: the smem-A / chunk-partitioned transform, two TMEM-A tiles, the
-        # 1SM tile, stream-K and the split-K reduce (K = 256 is two 128-deep tiles).
-        "2sm256x256",
+        # Blackwell: a 2SM tile, the 1SM tile, stream-K and the split-K reduce
+        # (K = 256 is two 128-deep tiles).
         "2sm256x128",
         "1sm128x128",
         "2sm256x128_streamk",
@@ -655,7 +654,6 @@ def test_w8a16_fp8_gemm_rejects_unknown_algo_name():
 _ALGOS_SM100 = [
     "2sm256x128",
     "2sm256x192",
-    "2sm256x256",
     "1sm128x128",
     "2sm256x128_splitk",
     "2sm256x128_streamk",
@@ -664,7 +662,6 @@ _ALGOS_SM100 = [
 _ALGOS_SM90 = [
     "128x256",
     "128x192",
-    "128x160",
     "128x128",
     "64x256",
     "128x256_streamk",
@@ -733,7 +730,6 @@ _GROUPED_CASES = [
     # Blackwell: weight >= 64 MiB and M >= 4096 turn the swizzle on; 4097 activation
     # rows leave a residual tile, 16392 weight rows a residual 2SM tile.
     ("2sm256x128", 4097, 16392, 4096),
-    ("2sm256x256", 4097, 16392, 4096),  # the smem-A tile under the swizzle
     ("2sm256x128_splitk", 4097, 16392, 4096),
 ]
 
