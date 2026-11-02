@@ -700,18 +700,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "32c057dbbe84e98a6b6f5619eed73ff7561d671e13f1d3774f41ea330934817f",
         },
     },
-    "cake_dsv4_11e876e6f0cc55f08732": {
-        "sources": [
-            "sm_103a/cake_dsv4_11e876e6f0cc55f08732_kernel.cu",
-            "sm_103a/cake_dsv4_11e876e6f0cc55f08732_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "arg_plan": "fp8_lowhead_qlayout",
-        "arches": ["sm_103a"],
-        "identity": {
-            "sm_103a": "7612dd137627b291dce470afe3e85a1426e26d9efedc1ffd519c1d6e38ae1fab",
-        },
-    },
     "cake_dsv4_13091b5bf0612783f02d": {
         "sources": [
             "sm_103a/cake_dsv4_13091b5bf0612783f02d_kernel.cu",
@@ -816,18 +804,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "25e23b357ee5a9141c42b933e73f0f639af8ed1bd695505068e7a82fe77da22a",
         },
     },
-    "cake_dsv4_3d34c18e5e5ecb09ea72": {
-        "sources": [
-            "sm_100a/cake_dsv4_3d34c18e5e5ecb09ea72_kernel.cu",
-            "sm_100a/cake_dsv4_3d34c18e5e5ecb09ea72_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math", "-Xptxas=--register-usage-level=10"],
-        "arg_plan": "fp8_lowhead_qlayout",
-        "arches": ["sm_100a"],
-        "identity": {
-            "sm_100a": "4772f926383010fb232edc487f688ddf307f6d4a90e970a0b7ae37beee49cdbb",
-        },
-    },
     "cake_dsv4_3eaffaa117944ce5e14e": {
         "sources": [
             "common/cake_dsv4_3eaffaa117944ce5e14e_kernel.cu",
@@ -929,6 +905,18 @@ MODULES: dict[str, dict[str, Any]] = {
         "identity": {
             "sm_100a": "00c1f03b2b547713d533e73462ebe845b856a21adc732d2ca3c02b0e7b9527c0",
             "sm_103a": "56980013bb3fe4bba3c55e9c737cc2c2ef6a172363e374108b2b77d67013c23a",
+        },
+    },
+    "cake_dsv4_7302f6fd2e2826d6826e": {
+        "sources": [
+            "sm_103a/cake_dsv4_7302f6fd2e2826d6826e_kernel.cu",
+            "sm_103a/cake_dsv4_7302f6fd2e2826d6826e_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_lowhead_qlayout",
+        "arches": ["sm_103a"],
+        "identity": {
+            "sm_103a": "8a69df496b95400682d4dfe1189feebf24e7af8aad00b0f0817a278405c4e7f8",
         },
     },
     "cake_dsv4_750835d54fe97cfc7ad4": {
@@ -1054,6 +1042,18 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": ["sm_100a"],
         "identity": {
             "sm_100a": "eed23e81f47b3907beab754067a37f0f5b40d6902187e8f2a5dd5a0210d61ec5",
+        },
+    },
+    "cake_dsv4_b7c345c94f3a216b24e5": {
+        "sources": [
+            "sm_100a/cake_dsv4_b7c345c94f3a216b24e5_kernel.cu",
+            "sm_100a/cake_dsv4_b7c345c94f3a216b24e5_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "-Xptxas=--register-usage-level=10"],
+        "arg_plan": "fp8_lowhead_qlayout",
+        "arches": ["sm_100a"],
+        "identity": {
+            "sm_100a": "fe482c106d746eb25e14b0e92414600c7894c848f56e6e2397c560edf962beec",
         },
     },
     "cake_dsv4_cbf3168c696847fd3f69": {
@@ -1221,7 +1221,7 @@ VARIANTS: dict[str, dict[str, str]] = {
         "fp8_h64_source_exact": "cake_dsv4_e5e9d7f2a2798aec29ff",
         "fp8_h8_h16_source_exact": "cake_dsv4_fee38be0a1a558bc4cf4",
         "fp8_lowhead_h64": "cake_dsv4_cbf3168c696847fd3f69",
-        "fp8_lowhead_one_partition": "cake_dsv4_3d34c18e5e5ecb09ea72",
+        "fp8_lowhead_one_partition": "cake_dsv4_b7c345c94f3a216b24e5",
         "fp8_lowhead_prefill": "cake_dsv4_d9d623599c9697a9ccf3",
         "split_reduce": "cake_dsv4_5f640d72462f26d33803",
     },
@@ -1250,7 +1250,7 @@ VARIANTS: dict[str, dict[str, str]] = {
         "fp8_h64_source_exact": "cake_dsv4_e5e9d7f2a2798aec29ff",
         "fp8_h8_h16_source_exact": "cake_dsv4_ff4aa022aa97fded6032",
         "fp8_lowhead_h64": "cake_dsv4_cbf3168c696847fd3f69",
-        "fp8_lowhead_one_partition": "cake_dsv4_11e876e6f0cc55f08732",
+        "fp8_lowhead_one_partition": "cake_dsv4_7302f6fd2e2826d6826e",
         "fp8_lowhead_prefill": "cake_dsv4_e21760e2024d7c1e85c9",
         "split_reduce": "cake_dsv4_5f640d72462f26d33803",
     },
