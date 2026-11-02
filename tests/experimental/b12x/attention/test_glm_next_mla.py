@@ -89,6 +89,11 @@ def _glm_next_plan_and_binding(
     return_lse: bool = False,
     lse_scale: str = "base2",
 ):
+    """Plan and prepare a GLM-Next sparse-MLA binding for this exact cache ABI.
+
+    The record format (BF16 or NVFP4) is inferred from the cache's last
+    dimension; the returned binding owns the preparation needed for replay.
+    """
     is_nvfp4 = int(kv_cache.shape[-1]) == _GLM_NEXT_NVFP4_RECORD_BYTES
     plan = sparse_mla.plan(
         sparse_mla.Caps(
@@ -1041,6 +1046,12 @@ def test_glm_next_nvfp4_writer_rejects_capture_compile_miss(
 
 
 def test_glm_next_cpu_reference_path_preserves_model_identity() -> None:
+    """Low-level CPU planning and the internal reference fallback keep GLM-Next.
+
+    Binding leaves scratch untouched, the fallback matches the reference, and
+    the public ``run`` rejects a low-level binding. Public binding identity is
+    covered separately through a mocked prepared state.
+    """
     torch.manual_seed(20260826)
     rows, heads, cache_tokens, width = 2, 8, 16, 8
     latent = torch.randn((cache_tokens, 512), dtype=torch.bfloat16) / 4
