@@ -4065,6 +4065,7 @@ def _trtllm_batch_decode_token_sparse_reference(
 def _trtllm_batch_decode_token_sparse_init(
     *,
     num_tokens: int,
+    batch_size: int | None = None,
     num_heads: int = 16,
     head_dim: int = 256,
     sparse_top_k: int = 512,
@@ -4078,6 +4079,8 @@ def _trtllm_batch_decode_token_sparse_init(
     and V slot lists are distinct random slots; the first token uses all
     ``sparse_top_k`` of them and the others a random count.
     """
+    if batch_size is not None and batch_size != num_tokens:
+        raise ValueError("token-sparse decode needs batch_size == num_tokens")
     torch.manual_seed(seed)
     num_pages = max(num_pages, 4 * sparse_top_k)
     query = torch.randn(
