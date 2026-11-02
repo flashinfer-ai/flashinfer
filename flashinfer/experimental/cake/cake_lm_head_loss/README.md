@@ -1,4 +1,4 @@
-# Cake chunked LM-head + loss training backend, non-deterministic form (SM100 / SM103)
+# Cake chunked LM-head + loss training backend, non-deterministic form (SM100 / SM103 / SM107)
 
 Experimental backend for the chunked large-vocabulary LM-head projection with a
 fused log-sum-exp / cross-entropy / policy-gradient loss and a memory-bounded
@@ -10,8 +10,9 @@ shared contract, the kernels and the toolchain rules in full).  Tracking issue
 of the family: https://github.com/flashinfer-ai/flashinfer/issues/5680.
 
 Both the API and the backend are experimental: no compatibility guarantee,
-SM100 (B200 / GB200) is the acceptance architecture and SM103 (B300 / GB300) is
-compiled from the same sources.  The feature does not participate in automatic
+SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
+SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
+built for `sm_107a`, under the base dispatch rules).  The feature does not participate in automatic
 backend selection, autotuning or trace-apply.  Its libraries are loaded
 prebuilt from `aot/` when the package ships them and JIT-built by FlashInfer
 from `build.json` otherwise (see "Layout of this package").
@@ -162,8 +163,8 @@ vocabulary block, `F`: split-tail items):
 By architecture: `sm_100a` (B200) is tested on the device.  On
 `sm_103a` (GB300) the rule has no cell, so the dense dX runs one slice
 everywhere (the deterministic bits); the support tests, forced two to four
-slices included, pass on GB300.  `sm_107a` is pending: this package has no
-`sm_107a` build.
+slices included, pass on GB300.  On `sm_107a` (R200) the rule has no cell
+either: the dense dX runs one slice everywhere.
 
 Accuracy on B200, worst of 20 runs against the FP64 oracle: the production
 row at H 5120 (T 16231, V 152064, chunks of 4096 and 3943 rows, two slices on
@@ -379,8 +380,12 @@ import is the JIT fallback of `cake_build.py`.
   package's prefix, except the K-sliced dX GEMM: its `gemm_dx_red*` forms
   replace the deterministic sliced forms and `slab_sum`.  The `sm_103a`
   reduction forms pass this package's support tests on GB300.
-* `sm_107a`: not built yet (`SUPPORTED_COMPUTE_CAPABILITIES` lists `sm_100a`
-  and `sm_103a`); it follows the deterministic family's `sm_107a` programs.
+* `sm_107a`: the `sm_107a` record registers every stage of the `sm_103a`
+  record, each program built for `sm_107a` (the deterministic family's
+  `sm_107a` programs under this package's prefix and the `sm_103a` reduction
+  forms).  No per-architecture rule table lists `sm_107a`, so its rules reach
+  the device-count logits forms and the 256-wide dX tiles of the structural
+  forms, as on the deterministic package.
 * Temperature in the loss / log-probability entries
   (https://github.com/flashinfer-ai/flashinfer/issues/7637): follows the
   deterministic package when it lands there.

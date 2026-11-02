@@ -27,8 +27,8 @@ against that suite's source below), over repeated runs (worst case), and compare
 deterministic package on the same inputs: ``loss`` / ``logp`` / ``lse`` and ``dW`` keep their fixed
 order and equal its bits; ``dX`` meets the budgets and its distance to the deterministic ``dX`` is
 reported.  The host layer (mode contract, PyTorch's deterministic-algorithms alert, the reference
-backend) runs anywhere; the device tests need an SM100 / SM103 GPU and the package's rendered
-programs.
+backend) runs anywhere; the device tests need an SM100 / SM103 / SM107 GPU and the package's
+rendered programs.
 """
 
 import ast
@@ -37,6 +37,7 @@ import dataclasses
 import functools
 import gc
 import inspect
+import json
 import math
 import os
 import subprocess
@@ -353,6 +354,47 @@ def test_loader_is_the_deterministic_packages_bytes():
     assert (PACKAGE_DIR / "cake_build.py").read_bytes() == (
         det_dir / "cake_build.py"
     ).read_bytes()
+
+
+def test_each_supported_architecture_has_its_record_and_libraries():
+    """The supported compute capabilities name exactly the architectures of the registry's records (``(10, 7)``
+    only with an ``sm_107a`` record), ``build.json`` builds exactly those architectures, and every registered stage
+    of each record has its ``<library>_<arch>`` entry.  The ``sm_107a`` record registers the ``sm_103a`` record's
+    stages and programs."""
+    assert cake_backend.SUPPORTED_COMPUTE_CAPABILITIES == {
+        (10, 0): "sm_100a",
+        (10, 3): "sm_103a",
+        (10, 7): "sm_107a",
+    }
+    arches = set(cake_backend.SUPPORTED_COMPUTE_CAPABILITIES.values())
+    by_arch = {record["arch"]: name for name, record in cake_jit.MODULES.items()}
+    assert set(by_arch) == arches and len(by_arch) == len(cake_jit.MODULES)
+    if not (PACKAGE_DIR / "build.json").is_file():
+        pytest.skip(
+            "the package's programs are not rendered in this checkout (no build.json)"
+        )
+    manifest = json.loads((PACKAGE_DIR / "build.json").read_text())
+    entries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert set(manifest["arch_flags"]) == arches
+    assert {entry["arch"] for entry in entries.values()} == arches
+    for arch, name in by_arch.items():
+        stages = cake_jit.registered_stages(name)
+        assert stages, name
+        for stage in stages:
+            library = cake_jit.library_name(name, stage)
+            assert library.endswith("_" + arch), (name, stage)
+            assert library in entries and entries[library]["arch"] == arch, (
+                name,
+                stage,
+            )
+    sm107, sm103 = by_arch["sm_107a"], by_arch["sm_103a"]
+    assert cake_jit.registered_stages(sm107) == cake_jit.registered_stages(sm103)
+    for stage in cake_jit.registered_stages(sm107):
+        assert (
+            cake_jit.MODULES[sm107][stage]["library"]
+            == cake_jit.MODULES[sm103][stage]["library"]
+        ), stage
+    assert cake_jit.MODULES[sm107]["geometry"] == cake_jit.MODULES[sm103]["geometry"]
 
 
 def _mode_calls(X, W, labels):
@@ -1476,7 +1518,7 @@ def test_binding_cache_owned_bytes_while_another_thread_remembers(module):
 
 
 # ---------------------------------------------------------------------------
-# Device (SM100 / SM103 with the package's rendered programs)
+# Device (SM100 / SM103 / SM107 with the package's rendered programs)
 # ---------------------------------------------------------------------------
 
 
@@ -1489,7 +1531,7 @@ def _device_supported() -> bool:
 
 def _require_program(*, entry: str = "loss"):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 device")
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
     if not (PACKAGE_DIR / "build.json").is_file():
         pytest.skip(
             "the package's programs are not rendered in this checkout (no build.json)"
@@ -3142,16 +3184,44 @@ def _red_stage_pins(stage: str, k_slices: int = 4) -> dict:
     }
 
 
+def test_device_loads_the_libraries_of_its_architecture():
+    """On a registered device every stage of the device's record loads the library ``build.json`` builds for the
+    device's architecture (``<library>_sm_107a`` on compute capability 10.7): the prebuilt one under ``aot/`` when
+    the package ships it, else FlashInfer's JIT build."""
+    _require_program(entry="loss")
+    name, record = cake_backend.record_for(CUDA)
+    arch = record["arch"]
+    capability = torch.cuda.get_device_capability(0)
+    assert arch == cake_backend.SUPPORTED_COMPUTE_CAPABILITIES[capability]
+    libraries = []
+    for stage in cake_jit.registered_stages(name):
+        library = cake_jit.library_name(name, stage)
+        assert library.endswith("_" + arch), (stage, library)
+        assert cake_jit.load_cake_lm_head_loss_module(name, stage) is not None
+        libraries.append(library)
+    prebuilt = sum(cake_build.prebuilt_path(library).is_file() for library in libraries)
+    print(
+        f"\n{arch} (capability {capability}): {len(libraries)} stages loaded "
+        f"({len(set(libraries))} libraries, {prebuilt} stages prebuilt); "
+        f"first {cake_build.library_path(libraries[0])}"
+    )
+
+
 @pytest.mark.parametrize("stage", RED_STAGES)
 def test_device_every_reduction_form_runs_within_the_budgets(glm_weight, stage):
-    """Every ``gemm_dx_red*`` form the running architecture registers (``gemm_dx_red_swab`` on ``sm_103a`` only), pinned
-    at four K slices on a call of two whole 4096-row chunks: the launch record shows it launched on both, the outputs
-    pass the deterministic suite's gates against the FP64 oracle, and ``loss`` / ``logp`` / ``dW`` are the
+    """Every ``gemm_dx_red*`` form the running architecture registers and its tuning accepts (``gemm_dx_red_swab`` on
+    the ``DX_SWAB_ARCHES`` only: ``sm_107a`` registers it with the ``sm_103a`` stages, but no rule or pin selects it),
+    pinned at four K slices on a call of two whole 4096-row chunks: the launch record shows it launched on both, the
+    outputs pass the deterministic suite's gates against the FP64 oracle, and ``loss`` / ``logp`` / ``dW`` are the
     deterministic package's bits."""
     _require_program(entry="loss")
-    module_name, _ = cake_backend.record_for(CUDA)
+    module_name, record = cake_backend.record_for(CUDA)
     if stage not in cake_jit.registered_stages(module_name):
         pytest.skip(f"{stage} is not registered for this architecture")
+    if stage.endswith("_swab") and record["arch"] not in cake_backend.DX_SWAB_ARCHES:
+        pytest.skip(
+            f"{stage}: the swapped dX tile is pinned on {', '.join(cake_backend.DX_SWAB_ARCHES)} only"
+        )
     inp = _device_inputs(8192, "ce", W=glm_weight, ignore_frac=0.0)
     tuning = {"dx": _red_stage_pins(stage)}
     cake_backend.BINDING_CACHE.clear()
