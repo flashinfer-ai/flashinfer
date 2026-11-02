@@ -82,7 +82,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import cached_property
 from types import ModuleType
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, TypeVar, Union
 
 import torch
 import tvm_ffi
@@ -2221,7 +2221,7 @@ class _CachedAtomic:
     k2: Optional[_K2Binding] = field(default=None, repr=False)
 
 
-def _release_atomic_entry(entry: _CachedAtomic) -> None:
+def _release_atomic_entry(entry: Union[_CachedAtomic, _CachedSplitK2]) -> None:
     """``on_evict`` of the convenience caches: the arena of an evicted entry loses a reference and is released when
     no cached entry uses it any more."""
     arena = entry.arena
@@ -2232,9 +2232,13 @@ def _release_atomic_entry(entry: _CachedAtomic) -> None:
         del _ATOMIC_ARENAS[arena.key]
 
 
+#: An entry of the convenience caches (:data:`_K1_ATOMIC_CACHE`, :data:`_K2_ATOMIC_CACHE`, :data:`_K2_SPLITK_CACHE`).
+_CacheEntry = TypeVar("_CacheEntry", "_CachedAtomic", "_CachedSplitK2")
+
+
 def _cache_insert(
-    cache: "OrderedDict[tuple, Any]", key: tuple, entry: _CachedAtomic
-) -> _CachedAtomic:
+    cache: "OrderedDict[tuple, Any]", key: tuple, entry: _CacheEntry
+) -> _CacheEntry:
     det = deterministic_backend()
     if entry.arena is not None:
         entry.arena.refs += 1
