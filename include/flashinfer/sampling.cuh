@@ -1430,7 +1430,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
                                             IdType top_k_val, float top_p_val, uint32_t d,
                                             uint32_t chunk_size, uint64_t* seed_arr,
                                             uint64_t seed_val, uint64_t* offset_arr,
-                                            uint64_t offset_val) {
+                                            uint64_t offset_val, uint32_t seed_stride,
+                                            uint32_t offset_stride) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
   using TempStorage = SplitRowSamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM>;
   constexpr uint32_t NUM_WARPS = TempStorage::NUM_WARPS;
@@ -1466,21 +1467,12 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
   // Zero-pad to a multiple of 4 elements so that float4 reads of the last segment are defined.
   if (tx < 4 && chunk_len + tx < round_up(chunk_len, 4u)) chunk[chunk_len + tx] = 0.f;
 
-  uint64_t philox_seed = seed_arr ? seed_arr[0] : seed_val;
-  uint64_t philox_offset = offset_arr ? offset_arr[0] : offset_val;
+  uint64_t philox_seed = seed_arr ? seed_arr[bx * seed_stride] : seed_val;
+  uint64_t philox_offset = offset_arr ? offset_arr[bx * offset_stride] : offset_val;
   curandStatePhilox4_32_10_t state;
   curand_init(philox_seed, bx, philox_offset, &state);
-  // Same parameter indexing as the single-CTA kernel of each mode.
-  uint32_t k = 0;
-  float p = 1.f;
-  if constexpr (MODE == SplitRowSamplingMode::kTopP) {
-    p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
-  } else if constexpr (MODE == SplitRowSamplingMode::kTopK) {
-    k = top_k_arr == nullptr ? top_k_val : top_k_arr[bx];
-  } else {
-    k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
-    p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
-  }
+  const uint32_t k = top_k_arr == nullptr ? top_k_val : top_k_arr[row_idx];
+  const float p = top_p_arr == nullptr ? top_p_val : top_p_arr[row_idx];
 
   // Warp segments are multiples of 4 elements so that lanes can read float4.
   const uint32_t seg = round_up(ceil_div(chunk_len, NUM_WARPS), 4u);
@@ -1709,7 +1701,8 @@ cudaError_t SplitRowRejectionSamplingFromProb(uint32_t cluster_size, T* probs, I
                                               float* top_p_arr, IdType top_k_val, float top_p_val,
                                               uint32_t batch_size, uint32_t d, uint64_t* seed_arr,
                                               uint64_t seed_val, uint64_t* offset_arr,
-                                              uint64_t offset_val, cudaStream_t stream) {
+                                              uint64_t offset_val, cudaStream_t stream,
+                                              uint32_t seed_stride, uint32_t offset_stride) {
   constexpr uint32_t BLOCK_THREADS = SPLIT_ROW_SAMPLING_THREADS;
   using TempStorage = SplitRowSamplingTempStorage<BLOCK_THREADS, SCAN_ALGO>;
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
@@ -1738,7 +1731,7 @@ cudaError_t SplitRowRejectionSamplingFromProb(uint32_t cluster_size, T* probs, I
     config.numAttrs = 1;
     FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(
         &config, kernel, probs, output, valid, indices, top_k_arr, top_p_arr, top_k_val, top_p_val,
-        d, chunk_size, seed_arr, seed_val, offset_arr, offset_val));
+        d, chunk_size, seed_arr, seed_val, offset_arr, offset_val, seed_stride, offset_stride));
   });
   return cudaSuccess;
 }
@@ -1955,7 +1948,7 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* 
         SplitRowRejectionSamplingFromProb<SplitRowSamplingMode::kTopK, T, IdType>(
             cluster_size, probs, output, valid, indices, reinterpret_cast<IdType*>(top_k_arr),
             nullptr, static_cast<IdType>(top_k_val), 1.f, batch_size, d, seed_arr, seed_val,
-            offset_arr, offset_val, stream);
+            offset_arr, offset_val, stream, seed_stride, offset_stride);
     if (status != cudaErrorNotSupported) return status;
   }
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
@@ -1993,7 +1986,8 @@ cudaError_t TopPSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* 
         SplitRowRejectionSamplingFromProb<SplitRowSamplingMode::kTopP, T, IdType>(
             cluster_size, probs, output, valid, indices, nullptr,
             reinterpret_cast<float*>(top_p_arr), IdType(0), static_cast<float>(top_p_val),
-            batch_size, d, seed_arr, seed_val, offset_arr, offset_val, stream);
+            batch_size, d, seed_arr, seed_val, offset_arr, offset_val, stream, seed_stride,
+            offset_stride);
     if (status != cudaErrorNotSupported) return status;
   }
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
@@ -2062,7 +2056,8 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
         SplitRowRejectionSamplingFromProb<SplitRowSamplingMode::kTopKTopP, T, IdType>(
             cluster_size, probs, output, valid, indices, top_k_arr,
             reinterpret_cast<float*>(top_p_arr), top_k_val, static_cast<float>(top_p_val),
-            batch_size, d, seed_arr, seed_val, offset_arr, offset_val, stream);
+            batch_size, d, seed_arr, seed_val, offset_arr, offset_val, stream, seed_stride,
+            offset_stride);
     if (status != cudaErrorNotSupported) return status;
   }
   const uint32_t vec_size = std::gcd(16 / sizeof(T), d);
