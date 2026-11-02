@@ -284,6 +284,39 @@ def test_select_record_refuses_a_mode_without_records(monkeypatch: pytest.Monkey
         cake_jit.select_record("dqkg", **scalars, path="light", l2n="on")
 
 
+def test_l2n_classes_and_the_l2n_in_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A plain record kept on some paths of the fused route narrows its rule with ``l2n_in``; the twin serves the
+    others: exactly one record per (mode, path)."""
+    fake = {
+        "x_plain": {
+            "stage": "qk_l2norm",
+            "l2n": ["off", "fused"],
+            "select_rule": {
+                "kind": "any_of",
+                "rules": [
+                    {"kind": "l2n_in", "modes": ["off"]},
+                    {"kind": "path_in", "paths": ["replay"]},
+                ],
+            },
+            "grid_rule": {"kind": "tokens"},
+        },
+        "x_l2n": {
+            "stage": "qk_l2norm",
+            "l2n": ["fused"],
+            "select_rule": {"kind": "path_in", "paths": ["fwd", "fwd_nosave"]},
+            "grid_rule": {"kind": "tokens"},
+        },
+    }
+    for name, rec in fake.items():
+        monkeypatch.setitem(cake_jit.MODULES, name, rec)
+    scalars = dict(num_chunks_pad=2, num_seqs=1, num_heads=1, sm_count=148, arch=cake_jit.ARCHES[0])
+    sel = lambda path, mode: cake_jit.select_record("qk_l2norm", **scalars, path=path, l2n=mode)  # noqa: E731
+    assert sel("fwd", "off") == "x_plain" and sel("replay", "off") == "x_plain"
+    assert sel("fwd", "fused") == "x_l2n" and sel("fwd_nosave", "fused") == "x_l2n"
+    assert sel("replay", "fused") == "x_plain"
+    assert sel("fwd", "fallback") is None  # optional stage, no record of the class
+
+
 def test_tokens_grid_rule(monkeypatch: pytest.MonkeyPatch) -> None:
     record = {"stage": "qk_l2norm", "grid_rule": {"kind": "tokens"}, "select_rule": {"kind": "always"}}
     monkeypatch.setitem(cake_jit.MODULES, "qk_l2norm_test", record)

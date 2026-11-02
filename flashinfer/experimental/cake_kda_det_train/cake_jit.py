@@ -6364,6 +6364,7 @@ def _admits(
     num_segments: int,
     arch: str,
     path: str,
+    l2n: str = "off",
 ) -> bool:
     kind = rule["kind"]
     if kind in ("always", "otherwise"):
@@ -6380,6 +6381,7 @@ def _admits(
                 num_segments=num_segments,
                 arch=arch,
                 path=path,
+                l2n=l2n,
             )
             for sub in rule["rules"]
         )
@@ -6439,6 +6441,8 @@ def _admits(
         return arch in rule["arches"]
     if kind == "path_in":
         return path in rule["paths"]
+    if kind == "l2n_in":
+        return l2n in rule["modes"]
     raise ValueError(f"unknown Cake KDA training selection rule: {kind!r}")
 
 
@@ -6591,7 +6595,9 @@ def select_record(
     ``l2n`` is the in-kernel Q/K L2 norm mode of the call (:data:`L2N_MODES`):
     a stage of :data:`L2N_STAGES` selects among its records whose ``l2n`` list
     holds the mode (absent: ``["off"]``); a non-optional stage with no record
-    of the mode is refused (the architecture's records do not serve it).
+    of the mode is refused (the architecture's records do not serve it).  The
+    ``l2n_in`` rule reads the mode (``modes``): a record serving several modes
+    (a plain record the l2n route keeps on some paths) narrows its rule there.
 
     ``ctas = num_chunks_pad * num_heads`` is the chunk-shaped CTA count the
     preparation stages switch on (``ctas_at_least`` / ``ctas_below`` /
@@ -6643,6 +6649,7 @@ def select_record(
             num_segments=num_segments,
             arch=arch,
             path=path,
+            l2n=l2n,
         )
 
     admitted = [
