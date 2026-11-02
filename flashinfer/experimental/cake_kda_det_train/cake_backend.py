@@ -1416,14 +1416,13 @@ def _lean_slots(
 
 
 # The layouts another route registers on this module's arenas (:func:`_register_route_slots`): mode -> its slots at
-# ``(tail_passes, R, H, NC, NSEG, gate_fused, l2n)`` (the context-parallel route's lean backward layout,
-# ``cake_kda_det_train_kcp.cake_kcp_plan``).  This module registers none and runs none; a registered mode is never one
+# ``(tail_passes, R, H, NC, NSEG, gate_fused)`` (the context-parallel route's lean backward layout,
+# ``cake_kda_det_train_kcp.cake_kcp_plan``), with ``l2n`` as a seventh argument in an in-kernel Q/K L2 norm mode
+# only, so a route that serves no l2n mode keeps the six-argument form.  This module registers none and runs none; a registered mode is never one
 # of its own (:data:`MODES`, :data:`LEAN_MODES`, :data:`FWD_LAYOUTS`), so their layouts and bytes do not depend on the
 # registry.  A mode keeps the one function it was registered with, so the cached :func:`_layout` of a registered
 # mode never changes (a mode looked up before its registration raised, which is not cached).
-_RouteSlots = Callable[
-    [int, int, int, int, int, bool, str], tuple[tuple[Occupant, ...], ...]
-]
+_RouteSlots = Callable[..., tuple[tuple[Occupant, ...], ...]]
 _ROUTE_SLOTS: dict[str, _RouteSlots] = {}
 
 
@@ -1547,6 +1546,10 @@ def _layout(
     slots = (
         _l2n_slots(_slots_of(mode, tail_passes, R, H, NC, NSEG), mode, l2n)
         if route is None
+        # a registered route's function takes the l2n mode as a seventh argument only in an l2n mode (the
+        # flag-off call is the six-argument one it always was)
+        else route(tail_passes, R, H, NC, NSEG, gate_fused)
+        if l2n == "off"
         else route(tail_passes, R, H, NC, NSEG, gate_fused, l2n)
     )
     if gate_fused:  # no gate epilogue: its input buffers leave the layout (an emptied slot leaves too)
