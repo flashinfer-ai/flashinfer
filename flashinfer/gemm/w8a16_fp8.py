@@ -70,12 +70,12 @@ def _byte_span(t: torch.Tensor) -> Optional[tuple]:
 
 
 def _check_disjoint(
-    written_name: str, written: torch.Tensor, read_name: str, read: torch.Tensor
+    written_name: str, w: Optional[tuple], read_name: str, r: Optional[tuple]
 ) -> None:
-    """``written`` is overwritten while ``read`` is still being read, so the two
-    must not share a byte (checked on the contiguous spans; nothing here is a
-    strided view)."""
-    w, r = _byte_span(written), _byte_span(read)
+    """The byte span ``w`` is overwritten while ``r`` is still being read, so the
+    two must not share a byte (spans of contiguous tensors from :func:`_byte_span`;
+    nothing here is a strided view; None is an empty tensor, which overlaps
+    nothing)."""
     if w is not None and r is not None and w[0] < r[1] and r[0] < w[1]:
         raise ValueError(
             f"{written_name} must not overlap {read_name} in memory ({written_name} "
@@ -561,14 +561,22 @@ def _check_aliasing(
     """The two buffers the call writes against everything it reads (and each
     other).  Inputs may alias one another; the empty act / out of an M == 0 call
     cover no bytes and so overlap nothing."""
-    reads = [("act", act), ("weight", weight), ("weight_scale", weight_scale)]
+    # Each span once per call (never cached across calls: the next call may pass
+    # other storage), then the same comparisons in the same order.
+    out_span = _byte_span(out)
+    reads = [
+        ("act", _byte_span(act)),
+        ("weight", _byte_span(weight)),
+        ("weight_scale", _byte_span(weight_scale)),
+    ]
     if bias is not None:
-        reads.append(("bias", bias))
-    for name, t in reads:
-        _check_disjoint("out", out, name, t)
+        reads.append(("bias", _byte_span(bias)))
+    for name, span in reads:
+        _check_disjoint("out", out_span, name, span)
     if workspace is not None:
-        for name, t in reads + [("out", out)]:
-            _check_disjoint("workspace", workspace, name, t)
+        ws_span = _byte_span(workspace)
+        for name, span in reads + [("out", out_span)]:
+            _check_disjoint("workspace", ws_span, name, span)
 
 
 def _select_workspace(

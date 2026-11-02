@@ -252,6 +252,13 @@ def _compile_pointers(specs: Tuple):
     )
 
 
+def _addresses(specs: Tuple) -> Tuple[int, ...]:
+    """The raw addresses of (dtype, address, alignment) triples, in order: what a
+    compiled kernel takes, read once per call from the same specs that would
+    compile it."""
+    return tuple(addr for _, addr, _ in specs)
+
+
 def _raw_stream(device: torch.device):
     """The current Torch stream of ``device`` as a driver stream handle (the public
     torch.cuda.current_stream() path costs ~20 us per call, most of a small GEMM)."""
@@ -330,10 +337,6 @@ def _get_sm100_kernel(
     partial_output: bool = False,
     splits: int = 1,
 ):
-    import cutlass.cute as cute
-
-    from .kernels.cute_dsl.w8a16_fp8_gemm_sm100 import Sm100W8A16Fp8GemmKernel
-
     mma_tiler, two_sm, cluster, a_in_smem = _SM100_TILES[algo]
     # Bytes of weight each transform thread converts per step: a whole stage when K
     # is one k-tile (no pipelining to overlap), 32 otherwise (as the W4A16 kernel).
@@ -355,6 +358,10 @@ def _get_sm100_kernel(
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
         return compiled
+    import cutlass.cute as cute
+
+    from .kernels.cute_dsl.w8a16_fp8_gemm_sm100 import Sm100W8A16Fp8GemmKernel
+
     kernel = Sm100W8A16Fp8GemmKernel(
         mma_tiler_mnk=mma_tiler,
         use_2cta_instrs=two_sm,
@@ -404,14 +411,14 @@ def _get_reduce_kernel(
     ``pointer_specs`` is not part of that key: every call of one specialization
     must supply the same operand dtypes and alignment guarantees (the caller's
     invariant), while the addresses themselves are passed at run time."""
-    import cutlass.cute as cute
-
-    from .kernels.cute_dsl.w8a16_fp8_splitk_reduce import W8A16SplitKReduce
-
     key = ("reduce", target, act_dtype, has_bias, splits)
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
         return compiled
+    import cutlass.cute as cute
+
+    from .kernels.cute_dsl.w8a16_fp8_splitk_reduce import W8A16SplitKReduce
+
     kernel_name = f"reduce_{_dtype_tag(act_dtype)}_bias{int(has_bias)}_sp{splits}"
     compiled = _build_kernel(
         kernel_name,
@@ -618,17 +625,7 @@ def _w8a16_fp8_gemm_sm100(
         partial_output=partials is not None,
         splits=splits,
     )
-    compiled(
-        weight.data_ptr(),
-        act.data_ptr(),
-        weight_scale.data_ptr(),
-        bias_tensor.data_ptr(),
-        gemm_out.data_ptr(),
-        n,
-        m,
-        k_slice,
-        stream,
-    )
+    compiled(*_addresses(pointer_specs), n, m, k_slice, stream)
     if partials is not None:
         reduce_specs = (
             (cutlass.Float32, partials.data_ptr(), 16),
@@ -639,16 +636,7 @@ def _w8a16_fp8_gemm_sm100(
         reduce = _get_reduce_kernel(
             target, act.dtype, has_bias, splits, reduce_specs, stream
         )
-        reduce(
-            partials.data_ptr(),
-            weight_scale.data_ptr(),
-            bias_tensor.data_ptr(),
-            out.data_ptr(),
-            m,
-            n,
-            m * n // 8,
-            stream,
-        )
+        reduce(*_addresses(reduce_specs), m, n, m * n // 8, stream)
 
 
 # ======================================================================= Hopper
@@ -853,10 +841,6 @@ def _get_sm90_kernel(
     stream,
     has_tail: bool = False,
 ):
-    import cutlass.cute as cute
-
-    from .kernels.cute_dsl.w8a16_fp8_gemm_sm90 import Sm90W8A16Fp8GemmKernel
-
     key = (
         "sm90",
         target,
@@ -870,6 +854,10 @@ def _get_sm90_kernel(
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
         return compiled
+    import cutlass.cute as cute
+
+    from .kernels.cute_dsl.w8a16_fp8_gemm_sm90 import Sm90W8A16Fp8GemmKernel
+
     kernel = Sm90W8A16Fp8GemmKernel(
         _SM90_TILES[tile_algo].rows,
         has_bias=has_bias,
@@ -1058,13 +1046,7 @@ def _w8a16_fp8_gemm_sm90(
         has_tail=has_tail,
     )
     compiled(
-        weight.data_ptr(),
-        act.data_ptr(),
-        weight_scale.data_ptr(),
-        bias_tensor.data_ptr(),
-        out.data_ptr(),
-        partials.data_ptr(),
-        counters.data_ptr(),
+        *_addresses(pointer_specs),
         n,
         m,
         k,
@@ -1083,7 +1065,7 @@ def _scratch(
     numel = 1
     for d in shape:
         numel *= d
-    nbytes = numel * torch.empty((), dtype=dtype).element_size()
+    nbytes = numel * dtype.itemsize
     flat = workspace.view(torch.uint8).flatten()
     return flat[offset : offset + nbytes].view(dtype).view(shape)
 
