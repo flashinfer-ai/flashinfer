@@ -1051,9 +1051,13 @@ def test_per_call_dtype_is_pcie_only_and_whitelisted(gloo_pg, monkeypatch):
         pcie.close()
 
 
-def test_joint_config_validation_uses_gathered_backends():
+def test_joint_config_validation_uses_gathered_backends(monkeypatch):
     """The verdict must be a pure function of the gathered configs, so every
     rank raises (or passes) together whatever backend it requested locally."""
+    # _encode_config range-checks the ordinal against the visible device
+    # count. The verdict under test does not depend on the machine, so pin
+    # a count that makes "cuda:0" valid even where no GPU is visible.
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     encode = UlyssesCommunicator._encode_config
     pcie_int8 = encode(1 << 10, torch.int8, "cuda:0", "pcie")
     UlyssesCommunicator._validate_configs_jointly(
