@@ -1030,10 +1030,10 @@ def test_k1_sm107a_token_counts_of_the_deterministic_rules():
     assert p(5120, 512, 212, 16231) is None and p(5120, 512, 212, 16384) is None
     for sms in (208, 216):
         assert p(5120, 512, sms, 16231) == (128, 1), sms
-    # 5120 -> 1024: 208 SMs at 16384 tokens (a row the deterministic rules leave unchanged)
-    assert p(5120, 1024, 208, 16384) is None
-    assert p(5120, 1024, 208, 16231) == (256, 1)
-    assert p(5120, 1024, 212, 16384) == (256, 1)
+    # 5120 -> 1024: no entry; every part keeps the 256-wide one-split program at both token counts
+    for sms in (208, 212, 216):
+        for T in (16231, 16384):
+            assert p(5120, 1024, sms, T) == (256, 1), (sms, T)
     # 4096 -> 32 and 5120 -> 32 keep their verdicts at both token counts
     for sms in (208, 212, 216):
         for T in (16231, 16384):

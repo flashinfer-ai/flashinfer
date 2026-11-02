@@ -166,7 +166,7 @@ slower there: BF16 output at 1024 tokens on `sm_103a` `4096 -> 48`, `6144 -> 32`
 | `5120 -> 48` | 16231; 16384 | 16231 | 16231 |
 | `5120 -> 64` | 16231 | 16231 | 16231 |
 | `5120 -> 512` | -- | 16231; 16384 | -- |
-| `5120 -> 1024` | 16384 | -- | -- |
+| `5120 -> 1024` | -- | -- | -- |
 
 *Table: the K1 token counts that run the deterministic program on `sm_107a` parts (`K1_SPLIT_RULE_EXCLUDED_TOKENS`;
 `--`: none).  They are token counts of the deterministic package's `sm_107a` rules for single token counts (16231 and
@@ -177,14 +177,14 @@ the rows were measured at 16172, 16231 and 16384 tokens against those plans: 15 
 token count with the L2 cache flushed before every launch, in a long-lived process per GPU and in a fresh process per
 row, in both arm orders, eager launches and CUDA graph replays, next to a kernel holding 8, 16 or 32 SMs in both launch
 orders, with the backward pass and the checkpointed step timed (9 paired groups); 212 SMs: eight parts in two nodes
-(`4096 -> 1024`: twelve parts in four nodes), 208 SMs: two parts.  A measured token count runs the deterministic
-program where the row's program failed the K1 rule above in some run, or left the backward pass or the checkpointed
-step more than 1.3 % slower than the deterministic program (ratio of the medians over the runs, or median of the
-paired ratios, in eager launches or in graph replays).  `5120 -> 1024` at 16384 tokens on 208 SMs is such a row,
-although the deterministic package's rules do not change its plan there.  The 216-SM entries were not measured on
-216-SM parts: they are the rule token counts where the deterministic package's speed-up of the row on a 216-SM part
-(its own measurement against its earlier plan) leaves this package's program less than 2 % faster than the
-deterministic program; the other rule token counts keep the 216-SM verdicts.*
+(`4096 -> 1024`: sixteen parts in five nodes), 208 SMs: two parts (`5120 -> 1024`: three).  A measured token count
+runs the deterministic program where the row's program failed the K1 rule above in some run, or left the backward
+pass or the checkpointed step more than 1.3 % slower than the deterministic program (ratio of the medians over the
+runs, or median of the paired ratios, in eager launches or in graph replays).  `4096 -> 1024` on 212 SMs and
+`5120 -> 1024` on 208 SMs were measured twice; the rule takes the runs of both measurements together.  The 216-SM
+entries were not measured on 216-SM parts: they are the rule token counts where the deterministic package's speed-up
+of the row on a 216-SM part (its own measurement against its earlier plan) leaves this package's program less than
+2 % faster than the deterministic program; the other rule token counts keep the 216-SM verdicts.*
 
 `"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
 units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six

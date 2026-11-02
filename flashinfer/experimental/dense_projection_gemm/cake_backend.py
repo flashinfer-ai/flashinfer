@@ -362,10 +362,9 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: 16231 and 16384 tokens against those plans (the protocol is in the sm_107a K1 token table of the README): a measured
 #: token count is an entry where the row's program failed the rule above in some run, or left the backward pass or the
 #: checkpointed step more than 1.3 % slower than the deterministic program (ratio of the medians over the runs, or
-#: median of the paired ratios, in eager launches or in graph replays).  That rule also gives one 208-SM entry of a row
-#: those rules do not change (``5120 -> 1024`` at 16384 tokens).  The 216-SM entries were not measured on 216-SM parts:
-#: they are the token counts where the deterministic package's speed-up of the row on a 216-SM part (its own
-#: measurement against its earlier plan) leaves this package's program less than 2 % faster than the deterministic
+#: median of the paired ratios, in eager launches or in graph replays).  The 216-SM entries were not measured on
+#: 216-SM parts: they are the token counts where the deterministic package's speed-up of the row on a 216-SM part (its
+#: own measurement against its earlier plan) leaves this package's program less than 2 % faster than the deterministic
 #: program; the other rows keep their 216-SM verdicts there.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
@@ -413,7 +412,6 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ),
     ("sm_107a", 1, 5120, 64, "f32"): ((208, 16231, 16231), (212, 16231, 16231), (216, 16231, 16231)),
     ("sm_107a", 1, 5120, 512, "f32"): ((212, 16231, 16231), (212, 16384, 16384)),
-    ("sm_107a", 1, 5120, 1024, "f32"): ((208, 16384, 16384),),
 }
 # fmt: on
 #: Per-SM-count verdicts of the parts of an architecture with fewer SMs than its :data:`K1_MIN_SM_COUNT`,
