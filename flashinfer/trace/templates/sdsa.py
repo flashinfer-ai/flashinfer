@@ -168,7 +168,13 @@ gather_key_sample_trace = TraceTemplate(
             ["requests", "capacity", "dim"],
             dtype_from="key_cache",
             param="sample_keys",
-        )
+        ),
+        "sample_scales": Tensor(
+            ["requests", "capacity", "scales"],
+            dtype="float8_e4m3fn",
+            param="sample_scales",
+            optional=True,
+        ),
     },
     tags=["arch:sm100", "arch:sm103"],
 )

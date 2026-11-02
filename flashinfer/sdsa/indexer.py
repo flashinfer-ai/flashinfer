@@ -72,8 +72,8 @@ def indexer_scores(
         E4M3 ``[rows, 8]`` for NVFP4 queries, a scale per 16 values. None for
         BF16.
     key_scales : torch.Tensor, optional
-        E4M3 ``[pages, 64, 8]`` for NVFP4 keys, paged like the keys. None for
-        BF16.
+        E4M3 ``[pages, 64, 8]`` for NVFP4 keys, paged like the keys. Pages can
+        be any multiple of 4 bytes apart. None for BF16.
     """
     from .shapes import DIM, MAX_ROWS, PAGE
 
@@ -188,9 +188,16 @@ def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
     if (
         key_cache.stride()[1:] != (dim, 1)
         or nvfp4
-        and key_scales.stride(1) != SCALES_PER_KEY
+        and key_scales.stride()[1:] != (SCALES_PER_KEY, 1)
     ):
         raise ValueError("A page's keys and their scales must be contiguous rows")
+    # TMA reads key pages, and the scorer reads scale pages as 4-byte words.
+    if key_cache.stride(0) * key_cache.element_size() % 16 or (
+        nvfp4 and key_scales.stride(0) % 4
+    ):
+        raise ValueError(
+            "Key pages must be a multiple of 16 bytes apart, and scale pages of 4"
+        )
     if get_compute_capability(query.device)[0] != 10:
         raise ValueError("Single-head paged MQA kernels require SM10x")
     tensors = (query, query_scales, *args)

@@ -209,7 +209,7 @@ select once: every call leaves them at zero.
 
 ## Tracing
 
-Each API records a trace template of the same name, with a reference.
+Each API records a trace template, with the op type `sdsa_<api>`.
 
 ## Validation
 

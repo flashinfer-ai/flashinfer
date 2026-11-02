@@ -607,6 +607,22 @@ def test_indexer_scores_rejects_bad_shapes() -> None:
             query_scales=torch.zeros(4, 8, device="cuda"),
             key_scales=torch.zeros(4, 64, 8, device="cuda"),
         )
+    with pytest.raises(ValueError, match="multiple of 16 bytes apart"):
+        padded = torch.zeros(4, 64 * 128 + 4, dtype=torch.bfloat16, device="cuda")
+        keys = padded[:, : 64 * 128].view(4, 64, 128)
+        run(query, keys, table, context, requests=requests, scores=scores)
+    with pytest.raises(ValueError, match="multiple of 16 bytes apart"):
+        padded = torch.zeros(4, 64 * 8 + 2, dtype=torch.uint8, device="cuda")
+        run(
+            torch.zeros(4, 64, dtype=torch.uint8, device="cuda"),
+            torch.zeros(4, 64, 64, dtype=torch.uint8, device="cuda"),
+            table,
+            context,
+            requests=requests,
+            scores=scores,
+            query_scales=torch.zeros(4, 8, dtype=torch.uint8, device="cuda"),
+            key_scales=padded[:, : 64 * 8].view(4, 64, 8),
+        )
 
 
 @sm10x_only
