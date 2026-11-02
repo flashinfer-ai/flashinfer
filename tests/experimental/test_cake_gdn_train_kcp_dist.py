@@ -135,6 +135,14 @@ GRADS = (
 LAYER_TENSORS = ("out", "dx", "dw", "dg", "dbeta")
 ATOL = RTOL = 1e-2
 STATE_REL_RMS_MAX = 1e-2  # forward-only mode: S_in (FP32, owner-merged) vs the FP64 cut state, per crossing-in fragment
+# #7817 rows: dq / dk against FP64 are judged by rel-RMS, not by the elementwise clause.  The pullback
+# (dx_hat - x_hat (x_hat . dx_hat)) / n of the raw 2^e-scaled rows cancels to small |ref| elements, where the
+# clause fails for the deterministic package's l2n output too (det_l2n: the same mismatch counts, e.g. C1-cp2 dq
+# 1655 / 498176); the merged deterministic contract (#8252) has no FP64 clause on these tensors.  The mismatch
+# count and the worst element stay in the report; the composed-chain and cross-arm gates are unchanged.
+L2N_DQK_FP64_REL_RMS_MAX = 1e-2
+# per row: this package's dq / dk FP64 rel-RMS <= det_l2n's x L2N_DQK_VS_DET_REL_RMS_RATIO_MAX
+L2N_DQK_VS_DET_REL_RMS_RATIO_MAX = 1.10
 WORLD_TIMEOUT_S = 300  # NCCL / rendezvous timeout of the WORLD group (printed at init)
 SCALE = kcp.SCALE
 C_CONV = 10240
@@ -302,6 +310,22 @@ def _verdict(row: Row, name: str, met: dict, budget, ref_mod) -> dict:
     return v
 
 
+def _rel_rms_verdict(met: dict, max_rel_rms: float) -> dict:
+    """Finite and rel-RMS <= ``max_rel_rms``; the elementwise count (``ATOL + RTOL |ref|``) and the worst element are
+    recorded, not judged."""
+    v = {
+        k: met[k]
+        for k in ("rel_rms", "max_abs", "ref_rms", "numel", "nonfinite", "mismatch")
+    }
+    v["worst"] = met["worst"]
+    v["verdict"] = "empty" if met["numel"] == 0 else "rel_rms"
+    v["rel_rms_max"] = max_rel_rms
+    v["ok"] = bool(
+        met["numel"] == 0 or (met["nonfinite"] == 0 and met["rel_rms"] <= max_rel_rms)
+    )
+    return v
+
+
 def _severity(v: dict) -> tuple:
     """Order of verdicts for the worst run: failed first, then non-finite, budget ratio, mismatches, max-abs."""
     b = v.get("budget") or {}
@@ -309,6 +333,8 @@ def _severity(v: dict) -> tuple:
         float(b.get("ratio_rel") or 0.0),
         float(b.get("ratio_max_u1") or b.get("ratio_max") or 0.0),
     )
+    if v.get("verdict") == "rel_rms":
+        ratio = float(v["rel_rms"]) / float(v["rel_rms_max"])
     return (
         not v["ok"],
         int(v.get("nonfinite", 0)),
@@ -323,8 +349,11 @@ class _Judge:
     (the arm's tensors can go), ``finish`` gathers them once over the group and every rank derives the same verdicts.
     Keys: ``fp64:<arm>:<tensor>`` and ``cross:<arm>:<tensor>``."""
 
-    def __init__(self, row: Row, ref_mod, budget) -> None:
+    def __init__(self, row: Row, ref_mod, budget, fp64_rel_rms=None) -> None:
+        """``fp64_rel_rms``: ``{tensor: max}``, the ``fp64`` comparisons of these tensors judged by finiteness and
+        rel-RMS alone (the elementwise count and the worst element recorded)."""
         self.row, self.ref_mod, self.budget = row, ref_mod, budget
+        self.fp64_rel_rms = dict(fp64_rel_rms or {})
         self.parts: dict[str, dict] = {}
         self.gated: dict[str, bool] = {}
 
@@ -363,9 +392,11 @@ class _Judge:
         out: dict[str, dict] = {}
         for key in keys:
             met = _combine([p.get(key) for p, _ in every])
-            v = _verdict(
-                self.row, key.rsplit(":", 1)[1], met, self.budget, self.ref_mod
-            )
+            name = key.rsplit(":", 1)[1]
+            if key.startswith("fp64:") and name in self.fp64_rel_rms:
+                v = _rel_rms_verdict(met, self.fp64_rel_rms[name])
+            else:
+                v = _verdict(self.row, name, met, self.budget, self.ref_mod)
             v["gated"] = gated[key]
             # a key missing on a rank: that rank skipped the comparison (fails the verdict)
             v["ranks"] = sum(1 for p, _ in every if key in p)
@@ -3508,7 +3539,12 @@ def _run_rank_l2n(
     t_start = time.time()
     ref_mod = _reference()
     refs = _local_reference_l2n(row, part, cu, rank, device)
-    judge = _Judge(row, ref_mod, _budget_cell(row))
+    judge = _Judge(
+        row,
+        ref_mod,
+        _budget_cell(row),
+        fp64_rel_rms={n: L2N_DQK_FP64_REL_RMS_MAX for n in ("dq", "dk")},
+    )
     flags: dict[str, bool] = {}
     info: dict[str, object] = {"T_r": T_r}
 
@@ -3967,6 +4003,28 @@ def _run_rank_l2n(
     # the WORLD-wide verdict: the ranks' exact flags (a rank without tokens holds the per-row flags it can) and the
     # judged verdicts (the worst of the N_REPEAT runs named per tensor)
     verdicts = judge.finish(group, W)
+    # no accuracy loss against the deterministic package on the same raw operands: every gated arm's dq / dk FP64
+    # rel-RMS within det_l2n's x L2N_DQK_VS_DET_REL_RMS_RATIO_MAX (the verdicts are the same on every rank)
+    for n in ("dq", "dk"):
+        det_v = verdicts.get(f"fp64:det_l2n:{n}")
+        mine = [
+            float(v["rel_rms"])
+            for key, v in verdicts.items()
+            if key.startswith("fp64:")
+            and key.endswith(f":{n}")
+            and v["gated"]
+            and key != f"fp64:det_l2n:{n}"
+        ]
+        worst = max(mine, default=0.0)
+        bound = (
+            float(det_v["rel_rms"]) * L2N_DQK_VS_DET_REL_RMS_RATIO_MAX
+            if det_v is not None
+            else -1.0
+        )
+        info[f"l2n_{n}_fp64_rel_rms"] = {"worst": worst, "det_l2n_x_ratio": bound}
+        flags[f"l2n_{n}_fp64_rel_rms_within_det"] = bool(
+            det_v is not None and worst <= bound
+        )
     flag_list: list = [None] * W
     info_list: list = [None] * W
     if W > 1:
