@@ -109,6 +109,7 @@ _COMMON = dict(
     split_units=["l6", "narrow", "wide"],
     split_wave_scope=None,
     l6_solo_rule=None,
+    l6_solo_unsampled_max_queries=None,
     wide_pair_snake_only=False,
     snake_default=False,
     tile_unroll_default=1,
@@ -350,7 +351,10 @@ def test_registry_records_are_well_formed():
             }
         ), arch
         # the unpaired three-warpgroup preference needs the unpaired l6 program
-        if policy.l6_solo_rule is not None:
+        if (
+            policy.l6_solo_rule is not None
+            or policy.l6_solo_unsampled_max_queries is not None
+        ):
             assert "scan:l6:u1:s0:f0" in keys, arch
         # the key-range split serves exactly the unit geometries whose split program the architecture registers
         assert policy.split_units == sorted(
@@ -730,6 +734,11 @@ def test_policy_record_round_trip_and_validation():
         dict(l6_solo_rule=[128.0, 0]),
         dict(l6_solo_rule=[128.0, 2.0]),
         dict(l6_solo_rule=[True, 2]),
+        # its query bound with the sampled first threshold off: an integer >= 1 or None
+        dict(l6_solo_unsampled_max_queries=0),
+        dict(l6_solo_unsampled_max_queries=16384.0),
+        dict(l6_solo_unsampled_max_queries=True),
+        dict(l6_solo_unsampled_max_queries=[16384]),
         # the scope of the two-way wave split: [ascending unit geometries, max segments >= 1, sampled only] or None
         dict(split_wave_scope="narrow"),
         dict(split_wave_scope=[]),
@@ -1741,9 +1750,11 @@ def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit(
         )
         == unsampled.workspace_bytes
     )
-    # the other architectures carry no rule: both sampling modes keep the same unit and pair
+    # the other architectures carry no sampled rule; their unsampled bound (16384 queries) leaves a 64k-query call alone:
+    # both sampling modes keep the same unit and pair
     for arch in ("sm_100a", "sm_103a"):
         assert policy_for(arch).l6_solo_rule is None
+        assert policy_for(arch).l6_solo_unsampled_max_queries == 16384
         a = plan_dsa_indexer_det_topk(
             65536, 65536, 1, top_k=2048, arch=arch, num_sms=148
         )
@@ -1751,6 +1762,83 @@ def test_l6_solo_rule_prefers_the_unpaired_l6_unit_where_registered_and_unsplit(
             65536, 65536, 1, top_k=2048, arch=arch, num_sms=148, sample_tiles_max=0
         )
         assert (a.kind, a.block_q, a.pair) == (b.kind, b.block_q, b.pair), arch
+
+
+def test_l6_solo_unsampled_max_queries_on_sm_100a_and_sm_103a():
+    """sm_100a / sm_103a ``l6_solo_unsampled_max_queries`` 16384 (no ``l6_solo_rule``): a call with the sampled first
+    threshold off and at most 16384 queries whose plan is the CTA-pair l6 unit without a split runs the unpaired l6 unit;
+    a wide or narrow plan keeps its unit
+    (the descending three-warpgroup program; same ids and score bits, round-19 lane Q screen: GB200 sink calls of 32k+
+    queries lose with it, every call up to 16384 queries gains or holds).  On a grid of shapes in both modes and on every
+    frozen SM count, each plan equals the plan of the record without the field except exactly there; sampled calls and
+    sm_107a (field None) are unchanged; without a registry the preference stays off."""
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    assert policy_for("sm_107a").l6_solo_unsampled_max_queries is None
+    for arch in ("sm_100a", "sm_103a"):
+        p, keys = policy_for(arch), cake_jit.PROGRAM_KEYS[arch]
+        assert p.l6_solo_rule is None and p.l6_solo_unsampled_max_queries == 16384
+        plain = DispatchPolicy.from_record(
+            dict(p.record(), l6_solo_unsampled_max_queries=None)
+        )
+        unpaired = DispatchPolicy.from_record(dict(plain.record(), pair_rule=None))
+
+        def plan(policy, T, Tkv, S, sample, grid, top_k=2048, scan_keys=keys):
+            return select_program(
+                policy,
+                num_queries=T,
+                num_keys=Tkv,
+                num_segments=S,
+                ratio=1,
+                top_k=top_k,
+                grid=grid,
+                sample_tiles_max=sample,
+                scan_keys=scan_keys,
+            )
+
+        for grid in _FROZEN_GRIDS[arch]:
+            # eight packed 2048 x 32768 segments (16384 queries, 248 mean tiles): pair l6 sampled, unpaired l6 unsampled
+            base = plan(plain, 16384, 262144, 8, 0, grid)
+            got = plan(p, 16384, 262144, 8, 0, grid)
+            assert (base.kind, base.n_split) == ("pair_l6", 1), (arch, grid)
+            assert (got.kind, got.block_q, got.pair, got.n_split) == ("l6", 6, False, 1)
+            assert got.scan_key in keys and got.grid_ctas == grid, (arch, grid)
+            assert plan(p, 16384, 262144, 8, None, grid) == plan(
+                plain, 16384, 262144, 8, None, grid
+            )
+            # 16385 queries: past the bound, the pair stays; without a registry the preference stays off
+            assert plan(p, 16385, 262144 + 8, 8, 0, grid) == plan(
+                plain, 16385, 262144 + 8, 8, 0, grid
+            )
+            assert plan(p, 16384, 262144, 8, 0, grid, scan_keys=None) == plan(
+                plain, 16384, 262144, 8, 0, grid, scan_keys=None
+            )
+        moved = 0
+        for q, k, S, top_k, sample, grid in itertools.product(
+            (1024, 2048, 4096, 8192, 16384, 32768),
+            (8192, 16384, 32768, 65536, 131072),
+            (1, 2, 4, 8),
+            (512, 2048),
+            (None, 0),
+            _FROZEN_GRIDS[arch],
+        ):
+            T, Tkv = q * S, k * S
+            if q > k or T > 65536:
+                continue
+            base = plan(plain, T, Tkv, S, sample, grid, top_k)
+            got = plan(p, T, Tkv, S, sample, grid, top_k)
+            want = base
+            if (
+                sample == 0
+                and T <= 16384
+                and (base.kind, base.n_split) == ("pair_l6", 1)
+            ):
+                want = plan(unpaired, T, Tkv, S, sample, grid, top_k)
+                assert (want.kind, want.n_split) == ("l6", 1), (arch, T, Tkv, S)
+                moved += 1
+            assert got == want, (arch, T, Tkv, S, top_k, sample, grid, got.scan_key)
+            assert got.scan_key in keys, (arch, T, Tkv, S, got.scan_key)
+        assert moved, arch
 
 
 def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():

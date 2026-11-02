@@ -85,12 +85,15 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   at ``T_r = 32768``, ``H_qk = 16``; ``boundary_mode="saved"`` only); the
   workspace gains the transient normalized rows ``qn`` / ``kn`` (BF16
   ``[T_r, H_qk, 128]`` each, ``2 * 256 T_r H_qk`` bytes together, 256 MiB at
-  the same shape) in the forward's tape walk and in every backward phase (and
-  in the kept form's recompute forward), plus the arena ``qk_rstd`` in the
-  backward forms that re-run #1 (the light replay and ``boundary_mode=
-  "replay"``; the ``save_mode="full"`` and kept-tape backwards read the saved
-  one).  The forward drops ``kn`` before its output and ``qn`` after #5, so
-  nothing of the norm is left in the arena after a forward.
+  the same shape) in the forward's tape walk and in every backward phase of
+  the replay and ``save_mode="full"`` forms (and in the kept form's recompute
+  forward, which hands them to its backward with the tapes: there they are
+  hand-off tensors, ``bwd.kept_tapes``, not workspace), plus the arena
+  ``qk_rstd`` in the backward forms that re-run #1
+  (the light replay and ``boundary_mode="replay"``; the ``save_mode="full"``
+  and kept-tape backwards read the saved one).  The forward drops ``kn``
+  before its output and ``qn`` after #5, so nothing of the norm is left in
+  the arena after a forward.
 
 All sizes are exact integers of the shapes the host allocates (``R = 64
 NC_pad`` padded token rows, ``NC_pad`` the even chunk bound), not estimates.
@@ -437,9 +440,11 @@ def gdn_det_workspace_layout_kcp(
       checkpointed region saves a tensor).  ``save_mode="full"`` saves the forward tapes as fresh tensors: none is
       workspace in either lifetime.  ``backward_transient`` = the backward's phase maximum with the hand-off tensors
       added (the memory a backward needs besides the saved set; the same figure in both forms).
-    * ``use_qk_l2norm_in_kernel``: ``qn`` / ``kn`` in the forward's tape walk, in every backward phase and in the
-      kept form's recompute forward; ``bwd.qk_rstd`` (the arena ``r``) where the backward re-runs #1 (the light
-      replay, ``boundary_mode="replay"``).
+    * ``use_qk_l2norm_in_kernel``: ``qn`` / ``kn`` in the forward's tape walk, in every backward phase of the
+      replay and ``save_mode="full"`` forms (``qk_apply`` writes them there) and in the kept form's recompute
+      forward, which hands them over with the ten tapes: in the kept-tape backward they are hand-off tensors
+      (``bwd.kept_tapes``, ``bwd.qn`` / ``bwd.kn`` 0); ``bwd.qk_rstd`` (the arena ``r``) where the backward re-runs #1
+      (the light replay, ``boundary_mode="replay"``).
     """
     H_qk, HV = _check(H_qk, HV)
     l2n = _flag(use_qk_l2norm_in_kernel, "use_qk_l2norm_in_kernel")
@@ -548,11 +553,16 @@ def gdn_det_workspace_layout_kcp(
         if group_reduce == "host"
         else 0,  # #8, the host form of the grouped reduction
     }
-    # the norm in the backward: qn / kn from #1_l2n (light replay, replay mode) or qk_apply (full, kept) until #8, and
-    # the arena r where #1 is re-run (the full / kept forms read the saved r)
+    # the norm in the backward: qn / kn from #1_l2n (light replay, replay mode) or qk_apply (full) until #8 -- the
+    # kept form binds the recompute forward's hand-off rows (outside the workspace, bwd.kept_tapes) -- and the arena r
+    # where #1 is re-run (the full / kept forms read the saved r)
     replays_prep = (not saved) or not (full or kept)
+    kept_qk = sum(qk_rows.values()) if kept else 0
     bwd_l2n = (
-        {**qk_rows, "qk_rstd": T_r * H_qk * QK_RSTD_BYTES if replays_prep else 0}
+        {
+            **{k: 0 if kept else v for k, v in qk_rows.items()},
+            "qk_rstd": T_r * H_qk * QK_RSTD_BYTES if replays_prep else 0,
+        }
         if l2n
         else {}
     )
@@ -582,14 +592,15 @@ def gdn_det_workspace_layout_kcp(
     phases = {"exchange": phase_exchange, "walk": phase_walk, "end": phase_end}
     if kept:
         # the recompute forward of the kept form drops no tape before handing all ten over (its qn / kn are live
-        # through its tape walk like any forward's)
+        # through its tape walk like any forward's, and handed over too)
         phases["recompute_forward"] = (
             sum(fwd_pools.values()) + light_sum + sum(qk_rows.values())
         )
     out = {f"fwd.{k}": v for k, v in fwd.items()}
     if backward:
         out.update({f"bwd.{k}": v for k, v in bwd.items()})
-        out["bwd.kept_tapes"] = light_sum if kept else 0
+        # the hand-off tensors: the ten forward tapes, with the norm also qn / kn
+        out["bwd.kept_tapes"] = light_sum + kept_qk if kept else 0
         out.update({f"bwd.phase.{k}": v for k, v in phases.items()})
     out["forward"] = sum(fwd.values())
     out["backward"] = max(phases.values()) if backward else 0
@@ -598,6 +609,7 @@ def gdn_det_workspace_layout_kcp(
         (
             max(phase_exchange, phase_walk, phase_end - sum(bwd_fwd_tapes_end.values()))
             + light_sum
+            + kept_qk
         )
         if (backward and kept)
         else out["backward"]

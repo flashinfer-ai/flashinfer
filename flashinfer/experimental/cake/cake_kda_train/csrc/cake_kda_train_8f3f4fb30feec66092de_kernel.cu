@@ -577,6 +577,7 @@ kernel_cake_kda_train_8f3f4fb30feec66092de(const __grid_constant__ CUtensorMap d
                     }
                     dgk_s[hk] = dgk_inter;
                 }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(hd_read_done_addr);
                 mbarrier_wait(a_ready_addr, _phase_a_ready_0);
                 _phase_a_ready_0 ^= 1;
