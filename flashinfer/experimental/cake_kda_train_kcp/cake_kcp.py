@@ -6731,8 +6731,9 @@ def chunk_kda_kcp(
     Python dispatch mode (a selective-checkpoint policy) the call keeps the light set.  The non-reentrant original
     forward decides and its recompute replays that decision, so both passes save the same tensors whatever state the
     recompute runs under.  Memory: the set lives from the recompute to the end of the node's backward (and inside the
-    original forward call), so the checkpoint peak per engaged call rises by :func:`kda_handoff_bytes_kcp` (the saved
-    set is ``kda_saved_bytes_kcp(..., checkpoint_handoff=True)``); ``"off"`` keeps the light set.
+    original forward call), so the checkpoint peak per engaged call rises by at most :func:`kda_handoff_bytes_kcp`
+    (the saved set is ``kda_saved_bytes_kcp(..., checkpoint_handoff=True)``: no carry plane); ``"off"`` keeps the
+    light set.
 
     ``recompute_handle`` (keyword-only; ``None`` = unchanged): a :class:`RecomputeHandleKcp` (any object with an
     ``entries`` dict) makes torch's checkpoint recompute of this call run without the forward state exchange -- the

@@ -14,18 +14,22 @@ Checkpoint hand-off of the non-deterministic context-parallel (KCP) KDA training
 (``chunk_kda_kcp(..., checkpoint_handoff=)``): under ``torch.utils.checkpoint`` the forward keeps its tape set and
 the backward reads it instead of re-running the intra program, WY and the K1 tape walk.
 
-Multi-GPU rows (the checkpoint rows ``CKPT_ROWS`` of ``test_cake_kda_train_kcp_dist.py``, the same launch forms):
-``out``, the five gradients and ``dw`` (the checkpointed function returns ``out * w``) with the hand-off on are
-bitwise those with it off and those of the direct pass, for ``use_reentrant`` False and True, with a recompute handle
-(both tiers), on a lean arena and a per-call workspace; the forward's launches and every collective are unchanged;
-the backward launches no intra program, WY or K1 tape walk; the saved set grows by the byte query's difference; a
-NaN-filled tape set, poisoned free blocks and a poisoned local arena (between the recompute and the backward) change
-no bit; ranks that decide differently (``"on"`` on some, ``"off"`` on others) change no bit; the refusals (``"off"``,
-no checkpoint, a blocked state such as a CUDA-graph capture, a selective-checkpoint policy, ``"auto"`` off the
-verified devices) keep the light set in both passes and change no bit; a Python dispatch mode in one pass only
-follows the original forward's decision in both; ``"auto"`` engages exactly where the admission rule admits the
-call; the facade ``flashinfer.cake_kda_train_kcp`` forwards the mode under ``deterministic=False`` and never engages
-under ``deterministic=True``; a checkpointed forward with the hand-off retains nothing.
+Multi-GPU rows (``HANDOFF_ROWS``: the checkpoint rows ``CKPT_ROWS`` of ``test_cake_kda_train_kcp_dist.py``, the
+same launch forms, and two rows at H8 and H32): ``out``, the five gradients and ``dw`` (the checkpointed function
+returns ``out * w``) with the hand-off on are bitwise those with it off and those of the direct pass, for
+``use_reentrant`` False and True, with a recompute handle (both tiers), on a lean arena and a per-call workspace,
+with the ring exchange (where the partition allows it) and the overlap schedule, and over two backwards
+(``retain_graph``); the forward's launches and every collective are unchanged; the backward launches no intra
+program, WY or K1 tape walk; the saved set grows by the byte query's difference; a NaN-filled tape set, poisoned free
+blocks and a poisoned local arena (between the recompute and the backward) change no bit; ranks that decide
+differently (``"on"`` on some, ``"off"`` on others) change no bit; the refusals (``"off"``, no checkpoint, a blocked
+state such as a CUDA-graph capture, a selective-checkpoint policy) keep the light set in both passes and change no
+bit; a Python dispatch mode in one pass only follows the original forward's decision in both; ``"auto"`` follows the
+admission rule: the shipped work bound refuses these small rows, with the bound at 0 it engages on a verified device
+at an admitted head count and refuses as ``"unverified"`` with the verified set emptied (each refusal counted once);
+the facade ``flashinfer.cake_kda_train_kcp`` forwards the mode under ``deterministic=False`` and never engages under
+``deterministic=True``; a checkpointed forward with the hand-off retains nothing.  A check whose light path does not
+run under its dispatch mode or policy has nothing to compare: the row lists it under ``not_run``.
 Single-process rows: the static rule, the admission table, the phase probe, the once-per-call decision, the saved
 set's tape members and the byte queries of the package and the facade.
 """
@@ -76,6 +80,11 @@ VERIFIED_KEYS = frozenset(
 )
 AUTO_HEADS = frozenset({4, 8, 16, 32, 64})
 MIN_HEAD_TOKENS = 393216
+# the hand-off rows: the checkpoint rows (H1, H4, H16, H64) and the H64 row's packing at the other head counts of
+# AUTO_HEADS
+HANDOFF_ROWS = CKPT_ROWS + [
+    ((2048, 5, 3000, 1), heads, 4, "zigzag_per_document") for heads in (8, 32)
+]
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -161,6 +170,8 @@ def _run_rank_handoff(
         "torch": torch.__version__,
     }
     flags: dict[str, bool] = {}
+    # the flags that passed without a comparison (the light path does not run under the check's mode or policy)
+    not_run: list[str] = []
 
     def leaves():
         return [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
@@ -178,15 +189,19 @@ def _run_rank_handoff(
         poison_tape: bool = False,
         fwd_mode: bool = False,
         bwd_mode: bool = False,
+        twice: bool = False,
+        **opts,
     ):
         """One checkpointed (or direct) step of ``out * w``: the results and the LAST_CALL records of the original
         forward, the recompute (None without one) and the backward.  ``fwd_mode`` / ``bwd_mode``: a pass-through
-        Python dispatch mode around the forward / the backward (the recompute) only."""
+        Python dispatch mode around the forward / the backward (the recompute) only.  ``twice``: two backwards
+        (``retain_graph`` on the first; the gradients accumulate, the records are the second's).  ``opts``: options
+        of the call (``exchange``, ``_kcp_test_knobs``)."""
         if poison_free:
             _poison(device)
         lv = leaves()
         wl = torch.ones_like(dout).requires_grad_(True)
-        kw = {}
+        kw = dict(opts)
         if handle is not None:
             kw["recompute_handle"] = handle
         if keep is not None:
@@ -227,7 +242,8 @@ def _run_rank_handoff(
             if ckpt:
                 cake_kcp.LAST_CALL.pop("fwd")
             with _PassThroughMode() if bwd_mode else contextlib.nullcontext():
-                out.backward(dout)
+                for i in range(2 if twice else 1):
+                    out.backward(dout, retain_graph=twice and i == 0)
         finally:
             cake_kcp._HANDOFF_POISON = prev
         rec_fwd = cake_kcp.LAST_CALL.get("fwd")
@@ -346,6 +362,36 @@ def _run_rank_handoff(
     res_mx, recs_mx = run(mixed)
     flags["mixed_ranks_bitwise"] = _same(res_mx, base)
     flags["mixed_ranks_engaged"] = engaged(recs_mx) if mixed == "on" else light(recs_mx)
+    # the ring exchange (where the partition allows it) and the overlap schedule (test knob; with a2a and the ring),
+    # from a poisoned allocator: bitwise "off", whose launches the hand-off's are minus SKIPPED
+    ring_ok = int(ctx.n_d_max) - 1 <= cake_kcp.RING_MAX_HOPS
+    info["ring_eligible"] = ring_ok
+    overlap = {"_kcp_test_knobs": {"schedule": "overlap"}}
+    forms = {"overlap": overlap}
+    if ring_ok:
+        forms["ring"] = {"exchange": "ring"}
+        forms["ring_overlap"] = {"exchange": "ring", **overlap}
+    previous_knobs = cake_kcp_plan.enable_test_knobs(True)
+    try:
+        for form, opts in forms.items():
+            res_f_off, recs_f_off = run("off", poison_free=True, **opts)
+            res_f_on, recs_f_on = run("on", poison_free=True, **opts)
+            flags[f"{form}_bitwise"] = _same(res_f_off, base) and _same(res_f_on, base)
+            flags[f"{form}_engaged"] = engaged(recs_f_on) and light(recs_f_off)
+            flags[f"{form}_launches"] = skips(recs_f_on, recs_f_off)
+            if "exchange" in opts:
+                flags[f"{form}_exchange"] = (
+                    recs_f_on["orig"]["exchange"] == opts["exchange"]
+                    and recs_f_off["orig"]["exchange"] == opts["exchange"]
+                )
+    finally:
+        cake_kcp_plan.enable_test_knobs(previous_knobs)
+    # retain_graph: each backward replays the original forward's decision; exactly twice the gradients
+    res_tw, recs_tw = run("on", twice=True)
+    flags["twice_bitwise"] = _same(
+        res_tw, {n: base[n] if n == "out" else base[n] + base[n] for n in base}
+    )
+    flags["twice_engaged"] = engaged(recs_tw)
     # refusals: no checkpoint (no phase), a blocked state (CUDA-graph capture / torch.compile tracing, simulated in both
     # passes), a selective-checkpoint policy (a dispatch mode in both passes), "auto" off the verified set
     res_nc, recs_nc = run("on", ckpt=False)
@@ -367,6 +413,7 @@ def _run_rank_handoff(
         res_sac_off = None
     if res_sac_off is None:
         flags["refuse_sac"] = True
+        not_run.append("refuse_sac")
     else:
         try:
             res_sac, recs_sac = run("on", context_fn=sac)
@@ -377,53 +424,74 @@ def _run_rank_handoff(
             info["sac_error"] = traceback.format_exc()[-1500:]
             flags["refuse_sac"] = False
     # a Python dispatch mode in one pass only: the original forward decides (refused under the mode, engaged without
-    # it) and the recompute replays that decision, so the two passes save the same tensors
-    try:
-        res_fm_off, _ = run("off", fwd_mode=True)
-    except Exception:  # noqa: BLE001 - the light path itself does not run under the mode: nothing to compare
-        info["dispatch_mode_unsupported"] = traceback.format_exc()[-1500:]
-        res_fm_off = None
-    if res_fm_off is None:
-        flags["mode_fwd_only"] = flags["mode_bwd_only"] = True
-    else:
+    # it) and the recompute replays that decision, so the two passes save the same tensors (each side on its own)
+    for side in ("fwd", "bwd"):
+        mode_kw = {f"{side}_mode": True}
         try:
-            res_fm, recs_fm = run("on", fwd_mode=True)
-            flags["mode_fwd_only"] = (
-                _same(res_fm, res_fm_off) and _same(res_fm, base) and light(recs_fm)
+            res_m_off, _ = run("off", **mode_kw)
+        except Exception:  # noqa: BLE001 - the light path itself does not run under the mode: nothing to compare
+            info[f"mode_{side}_only_unsupported"] = traceback.format_exc()[-1500:]
+            flags[f"mode_{side}_only"] = True
+            not_run.append(f"mode_{side}_only")
+            continue
+        try:
+            res_m, recs_m = run("on", **mode_kw)
+            flags[f"mode_{side}_only"] = (
+                _same(res_m, res_m_off)
+                and _same(res_m, base)
+                and (light(recs_m) if side == "fwd" else engaged(recs_m))
             )
         except Exception:  # noqa: BLE001 - recorded; the flag fails
-            info["mode_fwd_only_error"] = traceback.format_exc()[-1500:]
-            flags["mode_fwd_only"] = False
-        try:
-            res_bm, recs_bm = run("on", bwd_mode=True)
-            flags["mode_bwd_only"] = _same(res_bm, base) and engaged(recs_bm)
-        except Exception:  # noqa: BLE001 - recorded; the flag fails
-            info["mode_bwd_only_error"] = traceback.format_exc()[-1500:]
-            flags["mode_bwd_only"] = False
+            info[f"mode_{side}_only_error"] = traceback.format_exc()[-1500:]
+            flags[f"mode_{side}_only"] = False
+    # "auto": the shipped rule (on these small rows the work bound refuses, or the head count at H1), then the work
+    # bound at 0 (cake_kcp_plan's constants are read at call time): engaged on a verified device at an admitted head
+    # count, refused as "unverified" with the verified set emptied.  Decided once per checkpointed call: a refusal is
+    # counted once (in the original forward), an engaged call saves twice and binds once
     total = ctx.partition.total
-    verified = cake_kcp_plan.KCP_HANDOFF_VERIFIED
-    stats0 = cake_kcp.kcp_handoff_stats()
-    cake_kcp_plan.KCP_HANDOFF_VERIFIED = frozenset()
-    try:
-        want_refusal = "refused_" + cake_kcp_plan.kcp_handoff_auto_refusal(
-            key, H, total, W
-        )
-        res_un, recs_un = run("auto")
-    finally:
-        cake_kcp_plan.KCP_HANDOFF_VERIFIED = verified
-    stats1 = cake_kcp.kcp_handoff_stats()
-    # decided once per checkpointed call: counted in the original forward only
-    flags["refuse_auto_unverified"] = (
-        _same(res_un, base)
-        and light(recs_un)
-        and stats1[want_refusal] - stats0[want_refusal] == 1
+    shipped = (
+        cake_kcp_plan.KCP_HANDOFF_MIN_HEAD_TOKENS,
+        cake_kcp_plan.KCP_HANDOFF_VERIFIED,
     )
-    # "auto" on the shipped set: engaged exactly where the admission rule admits the call
-    res_auto, recs_auto = run("auto")
-    auto_on = cake_kcp_plan.kcp_handoff_auto_refusal(key, H, total, W) is None
-    info["auto_engages"] = auto_on
-    flags["auto_bitwise"] = _same(res_auto, base)
-    flags["auto_rule"] = engaged(recs_auto) if auto_on else light(recs_auto)
+    kept = {"save": 2, "bound": 1} if T_r > 0 else {}
+
+    @contextlib.contextmanager
+    def auto_rule(min_head_tokens: int, verified):
+        """``"auto"``'s admission constants for the block; yields the rule's reason for this row (``None``:
+        admitted)."""
+        cake_kcp_plan.KCP_HANDOFF_MIN_HEAD_TOKENS = min_head_tokens
+        cake_kcp_plan.KCP_HANDOFF_VERIFIED = verified
+        try:
+            yield cake_kcp_plan.kcp_handoff_auto_refusal(key, H, total, W)
+        finally:
+            (
+                cake_kcp_plan.KCP_HANDOFF_MIN_HEAD_TOKENS,
+                cake_kcp_plan.KCP_HANDOFF_VERIFIED,
+            ) = shipped
+
+    reasons = {}
+    for case, rule in (
+        ("shipped", shipped),
+        ("bound0", (0, shipped[1])),
+        ("bound0_unverified", (0, frozenset())),
+    ):
+        with auto_rule(*rule) as reason:
+            before = cake_kcp.kcp_handoff_stats()
+            res_a, recs_a = run("auto")
+            after = cake_kcp.kcp_handoff_stats()
+        reasons[case] = reason
+        delta = {n: after[n] - before[n] for n in after if after[n] != before[n]}
+        if reason is None:
+            flags[f"auto_{case}"] = (
+                _same(res_a, base) and engaged(recs_a) and delta == kept
+            )
+        else:
+            flags[f"auto_{case}"] = (
+                _same(res_a, base)
+                and light(recs_a)
+                and delta == {"refused_" + reason: 1}
+            )
+    info["auto_reasons"] = reasons
 
     # the facade: deterministic=False forwards the mode (engaged as the package decides), deterministic=True runs
     # the deterministic package, which has no hand-off (the counters do not move; every mode gives the same bits)
@@ -458,11 +526,12 @@ def _run_rank_handoff(
         )
         return res, {k: after[k] - before[k] for k in after if after[k] != before[k]}
 
-    kept = {"save": 2, "bound": 1} if T_r > 0 else {}
     det_res = {}
     for mode in ("auto", "on", "off"):
-        res_f, delta = run_facade(mode, False)
-        want = kept if (mode == "on" or (mode == "auto" and auto_on)) else {}
+        # the work bound at 0: "auto" engages as on a production-size batch of a verified device
+        with auto_rule(0, shipped[1]) as reason:
+            res_f, delta = run_facade(mode, False)
+        want = kept if (mode == "on" or (mode == "auto" and reason is None)) else {}
         flags[f"facade_nd_{mode}_bitwise"] = _same(res_f, base)
         flags[f"facade_nd_{mode}_engaged"] = {
             k: n for k, n in delta.items() if k in ("save", "bound")
@@ -502,6 +571,7 @@ def _run_rank_handoff(
             del out, lv
     info["retained_bytes"] = retained
     flags["retained_zero"] = all(r == 0 for r in retained.values())
+    info["not_run"] = not_run
 
     gathered: list = [None] * W
     dist.all_gather_object(gathered, (flags, info))
@@ -513,6 +583,7 @@ def _run_rank_handoff(
         "failing_ranks": {
             key_: [r for r, f in enumerate(flag_list) if not f[key_]] for key_ in flags
         },
+        "not_run": sorted({n for i in info_list for n in i["not_run"]}),
         "info_by_rank": info_list,
     }
     report["pass"] = all(report["flags"].values()) and all(
@@ -539,7 +610,7 @@ def _spawn_entry_handoff(rank: int, W: int, row, port: int, result_dir: str) -> 
             dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("row", CKPT_ROWS, ids=_row_id)
+@pytest.mark.parametrize("row", HANDOFF_ROWS, ids=_row_id)
 def test_checkpoint_handoff_rows(row) -> None:
     """The hand-off rows of ``_run_rank_handoff`` on every rank of the row."""
     W = row[2]
@@ -796,7 +867,9 @@ def test_handoff_byte_queries_and_counters_are_public() -> None:
     """The package root and the facade export ``kda_handoff_bytes_kcp`` and ``kcp_handoff_stats``; the facade's
     ``kda_saved_bytes_kcp`` takes ``checkpoint_handoff`` (default ``False``, the light set), forwards it under
     ``deterministic=False`` and ignores it under ``deterministic=True`` (the deterministic package's figure); the
-    facade's ``kda_handoff_bytes_kcp`` is the package's under ``deterministic=False`` and ``0`` under ``True``."""
+    facade's ``kda_handoff_bytes_kcp`` is the package's under ``deterministic=False`` and ``0`` under ``True``.  The
+    byte queries' ``checkpoint_handoff`` is the decision (a ``bool``): the entry's modes raise ``TypeError`` (in both
+    modes of the facade), as does a non-bool ``deterministic`` of ``kda_handoff_bytes_kcp``."""
     import importlib
     import inspect
 
@@ -849,6 +922,16 @@ def test_handoff_byte_queries_and_counters_are_public() -> None:
                 assert kcp_api.kda_saved_bytes_kcp(
                     nd_ctx, H=H, checkpoint_handoff=False, deterministic=False
                 ) == kcp_api.kda_saved_bytes_kcp(det_ctx, H=H)
+            for bad in ("auto", "on", "off", 1, None):
+                with pytest.raises(TypeError, match="checkpoint_handoff"):
+                    cake_kcp_plan.kda_saved_bytes_kcp(nd_ctx, checkpoint_handoff=bad)
+                for det, ctx in ((False, nd_ctx), (True, det_ctx)):
+                    with pytest.raises(TypeError, match="checkpoint_handoff"):
+                        kcp_api.kda_saved_bytes_kcp(
+                            ctx, checkpoint_handoff=bad, deterministic=det
+                        )
+            with pytest.raises(TypeError, match="deterministic"):
+                kcp_api.kda_handoff_bytes_kcp(nd_ctx, deterministic=1)
 
 
 def test_facade_checkpoint_handoff_routing(monkeypatch) -> None:

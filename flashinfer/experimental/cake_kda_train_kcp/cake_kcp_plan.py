@@ -2453,10 +2453,10 @@ CHECKPOINT_KEEPS = ("states", "transfer")
 # (H * T // W = 522784) 1.05-1.10; H4 at CP4 (261392) 1.03-1.04 on B200, 1.01-1.03 on B300, 1.02-1.04 on R200 and
 # 0.978-0.996 on GB300 (a loss); H4 at CP8 (130696) 0.985-1.002 on B200 and 0.979-1.010 on B300.  The bound 393216
 # lies between 261392 and 522784: it admits every measured row that gains at least 5 % and refuses every measured
-# loss (and the 1-4 % H4 CP4 gains with it).  H8 and H32 lie between measured head counts and meet the same bound.
-# Every key measured the output and every gradient bitwise equal with the hand-off on and off.  The hand-off raises
-# the checkpoint peak by :func:`kda_handoff_bytes_kcp` per rank (measured +152 MiB at CP8 H4 to +10196 MiB at CP2 H64).
-# A new device or toolkit needs those rows again before it enters KCP_HANDOFF_VERIFIED.
+# loss (and the 1-4 % H4 CP4 gains with it).  Every key measured the output and every gradient bitwise equal with
+# the hand-off on and off.  The hand-off raises the checkpoint peak by at most :func:`kda_handoff_bytes_kcp` per rank
+# (measured +152 MiB at CP8 H4 to +10196 MiB at CP2 H64).  A new device, toolkit or head count needs those rows again
+# before it enters KCP_HANDOFF_VERIFIED or KCP_HANDOFF_HEADS.
 #
 # H, the total and the world size are the same on every rank (the layer's head count and the partition every rank
 # builds its context from), so every rank of a group of one device kind decides alike.  A rank may still differ (a
@@ -2490,7 +2490,9 @@ def kda_handoff_bytes_kcp(ctx: ContextKcp, *, H: int = 64) -> int:
     replaces reads the plane): :func:`kda_saved_bytes_kcp` with ``checkpoint_handoff=True`` is the saved set of such
     a forward.  The set lives from the recompute to the end of that node's backward (and, under non-reentrant
     checkpoint, inside the original forward call too, freed at its return): the checkpoint peak of a call the hand-off
-    engages on is this many bytes higher than with ``checkpoint_handoff="off"``."""
+    engages on is at most this many bytes higher than with ``checkpoint_handoff="off"`` (the saved set grows by
+    ``kda_saved_bytes_kcp(..., checkpoint_handoff=True) - kda_saved_bytes_kcp(...)``, this less the carry plane at
+    ``P > 1``)."""
     H = int(H)
     return ctx.NC_pad * H * 32768 + ctx.R * H * 768
 
@@ -2588,7 +2590,13 @@ def kda_saved_bytes_kcp(
     set of every call the checkpoint hand-off does not engage on; ``True`` is the saved set of a forward that keeps
     the hand-off's tape set -- plus :func:`kda_handoff_bytes_kcp`, without the carry plane term -- that is, of a
     checkpointed call with ``checkpoint_handoff="on"``, or ``"auto"`` where :func:`kcp_handoff_auto_refusal` admits
-    it.  A rank without tokens keeps no tape set: query it with ``False``."""
+    it.  A rank without tokens keeps no tape set: query it with ``False``.  The flag is that decision, not the entry's
+    mode: a value that is not a ``bool`` raises ``TypeError``."""
+    if not isinstance(checkpoint_handoff, bool):
+        raise TypeError(
+            "checkpoint_handoff of the byte query is the hand-off decision (a bool), not chunk_kda_kcp's mode; "
+            f"got {checkpoint_handoff!r}"
+        )
     _check_save_mode(save_mode)
     save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
     H, C = int(H), int(C)

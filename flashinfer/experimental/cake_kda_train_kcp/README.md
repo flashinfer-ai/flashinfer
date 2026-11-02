@@ -386,7 +386,9 @@ The rule comes from the `ckpt` step (time with the hand-off off / on) at
 1.07-1.14 on every row; H4 at CP2 (H * T / W = 522784) 1.05-1.10; H4 at CP4
 (261392) 1.01-1.04 on B200, B300 and R200 but 0.978-0.996 on GB300; H4 at
 CP8 (130696) 0.979-1.010 on B200 and B300.  The bound admits every row that
-gains 5 % or more and refuses every loss.  H, the batch's total and the
+gains 5 % or more and refuses every loss.  A new device, toolkit or head
+count needs these rows and the hand-off rows before it enters
+`KCP_HANDOFF_VERIFIED` or `KCP_HANDOFF_HEADS`.  H, the batch's total and the
 world size are the same on every rank, so the ranks of a group of one device
 kind decide alike; a rank that decides otherwise (a rank without tokens never
 keeps a set) still runs the same collectives, because the launches the
@@ -396,10 +398,13 @@ Memory: the set costs `kda_handoff_bytes_kcp(ctx, H=...)` =
 `NC_pad * H * 32768 + R * H * 768` bytes (1280 B per internal token-head) on
 each rank and lives from the recompute to the end of the node's backward
 (non-reentrant: also inside the original forward call).  An engaged call
-raises the checkpoint peak by that much; measured with `"on"`: +152 MiB per
-rank at CP8 H4 to +10196 MiB at CP2 H64 (T = 261392).
+raises the checkpoint peak by at most that much: the saved set grows by
+`kda_saved_bytes_kcp(..., checkpoint_handoff=True) - kda_saved_bytes_kcp(...)`,
+the tape set less the carry plane at `P > 1`.  Measured with `"on"`: +152 MiB
+per rank at CP8 H4 to +10196 MiB at CP2 H64 (T = 261392).
 `kda_saved_bytes_kcp(..., checkpoint_handoff=True)` is the saved set of an
-engaged call (no carry plane); the facade `flashinfer.cake_kda_train_kcp`
+engaged call (no carry plane; the flag is the decision, a `bool`, not the
+mode); the facade `flashinfer.cake_kda_train_kcp`
 exports `kda_saved_bytes_kcp(..., checkpoint_handoff=...)`,
 `kda_handoff_bytes_kcp` (`0` with `deterministic=True`) and
 `kcp_handoff_stats()` (the forwards that kept a set, the backwards that read
