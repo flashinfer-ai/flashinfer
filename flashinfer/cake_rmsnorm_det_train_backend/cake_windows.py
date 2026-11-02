@@ -237,7 +237,7 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (4096, 14928, "cake_rmsnorm_det_train_1df7db17277d363b5168"),
             (14928, 15566, "cake_rmsnorm_det_train_4df08ce51fb01ba1193f"),
             (15566, 40448, "cake_rmsnorm_det_train_f522f5b8d4343d96ca04"),
-            (40448, None, "cake_rmsnorm_det_train_16a5e0b1afd90f38ed44"),
+            (40448, None, "cake_rmsnorm_det_train_cbeae168d70edd196417"),
         ),
         "bwd_w32_h1536": (
             (0, 1024, "cake_rmsnorm_det_train_baff9ecbafe7de1e6030"),
@@ -808,16 +808,8 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (16384, "same"),
             (50688, "same"),
         ),
-        "bwd_h256": (
-            (65536, "unmeasured"),
-            (70656, "unmeasured"),
-            (1572864, "unmeasured"),
-        ),
-        "bwd_w32_h256": (
-            (65536, "unmeasured"),
-            (70656, "unmeasured"),
-            (1572864, "unmeasured"),
-        ),
+        "bwd_h256": ((65536, "unmeasured"), (70656, "same"), (1572864, "same")),
+        "bwd_w32_h256": ((65536, "unmeasured"), (70656, "same"), (1572864, "same")),
         "bwd_h4096": ((256, "same"), (1024, "same"), (4096, "same"), (24064, "same")),
         "bwd_w32_h4096": (
             (256, "same"),
@@ -1157,7 +1149,10 @@ its own windows.
 * ``sm_100a`` ``bwd_residual_h6144``: (0, inf) 0dcdc563
 * ``sm_103a`` ``bwd_h1536``: (0, 1024] 7dc29629 = (1024, 4096] c1a9efdf =
   (4096, 14928] 1df7db17 = (14928, 15566] 4df08ce5 = (15566, 40448] f522f5b8 =
-  (40448, inf) 16a5e0b1
+  (40448, inf) cbeae168
+* ``sm_103a`` ``bwd_w32_h1536``: (0, 1024] baff9ecb = (1024, 4096] 17d9cdfd =
+  (4096, 14928] a99e2b38 = (14928, 15566] 7a72e97b = (15566, 40448] 109f19bb =
+  (40448, inf) ca6211f3
 * ``sm_103a`` ``bwd_h2048``: (0, 3072] caf6978e = (3072, 4096] 9ac8d21e ~
   (4096, 16384] caf6978e = (16384, 32768] caf6978e = (32768, 55296] 302f64db =
   (55296, inf) 018f0cd7
@@ -1176,8 +1171,8 @@ its own windows.
   (16384, 45056] 56d26996 = (45056, inf) e694b0a2
 * ``sm_107a`` ``bwd_h2048``: (0, 256] 84efa2af = (256, 1024] 845cdcd8 ~
   (1024, 16384] 81c3d8ab = (16384, 50688] 845cdcd8 = (50688, inf) 694decfb
-* ``sm_107a`` ``bwd_h256``: (0, 65536] af005462 ? (65536, 70656] a385ae16 ?
-  (70656, 1572864] 083ea823 ? (1572864, inf) c18297d7
+* ``sm_107a`` ``bwd_h256``: (0, 65536] af005462 ? (65536, 70656] a385ae16 =
+  (70656, 1572864] 083ea823 = (1572864, inf) c18297d7
 * ``sm_107a`` ``bwd_h4096``: (0, 256] 0da5dd4b = (256, 1024] a647fccc =
   (1024, 4096] d41a514f = (4096, 24064] ee4a9053 = (24064, inf) 99a01f2a
 * ``sm_107a`` ``bwd_h512``: (0, 1024] 3feed502 = (1024, 4096] 3feed502 =

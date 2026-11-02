@@ -12116,7 +12116,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_det_train_1df7db17277d363b5168",
             "cake_rmsnorm_det_train_4df08ce51fb01ba1193f",
             "cake_rmsnorm_det_train_f522f5b8d4343d96ca04",
-            "cake_rmsnorm_det_train_16a5e0b1afd90f38ed44",
+            "cake_rmsnorm_det_train_cbeae168d70edd196417",
             "cake_rmsnorm_det_train_9b727c2c9933b2ca6724",
             "cake_rmsnorm_det_train_1863320f3158d35eead6",
             "cake_rmsnorm_det_train_9b727c2c9933b2ca6724__4096_14928",

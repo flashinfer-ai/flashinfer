@@ -247,7 +247,8 @@ def test_rendered_windows_match_the_registry() -> None:
     """The exporter's ``cake_windows`` module is the registry: its table is ``program_windows`` of every route, its
     edges are the windows' upper bounds with a known class, and its sections (the docstring notes of the forward and
     backward) name every BF16 route of their kind and cover the FP32-weight routes in one sentence (they select among
-    the twins over the same windows), the re-cut ones (``RECUT_FP32_ROUTES``) as lines of their own."""
+    the twins over the same windows), the re-cut and swapped ones (``RECUT_FP32_ROUTES``,
+    ``SWAPPED_FP32_ROUTES``) as lines of their own."""
     assert set(windows.PROGRAM_WINDOWS) == set(loader.ROUTES) == set(windows.EDGES)
     assert set(windows.EDGE_CLASSES) == {"same", "ulp", "dx", "unmeasured"}
     for arch, routes in loader.ROUTES.items():
@@ -271,9 +272,10 @@ def test_rendered_windows_match_the_registry() -> None:
             )
             listed = f"``{arch}`` ``{route}``:" in windows.SECTIONS[kind]
             if w_dtype == "f32":
-                # an FP32-weight route is one sentence of the section, a re-cut one a line of its own; its base
-                # route is a line either way
-                recut = (arch, hidden, kind, residual) in RECUT_FP32_ROUTES
+                # an FP32-weight route is one sentence of the section, a re-cut or swapped one a line of its
+                # own; its base route is a line either way
+                key = (arch, hidden, kind, residual)
+                recut = key in RECUT_FP32_ROUTES or key in SWAPPED_FP32_ROUTES
                 assert listed == recut, (arch, route)
                 base = loader.route_key(hidden, kind, residual)
                 assert f"``{arch}`` ``{base}``:" in windows.SECTIONS[kind], (
@@ -414,6 +416,12 @@ RECUT_FP32_ROUTES: dict[
     ),
     ("sm_107a", 5120, "fwd", False): ((49152, None),),
 }
+
+
+# The FP32-weight routes whose window runs the FP32-weight twin of another program than the BF16 route's there, under
+# a record of the same host plan (the window, grid rule and workspace of the BF16 record): SM103 H = 1536 above
+# 40448 rows, where the register-compensated program is faster with the FP32 weight and not with the BF16 weight.
+SWAPPED_FP32_ROUTES = {("sm_103a", 1536, "bwd", False)}
 
 
 def _window(record) -> tuple[int | None, int | None]:
