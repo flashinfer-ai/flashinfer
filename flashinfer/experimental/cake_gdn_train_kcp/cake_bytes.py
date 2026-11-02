@@ -426,7 +426,10 @@ def gdn_workspace_layout_kcp(
 
     * ``forward``: the tape walk of an eager forward -- the pools plus the eight forward tapes live then (#1's
       backward-only outputs ``akk`` / ``gcum`` are dropped right after #1; the six tapes #5 does not read go before
-      the output, so the forward's end state is below its peak).
+      the output, so the forward's end state is below its peak).  The offset walks bind ``u`` in place of ``h`` /
+      ``v_new``, so a fresh arena allocates those two at the first tape walk: under ``schedule="wait_first"`` and on
+      a rank without a document start that walk runs after the c1 send pool is released, at most ``fwd.c1_send``
+      below this figure; a reused workspace binds them from the previous forward on.
     * ``backward``: the largest of its phases -- the adjoint exchange (every backward pool plus the tapes #6 wrote),
       the adjoint tape walk (``carry`` / ``b2_recv`` plus ``dh``; the exchange pools and staging planes are gone)
       and the end state (the tapes #8 / #9 read, every pool but ``eye`` released) -- with the forward tapes of the

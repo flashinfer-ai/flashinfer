@@ -570,6 +570,9 @@ SAVED_TENSOR_OF_BUFFER: dict[str, str] = {
 # The #7 offset walk's never-dereferenced tape pointer: the forward tape of the same shape and dtype, live by then
 # (saved or replayed), so ``dh_tape`` is first allocated by the first tape walk -- after the adjoint merge.
 DHU_OFFSET_TAPE_STANDIN = "h_tape"
+# The #2 offset walk's never-dereferenced tape pointers ``h_tape`` / ``v_new``: the ``u`` tape (BF16 and contiguous like
+# both, written by #1 before any walk), so the summaries bind neither and the first tape walk allocates both.
+FWDH_OFFSET_TAPE_STANDIN = "u"
 BWD_DEAD_AFTER_ADJ_MERGE: tuple[str, ...] = (
     "c1_send",
     "c1_recv",
@@ -3234,8 +3237,11 @@ class CallKcp:
                 **self._block_args("h0", h0),
                 **self._block_args("out", out),
                 tile_stride=h0.stride if tape else out.stride,
-                h_tape=self.tape("h_tape"),
-                v_new=self.tape("v_new"),
+                # The offset program never dereferences the tape pointers (its build holds no load or store of them),
+                # so it gets ``u`` for both (``FWDH_OFFSET_TAPE_STANDIN``): binding ``h_tape`` / ``v_new`` here would
+                # allocate them at the summaries, while every forward pool is live, for a walk that never writes them.
+                h_tape=self.tape("h_tape" if tape else FWDH_OFFSET_TAPE_STANDIN),
+                v_new=self.tape("v_new" if tape else FWDH_OFFSET_TAPE_STANDIN),
             )
         elif name == "kcp_transfer_walk":
             out = self.block(kw["out"])
@@ -6073,6 +6079,7 @@ __all__ = [
     "MODE",
     "BWD_DEAD_AFTER_ADJ_MERGE",
     "DHU_OFFSET_TAPE_STANDIN",
+    "FWDH_OFFSET_TAPE_STANDIN",
     "DHU_PROGRAMS",
     "BWD_DEAD_BEFORE_DQKG",
     "BWD_DEAD_BEFORE_TAPES",
