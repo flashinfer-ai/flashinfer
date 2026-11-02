@@ -4069,6 +4069,7 @@ def _trtllm_batch_decode_token_sparse_init(
     head_dim: int = 256,
     sparse_top_k: int = 512,
     num_pages: int = 0,
+    batch_size: int = 0,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -4076,8 +4077,11 @@ def _trtllm_batch_decode_token_sparse_init(
 
     Each query token is a request over one-token pages of one KV head. Its K
     and V slot lists are distinct random slots; the first token uses all
-    ``sparse_top_k`` of them and the others a random count.
+    ``sparse_top_k`` of them and the others a random count. ``batch_size``
+    defaults to ``num_tokens``, the only value it can take.
     """
+    if batch_size not in (0, num_tokens):
+        raise ValueError("batch_size must equal num_tokens")
     torch.manual_seed(seed)
     num_pages = max(num_pages, 4 * sparse_top_k)
     query = torch.randn(
