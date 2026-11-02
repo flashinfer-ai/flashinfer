@@ -521,6 +521,11 @@ const auto cleanup_workspace = [&]() {
 //     * The "token_idx_in_expert" → SF token index is now the simple
 //       per-block linear mapping (no 4×32 transpose).
 // =====================================================================
+// Local experts below this index are resident experts, never the target of an
+// in-kernel weight copy; with the copy compiled out every slot is resident.
+const uint32_t eplb_num_resident_experts =
+    kInKernelWeightCopy ? in_kernel_copy.num_resident_experts : kNumExpertsPerRank;
+
 if (warp_idx < kNumDispatchWarps) {
   cutlass::arch::warpgroup_reg_dealloc<kNumDispatchRegisters>();
 
@@ -697,6 +702,17 @@ if (warp_idx < kNumDispatchWarps) {
   // cached expert counts; dispatch warps that skipped the pull loop never fetched them.
   if (warp_idx >= kNumActiveDispatchWarps) scheduler.fetch_expert_recv_count();
 
+  // In-kernel weight copy: the dispatch warps are idle from the end of the token
+  // pull until the combine, the whole GEMM phase, so they copy the changed
+  // redundant expert slots now. The scheduler visits local experts in index
+  // order and the redundant slots are the last ones, so their tasks follow every
+  // resident expert's and the weight loader rarely waits.
+  if constexpr (kInKernelWeightCopy) {
+    eplb::in_kernel_copy_share<kNumRanks, kNumDispatchThreads>(
+        in_kernel_copy, sm_idx, kNumSMs, thread_idx,
+        [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+  }
+
   // Cleanup workspace, overlapping with combine
   ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 
@@ -706,6 +722,11 @@ if (warp_idx < kNumDispatchWarps) {
       workspace, sym_buffer, sm_idx, thread_idx,
       [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, true, false);
   if (thread_idx == 0) stamp_max(8);
+  // In-kernel weight copy: the copy list is consumed. Every CTA of every rank
+  // has passed the barrier above, so none can still be reading it.
+  if constexpr (kInKernelWeightCopy) {
+    if (sm_idx == 0 and thread_idx == 0) *in_kernel_copy.copy_count = 0;
+  }
 } else if (warp_idx == kNumDispatchWarps) {
   // =====================================================================
   // ROLE 2: GEMM TMA LOAD warps (load A+SFA, B+SFB)
@@ -782,6 +803,18 @@ if (warp_idx < kNumDispatchWarps) {
 } else if (warp_idx == kNumDispatchWarps + 1) {
   cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
 
+  // In-kernel weight copy: redundant expert slots still being written in this
+  // launch, one mask per plane group (L1, L2), held in two scalar registers (an
+  // indexed array would go to local memory, and this warp runs inside the
+  // loader register budget). A bit is cleared once the slot's group has been
+  // seen complete; a zero mask is the common case and costs one predicated
+  // branch per task.
+  uint32_t eplb_pending_l1 = 0u, eplb_pending_l2 = 0u;
+  if constexpr (kInKernelWeightCopy) {
+    eplb_pending_l1 = eplb::in_kernel_copy_pending_mask(in_kernel_copy);
+    eplb_pending_l2 = eplb_pending_l1;
+  }
+
   const auto load_b_task = [&](const auto& block_phase, const uint32_t& local_expert_idx,
                                const uint32_t& num_k_blocks, const uint32_t& m_block_idx,
                                const uint32_t& n_block_idx, const uint32_t& pool_block_idx,
@@ -794,6 +827,21 @@ if (warp_idx < kNumDispatchWarps) {
     // stage is `BLOCK_N / kBTileRows` bulk copies of adjacent tiles.
     constexpr uint32_t kNumTileLoads = LOAD_BLOCK_N / kBTileRows;
     constexpr uint32_t kNumNTiles = shape_n / kBTileRows;
+
+    if constexpr (kInKernelWeightCopy) {
+      constexpr uint32_t group = kBlockIsL2 ? 1u : 0u;
+      uint32_t& pending = kBlockIsL2 ? eplb_pending_l2 : eplb_pending_l1;
+      if (pending != 0u and local_expert_idx >= eplb_num_resident_experts) {
+        const uint32_t slot = local_expert_idx - eplb_num_resident_experts;
+        if ((pending >> slot) & 1u) {
+          // Every lane acquires, so whichever lane is elected to issue the bulk
+          // copies is ordered after the copy.
+          eplb::in_kernel_copy_wait_slot(in_kernel_copy.copy_done + slot * 2 + group, kNumSMs);
+          __syncwarp();
+          pending &= ~(1u << slot);
+        }
+      }
+    }
 
     for (uint32_t k_block_idx = 0; k_block_idx < num_k_blocks; advance_pipeline(k_block_idx)) {
       empty_barriers[stage_idx]->wait(phase ^ 1);
@@ -919,8 +967,28 @@ if (warp_idx < kNumDispatchWarps) {
     const uint32_t row_offset_r1 = row_block_offset + r_1;
     using BlockPhaseTag = std::remove_cv_t<std::remove_reference_t<decltype(block_phase)>>;
     constexpr bool kBlockIsL2 = BlockPhaseTag::value == sched::BlockPhase::Linear2;
-    const float l2_global_scale =
-        l2_global_scales == nullptr ? 1.0f : __ldg(l2_global_scales + local_expert_idx);
+    // With the in-kernel weight copy a redundant expert slot's scales are
+    // written by the dispatch warps during this launch, so they must come
+    // through the coherent path and must be read only after the GEMM main loop:
+    // the weight loader waits for the slot's copy before its first weight fetch
+    // and the main loop consumes those weights, so by the epilogue the copy has
+    // landed. A read at task start raced the copy and could apply the slot's
+    // previous scale. Resident slots are never written by a copy, so their
+    // scale is read through the non-coherent path at task start, as in the
+    // kernel without the copy, and the load hides behind the main loop. (A
+    // coherent load after the loop on every task cost about 3% of the L2 task
+    // time; pinning the load into the first k-block slowed every task by 2%.)
+    const bool scale_after_loop =
+        kInKernelWeightCopy and local_expert_idx >= eplb_num_resident_experts;
+    const auto load_global_scale = [&](const float* scales) -> float {
+      if (scales == nullptr) return 1.0f;
+      return scale_after_loop ? __ldcg(scales + local_expert_idx)
+                              : __ldg(scales + local_expert_idx);
+    };
+    float task_global_scale = 1.0f;
+    if (not scale_after_loop)
+      task_global_scale = load_global_scale(kBlockIsL2 ? l2_global_scales : l1_global_scales);
+    float l2_global_scale = 1.0f;
     const auto cast_l2_scaled_bf16_pair = [&](float x, float y) -> uint32_t {
       x *= l2_global_scale;
       y *= l2_global_scale;
@@ -1383,6 +1451,12 @@ if (warp_idx < kNumDispatchWarps) {
         }
       }
     }
+
+    // The main loop is done: a redundant expert slot's planes, scales included,
+    // are in place (see `load_global_scale`).
+    if (scale_after_loop)
+      task_global_scale = load_global_scale(kBlockIsL2 ? l2_global_scales : l1_global_scales);
+    if constexpr (kBlockIsL2) l2_global_scale = task_global_scale;
 
     // Skip epilogue when block is past valid M (the GEMM loop already
     // released its pipeline stages). Drain any prior L1 async store.
