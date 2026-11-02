@@ -618,7 +618,8 @@ def l2n_steps(
                 return chunk_kda_det_kcp(
                     q, k, v, g, beta, ctx, use_qk_l2norm_in_kernel=True, **kw
                 )
-            if arm == "S_F":  # flash-linear-attention's norm reads contiguous rows (a no-op unless packed)
+            # flash-linear-attention's norm reads contiguous rows (a no-op unless packed)
+            if arm == "S_F":
                 q, k = q.contiguous(), k.contiguous()
             return chunk_kda_det_kcp(norm(q), norm(k), v, g, beta, ctx, **kw)
 
