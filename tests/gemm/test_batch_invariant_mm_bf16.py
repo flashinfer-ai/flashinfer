@@ -96,6 +96,7 @@ def test_fingerprint_is_a_function_of_the_weight_shape():
     )
     assert bi.fingerprint("mm_bf16", N=128, K=4096).startswith("gemm-bf16-kchunk2-")
     assert bi.fingerprint("mm_bf16", N=64, K=8192).startswith("gemm-bf16-kchunk8-")
+    assert bi.fingerprint("mm_bf16", N=0, K=4096).startswith("gemm-bf16-kfold-")
     assert bi.fingerprint("mm_bf16", N=4096, K=4096) != bi.fingerprint(
         "mm_bf16", N=4096, K=4096 + 16
     )
@@ -111,6 +112,7 @@ def test_chunk_rule_takes_no_m():
 
     assert list(inspect.signature(chunks_for).parameters) == ["N", "K"]
     assert chunks_for(4096, 4096) == 1 and chunks_for(8192, 8192) == 1
+    assert chunks_for(0, 4096) == 1  # an empty weight: no split, as in Lean
     assert (
         chunks_for(128, 4096) == 2
         and chunks_for(64, 8192) == 8
@@ -154,6 +156,18 @@ def test_tactic_encoding_round_trips():
             tuning.knobs_from_tactic(t) == cfg
             and tuning.knobs_from_tactic(list(t)) == cfg
         )
+
+
+def test_cache_key_covers_every_kernel_source():
+    from flashinfer.batch_invariant.jit import relative_sources
+
+    srcs = set(relative_sources("batch_invariant_gemm_bf16"))
+    assert {
+        "gemm/batch_invariant/blocks/compile.py",
+        "gemm/batch_invariant/fixup.py",
+        "gemm/batch_invariant/blocks/kernel.py",
+        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
+    } <= srcs
 
 
 def test_unsupported_device_raises_before_any_kernel():
@@ -394,8 +408,32 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(N, K, layout):
 
 
 @needs_device
+def test_misaligned_a_is_copied_and_keeps_the_bits():
+    # a contiguous view whose base address is two bytes past a 16-byte boundary: a placement, so the same bits
+    M, K, N = 16, 4096, 4096
+    a, b = rnd_bf16(M, K, 111), rnd_bf16(K, N, 112)
+    buf = torch.empty(M * K + 8, dtype=torch.bfloat16, device="cuda")
+    buf[1 : 1 + M * K].copy_(a.flatten())
+    a_off = buf[1 : 1 + M * K].view(M, K)
+    assert a_off.is_contiguous() and a_off.data_ptr() % 16 == 2
+    assert torch.equal(bits(bi_mm(a_off, b)), bits(bi_mm(a, b)))
+    assert torch.equal(bits(bi_mm(a_off[:1], b)), bits(bi_mm(a[:1], b)))
+
+
+@needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     a, b = rnd_bf16(16, 4096, 101), rnd_bf16(4096, 4096, 102)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="K > 0 and N > 0"):
+        bi_mm(a, torch.empty(4096, 0, dtype=torch.bfloat16, device="cuda"))
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="K > 0 and N > 0"):
+        bi_mm(a[:, :0], b[:0])
+    off = torch.empty(4096 * 4096 + 8, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="16-byte-aligned B"):
+        bi_mm(a, off[1 : 1 + 4096 * 4096].view(4096, 4096))
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="16-byte-aligned output"
+    ):
+        bi_mm(a, b, out=off[1 : 1 + 16 * 4096].view(16, 4096))
     with pytest.raises(bi.BatchInvariantUnsupportedError, match='backend="auto"'):
         flashinfer.mm_bf16(a, b, backend="cudnn", batch_invariant=True)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="bias"):

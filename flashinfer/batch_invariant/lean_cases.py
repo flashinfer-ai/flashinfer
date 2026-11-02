@@ -63,6 +63,7 @@ GEMM_OUT_CASES = [
     (64, "f32"),
 ]  # (K, out_fmt): f32 is the split class's partial store
 CHUNK_TABLE_SHAPES = [
+    (0, 4096),  # an empty weight: no split (natural-number division in Lean)
     (64, 64),
     (64, 8192),
     (64, 262144),

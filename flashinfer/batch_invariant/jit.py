@@ -44,6 +44,14 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     ),
 }
 
+#: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer
+#: package: the relative-import closure cannot reach them, so they are keyed explicitly (a missing file is an error).
+MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
+    "batch_invariant_gemm_bf16": (
+        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
+    ),
+}
+
 
 def _in_mode(path: Path) -> bool:
     return any(path == d or d in path.parents for d in MODE_DIRS)
@@ -100,6 +108,11 @@ def module_sources(module: str) -> Tuple[Path, ...]:
             if d in MODE_DIRS or not _in_mode(d):
                 break
             d = d.parent
+    for r in MODULE_EXTRA_SOURCES.get(module, ()):
+        p = (_FI_DIR / r).resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"{module}: cache key source {r} is missing")
+        seen.add(p)
     return tuple(sorted(seen))
 
 

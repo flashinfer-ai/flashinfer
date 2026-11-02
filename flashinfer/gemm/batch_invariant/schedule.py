@@ -37,9 +37,10 @@ def chunks_for(N: int, K: int) -> int:
     (2 * M * K bytes), i.e. C <= K / (16 N); K / C must be a whole number of 16-wide MMA steps (so every chunk is
     exactly a ``kchunk`` fold of the specification) and >= SPLIT_MIN_KC; and no split at all when N alone gives
     enough CTAs. Because the rule takes no M, a narrow weight runs the chunked class at every M, large prefills included
-    (the fp32 partial round trip is then a bounded fraction of the operand traffic). Mirrored by ``BIK.GEMM.chunksFor``
-    in Lean (checked by the generated conformance cases)."""
-    if -(-N // 32) >= SPLIT_MIN_CTAS:
+    (the fp32 partial round trip is then a bounded fraction of the operand traffic). An empty weight (N = 0) has no
+    split, as the Lean mirror's natural-number division gives. Mirrored by ``BIK.GEMM.chunksFor`` in Lean (checked by
+    the generated conformance cases)."""
+    if N <= 0 or -(-N // 32) >= SPLIT_MIN_CTAS:
         return 1
     budget = K // (16 * N)
     C = 1

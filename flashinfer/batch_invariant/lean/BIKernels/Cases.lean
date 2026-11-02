@@ -30,7 +30,7 @@ theorem gemmout2 : (outputKfold "f32" ⟨0⟩ ⟨0⟩ 4).sexpr = "(cvt f32 (mma1
 def gemmOutCases : List (Nat × String) := [(4, "bf16"), (8, "bf16"), (4, "f32")]
 
 /-- `chunks_for(N, K)` as the Python dispatcher computes it; Lean re-derives it. -/
-def chunkTable : List (Nat × Nat × Nat) := [(64, 64, 1), (64, 8192, 8), (64, 262144, 128), (256, 131072, 32), (512, 65536, 8), (1024, 8192, 1), (4096, 4096, 1), (8192, 8192, 1), (8192, 262144, 1), (2048, 2048, 1), (128, 4096, 2)]
+def chunkTable : List (Nat × Nat × Nat) := [(0, 4096, 1), (64, 64, 1), (64, 8192, 8), (64, 262144, 128), (256, 131072, 32), (512, 65536, 8), (1024, 8192, 1), (4096, 4096, 1), (8192, 8192, 1), (8192, 262144, 1), (2048, 2048, 1), (128, 4096, 2)]
 theorem chunk_rule_matches : chunkTable.all (fun ⟨N, K, C⟩ => chunksFor N K == C) = true := by decide
 
 /-! The generator's configuration space at the reference shape (1000, 4096, 4096) (`gemm.generator.enumerate_space`): every knob record, checked against the kernel's static constraints (`ConfigOK`), counted, and the `config_invariance` theorem instantiated on it. -/

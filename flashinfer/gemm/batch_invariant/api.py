@@ -21,6 +21,7 @@ CLASS = "gemm.bf16"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
 MM_BF16_ARCHS = ((10, 0), (10, 3), (10, 7))
 _ALIGN = 8  # bf16 elements per 16 bytes
+_ALIGN_BYTES = 16  # the operand base alignment the kernels assume (TMA)
 
 
 def _layout_of_b(b: torch.Tensor, K: int, N: int) -> str:
@@ -69,20 +70,31 @@ def prepare_operands(
         raise unsupported(
             CLASS, "operands on different devices", "A and B on one device"
         )
+    if K == 0 or N == 0:
+        raise unsupported(
+            CLASS, f"K = {K}, N = {N}", "K > 0 and N > 0 (only M may be empty)"
+        )
     if K % _ALIGN or N % _ALIGN:
         raise unsupported(
             CLASS,
             f"K = {K}, N = {N}",
             f"K and N multiples of {_ALIGN} (16-byte TMA rows)",
         )
-    if a.stride(1) != 1 or a.stride(0) % _ALIGN:
-        # a placement, not numerics: the kernel reads 16-byte-aligned rows (a single row's row stride is immaterial)
+    if a.stride(1) != 1 or a.stride(0) % _ALIGN or a.data_ptr() % _ALIGN_BYTES:
+        # a placement, not numerics: the kernel reads 16-byte-aligned rows from a 16-byte-aligned base (a single
+        # row's row stride is immaterial)
         a = (
             a.as_strided((1, K), (K, 1), a.storage_offset())
-            if (M == 1 and a.stride(1) == 1)
-            else a.contiguous()
+            if (M == 1 and a.stride(1) == 1 and a.data_ptr() % _ALIGN_BYTES == 0)
+            else a.clone(memory_format=torch.contiguous_format)
         )
     b_major = _layout_of_b(b, K, N)
+    if b.data_ptr() % _ALIGN_BYTES:
+        raise unsupported(
+            CLASS,
+            "B at a base address that is not 16-byte aligned",
+            "a 16-byte-aligned B",
+        )
     if out is None:
         out = torch.empty(M, N, dtype=torch.bfloat16, device=a.device)
     else:
@@ -95,6 +107,12 @@ def prepare_operands(
         if out.device != a.device:
             raise unsupported(
                 CLASS, "out on another device", "the output on A's device"
+            )
+        if out.data_ptr() % _ALIGN_BYTES:
+            raise unsupported(
+                CLASS,
+                "out at a base address that is not 16-byte aligned",
+                "a 16-byte-aligned output",
             )
         if out.stride(1) != 1 or (M > 1 and out.stride(0) != N):
             raise unsupported(
