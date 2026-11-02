@@ -1,46 +1,16 @@
-"""Physics-informed cost model of the bf16 GEMM records: the dispatcher of `mm_bf16(batch_invariant=True)`.
+"""Cost model of the bf16 GEMM records: the dispatcher behind `mm_bf16(batch_invariant=True)`.
 
-For one knob record at one shape the model predicts the device time (us) from the hardware's structure and a handful of fitted
-constants; `rank` evaluates a whole configuration space at once (numpy, a few ms for 720 records) and `schedule.default_config`
-takes the argmin. Nothing here reaches the bits: every record of the space computes the class (R3), the model only orders them.
+For one knob record at one shape the model predicts the device time (us) from the part's structure (`Arch`) and fitted
+constants (`Fit`); `rank` evaluates a whole configuration space at once and `schedule.default_config` takes the argmin.
+Nothing here reaches the bits: every record of the space computes the class (R3), the model only orders them.
 
-Terms (per record; the symbols are the fields of `Arch` and `Fit`):
+The time is a soft maximum of four bounds -- the per-CTA tile time (waves of tiles, each the slowest of the MMA, TMA,
+smem and latency paths per k-tile, plus the epilogue), the HBM traffic under the persistent raster's L2 footprint rule,
+the L2 -> SM traffic, and the small-M hot-line bound -- plus the launch floor and, for the workspace split, the fixup node.
 
-* **tiles and waves**: the MMA tile is `tile_m x tile_n` (two CTAs of `tile_m / 2` rows for the 2-CTA instruction); the scheduler's
-  unit is a cluster tile of `cm x cn` CTAs; the persistent grid holds `P = SM // (cm cn)` clusters and a CTA runs `waves = ceil(units / P)`
-  tiles in turn (the split class's workspace record has `C` units per output tile; the in-CTA record folds the `C` chunks on one CTA).
-* **per k-tile time** (one 128-byte smem stage = `inner` instruction K-steps): the largest of the instruction time
-  (`2 ctm ctn k / (flop_per_clk x f x mma_eff)`, with a minimum per instruction for the small tiles the issue rate bounds), the TMA
-  path -- the bytes this CTA's TMA unit fetches from L2 (its multicast share: `A / cn + B / pairs_m`) over `fetch_gbps` plus the
-  per-k-tile issue and mbarrier hand-shake cost (`ktile_ns`, `ktile_2cta_ns` for the pair's cross-CTA hand-shake; `cl4_ns` on top for
-  clusters of four or more CTAs, whose multicast fan-in is not hidden) plus the zero-fill of the A box's rows past M (`oob_gbps`: the
-  decode regime's dominant per-CTA cost, split among an N-cluster's CTAs), the smem ingress
-  of the whole stage and the smem bandwidth the stage's writes share with the MMA's operand reads (`smem_gbps`: a wide 1-CTA tile is bound
-  there, the 2-CTA pair of the same CTA tile is not) -- (`(A + B) / ingress`; the `n` layout's MN-major B box with rows under 128 B pays `nmajor_pen`), and the ring's
-  refill under memory latency (Little's law: `latency / stages`, the stage count from the smem budget as `StaticPlan._stages` forms
-  it). Ghost units: the scheduler rounds the cluster grid up to the swizzle along the raster's minor axis and a cluster spans
-  `cm x cn` tiles, so one-M-tile problems run ghost CTAs on zero-filled A at full cost (the decode pathologies of the measurements).
-* **epilogue**: `ctm ctn out_bytes / epi_gbps + tile_us` per tile (TMEM -> registers -> smem -> TMA store, the scheduler step); it
-  overlaps the next tile's mainloop when two TMEM accumulator stages exist, and is serialised when one does (the in-CTA chunk fold's
-  running sum at tile N 256 / 64-row tiles); the in-CTA fold adds one TMEM read + write pass per chunk.
-* **aggregate bounds**: the L2 -> SM traffic (`units x k-tiles x (A / cn + B / pairs_m)` bytes: multicast shares the L2 reads, not the
-  ingress) against `l2_tbps`, and the HBM traffic against `hbm_eff x hbm_tbps`. HBM bytes follow the persistent raster: with raster
-  along M and swizzle `s` the tile sequence walks all M for `s` N-columns of clusters (a group), so the walked operand (A) is streamed
-  once per group pass -- the groups a wave spans share a pass -- and every pass after the first misses the L2 for the part of
-  (A + the group's B) that does not fit `l2_frac` of it (the cyclic re-use distance is the operand); the group's fixed operand (B) is read
-  once per group and re-read every wave of the group only when it does not stay resident next to the wave's walked footprint
-  (transposed for raster along N); plus the output, the split class's fp32 partials out and back and the fixup node's own floor.
-* **the hot-line bound** of small M: the A box fetches only its valid rows (a 128-byte line per row per k-tile), and with M rows the
-  machine's A requests land on M lines, i.e. M L2 home slices (`hot_gbps` each); at M = 1 every CTA's A fetch is served by one slice,
-  so decode time grows with the number of tiles and the A multicast of the N-clusters is what relieves it.
-* `time = launch + p-norm(fill + waves x tile time + the last epilogue, HBM, L2 (hits + `miss_cost` x misses), hot lines)` -- a soft
-  maximum (`softmax_p`): bounds of similar size interfere (an HBM-heavy raster slows a compute-bound tile) -- times a cluster-coupling
-  penalty per extra CTA, plus the fixup node for the workspace split.
-
-Structural (never re-fitted): the instruction rates per clock, the tile geometry, the stage counts, the raster / footprint rule, the
-TMEM stage rule. Fitted per architecture family on full-space CUPTI sweeps (every record of the space timed at every point of an
-M x (N, K) grid, both weight layouts): the `Fit` constants, stored in `cost_model_fits.json` per family. `Arch` holds the part's
-structural numbers (the SM count is a parameter within a family); an entry marked ``placeholder`` carries public figures only.
+Every numeric constant in this file (the `Arch` entries, the `Fit` defaults, `DECODE_M`) and every value in
+`cost_model_fits.json` is empirical: chosen or fitted from timings of these kernels on the parts, not derived from first
+principles. The fits are stored per architecture family; the SM count is a parameter within a family.
 """
 
 from __future__ import annotations
@@ -61,51 +31,36 @@ from .spec import ELEM_BITS, MMA_K
 
 @dataclass(frozen=True)
 class Arch:
-    """Structural numbers of a part. ``flop_per_clk_sm`` is the dense bf16 rate of one SM's tensor core (tcgen05 kind::f16).
-    ``hbm_tbps`` is the measured copy bandwidth where known (the nominal figure otherwise, marked by
-    ``placeholder``). ``family`` is the architecture generation whose fitted constants (`Fit`, keyed by family in
-    `cost_model_fits.json`) apply: the per-SM constants are the generation's, the SM count is a parameter of the part."""
+    """A part's numbers (empirical). ``family`` keys the fitted constants in `cost_model_fits.json`; ``placeholder`` marks a
+    part whose numbers are public figures only."""
 
     name: str
     sm_count: int
-    clock_ghz: float  # sustained SM clock under a GEMM load
+    clock_ghz: float  # sustained SM clock under load
     flop_per_clk_sm: int = 8192  # dense bf16 FLOP / clk / SM
-    hbm_tbps: float = 9.1  # measured 2-8 GB copy bandwidth on this part (7.0 nominal)
+    hbm_tbps: float = 9.1  # copy bandwidth, TB/s
     l2_bytes: int = 112 << 20
-    smem_bytes: int = 334848  # cutlass.memory.get_smem_capacity_in_bytes() on sm_107a: what StaticPlan budgets against
-    tmem_cols: int = 512  # the dense body plans the 512-column TMEM (sm_107 has 576)
+    smem_bytes: int = 334848  # shared memory per CTA the kernel plans against (`cutlass.memory.get_smem_capacity_in_bytes`)
+    tmem_cols: int = 512  # TMEM columns the kernel plans against
     placeholder: bool = False
     family: str = "sm_107"  # the fit's key (sm_107 / sm_100 / sm_103)
 
 
-# The parts the dispatcher serves: Rubin NVL8 (sm_107, 204 SMs), Vera Rubin NVL72 (sm_107, 224),
-# B200 (sm_100, 148), GB200 (sm_100, 152), B300 (sm_103, 148), GB300 (sm_103, 152). Within a family the SM count is the only
-# difference the model sees (`P = SM // cluster`, the waves, the hot-line and aggregate bounds); the family carries the fitted
-# per-SM constants and the part the memory-system numbers. The first entry of a family is its canonical part (the one measured).
-# sm_100 numbers: 148 SMs, max SM clock 1.83 GHz; the sustained rate under a GEMM load is what the B200 sweep measured: the best
-# record of the heatmap grid reaches 1.61 PF = 148 x 8192 x 1.55 GHz x 0.85 (the bf16 instruction efficiency), so 1.55 GHz is the
-# clock the per-SM constants carry over at (the part throttles further over a 32768-row point); HBM3e 8 TB/s nominal (7.4
-# measured-class), 126 MB L2, 228 KB smem (232448 B as the DSL budgets it), 512 TMEM columns; sm_103 (B300 / GB300) the same memory
-# system at the same SM counts, public figures only (placeholder until measured; its fit falls back to sm_100's).
+# The parts, as (family, SM count); the SM count is the only difference the model sees within a family.
 _SM100 = dict(clock_ghz=1.55, hbm_tbps=7.4, l2_bytes=126 << 20, smem_bytes=232448)
 ARCHS: Dict[str, Arch] = {
-    # Rubin NVL8 (SM107): 204 SMs, 112 MB L2; the 256x256 2-CTA mainloop sustains 36 TFLOP/s per pair at 16384 x 8192^2
-    # (`mma_eff` x 8192 FLOP / clk / SM x 2.3 GHz)
     "sm_107": Arch("sm_107", 204, 2.3),
-    # Vera Rubin NVL72 (SM107): 224 SMs, otherwise the same part (the fit's constants carry over; the SM count is a parameter)
     "sm_107_224": Arch("sm_107_224", 224, 2.3),
-    "sm_100": Arch("sm_100", 148, family="sm_100", **_SM100),  # B200 (measured)
-    "sm_100_152": Arch("sm_100_152", 152, family="sm_100", **_SM100),  # GB200
-    "sm_103": Arch("sm_103", 148, family="sm_103", placeholder=True, **_SM100),  # B300
-    "sm_103_152": Arch(
-        "sm_103_152", 152, family="sm_103", placeholder=True, **_SM100
-    ),  # GB300
+    "sm_100": Arch("sm_100", 148, family="sm_100", **_SM100),
+    "sm_100_152": Arch("sm_100_152", 152, family="sm_100", **_SM100),
+    "sm_103": Arch("sm_103", 148, family="sm_103", placeholder=True, **_SM100),
+    "sm_103_152": Arch("sm_103_152", 152, family="sm_103", placeholder=True, **_SM100),
 }
 FAMILY_OF_CC = {(10, 0): "sm_100", (10, 3): "sm_103", (10, 7): "sm_107"}
 FIT_FALLBACK = {
     "sm_103": "sm_100",
     "sm_100": "sm_107",
-}  # a family without its own fit takes its nearest measured relative's
+}  # a family without its own fit takes the nearest family's
 
 
 def family_of(cc: Tuple[int, int]) -> str:
@@ -121,7 +76,7 @@ def arch_for(
     """The part the dispatcher models: by name; else the ``family`` (the operand device's, `family_of`; sm_107 when not given) at
     ``sm_count`` SMs (204 when not given). A (family, SM count) with an entry in `ARCHS` is that part; any other count is the
     family's canonical part with the SM count replaced (an emulated SKU: `name = <family>_<count>`, e.g. ``sm_107_148`` for a
-    148-SM grid cap on a Rubin part) -- the measured override cells of a part never apply to it, only the model does."""
+    148-SM grid cap)."""
     if name:
         return ARCHS[name]
     family = family or "sm_107"
@@ -139,47 +94,40 @@ def arch_for(
 
 @dataclass(frozen=True)
 class Fit:
-    """The empirical constants (fitted per architecture family; the defaults are first-principles
-    guesses that the entries of `cost_model_fits.json` replace). Two kinds: **per-SM physics** -- the instruction efficiency
-    (`mma_eff`, `inst_min_clk`), the per-CTA TMA path (`ktile_ns`, `ktile_2cta_ns`, `fetch_gbps`, `ingress_gbps`,
-    `smem_gbps`, `nmajor_pen`), the ring's latency (`latency_us`), the epilogue (`epi_gbps`, `tile_us`, `fill_us`) and the
-    cluster coupling (`cluster_pen`) -- which carry across the parts of a family and, measured on the B200, across the two
-    generations within ~25 % (the SM count enters only through the structure: P, waves, aggregate demand); and **part-level**
-    -- the aggregate L2 (`l2_tbps`, `hot_gbps`, `l2_frac`, `miss_cost`), the HBM efficiency (`hbm_eff`), the launch and fixup
-    floors (`launch_us`, `fixup_us`), the bounds' interference (`softmax_p`), the cluster-of-four fan-in (`cl4_ns`: 31 ns on
-    sm_107, 12.5 on the B200) and the TMA zero-fill rate (`oob_gbps`: 41 vs 81 GB/s) -- which a part re-fits."""
+    """The fitted constants (all empirical; the defaults are placeholders that the entries of `cost_model_fits.json`
+    replace). Per-SM constants carry across the parts of a family; part-level ones (the aggregate L2, the HBM efficiency,
+    the launch and fixup floors, `softmax_p`, `cl4_ns`, `oob_gbps`) are fitted per family."""
 
-    mma_eff: float = 0.92  # sustained fraction of the instruction rate in a long mainloop (kind::f16)
-    inst_min_clk: float = 18.0  # the smallest time one tcgen05.mma takes, in SM clocks (issue-bound narrow tiles; a per-SM constant
-    # that carries across clocks: sm_107 8.1 clk = 3.5 ns at 2.3 GHz, the B200's fit 7.9 clk = 5.1 ns at 1.55 GHz)
-    ktile_ns: float = 60.0  # per k-tile per CTA: TMA issue + mbarrier hand-shakes, serial with the fetch on the TMA path
-    ktile_2cta_ns: float = 60.0  # the same on the 2-CTA instruction (the pair's hand-shake overlaps the MMA in steady state)
-    fetch_gbps: float = 140.0  # per-SM TMA fetch from L2 (the bytes this CTA's TMA unit requests: its multicast share), GB/s
-    hot_gbps: float = 120.0  # L2 bandwidth of ONE line's home slice: at small M every CTA fetches the same few A lines per k-tile
-    oob_gbps: float = 70.0  # the TMA engine's zero-fill rate for out-of-bounds box rows (the A tile's rows past M; per issuing CTA)
-    cl4_ns: float = 70.0  # per k-tile cost of a cluster of four or more CTAs (the multicast fan-in / slot-release hand-shake is not hidden)
-    miss_cost: float = 2.0  # L2 bandwidth consumed per byte that misses to HBM (the fill and its read), on top of the hit traffic
-    softmax_p: float = 3.0  # the aggregate bounds combine as a p-norm (p -> inf: a pure max; finite: HBM traffic slows a compute-bound tile)
-    ingress_gbps: float = 220.0  # per-SM smem ingress (every byte that lands in this CTA's ring, multicast or not), GB/s
-    smem_gbps: float = 300.0  # per-SM smem bandwidth shared by the TMA's writes and the MMA's operand reads (~128 B/clk): the 1-CTA
-    # 128x256 tile reads 12 KB per instruction from ONE CTA's smem where the 2-CTA 256x256 pair reads 8 KB
-    # per CTA -- measured 1.3x slower at M = 32768 with the same MMA, ingress and L2 figures (2026-10-31)
+    mma_eff: float = 0.92  # sustained fraction of the MMA instruction rate
+    inst_min_clk: float = 18.0  # minimum time of one tcgen05.mma, in SM clocks
+    ktile_ns: float = 60.0  # per k-tile per CTA: TMA issue + mbarrier hand-shakes
+    ktile_2cta_ns: float = 60.0  # the same for the 2-CTA instruction
+    fetch_gbps: float = 140.0  # per-SM TMA fetch from L2 (this CTA's multicast share)
+    hot_gbps: float = 120.0  # L2 bandwidth of one line's home slice (the small-M bound)
+    oob_gbps: float = 70.0  # TMA zero-fill rate of out-of-bounds A rows
+    cl4_ns: float = 70.0  # per k-tile cost of a cluster of four or more CTAs
+    miss_cost: float = (
+        2.0  # L2 bandwidth per byte that misses to HBM, on top of the hit traffic
+    )
+    softmax_p: float = 3.0  # the bounds combine as a p-norm (p -> inf: a pure max)
+    ingress_gbps: float = 220.0  # per-SM smem ingress of the stage
+    smem_gbps: float = 300.0  # per-SM smem bandwidth shared by the stage's writes and the MMA's operand reads
     l2_tbps: float = 28.0  # aggregate L2 -> SM bandwidth, TB/s
     hbm_eff: float = 0.85  # fraction of the copy bandwidth a streaming GEMM reaches
-    latency_us: float = 1.3  # memory latency behind the ring (Little's law)
-    launch_us: float = (
-        3.0  # kernel floor: graph-node launch, prologue (TMEM alloc, barriers), tail
-    )
+    latency_us: float = 1.3  # memory latency behind the ring
+    launch_us: float = 3.0  # kernel floor: launch, prologue, tail
     fill_us: float = 0.7  # the first stage's latency per persistent CTA
     tile_us: float = (
         0.25  # per tile: scheduler step, accumulator hand-off, store commit
     )
-    epi_gbps: float = 120.0  # epilogue bandwidth per SM (TMEM -> RF -> smem -> TMA store), output bytes
+    epi_gbps: float = (
+        120.0  # epilogue bandwidth per SM (TMEM -> registers -> smem -> TMA store)
+    )
     fixup_us: float = 2.5  # the split class's fixup node: launch gap + its own floor
     cluster_pen: float = 0.02  # coupling penalty per extra CTA in the cluster
     l2_frac: float = 0.8  # usable fraction of the L2 for the residency rule
-    nmajor_pen: float = 1.2  # residual multiplier on the line-granular B traffic of the `n` layout when the B box row is under 128 bytes
-    two_cta_gain: float = 1.0  # per-k-tile time multiplier of the 2-CTA instruction (< 1: one issue for 256 rows)
+    nmajor_pen: float = 1.2  # multiplier on the line-granular B traffic of the `n` layout when the B box row is under 128 bytes
+    two_cta_gain: float = 1.0  # per-k-tile time multiplier of the 2-CTA instruction
 
 
 FITS_PATH = os.path.join(os.path.dirname(__file__), "cost_model_fits.json")
@@ -200,9 +148,7 @@ FITS: Dict[str, Fit] = _load_fits()
 
 
 def fit_for(arch: Arch) -> Fit:
-    """The part's fitted constants: its family's entry of `cost_model_fits.json` (the SM count is a parameter of the structure, the
-    per-SM constants carry across the family's parts), else the nearest measured family's (`FIT_FALLBACK`), else the first-principles
-    defaults."""
+    """The family's entry of `cost_model_fits.json`, else the nearest family's (`FIT_FALLBACK`), else the defaults."""
     fam: Optional[str] = arch.family
     while fam:
         if fam in FITS:
@@ -282,10 +228,8 @@ def predict_arrays(
     nchunk_cta = np.where(a["cc"] & split, chunks, 1.0)
     Kc = K / chunks
 
-    # tiles, cluster units, waves. The persistent scheduler rounds the cluster grid up to the swizzle along the raster's minor axis
-    # (`PersistentTileSchedulerParams`: `round_up(shape, (1, s, 1))` for raster m, `(s, 1, 1)` for raster n), so a problem with one M
-    # tile and raster n at swizzle 8 runs 8 "ghost" cluster rows whose CTAs stream zero-filled A and the real B at full cost; likewise a
-    # cluster of 4 along M at one M tile runs 3 ghost CTAs. Every unit, ghost or not, costs a tile time.
+    # tiles, cluster units, waves: the scheduler rounds the cluster grid up to the swizzle along the raster's minor axis, so
+    # ghost units (zero-filled A) cost a tile time like real ones
     m_tiles = np.ceil(M / a["tm"])
     n_tiles = np.ceil(N / ctn)
     m_cl = np.ceil(m_tiles / pairs_m)
@@ -308,8 +252,7 @@ def predict_arrays(
     t_mma_kt = inner * t_inst * np.where(two, fit.two_cta_gain, 1.0)
     a_stage = ctm * kb * elem
     b_stage = ctn * kb * elem / cta_div
-    # the `n` layout's B box is kb K-rows of ctn x elem bytes: a row narrower than a 128-byte line still costs the line (and the TMA
-    # engine a request), so the narrow tiles' B traffic is counted at line granularity times a fitted residual penalty
+    # the `n` layout's B box: a row narrower than a 128-byte line still costs the line (times a fitted penalty)
     b_row = ctn * elem / cta_div
     b_eff = np.where(
         (b_major == "n") & (b_row < 128), kb * 128.0 * fit.nmajor_pen, b_stage
@@ -329,10 +272,7 @@ def predict_arrays(
     t_ingress_kt = (
         a_stage + b_eff
     ) / fit.ingress_gbps  # bytes / (GB/s) = ns: every byte landing in the ring
-    # the smem bandwidth is shared by the TMA's writes (the stage) and the MMA's operand reads: per instruction the unit reads the CTA's
-    # A rows and its share of the B columns (the pair's second CTA holds the other half), `inner` instructions per k-tile. A wide 1-CTA
-    # tile (128x256: 12 KB per instruction + 48 KB of stage per k-tile) is bound here while the 2-CTA pair of the same CTA tile (8 KB +
-    # 32 KB) is MMA-bound: the mechanism behind the pair's 1.3x at M = 32768 that the ingress and L2 terms alone could not order
+    # smem bandwidth shared by the stage's writes and the MMA's operand reads (`inner` instructions per k-tile)
     mma_reads = inner * inst_k * elem * (ctm + ctn / cta_div)
     t_smem_kt = (a_stage + b_eff + mma_reads) / fit.smem_gbps
     t_fetch_kt = (
@@ -340,8 +280,7 @@ def predict_arrays(
     ) / fit.fetch_gbps  # the bytes this CTA's TMA unit requests (multicast shares)
     t_lat_kt = fit.latency_us * 1e3 / stages
     ktile = np.where(two, fit.ktile_2cta_ns, fit.ktile_ns)
-    # the A box's rows past M are zero-filled by the issuing CTA's TMA engine at a modest rate (the decode measurements: a 64-row box with one
-    # valid row costs ~8 KB of fill per k-tile; the N-cluster splits the box among its CTAs; the pair's second CTA fills its whole box)
+    # zero-fill of the A box's rows past M, split among an N-cluster's CTAs
     oob_rows = np.where(
         two,
         np.where(ctm >= M, ctm, np.maximum(0.0, 2 * ctm - M)),
@@ -349,8 +288,7 @@ def predict_arrays(
     )
     oob_rows = np.minimum(oob_rows, ctm)
     t_oob_kt = oob_rows * 128.0 / cn / fit.oob_gbps
-    # the TMA path pays its per-k-tile issue, zero-fill and hand-shake cost serially with its fetch; the MMA path hides it; a cluster of
-    # four or more CTAs pays its fan-in hand-shake per k-tile on top (measured +20-50 % at the compute-bound shapes against the pair)
+    # the TMA path pays its per-k-tile costs serially with its fetch; clusters of four or more pay their fan-in on top
     t_kt = np.maximum.reduce(
         [t_mma_kt, t_fetch_kt + t_oob_kt + ktile, t_ingress_kt, t_smem_kt, t_lat_kt]
     ) + np.where(cl >= 4, fit.cl4_ns, 0.0)
@@ -367,7 +305,7 @@ def predict_arrays(
     )
     t_cta = fit.fill_us + waves * t_tile + t_epi
 
-    # aggregate traffic: L2 -> SM (multicast shares the reads), HBM (the raster's footprint rule)
+    # aggregate traffic: L2 -> SM (multicast shares the reads) and HBM (the raster's footprint rule)
     l2_bytes = units * cl * k_tiles * (a_stage / cn + b_stage / pairs_m)
     rows_cl = a["tm"] * pairs_m
     cols_cl = ctn * cn
@@ -400,22 +338,17 @@ def predict_arrays(
     group_fp = (
         np.minimum(s, min_cl) * fix_dim * K_unit * elem
     )  # one group's fixed operand
-    # the walked operand is streamed once per group pass; the groups a wave spans share the pass, so passes = min(groups, waves); a
-    # pass after the first misses the L2 for the part of (operand + group) that does not fit (the cyclic re-use distance is the operand)
+    # the walked operand streams once per group pass; a pass after the first misses the L2 for what does not fit
     passes = np.minimum(n_groups, waves)
     miss_frac = np.clip(
         (walked_total + group_fp - l2_eff) / np.maximum(walked_total, 1.0), 0.0, 1.0
     )
     walked_hbm = walked_total * (1.0 + (passes - 1.0) * miss_frac)
-    # a group's fixed operand is read when the group starts and stays resident across the group's waves when it fits next to the
-    # wave's walked footprint; otherwise every wave of the group reads it again
+    # a group's fixed operand stays resident across the group's waves when it fits next to the walked footprint
     fixed_hbm = fixed_total * np.where(
         group_fp + walk_fp <= l2_eff, 1.0, waves_per_group
     )
-    # the workspace split: the chunk is the scheduler's outermost (batch) coordinate, so the grid walks chunk 0's tiles, then chunk 1's
-    # ... -- each chunk a GEMM of its own K slice (K_unit = Kc above: the footprint rule already prices one chunk's passes and groups),
-    # and the C chunks' slices are distinct data, so the operand traffic is the per-chunk figure times C (monotone in the SM count,
-    # unlike a rule over the wave's footprint across chunks, which predicted a 204-SM part slower than a 148-SM one at a split shape)
+    # the workspace split walks one chunk's tiles after another: the per-chunk footprint rule times C
     units_c = (
         m_cl * n_cl
     )  # one chunk's units: the passes and groups of one chunk's walk
@@ -442,10 +375,7 @@ def predict_arrays(
     t_l2 = (l2_bytes + fit.miss_cost * hbm_bytes) / (
         fit.l2_tbps * 1e6
     )  # misses cost the L2 their fill and their read
-    # the hot-line bound of small M: every A box fetches the tile's VALID rows (one 128-byte line per row per k-tile; the zero-filled
-    # rows cost nothing in L2), and with M rows the whole machine's A requests land on M lines -- M home slices -- per k-tile, so at
-    # M = 1 every CTA's A fetch is served by one slice (the decode measurements: time ~ number of tiles for the narrow tiles; the A multicast
-    # of the N-clusters divides the requests, the M-clusters' B multicast does not)
+    # the hot-line bound: with M valid rows the machine's A requests land on M L2 home slices per k-tile
     a_rows_valid = np.minimum(M, ctm)
     a_req_bytes = units * (cl / cn) * k_tiles * a_rows_valid * 128.0
     hot_rate = np.minimum(
@@ -540,14 +470,12 @@ def explain(
 
 # ----------------------------------------------------------------------------- the dispatcher's entry
 
-DECODE_M = 64  # up to this many rows the candidate set is the decode-sane subset below
+DECODE_M = 64  # up to this many rows the candidates are the `decode_sane` subset
 
 
 def decode_sane(k: Knobs, M: int) -> bool:
-    """The dispatcher's candidate guard at M <= DECODE_M (a heuristic, not a space change): the measurements found, at every decode
-    point, the best record among the 1-CTA tiles of N >= 32 in an N-cluster (1x1 / 1x2 / 1x4) at swizzle 1; the 2-CTA pair with one
-    valid row, the clusters along M, the 8 / 16-wide tiles and the swizzled rasters were 1.5-10x slower (the hot A lines and the
-    per-tile costs, whose magnitudes the model reproduces only qualitatively). Records outside the guard stay members of the space."""
+    """The candidate guard at M <= DECODE_M (a heuristic, not a space change): 1-CTA tiles of N >= 32 in an N-cluster at
+    swizzle 1. Records outside the guard stay members of the space."""
     if M > DECODE_M:
         return True
     return (
@@ -571,9 +499,8 @@ def rank(
     arch_name: Optional[str] = None,
     topk: Optional[int] = None,
 ) -> Tuple[Tuple[Knobs, float], ...]:
-    """The records of the class's enumerated space (`generator.enumerate_space`: the knob product the body accepts for the shape and
-    layout; at M <= DECODE_M the `decode_sane` subset) ordered by predicted time, best first; ``topk`` truncates. Cached per argument
-    tuple (the dispatcher calls it per mm)."""
+    """The records of the class's enumerated space for the shape and layout (at M <= DECODE_M the `decode_sane` subset) ordered
+    by predicted time, best first; ``topk`` truncates. Cached per argument tuple."""
     from .generator import enumerate_space
 
     arch = arch_for(sm_count, arch_name, family)

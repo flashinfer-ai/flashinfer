@@ -71,9 +71,6 @@ exclude = [
   "flashinfer-cubin*",
   "flashinfer.experimental.b12x._compat*",
   "flashinfer.prims_ts.moe.tools*",
-  # The Lean project of the batch-invariant mode (proofs, run by tests/batch_invariant/test_lean.py where a toolchain is
-  # installed; never shipped). The directory holds no __init__.py and no package-data entry names it, so this line
-  # documents the intent rather than adds a rule.
   "flashinfer.batch_invariant.lean*",
 ]
 

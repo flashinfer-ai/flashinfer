@@ -212,6 +212,3 @@ flashinfer/moe_ep/backends/split/comm/nixl_ep/_vendored/
 .sqsh_build_logs/
 *.sqsh
 .fi_workspace/
-
-# Lean build directory of the batch-invariant mode's proofs
-flashinfer/batch_invariant/lean/.lake/

@@ -750,6 +750,7 @@ def mm_bf16(
         "cute-dsl",
         "auto",
     ] = "cudnn",
+    *,
     batch_invariant: bool = False,
 ) -> torch.Tensor:
     r"""MM BF16

@@ -67,7 +67,7 @@ CTA_CHUNKS_MAX_TN = 256
 @dataclass(frozen=True)
 class Knobs:
     """One point of the generator's configuration space. Field layout, equality and ``describe()`` are stable:
-    they key the dispatcher's overrides and the compiled-kernel cache."""
+    they key the compiled-kernel cache."""
 
     mma_tiler_mn: Tuple[int, int] = (256, 256)
     cluster_shape_mn: Tuple[int, int] = (2, 1)
