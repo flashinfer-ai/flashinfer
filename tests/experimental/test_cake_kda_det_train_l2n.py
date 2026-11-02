@@ -928,6 +928,86 @@ def test_l2n_fused_equals_the_fallback_route(shape) -> None:
         assert _bits(a).equal(_bits(b)), "replay"
 
 
+@pytest.mark.parametrize("raw_gate", [False, True], ids=["g", "raw"])
+@pytest.mark.parametrize(
+    "shape", SHAPES_L2N[:4], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}"
+)
+def test_l2n_fallback_route_matches_the_exact_reference(
+    shape, raw_gate: bool, l2n_hook: dict
+) -> None:
+    """The force-fallback route alone (token-local normalize / apply, the GLM intra capture forms, the pullback),
+    runnable before the fused records ship: the forward's rstd / qn / kn are bitwise the shared reference's, the
+    saved-set backward's qn / kn are the forward's, out and every gradient pass the declared elementwise gate against
+    the exact FP64 layer, and the replay and a repeat give the saved-set backward's bits."""
+    device = _l2n_device("fallback")
+    lengths, H = shape
+    inputs = _l2n_inputs(lengths, H, device, raw_gate=raw_gate)
+    S, N = sum(lengths), len(lengths)
+    ws = cake_backend.KdaDetWorkspace.for_problem(
+        S, N, H, device, gate="raw" if raw_gate else "g", l2n="fallback"
+    )
+    assert ws.l2n == "fallback" and ws.plan.dispatched("qk_pullback", "light")
+    out, saved = _fwd(inputs, raw_gate, workspace=ws)
+    fwd = {n: l2n_hook[f"fwd.{n}"].cpu() for n in ("qn", "kn", "qk_rstd")}
+    grads = _bwd(inputs, saved, raw_gate, workspace=ws)
+    torch.cuda.synchronize(device)
+    i = inputs
+    qn_ref, rq_ref = ref_l2n.qk_l2norm(i["q"].cpu())
+    kn_ref, rk_ref = ref_l2n.qk_l2norm(i["k"].cpu())
+    assert _bits(fwd["qn"]).equal(_bits(qn_ref)) and _bits(fwd["kn"]).equal(
+        _bits(kn_ref)
+    )
+    assert _bits(fwd["qk_rstd"]).equal(_bits(torch.stack((rq_ref, rk_ref))))
+    assert _bits(saved.qk_rstd.cpu()).equal(_bits(fwd["qk_rstd"]))
+    for name in ("qn", "kn"):
+        assert _bits(l2n_hook[f"bwd.{name}"].cpu()).equal(_bits(fwd[name])), name
+    if raw_gate:
+        ref_out, ref = ref_l2n.kda_exact_raw_l2n_with_grads(
+            i["q"],
+            i["k"],
+            i["v"],
+            i["g"],
+            i["beta"],
+            i["A_log"],
+            i["dt_bias"],
+            i["dout"],
+            i["cu_seqlens"],
+            cake_backend.SCALE,
+            LOWER_BOUND,
+        )
+        names = ("dq", "dk", "dv", "dbeta", "dg", "dA_log", "ddt_bias")
+    else:
+        ref_out, ref = ref_l2n.kda_exact_l2n_with_grads(
+            i["q"],
+            i["k"],
+            i["v"],
+            i["g"],
+            i["beta"],
+            i["dout"],
+            i["cu_seqlens"],
+            cake_backend.SCALE,
+        )
+        names = ("dq", "dk", "dv", "dbeta", "dg")
+    candidates = {"out": out, **dict(zip(names, grads, strict=True))}
+    references = {"out": ref_out, **ref}
+    failures = []
+    for name, cand in candidates.items():
+        r = references[name].reshape(cand.shape)
+        gate = elementwise_gate(cand, r, ATOL, RTOL)
+        if not gate["pass"]:
+            failures.append((name, gate, error_metrics(cand, r)))
+    assert not failures, failures
+    ref_grads = [g.clone() for g in grads]
+    replay = _bwd(inputs, None, raw_gate, workspace=ws)
+    assert l2n_hook["bwd.path"] == "replay"
+    out2, saved2 = _fwd(inputs, raw_gate, workspace=ws)
+    assert _bits(out2).equal(_bits(out))
+    repeat = _bwd(inputs, saved2, raw_gate, workspace=ws)
+    for tag, other in (("replay", replay), ("repeat", repeat)):
+        for a, b in zip(ref_grads, other, strict=True):
+            assert _bits(a).equal(_bits(b)), tag
+
+
 def test_l2n_refusals_on_device() -> None:
     """Saved sets and workspaces of the other mode are refused; flag-off workspaces refuse flag-on calls."""
     device = _l2n_device()
