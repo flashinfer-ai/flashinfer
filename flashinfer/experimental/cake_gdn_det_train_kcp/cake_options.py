@@ -155,8 +155,9 @@ TEST_KNOBS: dict[str, tuple[Any, ...] | None] = {
         True,
     ),  # use_qk_l2norm_in_kernel: keep qn / kn / rstd copies (and regen rstd == saved) in LAST_CALL for the oracles
     # 1 = the summaries' offset walk (#2 offset / FP32-class #3) runs on a side stream concurrently with the #3 transfer
-    # walk (fork / join with CUDA events; same launches, arguments and outputs); 0 = one stream (shipped)
-    "walk_pair": (0, 1),
+    # walk (fork / join with CUDA events; same launches, arguments and outputs); 0 = one stream; None (shipped) = auto:
+    # on for zigzag partitions of <= 8 ranks on sm_100a / sm_103a (cake_kcp._walk_pair_enabled)
+    "walk_pair": (None, 0, 1),
 }
 TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "schedule": SCHEDULE_DEFAULT,
@@ -169,7 +170,7 @@ TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "fwdh_vh": None,
     "dhu_vh": None,
     "record_qk": False,
-    "walk_pair": 0,
+    "walk_pair": None,
 }
 
 

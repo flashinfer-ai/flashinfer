@@ -52,8 +52,9 @@ again go to the owners (``b1``); the owner walks each chain backwards
 fragment's ``dS_out`` (``b2``); the adjoint tape walk (#7 ``program=tape``)
 runs from it; ``bwd_dqkg`` (#8, the FP32 group reduction of the ``r`` value
 heads' ``dq`` / ``dk`` fused) and ``gate_epilogue`` (#9) finish the gradients.
-One compute stream (test knob ``walk_pair=1`` on a zigzag / zigzag-per-document partition of at most 8 ranks: the
-summaries' offset walk on a side stream beside the transfer walk, fork / join with CUDA events); the collectives are asynchronous on the caller's process
+One compute stream (on ``sm_100a`` / ``sm_103a`` with a zigzag / zigzag-per-document partition of at most 8 ranks: the
+summaries' offset walk on a side stream beside the transfer walk, fork / join with CUDA events, :func:`_walk_pair_enabled`);
+the collectives are asynchronous on the caller's process
 group and waited at their first consumer; the issue order is the same on
 every rank, so a checkpoint replay re-runs the same program order.  With a recompute handle
 (``recompute_handle``, :class:`RecomputeHandleDetKcp`) the original forward stores its ``S_in`` in the handle and torch's
@@ -2787,7 +2788,7 @@ class CallDetKcp:
         self.schedule = str(opts.knob("schedule"))
         self.cols_rule = str(opts.knob("cols_rule"))
         self.debug_sequence = bool(opts.knob("debug_sequence"))
-        self.walk_pair = _walk_pair_enabled(opts.knob("walk_pair"), ctx)
+        self.walk_pair = _walk_pair_enabled(opts.knob("walk_pair"), ctx, self.device)
         # (name, args) of the launches resolved while _walk_pair defers them (issued on its side stream); else None
         self._deferred: list[tuple[str, dict[str, Any]]] | None = None
         if int(tb.fused_walks) != int(opts.knob("fused_walks")):
@@ -3783,8 +3784,9 @@ def _ring_backward(call: CallDetKcp, *, walk_ends: bool = False) -> None:
 # Launch sequences (one compute stream; waits at first consumption; shipped schedule wait_first + fused tape walks)
 
 
-# Test knob ``walk_pair`` (default 0): the summaries' offset walk and transfer walk read the same tapes (k, w, u,
-# rowscale, gamma) and the tables only and write disjoint tiles, so the offset walk may run beside the transfer walk.
+# Walk pair (test knob ``walk_pair``, default ``None`` = auto): the summaries' offset walk and transfer walk read the
+# same tapes (k, w, u, rowscale, gamma) and the tables only and write disjoint tiles, so the offset walk may run beside
+# the transfer walk.
 # Its launch is resolved on the current stream (pools, tapes and device tables are bound and uploaded there: nothing
 # is allocated on the side stream) and issued on a per-device side stream after a fork event recorded on the current
 # stream; the transfer walk follows on the current stream, which then waits on the side stream's join event before
@@ -3795,27 +3797,49 @@ def _ring_backward(call: CallDetKcp, *, walk_ends: bool = False) -> None:
 # leaves the capture through the same two events.
 # The pair is enabled on the zigzag partitions only (WALK_PAIR_LAYOUTS) of at most WALK_PAIR_MAX_WORLD ranks; a
 # contiguous or explicit partition, or a larger world, keeps the walk_pair=0 path (GB300 CP8: the contiguous rows, three
-# summaries per rank, ran 1-3 % slower paired; GB300 CP16: one summary per rank, no measured gain).
+# summaries per rank, ran 1-3 % slower paired; GB300 CP16: one summary per rank, no measured gain).  The default (auto)
+# pairs only on the architectures in WALK_PAIR_AUTO_CAPABILITIES: sm_100a (GB200) and sm_103a (GB300), where no zigzag
+# row at CP2 / CP4 / CP8 ran more than 1 % slower in both timing sessions and the CP4 / CP8 rows gained up to 6-8 %.
+# sm_107a keeps one stream: on a 212-SM R200 the CP4 zigzag rows ran 1.2-2.5 % slower paired in both sessions, and
+# there is no 216-SM measurement.  An explicit walk_pair=0 / 1 forces either path (still on the zigzag partitions only).
 WALK_PAIR_LAYOUTS = ("zigzag", "zigzag_per_document")
 WALK_PAIR_MAX_WORLD = 8
+WALK_PAIR_AUTO_CAPABILITIES = ((10, 0), (10, 3))  # sm_100a, sm_103a
 _SIDE_STREAMS: dict[int, torch.cuda.Stream] = {}
+_CAPABILITIES: dict[int, tuple[int, int]] = {}
 WALK_PAIR_STATS: dict[str, int] = {
     "paired": 0,  # walk pairs issued as fork / join
     "single": 0,  # walk pairs with the knob on that had one side empty (issued on the current stream only)
 }
 
 
-def _walk_pair_enabled(knob: int, ctx: Any) -> bool:
-    """The ``walk_pair`` test knob as applied to the call: on only for a context whose partition layout is in
-    :data:`WALK_PAIR_LAYOUTS` and whose world has at most :data:`WALK_PAIR_MAX_WORLD` ranks."""
+def _device_capability(device: torch.device | None) -> tuple[int, int] | None:
+    """The compute capability of a CUDA ``device`` (read once per device index, host only); ``None`` off CUDA."""
+    if device is None or device.type != "cuda":
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    capability = _CAPABILITIES.get(index)
+    if capability is None:
+        capability = _CAPABILITIES[index] = tuple(
+            torch.cuda.get_device_capability(index)
+        )
+    return capability
+
+
+def _walk_pair_enabled(
+    knob: int | None, ctx: Any, device: torch.device | None = None
+) -> bool:
+    """The walk pair as applied to the call: only for a context whose partition layout is in
+    :data:`WALK_PAIR_LAYOUTS` and whose world has at most :data:`WALK_PAIR_MAX_WORLD` ranks; there ``walk_pair=0`` /
+    ``1`` forces it off / on, and the default ``None`` (auto) turns it on when ``device`` is a CUDA device whose
+    capability is in :data:`WALK_PAIR_AUTO_CAPABILITIES` (``sm_100a``, ``sm_103a``)."""
     part = getattr(ctx, "partition", None)
     layout, world = getattr(part, "layout", None), getattr(part, "world_size", None)
-    return (
-        bool(knob)
-        and layout in WALK_PAIR_LAYOUTS
-        and world is not None
-        and world <= WALK_PAIR_MAX_WORLD
-    )
+    if layout not in WALK_PAIR_LAYOUTS or world is None or world > WALK_PAIR_MAX_WORLD:
+        return False
+    if knob is None:
+        return _device_capability(device) in WALK_PAIR_AUTO_CAPABILITIES
+    return bool(knob)
 
 
 def _side_stream(device: torch.device) -> torch.cuda.Stream:
@@ -3836,8 +3860,8 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
 def _walk_pair(
     call: CallDetKcp, side: Callable[[], None], main: Callable[[], None]
 ) -> None:
-    """``side()`` then ``main()``: in this order on the current stream (``walk_pair=0``, a CPU device), or with the
-    launches of ``side()`` on the side stream concurrently with ``main()`` (``walk_pair=1``, see above)."""
+    """``side()`` then ``main()``: in this order on the current stream (walk pair off, a CPU device), or with the
+    launches of ``side()`` on the side stream concurrently with ``main()`` (walk pair on, see above)."""
     if not call.walk_pair or call.device.type != "cuda":
         side()
         main()

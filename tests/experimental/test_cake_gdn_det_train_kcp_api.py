@@ -290,14 +290,84 @@ def test_test_knobs_are_a_keyword_dict_with_known_keys() -> None:
         o.knob("walk_geometry")
 
 
-def test_walk_pair_knob_is_off_by_default() -> None:
-    assert opt.TEST_KNOB_DEFAULTS["walk_pair"] == 0
-    assert make_options().knob("walk_pair") == 0
+def test_walk_pair_knob_defaults_to_auto() -> None:
+    assert opt.TEST_KNOBS["walk_pair"] == (None, 0, 1)
+    assert opt.TEST_KNOB_DEFAULTS["walk_pair"] is None
+    assert make_options().knob("walk_pair") is None
+    assert make_options(test_knobs={"walk_pair": None}).knob("walk_pair") is None
+    assert make_options(test_knobs={"walk_pair": 0}).knob("walk_pair") == 0
     assert make_options(test_knobs={"walk_pair": 1}).knob("walk_pair") == 1
-    for bad in (2, -1, True, "1"):
+    for bad in (2, -1, True, False, "1"):
         with pytest.raises(ValueError):
             make_options(test_knobs={"walk_pair": bad})
-    assert make_options(test_knobs={"walk_pair": 1}).key() != make_options().key()
+    keys = {make_options(test_knobs={"walk_pair": v}).key() for v in (None, 0, 1)}
+    assert len(keys) == 3
+    with pytest.raises(TypeError):
+        make_options(walk_pair=1)  # a test knob, never a public option
+
+
+@pytest.mark.parametrize(
+    "knob, layout, world, capability, on",
+    [
+        (None, "zigzag", 2, (10, 3), True),
+        (None, "zigzag", 4, (10, 0), True),
+        (None, "zigzag_per_document", 4, (10, 3), True),
+        (None, "zigzag_per_document", 8, (10, 0), True),
+        (None, "contiguous", 4, (10, 3), False),
+        (None, "explicit", 4, (10, 0), False),
+        (None, "zigzag", 16, (10, 3), False),
+        (None, "zigzag_per_document", 16, (10, 0), False),
+        (None, "zigzag", 4, (10, 7), False),
+        (None, "zigzag_per_document", 8, (10, 7), False),
+        (None, "zigzag", 4, (9, 0), False),
+        (None, "zigzag", 4, (12, 0), False),
+        (0, "zigzag", 4, (10, 3), False),
+        (0, "zigzag_per_document", 8, (10, 0), False),
+        (1, "zigzag", 4, (10, 7), True),
+        (1, "zigzag", 4, (10, 3), True),
+        (1, "zigzag", 16, (10, 3), False),
+        (1, "contiguous", 4, (10, 0), False),
+    ],
+)
+def test_walk_pair_auto_is_on_for_zigzag_up_to_8_ranks_on_sm100_and_sm103(
+    monkeypatch, knob, layout, world, capability, on
+) -> None:
+    """The default (``None``) pairs the walks on a zigzag / zigzag-per-document partition of at most 8 ranks on
+    ``sm_100a`` / ``sm_103a`` only (``sm_107a`` keeps one stream); an explicit 0 / 1 forces either path there."""
+    kcp = _mod("cake_kcp")
+    assert kcp.WALK_PAIR_AUTO_CAPABILITIES == ((10, 0), (10, 3))
+    queried: list = []
+
+    def capability_of(index):
+        queried.append(index)
+        return capability
+
+    monkeypatch.setattr(kcp, "_CAPABILITIES", {})
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability_of)
+    ctx = types.SimpleNamespace(
+        partition=types.SimpleNamespace(layout=layout, world_size=world)
+    )
+    device = torch.device("cuda", 1)
+    assert kcp._walk_pair_enabled(knob, ctx, device) is on
+    assert kcp._walk_pair_enabled(knob, ctx, device) is on
+    assert len(queried) <= 1  # the capability is read once per device
+    assert all(index == 1 for index in queried)
+
+
+def test_walk_pair_auto_is_off_without_a_cuda_device(monkeypatch) -> None:
+    kcp = _mod("cake_kcp")
+
+    def no_query(index):
+        raise AssertionError("no capability query off CUDA")
+
+    monkeypatch.setattr(kcp, "_CAPABILITIES", {})
+    monkeypatch.setattr(torch.cuda, "get_device_capability", no_query)
+    ctx = types.SimpleNamespace(
+        partition=types.SimpleNamespace(layout="zigzag", world_size=4)
+    )
+    assert kcp._walk_pair_enabled(None, ctx, torch.device("cpu")) is False
+    assert kcp._walk_pair_enabled(None, ctx) is False
+    assert kcp._walk_pair_enabled(1, ctx, torch.device("cpu")) is True
 
 
 @pytest.mark.parametrize(
