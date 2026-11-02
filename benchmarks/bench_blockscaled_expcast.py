@@ -3,7 +3,7 @@
 """NVFP4/MXFP8 causal/noncausal attention timing and accuracy sweep.
 
 Run in your activated environment from the repository root:
-    CUDA_VISIBLE_DEVICES=3 PYTHONPATH="$PWD" python benchmarks/bench_expcast_configs.py
+    CUDA_VISIBLE_DEVICES=3 PYTHONPATH="$PWD" python benchmarks/bench_blockscaled_expcast.py
 
 Run the explicit Q/KV cases below with both masks, both schedulers and three JIT variants:
 blockscaled exp2, blockscaled expcast, and regular BF16 QK exp2.
@@ -31,8 +31,6 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import torch
-
-from bench_blackwell_attention_cutedsl import dequantize_blockscaled
 
 from flashinfer.attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
 from flashinfer.attention.cute_dsl.fmha_blockscaled import (
@@ -74,6 +72,37 @@ SEED = 0
 WARMUP_ITERS = 5
 REPEAT_ITERS = 30
 OUTPUT = Path("profiling/expcast-b200/expcast_configs_gqa.csv")
+
+
+def dequantize_blockscaled(data, scales, global_scale, qk_mode, head_dim):
+    """Decode the exact stored Q/K and their 128x4-swizzled block scales."""
+    batch, length, heads, _ = data.shape
+    block_size = 16 if qk_mode == "nvfp4" else 32
+    padded_length = (length + 127) // 128 * 128
+    scale_columns = head_dim // block_size
+    padded_columns = (scale_columns + 3) // 4 * 4
+    scales = (
+        scales.float()
+        .reshape(batch, heads, padded_length // 128, padded_columns // 4, 32, 4, 4)
+        .permute(0, 1, 2, 5, 4, 3, 6)
+        .reshape(batch, heads, padded_length, padded_columns)[
+            :, :, :length, :scale_columns
+        ]
+        .repeat_interleave(block_size, dim=-1)
+        .transpose(1, 2)
+    )
+    if qk_mode == "nvfp4":
+        packed = data.view(torch.uint8).int()
+        codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
+        levels = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6], device=data.device, dtype=torch.float32
+        )
+        values = levels[codes & 7] * torch.where(codes & 8 != 0, -1.0, 1.0)
+    elif qk_mode == "mxfp8":
+        values = data.float()
+    else:
+        raise ValueError(f"Reference decoding is not implemented for {qk_mode}")
+    return values * scales * global_scale
 
 
 def scheduling_override(original_init, persistent):
