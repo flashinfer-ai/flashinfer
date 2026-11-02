@@ -564,6 +564,31 @@ def test_topk_select_wide_score_buffer_matches_reference(batch):
 
 
 @sm90_only
+@pytest.mark.parametrize("hq,sq", [(1, 4), (2, 4), (4, 1)])
+def test_proxy_decode_wide_buffer_tail_is_neg_inf(hq, sq):
+    """Every column past a sequence's last tile is -inf in that sequence's
+    rows of a max_model_len-wide buffer (the grid fills them across
+    sequences), and every column inside it is a real score."""
+    seqs = (1, 129, 5000, 300, 8191 * 128, 64 * 128 + 7)
+    reqs = [(sq, s) for s in seqs]
+    q, k, cu_q, page_table, seqused_k, _ = _ragged_proxy_inputs(reqs, 8192, hq=hq)
+    scores = msa_proxy_score(
+        q,
+        k,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        max_seqlen_q=sq,
+        max_k_tiles=8192,
+    )
+    for r, s in enumerate(seqs):
+        rows = scores[:, :, r * sq : (r + 1) * sq]
+        n = -(-s // BLK_KV)
+        assert bool(torch.isneginf(rows[:, n:]).all()), (r, s)
+        assert bool(torch.isfinite(rows[:, : n - 1]).all()), (r, s)
+
+
+@sm90_only
 @pytest.mark.parametrize("prefix", [642539, 642560])
 def test_topk_select_long_chunk_unaligned_prefix(sm90_regression_backend, prefix):
     """A chunked-prefill step whose prefix is not page-aligned: 32 adjacent
@@ -584,6 +609,30 @@ def test_topk_select_long_chunk_unaligned_prefix(sm90_regression_backend, prefix
     )
     # Every token has thousands of valid pages, so the reference is the
     # forced last page plus the top 15 of the rest, ascending.
+    ref = scores[0].T.clone()
+    ref[torch.arange(nq, device="cuda"), nvp.long() - 1] = float("inf")
+    ref = torch.topk(ref, TOPK, dim=1).indices.sort(dim=1).values.to(torch.int32)
+    assert torch.equal(out[:, 0], ref)
+
+
+@sm90_only
+@pytest.mark.parametrize("batch", [1, 24, 64])
+def test_topk_select_decode_width_with_long_extents(sm90_regression_backend, batch):
+    """A decode batch on a CUDA-graph-wide score buffer is planned for a
+    narrower width than the buffer (its extents are only known per token);
+    extents up to the full width must still select exactly."""
+    width, nq = 8192, 4 * batch
+    g = torch.Generator(device="cuda").manual_seed(batch)
+    ext = torch.randint(17, width + 1, (batch,), generator=g, device="cuda")
+    ext[0] = width
+    nvp = (ext[:, None] - torch.arange(3, -1, -1, device="cuda")).reshape(-1)
+    nvp = nvp.to(torch.int32)
+    valid = torch.arange(width, device="cuda")[:, None] < nvp[None, :]
+    scores = torch.randn(1, width, nq, generator=g, device="cuda")
+    scores = scores.masked_fill(~valid[None], float("-inf"))
+    out = msa_topk_select(
+        scores, TOPK, num_valid_pages=nvp, force_begin_blocks=0, force_end_blocks=1
+    )
     ref = scores[0].T.clone()
     ref[torch.arange(nq, device="cuda"), nvp.long() - 1] = float("inf")
     ref = torch.topk(ref, TOPK, dim=1).indices.sort(dim=1).values.to(torch.int32)
@@ -953,6 +1002,26 @@ def test_program_first_needed_under_capture_raises_instead_of_building(monkeypat
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(sel, eager)
+
+
+@sm90_only
+def test_topk_preload_covers_serving_plans(monkeypatch):
+    """The CuTe top-k preload builds the kernels that decode at a CUDA-graph
+    width and eager steps of any width and token count pick, so none of them
+    compiles mid-serving."""
+    from flashinfer.msa_ops.cute_dsl import topk_select_sm90 as ts
+
+    built = set()
+    monkeypatch.setattr(ts, "_cache", {})
+    monkeypatch.setattr(ts, "_compile", lambda key, *args: built.add(key) or key)
+    assert ts.preload() == len(built)
+    served = {ts._select_plan(1, 8192, 4 * b, True) for b in (1, 8, 24, 48, 64, 512)}
+    served |= {
+        ts._plan(1, t, n)
+        for t in range(17, 8193, 61)
+        for n in (1, 64, 1000, 4096, 5084, 8124)
+    }
+    assert {p + (True, torch.float32) for p in served} <= built
 
 
 @sm90_only
@@ -1568,6 +1637,88 @@ def test_single_token_prefill_short_block_lists(hq, qlen, nvalid):
     )
     err = (out[rows].float() - ref).norm() / ref.norm()
     assert err < 3e-3, f"rel-L2 {err:.2e} vs fp32 reference"
+
+
+@sm90_only
+@pytest.mark.parametrize(
+    "prefix_pages, q_lens",
+    [
+        (40, (1024, 768)),  # union schedule (page table <= 800 wide)
+        (900, (512,)),  # single-token schedule, fp8 PV body (transposes V)
+    ],
+)
+def test_cute_prefill_transposes_only_referenced_pages(
+    monkeypatch, prefix_pages, q_lens
+):
+    """The CuTe prefill's V transpose covers the pages the batch's extents
+    reference, not the whole KV pool: a pool four times larger, with NaN in
+    every page no sequence references, two sequences sharing their first
+    pages, and a second call after the referenced pages change (a page the
+    transpose skipped would keep the first call's V)."""
+    from flashinfer.msa_ops import cake_hopper_sm90
+
+    monkeypatch.setattr(
+        cake_hopper_sm90, "prefill_route_available", lambda **kwargs: False
+    )
+    torch.manual_seed(prefix_pages)
+    hq, hkv, nb = 8, 1, len(q_lens)
+    seqs = [prefix_pages * BLK_KV + ql for ql in q_lens]
+    width = max(-(-s // BLK_KV) for s in seqs)
+    npg = 4 * nb * width
+    perm = torch.randperm(npg, device="cuda").to(torch.int32)
+    page_table = perm[: nb * width].view(nb, width).clone()
+    page_table[:, :4] = page_table[0, :4].clone()  # a shared prefix
+    referenced = torch.zeros(npg, dtype=torch.bool, device="cuda")
+    for b, s in enumerate(seqs):
+        referenced[page_table[b, : -(-s // BLK_KV)].long()] = True
+    kv = torch.full((npg, hkv, BLK_KV, 2 * HEAD_DIM), float("nan"), device="cuda")
+    kv = kv.to(torch.float8_e4m3fn)
+    q = torch.randn(sum(q_lens), hq, HEAD_DIM, device="cuda").to(torch.bfloat16)
+    cu_q = torch.tensor([0, *q_lens], device="cuda").cumsum(0).to(torch.int32)
+    seqused_k = torch.tensor(seqs, dtype=torch.int32, device="cuda")
+    # Each query selects its own block and 15 random older ones.
+    qpos = torch.cat(
+        [
+            torch.arange(s - ql, s, device="cuda")
+            for s, ql in zip(seqs, q_lens, strict=True)
+        ]
+    )
+    own = qpos // BLK_KV
+    score = torch.rand(len(qpos), width, device="cuda")
+    score[torch.arange(width, device="cuda")[None, :] >= own[:, None]] = -1.0
+    sel = torch.cat([score.topk(TOPK - 1, dim=-1).indices, own[:, None]], dim=-1)
+    idx = sel.sort(dim=-1).values.to(torch.int32)[None].contiguous()
+    starts = [sum(q_lens[:b]) for b in range(nb)]
+    rows = [
+        s + o
+        for s, ql in zip(starts, q_lens, strict=True)
+        for o in (0, ql // 2, ql - 1)
+    ]
+
+    def seq_of(row):
+        b = max(i for i, s in enumerate(starts) if s <= row)
+        return b, int(qpos[row])
+
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    for _ in range(2):
+        fresh = torch.randn(npg, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") * 0.5
+        kv[referenced] = fresh.to(torch.float8_e4m3fn)[referenced]
+        k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+        out = msa_sparse_attention(
+            q,
+            k,
+            v,
+            idx,
+            cu_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            causal=True,
+            softmax_scale=scale,
+        )
+        assert torch.isfinite(out.float()).all()
+        ref = _ref_attn_rows(q, kv, idx, page_table, seqused_k, scale, rows, seq_of)
+        err = (out[rows].float() - ref).norm() / ref.norm()
+        assert err < 3e-3, f"rel-L2 {err:.2e} vs fp32 reference"
 
 
 @sm90_only

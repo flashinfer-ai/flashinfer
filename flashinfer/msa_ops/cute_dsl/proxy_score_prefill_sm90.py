@@ -19,6 +19,8 @@ import cutlass.cute.nvgpu.cpasync as cpasync
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 
+from ._disk_cache_sm90 import load_or_compile
+
 
 # ---------------------------------------------------------------------------
 # accumulator layout helpers (WGMMA C fragment -> (M, N) view)
@@ -953,6 +955,7 @@ def run(
     fold = 1 if n_mtiles * 16 >= nkt else 0
 
     key = (hq, k.shape[2], k.shape[3], use_tma_q, fold, use_fp32_acc)
+    key += (q.dtype, k.dtype, max_score.dtype)
     op = _CACHE.get(key)
     if op is None:
         kern = MsaProxyScore(
@@ -988,16 +991,18 @@ def run(
                 prefix_lens, assumed_align=4, enable_tvm_ffi=True
             ).mark_layout_dynamic(leading_dim=0),
         )
-        op = cute.compile(
-            kern,
-            _kf_stream(),
-            *args,
-            cutlass.Int32(total_q),
-            cutlass.Int32(nkt),
-            cutlass.Int32(batch_size),
-            cutlass.Int32(nkchunk),
-            cutlass.Int32(n_mtiles),
-            options="--enable-tvm-ffi",
+        sizes = (total_q, nkt, batch_size, nkchunk, n_mtiles)
+        op = load_or_compile(
+            "msa_proxy_score_prefill_sm90",
+            key,
+            lambda: cute.compile(
+                kern,
+                _kf_stream(),
+                *args,
+                *map(cutlass.Int32, sizes),
+                options="--enable-tvm-ffi",
+            ),
+            __file__,
         )
         _CACHE[key] = op
     op(

@@ -16,6 +16,8 @@ import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute.runtime import from_dlpack
 
+from ._disk_cache_sm90 import load_or_compile
+
 PAGE = 128
 HALF = 64
 DIM = 128
@@ -240,12 +242,29 @@ def _msa_kernel(
         cute.arch.sync_threads()
         it = it + 1
 
-    # Columns [nb, ncols) are -inf; the sequence's nsplit CTAs share them.
-    n_tail = (ncols - nb) * nq
-    for e in cutlass.range(t0 * NTHREADS + tidx, n_tail, nsplit * NTHREADS, unroll=1):
-        c = e // nq
-        i = e - c * nq
-        mOut[i % Hq, nb + c, b * sq + i // Hq] = neg
+    # Columns past each sequence's last tile are -inf.  At max_model_len's
+    # width (a CUDA graph) that is most of the buffer, and filling it per
+    # sequence after the scoring walk put up to 15 us of stores on the tail of
+    # the longest CTAs (48 x q4 at 128k on H100).  Instead every CTA takes an
+    # even share of the (h, column, sequence) segments, sq scores each, with
+    # consecutive threads on consecutive sequences of one (h, column) row.
+    gid = b * nsplit + t0
+    for e in cutlass.range(
+        gid * NTHREADS + tidx,
+        Hq * ncols * nbatch,
+        nbatch * nsplit * NTHREADS,
+        unroll=1,
+    ):
+        bb = e % nbatch
+        r = e // nbatch
+        h = 0
+        c = r
+        if cutlass.const_expr(Hq > 1):
+            h = r // ncols
+            c = r - h * ncols
+        if c >= cutlass.min((mSeq[bb] + 127) // 128, ncols):
+            for j in cutlass.range_constexpr(sq):
+                mOut[h, c, bb * sq + j] = neg
 
 
 @cute.jit
@@ -403,7 +422,7 @@ def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
 
     nsplit = _nsplit(B, max_k_tiles, max_score.device)
 
-    key = (Hq, sq, batch_fast, _NSTAGE)
+    key = (Hq, sq, batch_fast, _NSTAGE, k.dtype, q.dtype, max_score.dtype)
     fn = _CACHE.get(key)
     if fn is None:
         mK = from_dlpack(k, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
@@ -421,23 +440,13 @@ def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
         mOut = from_dlpack(
             max_score, assumed_align=16, enable_tvm_ffi=True
         ).mark_layout_dynamic(leading_dim=2)
-        fn = cute.compile(
-            _msa_host,
-            _kf_stream(),
-            mK,
-            mQ,
-            mPage,
-            mSeq,
-            mOut,
-            nsplit,
-            nq,
-            Hq,
-            sq,
-            log2_hq,
-            TN,
-            batch_fast,
-            _NSTAGE,
-            options="--enable-tvm-ffi",
+        args = (_msa_host, _kf_stream(), mK, mQ, mPage, mSeq, mOut, nsplit)
+        args += (nq, Hq, sq, log2_hq, TN, batch_fast, _NSTAGE)
+        fn = load_or_compile(
+            "msa_proxy_score_decode_sm90",
+            key,
+            lambda: cute.compile(*args, options="--enable-tvm-ffi"),
+            __file__,
         )
         _CACHE[key] = fn
     fn(_kf_stream(), k, q, page_table, seqused_k, max_score, nsplit)

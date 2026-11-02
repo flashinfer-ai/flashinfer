@@ -159,10 +159,21 @@ def preload_sm90_programs(kinds: Optional[Iterable[str]] = None) -> dict[str, in
     ``topk_select``, ``sparse_prefill``; about 4 s per program not yet in the
     JIT cache (89 programs in all), ~10 ms per prebuilt one.  Returns the
     programs loaded per kind.
+
+    ``topk_select`` also builds the CuTe top-k kernels its planner picks over
+    a grid of serving geometries (``"topk_select_cute"`` in the result: the
+    kernels covered).  Their compile key is the plan, so an eager step's width
+    and token count otherwise compile a new one mid-serving; each takes 1-2 s
+    the first time on a node and is then read from the CuTe-DSL disk cache.
     """
     from .cake_hopper_sm90 import preload_programs
 
-    return preload_programs(kinds)
+    loaded = preload_programs(kinds)
+    if "topk_select" in loaded:
+        from .cute_dsl.topk_select_sm90 import preload
+
+        loaded["topk_select_cute"] = preload()
+    return loaded
 
 
 def proxy_score_sm90(
