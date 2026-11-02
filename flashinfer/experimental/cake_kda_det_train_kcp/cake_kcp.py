@@ -5185,7 +5185,7 @@ def _backward(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
             for name in tail_stages:
                 call.stage(name, tail_pass=i)
     if call.gate == "raw":
-        call.stage("param_finalize")
+        call.stage("param_finalize", seg_cap=call.scratch.get("seg_cap"))
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -5935,7 +5935,8 @@ def _bwd_body(call: CallDetKcp, saved: SavedDetKcp | None) -> tuple[torch.Tensor
     (contiguous ``[T_r, H, 128]``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 ``[H * 128]``: this rank's partial
     sums (the parameter gradients of its own tokens).  The raw GLM intra program writes the per-chunk ``(hi, lo)``
     partials ``dA_part`` / ``db_part`` (FP32 ``[NC_pad, H, 128, 2]`` each, per call, outside the arena; the real
-    chunks only) and ``param_finalize`` reduces them in the fixed order of the local chunks; a rank without tokens
+    chunks only) and ``param_finalize`` reduces them in the fixed order of the local chunks, with its per-call
+    scratch ``part2`` / ``ticket`` and ``seg_cap`` from ``cake_backend._raw_finalize_scratch``; a rank without tokens
     launches nothing and returns zero parameter gradients."""
     dt = call.backend.dtypes
     T, H = call.T_r, call.H
@@ -5951,6 +5952,11 @@ def _bwd_body(call: CallDetKcp, saved: SavedDetKcp | None) -> tuple[torch.Tensor
             nc_pad = int(call.local.plan.NC_pad)
             for name in ("dA_part", "db_part"):
                 call.grads[name] = _alloc((nc_pad, H, D, 2), dt["dA_log"], call.device)
+            # param_finalize's per-call scratch: the second-stage partials and the per-head ticket
+            fin = cake_backend._raw_finalize_scratch(nc_pad, H, call.device)
+            call.grads["part2"] = fin["part2"]
+            call.grads["ticket"] = fin["ticket"]
+            call.scratch["seg_cap"] = int(fin["seg_cap"])
             call.grads["dA_log"] = _alloc((H,), dt["dA_log"], call.device)
             call.grads["ddt_bias"] = _alloc((H * D,), dt["ddt_bias"], call.device)
         else:  # no local stage runs on this rank: its tokens contribute nothing

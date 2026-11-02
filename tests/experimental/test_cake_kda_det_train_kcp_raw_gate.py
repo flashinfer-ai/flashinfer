@@ -507,9 +507,10 @@ def test_raw_local_stage_values_cover_the_records(H, arch, sm) -> None:
     saved-mode and a replay backward bind every logical name of every record they launch (the raw intra / prep /
     GLM intra records read ``g_raw``, its strides, ``A_log``, ``dt_bias``, ``lower_bound``; the GLM intra program
     writes ``dg_raw`` and the partials ``dA_part`` / ``db_part``; ``param_finalize`` reads ``seq_chunk_start``
-    bounded at ``num_seqs`` = the rank's fragments and writes ``dA_log`` / ``ddt_bias`` on its ``(H, 1, 1)`` grid);
-    no gate epilogue launches; every stage outside ``cake_jit.GATE_STAGES`` launches exactly the explicit plan's
-    record on the same grid, and the raw records replace the explicit ones stage for stage."""
+    bounded at ``num_seqs`` = the rank's fragments and writes ``dA_log`` / ``ddt_bias`` on its ``(H, seg_cap, 1)``
+    grid with the per-call ``part2`` / ``ticket`` scratch); no gate epilogue launches; every stage outside
+    ``cake_jit.GATE_STAGES`` launches exactly the explicit plan's record on the same grid, and the raw records
+    replace the explicit ones stage for stage."""
     ctx = _cpu_ctx(sm=sm)
     assert ctx.T_r > 0
     plans = {
@@ -562,11 +563,20 @@ def test_raw_local_stage_values_cover_the_records(H, arch, sm) -> None:
             **cake_backend._raw_values(raw_g, gp),
         },
     }
+    # param_finalize's per-call scratch, as the raw backward of a rank with tokens allocates it
+    fin_scratch = cake_backend._raw_finalize_scratch(
+        int(plans["raw"].NC_pad), H, torch.device("cpu")
+    )
+    seg_cap = int(fin_scratch["seg_cap"])
     grads = {
         "g": {n: torch.zeros(1) for n in ("dq", "dk", "dv", "dg", "dbeta")},
         "raw": {
-            n: torch.zeros(1)
-            for n in ("dq", "dk", "dv", "dbeta", "dg_raw", "dA_part", "db_part", "dA_log", "ddt_bias")
+            **{
+                n: torch.zeros(1)
+                for n in ("dq", "dk", "dv", "dbeta", "dg_raw", "dA_part", "db_part", "dA_log", "ddt_bias")
+            },
+            "part2": fin_scratch["part2"],
+            "ticket": fin_scratch["ticket"],
         },
     }  # fmt: skip
 
@@ -582,7 +592,9 @@ def test_raw_local_stage_values_cover_the_records(H, arch, sm) -> None:
             stages = [("bwd_prep", {"saved": saved}), ("fwd_intra", {}), ("wy", {}), ("dav", {}),
                       ("dqkg", {}), ("glm_intra", {})]  # fmt: skip
             stages.append(
-                ("param_finalize", {}) if gate == "raw" else ("gate_epilogue", {})
+                ("param_finalize", {"seg_cap": seg_cap})
+                if gate == "raw"
+                else ("gate_epilogue", {})
             )
         else:
             stages = [("fwd_intra", {}), ("wy_fwd", {}), ("fwd_o", {})]
@@ -645,7 +657,7 @@ def test_raw_local_stage_values_cover_the_records(H, arch, sm) -> None:
         if r in cake_jit.MODULES
     )
     fin = bwd[-1][3]
-    assert bwd[-1][2] == pr.grid("param_finalize", b) == (H, 1, 1)
+    assert bwd[-1][2] == pr.grid("param_finalize", b) == (H, seg_cap, 1)
     assert (
         fin["num_seqs"] == ctx.n_frag
         and fin["seq_chunk_start"] is ctx.tables["seq_chunk_start"]
@@ -653,6 +665,11 @@ def test_raw_local_stage_values_cover_the_records(H, arch, sm) -> None:
     assert (
         fin["dA_part"] is grads["raw"]["dA_part"]
         and fin["ddt_bias"] is grads["raw"]["ddt_bias"]
+    )
+    assert (
+        fin["part2"] is fin_scratch["part2"]
+        and fin["ticket"] is fin_scratch["ticket"]
+        and fin["seg_cap"] == seg_cap
     )
     gi = bwd[-2][3]
     assert (
