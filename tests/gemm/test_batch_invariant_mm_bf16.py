@@ -174,6 +174,9 @@ def test_tactic_encoding_round_trips():
 
 
 def test_cache_key_covers_every_kernel_source():
+    """The compiled-kernel cache key is the kernel sources (the blocks, the fixup, the specification and generator they
+    import, the vendored tile scheduler) and not the dispatcher's host-side selection code (chunk rule, cost model): an edit to
+    the latter must keep every compiled object valid."""
     from flashinfer.batch_invariant.jit import relative_sources
 
     srcs = set(
@@ -181,10 +184,23 @@ def test_cache_key_covers_every_kernel_source():
     )  # the GEMM cache module shared by the bf16 and fp8 classes
     assert {
         "gemm/batch_invariant/blocks/compile.py",
-        "gemm/batch_invariant/fixup.py",
+        "gemm/batch_invariant/blocks/epilogue.py",
         "gemm/batch_invariant/blocks/kernel.py",
+        "gemm/batch_invariant/blocks/mainloop.py",
+        "gemm/batch_invariant/blocks/operands.py",
+        "gemm/batch_invariant/blocks/producer.py",
+        "gemm/batch_invariant/fixup.py",
+        "gemm/batch_invariant/spec.py",
+        "gemm/batch_invariant/generator.py",
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     } <= srcs
+    assert (
+        not {
+            "gemm/batch_invariant/schedule.py",
+            "gemm/batch_invariant/heuristic.py",
+        }
+        & srcs
+    )
 
 
 def test_unsupported_device_raises_before_any_kernel():
