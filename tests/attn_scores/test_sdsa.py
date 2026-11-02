@@ -573,6 +573,7 @@ def test_quantize_write_index_qk_nvfp4_rejects_bad_inputs(monkeypatch) -> None:
         run()
 
 
+@sm10x_only
 @torch.inference_mode()
 def test_indexer_scores_rejects_bad_shapes() -> None:
     query = torch.zeros(4, 128, dtype=torch.bfloat16, device="cuda")
