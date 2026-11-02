@@ -192,6 +192,16 @@ def parse_gdn_args(line, parser):
         "the batch).",
     )
     parser.add_argument(
+        "--use_cp",
+        type=str,
+        required=False,
+        default="auto",
+        choices=["auto", "true", "false"],
+        help="Prefill only: the use_cp argument of chunk_gated_delta_rule. "
+        "'auto' (default) lets FlashInfer decide; 'true' forces the "
+        "context-parallel route and 'false' the non-CP kernel.",
+    )
+    parser.add_argument(
         "--update_state",
         action="store_true",
         default=False,
@@ -332,6 +342,8 @@ def parse_gdn_args(line, parser):
                 "The triton backend is only available for decode/MTP routines; "
                 "prefill supports flashinfer and fla"
             )
+    elif args.use_cp != "auto":
+        raise ValueError("--use_cp is only applicable to chunk_gated_delta_rule")
 
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
@@ -953,6 +965,7 @@ def testChunkGatedDeltaRule(args):
     num_k_heads = args.num_k_heads
     num_v_heads = args.num_v_heads
     head_size = args.head_size
+    use_cp = {"auto": "auto", "true": True, "false": False}[args.use_cp]
     is_cuda_graph_compatible = not args.no_cuda_graph
     run_refcheck = args.refcheck
     res = []
@@ -1059,6 +1072,7 @@ def testChunkGatedDeltaRule(args):
                 False,  # use_qk_l2norm_in_kernel (k is pre-normalized)
                 output=output,
                 output_state=output_state,
+                use_cp=use_cp,
             )[0]
         elif backend == "fla":
             return fla_gdn(
@@ -1178,6 +1192,7 @@ def testChunkGatedDeltaRule(args):
                 cur_res["num_v_heads"] = num_v_heads
                 cur_res["head_size"] = head_size
                 cur_res["input_dtype"] = str(input_dtype)
+                cur_res["use_cp"] = args.use_cp
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
