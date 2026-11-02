@@ -2090,6 +2090,173 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
                 assert names[i + 1 :] == (["param_finalize"] if gate == "raw" else [])
 
 
+L2N_ROW_CASES = [c for c in LOCAL_RECORD_CASES if c[0] == 4]
+
+
+@pytest.mark.parametrize("kind", ("bwd_saved", "bwd_replay"))
+@pytest.mark.parametrize("form", ("fused", "fallback"))
+@pytest.mark.parametrize("gate", ("g", "raw"))
+@pytest.mark.parametrize(
+    "H,arch,sm", L2N_ROW_CASES, ids=[f"h{h}-{a}-{s}" for h, a, s in L2N_ROW_CASES]
+)
+def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> None:
+    """The flag-on backward (:func:`cake_kcp._bwd_body`, its launches recorded on a CPU arena with the replay layout's
+    real regions) keeps its token-layout ``qn`` / ``kn`` in the arena: ``kn`` on the bytes of ``dv2``, which rides
+    on dq / dk (the two halves of one ``[2, T_r, H, 128]`` tensor), and ``qn`` on the bytes of ``v_new``, which
+    rides on dg (raw gate mode: on ``dg_raw`` only where it covers the ``R`` rows, here not, so ``qn`` is per
+    call).  Every launch that binds ``v_new`` / ``dv2`` binds the moved views and comes before the first launch
+    that binds an output they ride on; the arena's cached views are not rebound; the backward allocates no byte
+    beyond the flag-off backward's but the replay's rstd (and the raw mode's per-call ``qn``).  A forward and a
+    rank whose internal rows exceed twice its tokens move nothing."""
+    missing = cake_kcp_plan.qk_l2norm_missing(form, gate, arch)
+    if missing is not None:
+        pytest.skip(
+            f"use_qk_l2norm_in_kernel=True ({form}) cannot run on the KCP route yet: {missing}"
+        )
+    opts = cake_kcp._options({})
+    launches: list = []
+
+    class Arena:
+        def __init__(self, plan) -> None:
+            self.plan = plan
+            self.device = torch.device("cpu")
+            self.device_index = 0
+            self.arch = arch
+            self.launcher = self._launch
+            self.fwd_layout = cake_kcp.LOCAL_LAYOUT_FWD
+            regions = plan.layout(cake_kcp.LOCAL_LAYOUT_BWD)
+            self.arena = torch.zeros(
+                max(r.offset + r.nbytes for r in regions), dtype=torch.uint8
+            )
+            self.ns = types.SimpleNamespace()
+            for r in regions:
+                part = self.arena[r.offset : r.offset + r.nbytes]
+                setattr(self.ns, r.name, part.view(r.dtype).view(r.shape))
+
+        def views(self, mode: str):
+            assert mode == cake_kcp.LOCAL_LAYOUT_BWD, mode
+            return self.ns
+
+        def _launch(self, record, values, *, grid, device_index) -> None:
+            launches.append(("backend", record, dict(values)))
+
+    class Provider:
+        def run_record(self, record, values, *, grid, device_index) -> None:
+            launches.append(("kcp", record, dict(values)))
+
+    backend = cake_kcp.KernelBackend(programs=Provider())
+
+    def mod(src: str, record: str) -> dict:
+        return (cake_jit if src == "backend" else cake_kcp_jit).MODULES[record]
+
+    def drive(ctx, mode: str, backward: bool = True):
+        T = int(ctx.T_r)
+        plan = cake_backend.plan(
+            ctx.T_r, ctx.n_frag, H, sm, arch, gate=gate, **cake_kcp_plan.qk_l2norm_plan_kwargs(mode)
+        )  # fmt: skip
+        zeros = torch.zeros(T, H, D, dtype=torch.bfloat16)
+        q_raw, k_raw, _ = _packed_qk(zeros, zeros)
+        ops = {"q": q_raw, "k": k_raw, "v": torch.zeros(1), "beta": torch.zeros(1), "dout": torch.zeros(1)}
+        if gate == "raw":
+            gp = cake_backend._gate_params(
+                "raw", torch.zeros(H), torch.zeros(H * D), LOWER_BOUND, H, torch.device("cpu")
+            )  # fmt: skip
+            ops.update(cake_backend._raw_values(zeros.clone(), gp))
+        else:
+            ops["g"] = torch.zeros(1)
+        saved = None
+        if kind == "bwd_saved":
+            saved = types.SimpleNamespace(
+                S_in=torch.zeros(1), c1_recv=None, M_seg=None, carry=None, qk_rstd=torch.zeros(2, T, H)
+            )  # fmt: skip
+        tb = cake_kcp._Tables(ctx, H, fused_walks=opts.fused_walks)
+        call = _DriveCall(
+            local=Arena(plan), ctx=ctx, tb=tb, T_r=T, H=H, backward=backward, host_trim=int(opts.host_trim),
+            ops=ops, scale=0.5, scratch={}, local_values=None, out=None, grads=None,
+            device=torch.device("cpu"), opts=opts, gate=gate, l2n=mode != "off", l2n_mode=mode, l2n_values=None,
+            backend=backend, schedule=str(opts.schedule), exchange="a2a", merge_fuse=str(opts.merge_fuse),
+            saved_carry=int(opts.saved_carry), bufs={}, kcp=[],
+        )  # fmt: skip
+        if not backward:
+            return call, None, []
+        backend.begin_call(call)
+        allocs: list = []
+        alloc = cake_kcp._alloc
+
+        def counting(shape, dtype, device):
+            allocs.append(torch.Size(shape).numel() * dtype.itemsize)
+            return alloc(shape, dtype, device)
+
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(cake_kcp, "_alloc", counting)
+            cake_kcp._bwd_body(call, saved)
+        done = list(launches)
+        launches.clear()
+        return call, done, allocs
+
+    ctx = _cpu_ctx(sm=sm)
+    T = int(ctx.T_r)
+    call, res, allocs = drive(ctx, form)
+    _, _, allocs_off = drive(ctx, "off")
+    p = call.local.plan
+    assert T < p.R <= 2 * T  # the one-token document pads its chunk: dg_raw does not cover R
+    dg = "dg_raw" if gate == "raw" else "dg"
+    expected = {"dv2": ("dq", "dk")} | ({"v_new": ("dg",)} if gate == "g" else {})
+    assert cake_kcp._l2n_row_hosts(call) == expected
+    arena, moved = call.local.ns, call.scratch["views"]
+    assert moved is not arena and call.local.views(cake_kcp.LOCAL_LAYOUT_BWD) is arena
+    lo, n = call.local.arena.data_ptr(), call.local.arena.numel()
+
+    def in_arena(t: torch.Tensor) -> bool:
+        return lo <= t.data_ptr() < lo + n
+
+    assert in_arena(arena.v_new) and in_arena(arena.dv2)
+    dq, dk = call.grads["dq"], call.grads["dk"]
+    assert dk.data_ptr() == dq.data_ptr() + T * H * D * 2
+    assert moved.dv2.data_ptr() == dq.data_ptr() and moved.dv2.shape == arena.dv2.shape
+    assert call.local_values["dv2"] is moved.dv2
+    if "v_new" in expected:
+        assert moved.v_new.data_ptr() == call.grads[dg].data_ptr()
+        assert moved.v_new.shape == arena.v_new.shape and moved.v_new.dtype == arena.v_new.dtype
+        assert call.local_values["v_new"] is moved.v_new
+    else:
+        assert moved.v_new is arena.v_new
+    # the normalized rows: kn on dv2's arena bytes, qn on v_new's (raw gate mode: per call)
+    outs = {"dq", "dk", dg}
+    first_out = next(
+        i for i, (s, r, _v) in enumerate(res) if outs & set(mod(s, r)["logical"].values())
+    )
+    seen = set()
+    for i, (src, record, values) in enumerate(res):
+        names = set(mod(src, record)["logical"].values())
+        for buf in ("v_new", "dv2"):
+            if buf in names:
+                assert i < first_out, (record, buf)
+                assert values[buf] is getattr(moved, buf), (record, buf)
+                seen.add(buf)
+        if {"qn", "kn", "q", "k"} & names:
+            assert values["kn"].data_ptr() == arena.dv2.data_ptr(), record
+            assert values["qn"].data_ptr() != values["kn"].data_ptr(), record
+            if "v_new" in expected:
+                assert values["qn"].data_ptr() == arena.v_new.data_ptr(), record
+            else:
+                assert not in_arena(values["qn"]), record
+    assert seen == {"v_new", "dv2"}
+    # bytes beyond the flag-off backward's: the replay's rstd, and qn where v_new stays
+    extra = (0 if kind == "bwd_saved" else 8 * T * H) + (0 if "v_new" in expected else T * H * D * 2)
+    assert sum(allocs) - sum(allocs_off) == extra
+    assert p.workspace_bytes("replay") == cake_backend.plan(
+        ctx.T_r, ctx.n_frag, H, sm, arch, gate=gate
+    ).workspace_bytes("replay")
+    # nothing moves on a forward or where the rows exceed twice the tokens (one-token documents)
+    fwd, _, _ = drive(ctx, form, backward=False)
+    assert cake_kcp._l2n_row_hosts(fwd) == {}
+    short, _, _ = drive(_cpu_ctx(lengths=(1,) * 64, sm=sm), form)
+    assert 0 < 2 * short.T_r < short.local.plan.R
+    assert cake_kcp._l2n_row_hosts(short) == {}
+    assert short.scratch["views"] is short.local.ns
+
+
 # --------------------------------------------------------------------------- GPU helpers
 
 

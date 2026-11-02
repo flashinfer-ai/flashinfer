@@ -419,9 +419,15 @@ dq_raw, dk_raw, dv, dbeta, dg = chunk_kda_det_bwd_kcp(
   empty on a rank without tokens): `kda_det_saved_bytes_kcp(...,
   use_qk_l2norm_in_kernel=True)` is `8 * S_local * H` bytes more.  The
   normalized q / k are never saved: the backward rebuilds them bitwise from
-  the raw rows and the rstd into a per-call buffer (`512 * S_local * H` bytes
-  for the duration of the backward), and a checkpoint recompute writes its
-  rstd afresh, so a recompute handle's entry and bytes do not change.
+  the raw rows and the rstd, and a checkpoint recompute writes its rstd
+  afresh, so a recompute handle's entry and bytes do not change.  The
+  backward keeps the rebuilt rows in its local arena, in the bytes of two
+  internal buffers that it moves into the bytes of its own outputs (dq / dk
+  and the gate gradient) until the GLM intra program writes those, so it
+  needs no memory beyond the flag-off backward's.  Where an output is too
+  small for its buffer (more than `2 * S_local` internal rows; in raw gate
+  mode more than `S_local` for the gate gradient), that row set takes a
+  per-call buffer (`256 * S_local * H` bytes each) instead.
 * The mode is fixed per workspace (the replay local arena of that mode;
   `local_arena="lean"` is refused with it), recorded in the saved set
   (`SavedDetKcp.qk_l2norm`), the graph validity key and a recompute handle's

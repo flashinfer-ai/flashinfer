@@ -277,6 +277,7 @@ for K4's states (c1 / b1 pairs, ``tile_stride`` 2) and the carry plane; under ``
 
 from __future__ import annotations
 
+import copy
 import ctypes
 import dataclasses
 import functools
@@ -3422,11 +3423,12 @@ class WorkspaceDetKcp:
     ``"off"`` without it): the local arena is planned in that mode (:func:`cake_kcp_plan.qk_l2norm_plan_kwargs`), the
     KCP pools do not depend on it, a call in the other mode is refused with ``ValueError``, and the mode runs on the
     replay local arena (``local_arena="lean"`` is refused with it; the lean layout follows the single-rank tail-pass
-    layout of the mode's programs).  The mode's per-call tensors (the backward's normalized q / k, the rstd of a call
-    without a saved set) live outside the workspace.  ``_qk_l2norm_form="fallback"`` (with the flag; a test knob, as
-    the single-rank explicit fallback workspace) runs the single-rank fallback form: the separate normalization and
-    pullback programs around the plain records, whose results are bitwise those of the fused form.  With the flag on,
-    construction raises ``NotImplementedError`` while the single-rank programs of the form are absent
+    layout of the mode's programs).  The rstd of a call without a saved set is per call; the backward's normalized
+    q / k take the arena bytes of the buffers it moves onto its outputs (:func:`_l2n_row_hosts`), else per-call
+    tensors.  ``_qk_l2norm_form="fallback"`` (with the flag; a test knob, as the single-rank explicit fallback
+    workspace) runs the single-rank fallback form: the separate normalization and pullback programs around the plain
+    records, whose results are bitwise those of the fused form.  With the flag on, construction raises
+    ``NotImplementedError`` while the single-rank programs of the form are absent
     (:func:`cake_kcp_plan.require_qk_l2norm`: rank-independent inputs only, before any arena or plan), on every rank
     alike, as do :meth:`ensure` and :meth:`reserve` on another device architecture."""
 
@@ -5412,7 +5414,7 @@ def _backward(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
         call.stage("qk_pullback")
     if call.gate == "raw":
         call.stage("param_finalize", seg_cap=call.scratch.get("seg_cap"))
-    if call.l2n:  # the per-call normalized q / k die after their last reader (the GLM intra program)
+    if call.l2n:  # the normalized q / k die after their last reader (the GLM intra program)
         call.l2n_values = None
 
 
@@ -6280,18 +6282,22 @@ def _bwd_body(call: CallDetKcp, saved: SavedDetKcp | None) -> tuple[torch.Tensor
     chunks only) and ``param_finalize`` reduces them in the fixed order of the local chunks, with its per-call
     scratch ``part2`` / ``ticket`` and ``seg_cap`` from ``cake_backend._raw_finalize_scratch``; a rank without tokens
     launches nothing and returns zero parameter gradients.  In-kernel Q / K L2 norm: the saved set's rstd or, in
-    replay mode, a fresh one, and the per-call normalized q / k (:func:`_qk_l2norm_begin`); the outputs are the
-    same."""
-    if call.l2n:
-        _qk_l2norm_begin(call, None if saved is None else saved.qk_rstd)
+    replay mode, a fresh one, and the normalized q / k (:func:`_qk_l2norm_begin`), in the arena where the replay
+    layout's ``v_new`` / ``dv2`` ride on the outputs' bytes (:func:`_l2n_row_hosts`; dq / dk are then the two halves
+    of one tensor); the outputs are the same."""
     dt = call.backend.dtypes
     T, H = call.T_r, call.H
-    call.grads = {
-        "dq": _alloc((T, H, D), dt["dq"], call.device),
-        "dk": _alloc((T, H, D), dt["dk"], call.device),
-        "dv": _alloc((T, H, D), dt["dv"], call.device),
-    }
+    hosts = _l2n_row_hosts(call) if call.l2n else {}
+    moved: dict[str, torch.Tensor] = {}  # the moved arena buffer -> the output tensor whose bytes carry it
+    if "dv2" in hosts:
+        moved["dv2"] = _alloc((2, T, H, D), dt["dq"], call.device)
+        dq, dk = moved["dv2"][0], moved["dv2"][1]
+    else:
+        dq = _alloc((T, H, D), dt["dq"], call.device)
+        dk = _alloc((T, H, D), dt["dk"], call.device)
+    call.grads = {"dq": dq, "dk": dk, "dv": _alloc((T, H, D), dt["dv"], call.device)}
     if call.gate == "raw":
+        names = _RAW_GRADS
         call.grads["dg_raw"] = _alloc((T, H, D), dt["dg_raw"], call.device)
         call.grads["dbeta"] = _alloc((T, H), dt["dbeta"], call.device)
         if call.local is not None and T > 0:
@@ -6308,16 +6314,72 @@ def _bwd_body(call: CallDetKcp, saved: SavedDetKcp | None) -> tuple[torch.Tensor
         else:  # no local stage runs on this rank: its tokens contribute nothing
             call.grads["dA_log"] = _zeros((H,), dt["dA_log"], call.device)
             call.grads["ddt_bias"] = _zeros((H * D,), dt["ddt_bias"], call.device)
-        _backward(call, saved)
-        return tuple(call.grads[n] for n in _RAW_GRADS)
-    call.grads["dg"] = _alloc((T, H, D), dt["dg"], call.device)
-    call.grads["dbeta"] = _alloc((T, H), dt["dbeta"], call.device)
+    else:
+        names = ("dq", "dk", "dv", "dbeta", "dg")
+        call.grads["dg"] = _alloc((T, H, D), dt["dg"], call.device)
+        call.grads["dbeta"] = _alloc((T, H), dt["dbeta"], call.device)
+    if "v_new" in hosts:
+        moved["v_new"] = call.grads[hosts["v_new"][0]]
+    if call.l2n:
+        _qk_l2norm_begin(call, None if saved is None else saved.qk_rstd, hosts=moved)
     _backward(call, saved)
-    return tuple(call.grads[n] for n in ("dq", "dk", "dv", "dbeta", "dg"))
+    return tuple(call.grads[n] for n in names)
+
+
+# The in-kernel Q / K L2 norm's backward keeps its token-layout normalized rows in the local arena where it can (issue
+# #7817): ``qn`` on the bytes of the replay layout's ``v_new``, ``kn`` on those of ``dv2``, each of which then rides on
+# the bytes of per-call outputs that only the stages of :data:`_L2N_LATE_STAGES` write, after the last ``v_new`` /
+# ``dv2`` read (the fused gradient, step 6): ``dv2`` on dq / dk (the two halves of one BF16 ``[2, T_r, H, 128]``
+# tensor), ``v_new`` on dg (FP32 ``[T_r, H, 128]``; raw gate mode the BF16 ``dg_raw``).  Without them the backward
+# would hold a per-call ``[T_r, H, 128]`` BF16 pair beyond the flag-off backward's peak (:func:`_l2n_row_hosts`).
+_L2N_LATE_STAGES = frozenset({"glm_intra", "gate_epilogue", "qk_pullback", "param_finalize"})
+_L2N_ROW_HOSTS = (("v_new", "qn"), ("dv2", "kn"))  # (the moved arena buffer, the normalized rows on its bytes)
+
+
+def _l2n_row_hosts(call: CallDetKcp) -> dict[str, tuple[str, ...]]:
+    """The arena buffers a flag-on backward moves onto per-call outputs, each with the outputs whose bytes carry it:
+    ``{"v_new": ("dg",), "dv2": ("dq", "dk")}`` (raw gate mode ``("dg_raw",)``); the freed bytes hold ``qn`` /
+    ``kn`` (:data:`_L2N_ROW_HOSTS`, :func:`_qk_l2norm_begin`).  A buffer moves where the replay layout holds it alone
+    in its slot, its outputs' BF16 rows cover its ``R`` rows (dq / dk and dg ``2 T_r``, dg_raw ``T_r``), no record of
+    the stages of :data:`_L2N_LATE_STAGES` binds it and no record of the backward's other stages binds those
+    outputs.  The KCP's own programs bind no output (K1 / K2 write the tapes, ``kcp_dav`` reads ``v_new`` at step
+    4).  Nothing moves on a forward, on a rank without local stages or tokens, or on the lean layout."""
+    if not call.backward or call.local is None or call.T_r == 0 or _lean_passes(call.local):
+        return {}
+    p, path, T, dt = call.local.plan, LOCAL_PATH_BWD, call.T_r, call.backend.dtypes
+    late: set[str] = set()
+    early: set[str] = set()
+    for stage in (*L2N_FALLBACK_STAGES, *LOCAL_STAGES_BWD):
+        if stage in KCP_LOCAL_RECORDS:
+            continue
+        if stage in WY_DIRECT_RECORDS and not p.dispatched(stage, path):
+            record = WY_DIRECT_RECORDS[stage]
+        elif p.dispatched(stage, path):
+            record = p.record(stage, path)
+        else:
+            continue
+        (late if stage in _L2N_LATE_STAGES else early).update(
+            cake_jit.MODULES[record]["logical"].values()
+        )
+    regions = p.layout(LOCAL_LAYOUT_BWD)
+    slot = {r.name: r.slot for r in regions}
+    dg = "dg_raw" if call.gate == "raw" else "dg"
+    pair = 2 * T if dt["dq"] == dt["dk"] == torch.bfloat16 else 0
+    cases = (("v_new", (dg,), T * dt[dg].itemsize // 2), ("dv2", ("dq", "dk"), pair))
+    hosts: dict[str, tuple[str, ...]] = {}
+    for buf, outs, rows in cases:
+        alone = buf in slot and sum(r.slot == slot[buf] for r in regions) == 1
+        if alone and rows >= p.R and buf not in late and early.isdisjoint(outs):
+            hosts[buf] = outs
+    return hosts
 
 
 def _qk_l2norm_begin(
-    call: CallDetKcp, rstd: torch.Tensor | None = None, *, save: bool = False
+    call: CallDetKcp,
+    rstd: torch.Tensor | None = None,
+    *,
+    save: bool = False,
+    hosts: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor | None:
     """The in-kernel Q / K L2 norm part of a call with ``use_qk_l2norm_in_kernel=True`` (issue #7817), first in its
     body; returns the rstd a saving forward keeps (``None`` otherwise).  The FP32 rstd ``qk_rstd`` ``[2, T_r, H]``
@@ -6329,12 +6391,14 @@ def _qk_l2norm_begin(
     the forward and replay layouts (both carry them: the capability check refuses a layout without them, so there
     is no stand-in); on a forward it writes no token-layout ``qn`` / ``kn`` (``write_qkn = 0``: no later forward
     program reads them, the slot views stand in; the fallback form's separate normalization writes them into the
-    first ``T_r`` rows of the same slots), on a backward the token-layout rows are a per-call ``[T_r, H, 128]`` BF16
-    pair outside the workspace (``write_qkn = 1``: written by the first q / k reader, read by the later ones,
-    dropped after the GLM intra program).  The values: one dict for every local stage (``q`` / ``k`` the
-    token-layout normalized rows, ``q_raw`` / ``k_raw`` the raw views and their strides, ``qk_rstd``,
-    ``num_tokens``, the dq / dk row strides, the three scalars).  A rank without tokens binds nothing and launches
-    no stage of the mode.  The capability refusal comes earlier, in :func:`_prepare`, on every rank alike."""
+    first ``T_r`` rows of the same slots), on a backward the token-layout rows ``[T_r, H, 128]`` BF16
+    (``write_qkn = 1``: written by the first q / k reader, read by the later ones up to the GLM intra program) are
+    ``qn`` on the arena bytes of ``v_new`` and ``kn`` on those of ``dv2`` where ``hosts`` (:func:`_l2n_row_hosts`,
+    from :func:`_bwd_body`) maps that buffer to the per-call output whose bytes then carry it (the call's views and
+    values bind the moved buffer there), else per call outside the workspace.  The values: one dict for every local
+    stage (``q`` / ``k`` the token-layout normalized rows, ``q_raw`` / ``k_raw`` the raw views and their strides,
+    ``qk_rstd``, ``num_tokens``, the dq / dk row strides, the three scalars).  A rank without tokens binds nothing and
+    launches no stage of the mode.  The capability refusal comes earlier, in :func:`_prepare`, on every rank alike."""
     T, H, dt = call.T_r, call.H, call.backend.dtypes
     keep = save and not call.backward
     if call.local is None or T == 0:
@@ -6354,8 +6418,7 @@ def _qk_l2norm_begin(
     qn_int, kn_int = views.qn_int, views.kn_int
     write_qkn = int(call.backward)
     if call.backward:
-        qk = _alloc((2, T, H, D), dt["q"], call.device)
-        qn, kn = qk[0], qk[1]
+        qn, kn = _l2n_bwd_rows(call, hosts or {})
     elif call.l2n_mode == "fallback":
         qn, kn = qn_int[:T], kn_int[:T]
     else:
@@ -6384,6 +6447,37 @@ def _qk_l2norm_begin(
         "write_rstd": rw[1],
     }
     return rstd if keep else None
+
+
+def _l2n_bwd_rows(
+    call: CallDetKcp, hosts: dict[str, torch.Tensor]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A flag-on backward's token-layout ``qn`` / ``kn`` ``[T_r, H, 128]`` BF16: for each arena buffer of
+    :data:`_L2N_ROW_HOSTS` in ``hosts``, the buffer moves onto the leading bytes of its host output (a copy of the
+    call's views and its values bind it there) and its normalized rows take the first ``T_r`` rows of its arena
+    bytes; a per-call tensor for the others (one ``[2, T_r, H, 128]`` pair when neither moves)."""
+    T, H, dt = call.T_r, call.H, call.backend.dtypes
+    rows: dict[str, torch.Tensor] = {}
+    if hosts:
+        views = call.scratch["views"]
+        moved = copy.copy(views)  # the arena's views are cached per layout: never rebind them
+        for buf, out in _L2N_ROW_HOSTS:
+            host = hosts.get(buf)
+            if host is None:
+                continue
+            arena = getattr(views, buf)
+            rows[out] = arena[:T]
+            there = host.view(-1).view(arena.dtype)[: arena.numel()].view(arena.shape)
+            setattr(moved, buf, there)
+            call.local_values[buf] = there
+        call.scratch["views"] = moved
+    if not rows:
+        qk = _alloc((2, T, H, D), dt["q"], call.device)
+        return qk[0], qk[1]
+    for out in ("qn", "kn"):
+        if out not in rows:
+            rows[out] = _alloc((T, H, D), dt["q" if out == "qn" else "k"], call.device)
+    return rows["qn"], rows["kn"]
 
 
 # ----------------------------------------------------------------------------------------------------------------
