@@ -23,11 +23,12 @@ from flashinfer.attention.prims_ts import (
     get_prims_ts_sparse_mla_decode_workspace_size,
 )
 from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+from flashinfer.utils import get_compute_capability
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
-    or not is_cute_dsl_arch_supported(*torch.cuda.get_device_capability()),
+    or get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7))
+    or not is_cute_dsl_arch_supported(*get_compute_capability(torch.device("cuda"))),
     reason="Requires SM100/SM103/SM107 and a CuTe DSL that can target it",
 )
 
