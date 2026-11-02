@@ -4207,10 +4207,12 @@ def _forward(
         launch, before WY overwrites the slots)."""
         if not hook or fallback:
             return None
-        return lambda: (
-            _internal_to_tokens(a.qn_int, tables_a[0], tables_a[1], qn_tok),
-            _internal_to_tokens(a.kn_int, tables_a[0], tables_a[1], kn_tok),
-        )
+
+        def copy_rows() -> None:
+            _internal_to_tokens(a.qn_int, tables_a[0], tables_a[1], qn_tok)
+            _internal_to_tokens(a.kn_int, tables_a[0], tables_a[1], kn_tok)
+
+        return copy_rows
 
     qn = kn = None
     seg_state = hseg = seg_m = None
