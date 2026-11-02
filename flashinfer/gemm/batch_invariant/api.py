@@ -117,13 +117,15 @@ def _aligned_rows(a: torch.Tensor, M: int, K: int, align: int) -> torch.Tensor:
     return a
 
 
-def _check_base(t: torch.Tensor, name: str, cls: str) -> None:
+def _check_base(
+    t: torch.Tensor, name: str, cls: str, what: Optional[str] = None
+) -> None:
     """The operand base alignment the kernels assume (TMA): a placement check, not numerics."""
     if t.data_ptr() % _ALIGN_BYTES:
         raise unsupported(
             cls,
             f"{name} at a base address that is not 16-byte aligned",
-            f"a 16-byte-aligned {name}",
+            f"a 16-byte-aligned {what or name}",
         )
 
 
@@ -145,7 +147,7 @@ def _prepare_out(
         )
     if out.device != device:
         raise unsupported(cls, "out on another device", "the output on A's device")
-    _check_base(out, "out", cls)
+    _check_base(out, "out", cls, "output")
     if out.stride(1) != 1 or (M > 1 and out.stride(0) != N):
         raise unsupported(
             cls,
@@ -491,7 +493,7 @@ def prepare_bmm_fp8_operands(
             )
         if out.device != A.device:
             raise unsupported(cls, "out on another device", "the output on A's device")
-        _check_base(out, "out", cls)
+        _check_base(out, "out", cls, "output")
         if (
             out.stride(2) != 1
             or (M > 1 and out.stride(1) != N)
