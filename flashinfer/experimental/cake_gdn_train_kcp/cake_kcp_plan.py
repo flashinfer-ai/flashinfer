@@ -63,8 +63,9 @@ SMALL_ONE_HV_MAX = 12`` whose fragments all have at most ``SMALL_ONE_NC_MAX = 16
 merges, compose chain or staging planes), and on every other row each rank below the chain cap takes ``min(P,
 wave_fill P)`` (the one-wave fill); on ``sm_count >= FILL_GUARD_SM_MIN = 153`` a row whose every rank holds at least
 two fragments keeps the ``"row_cost_lpt"`` vector when the fill would walk a fragment of at least ``FILL_GUARD_NC_MIN =
-200`` chunks as one chain (``P = 1`` below its ``"row_cost_lpt"`` P); it never raises a rank's ``P`` (``"row_cost_lpt"``,
-``"fill_small"`` and ``"fill_down"`` stay selectable).
+200`` chunks as one chain (``P = 1`` below its ``"row_cost_lpt"`` P) and that raises the row's slowest-rank B3 walk steps
+(:func:`walk_steps_rank_b3`) above those of the ``"row_cost_lpt"`` vector; it never raises a rank's ``P``
+(``"row_cost_lpt"``, ``"fill_small"`` and ``"fill_down"`` stay selectable).
 ``kcp_plan_row(row_tables(part), HV, sm_count)`` (the legacy
 ``"row_cost"`` rule, selectable; ``"row_cost_lpt"`` below starts from
 its plan) picks the segments per fragment ``P`` of every rank (``NSEG =
@@ -202,17 +203,20 @@ ROW_RULES = (
 # (candidate): at HV <= SMALL_ONE_HV_MAX, when no fragment of any rank exceeds SMALL_ONE_NC_MAX chunks, every rank runs
 # P = 1 (no segment merges, compose chain or staging planes); every other row keeps "row_cost_lpt".  "fill_small":
 # "small_one" on its rows, "fill_down" on every other row.  None of them raises a rank's P.
-# "fill_down_guard" / "fill_small_guard" (the shipped graph / eager rules): "fill_down" / "fill_small" with a row guard on SM
-# counts of at least FILL_GUARD_SM_MIN: on a row whose every rank holds at least two fragments (zigzag / per-document
-# layouts), when the fill sends a rank to P = 1 below its "row_cost_lpt" P and that rank's longest fragment has at least
-# FILL_GUARD_NC_MIN chunks, the row keeps "row_cost_lpt" bitwise.  On R200 (212 / 216 SMs) the one-wave fill of a
-# three-fragment rank is floor(SM / (3 HV)) = 1 at HV = 48 while the two-fragment ranks keep P = 2, so the long fragment
-# becomes the row's slowest forward walk: on the 212-SM records (K3E / P1 / P2 / P3 / P5 (16,48) CP8 zigzag, 237 /
-# 256-chunk fragments) "row_cost_lpt" is 7-10 % faster in the forward and 5-6 % in the checkpointed step (1-3 % with
-# graph replay), 0-3 % slower in forward + backward (fewer segments keep the backward cheaper).  Shorter fragments
-# (<= 128 chunks) and rows with single-fragment ranks measured faster with the fill (or within 1 %), so the guard leaves
-# them.  The fill was calibrated on the 148 / 152-SM rows of record; the guard starts above that range, so B200 / GB300
-# plans are those of "fill_down" / "fill_small" bitwise.
+# "fill_down_guard" / "fill_small_guard" (the shipped graph / eager rules): "fill_down" / "fill_small" with a row guard.
+# The row keeps "row_cost_lpt" bitwise when all four conditions hold: (1) sm_count >= FILL_GUARD_SM_MIN; (2) every rank
+# holds at least two fragments (whatever the layout); (3) the fill sends some rank to P = 1 below its "row_cost_lpt" P
+# while that rank's longest fragment has at least FILL_GUARD_NC_MIN chunks; (4) the fill's slowest-rank B3 walk steps
+# (walk_steps_rank_b3, the largest over the ranks) exceed those of the "row_cost_lpt" vector.  Otherwise the row keeps
+# the fill.  On R200 (212 / 216 SMs) the one-wave fill of a three-fragment rank is floor(SM / (3 HV)) = 1 at HV = 48
+# while the two-fragment ranks keep P = 2, so the long fragment becomes the row's slowest walk: on the 212-SM records
+# (K3E / P1 / P2 / P3 / P5 (16,48) CP8 zigzag, 237 / 256-chunk fragments) "row_cost_lpt" is 7-10 % faster in the
+# forward and 5-6 % in the checkpointed step (1-3 % with graph replay), 0-3 % slower in forward + backward (fewer
+# segments keep the backward cheaper).  Condition (4) leaves the rows whose fill already walks fewer steps, e.g. a
+# contiguous CP2 row whose P = 1 rank holds 224-chunk fragments next to a rank with a 384-chunk fragment.  Shorter
+# fragments (<= 128 chunks) and rows with single-fragment ranks measured faster with the fill (or within 1 %), so the
+# guard leaves them.  The fill was calibrated on the 148 / 152-SM rows of record; the guard starts above that range, so
+# B200 / GB300 plans are those of "fill_down" / "fill_small" bitwise.
 FILL_GUARD_SM_MIN = 153
 FILL_GUARD_NC_MIN = 200
 SMALL_ONE_HV_MAX = 12
@@ -1095,6 +1099,17 @@ def kcp_plan_row(
                     seg, P=P_new, NSEG=seg.n_frag * P_new, p_rule=p_rule
                 )
             )
+
+        def slowest_walk(plans: "tuple[KcpSegmentPlan, ...]") -> int:
+            return max(
+                (
+                    walk_steps_rank_b3(table, HV, sm_count, seg.P)
+                    for table, seg in zip(tables, plans, strict=True)
+                    if table
+                ),
+                default=0,
+            )
+
         if (
             p_rule in ("fill_down_guard", "fill_small_guard")
             and sm_count >= FILL_GUARD_SM_MIN
@@ -1103,8 +1118,9 @@ def kcp_plan_row(
                 new.P == 1 < old.P and max(nc for nc, _ in table) >= FILL_GUARD_NC_MIN
                 for new, old, table in zip(out, shipped, tables, strict=True)
             )
+            and slowest_walk(tuple(out)) > slowest_walk(shipped)
         ):
-            # the row guard: the fill would walk a long fragment as one chain (the row's slowest forward walk)
+            # the row guard: the fill would walk a long fragment as one chain and so lengthen the row's slowest walks
             return tuple(dataclasses.replace(seg, p_rule=p_rule) for seg in shipped)
         return tuple(out)
 

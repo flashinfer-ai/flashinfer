@@ -1283,11 +1283,13 @@ def test_faster_schedule_rules_never_raise_a_ranks_P() -> None:
 def test_fill_guard_keeps_row_cost_lpt_for_a_long_one_chain_fragment() -> None:
     """The shipped rules ``"fill_small_guard"`` (eager) and ``"fill_down_guard"`` (graph replay) are ``"fill_small"`` /
     ``"fill_down"`` plus a row guard on SM counts of at least ``FILL_GUARD_SM_MIN``: on a row whose every rank holds at
-    least two fragments, when the fill sends a rank to P = 1 below its ``"row_cost_lpt"`` P and that rank's longest
-    fragment has at least ``FILL_GUARD_NC_MIN`` chunks, the row keeps the ``"row_cost_lpt"`` vector.  Below the guard's
-    SM range (B200 148, GB300 152) every plan equals the unguarded rule's; on R200 (212 / 216 SMs) the K3E zigzag row
-    (third rank: three 256-chunk fragments) keeps ``"row_cost_lpt"``, while the DET 64k zigzag CP4 row (128-chunk
-    fragments) and the single-document zigzag row (no P = 1 rank) keep the one-wave fill."""
+    least two fragments, when the fill sends a rank to P = 1 below its ``"row_cost_lpt"`` P, that rank's longest
+    fragment has at least ``FILL_GUARD_NC_MIN`` chunks and the fill's slowest-rank B3 walk steps exceed those of the
+    ``"row_cost_lpt"`` vector, the row keeps the ``"row_cost_lpt"`` vector.  Below the guard's SM range (B200 148,
+    GB300 152) every plan equals the unguarded rule's; on R200 (212 / 216 SMs) the K3E zigzag CP8 row (third rank:
+    three 256-chunk fragments) and the quarter / half K3E zigzag rows (CP4 / CP2) keep ``"row_cost_lpt"``, while the DET
+    64k zigzag CP4 row (128-chunk fragments), the single-document zigzag row (no P = 1 rank) and the half K3E contiguous
+    CP2 row (the fill walks fewer steps) keep the one-wave fill."""
     pairs = (("fill_small_guard", "fill_small"), ("fill_down_guard", "fill_down"))
     assert (
         gp.P_RULE_DEFAULT == "fill_small_guard" and gp.P_RULE_GRAPH == "fill_down_guard"
@@ -1301,10 +1303,19 @@ def test_fill_guard_keeps_row_cost_lpt_for_a_long_one_chain_fragment() -> None:
     det3_z4 = gp.row_tables(gp.partition_kcp(det3, 4, "zigzag"))
     assert [len(t) for t in det3_z4] == [2, 3, 2, 3]
     one_doc_z = gp.row_tables(gp.partition_kcp(torch.tensor([0, 254976]), 8, "zigzag"))
+    k3e4 = torch.tensor([0, 49152, 81920, 110592, 131072], dtype=torch.int64)
+    k3e4_z4 = gp.row_tables(gp.partition_kcp(k3e4, 4, "zigzag"))
+    k3e2 = torch.tensor([0, 24576, 40960, 55296, 65536], dtype=torch.int64)
+    k3e2_z2 = gp.row_tables(gp.partition_kcp(k3e2, 2, "zigzag"))
+    k3e2_c2 = gp.row_tables(gp.partition_kcp(k3e2, 2, "contiguous"))
+    assert [len(t) for t in k3e2_c2] == [2, 3]
     tables = (
         k3e_z,
         det3_z4,
         one_doc_z,
+        k3e4_z4,
+        k3e2_z2,
+        k3e2_c2,
         TABLE_P1_CP4_D,
         TABLE_P1_CP2_C,
         TABLE_P3_CP2_C,
@@ -1312,6 +1323,16 @@ def test_fill_guard_keeps_row_cost_lpt_for_a_long_one_chain_fragment() -> None:
         (((119, True), (119, True)),) * 8,
         ((), ((150, True), (20, False))),
     )
+
+    def slowest(table, HV, sm, P):
+        return max(
+            (
+                gp.walk_steps_rank_b3(t, HV, sm, p)
+                for t, p in zip(table, P, strict=True)
+                if t
+            ),
+            default=0,
+        )
 
     def Ps(table, HV, sm, rule):
         plans = gp.kcp_plan_row(table, HV, sm, p_rule=rule)
@@ -1341,6 +1362,7 @@ def test_fill_guard_keeps_row_cost_lpt_for_a_long_one_chain_fragment() -> None:
                             and max(nc for nc, _ in t) >= gp.FILL_GUARD_NC_MIN
                             for f, q, t in zip(fill, ship, table, strict=True)
                         )
+                        and slowest(table, HV, sm, fill) > slowest(table, HV, sm, ship)
                     )
                     assert got == (ship if keep else fill), (guarded, sm, HV)
                     guarded_rows += keep and fill != ship
@@ -1351,6 +1373,13 @@ def test_fill_guard_keeps_row_cost_lpt_for_a_long_one_chain_fragment() -> None:
         for guarded, plain in pairs:
             assert Ps(k3e_z, 48, sm, guarded) == (3, 3, 2, 3, 3, 3, 3, 3)
             assert Ps(det3_z4, 48, sm, guarded) == Ps(det3_z4, 48, sm, plain)
+            assert Ps(k3e4_z4, 48, sm, plain) == (2, 1, 2, 2)
+            assert Ps(k3e4_z4, 48, sm, guarded) == (3, 2, 3, 3)
+            assert Ps(k3e2_z2, 48, sm, plain) == (1, 2)
+            assert Ps(k3e2_z2, 48, sm, guarded) == (2, 2)
+            # a P = 1 rank with a 224-chunk fragment, but the fill walks fewer steps than "row_cost_lpt" (3, 2)
+            assert Ps(k3e2_c2, 48, sm, "row_cost_lpt") == (3, 2)
+            assert Ps(k3e2_c2, 48, sm, guarded) == (3, 1) == Ps(k3e2_c2, 48, sm, plain)
             assert (
                 Ps(one_doc_z, 48, sm, guarded)
                 == (2,) * 8

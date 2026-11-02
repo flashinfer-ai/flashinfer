@@ -114,10 +114,12 @@ The packed GDN training routes come in four combinations:
   segment merges, compose chain or staging planes); elsewhere a rank below the
   256-step chain cap takes the one-wave fill `P` when that is smaller.  On
   GPUs with at least 153 SMs (R200) a row guard keeps the deterministic
-  package's plan when every rank holds at least two fragments and the fill
-  would walk a fragment of at least 200 chunks as one chain (`P = 1`; on a
-  zigzag rank with three fragments that walk becomes the row's slowest
-  forward walk); B200 and B300 / GB300 plans are unchanged by the guard.  It
+  package's plan when every rank holds at least two fragments, the fill
+  would walk a fragment of at least 200 chunks as one chain (`P = 1`), and
+  that raises the slowest rank's walk steps above those of the deterministic
+  package's plan (on a zigzag rank with three fragments that walk becomes the
+  row's slowest walk); B200 and B300 / GB300 plans are unchanged by the
+  guard.  It
   never raises a rank's `P`, needs no host synchronization, and the plan stays
   a pure function of the fragment tables, `HV` and the SM count (the same `P`
   on every rank).  A context built with `graph_replay=True` (for calls with
