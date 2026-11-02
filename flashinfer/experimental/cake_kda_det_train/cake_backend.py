@@ -934,9 +934,13 @@ def _plan(
         "sm_count": sm_count,
     }
     # the saved-state path exists on the segmented route only (the serial route has no segment states)
+    # an in-kernel Q/K L2 norm mode launches no gate epilogue: its GLM intra programs write the gate gradients
+    # themselves on every architecture (:func:`_gate_fused`)
     records = {
         path: {
-            stage: _select_record(
+            stage: None
+            if l2n != "off" and stage == "gate_epilogue"
+            else _select_record(
                 stage, gate, **scalars, arch=arch, path=path, **_l2n_kw(l2n)
             )
             for stage in _PATH_STAGES[path]
