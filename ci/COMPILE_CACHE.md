@@ -118,7 +118,8 @@ through `extra_key_files`. This is not a general Python dependency analyzer.
 CPU lifecycle tests mock Docker but use real locks, copies, pruning, and shell
 exit handling. They live outside `tests/` so broad GPU runs and packaged nightly
 tests do not collect host-infrastructure checks. The pre-commit workflow runs
-them once on a CPU runner for each PR/main push:
+the `unittest` discovery below once on a CPU runner for each PR/main push; run
+the JIT tests and the `bash -n` syntax check manually:
 
 ```bash
 python -m unittest discover -s ci/tests -p 'test_compile_cache*.py' -v
