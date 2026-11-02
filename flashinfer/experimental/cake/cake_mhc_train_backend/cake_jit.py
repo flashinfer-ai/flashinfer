@@ -7358,10 +7358,12 @@ BWD_SLAB_ORDER = {
 # device with 212 SMs reads the cells below.
 # sm_107a with 212 SMs (R200) at hidden 4096, by the package-level A/B of BWD_SLAB_ORDER (2 runs, 16 replay groups x 30
 # replays, each after a 512 MiB L2 flush, backward and checkpointed-step graphs, 103 token counts in 256..65592): the
-# slab arm (the slab order and the bands below at every token count) against the chunk arm (the chunk order and
-# (0.5, 0.97)) reads faster at 84 of the 96 token counts from 1877 and slower at none, -853..-935 us in sum per run and
-# path, and faster in 16 of 16 groups at every token count of an edge run on the same board (33402..33920, 34367..34369,
-# 40960, 49152, 73728 / 98304 / 122880; -5.1..-100.3 us). Below 1877, 1536 reads slower in both runs (+0.9..+1.1 us) and
+# slab arm (the slab order, with (0.5, 0.985) to 33600 tokens, (0.5, 0.98) to 34368 and (0.5, 0.97) above, at every
+# token count) against the chunk arm (the chunk order and (0.5, 0.97)) reads faster at 84 of the 96 token counts from
+# 1877 and slower at none, -853..-935 us in sum per run and path, and faster in 16 of 16 groups at every token count of
+# an edge run on the same board (33402..33920, 34367..34369, 40960, 49152, 73728 / 98304 / 122880; -5.1..-100.3 us).
+# Below 1877 the slab arm's bands pick the form (0.5, 0.97) picks at each of the 7 measured token counts (lpt at 1024,
+# dynr at the others), so there the arms differ in the order only: 1536 reads slower in both runs (+0.9..+1.1 us) and
 # 1151 on the checkpointed step in one (+0.8 us), 1535 faster on the checkpointed step in both (-1.4..-1.5 us), the
 # others neutral; no token count in 1537..1876 is measured. So both cells keep the chunk arm's order and (0.5, 0.97) to
 # 1876 tokens, where the board launches what the tables above launch, and from 1877 tokens they are the slab arm's rule.
