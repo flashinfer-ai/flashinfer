@@ -1105,7 +1105,7 @@ cudaError_t launch_cooperative_kernel(const void* kernel, dim3 grid, dim3 block,
 cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temperature_arr,
                                      float temperature_val, ParameterKind parameter_kind,
                                      uint32_t rows, uint32_t vocab_size, void* workspace,
-                                     size_t workspace_bytes, bool enable_pdl, bool is_sm103,
+                                     size_t workspace_bytes, bool enable_pdl, bool pdl_device,
                                      SoftmaxRoute* selected_route, cudaStream_t stream) {
   const SoftmaxRoute route =
       select_softmax_route(rows, vocab_size, parameter_kind, buffers_aligned(logits, output));
@@ -1117,13 +1117,12 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
   float* parameter = temperature_arr != nullptr ? temperature_arr : logits;
   int rows_i = static_cast<int>(rows);
   int vocab_size_i = static_cast<int>(vocab_size);
-  // Keep the existing sm_100a launch path unchanged; sm_107a launches without
-  // PDL too, since the warp, rowwise, bootstrap and persistent kernels issue
-  // griddepcontrol only in their sm_103a builds. The high bit is an
-  // sm_103a integration-only PDL flag; adapted kernels strip it before
+  // Keep the existing sm_100a launch path unchanged; sm_103a and sm_107a launch
+  // with PDL. The high bit is the PDL flag of their builds
+  // (FLASHINFER_CAKE_SOFTMAX_DEVICE_PDL); adapted kernels strip it before
   // evaluating the original 0/1/2 parameter-kind ABI. The row-caching cluster
   // kernels instead have _pdl twins and take the plain parameter kind.
-  const bool launch_with_pdl = is_sm103 && enable_pdl;
+  const bool launch_with_pdl = pdl_device && enable_pdl;
   int parameter_kind_i = static_cast<int>(parameter_kind) | (launch_with_pdl ? 4 : 0);
 
   if (route == SoftmaxRoute::kWarp) {
@@ -1296,8 +1295,8 @@ SoftmaxRoute query_softmax_route(TensorView logits, Optional<TensorView> maybe_t
     return route;
   }
   CachedLaunch launch{};
-  // Mirrors launch_blackwell_softmax: only sm_103a launches with PDL.
-  const bool launch_with_pdl = enable_pdl && device_minor == 3;
+  // Mirrors launch_blackwell_softmax: sm_103a and sm_107a launch with PDL.
+  const bool launch_with_pdl = enable_pdl && (device_minor == 3 || device_minor == 7);
   status = select_cached_launch(rows, vocab_size, parameter_kind, launch_with_pdl,
                                 logits.device().device_id, &launch);
   TVM_FFI_ICHECK(status == cudaSuccess)
@@ -1349,7 +1348,7 @@ Array<int64_t> query_cached_kernel(TensorView logits, Optional<TensorView> maybe
 
 void blackwell_softmax_impl(TensorView workspace_buffer, TensorView logits, TensorView output,
                             Optional<TensorView> maybe_temperature_arr, double temperature_val,
-                            bool enable_pdl, bool temperature_is_none, bool is_sm103) {
+                            bool enable_pdl, bool temperature_is_none, bool pdl_device) {
   const ParameterKind parameter_kind =
       validate_logits_and_temperature(logits, maybe_temperature_arr, temperature_is_none);
   validate_softmax_io(workspace_buffer, logits, output);
@@ -1369,7 +1368,7 @@ void blackwell_softmax_impl(TensorView workspace_buffer, TensorView logits, Tens
   SoftmaxRoute selected_route = SoftmaxRoute::kFallback;
   cudaError_t status = launch_blackwell_softmax(
       logits_ptr, output_ptr, temperature_ptr, static_cast<float>(temperature_val), parameter_kind,
-      rows, vocab_size, workspace_buffer.data_ptr(), workspace_bytes, enable_pdl, is_sm103,
+      rows, vocab_size, workspace_buffer.data_ptr(), workspace_bytes, enable_pdl, pdl_device,
       &selected_route, stream);
   if (status == cudaErrorNotSupported) {
     status = sampling::OnlineSoftmax<float>(logits_ptr, output_ptr, rows, vocab_size,
@@ -1386,9 +1385,9 @@ void blackwell_softmax_impl(TensorView workspace_buffer, TensorView logits, Tens
 
 void blackwell_softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
                        Optional<TensorView> maybe_temperature_arr, double temperature_val,
-                       bool enable_pdl, bool temperature_is_none, bool is_sm103) {
+                       bool enable_pdl, bool temperature_is_none, bool pdl_device) {
   blackwell_softmax_impl(workspace_buffer, logits, output, maybe_temperature_arr, temperature_val,
-                         enable_pdl, temperature_is_none, is_sm103);
+                         enable_pdl, temperature_is_none, pdl_device);
 }
 
 int64_t blackwell_softmax_route(TensorView logits, Optional<TensorView> maybe_temperature_arr,

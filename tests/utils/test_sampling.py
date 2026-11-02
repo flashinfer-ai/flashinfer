@@ -1448,6 +1448,44 @@ def test_softmax_pdl_waits_for_temperature(batch_size, vocab_size):
 
 
 @pytest.mark.parametrize(
+    "batch_size,vocab_size",
+    [
+        (8, 111),  # warp-packed route
+        (8, 1001),  # rowwise route (vocab not a multiple of 8)
+        (256, 32004),  # cooperative bootstrap route
+        (1, 32000),  # row-caching cluster route, _pdl twin
+        (16, 151552),  # shared-tile cluster route, _pdl twin
+        (48, 256000),  # persistent 16-CTA clusters
+        (1024, 256000),  # shared-tile 16-CTA clusters, _pdl twin
+    ],
+)
+def test_softmax_blackwell_pdl_waits_for_temperature(batch_size, vocab_size):
+    if torch.cuda.get_device_capability() not in ((10, 3), (10, 7)):
+        pytest.skip("Cake softmax routes launch with PDL on SM103 and SM107")
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    temperature_value = 0.5
+    temperature = torch.full((batch_size,), temperature_value, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+    expected = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=False
+    )
+
+    # Row 0's temperature is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the softmax kernel.
+    temperature[0] = temperature_value * 4
+    late_store(temperature, temperature_value)
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=True
+    )
+
+    torch.testing.assert_close(probs, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
     "batch_size,vocab_size,temperature_kind",
     [
         (1, 32000, "none"),  # cached cluster route, one row spread over 16 CTAs
