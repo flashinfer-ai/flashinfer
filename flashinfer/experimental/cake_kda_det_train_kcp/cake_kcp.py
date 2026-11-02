@@ -5414,7 +5414,8 @@ def _backward(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
         call.stage("qk_pullback")
     if call.gate == "raw":
         call.stage("param_finalize", seg_cap=call.scratch.get("seg_cap"))
-    if call.l2n:  # the normalized q / k die after their last reader (the GLM intra program)
+    # the normalized q / k die after their last reader (the GLM intra program)
+    if call.l2n:
         call.l2n_values = None
 
 
@@ -6288,7 +6289,8 @@ def _bwd_body(call: CallDetKcp, saved: SavedDetKcp | None) -> tuple[torch.Tensor
     dt = call.backend.dtypes
     T, H = call.T_r, call.H
     hosts = _l2n_row_hosts(call) if call.l2n else {}
-    moved: dict[str, torch.Tensor] = {}  # the moved arena buffer -> the output tensor whose bytes carry it
+    # the moved arena buffer -> the output tensor whose bytes carry it
+    moved: dict[str, torch.Tensor] = {}
     if "dv2" in hosts:
         moved["dv2"] = _alloc((2, T, H, D), dt["dq"], call.device)
         dq, dk = moved["dv2"][0], moved["dv2"][1]
@@ -6297,7 +6299,7 @@ def _bwd_body(call: CallDetKcp, saved: SavedDetKcp | None) -> tuple[torch.Tensor
         dk = _alloc((T, H, D), dt["dk"], call.device)
     call.grads = {"dq": dq, "dk": dk, "dv": _alloc((T, H, D), dt["dv"], call.device)}
     if call.gate == "raw":
-        names = _RAW_GRADS
+        names: tuple[str, ...] = _RAW_GRADS
         call.grads["dg_raw"] = _alloc((T, H, D), dt["dg_raw"], call.device)
         call.grads["dbeta"] = _alloc((T, H), dt["dbeta"], call.device)
         if call.local is not None and T > 0:
@@ -6332,11 +6334,16 @@ def _bwd_body(call: CallDetKcp, saved: SavedDetKcp | None) -> tuple[torch.Tensor
 # ``dv2`` read (the fused gradient, step 6): ``dv2`` on dq / dk (the two halves of one BF16 ``[2, T_r, H, 128]``
 # tensor), ``v_new`` on dg (FP32 ``[T_r, H, 128]``; raw gate mode the BF16 ``dg_raw``).  Without them the backward
 # would hold a per-call ``[T_r, H, 128]`` BF16 pair beyond the flag-off backward's peak (:func:`_l2n_row_hosts`).
-_L2N_LATE_STAGES = frozenset({"glm_intra", "gate_epilogue", "qk_pullback", "param_finalize"})
-_L2N_ROW_HOSTS = (("v_new", "qn"), ("dv2", "kn"))  # (the moved arena buffer, the normalized rows on its bytes)
+_L2N_LATE_STAGES = frozenset(
+    {"glm_intra", "gate_epilogue", "qk_pullback", "param_finalize"}
+)
+# (the moved arena buffer, the normalized rows on its bytes)
+_L2N_ROW_HOSTS = (("v_new", "qn"), ("dv2", "kn"))
 # The decision per plan (``cake_backend.plan`` returns one object per problem): {id(plan): (a weak reference to it,
 # the registry it read, {(gate, output dtypes): hosts})}, so a backward's host prologue does not walk the records again
-_L2N_ROW_HOSTS_KEPT: dict[int, tuple[Any, Any, dict[tuple[Any, ...], dict[str, tuple[str, ...]]]]] = {}
+_L2N_ROW_HOSTS_KEPT: dict[
+    int, tuple[Any, Any, dict[tuple[Any, ...], dict[str, tuple[str, ...]]]]
+] = {}
 
 
 def _l2n_row_hosts(call: CallDetKcp) -> dict[str, tuple[str, ...]]:
@@ -6349,7 +6356,12 @@ def _l2n_row_hosts(call: CallDetKcp) -> dict[str, tuple[str, ...]]:
     4).  Nothing moves on a forward, on a rank without local stages or tokens, or on the lean layout.  The decision is
     kept per plan, gate mode and output dtypes while the registry is the same object (:data:`_L2N_ROW_HOSTS_KEPT`);
     callers do not modify the returned dict."""
-    if not call.backward or call.local is None or call.T_r == 0 or _lean_passes(call.local):
+    if (
+        not call.backward
+        or call.local is None
+        or call.T_r == 0
+        or _lean_passes(call.local)
+    ):
         return {}
     p, dt = call.local.plan, call.backend.dtypes
     dg = "dg_raw" if call.gate == "raw" else "dg"
@@ -6484,7 +6496,8 @@ def _l2n_bwd_rows(
     rows: dict[str, torch.Tensor] = {}
     if hosts:
         views = call.scratch["views"]
-        moved = copy.copy(views)  # the arena's views are cached per layout: never rebind them
+        # the arena's views are cached per layout: never rebind them
+        moved = copy.copy(views)
         for buf, out in _L2N_ROW_HOSTS:
             host = hosts.get(buf)
             if host is None:

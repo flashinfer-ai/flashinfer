@@ -2156,7 +2156,13 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
         )  # fmt: skip
         zeros = torch.zeros(T, H, D, dtype=torch.bfloat16)
         q_raw, k_raw, _ = _packed_qk(zeros, zeros)
-        ops = {"q": q_raw, "k": k_raw, "v": torch.zeros(1), "beta": torch.zeros(1), "dout": torch.zeros(1)}
+        ops = {
+            "q": q_raw,
+            "k": k_raw,
+            "v": torch.zeros(1),
+            "beta": torch.zeros(1),
+            "dout": torch.zeros(1),
+        }
         if gate == "raw":
             gp = cake_backend._gate_params(
                 "raw", torch.zeros(H), torch.zeros(H * D), LOWER_BOUND, H, torch.device("cpu")
@@ -2199,7 +2205,8 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
     call, res, allocs = drive(ctx, form)
     _, _, allocs_off = drive(ctx, "off")
     p = call.local.plan
-    assert T < p.R <= 2 * T  # the one-token document pads its chunk: dg_raw does not cover R
+    # the one-token document pads its chunk: dg_raw does not cover R
+    assert T < p.R <= 2 * T
     dg = "dg_raw" if gate == "raw" else "dg"
     expected = {"dv2": ("dq", "dk")} | ({"v_new": ("dg",)} if gate == "g" else {})
     assert cake_kcp._l2n_row_hosts(call) == expected
@@ -2219,14 +2226,19 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
     assert call.local_values["dv2"] is moved.dv2
     if "v_new" in expected:
         assert moved.v_new.data_ptr() == call.grads[dg].data_ptr()
-        assert moved.v_new.shape == arena.v_new.shape and moved.v_new.dtype == arena.v_new.dtype
+        assert (
+            moved.v_new.shape == arena.v_new.shape
+            and moved.v_new.dtype == arena.v_new.dtype
+        )
         assert call.local_values["v_new"] is moved.v_new
     else:
         assert moved.v_new is arena.v_new
     # the normalized rows: kn on dv2's arena bytes, qn on v_new's (raw gate mode: per call)
     outs = {"dq", "dk", dg}
     first_out = next(
-        i for i, (s, r, _v) in enumerate(res) if outs & set(mod(s, r)["logical"].values())
+        i
+        for i, (s, r, _v) in enumerate(res)
+        if outs & set(mod(s, r)["logical"].values())
     )
     seen = set()
     for i, (src, record, values) in enumerate(res):
@@ -2245,7 +2257,9 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
                 assert not in_arena(values["qn"]), record
     assert seen == {"v_new", "dv2"}
     # bytes beyond the flag-off backward's: the replay's rstd, and qn where v_new stays
-    extra = (0 if kind == "bwd_saved" else 8 * T * H) + (0 if "v_new" in expected else T * H * D * 2)
+    extra = (0 if kind == "bwd_saved" else 8 * T * H) + (
+        0 if "v_new" in expected else T * H * D * 2
+    )
     assert sum(allocs) - sum(allocs_off) == extra
     assert p.workspace_bytes("replay") == cake_backend.plan(
         ctx.T_r, ctx.n_frag, H, sm, arch, gate=gate
