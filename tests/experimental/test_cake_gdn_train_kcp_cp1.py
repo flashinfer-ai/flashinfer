@@ -27,7 +27,8 @@ elementwise mismatches), the adversarial weak-erasure regimes (contract,
 finiteness and a relative-RMS sanity bound; mismatch counts recorded as
 evidence), the six head pairs (16, 48), (8, 24), (4, 12),
 (2, 6), (1, 3), (4, 4), the degenerate one-token / zero-token packs, the packed
-QKV strided view against the contiguous input, and the explicit forward /
+QKV strided view against the contiguous input, plain ``split`` views of a packed QKV row against the packed views and
+contiguous operands with their hooks and ``retain_grad`` (issue #8367), and the explicit forward /
 backward entries against autograd (output order ``dq, dk, dv, dbeta, dg``,
 saved-context against replay), and two caller streams with cached workspaces.  The multi-rank rows and the
 runtime contracts live in ``test_cake_gdn_train_kcp_dist.py``; the CPU plan, table, byte-query and fake-backend tests in
@@ -328,6 +329,154 @@ def test_packed_qkv_strided_view_is_within_budget_of_the_contiguous_input(
     _arms_within_budget(
         {"contiguous": contiguous, "strided": strided}, ref, TENSORS, "packed QKV"
     )
+
+
+def _split_view_pass(form, row0, g0, b0, dout, ctx, heads, *, ckpt, **o) -> dict:
+    """One autograd pass with q / k / v taken from the packed ``[1, T, (2 H_qk + HV) * 128]`` row ``row0``:
+    ``"plain"`` = ``split`` + ``view`` head views, ``"packed"`` = ``packed_qkv_views_kcp``, ``"contiguous"`` =
+    separate contiguous leaves holding the same values.  A tensor hook (recording the gradient) and ``retain_grad``
+    are set on every view (and on the split outputs) of the original forward.  Returns the results keyed by tensor
+    name (no batch axis; ``dq`` / ``dk`` / ``dv`` cut from the row gradient), the row gradient, the hooks' records
+    and the views."""
+    pkg = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp")
+    H, HV = heads
+    T = row0.shape[1]
+    sizes = (H * D, H * D, HV * D)
+    row = row0.detach().clone().requires_grad_(True)
+    g, beta = (x.detach().clone().requires_grad_(True) for x in (g0, b0))
+    leaves = []
+    if form == "contiguous":
+        leaves = [
+            p.detach()
+            .clone(memory_format=torch.contiguous_format)
+            .view(1, T, n, D)
+            .requires_grad_(True)
+            for p, n in zip(row0.split(sizes, dim=-1), (H, H, HV), strict=True)
+        ]
+    fired: dict = {}
+    views: dict = {}
+
+    def fn(row, g, beta, *leaves):
+        parts = ()
+        if form == "contiguous":
+            q, k, v = leaves
+        elif form == "plain":
+            parts = row.split(sizes, dim=-1)
+            q, k, v = (
+                p.view(1, T, n, D) for p, n in zip(parts, (H, H, HV), strict=True)
+            )
+        else:
+            q, k, v = pkg.packed_qkv_views_kcp(row, H_qk=H, HV=HV)
+        if not views:  # the original forward (a checkpoint recompute builds a graph no backward runs)
+            views.update(q=q, k=k, v=v, **{f"part{i}": p for i, p in enumerate(parts)})
+            for name, t in views.items():
+                t.register_hook(
+                    lambda gr, name=name: fired.setdefault(name, []).append(gr.clone())
+                )
+                t.retain_grad()
+        return gdn_api.chunk_gdn_kcp(q, k, v, g, beta, ctx, deterministic=False, **o)
+
+    if ckpt:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(fn, row, g, beta, *leaves, use_reentrant=False)
+    else:
+        out = fn(row, g, beta, *leaves)
+    out.backward(dout)
+    drow = (
+        torch.cat([x.grad.reshape(1, T, -1) for x in leaves], -1)
+        if leaves
+        else row.grad
+    )
+    res = {"out": out.detach()[0], "dg": g.grad[0], "dbeta": beta.grad[0]}
+    for n, (a, b), h in zip(
+        ("dq", "dk", "dv"),
+        ((0, H * D), (H * D, 2 * H * D), (2 * H * D, None)),
+        (H, H, HV),
+        strict=True,
+    ):
+        res[n] = drow[0, :, a:b].reshape(T, h, D)
+    return {"res": res, "row": drow, "fired": fired, "views": views}
+
+
+@pytest.mark.parametrize("ckpt", [False, True], ids=["direct", "checkpoint"])
+@pytest.mark.parametrize("norm", [False, True], ids=["l2n-off", "l2n-on"])
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [((300, 777), (2, 6)), ((2048 + 37, 1000), (16, 48))],
+    ids=["2x6", "16x48"],
+)
+def test_plain_split_views_keep_hooks_and_are_within_budget(
+    device, lengths, heads, norm, ckpt
+) -> None:
+    """Issue #8367 on the device programs: plain ``split`` / ``view`` head views of one packed QKV row, the
+    ``packed_qkv_views_kcp`` views of it and contiguous operands each give ``out``, ``dq | dk | dv`` (the row
+    gradient), ``dg`` and ``dbeta`` within the deterministic route's budgets of the FP64 reference and of each other,
+    with the in-kernel norm off and on (norm on: ``dq`` / ``dk`` carry the norm's pullback and are judged between the
+    arms), direct and checkpointed (bitwise equality between two results of this package is not part of its
+    contract).  Exact and structural: plain views keep torch's autograd path -- their tensor hooks
+    and ``retain_grad`` (and those on the split outputs) fire once with the gradient the row receives in the same
+    pass -- and only the packed views' split hands the packed dQKV row on without a concatenation."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    H, HV = heads
+    cu = _cu(lengths)
+    T = cu[-1]
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    row0 = torch.cat(
+        [inputs[n].to(device).reshape(1, T, -1) for n in ("q", "k", "v")], -1
+    ).contiguous()
+    g0, b0, dout = (inputs[n].to(device) for n in ("g", "beta", "dout"))
+    o = {"use_qk_l2norm_in_kernel": norm}
+    cols = {"q": (0, H * D), "k": (H * D, 2 * H * D), "v": (2 * H * D, None)}
+    expect_split = {
+        "contiguous": {"aliased": 0, "concatenated": 0},
+        "plain": {"aliased": 0, "concatenated": 0},
+        "packed": {"aliased": 1, "concatenated": 0},
+    }
+    arms = {}
+    for form, split in expect_split.items():
+        before = dict(kcp.PACKED_SPLIT_STATS)
+        got = _split_view_pass(form, row0, g0, b0, dout, ctx, heads, ckpt=ckpt, **o)
+        delta = {n: kcp.PACKED_SPLIT_STATS[n] - before[n] for n in before}
+        assert delta == split, (form, delta)
+        assert kcp.LAST_CALL["bwd"]["grad_layout"] == (
+            "separate" if form == "contiguous" else "packed"
+        ), form
+        _check_contract(got["res"], inputs)
+        arms[form] = got["res"]
+        assert sorted(got["fired"]) == sorted(got["views"]), form
+        for i, n in enumerate(("q", "k", "v")):
+            a, b = cols[n]
+            want = got["row"][..., a:b]
+            assert len(got["fired"][n]) == 1, (form, n)
+            assert torch.equal(got["fired"][n][0].reshape(want.shape), want), (form, n)
+            assert torch.equal(got["views"][n].grad.reshape(want.shape), want), (
+                form,
+                n,
+            )
+            if form == "plain":
+                part = got["fired"][f"part{i}"]
+                assert len(part) == 1 and torch.equal(part[0], want), (form, n)
+    ref, _ = reference_pack(inputs, device)
+    if not norm:
+        _arms_within_budget(arms, ref, TENSORS, "split views")
+        return
+    # with the norm on, the unit-norm operands give the reference's out / dv / dg / dbeta (budgets only), while the
+    # norm's pullback removes the radial part of dq / dk: those two are judged between the arms
+    _arms_within_budget(
+        arms, ref, ("out", "dv", "dg", "dbeta"), "split views", elementwise=False
+    )
+    keys = list(arms)
+    for i, a in enumerate(keys):
+        for b in keys[i + 1 :]:
+            for n in ("dq", "dk"):
+                _within_budget(
+                    arms[a][n],
+                    arms[b][n],
+                    f"split views: {a} vs {b} {n}",
+                    elementwise=False,
+                )
 
 
 def test_explicit_entries_are_within_budget_of_autograd_and_keep_the_output_order(

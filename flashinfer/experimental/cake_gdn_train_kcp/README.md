@@ -159,6 +159,10 @@ The packed GDN training routes come in four combinations:
   `layout="copy"` makes a contiguous copy first; its time is part of the
   measured module when reported.  Strided and contiguous inputs give the
   same results within the accuracy budgets.
+* When `q` / `k` / `v` are head views of one packed row, take them with
+  `packed_qkv_views_kcp` for full backward speed: plain `split` views of the
+  row give the same gradients, but the backward is about 1.1 ms (33-36 %)
+  slower at `(16, 48)` and 32,768 tokens (**Packed Q/K/V** below).
 * `scale` defaults to `128 ** -0.5`.
 * The host reads no tensor contents (no `.item()`, `.tolist()`, no implicit
   synchronization): every table is built on the CPU from the partition
@@ -313,6 +317,40 @@ row, and the split's backward returns that row as the gradient of `qkv`: no
 concatenation and no copy between the GDN backward and the convolution's
 backward.  The gradient values are bitwise those of separate operands
 (`LAST_CALL["bwd"]["grad_layout"]` is `"packed"` or `"separate"`).
+
+Callers whose `q` / `k` / `v` are head views of one packed row get the full
+backward speed only through `packed_qkv_views_kcp`.  Its conditions: `qkv`
+is `[..., T, (2 H_qk + HV) * 128]` with a dense channel axis
+(`qkv.stride(-1) == 1`), and `q` / `k` / `v` are its three head views in that
+order.  Plain views of the same row
+(`qkv.split((H_qk * 128, H_qk * 128, HV * 128), -1)`, then
+`.view(T, heads, 128)`) run the same programs on the same operands and give
+the same results (within the accuracy budgets; bitwise in every run measured
+below), and the backward still writes one packed row, but torch's split
+backward then concatenates `dq` / `dk` / `dv` into a new row.  Measured cost
+of the plain views (the #8367 repro with `deterministic=False`:
+`(H_qk, HV) = (16, 48)`, 32,768 tokens in five documents, one-rank context,
+forward and backward to the packed row, and the checkpointed step
+`torch.utils.checkpoint(views + chunk_gdn_kcp, use_reentrant=False)` =
+two forwards and one backward; CUDA-event ms, the median of 16 group
+medians (2 runs x 8 groups; a group = 2 x 20 timed calls per view form after
+5 warm-up calls, the forms interleaved in palindromic order); PyTorch
+2.14.1+cu130, CUDA 13.0 runtime):
+
+| GPU | in-kernel L2 norm | forward split / packed | backward split / packed | backward split - packed | checkpointed step split / packed |
+|---|---|---|---|---|---|
+| B200 (sm_100a, 148 SMs) | on | not stable in this run | 4.602 / 3.466 | +1.136 (1.328x) | 6.413 / 5.285 (1.213x) |
+| GB300 (sm_103a, 152 SMs) | off | 1.416 / 1.432 | 4.017 / 2.946 | +1.071 (1.364x) | 5.490 / 4.438 (1.237x) |
+| GB300 (sm_103a, 152 SMs) | on | 1.575 / 1.594 | 4.311 / 3.239 | +1.072 (1.331x) | 5.947 / 4.895 (1.215x) |
+
+The three views are the outputs of one custom autograd node.  Hooks and
+`retain_grad` on them fire as on any autograd output.  Its backward returns
+the incoming packed row itself when `dq` / `dk` / `dv` are the head views of
+one row of `qkv`'s shape and dtype (`PACKED_SPLIT_STATS["aliased"]`), and
+concatenates them otherwise (`PACKED_SPLIT_STATS["concatenated"]`): a missing
+gradient counts as zeros, and a hook that returns a new gradient also makes it
+concatenate.  Autograd refuses an in-place change to the views while `qkv`
+requires grad.  Plain `split` views keep torch's own autograd path and hooks.
 
 ```
 gdn_comm_bytes_kcp(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1_send, b2_recv, halo_fwd, halo_bwd}}
