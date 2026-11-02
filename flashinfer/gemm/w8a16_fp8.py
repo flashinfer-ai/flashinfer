@@ -20,7 +20,14 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
-from ..utils import get_compute_capability, register_custom_op, register_fake_op
+from ..trace.templates.gemm import w8a16_fp8_gemm_trace
+from ..utils import (
+    backend_requirement,
+    get_compute_capability,
+    register_custom_op,
+    register_fake_op,
+    supported_compute_capability,
+)
 from . import w8a16_fp8_dispatch as _dispatch
 
 
@@ -253,7 +260,23 @@ def _algo_code(algo: Optional[str], device: torch.device) -> int:
         raise ValueError(f"unknown algo {algo!r}; one of {sorted(table)}") from None
 
 
-@flashinfer_api
+@supported_compute_capability([90, 100, 103])
+def _w8a16_fp8_gemm_check(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    algo: Optional[str] = None,
+    workspace: Optional[torch.Tensor] = None,
+) -> bool:
+    """Device support of the single (CuTe-DSL) backend; the argument contract is
+    checked in the function body, where the messages name the offending argument."""
+    return True
+
+
+@backend_requirement({}, common_check=_w8a16_fp8_gemm_check)
+@flashinfer_api(trace=w8a16_fp8_gemm_trace)
 def w8a16_fp8_gemm(
     act: torch.Tensor,
     weight: torch.Tensor,
@@ -332,9 +355,14 @@ def w8a16_fp8_gemm(
 
     Notes
     -----
-    Runs on Hopper (``sm_90a``) and Blackwell (``sm_100a`` / ``sm_103a``).  The
-    kernels are CuTe-DSL, compiled on first use per architecture, tile variant,
-    activation dtype and bias presence, and are not part of the AOT packages.
+    Runs on Hopper (``sm_90a``) and Blackwell (``sm_100a`` / ``sm_103a``);
+    ``w8a16_fp8_gemm.is_compute_capability_supported(cc)`` answers for a
+    device.  The kernels are CuTe-DSL, compiled on first use per architecture,
+    tile variant, activation dtype and bias presence, and are not part of the
+    AOT packages.  Compiled kernels go to the on-disk CuTe-DSL cache under the
+    JIT workspace (``cached_ops/w8a16_fp8_gemm_<arch>_cute_dsl/``), so a later
+    process reloads them instead of recompiling; ``FLASHINFER_DISABLE_JIT`` and
+    ``FLASHINFER_CUTE_DSL_DISABLE_CACHE`` apply as to every CuTe-DSL kernel.
 
     Shapes and layout: ``K`` must be a multiple of 16 and ``N`` a multiple of
     8, both non-zero, and ``M`` (the product of ``act``'s leading dimensions,

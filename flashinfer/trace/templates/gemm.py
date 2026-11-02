@@ -2843,3 +2843,83 @@ svdquant_linear_trace = TraceTemplate(
     tags=["quantization:fp4"],
     init=_svdquant_linear_init,
 )
+
+
+# ── w8a16_fp8_gemm (bf16 / fp16 activation, FP8 e4m3 weight, per-tensor scale) ─
+
+
+@torch.no_grad()
+def _w8a16_fp8_gemm_reference(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias=None,
+    **_unused,
+) -> torch.Tensor:
+    """``act @ (weight.float() * weight_scale).T + bias`` with the e4m3 weight
+    dequantized exactly in fp32 and one rounding into ``act``'s dtype."""
+    a = act.to(torch.float32)
+    w = weight.to(torch.float32) * weight_scale.to(torch.float32).reshape(())
+    res = a @ w.T
+    if bias is not None:
+        res = res + bias.to(torch.float32)
+    return res.to(act.dtype)
+
+
+def _w8a16_fp8_gemm_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    scalar: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.gemm.w8a16_fp8_gemm``.
+
+    Sourced from ``tests/gemm/test_w8a16_fp8_gemm.py``: a ``randn`` bf16
+    activation and a ``randn`` weight quantized per tensor to e4m3 (mirrored
+    as ``per_tensor_fp8_quantize``); ``weight_scale`` is the dequant multiplier.
+    """
+    del scalar
+    torch.manual_seed(seed)
+    act = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    weight_bf16 = torch.randn(N, K, dtype=torch.bfloat16, device=device)
+    weight, inv_scale = per_tensor_fp8_quantize(weight_bf16)
+    return {"act": act, "weight": weight, "weight_scale": inv_scale.reshape(1)}
+
+
+w8a16_fp8_gemm_trace = TraceTemplate(
+    op_type="gemm_w8a16_fp8",
+    name_prefix="w8a16_fp8_gemm",
+    description=(
+        "W8A16 GEMM: out = act @ (weight * weight_scale).T + bias. act is "
+        "bf16 / fp16 [M, K]; weight is float8_e4m3fn [N, K] with one per-tensor "
+        "fp32 scale, dequantized inside the kernel."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+        "scalar": Var(description="weight_scale tensor length (1)."),
+    },
+    inputs={
+        "act": Tensor(["M", "K"]),
+        "weight": Tensor(
+            ["N", "K"],
+            dtype="float8_e4m3fn",
+            description="FP8 e4m3 weight in torch.nn.Linear layout [N, K].",
+        ),
+        "weight_scale": Tensor(
+            ["scalar"], dtype="float32", description="Per-tensor dequant scale."
+        ),
+        "bias": Tensor(["N"], optional=True, description="Bias in act's dtype."),
+    },
+    outputs={
+        "out": Tensor(["M", "N"], dtype_from="act"),
+    },
+    tags=["status:verified", "quantization:float8_e4m3fn"],
+    reference=_w8a16_fp8_gemm_reference,
+    check=_gemm_check,
+    init=_w8a16_fp8_gemm_init,
+)

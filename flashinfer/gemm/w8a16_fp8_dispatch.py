@@ -208,7 +208,48 @@ def _raw_stream(device: torch.device):
     return cuda.CUstream(torch._C._cuda_getCurrentRawStream(index))
 
 
+# In-process layer of the kernel cache.  Below it sits the shared on-disk cache of
+# flashinfer/jit/cute_dsl_core.py: one module directory per compile arch (the
+# sm_100a and sm_103a builds of the Blackwell kernel never share an artifact), one
+# exported object per specialization, invalidated by the DSL version or a change
+# to any file of _kernel_source_files().  A new process reloads the object instead
+# of recompiling; FLASHINFER_CUTE_DSL_DISABLE_CACHE=1 turns the disk layer off.
 _KERNEL_CACHE: Dict[Tuple, object] = {}
+_CUTE_DSL_MODULE = "w8a16_fp8_gemm"
+
+
+def _kernel_source_files() -> Tuple[str, ...]:
+    """Source files whose content invalidates the on-disk kernel cache."""
+    from .kernels.cute_dsl import (
+        w8a16_fp8_gemm_sm90,
+        w8a16_fp8_gemm_sm100,
+        w8a16_fp8_gemm_sm100_utils,
+        w8a16_fp8_splitk_reduce,
+    )
+
+    return (
+        __file__,
+        w8a16_fp8_gemm_sm90.__file__,
+        w8a16_fp8_gemm_sm100.__file__,
+        w8a16_fp8_gemm_sm100_utils.__file__,
+        w8a16_fp8_splitk_reduce.__file__,
+    )
+
+
+def _build_kernel(kernel_name: str, compile_fn):
+    """``compile_fn()`` through the shared CuTe-DSL disk cache."""
+    from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+    return build_and_load_cute_dsl_kernel(
+        _CUTE_DSL_MODULE,
+        kernel_name,
+        compile_fn,
+        extra_key_files=_kernel_source_files(),
+    )
+
+
+def _dtype_tag(dtype: torch.dtype) -> str:
+    return "bf16" if dtype == torch.bfloat16 else "fp16"
 
 
 def _get_sm100_kernel(
@@ -262,16 +303,25 @@ def _get_sm100_kernel(
         enable_pdl=enable_pdl,
         partial_output=partial_output,
     )
-    compiled = cute.compile(
-        kernel.wrapper,
-        *_compile_pointers(pointer_specs),
-        n,
-        m,
-        k,
-        splits=splits,
-        max_active_clusters=max_active_clusters,
-        stream=stream,
-        options="--opt-level 2 --enable-tvm-ffi",
+    kernel_name = (
+        f"sm100_algo{algo}_{_dtype_tag(act_dtype)}_bias{int(has_bias)}"
+        f"_swz{swizzle_size}_rm{int(raster_along_m)}_tf{transform_fragment_size}"
+        f"_mac{max_active_clusters}_pdl{int(enable_pdl)}"
+        f"_po{int(partial_output)}_sp{splits}"
+    )
+    compiled = _build_kernel(
+        kernel_name,
+        lambda: cute.compile(
+            kernel.wrapper,
+            *_compile_pointers(pointer_specs),
+            n,
+            m,
+            k,
+            splits=splits,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+            options="--opt-level 2 --enable-tvm-ffi",
+        ),
     )
     _KERNEL_CACHE[key] = compiled
     return compiled
@@ -290,14 +340,18 @@ def _get_reduce_kernel(
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
         return compiled
-    compiled = cute.compile(
-        W8A16SplitKReduce(has_bias, splits).wrapper,
-        *_compile_pointers(pointer_specs),
-        1,
-        8,
-        1,
-        stream=stream,
-        options="--opt-level 2 --enable-tvm-ffi",
+    kernel_name = f"reduce_{_dtype_tag(act_dtype)}_bias{int(has_bias)}_sp{splits}"
+    compiled = _build_kernel(
+        kernel_name,
+        lambda: cute.compile(
+            W8A16SplitKReduce(has_bias, splits).wrapper,
+            *_compile_pointers(pointer_specs),
+            1,
+            8,
+            1,
+            stream=stream,
+            options="--opt-level 2 --enable-tvm-ffi",
+        ),
     )
     _KERNEL_CACHE[key] = compiled
     return compiled
@@ -657,18 +711,25 @@ def _get_sm90_kernel(
         group_size=group,
         has_tail=has_tail,
     )
-    compiled = cute.compile(
-        kernel.wrapper,
-        *_compile_pointers(pointer_specs),
-        n,
-        m,
-        k,
-        tail_blocks,
-        1,  # body_items: dynamic
-        1,  # tail_splits: dynamic
-        num_persistent=num_persistent,
-        stream=stream,
-        options="--opt-level 2 --enable-tvm-ffi",
+    kernel_name = (
+        f"sm90_algo{tile_algo}_{_dtype_tag(act_dtype)}_bias{int(has_bias)}"
+        f"_grp{group}_np{num_persistent}_tail{int(has_tail)}"
+    )
+    compiled = _build_kernel(
+        kernel_name,
+        lambda: cute.compile(
+            kernel.wrapper,
+            *_compile_pointers(pointer_specs),
+            n,
+            m,
+            k,
+            tail_blocks,
+            1,  # body_items: dynamic
+            1,  # tail_splits: dynamic
+            num_persistent=num_persistent,
+            stream=stream,
+            options="--opt-level 2 --enable-tvm-ffi",
+        ),
     )
     _KERNEL_CACHE[key] = compiled
     return compiled
