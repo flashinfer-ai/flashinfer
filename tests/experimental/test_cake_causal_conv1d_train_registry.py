@@ -31,6 +31,7 @@ import filecmp
 import hashlib
 import importlib.util
 import inspect
+import os
 import re
 import sys
 import warnings
@@ -490,6 +491,202 @@ def test_backward_workspace_covers_every_override_row() -> None:
                 assert tiles == cake_jit.override_tiles(arch, route, C, geometry)
                 layout = cake_jit.accumulator_layout(record, C, tiles)
                 assert layout["total_bytes"] <= nbytes, (arch, route, C, name)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# The host plan of a call row (``_ROW_PLANS``): planned by the row's first call, the same values as a per-call plan.
+
+# The SM counts of the fake devices of the sweep, per architecture (B200 / GB300 / R200 boards first: the counts the
+# grid-trim rules were measured at).  The default sweep takes the first; the full sweep every one.
+PLAN_SWEEP_SMS = {"sm_100a": (148, 160), "sm_103a": (152, 148), "sm_107a": (212, 216)}
+# A device index no real device has: the rows the sweep plans never serve a launch.
+FAKE_DEVICE = 1 << 20
+# CAKE_CONV1D_FULL_PLAN_SWEEP=1 runs the full sweep: every SM count, five document counts and three token orders.
+FULL_PLAN_SWEEP = os.environ.get("CAKE_CONV1D_FULL_PLAN_SWEEP") == "1"
+
+
+def _plan_sweep_channels() -> tuple[int, ...]:
+    """``CHANNELS``, rows off the 32-channel grid, and every selection threshold and ``TILE_OVERRIDES`` channel count
+    of the registry with the multiple of 8 below it."""
+
+    channels = {*CHANNELS, 16, 24, 248, 520, 640, 1048, 1152, 3072}
+    for record in cake_jit.MODULES.values():
+        rule = cake_jit.select_rule(record)
+        for C in (rule or {}).get("channels", {}).values():
+            channels |= {int(C) - 8, int(C)}
+    for rows in cake_jit.TILE_OVERRIDES.values():
+        for _, C in rows:
+            channels |= {C - 8, C, C + 8}
+    return tuple(sorted(C for C in channels if C > 0))
+
+
+def _plan_sweep_tokens() -> tuple[int, ...]:
+    """Token counts on both sides of every bound where ``S`` enters a plan: the ``TILE_OVERRIDES`` ranges, the
+    grid-trim minimums and the selection rules' token floors, plus a few others."""
+
+    tokens = {1, 2, 63, 64, 1000, 250340, 1 << 20}
+    for rows in cake_jit.TILE_OVERRIDES.values():
+        for _, s_min, s_max in rows.values():
+            tokens |= {s_min - 1, s_min, s_max, s_max + 1}
+    tokens |= {cake_jit.TILE_ALIGNED_MIN_S - 1, cake_jit.TILE_ALIGNED_MIN_S}
+    for classes in cake_jit.TILE_ALIGNED_CLASSES.values():
+        for s_min, _ in classes.values():
+            tokens |= {s_min - 1, s_min}
+    for record in cake_jit.MODULES.values():
+        rule = cake_jit.select_rule(record)
+        for S in (rule or {}).get("tokens", {}).values():
+            tokens |= {int(S) - 1, int(S)}
+    return tuple(sorted(S for S in tokens if S > 0))
+
+
+@pytest.fixture
+def fake_device(monkeypatch):
+    """Plan on :data:`FAKE_DEVICE` of a given architecture and SM count: ``use(arch, sms)`` points ``cake_jit``'s
+    device queries at it and empties ``_ROW_PLANS``; the rows planned are dropped again after the test."""
+
+    def use(arch: str, sms: int) -> None:
+        monkeypatch.setattr(cake_jit, "device_arch", lambda device_index: arch)
+        monkeypatch.setattr(cake_jit, "sm_count", lambda device_index: sms)
+        pkg.plan_cache_clear()
+
+    pkg.plan_cache_clear()
+    yield use
+    pkg.plan_cache_clear()
+
+
+def _per_call(arch: str, kind: str, S: int, C: int, num_docs: int, gm: int, policy):
+    """What a call plans without ``_ROW_PLANS`` (``_route`` then ``_launch``), or the error it raises."""
+
+    try:
+        names = pkg._route(arch, kind, needs=pkg._route_needs(policy), C=C, S=S)
+        scalars, grid = pkg._launch(
+            cake_jit.MODULES[names[0]],
+            S,
+            C,
+            num_docs,
+            device_index=FAKE_DEVICE,
+            arch=arch,
+            bwd_grid_mult=gm,
+        )
+        return tuple(names), pkg._scalars(scalars), tuple(grid)
+    except (ValueError, RuntimeError) as exc:
+        return type(exc).__name__, str(exc)
+
+
+def _row_planned(arch: str, kind: str, S: int, C: int, num_docs: int, gm: int, policy):
+    """What a call plans from its ``_ROW_PLANS`` row (``_call_plan``), or the error it raises."""
+
+    try:
+        names, record, scalars, grid, _ = pkg._call_plan(
+            arch,
+            kind,
+            S,
+            C,
+            num_docs,
+            device_index=FAKE_DEVICE,
+            policy=policy,
+            bwd_grid_mult=gm,
+        )
+        assert record is cake_jit.MODULES[names[0]]
+        assert tuple(scalars) == cake_jit.PLAN_SCALARS
+        assert all(type(value) is int for value in scalars.values())
+        return tuple(names), dict(scalars), tuple(grid)
+    except (ValueError, RuntimeError) as exc:
+        return type(exc).__name__, str(exc)
+
+
+def _sweep_row_plans(arch: str) -> int:
+    """Every route of ``arch`` x the sweep's channel counts, token counts (in each order of the sweep, the row
+    planned by the order's first call), document counts and backward grid multiples: the row plan equals the per-call
+    plan, errors included.  Returns the number of calls checked."""
+
+    channels, tokens = _plan_sweep_channels(), _plan_sweep_tokens()
+    orders = [tokens]
+    if FULL_PLAN_SWEEP:
+        half = len(tokens) // 2
+        orders += [tokens[::-1], tokens[half:] + tokens[:half]]
+    docs = (1, 2, 4, 5, 1000) if FULL_PLAN_SWEEP else (1, 1000)
+    checked = 0
+    for order in orders:
+        pkg.plan_cache_clear()
+        for kind in cake_jit.ROUTES[arch]:
+            backward = cake_jit.route_role(kind) == "bwd"
+            policy = "fp32" if kind.endswith("fp32g") else "bf16" if backward else None
+            for gm in pkg.BWD_GRID_MULTS if backward else (1,):
+                for C in channels:
+                    for S in order:
+                        for num_docs in docs:
+                            want = _per_call(arch, kind, S, C, num_docs, gm, policy)
+                            got = _row_planned(arch, kind, S, C, num_docs, gm, policy)
+                            assert got == want, (arch, kind, C, S, num_docs, gm)
+                            checked += 1
+        assert len(pkg._ROW_PLANS) <= pkg._ROW_PLANS_MAX
+    return checked
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ARCHES)
+def test_row_plans_match_the_per_call_plan(arch, fake_device, record_property) -> None:
+    """A call planned from its ``_ROW_PLANS`` row launches the programs, plan scalars and grid a per-call plan
+    (``_route`` + ``_launch``) gives, and raises the same errors, on fake devices of the architecture: every route,
+    channel counts at every selection threshold and ``C % 32`` rows (whose grid ``launch_grid`` may trim by ``S``),
+    token counts at every ``TILE_OVERRIDES`` bound, grid-trim minimum and token floor, document counts and every
+    ``bwd_grid_mult``.  ``CAKE_CONV1D_FULL_PLAN_SWEEP=1`` runs the full sweep."""
+
+    checked = 0
+    for sms in PLAN_SWEEP_SMS[arch][: None if FULL_PLAN_SWEEP else 1]:
+        fake_device(arch, sms)
+        checked += _sweep_row_plans(arch)
+    record_property("row_plan_calls_checked", checked)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ARCHES)
+def test_row_plans_follow_a_replaced_override_table(
+    arch, fake_device, monkeypatch
+) -> None:
+    """A row planned before ``TILE_OVERRIDES`` changes keeps its plan until :func:`plan_cache_clear` empties the
+    cache; after it, with the rows of every architecture on ``arch`` (sm_107a ships none), every row's calls on both
+    sides of its token range plan as a per-call plan does, the override's tiles inside the range."""
+
+    fake_device(arch, PLAN_SWEEP_SMS[arch][0])
+    shipped = dict(cake_jit.TILE_OVERRIDES.get(arch, {}))
+    rows = {
+        key: value
+        for table in cake_jit.TILE_OVERRIDES.values()
+        for key, value in table.items()
+    }
+
+    def policy_of(route: str) -> str:
+        return "fp32" if route.endswith("fp32g") else "bf16"
+
+    planned = {
+        key: _row_planned(arch, key[0], value[1], key[1], 3, 1, policy_of(key[0]))
+        for key, value in rows.items()
+        if key[0] in cake_jit.ROUTES[arch]
+    }
+    monkeypatch.setitem(cake_jit.TILE_OVERRIDES, arch, rows)
+    changed = 0
+    for (route, C), before in planned.items():
+        _, s_min, _ = rows[(route, C)]
+        now = _per_call(arch, route, s_min, C, 3, 1, policy_of(route))
+        assert _row_planned(arch, route, s_min, C, 3, 1, policy_of(route)) == before
+        changed += now != before
+    assert changed or rows.items() <= shipped.items(), arch
+    assert pkg.plan_cache_clear() >= 1
+    checked = 0
+    for (route, C), (ct_vec, s_min, s_max) in rows.items():
+        if route not in cake_jit.ROUTES[arch]:
+            continue
+        for S in (s_min - 1, s_min, s_max, s_max + 1):
+            for gm in pkg.BWD_GRID_MULTS:
+                want = _per_call(arch, route, S, C, 3, gm, policy_of(route))
+                got = _row_planned(arch, route, S, C, 3, gm, policy_of(route))
+                assert got == want, (route, C, S, gm)
+                if s_min <= S <= s_max and isinstance(got[1], dict):
+                    assert got[1]["ct_vec"] == ct_vec, (route, C, S, gm)
+                checked += 1
+    assert checked
 
 
 # ----------------------------------------------------------------------------------------------------------------

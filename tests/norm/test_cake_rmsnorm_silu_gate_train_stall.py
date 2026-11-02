@@ -19,9 +19,10 @@ on another stream (the concurrent-launch contract of issues #7038 and #7548).
 
 The forward launches a plain grid of independent CTAs; on SM100 and SM103
 up to 10 rows per SM the short forward launches one 256-thread CTA per row
-block (fewer CTAs than SMs), from 976 rows per SM the mid forward whole waves
-of 6 CTAs per SM that each walk at most 2 row blocks, and from 2400 rows per
-SM the long forward whole waves of 3 CTAs per SM that each walk at most 6.  The backward launches
+block (fewer CTAs than SMs), from 976 rows per SM on SM100 and SM103 (800 on
+SM107) the mid forward whole waves of 6 CTAs per SM that each walk at most 2
+row blocks, and from 2400 rows per SM (1740 on SM107) the long forward whole
+waves of 3 CTAs per SM that each walk at most 6.  The backward launches
 at most one wave of CTAs (on SM100 and SM103 from 1280 rows per SM the long
 backward 5 CTAs per SM, a quarter more than an SM holds at once, its fifth on
 an SM starting as one of the first four leaves): when the grid has a CTA for
@@ -43,9 +44,12 @@ or at most ``MAX_EXTRA_MS`` above it.  The alone and busy calls alternate in
 pairs, so host launch gaps and clock drift hit both arms alike.
 
 The backward beside a kernel resident on every SM (issue #7548, item 2): each
-CTA of the backward needs 20736 bytes of dynamic shared memory, so a side
+CTA of the backward needs 20736 bytes of dynamic shared memory (on SM107 from
+1024 rows per SM each CTA of the long backward needs 10496), so a side
 kernel holding every SM with the default carveout delays its start until the
-side kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_silu_gate_train`).
+side kernel exits (observed on B200 with the 20736-byte CTAs and on R200 with
+both sizes, not by these tests; documented in
+:mod:`flashinfer.cake_rmsnorm_silu_gate_train`).
 The documented remedy is checked here: with the side kernel's preferred
 carveout set to the maximum shared memory, the backward (BF16 and FP32 weight
 gradients) and the forward start beside it and cost at most
@@ -68,11 +72,13 @@ backward), where the earlier fixed one-wave grid of 16 blocks per CTA ran
 beside the same side kernels: busy / alone is at most ``N / (N - k)``, plus
 the share of one CTA's blocks in the call (a CTA whose slot the side kernel
 holds walks all of its blocks once it starts), plus ``PROPORTIONAL_SLACK``, at
-the token counts that give the long forward's CTA slots 25 and 100 row blocks
-each (its threshold of 2400 rows per SM and four times that) and the mid
-forward's 11 and 24 (1056 and 2304 rows per SM: the fewest whole blocks
-per slot at or above its threshold of 976 rows per SM, and the most below the
-long forward's).  The short forward at 1 and 10 rows per SM keeps its speed
+the token counts that give the long forward's CTA slots the fewest whole row
+blocks each at or above its threshold and four times that (25 and 100 on
+SM100 and SM103, from 2400 rows per SM; 19 and 76 on SM107, from 1740) and
+the mid forward's the fewest at or above its threshold and the most below the
+long forward's (11 and 24, 1056 and 2304 rows per SM, on SM100 and SM103; 9
+and 18, 864 and 1728 rows per SM, on SM107).  The short forward at 1 and 10
+rows per SM keeps its speed
 beside the one-thread kernel, starts beside the all-SM kernel with the
 max-shared carveout, and beside a side kernel that holds ``k`` SMs (the item 1
 side kernels and 16 CTAs of 1024 threads with the max-shared carveout) ends no
@@ -662,39 +668,50 @@ def test_backward_slows_in_proportion_to_the_sms_held(
 
 
 # The long and mid forwards beside the item 1 side kernels: the long forward's
-# CTA slots (3 per SM) get 25 and 100 row blocks of 32 rows each, the mid
-# forward's (6 per SM) 11 and 24 row blocks of 16 rows each.
-LONG_FORWARD_BLOCKS_PER_SLOT = (25, 100)
-MID_FORWARD_BLOCKS_PER_SLOT = (11, 24)
+# CTA slots (3 per SM) get row blocks of 32 rows, the mid forward's (6 per SM)
+# row blocks of 16 rows, at the fewest whole blocks per slot at or above the
+# module's rows per SM on the device ("first": 25 and 11 on SM100 and SM103, 19
+# and 9 on SM107) and at four times that for the long forward, the most below
+# the long forward's rows per SM for the mid forward ("last": 100 and 24, 76
+# and 18).
+FORWARD_EDGES = ("first", "last")
 
 
-def _persistent_forward_tokens(role: str, blocks_per_slot: int) -> tuple[int, float]:
-    """``(T, cta_share)``: the fewest tokens ``T`` whose ``T * H`` rows give
-    each CTA slot of the forward module of ``role`` (``fwd_long`` or
-    ``fwd_mid``) ``blocks_per_slot`` row blocks, and the share of one CTA's
-    blocks in the call alone (blocks a CTA walks over blocks a slot runs);
-    skips where the architecture routes no such module."""
+def _persistent_forward_tokens(role: str, edge: str) -> tuple[int, int, float]:
+    """``(blocks_per_slot, T, cta_share)``: the row blocks per CTA slot of the
+    forward module of ``role`` (``fwd_long`` or ``fwd_mid``) at ``edge`` of
+    its rows, the fewest tokens ``T`` whose ``T * H`` rows give each slot that
+    many, and the share of one CTA's blocks in the call alone (blocks a CTA
+    walks over blocks a slot runs); skips where the architecture routes no such
+    module."""
     device_index = torch.cuda.current_device()
     arch = loader.device_arch(device_index)
-    name = loader.ROUTES[arch].get(role)
+    routes = loader.ROUTES[arch]
+    name = routes.get(role)
     if name is None:
         pytest.skip(f"{arch} routes no {role} module")
     sms = torch.cuda.get_device_properties(device_index).multi_processor_count
     rule = loader.MODULES[name]["grid_rule"]
     slots = int(rule["ctas_per_sm"]) * sms
     rows_per_block = int(rule["rows_per_block"])
+    # rows per SM that give each slot of the SM one more row block
+    step = int(rule["ctas_per_sm"]) * rows_per_block
+    blocks_per_slot = -(-loader.min_rows_per_sm(name, arch) // step)
+    if edge == "last" and role == "fwd_long":
+        blocks_per_slot *= 4
+    elif edge == "last":
+        long_start = loader.min_rows_per_sm(routes["fwd_long"], arch)
+        blocks_per_slot = (long_start - 1) // step
     tokens = -(-(blocks_per_slot * slots * rows_per_block) // H)
     rows = tokens * H
     assert loader.module_for_rows(arch, "fwd", rows, sms) == name
     (ctas, _, _) = loader.launch_grid(loader.MODULES[name], rows=rows, sm_count=sms)
     blocks = -(-rows // rows_per_block)
-    return tokens, -(-blocks // ctas) * slots / blocks
+    return blocks_per_slot, tokens, -(-blocks // ctas) * slots / blocks
 
 
-def _forward_slows_in_proportion(
-    role: str, blocks_per_slot: int, ctas: int, threads: int
-) -> None:
-    tokens, cta_share = _persistent_forward_tokens(role, blocks_per_slot)
+def _forward_slows_in_proportion(role: str, edge: str, ctas: int, threads: int) -> None:
+    blocks_per_slot, tokens, cta_share = _persistent_forward_tokens(role, edge)
     x, z, w, _dy = _inputs(tokens)
     y = torch.empty_like(x)
 
@@ -726,21 +743,21 @@ def _forward_slows_in_proportion(
 @pytest.mark.parametrize(
     "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
 )
-@pytest.mark.parametrize("blocks_per_slot", LONG_FORWARD_BLOCKS_PER_SLOT)
+@pytest.mark.parametrize("edge", FORWARD_EDGES)
 def test_long_forward_slows_in_proportion_to_the_sms_held(
-    blocks_per_slot: int, ctas: int, threads: int
+    edge: str, ctas: int, threads: int
 ) -> None:
-    _forward_slows_in_proportion("fwd_long", blocks_per_slot, ctas, threads)
+    _forward_slows_in_proportion("fwd_long", edge, ctas, threads)
 
 
 @pytest.mark.parametrize(
     "ctas,threads", PROPORTIONAL_SIDES, ids=["1x128", "16x640", "32x640"]
 )
-@pytest.mark.parametrize("blocks_per_slot", MID_FORWARD_BLOCKS_PER_SLOT)
+@pytest.mark.parametrize("edge", FORWARD_EDGES)
 def test_mid_forward_slows_in_proportion_to_the_sms_held(
-    blocks_per_slot: int, ctas: int, threads: int
+    edge: str, ctas: int, threads: int
 ) -> None:
-    _forward_slows_in_proportion("fwd_mid", blocks_per_slot, ctas, threads)
+    _forward_slows_in_proportion("fwd_mid", edge, ctas, threads)
 
 
 # The short forward: the rows per SM of its two token counts (one row and its

@@ -4648,7 +4648,7 @@
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a_kernel.cu",
     "csrc/experimental/mega_moe_v3/generated/deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a_binding.cu"
    ],
-   "closure_sha256": "9d86368986f158df20fa58d02d4830bcf4a908d25a02c873713f34e993e67f31",
+   "closure_sha256": "e88dff12cf489e87206bbf826a1e7486a9dd8096c335b7680e6b16163dafa606",
    "compile_flags": [
     "--use_fast_math"
    ],

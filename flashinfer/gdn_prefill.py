@@ -679,12 +679,17 @@ def _run_cake_gdn_prefill(
     # The device's SM count and, with ``cu_seqlens_cpu``, the host sequence
     # lengths: the rule the resolver evaluated with the architecture's nominal
     # count; this grid is authoritative for the workspace.
-    grid_x = _cake_gdn_prefill_grid_x(
-        total_tiles,
-        _cake_gdn_sm_count(device_index),
-        dvsplit,
-        bound_tokens,
-        seq_lens,
+    # The ragged DV-split route (``route.one_cta_per_tile``) launches one CTA per half tile.
+    grid_x = (
+        total_tiles
+        if route.one_cta_per_tile
+        else _cake_gdn_prefill_grid_x(
+            total_tiles,
+            _cake_gdn_sm_count(device_index),
+            dvsplit,
+            bound_tokens,
+            seq_lens,
+        )
     )
 
     empty_i32 = _cake_gdn_sentinel(device_index, torch.int32)

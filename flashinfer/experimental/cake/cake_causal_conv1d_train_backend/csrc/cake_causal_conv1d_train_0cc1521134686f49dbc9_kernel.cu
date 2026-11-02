@@ -1549,7 +1549,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
         red[i_9 * 128 + tid] = _sub_107;
     }
     __syncthreads();
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
     int c0_0 = (ct * ct_vec + v) * 8;
     if (sub == 0 && c0_0 < C) {
         float tot[32];
@@ -1577,13 +1577,13 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
 #endif
             #pragma unroll
             for (int k_2 = 0; k_2 < 4; k_2++) {
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                 asm volatile("red.global.add.f64 [%0], %1;" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[soff + (c0_0 + j_10) * 4 + k_2])), "d"((double)tot[j_10 * 4 + k_2]) : "memory");
 #else
                 t4[k_2] = red[(jq * 4 + k_2) * 128 + vq];
 #endif
             }
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
         }
         float totb[8];
         #pragma unroll
@@ -1608,7 +1608,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
                 tb_2[0] = tb_2[0] + red[(32 + jq) * 128 + rq];
 #endif
             }
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
         }
         #pragma unroll
         for (int j_13 = 0; j_13 < 8; j_13++) {
@@ -1651,7 +1651,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
             z4[e] = 0.0f;
         }
         float a[8];
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
         float tb_2[2];
 #else
         float tb_3[2];
@@ -1663,13 +1663,13 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
         zd[0] = zero64;
         zd[1] = zero64;
         #pragma unroll 1
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
         for (int c0_1 = ch0 + tid; c0_1 < ch0 + ct_vec * 8; c0_1 += 256) {
 #else
         for (int c0_0 = ch0 + tid; c0_0 < ch0 + ct_vec * 8; c0_0 += 256) {
 #endif
             #pragma unroll
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
             for (int j_14 = 0; j_14 < 2; j_14++) {
                 int cl = c0_1 + 128 * j_14;
 #else
@@ -1679,7 +1679,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
                 if (cl < lim) {
                     long long cl64 = (long long)cl;
                     #pragma unroll
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                     for (int s_9 = 0; s_9 < 4; s_9++) {
 #else
                     for (int s_8 = 0; s_8 < 4; s_8++) {
@@ -1687,7 +1687,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
                         #pragma unroll
                         for (int e_1 = 0; e_1 < 4; e_1++) {
                             {
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                                 d[(j_14 * 4 + s_9) * 4 + e_1] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_9 + cl64 * 4 + (long long)e_1));
 #else
                                 d[(j_10 * 4 + s_8) * 4 + e_1] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_8 + cl64 * 4 + (long long)e_1));
@@ -1696,13 +1696,13 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
                         }
                     }
                     #pragma unroll
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                     for (int s_10 = 0; s_10 < 4; s_10++) {
 #else
                     for (int s_9 = 0; s_9 < 4; s_9++) {
 #endif
                         {
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                             tbd[j_14 * 4 + s_10] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_10 + (long long)C * 4 + cl64));
 #else
                             tbd[j_10 * 4 + s_9] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_9 + (long long)C * 4 + cl64));
@@ -1712,7 +1712,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
                 }
             }
             #pragma unroll
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
             for (int j_15 = 0; j_15 < 2; j_15++) {
                 int c = c0_1 + 128 * j_15;
 #else
@@ -1723,7 +1723,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
                     long long c64_2 = (long long)c;
                     long long bi = (long long)C * 4 + c64_2;
                     #pragma unroll
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                     for (int s_11 = 0; s_11 < 4; s_11++) {
                         reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_11 + c64_2 * 4))[0] = reinterpret_cast<int4*>(zd)[0];
                         reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_11 + c64_2 * 4 + 2))[0] = reinterpret_cast<int4*>(zd)[0];
@@ -1734,14 +1734,14 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
 #endif
                     }
                     #pragma unroll
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                     for (int s_12 = 1; s_12 < 4; s_12++) {
 #else
                     for (int s_11 = 1; s_11 < 4; s_11++) {
 #endif
                         #pragma unroll
                         for (int e_2 = 0; e_2 < 4; e_2++) {
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                             d[j_15 * 4 * 4 + e_2] = d[j_15 * 4 * 4 + e_2] + d[(j_15 * 4 + s_12) * 4 + e_2];
 #else
                             d[j_11 * 4 * 4 + e_2] = d[j_11 * 4 * 4 + e_2] + d[(j_11 * 4 + s_11) * 4 + e_2];
@@ -1750,14 +1750,14 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
                     }
                     #pragma unroll
                     for (int e_3 = 0; e_3 < 4; e_3++) {
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                         a[4 * j_15 + e_3] = (float)d[j_15 * 4 * 4 + e_3];
 #else
                         a[4 * j_11 + e_3] = (float)d[j_11 * 4 * 4 + e_3];
 #endif
                     }
                     #pragma unroll
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                     for (int s_13 = 0; s_13 < 4; s_13++) {
                         *reinterpret_cast<unsigned long long*>(dw_acc + (cstride * (long long)s_13 + bi)) = (unsigned long long)((unsigned long long)(zd[(0) + 0]));
 #else
@@ -1766,7 +1766,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
 #endif
                     }
                     #pragma unroll
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                     for (int s_14 = 1; s_14 < 4; s_14++) {
                         tbd[j_15 * 4] = tbd[j_15 * 4] + tbd[j_15 * 4 + s_14];
 #else
@@ -1774,7 +1774,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
                         tbd[j_11 * 4] = tbd[j_11 * 4] + tbd[j_11 * 4 + s_13];
 #endif
                     }
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                     tb_2[j_15] = (float)tbd[j_15 * 4];
 #else
                     tb_3[j_11] = (float)tbd[j_11 * 4];
@@ -1782,7 +1782,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
                     if ((flags & 2) != 0) {
                         #pragma unroll
                         for (int e_4 = 0; e_4 < 4; e_4++) {
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                             *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_4)) = (__nv_bfloat16)a[4 * j_15 + e_4];
 #else
                             *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_4)) = (__nv_bfloat16)a[4 * j_11 + e_4];
@@ -1790,7 +1790,7 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
                         }
                     } else {
                         {
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                             float4 _v4 = make_float4(a[4 * j_15 + 0], a[4 * j_15 + 1], a[4 * j_15 + 2], a[4 * j_15 + 3]);
 #else
                             float4 _v4 = make_float4(a[4 * j_11 + 0], a[4 * j_11 + 1], a[4 * j_11 + 2], a[4 * j_11 + 3]);
@@ -1799,13 +1799,13 @@ kernel_cake_causal_conv1d_train_0cc1521134686f49dbc9(__nv_bfloat16* __restrict__
                         }
                     }
                     if ((flags & 8) != 0) {
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                         *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_2[j_15];
 #else
                         *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_3[j_11];
 #endif
                     } else {
-#if __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030
+#if __CUDA_ARCH__ == 1000
                         *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_2[j_15];
 #else
                         *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_3[j_11];

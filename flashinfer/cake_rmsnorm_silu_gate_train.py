@@ -44,9 +44,9 @@ dispatches on it here:
 * ``deterministic=False`` runs the standalone non-deterministic package
   ``flashinfer.cake_rmsnorm_silu_gate_train_backend``: the same forward kernel
   (it has no reduction, so ``y`` has the same bits; on SM100 and SM103 up to
-  10 rows per SM a forward with 16 threads to a row and from 976 rows per SM
-  a forward whose CTAs each walk several row blocks, also the same bits) and
-  a one-kernel backward whose ``dx`` and ``dz`` are the
+  10 rows per SM a forward with 16 threads to a row, and from 976 rows per SM
+  on SM100 and SM103, 800 on SM107, a forward whose CTAs each walk several row
+  blocks, also the same bits) and a one-kernel backward whose ``dx`` and ``dz`` are the
   deterministic backward's bits.  Its CTAs take row blocks (one block each
   when the grid has a CTA for every block;
   past one wave of CTAs they claim the blocks in chunks), sum the weight
@@ -107,13 +107,16 @@ stream from it and keeps it for the life of the process, so a replay launches
 no fill kernel (with none ready, the graph zero-fills a buffer of its own).
 
 Beside kernels resident on other streams (FlashInfer issue #7548; observed on
-B200, sm_100a): above 256 rows each CTA of the non-deterministic backward needs
-20736 bytes of dynamic shared memory (an SM of sm_100a holds four such CTAs),
-and an SM serves it only once it can switch to a shared-memory carveout that
-holds it.  A kernel on another stream whose CTAs hold every SM with a small
-carveout (for example a long-running kernel with little or no shared memory and
-the default carveout) therefore delays that backward's start until the kernel
-exits.  Setting
+B200, sm_100a, with the 20736-byte CTAs and on R200, sm_107a, with the
+20736-byte and the 10496-byte CTAs): above 256 rows on SM100 and SM103, and
+below 1024 rows per SM on SM107, each CTA of the non-deterministic backward
+needs 20736 bytes of dynamic shared memory (an SM of sm_100a holds four such
+CTAs; from 1024 rows per SM on SM107 each CTA of the long backward needs 10496
+bytes), and an SM serves it only once it can switch to a shared-memory
+carveout that holds it.  A kernel on another stream whose CTAs hold every SM
+with a small carveout (for example a long-running kernel with little or no
+shared memory and the default carveout) therefore delays that backward's start
+until the kernel exits.  Setting
 ``cudaFuncAttributePreferredSharedMemoryCarveout`` to
 ``cudaSharedmemCarveoutMaxShared`` on such a resident kernel, or giving it a
 large dynamic shared-memory allocation, lets the backward start beside it.  The
@@ -288,9 +291,9 @@ def cake_rmsnorm_silu_gate_train_forward(
         (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_forward`)
         with these arguments.  ``False`` runs the non-deterministic package's
         forward program, the same kernel rendered there, or on SM100 / SM103
-        up to 10 rows per SM a forward with 16 threads to a row and from 976
-        rows per SM a forward whose CTAs each walk several row blocks, with
-        the same arithmetic (the forward has no reduction, so
+        up to 10 rows per SM a forward with 16 threads to a row, and from 976
+        rows per SM on SM100 / SM103 (800 on SM107) a forward whose CTAs each
+        walk several row blocks, with the same arithmetic (the forward has no reduction, so
         both return the same bits); it is refused while
         ``torch.use_deterministic_algorithms(True)`` is in effect (with
         ``warn_only=True``: a warning, then the deterministic forward).

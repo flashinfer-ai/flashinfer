@@ -48,10 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define SMEM_STAGE0_OFF 0
-#define SMEM_STAGE0_STAGE_BYTES 14336
-#define SMEM_STAGE0_STRIDE 14336
-#define SMEM_TOTAL 14336
 #define THREADS 448
 
 #include <math_constants.h>
@@ -59,29 +55,17 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(448) void
-kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ shared, __nv_bfloat16* __restrict__ gemm_slice, __nv_bfloat16* __restrict__ out, long long* __restrict__ peer_ptrs, __nv_bfloat16* __restrict__ mcast_ptr, unsigned int* __restrict__ buffer_flags, int num_tokens, int rank, int my_col_begin, int my_cols, int gemm_plane_stride, int num_gemm_splits)
+kernel_cake_kimi_k3_tp12_tail_671dde219eeac662d192(__nv_bfloat16* __restrict__ shared, __nv_bfloat16* __restrict__ gemm_slice, __nv_bfloat16* __restrict__ out, long long* __restrict__ peer_ptrs, __nv_bfloat16* __restrict__ mcast_ptr, unsigned int* __restrict__ buffer_flags, int num_tokens, int rank, int my_col_begin, int my_cols, int gemm_plane_stride, int num_gemm_splits)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
 
-    extern __shared__ __align__(128) char smem_raw[];
-    int smem;
-#if __CUDA_ARCH__ == 1000
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
-#else
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
 
     const int cta_rank = 0;
-
-    // Kernel setup ops
-    unsigned int* stage0 = reinterpret_cast<unsigned int*>(smem_raw + 0);
-    const int stage0_addr = smem + 0;
 
     // === Task calls (declaration order) ===
     int first_token = blockIdx.x;
@@ -166,128 +150,6 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
     #pragma unroll 1
     for (int k = 0; k < total_iters; k++) {
         int token_a = first_token + k * stride;
-        if (token_a < num_tokens) {
-            unsigned int _vec_load_2[4];
-            {
-                uint4 _uv4_2 = *reinterpret_cast<const uint4*>(shared + (token_a * 7168 + col) + 0);
-                _vec_load_2[0 + 0] = _uv4_2.x;
-                _vec_load_2[0 + 1] = _uv4_2.y;
-                _vec_load_2[0 + 2] = _uv4_2.z;
-                _vec_load_2[0 + 3] = _uv4_2.w;
-            }
-            uint32_t _packed16_sanitize_0[4];
-            {
-                uint32_t _p16_word_3_0 = _vec_load_2[0];
-                if ((_p16_word_3_0 & 0x0000ffffu) == 0x00008000u) _p16_word_3_0 &= 0xffff0000u;
-                if ((_p16_word_3_0 & 0xffff0000u) == 0x80000000u) _p16_word_3_0 &= 0x0000ffffu;
-                _packed16_sanitize_0[0] = _p16_word_3_0;
-                uint32_t _p16_word_3_1 = _vec_load_2[1];
-                if ((_p16_word_3_1 & 0x0000ffffu) == 0x00008000u) _p16_word_3_1 &= 0xffff0000u;
-                if ((_p16_word_3_1 & 0xffff0000u) == 0x80000000u) _p16_word_3_1 &= 0x0000ffffu;
-                _packed16_sanitize_0[1] = _p16_word_3_1;
-                uint32_t _p16_word_3_2 = _vec_load_2[2];
-                if ((_p16_word_3_2 & 0x0000ffffu) == 0x00008000u) _p16_word_3_2 &= 0xffff0000u;
-                if ((_p16_word_3_2 & 0xffff0000u) == 0x80000000u) _p16_word_3_2 &= 0x0000ffffu;
-                _packed16_sanitize_0[2] = _p16_word_3_2;
-                uint32_t _p16_word_3_3 = _vec_load_2[3];
-                if ((_p16_word_3_3 & 0x0000ffffu) == 0x00008000u) _p16_word_3_3 &= 0xffff0000u;
-                if ((_p16_word_3_3 & 0xffff0000u) == 0x80000000u) _p16_word_3_3 &= 0x0000ffffu;
-                _packed16_sanitize_0[3] = _p16_word_3_3;
-            }
-            unsigned long long scatter_index = ((unsigned long long)token_a * 12 + (unsigned long long)rank) * 640 + slot_col;
-            unsigned int stage_addr = stage0_addr + (unsigned int)(k % 2) * 7168;
-            if (tid < 12) {
-                asm volatile("cp.async.bulk.wait_group.read 1;");
-            }
-            asm volatile("barrier.sync 2, 448;" ::: "memory");
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(stage_addr + (unsigned int)(tid * 16)), "r"(_packed16_sanitize_0[0]), "r"(_packed16_sanitize_0[1]), "r"(_packed16_sanitize_0[2]), "r"(_packed16_sanitize_0[3]));
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            asm volatile("barrier.sync 2, 448;" ::: "memory");
-            if (tid < 12) {
-                int piece_lo = 0;
-                int piece_hi = 0;
-                int piece_begin = 0;
-                if (tid == 0) {
-                    piece_lo = 0;
-                    piece_hi = 640;
-                    piece_begin = 0;
-                }
-                if (tid == 1) {
-                    piece_lo = 640;
-                    piece_hi = 1280;
-                    piece_begin = 640;
-                }
-                if (tid == 2) {
-                    piece_lo = 1280;
-                    piece_hi = 1920;
-                    piece_begin = 1280;
-                }
-                if (tid == 3) {
-                    piece_lo = 1920;
-                    piece_hi = 2560;
-                    piece_begin = 1920;
-                }
-                if (tid == 4) {
-                    piece_lo = 2560;
-                    piece_hi = 3200;
-                    piece_begin = 2560;
-                }
-                if (tid == 5) {
-                    piece_lo = 3200;
-                    piece_hi = 3840;
-                    piece_begin = 3200;
-                }
-                if (tid == 6) {
-                    piece_lo = 3840;
-                    piece_hi = 4480;
-                    piece_begin = 3840;
-                }
-                if (tid == 7) {
-                    piece_lo = 4480;
-                    piece_hi = 5120;
-                    piece_begin = 4480;
-                }
-                if (tid == 8) {
-                    piece_lo = 5120;
-                    piece_hi = 5632;
-                    piece_begin = 5120;
-                }
-                if (tid == 9) {
-                    piece_lo = 5632;
-                    piece_hi = 6144;
-                    piece_begin = 5632;
-                }
-                if (tid == 10) {
-                    piece_lo = 6144;
-                    piece_hi = 6656;
-                    piece_begin = 6144;
-                }
-                if (tid == 11) {
-                    piece_lo = 6656;
-                    piece_hi = 7168;
-                    piece_begin = 6656;
-                }
-                int half_lo = blockIdx.y * 3584;
-                int half_hi = half_lo + 3584;
-                if (piece_lo < half_lo) {
-                    piece_lo = half_lo;
-                }
-                if (piece_hi > half_hi) {
-                    piece_hi = half_hi;
-                }
-                if (piece_hi > piece_lo) {
-                    unsigned long long slot_o = ((unsigned long long)token_a * 12 + (unsigned long long)rank) * 640 + (unsigned long long)(piece_lo - piece_begin);
-                    {
-                        void* _cpbulk_dst_4 = reinterpret_cast<void*>(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[tid]) + (current_epoch_elements + slot_o));
-                        asm volatile(
-                            "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
-                            :: "l"(_cpbulk_dst_4), "r"(stage_addr + (unsigned int)((piece_lo - half_lo) * 2)), "r"((uint32_t)((piece_hi - piece_lo) * 2))
-                            : "memory");
-                    }
-                }
-                asm volatile("cp.async.bulk.commit_group;");
-            }
-        }
         if (k == 0) {
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             uint8_t* bytes_base = reinterpret_cast<uint8_t*>(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]));
@@ -308,36 +170,122 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                 unsigned int boundary = (clear[0] + 15) / 16;
                 for (unsigned int packed = thread; packed < boundary; packed += threads) {
                     {
-                        auto _gst_5 = reinterpret_cast<unsigned __int128*>(bytes_base + stage_offset) + packed;
-                        __builtin_assume(__isGlobal(_gst_5));
-                        reinterpret_cast<int4*>(_gst_5)[0] = reinterpret_cast<int4*>(sentinel)[0];
+                        auto _gst_2 = reinterpret_cast<unsigned __int128*>(bytes_base + stage_offset) + packed;
+                        __builtin_assume(__isGlobal(_gst_2));
+                        reinterpret_cast<int4*>(_gst_2)[0] = reinterpret_cast<int4*>(sentinel)[0];
                     }
                 }
             }
-        }
-        if (k == 1) {
             asm volatile("griddepcontrol.wait;" ::: "memory");
         }
-        int token_b = token_a - stride;
+        int token_b = token_a;
         if (token_b >= 0) {
             if (token_b < num_tokens) {
                 if (owner == rank) {
                     uint32_t _mnnvl_twoshot_reduce_0[4];
                     {
-                        float2 _mtr_accum_6[4];
-                        bool _mtr_valid_6;
+                        float2 _mtr_accum_3[4];
+                        bool _mtr_valid_3;
                         do {
-                            _mtr_valid_6 = true;
+                            _mtr_valid_3 = true;
                             #pragma unroll
-                            for (int _mtr_pair = 0; _mtr_pair < 4; ++_mtr_pair) _mtr_accum_6[_mtr_pair] = make_float2(0.0f, 0.0f);
-                            uint32_t _mtr_rank_6_0[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_0[0]), "=r"(_mtr_rank_6_0[1]), "=r"(_mtr_rank_6_0[2]), "=r"(_mtr_rank_6_0[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + (unsigned long long)token_b * 12 * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_0 = false;
-                            _mtr_dirty_6_0 |= (_mtr_rank_6_0[0] == 0x80000000u);
-                            _mtr_dirty_6_0 |= (_mtr_rank_6_0[1] == 0x80000000u);
-                            _mtr_dirty_6_0 |= (_mtr_rank_6_0[2] == 0x80000000u);
-                            _mtr_dirty_6_0 |= (_mtr_rank_6_0[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_0;
+                            for (int _mtr_pair = 0; _mtr_pair < 4; ++_mtr_pair) _mtr_accum_3[_mtr_pair] = make_float2(0.0f, 0.0f);
+                            uint32_t _mtr_rank_3_0[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_0[0]), "=r"(_mtr_rank_3_0[1]), "=r"(_mtr_rank_3_0[2]), "=r"(_mtr_rank_3_0[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + (unsigned long long)token_b * 12 * 640 + (unsigned long long)local_col)) : "memory");
+                            uint32_t _mtr_rank_3_1[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_1[0]), "=r"(_mtr_rank_3_1[1]), "=r"(_mtr_rank_3_1[2]), "=r"(_mtr_rank_3_1[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 1) * 640 + (unsigned long long)local_col)) : "memory");
+                            uint32_t _mtr_rank_3_2[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_2[0]), "=r"(_mtr_rank_3_2[1]), "=r"(_mtr_rank_3_2[2]), "=r"(_mtr_rank_3_2[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 2) * 640 + (unsigned long long)local_col)) : "memory");
+                            uint32_t _mtr_rank_3_3[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_3[0]), "=r"(_mtr_rank_3_3[1]), "=r"(_mtr_rank_3_3[2]), "=r"(_mtr_rank_3_3[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 3) * 640 + (unsigned long long)local_col)) : "memory");
+                            uint32_t _mtr_rank_3_4[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_4[0]), "=r"(_mtr_rank_3_4[1]), "=r"(_mtr_rank_3_4[2]), "=r"(_mtr_rank_3_4[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 4) * 640 + (unsigned long long)local_col)) : "memory");
+                            uint32_t _mtr_rank_3_5[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_5[0]), "=r"(_mtr_rank_3_5[1]), "=r"(_mtr_rank_3_5[2]), "=r"(_mtr_rank_3_5[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 5) * 640 + (unsigned long long)local_col)) : "memory");
+                            uint32_t _mtr_rank_3_6[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_6[0]), "=r"(_mtr_rank_3_6[1]), "=r"(_mtr_rank_3_6[2]), "=r"(_mtr_rank_3_6[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 6) * 640 + (unsigned long long)local_col)) : "memory");
+                            uint32_t _mtr_rank_3_7[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_7[0]), "=r"(_mtr_rank_3_7[1]), "=r"(_mtr_rank_3_7[2]), "=r"(_mtr_rank_3_7[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 7) * 640 + (unsigned long long)local_col)) : "memory");
+                            uint32_t _mtr_rank_3_8[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_8[0]), "=r"(_mtr_rank_3_8[1]), "=r"(_mtr_rank_3_8[2]), "=r"(_mtr_rank_3_8[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 8) * 640 + (unsigned long long)local_col)) : "memory");
+                            uint32_t _mtr_rank_3_9[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_9[0]), "=r"(_mtr_rank_3_9[1]), "=r"(_mtr_rank_3_9[2]), "=r"(_mtr_rank_3_9[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 9) * 640 + (unsigned long long)local_col)) : "memory");
+                            uint32_t _mtr_rank_3_10[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_10[0]), "=r"(_mtr_rank_3_10[1]), "=r"(_mtr_rank_3_10[2]), "=r"(_mtr_rank_3_10[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 10) * 640 + (unsigned long long)local_col)) : "memory");
+                            uint32_t _mtr_rank_3_11[4];
+                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_3_11[0]), "=r"(_mtr_rank_3_11[1]), "=r"(_mtr_rank_3_11[2]), "=r"(_mtr_rank_3_11[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 11) * 640 + (unsigned long long)local_col)) : "memory");
+                            bool _mtr_dirty_3_0 = false;
+                            _mtr_dirty_3_0 |= (_mtr_rank_3_0[0] == 0x80000000u);
+                            _mtr_dirty_3_0 |= (_mtr_rank_3_0[1] == 0x80000000u);
+                            _mtr_dirty_3_0 |= (_mtr_rank_3_0[2] == 0x80000000u);
+                            _mtr_dirty_3_0 |= (_mtr_rank_3_0[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_0;
+                            bool _mtr_dirty_3_1 = false;
+                            _mtr_dirty_3_1 |= (_mtr_rank_3_1[0] == 0x80000000u);
+                            _mtr_dirty_3_1 |= (_mtr_rank_3_1[1] == 0x80000000u);
+                            _mtr_dirty_3_1 |= (_mtr_rank_3_1[2] == 0x80000000u);
+                            _mtr_dirty_3_1 |= (_mtr_rank_3_1[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_1;
+                            bool _mtr_dirty_3_2 = false;
+                            _mtr_dirty_3_2 |= (_mtr_rank_3_2[0] == 0x80000000u);
+                            _mtr_dirty_3_2 |= (_mtr_rank_3_2[1] == 0x80000000u);
+                            _mtr_dirty_3_2 |= (_mtr_rank_3_2[2] == 0x80000000u);
+                            _mtr_dirty_3_2 |= (_mtr_rank_3_2[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_2;
+                            bool _mtr_dirty_3_3 = false;
+                            _mtr_dirty_3_3 |= (_mtr_rank_3_3[0] == 0x80000000u);
+                            _mtr_dirty_3_3 |= (_mtr_rank_3_3[1] == 0x80000000u);
+                            _mtr_dirty_3_3 |= (_mtr_rank_3_3[2] == 0x80000000u);
+                            _mtr_dirty_3_3 |= (_mtr_rank_3_3[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_3;
+                            bool _mtr_dirty_3_4 = false;
+                            _mtr_dirty_3_4 |= (_mtr_rank_3_4[0] == 0x80000000u);
+                            _mtr_dirty_3_4 |= (_mtr_rank_3_4[1] == 0x80000000u);
+                            _mtr_dirty_3_4 |= (_mtr_rank_3_4[2] == 0x80000000u);
+                            _mtr_dirty_3_4 |= (_mtr_rank_3_4[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_4;
+                            bool _mtr_dirty_3_5 = false;
+                            _mtr_dirty_3_5 |= (_mtr_rank_3_5[0] == 0x80000000u);
+                            _mtr_dirty_3_5 |= (_mtr_rank_3_5[1] == 0x80000000u);
+                            _mtr_dirty_3_5 |= (_mtr_rank_3_5[2] == 0x80000000u);
+                            _mtr_dirty_3_5 |= (_mtr_rank_3_5[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_5;
+                            bool _mtr_dirty_3_6 = false;
+                            _mtr_dirty_3_6 |= (_mtr_rank_3_6[0] == 0x80000000u);
+                            _mtr_dirty_3_6 |= (_mtr_rank_3_6[1] == 0x80000000u);
+                            _mtr_dirty_3_6 |= (_mtr_rank_3_6[2] == 0x80000000u);
+                            _mtr_dirty_3_6 |= (_mtr_rank_3_6[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_6;
+                            bool _mtr_dirty_3_7 = false;
+                            _mtr_dirty_3_7 |= (_mtr_rank_3_7[0] == 0x80000000u);
+                            _mtr_dirty_3_7 |= (_mtr_rank_3_7[1] == 0x80000000u);
+                            _mtr_dirty_3_7 |= (_mtr_rank_3_7[2] == 0x80000000u);
+                            _mtr_dirty_3_7 |= (_mtr_rank_3_7[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_7;
+                            bool _mtr_dirty_3_8 = false;
+                            _mtr_dirty_3_8 |= (_mtr_rank_3_8[0] == 0x80000000u);
+                            _mtr_dirty_3_8 |= (_mtr_rank_3_8[1] == 0x80000000u);
+                            _mtr_dirty_3_8 |= (_mtr_rank_3_8[2] == 0x80000000u);
+                            _mtr_dirty_3_8 |= (_mtr_rank_3_8[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_8;
+                            bool _mtr_dirty_3_9 = false;
+                            _mtr_dirty_3_9 |= (_mtr_rank_3_9[0] == 0x80000000u);
+                            _mtr_dirty_3_9 |= (_mtr_rank_3_9[1] == 0x80000000u);
+                            _mtr_dirty_3_9 |= (_mtr_rank_3_9[2] == 0x80000000u);
+                            _mtr_dirty_3_9 |= (_mtr_rank_3_9[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_9;
+                            bool _mtr_dirty_3_10 = false;
+                            _mtr_dirty_3_10 |= (_mtr_rank_3_10[0] == 0x80000000u);
+                            _mtr_dirty_3_10 |= (_mtr_rank_3_10[1] == 0x80000000u);
+                            _mtr_dirty_3_10 |= (_mtr_rank_3_10[2] == 0x80000000u);
+                            _mtr_dirty_3_10 |= (_mtr_rank_3_10[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_10;
+                            bool _mtr_dirty_3_11 = false;
+                            _mtr_dirty_3_11 |= (_mtr_rank_3_11[0] == 0x80000000u);
+                            _mtr_dirty_3_11 |= (_mtr_rank_3_11[1] == 0x80000000u);
+                            _mtr_dirty_3_11 |= (_mtr_rank_3_11[2] == 0x80000000u);
+                            _mtr_dirty_3_11 |= (_mtr_rank_3_11[3] == 0x80000000u);
+                            _mtr_valid_3 &= !_mtr_dirty_3_11;
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -345,7 +293,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_0[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_0[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -353,7 +301,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_0[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_0[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -361,7 +309,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_0[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_0[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -369,15 +317,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_0[3]));
-                            uint32_t _mtr_rank_6_1[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_1[0]), "=r"(_mtr_rank_6_1[1]), "=r"(_mtr_rank_6_1[2]), "=r"(_mtr_rank_6_1[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 1) * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_1 = false;
-                            _mtr_dirty_6_1 |= (_mtr_rank_6_1[0] == 0x80000000u);
-                            _mtr_dirty_6_1 |= (_mtr_rank_6_1[1] == 0x80000000u);
-                            _mtr_dirty_6_1 |= (_mtr_rank_6_1[2] == 0x80000000u);
-                            _mtr_dirty_6_1 |= (_mtr_rank_6_1[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_1;
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_0[3]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -385,7 +325,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_1[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_1[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -393,7 +333,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_1[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_1[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -401,7 +341,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_1[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_1[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -409,15 +349,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_1[3]));
-                            uint32_t _mtr_rank_6_2[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_2[0]), "=r"(_mtr_rank_6_2[1]), "=r"(_mtr_rank_6_2[2]), "=r"(_mtr_rank_6_2[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 2) * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_2 = false;
-                            _mtr_dirty_6_2 |= (_mtr_rank_6_2[0] == 0x80000000u);
-                            _mtr_dirty_6_2 |= (_mtr_rank_6_2[1] == 0x80000000u);
-                            _mtr_dirty_6_2 |= (_mtr_rank_6_2[2] == 0x80000000u);
-                            _mtr_dirty_6_2 |= (_mtr_rank_6_2[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_2;
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_1[3]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -425,7 +357,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_2[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_2[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -433,7 +365,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_2[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_2[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -441,7 +373,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_2[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_2[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -449,15 +381,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_2[3]));
-                            uint32_t _mtr_rank_6_3[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_3[0]), "=r"(_mtr_rank_6_3[1]), "=r"(_mtr_rank_6_3[2]), "=r"(_mtr_rank_6_3[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 3) * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_3 = false;
-                            _mtr_dirty_6_3 |= (_mtr_rank_6_3[0] == 0x80000000u);
-                            _mtr_dirty_6_3 |= (_mtr_rank_6_3[1] == 0x80000000u);
-                            _mtr_dirty_6_3 |= (_mtr_rank_6_3[2] == 0x80000000u);
-                            _mtr_dirty_6_3 |= (_mtr_rank_6_3[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_3;
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_2[3]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -465,7 +389,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_3[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_3[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -473,7 +397,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_3[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_3[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -481,7 +405,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_3[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_3[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -489,15 +413,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_3[3]));
-                            uint32_t _mtr_rank_6_4[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_4[0]), "=r"(_mtr_rank_6_4[1]), "=r"(_mtr_rank_6_4[2]), "=r"(_mtr_rank_6_4[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 4) * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_4 = false;
-                            _mtr_dirty_6_4 |= (_mtr_rank_6_4[0] == 0x80000000u);
-                            _mtr_dirty_6_4 |= (_mtr_rank_6_4[1] == 0x80000000u);
-                            _mtr_dirty_6_4 |= (_mtr_rank_6_4[2] == 0x80000000u);
-                            _mtr_dirty_6_4 |= (_mtr_rank_6_4[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_4;
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_3[3]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -505,7 +421,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_4[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_4[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -513,7 +429,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_4[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_4[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -521,7 +437,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_4[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_4[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -529,15 +445,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_4[3]));
-                            uint32_t _mtr_rank_6_5[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_5[0]), "=r"(_mtr_rank_6_5[1]), "=r"(_mtr_rank_6_5[2]), "=r"(_mtr_rank_6_5[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 5) * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_5 = false;
-                            _mtr_dirty_6_5 |= (_mtr_rank_6_5[0] == 0x80000000u);
-                            _mtr_dirty_6_5 |= (_mtr_rank_6_5[1] == 0x80000000u);
-                            _mtr_dirty_6_5 |= (_mtr_rank_6_5[2] == 0x80000000u);
-                            _mtr_dirty_6_5 |= (_mtr_rank_6_5[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_5;
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_4[3]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -545,7 +453,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_5[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_5[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -553,7 +461,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_5[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_5[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -561,7 +469,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_5[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_5[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -569,15 +477,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_5[3]));
-                            uint32_t _mtr_rank_6_6[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_6[0]), "=r"(_mtr_rank_6_6[1]), "=r"(_mtr_rank_6_6[2]), "=r"(_mtr_rank_6_6[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 6) * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_6 = false;
-                            _mtr_dirty_6_6 |= (_mtr_rank_6_6[0] == 0x80000000u);
-                            _mtr_dirty_6_6 |= (_mtr_rank_6_6[1] == 0x80000000u);
-                            _mtr_dirty_6_6 |= (_mtr_rank_6_6[2] == 0x80000000u);
-                            _mtr_dirty_6_6 |= (_mtr_rank_6_6[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_6;
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_5[3]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -585,7 +485,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_6[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_6[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -593,7 +493,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_6[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_6[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -601,7 +501,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_6[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_6[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -609,15 +509,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_6[3]));
-                            uint32_t _mtr_rank_6_7[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_7[0]), "=r"(_mtr_rank_6_7[1]), "=r"(_mtr_rank_6_7[2]), "=r"(_mtr_rank_6_7[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 7) * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_7 = false;
-                            _mtr_dirty_6_7 |= (_mtr_rank_6_7[0] == 0x80000000u);
-                            _mtr_dirty_6_7 |= (_mtr_rank_6_7[1] == 0x80000000u);
-                            _mtr_dirty_6_7 |= (_mtr_rank_6_7[2] == 0x80000000u);
-                            _mtr_dirty_6_7 |= (_mtr_rank_6_7[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_7;
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_6[3]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -625,7 +517,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_7[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_7[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -633,7 +525,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_7[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_7[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -641,7 +533,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_7[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_7[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -649,15 +541,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_7[3]));
-                            uint32_t _mtr_rank_6_8[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_8[0]), "=r"(_mtr_rank_6_8[1]), "=r"(_mtr_rank_6_8[2]), "=r"(_mtr_rank_6_8[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 8) * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_8 = false;
-                            _mtr_dirty_6_8 |= (_mtr_rank_6_8[0] == 0x80000000u);
-                            _mtr_dirty_6_8 |= (_mtr_rank_6_8[1] == 0x80000000u);
-                            _mtr_dirty_6_8 |= (_mtr_rank_6_8[2] == 0x80000000u);
-                            _mtr_dirty_6_8 |= (_mtr_rank_6_8[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_8;
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_7[3]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -665,7 +549,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_8[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_8[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -673,7 +557,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_8[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_8[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -681,7 +565,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_8[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_8[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -689,15 +573,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_8[3]));
-                            uint32_t _mtr_rank_6_9[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_9[0]), "=r"(_mtr_rank_6_9[1]), "=r"(_mtr_rank_6_9[2]), "=r"(_mtr_rank_6_9[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 9) * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_9 = false;
-                            _mtr_dirty_6_9 |= (_mtr_rank_6_9[0] == 0x80000000u);
-                            _mtr_dirty_6_9 |= (_mtr_rank_6_9[1] == 0x80000000u);
-                            _mtr_dirty_6_9 |= (_mtr_rank_6_9[2] == 0x80000000u);
-                            _mtr_dirty_6_9 |= (_mtr_rank_6_9[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_9;
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_8[3]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -705,7 +581,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_9[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_9[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -713,7 +589,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_9[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_9[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -721,7 +597,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_9[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_9[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -729,15 +605,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_9[3]));
-                            uint32_t _mtr_rank_6_10[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_10[0]), "=r"(_mtr_rank_6_10[1]), "=r"(_mtr_rank_6_10[2]), "=r"(_mtr_rank_6_10[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 10) * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_10 = false;
-                            _mtr_dirty_6_10 |= (_mtr_rank_6_10[0] == 0x80000000u);
-                            _mtr_dirty_6_10 |= (_mtr_rank_6_10[1] == 0x80000000u);
-                            _mtr_dirty_6_10 |= (_mtr_rank_6_10[2] == 0x80000000u);
-                            _mtr_dirty_6_10 |= (_mtr_rank_6_10[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_10;
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_9[3]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -745,7 +613,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_10[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_10[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -753,7 +621,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_10[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_10[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -761,7 +629,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_10[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_10[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -769,15 +637,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_10[3]));
-                            uint32_t _mtr_rank_6_11[4];
-                            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_mtr_rank_6_11[0]), "=r"(_mtr_rank_6_11[1]), "=r"(_mtr_rank_6_11[2]), "=r"(_mtr_rank_6_11[3]) : "l"(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]) + (current_epoch_elements + ((unsigned long long)token_b * 12 + 11) * 640 + (unsigned long long)local_col)) : "memory");
-                            bool _mtr_dirty_6_11 = false;
-                            _mtr_dirty_6_11 |= (_mtr_rank_6_11[0] == 0x80000000u);
-                            _mtr_dirty_6_11 |= (_mtr_rank_6_11[1] == 0x80000000u);
-                            _mtr_dirty_6_11 |= (_mtr_rank_6_11[2] == 0x80000000u);
-                            _mtr_dirty_6_11 |= (_mtr_rank_6_11[3] == 0x80000000u);
-                            _mtr_valid_6 &= !_mtr_dirty_6_11;
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_10[3]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -785,7 +645,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[0]).x), "+f"((_mtr_accum_6[0]).y) : "r"(_mtr_rank_6_11[0]));
+                                : "+f"((_mtr_accum_3[0]).x), "+f"((_mtr_accum_3[0]).y) : "r"(_mtr_rank_3_11[0]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -793,7 +653,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[1]).x), "+f"((_mtr_accum_6[1]).y) : "r"(_mtr_rank_6_11[1]));
+                                : "+f"((_mtr_accum_3[1]).x), "+f"((_mtr_accum_3[1]).y) : "r"(_mtr_rank_3_11[1]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -801,7 +661,7 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[2]).x), "+f"((_mtr_accum_6[2]).y) : "r"(_mtr_rank_6_11[2]));
+                                : "+f"((_mtr_accum_3[2]).x), "+f"((_mtr_accum_3[2]).y) : "r"(_mtr_rank_3_11[2]));
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b16 lo, hi;\n\t"
@@ -809,11 +669,11 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                                 "add.rn.f32.bf16 %0, lo, %0;\n\t"
                                 "add.rn.f32.bf16 %1, hi, %1;\n\t"
                                 "}\n"
-                                : "+f"((_mtr_accum_6[3]).x), "+f"((_mtr_accum_6[3]).y) : "r"(_mtr_rank_6_11[3]));
-                        } while (!_mtr_valid_6);
+                                : "+f"((_mtr_accum_3[3]).x), "+f"((_mtr_accum_3[3]).y) : "r"(_mtr_rank_3_11[3]));
+                        } while (!_mtr_valid_3);
                         #pragma unroll
                         for (int _mtr_pair = 0; _mtr_pair < 4; ++_mtr_pair) {
-                            __nv_bfloat162 _mtr_out = __float22bfloat162_rn(_mtr_accum_6[_mtr_pair]);
+                            __nv_bfloat162 _mtr_out = __float22bfloat162_rn(_mtr_accum_3[_mtr_pair]);
                             _mnnvl_twoshot_reduce_0[_mtr_pair] = *reinterpret_cast<uint32_t*>(&_mtr_out);
                         }
                     }
@@ -827,16 +687,16 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                     float out_f32[8];
                     float _vec_load_3[8];
                     {
-                        const uint4* _vptr_7 = reinterpret_cast<const uint4*>(gemm_slice + gemm_index + 0);
-                        uint4 _vld_7[1];
+                        const uint4* _vptr_4 = reinterpret_cast<const uint4*>(gemm_slice + gemm_index + 0);
+                        uint4 _vld_4[1];
                         #pragma unroll
                         for (int _blk = 0; _blk < 1; _blk++) {
-                            _vld_7[_blk] = _vptr_7[_blk];
-                            uint32_t* _vpairs_7 = reinterpret_cast<uint32_t*>(&_vld_7[_blk]);
+                            _vld_4[_blk] = _vptr_4[_blk];
+                            uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4[_blk]);
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
-                                (&_vec_load_3[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) << 16);
-                                (&_vec_load_3[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_7[_pair]) & 0xffff0000u);
+                                (&_vec_load_3[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
+                                (&_vec_load_3[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
                             }
                         }
                     }
@@ -852,18 +712,18 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
                     uint32_t _packed16_sanitize_1[4];
                     #pragma unroll
                     for (int _p16s_word = 0; _p16s_word < 4; ++_p16s_word) {
-                        uint32_t _p16s_carrier_8 = static_cast<uint32_t>(out_f32_bf16[_p16s_word]);
-                        uint32_t _p16s_lo_8 = _p16s_carrier_8 & 0x0000ffffu;
-                        uint32_t _p16s_hi_8 = (_p16s_carrier_8 >> 16) & 0x0000ffffu;
-                        if (_p16s_lo_8 == 0x00008000u) _p16s_lo_8 = 0u;
-                        if (_p16s_hi_8 == 0x00008000u) _p16s_hi_8 = 0u;
-                        _packed16_sanitize_1[_p16s_word] = _p16s_lo_8 | (_p16s_hi_8 << 16);
+                        uint32_t _p16s_carrier_5 = static_cast<uint32_t>(out_f32_bf16[_p16s_word]);
+                        uint32_t _p16s_lo_5 = _p16s_carrier_5 & 0x0000ffffu;
+                        uint32_t _p16s_hi_5 = (_p16s_carrier_5 >> 16) & 0x0000ffffu;
+                        if (_p16s_lo_5 == 0x00008000u) _p16s_lo_5 = 0u;
+                        if (_p16s_hi_5 == 0x00008000u) _p16s_hi_5 = 0u;
+                        _packed16_sanitize_1[_p16s_word] = _p16s_lo_5 | (_p16s_hi_5 << 16);
                     }
                     reinterpret_cast<int4*>(mcast_ptr + (current_epoch_elements + stage_elements + (unsigned long long)(token_b * 7168 + col)))[0] = reinterpret_cast<int4*>(_packed16_sanitize_1)[0];
                 }
             }
         }
-        int token_c = token_b - stride;
+        int token_c = token_b - 2 * stride;
         if (token_c >= 0) {
             int row_c = token_c * 7168 + col;
             uint32_t _sysv_poll_group_0[4];
@@ -874,9 +734,6 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
             );
             reinterpret_cast<int4*>(out + row_c)[0] = reinterpret_cast<int4*>(_sysv_poll_group_0)[0];
         }
-    }
-    if (tid < 12) {
-        asm volatile("cp.async.bulk.wait_group.read 0;");
     }
     uint8_t* bytes_base_1 = reinterpret_cast<uint8_t*>(reinterpret_cast<__nv_bfloat16*>(peer_ptrs[rank]));
     unsigned int dirty_1 = (unsigned int)_vec_load_0[1];
@@ -896,9 +753,9 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
         unsigned int boundary_1 = (clear_1[1] + 15) / 16;
         for (unsigned int packed_1 = thread_1; packed_1 < boundary_1; packed_1 += threads_1) {
             {
-                auto _gst_9 = reinterpret_cast<unsigned __int128*>(bytes_base_1 + stage_offset_1) + packed_1;
-                __builtin_assume(__isGlobal(_gst_9));
-                reinterpret_cast<int4*>(_gst_9)[0] = reinterpret_cast<int4*>(sentinel_1)[0];
+                auto _gst_6 = reinterpret_cast<unsigned __int128*>(bytes_base_1 + stage_offset_1) + packed_1;
+                __builtin_assume(__isGlobal(_gst_6));
+                reinterpret_cast<int4*>(_gst_6)[0] = reinterpret_cast<int4*>(sentinel_1)[0];
             }
         }
     }
@@ -908,14 +765,14 @@ kernel_cake_kimi_k3_tp12_tail_b07ac9e62b88b42f4a87(__nv_bfloat16* __restrict__ s
         asm volatile("barrier.arrive 1, 448;" ::: "memory");
     }
     if (tid == 0) {
-        asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+        asm volatile("red.async.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
     }
     if (first_token == 0) {
         if (blockIdx.y == 0) {
             if (tid == 0) {
                 {
-                    volatile unsigned int* _sysv_wait_p_10 = reinterpret_cast<volatile unsigned int*>(buffer_flags) + (8);
-                    while (*_sysv_wait_p_10 < static_cast<unsigned int>(gridDim.x * gridDim.y * gridDim.z)) {}
+                    volatile unsigned int* _sysv_wait_p_7 = reinterpret_cast<volatile unsigned int*>(buffer_flags) + (8);
+                    while (*_sysv_wait_p_7 < static_cast<unsigned int>(gridDim.x * gridDim.y * gridDim.z)) {}
                 }
                 unsigned int current = (unsigned int)_vec_load_0[0];
                 unsigned int head[4];
