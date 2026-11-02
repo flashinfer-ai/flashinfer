@@ -41,6 +41,23 @@ SM100/SM103 run it as two internal KV passes; build any caller
 arguments. Paging arguments, the output contract, and
 ``out=``/``schedule_meta`` semantics are identical across the pair.
 
+FP8 selects 64-bit store offsets when the physical output span, including row
+padding, reaches ``2**31`` elements. Logical dimensions still fit int32. This
+specialization has small-output and lowering coverage. The H64/Q8192/1M
+benchmark uses a full-score buffer of ``2**33`` FP32 elements (about 8.6 billion),
+selects the Int64 store path, and passes all-row FP32 checks before and after
+timing. There is no dedicated unit test at that scale. FP4 continues to reject
+spans of ``2**31`` elements or larger.
+
+The FP8 scorer accepts ``math_mode="relu_strict"`` (default) or
+``"relu_fast"``. Strict uses NaN-aware ReLU with the full scale. Fast FP32
+epilogues use packed ``x + abs(x)`` and one half-scale compensation:
+intermediate overflow, tiny-scale underflow and exceptional-value behavior
+can differ. FP16 epilogue arithmetic is unchanged; FP16 output storage alone
+does not select FP16 arithmetic. The trace reference models FP32 accumulation
+and epilogue with FP32 or FP16 output storage, rejecting other traced arithmetic
+precisions independently of the public scorer's supported FP16 arithmetic.
+
 .. note::
 
   Within each row's scheduled extent the kernels write unconditionally and

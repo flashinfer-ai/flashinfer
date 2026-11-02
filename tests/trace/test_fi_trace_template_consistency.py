@@ -409,6 +409,19 @@ def _make_sample_kwargs(template: TraceTemplate, axis_size: int = 4) -> Dict[str
     collected into a tuple and stored under the shared ``param`` key.
     """
     sizes = {name: axis_size for name in template.axes}
+    required_axes = {
+        axis
+        for descriptor in template.inputs.values()
+        if isinstance(descriptor, Tensor) and not descriptor.optional
+        for axis in descriptor.dim_names
+    }
+    missing_constants = {
+        axis
+        for axis, marker in template.axes.items()
+        if isinstance(marker, Const)
+        and marker.value is None
+        and axis not in required_axes
+    }
 
     # Accumulate tuple parts: param → list indexed by tuple_idx
     tuple_parts: Dict[str, list] = {}
@@ -416,7 +429,7 @@ def _make_sample_kwargs(template: TraceTemplate, axis_size: int = 4) -> Dict[str
 
     for json_key, descriptor in template.inputs.items():
         if isinstance(descriptor, Scalar):
-            if descriptor.optional:
+            if descriptor.optional and json_key not in missing_constants:
                 continue
             p = _resolved_param(json_key, descriptor)
             if descriptor.dtype == "int32":
@@ -425,7 +438,9 @@ def _make_sample_kwargs(template: TraceTemplate, axis_size: int = 4) -> Dict[str
                 kwargs[p] = 1.0
 
         elif isinstance(descriptor, Tensor):
-            if descriptor.optional:
+            if descriptor.optional and not missing_constants.intersection(
+                descriptor.dim_names
+            ):
                 continue
             p = _resolved_param(json_key, descriptor)
             shape = [sizes.get(d, axis_size) for d in descriptor.dim_names]
