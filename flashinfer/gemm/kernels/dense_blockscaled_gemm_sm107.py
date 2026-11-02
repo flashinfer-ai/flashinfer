@@ -228,7 +228,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         c: cute.Tensor,
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         swizzle_size: int = 1,
         raster_order: Literal["m", "n"] = "m",
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
@@ -310,7 +310,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         a_sf_ptr: cute.Pointer,
         b_sf_ptr: cute.Pointer,
         alpha_tensor: cute.Tensor,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         current_stream,
         swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -379,7 +379,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         c_ptr: cute.Pointer,
         alpha_tensor: cute.Tensor,
         c_ld: cutlass.Int64,
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         current_stream: cuda.CUstream,
         swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -404,7 +404,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             c_ptr (cute.Pointer): Pointer to the C tensor.
             alpha_tensor (cute.Tensor): Device tensor containing alpha scaling factor.
             c_ld (cutlass.Int64): C leading dimension override. Use 0 for default contiguous layout.
-            max_active_clusters (cutlass.Constexpr): Maximum number of active clusters.
+            max_active_clusters (cutlass.Int32): Maximum number of active clusters.
             current_stream (cuda.CUstream): CUDA stream for the operation.
             swap_ab (cutlass.Constexpr, optional): Whether to swap A and B. Defaults to False.
             epilogue_op (cutlass.Constexpr, optional): Elementwise lambda for epilogue.
@@ -912,7 +912,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         alpha: cute.Tensor,
         layouts: cutlass.Constexpr[Tuple[OperandMajorMode, OperandMajorMode, utils.LayoutEnum]],
         problem_mnkl: Tuple[int, int, int, int],
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         c_ld: cutlass.Int64 = cutlass.Int64(0),
@@ -935,7 +935,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         :param c_tensor: Output tensor C
         :type c_tensor: cute.Tensor
         :param max_active_clusters: Maximum number of active clusters
-        :type max_active_clusters: cutlass.Constexpr
+        :type max_active_clusters: cutlass.Int32
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
@@ -2804,8 +2804,8 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         c_ptr: cute.Pointer,
         layouts: cutlass.Constexpr[Tuple[OperandMajorMode, OperandMajorMode, utils.LayoutEnum]],
         problem_mnkl: Tuple[int, int, int, int],
-        preferred_max_active_clusters: cutlass.Constexpr,
-        fallback_max_active_clusters: cutlass.Constexpr,
+        preferred_max_active_clusters: cutlass.Int32,
+        fallback_max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         alpha: cute.Tensor,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -2829,9 +2829,9 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         :param c_tensor: Output tensor C
         :type c_tensor: cute.Tensor
         :param preferred_max_active_clusters: Maximum number of preferred active clusters
-        :type preferred_max_active_clusters: cutlass.Constexpr
+        :type preferred_max_active_clusters: cutlass.Int32
         :param fallback_max_active_clusters: Maximum number of fallback active clusters
-        :type fallback_max_active_clusters: cutlass.Constexpr
+        :type fallback_max_active_clusters: cutlass.Int32
         :param stream: CUDA stream for asynchronous execution
         :type stream: cuda.CUstream
         :param epilogue_op: Optional elementwise lambda function to apply to the output tensor
@@ -4004,8 +4004,8 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         cta_tile_shape_mnk: Tuple[int, int, int],
         preferred_cluster_shape_mn: Tuple[int, int],
         fallback_cluster_shape_mn: Tuple[int, int],
-        preferred_max_active_clusters: cutlass.Constexpr,
-        fallback_max_active_clusters: cutlass.Constexpr,
+        preferred_max_active_clusters: cutlass.Int32,
+        fallback_max_active_clusters: cutlass.Int32,
     ) -> Tuple[
         utils.PersistentTileSchedulerParams,
         Tuple[int, int, int],
@@ -4022,9 +4022,9 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         :param fallback_cluster_shape_mn: Shape of each cluster in M, N dimensions.
         :type fallback_cluster_shape_mn: tuple[int, int]
         :param preferred_max_active_clusters: Maximum number of preferred active clusters.
-        :type preferred_max_active_clusters: cutlass.Constexpr
+        :type preferred_max_active_clusters: cutlass.Int32
         :param fallback_max_active_clusters: Maximum number of fallback active clusters.
-        :type fallback_max_active_clusters: cutlass.Constexpr
+        :type fallback_max_active_clusters: cutlass.Int32
 
         :return: A tuple containing:
             - preferred_tile_sched_params: Parameters for the preferred persistent tile scheduler.
@@ -4105,8 +4105,8 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         c_ptr: cute.Pointer,
         alpha_tensor: cute.Tensor,
         c_ld: cutlass.Int64,
-        preferred_max_active_clusters: cutlass.Constexpr,
-        fallback_max_active_clusters: cutlass.Constexpr,
+        preferred_max_active_clusters: cutlass.Int32,
+        fallback_max_active_clusters: cutlass.Int32,
         current_stream: cuda.CUstream,
         swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,
