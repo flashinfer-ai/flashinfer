@@ -12,7 +12,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from ..support import check_device, unsupported
+from ...batch_invariant.support import check_device, unsupported
 from .generator import Knobs
 from .schedule import chunks_for, default_config
 from .spec import MMA_K
@@ -41,7 +41,7 @@ def sm_count_of(device: torch.device) -> int:
 
 def part_of(device: torch.device) -> Tuple[int, str]:
     """The part the dispatcher models for ``device``: its SM count and architecture family (`cost_model.family_of`)."""
-    from ..support import compute_capability
+    from ...batch_invariant.support import compute_capability
     from .cost_model import family_of
 
     return sm_count_of(device), family_of(compute_capability(device))

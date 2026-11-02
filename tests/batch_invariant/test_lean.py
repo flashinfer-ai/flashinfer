@@ -18,7 +18,7 @@ import subprocess
 import pytest
 
 from flashinfer.batch_invariant import lean_cases
-from flashinfer.batch_invariant.gemm.spec import MMA_K
+from flashinfer.gemm.batch_invariant.spec import MMA_K
 
 LAKE = shutil.which("lake") or os.path.expanduser("~/.elan/bin/lake")
 needs_lake = pytest.mark.skipif(

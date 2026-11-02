@@ -1,5 +1,5 @@
 import BIKernels.GEMM
-/-! Canonical S-expressions, textually identical to `term.sexpr` on the Python side (`flashinfer/batch_invariant/fp/term.py`)
+/-! Canonical S-expressions, textually identical to `term.sexpr` on the Python side (`flashinfer/batch_invariant/fp_interface/term.py`)
 for the GEMM terms. The commutative `add` prints its operands sorted, as Python does. -/
 namespace BIK
 

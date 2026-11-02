@@ -13,8 +13,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32
 
-from .. import jit
-from ..fp.cute import CuteF32, get_cutlass_dtype
+from ...batch_invariant import jit
+from ...batch_invariant.fp_interface.cute import CuteF32, get_cutlass_dtype
 from .blocks.compile import MODULE
 
 VEC = 4  # fp32 per 16-byte load

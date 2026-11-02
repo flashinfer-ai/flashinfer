@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 
-from .. import canon
+from ...batch_invariant import canon
 from .spec import ELEM_BITS, MMA_K, MMA_OP, GemmSpec, k_steps
 
 MMA_K_BLOCKS = 4  # instruction K-steps per smem stage: the static inner radix of the mainloop's blocked fold
@@ -297,7 +297,7 @@ class GemmKernelPlan:
         the kernel executes (``MainloopBlock.lowering``) builds, over the block count the kernel runs for this K, the
         canonical fold of the padded K (the zero-filled tail steps are identities: Lean ``fold_pad``), per chunk for
         the split class."""
-        from ..fp.term import TermAlgebra
+        from ...batch_invariant.fp_interface.term import TermAlgebra
         from .spec import reduction, reduction_chunked
 
         alg = alg or TermAlgebra()

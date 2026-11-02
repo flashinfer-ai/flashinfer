@@ -12,7 +12,7 @@ Two consistency classes:
 
 * ``gemm.bf16.kfold``: one fold over all K-steps from +0;
 * ``gemm.bf16.kchunk[C]``: K cut into ``C`` equal chunks (``C`` a function of the weight shape only, never of
-  M: :func:`flashinfer.batch_invariant.gemm.schedule.chunks_for`), each chunk an MMA fold from +0, the chunk
+  M: :func:`flashinfer.gemm.batch_invariant.schedule.chunks_for`), each chunk an MMA fold from +0, the chunk
   partials folded in chunk order with ``add.rn`` from +0. A split kernel computes the chunks on different CTAs
   and folds them in a fixup pass; the in-CTA chunk fold computes the same boundaries inside one CTA.
 """
@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import hashlib
 
-from ..canon import Digit, Reduction
-from ..fp.term import Term, TermAlgebra, fingerprint
+from ...batch_invariant.canon import Digit, Reduction
+from ...batch_invariant.fp_interface.term import Term, TermAlgebra, fingerprint
 
 MMA_K = 16  # bf16 K extent of one tcgen05.mma
 MMA_OP = "mma_bf16_k16"

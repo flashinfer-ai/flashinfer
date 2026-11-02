@@ -3,8 +3,8 @@
 """Batch-invariant mode: deterministic, batch-invariant kernels behind ``batch_invariant=True``.
 
 The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface
-in its symbolic, exact-CPU and device backends, the term language and its fingerprints), the kernel classes behind the
-FlashInfer operators that accept the flag, and the Lean project that proves the engine's reduction orders. ``README.md``
+``fp_interface`` in its symbolic and device backends, the term language and its fingerprints) and the Lean project that
+proves the engine's reduction orders; each kernel class lives next to its FlashInfer operator (``flashinfer/gemm/batch_invariant``). ``README.md``
 next to this file is the contract: the guarantee (R1-R4), the flag semantics, the tests and how to check the proofs.
 """
 
@@ -29,8 +29,8 @@ class ClassInfo(NamedTuple):
 
 
 def _mm_bf16_fingerprint(N: int, K: int) -> str:
-    from .gemm.schedule import chunks_for
-    from .gemm.spec import spec_fingerprint
+    from ..gemm.batch_invariant.schedule import chunks_for
+    from ..gemm.batch_invariant.spec import spec_fingerprint
 
     return spec_fingerprint(K, "bf16", chunks_for(N, K))
 

@@ -12,7 +12,7 @@ import functools
 import cutlass
 import cutlass.cute as cute
 
-from ... import jit
+from ....batch_invariant import jit
 from ..generator import Knobs
 from .kernel import BlockGemm
 from .operands import ALIGN, IN_DT, OUT_DT, can_implement  # noqa: F401  (re-exported)

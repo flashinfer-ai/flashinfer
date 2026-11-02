@@ -28,7 +28,7 @@ from ...fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ..support import unsupported
+from ...batch_invariant.support import unsupported
 from .api import CLASS, mm_bf16_batch_invariant, part_of, prepare_operands
 from .generator import Knobs
 from .schedule import chunks_for, default_config, rank_topk

@@ -28,7 +28,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.utils.blackwell_helpers import get_smem_store_op, get_tmem_load_op
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
-from ...fp.cute import CuteF32
+from ....batch_invariant.fp_interface.cute import CuteF32
 from .operands import ACC_DTYPE, BAR_EPILOGUE, EPILOGUE_WARPS
 
 

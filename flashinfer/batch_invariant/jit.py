@@ -4,7 +4,8 @@
 
 :func:`build_and_load` is :func:`flashinfer.jit.cute_dsl_core.build_and_load_cute_dsl_kernel` with the module's **source
 closure** as the key files: the transitive closure of relative imports (module- and function-level) from the module's
-root files (:data:`MODULE_ROOTS`) plus the ``__init__`` of every package on the way. A change to any file a kernel's
+root files (:data:`MODULE_ROOTS`) within the mode's directories (:data:`MODE_DIRS`) plus the ``__init__`` of every package on
+the way. A change to any file a kernel's
 generated code depends on therefore invalidates the module's cached objects, while the API module stays outside the
 closure and can change freely. Everything else (module directory, ``meta.json``, locking, ``FLASHINFER_DISABLE_JIT``,
 ``FLASHINFER_CUTE_DSL_DISABLE_CACHE``) is FlashInfer's.
@@ -26,13 +27,26 @@ __all__ = [
     "sanitize_symbol_name",
 ]
 
-_PKG_DIR = Path(__file__).resolve().parent
+_FI_DIR = Path(__file__).resolve().parents[1]  # the flashinfer package
+#: The directories of the mode: the engine here and the per-operator classes next to their FlashInfer operators.
+MODE_DIRS: Tuple[Path, ...] = (
+    _FI_DIR / "batch_invariant",
+    _FI_DIR / "gemm" / "batch_invariant",
+)
 
-#: Root files of every cache module; the module's closure is the transitive relative-import closure of these files.
+#: Root files of every cache module, relative to the flashinfer package; the module's closure is the transitive
+#: relative-import closure of these files within the mode's directories.
 MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
     # the GEMM kernels and the split-K fixup share one module: both roots, so an edit to either invalidates its objects
-    "batch_invariant_gemm_bf16": ("gemm/blocks/compile.py", "gemm/fixup.py"),
+    "batch_invariant_gemm_bf16": (
+        "gemm/batch_invariant/blocks/compile.py",
+        "gemm/batch_invariant/fixup.py",
+    ),
 }
+
+
+def _in_mode(path: Path) -> bool:
+    return any(path == d or d in path.parents for d in MODE_DIRS)
 
 
 def _relative_imports(path: Path) -> set:
@@ -58,7 +72,7 @@ def _relative_imports(path: Path) -> set:
         for c in cands:
             if c.exists():
                 r = c.resolve()
-                if r == _PKG_DIR or _PKG_DIR in r.parents:
+                if _in_mode(r):
                     out.add(r)
     return out
 
@@ -68,9 +82,9 @@ def module_sources(module: str) -> Tuple[Path, ...]:
     """The source files a module's compiled objects depend on (see the module docstring)."""
     roots = MODULE_ROOTS.get(module)
     if roots is None:
-        return tuple(sorted(_PKG_DIR.rglob("*.py")))
+        return tuple(sorted(p for d in MODE_DIRS for p in d.rglob("*.py")))
     seen: set = set()
-    stack = [(_PKG_DIR / r).resolve() for r in roots]
+    stack = [(_FI_DIR / r).resolve() for r in roots]
     while stack:
         p = stack.pop()
         if p in seen:
@@ -83,14 +97,14 @@ def module_sources(module: str) -> Tuple[Path, ...]:
             init = d / "__init__.py"
             if init.exists():
                 seen.add(init.resolve())
-            if d == _PKG_DIR or _PKG_DIR not in d.parents:
+            if d in MODE_DIRS or not _in_mode(d):
                 break
             d = d.parent
     return tuple(sorted(seen))
 
 
 def relative_sources(module: str) -> list:
-    return [str(p.relative_to(_PKG_DIR)) for p in module_sources(module)]
+    return [str(p.relative_to(_FI_DIR)) for p in module_sources(module)]
 
 
 def build_and_load(module: str, kernel: str, compile_fn: Callable[[], Any]) -> Any:

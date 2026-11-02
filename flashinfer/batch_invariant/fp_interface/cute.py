@@ -8,7 +8,7 @@ FMAs), these are opaque to the compiler: no contraction, no reassociation, no fl
 tensor-core step is not here: it is the kernel's opaque ``cute.gemm`` on the accumulator, below which
 nothing is reordered.
 
-The class mirrors the interface of :class:`flashinfer.batch_invariant.fp.term.TermAlgebra` (symbolic), so
+The class mirrors the interface of :class:`flashinfer.batch_invariant.fp_interface.term.TermAlgebra` (symbolic), so
 the specification's chains can be written once and run under both backends.
 """
 

@@ -30,11 +30,16 @@ import dataclasses
 import os
 from typing import Dict, List, Tuple
 
-from .fp import term
-from .gemm.cost_model import PARTS
-from .gemm.generator import REFERENCE_SHAPE, Knobs, MainloopBlock, enumerate_space
-from .gemm.schedule import chunks_for, default_config
-from .gemm.spec import MMA_K, GemmSpec, reduction
+from .fp_interface import term
+from ..gemm.batch_invariant.cost_model import PARTS
+from ..gemm.batch_invariant.generator import (
+    REFERENCE_SHAPE,
+    Knobs,
+    MainloopBlock,
+    enumerate_space,
+)
+from ..gemm.batch_invariant.schedule import chunks_for, default_config
+from ..gemm.batch_invariant.spec import MMA_K, GemmSpec, reduction
 
 LEAN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lean")
 CASES_PATH = os.path.join(LEAN_DIR, "BIKernels", "Cases.lean")
