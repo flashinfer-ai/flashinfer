@@ -513,11 +513,19 @@ def _prims_ts_trace_scale_values(kwargs, names, *, bound):
             planned, torch.Tensor
         ):
             raise ValueError(f"{name} must retain its planned float or tensor type")
-        values[name] = (
-            value.view(1)
-            if isinstance(value, torch.Tensor) and value.ndim == 0
-            else value
-        )
+        if isinstance(value, torch.Tensor):
+            if (
+                value.numel() != 1
+                or value.ndim > 1
+                or value.dtype != torch.float32
+                or not value.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be a contiguous float32 tensor of shape () or (1,)"
+                )
+            if value.ndim == 0:
+                value = value.view(1)
+        values[name] = value
     return values
 
 

@@ -195,6 +195,43 @@ def test_prims_ts_scalar_tensor_trace(bound):
     "family", ["decode", "mla", "block_sparse", "paged_block_sparse"]
 )
 @pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("scale_index", [0, 1])
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((0,), torch.float32),
+        ((2,), torch.float32),
+        ((1, 1), torch.float32),
+        ((1,), torch.float16),
+    ],
+)
+def test_prims_ts_trace_rejects_invalid_scale_metadata(
+    family, bound, scale_index, shape, dtype
+):
+    scales = [0.25, 1.0]
+    invalid = torch.empty(shape, dtype=dtype, device="meta")
+    scales[scale_index] = invalid
+    api, kwargs, names = _trace_case(family, bound, scales)
+    with pytest.raises(
+        ValueError, match=f"{names[scale_index]} must be a contiguous float32 tensor"
+    ):
+        fi_trace(api, **kwargs)
+    if bound:
+        # Both an inherited operand and an explicit run override must satisfy
+        # the fixed one-element tensor schema before TraceApply can select it.
+        scales[scale_index] = torch.empty(1, device="meta")
+        api, kwargs, _ = _trace_case(family, True, scales)
+        with pytest.raises(
+            ValueError,
+            match=f"{names[scale_index]} must be a contiguous float32 tensor",
+        ):
+            fi_trace(api, **kwargs, **{names[scale_index]: invalid})
+
+
+@pytest.mark.parametrize(
+    "family", ["decode", "mla", "block_sparse", "paged_block_sparse"]
+)
+@pytest.mark.parametrize("bound", [False, True])
 def test_prims_ts_scale_variants_are_registered(family, bound):
     api, _, names = _trace_case(family, bound, (0.25, 1.0))
     original = inspect.unwrap(api)

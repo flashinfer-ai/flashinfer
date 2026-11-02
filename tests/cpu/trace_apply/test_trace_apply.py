@@ -607,6 +607,61 @@ def test_prims_ts_device_scale_routes(family, bound, scale_types, scalar_tensor)
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("scale_index", [0, 1])
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((0,), torch.float32),
+        ((2,), torch.float32),
+        ((1, 1), torch.float32),
+        ((1,), torch.float16),
+    ],
+)
+def test_prims_ts_invalid_scale_metadata_falls_back(bound, scale_index, shape, dtype):
+    from tests.trace.test_prims_ts_global_scales import _trace_case
+
+    scales = [0.25, 1.0]
+    scales[scale_index] = torch.empty(1, device="meta")
+    api, kwargs, names = _trace_case(
+        "block_sparse" if bound else "decode", bound, scales
+    )
+    definition = flashinfer.fi_trace(api, **kwargs)
+    kwargs[names[scale_index]] = torch.empty(shape, dtype=dtype, device="meta")
+    if bound:
+        state = api.__self__._plan_state
+        state.device = torch.device("cuda:0")
+        state.use_kv_valid_bits = False
+        state.dummy_kv_valid_bits = None
+        kwargs.update(validate=False, out=kwargs["q"])
+        expected_error = (
+            f"{names[scale_index]} must be a contiguous CUDA float32 tensor"
+        )
+    else:
+        expected_error = "block_tables must be a CUDA tensor"
+
+    # Establish the real API's rejection without requiring a GPU or replacing
+    # its implementation. Apply must preserve that fallback, not run a solution.
+    with pytest.raises(ValueError, match=expected_error):
+        api(**kwargs)
+    calls = []
+
+    def solution(**inputs):
+        calls.append(inputs)
+        return kwargs["q"]
+
+    ta.enable_apply({definition["name"]: solution})
+    target = (
+        api.__self__.run
+        if bound
+        else getattr(importlib.import_module(api.__module__), api.__name__)
+    )
+    with pytest.raises(ValueError, match=expected_error):
+        target(**kwargs)
+    assert not calls
+
+
+@pytest.mark.cpu_only
 def test_enable_apply_real_kernel_numeric():
     """A genuine torch RMSNorm callable; assert the substituted output matches."""
     ta.enable_apply({"rmsnorm_h16": _torch_rmsnorm})
