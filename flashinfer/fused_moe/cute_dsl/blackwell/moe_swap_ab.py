@@ -38,6 +38,7 @@ from flashinfer.utils import get_compute_capability
 
 from ..moe_utils import (
     normalize_cute_dsl_moe_activation_type,
+    validate_cute_dsl_moe_clamped_relu2_config,
     validate_cute_dsl_moe_situ_config,
 )
 from .moe_swap_ab_kernel import Sm100BlockScaledGroupedGemmKernel
@@ -97,6 +98,7 @@ def _run_blockscaled_gemm(
     sm_count=None,
     publish_routing_before_signal=False,
     activation_cache_policy: str = "normal",
+    clamped_relu2_limit=None,
 ):
     cache_policies = {
         "normal": 0,
@@ -162,6 +164,7 @@ def _run_blockscaled_gemm(
         _blockscaled_ptr(num_tiles, cutlass.Int32),
         _blockscaled_ptr(token_final_scales, scale_dtype),
         _blockscaled_ptr(per_token_scale, cutlass.Float32),
+        _blockscaled_ptr(clamped_relu2_limit, cutlass.Float32, 4),
     )
     device_sms = get_num_sm(activation.device)
     num_sms = device_sms if sm_count is None else sm_count
@@ -331,6 +334,7 @@ def launch_gather_gemm(
     gated: bool = True,
     k_steps: Optional[int] = None,
     use_clc_scheduler: bool = True,
+    clamped_relu2_limit: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Gather input inside FC1 with the swap-AB weight layout."""
     _check_gemm_inputs(a, b, a_dtype, b_dtype, a_per_token_scale, k_steps)
@@ -390,6 +394,9 @@ def launch_gather_gemm(
         )
     validate_cute_dsl_moe_situ_config(
         normalized_activation_type, situ_beta, situ_linear_beta
+    )
+    validate_cute_dsl_moe_clamped_relu2_config(
+        normalized_activation_type, clamped_relu2_limit, a.device
     )
     if type(use_clc_scheduler) is not bool:
         raise ValueError("use_clc_scheduler must be a boolean")
@@ -508,6 +515,7 @@ def launch_gather_gemm(
         activation_cache_policy="evict_last",
         use_clc_scheduler=use_clc_scheduler,
         sm_count=sm_count,
+        clamped_relu2_limit=clamped_relu2_limit,
     )
     return out, out_scale
 

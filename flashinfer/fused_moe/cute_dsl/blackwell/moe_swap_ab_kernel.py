@@ -561,6 +561,7 @@ class Sm100BlockScaledMoeEpilogue:
             ActivationType.Swiglu.value,
             ActivationType.GegluTanh.value,
             ActivationType.Relu2.value,
+            ActivationType.ClampedRelu2.value,
         ):
             raise ValueError(
                 f"Unsupported split block-scaled activation: {activation_type}"
@@ -601,6 +602,10 @@ class Sm100BlockScaledMoeEpilogue:
             ActivationType.Swiglu.value,
             ActivationType.GegluTanh.value,
         )
+        self.nongated = activation_type in (
+            ActivationType.Relu2.value,
+            ActivationType.ClampedRelu2.value,
+        )
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
@@ -623,11 +628,23 @@ class Sm100BlockScaledMoeEpilogue:
         self.transpose_barrier = pipeline.NamedBarrier(6, 128)
 
     @cute.jit
-    def _activate(self, up, gate, alpha):
+    def _activate(self, up, gate, alpha, clamped_relu2_params=None):
         result = cute.make_rmem_tensor((16,), cutlass.Float32)
         for i in cutlass.range_constexpr(0, 16, 2):
             u = cute.arch.mul_packed_f32x2((up[i], up[i + 1]), (alpha, alpha))
-            if cutlass.const_expr(self.activation_type == ActivationType.Relu2.value):
+            if cutlass.const_expr(self.nongated):
+                if cutlass.const_expr(
+                    self.activation_type == ActivationType.ClampedRelu2.value
+                ):
+                    limit, inv_limit = clamped_relu2_params
+                    u = cute.arch.mul_packed_f32x2(u, (inv_limit, inv_limit))
+                    u = cute.arch.mul_packed_f32x2(
+                        (
+                            tanh_f32(u[0], fastmath=True),
+                            tanh_f32(u[1], fastmath=True),
+                        ),
+                        (limit, limit),
+                    )
                 relu = (
                     cute.arch.fmax(u[0], cutlass.Float32(0.0)),
                     cute.arch.fmax(u[1], cutlass.Float32(0.0)),
@@ -850,6 +867,7 @@ class Sm100BlockScaledMoeEpilogue:
         release_acc: cutlass.Constexpr = False,
         acc_pipeline=None,
         acc_state=None,
+        clamped_relu2_params=None,
     ):
         warp = (tidx // 32) % 4
         lane = tidx % 32
@@ -937,10 +955,7 @@ class Sm100BlockScaledMoeEpilogue:
                         self._store_converted(
                             values, output_tensor, output_row, channel
                         )
-        elif cutlass.const_expr(
-            self.activation_type == ActivationType.Relu2.value
-            or self.activation_type is None
-        ):
+        elif cutlass.const_expr(self.nongated or self.activation_type is None):
             top = _blockscaled_load16x32(scratch)
             bottom = _blockscaled_load16x32(scratch + (16 << 16))
             transposed = _blockscaled_transpose16x32((top, bottom), scratch)
@@ -954,10 +969,7 @@ class Sm100BlockScaledMoeEpilogue:
             scale = alpha
             output_row = row
             if token_start + lane < valid_tokens:
-                if cutlass.const_expr(
-                    self.use_per_token_scale
-                    and self.activation_type == ActivationType.Relu2.value
-                ):
+                if cutlass.const_expr(self.use_per_token_scale and self.nongated):
                     scale = (
                         scale
                         * per_token_scale[
@@ -969,9 +981,9 @@ class Sm100BlockScaledMoeEpilogue:
                 if cutlass.const_expr(self.scatter_output):
                     output_row = fc2_output_row
                     scale = fc2_scale
-            if cutlass.const_expr(self.activation_type == ActivationType.Relu2.value):
-                top = self._activate(top, None, scale)
-                bottom = self._activate(bottom, None, scale)
+            if cutlass.const_expr(self.nongated):
+                top = self._activate(top, None, scale, clamped_relu2_params)
+                bottom = self._activate(bottom, None, scale, clamped_relu2_params)
             elif cutlass.const_expr(self.activation_type is None):
                 for i in cutlass.range_constexpr(0, 16, 2):
                     top[i], top[i + 1] = cute.arch.mul_packed_f32x2(
@@ -1033,6 +1045,7 @@ class Sm100BlockScaledMoeEpilogue:
         acc_state,
         channel_stride: cutlass.Constexpr,
         channel_tiles: cutlass.Constexpr,
+        clamped_relu2_params=None,
     ):
         # Treat all channel tiles as one virtual accumulator column range.
         # The actual scale footprint, rounded to a 32-column transpose slab,
@@ -1069,6 +1082,7 @@ class Sm100BlockScaledMoeEpilogue:
                     step + 1 == self.overlap_activation_steps,
                     acc_pipeline,
                     acc_state,
+                    clamped_relu2_params,
                 )
             elif cutlass.const_expr(step + 1 == self.overlap_activation_steps):
                 cute.arch.fence_view_async_tmem_load()
@@ -1335,6 +1349,7 @@ class Sm100BlockScaledMoeEpilogue:
         acc_pipeline=None,
         acc_state=None,
         tma_output=None,
+        clamped_relu2_params=None,
     ):
         lane = tidx % 32
         if cutlass.const_expr(self.bulk_tokens > 0):
@@ -1409,9 +1424,7 @@ class Sm100BlockScaledMoeEpilogue:
                             else uniform_scale
                         ),
                     )
-        elif cutlass.const_expr(
-            self.gated or self.activation_type == ActivationType.Relu2.value
-        ):
+        elif cutlass.const_expr(self.gated or self.nongated):
             for token_start in cutlass.range(0, self.tile_n, 32, unroll=1):
                 if token_start < valid_tokens:
                     self._run_token_group(
@@ -1430,6 +1443,7 @@ class Sm100BlockScaledMoeEpilogue:
                         token_start,
                         cutlass.Int32(0),
                         alpha,
+                        clamped_relu2_params=clamped_relu2_params,
                     )
 
 
@@ -2077,6 +2091,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         num_tiles_ptr: cute.Pointer,
         token_final_scales_ptr: Optional[cute.Pointer],
         per_token_scale_ptr: Optional[cute.Pointer],
+        clamped_relu2_limit_ptr: Optional[cute.Pointer],
         num_channels: cutlass.Constexpr,
         num_routes: cutlass.Int64,
         reduction_size: cutlass.Constexpr,
@@ -2173,6 +2188,11 @@ class Sm100BlockScaledGroupedGemmKernel:
             per_token_scale = cute.make_tensor(
                 per_token_scale_ptr, cute.make_layout((per_token_scale_rows,))
             )
+        clamped_relu2_limit = None
+        if cutlass.const_expr(clamped_relu2_limit_ptr is not None):
+            clamped_relu2_limit = cute.make_tensor(
+                clamped_relu2_limit_ptr, cute.make_layout((1,))
+            )
         self(
             weights,
             activations,
@@ -2188,6 +2208,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             num_tiles,
             token_final_scales,
             per_token_scale,
+            clamped_relu2_limit,
             stream,
         )
 
@@ -2208,6 +2229,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         num_tiles,
         token_final_scales,
         per_token_scale,
+        clamped_relu2_limit,
         stream,
     ):
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
@@ -2475,6 +2497,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             num_tiles,
             token_final_scales,
             per_token_scale,
+            clamped_relu2_limit,
             sched_params,
         ).launch(
             grid=launch_grid,
@@ -2652,6 +2675,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         num_tiles,
         token_final_scales,
         per_token_scale,
+        clamped_relu2_limit,
         sched_params,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -3308,6 +3332,14 @@ class Sm100BlockScaledGroupedGemmKernel:
             norm = cutlass.Float32(1.0)
             if cutlass.const_expr(norm_const is not None):
                 norm = norm_const[0]
+            # Read the runtime clamp after the PDL wait, once per epilogue
+            # thread and outside the persistent tile loop.
+            clamped_relu2_params = None
+            if cutlass.const_expr(
+                self.epilogue.activation_type == ActivationType.ClampedRelu2.value
+            ):
+                limit = clamped_relu2_limit[0]
+                clamped_relu2_params = (limit, cutlass.Float32(1.0) / limit)
             consumer = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.acc_stages
             )
@@ -3364,6 +3396,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                         consumer,
                         self.mma_m,
                         self.channel_tiles,
+                        clamped_relu2_params,
                     )
                 else:
                     for channel_tile in cutlass.range_constexpr(self.channel_tiles):
@@ -3397,6 +3430,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                             acc_pipe,
                             consumer,
                             tma_output,
+                            clamped_relu2_params,
                         )
                 cute.arch.fence_view_async_tmem_load()
                 if cutlass.const_expr(not self.overlap_acc):

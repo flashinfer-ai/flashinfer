@@ -391,6 +391,7 @@ def _activation_kernel(
     ACC,
     ALPHA,
     ROW_SCALE,
+    CLAMP_LIMIT,
     OUT,
     N: tl.constexpr,
     WIDTH: tl.constexpr,
@@ -417,8 +418,12 @@ def _activation_kernel(
         else:
             row_scale = tl.load(ROW_SCALE + row, index < N, other=0)
         alpha = _mul_rn_f32(alpha, row_scale)
-    if ACTIVATION == "relu2":
+    if ACTIVATION == "relu2" or ACTIVATION == "clamped_relu2":
         up = _mul_rn_f32(tl.load(ACC + index, index < N, other=0), alpha)
+        if ACTIVATION == "clamped_relu2":
+            limit = tl.load(CLAMP_LIMIT)
+            inverse = tl.div_rn(1.0, limit)
+            up = _mul_rn_f32(limit, _tanh_approx_f32(_mul_rn_f32(up, inverse)))
         result = tl.inline_asm_elementwise(
             "{ .reg .f32 r; max.f32 r, $1, 0f00000000; mul.rn.f32 $0, r, r; }",
             "=f,f",
@@ -524,6 +529,7 @@ def activate_fc1(
     swiglu_limit=None,
     situ_beta=None,
     situ_linear_beta=None,
+    clamped_relu2_limit=None,
 ):
     """Apply the FC1 FP32 scale and activation before intermediate quantization."""
     if accumulators.ndim != 2 or accumulators.dtype != torch.float32:
@@ -532,6 +538,8 @@ def activate_fc1(
         raise ValueError("split MoE arithmetic references require CUDA")
     if activation_type == ActivationType.Relu2:
         kind, width = "relu2", accumulators.shape[1]
+    elif activation_type == ActivationType.ClampedRelu2:
+        kind, width = "clamped_relu2", accumulators.shape[1]
     elif activation_type in (ActivationType.Swiglu, ActivationType.GegluTanh):
         if accumulators.shape[1] % 2:
             raise ValueError("gated FC1 accumulators require equal up/gate halves")
@@ -539,6 +547,18 @@ def activate_fc1(
         kind = "swiglu" if activation_type == ActivationType.Swiglu else "geglu_tanh"
     else:
         raise ValueError(f"Unsupported split MoE activation: {activation_type}")
+    if activation_type == ActivationType.ClampedRelu2:
+        if (
+            clamped_relu2_limit is None
+            or clamped_relu2_limit.shape != (1,)
+            or clamped_relu2_limit.dtype != torch.float32
+            or clamped_relu2_limit.device != accumulators.device
+        ):
+            raise ValueError(
+                "ClampedRelu2 requires an FP32 limit[1] on the input device"
+            )
+    elif clamped_relu2_limit is not None:
+        raise ValueError("clamped_relu2_limit requires ActivationType.ClampedRelu2")
     if situ_beta is not None:
         if activation_type != ActivationType.Swiglu:
             raise ValueError("SiTU requires ActivationType.Swiglu")
@@ -564,6 +584,7 @@ def activate_fc1(
         accumulators.contiguous(),
         alpha,
         per_token_scale,
+        clamped_relu2_limit,
         output,
         output.numel(),
         width,
@@ -792,6 +813,7 @@ def cute_dsl_moe_reference(
     sf_vec_size=16,
     swap_ab=True,
     mma_k_plans=(None, None),
+    clamped_relu2_limit=None,
 ):
     """Evaluate unfused swap-AB MoE from the exact prepared kernel operands.
 
@@ -815,7 +837,7 @@ def cute_dsl_moe_reference(
         raise ValueError("The standalone SM100 MoE finalizer requires BF16 output")
     if per_token_scale is not None and sf_vec_size != 16:
         raise ValueError("Per-token scaling is an NVFP4 contract")
-    if activation_type == ActivationType.Relu2:
+    if activation_type in (ActivationType.Relu2, ActivationType.ClampedRelu2):
         gated = False
     elif activation_type in (ActivationType.Swiglu, ActivationType.GegluTanh):
         gated = True
@@ -874,6 +896,7 @@ def cute_dsl_moe_reference(
             swiglu_limit,
             situ_beta,
             situ_linear_beta,
+            clamped_relu2_limit,
         )
         if sf_vec_size == 16:
             if per_token_scale is None:

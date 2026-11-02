@@ -627,7 +627,6 @@ def _moe_core_impl(
         gemm1_options = {
             "mma_tiler": gemm1_mma_tiler,
             "mma_inst_shape": gemm1_mma_inst_shape,
-            "clamped_relu2_limit": clamped_relu2_limit,
         }
         gemm2_options = {
             "mma_tiler": gemm2_mma_tiler,
@@ -861,6 +860,7 @@ def _moe_core_impl(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             gated=gated,
+            clamped_relu2_limit=clamped_relu2_limit,
             **gemm1_options,
         )
     if use_per_token_activation:

@@ -364,6 +364,7 @@ def _compute_moe_quant_mode_reference(tensors, quant_mode, swap_ab=False, **kwar
                 )
             }
             inputs.update({key: kwargs[key] for key in reference_keys if key in kwargs})
+            inputs["clamped_relu2_limit"] = kwargs.get("clamped_relu2_limit")
             if quant_mode == "w4a4":
                 reference_config = dict(
                     per_token_scale=tensors["x_per_token_scale"],
@@ -2400,7 +2401,7 @@ class TestCuteDslFusedMoeFunctional:
         + [
             pytest.param(
                 quant_mode,
-                ActivationType.Swiglu,
+                activation_type,
                 17,
                 2,
                 256,
@@ -2415,10 +2416,11 @@ class TestCuteDslFusedMoeFunctional:
                 marks=mxfp8_required,
             )
             for quant_mode in ("w4a8", "mxfp8")
-            for activation, situ_beta, situ_linear_beta in (
-                ("swiglu", None, None),
-                ("situ-gate", 1.75, None),
-                ("situ-gate-and-up", 0.8, 1.5),
+            for activation, activation_type, situ_beta, situ_linear_beta in (
+                ("swiglu", ActivationType.Swiglu, None, None),
+                ("situ-gate", ActivationType.Swiglu, 1.75, None),
+                ("situ-gate-and-up", ActivationType.Swiglu, 0.8, 1.5),
+                ("clamped-relu2", ActivationType.ClampedRelu2, None, None),
             )
             for tile, tactic in (
                 (
@@ -2475,6 +2477,11 @@ class TestCuteDslFusedMoeFunctional:
             tactic=tactic,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            clamped_relu2_limit=(
+                torch.tensor([0.25], dtype=torch.float32, device="cuda")
+                if activation_type == ActivationType.ClampedRelu2
+                else None
+            ),
         )
 
     @pytest.mark.parametrize(
@@ -2549,6 +2556,7 @@ class TestCuteDslFusedMoeFunctional:
         tactic=None,
         situ_beta=None,
         situ_linear_beta=None,
+        clamped_relu2_limit=None,
     ):
         from flashinfer import cute_dsl_fused_moe
 
@@ -2659,6 +2667,7 @@ class TestCuteDslFusedMoeFunctional:
             swap_ab=swap_ab,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            clamped_relu2_limit=clamped_relu2_limit,
         )
         result = cute_dsl_fused_moe(**inputs, **config, tactic=tactic)
 
@@ -2681,6 +2690,7 @@ class TestCuteDslFusedMoeFunctional:
             activation_type=activation_type,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
+            clamped_relu2_limit=clamped_relu2_limit,
             **reference_inputs,
         )
 
@@ -2710,7 +2720,10 @@ class TestCuteDslFusedMoeFunctional:
                 cute_dsl_fused_moe(**invalid, **config, tactic=tactic)
 
     @pytest.mark.parametrize("use_per_token_activation", [False, True])
-    def test_clamped_relu2_accuracy(self, use_per_token_activation: bool):
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    def test_clamped_relu2_accuracy(
+        self, use_per_token_activation: bool, swap_ab: bool
+    ):
         """Accuracy test for the non-gated clamped ReLU^2 (W4A4)."""
         from flashinfer import cute_dsl_fused_moe
 
@@ -2733,10 +2746,11 @@ class TestCuteDslFusedMoeFunctional:
             top_k=top_k,
             gated=False,
             use_per_token_activation=use_per_token_activation,
+            swap_ab=swap_ab,
         )
         api_inputs, reference_inputs = _prepare_moe_quant_mode_inputs(tensors, "w4a4")
 
-        result = cute_dsl_fused_moe(
+        inputs = dict(
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
@@ -2745,15 +2759,19 @@ class TestCuteDslFusedMoeFunctional:
             w2_weight=tensors["w2_weight"],
             w2_weight_sf=tensors["w2_weight_sf"],
             w2_alpha=tensors["w2_alpha"],
+            **api_inputs,
+        )
+        limit = torch.tensor([clamped_relu2_limit], dtype=torch.float32, device="cuda")
+        config = dict(
             num_experts=num_experts,
             top_k=top_k,
             activation_type=activation_type,
             quant_mode="w4a4",
-            clamped_relu2_limit=torch.tensor(
-                [clamped_relu2_limit], dtype=torch.float32, device="cuda"
-            ),
-            **api_inputs,
+            clamped_relu2_limit=limit,
+            swap_ab=swap_ab,
+            use_fused_finalize=not swap_ab,
         )
+        result = cute_dsl_fused_moe(**inputs, **config)
 
         ref_output = compute_reference_moe_fp4(
             token_selected_experts=tensors["token_selected_experts"],
@@ -2790,6 +2808,40 @@ class TestCuteDslFusedMoeFunctional:
             f"ClampedRelu2 output is not closer to its reference "
             f"({clamped_error:.4f}) than to the ReLU^2 reference ({relu2_error:.4f})"
         )
+        if swap_ab:
+            from flashinfer import CuteDslMoEWrapper
+
+            exact = _compute_moe_quant_mode_reference(
+                tensors,
+                "w4a4",
+                swap_ab=True,
+                activation_type=activation_type,
+                clamped_relu2_limit=limit,
+            )
+            assert_cute_dsl_moe_bits(result, exact)
+            wrapper = CuteDslMoEWrapper(
+                **config,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                use_cuda_graph=True,
+            )
+            wrapper.run(**inputs)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = wrapper.run(**inputs)
+            graph.replay()
+            assert_cute_dsl_moe_bits(captured, exact)
+            limit.fill_(0.5)
+            graph.replay()
+            changed = _compute_moe_quant_mode_reference(
+                tensors,
+                "w4a4",
+                swap_ab=True,
+                activation_type=activation_type,
+                clamped_relu2_limit=limit,
+            )
+            assert_cute_dsl_moe_bits(captured, changed)
+            assert not torch.equal(exact, changed)
 
     def test_clamped_relu2_rejected_for_w4a16(self):
         """W4A16 has no ClampedRelu2 epilogue; the functional API rejects it

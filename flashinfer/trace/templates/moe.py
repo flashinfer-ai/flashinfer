@@ -2662,10 +2662,11 @@ def _moe_bf16_run_experts(
     situ_beta=None,
     situ_linear_beta=None,
     use_shuffled_weight=True,
+    clamped_relu2_limit=None,
 ):
     """Un-quantized (bf16) MoE expert computation."""
     # Keep enum values local so the serialized reference needs only PyTorch.
-    swiglu, swiglu_step, geglu_tanh, relu2 = 3, 7, 8, 6
+    swiglu, swiglu_step, geglu_tanh, relu2, clamped_relu2 = 3, 7, 8, 6, 12
     activation_type = int(activation_type)
     if situ_beta is not None or situ_linear_beta is not None:
         from ...fused_moe.cute_dsl.moe_utils import (
@@ -2673,10 +2674,11 @@ def _moe_bf16_run_experts(
         )
 
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
-    if activation_type not in (swiglu, swiglu_step, geglu_tanh, relu2):
+    if activation_type not in (swiglu, swiglu_step, geglu_tanh, relu2, clamped_relu2):
         raise ValueError(
             f"Unsupported activation_type {activation_type!r}; "
-            "expected 3 (SwiGLU), 7 (SwiGLUStep), 8 (GeGLUTanh), or 6 (ReLU2)"
+            "expected 3 (SwiGLU), 7 (SwiGLUStep), 8 (GeGLUTanh), "
+            "6 (ReLU2), or 12 (ClampedRelu2)"
         )
     if activation_type == swiglu_step:
         gemm1_weights = gemm1_weights.transpose(1, 2).flatten(2)
@@ -2703,7 +2705,12 @@ def _moe_bf16_run_experts(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W1[le].t())
-        if activation_type == relu2:
+        if activation_type == clamped_relu2:
+            if clamped_relu2_limit is None:
+                raise ValueError("ClampedRelu2 requires clamped_relu2_limit")
+            limit = clamped_relu2_limit.to(device=device, dtype=torch.float32)
+            act = torch.relu(limit * torch.tanh(G1 / limit)) ** 2
+        elif activation_type == relu2:
             act = torch.relu(G1) ** 2
         else:
             X1, X2 = G1[:, :I], G1[:, I:]
@@ -5031,6 +5038,7 @@ def _cute_dsl_fused_moe_reference(
     per_token_scale=None,
     local_expert_offset=0,
     swap_ab=False,
+    clamped_relu2_limit=None,
     **_unused,
 ):
     """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
@@ -5081,7 +5089,7 @@ def _cute_dsl_fused_moe_reference(
     else:
         W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp)
         W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp)
-    if int(activation_type) != ActivationType.Relu2.value:
+    if ActivationType(int(activation_type)).is_gated:
         from ...fused_moe.prepare import _cute_dsl_gated_weight_group_size
 
         # Undo the weight-preparation interleave for the shared reference.
@@ -5111,6 +5119,7 @@ def _cute_dsl_fused_moe_reference(
         gemm1_clamp_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        clamped_relu2_limit=clamped_relu2_limit,
     )
 
 
