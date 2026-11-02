@@ -45,7 +45,12 @@ struct DefaultAttention : AttentionVariantBase {
     qo_len = params.get_qo_len(batch_idx);
     kv_len = params.get_kv_len(batch_idx);
     if constexpr (use_logits_soft_cap) {
-      soft_cap_pre_tanh_scale = params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
+      if constexpr (use_alibi) {
+        // The ALiBi transform below applies sm_scale before adding the bias.
+        soft_cap_pre_tanh_scale = math::ptx_rcp(params.logits_soft_cap);
+      } else {
+        soft_cap_pre_tanh_scale = params.sm_scale * math::ptx_rcp(params.logits_soft_cap);
+      }
       sm_scale_log2 = math::log2e * params.logits_soft_cap;
     } else {
       if constexpr (use_alibi) {

@@ -48,6 +48,23 @@ def warmup_jit():
             [False],  # use_sliding_windows
             [False],  # use_logits_soft_caps
             [False],  # use_fp16_qk_reductions
+        )
+        + gen_decode_attention_modules(
+            [torch.float16],  # q_dtypes
+            [torch.float16],  # kv_dtypes
+            [128],  # head_dims
+            [2],  # pos_encoding_modes
+            [False],  # use_sliding_windows
+            [True],  # use_logits_soft_caps
+        )
+        + gen_prefill_attention_modules(
+            [torch.float16],  # q_dtypes
+            [torch.float16],  # kv_dtypes
+            [128],  # head_dims
+            [2],  # pos_encoding_modes
+            [False],  # use_sliding_windows
+            [True],  # use_logits_soft_caps
+            [False],  # use_fp16_qk_reductions
         ),
         verbose=False,
     )
@@ -98,6 +115,31 @@ def test_single_prefill_alibi(
         mask = torch.tril(mask, diagonal=kv_len - q_len)
     o_ref = alibi_attention(q, k, v, mask)
     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("attention_mode", ["decode", "prefill"])
+def test_alibi_logits_soft_cap_sm_scale_invariance(attention_mode):
+    head_dim = 128
+    sm_scale = 0.125
+    q = torch.ones(1, head_dim, device="cuda:0", dtype=torch.float16)
+    k = torch.stack([torch.zeros_like(q), torch.full_like(q, 0.5)])
+    v = torch.stack([torch.zeros_like(q), torch.ones_like(q)])
+    kwargs = {
+        "pos_encoding_mode": "ALIBI",
+        "logits_soft_cap": 8.0,
+    }
+
+    if attention_mode == "decode":
+        attention = flashinfer.single_decode_with_kv_cache
+    else:
+        attention = flashinfer.single_prefill_with_kv_cache
+        q = q.unsqueeze(0)
+        kwargs["backend"] = "fa2"
+
+    o_scaled_logits = attention(q, k, v, sm_scale=sm_scale, **kwargs)
+    o_scaled_query = attention(q * sm_scale, k, v, sm_scale=1.0, **kwargs)
+
+    torch.testing.assert_close(o_scaled_logits, o_scaled_query, rtol=0, atol=0)
 
 
 if __name__ == "__main__":
