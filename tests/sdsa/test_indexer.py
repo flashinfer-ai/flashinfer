@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""The SDSA indexer kernels and quantize_write_index_qk_nvfp4 against exact
-references over random paged BF16 or NVFP4 keys."""
+"""The SDSA (Simplified DSA) indexer kernels and quantize_write_index_qk_nvfp4
+against exact references over random paged BF16 or NVFP4 keys."""
 
 from functools import partial
 

@@ -3492,7 +3492,7 @@ group_union_masks.fi_trace(
     num_keys=16384,
 )
 
-# ── SDSA indexer ──────────────────────────────────────────────────────────────
+# ── SDSA (Simplified DSA) indexer ─────────────────────────────────────────────
 from flashinfer.sdsa import (
     gather_key_sample,
     indexer_scores,

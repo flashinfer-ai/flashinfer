@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""The single-head paged scorer: FP32 dot products of query rows with their
-request's paged BF16 or NVFP4 keys, on SM100 tensor cores (tcgen05), stored as
-scores or selected against per-row thresholds."""
+"""The paged scorer of the SDSA (Simplified DSA) indexer: FP32 dot products of
+query rows with their request's paged BF16 or NVFP4 keys, on SM100 tensor cores
+(tcgen05), stored as scores or selected against per-row thresholds."""
 
 from functools import cache
 from typing import Optional

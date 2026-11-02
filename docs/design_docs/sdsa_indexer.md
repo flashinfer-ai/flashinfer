@@ -2,7 +2,7 @@
 
 DeepSeek Sparse Attention (DSA) attends each query token to its Top-K keys. An
 indexer gives the scores that pick these keys. The DSA indexer has many heads
-(`fp8_paged_mqa_logits`, `fp4_paged_mqa_logits`). The SDSA indexer
+(`fp8_paged_mqa_logits`, `fp4_paged_mqa_logits`). The SDSA (Simplified DSA) indexer
 has one query head and no head weights: a score is the dot product of a
 query row and a key. The APIs in `flashinfer.sdsa` serve this indexer. The
 module has five parts:

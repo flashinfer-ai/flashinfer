@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""SDSA: sparse attention in which a one-head indexer selects the Top-K keys of
-each query token and an MQA core attends to these keys."""
+"""SDSA (Simplified DSA): sparse attention in which a one-head indexer selects
+the Top-K keys of each query token and an MQA core attends to these keys."""
 
 from .indexer import (
     gather_key_sample,

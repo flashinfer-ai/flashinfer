@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""SDSA indexer APIs. The SDSA indexer scores keys with one query head and
-no head weights. These APIs score its keys, select the keys that score above
-a threshold, set the thresholds from a key sample, write the Top-K keys of
+"""APIs of the SDSA (Simplified DSA) indexer, which scores keys with one query
+head and no head weights. These APIs score its keys, select the keys that score
+above a threshold, set the thresholds from a key sample, write the Top-K keys of
 the selection, and quantize its keys and queries to NVFP4."""
 
 from typing import Optional

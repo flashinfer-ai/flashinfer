@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""TraceTemplates of the SDSA indexer APIs in :mod:`flashinfer.sdsa`."""
+"""TraceTemplates of the SDSA (Simplified DSA) indexer APIs in :mod:`flashinfer.sdsa`."""
 
 from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 

@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 by FlashInfer team.
+
+"""The BF16 scorer of the SDSA (Simplified DSA) indexer off SM10x, such as on Hopper."""
+
 import triton  # type: ignore[import]
 import triton.language as tl  # type: ignore[import]
 
