@@ -695,7 +695,7 @@ def _k1_values(
 #: (64 tokens) unmeasured.  A token count outside the windows was not measured or missed, a ``None`` entry is a
 #: measured row that missed, a row without an entry was not measured: all of them run the deterministic program, and
 #: so does every window but a ``"waves"`` one on a device whose SM count is not the measured one,
-#: :data:`ROUTER_SM_COUNT`.
+#: :data:`ROUTER_SM_COUNT`, unless :data:`ROUTER_RULES_BY_SM` has a table for that SM count.
 # fmt: off
 ROUTER_RULES: dict[
     tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]
@@ -739,6 +739,32 @@ ROUTER_RULES: dict[
 #: window, which keeps the condition of :func:`router_waves` on every SM count (the plan of these rows before the
 #: windows).  An explicit ``splits`` is not affected.
 ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 216}
+#: Per-SM-count router verdicts of the parts of an architecture whose SM count is not :data:`ROUTER_SM_COUNT`,
+#: ``(arch, sm_count) -> {key: rule}`` (keys and rules as in :data:`ROUTER_RULES`, measured on parts of exactly that SM
+#: count under the same rule, in two jobs on different parts).  Such a part takes the table of its own SM count only:
+#: a row without an entry in it, and every token count outside its windows, runs the deterministic program.
+#: The sm_107a tables were measured on 208-SM and 212-SM R200 parts at 16172 to 16384 tokens: hidden 5120 takes
+#: "H0.5x4" there (104 head and 416 tail units on 208 SMs, 106 and 424 on 212); hidden 4096 and 6144 and the forward
+#: keep the deterministic plan, as on 216 SMs.
+# fmt: off
+ROUTER_RULES_BY_SM: dict[
+    tuple[str, int],
+    dict[tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]],
+] = {
+    ("sm_107a", 208): {
+        ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
+        ("sm_107a", "nn_t", 4096, 256): None,
+        ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+        ("sm_107a", "nn_t", 6144, 256): None,
+    },
+    ("sm_107a", 212): {
+        ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
+        ("sm_107a", "nn_t", 4096, 256): None,
+        ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+        ("sm_107a", "nn_t", 6144, 256): None,
+    },
+}
+# fmt: on
 #: The template suffix of the weight gradient's head/tail program (``router_fp32_gemm_atomic_nn_t`` + suffix): the
 #: head/tail partition on three TMEM chunk buffers, with register reallocation between its warpgroups.
 ROUTER_HEAD_TAIL_SUFFIX = "_ht_c3_nreg"
@@ -754,6 +780,19 @@ ROUTER_WAVE_K_BLOCKS = 68
 #: ... and only where the deterministic plan fills its last wave of CTA pairs below this fraction
 #: (``w / ceil(w)``, ``w = ROUTER_DET_WGRAD_SPLITS * tiles / pairs``).
 ROUTER_WAVE_MAX_DET_FILL = 0.8
+
+
+def router_rules(
+    arch: str, sm_count: int
+) -> tuple[dict[tuple[str, str, int, int], Any], bool]:
+    """``(rules, measured)``: the router verdicts a device of ``sm_count`` SMs takes -- the table of
+    :data:`ROUTER_RULES_BY_SM` for exactly ``(arch, sm_count)``, else :data:`ROUTER_RULES` -- and whether their
+    windows other than ``"waves"`` hold on it (always for a table of its own; for :data:`ROUTER_RULES` only on
+    :data:`ROUTER_SM_COUNT` SMs)."""
+    table = ROUTER_RULES_BY_SM.get((arch, int(sm_count)))
+    if table is not None:
+        return table, True
+    return ROUTER_RULES, int(sm_count) == ROUTER_SM_COUNT.get(arch)
 
 
 def router_waves(
@@ -930,11 +969,12 @@ def router_partition(
     * a caller's ``splits``: ``splits`` units per tile (``1``: every tile stored whole, the deterministic program's
       one-split bits -- the control of a measurement); the forward takes at most
       :data:`ROUTER_FORWARD_MAX_SPLITS`.
-    * otherwise the row's verdict in :data:`ROUTER_RULES`: the spec of its token window that holds the launch's token
-      count (``K`` of the weight gradient, ``M`` of the forward), on a device of :data:`ROUTER_SM_COUNT` SMs (a
-      ``"waves"`` window on every device where :func:`router_waves` gives a partition); a row, token count or SM
-      count without one, or a head/tail partition the token count cannot hold (:func:`router_partition_fits`), runs
-      the deterministic program.
+    * otherwise the row's verdict in :data:`ROUTER_RULES` (on a device with a table of its own in
+      :data:`ROUTER_RULES_BY_SM`, that table; :func:`router_rules`): the spec of its token window that holds the
+      launch's token count (``K`` of the weight gradient, ``M`` of the forward), on a device of
+      :data:`ROUTER_SM_COUNT` SMs or one with a table of its own (a ``"waves"`` window on every device where
+      :func:`router_waves` gives a partition); a row, token count or SM count without one, or a head/tail partition
+      the token count cannot hold (:func:`router_partition_fits`), runs the deterministic program.
 
     A forward partition must give every element at most two partials (:func:`router_at_most_two_partials`) and
     cannot be a head/tail partition: ``ValueError`` otherwise."""
@@ -958,14 +998,15 @@ def router_partition(
         spec = f"S{s}"
     else:
         hidden, tokens = (K, M) if layout == "kk" else (M, K)
-        rule = ROUTER_RULES.get((arch, layout, int(hidden), int(N)))
+        rules, measured = router_rules(arch, sm_count)
+        rule = rules.get((arch, layout, int(hidden), int(N)))
         if isinstance(rule, tuple):  # token windows (min_tokens, max_tokens, spec)
             spec = next((s for lo, hi, s in rule if lo <= int(tokens) <= hi), None)
         else:
             spec = rule
         if spec == "waves":  # its own SM-count condition, on every SM count
             spec = router_waves(m_pairs, n_tiles, k_iters, sm_count)
-        elif int(sm_count) != ROUTER_SM_COUNT.get(arch):
+        elif not measured:
             return None
         if spec is None:
             return None
@@ -2281,8 +2322,9 @@ def router_wgrad(
 ) -> torch.Tensor:
     """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store;
     ``splits`` defaults to the deterministic package's production count (6), or with ``deterministic=False`` to the
-    partition of the row's verdict in :data:`ROUTER_RULES` (:func:`router_partition`; a row or token count without
-    one runs the deterministic program)."""
+    partition of the row's verdict in :data:`ROUTER_RULES` or, on a part with a table of its own, in
+    :data:`ROUTER_RULES_BY_SM` (:func:`router_partition`; a row or token count without one runs the deterministic
+    program)."""
     if _resolve_deterministic(deterministic, "router_wgrad"):
         return _det_entry("router_wgrad")(G, X, out, **_splits_kw(splits))
     if out is None:

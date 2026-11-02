@@ -44,7 +44,7 @@ from .api_logging import flashinfer_experimental_api
 # applied to the backend's cache on first use (the first call of either
 # entry point).
 
-_FEATURE = "chunked LM-head + loss training kernels (SM100/SM103)"
+_FEATURE = "chunked LM-head + loss training kernels (SM100/SM103/SM107)"
 
 _CHECK_WITHOUT_COUNT = (
     "check_num_valid_rows=True needs num_valid_rows (the count it checks)"
@@ -222,7 +222,7 @@ def chunked_lm_head_det_loss(
     check_num_valid_rows: bool = False,
 ):
     r"""Differentiable chunked LM-head projection + loss with a memory-bounded
-    backward, SM100 / SM103 only.
+    backward, SM100 / SM103 / SM107 only.
 
     Computes the projection ``z = X @ W^T`` over token chunks of ``chunk_size``
     rows, the per-row log-probability of the selected token
@@ -572,7 +572,7 @@ def chunked_lm_head_det_logprob(
     temperature: Union[None, float, torch.Tensor] = None,
     check_temperature: bool = False,
 ) -> torch.Tensor:
-    r"""Differentiable chunked selected-token log-probability, SM100 / SM103 only.
+    r"""Differentiable chunked selected-token log-probability, SM100 / SM103 / SM107 only.
 
     Returns the FP32 ``logp [T]`` (``logp_t = z[t, y_t] - logsumexp_v z[t, v]``
     for valid rows, 0 for rows whose label is ``-100``) of the projection
@@ -696,7 +696,7 @@ def chunked_lm_head_det_preload(
     temperature: bool = False,
 ):
     r"""Do part of the one-time work of a process's first chunked LM-head call
-    ahead of it, then wait for the device once (SM100 / SM103 only).
+    ahead of it, then wait for the device once (SM100 / SM103 / SM107 only).
 
     Loads every generated library of the loss and log-probability entries for
     ``device``'s architecture (a JIT build when the package ships no prebuilt
@@ -740,7 +740,7 @@ def chunked_lm_head_det_support_logprob(
     check_inputs: bool = False,
     backend: str = "cake",
 ) -> torch.Tensor:
-    r"""Differentiable log-probabilities over a ragged candidate support per token, SM100 / SM103 only.
+    r"""Differentiable log-probabilities over a ragged candidate support per token, SM100 / SM103 / SM107 only.
 
     The candidates of row ``t`` are ``support_ids[support_offsets[t]:support_offsets[t + 1]]`` (int32 or
     int64 ids, unique inside a row, any order; int32 or int64 offsets, ``support_offsets[0] = 0``,
@@ -792,7 +792,7 @@ def chunked_lm_head_det_support_kl(
     check_inputs: bool = False,
     backend: str = "cake",
 ):
-    r"""Unreduced forward KL from a detached teacher over a ragged candidate support, SM100 / SM103 only.
+    r"""Unreduced forward KL from a detached teacher over a ragged candidate support, SM100 / SM103 / SM107 only.
 
     ``KL_t = sum_j Q_j (lq_j - logp_j)`` over the candidates of row ``t`` with ``Q_j = exp(lq_j) > 0``,
     for the FP32 teacher log-probabilities ``teacher_logprobs [M]`` aligned with ``support_ids``
