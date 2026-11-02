@@ -795,7 +795,7 @@ class Sm90W8A16Fp8GemmKernel:
                 cute.arch.mbarrier_wait(order_bar + cg, order_phase)
 
             # ---- mainloop
-            self._mainloop(
+            read_state, release_state = self._mainloop(
                 ab_pipeline,
                 read_state,
                 release_state,
@@ -1098,7 +1098,10 @@ class Sm90W8A16Fp8GemmKernel:
     ):
         """One work item's k-tiles into ``accumulators``: per k-tile the fp8 weight
         fragments are loaded from the stage and converted in registers while the
-        wgmma of the previous k-block runs; stages are released one behind."""
+        wgmma of the previous k-block runs; stages are released one behind.
+
+        Returns the advanced ``(read_state, release_state)``: a pipeline state is
+        passed into a jit helper by value, so the caller must take them back."""
         num_k_blocks = cute.size(tCrA_mma, mode=[2])
         k_wait_max = min(num_k_blocks - 1, 7)
         accumulators.fill(0.0)
@@ -1183,6 +1186,7 @@ class Sm90W8A16Fp8GemmKernel:
                 if cutlass.const_expr(kb + 1 < num_k_blocks):
                     self._a_convert(tCrA_mma, kb + 1, a_words_k[kb + 1])
             warpgroup.fence()
+        return read_state, release_state
 
     # ---------------------------------------------------------- tail fix-up
     @cute.jit

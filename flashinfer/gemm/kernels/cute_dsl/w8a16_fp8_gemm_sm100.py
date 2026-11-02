@@ -1531,7 +1531,7 @@ class Sm100W8A16Fp8GemmKernel:
         )
         epi_tile_count = cutlass.Int32(0)
         while work_tile.is_valid_tile:
-            num_prev_subtiles = self._epilogue_tile(
+            num_prev_subtiles, acc_consumer_state = self._epilogue_tile(
                 work_tile,
                 tile_l,
                 epi_tile_count,
@@ -1728,7 +1728,9 @@ class Sm100W8A16Fp8GemmKernel:
         """One output tile of the epilogue warps: wait for its accumulator stage, scale
         (and bias) in fp32, cast, and store it subtile by subtile through smem and the
         TMA (a partial last activation tile of split-K partials goes through the
-        predicated SIMT store).  Returns the subtile count advanced."""
+        predicated SIMT store).  Returns the advanced subtile count and accumulator
+        consumer state (a pipeline state is passed into a jit helper by value, so
+        the caller must take it back)."""
         m_base = work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
         # The tile's activation offset within C: its K-slice's rows follow
         # the previous slices' (split-K partials).
@@ -1868,7 +1870,7 @@ class Sm100W8A16Fp8GemmKernel:
                     cute.flatten(tTR_gC[(None, None, None, subtile_idx)]),
                     pred=cute.flatten(tCpC),
                 )
-        return num_prev_subtiles
+        return num_prev_subtiles, acc_consumer_state
 
     @cute.jit
     def _next_work_tile(
