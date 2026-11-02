@@ -587,6 +587,7 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                     }
                     dgk_s[hk] = dgk_inter;
                 }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(hd_read_done_addr);
                 mbarrier_wait(a_ready_addr, _phase_a_ready_0);
                 _phase_a_ready_0 ^= 1;
@@ -1284,6 +1285,7 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                         dkf1[j_8 + jj_5] = __fmaf_rn(tmem_load_1_2[j_8 + jj_5] * e_g2_0[j_8 + jj_5], beta_t, dk2_0[j_8 + jj_5]);
                     }
                 }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(hd_empty_addr);
                 if (nxt_c < (unsigned int)num_items_c) {

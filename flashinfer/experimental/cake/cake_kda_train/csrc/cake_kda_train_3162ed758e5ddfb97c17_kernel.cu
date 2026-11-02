@@ -257,7 +257,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kda_train_f3c938ed124d4a384e53(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap g, __nv_bfloat16* __restrict__ beta, int* __restrict__ cu_seqlens, int num_seqs, __nv_bfloat16* __restrict__ aqk_ext, __nv_bfloat16* __restrict__ akk_ext, __nv_bfloat16* __restrict__ aqk_int, __nv_bfloat16* __restrict__ akk_int, int num_heads, int num_qk_heads, int group, int write_ext, int write_int, float scale, float* __restrict__ gk_out, __nv_bfloat16* __restrict__ kb_out, __nv_bfloat16* __restrict__ kg_out, __nv_bfloat16* __restrict__ qg_out, __nv_bfloat16* __restrict__ v_new, int write_prep, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, int* __restrict__ seq_chunk_start, int* __restrict__ seq_order, int segments, int proportional, int* __restrict__ seg_table, float* __restrict__ beta_int)
+kernel_cake_kda_train_3162ed758e5ddfb97c17(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap g, __nv_bfloat16* __restrict__ beta, int* __restrict__ cu_seqlens, int num_seqs, __nv_bfloat16* __restrict__ aqk_ext, __nv_bfloat16* __restrict__ akk_ext, __nv_bfloat16* __restrict__ aqk_int, __nv_bfloat16* __restrict__ akk_int, int num_heads, int num_qk_heads, int group, int write_ext, int write_int, float scale, float* __restrict__ gk_out, __nv_bfloat16* __restrict__ kb_out, __nv_bfloat16* __restrict__ kg_out, __nv_bfloat16* __restrict__ qg_out, __nv_bfloat16* __restrict__ v_new, int write_prep, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, int* __restrict__ seq_chunk_start, int* __restrict__ seq_order, int segments, int proportional, int* __restrict__ seg_table)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -755,7 +755,14 @@ kernel_cake_kda_train_f3c938ed124d4a384e53(const __grid_constant__ CUtensorMap q
                         int du = order_t[ru];
                         int c0u = starts[du];
                         int n_u = starts[du + 1] - c0u;
-                        seg_table[base_t_tb + i_u + ru] = c0u + pu * n_u / segments;
+                        int off_u = pu * n_u / segments;
+                        int tail_u = n_u / (4 * segments);
+                        if (segments >= 2) {
+                            if (tail_u >= 1) {
+                                off_u = pu * (n_u - tail_u) / (segments - 1);
+                            }
+                        }
+                        seg_table[base_t_tb + i_u + ru] = c0u + off_u;
                         if (pu == segments - 1) {
                             seg_table[base_t_tb + i_u + ru + 1] = c0u + n_u;
                         }
@@ -939,19 +946,18 @@ kernel_cake_kda_train_f3c938ed124d4a384e53(const __grid_constant__ CUtensorMap q
                     _packed_5[_lp + 3] = *(uint32_t*)&_bf2;
                 }
                 reinterpret_cast<int4*>(v_new + pidx_p)[0] = reinterpret_cast<int4*>(_packed_5)[0];
-                {
-                    float4 _v4 = make_float4(pz8[0 + 0], pz8[0 + 1], pz8[0 + 2], pz8[0 + 3]);
-                    *reinterpret_cast<float4*>((gk_out + pidx_p) + 0) = _v4;
-                }
-                {
-                    float4 _v4 = make_float4(pz8[4 + 0], pz8[4 + 1], pz8[4 + 2], pz8[4 + 3]);
-                    *reinterpret_cast<float4*>((gk_out + (pidx_p + 4)) + 0) = _v4;
-                }
             }
-            if (tid_p < 64) {
-                long long brow_p = (long long)chunk_s * 64 + (long long)tid_p;
-                float bz = 0.0f;
-                beta_int[brow_p * (long long)num_heads + (long long)head_p] = bz;
+            if (tid_p < 32) {
+                float pz4[4];
+                pz4[0] = 0.0f;
+                pz4[1] = 0.0f;
+                pz4[2] = 0.0f;
+                pz4[3] = 0.0f;
+                long long gidx_p = pbase_p + (long long)(prs_p * 63) + (long long)(tid_p * 4);
+                {
+                    float4 _v4 = make_float4(pz4[0 + 0], pz4[0 + 1], pz4[0 + 2], pz4[0 + 3]);
+                    *reinterpret_cast<float4*>((gk_out + gidx_p) + 0) = _v4;
+                }
             }
         }
     }
@@ -1056,9 +1062,6 @@ kernel_cake_kda_train_f3c938ed124d4a384e53(const __grid_constant__ CUtensorMap q
             b_v = (float)b_raw;
         }
         beta_s[tid_0] = b_v;
-        if (write_prep != 0) {
-            beta_int[((long long)row0 + (long long)tid_0) * (long long)num_heads + (long long)head] = b_v;
-        }
     }
     int sl = lane_1 % 16;
     int hh = lane_1 / 16;
@@ -1185,6 +1188,21 @@ kernel_cake_kda_train_f3c938ed124d4a384e53(const __grid_constant__ CUtensorMap q
     asm volatile("tcgen05.fence::before_thread_sync;");
     asm volatile("barrier.sync 1, 256;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;");
+    if (write_prep != 0) {
+        if (tid_0 < 32) {
+            float g63[4];
+            int g63_c = (tid_0 & 7 ^ 7) * 16;
+            int g63_a = gk0 + (tid_0 >> 3) * 8192 + 8064 + g63_c;
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&g63[0])), "=r"(*reinterpret_cast<uint32_t*>(&g63[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&g63[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&g63[(0) + 3]))
+                : "r"(g63_a));
+            long long g63_o = ibase * 2 + (long long)(ars * 2 * 63 + tid_0 * 4);
+            {
+                float4 _v4 = make_float4(g63[0 + 0], g63[0 + 1], g63[0 + 2], g63[0 + 3]);
+                *reinterpret_cast<float4*>((gk_out + g63_o) + 0) = _v4;
+            }
+        }
+    }
     unsigned int _phase_q_full = 0;
     unsigned int _phase_ring_empty_0 = 1;
     unsigned int _phase_acc_done_0 = 0;
@@ -1222,14 +1240,6 @@ kernel_cake_kda_train_f3c938ed124d4a384e53(const __grid_constant__ CUtensorMap q
         int bq = q4 - i - 1 & 3;
         if (fill != 0) {
             mbarrier_wait(q_full_addr + (qs) * 8, _phase_q_full);
-            float gk_b[4];
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&gk_b[0])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b[(0) + 3]))
-                : "r"(gk_i));
-            {
-                float4 _v4 = make_float4(gk_b[0 + 0], gk_b[0 + 1], gk_b[0 + 2], gk_b[0 + 3]);
-                *reinterpret_cast<float4*>((gk_out + o_i + 0) + 0) = _v4;
-            }
             float gk[4];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&gk[0])), "=r"(*reinterpret_cast<uint32_t*>(&gk[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&gk[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&gk[(0) + 3]))
@@ -1885,14 +1895,6 @@ kernel_cake_kda_train_f3c938ed124d4a384e53(const __grid_constant__ CUtensorMap q
         int bq_0 = q4 - i - 1 & 3;
         if (fill != 0) {
             mbarrier_wait(q_full_addr + (qs) * 8, _phase_q_full);
-            float gk_b_1[4];
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&gk_b_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b_1[(0) + 3]))
-                : "r"(gk_i + 8192));
-            {
-                float4 _v4 = make_float4(gk_b_1[0 + 0], gk_b_1[0 + 1], gk_b_1[0 + 2], gk_b_1[0 + 3]);
-                *reinterpret_cast<float4*>((gk_out + o_i + 32) + 0) = _v4;
-            }
             float gk_1[4];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&gk_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&gk_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&gk_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&gk_1[(0) + 3]))
@@ -2244,14 +2246,6 @@ kernel_cake_kda_train_f3c938ed124d4a384e53(const __grid_constant__ CUtensorMap q
         int bq_5 = q4 - i - 1 & 3;
         if (fill != 0) {
             mbarrier_wait(q_full_addr + (qs) * 8, _phase_q_full);
-            float gk_b_2[4];
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&gk_b_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b_2[(0) + 3]))
-                : "r"(gk_i + 16384));
-            {
-                float4 _v4 = make_float4(gk_b_2[0 + 0], gk_b_2[0 + 1], gk_b_2[0 + 2], gk_b_2[0 + 3]);
-                *reinterpret_cast<float4*>((gk_out + o_i + 64) + 0) = _v4;
-            }
             float gk_2[4];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&gk_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&gk_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&gk_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&gk_2[(0) + 3]))
@@ -2603,14 +2597,6 @@ kernel_cake_kda_train_f3c938ed124d4a384e53(const __grid_constant__ CUtensorMap q
         int bq_10 = q4 - i - 1 & 3;
         if (fill != 0) {
             mbarrier_wait(q_full_addr + (qs) * 8, _phase_q_full);
-            float gk_b_3[4];
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&gk_b_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&gk_b_3[(0) + 3]))
-                : "r"(gk_i + 24576));
-            {
-                float4 _v4 = make_float4(gk_b_3[0 + 0], gk_b_3[0 + 1], gk_b_3[0 + 2], gk_b_3[0 + 3]);
-                *reinterpret_cast<float4*>((gk_out + o_i + 96) + 0) = _v4;
-            }
             float gk_3[4];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&gk_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&gk_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&gk_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&gk_3[(0) + 3]))
