@@ -353,7 +353,7 @@ GRID_KINDS = (
     "docs_heads",
     "carry_groups",
     "segments_heads",
-    "heads",
+    "head_chunk_blocks",
 )
 # the records delivered for a subset of the architectures (every other record ships on all three, the two-level
 # carry and the no-kb prep among them): the gate epilogue and its unfused GLM intra program on sm_100a, the fused
@@ -969,7 +969,7 @@ def test_the_raw_gate_records_mirror_the_g_records() -> None:
         "kind": "path_in",
         "paths": ["light", "light_states", "tape", "replay"],
     }
-    assert fin["grid_rule"] == {"kind": "heads"}
+    assert fin["grid_rule"] == {"kind": "head_chunk_blocks", "per_cta": 128}
     assert list(fin["arches"]) == list(ARCHES)
     assert set(fin["logical"].values()) == {
         "dA_part",
@@ -1215,8 +1215,8 @@ def _expected_grid(
         RAW_GLM_INTRA,
     ):
         return (nc_pad, h, 1)
-    if name == RAW_FINALIZE:  # one CTA per head
-        return (h, 1, 1)
+    if name == RAW_FINALIZE:  # one CTA per (head, segment of 128 chunks)
+        return (h, max(1, -(-nc_pad // 128)), 1)
     if name.startswith(("wy_", "dav")):  # one CTA per (pair, head) item
         return (max(1, nc_pad // 2 * h), 1, 1)
     if name == "fwdh_v3":
@@ -2364,7 +2364,11 @@ def test_raw_gate_plans_select_the_raw_class_and_the_fused_layouts() -> None:
                     assert not pr.dispatched("gate_epilogue", path)
                     assert not pg.dispatched("param_finalize", path)
                     if backward:
-                        assert pr.grid("param_finalize", path) == (heads, 1, 1)
+                        assert pr.grid("param_finalize", path) == (
+                            heads,
+                            max(1, -(-pr.NC_pad // 128)),
+                            1,
+                        )
                         assert pr.launches("param_finalize", path) == 1
                     for tables in (True, False):
                         want = (
@@ -2440,8 +2444,12 @@ def test_raw_gate_plans_select_the_raw_class_and_the_fused_layouts() -> None:
                     cake_backend.lifetime_table("bwd", plan=pr, gate_fused=False)
                 report = cake_backend.memory_report(S, N, heads, gate="raw", **q)
                 assert report["gate_fused"] is True
-                # the raw backward's per-call partials (hi, lo) FP32 [NC_pad, H, 128, 2], twice, outside the arena
-                assert report["bwd_partials"] == 2 * NC * H * D * 2 * 4
+                # the raw backward's per-call partials (hi, lo) FP32 [NC_pad, H, 128, 2], twice, plus the
+                # finalize's FP32 part2 [H, seg_cap, 128, 4] and its u32 ticket [H], outside the arena
+                seg_cap = max(1, -(-NC // 128))
+                assert report["bwd_partials"] == (
+                    2 * NC * H * D * 2 * 4 + H * seg_cap * D * 4 * 4 + 4 * H
+                )
                 assert cake_backend.memory_report(S, N, heads, **q)["bwd_partials"] == 0
                 assert report["out_bwd"] == cake_backend.output_bytes(
                     S, heads, backward=True, gate="raw"
@@ -3480,15 +3488,16 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    # The 65 programs of cake_jit.MODULES, each built for the architectures its record delivers (61 on all three,
-    # the four of RECORD_ARCHES on one each: 187 libraries); the KCP programs have their own package.
+    # The 73 programs of cake_jit.MODULES (65 of the g gate plus the 8 raw-gate programs), each built for the
+    # architectures its record delivers (69 on all three, the four of RECORD_ARCHES on one each: 211 libraries);
+    # the KCP programs have their own package.
     train_libraries = {
         (record["library"], arch)
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
-    assert len(train_libraries) == 187
-    assert len(names) == len(set(names)) == 187
+    assert len(train_libraries) == 211
+    assert len(names) == len(set(names)) == 211
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"
@@ -5902,11 +5911,12 @@ def _check_group_launches(launched, p, arena, lengths, path, *, passes=None) -> 
                         num_segments=pb.NSEG,
                     )
                     assert tuple(grid) == tuple(want), (name, b, i)
-    # the raw mode's parameter finalize closes the call: once, one CTA per head of the whole problem
+    # the raw mode's parameter finalize closes the call: once, one CTA per (head, segment of 128 chunks)
     if not forward and p.dispatched("param_finalize", path):
         name, grid, *_ = launched[pos]
         assert name == p.record("param_finalize", path)
-        assert tuple(grid) == tuple(p.grid("param_finalize", path)) == (p.H, 1, 1)
+        assert tuple(grid) == tuple(p.grid("param_finalize", path))
+        assert tuple(grid) == (p.H, max(1, -(-p.NC_pad // 128)), 1)
         pos += 1
     assert pos == len(launched)
 
@@ -7783,7 +7793,7 @@ def test_raw_gate_autograd_and_checkpoint_give_the_explicit_gradients(
         )
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(cake_backend, "chunk_kda_bwd", capture)
+    monkeypatch.setattr(cake_backend, "chunk_kda_det_bwd", capture)
     leaves = _raw_leaves(inputs)
     _raw_autograd(leaves, cu).backward(dout)
     assert seen == [("raw", LOWER_BOUND, True, LOWER_BOUND)]
@@ -7793,7 +7803,7 @@ def test_raw_gate_autograd_and_checkpoint_give_the_explicit_gradients(
     def other_bound(*args, **kwargs):
         return original(*args, **dict(kwargs, lower_bound=-4.0))
 
-    monkeypatch.setattr(cake_backend, "chunk_kda_bwd", other_bound)
+    monkeypatch.setattr(cake_backend, "chunk_kda_det_bwd", other_bound)
     o = _raw_autograd(_raw_leaves(inputs), cu)
     with pytest.raises(ValueError, match="lower_bound"):
         o.backward(dout)
@@ -7807,7 +7817,7 @@ def test_raw_gate_autograd_and_checkpoint_give_the_explicit_gradients(
         )
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(cake_backend, "chunk_kda_bwd", g_mode)
+    monkeypatch.setattr(cake_backend, "chunk_kda_det_bwd", g_mode)
     o = _raw_autograd(_raw_leaves(inputs), cu)
     with pytest.raises(ValueError, match="written by a forward in gate mode"):
         o.backward(dout)
