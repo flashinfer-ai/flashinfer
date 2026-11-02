@@ -1057,9 +1057,9 @@ def prims_ts_fp4_block_scale_routed_moe(
     )
 
 
-# Traced as the routed MoE whose kernels it compiles: it takes that op's
-# kernel-selecting arguments.
-@flashinfer_api(trace=trtllm_fp4_block_scale_routed_moe_trace)
+# No trace=: Trace Apply would replace this warmup with a routed-MoE solution,
+# and FLASHINFER_TRACE_DUMP would record it as a routed-MoE call.
+@flashinfer_api
 def prims_ts_fp4_block_scale_routed_moe_precompile(
     topk_ids: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     routing_bias: Optional[torch.Tensor],
