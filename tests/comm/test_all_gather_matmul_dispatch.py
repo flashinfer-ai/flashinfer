@@ -2,7 +2,7 @@ import importlib
 import inspect
 import sys
 from types import ModuleType, SimpleNamespace
-from typing import Callable
+from typing import Callable, Optional
 
 import pytest
 import torch
@@ -47,6 +47,7 @@ def test_public_package_exports_exact_prepare_api():
         "w",
         "group",
         "backend",
+        "max_rows",
         "verbose",
     )
     assert signature.parameters["inp"].annotation is torch.Tensor
@@ -55,6 +56,9 @@ def test_public_package_exports_exact_prepare_api():
     assert signature.parameters["backend"].annotation is str
     assert signature.parameters["backend"].kind is inspect.Parameter.KEYWORD_ONLY
     assert signature.parameters["backend"].default == "auto"
+    assert signature.parameters["max_rows"].annotation == Optional[int]
+    assert signature.parameters["max_rows"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["max_rows"].default is None
     assert signature.parameters["verbose"].annotation is bool
     assert signature.parameters["verbose"].kind is inspect.Parameter.KEYWORD_ONLY
     assert signature.parameters["verbose"].default is False
@@ -73,20 +77,20 @@ def test_prepare_backend_forwards_exact_binding(monkeypatch, backend):
     launcher = object()
     calls = []
 
-    def fake_prepare(actual_inp, actual_weight, actual_group, *, verbose):
-        calls.append((actual_inp, actual_weight, actual_group, verbose))
+    def fake_prepare(actual_inp, actual_weight, actual_group, *, max_rows, verbose):
+        calls.append((actual_inp, actual_weight, actual_group, max_rows, verbose))
         return launcher
 
-    backend_module._prepare_all_gather_matmul_cake_packed_qkv = fake_prepare
+    backend_module._prepare_all_gather_matmul_cake = fake_prepare
     monkeypatch.setitem(sys.modules, backend_module.__name__, backend_module)
 
     assert (
         dispatcher.prepare_all_gather_matmul(
-            inp, weight, subgroup, backend=backend, verbose=True
+            inp, weight, subgroup, backend=backend, max_rows=4096, verbose=True
         )
         is launcher
     )
-    assert calls == [(inp, weight, subgroup, True)]
+    assert calls == [(inp, weight, subgroup, 4096, True)]
 
 
 def test_prepare_unsupported_input_failure_propagates(monkeypatch):
@@ -98,7 +102,7 @@ def test_prepare_unsupported_input_failure_propagates(monkeypatch):
     def reject(*args, **kwargs):
         raise ValueError("unsupported prepared configuration")
 
-    backend_module._prepare_all_gather_matmul_cake_packed_qkv = reject
+    backend_module._prepare_all_gather_matmul_cake = reject
     monkeypatch.setitem(sys.modules, backend_module.__name__, backend_module)
 
     with pytest.raises(ValueError, match="unsupported prepared configuration"):

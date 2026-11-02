@@ -18,6 +18,8 @@ TEST_SHAPES = [
     (1, 8, 8, 128),  # vec-aligned fast path
     (2, 16, 24, 64),  # vec-aligned, batch > 1
     (1, 5, 8, 3),  # unaligned row -> scalar fallback path
+    (1, 11, 48, 34),  # 8B-aligned rows with eight ranks
+    (2, 7, 8, 17),  # exercises 8B and scalar paths across world sizes
 ]
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
@@ -55,7 +57,7 @@ def _run_correctness_worker(world_size, rank, distributed_init_port):
         # Output staging buffer must hold the largest a2a output (== input numel).
         max_bytes = max(B * S * H * D for (B, S, H, D) in TEST_SHAPES) * 4  # fp32
         buffer_ptrs = comm.create_shared_buffer(max_bytes, group=group)
-        # Signal buffers: one Signal per rank (same layout as vLLM custom AR).
+        # The raw API keeps the original one-slot signal allocation.
         meta_ptrs = comm.create_shared_buffer(comm.vllm_meta_size(), group=group)
 
         custom_ptr = comm.init_ulysses_a2a(

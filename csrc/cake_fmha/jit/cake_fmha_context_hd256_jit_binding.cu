@@ -55,85 +55,9 @@ double ScalarScale(Variant<double, ffi::Tensor> scale, const char* name) {
   return scalar.value();
 }
 
-void CheckSameDevice(TensorView query, TensorView tensor, const char* name) {
-  TVM_FFI_ICHECK_EQ(query.device().device_type, tensor.device().device_type)
-      << name << " must be on the query device";
-  TVM_FFI_ICHECK_EQ(query.device().device_id, tensor.device().device_id)
-      << name << " must be on the query device";
-}
+#include "include/cake_fmha_host_helpers.inc"
 
-struct TmaDeviceSlotState {
-  CUdeviceptr pointer = 0;
-  cudaEvent_t completion = nullptr;
-  cudaStream_t last_stream = nullptr;
-  std::string key;
-  bool has_completion = false;
-  bool reserved = false;
-  bool pinned = false;
-};
-
-struct TmaDeviceArena {
-  static constexpr size_t kSlotsPerChunk = 256;
-  static constexpr size_t kMaxReusableSlots = 4096;
-  static constexpr size_t kMaxPinnedSlots = 4096;
-  std::vector<CUdeviceptr> chunks;
-  std::vector<cudaEvent_t> events;
-  std::vector<TmaDeviceSlotState> slots;
-  std::unordered_map<std::string, size_t> pinned_slots;
-  unsigned long long context_id = 0;
-  size_t reusable_slots = 0;
-  size_t pinned_count = 0;
-  size_t cursor = 0;
-};
-
-struct TmaDeviceSlotLease {
-  void* pointer;
-  CUcontext context;
-  size_t slot_index;
-  bool track_completion;
-};
-
-bool TmaDeviceSlotReady(const TmaDeviceSlotState& slot) {
-  if (!slot.has_completion) return true;
-  cudaError_t status = cudaEventQuery(slot.completion);
-  if (status == cudaSuccess) return true;
-  TVM_FFI_ICHECK_EQ(status, cudaErrorNotReady)
-      << "failed to query Cake FMHA TMA descriptor completion: "
-      << cudaGetErrorString(status);
-  return false;
-}
-
-void AddTmaDeviceSlotChunk(TmaDeviceArena& arena) {
-  size_t count = std::min(TmaDeviceArena::kSlotsPerChunk,
-                          TmaDeviceArena::kMaxReusableSlots - arena.reusable_slots);
-  TVM_FFI_ICHECK_GT(count, 0);
-  CUdeviceptr chunk = 0;
-  CUresult result = cuMemAlloc(&chunk, count * sizeof(CUtensorMap));
-  TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS)
-      << "failed to allocate Cake FMHA TMA descriptor chunk";
-  arena.chunks.push_back(chunk);
-  for (size_t index = 0; index < count; ++index) {
-    cudaEvent_t completion = nullptr;
-    cudaError_t status = cudaEventCreateWithFlags(&completion, cudaEventDisableTiming);
-    TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "failed to create Cake FMHA TMA descriptor completion event: "
-        << cudaGetErrorString(status);
-    arena.events.push_back(completion);
-    arena.slots.push_back(
-        {chunk + index * sizeof(CUtensorMap), completion, nullptr, "", false, false, false});
-  }
-  arena.reusable_slots += count;
-}
-
-std::mutex& TmaDeviceSlotMutex() {
-  static auto* mutex = new std::mutex();
-  return *mutex;
-}
-
-std::unordered_map<CUcontext, TmaDeviceArena>& TmaDeviceArenas() {
-  static auto* arenas = new std::unordered_map<CUcontext, TmaDeviceArena>();
-  return *arenas;
-}
+#include "include/cake_fmha_tma_device_arena.inc"
 
 // Eager descriptors live in a bounded, completion-tracked pool. An exact
 // prewarmed descriptor is removed from that pool when capture first observes
@@ -245,31 +169,7 @@ TmaDeviceSlotLease TmaDeviceSlot(const CUtensorMap& tm, int device_id, cudaStrea
           selected, true};
 }
 
-void RecordTmaDeviceSlotUses(std::initializer_list<TmaDeviceSlotLease> leases,
-                             cudaStream_t stream) {
-  std::lock_guard<std::mutex> lock(TmaDeviceSlotMutex());
-  for (const auto& lease : leases) {
-    if (!lease.track_completion) continue;
-    auto arena_it = TmaDeviceArenas().find(lease.context);
-    TVM_FFI_ICHECK(arena_it != TmaDeviceArenas().end())
-        << "Cake FMHA TMA descriptor arena disappeared before completion";
-    auto& arena = arena_it->second;
-    TVM_FFI_ICHECK_LT(lease.slot_index, arena.slots.size())
-        << "Cake FMHA TMA descriptor lease index is out of range";
-    auto& slot = arena.slots[lease.slot_index];
-    if (slot.pinned) {
-      slot.reserved = false;
-      continue;
-    }
-    cudaError_t status = cudaEventRecord(slot.completion, stream);
-    TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-        << "failed to record Cake FMHA TMA descriptor completion: "
-        << cudaGetErrorString(status);
-    slot.has_completion = true;
-    slot.last_stream = stream;
-    slot.reserved = false;
-  }
-}
+#include "include/cake_fmha_tma_device_slot_uses.inc"
 
 CUtensorMap EncodeStagedQ(void* pointer, int64_t total_rows) {
 #if CAKE_FMHA_HD256_FP8

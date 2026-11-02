@@ -13,6 +13,7 @@ from flashinfer.fused_moe import (
     GeGLU,
     ReLU2,
     SwiGLU,
+    SwiGLUStep,
     # Unified configs, packs, and runners
     BackendOptions,
     ExecutionConfig,
@@ -50,13 +51,17 @@ def _build_per_tensor_fp8_runner(config):
 
 
 def _is_trtllm_fp8_arch() -> bool:
-    return torch.cuda.is_available() and get_compute_capability(
-        torch.device("cuda")
-    ) in ((10, 0), (10, 3))
+    from flashinfer.fused_moe.api import _TRTLLM_ROUTED_FP8_ARCHS
+
+    if not torch.cuda.is_available():
+        return False
+    major, minor = get_compute_capability(torch.device("cuda"))
+    return major * 10 + minor in _TRTLLM_ROUTED_FP8_ARCHS
 
 
 pytestmark = pytest.mark.skipif(
-    not _is_trtllm_fp8_arch(), reason="TRTLLM block-FP8 MoE requires SM100/103"
+    not _is_trtllm_fp8_arch(),
+    reason="TRTLLM block-FP8 MoE requires an arch in _TRTLLM_ROUTED_FP8_ARCHS",
 )
 
 HIDDEN = 256
@@ -782,6 +787,7 @@ def _per_tensor_fp8_reference(
     expert_offset: int = 0,
     routing_scales_on_input: bool = False,
     activation=None,
+    per_expert_limits=None,
     wrong_formula: bool = False,
 ) -> torch.Tensor:
     activation = activation or SwiGLU()
@@ -810,11 +816,21 @@ def _per_tensor_fp8_reference(
         else:
             up = gemm1[:, :INTERMEDIATE]
             gate = gemm1[:, INTERMEDIATE:]
-            intermediate = (
-                F.gelu(gate) * up
-                if isinstance(activation, GeGLU)
-                else F.silu(gate) * up
-            )
+            if isinstance(activation, SwiGLUStep):
+                limit = (
+                    activation.limit
+                    if per_expert_limits is None
+                    else per_expert_limits[local_expert]
+                )
+                intermediate = torch.clamp(F.silu(gate), max=limit) * torch.clamp(
+                    up, min=-limit, max=limit
+                )
+            else:
+                intermediate = (
+                    F.gelu(gate) * up
+                    if isinstance(activation, GeGLU)
+                    else F.silu(gate) * up
+                )
         intermediate_q = (intermediate * intermediate_scale).clamp(-fp8_max, fp8_max)
         intermediate_deq = (
             intermediate_q.to(torch.float8_e4m3fn).float() / intermediate_scale
@@ -831,6 +847,7 @@ def _per_tensor_fp8_reference(
 
 def _make_per_tensor_fp8_case(
     *,
+    tokens: int = TOKENS,
     routing_input_mode: RoutingInputMode = RoutingInputMode.FromLogits,
     routing_method: RoutingMethodType = RoutingMethodType.Default,
     top_k: int = TOP_K,
@@ -838,23 +855,23 @@ def _make_per_tensor_fp8_case(
     local_num_experts: int = NUM_EXPERTS,
     local_expert_offset: int = 0,
     activation=None,
+    per_expert_limits=None,
+    gemm1_weight_multiplier: float = 1.0,
+    intermediate_quant_scale: float = 64.0,
     with_wrong_formula_reference: bool = False,
 ):
     torch.manual_seed(42)
     device = torch.device("cuda")
-    x = torch.randn(TOKENS, HIDDEN, device=device, dtype=torch.bfloat16)
+    x = torch.randn(tokens, HIDDEN, device=device, dtype=torch.bfloat16)
     activation = activation or SwiGLU()
     gemm1_rows = INTERMEDIATE * (2 if activation.is_gated else 1)
-    w1 = (
-        torch.randn(
-            local_num_experts,
-            gemm1_rows,
-            HIDDEN,
-            device=device,
-            dtype=torch.bfloat16,
-        )
-        / HIDDEN**0.5
-    )
+    w1 = torch.randn(
+        local_num_experts,
+        gemm1_rows,
+        HIDDEN,
+        device=device,
+        dtype=torch.bfloat16,
+    ) * (gemm1_weight_multiplier / HIDDEN**0.5)
     w2 = (
         torch.randn(
             local_num_experts,
@@ -865,7 +882,7 @@ def _make_per_tensor_fp8_case(
         )
         / INTERMEDIATE**0.5
     )
-    logits = torch.randn(TOKENS, num_experts, device=device, dtype=torch.float32)
+    logits = torch.randn(tokens, num_experts, device=device, dtype=torch.float32)
     if routing_method is RoutingMethodType.Llama4:
         routing_weights, selected_experts = torch.topk(
             torch.sigmoid(logits), top_k, dim=-1
@@ -877,7 +894,7 @@ def _make_per_tensor_fp8_case(
     selected_experts = selected_experts.to(torch.int32)
 
     input_scale = fp8_per_tensor_global_scale(x)
-    intermediate_scale = torch.tensor(64.0, device=device)
+    intermediate_scale = torch.tensor(intermediate_quant_scale, device=device)
     x_q, x_scale = TrtllmFp8PerTensorConfig.prepare_activations(
         x, hidden_states_scale_global=input_scale
     )
@@ -892,6 +909,12 @@ def _make_per_tensor_fp8_case(
         activation=activation,
         device=device,
     )
+    if per_expert_limits is not None:
+        # The public typed limit is physical; the exported cubin pointer takes
+        # raw FC1 accumulators. The last row can represent a shared expert at 16.
+        view["gemm1_clamp_limit"] = (
+            per_expert_limits / view["output1_scales_gate_scalar"]
+        ).contiguous()
     if routing_input_mode is RoutingInputMode.FromLogits:
         act = MoEActivationPack(
             hidden_states_q=x_q,
@@ -929,7 +952,7 @@ def _make_per_tensor_fp8_case(
         ),
         activation=activation,
         backend=BackendOptions((TrtllmFp8PerTensorConfig(),)),
-        execution=ExecutionConfig(tune_max_num_tokens=TOKENS),
+        execution=ExecutionConfig(tune_max_num_tokens=tokens),
     )
     ref = _per_tensor_fp8_reference(
         x,
@@ -942,6 +965,7 @@ def _make_per_tensor_fp8_case(
         expert_offset=local_expert_offset,
         routing_scales_on_input=(routing_method is RoutingMethodType.Llama4),
         activation=activation,
+        per_expert_limits=per_expert_limits,
     )
     if not with_wrong_formula_reference:
         return act, weights, config, ref, selected_experts
@@ -1030,6 +1054,32 @@ def test_fp8_per_tensor_new_activation_matches_reference(activation):
     runner = _build_per_tensor_fp8_runner(config)
     direct = runner.forward(runner.pack_inputs(act, weights))
     _assert_per_tensor_fp8_close(direct, ref)
+
+
+@pytest.mark.parametrize(
+    "routing_input_mode",
+    [RoutingInputMode.FromLogits, RoutingInputMode.UnpackedPrecomputed],
+    ids=["from-logits", "pre-routed"],
+)
+def test_fp8_per_tensor_swiglu_step_mixed_limits(routing_input_mode):
+    """Typed 7 and per-expert 16 limits survive non-unit FC1 dequant scales."""
+    limits = torch.tensor([7.0, 16.0] * (NUM_EXPERTS // 2), device="cuda")
+    kwargs = dict(
+        tokens=16,
+        routing_input_mode=routing_input_mode,
+        activation=SwiGLUStep(limit=7.0),
+        gemm1_weight_multiplier=10.0,
+        intermediate_quant_scale=0.5,
+    )
+    act, weights, config, ref, _ = _make_per_tensor_fp8_case(
+        **kwargs, per_expert_limits=limits
+    )
+    default_act, default_weights, _, all_seven_ref, _ = _make_per_tensor_fp8_case(
+        **kwargs
+    )
+    layer = MoELayer(config)
+    _assert_per_tensor_fp8_close(layer(act, weights), ref)
+    _assert_per_tensor_fp8_close(layer(default_act, default_weights), all_seven_ref)
 
 
 @pytest.mark.parametrize(

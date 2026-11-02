@@ -49,23 +49,28 @@ def prepare_kimi_k3_fused_router(
     The experimental generated-program backend routes FP32 gate logits for 896
     experts (top-16 on ``sigmoid(logits) + bias``, weights renormalized over
     the selected sigmoid scores) and writes the ``block_m``-aligned route plan
-    (``moe_align_block_size`` layout) in one launch.  Exactly the routed
-    shapes ``num_tokens in {1, 2, 4, ..., 8192}`` with ``block_m in {8, 16}``
-    are served; see ``flashinfer/experimental/kimi_k3_fused_router/README.md``.
+    (``moe_align_block_size`` layout) in one launch.  Any ``num_tokens`` from
+    1 to 8192 is served with ``block_m in {8, 16}``: the dispatch arm is
+    chosen from a table measured at the powers of two from 1 to 8192 tokens,
+    other counts taking the arm of the next measured count up; larger counts
+    raise ``ValueError``.  See
+    ``flashinfer/experimental/kimi_k3_fused_router/README.md``.
 
     Parameters
     ----------
     logits : torch.Tensor
-        Contiguous float32 ``[num_tokens, 896]`` gate logits.
+        Contiguous, 16-byte aligned float32 ``[num_tokens, 896]`` gate logits.
     bias : torch.Tensor
-        Contiguous float32 ``[896]`` selection bias (selection only; it does
-        not enter the weights).
+        Contiguous, 16-byte aligned float32 ``[896]`` selection bias (selection
+        only; it does not enter the weights).
     block_m : int
         Route block alignment, 8 or 16.
     plan : Optional[KimiK3RoutePlan]
         Caller-owned outputs from
         :func:`flashinfer.fused_moe.allocate_kimi_k3_route_plan`; allocated
-        with worst-case capacity when omitted.
+        with worst-case capacity when omitted.  Its ``topk_ids``,
+        ``expert_counts``, ``expert_offsets`` and ``expert_scatter_offsets``
+        must be 16-byte aligned.
     backend : str
         Only ``"cake"`` is supported.
 

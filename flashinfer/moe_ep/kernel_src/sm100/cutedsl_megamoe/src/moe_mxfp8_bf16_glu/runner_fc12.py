@@ -111,11 +111,11 @@ class Mxfp8Bf16Fc12Tester(SwigluBf16Fc12Tester):
             problem.hidden <= 0
             or problem.intermediate <= 0
             or problem.hidden % 32 != 0
-            or (problem.intermediate // 2) % 32 != 0
+            or problem.intermediate % 64 != 0
         ):
             raise ValueError(
-                "hidden and intermediate/2 must be positive multiples of "
-                "the MXFP8 per-32 scale block."
+                "hidden must be a positive multiple of 32 and intermediate "
+                "(gate+up width) must be a positive multiple of 64."
             )
 
         self.weight_kind: WeightKind = weight_kind

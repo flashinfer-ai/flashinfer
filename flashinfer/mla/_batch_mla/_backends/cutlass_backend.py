@@ -11,6 +11,7 @@ from typing import ClassVar, Optional, Union, cast
 
 import torch
 
+from ....autotuner import TunableRunner
 from ....jit.mla import gen_mla_module
 from ....utils import check_shape_dtype_device, get_compute_capability
 from ._capabilities import (
@@ -19,6 +20,7 @@ from ._capabilities import (
     plan_capability_rejection_reason,
 )
 from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
+from .._contracts import _resolve_structural_mla_input
 
 
 def _get_compute_capability(device: torch.device):
@@ -202,7 +204,7 @@ def get_mla_module():
     return gen_mla_module().build_and_load()
 
 
-class _BatchMLAPagedAttentionCutlassBackend:
+class _BatchMLAPagedAttentionCutlassBackend(TunableRunner):
     _plan_capabilities: ClassVar[MLAPlanCapabilities] = MLAPlanCapabilities(
         backend_name="cutlass",
         lse_modes=frozenset({"none"}),
@@ -471,6 +473,92 @@ class _BatchMLAPagedAttentionCutlassBackend:
             output_scale,
         )
         return out
+
+    # Autotuning support for the current wrapper plan.
+
+    def __hash__(self):
+        return hash(type(self))
+
+    def configure_tuning(self, *, cache_key: tuple, run_options: dict) -> None:
+        """Bind immutable options; request tensors stay in forward's inputs."""
+        if any(isinstance(value, torch.Tensor) for value in run_options.values()):
+            raise TypeError("Planned tuning options must not contain tensors.")
+        self._planned_tuning_key = cache_key
+        self._planned_run_options = dict(run_options)
+
+    def get_valid_tactics(self, inputs, profile):
+        # A packed representation can still be strided. CUTLASS uses compact
+        # strides, while other candidates can execute that valid MLA workload.
+        widths = (self._head_dim_ckv, self._head_dim_kpe)
+        query = _resolve_structural_mla_input(
+            inputs[0],
+            desired="packed",
+            widths=widths,
+            name="query",
+            expected_dtype=self._q_data_type,
+            planned_dtype_name="q_data_type",
+            split_leaf_names=("q_nope", "q_pe"),
+        )
+        cache = _resolve_structural_mla_input(
+            inputs[1],
+            desired="packed",
+            widths=widths,
+            name="KV cache",
+            expected_dtype=self._kv_data_type,
+            planned_dtype_name="kv_data_type",
+            split_leaf_names=("ckv_cache", "kpe_cache"),
+        )
+        _check_cutlass_shape(query, cache, self._kv_len, self._page_table)
+        out = inputs[2]
+        if out is not None:
+            check_shape_dtype_device(
+                out,
+                (*query.shape[:-1], self._head_dim_ckv),
+                self._output_dtype,
+                self.device,
+                "out",
+            )
+        tensors = (query, cache) if out is None else (query, cache, out)
+        for tensor in tensors:
+            if tensor.device != self.device:
+                raise ValueError(
+                    "CUTLASS launch tensors must be on the workspace device."
+                )
+        if not all(tensor.is_contiguous() for tensor in tensors):
+            return []
+        return [-1]
+
+    def get_cache_key_extras(self, inputs):
+        return ("planned", self._planned_tuning_key)
+
+    def forward(
+        self,
+        inputs,
+        tactic: int = -1,
+        do_preparation: bool = False,
+        run_options=None,
+        **kwargs,
+    ):
+        if tactic != -1:
+            raise ValueError(f"Unsupported CUTLASS MLA tactic: {tactic!r}.")
+        query, kv_cache, out, lse, sinks = inputs[:5]
+        widths = (self._head_dim_ckv, self._head_dim_kpe)
+        return self.run_from_wrapper(
+            query=_resolve_structural_mla_input(
+                query, desired="packed", widths=widths, name="query"
+            ),
+            kv_cache=_resolve_structural_mla_input(
+                kv_cache, desired="packed", widths=widths, name="KV cache"
+            ),
+            out=out,
+            lse=lse,
+            sinks=sinks,
+            profiler_buffer=None,
+            kv_len=None,
+            page_table=None,
+            ckv_scale_arr=None,
+            **(self._planned_run_options if run_options is None else run_options),
+        )
 
     @classmethod
     def run_planless(

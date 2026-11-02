@@ -263,7 +263,7 @@ DEFAULT_SEQLEN: int = 8192
 DEFAULT_BATCH: int = 1
 DEFAULT_HEADS: int = 32
 DEFAULT_SCALE: float = 1.0 / (DK**0.5)
-L2_NORM_EPS: float = 1.0e-12
+L2_NORM_EPS: float = 1.0e-6
 VERIFY_RTOL: float = 1.0e-2
 VERIFY_ATOL: float = 1.0e-3
 
@@ -787,11 +787,12 @@ def _torch_exp2(x: torch.Tensor) -> torch.Tensor:
 def _torch_l2_normalize_qk(
     q: torch.Tensor, k: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """L2-normalize q/k on the head dimension (rsqrt of the squared sum)."""
+    """Apply additive Q/K normalization in FP32."""
 
+    q, k = q.float(), k.float()
     return (
-        torch.nn.functional.normalize(q.float(), p=2.0, dim=-1, eps=L2_NORM_EPS),
-        torch.nn.functional.normalize(k.float(), p=2.0, dim=-1, eps=L2_NORM_EPS),
+        q * torch.rsqrt(q.square().sum(dim=-1, keepdim=True) + L2_NORM_EPS),
+        k * torch.rsqrt(k.square().sum(dim=-1, keepdim=True) + L2_NORM_EPS),
     )
 
 
@@ -1715,13 +1716,12 @@ def cg0_materialize_decay_operands(
 
     q_sum_sq = warp_group_sum_8(q_sum_sq)
     k_sum_sq = warp_group_sum_8(k_sum_sq)
-    norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
     q_inv_norm = cute.math.rsqrt(
-        cute.math.max(q_sum_sq, norm_floor_sq, ftz=True),
+        q_sum_sq + cutlass.Float32(L2_NORM_EPS),
         fastmath=True,
     )
     k_inv_norm = cute.math.rsqrt(
-        cute.math.max(k_sum_sq, norm_floor_sq, ftz=True),
+        k_sum_sq + cutlass.Float32(L2_NORM_EPS),
         fastmath=True,
     )
 
@@ -7372,13 +7372,12 @@ def cg0_materialize_prep_operands(
 
     q_sum_sq = warp_group_sum_8(q_sum_sq)
     k_sum_sq = warp_group_sum_8(k_sum_sq)
-    norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
     q_inv_norm = cute.math.rsqrt(
-        cute.math.max(q_sum_sq, norm_floor_sq, ftz=True),
+        q_sum_sq + cutlass.Float32(L2_NORM_EPS),
         fastmath=True,
     )
     k_inv_norm = cute.math.rsqrt(
-        cute.math.max(k_sum_sq, norm_floor_sq, ftz=True),
+        k_sum_sq + cutlass.Float32(L2_NORM_EPS),
         fastmath=True,
     )
 

@@ -26,8 +26,8 @@ def _require_blackwell():
     if not is_cuda_tile_available():
         pytest.skip("cuTile compiler toolchain is unavailable")
     capability = get_compute_capability(torch.device("cuda"))
-    if capability not in {(10, 0), (10, 3), (12, 0), (12, 1)}:
-        pytest.skip("cuTile MLA decode requires SM100, SM103, SM120, or SM121")
+    if capability not in {(10, 0), (10, 3), (10, 7), (12, 0), (12, 1)}:
+        pytest.skip("cuTile MLA decode requires SM100, SM103, SM107, SM120, or SM121")
 
 
 def _torch_mla_decode_ref(
@@ -583,6 +583,44 @@ def test_cutile_launch_grid_overflow_is_typed(batch, heads, block_h, splits, mes
         _validate_launch_grids(batch, heads, block_h, splits)
 
 
+@pytest.mark.parametrize(
+    "capability,batch,heads,page,expected_ctas",
+    [
+        *(
+            (capability, batch, heads, page, expected_ctas)
+            for capability in ((12, 0), (12, 1))
+            for batch, heads, page, expected_ctas in (
+                (16, 64, 1, 1),
+                (16, 128, 1, 1),
+                (16, 128, 16, 1),
+                (16, 256, 2, 1),
+                (16, 64, 16, 2),
+                (16, 128, 32, 2),
+                (16, 64, 64, 2),
+                (32, 256, 128, 2),
+                (16, 32, 1, None),
+                (16, 32, 16, None),
+                (8, 128, 1, None),
+                (8, 128, 16, None),
+            )
+        ),
+        ((10, 0), 16, 64, 1, 1),
+        ((10, 0), 16, 128, 16, 2),
+        ((10, 0), 16, 64, 16, 2),
+        ((10, 3), 16, 128, 16, 2),
+        ((12, 2), 16, 128, 16, 2),
+    ],
+)
+def test_cutile_configuration_cta_guards(capability, batch, heads, page, expected_ctas):
+    from flashinfer.mla._batch_mla._backends._cutile_prepared import _configuration
+
+    config = _configuration(batch, heads, page, 3328, 48, capability)
+    assert config[-1] == expected_ctas
+    # The failing SM121 request retains its tile, split and transpose choices.
+    if capability == (12, 1) and (batch, heads, page) == (16, 128, 16):
+        assert config == (128, 16, 2, 2048, 2, False, 1)
+
+
 def test_cutile_int64_abi_preserves_large_known_and_dynamic_strides():
     from flashinfer.mla._batch_mla._backends._cutile_prepared import (
         _configuration,
@@ -644,8 +682,11 @@ def _forbidden(*args, **kwargs):
 
 @pytest.fixture
 def cutile_sm100():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("prepared cuTile acceptance requires SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 7),
+    ):
+        pytest.skip("prepared cuTile acceptance requires SM100/SM107")
     pytest.importorskip("cuda.tile.compilation")
     from flashinfer.cutile.cutile_common import is_cuda_tile_available
 

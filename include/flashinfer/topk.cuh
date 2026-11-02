@@ -39,23 +39,41 @@ enum class TopKTieBreak : uint32_t {
   Large = 2,
 };
 
-template <uint32_t BLOCK_THREADS>
-inline size_t GetRadixTopKAvailableOrderedSmemBytes(size_t max_smem_per_block,
-                                                    size_t fixed_smem_aligned,
-                                                    bool reserve_launch_headroom) {
-  using RadixTopKDetBlockScanT =
-      cub::BlockScan<uint32_t, BLOCK_THREADS, cub::BLOCK_SCAN_RAKING_MEMOIZE>;
-  constexpr size_t RADIX_TOPK_DETERMINISTIC_BLOCK_SCAN_SMEM =
-      sizeof(typename RadixTopKDetBlockScanT::TempStorage);
-  constexpr size_t RADIX_TOPK_LAUNCH_SMEM_HEADROOM = 2 * RADIX_TOPK_DETERMINISTIC_BLOCK_SCAN_SMEM;
-  const size_t launch_headroom =
-      reserve_launch_headroom ? RADIX_TOPK_LAUNCH_SMEM_HEADROOM : size_t(0);
-  if (max_smem_per_block <= fixed_smem_aligned + launch_headroom) {
-    return 0;
+template <typename OrderedType, typename KernelSelector>
+inline cudaError_t GetRadixTopKLaunchConfig(uint32_t num_elements, uint32_t vec_size,
+                                            size_t max_smem_per_block, size_t fixed_smem_aligned,
+                                            KernelSelector select_kernel, uint32_t& ctas_per_group,
+                                            uint32_t& chunk_size, uint32_t& smem_size,
+                                            const void*& kernel) {
+  if (num_elements == 0 || max_smem_per_block <= fixed_smem_aligned) {
+    return cudaErrorInvalidValue;
   }
-  // Reserve enough launch-time headroom for deterministic radix kernels that
-  // instantiate additional static shared scratch such as BlockScan temp storage.
-  return max_smem_per_block - fixed_smem_aligned - launch_headroom;
+  uint32_t capacity = round_down(
+      static_cast<uint32_t>((max_smem_per_block - fixed_smem_aligned) / sizeof(OrderedType)),
+      vec_size);
+  if (capacity == 0) return cudaErrorInvalidValue;
+  ctas_per_group = ceil_div(num_elements, capacity);
+  while (true) {
+    chunk_size = round_up(ceil_div(num_elements, ctas_per_group), vec_size);
+    kernel = select_kernel(ctas_per_group == 1);
+    cudaFuncAttributes attr;
+    FLASHINFER_CUDA_CALL(cudaFuncGetAttributes(&attr, kernel));
+    smem_size = fixed_smem_aligned + size_t(chunk_size) * sizeof(OrderedType);
+    // Check the actual allocation after splitting: reserving capacity up front
+    // can turn an already safe single-CTA launch into a slower multi-CTA launch.
+    if (smem_size + attr.sharedSizeBytes <= max_smem_per_block) return cudaSuccess;
+    if (fixed_smem_aligned + attr.sharedSizeBytes >= max_smem_per_block) {
+      return cudaErrorInvalidValue;
+    }
+    capacity = round_down(
+        static_cast<uint32_t>((max_smem_per_block - fixed_smem_aligned - attr.sharedSizeBytes) /
+                              sizeof(OrderedType)),
+        vec_size);
+    if (capacity == 0) return cudaErrorInvalidValue;
+    // A transition to multi-CTA can select a different kernel specialization;
+    // recheck that specialization's static storage on the next iteration.
+    ctas_per_group = std::max(ctas_per_group + 1, ceil_div(num_elements, capacity));
+  }
 }
 
 // ==================== Multi-CTA Top-K Implementation ====================
@@ -413,183 +431,6 @@ __device__ __forceinline__ void RadixSuffixSum(uint32_t* suffix_sum, uint32_t tx
     }
     __syncthreads();
   }
-}
-
-/*!
- * \brief Find the threshold bucket that contains the k-th largest element.
- *
- * The threshold bucket satisfies: count_ge >= k && count_gt < k
- * where count_ge = suffix_sum[bucket] and count_gt = suffix_sum[bucket+1].
- *
- * \param suffix_sum Shared memory array containing suffix sums
- * \param remaining_k Number of top-k elements still to find
- * \param found_bucket Output: the found threshold bucket
- * \param found_remaining_k Output: remaining_k minus count of elements > threshold
- * \param tx Thread index within the block
- */
-__device__ __forceinline__ void RadixFindThresholdBucket(uint32_t* suffix_sum, uint32_t remaining_k,
-                                                         uint32_t* found_bucket,
-                                                         uint32_t* found_remaining_k, uint32_t tx) {
-  constexpr uint32_t RADIX = 256;
-  // Initialize (only thread 0)
-  if (tx == 0) {
-    *found_bucket = 0;
-    *found_remaining_k = remaining_k;
-  }
-  __syncthreads();
-
-  // All threads in RADIX range check their bucket
-  if (tx < RADIX) {
-    uint32_t count_ge = suffix_sum[tx];
-    uint32_t count_gt = (tx + 1 < RADIX) ? suffix_sum[tx + 1] : 0;
-    if (count_ge >= remaining_k && count_gt < remaining_k) {
-      *found_bucket = tx;
-      *found_remaining_k = remaining_k - count_gt;
-    }
-  }
-  __syncthreads();
-}
-
-/*!
- * \brief Build local histogram for one round of radix select.
- *
- * Counts elements in shared_ordered that match the current prefix and bins them
- * by their byte at the current shift position.
- *
- * \tparam OrderedType The ordered integer type (uint16_t or uint32_t)
- * \param shared_ordered Shared memory containing ordered values
- * \param actual_chunk_size Number of elements in this CTA's chunk
- * \param local_histogram Output shared memory histogram
- * \param prefix Current prefix (high bits determined so far)
- * \param shift Bit shift for extracting current byte
- * \param round Current round (0 to NUM_ROUNDS-1)
- * \param tx Thread index
- */
-template <uint32_t BLOCK_THREADS, typename OrderedType>
-__device__ __forceinline__ void RadixBuildLocalHistogram(const OrderedType* shared_ordered,
-                                                         uint32_t actual_chunk_size,
-                                                         uint32_t* local_histogram, uint32_t prefix,
-                                                         uint32_t shift, uint32_t round,
-                                                         uint32_t tx) {
-  constexpr uint32_t ORDERED_BITS = sizeof(OrderedType) * 8;
-  constexpr uint32_t RADIX_BITS = 8;
-
-  for (uint32_t i = tx; i < actual_chunk_size; i += BLOCK_THREADS) {
-    OrderedType ordered = shared_ordered[i];
-
-    // Check if this element matches the prefix (high bits determined so far)
-    OrderedType mask =
-        (round == 0)
-            ? OrderedType(0)
-            : static_cast<OrderedType>(~OrderedType(0) << (ORDERED_BITS - round * RADIX_BITS));
-    if ((ordered & mask) == static_cast<OrderedType>(prefix)) {
-      uint32_t bucket = (ordered >> shift) & 0xFF;
-      atomicAdd(&local_histogram[bucket], 1);
-    }
-  }
-}
-
-/*!
- * \brief Perform one round of radix select with optional multi-CTA synchronization.
- *
- * This is the core radix select logic used by all TopK kernels.
- * It builds histogram, aggregates across CTAs (if multi-CTA), computes suffix sum,
- * and finds the threshold bucket.
- *
- * \tparam BLOCK_THREADS Number of threads per block
- * \tparam SINGLE_CTA True if single-CTA mode (no inter-CTA sync needed)
- * \tparam OrderedType The ordered integer type
- *
- * \param shared_ordered Shared memory containing ordered values
- * \param actual_chunk_size Number of elements in this CTA's chunk
- * \param local_histogram Shared memory for local histogram (size RADIX)
- * \param suffix_sum Shared memory for suffix sum computation (size RADIX)
- * \param state Pointer to RadixRowState for multi-CTA sync (nullptr if SINGLE_CTA)
- * \param prefix Current prefix value
- * \param remaining_k Current remaining k value
- * \param round Current round (0 to NUM_ROUNDS-1)
- * \param barrier_phase Reference to barrier phase counter
- * \param ctas_per_group Number of CTAs per group
- * \param tx Thread index
- * \param out_new_prefix Output: updated prefix after this round
- * \param out_new_remaining_k Output: updated remaining_k after this round
- */
-template <uint32_t BLOCK_THREADS, bool SINGLE_CTA, typename OrderedType>
-__device__ __forceinline__ void RadixSelectOneRound(
-    const OrderedType* shared_ordered, uint32_t actual_chunk_size, uint32_t* local_histogram,
-    uint32_t* suffix_sum, uint32_t* shared_scalars, RadixRowState* state, uint32_t prefix,
-    uint32_t remaining_k, uint32_t round, uint32_t iter, int& barrier_phase,
-    uint32_t ctas_per_group, uint32_t cta_in_group, uint32_t tx, uint32_t* out_new_prefix,
-    uint32_t* out_new_remaining_k) {
-  constexpr uint32_t RADIX = 256;
-  constexpr uint32_t ORDERED_BITS = sizeof(OrderedType) * 8;
-  constexpr uint32_t RADIX_BITS = 8;
-  constexpr uint32_t NUM_ROUNDS = ORDERED_BITS / RADIX_BITS;
-  uint32_t shift = ORDERED_BITS - (round + 1) * RADIX_BITS;
-  uint32_t global_round = iter * NUM_ROUNDS + round;
-
-  // For multi-CTA: pointers to global histograms (triple buffer)
-  uint32_t* current_hist = nullptr;
-  uint32_t* next_hist = nullptr;
-  if constexpr (!SINGLE_CTA) {
-    current_hist = state->histogram[global_round % 3];
-    next_hist = state->histogram[(global_round + 1) % 3];
-  }
-
-  // Clear local histogram only
-  for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-    local_histogram[i] = 0;
-  }
-  __syncthreads();
-
-  // Build local histogram from shared memory
-  RadixBuildLocalHistogram<BLOCK_THREADS, OrderedType>(shared_ordered, actual_chunk_size,
-                                                       local_histogram, prefix, shift, round, tx);
-  __syncthreads();
-
-  // For multi-CTA: write -> (leading CTA clears next) -> barrier -> read
-  // For single-CTA: local_histogram is already the complete histogram
-  if constexpr (!SINGLE_CTA) {
-    // Accumulate local histogram to global
-    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-      if (local_histogram[i] > 0) {
-        atomicAdd(&current_hist[i], local_histogram[i]);
-      }
-    }
-
-    // Only leading CTA clears next round's histogram BEFORE barrier
-    if (cta_in_group == 0) {
-      for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-        next_hist[i] = 0;
-      }
-    }
-
-    // Barrier: wait for all CTAs to finish atomicAdd and clearing
-    __syncthreads();  // converge the CTA so tx0's release covers every thread's atomicAdds/clears
-    AdvanceRadixGroupBarrier(state, barrier_phase, ctas_per_group, tx);
-
-    // Read current histogram (after barrier, all atomicAdds are complete)
-    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-      suffix_sum[i] = current_hist[i];
-    }
-  } else {
-    // Single-CTA: copy local histogram directly to suffix_sum
-    for (uint32_t i = tx; i < RADIX; i += BLOCK_THREADS) {
-      suffix_sum[i] = local_histogram[i];
-    }
-  }
-  __syncthreads();
-
-  // Compute suffix sum
-  RadixSuffixSum<BLOCK_THREADS>(suffix_sum, tx);
-
-  // Find threshold bucket using shared_scalars for found_bucket and found_remaining_k
-  // shared_scalars[0] = found_bucket, shared_scalars[1] = found_remaining_k
-  RadixFindThresholdBucket(suffix_sum, remaining_k, &shared_scalars[0], &shared_scalars[1], tx);
-
-  // Output new prefix and remaining_k
-  *out_new_prefix = prefix | (shared_scalars[0] << shift);
-  *out_new_remaining_k = shared_scalars[1];
 }
 
 /*!
@@ -1704,22 +1545,23 @@ cudaError_t RadixTopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdT
   constexpr size_t fixed_smem_aligned = round_up(fixed_smem_size, 16);
 
   // Calculate max chunk size that fits in shared memory
-  const size_t available_for_ordered = GetRadixTopKAvailableOrderedSmemBytes<BLOCK_THREADS>(
-      max_smem_per_block, fixed_smem_aligned, false);
-  if (available_for_ordered == 0) {
-    return cudaErrorInvalidValue;
-  }
-  uint32_t max_chunk_elements = available_for_ordered / sizeof(OrderedType);
-  max_chunk_elements = round_down(max_chunk_elements, vec_size);
-  const uint32_t min_chunk_size = vec_size * BLOCK_THREADS;
-  max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
-
-  uint32_t ctas_per_group = ceil_div(vocab_size, max_chunk_elements);
-  uint32_t chunk_size = ceil_div(vocab_size, ctas_per_group);
-  chunk_size = round_up(chunk_size, vec_size);
-  chunk_size = std::min(chunk_size, max_chunk_elements);
-
-  const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
+  auto select_kernel = [&](bool single_cta) -> const void* {
+    const void* kernel = nullptr;
+    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+      kernel =
+          single_cta
+              ? (const void*)
+                    RadixTopKMaskLogitsKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, true, DType, IdType>
+              : (const void*)RadixTopKMaskLogitsKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false,
+                                                                DType, IdType>;
+    });
+    return kernel;
+  };
+  uint32_t ctas_per_group, chunk_size, smem_size;
+  const void* kernel;
+  FLASHINFER_CUDA_CALL(GetRadixTopKLaunchConfig<OrderedType>(
+      vocab_size, vec_size, max_smem_per_block, fixed_smem_aligned, select_kernel, ctas_per_group,
+      chunk_size, smem_size, kernel));
   const bool single_cta = (ctas_per_group == 1);
 
   // The multi-CTA path uses a software barrier whose participants must all be
@@ -1735,30 +1577,13 @@ cudaError_t RadixTopKMaskLogitsMultiCTA(DType* logits, DType* masked_logits, IdT
   if (num_groups == 0) num_groups = 1;
   uint32_t total_ctas = num_groups * ctas_per_group;
 
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    if (single_cta) {
-      auto kernel =
-          RadixTopKMaskLogitsKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, true, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&logits,     &masked_logits,     &top_k_arr,  &top_k_val,     &vocab_size,
-                      &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    } else {
-      auto kernel =
-          RadixTopKMaskLogitsKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false, DType, IdType>;
-      FLASHINFER_CUDA_CALL(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-      dim3 nblks(total_ctas);
-      dim3 nthrs(BLOCK_THREADS);
-      void* args[] = {&logits,     &masked_logits,     &top_k_arr,  &top_k_val,     &vocab_size,
-                      &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-      FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-    }
-  });
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  dim3 nblks(total_ctas);
+  dim3 nthrs(BLOCK_THREADS);
+  void* args[] = {&logits,     &masked_logits,     &top_k_arr,  &top_k_val,     &vocab_size,
+                  &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
 
   return cudaSuccess;
 }
@@ -2067,22 +1892,27 @@ cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdTy
   constexpr size_t fixed_smem_aligned = round_up(fixed_smem_size, 16);
 
   // Calculate max chunk size that fits in shared memory
-  const size_t available_for_ordered = GetRadixTopKAvailableOrderedSmemBytes<BLOCK_THREADS>(
-      max_smem_per_block, fixed_smem_aligned, false);
-  if (available_for_ordered == 0) {
-    return cudaErrorInvalidValue;
-  }
-  uint32_t max_chunk_elements = available_for_ordered / sizeof(OrderedType);
-  max_chunk_elements = round_down(max_chunk_elements, vec_size);
-  const uint32_t min_chunk_size = vec_size * BLOCK_THREADS;
-  max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
-
-  uint32_t ctas_per_group = ceil_div(vocab_size, max_chunk_elements);
-  uint32_t chunk_size = ceil_div(vocab_size, ctas_per_group);
-  chunk_size = round_up(chunk_size, vec_size);
-  chunk_size = std::min(chunk_size, max_chunk_elements);
-
-  const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
+  auto select_kernel = [&](bool single_cta) -> const void* {
+    const void* kernel = nullptr;
+    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+      // Single-CTA renorm is deterministic without the multi-CTA accumulation path.
+      kernel = (const void*)
+          RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, true, false, DType, IdType>;
+      if (!single_cta) {
+        kernel = deterministic
+                     ? (const void*)RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE,
+                                                                       false, true, DType, IdType>
+                     : (const void*)RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE,
+                                                                       false, false, DType, IdType>;
+      }
+    });
+    return kernel;
+  };
+  uint32_t ctas_per_group, chunk_size, smem_size;
+  const void* kernel;
+  FLASHINFER_CUDA_CALL(GetRadixTopKLaunchConfig<OrderedType>(
+      vocab_size, vec_size, max_smem_per_block, fixed_smem_aligned, select_kernel, ctas_per_group,
+      chunk_size, smem_size, kernel));
   const bool single_cta = (ctas_per_group == 1);
 
   // Calculate number of groups (how many rows to process concurrently)
@@ -2090,26 +1920,13 @@ cudaError_t RadixTopKRenormProbMultiCTA(DType* probs, DType* renormed_prob, IdTy
   if (num_groups == 0) num_groups = 1;
   uint32_t total_ctas = num_groups * ctas_per_group;
 
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    // Single-CTA sums with a block reduction in a fixed order, so it is
-    // already deterministic; the DETERMINISTIC path only changes multi-CTA
-    // accumulation.
-    auto kernel =
-        RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, true, false, DType, IdType>;
-    if (!single_cta) {
-      kernel = deterministic ? RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false,
-                                                                  true, DType, IdType>
-                             : RadixTopKRenormProbKernel_MultiCTA<BLOCK_THREADS, VEC_SIZE, false,
-                                                                  false, DType, IdType>;
-    }
-    FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    dim3 nblks(total_ctas);
-    dim3 nthrs(BLOCK_THREADS);
-    void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
-                    &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
-  });
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  dim3 nblks(total_ctas);
+  dim3 nthrs(BLOCK_THREADS);
+  void* args[] = {&probs,      &renormed_prob,     &top_k_arr,  &top_k_val,     &vocab_size,
+                  &batch_size, &row_states_buffer, &chunk_size, &ctas_per_group};
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
 
   return cudaSuccess;
 }
@@ -2162,27 +1979,60 @@ cudaError_t RadixTopKPageTableTransformMultiCTA(
 
   constexpr size_t fixed_smem_size = sizeof(uint32_t) * (256 + 256 + 5);
   constexpr size_t fixed_smem_aligned = round_up(fixed_smem_size, 16);
-  const size_t available_for_ordered = GetRadixTopKAvailableOrderedSmemBytes<BLOCK_THREADS>(
-      max_smem_per_block, fixed_smem_aligned, deterministic);
-  if (available_for_ordered == 0) {
-    return cudaErrorInvalidValue;
-  }
-
-  uint32_t max_chunk_elements = available_for_ordered / sizeof(OrderedType);
-  max_chunk_elements = round_down(max_chunk_elements, vec_size);
-  const uint32_t min_chunk_size = vec_size * BLOCK_THREADS;
-  max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
-
-  uint32_t ctas_per_group = ceil_div(max_len, max_chunk_elements);
+  auto select_kernel = [&](bool single_cta) -> const void* {
+    const void* kernel = nullptr;
+    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+      if constexpr (!std::is_empty_v<PageTablePolicy>) {
+        if (single_cta) {
+          kernel =
+              deterministic
+                  ? (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, true, true,
+                                                         RadixTopKMode::PageTableTransform, DType,
+                                                         IdType, PageTablePolicy, PageTablePolicy>
+                  : (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, true, false,
+                                                         RadixTopKMode::PageTableTransform, DType,
+                                                         IdType, PageTablePolicy, PageTablePolicy>;
+        } else {
+          kernel =
+              deterministic
+                  ? (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, false, true,
+                                                         RadixTopKMode::PageTableTransform, DType,
+                                                         IdType, PageTablePolicy, PageTablePolicy>
+                  : (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, false, false,
+                                                         RadixTopKMode::PageTableTransform, DType,
+                                                         IdType, PageTablePolicy, PageTablePolicy>;
+        }
+      } else {
+        if (single_cta) {
+          kernel = deterministic
+                       ? (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, true, true,
+                                                              RadixTopKMode::PageTableTransform,
+                                                              DType, IdType, PageTablePolicy>
+                       : (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, true, false,
+                                                              RadixTopKMode::PageTableTransform,
+                                                              DType, IdType, PageTablePolicy>;
+        } else {
+          kernel = deterministic
+                       ? (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, false, true,
+                                                              RadixTopKMode::PageTableTransform,
+                                                              DType, IdType, PageTablePolicy>
+                       : (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, false, false,
+                                                              RadixTopKMode::PageTableTransform,
+                                                              DType, IdType, PageTablePolicy>;
+        }
+      }
+    });
+    return kernel;
+  };
+  uint32_t ctas_per_group, chunk_size, smem_size;
+  const void* kernel;
+  FLASHINFER_CUDA_CALL(GetRadixTopKLaunchConfig<OrderedType>(
+      max_len, vec_size, max_smem_per_block, fixed_smem_aligned, select_kernel, ctas_per_group,
+      chunk_size, smem_size, kernel));
   if (deterministic && ctas_per_group > RADIX_TOPK_MAX_DETERMINISTIC_CTAS_PER_GROUP) {
     return cudaErrorInvalidConfiguration;
   }
-  uint32_t chunk_size = ceil_div(max_len, ctas_per_group);
-  chunk_size = round_up(chunk_size, vec_size);
-  chunk_size = std::min(chunk_size, max_chunk_elements);
-
   const bool single_cta = (ctas_per_group == 1);
-  const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
 
   uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, num_rows);
   if (num_groups == 0) num_groups = 1;
@@ -2218,38 +2068,11 @@ cudaError_t RadixTopKPageTableTransformMultiCTA(
     return cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream);
   };
 
-#define LAUNCH_PAGE_TABLE_KERNEL(THREADS, SINGLE_CTA_FLAG, DET_FLAG)                          \
-  do {                                                                                        \
-    if constexpr (!std::is_empty_v<PageTablePolicy>) {                                        \
-      auto kernel = RadixTopKKernel_Unified<THREADS, VEC_SIZE, SINGLE_CTA_FLAG, DET_FLAG,     \
-                                            RadixTopKMode::PageTableTransform, DType, IdType, \
-                                            PageTablePolicy, PageTablePolicy>;                \
-      FLASHINFER_CUDA_CALL(launch_kernel(kernel, page_table_policy));                         \
-    } else {                                                                                  \
-      auto kernel = RadixTopKKernel_Unified<THREADS, VEC_SIZE, SINGLE_CTA_FLAG, DET_FLAG,     \
-                                            RadixTopKMode::PageTableTransform, DType, IdType, \
-                                            PageTablePolicy>;                                 \
-      FLASHINFER_CUDA_CALL(launch_kernel(kernel));                                            \
-    }                                                                                         \
-  } while (0)
-
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    if (single_cta) {
-      if (!deterministic) {
-        LAUNCH_PAGE_TABLE_KERNEL(BLOCK_THREADS, true, false);
-      } else {
-        LAUNCH_PAGE_TABLE_KERNEL(BLOCK_THREADS, true, true);
-      }
-    } else {
-      if (!deterministic) {
-        LAUNCH_PAGE_TABLE_KERNEL(BLOCK_THREADS, false, false);
-      } else {
-        LAUNCH_PAGE_TABLE_KERNEL(BLOCK_THREADS, false, true);
-      }
-    }
-  });
-
-#undef LAUNCH_PAGE_TABLE_KERNEL
+  if constexpr (!std::is_empty_v<PageTablePolicy>) {
+    FLASHINFER_CUDA_CALL(launch_kernel(kernel, page_table_policy));
+  } else {
+    FLASHINFER_CUDA_CALL(launch_kernel(kernel));
+  }
 
   return cudaSuccess;
 }
@@ -2291,27 +2114,38 @@ cudaError_t RadixTopKRaggedTransformMultiCTA(DType* input, IdType* output_indice
 
   constexpr size_t fixed_smem_size = sizeof(uint32_t) * (256 + 256 + 5);
   constexpr size_t fixed_smem_aligned = round_up(fixed_smem_size, 16);
-  const size_t available_for_ordered = GetRadixTopKAvailableOrderedSmemBytes<BLOCK_THREADS>(
-      max_smem_per_block, fixed_smem_aligned, deterministic);
-  if (available_for_ordered == 0) {
-    return cudaErrorInvalidValue;
-  }
-
-  uint32_t max_chunk_elements = available_for_ordered / sizeof(OrderedType);
-  max_chunk_elements = round_down(max_chunk_elements, vec_size);
-  const uint32_t min_chunk_size = vec_size * BLOCK_THREADS;
-  max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
-
-  uint32_t ctas_per_group = ceil_div(max_len, max_chunk_elements);
+  auto select_kernel = [&](bool single_cta) -> const void* {
+    const void* kernel = nullptr;
+    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+      if (single_cta) {
+        kernel = deterministic
+                     ? (const void*)
+                           RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, true, true,
+                                                   RadixTopKMode::RaggedTransform, DType, IdType>
+                     : (const void*)
+                           RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, true, false,
+                                                   RadixTopKMode::RaggedTransform, DType, IdType>;
+      } else {
+        kernel = deterministic
+                     ? (const void*)
+                           RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, false, true,
+                                                   RadixTopKMode::RaggedTransform, DType, IdType>
+                     : (const void*)
+                           RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, false, false,
+                                                   RadixTopKMode::RaggedTransform, DType, IdType>;
+      }
+    });
+    return kernel;
+  };
+  uint32_t ctas_per_group, chunk_size, smem_size;
+  const void* kernel;
+  FLASHINFER_CUDA_CALL(GetRadixTopKLaunchConfig<OrderedType>(
+      max_len, vec_size, max_smem_per_block, fixed_smem_aligned, select_kernel, ctas_per_group,
+      chunk_size, smem_size, kernel));
   if (deterministic && ctas_per_group > RADIX_TOPK_MAX_DETERMINISTIC_CTAS_PER_GROUP) {
     return cudaErrorInvalidConfiguration;
   }
-  uint32_t chunk_size = ceil_div(max_len, ctas_per_group);
-  chunk_size = round_up(chunk_size, vec_size);
-  chunk_size = std::min(chunk_size, max_chunk_elements);
-
   const bool single_cta = (ctas_per_group == 1);
-  const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
 
   uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, num_rows);
   if (num_groups == 0) num_groups = 1;
@@ -2344,32 +2178,9 @@ cudaError_t RadixTopKRaggedTransformMultiCTA(DType* input, IdType* output_indice
                   &chunk_size,
                   &ctas_per_group};
 
-#define LAUNCH_RAGGED_KERNEL(THREADS, SINGLE_CTA_FLAG, DET_FLAG)                                  \
-  do {                                                                                            \
-    auto kernel = RadixTopKKernel_Unified<THREADS, VEC_SIZE, SINGLE_CTA_FLAG, DET_FLAG,           \
-                                          RadixTopKMode::RaggedTransform, DType, IdType>;         \
-    FLASHINFER_CUDA_CALL(                                                                         \
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));    \
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream)); \
-  } while (0)
-
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    if (single_cta) {
-      if (!deterministic) {
-        LAUNCH_RAGGED_KERNEL(BLOCK_THREADS, true, false);
-      } else {
-        LAUNCH_RAGGED_KERNEL(BLOCK_THREADS, true, true);
-      }
-    } else {
-      if (!deterministic) {
-        LAUNCH_RAGGED_KERNEL(BLOCK_THREADS, false, false);
-      } else {
-        LAUNCH_RAGGED_KERNEL(BLOCK_THREADS, false, true);
-      }
-    }
-  });
-
-#undef LAUNCH_RAGGED_KERNEL
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
 
   return cudaSuccess;
 }
@@ -2408,30 +2219,34 @@ cudaError_t RadixTopKMultiCTA(DType* input, IdType* output_indices, DType* outpu
   // Scalars: 5 for single-CTA, 4 for multi-CTA
   constexpr size_t fixed_smem_size = sizeof(uint32_t) * (256 + 256 + 5);
   constexpr size_t fixed_smem_aligned = round_up(fixed_smem_size, 16);
-  const size_t available_for_ordered = GetRadixTopKAvailableOrderedSmemBytes<BLOCK_THREADS>(
-      max_smem_per_block, fixed_smem_aligned, deterministic);
-  if (available_for_ordered == 0) {
-    return cudaErrorInvalidValue;
-  }
-
-  uint32_t max_chunk_elements = available_for_ordered / sizeof(OrderedType);
-  max_chunk_elements = round_down(max_chunk_elements, vec_size);
-  const uint32_t min_chunk_size = vec_size * BLOCK_THREADS;
-  max_chunk_elements = std::max(max_chunk_elements, min_chunk_size);
-
-  uint32_t ctas_per_group = ceil_div(vocab_size, max_chunk_elements);
+  auto select_kernel = [&](bool single_cta) -> const void* {
+    const void* kernel = nullptr;
+    DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
+      if (single_cta) {
+        kernel = deterministic
+                     ? (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, true, true,
+                                                            RadixTopKMode::Basic, DType, IdType>
+                     : (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, true, false,
+                                                            RadixTopKMode::Basic, DType, IdType>;
+      } else {
+        kernel = deterministic
+                     ? (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, false, true,
+                                                            RadixTopKMode::Basic, DType, IdType>
+                     : (const void*)RadixTopKKernel_Unified<BLOCK_THREADS, VEC_SIZE, false, false,
+                                                            RadixTopKMode::Basic, DType, IdType>;
+      }
+    });
+    return kernel;
+  };
+  uint32_t ctas_per_group, chunk_size, smem_size;
+  const void* kernel;
+  FLASHINFER_CUDA_CALL(GetRadixTopKLaunchConfig<OrderedType>(
+      vocab_size, vec_size, max_smem_per_block, fixed_smem_aligned, select_kernel, ctas_per_group,
+      chunk_size, smem_size, kernel));
   if (deterministic && ctas_per_group > RADIX_TOPK_MAX_DETERMINISTIC_CTAS_PER_GROUP) {
     return cudaErrorInvalidConfiguration;
   }
-  uint32_t chunk_size = ceil_div(vocab_size, ctas_per_group);
-  chunk_size = round_up(chunk_size, vec_size);
-  chunk_size = std::min(chunk_size, max_chunk_elements);
-
-  // Determine if we use single-CTA path
   const bool single_cta = (ctas_per_group == 1);
-
-  // Calculate smem_size: fixed + ordered values
-  const uint32_t smem_size = fixed_smem_aligned + chunk_size * sizeof(OrderedType);
 
   // Calculate number of groups (how many rows to process concurrently)
   uint32_t num_groups = std::min(static_cast<uint32_t>(num_sms) / ctas_per_group, batch_size);
@@ -2455,32 +2270,9 @@ cudaError_t RadixTopKMultiCTA(DType* input, IdType* output_indices, DType* outpu
       &vocab_size,    &batch_size,     &row_states_buffer, &det_scratch_buffer, &chunk_size,
       &ctas_per_group};
 
-#define LAUNCH_BASIC_KERNEL(THREADS, SINGLE_CTA_FLAG, DET_FLAG)                                   \
-  do {                                                                                            \
-    auto kernel = RadixTopKKernel_Unified<THREADS, VEC_SIZE, SINGLE_CTA_FLAG, DET_FLAG,           \
-                                          RadixTopKMode::Basic, DType, IdType>;                   \
-    FLASHINFER_CUDA_CALL(                                                                         \
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));    \
-    FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream)); \
-  } while (0)
-
-  DISPATCH_ALIGNED_VEC_SIZE(vec_size, VEC_SIZE, {
-    if (single_cta) {
-      if (!deterministic) {
-        LAUNCH_BASIC_KERNEL(BLOCK_THREADS, true, false);
-      } else {
-        LAUNCH_BASIC_KERNEL(BLOCK_THREADS, true, true);
-      }
-    } else {
-      if (!deterministic) {
-        LAUNCH_BASIC_KERNEL(BLOCK_THREADS, false, false);
-      } else {
-        LAUNCH_BASIC_KERNEL(BLOCK_THREADS, false, true);
-      }
-    }
-  });
-
-#undef LAUNCH_BASIC_KERNEL
+  FLASHINFER_CUDA_CALL(
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  FLASHINFER_CUDA_CALL(cudaLaunchKernel(kernel, nblks, nthrs, args, smem_size, stream));
 
   return cudaSuccess;
 }

@@ -9,7 +9,10 @@ from flashinfer.grouped_mm.core import (
     _check_grouped_mm_fp8,
     _check_grouped_mm_mxfp8,
 )
-from flashinfer.grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION
+from flashinfer.grouped_mm.cudnn import (
+    _CUDNN_MOE_MIN_VERSION,
+    _cudnn_moe_block_scale_min_version,
+)
 from flashinfer.utils import get_compute_capability
 
 try:
@@ -27,8 +30,7 @@ except (ImportError, OSError):
     CUDNN_HAS_MOE_API = False
 
 
-def _requires_cudnn_moe(feature: str):
-    min_ver = _CUDNN_MOE_MIN_VERSION
+def _requires_cudnn_moe(feature: str, min_ver: int = _CUDNN_MOE_MIN_VERSION):
     ver = CUDNN_BACKEND_VERSION
     return pytest.mark.skipif(
         not CUDNN_AVAILABLE or ver < min_ver or not CUDNN_HAS_MOE_API,
@@ -41,7 +43,13 @@ def _requires_cudnn_moe(feature: str):
 
 
 requires_cudnn_moe = _requires_cudnn_moe("grouped matmul")
-requires_cudnn_moe_block_scale = _requires_cudnn_moe("block-scale")
+_block_scale_min_ver = _CUDNN_MOE_MIN_VERSION
+if torch.cuda.is_available():
+    _major, _minor = get_compute_capability(torch.device("cuda"))
+    _block_scale_min_ver = _cudnn_moe_block_scale_min_version(_major * 10 + _minor)
+requires_cudnn_moe_block_scale = _requires_cudnn_moe(
+    "block-scale", _block_scale_min_ver
+)
 
 
 def _requires_supported_cc(check_fn):

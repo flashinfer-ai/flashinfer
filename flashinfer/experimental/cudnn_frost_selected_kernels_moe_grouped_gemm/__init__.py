@@ -1,21 +1,8 @@
-"""Runtime for kernels generated offline by cuDNN Frost.
+# Copyright (c) 2026 by FlashInfer team. Licensed under Apache-2.0.
+"""Compatibility import for flashinfer.fused_moe.backends.cudnn_frost (one release)."""
 
-cuDNN Frost is a build-time dependency only.  The deployed FlashInfer process reads
-a source manifest and JIT-compiles its standalone Python kernels with CuTe DSL.
-Compiled code is cached in FlashInfer's writable JIT directory.
-"""
-
-__all__ = [
-    "CudnnFrostGroupedGemm1SwiGLURunner",
-    "matching_kernels",
-    "workspace_size",
-]
+from importlib import import_module
 
 
 def __getattr__(name):
-    # A deferred support-check import must not load the execution implementation.
-    if name in __all__:
-        from .bf16 import runtime
-
-        return getattr(runtime, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(import_module("flashinfer.fused_moe.backends.cudnn_frost"), name)

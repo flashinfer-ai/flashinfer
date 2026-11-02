@@ -87,25 +87,21 @@ def verify_topk_correctness(logits, values, indices, k):
     return True
 
 
-def _get_cached_topk_row_states_buffer(device: torch.device):
-    if device.type == "cuda" and device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    key = (f"radix_topk_row_states_{device}", device)
-    return flashinfer_utils._cache_buf.get(key)
-
-
-def _clear_cached_topk_row_states_buffer(device: torch.device):
-    if device.type == "cuda" and device.index is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    key = (f"radix_topk_row_states_{device}", device)
-    flashinfer_utils._cache_buf.pop(key, None)
-
-
 def _build_strictly_descending_logits(
     num_rows: int, vocab_size: int, device: torch.device
 ) -> torch.Tensor:
     base = torch.arange(vocab_size, 0, -1, device=device, dtype=torch.float32)
     return base.unsqueeze(0).repeat(num_rows, 1).contiguous()
+
+
+def _cached_row_states_buffer(device: torch.device):
+    """The ``row_states`` buffer the radix top-k APIs reuse on ``device``'s current stream."""
+    key = (
+        "radix_topk_row_states",
+        device,
+        torch.cuda.current_stream(device).cuda_stream,
+    )
+    return flashinfer_utils._stream_cache_buf.get(key)
 
 
 def _top_k_case_id(case):
@@ -299,84 +295,283 @@ def test_top_k_large_batch(batch_size, vocab_size, k, det, tie_break):
 
 
 @pytest.mark.parametrize("api_kind", ["top_k", "page_table", "ragged"])
-@pytest.mark.parametrize(
-    ("first_deterministic", "second_deterministic"),
-    [(False, True), (True, False)],
-)
-def test_multi_cta_reuses_dirty_cached_row_states_buffer_across_mode_transitions(
-    api_kind, set_topk_algo, first_deterministic, second_deterministic
-):
+def test_multi_cta_row_states_not_shared_across_streams(api_kind, set_topk_algo):
+    """Concurrent multi-CTA top-k launches must not share the row_states scratch.
+
+    ``row_states`` holds the kernel's inter-CTA synchronization state. It used to
+    come from a per-device cached buffer, so two launches racing on different
+    streams corrupted each other's reduction (flashinfer-ai/flashinfer#3618). It
+    is now allocated per call from the stream-ordered caching allocator, so every
+    launch gets a disjoint buffer.
+
+    This interleaves launches on two streams without syncing between them, so the
+    sequences actually overlap on the device, and checks every result against a
+    per-stream reference. Distinct (descending vs. ascending) inputs ensure a
+    shared/raced buffer would corrupt at least one stream.
+    """
     set_topk_algo("multi_cta")
     device = torch.device("cuda")
-    _clear_cached_topk_row_states_buffer(device)
+    batch_size, vocab_size, k = 4, 131072, 512
 
-    batch_size = 4
-    vocab_size = 131072
-    k = 512
-    logits = _build_strictly_descending_logits(batch_size, vocab_size, device)
+    logits_a = _build_strictly_descending_logits(batch_size, vocab_size, device)
+    logits_b = torch.flip(logits_a, dims=(-1,)).contiguous()
 
-    if api_kind == "top_k":
-        expected_values = logits[:, :k]
-        expected_indices = (
-            torch.arange(k, device=device, dtype=torch.int64)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-
-        values_a, indices_a = flashinfer.top_k(
-            logits, k, sorted=True, deterministic=first_deterministic
-        )
-        torch.testing.assert_close(values_a, expected_values)
-        assert torch.equal(indices_a, expected_indices)
-        buf_a = _get_cached_topk_row_states_buffer(device)
-        assert buf_a is not None
-
-        values_b, indices_b = flashinfer.top_k(
-            logits, k, sorted=True, deterministic=second_deterministic
-        )
-        torch.testing.assert_close(values_b, expected_values)
-        assert torch.equal(indices_b, expected_indices)
-    else:
+    def run(logits):
+        if api_kind == "top_k":
+            return flashinfer.top_k(logits, k, sorted=True, deterministic=True)
         lengths = torch.full(
             (batch_size,), vocab_size, device=device, dtype=torch.int32
         )
-        expected = torch.arange(k, device=device, dtype=torch.int32).unsqueeze(0)
-        expected = expected.expand(batch_size, -1)
         src_page_table = None
         offsets = None
-
-        if api_kind == "ragged":
-            offsets = torch.arange(
-                0, batch_size * vocab_size, vocab_size, device=device, dtype=torch.int32
+        if api_kind == "page_table":
+            src_page_table = (
+                torch.arange(vocab_size, device=device, dtype=torch.int32)
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+                .contiguous()
             )
-            expected = offsets.unsqueeze(1) + expected
-
-        output_a = _run_transform(
+        elif api_kind == "ragged":
+            offsets = torch.arange(
+                0,
+                batch_size * vocab_size,
+                vocab_size,
+                device=device,
+                dtype=torch.int32,
+            )
+        return _run_transform(
             logits,
             k,
             api_kind,
             lengths=lengths,
-            deterministic=first_deterministic,
+            deterministic=True,
             src_page_table=src_page_table,
             offsets=offsets,
         )
-        _assert_unordered_indices_match(output_a, expected)
-        buf_a = _get_cached_topk_row_states_buffer(device)
-        assert buf_a is not None
 
-        output_b = _run_transform(
-            logits,
-            k,
-            api_kind,
-            lengths=lengths,
-            deterministic=second_deterministic,
-            src_page_table=src_page_table,
-            offsets=offsets,
+    def equal(x, y):
+        if isinstance(x, tuple):
+            return all(torch.equal(a, b) for a, b in zip(x, y, strict=True))
+        return torch.equal(x, y)
+
+    # Per-stream references on the default stream; this also triggers the JIT
+    # compile so the concurrent loop below does not compile on a side stream.
+    ref_a = run(logits_a)
+    ref_b = run(logits_b)
+    torch.cuda.synchronize()
+
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+
+    outs_a = []
+    outs_b = []
+    for _ in range(32):
+        with torch.cuda.stream(stream_a):
+            outs_a.append(run(logits_a))
+        with torch.cuda.stream(stream_b):
+            outs_b.append(run(logits_b))
+    torch.cuda.synchronize()
+
+    for out in outs_a:
+        assert equal(out, ref_a)
+    for out in outs_b:
+        assert equal(out, ref_b)
+
+
+def test_multi_cta_row_states_not_shared_across_graphs(set_topk_algo):
+    """Concurrent graph replays must preserve every top-k value and index."""
+    set_topk_algo("multi_cta")
+    batch_size, vocab_size, k = 32, 524288, 512
+    logits_a = _build_strictly_descending_logits(
+        batch_size, vocab_size, torch.device("cuda")
+    )
+    logits_b = logits_a.flip(-1).contiguous()
+    references = [torch.topk(logits, k, dim=-1) for logits in (logits_a, logits_b)]
+    for logits in (logits_a, logits_b):
+        flashinfer.top_k(logits, k, sorted=True, deterministic=True)
+    torch.cuda.synchronize()
+
+    graphs, outputs, streams = [], [], []
+    for logits in (logits_a, logits_b):
+        stream = torch.cuda.Stream()
+        graph = torch.cuda.CUDAGraph()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.graph(graph, stream=stream):
+            results = [
+                flashinfer.top_k(logits, k, sorted=True, deterministic=True)
+                for _ in range(8)
+            ]
+        graphs.append(graph)
+        outputs.append(results)
+        streams.append(stream)
+    torch.cuda.synchronize()
+
+    for graph, stream, results, reference in zip(
+        graphs, streams, outputs, references, strict=True
+    ):
+        with torch.cuda.stream(stream):
+            graph.replay()
+        torch.cuda.synchronize()
+        for result in results:
+            assert all(
+                torch.equal(a, b) for a, b in zip(result, reference, strict=True)
+            )
+
+    for _ in range(16):
+        for graph, stream in zip(graphs, streams, strict=True):
+            with torch.cuda.stream(stream):
+                graph.replay()
+        torch.cuda.synchronize()
+        for results, reference in zip(outputs, references, strict=True):
+            for result in results:
+                assert all(
+                    torch.equal(a, b) for a, b in zip(result, reference, strict=True)
+                )
+
+
+@pytest.mark.parametrize("api_kind", ["top_k", "page_table", "ragged"])
+def test_multi_cta_row_states_isolated_across_streams_with_different_row_counts(
+    api_kind, set_topk_algo
+):
+    """Streams whose launches dirty different numbers of row-state groups stay apart.
+
+    Each stream reuses one cached ``row_states`` buffer across its launches, and
+    two streams must never share one. The deterministic kernel places its
+    per-group collect scratch right after the row-state array, so a 2-row launch
+    and a 32-row launch put it at different offsets: a shared buffer would let
+    each stream overwrite the other's histograms, counters and scratch.
+    """
+    set_topk_algo("multi_cta")
+    device = torch.device("cuda")
+    vocab_size, k = 131072, 512
+    logits_a = _build_strictly_descending_logits(2, vocab_size, device)
+    logits_b = torch.flip(
+        _build_strictly_descending_logits(32, vocab_size, device), dims=(-1,)
+    ).contiguous()
+
+    def run(logits):
+        if api_kind == "top_k":
+            return flashinfer.top_k(logits, k, sorted=True, deterministic=True)
+        return _run_transform(logits, k, api_kind, deterministic=True)
+
+    def equal(x, y):
+        if isinstance(x, tuple):
+            return all(torch.equal(a, b) for a, b in zip(x, y, strict=True))
+        return torch.equal(x, y)
+
+    ref_a = run(logits_a)
+    ref_b = run(logits_b)
+    torch.cuda.synchronize()
+
+    stream_a = torch.cuda.Stream()
+    stream_b = torch.cuda.Stream()
+    outs_a, outs_b = [], []
+    for _ in range(32):
+        with torch.cuda.stream(stream_a):
+            outs_a.append(run(logits_a))
+        with torch.cuda.stream(stream_b):
+            outs_b.append(run(logits_b))
+    torch.cuda.synchronize()
+
+    for out in outs_a:
+        assert equal(out, ref_a)
+    for out in outs_b:
+        assert equal(out, ref_b)
+
+    with torch.cuda.stream(stream_a):
+        buf_a = _cached_row_states_buffer(logits_a.device)
+    with torch.cuda.stream(stream_b):
+        buf_b = _cached_row_states_buffer(logits_b.device)
+    assert buf_a is not None and buf_b is not None
+    assert buf_a is not buf_b
+
+
+@pytest.mark.parametrize("api_kind", ["top_k", "page_table", "ragged"])
+def test_multi_cta_reuses_row_states_buffer_on_one_stream_across_regimes(
+    api_kind, set_topk_algo
+):
+    """One stream reuses its cached ``row_states`` buffer, dirty, across regimes.
+
+    The buffer is zeroed only when it is allocated, so every multi-CTA launch
+    must leave it ready for the next one: when the next launch switches between
+    the deterministic and non-deterministic kernels, which place their collect
+    scratch differently, and when it follows a single-CTA launch that never
+    touches the buffer.
+    """
+    set_topk_algo("multi_cta")
+    device = torch.device("cuda")
+    batch_size, k = 4, 512
+    multi_cta_logits = _build_strictly_descending_logits(batch_size, 131072, device)
+    # A 4096-wide fp32 row keeps ctas_per_group == 1 even under the multi_cta
+    # override, so this runs the radix single-CTA branch.
+    single_cta_logits = _build_strictly_descending_logits(batch_size, 4096, device)
+
+    def run_and_check(logits, deterministic):
+        expected_indices = (
+            torch.arange(k, device=device, dtype=torch.int64)
+            .unsqueeze(0)
+            .expand(logits.shape[0], -1)
         )
-        _assert_unordered_indices_match(output_b, expected)
+        if api_kind == "top_k":
+            values, indices = flashinfer.top_k(
+                logits, k, sorted=True, deterministic=deterministic
+            )
+            torch.testing.assert_close(values, logits[:, :k])
+            assert torch.equal(indices, expected_indices)
+        else:
+            output = _run_transform(logits, k, api_kind, deterministic=deterministic)
+            _assert_unordered_indices_match(output, expected_indices.to(torch.int32))
 
-    buf_b = _get_cached_topk_row_states_buffer(device)
-    assert buf_b is buf_a
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        run_and_check(multi_cta_logits, deterministic=False)
+        buf = _cached_row_states_buffer(multi_cta_logits.device)
+        assert buf is not None
+        run_and_check(multi_cta_logits, deterministic=True)
+        run_and_check(single_cta_logits, deterministic=True)
+        run_and_check(multi_cta_logits, deterministic=False)
+        run_and_check(multi_cta_logits, deterministic=True)
+        assert _cached_row_states_buffer(multi_cta_logits.device) is buf
+    torch.cuda.synchronize()
+
+
+def test_multi_cta_row_states_graph_replay_isolated_from_eager_stream(set_topk_algo):
+    """Captured launches own their ``row_states``; eager launches on another stream own theirs."""
+    set_topk_algo("multi_cta")
+    device = torch.device("cuda")
+    batch_size, vocab_size, k = 16, 262144, 512
+    logits_graph = _build_strictly_descending_logits(batch_size, vocab_size, device)
+    logits_eager = logits_graph.flip(-1).contiguous()
+    ref_graph = torch.topk(logits_graph, k, dim=-1)
+    ref_eager = torch.topk(logits_eager, k, dim=-1)
+
+    def run(logits):
+        return flashinfer.top_k(logits, k, sorted=True, deterministic=True)
+
+    run(logits_graph)
+    run(logits_eager)
+    torch.cuda.synchronize()
+
+    graph_stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    graph_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=graph_stream):
+        graph_outs = [run(logits_graph) for _ in range(8)]
+    torch.cuda.synchronize()
+
+    eager_stream = torch.cuda.Stream()
+    eager_outs = []
+    for _ in range(16):
+        with torch.cuda.stream(graph_stream):
+            graph.replay()
+        with torch.cuda.stream(eager_stream):
+            eager_outs.extend(run(logits_eager) for _ in range(8))
+    torch.cuda.synchronize()
+
+    for out in graph_outs:
+        assert all(torch.equal(a, b) for a, b in zip(out, ref_graph, strict=True))
+    for out in eager_outs:
+        assert all(torch.equal(a, b) for a, b in zip(out, ref_eager, strict=True))
 
 
 @pytest.mark.parametrize("k", [256, 1024, 2048])
@@ -3265,8 +3460,8 @@ def test_top_k_uint32_pointer_overflow():
 def _require_sm100_or_sm103():
     major, minor = get_compute_capability(torch.device("cuda"))
     cc = major * 10 + minor
-    if cc not in [100, 103]:
-        pytest.skip("topk_clusters_exact requires SM100 or SM103 (Blackwell)")
+    if cc not in [100, 103, 107]:
+        pytest.skip("topk_clusters_exact requires SM100, SM103 or SM107")
 
 
 @pytest.mark.parametrize("batch_size", [1, 16, 64])
@@ -3321,6 +3516,27 @@ def test_topk_clusters_exact_correctness(
     accuracy = compute_topk_accuracy(indices, ref_indices.int(), batch_size, k)
     acc = 0.95 if dtype == torch.bfloat16 else 0.99
     assert accuracy >= acc, f"Accuracy {accuracy:.4f} < {acc}"
+
+
+@pytest.mark.parametrize("batch_size", [200, 252])
+def test_topk_clusters_exact_two_clusters_repeated(batch_size):
+    """Repeated calls with two clusters per row (128 <= batch_size < 256) stay exact."""
+    _require_sm100_or_sm103()
+
+    torch.manual_seed(42)
+    vocab_size, k = 248320, 20
+    logits = torch.randn(batch_size, vocab_size, device="cuda") * 3
+    ref_values = torch.topk(logits, k, dim=-1).values
+
+    for _ in range(200):
+        indices, values = flashinfer.topk.topk_clusters_exact(
+            logits, k, output_values=True, out_dtype=torch.int64
+        )
+        assert ((indices >= 0) & (indices < vocab_size)).all()
+        torch.testing.assert_close(logits.gather(1, indices), values)
+        torch.testing.assert_close(
+            values.sort(dim=-1, descending=True).values, ref_values
+        )
 
 
 @pytest.mark.parametrize("batch_size", [1, 16])

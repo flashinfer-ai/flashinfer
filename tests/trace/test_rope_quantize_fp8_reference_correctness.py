@@ -74,3 +74,136 @@ def test_rope_quantize_fp8_reference_correctness(shape_kwargs):
     )
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize(
+    "quantize_dtype,sat_min,sat_max",
+    [
+        (torch.float8_e5m2, -57344.0, 57344.0),
+        (torch.float8_e4m3fn, -448.0, 448.0),
+    ],
+)
+def test_rope_quantize_fp8_reference_saturation_follows_dtype(
+    quantize_dtype, sat_min, sat_max
+):
+    """The clamp applied before the FP8 cast must follow quantize_dtype.
+
+    pos_ids 0 with cos 1 / sin 0 keeps the rotation an identity, so the
+    values reaching the quantizer are exactly the ones built below. All of
+    them are exact in bf16; every value past the first lies above the e4m3
+    max of 448, on both signs, with 61440 past the e5m2 max of 57344.
+    """
+    from flashinfer.trace.templates.rope import rope_quantize_fp8_trace
+
+    cos_sin_cache = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    pos_ids = torch.zeros(4, dtype=torch.int32)
+    values = torch.tensor(
+        [448.0, 512.0, 2048.0, 28672.0, 57344.0, 61440.0, -59904.0, -512.0],
+        dtype=torch.bfloat16,
+    )
+    q_rope = values.reshape(4, 1, 2)
+    k_rope = q_rope.clone()
+    q_r_ref, k_r_ref, _, _ = rope_quantize_fp8_trace.reference(
+        q_rope,
+        k_rope,
+        None,
+        None,
+        cos_sin_cache,
+        pos_ids,
+        quantize_dtype=quantize_dtype,
+    )
+    expected = values.to(torch.float32).clamp(sat_min, sat_max).to(quantize_dtype)
+    assert q_r_ref.dtype == quantize_dtype
+    assert torch.equal(q_r_ref.reshape(-1).to(torch.float32), expected.float())
+    assert torch.equal(k_r_ref.reshape(-1).to(torch.float32), expected.float())
+    if quantize_dtype == torch.float8_e5m2:
+        # e5m2 represents values up to 57344; clamping them at the e4m3
+        # max of 448 would compress the representable range by 128x.
+        assert (q_r_ref.float().abs() > 448.0).any()
+
+
+def test_rope_quantize_fp8_reference_infers_dtype_from_out_tensors():
+    """A None quantize_dtype must resolve from the out tensors like the API.
+
+    rope_quantize_fp8 infers the dtype from q_rope_out/k_rope_out/... when
+    quantize_dtype is None, so the reference has to resolve the same way;
+    falling back to e4m3fn unconditionally would clamp e5m2 outputs at 448.
+    """
+    from flashinfer.trace.templates.rope import rope_quantize_fp8_trace
+
+    cos_sin_cache = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    pos_ids = torch.zeros(2, dtype=torch.int32)
+    q_rope = torch.tensor(
+        [[[512.0, 57344.0]], [[2048.0, -59904.0]]], dtype=torch.bfloat16
+    )
+    k_rope = q_rope.clone()
+    q_rope_out = torch.empty(2, 1, 2, dtype=torch.float8_e5m2)
+    q_r_ref, _, _, _ = rope_quantize_fp8_trace.reference(
+        q_rope,
+        k_rope,
+        None,
+        None,
+        cos_sin_cache,
+        pos_ids,
+        q_rope_out=q_rope_out,
+    )
+    expected = q_rope.to(torch.float32).clamp(-57344.0, 57344.0).to(torch.float8_e5m2)
+    assert q_r_ref.dtype == torch.float8_e5m2
+    assert torch.equal(q_r_ref.reshape(-1).float(), expected.reshape(-1).float())
+
+
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [dict(nnz=16, num_q_heads=8, num_k_heads=2, rope_dim=64, no_rope_dim=64)],
+)
+def test_rope_quantize_fp8_reference_e5m2_kernel_consistency(shape_kwargs):
+    """e5m2 kernel vs reference above the e4m3 max of 448.
+
+    A large quantization scale pushes the randn inputs well past 448 so the
+    run exercises the range where the old ±448 clamp diverged from the
+    kernel's per-format saturation.
+    """
+    from flashinfer.rope import rope_quantize_fp8
+    from flashinfer.trace.templates.rope import rope_quantize_fp8_trace
+
+    inputs = rope_quantize_fp8_trace.init(**shape_kwargs)
+    q_r_api, k_r_api, q_n_api, k_n_api = rope_quantize_fp8(
+        inputs["q_rope"],
+        inputs["k_rope"],
+        inputs["q_nope"],
+        inputs["k_nope"],
+        inputs["cos_sin_cache"],
+        inputs["pos_ids"],
+        is_neox=inputs["is_neox"],
+        quantize_dtype=torch.float8_e5m2,
+        quant_scale_q=1000.0,
+        quant_scale_kv=1000.0,
+    )
+    q_r_ref, k_r_ref, q_n_ref, k_n_ref = rope_quantize_fp8_trace.reference(
+        inputs["q_rope"],
+        inputs["k_rope"],
+        inputs["q_nope"],
+        inputs["k_nope"],
+        inputs["cos_sin_cache"],
+        inputs["pos_ids"],
+        is_neox=inputs["is_neox"],
+        quantize_dtype=torch.float8_e5m2,
+        quant_scale_q=1000.0,
+        quant_scale_kv=1000.0,
+    )
+    # The scale puts the bulk of the magnitudes past 448 without nearing
+    # the e5m2 max of 57344, so the kernel's saturation stays unclamped.
+    assert (q_r_api.float().abs() > 448.0).any()
+    # e5m2 has a 2-bit mantissa: adjacent representable values at a binade
+    # start are 25% apart, so a rotate-side fp32 rounding difference that
+    # lands on an RN boundary can flip one e5m2 code point. The nope
+    # tensors, which skip the rotation, match the kernel bit-exact.
+    _check(
+        rope_quantize_fp8_trace,
+        (q_r_ref.float(), k_r_ref.float(), q_n_ref.float(), k_n_ref.float()),
+        (q_r_api.float(), k_r_api.float(), q_n_api.float(), k_n_api.float()),
+        atol=1e-2,
+        rtol=3e-1,
+    )
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()

@@ -249,6 +249,21 @@ struct KVCacheTraits<ModelType::DSV4_1> : Dsv41Fp8Layout {
   __device__ static __forceinline__ uint8_t scale_to_ue8m0(uint8_t scale);
 };
 
+// FlashMLA's DeepSeek-V4.1 inline-scale records: DSV4_1's geometry and scales
+// with each token's 16 scale bytes after its 512 data bytes. The 528B record is
+// the smem row (DSV4_1 already pads that row to 528B), so one bulk copy brings
+// data and scales, and the kernels read the scales at +512 in smem. Rows are
+// addressed flat with the validated runtime row stride, like GLM53_NOPE.
+template <>
+struct KVCacheTraits<ModelType::DSV4_1_INLINE> : Dsv41Fp8InlineLayout {
+  static constexpr int KV_SMEM_STRIDE = D_NOPE + SCALE_BYTES_PER_TOKEN;  // 528
+  static constexpr int KV_SMEM_COPY_BYTES = KV_SMEM_STRIDE;
+  static constexpr bool SCALE_IN_KV_SMEM = true;
+  static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;
+  static constexpr int Q_NOPE_BF16_STRIDE = D_NOPE + 8;
+  __device__ static __forceinline__ uint8_t scale_to_ue8m0(uint8_t scale);
+};
+
 struct CacheFormatInfo {
   int query_dim;
   int value_dim;
@@ -288,6 +303,7 @@ constexpr CacheFormatInfo cache_format_info(ModelType mt) {
     FORMAT(GLM53_NOPE);
     FORMAT(DOTS3_SWA);
     FORMAT(DSV4_1);
+    FORMAT(DSV4_1_INLINE);
   }
 #undef FORMAT
   return {};
@@ -318,6 +334,8 @@ static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::D_ROPE == 0);
 static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::D_V == D_V);
 static_assert(KVCacheTraits<ModelType::DSV4_1>::D_ROPE == 0);
 static_assert(KVCacheTraits<ModelType::DSV4_1>::D_V == D_V);
+static_assert(KVCacheTraits<ModelType::DSV4_1_INLINE>::D_ROPE == 0);
+static_assert(KVCacheTraits<ModelType::DSV4_1_INLINE>::D_V == D_V);
 static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::D_V != D_V,
               "DOTS3_SWA is the D_V opt-out; if it ever equals 512, fold it back "
@@ -344,3 +362,10 @@ static_assert(KVCacheTraits<ModelType::DSV4_1>::NUM_SCALES == 16);
 static_assert(KVCacheTraits<ModelType::DSV4_1>::SCALE_BYTES_PER_TOKEN == 16);
 static_assert(KVCacheTraits<ModelType::DSV4_1>::BYTES_PER_TOKEN == 528);
 static_assert(KVCacheTraits<ModelType::DSV4_1>::SCALE_DATA_PREFIX_BYTES == 512);
+static_assert(KVCacheTraits<ModelType::DSV4_1_INLINE>::NUM_SCALES == 16);
+static_assert(KVCacheTraits<ModelType::DSV4_1_INLINE>::SCALE_BYTES_PER_TOKEN == 16);
+static_assert(KVCacheTraits<ModelType::DSV4_1_INLINE>::BYTES_PER_TOKEN == 528);
+static_assert(KVCacheTraits<ModelType::DSV4_1_INLINE>::SCALE_DATA_PREFIX_BYTES == 512);
+static_assert(KVCacheTraits<ModelType::DSV4_1_INLINE>::KV_SMEM_STRIDE ==
+                  KVCacheTraits<ModelType::DSV4_1>::KV_SMEM_STRIDE,
+              "both placements share the 528B smem row");

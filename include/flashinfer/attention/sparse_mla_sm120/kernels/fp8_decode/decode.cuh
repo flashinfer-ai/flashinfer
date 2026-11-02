@@ -51,9 +51,11 @@ __global__ void __launch_bounds__(
     (DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>::template block_threads<GatherSchedule>()),
     GatherSchedule::MIN_BLOCKS)
     sparse_mla_decode_dsv4_kernel(
-        const bf16* __restrict__ Q,            // [num_tokens, num_heads, d_qk] bf16
-        const uint8_t* __restrict__ KV_cache,  // FP8 paged (DSV4 footer layout)
-        const int32_t* __restrict__ indices,   // [num_tokens, topk] int32
+        const bf16* __restrict__ Q,  // [num_tokens, num_heads, d_qk] bf16
+        // FP8 paged (footer layout), or inline-scale rows for DSV4_1_INLINE,
+        // whose (extra_)page_stride_bytes are then the row pitches.
+        const uint8_t* __restrict__ KV_cache,
+        const int32_t* __restrict__ indices,  // [num_tokens, topk] int32
         bf16* __restrict__ mid_out,   // [num_tokens, num_heads, scratch_split_stride, d_v] bf16
         float* __restrict__ mid_lse,  // [num_tokens, num_heads, scratch_split_stride] f32
         const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
@@ -76,8 +78,9 @@ __global__ void __launch_bounds__(
             pages) {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>;
-  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA || MT == ModelType::DSV4_1,
-                "decode-dsv4 serves the footer-scale model types (DSV4, DOTS3_SWA, DSV4_1)");
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA || is_dsv41(MT),
+                "decode-dsv4 serves the UE8M0-scaled model types (DSV4, DOTS3_SWA, DSV4_1, "
+                "DSV4_1_INLINE)");
   constexpr int D_NOPE = KV::D_NOPE;                                // 448
   constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
   constexpr int D_QK = KV::D_QK;                                    // 512
@@ -264,7 +267,8 @@ __global__ void __launch_bounds__(
   }
 
   // ── TMA bulk constants ──
-  constexpr uint32_t DSV4_BULK_NOPE_BYTES = (uint32_t)D_NOPE;  // DSV4 448, DSV4_1 512
+  // DSV4 448, DSV4_1 512; DSV4_1_INLINE 528, the whole record (nope + scales).
+  constexpr uint32_t DSV4_BULK_NOPE_BYTES = (uint32_t)KV::KV_SMEM_COPY_BYTES;
   constexpr uint32_t DSV4_BULK_ROPE_BYTES = (uint32_t)D_ROPE_C * sizeof(bf16);  // DSV4 128
   constexpr uint32_t DSV4_BULK_TX_BYTES =
       (uint32_t)Cfg::BI * (DSV4_BULK_NOPE_BYTES + DSV4_BULK_ROPE_BYTES);
@@ -295,7 +299,6 @@ __global__ void __launch_bounds__(
     };
     uint8_t* kv_fp8_dst = sm.kv_fp8(buf);
     bf16* kv_rope_dst = sm.kv_rope(buf);
-    uint8_t* kv_sc_dst = sm.kv_sc(buf);
 
     // Per-lane entries (BI / IO_THREADS, compile-time): read each candidate's
     // index exactly once into registers — both the scale gather and the bulk
@@ -311,34 +314,40 @@ __global__ void __launch_bounds__(
       idx_raw[e] = (cand_pos < g_end) ? section_idx_base[cand_pos] : -1;
     }
 
-    // Footer scale rows are 8B (DSV4, DOTS3_SWA) or 16B (DSV4_1); both stay
-    // naturally aligned (the block stride and the in-block footer offset are
-    // multiples of the row width).
-    using ScaleWord = typename std::conditional<SCALE_BYTES_PER_TOKEN == 16, uint4, uint64_t>::type;
-    ScaleWord scale_word[EPW];
+    // Inline-scale records carry their scales inside the bulk copy below, so
+    // only the footer layouts gather scale rows here.
+    if constexpr (!KV::SCALE_IN_KV_SMEM) {
+      uint8_t* kv_sc_dst = sm.kv_sc(buf);
+      // Footer scale rows are 8B (DSV4, DOTS3_SWA) or 16B (DSV4_1); both stay
+      // naturally aligned (the block stride and the in-block footer offset are
+      // multiples of the row width).
+      using ScaleWord =
+          typename std::conditional<SCALE_BYTES_PER_TOKEN == 16, uint4, uint64_t>::type;
+      ScaleWord scale_word[EPW];
 #pragma unroll
-    for (int e = 0; e < EPW; e++) {
-      if constexpr (sizeof(ScaleWord) == 16) {
-        scale_word[e] = make_uint4(0, 0, 0, 0);
-      } else {
-        scale_word[e] = 0;
+      for (int e = 0; e < EPW; e++) {
+        if constexpr (sizeof(ScaleWord) == 16) {
+          scale_word[e] = make_uint4(0, 0, 0, 0);
+        } else {
+          scale_word[e] = 0;
+        }
+        if (idx_raw[e] >= 0) {
+          const int idx = idx_raw[e];
+          const int block_idx_g = page_index(idx);
+          const int local_idx_g = idx - block_idx_g * section_pbs;
+          const uint8_t* scale_base =
+              section_kv + (size_t)block_idx_g * section_stride +
+              CacheLayout::scale_offset(size_t(section_pbs), size_t(local_idx_g));
+          scale_word[e] = __ldg(reinterpret_cast<const ScaleWord*>(scale_base));
+        }
       }
-      if (idx_raw[e] >= 0) {
-        const int idx = idx_raw[e];
-        const int block_idx_g = page_index(idx);
-        const int local_idx_g = idx - block_idx_g * section_pbs;
-        const uint8_t* scale_base =
-            section_kv + (size_t)block_idx_g * section_stride +
-            CacheLayout::scale_offset(size_t(section_pbs), size_t(local_idx_g));
-        scale_word[e] = __ldg(reinterpret_cast<const ScaleWord*>(scale_base));
-      }
-    }
 #pragma unroll
-    for (int e = 0; e < EPW; e++) {
-      *reinterpret_cast<ScaleWord*>(kv_sc_dst + (size_t)(e * Cfg::IO_THREADS + lane) *
-                                                    SCALE_BYTES_PER_TOKEN) = scale_word[e];
+      for (int e = 0; e < EPW; e++) {
+        *reinterpret_cast<ScaleWord*>(kv_sc_dst + (size_t)(e * Cfg::IO_THREADS + lane) *
+                                                      SCALE_BYTES_PER_TOKEN) = scale_word[e];
+      }
+      __threadfence_block();
     }
-    __threadfence_block();
 
     if (lane == 0) {
       pipeline::BulkReady::expect(sm.mbar_full(buf), DSV4_BULK_TX_BYTES);
@@ -355,11 +364,17 @@ __global__ void __launch_bounds__(
       // slot: a NaN there would leak through 0 * NaN in the value MMA.
       const bool valid = idx_raw[e] >= 0;
       const int idx = valid ? idx_raw[e] : 0;
-      const int block_idx_g = page_index(idx);
-      const int local_idx_g = idx - block_idx_g * section_pbs;
-      const uint8_t* data_base = valid ? section_kv + (size_t)block_idx_g * section_stride +
-                                             CacheLayout::data_offset(size_t(local_idx_g))
-                                       : sparse_mla_zero_row;
+      const uint8_t* data_base;
+      if constexpr (KV::SCALE_IN_KV_SMEM) {
+        // Flat rows at the section's validated 16B-aligned row pitch.
+        data_base = section_kv + ((size_t)idx * (section_stride >> 4) << 4);
+      } else {
+        const int block_idx_g = page_index(idx);
+        const int local_idx_g = idx - block_idx_g * section_pbs;
+        data_base = section_kv + (size_t)block_idx_g * section_stride +
+                    CacheLayout::data_offset(size_t(local_idx_g));
+      }
+      data_base = valid ? data_base : sparse_mla_zero_row;
       static_assert(DSV4_BULK_NOPE_BYTES + DSV4_BULK_ROPE_BYTES <= SPARSE_MLA_ZERO_ROW_BYTES);
       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
                         DSV4_BULK_NOPE_BYTES, sm.mbar_full(buf));
@@ -436,7 +451,10 @@ __global__ void __launch_bounds__(
     bar_sync_t<Cfg::MATH_BARRIER, Cfg::MATH_THREADS>();
 
     uint8_t* sm_kv_fp8 = sm.kv_fp8(buf);
-    uint8_t* sm_kv_sc = sm.kv_sc(buf);
+    // Footer scale rows (SCALE_BYTES_PER_TOKEN apart) or the inline scales in
+    // each KV row (KV_SMEM_STRIDE apart).
+    const uint8_t* sm_kv_sc = sm.kv_scales(buf);
+    constexpr int SCALE_STRIDE = Layout::SCALE_STRIDE;
     bf16* sm_kv_rope = sm.kv_rope(buf);
 
     // ── Stage 2 QK ────────────────────────────────────────────
@@ -444,7 +462,7 @@ __global__ void __launch_bounds__(
     static_assert(Cfg::QK_N_TILES == 1);
     qk_fp8_nope_16x8<KV>(qk[0], sm.q_fp8(), sm.q_sc(),
                          sm_kv_fp8 + (size_t)warp_id * Cfg::ENTRIES_PER_WARP * KV_SMEM_STRIDE,
-                         sm_kv_sc + warp_id * Cfg::ENTRIES_PER_WARP * SCALE_BYTES_PER_TOKEN, lane);
+                         sm_kv_sc + warp_id * Cfg::ENTRIES_PER_WARP * SCALE_STRIDE, lane);
     {
       // K-rope B operand: scalar per-lane reads. mma.m16n8k16 needs each lane's
       // b0/b1 to hold consecutive K-rows of one N-entry, which ldmatrix.x2.trans
@@ -642,10 +660,8 @@ __global__ void __launch_bounds__(
         const int cand_e1 = cand_e0 + 1;
 #pragma unroll
         for (int vc = 0; vc < N_V_CHUNKS; vc++) {
-          const float vsc0 =
-              fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
-          const float vsc1 =
-              fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
+          const float vsc0 = fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e0 * SCALE_STRIDE + vc]);
+          const float vsc1 = fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e1 * SCALE_STRIDE + vc]);
           atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid]),
                     __float_as_int(fmaxf(fabsf(w_pre[nt][0] * vsc0), fabsf(w_pre[nt][1] * vsc1))));
           atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid + 8]),
@@ -679,10 +695,8 @@ __global__ void __launch_bounds__(
         for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
           const int cand_e0 = warp_first_cand_xv + nt * 8 + tid * 2;
           const int cand_e1 = cand_e0 + 1;
-          const float vsc0 =
-              fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
-          const float vsc1 =
-              fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
+          const float vsc0 = fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e0 * SCALE_STRIDE + vc]);
+          const float vsc1 = fp32_from_exponent_byte(sm_kv_sc[(size_t)cand_e1 * SCALE_STRIDE + vc]);
           __nv_fp8_e4m3 f00(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][0] * vsc0 * si0)));
           __nv_fp8_e4m3 f01(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][1] * vsc1 * si0)));
           __nv_fp8_e4m3 f10(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][2] * vsc0 * si1)));

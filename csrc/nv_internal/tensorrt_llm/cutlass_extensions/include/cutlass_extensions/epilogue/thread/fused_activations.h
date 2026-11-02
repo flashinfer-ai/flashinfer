@@ -75,6 +75,44 @@ struct Relu2 {
   }
 };
 
+// Tanh-soft-clamped squared-ReLU: out = [limit * tanh(relu(x) / limit)]^2.
+//
+// Implements megatron-core's clamped_squared_relu(x, clamp_scale) (see
+// megatron/core/fusions/fused_weighted_squared_relu.py in NVIDIA/Megatron-LM).
+// `limit` is the clamp scale and must be a finite, strictly positive value
+// supplied as a model-wide scalar via ActivationParams::swiglu_limit (the
+// field name is SwiGLU-specific in name only).
+struct ClampedRelu2Arguments {
+  float const* limit_ptr = nullptr;
+};
+
+template <typename T>
+struct ClampedRelu2 {
+  static const bool kIsHeavy = true;
+
+  // Sm90Compute instantiates the activation on an Array<T, FragmentSize>, but
+  // obtains Arguments from the scalar activation type. Keep the argument type
+  // independent of T so both instantiations have the same function signature.
+  using Arguments = ClampedRelu2Arguments;
+
+  CUTLASS_HOST_DEVICE
+  T operator()(T value, float limit) const {
+    ReLu<T> relu_op;
+    Tanh<T> tanh_op;
+    // cutlass::Array<T, N> has no single-scalar constructor; multiply/divide
+    // against a bare float directly via the native operator*, the same
+    // mixed Array-times-float idiom already used for `gate_act * quant_scale`
+    // in doActivationKernel below.
+    T r = relu_op(value);
+    T t = tanh_op(r * (1.0f / limit));
+    T clamped = t * limit;
+    return clamped * clamped;
+  }
+
+  CUTLASS_DEVICE
+  T operator()(T value, Arguments const& args) const { return (*this)(value, args.limit_ptr[0]); }
+};
+
 }  // namespace thread
 }  // namespace epilogue
 }  // namespace cutlass

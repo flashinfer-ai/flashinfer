@@ -251,31 +251,69 @@ def _get_torch_info():
     return info
 
 
+def _kernel_package_matches(pkg, version, flashinfer_version):
+    # Same rule as flashinfer/jit/env.py: flashinfer-cubin must match exactly,
+    # while jit-cache wheels may add a CUDA local version (e.g. 0.7.0+cu130).
+    return version == flashinfer_version or (
+        pkg != "flashinfer-cubin" and version.startswith(f"{flashinfer_version}+")
+    )
+
+
+def _get_kernel_package_info():
+    dists = _guard(_installed_distributions, None)
+    if not isinstance(dists, dict):
+        return {}
+    info = {}
+    fi_version = dists.get("flashinfer-python")
+    for pkg in ("flashinfer-cubin", "flashinfer-jit-cache"):
+        ver = dists.get(pkg)
+        if ver is None:
+            info[pkg] = "not installed"
+        elif fi_version and not _kernel_package_matches(pkg, ver, fi_version):
+            # Classic screwup: flashinfer-python upgraded but the kernel
+            # wheel kept at the old version (sometimes with
+            # FLASHINFER_DISABLE_VERSION_CHECK to silence the guard).
+            info[pkg] = f"{ver}  ⚠ MISMATCH vs flashinfer-python=={fi_version}"
+        else:
+            info[pkg] = ver
+
+    providers = sorted(
+        (match.group(1), ver)
+        for name, ver in dists.items()
+        if (match := re.fullmatch(r"flashinfer-jit-cache-(sm\d{2,3}[af]?)", name))
+    )
+    if providers:
+        line = ", ".join(tag for tag, _ in providers)
+        # Providers are only discovered through the shim and must match it
+        # exactly, CUDA suffix included.
+        shim_version = dists.get("flashinfer-jit-cache")
+        if shim_version is None:
+            line += "  ⚠ flashinfer-jit-cache not installed"
+        else:
+            stale = [f"{tag}=={ver}" for tag, ver in providers if ver != shim_version]
+            if stale:
+                line += (
+                    f"  ⚠ MISMATCH vs flashinfer-jit-cache=={shim_version}: "
+                    + ", ".join(stale)
+                )
+        info["flashinfer-jit-cache providers"] = line
+    return info
+
+
 def _get_flashinfer_info():
     info = {}
     try:
         import flashinfer
     except Exception as e:
         info["flashinfer"] = f"<import failed: {type(e).__name__}: {e}>"
+        # Older releases fail to import when a kernel wheel does not match
+        # flashinfer-python, so report the versions anyway.
+        info.update(_get_kernel_package_info())
         return info
     info["flashinfer"] = _guard(lambda: flashinfer.__version__, "?")
     info["flashinfer commit"] = _guard(lambda: flashinfer.__git_commit__, "?")
     info["flashinfer file"] = _guard(lambda: flashinfer.__file__, "?")
-
-    dists = _guard(_installed_distributions, None)
-    if isinstance(dists, dict):
-        fi_version = dists.get("flashinfer-python")
-        for pkg in ("flashinfer-cubin", "flashinfer-jit-cache"):
-            ver = dists.get(pkg)
-            if ver is None:
-                info[pkg] = "not installed"
-            elif fi_version and ver != fi_version:
-                # Classic screwup: flashinfer-python upgraded but the AOT
-                # companion package kept at the old version (sometimes with
-                # FLASHINFER_DISABLE_VERSION_CHECK to silence the guard).
-                info[pkg] = f"{ver}  ⚠ MISMATCH vs flashinfer-python=={fi_version}"
-            else:
-                info[pkg] = ver
+    info.update(_get_kernel_package_info())
 
     def _cache_dir():
         from flashinfer.jit.env import FLASHINFER_CACHE_DIR

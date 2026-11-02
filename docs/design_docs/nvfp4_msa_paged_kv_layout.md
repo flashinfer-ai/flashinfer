@@ -71,7 +71,7 @@ The route's `_v_scale_unswizzle_index` inverts exactly this map.
 
 ## 4. Public views of one allocation
 
-All SM100/SM103 readers take four strided `uint8` (or E4M3-reinterpreted) views
+All SM100/SM103/SM107 readers take four strided `uint8` (or E4M3-reinterpreted) views
 of the same allocation, never a repacked copy:
 
 | view | shape | strides (bytes) | storage offset |
@@ -151,7 +151,7 @@ cache zero-copy:
 
 `flashinfer.msa_ops.prepare_msa_nvfp4_sparse_decode` (experimental, Cake
 backend under `flashinfer/experimental/msa_nvfp4_decode/`) is a second reader
-of exactly this contract on compute capability 10.0/10.3: it consumes the four
+of exactly this contract on compute capability 10.0/10.3/10.7: it consumes the four
 strided views of section 4 in place, folds `k_global_scale` into the softmax
 scale, applies `v_global_scale` in its epilogue, and takes the head-major
 top-k selection of section 5. It adds no layout, encoding or selection rule of

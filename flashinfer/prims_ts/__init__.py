@@ -25,9 +25,24 @@ from .utils import (
 
 configure_cute_dsl_cache_dir()
 
+from .gemm import (
+    fp4_linear,
+    fp4_linear_swiglu,
+    fp4_qkv_qknorm_rope,
+    fp8_linear,
+    fp8_linear_swiglu,
+    fp8_qkv_qknorm_rope,
+)
+
 __all__ = [
     "configure_cute_dsl_cache_dir",
     "ensure_cutlass_dsl_experimental",
     "get_prims_ts_compile_options",
     "is_prims_ts_available",
+    "fp8_linear",
+    "fp8_linear_swiglu",
+    "fp8_qkv_qknorm_rope",
+    "fp4_linear",
+    "fp4_linear_swiglu",
+    "fp4_qkv_qknorm_rope",
 ]

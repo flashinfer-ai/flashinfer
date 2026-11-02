@@ -36,7 +36,6 @@ from flashinfer.diffusion_ops import (
     minimax_h3_out_proj,
     minimax_h3_out_proj_mxfp8,
     minimax_h3_out_proj_nvfp4,
-    minimax_h3_out_proj_reference,
     prepare_minimax_h3_o_weight_mxfp8,
     prepare_minimax_h3_o_weight_nvfp4,
 )
@@ -55,15 +54,20 @@ from flashinfer.diffusion_ops.minimax_h3_out_proj import (
     NVFP4_PACKED_COLS,
     NVFP4_SF_COLS,
     NVFP4_SF_K_TILES,
-    _reference_from_operands,
+    _m_tiles,
+    _module_for,
     _weight_scale_tiles,
     minimax_h3_nvfp4_alpha,
     minimax_h3_nvfp4_global_scale,
-    minimax_h3_unpack_attn_out,
     mxfp8_activation_scale_workspace_bytes,
     nvfp4_activation_scale_workspace_bytes,
 )
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.minimax_h3_out_proj_reference import (
+    _reference_from_operands,
+    minimax_h3_out_proj_reference,
+    minimax_h3_unpack_attn_out,
+)
 
 ATOL = 1e-2
 RTOL = 1e-2
@@ -73,6 +77,10 @@ MAX_VIOLATIONS_FLOOR = 4
 # production token count of one rank at sequence-parallel degree 8.
 M_VALUES = [1, 129, 257, 4824]
 P_VALUES = list(MINIMAX_H3_SEQUENCE_PARALLEL_DEGREES)
+# Engine modulation projection: the gate table is a column chunk of a [rows, 6 * 5376] buffer
+# with rows = 3 x unique timesteps (3 or 6 in the t2va pipeline); 12 exercises rows above 9.
+ENGINE_TABLE_CHUNKS = 6
+ENGINE_TABLE_ROWS = [3, 6, 12]
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
@@ -104,21 +112,46 @@ def make_model(device: torch.device, seed: int = 4616) -> Dict[str, torch.Tensor
     return {"o_weight": o_weight, "gate": gate}
 
 
-def make_gate_index(rows: int, device: torch.device) -> torch.Tensor:
-    """Nine contiguous segments over the rows, with out-of-range indices planted at a few rows
-    (``-1`` where ``row % 101 == 50``, ``9`` where ``row % 103 == 60``) so the device-side guard
-    (``gate = 0``, i.e. ``out = residual``) is exercised."""
+def make_engine_model(
+    model: Dict[str, torch.Tensor],
+    gate_rows: int,
+    device: torch.device,
+    seed: int = 4617,
+) -> Dict[str, torch.Tensor]:
+    """``model`` with its gate table replaced by column chunk 5 of a ``[gate_rows, 6 * 5376]``
+    modulation projection: row stride ``6 * 5376``, not contiguous."""
+    g = torch.Generator(device=device)
+    g.manual_seed(seed + gate_rows)
+    proj = torch.empty(
+        (gate_rows, ENGINE_TABLE_CHUNKS * MINIMAX_H3_HIDDEN),
+        dtype=torch.bfloat16,
+        device=device,
+    ).uniform_(-1.0, 1.0, generator=g)
+    gate = proj[:, 5 * MINIMAX_H3_HIDDEN :]
+    assert gate.stride() == (ENGINE_TABLE_CHUNKS * MINIMAX_H3_HIDDEN, 1)
+    assert not gate.is_contiguous()
+    return {**model, "gate": gate}
+
+
+def make_gate_index(
+    rows: int, device: torch.device, gate_rows: int = MINIMAX_H3_GATE_ROWS
+) -> torch.Tensor:
+    """``gate_rows`` contiguous segments over the rows (int64), with out-of-range indices planted
+    at a few rows (``-1`` where ``row % 101 == 50``, ``gate_rows`` where ``row % 103 == 60``) so
+    the device-side guard (``gate = 0``, i.e. ``out = residual``) is exercised."""
     r = torch.arange(rows, dtype=torch.int64, device=device)
-    idx = torch.div(r * MINIMAX_H3_GATE_ROWS, rows, rounding_mode="floor").clamp_max(
-        MINIMAX_H3_GATE_ROWS - 1
-    )
+    idx = torch.div(r * gate_rows, rows, rounding_mode="floor").clamp_max(gate_rows - 1)
     idx = torch.where(r % 101 == 50, torch.full_like(idx, -1), idx)
-    idx = torch.where(r % 103 == 60, torch.full_like(idx, MINIMAX_H3_GATE_ROWS), idx)
-    return idx.to(torch.int32)
+    idx = torch.where(r % 103 == 60, torch.full_like(idx, gate_rows), idx)
+    return idx
 
 
 def make_inputs(
-    rows: int, degree: int, device: torch.device, seed: int = 4616
+    rows: int,
+    degree: int,
+    device: torch.device,
+    seed: int = 4616,
+    gate_rows: int = MINIMAX_H3_GATE_ROWS,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``(attn_out [P, M, 56 // P, 128], gate_index [M], residual [M, 5376])``."""
     g = torch.Generator(device=device)
@@ -131,7 +164,7 @@ def make_inputs(
     residual = torch.empty(
         (rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
     ).normal_(0.0, 1.0, generator=g)
-    return attn_out, make_gate_index(rows, device), residual
+    return attn_out, make_gate_index(rows, device, gate_rows), residual
 
 
 # --------------------------------------------------------------------------------------------
@@ -244,8 +277,14 @@ def kernel_nvfp4_activation(
 # --------------------------------------------------------------------------------------------
 
 
+def _gate_rows(model) -> int:
+    return int(model["gate"].shape[0])
+
+
 def run_bf16_case(rows: int, degree: int, model, device) -> Dict[str, float]:
-    attn_out, idx, residual = make_inputs(rows, degree, device)
+    attn_out, idx, residual = make_inputs(
+        rows, degree, device, gate_rows=_gate_rows(model)
+    )
     out = minimax_h3_out_proj(attn_out, model["o_weight"], model["gate"], idx, residual)
     torch.cuda.synchronize()
     ref = minimax_h3_out_proj_reference(
@@ -255,7 +294,9 @@ def run_bf16_case(rows: int, degree: int, model, device) -> Dict[str, float]:
 
 
 def run_mxfp8_case(rows: int, degree: int, model, prepared, device) -> Dict[str, float]:
-    attn_out, idx, residual = make_inputs(rows, degree, device)
+    attn_out, idx, residual = make_inputs(
+        rows, degree, device, gate_rows=_gate_rows(model)
+    )
     w_q, w_tiles, w_deq = prepared
     workspace_q = torch.empty(
         (rows, MINIMAX_H3_ATTN_DIM), dtype=torch.float8_e4m3fn, device=device
@@ -295,7 +336,9 @@ def run_mxfp8_case(rows: int, degree: int, model, prepared, device) -> Dict[str,
 
 
 def run_nvfp4_case(rows: int, degree: int, model, prepared, device) -> Dict[str, float]:
-    attn_out, idx, residual = make_inputs(rows, degree, device)
+    attn_out, idx, residual = make_inputs(
+        rows, degree, device, gate_rows=_gate_rows(model)
+    )
     w_q, w_tiles, w_scaled, g_w = prepared
     a = minimax_h3_unpack_attn_out(attn_out)
     # Static activation global scale calibrated from the activation of this shape.
@@ -451,13 +494,217 @@ def test_minimax_h3_out_proj_nvfp4(rows, degree, model, prepared_nvfp4, device):
 
 
 @requires_blackwell
-def test_minimax_h3_out_proj_invalid_index_rows_pass_residual(model, device):
-    rows = 300
-    attn_out, idx, residual = make_inputs(rows, 2, device)
-    idx = idx.clone()
-    idx[:3] = torch.tensor(
-        [-1, MINIMAX_H3_GATE_ROWS, -(2**31)], dtype=torch.int32, device=device
+@pytest.mark.parametrize("gate_rows", ENGINE_TABLE_ROWS)
+@pytest.mark.parametrize("degree", [1, 8])
+def test_minimax_h3_out_proj_bf16_engine_gate(gate_rows, degree, model, device):
+    engine = make_engine_model(model, gate_rows, device)
+    run_bf16_case(257, degree, engine, device)
+    # The strided view was passed through, not copied.
+    assert engine["gate"].stride(0) == ENGINE_TABLE_CHUNKS * MINIMAX_H3_HIDDEN
+
+
+@requires_blackwell
+def test_minimax_h3_out_proj_mxfp8_engine_gate(model, prepared_mxfp8, device):
+    run_mxfp8_case(257, 2, make_engine_model(model, 6, device), prepared_mxfp8, device)
+
+
+@requires_blackwell
+def test_minimax_h3_out_proj_nvfp4_engine_gate(model, prepared_nvfp4, device):
+    run_nvfp4_case(257, 2, make_engine_model(model, 6, device), prepared_nvfp4, device)
+
+
+# The NVFP4 GEMM's tail-split program runs the tail tiles of a partial last wave as two 256 x 128
+# half units each; the host picks it per shape.  Its output must be bitwise equal to the
+# whole-tile program's, for the host's choice and for forced schedules: (M, P, tail tile pairs)
+# with 4824 rows = 399 tile pairs (19 past five waves of 76 co-resident pairs), 7169 rows = 609
+# (one past eight waves) and 300 rows = 42, plus every tile as two half units.
+TAIL_SPLIT_CASES = [(4824, 8, 19), (7169, 4, 1), (300, 2, 5)]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows,degree,tail", TAIL_SPLIT_CASES)
+def test_minimax_h3_out_proj_nvfp4_tail_split_bitwise(
+    rows, degree, tail, model, prepared_nvfp4, device
+):
+    attn_out, idx, residual = make_inputs(
+        rows, degree, device, gate_rows=_gate_rows(model)
     )
+    w_q, w_tiles, _, g_w = prepared_nvfp4
+    g_a = minimax_h3_nvfp4_global_scale(minimax_h3_unpack_attn_out(attn_out))
+    alpha = minimax_h3_nvfp4_alpha(g_a, g_w)
+    num_tiles = _m_tiles(rows) // 2 * (MINIMAX_H3_HIDDEN // 256)
+
+    def run(full_units=None):
+        workspace_q = torch.empty(
+            (rows, NVFP4_PACKED_COLS), dtype=torch.uint8, device=device
+        )
+        workspace_sf = torch.zeros(
+            (nvfp4_activation_scale_workspace_bytes(rows),),
+            dtype=torch.uint8,
+            device=device,
+        )
+        out = torch.empty(
+            (rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
+        )
+        if full_units is None:
+            minimax_h3_out_proj_nvfp4(
+                attn_out,
+                g_a,
+                w_q,
+                w_tiles,
+                alpha,
+                model["gate"],
+                idx,
+                residual,
+                out=out,
+                workspace_q=workspace_q,
+                workspace_sf=workspace_sf,
+            )
+        else:
+            _module_for(device).minimax_h3_out_proj_nvfp4_schedule(
+                attn_out,
+                g_a,
+                w_q,
+                w_tiles,
+                alpha,
+                model["gate"],
+                idx,
+                residual,
+                out,
+                workspace_q,
+                workspace_sf,
+                full_units,
+            )
+        torch.cuda.synchronize()
+        return out
+
+    whole = run(-1)
+    for name, full_units in (
+        ("the host's schedule", None),
+        ("every tile as two half units", 0),
+        (f"a {tail}-tile tail", num_tiles - tail),
+    ):
+        assert torch.equal(run(full_units), whole), (
+            f"nvfp4 P={degree} M={rows}: {name} differs from the whole-tile program"
+        )
+
+
+# The BF16 and MXFP8 GEMMs have the same tail-split program, with their own host limits: the
+# NVFP4 cases plus 9648 rows = 798 tile pairs (a tail of half the co-resident pairs) and one
+# row (one pair of row tiles, so all 21 tile pairs are tail tiles).
+BF16_MXFP8_TAIL_SPLIT_CASES = [*TAIL_SPLIT_CASES, (9648, 4, 38), (1, 8, 21)]
+
+
+def check_tail_split_bitwise(run, rows: int, degree: int, tail: int, what: str) -> None:
+    """``run(full_units)`` returns the output of the host's schedule (None) or of a forced
+    one (-1: the whole-tile program; n >= 0: n whole-tile units, then half units)."""
+    num_tiles = _m_tiles(rows) // 2 * (MINIMAX_H3_HIDDEN // 256)
+    whole = run(-1)
+    for name, full_units in (
+        ("the host's schedule", None),
+        ("every tile as two half units", 0),
+        (f"a {tail}-tile tail", num_tiles - tail),
+    ):
+        assert torch.equal(run(full_units), whole), (
+            f"{what} P={degree} M={rows}: {name} differs from the whole-tile program"
+        )
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows,degree,tail", BF16_MXFP8_TAIL_SPLIT_CASES)
+def test_minimax_h3_out_proj_bf16_tail_split_bitwise(rows, degree, tail, model, device):
+    attn_out, idx, residual = make_inputs(
+        rows, degree, device, gate_rows=_gate_rows(model)
+    )
+
+    def run(full_units):
+        out = torch.empty(
+            (rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
+        )
+        if full_units is None:
+            minimax_h3_out_proj(
+                attn_out, model["o_weight"], model["gate"], idx, residual, out=out
+            )
+        else:
+            _module_for(device).minimax_h3_out_proj_schedule(
+                attn_out,
+                model["o_weight"],
+                model["gate"],
+                idx,
+                residual,
+                out,
+                full_units,
+            )
+        torch.cuda.synchronize()
+        return out
+
+    check_tail_split_bitwise(run, rows, degree, tail, "bf16")
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows,degree,tail", BF16_MXFP8_TAIL_SPLIT_CASES)
+def test_minimax_h3_out_proj_mxfp8_tail_split_bitwise(
+    rows, degree, tail, model, prepared_mxfp8, device
+):
+    attn_out, idx, residual = make_inputs(
+        rows, degree, device, gate_rows=_gate_rows(model)
+    )
+    w_q, w_tiles, _ = prepared_mxfp8
+
+    def run(full_units):
+        workspace_q = torch.empty(
+            (rows, MINIMAX_H3_ATTN_DIM), dtype=torch.float8_e4m3fn, device=device
+        )
+        workspace_sf = torch.zeros(
+            (mxfp8_activation_scale_workspace_bytes(rows),),
+            dtype=torch.uint8,
+            device=device,
+        )
+        out = torch.empty(
+            (rows, MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=device
+        )
+        if full_units is None:
+            minimax_h3_out_proj_mxfp8(
+                attn_out,
+                w_q,
+                w_tiles,
+                model["gate"],
+                idx,
+                residual,
+                out=out,
+                workspace_q=workspace_q,
+                workspace_sf=workspace_sf,
+            )
+        else:
+            _module_for(device).minimax_h3_out_proj_mxfp8_schedule(
+                attn_out,
+                w_q,
+                w_tiles,
+                model["gate"],
+                idx,
+                residual,
+                out,
+                workspace_q,
+                workspace_sf,
+                full_units,
+            )
+        torch.cuda.synchronize()
+        return out
+
+    check_tail_split_bitwise(run, rows, degree, tail, "mxfp8")
+
+
+@requires_blackwell
+@pytest.mark.parametrize("gate_rows", [3, MINIMAX_H3_GATE_ROWS])
+def test_minimax_h3_out_proj_invalid_index_rows_pass_residual(gate_rows, model, device):
+    rows = 300
+    if gate_rows != MINIMAX_H3_GATE_ROWS:
+        model = make_engine_model(model, gate_rows, device)
+    attn_out, idx, residual = make_inputs(rows, 2, device, gate_rows=gate_rows)
+    idx = idx.clone()
+    int64 = torch.iinfo(torch.int64)
+    bad = [-1, gate_rows, gate_rows + 1, -(2**40), 2**40, int64.min, int64.max]
+    idx[: len(bad)] = torch.tensor(bad, dtype=torch.int64, device=device)
     out = torch.full(
         (rows, MINIMAX_H3_HIDDEN), float("nan"), dtype=torch.bfloat16, device=device
     )
@@ -466,7 +713,8 @@ def test_minimax_h3_out_proj_invalid_index_rows_pass_residual(model, device):
     )
     torch.cuda.synchronize()
     assert returned.data_ptr() == out.data_ptr()
-    assert torch.equal(out[:3], residual[:3])
+    assert torch.equal(out[: len(bad)], residual[: len(bad)])
+    assert not torch.equal(out[len(bad) :], residual[len(bad) :])
     ref = minimax_h3_out_proj_reference(
         attn_out, model["o_weight"], model["gate"], idx, residual
     )
@@ -493,11 +741,43 @@ def test_minimax_h3_out_proj_rejects_bad_inputs(model, device):
         )
     with pytest.raises(ValueError):
         minimax_h3_out_proj(
-            attn_out, model["o_weight"], model["gate"], idx.long(), residual
-        )
-    with pytest.raises(ValueError):
-        minimax_h3_out_proj(
             attn_out,
             *args,
             out=torch.empty((8, 64), dtype=torch.bfloat16, device=device),
         )
+
+    def call(gate=model["gate"], index=idx):
+        minimax_h3_out_proj(attn_out, model["o_weight"], gate, index, residual)
+
+    # int32 indices are no longer part of the contract.
+    with pytest.raises(ValueError, match="gate_index"):
+        call(index=idx.int())
+    with pytest.raises(ValueError, match="gate_index"):
+        call(index=idx[:4])
+    # Gate table: wrong dtype, non-unit last stride, odd row pitch, misaligned base pointer.
+    with pytest.raises(ValueError, match="gate"):
+        call(gate=model["gate"].half())
+    with pytest.raises(ValueError, match="unit last stride"):
+        call(
+            gate=torch.empty(
+                (MINIMAX_H3_HIDDEN, 9), dtype=torch.bfloat16, device=device
+            ).t()
+        )
+    with pytest.raises(ValueError, match="row pitch"):
+        call(
+            gate=torch.empty(
+                (9, MINIMAX_H3_HIDDEN + 4), dtype=torch.bfloat16, device=device
+            )[:, :MINIMAX_H3_HIDDEN]
+        )
+    storage = torch.empty(
+        9 * MINIMAX_H3_HIDDEN + 8, dtype=torch.bfloat16, device=device
+    )
+    misaligned = storage[4 : 4 + 9 * MINIMAX_H3_HIDDEN].view(9, MINIMAX_H3_HIDDEN)
+    assert misaligned.data_ptr() % 16 == 8
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        call(gate=misaligned)
+    # An engine-layout gate table passes the validation layer (no launch here).
+    from flashinfer.diffusion_ops.minimax_h3_out_proj import _check_epilogue_inputs
+
+    engine = make_engine_model(model, 6, device)
+    _check_epilogue_inputs(engine["gate"], idx, residual, 8, device)

@@ -521,8 +521,8 @@ def fused_kda_decode(
 
     This operator fuses a width-four depthwise causal convolution with SiLU,
     one recurrent KDA update, and gated RMSNorm. It is specialized for
-    head dimension 128 and 8, 12, 24, 32, 48, or 96 heads. ``conv_state``
-    and ``state`` are updated in-place.
+    head dimension 128 and 8, 12, 16, 24, 32, 48, 64, or 96 heads.
+    ``conv_state`` and ``state`` are updated in-place.
 
     Slot zero is reserved as a null slot. Rows whose ``state_indices`` value
     is non-positive produce zeros and do not update either cache.
@@ -536,9 +536,12 @@ def fused_kda_decode(
             dtype float32.
         conv_state:
             Paged convolution cache with shape
-            ``[num_slots, 3 * H * 128, 3]`` and dtype bfloat16. Each slot must
-            use the sequence-dimension cache layout with strides
-            ``[slot_stride, 1, 3 * H * 128]``.
+            ``[num_slots, 3 * H * 128, 3]`` and dtype bfloat16. Each slot uses
+            either the sequence-dimension (SD) cache layout with strides
+            ``[slot_stride, 1, 3 * H * 128]`` or the dimension-first (DS)
+            layout with strides ``[slot_stride, 3, 1]``. Slots must start
+            8-byte aligned (``slot_stride`` a multiple of 4). The Cake backend
+            supports SD only.
         raw_gate:
             Raw per-channel recurrence gate with shape
             ``[1, num_rows, H, 128]`` and dtype bfloat16.
@@ -678,9 +681,10 @@ def packed_fused_kda_decode(
     T>1 fails closed. T>1 uses the SM10x CuTe DSL packed backend, which
     accepts float32 or bfloat16 recurrent state and requires a finite negative
     ``lower_bound``. Both paths require head dimension 128 and convolution
-    width four; T=1 accepts 8, 12, 24, 32, 48, or 96 heads and T>1 accepts
-    12, 24, 32, 48, or 96 heads. Other tensors follow :func:`fused_kda_decode`,
-    with the packed row count supplied by ``x``.
+    width four; T=1 accepts 8, 12, 16, 24, 32, 48, 64, or 96 heads and T>1
+    accepts 12, 16, 24, 32, 48, 64, or 96 heads. T>1 requires the SD
+    convolution-cache layout; the DS layout is T=1 only. Other tensors follow
+    :func:`fused_kda_decode`, with the packed row count supplied by ``x``.
 
     ``query_start_loc`` must be contiguous int32 of shape ``[N+1]``, start at
     zero, and contain nondecreasing offsets within ``x`` with active lengths no

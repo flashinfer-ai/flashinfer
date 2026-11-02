@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Native SM110 XQA ledger rows (tcgen05 and register-MMA routes) using FlashInfer's CUPTI cold-L2 timer.
+"""Native SM110 XQA ledger rows (the tmem / pair tree schedules and the D128 decode) using FlashInfer's CUPTI cold-L2 timer.
 
 This reports native latency samples, not a source/export equivalence audit.
 Compilation, allocation, and the FP32 oracle run outside measured replay.
@@ -19,7 +19,24 @@ import time
 import warnings
 
 
-def inputs_and_reference(shape, recipes):
+TREE_KERNELS = ("auto", "tmem", "pair")
+
+
+def pair_refused(shape, kernel):
+    """Whether ``prepare`` refuses the ``pair`` schedule for this ledger row, by
+    the two rules the package documents (``cake_jit.select_record``): ``pair``
+    serves E4M3 KV only, and only KV heads with an even number of 128-row Q
+    tiles (``ceil(query_tokens * Hq / Hkv / 128)``).  Decode rows and the other
+    schedules never refuse."""
+    if kernel != "pair" or shape["head_dim"] != 512:
+        return False
+    if shape["kv_dtype"] != "float8_e4m3fn":
+        return True
+    ratio = shape["query_heads"] // shape["kv_heads"]
+    return (-(-shape["query_tokens"] * ratio // 128)) % 2 == 1
+
+
+def inputs_and_reference(shape, recipes, kernel=None):
     import torch
 
     tree = shape["head_dim"] == 512
@@ -115,7 +132,7 @@ def inputs_and_reference(shape, recipes):
         outputs.append(value)
     expected = torch.stack(outputs).to(torch.float16)
     kwargs = dict(
-        kernel=shape.get("kernel", "tcgen05"),
+        kernel=(kernel if kernel is not None and tree else shape.get("kernel", "auto")),
         mask=mask,
         page_table=pages,
         page_size=shape["page_size"],
@@ -148,6 +165,11 @@ def main():
         "--warmup-iters", type=int, help="explicit warmup count instead of duration"
     )
     parser.add_argument("--repeat-iters", type=int, default=256)
+    parser.add_argument(
+        "--kernel",
+        choices=TREE_KERNELS,
+        help="run every tree row under this schedule instead of the ledger's (a row the schedule refuses is reported as unsupported)",
+    )
     args = parser.parse_args()
     if args.warmup_iters is not None:
         if args.warmup_iters < 1:
@@ -174,24 +196,18 @@ def main():
 
     import torch
     import flashinfer
-    from flashinfer.experimental.sm110_xqa.jit import get_manifest, require_sm110
+    from flashinfer.experimental.sm110_xqa.backend import require_sm110
     from flashinfer.sm110_xqa import prepare
     from flashinfer.testing import bench_gpu_time
 
     started = time.monotonic()  # Physical turnaround only; never GPU timing.
     require_sm110(torch.device("cuda", torch.cuda.current_device()))
-    manifest = get_manifest()
     ledger_bytes = args.ledger.read_bytes()
     ledger = json.loads(ledger_bytes)
-    if (
-        ledger["architecture"] != "sm_110a"
-        or ledger["shape_count"] != len(ledger["shapes"])
-        or [row["name"] for row in ledger["shapes"]] != manifest["shape_denominator"]
-        or hashlib.sha256(ledger_bytes).hexdigest() != manifest["shape_ledger_sha256"]
+    if ledger["architecture"] != "sm_110a" or ledger["shape_count"] != len(
+        ledger["shapes"]
     ):
-        raise ValueError(
-            "benchmark ledger must match the frozen manifest shape denominator"
-        )
+        raise ValueError("benchmark ledger must be a complete sm_110a shape ledger")
     if ledger["inputs"] != {
         "tree": {"distribution": "uniform", "minimum": -1.0, "maximum": 1.0, "seed": 0},
         "decode": {"distribution": "normal", "mean": 0.0, "std": 1.0, "seed": 0},
@@ -206,9 +222,7 @@ def main():
         "cuda": torch.version.cuda,
         "flashinfer": flashinfer.__version__,
         "cupti": cupti_version,
-        "manifest_sha256": hashlib.sha256(
-            json.dumps(manifest, sort_keys=True).encode()
-        ).hexdigest(),
+        "ledger_sha256": hashlib.sha256(ledger_bytes).hexdigest(),
         "timing": {
             "backend": "cupti",
             "cold_l2": True,
@@ -219,13 +233,36 @@ def main():
             "repeat_iters": args.repeat_iters,
             "activity_identity_audit": False,
         },
+        "kernel_override": args.kernel,
         "rows": [],
         "complete": False,
     }
     for shape in ledger["shapes"]:
         row_started = time.monotonic()
-        inputs, kwargs, expected = inputs_and_reference(shape, ledger["inputs"])
-        plan = prepare(*inputs, **kwargs)
+        inputs, kwargs, expected = inputs_and_reference(
+            shape, ledger["inputs"], args.kernel
+        )
+        try:
+            plan = prepare(*inputs, **kwargs)
+        except ValueError as refused:
+            if not pair_refused(shape, kwargs["kernel"]):
+                # Only the documented ``pair`` refusals skip a row; anything else
+                # is a benchmark failure, not an unsupported shape.
+                raise
+            row = {
+                "shape": shape,
+                "kernel": kwargs["kernel"],
+                "unsupported": str(refused),
+                "physical_seconds": time.monotonic() - row_started,
+            }
+            report["rows"].append(row)
+            report.update(
+                complete=len(report["rows"]) == len(ledger["shapes"]),
+                physical_seconds=time.monotonic() - started,
+            )
+            save(args.output, report)
+            print(json.dumps(row), flush=True)
+            continue
         torch.testing.assert_close(plan.run(), expected, atol=0.01, rtol=0.01)
         with warnings.catch_warnings():
             # The upstream CUPTI helper warns immediately before its fallback.
@@ -251,7 +288,10 @@ def main():
         torch.testing.assert_close(plan.run(), expected, atol=0.01, rtol=0.01)
         row = {
             "shape": shape,
+            "kernel": kwargs["kernel"],
             "route": plan.route,
+            "program": plan.program,
+            "grid": list(plan.grid),
             "correct": True,
             "median_us": 1000 * statistics.median(samples),
             "samples_ms": list(samples),

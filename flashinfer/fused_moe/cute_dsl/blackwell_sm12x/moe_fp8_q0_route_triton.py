@@ -246,11 +246,17 @@ def _fp8_q0_route_direct_kernel(
         pair_idx = token_idx * top_k + slot_idx
         routed_row = tl.load(dst_rows + pair_idx)
         scale_row = tl.load(scale_dst_rows + pair_idx)
-        tl.store(q_out + routed_row * s_qom + cols * s_qok, quant, mask=valid_cols)
+        # dst_rows is -1 for an unrouted (negative expert id) pair: no row to fill.
+        routed = routed_row >= 0
+        tl.store(
+            q_out + routed_row * s_qom + cols * s_qok,
+            quant,
+            mask=valid_cols & routed,
+        )
         tl.store(
             scale_out + scale_blocks * s_som + scale_row * s_sok,
             scales,
-            mask=scale_blocks < num_scale_blocks,
+            mask=(scale_blocks < num_scale_blocks) & routed,
         )
 
 

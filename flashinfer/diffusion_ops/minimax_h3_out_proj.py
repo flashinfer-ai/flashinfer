@@ -26,6 +26,8 @@ from ..jit.minimax_h3_out_proj import (
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
 from .minimax_h3_fc1_swiglu import (
+    _check_index,
+    _check_table,
     _scalar_f32,
     _swizzle_sf_128x4,
     _unswizzle_sf_128x4,
@@ -40,6 +42,9 @@ MINIMAX_H3_HEAD_DIM = 128
 MINIMAX_H3_ATTN_DIM = (
     MINIMAX_H3_NUM_HEADS * MINIMAX_H3_HEAD_DIM
 )  # 7168, the GEMM reduction
+# Production default gate table row count (3 modulation rows x 3 timestep groups) used by the
+# tests and benchmarks.  It is NOT a validation bound: the operators accept ``[rows, 5376]`` gate
+# tables with any ``rows >= 1`` and read the row count and row stride from the tensor.
 MINIMAX_H3_GATE_ROWS = 9
 MINIMAX_H3_SEQUENCE_PARALLEL_DEGREES = (1, 2, 4, 8)
 MINIMAX_H3_MAX_ROWS = 1 << 24
@@ -64,8 +69,6 @@ NVFP4_SF_K_TILES = NVFP4_SF_COLS // 4  # 112 tiles per 128-row block
 # Combined 256-row weight scale tiles: [n_tile][k_set][half][512 bytes].
 MXFP8_O_SCALE_TILE_BYTES = _N_TILES * MXFP8_SF_K_TILES * 2 * _SF_TILE_BYTES
 NVFP4_O_SCALE_TILE_BYTES = _N_TILES * NVFP4_SF_K_TILES * 2 * _SF_TILE_BYTES
-
-_REFERENCE_CHUNK_ROWS = 1024
 
 
 @functools.lru_cache(maxsize=None)
@@ -153,10 +156,14 @@ def _check_epilogue_inputs(
     rows: int,
     device: torch.device,
 ) -> None:
-    _check_tensor(
-        gate, "gate", (MINIMAX_H3_GATE_ROWS, MINIMAX_H3_HIDDEN), torch.bfloat16, device
-    )
-    _check_tensor(gate_index, "gate_index", (rows,), torch.int32, device)
+    _check_table(gate, "gate", device)
+    # The out_proj epilogue forms the gate table offset as a 32x32->64-bit multiply of the row index and
+    # the row pitch: rows must not overlap and the pitch must fit 32 bits.
+    if not MINIMAX_H3_HIDDEN <= gate.stride(0) < 2**32:
+        raise ValueError(
+            f"gate row stride must be in [{MINIMAX_H3_HIDDEN}, 2^32) elements, got {gate.stride(0)}"
+        )
+    _check_index(gate_index, "gate_index", rows, device)
     _check_tensor(
         residual, "residual", (rows, MINIMAX_H3_HIDDEN), torch.bfloat16, device
     )
@@ -210,77 +217,8 @@ def _scale_tiles(
 
 
 # --------------------------------------------------------------------------------------------
-# Layout helpers and pure-torch reference
+# Layout helpers
 # --------------------------------------------------------------------------------------------
-
-
-def minimax_h3_unpack_attn_out(attn_out: torch.Tensor) -> torch.Tensor:
-    r"""``[P, M, 56 // P, 128]`` receive layout -> the logical activation ``A`` ``[M, 7168]``
-    with ``A[m, h * 128 + d] = attn_out[h // (56 // P), m, h % (56 // P), d]`` (a copy; the
-    fused kernels never materialise it)."""
-    degree, rows = int(attn_out.shape[0]), int(attn_out.shape[1])
-    return (
-        attn_out.reshape(degree, rows, MINIMAX_H3_ATTN_DIM // degree)
-        .permute(1, 0, 2)
-        .reshape(rows, MINIMAX_H3_ATTN_DIM)
-    )
-
-
-def _gate_residual_epilogue(
-    o: torch.Tensor,
-    gate: torch.Tensor,
-    gate_index: torch.Tensor,
-    residual: torch.Tensor,
-) -> torch.Tensor:
-    idx = gate_index.to(torch.int64)
-    valid = (idx >= 0) & (idx < MINIMAX_H3_GATE_ROWS)
-    g = gate.index_select(0, idx.clamp(0, MINIMAX_H3_GATE_ROWS - 1))
-    g = torch.where(valid[:, None], g, torch.zeros_like(g))
-    p = (g * o).to(torch.bfloat16)  # BF16 x BF16: FP32 product, one rounding
-    return (residual + p).to(torch.bfloat16)
-
-
-def _reference_from_operands(
-    a: torch.Tensor,
-    w: torch.Tensor,
-    gate: torch.Tensor,
-    gate_index: torch.Tensor,
-    residual: torch.Tensor,
-    alpha: Optional[float] = None,
-) -> torch.Tensor:
-    """``out = BF16(residual + BF16(gate[idx] * BF16(alpha * a @ w^T)))`` with an FP32 GEMM
-    (TF32 disabled) over any float-convertible operands ``a`` ``[M, K]`` / ``w`` ``[N, K]``."""
-    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = False
-    try:
-        w_t = w.float().t()
-        o = torch.empty(
-            (a.shape[0], MINIMAX_H3_HIDDEN), dtype=torch.bfloat16, device=a.device
-        )
-        for r0 in range(0, a.shape[0], _REFERENCE_CHUNK_ROWS):
-            r1 = min(a.shape[0], r0 + _REFERENCE_CHUNK_ROWS)
-            h = a[r0:r1].float() @ w_t
-            if alpha is not None:
-                h = h * float(alpha)
-            o[r0:r1] = h.to(torch.bfloat16)
-        return _gate_residual_epilogue(o, gate, gate_index, residual)
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-
-
-def minimax_h3_out_proj_reference(
-    attn_out: torch.Tensor,
-    o_weight: torch.Tensor,
-    gate: torch.Tensor,
-    gate_index: torch.Tensor,
-    residual: torch.Tensor,
-) -> torch.Tensor:
-    r"""Pure-torch BF16 reference of :func:`minimax_h3_out_proj`: unpack the receive layout,
-    FP32 GEMM (TF32 disabled) rounded to BF16, indexed gate product rounded to BF16, residual sum
-    rounded to BF16."""
-    return _reference_from_operands(
-        minimax_h3_unpack_attn_out(attn_out), o_weight, gate, gate_index, residual
-    )
 
 
 def _weight_scale_tiles(sf_linear: torch.Tensor) -> torch.Tensor:
@@ -537,10 +475,12 @@ def minimax_h3_out_proj(
     BF16 exactly where the PyTorch module graph does::
 
         o   = BF16(A @ o_weight^T)                 # FP32 accumulation
-        p   = BF16(gate[gate_index[m]] * o)        # gate = 0 for an index outside [0, 9)
+        p   = BF16(gate[gate_index[m]] * o)        # gate = 0 for an index outside [0, rows)
         out = BF16(residual + p)
 
-    One persistent 2-CTA tcgen05 GEMM with the fused epilogue runs on the current stream.
+    One persistent 2-CTA tcgen05 GEMM with the fused epilogue runs on the current stream.  The
+    gate operands are the engine's own tensors (a column-chunk table view, int64 indices);
+    nothing is copied on the host.
 
     Parameters
     ----------
@@ -550,9 +490,14 @@ def minimax_h3_out_proj(
     o_weight : torch.Tensor
         Contiguous ``bfloat16`` ``[5376, 7168]`` output-projection weight (``nn.Linear`` layout).
     gate : torch.Tensor
-        ``bfloat16`` ``[9, 5376]`` gate table.
+        ``bfloat16`` ``[rows, 5376]`` gate table with any ``rows >= 1``.  ``stride(1)`` must be
+        ``1``; ``stride(0)`` may exceed ``5376`` (for example ``6 * 5376`` for a column chunk of
+        the engine's ``[rows, 6 * 5376]`` modulation projection) and must be a multiple of 8
+        elements (16 bytes); the data pointer must be 16-byte aligned.  The tensor is passed to
+        the kernel as it is, with its row count and row stride.
     gate_index : torch.Tensor
-        ``int32`` ``[M]`` table row per activation row.
+        Contiguous ``int64`` ``[M]`` table row per activation row.  Values in ``[0, rows)``
+        select a gate row; any other int64 value yields ``gate = 0`` (``out = residual``).
     residual : torch.Tensor
         Contiguous ``bfloat16`` ``[M, 5376]`` residual stream.
     out : Optional[torch.Tensor]
@@ -783,8 +728,6 @@ __all__ = [
     "minimax_h3_out_proj",
     "minimax_h3_out_proj_mxfp8",
     "minimax_h3_out_proj_nvfp4",
-    "minimax_h3_out_proj_reference",
-    "minimax_h3_unpack_attn_out",
     "mxfp8_activation_scale_workspace_bytes",
     "nvfp4_activation_scale_workspace_bytes",
     "prepare_minimax_h3_o_weight_mxfp8",

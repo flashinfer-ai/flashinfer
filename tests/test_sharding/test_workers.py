@@ -23,6 +23,32 @@ from scripts.test_sharding.workers import (
 )
 
 
+def test_descendant_scan_tolerates_exiting_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for pid, parent in [(30, 20), (20, 10), (40, 10)]:
+        process_dir = tmp_path / str(pid)
+        process_dir.mkdir()
+        (process_dir / "status").write_text(f"PPid:\t{parent}\n")
+    dying = tmp_path / "40" / "status"
+    real_stat, real_read = Path.stat, Path.read_text
+
+    def stat(path, *args, **kwargs):
+        if path == dying:
+            raise ProcessLookupError("process exited")
+        return real_stat(path, *args, **kwargs)
+
+    def read(path, *args, **kwargs):
+        if path == dying:
+            raise ProcessLookupError("process exited")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(Path, "read_text", read)
+    monkeypatch.setattr(workers_module, "Path", lambda path: tmp_path)
+    assert workers_module._descendant_pids(10) == {10, 20, 30}
+
+
 def test_abnormal_pytest_exit_does_not_finalize_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -32,7 +32,7 @@ Key differences from MXFP4:
 
 import functools
 import os
-from typing import Callable, Tuple, Union, cast
+from typing import Callable, Optional, Tuple, Union, cast
 
 import cutlass
 import cutlass.cute as cute
@@ -57,8 +57,11 @@ from ...cute_dsl.fp4_common import (
 )
 from ...cute_dsl.utils import get_num_sm
 from ..nvfp4_quantization_utils import (
+    nvfp4_4over6_cache_key,
+    _UNSET,
     NVFP44Over6Config,
-    current_nvfp4_4over6_config,
+    nvfp4_4over6_fp8_input_error,
+    resolve_nvfp4_4over6,
     env_flag_enabled as _env_flag_enabled,
 )
 from ..quantization_cute_dsl_utils import (
@@ -1876,9 +1879,8 @@ def _nvfp4_kernel_name(
     if disable_fp4_quant_fast_math:
         name += "_nofastmath"
     if nvfp4_4over6_config is not None:
-        cfg = nvfp4_4over6_config
-        err_mode = getattr(cfg.err_mode, "name", cfg.err_mode)
-        name += f"_4over6_{cfg.e4m3_max}_{err_mode}_{int(cfg.err_use_fast_math)}"
+        # The same token keys the MoE autotuner cache, so the two cannot drift.
+        name += f"_{nvfp4_4over6_cache_key(nvfp4_4over6_config)}"
     if fold_out_scale:
         name += "_folded"
     if threads is not None:
@@ -2505,12 +2507,49 @@ def _get_compiled_kernel_nvfp4_tma(
     return compiled_kernel, kernel_obj.rows_per_block
 
 
+def _nvfp4_outputs(
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    m: int,
+    k: int,
+    scale_output_size: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fresh ``(fp4 [m, k/2], flat scale [scale_output_size])`` buffers, or views of the
+    caller-owned ``out`` destinations (validated: dtype, contiguity, device, size)."""
+    if out is None:
+        return (
+            torch.empty(m, k // 2, dtype=torch.uint8, device=device),
+            torch.empty(scale_output_size, dtype=torch.uint8, device=device),
+        )
+    fp4_out, sf_out = out
+    for name, t in (("fp4_out", fp4_out), ("sf_out", sf_out)):
+        if t.dtype != torch.uint8 or not t.is_contiguous() or t.device != device:
+            raise ValueError(
+                f"nvfp4_quantize_cute_dsl out={name} must be a contiguous uint8 "
+                f"tensor on {device}"
+            )
+    if tuple(fp4_out.shape) != (m, k // 2):
+        raise ValueError(
+            f"nvfp4_quantize_cute_dsl out fp4 shape {tuple(fp4_out.shape)} != {(m, k // 2)}"
+        )
+    flat = sf_out.view(-1)
+    if flat.numel() < scale_output_size:
+        raise ValueError(
+            f"nvfp4_quantize_cute_dsl out scale buffer holds {flat.numel()} bytes, "
+            f"the selected kernel writes {scale_output_size}"
+        )
+    return fp4_out, flat[:scale_output_size]
+
+
 @flashinfer_api
 def nvfp4_quantize_cute_dsl(
     input: torch.Tensor,
     global_scale: float | torch.Tensor,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to NVFP4 format using the CuTe-DSL kernel.
 
@@ -2538,6 +2577,22 @@ def nvfp4_quantize_cute_dsl(
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Auto-detected
         from device capability (SM >= 9.0) when ``None``.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off. The environment is ignored.
+        - :class:`NVFP44Over6Config`: on with exactly that recipe. The
+          environment is ignored.
+
+    out : (torch.Tensor, torch.Tensor), optional
+        Caller-owned destinations ``(fp4_out, sf_out)``: ``fp4_out`` a contiguous
+        ``uint8 [M, K/2]`` view, ``sf_out`` a contiguous ``uint8`` buffer whose
+        flat prefix receives the scale factors (it must hold at least the padded
+        scale size of the selected path; with the linear layout and M below the
+        TMA crossover that is exactly ``M * K/16``). The kernels write straight
+        into them (no extra copy); the returned tensors are views of them.
 
     Returns
     -------
@@ -2572,6 +2627,12 @@ def nvfp4_quantize_cute_dsl(
         f"K ({k}) must be divisible by NVFP4_SF_VEC_SIZE={NVFP4_SF_VEC_SIZE}"
     )
 
+    # Resolve before the empty-input return so an invalid or fp8-incompatible
+    # recipe is rejected (and the environment shim warns) regardless of shape.
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
+    if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
+        raise nvfp4_4over6_fp8_input_error(input.dtype)
+
     # Return explicit empty shapes before compiling or launching. In
     # particular, K == 0 would make _compute_optimal_threads divide by zero.
     if m == 0 or k == 0:
@@ -2580,6 +2641,12 @@ def nvfp4_quantize_cute_dsl(
             padded_sf_cols = num_sf_blocks_per_row
         else:
             padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
+        if out is not None:
+            # Same contract as a launch: validated views of the caller's buffers.
+            fp4_output, scale_output = _nvfp4_outputs(
+                out, m, k, m * padded_sf_cols, input.device
+            )
+            return fp4_output, scale_output.view(m, padded_sf_cols)
         return (
             torch.empty((m, k // 2), dtype=torch.uint8, device=input.device),
             torch.empty((m, padded_sf_cols), dtype=torch.uint8, device=input.device),
@@ -2615,9 +2682,8 @@ def nvfp4_quantize_cute_dsl(
     disable_fp4_quant_fast_math = _env_flag_enabled(
         "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
     )
-    nvfp4_4over6_config = current_nvfp4_4over6_config()
-    if nvfp4_4over6_config is not None and input.dtype == torch.float8_e4m3fn:
-        raise ValueError("FLASHINFER_NVFP4_4OVER6 requires fp16 or bf16 input")
+    # The TMA kernel has no recipe parameter, so it is only eligible for
+    # standard NVFP4.
     is_sm107 = get_compute_capability(input.device) == (10, 7)
     use_tma = (
         _should_use_tma(
@@ -2662,9 +2728,8 @@ def nvfp4_quantize_cute_dsl(
             (padded_m + rows_per_block - 1) // rows_per_block, tma_target_grid
         )
 
-        fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(
-            scale_output_size, dtype=torch.uint8, device=input.device
+        fp4_output, scale_output = _nvfp4_outputs(
+            out, m, k, scale_output_size, input.device
         )
 
         kernel_fn(
@@ -2723,9 +2788,8 @@ def nvfp4_quantize_cute_dsl(
             target_grid,
         )
 
-        fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(
-            scale_output_size, dtype=torch.uint8, device=input.device
+        fp4_output, scale_output = _nvfp4_outputs(
+            out, m, k, scale_output_size, input.device
         )
 
         kernel_fn(
@@ -2746,9 +2810,8 @@ def nvfp4_quantize_cute_dsl(
         padded_sf_cols = ((num_sf_blocks_per_row + 3) // 4) * 4
         scale_output_size = padded_m * padded_sf_cols
 
-        fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
-        scale_output = torch.empty(
-            scale_output_size, dtype=torch.uint8, device=input.device
+        fp4_output, scale_output = _nvfp4_outputs(
+            out, m, k, scale_output_size, input.device
         )
 
         use_tile = (
@@ -2810,8 +2873,14 @@ def nvfp4_quantize_smooth_cute_dsl(
     pre_quant_scale: torch.Tensor,
     global_scale: torch.Tensor,
     enable_pdl: bool | None = None,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fuse BF16 channel smoothing into the 128x4 NVFP4 quantizer."""
+    """Fuse BF16 channel smoothing into the 128x4 NVFP4 quantizer.
+
+    ``nvfp4_4over6`` follows the same three-state contract as
+    :func:`nvfp4_quantize_cute_dsl`.
+    """
     from ...utils import device_support_pdl
 
     if input.ndim != 2 or input.dtype != torch.bfloat16 or not input.is_cuda:
@@ -2836,6 +2905,8 @@ def nvfp4_quantize_smooth_cute_dsl(
         pre_quant_scale = pre_quant_scale.clone()
     global_scale_arg = global_scale.float().reshape(1).contiguous().to(input.device)
     enable_pdl = device_support_pdl(input.device) if enable_pdl is not False else False
+    # Resolved before the empty-input return, see nvfp4_quantize_cute_dsl.
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
 
     num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
     padded_m = _round_up(m, ROW_TILE_SIZE)
@@ -2855,7 +2926,7 @@ def nvfp4_quantize_smooth_cute_dsl(
         SF_LAYOUT_128x4,
         enable_pdl,
         _env_flag_enabled("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"),
-        current_nvfp4_4over6_config(),
+        nvfp4_4over6_config,
         global_scale_is_tensor=True,
         smooth_quant=True,
     )
@@ -2881,6 +2952,8 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
     global_scale: torch.Tensor,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Apply SwiGLU and NVFP4 quantization using CuTe-DSL.
 
@@ -2897,6 +2970,14 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
         Scale layout: 0 for 128x4, 1 for 8x4, or 2 for linear.
     enable_pdl : bool, optional
         Enable Programmatic Dependent Launch. Auto-detected when None.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off. The environment is ignored.
+        - :class:`NVFP44Over6Config`: on with exactly that recipe. The
+          environment is ignored.
 
     Returns
     -------
@@ -2931,6 +3012,8 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
     m = 1
     for dim in input.shape[:-1]:
         m *= int(dim)
+    # Resolved before the empty-input return, see nvfp4_quantize_cute_dsl.
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
 
     # Return empty outputs without compiling or launching.
     if m == 0 or k == 0:
@@ -2971,7 +3054,6 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
     disable_fp4_quant_fast_math = _env_flag_enabled(
         "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
     )
-    nvfp4_4over6_config = current_nvfp4_4over6_config()
 
     # SwiGLU fusion uses the non-TMA vectorized-load kernels only.
     kernel_fn, block_unit = _get_compiled_kernel_nvfp4(
@@ -3055,6 +3137,8 @@ def nvfp4_quantize_per_token_cute_dsl(
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
     out_scale: torch.Tensor | None = None,
+    # Appended last so existing positional construction keeps working.
+    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Per-token NVFP4 activation quantization using the CuTe-DSL kernel.
 
@@ -3092,6 +3176,14 @@ def nvfp4_quantize_per_token_cute_dsl(
         ``per_token_scale`` is multiplied by, folded in by the kernel so a
         downstream output scalar needs no separate pass. Does not change
         ``fp4_output`` or ``scale_output``.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
+
+        - omitted (the default): read the legacy ``FLASHINFER_NVFP4_4OVER6*``
+          environment variables.
+        - ``None``: 4over6 off. The environment is ignored.
+        - :class:`NVFP44Over6Config`: on with exactly that recipe. The
+          environment is ignored.
 
     Returns
     -------
@@ -3157,7 +3249,7 @@ def nvfp4_quantize_per_token_cute_dsl(
     disable_fp4_quant_fast_math = _env_flag_enabled(
         "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH"
     )
-    nvfp4_4over6_config = current_nvfp4_4over6_config()
+    nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
 
     fold_out_scale = out_scale is not None
     if fold_out_scale:

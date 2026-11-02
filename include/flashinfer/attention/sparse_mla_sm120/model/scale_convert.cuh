@@ -113,3 +113,8 @@ __device__ __forceinline__ uint8_t KVCacheTraits<ModelType::DSV4>::scale_to_ue8m
 __device__ __forceinline__ uint8_t KVCacheTraits<ModelType::DSV4_1>::scale_to_ue8m0(uint8_t scale) {
   return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
 }
+
+__device__ __forceinline__ uint8_t
+KVCacheTraits<ModelType::DSV4_1_INLINE>::scale_to_ue8m0(uint8_t scale) {
+  return ScaleConvert<Scales::FORMAT>::to_ue8m0(scale);
+}

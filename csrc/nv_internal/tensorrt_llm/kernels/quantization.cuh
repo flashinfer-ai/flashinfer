@@ -220,12 +220,14 @@ constexpr int CVT_FP8_TO_FP4_ELTS_PER_THREAD = 16;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // FP4/MXFP8 Quantization Kernels
 
+// LOADS_IN_FLIGHT: input vectors loaded per thread before converting (1 = original schedule).
 template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
           bool USE_ROW_WISE_SCALE = false, bool USE_INVERSE_SCALE = false,
-          bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
+          bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type,
+          int LOADS_IN_FLIGHT = 1>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-__launch_bounds__(512, 4) quantize_with_block_size(
+__launch_bounds__(512, (LOADS_IN_FLIGHT > 1 ? 2 : 4)) quantize_with_block_size(
 #else
 quantize_with_block_size(
 #endif
@@ -255,21 +257,6 @@ quantize_with_block_size(
       !IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value || SF_VEC_SIZE == CVT_FP4_SF_VEC_SIZE,
       "NVFP4 4over6 requires NVFP4 scale blocks");
 
-  // Get the caller-provided global scaling factor, which will be applied to the SF.
-  float SFScaleVal = 1.0f;
-  if constexpr (!USE_ROW_WISE_SCALE) {
-    if (SFScale != nullptr) {
-      SFScaleVal = *SFScale;
-      if constexpr (USE_INVERSE_SCALE) {
-        if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
-          SFScaleVal = __fdiv_rn(1.0f, SFScaleVal);
-        } else {
-          SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
-        }
-      }
-    }
-  }
-
   // Is it swizzled layout?
   bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
                             layout == QuantizationSFLayout::SWIZZLED_8x4;
@@ -285,7 +272,22 @@ quantize_with_block_size(
   int numPaddedColThreads = numPaddedCols / ELTS_PER_THREAD;
   int numColThreadsForSf = numColsForSf / ELTS_PER_THREAD;
 
-  asm volatile("griddepcontrol.wait;");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
+  // Get the caller-provided global scaling factor, which will be applied to the SF.
+  float SFScaleVal = 1.0f;
+  if constexpr (!USE_ROW_WISE_SCALE) {
+    if (SFScale != nullptr) {
+      SFScaleVal = *SFScale;
+      if constexpr (USE_INVERSE_SCALE) {
+        if constexpr (DISABLE_FP4_QUANT_FAST_MATH) {
+          SFScaleVal = __fdiv_rn(1.0f, SFScaleVal);
+        } else {
+          SFScaleVal = reciprocal_approximate_ftz(SFScaleVal);
+        }
+      }
+    }
+  }
 
   // Input tensor batch/row/col loops.
   // Optimization: Iterate over actual rows first (hot path), then padding rows (cold path)
@@ -332,59 +334,84 @@ quantize_with_block_size(
     } else {
       // Normal path: This row contains actual data
       for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
-        for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
-          std::optional<int> optionalBatchIdx = batchIdx;
-          std::optional<int> optionalNumRows = numRows;
-
-          // The SF output pointer.
-          auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
-              optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numColsForSf / SF_VEC_SIZE, SFout,
-              layout);
-
-          // The input tensor offset.
-          int64_t inOffset =
-              static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
-          int64_t outOffset =
-              static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
-
-          // Set the values to 0 of those are padded columns.
-          if (colIdx >= numColThreads && colIdx < numPaddedColThreads) {
-            // Dispatch the quantization kernel.
-            if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
-              reinterpret_cast<FP4OutT*>(out)[outOffset] = FP4OutT{0};
-            } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
-              reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
-            } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
-              reinterpret_cast<MxFp8OutT*>(out)[outOffset] = MxFp8OutT{};
+        for (int colBase = threadIdx.x; colBase < numColThreadsForSf;
+             colBase += blockDim.x * LOADS_IN_FLIGHT) {
+          PackedVecT in_vecs[LOADS_IN_FLIGHT];
+          if constexpr (LOADS_IN_FLIGHT > 1) {
+#pragma unroll
+            for (int u = 0; u < LOADS_IN_FLIGHT; ++u) {
+              int const colIdx = colBase + u * blockDim.x;
+              if (colIdx < numColThreads) {
+                loadPackedVec(
+                    in_vecs[u],
+                    reinterpret_cast<PackedVecT const*>(in) +
+                        static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx);
+              }
             }
           }
-
-          // Process actual data or padding
-          if (colIdx >= numColThreads) {
-            // Column padding: Set the SF padding to 0.
-            if (sf_out != nullptr) {
-              sf_out[0] = 0x00;
+#pragma unroll
+          for (int u = 0; u < LOADS_IN_FLIGHT; ++u) {
+            int const colIdx = colBase + u * blockDim.x;
+            if (colIdx >= numColThreadsForSf) {
+              break;
             }
-          } else {
-            // Load the input vector.
-            PackedVecT in_vec;
-            loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
+            std::optional<int> optionalBatchIdx = batchIdx;
+            std::optional<int> optionalNumRows = numRows;
 
-            // Dispatch the quantization kernel.
-            if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
-              reinterpret_cast<FP4OutT*>(out)[outOffset] =
-                  cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
-                                       DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
-                      in_vec, SFScaleVal, sf_out);
-            } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
-              reinterpret_cast<uint64_t*>(out)[outOffset] =
-                  cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
-                      in_vec, SFScaleVal, sf_out);
-            } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
-              reinterpret_cast<MxFp8OutT*>(out)[outOffset] =
-                  cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, ELTS_PER_THREAD>(in_vec, sf_out);
+            // The SF output pointer.
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, CVT_NUM_THREADS_PER_SF>(
+                optionalBatchIdx, rowIdx, colIdx, optionalNumRows, numColsForSf / SF_VEC_SIZE,
+                SFout, layout);
+
+            // The input tensor offset.
+            int64_t inOffset =
+                static_cast<int64_t>(batchIdx * numRows + rowIdx) * numColThreads + colIdx;
+            int64_t outOffset =
+                static_cast<int64_t>(batchIdx * numRows + rowIdx) * numPaddedColThreads + colIdx;
+
+            // Set the values to 0 of those are padded columns.
+            if (colIdx >= numColThreads && colIdx < numPaddedColThreads) {
+              // Dispatch the quantization kernel.
+              if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
+                reinterpret_cast<FP4OutT*>(out)[outOffset] = FP4OutT{0};
+              } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
+                reinterpret_cast<uint64_t*>(out)[outOffset] = 0ull;
+              } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
+                reinterpret_cast<MxFp8OutT*>(out)[outOffset] = MxFp8OutT{};
+              }
             }
-          }
+
+            // Process actual data or padding
+            if (colIdx >= numColThreads) {
+              // Column padding: Set the SF padding to 0.
+              if (sf_out != nullptr) {
+                sf_out[0] = 0x00;
+              }
+            } else {
+              PackedVecT in_vec;
+              if constexpr (LOADS_IN_FLIGHT == 1) {
+                // Load the input vector.
+                loadPackedVec(in_vec, reinterpret_cast<PackedVecT const*>(in) + inOffset);
+              } else {
+                in_vec = in_vecs[u];
+              }
+
+              // Dispatch the quantization kernel.
+              if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4) {
+                reinterpret_cast<FP4OutT*>(out)[outOffset] =
+                    cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF,
+                                         DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(
+                        in_vec, SFScaleVal, sf_out);
+              } else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4) {
+                reinterpret_cast<uint64_t*>(out)[outOffset] =
+                    cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, ELTS_PER_THREAD, UE8M0_SF>(
+                        in_vec, SFScaleVal, sf_out);
+              } else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8) {
+                reinterpret_cast<MxFp8OutT*>(out)[outOffset] =
+                    cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, ELTS_PER_THREAD>(in_vec, sf_out);
+              }
+            }
+          }  // u
         }
       }
     }
@@ -447,6 +474,20 @@ quantize_with_block_size_tma(
   auto empty_barriers =
       PatternVisitor([=](const uint32_t& i) { return barrier_start_ptr + (NUM_STAGES + i); });
 
+  // Is it swizzled layout?
+  bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
+                            layout == QuantizationSFLayout::SWIZZLED_8x4;
+
+  // The number of padded rows considering 128x4 or 8x4 SF layout.
+  int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
+  int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, rowTile) : numRows;
+  int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
+
+  // Work items are (batch, 16-row tile) pairs.
+  int const numRowTiles = (numPaddedRowsForSf + TMA_ROW_TILE - 1) / TMA_ROW_TILE;
+
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+
   // Get the global scaling factor
   float SFScaleVal = 1.0f;
   if constexpr (!USE_ROW_WISE_SCALE) {
@@ -461,17 +502,6 @@ quantize_with_block_size_tma(
       }
     }
   }
-
-  // Is it swizzled layout?
-  bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED_128x4 ||
-                            layout == QuantizationSFLayout::SWIZZLED_8x4;
-
-  // The number of padded rows considering 128x4 or 8x4 SF layout.
-  int rowTile = (layout == QuantizationSFLayout::SWIZZLED_128x4) ? 128 : 8;
-  int numPaddedRowsForSf = isSfSwizzledLayout ? PadUpFn(numRows, rowTile) : numRows;
-  int numColsForSf = isSfSwizzledLayout ? PadUpFn(numPaddedCols, 4 * SF_VEC_SIZE) : numPaddedCols;
-
-  asm volatile("griddepcontrol.wait;");
 
   // TMA barrier initialization.
   if (warpIdx == 0 and laneIdx == 0) {
@@ -492,9 +522,10 @@ quantize_with_block_size_tma(
 
   if (warpIdx == 0 and elect_one_sync()) {
     // Producer warp - TMA loads
-    for (int rowIdx = blockIdx.x * TMA_ROW_TILE; rowIdx < numPaddedRowsForSf;
-         rowIdx += gridDim.x * TMA_ROW_TILE) {
-      for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
+    for (int tileIdx = blockIdx.x; tileIdx < numRowTiles * numbatches; tileIdx += gridDim.x) {
+      {
+        int const rowIdx = (tileIdx % numRowTiles) * TMA_ROW_TILE;
+        int const batchIdx = tileIdx / numRowTiles;
         for (int colIdx = 0; colIdx < numCols; colIdx += NUM_CONSUMER_WARPS * TMA_COL_TILE) {
           empty_barriers[stage_idx]->wait(phase);
 
@@ -516,9 +547,10 @@ quantize_with_block_size_tma(
     int consumerWarpIdx = warpIdx - 1;
     typename Traits::ThreadIndexing tidx(laneIdx, consumerWarpIdx);
 
-    for (int rowIdx = blockIdx.x * TMA_ROW_TILE; rowIdx < numPaddedRowsForSf;
-         rowIdx += gridDim.x * TMA_ROW_TILE) {
-      for (int batchIdx = 0; batchIdx < numbatches; batchIdx++) {
+    for (int tileIdx = blockIdx.x; tileIdx < numRowTiles * numbatches; tileIdx += gridDim.x) {
+      {
+        int const rowIdx = (tileIdx % numRowTiles) * TMA_ROW_TILE;
+        int const batchIdx = tileIdx / numRowTiles;
         std::optional<int> optionalBatchIdx = batchIdx;
         std::optional<int> optionalNumRows = numRows;
         tidx.reset();  // Reset column indices for each row iteration
@@ -559,9 +591,10 @@ quantize_with_block_size_tma(
               reinterpret_cast<uint64_t*>(out)[threadOutOffset] = 0ull;
             }
 
-            // Set SF padding to 0
+            // Set SF padding to 0. The last row tile can extend past the padded SF rows,
+            // which have no slot in the scale-factor buffer.
             if (threadRowIdxGlobal >= numRows || tidx.colIdx >= numCols) {
-              if (sf_out != nullptr) {
+              if (sf_out != nullptr && threadRowIdxGlobal < numPaddedRowsForSf) {
                 sf_out[0] = 0x00;
               }
             } else {
@@ -718,6 +751,134 @@ cvt_fp16_to_fp4_expert(
                              DISABLE_FP4_QUANT_FAST_MATH, NVFP4_4OVER6_CONFIG>(in_vec, SFScaleVal,
                                                                                sf_out);
   }
+#endif
+}
+
+// MXFP8 quantization of an expert-major, masked batch, optionally fused with SiLU-and-mul.
+//
+// in:    [numExperts, numRows, numCols], or [numExperts, numRows, 2 * numCols] (gate then up)
+//        when USE_SILU_AND_MUL is set.
+// out:   [numExperts, numRows, numPaddedCols] e4m3; padded columns are zero.
+// SFout: per expert, [round_up(numRows, 128), numPaddedCols / 32] UE8M0 scales, 128x4 swizzled;
+//        padded columns get scale byte 0.
+// mask:  [numExperts]; only the first min(mask[e], numRows) rows of expert e are read and written.
+//
+// The valid rows of all experts form one list, so a skewed mask still spreads over the whole grid.
+// blockIdx.x and threadIdx.y stride over the list, threadIdx.x over the half scale blocks of a row.
+// Two lanes quantize a scale block and shuffle its maximum within the warp, so a warp holds one row
+// and every lane runs every column iteration. With at most 32 experts each warp keeps the experts'
+// first rows in registers; otherwise the block keeps them in numExperts + 1 int32 of dynamic
+// shared memory.
+template <class Type, bool USE_SILU_AND_MUL>
+__global__ void cvt_fp16_to_mxfp8_expert(int32_t numExperts, int32_t numRows, int32_t numCols,
+                                         int32_t numPaddedCols, Type const* in, int32_t const* mask,
+                                         uint8_t* out, uint32_t* SFout) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  static constexpr int SF_VEC_SIZE = 32;
+  // Half a scale block, read with one 32-byte load.
+  using HalfBlockT = PackedVec<Type, SF_VEC_SIZE / 2>;
+  static_assert(sizeof(HalfBlockT) == sizeof(PackedU32x8));
+  extern __shared__ int32_t expertFirstRow[];
+
+  int const numHalfBlocks = numCols / (SF_VEC_SIZE / 2);
+  int const numPaddedHalfBlocks = numPaddedCols / (SF_VEC_SIZE / 2);
+  int const numInHalfBlocks = USE_SILU_AND_MUL ? 2 * numHalfBlocks : numHalfBlocks;
+  auto const quantizeRow = [&](int expertIdx, int rowIdx) {
+    // Non-negative indices let the scale-offset math use shifts instead of signed division.
+    __builtin_assume(rowIdx >= 0);
+    int64_t const rowOffset = static_cast<int64_t>(expertIdx) * numRows + rowIdx;
+    HalfBlockT const* inRow = reinterpret_cast<HalfBlockT const*>(in) + rowOffset * numInHalfBlocks;
+    for (int colBase = 0; colBase < numPaddedHalfBlocks; colBase += blockDim.x) {
+      int const colIdx = colBase + threadIdx.x;
+      HalfBlockT vec;
+      if (colIdx < numHalfBlocks) {
+        loadPackedVec(vec, inRow + colIdx);
+        if constexpr (USE_SILU_AND_MUL) {
+          HalfBlockT upVec;
+          loadPackedVec(upVec, inRow + numHalfBlocks + colIdx);
+          silu_and_mul<Type, SF_VEC_SIZE / 2>(vec, upVec);
+        }
+      } else {
+        reinterpret_cast<PackedU32x8&>(vec) = PackedU32x8{};
+      }
+      uint8_t* sfOut = nullptr;
+      if (colIdx < numPaddedHalfBlocks) {
+        sfOut = cvt_quant_get_sf_out_offset<uint32_t, 2>(expertIdx, rowIdx, colIdx, numRows,
+                                                         numPaddedCols / SF_VEC_SIZE, SFout,
+                                                         QuantizationSFLayout::SWIZZLED_128x4);
+      }
+      uint4 const outVec = cvt_warp_fp16_to_mxfp8<Type, SF_VEC_SIZE, SF_VEC_SIZE / 2>(vec, sfOut);
+      if (colIdx < numPaddedHalfBlocks) {
+        reinterpret_cast<uint4*>(out)[rowOffset * numPaddedHalfBlocks + colIdx] = outVec;
+      }
+    }
+  };
+
+  cudaGridDependencySynchronize();
+
+  int const tid = threadIdx.y * blockDim.x + threadIdx.x;
+  int const laneIdx = tid % 32;
+  int const listBegin = blockIdx.x * blockDim.y + threadIdx.y;
+  int const listStride = gridDim.x * blockDim.y;
+  // Inclusive warp scan of value; every lane passes the same carry.
+  auto const warpScan = [&](int value, int carry) {
+#pragma unroll
+    for (int offset = 1; offset < 32; offset *= 2) {
+      int const prev = __shfl_up_sync(0xffffffffu, value, offset);
+      value += laneIdx >= offset ? prev : 0;
+    }
+    return value + carry;
+  };
+
+  if (numExperts <= 32) {
+    int const count = laneIdx < numExperts ? max(0, min(mask[laneIdx], numRows)) : 0;
+    int const lastRow = warpScan(count, 0);
+    int const firstRow = lastRow - count;
+    int const numValidRows = __shfl_sync(0xffffffffu, lastRow, 31);
+    for (int listIdx = listBegin; listIdx < numValidRows; listIdx += listStride) {
+      // The row's expert is the last one whose first row is at most listIdx.
+      int const expertIdx =
+          __popc(__ballot_sync(0xffffffffu, laneIdx < numExperts && firstRow <= listIdx)) - 1;
+      quantizeRow(expertIdx, listIdx - __shfl_sync(0xffffffffu, firstRow, expertIdx));
+    }
+  } else {
+    for (int e = tid; e < numExperts; e += blockDim.x * blockDim.y) {
+      expertFirstRow[e + 1] = max(0, min(mask[e], numRows));
+    }
+    __syncthreads();
+    if (tid < 32) {
+      int carry = 0;
+      for (int base = 0; base < numExperts; base += 32) {
+        int const e = base + laneIdx;
+        int const lastRow = warpScan(e < numExperts ? expertFirstRow[e + 1] : 0, carry);
+        if (e < numExperts) {
+          expertFirstRow[e + 1] = lastRow;
+        }
+        carry = __shfl_sync(0xffffffffu, lastRow, 31);
+      }
+      if (laneIdx == 0) {
+        expertFirstRow[0] = 0;
+      }
+    }
+    __syncthreads();
+    int const numValidRows = expertFirstRow[numExperts];
+    for (int listIdx = listBegin; listIdx < numValidRows; listIdx += listStride) {
+      // The row's expert is the last one whose first row is at most listIdx; the first rows are
+      // non-decreasing, so the warp counts them 32 at a time.
+      int expertIdx = -1;
+      for (int base = 0; base < numExperts; base += 32) {
+        int const e = base + laneIdx;
+        unsigned const atOrBefore =
+            __ballot_sync(0xffffffffu, e < numExperts && expertFirstRow[e] <= listIdx);
+        expertIdx += __popc(atOrBefore);
+        if (atOrBefore != 0xffffffffu) {
+          break;
+        }
+      }
+      quantizeRow(expertIdx, listIdx - expertFirstRow[expertIdx]);
+    }
+  }
+  cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 

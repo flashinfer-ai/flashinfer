@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from flashinfer.concat_ops import concat_mla_k
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.utils import get_compute_capability
 
 NUM_LOCAL_HEADS = 128
@@ -175,8 +176,11 @@ def _make_cake_tensors(
 def _require_cake_concat_mla_k() -> None:
     if not torch.cuda.is_available():
         pytest.skip("Cake concat MLA K requires CUDA")
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
-        pytest.skip("Cake concat MLA K requires SM100 or SM103")
+    capability = get_compute_capability(torch.device("cuda"))
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake concat MLA K requires SM100, SM103 or SM107")
+    if capability == (10, 7) and not is_cuda_version_at_least("13.0"):
+        pytest.skip("Cake concat MLA K on SM107 requires CUDA 13.0 or newer")
 
 
 # ────────────────────────── Core correctness tests ──────────────────────────
@@ -358,49 +362,139 @@ def test_cake_concat_mla_k_full_contract(
     )
 
 
-def test_cake_concat_mla_k_selects_sm100f_on_cc100(monkeypatch):
-    from flashinfer.jit import cake_concat_mla_k
+@pytest.mark.parametrize("num_tokens", [1, 1024])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_cake_concat_mla_k_is_cuda_graph_safe(num_tokens: int, dtype: torch.dtype):
+    """Capture the Cake route once and replay it on fresh input bytes: byte-exact vs eager."""
 
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
-    monkeypatch.setattr(
-        "flashinfer.jit.cpp_ext.is_cuda_version_at_least",
-        lambda version: version == "12.9",
-    )
-
-    assert cake_concat_mla_k.cake_concat_mla_k_target(torch.device("cuda")) == (
-        "sm100f"
-    )
+    _require_cake_concat_mla_k()
+    torch.manual_seed(23)
+    k, k_nope, k_rope = _make_cake_tensors(num_tokens, dtype, "contiguous", False)
+    concat_mla_k(
+        k, k_nope, k_rope, backend="cake"
+    )  # JIT load + warm-up outside the capture
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        concat_mla_k(k, k_nope, k_rope, backend="cake")
+    torch.cuda.current_stream().wait_stream(stream)
+    for seed in (29, 31):
+        torch.manual_seed(seed)
+        _, fresh_nope, fresh_rope = _make_cake_tensors(
+            num_tokens, dtype, "contiguous", False
+        )
+        k_nope.copy_(fresh_nope)
+        k_rope.copy_(fresh_rope)
+        k.fill_(0)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = torch.empty_like(k)
+        expected[..., :QK_NOPE_HEAD_DIM] = k_nope
+        expected[..., QK_NOPE_HEAD_DIM:] = k_rope.expand(
+            num_tokens, NUM_LOCAL_HEADS, -1
+        )
+        assert torch.equal(
+            k.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+        )
 
 
 @pytest.mark.parametrize(
-    ("target", "target_arch", "expected_compute", "forbidden_compute"),
+    ("capability", "target"),
+    [((10, 0), "sm_100a"), ((10, 3), "sm_103a"), ((10, 7), "sm_107a")],
+)
+def test_cake_concat_mla_k_selects_the_exact_target(monkeypatch, capability, target):
+    from flashinfer import concat_ops
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
+    monkeypatch.setattr(
+        "flashinfer.jit.cpp_ext.is_cuda_version_at_least", lambda version: True
+    )
+
+    assert concat_ops.cake_concat_mla_k_target(torch.device("cuda")) == target
+
+
+def test_cake_concat_mla_k_sm_107a_needs_cuda_13(monkeypatch):
+    from flashinfer import concat_ops
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 7))
+    monkeypatch.setattr(
+        "flashinfer.jit.cpp_ext.is_cuda_version_at_least", lambda version: False
+    )
+    with pytest.raises(RuntimeError, match="CUDA 13.0"):
+        concat_ops.cake_concat_mla_k_target(torch.device("cuda"))
+
+
+def test_cake_concat_mla_k_programs_ship_their_targets():
+    from flashinfer.jit import cake_program
+    from flashinfer.jit.cake_concat_mla_k import ONE_CTA, PROGRAMS, SPLIT
+
+    assert PROGRAMS == (ONE_CTA, SPLIT)
+    assert ONE_CTA.targets == ("sm_100a", "sm_103a", "sm_107a")
+    assert SPLIT.targets == ("sm_107a",)
+    for program in PROGRAMS:
+        for target in program.targets:
+            flags = program.spec(target).extra_cuda_cflags
+            assert all(flag in flags for flag in cake_program.TARGET_FLAGS[target])
+    kernel_sources = {
+        program: next(
+            path for path in program.source_paths() if path.name.endswith("_kernel.cu")
+        )
+        for program in PROGRAMS
+    }
+    assert "gridDim.y" in kernel_sources[SPLIT].read_text()
+    assert "gridDim.y" not in kernel_sources[ONE_CTA].read_text()
+
+
+@pytest.mark.parametrize(
+    ("tokens", "element_bytes", "target", "expected"),
     [
-        ("sm100f", (10, "0f"), "compute_100f", "compute_103a"),
-        ("sm103a", (10, "3a"), "compute_103a", "compute_100f"),
+        (1, 2, "sm_107a", 2),
+        (2, 1, "sm_107a", 2),
+        (2, 2, "sm_107a", 6),
+        (70, 2, "sm_107a", 6),
+        (71, 2, "sm_107a", 3),
+        (141, 2, "sm_107a", 3),
+        (142, 2, "sm_107a", 2),
+        (213, 2, "sm_107a", 1),
+        (4096, 2, "sm_107a", 1),
+        (0, 2, "sm_107a", 1),
+        (2, 2, "sm_103a", 1),
+        (2, 2, "sm_100a", 1),
     ],
 )
-def test_cake_concat_mla_k_jit_target_isolated(
-    monkeypatch,
-    target,
-    target_arch,
-    expected_compute,
-    forbidden_compute,
-):
-    from flashinfer.jit import cake_concat_mla_k
-    from flashinfer.jit import core as jit_core
+def test_cake_concat_mla_k_split_rule(tokens, element_bytes, target, expected):
+    from flashinfer import concat_ops
 
-    monkeypatch.setattr(
-        jit_core.current_compilation_context,
-        "TARGET_CUDA_ARCHS",
-        {target_arch},
+    assert (
+        concat_ops.cake_concat_mla_k_split_ctas(tokens, element_bytes, target)
+        == expected
     )
-    cake_concat_mla_k.gen_cake_concat_mla_k_module.cache_clear()
+    if tokens:
+        window = concat_ops.cake_concat_mla_k_tokens_per_cta(element_bytes)
+        assert concat_ops.cake_concat_mla_k_grid(tokens, element_bytes, target) == (
+            (tokens + window - 1) // window,
+            expected,
+            1,
+        )
 
-    spec = cake_concat_mla_k.gen_cake_concat_mla_k_module(target)
 
-    assert f"_{target}_" in spec.name
-    assert any(expected_compute in flag for flag in spec.extra_cuda_cflags)
-    assert not any(forbidden_compute in flag for flag in spec.extra_cuda_cflags)
+def test_cake_concat_mla_k_programs_are_selected_per_target():
+    from flashinfer import concat_ops
+    from flashinfer.jit.cake_concat_mla_k import ONE_CTA, SPLIT
+
+    assert concat_ops.cake_concat_mla_k_tokens_per_cta(1) == 2
+    assert concat_ops.cake_concat_mla_k_tokens_per_cta(2) == 1
+    with pytest.raises(ValueError):
+        concat_ops.cake_concat_mla_k_tokens_per_cta(4)
+    with pytest.raises(ValueError):
+        concat_ops.cake_concat_mla_k_split_ctas(2, 2, "sm100f")
+    assert concat_ops._cake_program("sm_100a", 1) is ONE_CTA
+    assert concat_ops._cake_program("sm_103a", 1) is ONE_CTA
+    # The split program serves only launches with grid_y > 1 on the split target.
+    assert concat_ops._cake_program("sm_107a", 1) is ONE_CTA
+    assert concat_ops._cake_program("sm_107a", 2) is SPLIT
+    assert concat_ops._cake_program("sm_107a", 6) is SPLIT
 
 
 def test_cake_concat_mla_k_rejects_unsupported_arch(monkeypatch):

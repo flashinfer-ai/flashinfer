@@ -5,8 +5,9 @@
 This is shim glue, not kernel-team code, so it lives in ``shim/`` (never inside
 ``src/`` — that directory is a *verbatim* drop from the kernel team).  It adds
 the sibling ``src/`` directory to ``sys.path`` so the raw kernel packages
-(``common``, ``moe_nvfp4_swapab``, ``moe_hopper_fp8``, and the inner ``src``)
-import as top-level modules without a separate editable install.
+(``common``, ``moe_nvfp4_swapab``, ``moe_hopper_fp8``, ``moe_hopper_bf16``, and
+the inner ``src``) import as top-level modules without a separate editable
+install.
 
 The SM90 drop is a fork of the SM100 kernel repo, so both trees expose the
 SAME top-level module names (``common``, ``src``, ``moe_nvfp4_swapab``).  Only

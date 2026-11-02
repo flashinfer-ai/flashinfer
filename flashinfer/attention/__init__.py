@@ -18,11 +18,13 @@ from ._core import *  # noqa: F401,F403
 from ._core import (
     BatchAttention,
     BatchAttentionWithAttentionSinkWrapper,
+    BatchDecodeWithAttentionSinkWrapper,
     BatchPrefillWithCausalBidirectionalRangesWrapper,
 )
 
 __all__ = [
     "BatchAttention",
     "BatchAttentionWithAttentionSinkWrapper",
+    "BatchDecodeWithAttentionSinkWrapper",
     "BatchPrefillWithCausalBidirectionalRangesWrapper",
 ]

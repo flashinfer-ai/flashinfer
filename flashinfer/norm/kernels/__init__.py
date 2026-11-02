@@ -34,7 +34,15 @@ from .fused_add_rmsnorm import (
 )
 from .layernorm import (
     LayerNormKernel,
+    LayerNormQuantKernel,
     layernorm_cute,
+    layernorm_quant_cute,
+)
+from .gated_residual_rmsnorm import gated_residual_rmsnorm
+from .gated_residual_next_rmsnorm import gated_residual_next_rmsnorm
+from .rmsnorm_sigmoid_gate import (
+    rmsnorm_sigmoid_gate,
+    supports_rmsnorm_sigmoid_gate,
 )
 
 __all__ = [
@@ -52,5 +60,12 @@ __all__ = [
     "fused_add_rmsnorm_quant_cute",
     # LayerNorm
     "LayerNormKernel",
+    "LayerNormQuantKernel",
     "layernorm_cute",
+    "layernorm_quant_cute",
+    # Specialized fused normalization kernels
+    "gated_residual_rmsnorm",
+    "gated_residual_next_rmsnorm",
+    "rmsnorm_sigmoid_gate",
+    "supports_rmsnorm_sigmoid_gate",
 ]

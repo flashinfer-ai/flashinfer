@@ -19,24 +19,24 @@ export CUDA_MAJOR CUDA_MINOR
 
 mkdir -p "${FLASHINFER_CI_CACHE}" "${REPO_ROOT}/sccache-stats"
 
-if [ "${FLASHINFER_JIT_CACHE_BUILD_TARGET}" = "provider" ] && \
-   [ "${FLASHINFER_LOCAL_VERSION}" = "cu134" ]; then
-  : "${SCCACHE_PATCHED_BINARY_PATH:=/ci-cache/sccache-cu134/${ARCH}/sccache}"
-  export SCCACHE_PATCHED_BINARY_PATH
-  host_sccache_path="${FLASHINFER_CI_CACHE}${SCCACHE_PATCHED_BINARY_PATH#/ci-cache}"
-  if [ ! -x "${host_sccache_path}" ]; then
-    docker run --rm \
-      -v "${REPO_ROOT}:/workspace" \
-      -v "${FLASHINFER_CI_CACHE}:/ci-cache" \
-      -e CUDA_VERSION \
-      -e SCCACHE_PATCHED_BINARY_PATH \
-      -w /workspace \
-      "${DOCKER_IMAGE}" \
-      bash /workspace/scripts/build_patched_sccache.sh
-  fi
+# Keep docker run's default cached-image behavior, but retry transient registry
+# failures before starting a build. Never retry the build itself.
+if ! docker image inspect "${DOCKER_IMAGE}" >/dev/null 2>&1; then
+  for attempt in 1 2 3 4; do
+    if docker pull "${DOCKER_IMAGE}"; then
+      break
+    fi
+    if (( attempt == 4 )); then
+      echo "Failed to pull ${DOCKER_IMAGE} after ${attempt} attempts" >&2
+      exit 1
+    fi
+    delay=$(( 5 * 2 ** (attempt - 1) ))
+    echo "Image pull failed; retrying in ${delay}s (attempt $(( attempt + 1 ))/4)" >&2
+    sleep "${delay}"
+  done
 fi
 
-docker run --rm \
+docker run --rm --pull=never \
   -v "${REPO_ROOT}:/workspace" \
   -v "${FLASHINFER_CI_CACHE}:/ci-cache" \
   -e AOT_MAX_JOBS_CAP="${AOT_MAX_JOBS_CAP:-0}" \
@@ -60,7 +60,6 @@ docker run --rm \
   -e JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS="${JIT_CACHE_WATCHDOG_TERM_GRACE_SECONDS:-120}" \
   -e PYTORCH_INDEX \
   -e SCCACHE_BUCKET="${SCCACHE_BUCKET:-}" \
-  -e SCCACHE_PATCHED_BINARY_PATH="${SCCACHE_PATCHED_BINARY_PATH:-}" \
   -e SCCACHE_REGION="${SCCACHE_REGION:-}" \
   -e SCCACHE_STATS_DIR=/workspace/sccache-stats \
   -w /workspace \
