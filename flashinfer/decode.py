@@ -3335,8 +3335,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             The calibration scale of value for fp8 or nvfp4 input, if not provided, will be set to ``1.0``.
         out : Optional[torch.Tensor]
             The output tensor, if not provided, will be allocated internally. Must be zero-init for cute-dsl backend.
+            Must be contiguous for the FA2 backend (both ``use_tensor_cores=False`` and ``use_tensor_cores=True``).
         lse : Optional[torch.Tensor]
             The log-sum-exp of attention logits, if not provided, will be allocated internally.
+            Validated whenever provided (including when ``return_lse=False``); must be ``float32``
+            with shape ``[batch_size * q_len_per_req, num_qo_heads]`` on ``q``'s device, and must
+            be contiguous for the FA2 backend.
         return_lse : bool
             Whether to return the logsumexp of attention scores, defaults to ``False``.
         enable_pdl : bool
@@ -3577,15 +3581,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if rope_theta is None:
             rope_theta = 1e4
 
-        if return_lse:
-            if lse is None:
-                lse = torch.empty(
-                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
-                )
-            else:
-                check_shape_dtype_device(
-                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
-                )
+        if lse is not None:
+            check_shape_dtype_device(
+                lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
+            )
+        elif return_lse:
+            lse = torch.empty(
+                (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
+            )
 
         if self._backend == "cutile":
             if return_lse:

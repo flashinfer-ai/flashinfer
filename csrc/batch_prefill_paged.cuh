@@ -29,6 +29,9 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                      Optional<TensorView> maybe_lse, int64_t mask_mode_code,
                                      int64_t layout, int64_t window_left,
                                      bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
+  // Both the paged prefill kernel and the split-KV merge use dense output addressing.
+  check_contiguous(o, "out");
+
   PrefillPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
   QKVLayout kv_layout = static_cast<QKVLayout>(layout);
@@ -46,6 +49,9 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
 
   if (maybe_lse) {
     const auto& lse = *maybe_lse;
+    check_dtype(lse, dl_float32, "lse");
+    check_contiguous(lse, "lse");
+    TVM_FFI_ICHECK_EQ(lse.ndim(), 2);
     TVM_FFI_ICHECK_EQ(lse.size(0), q.size(0));
     TVM_FFI_ICHECK_EQ(lse.size(1), q.size(1));
   }
