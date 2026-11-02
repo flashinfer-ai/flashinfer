@@ -2107,7 +2107,7 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
     call).  Every launch that binds ``v_new`` / ``dv2`` binds the moved views and comes before the first launch
     that binds an output they ride on; the arena's cached views are not rebound; the backward allocates no byte
     beyond the flag-off backward's but the replay's rstd (and the raw mode's per-call ``qn``).  A forward and a
-    rank whose internal rows exceed twice its tokens move nothing."""
+    rank whose internal rows exceed twice its tokens move nothing; the decision is kept per plan."""
     missing = cake_kcp_plan.qk_l2norm_missing(form, gate, arch)
     if missing is not None:
         pytest.skip(
@@ -2203,6 +2203,8 @@ def test_l2n_backward_rows_ride_in_the_arena(H, arch, sm, gate, form, kind) -> N
     dg = "dg_raw" if gate == "raw" else "dg"
     expected = {"dv2": ("dq", "dk")} | ({"v_new": ("dg",)} if gate == "g" else {})
     assert cake_kcp._l2n_row_hosts(call) == expected
+    # kept per plan: a later backward of the same problem does not walk the records again
+    assert cake_kcp._l2n_row_hosts(call) is cake_kcp._l2n_row_hosts(call)
     arena, moved = call.local.ns, call.scratch["views"]
     assert moved is not arena and call.local.views(cake_kcp.LOCAL_LAYOUT_BWD) is arena
     lo, n = call.local.arena.data_ptr(), call.local.arena.numel()

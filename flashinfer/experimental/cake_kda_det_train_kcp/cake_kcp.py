@@ -6334,6 +6334,9 @@ def _bwd_body(call: CallDetKcp, saved: SavedDetKcp | None) -> tuple[torch.Tensor
 # would hold a per-call ``[T_r, H, 128]`` BF16 pair beyond the flag-off backward's peak (:func:`_l2n_row_hosts`).
 _L2N_LATE_STAGES = frozenset({"glm_intra", "gate_epilogue", "qk_pullback", "param_finalize"})
 _L2N_ROW_HOSTS = (("v_new", "qn"), ("dv2", "kn"))  # (the moved arena buffer, the normalized rows on its bytes)
+# The decision per plan (``cake_backend.plan`` returns one object per problem): {id(plan): (a weak reference to it,
+# the registry it read, {(gate, output dtypes): hosts})}, so a backward's host prologue does not walk the records again
+_L2N_ROW_HOSTS_KEPT: dict[int, tuple[Any, Any, dict[tuple[Any, ...], dict[str, tuple[str, ...]]]]] = {}
 
 
 def _l2n_row_hosts(call: CallDetKcp) -> dict[str, tuple[str, ...]]:
@@ -6343,10 +6346,31 @@ def _l2n_row_hosts(call: CallDetKcp) -> dict[str, tuple[str, ...]]:
     in its slot, its outputs' BF16 rows cover its ``R`` rows (dq / dk and dg ``2 T_r``, dg_raw ``T_r``), no record of
     the stages of :data:`_L2N_LATE_STAGES` binds it and no record of the backward's other stages binds those
     outputs.  The KCP's own programs bind no output (K1 / K2 write the tapes, ``kcp_dav`` reads ``v_new`` at step
-    4).  Nothing moves on a forward, on a rank without local stages or tokens, or on the lean layout."""
+    4).  Nothing moves on a forward, on a rank without local stages or tokens, or on the lean layout.  The decision is
+    kept per plan, gate mode and output dtypes while the registry is the same object (:data:`_L2N_ROW_HOSTS_KEPT`);
+    callers do not modify the returned dict."""
     if not call.backward or call.local is None or call.T_r == 0 or _lean_passes(call.local):
         return {}
-    p, path, T, dt = call.local.plan, LOCAL_PATH_BWD, call.T_r, call.backend.dtypes
+    p, dt = call.local.plan, call.backend.dtypes
+    dg = "dg_raw" if call.gate == "raw" else "dg"
+    kept = _L2N_ROW_HOSTS_KEPT.get(id(p))
+    if kept is None or kept[0]() is not p or kept[1] is not cake_jit.MODULES:
+        for stale in [k for k, v in _L2N_ROW_HOSTS_KEPT.items() if v[0]() is None]:
+            del _L2N_ROW_HOSTS_KEPT[stale]
+        kept = (weakref.ref(p), cake_jit.MODULES, {})
+        _L2N_ROW_HOSTS_KEPT[id(p)] = kept
+    key = (call.gate, call.T_r, dt["dq"], dt["dk"], dt[dg])
+    hosts = kept[2].get(key)
+    if hosts is None:
+        hosts = kept[2][key] = _l2n_row_hosts_of(p, call.gate, call.T_r, dt)
+    return hosts
+
+
+def _l2n_row_hosts_of(
+    p: Any, gate: str, T: int, dt: dict[str, torch.dtype]
+) -> dict[str, tuple[str, ...]]:
+    """The uncached decision of :func:`_l2n_row_hosts` for plan ``p`` of a rank with ``T`` tokens."""
+    path = LOCAL_PATH_BWD
     late: set[str] = set()
     early: set[str] = set()
     for stage in (*L2N_FALLBACK_STAGES, *LOCAL_STAGES_BWD):
@@ -6363,7 +6387,7 @@ def _l2n_row_hosts(call: CallDetKcp) -> dict[str, tuple[str, ...]]:
         )
     regions = p.layout(LOCAL_LAYOUT_BWD)
     slot = {r.name: r.slot for r in regions}
-    dg = "dg_raw" if call.gate == "raw" else "dg"
+    dg = "dg_raw" if gate == "raw" else "dg"
     pair = 2 * T if dt["dq"] == dt["dk"] == torch.bfloat16 else 0
     cases = (("v_new", (dg,), T * dt[dg].itemsize // 2), ("dv2", ("dq", "dk"), pair))
     hosts: dict[str, tuple[str, ...]] = {}
