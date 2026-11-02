@@ -37,11 +37,12 @@ zeroing the accumulators).  ``ROUTES[arch][role]`` names the one module a role
 runs on an architecture.  An architecture may also route a role's long role
 (``fwd_long``, ``bwd_bf16_long``, ``bwd_f32_long``) and the forward's mid role
 (``fwd_mid``), whose module runs in the role's place from ``min_rows_per_sm``
-rows per SM of its grid rule (:func:`module_for_rows`; the long role first,
-from more rows): on sm_100a and sm_103a a forward that walks several row
-blocks per CTA, loading each next block while it computes the current one,
-``y`` the same bits (the long forward 32-row blocks on 256-thread CTAs, the mid
-forward 16-row blocks on 128-thread CTAs); on sm_100a and sm_103a from
+rows per SM of its grid rule (:func:`min_rows_per_sm`: one count, or one per
+architecture of the record; :func:`module_for_rows`; the long role first, from
+more rows): on every architecture a forward that walks several row blocks per
+CTA, loading each next block while it computes the current one, ``y`` the same
+bits (the long forward 32-row blocks on 256-thread CTAs, the mid forward
+16-row blocks on 128-thread CTAs); on sm_100a and sm_103a from
 1280 rows per SM a backward whose thread 0 warms the next row block of
 packed rows in L2 with one bulk prefetch a tensor, launched with 5 CTAs per
 SM, and on sm_107a from 1024 the backward with 128-thread CTAs, ``dx`` and
@@ -93,16 +94,23 @@ GPC and each wait for the other CTAs' partials of their columns.  A kernel
 resident on another stream delays a call of the other modules roughly in
 proportion to the SM slots it holds, and one that holds resources a kernel
 needs on every SM can still delay its start.  A long or mid forward CTA whose
-slot such a kernel holds walks all of its blocks once it starts.  The long
-forward runs only from the ``min_rows_per_sm`` at which, with at most
-``max_blocks_per_cta`` blocks a CTA, that delay is no larger than the
-forward's; the mid forward only from
-the one at which such a call stays within the forward stall test's bound and
-ends no later than the forward's, and the short forward only up to the
-``max_rows_per_sm`` at which its grid has fewer CTAs than the SMs and such a
-call still ends no later than the forward's (FlashInfer issue #7548); the
-short backward runs only up to the ``max_rows`` at which no CTA of its
-cluster takes more than one row block.
+slot such a kernel holds walks all of its blocks once it starts.  On sm_100a
+and sm_103a the long forward runs only from the ``min_rows_per_sm`` at which,
+with at most ``max_blocks_per_cta`` blocks a CTA, that delay is no larger
+than the forward's, and the mid forward only from the one at which such a
+call stays within the forward stall test's bound and ends no later than the
+forward's.  On sm_107a (probed with 212 SMs) each runs from the
+``min_rows_per_sm`` from which, in the medians over the probe runs, such a
+call stayed within that bound beside every kernel holding part of the SMs and
+took at most 1 % plus the runs' spread longer than the forward beside every
+probed kernel; there the long forward's delay over its share of the held
+slots is larger than the forward's at every routed row count probed, and the
+mid forward ends after the forward at 1152 rows per SM (by up to 2.15 % in
+the worst run; in the worst kernel-launch run also at 960).  The short
+forward runs only up to the ``max_rows_per_sm`` at which its grid has fewer
+CTAs than the SMs and such a call still ends no later than the forward's
+(FlashInfer issue #7548); the short backward runs only up to the ``max_rows``
+at which no CTA of its cluster takes more than one row block.
 
 The workspace of the backward is ``dw_slots * 128`` FP64 accumulators and one
 8-byte word holding two 32-bit words, the arrival ticket and the claim counter
@@ -191,16 +199,17 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "fwd",
     },
-    # The long forward (sm_100a, sm_103a): 256 threads, 8 lanes per row
-    # (32-row blocks), 32-byte accesses, at most 3 CTAs per SM, each loading
-    # its next block while it computes the current one, the gate on packed
-    # FP32 pairs (build {"lanes": 8, "math": "x2", "min_blocks": 3,
-    # "threads": 256}); whole waves of at most 6 blocks per CTA, from 2400
-    # rows per SM.
+    # The long forward: 256 threads, 8 lanes per row (32-row blocks), 32-byte
+    # accesses, at most 3 CTAs per SM, each loading its next block while it
+    # computes the current one, the gate on packed FP32 pairs (build {"lanes":
+    # 8, "math": "x2", "min_blocks": 3, "threads": 256}); whole waves of at
+    # most 6 blocks per CTA, from 2400 rows per SM on sm_100a and sm_103a and
+    # from 1740 (four whole waves) on sm_107a.
     "cake_rmsnorm_silu_gate_train_e0672c312c57421abe21": {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "x"],
@@ -223,7 +232,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "ctas_per_sm": 3,
             "kind": "persistent_row_blocks",
             "max_blocks_per_cta": 6,
-            "min_rows_per_sm": 2400,
+            "min_rows_per_sm": {
+                "sm_100a": 2400,
+                "sm_103a": 2400,
+                "sm_107a": 1740,
+            },
             "rows_per_block": 32,
         },
         "kernel": "cake_rmsnorm_silu_gate_train_e0672c312c57421abe21",
@@ -251,15 +264,16 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "fwd_long",
     },
-    # The mid forward (sm_100a, sm_103a): the long forward's kernel on 128
-    # threads, 8 lanes per row (16-row blocks), at most 6 CTAs per SM (build
-    # {"lanes": 8, "math": "x2", "min_blocks": 6, "threads": 128}); whole
-    # waves of at most 2 blocks per CTA, from 976 rows per SM up to the long
-    # forward's.
+    # The mid forward: the long forward's kernel on 128 threads, 8 lanes per
+    # row (16-row blocks), at most 6 CTAs per SM (build {"lanes": 8, "math":
+    # "x2", "min_blocks": 6, "threads": 128}); whole waves of at most 2 blocks
+    # per CTA, from 976 rows per SM on sm_100a and sm_103a and from 800 on
+    # sm_107a, up to the long forward's.
     "cake_rmsnorm_silu_gate_train_8bd481246a4b97382250": {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "x"],
@@ -282,7 +296,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "ctas_per_sm": 6,
             "kind": "persistent_row_blocks",
             "max_blocks_per_cta": 2,
-            "min_rows_per_sm": 976,
+            "min_rows_per_sm": {
+                "sm_100a": 976,
+                "sm_103a": 976,
+                "sm_107a": 800,
+            },
             "rows_per_block": 16,
         },
         "kernel": "cake_rmsnorm_silu_gate_train_8bd481246a4b97382250",
@@ -1003,6 +1021,8 @@ ROUTES: dict[str, dict[str, str]] = {
     },
     "sm_107a": {
         "fwd": "cake_rmsnorm_silu_gate_train_05ffc12001cf81513436",
+        "fwd_long": "cake_rmsnorm_silu_gate_train_e0672c312c57421abe21",
+        "fwd_mid": "cake_rmsnorm_silu_gate_train_8bd481246a4b97382250",
         "bwd_bf16": "cake_rmsnorm_silu_gate_train_58f1ac96c476c73ec5c8",
         "bwd_bf16_long": "cake_rmsnorm_silu_gate_train_8b61372f6a32eeca4d10",
         "bwd_f32": "cake_rmsnorm_silu_gate_train_26c869703d0ab9e4a39d",
@@ -1059,6 +1079,15 @@ def route_module(arch: str, role: str) -> str:
     return name
 
 
+def min_rows_per_sm(name: str, arch: str) -> int:
+    """The rows per SM from which the long or mid module ``name`` runs on
+    ``arch``: its grid rule's ``min_rows_per_sm``, one count for every
+    architecture of the record or one count per architecture."""
+
+    start = MODULES[name]["grid_rule"]["min_rows_per_sm"]
+    return int(start[arch] if isinstance(start, dict) else start)
+
+
 def module_for_rows(arch: str, role: str, rows: int, sm_count: int) -> str:
     """The module that runs ``role`` (one of ``ROLES``) for ``rows`` rows on
     ``arch`` with ``sm_count`` SMs: the role's short module when ``arch``
@@ -1066,8 +1095,9 @@ def module_for_rows(arch: str, role: str, rows: int, sm_count: int) -> str:
     that does not grow with the rows: the short backward's one cluster) or
     else its ``max_rows_per_sm * sm_count`` (one CTA per row block: the short
     forward), else the first of the role's long and mid modules (``TIERS``
-    order) that ``arch`` routes with ``rows >= min_rows_per_sm * sm_count``
-    of its grid rule, else :func:`route_module`."""
+    order) that ``arch`` routes with
+    ``rows >= min_rows_per_sm(module, arch) * sm_count``, else
+    :func:`route_module`."""
 
     routes = ROUTES.get(arch, {})
     short = routes.get(f"{role}_short")
@@ -1081,9 +1111,9 @@ def module_for_rows(arch: str, role: str, rows: int, sm_count: int) -> str:
             return short
     for tier in TIERS:
         name = routes.get(f"{role}{tier}")
-        if name is not None and int(rows) >= int(
-            MODULES[name]["grid_rule"]["min_rows_per_sm"]
-        ) * int(sm_count):
+        if name is not None and int(rows) >= min_rows_per_sm(name, arch) * int(
+            sm_count
+        ):
             return name
     return route_module(arch, role)
 
@@ -1261,6 +1291,7 @@ __all__ = [
     "launch_grid",
     "library_name",
     "load",
+    "min_rows_per_sm",
     "module_for_rows",
     "route_module",
     "run_module",

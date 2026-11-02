@@ -1170,10 +1170,10 @@ def _sm_count() -> int:
 
 
 # The rows per SM up to which sm_100a and sm_103a run the short forward, and
-# from which they run the mid and the long forward.
+# from which each architecture runs the mid and the long forward.
 SHORT_FORWARD_ROWS_PER_SM = 10
-MID_FORWARD_ROWS_PER_SM = 976
-LONG_FORWARD_ROWS_PER_SM = 2400
+MID_FORWARD_ROWS_PER_SM = {"sm_100a": 976, "sm_103a": 976, "sm_107a": 800}
+LONG_FORWARD_ROWS_PER_SM = {"sm_100a": 2400, "sm_103a": 2400, "sm_107a": 1740}
 # Forward inputs around and past the short, the mid and the long forward's
 # thresholds: (tokens, heads, layout); ``heads=None`` takes ``threshold * SMs
 # + tokens`` rows (the short threshold for ``flat-short``, the mid one for
@@ -1211,13 +1211,15 @@ def test_forward_around_the_long_threshold_matches_the_deterministic_package(
     the long forward's thresholds and past them, and the forward launches
     ``module_for_rows``' module: where the architecture routes them, the short
     forward up to ``SHORT_FORWARD_ROWS_PER_SM * SMs`` rows, the long forward
-    from ``2400 * SMs`` rows and the mid forward from
+    from ``LONG_FORWARD_ROWS_PER_SM * SMs`` rows and the mid forward from
     ``MID_FORWARD_ROWS_PER_SM * SMs`` rows below that, else the forward."""
     sms = _sm_count()
     arch = loader.device_arch(torch.cuda.current_device())
+    mid_start = MID_FORWARD_ROWS_PER_SM[arch]
+    long_start = LONG_FORWARD_ROWS_PER_SM[arch]
     if heads is None:
-        start = {"flat-short": SHORT_FORWARD_ROWS_PER_SM, "flat-mid": 976}.get(
-            layout, LONG_FORWARD_ROWS_PER_SM
+        start = {"flat-short": SHORT_FORWARD_ROWS_PER_SM, "flat-mid": mid_start}.get(
+            layout, long_start
         )
         x, z, w, _ = suite.make(start * sms + tokens, 1, layout="flat", seed=21)
     else:
@@ -1231,9 +1233,9 @@ def test_forward_around_the_long_threshold_matches_the_deterministic_package(
     want = loader.route_module(arch, "fwd")
     if "fwd_short" in routes and rows <= SHORT_FORWARD_ROWS_PER_SM * sms:
         want = routes["fwd_short"]
-    elif "fwd_long" in routes and rows >= LONG_FORWARD_ROWS_PER_SM * sms:
+    elif "fwd_long" in routes and rows >= long_start * sms:
         want = routes["fwd_long"]
-    elif "fwd_mid" in routes and rows >= MID_FORWARD_ROWS_PER_SM * sms:
+    elif "fwd_mid" in routes and rows >= mid_start * sms:
         want = routes["fwd_mid"]
     assert name == want, (arch, rows, sms)
     assert torch.equal(y, det_forward(x, z, w, EPS)), "y vs the deterministic package"
