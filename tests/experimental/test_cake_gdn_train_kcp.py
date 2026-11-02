@@ -1067,7 +1067,7 @@ def test_row_cost_rule_is_the_default_and_the_per_rank_rules_stay_selectable() -
     stay selectable through ``p_rule`` and then drive the head plan; the row rule picks the recorded vectors on three
     tables of record (two flip to ``"one"`` -- one far below any margin, one at a model ratio of 0.980 that only the
     ``"one"`` margin of 0 admits -- and one keeps the base far from any margin)."""
-    assert gp.P_RULE_DEFAULT == "fill_small" and "row_cost_lpt" in gp.P_RULES
+    assert gp.P_RULE_DEFAULT == "fill_small_guard" and "row_cost_lpt" in gp.P_RULES
     assert "row_cost" in gp.P_RULES
     assert gp.ROW_COST_BASE == "wave_fill1" and gp.ROW_COST_POLICIES == ("occ", "one")
     assert gp.ROW_COST_COMPOSE_K == 2 and gp.ROW_COST_MARGIN_PCT == {"occ": 2, "one": 0}
@@ -1149,14 +1149,16 @@ def test_row_cost_rule_is_the_default_and_the_per_rank_rules_stay_selectable() -
 
 
 def test_graph_replay_context_takes_the_fill_down_plan() -> None:
-    """``build_context_kcp(..., graph_replay=True)`` plans with :data:`P_RULE_GRAPH` (``"fill_down"``: the default
-    ``"fill_small"`` without its ``P = 1`` rows) on every rank; an explicit ``p_rule`` still wins; the default context
+    """``build_context_kcp(..., graph_replay=True)`` plans with :data:`P_RULE_GRAPH` (``"fill_down_guard"``: the default
+    ``"fill_small_guard"`` without its ``P = 1`` rows) on every rank; an explicit ``p_rule`` still wins; the default context
     keeps :data:`P_RULE_DEFAULT`; a non-bool hint is a ``TypeError``."""
-    assert gp.P_RULE_GRAPH == "fill_down" and gp.P_RULE_GRAPH in gp.ROW_RULES
+    assert gp.P_RULE_GRAPH == "fill_down_guard" and gp.P_RULE_GRAPH in gp.ROW_RULES
     assert gp.P_RULE_GRAPH in gp.P_RULES
     # a small-head row of short fragments: the default walks every fragment as one chain, the graph plan keeps segments
     small = tuple(((128, True), (128, True), (128, True)) for _ in range(8))
-    fs = [seg.P for seg in gp.kcp_plan_row(small, 6, SM_COUNT, p_rule="fill_small")]
+    fs = [
+        seg.P for seg in gp.kcp_plan_row(small, 6, SM_COUNT, p_rule=gp.P_RULE_DEFAULT)
+    ]
     fd = [seg.P for seg in gp.kcp_plan_row(small, 6, SM_COUNT, p_rule=gp.P_RULE_GRAPH)]
     assert set(fs) == {1} and max(fd) > 1, (fs, fd)
     # every other row: the graph plan is the default plan
@@ -1165,7 +1167,8 @@ def test_graph_replay_context_takes_the_fill_down_plan() -> None:
         (tuple(((300, True), (40, False)) for _ in range(4)), 6),
     ):
         fs = [
-            seg.P for seg in gp.kcp_plan_row(table, hv, SM_COUNT, p_rule="fill_small")
+            seg.P
+            for seg in gp.kcp_plan_row(table, hv, SM_COUNT, p_rule=gp.P_RULE_DEFAULT)
         ]
         fd = [
             seg.P
@@ -1275,6 +1278,97 @@ def test_faster_schedule_rules_never_raise_a_ranks_P() -> None:
             assert both == (tuple(1 for _ in table) if small else fill)
             lowered += int(small and max(seg.P for seg in ship) > 1)
     assert lowered > 0  # the rule changes some shipped plan (else it would be a no-op)
+
+
+def test_fill_guard_keeps_row_cost_lpt_for_a_long_one_chain_fragment() -> None:
+    """The shipped rules ``"fill_small_guard"`` (eager) and ``"fill_down_guard"`` (graph replay) are ``"fill_small"`` /
+    ``"fill_down"`` plus a row guard on SM counts of at least ``FILL_GUARD_SM_MIN``: on a row whose every rank holds at
+    least two fragments, when the fill sends a rank to P = 1 below its ``"row_cost_lpt"`` P and that rank's longest
+    fragment has at least ``FILL_GUARD_NC_MIN`` chunks, the row keeps the ``"row_cost_lpt"`` vector.  Below the guard's
+    SM range (B200 148, GB300 152) every plan equals the unguarded rule's; on R200 (212 / 216 SMs) the K3E zigzag row
+    (third rank: three 256-chunk fragments) keeps ``"row_cost_lpt"``, while the DET 64k zigzag CP4 row (128-chunk
+    fragments) and the single-document zigzag row (no P = 1 rank) keep the one-wave fill."""
+    pairs = (("fill_small_guard", "fill_small"), ("fill_down_guard", "fill_down"))
+    assert (
+        gp.P_RULE_DEFAULT == "fill_small_guard" and gp.P_RULE_GRAPH == "fill_down_guard"
+    )
+    assert {r for pair in pairs for r in pair} <= set(gp.ROW_RULES) <= set(gp.P_RULES)
+    assert 152 < gp.FILL_GUARD_SM_MIN <= 212 and 128 < gp.FILL_GUARD_NC_MIN <= 237
+    k3e = torch.tensor([0, 98304, 163840, 221184, 262144], dtype=torch.int64)
+    k3e_z = gp.row_tables(gp.partition_kcp(k3e, 8, "zigzag"))
+    assert [len(t) for t in k3e_z] == [2, 2, 3, 2, 2, 2, 2, 2]
+    det3 = torch.tensor([0, 15945, 37790, 65536], dtype=torch.int64)
+    det3_z4 = gp.row_tables(gp.partition_kcp(det3, 4, "zigzag"))
+    assert [len(t) for t in det3_z4] == [2, 3, 2, 3]
+    one_doc_z = gp.row_tables(gp.partition_kcp(torch.tensor([0, 254976]), 8, "zigzag"))
+    tables = (
+        k3e_z,
+        det3_z4,
+        one_doc_z,
+        TABLE_P1_CP4_D,
+        TABLE_P1_CP2_C,
+        TABLE_P3_CP2_C,
+        (((130, True),) * 12,) * 8,
+        (((119, True), (119, True)),) * 8,
+        ((), ((150, True), (20, False))),
+    )
+
+    def Ps(table, HV, sm, rule):
+        plans = gp.kcp_plan_row(table, HV, sm, p_rule=rule)
+        assert all(
+            seg.p_rule == rule and seg.n_frag * seg.P == seg.NSEG for seg in plans
+        )
+        return tuple(seg.P for seg in plans)
+
+    guarded_rows = 0
+    for table in tables:
+        for HV in (6, 12, 24, 48):
+            for sm in (148, 152, 212, 216):
+                ship = Ps(table, HV, sm, "row_cost_lpt")
+                one = HV <= gp.SMALL_ONE_HV_MAX and all(
+                    nc <= gp.SMALL_ONE_NC_MAX for t in table for nc, _ in t
+                )
+                for guarded, plain in pairs:
+                    got, fill = Ps(table, HV, sm, guarded), Ps(table, HV, sm, plain)
+                    assert all(1 <= p <= q for p, q in zip(got, ship, strict=True))
+                    # the small_one rows (the det twin's default as well) are not guarded
+                    keep = (
+                        sm >= gp.FILL_GUARD_SM_MIN
+                        and not (guarded == "fill_small_guard" and one)
+                        and all(len(t) >= 2 for t in table)
+                        and any(
+                            f == 1 < q
+                            and max(nc for nc, _ in t) >= gp.FILL_GUARD_NC_MIN
+                            for f, q, t in zip(fill, ship, table, strict=True)
+                        )
+                    )
+                    assert got == (ship if keep else fill), (guarded, sm, HV)
+                    guarded_rows += keep and fill != ship
+    assert guarded_rows > 0  # the guard changes some plan (else it would be a no-op)
+    for sm in (212, 216):
+        assert Ps(k3e_z, 48, sm, "fill_small") == (2, 2, 1, 2, 2, 2, 2, 2)
+        assert Ps(k3e_z, 48, sm, "row_cost_lpt") == (3, 3, 2, 3, 3, 3, 3, 3)
+        for guarded, plain in pairs:
+            assert Ps(k3e_z, 48, sm, guarded) == (3, 3, 2, 3, 3, 3, 3, 3)
+            assert Ps(det3_z4, 48, sm, guarded) == Ps(det3_z4, 48, sm, plain)
+            assert (
+                Ps(one_doc_z, 48, sm, guarded)
+                == (2,) * 8
+                == Ps(one_doc_z, 48, sm, "fill_down")
+            )
+            assert Ps(one_doc_z, 48, sm, "row_cost_lpt") == (3,) * 8
+    for sm in (148, 152):
+        assert (
+            Ps(k3e_z, 48, sm, "fill_small_guard")
+            == (1,) * 8
+            == Ps(k3e_z, 48, sm, "row_cost_lpt")
+        )
+    want = (3, 3, 2, 3, 3, 3, 3, 3)
+    for r in range(8):
+        ctx = gp.build_context_kcp(
+            gp.partition_kcp(k3e, 8, "zigzag"), None, r, CPU, 4, sm_count=212
+        )
+        assert ctx.p_rule == "fill_small_guard" and want[r] == ctx.heads(48).P
 
 
 def test_row_cost_model_is_integer_and_crossing_aware() -> None:
