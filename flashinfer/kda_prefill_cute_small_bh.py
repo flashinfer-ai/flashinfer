@@ -27,6 +27,7 @@ from .kda_prefill import (
     _cached_packed_task_metadata,
     _check_output_does_not_overlap_inputs,
     _get_stream_workspace,
+    _is_state_pool_tensor,
 )
 from .utils import get_compute_capability
 
@@ -80,7 +81,6 @@ def _is_kda_prefill_cute_small_bh_eligible(
         any(
             value is not None
             for value in (
-                ssm_state_indices,
                 num_spec_tokens,
                 num_accepted_tokens,
                 initial_state_source,
@@ -173,7 +173,23 @@ def _is_kda_prefill_cute_small_bh_eligible(
         ):
             return False
 
-    if initial_state is not None and (
+    if ssm_state_indices is not None:
+        # Indexed state reads and updates initial_state[ssm_state_indices[n]]
+        # in place; the pool may hold more slots than sequences and may pad
+        # its slot stride.
+        if (
+            not isinstance(ssm_state_indices, torch.Tensor)
+            or ssm_state_indices.device != q.device
+            or ssm_state_indices.dtype != torch.int32
+            or ssm_state_indices.shape != (num_sequences,)
+            or not ssm_state_indices.is_contiguous()
+            or not _is_state_pool_tensor(
+                initial_state, device=q.device, num_heads=num_heads
+            )
+            or initial_state.dtype != q.dtype
+        ):
+            return False
+    elif initial_state is not None and (
         not isinstance(initial_state, torch.Tensor)
         or initial_state.device != q.device
         or initial_state.dtype != q.dtype
@@ -289,8 +305,13 @@ def _run_kda_prefill_cute_small_bh(
     cu_seqlens: Optional[torch.Tensor],
     output: Optional[torch.Tensor],
     prefill_workspace: Optional[RecurrentKDAPrefillWorkspace],
+    ssm_state_indices: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Launch the small-BH CuTe DSL KDA prefill kernel."""
+    """Launch the small-BH CuTe DSL KDA prefill kernel.
+
+    With ``ssm_state_indices``, ``initial_state`` is a state pool and sequence
+    ``n`` reads and updates slot ``ssm_state_indices[n]`` in place.
+    """
 
     from .kda_kernels.kda_chunked_bt16_small_bh import chunk_kda_fwd
 
@@ -377,6 +398,7 @@ def _run_kda_prefill_cute_small_bh(
             output=out_arg,
             state_input=initial_state,
             state_output=state_buffer,
+            state_indices=ssm_state_indices,
             workspace_tensors=workspace_tensors,
         )
 
