@@ -115,6 +115,17 @@ struct Params {
   int32_t topk, group_size, num_qo_heads, num_tiles, num_splits;
 };
 
+// The fields of Params the merge reads. Its launch takes them alone, so each merge CTA reads its
+// arguments from fewer constant-cache lines than the attention kernel's parameters span.
+struct MergeParams {
+  const nv_bfloat16* gate;
+  nv_bfloat16* out;
+  float* partial_out;
+  float* partial_lse;
+  int64_t out_stride_row, out_stride_head;
+  int32_t num_rows, num_qo_heads, num_splits;
+};
+
 template <KvFormat F>
 struct SharedStorage {
   using Traits = KvTraits<F>;
@@ -718,7 +729,7 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
 // kOneWarp is the single-warp NVFP4 launch: its splits fit one group, which it stops after, and it
 // keeps its sum in registers.
 template <KvFormat F, bool kOneWarp = false>
-__global__ void __launch_bounds__(32 * kMergeWarps<F>) MergeKernel(const Params p) {
+__global__ void __launch_bounds__(32 * kMergeWarps<F>) MergeKernel(const MergeParams p) {
   const int row = blockIdx.x, head = blockIdx.y;
   const uint32_t num_warps = kOneWarp ? 1 : blockDim.x / 32, warp = kOneWarp ? 0 : threadIdx.x / 32;
   const uint32_t lane = threadIdx.x % 32;
@@ -874,16 +885,21 @@ inline cudaError_t SparsePagedAttention(const Params& p, cudaStream_t stream) {
     SparsePagedAttentionKernel<F><<<grid, kNumThreads, sizeof(SharedStorage<F>), stream>>>(p);
   }
   if (p.num_splits > 1) {
+    const MergeParams merge{p.gate,           p.out,
+                            p.partial_out,    p.partial_lse,
+                            p.out_stride_row, p.out_stride_head,
+                            p.num_rows,       p.num_qo_heads,
+                            p.num_splits};
     const int warps = min(int(kMergeWarps<F>), (p.num_splits + kMergeDepth - 1) / kMergeDepth);
     const size_t acc_bytes = F == KvFormat::kNVFP4 ? 0 : warps * kHeadDim * sizeof(float);
     const dim3 grid(p.num_rows, p.num_qo_heads);
     if constexpr (F == KvFormat::kNVFP4) {
       if (warps == 1) {
-        MergeKernel<F, true><<<grid, 32, 0, stream>>>(p);
+        MergeKernel<F, true><<<grid, 32, 0, stream>>>(merge);
         return cudaGetLastError();
       }
     }
-    MergeKernel<F><<<grid, 32 * warps, acc_bytes, stream>>>(p);
+    MergeKernel<F><<<grid, 32 * warps, acc_bytes, stream>>>(merge);
   }
   return cudaGetLastError();
 }
