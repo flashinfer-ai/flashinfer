@@ -340,7 +340,13 @@ def test_l2n_classes_and_the_l2n_in_rule(monkeypatch: pytest.MonkeyPatch) -> Non
     assert sel("fwd", "off") == "x_plain" and sel("replay", "off") == "x_plain"
     assert sel("fwd", "fused") == "x_l2n" and sel("fwd_nosave", "fused") == "x_l2n"
     assert sel("replay", "fused") == "x_plain"
-    assert sel("fwd", "fallback") is None  # optional stage, no record of the class
+    # the fallback class: the registry's own token-local record (none of the two above serves the mode)
+    shipped = [
+        n
+        for n in cake_jit.records_of_stage("qk_l2norm")
+        if "fallback" in cake_jit.MODULES[n].get("l2n", ["off"])
+    ]
+    assert sel("fwd", "fallback") == (shipped[0] if shipped else None)
 
 
 def test_tokens_grid_rule(monkeypatch: pytest.MonkeyPatch) -> None:
