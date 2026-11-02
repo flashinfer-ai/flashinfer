@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import functools
 import heapq
+import os
 import warnings
 from dataclasses import dataclass, field
 from dataclasses import replace as dataclass_replace
@@ -1311,6 +1312,142 @@ def _smallm_sm_count(device: torch.device) -> int:
             torch.cuda.get_device_properties(index).multi_processor_count
         )
     return count
+
+
+# (CUDA device index, raw stream handle, current CUDA context handle) -> the
+# SM count of the stream's context: the device's for a primary-context stream,
+# the partition's for a green context's.  Read once per key: the hot path is a
+# torch stream lookup, a thread-local context read and this dict.
+_STREAM_SM_COUNTS: dict[tuple[int, int, int], int] = {}
+# ``(cuCtxGetCurrent, cuStreamGetCtx, cuCtxGetDevResource, SM resource type)``
+# of ``cuda.bindings.driver`` once resolved; ``False`` without them (then a
+# launch is planned on the device's SM count).
+_CONTEXT_QUERIES: Any = None
+
+
+def _context_queries() -> Any:
+    global _CONTEXT_QUERIES
+    if _CONTEXT_QUERIES is None:
+        try:
+            from cuda.bindings import driver
+
+            _CONTEXT_QUERIES = (
+                driver.cuCtxGetCurrent,
+                driver.cuStreamGetCtx,
+                driver.cuCtxGetDevResource,
+                driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM,
+            )
+        except (ImportError, AttributeError):
+            _CONTEXT_QUERIES = False
+    return _CONTEXT_QUERIES
+
+
+def _stream_context_sm_count(index: int) -> int | None:
+    """The SM count of the CUDA context of device ``index``'s current torch
+    stream (a green context's stream runs on its partition; the legacy default
+    stream runs on the thread's current context); ``None`` when the driver
+    cannot tell."""
+
+    queries = _CONTEXT_QUERIES
+    if queries is None:
+        queries = _context_queries()
+    if not queries:
+        return None
+    get_current, stream_context, context_resource, sm_type = queries
+    stream = torch._C._cuda_getCurrentRawStream(index)
+    err, current = get_current()
+    if int(err):
+        return None
+    key = (index, stream, int(current))
+    count = _STREAM_SM_COUNTS.get(key)
+    if count is None:
+        err, context = stream_context(stream)
+        if int(err) or not int(context):
+            context = current
+        if not int(context):
+            return None
+        err, resource = context_resource(context, sm_type)
+        if int(err):
+            return None
+        count = _STREAM_SM_COUNTS[key] = int(resource.sm.smCount)
+    return count
+
+
+# Whether this process may launch the small-M route on a stream of an SM
+# partition (a green context).  Set when FlashInfer's green-context helpers or
+# torch create a green context (observed below), by
+# ``FLASHINFER_CAKE_FMHA_SM_PARTITIONS=1`` or by
+# :func:`enable_cake_fmha_sm_partitions`.  Until then a launch is planned on
+# the device's SM count without reading its stream.
+_SMALLM_SM_PARTITIONS = os.environ.get("FLASHINFER_CAKE_FMHA_SM_PARTITIONS") == "1"
+
+
+def enable_cake_fmha_sm_partitions(enabled: bool = True) -> None:
+    """Plan small-M decode splits on the SMs of the launch stream's CUDA
+    context.  On by itself once FlashInfer's green-context helpers or torch
+    create a green context; a process that partitions the device by other
+    means (the driver API directly) enables it."""
+
+    global _SMALLM_SM_PARTITIONS
+    _SMALLM_SM_PARTITIONS = bool(enabled)
+
+
+def _observe_torch_green_contexts() -> None:
+    """Enable the partition-aware plan when ``torch.cuda.green_contexts``
+    creates a green context or hands out its stream or context (which covers a
+    green context created before FlashInfer was imported); if torch's class
+    cannot be observed, enable it now."""
+
+    try:
+        from torch.cuda.green_contexts import GreenContext
+    except ImportError:
+        return
+
+    def observed(function):
+        @functools.wraps(function)
+        def enable_then_call(*args, **kwargs):
+            enable_cake_fmha_sm_partitions()
+            return function(*args, **kwargs)
+
+        enable_then_call._cake_fmha_observed = True  # type: ignore[attr-defined]
+        return enable_then_call
+
+    for name in ("__init__", "create", "Stream", "set_context"):
+        member = vars(GreenContext).get(name)
+        static = isinstance(member, staticmethod)
+        function = member.__func__ if static else member
+        if not callable(function) or getattr(function, "_cake_fmha_observed", False):
+            continue
+        try:
+            setattr(
+                GreenContext,
+                name,
+                staticmethod(observed(function)) if static else observed(function),
+            )
+        except (AttributeError, TypeError):
+            enable_cake_fmha_sm_partitions()
+            return
+
+
+_observe_torch_green_contexts()
+
+
+def _smallm_launch_sm_count(
+    device: torch.device, device_sm_count: int | None = None
+) -> int:
+    """The SMs a small-M launch on ``device``'s current torch stream can hold
+    at once: the device's (:func:`_smallm_sm_count`, or ``device_sm_count``
+    when the caller has it), bounded by the stream's CUDA context (a green
+    context's partition).  Every split of a small-M tile waits for all of them,
+    so a split count planned on more SMs than the stream's context holds never
+    completes."""
+
+    count = _smallm_sm_count(device) if device_sm_count is None else device_sm_count
+    if device.type != "cuda":
+        return count
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    partition = _stream_context_sm_count(index)
+    return count if partition is None or partition >= count else partition
 
 
 # On-device load-balanced split-KV decode (Cake routes ``decode_balanced_bf16_v1``
@@ -3219,20 +3356,28 @@ def _decode_smallm_program_select(
     num_split: int,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
+    whole_device: bool = True,
 ) -> tuple[tuple[str, str], int] | None:
     """``(program, num_split)`` of a small-M launch the generated programs
     serve, or ``None``: the module's split rule, except one 64-row tile of
     eight query tokens over 64-token pages whose KV is exactly nine 128-token
     blocks, which the nine-CTA cluster program merges in distributed shared
-    memory."""
+    memory.  The cluster program needs ``whole_device``: the launch's stream
+    holds every SM of the device.  A non-portable nine-CTA cluster needs nine
+    SMs of one GPC, which an SM partition (a green context) need not hold, and
+    its launch then fails; the binding does not expose the kernel to an
+    occupancy query, so a partition takes the split rule."""
 
     if block_tables.dtype != torch.int32 or seq_lens.dtype != torch.int32:
         return None
     cluster = 0
     # The cluster program's precondition: one tile (one request, one KV head)
-    # whose KV fits its nine 128-token blocks.
-    if (n_rows, page_size, q_len, group, tiles) == (64, 64, 8, 8, 1) and (
-        8 * 128 < max_seq_len <= 9 * 128
+    # whose KV fits its nine 128-token blocks, launched where its nine-CTA
+    # cluster is resident (``whole_device``).
+    if (
+        whole_device
+        and (n_rows, page_size, q_len, group, tiles) == (64, 64, 8, 8, 1)
+        and 8 * 128 < max_seq_len <= 9 * 128
     ):
         num_split = cluster = 9
     key = (n_rows, page_size, q_len, group, num_split, cluster)
@@ -3992,9 +4137,19 @@ def select_cake_fmha_decode_route(
         smallm_rows = _smallm_tile_rows_for(q_len, group)
         smallm_tiles = batch_size * num_kv_heads
         smallm_sm_count = _smallm_sm_count(device)
+        # The small-M split count is planned on the SMs the launch's stream
+        # holds (a green context's partition); the other routes keep the
+        # device's SM count.
+        smallm_launch_sm_count = (
+            _smallm_launch_sm_count(device, smallm_sm_count)
+            if _SMALLM_SM_PARTITIONS
+            and smallm_rows is not None
+            and query.shape[2] == 256
+            else smallm_sm_count
+        )
         smallm_num_split = _smallm_num_split(
             tiles=smallm_tiles,
-            sm_count=smallm_sm_count,
+            sm_count=smallm_launch_sm_count,
             max_seq_len=max_seq_len,
             n_rows=smallm_rows or 64,
         )
@@ -4097,6 +4252,7 @@ def select_cake_fmha_decode_route(
                 num_split=smallm_num_split,
                 block_tables=block_tables,
                 seq_lens=seq_lens,
+                whole_device=smallm_launch_sm_count >= smallm_sm_count,
             )
             smallm_key, smallm_split = smallm_program or (None, smallm_num_split)
             candidate = CakeFmhaDecodeRoute(
