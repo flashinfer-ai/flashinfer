@@ -108,6 +108,7 @@ from .cake_policy import (
     ProgramChoice,
     finalize_grid,
     select_program,
+    ticket_static_path,
 )
 
 NUM_HEADS = 32
@@ -620,9 +621,11 @@ def dsa_indexer_det_workspace_size(
     ranges.  The dispatch, and with it the bound, depends on ``T``, ``Tkv``,
     ``S``, ``ratio`` and ``top_k``; prepare a call's buffer for its own geometry
     (or for the largest bound over the geometries it will serve).  The bound
-    covers both sampling modes: where the record's ``l6_solo_rule`` gives a
-    call with the sampled first threshold off (``sample_tiles_max=0``) another
-    unit geometry than the sampled default, the larger of the two plans.
+    covers both sampling modes: where the record's ``l6_solo_rule``,
+    ``split_wave_scope`` or ``wide_pair_snake_only`` gives a call with the
+    sampled first threshold off (``sample_tiles_max=0``) another unit
+    geometry, pair or split than the sampled default, the larger of the two
+    plans.
     """
     return max(
         int(
@@ -755,11 +758,16 @@ class DSAIndexerDetRunner:
     # the buffer may be written between two runs by another runner of a different geometry
     # (its candidate region covers this tail) or by any other kernel the caller lends it to,
     # so ``run()`` zeroes the tail before every launch sequence, on the current stream; a
-    # graph capturing it carries that memset node.  A ``run()`` that raised while launching
-    # may have left the word non-zero: it marks the tail dirty and the next ``run()`` zeroes
-    # it first.
+    # graph capturing it carries that memset node.  Static calls (``_tail_static``): where the
+    # shape alone bounds the work units by the launched grid (``ticket_static_path``), every
+    # scan launch takes the static fast path, which gives each CTA its unit by index and never
+    # reads or writes the ticket word, so neither prepare nor a run zeroes the tail (no
+    # memset on either workspace kind).  A ``run()`` that raised while launching may have
+    # left the word non-zero: it marks the tail dirty and the next ``run()`` zeroes it
+    # first (static or not).
     ticket_tail: Optional[torch.Tensor] = field(default=None, repr=False)
     _tail_shared: bool = field(default=False, repr=False)
+    _tail_static: bool = field(default=False, repr=False)
     _tail_dirty: bool = field(default=False, repr=False)
 
     @property
@@ -788,10 +796,12 @@ class DSAIndexerDetRunner:
     def _run(self, *, fresh_tail: bool) -> tuple[torch.Tensor, torch.Tensor]:
         """``fresh_tail``: the caller knows the shared tail is still as ``prepare`` zeroed it (the eager entry runs a
         runner it just prepared, on the same stream, with nothing launched in between), so the memset of a
-        caller-owned workspace is skipped; a dirty tail is restored either way."""
+        caller-owned workspace is skipped (as on a static call, whose scan never touches the word); a dirty tail is
+        restored either way."""
         with _ffi_stream_context(self.device_index):
             if self.ticket_tail is not None and (
-                self._tail_dirty or (self._tail_shared and not fresh_tail)
+                self._tail_dirty
+                or (self._tail_shared and not fresh_tail and not self._tail_static)
             ):
                 # caller-owned workspace: others may have written the tail since the last run;
                 # or a previous run raised while launching.  Restore the ticket word before the scan.
@@ -1032,11 +1042,16 @@ def prepare_dsa_indexer_det_topk(
     # memset, a run adds none.  Caller-owned ``workspace_buffer``: the buffer may be written
     # between runs by others (another runner's candidate region, any kernel it is lent to),
     # so the runner zeroes the tail again before every run (see ``DSAIndexerDetRunner.ticket_tail``).
-    # sm_107a: no tail view, nothing zeroed.
+    # A static call (``ticket_static_path``: the shape bounds the work units by the launched
+    # grid, so every scan launch takes the static fast path and never touches the word) is
+    # zeroed neither here nor per run.  sm_107a: no tail view, nothing zeroed.
     ticket_tail = None
+    tail_static = False
     if launches and arch in TICKET_TAIL_ARCHES:
         ticket_tail = flat[workspace_bytes - TICKET_TAIL_BYTES : workspace_bytes]
-        ticket_tail.zero_()
+        tail_static = ticket_static_path(choice)
+        if not tail_static:
+            ticket_tail.zero_()
     return DSAIndexerDetRunner(
         arch=arch,
         abi=abi,
@@ -1052,6 +1067,7 @@ def prepare_dsa_indexer_det_topk(
         grid=grid,
         ticket_tail=ticket_tail,
         _tail_shared=caller_owned_workspace and ticket_tail is not None,
+        _tail_static=tail_static,
     )
 
 
