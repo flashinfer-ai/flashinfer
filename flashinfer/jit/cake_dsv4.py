@@ -386,7 +386,7 @@ _NVFP4_PREFILL_RECORDS = {
 
 def _nvfp4_variants(arch: str) -> dict[str, dict[str, object]]:
     """The NVFP4 records of one architecture (CUDA 13.4: PTX ISA 9.4 QMUL4)."""
-    return {
+    variants: dict[str, dict[str, object]] = {
         variant: {
             **record,
             "compile_flags": ["--use_fast_math"],
@@ -394,14 +394,14 @@ def _nvfp4_variants(arch: str) -> dict[str, dict[str, object]]:
             "min_cuda_version": "13.4",
         }
         for variant, record in _NVFP4_RECORDS.items()
-    } | {
-        variant: {
+    }
+    for variant, record in _NVFP4_PREFILL_RECORDS[arch].items():
+        variants[variant] = {
             **record,
             "compile_flags": ["--use_fast_math"],
             "min_cuda_version": "13.4",
         }
-        for variant, record in _NVFP4_PREFILL_RECORDS[arch].items()
-    }
+    return variants
 
 
 # The BF16 / FP8 argument plans, programs and variant routes (see the module
