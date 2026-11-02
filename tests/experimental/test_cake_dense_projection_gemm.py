@@ -2126,10 +2126,11 @@ def test_k2_memo_is_the_planners_check(monkeypatch):
     own[("sm_107a", "nn_t", 6144, 256)] = None
     assert runs(geometry, 1)
     assert check() == kept
-    # a full memo starts over
+    # a full memo starts over (from an empty memo: every check is a miss)
     monkeypatch.setattr(cake_backend, "_ROUTER_MEMO_SIZE", 5)
+    cake_backend.clear_convenience_caches()
     assert check() == kept
-    assert len(cake_backend._router_memo().without_verdict) <= 5
+    assert 0 < len(cake_backend._router_memo().without_verdict) <= 5
 
 
 def test_k2_memo_under_concurrent_table_changes(monkeypatch):
