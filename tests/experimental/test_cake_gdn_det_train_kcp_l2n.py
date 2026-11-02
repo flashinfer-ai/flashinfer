@@ -853,6 +853,17 @@ def test_saved_count_and_the_recompute_output_skip() -> None:
 # saved set v2, handle key, options and signatures
 
 
+def _same_field(a: object, b: object) -> bool:
+    """``True`` when ``a`` and ``b`` are the same tensor object, tuples of such, or equal non-tensor values."""
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        return len(a) == len(b) and all(
+            _same_field(x, y) for x, y in zip(a, b, strict=True)
+        )
+    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+        return a is b
+    return a is b or a == b
+
+
 def test_saved_set_v2_round_trip_and_refusals() -> None:
     ctx, ops = _setup()
     out, saved = kcp.chunk_gdn_det_fwd_kcp(
@@ -864,7 +875,11 @@ def test_saved_set_v2_round_trip_and_refusals() -> None:
     back = kcp.SavedDetKcp.from_tensors(
         saved.tensors(), saved.flags(), saved.meta(), ctx
     )
-    assert back == saved and back.qk_rstd is saved.qk_rstd
+    # Field by field: on Python >= 3.13 a dataclass ``__eq__`` compares tensor fields with ``==`` (ambiguous).
+    for f in dataclasses.fields(saved):
+        if f.compare:
+            assert _same_field(getattr(back, f.name), getattr(saved, f.name)), f.name
+    assert back.qk_rstd is saved.qk_rstd
     bwd = dict(backend="fake")
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
         kcp.chunk_gdn_det_bwd_kcp(
@@ -1172,3 +1187,43 @@ def test_nondeterministic_route_drops_or_refuses_the_l2n_option() -> None:
         facade._nd_without_l2n({"use_qk_l2norm_in_kernel": True})
     det_mapped = facade._options_for(True, {"use_qk_l2norm_in_kernel": True})
     assert det_options.make_options(det_mapped).use_qk_l2norm_in_kernel is True
+
+
+def test_nondeterministic_byte_queries_drop_or_refuse_the_l2n_option(
+    monkeypatch,
+) -> None:
+    """The facade's byte queries on the ``deterministic=False`` route follow the compute entries:
+    ``use_qk_l2norm_in_kernel=False`` reaches the non-deterministic package without the key and ``True`` is refused
+    with a ``ValueError``; the deterministic route forwards the keyword unchanged."""
+    facade = importlib.import_module("flashinfer.cake_gdn_train_kcp")
+    seen: list = []
+
+    def recorder(tag):
+        def fn(*args, **kwargs):
+            seen.append((tag, kwargs))
+            return 0
+
+        return fn
+
+    names = {
+        "gdn_saved_bytes_kcp": "gdn_det_saved_bytes_kcp",
+        "gdn_workspace_bytes_kcp": "gdn_det_workspace_bytes_kcp",
+    }
+    for entry, det_name in names.items():
+        monkeypatch.setattr(facade._pkg(), entry, recorder(f"nondet:{entry}"))
+        monkeypatch.setattr(facade._det(), det_name, recorder(f"det:{det_name}"))
+    ctx = object()  # the recorders read nothing
+    for entry, det_name in names.items():
+        query = getattr(facade, entry)
+        query(ctx, H_qk=1, HV=3, deterministic=False, use_qk_l2norm_in_kernel=False)
+        assert seen[-1][0] == f"nondet:{entry}"
+        assert "use_qk_l2norm_in_kernel" not in seen[-1][1]
+        with pytest.raises(
+            ValueError, match="does not support use_qk_l2norm_in_kernel"
+        ):
+            query(ctx, H_qk=1, HV=3, deterministic=False, use_qk_l2norm_in_kernel=True)
+        query(ctx, H_qk=1, HV=3, use_qk_l2norm_in_kernel=True)
+        assert seen[-1] == (
+            f"det:{det_name}",
+            {"H_qk": 1, "HV": 3, "use_qk_l2norm_in_kernel": True},
+        )

@@ -40,7 +40,8 @@ live in the routed package; this module forwards every keyword.  Every switch
 is a keyword argument; no environment variable is read.
 
 Operands of one rank (its ``T_r`` local tokens in fragment order): ``q, k``
-BF16 ``[1, T_r, H_qk, 128]`` (L2-normalized by the caller), ``v`` BF16
+BF16 ``[1, T_r, H_qk, 128]`` (L2-normalized by the caller, or in the kernel with
+``use_qk_l2norm_in_kernel=True`` on the deterministic route), ``v`` BF16
 ``[1, T_r, HV, 128]`` with ``HV % H_qk == 0`` (production ``(16, 48)``),
 ``g`` FP32 ``[1, T_r, HV]`` (the natural-log decay, preactivated, no clamp),
 ``beta`` FP32 ``[1, T_r, HV]`` (through the sigmoid).  Strided packed-QKV
@@ -530,7 +531,7 @@ def gdn_workspace_bytes_kcp(
     the per-phase terms are ``gdn_workspace_layout_kcp`` of the package) on the route ``deterministic`` selects."""
     if _deterministic(deterministic, "gdn_workspace_bytes_kcp"):
         return _det().gdn_det_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
-    return _pkg().gdn_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
+    return _pkg().gdn_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **_nd_without_l2n(kw))
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -541,7 +542,7 @@ def gdn_saved_bytes_kcp(
     crossing fragment, on the route ``deterministic`` selects."""
     if _deterministic(deterministic, "gdn_saved_bytes_kcp"):
         return _det().gdn_det_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
-    return _pkg().gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
+    return _pkg().gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **_nd_without_l2n(kw))
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
