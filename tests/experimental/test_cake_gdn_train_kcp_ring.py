@@ -102,7 +102,12 @@ def _pass(kcp, ctx, ops, **o) -> tuple[dict[str, torch.Tensor], list[str]]:
     )
     seq = list(kcp.LAST_CALL["fwd"]["sequence"])
     dq, dk, dv, dbeta, dg = kcp.chunk_gdn_bwd_kcp(
-        *args, ctx, ops["dout"], saved=saved, backend="fake", **o,
+        *args,
+        ctx,
+        ops["dout"],
+        saved=saved,
+        backend="fake",
+        **o,
         deterministic=False,
     )
     return {"out": out, "dq": dq, "dk": dk, "dv": dv, "dbeta": dbeta, "dg": dg}, seq
@@ -115,12 +120,8 @@ def _rank(rank: int, init_file: str, cu: list[int], crossing: bool) -> None:
     try:
         torch.set_flush_denormal(False)
         kcp, plan, l2n_ref = _mod("cake_kcp"), _mod("cake_kcp_plan"), _mod("cake_l2n")
-        part = plan.partition_kcp(
-            torch.tensor(cu, dtype=torch.int64), W, "contiguous"
-        )
-        ctx = plan.build_context_kcp(
-            part, dist.group.WORLD, rank, torch.device("cpu")
-        )
+        part = plan.partition_kcp(torch.tensor(cu, dtype=torch.int64), W, "contiguous")
+        ctx = plan.build_context_kcp(part, dist.group.WORLD, rank, torch.device("cpu"))
         assert int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS, int(ctx.n_d_max)
         if crossing:
             assert int(ctx.N_out) > 0 and int(ctx.n_d_max) == 3, (

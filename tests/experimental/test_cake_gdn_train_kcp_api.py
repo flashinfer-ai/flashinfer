@@ -1053,7 +1053,9 @@ def test_facade_forwards_the_l2n_option_on_both_routes(monkeypatch) -> None:
     facade.chunk_gdn_fwd_kcp(
         t, t, t, t, t, object(), options=mapping, deterministic=False
     )
-    assert seen[-1][0] == "nondet:chunk_gdn_fwd_kcp" and seen[-1][1]["options"] == mapping
+    assert (
+        seen[-1][0] == "nondet:chunk_gdn_fwd_kcp" and seen[-1][1]["options"] == mapping
+    )
     nd_o = OptionsKcp(use_qk_l2norm_in_kernel=True)
     assert nd_o.use_qk_l2norm_in_kernel is True
     facade.chunk_gdn_bwd_kcp(

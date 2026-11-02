@@ -728,12 +728,15 @@ def _pair_id(pair: PoisonPair) -> str:
 
 def _report_file(obj, kind: str) -> str:
     ident = _pair_id(obj) if isinstance(obj, PoisonPair) else _row_id(obj)
-    return ident + {
-        "full": ".json",
-        "fwd": "-fwd.json",
-        "poison": "-poison.json",
-        "l2n": "-l2n.json",
-    }[kind]
+    return (
+        ident
+        + {
+            "full": ".json",
+            "fwd": "-fwd.json",
+            "poison": "-poison.json",
+            "l2n": "-l2n.json",
+        }[kind]
+    )
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -3593,9 +3596,9 @@ def _run_rank_l2n(
         r for r, _g in res_off["bwd"]["records"]
     }
     info["norm_off_records"] = sorted(used)
-    flags["norm_off_launches_v1_only"] = used <= set(V1_LIBRARIES) and not res_off[
-        "fwd"
-    ]["qk_l2norm"]
+    flags["norm_off_launches_v1_only"] = (
+        used <= set(V1_LIBRARIES) and not res_off["fwd"]["qk_l2norm"]
+    )
     del res_off
 
     # (a) the norm on: the worst of N_REPEAT runs against FP64; every form against FP64 and its partner
@@ -3662,7 +3665,9 @@ def _run_rank_l2n(
             "run0",
         )
     res_host = saved_pass(group_reduce="host", **L2N)
-    arm("host_reduce", res_host, res, "run0", gate=False)  # reported, as the norm-off host form
+    arm(
+        "host_reduce", res_host, res, "run0", gate=False
+    )  # reported, as the norm-off host form
 
     # (b) the deterministic package with the norm on the same raw operands (its own partition / context / workspace)
     det_api = importlib.import_module(DET_API)

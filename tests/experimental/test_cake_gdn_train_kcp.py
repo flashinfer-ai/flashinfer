@@ -5490,8 +5490,6 @@ def test_gradients_accumulate_into_a_nonzero_grad(ckpt) -> None:
         _within_budget(lf.grad, pre[n].double() + ref[n], f"{n}: g0 + gradient")
 
 
-
-
 # ----------------------------------------------------------------------------------------------------------------
 # Packed Q/K/V (issue #7817): q / k / v as head views of the convolution's packed row; the backward writes dq / dk / dv
 # into one packed row and the split hands it on without a concatenation.

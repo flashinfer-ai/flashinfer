@@ -408,7 +408,15 @@ def _saved_pass(ctx, ops, *, q=None, k=None, ws=None, **o) -> dict[str, torch.Te
     kk = ops["k"] if k is None else k
     o = {"backend": "fake", **o}
     out, saved = kcp.chunk_gdn_fwd_kcp(
-        qq, kk, ops["v"], ops["g"], ops["beta"], ctx, workspace=ws, **o, deterministic=False
+        qq,
+        kk,
+        ops["v"],
+        ops["g"],
+        ops["beta"],
+        ctx,
+        workspace=ws,
+        **o,
+        deterministic=False,
     )
     dq, dk, dv, dbeta, dg = kcp.chunk_gdn_bwd_kcp(
         qq,
@@ -445,7 +453,9 @@ def _autograd(
     hd = kcp.RecomputeHandleKcp() if handle else None
 
     def fn(q, k, v, g, beta, h):
-        return kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, recompute_handle=h, **o, deterministic=False)
+        return kcp.chunk_gdn_kcp(
+            q, k, v, g, beta, ctx, recompute_handle=h, **o, deterministic=False
+        )
 
     if ckpt:
         from torch.utils.checkpoint import checkpoint
@@ -661,7 +671,9 @@ def test_modes_are_bitwise_with_the_norm(segments) -> None:
     g, beta = (ops[n].detach().clone().requires_grad_(True) for n in ("g", "beta"))
     before = dict(kcp.PACKED_SPLIT_STATS)
     pq, pk, pv = kcp.packed_qkv_views_kcp(qkv, H_qk=H, HV=HV)
-    out = kcp.chunk_gdn_kcp(pq, pk, pv, g, beta, ctx, backend="fake", **o, deterministic=False)
+    out = kcp.chunk_gdn_kcp(
+        pq, pk, pv, g, beta, ctx, backend="fake", **o, deterministic=False
+    )
     out.backward(ops["dout"])
     assert kcp.PACKED_SPLIT_STATS["aliased"] - before["aliased"] == 1
     assert kcp.LAST_CALL["bwd"]["grad_layout"] == "packed"
@@ -720,10 +732,18 @@ def test_backward_rebuilds_the_forward_rows(opts, source) -> None:
     ctx, ops = _setup()
     knobs = {"test_knobs": {"record_qk": True}}
     o = dict(use_qk_l2norm_in_kernel=True, **opts, **knobs)
-    out, saved = kcp.chunk_gdn_fwd_kcp(*_ops(ops), ctx, backend="fake", **o, deterministic=False)
+    out, saved = kcp.chunk_gdn_fwd_kcp(
+        *_ops(ops), ctx, backend="fake", **o, deterministic=False
+    )
     fwd = kcp.LAST_CALL["fwd"]["qk"]
     kcp.chunk_gdn_bwd_kcp(
-        *_ops(ops), ctx, ops["dout"], saved=saved, backend="fake", **o, deterministic=False
+        *_ops(ops),
+        ctx,
+        ops["dout"],
+        saved=saved,
+        backend="fake",
+        **o,
+        deterministic=False,
     )
     bwd = kcp.LAST_CALL["bwd"]["qk"]
     assert kcp.LAST_CALL["bwd"]["qk_source"] == source
@@ -875,14 +895,16 @@ def _same_field(a: object, b: object) -> bool:
 def test_saved_set_v2_round_trip_and_refusals() -> None:
     ctx, ops = _setup()
     out, saved = kcp.chunk_gdn_fwd_kcp(
-        *_ops(ops), ctx, backend="fake", use_qk_l2norm_in_kernel=True, deterministic=False
+        *_ops(ops),
+        ctx,
+        backend="fake",
+        use_qk_l2norm_in_kernel=True,
+        deterministic=False,
     )
     assert kcp.KCP_SAVED_VERSION == 2 and saved.version == 2
     assert saved.qk_l2norm is True and saved.flags() == (True, False, True)
     assert saved.tensors()[-1] is saved.qk_rstd and saved.meta()["qk_l2norm"] is True
-    back = kcp.SavedKcp.from_tensors(
-        saved.tensors(), saved.flags(), saved.meta(), ctx
-    )
+    back = kcp.SavedKcp.from_tensors(saved.tensors(), saved.flags(), saved.meta(), ctx)
     # Field by field: on Python >= 3.13 a dataclass ``__eq__`` compares tensor fields with ``==`` (ambiguous).
     for f in dataclasses.fields(saved):
         if f.compare:
@@ -893,7 +915,9 @@ def test_saved_set_v2_round_trip_and_refusals() -> None:
         kcp.chunk_gdn_bwd_kcp(
             *_ops(ops), ctx, ops["dout"], saved=saved, **bwd, deterministic=False
         )  # flag off, saved on
-    _o, saved_off = kcp.chunk_gdn_fwd_kcp(*_ops(ops), ctx, backend="fake", deterministic=False)
+    _o, saved_off = kcp.chunk_gdn_fwd_kcp(
+        *_ops(ops), ctx, backend="fake", deterministic=False
+    )
     with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel"):
         kcp.chunk_gdn_bwd_kcp(
             *_ops(ops),
@@ -929,7 +953,13 @@ def test_saved_set_v2_round_trip_and_refusals() -> None:
     v1 = dataclasses.replace(saved, version=1)
     with pytest.raises(ValueError, match="version"):
         kcp.chunk_gdn_bwd_kcp(
-            *_ops(ops), ctx, ops["dout"], saved=v1, use_qk_l2norm_in_kernel=True, **bwd, deterministic=False
+            *_ops(ops),
+            ctx,
+            ops["dout"],
+            saved=v1,
+            use_qk_l2norm_in_kernel=True,
+            **bwd,
+            deterministic=False,
         )
     owned = dataclasses.replace(saved, release_in_backward=True)
     owned.forget(kcp.QK_RSTD)
@@ -944,7 +974,9 @@ def test_handle_key_carries_the_flag() -> None:
     opts = kcp.make_options(
         backend="fake", use_qk_l2norm_in_kernel=True, save_transfer=False
     )
-    _out, saved = kcp.chunk_gdn_fwd_kcp(*_ops(ops), ctx, options=opts, deterministic=False)
+    _out, saved = kcp.chunk_gdn_fwd_kcp(
+        *_ops(ops), ctx, options=opts, deterministic=False
+    )
     key_off = kcp._handle_key(
         saved.T_r,
         saved.H_qk,
@@ -990,7 +1022,11 @@ def test_option_keyword_and_override_rule() -> None:
         assert p.kind == p.KEYWORD_ONLY and p.default is False, fn
         assert not any("rstd" in n for n in params), fn
     # the mode-dispatching facade forwards the option through its keyword arguments to the routed package
-    for fn in (facade.chunk_gdn_kcp, facade.chunk_gdn_fwd_kcp, facade.chunk_gdn_bwd_kcp):
+    for fn in (
+        facade.chunk_gdn_kcp,
+        facade.chunk_gdn_fwd_kcp,
+        facade.chunk_gdn_bwd_kcp,
+    ):
         params = inspect.signature(fn).parameters
         assert any(p.kind == p.VAR_KEYWORD for p in params.values()), fn
         assert not any("rstd" in n for n in params), fn
@@ -1009,7 +1045,10 @@ def test_option_keyword_and_override_rule() -> None:
     )
     assert kcp.LAST_CALL["fwd"]["qk_l2norm"] is True  # a non-default keyword overrides
     kcp.chunk_gdn_fwd_kcp(
-        *_ops(ops), ctx, options={"backend": "fake", "use_qk_l2norm_in_kernel": True}, deterministic=False
+        *_ops(ops),
+        ctx,
+        options={"backend": "fake", "use_qk_l2norm_in_kernel": True},
+        deterministic=False,
     )
     assert kcp.LAST_CALL["fwd"]["qk_l2norm"] is True
     leaves = [x.detach().clone().requires_grad_(True) for x in _ops(ops)]
@@ -1031,7 +1070,11 @@ def test_kernel_backend_refuses_until_the_records_ship() -> None:
         pytest.skip("the registry ships the in-kernel L2 norm records")
     with pytest.raises(RuntimeError, match="not ship"):
         kcp.chunk_gdn_fwd_kcp(
-            *_ops(ops), ctx, backend="kernels", use_qk_l2norm_in_kernel=True, deterministic=False
+            *_ops(ops),
+            ctx,
+            backend="kernels",
+            use_qk_l2norm_in_kernel=True,
+            deterministic=False,
         )
     with pytest.raises(ValueError, match="no shipped record"):
         jit.select_record("fwd_prep_l2n")
@@ -1109,9 +1152,7 @@ def test_workspace_layout_counts_the_norm_rows() -> None:
             ), (kw, ph)
         assert not any(k.endswith((".qn", ".kn", ".qk_rstd")) for k in off)
     with pytest.raises(TypeError):
-        gbytes.gdn_workspace_bytes_kcp(
-            ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=1
-        )
+        gbytes.gdn_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=1)
 
 
 def test_emulation_threads_the_flag() -> None:
@@ -1144,7 +1185,11 @@ def test_zero_token_rank_saves_an_empty_rstd() -> None:
         pytest.skip(f"no zero-token single-rank context: {exc}")
     ops = _raw_inputs([0, 0], 2, 6)
     out, saved = kcp.chunk_gdn_fwd_kcp(
-        *_ops(ops), ctx, backend="fake", use_qk_l2norm_in_kernel=True, deterministic=False
+        *_ops(ops),
+        ctx,
+        backend="fake",
+        use_qk_l2norm_in_kernel=True,
+        deterministic=False,
     )
     assert (
         tuple(saved.qk_rstd.shape) == (2, 0, 2) and saved.tensors()[-1] is saved.qk_rstd
@@ -1180,7 +1225,11 @@ def test_facade_nondeterministic_route_runs_the_norm() -> None:
     for how in (
         {"use_qk_l2norm_in_kernel": True},
         {"options": {"backend": "fake", "use_qk_l2norm_in_kernel": True}},
-        {"options": det_options.OptionsDetKcp(backend="fake", use_qk_l2norm_in_kernel=True)},
+        {
+            "options": det_options.OptionsDetKcp(
+                backend="fake", use_qk_l2norm_in_kernel=True
+            )
+        },
         {"options": kcp.make_options(backend="fake", use_qk_l2norm_in_kernel=True)},
     ):
         kw = {} if "options" in how else {"backend": "fake"}
@@ -1194,7 +1243,11 @@ def test_facade_nondeterministic_route_runs_the_norm() -> None:
         got = {"out": out, "dq": dq, "dk": dk, "dv": dv, "dg": dg, "dbeta": dbeta}
         _same(got, want, f"facade {how}")
     off = facade.chunk_gdn_fwd_kcp(
-        *_ops(ops), ctx, deterministic=False, backend="fake", use_qk_l2norm_in_kernel=False
+        *_ops(ops),
+        ctx,
+        deterministic=False,
+        backend="fake",
+        use_qk_l2norm_in_kernel=False,
     )[1]
     assert off.qk_l2norm is False and off.qk_rstd is None
     assert kcp.LAST_CALL["fwd"]["qk_l2norm"] is False
@@ -1209,21 +1262,27 @@ def test_facade_byte_queries_take_the_option_on_both_routes() -> None:
     for query in ("gdn_saved_bytes_kcp", "gdn_workspace_bytes_kcp"):
         q = getattr(facade, query)
         on = q(ctx, H_qk=H_qk, HV=HV, deterministic=False, use_qk_l2norm_in_kernel=True)
-        off = q(ctx, H_qk=H_qk, HV=HV, deterministic=False, use_qk_l2norm_in_kernel=False)
+        off = q(
+            ctx, H_qk=H_qk, HV=HV, deterministic=False, use_qk_l2norm_in_kernel=False
+        )
         det_on = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
         det_off = q(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=False)
         assert on > off and det_on > det_off, query
         assert on - off == det_on - det_off, query
-    assert facade.gdn_saved_bytes_kcp(
-        ctx, H_qk=H_qk, HV=HV, deterministic=False, use_qk_l2norm_in_kernel=True
-    ) - facade.gdn_saved_bytes_kcp(
-        ctx, H_qk=H_qk, HV=HV, deterministic=False
-    ) == 8 * int(ctx.T_r) * H_qk
+    assert (
+        facade.gdn_saved_bytes_kcp(
+            ctx, H_qk=H_qk, HV=HV, deterministic=False, use_qk_l2norm_in_kernel=True
+        )
+        - facade.gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, deterministic=False)
+        == 8 * int(ctx.T_r) * H_qk
+    )
 
 
 def _rel_rms(a: torch.Tensor, b: torch.Tensor) -> float:
     a, b = a.double(), b.double()
-    return float(((a - b).pow(2).mean().sqrt() / b.pow(2).mean().sqrt().clamp_min(1e-30)).item())
+    return float(
+        ((a - b).pow(2).mean().sqrt() / b.pow(2).mean().sqrt().clamp_min(1e-30)).item()
+    )
 
 
 @pytest.mark.parametrize("heads", [(2, 2), (2, 6)])
@@ -1231,13 +1290,19 @@ def test_det_package_with_the_norm_within_the_det_constants(heads) -> None:
     """The deterministic package with the norm on the same raw inputs and context (fake backend): every tensor within
     the deterministic accuracy constants of this package (rel-RMS <= 1e-2, max-abs <= 2e-2 of max|ref|), worst over
     both save modes and the checkpoint replay."""
-    det_kcp = importlib.import_module("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
-    det_plan = importlib.import_module("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp_plan")
+    det_kcp = importlib.import_module(
+        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp"
+    )
+    det_plan = importlib.import_module(
+        "flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp_plan"
+    )
     H_qk, HV = heads
     ops = _raw_inputs(CU, H_qk, HV)
     part = plan.partition_kcp(torch.tensor(CU, dtype=torch.int64), 1, "contiguous")
     ctx = plan.build_context_kcp(part, None, 0, CPU)
-    det_part = det_plan.partition_det_kcp(torch.tensor(CU, dtype=torch.int64), 1, "contiguous")
+    det_part = det_plan.partition_det_kcp(
+        torch.tensor(CU, dtype=torch.int64), 1, "contiguous"
+    )
     det_ctx = det_plan.build_context_det_kcp(det_part, None, 0, CPU)
     worst = {}
     for save_mode in ("light", "full"):
@@ -1254,5 +1319,12 @@ def test_det_package_with_the_norm_within_the_det_constants(heads) -> None:
             ma = float((nd[n].double() - ref).abs().max().item())
             bound = 2e-2 * float(ref.abs().max().item())
             worst[n] = max(worst.get(n, 0.0), rr)
-            assert rr <= 1e-2 and ma <= bound + 1e-30, (heads, save_mode, n, rr, ma, bound)
+            assert rr <= 1e-2 and ma <= bound + 1e-30, (
+                heads,
+                save_mode,
+                n,
+                rr,
+                ma,
+                bound,
+            )
     assert set(worst) == set(TENSORS)
