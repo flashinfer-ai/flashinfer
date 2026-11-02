@@ -64,6 +64,14 @@ _LARGE_P1024_TOKENS = (16384,)
 # 8192-token row of sm_100a today.
 _LARGE_P512FH2QR_ARCHES = ("sm_100a",)
 _LARGE_P512FH2QR_TOKENS = (8192,)
+# Architectures and token counts whose tile-N16 claim8 route quantizes and routes
+# in one launch: the 8- and 16-token routes' quant_route program (block 0 routes,
+# blocks 1..num_tokens quantize) replaces the separate quantization and
+# single-CTA router launches (four launches; the "m64_claim8_qr" selector) --
+# the 64-token row of sm_100a today.  The FC1, FC2, finalize and FC2 pool are
+# those of "m64_claim8".
+_MID_QR_ARCHES = ("sm_100a",)
+_MID_QR_TOKENS = (64,)
 # The 512- and 1024-token routes launch the routing kernel as one thread-block
 # cluster of this many CTAs (the kernel declares the matching cluster size).
 _ROUTE_MC_CLUSTER = 8
@@ -182,6 +190,16 @@ _SELECTORS = {
         },
         _M64_CLAIM8_FC2_GRID_N,
     ),
+    "m64_claim8_qr": (
+        _QUANT_ROUTE,
+        {
+            "quant_route": "quant_route:s2b",
+            "fc1": "fc1:n16_claim8",
+            "fc2": "fc2:n16_claim8",
+            "finalize": "finalize:feature",
+        },
+        _M64_CLAIM8_FC2_GRID_N,
+    ),
     "n32_claim8": (
         _FUSED,
         {
@@ -267,6 +285,8 @@ def _selector(arch, num_tokens):
     if num_tokens == 8:
         return "n8_feature_ef_f2e" if arch in _SMALL_L2POLICY_ARCHES else "n8_feature"
     if num_tokens in _FORCED_TILE_N16_TOKENS:
+        if arch in _MID_QR_ARCHES and num_tokens in _MID_QR_TOKENS:
+            return "m64_claim8_qr"
         return "m64_claim8"
     if num_tokens in _N32_CLAIM8_TOKENS:
         return "n32_claim8"
@@ -656,7 +676,9 @@ def _stage_constants(stage, views, prepared, num_tokens):
             K=_I,
             grid_m=_H // 128,
             grid_n=max_tiles,
-            K_tiles=1 if selector in ("m64_claim8", "n32_claim8") else 2,
+            K_tiles=1
+            if selector in ("m64_claim8", "m64_claim8_qr", "n32_claim8")
+            else 2,
             **route_views,
         )
         if workfeed:
@@ -678,6 +700,7 @@ def _stage_constants(stage, views, prepared, num_tokens):
             "n8_w2a_m16",
             "n8_w2a_m16_ef_f2e",
             "m64_claim8",
+            "m64_claim8_qr",
         )
         vec = 2 if tile_n == 8 else 8
         values = dict(
