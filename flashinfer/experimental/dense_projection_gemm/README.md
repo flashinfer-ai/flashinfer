@@ -150,7 +150,7 @@ the GPU's software power cap: after 21 of their 24 runs `nvidia-smi` read `clock
 were measured interleaved, in paired groups.  Inside the head/tail windows cuBLAS FP32 in
 `CUBLAS_FP32_EMULATED_BF16X9_MATH` (the benchmark's `bf16x9` arm) took x1.455-1.565 (GB200 hidden 4096), x1.516-1.594
 (GB200 hidden 5120), x1.534-1.610 (GB300), x1.630-1.715 (R200, 216 SMs), x1.647-1.728 (R200, 212 SMs) and
-x1.639-1.701 (R200, 208 SMs) of the partition's time: at least x1.455.  On the 208-SM and 212-SM parts at full SM
+x1.639-1.768 (R200, 208 SMs) of the partition's time: at least x1.455.  On the 208-SM and 212-SM parts at full SM
 clock `"H0.5x3"` was 0.9-2.1 % faster than `"H0.5x4"`, but on a 208-SM part at a lower SM clock (about 2000 MHz; there
 `"H0.5x4"` took x0.931-0.959 alone) it was up to 4.9 % slower than the deterministic plan when launched before a
 resident kernel, so both SM counts take `"H0.5x4"`.  The head/tail windows hold
