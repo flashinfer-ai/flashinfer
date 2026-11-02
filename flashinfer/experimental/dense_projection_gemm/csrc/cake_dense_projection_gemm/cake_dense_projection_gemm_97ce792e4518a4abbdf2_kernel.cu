@@ -238,6 +238,7 @@ kernel_cake_dense_projection_gemm_97ce792e4518a4abbdf2(const __grid_constant__ C
     const int box_addr = smem + 214016;
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 230400);
     const int work_response_addr = smem + 230400;
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
     // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 32 barriers)
     // Mbarriers at smem_raw[0..256)
@@ -329,6 +330,7 @@ kernel_cake_dense_projection_gemm_97ce792e4518a4abbdf2(const __grid_constant__ C
             unsigned int _phase_mma_done = 1;
             unsigned int _phase_work_full = 0;
             if (elect_sync()) {
+                asm volatile("griddepcontrol.wait;" ::: "memory");
                 unsigned int this_bid = bid;
                 #pragma unroll 1
                 for (unsigned int _unit_iter = 0; _unit_iter < units; _unit_iter++) {
@@ -768,6 +770,7 @@ kernel_cake_dense_projection_gemm_97ce792e4518a4abbdf2(const __grid_constant__ C
     if (warp >= 4 && warp <= 11) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 176;");
         { // epilogue_main
+            asm volatile("griddepcontrol.wait;" ::: "memory");
             unsigned int chunk_stage_1 = 0;
             unsigned int work_stage_2 = 0;
             const int epi_warp = warp % 4;

@@ -482,15 +482,19 @@ def test_k2_routes(monkeypatch):
     calls = atomic.calls
     (fwd2_args, fwd2_kwargs), (fwd_args, fwd_kwargs), (wg_args, wg_kwargs) = calls
     assert fwd2_args[1] is X and fwd2_args[2].equal(W.t())
-    assert fwd2_kwargs == {"splits": 2}
+    assert fwd2_kwargs == {"splits": 2, "enable_pdl": None}
     assert (
         fwd_args[0] == "launch"
         and fwd_args[1] is X
         and fwd_args[2].equal(W.t())
-        and fwd_kwargs == {"splits": None}
+        and fwd_kwargs == {"splits": None, "enable_pdl": None}
     )
     assert tuple(fwd_args[3].shape) == (T, N) and fwd_args[3].dtype == torch.float32
-    assert wg_args[1].equal(G.t()) and wg_args[2] is X and wg_kwargs == {"splits": 5}
+    assert (
+        wg_args[1].equal(G.t())
+        and wg_args[2] is X
+        and wg_kwargs == {"splits": 5, "enable_pdl": None}
+    )
     assert tuple(wg_args[3].shape) == (N, K)
     # the generic entry: the kn class runs the deterministic program, kk / nn_t this package's
     assert (
@@ -1912,9 +1916,10 @@ def test_k2_values_feed_every_registered_router_program():
         if cake_jit.MODULES[name]["template"].endswith(
             cake_backend.ROUTER_HEAD_TAIL_SUFFIX
         ):
-            assert [a for _, a in plan_args][-5:] == [
+            assert [a for _, a in plan_args][-6:] == [
                 "head_spans",
                 "head_steps",
+                "enable_pdl",
                 "grid_x",
                 "grid_y",
                 "grid_z",
@@ -2456,7 +2461,7 @@ def test_k2_bound_arguments_are_the_ordered_arguments(monkeypatch, case):
         else det_backend.arg_plan_of(det_backend.MODULES[split_module])
     )
     bound = cake_backend._k2_binding(
-        plan, out, split_src, module_name, arg_plan, split_module, split_arg_plan
+        plan, out, split_src, module_name, arg_plan, split_module, split_arg_plan, 0
     )
     n = split_src.numel()
     arena = cake_backend._AtomicArena(torch.device("cpu"), (0, 0))

@@ -81,6 +81,8 @@ kernel_cake_dense_projection_det_gemm_5b4e87b523f799e09384(float* __restrict__ s
     const int cta_rank = 0;
 
     // === Task calls (declaration order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     unsigned long long nn = (unsigned long long)n;
     unsigned long long e0 = (unsigned long long)(bid * 256 + tid) * 8;
     unsigned long long e1 = e0 + 4;

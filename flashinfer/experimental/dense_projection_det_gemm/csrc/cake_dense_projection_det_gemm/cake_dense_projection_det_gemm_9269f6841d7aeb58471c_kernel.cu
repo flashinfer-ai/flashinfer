@@ -216,6 +216,7 @@ kernel_cake_dense_projection_det_gemm_9269f6841d7aeb58471c(const __grid_constant
     const int b3_addr = smem + 50176;
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 214016);
     const int work_response_addr = smem + 214016;
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
     // Mbarrier init (9 pipeline groups, 0 ordered-sequence groups, 28 barriers)
     // Mbarriers at smem_raw[0..224)
@@ -283,6 +284,7 @@ kernel_cake_dense_projection_det_gemm_9269f6841d7aeb58471c(const __grid_constant
 
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 
     const int taddr = tmem_addr_storage[0];
 

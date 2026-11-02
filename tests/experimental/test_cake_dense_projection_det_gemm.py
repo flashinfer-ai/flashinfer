@@ -915,7 +915,9 @@ def test_registry_records_are_well_formed():
             assert plan_items[-4] == ["launch", "enable_pdl"]
             assert list(record["launch"]["block"]) == [256, 1, 1], name
             assert record["template"] in dict(
-                (t, w) for w, t in cake_backend.SWAP_TEMPLATES
+                (t, w)
+                for w, t in cake_backend.SWAP_TEMPLATES
+                + cake_backend.SWAP_TEMPLATES_WEIGHTS_STATIC
             )
             assert record["arches"] == list(cake_jit.ARCHES), name
         else:
@@ -6085,7 +6087,12 @@ def test_fused_split_selection_follows_the_registry(monkeypatch):
     source is a contiguous fp32 view of at most int32 elements; otherwise the torch chain splits."""
     assert cake_backend._split_grid(1) == (1, 1, 1)
     assert cake_backend._split_grid(3 * cake_backend.SPLIT_BLOCK_ELEMS + 1) == (4, 1, 1)
-    assert cake_backend._split_values("s", "p", 5) == {"src": "s", "parts": "p", "n": 5}
+    assert cake_backend._split_values("s", "p", 5) == {
+        "src": "s",
+        "parts": "p",
+        "n": 5,
+        "enable_pdl": 0,
+    }
     W = torch.empty(256, 6144)
     _cpu_router_registry(monkeypatch, fused=False)
     assert cake_backend.fused_split_module("sm_100a") is None
@@ -9323,6 +9330,55 @@ def test_swapped_forward_pdl_waits_for_an_early_producer(T):
         _check(O2, torch.einsum("gtd,gdr->gtr", A2.double(), B2.double()))
 
 
+@pytest.mark.parametrize("T", [16, 128])
+def test_swapped_forward_default_waits_for_an_early_producer_writing_b(T):
+    """The default (``enable_pdl`` on, ``weights_static`` off) never reads ``B`` before the preceding kernel
+    completes: a long planner GEMM on a few CTAs (K = 65536) that triggers its dependents at entry writes the weights
+    the swapped forward reads next, and the forward sees every weight it wrote.  (The ``weights_static`` programs read
+    the NaN the weights were poisoned with in this chain: that is what the keyword states cannot happen.)"""
+    _require_swap()
+    G, D, R, Kp = 2, 256, 256, 65536
+    g = torch.Generator(device="cuda").manual_seed(SEED + 8)
+    y = (torch.randn(G, R, Kp, device="cuda", generator=g) * Kp**-0.5).to(
+        torch.bfloat16
+    )
+    z = torch.randn(G, D, Kp, device="cuda", generator=g).to(torch.bfloat16)
+    o = torch.randn(T, G, D, device="cuda", generator=g).to(torch.bfloat16)
+    w = torch.empty(G, R, D, device="cuda", dtype=torch.bfloat16)
+    res = torch.empty(T, G, R, device="cuda", dtype=torch.bfloat16)
+    A, B, O = o.transpose(0, 1), w.transpose(1, 2), res.transpose(0, 1)
+    launch = _swap_launch(A, B, O)
+    assert launch is not None
+    assert not cake_jit.MODULES[launch.module_name]["template"].endswith("_we")
+    for _ in range(3):
+        w.fill_(float("nan"))
+        res.fill_(float("nan"))
+        # the producer of the weights: w[g] = y[g] @ z[g].T on the planner's program (N < 2 M: not swapped)
+        cake_backend.dense_projection_det_gemm(y, z.transpose(1, 2), w)
+        cake_backend.dense_projection_det_gemm(A, B, O)
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(w).all())
+        _check(O, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
+
+
+def test_weights_static_runs_the_weights_early_program():
+    """``weights_static=True`` with PDL routes the swapped rows to the ``_we`` programs, which give the default's
+    bits on weights no kernel in flight writes."""
+    _require_swap()
+    for template in cake_backend.SWAP_TEMPLATES_WEIGHTS_STATIC:
+        _require_program(template[1])
+    A, B, out = _swap_views(64, seed=SEED + 9)
+    early = cake_backend._swap_ab_cached(A, B, out, False, True)
+    assert early is not None
+    assert cake_jit.MODULES[early.module_name]["template"].endswith("_we")
+    cake_backend.dense_projection_det_gemm(A, B, out)
+    first = out.clone()
+    out.fill_(float("nan"))
+    cake_backend.dense_projection_det_gemm(A, B, out, weights_static=True)
+    torch.cuda.synchronize()
+    assert torch.equal(out, first)
+
+
 def test_swapped_forward_replays_in_a_cuda_graph_with_pdl():
     """The swapped launch allocates nothing: a PDL chain captured into a CUDA graph replays on new values written
     into the bound views."""
@@ -9356,14 +9412,32 @@ def test_swapped_forward_replays_in_a_cuda_graph_with_pdl():
 # ---------------------------------------------------------------------------
 
 
-def test_every_k1_program_takes_enable_pdl_per_call():
-    """Every K1 program (the planner's, the eight-warp form and the swapped forward) takes the per-call PDL flag right
-    before the grid; the router and its split kernel launch without the attribute."""
+def test_every_program_takes_enable_pdl_per_call():
+    """Every program (the planner's, the eight-warp form, the swapped forward, the router and its split kernel) takes
+    the per-call PDL flag right before the grid."""
     for name, record in cake_jit.MODULES.items():
         plan = [list(item) for item in cake_jit.arg_plan_of(record)]
-        k1 = record["template"].startswith(("dense_proj_det_gemm_", "swap_ab_"))
-        assert (plan[-4] == ["launch", "enable_pdl"]) == k1, (name, plan[-4])
-        assert sum(kind == "launch" for kind, _ in plan) == int(k1), name
+        assert plan[-4] == ["launch", "enable_pdl"], (name, plan[-4])
+        assert sum(kind == "launch" for kind, _ in plan) == 1, name
+
+
+def test_weights_static_selects_the_weights_early_programs():
+    """Each swapped tile ships twice on every architecture: the default program, whose weight loads wait for the
+    preceding kernel, and the ``_we`` one, whose weight loads run ahead of the wait; ``weights_static`` picks it."""
+    for arch in cake_jit.ARCHES:
+        for (w, safe), (w_we, early) in zip(
+            cake_backend.SWAP_TEMPLATES,
+            cake_backend.SWAP_TEMPLATES_WEIGHTS_STATIC,
+            strict=True,
+        ):
+            assert w == w_we and early == f"{safe}_we"
+            assert cake_jit.select_module(arch, safe) != cake_jit.select_module(
+                arch, early
+            )
+        pick = cake_backend.swap_ab_template
+        assert pick(8, 64, 1024, 152, arch) == "swap_ab_w64_t64_s12"
+        assert pick(8, 64, 1024, 152, arch, True) == "swap_ab_w64_t64_s12_we"
+        assert pick(8, 256, 1024, 152, arch, True) == "swap_ab_w128_t64_s8_we"
 
 
 def test_enable_pdl_defaults_to_device_support():

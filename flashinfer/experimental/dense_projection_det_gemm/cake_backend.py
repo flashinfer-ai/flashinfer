@@ -4325,15 +4325,20 @@ def _launch_cached_gemm(
 # weights stream through a deep TMA ring, at most two waves of single-CTA tiles, and every output element is the one FP32 sum
 # of its whole K, rounded once (no split, so the bits do not depend on the tile).  The program reads ``A`` and the
 # K-major ``B`` through tensor maps over the caller's views and stores into ``out`` at
-# ``l * out_l + m * ldo + n``, so token-major views run without a copy.  Its weight loads run ahead of the PDL wait
-# (only the token loads wait): with ``enable_pdl`` the call overlaps its weight stream with the predecessor's tail,
-# which requires that no kernel still in flight on the stream writes ``B``.
+# ``l * out_l + m * ldo + n``, so token-major views run without a copy.  Under ``enable_pdl`` the default programs
+# wait for the predecessor grid before any operand load; with ``weights_static=True`` (the caller states that no
+# kernel still in flight on the stream writes ``B``) the ``_we`` programs run instead, whose weight loads start ahead
+# of the wait (only the token loads wait), so the weight stream overlaps the predecessor's tail.
 SWAP_TILE_T = 64  # tokens per CTA of the swapped programs
 #: Weight rows per CTA -> the template serving them, in preference order: the narrow tile while its CTAs fit one
 #: wave (more CTAs streaming the weights), the wide one otherwise.
 SWAP_TEMPLATES: Tuple[Tuple[int, str], ...] = (
     (64, "swap_ab_w64_t64_s12"),
     (128, "swap_ab_w128_t64_s8"),
+)
+#: The same tiles whose weight loads run ahead of the PDL wait (``weights_static=True``).
+SWAP_TEMPLATES_WEIGHTS_STATIC: Tuple[Tuple[int, str], ...] = tuple(
+    (tile_w, f"{template}_we") for tile_w, template in SWAP_TEMPLATES
 )
 #: The most waves of single-CTA tiles a swapped forward runs in.  Its CTAs each stream their weight rows once; past
 #: two waves the planner's pair tiles stream them faster (GB300: 8 x 4096 x 1024 at 64 tokens, 256 CTAs, 17.0 us
@@ -4367,13 +4372,16 @@ def _aligned_view(t: torch.Tensor) -> bool:
     )
 
 
-def swap_ab_template(L: int, M: int, N: int, sm_count: int, arch: str) -> Optional[str]:
+def swap_ab_template(
+    L: int, M: int, N: int, sm_count: int, arch: str, weights_static: bool = False
+) -> Optional[str]:
     """The ``swap_ab_<tile>`` template a swapped forward of ``L`` batches of ``M`` tokens against ``N`` weight rows
-    runs on ``arch``: the first of :data:`SWAP_TEMPLATES` whose CTAs fit one wave of the device's SMs, else the
-    widest; ``None`` when that one needs more than :data:`SWAP_MAX_WAVES` waves (the planner's program is faster
+    runs on ``arch``: the first of :data:`SWAP_TEMPLATES` (:data:`SWAP_TEMPLATES_WEIGHTS_STATIC` with
+    ``weights_static``) whose CTAs fit one wave of the device's SMs, else the widest; ``None`` when that one needs more than :data:`SWAP_MAX_WAVES` waves (the planner's program is faster
     there) or ``arch`` registers none of them."""
     table = KERNELS.get(arch, {})
-    registered = [(w, t) for w, t in SWAP_TEMPLATES if t in table]
+    templates = SWAP_TEMPLATES_WEIGHTS_STATIC if weights_static else SWAP_TEMPLATES
+    registered = [(w, t) for w, t in templates if t in table]
     if not registered:
         return None
     m_tiles = -(-M // SWAP_TILE_T)
@@ -4387,7 +4395,11 @@ def swap_ab_template(L: int, M: int, N: int, sm_count: int, arch: str) -> Option
 
 
 def _swap_ab_launch(
-    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, transposed_out: bool
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    transposed_out: bool,
+    weights_static: bool = False,
 ) -> Optional[_SwapLaunch]:
     """The swapped launch of a K1 call, or ``None`` when the call stays on the planner: a batched forward
     (``A`` K-major, ``B`` K-major, BF16 out, no transposed store) that :func:`swap_small_m` selects, with ``K`` a
@@ -4430,11 +4442,13 @@ def _swap_ab_launch(
     facts = device_facts(device)
     if facts.arch is None:
         return None
-    template = swap_ab_template(L, M, N, facts.sm_count, facts.arch)
+    template = swap_ab_template(L, M, N, facts.sm_count, facts.arch, weights_static)
     if template is None:
         return None
     module_name = select_module(facts.arch, template)
-    tile_w = dict((t, w) for w, t in SWAP_TEMPLATES)[template]
+    tile_w = dict((t, w) for w, t in SWAP_TEMPLATES + SWAP_TEMPLATES_WEIGHTS_STATIC)[
+        template
+    ]
     grid = (-(-N // tile_w), -(-M // SWAP_TILE_T), L)
     module = load_cake_dense_projection_det_gemm_module(module_name, facts.arch)
     entry = getattr(module, MODULES[module_name]["ffi_entry"])
@@ -4445,18 +4459,28 @@ _SWAP_CACHE: "OrderedDict[tuple, Union[_SwapLaunch, bool]]" = OrderedDict()
 
 
 def _swap_ab_cached(
-    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, transposed_out: bool
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    transposed_out: bool,
+    weights_static: bool = False,
 ) -> Optional[_SwapLaunch]:
-    """:func:`_swap_ab_launch` cached by the device and the geometry of the views (a routed launch, or ``False``
-    for a row that stays on the planner) in a least-recently-used cache of ``CONVENIENCE_CACHE_SIZE`` entries."""
+    """:func:`_swap_ab_launch` cached by the device, ``weights_static`` and the geometry of the views (a routed
+    launch, or ``False`` for a row that stays on the planner) in a least-recently-used cache of
+    ``CONVENIENCE_CACHE_SIZE`` entries."""
     if not (A.is_cuda and B.is_cuda and out.is_cuda):
         return None
     key = convenience_key(
-        _cuda_index(out.device), 0, (bool(transposed_out),), A, B, out
+        _cuda_index(out.device),
+        0,
+        (bool(transposed_out), bool(weights_static)),
+        A,
+        B,
+        out,
     )
     hit = _cache_get(_SWAP_CACHE, key)
     if hit is None:
-        launch = _swap_ab_launch(A, B, out, transposed_out)
+        launch = _swap_ab_launch(A, B, out, transposed_out, weights_static)
         with _PLAN_LOCK:
             hit = _cache_put(_SWAP_CACHE, key, launch if launch is not None else False)
     return hit or None
@@ -4494,19 +4518,22 @@ def dense_projection_det_gemm(
     *,
     transposed_out: bool = False,
     enable_pdl: Optional[bool] = None,
+    weights_static: bool = False,
 ) -> torch.Tensor:
     """``out[l, m, n] = sum_k A[l, m, k] B[l, k, n]`` for strided views (the cached convenience path:
     planned once per device, stream and view geometry, then rebound and launched).
 
     A batched forward row of few tokens (:func:`swap_small_m`) runs the swapped program (:func:`swap_ab_template`),
     every other row the planner's program.  ``enable_pdl`` (default: the device supports it) launches either as a
-    programmatic dependent launch: every CTA lets the next kernel launch at its entry; the planner's program waits
-    for the preceding kernel before its first global access, the swapped program before its token loads only, its
-    weight loads starting while the preceding kernel finishes, so ``B`` must not be written by a kernel still in
-    flight on the stream (a weight is a parameter of the model).  Pass ``enable_pdl=False`` when it is."""
-    swap = _swap_ab_cached(A, B, out, transposed_out)
+    programmatic dependent launch: every CTA lets the next kernel launch at its entry and waits for the preceding
+    kernel before its first global access.  ``weights_static=True`` states that no kernel still in flight on the
+    stream writes ``B`` (a weight of the model between updates): the swapped program then starts its weight loads
+    before the wait, so the weight stream overlaps the preceding kernel's tail, and only its token loads wait.  The
+    default never reads ``B`` before the preceding kernel completes."""
+    pdl = pdl_enabled(enable_pdl, out.device)
+    swap = _swap_ab_cached(A, B, out, transposed_out, bool(weights_static) and pdl)
     if swap is not None:
-        return _run_swap_ab(swap, A, B, out, pdl_enabled(enable_pdl, out.device))
+        return _run_swap_ab(swap, A, B, out, pdl)
     return _launch_cached_gemm(
         A, B, out, transposed_out=transposed_out, enable_pdl=enable_pdl
     )
@@ -4865,11 +4892,11 @@ def _fused_split_for(arch: str, split_src: torch.Tensor) -> Optional[str]:
     return fused_split_module(arch)
 
 
-def _split_values(src: Any, parts: Any, n: int) -> dict[str, Any]:
-    """The keyword arguments of a fused split launch -- the fp32 source, the ``[3, *src.shape]`` BF16 stack and
-    the element count -- ordered by the module's argument plan in :func:`_bind`.  The one place the program's
-    binding names live."""
-    return dict(src=src, parts=parts, n=int(n))
+def _split_values(src: Any, parts: Any, n: int, enable_pdl: Any = 0) -> dict[str, Any]:
+    """The keyword arguments of a fused split launch -- the fp32 source, the ``[3, *src.shape]`` BF16 stack,
+    the element count and the PDL flag -- ordered by the module's argument plan in :func:`_bind`.  The one place
+    the program's binding names live."""
+    return dict(src=src, parts=parts, n=int(n), enable_pdl=enable_pdl)
 
 
 def _split_grid(n: int) -> tuple[int, int, int]:
@@ -5016,9 +5043,10 @@ def _k2_values(
     out32: Any,
     ldo: int,
     out_l: int,
+    enable_pdl: Any,
 ) -> dict[str, Any]:
     """The keyword arguments of a K2 launch; ``A`` / ``parts`` / ``out32`` are views or :class:`_Slot`
-    markers."""
+    markers, ``enable_pdl`` the launch's PDL flag (0 or 1) or a :class:`_Slot`."""
     return dict(
         A=A,
         B=parts,
@@ -5031,6 +5059,7 @@ def _k2_values(
         ldo=ldo,
         out_l=out_l,
         num_cluster_tiles=plan.num_cluster_tiles,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -5040,10 +5069,13 @@ def prepare_router_fp32_det_gemm(
     out: torch.Tensor,
     *,
     splits: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> PreparedRouterDetGemm:
     """Validate one fp32 binding, plan it and prepare its launch (the only allocations of the
     K2 backend: the BF16x3 stack, the fp32 residual scratch of the torch-chain split and the
-    split-K workspace)."""
+    split-K workspace).  ``enable_pdl`` (default: the device supports it) launches the fused split and the
+    router as programmatic dependent launches, each waiting for the preceding kernel before its first global
+    access."""
     plan, _, _, arch, module_name = _k2_plan(A, B, out, splits=splits)
     device = out.device
     a_view, split_src = _k2_views(A, B, plan)
@@ -5059,13 +5091,16 @@ def prepare_router_fp32_det_gemm(
         out32, ldo, out_l = workspace, *_k2_workspace_strides(workspace)
     else:
         out32, ldo, out_l = _k2_out32(out), int(out.stride(0)), 0
-    values = _k2_values(plan, A=a_view, parts=parts, out32=out32, ldo=ldo, out_l=out_l)
+    pdl = int(pdl_enabled(enable_pdl, device))
+    values = _k2_values(
+        plan, A=a_view, parts=parts, out32=out32, ldo=ldo, out_l=out_l, enable_pdl=pdl
+    )
     launch = bind_launch(module_name, values, plan.grid, arch)
     split_launch = None
     if split_module is not None:
         n = split_src.numel()
         split_launch = bind_launch(
-            split_module, _split_values(split_src, parts, n), _split_grid(n), arch
+            split_module, _split_values(split_src, parts, n, pdl), _split_grid(n), arch
         )
     return PreparedRouterDetGemm(
         module_name=module_name,
@@ -5154,13 +5189,14 @@ def _prepare_cached_router(
         out32=_Slot("out32"),
         ldo=ldo,
         out_l=out_l,
+        enable_pdl=_Slot("enable_pdl"),
     )
     entry, template = _bind(module_name, values, plan.grid, arch)
     split = None
     if split_module is not None:
         split = _bind(
             split_module,
-            _split_values(_Slot("src"), _Slot("parts"), n),
+            _split_values(_Slot("src"), _Slot("parts"), n, _Slot("enable_pdl")),
             _split_grid(n),
             arch,
         )
@@ -5185,7 +5221,12 @@ def _prepare_cached_router(
 
 
 def _launch_cached_router(
-    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int]
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    splits: Optional[int],
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """The convenience path of K2: plan on the first call for a (device, stream, geometry, splits) key; on every
     call re-split the second operand into the BF16x3 stack carved out of the arena of the device and stream (one
@@ -5224,6 +5265,7 @@ def _launch_cached_router(
             parts=ws["parts"],
             out32=_k2_out32(out) if workspace is None else workspace,
             src=split_src,
+            enable_pdl=int(pdl_enabled(enable_pdl, index)),
         )
         with _ffi_stream_context(index, stream):
             if cached.split is not None:
@@ -5238,11 +5280,17 @@ def _launch_cached_router(
 
 
 def router_fp32_det_gemm(
-    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, splits: Optional[int] = None
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    splits: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[m, n] = sum_k A[m, k] B[k, n]`` for fp32 views through the emulation (the cached convenience
-    path: planned once per device, stream, view geometry and split count, then re-split and launched)."""
-    return _launch_cached_router(A, B, out, splits=splits)
+    path: planned once per device, stream, view geometry and split count, then re-split and launched).
+    ``enable_pdl`` as for :func:`prepare_router_fp32_det_gemm`."""
+    return _launch_cached_router(A, B, out, splits=splits, enable_pdl=enable_pdl)
 
 
 def router_det_forward(
@@ -5251,20 +5299,25 @@ def router_det_forward(
     out: Optional[torch.Tensor] = None,
     *,
     splits: int = 4,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation."""
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.float32)
-    return router_fp32_det_gemm(X, W.t(), out, splits=splits)
+    return router_fp32_det_gemm(X, W.t(), out, splits=splits, enable_pdl=enable_pdl)
 
 
 def router_det_dgrad(
-    G: torch.Tensor, W: torch.Tensor, out: Optional[torch.Tensor] = None
+    G: torch.Tensor,
+    W: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[T, K] = G[T, N] @ W[N, K]`` in FP32 through the emulation."""
     if out is None:
         out = torch.empty(G.shape[0], W.shape[1], device=G.device, dtype=torch.float32)
-    return router_fp32_det_gemm(G, W, out, splits=1)
+    return router_fp32_det_gemm(G, W, out, splits=1, enable_pdl=enable_pdl)
 
 
 def router_det_wgrad(
@@ -5273,11 +5326,12 @@ def router_det_wgrad(
     out: Optional[torch.Tensor] = None,
     *,
     splits: int = 6,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store."""
     if out is None:
         out = torch.empty(G.shape[1], X.shape[1], device=G.device, dtype=torch.float32)
-    return router_fp32_det_gemm(G.t(), X, out, splits=splits)
+    return router_fp32_det_gemm(G.t(), X, out, splits=splits, enable_pdl=enable_pdl)
 
 
 # --- the former public names (before the det rename), aliases of the canonical objects -----------------------
