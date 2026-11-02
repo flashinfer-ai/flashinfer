@@ -612,7 +612,7 @@ def test_indexer_scores_rejects_bad_shapes() -> None:
         keys = padded[:, : 64 * 128].view(4, 64, 128)
         run(query, keys, table, context, requests=requests, scores=scores)
     with pytest.raises(ValueError, match="multiple of 16 bytes apart"):
-        padded = torch.zeros(4, 64 * 8 + 2, dtype=torch.uint8, device="cuda")
+        padded = torch.zeros(4, 64 * 8 + 4, dtype=torch.uint8, device="cuda")
         run(
             torch.zeros(4, 64, dtype=torch.uint8, device="cuda"),
             torch.zeros(4, 64, 64, dtype=torch.uint8, device="cuda"),

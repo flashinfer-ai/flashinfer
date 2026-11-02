@@ -171,6 +171,7 @@ gather_key_sample_trace = TraceTemplate(
         ),
         "sample_scales": Tensor(
             ["requests", "capacity", "scales"],
+            dtype_from="sample_scales",
             dtype="float8_e4m3fn",
             param="sample_scales",
             optional=True,
