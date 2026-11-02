@@ -68,7 +68,7 @@ CTAs, 512 for the 128-thread form) and
 and architecture (the token-count bands ``BWD_SLAB_BANDS`` ahead of the
 per-architecture ``BWD_SLAB_PROGRAM``: the dynamic-schedule form ``dynr`` on
 sm_100a and sm_103a, ``xrsg`` on sm_107a; on sm_100a for ``1024 < T <= 4096``
-its late-claim form ``dynl``, which ``BWD_SLAB_FIT`` replaces with ``xrsg``
+its late-claim form ``dynl``, which ``BWD_SLAB_FIT`` replaces with ``xrsg_p160``
 where the K7 units fit the SMs and at the chunk counts / runs it lists); the
 residual mixing's program of record is per
 architecture too (``FWD_FINISH_PROGRAM`` / :func:`fwd_finish_program`, its
@@ -3374,7 +3374,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
-    "cake_mhc_det_train_bwd_slab__xrsg": {
+    "cake_mhc_det_train_bwd_slab__xrsg_p160": {
         "arches": [
             "sm_100a",
         ],
@@ -3402,17 +3402,17 @@ MODULES: dict[str, dict[str, Any]] = {
             "slabs": 64,
         },
         "hidden": 4096,
-        "kernel": "cake_mhc_det_train_bwd_slab__xrsg",
-        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__xrsg",
+        "kernel": "cake_mhc_det_train_bwd_slab__xrsg_p160",
+        "kernel_symbol": "kernel_cake_mhc_det_train_bwd_slab__xrsg_p160",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 232448,
+            "dynamic_smem_bytes": 230912,
             "persistent_ctas_per_sm": 1,
             "use_pdl": "runtime",
         },
-        "library": "cake_mhc_det_train_bwd_slab__xrsg",
+        "library": "cake_mhc_det_train_bwd_slab__xrsg_p160",
         "logical": {
             "P": "parts",
             "T": "rows",
@@ -3429,7 +3429,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_slab",
         "select_rule": {
             "kind": "program",
-            "program": "xrsg",
+            "program": "xrsg_p160",
             "rule": "bwd_slab_program",
         },
         "workspace_rule": {
@@ -7152,7 +7152,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn",
             "cake_mhc_det_train_bwd_token__rt64",
             "cake_mhc_det_train_bwd_slab__dynr",
-            "cake_mhc_det_train_bwd_slab__xrsg",
+            "cake_mhc_det_train_bwd_slab__xrsg_p160",
             "cake_mhc_det_train_bwd_slab__dynl",
             "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl",
             "cake_mhc_det_train_bwd_reduce__wpu4_spred",
@@ -8001,7 +8001,7 @@ BWD_SLAB_BANDS = {
 # BWD_SLAB_FIT: (program, replacement, P values, (P, above, at_most) runs) per architecture -- where the band names
 # `program` and the K7 units of the call fit the SM count (k7_chunks(T, sm_count).units <= sm_count: one round, every
 # CTA one unit, no ticket drawn), its chunk count P is one of the listed values, or its P is a run's P with
-# above < T <= at_most, `replacement` is launched instead. On sm_100a ("dynl", "xrsg", (), ((7, 1536, 1792),
+# above < T <= at_most, `replacement` is launched instead. On sm_100a ("dynl", "xrsg_p160", (), ((7, 1536, 1792),
 # (9, 2176, 2304), (7, 1920, 2240), (19, 2304, 2432), (19, 3584, 3648))) [K7N draft: the P = 9 / P = 19 exclusions
 # as runs; the other P = 9 runs pass the FlashInfer-level re-gate on the shipped dynl, the P = 19 run 2305-2432
 # does not (GB200 backward_finish 1.0101-1.0208)]:
@@ -8013,12 +8013,17 @@ BWD_SLAB_BANDS = {
 # 3616 (GB200). The P = 7 rows exist on 152 SMs only; in the runs 1537-1792 and
 # 1921-2240 dynl read 1.0147 at 1728, and with a 128-thread side CTA on every SM its path took 1.0783 / 1.0784 of its
 # unloaded path at 2048 (two GB200 sessions; the bound is 1.0625), where the other P = 7 runs read 0.9965-1.0064 and
-# a loaded path of 1.0299-1.0496 (1216 / 1280: one GB200 session, 2560 / 3072 / 3584: two). So xrsg stays the
-# program at these rows and a full-SM side load still holds them (a coverage boundary of FlashInfer #7046).
+# a loaded path of 1.0299-1.0496 (1216 / 1280: one GB200 session, 2560 / 3072 / 3584: two). So the static schedule
+# stays the program at these rows, as xrsg_p160: xrsg with the 160-register pool and 64-byte token table rows,
+# bitwise with xrsg, whose 229,888-byte pool leaves room for a 128-thread side CTA on every SM. There its loaded cell
+# completes 8/8 where xrsg's does not (path 1.0312-1.0390 of its unloaded path on B200 at 1536 / 2048 / 2560 / 3584,
+# 0.9501-1.0317 on GB200 at 1536 / 2048 / 2304 / 2368 / 3616, the P = 7 / 9 / 19 rows included; the bound is
+# 1.0625), and unloaded it takes 1.0028-1.0052 (B200) and 0.9972-1.0039 (GB200) of xrsg's backward path (two sessions
+# each on distinct hosts, identical-program control 0.9971-1.0017).
 BWD_SLAB_FIT = {
     "sm_100a": (
         "dynl",
-        "xrsg",
+        "xrsg_p160",
         (),
         (
             (7, 1536, 1792),
