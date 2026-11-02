@@ -717,11 +717,13 @@ DX_BITWISE_WITH = {
     "cake_rmsnorm_train_ae610afdf77ff6714a5b": "cake_rmsnorm_det_train_b457c4d134e44476dc6f",
     # sm_100a H2048 column (0, 336]; det module at T 257
     "cake_rmsnorm_train_64e6aa82bb2c6d4ea978": "cake_rmsnorm_det_train_caf6978ed0a17fbf65b9",
-    # sm_100a H2048 help row (7168, 11264] and (13608, 45056]; det module at T 16385
+    # sm_100a H2048 help row (7168, 11264], (13608, 45056] and (58880, inf); det
+    # module at T 16385 and 65536
     "cake_rmsnorm_train_0fa4f255caf709d09f66": "cake_rmsnorm_det_train_ceeef043ac64f37fc529",
     # sm_100a H4096 column (0, 1152]; det module at T 257
     "cake_rmsnorm_train_4822793ea0c954c11af6": "cake_rmsnorm_det_train_59270fb249dcba1ff679",
-    # sm_100a H4096 help row (4608, 36864]; det module at T 16385
+    # sm_100a H4096 help row (4608, 36864] and (52736, inf); det module at T 16385
+    # and 65536
     "cake_rmsnorm_train_15e157d2ee9080d206a9": "cake_rmsnorm_det_train_35a0b0ca6b2060313255",
     # sm_100a H6144 column (0, 1152]; det module at T 257 (the help row differs)
     "cake_rmsnorm_train_44508df7dab2ab688f85": "cake_rmsnorm_det_train_5c804aed7ad14b99e1d0",
@@ -863,31 +865,40 @@ def test_repeated_launches_against_fp64_and_det(
     )
 
 
-# H5120: the backward runs the plain det pair up to H5120_PLAIN_EDGE, the
-# deterministic package's compensated det pair (compensated per-chunk dw sums)
-# from there up to H5120_ACCURACY_EDGE, and the FP64-accumulating single kernel
-# (on sm_103a its twosum form) above it.  The plain edge is the deterministic
-# package's own switch to its compensated pair; the accuracy edge, per weight
-# dtype, is the largest token count at which the compensated pair's dw is
-# measured within ACCURACY_MARGIN of the per-element budget: T 65536, and T 57344
-# for the FP32 weight on R200 (0.877 of the budget at T 65536).  The margin is
-# taken against the FP64 reference at the kernel's FP32 rstd; against the FP64
-# reference at the FP64 rstd (which differs from it by the forward's FP32 rstd
-# rounding, the same for the deterministic package) the dw stays within the
-# budget.  Worst dw element over its budget at the kernel's rstd, 60 inputs of
-# each of three input families, BF16 and FP32 weight: B200 plain pair <= 0.236
-# up to T 6144, compensated pair <= 0.781 up to T 65536, single <= 0.643 at
-# T 65537; GB300 plain pair <= 0.245 up to T 5120, compensated pair <= 0.657 up
-# to T 65536, twosum single <= 0.0006 at T 65537 and 81920; R200 plain pair
-# <= 0.499 (216 SMs) and <= 0.545 (212 SMs) up to T 19968, compensated pair
-# <= 0.767 (BF16 weight, up to T 65536; 0.837 at T 65536 on 216 SMs) and
-# <= 0.732 (FP32 weight, up to T 57344), single <= 0.639 at T 65537 (BF16
-# weight) and <= 0.633 at T 57345 (FP32 weight) (212 SMs).
+# H5120: the backward runs the plain det pair up to H5120_PLAIN_EDGE (with
+# BF16 weight a single kernel up to T 896 on sm_100a and from T 320 to 896 on
+# sm_103a), the deterministic package's compensated det pair (compensated
+# per-chunk dw sums) from there up to H5120_ACCURACY_EDGE, and the
+# FP64-accumulating single kernel (on sm_103a its twosum form) above it.  The
+# plain edge is the deterministic package's own switch to its compensated
+# pair.  The accuracy edge is T 65536, the top of the qualified range, on
+# sm_100a, T 61952 on sm_103a and T 49152 on sm_107a, for both weight dtypes:
+# on GB300 the compensated pair's worst dw element reaches 0.888 of its budget
+# at T 62464 (FP32 weight; the two weight dtypes' compensated pairs compute
+# the same dw for equal inputs), and on the 216-SM R200 board 0.867 at T 53248
+# (BF16 weight, 200 inputs of each of three families) and 0.905 at T 57344
+# (FP32 weight), above ACCURACY_MARGIN.  The margin is taken against the FP64
+# reference at the kernel's FP32 rstd; against the FP64 reference at the FP64
+# rstd (which differs from it by the forward's FP32 rstd rounding, the same
+# for the deterministic package) the forms this test runs stay within the
+# budget, while the compensated pair above the sm_107a edge reaches 1.012 of
+# it at T 53248 on the 216-SM board.  Worst dw element over its budget at the
+# kernel's rstd, 60 or more inputs of each of three input families, BF16 and
+# FP32 weight: B200 plain pair <= 0.236 up to T 6144, compensated pair
+# <= 0.781 up to T 65536, single <= 0.643 at T 65537; GB300 plain pair
+# <= 0.245 up to T 5120, compensated pair <= 0.739 up to T 61952, twosum
+# single <= 0.0006 at the sampled T from 61953 to 81920; R200 plain pair
+# <= 0.499 (216 SMs) and <= 0.545 (212 SMs) up to T 19968, compensated pair up
+# to T 49152 <= 0.737 (both weights) on 212 SMs, <= 0.759 (BF16 weight) and
+# <= 0.787 (FP32 weight) on 216 SMs (<= 0.818 at T 49152 over 200 inputs of
+# each of three families, both weights), single <= 0.703 (BF16 weight) and
+# <= 0.633 (FP32 weight) at the sampled T from 49152 to 65537 (212 SMs;
+# <= 0.608 and <= 0.646 from 49152 to 65537 on 216 SMs).
 H5120_PLAIN_EDGE = {"sm_100a": 6144, "sm_103a": 5120, "sm_107a": 19968}
 H5120_ACCURACY_EDGE = {
     "sm_100a": {"bf16": 65536, "f32": 65536},
-    "sm_103a": {"bf16": 65536, "f32": 65536},
-    "sm_107a": {"bf16": 65536, "f32": 57344},
+    "sm_103a": {"bf16": 61952, "f32": 61952},
+    "sm_107a": {"bf16": 49152, "f32": 49152},
 }
 ACCURACY_MARGIN = 0.85
 ACCURACY_SEEDS = 20
