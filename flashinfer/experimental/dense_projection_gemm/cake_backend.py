@@ -750,6 +750,67 @@ def _k1_values(
 # K2 planner: the stream-K partition and the measured verdicts
 # ---------------------------------------------------------------------------
 
+#: The change count of the router verdict tables (:class:`_VerdictTable`): every change of one adds one, so what the
+#: convenience path keeps from the tables (:func:`_router_memo`) is derived again after any change.
+_VERDICT_GENERATION = 0
+
+
+def _verdicts_changed() -> None:
+    global _VERDICT_GENERATION
+    _VERDICT_GENERATION += 1
+
+
+class _VerdictTable(dict):
+    """A ``dict`` of measured verdicts that counts its changes in :data:`_VERDICT_GENERATION` (an item set or deleted,
+    the table updated, popped or cleared).  :data:`ROUTER_RULES`, :data:`ROUTER_RULES_BY_SM` and each table it holds
+    are such tables, so the convenience path keeps what it reads from them (:func:`_router_memo`) until one changes;
+    a table bound in their place that is not one is read on every call.  A copy (``dict(table)``) is a plain
+    ``dict``."""
+
+    __slots__ = ()
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        super().__setitem__(key, value)
+        _verdicts_changed()
+
+    def __delitem__(self, key: Any) -> None:
+        super().__delitem__(key)
+        _verdicts_changed()
+
+    def __ior__(self, other: Any) -> Any:
+        try:
+            return super().__ior__(other)
+        finally:
+            _verdicts_changed()
+
+    def clear(self) -> None:
+        super().clear()
+        _verdicts_changed()
+
+    def pop(self, *args: Any) -> Any:
+        try:
+            return super().pop(*args)
+        finally:
+            _verdicts_changed()
+
+    def popitem(self) -> Any:
+        try:
+            return super().popitem()
+        finally:
+            _verdicts_changed()
+
+    def setdefault(self, *args: Any) -> Any:
+        try:
+            return super().setdefault(*args)
+        finally:
+            _verdicts_changed()
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        try:
+            super().update(*args, **kwargs)
+        finally:
+            _verdicts_changed()
+
 #: Per-row verdicts of the router, ``(arch, layout, hidden, experts) -> rule``: ``layout`` ``"kk"`` (the forward,
 #: ``hidden = K``) or ``"nn_t"`` (the swapped weight gradient, ``hidden`` = the launch's ``M``), ``experts`` = the
 #: launch's ``N``.  A partition spec -- ``"waves"`` (:func:`router_waves`), a head/tail spec ``"H<f>x<k>"`` or
@@ -773,7 +834,7 @@ def _k1_values(
 # fmt: off
 ROUTER_RULES: dict[
     tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]
-] = {
+] = _VerdictTable({
     # the forward: no partition replay-safe under recompute (at most two partials per element) holds its margin next
     # to a resident kernel; the deterministic plan (four splits) on every architecture
     ("sm_100a", "kk", 4096, 256): None, ("sm_100a", "kk", 5120, 256): None, ("sm_100a", "kk", 6144, 256): None,
@@ -806,7 +867,7 @@ ROUTER_RULES: dict[
     ("sm_107a", "nn_t", 4096, 256): None,
     ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", "nn_t", 6144, 256): None,
-}
+})
 # fmt: on
 #: The SM count the verdicts of :data:`ROUTER_RULES` were measured on, per architecture (152-SM GB200 / GB300, 216-SM
 #: R200): on a device with any other SM count a router row runs the deterministic program, except in a ``"waves"``
@@ -824,20 +885,20 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]],
-] = {
-    ("sm_107a", 208): {
+] = _VerdictTable({
+    ("sm_107a", 208): _VerdictTable({
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
         ("sm_107a", "nn_t", 4096, 256): None,
         ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
         ("sm_107a", "nn_t", 6144, 256): None,
-    },
-    ("sm_107a", 212): {
+    }),
+    ("sm_107a", 212): _VerdictTable({
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
         ("sm_107a", "nn_t", 4096, 256): None,
         ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
         ("sm_107a", "nn_t", 6144, 256): None,
-    },
-}
+    }),
+})
 # fmt: on
 #: The template suffix of the weight gradient's head/tail program (``router_fp32_gemm_atomic_nn_t`` + suffix): the
 #: head/tail partition on three TMEM chunk buffers, with register reallocation between its warpgroups.
@@ -1350,6 +1411,69 @@ def _k2_row_without_verdict(
     planner can give a plan.  ``False`` leaves the decision (and every refusal of an invalid binding) to the
     planner."""
     return _k2_geometry_without_verdict(_k2_geometry(A, B, out), arch, sm_count)
+
+
+@dataclass(slots=True)
+class _RouterMemo:
+    """What the convenience path keeps from the router tables bound at ``generation`` (:data:`_VERDICT_GENERATION`,
+    the tables ``rules`` / ``by_sm`` as :data:`ROUTER_RULES` / :data:`ROUTER_RULES_BY_SM`): whether some table gives
+    the forward (``kk``) a verdict, and the conclusions of :func:`_k2_geometry_without_verdict` per (device index,
+    :func:`_k2_geometry`) -- a device's architecture and SM count are fixed for the process.  ``tracked`` is false
+    when some table in use is not a :class:`_VerdictTable`: such a memo is derived again on every call."""
+
+    generation: int
+    rules: Any
+    by_sm: Any
+    tracked: bool
+    forward_verdicts: bool
+    without_verdict: dict = field(default_factory=dict)
+
+
+#: The most conclusions a :class:`_RouterMemo` keeps (it starts over when full: a geometry is one token count).
+_ROUTER_MEMO_SIZE = 1024
+_ROUTER_MEMO = _RouterMemo(-1, None, None, False, True)
+
+
+def _router_memo() -> _RouterMemo:
+    """The :class:`_RouterMemo` of the router tables bound now: the kept one while no table changed or was rebound,
+    else a new one (the generation is read before the tables, so a change while it is derived renews it again)."""
+    global _ROUTER_MEMO
+    memo = _ROUTER_MEMO
+    if (
+        memo.generation == _VERDICT_GENERATION
+        and memo.tracked
+        and memo.rules is ROUTER_RULES
+        and memo.by_sm is ROUTER_RULES_BY_SM
+    ):
+        return memo
+    generation, rules, by_sm = _VERDICT_GENERATION, ROUTER_RULES, ROUTER_RULES_BY_SM
+    tables = (rules, *by_sm.values())
+    tracked = isinstance(by_sm, _VerdictTable) and all(
+        isinstance(t, _VerdictTable) for t in tables
+    )
+    forward = any(
+        rule is not None for t in tables for key, rule in t.items() if key[1] == "kk"
+    )
+    memo = _RouterMemo(generation, rules, by_sm, tracked, forward)
+    _ROUTER_MEMO = memo
+    return memo
+
+
+def _k2_runs_without_verdict(geometry: _K2Geometry, index: int) -> bool:
+    """:func:`_k2_geometry_without_verdict` of a call's :func:`_k2_geometry` on CUDA device ``index`` (its
+    architecture and SM count), kept in the :class:`_RouterMemo` of the tables bound now."""
+    memo = _router_memo()
+    key = (index, geometry)
+    without = memo.without_verdict.get(key)
+    if without is None:
+        facts = deterministic_backend().device_facts(index)
+        without = facts.arch is not None and _k2_geometry_without_verdict(
+            geometry, facts.arch, facts.sm_count
+        )
+        if len(memo.without_verdict) >= _ROUTER_MEMO_SIZE:
+            memo.without_verdict.clear()
+        memo.without_verdict[key] = without
+    return without
 
 
 def _k2_key(
@@ -1875,7 +1999,9 @@ def _atomic_k2(
 # allocated or grown (the last split reads the never-written padding columns of a partial tile and discards them) and
 # need no memset per launch either.  A row the planner keeps on the deterministic program is cached
 # as such and calls the deterministic package's convenience path; a K2 call without a split count whose row has no
-# verdict (:func:`_k2_row_without_verdict`) calls it without planning or caching its key here.  A K2 entry binds its
+# verdict (:func:`_k2_row_without_verdict`, kept per device and view geometry until a router table changes,
+# :func:`_router_memo`) calls it without planning or caching its key here, and so does a forward without a split
+# count while no router table gives the forward a verdict.  A K2 entry binds its
 # argument lists once (:class:`_K2Binding`: the plan's values in the program's order, the arena's BF16x3 stack carved
 # and converted once per arena growth), so a call converts only the caller's views and fills ``out`` with the bound
 # geometry.  After a launch that did not complete, :func:`clear_convenience_caches` drops the arenas (fresh tickets
@@ -2207,15 +2333,11 @@ def _launch_cached_atomic_k2(
         # A, B and out are not on one CUDA device: raises
         det._same_cuda_device(A, B, out)
     geometry = _k2_geometry(A, B, out)
-    if splits is None:
+    if splits is None and _k2_runs_without_verdict(geometry, index):
         # a row without a verdict runs the deterministic program: call it without planning (or caching) the key here
-        facts = det.device_facts(out.device)
-        if facts.arch is not None and _k2_geometry_without_verdict(
-            geometry, facts.arch, facts.sm_count
-        ):
-            return getattr(det, DETERMINISTIC_NAMES["router_fp32_gemm"])(
-                A, B, out, splits=None
-            )
+        return getattr(det, DETERMINISTIC_NAMES["router_fp32_gemm"])(
+            A, B, out, splits=None
+        )
     stream = det._current_raw_stream(index)
     out_ptr = out.data_ptr()
     key = _k2_key(index, stream, splits, A, B, out, geometry, out_ptr)
@@ -2322,12 +2444,15 @@ def _launch_cached_atomic_k2(
 
 
 def clear_convenience_caches() -> None:
-    """Drop every cached convenience-path launch and release every workspace arena of both packages (this
-    package's launches and the deterministic package's)."""
+    """Drop every cached convenience-path launch, what the convenience path keeps from the router tables
+    (:func:`_router_memo`) and every workspace arena of both packages (this package's launches and the deterministic
+    package's)."""
+    global _ROUTER_MEMO
     with _ATOMIC_PLAN_LOCK:
         _K1_ATOMIC_CACHE.clear()
         _K2_ATOMIC_CACHE.clear()
         _ATOMIC_ARENAS.clear()
+        _ROUTER_MEMO = _RouterMemo(-1, None, None, False, True)
     deterministic_backend().clear_convenience_caches()
 
 
@@ -2633,11 +2758,17 @@ def router_forward(
     """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation; ``splits`` defaults to the deterministic
     package's production count (4).  With ``deterministic=False`` a row runs this package's program only with an
     explicit ``splits`` (at most two partials per element: the logits repeat bit for bit) or a verdict of
-    :data:`ROUTER_RULES` (none ships for the forward), else the deterministic program."""
+    :data:`ROUTER_RULES` (none ships for the forward), else the deterministic program: without a split count, while
+    no router table gives the forward a verdict, the call goes to the deterministic package's convenience path
+    directly (``router_fp32_gemm(X, W.T, out)``, the call the planner would make)."""
     if _resolve_deterministic(deterministic, "router_forward"):
         return _det_entry("router_forward")(X, W, out, **_splits_kw(splits))
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.float32)
+    if splits is None and not _router_memo().forward_verdicts:
+        # no router table gives the forward a verdict: the deterministic program (its convenience path, the call the
+        # planner would make), without the per-call check of the row
+        return _det_entry("router_fp32_gemm")(X, W.t(), out, splits=None)
     return _router_gemm(X, W.t(), out, splits, False)
 
 
@@ -2666,12 +2797,18 @@ def router_wgrad(
     ``splits`` defaults to the deterministic package's production count (6), or with ``deterministic=False`` to the
     partition of the row's verdict in :data:`ROUTER_RULES` or, on a part with a table of its own, in
     :data:`ROUTER_RULES_BY_SM` (:func:`router_partition`; a row or token count without one runs the deterministic
-    program)."""
+    program, through the deterministic package's convenience path directly)."""
     if _resolve_deterministic(deterministic, "router_wgrad"):
         return _det_entry("router_wgrad")(G, X, out, **_splits_kw(splits))
     if out is None:
         out = torch.empty(G.shape[1], X.shape[1], device=G.device, dtype=torch.float32)
-    return _router_gemm(G.t(), X, out, splits, False)
+    A = G.t()
+    if splits is None:
+        index = out.get_device()
+        if index >= 0 and _k2_runs_without_verdict(_k2_geometry(A, X, out), index):
+            # a row without a verdict (kept per device and geometry, :func:`_router_memo`): the deterministic program
+            return _det_entry("router_fp32_gemm")(A, X, out, splits=None)
+    return _router_gemm(A, X, out, splits, False)
 
 
 def split_fp32_to_bf16x3_(

@@ -29,6 +29,7 @@ import inspect
 import json
 import re
 import sys
+import threading
 import warnings
 from pathlib import Path
 from types import ModuleType
@@ -439,8 +440,10 @@ def test_k1_operation_routes(monkeypatch):
 
 
 def test_k2_routes(monkeypatch):
-    """``deterministic=False``: the router forward and weight gradient reach this package's stream-K path; the
-    input gradient and the split stage run the deterministic programs."""
+    """``deterministic=False``: the router weight gradient reaches this package's stream-K path, and so does the
+    forward with a split count or while some router table gives the forward a verdict; without either the forward
+    goes to the deterministic package's convenience path directly (the call the planner would make for a row
+    without a verdict).  The input gradient and the split stage run the deterministic programs."""
     dgrad, split = (
         _patch_det(monkeypatch, "router_dgrad"),
         _patch_det(monkeypatch, "split_fp32_to_bf16x3_"),
@@ -450,6 +453,15 @@ def test_k2_routes(monkeypatch):
     monkeypatch.setattr(cake_backend, "_atomic_k2", atomic)
     T, K, N = 64, 32, 16
     X, W, G = torch.zeros(T, K), torch.zeros(N, K), torch.zeros(T, N)
+    assert cake_backend.router_forward(X, W, deterministic=False) is gemm.result
+    ((args, kwargs),) = gemm.calls
+    assert args[0] is X and args[1].equal(W.t()) and kwargs == {"splits": None}
+    assert tuple(args[2].shape) == (T, N) and args[2].dtype == torch.float32
+    assert (
+        cake_backend.router_forward(X, W, deterministic=False, splits=2)
+        is atomic.result
+    )
+    monkeypatch.setitem(cake_backend.ROUTER_RULES, ("sm_103a", "kk", K, N), "S2")
     assert cake_backend.router_forward(X, W, deterministic=False) is atomic.result
     assert (
         cake_backend.router_wgrad(G, X, deterministic=False, splits=5) is atomic.result
@@ -459,7 +471,10 @@ def test_k2_routes(monkeypatch):
         cake_backend.split_fp32_to_bf16x3_("s", "p", "r", deterministic=False)
         is split.result
     )
-    (fwd_args, fwd_kwargs), (wg_args, wg_kwargs) = atomic.calls
+    calls = atomic.calls
+    (fwd2_args, fwd2_kwargs), (fwd_args, fwd_kwargs), (wg_args, wg_kwargs) = calls
+    assert fwd2_args[1] is X and fwd2_args[2].equal(W.t())
+    assert fwd2_kwargs == {"splits": 2}
     assert (
         fwd_args[0] == "launch"
         and fwd_args[1] is X
@@ -484,7 +499,7 @@ def test_k2_routes(monkeypatch):
         cake_backend.router_fp32_gemm(G.t(), X, torch.zeros(N, K), deterministic=False)
         is atomic.result
     )
-    assert len(gemm.calls) == 1 and len(atomic.calls) == 4
+    assert len(gemm.calls) == 2 and len(atomic.calls) == 5
 
 
 def _register(monkeypatch, arch: str, *templates: str) -> None:
@@ -1972,6 +1987,189 @@ def test_k2_rows_without_a_verdict_skip_the_planner(monkeypatch):
     assert not without_verdict(X, W.t(), out, arch, sm_count)
 
 
+def test_router_tables_count_their_changes():
+    """``ROUTER_RULES``, ``ROUTER_RULES_BY_SM`` and each table it holds count their changes: every way of changing
+    a table moves the generation the convenience path's memo is kept for; a copy is a plain ``dict`` with the same
+    items."""
+    tables = (
+        cake_backend.ROUTER_RULES,
+        cake_backend.ROUTER_RULES_BY_SM,
+        *cake_backend.ROUTER_RULES_BY_SM.values(),
+    )
+    assert all(type(t) is cake_backend._VerdictTable for t in tables)
+    for t in tables:
+        assert type(dict(t)) is dict and dict(t) == t
+    key = ("sm_103a", "kk", 2048, 256)
+    table = cake_backend._VerdictTable({("sm_103a", "nn_t", 2048, 256): None})
+    changes = (
+        lambda: table.__setitem__(key, "S2"),
+        lambda: table.__delitem__(key),
+        lambda: table.update({key: None}),
+        lambda: table.pop(key),
+        lambda: table.setdefault(key, "S2"),
+        lambda: table.__ior__({key: None}),
+        lambda: table.popitem(),
+        lambda: table.clear(),
+    )
+    for change in changes:
+        before = cake_backend._VERDICT_GENERATION
+        change()
+        assert cake_backend._VERDICT_GENERATION > before
+    assert table == {}
+
+
+def test_router_memo_follows_the_router_tables(monkeypatch):
+    """The memo of the router tables (``_router_memo``) is kept while no table changes and derived again after any
+    change: no forward verdict ships; a forward verdict set in any table, and its removal, are seen at the next call;
+    a table rebound in place of one is seen, and one that does not count its changes (a plain ``dict``) is read on
+    every call; ``clear_convenience_caches`` drops the memo."""
+    cake_backend.clear_convenience_caches()
+    memo = cake_backend._router_memo()
+    assert memo.tracked and not memo.forward_verdicts and not memo.without_verdict
+    assert cake_backend._router_memo() is memo
+    own = cake_backend.ROUTER_RULES_BY_SM[("sm_107a", 212)]
+    key = ("sm_107a", "kk", 5120, 256)
+    monkeypatch.setitem(own, key, "S2")
+    assert cake_backend._router_memo().forward_verdicts
+    own[key] = None
+    assert not cake_backend._router_memo().forward_verdicts
+    # a change of a weight-gradient row renews the memo too (its conclusions may differ)
+    memo = cake_backend._router_memo()
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES, ("sm_100a", "nn_t", 4096, 256), "pairs"
+    )
+    renewed = cake_backend._router_memo()
+    assert renewed is not memo and renewed.tracked and not renewed.forward_verdicts
+    # a plain table bound in place of one: read on every call, so a change of it is seen without a generation
+    plain = dict(cake_backend.ROUTER_RULES_BY_SM)
+    monkeypatch.setattr(cake_backend, "ROUTER_RULES_BY_SM", plain)
+    assert not cake_backend._router_memo().tracked
+    assert not cake_backend._router_memo().forward_verdicts
+    plain[("sm_107a", 200)] = {key: "S2"}
+    assert cake_backend._router_memo().forward_verdicts
+    del plain[("sm_107a", 200)]
+    assert not cake_backend._router_memo().forward_verdicts
+    # a counting table bound in place of one: kept again, and its changes are seen
+    rules = cake_backend._VerdictTable(cake_backend.ROUTER_RULES)
+    monkeypatch.setattr(cake_backend, "ROUTER_RULES", rules)
+    monkeypatch.setattr(
+        cake_backend,
+        "ROUTER_RULES_BY_SM",
+        cake_backend._VerdictTable(
+            {k: cake_backend._VerdictTable(v) for k, v in plain.items()}
+        ),
+    )
+    memo = cake_backend._router_memo()
+    assert memo.tracked and memo.rules is rules and cake_backend._router_memo() is memo
+    rules[("sm_100a", "kk", 4096, 256)] = "forward"
+    assert cake_backend._router_memo().forward_verdicts
+    cake_backend.clear_convenience_caches()
+    assert cake_backend._router_memo() is not memo
+
+
+def _fake_device_facts(monkeypatch, parts):
+    """``deterministic_backend().device_facts(index)`` of fake CUDA devices ``index -> (arch, sm_count)`` (CPU
+    tests of the convenience path's memo, which keys its conclusions by device index)."""
+    facts = {
+        i: det_backend.DeviceFacts(index=i, arch=a, sm_count=n, l2_bytes=1 << 27)
+        for i, (a, n) in parts.items()
+    }
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None: facts[device])
+
+
+def test_k2_memo_is_the_planners_check(monkeypatch):
+    """``_k2_runs_without_verdict`` (the convenience path's check of a call without a split count, kept per device
+    index and view geometry) is ``_k2_row_without_verdict`` on that device's architecture and SM count for every
+    binding -- each device its own -- and follows the router tables: a verdict set at run time in the table of a
+    device's SM count is seen at the next call (the row is planned), and so is its removal, without clearing any
+    cache; the memo starts over when full and still answers the same."""
+    parts = {0: ("sm_103a", 152), 1: ("sm_107a", 212), 2: ("sm_107a", 216)}
+    _fake_device_facts(monkeypatch, parts)
+    cake_backend.clear_convenience_caches()
+    runs = cake_backend._k2_runs_without_verdict
+    cases = []
+    for hidden in (2048, 4096, 5120, 6144):
+        for T in (64, 128, 192, 193, 224, 1024, 16231):
+            X, W, G = (
+                torch.empty(T, hidden),
+                torch.empty(256, hidden),
+                torch.empty(T, 256),
+            )
+            cases += [
+                (X, W.t(), torch.empty(T, 256)),
+                (G.t(), X, torch.empty(256, hidden)),
+                (G, W, torch.empty(T, hidden)),  # the kn class: left to the planner
+                (X.bfloat16(), W.t(), torch.empty(T, 256)),  # refused by the planner
+            ]
+
+    def check():
+        n = 0
+        for index, (arch, sm_count) in parts.items():
+            for A, B, out in cases:
+                want = cake_backend._k2_row_without_verdict(A, B, out, arch, sm_count)
+                got = runs(cake_backend._k2_geometry(A, B, out), index)
+                assert got == want, (index, tuple(A.shape), A.stride(), A.dtype)
+                n += want
+        return n
+
+    kept = check()
+    assert kept and check() == kept  # the second pass reads the memo
+    memo = cake_backend._router_memo()
+    assert len(memo.without_verdict) == len(parts) * len(cases)
+    # a verdict set at run time in the table of the 212-SM part's SM count: seen at the next call
+    G, X = torch.empty(64, 256), torch.empty(64, 6144)
+    geometry = cake_backend._k2_geometry(G.t(), X, torch.empty(256, 6144))
+    assert runs(geometry, 1) and runs(geometry, 0)
+    own = cake_backend.ROUTER_RULES_BY_SM[("sm_107a", 212)]
+    monkeypatch.setitem(own, ("sm_107a", "nn_t", 6144, 256), ((1, 64, "pairs"),))
+    assert not runs(geometry, 1) and runs(geometry, 0) and runs(geometry, 2)
+    own[("sm_107a", "nn_t", 6144, 256)] = None
+    assert runs(geometry, 1)
+    assert check() == kept
+    # a full memo starts over
+    monkeypatch.setattr(cake_backend, "_ROUTER_MEMO_SIZE", 5)
+    assert check() == kept
+    assert len(cake_backend._router_memo().without_verdict) <= 5
+
+
+def test_k2_memo_under_concurrent_table_changes(monkeypatch):
+    """Threads checking router calls while another thread sets and removes a verdict: no call fails, and once the
+    tables stop changing every conclusion is the planner's for the final tables (a conclusion drawn while a table
+    changed is not kept past that change)."""
+    _fake_device_facts(monkeypatch, {0: ("sm_103a", 152)})
+    cake_backend.clear_convenience_caches()
+    geometries = []
+    for T in (64, 128, 192, 224, 1024):
+        G, X = torch.empty(T, 256), torch.empty(T, 4096)
+        geometries.append(
+            (cake_backend._k2_geometry(G.t(), X, torch.empty(256, 4096)), T)
+        )
+    key = ("sm_103a", "nn_t", 4096, 256)
+    monkeypatch.setitem(cake_backend.ROUTER_RULES, key, None)
+    stop, errors = threading.Event(), []
+
+    def reader():
+        try:
+            while not stop.is_set():
+                for geometry, _ in geometries:
+                    cake_backend._k2_runs_without_verdict(geometry, 0)
+        except Exception as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=reader) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for i in range(200):
+        cake_backend.ROUTER_RULES[key] = ((1, 128, "pairs"),) if i % 2 else None
+    cake_backend.ROUTER_RULES[key] = ((1, 128, "pairs"),)
+    stop.set()
+    for t in threads:
+        t.join()
+    assert not errors
+    for geometry, T in geometries:
+        assert cake_backend._k2_runs_without_verdict(geometry, 0) == (T > 128), T
+
+
 # (arch, SM count) of the measured router tables: ROUTER_RULES on 152-SM GB200 / GB300 and 216-SM R200 parts,
 # ROUTER_RULES_BY_SM on 208-SM and 212-SM R200 parts
 ROUTER_TABLE_PARTS = (
@@ -3244,6 +3442,66 @@ def test_gpu_router_rows_without_a_verdict_run_the_deterministic_program_unplann
         A, B, out = _router_case("fwd", X, W, G)
         assert cake_backend.router_fp32_gemm(A, B, out, deterministic=False) is out
         assert torch.equal(out, fwd) and not cake_backend._K2_ATOMIC_CACHE
+
+
+def test_gpu_router_verdicts_set_at_run_time_are_seen(monkeypatch):
+    """The convenience path keeps whether a router row has a verdict (per device and view geometry) and whether any
+    router table gives the forward one until a router table changes: on a row without a verdict the forward and the
+    weight gradient give the deterministic program's bits (unplanned, also on the second call, from the memo); a
+    verdict set at run time in the table of the device's SM count runs this package's program at the next call,
+    without clearing a cache, and its removal the deterministic program again."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    table, _ = cake_backend.router_rules(arch, sm_count)
+    if table is cake_backend.ROUTER_RULES:
+        # a verdict of ROUTER_RULES applies on this device whatever its SM count
+        monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
+    hidden, T = 6144, 1000  # no verdict on any architecture
+    X, W, G = _router_inputs(T, device, SEED + 26, K=hidden)
+    keys = {"fwd": (arch, "kk", hidden, 256), "wgrad": (arch, "nn_t", hidden, 256)}
+    assert all(table.get(k) is None for k in keys.values())
+    cake_backend.clear_convenience_caches()
+    want_fwd = det_backend.router_fp32_det_gemm(
+        X, W.t(), torch.empty(T, 256, device=device)
+    )
+    want_wgrad = det_backend.router_fp32_det_gemm(
+        G.t(), X, torch.empty(256, hidden, device=device)
+    )
+
+    def unplanned():
+        for _ in range(2):
+            fwd = cake_backend.router_forward(X, W, deterministic=False)
+            wgrad = cake_backend.router_wgrad(G, X, deterministic=False)
+            assert torch.equal(fwd, want_fwd) and torch.equal(wgrad, want_wgrad)
+        assert not cake_backend._K2_ATOMIC_CACHE
+
+    unplanned()
+    monkeypatch.setitem(table, keys["fwd"], "forward")
+    monkeypatch.setitem(table, keys["wgrad"], "pairs")
+    ref_fwd, ref_wgrad = X.double() @ W.double().t(), G.double().t() @ X.double()
+
+    def fwd():
+        return cake_backend.router_forward(X, W, deterministic=False)
+
+    def wgrad():
+        return cake_backend.router_wgrad(G, X, deterministic=False)
+
+    for op, A, B, ref, call in (
+        ("fwd", X, W.t(), ref_fwd, fwd),
+        ("wgrad", G.t(), X, ref_wgrad, wgrad),
+    ):
+        out = torch.empty(A.shape[0], B.shape[1], device=device)
+        plan = cake_backend.plan_router_fp32_gemm(A, B, out, deterministic=False)
+        assert isinstance(plan, cake_backend.AtomicRouterPlan), op
+        _assert_ran(call, cake_jit.select_module(arch, plan.template))
+        assert _rel_fro(call(), ref) <= ROUTER_REL_FRO_MAX, op
+    first = fwd()
+    assert torch.equal(fwd(), first)
+    assert len(cake_backend._K2_ATOMIC_CACHE) == 2
+    table[keys["fwd"]] = None
+    table[keys["wgrad"]] = None
+    for _ in range(2):
+        assert torch.equal(fwd(), want_fwd) and torch.equal(wgrad(), want_wgrad)
 
 
 def test_gpu_cached_router_launch_is_the_prepared_launch():
