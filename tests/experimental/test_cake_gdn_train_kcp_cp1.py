@@ -839,3 +839,70 @@ def test_launch_scope_enters_one_stream_context_per_entry_body(
             TENSORS,
             f"launch scope (checkpoint={ckpt})",
         )
+
+
+def test_graph_replay_keeps_each_view_form_its_own_gradient_layout(device) -> None:
+    """``graph="replay"`` with a caller-held workspace, autograd through ``chunk_gdn_kcp``: q / k / v as
+    ``packed_qkv_views_kcp`` views and as plain ``split`` / ``view`` views of the same packed row (the same pointers
+    and strides) share the forward graph but are two backward graph keys.  Each form captures its own backward with
+    its own gradient layout (``"packed"`` / ``"separate"``), and alternating forms replay their own graphs, never the
+    other form's; every ``out`` and row gradient is within the budget of the FP64 reference."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    H, HV = 2, 6
+    cu = _cu((300, 777))
+    T = cu[-1]
+    inputs = make_inputs(cu, H, HV)
+    ref, _ = reference_pack(inputs, device)
+    ctx = _local_context(cu, device)
+    ws = kcp.WorkspaceKcp()
+    row = torch.cat(
+        [inputs[n].to(device).reshape(1, T, -1) for n in ("q", "k", "v")], -1
+    ).contiguous()
+    row.requires_grad_(True)
+    g, beta, dout = (inputs[n].to(device) for n in ("g", "beta", "dout"))
+    sizes = (H * D, H * D, HV * D)
+
+    def views(form):
+        if form == "packed":
+            return kcp.packed_qkv_views_kcp(row, H_qk=H, HV=HV)
+        parts = row.split(sizes, dim=-1)
+        return tuple(p.view(1, T, n, D) for p, n in zip(parts, (H, H, HV), strict=True))
+
+    # each form's backward runs eager on its first call, captures on its second and replays from then on (the forward
+    # graph is the same for both forms)
+    forms = ("packed",) * 4 + ("plain",) * 3 + ("packed", "plain")
+    events, arms = [], {}
+    kcp.graph_cache_clear()
+    try:
+        for i, form in enumerate(forms):
+            q, k, v = views(form)
+            out = gdn_api.chunk_gdn_kcp(
+                q, k, v, g, beta, ctx, workspace=ws, graph="replay", deterministic=False
+            )
+            (drow,) = torch.autograd.grad(out, (row,), dout)
+            rec = kcp.LAST_CALL["bwd"]
+            events.append((form, rec["graph_event"], rec["grad_layout"]))
+            res = {"out": out.detach()[0].clone()}
+            for n, (a, b), h in zip(
+                ("dq", "dk", "dv"),
+                ((0, H * D), (H * D, 2 * H * D), (2 * H * D, None)),
+                (H, H, HV),
+                strict=True,
+            ):
+                res[n] = drow[0, :, a:b].reshape(T, h, D).clone()
+            arms[f"call {i} {form}"] = res
+            del q, k, v, out, drow
+    finally:
+        kcp.graph_cache_clear()
+    layout = {"packed": "packed", "plain": "separate"}
+    assert events == [
+        (f, e, layout[f])
+        for f, e in zip(
+            forms,
+            ("eager", "capture", "replay", "replay")
+            + ("eager", "capture", "replay")
+            + ("replay", "replay"),
+            strict=True,
+        )
+    ], events
+    _arms_within_budget(arms, ref, ("out", "dq", "dk", "dv"), "graph view forms")
