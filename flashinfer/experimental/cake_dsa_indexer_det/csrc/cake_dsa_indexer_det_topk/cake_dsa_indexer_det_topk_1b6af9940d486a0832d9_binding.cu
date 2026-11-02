@@ -35,7 +35,7 @@
 #define CAKE_BINDING_THREADS 384
 #endif
 #ifndef CAKE_BINDING_SMEM
-#define CAKE_BINDING_SMEM 220416
+#define CAKE_BINDING_SMEM 220544
 #endif
 
 extern "C" __global__ void CAKE_KERNEL_SYMBOL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split);
