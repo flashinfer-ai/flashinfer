@@ -303,7 +303,7 @@ MULTI_RECORDS = {
         "cake_mhc_det_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 67, 52
+N_RECORDS, N_LIBRARIES = 68, 53
 RECORD_SCALARS = {
     "cake_mhc_det_train_fn_split": {"want_t": 0},
     "cake_mhc_det_train_fn_split__tv128__t": {"want_t": 1},
@@ -1617,10 +1617,12 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     assert loader.fwd_map_program(4096, 152, "sm_103a") == "nsx_ct"
     assert loader.fwd_map_program(8192, 152, "sm_103a") == "nsx_g2_ol2l"
     assert loader.fwd_map_program(16263, 152, "sm_103a") == "tk_nsx_g2_ol2l_ct"
-    assert loader.fwd_map_program(16263, 148, "sm_100a") == "nsx_g2_ol2l"  # slack 12 < 19
+    # slack 12 < 19
+    assert loader.fwd_map_program(16263, 148, "sm_100a") == "nsx_g2_ol2l"
     assert loader.fwd_map_program(14928, 148, "sm_100a") == "tk_nsx_g2_ol2l_ct_ef_cap"
     assert loader.fwd_map_program(16263, 152, "sm_100a") == "tk_nsx_g2_ol2l_ct_ef_cap"
-    assert loader.fwd_map_program(14592, 152, "sm_100a") == "nsx_g2_ol2l"  # 912 units = 6 x 152: slack 0
+    # 912 units = 6 x 152: slack 0
+    assert loader.fwd_map_program(14592, 152, "sm_100a") == "nsx_g2_ol2l"
     assert loader.fwd_map_program(8320, 152, "sm_100a") == "nsx_g2_ol2l"  # P_K 16
     assert loader.fwd_map_program(32768, 148, "sm_100a") == "tk_nsx_g2_ol2l_ct"
     assert loader.fwd_map_program(4096, 148, "sm_100a") == "ns96_g2_ol2l_ct"
