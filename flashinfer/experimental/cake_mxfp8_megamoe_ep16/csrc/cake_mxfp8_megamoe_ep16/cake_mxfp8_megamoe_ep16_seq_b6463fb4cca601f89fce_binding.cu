@@ -1164,7 +1164,7 @@ void SetupTmaPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
 }
 
 // The fused kernel's cooperative grid: CAKE_MEGAMOE_GRID_CLUSTERS two-CTA clusters, as the generated body schedules
-// (72 by default; the sm_107a build defines 96). Its grid counters count (epoch + 1) x CTAs in 32-bit signed arithmetic.
+// (72 by default; the sm_107a build defines 104). Its grid counters count (epoch + 1) x CTAs in 32-bit signed arithmetic.
 #ifndef CAKE_MEGAMOE_GRID_CLUSTERS
 #define CAKE_MEGAMOE_GRID_CLUSTERS 72
 #endif

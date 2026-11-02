@@ -30,6 +30,7 @@ import tvm_ffi
 from ...comm.torch_symmetric_memory import _enable_symm_mem_for_group
 from ...moe_ep.cake_mxfp8_megamoe_ep16 import CakeMxfp8MegaMoeEp16Weights
 from .jit import (
+    device_arch,
     fused_grid_ctas,
     load_cake_mxfp8_megamoe_ep16_module,
     require_cute_dsl_capability,
@@ -466,17 +467,18 @@ class CakeMxfp8MegaMoeEp16:
         self._backend = backend
         if backend == "cute_dsl":
             require_cute_dsl_capability(capability)
-            from .cute_dsl import FUSED_GRID_CTAS as grid_ctas
-            from .cute_dsl import create_runner
+            from .cute_dsl import FUSED_GRID_CTAS, create_runner
+
+            grid_ctas = FUSED_GRID_CTAS[device_arch(capability)]
         else:
-            # The fused kernel's grid barriers need every CTA of its cooperative grid resident at once, one per SM.
             grid_ctas = fused_grid_ctas(capability)
-            sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-            if grid_ctas > sm_count:
-                raise RuntimeError(
-                    f"Cake MXFP8 MegaMoE needs {grid_ctas} co-resident CTAs (one per SM) on compute capability "
-                    f"{capability[0]}.{capability[1]}, but the device has {sm_count} SMs"
-                )
+        # The fused kernel's grid barriers need every CTA of its cooperative grid resident at once, one per SM.
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        if grid_ctas > sm_count:
+            raise RuntimeError(
+                f"Cake MXFP8 MegaMoE needs {grid_ctas} co-resident CTAs (one per SM) on compute capability "
+                f"{capability[0]}.{capability[1]}, but the device has {sm_count} SMs"
+            )
         self._fused_grid_ctas = grid_ctas
 
         self._validate_weights(weights, device=device)
