@@ -162,7 +162,9 @@ def test_tactic_encoding_round_trips():
 def test_cache_key_covers_every_kernel_source():
     from flashinfer.batch_invariant.jit import relative_sources
 
-    srcs = set(relative_sources("batch_invariant_gemm_bf16"))
+    srcs = set(
+        relative_sources("batch_invariant_gemm")
+    )  # the GEMM cache module shared by the bf16 and fp8 classes
     assert {
         "gemm/batch_invariant/blocks/compile.py",
         "gemm/batch_invariant/fixup.py",
