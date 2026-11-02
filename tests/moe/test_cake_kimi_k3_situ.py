@@ -475,10 +475,17 @@ def _skewed_routing(num_tokens, device):
     return ids.contiguous()
 
 
+def _hot_routing(num_tokens, device):
+    # Every token routes to the same 16 experts; the other 880 receive none.
+    slots = torch.arange(TOP_K, dtype=torch.int32, device=device)
+    return slots[None, :].expand(num_tokens, TOP_K).contiguous()
+
+
 ROUTINGS = {
     "uniform": _uniform_routing,
     "grouped": _grouped_routing,
     "skewed": _skewed_routing,
+    "hot": _hot_routing,
 }
 
 
@@ -1237,8 +1244,8 @@ def _tile_n16_routing_in_pair_order(views, ids):
 
 @pytest.mark.parametrize(
     "num_tokens, routing",
-    [(64, "uniform"), (64, "skewed")],
-    ids=["m64_uniform", "m64_skewed"],
+    [(64, "uniform"), (64, "skewed"), (64, "hot")],
+    ids=["m64_uniform", "m64_skewed", "m64_hot"],
 )
 def test_cake_situ_fused_quant_route_matches_the_two_launch_route(
     num_tokens,
@@ -1280,6 +1287,9 @@ def test_cake_situ_fused_quant_route_matches_the_two_launch_route(
     fused = _tile_n16_routing_in_pair_order(views, ids)
     fused_output = output.clone()
     assert 0 < fused["total_tiles"] <= prepared["max_tiles"]
+    if routing == "hot":
+        # Experts 0..15 receive every token: num_tokens / 16 full tiles each.
+        assert fused["total_tiles"] == TOP_K * num_tokens // 16
     for name in ("intermediate_packed", "intermediate_scales", "x_packed", "x_scales"):
         views[name].zero_()
     views["token_to_permuted"].fill_(-1)
