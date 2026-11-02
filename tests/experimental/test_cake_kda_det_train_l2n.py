@@ -265,6 +265,73 @@ def test_fallback_backward_keeps_dq_f_dk_f_until_the_pullback(mode: str) -> None
         cake_backend.lifetime_table(mode, l2n="fused", gate_fused=False)
 
 
+def _shipped_l2n_modes(gate: str = "g") -> list[str]:
+    """The l2n modes whose fwd_intra / bwd_prep / glm_intra records of gate mode ``gate`` this build ships."""
+    return [
+        mode
+        for mode in ("fused", "fallback")
+        if all(
+            any(
+                mode in cake_jit.MODULES[n].get("l2n", ["off"])
+                for n in cake_jit.records_of_stage(stage, gate)
+            )
+            for stage in ("fwd_intra", "bwd_prep", "glm_intra")
+        )
+    ]
+
+
+@pytest.mark.parametrize("arch", list(cake_jit.ARCHES))
+def test_saved_set_backward_keeps_qn_kn_in_the_arena(arch: str) -> None:
+    """The saved-set backward of an l2n mode keeps qn / kn on the arena's do_int / dv2 bytes (dv2 on the dq / dk
+    bytes): no record of those paths binds do_int, only the dq / dk writers bind dq / dk and none of them dv2, so
+    memory_report counts no per-call qn / kn there; the replay, a lean layout, two tail passes and 2 S < R keep them
+    per call."""
+    modes = _shipped_l2n_modes()
+    if not modes:
+        pytest.skip("this build ships no l2n mode")
+    rows = 2 * D * 2  # per-call qn + kn bytes per token-head
+    for mode in modes:
+        for gate in (x for x in ("g", "raw") if mode in _shipped_l2n_modes(x)):
+            for S, N, H in ((5000, 3, 16), (16384, 1, 64), (16384, 4, 64)):
+                p = cake_backend.plan(S, N, H, 148, arch, gate=gate, l2n=mode)
+                saved = ("light", "light_states", "tape")
+                for path in (x for x in saved if x in p.records):
+                    layout = "bwd_tape" if path == "tape" else "bwd"
+                    names = {r.name for r in p.layout(layout)}
+                    assert {"do_int", "dv2"} <= names
+                    ok = cake_backend._l2n_rows_in_arena(p, path, names, 1)
+                    assert ok, (path, mode, gate)
+                    assert not cake_backend._l2n_rows_in_arena(p, path, names, 2)
+                    lean = {r.name for r in p.layout(layout + "_lean")}
+                    assert not cake_backend._l2n_rows_in_arena(p, path, lean, 1)
+                replay = {r.name for r in p.layout("replay")}
+                assert not cake_backend._l2n_rows_in_arena(p, "replay", replay, 1)
+                for save_mode in ("light", "tape"):
+                    report = cake_backend.memory_report(
+                        S, N, H, save_mode, sm_count=148, arch=arch, gate=gate, l2n=mode
+                    )
+                    assert report["bwd_qn_kn"] == 0, (save_mode, mode, gate)
+                    assert report["replay_qn_kn"] == rows * S * H
+                lean_report = cake_backend.memory_report(
+                    S,
+                    N,
+                    H,
+                    sm_count=148,
+                    arch=arch,
+                    gate=gate,
+                    l2n=mode,
+                    arena=cake_backend.KdaDetArena(lean=True),
+                )
+                assert lean_report["bwd_qn_kn"] == rows * S * H
+        # 64 tokens in 8 documents: R = 640 internal rows > 2 S, dv2 does not fit the dq / dk bytes
+        p = cake_backend.plan(64, 8, 2, 148, arch, l2n=mode)
+        assert 2 * p.S < p.R
+        names = {r.name for r in p.layout("bwd")}
+        assert not cake_backend._l2n_rows_in_arena(p, "light", names, 1)
+        report = cake_backend.memory_report(64, 8, 2, sm_count=148, arch=arch, l2n=mode)
+        assert report["bwd_qn_kn"] == rows * 64 * 2
+
+
 def test_gate_fused_on_every_arch_in_l2n_modes() -> None:
     for arch in cake_jit.ARCHES:
         assert cake_backend._gate_fused(arch, "g", "fused") is True
@@ -926,6 +993,81 @@ def test_l2n_fused_equals_the_fallback_route(shape) -> None:
         assert _bits(a).equal(_bits(b))
     for a, b in zip(_bwd(inputs, None), _bwd(inputs, None, workspace=ws), strict=True):
         assert _bits(a).equal(_bits(b)), "replay"
+
+
+@pytest.mark.parametrize("raw_gate", [False, True], ids=["g", "raw"])
+@pytest.mark.parametrize("save_mode", ["light", "tape"])
+@pytest.mark.parametrize("mode", ["fused", "fallback"])
+def test_l2n_saved_set_backward_allocates_what_the_flag_off_backward_does(
+    mode: str, save_mode: str, raw_gate: bool
+) -> None:
+    """The saved-set backward with use_qk_l2norm_in_kernel=True keeps qn / kn in its arena: on caller-owned
+    workspaces of the same problem its per-call peak is at most the flag-off backward's (dq / dk / dv / dg / dbeta,
+    no per-call qn / kn), and memory_report counts none."""
+    device = _l2n_device(mode)
+    gate = "raw" if raw_gate else "g"
+    if mode not in _shipped_l2n_modes(gate):
+        pytest.skip(f"this build ships no l2n={mode!r} records of gate mode {gate!r}")
+    lengths, H = (4000, 96), 32
+    S, N = sum(lengths), len(lengths)
+    inputs = _l2n_inputs(lengths, H, device, raw_gate=raw_gate)
+    ws_on = cake_backend.KdaDetWorkspace.for_problem(
+        S, N, H, device, save_mode=save_mode, gate=gate, l2n=mode
+    )
+    ws_off = cake_backend.KdaDetWorkspace.for_problem(
+        S, N, H, device, save_mode=save_mode, gate=gate
+    )
+    i = inputs
+    qn = ref_l2n.qk_l2norm(i["q"].cpu())[0].to(device)
+    kn = ref_l2n.qk_l2norm(i["k"].cpu())[0].to(device)
+    _, saved_on = _fwd(inputs, raw_gate, workspace=ws_on)
+    _, saved_off = cake_backend.chunk_kda_det_fwd(
+        qn,
+        kn,
+        i["v"],
+        _g(i, raw_gate),
+        i["beta"],
+        i["cu_seqlens"],
+        workspace=ws_off,
+        **_gate_kw(i, raw_gate),
+    )
+
+    def peak(fn) -> int:
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        base = torch.cuda.memory_allocated(device)
+        grads = fn()
+        torch.cuda.synchronize(device)
+        del grads
+        return torch.cuda.max_memory_allocated(device) - base
+
+    peak_on = peak(lambda: _bwd(inputs, saved_on, raw_gate, workspace=ws_on))
+    peak_off = peak(
+        lambda: cake_backend.chunk_kda_det_bwd(
+            qn,
+            kn,
+            i["v"],
+            _g(i, raw_gate),
+            i["beta"],
+            i["cu_seqlens"],
+            i["dout"],
+            saved=saved_off,
+            workspace=ws_off,
+            **_gate_kw(i, raw_gate),
+        )
+    )
+    assert peak_on <= peak_off, (peak_on, peak_off)
+    report = cake_backend.memory_report(
+        S,
+        N,
+        H,
+        save_mode,
+        sm_count=ws_on.plan.sm_count,
+        arch=ws_on.plan.arch,
+        gate=gate,
+        l2n=mode,
+    )
+    assert report["bwd_qn_kn"] == 0
 
 
 @pytest.mark.parametrize("raw_gate", [False, True], ids=["g", "raw"])
