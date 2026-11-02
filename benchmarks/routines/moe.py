@@ -324,6 +324,21 @@ def parse_moe_args(line, parser):
         default=0,
         help="Expert parallel rank for cutlass_fused_moe.",
     )
+    parser.add_argument(
+        "--no_fused_finalize",
+        action="store_true",
+        default=False,
+        help="Pass use_fused_finalize=False to cutlass_fused_moe (non-fused, deterministic finalize).",
+    )
+    parser.add_argument(
+        "--enable_alltoall",
+        action="store_true",
+        default=False,
+        help=(
+            "Pass enable_alltoall=True to cutlass_fused_moe: with ep_size > 1 the finalize does not "
+            "zero-fill the rows of tokens that have no expert on this rank."
+        ),
+    )
 
     # BGMV MoE specific arguments
     parser.add_argument(
@@ -1002,6 +1017,8 @@ def testCutlassFusedMoe(args):
                 quant_scales=None,
                 output=out,
                 enable_pdl=args.enable_pdl,
+                use_fused_finalize=not args.no_fused_finalize,
+                enable_alltoall=args.enable_alltoall,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
@@ -1071,6 +1088,8 @@ def testCutlassFusedMoe(args):
                 quant_scales=quant_scales,
                 output=out,
                 enable_pdl=args.enable_pdl,
+                use_fused_finalize=not args.no_fused_finalize,
+                enable_alltoall=args.enable_alltoall,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
@@ -1158,6 +1177,8 @@ def testCutlassFusedMoe(args):
                 input_sf=input_sf,
                 output=out,
                 enable_pdl=args.enable_pdl,
+                use_fused_finalize=not args.no_fused_finalize,
+                enable_alltoall=args.enable_alltoall,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
             )
 
@@ -1258,6 +1279,8 @@ def testCutlassFusedMoe(args):
         cur_res["tp_rank"] = tp_rank
         cur_res["ep_size"] = ep_size
         cur_res["ep_rank"] = ep_rank
+        cur_res["no_fused_finalize"] = args.no_fused_finalize
+        cur_res["enable_alltoall"] = args.enable_alltoall
         res.append(cur_res)
 
     return res
