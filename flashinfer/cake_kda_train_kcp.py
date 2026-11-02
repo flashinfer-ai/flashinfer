@@ -92,9 +92,11 @@ Raw gate mode (``use_gate_in_kernel=True`` with ``A_log``, ``dt_bias`` and
 compute entries forward the keywords, ``chunk_kda_bwd_kcp`` then returns seven
 tensors (``dA_log`` / ``ddt_bias`` this rank's partial sums, summed over the
 group with :func:`reduce_gate_param_grads_kcp`), and ``kda_workspace_bytes_kcp``
-takes ``use_gate_in_kernel``.  ``deterministic=False`` raises ``ValueError`` for
-it and for ``use_qk_l2norm_in_kernel=True`` (#7817; the in-kernel q / k L2 norm
-is not available on that package); the off values (``use_gate_in_kernel=False``,
+takes ``use_gate_in_kernel``.  The in-kernel q / k L2 norm
+(``use_qk_l2norm_in_kernel=True``, #7817) runs on the deterministic package too:
+the compute entries forward it, and ``kda_workspace_bytes_kcp`` /
+``kda_saved_bytes_kcp`` take it.  ``deterministic=False`` raises ``ValueError``
+naming ``deterministic=True`` for either mode; the off values (``use_gate_in_kernel=False``,
 ``A_log`` / ``dt_bias`` / ``lower_bound`` ``None``,
 ``use_qk_l2norm_in_kernel=False``) are accepted on both routes.
 
@@ -542,6 +544,7 @@ def kda_workspace_bytes_kcp(
     local_arena: Optional[str] = None,
     lean_passes: Optional[int] = None,
     use_gate_in_kernel: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
     deterministic: bool = True,
 ) -> int:
     """Bytes of this rank's KCP workspace for ``H`` heads on the package ``deterministic`` selects (the same for both
@@ -550,7 +553,9 @@ def kda_workspace_bytes_kcp(
     (``WorkspaceKcp`` / ``WorkspaceDetKcp`` ``(local_arena="lean", lean_passes=...)``, opt-in: the backward's lean
     local arena, its tail in ``lean_passes`` passes, two by default); ``None`` keeps the replay arena.
     ``use_gate_in_kernel``: the workspace's gate mode (``WorkspaceDetKcp(use_gate_in_kernel=True)``, the raw gate
-    mode); ``True`` with ``deterministic=False`` raises ``ValueError``."""
+    mode); ``use_qk_l2norm_in_kernel``: its in-kernel q / k L2 norm mode
+    (``WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)``).  Either ``True`` with ``deterministic=False`` raises
+    ``ValueError``."""
     det = _deterministic(deterministic, "kda_workspace_bytes_kcp")
     plan = _det_plan() if det else _nd_plan()
     if save_transfer is None:
@@ -566,6 +571,7 @@ def kda_workspace_bytes_kcp(
         local_arena=local_arena,
         lean_passes=lean_passes,
         use_gate_in_kernel=use_gate_in_kernel,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
 
@@ -600,11 +606,13 @@ def kda_saved_bytes_kcp(
     with_conv: bool = True,
     C: int = 8192,
     checkpoint_keep: Optional[str] = None,
+    use_qk_l2norm_in_kernel: bool = False,
     deterministic: bool = True,
 ) -> int:
     """Bytes of this rank's KCP saved set for ``H`` heads on the package ``deterministic`` selects (the same for both
     values); see :func:`flashinfer.cake_kda_det_train_kcp.kda_det_saved_bytes_kcp` for ``save_transfer``,
-    ``with_conv``, ``C`` and ``checkpoint_keep``."""
+    ``with_conv``, ``C``, ``checkpoint_keep`` and ``use_qk_l2norm_in_kernel`` (the saved set of the in-kernel q / k L2
+    norm; ``True`` with ``deterministic=False`` raises ``ValueError``)."""
     det = _deterministic(deterministic, "kda_saved_bytes_kcp")
     plan = _det_plan() if det else _nd_plan()
     if save_transfer is None and checkpoint_keep is None:
@@ -618,6 +626,7 @@ def kda_saved_bytes_kcp(
         with_conv=with_conv,
         C=C,
         checkpoint_keep=checkpoint_keep,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
 

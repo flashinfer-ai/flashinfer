@@ -485,6 +485,8 @@ def test_facade_byte_queries_resolve_save_transfer_like_the_deterministic_facade
         by_route[1]["save_transfer"] is None and by_route[2]["save_transfer"] is False
     )
     assert by_route[0]["use_gate_in_kernel"] is False
+    assert by_route[0]["use_qk_l2norm_in_kernel"] is False
+    assert by_route[1]["use_qk_l2norm_in_kernel"] is False
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -507,7 +509,7 @@ RAW_GATE_ON = [
     {"use_gate_in_kernel": True, "use_qk_l2norm_in_kernel": True},
 ]
 RAW_GATE = "runs on the deterministic package only; pass deterministic=True"
-QK_NORM = "in-kernel q / k L2 norm is not available with deterministic=False"
+QK_NORM = "in-kernel q / k L2 norm runs on the deterministic package only"
 
 
 def _raw_gate_keywords() -> dict:
@@ -575,6 +577,66 @@ def test_package_byte_query_refuses_the_raw_gate() -> None:
         kcp_api.kda_workspace_bytes_kcp(
             object(), use_gate_in_kernel=True, deterministic=False
         )
+
+
+def test_package_byte_queries_refuse_the_in_kernel_qk_norm() -> None:
+    """The package's workspace and saved-set byte queries take the deterministic queries' ``use_qk_l2norm_in_kernel``:
+    ``False`` gives the bytes of the omitted keyword, any other value is a ``ValueError`` naming
+    ``deterministic=True``, before the context is read; the facade's ``deterministic=False`` route raises the same."""
+    plan = _mod("cake_kcp_plan")
+    ctx = kcp_api.build_context_kcp(
+        kcp_api.partition_kcp(MODE_CU, 2, deterministic=False),
+        None,
+        0,
+        "cpu",
+        sm_count=148,
+        deterministic=False,
+    )
+    for query in ("kda_workspace_bytes_kcp", "kda_saved_bytes_kcp"):
+        fn = getattr(plan, query)
+        assert fn(ctx, H=4, use_qk_l2norm_in_kernel=False) == fn(ctx, H=4), query
+        for value in (True, 1, None):
+            with pytest.raises(ValueError, match=QK_NORM) as info:
+                fn(object(), use_qk_l2norm_in_kernel=value)
+            assert "deterministic=True" in str(info.value), query
+        with pytest.raises(ValueError, match=QK_NORM) as info:
+            getattr(kcp_api, query)(
+                object(), use_qk_l2norm_in_kernel=True, deterministic=False
+            )
+        assert "deterministic=True" in str(info.value), query
+
+
+def test_facade_byte_queries_forward_the_in_kernel_qk_norm(
+    monkeypatch, torch_deterministic
+) -> None:
+    """``deterministic=True`` hands ``use_qk_l2norm_in_kernel`` (and the raw gate's ``use_gate_in_kernel``) to the
+    deterministic byte queries unchanged; ``deterministic=False`` hands the value to this package's queries (which
+    refuse ``True``: :func:`test_package_byte_queries_refuse_the_in_kernel_qk_norm`); under torch's deterministic
+    algorithms a ``deterministic=False`` query is the deterministic package's and receives it."""
+    seen = _route_recorders(monkeypatch)
+    ctx = object()
+    for query in ("kda_workspace_bytes_kcp", "kda_saved_bytes_kcp"):
+        det_tag = f"det:{FACADE_DET_NAMES[query]}"
+        assert getattr(kcp_api, query)(ctx, use_qk_l2norm_in_kernel=True) == det_tag
+        assert seen[-1][1]["use_qk_l2norm_in_kernel"] is True, query
+        assert getattr(kcp_api, query)(ctx, deterministic=False) == f"nd:{query}", query
+        assert seen[-1][1]["use_qk_l2norm_in_kernel"] is False, query
+    kcp_api.kda_workspace_bytes_kcp(
+        ctx, use_gate_in_kernel=True, use_qk_l2norm_in_kernel=True
+    )
+    assert seen[-1][1]["use_gate_in_kernel"] is True
+    assert seen[-1][1]["use_qk_l2norm_in_kernel"] is True
+    owner = sys.modules[kcp_api._deterministic.__module__]
+    monkeypatch.setattr(owner, "_DET_FALLBACK_WARNED", True)
+    torch.use_deterministic_algorithms(True)
+    for query in ("kda_workspace_bytes_kcp", "kda_saved_bytes_kcp"):
+        assert (
+            getattr(kcp_api, query)(
+                ctx, use_qk_l2norm_in_kernel=True, deterministic=False
+            )
+            == f"det:{FACADE_DET_NAMES[query]}"
+        ), query
+        assert seen[-1][1]["use_qk_l2norm_in_kernel"] is True, query
 
 
 def test_facade_forwards_the_raw_gate_to_the_deterministic_package(
