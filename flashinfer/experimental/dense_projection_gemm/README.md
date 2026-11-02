@@ -177,7 +177,11 @@ different streams never share them.  After an aborted launch, call `PreparedAtom
 `clear_convenience_caches()`).  A K2 launch with part tiles zeroes `out` on the launch stream (one memset) between
 the split and the program; prepared launches of both programs allocate nothing and can be captured in a CUDA graph.
 A prepared K2 launch binds everything but the stream when prepared (its FFI arguments are converted once), so a call
-issues its launches back to back.
+issues its launches back to back.  A cached K2 launch of the convenience path orders its arguments once per cache key
+and converts the arena's BF16x3 stack once per arena growth, so a call converts only the caller's views; a K2 call
+without a split count whose row has no verdict in the router table of the device's SM count (`ROUTER_RULES`, or the
+part's own table in `ROUTER_RULES_BY_SM`) calls the deterministic package's convenience path directly (nothing is
+planned or cached here for it).
 
 ## Benchmark
 
