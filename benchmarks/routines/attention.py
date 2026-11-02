@@ -128,6 +128,9 @@ def _drop_backends_without_trtllm_knobs(backends, args, device, knob_ok):
     for backend in list(backends):
         if backend not in knob_ok:
             _drop_backend(backends, backend, "does not take the trtllm-gen-only knobs")
+        elif backend == "trtllm-native" and get_compute_capability(device)[0] != 10:
+            # Resolves to xqa off SM10x (decode.py), which ignores these knobs.
+            _drop_backend(backends, backend, "resolves to xqa here, which ignores them")
         elif sm107_only and get_compute_capability(device) != (10, 7):
             _drop_backend(
                 backends,
@@ -137,24 +140,17 @@ def _drop_backends_without_trtllm_knobs(backends, args, device, knob_ok):
 
 
 def _record_mode_columns(cur_res, args):
-    """CSV columns for the optional dense-attention modes; empty when unused so
-    rows from lines that do not request a mode keep their historical values."""
-    if args.window_left >= 0:
-        cur_res["window_left"] = args.window_left
-    if args.logits_soft_cap > 0:
-        cur_res["logits_soft_cap"] = args.logits_soft_cap
-    if args.sinks:
-        cur_res["sinks"] = True
-    if getattr(args, "use_token_head_sf", False):
-        cur_res["use_token_head_sf"] = True
-    if args.use_fp16_softmax:
-        cur_res["use_fp16_softmax"] = True
-    if args.uses_spcompress:
-        cur_res["uses_spcompress"] = True
-    if args.skip_softmax_threshold_scale_factor is not None:
-        cur_res["skip_softmax_threshold_scale_factor"] = (
-            args.skip_softmax_threshold_scale_factor
-        )
+    """CSV columns for the optional dense-attention modes. Written on every row:
+    the CSV writer fills unset columns from the flag defaults anyway."""
+    cur_res["window_left"] = args.window_left
+    cur_res["logits_soft_cap"] = args.logits_soft_cap
+    cur_res["sinks"] = args.sinks
+    cur_res["use_token_head_sf"] = getattr(args, "use_token_head_sf", False)
+    cur_res["use_fp16_softmax"] = args.use_fp16_softmax
+    cur_res["uses_spcompress"] = args.uses_spcompress
+    cur_res["skip_softmax_threshold_scale_factor"] = (
+        args.skip_softmax_threshold_scale_factor
+    )
 
 
 def _cudnn_frontend_at_least(major, minor):
@@ -2147,6 +2143,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 sink_wrapper_backend,
                 "attention-sink wrapper requires out_dtype == q_dtype",
             )
+    if args.sinks and args.logits_soft_cap > 0:
+        # The attention-sink wrapper's variant has no soft-cap; it would drop it.
+        for sink_wrapper_backend in ("fa2", "fa3", "auto"):
+            _drop_backend(
+                backends,
+                sink_wrapper_backend,
+                "attention-sink wrapper does not apply --logits_soft_cap",
+            )
 
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
@@ -3544,7 +3548,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                     workspace_buffer,
                     "NHD",
                     use_cuda_graph=is_cuda_graph_compatible
-                    if backend not in ("fa2", "cutlass")
+                    if backend != "fa2"
                     else False,
                     qo_indptr_buf=qo_indptr,
                     kv_indptr_buf=kv_indptr,
@@ -3906,11 +3910,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             repeat_iters=args.num_iters,
             sleep_after_run=True,
             enable_cupti=args.use_cupti,
-            # cutlass re-allocates plan buffers per plan() and refuses CUDA-graph
-            # mode since #5133 (prefill.py), so it is timed eagerly like fa2.
-            use_cuda_graph=(
-                is_cuda_graph_compatible and cur_backend not in ("fa2", "cutlass")
-            ),
+            use_cuda_graph=(is_cuda_graph_compatible and cur_backend != "fa2"),
             cold_l2_cache=True,
             input_args=(
                 q,

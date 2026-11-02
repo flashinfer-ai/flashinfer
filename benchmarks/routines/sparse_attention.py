@@ -1154,6 +1154,16 @@ def testBlockSparseAttentionWrapper(args):
             continue
         wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(workspace, backend=b)
         wrapper.plan(indptr, indices, M, N, R, C, Hq, Hkv, D, **plan_kw)
+        if b == "cutile":
+            # cutile compiles at the first run and needs cuda-tile + tileiras.
+            try:
+                wrapper.run(q, k, v)
+            except Exception as e:
+                print(
+                    f"[INFO] cutile backend does not support this configuration: "
+                    f"{type(e).__name__}: {e}. Skipping."
+                )
+                continue
         if args.refcheck:
             outputs[b] = wrapper.run(q, k, v).detach().clone()
         times = _time(args, lambda _b, w=wrapper: w.run(q, k, v), b)
