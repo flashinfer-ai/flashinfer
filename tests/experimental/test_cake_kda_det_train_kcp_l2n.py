@@ -51,6 +51,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import datetime
+import functools
 import gc
 import inspect
 import json
@@ -119,6 +120,17 @@ def _l2n_missing(form: str = "fused", gate: str = "g") -> str | None:
     """The route's capability check on the current device's architecture (none without CUDA): ``None`` once the
     existing backend serves ``form`` in gate mode ``gate``, else the reason (``cake_kcp_plan.qk_l2norm_missing``)."""
     return cake_kcp_plan.qk_l2norm_missing(form, gate, cake_kcp_plan.qk_l2norm_arch())
+
+
+# the unpatched check (``capable`` replaces it)
+_QK_L2NORM_MISSING = cake_kcp_plan.qk_l2norm_missing
+
+
+@functools.cache
+def _backend_serves(mode: str, gate: str) -> bool:
+    """Whether the existing backend serves l2n mode ``mode`` in gate mode ``gate`` on every exported architecture
+    (the unpatched capability check)."""
+    return _QK_L2NORM_MISSING(mode, gate, None) is None
 
 
 @pytest.fixture
@@ -268,12 +280,16 @@ def _saved_summary(saved) -> dict:
 def _plan_recorder(name: str, real, calls: list, results: list | None = None):
     """``real`` (the existing backend's ``plan`` / ``workspace_bytes`` / ``tables_bytes``) recording its calls in
     ``calls`` and, with ``results``, each call's ``(name, args, keywords, result)``; a backend whose function does not
-    take ``l2n`` yet is called without it (the flag-off arena: the recorded keywords are the point)."""
+    take ``l2n`` yet, or whose records do not serve the mode yet, is called without it (the flag-off arena: the
+    recorded keywords are the point).  The wrapper keeps ``real``'s signature for the capability check."""
     takes_l2n = "l2n" in inspect.signature(real).parameters
 
+    @functools.wraps(real)
     def wrapped(*a, **k):
         calls.append([name, _jsonable(a), _jsonable(sorted(k.items()))])
-        if not takes_l2n:
+        if "l2n" in k and not (
+            takes_l2n and _backend_serves(k["l2n"], k.get("gate", "g"))
+        ):
             k = {x: v for x, v in k.items() if x != "l2n"}
         out = real(*a, **k)
         if results is not None:
@@ -1566,11 +1582,14 @@ def test_l2n_fallback_stages_are_never_skipped() -> None:
 # PENDING(single-rank in-kernel Q/K L2 norm programs): delete these rows once the existing backend serves the mode
 # (they skip then; the W = 2 / 4 refusal rows force a reason and stay); the record-coverage row and the GPU rows below
 # take over.
-def _never(name: str):
+def _never(name: str, like=None):
+    """A raiser standing in for ``name``; with ``like``, it keeps that callable's signature, so the capability check
+    reads the same signature with the raiser in place."""
+
     def fn(*_a, **_k):
         raise AssertionError(f"{name} reached before the in-kernel Q/K L2 norm refusal")
 
-    return fn
+    return fn if like is None else functools.wraps(like, updated=())(fn)
 
 
 def test_l2n_kernel_path_raises_until_bound() -> None:
@@ -1613,7 +1632,8 @@ def test_l2n_kernel_path_raises_until_bound() -> None:
             for name in ("tables", "_size_pools", "_bind_local", "_local_plan"):
                 m.setattr(cake_kcp.WorkspaceDetKcp, name, _never(name))
             for name in ("plan", "workspace_bytes", "KdaDetWorkspace"):
-                m.setattr(cake_backend, name, _never(f"cake_backend.{name}"))
+                real_fn = getattr(cake_backend, name)
+                m.setattr(cake_backend, name, _never(f"cake_backend.{name}", real_fn))
             # a CUDA device reads as sm_100a (no device is touched: the refusal comes first)
             m.setattr(
                 cake_kcp_plan,
