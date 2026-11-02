@@ -194,11 +194,15 @@ only); the 512-wide k tile's routes bind the unordered-tail builds.
 | `dgrad` probed queue split | yes | yes | - |
 | `wgrad` k256 `main` + ordered `tail_reduce` | yes | yes | yes |
 | `wgrad` k256 `main_wave` | yes | yes | - |
-| `wgrad` k512 unordered tail: `main`, `main_halves` | yes (planned walk) | yes (planned walk) | yes |
+| `wgrad` k512 unordered tail: `main`, `main_halves` | yes (planned walk) | yes (planned walk) | yes (planned walk, slack tail) |
 | `wgrad` k512 unordered tail: `main_wave`, `main_wave_halves` (wp8) | yes | yes | - |
-| `wgrad` k512 unordered tail: `main_halves_k256t` | - | - | yes |
+| `wgrad` k512 unordered tail: `main_halves_k256t` | - | - | yes (slack tail) |
 | `wgrad` output dtypes | bf16, fp32 | bf16, fp32 | bf16, fp32 |
 | CUDA toolkit floor (`min_cuda`) | 12.8 | 12.9 | 13.4 |
+
+The slack tail placement runs a launch's split tail whole on the clusters the
+full waves leave least loaded when every tail tile fits there; the kernel
+decides per launch on the device.
 
 A stage runs where the host plan constants select it; validation and
 performance results per architecture are reported in the delivery pull
