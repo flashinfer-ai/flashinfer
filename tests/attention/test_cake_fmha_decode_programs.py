@@ -1283,6 +1283,91 @@ def test_cake_fmha_decode_smallm_split_count_follows_the_streams_partition(
     assert route.program is None and route.num_split == 16, route
 
 
+def _fake_context_queries(monkeypatch, state, calls, *, stream_ids: bool):
+    """Driver queries over ``state``: the current stream's handle, its ID, its
+    context's handle, ID and SM count; ``calls`` logs each context read."""
+
+    def stream_id(stream):
+        return 0, state["stream_id"]
+
+    def stream_context(stream):
+        assert stream == state["stream"]
+        return 0, state["handle"]
+
+    def context_id(context):
+        return 0, state["context_id"]
+
+    def context_resource(context, sm_type):
+        calls.append(state["context_id"])
+        return 0, SimpleNamespace(sm=SimpleNamespace(smCount=state["sms"]))
+
+    monkeypatch.setattr(
+        torch._C, "_cuda_getCurrentRawStream", lambda index: state["stream"]
+    )
+    monkeypatch.setattr(cake_api, "_STREAM_SM_COUNTS", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_SM_COUNTS", {})
+    monkeypatch.setattr(cake_api, "_CU_STREAMS", {})
+    monkeypatch.setattr(
+        cake_api,
+        "_CONTEXT_QUERIES",
+        (
+            stream_id if stream_ids else None,
+            stream_context,
+            lambda: (0, state["handle"]),
+            context_id,
+            context_resource,
+            "sm",
+            lambda stream: stream,
+        ),
+    )
+
+
+def test_cake_fmha_smallm_partition_sm_count_follows_a_reused_stream_handle(
+    monkeypatch,
+) -> None:
+    """Without stream IDs, a stream handle (and a context handle) reused by a
+    new green context of another size reads the new context's SM count: the
+    count is cached per context ID, which the driver never reuses."""
+
+    state = {"stream": 7, "stream_id": None, "handle": 0x10, "context_id": 1}
+    state["sms"] = 64
+    calls = []
+    _fake_context_queries(monkeypatch, state, calls, stream_ids=False)
+    assert cake_api._stream_context_sm_count(0) == 64
+    assert cake_api._stream_context_sm_count(0) == 64
+    assert calls == [1]
+    # The 64-SM context and its stream are destroyed; a 32-SM context reuses
+    # both handles.
+    state.update(context_id=2, sms=32)
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert calls == [1, 2]
+
+
+def test_cake_fmha_smallm_partition_sm_count_is_cached_per_stream_id(
+    monkeypatch,
+) -> None:
+    """The SM count is cached per stream ID: a launch on a known stream reads
+    no context, and a reused stream handle with a new ID (a new green context)
+    reads its own context.  The per-thread default stream, whose context is the
+    thread's, is resolved to its context on every launch."""
+
+    state = {"stream": 7, "stream_id": 11, "handle": 0x10, "context_id": 1}
+    state["sms"] = 64
+    calls = []
+    _fake_context_queries(monkeypatch, state, calls, stream_ids=True)
+    assert cake_api._stream_context_sm_count(0) == 64
+    state["context_id"] = 99  # a hit reads no context
+    assert cake_api._stream_context_sm_count(0) == 64
+    assert calls == [1]
+    state.update(stream_id=12, context_id=2, sms=32)
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert calls == [1, 2]
+    state.update(stream=2, stream_id=None, context_id=3, sms=48)
+    assert cake_api._stream_context_sm_count(0) == 48
+    assert cake_api._stream_context_sm_count(0) == 48
+    assert calls == [1, 2, 3]
+
+
 @pytest.mark.parametrize("mutation", ("uint32_tables", "lse", "device_scales"))
 def test_cake_fmha_decode_smallm_scale_table_and_lse_forms(
     decode_target, mutation
@@ -1642,8 +1727,31 @@ def _smallm_partition_child(sms, rows, api, green=None):
             if green is None:
                 from torch.cuda.green_contexts import GreenContext
 
+                if api == "torch_recreated":
+                    # A larger partition planned first, then destroyed: its
+                    # stream handle may come back for the new partition.
+                    first = GreenContext.create(num_sms=2 * sms, device_id=0)
+                    with torch.cuda.stream(first.Stream()):
+                        first_sms = cake_api._smallm_launch_sm_count(
+                            torch.device("cuda")
+                        )
+                        first_stream = torch.cuda.current_stream().cuda_stream
+                    del first
+                    import gc
+
+                    gc.collect()
                 green = GreenContext.create(num_sms=sms, device_id=0)
             stream, partition = green.Stream(), sms
+            if api == "torch_recreated":
+                print(
+                    json.dumps(
+                        {
+                            "first_sms": first_sms,
+                            "handle_reused": stream.cuda_stream == first_stream,
+                        }
+                    ),
+                    flush=True,
+                )
     except Exception as error:  # noqa: BLE001 - any failure means no partition
         print(json.dumps({"skip": f"no green context: {error!r}"}), flush=True)
         return
@@ -1686,11 +1794,14 @@ def _smallm_partition_child(sms, rows, api, green=None):
 
 
 @_GPU
-@pytest.mark.parametrize("api", ("flashinfer", "torch", "torch_before_import"))
+@pytest.mark.parametrize(
+    "api", ("flashinfer", "torch", "torch_before_import", "torch_recreated")
+)
 def test_cake_decode_smallm_in_an_sm_partition_completes(api) -> None:
     """On a stream of a 32-SM green context (FlashInfer's or torch's, also one
-    created before FlashInfer was imported, with no partition setting) the
-    small-M rows plan at most 32 splits per tile and
+    created before FlashInfer was imported or after a 64-SM one was planned
+    and destroyed, with no partition setting) the small-M rows plan at most 32
+    splits per tile and
     complete (the full device's 65- and 152-way programs
     would wait forever for CTAs the partition cannot hold, and its nine-CTA
     cluster would not launch), matching the FP32 reference."""
@@ -1716,6 +1827,10 @@ def test_cake_decode_smallm_in_an_sm_partition_completes(api) -> None:
     if records and "skip" in records[0]:
         pytest.skip(records[0]["skip"])
     assert result.returncode == 0, result.stderr[-4000:]
+    if api == "torch_recreated":
+        first = records.pop(0)
+        print(json.dumps(first))
+        assert first["first_sms"] == 2 * _PARTITION_SMS, first
     assert [r["row"] for r in records] == list(_PARTITION_ROWS), result.stderr[-4000:]
     device_sms = torch.cuda.get_device_properties(0).multi_processor_count
     for record in records:
