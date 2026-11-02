@@ -32,7 +32,10 @@ single blocks at the end, each CTA its next chunk as the last block of its
 current one starts, so a CTA that starts late takes fewer blocks (one that
 becomes resident after every chunk was claimed takes none).  The CTAs add their weight-gradient
 sums into FP64 accumulators and take a ticket on the arrival word; whichever
-CTA arrives last finishes the sum, and no CTA waits for another.  Beside a
+CTA arrives last finishes the sum, and no CTA waits for another.  On SM100 and
+SM103 up to 256 rows the short backward launches one cluster of 16 CTAs,
+scheduled together on the SMs of one GPC, whose CTAs each wait for the other
+CTAs' FP32 partials of their columns and finish them, with no workspace.  Beside a
 long-resident one-thread kernel on another stream each call must keep its
 speed: per token count, the median of seven event-timed calls with the side
 kernel resident is at most ``MAX_RATIO`` times the median of seven calls alone,
@@ -47,7 +50,10 @@ The documented remedy is checked here: with the side kernel's preferred
 carveout set to the maximum shared memory, the backward (BF16 and FP32 weight
 gradients) and the forward start beside it and cost at most
 ``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side kernel's
-``ALL_SM_SPIN_MS`` lifetime.
+``ALL_SM_SPIN_MS`` lifetime; so does the short backward (6144 bytes a CTA)
+at 1 and 5 tokens (48 and 240 rows), which also starts beside it with the
+default and the maximum-L1 carveout (these tests do not launch the backward
+it replaces beside that side kernel).
 
 The backward beside a side kernel that holds ``k`` of the ``N`` SMs (issue
 #7548, item 1): busy / alone is at most the proportional ``N / (N - k)``, plus
@@ -80,7 +86,14 @@ host or the GPU fall on both alike: a measurement counts only when each
 forward's alone median is at most ``SHORT_MAX_ALONE_SPREAD`` times its fastest
 alone sample of that measurement, else it is taken again, at most
 ``SHORT_EXTRA_ATTEMPTS`` more times, and the bound applies to the first
-measurement that counts (to the last one when none does).
+measurement that counts (to the last one when none does).  The short
+backward at 1 and 5 tokens (48 and 240 rows) keeps its speed beside the
+one-thread kernel and, beside the short forward's side kernels, ends no later
+than the backward it replaces (the role's module, the one-wave backward, at
+the same rows) by the short forward's bound and measurement rule: there a
+measurement counts only when the short backward's and the replaced backward's
+alone medians are each at most ``SHORT_MAX_ALONE_SPREAD`` times their fastest
+alone sample of that measurement.
 
 In the item 1 and item 2 tests every side CTA records its SM and its start
 time, and a run counts only when the side kernel held the intended SMs before
@@ -880,6 +893,193 @@ def test_short_forward_ends_no_later_than_the_forward_beside_held_sms(
         f"tokens={tokens}: beside {ctas} x {threads} side CTAs ({side}) the short "
         f"forward took {busy_ms:.4f} ms, the deterministic forward "
         f"{det_busy_ms:.4f} ms (at most {1 + PROPORTIONAL_SLACK:.2f} times or "
+        f"{SHORT_EXTRA_MS} ms more; measurement {attempt} of at most {attempts}, "
+        f"alone spread {spread:.3f}, "
+        + ("counted)" if counts else f"none counted: above {SHORT_MAX_ALONE_SPREAD})")
+    )
+
+
+# The short backward (SM100 and SM103): one token and the most whole tokens of
+# H heads within its 256 rows, beside the short forward's side kernels.  Its
+# held test takes the short forward's bound, slack and SHORT_MAX_ALONE_SPREAD,
+# a threshold set from the short forward's held measurements above (no
+# measurement of the short backward went into it).
+SHORT_BACKWARD_TOKENS = (1, 5)
+SHORT_BACKWARD_SIDES = SHORT_FORWARD_SIDES
+# cudaSharedmemCarveoutMaxL1.  The tests below check that the short backward
+# (6144 bytes a CTA) starts beside a side kernel holding every SM without
+# shared memory with this or the default carveout (at most
+# MAX_ALL_SM_EXTRA_MS more than alone); the backward it replaces (20736 bytes
+# a CTA) is not launched beside that side kernel here.
+CARVEOUT_MAX_L1 = 0
+
+
+def _short_backward(tokens: int) -> tuple[str, str]:
+    """``(the short backward, the backward it replaces)``: the BF16
+    weight-gradient modules of ``tokens * H`` rows, where the architecture
+    routes the short backward (skips elsewhere)."""
+    device_index = torch.cuda.current_device()
+    arch = loader.device_arch(device_index)
+    name = loader.ROUTES[arch].get("bwd_bf16_short")
+    if name is None:
+        pytest.skip(f"{arch} routes no bwd_bf16_short module")
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    assert loader.module_for_rows(arch, "bwd_bf16", tokens * H, sms) == name
+    return name, loader.route_module(arch, "bwd_bf16")
+
+
+@pytest.mark.parametrize("tokens", SHORT_BACKWARD_TOKENS)
+def test_short_backward_keeps_its_speed_beside_a_resident_kernel(tokens: int) -> None:
+    _short_backward(tokens)
+    x, z, w, dy = _inputs(tokens)
+    workspace = workspace_for(tokens * H, x.device)
+
+    def call():
+        return backward(dy, x, z, w, EPS, workspace=workspace)
+
+    side = torch.cuda.Stream()
+    for _ in range(WARMUP):
+        _timed(call, side=None)
+    alone, busy = [], []
+    for _ in range(RUNS):
+        alone.append(_timed(call, side=None))
+        busy.append(_timed(call, side=side))
+    alone_ms = statistics.median(t for t, _ in alone)
+    busy_ms = statistics.median(t for t, _ in busy)
+    print(
+        f"STALL stage=short_backward tokens={tokens} heads={H} "
+        f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
+        f"ratio={busy_ms / alone_ms:.3f} extra_ms={busy_ms - alone_ms:.4f}"
+    )
+    _check_outputs("backward", tokens, alone, busy, _dw_reference(dy, x, z))
+    assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
+    assert _keeps_its_speed(alone_ms, busy_ms), (
+        f"short backward tokens={tokens}: {busy_ms:.4f} ms beside a resident "
+        f"kernel vs {alone_ms:.4f} ms alone"
+    )
+
+
+@pytest.mark.parametrize("tokens", SHORT_BACKWARD_TOKENS)
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+def test_short_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
+    dw_dtype: torch.dtype, tokens: int
+) -> None:
+    _short_backward(tokens)
+    x, z, w, dy = _inputs(tokens)
+    workspace = workspace_for(tokens * H, x.device)
+    dw = torch.empty(D, dtype=dw_dtype, device=x.device)
+
+    def call():
+        return backward(dy, x, z, w, EPS, grad_weight=dw, workspace=workspace)
+
+    alone_ms, busy_ms, alone, busy = _paired_medians(
+        call, _spin(CARVEOUT_MAX_SHARED), ALL_SM_RUNS
+    )
+    print(
+        f"ALL_SM stage=short_backward tokens={tokens} heads={H} dw={dw_dtype} "
+        f"carveout=max_shared alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
+        f"extra_ms={busy_ms - alone_ms:.4f}"
+    )
+    _check_outputs("backward", tokens, alone, busy, _dw_reference(dy, x, z))
+    assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
+    assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
+        f"tokens={tokens}: short backward alone {alone_ms:.4f} ms, beside an "
+        f"all-SM kernel with the max-shared carveout {busy_ms:.4f} ms (at most "
+        f"{MAX_ALL_SM_EXTRA_MS} ms more; the side kernel lives {ALL_SM_SPIN_MS} ms)"
+    )
+
+
+@pytest.mark.parametrize("tokens", SHORT_BACKWARD_TOKENS)
+@pytest.mark.parametrize("carveout", [None, CARVEOUT_MAX_L1], ids=["default", "max_l1"])
+def test_short_backward_starts_beside_an_all_sm_kernel_with_a_small_carveout(
+    carveout: int | None, tokens: int
+) -> None:
+    _short_backward(tokens)
+    x, z, w, dy = _inputs(tokens)
+    workspace = workspace_for(tokens * H, x.device)
+
+    def call():
+        return backward(dy, x, z, w, EPS, workspace=workspace)
+
+    alone_ms, busy_ms, alone, busy = _paired_medians(call, _spin(carveout), ALL_SM_RUNS)
+    label = "default" if carveout is None else "max_l1"
+    print(
+        f"ALL_SM stage=short_backward tokens={tokens} heads={H} "
+        f"dw=torch.bfloat16 carveout={label} alone_ms={alone_ms:.4f} "
+        f"busy_ms={busy_ms:.4f} extra_ms={busy_ms - alone_ms:.4f}"
+    )
+    _check_outputs("backward", tokens, alone, busy, _dw_reference(dy, x, z))
+    assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
+    assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
+        f"tokens={tokens}: short backward alone {alone_ms:.4f} ms, beside an "
+        f"all-SM kernel with the {label} carveout {busy_ms:.4f} ms (at most "
+        f"{MAX_ALL_SM_EXTRA_MS} ms more; the side kernel lives {ALL_SM_SPIN_MS} ms)"
+    )
+
+
+@pytest.mark.parametrize(
+    "ctas,threads,carveout",
+    SHORT_BACKWARD_SIDES,
+    ids=["1x128", "16x640", "32x640", "16x1024-max_shared"],
+)
+@pytest.mark.parametrize("tokens", SHORT_BACKWARD_TOKENS)
+def test_short_backward_ends_no_later_than_the_backward_beside_held_sms(
+    tokens: int, ctas: int, threads: int, carveout: int | None
+) -> None:
+    _name, replaced = _short_backward(tokens)
+    x, z, w, dy = _inputs(tokens)
+    workspace = workspace_for(tokens * H, x.device)
+
+    def call():
+        return backward(dy, x, z, w, EPS, workspace=workspace)
+
+    def call_replaced():
+        # the module the short backward replaces at these rows
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(pkg, "module_for_rows", lambda *_args: replaced)
+            return backward(dy, x, z, w, EPS, workspace=workspace)
+
+    spin = _spin(carveout, ctas=ctas, threads=threads)
+    side = f"{ctas}x{threads}" + ("s" if carveout is not None else "")
+    attempts = 1 + SHORT_EXTRA_ATTEMPTS
+    for attempt in range(1, attempts + 1):
+        short_medians, replaced_medians = _interleaved_paired_medians(
+            (call, call_replaced), spin, PROPORTIONAL_RUNS
+        )
+        alone_ms, busy_ms, alone, busy = short_medians
+        rep_alone_ms, rep_busy_ms, rep_alone, rep_busy = replaced_medians
+        alone_min_ms = min(t for t, _ in alone)
+        rep_alone_min_ms = min(t for t, _ in rep_alone)
+        spread = max(alone_ms / alone_min_ms, rep_alone_ms / rep_alone_min_ms)
+        counts = spread <= SHORT_MAX_ALONE_SPREAD
+        print(
+            f"HELD stage=short_backward tokens={tokens} heads={H} side={side} "
+            f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} "
+            f"replaced_alone_ms={rep_alone_ms:.4f} replaced_busy_ms={rep_busy_ms:.4f} "
+            f"busy_vs_replaced={busy_ms / rep_busy_ms:.3f} "
+            f"alone_min_ms={alone_min_ms:.4f} replaced_alone_min_ms={rep_alone_min_ms:.4f} "
+            f"alone_spread={spread:.3f} attempt={attempt}/{attempts} "
+            f"counts={int(counts)}"
+        )
+        _check_outputs(
+            "backward",
+            tokens,
+            alone + rep_alone,
+            busy + rep_busy,
+            _dw_reference(dy, x, z),
+        )
+        assert not bool(workspace.any()), f"tokens={tokens}: the workspace is not zero"
+        if counts:
+            break
+    assert (
+        busy_ms <= rep_busy_ms * (1 + PROPORTIONAL_SLACK)
+        or busy_ms - rep_busy_ms <= SHORT_EXTRA_MS
+    ), (
+        f"tokens={tokens}: beside {ctas} x {threads} side CTAs ({side}) the short "
+        f"backward took {busy_ms:.4f} ms, the backward it replaces "
+        f"{rep_busy_ms:.4f} ms (at most {1 + PROPORTIONAL_SLACK:.2f} times or "
         f"{SHORT_EXTRA_MS} ms more; measurement {attempt} of at most {attempts}, "
         f"alone spread {spread:.3f}, "
         + ("counted)" if counts else f"none counted: above {SHORT_MAX_ALONE_SPREAD})")

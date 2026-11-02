@@ -1305,3 +1305,75 @@ def test_backward_around_the_long_threshold_matches_the_deterministic_package(
     name = long if rows >= start * sms else loader.route_module(arch, role)
     assert loader.module_for_rows(arch, role, rows, sms) == name
     assert launched == [name] * suite.REPEATS, launched
+
+
+# The most rows of the short backward on SM100 and SM103.
+SHORT_BACKWARD_ROWS = 256
+# Backward inputs around the short backward's 256 rows: (tokens, heads,
+# layout); ``heads=None`` takes ``tokens`` rows as one flat [rows, 128] tensor.
+SHORT_BACKWARD_CASES = [
+    pytest.param(1, 48, "contiguous", id="1x48"),
+    pytest.param(5, 48, "projection", id="5x48-projection"),
+    pytest.param(13, 7, "head_major", id="13x7-head_major"),
+    pytest.param(255, None, "flat", id="threshold-1"),
+    pytest.param(256, None, "flat", id="threshold"),
+    pytest.param(257, None, "flat", id="threshold+1"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("tokens,heads,layout", SHORT_BACKWARD_CASES)
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+def test_backward_around_the_short_threshold_matches_the_deterministic_package(
+    tokens,
+    heads,
+    layout,
+    dw_dtype,
+    determinism_setting,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Around the short backward's 256 rows: the module launched is
+    ``module_for_rows``' (where the architecture routes it, the short backward
+    up to ``SHORT_BACKWARD_ROWS`` rows, else the backward), ``dx`` and ``dz``
+    are the deterministic package's bits, ``dw`` lies within the budget of the
+    deterministic ``dw`` on every repeat (an accumulated one within the budget
+    of the FP64 reference), and the workspace is zero after every call."""
+    arch = loader.device_arch(torch.cuda.current_device())
+    role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
+    sms = _sm_count()
+    if heads is None:
+        x, z, w, dy = suite.make(tokens, 1, layout="flat", seed=23)
+    else:
+        x, z, w, dy = suite.make(tokens, heads, layout=layout, seed=23)
+    rows = x.numel() // D
+    mag = suite.magnitudes(dy, x, z, EPS)
+
+    def out(value=None):
+        if value is None:
+            return torch.empty(D, dtype=dw_dtype, device=x.device)
+        return torch.full((D,), value, dtype=dw_dtype, device=x.device)
+
+    dx_d, dz_d, dw_d = det_backward(dy, x, z, w, EPS, grad_weight=out())
+    dw64 = suite.fp64_reference(dy, x, z, w, EPS)[3]
+    ws = nd_workspace(rows, x.device)
+    launched = _spy_launches(monkeypatch)
+    for _ in range(suite.REPEATS):
+        dx, dz, dw = nd_backward(dy, x, z, w, EPS, grad_weight=out(), workspace=ws)
+        assert dw.dtype == dw_dtype
+        assert torch.equal(dx, dx_d), "dx vs the deterministic package"
+        assert torch.equal(dz, dz_d), "dz vs the deterministic package"
+        suite.assert_dw_within(dw, dw_d, mag, what="dw vs the deterministic package")
+        assert not bool(ws.any()), "the workspace is not zero"
+    acc = nd_backward(
+        dy, x, z, w, EPS, grad_weight=out(0.25), accumulate_grad_weight=True
+    )[2]
+    suite.assert_dw_within(acc, 0.25 + dw64, mag, what="accumulated dw vs FP64")
+    short = loader.ROUTES[arch].get(f"{role}_short")
+    want = loader.route_module(arch, role)
+    if short is not None and rows <= SHORT_BACKWARD_ROWS:
+        assert loader.MODULES[short]["grid_rule"]["max_rows"] == SHORT_BACKWARD_ROWS
+        want = short
+    assert loader.module_for_rows(arch, role, rows, sms) == want
+    assert launched == [want] * (suite.REPEATS + 1), launched

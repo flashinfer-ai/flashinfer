@@ -435,9 +435,9 @@ def test_dense_mqa_logits(precision, queries, keys):
         ),  # above the fused Q <= 128 bound: the class under either order
         ("fp8", 16, 32768, "fp8:full:le32:short"),
         ("fp8", 16, 1048576, "fp8:full:le32:short"),
-        ("fp8", 16, 1048832, "fp8:full:le16"),
+        ("fp8", 16, 1048832, "fp8:full:le32:short"),
         ("fp8", 3, 8192, "fp8:partial:le32:short"),
-        ("fp8", 3, 1048832, "fp8:partial:le16"),
+        ("fp8", 3, 1048832, "fp8:partial:le32:short"),
         (
             "fp8",
             2,
@@ -536,7 +536,7 @@ def test_dense_mqa_route_selection(precision, queries, keys, route):
         policy = _runtime._catalog()["policy"]
         assert policy["fused_qle2048_max_kv"] == {"sm_100a": 34048, "sm_103a": 65536}
         assert policy["fused_qle2048_small_q_max_kv"] == {
-            "sm_100a": 34048,
+            "sm_100a": 65792,
             "sm_103a": 65792,
         }
         # the served route applies the device's own bound for the query count: the two-launch tier past it
@@ -580,6 +580,17 @@ def test_dense_single_launch_policy_is_published():
             for arch in arches:
                 bound = _runtime._scan_bound(value, arch)
                 assert bound >= 256 and bound % 256 == 0, (precision, ceiling, arch)
+            # the class's per-architecture small-Q band: a query bound up to the class's query ceiling (below the
+            # class's query counts = none) and a KV bound at or above the class's own bound, whole blocks
+            band_q = table.get(f"fused_scan{ceiling}_small_q_max_queries")
+            band_kv = table.get(f"fused_scan{ceiling}_small_q_max_kv")
+            assert (band_q is None) == (band_kv is None), (precision, ceiling)
+            if band_q is not None:
+                assert sorted(band_q) == sorted(band_kv) == arches, (precision, ceiling)
+                for arch in arches:
+                    assert 1 <= int(band_q[arch]) <= ceiling * _runtime.BLOCK_Q
+                    assert int(band_kv[arch]) >= _runtime._scan_bound(value, arch)
+                    assert int(band_kv[arch]) % 256 == 0, (precision, ceiling, arch)
         q1_bound = int(table["fused_q1_max_kv"])
         assert q1_bound >= 256 and q1_bound % 256 == 0, precision
     assert int(policy["fused_q128_max_kv"]) % 256 == 0
@@ -695,12 +706,12 @@ def test_dense_fp4_scan_bounds_are_per_arch():
     # (queries, keys): {arch: served route}, the logical name = the most permissive architecture's route
     cases = {
         (16, 1048576): {"sm_100a": "fp4:le32:short", "sm_103a": "fp4:le32:short"},
-        (16, 1048832): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le32:short"},
-        (33, 1048832): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le32:short"},
+        (16, 1048832): {"sm_100a": "fp4:le32:short", "sm_103a": "fp4:le32:short"},
+        (33, 1048832): {"sm_100a": "fp4:le32:short", "sm_103a": "fp4:le32:short"},
         (128, 1048832): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le32:short"},
         (16, 1049088): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le16"},
         (130, 65536): {"sm_100a": "fp4:qle1024:short", "sm_103a": "fp4:qle1024:short"},
-        (130, 65792): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:qle1024:short"},
+        (130, 65792): {"sm_100a": "fp4:qle1024:short", "sm_103a": "fp4:qle1024:short"},
         (1025, 65792): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:le1024:short"},
         (2052, 65792): {"sm_100a": "fp4:any", "sm_103a": "fp4:le1024:short"},
         (130, 66048): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:le2048"},
@@ -728,55 +739,133 @@ def test_dense_fp4_scan_bounds_are_per_arch():
     )
 
 
+def test_dense_scan_class_small_q_bands_are_per_arch():
+    """Host-only: the per-architecture small-Q bands of the in-kernel scan classes (the FP8
+    32-block class, the FP4 32- and 1024-block classes). On each architecture a 32-head call
+    of the class with Q <= ``fused_scan<c>_small_q_max_queries[arch]`` is served the class up
+    to ``fused_scan<c>_small_q_max_kv[arch]``, every other query count of the class up to
+    ``fused_scan<c>_max_kv``; past its bound the call takes the two-launch route of its query
+    count. The logical ``route_name`` applies the most permissive architecture."""
+    catalog = _runtime._catalog()
+    arches = sorted(catalog["arches"])
+    policy = catalog["policy"]
+    cases = (
+        ("fp8", policy, 32),
+        ("fp4", policy["fp4"], 32),
+        ("fp4", policy["fp4"], 1024),
+    )
+    for precision, table, ceiling in cases:
+        band_q = {
+            a: int(v)
+            for a, v in table[f"fused_scan{ceiling}_small_q_max_queries"].items()
+        }
+        band_kv = {
+            a: int(v) for a, v in table[f"fused_scan{ceiling}_small_q_max_kv"].items()
+        }
+        plain = {
+            a: _runtime._scan_bound(table[f"fused_scan{ceiling}_max_kv"], a)
+            for a in arches
+        }
+        lowest = (
+            2 if ceiling == 32 else 32 * _runtime.BLOCK_Q + 1
+        )  # the class's smallest query count
+        for arch in arches:
+            # the band's query bound and the class's query counts (FP8 Q = 128 belongs to the fused Q128 rule)
+            queries = sorted(
+                {lowest, band_q[arch], band_q[arch] + 1, ceiling * _runtime.BLOCK_Q}
+                - {1, 128 if precision == "fp8" else 0}
+            )
+            for q in queries:
+                if not lowest <= q <= ceiling * _runtime.BLOCK_Q:
+                    continue
+                in_band = q <= band_q[arch]
+                bound = max(plain[arch], band_kv[arch]) if in_band else plain[arch]
+                assert _runtime._scan_class_bound(table, ceiling, q, arch) == bound
+                assert _runtime._fused_scan_class(q, bound, table, arch) == ceiling
+                assert _runtime._fused_scan_class(q, bound + 256, table, arch) == 0
+                # (FP8: the fused Q <= 128 text owns K <= fused_qle128_max_kv only; the class serves at its bound)
+                route = _runtime.served_route(precision, q, bound, arch=arch)
+                assert ":short" in route, (precision, ceiling, arch, q, route)
+                past = _runtime.served_route(precision, q, bound + 256, arch=arch)
+                assert ":short" not in past, (precision, ceiling, arch, q, past)
+            for q in range(lowest, ceiling * _runtime.BLOCK_Q + 1):
+                if precision == "fp8" and q == 128:
+                    continue
+                union = max(
+                    max(plain[a], band_kv[a]) if q <= band_q[a] else plain[a]
+                    for a in arches
+                )
+                assert _runtime._scan_class_bound(table, ceiling, q) == union, (
+                    precision,
+                    ceiling,
+                    q,
+                )
+    # the FP8 32-block class past its bound: Q = 16 / Q = 3 at the first KV length above every bound take the le16 pair
+    top = max(
+        int(policy["fused_scan32_max_kv"]),
+        *(int(v) for v in policy["fused_scan32_small_q_max_kv"].values()),
+    )
+    assert _runtime.route_name("fp8", 16, top + 256) == "fp8:full:le16"
+    assert _runtime.route_name("fp8", 3, top + 256) == "fp8:partial:le16"
+
+
 def test_dense_fp8_qle2048_small_q_band_is_per_arch():
     """Host-only: the small-Q band of the fused Q <= 2048 route. On each architecture
     a 32-head FP8 call with 128 < Q <= ``fused_qle2048_small_q_max_queries[arch]``
     takes ``fp8:qle2048:short`` up to ``fused_qle2048_small_q_max_kv[arch]``, every
     other query count of the tier up to ``fused_qle2048_max_kv[arch]``; past its
-    bound the call takes the two-launch tier pair. sm_100a has no band (128), so
-    its routes are those of the plain bound."""
-    policy = _runtime._catalog()["policy"]
-    small_q = policy["fused_qle2048_small_q_max_queries"]
-    small_kv = policy["fused_qle2048_small_q_max_kv"]
-    plain = policy["fused_qle2048_max_kv"]
-    assert int(small_q["sm_100a"]) == 128 and int(small_kv["sm_100a"]) == int(
-        plain["sm_100a"]
-    )
-    qstar, kv = int(small_q["sm_103a"]), int(small_kv["sm_103a"])
-    assert 132 <= qstar < 2048 and kv == int(plain["sm_103a"]) + 256
+    bound the call takes the two-launch tier pair. An architecture whose query bound
+    is 128 has no band (its KV bound equals the plain bound). The logical name applies
+    the most permissive architecture's bound for the query count."""
+    catalog = _runtime._catalog()
+    arches = sorted(catalog["arches"])
+    policy = catalog["policy"]
+    small_q = {
+        a: int(v) for a, v in policy["fused_qle2048_small_q_max_queries"].items()
+    }
+    small_kv = {a: int(v) for a, v in policy["fused_qle2048_small_q_max_kv"].items()}
+    plain = {a: int(v) for a, v in policy["fused_qle2048_max_kv"].items()}
+    assert sorted(small_q) == sorted(small_kv) == sorted(plain) == arches
 
     def tier(q):
         return f"fp8:{'full' if q % 4 == 0 else 'partial'}:le2048"
 
-    for queries in (129, 130, 132, qstar):
-        assert _runtime._fused_qle2048_bound("sm_103a", queries) == kv
-        assert _runtime._fused_qle2048_bound("sm_100a", queries) == int(
-            plain["sm_100a"]
-        )
-        for keys in (kv - 255, kv):
-            assert (
-                _runtime.served_route("fp8", queries, keys, arch="sm_103a")
-                == "fp8:qle2048:short"
-            ), (queries, keys)
-            assert _runtime.served_route("fp8", queries, keys, arch="sm_100a") == tier(
+    def bound(arch, q):
+        return max(plain[arch], small_kv[arch]) if q <= small_q[arch] else plain[arch]
+
+    for arch in arches:
+        qstar, kv = small_q[arch], small_kv[arch]
+        assert 128 <= qstar < _runtime.FUSED_QLE2048_MAX_Q, arch
+        assert kv >= plain[arch] and kv % 256 == 0, arch
+        if qstar == 128:  # no band
+            assert kv == plain[arch], arch
+        for queries in sorted({129, 130, 132, max(qstar, 129), qstar + 1}):
+            b = bound(arch, queries)
+            assert _runtime._fused_qle2048_bound(arch, queries) == b, (arch, queries)
+            for keys in (b - 255, b):
+                assert (
+                    _runtime.served_route("fp8", queries, keys, arch=arch)
+                    == "fp8:qle2048:short"
+                ), (arch, queries, keys)
+            assert _runtime.served_route("fp8", queries, b + 256, arch=arch) == tier(
                 queries
-            )
-            assert _runtime.route_name("fp8", queries, keys) == "fp8:qle2048:short"
+            ), (arch, queries)
+    for queries in sorted(
+        {129, 130, 132, *small_q.values(), *(q + 1 for q in small_q.values())}
+    ):
+        if not 128 < queries <= _runtime.FUSED_QLE2048_MAX_Q:
+            continue
+        union = max(bound(a, queries) for a in arches)
+        assert _runtime.route_name("fp8", queries, union) == "fp8:qle2048:short"
+        assert _runtime.route_name("fp8", queries, union + 256) == tier(queries)
+        served = {
+            a: _runtime.served_route("fp8", queries, union, arch=a) for a in arches
+        }
+        if len(set(served.values())) > 1:
             with pytest.raises(ValueError, match="pass arch"):
-                _runtime.served_route("fp8", queries, keys)
-        for arch in ("sm_100a", "sm_103a"):
-            assert _runtime.served_route("fp8", queries, kv + 256, arch=arch) == tier(
-                queries
-            )
-    # one query past the band: the plain bound on sm_103a
-    above = qstar + 1
-    assert _runtime._fused_qle2048_bound("sm_103a", above) == int(plain["sm_103a"])
-    assert _runtime.served_route("fp8", above, kv, arch="sm_103a") == tier(above)
-    assert (
-        _runtime.served_route("fp8", above, int(plain["sm_103a"]), arch="sm_103a")
-        == "fp8:qle2048:short"
-    )
-    assert _runtime.route_name("fp8", above, kv) == tier(above)
+                _runtime.served_route("fp8", queries, union)
+        else:
+            assert _runtime.served_route("fp8", queries, union) == "fp8:qle2048:short"
 
 
 def test_dense_logits_route_expectation_is_per_arch():
@@ -786,20 +875,42 @@ def test_dense_logits_route_expectation_is_per_arch():
     expectation follows the device and is listed here; at the next KV block both
     architectures agree again."""
     per_arch = {
-        ("fp4", 16, 1048832): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le32:short"},
-        ("fp4", 33, 1048832): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le32:short"},
-        ("fp4", 130, 65792): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:qle1024:short"},
+        ("fp4", 16, 1048832): {
+            "sm_100a": "fp4:le32:short",
+            "sm_103a": "fp4:le32:short",
+        },
+        ("fp4", 33, 1048832): {
+            "sm_100a": "fp4:le32:short",
+            "sm_103a": "fp4:le32:short",
+        },
+        ("fp4", 130, 65792): {
+            "sm_100a": "fp4:qle1024:short",
+            "sm_103a": "fp4:qle1024:short",
+        },
         ("fp4", 2052, 65792): {"sm_100a": "fp4:any", "sm_103a": "fp4:le1024:short"},
         ("fp4", 16, 1049088): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le16"},
         ("fp4", 33, 1049088): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le128"},
         ("fp4", 130, 66048): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:le2048"},
         ("fp4", 2052, 66048): {"sm_100a": "fp4:any", "sm_103a": "fp4:any"},
+        ("fp8", 3, 1048832): {
+            "sm_100a": "fp8:partial:le32:short",
+            "sm_103a": "fp8:partial:le16",
+        },
+        ("fp8", 16, 1048832): {
+            "sm_100a": "fp8:full:le32:short",
+            "sm_103a": "fp8:full:le16",
+        },
+        ("fp8", 3, 1049088): {
+            "sm_100a": "fp8:partial:le16",
+            "sm_103a": "fp8:partial:le16",
+        },
+        ("fp8", 16, 1049088): {"sm_100a": "fp8:full:le16", "sm_103a": "fp8:full:le16"},
         ("fp8", 130, 65792): {
-            "sm_100a": "fp8:partial:le2048",
+            "sm_100a": "fp8:qle2048:short",
             "sm_103a": "fp8:qle2048:short",
         },
         ("fp8", 132, 65792): {
-            "sm_100a": "fp8:full:le2048",
+            "sm_100a": "fp8:qle2048:short",
             "sm_103a": "fp8:qle2048:short",
         },
         ("fp8", 130, 66048): {
@@ -953,7 +1064,13 @@ def test_dense_route_table_is_catalog_driven():
     }
     # order-independent points
     assert _runtime.route_name("fp8", 1, 4096) == "fp8:q1:short"
-    assert _runtime.route_name("fp8", 16, scan32 + 256) == "fp8:full:le16"
+    scan32_band = max(
+        int(v) for v in policy["fused_scan32_small_q_max_kv"].values()
+    )  # the class's small-Q band's most permissive bound (at or above the class's bound)
+    assert (
+        _runtime.route_name("fp8", 16, max(scan32, scan32_band) + 256)
+        == "fp8:full:le16"
+    )
     small_q_max_kv = max(
         int(v) for v in policy["fused_qle2048_small_q_max_kv"].values()
     )  # the small-Q band's most permissive bound (at or above the plain bound)
@@ -992,7 +1109,8 @@ def test_dense_route_table_is_catalog_driven():
         with pytest.raises(ValueError, match="pass arch"):
             _runtime.route_name("fp8", 130, 8192)
     assert _runtime.dense_route_available(32, 16, 4096)
-    assert _runtime.dense_route_available(32, 16, 1048832)
+    for a in arches:  # the per-arch FP8 32-block small-Q band: the architectures serve Q 16 at K 1048832 differently
+        assert _runtime.dense_route_available(32, 16, 1048832, arch=a)
     # 32 heads: the K rule is each route record's, per architecture (FP4 256; an FP8 route 256, or 1 on the
     # architectures where its programs take any K), with the record's kv_min (256 for the shipped two-stage
     # programs and the v9 scan classes, whose KV boxes are fitted to one block; 1 for the fused tiered programs).
@@ -1008,13 +1126,14 @@ def test_dense_route_table_is_catalog_driven():
             assert record["kv_min"] == 1
             assert all(int(v) == 1 for v in record["kv_alignment"].values()), route
     for keys in (4096, 1048832):
-        record = _runtime.route_record("fp8", 16, keys)
-        assert record["num_heads"] == 32 and record["block_q"] == 4
-        assert record["clean_logits"] == "fused"
-        assert (
-            record["kv_alignment"]
-            == routes[_runtime.route_name("fp8", 16, keys)]["kv_alignment"]
-        )
+        for a in arches:  # per arch: the FP8 32-block small-Q band serves Q 16 at K 1048832 on one architecture only
+            record = _runtime.route_record("fp8", 16, keys, arch=a)
+            assert record["num_heads"] == 32 and record["block_q"] == 4
+            assert record["clean_logits"] == "fused"
+            assert (
+                record["kv_alignment"]
+                == routes[_runtime.route_name("fp8", 16, keys)]["kv_alignment"]
+            )
     for arch in arches:
         assert _runtime.route_kv_alignment("fp8:full:le16", arch=arch) in (1, 256)
         # A 32-head ``:short`` route is served everywhere (no per-arch admission); the K verdict is the served record's
@@ -2270,6 +2389,8 @@ def _route_point(route_name, record):
             bounds.extend(
                 int(v) for v in (value.values() if isinstance(value, dict) else [value])
             )
+            band = table.get(f"fused_scan{int(ceiling)}_small_q_max_kv") or {}
+            bounds.extend(int(v) for v in band.values())
         if precision == "fp8":
             bounds.append(int(policy["fused_q128_max_kv"]))
             bounds.append(int(policy["fused_qle128_max_kv"]))

@@ -70,7 +70,8 @@ SMALL_L2POLICY_ARCHES = ("sm_100a",)
 # and scatter kernels with per-CTA shared-memory privatization and block
 # reservation (1024 routed pairs per CTA; the "large_q8i_p1024" selector) --
 # the 16384-token row of sm_100a today; every other large row keeps the
-# production routing kernels (256 pairs per CTA).
+# production routing kernels (256 pairs per CTA). That route's finalize loads
+# the partial rows of all 16 routed slots of a token before it accumulates them.
 LARGE_P1024_ARCHES = ("sm_100a",)
 LARGE_P1024_TOKENS = (16384,)
 # ... and the seven-stage route (quantization fused with the routing-table reset,
@@ -720,7 +721,16 @@ def test_cake_situ_every_route_eager_and_external_graph(
         assert bindings["fused_router"]["fc2_pool_ctas"] == 196
     if prepared["selector"] == "large_q8i_p1024":
         # The per-CTA privatized routing kernels handle 1024 routed pairs per
-        # CTA: a quarter of the production routing grid of the same row.
+        # CTA: a quarter of the production routing grid of the same row. The
+        # finalize is the program that loads all 16 routed slots of a token
+        # before it accumulates them, with the production finalize's arguments.
+        assert prepared["modules"]["finalize"] == cake_situ_program(
+            arch, "finalize:n128_q8i_mlp16"
+        )
+        assert (
+            MODULES[prepared["modules"]["finalize"]]["arg_plan"]
+            == MODULES[cake_situ_program(arch, "finalize:n128_q8i")]["arg_plan"]
+        )
         bindings = _cake_situ_stage_bindings(
             _options(x, ids, route_weights, output, weights, workspace), prepared
         )
