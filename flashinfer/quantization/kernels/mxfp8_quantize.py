@@ -35,7 +35,6 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32, Uint8
 
-from ...api_logging import flashinfer_api
 from ...cute_dsl.fp4_common import (
     fmax_f32,
     ld_global_v4_u32,
@@ -1309,7 +1308,6 @@ def _get_compiled_kernel_mxfp8_swizzled(
     return compiled_kernel, kernel_obj.rows_per_block
 
 
-@flashinfer_api
 def mxfp8_quantize_cute_dsl(
     input: torch.Tensor,
     is_sf_swizzled_layout: bool = True,
