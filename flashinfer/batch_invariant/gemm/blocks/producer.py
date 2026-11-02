@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """TMA producer block: one warp streams the A and B k-tiles of each owned output tile into the
 smem ring, k-tiles ascending, one ring slot per k-tile, multicast across the cluster when the
 knobs say so. The order here is the order the MMA block consumes; it carries no arithmetic.

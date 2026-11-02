@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Torch-facing entry of the bf16 GEMM class: ``mm_bf16_batch_invariant`` is what :func:`flashinfer.mm_bf16` runs
 under ``batch_invariant=True``. C = A @ B in bf16 with fp32 accumulation; A is (M, K) row-major, B is (K, N) either
 row-major or the transpose of a row-major (N, K) tensor (FlashInfer's documented "column-major" weight), C is (M, N)

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Dispatch of the bf16 GEMM: the chunk rule (a function of the weight shape only) and the cost-model dispatcher.
 
 Every record of the configuration space computes the class (R3), so the choice here never reaches the bits; it only

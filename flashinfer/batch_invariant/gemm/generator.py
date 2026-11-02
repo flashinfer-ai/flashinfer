@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The dense bf16 GEMM as a kernel generator on the engine.
 
 A GEMM kernel is generated from three typed parts, and nothing else:

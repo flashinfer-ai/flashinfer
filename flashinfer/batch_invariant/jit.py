@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Compiled kernels of the batch-invariant classes in FlashInfer's CuTe-DSL disk cache.
 
 :func:`build_and_load` is :func:`flashinfer.jit.cute_dsl_core.build_and_load_cute_dsl_kernel` with the module's **source

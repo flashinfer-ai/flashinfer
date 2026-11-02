@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Epilogue block: the spec's elementwise chain after the fold, then the store.
 
 Per epilogue subtile: TMEM -> registers (fp32), then the chain's single ``cvt.rn`` as the vector

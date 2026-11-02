@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Generate ``lean/BIKernels/Cases.lean`` from the Python side.
 
 For the bf16 GEMM class the file carries
@@ -29,6 +31,7 @@ import os
 from typing import Dict, List, Tuple
 
 from .fp import term
+from .gemm.cost_model import PARTS
 from .gemm.generator import REFERENCE_SHAPE, Knobs, MainloopBlock, enumerate_space
 from .gemm.schedule import chunks_for, default_config
 from .gemm.spec import MMA_K, GemmSpec, reduction
@@ -76,14 +79,6 @@ C4_SHAPE = (
 DISPATCH_MS = (1, 8, 64, 512, 4096, 16384)
 DISPATCH_NS = (64, 128, 256, 512, 1024, 2048, 4096, 8192)
 DISPATCH_BIG = (16384, 65536, 262144)
-#: The parts the dispatcher serves, (family, SM count): Rubin NVL8 / Vera Rubin NVL72 (sm_107), B200 / GB200 (sm_100), B300 (sm_103)
-DISPATCH_PARTS = (
-    ("sm_107", 204),
-    ("sm_107", 224),
-    ("sm_100", 148),
-    ("sm_100", 152),
-    ("sm_103", 148),
-)
 #: The generated theorems closed by ``native_decide`` (the exhaustive checks over the configuration space); every
 #: other case is kernel ``decide``. ``lean/Axioms.lean`` pins exactly these names.
 DECIDED_THEOREMS = (
@@ -133,7 +128,7 @@ def spaces() -> Tuple[List[Knobs], List[Knobs]]:
 
 
 def dispatch_cases() -> Dict[Knobs, Tuple[int, int, int]]:
-    """Every record the dispatcher returns over the grid (both weight layouts, every part of `DISPATCH_PARTS`), with the first shape that
+    """Every record the dispatcher returns over the grid (both weight layouts, every part of `PARTS`), with the first shape that
     selects it."""
     disp: Dict[Knobs, Tuple[int, int, int]] = {}
     pairs = [(N, K) for N in DISPATCH_NS for K in DISPATCH_NS]
@@ -143,7 +138,7 @@ def dispatch_cases() -> Dict[Knobs, Tuple[int, int, int]]:
         C = chunks_for(N, K)
         for M in DISPATCH_MS:
             for b_major in ("n", "k"):
-                for family, sm in DISPATCH_PARTS:
+                for family, sm in PARTS:
                     k = dataclasses.replace(
                         default_config(M, N, K, C, b_major, sm, family), grid_clusters=0
                     )

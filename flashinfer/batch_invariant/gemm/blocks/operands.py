@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Host-side operand block: everything that depends only on the knobs, the formats and the
 operand major modes . None of it decides a numeric order; the one
 numerically visible choice, the MMA instruction variant, is the A2 surface
@@ -14,6 +16,11 @@ from typing import Tuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
+
+# FlashInfer's copy of the DSL's persistent tile scheduler (the DSL's own module is deprecated and warns per use)
+from flashinfer.cute_dsl.attention.fmha.helpers import (
+    static_persistent_tile_scheduler as tile_scheduler,
+)
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from ..generator import MMA_K_BLOCKS, Knobs  # noqa: F401  (MMA_K_BLOCKS re-exported: the mainloop's inner radix)
@@ -231,13 +238,13 @@ def build_grid(st: StaticPlan, c: cute.Tensor, max_active_clusters):
         c, tiler=cute.slice_(st.cta_tile_shape_mnk, (None, None, 0))
     )
     num_ctas_mnl = gc[(0, (None, None, None))].shape
-    params = utils.PersistentTileSchedulerParams(
+    params = tile_scheduler.PersistentTileSchedulerParams(
         num_ctas_mnl,
         (*st.cluster_shape_mn, 1),
         st.knobs.swizzle_size,
         st.knobs.raster_along == "m",
     )
-    grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+    grid = tile_scheduler.StaticPersistentTileScheduler.get_grid_shape(
         params, max_active_clusters
     )
     return params, grid

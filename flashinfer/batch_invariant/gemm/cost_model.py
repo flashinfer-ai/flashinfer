@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Cost model of the bf16 GEMM records: the dispatcher behind `mm_bf16(batch_invariant=True)`.
 
 For one knob record at one shape the model predicts the device time (us) from the part's structure (`Arch`) and fitted
@@ -56,6 +58,8 @@ ARCHS: Dict[str, Arch] = {
     "sm_103": Arch("sm_103", 148, family="sm_103", placeholder=True, **_SM100),
     "sm_103_152": Arch("sm_103_152", 152, family="sm_103", placeholder=True, **_SM100),
 }
+#: The parts as (family, SM count): what the dispatcher serves, what the generated Lean cases and the tests enumerate.
+PARTS = tuple((a.family, a.sm_count) for a in ARCHS.values())
 FAMILY_OF_CC = {(10, 0): "sm_100", (10, 3): "sm_103", (10, 7): "sm_107"}
 FIT_FALLBACK = {
     "sm_103": "sm_100",

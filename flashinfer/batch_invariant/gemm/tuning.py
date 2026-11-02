@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The FlashInfer entry of the bf16 GEMM class: what :func:`flashinfer.mm_bf16` runs under ``batch_invariant=True``.
 
 The flag requires ``backend="auto"``: the class replaces the backends rather than joining them (a backend's kernel

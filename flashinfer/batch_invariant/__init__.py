@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Batch-invariant mode: deterministic, batch-invariant kernels behind ``batch_invariant=True``.
 
 The package holds the engine of the batch-invariant kernels (the canonical reduction plan, the floating-point interface

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Compile wrapper for the block-built GEMM: one TVM-FFI object per (knobs, B major, chunks, SM count) with dynamic M, N, K;
 cache module ``batch_invariant_gemm_bf16`` in FlashInfer's CuTe-DSL disk cache. Operand conventions: A (M, K)
 K-major, B (K, N) N-major (torch row-major) or K-major (a transposed weight), C (M, N) N-major, fp32 accumulate.

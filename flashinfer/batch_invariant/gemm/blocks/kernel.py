@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The kernel body: scaffolding (smem, pipelines, barriers, TMEM), the role dispatch and the composition of
 the blocks. ``BlockGemm`` is the bf16 body: the engine's fold in the mainloop, ``cvt.rn`` in the epilogue.
 """
@@ -8,7 +10,11 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.utils as utils
+
+# FlashInfer's copy of the DSL's persistent tile scheduler (the DSL's own module is deprecated and warns per use)
+from flashinfer.cute_dsl.attention.fmha.helpers import (
+    static_persistent_tile_scheduler as tile_scheduler,
+)
 from cutlass.cute.nvgpu import cpasync
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.tensor_utils import LayoutEnum
@@ -118,7 +124,7 @@ class BlockGemm:
         b_smem_layout_staged: cute.ComposedLayout,
         c_smem_layout_staged,
         epi_tile: cute.Tile,
-        tile_sched_params: utils.PersistentTileSchedulerParams,
+        tile_sched_params: tile_scheduler.PersistentTileSchedulerParams,
     ):
         st = self.st
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -248,7 +254,7 @@ class BlockGemm:
 
         # --- roles
         if warp_idx == TMA_WARP:
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             tma_producer_loop(
@@ -270,7 +276,7 @@ class BlockGemm:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             mma_loop(
@@ -298,7 +304,7 @@ class BlockGemm:
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(ACC_DTYPE)
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched = tile_scheduler.StaticPersistentTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
             )
             epilogue_loop(

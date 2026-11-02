@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The gates of the batch-invariant mode: the device check of an operator's class and the "unsupported raises" rule.
 Light imports only: the operators import this module on every call with ``batch_invariant=True``."""
 

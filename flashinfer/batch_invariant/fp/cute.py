@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The only floating-point primitives a batch-invariant CuTe-DSL kernel may use.
 
 Each one lowers to an NVVM intrinsic with an explicit ``.rn`` rounding mode (``add.rn.f32``). Unlike

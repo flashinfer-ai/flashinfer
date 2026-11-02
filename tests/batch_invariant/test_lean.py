@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The Lean coupling of the class ``gemm.bf16`` (``flashinfer/batch_invariant/lean/``).
 
 Device-free (every CI job): the committed ``Cases.lean`` is byte for byte what the Python spec and engine emit, so a

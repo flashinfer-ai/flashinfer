@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The batch-invariant bf16 GEMM: ``flashinfer.mm_bf16(a, b, backend="auto", batch_invariant=True)``.
 
 There is no exact CPU oracle for ``tcgen05.mma``, so the class is checked by bit agreement across its configurations
@@ -18,6 +20,7 @@ from flashinfer.batch_invariant.gemm.api import (
     mm_bf16_batch_invariant,
 )
 from flashinfer.batch_invariant.gemm.blocks.operands import can_implement
+from flashinfer.batch_invariant.gemm.cost_model import PARTS
 from flashinfer.batch_invariant.gemm.generator import (
     REFERENCE_SHAPE,
     Knobs,
@@ -29,7 +32,6 @@ from flashinfer.batch_invariant.gemm.schedule import (
     rank_topk,
 )
 
-_PARTS = (("sm_107", 204), ("sm_107", 224), ("sm_100", 148), ("sm_100", 152))
 _supported = torch.cuda.is_available() and bi.is_supported_device(
     torch.device("cuda"), MM_BF16_ARCHS
 )
@@ -119,7 +121,7 @@ def test_chunk_rule_takes_no_m():
         assert C & (C - 1) == 0 and K % (16 * C) == 0 and (C == 1 or K // C >= 256)
 
 
-@pytest.mark.parametrize("family,sm_count", _PARTS)
+@pytest.mark.parametrize("family,sm_count", PARTS)
 def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
     """R3 membership: every configuration the dispatcher or the tuner's candidate list returns is a well-formed record
     the kernel accepts for the shape; the candidates are distinct and the default is their first."""
@@ -255,7 +257,7 @@ def test_config_agreement(M, N, K):
     tile) give identical bits."""
     a, b = adv_bf16(M, K, 61), adv_bf16(K, N, 62)
     cfgs = []
-    for family, sm in _PARTS:
+    for family, sm in PARTS:
         cfgs += rank_topk(M, N, K, 1, "n", sm, 10, family)
     cfgs += [
         Knobs((64, 32), (1, 1), False, True, "m", 1),

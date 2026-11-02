@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Hash-consed symbolic terms over uninterpreted floating-point primitives.
 
 A term records *which* operations were applied in *which* association, not their numeric value. Two

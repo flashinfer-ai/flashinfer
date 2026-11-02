@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The canonical hierarchical-reduction engine (docs/generalization.md).
 
 A :class:`Reduction` is an op's *definition*: an index set written as mixed-radix

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The floating-point interface of the batch-invariant kernels, in its two backends.
 
 * :mod:`.term`: symbolic terms that record which operations were applied in which association (fingerprints,

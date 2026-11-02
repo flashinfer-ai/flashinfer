@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Split-K fixup: ``out[m, n] = cvt_rn( ((+0 + W[m,n,0]) + W[m,n,1]) + ... )`` over the C fp32 chunk partials, in
 chunk order (the ``chunk`` fold digit of the chunked specification). All math through ``CuteF32``; vectorised over n
 with 16-byte loads; columns predicated; the grid's y extent is capped (``MAX_GRID_Y``) and each block strides over the

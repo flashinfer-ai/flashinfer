@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Canonical dataflow of the dense bf16 GEMM.
 
 Per output element (m, n): a single ``fold`` digit over the K-steps of one ``tcgen05.mma`` (16 bf16 elements

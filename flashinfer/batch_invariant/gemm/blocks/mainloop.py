@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The mainloop block: the ``kstep`` fold of the spec, issued by its blocked lowering.
 
 The spec's fold has a runtime trip count (K is a runtime argument), so the kernel issues it
