@@ -43,6 +43,8 @@ _SM100_TILES: Dict[int, Tuple[Tuple[int, int, int], bool, Tuple[int, int], bool]
 }
 _SM100_SPLITK = 5
 _SM100_STREAMK = 6
+# Largest splits x M the split-K kernel's 32-bit row coordinates represent.
+_SM100_MAX_STACKED_ROWS = 2**31 - 1
 
 
 def _tiles(x: int, t: int) -> int:
@@ -429,6 +431,11 @@ def _sm100_plan(algo: int, m: int, n: int, k: int, device: torch.device) -> Tupl
                 "128 whose k-tile count has a divisor in 2..8"
             )
         algo = 1
+    if splits > 1 and splits * m > _SM100_MAX_STACKED_ROWS:
+        # The kernel writes the slices' partials as one output of splits x M rows
+        # and derives its row coordinates in 32-bit arithmetic: a stacked extent
+        # past that runs the 256x128 tile plain (no workspace), as the query reports.
+        splits = 1
     mma_tiler, two_sm, cluster, _ = _SM100_TILES[algo]
     plan = (
         algo,

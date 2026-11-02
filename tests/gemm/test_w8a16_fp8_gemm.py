@@ -289,8 +289,6 @@ def test_w8a16_fp8_gemm_workspace_bytes_splitk_overflow():
     expect_partials = _major() == 10
     for m, n, k, floor in [
         (2**20, 2**19, 1024, 2**42),
-        # 2 slices x (2^31 - 256) x 448 floats, about 7.7 TB.
-        (big, 448, 1024, 2 * big * 448 * 4),
         # Long K with a large grid: the wave-fill split rules run at their extremes.
         (2**20, 2**19, 2**30, 2**42),
     ]:
@@ -303,6 +301,19 @@ def test_w8a16_fp8_gemm_workspace_bytes_splitk_overflow():
     for m, n, k in [(big, big, 1024), (2**30, 2**30, 2**30)]:
         with pytest.raises(ValueError, match="too large"):
             w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
+    # Blackwell stacks the slices' partials as one output of splits x M rows and
+    # derives row coordinates in 32 bits: a forced split on an M whose stacked extent
+    # would pass 2^31 - 1 runs plain (no workspace), the query says so, and the
+    # largest M that still stacks (2 slices) reports its partials.
+    if expect_partials:
+        assert w8a16_fp8_gemm_workspace_bytes(2**30 + 128, 8, 256, dev, algo) == 0
+        assert w8a16_fp8_gemm_workspace_bytes(2**30 + 128, 8, 256, dev) == 0
+        # M at the dimension bound: 2 slices would stack to 2^32 - 1024 rows.
+        assert w8a16_fp8_gemm_workspace_bytes(big, 448, 1024, dev, algo) == 0
+        assert (
+            w8a16_fp8_gemm_workspace_bytes(2**30 - 128, 8, 256, dev, algo)
+            == 2 * (2**30 - 128) * 8 * 4
+        )
 
 
 def test_w8a16_fp8_gemm_rejects_aliasing():
@@ -933,19 +944,22 @@ def test_w8a16_fp8_gemm_two_streams_own_workspaces():
 
 
 def test_w8a16_fp8_gemm_graph_replay_two_graphs():
-    """One split call captured into a CUDA graph per stream, each with its own
-    workspace, the two graphs replayed repeatedly and interleaved on their streams.
-    Replay must reproduce the result every time: whatever the kernel keeps in the
-    workspace (partials, arrival counters) is re-established inside the graph."""
+    """One split call per stream captured into a CUDA graph, each with its own
+    inputs, output and workspace, the two graphs replayed repeatedly and interleaved
+    on their streams.  Before every replay, on the replay stream, the output is set
+    to NaN and the workspace to garbage: a replay must rebuild everything it reads
+    back (partials, arrival counters) inside the graph, and stale partials of the
+    previous replay cannot stand in for a slice released early."""
     dev = torch.device("cuda")
     algo, (m, n, k) = _tail_algo_and_shape(dev)
     torch.manual_seed(0)
-    act = torch.randn(m, k, device=dev, dtype=torch.bfloat16)
-    w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
-    ref = w8a16_fp8_gemm(act, w_fp8, scale, algo=algo)
     need = w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo)
-    graphs, outs, streams = [], [], []
-    for _ in range(2):
+    graphs, outs, streams, wss, refs, inputs = [], [], [], [], [], []
+    for i in range(2):
+        act = torch.randn(m, k, device=dev, dtype=torch.bfloat16) * (i + 1)
+        w_fp8, scale = _quantize(torch.randn(n, k, device=dev) * 0.02)
+        inputs.append((act, w_fp8, scale))  # the graphs hold raw pointers
+        refs.append(w8a16_fp8_gemm(act, w_fp8, scale, algo=algo))
         s = torch.cuda.Stream()
         ws = torch.full((need,), 0x7F, dtype=torch.uint8, device=dev)
         out = torch.empty(m, n, device=dev, dtype=act.dtype)
@@ -959,15 +973,16 @@ def test_w8a16_fp8_gemm_graph_replay_two_graphs():
         graphs.append(g)
         outs.append(out)
         streams.append(s)
+        wss.append(ws)  # ...so every buffer a graph reads or writes stays alive
     torch.cuda.synchronize()
     for rep in range(12):
-        for out in outs:
-            out.fill_(float("nan"))
-        for g, s in zip(graphs, streams, strict=True):
+        for g, s, out, ws in zip(graphs, streams, outs, wss, strict=True):
             with torch.cuda.stream(s):
+                out.fill_(float("nan"))
+                ws.fill_(0x7F if rep % 2 else 0x00)
                 g.replay()
         torch.cuda.synchronize()
-        for i, out in enumerate(outs):
+        for i, (out, ref) in enumerate(zip(outs, refs, strict=True)):
             assert torch.equal(out, ref), (algo, rep, i)
 
 
