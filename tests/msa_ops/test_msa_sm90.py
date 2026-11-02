@@ -1722,6 +1722,76 @@ def test_cute_prefill_transposes_only_referenced_pages(
 
 
 @sm90_only
+def test_cute_prefill_single_masks_blocks_past_the_extent(monkeypatch):
+    """A selected block at or past the sequence's extent (prefix plus its
+    queries) is causally masked in full, as on every other schedule.  The
+    fp8 single-token schedule transposes V only below that extent, so such a
+    block must not read its never-written transpose page: the transpose's
+    memory is poisoned with fp8 NaN here, which 0 * NaN would carry through
+    the causal mask into the output."""
+    from flashinfer.msa_ops import cake_hopper_sm90
+
+    monkeypatch.setattr(
+        cake_hopper_sm90, "prefill_route_available", lambda **kwargs: False
+    )
+    torch.manual_seed(0)
+    hq, hkv, ql, extra = 8, 1, 512, 4
+    seq = 900 * BLK_KV + ql  # single-token schedule, fp8 PV body
+    own_pages = -(-seq // BLK_KV)
+    width = own_pages + extra  # page-table columns past the extent
+    npg = 2 * width
+    page_table = torch.randperm(npg, device="cuda").to(torch.int32)[:width][None]
+    kv = torch.randn(npg, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") * 0.5
+    kv = kv.to(torch.float8_e4m3fn)
+    k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+    q = torch.randn(ql, hq, HEAD_DIM, device="cuda").to(torch.bfloat16)
+    cu_q = torch.tensor([0, ql], dtype=torch.int32, device="cuda")
+    seqused_k = torch.tensor([seq], dtype=torch.int32, device="cuda")
+    qpos = torch.arange(seq - ql, seq, device="cuda")
+    own = qpos // BLK_KV
+    # 13 older blocks, the query's own, and two past the extent (ascending).
+    score = torch.rand(ql, own_pages, device="cuda")
+    score[torch.arange(own_pages, device="cuda")[None, :] >= own[:, None]] = -1.0
+    past = torch.tensor([own_pages, own_pages + extra - 1], device="cuda")
+    sel = torch.cat(
+        [score.topk(TOPK - 3, dim=-1).indices, own[:, None], past.expand(ql, 2)], -1
+    )
+    idx = sel.sort(dim=-1).values.to(torch.int32)[None].contiguous()
+    # The past-extent blocks sort last: the same selection without them.
+    clean = idx.clone()
+    clean[..., -2:] = -1
+
+    empty = torch.empty
+
+    def nan_empty(*args, **kwargs):
+        # The op's only fp8 allocation is the V transpose: fill it with fp8
+        # NaN (0xFF), standing in for whatever memory it is handed.
+        t = empty(*args, **kwargs)
+        if t.dtype == torch.float8_e4m3fn:
+            t.view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(torch, "empty", nan_empty)
+
+    def run(indices):
+        return msa_sparse_attention(
+            q,
+            k,
+            v,
+            indices.contiguous(),
+            cu_q,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            causal=True,
+            softmax_scale=1.0 / math.sqrt(HEAD_DIM),
+        )
+
+    out = run(idx)
+    assert torch.isfinite(out.float()).all(), "an untransposed V page reached the PV"
+    assert torch.equal(out, run(clean))
+
+
+@sm90_only
 @pytest.mark.parametrize(
     "fill", ["nan", "nan_k_only", "nan_v_only", "garbage", "zeros"]
 )

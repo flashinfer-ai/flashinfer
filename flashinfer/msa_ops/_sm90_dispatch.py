@@ -165,6 +165,9 @@ def preload_sm90_programs(kinds: Optional[Iterable[str]] = None) -> dict[str, in
     kernels covered).  Their compile key is the plan, so an eager step's width
     and token count otherwise compile a new one mid-serving; each takes 1-2 s
     the first time on a node and is then read from the CuTe-DSL disk cache.
+    Only the masked kernels on fp32 scores are covered (a call passing
+    ``num_valid_pages`` or forced blocks); an unmasked call compiles its
+    kernel at its first use.
     """
     from .cake_hopper_sm90 import preload_programs
 
@@ -673,7 +676,9 @@ def sparse_prefill_sm90(
                 f"{int(page_table.shape[1])} > {_MPG_UNION_MAX}) supports "
                 f"Hq/Hkv of 8 or 16, got {g}"
             )
-        from .cute_dsl.sparse_prefill_single_sm90 import run as _prefill
+        from .cute_dsl.sparse_prefill_single_sm90 import run as _single_prefill
+
+        _prefill = _single_prefill
     else:
         if int(page_table.shape[0]) > _MAX_BATCH:
             raise NotImplementedError(
@@ -681,7 +686,9 @@ def sparse_prefill_sm90(
                 f"fixed extent of {_MAX_BATCH} sequences, got "
                 f"{int(page_table.shape[0])}"
             )
-        from .cute_dsl.sparse_prefill_sm90 import run as _prefill
+        from .cute_dsl.sparse_prefill_sm90 import run as _union_prefill
+
+        _prefill = _union_prefill
 
     kv = _as_packed_kv(k, v, q.shape[-1], require_dense=True)
     cu = cu_seqlens_q.to(torch.int32).contiguous()

@@ -875,6 +875,11 @@ class MsaSparseAttnFp8:
 
         if tidx < TOPK:
             blk = mIdx[hkv, tok, tidx]
+            # tkernel transposes only the pages below the sequence's extent; a
+            # block at or past it is causally masked in full, so drop it rather
+            # than read an unwritten vt page (0 * NaN survives the mask).
+            if blk * PG >= mPfx[b] + mCu[b + 1] - mCu[b]:
+                blk = cutlass.Int32(-1)
             meta[tidx] = blk
             pg0 = cutlass.Int32(0)
             if blk >= 0:
