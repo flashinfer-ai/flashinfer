@@ -43,6 +43,12 @@ class CuteF32:
         """``cvt.rn.<fmt>.f32`` (``arith.truncf``, RNE); the identity for ``f32``."""
         return a if fmt_name == "f32" else a.to(get_cutlass_dtype(fmt_name))
 
+    @staticmethod
+    def widen(a):
+        """A bf16 / f16 value as binary32 (``arith.extf``): exact, a bit movement rather than a rounding step; how a
+        narrower input (the bias) enters the fp32 chain."""
+        return a.to(Float32)
+
 
 # Name <-> CuTe dtype table shared by the kernels (kept out of the API modules so that compiled-kernel cache keys do not depend
 # on them).

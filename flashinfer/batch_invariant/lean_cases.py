@@ -12,7 +12,8 @@ carries
   ``gemm/blocks/mainloop.py`` executes it): its inner radix per format and the *Python engine's* trace at sampled
   block counts, reproduced by the Lean loop model ``kblockLoop`` / ``kblockLoop32`` node for node, plus
   ``kblockLoop_eq_kfold`` / ``kblockLoop32_eq_kfold32`` instantiated on the emitted radix;
-* the epilogue chain per output format, unscaled (bf16) and scaled (fp8: ``mul.rn alpha`` then the conversion);
+* the epilogue chain per output format, unscaled (bf16) and scaled (fp8: ``mul.rn alpha`` then the conversion),
+  and the biased chain of the bf16 classes;
 * the dispatcher's chunk rules ``chunks_for(N, K, fmt)`` as tables that Lean's ``chunksFor`` / ``chunksForFp8``
   re-derive;
 * the generator's configuration spaces at the reference shape and the split classes' spaces at a chunked shape, every
@@ -65,6 +66,10 @@ GEMM_OUT_CASES = [
     (128, "bf16"),
     (64, "f32"),
 ]  # (K, out_fmt): f32 is the split class's partial store
+GEMM_BIAS_CASES = [
+    (64, 1),
+    (256, 2),
+]  # (K, chunks): the biased chain (the bias added once before the conversion) on both classes
 CHUNK_TABLE_SHAPES = [
     (0, 4096),  # an empty weight: no split (natural-number division in Lean)
     (64, 64),
@@ -156,6 +161,14 @@ def out_cases(in_fmt: str = "bf16") -> List[Tuple[int, str, str]]:
     return [
         (K, fmt, term.sexpr(GemmSpec(K, fmt, in_fmt=in_fmt).out(0, 0)))
         for K, fmt in cases
+    ]
+
+
+def bias_cases() -> List[Tuple[int, int, str]]:
+    """``(K, chunks, sexpr)``: the Python spec's biased output element (0, 0) of each class."""
+    return [
+        (K, C, term.sexpr(GemmSpec(K, chunks=C, bias=True).out(0, 0)))
+        for K, C in GEMM_BIAS_CASES
     ]
 
 
@@ -352,6 +365,27 @@ def _render_format(L: List[str], in_fmt: str) -> None:
     L.append("")
 
 
+def _render_bias(L: List[str]) -> None:
+    """The biased chain of the bf16 classes: `outputElemBias` against the Python spec's biased output term."""
+    mk = MMA_K_OF["bf16"]
+    L.append(
+        "/-! The biased chain (`spec.output_elem` with a bias column): `outputElemBias` against the Python spec's biased "
+        "output term, on both bf16 classes: the bias leaf added once to the whole fold, then the conversion. -/"
+    )
+    for i, (K, C, sx) in enumerate(bias_cases()):
+        steps = K // mk
+        t = f"kfold ⟨0⟩ ⟨0⟩ {steps}" if C == 1 else f"kchunk ⟨0⟩ ⟨0⟩ {C} {steps // C}"
+        L.append(
+            f'theorem gemmbias{i}_spec : (outputElemBias "bf16" ({t}) ⟨0⟩).sexpr = {lean_str(sx)} := by decide  -- K={K} C={C}'
+        )
+    L.append(
+        "def gemmBiasCases : List (Nat × Nat) := ["
+        + ", ".join(f"({K // mk}, {C})" for K, C in GEMM_BIAS_CASES)
+        + "]"
+    )
+    L.append("")
+
+
 def render() -> str:
     """The content of ``Cases.lean``."""
     L = [
@@ -365,6 +399,7 @@ def render() -> str:
         "",
     ]
     _render_format(L, "bf16")
+    _render_bias(L)
     _render_format(L, FP8_FMT)
     L.append("end BIK")
     return "\n".join(L) + "\n"
@@ -375,7 +410,7 @@ def summary() -> str:
     space8, spacec8 = spaces(FP8_FMT)
     return (
         f"lean_cases coverage: gemm specs={len(GEMM_CASES)}+{len(GEMM_FP8_CASES)} loop cases={len(GEMM_LOOP_CASES)}+{len(GEMM_FP8_LOOP_CASES)} "
-        f"output cases={len(GEMM_OUT_CASES)}+{len(GEMM_FP8_OUT_CASES)} chunk-table shapes={len(CHUNK_TABLE_SHAPES)}+{len(FP8_CHUNK_EXTRA)} "
+        f"output cases={len(GEMM_OUT_CASES)}+{len(GEMM_FP8_OUT_CASES)} bias cases={len(GEMM_BIAS_CASES)} chunk-table shapes={len(CHUNK_TABLE_SHAPES)}+{len(FP8_CHUNK_EXTRA)} "
         f"space={len(space)}/{len(space8)} split space={len(spacec)}/{len(spacec8)} dispatch records={len(dispatch_cases())}/{len(dispatch_cases(FP8_FMT))}"
     )
 

@@ -36,7 +36,9 @@ structure ColData where
 of column `b`; `mma32 acc a t b` the fp8 K-step of 32 elements (a different opaque primitive: step `t` of the fp8 fold
 covers the elements of bf16 steps `2t` and `2t + 1`); `zero` is the +0 the accumulator starts from; `add` folds chunk
 partials; `mul` is the fp8 chain's `mul.rn` (the scales' product and the fold's scaling); `sym` a runtime scalar
-(the per-tensor scales); `cvt fmt` is the epilogue's single correctly rounded conversion to the output format. -/
+(the per-tensor scales); `cvt fmt` is the epilogue's single correctly rounded conversion to the output format; `bias n` is the bias of
+output column `n` (the bf16 bias widened to binary32, which is exact), a leaf like the operand slices, which the biased
+chain's `add` adds once to the whole fold. -/
 inductive GTerm where
   | zero
   | mma16 (acc : GTerm) (a : RowData) (t : Nat) (b : ColData)
@@ -45,6 +47,7 @@ inductive GTerm where
   | mul (x y : GTerm)
   | sym (name : String)
   | cvt (fmt : String) (x : GTerm)
+  | bias (n : ColData)
   deriving DecidableEq, Repr
 
 /-- Fold the K-steps `t0, t0+1, ..., t0+n-1` in ascending order onto `acc`. -/
@@ -177,6 +180,7 @@ structure Prims (α : Type) where
   mul : α → α → α
   sym : String → α
   cvt : String → α → α
+  bias : ColData → α
 
 variable {α : Type}
 
@@ -188,6 +192,7 @@ def eval (P : Prims α) : GTerm → α
   | .mul x y => P.mul (eval P x) (eval P y)
   | .sym s => P.sym s
   | .cvt f x => P.cvt f (eval P x)
+  | .bias n => P.bias n
 
 /-- **R1 determinism** at the semantic level: evaluation is a function; two executions of the same term under the
 same interpretation agree. -/
@@ -265,6 +270,47 @@ theorem output32_split_eq_kchunk32 (fmt : String) (a : RowData) (b : ColData) (C
     outputElem true fmt (splitKernel32 a b C kc σ) = outputKchunk32 fmt a b C kc := by
   unfold outputKchunk32; rw [splitKernel32_eq_kchunk32]
 
+/-! ## The biased chain (`spec.output_elem` with a bias column, `spec.BIAS_NOTE`)
+
+The bias of the output column is added once, in fp32, to the fully reduced accumulator, then the single `cvt.rn`:
+`cvt fmt (add acc (bias n))`. The bias is a leaf of the term (the bf16 bias widened to binary32, exactly), so a biased
+and an unbiased output are different terms (`outputElemBias_ne_outputElem`), and every fold identity above lifts to
+the biased output by congruence: the bias step is a per-element postfix of the fold, applied after the whole fold
+whatever implementation computed it (the unsplit kernel's epilogue, the in-CTA chunk fold's epilogue, the workspace
+split's fixup -- the partials stay bias-free). -/
+
+def outputElemBias (fmt : String) (acc : GTerm) (n : ColData) : GTerm := .cvt fmt (.add acc (.bias n))
+
+/-- The biased output of the unsplit class. -/
+def outputKfoldBias (fmt : String) (a : RowData) (b : ColData) (steps : Nat) : GTerm :=
+  outputElemBias fmt (kfold a b steps) b
+
+/-- The biased output of the split class. -/
+def outputKchunkBias (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) : GTerm :=
+  outputElemBias fmt (kchunk a b C kc) b
+
+/-- The workspace split with the bias added in the fixup after the chunk fold is the biased split class, for any
+chunk-to-CTA assignment. -/
+theorem outputBias_split_eq_kchunk (fmt : String) (a : RowData) (b : ColData) (C kc : Nat) (σ : Nat → Nat) :
+    outputElemBias fmt (splitKernel a b C kc σ) b = outputKchunkBias fmt a b C kc := by
+  unfold outputKchunkBias; rw [splitKernel_eq_kchunk]
+
+/-- The bias step is a congruence: equal folds give equal biased outputs, so every identity of the folds is an
+identity of the biased outputs. -/
+theorem outputElemBias_congr (fmt : String) {x y : GTerm} (n : ColData) (h : x = y) :
+    outputElemBias fmt x n = outputElemBias fmt y n := by rw [h]
+
+/-- A biased output is never an unbiased one, whatever the fold: the two are different specifications (the Python
+fingerprint carries the bias flag for the same reason). -/
+theorem outputElemBias_ne_outputElem (fmt : String) (acc : GTerm) (n : ColData) :
+    outputElemBias fmt acc n ≠ outputElem false fmt acc := by
+  intro h
+  have h' : GTerm.add acc (.bias n) = acc := by
+    simpa [outputElemBias, outputElem] using h
+  have hs := congrArg sizeOf h'
+  simp at hs
+  omega
+
 /-! ## The batched launch: R2 in all its forms -/
 
 /-- The per-row kernel is a function of the row's data and the weight; the launch applies it to every row. There is
@@ -299,6 +345,15 @@ theorem split_launch_is_kchunk (C kc : Nat) (σ : Nat → Nat) (M : Nat) (rows :
 theorem split32_launch_is_kchunk32 (C kc : Nat) (σ : Nat → Nat) (M : Nat) (rows : Fin M → RowData) (b : ColData) (r : Fin M) :
     launch M rows (fun a b => splitKernel32 a b C kc σ) b r = launch M rows (fun a b => kchunk32 a b C kc) b r := by
   simp only [launch, kernelRow, splitKernel32_eq_kchunk32]
+
+/-- The biased classes are launches of per-row functions too (no batch parameter inside), so `batch_invariance`,
+`permutation_invariance` and `subbatch_invariance` apply to them unchanged; the biased split kernel is a launch of
+the biased split class. -/
+theorem biased_split_launch_is_kchunk (fmt : String) (C kc : Nat) (σ : Nat → Nat) (M : Nat) (rows : Fin M → RowData)
+    (b : ColData) (r : Fin M) :
+    launch M rows (fun a b => outputElemBias fmt (splitKernel a b C kc σ) b) b r
+      = launch M rows (fun a b => outputKchunkBias fmt a b C kc) b r := by
+  simp only [launch, kernelRow, outputBias_split_eq_kchunk]
 
 /-- **Chunk count must not depend on M.** Stated as the contrapositive the dispatcher obeys: if the chunk count were a
 function of M, two batch sizes could disagree on a row; `chunks_for(N, K, fmt)` in `gemm/schedule.py` takes no M for
