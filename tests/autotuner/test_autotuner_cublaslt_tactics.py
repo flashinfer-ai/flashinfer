@@ -29,6 +29,7 @@ from flashinfer.autotuner.autotuner import _profile_measurement_scope
 from flashinfer.gemm import gemm_base
 from flashinfer.gemm.gemm_base import (
     _BF16_GEMM_SM100_TUNING_CONFIG,
+    _check_cublaslt_descriptor_ran,
     _cublaslt_algo_tensor,
     _cublaslt_algos_to_tactics,
     _is_cublaslt_algo_tactic,
@@ -75,6 +76,18 @@ def test_descriptor_json_roundtrip():
 )
 def test_non_descriptor_tactics_rejected(tactic):
     assert not _is_cublaslt_algo_tactic(tactic)
+
+
+def test_default_tactic_is_not_a_rejected_descriptor():
+    """The autotuner times ``-1`` as a candidate (it races the tuned tactics
+    under ``autotune_v2``); the heuristic default it runs must not be
+    disqualified as a descriptor that does not apply."""
+    with _profile_measurement_scope():
+        _check_cublaslt_descriptor_ran(0, -1)
+        _check_cublaslt_descriptor_ran(1, _DESCRIPTORS[0])
+        with pytest.raises(RuntimeError, match="does not apply"):
+            _check_cublaslt_descriptor_ran(0, _DESCRIPTORS[0])
+    _check_cublaslt_descriptor_ran(0, _DESCRIPTORS[0])
 
 
 _OP = "test::cublaslt_descriptor_persistence"
@@ -247,6 +260,20 @@ def profiled(monkeypatch):
 
 
 @pytest.fixture
+def profiled_tactics(monkeypatch):
+    """(runner class name, tactic) of every profiled tactic."""
+    calls = []
+    original = AutoTuner._profile_single_kernel
+
+    def counting(self, runner, inputs, tactic, *args, **kwargs):
+        calls.append((runner.__class__.__name__, tactic))
+        return original(self, runner, inputs, tactic, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", counting)
+    return calls
+
+
+@pytest.fixture
 def descriptor_runs(monkeypatch):
     """(used_descriptor, tactic) of every descriptor run."""
     runs = []
@@ -326,6 +353,28 @@ def test_graph_capture_inside_outer_autotune(backend, tuner, profiled):
             torch.cuda.synchronize()
             problem.check()
     assert profiled == []
+
+
+def test_default_races_under_autotune_v2(tmp_path, monkeypatch, profiled_tactics):
+    """``autotune_v2`` times ``tactic=-1`` of the first runner as a candidate;
+    the cuBLASLt runner's heuristic default must be measured, not disqualified."""
+    _skip_unless_backend("cublaslt")
+    monkeypatch.setenv("FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
+    tuner = _fresh_process()
+    try:
+        with autotune_v2():
+            problem = _Problem("cublaslt", 256)
+            problem()
+        problem.check()
+        tactics = [
+            t for name, t in profiled_tactics if name == "CublasltBf16GemmRunner"
+        ]
+        assert -1 in tactics
+        assert any(_is_cublaslt_algo_tactic(t) for t in tactics)
+        assert tuner.stats.failed_tactics == {}
+        assert tuner.stats.failed_profiling_count == {}
+    finally:
+        _fresh_process()
 
 
 def _runner_and_inputs(backend, m):

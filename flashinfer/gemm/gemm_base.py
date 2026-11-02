@@ -246,11 +246,16 @@ def _check_cublaslt_descriptor_ran(used_descriptor: int, tactic) -> None:
     Outside profiling, a descriptor that cuBLASLt rejects for the actual
     problem (e.g. tuned at another M of the bucket, or persisted by another
     cuBLASLt version) runs the heuristic default instead.
+
+    The heuristic default itself (``tactic == -1``) is never a rejected
+    descriptor: the autotuner times it as a candidate of its own (the default
+    races the tuned tactics in ``autotune_v2`` contexts).
     """
-    if not used_descriptor and is_in_profile_measurement():
-        raise RuntimeError(
-            f"cuBLASLt algorithm {tactic!r} does not apply to the profiled problem."
-        )
+    if tactic == -1 or used_descriptor or not is_in_profile_measurement():
+        return
+    raise RuntimeError(
+        f"cuBLASLt algorithm {tactic!r} does not apply to the profiled problem."
+    )
 
 
 # Error messages
