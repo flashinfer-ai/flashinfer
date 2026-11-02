@@ -328,6 +328,7 @@ def _worker(rank, args):
                     logical = idx.clone()
 
                     def prepare_slots():
+                        """Restore the logical routing, then plan and remap the redundant expert slots for ``m`` tokens."""
                         slot_buffer.topk_idx[:m].copy_(logical)
                         slots.plan_and_remap(m)
 

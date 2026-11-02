@@ -80,6 +80,7 @@ __all__ = [
 
 
 def _jit_args(factory, plan, b):
+    """Positional JIT arguments for ``factory`` from ``plan`` and buffer ``b``, with the rank count where that factory expects it."""
     args = (plan, b.num_sms)
     # Keep the trailing fused rank argument compatible with existing JIT callers.
     if factory is not gen_megamoe_sm90_nvfp4_module:
@@ -179,6 +180,7 @@ class MegaMoESymmBuffer:
         activation_clamp: float = 10.0,
         fast_math: bool = True,
     ) -> None:
+        """Validate the geometry, allocate the symmetric buffer and expose this rank's staging views."""
         import torch.distributed._symmetric_memory as symm_mem
 
         # Buffer geometry is format-independent; NVFP4 checks its narrower
@@ -253,6 +255,7 @@ class MegaMoESymmBuffer:
         )
 
     def _view(self, byte_offset: int, shape: Tuple[int, ...], dtype: torch.dtype):
+        """Typed view of ``shape`` into the symmetric buffer starting at ``byte_offset``."""
         itemsize = torch.empty((), dtype=dtype).element_size()
         numel = 1
         for s in shape:
@@ -513,6 +516,7 @@ def nvfp4_mega_moe(
 
 
 def _validate_call(y, w1, w2, b, m, weight_format, stats, gs1, gs2):
+    """Check ``y``, the expert weights and the optional per-expert tensors against the buffer geometry; raise ``ValueError`` on a mismatch."""
     if b.buffer is None:
         raise ValueError("symmetric buffer has been destroyed")
     if not 0 < m <= b.num_max_tokens_per_rank or m > getattr(b, "num_staged_tokens", 0):
@@ -684,6 +688,8 @@ FAMILY_THRESHOLD = 256
 
 @dataclasses.dataclass(frozen=True)
 class SplitPlan:
+    """Compile-time configuration of the NVFP4 split kernel: L1/L2 pipeline depth and shared memory, wave width, pool sizes and dispatch policies."""
+
     l1_num_stages: int
     l1_smem_size: int
     l2_num_stages: int
@@ -758,6 +764,7 @@ def select_split_plan(
 
 
 def _run_split(y, l1_weights, l2_weights, b, m, stats, gs1, gs2):
+    """Select the split plan for ``m`` tokens and launch the NVFP4 split kernel on buffer ``b``."""
     plan = select_split_plan(
         b.num_sms,
         b.group.size(),

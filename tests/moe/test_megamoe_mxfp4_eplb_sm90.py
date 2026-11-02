@@ -99,6 +99,7 @@ def _replicated_plan(counts, hot, block_m, R, E, H, S):
 
 
 def _plane_checksums(slots):
+    """Per-slot INT64 checksums of the four weight and scale planes, stacked as ``[4, slots]``."""
     sums = []
     for v in (
         slots.l1_weights,
@@ -174,6 +175,7 @@ def _setup(rank, args, seed, hot_seed, num_hot):
     hot = torch.randperm(E, device="cuda", generator=hot_generator)[:num_hot].tolist()
 
     def run(y, stats, in_kernel_copy=True):
+        """Launch the fused MXFP4 kernel into ``y``, with or without the in-kernel weight copy."""
         return mxfp4_mega_moe(
             y,
             slots.l1_weights,
@@ -186,18 +188,21 @@ def _setup(rank, args, seed, hot_seed, num_hot):
         )
 
     def reference(x, idx, routing):
+        """Logical BF16 reference output and per-expert counts for this rank."""
         return _reference(x.float() / 128, idx, routing, ref1, ref2, gs1, gs2, rank, H)
 
     return (ep, h, E, topk, S, H), buffer, slots, generator, hot, run, reference
 
 
 def _worker(rank, args):
+    """Per-rank body of the external replica plan test: empty placement, replicated hot experts with separate and in-kernel weight copy, remap-only, slot swaps and CUDA graph replay."""
     geometry, buffer, slots, generator, hot, run, reference = _setup(
         rank, args, seed=7919, hot_seed=29, num_hot=args.slots
     )
     ep, h, E, topk, S, H = geometry
 
     def check(y, expected, stats, expected_stats, label):
+        """Assert ``y`` is close to ``expected`` and ``stats`` equals ``expected_stats``."""
         torch.cuda.synchronize()
         _assert_close(y, expected, label)
         assert torch.equal(stats.long(), expected_stats), (label, stats, expected_stats)
@@ -326,12 +331,14 @@ def _worker(rank, args):
 
 
 def _run(args, worker=_worker):
+    """Spawn ``worker`` on ``args.ep`` ranks with a local rendezvous."""
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29652")
     torch.multiprocessing.spawn(worker, args=(args,), nprocs=args.ep)
 
 
 def _namespace(ep, **overrides):
+    """Default test arguments for ``ep`` ranks, with ``overrides`` applied."""
     args = dict(
         ep=ep,
         hidden=512,
@@ -348,6 +355,7 @@ def _namespace(ep, **overrides):
 
 @pytest.mark.parametrize("ep", [4, 8])
 def test_mxfp4_external_replica_plan(ep):
+    """Fused MXFP4 kernel with externally installed replica plans matches the logical reference on ``ep`` SM90 GPUs."""
     if torch.cuda.device_count() < ep or torch.cuda.get_device_capability()[0] != 9:
         pytest.skip(f"requires {ep} Hopper GPUs")
     _run(_namespace(ep))
@@ -359,6 +367,7 @@ def test_mxfp4_external_replica_plan(ep):
 
 
 def _ceil_div(a, b):
+    """Ceiling of ``a / b`` for non-negative integers."""
     return -(-a // b)
 
 
@@ -386,9 +395,11 @@ def _plan_reference(
     tau = _ceil_div(sum(b), R)
 
     def replicas_on(r):
+        """Number of non-resident experts rank ``r`` currently holds blocks of."""
         return sum(1 for e in range(E) if resident[e] != r and q[e][r] > 0)
 
     def holds(r, e):
+        """Whether rank ``r`` already has expert ``e`` as a replica or cached in a slot."""
         return q[e][r] > 0 or e in cached[r]
 
     for _ in range(S + 2):
@@ -560,12 +571,14 @@ def _expected_stats(idx, counts, copies, slot_expert, block_m, rank):
 
 
 def _planner_worker(rank, args):
+    """Per-rank body of the in-kernel planner test: warm, repeated, cold, gated and CUDA graph plans checked against the serial reference and the kernel output."""
     geometry, buffer, slots, generator, hot, run, reference = _setup(
         rank, args, seed=104729, hot_seed=31, num_hot=args.slots + 1
     )
     ep, h, E, topk, S, H = geometry
 
     def tables():
+        """Snapshot of the device-side plan tables: slot experts, copies, expert bases, copy count and copy list."""
         torch.cuda.synchronize()
         return (
             slots.slot_expert.cpu().tolist(),
@@ -576,6 +589,7 @@ def _planner_worker(rank, args):
         )
 
     def check_plan(prev, counts, block_m, open_gate_blocks, label):
+        """Assert the installed plan is rank-consistent, structurally valid and bit for bit equal to the serial reference; return its tables and busiest-rank loads."""
         slot_expert, copies, expert_base, copy_count, copy_list = tables()
         # Identical tables on every rank.
         for mine in (slots.slot_expert, slots.copies):
@@ -757,6 +771,7 @@ def _planner_worker(rank, args):
 
 @pytest.mark.parametrize("ep", [4, 8])
 def test_mxfp4_in_kernel_planner(ep):
+    """In-kernel planner tables, weight copies and kernel output match the serial reference on ``ep`` SM90 GPUs."""
     if torch.cuda.device_count() < ep or torch.cuda.get_device_capability()[0] != 9:
         pytest.skip(f"requires {ep} Hopper GPUs")
     _run(_namespace(ep), _planner_worker)
@@ -784,6 +799,7 @@ def test_slot_arena_keeps_the_fixed_block_size():
 
 
 def test_mxfp4_jit_cache_distinguishes_in_kernel_copy():
+    """Module keys differ between the plain MXFP4 kernel and its in-kernel weight copy variant, and between EPLB geometries."""
     from flashinfer.jit.megamoe import (
         get_megamoe_sm90_eplb_uri,
         get_megamoe_sm90_mxfp4_uri,
@@ -812,6 +828,7 @@ def test_mxfp4_jit_cache_distinguishes_in_kernel_copy():
     ],
 )
 def test_slot_geometry_is_validated(ranks, experts, slots, physical):
+    """Physical buffer sizes that do not match ranks x (resident experts + redundant slots) are rejected."""
     from flashinfer.megamoe.eplb import _check_geometry
 
     with pytest.raises(ValueError):
@@ -819,6 +836,7 @@ def test_slot_geometry_is_validated(ranks, experts, slots, physical):
 
 
 def test_slot_geometry_accepts_matching_buffer():
+    """A physical buffer of exactly ranks x (resident experts + redundant slots) passes the geometry check."""
     from flashinfer.megamoe.eplb import _check_geometry
 
     _check_geometry(8, 256, 4, 288)

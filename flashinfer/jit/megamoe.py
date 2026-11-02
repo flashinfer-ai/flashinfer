@@ -16,6 +16,7 @@ from .core import JitSpec, gen_jit_spec, write_if_different
 
 
 def _csrc_dir() -> Path:
+    """Directory holding the MegaMoE CUDA sources, installed or in a source checkout."""
     installed = jit_env.FLASHINFER_CSRC_DIR / "megamoe"
     if installed.exists():
         return installed
@@ -70,6 +71,7 @@ def get_megamoe_sm90_nvfp4_uri(
     fast_math: bool,
     num_ranks: int = 8,
 ) -> str:
+    """Module key of the NVFP4 fused kernel: shape, rank width and every compile-time plan policy."""
     return (
         f"megamoe_sm90_nvfp4_r{num_ranks}_sm{num_sms}_e{num_experts}_k{num_topk}"
         f"_h{hidden}_i{intermediate_hidden}_cap{num_max_tokens_per_rank}"
@@ -99,6 +101,7 @@ def gen_megamoe_sm90_nvfp4_module(
     fast_math: bool,
     num_ranks: int = 8,
 ) -> JitSpec:
+    """Render the fused config for ``plan`` and return the JIT spec of the NVFP4 fused kernel module."""
     uri = get_megamoe_sm90_nvfp4_uri(
         plan,
         num_sms,
@@ -160,6 +163,7 @@ def _split_shape_uri(
     hidden,
     intermediate_hidden,
 ) -> str:
+    """Shape part shared by the split-family module keys."""
     return (
         f"sm{num_sms}_r{num_ranks}_e{num_experts}_k{num_topk}"
         f"_h{hidden}_i{intermediate_hidden}_cap{num_max_tokens_per_rank}"
@@ -218,6 +222,7 @@ def get_megamoe_sm90_nvfp4_split_uri(
     activation_clamp,
     fast_math,
 ) -> str:
+    """Module key of the NVFP4 split kernel: shape, pipeline depths and dispatch policies of ``plan``."""
     return (
         "megamoe_sm90_nvfp4_split_"
         + _split_shape_uri(
@@ -250,6 +255,10 @@ def gen_megamoe_sm90_nvfp4_split_module(
     activation_clamp,
     fast_math,
 ) -> JitSpec:
+    """Render the split config for ``plan`` and return the JIT spec of the NVFP4 split kernel module.
+
+    Compiler fast-math stays off here; ``fast_math`` only selects source intrinsics.
+    """
     uri = get_megamoe_sm90_nvfp4_split_uri(
         plan,
         num_sms,
@@ -292,6 +301,7 @@ def gen_megamoe_sm90_nvfp4_split_module(
 
 
 def gen_megamoe_sm90_layout_module() -> JitSpec:
+    """JIT spec of the helper that computes the symmetric buffer layout and byte offsets."""
     csrc = _csrc_dir()
     return gen_jit_spec(
         "megamoe_sm90_layout",
