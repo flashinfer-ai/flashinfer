@@ -243,7 +243,11 @@ ROUTER_BLOCK_K = 32  # fp32 elements per router K block
 K1_PAIR_ROWS = 256  # rows of a K1 tile (a CTA pair, 2 x 128)
 K1_BLOCK_K = 64  # K elements per K1 K block
 K1_COUNTER_WORDS = 512  # ticket words per K1 tile: 16 epilogue warp slices x 32 lanes
-K1_BLOCK_N_CHOICES = (64, 128, 256)
+K1_BLOCK_N_CHOICES = (64, 128, 192, 256)
+#: The tile widths of :data:`K1_BLOCK_N_CHOICES` this package runs as its row-major-store program, with the operands
+#: exchanged (:attr:`AtomicGemmPlan.out_t` false): a CTA pair's tile is 256 rows of the transposed-store launch's ``N``
+#: by ``block_n`` columns of its ``M``.  The other widths run as transposed-store programs.
+K1_ROW_MAJOR_BLOCK_N: tuple[int, ...] = (192,)
 
 # ---------------------------------------------------------------------------
 # K1 planner: the measured verdicts
@@ -254,8 +258,9 @@ K1_BLOCK_N_CHOICES = (64, 128, 256)
 # ``dW[d_out, d_in] = G[T, d_out].T @ X[T, d_in]`` has ``A = X``, ``B = G``, ``M = d_in``, ``N = d_out``, ``K = T``.
 
 #: Per-row verdicts of the K1 weight gradient, ``(arch, L, M, N, out_dtype) -> (block_n, num_splits)`` (this
-#: package's program with that tile width and split count) or ``-> None`` (the deterministic program); ``M`` / ``N``
-#: as above, ``out_dtype`` ``"bf16"`` or ``"f32"``.  A row carries a program only where that program was measured
+#: package's program with that tile width and split count; a width of :data:`K1_ROW_MAJOR_BLOCK_N` runs the row-major
+#: program with the operands exchanged) or ``-> None`` (the deterministic program); ``M`` / ``N`` as above,
+#: ``out_dtype`` ``"bf16"`` or ``"f32"``.  A row carries a program only where that program was measured
 #: faster than the deterministic package's shipped plan of the row in every measurement run: a one-sided paired sign
 #: test (p < 0.05) with a median time ratio below 0.99, in eager launches and in CUDA graph replays, at token counts
 #: 16172 to 16384, and no more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another
@@ -332,7 +337,9 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: more than 3 % slower than the deterministic plan in some graph replays behind a kernel holding 8 to 32 SMs.  Not
 #: faster than the deterministic plan in every run on 208 SMs (one of the parts runs at a lower SM clock):
 #: ``8192 -> 128``, ``4096 -> 4096`` FP32 and ``5120 -> 1024`` BF16; the last also runs the deterministic program on 212
-#: SMs, where it is 1.3 to 2.5 % faster.
+#: SMs, where it is 1.3 to 2.5 % faster.  On 212 SMs ``4096 -> 1024`` FP32 takes the 192-wide row-major program at one
+#: split (88 tiles of 256 ``d_out`` rows by 192 ``d_in`` columns, 176 CTAs, one wave next to a kernel holding 32 SMs),
+#: which keeps more SMs busy than the 128 CTAs of the 256-wide transposed tile.
 # fmt: off
 K1_SPLIT_RULES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]]
@@ -357,7 +364,7 @@ K1_SPLIT_RULES_BY_SM: dict[
         ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
         ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
         ("sm_107a", 1, 4096, 512, "bf16"): None, ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
-        ("sm_107a", 1, 4096, 1024, "f32"): (256, 1),
+        ("sm_107a", 1, 4096, 1024, "f32"): (192, 1),
         ("sm_107a", 1, 4096, 4096, "f32"): (256, 1),
         ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 3),
         ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
@@ -415,17 +422,19 @@ def k1_plan(
 
 
 def k1_block_n(N: int) -> int:
-    """Column tile of a K1 launch with an explicit split count and no tile width: the choice of
+    """Column tile of a K1 launch with an explicit split count and no tile width: the transposed-store choice of
     :data:`K1_BLOCK_N_CHOICES` that pads ``N`` least (the wider tile on a tie)."""
-    return min(K1_BLOCK_N_CHOICES, key=lambda bn: (_ceil_div(N, bn) * bn, -bn))
+    widths = [bn for bn in K1_BLOCK_N_CHOICES if bn not in K1_ROW_MAJOR_BLOCK_N]
+    return min(widths, key=lambda bn: (_ceil_div(N, bn) * bn, -bn))
 
 
 def atomic_k1_template(block_n: int, out_f32: bool) -> str:
-    """The registry template of this package's K1 program (both operands MN-major, transposed store)."""
+    """The registry template of this package's K1 program (both operands MN-major): the transposed-store program of
+    the tile width, or the row-major-store one for a width of :data:`K1_ROW_MAJOR_BLOCK_N`."""
     return (
         f"{cake_jit.TEMPLATE_PREFIXES[0]}nn_n{int(block_n)}"
         + ("_f32" if out_f32 else "")
-        + "_t"
+        + ("" if int(block_n) in K1_ROW_MAJOR_BLOCK_N else "_t")
     )
 
 
@@ -437,10 +446,11 @@ def atomic_k1_template(block_n: int, out_f32: bool) -> str:
 @dataclass(frozen=True)
 class AtomicGemmPlan:
     """The host plan of one K1 launch of this package: the transposed-store GEMM ``out[l, n, m] = sum_k A[l, k, m]
-    B[l, k, n]`` over the ``[L, K, M]`` / ``[L, K, N]`` operand views, ``L x m_tiles x n_tiles`` tiles of
-    ``256 x block_n`` each cut into ``splits`` K ranges, walked persistently by at most ``sm_pairs`` CTA pairs.
-    ``transposed_out`` is the caller's: without it the caller's ``out[l, m, n]`` is this launch with the caller's
-    operands exchanged (``swapped``)."""
+    B[l, k, n]`` (``out_t``), or the row-major-store GEMM ``out[l, m, n]`` (``out_t`` false: the widths of
+    :data:`K1_ROW_MAJOR_BLOCK_N`), over the launch's ``[L, K, M]`` / ``[L, K, N]`` operand views, ``L x m_tiles x
+    n_tiles`` tiles of ``256 x block_n`` each cut into ``splits`` K ranges, walked persistently by at most ``sm_pairs``
+    CTA pairs.  ``M`` and ``N`` are the launch's.  ``transposed_out`` is the caller's: the launch takes the caller's
+    operands exchanged (``swapped``) when its store form differs from the caller's output layout."""
 
     L: int
     M: int
@@ -454,10 +464,11 @@ class AtomicGemmPlan:
     n_tiles: int
     sm_pairs: int
     template: str
+    out_t: bool = True
 
     @property
     def swapped(self) -> bool:
-        return not self.transposed_out
+        return self.transposed_out != self.out_t
 
     @property
     def tiles(self) -> int:
@@ -519,9 +530,10 @@ def plan_atomic_gemm(
     package's program does not take (dtypes, a K-major operand, extents not multiples of 8, an output row or batch
     stride not a multiple of 8 elements, an output not 16-byte aligned), a template this checkout does not register
     for ``arch``, or the planner (:func:`k1_plan`).  An explicit ``splits`` / ``block_n`` replaces the planner's
-    choice (the other one from the planner, else ``1`` split / :func:`k1_block_n`) and runs this package's program
-    whenever the view and the registry allow it.  Raises ``ValueError`` for inconsistent shapes (as the
-    deterministic planner does) and for an explicit choice the program cannot run."""
+    choice (the other one from the planner, else ``1`` split / :func:`k1_block_n`) and runs this package's program of
+    that width (the row-major-store program for a width of :data:`K1_ROW_MAJOR_BLOCK_N`) whenever the view and the
+    registry allow it.  Raises ``ValueError`` for inconsistent shapes (as the deterministic planner does) and for an
+    explicit choice the program cannot run."""
     det = deterministic_backend()
     A3, B3, O3 = (
         det.as_batched(A, "A"),
@@ -598,6 +610,10 @@ def plan_atomic_gemm(
     template = atomic_k1_template(bn, out_f32)
     if template not in cake_jit.KERNELS.get(arch, {}):
         return (*none, f"{template} is not registered for {arch}")
+    out_t = bn not in K1_ROW_MAJOR_BLOCK_N
+    if not out_t:
+        # the row-major-store launch: the transposed-store launch with its operands and extents exchanged
+        a_launch, b_launch, M_, N_ = b_launch, a_launch, N_, M_
     plan = AtomicGemmPlan(
         L=L,
         M=M_,
@@ -611,6 +627,7 @@ def plan_atomic_gemm(
         n_tiles=_ceil_div(N_, bn),
         sm_pairs=max(1, int(sm_count) // 2),
         template=template,
+        out_t=out_t,
     )
     return plan, a_launch, b_launch, O3, ""
 
@@ -702,16 +719,19 @@ ROUTER_RULES: dict[
     # that plan at 16172 to 16384 tokens when launched before a kernel holding SMs on another stream.  Hidden 6144
     # keeps the deterministic plan: on sm_100a no partition was faster in every run in CUDA graphs; on sm_103a the
     # closest one ("H1x5p44", x0.973-0.983 alone) left the backward pass (input and weight gradient) no faster.
-    # sm_107a keeps the deterministic plan: at hidden 4096 "H0.5x4" was up to 7 % slower than that plan when a kernel
-    # holding 16 SMs on another stream started during it (the kernel takes SMs the head spans wait for), at hidden
-    # 6144 it left the backward pass no faster, and at hidden 5120 it was measured on one part only
+    # sm_107a: hidden 5120 "H0.5x4" (four tail units, 108 head and 432 tail units on 216 SMs; measured on two parts at
+    # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
+    # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
+    # the head spans wait for), at 6144 it left the backward pass no faster
     ("sm_100a", "nn_t", 4096, 256): ((10240, 16384, "H1x5p44"),),
     ("sm_100a", "nn_t", 5120, 256): ((1, 128, "waves"), (10240, 32768, "H0.5x3")),
     ("sm_100a", "nn_t", 6144, 256): None,
     ("sm_103a", "nn_t", 4096, 256): None,
     ("sm_103a", "nn_t", 5120, 256): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
     ("sm_103a", "nn_t", 6144, 256): None,
-    ("sm_107a", "nn_t", 4096, 256): None, ("sm_107a", "nn_t", 5120, 256): None, ("sm_107a", "nn_t", 6144, 256): None,
+    ("sm_107a", "nn_t", 4096, 256): None,
+    ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+    ("sm_107a", "nn_t", 6144, 256): None,
 }
 # fmt: on
 #: The SM count the verdicts of :data:`ROUTER_RULES` were measured on, per architecture (152-SM GB200 / GB300, 216-SM

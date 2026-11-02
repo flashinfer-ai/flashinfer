@@ -30,6 +30,7 @@ import tvm_ffi
 from ...comm.torch_symmetric_memory import _enable_symm_mem_for_group
 from ...moe_ep.cake_mxfp8_megamoe_ep16 import CakeMxfp8MegaMoeEp16Weights
 from .jit import (
+    fused_grid_ctas,
     load_cake_mxfp8_megamoe_ep16_module,
     require_cute_dsl_capability,
     require_supported_capability,
@@ -46,8 +47,6 @@ _MAX_TOKENS_PER_RANK = 64
 _EXPERT_ROW_SEGMENTS = (32, 16, 16)
 _EXPERT_ROWS = sum(_EXPERT_ROW_SEGMENTS)
 _SUPPORTED_TOKENS = (16, 32, _MAX_TOKENS_PER_RANK)
-_FUSED_GRID_CTAS = 144
-_MAX_LAUNCH_EPOCH = (2**31 - 1) // _FUSED_GRID_CTAS - 1
 _CUTE_DSL_PEER_CAPACITY = 32
 _CUTE_DSL_FLAG_WORDS = 2 + 2 * 2 * _WORLD_SIZE
 
@@ -206,8 +205,13 @@ def _validate_gathered_routing_capacity(gathered: torch.Tensor) -> None:
         )
 
 
-def _validate_launch_epoch(epoch: int) -> None:
-    if epoch < 0 or epoch > _MAX_LAUNCH_EPOCH:
+def _max_launch_epoch(grid_ctas: int) -> int:
+    # The grid counters count (epoch + 1) x CTAs of the launched fused grid in 32-bit signed arithmetic.
+    return (2**31 - 1) // grid_ctas - 1
+
+
+def _validate_launch_epoch(epoch: int, grid_ctas: int) -> None:
+    if epoch < 0 or epoch > _max_launch_epoch(grid_ctas):
         raise RuntimeError(
             "Cake MXFP8 MegaMoE session launch epoch is exhausted; "
             "create a new session before submitting another forward"
@@ -462,7 +466,18 @@ class CakeMxfp8MegaMoeEp16:
         self._backend = backend
         if backend == "cute_dsl":
             require_cute_dsl_capability(capability)
+            from .cute_dsl import FUSED_GRID_CTAS as grid_ctas
             from .cute_dsl import create_runner
+        else:
+            # The fused kernel's grid barriers need every CTA of its cooperative grid resident at once, one per SM.
+            grid_ctas = fused_grid_ctas(capability)
+            sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+            if grid_ctas > sm_count:
+                raise RuntimeError(
+                    f"Cake MXFP8 MegaMoE needs {grid_ctas} co-resident CTAs (one per SM) on compute capability "
+                    f"{capability[0]}.{capability[1]}, but the device has {sm_count} SMs"
+                )
+        self._fused_grid_ctas = grid_ctas
 
         self._validate_weights(weights, device=device)
         self.weights = weights
@@ -618,7 +633,7 @@ class CakeMxfp8MegaMoeEp16:
 
         workspace = self._workspace
         launch_epoch = self._launch_epoch
-        _validate_launch_epoch(launch_epoch)
+        _validate_launch_epoch(launch_epoch, self._fused_grid_ctas)
         with torch.cuda.device(device), tvm_ffi.use_torch_stream():
             if self._backend == "cuda":
                 self._module.run(

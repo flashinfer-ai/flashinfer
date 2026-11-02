@@ -66,6 +66,9 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.query import (
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
     make_throughput_latency_mla_config,
 )
+from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.parallel_reduction import (
+    GMEM_REDUCTION_RUNTIME_SPLIT_WINDOWS,
+)
 from flashinfer.mla import (
     get_prims_ts_batch_mla_decode_workspace_size,
 )
@@ -3661,6 +3664,7 @@ def test_mla_final_lse(dtype, heads, nq, nk, packed, mode):
     "heads,batch,kv",
     [
         (16, 3, 2304),  # Rounded capacity changes cluster residency.
+        (8, 1, 9216),  # Q8 runtime-split G1 parallel reducer.
         (64, 1, 8192),
         (64, 1, 19456),
         (128, 1, 8192),  # Balance a live prefix across the full Q128 cluster.
@@ -3683,8 +3687,15 @@ def test_mla_runtime_count_changes(dtype, heads, batch, kv):
     )
     lse = torch.empty(case.query.shape[:-1], device="cuda")
     # Reuse the same compiled callable/scratch for increasing and decreasing counts.
+    # Pin both sides of every runtime reducer window boundary: a window's last
+    # count and the next window's first (predicated) count, including the first
+    # count past the largest window, which takes the runtime chunk loop.
+    window_counts = sorted(
+        {1, 2, 3, 4}
+        | {n for w in GMEM_REDUCTION_RUNTIME_SPLIT_WINDOWS for n in (w, w + 1)}
+    )
     for count in (
-        *[n for n in (1, 2, 3, 4, 8, 9, 16, 17, 32) if n <= capacity],
+        *[n for n in window_counts if n <= capacity],
         capacity,
         2,
     ):

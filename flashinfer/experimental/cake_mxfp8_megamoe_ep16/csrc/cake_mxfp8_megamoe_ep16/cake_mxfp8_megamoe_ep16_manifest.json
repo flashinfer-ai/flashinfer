@@ -203,7 +203,7 @@
       },
       "launches_per_call": 2,
       "setup_launches": 1,
-      "max_launch_epoch": 14913079,
+      "max_launch_epoch": 11184809,
       "compile_flags": [
         "--use_fast_math"
       ],

@@ -22,7 +22,8 @@ recurrence of the same operands and with one another.  Per row and rank the test
   for every tensor;
 * bitwise (G3): repeat; saved == replay (``boundary_mode``); ``save_mode`` light == full; autograd == explicit;
   ``torch.utils.checkpoint(use_reentrant=False)`` == direct; ``save_transfer`` True == False; ring == a2a where the
-  partition allows the ring; strided packed-QKV views == contiguous operands (``layout`` tma and copy);
+  partition allows the ring; strided packed-QKV views == contiguous operands (``layout`` tma and copy; under tma the
+  backward writes one packed dQKV row, and ``packed_qkv_views_det_kcp`` hands it to a packed leaf without a concatenation);
   ``.backward()`` twice accumulates exactly twice the gradient;
 * semantics (G4): zero-gradient leak (``dout`` zero outside one document -> exactly zero gradients on the others) and
   independence (the other documents' operands replaced -> one document's outputs bitwise unchanged);
@@ -1132,7 +1133,41 @@ def _run_rank(
     # strided packed-QKV views: zero-copy (layout="tma") and the copy adapter, both bitwise the contiguous call
     _buf, qs, ks, vs = _packed_views(q, k, v)
     flags["strided_eq_contiguous"] = _eq(res, saved_pass(qs, ks, vs))
+    # issue #7817: packed operands -> #8 writes dq / dk / dv as the same views of one packed dQKV row
+    flags["packed_grad_layout"] = (
+        int(q.shape[0]) == 0 or kcp.LAST_CALL["bwd"]["grad_layout"] == "packed"
+    )  # T_r = 0: nothing to pack
     flags["copy_layout_eq_contiguous"] = _eq(res, saved_pass(qs, ks, vs, layout="copy"))
+    # the copy adapter copies strided views; a one-token view is already contiguous, stays a packed view and keeps
+    # the packed gradient row
+    copy_noop = int(q.shape[0]) > 0 and all(x.is_contiguous() for x in (qs, ks, vs))
+    flags["copy_grad_layout_separate"] = kcp.LAST_CALL["bwd"]["grad_layout"] == (
+        "packed" if copy_noop else "separate"
+    )
+    # ... and the split hands that row to the packed leaf without a concatenation (autograd, bitwise)
+    split_before = dict(kcp.PACKED_SPLIT_STATS)
+    qkv_leaf = _buf.detach().clone().requires_grad_(True)
+    g_leaf, b_leaf = (x.detach().clone().requires_grad_(True) for x in (g, beta))
+    pq, pk, pv = kcp.packed_qkv_views_det_kcp(qkv_leaf, H_qk=H_qk, HV=HV)
+    out_split = kcp.chunk_gdn_det_kcp(
+        pq, pk, pv, g_leaf, b_leaf, ctx, workspace=ws, **base
+    )
+    out_split.backward(dout)
+    ga = qkv_leaf.grad
+    res_split = {
+        "out": out_split.detach(),
+        "dq": ga[:, : H_qk * 128].reshape(-1, H_qk, 128),
+        "dk": ga[:, H_qk * 128 : 2 * H_qk * 128].reshape(-1, H_qk, 128),
+        "dv": ga[:, 2 * H_qk * 128 :].reshape(-1, HV, 128),
+        "dg": g_leaf.grad,
+        "dbeta": b_leaf.grad,
+    }
+    flags["packed_split_eq_contiguous"] = _eq(res_auto, res_split)
+    flags["packed_split_aliased"] = (
+        int(ga.shape[0]) == 0
+        or kcp.PACKED_SPLIT_STATS["aliased"] - split_before["aliased"] == 1
+    )
+    del qkv_leaf, g_leaf, b_leaf, out_split, ga, res_split
     # gradient accumulation: .backward() twice == exactly twice the gradient (x + x is exact in every float format)
     res_twice = autograd_pass(False, twice=True)
     flags["backward_twice_accumulates"] = all(
@@ -2120,7 +2155,11 @@ def _run_rank_layer(
     device: torch.device,
     result_dir: str | None,
     backend: str,
+    *,
+    l2n: bool = False,
 ) -> dict:
+    """One whole-layer row (``l2n``: #7817, the in-kernel L2 norm on the raw convolution output views instead of the
+    caller's norm)."""
     import inspect
 
     from flashinfer import cake_causal_conv1d_train as conv
@@ -2150,8 +2189,11 @@ def _run_rank_layer(
         ckw = {"recompute_handle": h} if (h is not None and conv_takes_handle) else {}
         y = conv.cake_causal_conv1d_kcp(x, w, ctx, **ckw)
         qkv = y.view(y.shape[0], 2 * H_qk + HV, 128)
-        q = _l2_normalize(qkv[:, :H_qk])
-        k = _l2_normalize(qkv[:, H_qk : 2 * H_qk])
+        if l2n:  # #7817: the raw views; the recurrence normalizes q / k itself
+            q, k = qkv[:, :H_qk], qkv[:, H_qk : 2 * H_qk]
+        else:
+            q = _l2_normalize(qkv[:, :H_qk])
+            k = _l2_normalize(qkv[:, H_qk : 2 * H_qk])
         v = qkv[:, 2 * H_qk :]
         return kcp.chunk_gdn_det_kcp(
             q,
@@ -2163,6 +2205,7 @@ def _run_rank_layer(
             recompute_handle=h,
             save_transfer=False,
             backend=backend,
+            **({"use_qk_l2norm_in_kernel": True} if l2n else {}),
         )
 
     def run(mode: str):
@@ -2229,7 +2272,7 @@ def _run_rank_layer(
         "rank": rank,
         "world": W,
         "backend": backend,
-        "mode": "layer",
+        "mode": "layer-l2n" if l2n else "layer",
         "host": socket.gethostname(),
         "device": str(device),
         "device_name": torch.cuda.get_device_name(device),
@@ -2261,7 +2304,10 @@ def _run_rank_layer(
     if result_dir:
         os.makedirs(result_dir, exist_ok=True)
         with open(
-            os.path.join(result_dir, f"{row.name}-layer-rank{rank}.json"), "w"
+            os.path.join(
+                result_dir, f"{row.name}-layer{'-l2n' if l2n else ''}-rank{rank}.json"
+            ),
+            "w",
         ) as fh:
             json.dump(report, fh, indent=1, default=str)
     return report
@@ -2277,3 +2323,624 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
     if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(row, slurm, _backend_name(), _run_rank_layer)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# #7817: the in-kernel Q / K L2 norm (``use_qk_l2norm_in_kernel=True``).  ``q`` / ``k`` are RAW rows here (the
+# generator's rows times a per-token, per-head power of two drawn from the global token index, so every rank sees
+# the bits of the global pack).  Per row and rank:
+#
+# * mode equalities with the norm (bitwise): repeat, light == full (``qk_apply``) == boundary replay, autograd ==
+#   saved, checkpoint (replay form, kept tapes, "auto") == direct, recompute handle == direct, ``save_transfer``,
+#   ring == a2a (where the partition allows it), CUDA-graph replay == eager, ``.backward()`` twice;
+# * the composed chain: out / dv / dbeta / dg == the norm-off route on the materialized ``(qn, kn)`` (the forward's
+#   own rows, ``record_qk``); dq / dk == ``bf16(l2n_pullback(x, r, D))`` with ``D`` the norm-off route's
+#   ``group_reduce="host"`` partials summed in head order (the oracle of #8_l2n's fused group sum + pullback);
+# * #1_l2n: its eight tapes == v1 #1 on the materialized ``(qn, kn)``; its ``qn`` / ``kn`` / ``r`` == the
+#   ``cake_l2n`` reference (CPU, FTZ off); ``qk_apply`` on its ``r`` == its ``qn`` / ``kn``; the backward's rows and
+#   regenerated ``r`` == the forward's;
+# * norm off unchanged: the v1 records' library identities and csrc bytes are the pinned ones of 615a65850, and the
+#   norm-off route launches only them;
+# * packed QKV views with the norm: bitwise the contiguous call, the split still aliases the packed dQKV row;
+# * memory: no ``qn`` / ``kn`` / ``qk_rstd`` in the arena after a forward or a backward; the bytes a forward retains
+#   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term;
+#   the peaks and a profiler count of copy ops on the packed views are recorded.
+#
+# The rows skip with a clear reason while the registry does not ship the three records (the kernel backend refuses
+# the option then); ``KCP_TEST_BACKEND=fake`` runs them on the torch emulation.
+
+V1_LIBRARIES = {
+    "bwd_dqkg": "cake_gdn_det_train_501d82df9928cfc02551",
+    "bwd_prep": "cake_gdn_det_train_d4be7d17c0c64e05e81c",
+    "fwd_o": "cake_gdn_det_train_48f2bbfe1482cf86506c",
+    "fwd_prep": "cake_gdn_det_train_3465abf6a7e24059f85c",
+    "gate_epilogue": "cake_gdn_det_train_b902b0b0bef82d9f7c53",
+    "kcp_affine_merge_c16": "cake_gdn_det_train_89f5ff59f03eb170e3bf_kcp",
+    "kcp_affine_merge_c8": "cake_gdn_det_train_c6958a0a4ed5cb55a9a1_kcp",
+    "kcp_dhu_offset": "cake_gdn_det_train_665649ff924fda17ec3f_kcp",
+    "kcp_dhu_offset_vh64": "cake_gdn_det_train_0ed5c4450f8dbac6fb1e_kcp",
+    "kcp_dhu_tape": "cake_gdn_det_train_8b193b1101cc03b7d704_kcp",
+    "kcp_dhu_tape_vh64": "cake_gdn_det_train_a44997811b71d9d83fb4_kcp",
+    "kcp_fwdh_offset": "cake_gdn_det_train_eb58759a50e781620aed_kcp",
+    "kcp_fwdh_offset_vh64": "cake_gdn_det_train_fc32e3ea90cd1b718ad8_kcp",
+    "kcp_fwdh_tape": "cake_gdn_det_train_01f0e0eab26c58ff3953_kcp",
+    "kcp_fwdh_tape_vh64": "cake_gdn_det_train_2eade16c7f51796727a5_kcp",
+    "kcp_transfer_walk": "cake_gdn_det_train_4bf560a7ea389e92d5f1_kcp",
+    "kcp_transfer_walk_three_mma": "cake_gdn_det_train_2f42874614b85ffc14fe_kcp",
+    "kcp_transfer_walk_plain_tf32": "cake_gdn_det_train_efbba796414578cbd8b5_kcp",
+}
+# sha256 over the sorted lines "<file> <sha256>\n" of the 36 csrc files (<library>_kernel.cu / _binding.cu) of the
+# 18 records above at FlashInfer 615a65850 (the package before the norm)
+V1_CSRC_DIGEST = "8ba3ceacd195fcc2794ed799da319fb9648abef343ca4502af1282e043a0cf97"
+L2N_SKIP = (
+    "the in-kernel Q/K L2 norm records (fwd_prep_l2n, bwd_dqkg_l2n, qk_apply) are not in the shipped registry "
+    "yet: use_qk_l2norm_in_kernel cannot run on the kernel backend"
+)
+L2N = {"use_qk_l2norm_in_kernel": True}
+
+
+def _l2n_shipped() -> bool:
+    shipped = getattr(kcp, "l2n_records_shipped", None)
+    return bool(shipped()) if callable(shipped) else False
+
+
+def _skip_unless_l2n(backend: str) -> None:
+    if backend == "kernels" and not _l2n_shipped():
+        pytest.skip(L2N_SKIP)
+
+
+def _v1_csrc_digest() -> str:
+    import hashlib
+
+    lines = []
+    for lib in sorted(V1_LIBRARIES.values()):
+        for suffix in ("_kernel.cu", "_binding.cu"):
+            path = PACKAGE_DIR / "csrc" / f"{lib}{suffix}"
+            lines.append(
+                f"{path.name} {hashlib.sha256(path.read_bytes()).hexdigest()}\n"
+            )
+    return hashlib.sha256("".join(sorted(lines)).encode()).hexdigest()
+
+
+def _raw_qk(
+    row: Row, part, cu: list[int], rank: int, x: torch.Tensor, salt: int
+) -> torch.Tensor:
+    """``x`` (this rank's L2-normalized generator rows) times ``2^e``, ``e`` in [-6, 6] per (global token, head)."""
+    total, H = cu[-1], x.shape[1]
+    gen = torch.Generator(device="cpu").manual_seed(78170 + salt)
+    e = torch.randint(-6, 7, (max(total, 1), H, 1), generator=gen).float()
+    pieces = [
+        torch.arange(cu[f.doc] + f.off, cu[f.doc] + f.off + f.length)
+        for f in part.fragments[rank]
+        if f.length
+    ]
+    l2g = torch.cat(pieces) if pieces else torch.zeros(0, dtype=torch.int64)
+    return (x.float() * torch.exp2(e[l2g]).to(x.device)).to(torch.bfloat16)
+
+
+def _prep_tapes(
+    ctx, q, k, v, g, beta, *, l2n: bool, backend: str, rstd=None, apply=False
+) -> dict:
+    """One #1 (``l2n``: #1_l2n) -- or with ``apply`` one ``qk_apply`` on ``rstd`` -- on zero-initialised tapes of a
+    fresh workspace; returns copies of the eight #1 tapes and the norm's rows."""
+    opts = kcp.make_options(backend=backend, use_qk_l2norm_in_kernel=l2n)
+    call, _ = kcp._prepare(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        scale=None,
+        opts=opts,
+        workspace=kcp.WorkspaceDetKcp(),
+        backward=apply,
+        dout=(torch.zeros(v.shape, dtype=v.dtype, device=v.device) if apply else None),
+    )
+    names = ("w", "u", "aqk", "akk", "g_cum", "rowscale", "qscale", "gamma")
+    for n in names:
+        call.tapes[n] = call.tape(n).zero_()
+    if l2n:
+        for n in (*kcp.QK_TAPES, kcp.QK_RSTD):
+            call.tapes[n] = call.tape(n).zero_()
+    if apply:
+        call.bufs[kcp.QK_RSTD] = rstd
+        call.local("qk_apply")
+    else:
+        call.local("fwd_prep")
+    torch.cuda.synchronize(q.device)
+    out = {} if apply else {n: call.tape(n).clone() for n in names}
+    if l2n:
+        out.update({n: call.tape(n).clone() for n in kcp.QK_TAPES})
+        out["rstd"] = call.rstd_in().clone() if apply else call.rstd_out().clone()
+    return out
+
+
+def _run_rank_l2n(
+    rank: int,
+    W: int,
+    row: Row,
+    group,
+    device: torch.device,
+    result_dir: str | None,
+    backend: str,
+) -> dict:
+    l2n = _mod("cake_l2n")
+    gb = _mod("cake_bytes")
+    H_qk, HV = row.heads
+    part, cu = _partition(row)
+    ctx = plan.build_context_det_kcp(part, group, rank, device)
+    ops = _local_inputs(row, part, cu, rank, device)
+    q = _raw_qk(row, part, cu, rank, ops["q"], 1)
+    k = _raw_qk(row, part, cu, rank, ops["k"], 2)
+    v, g, beta, dout = (ops[n] for n in ("v", "g", "beta", "dout"))
+    T_r = int(q.shape[0])
+    ws = kcp.WorkspaceDetKcp()
+    base = {"backend": backend}
+    t_start = time.time()
+    flags: dict[str, bool] = {}
+    info: dict[str, object] = {"T_r": T_r}
+
+    def saved_pass(qq=q, kk=k, workspace=ws, **opts) -> dict:
+        o = {**base, **opts}
+        out, saved = kcp.chunk_gdn_det_fwd_kcp(
+            qq, kk, v, g, beta, ctx, workspace=workspace, **o
+        )
+        rec_f = dict(kcp.LAST_CALL["fwd"])
+        dq, dk, dv, dbeta, dg = kcp.chunk_gdn_det_bwd_kcp(
+            qq, kk, v, g, beta, ctx, dout, saved=saved, workspace=workspace, **o
+        )
+        return {
+            "out": out,
+            "dq": dq,
+            "dk": dk,
+            "dv": dv,
+            "dg": dg,
+            "dbeta": dbeta,
+            "saved": saved,
+            "fwd": rec_f,
+            "bwd": dict(kcp.LAST_CALL["bwd"]),
+        }
+
+    def autograd_pass(ckpt: bool, *, handle=False, twice=False, **opts) -> dict:
+        leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+        o = {**base, **opts}
+        hd = kcp.RecomputeHandleDetKcp() if handle else None
+
+        def fn(q_, k_, v_, g_, b_, h_):
+            return kcp.chunk_gdn_det_kcp(
+                q_, k_, v_, g_, b_, ctx, workspace=ws, recompute_handle=h_, **o
+            )
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, hd, use_reentrant=False)
+        else:
+            out = fn(*leaves, hd)
+        out.backward(dout, retain_graph=twice)
+        if twice:
+            out.backward(dout)
+        return {
+            "out": out.detach(),
+            **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
+        }
+
+    # norm off unchanged: pinned v1 identities and bytes; the norm-off route launches only v1 records
+    jit = _mod("cake_jit")
+    flags["norm_off_libraries_pinned"] = all(
+        ({**jit.MODULES, **jit.TEST_MODULES}.get(n) or {}).get("library") == lib
+        for n, lib in V1_LIBRARIES.items()
+    )
+    try:
+        info["v1_csrc_digest"] = _v1_csrc_digest()
+    except OSError as exc:
+        info["v1_csrc_digest"] = f"unavailable: {exc}"
+    flags["norm_off_csrc_bytes_pinned"] = info["v1_csrc_digest"] == V1_CSRC_DIGEST
+    res_off = saved_pass()
+    used = {r for r, _g in res_off["fwd"]["records"]} | {
+        r for r, _g in res_off["bwd"]["records"]
+    }
+    info["norm_off_records"] = sorted(used)
+    flags["norm_off_bitwise_unchanged"] = (
+        flags["norm_off_libraries_pinned"]
+        and flags["norm_off_csrc_bytes_pinned"]
+        and used <= set(V1_LIBRARIES)
+        and not res_off["fwd"]["qk_l2norm"]
+    )
+
+    # the norm on: mode equalities
+    res = saved_pass(**L2N, test_knobs={"record_qk": True})
+    rec_fwd_qk, rec_bwd_qk = res["fwd"].get("qk"), res["bwd"].get("qk")
+    info["fwd_record"] = {
+        k_: v_
+        for k_, v_ in res["fwd"].items()
+        if k_ not in ("sequence", "pool_bytes", "fresh_bytes", "merges", "qk")
+    }
+    info["bwd_record"] = {
+        k_: v_
+        for k_, v_ in res["bwd"].items()
+        if k_ not in ("sequence", "pool_bytes", "fresh_bytes", "merges", "qk")
+    }
+    info["fwd_sequence"], info["bwd_sequence"] = (
+        list(res["fwd"]["sequence"]),
+        list(res["bwd"]["sequence"]),
+    )
+    flags["l2n_repeat"] = _eq(res, saved_pass(**L2N))
+    full = saved_pass(save_mode="full", **L2N, test_knobs={"record_qk": True})
+    flags["l2n_light_eq_full"] = _eq(res, full) and (
+        T_r == 0 or full["bwd"]["qk_source"] == "qk_apply"
+    )
+    flags["l2n_saved_eq_replay"] = _eq(res, saved_pass(boundary_mode="replay", **L2N))
+    flags["l2n_save_transfer_eq"] = _eq(res, saved_pass(save_transfer=False, **L2N))
+    res_auto = autograd_pass(False, **L2N)
+    flags["l2n_autograd_eq_saved"] = _eq(res, res_auto)
+    for name, opts in (
+        ("ckpt_replay_form", {"reuse_recompute_tapes": False}),
+        ("ckpt_kept", {"reuse_recompute_tapes": True}),
+        ("ckpt_auto", {"reuse_recompute_tapes": "auto"}),
+        ("ckpt_full", {"save_mode": "full"}),
+        ("ckpt_boundary_replay", {"boundary_mode": "replay"}),
+    ):
+        flags[f"l2n_{name}_eq_direct"] = _eq(
+            res_auto, autograd_pass(True, **opts, **L2N)
+        )
+        if name == "ckpt_kept":
+            info["kept_tapes_source"] = kcp.LAST_CALL["bwd"].get("tapes_source")
+            info["kept_qk_source"] = kcp.LAST_CALL["bwd"].get("qk_source")
+    flags["l2n_handle_eq_direct"] = _eq(
+        res_auto, autograd_pass(True, handle=True, save_transfer=False, **L2N)
+    )
+    twice = autograd_pass(True, handle=True, twice=True, save_transfer=False, **L2N)
+    flags["l2n_twice_accumulates"] = all(
+        torch.equal(twice[n], res_auto[n] + res_auto[n]) for n in GRADS
+    )
+    if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
+        flags["l2n_ring_eq_a2a"] = _eq(
+            res, saved_pass(exchange="ring", save_transfer=False, **L2N)
+        )
+    res_host = saved_pass(group_reduce="host", **L2N)
+    info["l2n_host_eq_fused"] = _eq(
+        res, res_host
+    )  # reported, as the norm-off host == fused
+
+    # the composed chain on the forward's own rows.  The reference pass exchanges states, so every rank issues it (a
+    # rank without tokens passes its empty rows); skipping it there would put the ranks' collectives out of step.
+    ws0 = kcp.WorkspaceDetKcp()
+    ref = saved_pass(
+        qq=(rec_fwd_qk["qn"] if T_r > 0 else q).clone(),
+        kk=(rec_fwd_qk["kn"] if T_r > 0 else k).clone(),
+        workspace=ws0,
+        group_reduce="host",
+    )
+    if T_r > 0:
+        qn, kn, rstd = rec_fwd_qk["qn"], rec_fwd_qk["kn"], rec_fwd_qk["rstd"]
+        flags["l2n_bwd_rows_eq_fwd"] = all(
+            torch.equal(rec_bwd_qk[n], rec_fwd_qk[n]) for n in ("qn", "kn", "rstd")
+        )
+        flags["l2n_regen_rstd_eq_saved"] = bool(rec_bwd_qk.get("rstd_regen_equal"))
+        flags["l2n_full_rows_eq_fwd"] = all(
+            torch.equal(full["bwd"]["qk"][n], rec_fwd_qk[n])
+            for n in ("qn", "kn", "rstd")
+        )
+        qh, rq = l2n.qk_l2norm_ref(q.cpu())
+        kh, rk = l2n.qk_l2norm_ref(k.cpu())
+        flags["l2n_qk_eq_helper"] = (
+            torch.equal(qn.cpu(), qh)
+            and torch.equal(kn.cpu(), kh)
+            and torch.equal(rstd.cpu(), torch.stack([rq, rk]))
+        )
+        flags["l2n_eq_reference_out_dv_dbeta_dg"] = _eq(
+            res, ref, ("out", "dv", "dbeta", "dg")
+        )
+        # the host form's D is the head-order sum of the partials; the fused #8_l2n's FP32 group sum is that sum
+        # only at one value head per Q/K head (r > 1: the fused form is reported against it)
+        r_ = HV // H_qk
+        ok_host = ok_fused = True
+        for name, part, x, plane in (("dq", "dq_part", q, 0), ("dk", "dk_part", k, 1)):
+            p = ws0.tape(part).view(T_r, H_qk, r_, 128)
+            acc = p[:, :, 0]
+            for j in range(1, r_):
+                acc = acc + p[:, :, j]
+            want = l2n.l2n_pullback(x, rstd[plane], acc).to(torch.bfloat16)
+            ok_host = ok_host and torch.equal(res_host[name], want)
+            ok_fused = ok_fused and torch.equal(res[name], want)
+        flags["l2n_host_dqdk_eq_partials_pullback"] = ok_host
+        if r_ == 1:
+            flags["l2n_fused_dqdk_eq_partials_pullback"] = ok_fused
+        else:
+            info["fused_dqdk_eq_partials_pullback"] = ok_fused
+        # #1_l2n against v1 #1 on the materialized rows, the reference, and qk_apply
+        on = _prep_tapes(ctx, q, k, v, g, beta, l2n=True, backend=backend)
+        off = _prep_tapes(
+            ctx, on["qn"], on["kn"], v, g, beta, l2n=False, backend=backend
+        )
+        flags["l2n_prep_tapes_eq_v1"] = all(torch.equal(on[n], off[n]) for n in off)
+        flags["l2n_prep_rows_eq_forward"] = torch.equal(on["qn"], qn) and torch.equal(
+            on["rstd"], rstd
+        )
+        ap = _prep_tapes(
+            ctx,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            l2n=True,
+            backend=backend,
+            rstd=on["rstd"].clone(),
+            apply=True,
+        )
+        flags["l2n_qk_apply_eq_prep"] = torch.equal(ap["qn"], on["qn"]) and torch.equal(
+            ap["kn"], on["kn"]
+        )
+
+    # packed QKV views with the norm: bitwise, and the split still aliases the packed dQKV row
+    buf, qs, ks, vs = _packed_views(q, k, v)
+    flags["l2n_strided_eq_contiguous"] = _eq(res, saved_pass(qq=qs, kk=ks, **L2N))
+    split_before = dict(kcp.PACKED_SPLIT_STATS)
+    qkv_leaf = buf.detach().clone().requires_grad_(True)
+    g_leaf, b_leaf = (x.detach().clone().requires_grad_(True) for x in (g, beta))
+    pq, pk, pv = kcp.packed_qkv_views_det_kcp(qkv_leaf, H_qk=H_qk, HV=HV)
+    try:
+        from torch.profiler import ProfilerActivity, profile
+
+        with profile(activities=[ProfilerActivity.CPU]) as prof:
+            out_split = kcp.chunk_gdn_det_kcp(
+                pq, pk, pv, g_leaf, b_leaf, ctx, workspace=ws, **base, **L2N
+            )
+            out_split.backward(dout)
+        names = [e.name for e in prof.events()]
+        info["profiler_copy_ops"] = {
+            n: names.count(n)
+            for n in ("aten::copy_", "aten::contiguous", "aten::clone", "aten::cat")
+            if n in names
+        }
+    except Exception as exc:  # noqa: BLE001 - the profiler is evidence only
+        info["profiler_copy_ops"] = (
+            f"unavailable: {type(exc).__name__}: {str(exc)[:120]}"
+        )
+        out_split = kcp.chunk_gdn_det_kcp(
+            pq, pk, pv, g_leaf, b_leaf, ctx, workspace=ws, **base, **L2N
+        )
+        out_split.backward(dout)
+    ga = qkv_leaf.grad
+    res_split = {
+        "out": out_split.detach(),
+        "dq": ga[:, : H_qk * 128].reshape(-1, H_qk, 128),
+        "dk": ga[:, H_qk * 128 : 2 * H_qk * 128].reshape(-1, H_qk, 128),
+        "dv": ga[:, 2 * H_qk * 128 :].reshape(-1, HV, 128),
+        "dg": g_leaf.grad,
+        "dbeta": b_leaf.grad,
+    }
+    flags["l2n_packed_split_eq_contiguous"] = _eq(res_auto, res_split)
+    flags["l2n_packed_split_aliased"] = (
+        T_r == 0 or kcp.PACKED_SPLIT_STATS["aliased"] - split_before["aliased"] == 1
+    )
+    del qkv_leaf, g_leaf, b_leaf, out_split, ga, res_split
+
+    # CUDA-graph replay with the norm: the fourth forward + backward replay, bitwise the eager result
+    try:
+        kcp.graph_cache_clear()
+        events = []
+        for _ in range(4):
+            out_g, saved_g = kcp.chunk_gdn_det_fwd_kcp(
+                q, k, v, g, beta, ctx, workspace=ws, graph="replay", **base, **L2N
+            )
+            grads_g = kcp.chunk_gdn_det_bwd_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                dout,
+                saved=saved_g,
+                workspace=ws,
+                graph="replay",
+                **base,
+                **L2N,
+            )
+            g_res = {
+                "out": out_g.clone(),
+                **{
+                    n: t.clone()
+                    for n, t in zip(
+                        ("dq", "dk", "dv", "dbeta", "dg"), grads_g, strict=True
+                    )
+                },
+            }
+            events.append(
+                [
+                    kcp.LAST_CALL["fwd"]["graph_event"],
+                    kcp.LAST_CALL["bwd"]["graph_event"],
+                ]
+            )
+        info["graph_events"] = events
+        graph_ok = events[-1] == ["replay", "replay"] and _eq(res, g_res)
+        torch.cuda.synchronize(device)
+        kcp.graph_cache_clear()
+    except Exception as exc:  # noqa: BLE001 - recorded; the gate decides
+        info["graph_error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+        graph_ok = False
+        kcp.graph_cache_clear()
+    flags["l2n_graph_eq_eager"] = bool(graph_ok)
+
+    # memory: nothing of the norm in the arena after a forward / a backward; retained after a forward = off + r
+    wsm = kcp.WorkspaceDetKcp()
+    bad = {*kcp.QK_TAPES, kcp.QK_RSTD}
+    out_m, saved_m = kcp.chunk_gdn_det_fwd_kcp(
+        q, k, v, g, beta, ctx, workspace=wsm, **base, **L2N
+    )
+    flags["l2n_absent_after_forward"] = not (set(wsm._tapes) & bad)
+    kcp.chunk_gdn_det_bwd_kcp(
+        q, k, v, g, beta, ctx, dout, saved=saved_m, workspace=wsm, **base, **L2N
+    )
+    flags["l2n_absent_after_backward"] = not (set(wsm._tapes) & bad)
+    del out_m, saved_m, wsm
+
+    def retained(**opts) -> tuple[int, int, int]:
+        kcp.chunk_gdn_det_fwd_kcp(
+            q, k, v, g, beta, ctx, workspace=None, **base, **opts
+        )  # warm-up of the form
+        torch.cuda.synchronize(device)
+        gc.collect()
+        torch.cuda.reset_peak_memory_stats(device)
+        before = _alloc_stats(device)
+        live = torch.cuda.memory_allocated(device)
+        out_r, saved_r = kcp.chunk_gdn_det_fwd_kcp(
+            q, k, v, g, beta, ctx, workspace=None, **base, **opts
+        )
+        torch.cuda.synchronize(device)
+        after = _alloc_stats(device)
+        peak = int(torch.cuda.max_memory_allocated(device) - live)
+        kept = int(
+            after["requested"]
+            - before["requested"]
+            - out_r.numel() * out_r.element_size()
+        )
+        nbytes = int(saved_r.bytes)
+        del out_r, saved_r
+        return kept, nbytes, peak
+
+    kept_off, saved_off_b, peak_off = retained()
+    kept_on, saved_on_b, peak_on = retained(**L2N)
+    rstd_bytes = 8 * T_r * H_qk
+    info["memory"] = {
+        "retained_off": kept_off,
+        "retained_on": kept_on,
+        "saved_off": saved_off_b,
+        "saved_on": saved_on_b,
+        "fwd_peak_off": peak_off,
+        "fwd_peak_on": peak_on,
+        "qn_kn_bytes": 2 * T_r * H_qk * 256,
+    }
+    flags["l2n_post_forward_eq_off_plus_rstd"] = kept_on - kept_off == rstd_bytes
+    q_on = int(
+        gb.gdn_det_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True)
+    )
+    q_off = int(gb.gdn_det_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV))
+    info["saved_query"] = {"on": q_on, "off": q_off}
+    flags["l2n_saved_bytes_on_minus_off"] = (
+        saved_on_b - saved_off_b == rstd_bytes == q_on - q_off
+    )
+
+    # gather the flags; the verdict is WORLD-wide
+    flag_list: list = [None] * W
+    info_list: list = [None] * W
+    if W > 1:
+        dist.all_gather_object(flag_list, flags, group=group)
+        dist.all_gather_object(info_list, info, group=group)
+    else:
+        flag_list, info_list = [flags], [info]
+    report: dict = {
+        "row": dataclasses.asdict(row),
+        "rank": rank,
+        "world": W,
+        "backend": backend,
+        "mode": "l2n",
+        "host": socket.gethostname(),
+        "device": str(device),
+        "device_name": torch.cuda.get_device_name(device),
+        "torch": torch.__version__,
+        "utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pass": True,
+        "flags": {},
+        "gated": [],
+        "reported": [],
+        "info_by_rank": info_list,
+        "seconds": None,
+    }
+    # a rank without tokens has no rows to compare: the per-row flags exist on the ranks with tokens only
+    keys = sorted({k_ for f in flag_list for k_ in f})
+    for key in keys:
+        ok = all(f[key] for f in flag_list if key in f)
+        report["flags"][key] = ok
+        # the csrc-byte pin needs the rendered sources of the v1 records in the tree (a re-render at a new pin is
+        # reported, and the bytes A/B of the render lane decides)
+        if key == "norm_off_csrc_bytes_pinned":
+            report["reported"].append(key)
+            continue
+        if key == "norm_off_bitwise_unchanged" and not all(
+            f.get("norm_off_csrc_bytes_pinned", True) for f in flag_list
+        ):
+            ok = all(f["norm_off_libraries_pinned"] for f in flag_list)
+            report["flags"][key] = ok
+        report["gated"].append(key)
+        report["pass"] &= ok
+    report["seconds"] = round(time.time() - t_start, 2)
+    if W > 1:
+        verdict: list = [None] * W
+        dist.all_gather_object(verdict, report["pass"], group=group)
+        report["pass"] = all(verdict)
+        dist.barrier(group=group)
+    if rank == 0 and result_dir:
+        os.makedirs(result_dir, exist_ok=True)
+        with open(os.path.join(result_dir, _row_id(row) + "-l2n.json"), "w") as fh:
+            json.dump(report, fh, indent=1, default=str)
+    return report
+
+
+def _spawn_entry_l2n(
+    rank: int, W: int, row: Row, port: int, result_dir: str, backend: str
+) -> None:
+    device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
+    torch.cuda.set_device(device)
+    try:
+        if W > 1:
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", str(port))
+            dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+        group = dist.group.WORLD if W > 1 else None
+        report = _run_rank_l2n(rank, W, row, group, device, result_dir, backend)
+        if not report["pass"]:
+            raise AssertionError(
+                f"rank {rank}: {json.dumps(report, default=str)[:4000]}"
+            )
+    finally:
+        kcp.graph_cache_clear()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("row", _selected_rows(), ids=_row_id)
+def test_l2n_rows(row: Row, slurm) -> None:
+    """#7817 rows: the in-kernel Q / K L2 norm on the row's partition (see the block comment above).  Skips with a
+    clear reason while the registry does not ship the three records (kernel backend)."""
+    if _test_mode() != "full":
+        pytest.skip("KCP_TEST_MODE=forward: the forward-only rows run instead")
+    backend = _backend_name()
+    _skip_unless_l2n(backend)
+    if slurm is not None:
+        _slurm_row(row, slurm, backend, _run_rank_l2n)
+        return
+    _skip_unless_runnable(row.W, backend)
+    with tempfile.TemporaryDirectory(prefix="cake_gdn_kcp_l2n_") as tmp:
+        result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
+        mp.start_processes(
+            _spawn_entry_l2n,
+            args=(row.W, row, _free_port(), result_dir, backend),
+            nprocs=row.W,
+            join=True,
+            start_method="spawn",
+        )
+        with open(os.path.join(result_dir, _row_id(row) + "-l2n.json")) as fh:
+            report = json.load(fh)
+    assert report["pass"], report
+
+
+@pytest.mark.parametrize("row", LAYER_ROWS, ids=_row_id)
+def test_l2n_layer_checkpoint_rows(row: Row, slurm) -> None:
+    """#7817 whole-layer rows: KCP convolution + ``chunk_gdn_det_kcp(use_qk_l2norm_in_kernel=True)`` on the RAW
+    convolution output views in one checkpointed region (the B3 boundary), with and without a recompute handle:
+    out / dx / dw / dg / dbeta bitwise the direct pass; L8 is the ``C = 10240`` (16, 48) row."""
+    if slurm is None:
+        pytest.skip("the layer rows run under Slurm")
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
+    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+        pytest.skip("the conv package does not support this device")
+    backend = _backend_name()
+    _skip_unless_l2n(backend)
+    import functools
+
+    _slurm_row(row, slurm, backend, functools.partial(_run_rank_layer, l2n=True))

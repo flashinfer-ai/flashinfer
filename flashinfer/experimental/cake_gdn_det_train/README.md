@@ -3,9 +3,10 @@
 Experimental backend for the forward and backward of packed GDN (scalar-gated
 DeltaNet) layers in training: head dimension 128, chunk 64, grouped Q/K heads
 (`HV` a multiple of `H`), no context parallelism.  Every launch is a plain
-stream-ordered kernel: no atomics, no data-dependent ordering, so the outputs
-and every gradient are bitwise the same run to run for one layout and one
-plan.  Some stages run as two groups of sequences on the caller's stream and a
+stream-ordered kernel: no atomic on a value (the wavefront pair below counts
+stored tiles with atomic counters, whose order no value depends on), no
+data-dependent ordering, so the outputs and every gradient are bitwise the same
+run to run for one layout and one plan.  Some stages run as two groups of sequences on the caller's stream and a
 side stream; the groups write disjoint outputs, so this holds with one or two
 streams.
 
@@ -80,6 +81,19 @@ so no `dv_local` stage runs.  Both forms give the same bits.  For a value-head
 group of two (`HV == 2 * H`) or of three (`HV == 3 * H`) one fused tcgen05
 cluster kernel then computes `dq`, `dk`, `dv`, `dg` and `dbeta`; other groups
 run `dqkwg`, the WY pullback and the finalize.
+
+On the host-table route, where the `dhu_tc2` adjoint scan (serial, or the second
+pass of a split plan) feeds the fused tail of a value-head group of two with a
+BF16 `beta` on the caller's stream, and its `segments x HV` CTAs take at most
+half the SMs, the backward runs the two as a wavefront pair: the scan counts
+each (chunk, value head) tile in a workspace once it has stored that tile's
+`dh` and `dv2`, and the tail visits the chunks in the order the scan finishes
+them and waits for each count before it reads the tile.  The tail runs on the
+side stream once every scan CTA has started.  The pair runs on `sm_103a`, and
+on `sm_100a` with at least 32 value heads.  A CUDA graph does
+not order its two branches, so under a capture the backward records the
+separate launches.  The tail reads the values it reads without the pair: the
+same bits.
 
 On the host-table route the long sequences start first.  The tables list the
 sequences by chunk count, longest first (ties in the caller's order); every
