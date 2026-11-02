@@ -642,7 +642,12 @@ def test_modes_are_bitwise_with_the_norm(segments) -> None:
         if reuse is True:
             assert kcp.KEPT_STATS["take"] - stats["take"] == 1
             assert kcp.LAST_CALL["bwd"]["tapes_source"] == "kept"
-            assert kcp.LAST_CALL["bwd"]["qk_source"] == "qk_apply"
+        if kcp.LAST_CALL["bwd"]["tapes_source"] == "kept":
+            # the recompute forward's qn / kn came with the tapes: no program re-reads the raw rows to normalize
+            assert kcp.LAST_CALL["bwd"]["qk_source"] == "kept"
+            assert not {"qk_apply", "fwd_prep_l2n"} & set(
+                kcp.LAST_CALL["bwd"]["sequence"]
+            )
     _same(
         direct, _autograd(ctx, ops, ckpt=True, save_mode="full", **o), "checkpoint full"
     )
@@ -1122,9 +1127,142 @@ def test_launch_values_are_the_program_args() -> None:
     assert kcp.TART_MODULE_OF["fwd_prep_l2n"] == "gdn_chunk_det_train_fwd_prep_l2n_v1"
 
 
+class _PeakWorkspace(kcp.WorkspaceKcp):
+    """A workspace recording the most bytes it binds (every allocation path)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.peak = 0
+
+    def _upd(self):
+        self.peak = max(self.peak, self.bytes)
+
+    def tape(self, name):
+        t = super().tape(name)
+        self._upd()
+        return t
+
+    def pool(self, name, n=None):
+        t = super().pool(name, n)
+        self._upd()
+        return t
+
+    def ensure(self, *a, **k):
+        tb = super().ensure(*a, **k)
+        self._upd()
+        return tb
+
+    def adopt_tape(self, name, t):
+        r = super().adopt_tape(name, t)
+        self._upd()
+        return r
+
+
+def test_kept_backward_binds_the_recompute_rows() -> None:
+    """A checkpoint with kept recompute tapes and the norm: the recompute forward hands its ``qn`` / ``kn`` over with
+    the tapes, the backward binds them (``qk_source`` ``"kept"``) and launches neither ``qk_apply`` nor #1_l2n; the
+    rows it reads are the forward's (``record_qk``), the gradients the direct autograd's, nothing of the norm and no
+    kept entry is left after the backward (#7039), and the arena follows the kept form of the workspace query."""
+    from torch.utils.checkpoint import checkpoint
+
+    ctx, ops = _setup()
+    H_qk, HV = ops["q"].shape[1], ops["v"].shape[1]
+    o = dict(use_qk_l2norm_in_kernel=True)
+    direct = _autograd(ctx, ops, ckpt=False, **o)
+    layout = gbytes.gdn_workspace_layout_kcp(
+        ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes=True, **o
+    )
+    ws = _PeakWorkspace()
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+
+    def fn(q, k, v, g, beta):
+        return kcp.chunk_gdn_kcp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            workspace=ws,
+            backend="fake",
+            reuse_recompute_tapes=True,
+            test_knobs={"record_qk": True},
+            **o,
+            deterministic=False,
+        )
+
+    stats = dict(kcp.KEPT_STATS)
+    out = checkpoint(fn, *leaves, use_reentrant=False)
+    assert ws.peak == layout["forward"], (ws.peak, layout["forward"])
+    ws.peak = 0
+    out.backward(ops["dout"])
+    assert ws.peak == layout["backward"], (ws.peak, layout["backward"])
+    assert ws.bytes == layout["bwd.phase.end"], (ws.bytes, layout["bwd.phase.end"])
+    rec = kcp.LAST_CALL["bwd"]
+    assert rec["tapes_source"] == "kept" and rec["qk_source"] == "kept"
+    assert rec["rstd_source"] == "saved"
+    assert not {"qk_apply", "fwd_prep_l2n"} & set(rec["sequence"]), rec["sequence"]
+    assert "bwd_dqkg_l2n" in rec["sequence"]
+    for key in ("take", "released"):
+        assert kcp.KEPT_STATS[key] - stats[key] == 1, key
+    assert kcp.kept_registry_size() == 0
+    qh, rq = l2n.qk_l2norm_ref(ops["q"])
+    kh, rk = l2n.qk_l2norm_ref(ops["k"])
+    assert torch.equal(rec["qk"]["qn"], qh) and torch.equal(rec["qk"]["kn"], kh)
+    assert torch.equal(rec["qk"]["rstd"], torch.stack([rq, rk]))
+    assert not set(ws._tapes) & {*kcp.QK_TAPES, kcp.QK_RSTD}, sorted(ws._tapes)
+    got = {
+        "out": out.detach(),
+        **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
+    }
+    _same(direct, got, "kept checkpoint")
+
+
+def test_kept_rows_are_checked() -> None:
+    """A hand-off forward unbinds ``qn`` / ``kn`` from the arena and hands them over exactly when the norm is on;
+    a kept set without them (or with them while the call runs without the norm) is refused by the backward."""
+    ctx, ops = _setup()
+    for on in (True, False):
+        o = dict(backend="fake", use_qk_l2norm_in_kernel=on, reuse_recompute_tapes=True)
+        ws = kcp.WorkspaceKcp()
+        call, _ = kcp._prepare(
+            *_ops(ops),
+            ctx,
+            scale=None,
+            opts=kcp.make_options(**o),
+            workspace=ws,
+            backward=False,
+        )
+        _out, saved = kcp._fwd_body(call, save=True, hand_off=True)
+        assert set(saved.kept.qk) == (set(kcp.QK_TAPES) if on else set())
+        assert not set(ws._tapes) & {*kcp.QK_TAPES, kcp.QK_RSTD}, sorted(ws._tapes)
+        saved.kept.qk = (
+            {}
+            if on
+            else {
+                n: torch.zeros(ops["q"].shape, dtype=torch.bfloat16)
+                for n in kcp.QK_TAPES
+            }
+        )
+        with pytest.raises(ValueError, match="qn / kn"):
+            kcp.chunk_gdn_bwd_kcp(
+                *_ops(ops),
+                ctx,
+                ops["dout"],
+                saved=saved,
+                workspace=ws,
+                **o,
+                deterministic=False,
+            )
+
+
 def test_workspace_layout_counts_the_norm_rows() -> None:
-    """The workspace query: ``qn`` / ``kn`` in the forward and every backward phase, the arena ``r`` only where #1
-    is re-run; flag off: the v1 layout exactly; the measured arena of a light backward fits it."""
+    """The workspace query: ``qn`` / ``kn`` in the forward and every backward phase (the kept-tape form: hand-off
+    tensors, ``bwd.kept_tapes``, outside the workspace), the arena ``r`` only where #1 is re-run; flag off: the v1
+    layout exactly."""
     ctx, ops = _setup()
     H_qk, HV = ops["q"].shape[1], ops["v"].shape[1]
     T = ops["q"].shape[0]
@@ -1139,17 +1277,29 @@ def test_workspace_layout_counts_the_norm_rows() -> None:
         on = gbytes.gdn_workspace_layout_kcp(
             ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True, **kw
         )
-        assert on["fwd.qn"] == on["fwd.kn"] == on["bwd.qn"] == on["bwd.kn"] == row
+        kept = bool(kw.get("reuse_recompute_tapes"))
+        assert on["fwd.qn"] == on["fwd.kn"] == row
+        assert on["bwd.qn"] == on["bwd.kn"] == (0 if kept else row), kw
+        assert on["bwd.kept_tapes"] - off["bwd.kept_tapes"] == (2 * row if kept else 0)
         assert on["forward"] - off["forward"] == 2 * row
         replays = kw.get("boundary_mode") == "replay" or not (
-            kw.get("save_mode") == "full" or kw.get("reuse_recompute_tapes")
+            kw.get("save_mode") == "full" or kept
         )
         assert on["bwd.qk_rstd"] == (8 * T * H_qk if replays else 0), kw
         for ph in ("exchange", "walk", "end"):
             assert (
                 on[f"bwd.phase.{ph}"] - off[f"bwd.phase.{ph}"]
-                == 2 * row + on["bwd.qk_rstd"]
+                == (0 if kept else 2 * row) + on["bwd.qk_rstd"]
             ), (kw, ph)
+        if kept:
+            assert (
+                on["bwd.phase.recompute_forward"] - off["bwd.phase.recompute_forward"]
+                == 2 * row
+            )
+        assert (
+            on["backward_transient"] - off["backward_transient"]
+            == 2 * row + on["bwd.qk_rstd"]
+        ), kw
         assert not any(k.endswith((".qn", ".kn", ".qk_rstd")) for k in off)
     with pytest.raises(TypeError):
         gbytes.gdn_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=1)
