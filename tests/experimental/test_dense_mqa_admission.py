@@ -339,7 +339,13 @@ def test_dense_route_available_rejects_out_of_contract_points(catalog_variant):
 def test_plan_rejection_uses_the_admitted_route(monkeypatch, enforce_admission):
     """Runtime diagnostics follow the served route; export admission stays architecture-independent."""
     monkeypatch.setattr(_runtime, "_resolve_device", lambda q, sms: ("sm_100a", 148))
-    queries, keys = 129, 40013
+    # Above the fused small-Q band and the fused K bound, sm_100a serves this shape on
+    # the partial route while the architecture-independent name stays fused.
+    queries, keys = 301, 40013
+    assert _runtime.served_route("fp8", queries, keys, arch="sm_100a") == (
+        "fp8:partial:le2048"
+    )
+    assert _runtime.route_name("fp8", queries, keys) == "fp8:qle2048:short"
     q = torch.empty((queries, 32, 128), device="meta")
     kv = torch.empty((keys, 128), device="meta")
     weights = torch.empty((queries, 32), device="meta")
