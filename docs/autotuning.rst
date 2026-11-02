@@ -530,11 +530,12 @@ non-invariant default tactic.
 
 .. note::
 
-   Coverage is limited to the SM100/SM103 ``mm_mxfp8(backend="cute-dsl")``
-   runners. On SM107 the untuned low-M default can still split K, so the mode
-   gives no bitwise guarantee there yet. Other runners with split-K tactics,
-   such as ``mm_fp4(backend="cute-dsl")`` and the ``cutedsl_low_latency``
-   block-scaled GEMMs, are not classified yet: they keep the default
+   Classified runners: the SM100/SM103/SM107 ``mm_mxfp8(backend="cute-dsl")``
+   runners and the ``cutedsl_low_latency`` block-scaled GEMM runner (split-K
+   is their only batch-variant tactic family, and their untuned default does
+   not split K under the mode). On SM107 bitwise equality between the low-M
+   kernel and the SM107 wide-tile kernel across M buckets is not validated.
+   ``mm_fp4(backend="cute-dsl")`` is not classified yet: it keeps the default
    ``is_batch_invariant_tactic`` (every tactic allowed) and may still select
    split-K under the mode.
 

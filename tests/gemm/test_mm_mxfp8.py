@@ -185,10 +185,47 @@ def test_mm_mxfp8_cute_dsl_narrow_tiles_only_within_32_tokens():
 
 
 def _skip_if_batch_invariant_uncovered():
-    # Batch-invariant autotuning covers the SM100/SM103 cute-dsl runners; the
-    # SM107 runner list (whose low-M default may split K) is not covered yet.
+    # The bit-equality checks are validated on SM100/SM103. On SM107 the mode
+    # keeps the low-M default from splitting K, but equality between the low-M
+    # kernel and the SM107 wide-tile kernel across M buckets is not validated.
     if get_compute_capability(torch.device("cuda")) == (10, 7):
-        pytest.skip("batch-invariant autotuning does not cover SM107 yet")
+        pytest.skip("batch-invariant bit-equality is not validated on SM107")
+
+
+def test_mm_mxfp8_low_m_fallback_split_under_batch_invariant_mode(monkeypatch):
+    """The untuned low-M default splits K only on SM107 (``low_m_only``) and
+    only while batch-invariant autotuning is off; under the mode tactic -1
+    reduces K in one pass, as ``is_batch_invariant_tactic(-1)`` promises."""
+    from flashinfer.autotuner import (
+        get_autotune_batch_invariant,
+        set_autotune_batch_invariant,
+    )
+
+    class Kernel:
+        MMA_INST_BITS_K = 256
+        MMA_INST_TILE_K = 4
+        SUPPORTED_SPLIT_K_SLICES = (2, 4)
+
+        @staticmethod
+        def is_valid_tactic(m, real_k, ab_dtype, slices):
+            return True
+
+    class Dtype:
+        width = 8
+
+    monkeypatch.setattr(gemm_base, "get_device_sm_count", lambda device: 148)
+    # tile_k 128, 16 N tiles: 4 slices fill 64 of 111 CTAs with 16 K blocks each.
+    args = (8, 2048, 8192, Dtype, Kernel, torch.device("cpu"))
+    saved = get_autotune_batch_invariant()
+    try:
+        set_autotune_batch_invariant(False)
+        assert gemm_base._mxfp8_low_m_fallback_split(False, *args) == 1
+        assert gemm_base._mxfp8_low_m_fallback_split(True, *args) == 4
+        set_autotune_batch_invariant(True)
+        assert gemm_base._mxfp8_low_m_fallback_split(False, *args) == 1
+        assert gemm_base._mxfp8_low_m_fallback_split(True, *args) == 1
+    finally:
+        set_autotune_batch_invariant(saved)
 
 
 def test_mm_mxfp8_cute_dsl_batch_invariant_tactics():
