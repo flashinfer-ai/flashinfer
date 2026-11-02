@@ -58,20 +58,20 @@ from . import cake_build
 # and ``main``, ``main_wave`` and the ordered fp32 ``tail_reduce`` of the
 # 256-wide k tile.  The 512-wide k tile's weight-gradient routes bind the
 # builds of the deterministic package's k512 forms -- ``main``, ``main_wave``,
-# ``main_halves`` (with the planned tile walk; on sm_107a with the slack tail
-# placement too), ``main_wave_halves`` (waves synchronised every eight) and, on
-# sm_107a, ``main_halves_k256t`` (with the slack tail placement) -- whose split
-# tail is added in place: every unit of a split tail tile adds its fp32
-# accumulator into the tile's fp32 sum in ``tail_sums`` with unordered
-# reductions and counts its arrival on the tile's tickets in ``tail_tickets``;
-# the last unit rounds the sum once, stores it and clears the sum and the
-# tickets.  Those routes have no ``tail_reduce`` stage and launch one kernel.
-# Every whole tile is reduced in a fixed order by one CTA pair, as in the
-# deterministic package; only a split tail tile's units are added in an order
-# the launch does not fix.  With the slack tail placement the kernel plans each
-# launch's tail on the device: when every tail tile fits in the room the full
-# waves leave on the least-loaded clusters, each runs whole on one of them (no
-# sum or ticket is touched), else the tail splits as above.
+# ``main_halves`` (with the planned tile walk and the slack tail placement),
+# ``main_wave_halves`` (waves synchronised every eight) and, on sm_107a,
+# ``main_halves_k256t`` (with the slack tail placement) -- whose split tail is
+# added in place: every unit of a split tail tile adds its fp32 accumulator
+# into the tile's fp32 sum in ``tail_sums`` with unordered reductions and
+# counts its arrival on the tile's tickets in ``tail_tickets``; the last unit
+# rounds the sum once, stores it and clears the sum and the tickets.  Those
+# routes have no ``tail_reduce`` stage and launch one kernel.  Every whole tile
+# is reduced in a fixed order by one CTA pair, as in the deterministic package;
+# only a split tail tile's units are added in an order the launch does not fix.
+# With the slack tail placement the kernel plans each launch's tail on the
+# device: when every tail tile fits in the room the full waves leave on the
+# least-loaded clusters, each runs whole on one of them (no sum or ticket is
+# touched), else the tail splits as above.
 #
 # The host chooses among the stages a route serves by ``HOST_PLAN_CONSTANTS``,
 # with the deterministic package's rules and constants (``cake_backend``,
