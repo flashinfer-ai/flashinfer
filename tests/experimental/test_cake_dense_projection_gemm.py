@@ -1899,6 +1899,94 @@ def test_k2_rows_without_a_verdict_skip_the_planner(monkeypatch):
     assert not without_verdict(X, W.t(), out, arch, sm_count)
 
 
+# (arch, SM count) of the measured router tables: ROUTER_RULES on 152-SM GB200 / GB300 and 216-SM R200 parts,
+# ROUTER_RULES_BY_SM on 208-SM and 212-SM R200 parts
+ROUTER_TABLE_PARTS = (
+    ("sm_100a", 152),
+    ("sm_103a", 152),
+    ("sm_107a", 208),
+    ("sm_107a", 212),
+    ("sm_107a", 216),
+)
+
+
+def test_router_rule_spec_reads_the_table_of_the_sm_count(monkeypatch):
+    """The convenience path's no-verdict check reads the router table of the device's SM count (``router_rules``):
+    ``ROUTER_RULES`` on 152 SMs (sm_100a, sm_103a) and 216 SMs (sm_107a), the part's own table of
+    ``ROUTER_RULES_BY_SM`` on 208 and 212 SMs (sm_107a).  At every row of that table and the edges of its windows the
+    spec is the table's, ``None`` exactly where the device's planner keeps the row on the deterministic program for
+    want of a verdict; a verdict in only one table is seen on exactly its SM count."""
+    _register(
+        monkeypatch,
+        "sm_107a",
+        "router_fp32_gemm_atomic_kk",
+        "router_fp32_gemm_atomic_nn_t",
+        "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX,
+    )
+    checked = 0
+    for arch, sms in ROUTER_TABLE_PARTS:
+        table, holds = cake_backend.router_rules(arch, sms)
+        own = cake_backend.ROUTER_RULES_BY_SM.get((arch, sms))
+        assert holds and table is (cake_backend.ROUTER_RULES if own is None else own)
+        assert (own is None) == (sms == cake_backend.ROUTER_SM_COUNT[arch])
+        for (key_arch, layout, hidden, experts), rule in table.items():
+            if key_arch != arch:
+                continue
+            for T in sorted(_router_spec_tokens(rule)):
+                M, N, K = (
+                    (T, experts, hidden) if layout == "kk" else (hidden, experts, T)
+                )
+                want = rule
+                if isinstance(rule, tuple):
+                    want = next((s for lo, hi, s in rule if lo <= T <= hi), None)
+                spec = cake_backend._router_rule_spec(
+                    layout, arch=arch, sm_count=sms, M=M, N=N, K=K
+                )
+                assert spec == want, (arch, sms, layout, hidden, T)
+                part = cake_backend.router_partition(
+                    layout, arch=arch, M=M, N=N, K=K, sm_count=sms
+                )
+                if spec is None:
+                    assert part is None, (arch, sms, layout, hidden, T)
+                checked += 1
+    assert checked > 300
+    # the sm_107a hidden-5120 weight gradient: "H0.5x4" at 16172 to 16384 tokens on 208, 212 and 216 SMs
+    for sms in (208, 212, 216):
+        for T, want in ((16171, None), (16172, "H0.5x4"), (16384, "H0.5x4")):
+            assert (
+                cake_backend._router_rule_spec(
+                    "nn_t", arch="sm_107a", sm_count=sms, M=5120, N=256, K=T
+                )
+                == want
+            )
+    # a verdict in the 212-SM table only, then in ROUTER_RULES only (216 SMs): the no-verdict check of a binding of
+    # the row follows the table of each SM count
+    key = ("sm_107a", "nn_t", 6144, 256)
+    tables = {
+        part: dict(rows) for part, rows in cake_backend.ROUTER_RULES_BY_SM.items()
+    }
+    tables[("sm_107a", 212)][key] = ((16172, 16384, "H0.5x4"),)
+    monkeypatch.setattr(cake_backend, "ROUTER_RULES_BY_SM", tables)
+    G, X = torch.empty(16231, 256), torch.empty(16231, 6144)
+    out = torch.empty(256, 6144)
+    keeps = {
+        sms: cake_backend._k2_row_without_verdict(G.t(), X, out, "sm_107a", sms)
+        for sms in (208, 212, 216)
+    }
+    assert keeps == {208: True, 212: False, 216: True}
+    plan, _ = cake_backend.plan_atomic_router(
+        G.t(), X, out, arch="sm_107a", sm_count=212
+    )
+    assert plan is not None and plan.head_spans > 0
+    monkeypatch.setitem(cake_backend.ROUTER_RULES, key, ((16172, 16384, "H0.5x4"),))
+    tables[("sm_107a", 212)][key] = None
+    keeps = {
+        sms: cake_backend._k2_row_without_verdict(G.t(), X, out, "sm_107a", sms)
+        for sms in (208, 212, 216)
+    }
+    assert keeps == {208: True, 212: True, 216: False}
+
+
 @pytest.mark.parametrize("splits", [None, 2])
 def test_k2_key_is_the_convenience_key(splits):
     """The cached K2 launch reads the call's geometry once (``_k2_geometry``) for its checks and its key; the key is
@@ -3118,6 +3206,65 @@ def test_gpu_cached_router_launch_is_the_prepared_launch():
             ran += 1
     print(f"ROUTER_BOUND_LAUNCH {arch}: {ran} launches")
     assert ran
+
+
+def test_gpu_cached_router_launch_runs_the_head_tail_windows_at_their_edges():
+    """Unforced (``deterministic=False``, no split count): at the first and the last token count of every head/tail
+    window of this device's router table (``router_rules`` of its architecture and SM count), the convenience path's
+    cached launch (its bound arguments, ``_K2Binding``) runs the prepared launch's plan and program, meets the gate
+    and, for a reproducible plan, gives the prepared launch's bits; the second call of the key reuses the binding."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    rules, holds = cake_backend.router_rules(arch, sm_count)
+    edges = []
+    for (rule_arch, layout, hidden, _experts), rule in sorted(
+        rules.items(), key=lambda kv: kv[0]
+    ):
+        if rule_arch != arch or layout != "nn_t" or not isinstance(rule, tuple):
+            continue
+        for first, last, spec in rule:
+            if holds and cake_backend.router_head_tail(spec) is not None:
+                edges += [(hidden, first), (hidden, last)]
+    ran = 0
+    for hidden, T in edges:
+        X, W, G = _router_inputs(T, device, SEED + 26, K=hidden)
+        A, B, out = _router_case("wgrad", X, W, G)
+        prepared = cake_backend.prepare_router_fp32_gemm(
+            A, B, out.clone(), deterministic=False
+        )
+        assert isinstance(prepared, cake_backend.PreparedAtomicRouterGemm), (hidden, T)
+        assert prepared.plan.head_spans > 0, (hidden, T)
+        want = prepared.launch().clone()
+        cake_backend.clear_convenience_caches()
+        _assert_ran(
+            lambda A=A, B=B, out=out: cake_backend.router_fp32_gemm(
+                A, B, out, deterministic=False
+            ),
+            prepared.module_name,
+        )
+        torch.cuda.synchronize()
+        (entry,) = cake_backend._K2_ATOMIC_CACHE.values()
+        assert entry.plan == prepared.plan, (hidden, T)
+        assert entry.module_name == prepared.module_name, (hidden, T)
+        bound = entry.k2
+        assert bound is not None and bound.version == entry.arena.version
+        ref = A.double() @ B.double()
+        assert _rel_fro(out, ref) <= ROUTER_REL_FRO_MAX, (hidden, T)
+        assert _rel_fro(want, ref) <= ROUTER_REL_FRO_MAX, (hidden, T)
+        if prepared.plan.reproducible:
+            assert torch.equal(out, want), (hidden, T)
+        out.fill_(float("nan"))
+        assert cake_backend.router_fp32_gemm(A, B, out, deterministic=False) is out
+        torch.cuda.synchronize()
+        (again,) = cake_backend._K2_ATOMIC_CACHE.values()
+        assert again is entry and again.k2 is bound, (hidden, T)
+        assert _rel_fro(out, ref) <= ROUTER_REL_FRO_MAX, (hidden, T)
+        if prepared.plan.reproducible:
+            assert torch.equal(out, want), (hidden, T)
+        ran += 1
+    print(f"ROUTER_BOUND_HEAD_TAIL_EDGES {arch} sm_count={sm_count}: {ran} launches")
+    if not ran:
+        pytest.skip(f"no router head/tail window of {arch} applies on {sm_count} SMs")
 
 
 @pytest.mark.parametrize("op, splits", [("fwd", 2), ("wgrad", 4)])
