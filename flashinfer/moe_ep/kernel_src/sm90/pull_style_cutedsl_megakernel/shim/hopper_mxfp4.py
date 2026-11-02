@@ -136,7 +136,9 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
     fp8_accum_mode: Literal["1xacc"] = "1xacc"
     swap_ab: bool = True
     # Preserve the qualified MXFP4 layout when the FP8 base gains new features.
-    # The compact pull buffer (one dispatch slot per active warp) is opt-in.
+    # The compact pull buffer (one dispatch slot per active warp) and the
+    # inherited dispatch-pull batch/rotation are tactic fields; omitted fields
+    # select the full 4-slot buffer and the serial, static pull.
     compact_pull_buffer: bool = False
     generate_c: Literal[False] = False
     mma_tiler_mnk: Tuple[int, int, int] = _MXFP4_MMA_TILER_DEFAULT
@@ -236,9 +238,19 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
             for item in dataclasses.fields(MegaMoEHopperFp8Config)
         }
         base_kwargs["fp8_scale_mode"] = "blockwise"
+        tile_m, tile_n, tile_k = self.mma_tiler_mnk
+        # Packed FP4 adds swap-AB token tiles N72/N80: one task holds an
+        # expert's 65-80 rows where N64 needs a second, nearly empty tile.
+        # FP8 keeps its own widths; the proxy only checks the whitelist on N.
+        if tile_n in (72, 80):
+            base_kwargs["mma_tiler_mnk"] = (tile_m, 64, tile_k)
         MegaMoEHopperFp8Config(**base_kwargs)
 
-        tile_m, _tile_n, tile_k = self.mma_tiler_mnk
+        if tile_n in (72, 80) and tile_m != 256:
+            raise ValueError(
+                f"Hopper {self._weight_format} x FP8 token tiles N72/N80 require M=256; "
+                f"got mma_tiler_mnk={self.mma_tiler_mnk}."
+            )
         if tile_m not in (128, 256):
             raise ValueError(
                 f"Hopper {self._weight_format} x FP8 requires swap-AB MMA tile M=128 or 256; "
@@ -309,7 +321,13 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
     _validate_tactic = staticmethod(_validate_complete_mxfp4_tactic)
 
     def _conversion_tactic(self, kernel) -> Dict[str, Any]:
-        return {}
+        return {"compact_pull_buffer": bool(kernel.token_comm.compact_pull_buffer)}
+
+    def _dispatch_tactic(self, kernel) -> Dict[str, Any]:
+        return {
+            "dispatch_pull_batch": int(kernel.token_comm.pull_batch),
+            "dispatch_pull_rotate": bool(kernel.token_comm.pull_rotate),
+        }
 
     _mega_key: Optional[tuple]
     _mega: Optional[_CompiledMega]
@@ -318,11 +336,17 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
         """Apply declared packed-FP4 tactics; reject stale/cache-only fields."""
         if knobs is None:
             return
+        from .mxfp4_optimization import MXFP4_PULL_DEFAULTS
+
         validated = self._validate_tactic(
             knobs,
             source=f"{self._weight_format} frontend.apply_knobs()",
         )
-        new_config = dataclasses.replace(self.config, **validated)
+        # Normalized tactics omit default pull fields; reset them so a tactic
+        # never inherits the previous tactic's pull buffer or batch.
+        new_config = dataclasses.replace(
+            self.config, **{**MXFP4_PULL_DEFAULTS, **validated}
+        )
         if new_config == self.config:
             return
         ensure_not_capturing(f"{self._weight_format} apply_knobs (config change)")
@@ -371,6 +395,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
                 "tail_split_pairs": bool(kernel.tail_split_pairs),
                 "fc2_tail_n8": kernel.mxfp4_optimizations.fc2_tail_n8,
                 "fc1_ready_mode": kernel.mxfp4_optimizations.fc1_ready_mode,
+                **self._dispatch_tactic(kernel),
                 **self._conversion_tactic(kernel),
             },
             source=f"{self._weight_format} frontend effective tactic",
@@ -516,7 +541,10 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             use_2cta_instrs=c.use_2cta_instrs,
             group_hint=group_hint,
             token_padding_block=token_padding_block,
-            sf_padding_block=SfPaddingBlock,
+            # The activation-SF TMA addresses a token tile as (expert SF base +
+            # tile * N) // N, so every expert's SF base must be a multiple of N.
+            sf_padding_block=-(-SfPaddingBlock // token_padding_block)
+            * token_padding_block,
             load_balance_mode=c.load_balance_mode,
             static_expert_shape=static_expert_shape,
             force_static_sched=c.force_static_sched,
@@ -543,6 +571,8 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             combine_format=c.combine_format,
             active_dispatch_warps=c.active_dispatch_warps,
             compact_pull_buffer=c.compact_pull_buffer,
+            dispatch_pull_batch=c.dispatch_pull_batch,
+            dispatch_pull_rotate=c.dispatch_pull_rotate,
             fc1_store_offload=c.fc1_store_offload,
             fc1_early_done_publish=c.fc1_early_done_publish,
             fold_producer_warps=c.fold_producer_warps,
@@ -898,8 +928,23 @@ def resolve_hopper_mxfp4_knobs(
             )
         return tactic
 
-    # Prefer the bucket winner when legal; smaller shapes may require the
-    # first legal tactic in the stable manifest union instead.
+    from .mxfp4_optimization import hopper_mxfp4_fused_default_tactic
+
+    default = hopper_mxfp4_fused_default_tactic(
+        num_max_tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_total_experts,
+        world_size=world_size,
+        routing_profile=routing_profile,
+        num_topk=num_topk,
+    )
+    if default is not None:
+        return _validate_complete_mxfp4_tactic(
+            default, source="MXFP4 per-bucket default"
+        )
+    # Otherwise prefer the legacy bucket winner when legal; smaller shapes may
+    # require the first legal tactic in the stable manifest union instead.
     return _validate_complete_mxfp4_tactic(
         _ordered_base_candidates(
             num_max_tokens,
@@ -943,7 +988,9 @@ def _resolve_hopper_mxfp4_mega_moe_config(
     fc1_store_offload: Optional[bool] = None,
     fc1_early_done_publish: Optional[bool] = None,
     fold_producer_warps: Optional[bool] = None,
-    compact_pull_buffer: bool = False,
+    compact_pull_buffer: Optional[bool] = None,
+    dispatch_pull_batch: Optional[int] = None,
+    dispatch_pull_rotate: Optional[bool] = None,
     apply_routing_weights_before_fc2: bool = True,
     group_hint: Optional[int] = None,
     clc_bundle_size: Optional[int] = None,
@@ -1022,6 +1069,26 @@ def _resolve_hopper_mxfp4_mega_moe_config(
         # caller token-back choice wins over a cache entry.
         if token_back_mode is not None:
             resolved.pop("token_back_mode", None)
+        # Pull-buffer fields are tactic fields omitted at their defaults; an
+        # explicit caller value wins over the tactic in the same way.
+        from .mxfp4_optimization import MXFP4_PULL_DEFAULTS
+
+        resolved = {**MXFP4_PULL_DEFAULTS, **resolved}
+        for name, value in (
+            ("compact_pull_buffer", compact_pull_buffer),
+            ("dispatch_pull_batch", dispatch_pull_batch),
+            ("dispatch_pull_rotate", dispatch_pull_rotate),
+        ):
+            if value is not None:
+                resolved.pop(name)
+        # A tactic's pull batch keeps rows in the idle slots of the full
+        # 4-slot buffer of the serial epi_warps dispatch. When an explicit
+        # token-back mode or compact buffer rules that out, keep the rest of
+        # the tactic with one row in flight; the batch never changes outputs.
+        if resolved.get("dispatch_pull_batch", 1) > 1 and (
+            compact_pull_buffer or token_back_mode not in (None, "epi_warps")
+        ):
+            resolved["dispatch_pull_batch"] = 1
 
     config = MegaMoEHopperMxfp4Config(
         rank=rank,
@@ -1059,7 +1126,13 @@ def _resolve_hopper_mxfp4_mega_moe_config(
             if fold_producer_warps is None
             else fold_producer_warps
         ),
-        compact_pull_buffer=compact_pull_buffer,
+        compact_pull_buffer=(
+            False if compact_pull_buffer is None else compact_pull_buffer
+        ),
+        dispatch_pull_batch=1 if dispatch_pull_batch is None else dispatch_pull_batch,
+        dispatch_pull_rotate=(
+            False if dispatch_pull_rotate is None else dispatch_pull_rotate
+        ),
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         group_hint=group_hint,
         clc_bundle_size=clc_bundle_size,
@@ -1112,7 +1185,9 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
     fc1_store_offload: Optional[bool] = None,
     fc1_early_done_publish: Optional[bool] = None,
     fold_producer_warps: Optional[bool] = None,
-    compact_pull_buffer: bool = False,
+    compact_pull_buffer: Optional[bool] = None,
+    dispatch_pull_batch: Optional[int] = None,
+    dispatch_pull_rotate: Optional[bool] = None,
     apply_routing_weights_before_fc2: bool = True,
     group_hint: Optional[int] = None,
     clc_bundle_size: Optional[int] = None,
@@ -1130,7 +1205,9 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
     backend because it requires live weights, staged routing, and every EP
     rank in lockstep. Explicit geometry/execution axes and ``knobs=`` are
     mutually exclusive. An explicit token-back mode retains its established
-    precedence over a cached tactic.
+    precedence over a cached tactic, and so do explicit pull-buffer fields
+    (``compact_pull_buffer``, ``dispatch_pull_batch``,
+    ``dispatch_pull_rotate``); ``None`` leaves them to the tactic.
     """
     config = _resolve_hopper_mxfp4_mega_moe_config(
         num_total_experts,
@@ -1161,6 +1238,8 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
         fc1_early_done_publish=fc1_early_done_publish,
         fold_producer_warps=fold_producer_warps,
         compact_pull_buffer=compact_pull_buffer,
+        dispatch_pull_batch=dispatch_pull_batch,
+        dispatch_pull_rotate=dispatch_pull_rotate,
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         group_hint=group_hint,
         clc_bundle_size=clc_bundle_size,

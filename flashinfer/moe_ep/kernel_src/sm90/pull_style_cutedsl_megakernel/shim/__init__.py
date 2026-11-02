@@ -37,7 +37,11 @@ from .autotune import (
     autotune_knobs,
     hopper_fp8_candidates,
 )
-from .mxfp4_optimization import hopper_mxfp4_candidates
+from .mxfp4_optimization import (
+    MXFP4_FUSED_DEFAULT_TOKEN_BUCKETS,
+    hopper_mxfp4_candidates,
+    hopper_mxfp4_fused_default_tactic,
+)
 from .nvfp4_autotune import autotune_hopper_nvfp4_mega_moe
 from .nvfp4_tuner import hopper_nvfp4_candidates
 from .knob_cache import (
@@ -171,9 +175,11 @@ __all__ = [
     "MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE",
     "MXFP4_TUNING_ROUTING_PROFILES",
     "MXFP4_TUNING_TOKEN_BUCKETS",
+    "MXFP4_FUSED_DEFAULT_TOKEN_BUCKETS",
     "Mxfp4RoutingProfile",
     "hopper_mxfp4_candidates",
     "hopper_mxfp4_default_tactic",
+    "hopper_mxfp4_fused_default_tactic",
     "is_hopper_mxfp4_tactic_shape_compatible",
     "is_valid_hopper_mxfp4_tactic",
     "normalize_hopper_mxfp4_routing_profile",

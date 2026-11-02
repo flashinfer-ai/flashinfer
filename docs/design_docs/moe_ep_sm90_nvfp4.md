@@ -107,7 +107,13 @@ experts, top-6, K64, `block_permutation_v1` routing** at these capacities:
 ```
 
 For the reference model the heuristic rounds capacity up to the next bucket,
-and uses the largest bucket above 32768. Clamp and SM90 product name do not
+and uses the largest bucket above 32768. As for MXFP4, a default without the
+scale ring then takes the token-tile width of 64, 72 or 80 that needs the
+fewest tiles for the balanced rows per expert,
+`max_tokens * top_k * EP / experts`; ties keep N64. For the reference model
+this changes 1025-1280, 2049-2560 and 3073-3840 tokens and every capacity
+above 4096; on H200 it measured 0.61-0.98x the N64 default at nine of these
+capacities, from 1152 to 32768 tokens. Clamp and SM90 product name do not
 gate it. Other model shapes, routing or K layouts use a shape-compatible
 fallback. These are legal starting configurations, not measured performance
 guarantees for other capacities or hardware.

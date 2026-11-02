@@ -363,7 +363,7 @@ def validate_hopper_mxfp4_tactic(tactic: Mapping[str, Any]) -> dict[str, Any]:
     m, n, k = tile
     if (
         m not in (128, 256)
-        or n not in (16, 32, 64, 128)
+        or n not in (16, 32, 64, 72, 80, 128)
         or k
         not in (
             128,
@@ -371,6 +371,8 @@ def validate_hopper_mxfp4_tactic(tactic: Mapping[str, Any]) -> dict[str, Any]:
         )
     ):
         raise ValueError("illegal MXFP4 fused tile")
+    if n in (72, 80) and m != 256:
+        raise ValueError("MXFP4 fused N72/N80 token tiles require M256")
     if tactic["pingpong"] and m != 128:
         raise ValueError("MXFP4 fused pingpong requires M128")
     cluster = _triple(tactic["cluster_shape_mnk"], "cluster_shape_mnk")
@@ -489,8 +491,13 @@ def _base_candidate_union_sha256() -> str:
 def hopper_mxfp4_cache_provenance_sha256(
     *,
     routing_profile: str = MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
+    include_fused_defaults: bool = True,
 ) -> str:
-    """Return the exact cache identity for the shipped tuning domain."""
+    """Return the exact cache identity for the shipped tuning domain.
+
+    ``include_fused_defaults`` must match the candidate domain the cache entry
+    was tuned over (see ``hopper_mxfp4_candidates``).
+    """
 
     profile = normalize_hopper_mxfp4_routing_profile(routing_profile)
     candidate_union_sha256 = _base_candidate_union_sha256()
@@ -502,18 +509,25 @@ def hopper_mxfp4_cache_provenance_sha256(
         "tuning_provenance": _CACHE_PROVENANCE[profile],
     }
     from ..src.moe_hopper_fp8.mxfp4_policy import MXFP4_OPTIMIZATION_VERSION
-    from .mxfp4_optimization import mxfp4_tail_candidate_provenance
+    from .mxfp4_optimization import (
+        mxfp4_fused_default_provenance,
+        mxfp4_tail_candidate_provenance,
+    )
 
     # Shape and world size are already separate knob-cache key fields.
     # This domain version binds eligibility/code changes without changing the
     # retained cache namespace.
-    payload["optimization_domain"] = {
+    optimization_domain: dict[str, Any] = {
         "implementation": MXFP4_OPTIMIZATION_VERSION,
         "fc2_tail_n8": [False, True],
         "fc1_ready_mode": ["tile", "k256"],
         "tail_split_pairs": [False, True],
         "tail_candidate_extension": mxfp4_tail_candidate_provenance(),
     }
+    fused_defaults = mxfp4_fused_default_provenance(profile)
+    if include_fused_defaults and fused_defaults is not None:
+        optimization_domain["fused_default_extension"] = fused_defaults
+    payload["optimization_domain"] = optimization_domain
     canonical = json.dumps(
         payload,
         ensure_ascii=True,
@@ -551,7 +565,12 @@ def hopper_mxfp4_default_tactic(
     *,
     routing_profile: str = MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
 ) -> dict[str, Any]:
-    """Return a copy of the ceil-bucket default, clamping above 2048 tokens."""
+    """Return a copy of the ceil-bucket default, clamping above 2048 tokens.
+
+    This legacy geometry table orders the candidates, seeds the tail-pair
+    candidates and backs the NV fallback. Untuned MXFP4 launches first use
+    ``mxfp4_optimization.hopper_mxfp4_fused_default_tactic``.
+    """
     profile = normalize_hopper_mxfp4_routing_profile(routing_profile)
     bucket_index = MXFP4_TUNING_TOKEN_BUCKETS.index(_token_bucket(max_tokens))
     return dict(_BASE_TACTICS[_DEFAULT_INDICES[profile][bucket_index]])
