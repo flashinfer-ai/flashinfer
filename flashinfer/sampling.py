@@ -201,7 +201,7 @@ def _blackwell_softmax_capability(device_index: int) -> Tuple[int, int]:
 @functools.cache
 def _supports_blackwell_softmax(device_index: int) -> bool:
     major, minor = _blackwell_softmax_capability(device_index)
-    return major == 10 and minor in (0, 3)
+    return major == 10 and minor in (0, 3, 7)
 
 
 @functools.cache
@@ -962,8 +962,8 @@ def softmax(
         Whether to enable Programmatic Dependent Launch (PDL) for improved performance on supported hardware.
         If None (default), PDL will be automatically enabled on devices with compute capability >= 9.0.
         The custom Blackwell softmax routes currently apply PDL on SM103; the
-        SM100 fast path remains non-PDL, while fallback routes preserve their
-        existing PDL behavior. On SM100/SM103, 32-byte aligned rows whose
+        SM100 and SM107 fast paths remain non-PDL, while fallback routes preserve
+        their existing PDL behavior. On SM100/SM103/SM107, 32-byte aligned rows whose
         vocabulary is a multiple of 8 and at most 262144 take the row-caching
         cluster route, which reads and writes each row exactly once.
     Returns

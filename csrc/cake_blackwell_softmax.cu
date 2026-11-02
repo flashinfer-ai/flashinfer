@@ -1117,7 +1117,9 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
   float* parameter = temperature_arr != nullptr ? temperature_arr : logits;
   int rows_i = static_cast<int>(rows);
   int vocab_size_i = static_cast<int>(vocab_size);
-  // Keep the existing sm_100a launch path unchanged. The high bit is an
+  // Keep the existing sm_100a launch path unchanged; sm_107a launches without
+  // PDL too, since the warp, rowwise, bootstrap and persistent kernels issue
+  // griddepcontrol only in their sm_103a builds. The high bit is an
   // sm_103a integration-only PDL flag; adapted kernels strip it before
   // evaluating the original 0/1/2 parameter-kind ABI. The row-caching cluster
   // kernels instead have _pdl twins and take the plain parameter kind.
@@ -1283,7 +1285,7 @@ SoftmaxRoute query_softmax_route(TensorView logits, Optional<TensorView> maybe_t
   }
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Blackwell Softmax route query failed with error code " << cudaGetErrorString(status);
-  if (device_major != 10 || (device_minor != 0 && device_minor != 3)) {
+  if (device_major != 10 || (device_minor != 0 && device_minor != 3 && device_minor != 7)) {
     return SoftmaxRoute::kFallback;
   }
   const auto rows = static_cast<uint32_t>(logits.size(0));

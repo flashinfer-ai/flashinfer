@@ -441,7 +441,7 @@ def test_blackwell_softmax_low_temperature_huge_logits_match_torch(
 def test_blackwell_route_observer_falls_back_off_blackwell():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+    if torch.cuda.get_device_capability() in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("This test exercises the non-Blackwell observer gate")
 
     logits = torch.empty((1, 111), device="cuda")
@@ -450,6 +450,45 @@ def test_blackwell_route_observer_falls_back_off_blackwell():
     )
 
     assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature_kind",
+    [
+        (4, 151552, "scalar"),  # a speculative-decoding verify step's rows
+        (37, 262144, "per_row"),  # the widest cached row: 16 CTAs x 8 tiles
+        (512, 128000, "none"),
+        (8, 4096, "per_row"),
+    ],
+)
+def test_blackwell_softmax_on_sm107_takes_blackwell_routes(
+    rows, vocab_size, temperature_kind, enable_pdl
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("This test exercises the SM107 gate")
+
+    generator = torch.Generator(device="cuda").manual_seed(rows * vocab_size)
+    logits = torch.randn(rows, vocab_size, device="cuda", generator=generator)
+    if temperature_kind == "none":
+        temperature, scale = None, torch.ones(rows, 1, device="cuda")
+    elif temperature_kind == "scalar":
+        temperature, scale = 0.7, torch.full((rows, 1), 0.7, device="cuda")
+    else:
+        temperature = torch.rand(rows, device="cuda", generator=generator) + 0.25
+        scale = temperature[:, None]
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    actual = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    expected = torch.softmax(logits / scale, dim=-1)
+
+    assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize(
