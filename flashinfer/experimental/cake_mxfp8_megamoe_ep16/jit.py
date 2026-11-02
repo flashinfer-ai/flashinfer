@@ -18,10 +18,11 @@ limitations under the License.
 #
 # The generated sources are one architecture-neutral closure (tcgen05/TMEM
 # code, no __CUDA_ARCH__ dependence) compiled as one exact-architecture module
-# per admitted target. Targets follow FlashInfer's compilation context
-# (FLASHINFER_CUDA_ARCH_LIST or the visible devices), restricted to the
-# capabilities the kernels are built for. The sm_107a target needs CUDA 13.4
-# or newer.
+# per admitted target; the sm_107a module defines its fused-grid size
+# (CAKE_MEGAMOE_GRID_CLUSTERS, _GRID_CLUSTERS below). Targets follow
+# FlashInfer's compilation context (FLASHINFER_CUDA_ARCH_LIST or the visible
+# devices), restricted to the capabilities the kernels are built for. The
+# sm_107a target needs CUDA 13.4 or newer.
 
 from __future__ import annotations
 
@@ -52,6 +53,10 @@ _ARCH_FLAGS: dict[tuple[int, int], tuple[str, list[str]]] = {
 }
 # Capabilities whose target needs a newer CUDA toolkit than FlashInfer's minimum.
 _MIN_CUDA: dict[tuple[int, int], str] = {(10, 7): "13.4"}
+# Two-CTA clusters of the fused kernel's static grid (CAKE_MEGAMOE_GRID_CLUSTERS of the generated body and binding):
+# 72 (144 CTAs, the GB300 schedule) unless listed. R200 (212 or 216 SMs) runs the 96-cluster schedule.
+_DEFAULT_GRID_CLUSTERS = 72
+_GRID_CLUSTERS: dict[tuple[int, int], int] = {(10, 7): 96}
 SUPPORTED_CAPABILITIES = tuple(sorted(_ARCH_FLAGS))
 # The CuTe-DSL backend has one generated program per admitted architecture.
 CUTE_DSL_CAPABILITIES = SUPPORTED_CAPABILITIES
@@ -173,6 +178,13 @@ def require_cute_dsl_capability(capability: tuple[int, int]) -> tuple[int, int]:
     return capability
 
 
+def fused_grid_ctas(capability: tuple[int, int]) -> int:
+    """CTAs of the fused kernel's cooperative grid on an admitted capability; all must be co-resident."""
+
+    capability = (int(capability[0]), int(capability[1]))
+    return 2 * _GRID_CLUSTERS.get(capability, _DEFAULT_GRID_CLUSTERS)
+
+
 def device_arch(capability: tuple[int, int]) -> str:
     """The exact CUDA architecture name (``sm_100a`` / ``sm_103a`` / ``sm_107a``) of an admitted capability."""
 
@@ -183,7 +195,13 @@ def device_arch(capability: tuple[int, int]) -> str:
 def gen_cake_mxfp8_megamoe_ep16_module(capability: tuple[int, int]) -> JitSpec:
     """Create the exact-architecture JIT specification for one admitted capability."""
 
-    arch, flags = _ARCH_FLAGS[require_supported_capability(capability)]
+    capability = require_supported_capability(capability)
+    arch, flags = _ARCH_FLAGS[capability]
+    grid = (
+        [f"-DCAKE_MEGAMOE_GRID_CLUSTERS={_GRID_CLUSTERS[capability]}"]
+        if capability in _GRID_CLUSTERS
+        else []
+    )
     csrc_root, manifest = _read_manifest()
     units = manifest["sequences"][0]["translation_units"]
     sources = [
@@ -194,7 +212,7 @@ def gen_cake_mxfp8_megamoe_ep16_module(capability: tuple[int, int]) -> JitSpec:
     spec = gen_jit_spec(
         name=f"{_OPERATOR_DIR}_{arch}",
         sources=sources,
-        extra_cuda_cflags=[*flags, "--use_fast_math"],
+        extra_cuda_cflags=[*flags, "--use_fast_math", *grid],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[csrc_root, operator_dir, *_get_flashinfer_header_dirs()],
     )
@@ -241,6 +259,7 @@ __all__ = [
     "SUPPORTED_CAPABILITIES",
     "cute_dsl_source",
     "device_arch",
+    "fused_grid_ctas",
     "gen_cake_mxfp8_megamoe_ep16_module",
     "load_cake_mxfp8_megamoe_ep16_module",
     "require_cute_dsl_capability",
