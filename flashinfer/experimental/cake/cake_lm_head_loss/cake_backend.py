@@ -348,6 +348,23 @@ STAGE_TENSORS = {
     # the log-probability arms of the logits GEMM also read the per-token rows (``d_in`` = the kernel's ``dlogp``)
     "gemm_logits_dz": ("A", "B", "C", "STATS_OUT", "WS", "labels", "lse", "d_in"),
     "gemm_logits_lbl": ("A", "B", "C", "STATS_OUT", "WS", "labels"),
+    # the zero-gradient row skip's forms also read the chunk's count cell
+    **{
+        stage: ("A", "B", "C", "STATS_OUT", "WS", "CNT")
+        for stage in GEMM_STAGES
+        if stage.endswith("_dcnt")
+    },
+    "gemm_logits_dz_dcnt": (
+        "A",
+        "B",
+        "C",
+        "STATS_OUT",
+        "WS",
+        "labels",
+        "lse",
+        "d_in",
+        "CNT",
+    ),
     "row_finalize": (
         "stats",
         "z",
@@ -470,6 +487,7 @@ HIDDEN_COUNT_STAGE = "gather_rows_bf16"
 # ``row_finalize`` reads: bitwise the same ``lse`` / ``logp``.  Selected by the ``logprob_dz`` / ``logprob_lbl`` switches
 # (default on: :func:`logprob_dz_default` / :func:`logprob_lbl_default`) when the record registers them.
 LOGPROB_DZ_STAGE = "gemm_logits_dz"
+LOGPROB_DZ_DCNT_STAGE = "gemm_logits_dz_dcnt"  # its form under the zero-gradient row skip (:data:`DCNT_BASES`)
 LOGPROB_LBL_STAGE = "gemm_logits_lbl"
 LOGITS_BASES = (
     "gemm_logits",
@@ -593,7 +611,7 @@ _TUNING_KNOBS = {
 _STAGE_RE = re.compile(
     r"(?P<base>" + "|".join(sorted(BASE_STAGES, key=len, reverse=True)) + r")"
     r"(?P<mcnt>_mcnt)?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?P<split>_split)?(?P<swab>_swab)?"
-    r"(?P<gn>_gn)?(?P<tma>_tma)?"
+    r"(?P<gn>_gn)?(?P<tma>_tma)?(?P<dcnt>_dcnt)?"
 )
 STAGE_KNOBS = (
     "count",
@@ -603,7 +621,17 @@ STAGE_KNOBS = (
     "swab",
     "blocked",
     "epi_store",
+    "dcnt",
 )
+# The zero-gradient row skip of the log-probability backward (``_dcnt``, :func:`zero_dlogp_partition`): the backward
+# orders each chunk's rows so that the rows whose upstream gradient ``dlogp`` is nonzero come first and holds their
+# number per chunk in an int32 device cell (``CNT``); the ``_dcnt`` form of a GEMM bounds its work by that cell at the
+# launch shape of the chunk's full row count (no read-back, one launch sequence, CUDA-graph capturable).  The dz arm
+# and the K-sliced dX reduction skip the work items whose pair of row tiles starts at or past the count (their rows keep
+# what they held: never read), the weight-gradient accumulate and bf16 fused cast run ``ceil(count / 64)`` of its K
+# steps (one at least on a first chunk; none leaves the accumulator as it was, and the cast writes ``bf16(g * WS)``).
+# The bases that have the form (not the swapped dX tile, not the TMA-epilogue forms):
+DCNT_BASES = ("gemm_logits_dz", "gemm_dx_red", "gemm_dw_acc", "gemm_dw_cast_bf16")
 
 
 def stage_variant(
@@ -616,9 +644,10 @@ def stage_variant(
     swab: bool = False,
     blocked: bool = False,
     epi_store: Optional[str] = None,
+    dcnt: bool = False,
 ) -> str:
     """Stage name of one structural form of ``base``: the rule outputs that select a kernel body, in the fixed suffix
-    order ``_mcnt``, ``_tn256``, ``_st<stages>``, ``_split``, ``_swab``, ``_gn``, ``_tma``; ``split``: the wide
+    order ``_mcnt``, ``_tn256``, ``_st<stages>``, ``_split``, ``_swab``, ``_gn``, ``_tma``, ``_dcnt``; ``split``: the wide
     dX tile with its last wave's trailing items run as half items (:func:`dx_split_rule`); ``swab``: the wide dX tile
     with swapped operands at the table ring depth (:func:`dx_swab_rule`); a default output (the host-bound row
     count, the wide tile, the table ring depth, the 1-D raster, the default epilogue) adds nothing, so
@@ -627,8 +656,9 @@ def stage_variant(
     whose valid-row bound is read from device memory (chunk 0 of the hidden valid-row count path); ``blocked``: the
     weight-gradient accumulate / fp32 fused cast on the 2-D blocked raster
     (``group_n`` set); ``epi_store="tma"``: the weight-gradient accumulate's TMA reduce-add or the bf16 fused cast's
-    TMA store (:func:`dw_cast_tma_rule`).  The slice count, the raster height and the block width themselves are
-    launch scalars (:func:`gemm_scalars`), not part of the name."""
+    TMA store (:func:`dw_cast_tma_rule`); ``dcnt``: the form bounded by the device count of the chunk's live rows
+    (:data:`DCNT_BASES`, the zero-gradient row skip).  The slice count, the raster height and the block width
+    themselves are launch scalars (:func:`gemm_scalars`), not part of the name."""
     if base not in BASE_STAGES:
         raise ValueError(f"unknown base stage {base!r}")
     name = base
@@ -680,6 +710,12 @@ def stage_variant(
                 f"{base}: the only epilogue variants are the weight-gradient accumulate's TMA reduce-add and the bf16 fused cast's TMA store, got {epi_store!r}"
             )
         name += "_tma"
+    if dcnt:
+        if base not in DCNT_BASES or swab or name.endswith("_tma"):
+            raise ValueError(
+                f"{base}: the device-count row bound exists for {DCNT_BASES} only (not the swapped or TMA-epilogue forms)"
+            )
+        name += "_dcnt"
     return name
 
 
@@ -699,6 +735,7 @@ def _parse_stage(stage: str) -> tuple[str, tuple[tuple[str, Any], ...]]:
         swab=bool(m["swab"]),
         blocked=bool(m["gn"]),
         epi_store="tma" if m["tma"] else None,
+        dcnt=bool(m["dcnt"]),
     )
     if stage_variant(m["base"], **knobs) != stage:
         raise ValueError(f"not a stage name of this backend: {stage!r}")
@@ -706,7 +743,7 @@ def _parse_stage(stage: str) -> tuple[str, tuple[tuple[str, Any], ...]]:
 
 
 def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
-    """``(base, {count, tile_n, stages, split, swab, blocked, epi_store})`` of a stage name (the inverse of
+    """``(base, {count, tile_n, stages, split, swab, blocked, epi_store, dcnt})`` of a stage name (the inverse of
     :func:`stage_variant`; the knob keys are ``STAGE_KNOBS``)."""
     base, knobs = _parse_stage(stage)
     return base, dict(knobs)
@@ -1276,11 +1313,12 @@ def dx_stage(
     stages: Optional[int] = None,
     split: bool = False,
     swab: bool = False,
+    dcnt: bool = False,
 ) -> str:
     """Stage name of the dX GEMM run as ``k_slices`` K-slice work items per output tile: the plain-store ``gemm_dx``
     forms for one slice, the K-sliced reduction :data:`DX_RED_STAGE` forms above one; ``tile_n`` = the pair tile's
     column width, ``None`` / ``DX_TILE_WIDE`` = the wide default; ``stages`` = the operand-ring depth, ``None`` = the
-    table depth."""
+    table depth; ``dcnt``: the reduction form bounded by the device count of live rows (the plain store has none)."""
     if not 1 <= int(k_slices) <= DX_RED_SLICES_MAX:
         raise ValueError(
             f"the dX GEMM runs 1 .. {DX_RED_SLICES_MAX} K slices per tile, got {k_slices}"
@@ -1291,6 +1329,7 @@ def dx_stage(
         stages=stages,
         split=split,
         swab=swab,
+        dcnt=bool(dcnt) and int(k_slices) > 1,
     )
 
 
@@ -2472,6 +2511,76 @@ def set_zero_weight_min_rows(rows: int) -> int:
     return previous
 
 
+# The smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip
+# (:func:`set_zero_dlogp_min_rows`, no environment variable; ``None`` = never).  The skip orders the rows on the device
+# and adds its count cells (a fixed handful of small launches per call, no host synchronization), so below the floor a
+# call keeps the shipped backward.
+ZERO_DLOGP_MIN_ROWS_DEFAULT: Optional[int] = 0
+_ZERO_DLOGP_MIN_ROWS: dict[str, Optional[int]] = {"rows": ZERO_DLOGP_MIN_ROWS_DEFAULT}
+
+
+def zero_dlogp_min_rows() -> Optional[int]:
+    """The smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip, ``None`` =
+    never (:func:`set_zero_dlogp_min_rows`; default :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT`)."""
+    return _ZERO_DLOGP_MIN_ROWS["rows"]
+
+
+def set_zero_dlogp_min_rows(rows: Optional[int]) -> Optional[int]:
+    """Set the smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip for the
+    following calls of this process (``0``: every eligible call; ``None``: never) and return the previous value.  Read
+    once per call; the binding key holds whether a call runs it."""
+    if rows is not None and (
+        isinstance(rows, bool) or int(rows) != rows or int(rows) < 0
+    ):
+        raise ValueError(
+            f"zero-dlogp min rows must be None or a non-negative integer, got {rows!r}"
+        )
+    previous = _ZERO_DLOGP_MIN_ROWS["rows"]
+    _ZERO_DLOGP_MIN_ROWS["rows"] = None if rows is None else int(rows)
+    return previous
+
+
+def zero_dlogp_partition(
+    labels: torch.Tensor,
+    dlogp: torch.Tensor,
+    row_index: torch.Tensor,
+    lse: torch.Tensor,
+    chunk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The zero-gradient row skip's row order of a compacted log-probability backward, on the device (no host
+    synchronization; capturable): ``(row_index, lse, scan, counts)``.
+
+    A valid row whose upstream gradient ``dlogp`` (FP32 ``[T]``) is ``+0`` or ``-0`` contributes exact zeros to ``dX``
+    and ``dW``; the others (a NaN included) are the live rows.  The returned ``row_index`` holds the forward's valid
+    rows (``row_index``, ascending) with the live rows first, each group in ascending order, and ``lse`` the forward's
+    compact statistic in that order; ``scan`` is the inclusive int32 count of live rows over the ``[T]`` rows (the
+    fused dX finalize's scan: ``scan[r] - 1`` is the position of a live row ``r``, and the rows past the live count are
+    never read), ``counts`` the int32 per-chunk count of live rows of the ``chunk``-row chunks (the ``_dcnt`` forms'
+    ``CNT``), at least one in the first chunk (whose weight-gradient GEMM stores its first K step)."""
+    rows = int(row_index.numel())
+    device = dlogp.device
+    live = torch.logical_and(labels.reshape(-1) >= 0, dlogp != 0)
+    scan = torch.cumsum(live, 0, dtype=torch.int32)
+    count = scan[-1:]
+    # live rows up to and including each valid row
+    before = scan.index_select(0, row_index)
+    position = torch.arange(rows, dtype=torch.int32, device=device)
+    # a live row goes to its rank among the live rows, a zero-gradient row after every live row, by its rank among them
+    dest = torch.where(
+        live.index_select(0, row_index), before - 1, count + position - before
+    )
+    dest = dest.long()
+    order = torch.empty_like(row_index).index_copy_(0, dest, row_index)
+    lse_ordered = torch.empty_like(lse).index_copy_(0, dest, lse)
+    num_chunks = -(-rows // int(chunk))
+    starts = torch.arange(
+        0, num_chunks * int(chunk), int(chunk), dtype=torch.int32, device=device
+    )
+    counts = torch.clamp(count - starts, 0, int(chunk))
+    counts[:1].clamp_(min=1)
+    return order, lse_ordered, scan, counts
+
+
 def zero_weight_split(
     problem: "Problem", compact: bool, min_rows: Optional[int] = None
 ) -> bool:
@@ -3048,6 +3157,10 @@ class Plan:
     # recompute writes ``dz`` itself (no ``row_grad``), the forward writes the statistics and the label column only
     logprob_dz: bool = False
     logprob_lbl: bool = False
+    # the zero-gradient row skip of the log-probability backward (:data:`DCNT_BASES`): the dz arm, the K-sliced dX
+    # reductions and the weight-gradient GEMMs run their ``_dcnt`` forms, bounded by the per-chunk device counts
+    # ``t["dcnt"]`` of the rows the call ordered first (:func:`zero_dlogp_partition`)
+    dcnt: bool = False
     # the kept-logits form of the log-probability entry (:class:`_KeptPlan`); not a field: the default plan is unchanged
     logprob_keep: ClassVar[bool] = False
 
@@ -3077,7 +3190,11 @@ class Plan:
         """The log-probability backward's recompute GEMM of chunk ``index``: the ``dz`` arm (:attr:`logprob_dz`), else
         the stats-free logits GEMM that ``row_grad`` follows."""
         stage = self.logits_stage(index, stats=False)
-        return LOGPROB_DZ_STAGE if self.logprob_dz else stage
+        return (
+            stage_variant(LOGPROB_DZ_STAGE, dcnt=self.dcnt)
+            if self.logprob_dz
+            else stage
+        )
 
     def dx_stage_of(self, index: int) -> str:
         """The dX GEMM form of chunk ``index``: the plain store (one slice) or the K-sliced reduction
@@ -3090,6 +3207,7 @@ class Plan:
             v.dx_stages,
             split=v.dx_split is not None,
             swab=v.dx_swab,
+            dcnt=self.dcnt,
         )
 
     def dw_acc_stage(self, index: int) -> str:
@@ -3097,7 +3215,10 @@ class Plan:
         raster height and the block width are launch scalars)."""
         v = self.variants_of(index)
         return stage_variant(
-            "gemm_dw_acc", blocked=v.dw_group_n is not None, epi_store=v.dw_epi_store
+            "gemm_dw_acc",
+            blocked=v.dw_group_n is not None,
+            epi_store=v.dw_epi_store,
+            dcnt=self.dcnt,
         )
 
     @property
@@ -3200,6 +3321,7 @@ class Plan:
                 epi_store="tma"
                 if v.dw_cast_tma
                 else None,  # the TMA form of the bf16 cast (dw_cast_tma_rule)
+                dcnt=self.dcnt,
             )
         return "scale_cast_f32" if fp32 else "scale_cast_bf16"
 
@@ -3245,6 +3367,7 @@ def make_plan(
     dx_slice_policy: Optional[str] = None,
     dx_red_min_rows: Optional[int] = None,
     logprob_keep: bool = False,
+    dcnt: bool = False,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (the K-sliced reduction form registered) picks each chunk's slice count
     with :func:`dx_slices` under ``dx_slice_policy`` (``None`` = :func:`dx_slice_policy`; ``dx_resident`` = the device's
@@ -3260,7 +3383,9 @@ def make_plan(
     the statistics) at the buffer extent ``min(chunk, T)``, whose raster-rule height the plan records.  ``logprob_dz`` /
     ``logprob_lbl`` (a log-probability plan of a record that registers them) run the entry's logits GEMM arms
     (:attr:`Plan.logprob_dz`, :attr:`Plan.logprob_lbl`).  ``logprob_keep`` (a log-probability plan, a registered
-    program): the kept-logits plan (:class:`_KeptPlan`), which runs neither arm."""
+    program): the kept-logits plan (:class:`_KeptPlan`), which runs neither arm.  ``dcnt`` (a log-probability plan
+    with the dz arm, a registered program): the zero-gradient row skip's ``_dcnt`` forms (:attr:`Plan.dcnt`); off when
+    a chunk takes a form without one (a weight-gradient TMA epilogue, the swapped dX tile)."""
     if (logprob_dz or logprob_lbl or logprob_keep) and problem.entry != "logprob":
         raise ValueError("the logits GEMM arms belong to the log-probability entry")
     if logprob_keep:
@@ -3337,6 +3462,18 @@ def make_plan(
             problem.hidden, min(int(problem.chunk), int(problem.num_rows)), arch
         )
         hidden_group = None if raster is None else raster[0]
+    dcnt = bool(
+        dcnt
+        and arch is not None
+        and problem.entry == "logprob"
+        and logprob_dz
+        and not logprob_keep
+        and not hidden_count
+        and not any(
+            v.dx_swab or v.dw_epi_store not in (None, "redsm") or v.dw_cast_tma
+            for v in variants
+        )
+    )
     return (_KeptPlan if logprob_keep else Plan)(
         problem,
         chunks,
@@ -3354,6 +3491,7 @@ def make_plan(
         bool(hidden_stats),
         logprob_dz=bool(logprob_dz),
         logprob_lbl=bool(logprob_lbl),
+        dcnt=dcnt,
     )
 
 
@@ -3996,7 +4134,7 @@ def side_stream_schedule(
             seen.add(index)
             if index > 0:
                 joins.add(pos)
-        if stage in ("row_grad", LOGPROB_DZ_STAGE):
+        if stage in ("row_grad", LOGPROB_DZ_STAGE, LOGPROB_DZ_DCNT_STAGE):
             forks.add(pos)
     after = chunk_keys[-1][0] + 1
     if after < len(keys):
@@ -4322,7 +4460,21 @@ def stage_values(
         )
     else:
         raise ValueError(f"unknown stage {stage!r}")
+    _dcnt_value(stage, t, plan, index, values)
     return values
+
+
+def _dcnt_value(
+    stage: str, t: dict[str, Any], plan: Plan, index, values: dict[str, Any]
+) -> None:
+    """The count cell ``CNT`` of a ``_dcnt`` GEMM form of chunk ``index`` (the chunk's element of the call's int32
+    ``t["dcnt"]``, :func:`zero_dlogp_partition`), added to ``values`` in place; nothing for any other stage."""
+    if stage in GEMM_STAGES and parse_stage(stage)[1]["dcnt"]:
+        if not plan.dcnt:
+            raise ValueError(
+                f"stage {stage!r} belongs to a plan of the zero-gradient row skip"
+            )
+        values.update(CNT=t["dcnt"][index : index + 1])
 
 
 def _slot_values(stage: str, t: dict[str, Any], plan: Plan, index) -> dict[str, Any]:
@@ -4417,6 +4569,7 @@ def _slot_values(stage: str, t: dict[str, Any], plan: Plan, index) -> dict[str, 
         )
     else:
         return stage_values(stage, t, plan, index)
+    _dcnt_value(stage, t, plan, index, values)
     return values
 
 
@@ -4595,7 +4748,9 @@ def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
             # the queued device-count recompute stored ``z``
             keys.append(("row_grad", index))
         elif plan.logprob_dz:
-            keys.append((LOGPROB_DZ_STAGE, index))  # the recompute stores ``dz`` itself
+            keys.append(
+                (plan.recompute_stage(index), index)
+            )  # the recompute stores ``dz`` itself (its ``_dcnt`` form under the zero-gradient row skip)
         else:
             keys.append((plan.logits_stage(index, stats=False), index))
             keys.append(("row_grad", index))
@@ -5149,6 +5304,7 @@ def prepare_lm_head_loss(
     logprob_lbl: Optional[bool] = None,
     dx_rule: Optional[tuple] = None,
     logprob_keep: bool = False,
+    dcnt: Optional[torch.Tensor] = None,
 ) -> LmHeadLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -5212,6 +5368,12 @@ def prepare_lm_head_loss(
     (:func:`forward_logprob_keep`, :func:`backward_logprob_keep`); the runner
     itself does not launch it (its ``forward`` / ``backward`` raise
     ``NotImplementedError``).
+
+    ``dcnt`` (log-probability entry, compacted rows ordered by
+    :func:`zero_dlogp_partition`): the int32 per-chunk counts of live rows; the
+    plan then runs the ``_dcnt`` forms (:attr:`Plan.dcnt`) where the record
+    registers every one it needs, and the shipped forms otherwise (the same
+    outputs: every row computed).
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -5325,7 +5487,11 @@ def prepare_lm_head_loss(
         dx_slice_policy=slice_policy,
         dx_red_min_rows=red_min_rows,
         logprob_keep=keep,
+        dcnt=dcnt is not None,
     )
+    if plan.dcnt and any(s not in stages for s in plan.stages):
+        # a record without the counted forms: every row computed
+        plan = replace(plan, dcnt=False)
     missing = [s for s in plan.stages if s not in stages]
     if missing:
         raise NotImplementedError(
@@ -5415,6 +5581,9 @@ def prepare_lm_head_loss(
             t["d_in"] = torch.empty((rows_loop,), dtype=torch.float32, device=device)
         else:
             t["d_in"] = d_in
+        if plan.dcnt:
+            _check_output(dcnt, "dcnt", (plan.num_chunks,), torch.int32)
+            t["dcnt"] = dcnt
     if plan.need_dx:
         t["dx_acc"] = output(dx_acc, "dx_acc", (rows_loop, H), torch.float32)
         if plan.dx_cast:
@@ -5603,9 +5772,11 @@ def logprob_backward_binding_key(
     hidden_count=False,
     logprob_dz=False,
     dx_rule=None,
+    zero_dlogp=False,
 ) -> tuple:
     """Cache key of a log-probability backward binding (as :func:`forward_binding_key`, the dX slice rule's settings
-    ``dx_rule`` included); ``logprob_dz`` the resolved recompute form (:func:`logprob_dz_default`).  ``lse`` (the
+    ``dx_rule`` included); ``logprob_dz`` the resolved recompute form (:func:`logprob_dz_default`), ``zero_dlogp``
+    whether the call runs the zero-gradient row skip (:func:`zero_dlogp_partition`).  ``lse`` (the
     forward's statistic) and ``dlogp`` enter by layout only (:func:`_layout`): the binding slots both per call and
     no plan reads their addresses, so a backward whose ``lse`` / ``dlogp`` the caching allocator placed elsewhere --
     each forward allocates a fresh ``lse`` -- runs from the remembered binding instead of binding again."""
@@ -5626,6 +5797,7 @@ def logprob_backward_binding_key(
         bool(dx_finalize),
         bool(hidden_count),
         bool(logprob_dz),
+        bool(zero_dlogp),
         _rule_key(dx_rule),
     )
 
@@ -6012,6 +6184,7 @@ class _Binding:
         hidden=None,
         dw_stream: str = "auto",
         fill_side: bool = False,
+        dcnt: Optional[torch.Tensor] = None,
     ):
         p, plan = self.plan.problem, self.plan
         T, H, V = plan.rows, p.hidden, p.vocab
@@ -6028,6 +6201,12 @@ class _Binding:
             t["d_in"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         else:
             t["d_in"] = dlogp
+        if plan.dcnt:
+            if dcnt is None:
+                raise ValueError(
+                    "the remembered binding runs the zero-gradient row skip: pass its counts"
+                )
+            t["dcnt"] = dcnt
         join = (
             _side_fill_dx_acc(t, plan, self.device, self.device_index, T)
             if fill_side and plan.need_dx
@@ -7082,13 +7261,24 @@ def finalize_dx(
     num_rows: Optional[int],
     *,
     backend: str = "cake",
+    scan: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """The dX output boundary: ``bf16(g * acc)`` restored to the caller's ``[num_rows, H]`` rows.  Every row valid
     (``row_index`` None): :func:`scale_cast`, already one pass over every row.  Compacted rows with the forward's
     valid-row mask (``row_valid``: the fused dX finalize): the inclusive int32 scan -- one ``cumsum``, issued here
     behind the backward's queued GEMMs -- and one :func:`scale_cast_scatter` launch.  Compacted rows without the mask
     (the forward ran with ``dx_finalize=False``): the flat cast, then :func:`scatter_rows`
-    (zero fill + ``index_copy_``).  All three produce the same bits."""
+    (zero fill + ``index_copy_``).  All three produce the same bits.  ``scan`` (the zero-gradient row skip,
+    :func:`zero_dlogp_partition`): the inclusive int32 scan of the rows ``acc`` holds, already formed (``row_valid``
+    is then not read): the accumulator's rows past the scan's count are never read and those output rows are zeros."""
+    if row_index is not None and scan is not None:
+        if num_rows is None:
+            raise ValueError(
+                "finalize_dx needs num_rows (the caller's T) with row_index"
+            )
+        return scale_cast_scatter(
+            acc, grad, row_index, scan, int(num_rows), backend=backend
+        )
     if row_index is None:
         return scale_cast(acc, grad, torch.bfloat16, backend=backend)
     if num_rows is None:
@@ -7455,6 +7645,33 @@ def _forward_logprob_rows(
     return logp, lse, runner.memory
 
 
+def _zero_dlogp_skip(
+    device: torch.device,
+    row_index: Optional[torch.Tensor],
+    backend: str,
+    dz_arm: bool,
+    need_dx: bool,
+    fused_dx: bool,
+) -> bool:
+    """Whether a log-probability backward that reuses the forward's row index runs the zero-gradient row skip: a
+    compacted call (``row_index`` given) of at least :func:`zero_dlogp_min_rows` rows on the ``cake`` backend, with the
+    ``dz`` arm and, when it produces ``dX``, the fused dX finalize (which writes the skipped rows' exact zeros), on a
+    record that registers the counted dz arm (:data:`LOGPROB_DZ_DCNT_STAGE`)."""
+    floor = zero_dlogp_min_rows()
+    if (
+        floor is None
+        or row_index is None
+        or int(row_index.numel()) < floor
+        or backend != "cake"
+        or not dz_arm
+        or (need_dx and not fused_dx)
+        or device.type != "cuda"
+    ):
+        return False
+    module_name, _record = record_for(device)
+    return LOGPROB_DZ_DCNT_STAGE in registered_stages(module_name)
+
+
 def backward_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -7492,7 +7709,14 @@ def backward_logprob(
     :func:`gemm_tuning_default`) as in :func:`forward_loss`.  ``logprob_dz`` (default
     :func:`logprob_dz_default`): each chunk's recompute writes ``dz`` from the logits GEMM's
     epilogue instead of storing the logits for ``row_grad`` (bitwise the same ``dz``, hence the same ``dW`` and the
-    same ``dX`` operands; a chunk of more than one dX slice adds them in an unordered FP32 reduction)."""
+    same ``dX`` operands; a chunk of more than one dX slice adds them in an unordered FP32 reduction).
+
+    Zero-gradient row skip (:func:`zero_dlogp_partition`; a compacted backward that reuses the forward's row index,
+    with the ``dz`` arm and, when it produces ``dX``, the fused dX finalize, of at least :func:`zero_dlogp_min_rows`
+    rows, on a record with the ``_dcnt`` forms): the chunk loop takes the valid rows whose ``dlogp`` is nonzero first and
+    its dz, dX and dW GEMMs bound their work by the per-chunk device count of those rows (no host synchronization;
+    capturable).  The rows of a zero ``dlogp`` get exact-zero ``dX`` rows and add nothing to ``dW``; ``dX`` of every
+    other row is the same; ``dW`` sums the same nonzero products over the live rows in the new row order (FP32)."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_inputs(
@@ -7519,12 +7743,17 @@ def backward_logprob(
     )  # resolved once per call
     compact = bool(T and _resolve_compact(compact_rows))
     hc = None
+    skip = False  # the zero-gradient row skip (resolved below for a call that reuses the forward's row index)
+    scan = counts = None
     if row_index is not _RECOUNT:
         # the forward's valid-row index: the plan is known without a count (the valid-row mask of the fused dX finalize
         # is one device comparison, no synchronization)
         if row_index is not None and not compact:
             raise ValueError("a valid-row index belongs to a compacted backward")
-        row_valid = (labels >= 0) if (row_index is not None and fused_dx) else None
+        skip = _zero_dlogp_skip(X.device, row_index, backend, dz_arm, need_dx, fused_dx)
+        row_valid = (
+            (labels >= 0) if (row_index is not None and fused_dx and not skip) else None
+        )
     else:
         hc = _hidden_count(
             problem,
@@ -7556,6 +7785,10 @@ def backward_logprob(
         )
     _check_output(lse, "lse", (rows,), torch.float32)
     dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
+    if skip:
+        row_index, lse, scan, counts = zero_dlogp_partition(
+            labels, dlogp, row_index, lse, problem.chunk
+        )
     cache = BINDING_CACHE
     key = None
     valid_count = None if row_index is None else rows
@@ -7569,7 +7802,9 @@ def backward_logprob(
             return None
         if dx_cast:
             return scatter_rows(dx, row_index, T)
-        return finalize_dx(dx, None, row_index, row_valid, T, backend=backend)
+        return finalize_dx(
+            dx, None, row_index, row_valid, T, backend=backend, scan=scan
+        )
 
     if backend == "cake" and cache.enabled:
         key = logprob_backward_binding_key(
@@ -7588,11 +7823,12 @@ def backward_logprob(
             hidden_count=hc is not None,
             logprob_dz=dz_arm,
             dx_rule=rule,
+            zero_dlogp=skip,
         )
         binding = cache.lookup(key)
         if binding is not None:
             dx, dw = binding.backward_logprob(
-                X, W, labels, lse, dlogp, row_index, hc, stream_mode, fill_side
+                X, W, labels, lse, dlogp, row_index, hc, stream_mode, fill_side, counts
             )
             return finish_dx(dx), dw
     runner = prepare_lm_head_loss(
@@ -7615,6 +7851,7 @@ def backward_logprob(
         dw_stream=stream_mode,
         logprob_dz=dz_arm,
         dx_rule=rule,
+        dcnt=counts,
     )
     if hc is not None:
         binding = _Binding.from_runner(runner, hc)
