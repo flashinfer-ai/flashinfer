@@ -495,6 +495,7 @@ def _launch(
     num_docs: int,
     *,
     device_index: int,
+    arch: str,
     bwd_grid_mult: int = 1,
 ) -> tuple[dict[str, int], tuple[int, int, int]]:
     """The kernel scalars and the grid of one launch of ``record`` (the host plan of ``cake_jit``).
@@ -506,7 +507,10 @@ def _launch(
     unwritten.  The caller launches this grid, so a call plans it once.  A
     backward ``bwd_grid_mult`` above 1 launches that many times the record's
     untrimmed grid (``launch_grid`` without the row), never trimmed to whole
-    channel-tile ranks; the scalars do not depend on the grid.
+    channel-tile ranks; the scalars do not depend on the grid.  A backward
+    record's plan takes the device's architecture ``arch`` and the record's
+    route, so a row of ``cake_jit.TILE_OVERRIDES`` runs its narrower channel
+    tiles.
     """
 
     scalars = plan(
@@ -515,6 +519,8 @@ def _launch(
         num_docs,
         geometry=record["grid_rule"]["geometry"],
         role=record["role"],
+        arch=arch,
+        route=_loader.record_route(record, arch),
     )
     if bwd_grid_mult == 1:
         grid = launch_grid(record, device_index=device_index, C=C, S=S)
@@ -948,7 +954,7 @@ def cake_causal_conv1d_train_forward(
     names = _route(arch, kind, needs="this forward (bias / BF16 taps)", C=C, S=S)
     device_index = _device_index(device)
     scalars, grid = _launch(
-        _loader.MODULES[names[0]], S, C, num_docs, device_index=device_index
+        _loader.MODULES[names[0]], S, C, num_docs, device_index=device_index, arch=arch
     )
     values: dict[str, object] = {
         "x": x_flat,
@@ -1111,7 +1117,13 @@ def cake_causal_conv1d_train_backward(
     record = _loader.MODULES[names[0]]
     device_index = _device_index(device)
     scalars, grid = _launch(
-        record, S, C, num_docs, device_index=device_index, bwd_grid_mult=bwd_grid_mult
+        record,
+        S,
+        C,
+        num_docs,
+        device_index=device_index,
+        arch=arch,
+        bwd_grid_mult=bwd_grid_mult,
     )
     layout = _accumulator_layout(record, C, scalars["n_ch_tiles"])
     acc, work = _backward_accumulators(

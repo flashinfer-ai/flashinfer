@@ -1491,7 +1491,6 @@ kernel_cake_causal_conv1d_train_befc06774f6fee7c36ce(__nv_bfloat16* __restrict__
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    __threadfence();
     __syncthreads();
     if (tid == 0) {
         uint32_t done;
@@ -1506,50 +1505,61 @@ kernel_cake_causal_conv1d_train_befc06774f6fee7c36ce(__nv_bfloat16* __restrict__
     __syncthreads();
     float last = red[0];
     if (last != 0.0f) {
-        __threadfence();
         int ch0 = ct * ct_vec * 8;
-        float a4[4];
-        float tb_3[1];
+        int lim = ((C) < (ch0 + ct_vec * 8) ? (C) : (ch0 + ct_vec * 8));
         float z4[4];
         #pragma unroll
         for (int e = 0; e < 4; e++) {
             z4[e] = 0.0f;
         }
+        float a[16];
+        float tb_3[4];
         #pragma unroll 1
-        for (int c = ch0 + tid; c < ch0 + ct_vec * 8; c += 128) {
-            if (c < C) {
-                long long c64_2 = (long long)c;
-                {
-                    float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + c64_2 * 4);
-                    a4[0 + 0] = _v4.x;
-                    a4[0 + 1] = _v4.y;
-                    a4[0 + 2] = _v4.z;
-                    a4[0 + 3] = _v4.w;
-                }
-                {
-                    float4 _v4 = make_float4(z4[0 + 0], z4[0 + 1], z4[0 + 2], z4[0 + 3]);
-                    *reinterpret_cast<float4*>(dw_acc + c64_2 * 4) = _v4;
-                }
-                if ((flags & 2) != 0) {
-                    #pragma unroll
-                    for (int e_1 = 0; e_1 < 4; e_1++) {
-                        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_1)) = (__nv_bfloat16)a4[e_1];
-                    }
-                } else {
+        for (int c0_0 = ch0 + tid; c0_0 < ch0 + ct_vec * 8; c0_0 += 512) {
+            #pragma unroll
+            for (int j_8 = 0; j_8 < 4; j_8++) {
+                int cl = c0_0 + 128 * j_8;
+                if (cl < lim) {
+                    long long cl64 = (long long)cl;
                     {
-                        float4 _v4 = make_float4(a4[0 + 0], a4[0 + 1], a4[0 + 2], a4[0 + 3]);
-                        *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4) = _v4;
+                        float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + cl64 * 4);
+                        a[4 * j_8 + 0] = _v4.x;
+                        a[4 * j_8 + 1] = _v4.y;
+                        a[4 * j_8 + 2] = _v4.z;
+                        a[4 * j_8 + 3] = _v4.w;
+                    }
+                    {
+                        tb_3[j_8] = *reinterpret_cast<const float*>(dw_acc + ((long long)C * 4 + cl64));
                     }
                 }
-                long long bi = (long long)C * 4 + c64_2;
-                {
-                    tb_3[0] = *reinterpret_cast<const float*>(dw_acc + bi);
-                }
-                *(reinterpret_cast<float*>(dw_acc) + (bi)) = z4[0];
-                if ((flags & 8) != 0) {
-                    *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_3[0];
-                } else {
-                    *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_3[0];
+            }
+            #pragma unroll
+            for (int j_9 = 0; j_9 < 4; j_9++) {
+                int c = c0_0 + 128 * j_9;
+                if (c < lim) {
+                    long long c64_2 = (long long)c;
+                    long long bi = (long long)C * 4 + c64_2;
+                    {
+                        float4 _v4 = make_float4(z4[0 + 0], z4[0 + 1], z4[0 + 2], z4[0 + 3]);
+                        *reinterpret_cast<float4*>(dw_acc + c64_2 * 4) = _v4;
+                    }
+                    *(reinterpret_cast<float*>(dw_acc) + (bi)) = z4[0];
+                    if ((flags & 2) != 0) {
+                        #pragma unroll
+                        for (int e_1 = 0; e_1 < 4; e_1++) {
+                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_1)) = (__nv_bfloat16)a[4 * j_9 + e_1];
+                        }
+                    } else {
+                        {
+                            float4 _v4 = make_float4(a[4 * j_9 + 0], a[4 * j_9 + 1], a[4 * j_9 + 2], a[4 * j_9 + 3]);
+                            *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4) = _v4;
+                        }
+                    }
+                    if ((flags & 8) != 0) {
+                        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(db)) + (c64_2)) = (__nv_bfloat16)tb_3[j_9];
+                    } else {
+                        *(reinterpret_cast<float*>(reinterpret_cast<float*>(db)) + (c64_2)) = tb_3[j_9];
+                    }
                 }
             }
         }

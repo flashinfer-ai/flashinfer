@@ -41,6 +41,12 @@ grid, ``dx`` stays bitwise the deterministic default's, the gradients stay withi
 deterministic default, the workspace (the same size at every multiple) reads back zero after every launch, under
 CUDA Graph capture / replay and through the autograd entry (plain and checkpointed).
 
+The narrower channel tiles of ``TILE_OVERRIDES``: one row per architecture (``OVERRIDE_CASES``) launches the row's
+tiles, on a caller-owned workspace of the public size and on the package's, with ``dx`` bitwise the deterministic
+package's, the gradients within budget of the reference and of the deterministic package, and the workspace zero
+after the call.  On an architecture whose rows the package withholds (``WITHHELD_OVERRIDE_ARCHES``) the case has no
+override and launches ``channel_split``'s tiles, under the same checks.
+
 This suite names its package once, through ``tests.test_helpers.cake_package`` (key
 ``cake.cake_causal_conv1d_train``), and the deterministic package for the parity checks through the same table;
 a vendored build without the deterministic package skips those checks.  Every test skips until the exporter has
@@ -116,6 +122,16 @@ REPEAT_CASES = (
     (4097, 1160, (1000, 0, 3, 3094)),
 )
 PRECISION_CASES = ((250340, 512, "perf"), (250340, 1280, "perf"))
+# One row of ``TILE_OVERRIDES`` per architecture (route, S, C): the backward runs its narrower channel tiles there.
+# On an architecture of ``WITHHELD_OVERRIDE_ARCHES`` the package carries no rows: the case plans ``channel_split``.
+OVERRIDE_CASES = {
+    "sm_100a": ("bwd_bias_fp32g", 62585, 2048),
+    "sm_103a": ("bwd", 62585, 1536),
+    "sm_107a": ("bwd_dt", 62585, 768),
+}
+# The architectures whose ``TILE_OVERRIDES`` rows the package withholds (an empty table): sm_107a's rows wait for
+# timing on its 216-SM boards.
+WITHHELD_OVERRIDE_ARCHES = frozenset({"sm_107a"})
 # Wide channel counts on every route: C = 4096 (four documents, one empty) and C = 10240 (a packed q / k / v
 # projection width), at small S.
 WIDE_CASES = ((4097, 4096, (1000, 0, 3, 3094)), (2048, 10240, "perf"))
@@ -883,6 +899,87 @@ def test_repeated_launches_worst_case(case, kind, record_property) -> None:
     assert torch.equal(dx0, dx_d), (
         f"dx differs from the deterministic package ({kind} {case})"
     )
+
+
+@pytest.mark.parametrize("own_workspace", (True, False), ids=("own-ws", "pkg-ws"))
+def test_tile_override_row(own_workspace, monkeypatch, record_property) -> None:
+    """The architecture's ``OVERRIDE_CASES`` row of ``TILE_OVERRIDES`` launches the row's narrower channel tiles
+    (``ct_vec``, ``threads // ct_vec`` sub-tiles, ``ceil(C / vec / ct_vec)`` tiles) on a caller-owned workspace of
+    the public size, or the package's: ``dx`` within budget of the reference and bitwise the deterministic package's
+    (when importable), ``dweight`` / ``dbias`` within the route's budget of the reference and of the deterministic
+    package, the workspace zero after the call.  On an architecture of ``WITHHELD_OVERRIDE_ARCHES`` the case has no
+    override (``tile_override`` is ``None``) and launches ``channel_split``'s tiles, under the same checks."""
+
+    arch, device = _arch(), _device()
+    kind, S, C = OVERRIDE_CASES[arch]
+    _require_route(kind)
+    ct_vec = loader.tile_override(arch, kind, C, S)
+    (name,) = loader.selected_modules(arch, kind, C=C, S=S)
+    geometry = loader.MODULES[name]["grid_rule"]["geometry"]
+    split = dict(
+        zip(
+            ("ct_vec", "n_sub", "n_ch_tiles"),
+            loader.channel_split(C, geometry=geometry, role="bwd"),
+            strict=True,
+        )
+    )
+    if arch in WITHHELD_OVERRIDE_ARCHES:
+        assert ct_vec is None, (
+            f"{arch} {kind} C={C} S={S}: the package withholds {arch}'s TILE_OVERRIDES rows, yet plans ct_vec={ct_vec}"
+        )
+        wanted = split
+    else:
+        assert ct_vec is not None, f"{arch} {kind} C={C} S={S} is no TILE_OVERRIDES row"
+        wanted = {
+            "ct_vec": ct_vec,
+            "n_sub": geometry["threads"] // ct_vec,
+            "n_ch_tiles": -(-(C // geometry["vec"]) // ct_vec),
+        }
+        assert wanted != split, "the row must differ from the default split"
+    seen = []
+    launch = pkg.run_module
+
+    def record_launch(name, values, *, device_index, grid=None):
+        seen.append((name, {key: int(values[key]) for key in wanted}))
+        return launch(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    label = f"{arch} {kind} S={S} C={C} ct_vec={wanted['ct_vec']}"
+    x, w, cu, dy, b, policy = _route_inputs(S, C, "perf", kind, key=9)
+    workspace = (
+        pkg.cake_causal_conv1d_train_backward_workspace(
+            S, C, device, deterministic=False
+        )
+        if own_workspace
+        else None
+    )
+    dx, dw, db = _backward(x, w, cu, dy, b, policy, workspace=workspace)
+    assert seen == [(name, wanted)], f"{label}: launched {seen}"
+    worst_dw, worst_db = _check_grads(
+        dx, dw, db, reference_backward(x, w, cu, dy, b=b, policy=policy),
+        policy=policy, label=label,
+    )  # fmt: skip
+    held = workspace if own_workspace else _stream_workspace(device)
+    assert held is not None and int(torch.count_nonzero(held)) == 0, label
+    record_property("override_ct_vec", ct_vec)
+    record_property("worst_dweight_ratio_to_budget", worst_dw)
+    record_property("worst_dbias_ratio_to_budget", worst_db)
+    det = _det_or_none()
+    if det is None:
+        return
+    dx_d, dw_d, db_d = _det_backward(det, x, w, cu, dy, b, policy)
+    assert torch.equal(dx, dx_d), f"dx differs from the deterministic package ({label})"
+    for got, ref, what in ((dw, dw_d, "dweight"), (db, db_d, "dbias")):
+        if got is None:
+            continue
+        atol, rtol = _grad_tolerance(policy, got.dtype)
+        _assert_within(
+            got.float(),
+            ref.float(),
+            atol=atol,
+            rtol=rtol,
+            label=f"{what} vs det {label}",
+        )
 
 
 @pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
