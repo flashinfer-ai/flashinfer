@@ -7015,6 +7015,66 @@ def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
         _check_against_references(run, inp, entry="logprob", ceiling=True)
 
 
+
+@pytest.mark.parametrize("last", [650, 1792, 1793])
+def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
+    glm_weight, monkeypatch, last
+):
+    """Without zero-gradient rows (z = 0) a two-chunk backward under the skip gives the bits of the backward without
+    it: the partition runs, every row stays live, and ``dW`` and ``logp`` are bitwise those of the skip-off run.  A
+    last chunk of 650 or 1792 rows (``dw_cast_tma_rule`` holds) casts through the TMA cast's counted form
+    ``gemm_dw_cast_bf16_tma_dcnt``; 1793 rows (one row above the rule's bound, the negative control) takes the counted
+    per-thread cast, as the plan without the skip takes the per-thread cast."""
+    _require_zero_dlogp_skip()
+    module_name, record = cake_backend.record_for(CUDA)
+    rows = cake_backend.DEFAULT_CHUNK_SIZE + last
+    inp = _device_inputs(rows, "ce", W=glm_weight, ignore_frac=0.0)
+    dlogp = inp.dlogp
+    inp = dataclasses.replace(
+        inp,
+        dlogp=torch.where(dlogp == 0, torch.ones_like(dlogp), dlogp).contiguous(),
+    )
+    assert bool((inp.labels >= 0).all()) and bool((inp.dlogp != 0).all())
+    partition = cake_backend.zero_dlogp_partition
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(int(args[2].numel()))
+        return partition(*args, **kwargs)
+
+    cake_backend.BINDING_CACHE.clear()
+    monkeypatch.setattr(cake_backend, "zero_dlogp_partition", counted)
+    with _zero_dlogp_floor(0):
+        nd = _logprob_call(inp)
+    with _zero_dlogp_floor(None):
+        plain = _logprob_call(inp)
+    assert calls == [rows]
+    (skip_plan, _), (shipped, _) = _logprob_bwd_plans()
+    assert skip_plan.dcnt and not shipped.dcnt
+    assert skip_plan.num_chunks == 2 and skip_plan.chunks[-1][1] == last
+    tma = cake_backend.dw_cast_tma_rule(2, last, record["arch"])
+    assert tma == (last <= cake_backend.DW_CAST_TMA_MAX_ROWS[record["arch"]])
+    assert shipped.dw_cast_stage == (
+        "gemm_dw_cast_bf16_tma" if tma else "gemm_dw_cast_bf16"
+    )
+    if tma:
+        stages = cake_jit.registered_stages(module_name)
+        assert cake_backend.DW_CAST_TMA_DCNT_STAGE in stages
+        assert skip_plan.dw_cast_stage == cake_backend.DW_CAST_TMA_DCNT_STAGE
+    else:
+        assert skip_plan.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
+    for key in ("logp", "dW"):
+        assert _same_bits(nd[key], plain[key]), key
+    scale = float(plain["dX"].float().abs().max())
+    dx_diff = float((nd["dX"].float() - plain["dX"].float()).abs().max())
+    assert dx_diff <= scale * 2**-7, (dx_diff, scale)
+    print(
+        f"\nzero-dlogp skip on {record['arch']}, z = 0, last chunk {last} rows: "
+        f"cast {skip_plan.dw_cast_stage} (skip off: {shipped.dw_cast_stage}); "
+        f"dW and logp bitwise equal, max |dX - skip off| {dx_diff:.3g}"
+    )
+
+
 def test_device_zero_dlogp_default_floor_is_one_row_above_a_chunk(
     glm_weight, monkeypatch
 ):
