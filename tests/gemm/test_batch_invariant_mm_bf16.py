@@ -617,8 +617,6 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         bi_mm(a, b, out=off[1 : 1 + 16 * 4096].view(16, 4096))
     with pytest.raises(bi.BatchInvariantUnsupportedError, match='backend="auto"'):
         flashinfer.mm_bf16(a, b, backend="cudnn", batch_invariant=True)
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 bias"):
-        bi_mm(a, b, bias=torch.zeros(4096, dtype=torch.float32, device="cuda"))
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 output"):
         bi_mm(a, b, out_dtype=torch.float32)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="multiples of 8"):
@@ -632,13 +630,19 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         )
     out = bi_mm(a[:0], b)
     assert out.shape == (0, 4096) and out.dtype == torch.bfloat16
-    # a wrong-dtype `out` through the public API is FlashInfer's own contract (its common check raises before the flag
-    # path); the class's entry raises its typed error for the same input
+    # a wrong-dtype `out` or bias through the public API is FlashInfer's own contract (its common check raises before
+    # the flag path); the class's entry raises its typed error for the same inputs
     with pytest.raises(ValueError):
         bi_mm(a, b, out=torch.empty(16, 4096, dtype=torch.float16, device="cuda"))
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="out"):
         mm_bf16_batch_invariant(
             a, b, torch.empty(16, 4096, dtype=torch.float16, device="cuda")
+        )
+    with pytest.raises(ValueError):
+        bi_mm(a, b, bias=torch.zeros(4096, dtype=torch.float32, device="cuda"))
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 bias"):
+        mm_bf16_batch_invariant(
+            a, b, bias=torch.zeros(4096, dtype=torch.float32, device="cuda")
         )
 
 
@@ -666,6 +670,8 @@ def test_bias_matches_the_exact_reference(M, N, K):
     expected = bits(exact_biased_reference(a, b, bias))
     assert torch.equal(bits(bi_mm(a, b, bias=bias)), expected)
     assert torch.equal(bits(bi_mm(a, k_major(b), bias=bias)), expected)
+    # the biased and the unbiased chain are different specifications (the fractional bias moves the rounding)
+    assert not torch.equal(bits(bi_mm(a, b)), expected)
     C = chunks_for(N, K)
     recs = [Knobs((128, 64), (1, 1), False, True, "m", 1)]
     if C > 1:
@@ -729,8 +735,6 @@ def test_bias_bits_agree_across_configurations(M, N, K):
         assert torch.equal(
             bits(mm_bf16_batch_invariant(a, b, bias=bias, config=cfg, chunks=C)), ref
         ), f"grid={g}"
-    # the biased and the unbiased chain are different specifications
-    assert not torch.equal(bits(bi_mm(a, b)), ref)
 
 
 @needs_device
@@ -756,6 +760,8 @@ def test_unsupported_bias_inputs_raise():
     N = 4096
     bias = rnd_bf16(1, N, 153)[0]
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 bias"):
+        mm_bf16_batch_invariant(a, b, bias=bias.float())
+    with pytest.raises(ValueError):  # the public API's own dtype contract comes first
         bi_mm(a, b, bias=bias.float())
     with pytest.raises(bi.BatchInvariantUnsupportedError, match=r"shape \(4096,\)"):
         bi_mm(a, b, bias=rnd_bf16(1, N + 8, 154)[0])
@@ -768,8 +774,6 @@ def test_unsupported_bias_inputs_raise():
         bi_mm(a, b, bias=off[1 : 1 + N])
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 output"):
         bi_mm(a, b, bias=bias, out_dtype=torch.float32)
-    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 bias"):
-        mm_bf16_batch_invariant(a, b, bias=bias.float())
     out = bi_mm(a[:0], b, bias=bias)
     assert out.shape == (0, N) and out.dtype == torch.bfloat16
     # an aligned slice of a larger tensor is a bias like any other
