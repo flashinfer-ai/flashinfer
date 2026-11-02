@@ -1070,6 +1070,7 @@ def fp4_quantize(
     ----------
     input : torch.Tensor
         Input tensor of shape ``[M, K]`` with dtype fp16/bf16/fp8_quantized.
+        Any leading dimensions are folded into ``M`` (see Notes).
     global_scale : torch.Tensor, optional
         Global scale factor of shape ``[1]`` and dtype ``float32``.
     sf_vec_size : int
@@ -1113,8 +1114,15 @@ def fp4_quantize(
     -------
     Tuple[torch.Tensor, torch.Tensor]
         ``(x_q, sf)`` where ``x_q`` has shape ``[M, K/2]`` with dtype
-        ``FLOAT4_E2M1X2`` and ``sf`` is the scale-factor tensor whose
-        shape depends on the layout and ``sf_vec_size``.
+        ``FLOAT4_E2M1X2`` and ``sf`` is the ``uint8`` scale-factor tensor
+        with one scale per ``sf_vec_size`` elements along ``K``.  The
+        ``"cuda"`` backend returns a flat 1D buffer of length
+        ``round_up(M, R) * round_up(K / sf_vec_size, 4)`` for the swizzled
+        layouts (``R = 128`` for 128x4, ``R = 8`` for 8x4) and
+        ``M * K / sf_vec_size`` for the linear layout; the ``"cute-dsl"``
+        backend returns the same bytes as 2D
+        ``[round_up(M, R), round_up(K / sf_vec_size, 4)]`` (swizzled) or
+        ``[M, K / sf_vec_size]`` (linear).
 
     Raises
     ------
@@ -1139,6 +1147,13 @@ def fp4_quantize(
     -----
     Build the global scale from the same recipe:
     ``flashinfer.make_nvfp4_global_scale(..., nvfp4_4over6_config=<same value>)``.
+
+    Scale-factor layout convention: an input with more than two dimensions
+    is quantized as ``[prod(leading dims), K]``, so the leading dimensions
+    are folded into the row dimension and the swizzle padding is applied
+    once to the folded row count, not to each batch.  For a batched
+    ``[B, M, K]`` input whose consumer expects each batch padded
+    independently, use :func:`nvfp4_batched_quantize`.
     """
     if sf_vec_size != 16 and sf_vec_size != 32:
         raise NotImplementedError("sf_vec_size can only be 16 or 32")
@@ -1591,6 +1606,7 @@ def nvfp4_quantize(
     ----------
     a : torch.Tensor
         Input tensor of shape ``[M, K]`` with dtype fp16/bf16/float8_e4m3fn.
+        Any leading dimensions are folded into ``M`` (see Notes).
     a_global_sf : float or torch.Tensor
         Global scale factor. The CuTe-DSL backend accepts a host-side float
         or, for backward compatibility, a single-element tensor.
@@ -1643,8 +1659,15 @@ def nvfp4_quantize(
     -------
     Tuple[torch.Tensor, torch.Tensor]
         ``(x_q, sf)`` where ``x_q`` has shape ``[M, K/2]`` with dtype
-        ``FLOAT4_E2M1X2`` and ``sf`` is the scale-factor tensor (shape
-        depends on the layout and ``sf_vec_size``).  When
+        ``FLOAT4_E2M1X2`` and ``sf`` holds the E4M3 scale factors
+        (``uint8``), one per ``sf_vec_size`` elements along ``K``.  The
+        ``"cuda"`` backend returns a flat 1D buffer of length
+        ``round_up(M, R) * round_up(K / sf_vec_size, 4)`` for the swizzled
+        layouts (``R = 128`` for ``layout_128x4``, ``R = 8`` for
+        ``layout_8x4``) and ``M * K / sf_vec_size`` for ``layout_linear``;
+        the ``"cute-dsl"`` backend returns the same bytes as 2D
+        ``[round_up(M, R), round_up(K / sf_vec_size, 4)]`` (swizzled) or
+        ``[M, K / sf_vec_size]`` (linear).  When
         ``per_token_activation=True``, a third tensor containing per-token
         FP32 scales is also returned.
 
@@ -1661,6 +1684,13 @@ def nvfp4_quantize(
     With ``per_token_activation=True`` the pairing is checked when
     ``nvfp4_4over6`` is explicit and ``a_global_sf`` is readable without a
     device synchronization.
+
+    Scale-factor layout convention: this is the 2D quantizer.  An input
+    with more than two dimensions is quantized as ``[prod(leading dims), K]``,
+    so the leading dimensions are folded into the row dimension and the
+    swizzle padding is applied once to the folded row count, not to each
+    batch.  For a batched ``[B, M, K]`` input whose consumer expects each
+    batch padded independently, use :func:`nvfp4_batched_quantize`.
     """
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     nvfp4_4over6_is_explicit = nvfp4_4over6 is not _UNSET
@@ -1887,7 +1917,8 @@ def mxfp4_quantize(
     Parameters
     ----------
     a : torch.Tensor
-        Input tensor of shape ``[M, K]`` with dtype fp16/bf16.
+        Input tensor of shape ``[M, K]`` with dtype fp16/bf16.  Any leading
+        dimensions are folded into ``M`` (see Notes).
     backend : str
         Backend to use for quantization:
 
@@ -1907,14 +1938,26 @@ def mxfp4_quantize(
     Tuple[torch.Tensor, torch.Tensor]
         ``(x_q, sf)`` where ``x_q`` has shape ``[M, K/2]`` with dtype
         ``uint8`` (``FLOAT4_E2M1X2``) and ``sf`` is the UE8M0 scale-factor
-        tensor (``uint8``) whose shape depends on the chosen layout and
-        ``sf_vec_size`` (fixed at ``32`` here).
+        tensor (``uint8``) with one scale per 32 elements along ``K``.  The
+        ``"cuda"`` backend returns a flat 1D buffer of length
+        ``round_up(M, R) * round_up(K / 32, 4)`` for the swizzled layouts
+        (``R = 128`` for ``layout_128x4``, ``R = 8`` for ``layout_8x4``) and
+        ``M * K / 32`` for ``layout_linear``; the ``"cute-dsl"`` backend
+        returns the same bytes as 2D ``[round_up(M, R), round_up(K / 32, 4)]``
+        (swizzled) or ``[M, K / 32]`` (linear).
 
     Warnings
     --------
     The ``"cute-dsl"`` backend is **experimental** and not part of the
     stable API.  It may change or be removed in future versions without
     notice.  Use at your own risk for production workloads.
+
+    Notes
+    -----
+    Scale-factor layout convention: an input with more than two dimensions
+    is quantized as ``[prod(leading dims), K]``, so the leading dimensions
+    are folded into the row dimension and the swizzle padding is applied
+    once to the folded row count, not to each batch.
     """
     sfLayout = SfLayout(sfLayout)
     if backend == "cute-dsl":
@@ -2066,6 +2109,16 @@ def nvfp4_batched_quantize(
         ``[B, ceil(M / 128) * 128 * ceil(K / sf_vec_size / 4) * 4]``
         (M is padded to a multiple of 128 and ``K / sf_vec_size`` is
         rounded up to a multiple of 4).
+
+    Notes
+    -----
+    Scale-factor layout convention: unlike :func:`nvfp4_quantize`, which
+    folds the batch into the row dimension and pads the folded row count
+    once, this function pads each batch's ``M`` to 128 independently, so
+    row ``B_i`` of ``sf`` is exactly the 128x4-swizzled scale buffer of
+    ``a[i]``.  Its 3D view is
+    ``sf.view(B, round_up(M, 128), round_up(K / sf_vec_size, 4))``.  Use
+    this function for batched consumers that read a per-batch descale.
     """
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     # e4m3 input reaches the recipe-less FP8 branch of invokeFP4Quantization;

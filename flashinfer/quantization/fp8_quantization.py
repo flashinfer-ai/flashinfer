@@ -376,7 +376,8 @@ def mxfp8_quantize(
     input : torch.Tensor
         Input tensor of shape ``[M, K]`` with dtype fp16/bf16/fp8_quantized.
         The ``"cute-dsl"`` backend additionally supports fp32 input; the
-        ``"cuda"`` backend does not.
+        ``"cuda"`` backend does not.  Any leading dimensions are folded into
+        ``M`` (see Notes).
     is_sf_swizzled_layout : bool
         Whether to use the swizzled layout for scale factors.  Defaults to
         ``True``.
@@ -398,15 +399,31 @@ def mxfp8_quantize(
     -------
     Tuple[torch.Tensor, torch.Tensor]
         ``(x_q, sf)`` where ``x_q`` has shape ``[M, K]`` with dtype
-        ``FLOAT8_E4M3`` and ``sf`` is the scale-factor tensor whose
-        shape depends on the chosen layout and ``sf_vec_size`` (fixed at
-        ``32`` here).
+        ``FLOAT8_E4M3`` and ``sf`` is a flat 1D ``uint8`` (E8M0) tensor with
+        one scale per 32 elements along ``K``.  For the swizzled layouts its
+        length is ``round_up(M, R) * round_up(K / 32, 4)`` with ``R = 128``
+        for ``layout_128x4`` and ``R = 8`` for ``layout_8x4``; for
+        ``layout_linear`` it is ``M * K / 32`` in row-major order with no
+        padding.
 
     Warnings
     --------
     The ``"cute-dsl"`` backend is **experimental** and not part of the
     stable API.  It may change or be removed in future versions without
     notice.
+
+    Notes
+    -----
+    Scale-factor layout convention: ``sf`` is 1D whatever the input rank.
+    An input with more than two dimensions is quantized as
+    ``[prod(leading dims), K]``, so the leading dimensions are folded into
+    the row dimension and the swizzle padding is applied once to the folded
+    row count, not to each batch.  A batched ``[B, M, K]`` input therefore
+    yields ``round_up(B * M, R) * round_up(K / 32, 4)`` scales, not
+    ``B * round_up(M, R) * round_up(K / 32, 4)``; the two agree only when
+    ``M`` is a multiple of ``R``.  :func:`flashinfer.gemm.bmm_mxfp8` consumes this folded
+    layout (see its ``A_scale`` documentation).  The 2D view of a swizzled
+    buffer is ``sf.view(round_up(M, R), round_up(K / 32, 4))``.
     """
     sf_vec_size = 32
 
