@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public-API SM90 NVFP4/MXFP4 EP4 compute benchmark.
+"""Public-API SM90 NVFP4/MXFP4 EP2/EP4 compute benchmark.
 
-Run with torchrun --standalone --nproc-per-node=4. Weight preparation, input
+Run with torchrun --standalone --nproc-per-node=4 (or 2 for EP2). Weight preparation, input
 staging, allocation, cooldown and padding are outside CUDA events. The measured
 region is compute_staged(): MegaMoE plus top-k reduction. The deterministic
 common-BF16 fixture follows the historical input/weight recipe. Exact saved
@@ -315,7 +315,9 @@ def measure(torch, dist, group, layer, output, args, cycles, reference, retained
         medians = sorted(x["median_us"] for x in rows)
         score = medians[-1]
         threshold = max(12.0, 0.01 * score) if output.shape[0] >= 2048 else 12.0
-        gap = medians[2] - medians[1]
+        # A start skew shows as a gap between the two middle ranks (both ranks at EP2).
+        mid = len(medians) // 2
+        gap = medians[mid] - medians[mid - 1]
         attempts.append(
             {
                 "attempt": attempt,
@@ -338,13 +340,14 @@ def main():
         int(os.environ[name]) for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE")
     )
     if (
-        world != 4
+        world not in (2, 4)
         or args.experts % world
         or args.hidden % 128
         or args.intermediate % 128
     ):
         raise ValueError(
-            "requires EP4, experts divisible by four and K128-aligned widths"
+            "requires EP2 or EP4, experts divisible by the EP size and "
+            "K128-aligned widths"
         )
     affinity = cpu_binding(local_rank, world)
     import torch
