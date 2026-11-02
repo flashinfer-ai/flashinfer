@@ -4172,6 +4172,7 @@ def _forward(
     # the test hook's token-layout copies of the forward's normalized rows (only when the hook is on)
     hook = _l2n_record is not None and l2n != "off"
     qn_tok = kn_tok = None
+    fallback_rows: dict[str, torch.Tensor] = {}
     if hook and not fallback:
         qn_tok = _alloc((S, H, D), torch.bfloat16, ws.device)
         kn_tok = _alloc((S, H, D), torch.bfloat16, ws.device)
@@ -4202,9 +4203,15 @@ def _forward(
         )
 
     def qk_l2norm(lv: dict[str, Any] | None) -> None:
-        """The fallback's token-local normalization of the whole problem, once, before the intra program(s)."""
+        """The fallback's token-local normalization of the whole problem, once, before the intra program(s); the
+        hook copies its rows right away (on the slot views, WY overwrites them after the intra program)."""
         if lv is not None and p.dispatched("qk_l2norm", path):
             ws.run("qk_l2norm", {**lv, "num_heads": H}, path=path)
+            if hook:
+                fallback_rows["qn"], fallback_rows["kn"] = (
+                    lv["qn"].clone(),
+                    lv["kn"].clone(),
+                )
 
     def record_rows(a: types.SimpleNamespace, tables_a: tuple[torch.Tensor, ...]):
         """The hook's copy of the fused intra program's internal rows into token layout (right after the intra
@@ -4351,8 +4358,8 @@ def _forward(
     if hook:
         _record_l2n(
             "fwd",
-            qn=qn if fallback else qn_tok,
-            kn=kn if fallback else kn_tok,
+            qn=fallback_rows.get("qn", qn) if fallback else qn_tok,
+            kn=fallback_rows.get("kn", kn) if fallback else kn_tok,
             **({"qk_rstd": qk_rstd} if write_rstd else {}),
         )
     saved = None
