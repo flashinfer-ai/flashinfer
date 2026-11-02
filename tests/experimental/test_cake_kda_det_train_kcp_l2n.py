@@ -910,6 +910,147 @@ def test_l2n_refusal_precedes_the_operand_checks() -> None:
                 entry(**kw)
 
 
+class _NoCollectives:
+    """``torch.distributed`` as the KCP modules see it in :func:`test_l2n_refusal_messages_are_pinned`: the queries
+    pass through, any other attribute (a collective, a group constructor) raises :class:`_Stop`."""
+
+    _QUERIES = frozenset({"is_available", "is_initialized", "get_rank", "get_world_size"})
+
+    def __getattr__(self, name: str):
+        if name in self._QUERIES:
+            return getattr(dist, name)
+        raise _Stop(f"torch.distributed.{name} reached before the refusal")
+
+
+def _refusal_rows(T: int, H: int) -> list:
+    """``(row, operand overrides, error type, message)`` of the flag-on refusals of :func:`_prepare` /
+    :func:`cake_kcp._operands` in their order: the q / k view rule's metadata checks (:func:`cake_kcp._check_qk_view`),
+    the base address of the single-rank rule (``cake_backend._check_qk_raw``, the one per-rank check), the dtype and
+    shape, the contiguity of ``v`` / ``g`` / ``beta``, and two bad operands at once (the first one checked)."""
+    wide2 = torch.zeros(T, H, 2 * D, dtype=torch.bfloat16)
+    flat = torch.zeros(T * (H * D + 8) + 64, dtype=torch.bfloat16)
+    wide = torch.zeros(T, H * D + 8, dtype=torch.bfloat16)
+    rows = []
+    for n in ("q", "k"):
+        inner, head = wide2[..., ::2], wide2[..., :D]
+        token4 = flat.as_strided((T, H, D), (H * D + 4, D, 1))
+        overlap = flat.as_strided((T, H, D), (8, D, 1))
+        token_msg = (
+            f"{n}: use_qk_l2norm_in_kernel=True needs a token stride of a multiple of 8 elements and at least "
+            f"{H * D} (no overlapping token rows), got strides "
+        )
+        address_msg = (
+            f"{n}: the strides {(H * D + 8, D, 1)} (elements) or address are not accepted with "
+            "use_qk_l2norm_in_kernel=True: the head stride must be 128, the token stride a multiple of 8 elements "
+            f"(16 bytes) and at least 128 * H = {D * H} (token rows must not overlap), and the address 16-byte "
+            "aligned; a strided view is never copied"
+        )
+        rows += [
+            (f"{n}_inner_stride_2", {n: inner}, ValueError,
+             f"{n}: use_qk_l2norm_in_kernel=True needs innermost stride 1, got strides {inner.stride()}"),
+            (f"{n}_head_stride_256", {n: head}, ValueError,
+             f"{n}: use_qk_l2norm_in_kernel=True needs head stride {D}, got strides {head.stride()}"),
+            (f"{n}_token_stride_4_mod_8", {n: token4}, ValueError, token_msg + str(token4.stride())),
+            (f"{n}_overlapping_rows", {n: overlap}, ValueError, token_msg + str(overlap.stride())),
+            (f"{n}_base_plus_2_bytes", {n: wide[:, 1 : 1 + H * D].view(T, H, D)}, ValueError, address_msg),
+            (f"{n}_base_plus_8_bytes", {n: wide[:, 4 : 4 + H * D].view(T, H, D)}, ValueError, address_msg),
+            (f"{n}_fp32", {n: torch.zeros(T, H, D)}, ValueError, f"{n}: expected torch.bfloat16, got torch.float32"),
+            (f"{n}_shape", {n: torch.zeros(T, H + 1, D, dtype=torch.bfloat16)}, ValueError,
+             f"{n}: expected shape {(T, H, D)}, got {(T, H + 1, D)}"),
+        ]  # fmt: skip
+    v = torch.zeros(T, H, 2 * D, dtype=torch.bfloat16)[..., :D]
+    g = torch.zeros(T, H, 2 * D)[..., :D]
+    beta = torch.zeros(T, 2 * H, dtype=torch.bfloat16)[:, ::2]
+
+    def contiguous(n: str, x: torch.Tensor) -> str:
+        return f"{n}: must be contiguous (strides {x.stride()}); the kernels take no strided operands"
+
+    rows += [
+        ("v_strided", {"v": v}, ValueError, contiguous("v", v)),
+        ("g_strided", {"g": g}, ValueError, contiguous("g", g)),
+        ("beta_strided", {"beta": beta}, ValueError, contiguous("beta", beta)),
+        ("q_before_k", {"q": wide2[..., :D], "k": wide2[..., ::2]}, ValueError,
+         f"q: use_qk_l2norm_in_kernel=True needs head stride {D}, got strides {wide2[..., :D].stride()}"),
+        ("k_before_v", {"k": wide2[..., ::2], "v": v}, ValueError,
+         f"k: use_qk_l2norm_in_kernel=True needs innermost stride 1, got strides {wide2[..., ::2].stride()}"),
+    ]  # fmt: skip
+    return rows
+
+
+def test_l2n_refusal_messages_are_pinned(capable, monkeypatch) -> None:
+    """The flag-on refusals reachable through the KCP entries (forward, backward, autograd), each pinned to its error
+    type and exact message, so a change of the single-rank rule's implementation (``cake_backend._check_qk_raw``) or
+    of the order of the checks shows here: the q / k view rule, the dtype and shape, non-contiguous ``v`` / ``g`` /
+    ``beta`` / ``dout``, two bad operands (the first checked one reports), and the lean local arena
+    (``WorkspaceDetKcp(local_arena="lean")`` refuses the mode; a flag-off lean workspace given to a flag-on call is a
+    workspace of another mode).  Every refusal comes before any ``torch.distributed`` call (:class:`_NoCollectives`),
+    and the metadata refusals carry the same message on a rank without tokens."""
+    H = 4
+    ctx = _cpu_ctx()
+    ops = _cpu_ops(ctx, H)
+    T = int(ctx.T_r)
+    zctx = _cpu_zero_ctx()  # a rank without tokens
+    zops = _cpu_ops(zctx, H)
+    assert T > 1 and int(zctx.T_r) == 0
+    lean_off = cake_kcp.WorkspaceDetKcp(ctx, H, local_arena="lean", allocate=False)
+    for mod in (cake_kcp, cake_kcp_plan):
+        monkeypatch.setattr(mod, "dist", _NoCollectives())
+
+    def entries(o: dict, c) -> dict:
+        args = _args(o, c)
+        return {
+            "fwd": lambda **kw: cake_kcp.chunk_kda_det_fwd_kcp(*args, **kw),
+            "bwd": lambda **kw: cake_kcp.chunk_kda_det_bwd_kcp(*args, o["dout"], **kw),
+            "autograd": lambda **kw: cake_kcp.chunk_kda_det_kcp(*args, **kw),
+        }
+
+    def raises(fn, kw: dict, kind: type, message: str, where: str) -> None:
+        try:
+            fn(**kw)
+        except Exception as exc:  # the type is pinned below
+            assert type(exc) is kind, (where, type(exc), str(exc))
+            assert str(exc) == message, (where, str(exc))
+        else:
+            pytest.fail(f"{where}: no refusal")
+
+    for row, bad, kind, message in _refusal_rows(T, H):
+        for name, entry in entries({**ops, **bad}, ctx).items():
+            raises(entry, L2N, kind, message, f"{row}/{name}")
+    dout = torch.zeros(T, H, 2 * D, dtype=torch.bfloat16)[..., :D]
+    raises(
+        entries({**ops, "dout": dout}, ctx)["bwd"],
+        L2N,
+        ValueError,
+        f"dout: must be contiguous (strides {dout.stride()}); the kernels take no strided operands",
+        "dout_strided/bwd",
+    )
+    # the lean local arena
+    lean = (
+        'WorkspaceDetKcp: use_qk_l2norm_in_kernel=True runs on the replay local arena; local_arena="lean" is not '
+        "supported with the in-kernel Q/K L2 norm yet"
+    )
+    raises(
+        cake_kcp.WorkspaceDetKcp,
+        {"ctx": ctx, "H": H, "local_arena": "lean", "allocate": False, **L2N},
+        NotImplementedError,
+        lean,
+        "lean_workspace",
+    )
+    mode = (
+        "workspace: allocated with use_qk_l2norm_in_kernel=False, the call runs use_qk_l2norm_in_kernel=True; "
+        "allocate the WorkspaceDetKcp with use_qk_l2norm_in_kernel=True"
+    )
+    for name, entry in entries(ops, ctx).items():
+        raises(entry, {"workspace": lean_off, **L2N}, ValueError, mode, f"lean_flag_off_workspace/{name}")
+    # a rank without tokens: the same q / k metadata refusals with the same messages (the base address is per rank;
+    # an empty v / g / beta has no element a stride addresses; the shape message names the rank's token count)
+    for row, bad, kind, message in _refusal_rows(0, H):
+        if "base_plus" in row or row.endswith(("_shape", "_strided")):
+            continue
+        for name, entry in entries({**zops, **bad}, zctx).items():
+            raises(entry, L2N, kind, message, f"zero_token/{row}/{name}")
+
+
 # --------------------------------------------------------------------------- CPU rows: workspace and byte queries
 
 
