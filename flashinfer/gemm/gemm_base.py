@@ -414,10 +414,7 @@ def _cutlass_mm_bf16_requirement(
         raise ValueError(
             "You cannot use the CUTLASS backend with a bias. Use the TGV backend instead."
         )
-    if pdl:
-        raise ValueError(
-            "The CUTLASS backend does not support PDL. Use the TGV backend instead."
-        )
+    # No PDL launch: pdl=True runs it without PDL.
     _require_contiguous_a_column_major_b(a, b, "CUTLASS")
 
     _validate_bf16_output_dtype(out_dtype)
@@ -447,10 +444,7 @@ def _cublaslt_mm_bf16_requirement(
             raise ValueError("cuBLASLt bias must be on the same CUDA device as A.")
         if not bias.is_contiguous():
             raise ValueError("cuBLASLt bias must be contiguous.")
-    if pdl:
-        raise ValueError(
-            "The cuBLASLt backend does not support PDL. Use the TGV backend instead."
-        )
+    # No PDL launch: pdl=True runs it without PDL.
     _require_contiguous_a_column_major_b(a, b, "cuBLASLt")
     _validate_bf16_output_dtype(out_dtype)
 
