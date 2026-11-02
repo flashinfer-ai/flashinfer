@@ -116,13 +116,13 @@ ARG_PLANS: dict[str, list[list[str]]] = {
     ],
 }
 # The architectures whose scan programs draw every work unit from the workspace's
-# ticket tail (``cake_policy.TICKET_TAIL_BYTES``): every sm_100a / sm_103a scan
-# program.  Every completed scan launch leaves the ticket word at 0; the host
-# (``cake_backend``) zeroes the tail once when it prepares a runner on its own
-# workspace, and before every run on a caller-owned ``workspace_buffer`` (others
-# may write that buffer between runs).  sm_107a keeps the static unit
-# enumeration and leaves the tail unused.
-TICKET_TAIL_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a")
+# ticket tail (``cake_policy.TICKET_TAIL_BYTES``): every scan program on every
+# architecture but the physical kinds of ``POLICY[arch]["static_scan_kinds"]``
+# (the sm_107a l6 programs), which keep the static enumeration.  Every completed
+# scan launch leaves the ticket word at 0; the host (``cake_backend``) zeroes the
+# tail once when it prepares a runner on its own workspace, and before every run
+# on a caller-owned ``workspace_buffer`` (others may write that buffer between runs).
+TICKET_TAIL_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_107a")
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_dsa_indexer_det_topk_04db38446d526901fed3": {
         "role": "scan",
@@ -746,6 +746,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": None,
         "sample_class_rule": [8, 500],
         "lsf_programs": True,
+        "static_scan_kinds": [],
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,
@@ -823,6 +824,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": [4096, 375],
         "sample_class_rule": [8, 500],
         "lsf_programs": True,
+        "static_scan_kinds": [],
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,
@@ -916,6 +918,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_shift_rule": None,
         "sample_class_rule": None,
         "lsf_programs": False,
+        "static_scan_kinds": ["l6", "pair_l6"],
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,

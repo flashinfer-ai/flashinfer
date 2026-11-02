@@ -125,6 +125,7 @@ _COMMON = dict(
     sample_shift_rule=None,
     sample_class_rule=None,
     lsf_programs=False,
+    static_scan_kinds=[],
     far_sample=0,
     check_period_max=32,
     check_period_knob_max=64,
@@ -756,6 +757,11 @@ def test_policy_record_round_trip_and_validation():
         # the wide CTA pair on the snake walk only (sampled calls): a bool
         dict(wide_pair_snake_only=1),
         dict(wide_pair_snake_only=None),
+        # the static scan kinds: an ascending list of physical scan kinds
+        dict(static_scan_kinds="l6"),
+        dict(static_scan_kinds=["split"]),
+        dict(static_scan_kinds=["pair_l6", "l6"]),
+        dict(static_scan_kinds=["l6", "l6"]),
         # the units the CTA pair serves: an ascending list of unit geometries, not empty while pair_rule is set
         dict(pair_units="l6"),
         dict(pair_units=["pair_l6"]),
@@ -3337,7 +3343,7 @@ _TICKET_WORD_BYTES = 8 * 16
 def _assert_ticket_tail_zero(runner) -> None:
     """The ticket word reads 0 after every completed run (every completed scan launch leaves it 0; a
     backend-owned tail is zeroed once at prepare, a caller-owned one again before every run); None
-    on the architectures without a tail.  The segment order behind it is not checked: an :lsf launch
+    for a program without a tail (``static_scan_kinds``).  The segment order behind it is not checked: an :lsf launch
     leaves it written.  A static call (``runner._tail_static``, ``cake_policy.ticket_static_path``) never touches the word,
     which then holds whatever the buffer held: nothing to check."""
     if runner.ticket_tail is not None and not runner._tail_static:
@@ -3370,7 +3376,7 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
     )
     runner = _prepare(inputs)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail on this architecture")
+        pytest.skip("no ticket tail for this program (static_scan_kinds)")
     assert not runner._tail_shared  # backend-owned: nothing else writes the tail
     assert not runner._tail_static  # the call draws tickets
     torch.cuda.synchronize()
@@ -3411,10 +3417,10 @@ def _workspace_bytes(inputs: ref.IndexerInputs, device: torch.device) -> int:
 
 
 def _caller_owned_runner(inputs: ref.IndexerInputs, workspace: torch.Tensor):
-    """A runner on the caller-owned ``workspace`` (skips where the architecture has no ticket tail)."""
+    """A runner on the caller-owned ``workspace`` (skips where its program has no ticket tail)."""
     runner = _prepare(inputs, workspace_buffer=workspace)
     if runner.ticket_tail is None:
-        pytest.skip("no ticket tail on this architecture")
+        pytest.skip("no ticket tail for this program (static_scan_kinds)")
     assert runner._tail_shared
     return runner
 
@@ -3532,7 +3538,7 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         assert ref.same_bits(out, expected), fill
         _assert_ticket_tail_zero(runners[-1])
     if runners[-1].ticket_tail is None:
-        pytest.skip("no ticket tail on this architecture")
+        pytest.skip("no ticket tail for this program (static_scan_kinds)")
     assert runners[-1]._tail_shared and not run_memsets  # zeroed by prepare only
     assert not runners[-1]._tail_static  # the call draws tickets
     runner = runners[-1]
@@ -3586,6 +3592,63 @@ def test_caller_owned_workspace_graph_replay_restores_the_tail():
     torch.cuda.synchronize()
     _assert_ticket_tail_zero(runner)
     _judge_ok(_cloned(captured), ref.select_reference(inputs))
+
+
+def test_static_scan_kind_runner_has_no_ticket_tail_and_stays_exact_on_a_poisoned_workspace():
+    """A program of the record's ``static_scan_kinds`` (sm_107a: the l6 and CTA-pair l6 programs) keeps the static
+    enumeration on every call, also where the call's units exceed the grid: its runner gets no ticket tail (no memset
+    at prepare or run) and its rows stay bit-exact on a caller-owned buffer poisoned everywhere.  A drawing program on
+    the same architecture keeps its tail."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    arch = arch_for(device)
+    static_kinds = policy_for(arch).static_scan_kinds
+    if not static_kinds:
+        pytest.skip("every scan program of this architecture draws tickets")
+    found = {}
+    for (T, Tkv, S), sample in itertools.product(
+        (
+            (8192, 32768, 1),
+            (8192, 131072, 4),
+            (4096, 16384, 2),
+            (2048, 65536, 1),
+            (32768, 32768, 1),
+            (16384, 131072, 1),
+            (65536, 65536, 8),
+        ),
+        (None, 0),
+    ):
+        choice = cake_backend.plan_dsa_indexer_det_topk(
+            T, Tkv, S, top_k=2048, sample_tiles_max=sample
+        )
+        if cake_policy.ticket_static_path(choice):
+            continue  # one unit per CTA at most: no draw either way
+        static = choice.physical_kind in static_kinds
+        found.setdefault(static, (T, Tkv, S, sample))
+    assert True in found, (
+        "no geometry runs a static scan kind with more units than CTAs"
+    )
+    assert False in found, (
+        "no geometry runs a drawing scan program with more units than CTAs"
+    )
+    for static, (T, Tkv, S, sample) in sorted(found.items()):
+        inputs = ref.make_random_inputs(
+            [T // S] * S, [Tkv // S] * S, top_k=2048, seed=78, device="cuda"
+        )
+        extra = {} if sample is None else {"sample_tiles_max": sample}
+        expected = _cloned(_run(inputs, **extra))
+        shared = torch.empty(
+            _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+        )
+        shared.fill_(7)
+        runner = _prepare(inputs, workspace_buffer=shared, **extra)
+        assert (runner.choice.physical_kind in static_kinds) == static
+        assert (runner.ticket_tail is None) == static, runner.choice.scan_key
+        for _ in range(2):
+            out = runner()
+            torch.cuda.synchronize()
+            assert ref.same_bits(out, expected), runner.choice.scan_key
+        _assert_ticket_tail_zero(runner)
 
 
 def test_static_call_skips_the_tail_memset_and_never_touches_the_ticket_word():
@@ -3908,21 +3971,20 @@ def test_policy_is_validated_once_per_architecture(monkeypatch):
 
 
 def test_lsf_copy_runs_on_packed_calls_of_unequal_key_segments():
-    """Lever LSF (#7549): the ticket architectures ship the longest-first segment order copy of every scan program
-    (key suffix ``:lsf``, a program of its own); the host runs it on packed calls whose key segments are not all equal
-    and the program without it on one-segment calls and on packed calls of equal key segments
-    (``num_keys == S x max_seqlen_k``)."""
+    """Lever LSF (#7549): an architecture whose policy sets ``lsf_programs`` (a ticket architecture) ships the
+    longest-first segment order copy of every scan program (key suffix ``:lsf``, a program of its own); the host runs it
+    on packed calls whose key segments are not all equal and the program without it on one-segment calls and on packed
+    calls of equal key segments (``num_keys == S x max_seqlen_k``)."""
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
         scan = {k for k in keys if k.startswith("scan:")}
         copies = {k for k in scan if k.endswith(":lsf")}
-        ticket = arch in cake_jit.TICKET_TAIL_ARCHES
-        assert copies == ({k + ":lsf" for k in scan - copies} if ticket else set()), (
-            arch
-        )
+        lsf = policy_for(arch).lsf_programs
+        assert copies == ({k + ":lsf" for k in scan - copies} if lsf else set()), arch
         assert all(keys[k] != keys[k[: -len(":lsf")]] for k in copies), arch
-        assert policy_for(arch).lsf_programs == ticket, arch
+        # the copy reorders the ticket draws, so only a ticket architecture can ship it
+        assert not lsf or arch in cake_jit.TICKET_TAIL_ARCHES, arch
     p = policy_for("sm_100a")
     one = _select(p, 65536, 65536)
     assert not one.lsf and not one.scan_key.endswith(":lsf")
@@ -3942,3 +4004,23 @@ def test_lsf_copy_runs_on_packed_calls_of_unequal_key_segments():
     assert _select(p, 8 * 32768, 8 * 32768, S=8).lsf  # no bound: the host cannot tell
     off = DispatchPolicy.from_record(dict(p.record(), lsf_programs=False))
     assert not _select(off, 8 * 32768, 8 * 32768, S=8, max_seqlen_k=65536).lsf
+
+
+def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
+    """Every architecture is a ticket architecture; a record's ``static_scan_kinds`` names the physical scan kinds whose
+    programs keep the static enumeration there (sm_107a: the l6 and CTA-pair l6 programs), each a kind the
+    architecture registers, and a kind with an ``:lsf`` copy is never static (the copy reorders ticket draws)."""
+    assert tuple(cake_jit.POLICY) == cake_jit.TICKET_TAIL_ARCHES
+    assert {arch: policy_for(arch).static_scan_kinds for arch in cake_jit.POLICY} == {
+        "sm_100a": [],
+        "sm_103a": [],
+        "sm_107a": ["l6", "pair_l6"],
+    }
+    if not cake_jit.PROGRAM_KEYS:
+        pytest.skip("placeholder registry")
+    for arch, keys in cake_jit.PROGRAM_KEYS.items():
+        scan = [k.split(":") for k in keys if k.startswith("scan:")]
+        kinds = {parts[1] for parts in scan}
+        lsf_kinds = {parts[1] for parts in scan if parts[-1] == "lsf"}
+        for kind in policy_for(arch).static_scan_kinds:
+            assert kind in kinds and kind not in lsf_kinds, (arch, kind)
