@@ -1659,6 +1659,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS)
  *   cluster while the grid still fills less than half of the SMs. Tuned on GH200 (132 SMs);
  *   other architectures keep the single-CTA kernels until they are measured.
  */
+template <SplitRowSamplingMode MODE>
 inline uint32_t GetSplitRowSamplingClusterSize(uint32_t batch_size, uint32_t d) {
   constexpr uint32_t kTargetChunk = 26624, kMinChunk = 4096;
   int device, major = 0, num_sms = 0, max_smem = 0;
@@ -1677,11 +1678,13 @@ inline uint32_t GetSplitRowSamplingClusterSize(uint32_t batch_size, uint32_t d) 
   if (!fits(c)) return 0;
   // With 8-CTA clusters the single-CTA kernels catch up on large grids. Measured crossovers:
   // about 24 CTAs per SM for chunks above the target (one resident CTA per SM) and about 64 for
-  // chunks above 16K floats. 2- and 4-CTA clusters stayed ahead up to batch 8192.
+  // chunks above 16K floats. Top-p falls behind sooner on H100, so it leaves at 16 and 32.
+  // 2- and 4-CTA clusters stayed ahead up to batch 8192.
   if (c == SPLIT_ROW_SAMPLING_MAX_CLUSTER) {
+    constexpr bool kTopP = MODE == SplitRowSamplingMode::kTopP;
     const uint32_t num_ctas = batch_size * c;
-    if (ceil_div(d, c) > kTargetChunk && num_ctas >= 24u * num_sms) return 0;
-    if (ceil_div(d, c) > 16384 && num_ctas >= 64u * num_sms) return 0;
+    if (ceil_div(d, c) > kTargetChunk && num_ctas >= (kTopP ? 16u : 24u) * num_sms) return 0;
+    if (ceil_div(d, c) > 16384 && num_ctas >= (kTopP ? 32u : 64u) * num_sms) return 0;
   }
   while (c < SPLIT_ROW_SAMPLING_MAX_CLUSTER &&
          batch_size * c * 2 <= static_cast<uint32_t>(num_sms) && ceil_div(d, c * 2) >= kMinChunk) {
@@ -1942,7 +1945,8 @@ cudaError_t TopKSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* 
                                  bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
                                  uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0,
                                  uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
-  if (const uint32_t cluster_size = GetSplitRowSamplingClusterSize(batch_size, d);
+  if (const uint32_t cluster_size =
+          GetSplitRowSamplingClusterSize<SplitRowSamplingMode::kTopK>(batch_size, d);
       cluster_size > 1) {
     const cudaError_t status =
         SplitRowRejectionSamplingFromProb<SplitRowSamplingMode::kTopK, T, IdType>(
@@ -1980,7 +1984,8 @@ cudaError_t TopPSamplingFromProb(T* probs, IdType* output, bool* valid, IdType* 
                                  bool deterministic, uint64_t* seed_arr, uint64_t seed_val,
                                  uint64_t* offset_arr, uint64_t offset_val, cudaStream_t stream = 0,
                                  uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
-  if (const uint32_t cluster_size = GetSplitRowSamplingClusterSize(batch_size, d);
+  if (const uint32_t cluster_size =
+          GetSplitRowSamplingClusterSize<SplitRowSamplingMode::kTopP>(batch_size, d);
       cluster_size > 1) {
     const cudaError_t status =
         SplitRowRejectionSamplingFromProb<SplitRowSamplingMode::kTopP, T, IdType>(
@@ -2050,7 +2055,8 @@ cudaError_t TopKTopPSamplingFromProb(T* probs, IdType* top_k_arr, T* top_p_arr, 
                                      uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
                                      uint64_t offset_val, cudaStream_t stream = 0,
                                      uint32_t seed_stride = 0, uint32_t offset_stride = 0) {
-  if (const uint32_t cluster_size = GetSplitRowSamplingClusterSize(batch_size, d);
+  if (const uint32_t cluster_size =
+          GetSplitRowSamplingClusterSize<SplitRowSamplingMode::kTopKTopP>(batch_size, d);
       cluster_size > 1) {
     const cudaError_t status =
         SplitRowRejectionSamplingFromProb<SplitRowSamplingMode::kTopKTopP, T, IdType>(
