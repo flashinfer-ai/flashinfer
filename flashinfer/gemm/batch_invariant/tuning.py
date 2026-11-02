@@ -36,6 +36,7 @@ from .api import (
     bmm_fp8_batch_invariant,
     mm_bf16_batch_invariant,
     part_of,
+    prepare_bias,
     prepare_bmm_fp8_operands,
     prepare_operands,
 )
@@ -96,7 +97,7 @@ def knobs_from_tactic(t: Any) -> Knobs:
 
 
 def _tuning_config(out_index: int) -> TuningConfig:
-    """inputs = [a, b, (the scales,) out]: a's row count (its second-to-last mode, also for the batched operands) is the
+    """inputs = [a, b, out, bias] / [A, B, A_scale, B_scale, out]: a's row count (its second-to-last mode, also for the batched operands) is the
     tuned dimension (the hybrid token buckets of the GEMM backends), out follows it; b is static and lives in the profiling
     arena so that its layout is the caller's."""
     return TuningConfig(
@@ -220,8 +221,12 @@ class BatchInvariantGemmRunner(TunableRunner):
             return bmm_fp8_batch_invariant(
                 A, B, sa, sb, out.dtype, out, config=cfg, chunks=self.chunks
             )
-        a, b, out = inputs
-        return mm_bf16_batch_invariant(a, b, out, config=cfg, chunks=self.chunks)
+        a, b, out, bias = (
+            inputs  # bias: the (N,) vector or None (the autotuner keeps a None input as is)
+        )
+        return mm_bf16_batch_invariant(
+            a, b, out, bias=bias, config=cfg, chunks=self.chunks
+        )
 
 
 BatchInvariantBf16GemmRunner = (
@@ -246,23 +251,24 @@ def mm_bf16_batch_invariant_auto(
     backend: str,
 ) -> torch.Tensor:
     """``flashinfer.mm_bf16(a, b, ..., batch_invariant=True)``: the class behind the FlashInfer API's autotuner.
-    ``pdl`` is accepted and launches nothing differently: the class's kernels run in plain stream order."""
+    ``bias`` (bf16, (N,)) selects the biased chain (the bias added once in fp32 to the reduced accumulator before the
+    single rounding); ``pdl`` is accepted and launches nothing differently: the class's kernels run in plain stream
+    order."""
     if backend != "auto":
         raise unsupported(
             CLASS,
             f"backend={backend!r} together with batch_invariant=True",
             'backend="auto" (the flag selects the batch-invariant class in place of the backends)',
         )
-    if bias is not None:
-        raise unsupported(CLASS, "a bias", "bias=None (no fused epilogue)")
     if out_dtype != torch.bfloat16:
         raise unsupported(CLASS, f"out_dtype={out_dtype}", "bf16 output")
     # every typed check runs before the autotuner sees the shape: it only ever profiles shapes the class accepts
     a, out, b_major, M, N, K = prepare_operands(a, b, out)
+    bias = prepare_bias(bias, N, a)
     if M == 0:
         return out
     runner = _runner("mm_bf16", "bf16", b_major, chunks_for(N, K), *part_of(a.device))
-    inputs = [a, b, out]
+    inputs = [a, b, out, bias]
     chosen, tactic = AutoTuner.get().choose_one(
         CUSTOM_OP, [runner], TUNING_CONFIG, inputs
     )
