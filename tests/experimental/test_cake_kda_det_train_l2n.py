@@ -466,3 +466,39 @@ def test_kda_reference_normalizes_and_pulls_back_like_fp64() -> None:
     dx = kda_l2n.l2n_pullback(x, r, Dq)
     err = (dx.double() - dx64).abs().max() / dx64.abs().max()
     assert err < 1e-5, err
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# plans
+
+
+@pytest.mark.parametrize("arch", list(cake_jit.ARCHES))
+def test_flag_off_plans_are_the_default_plans(arch: str) -> None:
+    for S, N, H in ((256, 1, 2), (5000, 3, 16), (64 * 40, 300, 64)):
+        default = cake_backend.plan(S, N, H, 148, arch)
+        assert cake_backend.plan(S, N, H, 148, arch, l2n="off") is default
+        assert default.l2n == "off"
+        assert not any(
+            stage in ("qk_l2norm", "qk_apply", "qk_pullback") and name is not None
+            for by_stage in default.records.values()
+            for stage, name in by_stage.items()
+        )
+
+
+@pytest.mark.parametrize("arch", list(cake_jit.ARCHES))
+def test_l2n_plans_need_l2n_records(arch: str) -> None:
+    """A mode whose records the build does not ship is refused at planning (no silent route)."""
+    for mode in ("fused", "fallback"):
+        ships = all(
+            any(mode in cake_jit.MODULES[n].get("l2n", ["off"]) for n in cake_jit.records_of_stage(stage))
+            for stage in ("fwd_intra", "bwd_prep", "glm_intra")
+        )
+        if ships:
+            p = cake_backend.plan(256, 1, 2, 148, arch, l2n=mode)
+            assert p.l2n == mode and p.gate_fused
+            assert p.dispatched("qk_pullback", "light") == (mode == "fallback")
+        else:
+            with pytest.raises(ValueError, match="no record serves the in-kernel Q/K L2 norm mode"):
+                cake_backend.plan(256, 1, 2, 148, arch, l2n=mode)
+    with pytest.raises(ValueError, match="l2n must be one of"):
+        cake_backend.plan(256, 1, 2, 148, arch, l2n="on")
