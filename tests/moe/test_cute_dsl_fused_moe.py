@@ -2478,7 +2478,7 @@ class TestCuteDslFusedMoeFunctional:
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             clamped_relu2_limit=(
-                torch.tensor([0.25], dtype=torch.float32, device="cuda")
+                torch.tensor([0.3], dtype=torch.float32, device="cuda")
                 if activation_type == ActivationType.ClampedRelu2
                 else None
             ),
@@ -2831,7 +2831,7 @@ class TestCuteDslFusedMoeFunctional:
                 captured = wrapper.run(**inputs)
             graph.replay()
             assert_cute_dsl_moe_bits(captured, exact)
-            limit.fill_(0.5)
+            limit.fill_(0.7)
             graph.replay()
             changed = _compute_moe_quant_mode_reference(
                 tensors,
