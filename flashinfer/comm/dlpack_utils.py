@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ctypes
+import operator
 from ctypes import (
     CFUNCTYPE,
     POINTER,
@@ -198,8 +199,8 @@ def pack_strided_memory(
 ) -> torch.Tensor:
     r"""Pack a strided device allocation as a PyTorch tensor view.
 
-    A fresh DLPack capsule is created on every call, so each tensor returned
-    by this function consumes its own capsule.
+    The caller must keep the allocation mapped until the returned tensor and
+    all its derived views have been released. This function does not free it.
 
     Parameters
     ----------
@@ -221,10 +222,45 @@ def pack_strided_memory(
     torch.Tensor
         A tensor that views the provided device memory.
     """
-    # Create a new capsule each time
-    capsule_wrapper = create_dlpack_capsule(
-        ptr, segment_size, segment_stride, num_segments, dtype, dev_id
+    if dtype not in (
+        torch.float8_e5m2,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.float16,
+        torch.float32,
+        torch.float64,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+    ):
+        raise NotImplementedError(dtype)
+    ptr, segment_size, segment_stride, num_segments = map(
+        operator.index, (ptr, segment_size, segment_stride, num_segments)
     )
-    torch_tensor = torch.utils.dlpack.from_dlpack(capsule_wrapper.capsule)
-    torch_tensor._capsule_wrapper = capsule_wrapper
-    return torch_tensor
+    if min(ptr, segment_size, segment_stride, num_segments) < 0:
+        raise ValueError("Pointer, sizes and stride must be nonnegative")
+    element_size = torch.empty(0, dtype=dtype, device="cpu").element_size()
+    width = segment_size // element_size
+    stride = segment_stride // element_size
+    nbytes = (
+        ((num_segments - 1) * stride + width) * element_size
+        if num_segments and width
+        else 0
+    )
+    if max(ptr, num_segments, width, stride, nbytes) > 2**63 - 1:
+        raise ValueError("External memory geometry exceeds signed 64-bit limits")
+    construct_storage = getattr(torch._C, "_construct_storage_from_data_pointer", None)
+    if construct_storage is None:
+        raise RuntimeError("PyTorch native external-memory storage API is required")
+    device = torch.device("cuda", dev_id)
+    # Tensor attributes can die before its storage. Native non-owning storage
+    # keeps metadata in C++ without a Python deleter or ownership of ptr.
+    storage = construct_storage(ptr, device, nbytes)
+    return torch.empty(0, dtype=dtype, device=device).set_(
+        storage, 0, (num_segments, width), (stride, 1)
+    )
