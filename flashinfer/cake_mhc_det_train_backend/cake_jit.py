@@ -7804,7 +7804,7 @@ FN_SPLIT_GRID = {"b16": 256, "tv128": 256, "tv128_t128": 512}
 # 1.022-1.024 at 1024, 1.015-1.017 at 2048, 1.005-1.011 at 4096. A band keeps the rows where every session reads at
 # least 1 % faster: sm_100a to 4096 tokens, sm_103a to 2048. sm_107a (the same 256-thread form in place of the b16 fnp
 # split and the 128-thread tv128_t128 fnTp split): provisional, to be set from its R200 measurement.
-FN_SPLIT_CARRY = {
+FN_SPLIT_CARRY: dict[str, dict[str, Any]] = {
     "sm_100a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
     "sm_103a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 2048),)},
     "sm_107a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},

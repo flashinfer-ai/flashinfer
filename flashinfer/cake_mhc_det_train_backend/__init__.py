@@ -1359,10 +1359,20 @@ def _forward_stats(
                 arch, "fwd_recompute", rows, hidden, index, _PATH_CHECKPOINT, carry
             )
             views = _fast_workspace(workspace, "fwd", rows, hidden, index, X)
-            values = (fn, X, X.view(route.x_flat), scale, base, stats, rms_eps, hc_eps)
+            fast_values = (
+                fn,
+                X,
+                X.view(route.x_flat),
+                scale,
+                base,
+                stats,
+                rms_eps,
+                hc_eps,
+            )
             _launch_route(
                 route,
-                (values + (fnTp,) if carry else values) + route.workspace(views),
+                (fast_values + (fnTp,) if carry else fast_values)
+                + route.workspace(views),
                 index,
             )
             return stats
@@ -1946,7 +1956,7 @@ class _MHCTrainState:
         self.save_stats = bool(save_stats)
         self.rms_eps, self.hc_eps, self.sinkhorn_iters = rms_eps, hc_eps, sinkhorn_iters
         self.workspace, self.backward_workspace = workspace, backward_workspace
-        self.fn_key = None
+        self.fn_key: Optional[tuple[Any, ...]] = None
 
     def replay(
         self, X: torch.Tensor, fnTp: Optional[torch.Tensor] = None
