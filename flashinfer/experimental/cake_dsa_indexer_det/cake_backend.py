@@ -237,6 +237,16 @@ def policy_for(arch: str) -> DispatchPolicy:
     return DispatchPolicy.from_record(record)
 
 
+@functools.cache
+def ticket_tail_skips(arch: str) -> Optional[frozenset]:
+    """None when ``arch`` is not a ticket architecture (``TICKET_TAIL_ARCHES``); else the physical scan kinds of its
+    record's ``static_scan_kinds``, whose programs keep the static enumeration and get no ticket tail.  Fixed for the
+    life of the process (like ``policy_for``), so a call decides its tail with one lookup and one set test."""
+    if arch not in TICKET_TAIL_ARCHES:
+        return None
+    return frozenset(policy_for(arch).static_scan_kinds)
+
+
 def program_for(arch: str, key: str) -> str:
     """The registered program of ``key`` on ``arch``; fails closed by name when the dispatch reaches an unshipped form."""
     programs = PROGRAM_KEYS.get(arch)
@@ -969,6 +979,18 @@ def prepare_dsa_indexer_det_topk(
     if choice.merge_key is not None:
         programs["merge"] = program_for(arch, choice.merge_key)
     workspace_bytes = int(choice.workspace_bytes)
+    # the ticket-tail decision (see the comment where the tail is zeroed) is host arithmetic only: it is made here,
+    # before the call's first device operation, so an eager call does not hold the stream for it
+    tail_at, tail_static = -1, False
+    tail_skips = ticket_tail_skips(arch)
+    if (
+        num_queries > 0
+        and num_keys > 0
+        and tail_skips is not None
+        and choice.physical_kind not in tail_skips
+    ):
+        tail_at = workspace_bytes - TICKET_TAIL_BYTES
+        tail_static = ticket_static_path(choice)
     caller_owned_workspace = workspace_buffer is not None
     if workspace_buffer is None:
         workspace_buffer = torch.empty(
@@ -1059,17 +1081,12 @@ def prepare_dsa_indexer_det_topk(
     # grid, so every scan launch takes the static fast path and never touches the word) is
     # zeroed neither here nor per run.  A program of the record's ``static_scan_kinds`` (the
     # sm_107a l6 programs) keeps the static enumeration on every call: no tail view, nothing zeroed.
-    tail_at, tail_view, tail_static = -1, None, False
-    if (
-        launches
-        and arch in TICKET_TAIL_ARCHES
-        and choice.physical_kind not in policy_for(arch).static_scan_kinds
-    ):
-        tail_at = workspace_bytes - TICKET_TAIL_BYTES
-        tail_static = ticket_static_path(choice)
-        if not tail_static:
-            tail_view = flat[tail_at:workspace_bytes]
-            tail_view.zero_()
+    # (``tail_at`` / ``tail_static`` were decided above, before the first device operation; a call launches
+    # iff it has queries and keys.)
+    tail_view = None
+    if tail_at >= 0 and not tail_static:
+        tail_view = flat[tail_at:workspace_bytes]
+        tail_view.zero_()
     return DSAIndexerDetRunner(
         arch=arch,
         abi=abi,

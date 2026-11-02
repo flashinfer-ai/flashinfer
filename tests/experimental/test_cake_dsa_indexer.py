@@ -4016,6 +4016,12 @@ def test_static_scan_kinds_are_registered_ticket_architecture_kinds():
         "sm_103a": [],
         "sm_107a": ["l6", "pair_l6"],
     }
+    # prepare decides a call's tail from this per-architecture set (made once per process)
+    for arch in cake_jit.POLICY:
+        assert cake_backend.ticket_tail_skips(arch) == frozenset(
+            policy_for(arch).static_scan_kinds
+        )
+    assert cake_backend.ticket_tail_skips("sm_90a") is None
     if not cake_jit.PROGRAM_KEYS:
         pytest.skip("placeholder registry")
     for arch, keys in cake_jit.PROGRAM_KEYS.items():
