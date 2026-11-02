@@ -39,7 +39,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define TMEM_ACCUM_OFFSET 0
 #define TMEM_SCALE_A_OFFSET 32
 #define TMEM_SCALE_B_OFFSET 36
-#define NUM_PIPE_STAGES 11
+#define NUM_PIPE_STAGES 12
 #define NUM_ACCUM_PIPE_STAGES 2
 #define NUM_TASK_PIPE_STAGES 4
 #define SMEM_COMBINE_SMEM_OFF 0
@@ -48,44 +48,42 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SMEM_HIST_OFF 0
 #define SMEM_SMEM_HIST_STAGE_BYTES 192
 #define SMEM_SMEM_HIST_STRIDE 192
-#define SMEM_SMEM_DST_ROW_OFF 1024
+#define SMEM_SMEM_DST_ROW_OFF 192
 #define SMEM_SMEM_DST_ROW_STAGE_BYTES 16
 #define SMEM_SMEM_DST_ROW_STRIDE 16
-#define SMEM_SMEM_ERO_OFF 1040
+#define SMEM_SMEM_ERO_OFF 208
 #define SMEM_SMEM_ERO_STAGE_BYTES 192
 #define SMEM_SMEM_ERO_STRIDE 192
-#define SMEM_SMEM_XSF_OFF 1232
+#define SMEM_SMEM_XSF_OFF 400
 #define SMEM_SMEM_XSF_STAGE_BYTES 2560
 #define SMEM_SMEM_XSF_STRIDE 2560
-#define SMEM_SMEM_DIRECT_TILE_OFF 4096
+#define SMEM_SMEM_DIRECT_TILE_OFF 3072
 #define SMEM_SMEM_DIRECT_TILE_STAGE_BYTES 2048
 #define SMEM_SMEM_DIRECT_TILE_STRIDE 2048
-#define SMEM_SMEM_OUTPUT_OFF 21504
+#define SMEM_SMEM_OUTPUT_OFF 5120
 #define SMEM_SMEM_OUTPUT_STAGE_BYTES 4096
 #define SMEM_SMEM_OUTPUT_STRIDE 4096
-#define SMEM_SMEM_A_OFF 25600
+#define SMEM_SMEM_A_OFF 9216
 #define SMEM_SMEM_A_STAGE_BYTES 1024
 #define SMEM_SMEM_A_STRIDE 1024
-#define SMEM_SMEM_B_OFF 36864
+#define SMEM_SMEM_B_OFF 21504
 #define SMEM_SMEM_B_STAGE_BYTES 16384
 #define SMEM_SMEM_B_STRIDE 16384
-#define SMEM_SMEM_SFA_OFF 217088
+#define SMEM_SMEM_SFA_OFF 218112
 #define SMEM_SMEM_SFA_STAGE_BYTES 512
 #define SMEM_SMEM_SFA_STRIDE 512
-#define SMEM_SMEM_SFB_OFF 222720
+#define SMEM_SMEM_SFB_OFF 224256
 #define SMEM_SMEM_SFB_STAGE_BYTES 512
 #define SMEM_SMEM_SFB_STRIDE 512
-#define SMEM_AMAX_REDUCTION_OFF 228352
+#define SMEM_AMAX_REDUCTION_OFF 230400
 #define SMEM_AMAX_REDUCTION_STAGE_BYTES 256
 #define SMEM_AMAX_REDUCTION_STRIDE 256
-#define SMEM_TASK_INFOS_OFF 228608
+#define SMEM_TASK_INFOS_OFF 230656
 #define SMEM_TASK_INFOS_STAGE_BYTES 128
 #define SMEM_TASK_INFOS_STRIDE 128
-#define SMEM_TOTAL 229504
+#define SMEM_TOTAL 231552
 #define THREADS 512
-#ifndef NUM_CTAS
-#error "NUM_CTAS is a downstream specialization of this program; define it on the compile line"
-#endif
+#define NUM_CTAS 152
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -296,14 +294,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a(int* __restrict__ 
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #endif
 
-    const int mbar_base = smem + 228736;
+    const int mbar_base = smem + 230784;
     #define full_addr (mbar_base + 0)
-    #define empty_addr (mbar_base + 88)
-    #define tmem_full_addr (mbar_base + 176)
-    #define tmem_empty_addr (mbar_base + 192)
-    #define task_full_addr (mbar_base + 208)
-    #define task_empty_addr (mbar_base + 240)
-    #define combine_barriers_addr (mbar_base + 272)
+    #define empty_addr (mbar_base + 96)
+    #define tmem_full_addr (mbar_base + 192)
+    #define tmem_empty_addr (mbar_base + 208)
+    #define task_full_addr (mbar_base + 224)
+    #define task_empty_addr (mbar_base + 256)
+    #define combine_barriers_addr (mbar_base + 288)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -319,28 +317,28 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a(int* __restrict__ 
     const int combine_smem_addr = smem + 0;
     int* smem_hist = reinterpret_cast<int*>(smem_raw + 0);
     const int smem_hist_addr = smem + 0;
-    int* smem_dst_row = reinterpret_cast<int*>(smem_raw + 1024);
-    const int smem_dst_row_addr = smem + 1024;
-    int* smem_ero = reinterpret_cast<int*>(smem_raw + 1040);
-    const int smem_ero_addr = smem + 1040;
-    unsigned int* smem_xsf = reinterpret_cast<unsigned int*>(smem_raw + 1232);
-    const int smem_xsf_addr = smem + 1232;
-    uint8_t* smem_direct_tile = reinterpret_cast<uint8_t*>(smem_raw + 4096);
-    const int smem_direct_tile_addr = smem + 4096;
-    uint8_t* smem_output = reinterpret_cast<uint8_t*>(smem_raw + 21504);
-    const int smem_output_addr = smem + 21504;
-    uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 25600);
-    const int smem_a_addr = smem + 25600;
-    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 36864);
-    const int smem_b_addr = smem + 36864;
-    unsigned int* smem_sfa = reinterpret_cast<unsigned int*>(smem_raw + 217088);
-    const int smem_sfa_addr = smem + 217088;
-    unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + 222720);
-    const int smem_sfb_addr = smem + 222720;
-    float* amax_reduction = reinterpret_cast<float*>(smem_raw + 228352);
-    const int amax_reduction_addr = smem + 228352;
-    unsigned int* task_infos = reinterpret_cast<unsigned int*>(smem_raw + 228608);
-    const int task_infos_addr = smem + 228608;
+    int* smem_dst_row = reinterpret_cast<int*>(smem_raw + 192);
+    const int smem_dst_row_addr = smem + 192;
+    int* smem_ero = reinterpret_cast<int*>(smem_raw + 208);
+    const int smem_ero_addr = smem + 208;
+    unsigned int* smem_xsf = reinterpret_cast<unsigned int*>(smem_raw + 400);
+    const int smem_xsf_addr = smem + 400;
+    uint8_t* smem_direct_tile = reinterpret_cast<uint8_t*>(smem_raw + 3072);
+    const int smem_direct_tile_addr = smem + 3072;
+    uint8_t* smem_output = reinterpret_cast<uint8_t*>(smem_raw + 5120);
+    const int smem_output_addr = smem + 5120;
+    uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 9216);
+    const int smem_a_addr = smem + 9216;
+    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 21504);
+    const int smem_b_addr = smem + 21504;
+    unsigned int* smem_sfa = reinterpret_cast<unsigned int*>(smem_raw + 218112);
+    const int smem_sfa_addr = smem + 218112;
+    unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + 224256);
+    const int smem_sfb_addr = smem + 224256;
+    float* amax_reduction = reinterpret_cast<float*>(smem_raw + 230400);
+    const int amax_reduction_addr = smem + 230400;
+    unsigned int* task_infos = reinterpret_cast<unsigned int*>(smem_raw + 230656);
+    const int task_infos_addr = smem + 230656;
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B1))) : "memory"); }
@@ -354,104 +352,106 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a(int* __restrict__ 
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
-    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 82 barriers)
-    // Mbarriers at smem_raw[228736..229392)
+    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 84 barriers)
+    // Mbarriers at smem_raw[230784..231456)
 
     if (warp == 2) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'pipe' ---
-            // full: 11 barriers, init_count=4
-            mbarrier_init(smem + 228736, 4);
-            mbarrier_init(smem + 228744, 4);
-            mbarrier_init(smem + 228752, 4);
-            mbarrier_init(smem + 228760, 4);
-            mbarrier_init(smem + 228768, 4);
-            mbarrier_init(smem + 228776, 4);
-            mbarrier_init(smem + 228784, 4);
-            mbarrier_init(smem + 228792, 4);
-            mbarrier_init(smem + 228800, 4);
-            mbarrier_init(smem + 228808, 4);
-            mbarrier_init(smem + 228816, 4);
-            // empty: 11 barriers, init_count=1
-            mbarrier_init(smem + 228824, 1);
-            mbarrier_init(smem + 228832, 1);
-            mbarrier_init(smem + 228840, 1);
-            mbarrier_init(smem + 228848, 1);
-            mbarrier_init(smem + 228856, 1);
-            mbarrier_init(smem + 228864, 1);
-            mbarrier_init(smem + 228872, 1);
-            mbarrier_init(smem + 228880, 1);
-            mbarrier_init(smem + 228888, 1);
-            mbarrier_init(smem + 228896, 1);
-            mbarrier_init(smem + 228904, 1);
+            // full: 12 barriers, init_count=4
+            mbarrier_init(smem + 230784, 4);
+            mbarrier_init(smem + 230792, 4);
+            mbarrier_init(smem + 230800, 4);
+            mbarrier_init(smem + 230808, 4);
+            mbarrier_init(smem + 230816, 4);
+            mbarrier_init(smem + 230824, 4);
+            mbarrier_init(smem + 230832, 4);
+            mbarrier_init(smem + 230840, 4);
+            mbarrier_init(smem + 230848, 4);
+            mbarrier_init(smem + 230856, 4);
+            mbarrier_init(smem + 230864, 4);
+            mbarrier_init(smem + 230872, 4);
+            // empty: 12 barriers, init_count=1
+            mbarrier_init(smem + 230880, 1);
+            mbarrier_init(smem + 230888, 1);
+            mbarrier_init(smem + 230896, 1);
+            mbarrier_init(smem + 230904, 1);
+            mbarrier_init(smem + 230912, 1);
+            mbarrier_init(smem + 230920, 1);
+            mbarrier_init(smem + 230928, 1);
+            mbarrier_init(smem + 230936, 1);
+            mbarrier_init(smem + 230944, 1);
+            mbarrier_init(smem + 230952, 1);
+            mbarrier_init(smem + 230960, 1);
+            mbarrier_init(smem + 230968, 1);
             // --- pipeline 'accum_pipe' ---
             // tmem_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 228912, 1);
-            mbarrier_init(smem + 228920, 1);
+            mbarrier_init(smem + 230976, 1);
+            mbarrier_init(smem + 230984, 1);
             // tmem_empty: 2 barriers, init_count=512
-            mbarrier_init(smem + 228928, 512);
-            mbarrier_init(smem + 228936, 512);
+            mbarrier_init(smem + 230992, 512);
+            mbarrier_init(smem + 231000, 512);
             // --- pipeline 'task_pipe' ---
             // task_full: 4 barriers, init_count=1
-            mbarrier_init(smem + 228944, 1);
-            mbarrier_init(smem + 228952, 1);
-            mbarrier_init(smem + 228960, 1);
-            mbarrier_init(smem + 228968, 1);
+            mbarrier_init(smem + 231008, 1);
+            mbarrier_init(smem + 231016, 1);
+            mbarrier_init(smem + 231024, 1);
+            mbarrier_init(smem + 231032, 1);
             // task_empty: 4 barriers, init_count=512
-            mbarrier_init(smem + 228976, 512);
-            mbarrier_init(smem + 228984, 512);
-            mbarrier_init(smem + 228992, 512);
-            mbarrier_init(smem + 229000, 512);
+            mbarrier_init(smem + 231040, 512);
+            mbarrier_init(smem + 231048, 512);
+            mbarrier_init(smem + 231056, 512);
+            mbarrier_init(smem + 231064, 512);
             // combine_barriers: 48 barriers, init_count=1
-            mbarrier_init(smem + 229008, 1);
-            mbarrier_init(smem + 229016, 1);
-            mbarrier_init(smem + 229024, 1);
-            mbarrier_init(smem + 229032, 1);
-            mbarrier_init(smem + 229040, 1);
-            mbarrier_init(smem + 229048, 1);
-            mbarrier_init(smem + 229056, 1);
-            mbarrier_init(smem + 229064, 1);
-            mbarrier_init(smem + 229072, 1);
-            mbarrier_init(smem + 229080, 1);
-            mbarrier_init(smem + 229088, 1);
-            mbarrier_init(smem + 229096, 1);
-            mbarrier_init(smem + 229104, 1);
-            mbarrier_init(smem + 229112, 1);
-            mbarrier_init(smem + 229120, 1);
-            mbarrier_init(smem + 229128, 1);
-            mbarrier_init(smem + 229136, 1);
-            mbarrier_init(smem + 229144, 1);
-            mbarrier_init(smem + 229152, 1);
-            mbarrier_init(smem + 229160, 1);
-            mbarrier_init(smem + 229168, 1);
-            mbarrier_init(smem + 229176, 1);
-            mbarrier_init(smem + 229184, 1);
-            mbarrier_init(smem + 229192, 1);
-            mbarrier_init(smem + 229200, 1);
-            mbarrier_init(smem + 229208, 1);
-            mbarrier_init(smem + 229216, 1);
-            mbarrier_init(smem + 229224, 1);
-            mbarrier_init(smem + 229232, 1);
-            mbarrier_init(smem + 229240, 1);
-            mbarrier_init(smem + 229248, 1);
-            mbarrier_init(smem + 229256, 1);
-            mbarrier_init(smem + 229264, 1);
-            mbarrier_init(smem + 229272, 1);
-            mbarrier_init(smem + 229280, 1);
-            mbarrier_init(smem + 229288, 1);
-            mbarrier_init(smem + 229296, 1);
-            mbarrier_init(smem + 229304, 1);
-            mbarrier_init(smem + 229312, 1);
-            mbarrier_init(smem + 229320, 1);
-            mbarrier_init(smem + 229328, 1);
-            mbarrier_init(smem + 229336, 1);
-            mbarrier_init(smem + 229344, 1);
-            mbarrier_init(smem + 229352, 1);
-            mbarrier_init(smem + 229360, 1);
-            mbarrier_init(smem + 229368, 1);
-            mbarrier_init(smem + 229376, 1);
-            mbarrier_init(smem + 229384, 1);
+            mbarrier_init(smem + 231072, 1);
+            mbarrier_init(smem + 231080, 1);
+            mbarrier_init(smem + 231088, 1);
+            mbarrier_init(smem + 231096, 1);
+            mbarrier_init(smem + 231104, 1);
+            mbarrier_init(smem + 231112, 1);
+            mbarrier_init(smem + 231120, 1);
+            mbarrier_init(smem + 231128, 1);
+            mbarrier_init(smem + 231136, 1);
+            mbarrier_init(smem + 231144, 1);
+            mbarrier_init(smem + 231152, 1);
+            mbarrier_init(smem + 231160, 1);
+            mbarrier_init(smem + 231168, 1);
+            mbarrier_init(smem + 231176, 1);
+            mbarrier_init(smem + 231184, 1);
+            mbarrier_init(smem + 231192, 1);
+            mbarrier_init(smem + 231200, 1);
+            mbarrier_init(smem + 231208, 1);
+            mbarrier_init(smem + 231216, 1);
+            mbarrier_init(smem + 231224, 1);
+            mbarrier_init(smem + 231232, 1);
+            mbarrier_init(smem + 231240, 1);
+            mbarrier_init(smem + 231248, 1);
+            mbarrier_init(smem + 231256, 1);
+            mbarrier_init(smem + 231264, 1);
+            mbarrier_init(smem + 231272, 1);
+            mbarrier_init(smem + 231280, 1);
+            mbarrier_init(smem + 231288, 1);
+            mbarrier_init(smem + 231296, 1);
+            mbarrier_init(smem + 231304, 1);
+            mbarrier_init(smem + 231312, 1);
+            mbarrier_init(smem + 231320, 1);
+            mbarrier_init(smem + 231328, 1);
+            mbarrier_init(smem + 231336, 1);
+            mbarrier_init(smem + 231344, 1);
+            mbarrier_init(smem + 231352, 1);
+            mbarrier_init(smem + 231360, 1);
+            mbarrier_init(smem + 231368, 1);
+            mbarrier_init(smem + 231376, 1);
+            mbarrier_init(smem + 231384, 1);
+            mbarrier_init(smem + 231392, 1);
+            mbarrier_init(smem + 231400, 1);
+            mbarrier_init(smem + 231408, 1);
+            mbarrier_init(smem + 231416, 1);
+            mbarrier_init(smem + 231424, 1);
+            mbarrier_init(smem + 231432, 1);
+            mbarrier_init(smem + 231440, 1);
+            mbarrier_init(smem + 231448, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -459,9 +459,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a(int* __restrict__ 
     __syncwarp();
 
     // TMEM alloc (64 columns, 40 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 229392);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 231456);
     if (warp == 3) {
-        int _tmem_hold = smem + 229392;
+        int _tmem_hold = smem + 231456;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(64) : "memory");
         __syncwarp();
     }
@@ -725,7 +725,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a(int* __restrict__ 
                     }
                     __syncwarp();
                     a_stage += 1;
-                    if (a_stage == 11) { a_stage = 0; _phase_empty ^= 1; }
+                    if (a_stage == 12) { a_stage = 0; _phase_empty ^= 1; }
                 }
             }
         }
@@ -842,7 +842,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a(int* __restrict__ 
                     }
                     __syncwarp();
                     b_stage += 1;
-                    if (b_stage == 11) { b_stage = 0; _phase_empty_1 ^= 1; }
+                    if (b_stage == 12) { b_stage = 0; _phase_empty_1 ^= 1; }
                 }
             }
         }
@@ -912,7 +912,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t16_sm103a(int* __restrict__ 
                         }
                         __syncwarp();
                         mma_stage += 1;
-                        if (mma_stage == 11) { mma_stage = 0; _phase_full ^= 1; }
+                        if (mma_stage == 12) { mma_stage = 0; _phase_full ^= 1; }
                     }
                     completed_tasks += 1;
                     accum_cursor += 1;

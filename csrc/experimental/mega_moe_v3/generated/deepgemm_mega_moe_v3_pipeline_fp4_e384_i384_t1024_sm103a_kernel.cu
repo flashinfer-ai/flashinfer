@@ -731,7 +731,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                     if (in_expert + 1 == (unsigned int)expert_counts[e_s]) {
                         arrivals = 32 - in_expert % 32;
                     }
-                    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(PrivateCounters) + (1154 + sf_block))), "r"(static_cast<unsigned int>(arrivals)) : "memory");
+                    asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(PrivateCounters) + (1154 + sf_block))), "r"(static_cast<unsigned int>(arrivals)) : "memory");
                 }
                 __syncwarp();
             }
