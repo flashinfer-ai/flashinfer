@@ -741,11 +741,7 @@ def testGroupGemmFp8NtGroupwise(args):
             repeat_iters=args.num_iters,
             sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
             enable_cupti=args.use_cupti,
-            # DeepGEMM re-loads its cubin on every call (flashinfer/deep_gemm.py
-            # load() looks up RUNTIME_CACHE without the ".cubin" suffix it
-            # stores under), which CUDA-graph capture cannot record; time it
-            # eagerly. CUPTI still reports kernel time only.
-            use_cuda_graph=is_cuda_graph_compatible and cur_backend != "deepgemm",
+            use_cuda_graph=is_cuda_graph_compatible,
             cold_l2_cache=True,
             input_args=(cur_backend, a_fp8, b_fp8, a_scale, b_scale, m_indptr),
         )
@@ -2978,14 +2974,12 @@ def _bench_and_report(
     extra_fields,
     cos_sim_min=0.99,
     autotune_backends=(),
-    no_graph_backends=(),
 ):
     """Shared timing / refcheck / CSV tail of the routines below.
 
     run_fns:   backend -> zero-argument callable launching the op.
     refchecks: backend -> callable(output) returning the cosine similarity of
                the backend's valid output against its reference, or None.
-    no_graph_backends: backends timed without CUDA graphs (see callers).
     """
     res = []
     cache_path = getattr(args, "autotune_cache", None)
@@ -3020,7 +3014,7 @@ def _bench_and_report(
             repeat_iters=args.num_iters,
             sleep_after_run=True,  # GEMMs are very MMA-heavy, so prefer sleep to reduce throttling.
             enable_cupti=args.use_cupti,
-            use_cuda_graph=not args.no_cuda_graph and backend not in no_graph_backends,
+            use_cuda_graph=not args.no_cuda_graph,
             cold_l2_cache=True,
         )
 
@@ -3581,9 +3575,6 @@ def testMaskedGroupedGemm(args):
             "out_dtype": str(out_dtype),
         },
         cos_sim_min=0.97 if "fp4" in dtype else 0.99,
-        # DeepGEMM reloads its cubin on every call (deep_gemm.py load() cache
-        # key mismatch), which CUDA-graph capture cannot record.
-        no_graph_backends=("deepgemm",),
     )
 
 
