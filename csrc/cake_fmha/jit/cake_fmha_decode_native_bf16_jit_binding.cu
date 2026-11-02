@@ -412,9 +412,12 @@ void cake_paged_attention_decode(
   unsigned int grid_z = 1;
   // The exact sink kernel maps one CTA per (query, KV head, batch) tile.
   // The exact B4 CGA kernel maps one two-CTA cluster per logical tile.
-  // Other native-BF16 members use their existing persistent 1-D launch.
+  // Other native-BF16 members use their existing persistent 1-D launch: the
+  // retained-KV sink member at the exact sink shape strides its tiles over
+  // blockIdx.x, and the 3-D grid would run every tile in each of its CTAs.
 #if BATCH_SIZE == 256 && Q_LEN == 1 && NUM_Q_HEADS == 32 && NUM_KV_HEADS == 4 && \
-    CAKE_FMHA_HAS_SINK == 1 && CAKE_FMHA_HAS_WINDOW == 0 && CAKE_FMHA_USE_SCALE_PTR == 0
+    CAKE_FMHA_HAS_SINK == 1 && CAKE_FMHA_HAS_WINDOW == 0 && CAKE_FMHA_USE_SCALE_PTR == 0 && \
+    CAKE_FMHA_RETAIN_KV_L2 == 0
   grid_x = Q_LEN;
   grid_y = NUM_KV_HEADS;
   grid_z = BATCH_SIZE;
