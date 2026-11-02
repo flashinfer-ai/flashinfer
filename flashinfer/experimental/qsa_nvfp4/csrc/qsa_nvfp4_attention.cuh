@@ -706,11 +706,14 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
 // One CTA per (row, query head): LSE-weighted sum of the split outputs, BF16 rounding, FP32 gate.
 // Each warp merges a contiguous chunk of the splits, kMergeDepth at a time, issuing a group's
 // loads before using any of them, and lane l owns dims [8l, 8l + 8); the warps' sums are then
-// rescaled to a common max. The launch gives one warp per kMergeDepth splits, at most kMergeWarps.
-template <KvFormat F>
+// rescaled to a common max. The launch gives one warp per kMergeDepth splits, at most kMergeWarps;
+// kOneWarp is the single-warp NVFP4 launch: its splits fit one group, which it stops after, and it
+// keeps its sum in registers.
+template <KvFormat F, bool kOneWarp = false>
 __global__ void __launch_bounds__(32 * kMergeWarps<F>) MergeKernel(const Params p) {
   const int row = blockIdx.x, head = blockIdx.y;
-  const uint32_t num_warps = blockDim.x / 32, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const uint32_t num_warps = kOneWarp ? 1 : blockDim.x / 32, warp = kOneWarp ? 0 : threadIdx.x / 32;
+  const uint32_t lane = threadIdx.x % 32;
   const uint32_t dim = 8 * lane;
   const int64_t row_head = int64_t(row) * p.num_qo_heads + head;
   const int64_t split_pitch = int64_t(p.num_rows) * p.num_qo_heads;
@@ -721,21 +724,26 @@ __global__ void __launch_bounds__(32 * kMergeWarps<F>) MergeKernel(const Params 
 
   float m = -math::inf, den = 0.f, acc[8] = {};
   for (int base = first; base < last; base += kMergeDepth) {
+    const int depth = kOneWarp ? last - base : kMergeDepth;
     float lse[kMergeDepth];
     float4 part[kMergeDepth][2];
 #pragma unroll
     for (int k = 0; k < kMergeDepth; ++k) {
+      if (k == depth) break;
       const int64_t split_row = (base + k) * split_pitch + row_head;
       const float4* src =
           reinterpret_cast<const float4*>(p.partial_out + split_row * kHeadDim + dim);
-      const bool ok = base + k < last;
+      const bool ok = kOneWarp || base + k < last;
       lse[k] = ok ? p.partial_lse[split_row] : -math::inf;
       part[k][0] = ok ? src[0] : make_float4(0.f, 0.f, 0.f, 0.f);
       part[k][1] = ok ? src[1] : make_float4(0.f, 0.f, 0.f, 0.f);
     }
     float next_m = m;
 #pragma unroll
-    for (int k = 0; k < kMergeDepth; ++k) next_m = fmaxf(next_m, lse[k]);
+    for (int k = 0; k < kMergeDepth; ++k) {
+      if (k == depth) break;
+      next_m = fmaxf(next_m, lse[k]);
+    }
     if (next_m == -math::inf) continue;  // no values yet
     const float alpha = math::ptx_exp2(m - next_m);
     den *= alpha;
@@ -744,12 +752,36 @@ __global__ void __launch_bounds__(32 * kMergeWarps<F>) MergeKernel(const Params 
     m = next_m;
 #pragma unroll
     for (int k = 0; k < kMergeDepth; ++k) {
+      if (k == depth) break;
       const float w = math::ptx_exp2(lse[k] - m);
       const float* v = reinterpret_cast<const float*>(part[k]);
       den += w;
 #pragma unroll
       for (uint32_t j = 0; j < 8; ++j) acc[j] += w * v[j];
     }
+    if (depth < kMergeDepth) {  // the skipped slots would add +0, which turns a -0 sum into +0
+#pragma unroll
+      for (uint32_t j = 0; j < 8; ++j) acc[j] += 0.f;
+    }
+  }
+
+  // Normalizes the sum, rounds it to BF16, and applies the gate.
+  auto store = [&](float total, const float(&merged)[8]) {
+    const float inv = total > 0.f ? 1.f / total : 0.f;
+    const nv_bfloat16* gv = reinterpret_cast<const nv_bfloat16*>(&gate8);
+    uint4 out8;
+    nv_bfloat16* ov = reinterpret_cast<nv_bfloat16*>(&out8);
+#pragma unroll
+    for (uint32_t j = 0; j < 8; ++j) {
+      const float attn = __bfloat162float(__float2bfloat16(merged[j] * inv));
+      ov[j] = __float2bfloat16(attn * sigmoid(__bfloat162float(gv[j])));
+    }
+    *reinterpret_cast<uint4*>(p.out + int64_t(row) * p.out_stride_row + head * p.out_stride_head +
+                              dim) = out8;
+  };
+  if constexpr (kOneWarp) {  // a lone warp already holds the whole sum
+    store(den, acc);
+    return;
   }
 
   __shared__ float warp_m[kMergeWarps<F>], warp_den[kMergeWarps<F>];
@@ -783,17 +815,7 @@ __global__ void __launch_bounds__(32 * kMergeWarps<F>) MergeKernel(const Params 
       for (uint32_t j = 0; j < 8; ++j) merged[j] += scale * v[j];
     }
   }
-  const float inv = total > 0.f ? 1.f / total : 0.f;
-  const nv_bfloat16* gv = reinterpret_cast<const nv_bfloat16*>(&gate8);
-  uint4 out8;
-  nv_bfloat16* ov = reinterpret_cast<nv_bfloat16*>(&out8);
-#pragma unroll
-  for (uint32_t j = 0; j < 8; ++j) {
-    const float attn = __bfloat162float(__float2bfloat16(merged[j] * inv));
-    ov[j] = __float2bfloat16(attn * sigmoid(__bfloat162float(gv[j])));
-  }
-  *reinterpret_cast<uint4*>(p.out + int64_t(row) * p.out_stride_row + head * p.out_stride_head +
-                            dim) = out8;
+  store(total, merged);
 }
 
 template <KvFormat F>
@@ -846,7 +868,14 @@ inline cudaError_t SparsePagedAttention(const Params& p, cudaStream_t stream) {
   if (p.num_splits > 1) {
     const int warps = min(int(kMergeWarps<F>), (p.num_splits + kMergeDepth - 1) / kMergeDepth);
     const size_t acc_bytes = F == KvFormat::kNVFP4 ? 0 : warps * kHeadDim * sizeof(float);
-    MergeKernel<F><<<dim3(p.num_rows, p.num_qo_heads), 32 * warps, acc_bytes, stream>>>(p);
+    const dim3 grid(p.num_rows, p.num_qo_heads);
+    if constexpr (F == KvFormat::kNVFP4) {
+      if (warps == 1) {
+        MergeKernel<F, true><<<grid, 32, 0, stream>>>(p);
+        return cudaGetLastError();
+      }
+    }
+    MergeKernel<F><<<grid, 32 * warps, acc_bytes, stream>>>(p);
   }
   return cudaGetLastError();
 }
