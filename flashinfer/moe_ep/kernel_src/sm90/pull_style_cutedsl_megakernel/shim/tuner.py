@@ -105,8 +105,9 @@ def default_knobs(
 
     Wraps the kernel drop's token-bucket heuristic table
     (``heuristic_config.select_heuristic_config``), keyed on
-    ``fp8_scale_mode`` and the buffer capacity (eight-rank DeepSeek-V4
-    layouts take the table's measured ``EP8_OVERRIDES``), so the
+    ``fp8_scale_mode`` and the buffer capacity (eight- and sixteen-rank
+    DeepSeek-V4 layouts take the table's measured ``EP8_OVERRIDES`` /
+    ``EP16_OVERRIDES``), so the
     ``knobs=None`` fallback matches the shim's established default launch
     configs.  The
     table also carries the per-bucket ``token_back_mode``, ``group_hint``

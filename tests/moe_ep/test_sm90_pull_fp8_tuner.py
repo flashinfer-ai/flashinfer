@@ -71,13 +71,15 @@ class TestDefaultKnobs:
 
 
 class TestEightRankOverrides:
+    @pytest.mark.parametrize("world_size", [8, 16])
     @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
-    @pytest.mark.parametrize("tokens", [8, 256, 1024, 4096])
-    def test_eight_rank_rows(self, scale_mode, tokens, monkeypatch):
+    @pytest.mark.parametrize("tokens", [8, 128, 256, 512, 1024, 2048, 4096])
+    def test_eight_rank_rows(self, world_size, scale_mode, tokens, monkeypatch):
         pkg = _pkg()
         pkg.bootstrap_paths()
         from moe_hopper_fp8.heuristic_config import (
             EP8_OVERRIDES,
+            EP16_OVERRIDES,
             TAIL_SPLIT_ENV,
             select_heuristic_config,
             token_bucket,
@@ -86,17 +88,22 @@ class TestEightRankOverrides:
         # The env override would rewrite both rows; compare the table itself.
         monkeypatch.delenv(TAIL_SPLIT_ENV, raising=False)
 
+        overrides = {8: EP8_OVERRIDES, 16: EP16_OVERRIDES}[world_size]
         four = select_heuristic_config(scale_mode, tokens).config
-        eight = select_heuristic_config(scale_mode, tokens, world_size=8).config
-        assert eight == EP8_OVERRIDES[scale_mode].get(token_bucket(tokens), four)
-        # Only the tuned model layout takes the eight-rank rows.
+        eight = select_heuristic_config(
+            scale_mode, tokens, world_size=world_size
+        ).config
+        assert eight == overrides[scale_mode].get(token_bucket(tokens), four)
+        # Only the tuned model layout takes the multi-rank rows.
         assert (
             select_heuristic_config(
-                scale_mode, tokens, world_size=8, num_experts=256
+                scale_mode, tokens, world_size=world_size, num_experts=256
             ).config
             == four
         )
-        knobs = pkg.default_knobs(tokens, fp8_scale_mode=scale_mode, world_size=8)
+        knobs = pkg.default_knobs(
+            tokens, fp8_scale_mode=scale_mode, world_size=world_size
+        )
         assert knobs["mma_tiler_mnk"] == tuple(eight.mma_tiler_mnk)
         assert knobs["cluster_shape_mnk"] == tuple(eight.cluster_shape_mnk)
         assert knobs["group_hint"] == eight.group_hint
@@ -104,18 +111,22 @@ class TestEightRankOverrides:
         assert knobs["token_back_mode"] == eight.token_back_mode
         assert pkg.is_valid(knobs, fp8_scale_mode=scale_mode)
 
+    @pytest.mark.parametrize("world_size", [8, 16])
     @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
-    def test_eight_rank_default_leads_candidates(self, scale_mode, monkeypatch):
+    @pytest.mark.parametrize("max_tokens", [256, 1024])
+    def test_eight_rank_default_leads_candidates(
+        self, world_size, scale_mode, max_tokens, monkeypatch
+    ):
         pkg = _pkg()
         pkg.bootstrap_paths()
         from moe_hopper_fp8.heuristic_config import TAIL_SPLIT_ENV
 
         monkeypatch.delenv(TAIL_SPLIT_ENV, raising=False)
         cands = pkg.hopper_fp8_candidates(
-            fp8_scale_mode=scale_mode, max_tokens=1024, world_size=8
+            fp8_scale_mode=scale_mode, max_tokens=max_tokens, world_size=world_size
         )
         assert cands[0] == pkg.default_knobs(
-            1024, fp8_scale_mode=scale_mode, world_size=8
+            max_tokens, fp8_scale_mode=scale_mode, world_size=world_size
         )
 
 

@@ -2465,6 +2465,12 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
 
             if cutlass.const_expr(self.enable_token_comm):
                 cute.arch.fence_acq_rel_sys()
+                self.token_comm_hook_epilogue_tail(
+                    token_comm_args,
+                    warp_idx=warp_idx,
+                    lane_idx=cute.arch.lane_idx(),
+                    tidx=tidx,
+                )
 
         # ════════════════════════════════════════════════════════════════════
         # Empty-warp FC1 store server (swap-AB offload).

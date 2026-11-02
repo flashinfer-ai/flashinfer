@@ -197,6 +197,16 @@ not picked them up):
   tuning-cache identity includes the block (`*_cache_provenance_sha256`).
   FP8 blockwise kernels now reject mma_tiler K != 128, which they never
   supported.  Measurements in [TUNING.md](TUNING.md).  Not in the drop tree.
+- Internode tail reduce in the epilogue branch + sixteen-rank rows
+  (2026-10-29): both FP8 kernels call `token_comm_hook_epilogue_tail` at the
+  end of the epilogue branch; with NCCL GIN it runs the epilogue warps'
+  kernel-tail barriers and the rail-peer node reduce there
+  (`TokenInPullTokenBackPush.kernel_tail_reduce_warps`), and
+  `token_comm_hook_kernel_tail` / `kernel_tail` skip those warps, so the
+  reduce is no longer compiled for the 48-register dispatch group.
+  `heuristic_config.EP16_OVERRIDES` (blockwise 128-4096) and
+  `_RANK_OVERRIDES`.  Measurements in [TUNING.md](TUNING.md).  Not in the
+  drop tree.
 
 ## Layout
 

@@ -1687,6 +1687,11 @@ class Sm90SwigluFp8Fc12Kernel:
         pass
 
     @cute.jit
+    def token_comm_hook_epilogue_tail(self, token_comm_args, *, warp_idx, lane_idx, tidx):
+        """Epilogue warps' kernel-tail work, from their own branch.  No-op base."""
+        pass
+
+    @cute.jit
     def token_comm_hook_kernel_tail(self, token_comm_args, *, warp_idx, lane_idx, tidx):
         """All-warp kernel tail (NVLink release, etc.).  No-op base."""
         pass
@@ -3904,6 +3909,12 @@ class Sm90SwigluFp8Fc12Kernel:
 
             if cutlass.const_expr(self.enable_token_comm):
                 cute.arch.fence_acq_rel_sys()
+                self.token_comm_hook_epilogue_tail(
+                    token_comm_args,
+                    warp_idx=warp_idx,
+                    lane_idx=cute.arch.lane_idx(),
+                    tidx=tidx,
+                )
 
         # ════════════════════════════════════════════════════════════════════
         # Empty-warp FC1 store server (offload experiment).

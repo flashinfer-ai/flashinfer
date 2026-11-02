@@ -603,6 +603,91 @@ shape, the data recipe, the routing, AND the timed region before comparing
 tail and the host-launch gap inside its CUDA-event window, while the
 drop's `*_mega_us` columns are profiler-extracted kernel time only.
 
+## Internode NCCL GIN, two nodes x eight H100 (EP16, 2026-10-29)
+
+Two DGX H100 nodes (EOS: NDR 400 Gb/s, one rail NIC per GPU; driver 535
+with the CUDA 13.4 forward-compat user-mode driver), EP=16 with eight
+ranks per node, the P03 geometry above, FP8 blockwise,
+`benchmarks/bench_moe_ep_sm90_mega_internode.py`, max-rank median µs of
+20 timed iterations, one allocation.  Baselines are DeepEP V2 / NCCL-EP LL
+/ NCCL-EP HT dispatch and combine around an FP8-input grouped GEMM — the
+TRT-LLM block-scale runner (`cutlass`) or this tree's standalone FC12
+kernels (`fc12`, same heuristic table, re-measured with the EP16 rows at
+256-4096) — with their handoff stage included.
+
+| tokens/rank | mega before | mega now | DeepEP cutlass / fc12 | LL cutlass / fc12 | HT cutlass / fc12 | now / best |
+|---|---|---|---|---|---|---|
+| 8    | 698  | 664  | 830 / 834   | 777 / 793   | 942 / 1049  | 0.85 |
+| 64   | 776  | 741  | 993 / 884   | 878 / 829   | 1135 / 1147 | 0.89 |
+| 256  | 1623 | 845  | 1164 / 1079 | 1094 / 1083 | 1264 / 1285 | 0.78 |
+| 1024 | 2116 | 1903 | 2273 / 2138 | 2735 / 2605 | 2602 / 2458 | 0.89 |
+| 4096 | 5925 | 5518 | 7229 / 6814 | 9667 / 9299 | 7932 / 7505 | 0.81 |
+
+(mega before / now: two interleaved rounds each; the 8 / 64 fc12 baselines
+use rows the EP16 change does not touch.)
+
+* **EP16 rows** (`heuristic_config.EP16_OVERRIDES`).  Sixteen ranks ran on
+  the four-rank table, but an expert sees four times the rows of the same
+  four-rank bucket.  At 256 tokens (64 rows per expert) the swap-AB M256N32
+  row splits every expert into two to three token tiles and reads its
+  weights once per tile: GEMM phase ~1350 µs against 614 µs of CUTLASS
+  compute.  Two interleaved sweeps per bucket: bw256 non-swap M64N256
+  CGA2x2 859 µs (the four-rank 1024 row, which holds the same 64 rows per
+  expert), CGA2x1 871-891 (tail split 866, one-wave group 885), CGA1x1
+  1113, against the swap row's 1569-1605; bw128 the same M64N256 CGA2x2
+  782 / 791 against swap M256N16 1487 / 1513 (M256N32 994-997); bw512 /
+  1024 / 2048 / 4096 the EP8 row (CGA2x1 + tail split + one-wave group)
+  1166-1188 / 1909 / 3178-3189 / 5543-5680 against the four-rank rows'
+  1655-1664 (CGA1x1) / 2028-2125 (CGA2x2) / 3425-3440 (CGA2x2) /
+  5800-5864 (group_hint 264), i.e. -29 / -6 / -7 / -3..-4%.  bw8 (M256N8
+  680-690 vs N16 684-697) and bw64 (non-swap 762 vs swap 744) stay on the
+  four-rank rows.
+* **Node reduce in the epilogue branch.**  The rail-peer node reduce ran in
+  `kernel_tail`, which every warp executes after the role branches merge,
+  so ptxas compiled it under the folded dispatch group's 48-register
+  budget and the four-column unroll (24 16-byte loads per lane) spilled:
+  ~50 µs per token row, 55 / 107 / 229 µs at 256 / 1024 / 4096 tokens with
+  at most four rows per warp.  The epilogue warps now run their share of
+  the tail (the same kernel-tail barrier arrivals plus the reduce) at the
+  end of their own branch (`token_comm_hook_epilogue_tail` ->
+  `TokenInPullTokenBackPush.kernel_tail_reduce_warps`) and `kernel_tail`
+  skips them: reduce 17 / 27 / 91 µs; e2e with the old rows (two
+  interleaved rounds) 8 -6.3%, 64 -7.3%, 256 -2.4%, 1024 -3.5%,
+  4096 -2.4%.
+* **Tried and dropped: chunked return.**  Reduce warps counting finished
+  token chunks and CTA 0 posting one return put per chunk as soon as the
+  grid had reduced it (adaptive, >= 256 rows per chunk), to overlap the
+  reduce with the return RDMA.  A GIN put costs ~10 µs to post from one
+  thread, so 4 / 8 fixed chunks lost 31 / 78 µs at 8 tokens; the
+  counter-gated single put (no grid sync before the put) gained 1.4-2.1%
+  at 8 / 64 and the chunks ~1% at 1024 / 4096 — under the bar for the
+  extra synchronisation.
+
+Where the time goes now (`--stamps`, slowest rank, µs): kernel 873 / 1875 /
+5395 at 256 / 1024 / 4096 tokens = node barrier before the GEMM 90 / 67 /
+85, GEMM done 746 / 1505 / 4045 (fastest rank 687 / 1312 / 3896), node
+reduce 17 / 27 / 91, return put 96 / 329 / 1231 (line rate, ~45 GB/s).
+
+Internode levers left:
+
+1. **Overlap the return put** — the proxied origins' FC2 is the last
+   segment of the schedule, so the put is a pure tail (17% of the kernel
+   at 1024, 23% at 4096).  Ordering seg0 FC1, seg1 FC1, seg1 FC2, seg0 FC2
+   and running the reduce + return on the dispatch warp during seg0 FC2
+   would hide up to the seg0 FC2 time (~1/6 of the GEMM, ~13% at 256-4096
+   if the reduce keeps up).  The 48-register dispatch warp needs bulk-copy
+   loads (one LDG row in flight reaches ~130 GB/s, slower than the put),
+   seg1 FC2 completion needs a per-rank count and a node barrier of its
+   own, and the scheduler a third segment.
+2. **Rank skew before B1** — the slowest local rank finishes the GEMM
+   150-190 µs after the fastest at 1024 / 4096: with 24 experts of 256 ± 16
+   rows (1024 tokens) the per-rank 64-row tile count already spreads ~7%
+   max/mean, before any clock difference between GPUs.
+3. **Pull-paced FC1 start** — at 1024 tokens IKET shows the TMA-A warps
+   waiting ~100 µs per CTA for node-local rows in the first ~200 µs: one
+   active dispatch warp per CTA pulls ~100 GB/s, about the first group's
+   FC1 appetite.
+
 ## Next levers
 
 1. **Fused staging kernel** — port the SM100 tree's single-launch

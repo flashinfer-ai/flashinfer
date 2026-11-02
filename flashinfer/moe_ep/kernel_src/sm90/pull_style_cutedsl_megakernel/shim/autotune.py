@@ -38,14 +38,22 @@ from .tuner import default_knobs, is_valid
 def _sweep_geometries() -> List[Dict[str, Any]]:
     """Every geometry that wins at least one bucket of the kernel drop's
     four-rank sweep (``heuristic_config.HEURISTIC_CONFIGS``) or of the
-    eight-rank overrides (``EP8_OVERRIDES``), both scale modes, deduplicated.
-    Derived from the tables so a future refresh updates the candidate set
-    automatically."""
-    from moe_hopper_fp8.heuristic_config import EP8_OVERRIDES, HEURISTIC_CONFIGS
+    eight- / sixteen-rank overrides (``EP8_OVERRIDES`` / ``EP16_OVERRIDES``),
+    both scale modes, deduplicated.  Derived from the tables so a future
+    refresh updates the candidate set automatically."""
+    from moe_hopper_fp8.heuristic_config import (
+        EP8_OVERRIDES,
+        EP16_OVERRIDES,
+        HEURISTIC_CONFIGS,
+    )
 
     out: List[Dict[str, Any]] = []
     seen = set()
-    for table in (*HEURISTIC_CONFIGS.values(), *EP8_OVERRIDES.values()):
+    for table in (
+        *HEURISTIC_CONFIGS.values(),
+        *EP8_OVERRIDES.values(),
+        *EP16_OVERRIDES.values(),
+    ):
         for c in table.values():
             # The scheduler companions (group_hint / tail_split_pairs) were
             # tuned with the geometry, so they travel with it.

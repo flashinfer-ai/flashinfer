@@ -256,6 +256,30 @@ EP8_OVERRIDES = {
     },
 }
 
+# Sixteen ranks (two nodes x eight H100, NCCL GIN; EOS 2026-10-29, two
+# interleaved rounds) give every expert four times the four-rank rows of a
+# bucket.  Blockwise 128 / 256 (32 / 64 rows per expert) take the four-rank 1024
+# row (64 rows per expert): the swap-AB N16 / N32 rows re-read every expert's
+# weights once per token tile (1487-1513 -> 782-791 us, 1569-1605 -> 859-891 us).
+# 512-4096 take the eight-rank row (cga 2x1, tail split, one-wave group):
+# -29% / -6% / -7% / -3..-4%.  8 / 64 measured within noise; per_tensor and
+# the other buckets were not measured.
+_EP16_BW_SMALL = HEURISTIC_CONFIGS["blockwise"][1024]
+_EP16_BW_LARGE = EP8_OVERRIDES["blockwise"][1024]
+EP16_OVERRIDES = {
+    "per_tensor": {},
+    "blockwise": {
+        128: _EP16_BW_SMALL,
+        256: _EP16_BW_SMALL,
+        512: _EP16_BW_LARGE,
+        1024: _EP16_BW_LARGE,
+        2048: _EP16_BW_LARGE,
+        4096: _EP16_BW_LARGE,
+    },
+}
+
+_RANK_OVERRIDES = {8: EP8_OVERRIDES, 16: EP16_OVERRIDES}
+
 
 def token_bucket(tokens_per_rank: int) -> int:
     """Map a positive token count to the next measured power-of-two bucket."""
@@ -307,8 +331,11 @@ def select_heuristic_config(
         raise ValueError(f"Unsupported FP8 scale mode: {scale_mode!r}") from error
     bucket = token_bucket(tokens_per_rank)
     config = configs[bucket]
-    if (world_size, num_experts, num_topk) == (8, _TUNED_NUM_EXPERTS, _TUNED_NUM_TOPK):
-        config = EP8_OVERRIDES[normalized_scale_mode].get(bucket, config)
+    overrides = _RANK_OVERRIDES.get(world_size)
+    if overrides is not None and (num_experts, num_topk) == (
+        _TUNED_NUM_EXPERTS, _TUNED_NUM_TOPK,
+    ):
+        config = overrides[normalized_scale_mode].get(bucket, config)
     return HopperFp8ConfigSelection(
         config=_apply_tail_split_env_override(config),
         source="heuristic",
@@ -385,6 +412,7 @@ __all__ = [
     "HopperFp8ConfigSelection",
     "TAIL_SPLIT_ENV",
     "EP8_OVERRIDES",
+    "EP16_OVERRIDES",
     "TOKEN_BUCKETS",
     "resolve_hopper_fp8_config",
     "select_heuristic_config",

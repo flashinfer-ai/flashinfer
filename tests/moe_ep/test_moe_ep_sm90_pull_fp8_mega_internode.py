@@ -469,3 +469,7 @@ def test_moe_ep_sm90_pull_fp8_internode_kernel_layout(
     names = [spec.name for spec in kernel._local_region_specs]
     # Data buffers start at l1_token_buffer; everything before it is reset.
     assert names.index("gin_token_count") < names.index("l1_token_buffer")
+    # The epilogue warps run the node reduce from their own branch.
+    comm = kernel.token_comm
+    assert comm.num_tail_reduce_warps == len(kernel.epilogue_warp_id)
+    assert comm.tail_reduce_in_epilogue

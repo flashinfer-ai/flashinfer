@@ -1600,6 +1600,26 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         )
 
     @cute.jit
+    def token_comm_hook_epilogue_tail(
+        self,
+        token_comm_args,
+        *,
+        warp_idx,
+        lane_idx,
+        tidx,
+    ):
+        # Internode: the epilogue warps run their share of the kernel tail
+        # (the node reduce) from their own branch, under their register
+        # budget; token_comm_hook_kernel_tail then skips them.  They are
+        # exactly the tail reduce warps (num_tail_reduce_warps is
+        # len(epilogue_warp_id) with GIN, see __init__).
+        if cutlass.const_expr(self.token_comm.tail_reduce_in_epilogue):
+            self._kernel_tail_snapshot(token_comm_args, tidx=tidx)
+            self.token_comm.kernel_tail_reduce_warps(
+                token_comm_args, warp_idx=warp_idx, lane_idx=lane_idx,
+            )
+
+    @cute.jit
     def token_comm_hook_kernel_tail(
         self,
         token_comm_args,
@@ -1608,6 +1628,26 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         lane_idx,
         tidx,
     ):
+        if cutlass.const_expr(self.token_comm.tail_reduce_in_epilogue):
+            if warp_idx >= Int32(len(self.epilogue_warp_id)):
+                self._kernel_tail_snapshot(token_comm_args, tidx=tidx)
+                self.token_comm.kernel_tail(
+                    token_comm_args,
+                    warp_idx=warp_idx,
+                    lane_idx=lane_idx,
+                    tidx=tidx,
+                )
+        else:
+            self._kernel_tail_snapshot(token_comm_args, tidx=tidx)
+            self.token_comm.kernel_tail(
+                token_comm_args,
+                warp_idx=warp_idx,
+                lane_idx=lane_idx,
+                tidx=tidx,
+            )
+
+    @cute.jit
+    def _kernel_tail_snapshot(self, token_comm_args, *, tidx):
         # Snapshot the dispatch-produced per-expert token counts before the
         # generic tail zeroes expert_recv_count_sum between its NVLink
         # barriers.  CTA 0 copies the low 32 bits into the persistent local
@@ -1639,13 +1679,6 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 packed_count = Int64(token_comm_args.expert_recv_count_sum[expert_idx])
                 snapshot[expert_idx] = Int32(packed_count & Int64(0xFFFFFFFF))
                 expert_idx = expert_idx + block_dim_x
-
-        self.token_comm.kernel_tail(
-            token_comm_args,
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-            tidx=tidx,
-        )
 
 
 class Sm90MegaMoESwapABFp8Kernel(

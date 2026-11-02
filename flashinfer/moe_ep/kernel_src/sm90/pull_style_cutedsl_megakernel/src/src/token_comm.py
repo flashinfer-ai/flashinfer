@@ -491,7 +491,9 @@ class TokenInPullTokenBackPush:
         enable_nccl_gin: bool = False,
         global_rank: int = 0,
         # Internode tail: warps [0, n) (the epilogue warps, idle once the
-        # GEMM drains) run the node reduce; 0 keeps it on the dispatch group.
+        # GEMM drains) run the node reduce from their own branch through
+        # kernel_tail_reduce_warps and do not call kernel_tail; 0 keeps the
+        # reduce on the dispatch group inside kernel_tail.
         num_tail_reduce_warps: int = 0,
         # Launch-order-independent dispatch slots (see
         # ``_dispatch_prep_deterministic``).  Off by default: the atomic path
@@ -831,6 +833,12 @@ class TokenInPullTokenBackPush:
         self.gin_ret_signal_base = 2 * s
         self.gin_signal_count = 3 * s
         self.gin_pay_puts = 3
+        # The reduce warps run their share of the tail (the node reduce)
+        # from their own branch: the shared kernel tail is compiled for the
+        # 48-register dispatch group, which spills the reduce's loads.
+        self.tail_reduce_in_epilogue = (
+            self.enable_nccl_gin and self.num_tail_reduce_warps > 0
+        )
         # Developer-only progress stamps (MEGA_GIN_DEBUG_ADDR = device-visible
         # pinned host address); baked in at trace time, off by default.
         self._dbg_addr = int(os.environ.get("MEGA_GIN_DEBUG_ADDR", "0"))
@@ -3829,6 +3837,28 @@ class TokenInPullTokenBackPush:
         cute.arch.sync_warp()
 
     @cute.jit
+    def kernel_tail_reduce_warps(self, token_comm_args, *, warp_idx, lane_idx):
+        """The reduce warps' share of ``kernel_tail`` (``tail_reduce_in_epilogue``).
+
+        Called from the reduce warps' own branch so the node reduce is
+        compiled under their register budget; the arrivals pair with the
+        other warps' kernel-tail barriers around B1 and the reduce.
+        """
+        nb_kernel_tail = pipeline.NamedBarrier(
+            barrier_id=self.kernel_tail_named_barrier_id,
+            num_threads=self.kernel_tail_threads,
+        )
+        nb_kernel_tail.arrive_and_wait()
+        # The dispatch warps passed B1: every node-local FC2 write, including
+        # the landing rows of the remote origins this rank proxies, is visible.
+        nb_kernel_tail.arrive_and_wait()
+        self._gin_node_reduce(
+            token_comm_args, self._cta_linear_id(), Int32(warp_idx), lane_idx,
+            self.num_tail_reduce_warps,
+        )
+        nb_kernel_tail.arrive_and_wait()
+
+    @cute.jit
     def kernel_tail(
         self,
         token_comm_args,
@@ -3897,16 +3927,13 @@ class TokenInPullTokenBackPush:
                         token_comm_args, cta_linear_id, local_warp_idx, lane_idx,
                         self.num_dispatch_warps,
                     )
-        if cutlass.const_expr(self.enable_nccl_gin and self.num_tail_reduce_warps > 0):
-            # The epilogue warps reduce: B1 (ordered here by the CTA barrier)
-            # made the landing rows visible, and their register file keeps
-            # far more loads in flight than the 48-register dispatch group.
+        if cutlass.const_expr(self.tail_reduce_in_epilogue):
+            # The epilogue warps reduce (kernel_tail_reduce_warps, from their
+            # own branch) between these two barriers: B1 (ordered here by the
+            # CTA barrier) made the landing rows visible, and their register
+            # file keeps far more loads in flight than the 48-register
+            # dispatch group.
             nb_kernel_tail.arrive_and_wait()
-            if warp_idx < Int32(self.num_tail_reduce_warps):
-                self._gin_node_reduce(
-                    token_comm_args, self._cta_linear_id(), Int32(warp_idx),
-                    lane_idx, self.num_tail_reduce_warps,
-                )
             nb_kernel_tail.arrive_and_wait()
         if (warp_idx >= self.dispatch_warp_start) and (
             warp_idx < self.dispatch_warp_start + self.num_dispatch_warps
