@@ -137,18 +137,29 @@ def _det_plan() -> Any:
     return cake_kcp_plan
 
 
+# The non-deterministic package's modules once imported (_nd_kcp / _nd_plan): every later call reads the module object
+# instead of running the import statement again.
+_ND_MODULES: dict[str, Any] = {}
+
+
 def _nd_kcp() -> Any:
     """The non-deterministic package's host module, imported on first use."""
-    from .experimental.cake_kda_train_kcp import cake_kcp  # noqa: PLC0415
+    mod = _ND_MODULES.get("cake_kcp")
+    if mod is None:
+        from .experimental.cake_kda_train_kcp import cake_kcp  # noqa: PLC0415
 
-    return cake_kcp
+        mod = _ND_MODULES["cake_kcp"] = cake_kcp
+    return mod
 
 
 def _nd_plan() -> Any:
     """The non-deterministic package's plan module, imported on first use."""
-    from .experimental.cake_kda_train_kcp import cake_kcp_plan  # noqa: PLC0415
+    mod = _ND_MODULES.get("cake_kcp_plan")
+    if mod is None:
+        from .experimental.cake_kda_train_kcp import cake_kcp_plan  # noqa: PLC0415
 
-    return cake_kcp_plan
+        mod = _ND_MODULES["cake_kcp_plan"] = cake_kcp_plan
+    return mod
 
 
 def _det_workspace(workspace: Any, deterministic: bool, entry: str) -> Any:

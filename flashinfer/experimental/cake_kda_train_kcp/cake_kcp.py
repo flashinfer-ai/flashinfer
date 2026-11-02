@@ -1839,6 +1839,52 @@ SLICE_CACHE_MAX = 256  # pool[:n] views a WorkspaceKcp keeps (cleared when full)
 ENSURE_CACHE_MAX = (
     128  # trimmed-path ensure records a WorkspaceKcp keeps (cleared when full)
 )
+# plans whose local_scratch_table_bytes _scratch_bytes keeps (cleared when full)
+SCRATCH_BYTES_MAX = 256
+# cake_kcp_plan.local_scratch_table_bytes by plan object: id -> (the plan, its bytes).  A plan is immutable and the
+# entry holds it, so an id is not reused while its entry lives.
+_SCRATCH_BYTES: dict[int, tuple[Any, int]] = {}
+# The identity tile of the per-call workspaces (``workspace=None``, _prepare) by (device index, state dtype):
+# (the [128 * 128] identity, the raw stream that built it, the event recorded after the build).  The KCP programs only
+# read the pool "eye" (the x0 of the "map" / "tmap_m" merges, the zero state's never-read base pointer), so every
+# per-call workspace of a device binds this one tile instead of allocating and filling its own; it is never released or
+# replaced (pointer-stable), and a call on another stream orders the build first (one event wait, no host wait).
+_IDENTITY_TILES: dict[tuple[int, torch.dtype], tuple[torch.Tensor, int, Any]] = {}
+
+
+def _scratch_bytes(plan: Any) -> int:
+    """:func:`cake_kcp_plan.local_scratch_table_bytes` of ``plan``, computed once per plan object."""
+    hit = _SCRATCH_BYTES.get(id(plan))
+    if hit is not None and hit[0] is plan:
+        return hit[1]
+    n = cake_kcp_plan.local_scratch_table_bytes(plan)
+    if len(_SCRATCH_BYTES) >= SCRATCH_BYTES_MAX:
+        _SCRATCH_BYTES.clear()
+    _SCRATCH_BYTES[id(plan)] = (plan, n)
+    return n
+
+
+def _identity_tile(device: torch.device, dtype: torch.dtype) -> torch.Tensor | None:
+    """The shared identity tile of ``device`` (:data:`_IDENTITY_TILES`), built by the first call that needs it and
+    ordered on the current stream; ``None`` off CUDA and while the current stream captures a CUDA graph (a fill
+    captured there would run only at a replay, and a capture waits on no event recorded outside it): the workspace
+    then fills a tile of its own, as every workspace a caller owns does."""
+    if device.type != "cuda" or torch.cuda.is_current_stream_capturing():
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    raw = _raw_stream(index)
+    entry = _IDENTITY_TILES.get((index, dtype))
+    if entry is None:
+        tile = _alloc((TILE,), dtype, device)
+        tile.view(D, D).copy_(torch.eye(D, dtype=dtype, device=device))
+        built = torch.cuda.Event()
+        built.record(torch.cuda.current_stream(index))
+        # a concurrent first build on another thread: the first entry stored wins, the other tile is dropped
+        entry = _IDENTITY_TILES.setdefault((index, dtype), (tile, raw, built))
+    tile, made_on, built = entry
+    if made_on != raw:
+        torch.cuda.current_stream(index).wait_event(built)
+    return tile
 
 
 def _plan_view(arena: Any, plan: Any) -> Any:
@@ -3334,6 +3380,9 @@ class WorkspaceKcp:
         self._slices: dict[
             tuple[str, int], tuple[torch.Tensor, torch.Tensor]
         ] = {}  # pool[:n] views per (name, n), at most SLICE_CACHE_MAX
+        # the per-call workspace of a workspace=None call (_prepare): its "eye" pool is the device's shared identity
+        # tile (_identity_tile); a workspace a caller holds fills its own once
+        self._shared_eye = False
         if ctx is not None:
             if H is None:
                 raise ValueError("WorkspaceKcp: H is required with ctx")
@@ -3499,21 +3548,30 @@ class WorkspaceKcp:
     @staticmethod
     def _pool_need(tb: _Tables, backward: bool) -> dict[str, int]:
         """The elements of every pool ``tb`` needs on a ``backward`` / forward-only workspace, the lazily
-        allocated pools excluded and each :data:`cake_kcp_plan.SHARED_POOLS` pair at the larger need of the two."""
-        # allocated by the first call that reads them (pool()): the ring pools; on a forward-only workspace the pools
-        # only a forward without a saved set reads
-        lazy = cake_kcp_plan.LAZY_POOLS + (
-            () if backward else cake_kcp_plan.FWD_LAZY_POOLS
-        )
-        need = {
-            name: n for name, n in tb.pool_sizes(backward).items() if name not in lazy
-        }
-        for pair in cake_kcp_plan.SHARED_POOLS:  # one storage of the larger need
-            top = max((need[m] for m in pair if m in need), default=0)
-            for m in pair:
-                if m in need:
-                    need[m] = top
-        return need
+        allocated pools excluded and each :data:`cake_kcp_plan.SHARED_POOLS` pair at the larger need of the two.
+        Computed once per table set and direction (its sizes are fixed at construction; kept on the set as
+        ``_kcp_pool_need``); every call gets a copy of its own."""
+        backward = bool(backward)
+        kept = tb.__dict__.setdefault("_kcp_pool_need", {})
+        need = kept.get(backward)
+        if need is None:
+            # allocated by the first call that reads them (pool()): the ring pools; on a forward-only workspace the
+            # pools only a forward without a saved set reads
+            lazy = cake_kcp_plan.LAZY_POOLS + (
+                () if backward else cake_kcp_plan.FWD_LAZY_POOLS
+            )
+            need = {
+                name: n
+                for name, n in tb.pool_sizes(backward).items()
+                if name not in lazy
+            }
+            for pair in cake_kcp_plan.SHARED_POOLS:  # one storage of the larger need
+                top = max((need[m] for m in pair if m in need), default=0)
+                for m in pair:
+                    if m in need:
+                        need[m] = top
+            kept[backward] = need
+        return dict(need)
 
     def _size_pools(self, need: dict[str, int], device: torch.device) -> None:
         replaced = False
@@ -3580,12 +3638,12 @@ class WorkspaceKcp:
         return list(out.values())
 
     def _local_plan(self, key: tuple[int, int, int], device: torch.device) -> Any:
+        """The existing backend's plan of ``(S, num_docs, H)`` on ``device`` (its architecture cached per device
+        index, :func:`_arch_of`)."""
         index = (
             device.index if device.index is not None else torch.cuda.current_device()
         )
-        return cake_backend.plan(
-            *key, cake_jit.sm_count(index), cake_jit.device_arch(index)
-        )
+        return cake_backend.plan(*key, cake_jit.sm_count(index), _arch_of(index))
 
     def _bind_local(
         self, ctx: Any, H: int, device: torch.device, backward: bool
@@ -3649,8 +3707,9 @@ class WorkspaceKcp:
                 self._local_plan(key, device), passes=self.lean_passes
             )
         if passes is None:
-            self.local = cake_backend.KdaWorkspace.for_problem(
-                *key,
+            # KdaWorkspace.for_problem(*key, device, ...) with the plan of _local_plan (the same cached plan object)
+            self.local = cake_backend.KdaWorkspace(
+                self._local_plan(key, device),
                 device,
                 backward=kind,
                 save_mode=self.save_mode,
@@ -3727,6 +3786,12 @@ class WorkspaceKcp:
             if m is not None and self._pools.pop(m, None) is not None:
                 for key in [k for k in self._slices if k[0] == m]:
                     del self._slices[key]
+        if name == "eye" and self._shared_eye and n == TILE:
+            # a per-call workspace: the device's shared identity tile (read only; _identity_tile)
+            eye = _identity_tile(device, self.state_dtype)
+            if eye is not None:
+                self._pools[name] = eye
+                return True
         t = self._pools[name] = _alloc((n,), self.state_dtype, device)
         if shared:
             self._pools[mate] = t
@@ -3786,20 +3851,17 @@ class WorkspaceKcp:
 
     @property
     def bytes(self) -> int:
-        # every storage once (the SHARED_POOLS pairs are one tensor)
-        kcp = sum(
-            t.numel() * t.element_size()
-            for t in {id(t): t for t in self._pools.values()}.values()
-        )
+        # every storage once (the SHARED_POOLS pairs are one tensor); nbytes = numel() * element_size()
+        kcp = sum(t.nbytes for t in {id(t): t for t in self._pools.values()}.values())
         local = 0
         if self.local is not None:
             # the arena and the intra record's scratch table set where it writes one, its own and each plan view's
             counts = self.local.__dict__.get(TAIL_COUNTS_ATTR)
             local = (
                 int(self.local.bytes)
-                + cake_kcp_plan.local_scratch_table_bytes(self.local.plan)
+                + _scratch_bytes(self.local.plan)
                 + self._views_scratch
-                + (0 if counts is None else counts.numel() * counts.element_size())
+                + (0 if counts is None else counts.nbytes)
             )
         return kcp + local
 
@@ -3807,7 +3869,7 @@ class WorkspaceKcp:
     def pool_bytes(self) -> dict[str, int]:
         """Bytes per pool name; the two names of a :data:`cake_kcp_plan.SHARED_POOLS` pair report the same
         storage (:attr:`bytes` counts it once)."""
-        return {k: t.numel() * t.element_size() for k, t in self._pools.items()}
+        return {k: t.nbytes for k, t in self._pools.items()}
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -3866,12 +3928,15 @@ class SavedKcp:
 
     def tensors(self) -> tuple[torch.Tensor, ...]:
         """``S_in``, the optional members present, then the tape set when present (in :attr:`_TAPE` order)."""
-        base = (self.S_in,) + tuple(
-            t for t in (getattr(self, n) for n in self._OPTIONAL) if t is not None
-        )
-        if self.h is None:
-            return base
-        return base + tuple(getattr(self, n) for n in self._TAPE)
+        out = [self.S_in]
+        for name in self._OPTIONAL:
+            t = getattr(self, name)
+            if t is not None:
+                out.append(t)
+        if self.h is not None:
+            for name in self._TAPE:
+                out.append(getattr(self, name))
+        return tuple(out)
 
     def flags(self) -> tuple[bool, ...]:
         """One flag per optional member; one more (``True``) when the tape set travels too."""
@@ -3921,7 +3986,11 @@ class SavedKcp:
 
     @property
     def bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in self.tensors())
+        # nbytes = numel() * element_size(); computed by every saving forward for its LAST_CALL record
+        n = 0
+        for t in self.tensors():
+            n += t.nbytes
+        return n
 
 
 @dataclasses.dataclass
@@ -4038,6 +4107,10 @@ _OPTION_KEYS = (
     "spec3_probe",
     "graph",
 )  # spec3_probe, graph: public keywords
+# the validated options of a call without keywords, per value of cake_kcp_plan.SAVE_TRANSFER_DEFAULT (the one module
+# constant their validation reads at call time): one shared OptionsKcp, which no caller modifies (a call that needs
+# other options builds its own, _handle_options through dataclasses.replace)
+_DEFAULT_OPTIONS: dict[Any, OptionsKcp] = {}
 
 # The deterministic package's keywords of modes this package does not run, at the value each takes when the mode
 # is off: the raw gate (``use_gate_in_kernel`` with ``A_log`` / ``dt_bias`` / ``lower_bound``, FlashInfer #7816) and
@@ -4077,7 +4150,8 @@ def _options(kwargs: dict[str, Any]) -> OptionsKcp:
     through the plan module's validator (``precision_mode``) and, for the test knob ``transfer_walk`` (K3's
     ``tf32_hilo`` / ``bf16x3`` programs of ``build.test.json``: the TF32 hi/lo walk and the full-width BF16x3 form),
     through the same environment gate here, so the public API can never select a non-zero ``precision_mode`` or a
-    non-shipped transfer-walk program."""
+    non-shipped transfer-walk program.  No keywords: the shared validated defaults (:data:`_DEFAULT_OPTIONS`, the
+    same values as a validation of ``{}``)."""
     pre = kwargs.get("_kcp_options")
     if (
         pre is not None
@@ -4087,6 +4161,17 @@ def _options(kwargs: dict[str, Any]) -> OptionsKcp:
                 "_kcp_options is the validated OptionsKcp of the entry point and travels alone"
             )
         return pre
+    if not kwargs:
+        key = cake_kcp_plan.SAVE_TRANSFER_DEFAULT
+        opts = _DEFAULT_OPTIONS.get(key)
+        if opts is None:
+            opts = _DEFAULT_OPTIONS.setdefault(key, _validate_options({}))
+        return opts
+    return _validate_options(kwargs)
+
+
+def _validate_options(kwargs: dict[str, Any]) -> OptionsKcp:
+    """:func:`_options` of keywords other than ``_kcp_options``: a new validated :class:`OptionsKcp`."""
     kwargs = dict(kwargs)
     _refuse_modes(kwargs)
     raw = kwargs.pop("_kcp_test_knobs", None)
@@ -4449,7 +4534,7 @@ def _record(kind: str, call: CallKcp) -> None:
         "n_out": call.tb.n_out,
         "workspace_bytes": call.ws.bytes,
         "pool_bytes": call.ws.pool_bytes,
-        "fresh_bytes": {k: t.numel() * t.element_size() for k, t in call.bufs.items()},
+        "fresh_bytes": {k: t.nbytes for k, t in call.bufs.items()},
         "precision_mode": call.precision_mode,
         "transfer_walk": call.transfer_walk,
         "schedule": call.schedule,
@@ -5597,6 +5682,7 @@ def _prepare(
             local=backend.local_stages,
             save_mode=save_mode,
         )
+        workspace._shared_eye = True  # this call's own: the shared identity tile
     elif not isinstance(workspace, WorkspaceKcp):
         raise TypeError("workspace must be a WorkspaceKcp")
     if workspace.state_dtype != backend.dtypes["state"]:
@@ -5637,6 +5723,8 @@ def _prepare(
 def _require_deterministic_false(deterministic: object, entry: str) -> None:
     """Refuse every numerical mode but ``deterministic=False``: the deterministic programs are another package's
     (a call that swaps only the import path must fail, not change mode)."""
+    if deterministic is False:  # the one accepted value (bool has no subclass)
+        return
     if not isinstance(deterministic, bool) or deterministic:
         raise ValueError(
             f"{entry} is the non-deterministic context-parallel packed KDA training (deterministic=False), got "
@@ -6275,17 +6363,26 @@ def _fwd_handle(
 #
 # Decision (chunk_kda_kcp, once per checkpointed call, _handoff_decide): grad mode on and an input that requires grad;
 # the innermost default saved-tensor hooks are torch.utils.checkpoint's (the non-reentrant original forward's or
-# recompute's pack hook), or none inside a backward's graph task (the reentrant recompute).  The non-reentrant original
-# forward and the reentrant recompute then read the dynamic state -- no CUDA-graph capture, torch.compile tracing or
-# Python dispatch mode (a selective-checkpoint policy, a debug mode) -- and the static keys (_handoff_refusal:
-# boundary_mode="saved", graph="off", spec3_probe="off", the kernel backend with local stages, a CUDA device; "auto"
-# also cake_kcp_plan.kcp_handoff_auto_refusal).  The original forward records its decision on its checkpoint frame
+# recompute's pack hook), or none inside a backward's graph task (the reentrant recompute).  A request the call's own
+# arguments refuse (_handoff_static: boundary_mode="saved", graph="off", spec3_probe="off", a CUDA device; "auto" also
+# cake_kcp_plan.kcp_handoff_shape_refusal of H = v.shape[-2], ctx.partition.total and ctx.world_size) is refused in
+# every pass alike and records nothing: _handoff_static reads the call's mode, options, boundary_mode, v's device and
+# head count and ctx's total and world size, which the recompute passes again unchanged, and under "auto" the plan
+# module's KCP_HANDOFF_HEADS and KCP_HANDOFF_MIN_HEAD_TOKENS, read at call time, which must not change between a
+# checkpointed forward and its backward (patch them only around whole steps: a change in between can refuse a call in
+# one pass only and so shift the replayed decisions); both passes then compute the same refusal for the same call.
+# Such a call appends no decision to the frame in the original forward and takes no cursor in the recompute; the calls
+# that do are the same calls in the same order in both passes, so every recorded decision is replayed by the call that
+# recorded it.  For every other call the non-reentrant original forward and the reentrant recompute read the dynamic
+# state -- no CUDA-graph capture, torch.compile tracing or Python dispatch mode (a selective-checkpoint policy, a debug
+# mode) -- and the remaining keys (_handoff_refusal: the kernel backend with local stages; "auto" also the device's key
+# in cake_kcp_plan.kcp_handoff_auto_refusal).  The original forward records its decision on its checkpoint frame
 # (_HANDOFF_DECISIONS) and the recompute of that frame replays it in call order without reading its own state: the
-# two passes save the same tensors (or torch raises CheckpointError) whatever capture, compile or dispatch-mode state
-# either pass runs under.  A frame the hooks do not expose keeps the light set in both passes.  A rank without tokens
-# keeps no set.  The choice is rank-local: the collectives are the same in count, order and bytes either way, so ranks
-# may differ without a hang.  The package reads no environment variable; a benchmark selects the mode through the
-# keyword.
+# two passes save the same tensors (or torch raises CheckpointError) whatever capture, compile, dispatch-mode or
+# backend state either pass runs under.  A frame the hooks do not expose keeps the light set in both passes.  A rank
+# without tokens keeps no set.  The choice is rank-local: the collectives are the same in count, order and bytes either
+# way, so ranks may differ without a hang.  The package reads no environment variable; a benchmark selects the mode
+# through the keyword.
 
 KCP_HANDOFF_MODES = cake_kcp_plan.KCP_HANDOFF_MODES
 KCP_HANDOFF_DEFAULT = cake_kcp_plan.KCP_HANDOFF_DEFAULT
@@ -6294,7 +6391,11 @@ KCP_HANDOFF_HEADS = cake_kcp_plan.KCP_HANDOFF_HEADS
 KCP_HANDOFF_MIN_HEAD_TOKENS = cake_kcp_plan.KCP_HANDOFF_MIN_HEAD_TOKENS
 kda_handoff_bytes_kcp = cake_kcp_plan.kda_handoff_bytes_kcp
 # calls recorded with a kept ("save") / read ("bound") tape set, and the requests refused by the static keys, by reason
-# (counted where the decision is made: the original forward / the reentrant recompute)
+# in _handoff_refusal's order (boundary, graph, spec3, backend, device, then "auto"'s heads / work / unverified):
+# counted once per checkpointed call, where the decision is made -- the original forward / the reentrant recompute,
+# neither under a capture, tracing or a dispatch mode.  A request the call's arguments refuse (_handoff_static) reads no
+# frame: it counts in an original forward when torch's checkpoint hooks expose their frames
+# (_handoff_frames_readable); every other request counts once its frame has been read.
 HANDOFF_STATS: dict[str, int] = {
     "save": 0,
     "bound": 0,
@@ -6356,27 +6457,6 @@ def _handoff_top_pack() -> Any:
     return None if top is None else top[0]
 
 
-def _handoff_hooks() -> str | None:
-    """This thread's innermost default saved-tensor hooks: ``"none"``, ``"recompute"`` (the non-reentrant checkpoint's
-    recompute), ``"original"`` (a checkpoint region's original forward, also an inner region's forward that an outer
-    recompute re-runs) or ``"other"`` (a caller's hooks); ``None`` when the torch binding is missing or unusable."""
-    if _TOP_HOOKS is None:
-        return None
-    try:
-        pack = _handoff_top_pack()
-        if pack is None:
-            return "none"
-        module = getattr(pack, "__module__", None)
-        name = getattr(pack, "__qualname__", None)
-    except Exception:  # noqa: BLE001
-        return None
-    if module == _CHECKPOINT_MODULE and name == _RECOMPUTE_PACK:
-        return "recompute"
-    if module == _CHECKPOINT_MODULE and name == _ORIGINAL_PACK:
-        return "original"
-    return "other"
-
-
 @functools.cache
 def _handoff_frames_readable() -> bool:
     """Whether both pack hooks of torch.utils.checkpoint hold their frame in their closure (the original forward's
@@ -6419,13 +6499,16 @@ def _handoff_frame(phase: str) -> tuple[Any, Any] | None:
         return None
 
 
+# torch.compiler.is_compiling (None on a torch without it), looked up once
+_IS_COMPILING = getattr(getattr(torch, "compiler", None), "is_compiling", None)
+
+
 def _handoff_blocked() -> bool:
     """CUDA-graph capture or ``torch.compile`` tracing (a state that cannot be read blocks too)."""
     try:
         if torch.cuda.is_current_stream_capturing():
             return True
-        is_compiling = getattr(getattr(torch, "compiler", None), "is_compiling", None)
-        return bool(is_compiling is not None and is_compiling())
+        return bool(_IS_COMPILING is not None and _IS_COMPILING())
     except Exception:  # noqa: BLE001
         return True
 
@@ -6453,54 +6536,121 @@ def _handoff_toolkit(arch: str) -> str | None:
         return None
 
 
+# the device keys of _handoff_key by CUDA device index (each part is fixed for the process)
+_HANDOFF_KEYS: dict[int, tuple[str, int, str | None]] = {}
+# the refusals _handoff_refusal places before the backend's (the call's option keys)
+_HANDOFF_OPTION_REASONS = ("boundary", "graph", "spec3")
+
+
 def _handoff_key(device: torch.device) -> tuple[str, int, str | None]:
-    """The (architecture, SM count, Cake build toolkit) key of a CUDA device (:data:`KCP_HANDOFF_VERIFIED`)."""
+    """The (architecture, SM count, Cake build toolkit) key of a CUDA device (:data:`KCP_HANDOFF_VERIFIED`), kept per
+    device index: the architecture (:func:`_arch_of`), the SM count and the toolkit never change within a process.  A
+    device without an exported architecture raises ``RuntimeError`` on every call (nothing is kept for it)."""
     index = device.index if device.index is not None else torch.cuda.current_device()
-    arch = cake_jit.device_arch(index)
-    return arch, int(cake_jit.sm_count(index)), _handoff_toolkit(arch)
+    key = _HANDOFF_KEYS.get(index)
+    if key is None:
+        arch = _arch_of(index)
+        key = _HANDOFF_KEYS[index] = (
+            arch,
+            int(cake_jit.sm_count(index)),
+            _handoff_toolkit(arch),
+        )
+    return key
 
 
 def _handoff_phase(*inputs: Any) -> str | None:
-    """The checkpoint pass this call runs in (``"original"``, ``"recompute"`` or ``"reentrant"``), ``None`` outside
-    one (see the rule above): the saved-tensor hooks and the graph task only."""
-    if not torch.is_grad_enabled() or not any(
-        isinstance(t, torch.Tensor) and t.requires_grad for t in inputs
-    ):
+    """The checkpoint pass this call runs in (see the rule above), from this thread's innermost default saved-tensor
+    hooks and graph task only: ``"original"`` under torch.utils.checkpoint's original-forward pack hook (also an inner
+    region's forward that an outer recompute re-runs), ``"recompute"`` under its recompute pack hook, ``"reentrant"``
+    without hooks inside a backward's graph task; ``None`` under a caller's hooks, without hooks outside a backward,
+    or when the binding is missing or unusable.  It runs in both passes of every checkpointed call, also where the
+    call's arguments refuse the hand-off: one function, the hook read inline."""
+    if not torch.is_grad_enabled():
         return None
-    hooks = _handoff_hooks()
-    if hooks in ("original", "recompute"):
-        return hooks
-    if hooks == "none":
+    for t in inputs:  # an input that requires grad (a loop: no generator per call)
+        if isinstance(t, torch.Tensor) and t.requires_grad:
+            break
+    else:
+        return None
+    if _TOP_HOOKS is None:
+        return None
+    try:
+        try:
+            top = _TOP_HOOKS(True)  # ignore_is_tracing
+        except TypeError:  # a torch whose binding takes no argument
+            top = _TOP_HOOKS()
+        pack = None if top is None else top[0]
+        if pack is not None:
+            module = getattr(pack, "__module__", None)
+            name = getattr(pack, "__qualname__", None)
+    except Exception:  # noqa: BLE001 - an unusable binding: no checkpoint pass
+        return None
+    # no hooks: the reentrant recompute runs inside a backward's graph task
+    if pack is None:
         task = _handoff_task()
         return None if task is None or task == -1 else "reentrant"
-    return None
+    if module == _CHECKPOINT_MODULE:
+        if name == _RECOMPUTE_PACK:
+            return "recompute"
+        if name == _ORIGINAL_PACK:
+            return "original"
+    return None  # a caller's hooks
 
 
-def _handoff_refusal(
+def _handoff_static(
     mode: str, opts: OptionsKcp, boundary_mode: str, v: torch.Tensor, ctx: Any
 ) -> str | None:
-    """Why a request the phase admitted keeps the light set (``None``: the forward keeps its tape set): the static
-    keys of the call; under ``"auto"`` also :func:`cake_kcp_plan.kcp_handoff_auto_refusal` of this device's key, the
-    head count and the partition's total and world size."""
+    """The refusal the call's own arguments decide (``None``: they admit the request; see the rule above):
+    ``boundary_mode``, the ``graph`` and ``spec3_probe`` options, ``v`` off CUDA and, under ``"auto"``,
+    :func:`cake_kcp_plan.kcp_handoff_shape_refusal` of the head count ``v.shape[-2]`` and the partition's total and
+    world size.  It reads no backend, device property or checkpoint state; besides the arguments, which a call's
+    original forward and its recompute pass alike, it reads only :data:`cake_kcp_plan.KCP_HANDOFF_HEADS` and
+    :data:`cake_kcp_plan.KCP_HANDOFF_MIN_HEAD_TOKENS` (under ``"auto"``, at call time), so the two passes compute the
+    same value as long as those two constants do not change between them."""
     if boundary_mode != "saved":
         return "boundary"
     if opts.graph != "off":
         return "graph"
     if opts.spec3_probe != "off":
         return "spec3"
-    backend = get_backend()
-    if not isinstance(backend, KernelBackend) or not backend.local_stages:
-        return "backend"
     if v.device.type != "cuda":
         return "device"
     if mode == "auto":
+        return cake_kcp_plan.kcp_handoff_shape_refusal(
+            int(v.shape[-2]), ctx.partition.total, ctx.world_size
+        )
+    return None
+
+
+def _handoff_backend() -> str | None:
+    """``"backend"`` when the installed backend is not the kernel backend with local stages, else ``None``."""
+    backend = get_backend()
+    if not isinstance(backend, KernelBackend) or not backend.local_stages:
+        return "backend"
+    return None
+
+
+def _handoff_refusal(
+    mode: str, opts: OptionsKcp, boundary_mode: str, v: torch.Tensor, ctx: Any
+) -> str | None:
+    """Why a request the phase admitted keeps the light set (``None``: the forward keeps its tape set), in the order
+    boundary, graph, spec3, backend, device, then under ``"auto"`` :func:`cake_kcp_plan.kcp_handoff_auto_refusal` of
+    this device's key, the head count and the partition's total and world size: :func:`_handoff_static` with the
+    installed backend (:func:`_handoff_backend`) after the option keys and the device's key last."""
+    reason = _handoff_static(mode, opts, boundary_mode, v, ctx)
+    if reason in _HANDOFF_OPTION_REASONS:
+        return reason
+    backend = _handoff_backend()
+    if backend is not None:
+        return backend
+    if reason is None and mode == "auto":
         return cake_kcp_plan.kcp_handoff_auto_refusal(
             _handoff_key(v.device),
             int(v.shape[-2]),
             ctx.partition.total,
             ctx.world_size,
         )
-    return None
+    return reason
 
 
 def _handoff_replayed() -> bool:
@@ -6520,13 +6670,30 @@ def _handoff_decide(
     mode: str, opts: OptionsKcp, boundary_mode: str, ctx: Any, *inputs: Any
 ) -> bool:
     """Whether this call keeps its tape set, decided once per checkpointed call (see the rule above): no outside a
-    checkpoint pass; in a non-reentrant recompute the original forward's decision (:func:`_handoff_replayed`); in the
-    original forward and the reentrant recompute the dynamic state and :func:`_handoff_refusal` (``inputs`` = ``q, k,
-    v, g, beta``), the original forward recording the result on its frame."""
+    checkpoint pass; no in every pass when the call's arguments refuse it (:func:`_handoff_static`; nothing recorded
+    or replayed, the refusal counted where a decision is made); otherwise in a non-reentrant recompute the original
+    forward's decision (:func:`_handoff_replayed`), in the original forward and the reentrant recompute the dynamic
+    state and :func:`_handoff_refusal` (``inputs`` = ``q, k, v, g, beta``), the original forward recording the result
+    on its frame."""
     if mode == "off":
         return False
     phase = _handoff_phase(*inputs)
     if phase is None:
+        return False
+    reason = _handoff_static(mode, opts, boundary_mode, inputs[2], ctx)
+    if reason is not None:
+        # the same refusal in both passes: no frame record, no recompute cursor; counted once, in the original forward
+        # (whose frames torch exposes) or the reentrant recompute, under _handoff_refusal's order of reasons
+        if (
+            phase == "recompute"
+            or (phase == "original" and not _handoff_frames_readable())
+            or _handoff_blocked()
+            or _handoff_dispatch_modes()
+        ):
+            return False
+        if reason not in _HANDOFF_OPTION_REASONS:
+            reason = _handoff_backend() or reason
+        HANDOFF_STATS["refused_" + reason] += 1
         return False
     if phase == "recompute":
         return _handoff_replayed()
@@ -6729,11 +6896,14 @@ def chunk_kda_kcp(
     wherever the call supports it, ``"off"`` never.  Outside a checkpoint pass, with ``graph="replay"``,
     ``spec3_probe``, ``boundary_mode="replay"``, inside a CUDA-graph capture, under ``torch.compile`` tracing or a
     Python dispatch mode (a selective-checkpoint policy) the call keeps the light set.  The non-reentrant original
-    forward decides and its recompute replays that decision, so both passes save the same tensors whatever state the
-    recompute runs under.  Memory: the set lives from the recompute to the end of the node's backward (and inside the
-    original forward call), so the checkpoint peak per engaged call rises by at most :func:`kda_handoff_bytes_kcp`
-    (the saved set is ``kda_saved_bytes_kcp(..., checkpoint_handoff=True)``: no carry plane); ``"off"`` keeps the
-    light set.
+    forward decides and its recompute replays that decision, so both passes save the same tensors whatever capture,
+    compile or dispatch-mode state the recompute runs under; a request the call's arguments refuse (the keywords above,
+    a tensor off CUDA, under ``"auto"`` ``H`` and the batch's total and world size) is refused in both passes alike,
+    which needs :data:`KCP_HANDOFF_HEADS` and :data:`KCP_HANDOFF_MIN_HEAD_TOKENS` of ``cake_kcp_plan`` to stay
+    unchanged between the forward and its backward.  Memory: the set lives from the recompute to the end of the node's
+    backward (and inside the original forward call), so the checkpoint peak per engaged call rises by at most
+    :func:`kda_handoff_bytes_kcp` (the saved set is ``kda_saved_bytes_kcp(..., checkpoint_handoff=True)``: no carry
+    plane); ``"off"`` keeps the light set.
 
     ``recompute_handle`` (keyword-only; ``None`` = unchanged): a :class:`RecomputeHandleKcp` (any object with an
     ``entries`` dict) makes torch's checkpoint recompute of this call run without the forward state exchange -- the

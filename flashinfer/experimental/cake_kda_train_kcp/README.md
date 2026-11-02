@@ -275,8 +275,10 @@ and conv halo entry points call it on every call). A thread other than the
 compute thread must pass `stream=` (the current stream is per thread). Copies
 are refused under CUDA-graph capture (`graph="replay"` runs the first call of
 a key eagerly). Not covered: `workspace=None` calls allocate their pools per
-call (a caching-allocator miss can call `cudaMalloc`, an out-of-memory retry
-synchronizes; reuse a workspace under memory pressure), the debug paths
+call, all but the read-only identity tile, which the first such call on a
+device builds once and the later ones share (a caching-allocator miss can
+call `cudaMalloc`, an out-of-memory retry synchronizes; reuse a workspace
+under memory pressure), the debug paths
 (`spec3_probe`, `debug_sequence`) and `TORCH_NCCL_BLOCKING_WAIT=1`. The
 previous copies stay reachable for A/B records through the context test knobs
 `upload="blocking"` and `table_cache="workspace"` (the latter only with the
@@ -382,11 +384,21 @@ and H * (total packed tokens // world size) >= KCP_HANDOFF_MIN_HEAD_TOKENS = 393
 ```
 
 The rule comes from the `ckpt` step (time with the hand-off off / on) at
-261392 packed tokens in 4 documents, BF16, head dim 128: H16 and H64
-1.07-1.14 on every row; H4 at CP2 (H * T / W = 522784) 1.05-1.10; H4 at CP4
-(261392) 1.01-1.04 on B200, B300 and R200 but 0.978-0.996 on GB300; H4 at
-CP8 (130696) 0.979-1.010 on B200 and B300.  The bound admits every row that
-gains 5 % or more and refuses every loss.  A new device, toolkit or head
+261392 packed tokens in 4 documents, BF16, head dim 128.  On the rows the rule
+admits, measured with `"auto"` on this version on all four keys with the
+outputs and gradients bitwise those of `"off"`: H4 at CP2 (H * T / W = 522784)
+1.058-1.106; H16 and H64 1.073-1.147 (and 1.034 on one B200 CP8 H16 row whose
+timing drifted 5.20 %, over the benchmark's 2 % limit); H8 and H32, which stay
+in `KCP_HANDOFF_HEADS` on this evidence, 1.041-1.146.  Per key, H8: B200
+1.093-1.128, B300 1.082-1.122, GB300 1.041-1.124, R200 1.078-1.124; H32: B200
+1.117-1.146, B300 1.118-1.139, GB300 1.129-1.137, R200 1.127-1.134.  The H4
+rows the rule refuses were measured with `"on"` forced on the hand-off's first
+version: H4 at CP4 (261392) 1.033-1.043 on B200, 1.011-1.030 on B300 and
+1.025-1.034 on R200 but 0.978-0.989 on GB300; H4 at CP8 (130696) 0.985-1.002
+on B200 and 0.979-1.010 on B300.  That run measured every H4 row at CP2 and
+every H16 and H64 row 5 % or more faster.  H8 at CP8 (261392) is refused as
+`"work"` on the 8-GPU parts.  The bound admits every measured row that gains
+5 % or more and refuses every measured loss.  A new device, toolkit or head
 count needs these rows and the hand-off rows before it enters
 `KCP_HANDOFF_VERIFIED` or `KCP_HANDOFF_HEADS`.  H, the batch's total and the
 world size are the same on every rank, so the ranks of a group of one device
@@ -400,8 +412,10 @@ each rank and lives from the recompute to the end of the node's backward
 (non-reentrant: also inside the original forward call).  An engaged call
 raises the checkpoint peak by at most that much: the saved set grows by
 `kda_saved_bytes_kcp(..., checkpoint_handoff=True) - kda_saved_bytes_kcp(...)`,
-the tape set less the carry plane at `P > 1`.  Measured with `"on"`: +152 MiB
-per rank at CP8 H4 to +10196 MiB at CP2 H64 (T = 261392).
+the tape set less the carry plane at `P > 1`.  Measured with `"on"` forced on
+the hand-off's first version: +152 MiB per rank at CP8 H4 to +10196 MiB at CP2
+H64 (T = 261392); with `"auto"` on this version, +625.5 MiB at CP8 H16
+to +10196 MiB at CP2 H64.
 `kda_saved_bytes_kcp(..., checkpoint_handoff=True)` is the saved set of an
 engaged call (no carry plane; the flag is the decision, a `bool`, not the
 mode); the facade `flashinfer.cake_kda_train_kcp`
@@ -416,12 +430,20 @@ The call keeps the light set outside a checkpoint pass, with
 `graph="replay"`, `spec3_probe`, `boundary_mode="replay"`, inside a
 CUDA-graph capture, under `torch.compile` tracing and under a Python
 dispatch mode (a selective-checkpoint policy).  A non-reentrant checkpoint
-decides once per call: the original forward reads these states and the
-static keys and records its decision on the checkpoint frame, and the
-recompute replays it in call order without reading its own state, so both
-passes save the same tensors (torch raises `CheckpointError` otherwise) even
-when a capture, `torch.compile` or a dispatch mode is active in one pass
-only.  It combines with a recompute handle.
+decides once per call.  A request the call's own arguments refuse
+(`boundary_mode`, `graph`, `spec3_probe`, a tensor off CUDA and, under
+`"auto"`, the head count, the batch's total and the world size) is refused
+alike in both passes, which pass the same arguments, and records nothing.
+Under `"auto"` that refusal also reads `KCP_HANDOFF_HEADS` and
+`KCP_HANDOFF_MIN_HEAD_TOKENS` at call time: neither may change between a
+checkpointed forward and its backward (change them only between steps), or
+one pass can refuse a call the other admits and the recorded decisions shift.
+For every other call the original forward reads these states, the backend
+and the device key and records its decision on the checkpoint frame, and
+the recompute replays it in call order without reading its own state, so
+both passes save the same tensors (torch raises `CheckpointError` otherwise)
+even when a capture, `torch.compile` or a dispatch mode is active in one
+pass only.  It combines with a recompute handle.
 
 One halo exchange for a layer's q / k / v convolutions:
 `cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)` returns the

@@ -2449,13 +2449,20 @@ CHECKPOINT_KEEPS = ("states", "transfer")
 #     and H * (total packed tokens // world size) >= KCP_HANDOFF_MIN_HEAD_TOKENS
 #
 # Measured on the four keys below (B200, B300, GB300, R200; T = 261392 packed tokens in 4 documents, BF16, head dim
-# 128), ckpt step time with the hand-off off / on: H16 and H64 1.07-1.14 on every measured row; H4 at CP2
-# (H * T // W = 522784) 1.05-1.10; H4 at CP4 (261392) 1.03-1.04 on B200, 1.01-1.03 on B300, 1.02-1.04 on R200 and
-# 0.978-0.996 on GB300 (a loss); H4 at CP8 (130696) 0.985-1.002 on B200 and 0.979-1.010 on B300.  The bound 393216
-# lies between 261392 and 522784: it admits every measured row that gains at least 5 % and refuses every measured
-# loss (and the 1-4 % H4 CP4 gains with it).  Every key measured the output and every gradient bitwise equal with
-# the hand-off on and off.  The hand-off raises the checkpoint peak by at most :func:`kda_handoff_bytes_kcp` per rank
-# (measured +152 MiB at CP8 H4 to +10196 MiB at CP2 H64).  A new device, toolkit or head count needs those rows again
+# 128), ckpt step time with the hand-off off / on.  On the rows "auto" admits, measured with "auto" at this version on
+# all four keys with the output and every gradient bitwise those of "off": H4 at CP2 (H * T // W = 522784) 1.058-1.106;
+# H16 and H64 1.073-1.147 (and 1.034 on one B200 CP8 H16 row whose timing drifted 5.20 %, over the bench's 2 % limit);
+# H8 and H32, which stay in KCP_HANDOFF_HEADS on this evidence, 1.041-1.146.  Per key, H8: B200 1.093-1.128, B300
+# 1.082-1.122, GB300 1.041-1.124, R200 1.078-1.124; H32: B200 1.117-1.146, B300 1.118-1.139, GB300 1.129-1.137, R200
+# 1.127-1.134.  The H4 rows "auto" refuses were measured with "on" forced on the hand-off's first version: H4 at CP4
+# (261392) 1.033-1.043 on B200, 1.011-1.030 on B300, 1.025-1.034 on R200 and 0.978-0.989 on GB300 (a loss); H4 at CP8
+# (130696) 0.985-1.002 on B200 and 0.979-1.010 on B300.  That run measured every H4 CP2, H16 and H64 row at least 5 %
+# faster.  H8 at CP8 (261392) is below the bound and refused as "work" on the 8-GPU parts.  The bound 393216 lies
+# between 261392 and 522784: it admits every measured row that gains at least 5 % and refuses every measured loss (and
+# the 1.1-4.3 % H4 CP4 gains of B200, B300 and R200 with it).  Every key measured the output and every gradient bitwise
+# equal with the hand-off on and off.  The hand-off raises the checkpoint peak by at most :func:`kda_handoff_bytes_kcp`
+# per rank (measured with "on" on the first version: +152 MiB at CP8 H4 to +10196 MiB at CP2 H64; with "auto" at this
+# version: +625.5 MiB at CP8 H16 to +10196 MiB at CP2 H64).  A new device, toolkit or head count needs those rows again
 # before it enters KCP_HANDOFF_VERIFIED or KCP_HANDOFF_HEADS.
 #
 # H, the total and the world size are the same on every rank (the layer's head count and the partition every rank
@@ -2506,13 +2513,24 @@ def kcp_handoff_auto_refusal(
     device's (architecture, SM count, toolkit), not in :data:`KCP_HANDOFF_VERIFIED`).  ``total_tokens`` is the packed
     batch's token count (``ctx.partition.total``) and ``world_size`` the group's (``ctx.world_size``), not this
     rank's share."""
+    reason = kcp_handoff_shape_refusal(H, total_tokens, world_size)
+    if reason is not None:
+        return reason
+    if tuple(key) not in KCP_HANDOFF_VERIFIED:
+        return "unverified"
+    return None
+
+
+def kcp_handoff_shape_refusal(H: int, total_tokens: int, world_size: int) -> str | None:
+    """The part of :func:`kcp_handoff_auto_refusal` the call's shape decides, before the device key: ``"heads"``,
+    ``"work"`` or ``None``.  A function of its arguments and of :data:`KCP_HANDOFF_HEADS` and
+    :data:`KCP_HANDOFF_MIN_HEAD_TOKENS` only (read at call time), so the original forward and the recompute of a
+    checkpointed call compute the same value as long as neither constant changes between the two passes."""
     H, total_tokens, world_size = int(H), int(total_tokens), int(world_size)
     if H not in KCP_HANDOFF_HEADS:
         return "heads"
     if H * (total_tokens // world_size) < KCP_HANDOFF_MIN_HEAD_TOKENS:
         return "work"
-    if tuple(key) not in KCP_HANDOFF_VERIFIED:
-        return "unverified"
     return None
 
 
@@ -3318,6 +3336,7 @@ __all__ = [
     "KCP_HANDOFF_MODES",
     "KCP_HANDOFF_VERIFIED",
     "kcp_handoff_auto_refusal",
+    "kcp_handoff_shape_refusal",
     "kda_workspace_bytes_kcp",
     "near_equal",
     "owner_of_head",

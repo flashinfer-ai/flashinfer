@@ -30,13 +30,16 @@ at an admitted head count and refuses as ``"unverified"`` with the verified set 
 the facade ``flashinfer.cake_kda_train_kcp`` forwards the mode under ``deterministic=False`` and never engages under
 ``deterministic=True``; a checkpointed forward with the hand-off retains nothing.  A check whose light path does not
 run under its dispatch mode or policy has nothing to compare: the row lists it under ``not_run``.
-Single-process rows: the static rule, the admission table, the phase probe, the once-per-call decision, the saved
-set's tape members and the byte queries of the package and the facade.
+Single-process rows: the static rule, the admission table, the phase probe, the once-per-call decision (a refusal by
+the call's own arguments records nothing in either pass), the device key, the host values kept across calls (default
+options, pool needs, scratch table bytes), the per-call workspaces' shared identity tile, the saved set's tape members
+and the byte queries of the package and the facade.
 """
 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import gc
 import json
 import os
@@ -808,6 +811,8 @@ def test_handoff_decision_is_made_once_per_checkpointed_call(monkeypatch) -> Non
     from torch.utils.checkpoint import checkpoint
 
     assert cake_kcp._handoff_frames_readable()
+    # every request admitted by its arguments (these CPU tensors would be refused as "device") and by the rest
+    monkeypatch.setattr(cake_kcp, "_handoff_static", lambda *a: None)
     monkeypatch.setattr(cake_kcp, "_handoff_refusal", lambda *a: None)
     # no capture or tracing (the capture read itself is test_handoff_is_blocked_inside_a_cuda_graph_capture's): the
     # decisions below also run on a host without CUDA, where that read raises and so blocks
@@ -861,6 +866,234 @@ def test_handoff_decision_is_made_once_per_checkpointed_call(monkeypatch) -> Non
     monkeypatch.setattr(cake_kcp, "_handoff_frame", frame)
     gc.collect()
     assert len(cake_kcp._HANDOFF_DECISIONS) == frames_before
+
+
+def test_handoff_argument_refusals_record_nothing(monkeypatch) -> None:
+    """A request the call's own arguments refuse (``_handoff_static``: here ``"auto"``'s work bound and
+    ``boundary_mode="replay"``) is refused in both passes alike: it records no decision on the frame and takes no
+    recompute cursor (the frame holds the admitted calls' decisions only and each recompute advances its cursor once
+    per admitted call), so the admitted calls around it replay their own decisions in call order (the first one blocked
+    in the original forward, the last one engaged); it reads no device key, and it is counted once per checkpointed
+    call -- in the original forward, or in the reentrant recompute -- under ``_handoff_refusal``'s order of reasons
+    (the backend before the device and the "auto" rule).  It is not counted under a capture or tracing block, under a
+    dispatch mode, or in an original forward whose frames torch does not expose (the reentrant recompute, which reads
+    no frame, still counts there)."""
+    from torch.utils.checkpoint import checkpoint
+
+    assert cake_kcp._handoff_frames_readable()
+
+    def no_key(device):
+        raise AssertionError("a request was decided from the device key")
+
+    monkeypatch.setattr(cake_kcp, "_handoff_key", no_key)
+    opts = cake_kcp._options({})
+    # H4 at CP8 of T = 261392: H * (T // W) = 130696, below the bound ("work"); "on" reads no rule
+    ctx = types.SimpleNamespace(
+        partition=types.SimpleNamespace(total=261392), world_size=8
+    )
+    v = types.SimpleNamespace(device=torch.device("cuda", 0), shape=(32674, 4, 128))
+    assert cake_kcp._handoff_static("auto", opts, "saved", v, ctx) == "work"
+    assert cake_kcp._handoff_static("on", opts, "replay", v, ctx) == "boundary"
+    assert cake_kcp._handoff_static("on", opts, "saved", v, ctx) is None
+    blocked: list = []
+
+    # the first dynamic read of a step blocks: that call records False
+    def first_blocked() -> bool:
+        blocked.append(None)
+        return len(blocked) == 1
+
+    monkeypatch.setattr(cake_kcp, "_handoff_blocked", first_blocked)
+    seen: list = []
+    frames: list = []
+    mixed = [("on", "saved"), ("auto", "saved"), ("on", "replay"), ("on", "saved")]
+    refused = [("auto", "saved"), ("on", "replay")]
+    calls = list(mixed)
+
+    def fn(x):
+        for mode, boundary in calls:
+            seen.append(
+                cake_kcp._handoff_decide(mode, opts, boundary, ctx, x, x, v, x, x)
+            )
+        # the frame's record at the end of this pass: its decisions and its recompute cursors
+        phase = cake_kcp._handoff_phase(x)
+        found = (
+            cake_kcp._handoff_frame(phase)
+            if phase in ("original", "recompute")
+            else None
+        )
+        entry = None if found is None else cake_kcp._HANDOFF_DECISIONS.get(found[0])
+        if entry is not None:
+            frames.append((phase, list(entry[0]), sorted(entry[1].values())))
+        return x * x
+
+    def step(reentrant: bool, fwd_mode: bool = False) -> tuple[list, dict, list]:
+        seen.clear()
+        frames.clear()
+        blocked.clear()
+        before = cake_kcp.kcp_handoff_stats()
+        x = torch.ones(4, requires_grad=True)
+        with _PassThroughMode() if fwd_mode else contextlib.nullcontext():
+            y = checkpoint(fn, x, use_reentrant=reentrant).sum()
+        y.backward()
+        after = cake_kcp.kcp_handoff_stats()
+        delta = {n: after[n] - before[n] for n in after if after[n] != before[n]}
+        return list(seen), delta, list(frames)
+
+    counted = {"refused_work": 1, "refused_boundary": 1}
+    # the frame holds the two admitted calls' decisions; the recompute's cursor advanced twice
+    recorded = [("original", [False, True], []), ("recompute", [False, True], [2])]
+    assert step(False) == ([False, False, False, True] * 2, counted, recorded)
+    assert step(True) == ([False] * 4 + [False, False, False, True], counted, [])
+    # where an argument refusal is counted: refused calls only, so no frame record exists in any pass; counted with
+    # nothing blocking, not under a capture or tracing block, a dispatch mode or frames torch does not expose
+    calls[:] = refused
+    monkeypatch.setattr(cake_kcp, "_handoff_blocked", lambda: False)
+    assert step(False) == ([False] * 4, counted, [])
+    assert step(True) == ([False] * 4, counted, [])
+    monkeypatch.setattr(cake_kcp, "_handoff_blocked", lambda: True)
+    assert step(False) == ([False] * 4, {}, [])
+    assert step(True) == ([False] * 4, {}, [])
+    monkeypatch.setattr(cake_kcp, "_handoff_blocked", lambda: False)
+    assert step(False, fwd_mode=True) == ([False] * 4, {}, [])
+    modes = cake_kcp._handoff_dispatch_modes
+    monkeypatch.setattr(cake_kcp, "_handoff_dispatch_modes", lambda: True)
+    assert step(True) == ([False] * 4, {}, [])
+    monkeypatch.setattr(cake_kcp, "_handoff_dispatch_modes", modes)
+    readable = cake_kcp._handoff_frames_readable
+    monkeypatch.setattr(cake_kcp, "_handoff_frames_readable", lambda: False)
+    assert step(False) == ([False] * 4, {}, [])
+    assert step(True) == ([False] * 4, counted, [])
+    monkeypatch.setattr(cake_kcp, "_handoff_frames_readable", readable)
+    calls[:] = mixed
+    monkeypatch.setattr(cake_kcp, "_handoff_blocked", first_blocked)
+    # the reasons' order: the backend before the device and "auto"'s rule, after the option keys
+    monkeypatch.setattr(cake_kcp, "get_backend", lambda: object())
+    recorded = [("original", [False, False], []), ("recompute", [False, False], [2])]
+    assert step(False) == (
+        [False] * 8,
+        {"refused_backend": 2, "refused_boundary": 1},
+        recorded,
+    )
+    assert cake_kcp._handoff_refusal("auto", opts, "saved", v, ctx) == "backend"
+    assert cake_kcp._handoff_refusal("on", opts, "replay", v, ctx) == "boundary"
+
+
+def test_handoff_device_key_is_kept_per_index(monkeypatch) -> None:
+    """``_handoff_key`` reads a device's architecture, SM count and toolkit once per device index; a device without an
+    exported architecture raises on every call (nothing is kept for it)."""
+    calls: list = []
+
+    def arch_of(index: int) -> str:
+        calls.append(index)
+        if index == 1:
+            raise RuntimeError("not an exported Cake KDA training target")
+        return "sm_100a"
+
+    monkeypatch.setattr(cake_kcp, "_HANDOFF_KEYS", {})
+    monkeypatch.setattr(cake_kcp, "_arch_of", arch_of)
+    monkeypatch.setattr(cake_kcp.cake_jit, "sm_count", lambda index: 148)
+    monkeypatch.setattr(cake_kcp, "_handoff_toolkit", lambda arch: "13.4")
+    for _ in range(3):
+        key = cake_kcp._handoff_key(torch.device("cuda", 0))
+        assert key == ("sm_100a", 148, "13.4")
+    assert calls == [0]
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="exported"):
+            cake_kcp._handoff_key(torch.device("cuda", 1))
+    assert calls == [0, 1, 1]
+
+
+def test_host_values_kept_across_calls_are_exact() -> None:
+    """The host values the calls keep instead of recomputing are the recomputed ones: the validated options of a call
+    without keywords (one shared object, never changed by a call that needs other options), a table set's pool needs
+    (a copy per call) and a plan's scratch table bytes."""
+    shared = cake_kcp._options({})
+    assert cake_kcp._options({}) is shared
+    fresh = cake_kcp._validate_options({})
+    assert fresh is not shared
+    assert dataclasses.asdict(fresh) == dataclasses.asdict(shared)
+    other = cake_kcp._handle_options(shared, "states", None)
+    assert other is not shared and other.save_transfer is False
+    assert dataclasses.asdict(shared) == dataclasses.asdict(fresh)
+    assert cake_kcp._options({"graph": "off"}) is not shared
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        cake_kcp._options({"no_such_option": 1})
+    cu = torch.tensor([0, 1000, 1700, 3000], dtype=torch.int64)
+    part = cake_kcp_plan.partition_kcp(cu, 2, layout="zigzag_per_document")
+    ctx = cake_kcp_plan.build_context_kcp(part, None, 0, "cpu", 4, sm_count=148)
+    tb = cake_kcp.WorkspaceKcp(local=False).tables(ctx, 4)
+    for backward in (True, False):
+        lazy = cake_kcp_plan.LAZY_POOLS + (
+            () if backward else cake_kcp_plan.FWD_LAZY_POOLS
+        )
+        want = {n: s for n, s in tb.pool_sizes(backward).items() if n not in lazy}
+        for pair in cake_kcp_plan.SHARED_POOLS:
+            top = max((want[m] for m in pair if m in want), default=0)
+            want.update((m, top) for m in pair if m in want)
+        first = cake_kcp.WorkspaceKcp._pool_need(tb, backward)
+        assert first == want
+        first[next(iter(first))] = -1  # a caller's change stays its own
+        again = cake_kcp.WorkspaceKcp._pool_need(tb, backward)
+        assert again == want and again is not first
+    for S, N, H in ((3000, 3, 4), (1300, 2, 64)):
+        plan = cake_kcp.cake_backend.plan(S, N, H, 148, "sm_100a")
+        want_bytes = cake_kcp_plan.local_scratch_table_bytes(plan)
+        for _ in range(2):
+            assert cake_kcp._scratch_bytes(plan) == want_bytes
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA device required")
+def test_per_call_workspaces_share_one_identity_tile() -> None:
+    """The per-call workspace of a ``workspace=None`` call binds its device's shared identity tile as its ``"eye"``
+    pool (the same storage call after call and on another stream, counted in ``bytes`` as a tile of its own); a
+    workspace a caller holds fills a tile of its own; inside a CUDA-graph capture no shared tile is handed out and a
+    per-call workspace grown there fills a tile of its own (an identity after a replay); another device has a tile of
+    its own."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    eye = torch.eye(cake_kcp.D, dtype=torch.float32, device=device)
+
+    def grown(shared: bool):
+        ws = cake_kcp.WorkspaceKcp(local=False)
+        ws._shared_eye = shared
+        assert ws._grow("eye", cake_kcp.TILE, device)
+        return ws
+
+    a, b = grown(True), grown(True)
+    side = torch.cuda.Stream(device)
+    with torch.cuda.stream(side):
+        c = grown(True)
+    own = grown(False)
+    tiles = [w.pool("eye") for w in (a, b, c, own)]
+    torch.cuda.synchronize(device)
+    assert tiles[0].data_ptr() == tiles[1].data_ptr() == tiles[2].data_ptr()
+    assert tiles[3].data_ptr() != tiles[0].data_ptr()
+    for w, t in zip((a, b, c, own), tiles, strict=True):
+        assert torch.equal(t.view(cake_kcp.D, cake_kcp.D), eye)
+        assert w.bytes == cake_kcp.TILE * 4 and w.pool_bytes["eye"] == cake_kcp.TILE * 4
+    graph = torch.cuda.CUDAGraph()
+    out = torch.zeros(1, device=device)
+    with torch.cuda.graph(graph):
+        inside = cake_kcp._identity_tile(device, torch.float32)
+        captured = grown(True)
+        out.add_(1.0)
+    assert inside is None
+    graph.replay()
+    torch.cuda.synchronize(device)
+    tile = captured.pool("eye")
+    assert tile.data_ptr() != tiles[0].data_ptr()
+    assert torch.equal(tile.view(cake_kcp.D, cake_kcp.D), eye)
+    assert captured.bytes == cake_kcp.TILE * 4
+    if torch.cuda.device_count() > 1:
+        other = torch.device("cuda", (device.index + 1) % torch.cuda.device_count())
+        with torch.cuda.device(device):  # the current device stays the first one
+            ws = cake_kcp.WorkspaceKcp(local=False)
+            ws._shared_eye = True
+            assert ws._grow("eye", cake_kcp.TILE, other)
+            far = ws.pool("eye")
+            assert far is cake_kcp._identity_tile(other, torch.float32)
+        torch.cuda.synchronize(other)
+        assert far.device == other and far.data_ptr() != tiles[0].data_ptr()
+        assert torch.equal(far.view(cake_kcp.D, cake_kcp.D).cpu(), eye.cpu())
 
 
 def test_handoff_byte_queries_and_counters_are_public() -> None:
