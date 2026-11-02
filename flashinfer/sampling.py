@@ -1721,14 +1721,14 @@ def _top_k_first_fast_path(
     )
 
     def _map(local):
-        rows = (
-            torch.arange(local.size(0), device=local.device)
-            if indices is None
-            else indices.long()
-        )
-        return gathered_indices[rows, local.long()].to(
-            torch.int32 if indices is None else indices.dtype
-        )
+        if indices is None:
+            # Avoid advanced-indexing setup on the common non-indexed fast path.
+            return (
+                gathered_indices.gather(1, local.view(-1, 1).long())
+                .squeeze(1)
+                .to(torch.int32)
+            )
+        return gathered_indices[indices.long(), local.long()].to(indices.dtype)
 
     if return_valid:
         local, valid = result
