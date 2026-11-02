@@ -337,17 +337,20 @@ def plan_record(prepared):
     record = dict(template=prepared.template, grid=list(prepared.grid))
     if isinstance(prepared, cake_backend.PreparedAtomicGemm):
         p = prepared.plan
+        # the rule key is the transposed-store launch's (M = d_in, N = d_out); a row-major plan exchanges them
+        key_m, key_n = (p.M, p.N) if p.out_t else (p.N, p.M)
         record.update(
             block_n=p.block_n,
             splits=p.splits,
+            out_t=p.out_t,
             tiles=p.tiles,
             swapped=p.swapped,
             ws_bytes=4 * p.ws_f32_elems + 4 * p.counters_u32,
             rule_key=[
                 prepared.arch,
                 p.L,
-                p.M,
-                p.N,
+                key_m,
+                key_n,
                 "f32" if p.out_f32 else "bf16",
             ],
             rule_value=[p.block_n, p.splits],
@@ -356,6 +359,8 @@ def plan_record(prepared):
         p = prepared.plan
         record.update(
             units=p.units,
+            head_spans=p.head_spans,
+            head_steps=p.head_steps,
             tiles=p.tiles,
             k_iters=p.k_iters,
             part_tiles=p.part_tiles,

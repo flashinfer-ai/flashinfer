@@ -199,8 +199,14 @@ def _mask_score_quad(
     score1: Float32,
     score2: Float32,
     score3: Float32,
+    first_bit: cutlass.Constexpr[int] = 0,
 ) -> tuple[Float32, Float32, Float32, Float32]:
-    """Expand four bitmap bits with setp and replace invalid scores."""
+    """Expand bits ``first_bit + [0, 4)`` with setp and replace invalid scores."""
+    compare = "".join(
+        f"and.b32 bit, {{$r0}}, {1 << (first_bit + i):#x};\n"
+        f"setp.ne.u32 valid{i}, bit, 0;\n"
+        for i in range(4)
+    )
     return cute.arch.inline_ptx(
         """
         {
@@ -210,14 +216,9 @@ def _mask_score_quad(
             mov.b32 {$w1}, {$r2};
             mov.b32 {$w2}, {$r3};
             mov.b32 {$w3}, {$r4};
-            and.b32 bit, {$r0}, 0x1;
-            setp.ne.u32 valid0, bit, 0;
-            and.b32 bit, {$r0}, 0x2;
-            setp.ne.u32 valid1, bit, 0;
-            and.b32 bit, {$r0}, 0x4;
-            setp.ne.u32 valid2, bit, 0;
-            and.b32 bit, {$r0}, 0x8;
-            setp.ne.u32 valid3, bit, 0;
+        """
+        + compare
+        + """
             @!valid0 mov.b32 {$w0}, 0xff7fffff;
             @!valid1 mov.b32 {$w1}, 0xff7fffff;
             @!valid2 mov.b32 {$w2}, 0xff7fffff;
@@ -5319,6 +5320,78 @@ class TmemSPResource(MemoryResource):
             )
         return self._reduce_row_max(s_data, row_max)
 
+    @cute.jit
+    def _mask_window_chunks(
+        self,
+        s_data: SoftmaxChunks,
+        base_k: Int32,
+        window_start: Optional[Int32],
+        window_end: Optional[Int32],
+    ) -> SoftmaxChunks:
+        """Mask scores of keys ``base_k + [0, N)`` outside ``[window_start, window_end)``.
+
+        ``None`` leaves that side unbounded. With both bounds, each 32-column
+        chunk builds one valid-bit word, so a score costs a bit test and a
+        predicated mask value. A single bound keeps one create_mask and a select,
+        which is as cheap and measured faster on fixed-length BF16 plans.
+        """
+        tmem_x = self.cfg.tmem_x_load_s
+        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
+        if cutlass.const_expr(window_start is None or window_end is None):
+            masked_values = cutlass.vector.full(
+                [tmem_x],
+                self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
+                dtype=self.cfg.qk_acc_dtype,
+            )
+            all_true_mask = cutlass.vector.create_mask([tmem_x], [tmem_x])
+        for chunk_idx in cutlass.range_constexpr(num_chunks):
+            chunk_base = base_k + Int32(chunk_idx * tmem_x)
+            if cutlass.const_expr(window_end is None):
+                left_mask_inverted = cutlass.vector.create_mask(
+                    [tmem_x], [window_start - chunk_base]
+                )
+                mask = left_mask_inverted ^ all_true_mask
+                s_data[chunk_idx] = cutlass.vector.where(
+                    mask, s_data[chunk_idx], masked_values
+                )
+            elif cutlass.const_expr(window_start is None):
+                right_oob_start_idx = cute.math.min(
+                    cute.math.max(window_end - chunk_base, Int32(0)),
+                    Int32(tmem_x),
+                )
+                mask = cutlass.vector.create_mask([tmem_x], [right_oob_start_idx])
+                s_data[chunk_idx] = cutlass.vector.where(
+                    mask, s_data[chunk_idx], masked_values
+                )
+            else:
+                chunk_left = cute.math.min(
+                    cute.math.max(window_start - chunk_base, Int32(0)),
+                    Int32(tmem_x),
+                )
+                chunk_right = cute.math.min(
+                    cute.math.max(window_end - chunk_base, Int32(0)),
+                    Int32(tmem_x),
+                )
+                valid_bits = _bmsk_clamp(chunk_left, chunk_right - chunk_left)
+                chunk = s_data[chunk_idx]
+                masked_scores = []
+                for quad_idx in cutlass.range_constexpr(tmem_x // 4):
+                    quad_base = quad_idx * 4
+                    masked_scores.extend(
+                        _mask_score_quad(
+                            valid_bits,
+                            chunk[quad_base],
+                            chunk[quad_base + 1],
+                            chunk[quad_base + 2],
+                            chunk[quad_base + 3],
+                            quad_base,
+                        )
+                    )
+                s_data[chunk_idx] = cutlass.Vector.from_elements(
+                    tuple(masked_scores), self.cfg.qk_acc_dtype
+                )
+        return s_data
+
     @consumer_work(returns=(old_row_max, row_max))
     @cute.jit
     def left_masked_row_max(
@@ -5329,8 +5402,6 @@ class TmemSPResource(MemoryResource):
         q_offset: Int32,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Apply the bottom-right-aligned sliding-window left mask."""
-        tmem_x = self.cfg.tmem_x_load_s
-        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
         num_softmax_warps = 4
         warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
         tmem_row_id = warp_id_in_sg * cute.arch.WARP_SIZE
@@ -5363,37 +5434,13 @@ class TmemSPResource(MemoryResource):
                 (seq_tile_coord * self.cfg.q_tile_m - self.cfg.window_size_left)
                 // self.cfg.kv_tile_n,
             )
-        kv_tile_abs = kv_tile_start + stage_info.loop_offset
-
-        masked_values = cutlass.vector.full(
-            [tmem_x],
-            self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
-            dtype=self.cfg.qk_acc_dtype,
-        )
-        all_true_mask = cutlass.vector.create_mask([tmem_x], [tmem_x])
-
-        for chunk_idx in cutlass.range_constexpr(num_chunks):
-            base_k = kv_tile_abs * self.cfg.kv_tile_n + chunk_idx * tmem_x
-            left_oob_end_idx = window_bound_left - base_k
-            left_mask_inverted = cutlass.vector.create_mask(
-                [tmem_x], [left_oob_end_idx]
-            )
-            mask = left_mask_inverted ^ all_true_mask
-            if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
-                # Packed requests share a worst-case window span, and fixed
-                # bottom-right windows can begin at a non-aligned Q/K offset.
-                window_bound_right = index_q + q_offset
-                right_oob_start_idx = window_bound_right + Int32(1) - base_k
-                right_oob_start_idx = cute.math.min(
-                    cute.math.max(right_oob_start_idx, Int32(0)),
-                    Int32(tmem_x),
-                )
-                right_mask = cutlass.vector.create_mask([tmem_x], [right_oob_start_idx])
-                mask = mask & right_mask
-            s_data[chunk_idx] = cutlass.vector.where(
-                mask, s_data[chunk_idx], masked_values
-            )
-
+        base_k = (kv_tile_start + stage_info.loop_offset) * self.cfg.kv_tile_n
+        window_end = None
+        if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
+            # Packed requests share a worst-case window span, and fixed
+            # bottom-right windows can begin at a non-aligned Q/K offset.
+            window_end = index_q + q_offset + Int32(1)
+        s_data = self._mask_window_chunks(s_data, base_k, window_bound_left, window_end)
         return self._reduce_row_max(s_data, row_max)
 
     @consumer_work(returns=(old_row_max, row_max))
@@ -5658,8 +5705,6 @@ class TmemSPResource(MemoryResource):
         Sliding-window tails need both bounds because the final tile can also
         contain keys to the left of the visible window.
         """
-        tmem_x = self.cfg.tmem_x_load_s
-        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
         num_softmax_warps = 4
         warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
         s_data = self._load_s_chunks(stage_info)
@@ -5698,31 +5743,12 @@ class TmemSPResource(MemoryResource):
             else:
                 # Tail uses the first tile after the loop domain.
                 base_k = (kv_tile_start + stage_info.loop_end) * self.cfg.kv_tile_n
-            for chunk_idx in cutlass.range_constexpr(num_chunks):
-                chunk_base_k = base_k + chunk_idx * tmem_x
-                window_bound_right = index_q + q_offset
-                right_oob_start_idx = window_bound_right + Int32(1) - chunk_base_k
-                right_oob_start_idx = cute.math.min(
-                    cute.math.max(right_oob_start_idx, Int32(0)),
-                    Int32(tmem_x),
-                )
-                mask = cutlass.vector.create_mask([tmem_x], [right_oob_start_idx])
-                if cutlass.const_expr(self.needs_window_tail_left_mask):
-                    left_oob_end_idx = window_bound_left - chunk_base_k
-                    left_mask_inverted = cutlass.vector.create_mask(
-                        [tmem_x], [left_oob_end_idx]
-                    )
-                    all_true_mask = cutlass.vector.create_mask([tmem_x], [tmem_x])
-                    left_mask = left_mask_inverted ^ all_true_mask
-                    mask = mask & left_mask
-                masked_values = cutlass.vector.full(
-                    [tmem_x],
-                    self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
-                    dtype=self.cfg.qk_acc_dtype,
-                )
-                s_data[chunk_idx] = cutlass.vector.where(
-                    mask, s_data[chunk_idx], masked_values
-                )
+            window_start = None
+            if cutlass.const_expr(self.needs_window_tail_left_mask):
+                window_start = window_bound_left
+            s_data = self._mask_window_chunks(
+                s_data, base_k, window_start, index_q + q_offset + Int32(1)
+            )
         return self._reduce_row_max(s_data, row_max)
 
     @cute.jit

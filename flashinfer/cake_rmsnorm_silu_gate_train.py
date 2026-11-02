@@ -43,9 +43,10 @@ dispatches on it here:
   node.
 * ``deterministic=False`` runs the standalone non-deterministic package
   ``flashinfer.cake_rmsnorm_silu_gate_train_backend``: the same forward kernel
-  (it has no reduction, so ``y`` has the same bits; on SM100 and SM103 from
-  976 rows per SM a forward whose CTAs each walk several row blocks, also
-  the same bits) and a one-kernel backward whose ``dx`` and ``dz`` are the
+  (it has no reduction, so ``y`` has the same bits; on SM100 and SM103 up to
+  10 rows per SM a forward with 16 threads to a row, and from 976 rows per SM
+  on SM100 and SM103, 800 on SM107, a forward whose CTAs each walk several row
+  blocks, also the same bits) and a one-kernel backward whose ``dx`` and ``dz`` are the
   deterministic backward's bits.  Its CTAs take row blocks (one block each
   when the grid has a CTA for every block;
   past one wave of CTAs they claim the blocks in chunks), sum the weight
@@ -57,7 +58,12 @@ dispatches on it here:
   and so the rows of each FP32 run, and the order of the FP64 additions depend
   on scheduling: the weight gradient can differ between calls, always within
   the deterministic backward's error bound ``|dw64| * 2^-7 + sum|terms| *
-  2^-20`` per column (``dw64`` the exact sum of the ``terms``).  That
+  2^-20`` per column (``dw64`` the exact sum of the ``terms``).  On SM100 and
+  SM103 up to 256 rows the backward is one thread-block cluster of 16 CTAs
+  with the same row arithmetic, which adds the CTAs' FP32 partials of each
+  column in a fixed order in FP64 and rounds once: there the weight gradient
+  is the same bits on every call, within the same bound, and no workspace is
+  used.  That
   package's entry points take ``deterministic=False`` only (any other value is
   a ``ValueError``).
 * ``deterministic=False`` while ``torch.use_deterministic_algorithms(True)`` is
@@ -82,7 +88,8 @@ deterministic=False)``, 4104 bytes whatever ``T * H``) holds the FP64
 accumulators, the arrival ticket and the claim counter the backward's CTAs
 claim row blocks from when the rows have more blocks than one wave of CTAs;
 every launch of that backward uses one, also with
-``compute_grad_weight=False``.  The kernel leaves it zero: allocate
+``compute_grad_weight=False``, but the one-cluster backward of up to 256 rows
+on SM100 and SM103, which reads none.  The kernel leaves it zero: allocate
 it once, reuse it across calls, shapes, both weight-gradient dtypes and CUDA
 Graph replays without a reset, and give each stream that may run a backward at
 the same time its own buffer.  A buffer that did not come from that factory, or
@@ -91,7 +98,8 @@ that anything else wrote into, must be zeroed with
 before its next backward.  It is not interchangeable with the deterministic
 package's partial buffer.  Calls without a workspace use one 4104-byte buffer
 per device, stream and backward kernel (one per weight-gradient dtype, two
-on SM107 from 1024 rows per SM), kept for later calls; the
+from 1024 rows per SM on SM107 and from 1280 on SM100 and SM103), kept for
+later calls; the
 autograd node retains nothing else.  They also keep a reserve of 64
 zero-filled 4104-byte buffers per device (about 272 KiB, filled outside any
 capture): a call during CUDA Graph capture takes one per capture and capture
@@ -99,22 +107,32 @@ stream from it and keeps it for the life of the process, so a replay launches
 no fill kernel (with none ready, the graph zero-fills a buffer of its own).
 
 Beside kernels resident on other streams (FlashInfer issue #7548; observed on
-B200, sm_100a): each CTA of the non-deterministic backward needs 20736 bytes of
-dynamic shared memory (an SM of sm_100a holds four such CTAs), and an SM serves
-it only once it can switch to a shared-memory carveout that holds it.  A kernel
-on another stream whose CTAs hold every SM with a small carveout (for example a
-long-running kernel with little or no shared memory and the default carveout)
-therefore delays that backward's start until the kernel exits.  Setting
+B200, sm_100a, with the 20736-byte CTAs and on R200, sm_107a, with the
+20736-byte and the 10496-byte CTAs): above 256 rows on SM100 and SM103, and
+below 1024 rows per SM on SM107, each CTA of the non-deterministic backward
+needs 20736 bytes of dynamic shared memory (an SM of sm_100a holds four such
+CTAs; from 1024 rows per SM on SM107 each CTA of the long backward needs 10496
+bytes), and an SM serves it only once it can switch to a shared-memory
+carveout that holds it.  A kernel on another stream whose CTAs hold every SM
+with a small carveout (for example a long-running kernel with little or no
+shared memory and the default carveout) therefore delays that backward's start
+until the kernel exits.  Setting
 ``cudaFuncAttributePreferredSharedMemoryCarveout`` to
 ``cudaSharedmemCarveoutMaxShared`` on such a resident kernel, or giving it a
 large dynamic shared-memory allocation, lets the backward start beside it.  The
 deterministic backward also waits for such a kernel when that kernel has no
 shared memory and the default or the maximum-L1 carveout; both forwards start
-beside it whatever its carveout.  The non-deterministic backward launches at
-most one wave of CTAs.  When the grid has a CTA for every row block, CTA ``c``
-takes block ``c``; past one wave the CTAs claim every block in chunks from the
-workspace's claim counter, each CTA its next chunk as the last block of its
-current one starts, so a CTA that starts late takes fewer blocks.
+beside it whatever its carveout.  On SM100 and SM103 the one-cluster backward
+(up to 256 rows; 16 CTAs of 6144 bytes whatever the rows), measured at 48 and
+240 rows, started at once beside a kernel holding every SM with one 128-thread
+CTA, no shared memory and the default, the maximum-L1 or the maximum-shared
+carveout (B200 and GB300).  The non-deterministic backward launches at most one
+wave of CTAs, or on SM100 and SM103 from 1280 rows per SM 5 CTAs per SM, a
+quarter more than an SM holds at once.  When the grid has a CTA for every row
+block, CTA ``c`` takes block ``c``; past one wave the CTAs claim every block in
+chunks from the workspace's claim counter, each CTA its next chunk as the last
+block of its current one starts, so a CTA that starts late takes fewer blocks
+(none when every chunk was claimed before it started).
 
 Usage::
 
@@ -273,8 +291,9 @@ def cake_rmsnorm_silu_gate_train_forward(
         (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_forward`)
         with these arguments.  ``False`` runs the non-deterministic package's
         forward program, the same kernel rendered there, or on SM100 / SM103
-        from 976 rows per SM a forward whose CTAs each walk several row
-        blocks with the same arithmetic (the forward has no reduction, so
+        up to 10 rows per SM a forward with 16 threads to a row, and from 976
+        rows per SM on SM100 / SM103 (800 on SM107) a forward whose CTAs each
+        walk several row blocks, with the same arithmetic (the forward has no reduction, so
         both return the same bits); it is refused while
         ``torch.use_deterministic_algorithms(True)`` is in effect (with
         ``warn_only=True``: a warning, then the deterministic forward).
@@ -475,7 +494,8 @@ def cake_rmsnorm_silu_gate_train_backward(
         it; the non-deterministic kernel then touches neither ``grad_weight``
         nor the workspace's accumulators, but its CTAs still take the arrival
         ticket (and past one wave of row blocks claim their blocks from the
-        claim counter), so it uses a workspace too (and leaves it zero).
+        claim counter), so it uses a workspace too (and leaves it zero); the
+        one-cluster backward of up to 256 rows on SM100 and SM103 uses none.
     workspace : torch.Tensor, optional
         Caller-owned buffer from :func:`cake_rmsnorm_silu_gate_train_backward_workspace`
         called with the same ``deterministic`` flag: the deterministic
@@ -506,7 +526,11 @@ def cake_rmsnorm_silu_gate_train_backward(
         value first when accumulating).  The claimed blocks, and so the FP32
         runs, and the order of the FP64 additions depend on scheduling: ``dw``
         can differ between calls, always within the deterministic backward's
-        error bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column.
+        error bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column.  On
+        SM100 and SM103 up to 256 rows one cluster of 16 CTAs runs instead: the
+        CTAs' FP32 partials of a column are added in a fixed order in FP64, so
+        ``dw`` is the same bits on every call (within the same bound), and the
+        workspace is not used.
         ``False`` is refused with ``RuntimeError`` while
         ``torch.use_deterministic_algorithms(True)`` is in effect; with
         ``warn_only=True`` it warns and runs the deterministic backward (which

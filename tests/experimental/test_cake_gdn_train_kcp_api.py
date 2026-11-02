@@ -375,7 +375,8 @@ def test_facade_exposes_the_contract_names_keyword_only() -> None:
     for n in names:
         assert callable(getattr(facade, n)), n
         assert n in facade.__all__
-    # exactly the contract names plus the three public types; nothing else is public
+    # exactly the contract names plus the three public types; nothing else is public (the package-level
+    # packed_qkv_views_kcp is not a facade name)
     types = (
         "OptionsKcp",
         "ContextKcp",
@@ -425,6 +426,7 @@ def test_package_init_re_exports_the_route() -> None:
         "gdn_comm_bytes_kcp",
         "gdn_saved_bytes_kcp",
         "gdn_workspace_bytes_kcp",
+        "packed_qkv_views_kcp",
         "OptionsKcp",
         "ContextKcp",
         "SavedKcp",
@@ -1018,9 +1020,54 @@ def test_facade_context_graph_replay_hint(monkeypatch) -> None:
             facade.build_context_kcp(object(), None, 0, "cpu", graph_replay=bad)
 
 
+def test_facade_forwards_the_l2n_option_on_both_routes(monkeypatch) -> None:
+    """#7817 / #8063: ``use_qk_l2norm_in_kernel`` reaches the non-deterministic package unchanged (keyword, mapping and
+    the other route's options instance) on every compute entry and byte query, as it reaches the deterministic route;
+    under torch's deterministic algorithms ``deterministic=False`` still runs the deterministic route."""
+    facade = importlib.import_module(FACADE)
+    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
+    seen = _route_recorders(monkeypatch)
+    calls = _facade_calls(facade)
+    for entry in (
+        "chunk_gdn_kcp",
+        "chunk_gdn_fwd_kcp",
+        "chunk_gdn_bwd_kcp",
+        "gdn_workspace_bytes_kcp",
+        "gdn_saved_bytes_kcp",
+    ):
+        for flag in (False, True):
+            seen.clear()
+            assert calls[entry](use_qk_l2norm_in_kernel=flag, deterministic=False) == (
+                f"nondet:{entry}"
+            )
+            assert seen[-1][1]["use_qk_l2norm_in_kernel"] is flag, entry
+            seen.clear()
+            assert calls[entry](use_qk_l2norm_in_kernel=flag).startswith("det:")
+            assert seen[-1][1]["use_qk_l2norm_in_kernel"] is flag, entry
+    t = torch.zeros(1)
+    det_o = det_opt.OptionsDetKcp(use_qk_l2norm_in_kernel=True)
+    facade.chunk_gdn_kcp(t, t, t, t, t, object(), options=det_o, deterministic=False)
+    assert seen[-1][0] == "nondet:chunk_gdn_kcp"
+    assert seen[-1][1]["options"]["use_qk_l2norm_in_kernel"] is True
+    mapping = {"use_qk_l2norm_in_kernel": True}
+    facade.chunk_gdn_fwd_kcp(
+        t, t, t, t, t, object(), options=mapping, deterministic=False
+    )
+    assert (
+        seen[-1][0] == "nondet:chunk_gdn_fwd_kcp" and seen[-1][1]["options"] == mapping
+    )
+    nd_o = OptionsKcp(use_qk_l2norm_in_kernel=True)
+    assert nd_o.use_qk_l2norm_in_kernel is True
+    facade.chunk_gdn_bwd_kcp(
+        t, t, t, t, t, object(), t, options=nd_o, deterministic=False
+    )
+    assert seen[-1][0] == "nondet:chunk_gdn_bwd_kcp" and seen[-1][1]["options"] is nd_o
+
+
 def test_facade_converts_an_options_instance_of_the_other_route(monkeypatch) -> None:
-    """An options instance of the other route reaches the routed package as the mapping of its fields; the routed
-    package's own instance, a mapping and ``None`` pass through unchanged."""
+    """An options instance of the other route reaches the routed package as the mapping of all its fields
+    (``use_qk_l2norm_in_kernel`` included: both routes have it); the routed package's own instance, a mapping and
+    ``None`` pass through unchanged."""
     facade = importlib.import_module(FACADE)
     det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
     seen = _route_recorders(monkeypatch)
@@ -1321,7 +1368,18 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "kcp_dhu_tape",
         "bwd_dqkg",
         "gate_epilogue",
+        "fwd_prep_l2n",
+        "bwd_dqkg_l2n",
+        "qk_apply",
     )
+    # the in-kernel Q / K L2 norm (use_qk_l2norm_in_kernel): #1 / #8 siblings and the backward's qk_apply
+    assert kcp.L2N_PROGRAMS == ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
+    assert set(kcp.L2N_PROGRAMS) <= set(kcp.LOCAL_PROGRAMS)
+    assert kcp.L2N_SIBLING_OF == {
+        "fwd_prep": "fwd_prep_l2n",
+        "bwd_dqkg": "bwd_dqkg_l2n",
+    }
+    assert kcp.QK_TAPES == ("qn", "kn") and kcp.QK_RSTD == "qk_rstd"
     assert set(kcp.PROGRAM_ARGS) == set(kcp.PROGRAMS)
     assert (
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
@@ -1417,9 +1475,14 @@ def test_program_args_are_the_registry_logical_names() -> None:
         needed = set(rec["logical"].values())
         missing = needed - set(kcp.PROGRAM_ARGS[rec["program"]])
         assert not missing, (rec_name, sorted(missing))
-    # record resolution through the registry: shipped records, the merge variants by ncols, the test twins
+    # record resolution through the registry: shipped records, the merge variants by ncols, the test twins (the
+    # in-kernel L2 norm programs once their records ship; refused with a clear message before)
     for prog in kcp.PROGRAMS:
         if prog == "kcp_affine_merge":
+            continue
+        if prog in kcp.L2N_PROGRAMS and not jit.records_of_program(prog):
+            with pytest.raises(ValueError, match="no shipped record"):
+                jit.select_record(prog)
             continue
         assert jit.select_record(prog) == prog
     assert jit.select_record("kcp_affine_merge", ncols=128) == "kcp_affine_merge_c8"
