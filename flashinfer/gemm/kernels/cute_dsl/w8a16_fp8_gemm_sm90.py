@@ -982,8 +982,31 @@ class Sm90W8A16Fp8GemmKernel:
                 epi_barrier.arrive_and_wait()
 
         num_prev_subtiles = tiles_done * (m_subs * n_subs)
+        output_args = (
+            1 + cg,
+            tiled_copy_r2s,
+            tma_atom_c,
+            tma_store_pipeline,
+            sC,
+            tRS_sD,
+            tRS_rAcc,
+            tRS_cAcc,
+            tRS_rD,
+            tRS_rD_out,
+            sBias,
+            gC_mnl,
+            m_tile,
+            n_tile,
+            scale_val,
+            bias_buf,
+            thread_row,
+            num_prev_subtiles,
+            warp_idx,
+            epi_store_warp,
+        )
         # One (tile, slice) workspace block per tail item.  The output epilogue is
-        # a helper so the tail branch exists only when the tail is compiled in.
+        # a helper so the tail branch exists only when the tail is compiled in; the
+        # same call sits on the runtime non-tail path and the no-tail specialization.
         tail_block = lin - body_items
         if cutlass.const_expr(self.has_tail):
             if is_tail:
@@ -1049,51 +1072,9 @@ class Sm90W8A16Fp8GemmKernel:
                     ctid,
                 )
             else:
-                self._epilogue_output(
-                    1 + cg,
-                    tiled_copy_r2s,
-                    tma_atom_c,
-                    tma_store_pipeline,
-                    sC,
-                    tRS_sD,
-                    tRS_rAcc,
-                    tRS_cAcc,
-                    tRS_rD,
-                    tRS_rD_out,
-                    sBias,
-                    gC_mnl,
-                    m_tile,
-                    n_tile,
-                    scale_val,
-                    bias_buf,
-                    thread_row,
-                    num_prev_subtiles,
-                    warp_idx,
-                    epi_store_warp,
-                )
+                self._epilogue_output(*output_args)
         else:
-            self._epilogue_output(
-                1 + cg,
-                tiled_copy_r2s,
-                tma_atom_c,
-                tma_store_pipeline,
-                sC,
-                tRS_sD,
-                tRS_rAcc,
-                tRS_cAcc,
-                tRS_rD,
-                tRS_rD_out,
-                sBias,
-                gC_mnl,
-                m_tile,
-                n_tile,
-                scale_val,
-                bias_buf,
-                thread_row,
-                num_prev_subtiles,
-                warp_idx,
-                epi_store_warp,
-            )
+            self._epilogue_output(*output_args)
 
     @cute.jit
     def _mainloop(

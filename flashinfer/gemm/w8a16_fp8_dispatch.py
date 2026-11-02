@@ -532,8 +532,8 @@ def launch_w8a16_fp8_gemm(
     contiguous and 16-byte aligned on one Hopper or Blackwell device (the public
     :func:`flashinfer.gemm.w8a16_fp8_gemm` checks that).  ``algo``: a code of the
     architecture's table (0 = the model's choice).  ``workspace``: a buffer of at
-    least :func:`w8a16_fp8_gemm_workspace_bytes` bytes, or None to allocate when
-    needed."""
+    least :func:`w8a16_fp8_gemm_workspace_bytes` bytes; None only when that is 0.
+    The public op owns allocation; this layer never allocates."""
     # The DSL resolves its compile target from the current CUDA device: run the
     # call under act's device, which need not be the current one.
     with torch.cuda.device(act.device):
@@ -541,6 +541,18 @@ def launch_w8a16_fp8_gemm(
             _w8a16_fp8_gemm_sm90(act, weight, weight_scale, bias, out, algo, workspace)
         else:
             _w8a16_fp8_gemm_sm100(act, weight, weight_scale, bias, out, algo, workspace)
+
+
+def _require_workspace(workspace: Optional[torch.Tensor], nbytes: int) -> torch.Tensor:
+    """The caller's workspace for a plan that needs ``nbytes``: the launcher's
+    invariant is that the public op (or a direct caller) allocated it already."""
+    have = 0 if workspace is None else workspace.numel() * workspace.element_size()
+    if have < nbytes:
+        raise ValueError(
+            f"launch_w8a16_fp8_gemm needs a workspace of {nbytes} bytes for this "
+            f"plan, got {have} (see w8a16_fp8_gemm_workspace_bytes)"
+        )
+    return workspace
 
 
 def _w8a16_fp8_gemm_sm100(
@@ -566,10 +578,7 @@ def _w8a16_fp8_gemm_sm100(
     # no scale / bias.
     partials = None
     if splits > 1:
-        if workspace is None:
-            workspace = torch.empty(
-                splits * m * n * 4, dtype=torch.uint8, device=act.device
-            )
+        workspace = _require_workspace(workspace, splits * m * n * 4)
         partials = _scratch(workspace, (splits, m, n), torch.float32)
     k_slice = k // splits
     has_bias = bias is not None
@@ -714,7 +723,9 @@ def _sm90_split_us(t, m: int, n: int, k: int, num_sms: int, s: int) -> float:
     )
 
 
-def _sm90_pick_splits(t, m: int, n: int, k: int, num_sms: int) -> int:
+def _sm90_best_split(t, m: int, n: int, k: int, num_sms: int) -> tuple[int, float]:
+    """The cheapest legal split count of tile ``t`` and its modelled cost:
+    ``(1, 1e30)`` when no legal split has a usable cost."""
     best, best_us = 1, 1e30
     for s in range(2, _SM90_MAX_SPLITS + 1):
         if not _sm90_is_legal_split(k, s):
@@ -722,14 +733,14 @@ def _sm90_pick_splits(t, m: int, n: int, k: int, num_sms: int) -> int:
         us = _sm90_split_us(t, m, n, k, num_sms, s)
         if us < best_us:
             best_us, best = us, s
-    return best
+    return best, best_us
 
 
 def sm90_splits_for(algo: int, m: int, n: int, k: int, num_sms: int) -> int:
     """the model's split, or the smallest legal one when the
     variant is forced; 1 = K cannot be sliced."""
     t = _sm90_tile_of(algo)
-    s = _sm90_pick_splits(t, m, n, k, num_sms)
+    s, _ = _sm90_best_split(t, m, n, k, num_sms)
     if s >= 2:
         return s
     for c in range(2, _SM90_MAX_SPLITS + 1):
@@ -779,10 +790,7 @@ def _sm90_pick_by_cost(m: int, n: int, k: int, num_sms: int) -> int:
     for a in (7, 8):
         consider(a, _sm90_streamk_us(_sm90_tile_of(a), m, n, k, num_sms))
     for a in (10, 11, 12):
-        t = _sm90_tile_of(a)
-        for s in range(2, _SM90_MAX_SPLITS + 1):
-            if _sm90_is_legal_split(k, s):
-                consider(a, _sm90_split_us(t, m, n, k, num_sms, s))
+        consider(a, _sm90_best_split(_sm90_tile_of(a), m, n, k, num_sms)[1])
     return best
 
 
@@ -1001,8 +1009,7 @@ def _w8a16_fp8_gemm_sm90(
         _partial_bytes, counters_offset, total_bytes = _sm90_workspace_layout(
             tail_tiles, tail_splits, tile_a, tile_w
         )
-        if workspace is None:
-            workspace = torch.empty(total_bytes, dtype=torch.uint8, device=act.device)
+        workspace = _require_workspace(workspace, total_bytes)
         partials = _scratch(workspace, (tail_blocks, tile_a, tile_w), torch.float32)
         counters = _scratch(workspace, (tail_tiles,), torch.int64, counters_offset)
         # The kernel's precondition: the arrival counters are zero at launch.  One

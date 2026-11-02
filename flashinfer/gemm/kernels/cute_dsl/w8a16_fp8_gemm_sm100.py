@@ -174,8 +174,9 @@ class Sm100W8A16Fp8GemmKernel:
         self.smem_buffer_align_bytes = 1024
 
     # ------------------------------------------------------------------ setup
-    def _setup_attributes(self):
-        """Derive the MMA, pipeline depths and smem / TMEM layouts."""
+    def _setup_attributes(self) -> cute.TiledMma:
+        """Derive the MMA, pipeline depths and smem / TMEM layouts; returns the
+        tiled MMA the launch builds its TMA atoms and kernel on."""
         self.transform_a_source = (
             tcgen05.OperandSource.SMEM
             if self.a_in_smem
@@ -275,6 +276,7 @@ class Sm100W8A16Fp8GemmKernel:
             self.num_b_stage,
             self.num_trans2mma_stage,
         )
+        return tiled_mma
 
     # ------------------------------------------------------------- transform
     @cute.jit
@@ -596,17 +598,8 @@ class Sm100W8A16Fp8GemmKernel:
         self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
-        self._setup_attributes()
+        tiled_mma = self._setup_attributes()
 
-        tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.mma_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.acc_dtype,
-            self.cta_group,
-            self.mma_tiler[:2],
-            self.transform_a_source,
-        )
         a_op = mixed_input_utils.get_tma_atom_kind(
             self.is_a_mcast, self.use_2cta_instrs, False
         )

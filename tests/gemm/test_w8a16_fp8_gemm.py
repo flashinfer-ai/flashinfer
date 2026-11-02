@@ -215,6 +215,24 @@ def test_w8a16_fp8_gemm_caller_workspace():
     )
     with pytest.raises(ValueError, match="workspace too small"):
         w8a16_fp8_gemm(act, w_fp8, scale, algo=algo, workspace=ws[: need - 4])
+    # The launcher below the public op never allocates: handed no workspace for a
+    # plan that needs one, it refuses rather than silently owning the buffer.
+    from flashinfer.gemm import w8a16_fp8_dispatch as dispatch
+    from flashinfer.gemm.w8a16_fp8 import (
+        W8A16_FP8_GEMM_ALGOS_SM90,
+        W8A16_FP8_GEMM_ALGOS_SM100,
+    )
+
+    code = {**W8A16_FP8_GEMM_ALGOS_SM90, **W8A16_FP8_GEMM_ALGOS_SM100}[algo]
+    out_buf = torch.empty(m, n, dtype=act.dtype, device=dev)
+    with pytest.raises(ValueError, match="needs a workspace"):
+        dispatch.launch_w8a16_fp8_gemm(act, w_fp8, scale, None, out_buf, code, None)
+    with pytest.raises(ValueError, match="needs a workspace"):
+        dispatch.launch_w8a16_fp8_gemm(
+            act, w_fp8, scale, None, out_buf, code, ws[: need - 4]
+        )
+    dispatch.launch_w8a16_fp8_gemm(act, w_fp8, scale, None, out_buf, code, ws)
+    assert torch.equal(out_buf, ref)
     # A single-pass shape needs no scratch (0 bytes), so any valid buffer is accepted.
     plain = {9: "128x256", 10: "2sm256x128"}[major]
     assert w8a16_fp8_gemm_workspace_bytes(4096, 4096, 5120, dev, plain) == 0
