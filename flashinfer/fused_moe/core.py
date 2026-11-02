@@ -590,6 +590,13 @@ def reorder_rows_for_gated_act_gemm(x: torch.Tensor) -> torch.Tensor:
     gated-activation kernels can access the two halves with a single contiguous
     load.
 
+    The input holds the two FC1 halves stacked as ``[X1; X2]``: rows
+    ``[0, M // 2)`` are ``X1`` (the linear/up half) and rows ``[M // 2, M)`` are
+    ``X2`` (the gate half), the order every ``trtllm_*_moe`` entry point
+    documents for ``gemm1_weights``.  The output alternates one row of each
+    half, ``[X1[0], X2[0], X1[1], X2[1], ...]``; :func:`deinterleave_gated_rows`
+    with ``block=1`` undoes it.
+
     Parameters
     ----------
     x : torch.Tensor
@@ -607,6 +614,45 @@ def reorder_rows_for_gated_act_gemm(x: torch.Tensor) -> torch.Tensor:
     permute = lambda x: x[row_indices]
 
     return permute(x)
+
+
+def deinterleave_gated_rows(x: torch.Tensor, block: int) -> torch.Tensor:
+    r"""Undo a block interleave of the two FC1 halves along the row dimension.
+
+    Rows laid out as alternating ``block``-row chunks of two halves,
+    ``[A[0:b], B[0:b], A[b:2b], B[b:2b], ...]``, come back stacked as
+    ``[A; B]``.  The half whose chunk comes first in each pair becomes the
+    top half; order the result as ``[X1; X2]`` (linear/up half first, gate
+    half second) before handing it to a ``trtllm_*_moe`` entry point or to
+    :func:`reorder_rows_for_gated_act_gemm`.  ``block=1`` is the inverse of
+    :func:`reorder_rows_for_gated_act_gemm`.  This is a one-time host-side
+    weight preparation; the kernels have no interleaved FC1 variant.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Tensor with an even number of rows divisible by ``2 * block``.  Any
+        dtype is accepted; only the row dimension is reordered.
+    block : int
+        Number of consecutive rows per chunk in the interleaved layout.
+
+    Returns
+    -------
+    torch.Tensor
+        Row-permuted contiguous copy of ``x`` with shape equal to ``x.shape``.
+    """
+    if block < 1:
+        raise ValueError(f"block must be >= 1, got {block}")
+    M = x.shape[0]
+    if M % (2 * block) != 0:
+        raise ValueError(
+            f"x.shape[0] ({M}) must be a multiple of 2 * block ({2 * block})"
+        )
+    return (
+        x.reshape(M // (2 * block), 2, block, *x.shape[1:])
+        .transpose(0, 1)
+        .reshape(M, *x.shape[1:])
+    )
 
 
 def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Tensor:
@@ -1393,13 +1439,21 @@ def cutlass_fused_moe(
         Input scaling factor for quantization.
 
     swiglu_alpha : Optional[torch.Tensor]
-        Swiglu alpha for swiglu activation.
+        Per-expert float32 SwiGLU alpha.  Passing any of ``swiglu_alpha``,
+        ``swiglu_beta`` or ``swiglu_limit`` with ``ActivationType.Swiglu``
+        selects the ``SwigluBias`` kernel, which computes
+        ``gate * sigmoid(alpha * gate) * (linear + beta)`` with ``linear``
+        clamped to ``[-limit, limit]`` and ``gate`` capped at ``limit``
+        (defaults ``alpha=1``, ``beta=0``, ``limit=inf``).
 
     swiglu_beta : Optional[torch.Tensor]
-        Swiglu beta for swiglu activation.
+        Per-expert float32 SwiGLU beta (offset added to the linear half).
 
     swiglu_limit : Optional[torch.Tensor]
-        Per-expert SwiGLU limits for SwiGLU variants.
+        Per-expert float32 SwiGLU clamp limit.  A trainer-side clamp value
+        ``v`` and linear offset ``o`` (Megatron-Core's
+        ``activation_func_clamp_value`` / ``glu_linear_offset``) map to
+        ``swiglu_limit=v``, ``swiglu_beta=o`` and ``swiglu_alpha=None``.
 
     clamped_relu2_limit : Optional[torch.Tensor]
         Model-wide positive clamp scale for ClampedRelu2, provided as a
@@ -5009,6 +5063,15 @@ def trtllm_bf16_moe(
         weights, ``bfloat16``.  ``M`` equals ``2 * intermediate_size`` for
         gated activations and ``intermediate_size`` for non-gated
         activations.
+        For gated activations the ``M`` rows are the two halves stacked as
+        ``[X1; X2]``: rows ``[0, intermediate_size)`` are ``X1`` (linear/up)
+        and rows ``[intermediate_size, 2 * intermediate_size)`` are ``X2``
+        (gate), before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``).
+        Weights stored with gate and linear rows interleaved in fixed-width
+        blocks are de-interleaved once at load time with
+        :func:`deinterleave_gated_rows`; there is no kernel variant for an
+        interleaved FC1.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size // 128, intermediate_size, 128]``
         second-layer weights, ``bfloat16``.
@@ -5102,6 +5165,12 @@ def trtllm_bf16_moe(
         With ``SwigluStep``, clamps ``X1`` to ``[-limit, limit]`` and
         ``silu(X2)`` from above.  ``None`` uses a physical limit of ``7``.
         BF16 uses physical and raw accumulator units interchangeably.
+        A trainer-side SwiGLU given as a clamp value ``v`` (linear half
+        clamped to ``[-v, v]``, gate capped at ``v``) and a linear offset
+        ``o`` (``act(gate) * (linear + o)``), such as Megatron-Core's
+        ``activation_func_clamp_value`` and ``glu_linear_offset``, maps to
+        ``gemm1_clamp_limit=v``, ``gemm1_beta=o`` and ``gemm1_alpha=None``
+        (``1.0``) with ``ActivationType.Swiglu``.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
@@ -5235,6 +5304,15 @@ def trtllm_bf16_routed_moe(
         ``[num_experts, M // 128, hidden_size // 128, 128]`` first-layer
         weights, ``bfloat16``.  ``M`` equals ``2 * intermediate_size`` for
         gated activations and ``intermediate_size`` for non-gated activations.
+        For gated activations the ``M`` rows are the two halves stacked as
+        ``[X1; X2]``: rows ``[0, intermediate_size)`` are ``X1`` (linear/up)
+        and rows ``[intermediate_size, 2 * intermediate_size)`` are ``X2``
+        (gate), before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``).
+        Weights stored with gate and linear rows interleaved in fixed-width
+        blocks are de-interleaved once at load time with
+        :func:`deinterleave_gated_rows`; there is no kernel variant for an
+        interleaved FC1.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size // 128, intermediate_size, 128]``
         second-layer weights, ``bfloat16``.
@@ -5329,6 +5407,12 @@ def trtllm_bf16_routed_moe(
         BF16 has no global FC1 dequant scale, so raw accumulator and
         physical limits coincide. SwigluStep rejects ``gemm1_alpha`` and
         ``gemm1_beta``.
+        A trainer-side SwiGLU given as a clamp value ``v`` (linear half
+        clamped to ``[-v, v]``, gate capped at ``v``) and a linear offset
+        ``o`` (``act(gate) * (linear + o)``), such as Megatron-Core's
+        ``activation_func_clamp_value`` and ``glu_linear_offset``, maps to
+        ``gemm1_clamp_limit=v``, ``gemm1_beta=o`` and ``gemm1_alpha=None``
+        (``1.0``) with ``ActivationType.Swiglu``.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
@@ -6096,6 +6180,15 @@ def trtllm_fp8_block_scale_moe(
         ``weight_layout == WeightLayout.BlockMajorK`` (``2``).  ``M`` is
         ``2 * intermediate_size`` for gated activations and
         ``intermediate_size`` for non-gated activations.
+        For gated activations the ``M`` rows are the two halves stacked as
+        ``[X1; X2]``: rows ``[0, intermediate_size)`` are ``X1`` (linear/up)
+        and rows ``[intermediate_size, 2 * intermediate_size)`` are ``X2``
+        (gate), before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``).
+        Weights stored with gate and linear rows interleaved in fixed-width
+        blocks are de-interleaved once at load time with
+        :func:`deinterleave_gated_rows`; there is no kernel variant for an
+        interleaved FC1.
     gemm1_weights_scale : torch.Tensor
         ``[num_experts, 2*intermediate_size // (32 if mxfp8 else 128), hidden_size // (32 if mxfp8 else 128)]``
         first-layer block scales.
@@ -6195,6 +6288,12 @@ def trtllm_fp8_block_scale_moe(
         ``X1`` and ``silu(X2)`` at the physical limit.  ``None`` uses
         physical ``7`` for SwigluStep.  MXFP8 has no global FC1 dequant
         scale, so raw accumulator and physical units coincide.
+        A trainer-side SwiGLU given as a clamp value ``v`` (linear half
+        clamped to ``[-v, v]``, gate capped at ``v``) and a linear offset
+        ``o`` (``act(gate) * (linear + o)``), such as Megatron-Core's
+        ``activation_func_clamp_value`` and ``glu_linear_offset``, maps to
+        ``gemm1_clamp_limit=v``, ``gemm1_beta=o`` and ``gemm1_alpha=None``
+        (``1.0``) with ``ActivationType.Swiglu``.
     output : Optional[torch.Tensor]
         Optional in-place output tensor of shape ``[seq_len, hidden_size]``.
         Allocated internally when ``None`` (default).
@@ -6374,6 +6473,15 @@ def trtllm_fp8_block_scale_routed_moe(
         ``[num_experts, M, hidden_size]`` first-layer weights where ``M`` is
         ``2 * intermediate_size`` for gated activations and
         ``intermediate_size`` for non-gated.
+        For gated activations the ``M`` rows are the two halves stacked as
+        ``[X1; X2]``: rows ``[0, intermediate_size)`` are ``X1`` (linear/up)
+        and rows ``[intermediate_size, 2 * intermediate_size)`` are ``X2``
+        (gate), before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``).
+        Weights stored with gate and linear rows interleaved in fixed-width
+        blocks are de-interleaved once at load time with
+        :func:`deinterleave_gated_rows`; there is no kernel variant for an
+        interleaved FC1.
     gemm1_weights_scale : torch.Tensor
         ``[num_experts, 2*intermediate_size // (32 if mxfp8 else 128), hidden_size // (32 if mxfp8 else 128)]``
         first-layer block scales.
@@ -6477,6 +6585,12 @@ def trtllm_fp8_block_scale_routed_moe(
         it caps ``X1`` and ``silu(X2)`` at the physical limit, with a
         default of ``7`` when ``None``. MxFp8 has no global FC1 dequant
         scale, so raw accumulator and physical limits coincide.
+        A trainer-side SwiGLU given as a clamp value ``v`` (linear half
+        clamped to ``[-v, v]``, gate capped at ``v``) and a linear offset
+        ``o`` (``act(gate) * (linear + o)``), such as Megatron-Core's
+        ``activation_func_clamp_value`` and ``glu_linear_offset``, maps to
+        ``gemm1_clamp_limit=v``, ``gemm1_beta=o`` and ``gemm1_alpha=None``
+        (``1.0``) with ``ActivationType.Swiglu``.
 
     valid_hidden_size : Optional[int]
         Valid (unpadded) hidden dimension.  When provided, the ``hidden_size``
