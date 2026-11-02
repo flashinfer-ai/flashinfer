@@ -40,7 +40,9 @@ windows = cake_package("cake_rmsnorm_det_train", "cake_windows")
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 HIDDEN_SIZES = (6144, 5120, 4096, 2048, 1536, 512, 256)
 REDUCE_ROLE = "bwd_reduce"
-SHIPPED_SLABS = (16, 32, 64)
+# The column widths of the dw reduce slabs, one CTA each: 4 for the column-split H = 256 reduce (one column of a
+# four-column slab per lane).
+SHIPPED_SLABS = (4, 16, 32, 64)
 # Row counts of the contract: the small counts, both sides of every backward window edge of every route
 # (``test_rows_cover_every_backward_window_edge``) and the training shapes.
 ROWS = (
@@ -317,12 +319,14 @@ def test_rows_cover_every_backward_window_edge() -> None:
 # five-CTA ring at issue distance three without the L2 hint (``a3``), both at ``tail_div=4``, in two sessions per
 # architecture (BF16 and FP32 weight alike); sm_107a runs the pipeline to 65536 rows and the ring above.  Above the
 # ring's dw accuracy edge of each architecture (80896 rows on sm_100a, 99840 on sm_103a, 70656 on sm_107a) the ring
-# with compensated dw sums (``dc``) runs instead, and above 1572864 rows its form with hi / lo partial rows
+# with compensated dw sums (``dc``; on sm_100a and sm_107a its lean form ``dcln``, two rows per iteration with the
+# same arithmetic in the same order) runs instead, and above 1572864 rows its form with hi / lo partial rows
 # (``dchl``).
 H256_BWD_PROGRAMS = {
     "pd4": "rmsnorm_train_bwd_h256_t128x4_pd4_k_s32_split_pts_cl_td4",
     "a3": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhkc8_k_s32_split_pts_cl_td4_cs",
     "dc": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdf_k_s32_split_pts_cl_td4_cs",
+    "dcln": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfln_k_s32_split_pts_cl_td4_cs",
     "dchl": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfhl_k_s32_split_pts_cl_td4_cs",
 }
 H256_BWD_SPLIT = {
@@ -333,18 +337,18 @@ H256_BWD_SPLIT = {
             (5120, 12288, "a3"),
             (12288, 40960, "pd4"),
             (40960, edge, "a3"),
-            (edge, hl, "dc"),
+            (edge, hl, dc),
             (hl, None, "dchl"),
         )
-        for arch, edge, hl in (
-            ("sm_100a", 80896, 1572864),
-            ("sm_103a", 99840, 1572864),
+        for arch, edge, hl, dc in (
+            ("sm_100a", 80896, 1572864, "dcln"),
+            ("sm_103a", 99840, 1572864, "dc"),
         )
     },
     "sm_107a": (
         (0, 65536, "pd4"),
         (65536, 70656, "a3"),
-        (70656, 1572864, "dc"),
+        (70656, 1572864, "dcln"),
         (1572864, None, "dchl"),
     ),
 }
