@@ -1394,60 +1394,77 @@ def test_hidden_count_state_is_per_thread():
 def test_hidden_count_arange_records_each_stream_once(monkeypatch):
     """The count constant is recorded once per stream it is used on, again on a new stream, and afresh after it grew
     (a fresh thread on its own stream: its own constant); ``record_stream`` runs once per recorded stream, and the
-    grown constant keeps its values."""
+    grown constant keeps its values.  The counter keeps only the test thread's ``record_stream`` calls, and a mutant
+    that records the constant on every call (each call sees a new raw stream handle) fails the first check."""
     if not torch.cuda.is_available():
         pytest.skip("the count constant needs a CUDA device")
-    records: list[int] = []
+    records: list[tuple[int, int]] = []
     record_stream = torch.Tensor.record_stream
 
     def counting(self, stream):
-        records.append(stream.cuda_stream)
+        records.append((threading.get_ident(), stream.cuda_stream))
         return record_stream(self, stream)
 
     monkeypatch.setattr(torch.Tensor, "record_stream", counting)
     index = torch.cuda.current_device()
-    got = {}
-    errors: list[BaseException] = []
 
-    def run():
-        try:
-            with (
-                torch.cuda.device(index),
-                torch.cuda.stream(torch.cuda.Stream(index)),
-            ):
-                main = torch.cuda.current_stream(index).cuda_stream
-                recorded = cake_backend._thread_state("arange_streams")
-                ar = cake_backend._hidden_count_arange(index, 8)
-                cake_backend._hidden_count_arange(index, 8)
-                got["one"] = (len(recorded[index]), list(records))
-                side = torch.cuda.Stream(index)
-                with torch.cuda.stream(side):
-                    assert cake_backend._hidden_count_arange(index, 8) is ar
+    def scenario():
+        got = {}
+        errors: list[BaseException] = []
+        records.clear()  # a finished thread's identifier can be reused
+
+        def run():
+            me = threading.get_ident()
+
+            def mine():
+                return [stream for ident, stream in records if ident == me]
+
+            try:
+                with (
+                    torch.cuda.device(index),
+                    torch.cuda.stream(torch.cuda.Stream(index)),
+                ):
+                    main = torch.cuda.current_stream(index).cuda_stream
+                    recorded = cake_backend._thread_state("arange_streams")
+                    ar = cake_backend._hidden_count_arange(index, 8)
                     cake_backend._hidden_count_arange(index, 8)
-                assert cake_backend._hidden_count_arange(index, 8) is ar
-                got["two"] = (len(recorded[index]), list(records))
-                grown = cake_backend._hidden_count_arange(index, 2 * ar.numel() + 1)
-                got["grown"] = (grown is not ar, len(recorded[index]), list(records))
-                got["values"] = torch.equal(
-                    grown.cpu(),
-                    torch.arange(1, grown.numel() + 1, dtype=torch.int32),
-                )
-                got["streams"] = (main, side.cuda_stream)
-        except BaseException as exc:  # noqa: BLE001 -- re-raised by the main thread
-            errors.append(exc)
+                    got["one"] = (len(recorded[index]), mine())
+                    side = torch.cuda.Stream(index)
+                    with torch.cuda.stream(side):
+                        assert cake_backend._hidden_count_arange(index, 8) is ar
+                        cake_backend._hidden_count_arange(index, 8)
+                    assert cake_backend._hidden_count_arange(index, 8) is ar
+                    got["two"] = (len(recorded[index]), mine())
+                    grown = cake_backend._hidden_count_arange(index, 2 * ar.numel() + 1)
+                    got["grown"] = (grown is not ar, len(recorded[index]), mine())
+                    got["values"] = torch.equal(
+                        grown.cpu(),
+                        torch.arange(1, grown.numel() + 1, dtype=torch.int32),
+                    )
+                    got["streams"] = (main, side.cuda_stream)
+            except BaseException as exc:  # noqa: BLE001 -- re-raised by the main thread
+                errors.append(exc)
 
-    thread = threading.Thread(target=run)
-    thread.start()
-    thread.join(120)
-    assert not thread.is_alive(), "the thread did not finish"
-    torch.cuda.synchronize()
-    if errors:
-        raise errors[0]
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(120)
+        assert not thread.is_alive(), "the thread did not finish"
+        torch.cuda.synchronize()
+        if errors:
+            raise errors[0]
+        return got
+
+    got = scenario()
     main, side = got["streams"]
     assert got["one"] == (1, [main])
     assert got["two"] == (2, [main, side])
     assert got["grown"] == (True, 1, [main, side, main])
     assert got["values"]
+    # the mutant: every call sees a new raw stream handle, so the constant is recorded on every call
+    monkeypatch.setattr(cake_backend, "_current_raw_stream", lambda index: object())
+    mutant = scenario()
+    assert mutant["one"] != (1, [mutant["streams"][0]])
+    assert mutant["one"][1] == [mutant["streams"][0]] * 2
 
 
 @pytest.mark.parametrize("module", ["backend", "opt_in"])
@@ -6531,7 +6548,7 @@ def test_device_zero_dlogp_partition_kernel_is_the_reference(T, chunk, kind):
     ``zero_dlogp_partition_reference``'s outputs bit for bit -- the order, the reordered ``lse``, the ``[T]`` scan and the
     per-chunk counts (at least one in the first chunk) -- over random, 512-row group, all-zero, single-live,
     last-chunk-live and no-zero gradients, with signed zeros, NaN gradients (live on a valid row, ignored rows
-    included) and NaN statistics among them."""
+    included) and NaN statistics among them; the first call binds the launch, the second runs the remembered one."""
     _require_zero_dlogp_skip()
     module_name, _record = cake_backend.record_for(CUDA)
     assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in cake_jit.registered_stages(
@@ -6558,21 +6575,187 @@ def test_device_zero_dlogp_partition_kernel_is_the_reference(T, chunk, kind):
         launched.append(stage)
         return original(record, module_name, stage, *args, **kwargs)
 
+    cake_backend.BINDING_CACHE.clear()
     cake_backend._eager_launch = recording
     try:
-        got = cake_backend.zero_dlogp_partition(labels, dlogp, index, lse, chunk)
+        runs = [
+            cake_backend.zero_dlogp_partition(labels, dlogp, index, lse, chunk)
+            for _ in range(2)
+        ]
     finally:
         cake_backend._eager_launch = original
     assert launched == [cake_backend.ZERO_DLOGP_PARTITION_STAGE]
     want = cake_backend.zero_dlogp_partition_reference(labels, dlogp, index, lse, chunk)
     torch.cuda.synchronize()
+    for got in runs:
+        _assert_partition_is(got, want)
+        assert int(got[3][0]) >= 1
+
+
+def _assert_partition_is(got, want):
+    """``got`` (the partition's four outputs) equals ``want`` (the reference's) bit for bit, dtype, shape and device."""
     for name, g, w in zip(
         ("row_index", "lse", "scan", "counts"), got, want, strict=True
     ):
         assert g.dtype == w.dtype and g.shape == w.shape and g.device == w.device, name
         same = _same_bits(g, w) if g.is_floating_point() else torch.equal(g, w)
         assert same, name
-    assert int(got[3][0]) >= 1
+
+
+def _partition_inputs(T, seed, zero_frac=0.3):
+    """Partition inputs of ``T`` rows on the device: ``(labels, dlogp, row_index, lse)`` with about 10 % ignored rows
+    and ``zero_frac`` of the rows of a zero ``dlogp``."""
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    labels = torch.randint(0, 1000, (T,), generator=gen)
+    labels[torch.rand(T, generator=gen) < 0.1] = -100
+    dlogp = torch.randn(T, generator=gen)
+    dlogp[torch.rand(T, generator=gen) < zero_frac] = 0.0
+    labels, dlogp = labels.to(CUDA), dlogp.to(CUDA)
+    index = (labels >= 0).nonzero().squeeze(1)
+    lse = torch.randn(int(index.numel()), generator=gen).to(CUDA)
+    return labels, dlogp, index, lse
+
+
+def test_device_zero_dlogp_partition_remembers_its_launch(monkeypatch):
+    """The partition resolves the device's record once (no ``record_for`` per call), binds its launch once per
+    ``(device, T, chunk)`` form while ``BINDING_CACHE`` is enabled (a later call of the form slots its tensors into the
+    remembered launch: no binding, the same bits), binds again for another form and on every call with the cache
+    disabled, and returns its four outputs as disjoint, aligned views of one allocation."""
+    _require_zero_dlogp_skip()
+    stage = cake_backend.ZERO_DLOGP_PARTITION_STAGE
+    binds, resolved = [], []
+    eager_launch, record_for = cake_backend._eager_launch, cake_backend.record_for
+
+    def recording(record, module_name, name, *args, **kwargs):
+        binds.append(name)
+        return eager_launch(record, module_name, name, *args, **kwargs)
+
+    def counting(*args, **kwargs):
+        resolved.append(args)
+        return record_for(*args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "_eager_launch", recording)
+    monkeypatch.setattr(cake_backend, "record_for", counting)
+    monkeypatch.setattr(cake_backend, "_SKIP_RECORDS", {})
+    cake_backend.BINDING_CACHE.clear()
+    a, b = _partition_inputs(9001, SEED + 1), _partition_inputs(12289, SEED + 2)
+
+    def check(args, chunk):
+        got = cake_backend.zero_dlogp_partition(*args, chunk)
+        _assert_partition_is(
+            got, cake_backend.zero_dlogp_partition_reference(*args, chunk)
+        )
+        return got
+
+    got = check(a, 4096)
+    assert binds == [stage] and len(resolved) == 1
+    spans = sorted(
+        (t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in got
+    )
+    assert len({t.untyped_storage().data_ptr() for t in got}) == 1
+    assert all(t.data_ptr() % cake_backend.WORKSPACE_ALIGN == 0 for t in got)
+    assert all(e <= s for (_, e), (s, _) in zip(spans, spans[1:], strict=False))
+    for _ in range(3):
+        check(a, 4096)
+    assert binds == [stage]
+    check(b, 4096)
+    check(a, 1024)
+    check(a, 4096)
+    check(b, 4096)
+    assert binds == [stage] * 3
+    cake_backend.BINDING_CACHE.configure(enabled=False)
+    try:
+        check(a, 4096)
+        check(a, 4096)
+    finally:
+        cake_backend.BINDING_CACHE.configure(enabled=True)
+    assert binds == [stage] * 5 and len(resolved) == 1
+    torch.cuda.synchronize()
+
+
+def test_device_zero_dlogp_partition_concurrent_threads(monkeypatch):
+    """Threads that run the partition at once, each on its own stream -- resolving the device's record and binding the
+    launch together, on the same and on different forms, while another thread clears the binding cache between their
+    calls -- all get the reference's bits."""
+    _require_zero_dlogp_skip()
+    monkeypatch.setattr(cake_backend, "_SKIP_RECORDS", {})
+    cake_backend.BINDING_CACHE.clear()
+    index = torch.cuda.current_device()
+    cases = [
+        _partition_inputs(T, SEED + i) for i, T in enumerate((4097, 9001, 9001, 12289))
+    ]
+    torch.cuda.synchronize()
+    errors: list[BaseException] = []
+    done = threading.Event()
+    start = threading.Barrier(len(cases) + 1)
+
+    def worker(args):
+        try:
+            with (
+                torch.cuda.device(index),
+                torch.cuda.stream(torch.cuda.Stream(index)),
+            ):
+                start.wait(60)
+                runs = [
+                    cake_backend.zero_dlogp_partition(*args, 4096) for _ in range(16)
+                ]
+                want = cake_backend.zero_dlogp_partition_reference(*args, 4096)
+                torch.cuda.current_stream(index).synchronize()
+                for got in runs:
+                    _assert_partition_is(got, want)
+        except BaseException as exc:  # noqa: BLE001 -- re-raised by the main thread
+            errors.append(exc)
+
+    def clearer():
+        start.wait(60)
+        while not done.is_set():
+            cake_backend.BINDING_CACHE.clear()
+            time.sleep(0.0005)
+
+    threads = [threading.Thread(target=worker, args=(c,)) for c in cases]
+    other = threading.Thread(target=clearer)
+    for t in threads + [other]:
+        t.start()
+    for t in threads:
+        t.join(120)
+    done.set()
+    other.join(60)
+    assert not any(t.is_alive() for t in threads + [other]), "a thread did not finish"
+    torch.cuda.synchronize()
+    if errors:
+        raise errors[0]
+
+
+@pytest.mark.parametrize("remembered", (False, True), ids=("binds", "remembered"))
+def test_device_zero_dlogp_partition_cuda_graph(remembered, monkeypatch):
+    """The partition captured in a CUDA graph -- binding its launch and resolving the device's record inside the capture
+    (both forgotten after an eager warm-up that loaded the program) or slotting its tensors into the remembered launch
+    -- replays with other ``dlogp`` values written into the captured input (random, every and no row zero) and gives the
+    reference's bits for them."""
+    _require_zero_dlogp_skip()
+    labels, dlogp, index, lse = _partition_inputs(12289, SEED + 3)
+    cake_backend.zero_dlogp_partition(labels, dlogp, index, lse, 4096)
+    torch.cuda.synchronize()
+    if not remembered:
+        cake_backend.BINDING_CACHE.clear()
+        monkeypatch.setattr(cake_backend, "_SKIP_RECORDS", {})
+    static = dlogp.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = cake_backend.zero_dlogp_partition(labels, static, index, lse, 4096)
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(SEED + 4)
+    for frac in (0.166, 1.0, 0.0):
+        new = torch.randn(static.numel(), generator=gen)
+        new[torch.rand(static.numel(), generator=gen) < frac] = 0.0
+        static.copy_(new.to(CUDA))
+        graph.replay()
+        want = cake_backend.zero_dlogp_partition_reference(
+            labels, static, index, lse, 4096
+        )
+        torch.cuda.synchronize()
+        _assert_partition_is(got, want)
 
 
 def test_zero_dlogp_floor_switch():
