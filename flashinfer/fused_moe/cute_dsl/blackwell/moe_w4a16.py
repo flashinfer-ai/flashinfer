@@ -19,7 +19,6 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     allocate_moe_sort_buffers,
     get_max_num_permuted_tokens,
     moe_output_memset_inplace,
-    moe_permute,
     moe_sort,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
@@ -33,6 +32,7 @@ from flashinfer.tllm_enums import (
 
 from .moe_finalize import moe_unpermute
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
+from .moe_w4a16_prepare import moe_permute_w4a16
 
 
 W4A16GemmTactic = Tuple[Tuple[int, int, int], Tuple[int, int], bool]
@@ -438,7 +438,7 @@ def launch_w4a16_moe(
     permuted_idx_to_expanded_idx = permuted_idx_to_expanded_idx[:route_slots]
     hidden_workspace = workspace.hidden_workspace[:route_slots]
     intermediate = workspace.intermediate[:route_slots]
-    moe_permute(
+    moe_permute_w4a16(
         input=x,
         permuted_output=hidden_workspace,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,

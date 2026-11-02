@@ -26,6 +26,7 @@ import torch
 from .reference_delta_rule import exclusive_cumsum
 from . import reference_delta_rule as reference
 from flashinfer.utils import (
+    get_compute_capability,
     is_sm90a_supported,
     is_sm100a_supported,
     is_sm12x_supported,
@@ -60,6 +61,14 @@ elif torch.cuda.is_available() and is_sm12x_supported(torch.device("cuda")):
         cp_delta_rule_prefill_dsl_sm120 as cp_delta_rule_prefill_dsl,
         cp_delta_rule_t_precompute_dsl_sm120 as cp_delta_rule_t_precompute_dsl,
     )
+elif torch.cuda.is_available() and get_compute_capability(torch.device("cuda"))[0] == 8:
+    from flashinfer.gdn_kernels.delta_rule_dsl.delta_rule_cp_sm80 import (
+        cp_delta_rule_dsl_sm80 as cp_delta_rule_dsl,
+        cp_delta_rule_fixup_dsl_sm80 as cp_delta_rule_fixup_dsl,
+        cp_delta_rule_mn_precompute_dsl_sm80 as cp_delta_rule_mn_precompute_dsl,
+        cp_delta_rule_prefill_dsl_sm80 as cp_delta_rule_prefill_dsl,
+        cp_delta_rule_t_precompute_dsl_sm80 as cp_delta_rule_t_precompute_dsl,
+    )
 else:
     cp_delta_rule_dsl = None
     cp_delta_rule_fixup_dsl = None
@@ -77,6 +86,10 @@ from flashinfer.gdn_prefill import chunk_gated_delta_rule
 FIXUP_TF32_ATOL = 2e-3
 FIXUP_TF32_RTOL = 2e-3
 FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma"]
+if torch.cuda.is_available() and get_compute_capability(torch.device("cuda"))[0] == 8:
+    # The HMMA fixup hands its math warps extra registers with `setmaxnreg`,
+    # which SM8x does not have.
+    FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8"]
 
 
 def _skip_if_cp_unsupported():
@@ -89,8 +102,12 @@ def _skip_if_cp_unsupported():
                 f"SM100 CP GDN prefill requires CUDA 13+, got {torch.version.cuda}"
             )
         return
-    if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
-        pytest.skip("CP GDN prefill requires SM90, SM100, or SM12x")
+    if not (
+        get_compute_capability(device)[0] == 8
+        or is_sm90a_supported(device)
+        or is_sm12x_supported(device)
+    ):
+        pytest.skip("CP GDN prefill requires SM8x, SM90, SM100, or SM12x")
 
 
 def _seed_all(seed):
@@ -519,11 +536,13 @@ def test_cp_delta_rule_fixup(
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @pytest.mark.parametrize("chunk_len", [64, 128])
 @pytest.mark.parametrize("gate_baseline", [0.9, 0.9995])
+@pytest.mark.parametrize("store_state", [True, False])
 def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     qkv_factory,
     dtype,
     chunk_len,
     gate_baseline,
+    store_state,
     seed=int(os.environ.get("SEED", "0")),
 ):
     _skip_if_cp_unsupported()
@@ -568,6 +587,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     fixed_state = cp_delta_rule_fixup_dsl(
         local_transfer, local_state, cu_seqlens, total_seqlen, cp_chunk_len=cp_chunk_len
     )
+    fixed_before = fixed_state.clone()
 
     our_o = torch.empty_like(q)
     our_state = torch.empty(
@@ -580,7 +600,7 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     )
     cp_delta_rule_prefill_dsl(
         our_o,
-        our_state,
+        our_state if store_state else None,
         q,
         k,
         v,
@@ -594,6 +614,9 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
         max_seqlen=max_seqlen,
     )
     torch.cuda.synchronize()
+    if not store_state:
+        # No final state asked for: none lands in the fixup workspace.
+        assert torch.equal(fixed_state, fixed_before)
 
     ref_o = torch.empty_like(q)
     ref_state = torch.empty(
@@ -622,7 +645,8 @@ def test_cp_delta_rule_prefill_varlen_matches_non_cp_prefill(
     torch.cuda.synchronize()
 
     torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
-    torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
+    if store_state:
+        torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
 
 
 @torch.inference_mode()
@@ -1086,3 +1110,32 @@ def test_cp_delta_rule_external_state_dtype(
 
     torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
     torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
+
+
+@torch.inference_mode()
+def test_cp_delta_rule_public_wrapper_refuses_a_misaligned_gate():
+    """A contiguous gate off its 16-byte boundary is refused despite `_skip_check`."""
+    device = torch.device("cuda")
+    if get_compute_capability(device)[0] != 8:
+        pytest.skip("the SM8x CP stages check their pointer alignment")
+    seq_len = 128
+    x = torch.zeros(seq_len, 1, 128, dtype=torch.bfloat16, device=device)
+    alpha = torch.ones(seq_len, 1, dtype=torch.float32, device=device)
+    beta = torch.ones(seq_len + 1, dtype=torch.float32, device=device)[1:].view(
+        seq_len, 1
+    )
+    assert beta.is_contiguous() and beta.data_ptr() % 16
+    with pytest.raises(RuntimeError, match="16-byte alignment for beta"):
+        chunk_gated_delta_rule(
+            x,
+            x,
+            x,
+            alpha,
+            beta,
+            1.0,
+            None,
+            True,
+            _make_cu_seqlens([seq_len], device),
+            use_qk_l2norm_in_kernel=False,
+            use_cp=True,
+        )

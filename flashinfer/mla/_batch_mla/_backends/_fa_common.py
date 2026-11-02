@@ -990,6 +990,24 @@ class _BatchMLAPagedAttentionFaBackendBase(
                 buffer.copy_(original)
             raise
 
+    def _check_planned_geometry(self, q_nope, ckv_cache):
+        # Structural resolution already checked ranks, widths and matching
+        # prefix shapes/devices within each split pair. Only plan facts remain.
+        if q_nope.shape[:2] != self._planned_query_shape:
+            raise ValueError(
+                "q_nope rows and heads must match the planned query shape."
+            )
+        cache_shape = ckv_cache.shape
+        if cache_shape[1] != self._page_size:
+            raise ValueError("ckv_cache page size must match the planned page_size.")
+        if q_nope.device != self.device or ckv_cache.device != self.device:
+            raise ValueError(
+                "q_nope and ckv_cache must be on the planned workspace device."
+            )
+        page_min, required_pages = self._planned_kv_page_range
+        if page_min < 0 or cache_shape[0] < required_pages:
+            raise ValueError("KV cache does not cover the planned CSR page indices.")
+
     def run_from_wrapper(
         self,
         *,
@@ -1030,6 +1048,7 @@ class _BatchMLAPagedAttentionFaBackendBase(
             raise ValueError("BMM scales are not supported with an fa2/fa3 backend.")
         q_nope, q_pe = cast(tuple[torch.Tensor, torch.Tensor], query)
         ckv_cache, kpe_cache = cast(tuple[torch.Tensor, torch.Tensor], kv_cache)
+        self._check_planned_geometry(q_nope, ckv_cache)
         return self._run_generated_fa(
             q_nope=q_nope,
             q_pe=q_pe,
@@ -1059,6 +1078,9 @@ class _BatchMLAPagedAttentionFaBackendBase(
         self._planned_run_options = dict(run_options)
 
     def get_valid_tactics(self, inputs, profile):
+        # Limit automatic profiling to validated native FA3 widths.
+        if self._backend == "fa3" and self._head_dim_ckv not in (128, 256, 512):
+            return []
         return [-1] if self._prepare_planned_inputs(inputs) is not None else []
 
     def _prepare_planned_inputs(self, inputs):
@@ -1108,9 +1130,6 @@ class _BatchMLAPagedAttentionFaBackendBase(
             check_shape_dtype_device(
                 inputs[3], self._planned_query_shape, torch.float32, self.device, "lse"
             )
-        # Limit automatic profiling to validated native FA3 widths.
-        if self._backend == "fa3" and self._head_dim_ckv not in (128, 256, 512):
-            return None
         # Native FA forwards only outer strides. Q/KV loads and output stores
         # operate in 16-byte vectors, including for noncompact outer layouts.
         for tensor in (*query, *cache, inputs[2]):
@@ -1154,8 +1173,6 @@ class _BatchMLAPagedAttentionFaBackendBase(
         if tactic != -1:
             raise ValueError(f"Unsupported {self._backend} MLA tactic: {tactic!r}.")
         query, kv_cache, out, lse, sinks = inputs[:5]
-        # Selection lasts for the plan. Validate current tensors here as well
-        # as during profiling, before native code uses its fixed plan geometry.
         prepared = self._prepare_planned_inputs(inputs)
         if prepared is None:
             raise ValueError(

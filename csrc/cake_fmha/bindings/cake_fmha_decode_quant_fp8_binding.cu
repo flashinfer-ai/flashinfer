@@ -5,7 +5,7 @@
 
 #include "../include/cake_fmha.h"
 
-extern "C" __global__ void kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, uint8_t* O, int* page_table, int* seq_lens_kv, float* bmm1_scale_ptr, float* bmm2_scale_ptr, float* partial_O, float* partial_max, float* partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split);
+extern "C" __global__ void kernel_cake_fmha_decode_quant_fp8(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, uint8_t* O, int* page_table, int* seq_lens_kv, float* bmm1_scale_ptr, float* bmm2_scale_ptr, float* partial_O, float* partial_max, float* partial_sum, int pt_batch_stride, int pt_v_offset, int bmm1_is_log2, int num_splits, int blocks_per_split, float bmm1_scalar, float bmm2_scalar);
 
 extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8(
     CakeFmhaTensorMap const* Qt,
@@ -24,6 +24,8 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8(
     int bmm1_is_log2,
     int num_splits,
     int blocks_per_split,
+    float bmm1_scalar,
+    float bmm2_scalar,
     unsigned int grid_x,
     unsigned int grid_y,
     unsigned int grid_z,
@@ -51,7 +53,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_quant_fp8(
         const_cast<void*>(reinterpret_cast<const void*>(&pt_v_offset)),
         const_cast<void*>(reinterpret_cast<const void*>(&bmm1_is_log2)),
         const_cast<void*>(reinterpret_cast<const void*>(&num_splits)),
-        const_cast<void*>(reinterpret_cast<const void*>(&blocks_per_split))
+        const_cast<void*>(reinterpret_cast<const void*>(&blocks_per_split)),
+        const_cast<void*>(reinterpret_cast<const void*>(&bmm1_scalar)),
+        const_cast<void*>(reinterpret_cast<const void*>(&bmm2_scalar))
     };
     return cudaLaunchKernel(
         reinterpret_cast<const void*>(kernel_cake_fmha_decode_quant_fp8),

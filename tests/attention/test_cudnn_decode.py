@@ -207,6 +207,57 @@ def _dense_offset_case(q_len_per_req=1, packed=False, with_end=True):
 
 @requires_cudnn_graph
 @pytest.mark.parametrize("q_len_per_req", [1, 3])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_cudnn_decode_without_block_tables(q_len_per_req, dtype):
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("cuDNN SDPA requires SM80 or later")
+    torch.manual_seed(61)
+    b, h, hk, d, sk = 2, 8, 2, 128, 32
+    q = torch.randn(b * q_len_per_req, h, d, device="cuda", dtype=dtype)
+    k = torch.randn(b, hk, sk, d, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    lengths = torch.tensor([23, sk], device="cuda", dtype=torch.int32).reshape(
+        b, 1, 1, 1
+    )
+    workspace = torch.empty(128 << 20, device="cuda", dtype=torch.uint8)
+    out = torch.empty_like(q)
+    lse = torch.empty(b * q_len_per_req, h, device="cuda")
+
+    def run():
+        return cudnn_decode.cudnn_batch_decode_with_kv_cache(
+            q,
+            k,
+            v,
+            d**-0.5,
+            workspace,
+            max_sequence_kv=sk,
+            actual_seq_lens_kv=lengths,
+            q_len_per_req=q_len_per_req,
+            out=out,
+            lse=lse,
+            return_lse=True,
+        )
+
+    # The same dense KV buffers are one page per request in the reference.
+    tables = torch.arange(b, device="cuda", dtype=torch.int32).reshape(b, 1)
+    ref, stats = _decode_ref(
+        q, k, v, tables, lengths, d**-0.5, q_len_per_req=q_len_per_req
+    )
+    run()
+    torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+    torch.testing.assert_close(lse, stats, atol=0.003, rtol=0.003)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    out.fill_(torch.nan)
+    lse.fill_(torch.nan)
+    graph.replay()
+    torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+    torch.testing.assert_close(lse, stats, atol=0.003, rtol=0.003)
+
+
+@requires_cudnn_graph
+@pytest.mark.parametrize("q_len_per_req", [1, 3])
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("with_end", [False, True])
 def test_cudnn_decode_dense_offsets_capture(q_len_per_req, packed, with_end):

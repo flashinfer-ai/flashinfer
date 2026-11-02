@@ -17,13 +17,38 @@
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_kimi_k3_fp8_projection_device_common.cuh"
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags select the lever arms below (-DACC_BUFS=<n>; the guarded defaults are this
+// file's own values) and rename the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every
+// JIT library of the family exports a distinct kernel); the defaults name this file's own
+// program.
+#ifndef ACC_BUFS
+#define ACC_BUFS 1
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_kimi_k3_fp8_projection_67b79a99dbca18833ff9
+#endif
+
 #define CAKE_INF CUDART_INF_F
+#if ACC_BUFS == 2
+#define TMEM_NCOLS 144
+#else
 #define TMEM_NCOLS 80
+#endif
 #define TMEM_ACCUM_OFFSET 0
+#if ACC_BUFS == 2
+#define TMEM_TMEM_SFW_OFFSET 128
+#define TMEM_TMEM_SFX_OFFSET 136
+#else
 #define TMEM_TMEM_SFW_OFFSET 64
 #define TMEM_TMEM_SFX_OFFSET 72
+#endif
 #define NUM_TMA_PIPE_STAGES 4
+#if ACC_BUFS == 2
+#define NUM_MAINLOOP_PIPE_STAGES 2
+#else
 #define NUM_MAINLOOP_PIPE_STAGES 1
+#endif
 #define NUM_RED_PIPE_STAGES 1
 #define SMEM_SMEM_W_OFF 1024
 #define SMEM_SMEM_W_STAGE_BYTES 32768
@@ -61,7 +86,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_fp8_projection_67b79a99dbca18833ff9(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -80,9 +105,15 @@ kernel_cake_kimi_k3_fp8_projection_67b79a99dbca18833ff9(const __grid_constant__ 
     #define tma_full_addr (mbar_base + 0)
     #define mma_done_addr (mbar_base + 32)
     #define mainloop_done_addr (mbar_base + 64)
+#if ACC_BUFS == 2
+    #define epilogue_done_addr (mbar_base + 80)
+    #define red_full_addr (mbar_base + 96)
+    #define peers_free_addr (mbar_base + 104)
+#else
     #define epilogue_done_addr (mbar_base + 72)
     #define red_full_addr (mbar_base + 80)
     #define peers_free_addr (mbar_base + 88)
+#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -135,24 +166,49 @@ kernel_cake_kimi_k3_fp8_projection_67b79a99dbca18833ff9(const __grid_constant__ 
             // --- pipeline 'mainloop_pipe' ---
             // mainloop_done: 1 barriers, init_count=1
             mbarrier_init(smem + 64, 1);
+#if ACC_BUFS == 2
+            mbarrier_init(smem + 72, 1);
+            // epilogue_done: 2 barriers, init_count=4
+            mbarrier_init(smem + 80, 4);
+            mbarrier_init(smem + 88, 4);
+#else
             // epilogue_done: 1 barriers, init_count=4
             mbarrier_init(smem + 72, 4);
+#endif
             // --- pipeline 'red_pipe' ---
             // red_full: 1 barriers, init_count=1
+#if ACC_BUFS == 2
+            mbarrier_init(smem + 96, 1);
+#else
             mbarrier_init(smem + 80, 1);
+#endif
             // peers_free: 1 barriers, init_count=1
+#if ACC_BUFS == 2
+            mbarrier_init(smem + 104, 1);
+#else
             mbarrier_init(smem + 88, 1);
+#endif
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
     __syncwarp();
 
+#if ACC_BUFS == 2
+    // TMEM alloc (256 columns, 144 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 112);
+#else
     // TMEM alloc (128 columns, 80 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
+#endif
     if (warp == 0) {
+#if ACC_BUFS == 2
+        int _tmem_hold = smem + 112;
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
+#else
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
+#endif
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
@@ -166,8 +222,13 @@ kernel_cake_kimi_k3_fp8_projection_67b79a99dbca18833ff9(const __grid_constant__ 
 
     // Kernel post-init ops
     const int tmem_accum = taddr;
+#if ACC_BUFS == 2
+    const int tmem_tmem_sfw = taddr + 128;
+    const int tmem_tmem_sfx = taddr + 136;
+#else
     const int tmem_tmem_sfw = taddr + 64;
     const int tmem_tmem_sfx = taddr + 72;
+#endif
 
     // ---- Role: load ----
     if (warp == 0) {
@@ -283,7 +344,12 @@ kernel_cake_kimi_k3_fp8_projection_67b79a99dbca18833ff9(const __grid_constant__ 
                     if (mma_stage == 4) { mma_stage = 0; _phase_tma_full ^= 1; }
                 }
                 elect_commit(mainloop_done_addr + (acc_stage) * 8);
+#if ACC_BUFS == 2
+                acc_stage += 1;
+                if (acc_stage == 2) { acc_stage = 0; _phase_epilogue_done ^= 1; }
+#else
                 _phase_epilogue_done ^= 1;
+#endif
             }
         }
     }
@@ -332,7 +398,11 @@ kernel_cake_kimi_k3_fp8_projection_67b79a99dbca18833ff9(const __grid_constant__ 
                         }
                     }
                 }
+#if ACC_BUFS == 2
+                int acc_col_e = it_e % 2 * 64;
+#else
                 int acc_col_e = 0;
+#endif
                 float _tmem_load_0[64];
                 asm volatile(
                     "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -349,7 +419,12 @@ kernel_cake_kimi_k3_fp8_projection_67b79a99dbca18833ff9(const __grid_constant__ 
                 if (elect_sync()) {
                     mbarrier_arrive(epilogue_done_addr + (acc_stage_e) * 8);
                 }
+#if ACC_BUFS == 2
+                acc_stage_e += 1;
+                if (acc_stage_e == 2) { acc_stage_e = 0; _phase_mainloop_done ^= 1; }
+#else
                 _phase_mainloop_done ^= 1;
+#endif
                 unsigned int epi_base = smem_epi_addr + (unsigned int)(epi_group * 16384);
                 int my_rank = cta_rank;
                 int _min_1 = ((64) < ((my_rank + 1) * 32) ? (64) : ((my_rank + 1) * 32));
@@ -1546,7 +1621,11 @@ kernel_cake_kimi_k3_fp8_projection_67b79a99dbca18833ff9(const __grid_constant__ 
     asm volatile("barrier.cluster.wait.acquire.aligned;");
 
     if (warp == 0) {
+#if ACC_BUFS == 2
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(256));
+#else
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(128));
+#endif
     }
 }
 

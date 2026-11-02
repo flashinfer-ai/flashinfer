@@ -18,7 +18,8 @@
 
 // The generated body is a self-contained CUDA translation-unit fragment shared
 // by every supported architecture; each module compiles it with its own
-// -gencode.  Keep its fixed-width types intact: rewriting names such as
+// -gencode and its own CAKE_MEGAMOE_TOPK_REDUCE_ARCH, which picks the token
+// tiers below.  Keep its fixed-width types intact: rewriting names such as
 // uint32_t here would make the generated vector-load code refer to undefined
 // aliases.  The include stays ahead of the toolkit headers.
 // clang-format off
@@ -40,9 +41,73 @@ namespace cake_megamoe_topk_reduce {
 
 constexpr int32_t kTopK = 6;
 constexpr int32_t kHiddenSize = 4096;
-constexpr int32_t kGridCTAsPerToken = 4;
-constexpr int32_t kBlockThreads = 256;
 constexpr int32_t kRequiredAlignmentBytes = 128;
+
+// The generated source holds the reducer in seven CTA shapes.  Every thread runs
+// the same program (six loads, FP32 adds in increasing k, one RN rounding), so
+// all shapes write bit-identical rows; they differ in threads per CTA, BF16
+// values per thread, the L2 prefetch size or eviction priority of the loads and
+// the add instruction (a widening FMA or add.rn.f32.bf16, the same RN sum).
+// The sm_100a and sm_103a tiers launch the first four, the sm_107a tiers the
+// last three.
+enum class CtaShape {
+  k512x2,
+  k512x4,
+  k512x4Pf256,
+  k1024x4Pf256,
+  k64x8BaddL2Ef,
+  k256x2BaddL2Ef,
+  k256x4BaddL2Ef,
+};
+
+// The fastest shape depends on the live token count and the architecture: the
+// module launches the first tier whose max_tokens covers num_tokens.
+struct TokenTier {
+  int64_t max_tokens;
+  CtaShape shape;
+};
+
+constexpr int64_t kNoTokenLimit = std::numeric_limits<int64_t>::max();
+
+#if CAKE_MEGAMOE_TOPK_REDUCE_ARCH == 100
+constexpr TokenTier kTokenTiers[] = {
+    {48, CtaShape::k512x2},
+    {96, CtaShape::k512x4},
+    {2048, CtaShape::k512x4Pf256},
+    {kNoTokenLimit, CtaShape::k1024x4Pf256},
+};
+#elif CAKE_MEGAMOE_TOPK_REDUCE_ARCH == 103
+constexpr TokenTier kTokenTiers[] = {
+    {48, CtaShape::k512x2},        {96, CtaShape::k512x4},
+    {192, CtaShape::k512x4Pf256},  {256, CtaShape::k1024x4Pf256},
+    {1024, CtaShape::k512x4Pf256}, {kNoTokenLimit, CtaShape::k1024x4Pf256},
+};
+#elif CAKE_MEGAMOE_TOPK_REDUCE_ARCH == 107
+// R200 runs at most 1024 threads per SM: the middle tiers use 256-thread CTAs
+// and the large tier 64-thread CTAs with 128-bit accesses.
+constexpr TokenTier kTokenTiers[] = {
+    {64, CtaShape::k256x2BaddL2Ef},
+    {212, CtaShape::k256x4BaddL2Ef},
+    {kNoTokenLimit, CtaShape::k64x8BaddL2Ef},
+};
+#else
+#error "CAKE_MEGAMOE_TOPK_REDUCE_ARCH must be 100 (sm_100a), 103 (sm_103a) or 107 (sm_107a)"
+#endif
+
+inline CtaShape SelectShape(int64_t num_tokens) {
+  for (const TokenTier& tier : kTokenTiers) {
+    if (num_tokens <= tier.max_tokens) {
+      return tier.shape;
+    }
+  }
+  return CtaShape::k1024x4Pf256;
+}
+
+// A CTA of `threads` threads with `values` BF16 outputs each covers
+// threads * values of a token's kHiddenSize outputs.
+inline dim3 TokenGrid(int64_t num_tokens, int32_t threads, int32_t values) {
+  return dim3(static_cast<uint32_t>(kHiddenSize / (threads * values) * num_tokens), 1, 1);
+}
 
 inline void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
@@ -106,12 +171,39 @@ void Run(TensorView partials, TensorView out, int64_t num_tokens, int64_t cuda_s
     return;
   }
 
-  const dim3 grid(static_cast<uint32_t>(kGridCTAsPerToken * num_tokens), 1, 1);
-  const dim3 block(kBlockThreads, 1, 1);
+  auto* partials_ptr = reinterpret_cast<__nv_bfloat16*>(partials.data_ptr());
+  auto* out_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  kernel_cake_megamoe_workspace_topk_reduce_bfloat16_h4096_k6<<<grid, block, 0, stream>>>(
-      reinterpret_cast<__nv_bfloat16*>(partials.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
+  switch (SelectShape(num_tokens)) {
+    case CtaShape::k512x2:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x2<<<
+          TokenGrid(num_tokens, 512, 2), 512, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+    case CtaShape::k512x4:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x4<<<
+          TokenGrid(num_tokens, 512, 4), 512, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+    case CtaShape::k512x4Pf256:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x4_pf256<<<
+          TokenGrid(num_tokens, 512, 4), 512, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+    case CtaShape::k1024x4Pf256:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t1024x4_pf256<<<
+          TokenGrid(num_tokens, 1024, 4), 1024, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+    case CtaShape::k64x8BaddL2Ef:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t64x8_badd_l2ef<<<
+          TokenGrid(num_tokens, 64, 8), 64, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+    case CtaShape::k256x2BaddL2Ef:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t256x2_badd_l2ef<<<
+          TokenGrid(num_tokens, 256, 2), 256, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+    case CtaShape::k256x4BaddL2Ef:
+      kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t256x4_badd_l2ef<<<
+          TokenGrid(num_tokens, 256, 4), 256, 0, stream>>>(partials_ptr, out_ptr);
+      break;
+  }
   CheckCuda(cudaGetLastError(), "MegaMoE TopK-reduce launch");
 }
 

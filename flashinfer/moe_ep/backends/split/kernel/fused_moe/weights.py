@@ -4,66 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import torch
-
-from .....weights import MoEWeightPack
+from .....weights import MoEWeightPack, PrequantizedMoEWeights
 
 if TYPE_CHECKING:
     from ......fused_moe.api import MoEConfig, MoEWeightPack as FusedMoEWeightPack
-
-
-# Shape-keyed permute-index cache shared across experts/layers (mirrors
-# flashinfer.fused_moe.prepare._TRTLLM_PERMUTE_CACHE for the fp4 path).
-_TRTLLM_BF16_PERMUTE_CACHE: dict = {}
-
-
-def _block_major_k_weights(
-    w13: torch.Tensor, w2: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Shuffled BlockMajorK weights for the trtllm bf16 routed runner.
-
-    Mirrors the upstream trtllm-gen bf16 prep (tests/moe
-    ``trtllm_gen_fused_moe_utils``): gemm1 takes the gated-act w3/w1 row
-    reorder + MMA shuffle (``is_gated_act_gemm=True``), gemm2 the plain w2
-    shuffle, both with the kernel-internal ``epilogue_tile_m=128``, then
-    BlockMajorK conversion.  The previous plain ``shuffle_matrix_a`` with
-    tile 64 skipped the gated-act reorder and fed the kernel misordered
-    gate/up rows — undetected by EP-vs-kernel tests because both sides
-    shared this prep; caught by the torch-oracle tests.
-    """
-    from flashinfer.fused_moe.core import (
-        _maybe_get_cached_w3_w1_permute_indices,
-        convert_to_block_layout,
-        get_w2_permute_indices_with_cache,
-    )
-
-    epilogue_tile_m = 128
-    block_k = 128
-    device = w13.device
-
-    g1, g2 = [], []
-    for i in range(w13.shape[0]):
-        p = _maybe_get_cached_w3_w1_permute_indices(
-            _TRTLLM_BF16_PERMUTE_CACHE,
-            w13[i].view(torch.uint8),
-            epilogue_tile_m,
-            is_gated_act_gemm=True,
-        )
-        s = w13[i].view(torch.uint8)[p.to(device)].contiguous()
-        g1.append(convert_to_block_layout(s, block_k))
-
-        p = get_w2_permute_indices_with_cache(
-            _TRTLLM_BF16_PERMUTE_CACHE,
-            w2[i].view(torch.uint8),
-            epilogue_tile_m,
-        )
-        s = w2[i].view(torch.uint8)[p.to(device)].contiguous()
-        g2.append(convert_to_block_layout(s, block_k))
-
-    return (
-        torch.stack(g1).view(torch.bfloat16),
-        torch.stack(g2).view(torch.bfloat16),
-    )
 
 
 def materialize_fused_moe_weights(
@@ -76,15 +20,33 @@ def materialize_fused_moe_weights(
     candidate needs its view even when it is not first in the search order.
     Repeated configurations of the same backend share one weight view.
     """
+    if isinstance(weights, PrequantizedMoEWeights):
+        raise NotImplementedError(
+            "The split fused_moe kernel prepares every backend's weights from "
+            "canonical BF16; PrequantizedMoEWeights are not supported"
+        )
+
     from ......fused_moe.api import (
         CuteDslConfig,
         MoEWeightPack as FusedMoEWeightPack,
+        PrimsTsConfig,
         QuantFormat,
         TrtllmBf16Config,
         TrtllmFp4Config,
+        TrtllmFp8BlockConfig,
     )
 
     quant = moe_config.quant
+    # FP8PerTensor needs calibrated global scales, which MoEWeightPack does
+    # not carry.
+    prims_ts_pairs = (
+        (QuantFormat.NVFP4, QuantFormat.NVFP4),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP4, QuantFormat.BF16),
+        (QuantFormat.BF16, QuantFormat.BF16),
+        (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
+    )
     experts = moe_config.experts
     routing = moe_config.routing
     num_local = experts.local_num_experts or routing.num_experts
@@ -99,14 +61,16 @@ def materialize_fused_moe_weights(
         ):
             if "trtllm_bf16_routed" in pack.native_views:
                 continue
-            g1, g2 = _block_major_k_weights(weights.w13, weights.w2)
-            pack.prepare_for(
-                "trtllm_bf16_routed",
-                {
-                    "gemm1_weights": g1,
-                    "gemm2_weights": g2,
-                },
+            view = TrtllmBf16Config.prepare_weights(
+                weights.w13,
+                weights.w2,
+                num_local_experts=num_local,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=moe_config.activation,
+                device=weights.w13.device,
             )
+            pack.prepare_for("trtllm_bf16_routed", view)
             continue
 
         if quant.pair in (
@@ -128,6 +92,25 @@ def materialize_fused_moe_weights(
             pack.prepare_for("trtllm_fp4_routed", view)
             continue
 
+        if quant.pair == (
+            QuantFormat.DeepSeekFp8,
+            QuantFormat.DeepSeekFp8,
+        ) and isinstance(backend_cfg, TrtllmFp8BlockConfig):
+            if "trtllm_fp8_block" in pack.native_views:
+                continue
+            view = TrtllmFp8BlockConfig.prepare_weights(
+                weights.w13,
+                weights.w2,
+                quant=quant,
+                num_local_experts=num_local,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=moe_config.activation,
+                device=weights.w13.device,
+            )
+            pack.prepare_for("trtllm_fp8_block", view)
+            continue
+
         if quant.pair in (
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
             (QuantFormat.MXFP4, QuantFormat.MXFP8),
@@ -146,6 +129,22 @@ def materialize_fused_moe_weights(
                 device=weights.w13.device,
             )
             pack.prepare_for("cute_dsl", view)
+            continue
+
+        if quant.pair in prims_ts_pairs and isinstance(backend_cfg, PrimsTsConfig):
+            if "prims_ts" in pack.native_views:
+                continue
+            view = PrimsTsConfig.prepare_weights(
+                weights.w13,
+                weights.w2,
+                quant=quant,
+                num_local_experts=num_local,
+                hidden_size=hidden,
+                intermediate_size=intermediate,
+                activation=moe_config.activation,
+                device=weights.w13.device,
+            )
+            pack.prepare_for("prims_ts", view)
 
     if pack.native_views:
         return pack

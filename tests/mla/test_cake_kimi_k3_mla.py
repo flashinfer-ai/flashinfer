@@ -511,7 +511,33 @@ def test_plan_is_shared_across_calls_of_one_shape():
     narrow = plan_attention(
         batch=1, max_q_len=1, num_heads=12, max_seq_len=40000, sm_count=148
     )
-    assert not narrow.wide and narrow.main_kind == "main_rt16"
+    assert not narrow.wide and narrow.main_kind == "main_rt16_late"
+
+
+def test_late_trigger_route_follows_the_main_grid():
+    from flashinfer.mla.cake_kimi_k3_mla import (
+        LATE_TRIGGER_MIN_MAIN_CTAS,
+        plan_attention,
+    )
+
+    # Main CTAs on 152 SMs: 16, 32, and 128 with one split (no reducer).
+    for batch, max_seq_len, kind in (
+        (1, 4096, "main_rt16"),
+        (8, 1024, "main_rt16_late"),
+        (128, 1024, "main_rt16"),
+    ):
+        plan = plan_attention(
+            batch=batch,
+            max_q_len=1,
+            num_heads=12,
+            max_seq_len=max_seq_len,
+            sm_count=152,
+        )
+        ctas = plan.grid_main[0] * plan.grid_main[1] * plan.grid_main[2]
+        assert plan.main_kind == kind
+        assert (kind == "main_rt16_late") == (
+            plan.num_split > 1 and ctas >= LATE_TRIGGER_MIN_MAIN_CTAS
+        )
 
 
 def test_every_kernel_key_resolves_on_the_running_architecture():
@@ -529,12 +555,12 @@ def test_every_kernel_key_resolves_on_the_running_architecture():
             "arg_plan",
             "arches",
         }
-    # A per-architecture key names one program per supported architecture and nothing else.
+    # A per-architecture key names, for each supported architecture, a program generated for it.
     for _key, entry in KERNELS.items():
         if isinstance(entry, dict):
             assert set(entry) == supported_arches()
             assert all(
-                MODULES[name]["arches"] == [name_arch]
+                name_arch in MODULES[name]["arches"]
                 for name_arch, name in entry.items()
             )
 

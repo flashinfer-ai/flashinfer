@@ -143,6 +143,53 @@ class CollectiveStoreTma:
         cute.arch.cp_async_bulk_commit_group()
 
     @cute.jit
+    def store_rows_simt(
+        self,
+        sO: cute.Tensor,
+        g_o: cute.Tensor,
+        o_head_idx: cutlass.Int32,
+        stage_idx: cutlass.Int32,
+        row_tok0,
+        row_lo: cutlass.Int32,
+        row_hi: cutlass.Int32,
+    ):
+        """Store rows [row_lo, row_hi) of one O tile with plain stores.
+
+        Row r of the tile is token ``row_tok0 + r``. One warp; each lane moves
+        8 consecutive d (one 16 B vector) of one row per step.
+        """
+        vec = 8
+        lanes_per_row = self.D // vec
+        rows_per_step = 32 // lanes_per_row
+        lane = cute.arch.lane_idx()
+        d0 = (lane % cutlass.Int32(lanes_per_row)) * cutlass.Int32(vec)
+        row_in_step = lane // cutlass.Int32(lanes_per_row)
+        sO_stage = sO[None, None, stage_idx]
+        gO_head = g_o[None, None, o_head_idx]
+        store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            g_o.element_type,
+            num_bits_per_copy=vec * g_o.element_type.width,
+        )
+        frag = cute.make_rmem_tensor(vec, g_o.element_type)
+        # Runs once per padded work item: not unrolled, so the 24-register
+        # store warp keeps its addresses in registers.
+        for it in cutlass.range(self.BLK_Q // rows_per_step, unroll=1):
+            row = it * cutlass.Int32(rows_per_step) + row_in_step
+            if row >= row_lo and row < row_hi:
+                for j in cutlass.range_constexpr(vec):
+                    frag[j] = sO_stage[d0 + j, row]
+                # O rows are 16 B aligned (the entry checks the TMA layout)
+                # and d0 is a multiple of 8 elements.
+                dst = cute.make_tensor(
+                    cute.domain_offset((d0, row_tok0 + row), gO_head).iterator.align(
+                        16
+                    ),
+                    cute.make_layout(vec),
+                )
+                cute.copy(store_atom, frag, dst)
+
+    @cute.jit
     def step(
         self,
         sO: cute.Tensor,
@@ -194,6 +241,49 @@ class CollectiveStoreTma:
         return o_consumer_state
 
     @cute.jit
+    def step_first_padded(
+        self,
+        sO: cute.Tensor,
+        tma_atom_o: cute.CopyAtom,
+        g_tensormaps: cute.Tensor,
+        o_pipeline,
+        o_consumer_state,
+        work_desc,
+        o_head_idx: cutlass.Int32,
+        num_blocks: cutlass.Int32,
+        num_seqs: cutlass.Int32,
+        g_o: cute.Tensor,
+        pad: cutlass.Int32,
+    ):
+        """``step`` for the first tile of a work item that starts ``pad`` > 0
+        rows before its sequence (``work_desc`` spans the padded rows).
+
+        The sequence rows of this tile are written with plain stores: a TMA
+        store cannot skip the rows before the sequence, which belong to the
+        previous one. Later tiles start inside the sequence and use ``step``.
+        """
+        if not self.can_process(
+            sO, work_desc, num_blocks - cutlass.Int32(1), num_blocks, num_seqs
+        ):
+            self.create_tensormap_for_tail(tma_atom_o, g_tensormaps, work_desc)
+        o_pipeline.consumer_wait(o_consumer_state)
+        row_hi = work_desc.seq_len
+        if row_hi > cutlass.Int32(self.BLK_Q):
+            row_hi = cutlass.Int32(self.BLK_Q)
+        self.store_rows_simt(
+            sO,
+            g_o,
+            o_head_idx,
+            o_consumer_state.index,
+            work_desc.tok_offset,
+            pad,
+            row_hi,
+        )
+        o_pipeline.consumer_release(o_consumer_state)
+        o_consumer_state.advance()
+        return o_consumer_state
+
+    @cute.jit
     def run(
         self,
         sO: cute.Tensor,
@@ -207,22 +297,78 @@ class CollectiveStoreTma:
         o_stage: int,
         num_q_heads: cutlass.Int32,
         num_v_heads: cutlass.Int32,
+        g_o: cute.Tensor = None,
+        pad=None,
     ):
+        """Store every O tile of ``work_desc``.
+
+        ``g_o`` (the O tensor) and ``pad`` are given only when ``work_desc``
+        may start ``pad`` rows before its sequence (virtual left padding);
+        the padding rows are then not written.
+        """
         o_head_idx = work_desc.o_head_idx(num_q_heads, num_v_heads)
         o_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, o_stage
         )
-        for blk in cutlass.range(num_blocks, unroll=1):
-            o_consumer_state = self.step(
-                sO,
-                tma_atom_o,
-                tma_tensor_o,
-                g_tensormaps,
-                o_pipeline,
-                o_consumer_state,
-                work_desc,
-                o_head_idx,
-                blk,
-                num_blocks,
-                num_seqs,
-            )
+        if cutlass.const_expr(g_o is None):
+            for blk in cutlass.range(num_blocks, unroll=1):
+                o_consumer_state = self.step(
+                    sO,
+                    tma_atom_o,
+                    tma_tensor_o,
+                    g_tensormaps,
+                    o_pipeline,
+                    o_consumer_state,
+                    work_desc,
+                    o_head_idx,
+                    blk,
+                    num_blocks,
+                    num_seqs,
+                )
+        else:
+            # Only the first tile can hold padding rows; the loop over the
+            # others is the one above.
+            if pad != cutlass.Int32(0):
+                o_consumer_state = self.step_first_padded(
+                    sO,
+                    tma_atom_o,
+                    g_tensormaps,
+                    o_pipeline,
+                    o_consumer_state,
+                    work_desc,
+                    o_head_idx,
+                    num_blocks,
+                    num_seqs,
+                    g_o,
+                    pad,
+                )
+            else:
+                o_consumer_state = self.step(
+                    sO,
+                    tma_atom_o,
+                    tma_tensor_o,
+                    g_tensormaps,
+                    o_pipeline,
+                    o_consumer_state,
+                    work_desc,
+                    o_head_idx,
+                    cutlass.Int32(0),
+                    num_blocks,
+                    num_seqs,
+                )
+            for blk in cutlass.range(
+                cutlass.Int32(1), num_blocks, cutlass.Int32(1), unroll=1
+            ):
+                o_consumer_state = self.step(
+                    sO,
+                    tma_atom_o,
+                    tma_tensor_o,
+                    g_tensormaps,
+                    o_pipeline,
+                    o_consumer_state,
+                    work_desc,
+                    o_head_idx,
+                    blk,
+                    num_blocks,
+                    num_seqs,
+                )

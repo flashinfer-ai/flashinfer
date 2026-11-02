@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,13 @@
  * limitations under the License.
  */
 
-// Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
-#include "cake_dsa_h64_train_device_common.cuh"
+#include "cake_dsa_h64_train_device.cuh"
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 1
 
 extern "C" {
 
-__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
 kernel_cake_dsa_h64_train_19c560118a407f5473fe(int* __restrict__ indices, int* __restrict__ topk_length, int* __restrict__ key_scratch, int* __restrict__ pass_counts, int num_tokens, int topk, int idx_stride, int indices_offset, int has_topk_length, int token_base, int token_step, int pass_lo, int pass_hi)
 {
     const int tid = threadIdx.x;
@@ -32,20 +28,15 @@ kernel_cake_dsa_h64_train_19c560118a407f5473fe(int* __restrict__ indices, int* _
     const int lane = tid % 32;
 
 
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-
-    const int cta_rank = 0;
-
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int rowi = blockIdx.x * 4 + warp;
     int lane_0 = lane;
     if (rowi < num_tokens) {
         int token = token_base + token_step * rowi;
         int active = topk;
         if (has_topk_length != 0) {
-            int _max_0 = ((topk_length[token]) > (0) ? (topk_length[token]) : (0));
-            int _min_0 = ((_max_0) < (topk) ? (_max_0) : (topk));
+            int _max_1 = ((topk_length[token]) > (0) ? (topk_length[token]) : (0));
+            int _min_0 = ((_max_1) < (topk) ? (_max_1) : (topk));
             active = _min_0;
         }
         long long row_base = (long long)indices_offset + (long long)token * (long long)idx_stride;
@@ -59,23 +50,23 @@ kernel_cake_dsa_h64_train_19c560118a407f5473fe(int* __restrict__ indices, int* _
             if (cwhole != 0) {
                 int _vec_load_0[8];
                 {
-                    uint32_t _iv_0_0;
-                    uint32_t _iv_0_1;
-                    uint32_t _iv_0_2;
-                    uint32_t _iv_0_3;
-                    uint32_t _iv_0_4;
-                    uint32_t _iv_0_5;
-                    uint32_t _iv_0_6;
-                    uint32_t _iv_0_7;
-                    asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_iv_0_0), "=r"(_iv_0_1), "=r"(_iv_0_2), "=r"(_iv_0_3), "=r"(_iv_0_4), "=r"(_iv_0_5), "=r"(_iv_0_6), "=r"(_iv_0_7) : "l"((const void*)(indices + (row_base + (long long)cpos) + (0))) : "memory");
-                    _vec_load_0[0 + 0] = (int32_t)_iv_0_0;
-                    _vec_load_0[0 + 1] = (int32_t)_iv_0_1;
-                    _vec_load_0[0 + 2] = (int32_t)_iv_0_2;
-                    _vec_load_0[0 + 3] = (int32_t)_iv_0_3;
-                    _vec_load_0[0 + 4] = (int32_t)_iv_0_4;
-                    _vec_load_0[0 + 5] = (int32_t)_iv_0_5;
-                    _vec_load_0[0 + 6] = (int32_t)_iv_0_6;
-                    _vec_load_0[0 + 7] = (int32_t)_iv_0_7;
+                    uint32_t _iv_2_0;
+                    uint32_t _iv_2_1;
+                    uint32_t _iv_2_2;
+                    uint32_t _iv_2_3;
+                    uint32_t _iv_2_4;
+                    uint32_t _iv_2_5;
+                    uint32_t _iv_2_6;
+                    uint32_t _iv_2_7;
+                    asm volatile("ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];" : "=r"(_iv_2_0), "=r"(_iv_2_1), "=r"(_iv_2_2), "=r"(_iv_2_3), "=r"(_iv_2_4), "=r"(_iv_2_5), "=r"(_iv_2_6), "=r"(_iv_2_7) : "l"((const void*)(indices + (row_base + (long long)cpos) + (0))) : "memory");
+                    _vec_load_0[0 + 0] = (int32_t)_iv_2_0;
+                    _vec_load_0[0 + 1] = (int32_t)_iv_2_1;
+                    _vec_load_0[0 + 2] = (int32_t)_iv_2_2;
+                    _vec_load_0[0 + 3] = (int32_t)_iv_2_3;
+                    _vec_load_0[0 + 4] = (int32_t)_iv_2_4;
+                    _vec_load_0[0 + 5] = (int32_t)_iv_2_5;
+                    _vec_load_0[0 + 6] = (int32_t)_iv_2_6;
+                    _vec_load_0[0 + 7] = (int32_t)_iv_2_7;
                 }
                 kv8[0] = _vec_load_0[0];
                 kv8[1] = _vec_load_0[1];
@@ -152,13 +143,12 @@ kernel_cake_dsa_h64_train_19c560118a407f5473fe(int* __restrict__ indices, int* _
             if (kv8[7] >= pass_lo && kv8[7] < pass_hi) {
                 hit = hit + 1;
             }
-            uint32_t _warp_scan_sum_u32_0 = hit;
-            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(1));
-            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(2));
-            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(4));
-            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(8));
-            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(_warp_scan_sum_u32_0) : "r"(16));
-            unsigned int incl = _warp_scan_sum_u32_0;
+            uint32_t incl = hit;
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(1));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(2));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(4));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(8));
+            asm volatile("{ .reg .pred p; .reg .b32 t; shfl.sync.up.b32 t|p, %0, %1, 0, 0xffffffff; @p add.u32 %0, %0, t; }" : "+r"(incl) : "r"(16));
             int wpos = count + (int)(incl - hit);
             if (kv8[0] >= pass_lo && kv8[0] < pass_hi) {
                 key_scratch[out_base + (long long)wpos] = kv8[0];
@@ -192,8 +182,8 @@ kernel_cake_dsa_h64_train_19c560118a407f5473fe(int* __restrict__ indices, int* _
                 key_scratch[out_base + (long long)wpos] = kv8[7];
                 wpos = wpos + 1;
             }
-            unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, incl, 31);
-            count = count + (int)_shfl_0;
+            unsigned int _shfl_sync_3 = __shfl_sync(0xFFFFFFFF, incl, 31);
+            count = count + (int)_shfl_sync_3;
         }
         if (lane_0 == 0) {
             pass_counts[rowi] = count;

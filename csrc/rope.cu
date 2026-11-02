@@ -61,7 +61,8 @@ void apply_rope(TensorView q, TensorView k, TensorView q_rope, TensorView k_rope
           static_cast<c_idtype*>(indptr.data_ptr()), static_cast<c_idtype*>(offsets.data_ptr()),
           batch_size, num_qo_heads, num_kv_heads, rotary_dim, head_dim, q_stride_n, q_stride_h,
           k_stride_n, k_stride_h, q_rope_stride_n, q_rope_stride_h, k_rope_stride_n,
-          k_rope_stride_h, interleave, rope_scale, rope_theta, stream);
+          k_rope_stride_h, interleave, rope_scale, rope_theta, stream,
+          static_cast<uint32_t>(q.size(0)));
       TVM_FFI_ICHECK(status == cudaSuccess)
           << "BatchQKApplyRotary failed with error code " << cudaGetErrorString(status);
       return true;
@@ -207,7 +208,7 @@ void apply_llama31_rope(TensorView q, TensorView k, TensorView q_rope, TensorVie
           batch_size, num_qo_heads, num_kv_heads, rotary_dim, head_dim, q_stride_n, q_stride_h,
           k_stride_n, k_stride_h, q_rope_stride_n, q_rope_stride_h, k_rope_stride_n,
           k_rope_stride_h, interleave, rope_scale, rope_theta, low_freq_factor, high_freq_factor,
-          old_context_length, stream);
+          old_context_length, stream, static_cast<uint32_t>(q.size(0)));
 
       TVM_FFI_ICHECK(status == cudaSuccess)
           << "BatchQKApplyLlama31Rotary failed with error code " << cudaGetErrorString(status);

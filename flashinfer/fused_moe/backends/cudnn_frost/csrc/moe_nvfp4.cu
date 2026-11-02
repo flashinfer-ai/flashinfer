@@ -297,7 +297,7 @@ class CudnnFrostNvfp4MoeRunner final : public tvm::ffi::ModuleObj {
                 workspace, mode);
           });
     }
-    return Function(nullptr);
+    return std::nullopt;
   }
 
  private:

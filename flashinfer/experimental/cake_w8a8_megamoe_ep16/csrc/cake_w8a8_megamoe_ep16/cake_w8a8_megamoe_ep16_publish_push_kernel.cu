@@ -109,7 +109,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_publish_push(
+__global__ __launch_bounds__(128) void kernel_cake_w8a8_megamoe_ep16_publish_push(
     __nv_bfloat16* __restrict__ source_hidden, long long* __restrict__ source_ids,
     float* __restrict__ source_weights, __nv_bfloat16* __restrict__ local_terms,
     int* __restrict__ expert_counts, int* __restrict__ route_map, int* __restrict__ overflow,
@@ -138,14 +138,14 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_publish
   const int cta_rank = 0;
 
   // Kernel setup ops
-  uint8_t* row_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_ROW_STAGE_OFF);
-  const int row_stage_addr = smem + SMEM_ROW_STAGE_OFF;
-  uint8_t* scales_stage = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SCALES_STAGE_OFF);
-  const int scales_stage_addr = smem + SMEM_SCALES_STAGE_OFF;
-  int* ids_stage = reinterpret_cast<int*>(smem_raw + SMEM_IDS_STAGE_OFF);
-  const int ids_stage_addr = smem + SMEM_IDS_STAGE_OFF;
-  float* weights_stage = reinterpret_cast<float*>(smem_raw + SMEM_WEIGHTS_STAGE_OFF);
-  const int weights_stage_addr = smem + SMEM_WEIGHTS_STAGE_OFF;
+  uint8_t* row_stage = reinterpret_cast<uint8_t*>(smem_raw + 0);
+  const int row_stage_addr = smem + 0;
+  uint8_t* scales_stage = reinterpret_cast<uint8_t*>(smem_raw + 3072);
+  const int scales_stage_addr = smem + 3072;
+  int* ids_stage = reinterpret_cast<int*>(smem_raw + 3168);
+  const int ids_stage_addr = smem + 3168;
+  float* weights_stage = reinterpret_cast<float*>(smem_raw + 3200);
+  const int weights_stage_addr = smem + 3200;
 
   // === Task calls (dependency order) ===
   int token = bid;
@@ -208,7 +208,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_publish
       for (int element_1 = 0; element_1 < 16; element_1++) {
         normalized[element_1] = _vec_load_0[element_1] * inverse_scale;
       }
-      uint32_t _fp8_0[4];
+      unsigned int _fp8_0[4];
       {
         uint32_t _packed;
         asm volatile(
@@ -267,10 +267,7 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_publish
       }
       asm volatile(
           "st.shared.v4.b32 [%0], {%1,%2,%3,%4};" ::"r"(row_stage_addr + (unsigned int)column),
-          "r"(*reinterpret_cast<uint32_t*>(&_fp8_0[0])),
-          "r"(*reinterpret_cast<uint32_t*>(&_fp8_0[(0) + 1])),
-          "r"(*reinterpret_cast<uint32_t*>(&_fp8_0[(0) + 2])),
-          "r"(*reinterpret_cast<uint32_t*>(&_fp8_0[(0) + 3])));
+          "r"(_fp8_0[0]), "r"(_fp8_0[1]), "r"(_fp8_0[2]), "r"(_fp8_0[3]));
       if ((quant_chunk & 1) == 0) {
         scales_stage[quant_chunk / 2] = scale_i;
       }
@@ -351,22 +348,22 @@ __global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_publish
     for (int destination = 0; destination < 16; destination++) {
       if (world > destination) {
         if ((destination_mask >> destination & 1) != 0) {
-          // nvlink_push: peers.ptrs[destination] + slot_offset <- smem(row_stage_addr), 3232B
           {
-            void* __remote =
-                (void*)((char*)((push_inbox_peers).ptrs[destination]) + (uint64_t)(slot_offset));
+            void* _cpbulk_dst_1 = reinterpret_cast<void*>(
+                reinterpret_cast<uint8_t*>(push_inbox_peers.ptrs[destination]) +
+                (unsigned long long)slot_offset);
             asm volatile(
-                "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(__remote),
+                "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(_cpbulk_dst_1),
                 "r"(row_stage_addr), "r"((uint32_t)(3232))
                 : "memory");
           }
         } else {
-          // nvlink_push: peers.ptrs[destination] + slot_offset + 3168 <- smem(ids_stage_addr), 64B
           {
-            void* __remote = (void*)((char*)((push_inbox_peers).ptrs[destination]) +
-                                     (uint64_t)(slot_offset + 3168));
+            void* _cpbulk_dst_2 = reinterpret_cast<void*>(
+                reinterpret_cast<uint8_t*>(push_inbox_peers.ptrs[destination]) +
+                (unsigned long long)(slot_offset + 3168));
             asm volatile(
-                "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(__remote),
+                "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(_cpbulk_dst_2),
                 "r"(ids_stage_addr), "r"((uint32_t)(64))
                 : "memory");
           }

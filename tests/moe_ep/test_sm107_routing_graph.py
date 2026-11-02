@@ -37,7 +37,7 @@ def test_routing_graph_changes(monkeypatch, kind, early, family, capacity):
     )
     knobs = dict(
         kernel_variant=family,
-        apply_topk_at_fc1=early,
+        apply_routing_weights_before_fc2=early,
         reduce_topk_in_kernel=False,
     )
     if family == "genphase":

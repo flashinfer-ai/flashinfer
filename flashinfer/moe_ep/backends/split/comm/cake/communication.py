@@ -1,18 +1,16 @@
 """NVLink one-sided MoE communication with the generated Cake kernels.
 
 The Cake kernels are generated for Blackwell (compute capability 10.0 or
-10.3) and implement the one-sided put/get protocol of the ``moe_a2a_*`` ops in
-:mod:`flashinfer.comm.trtllm_moe_alltoall`, selected with ``backend="cake"``:
-the dispatch kernel writes each token into the receive buffers of the ranks
-that own its experts and the combine kernel reads the expert outputs back and
-reduces them locally. The symmetric workspace grows with
-``ep_size * max_tokens_per_rank``.
+10.3) and implement a one-sided put/get protocol: the dispatch kernel writes
+each token into the receive buffers of the ranks that own its experts and the
+combine kernel reads the expert outputs back and reduces them locally. The
+symmetric workspace grows with ``ep_size * max_tokens_per_rank``.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, ClassVar, Final, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from .....core.comm.communication import (
     MoEEpCommParams,
@@ -39,7 +37,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _CAKE_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
-_BACKEND: Final = "cake"
 # Alignment the Cake ops give the workspace regions.
 _ALIGNMENT = 128
 
@@ -73,9 +70,7 @@ class CakeAlltoAll(MoEEpCommunication):
         mapping, mnnvl_config = mnnvl_mapping_and_config(bootstrap, config.comm_backend)
         super().__init__(bootstrap, params)
         from ......comm.mnnvl import MnnvlMemory
-        from ......comm.trtllm_moe_alltoall import (
-            moe_a2a_get_workspace_size_per_rank,
-        )
+        from . import kernels
 
         if config.extra_payload_bytes_per_token < 0:
             raise ValueError("extra_payload_bytes_per_token must be non-negative")
@@ -93,13 +88,12 @@ class CakeAlltoAll(MoEEpCommunication):
         combine_bytes_per_token = params.hidden_size * max(
             params.token_dtype.itemsize, 2
         )
-        workspace_size_per_rank = moe_a2a_get_workspace_size_per_rank(
+        workspace_size_per_rank = kernels.workspace_size_per_rank(
             self.ep_size,
             params.max_tokens_per_rank,
             dispatch_bytes_per_token,
             combine_bytes_per_token,
             config.eplb_stats_num_experts,
-            backend=_BACKEND,
         )
 
         MnnvlMemory.initialize()
@@ -141,10 +135,7 @@ class CakeAlltoAll(MoEEpCommunication):
         import torch
 
         from ......comm.mnnvl import MnnvlMemory
-        from ......comm.trtllm_moe_alltoall import (
-            get_moe_alltoall_module,
-            moe_a2a_initialize,
-        )
+        from . import kernels
 
         key = (
             self.ep_rank,
@@ -158,23 +149,17 @@ class CakeAlltoAll(MoEEpCommunication):
         if state is None:
             mnnvl_mem = MnnvlMemory(mapping, workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
-            metainfo = moe_a2a_initialize(
+            metainfo = kernels.initialize(
                 workspace,
                 self.ep_rank,
                 self.ep_size,
                 self.params.max_tokens_per_rank,
                 self.config.eplb_stats_num_experts,
-                backend=_BACKEND,
             )
             # No peer may publish into this workspace until every rank has
             # cleared its own slice.
             MnnvlMemory.allocated_map[mnnvl_mem.ptr].comm.barrier()
-            names, values = get_moe_alltoall_module(
-                _BACKEND
-            ).moe_a2a_get_metainfo_index_pairs()
-            payload_index = dict(zip(names, values, strict=True))[
-                "MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX"
-            ]
+            payload_index = kernels.metainfo_index()["PAYLOAD_DATA_OFFSET_INDEX"]
             payload_offset = int(metainfo[payload_index])
             # The ops place the combine payload right after the current round's
             # dispatch payloads, so it moves with the token count and payload
@@ -233,35 +218,26 @@ class CakeAlltoAll(MoEEpCommunication):
         topk_weights: "torch.Tensor | None" = None,
         *,
         hidden_states_scale: "torch.Tensor | None" = None,
-        max_tokens_per_rank: Optional[int] = None,
+        runtime_max_tokens_per_rank: Optional[int] = None,
         eplb_local_stats: "torch.Tensor | None" = None,
         active_rank_mask: "torch.Tensor | None" = None,
     ) -> MoEEpDispatchResult:
         """See :meth:`MoEEpCommunication.dispatch`.
 
         ``active_rank_mask`` is a CPU ``uint64`` mask from
-        :func:`flashinfer.comm.moe_a2a_active_rank_mask`; tokens routed to a
-        masked-off rank are dropped. Requires ``enable_rank_mask=True``.
+        :func:`flashinfer.moe_ep.backends.split.comm.cake.kernels.active_rank_mask`;
+        tokens routed to a masked-off rank are dropped. Requires
+        ``enable_rank_mask=True``.
         """
         import torch
 
-        from ......comm.trtllm_moe_alltoall import (
-            moe_a2a_dispatch,
-            moe_a2a_sanitize_expert_ids,
-        )
+        from . import kernels
 
         state = self._live_state()
         check_round_owner(self, state)
-        tokens_per_rank = (
-            self.params.max_tokens_per_rank
-            if max_tokens_per_rank is None
-            else max_tokens_per_rank
+        tokens_per_rank = self._resolve_runtime_max_tokens_per_rank(
+            runtime_max_tokens_per_rank
         )
-        if not 0 < tokens_per_rank <= self.params.max_tokens_per_rank:
-            raise ValueError(
-                f"max_tokens_per_rank={tokens_per_rank} must be in "
-                f"(0, {self.params.max_tokens_per_rank}]"
-            )
         if eplb_local_stats is not None and eplb_local_stats.shape != (
             self.config.eplb_stats_num_experts,
         ):
@@ -291,7 +267,7 @@ class CakeAlltoAll(MoEEpCommunication):
                 "(MoEEpCommParams.dispatch_format, extra_payload_bytes_per_token)"
             )
 
-        recv, combine_offset, eplb_gathered_stats = moe_a2a_dispatch(
+        recv, combine_offset, eplb_gathered_stats = kernels.dispatch(
             topk_ids,
             payloads,
             self.workspace,
@@ -305,17 +281,15 @@ class CakeAlltoAll(MoEEpCommunication):
             enable_rank_mask=self.config.enable_rank_mask,
             active_rank_mask=active_rank_mask,
             enable_pdl=self.config.enable_pdl,
-            backend=_BACKEND,
             recv_view_cache=state["views"],
         )
-        moe_a2a_sanitize_expert_ids(
+        kernels.sanitize_expert_ids(
             recv[expert_id_index],
             self.workspace,
             self.metainfo,
             self.ep_rank,
             self.params.invalid_expert_id,
             enable_pdl=self.config.enable_pdl,
-            backend=_BACKEND,
         )
         self._round = {
             "local_num_tokens": topk_ids.shape[0],
@@ -339,9 +313,7 @@ class CakeAlltoAll(MoEEpCommunication):
     def get_combine_input_buffer(self, dtype: "torch.dtype") -> "torch.Tensor":
         """``[ep_size * tokens_per_rank, hidden_size]`` view of the combine
         payload region of this rank's workspace."""
-        from ......comm.trtllm_moe_alltoall import (
-            moe_a2a_wrap_payload_tensor_in_workspace,
-        )
+        from .kernels import wrap_workspace
 
         self._live_state()
         round_state = self._round
@@ -355,7 +327,7 @@ class CakeAlltoAll(MoEEpCommunication):
                 f"a {dtype} combine input of {end - start} bytes exceeds the "
                 "combine region"
             )
-        buffer = moe_a2a_wrap_payload_tensor_in_workspace(
+        buffer = wrap_workspace(
             self.workspace[self.ep_rank, :], [rows], start, end, dtype
         )
         round_state["combine_buffer"] = buffer
@@ -372,7 +344,7 @@ class CakeAlltoAll(MoEEpCommunication):
 
         ``active_rank_mask`` must match the mask passed to :meth:`dispatch`.
         """
-        from ......comm.trtllm_moe_alltoall import moe_a2a_combine
+        from . import kernels
 
         self._live_state()
         round_state = self._round
@@ -392,7 +364,7 @@ class CakeAlltoAll(MoEEpCommunication):
         in_workspace = (
             buffer is not None and expert_output.data_ptr() == buffer.data_ptr()
         )
-        combined = moe_a2a_combine(
+        combined = kernels.combine(
             payload,
             round_state["local_num_tokens"],
             self.workspace,
@@ -408,20 +380,31 @@ class CakeAlltoAll(MoEEpCommunication):
             active_rank_mask=active_rank_mask,
             enable_pdl=self.config.enable_pdl,
             output=output,
-            backend=_BACKEND,
         )
         self._round = None
         self._state["round_owner"] = None
         return combined
 
     def checkpoint_prepare(self) -> None:
-        """Release the workspace's physical memory, e.g. so that the process
-        can be checkpointed.
+        """Release the workspace's physical memory before a process checkpoint.
 
-        The virtual addresses stay reserved: CUDA graphs captured on the
-        workspace replay correctly after :meth:`checkpoint_restore`. Collective
-        over the EP group and only valid between rounds. Instances sharing the
-        workspace may call it again, which does nothing.
+        A CUDA process checkpoint cannot save the workspace's MNNVL physical
+        memory, which peer processes import. This method releases it but keeps
+        the workspace's virtual addresses reserved, so CUDA graphs captured on
+        the workspace replay correctly once :meth:`checkpoint_restore` has
+        backed it with new memory:
+
+        .. code-block:: python
+
+            communication.checkpoint_prepare()
+            # checkpoint and restore the process
+            communication.checkpoint_restore(comm_backend)
+
+        Collective over the EP group: every rank calls it in the same order,
+        after all work on the workspace has completed and only between
+        rounds. Instances sharing the workspace may call it again, which does
+        nothing. If it raises once unmapping has begun, the workspace cannot be
+        reused: restart the rank rather than retry.
         """
         state = self._live_state()
         if state["round_owner"] is not None:
@@ -432,23 +415,25 @@ class CakeAlltoAll(MoEEpCommunication):
         """Back the workspace with new memory after :meth:`checkpoint_prepare`
         and re-initialize it.
 
-        Collective over ``comm_backend``, which must span the EP group with
-        the original ranks. Does nothing when the workspace is mapped.
+        Collective over ``comm_backend``, a fresh backend that must span the
+        EP group with the original ranks and world size. Every rank calls it
+        in the same order. Does nothing when the workspace is mapped. If it
+        raises once remapping has begun, the workspace cannot be reused:
+        restart the rank rather than retry.
         """
         import torch
 
-        from ......comm.trtllm_moe_alltoall import moe_a2a_initialize
+        from . import kernels
 
         state = self._live_state()
         if not remap_mnnvl_memory(state["mnnvl_mem"], comm_backend):
             return
-        metainfo = moe_a2a_initialize(
+        metainfo = kernels.initialize(
             self.workspace,
             self.ep_rank,
             self.ep_size,
             self.params.max_tokens_per_rank,
             self.config.eplb_stats_num_experts,
-            backend=_BACKEND,
         )
         if not torch.equal(metainfo, self.metainfo):
             raise RuntimeError(

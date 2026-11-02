@@ -451,6 +451,9 @@ def test_batch_decode_tensor_cores_with_fast_plan(
         q, kv_data, return_lse=True
     )
 
+    # Finish the async schedule copy before reusing its pinned host staging
+    # buffer. This test checks batch invariance, not overlapping CPU replans.
+    torch.cuda.current_stream().synchronize()
     kv_indptr_invariant = kv_indptr[: invariant_bs + 1]
     kv_last_page_len_invariant = kv_last_page_len[:invariant_bs]
     global_override_indptr_cpu = global_override_indptr_cpu[: invariant_bs + 1]

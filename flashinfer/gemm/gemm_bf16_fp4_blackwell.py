@@ -57,17 +57,23 @@ SMK_CELL_PAIRS = {"cute_smk_s2_p2_n2_m16_z8_bf16": (2, 2)}
 SMK_COMPONENT_BY_CELL = {cell: component for component, cell in SMK_CELLS.items()}
 
 
-# Planes completion-counter parameter per tiled smk split cell (mirror of the producer's ``SMK_ROUTE_FLAGS`` acq flag ->
-# ``smk_counter_param``): ``completion_u32`` for the ``_a1`` cells (wave 4 round 7), ``completion`` otherwise.
-# ``None`` = the cluster DSMEM-mailbox ``_x1_d1`` form (wave 4 round 8): no planes workspace and no counter,
-# the launch binds only the GEMM operands and the record's cluster dims (1, 1, 4) fix the cluster attribute (like ``_z4c``).
-# The init-registered mailbox-tx form ``_x1_d1_e2`` routed since H11 (round 11, R10-6) keeps this binding unchanged: same
-# operands, cluster dims, grid and dynamic SMEM (the tx registration is a device-side barrier attribute, not a host constant).
-SMK_CELL_COUNTER = {
-    "cute_smk_s1_m16_z4_bf16": None,
-    "cute_smk_s2_p2_n2_m16_z8_bf16": "completion_u32",
-    "cute_smk_s2_m32_z6_bf16": "completion_u32",
-}
+# Planes completion-counter bindings of the tiled smk split programs and their counter dtypes: ``completion_u32``
+# for the ``_a1`` programs, ``completion`` otherwise.  Each routed program's ``MODULES`` record decides (its
+# ``arg_plan``), so the PDL and non-PDL programs of one cell may reduce differently.  A program whose plan binds no
+# ``partials`` is a cluster form -- the DSMEM-mailbox ``_x1_d1`` S=4 programs, the reduce-scatter ``_r1`` (16, 2, 8)
+# PDL programs: no planes workspace and no counter, the launch binds only the GEMM operands and the record's cluster
+# dims fix the cluster attribute (like ``_z4c``).
+SMK_PLANES_COUNTERS = {"completion": torch.int32, "completion_u32": torch.uint32}
+
+
+def _smk_planes_counter(record: dict[str, Any]) -> Optional[str]:
+    """The completion-counter binding of a planes program's record, ``None`` when it binds no planes workspace."""
+
+    names = {name for kind, name in record["arg_plan"] if kind == "buffer"}
+    if "partials" not in names:
+        return None
+    (counter,) = names & SMK_PLANES_COUNTERS.keys()
+    return counter
 
 
 def _smk_cell_pairs(component: str) -> Tuple[int, int]:
@@ -545,7 +551,7 @@ def _route_plan(
     selection; ``_plan`` only binds the tensors (and the stream-private workspace) per call.
     """
 
-    from ..jit.blackwell_bf16_fp4 import ROUTES, cluster_dims
+    from ..jit.blackwell_bf16_fp4 import MODULES, ROUTES, cluster_dims
 
     specs = []
     for component, stage_alpha, pdl, flat_grid, grid in _select_route(
@@ -578,16 +584,14 @@ def _route_plan(
         elif (
             component in SMK_CELLS
             and SMK_CELLS[component][2] > 1
-            and SMK_CELL_COUNTER.get(component) is not None
+            and (counter_name := _smk_planes_counter(MODULES[module])) is not None
         ):
-            # ``_a1`` planes cells (every routed split cell since wave 4 round 7) take the u32 counter under
-            # ``completion_u32`` (producer rule ``smk_split_bindings`` / ``smk_counter_param``); plain cells keep ``completion``.
-            counter_name = SMK_CELL_COUNTER[component]
+            # The planes program binds the FP32 planes and the counter its record names.
             workspace = (
                 SMK_CELLS[component][2],
                 n,
                 counter_name,
-                torch.uint32 if counter_name == "completion_u32" else torch.int32,
+                SMK_PLANES_COUNTERS[counter_name],
             )
         elif (
             component in SMK_CUDNN_COMPONENTS

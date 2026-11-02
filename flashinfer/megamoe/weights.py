@@ -5,6 +5,21 @@ and ``[experts, N, K/group_size]``. Packed bytes follow Marlin order: byte b in
 each four-byte word stores K[b] high and K[b+4] low.
 NVFP4 scales are raw unsigned E4M3 bytes per 16 elements; MXFP4 scales are
 unsigned E8M0 bytes per 32 elements. L1 inputs have gate rows followed by up.
+
+Callers convert checkpoint tensors to this format before calling the
+transforms; FlashInfer does not read checkpoint layouts:
+
+* Packing: common checkpoints (ModelOpt NVFP4, DeepSeek-V4 MXFP4) store K[2i]
+  in the low nibble of byte i, which must be reordered to Marlin order.
+* Scale range: the kernels decode FP4 times its scale into one E4M3 byte, so
+  every product must stay inside E4M3. NVFP4 needs ``6 * scale <= 448``;
+  MXFP4 needs ``2**-5 <= scale <= 2**6`` for groups with nonzero codes, because
+  its decoder saturates large products and flushes subnormal ones to zero.
+  Out-of-range scales are not detected and silently corrupt the output.
+* Global scales: move each expert's excess into a per-expert FP32 multiplier
+  (for example a power of two, which keeps the weights exact) and pass it as
+  ``l1_global_scales`` / ``l2_global_scales`` at run time. L1 has one global
+  per expert, so gate and up must share it.
 """
 
 from typing import Tuple
@@ -96,10 +111,12 @@ def transform_nvfp4_weights_for_mega_moe(
     ----------
     l1_weights : tuple[torch.Tensor, torch.Tensor]
         Packed UINT8 weights of shape ``[E, 2 * intermediate, hidden // 2]``
-        and raw UINT8 E4M3 scale bytes per 16 values. Gate rows precede up rows.
+        in Marlin byte order and raw UINT8 E4M3 scale bytes per 16 values with
+        ``6 * scale <= 448`` (see the module docs). Gate rows precede up rows.
     l2_weights : tuple[torch.Tensor, torch.Tensor]
         Packed UINT8 weights of shape ``[E, hidden, intermediate // 2]``
-        and raw UINT8 E4M3 scale bytes per 16 values.
+        in Marlin byte order and raw UINT8 E4M3 scale bytes per 16 values with
+        ``6 * scale <= 448``.
 
     Returns
     -------
@@ -120,10 +137,13 @@ def transform_mxfp4_weights_for_mega_moe(
     ----------
     l1_weights : tuple[torch.Tensor, torch.Tensor]
         Packed UINT8 weights of shape ``[E, 2 * intermediate, hidden // 2]``
-        and raw UINT8 E8M0 scale bytes per 32 values. Gate rows precede up rows.
+        in Marlin byte order and raw UINT8 E8M0 scale bytes per 32 values in
+        ``[2**-5, 2**6]`` for groups with nonzero codes (see the module docs).
+        Gate rows precede up rows.
     l2_weights : tuple[torch.Tensor, torch.Tensor]
         Packed UINT8 weights of shape ``[E, hidden, intermediate // 2]``
-        and raw UINT8 E8M0 scale bytes per 32 values.
+        in Marlin byte order and raw UINT8 E8M0 scale bytes per 32 values in
+        ``[2**-5, 2**6]`` for groups with nonzero codes.
 
     Returns
     -------

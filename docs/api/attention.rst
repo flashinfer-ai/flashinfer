@@ -195,6 +195,10 @@ single kernel launch.
 
     .. automethod:: __init__
 
+.. autoclass:: BatchDecodeWithAttentionSinkWrapper
+
+    .. automethod:: __init__
+
 
 SM120 NVFP4 Attention
 ---------------------
@@ -216,6 +220,12 @@ MLA (Multi-head Latent Attention) is an attention mechanism proposed in DeepSeek
 and `DeepSeek-R1 <https://arxiv.org/abs/2501.12948>`_).
 
 .. currentmodule:: flashinfer.mla
+
+Sliding-window MLA (SM90)
+-------------------------
+
+.. autofunction:: batch_decode_with_kv_cache_mla_swa
+.. autofunction:: get_mla_swa_workspace_size_bytes
 
 PageAttention for MLA
 ---------------------

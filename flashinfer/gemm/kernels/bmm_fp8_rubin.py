@@ -274,12 +274,13 @@ class SM107PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
         epilogue_op: cutlass.Constexpr,
-        output_scale_tensor: cute.Tensor,
+        a_scale_tensor: cute.Tensor,
+        b_scale_tensor: cute.Tensor,
         tiled_mma_bkeep: Optional[cute.TiledMma] = None,
         tiled_mma_breuse: Optional[cute.TiledMma] = None,
     ):
         """GPU device kernel performing the Persistent batched GEMM computation."""
-        output_scale = output_scale_tensor[0]
+        output_scale = a_scale_tensor[0] * b_scale_tensor[0]
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -719,13 +720,15 @@ class SM107PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
         c: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
-        output_scale_tensor: cute.Tensor,
+        a_scale_tensor: cute.Tensor,
+        b_scale_tensor: cute.Tensor,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
         """Override parent __call__ to pass Bkeep-Breuse tiled_mma objects to kernel.
 
-        :param output_scale_tensor: 1-element Float32 tensor containing the scale to multiply
-                                    the output by (fused into epilogue). If None, no scaling.
+        :param a_scale_tensor: 1-element Float32 tensor; multiplied with b_scale_tensor
+                               in the epilogue (no host-side product).
+        :param b_scale_tensor: 1-element Float32 tensor, see a_scale_tensor.
         """
         # Setup static attributes before smem/grid/tma computation
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
@@ -822,7 +825,8 @@ class SM107PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
             self.epi_tile,
             self.tile_sched_params,
             epilogue_op,
-            output_scale_tensor,
+            a_scale_tensor,
+            b_scale_tensor,
             tiled_mma_bkeep,  # Pass Bkeep tiled_mma
             tiled_mma_breuse,  # Pass Breuse tiled_mma
         ).launch(

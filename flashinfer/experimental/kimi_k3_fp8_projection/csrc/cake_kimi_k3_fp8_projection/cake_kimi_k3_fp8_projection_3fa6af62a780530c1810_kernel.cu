@@ -51,10 +51,22 @@
 #define SMEM_TOTAL 220160
 #define THREADS 192
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags select the lever arms below (-DCAKE_LEVER_PF=<n>; the guarded defaults are this
+// file's own values) and rename the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every
+// JIT library of the family exports a distinct kernel); the defaults name this file's own
+// program.
+#ifndef CAKE_LEVER_PF
+#define CAKE_LEVER_PF 1
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_kimi_k3_fp8_projection_3fa6af62a780530c1810
+#endif
+
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_fp8_projection_3fa6af62a780530c1810(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB, const __grid_constant__ CUtensorMap OUT)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB, const __grid_constant__ CUtensorMap OUT)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -188,8 +200,34 @@ kernel_cake_kimi_k3_fp8_projection_3fa6af62a780530c1810(const __grid_constant__ 
                                 asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFW))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfw_unit0 + k_begin * 4)) : "memory");
                                 asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFW))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfw_unit0 + k_begin * 4 + 2)) : "memory");
                             }
+#if CAKE_LEVER_PF == 3
+                            if (k_begin + 1 < k_begin + k_count) {
+                                if (cta_rank == 0) {
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W))), "r"((int)(0)), "r"((int)(0)), "r"((int)(w_tile0 + (k_begin + 1) * 2)) : "memory");
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W))), "r"((int)(0)), "r"((int)(0)), "r"((int)(w_tile0 + (k_begin + 1) * 2 + 1)) : "memory");
+                                }
+                                if (cta_rank == 1) {
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W))), "r"((int)(0)), "r"((int)(64)), "r"((int)(w_tile0 + (k_begin + 1) * 2)) : "memory");
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W))), "r"((int)(0)), "r"((int)(64)), "r"((int)(w_tile0 + (k_begin + 1) * 2 + 1)) : "memory");
+                                }
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFW))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfw_unit0 + (k_begin + 1) * 4)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFW))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfw_unit0 + (k_begin + 1) * 4 + 2)) : "memory");
+                            }
+                            if (k_begin + 2 < k_begin + k_count) {
+                                if (cta_rank == 0) {
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W))), "r"((int)(0)), "r"((int)(0)), "r"((int)(w_tile0 + (k_begin + 2) * 2)) : "memory");
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W))), "r"((int)(0)), "r"((int)(0)), "r"((int)(w_tile0 + (k_begin + 2) * 2 + 1)) : "memory");
+                                }
+                                if (cta_rank == 1) {
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W))), "r"((int)(0)), "r"((int)(64)), "r"((int)(w_tile0 + (k_begin + 2) * 2)) : "memory");
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W))), "r"((int)(0)), "r"((int)(64)), "r"((int)(w_tile0 + (k_begin + 2) * 2 + 1)) : "memory");
+                                }
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFW))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfw_unit0 + (k_begin + 2) * 4)) : "memory");
+                                asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&SFW))), "r"((int)(0)), "r"((int)(0)), "r"((int)(sfw_unit0 + (k_begin + 2) * 4 + 2)) : "memory");
+                            }
+#endif
                         }
-                        int k_pf = iter_k + 1;
+                        int k_pf = iter_k + CAKE_LEVER_PF;
                         if (k_pf < k_begin + k_count) {
                             if (cta_rank == 0) {
                                 asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&W))), "r"((int)(0)), "r"((int)(0)), "r"((int)(w_tile0 + k_pf * 2)) : "memory");

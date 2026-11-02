@@ -410,15 +410,27 @@ def test_dense_h12_beta_matches_the_strided_carrier_on_the_unbounded_gate(
     _assert_same(_snapshot(d), want)
 
 
-def _run_affine_epilogue(d, fused, monkeypatch, *, checkpoints, lower_bound):
+def _run_affine_epilogue(
+    d, fused, monkeypatch, *, checkpoints, lower_bound, merge=True
+):
     import flashinfer.cake_kda_tf32_runtime as runtime
 
+    routed = runtime._correction_merge_routed(d["q"].device)
     monkeypatch.setattr(
         runtime, "_fused_affine_epilogue_enabled", lambda: fused, raising=True
     )
+    if not merge:
+        monkeypatch.setattr(
+            runtime, "_correction_merge_routed", lambda device: False, raising=True
+        )
     call = _run(d, checkpoints=checkpoints, lower_bound=lower_bound)
-    assert "affine" in str(call.schedule)
-    assert ("_fused_epilogue" in str(call.schedule)) == fused
+    schedule = str(call.schedule)
+    assert "affine" in schedule
+    # A bounded chain whose correction windows merge themselves into the
+    # composite launches no epilogue kernel after them.
+    merged = fused and merge and routed and lower_bound is not None
+    assert ("_correction_merge" in schedule) == merged
+    assert ("_fused_epilogue" in schedule) == (fused and not merged)
     return _snapshot(d)
 
 
@@ -438,7 +450,8 @@ def test_affine_fused_epilogue_matches_torch_epilogue_bitwise(
 ):
     # The fused epilogue kernel (checkpoint-row merge + scatter, output tail
     # add, final-state select/add and pool scatter) replaces ~10 torch launches
-    # and must reproduce them bit for bit on every row it writes.
+    # and must reproduce them bit for bit on every row it writes; so must the
+    # bounded chain's correction windows that merge themselves (no epilogue).
     d = _inputs(lengths, 12, seed=11)
     pool = d["pool"].clone()
     want = _run_affine_epilogue(
@@ -451,6 +464,21 @@ def test_affine_fused_epilogue_matches_torch_epilogue_bitwise(
         d, True, monkeypatch, checkpoints=checkpoints, lower_bound=lower_bound
     )
     _assert_same(got, want)
+    if lower_bound is not None:
+        # The bounded chain with the epilogue kernel after its correction
+        # windows (no merging build): the same bits again.
+        d["pool"].copy_(pool)
+        d["out"].zero_()
+        d["state_checkpoints"].zero_()
+        got = _run_affine_epilogue(
+            d,
+            True,
+            monkeypatch,
+            checkpoints=checkpoints,
+            lower_bound=lower_bound,
+            merge=False,
+        )
+        _assert_same(got, want)
 
 
 @pytest.mark.parametrize(
@@ -884,3 +912,155 @@ def test_plan_cache_accounting_never_queries_the_allocator(monkeypatch):
         # counted; the allocator delta also includes rounding and the run's
         # transient scratch, so it bounds the accounting from above
         assert 0 < cache._bytes[next(reversed(cache._entries))] <= retained
+
+
+# Routes whose launch() replays a stored launch sequence: the split-sequence
+# composite (bounded gate: window-map chain with the fused epilogue; unbounded
+# gate with FP32 rows: the apply route) and a single fused kernel.
+_STORED_LAUNCH_ROUTES = {
+    "affine_chain": dict(lengths=[8192], heads=12, lower_bound=-5.0, fp32_rows=False),
+    "affine_apply": dict(lengths=[8392], heads=16, lower_bound=None, fp32_rows=True),
+    "single_kernel": dict(
+        lengths=[1024] * 4, heads=16, lower_bound=None, fp32_rows=False
+    ),
+}
+
+
+def _route_inputs(route, seed):
+    spec = _STORED_LAUNCH_ROUTES[route]
+    d = _inputs(spec["lengths"], spec["heads"], seed=seed)
+    if spec["fp32_rows"]:
+        d["state_checkpoints"] = torch.zeros_like(
+            d["state_checkpoints"], dtype=torch.float32
+        )
+    return d, spec["lower_bound"]
+
+
+def _assert_route(call, route):
+    schedule = str(call.schedule)
+    if route == "single_kernel":
+        assert "affine" not in schedule, schedule
+    else:
+        assert "affine" in schedule, schedule
+        assert ("apply" in schedule) == (route == "affine_apply"), schedule
+
+
+@pytest.mark.parametrize("route", sorted(_STORED_LAUNCH_ROUTES))
+def test_hit_on_new_tensors_after_a_stored_launch_reads_only_the_new_tensors(route):
+    """The stored launch sequence of a binding must never outlive a rebind.
+
+    Two launches on the first tensors store and replay the launch sequence; a
+    hit on a complete new tensor set (every input, output, pool and row buffer
+    moved, all contents different) must read and write only the new tensors,
+    leave the first set untouched, and reproduce an uncached run bitwise.
+    """
+    cache = KDAPrefillPlanCache(8)
+    first, lower_bound = _route_inputs(route, seed=31)
+    second, _ = _route_inputs(route, seed=32)
+    call = _run(first, cache, lower_bound=lower_bound)
+    _assert_route(call, route)
+    _run(first, cache, lower_bound=lower_bound)  # replays the stored sequence
+    torch.cuda.synchronize()
+    first_after = _snapshot(first)
+    first_pool = first["pool"].clone()
+    pool_second = second["pool"].clone()
+    assert _run(second, cache, lower_bound=lower_bound) is call  # rebind
+    _run(second, cache, lower_bound=lower_bound)  # stored sequence of the new binding
+    assert (cache.misses, cache.hits) == (1, 3)
+    torch.cuda.synchronize()
+    _assert_same(first_after, _snapshot(first))
+    assert torch.equal(first_pool.view(torch.uint8), first["pool"].view(torch.uint8))
+    got = _snapshot(second)
+    second["pool"].copy_(pool_second)
+    second["state_checkpoints"].zero_()
+    for _ in range(2):
+        _run(second, lower_bound=lower_bound)
+    _assert_same(got, _snapshot(second))
+
+
+@pytest.mark.parametrize("route", sorted(_STORED_LAUNCH_ROUTES))
+def test_stored_launch_runs_on_the_callers_current_stream(route):
+    """A launch sequence stored on one stream is issued on the caller's current stream.
+
+    The second launch runs on a side stream behind a long sleep and an input
+    update queued on that stream; issued anywhere else it would read the old
+    input before the update lands.
+    """
+    cache = KDAPrefillPlanCache(8)
+    d, lower_bound = _route_inputs(route, seed=33)
+    pool = d["pool"].clone()
+    old_q = d["q"].clone()
+    new_q = torch.randn_like(old_q) * 0.25
+    call = _run(d, cache, lower_bound=lower_bound)  # stores the sequence
+    _assert_route(call, route)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(50_000_000)
+        d["q"].copy_(new_q)
+        assert _prepare(d, cache, lower_bound=lower_bound) is call
+        call.launch()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    assert cache.fast_hits >= 1
+    got = _snapshot(d)
+    d["pool"].copy_(pool)
+    d["state_checkpoints"].zero_()
+    d["q"].copy_(old_q)
+    _run(d, lower_bound=lower_bound)
+    d["q"].copy_(new_q)
+    _run(d, lower_bound=lower_bound)
+    _assert_same(got, _snapshot(d))
+
+
+@pytest.mark.parametrize("captured", ["cache_hit", "prepared_launch"])
+@pytest.mark.parametrize("route", sorted(_STORED_LAUNCH_ROUTES))
+def test_stored_launch_graph_replays_new_tensor_contents(route, captured):
+    """CUDA-graph capture of a launch whose sequence is already stored.
+
+    ``cache_hit`` captures a plan-cache hit (descriptors re-encoded inside the
+    graph); ``prepared_launch`` captures launch() of the already obtained
+    prepared object.  Replays after new input contents and a new pool state
+    reproduce an uncached run bitwise, twice.
+    """
+    cache = KDAPrefillPlanCache(8)
+    d, lower_bound = _route_inputs(route, seed=34)
+    pool = d["pool"].clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        call = _run(d, cache, lower_bound=lower_bound)
+        d["pool"].copy_(pool)
+        _run(d, cache, lower_bound=lower_bound)  # replays the stored sequence
+    torch.cuda.current_stream().wait_stream(side)
+    _assert_route(call, route)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        if captured == "cache_hit":
+            _prepare(d, cache, lower_bound=lower_bound).launch()
+        else:
+            call.launch()
+    for scale in (2.0, 0.5):
+        for name in ("q", "k", "v", "g"):
+            d[name].copy_(torch.randn_like(d[name]) * 0.25)
+        d["beta"].copy_(torch.randn_like(d["beta"]))
+        d["pool"].copy_(pool * scale)
+        d["state_checkpoints"].zero_()
+        replay_pool = d["pool"].clone()
+        graph.replay()
+        torch.cuda.synchronize()
+        got = _snapshot(d)
+        d["pool"].copy_(replay_pool)
+        d["state_checkpoints"].zero_()
+        _run(d, lower_bound=lower_bound)
+        _assert_same(got, _snapshot(d))
+    # The eager path still replays its stored sequence after the capture.
+    d["pool"].copy_(pool)
+    d["state_checkpoints"].zero_()
+    call.launch()
+    torch.cuda.synchronize()
+    got = _snapshot(d)
+    d["pool"].copy_(pool)
+    d["state_checkpoints"].zero_()
+    _run(d, lower_bound=lower_bound)
+    _assert_same(got, _snapshot(d))

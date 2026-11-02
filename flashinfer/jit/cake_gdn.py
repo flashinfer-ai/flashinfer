@@ -44,6 +44,8 @@ CakeGDNArch = Literal["sm_100a", "sm_103a", "sm_107a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
 _DEFINE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RECORD_NAME = re.compile(r"^(decode|prefill)_(.+)_[0-9a-f]{12}$")
+_RECORD_TMA_ABI = {"decode": "pointer", "prefill": "grid_constant"}
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
@@ -131,7 +133,47 @@ def _manifest() -> dict[str, Any]:
         raise RuntimeError(
             f"unexpected Cake GDN manifest schema at {path}: {manifest.get('schema')!r}"
         )
+    for record in manifest["variants"]:
+        _derive_record_fields(record)
     return manifest
+
+
+def _derive_record_fields(record: dict[str, Any]) -> None:
+    """Fill the record fields the export derives from its name and outputs.
+
+    ``<domain>_<schedule>_<12 hex>`` names every record: ``domain`` is its
+    first token, ``source_schedule`` is
+    ``flashinfer.cake_gdn.generated.<domain>:<schedule>``, ``tma_abi`` is
+    fixed per domain, ``host_binding.entry`` is ``run_<name>`` and the
+    record-level ``architectures`` is the sorted union of its outputs'.  A
+    field the manifest spells out must agree with the derived value.
+    """
+
+    name = record["name"]
+    match = _RECORD_NAME.match(name)
+    if match is None:
+        raise RuntimeError(f"unparseable Cake GDN record name {name!r}")
+    domain, schedule = match.groups()
+    derived: dict[str, Any] = {
+        "domain": domain,
+        "source_schedule": f"flashinfer.cake_gdn.generated.{domain}:{schedule}",
+        "tma_abi": _RECORD_TMA_ABI[domain],
+        "architectures": sorted(
+            {arch for output in record["outputs"] for arch in output["architectures"]}
+        ),
+    }
+    targets = [
+        (record, "", derived),
+        (record["host_binding"], "host_binding.", {"entry": f"run_{name}"}),
+    ]
+    for target, prefix, fields in targets:
+        for field, value in fields.items():
+            if field in target and target[field] != value:
+                raise RuntimeError(
+                    f"Cake GDN record {name!r} spells {prefix}{field}="
+                    f"{target[field]!r}; its name and outputs derive {value!r}"
+                )
+            target[field] = value
 
 
 def _kernel_record(name: str) -> dict[str, Any]:
@@ -283,12 +325,18 @@ def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
 
 
 _HOST_SHIM_PLACEHOLDER = re.compile(r"@([A-Z][A-Z0-9_]*)@")
+_HOST_SHIM_CONDITIONAL = re.compile(
+    r"^//@if (\w+)\n(.*?)^//@else\n(.*?)^//@endif\n", re.S | re.M
+)
 
 
 def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
     """Render the TVM-FFI host shim of one variant from its class template.
 
     ``host_binding.template`` names the template under ``host/templates/``.
+    A ``//@if metadata_i64`` / ``//@else`` / ``//@endif`` block of lines keeps
+    its first arm for a record whose ``metadata_i64`` is true and its second
+    arm otherwise; the directive lines are dropped before the placeholders.
     ``@ENTRY@``, ``@MODULE_IDENT@``, ``@CUDA_SYMBOL@`` and ``@SHIM_NAMESPACE@``
     come from ``host_binding``; every other ``@NAME@`` placeholder takes the
     value of ``host_binding.params[NAME]``.  The result is byte-identical to
@@ -297,6 +345,13 @@ def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
 
     host = record["host_binding"]
     template = (_source_dir() / host["template"]).read_text(encoding="utf-8")
+    flags = {"metadata_i64": bool(record.get("metadata_i64", False))}
+    template = _HOST_SHIM_CONDITIONAL.sub(
+        lambda match: match.group(2) if flags[match.group(1)] else match.group(3),
+        template,
+    )
+    if "//@" in template:
+        raise RuntimeError(f"{host['template']} has an unresolved host-shim directive")
     values = {
         "ENTRY": host["entry"],
         "MODULE_IDENT": host["module_ident"],
@@ -1062,11 +1117,60 @@ def select_cake_gdn_prefill_variant(
     ):
         # The gate-stream twin is a performance specialization of the base body: the exporter
         # ships it for the head geometries its representative rows reach (the Hq16/Hv32,
-        # Hq8/Hv16 and Hq4/Hv8 families).  A key whose twin is not in the manifest runs its
-        # base record, exactly as the route did before the twin existed; only a missing base
-        # fails closed below.
+        # Hq8/Hv16 and Hq4/Hv8 families; on sm_107a the FP32-state twin also covers the
+        # Qwen3-Next / Qwen3.5 TP2/TP4/TP8 splits Hq2/Hv4, Hq8/Hv32, Hq4/Hv16 and Hq2/Hv8).
+        # A key whose twin is not in the manifest runs its base record, exactly as the route
+        # did before the twin existed; only a missing base fails closed below.
         gate_stream_full = False
         schedule_attr = _seq_schedule_attr(gate_stream_full=False)
+    if (
+        arch == "sm_107a"
+        and dvsplit
+        and not single_chunk
+        and not enable_checkpoints
+        and not use_state_indices
+        and not low_precision_state
+        and not _has_variant(
+            arch=arch,
+            domain="prefill",
+            schedule_attr=schedule_attr,
+            specializations=specializations,
+        )
+    ):
+        # sm_107a only.  DV-split is a physical-schedule choice (the tiles fit
+        # the active clusters), not part of the contract.  sm_107a's 212
+        # clusters put keys with 2 * num_seqs * max(Hq, Hv) in (148, 212] on
+        # DV-split where sm_100a runs full-DV (sm_103a only above 160; it
+        # fails closed on (148, 160]), and the non-gatepipe4
+        # DV-split schedules ship no (-1, 0, -1) geometry (Hv / Hq and Hv both
+        # not powers of two): e.g. FP16 I/O, FP32 initial + final state,
+        # ungated Hq2/Hv6 x 16 sequences.  On sm_107a a key the DV-split
+        # schedule does not ship runs the full-DV base record of the same key
+        # when one is shipped.
+        full_dv_schedule_attr = cake_gdn_prefill_seq_schedule(
+            arch,
+            _prefill_schedule_attr(
+                dvsplit=False,
+                use_initial_state=use_initial_state,
+                io_dtype=io_dtype,
+                state_dtype=state_dtype,
+                single_chunk=False,
+                gatepipe4=False,
+                fullgrid_vhold=False,
+                sm100a_state_inp_late=False,
+                sm103a_role_rebalanced=False,
+                gate_stream_full=False,
+            ),
+            use_state_indices=False,
+        )
+        if _has_variant(
+            arch=arch,
+            domain="prefill",
+            schedule_attr=full_dv_schedule_attr,
+            specializations=specializations,
+        ):
+            dvsplit = False
+            schedule_attr = full_dv_schedule_attr
     record = _variant_for(
         arch=arch,
         domain="prefill",

@@ -663,7 +663,7 @@ kernel_alpha_moe_nvfp4_up_workspace_contiguous_gate_up(const __grid_constant__ C
                         int workspace_tile_c = original_tile_c_1 + 2 * record_half;
                         bool record_has_upper_c = ((record_half == 0) ? pair_upper_c_1 : second_upper_c_1);
                         int live_record_subtiles_c = ((record_has_upper_c) ? 2 : 1);
-                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)(physical_feature_1 << 16) + (unsigned int)(record_half * 16);
+                        int gate_addr = taddr + (unsigned int)(feature_epilogue * 4 * 16) + (unsigned int)((consumer_warp_1 * 32) << 16) + (unsigned int)(record_half * 16);
                         int up_addr = gate_addr + 32;
                         float _tmem_load_0[16];
                         tmem_ld_x16(&_tmem_load_0[0], gate_addr);

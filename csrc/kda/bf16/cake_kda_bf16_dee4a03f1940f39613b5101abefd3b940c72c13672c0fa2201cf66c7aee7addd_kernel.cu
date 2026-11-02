@@ -1734,6 +1734,7 @@ kernel_cake_kda_bf16_dee4a03f1940f39613b5101abefd3b940c72c13672c0fa2201cf66c7aee
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                __syncwarp();
                 if (elect_sync()) {
                     mbarrier_arrive(page_operand_ready_addr);
                 }
@@ -1946,6 +1947,7 @@ kernel_cake_kda_bf16_dee4a03f1940f39613b5101abefd3b940c72c13672c0fa2201cf66c7aee
                 }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                __syncwarp();
                 if (elect_sync()) {
                     mbarrier_arrive(page_operand_ready_addr);
                 }
@@ -2523,6 +2525,7 @@ kernel_cake_kda_bf16_dee4a03f1940f39613b5101abefd3b940c72c13672c0fa2201cf66c7aee
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=f"(_tmem_load_6[0]), "=f"(_tmem_load_6[1]), "=f"(_tmem_load_6[2]), "=f"(_tmem_load_6[3]), "=f"(_tmem_load_6[4]), "=f"(_tmem_load_6[5]), "=f"(_tmem_load_6[6]), "=f"(_tmem_load_6[7]), "=f"(_tmem_load_6[8]), "=f"(_tmem_load_6[9]), "=f"(_tmem_load_6[10]), "=f"(_tmem_load_6[11]), "=f"(_tmem_load_6[12]), "=f"(_tmem_load_6[13]), "=f"(_tmem_load_6[14]), "=f"(_tmem_load_6[15]), "=f"(_tmem_load_6[16]), "=f"(_tmem_load_6[17]), "=f"(_tmem_load_6[18]), "=f"(_tmem_load_6[19]), "=f"(_tmem_load_6[20]), "=f"(_tmem_load_6[21]), "=f"(_tmem_load_6[22]), "=f"(_tmem_load_6[23]), "=f"(_tmem_load_6[24]), "=f"(_tmem_load_6[25]), "=f"(_tmem_load_6[26]), "=f"(_tmem_load_6[27]), "=f"(_tmem_load_6[28]), "=f"(_tmem_load_6[29]), "=f"(_tmem_load_6[30]), "=f"(_tmem_load_6[31])
                         : "r"(taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_4 * 32)));
+                    asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     {
                         #pragma unroll
                         for (int state_vec = 0; state_vec < 4; state_vec++) {

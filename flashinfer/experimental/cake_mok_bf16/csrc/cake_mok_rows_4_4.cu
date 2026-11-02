@@ -82,7 +82,7 @@ kernel_cake_mok_rows_4_4(int* __restrict__ topk_all, int* __restrict__ counts, i
     int* prefix = reinterpret_cast<int*>(smem_static_raw + 0);
     const int prefix_addr = (int)(unsigned long long)__cvta_generic_to_shared(prefix);
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int rank_stride = local_tokens * top_k;
     int first_expert = rank * 4;
     int lane_1 = tid % 32;

@@ -354,9 +354,10 @@ def _collect_partition(
     partition_name: str,
     *,
     allow_empty: bool,
+    log_directory: Path | None = None,
 ) -> list[dict[str, Any]]:
     output = directory / f"collection-{partition_index:02d}.json"
-    log_path = directory / f"collection-{partition_index:02d}.log"
+    log_path = (log_directory or directory) / f"collection-{partition_index:02d}.log"
     pytest_root = _pytest_root(repo_root, test_paths)
     env = os.environ.copy()
     pythonpath = env.get("PYTHONPATH")
@@ -418,6 +419,8 @@ def _collect_nodes(
     test_path: Path | Sequence[Path],
     timeout_seconds: float | None,
     grace_seconds: float,
+    *,
+    diagnostics_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     started_at = time.monotonic()
     test_paths = _as_test_paths(test_path)
@@ -425,6 +428,14 @@ def _collect_nodes(
     isolated_groups = _isolated_collection_groups(test_paths)
     isolated_paths = [path for _, paths in isolated_groups for path in paths]
     primary_targets = [path for path in test_paths if path not in isolated_paths]
+    log_directory = None
+    if diagnostics_dir is not None:
+        # Keep prewarm warnings even when collection succeeds or is interrupted.
+        # Concurrent collectors and later attempts must not overwrite each other.
+        log_directory = Path(
+            tempfile.mkdtemp(prefix="collection-", dir=diagnostics_dir)
+        )
+        write_console(f"COLLECTION LOGS: {log_directory}")
 
     def remaining_timeout() -> float | None:
         if timeout_seconds is None:
@@ -450,6 +461,7 @@ def _collect_nodes(
                         0,
                         "primary test scope",
                         allow_empty=bool(isolated_paths),
+                        log_directory=log_directory,
                     )
                 )
             for partition_index, (name, paths) in enumerate(isolated_groups, start=1):
@@ -465,6 +477,7 @@ def _collect_nodes(
                         partition_index,
                         name,
                         allow_empty=False,
+                        log_directory=log_directory,
                     )
                 )
     except CollectionTimeoutError as error:
@@ -644,6 +657,7 @@ def prepare_manifest(
             test_paths,
             collection_timeout_seconds,
             request.collection_grace_seconds,
+            diagnostics_dir=junit_dir,
         )
     except CollectionTimeoutError as error:
         if existing_plan is not None:

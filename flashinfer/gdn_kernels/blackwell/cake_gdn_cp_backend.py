@@ -233,6 +233,28 @@ def _default_physical_chunk_len(
     )
 
 
+def _choose_sm107_fixup_kind(
+    num_parallel_states: int, num_sms: int, *, all_sequences_equal: bool
+) -> str:
+    """The sm_107a SIMT fixup build: 3 CTAs per SM for a grid of more than 2.
+
+    The ``_mb3`` build (``__launch_bounds__(128, 3)``) computes the same
+    outputs bit for bit.  It is faster once the 32 row CTAs per (sequence,
+    head) exceed the 2 CTAs per SM of the default build, but only when every
+    sequence has the same number of CP chunks: unequal sequences leave the
+    longer ones' CTAs to finish alone, where the default build runs them
+    faster.  Equal lengths are the host-provable form of that condition.
+    """
+    rows = num_parallel_states * (_HEAD_DIM // 4)
+    if (
+        all_sequences_equal
+        and rows > 2 * num_sms
+        and has_gdn_cp_kernel("state_fixup_simt_row4_mb3", "sm_107a")
+    ):
+        return "state_fixup_simt_row4_mb3"
+    return "state_fixup_simt_row4"
+
+
 def _choose_fixup_kind(num_parallel_states: int, num_sms: int) -> str:
     if num_parallel_states <= num_sms * 2 // (_HEAD_DIM // 4):
         return "state_fixup_simt_row4"
@@ -383,6 +405,7 @@ class GDNCPPrefillPlan:
     def fixup_grid(self) -> tuple[int, int, int]:
         row_ctas = {
             "state_fixup_simt_row4": 32,
+            "state_fixup_simt_row4_mb3": 32,
             "state_fixup_utcmma64": 2,
             "state_fixup_utcmma128": 1,
         }[self.fixup_kernel]
@@ -592,8 +615,14 @@ def _build_plan(
         # sm_107a runs the fp32 SIMT fixup only (no TF32 UTCMMA recurrence);
         # sm_100a/sm_103a keep the parallelism-based choice unchanged.
         fixup_kernel=(
-            "state_fixup_simt_row4"
-            if arch == "sm_107a" or total_tokens <= (num_seqs - 1) * max_seqlen
+            _choose_sm107_fixup_kind(
+                num_seqs * num_sab_heads,
+                num_sms,
+                all_sequences_equal=all_sequences_equal,
+            )
+            if arch == "sm_107a"
+            else "state_fixup_simt_row4"
+            if total_tokens <= (num_seqs - 1) * max_seqlen
             else _choose_fixup_kind(num_seqs * num_sab_heads, num_sms)
         ),
         prefill_kernel=prefill_kernel,

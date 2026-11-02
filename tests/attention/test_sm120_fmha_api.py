@@ -125,5 +125,5 @@ def test_skip_softmax_threshold_load_follows_pdl_dependency_wait():
 
     kernel_source = inspect.getsource(SM120FusedMultiHeadAttentionFP8ForwardTMA.kernel)
     wait = kernel_source.index("cute.arch.griddepcontrol_wait()")
-    threshold_load = kernel_source.index("skip_softmax_threshold[batch_idx]")
+    threshold_load = kernel_source.index("skip_softmax_threshold[request_idx]")
     assert wait < threshold_load

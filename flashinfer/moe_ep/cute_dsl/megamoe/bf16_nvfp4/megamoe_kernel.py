@@ -148,7 +148,7 @@ class Sm100W4A16MegaMoEKernel:
         acc_dtype=cutlass.Float32,
         in_kernel_fc2_reduce=False,
         token_back_mode="epi_warps",
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=False,
         gate_up_clamp=None,
         epi_flag_batch=(1, 1),
         flag_batch=1,
@@ -164,7 +164,7 @@ class Sm100W4A16MegaMoEKernel:
             raise ValueError("W4A16 requires forward 2Dx3D scheduler records.")
         if load_balance_mode not in ("static", "atomic_counter"):
             raise ValueError("Unsupported W4A16 load_balance_mode.")
-        self.apply_topk_in_fc1 = apply_topk_in_fc1
+        self.apply_routing_weights_before_fc2 = apply_routing_weights_before_fc2
         if token_back_mode not in ("epi_warps", "reuse_dispatch_warps"):
             raise ValueError(
                 "W4A16 supports epi_warps or reuse_dispatch_warps token return."
@@ -320,7 +320,11 @@ class Sm100W4A16MegaMoEKernel:
             f"_swiglua{self.swiglu_alpha}_swiglub{self.swiglu_beta}"
             f"_situb{self.situ_beta}_situlinb{self.situ_linear_beta}"
             + ("_ikr" if self.in_kernel_fc2_reduce else "")
-            + ("_topk_fc1" if self.apply_topk_in_fc1 else "")
+            + (
+                "_routing_weights_before_fc2"
+                if self.apply_routing_weights_before_fc2
+                else ""
+            )
         )
 
     def _make_mixed(self, fragment_size, output_tensor, raw_stages, activation_stages):
@@ -771,7 +775,7 @@ class Sm100W4A16MegaMoEKernel:
             cluster_shape_mn=self.cluster_shape_mn,
             token_back_by_dispatch=self.token_back_by_dispatch,
             in_kernel_fc2_reduce=self.in_kernel_fc2_reduce,
-            apply_topk_in_fc1=self.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=(self.apply_routing_weights_before_fc2),
             epi_flag_batch=self.epi_flag_batch,
             static_expert_shape=self.static_expert_shape,
             gate_up_clamp=self.gate_up_clamp,
@@ -1055,7 +1059,7 @@ class Sm100W4A16MegaMoEKernel:
         if worker_idx < num_workers:
             token_idx, hidden_tile_idx = self.topk_reduce._prepare_bf16_worker(
                 None
-                if cutlass.const_expr(self.apply_topk_in_fc1)
+                if cutlass.const_expr(self.apply_routing_weights_before_fc2)
                 else token_comm_args.input_topk_weights_buffer,
                 score_reg,
                 worker_idx,
@@ -1517,7 +1521,7 @@ class Sm100W4A16MegaMoEKernel:
             not self.in_kernel_fc2_reduce and reduced_output is not None
         ):
             score_reg = None
-            if cutlass.const_expr(not self.apply_topk_in_fc1):
+            if cutlass.const_expr(not self.apply_routing_weights_before_fc2):
                 score_reg = cute.make_rmem_tensor(
                     (self.num_topk,), token_comm_args.input_topk_weights_buffer.dtype
                 )
@@ -1676,7 +1680,7 @@ class Sm100W4A16MegaMoEKernel:
                     self.topk_reduce._reduce_bf16_worker(
                         combine,
                         None
-                        if cutlass.const_expr(self.apply_topk_in_fc1)
+                        if cutlass.const_expr(self.apply_routing_weights_before_fc2)
                         else token_comm_args.input_topk_weights_buffer,
                         reduced_output,
                         token_idx,
@@ -1689,7 +1693,9 @@ class Sm100W4A16MegaMoEKernel:
                         token_idx, hidden_tile_idx = (
                             self.topk_reduce._prepare_bf16_worker(
                                 None
-                                if cutlass.const_expr(self.apply_topk_in_fc1)
+                                if cutlass.const_expr(
+                                    self.apply_routing_weights_before_fc2
+                                )
                                 else token_comm_args.input_topk_weights_buffer,
                                 score_reg,
                                 worker_idx,

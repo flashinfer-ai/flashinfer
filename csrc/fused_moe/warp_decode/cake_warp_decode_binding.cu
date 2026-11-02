@@ -237,7 +237,22 @@ void CheckWorkspace(const TensorView& workspace, int32_t device_id, int64_t requ
 struct LaunchContext {
   cudaStream_t stream;
   int32_t launch_count;
+  // Whether the chain's first kernel may also launch with programmatic dependent launch.
+  bool first_launch_programmatic;
 };
+
+// A chain's first kernel may overlap the previous kernel on the stream only if it runs
+// griddepcontrol.wait before it reads any caller input: the routing, the activations and their
+// scales, the weights and the per-expert scalars. It must also trigger its dependents only after
+// that wait, because the later kernels may read caller inputs before their own wait. Direct
+// schedules start with an FC1 program that waits first in every warp role and triggers its
+// dependents only after the wait. Every other schedule starts with a kernel that reads topk_ids
+// before it can wait: a route-pack or route-order kernel, or an FC1 that packs the routes
+// itself. Those chains start in stream order, and so does any schedule not listed here.
+bool FirstKernelWaitsBeforeInputs(const Schedule& schedule) {
+  return schedule.route_layout == RouteLayout::kDirect &&
+         schedule.route_packer == RoutePacker::kNone;
+}
 
 struct WorkspaceKey {
   int32_t device_id;
@@ -477,9 +492,14 @@ void LaunchOne(const KernelLaunch& launch, void* opaque_context) {
   std::array<cudaLaunchAttribute, 6> attributes{};
   uint32_t attribute_count = 0;
 
-  attributes[attribute_count].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attributes[attribute_count].val.programmaticStreamSerializationAllowed = 1;
-  ++attribute_count;
+  // A first kernel that reads caller inputs, such as the routing indices, before
+  // it could wait on the previous grid is submitted in stream order. Later
+  // kernels keep programmatic dependent launch.
+  if (context->launch_count > 0 || context->first_launch_programmatic) {
+    attributes[attribute_count].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attributes[attribute_count].val.programmaticStreamSerializationAllowed = 1;
+    ++attribute_count;
+  }
 
   const bool clustered = launch.cluster.x > 1 || launch.cluster.y > 1 || launch.cluster.z > 1;
   if (clustered) {
@@ -763,7 +783,7 @@ void RunWithActivationParams(
     CheckCuda(cudaStreamWaitEvent(stream, workspace.completion, 0),
               "cudaStreamWaitEvent(previous workspace submission)");
   }
-  LaunchContext context{stream, 0};
+  LaunchContext context{stream, 0, FirstKernelWaitsBeforeInputs(schedule)};
   try {
     generated::ForEachLaunch(invocation, schedule, LaunchOne, &context);
   } catch (...) {

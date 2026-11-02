@@ -24,15 +24,21 @@ padding rows, which the generated program writes itself (no host-side clear).
 
 from __future__ import annotations
 
-from typing import Optional, cast
+from typing import Any, Optional
 
 import torch
 import tvm_ffi
 
+from flashinfer.jit import cake_program
 from flashinfer.jit.cake_minimax_h3_qkv_quantize_pack import (
-    MiniMaxH3QkvPackFormat,
-    load_minimax_h3_qkv_pack_module,
-    minimax_h3_qkv_pack_route_record,
+    MXFP8_P1,
+    MXFP8_P2,
+    MXFP8_P4,
+    MXFP8_P8,
+    NVFP4_P1,
+    NVFP4_P2,
+    NVFP4_P4,
+    NVFP4_P8,
 )
 
 _HEADS = 56
@@ -47,6 +53,24 @@ _MXFP8_SCALE_COLS = _HEAD_DIM // _MXFP8_BLOCK  # 4 UE8M0 scales per head row
 _ELEMS_PER_LANE = 16  # 32 BF16 bytes per lane: the row alignment the loads need
 _SUPPORTED_PARTITIONS = (1, 2, 4, 8)
 _SUPPORTED_FORMATS = ("nvfp4", "mxfp8")
+
+# The generated program of every supported (format, P): the format decides the
+# quantization recipe and the argument list (NVFP4 takes ``out_global_scale``),
+# P is the destination partition count compiled into the program.
+_PROGRAMS: dict[tuple[str, int], cake_program.CakeProgram] = {
+    ("nvfp4", 1): NVFP4_P1,
+    ("nvfp4", 2): NVFP4_P2,
+    ("nvfp4", 4): NVFP4_P4,
+    ("nvfp4", 8): NVFP4_P8,
+    ("mxfp8", 1): MXFP8_P1,
+    ("mxfp8", 2): MXFP8_P2,
+    ("mxfp8", 4): MXFP8_P4,
+    ("mxfp8", 8): MXFP8_P8,
+}
+# Launch geometry shared by every program: 8 warps per CTA (block 256), each
+# warp packing 16 tokens of one (local head, kind) of one destination.
+_TOKENS_PER_WARP = 16
+_WARPS_PER_CTA = 8
 
 
 def _round_up(value: int, alignment: int) -> int:
@@ -151,23 +175,31 @@ def _require_output(
     return value
 
 
-def _stage_launch_grid(record: dict, *, M: int, P: int) -> tuple[int, int, int]:
-    """Launch grid of the generated pack program for the runtime token count ``M``.
+def minimax_h3_qkv_pack_target(device: torch.device) -> str:
+    """Exact target (``"sm_100a"`` or ``"sm_103a"``) every program ships for ``device``."""
+    capability = tuple(int(value) for value in torch.cuda.get_device_capability(device))
+    target = cake_program.CAPABILITY_TARGET.get((capability[0], capability[1]))
+    if target is None or any(
+        target not in program.targets for program in _PROGRAMS.values()
+    ):
+        raise RuntimeError(
+            "MiniMax-H3 QKV quantize-and-pack requires exact compute capability "
+            f"10.0 or 10.3, got {capability[0]}.{capability[1]}"
+        )
+    return target
 
-    The route record carries the rule with the constants of the generated
-    program (tokens per warp, warps per CTA); the token count is not part of
-    the program identity, so the grid is computed here for every call.
+
+def minimax_h3_qkv_pack_launch_grid(M: int, P: int) -> tuple[int, int, int]:
+    """Launch grid of the pack program for the runtime token count ``M``.
+
+    grid.x: one warp per (token group, local head, kind) of one destination
+    plus one CTA that zeroes the scale-tile padding rows; grid.y: the
+    destination.  The token count is not part of the program identity, so the
+    grid is computed here for every preparation.
     """
-    rule = record["launch_grid_rule"]
-    kind = str(rule["kind"])
-    if kind == "pack_warps_2d_plus_padding":
-        # grid.x: one warp per (token group, local head, kind) of one
-        # destination plus one CTA that zeroes the scale-tile padding rows;
-        # grid.y: the destination.
-        token_groups = -(-M // int(rule["tokens_per_warp"]))
-        warps = token_groups * (_HEADS // P) * _KINDS
-        return (-(-warps // int(rule["warps_per_cta"])) + 1, P, 1)
-    raise RuntimeError(f"generated program has unsupported launch grid rule {kind!r}")
+    token_groups = -(-M // _TOKENS_PER_WARP)
+    warps = token_groups * (_HEADS // P) * _KINDS
+    return (-(-warps // _WARPS_PER_CTA) + 1, P, 1)
 
 
 def _flat_source_view(
@@ -187,27 +219,20 @@ def _flat_source_view(
     return tensor.as_strided((span,), (1,), tensor.storage_offset())
 
 
-def _stage_call_args(record: dict, values: dict, *, grid: tuple[int, ...]) -> tuple:
-    grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
-    args = []
-    for raw_kind, raw_name in record["arg_plan"]:
-        kind = str(raw_kind)
-        name = str(raw_name)
-        if kind in {"buffer", "parameter"}:
-            if name not in values:
-                raise RuntimeError(
-                    f"generated program requires unknown argument {name!r}"
-                )
-            args.append(values[name])
-        elif kind == "grid" and name in grid_values:
-            args.append(grid_values[name])
-        else:
-            # The pack programs use plain global pointers: no TMA descriptors
-            # and no descriptor workspace.
-            raise RuntimeError(
-                f"generated program has unsupported argument {(kind, name)!r}"
-            )
-    return tuple(args)
+def _call_args(
+    program: cake_program.CakeProgram,
+    values: dict[str, Any],
+    *,
+    grid: tuple[int, int, int],
+) -> tuple[Any, ...]:
+    """Positional ``run`` arguments of ``program``: its host parameters in binding order, then the grid."""
+    bound = {**values, **dict(zip(cake_program.GRID_ARGS, grid, strict=True))}
+    missing = [name for name in program.args if name not in bound]
+    if missing:
+        raise RuntimeError(
+            f"program {program.name} requires arguments {missing} the host did not bind"
+        )
+    return tuple(bound[name] for name in program.args)
 
 
 class PreparedMiniMaxH3QkvQuantizePack:
@@ -255,7 +280,7 @@ def prepare_minimax_h3_qkv_quantize_pack(
     format: str,
     out_global_scale: Optional[torch.Tensor] = None,
 ) -> PreparedMiniMaxH3QkvQuantizePack:
-    """Bind caller-owned tensors to the exact ``(target, P, format)`` route.
+    """Bind caller-owned tensors to the ``(format, P)`` program of the device's exact target.
 
     ``out_global_scale`` (float32 ``[1]``, FlashInfer convention
     ``(448 * 6) / amax``) is required for ``"nvfp4"`` and must be ``None`` for
@@ -301,12 +326,10 @@ def prepare_minimax_h3_qkv_quantize_pack(
     elif out_global_scale is not None:
         raise ValueError("out_global_scale must be None for the mxfp8 format")
 
-    fmt = cast(MiniMaxH3QkvPackFormat, format)
-    route = minimax_h3_qkv_pack_route_record(device, P, fmt)
-    record = route["module"]
-    module = load_minimax_h3_qkv_pack_module(device, P, fmt)
+    program = _PROGRAMS[(format, P)]
+    module = program.load(minimax_h3_qkv_pack_target(device))
 
-    values = {
+    values: dict[str, Any] = {
         "q": _flat_source_view(q, M, token_stride, head_stride),
         "k": _flat_source_view(k, M, token_stride, head_stride),
         "v": _flat_source_view(v, M, token_stride, head_stride),
@@ -323,7 +346,7 @@ def prepare_minimax_h3_qkv_quantize_pack(
     }
     if out_global_scale is not None:
         values["out_global_scale"] = out_global_scale
-    args = _stage_call_args(record, values, grid=_stage_launch_grid(record, M=M, P=P))
+    args = _call_args(program, values, grid=minimax_h3_qkv_pack_launch_grid(M, P))
     return PreparedMiniMaxH3QkvQuantizePack(
         M=M,
         P=P,
@@ -348,7 +371,7 @@ def minimax_h3_qkv_quantize_pack(
     """One-shot convenience wrapper around :func:`prepare_minimax_h3_qkv_quantize_pack`.
 
     Allocates ``out_q`` / ``out_sf`` when they are not supplied; that
-    allocation (and the per-call route preparation) makes this wrapper
+    allocation (and the per-call preparation) makes this wrapper
     unsuitable for CUDA Graph capture.  Prepare once and reuse the returned
     operation for graph-safe, allocation-free launches.
     """
@@ -378,9 +401,11 @@ def minimax_h3_qkv_quantize_pack(
 
 __all__ = [
     "PreparedMiniMaxH3QkvQuantizePack",
+    "minimax_h3_qkv_pack_launch_grid",
     "minimax_h3_qkv_pack_output_shapes",
     "minimax_h3_qkv_pack_rows_per_destination",
     "minimax_h3_qkv_pack_scale_stride",
+    "minimax_h3_qkv_pack_target",
     "minimax_h3_qkv_quantize_pack",
     "prepare_minimax_h3_qkv_quantize_pack",
 ]

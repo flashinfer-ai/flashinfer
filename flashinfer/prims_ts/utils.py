@@ -48,5 +48,12 @@ def is_prims_ts_available() -> bool:
         return False
 
 
+def is_prims_ts_arch_available(major: int, minor: int) -> bool:
+    """Whether the installed CuTe DSL can natively target ``sm_{major}{minor}``."""
+    from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+    return is_cute_dsl_arch_supported(major, minor, native_only=True)
+
+
 def get_prims_ts_compile_options() -> str:
     return os.environ.get("FLASHINFER_PRIMS_TS_COMPILE_OPTIONS", "--opt-level 2")

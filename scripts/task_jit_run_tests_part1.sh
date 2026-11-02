@@ -14,7 +14,10 @@ if [ "$SKIP_INSTALL" = "0" ]; then
 fi
 
 # Separate processes release CUDA memory between files.
-bash tests/moe_ep/run_tests.sh unit
+# Not a pytest target, so a targeted run (JIT_TEST_SCOPE) never covers it.
+if [ -z "${JIT_TEST_SCOPE:-}" ]; then
+  bash tests/moe_ep/run_tests.sh unit
+fi
 pytest -s tests/attention/test_batch_decode_kernels.py
 pytest -s tests/utils/test_jit_example.py
 pytest -s tests/gemm/test_group_gemm.py

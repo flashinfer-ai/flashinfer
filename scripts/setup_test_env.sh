@@ -59,6 +59,10 @@ case "${_reqs_status}" in
 esac
 unset _reqs_output _reqs_status
 
+# The direct requirement sync above can update only the DSL metadata wheel.
+# Resolve its matching libraries before any CuTe DSL or quack import.
+bash "${SCRIPT_DIR}/install_cutlass_dsl.sh" || return 1
+
 # Install using only what the image carries; the check above covered the rest.
 # FLASHINFER_BUILD_NO_PIP keeps dropping isolation from activating the build
 # hooks' own downloads, which isolation has always swallowed here.
@@ -131,7 +135,7 @@ if [ -n "${CUTLASS_DSL_VERSION:-}" ]; then
   echo "Overriding nvidia-cutlass-dsl with: ${CUTLASS_DSL_PKG}"
   echo "========================================"
   # Clean uninstall old packages first (recommended by NVIDIA docs)
-  pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 -y 2>/dev/null || true
+  pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-dsl-libs-core nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 -y 2>/dev/null || true
   pip install "${CUTLASS_DSL_PKG}"
   echo "nvidia-cutlass-dsl override complete."
   echo ""

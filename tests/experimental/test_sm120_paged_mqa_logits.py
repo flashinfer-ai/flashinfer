@@ -357,10 +357,16 @@ def test_sm120_paged_mqa_logits_long_context_hint(
     hinted = _runtime.atom_variant(heads, next_n, batch, max_context_hint=hint)
     unhinted = _runtime.atom_variant(heads, next_n, batch)
     assert plan.max_context_hint == hint
-    assert plan.atom_variant == hinted
-    assert plan.route_name == _runtime.route_name(
-        heads, page_kv, next_n, batch, max_context_hint=hint
+    # On a device with a route table the hint may also select a device route
+    # (its own atom and schedule); everywhere else the default route runs.
+    device = dict(cta_budget=plan.num_sms, device_sms=plan.device_sms)
+    assert plan.route_name == _runtime.resolve_route(
+        heads, page_kv, next_n, batch, max_context_hint=hint, **device
     )
+    if plan.route_name == _runtime.route_name(
+        heads, page_kv, next_n, batch, max_context_hint=hint
+    ):
+        assert plan.atom_variant == hinted
     assert plan.route["atom_variant"] == plan.atom_variant
     assert plan.launch_count == 1 and plan.kernel_launches == 2
     # The 64-head 5-/6-token native atom exceeds the TMA Q box, so that
@@ -374,14 +380,18 @@ def test_sm120_paged_mqa_logits_long_context_hint(
     plan.run()
     torch.cuda.synchronize()
     _check(plan.logical_output, _reference(data), data, plan.output)
-    # The sequence rebuilt the schedule with the hinted atom count.
-    atoms = _runtime.next_n_atoms(next_n, batch, heads, max_context_hint=hint)
+    # The sequence rebuilt the schedule with the atom count of its route.
+    atoms = _runtime.next_n_atoms(
+        next_n, batch, heads, max_context_hint=hint, page_kv=page_kv, **device
+    )
     assert atoms == plan.num_next_n_atoms
     expected = _schedule_reference(
         data["context_lens"], _runtime.split_kv(), atoms, plan.num_sms
     )
-    assert plan.schedule_meta.cpu().tolist() == expected
-    # The standalone metadata entry with the same hint produces the same schedule.
+    if plan.dyn_schedule is None:
+        assert plan.schedule_meta.cpu().tolist() == expected
+    # The standalone metadata entry with the same hint produces the static
+    # schedule of that atom count (the one the sequence rebuilt on a static route).
     meta = get_paged_mqa_logits_metadata(
         data["context_lens"],
         page_kv,
@@ -389,11 +399,19 @@ def test_sm120_paged_mqa_logits_long_context_hint(
         num_heads=heads,
         max_context_hint=hint,
     )
-    assert torch.equal(meta, plan.schedule_meta)
+    assert meta.cpu().tolist() == expected
     # With the hint at batch 2-8 the exported head counts select different
     # schedules for next_n 5/6 (a5/a6 against a2), so the head-count-free call
-    # names ``num_heads`` there; next_n 3/4 resolve without it.
-    if next_n in (5, 6):
+    # names ``num_heads`` there; next_n 3/4 resolve without it.  A device route
+    # table can change which head counts agree, so the rule is checked against
+    # the per-head atom counts of the routes.
+    per_head = {
+        _runtime.next_n_atoms(
+            next_n, batch, h, max_context_hint=hint, page_kv=page_kv, **device
+        )
+        for h in _runtime.exported_heads()
+    }
+    if len(per_head) > 1:
         with pytest.raises(ValueError, match="num_heads"):
             get_paged_mqa_logits_metadata(
                 data["context_lens"], page_kv, plan.num_sms, max_context_hint=hint
@@ -402,19 +420,17 @@ def test_sm120_paged_mqa_logits_long_context_hint(
         heads_free = get_paged_mqa_logits_metadata(
             data["context_lens"], page_kv, plan.num_sms, max_context_hint=hint
         )
-        assert torch.equal(heads_free, plan.schedule_meta)
+        assert torch.equal(heads_free, meta)
     # The same operands WITHOUT the hint schedule the reference atoms, a
-    # different buffer wherever the variant changes.  The buffer is
+    # different buffer wherever the atom count changes.  The buffer is
     # DeepGEMM-identical and carries no atom count, so a mismatch is not
     # detectable from it; the logits entries rebuild the schedule under their
     # own hint (checked above), which is why the sequence stays consistent.
     unhinted_meta = get_paged_mqa_logits_metadata(
         data["context_lens"], page_kv, plan.num_sms, num_heads=heads
     )
-    if hinted == unhinted:
-        assert torch.equal(unhinted_meta, plan.schedule_meta)
-    else:
-        assert not torch.equal(unhinted_meta, plan.schedule_meta)
+    unhinted_atoms = _runtime.next_n_atoms(next_n, batch, heads)
+    assert (unhinted_meta.cpu().tolist() == expected) == (unhinted_atoms == atoms)
     # One-shot entry with the same hint: identical bits where both wrote.
     one_shot = fp8_paged_mqa_logits(
         data["q"],
@@ -1012,6 +1028,14 @@ def test_sm120_sequence_programs_share_one_text_per_atom_variant():
     assert texts and all(len(units) == 1 for units in texts.values()), texts
     kernels = {next(iter(units))[0] for units in texts.values()}
     assert len(kernels) == len(texts), sorted(kernels)
+    # Device routes (tuned per-device programs) reference their own units.
+    for route in catalog["device_routes"].values():
+        referenced.update(catalog["programs"][route["sequence"]]["sources"])
+    # A scheduler the device-route sequences share ships as a module record
+    # that is not standalone; its binding is referenced by that record.
+    for record in catalog["programs"].values():
+        if record.get("kind") == "module" and record.get("standalone") is False:
+            referenced.update(record["sources"])
     generated_dir = csrc / generated.removeprefix("csrc/")
     orphans = sorted(
         p.name

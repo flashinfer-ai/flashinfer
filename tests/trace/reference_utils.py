@@ -54,6 +54,18 @@ def _init_filtered(template, **kwargs):
     return template.init(**{k: v for k, v in kwargs.items() if k in accepted})
 
 
+def _unswizzle_mxfp8_scales_128x4(sf: torch.Tensor, row: int, col: int) -> torch.Tensor:
+    """Invert the 128x4 swizzle to a plain ``[row, col // 32]`` scale grid."""
+    scale_vec_size = 32
+    factor = scale_vec_size * 4
+    num_m_tiles = (row + 128 - 1) // 128
+    num_k_tiles = (col + factor - 1) // factor
+    sf_reshaped = sf.reshape(num_m_tiles, num_k_tiles, 32, 4, 4)
+    sf_unswizzled = sf_reshaped.transpose(1, 3)
+    sf_unswizzled = sf_unswizzled.reshape(num_m_tiles * 32 * 4, num_k_tiles * 4)
+    return sf_unswizzled[:row, : (col // scale_vec_size)].contiguous()
+
+
 def _assert_finite(*tensors: torch.Tensor) -> None:
     for t in tensors:
         if t is None:
