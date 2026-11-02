@@ -90,6 +90,8 @@ SPLIT_LIBRARY = {
     "b16": "cake_mhc_det_train_fn_split",
     "tv128": "cake_mhc_det_train_fn_split__tv128",
     "tv128_t128": "cake_mhc_det_train_fn_split__tv128_t128",
+    # the checkpoint carry's dual-layout form (FN_SPLIT_CARRY; no route names it)
+    "dual": "cake_mhc_det_train_fn_split__dual",
 }
 MAP_LIBRARY = {
     "ss_st4": "cake_mhc_det_train_fwd_map",
@@ -219,6 +221,7 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_det_train_fn_split__dual": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fn_split__tv128": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_fn_split__tv128_t128": ("sm_107a",),
     "cake_mhc_det_train_fwd_coef__g2_el": ("sm_107a",),
@@ -300,11 +303,18 @@ MULTI_RECORDS = {
         "cake_mhc_det_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 67, 51
+N_RECORDS, N_LIBRARIES = 68, 52
 RECORD_SCALARS = {
     "cake_mhc_det_train_fn_split": {"want_t": 0},
     "cake_mhc_det_train_fn_split__tv128__t": {"want_t": 1},
     "cake_mhc_det_train_fn_split__tv128_t128__t": {"want_t": 1},
+    "cake_mhc_det_train_fn_split__dual": {"want_t": 1},
+}
+# The checkpoint carry of the autograd path: the dual-layout fn split per architecture and its token-count bands.
+FN_SPLIT_CARRY = {
+    "sm_100a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
+    "sm_103a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 2048),)},
+    "sm_107a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
 }
 # The reference master's per-architecture tables of record (generated from the master text).
 TABLES = {
@@ -1156,10 +1166,13 @@ RULES_ROWS = (
     (65536, 208, 'sm_107a', 65536, True, 8, 4096, 416, 13, 832, 208, 5056, 416, 160, 4096, 832, 131072, 65536, 65536, 55574784, 42520832, 'b16', 'tv128_t128', 256, 512, 'lp2_w8_adj_qe', 'ss_st4', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (65536, 216, 'sm_107a', 65536, True, 8, 4096, 432, 27, 1728, 216, 2432, 432, 152, 4096, 864, 131072, 65536, 65536, 55574784, 64542976, 'b16', 'tv128_t128', 256, 512, 'lp2_w8_adj_qe', 'ss_st4', 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411, 't128', 'r2'),
 )  # fmt: skip
+# the dual-layout fn split's [piece][row][k] shared-memory tile of 64 k
+DUAL_SMEM = 12288
 LAUNCH_FACTS = {
     "cake_mhc_det_train_fn_split": ((256, 1, 1), 0, 1),
     "cake_mhc_det_train_fn_split__tv128__t": ((256, 1, 1), 0, 1),
     "cake_mhc_det_train_fn_split__tv128_t128__t": ((128, 1, 1), 0, 1),
+    "cake_mhc_det_train_fn_split__dual": ((256, 1, 1), DUAL_SMEM, 1),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1": ((192, 1, 1), 144384, 1),
     "cake_mhc_det_train_fwd_map__nsx": ((192, 1, 1), 115712, 2),
     "cake_mhc_det_train_fwd_map__nsx__tk": ((192, 1, 1), 115712, 2),
@@ -1233,6 +1246,7 @@ RECORD_ARCHES = {
     "cake_mhc_det_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fn_split__tv128__t": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_fn_split__tv128_t128__t": ("sm_107a",),
+    "cake_mhc_det_train_fn_split__dual": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx__tk": ("sm_103a",),
@@ -1826,6 +1840,7 @@ def test_registry_tables_are_literals() -> None:
         "K5_GRID_BANDS",
         "K5_FORM_BANDS",
         "K5_FORM_ROWS",
+        "FN_SPLIT_CARRY",
         "PDL_PATHS",
         "PDL_EDGES",
         "PDL_OFF_BANDS",
@@ -1834,6 +1849,7 @@ def test_registry_tables_are_literals() -> None:
     assert literals["MODULES"] == loader.MODULES
     assert literals["ROUTES"] == loader.ROUTES
     assert literals["RECORD_SCALARS"] == loader.RECORD_SCALARS
+    assert literals["FN_SPLIT_CARRY"] == loader.FN_SPLIT_CARRY
     assert tuple(literals["HIDDEN_SIZES"]) == (4096, 5120, 7168)
     assert {record["hidden"] for record in loader.MODULES.values()} == {
         4096,
@@ -1867,8 +1883,14 @@ def test_records_are_consistent() -> None:
         assert [
             name for name, record in modules.items() if record["library"] == library
         ] == [library], library
+    # the checkpoint carry's dual-layout fn split is named by FN_SPLIT_CARRY, not by a route
     routed = {
         arch: {name for names in H4096_ROUTES[arch].values() for name in names}
+        | {
+            entry["record"]
+            for carry_arch, entry in loader.FN_SPLIT_CARRY.items()
+            if carry_arch == arch
+        }
         for arch in loader.ARCHES
     }
     for name, record in modules.items():
@@ -2130,9 +2152,10 @@ def test_records_are_consistent() -> None:
     # (tv128 on sm_100a / sm_103a, its 128-thread form tv128_t128 on sm_107a).
     assert H4096_SCALARS == RECORD_SCALARS
     for name, scalars in H4096_SCALARS.items():
-        assert modules[name]["role"] == (
-            "fn_split_fwd" if scalars["want_t"] == 0 else "fn_split_bwd"
-        ), name
+        role = "fn_split_fwd" if scalars["want_t"] == 0 else "fn_split_bwd"
+        if any(entry["record"] == name for entry in FN_SPLIT_CARRY.values()):
+            role = "fn_split_carry"  # the dual-layout split: a want_t 1 launch that writes both layouts
+        assert modules[name]["role"] == role, name
         assert _is(name, "cake_mhc_det_train_fn_split")
     assert {n for n in modules if _is(n, "cake_mhc_det_train_fn_split")} == set(
         RECORD_SCALARS
@@ -2379,7 +2402,8 @@ def test_launch_facts_of_record() -> None:
     1024 B reserve within an SM's 228 KiB), the final reduction at its form's block (256 / 64 / 32 threads) and pool
     (the 64 KiB staging tile, the split parameter form's 4224 B, the 64- / 32-thread split forms' 2688 / 2432 B,
     the group-row forms' 128 B; the group-row token-owner forms' pool is 2048 B above their per-CTA forms'),
-    the fn split at 256 threads (128 for the 128-thread 16-byte-store form, whose grid doubles) and no dynamic pool."""
+    the fn split at 256 threads (128 for the 128-thread 16-byte-store form, whose grid doubles) and no dynamic pool
+    (the dual-layout form of the checkpoint carry: its 12 KiB staging tile)."""
     facts = {
         name: (
             record["launch"]["block"],
@@ -2390,9 +2414,12 @@ def test_launch_facts_of_record() -> None:
     }
     assert facts == LAUNCH_FACTS
     for name in H4096_SCALARS:
-        # the fn split covers 65536 thread-slots of 8 elements: 256 CTAs x 256 threads, or 512 x 128 for the 128-thread form
+        # the fn split covers 65536 thread-slots of 8 elements: 256 CTAs x 256 threads, or 512 x 128 for the 128-thread
+        # form; the dual-layout split stages the forward layout through its 12 KiB tile
         ctas = H4096_MODULES[name]["grid_rule"]["ctas"]
-        assert facts[name] == ((65536 // ctas, 1, 1), 0, 1) and ctas in (256, 512), name
+        smem = DUAL_SMEM if name == "cake_mhc_det_train_fn_split__dual" else 0
+        assert facts[name] == ((65536 // ctas, 1, 1), smem, 1), name
+        assert ctas in (256, 512), name
     for library, names in MULTI_RECORDS.items():
         assert len({facts[name] for name in names}) == 1, (
             library
@@ -2728,6 +2755,43 @@ def test_route_glue() -> None:
             else:
                 with pytest.raises(RuntimeError, match=f"not delivered for {arch}"):
                     loader.library_name(name, arch)
+
+
+@pytest.mark.cpu_only
+def test_checkpoint_carry() -> None:
+    """The checkpoint carry of the autograd path (``FN_SPLIT_CARRY``): inside a band the replay's fn split is the
+    dual-layout record, which writes both layouts at ``want_t = 1``, and ``bwd_finish`` launches the route's own
+    records without its fn split; outside every band and at the hidden sizes 5120 / 7168 there is no carry."""
+    assert loader.FN_SPLIT_CARRY == FN_SPLIT_CARRY
+    dual = "cake_mhc_det_train_fn_split__dual"
+    record = H4096_MODULES[dual]
+    assert record["role"] == "fn_split_carry" and record["library"] == dual
+    assert record["workspace_rule"] == {"kind": "regions", "workspace": "fwd"}
+    assert tuple(record["arches"]) == tuple(FN_SPLIT_CARRY)
+    assert loader.RECORD_SCALARS[dual] == {"want_t": 1}
+    for arch, entry in FN_SPLIT_CARRY.items():
+        ((above, at_most),) = entry["bands"]
+        for T in (above + 1, at_most):
+            assert loader.fn_split_carry(T, arch) == dual, (arch, T)
+            assert loader.fn_split_carry(T, arch, 5120) is None
+        assert loader.fn_split_carry(above, arch) is None
+        assert loader.fn_split_carry(at_most + 1, arch) is None
+        for T in (1, 129, at_most, at_most + 1, 4096):
+            for sm in SM_COUNTS:
+                for kind in ("fwd_recompute", "bwd_finish"):
+                    selected = loader.selected_modules(
+                        arch, 4096, kind, rows=T, sm_count=sm
+                    )
+                    carried = loader.carried_modules(
+                        arch, 4096, kind, rows=T, sm_count=sm
+                    )
+                    assert _is(selected[0], "cake_mhc_det_train_fn_split")
+                    want = ((dual,) if kind == "fwd_recompute" else ()) + selected[1:]
+                    assert carried == want, (arch, T, sm, kind)
+        with pytest.raises(ValueError, match="checkpoint carry has no"):
+            loader.carried_modules(arch, 4096, "fwd_prepare", rows=129, sm_count=148)
+    with pytest.raises(ValueError, match="no checkpoint carry"):
+        loader.carried_modules("sm_100a", 5120, "bwd_finish", rows=129, sm_count=148)
 
 
 @pytest.mark.cpu_only

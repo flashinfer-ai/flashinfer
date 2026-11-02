@@ -42,7 +42,10 @@ several policies has one record per policy (``<kernel>__<stage>`` after the
 first), all naming the kernel's ``library``, so it is compiled once: the fn
 split runs once per forward route (its forward operand layout) and once per
 backward route (``__t``, the transposed layout, selected by the ``want_t``
-scalar of :data:`RECORD_SCALARS`).
+scalar of :data:`RECORD_SCALARS`).  The autograd checkpoint replay inside the
+bands of :data:`FN_SPLIT_CARRY` launches the dual-layout split ``__dual``
+instead, which writes both layouts, and the backward route then launches no
+split (:func:`carried_modules`).
 
 The grid, chunk and workspace rules are pure integer functions of ``(T, SM
 count, architecture, hidden size)`` (:func:`k1_units` with the measured P_K band of
@@ -251,6 +254,51 @@ MODULES: dict[str, dict[str, Any]] = {
         "workspace_rule": {
             "kind": "regions",
             "workspace": "bwd",
+        },
+    },
+    "cake_mhc_det_train_fn_split__dual": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "fn"],
+            ["buffer", "fnp"],
+            ["buffer", "fnTp"],
+            ["parameter", "want_t"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas": 256,
+            "kind": "fixed",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_fn_split__dual",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fn_split__dual",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 12288,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_fn_split__dual",
+        "logical": {
+            "fn": "fn",
+            "fnTp": "fnTp",
+            "fnp": "fnp",
+            "want_t": "want_t",
+        },
+        "role": "fn_split_carry",
+        "select_rule": None,
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
         },
     },
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1": {
@@ -7609,7 +7657,8 @@ WORKSPACE_REGIONS: dict[str, list[dict[str, Any]]] = {
 # Scalar values a record fixes itself (the launch policy of a stage record):
 # the fn split (its production form and its 16-byte-store forms ``__tv128``
 # and ``__tv128_t128``) writes the forward operand layout (``want_t = 0``) or
-# the transposed layout of the backward (``want_t = 1``).
+# the transposed layout of the backward (``want_t = 1``); the dual-layout form
+# ``__dual`` writes both at ``want_t = 1``.
 RECORD_SCALARS: dict[str, dict[str, int]] = {
     "cake_mhc_det_train_fn_split": {
         "want_t": 0,
@@ -7618,6 +7667,9 @@ RECORD_SCALARS: dict[str, dict[str, int]] = {
         "want_t": 1,
     },
     "cake_mhc_det_train_fn_split__tv128_t128__t": {
+        "want_t": 1,
+    },
+    "cake_mhc_det_train_fn_split__dual": {
         "want_t": 1,
     },
     "cake_mhc_det_train_fn_split__h5120": {
@@ -7742,6 +7794,21 @@ FN_SPLIT_PROGRAM = {
 # 256 threads for "b16" / "tv128", 512 CTAs of 128 threads for "tv128_t128" -- what mhc_det_fn_split.grid_for_symbol
 # returns for the entry's symbol and the kernel-tests launch passes.
 FN_SPLIT_GRID = {"b16": 256, "tv128": 256, "tv128_t128": 512}
+# FN_SPLIT_CARRY: the activation-checkpoint carry of the autograd path (``save_stats=False``). Inside a band
+# (above, at_most] the replayed forward prefix launches the dual-layout fn split (t_store="v128", dual=True: one launch
+# writes fnp into the forward workspace and fnTp into a [3, 4H, 32] BF16 buffer, bitwise both single-layout forms), the
+# finish node's backward hands that buffer to the prepare node's backward on an autograd edge, and its bwd_finish
+# launches no fn split (the 3 MiB buffer lives from the replay to the end of the prepare node's backward, never across
+# the forward). Measured on the checkpoint path (the carry against the two-launch route, CUPTI active, three
+# independent sessions per architecture): B200 1.024-1.025 at 1024, 1.021-1.022 at 2048, 1.012-1.013 at 4096; GB300
+# 1.022-1.024 at 1024, 1.015-1.017 at 2048, 1.005-1.011 at 4096. A band keeps the rows where every session reads at
+# least 1 % faster: sm_100a to 4096 tokens, sm_103a to 2048. sm_107a (the same 256-thread form in place of the b16 fnp
+# split and the 128-thread tv128_t128 fnTp split): provisional, to be set from its R200 measurement.
+FN_SPLIT_CARRY = {
+    "sm_100a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
+    "sm_103a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 2048),)},
+    "sm_107a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
+}
 # FWD_MAP_BANDS: (above, at_most, program) of the mapping pass by token count (at_most None = unbounded); outside every
 # band the production form FWD_MAP_PRODUCTION ("ss_st4": a_path="ss", 4 stages). Every form below is EXACT: the
 # chunk's second stage issues [b1; b3] as ONE N64 MMA into the adjacent TMEM pair of the layout [big_0 | small | big_1]
@@ -9001,6 +9068,52 @@ def route_modules(arch: str, hidden: int, kind: str) -> tuple[str, ...]:
     return tuple(names)
 
 
+def fn_split_carry(rows: int, arch: str, hidden: int = HIDDEN) -> str | None:
+    """The dual-layout fn split record the checkpoint carry launches for ``rows`` tokens on
+    ``arch`` at hidden size ``hidden`` (:data:`FN_SPLIT_CARRY`), or ``None`` outside every band."""
+
+    entry = FN_SPLIT_CARRY.get(arch)
+    if entry is None or MODULES[entry["record"]]["hidden"] != int(hidden):
+        return None
+    rows = int(rows)
+    if any(above < rows <= at_most for above, at_most in entry["bands"]):
+        return entry["record"]
+    return None
+
+
+def carried_modules(
+    arch: str,
+    hidden: int,
+    kind: str,
+    *,
+    rows: int,
+    sm_count: int,
+    sinkhorn_iters: int = SINKHORN_ITERS,
+) -> tuple[str, ...]:
+    """:func:`selected_modules` of a checkpoint-carry call: ``fwd_recompute`` with the
+    dual-layout fn split of :data:`FN_SPLIT_CARRY` in place of its fn split, ``bwd_finish``
+    without its fn split (it reads the carried transposed layout).  The callers decide the
+    band (:func:`fn_split_carry`); this names the launches for any token count."""
+
+    entry = FN_SPLIT_CARRY.get(arch)
+    if entry is None or MODULES[entry["record"]]["hidden"] != int(hidden):
+        raise ValueError(
+            f"no checkpoint carry of the {route_key(hidden, kind)!r} route on {arch!r}"
+        )
+    names = selected_modules(
+        arch, hidden, kind, rows=rows, sm_count=sm_count, sinkhorn_iters=sinkhorn_iters
+    )
+    if MODULES[names[0]]["role"] not in ("fn_split_fwd", "fn_split_bwd"):
+        raise ValueError(
+            f"the {route_key(hidden, kind)!r} route does not start with the fn split"
+        )
+    if kind == "fwd_recompute":
+        return (entry["record"],) + names[1:]
+    if kind == "bwd_finish":
+        return names[1:]
+    raise ValueError(f"the checkpoint carry has no {kind!r} route")
+
+
 SELECT_RULE_KINDS = (
     "rows_between",
     "ctas_band",
@@ -9511,6 +9624,7 @@ __all__ = [
     "BWD_TOKEN_BANDS",
     "BWD_TOKEN_PROGRAM",
     "BWD_TOKEN_REGIMES",
+    "FN_SPLIT_CARRY",
     "FN_SPLIT_GRID",
     "FN_SPLIT_PROGRAM",
     "FWD_COEF_REGIMES",
@@ -9533,8 +9647,10 @@ __all__ = [
     "bwd_reduce_program",
     "bwd_slab_program",
     "bwd_token_program",
+    "carried_modules",
     "device_arch",
     "enable_pdl",
+    "fn_split_carry",
     "fn_split_grid",
     "fn_split_program",
     "fwd_coef_program",
