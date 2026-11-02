@@ -47,13 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_TILE_OFF 0
-#define SMEM_TILE_STAGE_BYTES 12288
-#define SMEM_TILE_STRIDE 12288
-#define SMEM_TOTAL 12288
-#define THREADS 256
-
 #include <math_constants.h>
 
 __device__ __forceinline__ float2 sub_f32x2_noftz(float2 a, float2 b) {
