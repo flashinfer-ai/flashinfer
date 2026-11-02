@@ -54,7 +54,7 @@ gradient products run as BF16 x BF16 products with FP32 accumulation per token c
 ``chunk_size`` rows (a development aid: it materializes a ``[chunk_size, V]`` block and is not
 allocation-free).
 
-``backend="cake"`` runs the generated kernels (SM100 / SM103, CUDA tensors), with no ``[T, V]`` or
+``backend="cake"`` runs the generated kernels (SM100 / SM103 / SM107, CUDA tensors), with no ``[T, V]`` or
 ``[chunk, V]`` tensor in the sparse form:
 
 * the validation stage (int32 copies of int64 ids / offsets, clamped), then the logits at the support
@@ -860,10 +860,11 @@ DW_MODES = ("auto", "global", "chunked")
 # (sm_100a) and GB300 (sm_103a): the thresholds that minimize the summed step time (forward + backward, relative to
 # the best pass forms of each problem) over a calibration set of uniform, Zipf-distributed and group-shared supports
 # at H = 6144, V = 154880, T = 8192 / 16384 and mean support sizes 32 to 2048, and a recorded top-p sampling mask.
-# The rule cannot see how much the rows share their candidates.
+# The rule cannot see how much the rows share their candidates.  sm_107a (R200) takes sm_103a's thresholds.
 SUPPORT_DENSE_MIN_MEAN_K: dict[str, dict[str, int]] = {
     "sm_100a": {"F": 512, "X": 1029, "W": 508},
     "sm_103a": {"F": 508, "X": 1029, "W": 508},
+    "sm_107a": {"F": 508, "X": 1029, "W": 508},
 }
 # Global weight-gradient mode (one pair range, BF16 dW stored directly, no FP32 [V, H] accumulator) up to this many
 # pairs; above it the pairs are cut into ranges of ``chunk_size * ceil(M / T)`` pairs accumulated in FP32.
@@ -1034,7 +1035,7 @@ class _Cake:
 def _cake_context(device: torch.device) -> _Cake:
     if device.type != "cuda":
         raise ValueError(
-            "backend='cake' runs on CUDA tensors of a compute capability 10.0 / 10.3 device; use backend='reference'"
+            "backend='cake' runs on CUDA tensors of a compute capability 10.0 / 10.3 / 10.7 device; use backend='reference'"
         )
     module, record = record_for(device)
     record_abi(record)

@@ -1,4 +1,4 @@
-# Cake chunked LM-head + loss training backend (SM100 / SM103)
+# Cake chunked LM-head + loss training backend (SM100 / SM103 / SM107)
 
 Experimental backend for the chunked large-vocabulary LM-head projection with
 a fused log-sum-exp / cross-entropy / policy-gradient loss and a
@@ -7,8 +7,9 @@ memory-bounded backward (GLM-5.2 geometry: hidden size 6144, vocabulary
 chunk 4096).  Tracking issue: flashinfer-ai/flashinfer#5680.
 
 Both the API and the backend are experimental: no compatibility guarantee,
-SM100 (B200 / GB200) is the acceptance architecture and SM103 (B300 / GB300)
-is compiled from the same sources.  The feature does not participate in
+SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
+SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
+built for `sm_107a`, under the base dispatch rules).  The feature does not participate in
 automatic backend selection, autotuning or trace-apply.  Its libraries are
 loaded prebuilt from `aot/` when the package ships them and JIT-built by
 FlashInfer from `build.json` otherwise (see "Layout of this package").
@@ -22,6 +23,8 @@ loss = chunked_lm_head_det_loss(X, W, labels, objective="ce", loss_div=loss_div,
 loss, logp = chunked_lm_head_det_loss(X, W, labels, objective="policy", infer_logp=infer_logp,
                                       loss_weights=loss_weights, return_logp=True)
 logp = chunked_lm_head_det_logprob(X, W, labels, chunk_size=4096)   # differentiable [T] FP32
+logp = chunked_lm_head_det_logprob(X, W, labels, temperature=0.7)   # scalar temperature
+logp = chunked_lm_head_det_logprob(X, W, labels, temperature=tau)   # per-token: FP32 [T] on X's device
 ```
 
 `det`: for fixed inputs, hardware, chunk plan and initial accumulation
@@ -91,12 +94,13 @@ aliases of the same objects.
   selective activation checkpointing (`context_fn` of
   `create_selective_checkpoint_contexts`, whose recomputation replays the
   checkpointed forward's operators by position) every det entry -- the loss,
-  log-probability (default, budget, kept logits) and candidate-support
-  entries -- runs its forward with all active torch dispatch modes popped,
-  the checkpoint's and any user mode on the stack (a `FlopCounterMode` does
-  not see the entry's operators; a tracing mode such as `FakeTensorMode` or a
-  `torch.compile` trace gets real launches on fake inputs and fails loudly),
-  and behaves as in a plain non-reentrant checkpoint.
+  log-probability (default, budget, kept logits, with a temperature) and
+  candidate-support entries -- runs its forward with all active torch
+  dispatch modes popped, the checkpoint's and any user mode on the stack (a
+  `FlopCounterMode` does not see the entry's operators; a tracing mode such
+  as `FakeTensorMode` or a `torch.compile` trace gets real launches on fake
+  inputs and fails loudly), and behaves as in a plain non-reentrant
+  checkpoint.
   `"forward"`: every call with a trainable input forms the gradients in its
   forward (the previous behavior).  The same `loss`, `logp`, `dX` and `dW`
   bits either way; `chunked_lm_head_det_logprob` forms no gradient in its
@@ -109,6 +113,44 @@ aliases of the same objects.
   `compact_rows=False` and no caller's count counts its valid rows on the host
   in the backward; a caller's count checked with `check_num_valid_rows=True` is
   read back in the forward, never in the backward).
+* Temperature (`temperature`, a keyword of `chunked_lm_head_det_logprob` only,
+  default `None`, the same as `1.0`; `check_temperature`, default `False`):
+  `None` or a positive Python
+  number or a float32 `[T]` tensor on `X`'s device (one value per row, any
+  stride; not differentiable, so a tensor with `requires_grad=True` is
+  rejected).  `logp_t = z[t, y_t] / tau_t - logsumexp_v(z[t, v] / tau_t)` and
+  `dlogp_t / dz[t, v] = (1[v = y_t] - softmax(z_t / tau_t)_v) / tau_t`.  The
+  BF16 projection is unchanged: each BF16 logit is widened to FP32 and
+  divided once by an IEEE FP32 division (`q = RN(z / tau_t)`, the same `q` for
+  the statistics, the label logit and the gradient), and the upstream
+  `dlogp_t` is divided once per row (`RN(dlogp_t / tau_t)`); `dX` and `dW`
+  see the temperature only through `dz`.  A scalar `s` gives the same bits as
+  `torch.full((T,), s)`; `1.0` (and any value whose FP32 rounding is 1.0)
+  runs the path without a temperature, bitwise the same as omitting it.
+  Every value must be positive and finite, also on ignored rows (`-100`),
+  whose temperature reaches no output (`logp`, `dX`, `dW`): on CUDA a bad
+  tensor value stops the stream with a device-side assertion queued before the
+  first kernel that reads the temperature (no host synchronization; it ends the
+  CUDA context, like a wrong `num_valid_rows`), and `check_temperature=True`
+  reads the check back once and raises `ValueError` instead.  Outputs are defined while
+  `|z / tau_t| < 3e38` on every row.  The temperature runs the
+  log-probability arms' temperature forms (`gemm_logits_lbl_tau`,
+  `gemm_logits_dz_tau`, `row_finalize_tau` and, for the hidden valid-row count,
+  `gemm_logits_mcnt_tau`), so `logprob_lbl=False` / `logprob_dz=False` are
+  rejected with a temperature, and a record without these forms raises
+  `NotImplementedError` for a call with a temperature (never a fallback to the
+  kernels without it).  The forward saves the compact FP32 temperature rows
+  for the backward (`memory_report_temperature(..., temperature=True)` counts
+  them); a recount backward with a temperature (`backward_logprob_temperature`
+  without the forward's `row_index`) takes the host count.  The temperature
+  path has entry points of its own in both backend modules
+  (`chunked_lm_head_det_logprob_temperature`, `forward_logprob_temperature`,
+  `backward_logprob_temperature`, `prepare_lm_head_det_loss_temperature`,
+  `memory_report_temperature`); the public entry calls them only for a
+  `temperature` other than `None`, so a call without one runs the backend
+  entries without a temperature parameter.  `chunked_lm_head_det_loss` takes
+  no temperature, and `memory_mode="keep_logits"` takes none either
+  (`ValueError`; its gradient form `row_grad` has no temperature form).
 * Valid-row compaction (`compact_rows`, a keyword of every eager and autograd
   entry point, default `True`; `prepare_lm_head_det_loss` takes it as a bool or the
   valid-row tensor, default `False`): when some labels are `-100` the chunk loop runs over the valid rows
@@ -380,9 +422,13 @@ aliases of the same objects.
   it once (the autograd entries in their forward) and raises the same
   `ValueError` on a mismatch, whatever `compact_rows`, `memory_mode` or the
   inputs that need a gradient.  The count is not derived from `loss_div`.
-* First call of a process (`chunked_lm_head_det_preload(device=None)`,
-  `cake_backend_opt_in.preload`): loads every library of the device's architecture
-  (a JIT build when the package ships no `aot/` library), creates the
+* First call of a process (`chunked_lm_head_det_preload(device=None, *,
+  temperature=False)`, `cake_backend_opt_in.preload`): loads every library of
+  the device's architecture except the temperature forms
+  (a JIT build when the package ships no `aot/` library; `temperature=True`
+  also loads the temperature forms and launches the temperature path's
+  PyTorch operators once, so a caller that never passes a temperature builds
+  no temperature library), creates the
   per-device side stream (the process's first `torch.cuda.Stream`), the count
   cells and constants, launches the PyTorch operators of the valid-row count
   paths once and synchronizes.  It does not launch the package's kernels:
@@ -556,6 +602,11 @@ gather and logits GEMM ran before the count was known, see
   `logprob_dz`): `gemm_logits_lbl` writes the partials and `z_c` at the label
   column only (forward); `gemm_logits_dz` writes `dz_c` (the `row_grad`
   sequence below) in place of `z_c` (backward recompute, no `row_grad`).
+  Their temperature forms (`gemm_logits_lbl_tau`, `gemm_logits_dz_tau`, and
+  `gemm_logits_mcnt_tau` for chunk 0 of the hidden valid-row count) read the
+  compact per-row FP32 temperature and divide each BF16-rounded logit once
+  before the statistics and the `exp`; the `dz` form also divides its row's
+  `dlogp_t` once.  `row_finalize_tau` divides the label logit the same way.
 * `row_finalize`: one warp per row merges the partials into `lse`, gathers
   the selected logit, writes `logp` (0 on ignored rows) and, per objective,
   the per-row logit-gradient scale `d_t` and the loss term; the
@@ -612,7 +663,8 @@ gather and logits GEMM ran before the count was known, see
 The GEMM stages are registered as structural *forms* -- one stage name per
 kernel body the program carries, named by the outputs of the per-chunk rules
 the production launchers of the kernel source apply that select a different
-body (`cake_backend.stage_variant` / `parse_stage`; suffixes in this order).
+body (`cake_backend.stage_variant`, `stage_form` with the temperature forms'
+`_tau` last / `parse_stage`; suffixes in this order).
 The call geometry and the rules' numeric outputs are *launch scalars* of every
 form (`cake_backend.gemm_scalars`: `ldc` and `k_iters` from `H` / `V`, the
 K-slice count `k_slices` and slice length `k_slice_iters`, the raster height
@@ -741,7 +793,9 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
   from the compact tables the generated-program export writes between the
   `generated registry` markers; a stage's physical record names its program
   and the architecture-free `library` stem `cake_lm_head_det_loss_<unit>`), stage
-  names (`STAGES`, `BASE_STAGES`, `GEMM_STAGES`), record selection
+  names (`STAGES`, `BASE_STAGES`, `GEMM_STAGES`; the temperature forms in
+  `TEMPERATURE_GEMM_STAGES` / `TEMPERATURE_ROW_STAGES` and every name in
+  launch order in `STAGES_WITH_TEMPERATURE`), record selection
   (`select_module`) and the loader glue: `library_name(name, stage)` is the
   `build.json` entry `<library>_<arch>` that
   `load_cake_lm_head_det_loss_module(name, stage)` loads through `cake_build`.
@@ -782,23 +836,28 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
 
 ## Status
 
-The registry holds one record per architecture (`sm_100a`, `sm_103a`),
-`cake_lm_head_det_loss_<arch>`, geometry-free (`H` / `V` and the rules' outputs are
-launch scalars: every `H` a multiple of 512 and `V` a multiple of 256 runs on
-it), with the sixteen base stages above plus the sixteen structural forms the
-rules can reach (`abi = lm_head_loss_v1`) and the fourteen candidate-support
-programs (`cake_support.SUPPORT_STAGES`: the validation stage per index width,
-the two row stages, the gather and scatter of the dense form, the support
-logits gather GEMM and the segment gather-accumulate dX / dW / combine kernels
-in their BF16 and FP32-accumulate modes), exported from the kernel snapshot
-named in the pull request.  `tests/experimental/test_cake_lm_head_det_support.py`
-tests the candidate-support entries (host rules and the reference backend on
-any device, the cake backend on a registered device).
+The registry holds one record per architecture (`sm_100a`, `sm_103a`,
+`sm_107a`), `cake_lm_head_det_loss_<arch>`, geometry-free (`H` / `V` and the rules'
+outputs are launch scalars: every `H` a multiple of 512 and `V` a multiple of
+256 runs on it), with the sixteen base stages above plus the sixteen structural
+forms the rules can reach on `sm_100a` and `sm_103a` (`abi = lm_head_loss_v1`),
+the four temperature forms of the log-probability entry and the fourteen
+candidate-support programs (`cake_support.SUPPORT_STAGES`: the validation stage
+per index width, the two row stages, the gather and scatter of the dense form,
+the support logits gather GEMM and the segment gather-accumulate dX / dW /
+combine kernels in their BF16 and FP32-accumulate modes), exported from the
+kernel snapshot named in the pull request.  The `sm_107a` record registers
+every stage of the `sm_103a` record; no structural-form rule table lists
+`sm_107a`, so its rules reach five of the sixteen forms (the device-count
+logits forms and the K-sliced and 256-wide dX tiles).
+`tests/experimental/test_cake_lm_head_det_support.py` tests the candidate-support
+entries (host rules and the reference backend on any device, the cake backend
+on a registered device).
 
 Tests: `tests/experimental/test_cake_lm_head_det_loss.py` and the public-API suite
 `tests/experimental/test_cake_lm_head_det_loss_api.py` (the host-layer tests
 run on any device through the reference path; the device tests skip without a
-registered program or a compute capability 10.0 / 10.3 device), and the
+registered program or a compute capability 10.0 / 10.3 / 10.7 device), and the
 CPU-only `tests/experimental/test_cake_lm_head_det_loss_standalone.py` (a copy of
 the package imports with `flashinfer` blocked and raises its host-side errors;
 `scripts/check_cake_build_manifests.py --vendored-gate` builds and loads the
@@ -811,7 +870,8 @@ the loader refuses an older toolkit: `cake_build.jit_spec` raises and the JIT
 spec lists leave the entry out.  CUDA 12.8's ptxas cannot build the 256-bit
 global loads and stores (`ld.global.v8.b32` / `st.global.v8.b32`) of eight
 `sm_100a` programs, the logits GEMM among them ("Illegal vector size: 8");
-`sm_103a` needs 12.9 by its architecture floor.
+`sm_103a` needs 12.9 and `sm_107a` 13.4 by their architecture floors (every
+`sm_107a` entry has `min_cuda` 13.4).
 
 The `sm_100a` 2-CTA GEMM producer loops (logits, dX and dW) have two orders,
 and the toolkit that compiles them selects one.  Built by nvcc 12.9 or 13.0,

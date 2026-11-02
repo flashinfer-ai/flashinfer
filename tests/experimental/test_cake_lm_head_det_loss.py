@@ -41,6 +41,7 @@ from tests.test_helpers.cake_lm_head_loss_reference import (
     KNEE_MARGIN,
     error_report,
     make_inputs,
+    make_temperature,
     reference_fp64,
     reference_unchunked,
     rel_l2,
@@ -78,8 +79,10 @@ grid_dims = cake_backend.grid_dims
 lm_head_det_loss_workspace_size = cake_backend.lm_head_det_loss_workspace_size
 logprob_backward_binding_key = cake_backend.logprob_backward_binding_key
 memory_report = cake_backend.memory_report
+memory_report_temperature = cake_backend.memory_report_temperature
 plan_chunks = cake_backend.plan_chunks
 prepare_lm_head_det_loss = cake_backend.prepare_lm_head_det_loss
+prepare_lm_head_det_loss_temperature = cake_backend.prepare_lm_head_det_loss_temperature
 recommended_k_slices = cake_backend.recommended_k_slices
 record_abi = cake_backend.record_abi
 stage_values = cake_backend.stage_values
@@ -129,7 +132,7 @@ def _device_supported() -> bool:
 
 def _require_program(*, entry: str = "loss"):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 device")
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
     if not generated_program_available(torch.device("cuda"), entry=entry):
         pytest.skip(
             f"generated chunked LM-head program ({entry} entry) not registered for this device"
@@ -149,8 +152,11 @@ def _require_hidden_count():
 
 
 @contextlib.contextmanager
-def _cache(enabled: bool):
-    cache = cake_backend.BINDING_CACHE
+def _cache(enabled: bool, switches=()):
+    """Switch the binding cache of the module whose entry points ``_run`` calls with ``switches`` (the opt-in
+    module's own cache for an opt-in keyword) and yield it."""
+    be = opt_in if _OPT_IN_KEYWORDS & set(switches) else cake_backend
+    cache = be.BINDING_CACHE
     was = cache.enabled
     cache.enabled = enabled
     try:
@@ -166,6 +172,10 @@ def _host_inputs(T, objective="ce", *, seed=SEED, **kw):
 
 
 _OPT_IN_KEYWORDS = {"memory_mode", "num_valid_rows", "check_num_valid_rows"}
+
+
+# The keywords of the log-probability entries' temperature forms (``*_temperature``).
+TEMPERATURE_KEYWORDS = frozenset({"temperature", "check_temperature"})
 
 
 def _run(
@@ -188,9 +198,14 @@ def _run(
     ``test_cake_lm_head_det_loss_api.py``).  ``switches``: the remaining switch keywords (``dx_finalize``, ``dw_stream``,
     ``hidden_count``, ``gemm_tuning``; ``logprob_dz`` / ``logprob_lbl`` of the log-probability entry), passed
     through; ``memory_mode`` / ``num_valid_rows`` / ``check_num_valid_rows`` call the opt-in module's entry points;
-    ``keep`` calls the log-probability entry with the kept logits (``chunked_lm_head_det_logprob_keep``).  Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the leaves."""
+    ``keep`` calls the log-probability entry with the kept logits (``chunked_lm_head_det_logprob_keep``); the
+    log-probability entry also takes the inputs' ``temperature`` unless ``switches`` names one, and a call with
+    ``temperature`` or ``check_temperature`` goes to the module's ``chunked_lm_head_det_logprob_temperature``.
+    Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the leaves."""
     X = inp.X.detach().requires_grad_(train_x)
     W = inp.W.detach().requires_grad_(train_w)
+    if entry != "loss" and inp.temperature is not None:
+        switches.setdefault("temperature", inp.temperature)
     be = opt_in if _OPT_IN_KEYWORDS & switches.keys() else cake_backend
     if entry == "loss":
         loss, logp = be.chunked_lm_head_det_loss(
@@ -212,9 +227,12 @@ def _run(
         if train_x or train_w:
             (loss if scale is None else loss * scale).backward()
     else:
+        tau = TEMPERATURE_KEYWORDS & switches.keys()
         entry_fn = (
             cake_backend.chunked_lm_head_det_logprob_keep
             if keep
+            else be.chunked_lm_head_det_logprob_temperature
+            if tau
             else be.chunked_lm_head_det_logprob
         )
         logp = entry_fn(
@@ -358,6 +376,28 @@ def test_registry_records_are_well_formed():
         "scale_cast_f32",
         "scale_cast_scatter_bf16",
     )
+    # the temperature forms of the log-probability entry (flashinfer#7637) have tables of their own: a call
+    # without a temperature reads STAGES / GEMM_STAGES / ROW_STAGES / STAGE_TENSORS, which carry none of them
+    assert set(cake_backend.TEMPERATURE_STAGES) == set(TAU_STAGES)
+    assert (
+        cake_jit.TEMPERATURE_GEMM_STAGES + cake_jit.TEMPERATURE_ROW_STAGES == TAU_STAGES
+    )
+    assert not set(TAU_STAGES) & (
+        set(cake_jit.STAGES) | set(cake_jit.ROW_STAGES) | set(STAGE_TENSORS)
+    )
+    assert (
+        tuple(s for s in cake_jit.STAGES_WITH_TEMPERATURE if s not in TAU_STAGES)
+        == cake_jit.STAGES
+    )
+    assert len(cake_jit.STAGES_WITH_TEMPERATURE) == len(cake_jit.STAGES) + len(
+        TAU_STAGES
+    )
+    tau_tensors = cake_backend.TEMPERATURE_STAGE_TENSORS
+    assert set(tau_tensors) == set(TAU_STAGES)
+    for stage in TAU_STAGES:
+        base = cake_backend.base_stage(stage)
+        assert set(tau_tensors[stage]) == set(STAGE_TENSORS[base]) | {"temperature"}
+    assert not any("temperature" in tensors for tensors in STAGE_TENSORS.values())
     assert (
         tuple(s for s in cake_jit.STAGES if cake_backend.base_stage(s) == s)
         == cake_jit.BASE_STAGES
@@ -484,6 +524,70 @@ def test_registry_records_are_well_formed():
             f"csrc/cake_lm_head_det_loss/{p.name}"
             for p in unit_dir.glob("*_binding.cu")
         ) == sorted(used)
+
+
+def test_registry_temperature_forms_are_well_formed():
+    """The temperature forms (:func:`cake_jit.registered_stages_with_temperature`; outside ``STAGES``, so
+    :func:`test_registry_records_are_well_formed` does not reach them) pass its per-stage checks: every record
+    registers the four, each with a ``build.json`` entry of its own, an argument plan of its twin's host values plus
+    ``temperature``, kernel and binding sources that exist and name its symbol, and its twin's cluster in the geometry
+    a call with a temperature binds with (``_TemperatureGeometry``, which declares every other stage's cluster as
+    :class:`Geometry` does)."""
+    manifest = cake_build.manifest()
+    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
+    package = Path(cake_jit.__file__).resolve().parent
+    twin = {
+        "gemm_logits_mcnt_tau": "gemm_logits_mcnt",
+        "gemm_logits_dz_tau": "gemm_logits_dz",
+        "gemm_logits_lbl_tau": "gemm_logits_lbl",
+        "row_finalize_tau": "row_finalize",
+    }
+    for name, record in cake_jit.MODULES.items():
+        stages = cake_jit.registered_stages_with_temperature(name)
+        assert set(TAU_STAGES) <= set(stages) <= set(cake_jit.STAGES_WITH_TEMPERATURE)
+        geometry = Geometry.from_record(record)
+        bound = cake_backend._TemperatureGeometry.of(geometry)
+        for stage in TAU_STAGES:
+            physical = record[stage]
+            assert physical["module"] and physical["ffi_entry"]
+            unit = physical["module"].removeprefix("cake_lm_head_det_loss_")
+            assert physical["library"] == cake_jit.library_stem(unit)
+            entry = libraries[cake_jit.library_name(name, stage)]
+            assert entry["arch"] == record["arch"]
+            assert entry["path"] == f"aot/{entry['name']}.so"
+            assert entry["entry"] == physical["ffi_entry"]
+            assert len(entry["closure_sha256"]) == 64
+            assert len(entry["sources"]) == 2
+            assert set(entry["sha256"]) == set(entry["sources"])
+            names = [n for _, n in physical["arg_plan"]]
+            assert len(names) == len(set(names)) and "temperature" in names
+            allowed = _STAGE_VALUES[twin[stage]] | {"temperature"}
+            for kind, arg in physical["arg_plan"]:
+                assert kind in {
+                    "buffer",
+                    "tma_buffer",
+                    "workspace",
+                    "parameter",
+                    "grid",
+                }
+                if kind == "grid":
+                    assert arg in ("grid_x", "grid_y", "grid_z")
+                else:
+                    assert CONTRACT_ALIASES.get(arg, arg) in allowed, (stage, arg)
+            assert int(physical.get("tma_workspace_bytes", 0)) >= 0
+            assert int(physical.get("workspace_bytes", 0)) >= 0
+            kernel, binding = (s.removeprefix("csrc/") for s in entry["sources"])
+            kernel_unit, defined = _kernel_source_symbol(entry, package)
+            assert (
+                kernel
+                == f"cake_lm_head_det_loss/cake_lm_head_det_loss_{kernel_unit}_kernel.cu"
+            )
+            assert defined == f"kernel_{physical['module']}"
+            assert (package / "csrc" / kernel).is_file()
+            assert (package / "csrc" / binding).is_file()
+            assert bound.cluster_ctas_of(stage) == geometry.cluster_ctas_of(twin[stage])
+        for stage in cake_jit.STAGES:
+            assert bound.cluster_ctas_of(stage) == geometry.cluster_ctas_of(stage)
 
 
 @pytest.mark.parametrize("C", [4096, 2048, 8192])
@@ -1080,10 +1184,11 @@ def test_stage_variant_grammar():
         "swab",
         "blocked",
         "epi_store",
+        "temperature",
     )
     for stage in cake_jit.STAGES:
         base, knobs = cake_backend.parse_stage(stage)
-        assert base in bases and cake_backend.stage_variant(base, **knobs) == stage
+        assert base in bases and cake_backend.stage_form(base, **knobs) == stage
         assert tuple(knobs) == cake_backend.STAGE_KNOBS
     # the device-count form of the logits GEMMs (the hidden valid-row count's chunk 0), first in the suffix order
     assert cake_backend.stage_variant("gemm_logits", count=True) == "gemm_logits_mcnt"
@@ -1102,6 +1207,7 @@ def test_stage_variant_grammar():
             "swab": False,
             "blocked": False,
             "epi_store": None,
+            "temperature": False,
         },
     )
     assert cake_backend.base_stage("gemm_logits_nostats_mcnt") == "gemm_logits_nostats"
@@ -1130,6 +1236,7 @@ def test_stage_variant_grammar():
             "swab": False,
             "blocked": False,
             "epi_store": None,
+            "temperature": False,
         },
     )
     assert cake_backend.parse_stage("gemm_dx_tn256")[1]["tile_n"] == 256
@@ -1148,6 +1255,7 @@ def test_stage_variant_grammar():
         swab=False,
         blocked=False,
         epi_store=None,
+        temperature=False,
     )
     # the 2-D blocked weight-gradient raster (the block width is a launch scalar)
     assert cake_backend.stage_variant("gemm_dw_acc", blocked=True) == "gemm_dw_acc_gn"
@@ -1166,6 +1274,7 @@ def test_stage_variant_grammar():
             swab=False,
             blocked=True,
             epi_store=None,
+            temperature=False,
         ),
     )
     assert cake_backend.stage_variant("gemm_dw_acc", epi_store="redsm") == "gemm_dw_acc"
@@ -1189,6 +1298,7 @@ def test_stage_variant_grammar():
             swab=False,
             blocked=False,
             epi_store="tma",
+            temperature=False,
         ),
     )
     assert cake_backend.stage_variant("gemm_dx", swab=True) == "gemm_dx_swab"
@@ -1211,8 +1321,69 @@ def test_stage_variant_grammar():
             swab=True,
             blocked=False,
             epi_store=None,
+            temperature=False,
         ),
     )
+    # the temperature forms of the log-probability entry (flashinfer#7637): the logits GEMM arms, the device-count
+    # logits GEMM with the statistics and row_finalize, suffix ``_tau`` last
+    assert (
+        cake_backend.stage_form("gemm_logits_lbl", temperature=True)
+        == "gemm_logits_lbl_tau"
+    )
+    assert (
+        cake_backend.stage_form("gemm_logits_dz", temperature=True)
+        == "gemm_logits_dz_tau"
+    )
+    assert (
+        cake_backend.stage_form("gemm_logits", count=True, temperature=True)
+        == "gemm_logits_mcnt_tau"
+    )
+    assert (
+        cake_backend.stage_form("row_finalize", temperature=True) == "row_finalize_tau"
+    )
+    assert cake_backend.parse_stage("gemm_logits_mcnt_tau") == (
+        "gemm_logits",
+        dict(
+            count=True,
+            sliced=False,
+            tile_n=None,
+            stages=None,
+            split=False,
+            swab=False,
+            blocked=False,
+            epi_store=None,
+            temperature=True,
+        ),
+    )
+    for stage in TAU_STAGES:
+        base = cake_backend.base_stage(stage)
+        assert stage == base + ("_mcnt_tau" if stage.endswith("_mcnt_tau") else "_tau")
+        assert cake_backend.parse_stage(stage)[1]["temperature"] is True
+    assert cake_backend.base_stage("row_finalize_tau") == "row_finalize"
+    for bad in (
+        # the temperature form of gemm_logits is the device-count one only
+        dict(base="gemm_logits"),
+        dict(base="gemm_logits_nostats"),
+        dict(base="gemm_logits_nostats", count=True),
+        dict(base="row_grad"),
+        dict(base="loss_reduce"),
+        dict(base="gemm_dx"),
+        dict(base="gemm_dw_acc"),
+        dict(base="gather_rows_bf16"),
+    ):
+        with pytest.raises(ValueError):
+            cake_backend.stage_form(bad.pop("base"), temperature=True, **bad)
+    for bad_name in (
+        "gemm_logits_tau",
+        "gemm_logits_nostats_tau",
+        "gemm_logits_tau_mcnt",
+        "gemm_logits_dz_tau_tau",
+        "row_grad_tau",
+        "gemm_dx_tau",
+        "row_finalize_tau_tma",
+    ):
+        with pytest.raises(ValueError):
+            cake_backend.parse_stage(bad_name)
     assert (
         cake_backend.dx_stage(2) == "gemm_dx_s"
         and cake_backend.dx_stage(4) == "gemm_dx_s"
@@ -2992,6 +3163,8 @@ def test_reachable_variants_complete_the_rule_closure():
         set(cake_jit.BASE_STAGES) | rv(bases, "sm_103a", 4) | rv(bases, "sm_100a", 4)
     )
     assert len(cake_jit.STAGES) == 32
+    # no rule reaches a temperature form (the call's temperature selects it: flashinfer#7637)
+    assert not set(TAU_STAGES) & (rv(bases, "sm_103a", 4) | rv(bases, "sm_100a", 4))
     assert (
         cake_backend.dx_max_slices(cake_jit.STAGES) == cake_backend.DX_K_SLICES_MAX == 4
     )
@@ -6891,7 +7064,7 @@ def test_budget_plan_keys():
 
 
 # ---------------------------------------------------------------------------
-# Device tests (compute capability 10.0 / 10.3 with a registered program; the pinned
+# Device tests (compute capability 10.0 / 10.3 / 10.7 with a registered program; the pinned
 # GLM-class geometry H = 6144, V = 154880 with small T)
 # ---------------------------------------------------------------------------
 
@@ -7737,7 +7910,9 @@ def test_device_dw_cast_tma_is_bitwise_the_shipped_cast(glm_weight, tail):
     """The bf16 fused cast's TMA store on the last chunk of a 2- or 3-chunk call (tails 1 .. 1792; 1793 keeps the
     shipped cast) gives the bits of the shipped cast (``"dw": {"epi_store": None}``) on every entry and objective."""
     _require_program(entry="loss")
-    module_name, _ = cake_backend.record_for(CUDA)
+    module_name, record = cake_backend.record_for(CUDA)
+    if record["arch"] not in cake_backend.DW_CAST_TMA_MAX_ROWS:
+        pytest.skip(f"no TMA-store dW cast on {record['arch']}")
     assert "gemm_dw_cast_bf16_tma" in cake_jit.registered_stages(module_name)
     C = 2048
     shipped = {"gemm_tuning": {"dw": {"epi_store": None}}}
@@ -7762,7 +7937,9 @@ def test_device_dw_cast_tma_adversarial_old_sum_is_bitwise(glm_weight):
     overflow): the TMA store (rows 1 .. 1792, the default) and the shipped cast (an explicit ``epi_store``) give the
     same bf16 bits for every tail and upstream scale, and the old sum is only read."""
     _require_program(entry="loss")
-    module_name, _ = cake_backend.record_for(CUDA)
+    module_name, record = cake_backend.record_for(CUDA)
+    if record["arch"] not in cake_backend.DW_CAST_TMA_MAX_ROWS:
+        pytest.skip(f"no TMA-store dW cast on {record['arch']}")
     assert "gemm_dw_cast_bf16_tma" in cake_jit.registered_stages(module_name)
     H, V = DEFAULT_H, DEFAULT_V
     gen = torch.Generator(device=CUDA).manual_seed(SEED + 97)
@@ -8988,9 +9165,12 @@ def _budget_step(inp, C, entry, **kw):
         loss.backward()
         loss = loss.detach()
     else:
-        logp = opt_in.chunked_lm_head_det_logprob(
-            X, W, inp.labels, chunk_size=C, backend="cake", **kw
+        entry_fn = (
+            opt_in.chunked_lm_head_det_logprob_temperature
+            if TEMPERATURE_KEYWORDS & kw.keys()
+            else opt_in.chunked_lm_head_det_logprob
         )
+        logp = entry_fn(X, W, inp.labels, chunk_size=C, backend="cake", **kw)
         logp.backward(inp.dlogp)
         loss = None
     torch.cuda.synchronize()
@@ -9533,6 +9713,1987 @@ def test_device_preload(glm_weight):
     ) and index in cake_backend._thread_state("cells")
     assert cake_backend._thread_state("arange")[index].numel() >= opt_in.PRELOAD_ROWS
     _assert_same_bits(before, _run(inp, 4096, backend="cake"))
+
+
+# ---------------------------------------------------------------------------
+# Temperature of the log-probability entry (flashinfer#7637)
+# ---------------------------------------------------------------------------
+#
+# ``temperature`` -- a positive finite Python number or CPU scalar, or an FP32 ``[T]`` tensor -- divides each row's
+# FP32 logits after the unchanged BF16 projection: ``q = RN(f32(bf16(acc)) / tau_t)``, ``logp_t = q[t, y_t] -
+# logsumexp_v q[t, v]`` and ``dz[t, v] = RN(dlogp_t / tau_t) * (1[v = y_t] - p_v)``.  A value that rounds to FP32 1.0
+# runs the call without a temperature (no new operation); a scalar runs the temperature kernels with the constant
+# ``[T]`` vector of its FP32 value.  Invalid values are errors on every row, ignored rows included.
+
+TAU_STAGES = (
+    "gemm_logits_mcnt_tau",
+    "gemm_logits_dz_tau",
+    "gemm_logits_lbl_tau",
+    "row_finalize_tau",
+)
+# the stages a temperature call never binds on the generated program (their temperature forms replace them)
+_UNTAU_STAGES = frozenset(
+    (
+        "gemm_logits",
+        "gemm_logits_mcnt",
+        "gemm_logits_nostats",
+        "gemm_logits_nostats_mcnt",
+        "gemm_logits_dz",
+        "gemm_logits_lbl",
+        "row_finalize",
+        "row_grad",
+    )
+)
+_LOGPROB_KEYS = ("logp", "dX", "dW")
+
+
+def _tau_with(inp, value, *, ignored):
+    """The heterogeneous temperature of ``inp``'s problem with ``value`` at its first valid (``ignored=False``) or
+    first ignored row."""
+    tau = make_temperature(inp.T, "hetero", seed=inp.seed, device=inp.X.device).clone()
+    rows = (~inp.valid if ignored else inp.valid).nonzero().reshape(-1)
+    tau[int(rows[0])] = value
+    return tau
+
+
+def _cuda_temperature():
+    if not torch.cuda.is_available():
+        pytest.skip("a CUDA scalar needs a CUDA device")
+    return torch.tensor(0.7, device="cuda")
+
+
+def _other_device():
+    return "cpu" if DEV.type == "cuda" else "meta"
+
+
+# ``case -> (kind, make(inp))``: "host" -- rejected from the host values alone (type, shape, dtype, device,
+# ``requires_grad``, a scalar's value); "value" -- a per-token tensor's values (read directly on the host; on a CUDA
+# device a device assertion, so these run with ``check_temperature=True`` there)
+_TAU_REJECTS = {
+    "zero": ("host", lambda inp: 0.0),
+    "negative": ("host", lambda inp: -1.0),
+    "nan": ("host", lambda inp: float("nan")),
+    "inf": ("host", lambda inp: float("inf")),
+    "negative_inf": ("host", lambda inp: float("-inf")),
+    "fp32_underflow": ("host", lambda inp: 1e-50),
+    "fp32_overflow": ("host", lambda inp: 1e39),
+    "int_overflow": ("host", lambda inp: 10**400),
+    "bool": ("host", lambda inp: True),
+    "int_zero": ("host", lambda inp: 0),
+    "string": ("host", lambda inp: "0.7"),
+    "list": ("host", lambda inp: [0.7] * inp.T),
+    "zero_dim_zero": ("host", lambda inp: torch.tensor(0.0)),
+    "zero_dim_nan": ("host", lambda inp: torch.tensor(float("nan"))),
+    "zero_dim_requires_grad": (
+        "host",
+        lambda inp: torch.tensor(0.7, requires_grad=True),
+    ),
+    "zero_dim_cuda": ("host", lambda inp: _cuda_temperature()),
+    "fp64": (
+        "host",
+        lambda inp: torch.full((inp.T,), 0.7, dtype=torch.float64, device=DEV),
+    ),
+    "bf16": (
+        "host",
+        lambda inp: torch.full((inp.T,), 0.7, dtype=torch.bfloat16, device=DEV),
+    ),
+    "int64": ("host", lambda inp: torch.ones(inp.T, dtype=torch.int64, device=DEV)),
+    "column": ("host", lambda inp: torch.full((inp.T, 1), 0.7, device=DEV)),
+    "longer": ("host", lambda inp: torch.full((inp.T + 1,), 0.7, device=DEV)),
+    "shorter": ("host", lambda inp: torch.full((inp.T - 1,), 0.7, device=DEV)),
+    "wrong_device": (
+        "host",
+        lambda inp: torch.full((inp.T,), 0.7, device=_other_device()),
+    ),
+    "requires_grad": (
+        "host",
+        lambda inp: torch.full((inp.T,), 0.7, device=DEV, requires_grad=True),
+    ),
+    "zero_at_valid_row": ("value", lambda inp: _tau_with(inp, 0.0, ignored=False)),
+    "negative_zero_at_valid_row": (
+        "value",
+        lambda inp: _tau_with(inp, -0.0, ignored=False),
+    ),
+    "negative_at_valid_row": (
+        "value",
+        lambda inp: _tau_with(inp, -0.5, ignored=False),
+    ),
+    "nan_at_valid_row": (
+        "value",
+        lambda inp: _tau_with(inp, float("nan"), ignored=False),
+    ),
+    "inf_at_valid_row": (
+        "value",
+        lambda inp: _tau_with(inp, float("inf"), ignored=False),
+    ),
+    # the issue: nonpositive / nonfinite temperatures are errors, ignored rows included
+    "zero_at_ignored_row": ("value", lambda inp: _tau_with(inp, 0.0, ignored=True)),
+    "nan_at_ignored_row": (
+        "value",
+        lambda inp: _tau_with(inp, float("nan"), ignored=True),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_TAU_REJECTS))
+def test_temperature_rejects(case):
+    """Every invalid ``temperature`` is a ``ValueError`` naming it, from the autograd entry and the eager forward,
+    with and without ``check_temperature`` (a per-token tensor's values on a CUDA device: with it; without it they are
+    a device assertion, ``test_device_temperature_assertion_stops_the_stream``): a nonpositive / nonfinite value,
+    one that rounds to FP32 zero or infinity, an int past the float range, a bool, a non-number, a 0-dim CUDA scalar
+    (reading it would synchronize), a tensor that is not FP32 ``[T]`` on the inputs' device or that requires a
+    gradient (the temperature is not differentiable), a nonpositive / nonfinite entry at a valid or an ignored row."""
+    kind, make = _TAU_REJECTS[case]
+    inp = _host_inputs(37, ignore_frac=0.2)
+    value = make(inp)
+    for check in (False, True) if kind == "host" or DEV.type != "cuda" else (True,):
+        with pytest.raises(ValueError, match="temperature"):
+            cake_backend.chunked_lm_head_det_logprob_temperature(
+                inp.X,
+                inp.W,
+                inp.labels,
+                chunk_size=16,
+                backend="reference",
+                temperature=value,
+                check_temperature=check,
+            )
+        with pytest.raises(ValueError, match="temperature"):
+            cake_backend.forward_logprob_temperature(
+                inp.X,
+                inp.W,
+                inp.labels,
+                chunk_size=16,
+                backend="reference",
+                temperature=value,
+                check_temperature=check,
+            )
+
+
+def test_temperature_accepts_numbers_and_strided_tensors():
+    """A Python number, a 0-dim CPU tensor (any float dtype: rounded once to FP32) and a non-contiguous FP32 ``[T]``
+    tensor (a stride-0 expanded scalar, a stride-2 view) give the bits of the contiguous constant tensor; a Python
+    int is that number."""
+    inp = _host_inputs(37, ignore_frac=0.2)
+    s = 0.7
+    full = _run(
+        inp,
+        16,
+        entry="logprob",
+        temperature=torch.full((37,), s, dtype=torch.float32, device=DEV),
+    )
+    for value in (
+        s,
+        torch.tensor(s),
+        torch.tensor(s, dtype=torch.float64),
+        torch.tensor(s, dtype=torch.float32, device=DEV).expand(37),
+        torch.full((74,), s, dtype=torch.float32, device=DEV)[::2],
+    ):
+        _assert_same_bits(
+            full, _run(inp, 16, entry="logprob", temperature=value), _LOGPROB_KEYS
+        )
+    _assert_same_bits(
+        _run(inp, 16, entry="logprob", temperature=2),
+        _run(inp, 16, entry="logprob", temperature=2.0),
+        _LOGPROB_KEYS,
+    )
+
+
+@pytest.mark.parametrize("compact", [True, False])
+def test_temperature_one_runs_the_default_path(compact, monkeypatch):
+    """``None``, ``1.0``, ``1``, ``tensor(1.0)`` and a value that rounds to FP32 1.0 run the call without a
+    temperature -- the temperature-rows helper is never called -- and a ones tensor runs the temperature path; all of
+    them give the bits of the call without the keyword, with and without ``check_temperature``."""
+    inp = _host_inputs(37, ignore_frac=0.2)
+    base = _run(inp, 16, entry="logprob", compact_rows=compact)
+    made: list = []
+    real = cake_backend._temperature_rows
+
+    def spy(*args, **kwargs):
+        made.append(args)  # every call, also one that would return None
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "_temperature_rows", spy)
+    for value in (None, 1.0, 1, torch.tensor(1.0), 1.0 + 1e-9):
+        made.clear()
+        for check in (False, True):
+            result = _run(
+                inp,
+                16,
+                entry="logprob",
+                compact_rows=compact,
+                temperature=value,
+                check_temperature=check,
+            )
+            _assert_same_bits(base, result, _LOGPROB_KEYS)
+        assert not made, value
+    ones = _run(
+        inp,
+        16,
+        entry="logprob",
+        compact_rows=compact,
+        temperature=torch.ones(37, dtype=torch.float32, device=DEV),
+    )
+    assert made
+    _assert_same_bits(base, ones, _LOGPROB_KEYS)
+
+
+@pytest.mark.parametrize("s", [0.7, 2.0])
+def test_temperature_scalar_equals_the_constant_tensor(s):
+    """A scalar temperature gives the bits of the constant FP32 tensor of its value (the same values reach the same
+    stages), differs from the call without one and passes the accuracy gates of its references."""
+    inp = _host_inputs(37, ignore_frac=0.2)
+    scalar = _run(inp, 16, entry="logprob", temperature=s)
+    tensor = _run(
+        inp,
+        16,
+        entry="logprob",
+        temperature=torch.full((37,), s, dtype=torch.float32, device=DEV),
+    )
+    _assert_same_bits(scalar, tensor, _LOGPROB_KEYS)
+    plain = _run(inp, 16, entry="logprob")
+    assert not torch.equal(scalar["logp"], plain["logp"])
+    _check_against_references(scalar, replace(inp, temperature=s), entry="logprob")
+
+
+@pytest.mark.parametrize(
+    "T, C, frac",
+    [
+        (1, 256, 0.0),
+        (255, 256, 0.05),
+        (255, 512, 0.5),
+        (513, 256, 0.5),
+        (513, 512, 0.05),
+        (1031, 256, 0.05),
+        (1031, 512, "all_but_one"),
+    ],
+)
+def test_temperature_heterogeneous_matches_the_references(T, C, frac):
+    """A heterogeneous per-token temperature (log-uniform in [0.25, 4], some rows exactly 1.0) on irregular ``T``,
+    with no / some / half / all but one of the rows ignored: ``logp`` / ``dX`` / ``dW`` within 1.05x the unchunked
+    PyTorch path's error against the FP64 oracle (both with the temperature) plus the floor, zeros on ignored rows."""
+    ignore = (T - 1) / T if frac == "all_but_one" else float(frac)
+    inp = _host_inputs(T, ignore_frac=ignore, temperature="hetero")
+    result = _run(inp, C, entry="logprob")
+    _check_dtypes(result, inp)
+    _check_against_references(result, inp, entry="logprob")
+    assert torch.all(result["logp"][~inp.valid] == 0)
+    assert torch.all(result["dX"][~inp.valid] == 0)
+
+
+@pytest.mark.parametrize("frac", ["none", "five_percent", "half", "all_but_one"])
+def test_temperature_compaction_matches_uncompacted(frac):
+    """The temperature follows its rows through the compaction (as ``test_compaction_matches_uncompacted``): the
+    compacted and uncompacted calls with a heterogeneous temperature are bitwise when no row is ignored and at the
+    host's precision level otherwise; the caller's count gives the bits of the counted compacted call; a temperature
+    moved by one row breaks the comparison (the check is not vacuous)."""
+    T, C = 37, 16
+    ignore = {
+        "none": 0.0,
+        "five_percent": 0.05,
+        "half": 0.5,
+        "all_but_one": (T - 1) / T,
+    }[frac]
+    inp = _host_inputs(T, ignore_frac=ignore, temperature="hetero")
+    num_ignored = int((~inp.valid).sum())
+    compact = _run(inp, C, entry="logprob", compact_rows=True)
+    plain = _run(inp, C, entry="logprob", compact_rows=False)
+    for result in (compact, plain):
+        _check_against_references(result, inp, entry="logprob")
+        assert torch.all(result["logp"][~inp.valid] == 0)
+        assert torch.all(result["dX"][~inp.valid] == 0)
+    if num_ignored == 0:
+        for key in _LOGPROB_KEYS:
+            assert torch.equal(compact[key], plain[key]), key
+    else:
+        assert torch.allclose(compact["logp"], plain["logp"], rtol=1e-5, atol=2e-5)
+        assert rel_l2(compact["dX"].float(), plain["dX"].float()) <= 1e-3
+        assert rel_l2(compact["dW"].float(), plain["dW"].float()) <= 1e-3
+    given = _run(
+        inp, C, entry="logprob", compact_rows=True, num_valid_rows=T - num_ignored
+    )
+    _assert_same_bits(compact, given, _LOGPROB_KEYS)
+    shifted = _run(
+        replace(inp, temperature=torch.roll(inp.temperature, 1)),
+        C,
+        entry="logprob",
+        compact_rows=True,
+    )
+    assert (shifted["logp"] - compact["logp"])[inp.valid].abs().max() > 1e-3
+
+
+def test_temperature_upstream_gradients():
+    """Arbitrary per-row upstream gradients with a heterogeneous temperature: random (nonzero on ignored rows too),
+    zeros, negated, large -- each within the gates of its references; zeros give zero gradients, the negated upstream
+    the negated gradients and twice the upstream twice the gradients (exact operations), and a retained graph
+    repeats the backward bitwise."""
+    inp = _host_inputs(65, ignore_frac=0.1, temperature="hetero")
+    base = _run(inp, 32, entry="logprob")
+    gen = torch.Generator(device=DEV)
+    gen.manual_seed(SEED + 7637)
+    upstream = dict(
+        random=torch.randn(65, generator=gen, device=DEV),
+        zeros=torch.zeros(65, device=DEV),
+        negated=-inp.dlogp,
+        large=inp.dlogp * 1e4,
+    )
+    results = {}
+    for name, g in upstream.items():
+        g_inp = replace(inp, dlogp=g.contiguous())
+        results[name] = _run(g_inp, 32, entry="logprob")
+        _check_against_references(results[name], g_inp, entry="logprob")
+        assert torch.equal(results[name]["logp"], base["logp"]), name
+    assert torch.all(results["zeros"]["dX"] == 0) and torch.all(
+        results["zeros"]["dW"] == 0
+    )
+    assert torch.equal(results["negated"]["dX"], -base["dX"])
+    assert torch.equal(results["negated"]["dW"], -base["dW"])
+    twice = _run(inp, 32, entry="logprob", scale=2.0)
+    assert torch.equal(twice["dX"], (2.0 * base["dX"].float()).to(torch.bfloat16))
+    assert torch.equal(twice["dW"], (2.0 * base["dW"].float()).to(torch.bfloat16))
+    X = inp.X.detach().requires_grad_()
+    W = inp.W.detach().requires_grad_()
+    logp = cake_backend.chunked_lm_head_det_logprob_temperature(
+        X,
+        W,
+        inp.labels,
+        chunk_size=32,
+        backend="reference",
+        temperature=inp.temperature,
+    )
+    first = torch.autograd.grad(logp, (X, W), inp.dlogp, retain_graph=True)
+    second = torch.autograd.grad(logp, (X, W), inp.dlogp)
+    for a, b, ref in zip(first, second, (base["dX"], base["dW"]), strict=True):
+        assert torch.equal(a, b) and torch.equal(a, ref)
+
+
+def test_temperature_frozen_inputs():
+    """Frozen ``X``, frozen ``W`` or both with a heterogeneous temperature: the one-sided gradients equal the
+    two-sided ones, ``logp`` is unchanged."""
+    inp = _host_inputs(37, ignore_frac=0.1, temperature="hetero")
+    both = _run(inp, 16, entry="logprob")
+    x_only = _run(inp, 16, entry="logprob", train_w=False)
+    w_only = _run(inp, 16, entry="logprob", train_x=False)
+    neither = _run(inp, 16, entry="logprob", train_x=False, train_w=False)
+    assert x_only["dW"] is None and w_only["dX"] is None
+    assert neither["dX"] is None and neither["dW"] is None
+    assert torch.equal(x_only["dX"], both["dX"])
+    assert torch.equal(w_only["dW"], both["dW"])
+    for r in (x_only, w_only, neither):
+        assert torch.equal(r["logp"], both["logp"])
+
+
+def test_temperature_keywords():
+    """``temperature`` and ``check_temperature`` are keyword-only arguments of the log-probability temperature
+    entries (the default resolves to no temperature; ``check_temperature`` defaults to ``False``) and of no entry
+    without the suffix (the log-probability entries keep their signatures) nor any loss entry; the checked call of a
+    valid temperature gives the bits of the unchecked one."""
+    for fn in (
+        cake_backend.chunked_lm_head_det_logprob_temperature,
+        cake_backend.forward_logprob_temperature,
+    ):
+        params = inspect.signature(fn).parameters
+        for name in ("temperature", "check_temperature"):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, (
+                fn.__name__,
+                name,
+            )
+        assert params["check_temperature"].default is False, fn.__name__
+        assert (
+            cake_backend._resolve_temperature(
+                params["temperature"].default, 4, torch.device("cpu")
+            )
+            is None
+        ), fn.__name__
+    for fn in (
+        cake_backend.chunked_lm_head_det_loss,
+        cake_backend.forward_loss,
+        cake_backend.backward_loss,
+        cake_backend.chunked_lm_head_det_logprob,
+        cake_backend.forward_logprob,
+        cake_backend.backward_logprob,
+    ):
+        params = inspect.signature(fn).parameters
+        assert "temperature" not in params and "check_temperature" not in params
+    inp = _host_inputs(37, ignore_frac=0.2, temperature="hetero")
+    _assert_same_bits(
+        _run(inp, 16, entry="logprob"),
+        _run(inp, 16, entry="logprob", check_temperature=True),
+        _LOGPROB_KEYS,
+    )
+
+
+def test_temperature_resolution():
+    """``_resolve_temperature(temperature, T, device, *, check=False)`` (shared with flashinfer#7636): ``None`` for no
+    temperature and every value that rounds to FP32 1.0; ``("scalar", s)`` with ``s`` the FP32 value of a positive
+    finite number or CPU scalar; ``("tensor", tau)`` with ``tau`` FP32 ``[T]`` holding the caller's values."""
+    resolve = cake_backend._resolve_temperature
+    cpu = torch.device("cpu")
+    for value in (None, 1.0, 1, torch.tensor(1.0), 1.0 + 1e-9):
+        assert resolve(value, 5, cpu) is None, value
+    fp32 = float(torch.tensor(0.7, dtype=torch.float32))
+    for value in (0.7, torch.tensor(0.7), torch.tensor(0.7, dtype=torch.float64)):
+        form, s = resolve(value, 5, cpu)
+        assert form == "scalar" and float(s) == fp32, value
+    assert resolve(1.0 + 2.0**-23, 5, cpu)[0] == "scalar"  # the next FP32 value above 1
+    tau = torch.tensor([0.5, 1.0, 2.0, 3.0, 0.25])
+    form, t = resolve(tau, 5, cpu)
+    assert form == "tensor" and t.dtype == torch.float32 and tuple(t.shape) == (5,)
+    assert torch.equal(t, tau)
+    form, t = resolve(torch.tensor(0.7).expand(5), 5, cpu)
+    assert form == "tensor" and torch.equal(t, torch.full((5,), 0.7))
+    form, t = resolve(torch.empty(0), 0, cpu)
+    assert form == "tensor" and t.numel() == 0
+    with pytest.raises(ValueError, match="temperature"):
+        resolve(torch.zeros(5), 5, cpu, check=True)
+
+
+def test_temperature_all_ignored_rows(monkeypatch):
+    """Every row ignored with a temperature: zeros without a binding or a launch, and the temperature is still
+    validated; ``T == 0`` with an empty temperature returns an empty ``logp``."""
+
+    def refuse(*args, **kwargs):
+        raise AssertionError(
+            "a call whose every row is ignored must neither bind nor launch"
+        )
+
+    monkeypatch.setattr(cake_backend, "prepare_lm_head_det_loss", refuse)
+    monkeypatch.setattr(cake_backend, "prepare_lm_head_det_loss_temperature", refuse)
+    monkeypatch.setattr(cake_backend, "record_for", refuse)
+    inp = _host_inputs(37, ignore_frac=1.0, temperature="hetero")
+    cache = cake_backend.BINDING_CACHE
+    hits, misses = cache.hits, cache.misses
+    for value in (inp.temperature, 0.7):
+        result = _run(inp, 16, entry="logprob", compact_rows=True, temperature=value)
+        _check_dtypes(result, inp)
+        assert torch.all(result["logp"] == 0)
+        assert torch.all(result["dX"] == 0) and torch.all(result["dW"] == 0)
+    assert (cache.hits, cache.misses) == (hits, misses)
+    with pytest.raises(ValueError, match="temperature"):
+        _run(
+            inp,
+            16,
+            entry="logprob",
+            compact_rows=True,
+            temperature=torch.zeros(37, device=DEV),
+            check_temperature=True,
+        )
+    empty = cake_backend.chunked_lm_head_det_logprob_temperature(
+        inp.X[:0],
+        inp.W,
+        inp.labels[:0],
+        backend="reference",
+        temperature=torch.empty(0, device=DEV),
+    )
+    assert tuple(empty.shape) == (0,)
+    empty = cake_backend.chunked_lm_head_det_logprob_temperature(
+        inp.X[:0], inp.W, inp.labels[:0], backend="reference", temperature=0.7
+    )
+    assert tuple(empty.shape) == (0,)
+
+
+def test_temperature_reaches_the_reference_engine():
+    """The reference backend applies the temperature: a heterogeneous temperature moves ``logp`` / ``dX`` / ``dW``
+    well away from the call without one and matches the references with it (a reference engine that ignored the
+    temperature would fail both)."""
+    inp = _host_inputs(200, temperature="hetero")
+    tau = _run(inp, 64, entry="logprob")
+    plain = _run(replace(inp, temperature=None), 64, entry="logprob")
+    assert (tau["logp"] - plain["logp"])[inp.valid].abs().max() > 1e-2
+    assert rel_l2(tau["dX"], plain["dX"]) > 1e-2
+    assert rel_l2(tau["dW"], plain["dW"]) > 1e-2
+    _check_against_references(tau, inp, entry="logprob")
+
+
+def test_temperature_through_the_opt_in_fast_entry(monkeypatch):
+    """The opt-in log-probability entry without a count in the fast memory mode (``memory_mode=None`` or ``"fast"``)
+    hands the temperature to ``cake_backend``'s entry: the graph node is ``cake_backend``'s autograd function,
+    ``logp`` / ``dX`` / ``dW`` are the bits of ``cake_backend``'s call with the same temperature (tensor and scalar)
+    and differ from the call without one, and ``temperature`` / ``check_temperature`` arrive unchanged (a tensor as
+    the same object)."""
+    inp = _host_inputs(37, ignore_frac=0.2, temperature="hetero")
+    plain = _run(replace(inp, temperature=None), 16, entry="logprob")
+    for tau in (inp.temperature, 0.7):
+        main = _run(inp, 16, entry="logprob", temperature=tau)
+        assert not torch.equal(main["logp"], plain["logp"])
+        for mode in (None, "fast"):
+            fell = _run(inp, 16, entry="logprob", temperature=tau, memory_mode=mode)
+            _assert_same_bits(fell, main, _LOGPROB_KEYS)
+            logp = opt_in.chunked_lm_head_det_logprob_temperature(
+                inp.X.detach().requires_grad_(),
+                inp.W,
+                inp.labels,
+                chunk_size=16,
+                backend="reference",
+                memory_mode=mode,
+                temperature=tau,
+            )
+            assert (
+                logp.grad_fn._forward_cls
+                is cake_backend.ChunkedLmHeadDetLogprobTemperatureFunction
+            )
+    seen = {}
+
+    def spy(*args, **kw):
+        seen.update(kw)
+        return torch.zeros(())
+
+    monkeypatch.setattr(cake_backend, "chunked_lm_head_det_logprob_temperature", spy)
+    for mode in (None, "fast"):
+        for tau, check in ((inp.temperature, True), (0.7, False)):
+            seen.clear()
+            opt_in.chunked_lm_head_det_logprob_temperature(
+                inp.X,
+                inp.W,
+                inp.labels,
+                backend="reference",
+                memory_mode=mode,
+                temperature=tau,
+                check_temperature=check,
+            )
+            assert seen["temperature"] is tau and seen["check_temperature"] is check
+
+
+def test_temperature_through_the_opt_in_entry_with_a_count(monkeypatch):
+    """The opt-in log-probability entry with a count (``num_valid_rows``) applies its autograd function of the path
+    without a temperature for ``temperature=None`` / ``1.0`` -- which resolves no temperature, forward or backward,
+    and gives the same bits for both -- and its temperature form otherwise; the default path's binding keys take no
+    temperature."""
+    inp = _host_inputs(37, ignore_frac=0.2, temperature="hetero")
+    n = int(inp.valid.sum())
+    real = opt_in._resolve_temperature
+
+    def refuse(*args, **kw):
+        raise AssertionError("the path without a temperature resolves no temperature")
+
+    plain = opt_in.ChunkedLmHeadDetLogprobFunction
+    bits = []
+    for tau, cls in (
+        (None, plain),
+        (1.0, plain),
+        (0.7, opt_in.ChunkedLmHeadDetLogprobTemperatureFunction),
+        (inp.temperature, opt_in.ChunkedLmHeadDetLogprobTemperatureFunction),
+    ):
+        monkeypatch.setattr(
+            opt_in, "_resolve_temperature", refuse if cls is plain else real
+        )
+        X = inp.X.detach().requires_grad_()
+        entry = (
+            opt_in.chunked_lm_head_det_logprob
+            if tau is None
+            else opt_in.chunked_lm_head_det_logprob_temperature
+        )
+        logp = entry(
+            X,
+            inp.W,
+            inp.labels,
+            chunk_size=16,
+            backend="reference",
+            num_valid_rows=n,
+            **({} if tau is None else dict(temperature=tau)),
+        )
+        assert logp.grad_fn._forward_cls is cls, tau
+        logp.sum().backward()
+        if cls is plain:
+            bits.append((_bits(logp.detach()), _bits(X.grad)))
+    assert all(torch.equal(a, b) for a, b in zip(*bits, strict=True))
+    for key in (opt_in.forward_binding_key, opt_in.logprob_backward_binding_key):
+        assert "temperature" not in inspect.signature(key).parameters
+
+
+def test_device_temperature_through_the_opt_in_entry_with_a_count(
+    glm_weight, monkeypatch
+):
+    """:func:`test_temperature_through_the_opt_in_entry_with_a_count` on the generated program through the opt-in
+    module's binding cache: ``temperature=None`` / ``1.0`` take the autograd function without a temperature, resolve
+    no temperature, reuse the forward binding of the first call (a backward binding is keyed by the addresses of the
+    forward's saved row tensors, so a later call may bind a backward again; no temperature binding remembered) and
+    give the same bits; ``0.7`` and per-token rows take the temperature form, which remembers temperature bindings of
+    its own."""
+    _require_tau_program()
+    T, C = 5000, 2048
+    inp = _device_inputs(T, W=glm_weight)
+    n = int(inp.valid.sum())
+    rows = make_temperature(T, "hetero", seed=SEED + 31, device=CUDA)
+    real = opt_in._resolve_temperature
+
+    def refuse(*args, **kw):
+        raise AssertionError("the path without a temperature resolves no temperature")
+
+    plain = opt_in.ChunkedLmHeadDetLogprobFunction
+    tempered = opt_in.ChunkedLmHeadDetLogprobTemperatureFunction
+    calls = (
+        (None, plain),
+        (1.0, plain),
+        (None, plain),
+        (1.0, plain),
+        (0.7, tempered),
+        (rows, tempered),
+    )
+    bits = []
+    with _cache(True, ("num_valid_rows",)) as cache:
+        cache.clear()
+        for i, (tau, cls) in enumerate(calls):
+            monkeypatch.setattr(
+                opt_in, "_resolve_temperature", refuse if cls is plain else real
+            )
+            before = set(cache._bindings)
+            X = inp.X.detach().requires_grad_()
+            entry = (
+                opt_in.chunked_lm_head_det_logprob
+                if tau is None
+                else opt_in.chunked_lm_head_det_logprob_temperature
+            )
+            logp = entry(
+                X,
+                inp.W,
+                inp.labels,
+                chunk_size=C,
+                backend="cake",
+                num_valid_rows=n,
+                **({} if tau is None else dict(temperature=tau)),
+            )
+            assert logp.grad_fn._forward_cls is cls, tau
+            (logp * inp.dlogp)[inp.valid].sum().backward()
+            torch.cuda.synchronize()
+            remembered = list(cache._bindings.values())
+            if cls is plain:
+                new = [key for key in cache._bindings if key not in before]
+                assert i == 0 or all(key[0] == "bwd" for key in new), (i, tau, new)
+                assert remembered and not any(
+                    isinstance(b, opt_in._TemperatureBinding) for b in remembered
+                )
+                bits.append((_bits(logp.detach()), _bits(X.grad)))
+            else:
+                assert any(
+                    isinstance(b, opt_in._TemperatureBinding) for b in remembered
+                )
+    for other in bits[1:]:
+        assert all(torch.equal(a, b) for a, b in zip(bits[0], other, strict=True))
+
+
+def test_temperature_plan_keys():
+    """A log-probability plan of a registered program whose call has a temperature runs the temperature forms in
+    the slots of the stages they replace -- the label-column forward, ``row_finalize``, the ``dz`` recompute and, on
+    the hidden valid-row count path, chunk 0's device-count GEMM -- with the same chunks and the same other keys; the
+    dW side stream forks behind each chunk's ``dz`` temperature form and a schedule whose side launch has no ``dz``
+    producer before it in its chunk is refused; the reference plan keeps the names without the suffix; the
+    temperature forms need a registered program, a call with a temperature and both logits GEMM arms."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    common = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        dx_finalize=True,
+        arch="sm_100a",
+    )
+    arms = dict(logprob_dz=True, logprob_lbl=True)
+    problem = _problem(8700, 6144, 154880, 4096, entry="logprob")
+    tau_problem = cake_backend._with_temperature(problem)
+    plain = cake_backend.make_plan(problem, valid_rows=8265, **arms, **common)
+    tau = cake_backend.make_plan_temperature(
+        tau_problem, valid_rows=8265, **arms, **common
+    )
+    assert tau.temperature and not plain.temperature
+    assert (
+        type(tau) is cake_backend._TemperaturePlan and type(plain) is cake_backend.Plan
+    )
+    assert tau.without_temperature() == replace(plain, problem=tau_problem)
+    assert tau.chunks == plain.chunks and tau.num_chunks == 3
+    rename = {
+        "gemm_logits_lbl": "gemm_logits_lbl_tau",
+        "gemm_logits_dz": "gemm_logits_dz_tau",
+        "row_finalize": "row_finalize_tau",
+    }
+    fwd, bwd = (
+        cake_backend._forward_keys_temperature(tau),
+        cake_backend._recompute_keys_temperature(tau),
+    )
+    assert fwd == tuple(
+        (rename.get(s, s), i) for s, i in cake_backend.forward_keys(plain)
+    )
+    assert bwd == tuple(
+        (rename.get(s, s), i) for s, i in cake_backend.recompute_keys(plain)
+    )
+    assert cake_backend.cast_keys(tau) == cake_backend.cast_keys(plain)
+    assert set(tau.stages) == {rename.get(s, s) for s in plain.stages}
+    assert list(tau.stages) == [
+        s for s in cake_jit.STAGES_WITH_TEMPERATURE if s in tau.stages
+    ]
+    assert not set(tau.stages) & _UNTAU_STAGES
+    assert cake_backend.forward_early_keys(tau)[-1] == ("gemm_logits_lbl_tau", 0)
+    _, forks, sides = cake_backend._side_stream_schedule_temperature(tau, bwd, True)
+    assert sorted(forks) == [
+        i for i, k in enumerate(bwd) if k[0] == "gemm_logits_dz_tau"
+    ]
+    assert len(sides) == 2 and all(p > min(forks) for p in sides)
+    broken = tuple(k for k in bwd if k != ("gemm_logits_dz_tau", 1))
+    with pytest.raises(RuntimeError, match="dz"):
+        cake_backend._side_stream_schedule_temperature(tau, broken, True)
+    hidden = replace(tau, hidden_count=True)
+    assert hidden.hidden_logits_stage() == "gemm_logits_mcnt_tau"
+    assert "gemm_logits_mcnt_tau" in hidden.stages
+    # no untempered stage either: the hidden count's recount backward (chunk 0's ``row_grad``) never runs with one
+    assert not set(hidden.stages) & _UNTAU_STAGES
+    assert "row_grad" in replace(plain, hidden_count=True).stages
+    assert cake_backend._forward_keys_temperature(hidden)[0] == ("row_finalize_tau", 0)
+    # the reference path (no registered program): the names without the suffix, the problem carries the temperature
+    ref = cake_backend.make_plan(
+        tau_problem, need_dx=True, need_dw=True, valid_rows=8265
+    )
+    assert not ref.temperature and ref.problem.temperature
+    assert ("gemm_logits", 0) in cake_backend.forward_keys(ref)
+    assert ("row_finalize", 0) in cake_backend.forward_keys(ref)
+    assert not any(s.endswith("_tau") for s in ref.stages)
+    for bad_problem, kw in (
+        (problem, arms),  # the call has no temperature
+        (tau_problem, dict(logprob_dz=True)),  # one arm off
+        (tau_problem, dict(logprob_lbl=True)),
+        (tau_problem, {}),
+    ):
+        with pytest.raises(ValueError, match="temperature"):
+            cake_backend.make_plan_temperature(
+                bad_problem, valid_rows=8265, **kw, **common
+            )
+    with pytest.raises(ValueError, match="temperature"):
+        cake_backend.make_plan_temperature(
+            tau_problem, need_dx=True, need_dw=True, **arms
+        )  # no registered program
+
+
+def test_default_route_carries_no_temperature_state():
+    """A call without a temperature builds and reads what it did before the temperature landed: :class:`Plan` (both
+    modules), :class:`ForwardResult` (both) and ``_HiddenCount`` have no temperature field (the temperature flag of a
+    plan is a class attribute of :class:`_TemperaturePlan`, a forward's compact temperature rows and the hidden count's
+    ``tau_c`` are typed class defaults set by the temperature path); :func:`make_plan` has no temperature keyword
+    (:func:`make_plan_temperature` plans the temperature forms, in each module of its own plan class);
+    :func:`stage_values`, :func:`make_plan` and the stage methods of :class:`Plan` read no temperature, and
+    :func:`stage_values_temperature` refuses a temperature form on a plan without it and a stage it replaces on a
+    plan with it."""
+    for cls in (
+        cake_backend.Plan,
+        opt_in.Plan,
+        cake_backend.ForwardResult,
+        opt_in.ForwardResult,
+    ):
+        names = {f.name for f in fields(cls)}
+        assert not {"temperature", "temperature_rows"} & names, cls
+    assert "tau_c" not in {f.name for f in fields(cake_backend._HiddenCount)}
+    assert cake_backend.ForwardResult.temperature_rows is None
+    assert cake_backend._HiddenCount.tau_c is None
+    for module in (cake_backend, opt_in):
+        assert "temperature" not in inspect.signature(module.make_plan).parameters
+        for fn in (module.make_plan, module.stage_values):
+            assert "temperature" not in inspect.getsource(fn), (module, fn)
+    for fn in (
+        cake_backend.Plan.hidden_logits_stage,
+        cake_backend.Plan.forward_logits_stage,
+        cake_backend.Plan.recompute_stage,
+        cake_backend.Plan.stages.fget,
+    ):
+        assert "temperature" not in inspect.getsource(fn), fn
+    assert not cake_backend.Plan.temperature and not opt_in.Plan.temperature
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    kw = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        num_sms=148,
+        arch="sm_100a",
+        logprob_dz=True,
+        logprob_lbl=True,
+    )
+    problem = _problem(8700, 6144, 154880, 4096, entry="logprob")
+    tau_problem = cake_backend._with_temperature(problem)
+    for module in (cake_backend, opt_in):
+        tau = module.make_plan_temperature(tau_problem, **kw)
+        plain = module.make_plan(tau_problem, **kw)
+        assert isinstance(tau, module.Plan) and tau.temperature
+        assert type(tau) is module._TemperaturePlan and type(plain) is module.Plan
+        assert tau.without_temperature() == plain and tau != plain
+        assert type(replace(tau, dx_finalize=True)) is module._TemperaturePlan
+        assert tau.row_finalize_stage == "row_finalize_tau"
+        assert plain.row_finalize_stage == "row_finalize"
+        with pytest.raises(ValueError, match="temperature form"):
+            module.stage_values_temperature("row_finalize_tau", {}, plain, 0)
+        with pytest.raises(ValueError, match="row kernel"):
+            module.stage_values_temperature("row_finalize", {}, tau, 0)
+    assert opt_in.make_plan_temperature(tau_problem, **kw).dw_rows is None
+
+
+def test_registry_declares_only_known_stages():
+    """Every stage a registry record declares is a name of ``STAGES_WITH_TEMPERATURE`` or of the candidate-support
+    programs (``cake_support.SUPPORT_STAGES``): :func:`cake_jit.registered_stages_with_temperature` keeps the names of
+    ``STAGES_WITH_TEMPERATURE`` only, so a row under another name (``gemm_logits_tau`` for ``gemm_logits_mcnt_tau``)
+    would drop out silently -- the hidden valid-row count would never find its temperature form and the device
+    temperature tests would skip."""
+    cake_support = cake_package("cake_lm_head_det_loss", "cake_support")
+    known = set(cake_jit.STAGES_WITH_TEMPERATURE) | set(cake_support.SUPPORT_STAGES)
+    for name, record in cake_jit.MODULES.items():
+        unknown = set(record.get("stages", ())) - known
+        assert not unknown, (name, sorted(unknown))
+
+
+def test_registered_stages_with_temperature(monkeypatch):
+    """A call without a temperature reads the stage tables without the temperature forms: ``STAGES``,
+    ``GEMM_STAGES`` (24 GEMM stages), ``ROW_STAGES`` and ``STAGE_TENSORS`` carry none, and
+    :func:`cake_jit.registered_stages` lists a record's stages without them.
+    :func:`cake_jit.registered_stages_with_temperature` lists every registered stage in the launch order of
+    ``STAGES_WITH_TEMPERATURE``, with the same declared-versus-carried check."""
+    assert len(cake_jit.GEMM_STAGES) == 24
+    assert (
+        tuple(
+            s
+            for s in cake_jit.STAGES_WITH_TEMPERATURE
+            if s.startswith("gemm_") and s not in TAU_STAGES
+        )
+        == cake_jit.GEMM_STAGES
+    )
+    tables = (
+        cake_jit.STAGES
+        + cake_jit.GEMM_STAGES
+        + cake_jit.ROW_STAGES
+        + tuple(STAGE_TENSORS)
+    )
+    assert not any(s.endswith("_tau") for s in tables)
+    with_tau = cake_jit.registered_stages_with_temperature
+    for name in cake_jit.MODULES:
+        stages = with_tau(name)
+        assert cake_jit.registered_stages(name) == tuple(
+            s for s in stages if s not in TAU_STAGES
+        )
+        assert list(stages) == [
+            s for s in cake_jit.STAGES_WITH_TEMPERATURE if s in stages
+        ]
+    name = "cake_lm_head_det_loss_fake"
+    record = _fake_record(_ROW_GRAD_PLAN)
+    tau = dict(record, stages=["row_grad", "row_finalize_tau"])
+    tau["row_finalize_tau"] = record["row_grad"]
+    monkeypatch.setitem(cake_jit.MODULES, name, tau)
+    assert cake_jit.registered_stages(name) == ("row_grad",)
+    assert with_tau(name) == ("row_finalize_tau", "row_grad")
+    monkeypatch.setitem(
+        cake_jit.MODULES, name, dict(record, stages=["row_grad", "row_finalize"])
+    )
+    with pytest.raises(ValueError, match="declares stages"):
+        with_tau(name)
+
+
+def test_temperature_stage_values_and_runner():
+    """A runner with a temperature binds it as ``tensors["temperature"]`` (the chunk loop's rows: ``[T]``
+    uncompacted, the compact ``[T_v]`` rows when compacted, like ``lse``) and every logits GEMM / row kernel role
+    reads it (the reference path keeps the stage names); the dX / dW GEMMs never do; its steps give the bits of the
+    autograd entry; a temperature of another shape or for the loss entry is refused."""
+    T, C = 37, 16
+    inp = _host_inputs(T, ignore_frac=0.2, temperature="hetero")
+    kw = dict(chunk_size=C, entry="logprob", backend="reference", fuse_dw_cast=False)
+    runner = prepare_lm_head_det_loss_temperature(
+        inp.X, inp.W, inp.labels, temperature=inp.temperature, **kw
+    )
+    plan, t = runner.plan, runner.tensors
+    assert plan.problem.temperature and not plan.temperature
+    assert t["temperature"] is inp.temperature
+    tau_values = cake_backend.stage_values_temperature
+    for index in range(plan.num_chunks):
+        for stage in ("gemm_logits", "gemm_logits_nostats", "row_finalize", "row_grad"):
+            v = tau_values(stage, t, plan, index)
+            assert v["temperature"] is t["temperature"], (stage, index)
+            # the stage values of a call without a temperature read none
+            assert "temperature" not in stage_values(stage, t, plan, index)
+        for stage in ("gemm_dx", "gemm_dw_acc"):
+            assert tau_values(stage, t, plan, index).get("temperature") is None
+    plain = prepare_lm_head_det_loss(inp.X, inp.W, inp.labels, **kw)
+    assert not plain.plan.problem.temperature
+    for stage in ("gemm_logits", "row_finalize", "row_grad"):
+        assert (
+            stage_values(stage, plain.tensors, plain.plan, 0).get("temperature") is None
+        )
+    row_index = inp.valid.nonzero().reshape(-1)
+    assert 0 < row_index.numel() < T
+    tau_c = inp.temperature.index_select(0, row_index).contiguous()
+    compact = prepare_lm_head_det_loss_temperature(
+        inp.X, inp.W, inp.labels, compact_rows=row_index, temperature=tau_c, **kw
+    )
+    assert compact.plan.compact and compact.tensors["temperature"] is tau_c
+    compact.forward()
+    if DEV.type == "cuda":
+        torch.cuda.synchronize()
+    eager = _run(inp, C, entry="logprob", compact_rows=True, fuse_dw_cast=False)
+    assert torch.equal(compact.scatter(compact.logp), eager["logp"])
+    for bad in (inp.temperature, tau_c[:-1], tau_c.double()):
+        with pytest.raises(ValueError, match="temperature"):
+            prepare_lm_head_det_loss_temperature(
+                inp.X, inp.W, inp.labels, compact_rows=row_index, temperature=bad, **kw
+            )
+    with pytest.raises(ValueError, match="temperature"):
+        prepare_lm_head_det_loss_temperature(
+            inp.X,
+            inp.W,
+            inp.labels,
+            loss_div=inp.loss_div,
+            chunk_size=C,
+            backend="reference",
+            temperature=inp.temperature,
+        )
+
+
+def test_temperature_logprob_arm_switches():
+    """A temperature runs both logits GEMM arms: an explicit ``logprob_lbl=False`` / ``logprob_dz=False`` with a
+    temperature is a ``ValueError`` on every backend (the default ``None`` and ``True`` are accepted); without a
+    temperature the switches keep their meaning."""
+    inp = _host_inputs(37, ignore_frac=0.2, temperature="hetero")
+    for kw in (dict(logprob_lbl=False), dict(logprob_dz=False)):
+        name = next(iter(kw))
+        with pytest.raises(ValueError, match=name):
+            _run(inp, 16, entry="logprob", **kw)
+        with pytest.raises(ValueError, match=name):
+            prepare_lm_head_det_loss_temperature(
+                inp.X,
+                inp.W,
+                inp.labels,
+                chunk_size=16,
+                entry="logprob",
+                backend="reference",
+                temperature=inp.temperature,
+                **kw,
+            )
+        _run(replace(inp, temperature=None), 16, entry="logprob", **kw)
+    on = _run(inp, 16, entry="logprob", logprob_lbl=True, logprob_dz=True)
+    _assert_same_bits(on, _run(inp, 16, entry="logprob"), _LOGPROB_KEYS)
+
+
+def test_temperature_dx_slices_fit_the_k_steps():
+    """The temperature plans of both modules take the fitted dX slice counts of the plan without a temperature: V =
+    256 has four K steps, so the slice rule's 3 slices at T = 1000, H = 6144 on 148 SMs run as 2 (V = 512 keeps 3),
+    every pin whose slices all hold a K step is kept and a pin of 3 slices over V = 256 is rejected."""
+    g = Geometry.from_record(None)
+    kw = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        arch="sm_100a",
+        logprob_dz=True,
+        logprob_lbl=True,
+    )
+    for module in (cake_backend, opt_in):
+        for V, want in ((256, (2,)), (512, (3,))):
+            problem = _problem(1000, 6144, V, 4096, entry="logprob")
+            plain = module.make_plan(problem, **kw)
+            tau = module.make_plan_temperature(
+                cake_backend._with_temperature(problem), **kw
+            )
+            assert tau.temperature and tau.dx_slices == plain.dx_slices == want, (
+                module.__name__,
+                V,
+                tau.dx_slices,
+                plain.dx_slices,
+            )
+        tau_problem = cake_backend._with_temperature(
+            _problem(1000, 6144, 256, 4096, entry="logprob")
+        )
+        for k in (1, 2, 4):
+            pinned = module.make_plan_temperature(
+                tau_problem, gemm_tuning={"dx": {"k_slices": k}}, **kw
+            )
+            assert pinned.dx_slices == (k,), (module.__name__, k)
+        with pytest.raises(ValueError, match="K steps"):
+            module.make_plan_temperature(
+                tau_problem, gemm_tuning={"dx": {"k_slices": 3}}, **kw
+            )
+
+
+def test_temperature_refuses_keep_logits():
+    """``memory_mode="keep_logits"`` takes no temperature: the opt-in module's temperature entry rejects a scalar
+    other than 1.0 and a per-token tensor (ignored rows included) with a ``ValueError`` before any launch; a scalar
+    whose FP32 value is 1.0 is the call without a temperature (on the reference backend the same error as the call
+    without one, which runs the kept form on the ``cake`` backend only)."""
+    inp = _host_inputs(37, ignore_frac=0.2, temperature="hetero")
+    for temperature in (0.5, 2, inp.temperature, torch.ones_like(inp.temperature)):
+        for backend in ("cake", "reference"):
+            with pytest.raises(ValueError, match="takes no temperature"):
+                opt_in.chunked_lm_head_det_logprob_temperature(
+                    inp.X,
+                    inp.W,
+                    inp.labels,
+                    chunk_size=16,
+                    backend=backend,
+                    memory_mode="keep_logits",
+                    temperature=temperature,
+                )
+    with pytest.raises(ValueError) as plain:
+        opt_in.chunked_lm_head_det_logprob(
+            inp.X,
+            inp.W,
+            inp.labels,
+            chunk_size=16,
+            backend="reference",
+            memory_mode="keep_logits",
+        )
+    for one in (1.0, 1, 1.0 + 2.0**-30):
+        with pytest.raises(ValueError) as got:
+            opt_in.chunked_lm_head_det_logprob_temperature(
+                inp.X,
+                inp.W,
+                inp.labels,
+                chunk_size=16,
+                backend="reference",
+                memory_mode="keep_logits",
+                temperature=one,
+            )
+        assert str(got.value) == str(plain.value), one
+    with pytest.raises(ValueError, match="takes no temperature"):
+        _run(inp, 16, entry="logprob", memory_mode="keep_logits")
+
+
+def test_temperature_needs_the_registered_forms():
+    """On a registered program a call with a temperature needs the arm's temperature form: a record without it is a
+    ``NotImplementedError`` naming the missing stage (never a silent fallback to the stages without the
+    temperature), an arm switched off a ``ValueError``; a call without a temperature keeps today's rule; the
+    reference path (no record) runs no arm."""
+    record = {"arch": "sm_100a"}
+    stages = tuple(s for s in cake_jit.STAGES if s not in TAU_STAGES)
+    arm = cake_backend._logprob_arm_temperature
+    for stage in (cake_backend.LOGPROB_DZ_STAGE, cake_backend.LOGPROB_LBL_STAGE):
+        tau_stage = stage + "_tau"
+        assert arm(record, stages, stage, True) is True
+        assert arm(record, stages, stage, False) is False
+        with pytest.raises(NotImplementedError, match=tau_stage):
+            arm(record, stages, stage, True, temperature=True)
+        assert arm(record, stages + (tau_stage,), stage, True, temperature=True) is True
+        with pytest.raises(ValueError, match=stage):
+            arm(record, stages + (tau_stage,), stage, False, temperature=True)
+        assert arm(None, stages, stage, True, temperature=True) is False
+
+
+def test_temperature_binding_keys_carry_the_flag():
+    """The binding keys of the log-probability entry carry whether the call has a temperature -- a flag, never the
+    temperature tensor (every tensor of a remembered launch is slotted per call)."""
+    kw = _valid_call(T=8)
+    X, W, labels = kw["X"], kw["W"], kw["labels"]
+    common = dict(
+        objective="ce",
+        loss_div=None,
+        infer_logp=None,
+        loss_weights=None,
+        chunk_size=4096,
+        need_dx=False,
+        need_dw=False,
+        grad_weight_dtype=torch.bfloat16,
+        entry="logprob",
+    )
+    tau_key = cake_backend.temperature_binding_key
+    fwd = forward_binding_key(X, W, labels, **common)
+    assert fwd == forward_binding_key(X, W, labels, **common)
+    assert tau_key(fwd) != fwd and tau_key(fwd) == tau_key(fwd)
+    assert not any(isinstance(v, torch.Tensor) for v in tau_key(fwd))
+    lse, dlogp = torch.zeros(8), torch.zeros(8)
+    bkw = dict(chunk_size=4096, need_dx=True, need_dw=True)
+    bwd = logprob_backward_binding_key(X, W, labels, lse, dlogp, **bkw)
+    assert tau_key(bwd) != bwd and tau_key(bwd) != tau_key(fwd)
+    # the default path's keys take no temperature (the flag is the temperature path's)
+    assert "temperature" not in inspect.signature(forward_binding_key).parameters
+    assert (
+        "temperature" not in inspect.signature(logprob_backward_binding_key).parameters
+    )
+
+
+def test_bind_stage_refuses_a_temperature_without_its_operand(monkeypatch):
+    """A call with a temperature fails closed on a temperature a stage cannot read: before its launches are bound
+    (:func:`cake_backend._check_temperature_operands`), a ``temperature`` host value for a stage whose argument plan
+    has no temperature operand is a ``ValueError`` before any module loads (host steps are skipped); ``None`` passes;
+    a stage whose plan has the operand passes and :func:`bind_stage` binds it as a tensor slot."""
+    name = "cake_lm_head_det_loss_fake"
+    monkeypatch.setitem(cake_jit.MODULES, name, _fake_record(_ROW_GRAD_PLAN))
+    loads: list = []
+
+    def load(n, s):
+        loads.append(s)
+        return SimpleNamespace(run=lambda *a: None)
+
+    monkeypatch.setattr(cake_backend, "load_cake_lm_head_det_loss_module", load)
+    check = cake_backend._check_temperature_operands
+    key = ("row_grad", 0)
+    values = _row_grad_values()
+    values["temperature"] = torch.ones(4)
+    with pytest.raises(ValueError, match="temperature"):
+        check(name, (("gather_rows", 0), key), {key: values})
+    assert not loads
+    values["temperature"] = None
+    check(name, (key,), {key: values})
+    assert bind_stage(name, "row_grad", values, (4, 1, 1)).slots == (
+        (0, "z"),
+        (1, "labels"),
+        (2, "lse"),
+        (3, "d"),
+    )
+    monkeypatch.setitem(
+        cake_jit.MODULES,
+        name,
+        _fake_record(
+            _ROW_GRAD_PLAN[:4] + [["buffer", "temperature"]] + _ROW_GRAD_PLAN[4:]
+        ),
+    )
+    values["temperature"] = torch.ones(4)
+    check(name, (key,), {key: values})
+    launch = bind_stage(name, "row_grad", values, (4, 1, 1))
+    assert (4, "temperature") in launch.slots
+    assert launch.arguments[4] is values["temperature"]
+
+
+def test_temperature_memory_report():
+    """``memory_report(temperature=True)`` counts the compact FP32 temperature the forward saves (4 bytes per loop
+    row) and, on the hidden valid-row count path, the ``[T]`` buffer and its transient int64 clamped index; the
+    default report is unchanged; the loss entry has no temperature."""
+    T, T_v, C = 16231, 15419, 4096
+    base = memory_report(T, DEFAULT_H, DEFAULT_V, C, entry="logprob", valid_rows=T_v)
+    tau = memory_report_temperature(
+        T, DEFAULT_H, DEFAULT_V, C, entry="logprob", valid_rows=T_v, temperature=True
+    )
+    assert "temperature_rows" not in base["accumulators"]
+    assert tau["accumulators"]["temperature_rows"] == 4 * T_v
+    assert tau["accumulator_bytes"] - base["accumulator_bytes"] == 4 * T_v
+    assert tau["temporary"] == base["temporary"]
+    hidden = memory_report_temperature(
+        T,
+        DEFAULT_H,
+        DEFAULT_V,
+        C,
+        entry="logprob",
+        valid_rows=T_v,
+        hidden_count=True,
+        temperature=True,
+    )
+    assert hidden["accumulators"]["temperature_rows"] == 4 * T
+    assert hidden["temporary"]["temperature_index"] == 8 * T
+    with pytest.raises(ValueError, match="temperature"):
+        memory_report_temperature(T, DEFAULT_H, DEFAULT_V, C, temperature=True)
+
+
+# --- device layer: the generated temperature forms
+
+
+def _require_tau_program():
+    """Skip unless the registered program carries the four temperature forms (``TAU_STAGES``)."""
+    _require_program(entry="logprob")
+    name, _ = cake_backend.record_for(CUDA)
+    missing = [
+        s
+        for s in TAU_STAGES
+        if s not in cake_jit.registered_stages_with_temperature(name)
+    ]
+    if missing:
+        pytest.skip(f"the registered program has no temperature forms {missing}")
+    return name
+
+
+def _spy_bound_stages(monkeypatch) -> list:
+    """Record the stage of every launch bound from now on (the chunk loop, the hidden count's prologue and the eager
+    launches all bind through ``_bind_all``)."""
+    bound: list = []
+
+    def spy_of(real):
+        def spy(record, module_name, keys, values, device, geometry):
+            bound.extend(k[0] for k in keys)
+            return real(record, module_name, keys, values, device, geometry)
+
+        return spy
+
+    # the opt-in entry points bind through the opt-in module's own ``_bind_all``
+    for be in (cake_backend, opt_in):
+        monkeypatch.setattr(be, "_bind_all", spy_of(be._bind_all))
+    return bound
+
+
+def _assert_temperature_plan(bound, *, hidden, case):
+    """The launches of a temperature call that bound: the label-column, ``dz`` and row-finalize temperature forms,
+    the device-count form exactly when the hidden valid-row count ran, and none of the stages they replace."""
+    stages = set(bound)
+    need = {"gemm_logits_lbl_tau", "gemm_logits_dz_tau", "row_finalize_tau"}
+    assert need <= stages, (case, sorted(stages))
+    assert ("gemm_logits_mcnt_tau" in stages) == bool(hidden), (case, sorted(stages))
+    assert not stages & _UNTAU_STAGES, (case, sorted(stages & _UNTAU_STAGES))
+
+
+def _expect_hidden(inp, C, kw) -> bool:
+    """Does a compacted-by-default autograd call with the switches ``kw`` run the hidden valid-row count on this
+    device and toolchain (``cake_jit.toolchain_runs_hidden_count``: not sm_103a with CUDA 13.0)?  A
+    ``memory_mode="budget"`` call never does: the hidden count's chunk-0 buffers take ``min(chunk, T)`` rows before
+    the count is known."""
+    return bool(
+        kw.get("compact_rows", True) is not False
+        and kw.get("hidden_count", True) is not False
+        and kw.get("memory_mode") != "budget"
+        and kw.get("num_valid_rows") is None
+        and -(-inp.T // C) >= cake_backend.HIDDEN_COUNT_MIN_CHUNKS
+        and cake_jit.toolchain_runs_hidden_count(cake_backend.arch_for(CUDA))
+    )
+
+
+# (name, switches): every switch whose values must give the bits of the defaults
+_TAU_SWITCH_MATRIX: tuple[tuple[str, dict], ...] = (
+    ("defaults", {}),
+    ("uncompacted", dict(compact_rows=False)),
+    ("host_count", dict(hidden_count=False)),
+    ("given_count", dict(num_valid_rows=True)),
+    ("budget", dict(memory_mode="budget")),
+    ("unfused_dw_cast", dict(fuse_dw_cast=False)),
+    ("no_dx_finalize", dict(dx_finalize=False)),
+    ("no_dw_stream", dict(dw_stream=False)),
+    ("dw_stream", dict(dw_stream=True)),
+)
+
+
+def _tau_switches(inp, switches) -> dict:
+    kw = dict(switches)
+    if kw.get("num_valid_rows") is True:
+        kw["num_valid_rows"] = int(inp.valid.sum())
+    return kw
+
+
+def _tau_inputs(T, *, W, ignore_frac=0.05, temperature="hetero", seed_offset=7637):
+    return make_inputs(
+        T,
+        seed=SEED + seed_offset + T,
+        device=CUDA,
+        W=W,
+        ignore_frac=ignore_frac,
+        temperature=temperature,
+    )
+
+
+def test_device_temperature_one_is_bitwise_the_default(glm_weight, monkeypatch):
+    """``temperature=1.0`` and a ones tensor give the bits (integer views) of the call without a temperature over
+    the switch matrix -- compacted / uncompacted, hidden / host / caller's count, fast / budget, fused / unfused dW
+    cast, dX finalize, dW side stream -- with the binding cache on and off, at two and four chunks; ``1.0`` binds no
+    temperature form and the ones tensor binds the temperature forms (the device-count one exactly when the hidden
+    valid-row count runs) and none of the stages they replace, so no cell compares a path with itself."""
+    _require_tau_program()
+    bound = _spy_bound_stages(monkeypatch)
+    for T in (4097, 16231):
+        inp = _device_inputs(T, W=glm_weight)
+        ones = torch.ones(T, dtype=torch.float32, device=CUDA)
+        for name, switches in _TAU_SWITCH_MATRIX:
+            kw = _tau_switches(inp, switches)
+            for cache_on in (True, False):
+                case = (T, name, cache_on)
+                with _cache(cache_on, kw) as cache:
+                    cache.clear()
+                    bound.clear()
+                    base = _run(inp, 4096, entry="logprob", backend="cake", **kw)
+                    assert not any(s.endswith("_tau") for s in bound), case
+                    bound.clear()
+                    one = _run(
+                        inp,
+                        4096,
+                        entry="logprob",
+                        backend="cake",
+                        temperature=1.0,
+                        **kw,
+                    )
+                    assert not any(s.endswith("_tau") for s in bound), case
+                    bound.clear()
+                    tensor = _run(
+                        inp,
+                        4096,
+                        entry="logprob",
+                        backend="cake",
+                        temperature=ones,
+                        **kw,
+                    )
+                    _assert_temperature_plan(
+                        bound, hidden=_expect_hidden(inp, 4096, kw), case=case
+                    )
+                _assert_same_bits(base, one, _LOGPROB_KEYS)
+                _assert_same_bits(base, tensor, _LOGPROB_KEYS)
+
+
+@pytest.mark.parametrize("T", [4097, 16231])
+def test_device_temperature_scalar_is_the_constant_tensor(glm_weight, monkeypatch, T):
+    """A scalar temperature gives the bits of the constant FP32 tensor of its value through the temperature forms
+    (two chunks; four chunks with the hidden valid-row count) and passes the accuracy gates of its references."""
+    _require_tau_program()
+    bound = _spy_bound_stages(monkeypatch)
+    inp = _device_inputs(T, W=glm_weight)
+    for s in (0.5, 0.7, 1.3):
+        with _cache(False):
+            bound.clear()
+            scalar = _run(inp, 4096, entry="logprob", backend="cake", temperature=s)
+            _assert_temperature_plan(
+                bound, hidden=_expect_hidden(inp, 4096, {}), case=(T, s)
+            )
+            tensor = _run(
+                inp,
+                4096,
+                entry="logprob",
+                backend="cake",
+                temperature=torch.full((T,), s, dtype=torch.float32, device=CUDA),
+            )
+        _assert_same_bits(scalar, tensor, _LOGPROB_KEYS)
+        if T == 4097:
+            _check_against_references(
+                scalar, replace(inp, temperature=s), entry="logprob"
+            )
+
+
+@pytest.mark.parametrize(
+    "T, C, ignore",
+    [
+        (1, 4096, 0.0),
+        (4095, 4096, 0.05),
+        (4097, 4096, 0.05),
+        (4097, 2048, 0.33),
+        (16231, 4096, 0.05),
+        (16231, 8192, 0.33),
+    ],
+)
+def test_device_temperature_heterogeneous_matches_the_references(
+    glm_weight, record_property, T, C, ignore
+):
+    """A heterogeneous per-token temperature on the generated program: ``logp`` / ``dX`` / ``dW`` within 1.05x the
+    unchunked PyTorch path's error against the FP64 oracle (both with the temperature) plus the floor; the
+    production ceiling (a temperature-1 figure) applies only where every temperature is at least 1.  The measured
+    errors are recorded (junit properties)."""
+    _require_tau_program()
+    inp = _tau_inputs(T, W=glm_weight, ignore_frac=ignore)
+    result = _run(inp, C, entry="logprob", backend="cake")
+    _check_dtypes(result, inp)
+    errors, b0_errors = _check_against_references(
+        result,
+        inp,
+        entry="logprob",
+        ceiling=bool(inp.temperature.min() >= 1.0),
+    )
+    record_property("temperature_errors", repr(errors))
+    record_property("temperature_unchunked_errors", repr(b0_errors))
+    assert torch.all(result["logp"][~inp.valid] == 0)
+    assert torch.all(result["dX"][~inp.valid] == 0)
+
+
+def test_device_temperature_switches_are_bitwise(glm_weight, monkeypatch):
+    """A heterogeneous temperature over the switch matrix: every switch gives the bits (integer views) of the
+    defaults with the binding cache on (first call and remembered binding) and off, each cell through the temperature
+    forms; compacted vs uncompacted: ``logp`` bitwise, the first chunk's valid ``dX`` rows bitwise when both plans
+    slice its dX GEMM alike, ``dW`` at the precision level; a row permutation of ``(X, labels, temperature, dlogp)``
+    permutes ``logp`` and the ``dX`` rows bitwise (row-local arithmetic) -- a temperature read at the wrong row breaks
+    each of these."""
+    _require_tau_program()
+    bound = _spy_bound_stages(monkeypatch)
+    for T in (4097, 16231):
+        inp = _tau_inputs(T, W=glm_weight)
+        with _cache(False):
+            bound.clear()
+            ref = _run(inp, 4096, entry="logprob", backend="cake")
+            _assert_temperature_plan(
+                bound, hidden=_expect_hidden(inp, 4096, {}), case=(T, "defaults")
+            )
+        for name, switches in _TAU_SWITCH_MATRIX[1:]:
+            if name == "uncompacted":
+                continue  # its own expectations below
+            kw = _tau_switches(inp, switches)
+            for cache_on in (True, False):
+                case = (T, name, cache_on)
+                with _cache(cache_on, kw) as cache:
+                    cache.clear()
+                    bound.clear()
+                    runs = [_run(inp, 4096, entry="logprob", backend="cake", **kw)]
+                    _assert_temperature_plan(
+                        bound, hidden=_expect_hidden(inp, 4096, kw), case=case
+                    )
+                    if cache_on:
+                        runs.append(
+                            _run(inp, 4096, entry="logprob", backend="cake", **kw)
+                        )
+                for run in runs:
+                    _assert_same_bits(ref, run, _LOGPROB_KEYS)
+        with _cache(True) as cache:
+            cache.clear()
+            bound.clear()
+            plain = _run(inp, 4096, entry="logprob", backend="cake", compact_rows=False)
+            _assert_temperature_plan(bound, hidden=False, case=(T, "uncompacted"))
+            comp = _run(inp, 4096, entry="logprob", backend="cake")
+            plans = {
+                b.plan.compact: b.plan
+                for key, b in cache._bindings.items()
+                if key[0] == "bwd"
+            }
+        assert set(plans) == {True, False}, plans
+        assert torch.equal(_bits(plain["logp"]), _bits(ref["logp"]))
+        _assert_same_bits(comp, ref, _LOGPROB_KEYS)
+        assert torch.all(plain["dX"][~inp.valid] == 0)
+        assert rel_l2(plain["dW"].float(), ref["dW"].float()) <= GATE_TINY["dW_rel_l2"]
+        if plans[True].dx_slices_of(0) == plans[False].dx_slices_of(0):
+            rows = inp.valid[:4096]
+            assert torch.equal(
+                _bits(plain["dX"][:4096][rows]), _bits(ref["dX"][:4096][rows])
+            )
+    # row permutation: one chunk, and two full chunks (8192 valid rows of 8623; the hidden valid-row count)
+    for T in (4000, 8623):
+        inp = _tau_inputs(T, W=glm_weight)
+        gen = torch.Generator(device=CUDA)
+        gen.manual_seed(SEED + T)
+        perm = torch.randperm(T, generator=gen, device=CUDA)
+        moved = replace(
+            inp,
+            X=inp.X[perm].contiguous(),
+            labels=inp.labels[perm].contiguous(),
+            dlogp=inp.dlogp[perm].contiguous(),
+            temperature=inp.temperature[perm].contiguous(),
+        )
+        with _cache(True) as cache:
+            cache.clear()
+            a = _run(inp, 4096, entry="logprob", backend="cake")
+            b = _run(moved, 4096, entry="logprob", backend="cake")
+            plans = [b_.plan for key, b_ in cache._bindings.items() if key[0] == "bwd"]
+        assert torch.equal(_bits(b["logp"]), _bits(a["logp"][perm])), T
+        slices = {p.dx_slices_of(i) for p in plans for i in range(p.num_chunks)}
+        # every chunk slices its dX GEMM alike: the rows are row-local
+        if len(slices) == 1:
+            rows = moved.valid
+            assert torch.equal(_bits(b["dX"][rows]), _bits(a["dX"][perm][rows])), T
+
+
+def test_device_temperature_budget_forms_are_bitwise(glm_weight, monkeypatch):
+    """Every budget form of the log-probability backward with a heterogeneous temperature gives the fast form's
+    bits (integer views), with and without ``dX``; the vocabulary-block recompute binds the ``dz`` temperature form
+    and none of the stages the temperature forms replace."""
+    _require_tau_program()
+    step = _require_recompute()
+    for T, C, train_x in ((1500, 4096, True), (8700, 4096, True), (8700, 4096, False)):
+        inp = _tau_inputs(T, W=glm_weight, seed_offset=7638)
+        _poison_allocator()
+        fast = _run(inp, C, entry="logprob", backend="cake", train_x=train_x)
+        for form in _budget_forms(step):
+            calls: list = []
+            _force_budget_plan(monkeypatch, form, calls)
+            monkeypatch.setattr(opt_in, "_budget_plan_temperature", opt_in._budget_plan)
+            bound = _spy_bound_stages(monkeypatch)
+            _poison_allocator()
+            with _cache(False, ("memory_mode",)):
+                budget = _run(
+                    inp,
+                    C,
+                    entry="logprob",
+                    backend="cake",
+                    train_x=train_x,
+                    memory_mode="budget",
+                )
+            assert calls == ["logprob"], (T, C, train_x, form)
+            _assert_same_bits(fast, budget, _LOGPROB_KEYS)
+            assert "gemm_logits_dz_tau" in bound, (T, form)
+            assert not set(bound) & _UNTAU_STAGES, (T, form, sorted(set(bound)))
+            monkeypatch.undo()
+
+
+def test_device_temperature_dw_side_stream_is_bitwise(glm_weight, monkeypatch):
+    """Four compacted chunks with a heterogeneous temperature: the dW side stream (forked behind each chunk's ``dz``
+    temperature form) gives the single-stream bits (integer views) in ten runs, through a fresh binding and the
+    remembered one; the side-stream calls enter two streams."""
+    _require_tau_program()
+    T, C = 16231, 4096
+    inp = _tau_inputs(T, W=glm_weight)
+    streams: list = []
+    real = cake_backend._ffi_stream_context
+
+    def spy(index):
+        streams.append(torch.cuda.current_stream(index).cuda_stream)
+        return real(index)
+
+    monkeypatch.setattr(cake_backend, "_ffi_stream_context", spy)
+    off = _run(inp, C, entry="logprob", backend="cake", dw_stream=False)
+    for i in range(10):
+        with _cache(i % 2 == 0):
+            streams.clear()
+            on = _run(inp, C, entry="logprob", backend="cake", dw_stream=True)
+            assert len(set(streams)) == 2, i
+        _assert_same_bits(off, on, _LOGPROB_KEYS)
+    _assert_same_bits(off, _run(inp, C, entry="logprob", backend="cake"), _LOGPROB_KEYS)
+
+
+def test_device_temperature_frozen_inputs(glm_weight):
+    """Frozen ``X``, frozen ``W`` or both with a heterogeneous temperature: the one-sided gradients equal the
+    two-sided ones, ``logp`` is unchanged."""
+    _require_tau_program()
+    inp = _tau_inputs(4097, W=glm_weight)
+    kw = dict(entry="logprob", backend="cake")
+    both = _run(inp, 4096, **kw)
+    x_only = _run(inp, 4096, train_w=False, **kw)
+    w_only = _run(inp, 4096, train_x=False, **kw)
+    neither = _run(inp, 4096, train_x=False, train_w=False, **kw)
+    assert x_only["dW"] is None and w_only["dX"] is None
+    assert neither["dX"] is None and neither["dW"] is None
+    assert torch.equal(_bits(x_only["dX"]), _bits(both["dX"]))
+    assert torch.equal(_bits(w_only["dW"]), _bits(both["dW"]))
+    for r in (x_only, w_only, neither):
+        assert torch.equal(_bits(r["logp"]), _bits(both["logp"]))
+
+
+def test_device_temperature_upstream_gradients(glm_weight):
+    """Arbitrary per-row upstream gradients with a heterogeneous temperature on the generated program: random
+    (nonzero on ignored rows too) and large ones within the gates of their references, zeros give zero gradients,
+    the negated upstream the negated gradients; a retained graph repeats the backward bitwise."""
+    _require_tau_program()
+    T = 4097
+    inp = _tau_inputs(T, W=glm_weight)
+    kw = dict(entry="logprob", backend="cake")
+    base = _run(inp, 4096, **kw)
+    zeros = _run(replace(inp, dlogp=torch.zeros_like(inp.dlogp)), 4096, **kw)
+    assert torch.all(zeros["dX"] == 0) and torch.all(zeros["dW"] == 0)
+    negated = _run(replace(inp, dlogp=-inp.dlogp), 4096, **kw)
+    assert torch.equal(negated["dX"], -base["dX"])
+    assert torch.equal(negated["dW"], -base["dW"])
+    gen = torch.Generator(device=CUDA)
+    gen.manual_seed(SEED + 7639)
+    for g in (torch.randn(T, generator=gen, device=CUDA), inp.dlogp * 1e4):
+        g_inp = replace(inp, dlogp=g.contiguous())
+        _check_against_references(_run(g_inp, 4096, **kw), g_inp, entry="logprob")
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    logp = cake_backend.chunked_lm_head_det_logprob_temperature(
+        X, W, inp.labels, chunk_size=4096, backend="cake", temperature=inp.temperature
+    )
+    first = torch.autograd.grad(logp, (X, W), inp.dlogp, retain_graph=True)
+    second = torch.autograd.grad(logp, (X, W), inp.dlogp)
+    for a, b, ref in zip(first, second, (base["dX"], base["dW"]), strict=True):
+        assert torch.equal(_bits(a), _bits(b)) and torch.equal(_bits(a), _bits(ref))
+
+
+_FRESH_PROCESS_TAU_SCRIPT = """
+import sys, torch
+sys.path.insert(0, {root!r})
+from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
+from tests.test_helpers.cake_package import cake_package
+cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
+W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W  # the module fixture's weight
+inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05, temperature="hetero")
+X = inp.X.detach().requires_grad_(True)
+W = inp.W.detach().requires_grad_(True)
+logp = cake_backend.chunked_lm_head_det_logprob_temperature(
+    X, W, inp.labels, chunk_size={C}, backend="cake", temperature=inp.temperature
+)
+dX, dW = torch.autograd.grad(logp, (X, W), inp.dlogp)
+torch.cuda.synchronize()
+torch.save(dict(logp=logp.detach().cpu(), dX=dX.cpu(), dW=dW.cpu()), {out!r})
+"""
+
+
+def test_device_temperature_fresh_thread_process_and_changing_t(glm_weight, tmp_path):
+    """With a heterogeneous temperature: the backward from a fresh thread and the whole step in a fresh process give
+    the main thread's bits; calls whose ``T`` changes between them (two chunks, one, four) repeat bitwise."""
+    _require_tau_program()
+    T, C = 4097, 4096
+    inp = _tau_inputs(T, W=glm_weight)
+
+    def grad_path():
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        logp = cake_backend.chunked_lm_head_det_logprob_temperature(
+            X, W, inp.labels, chunk_size=C, backend="cake", temperature=inp.temperature
+        )
+        dX, dW = torch.autograd.grad(logp, (X, W), inp.dlogp)
+        torch.cuda.synchronize()
+        return dict(logp=logp.detach(), dX=dX, dW=dW)
+
+    main = grad_path()
+    _check_against_references(main, inp, entry="logprob")
+    outcome = {}
+
+    def worker():
+        try:
+            outcome["result"] = grad_path()
+        except BaseException as exc:  # surfaced by the assertion below
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=worker, name="fresh-temperature-thread")
+    thread.start()
+    thread.join()
+    assert "error" not in outcome, repr(outcome.get("error"))
+    _assert_same_bits(outcome["result"], main, _LOGPROB_KEYS)
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    out = tmp_path / "fresh_process_temperature.pt"
+    script = _FRESH_PROCESS_TAU_SCRIPT.format(
+        root=root, T=T, seed=SEED + 7637 + T, seed_w=SEED, C=C, out=str(out)
+    )
+    env = dict(
+        os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=root,
+        timeout=1800,
+    )
+    assert proc.returncode == 0, (
+        f"fresh process failed ({proc.returncode}):\n{proc.stdout[-2000:]}\n{proc.stderr[-4000:]}"
+    )
+    fresh = torch.load(out)
+    _assert_same_bits({k: v.to(CUDA) for k, v in fresh.items()}, main, _LOGPROB_KEYS)
+    inputs = [_tau_inputs(n, W=glm_weight) for n in (4095, 4097, 1500, 16231, 4095)]
+    kw = dict(entry="logprob", backend="cake")
+    first = [_run(i, 4096, **kw) for i in inputs]
+    again = [_run(i, 4096, **kw) for i in inputs]
+    for a, b in zip(first, again, strict=True):
+        _assert_same_bits(a, b, _LOGPROB_KEYS)
+    _assert_same_bits(first[0], first[-1], _LOGPROB_KEYS)
+
+
+def test_device_temperature_ignored_rows(glm_weight):
+    """Ignored rows (``-100`` and other negative labels) with a heterogeneous temperature: ``logp`` and the ``dX``
+    rows are exactly zero, and the temperatures of ignored rows reach no output -- extreme valid values there
+    (``1e-30``, ``3e38``) give the same bits -- compacted, uncompacted and with the hidden valid-row count."""
+    _require_tau_program()
+    for T, compact in ((4097, True), (4097, False), (16231, True)):
+        inp = _tau_inputs(T, W=glm_weight, ignore_frac=0.33)
+        labels = inp.labels.clone()
+        ignored = (~inp.valid).nonzero().reshape(-1)
+        labels[ignored[:4]] = torch.tensor([-1, -7, -2, -(2**40)], device=CUDA)
+        inp = replace(inp, labels=labels)
+        kw = dict(entry="logprob", backend="cake", compact_rows=compact)
+        base = _run(inp, 4096, **kw)
+        assert torch.all(base["logp"][~inp.valid] == 0), (T, compact)
+        assert torch.all(base["dX"][~inp.valid] == 0), (T, compact)
+        tau = inp.temperature.clone()
+        tau[ignored[0::2]] = 1e-30
+        tau[ignored[1::2]] = 3e38
+        other = _run(replace(inp, temperature=tau), 4096, **kw)
+        _assert_same_bits(base, other, _LOGPROB_KEYS)
+
+
+def test_device_temperature_does_not_synchronize(glm_weight):
+    """With a temperature (a tensor, validated by a device assertion, and a scalar) the log-probability backward runs
+    without a host synchronization from a remembered binding (compacted and uncompacted, one to three chunks), and
+    the forward with the caller's count runs without one."""
+    _require_tau_program()
+    for T, C, compact in ((1500, 4096, True), (6000, 4096, False), (8700, 4096, True)):
+        inp = _tau_inputs(T, W=glm_weight)
+        for form in (inp.temperature, 0.7):
+            X = inp.X.detach().requires_grad_(True)
+            W = inp.W.detach().requires_grad_(True)
+            for i in range(2):
+                logp = cake_backend.chunked_lm_head_det_logprob_temperature(
+                    X,
+                    W,
+                    inp.labels,
+                    chunk_size=C,
+                    backend="cake",
+                    compact_rows=compact,
+                    temperature=form,
+                )
+                torch.cuda.synchronize()
+                if i:
+                    torch.cuda.set_sync_debug_mode("error")
+                try:
+                    logp.backward(inp.dlogp)
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
+                torch.cuda.synchronize()
+                assert torch.all(X.grad[~inp.valid] == 0)
+                X.grad = W.grad = None
+    if opt_in._given_count_readback(CUDA):
+        return  # this toolchain checks the caller's count by a readback
+    inp = _tau_inputs(8700, W=glm_weight)
+    n = int(inp.valid.sum())
+    for form in (inp.temperature, 0.7):
+        _run(
+            inp,
+            4096,
+            entry="logprob",
+            backend="cake",
+            num_valid_rows=n,
+            temperature=form,
+        )
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            opt_in.chunked_lm_head_det_logprob_temperature(
+                inp.X,
+                inp.W,
+                inp.labels,
+                chunk_size=4096,
+                backend="cake",
+                num_valid_rows=n,
+                temperature=form,
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("T", [4097, 16231])
+def test_device_temperature_step_peak(glm_weight, T):
+    """The step peak (forward through backward, outputs and gradients included) with a heterogeneous temperature
+    exceeds the peak without one by at most the temperature's own buffers -- the compact ``[T]`` FP32 vector, the
+    hidden count's transient int64 clamped index, the validation's bool temporaries -- plus allocator rounding, in
+    the fast and the budget memory mode (no ``[T, V]`` buffer)."""
+    _require_tau_program()
+    _require_recompute()
+    inp = _tau_inputs(T, W=glm_weight)
+    plain = replace(inp, temperature=None)
+    allowance = 4 * T + 8 * T + 3 * T + (16 << 10)
+    for kw in ({}, dict(memory_mode="budget")):
+        peaks = {}
+        for name, case in (("plain", plain), ("tau", inp)):
+            extra = (
+                {} if case.temperature is None else dict(temperature=case.temperature)
+            )
+            for _ in range(2):  # the second call launches from the remembered binding
+                _, peak, _ = _budget_step(case, 4096, "logprob", **extra, **kw)
+            peaks[name] = peak
+        assert peaks["tau"] - peaks["plain"] <= allowance, (T, kw, peaks, allowance)
+
+
+_TAU_ASSERT_SCRIPT = """
+import sys, torch
+sys.path.insert(0, {root!r})
+from tests.test_helpers.cake_lm_head_loss_reference import make_weight
+from tests.test_helpers.cake_package import cake_package
+cake_backend = cake_package("cake_lm_head_det_loss", "cake_backend")
+H, V = {H}, {V}
+labels = torch.tensor([0, -100, 3, 1, -100, 2], device="cuda")
+T = int(labels.numel())
+X = torch.randn(T, H, device="cuda").to(torch.bfloat16)
+W = make_weight(V, H, seed=1, device="cuda")
+good = torch.full((T,), 0.7, device="cuda")
+cake_backend.chunked_lm_head_det_logprob_temperature(X, W, labels, chunk_size=4, backend={backend!r}, temperature=good)
+torch.cuda.synchronize()
+print("RIGHT", flush=True)
+bad = good.clone()
+bad[{row}] = {value}
+cake_backend.chunked_lm_head_det_logprob_temperature(X, W, labels, chunk_size=4, backend={backend!r}, temperature=bad)
+torch.cuda.synchronize()
+print("WRONG_PASSED", flush=True)
+"""
+
+
+def test_device_temperature_assertion_stops_the_stream():
+    """An invalid CUDA temperature without ``check_temperature`` stops the stream with a device-side assertion (run in
+    a fresh process: the assertion ends the CUDA context) -- zero, negative, NaN and infinite entries at valid rows and
+    zero / NaN at ignored rows (strict on every row), on the reference backend and on the generated program; the
+    valid temperature passes first."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    env = dict(
+        os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
+    # labels [0, -100, 3, 1, -100, 2]: rows 1 and 4 ignored
+    cases = [
+        ("reference", H_HOST, V_HOST, 0, "0.0"),
+        ("reference", H_HOST, V_HOST, 3, "-0.5"),
+        ("reference", H_HOST, V_HOST, 2, "float('nan')"),
+        ("reference", H_HOST, V_HOST, 5, "float('inf')"),
+        ("reference", H_HOST, V_HOST, 1, "0.0"),
+        ("reference", H_HOST, V_HOST, 4, "float('nan')"),
+    ]
+    if _device_supported() and generated_program_available(CUDA, entry="logprob"):
+        name, _ = cake_backend.record_for(CUDA)
+        if all(
+            s in cake_jit.registered_stages_with_temperature(name) for s in TAU_STAGES
+        ):
+            cases += [
+                ("cake", DEFAULT_H, DEFAULT_V, 0, "0.0"),
+                ("cake", DEFAULT_H, DEFAULT_V, 4, "float('nan')"),
+            ]
+    for backend, H, V, row, value in cases:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _TAU_ASSERT_SCRIPT.format(
+                    root=root, H=H, V=V, backend=backend, row=row, value=value
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=root,
+            timeout=900,
+        )
+        report = f"{(backend, row, value)} {proc.returncode}\n{proc.stdout[-2000:]}\n{proc.stderr[-4000:]}"
+        assert "RIGHT" in proc.stdout, report
+        assert "WRONG_PASSED" not in proc.stdout and proc.returncode != 0, report
+        assert "assert" in proc.stderr.lower(), report
+
+
+@pytest.mark.parametrize("T", [4097, 16231])
+def test_device_temperature_binding_cache_rebinds_it(glm_weight, T):
+    """The binding key carries whether a call has a temperature, not its storage or values: calls with different
+    temperature tensors, scalars and an equal tensor in other storage launch from one remembered binding and give the
+    bits of fresh bindings (cache off); different temperatures give different results."""
+    _require_tau_program()
+    inp = _device_inputs(T, W=glm_weight)
+    tau1 = make_temperature(T, "hetero", seed=SEED + 1, device=CUDA)
+    tau2 = make_temperature(T, "hetero", seed=SEED + 2, device=CUDA)
+    forms = (tau1, tau2, 0.7, 1.3, tau1.clone())
+    kw = dict(entry="logprob", backend="cake")
+    with _cache(True) as cache:
+        cache.clear()
+        hits = cache.hits
+        hot = [_run(inp, 4096, temperature=f, **kw) for f in forms]
+        assert cache.hits - hits >= len(forms) - 1, (cache.hits, hits)
+    with _cache(False):
+        cold = [_run(inp, 4096, temperature=f, **kw) for f in forms]
+    for h, c in zip(hot, cold, strict=True):
+        _assert_same_bits(h, c, _LOGPROB_KEYS)
+    assert not torch.equal(hot[0]["logp"], hot[1]["logp"])
+    _assert_same_bits(hot[0], hot[4], _LOGPROB_KEYS)
+
+
+def test_device_temperature_needs_the_registered_forms(glm_weight, monkeypatch):
+    """A registered program without one of the temperature forms the call needs fails closed: without the
+    label-column, ``dz`` or row-finalize temperature form a call with a temperature is a ``NotImplementedError``
+    naming the missing stage (fast and budget memory modes; never a silent run of the stages without the
+    temperature), while the call without a temperature still runs; without the device-count temperature form the
+    call takes the host valid-row count and gives the bits of the hidden-count call."""
+    _require_tau_program()
+    real = cake_backend.registered_stages_with_temperature
+
+    def registered_without(stage):
+        # both modules read their own ``registered_stages_with_temperature`` (the stage lists of a call with a
+        # temperature; the budget memory mode plans in the opt-in module)
+        for be in (cake_backend, opt_in):
+            monkeypatch.setattr(
+                be,
+                "registered_stages_with_temperature",
+                lambda n, stage=stage: tuple(s for s in real(n) if s != stage),
+            )
+
+    T = 16231
+    inp = _device_inputs(T, W=glm_weight)
+    tau = make_temperature(T, "hetero", seed=SEED + 11, device=CUDA)
+    kw = dict(entry="logprob", backend="cake")
+    bound = _spy_bound_stages(monkeypatch)
+    with _cache(False), _cache(False, ("memory_mode",)):
+        full = _run(inp, 4096, temperature=tau, **kw)
+        _assert_temperature_plan(
+            bound, hidden=_expect_hidden(inp, 4096, {}), case="registered"
+        )
+        for drop in ("gemm_logits_dz_tau", "gemm_logits_lbl_tau", "row_finalize_tau"):
+            registered_without(drop)
+            for mode in ("fast", "budget"):
+                bound.clear()
+                with pytest.raises(NotImplementedError, match=drop):
+                    _run(inp, 4096, temperature=tau, memory_mode=mode, **kw)
+                assert not set(bound) & _UNTAU_STAGES, (drop, mode, sorted(set(bound)))
+            torch.cuda.synchronize()
+            _run(inp, 4096, **kw)  # the call without a temperature is unaffected
+        registered_without("gemm_logits_mcnt_tau")
+        bound.clear()
+        host = _run(inp, 4096, temperature=tau, **kw)
+        _assert_temperature_plan(bound, hidden=False, case="no mcnt_tau")
+    _assert_same_bits(full, host, _LOGPROB_KEYS)
+
+
+@pytest.mark.parametrize("T,H", [(1000, 6144), (4097, 6144)])
+def test_device_vocab_256_dx_slices_temperature(T, H):
+    """A call with a temperature plans its dX slices with the fitted rule of the call without one (V = 256 has four K
+    steps; 3 slices at T = 1000, H = 6144 and on the 1-row tail chunk of T = 4097 on 148 and 152 SMs before the fit):
+    the default plan and every pin whose slices all hold a K step match the references with a per-token temperature,
+    and a pin of 3 slices is rejected."""
+    _require_tau_program()
+    W = make_inputs(1, seed=SEED, H=H, V=256, device=CUDA, ignore_frac=0.0).W
+    inp = make_inputs(
+        T, seed=SEED + 7637 + T, H=H, V=256, device=CUDA, W=W, temperature="hetero"
+    )
+    for k in (None, 1, 2, 4):
+        tuning = None if k is None else {"dx": {"k_slices": k}}
+        result = _run(inp, 4096, entry="logprob", backend="cake", gemm_tuning=tuning)
+        _check_dtypes(result, inp)
+        _check_against_references(result, inp, entry="logprob")
+    with pytest.raises(ValueError, match="K steps"):
+        _run(
+            inp,
+            4096,
+            entry="logprob",
+            backend="cake",
+            gemm_tuning={"dx": {"k_slices": 3}},
+        )
+    plan = cake_backend.prepare_lm_head_det_loss_temperature(
+        inp.X,
+        inp.W,
+        inp.labels,
+        chunk_size=4096,
+        entry="logprob",
+        temperature=inp.temperature,
+    ).plan
+    assert plan.temperature
+    sms = torch.cuda.get_device_properties(CUDA).multi_processor_count
+    if (T, H) in _VOCAB_256_DEFAULT_DX_SLICES and sms in (148, 152):
+        assert plan.dx_slices == _VOCAB_256_DEFAULT_DX_SLICES[(T, H)], (
+            sms,
+            plan.dx_slices,
+        )
+    assert all(s == 1 or (s - 1) * -(-4 // s) < 4 for s in plan.dx_slices), (
+        plan.dx_slices
+    )
+
+
+@pytest.mark.parametrize("V", [256, 512, 154880])
+def test_device_budget_plan_temperature_is_the_plain_budget_plan(V):
+    """The budget form's memory plan of a call with a temperature (``_budget_plan_temperature``) is the plan of the
+    call without one -- the same dX K-slice slabs, fitted to V's K steps, for the slice rule and every pin -- on the
+    device's registered program."""
+    _require_tau_program()
+    rows = 1000
+    for k in (None, 1, 2, 4):
+        tuning = {} if k is None else {"dx": {"k_slices": k}}
+        kw = dict(
+            num_rows=rows,
+            rows=rows,
+            hidden=6144,
+            vocab=V,
+            chunk=4096,
+            compact=False,
+            need_dx=True,
+            fuse_dw_cast=True,
+            buffer_rows=rows,
+            x_copy=False,
+            dx_finalize=False,
+            budget_rows=rows,
+            tuning=tuning,
+        )
+        plain = opt_in._budget_plan("logprob", CUDA, **kw)
+        tau = opt_in._budget_plan_temperature("logprob", CUDA, **kw)
+        assert tau == plain, (V, k, tau, plain)
+
+
+def test_device_keep_logits_temperature_one_is_the_kept_call(glm_weight, monkeypatch):
+    """``memory_mode="keep_logits"`` with a temperature whose FP32 value is 1.0 is the kept call without a
+    temperature: the same bits (integer views) and no temperature form bound; a temperature other than 1.0 is a
+    ``ValueError``."""
+    _require_tau_program()
+    bound = _spy_bound_stages(monkeypatch)
+    inp = _device_inputs(4097, W=glm_weight)
+    base = _run(inp, 4096, entry="logprob", backend="cake", memory_mode="keep_logits")
+    assert not any(s.endswith("_tau") for s in bound)
+    bound.clear()
+    one = _run(
+        inp,
+        4096,
+        entry="logprob",
+        backend="cake",
+        memory_mode="keep_logits",
+        temperature=1.0,
+    )
+    assert not any(s.endswith("_tau") for s in bound)
+    _assert_same_bits(base, one, _LOGPROB_KEYS)
+    with pytest.raises(ValueError, match="takes no temperature"):
+        _run(
+            inp,
+            4096,
+            entry="logprob",
+            backend="cake",
+            memory_mode="keep_logits",
+            temperature=torch.full((inp.T,), 0.7, device=CUDA),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -10474,6 +12635,173 @@ def test_device_checkpointed_logprob_keep_step_is_bitwise(glm_weight, entry):
         run = step(kind, head_keep)
         assert _placement_bits(run[0], plain[0]), kind
         assert _placement_bits(run[1], plain[1]), kind
+
+
+@pytest.mark.parametrize("module", ["backend", "opt_in"])
+@pytest.mark.parametrize(
+    "kind", ["selective_recompute", "selective_save_mm", "selective_save_all"]
+)
+def test_temperature_selective_checkpoint_runs_outside_the_dispatch_modes(
+    monkeypatch, kind, module
+):
+    """The temperature entry under selective activation checkpointing runs its forward with every torch dispatch
+    mode popped in both passes (the checkpointed forward and the recomputation), as the other det entries, and gives
+    the uncheckpointed step's ``logp`` / ``dX`` / ``dW`` bits (a per-token temperature).  ``opt_in``: the opt-in
+    module's autograd function (the entry with a count)."""
+    inp = _host_inputs(65, ignore_frac=0.1, temperature="hetero")
+    mod = cake_backend if module == "backend" else opt_in
+    kw = (
+        {} if module == "backend" else dict(num_valid_rows=int((inp.labels >= 0).sum()))
+    )
+    real = mod.forward_logprob_temperature
+    stacks = []
+
+    def spy(*args, **kwargs):
+        stacks.append(torch._C._len_torch_dispatch_stack())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "forward_logprob_temperature", spy)
+    logps = []
+
+    def head(a, b):
+        logp = mod.chunked_lm_head_det_logprob_temperature(
+            a,
+            b,
+            inp.labels,
+            chunk_size=32,
+            backend="reference",
+            temperature=inp.temperature,
+            **kw,
+        )
+        logps.append(logp.detach())
+        return (logp * inp.dlogp).sum()
+
+    def step(k):
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        _checkpointed(k, head, X, W).backward()
+        return logps[0], X.grad, W.grad
+
+    plain = step("plain")
+    assert stacks == [0], stacks
+    stacks.clear()
+    logps.clear()
+    run = step(kind)
+    assert stacks == [0, 0], stacks
+    for name, a, b in zip(("logp", "dX", "dW"), run, plain, strict=True):
+        assert torch.equal(a, b), name
+    gc.collect()
+    assert len(cake_backend._CHECKPOINT_CALLS) == 0
+
+
+def _tau_region_entry(entry, inp, X, W):
+    """The scalar a temperature checkpoint test differentiates: the temperature entry on ``X`` / ``W`` (a per-token
+    temperature; ``opt_in_count``: the opt-in entry with a count, ``opt_in_budget``: its budget form)."""
+    if entry == "backend":
+        logp = cake_backend.chunked_lm_head_det_logprob_temperature(
+            X, W, inp.labels, chunk_size=4096, temperature=inp.temperature
+        )
+    else:
+        kw = (
+            dict(num_valid_rows=int((inp.labels >= 0).sum()))
+            if entry == "opt_in_count"
+            else dict(memory_mode="budget")
+        )
+        logp = opt_in.chunked_lm_head_det_logprob_temperature(
+            X, W, inp.labels, chunk_size=4096, temperature=inp.temperature, **kw
+        )
+    return (logp * inp.dlogp).sum()
+
+
+@pytest.mark.parametrize("entry", ["backend", "opt_in_count", "opt_in_budget"])
+def test_device_checkpointed_temperature_step_is_bitwise(glm_weight, entry):
+    """The temperature entry under a non-reentrant checkpoint, selective activation checkpointing and a dispatch mode
+    (around the checkpointed forward; around the whole step) gives the uncheckpointed step's ``dX`` / ``dW`` bits."""
+    _require_tau_program()
+    inp = _tau_inputs(12289, W=glm_weight)
+
+    def head(a, b):
+        return _tau_region_entry(entry, inp, a, b)
+
+    def step(kind):
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        if kind == "dispatch_mode_step":
+            with _PassThroughMode():
+                _checkpointed("nonreentrant", head, X, W).backward()
+        else:
+            _checkpointed(kind, head, X, W).backward()
+        torch.cuda.synchronize()
+        return X.grad, W.grad
+
+    step("plain")  # binds
+    plain = step("plain")
+    for kind in (
+        "nonreentrant",
+        "selective_recompute",
+        "selective_save_mm",
+        "selective_save_all",
+        "dispatch_mode",
+        "dispatch_mode_step",
+    ):
+        run = step(kind)
+        assert _placement_bits(run[0], plain[0]), kind
+        assert _placement_bits(run[1], plain[1]), kind
+
+
+@pytest.mark.parametrize("kind", ["hold", "user_mode", "nested"])
+@pytest.mark.parametrize("entry", ["backend", "opt_in_count", "opt_in_budget"])
+def test_device_selective_checkpoint_region_input_temperature(glm_weight, entry, kind):
+    """:func:`test_device_selective_checkpoint_region_input` for the temperature entry: its input formed inside the
+    selective-checkpoint region (``X = Hin @ P``), memory held between the forward and the backward (a binding miss in
+    the recomputation only), a user dispatch mode around the step (``user_mode``) or a non-reentrant checkpoint nested
+    inside the selective one (``nested``).  ``logp`` sum / ``dHin`` / ``dP`` / ``dW`` are the uncheckpointed step's
+    bits."""
+    _require_tau_program()
+    inp = _tau_inputs(12289, W=glm_weight)
+    H = inp.X.shape[1]
+    g = torch.Generator(device="cpu").manual_seed(SEED + 2)
+    Hin0 = (torch.randn(inp.X.shape, generator=g) * 0.5).to(torch.bfloat16).cuda()
+    P0 = (torch.randn(H, H, generator=g) / H**0.5).to(torch.bfloat16).cuda()
+
+    def region(h, p, w):
+        return _tau_region_entry(entry, inp, torch.mm(h, p), w)
+
+    def step(selective):
+        h, p, w = (t.detach().requires_grad_(True) for t in (Hin0, P0, inp.W))
+        mode = (
+            _PassThroughMode()
+            if (selective and kind == "user_mode")
+            else contextlib.nullcontext()
+        )
+        with mode:
+            if not selective:
+                out = region(h, p, w)
+            else:
+                fn = region
+                if kind == "nested":
+
+                    def fn(a, b, c):
+                        return torch.utils.checkpoint.checkpoint(
+                            region, a, b, c, use_reentrant=False
+                        )
+
+                out = torch.utils.checkpoint.checkpoint(
+                    fn, h, p, w, use_reentrant=False, context_fn=_selective("recompute")
+                )
+            held = [torch.empty_like(Hin0) for _ in range(2)] if selective else []
+            out.backward()
+        torch.cuda.synchronize()
+        del held
+        return [out.detach(), h.grad, p.grad, w.grad]
+
+    step(False)  # binds
+    plain = step(False)
+    for _ in range(2):
+        step(False)
+        run = step(True)
+        for name, a, b in zip(("logp", "dHin", "dP", "dW"), run, plain, strict=True):
+            assert _placement_bits(a, b), name
 
 
 @pytest.mark.parametrize("memory_mode", ["budget", None])

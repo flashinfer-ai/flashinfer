@@ -424,8 +424,13 @@ kernel_cake_lm_head_det_loss_69d867c2e601acd39856(const __grid_constant__ CUtens
                         mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int init_flag = ((mm_k == 0) ? 1 : 0);
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_0 = ((((smem_v1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int _mma_b_lo_0 = ((((smem_v0_addr) >> 4) & 0x7FFF) | 0x4000000) + (mma_tma_stage) * 3072;
+#else
                         int _mma_a_lo_0 = ((((smem_v1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int _mma_b_lo_0 = ((((smem_v0_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -461,8 +466,13 @@ kernel_cake_lm_head_det_loss_69d867c2e601acd39856(const __grid_constant__ CUtens
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_accum), "r"(((init_flag) ? 0 : 1)), "r"(((0x10408490U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(sw_n0_1) >> 3) << 17))) : "memory");
                         if (sw_n1_1 > 0) {
+#if __CUDA_ARCH__ == 1070
+                            int _mma_a_lo_1 = ((((smem_v1_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                            int _mma_b_lo_1 = ((((smem_v0_addr_0) >> 4) & 0x7FFF) | 0x4000000) + (mma_tma_stage) * 3072;
+#else
                             int _mma_a_lo_1 = ((((smem_v1_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                             int _mma_b_lo_1 = ((((smem_v0_addr_0) >> 4) & 0x3FFF) | 0x4000000) + (mma_tma_stage) * 3072;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
