@@ -181,6 +181,15 @@ def _two_shot_suffix(target: str, input_format: str, bv: int) -> str:
     )
 
 
+def _two_shot_norm_program(target: str, bv: int) -> str:
+    """The world-size-4 fused-norm program ``target`` builds for ``bv`` (bfloat16 input and output): the
+    two-shot program's forms without a pass-2 source token (the norm keeps the residual row where the
+    shared-memory source keeps the packets)."""
+    return f"tp4_rmsnorm_bf16_bf16_bv{bv}" + _two_shot_suffix(
+        target, "bf16", bv
+    ).replace("_p2m", "")
+
+
 def _fused_norm_forms(target: str, input_format: str, output_format: str) -> dict:
     """The forms of the whole fused-norm program ``target`` builds for one (input format, output format), as
     the registry records them: the poll ("all" for the probe-all poll), the pass 2 and its unroll, the worker
@@ -309,6 +318,7 @@ def _expected_program_ids() -> set[str]:
         for pf in (False, True)
     }
     ids |= {_fused_norm_band(t, i, o) for (t, i, o) in FUSED_NORM_BANDS}
+    ids |= {_two_shot_norm_program(t, bv) for t in TARGETS for bv in BVS}
     return ids
 
 
@@ -326,14 +336,14 @@ def _expected_params(
             windows = ("q_wire",)
         return (*inputs, "out", *windows, "peer_ptrs", "ctrl", "rank", "rows", "cap")
     outputs = ("out",) if output_format == "bf16" else ("outq", "out_sf", "gs_out")
+    windows = ("ts_wire", "ts_rs") if world_size == 4 else ("os_wire", "os_rs")
     return (
         *inputs,
         "res_in",
         "w",
         *outputs,
         "res_out",
-        "os_wire",
-        "os_rs",
+        *windows,
         "peer_ptrs",
         "ctrl",
         "rank",
@@ -349,7 +359,7 @@ def _binding_form(record: dict) -> str:
     if record["family"] == "allreduce":
         shot = "oneshot" if record["world_size"] == 2 else "twoshot"
         return f"tp{record['world_size']}_{shot}_{record['input_format']}"
-    return f"tp2_rmsnorm_{record['input_format']}_{record['output_format']}"
+    return f"tp{record['world_size']}_rmsnorm_{record['input_format']}_{record['output_format']}"
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +370,7 @@ def _binding_form(record: dict) -> str:
 @pytest.mark.cpu_only
 def test_registry_lists_every_program_with_the_contract_parameters() -> None:
     assert set(PROGRAMS) == _expected_program_ids()
-    assert len(PROGRAMS) == 53
+    assert len(PROGRAMS) == 59
     keys = {
         "family",
         "world_size",
@@ -391,7 +401,9 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
         if family == "allreduce":
             assert output_format is None and world_size in (2, 4)
         else:
-            assert output_format in OUTPUT_FORMATS and world_size == 2
+            assert output_format in OUTPUT_FORMATS and world_size in (2, 4)
+            if world_size == 4:
+                assert (input_format, output_format) == ("bf16", "bf16")
         assert record["params"] == _expected_params(
             family, world_size, input_format, output_format
         )
@@ -423,7 +435,11 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
             # tokens, pinned per target by the selection tests.
             assert record["bv"] in BVS
             assert record["reset"] in ("bulk", "st")
-            assert program.startswith(f"tp4_twoshot_{input_format}_bv{record['bv']}")
+            assert program.startswith(
+                f"tp4_twoshot_{input_format}_bv{record['bv']}"
+                if family == "allreduce"
+                else f"tp4_rmsnorm_{input_format}_{output_format}_bv{record['bv']}"
+            )
             assert program.endswith("_rst") == (record["reset"] == "st")
         elif family == "allreduce":
             # The one-shot kernel's re-arm form off the input format's baseline (the BF16 kernel
@@ -442,7 +458,10 @@ def test_registry_lists_every_program_with_the_contract_parameters() -> None:
             assert program.endswith(rearm), program
         else:
             assert record["bv"] is None and record["reset"] is None
-        if family == "rmsnorm":
+        if family == "rmsnorm" and world_size == 4:
+            # The two-shot fused norm has no prefetch build and sums its squares by half row.
+            assert record["prefetch"] is None and record["ss_order"] is None
+        elif family == "rmsnorm":
             assert record["prefetch"] in (False, True)
             assert program.endswith("_pf") == record["prefetch"], program
             stem = program[: -len("_pf")] if record["prefetch"] else program
@@ -529,7 +548,6 @@ def test_limits_and_selection_constants_match_the_contract() -> None:
         "record_bytes": 3456,
         "tp4_cap_max": 103000,
         "tp2_oneshot_grid_max": 4096,
-        "tp4_row_multiple": 4,
         "nvfp4_value_bytes": 3072,
         "nvfp4_scales_per_row": 384,
         "mxfp8_value_bytes": 6144,
@@ -546,13 +564,12 @@ def test_limits_and_selection_constants_match_the_contract() -> None:
     assert loader.RECORD_BYTES == ref.RECORD_BYTES == 3456
     assert LIMITS["hidden"] == ref.HIDDEN
     assert LIMITS["record_bytes"] == ref.RECORD_BYTES
-    assert LIMITS["tp4_row_multiple"] == ref.TP4_ROW_MULTIPLE
     # One call-state slot per CTA bounds every program's grid at the one-shot bound of LIMITS.
     assert {record["grid_max"] for record in PROGRAMS.values()} == {GRID_MAX}
     assert LIMITS["tp2_oneshot_grid_max"] == GRID_MAX
     assert set(loader.FAMILIES) == {"allreduce", "rmsnorm"}
     assert loader.world_sizes("allreduce") == (2, 4)
-    assert loader.world_sizes("rmsnorm") == (2,)
+    assert loader.world_sizes("rmsnorm") == (2, 4)
     assert set(loader.INPUT_FORMATS) == set(INPUT_FORMATS)
     assert set(loader.OUTPUT_FORMATS) == set(OUTPUT_FORMATS)
     with pytest.raises(ValueError):
@@ -578,7 +595,7 @@ def _expected_window(family: str, world_size: int, input_format: str, cap: int) 
     words (every window: one four-word call-state slot per CTA of the grid bound)."""
     ctrl_words = CTRL_WORDS_PER_CTA * GRID_MAX
     nr = world_size
-    if family == "allreduce" and world_size == 4:
+    if world_size == 4:
         # Per rotation buffer a reduce-scatter and an all-gather slot array of nr * capo rows each.
         capo = -(-cap // 4)
         rows = nr * capo
@@ -727,6 +744,7 @@ def test_window_keys_and_buffer_params_match_the_programs() -> None:
         "allreduce/4/nvfp4",
         "rmsnorm/2/bf16",
         "rmsnorm/2/nvfp4",
+        "rmsnorm/4/bf16",
     }
     for key, window in WINDOWS.items():
         family, world_size, input_format = key.split("/")
@@ -749,7 +767,7 @@ def test_window_keys_and_buffer_params_match_the_programs() -> None:
     with pytest.raises(ValueError):
         loader.window_contract("allreduce", 8, "bf16")
     with pytest.raises(ValueError):
-        loader.window_contract("rmsnorm", 4, "bf16")
+        loader.window_contract("rmsnorm", 4, "nvfp4")
 
 
 @pytest.mark.cpu_only
@@ -881,6 +899,37 @@ def test_program_for_two_shot_picks_the_targets_forms(
         assert record["reset"] == (
             "st" if variant in REGISTER_STORE_FORMS[target] else "bulk"
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("target", TARGETS)
+def test_program_for_two_shot_fused_norm(target: str) -> None:
+    """The four-rank fused norm (bfloat16 in and out) takes the two-shot schedule of select_bv at any row count."""
+    grid = 148
+    for rows, bv in ((1, 1), (7, 1), (2049, 1), (6000, 1), (8191, 0), (16384, 2)):
+        assert loader.select_bv(rows, grid) == bv
+        program = loader.program_for(
+            family="rmsnorm",
+            world_size=4,
+            input_format="bf16",
+            output_format="bf16",
+            rows=rows,
+            grid=grid,
+            target=target,
+        )
+        assert program == _two_shot_norm_program(target, bv)
+        assert target in PROGRAMS[program]["targets"] and PROGRAMS[program]["bv"] == bv
+    for output_format in ("nvfp4", "mxfp8"):
+        with pytest.raises(ValueError):
+            loader.program_for(
+                family="rmsnorm",
+                world_size=4,
+                input_format="bf16",
+                output_format=output_format,
+                rows=1024,
+                grid=grid,
+                target=target,
+            )
 
 
 @pytest.mark.cpu_only
@@ -1496,7 +1545,7 @@ def test_codec_reproduces_exact_cases() -> None:
     )
     assert rs.tolist() == [1.0, 1.0]
     assert torch.equal(ref.reference_allreduce([x, x]), torch.full_like(x, 5376.0))
-    # Two-shot (a multiple of 4 rows): the owner re-encodes 10752 under rs 4 (inv 0.25) and decodes it exactly.
+    # Two-shot: the owner re-encodes 10752 under rs 4 (inv 0.25) and decodes it exactly.
     x4 = torch.full((4, ref.HIDDEN), 2688.0, dtype=torch.bfloat16)
     assert torch.equal(
         ref.reference_allreduce([x4, x4, x4, x4]), torch.full_like(x4, 10752.0)
@@ -1518,10 +1567,11 @@ def test_codec_reproduces_exact_cases() -> None:
     assert q1[0, 0].item() == 7 and q1[0, 1].item() == 0
     with pytest.raises(ValueError):
         ref.reference_allreduce([x, x, x])
-    with pytest.raises(ValueError):
-        ref.reference_allreduce(
-            [x[:1], x[:1], x[:1], x[:1]]
-        )  # the two-shot needs a multiple of 4 rows
+    # The two-shot takes any row count: one row decodes like the rows of a whole quad.
+    assert torch.equal(
+        ref.reference_allreduce([x4[:1], x4[:1], x4[:1], x4[:1]]),
+        torch.full_like(x4[:1], 10752.0),
+    )
 
 
 @pytest.mark.cpu_only
@@ -1698,8 +1748,22 @@ def test_fused_norm_reference_on_cpu() -> None:
         from_records.residual_out,
         ref.f32_add_rn(acc_records, residual.float()).to(torch.bfloat16),
     )
+    # Four ranks: the two-shot decode of the rank-order sum, then the same epilogue, summing by half row.
+    xs4 = xs + [x.flip(0) for x in xs]
+    four = ref.reference_fused_rmsnorm(xs4, residual, weight, ss_order="halves")
+    acc4 = ref.twoshot(ref.oneshot_sum(ref.sources_bf16(xs4)))
+    assert torch.equal(
+        four.residual_out, ref.f32_add_rn(acc4, residual.float()).to(torch.bfloat16)
+    )
     with pytest.raises(ValueError):
-        ref.reference_fused_rmsnorm(xs + xs, residual, weight)
+        ref.reference_fused_rmsnorm(xs4[:3], residual, weight)
+    with pytest.raises(ValueError):
+        ref.reference_fused_rmsnorm(
+            residual_bf16=residual,
+            weight_bf16=weight,
+            records=records + records,
+            global_scales=torch.cat([scales, scales]),
+        )
     with pytest.raises(ValueError):
         ref.reference_fused_rmsnorm(xs, residual, weight[:-1])
     with pytest.raises(ValueError):
@@ -1751,6 +1815,15 @@ def test_sum_of_squares_follows_the_lane_order() -> None:
     assert ref.sum_of_squares(probe0, order="perm").item() == 2.0**24 + 4
     with pytest.raises(ValueError):
         ref.sum_of_squares(z, order="reversed")
+    # The two-shot programs' half-row order: each half's natural chains and butterfly, then half 0 + half 1.
+    ones = torch.ones((2, ref.HIDDEN), dtype=torch.float32)
+    assert ref.sum_of_squares(ones, order="halves").tolist() == [6144.0, 6144.0]
+    halves_probe = torch.zeros((1, ref.HIDDEN), dtype=torch.float32)
+    halves_probe[0, 0] = 2.0**12  # 2^24 in pair 0 of lane 0 (the first half)
+    halves_probe[0, 3072] = 1.0  # 1 in pair 3 of lane 0 (the second half)
+    assert ref.sum_of_squares(halves_probe, order="halves").item() == 2.0**24
+    assert ref.ss_order_of({"ss_order": None}) == "halves"
+    assert ref.ss_order_of({"ss_order": "perm"}) == "perm"
 
 
 @pytest.mark.cpu_only
