@@ -41,8 +41,9 @@ _MID_WORK5FD_TOKENS = (2048, 4096)
 _LARGE_C7_TOKENS = (8192, 16384)
 # Architectures whose 8- and 16-token routes run the FC1 + FC2 programs with evict_first cache
 # hints on their weight-stream TMA loads (the "n8_feature_ef_f2e" / "n8_w2a_m16_ef_f2e"
-# selectors) -- sm_100a today; sm_103a keeps "n8_feature" / "n8_w2a_m16".  Same stage lists
-# and launch arguments as the routes they supersede.
+# selectors) and whose single-token route runs the FC1 program with that hint (the
+# "m1_s2a_m1ef" selector) -- sm_100a today; sm_103a keeps "n8_feature" / "n8_w2a_m16" /
+# "m1_s2a".  Same stage lists and launch arguments as the routes they supersede.
 _SMALL_L2POLICY_ARCHES = ("sm_100a",)
 # Architectures whose 4096-token route runs the same 8-bit per-tile partial FC2
 # and finalize behind the work5fd FC1 (eight kernels); the 2048-token route
@@ -134,6 +135,15 @@ _SELECTORS = {
         _M1_FUSED,
         {
             "fc1": "fc1:n8_s2a",
+            "fc2": "fc2:n8_m1",
+            "finalize": "finalize:feature",
+        },
+        None,
+    ),
+    "m1_s2a_m1ef": (
+        _M1_FUSED,
+        {
+            "fc1": "fc1:n8_s2a_m1ef",
             "fc2": "fc2:n8_m1",
             "finalize": "finalize:feature",
         },
@@ -279,7 +289,7 @@ def _tile_n(num_tokens):
 def _selector(arch, num_tokens):
     tile_n = _tile_n(num_tokens)
     if num_tokens == 1:
-        return "m1_s2a"
+        return "m1_s2a_m1ef" if arch in _SMALL_L2POLICY_ARCHES else "m1_s2a"
     if num_tokens in _N8_W2A_M16_TOKENS:
         return "n8_w2a_m16_ef_f2e" if arch in _SMALL_L2POLICY_ARCHES else "n8_w2a_m16"
     if num_tokens == 8:
@@ -695,6 +705,7 @@ def _stage_constants(stage, views, prepared, num_tokens):
     if stage == "finalize":
         feature = selector in (
             "m1_s2a",
+            "m1_s2a_m1ef",
             "n8_feature",
             "n8_feature_ef_f2e",
             "n8_w2a_m16",
