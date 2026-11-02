@@ -53,8 +53,9 @@ indexed by the same pool slots as the checkpoints. Verify produces outputs
 without changing the checkpoint or storing a full state for every token.
 
 Once the accepted lengths are known, call ``gated_delta_rule_replayssm_commit``
-once across all layers. It replays only the accepted prefix and updates each
-live checkpoint in place. Zero acceptance leaves the checkpoint unchanged.
+once across all layers. It replays only the accepted prefix, or the accepted
+root-to-node path when ``accept_paths`` is given, and updates each live
+checkpoint in place. Zero acceptance leaves the checkpoint unchanged.
 The next verify overwrites the raw windows; no circular cache or deferred
 state update is retained between rounds. Use identical Q/K normalization
 settings for verify and commit.
@@ -68,7 +69,9 @@ tracked-checkpoint contracts.
 
 Commit defaults to ``backend="auto"``. With normalized K and no tracking,
 T=8 uses tcgen05; T=6/7 uses tcgen05 when B>1 and ``layers * B * HV >= 256``.
-Other cases use SIMT. Explicit ``backend="tcgen05"`` supports T=4..8.
+Other cases, including every tracked commit, use SIMT. Explicit
+``backend="tcgen05"`` supports T=4..8 and, with tracking, writes the FP32
+snapshots in a SIMT pass before the TF32 fold.
 The heuristic uses tensor metadata, not device-resident accepted lengths;
 short accepted prefixes may favor ``backend="simt"``. SIMT also retains FP32
 contractions when checkpoint accuracy is preferred over tensor-core throughput.
