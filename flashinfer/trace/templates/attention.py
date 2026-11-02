@@ -4784,6 +4784,14 @@ def trtllm_batch_decode_mla_trace_dispatch(**kwargs):
             "fi_trace does not yet represent cyclic DCP KV ownership or "
             "cross-rank LSE merging for MLA decode"
         )
+    if kwargs.get("batch_invariant", False):
+        # The sparse template and its init model the SM100 TRTLLM-GEN form (FP8
+        # query/KV); the SM120 batch-invariant route needs BF16 query, packed
+        # FP8 KV and a fixed decode split that the definition cannot carry.
+        raise NotImplementedError(
+            "fi_trace does not yet represent the SM120 sparse MLA "
+            "batch_invariant=True execution contract"
+        )
     sparse_mla_top_k = int(kwargs.get("sparse_mla_top_k", 0) or 0)
     if sparse_mla_top_k > 0:
         return trtllm_batch_decode_mla_sparse_trace
