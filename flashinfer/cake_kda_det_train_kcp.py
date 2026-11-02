@@ -445,6 +445,7 @@ def kda_det_saved_bytes_kcp(
     C: int = 8192,
     checkpoint_keep: Optional[str] = None,
     use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
 ) -> int:
     """Bytes of this rank's KCP saved set for ``H`` heads: the local saved set (:func:`~flashinfer.cake_kda_det_train.kda_det_train_saved_bytes`), the
     boundary states, and (``with_conv``) the convolution's history rows of ``C`` channels.  ``checkpoint_keep``
@@ -452,7 +453,9 @@ def kda_det_saved_bytes_kcp(
     (:func:`chunk_kda_det_kcp`; plus one convolution's history rows with ``with_conv``).  ``save_transfer``: ``None``
     is ``False`` without a tier; with one, an explicit value that contradicts it raises ``ValueError``.
     ``use_qk_l2norm_in_kernel``: the saved set of the in-kernel Q / K L2 norm adds its FP32 rstd, ``8 * S_local * H``
-    bytes (a recompute handle's bytes do not change)."""
+    bytes (a recompute handle's bytes do not change).  ``use_gate_in_kernel``: the call's gate mode; the bytes do not
+    depend on it, but with ``use_qk_l2norm_in_kernel=True`` the query raises ``NotImplementedError`` while the
+    in-kernel Q / K L2 norm is not available in that gate mode, as the call does."""
     from .experimental.cake_kda_det_train_kcp import cake_kcp_plan
 
     if save_transfer is None and checkpoint_keep is None:
@@ -466,6 +469,7 @@ def kda_det_saved_bytes_kcp(
         C=C,
         checkpoint_keep=checkpoint_keep,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        use_gate_in_kernel=use_gate_in_kernel,
     )
 
 

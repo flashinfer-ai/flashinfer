@@ -476,6 +476,10 @@ KCP_LOCAL_RECORDS = {"fwd_o": "kcp_fwd_o", "dav": "kcp_dav"}
 # The WY records the KCP launches directly where the plan fuses the WY representation into a state recurrence the
 # KCP does not run (its recurrences are the K1 / K2 walks): the forward's program and the replay's.
 WY_DIRECT_RECORDS = {"wy_fwd": "wy_fwd", "wy": "wy_bwd_replay"}
+# The in-kernel Q / K L2 norm's fallback stages (issue #7817): the separate normalization before the first q / k
+# reader and the pullback after GLM intra.  The fallback form launches them on every problem; a plan that does not
+# dispatch one is refused (:meth:`KernelBackend.stage`), never skipped as an optional stage the plan fuses away.
+L2N_FALLBACK_STAGES = ("qk_l2norm", "qk_apply", "qk_pullback")
 SCRATCH_TABLES_ATTR = "_kcp_scratch_tables"  # the arena attribute holding the table set the intra record writes
 COLLECTIVES = ("c1", "c2", "b1", "b2")
 
@@ -955,7 +959,8 @@ class KernelBackend(Backend):
     def stage(self, name: str, call: CallDetKcp, **extra: Any) -> None:
         """One local stage of :data:`LOCAL_STAGES_FWD` / :data:`LOCAL_STAGES_BWD`: the plan's record on the call's path
         (or the direct WY record), the KCP-owned record of ``fwd_o`` / ``dav``; nothing for an optional stage the plan
-        does not launch on the path (``gate_epilogue`` where ``glm_intra_v14`` writes the gate gradients itself)."""
+        does not launch on the path (``gate_epilogue`` where ``glm_intra_v14`` writes the gate gradients itself), but
+        ``RuntimeError`` for a stage of :data:`L2N_FALLBACK_STAGES` it does not launch."""
         values, views = call.local_values, call.scratch["views"]
         local = call.local
         p = local.plan
@@ -1017,6 +1022,13 @@ class KernelBackend(Backend):
                 device_index=local.device_index,
             )
             return
+        if name in L2N_FALLBACK_STAGES and not p.dispatched(name, path):
+            # q / k would stay raw or dq / dk unpulled: refuse.  The capability check (rank-independent) requires
+            # the stage's record on every problem of its grid; this guards a problem outside it
+            raise RuntimeError(
+                f"the plan dispatches no {name} on {path!r}; the in-kernel Q/K L2 "
+                "norm fallback form needs it on every problem"
+            )
         if (
             name in cake_jit.OPTIONAL_STAGES
             and name not in WY_DIRECT_RECORDS
@@ -5705,6 +5717,48 @@ def _l2n_key_saved(saved: SavedDetKcp | None) -> tuple[Any, ...]:
     return (saved.qk_rstd,) if saved is not None and saved.qk_l2norm else ()
 
 
+def _call_workspace(
+    workspace: Any,
+    backend: Any,
+    save_mode: str,
+    gate: str,
+    l2n: bool,
+    device: torch.device | str | None,
+) -> WorkspaceDetKcp:
+    """The workspace of a call: without one (``None``) a default workspace of the call's modes, the backend's state
+    dtype and local stages (with the flag on, its construction checks the mode on ``device``'s architecture);
+    otherwise ``workspace``, which must be a :class:`WorkspaceDetKcp` of the call's gate and in-kernel Q / K L2 norm
+    modes and the backend's state dtype (``TypeError`` / ``ValueError``)."""
+    if workspace is None:
+        workspace = WorkspaceDetKcp(
+            device=device,
+            state_dtype=backend.dtypes["state"],
+            local=backend.local_stages,
+            save_mode=save_mode,
+            use_gate_in_kernel=gate == "raw",
+            use_qk_l2norm_in_kernel=l2n,
+        )
+    elif not isinstance(workspace, WorkspaceDetKcp):
+        raise TypeError("workspace must be a WorkspaceDetKcp")
+    elif workspace.gate != gate:
+        raise ValueError(
+            f"workspace: allocated for gate mode {workspace.gate!r} "
+            f"(use_gate_in_kernel={workspace.gate == 'raw'}), the call runs gate mode {gate!r} "
+            f"(use_gate_in_kernel={gate == 'raw'}); allocate the WorkspaceDetKcp with "
+            f"use_gate_in_kernel={gate == 'raw'}"
+        )
+    elif workspace.qk_l2norm != l2n:
+        raise ValueError(
+            f"workspace: allocated with use_qk_l2norm_in_kernel={workspace.qk_l2norm}, the call runs "
+            f"use_qk_l2norm_in_kernel={l2n}; allocate the WorkspaceDetKcp with use_qk_l2norm_in_kernel={l2n}"
+        )
+    if workspace.state_dtype != backend.dtypes["state"]:
+        raise ValueError(
+            f"workspace state dtype {workspace.state_dtype} differs from the backend's {backend.dtypes['state']}"
+        )
+    return workspace
+
+
 def _prepare(
     q,
     k,
@@ -5750,6 +5804,13 @@ def _prepare(
         raise NotImplementedError(
             "spec3_probe is not supported with use_qk_l2norm_in_kernel=True"
         )
+    if l2n:
+        # the workspace's checks and the capability refusal before the operand checks, on rank-independent inputs
+        # only (the context's device model, the workspace's modes): a rank with misaligned or no tokens raises as
+        # the others do (the flag-off order is unchanged)
+        ctx_dev = getattr(ctx, "device", None)
+        workspace = _call_workspace(workspace, backend, save_mode, gate, l2n, ctx_dev)
+        workspace._require_l2n(ctx_dev)
     q, k, v, g, beta, T, H, batched = _operands(
         q, k, v, g, beta, ctx, dtypes=backend.dtypes, gate=gate, qk_l2norm=l2n
     )
@@ -5758,34 +5819,11 @@ def _prepare(
     if dout is not None:
         dout = _squeeze_batch(dout, "dout", 3)
         _check(dout, "dout", (T, H, D), backend.dtypes["dout"], device)
-    if workspace is None:
-        workspace = WorkspaceDetKcp(
-            state_dtype=backend.dtypes["state"],
-            local=backend.local_stages,
-            save_mode=save_mode,
-            use_gate_in_kernel=gate == "raw",
-            use_qk_l2norm_in_kernel=l2n,
-        )
-    elif not isinstance(workspace, WorkspaceDetKcp):
-        raise TypeError("workspace must be a WorkspaceDetKcp")
-    elif workspace.gate != gate:
-        raise ValueError(
-            f"workspace: allocated for gate mode {workspace.gate!r} "
-            f"(use_gate_in_kernel={workspace.gate == 'raw'}), the call runs gate mode {gate!r} "
-            f"(use_gate_in_kernel={gate == 'raw'}); allocate the WorkspaceDetKcp with "
-            f"use_gate_in_kernel={gate == 'raw'}"
-        )
-    elif workspace.qk_l2norm != l2n:
-        raise ValueError(
-            f"workspace: allocated with use_qk_l2norm_in_kernel={workspace.qk_l2norm}, the call runs "
-            f"use_qk_l2norm_in_kernel={l2n}; allocate the WorkspaceDetKcp with use_qk_l2norm_in_kernel={l2n}"
-        )
-    if workspace.state_dtype != backend.dtypes["state"]:
-        raise ValueError(
-            f"workspace state dtype {workspace.state_dtype} differs from the backend's {backend.dtypes['state']}"
-        )
+    if not l2n:
+        workspace = _call_workspace(workspace, backend, save_mode, gate, l2n, device)
     # the in-kernel Q / K L2 norm's capability on this device, before the workspace binds anything: rank-independent
-    # inputs only, so a rank without tokens raises as the others do (cake_kcp_plan.require_qk_l2norm)
+    # inputs only, so a rank without tokens raises as the others do (cake_kcp_plan.require_qk_l2norm; checked above
+    # on the context's device, nothing again on the same architecture)
     workspace._require_l2n(device)
     wait_ready = getattr(ctx, "wait_ready", None)
     # a context prepared on another stream: order its uploads on this one (enqueue only)

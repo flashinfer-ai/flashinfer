@@ -432,14 +432,21 @@ dq_raw, dk_raw, dv, dbeta, dg = chunk_kda_det_bwd_kcp(
 * The local programs of the mode are the single-rank backend's (its plan mode
   `l2n="fused"`: the first q / k reader normalizes, the GLM intra program
   pulls back; a saved-mode backward reads the saved rstd).  Until the
-  single-rank registry serves them on the device's architecture, with an
-  exported library, and its forward and replay layouts carry the normalized
-  slot views `qn_int` / `kn_int`, a call, a `WorkspaceDetKcp` and the byte
-  queries with the flag on raise `NotImplementedError` before any workspace
-  build, plan, launch or collective.  The check reads rank-independent inputs
-  only (the device architecture, the registry records and exports, the
-  flags, the static layout tables), so every rank, one without tokens too,
-  raises the same error with the same message.
+  single-rank registry selects a record of the mode for every such stage of
+  the forward and replay paths over a fixed grid of problem sizes (at most
+  and above 256 documents, few and many heads, the architecture's SM
+  counts), each delivered and exported for the device's architecture, with
+  exactly one normalizing first reader on the replay, and its forward and
+  replay layouts carry the normalized slot views `qn_int` / `kn_int`, a
+  call, a `WorkspaceDetKcp` and the byte queries with the flag on raise
+  `NotImplementedError` before any workspace build, plan, launch or
+  collective.  The check reads rank-independent inputs only (the
+  architecture of the context's device, the registry's selection over that
+  grid and its exports, the flags and gate mode, the static layout tables),
+  so every rank, one without tokens or with a misaligned view too, raises
+  the same error with the same message.  The saved byte query takes the
+  call's `use_gate_in_kernel` for this check.  With the flag off the byte
+  queries make no CUDA call for it.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,

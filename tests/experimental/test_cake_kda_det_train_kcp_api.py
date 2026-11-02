@@ -259,6 +259,7 @@ def test_recompute_handle_keywords_are_forwarded(
                     "C": 8192,
                     "checkpoint_keep": "states",
                     "use_qk_l2norm_in_kernel": False,
+                    "use_gate_in_kernel": False,
                 },
             ),
             (
@@ -300,8 +301,10 @@ def test_recompute_handle_keywords_are_forwarded(
 
 def test_public_module_forwards_the_raw_gate(monkeypatch: pytest.MonkeyPatch) -> None:
     """The raw gate mode on the public module (issue #7816): the KCP wrappers forward ``use_gate_in_kernel`` /
-    ``A_log`` / ``dt_bias`` / ``lower_bound`` through ``**options`` unchanged, ``kda_det_workspace_bytes_kcp``
-    forwards ``use_gate_in_kernel`` and ``reduce_gate_param_grads_det_kcp`` forwards to the KCP module's helper,
+    ``A_log`` / ``dt_bias`` / ``lower_bound`` through ``**options`` unchanged, ``kda_det_workspace_bytes_kcp`` and
+    ``kda_det_saved_bytes_kcp`` forward ``use_gate_in_kernel`` (a keyword-only ``bool = False``; the saved query
+    reads it for the in-kernel Q / K L2 norm's check) and ``reduce_gate_param_grads_det_kcp`` forwards to the KCP
+    module's helper,
     which the package lists in ``__all__``; ``flashinfer.kda_train`` binds ``kcp_reduce_gate_param_grads`` to the
     same object.  Device-free (recorders)."""
     from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp, cake_kcp_plan
@@ -326,6 +329,11 @@ def test_public_module_forwards_the_raw_gate(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(cake_kcp, "chunk_kda_det_kcp", recorder("autograd"))
     monkeypatch.setattr(cake_kcp, "reduce_gate_param_grads_det_kcp", recorder("reduce"))
     monkeypatch.setattr(cake_kcp_plan, "kda_det_workspace_bytes_kcp", recorder("bytes"))
+    monkeypatch.setattr(cake_kcp_plan, "kda_det_saved_bytes_kcp", recorder("saved"))
+    p = inspect.signature(kcp_api.kda_det_saved_bytes_kcp).parameters[
+        "use_gate_in_kernel"
+    ]
+    assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is False
     operands = tuple(object() for _ in range(6))
     kw = {
         "use_gate_in_kernel": True,
@@ -344,10 +352,17 @@ def test_public_module_forwards_the_raw_gate(monkeypatch: pytest.MonkeyPatch) ->
             == "bytes"
         )
         assert kcp_api.reduce_gate_param_grads_det_kcp(*reduce_args) == "reduce"
+        for gate in (True, False):
+            assert (
+                kcp_api.kda_det_saved_bytes_kcp(object(), use_gate_in_kernel=gate)
+                == "saved"
+            )
+        assert kcp_api.kda_det_saved_bytes_kcp(object()) == "saved"
     for name, _, got in calls[:3]:
         assert all(got[k] is v for k, v in kw.items()), name
     assert calls[3][2]["use_gate_in_kernel"] is True
     assert calls[4] == ("reduce", reduce_args, {})
+    assert [c[2]["use_gate_in_kernel"] for c in calls[5:]] == [True, False, False]
     assert "reduce_gate_param_grads_det_kcp" in kcp_api.__all__
     assert (
         kda_train.kcp_reduce_gate_param_grads is kcp_api.reduce_gate_param_grads_det_kcp

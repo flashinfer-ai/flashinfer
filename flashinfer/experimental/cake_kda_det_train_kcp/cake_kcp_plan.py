@@ -2472,6 +2472,7 @@ def kda_det_saved_bytes_kcp(
     saved_carry: bool = True,
     checkpoint_keep: str | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    use_gate_in_kernel: bool = False,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kda_det_saved_bytes_kcp(ctx, ...)``)::
 
@@ -2515,11 +2516,18 @@ def kda_det_saved_bytes_kcp(
     rstd of q and k (``SavedDetKcp.qk_rstd``, empty on a rank without tokens; the raw q / k are the caller's tensors,
     not counted here).  A recompute handle's entry does not change: the recompute writes its rstd afresh.  While the
     single-rank programs of the mode are absent it raises ``NotImplementedError`` as the workspace does
-    (:func:`require_qk_l2norm`)."""
+    (:func:`require_qk_l2norm`), for the gate mode ``use_gate_in_kernel`` (the call's; the bytes do not depend on
+    it) and the device model of ``ctx.device``."""
     _check_save_mode(save_mode)
     l2n = check_qk_l2norm(use_qk_l2norm_in_kernel)
-    if l2n:  # the refusal of every rank alike, as the workspace bytes (gate mode "g")
-        require_qk_l2norm(QK_L2NORM_FORM_DEFAULT, "g", qk_l2norm_arch())
+    if not isinstance(use_gate_in_kernel, bool):
+        raise ValueError(
+            f"use_gate_in_kernel must be a bool, got {use_gate_in_kernel!r}"
+        )
+    if l2n:  # the refusal of every rank alike, as the workspace bytes
+        gate = "raw" if use_gate_in_kernel else "g"
+        mode = QK_L2NORM_FORM_DEFAULT
+        require_qk_l2norm(mode, gate, qk_l2norm_arch(ctx.device))
     save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
     H, C = int(H), int(C)
     hp = ctx.heads(H)
@@ -3038,51 +3046,62 @@ def local_tail_count_words(arena_bytes: int, H: int) -> int:
 # pullback into the final dq / dk store.  Fallback: a separate normalization (``qk_l2norm``, or ``qk_apply`` from a
 # given rstd) before the first reader, the plain records, the GLM intra program's capture form and a separate pullback
 # (``qk_pullback``) after it.  The KCP programs, the collectives and their bytes do not change.
-# :data:`QK_L2NORM_RECORDS` are, per form and gate mode, the records of the existing backend's registry that the
-# route's stages of the mode can select on its two local paths (the forward's ``fwd_nosave``, the backward's
-# ``replay``) for any problem; an entry of several names is met by any one of them (the replay prep: the ``_l2n`` twin
-# where the prep reads q / k first, the plain record serving the mode where the intra program runs first).  Until all
-# serve, every call, workspace and byte query with the flag on raises ``NotImplementedError`` (:data:`QK_L2NORM_PENDING`)
-# before any workspace build, plan or collective, decided from rank-independent inputs only (:func:`qk_l2norm_missing`,
-# :func:`require_qk_l2norm`), so every rank -- one without tokens too -- raises the same error.
+# The route needs, for every problem, a record of the mode's class on each of its stages: the existing backend's
+# ``cake_jit.select_record(..., l2n=mode)`` (a stage of its ``L2N_STAGES`` selects among the records whose ``l2n``
+# modes hold the mode) for the stages of :data:`QK_L2NORM_STAGES` on the route's two local paths (the forward's
+# ``fwd_nosave``, the backward's ``replay``); in the fused form the forward's intra program normalizes and on the
+# replay exactly one first q / k reader does, the intra program or the prep, as the existing order of the problem
+# gives (:func:`qk_l2norm_intra_first`; in the fallback form none of them does).  The check selects over the
+# fixed grid :data:`QK_L2NORM_GRID` x :data:`QK_L2NORM_SMS` (no rank's tokens: at most and above the intra programs'
+# 256-document switch, head counts of both recurrence routes, one and sixteen chunks per document, SM counts of the
+# architecture's devices), and every selected record must be delivered for the architecture and exported there.  Until
+# all hold, every call, workspace and byte query with the flag on raises ``NotImplementedError``
+# (:data:`QK_L2NORM_PENDING`) before any workspace build, plan or collective, decided from rank-independent inputs only
+# (:func:`qk_l2norm_missing`, :func:`require_qk_l2norm`), so every rank -- one without tokens too -- raises the same
+# error.
 QK_L2NORM_PENDING = "use_qk_l2norm_in_kernel=True on the KCP route requires the single-rank in-kernel Q/K L2 norm programs"
 QK_L2NORM_FORMS = ("fused", "fallback")
 QK_L2NORM_FORM_DEFAULT = "fused"
-QK_L2NORM_RECORDS: dict[tuple[str, str], tuple[tuple[str, ...], ...]] = {
-    ("fused", "g"): (
-        ("fwd_intra_l2n",),
-        ("fwd_intra_v14_l2n",),
-        ("bwd_prep_g8_replay_l2n", "bwd_prep_g8_replay"),
-        ("glm_intra_l2n",),
-    ),
-    ("fused", "raw"): (
-        ("fwd_intra_raw_l2n",),
-        ("fwd_intra_v14_raw_l2n",),
-        ("bwd_prep_g8_replay_raw_l2n", "bwd_prep_g8_replay_raw"),
-        ("glm_intra_raw_l2n",),
-    ),
-    ("fallback", "g"): (
-        ("qk_l2norm",),
-        ("qk_l2norm_apply",),
-        ("fwd_intra",),
-        ("fwd_intra_v14",),
-        ("bwd_prep_g8_replay",),
-        ("glm_intra_l2n_capture",),
-        ("qk_pullback",),
-    ),
-    ("fallback", "raw"): (
-        ("qk_l2norm",),
-        ("qk_l2norm_apply",),
-        ("fwd_intra_raw",),
-        ("fwd_intra_v14_raw",),
-        ("bwd_prep_g8_replay_raw",),
-        ("glm_intra_raw_l2n_capture",),
-        ("qk_pullback",),
-    ),
+_QK_L2NORM_READERS = (
+    (LOCAL_PATH_FWD, "fwd_intra"),
+    (LOCAL_PATH_BWD, "fwd_intra"),
+    (LOCAL_PATH_BWD, "bwd_prep"),
+    (LOCAL_PATH_BWD, "glm_intra"),
+)
+# the fallback form's separate normalization (``qk_l2norm`` on both paths, ``qk_apply`` from a saved rstd) and
+# pullback, launched on every problem (never skipped)
+_QK_L2NORM_SEPARATE = (
+    (LOCAL_PATH_FWD, "qk_l2norm"),
+    (LOCAL_PATH_BWD, "qk_l2norm"),
+    (LOCAL_PATH_BWD, "qk_apply"),
+    (LOCAL_PATH_BWD, "qk_pullback"),
+)
+# (path, stage) per form
+QK_L2NORM_STAGES = {
+    "fused": _QK_L2NORM_READERS,
+    "fallback": _QK_L2NORM_READERS + _QK_L2NORM_SEPARATE,
 }
+# (num_chunks_pad, num_seqs, num_heads) of the check: 1 / 256 / 257 documents (the intra programs switch above 256),
+# 4 / 16 / 64 heads (the segmented route at few heads and at the 16 heads some architectures list, the serial route
+# at many), one and sixteen chunks per document
+QK_L2NORM_GRID = tuple(
+    (chunks * docs, docs, heads)
+    for docs in (1, 256, 257)
+    for heads in (4, 16, 64)
+    for chunks in (1, 16)
+)
+# the SM counts of each architecture's devices the check selects for (a superset is harmless: the existing backend
+# selects one record for every problem); an architecture not listed is checked at every listed count
+QK_L2NORM_SMS = {
+    "sm_100a": (148, 152),
+    "sm_103a": (148, 152, 160),
+    "sm_107a": (212, 216),
+}
+QK_L2NORM_SMS_ANY = tuple(sorted({sm for sms in QK_L2NORM_SMS.values() for sm in sms}))
 # the existing backend's layouts of the local arena in the mode (the backward workspace's forward layout, the
-# forward-only one, the backward's replay layout) and the slot views every one of them must carry: the intra
-# programs normalize into ``qn_int`` / ``kn_int`` on the forward and the replay alike, with no stand-in
+# forward-only one, the backward's replay layout) and the slot views every one of them must carry in both forms:
+# the intra programs normalize into ``qn_int`` / ``kn_int`` on the forward and the replay alike, and the fallback
+# form's separate normalization writes the forward's rows into the first ``T_r`` rows of the same slots
 QK_L2NORM_LAYOUTS = ("fwd", LOCAL_LAYOUT_FWD_ONLY, "replay")
 QK_L2NORM_SLOTS = ("qn_int", "kn_int")
 
@@ -3151,40 +3170,85 @@ def qk_l2norm_arch(device: torch.device | str | None = None) -> str | None:
     return _cuda_arch(index)
 
 
-def _record_missing(name: str, mode: str, arch: str | None) -> str | None:
-    """Why record ``name`` of the existing backend's registry cannot serve mode ``mode`` on ``arch`` (``None``: on
-    every architecture it lists), ``None`` when it can: absent, its ``l2n`` modes (absent: ``["off"]``) lack the
-    mode, its ``arches`` lack the architecture, or ``build.json`` has no library of it for the architecture."""
-    from ..cake_kda_det_train import cake_build, cake_jit
-
-    record = cake_jit.MODULES.get(name)
-    if record is None:
-        return f"no record {name}"
-    if mode not in record.get("l2n", ("off",)):
-        return f"record {name} does not serve l2n={mode!r}"
-    arches = tuple(record["arches"])
-    for a in arches if arch is None else (arch,):
-        if a not in arches:
-            return f"record {name} is not delivered for {a}"
-        if cake_jit.library_name(name, a) not in cake_build.libraries_by_name():
-            return f"record {name} has no exported library for {a}"
+def _qk_l2norm_readers(mode: str, picked: dict[tuple[str, str], str]) -> str | None:
+    """Why the records ``picked`` for one problem (``(path, stage) -> record``) do not give the route's order of
+    mode ``mode``, ``None`` when they do: fused, the forward's intra program is the ``_l2n`` twin (its first q / k
+    reader) and on the replay exactly one of the intra program and the prep is (:func:`qk_l2norm_intra_first`
+    runs that one first; the other reads the normalized rows); fallback, neither is (both read the rows of the
+    separate normalization)."""
+    fwd = picked[(LOCAL_PATH_FWD, "fwd_intra")]
+    intra = picked[(LOCAL_PATH_BWD, "fwd_intra")]
+    prep = picked[(LOCAL_PATH_BWD, "bwd_prep")]
+    twins = [r for r in (intra, prep) if r.endswith("_l2n")]
+    if mode == "fused":
+        if not fwd.endswith("_l2n"):
+            return f"the forward's intra record {fwd} does not normalize"
+        if len(twins) != 1:
+            return f"{len(twins)} of the replay's records {intra} / {prep} normalize"
+    elif twins or fwd.endswith("_l2n"):
+        return f"the fallback form's readers {fwd} / {intra} / {prep} normalize"
     return None
+
+
+def _qk_l2norm_problem(
+    mode: str,
+    modes: dict[str, Any],
+    arch: str,
+    sm: int,
+    problem: tuple[int, int, int],
+    libraries: Any,
+) -> str | None:
+    """Why the records the existing backend selects (``cake_jit.select_record`` with ``modes``) for one problem
+    ``(num_chunks_pad, num_seqs, num_heads)`` of :data:`QK_L2NORM_GRID` on architecture ``arch`` with ``sm`` SMs do
+    not serve mode ``mode``, ``None`` when they do: every stage of :data:`QK_L2NORM_STAGES` selects a record (no
+    ``ValueError``, no ``None``) delivered for ``arch`` with a library in ``libraries`` (``build.json``), and the
+    readers give the route's order (:func:`_qk_l2norm_readers`)."""
+    from ..cake_kda_det_train import cake_jit
+
+    nc, docs, heads = problem
+    where = f"{arch}, {sm} SMs, {docs} documents, {heads} heads, {nc} chunks"
+    picked: dict[tuple[str, str], str] = {}
+    for path, stage in QK_L2NORM_STAGES[mode]:
+        what = f"{stage} on {path} ({where})"
+        try:
+            name = cake_jit.select_record(
+                stage,
+                num_chunks_pad=nc,
+                num_seqs=docs,
+                num_heads=heads,
+                sm_count=sm,
+                arch=arch,
+                path=path,
+                **modes,
+            )
+        except ValueError as exc:
+            return f"the single-rank registry selects no {what}: {exc}"
+        if name is None:
+            return f"the single-rank registry selects no {what}"
+        if arch not in cake_jit.MODULES[name]["arches"]:
+            return f"record {name} ({what}) is not delivered for {arch}"
+        if cake_jit.library_name(name, arch) not in libraries:
+            return f"record {name} ({what}) has no exported library for {arch}"
+        picked[(path, stage)] = name
+    why = _qk_l2norm_readers(mode, picked)
+    return None if why is None else f"the single-rank registry ({where}): {why}"
 
 
 def qk_l2norm_missing(
     mode: str = QK_L2NORM_FORM_DEFAULT, gate: str = "g", arch: str | None = None
 ) -> str | None:
     """Why the KCP local stages cannot run mode ``mode`` in gate mode ``gate`` (``"g"`` / ``"raw"``) on architecture
-    ``arch`` (``None``: every architecture a record lists; :func:`qk_l2norm_arch`) yet, ``None`` once they can
-    (always for ``"off"``).  Decided from rank-independent inputs only -- the existing backend's signatures, its
-    registry records (their ``l2n`` modes and ``arches``), its ``build.json`` libraries and its static layout tables
-    -- never from a rank's tokens or plan, so every rank gets the same answer: its entry points do not take
-    ``use_qk_l2norm_in_kernel``; its plan or layout table has no such mode; an entry of :data:`QK_L2NORM_RECORDS` has
-    no record that serves the mode, is delivered for the architecture and is exported for it; or a layout of
-    :data:`QK_L2NORM_LAYOUTS` lacks the :data:`QK_L2NORM_SLOTS` views."""
+    ``arch`` (``None``: every exported architecture; :func:`qk_l2norm_arch`) yet, ``None`` once they can (always for
+    ``"off"``).  Decided from rank-independent inputs only -- the existing backend's signatures, its record selection
+    over the fixed problem grid (:data:`QK_L2NORM_GRID`, :data:`QK_L2NORM_SMS`), its ``build.json`` libraries and its
+    static layout tables -- never from a rank's tokens or plan, so every rank gets the same answer: its entry points
+    do not take ``use_qk_l2norm_in_kernel``; its plan, layout table or record selection has no such mode (or gate
+    mode); a stage of :data:`QK_L2NORM_STAGES` selects no record for a problem of the grid, or one not delivered or
+    not exported for the architecture; the selected readers do not give the route's order (:func:`_qk_l2norm_readers`);
+    or a layout of :data:`QK_L2NORM_LAYOUTS` lacks the :data:`QK_L2NORM_SLOTS` views."""
     if mode == "off":
         return None
-    from ..cake_kda_det_train import cake_backend, cake_jit
+    from ..cake_kda_det_train import cake_backend, cake_build, cake_jit
 
     if not _takes(cake_backend.chunk_kda_det_fwd, "use_qk_l2norm_in_kernel"):
         return "the single-rank backend does not take use_qk_l2norm_in_kernel"
@@ -3194,13 +3258,21 @@ def qk_l2norm_missing(
         or mode not in getattr(cake_jit, "L2N_MODES", ())
     ):
         return f"the single-rank plan has no in-kernel Q/K L2 norm mode {mode!r}"
-    absent = []
-    for names in QK_L2NORM_RECORDS[(mode, gate)]:
-        reasons = [_record_missing(name, mode, arch) for name in names]
-        if all(reasons):
-            absent.append(" / ".join(str(r) for r in reasons))
-    if absent:
-        return f"the single-rank registry: {'; '.join(absent)}"
+    select = cake_jit.select_record
+    if not _takes(select, "l2n"):
+        return "the single-rank registry selects no record by Q/K L2 norm mode"
+    modes: dict[str, Any] = {"l2n": mode}
+    if gate != "g":
+        if not _takes(select, "gate"):
+            return f"the single-rank registry selects no record of gate mode {gate!r}"
+        modes["gate"] = gate
+    libraries = cake_build.libraries_by_name()
+    for a in cake_jit.ARCHES if arch is None else (arch,):
+        for sm in QK_L2NORM_SMS.get(a, QK_L2NORM_SMS_ANY):
+            for problem in QK_L2NORM_GRID:
+                why = _qk_l2norm_problem(mode, modes, a, sm, problem, libraries)
+                if why is not None:
+                    return why
     for layout in QK_L2NORM_LAYOUTS:
         try:
             kw: dict[str, Any] = {"gate": gate, "l2n": mode}
@@ -3294,8 +3366,6 @@ def kda_det_workspace_bytes_kcp(
             "is not supported with the in-kernel Q/K L2 norm yet"
         )
     mode = qk_l2norm_mode(l2n)
-    # before any plan: the refusal of every rank alike (rank-independent inputs only)
-    require_qk_l2norm(mode, gate, qk_l2norm_arch())
     l2n_kw = qk_l2norm_plan_kwargs(mode)
     lean = (
         check_local_arena(local_arena) == "lean" and backward and save_mode == "light"
@@ -3303,6 +3373,10 @@ def kda_det_workspace_bytes_kcp(
     ctxs = list(ctx) if isinstance(ctx, (list, tuple)) else [ctx]
     if not ctxs:
         raise ValueError("kda_det_workspace_bytes_kcp: no context given")
+    if l2n:
+        # before any plan: the refusal of every rank alike (rank-independent inputs only: the device model of the
+        # contexts, never the current CUDA device); the flag-off query makes no CUDA call here
+        require_qk_l2norm(mode, gate, qk_l2norm_arch(ctxs[0].device))
     arena = 0
     counts = 0  # the tail-count table of the largest arena where it is a lean one
     scratch: dict[tuple[int, int], int] = {}
