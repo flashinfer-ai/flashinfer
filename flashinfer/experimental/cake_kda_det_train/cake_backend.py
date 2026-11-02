@@ -1766,7 +1766,9 @@ def _raw_finalize_scratch(NC_pad: int, H: int, device: torch.device) -> dict[str
     return {
         "part2": _alloc((int(H), seg_cap, D, 4), torch.float32, device),
         "seg_cap": seg_cap,
-        "ticket": torch.zeros((int(H),), dtype=torch.int32, device=device).view(torch.uint32),
+        "ticket": torch.zeros((int(H),), dtype=torch.int32, device=device).view(
+            torch.uint32
+        ),
     }
 
 
