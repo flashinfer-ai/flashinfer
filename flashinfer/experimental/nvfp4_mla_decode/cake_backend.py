@@ -129,14 +129,19 @@ REDUCE_GENERAL_MIN_SPLITS = 3  # KV splits of the plan's most split row
 # takes two splits, so it reads only the partials the decode just wrote. On an
 # (architecture, cluster count) of ``REDUCE_TWO_SPLITS_TARGETS`` it runs a plan
 # of two splits per row that a short-row decode program runs, when the rows
-# of two splits form one contiguous range of query rows; it is launched over
-# that range alone (``split_row_range``), with its row pointers offset to the
-# range's first row. The cluster count is the one the plan requests, ``num_sms
-# // CLUSTER_PAIR``: 74 on B200, 76 on GB200 and GB300.
+# of two splits form one contiguous range of query rows and, where the target
+# names a unit limit, every unit of the plan holds at most that many pipeline
+# tiles; it is launched over that range alone (``split_row_range``), with its
+# row pointers offset to the range's first row. The cluster count is the one
+# the plan requests, ``num_sms // CLUSTER_PAIR``: 74 on B200, 76 on GB200 and
+# GB300. On GB300 the limit is the SM100 short-row limit, so the program runs
+# the plans whose units the short-row rule bounds on SM100 too.
 REDUCE_TWO_SPLITS_RECORD = "reduce_two_splits"
-REDUCE_TWO_SPLITS_TARGETS = frozenset(
-    {("sm_100a", 74), ("sm_100a", 76), ("sm_103a", 76)}
-)
+REDUCE_TWO_SPLITS_TARGETS: dict[tuple[str, int], Optional[int]] = {
+    ("sm_100a", 74): None,
+    ("sm_100a", 76): None,
+    ("sm_103a", 76): SHORT_MAX_UNIT_TILES["sm_100a"],
+}
 SHORT_DECODE_RECORDS = frozenset(
     {SHORT_RECORD, SHORT_EPI_RECORD, SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD}
 )
@@ -724,6 +729,16 @@ def _two_split_rows(row_splits: Sequence[int]) -> Optional[tuple]:
     return first, count
 
 
+def _two_split_unit_ok(plan: WorkPlan, limit: Optional[int]) -> bool:
+    """True when ``limit`` is ``None`` or every unit of ``plan`` holds at most
+    ``limit`` pipeline tiles (the unit sum of ``select_decode_record``: one
+    item per piece, fields 3 and 4)."""
+    return limit is None or all(
+        sum(it[4] - it[3] for it in plan.items[first:last:V_HALVES]) <= limit
+        for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+    )
+
+
 def select_reduce_record(
     plan: WorkPlan,
     arch: str,
@@ -741,12 +756,13 @@ def select_reduce_record(
     runs a plan of two splits per row that a program of
     ``SHORT_DECODE_RECORDS`` runs (``select_decode_record``) when the registry
     delivers it for ``arch``, ``(arch, num_sms // CLUSTER_PAIR)`` is in
-    ``REDUCE_TWO_SPLITS_TARGETS`` and the rows of two splits (``row_splits``,
-    one count per query row) form one contiguous range (``split_row_range``);
-    every other plan runs ``"reduce"``. The combine programs' outputs are
-    bitwise identical. ``decode_record`` is the plan's
-    ``select_decode_record(plan, arch, num_sms)`` when the caller holds it
-    (``prepare``), so it is not selected a second time.
+    ``REDUCE_TWO_SPLITS_TARGETS``, every unit of the plan holds at most the
+    target's unit limit of pipeline tiles when it names one, and the rows of
+    two splits (``row_splits``, one count per query row) form one contiguous
+    range (``split_row_range``); every other plan runs ``"reduce"``. The
+    combine programs' outputs are bitwise identical. ``decode_record`` is the
+    plan's ``select_decode_record(plan, arch, num_sms)`` when the caller holds
+    it (``prepare``), so it is not selected a second time.
     """
     if (
         _delivered(REDUCE_GENERAL_RECORD, arch)
@@ -761,6 +777,9 @@ def select_reduce_record(
         and (arch, num_sms // CLUSTER_PAIR) in REDUCE_TWO_SPLITS_TARGETS
         and (decode_record or select_decode_record(plan, arch, num_sms))
         in SHORT_DECODE_RECORDS
+        and _two_split_unit_ok(
+            plan, REDUCE_TWO_SPLITS_TARGETS[(arch, num_sms // CLUSTER_PAIR)]
+        )
         and _two_split_rows(row_splits) is not None
     ):
         return REDUCE_TWO_SPLITS_RECORD

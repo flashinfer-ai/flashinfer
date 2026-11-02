@@ -1382,6 +1382,85 @@ def test_select_reduce_record_two_splits_needs_the_record(
     assert select_reduce_record(plan, "sm_100a", **kwargs) == "reduce"
 
 
+def test_two_split_targets_bound_the_sm103_units_by_the_sm100_short_limit():
+    """On the 152-SM SM103 part the two-split combine runs only plans whose
+    units the SM100 short-row rule bounds (32 pipeline tiles); the SM100 targets
+    keep their selection unchanged (no unit limit)."""
+    want = {
+        ("sm_100a", 74): None,
+        ("sm_100a", 76): None,
+        ("sm_103a", 76): cake_backend.SHORT_MAX_UNIT_TILES["sm_100a"],
+    }
+    assert want == REDUCE_TWO_SPLITS_TARGETS
+    assert cake_backend.SHORT_MAX_UNIT_TILES["sm_100a"] == 32
+
+
+@pytest.mark.parametrize(
+    "units,limit,want",
+    [
+        ([[16, 16]], 32, True),
+        ([[16, 17]], 32, False),
+        ([[32], [32], [2]], 32, True),
+        ([[32], [33]], 32, False),
+        ([[33]], 33, True),
+        ([[33], [64]], None, True),
+    ],
+)
+def test_two_split_unit_ok_sums_every_unit(units, limit, want):
+    plan = _hand_plan(*units)
+    assert cake_backend._two_split_unit_ok(plan, limit) is want
+
+
+@pytest.mark.parametrize(
+    "split_tiles,request_tiles,want",
+    [
+        (32, 64, REDUCE_TWO_SPLITS_RECORD),  # two units of 32 tiles
+        (33, 66, "reduce"),  # two units of 33 tiles
+        (33, 64, "reduce"),  # units of 33 and 31 tiles
+        (31, 62, REDUCE_TWO_SPLITS_RECORD),  # two units of 31 tiles
+    ],
+)
+def test_select_reduce_record_two_splits_unit_limit_on_sm103(
+    spec_records, two_splits_reduce_record, split_tiles, request_tiles, want
+):
+    """A 32 / 33 pipeline-tile unit boundary on the 152-SM SM103 part: every
+    plan runs a short-row decode program there (its limit is 64 tiles), and the
+    two-split combine runs only while no unit exceeds 32 tiles."""
+    plan, rows = _reduce_inputs(
+        [request_tiles * cake_backend.TILE_KV], 152, tiles_per_split=split_tiles
+    )
+    assert plan.max_splits == 2 and rows == [2] * 6
+    assert max(unit_tiles(plan)) == split_tiles
+    assert select_decode_record(plan, "sm_103a", 152) == SHORT_SPEC_RECORD
+    kwargs = dict(num_sms=152, row_splits=rows)
+    assert select_reduce_record(plan, "sm_103a", **kwargs) == want
+    # The 148-SM SM103 part never runs it.
+    assert (
+        select_reduce_record(plan, "sm_103a", num_sms=148, row_splits=rows) == "reduce"
+    )
+
+
+@pytest.mark.parametrize("num_sms", [148, 152])
+def test_select_reduce_record_two_splits_sm100_has_no_unit_limit(
+    spec_records, two_splits_reduce_record, num_sms
+):
+    """On SM100 the combine's selection is the short-row rule's: a plan of 32-tile
+    units runs it, and a 33-tile unit leaves the short-row decode programs."""
+    plan, rows = _reduce_inputs(
+        [64 * cake_backend.TILE_KV], num_sms, tiles_per_split=32
+    )
+    assert cake_backend._two_split_unit_ok(plan, None)
+    kwargs = dict(num_sms=num_sms, row_splits=rows)
+    assert select_reduce_record(plan, "sm_100a", **kwargs) == REDUCE_TWO_SPLITS_RECORD
+    plan, rows = _reduce_inputs(
+        [66 * cake_backend.TILE_KV], num_sms, tiles_per_split=33
+    )
+    decode = select_decode_record(plan, "sm_100a", num_sms)
+    assert decode not in cake_backend.SHORT_DECODE_RECORDS
+    kwargs = dict(num_sms=num_sms, row_splits=rows)
+    assert select_reduce_record(plan, "sm_100a", **kwargs) == "reduce"
+
+
 def test_work_table_keeps_direct_out_on_single_split_items():
     single = build_work_plan(
         [64, 65, 4096, 777],
