@@ -451,13 +451,15 @@ def test_plain_split_views_keep_hooks_and_are_within_budget(
             want = got["row"][..., a:b]
             assert len(got["fired"][n]) == 1, (form, n)
             assert torch.equal(got["fired"][n][0].reshape(want.shape), want), (form, n)
-            assert torch.equal(got["views"][n].grad.reshape(want.shape), want), (
-                form,
-                n,
-            )
+            # contiguous: q / k / v are the leaves the row gradient is read from, so
+            # their .grad is that gradient by construction (only the hook is checked)
+            if form != "contiguous":
+                vg = got["views"][n].grad.reshape(want.shape)
+                assert torch.equal(vg, want), (form, n)
             if form == "plain":
                 part = got["fired"][f"part{i}"]
                 assert len(part) == 1 and torch.equal(part[0], want), (form, n)
+                assert torch.equal(got["views"][f"part{i}"].grad, want), (form, n)
     ref, _ = reference_pack(inputs, device)
     if not norm:
         _arms_within_budget(arms, ref, TENSORS, "split views")

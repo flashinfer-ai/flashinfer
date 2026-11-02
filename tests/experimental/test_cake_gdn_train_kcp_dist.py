@@ -1057,6 +1057,7 @@ def _plain_split_pass(buf, g, beta, dout, call, H_qk: int, HV: int, *, ckpt: boo
             torch.equal(fired[n][0].reshape(T, -1), ga[:, a:b])
             and torch.equal(views[n].grad.reshape(T, -1), ga[:, a:b])
             and torch.equal(fired[f"part{i}"][0], ga[:, a:b])
+            and torch.equal(views[f"part{i}"].grad, ga[:, a:b])
             for i, (n, (a, b)) in enumerate(cols.items())
         )
     )

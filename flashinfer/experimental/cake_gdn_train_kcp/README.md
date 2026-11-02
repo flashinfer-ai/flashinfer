@@ -161,7 +161,7 @@ The packed GDN training routes come in four combinations:
   same results within the accuracy budgets.
 * When `q` / `k` / `v` are head views of one packed row, take them with
   `packed_qkv_views_kcp` for full backward speed: plain `split` views of the
-  row give the same gradients, but the backward is about 1.1 ms (33-36 %)
+  row give the same gradients, but the backward is about 1.1-1.2 ms (33-37 %)
   slower at `(16, 48)` and 32,768 tokens (**Packed Q/K/V** below).
 * `scale` defaults to `128 ** -0.5`.
 * The host reads no tensor contents (no `.item()`, `.tolist()`, no implicit
@@ -319,10 +319,13 @@ backward.  The gradient values are bitwise those of separate operands
 (`LAST_CALL["bwd"]["grad_layout"]` is `"packed"` or `"separate"`).
 
 Callers whose `q` / `k` / `v` are head views of one packed row get the full
-backward speed only through `packed_qkv_views_kcp`.  Its conditions: `qkv`
-is `[..., T, (2 H_qk + HV) * 128]` with a dense channel axis
-(`qkv.stride(-1) == 1`), and `q` / `k` / `v` are its three head views in that
-order.  Plain views of the same row
+backward speed through `packed_qkv_views_kcp`.  Its conditions: `qkv` is
+dense over `[..., T, (2 H_qk + HV) * 128]` (channel stride 1 and token stride
+exactly `(2 H_qk + HV) * 128`; a column slice of a wider row does not
+qualify), `q` / `k` / `v` are its three head views in that order, and the GDN
+call keeps the default `layout="tma"` (`layout="copy"` gives the programs
+contiguous copies, so the gradients come back as three rows and the split
+concatenates them).  Plain views of the same row
 (`qkv.split((H_qk * 128, H_qk * 128, HV * 128), -1)`, then
 `.view(T, heads, 128)`) run the same programs on the same operands and give
 the same results (within the accuracy budgets; bitwise in every run measured
@@ -333,13 +336,16 @@ of the plain views (the #8367 repro with `deterministic=False`:
 forward and backward to the packed row, and the checkpointed step
 `torch.utils.checkpoint(views + chunk_gdn_kcp, use_reentrant=False)` =
 two forwards and one backward; CUDA-event ms, the median of 16 group
-medians (2 runs x 8 groups; a group = 2 x 20 timed calls per view form after
-5 warm-up calls, the forms interleaved in palindromic order); PyTorch
-2.14.1+cu130, CUDA 13.0 runtime):
+medians (2 runs x 8 groups; a group = 2 blocks of 5 warm-up + 20 timed calls
+per view form, the forms interleaved in palindromic order; the B200 norm-off
+forward is from the one re-measure pair, after the first pair drifted by more
+than 2 %); one GPU per exclusive node; PyTorch 2.14.1+cu130, CUDA 13.0
+runtime):
 
 | GPU | in-kernel L2 norm | forward split / packed | backward split / packed | backward split - packed | checkpointed step split / packed |
 |---|---|---|---|---|---|
-| B200 (sm_100a, 148 SMs) | on | not stable in this run | 4.602 / 3.466 | +1.136 (1.328x) | 6.413 / 5.285 (1.213x) |
+| B200 (sm_100a, 148 SMs) | off | 1.568 / 1.575 | 4.386 / 3.195 | +1.191 (1.373x) | 6.039 / 4.839 (1.248x) |
+| B200 (sm_100a, 148 SMs) | on | 1.757 / 1.763 | 4.657 / 3.487 | +1.170 (1.336x) | 6.505 / 5.345 (1.217x) |
 | GB300 (sm_103a, 152 SMs) | off | 1.416 / 1.432 | 4.017 / 2.946 | +1.071 (1.364x) | 5.490 / 4.438 (1.237x) |
 | GB300 (sm_103a, 152 SMs) | on | 1.575 / 1.594 | 4.311 / 3.239 | +1.072 (1.331x) | 5.947 / 4.895 (1.215x) |
 

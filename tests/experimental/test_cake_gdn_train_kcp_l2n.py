@@ -799,6 +799,8 @@ def test_plain_split_views_keep_hooks_and_bitwise_gradients(norm, ckpt) -> None:
             if form == "plain":
                 part = got["fired"][f"part{i}"]
                 assert len(part) == 1 and torch.equal(part[0], want[n].reshape(T, -1))
+                pg = got["views"][f"part{i}"].grad
+                assert torch.equal(pg, want[n].reshape(T, -1)), (form, n)
 
 
 def test_packed_views_refuse_in_place_changes() -> None:

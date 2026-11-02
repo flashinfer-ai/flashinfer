@@ -5803,7 +5803,9 @@ def packed_qkv_views_kcp(
     ``dq`` / ``dk`` / ``dv`` as the same views of one fresh packed row; this split's backward hands that row on as
     the gradient of ``qkv`` without a concatenation.  Any other incoming gradient is concatenated.
 
-    Needs a dense channel axis (``qkv.stride(-1) == 1``).  The views are the outputs of one custom autograd node:
+    Needs a dense channel axis (``qkv.stride(-1) == 1``); the backward skips the concatenation only when ``qkv`` is
+    dense over ``[..., T, (2 H_qk + HV) * 128]`` (token stride exactly ``(2 H_qk + HV) * 128``) and the GDN call keeps
+    ``layout="tma"``.  The views are the outputs of one custom autograd node:
     hooks and ``retain_grad`` on them fire as on any autograd output; a missing gradient counts as zeros and a
     hook that returns a new gradient makes the backward concatenate (``PACKED_SPLIT_STATS``); autograd refuses an
     in-place change to the views while ``qkv`` requires grad."""
@@ -5852,10 +5854,10 @@ def chunk_gdn_kcp(
     must be ``False`` (:func:`check_mode`).
 
     ``q`` / ``k`` / ``v`` that are head views of one packed ``[..., T, (2 H_qk + HV) * 128]`` row get the full backward
-    speed only as :func:`packed_qkv_views_kcp` views.  Plain ``split`` / ``view`` views of the row run the same
-    programs on the same operands and give the same results, but torch's split backward concatenates ``dq`` /
-    ``dk`` / ``dv`` into a new row: about 1.1 ms (33-36 %) more backward per call at ``(16, 48)`` and 32,768 tokens
-    on B200 and GB300, with the in-kernel norm off or on (README, "Packed Q/K/V")."""
+    speed as :func:`packed_qkv_views_kcp` views (conditions: README, "Packed Q/K/V").  Plain ``split`` / ``view``
+    views of the row run the same programs on the same operands and give the same results, but torch's split
+    backward concatenates ``dq`` / ``dk`` / ``dv`` into a new row: about 1.1-1.2 ms (33-37 %) more backward per call
+    at ``(16, 48)`` and 32,768 tokens on B200 and GB300, with the in-kernel norm off or on (README, "Packed Q/K/V")."""
     check_mode(deterministic, "chunk_gdn_kcp")
     over = _literal_overrides(
         options,
