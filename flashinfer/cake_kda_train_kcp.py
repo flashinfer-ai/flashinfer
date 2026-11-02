@@ -68,6 +68,7 @@ Name map (the deterministic names are unchanged and always deterministic)::
       kda_det_workspace_bytes_kcp            kda_workspace_bytes_kcp
       kda_det_saved_bytes_kcp                kda_saved_bytes_kcp
       kda_det_comm_bytes_kcp                 kda_comm_bytes_kcp
+      reduce_gate_param_grads_det_kcp        reduce_gate_param_grads_kcp
       ContextDetKcp, PartitionDetKcp, ...    ContextKcp, PartitionKcp, ... (the non-deterministic package's types)
 
 ``flashinfer.kda_train.chunk_kda_kcp`` stays the deterministic entry (the name
@@ -85,6 +86,17 @@ Usage::
     out_local, saved = chunk_kda_fwd_kcp(q_local, k_local, v_local, g_local, beta_local, ctx, deterministic=False)
     grads = chunk_kda_bwd_kcp(q_local, k_local, v_local, g_local, beta_local, ctx, dout_local, saved=saved,
                               deterministic=False)
+
+Raw gate mode (``use_gate_in_kernel=True`` with ``A_log``, ``dt_bias`` and
+``lower_bound``; FlashInfer #7816) runs on the deterministic package only: the
+compute entries forward the keywords, ``chunk_kda_bwd_kcp`` then returns seven
+tensors (``dA_log`` / ``ddt_bias`` this rank's partial sums, summed over the
+group with :func:`reduce_gate_param_grads_kcp`), and ``kda_workspace_bytes_kcp``
+takes ``use_gate_in_kernel``.  ``deterministic=False`` raises ``ValueError`` for
+it and for ``use_qk_l2norm_in_kernel=True`` (#7817; the in-kernel q / k L2 norm
+is not available on that package); the off values (``use_gate_in_kernel=False``,
+``A_log`` / ``dt_bias`` / ``lower_bound`` ``None``,
+``use_qk_l2norm_in_kernel=False``) are accepted on both routes.
 
 The width-4 causal convolution with halo of the same partition takes this module's ``ctx``.
 """
@@ -337,7 +349,10 @@ def chunk_kda_fwd_kcp(
         The forward programs of the two are the same: bitwise the same ``out``.
     **options
         Further KCP options (``save_transfer``, ``exchange``, ``head_groups``, ``offset_class``, ``graph``),
-        forwarded.
+        forwarded; with ``deterministic=True`` also the raw gate keywords of
+        :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_fwd_kcp` (``use_gate_in_kernel``, ``A_log``,
+        ``dt_bias``, ``lower_bound``).  ``deterministic=False`` refuses the raw gate and
+        ``use_qk_l2norm_in_kernel=True`` (``ValueError``; see the module docstring).
 
     Returns
     -------
@@ -392,7 +407,7 @@ def chunk_kda_bwd_kcp(
     workspace: Optional[Any] = None,
     deterministic: bool = True,
     **options: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     r"""Context-parallel packed KDA chunked training backward of this rank's fragments.
 
     Parameters
@@ -413,7 +428,9 @@ def chunk_kda_bwd_kcp(
     Returns
     -------
     ``(dq, dk, dv, dbeta, dg)`` of this rank's tokens: BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.  Bitwise
-    reproducible at the same topology in both modes.
+    reproducible at the same topology in both modes.  In raw gate mode (``deterministic=True`` only) seven tensors,
+    ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, as :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_bwd_kcp`
+    returns them.
     """
     if _deterministic(deterministic, "chunk_kda_bwd_kcp"):
         return _det_kcp().chunk_kda_det_bwd_kcp(
@@ -524,13 +541,16 @@ def kda_workspace_bytes_kcp(
     C: int = 8192,
     local_arena: Optional[str] = None,
     lean_passes: Optional[int] = None,
+    use_gate_in_kernel: bool = False,
     deterministic: bool = True,
 ) -> int:
     """Bytes of this rank's KCP workspace for ``H`` heads on the package ``deterministic`` selects (the same for both
     values); see :func:`flashinfer.cake_kda_det_train_kcp.kda_det_workspace_bytes_kcp`.  ``ctx`` may be a list of
     contexts (one workspace that serves all of them).  ``local_arena`` / ``lean_passes`` are those of the workspace
     (``WorkspaceKcp`` / ``WorkspaceDetKcp`` ``(local_arena="lean", lean_passes=...)``, opt-in: the backward's lean
-    local arena, its tail in ``lean_passes`` passes, two by default); ``None`` keeps the replay arena."""
+    local arena, its tail in ``lean_passes`` passes, two by default); ``None`` keeps the replay arena.
+    ``use_gate_in_kernel``: the workspace's gate mode (``WorkspaceDetKcp(use_gate_in_kernel=True)``, the raw gate
+    mode); ``True`` with ``deterministic=False`` raises ``ValueError``."""
     det = _deterministic(deterministic, "kda_workspace_bytes_kcp")
     plan = _det_plan() if det else _nd_plan()
     if save_transfer is None:
@@ -545,7 +565,29 @@ def kda_workspace_bytes_kcp(
         C=C,
         local_arena=local_arena,
         lean_passes=lean_passes,
+        use_gate_in_kernel=use_gate_in_kernel,
     )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def reduce_gate_param_grads_kcp(
+    ctx: Any,
+    dA_log: torch.Tensor,
+    ddt_bias: torch.Tensor,
+    *,
+    deterministic: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The raw gate mode's full ``(dA_log, ddt_bias)`` from every rank's partial sums (the last two tensors of
+    :func:`chunk_kda_bwd_kcp`), bitwise reproducible; see
+    :func:`flashinfer.cake_kda_det_train_kcp.reduce_gate_param_grads_det_kcp`.  A collective: every rank of
+    ``ctx.group`` calls it.  The raw gate mode runs on the deterministic package only, so ``deterministic=False``
+    raises ``ValueError`` (unless torch's deterministic algorithms route it to the deterministic package)."""
+    if not _deterministic(deterministic, "reduce_gate_param_grads_kcp"):
+        raise ValueError(
+            "reduce_gate_param_grads_kcp: the raw gate mode (use_gate_in_kernel=True) runs on the deterministic "
+            "package only; pass deterministic=True"
+        )
+    return _det_kcp().reduce_gate_param_grads_det_kcp(ctx, dA_log, ddt_bias)
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -653,4 +695,5 @@ __all__ = [
     "kda_saved_bytes_kcp",
     "kda_workspace_bytes_kcp",
     "partition_kcp",
+    "reduce_gate_param_grads_kcp",
 ]
