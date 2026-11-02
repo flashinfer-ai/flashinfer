@@ -139,6 +139,10 @@ def cake_grouped_det_mm(
         ``[sum_m, N]`` bfloat16.  ``backward`` produces ``x.grad`` ``[sum_m, K]``
         bfloat16 and ``w.grad`` ``[E, N, K]`` in ``w``'s dtype (bfloat16); use
         :func:`grouped_det_gemm_wgrad` directly for an fp32 weight gradient.
+        The forward GEMM runs after autograd saved ``x``, ``w`` and ``offs``:
+        under a non-reentrant checkpoint with early stop on, the recomputation
+        skips it when these are the last saves of the innermost checkpointed
+        region, as for a built-in op.
     """
     from ..experimental.cake_moe_grouped_det_gemm.cake_autograd import (
         cake_grouped_det_mm as _impl,

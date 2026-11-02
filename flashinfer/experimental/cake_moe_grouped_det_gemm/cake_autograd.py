@@ -18,7 +18,11 @@ limitations under the License.
 # projection ``Y = X @ W[e].T`` with the activation gradient ``dX = G @ W[e]``
 # and the weight gradient ``dW[e] = G[e].T @ X[e]`` in ``backward``.
 # ``CakeGroupedDetMm`` calls the three generated programs as plain functions; no
-# torch custom op is registered.
+# torch custom op is registered.  ``cake_grouped_det_mm`` launches the forward
+# after ``CakeGroupedDetMm.apply`` returns, so autograd saves ``x``, ``w`` and
+# ``offs`` before the GEMM runs, as it does for a built-in op: a non-reentrant
+# checkpoint with early stop on (the torch default) then skips the recomputed
+# GEMM when these are the last saves of the innermost checkpointed region.
 
 from __future__ import annotations
 
@@ -64,6 +68,21 @@ def _bf16_rows(t: torch.Tensor) -> torch.Tensor:
     return t
 
 
+# Passed by ``cake_grouped_det_mm`` as the fifth argument of
+# ``CakeGroupedDetMm.apply``: ``forward`` then allocates ``Y`` without launching,
+# and the wrapper fills it after ``apply`` returns (after autograd saved the
+# inputs).
+_DEFER_FWD = object()
+
+
+def _fill_fwd(
+    x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor, y: torch.Tensor
+) -> None:
+    """The forward GEMM into ``y`` as ``forward`` runs it: grad mode off, so no node and no saved tensor."""
+    with torch.no_grad():
+        _fwd_op(x, w, offs, y.detach())
+
+
 class CakeGroupedDetMm(torch.autograd.Function):
     """``Y = grouped X @ W[e].T`` with ``dX`` and ``dW`` from the Cake programs.
 
@@ -71,16 +90,26 @@ class CakeGroupedDetMm(torch.autograd.Function):
     end offsets ``[E]`` (or ``m_indptr`` ``[E + 1]``).  ``backward`` returns
     ``dX`` ``[sum_m, K]`` bf16 and ``dW`` ``[E, N, K]`` in the dtype of ``w``;
     both reductions are bitwise deterministic and empty groups give exact
-    zeros.
+    zeros.  Through :func:`cake_grouped_det_mm` the forward GEMM runs after
+    autograd saved ``x``, ``w`` and ``offs``, so a checkpoint's early stop can
+    skip it; a direct ``CakeGroupedDetMm.apply(x, w, offs, deterministic)``
+    launches inside ``forward`` and a checkpoint always recomputes it, as does
+    the wrapper under ``torch.jit.trace`` and ``torch.compile``.
     """
 
     @staticmethod
     def forward(
-        ctx, x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor, deterministic: bool
+        ctx,
+        x: torch.Tensor,
+        w: torch.Tensor,
+        offs: torch.Tensor,
+        deterministic: bool,
+        _launch=None,
     ):
         num_groups = int(w.shape[0])
         y = torch.empty(x.shape[0], w.shape[1], dtype=torch.bfloat16, device=x.device)
-        _fwd_op(x, w, offs, y)
+        if _launch is not _DEFER_FWD:
+            _fwd_op(x, w, offs, y)
         ctx.save_for_backward(x, w, offs)
         ctx.num_groups = num_groups
         return y
@@ -103,7 +132,7 @@ class CakeGroupedDetMm(torch.autograd.Function):
                 ctx.num_groups, w.shape[1], w.shape[2], dtype=w.dtype, device=w.device
             )
             _wgrad_op(g, x, offs, dw, ctx.num_groups)
-        return dx, dw, None, None
+        return (dx, dw) + (None,) * (len(ctx.needs_input_grad) - 2)
 
 
 def cake_grouped_det_mm(
@@ -134,10 +163,21 @@ def cake_grouped_det_mm(
         ``[sum_m, N]`` bfloat16.  ``backward`` produces ``x.grad`` ``[sum_m, K]``
         bfloat16 and ``w.grad`` ``[E, N, K]`` in ``w``'s dtype (bfloat16); use
         :func:`grouped_det_gemm_wgrad` directly for an fp32 weight gradient.
+        The forward GEMM runs after autograd saved ``x``, ``w`` and ``offs``:
+        under a non-reentrant checkpoint with early stop on, the recomputation
+        skips it when these are the last saves of the innermost checkpointed
+        region, as for a built-in op.
     """
     if x.dtype != torch.bfloat16 or w.dtype != torch.bfloat16:
         raise ValueError(f"x and w must be bfloat16 (got {x.dtype} and {w.dtype})")
-    return CakeGroupedDetMm.apply(x, w, offs, bool(deterministic))
+    if torch.jit.is_tracing() or torch.compiler.is_compiling():
+        # A trace records ``apply`` only, and Dynamo cannot lift the deferred
+        # launch out of a checkpointed region: keep the launch inside ``forward``.
+        return CakeGroupedDetMm.apply(x, w, offs, bool(deterministic))
+    # ``apply`` saves x, w and offs; a checkpoint recomputation may stop inside it.
+    y = CakeGroupedDetMm.apply(x, w, offs, bool(deterministic), _DEFER_FWD)
+    _fill_fwd(x, w, offs, y)
+    return y
 
 
 # The names of the package before the deterministic-family rename (when it was
