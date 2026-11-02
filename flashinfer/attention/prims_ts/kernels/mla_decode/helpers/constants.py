@@ -85,6 +85,12 @@ SCORE_TOKENS_PER_QK_GROUP = 8
 # per-split LSE rescale factors in SMEM.
 SPLIT_REDUCTION_SCALE_BARRIER_ID = 4
 
+# The same scale barrier in the standalone 2CTA split-KV reducers, where every
+# thread of the CTA joins it. A named barrier ID reserves all lower IDs, so ID
+# 4 limited these latency-bound 128-thread CTAs to three per SM (SM107); ID 1
+# leaves residency to registers and threads (eight CTAs).
+STANDALONE_REDUCTION_SCALE_BARRIER_ID = 1
+
 # SmemPResource uses adjacent CTA barriers for the two FP8 P producer instances
 # after byte-transposed STSM stores have published their SMEM payloads.
 SMEM_P_FP8_STORE_BARRIER_BASE_ID = 4

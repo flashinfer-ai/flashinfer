@@ -25,7 +25,11 @@ from ..helpers.constants import (
     SUPPORTED_MLA_PAGE_SIZES,
     WARP_LANES,
 )
-from ..helpers.nvfp4_kv import Nvfp4KVConfig, validate_nvfp4_kv_formats
+from ..helpers.nvfp4_kv import (
+    Nvfp4KVConfig,
+    is_sm107_target,
+    validate_nvfp4_kv_formats,
+)
 from ..helpers.mask import MaskType, normalize_mask_type
 
 
@@ -496,6 +500,13 @@ def make_mla_decode_config(
             2,
             2 if rope_dim or fuse_output_quant else 3,
         )
+        if rope_dim and is_sm107_target():
+            # SM107's 327 KiB SMEM retains a third converted D576 K/V pair
+            # (279 KiB; 311 KiB with the fused output stage), so converters
+            # run two tiles ahead of the MMA (VR200 H96 top-k 2048, 64 rows:
+            # 27.8 -> 25.8 us; 256 rows: 71.9 -> 65.5 us). A fourth K stage
+            # adds nothing.
+            cfg.load_k_stage, cfg.load_v_stage = 3, 3
         cfg.load_num_warps = 8
         cfg.mma_s_stage = 1
         cfg.load_v_warp_id = cfg.load_k_warp_id

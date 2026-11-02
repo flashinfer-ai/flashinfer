@@ -550,6 +550,7 @@ def select_sparse_mla_profile(
     sm_count,
     rope_dim=0,
     kv_cache_format="native",
+    compute_capability=None,
 ):
     """Resolve one complete schedule from the validated public plan bounds.
 
@@ -557,6 +558,9 @@ def select_sparse_mla_profile(
     schedule with cluster reduction is replaced by the raw-count schedule when
     ``heads`` is not a multiple of 16: the cluster finisher needs whole M16
     head tiles, a kernel constraint rather than a measured crossover.
+    ``compute_capability`` is the device's ``(major, minor)``; it enables
+    architecture-specific choices (SM107 NVFP4 D576 unsplit waves), and
+    ``None`` keeps the architecture-independent schedule.
     """
     kwargs = dict(
         rows=rows,
@@ -566,6 +570,7 @@ def select_sparse_mla_profile(
         sm_count=sm_count,
         rope_dim=rope_dim,
         kv_cache_format=kv_cache_format,
+        compute_capability=compute_capability,
     )
     policy_heads = sparse_policy_heads(heads, dtype=dtype, rope_dim=rope_dim)
     profile = resolve_sparse_mla_profile(heads=policy_heads, **kwargs)
@@ -584,6 +589,7 @@ def resolve_sparse_mla_profile(
     sm_count,
     rope_dim=0,
     kv_cache_format="native",
+    compute_capability=None,
 ):
     """Choose, size and grid-fill the schedule for exactly ``heads`` heads.
 
@@ -666,7 +672,16 @@ def resolve_sparse_mla_profile(
         elif profile.family == "2cta":
             # Conversion makes longer per-cluster loops costly. Use the same
             # resident-wave split sizing below, with two SMs per cluster.
-            profile = replace(profile, split_kv=0)
+            # SM107 D576 retains three converted K/V tiles, so once the wave
+            # fill would split only twice, one unsplit wave beats the split
+            # plus its GMEM merge (Rubin, 208 SMs, H96 top-k 2048, 48 rows:
+            # 27.1 -> 25.6 us; 32 rows keep three splits: 22.9 vs 25.3 us).
+            unsplit = (
+                compute_capability == (10, 7)
+                and rope_dim == 64
+                and rows * 3 > sm_count // 2
+            )
+            profile = replace(profile, split_kv=1 if unsplit else 0)
     profile = size_profile_buffers(
         profile,
         rows=rows,

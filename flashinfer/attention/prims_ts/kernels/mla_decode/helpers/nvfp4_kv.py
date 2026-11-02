@@ -226,6 +226,16 @@ def nvfp4_row_bytes(rope_dim: int) -> int:
     return NVFP4_DATA_BYTES + rope_dim + NVFP4_SCALE_BYTES
 
 
+def is_sm107_target() -> bool:
+    """Whether the CuTe DSL compile target is SM107 itself (``sm_107``
+    through ``sm_107f``), so SM107-only resources such as its 327 KiB of SMEM
+    per CTA (SM100: 227 KiB) can be assumed. The ``sm_100f`` family target
+    is excluded: it also builds for SM100/SM103.
+    """
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return is_rubin_cute_dsl_available() and Arch.sm_107 <= arch <= Arch.sm_107f
+
+
 def use_sm107_nvfp4_converter() -> bool:
     """Whether the compile target is SM107, which uses the f16x2 converter.
 
@@ -235,9 +245,7 @@ def use_sm107_nvfp4_converter() -> bool:
     converter.
     """
     arch = BaseDSL._get_dsl().get_arch_enum()
-    if arch == Arch.sm_100f:
-        return True
-    return is_rubin_cute_dsl_available() and Arch.sm_107 <= arch <= Arch.sm_107f
+    return arch == Arch.sm_100f or is_sm107_target()
 
 
 @cute.jit

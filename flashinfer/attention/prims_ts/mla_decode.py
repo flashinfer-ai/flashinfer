@@ -2444,6 +2444,7 @@ def _resolve_sparse_mla_plan(
         sm_count=sm_count,
         rope_dim=qk_rope_head_dim,
         kv_cache_format=kv_cache_format,
+        compute_capability=torch.cuda.get_device_capability(device),
     )
     # Reloading V from L2 shortens native FP8 decode's producer lifetime.
     # Sustained grids amortize the retained-KV/CLC pipeline instead; packed
