@@ -1630,12 +1630,12 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_849a3682e63907b457aa(const __grid_co
                 b_cstop = b_sq;
                 int s_q1 = ((b_ekv > 0) ? b_eq + 1 : b_eq);
                 if (s_q1 > b_sq) {
-                    b_ctx = context_lens[b_sq * 1 + 1 - 1];
+                    b_ctx = context_lens[b_sq + 1 - 1];
                     b_cq = s_q1 - 1;
                     int s_lo = ((b_cq == b_sq) ? b_skv : 0);
                     int s_hi = b_ekv;
                     if (b_cq != b_eq) {
-                        s_hi = (context_lens[b_cq * 1 + 1 - 1] + 64 - 1) / 64;
+                        s_hi = (context_lens[b_cq + 1 - 1] + 64 - 1) / 64;
                     }
                     int s_steps = (s_hi - s_lo + 2 - 1) / 2;
                     b_ckv = s_lo;
@@ -1698,7 +1698,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_849a3682e63907b457aa(const __grid_co
                             b_cq = b_sq;
                             b_ckv = b_skv;
                             b_cstop = b_sq;
-                            b_ctx = context_lens[b_sq * 1 + 1 - 1];
+                            b_ctx = context_lens[b_sq + 1 - 1];
                             int f_nkv = (b_ctx + 64 - 1) / 64;
                             if (b_skv < f_nkv) {
                                 b_pg0 = block_table[b_sq * block_table_stride + b_skv / 2];
@@ -1722,7 +1722,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_849a3682e63907b457aa(const __grid_co
                     mbarrier_arrive(it_full_addr + (d_stage) * 8);
                     if (b_sq >= 0) {
                         asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&Q))), "r"((int)(0)), "r"((int)(b_sq * 32)) : "memory");
-                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&Weights))), "r"((int)(0)), "r"((int)(b_sq * 1)) : "memory");
+                        asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&Weights))), "r"((int)(0)), "r"((int)(b_sq)) : "memory");
                         if (b_pg0 >= 0) {
                             asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&KV))), "r"((int)(0)), "r"((int)(b_skv % 2 * 64)), "r"((int)(b_pg0)) : "memory");
                             asm volatile("cp.async.bulk.prefetch.tensor.2d.L2.global.tile [%0, {%1, %2}];" :: "l"((uint64_t)((&KV_scales))), "r"((int)(4096 + b_skv % 2 * 64)), "r"((int)(b_pg0)) : "memory");
@@ -1756,7 +1756,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_849a3682e63907b457aa(const __grid_co
                             b_cq = b_sq;
                             b_ckv = b_skv;
                             b_cstop = b_sq;
-                            b_ctx = context_lens[b_sq * 1 + 1 - 1];
+                            b_ctx = context_lens[b_sq + 1 - 1];
                             int h_nkv = (b_ctx + 64 - 1) / 64;
                             if (b_skv < h_nkv) {
                                 b_pg0 = block_table[b_sq * block_table_stride + b_skv / 2];

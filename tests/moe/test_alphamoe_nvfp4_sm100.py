@@ -514,6 +514,17 @@ def test_alphamoe_nvfp4_rejects_invalid_host_contracts():
     with pytest.raises(ValueError, match="non-overlapping"):
         alphamoe_nvfp4_aligned_moe(*overlapping_args)
 
+    padded_out = torch.zeros(
+        (case["M"], case["K"] + 8), dtype=torch.bfloat16, device="cuda"
+    )
+    noncontiguous_out = padded_out[:, : case["K"]]
+    assert not noncontiguous_out.is_contiguous()
+    assert noncontiguous_out.data_ptr() % 16 == 0
+    noncontiguous_args = list(args)
+    noncontiguous_args[13] = noncontiguous_out
+    with pytest.raises(ValueError, match="out must be contiguous"):
+        alphamoe_nvfp4_aligned_moe(*noncontiguous_args)
+
     misaligned_storage = torch.empty(
         case["M"] * case["K"] + 1, dtype=torch.bfloat16, device="cuda"
     )
@@ -554,6 +565,76 @@ def test_alphamoe_nvfp4_rejects_invalid_host_contracts():
         _launch(k128)
 
 
+# The 128-token batch plan: N = 256, K = 7168, 256 experts, top-8, block_m 16. Routed
+# scaling 1.0 keeps the BF16 accumulation error of the 128 x 7168 output well inside the
+# contract tolerance.
+_FUSED_BATCH_CASE = (128, 256, 7168, 256, 8, 16, 0.8, 1.0, 28140)
+_SCALE_KEYS = ("x_scale", "w1_scale", "w2_scale")
+
+
+def _offset_copy(tensor: torch.Tensor, offset: int) -> torch.Tensor:
+    """Contiguous copy of a one-byte-element tensor ``offset`` bytes past its allocation start."""
+    assert tensor.element_size() == 1
+    storage = torch.empty(tensor.numel() + 16, dtype=torch.uint8, device=tensor.device)
+    flat = storage[offset : offset + tensor.numel()]
+    flat.copy_(tensor.reshape(-1).view(torch.uint8))
+    copy = flat.view(tensor.dtype).view(tensor.shape)
+    assert copy.is_contiguous()
+    assert copy.data_ptr() - storage.data_ptr() == offset
+    assert copy.data_ptr() % 4 == offset % 4
+    return copy
+
+
+@pytest.mark.parametrize(
+    "scale_offsets",
+    [(0, 0, 0), (1, 0, 0), (0, 2, 3)],
+    ids=["word_scales", "byte_hidden_scale", "byte_weight_scales"],
+)
+def test_alphamoe_nvfp4_fused_batch_scale_loads_and_output_seed(scale_offsets):
+    """128-token batch plan with 4-byte aligned scale pointers and with scales at byte offsets.
+
+    Each runs into a fresh BF16 ``out`` and into a 16-byte aligned view inside a larger
+    buffer, both seeded with nonzero values: the result is the seed plus the routed sum,
+    and the bytes around the view stay unchanged.
+    """
+    _skip_if_not_supported()
+    case = _make_case(*_FUSED_BATCH_CASE)
+    m, k = case["M"], case["K"]
+    launch_case = dict(case)
+    for name, offset in zip(_SCALE_KEYS, scale_offsets, strict=True):
+        launch_case[name] = _offset_copy(case[name], offset)
+    assert all(launch_case[name].data_ptr() % 4 == 0 for name in _SCALE_KEYS) == (
+        scale_offsets == (0, 0, 0)
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(28141)
+    initial = (
+        torch.randn((m, k), dtype=torch.float32, device="cuda", generator=generator)
+        * 4.0
+    ).to(torch.bfloat16)
+    fresh = _launch(launch_case, out=initial.clone())
+
+    guard, sentinel = 8, -3.0
+    storage = torch.full(
+        (m * k + 2 * guard,), sentinel, dtype=torch.bfloat16, device="cuda"
+    )
+    view = storage[guard : guard + m * k].view(m, k)
+    assert view.is_contiguous()
+    assert view.data_ptr() % 16 == 0
+    assert view.data_ptr() != storage.data_ptr()
+    view.copy_(initial)
+    _launch(launch_case, out=view)
+    torch.cuda.synchronize()
+
+    expected = _reference(case, out_init=initial)
+    _assert_nvfp4_close(fresh, expected, "fused batch into a fresh output")
+    _assert_nvfp4_close(view, expected, "fused batch into an output view")
+    assert torch.all(storage[:guard] == sentinel), "bytes before the output changed"
+    assert torch.all(storage[guard + m * k :] == sentinel), (
+        "bytes after the output changed"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Deferred finalize (complete routes): identical arithmetic, BF16 caller seed.
 # ---------------------------------------------------------------------------
@@ -565,6 +646,26 @@ _COMPLETE_E, _COMPLETE_N, _COMPLETE_K, _COMPLETE_TOP_K, _COMPLETE_BLOCK_M = (
     8,
     8,
 )
+
+
+def _complete_route_workspaces(m: int) -> dict:
+    """Fresh caller-owned routing workspaces of the complete-route geometry for ``m`` tokens."""
+    device = torch.device("cuda")
+    pairs = m * _COMPLETE_TOP_K
+    raw_capacity = (
+        pairs * _COMPLETE_BLOCK_M
+        if pairs < _COMPLETE_E + 1
+        else pairs + (_COMPLETE_E + 1) * (_COMPLETE_BLOCK_M - 1)
+    )
+    expert_capacity = (raw_capacity + _COMPLETE_BLOCK_M - 1) // _COMPLETE_BLOCK_M
+    return dict(
+        sorted_token_ids=torch.empty(
+            (expert_capacity * _COMPLETE_BLOCK_M,), dtype=torch.int32, device=device
+        ),
+        expert_ids=torch.empty((expert_capacity,), dtype=torch.int32, device=device),
+        num_tokens_post_padded=torch.empty((1,), dtype=torch.int32, device=device),
+        cumsum_buffer=torch.empty((_COMPLETE_E + 2,), dtype=torch.int32, device=device),
+    )
 
 
 def _complete_route_case(m: int, seed: int, *, prepared_data: bool):
@@ -598,13 +699,6 @@ def _complete_route_case(m: int, seed: int, *, prepared_data: bool):
         (topk_weights / topk_weights.sum(dim=-1, keepdim=True)).float().contiguous()
     )
     topk_ids = topk_ids.to(torch.int32).contiguous()
-    pairs = m * _COMPLETE_TOP_K
-    raw_capacity = (
-        pairs * _COMPLETE_BLOCK_M
-        if pairs < _COMPLETE_E + 1
-        else pairs + (_COMPLETE_E + 1) * (_COMPLETE_BLOCK_M - 1)
-    )
-    expert_capacity = (raw_capacity + _COMPLETE_BLOCK_M - 1) // _COMPLETE_BLOCK_M
     case = dict(
         hidden_states=x,
         hidden_states_scale=x_scale,
@@ -639,18 +733,7 @@ def _complete_route_case(m: int, seed: int, *, prepared_data: bool):
     )
 
     def workspaces():
-        return dict(
-            sorted_token_ids=torch.empty(
-                (expert_capacity * _COMPLETE_BLOCK_M,), dtype=torch.int32, device=device
-            ),
-            expert_ids=torch.empty(
-                (expert_capacity,), dtype=torch.int32, device=device
-            ),
-            num_tokens_post_padded=torch.empty((1,), dtype=torch.int32, device=device),
-            cumsum_buffer=torch.empty(
-                (_COMPLETE_E + 2,), dtype=torch.int32, device=device
-            ),
-        )
+        return _complete_route_workspaces(m)
 
     return case, seed_out, workspaces
 

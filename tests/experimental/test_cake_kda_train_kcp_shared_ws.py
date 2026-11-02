@@ -13,12 +13,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-One KCP workspace shared by several prepared packs (``cake_kda_train.cake_kcp.KcpWorkspace``): ``reserve`` sizes it
+One KCP workspace shared by several prepared packs (``cake_kda_train_kcp.cake_kcp.WorkspaceKcp``, the non-deterministic package): ``reserve`` sizes it
 for a list of contexts (each pool at its largest need, the local arena at the largest layout, a plan view of it per
-other pack), ``kcp_workspace_bytes([ctx, ...], H=)`` predicts its bytes, and the calls of the reserved packs, in any
+other pack), ``kda_workspace_bytes_kcp([ctx, ...], H=)`` predicts its bytes, and the calls of the reserved packs, in any
 interleaving, allocate nothing, keep every pointer and give bitwise the results of one workspace per pack.  The
 workspace holds no context, its host caches are bounded, a call on another stream is ordered after the last one on
-the device, and ``allocate=False`` sizes the first forward for the backward.  Checkpointed layers with one recompute
+the device and a storage it releases is reused only after that stream's queued work (``record_stream`` on a switch
+only), and ``allocate=False`` sizes the first forward for the backward.  Checkpointed layers with one recompute
 handle per pack and layer on a shared workspace are bitwise and exchange-free in their recompute, and the tensors a
 handle stores are never in the workspace (the other packs' calls cannot overwrite them).  The multi-GPU rows are in
 ``test_cake_kda_train_kcp_dist.py``-style launch forms at the end of this file (``spawn`` or one process per Slurm
@@ -48,10 +49,10 @@ from tests.test_helpers.cake_host_sync import (
 from tests.test_helpers.cake_kda_train_kcp_saved import written_tensors
 from tests.test_helpers.cake_package import cake_package
 
-kp = cake_package("cake_kda_train", "cake_kcp_plan")
-cake_kcp = cake_package("cake_kda_train", "cake_kcp")
-cake_backend = cake_package("cake_kda_train", "cake_backend")
-cake_jit = cake_package("cake_kda_train", "cake_jit")
+kp = cake_package("cake_kda_train_kcp", "cake_kcp_plan")
+cake_kcp = cake_package("cake_kda_train_kcp", "cake_kcp")
+cake_backend = cake_package("cake.cake_kda_train", "cake_backend")
+cake_jit = cake_package("cake.cake_kda_train", "cake_jit")
 
 SM_COUNT = 152
 # the document lengths of four packs of one rank: different T_r and n_frag; at H = 4 the one-document and
@@ -68,14 +69,14 @@ def _cu(lengths) -> list[int]:
 
 
 def _part(lengths, W: int = 1, layout: str = "contiguous"):
-    return kp.kcp_partition(
+    return kp.partition_kcp(
         torch.tensor(_cu(lengths), dtype=torch.int64), W, layout=layout
     )
 
 
 def _new_ws(**kw):
     backend = cake_kcp.get_backend()
-    return cake_kcp.KcpWorkspace(
+    return cake_kcp.WorkspaceKcp(
         state_dtype=backend.dtypes["state"], local=backend.local_stages, **kw
     )
 
@@ -107,7 +108,7 @@ def _pointers(ws) -> dict:
 
 
 def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
-    """``kcp_workspace_bytes([ctx, ...])`` (host only): a list of one context is that context's bytes; a list gives
+    """``kda_workspace_bytes_kcp([ctx, ...])`` (host only): a list of one context is that context's bytes; a list gives
     each pool at its largest need over the contexts (a :data:`SHARED_POOLS` pair one storage of the larger), the
     largest local arena and each distinct pack's scratch table set -- computed here independently from the
     single-context queries; a ``reserve`` of the same list on a pools-only workspace allocates exactly that pool
@@ -119,14 +120,14 @@ def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
             parts = [_part(lengths, W, layout) for lengths in PACKS]
             for r in range(W):
                 ctxs = [
-                    kp.build_kcp_context(p, None, r, "cpu", 4, sm_count=SM_COUNT)
+                    kp.build_context_kcp(p, None, r, "cpu", 4, sm_count=SM_COUNT)
                     for p in parts
                 ]
                 for H in HEADS:
                     for backward in (True, False):
                         kw = {"H": H, "backward": backward}
-                        single = [kp.kcp_workspace_bytes(c, **kw) for c in ctxs]
-                        assert kp.kcp_workspace_bytes([ctxs[0]], **kw) == single[0]
+                        single = [kp.kda_workspace_bytes_kcp(c, **kw) for c in ctxs]
+                        assert kp.kda_workspace_bytes_kcp([ctxs[0]], **kw) == single[0]
                         lays = [kp.kcp_arena_layout(c, **kw) for c in ctxs]
                         need = {
                             key[5:]: max(lay[key] for lay in lays)
@@ -164,7 +165,7 @@ def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
                             (c.T_r, c.n_frag): loc - a
                             for c, loc, a in zip(ctxs, local, arena, strict=True)
                         }
-                        got = kp.kcp_workspace_bytes(ctxs, **kw)
+                        got = kp.kda_workspace_bytes_kcp(ctxs, **kw)
                         assert got == max(arena) + sum(scratch.values()) + pools, (
                             W,
                             layout,
@@ -175,14 +176,14 @@ def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
                         assert max(single) <= got < sum(single)
                         if backward:
                             for order in (ctxs, ctxs[::-1]):
-                                ws = cake_kcp.KcpWorkspace(local=False)
+                                ws = cake_kcp.WorkspaceKcp(local=False)
                                 ws.reserve(order, H)
                                 assert ws.bytes == pools, (W, layout, r, H)
                                 ptrs = _pointers(ws)
                                 for c in order:
                                     ws.ensure(c, H, device="cpu", backward=False)
                                 assert _pointers(ws) == ptrs and ws.bytes == pools
-                            ws_r = cake_kcp.KcpWorkspace(local=False)
+                            ws_r = cake_kcp.WorkspaceKcp(local=False)
                             ws_r.reserve(ctxs, H, ring=True)  # the hop pools too
                             assert ws_r.bytes == pools + sum(
                                 max(lay[f"pool.{n}"] for lay in lays)
@@ -193,22 +194,22 @@ def test_byte_query_of_a_list_is_the_per_pool_max() -> None:
 
 
 def test_reserve_floor_and_allocate_false_size_forwards_for_the_backward() -> None:
-    """``reserve`` and ``KcpWorkspace(ctx, H, allocate=False)`` keep a backward sizing floor: a later forward ensure
+    """``reserve`` and ``WorkspaceKcp(ctx, H, allocate=False)`` keep a backward sizing floor: a later forward ensure
     sizes the backward pools too (no forward-only state to upgrade); ``allocate=False`` allocates nothing until the
     first ensure; a workspace without a context keeps today's forward-only first state."""
     part = _part((1000, 577), 4, "zigzag_per_document")
-    ctx = kp.build_kcp_context(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
+    ctx = kp.build_context_kcp(part, None, 1, "cpu", 4, sm_count=SM_COUNT)
     full = kp.kcp_arena_layout(ctx, H=4)["arena"]
     fwd = kp.kcp_arena_layout(ctx, H=4, backward=False)["arena"]
     assert fwd < full
-    ws = cake_kcp.KcpWorkspace(ctx, 4, device="cpu", local=False, allocate=False)
+    ws = cake_kcp.WorkspaceKcp(ctx, 4, device="cpu", local=False, allocate=False)
     assert ws.bytes == 0 and not ws._pools and ws.local is None
     ws.ensure(ctx, 4, device="cpu", backward=False)
     assert ws.bytes == full and ws.has("b1_send")
-    plain = cake_kcp.KcpWorkspace(local=False)
+    plain = cake_kcp.WorkspaceKcp(local=False)
     plain.ensure(ctx, 4, device="cpu", backward=False)
     assert plain.bytes == fwd and not plain.has("b1_send")
-    reserved = cake_kcp.KcpWorkspace(local=False)
+    reserved = cake_kcp.WorkspaceKcp(local=False)
     reserved.reserve([ctx], 4)
     ptrs = _pointers(reserved)
     reserved.ensure(ctx, 4, device="cpu", backward=False)
@@ -222,10 +223,10 @@ def test_shared_workspace_holds_no_context_and_bounds_its_caches() -> None:
     table set weakly; the table set lives on the context); its pool-view and ensure-record caches stay bounded,
     and a record per context lets interleaved packs keep the fast path."""
     part = _part((1000, 577))
-    ws = cake_kcp.KcpWorkspace(local=False)
+    ws = cake_kcp.WorkspaceKcp(local=False)
     refs = []
     for _ in range(3):
-        ctx = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+        ctx = kp.build_context_kcp(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
         tb = ws.ensure(ctx, 64, device="cpu", backward=True, host_trim=True)
         assert ws.ensure(ctx, 64, device="cpu", backward=True, host_trim=True) is tb
         refs.append((weakref.ref(ctx), weakref.ref(tb)))
@@ -234,14 +235,14 @@ def test_shared_workspace_holds_no_context_and_bounds_its_caches() -> None:
     assert all(a() is None and b() is None for a, b in refs)
     assert ws._fast and all(rec[0]() is None for rec in ws._fast.values())
     # a dead ensure record misses: the next ensure takes the full path
-    ctx = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+    ctx = kp.build_context_kcp(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
     assert ws.ensure(ctx, 64, device="cpu", backward=True, host_trim=True) is not None
     n = ws._pools["c1_send"].numel()
     for i in range(1, cake_kcp.SLICE_CACHE_MAX + 50):
         ws.pool("c1_send", min(i, n), cached=True)
         assert len(ws._slices) <= cake_kcp.SLICE_CACHE_MAX
     # interleaved packs: one record each, every one a hit while no storage changes
-    other = kp.build_kcp_context(
+    other = kp.build_context_kcp(
         _part((50, 640, 77)), None, 0, "cpu", 4, sm_count=SM_COUNT
     )
     for _ in range(2):  # the first round may grow a pool, which drops the records
@@ -259,7 +260,7 @@ def test_shared_workspace_holds_no_context_and_bounds_its_caches() -> None:
     ws.tables = real
     part = _part((50, 640, 77))
     for _ in range(cake_kcp.ENSURE_CACHE_MAX + 10):
-        c = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
+        c = kp.build_context_kcp(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
         ws.ensure(c, 64, device="cpu", backward=True, host_trim=True)
         assert len(ws._fast) <= cake_kcp.ENSURE_CACHE_MAX
 
@@ -309,7 +310,7 @@ def _operands(device, T: int, H: int, seed: int) -> dict:
 
 def _packs(device, H: int, packs=PACKS, W: int = 1, rank: int = 0, layout="contiguous"):
     ctxs = [
-        kp.build_kcp_context(_part(lengths, W, layout), None, rank, device)
+        kp.build_context_kcp(_part(lengths, W, layout), None, rank, device)
         for lengths in packs
     ]
     ops = [_operands(device, int(c.T_r), H, 0x7815 + i) for i, c in enumerate(ctxs)]
@@ -317,13 +318,21 @@ def _packs(device, H: int, packs=PACKS, W: int = 1, rank: int = 0, layout="conti
 
 
 def _fwd(ctx, o, ws, **kw):
-    return cake_kcp.chunk_kda_kcp_fwd(
-        o["q"], o["k"], o["v"], o["g"], o["beta"], ctx, workspace=ws, **kw
+    return cake_kcp.chunk_kda_fwd_kcp(
+        o["q"],
+        o["k"],
+        o["v"],
+        o["g"],
+        o["beta"],
+        ctx,
+        workspace=ws,
+        **kw,
+        deterministic=False,
     )
 
 
 def _bwd(ctx, o, ws, saved, **kw):
-    return cake_kcp.chunk_kda_kcp_bwd(
+    return cake_kcp.chunk_kda_bwd_kcp(
         o["q"],
         o["k"],
         o["v"],
@@ -334,6 +343,7 @@ def _bwd(ctx, o, ws, saved, **kw):
         saved=saved,
         workspace=ws,
         **kw,
+        deterministic=False,
     )
 
 
@@ -381,7 +391,7 @@ def _schedule(ctxs, ops, wss, *, poison=None, **kw) -> list[dict]:
         ]
         out = torch.utils.checkpoint.checkpoint(
             lambda *a, i=i: cake_kcp.chunk_kda_kcp(
-                *a, ctxs[i], None, "light", "saved", wss[i], **kw
+                *a, ctxs[i], None, "light", "saved", wss[i], **kw, deterministic=False
             ),
             *lf,
             use_reentrant=False,
@@ -412,19 +422,19 @@ def test_gpu_reserved_shared_workspace_is_bitwise_per_pack(device) -> None:
     without a saved set, checkpointed autograd through all packs; the arena NaN-filled before every forward): out,
     the written saved sets and every gradient are bitwise those of one workspace per pack.  ``reserve`` allocates
     exactly the workspace's storages (``memory_allocated`` delta = their allocator-rounded bytes) and its ``bytes``
-    equal ``kcp_workspace_bytes(ctxs, H=H)``, below the sum of the per-pack workspaces; the local arena is the
+    equal ``kda_workspace_bytes_kcp(ctxs, H=H)``, below the sum of the per-pack workspaces; the local arena is the
     largest per-pack arena; after two schedules no pointer, arena, view or byte count has changed."""
     seen_p1 = seen_pn = 0
     for H in HEADS:
         ctxs, ops = _packs(device, H)
-        Ps = [cake_kcp.KcpWorkspace(local=False).tables(c, H).P for c in ctxs]
+        Ps = [cake_kcp.WorkspaceKcp(local=False).tables(c, H).P for c in ctxs]
         seen_p1 += sum(P == 1 for P in Ps)
         seen_pn += sum(P > 1 for P in Ps)
         per = [_new_ws() for _ in ctxs]
         for c, w in zip(ctxs, per, strict=True):
             w.ensure(c, H, device=device, backward=True)
         per_bytes = [w.bytes for w in per]
-        assert per_bytes == [kp.kcp_workspace_bytes(c, H=H) for c in ctxs]
+        assert per_bytes == [kp.kda_workspace_bytes_kcp(c, H=H) for c in ctxs]
         per_arena = max(w.local.bytes for w in per)
         ref = _schedule(ctxs, ops, per)
         del per
@@ -438,7 +448,7 @@ def test_gpu_reserved_shared_workspace_is_bitwise_per_pack(device) -> None:
         rounded = sum(
             -(-t.untyped_storage().nbytes() // 512) * 512 for t in _storages(ws)
         )
-        pred = kp.kcp_workspace_bytes(ctxs, H=H)
+        pred = kp.kda_workspace_bytes_kcp(ctxs, H=H)
         print(
             f"SHARED_WS H={H} P={Ps} per_pack={per_bytes} sum={sum(per_bytes)} max={max(per_bytes)} "
             f"shared={ws.bytes} pred={pred} delta={delta} rounded={rounded}"
@@ -498,15 +508,15 @@ def test_gpu_unreserved_shared_workspace_grows_to_the_max_only(device) -> None:
     for i in range(len(ctxs)):
         for key, val in ref[i].items():
             assert _same(res[i][key], val), (i, key)
-    assert ws.bytes == kp.kcp_workspace_bytes(ctxs, H=H)
+    assert ws.bytes == kp.kda_workspace_bytes_kcp(ctxs, H=H)
     print(f"UNRESERVED replaced={replaced} bytes={ws.bytes}")
 
 
 def test_gpu_allocate_false_sizes_the_first_forward_for_the_backward(device) -> None:
-    """B T3 with the sizing floor (compared after the first backward): ``KcpWorkspace(ctx, H, allocate=False)``
-    allocates nothing; its first forward allocates the backward workspace (``kcp_workspace_bytes(ctx, H=H)``, the
+    """B T3 with the sizing floor (compared after the first backward): ``WorkspaceKcp(ctx, H, allocate=False)``
+    allocates nothing; its first forward allocates the backward workspace (``kda_workspace_bytes_kcp(ctx, H=H)``, the
     backward arena) and the first backward allocates nothing more and moves no pointer; the results are bitwise
-    those of ``KcpWorkspace(ctx, H)``."""
+    those of ``WorkspaceKcp(ctx, H)``."""
     for H in HEADS:
         ctxs, ops = _packs(device, H, packs=PACKS[:2])
         ctx, o = ctxs[0], ops[0]
@@ -521,12 +531,14 @@ def test_gpu_allocate_false_sizes_the_first_forward_for_the_backward(device) -> 
         torch.cuda.synchronize(device)
         assert torch.cuda.memory_allocated(device) == base and ws.bytes == 0
         out, saved = _fwd(ctx, o, ws)
-        assert ws.local.backward and ws.bytes == kp.kcp_workspace_bytes(ctx, H=H)
+        assert ws.local.backward and ws.bytes == kp.kda_workspace_bytes_kcp(ctx, H=H)
         ptrs = _pointers(ws)
         torch.cuda.synchronize(device)
         before = torch.cuda.memory_allocated(device)
         grads = _bwd(ctx, o, ws, saved)
-        assert _pointers(ws) == ptrs and ws.bytes == kp.kcp_workspace_bytes(ctx, H=H)
+        assert _pointers(ws) == ptrs and ws.bytes == kp.kda_workspace_bytes_kcp(
+            ctx, H=H
+        )
         assert torch.equal(out, out_r) and _same(grads, grads_r), H
         assert _same(written_tensors(saved), written_tensors(saved_r)), H
         del grads
@@ -556,7 +568,7 @@ def test_gpu_four_pack_step_peak_drops_by_sum_minus_max(device) -> None:
             outs.append(
                 torch.utils.checkpoint.checkpoint(
                     lambda *a, c=c, i=i: cake_kcp.chunk_kda_kcp(
-                        *a, c, None, "light", "saved", wss[i]
+                        *a, c, None, "light", "saved", wss[i], deterministic=False
                     ),
                     *lf,
                     use_reentrant=False,
@@ -700,7 +712,10 @@ def test_gpu_fresh_contexts_on_a_long_lived_shared_workspace_release_everything(
 
 def test_gpu_call_on_another_stream_waits_for_the_last_one(device) -> None:
     """Stream rule: a call on another stream is ordered after the work the workspace's last stream queued (one
-    ``wait_stream``, no host wait, no error), and its results are bitwise those of the same call on one stream."""
+    ``wait_stream``, no host wait, no error), and its results are bitwise those of the same call on one stream.  The
+    order is checked by events, with no timing assumption: once the second stream's work is complete, an event
+    recorded after the first stream's queued call (behind ~1.5 s of device sleep) is complete too.  Without the wait
+    the second stream's work completes while the first stream still sleeps."""
     H = 4
     ctxs, ops = _packs(device, H, packs=PACKS[:2])
     ws = _new_ws()
@@ -709,12 +724,15 @@ def test_gpu_call_on_another_stream_waits_for_the_last_one(device) -> None:
     ref_grads = _bwd(ctxs[1], ops[1], ws, ref_saved)
     torch.cuda.synchronize(device)
     s1, s2 = torch.cuda.Stream(device), torch.cuda.Stream(device)
+    assert s1.cuda_stream != s2.cuda_stream
     cycles = sleep_cycles(device, 1500.0)
     for s in (s1, s2):
         s.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(s1):
         torch.cuda._sleep(cycles)
         out0, _ = _fwd(ctxs[0], ops[0], ws)
+        first = torch.cuda.Event()
+        first.record()
     t0 = time.perf_counter()
     with torch.cuda.stream(s2):
         out, saved = _fwd(ctxs[1], ops[1], ws)
@@ -722,16 +740,211 @@ def test_gpu_call_on_another_stream_waits_for_the_last_one(device) -> None:
         done = torch.cuda.Event()
         done.record()
     host = time.perf_counter() - t0
-    time.sleep(0.3)
-    waited = not done.query()  # still queued behind s1's sleep
+    done.synchronize()
+    # complete whenever the second stream's work is, if that work waited for it
+    ordered = first.query()
     torch.cuda.synchronize(device)
     assert host < 1.0, host
-    assert waited, (
+    assert ordered, (
         "the call on the second stream did not wait for the first stream's queued work"
     )
     assert ws._stream is not None and ws._stream[0] == s2.cuda_stream
     assert torch.equal(out, ref_out) and _same(grads, ref_grads)
     del out0
+
+
+def _live_ranges(ws) -> dict[int, int]:
+    """``data_ptr -> nbytes`` of every device storage the workspace holds (:func:`_storages`)."""
+    return {
+        t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+        for t in _storages(ws)
+    }
+
+
+def _hits(tensors, ranges: dict[int, int]) -> list[tuple[int, int]]:
+    """The ``(data_ptr, nbytes)`` of ``ranges`` that one of ``tensors`` overlaps."""
+    out = []
+    for t in tensors:
+        a = t.untyped_storage().data_ptr()
+        b = a + t.untyped_storage().nbytes()
+        out += [(p, n) for p, n in ranges.items() if a < p + n and p < b]
+    return out
+
+
+def _switch_setup(device, H: int):
+    """A small pack and a pack whose arena and pools are larger (their tables already copied by a first call), and a
+    workspace reserved for the small pack on a fresh stream ``sa``, with the large pack's tables built; plus a second
+    fresh stream ``sb``."""
+    small, small_ops = _packs(device, H, packs=(PACKS[0],))
+    big, big_ops = _packs(device, H, packs=((4000, 1700),))
+    warm = _new_ws()
+    _fwd(small[0], small_ops[0], warm)
+    _fwd(big[0], big_ops[0], warm)
+    del warm
+    gc.collect()
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    sa, sb = torch.cuda.Stream(device), torch.cuda.Stream(device)
+    with torch.cuda.stream(sa):
+        ws = _new_ws()
+        ws.reserve(small, H)
+        ws.tables(big[0], H)
+    torch.cuda.synchronize(device)
+    return (small[0], small_ops[0]), (big[0], big_ops[0]), ws, sa, sb
+
+
+# device sleep of the stream-switch rows, in ms: a later attempt runs only when stream B finished before the host's
+# check (an inconclusive attempt, never a pass); each attempt's results are checked whatever its timing
+SWITCH_SLEEPS_MS = (1000.0, 4000.0, 16000.0)
+
+
+def test_gpu_storage_a_switched_stream_used_is_not_reused_while_it_runs(device) -> None:
+    """Allocator rule of a stream switch (``record_stream``): a workspace allocated on stream A serves a call on
+    stream B queued behind device sleep, and an ``ensure`` on B for a larger pack then replaces its pools and its
+    arena.  While B is still busy (checked after the allocations; an attempt where B already finished is repeated
+    with a longer sleep), allocations on A of every released storage's size (twice each) never overlap a released
+    storage: the caching allocator returns a block to the stream that allocated it, so without the record it would
+    hand A the block B's queued work still reads and writes (the negative control: the previous head)."""
+    H = 4
+    for ms in SWITCH_SLEEPS_MS:
+        (sc, so), (bc, _bo), ws, sa, sb = _switch_setup(device, H)
+        old = _live_ranges(ws)
+        cycles = sleep_cycles(device, ms)
+        with torch.cuda.stream(sb):
+            torch.cuda._sleep(cycles)
+            out, _ = _fwd(sc, so, ws, save_for_backward=False)
+            ws.ensure(bc, H, device=device, backward=True)
+        live = _live_ranges(ws)
+        freed = {p: n for p, n in old.items() if p not in live}
+        held = []
+        with torch.cuda.stream(sa):
+            for n in freed.values():
+                for _ in range(2):
+                    held.append(torch.empty((n,), dtype=torch.uint8, device=device))
+        busy = not sb.query()  # B had not finished when the allocations were made
+        hits = _hits(held, freed)
+        torch.cuda.synchronize(device)
+        print(
+            f"STREAM_SWITCH_REUSE sleep_ms={ms} freed={sorted(freed.values())} held={len(held)} busy={busy} "
+            f"hits={hits}"
+        )
+        assert ws.local is not None and ws.local.arena.data_ptr() not in old
+        assert len(freed) >= 2, (old, live)  # the arena and at least one pool
+        del out, held, ws
+        if busy:
+            assert not hits, (
+                f"a storage stream B's queued work uses was handed to stream A: {hits}"
+            )
+            return
+    pytest.fail(f"stream B finished before the check at every sleep {SWITCH_SLEEPS_MS}")
+
+
+def test_gpu_stream_switch_with_a_replacement_and_poisoned_reuse_is_bitwise(
+    device,
+) -> None:
+    """A workspace allocated on stream A serves, on stream B behind device sleep, a forward and backward of a small
+    pack and then of a larger pack that replaces its pools and arena; once B's sleep ends, stream A fills blocks of
+    the released sizes allocated after the switch with NaN, over and over, while B's calls run.  The outputs and
+    gradients are bitwise those of one workspace per pack on one stream (checked at every attempt; an attempt whose
+    poison was queued only after B finished is repeated with a longer sleep)."""
+    H = 4
+    for ms in SWITCH_SLEEPS_MS:
+        (sc, so), (bc, bo), ws, sa, sb = _switch_setup(device, H)
+        refs = []
+        for c, o in ((sc, so), (bc, bo)):
+            w = _new_ws()
+            out, s = _fwd(c, o, w)
+            refs.append((out, _bwd(c, o, w, s)))
+            del w
+        torch.cuda.synchronize(device)
+        old = _live_ranges(ws)
+        cycles = sleep_cycles(device, ms)
+        got = []
+        with torch.cuda.stream(sb):
+            torch.cuda._sleep(cycles)
+            woke = torch.cuda.Event()
+            woke.record()
+            for c, o in ((sc, so), (bc, bo)):
+                out, s = _fwd(c, o, ws)
+                got.append((out, _bwd(c, o, ws, s)))
+            done = torch.cuda.Event()
+            done.record()
+        freed = {p: n for p, n in old.items() if p not in _live_ranges(ws)}
+        assert len(freed) >= 2, freed
+        with torch.cuda.stream(sa):
+            held = [
+                torch.empty((n // 4,), dtype=torch.float32, device=device)
+                for n in freed.values()
+            ]
+            sa.wait_event(woke)
+            for _ in range(64):
+                for t in held:
+                    t.fill_(float("nan"))
+                torch.cuda._sleep(max(cycles // 20000, 1))
+        busy = not done.query()  # the poison was queued before B's calls ran
+        torch.cuda.synchronize(device)
+        print(f"STREAM_SWITCH_POISON sleep_ms={ms} busy={busy}")
+        for i, ((out, grads), (rout, rgrads)) in enumerate(zip(got, refs, strict=True)):
+            assert torch.equal(out, rout) and _same(grads, rgrads), (ms, i)
+        del held, got, refs, ws
+        if busy:
+            return
+    pytest.fail(
+        f"stream B finished before the poison was queued at every sleep {SWITCH_SLEEPS_MS}"
+    )
+
+
+def test_gpu_record_stream_only_on_a_stream_switch(device, monkeypatch) -> None:
+    """Census of ``record_stream``: steady rounds of two packs on one stream record nothing; the first call on
+    another stream records each live storage of the workspace once (every pool, the arena and the scratch table
+    sets among them), and the later calls on that stream record nothing again; bitwise the first round."""
+    H = 4
+    ctxs, ops = _packs(device, H, packs=PACKS[:2])
+    ws = _new_ws()
+    ws.reserve(ctxs, H)
+
+    def rnd():
+        res = []
+        for c, o in zip(ctxs, ops, strict=True):
+            out, s = _fwd(c, o, ws)
+            res += [out, *_bwd(c, o, ws, s)]
+        return res
+
+    first = rnd()
+    rnd()
+    seen: list[tuple[int, int]] = []
+    record = torch.Tensor.record_stream
+
+    def counting(self, stream):
+        seen.append((self.untyped_storage().data_ptr(), stream.cuda_stream))
+        return record(self, stream)
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", counting)
+    for _ in range(2):
+        assert _same(rnd(), first)
+    steady = list(seen)
+    s2 = torch.cuda.Stream(device)
+    s2.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(s2):
+        res = rnd()
+        switch = list(seen[len(steady) :])
+        res2 = rnd()
+        after = list(seen[len(steady) + len(switch) :])
+    torch.cuda.current_stream(device).wait_stream(s2)
+    recorded = {p for p, s in switch if s == s2.cuda_stream}
+    print(
+        f"RECORD_STREAM steady={len(steady)} switch={len(switch)} storages={len(_live_ranges(ws))} "
+        f"recorded={len(recorded & set(_live_ranges(ws)))} after={len(after)}"
+    )
+    assert steady == [], steady
+    assert set(_live_ranges(ws)) <= recorded, (
+        "a storage of the workspace was not recorded on the new stream"
+    )
+    live = {t.untyped_storage().data_ptr() for t in ws._live_storages()}
+    mine = sorted(p for p, s in switch if p in live and s == s2.cuda_stream)
+    assert mine == sorted(live), (mine, sorted(live))
+    assert after == [], after
+    assert _same(res, first) and _same(res2, first)
 
 
 def test_gpu_graph_replay_on_a_reserved_shared_workspace(device) -> None:
@@ -886,7 +1099,7 @@ def _handle_pass(ctxs, ops, wss, *, keep=None, order="interleaved", poison=None,
     """Per pack :data:`HANDLE_LAYERS` KDA layers on its context (layer ``l + 1`` reads layer ``l``'s ``out`` as
     ``v``; leaves ``q, k, v, g, beta``; ``backward(dout)`` from the last layer).  ``keep=None``: direct autograd, no
     checkpoint, no handle (the reference).  Otherwise every layer runs under ``torch.utils.checkpoint`` (non-reentrant)
-    with its own :class:`KcpRecomputeHandle` and ``checkpoint_keep=keep``.  ``wss[i]``: pack ``i``'s workspace (one
+    with its own :class:`RecomputeHandleKcp` and ``checkpoint_keep=keep``.  ``wss[i]``: pack ``i``'s workspace (one
     object: shared).  ``poison(ws)`` before every forward and backward.  Right after each checkpointed forward the
     handle's stored tensors are copied; before every backward and at the end every stored tensor is compared bitwise
     with its copy (a stored tensor in the shared workspace would be overwritten by the other packs' calls and
@@ -929,7 +1142,18 @@ def _handle_pass(ctxs, ops, wss, *, keep=None, order="interleaved", poison=None,
                 poison(ws)
             if keep is None:
                 y = cake_kcp.chunk_kda_kcp(
-                    q, k, y, g, b, ctx, None, "light", "saved", ws, **kw
+                    q,
+                    k,
+                    y,
+                    g,
+                    b,
+                    ctx,
+                    None,
+                    "light",
+                    "saved",
+                    ws,
+                    **kw,
+                    deterministic=False,
                 )
                 continue
 
@@ -948,11 +1172,12 @@ def _handle_pass(ctxs, ops, wss, *, keep=None, order="interleaved", poison=None,
                     recompute_handle=h_,
                     checkpoint_keep=keep,
                     **kw,
+                    deterministic=False,
                 )
                 seen[_i][_layer].append(out.detach().clone())
                 return out * w_
 
-            h = cake_kcp.KcpRecomputeHandle()
+            h = cake_kcp.RecomputeHandleKcp()
             # ``out * w`` with ``w`` a leaf of ones changes no bit of ``out`` or of its gradient, but the product's
             # backward reads the recompute's ``out``: the recompute runs past the record above (torch stops a
             # recompute once the tensors it needs are back)
@@ -1116,7 +1341,7 @@ def _rank_packs(rank: int, W: int, row, port: int):
         dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
     group = dist.group.WORLD if W > 1 else None
     ctxs = [
-        kp.build_kcp_context(_part(lengths, W, layout), group, rank, device)
+        kp.build_context_kcp(_part(lengths, W, layout), group, rank, device)
         for lengths in packs
     ]
     ops = [
@@ -1133,7 +1358,7 @@ def _rank_packs(rank: int, W: int, row, port: int):
 def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
     """One rank: the four packs on one workspace per pack (reference) and on one reserved shared workspace (the
     interleaved schedule, the arena NaN-filled before every forward), bitwise compared on this rank; the shared
-    workspace's bytes against ``kcp_workspace_bytes(ctxs)`` and the per-pack sum, pointer stability over two rounds.
+    workspace's bytes against ``kda_workspace_bytes_kcp(ctxs)`` and the per-pack sum, pointer stability over two rounds.
     The verdicts are gathered to every rank."""
     packs, H, _w, layout, exchange = row
     device, ctxs, ops = _rank_packs(rank, W, row, port)
@@ -1143,7 +1368,7 @@ def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) ->
     per = [_new_ws() for _ in ctxs]
     ref = _schedule(ctxs, ops, per, **kw)
     report["per_pack_bytes"] = [w.bytes for w in per]
-    report["P"] = [cake_kcp.KcpWorkspace(local=False).tables(c, H).P for c in ctxs]
+    report["P"] = [cake_kcp.WorkspaceKcp(local=False).tables(c, H).P for c in ctxs]
     del per
     gc.collect()
     torch.cuda.synchronize(device)
@@ -1157,7 +1382,7 @@ def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) ->
     )
     report["shared_bytes"] = ws.bytes
     # the ring rows reserve the hop pools too: each at its largest need over the packs
-    report["pred_bytes"] = kp.kcp_workspace_bytes(ctxs, H=H) + (
+    report["pred_bytes"] = kp.kda_workspace_bytes_kcp(ctxs, H=H) + (
         sum(
             max(kp.kcp_arena_layout(c, H=H)[f"pool.{name}"] for c in ctxs)
             for name in kp.LAZY_POOLS
@@ -1177,7 +1402,7 @@ def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) ->
         if _pointers(ws) != ptrs:
             report["fail"].append(f"pointers moved r{rnd}")
     if report["shared_bytes"] != report["pred_bytes"]:
-        report["fail"].append("bytes != kcp_workspace_bytes(ctxs)")
+        report["fail"].append("bytes != kda_workspace_bytes_kcp(ctxs)")
     # the caching allocator may hand out a cached block up to 1 MiB larger than a request without splitting it
     if not (
         report["rounded"]
@@ -1205,10 +1430,19 @@ def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) ->
     return report
 
 
+def _bound_rank_threads(W: int) -> None:
+    """Give a spawned rank its share of the host's CPUs: each of the ``W`` ranks would
+    otherwise start as many threads as the host has, and rank 0's FP64 reference then
+    ran past the process group's ten-minute collective timeout while the other ranks
+    waited (813 s on a four-rank row that takes 22 s with the share)."""
+    torch.set_num_threads(max(1, len(os.sched_getaffinity(0)) // W))
+
+
 def _spawn_dist_entry(
     rank: int, W: int, row, port: int, result_dir: str, kind: str = "shared"
 ) -> None:
     try:
+        _bound_rank_threads(W)
         report = RANK_RUNNERS[kind](rank, W, row, port, result_dir)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
@@ -1255,13 +1489,20 @@ def _launch(row, kind: str) -> None:
         pytest.skip(f"{W} CUDA devices required, {torch.cuda.device_count()} visible")
     with tempfile.TemporaryDirectory(prefix="cake_kcp_shared_") as tmp:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
-        mp.start_processes(
-            _spawn_dist_entry,
-            args=(W, row, _free_port(), result_dir, kind),
-            nprocs=W,
-            join=True,
-            start_method="spawn",
-        )
+        for attempt in range(3):
+            try:
+                mp.start_processes(
+                    _spawn_dist_entry,
+                    args=(W, row, _free_port(), result_dir, kind),
+                    nprocs=W,
+                    join=True,
+                    start_method="spawn",
+                )
+                break
+            except mp.ProcessRaisedException as error:
+                # a port another process takes between _free_port and rank 0's bind: retry on a new port
+                if "EADDRINUSE" not in str(error) or attempt == 2:
+                    raise
         with open(os.path.join(result_dir, RESULT_NAMES[kind](row))) as fh:
             report = json.load(fh)
     assert report["pass"], report

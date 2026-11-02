@@ -58,6 +58,7 @@ def _int32_routing_stager_class(
     mxfp8_normal_scales: bool = False,
     num_experts: Optional[int] = None,
     fuse_tail_mask: bool = False,
+    zero_masked_scores: bool = True,
 ):
     """Adapt routing and optionally apply the normal-FP32 MXFP8 scale floor."""
     import cutlass
@@ -89,7 +90,7 @@ def _int32_routing_stager_class(
             topk_idx_output,
             topk_weights_output,
         ):
-            """Store int32 routes and zero masked scores for one live token.
+            """Store routes and scores under the selected masking policy.
 
             Optional checks reject invalid routes before narrowing IDs. When
             enabled, live CTAs also mask tails within the per-thread work limit.
@@ -126,11 +127,10 @@ def _int32_routing_stager_class(
                     if is_padding
                     else cutlass.Int32(topk_idx[token_idx, tid])
                 )
-                weight = (
-                    cutlass.Float32(0.0)
-                    if idx == -1
-                    else cutlass.Float32(topk_weights[token_idx, tid])
-                )
+                weight = cutlass.Float32(topk_weights[token_idx, tid])
+                if cutlass.const_expr(zero_masked_scores):
+                    if idx == -1:
+                        weight = cutlass.Float32(0.0)
                 topk_idx_output[token_idx, tid] = idx
                 topk_weights_output[token_idx, tid] = weight
 
@@ -386,6 +386,7 @@ def fused_quant_stage(
     mxfp8_normal_scales: bool = False,
     num_experts: Optional[int] = None,
     fuse_tail_mask: bool = False,
+    zero_masked_scores: bool = True,
 ) -> None:
     """Quantize + stage one batch into the mega symm-buffer views.
 
@@ -406,6 +407,8 @@ def fused_quant_stage(
     ``fuse_tail_mask`` additionally masks all trailing routing rows in that
     launch when the live CTAs have enough parallelism. Large tails retain a
     separate fill. It requires NVFP4 or normal-scale MXFP8 with int32 routes.
+    ``zero_masked_scores=False`` preserves scores for consumers that exclude
+    masked routes before arithmetic.
     """
     if quant_type not in _QUANT_TYPES:
         raise ValueError(
@@ -490,6 +493,7 @@ def fused_quant_stage(
         mxfp8_normal_scales,
         num_experts,
         fuse_tail_mask,
+        zero_masked_scores,
     )
     stager = _STAGERS.get(key)
     if stager is None:
@@ -498,9 +502,11 @@ def fused_quant_stage(
 
         stager_class = (
             _int32_routing_stager_class(
-                mxfp8_normal_scales, num_experts, fuse_tail_mask
+                mxfp8_normal_scales, num_experts, fuse_tail_mask, zero_masked_scores
             )
-            if topk_idx_out.dtype == torch.int32 or mxfp8_normal_scales
+            if topk_idx_out.dtype == torch.int32
+            or mxfp8_normal_scales
+            or not zero_masked_scores
             else DataPreprocess
         )
         stager = _CompiledStager(

@@ -126,7 +126,7 @@ class BatchAttention:
         head_dim_vo: int,
         page_size: int,
         causal: bool = False,
-        sm_scale: float = None,
+        sm_scale: Optional[float] = None,
         logits_soft_cap: Optional[float] = None,
         q_data_type: torch.dtype = torch.bfloat16,
         kv_data_type: torch.dtype = torch.bfloat16,
@@ -163,7 +163,7 @@ class BatchAttention:
             Page size of the paged KV-cache.
         causal : bool
             Whether to apply a causal mask.  Defaults to ``False``.
-        sm_scale : float
+        sm_scale : Optional[float]
             Softmax scale.  If ``None``, defaults to ``1/sqrt(head_dim_qk)``.
         logits_soft_cap : Optional[float]
             Logits soft-cap value.  ``None`` or ``0`` disables capping.

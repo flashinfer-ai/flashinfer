@@ -26,7 +26,7 @@ from .api_logging import flashinfer_experimental_api
 
 # Thin experimental entry points; validation of the backend contract, the
 # chunk plans, the workspace, launch binding, autograd wrappers and JIT
-# registration live in flashinfer.experimental.cake_lm_head_loss.
+# registration live in flashinfer.experimental.cake_lm_head_det_loss.
 #
 # The package backend takes every switch as a keyword argument and reads no
 # environment variable.  The FLASHINFER_CAKE_LM_HEAD_LOSS_* variables below
@@ -170,7 +170,7 @@ def _cake_backend() -> ModuleType:
     # The backend is imported on first use (experimental containment: core
     # reaches kernels and their dependencies through a deferred import) and
     # the binding-cache settings read at import are applied to it once.
-    from .experimental.cake_lm_head_loss import cake_backend
+    from .experimental.cake_lm_head_det_loss import cake_backend
 
     _configure_binding_cache(cake_backend, _BINDING_CACHE_SETTINGS)
     return cake_backend
@@ -182,14 +182,14 @@ def _cake_backend_opt_in() -> ModuleType:
     # their first use; a call with neither never imports them.  Their own
     # binding cache takes the same settings.
     _cake_backend()
-    from .experimental.cake_lm_head_loss import cake_backend_opt_in
+    from .experimental.cake_lm_head_det_loss import cake_backend_opt_in
 
     _configure_binding_cache(cake_backend_opt_in, _BINDING_CACHE_SETTINGS)
     return cake_backend_opt_in
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunked_lm_head_loss(
+def chunked_lm_head_det_loss(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -347,8 +347,9 @@ def chunked_lm_head_loss(
         ``logp`` / ``dX`` / ``dW`` as ``"fast"``; the recompute forms run more
         GEMM work.  The bound assumes a backward that frees the graph
         (``retain_graph=True`` keeps the forward's state); its margin is
-        measured on GB200, GB300 and B200 (see the package README).  No
-        environment variable.
+        measured on GB200, GB300 and B200 (see the package README).
+        ``"keep_logits"`` belongs to ``chunked_lm_head_det_logprob`` (a
+        ``ValueError`` here).  No environment variable.
     num_valid_rows : int, optional
         The number of labels ``>= 0`` (not ``-100``), as a host integer (a
         Python or NumPy integer or a CPU scalar tensor; a CUDA tensor is
@@ -374,7 +375,13 @@ def chunked_lm_head_loss(
     Gradients are produced only for inputs that require them (a frozen ``X``
     or ``W`` skips its GEMM).  The saved accumulators are re-scaled, never
     mutated, so a retained graph may run the backward repeatedly.  ``T == 0``
-    gives loss 0, an empty ``logp`` and zero gradients.
+    gives loss 0, an empty ``logp`` and zero gradients.  Under the backend's
+    default gradient placement (``cake_backend.set_gradient_placement``,
+    ``"auto"``) a call no backward can follow (grad mode off, also the first
+    pass of a reentrant ``torch.utils.checkpoint``) computes the loss only,
+    and inside a non-reentrant ``torch.utils.checkpoint`` the recomputation
+    forms the gradient accumulators instead of the checkpointed forward (one
+    gradient pass per step); every output is bitwise the same.
 
     A call with neither ``memory_mode`` nor ``num_valid_rows`` runs the
     backend's default entry (``cake_backend``) after this function's argument
@@ -387,14 +394,14 @@ def chunked_lm_head_loss(
     saved accumulators as soon as it has used them (a second backward then
     raises).
 
-    ``chunked_lm_head_preload`` loads the libraries and creates the
+    ``chunked_lm_head_det_preload`` loads the libraries and creates the
     per-device state ahead of a process's first call.
 
     Host side: inputs are validated and bound on the first call for an input
     binding (``data_ptr``, shape, stride and dtype of every input plus the
     options); later calls with the same binding launch from the remembered
     argument plans
-    (``flashinfer.experimental.cake_lm_head_loss.cake_backend.BINDING_CACHE``).
+    (``flashinfer.experimental.cake_lm_head_det_loss.cake_backend.BINDING_CACHE``).
     ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE=0`` disables that cache and
     ``FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY`` (a positive
     integer; default 64) sets its capacity: both are read when this module is
@@ -417,7 +424,7 @@ def chunked_lm_head_loss(
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_CHECK_WITHOUT_COUNT)
     if memory_mode is not None or num_valid_rows is not None:
-        return _cake_backend_opt_in().chunked_lm_head_loss(
+        return _cake_backend_opt_in().chunked_lm_head_det_loss(
             X,
             W,
             labels,
@@ -442,7 +449,7 @@ def chunked_lm_head_loss(
             num_valid_rows=num_valid_rows,
             check_num_valid_rows=check_num_valid_rows,
         )
-    return _cake_backend().chunked_lm_head_loss(
+    return _cake_backend().chunked_lm_head_det_loss(
         X,
         W,
         labels,
@@ -467,7 +474,7 @@ def chunked_lm_head_loss(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunked_lm_head_logprob(
+def chunked_lm_head_det_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
     labels: torch.Tensor,
@@ -496,7 +503,7 @@ def chunked_lm_head_logprob(
     epilogue) and produces BF16
     ``dX`` and ``dW`` through FP32 accumulators with one cast each (with
     ``fuse_dw_cast`` the last chunk's weight-gradient GEMM writes the BF16
-    ``dW`` from its epilogue).  Arguments as in :func:`chunked_lm_head_loss`,
+    ``dW`` from its epilogue).  Arguments as in :func:`chunked_lm_head_det_loss`,
     including the switches ``compact_rows``, ``fuse_dw_cast``, ``dx_finalize``,
     ``dw_stream``, ``hidden_count`` and ``gemm_tuning`` with the same defaults
     (``None`` reads the same ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` variable; every
@@ -504,7 +511,16 @@ def chunked_lm_head_logprob(
     the same values); ``dW`` is returned in BF16.  ``memory_mode``
     (``"budget"``: the backward's weight-gradient form within the same bound),
     ``num_valid_rows`` and ``check_num_valid_rows`` (the forward's count) as in
-    :func:`chunked_lm_head_loss`.
+    :func:`chunked_lm_head_det_loss`.  ``memory_mode="keep_logits"`` (this
+    entry only, without ``num_valid_rows``; opt-in): where a backward can
+    follow (grad mode on, ``X`` or ``W`` trainable) the forward keeps the BF16
+    logits of the valid rows, ``2 * T_v * V`` bytes from the forward to the
+    backward (the chunk bound of the memory rule does not hold for them), and
+    the first backward forms the logit gradient from them instead of
+    recomputing the logits (three GEMMs per chunk instead of four; a second
+    backward through a retained graph recomputes); where none can follow
+    (``torch.no_grad``, ``torch.inference_mode``, frozen inputs) the call is
+    the default one.  Bitwise the same ``logp``, ``dX`` and ``dW``.
     """
     if backend != "cake":
         raise ValueError(
@@ -513,7 +529,7 @@ def chunked_lm_head_logprob(
     if check_num_valid_rows and num_valid_rows is None:
         raise ValueError(_CHECK_WITHOUT_COUNT)
     if memory_mode is not None or num_valid_rows is not None:
-        return _cake_backend_opt_in().chunked_lm_head_logprob(
+        return _cake_backend_opt_in().chunked_lm_head_det_logprob(
             X,
             W,
             labels,
@@ -532,7 +548,7 @@ def chunked_lm_head_logprob(
             num_valid_rows=num_valid_rows,
             check_num_valid_rows=check_num_valid_rows,
         )
-    return _cake_backend().chunked_lm_head_logprob(
+    return _cake_backend().chunked_lm_head_det_logprob(
         X,
         W,
         labels,
@@ -551,7 +567,7 @@ def chunked_lm_head_logprob(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunked_lm_head_preload(device: Optional[Union[torch.device, int, str]] = None):
+def chunked_lm_head_det_preload(device: Optional[Union[torch.device, int, str]] = None):
     r"""Do part of the one-time work of a process's first chunked LM-head call
     ahead of it, then wait for the device once (SM100 / SM103 only).
 
@@ -574,13 +590,13 @@ def _cake_support() -> ModuleType:
     # The candidate-support entries live in their own module of the package; it
     # binds its kernels through the backend's cache, configured on first use.
     _cake_backend()
-    from .experimental.cake_lm_head_loss import cake_support
+    from .experimental.cake_lm_head_det_loss import cake_support
 
     return cake_support
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunked_lm_head_support_logprob(
+def chunked_lm_head_det_support_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
     support_ids: torch.Tensor,
@@ -616,7 +632,7 @@ def chunked_lm_head_support_logprob(
         raise ValueError(
             "the candidate-support LM-head kernels currently support backend='cake'"
         )
-    return _cake_support().chunked_lm_head_support_logprob(
+    return _cake_support().chunked_lm_head_det_support_logprob(
         X,
         W,
         support_ids,
@@ -631,7 +647,7 @@ def chunked_lm_head_support_logprob(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
-def chunked_lm_head_support_kl(
+def chunked_lm_head_det_support_kl(
     X: torch.Tensor,
     W: torch.Tensor,
     support_ids: torch.Tensor,
@@ -650,16 +666,16 @@ def chunked_lm_head_support_kl(
     ``KL_t = sum_j Q_j (lq_j - logp_j)`` over the candidates of row ``t`` with ``Q_j = exp(lq_j) > 0``,
     for the FP32 teacher log-probabilities ``teacher_logprobs [M]`` aligned with ``support_ids``
     (``requires_grad=False``; ``-inf`` entries drop out) and the student ``logp`` of
-    :func:`chunked_lm_head_support_logprob` on the same support; ``0`` on a row of one candidate or
+    :func:`chunked_lm_head_det_support_logprob` on the same support; ``0`` on a row of one candidate or
     none.  Returns the FP32 ``kl [T]``, or ``(kl, logp)`` with the differentiable packed student
     ``logp [M]`` when ``return_logprobs=True``.  Weighting, reduction and any ``tau ** 2`` factor
-    belong to the caller.  Other arguments as in :func:`chunked_lm_head_support_logprob`.
+    belong to the caller.  Other arguments as in :func:`chunked_lm_head_det_support_logprob`.
     """
     if backend != "cake":
         raise ValueError(
             "the candidate-support LM-head kernels currently support backend='cake'"
         )
-    return _cake_support().chunked_lm_head_support_kl(
+    return _cake_support().chunked_lm_head_det_support_kl(
         X,
         W,
         support_ids,
@@ -677,3 +693,12 @@ def chunked_lm_head_support_kl(
 # Read once at import: a malformed value fails here, naming the variable, not
 # on the first call.  Applied to the backend's cache by ``_cake_backend``.
 _BINDING_CACHE_SETTINGS: Dict[str, Any] = _binding_cache_settings()
+
+
+# The names before the deterministic (``det``) naming, kept as aliases: each is
+# the canonical function object above.
+chunked_lm_head_loss = chunked_lm_head_det_loss
+chunked_lm_head_logprob = chunked_lm_head_det_logprob
+chunked_lm_head_preload = chunked_lm_head_det_preload
+chunked_lm_head_support_logprob = chunked_lm_head_det_support_logprob
+chunked_lm_head_support_kl = chunked_lm_head_det_support_kl

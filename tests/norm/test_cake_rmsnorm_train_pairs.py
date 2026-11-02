@@ -13,445 +13,503 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Registry and host-rule gates of the Cake BF16 RMSNorm training backward pair.
-
-Every backward route launches two records per call: the main kernel's record
-(its persistent CTAs claim row chunks; it owns the workspace) and the dw
-reduce record after it (one CTA per column slab, programmatic dependent
-launch).  The registry gates and the chunk-formula pins read the registry and
-the host functions alone and need no device; the workspace gates need the
-exported device.
+The host plan of the non-deterministic RMSNorm training package without a
+device: every route tiles the positive token counts; a backward window launches
+either one single kernel (workspace rule ``claim_sum_f64``: counters and the
+kernel's ``workspace_bytes`` of FP64 column sums) or the deterministic
+package's pair (a ``chunk_partials`` main kernel, then its dw reduce), and the
+launch count of every window is the registry's; every backward route ships the
+single kernel in at least one window or is listed with its reason in
+``DET_PAIR_ROUTES``; the chunk table the host passes covers the rows exactly;
+the workspace has one layout with package-constant offsets (the pair counters,
+the single counters, the FP64 sums, the pair partial rows) whose regions never
+overlap, also for a family that mixes both forms; the windows module is the
+registry's; and ``build.json`` builds every library the registry launches.
 """
 
 from __future__ import annotations
 
+import json
+import re
+from pathlib import Path
+
 import pytest
-import torch
 
 from tests.test_helpers.cake_package import cake_package
 
+pytestmark = pytest.mark.cpu_only
+
 pkg = cake_package("cake_rmsnorm_train")
 loader = cake_package("cake_rmsnorm_train", "cake_jit")
-
-SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-HIDDEN_SIZES = (6144, 4096, 2048, 1536, 512)
-REDUCE_ROLE = "bwd_reduce"
-SHIPPED_SLABS = (16, 32, 64)
-# Row counts of the contract: the small counts, the window edges of every route and the training shapes.
-ROWS = (
-    1, 2, 7, 63, 64, 65, 127, 128, 129, 255, 257, 1023, 1024, 1025, 3072, 3073, 4096, 4097,
-    12288, 12289, 14928, 15566, 15567, 16231, 16263, 16384, 16385, 32768, 32769, 65536,
-)  # fmt: skip
+windows = cake_package("cake_rmsnorm_train", "cake_windows")
+SM_COUNTS = (148, 160, 132, 1)
 
 
-def _owners() -> dict[str, dict]:
-    return {
-        name: r
-        for name, r in loader.MODULES.items()
-        if r.get("workspace_rule") is not None
-    }
+def _routes():
+    for arch, by_route in loader.ROUTES.items():
+        for route in by_route:
+            yield arch, route
 
 
-def _companions() -> dict[str, dict]:
-    return {
-        name: r for name, r in loader.MODULES.items() if r.get("role") == REDUCE_ROLE
-    }
-
-
-# --------------------------------------------------------------------------- registry gates (no device)
-
-
-def test_no_record_is_a_cooperative_launch() -> None:
-    for name, record in loader.MODULES.items():
-        assert record["launch"]["cooperative"] is False, name
-        assert "cooperative" not in record["grid_rule"], name
-
-
-def test_owner_records_claim_chunks_and_own_the_workspace() -> None:
-    owners = _owners()
-    assert owners
-    for name, record in owners.items():
-        rule = record["grid_rule"]
-        assert rule["kind"] == "claimed_chunks", name
-        for key in (
-            "ctas_per_sm",
-            "grid_factor",
-            "launch_bound_ctas_per_sm",
-            "rows_per_issue",
-        ):
-            assert isinstance(rule[key], int) and rule[key] >= 1, (name, key)
-        assert rule["ctas_per_sm"] == min(
-            rule["grid_factor"], rule["launch_bound_ctas_per_sm"]
-        ), name
-        # the taper the record's kernel cuts its chunk table with, within the
-        # module constants (which bound the workspace)
-        tail_div, max_halving = loader.chunk_taper(rule)
-        assert (rule["tail_div"], rule["max_halving"]) == (tail_div, max_halving), name
-        assert 1 <= tail_div <= loader.TAIL_DIV, name
-        assert 0 <= max_halving <= loader.MAX_HALVING, name
-        workspace = record["workspace_rule"]
-        assert workspace["kind"] == "chunk_partials" and workspace["counters"] >= 2, (
-            name
-        )
-        # the kernel's twelfth parameter keeps its static-schedule name and carries the slot count
-        assert record["logical"]["n_chunks"] == "n_chunks", name
-        assert record["logical"]["rows_per_chunk"] == "slots", name
-        assert ["parameter", "rows_per_chunk"] in [
-            list(pair) for pair in record["arg_plan"]
-        ], name
-        assert "rows_per_chunk" not in record["logical"].values(), name
-        assert "slots" not in record["logical"], name
-    assert {"n_chunks", "slots"} <= set(loader.LOGICAL_SCALARS)
-    assert "rows_per_chunk" not in loader.LOGICAL_SCALARS
-
-
-def test_reduce_records_launch_one_cta_per_slab_under_pdl() -> None:
-    companions = _companions()
-    assert companions
-    for name, record in companions.items():
-        assert record["launch"]["use_pdl"] is True, name
-        assert record["grid_rule"]["kind"] == "fixed", name
-        assert record["workspace_rule"] is None, name
-        hidden, ctas = int(record["hidden"]), int(record["grid_rule"]["ctas"])
-        assert hidden % ctas == 0 and hidden // ctas in SHIPPED_SLABS, (
-            name,
-            hidden,
-            ctas,
-        )
-        assert [list(pair) for pair in record["arg_plan"]][:3] == [
-            ["buffer", "partial"],
-            ["buffer", "dw"],
-            ["parameter", "n_chunks"],
-        ], name
-
-
-@pytest.mark.parametrize("arch", sorted(loader.ROUTES))
-def test_every_backward_route_selects_an_owner_then_its_companion(arch: str) -> None:
-    owners, companions = _owners(), _companions()
-    routes = loader.ROUTES[arch]
-    checked = 0
-    for hidden in HIDDEN_SIZES:
-        for residual in (False, True):
-            if loader.route_key(hidden, "bwd", residual) not in routes:
-                continue
-            names = loader.route_modules(arch, hidden, "bwd", residual)
-            launched: set[str] = set()
-            for rows in ROWS:
-                selected = loader.selected_modules(
-                    arch, hidden, "bwd", residual, rows=rows
-                )
-                assert len(selected) == 2, (arch, hidden, residual, rows, selected)
-                owner, companion = selected
-                assert owner in owners and companion in companions, (
-                    arch,
-                    hidden,
-                    rows,
-                    selected,
-                )
-                assert (
-                    loader.MODULES[owner]["select_rule"]
-                    == loader.MODULES[companion]["select_rule"]
-                )
-                assert (
-                    loader.MODULES[owner]["hidden"]
-                    == loader.MODULES[companion]["hidden"]
-                    == hidden
-                )
-                launched.update(selected)
-            assert launched == set(names), (
-                arch,
-                hidden,
-                residual,
-                set(names) - launched,
-            )
-            # owners precede companions in the route: the host launches admitted records in route order
-            roles = [name in companions for name in names]
-            assert roles == sorted(roles), (arch, hidden, residual, names)
-            checked += 1
-    assert checked >= len(HIDDEN_SIZES)
-
-
-# --------------------------------------------------------------------------- the chunk formula (no device)
-
-
-def test_chunk_formula_matches_the_design_examples() -> None:
-    """The host's copy of the kernels' chunk table: the halving rounds and the final equalised round, in
-    pipeline-stage units (``rows_per_issue`` rows per stage), at the module constants and under the tapers a
-    record may spell (its kernel's ``tail_div`` / ``max_halving``)."""
-    assert (loader.TAIL_DIV, loader.MAX_HALVING, loader.MAX_ROUNDS) == (12, 5, 4)
-    slots = 296  # two CTAs per SM on a 148-SM device
-    assert [loader.n_chunks(T, slots, 1) for T in (256, 1024, 4096, 16384, 65536)] == [
-        256,
-        592,
-        888,
-        1184,
-        1184,
-    ]
-    assert loader.chunk_rounds(1024, slots, 1) == [(296, 2), (136, 2), (160, 1)]
-    assert loader.chunk_rounds(4096, slots, 1) == [
-        (296, 7),
-        (296, 4),
-        (248, 3),
-        (48, 2),
-    ]
-    assert loader.chunk_rounds(16384, slots, 1) == [
-        (296, 28),
-        (296, 14),
-        (296, 7),
-        (104, 7),
-        (192, 6),
-    ]
-    assert loader.chunk_rounds(65536, slots, 1) == [
-        (296, 111),
-        (296, 56),
-        (296, 28),
-        (120, 27),
-        (176, 26),
-    ]
-    # eight rows per stage (H = 512): a chunk is a whole number of stages, never a fraction of one
-    assert loader.chunk_rounds(1024, 148, 8) == [(128, 8)]
-    assert loader.chunk_rounds(16384, slots, 8) == [(296, 32), (296, 16), (272, 8)]
-    assert loader.n_chunks(16384, slots, 8) == 864
-    assert loader.chunk_rounds(65536, slots, 8) == [
-        (296, 112),
-        (296, 56),
-        (296, 32),
-        (200, 24),
-        (96, 16),
-    ]
-    assert loader.n_chunks(65536, slots, 8) == 1184
-    assert loader.chunk_rounds(16384, 148, 4) == [
-        (148, 56),
-        (148, 28),
-        (148, 16),
-        (100, 12),
-        (48, 8),
-    ]
-    assert loader.n_chunks(16384, 148, 4) == 592
-    # row counts between the last halving round's reach and the capacity (eight rows per stage, two CTAs per SM)
-    assert [
-        loader.n_chunks(T, slots, 8) for T in (32768, 33000, 36864, 37888, 38000)
-    ] == [888, 888, 888, 888, 888]
-    assert loader.chunk_rounds(0, slots, 1) == []
-    assert loader.chunk_table(5, slots, 1) == [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
-    assert loader.chunk_table(5, slots, 4) == [(0, 4), (4, 5)]
-    # a kernel built with a taper of its own cuts another table, which the host cuts with the record's taper:
-    # tail_div 4 (one halving round at most) on one CTA per SM of a 148-SM device, four rows per stage
-    assert [loader.n_chunks(T, 148, 4, 4, 5) for T in (1025, 1536, 2048, 4096)] == [
-        148,
-        236,
-        296,
-        296,
-    ]
-    assert loader.chunk_rounds(4096, 148, 4, 4, 5) == [(148, 16), (136, 12), (12, 8)]
-    assert loader.chunk_rounds(4096, 148, 4) == [(148, 16), (148, 8), (136, 4)]
-    # max_halving 2 on one CTA per SM of a 212-SM device
-    assert [
-        loader.n_chunks(T, 212, 4, 12, 2) for T in (14928, 16384, 32768, 65536)
-    ] == [636, 636, 636, 636]
-    assert loader.chunk_rounds(32768, 212, 4, 12, 2) == [
-        (212, 80),
-        (212, 40),
-        (136, 36),
-        (76, 32),
-    ]
-    assert loader.chunk_rounds(32768, 212, 4) == [
-        (212, 80),
-        (212, 40),
-        (212, 20),
-        (136, 16),
-        (76, 12),
-    ]
-    # tail_div 6, and tail_div 4 with max_halving 2, eight rows per stage
-    assert [loader.n_chunks(T, 148, 4, 6, 5) for T in (1024, 4096, 8192, 24000)] == [
-        148,
-        296,
-        444,
-        444,
-    ]
-    assert [loader.n_chunks(T, 148, 8, 4, 2) for T in (1024, 4096, 16384, 65536)] == [
-        128,
-        296,
-        296,
-        296,
-    ]
-    # at the constants the taper keywords change nothing; tail_div 1 cuts no halving round: one chunk per slot
-    assert loader.n_chunks(16384, slots, 8, 12, 5) == loader.n_chunks(16384, slots, 8)
-    assert loader.chunk_rounds(16384, 148, 4, 1, 5) == [(100, 112), (48, 108)]
-
-
-def test_chunk_taper_reads_the_pair_within_the_constants() -> None:
-    """A chunk-claiming record spells the taper its kernel was built with; the
-    host reads the pair and refuses a rule that lacks one or leaves the bounds
-    (the module constants) instead of cutting the table at the defaults."""
-    rule = {
-        "kind": "claimed_chunks",
-        "ctas_per_sm": 1,
-        "grid_factor": 1,
-        "launch_bound_ctas_per_sm": 1,
-        "rows_per_issue": 4,
-        "tail_div": 4,
-        "max_halving": 2,
-    }
-    assert loader.chunk_taper(rule) == (4, 2)
-    assert loader.chunk_taper(
-        {**rule, "tail_div": loader.TAIL_DIV, "max_halving": loader.MAX_HALVING}
-    ) == (loader.TAIL_DIV, loader.MAX_HALVING)
-    assert loader.chunk_taper({**rule, "tail_div": 1, "max_halving": 0}) == (1, 0)
-    for bad in (
-        {key: value for key, value in rule.items() if key != "tail_div"},
-        {key: value for key, value in rule.items() if key != "max_halving"},
-        {**rule, "max_halving": None},
-        {**rule, "tail_div": True},
-        {**rule, "tail_div": "4"},
-        {**rule, "tail_div": 0},
-        {**rule, "tail_div": loader.TAIL_DIV + 1},
-        {**rule, "max_halving": -1},
-        {**rule, "max_halving": loader.MAX_HALVING + 1},
-    ):
-        with pytest.raises(ValueError):
-            loader.chunk_taper(bad)
-    # the pure functions default to the constants and refuse a taper below the floors
-    assert loader.n_chunks(16384, 148, 4) == loader.n_chunks(
-        16384, 148, 4, loader.TAIL_DIV, loader.MAX_HALVING
-    )
-    with pytest.raises(ValueError):
-        loader.chunk_rounds(16384, 148, 4, 0, 5)
-    with pytest.raises(ValueError):
-        loader.chunk_rounds(16384, 148, 4, 12, -1)
-
-
-@pytest.mark.parametrize("taper", ((12, 5), (4, 5), (12, 2), (1, 0)))
-@pytest.mark.parametrize("slots", (1, 3, 148, 152, 296, 304, 432))
-@pytest.mark.parametrize("rpi", (1, 2, 4, 8))
-def test_chunk_table_covers_the_rows_within_the_capacity(
-    slots: int, rpi: int, taper: tuple[int, int]
-) -> None:
-    tail_div, max_halving = taper
-    rows_list = [
-        *range(1, 600 if taper == (12, 5) else 200),
-        1023,
-        1024,
-        1025,
-        4095,
-        4096,
-        4097,
-        16383,
-        16384,
-        16385,
-        65536,
-        65537,
-        1 << 20,
-    ]
-    for T in rows_list:
-        stages = -(-T // rpi)
-        table = loader.chunk_table(T, slots, rpi, tail_div, max_halving)
-        assert table[0][0] == 0 and table[-1][1] == T
-        assert all(b < e for b, e in table)  # no empty chunk
-        assert all(
-            table[i][1] == table[i + 1][0] for i in range(len(table) - 1)
-        )  # exact cover, no overlap
-        assert all(
-            (b % rpi == 0) and (e % rpi == 0 or e == T) for b, e in table
-        )  # whole stages, ragged last
-        n = loader.n_chunks(T, slots, rpi, tail_div, max_halving)
-        assert n == len(table)
-        assert n <= loader.chunk_capacity(T, slots) == min(T, loader.MAX_ROUNDS * slots)
-        if stages <= slots:
-            assert n == stages  # one stage per chunk below the slot count
-        rounds = loader.chunk_rounds(T, slots, rpi, tail_div, max_halving)
-        # a taper within the constants cuts no more rounds, hence no more chunks, than they do
-        assert len(rounds) <= len(loader.chunk_rounds(T, slots, rpi))
-        assert n <= loader.n_chunks(T, slots, rpi)
-        if tail_div == 1 or max_halving == 0:
-            # no halving round: one chunk per slot
-            assert len(rounds) <= 2 and n == min(stages, slots)
-        sizes = [rows for _count, rows in rounds]
-        assert sizes == sorted(
-            sizes, reverse=True
-        )  # chunk sizes never increase in claim order
-        assert all(rows % rpi == 0 for rows in sizes)
-        assert sum(count * rows for count, rows in rounds) == stages * rpi
-
-
-# --------------------------------------------------------------------------- the workspace (device)
-
-
-def _device() -> torch.device:
-    return torch.device("cuda:0")
-
-
-def _supported() -> bool:
+def _parse(route: str) -> tuple[str, int, bool, str]:
+    kind, _, rest = route.partition("_")
+    hidden = int(route.rsplit("_h", 1)[1])
     return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability(_device()) in SUPPORTED_CAPABILITIES
-        and pkg.is_cake_rmsnorm_train_supported(_device())
+        kind,
+        hidden,
+        "residual" in rest.split("_"),
+        "f32" if "w32" in rest.split("_") else "bf16",
     )
 
 
-@pytest.mark.skipif(
-    not _supported(),
-    reason="needs an SM100 / SM103 / SM107 device with exported routes",
-)
-@pytest.mark.parametrize("hidden", HIDDEN_SIZES)
-def test_workspace_puts_the_counters_first_and_grows_with_the_rows(hidden: int) -> None:
-    if not pkg.is_cake_rmsnorm_train_supported(_device(), hidden):
-        pytest.skip(f"hidden={hidden} has no exported route on this device")
-    device = _device()
-    sizes = [
-        pkg.cake_rmsnorm_train_backward_workspace_bytes(rows, hidden, device)
-        for rows in (1, 129, 4096, 16384, 65536)
-    ]
-    assert sizes == sorted(sizes) and all(size % 256 == 0 for size in sizes)
-    assert sizes[0] > loader.COUNTERS_BYTES
-    arch = loader.arch_for_capability(torch.cuda.get_device_capability(device))
-    sms = loader.sm_count(0)
-    for name in loader.route_modules(arch, hidden, "bwd", False):
+def _window(record: dict) -> tuple[int, int | None]:
+    rule = record["select_rule"]
+    if rule is None:
+        return (0, None)
+    return (rule["above"], rule["at_most"])
+
+
+def _launches(arch: str, route: str) -> list[tuple[int, int | None, list[str]]]:
+    """``(above, at_most, the records one call launches)`` of every window of a
+    route, from the registry: the main record of the window, then the dw reduce
+    record carrying its window (a det pair) if there is one."""
+
+    names = loader.ROUTES[arch][route]
+    out = []
+    for name in names:
         record = loader.MODULES[name]
-        if record.get("workspace_rule") is None:
+        if record["role"] == "bwd_reduce":
             continue
-        for rows in (1, 129, 16384, 65536):
-            layout = loader.workspace_layout(record, rows, device_index=0)
-            slots = int(record["grid_rule"]["ctas_per_sm"]) * sms
+        window = _window(record)
+        reduces = [
+            other
+            for other in names
+            if loader.MODULES[other]["role"] == "bwd_reduce"
+            and _window(loader.MODULES[other]) == window
+        ]
+        out.append((window[0], window[1], [name, *reduces]))
+    return sorted(out, key=lambda item: item[0])
+
+
+def _samples(above: int, at_most: int | None) -> list[int]:
+    """Token counts inside one window: both ends and the middle (the open window
+    up to 1 << 20)."""
+
+    top = at_most if at_most is not None else max(above * 2, 1 << 20)
+    return sorted({above + 1, (above + 1 + top) // 2, top})
+
+
+def test_every_route_tiles_the_token_counts() -> None:
+    for arch, route in _routes():
+        kind, hidden, residual, w_dtype = _parse(route)
+        assert loader.route_key(hidden, kind, residual, w_dtype) == route
+        spans = loader.program_windows(arch, hidden, kind, residual, w_dtype)
+        assert spans[0][0] == 0 and spans[-1][1] is None, (arch, route)
+        assert [(a, b) for a, b, _library in spans] == [
+            (a, b) for a, b, _names in _launches(arch, route)
+        ], (arch, route)
+
+
+def test_launch_count_of_every_window_is_the_registry_s() -> None:
+    """One call launches the window's records in route order: one single kernel,
+    or a det pair main kernel and its dw reduce; a forward window one kernel."""
+
+    counts = {"fwd": set(), "single": set(), "pair": set()}
+    for arch, route in _routes():
+        kind, hidden, residual, w_dtype = _parse(route)
+        for above, at_most, names in _launches(arch, route):
+            main = loader.MODULES[names[0]]
+            rule = main["workspace_rule"]
+            if kind == "fwd":
+                form = "fwd"
+                assert rule is None and len(names) == 1, (arch, route, names)
+            elif rule["kind"] == "claim_sum_f64":
+                form = "single"
+                assert len(names) == 1, (arch, route, names)
+            else:
+                form = "pair"
+                assert rule["kind"] == "chunk_partials" and len(names) == 2, names
+                assert loader.MODULES[names[1]]["workspace_rule"] is None
+            counts[form].add(len(names))
+            for rows in _samples(above, at_most):
+                selected = loader.selected_modules(
+                    arch, hidden, kind, residual, rows=rows, w_dtype=w_dtype
+                )
+                assert list(selected) == names, (arch, route, rows, selected)
+    assert counts["fwd"] == {1} and counts["single"] <= {1} and counts["pair"] <= {2}
+    print(
+        "LAUNCHES "
+        + " ".join(
+            f"{arch}:{route}:"
+            + ",".join(
+                f"({a},{b}]x{len(names)}" for a, b, names in _launches(arch, route)
+            )
+            for arch, route in _routes()
+            if route.startswith("bwd")
+        )
+    )
+
+
+def test_backward_records_are_chunk_claiming_kernels_or_their_reduce() -> None:
+    for arch, route in _routes():
+        kind, hidden, _residual, _w = _parse(route)
+        names = loader.ROUTES[arch][route]
+        for name in names:
+            record = loader.MODULES[name]
+            assert arch in record["arches"] and record["hidden"] == hidden
+            if kind == "fwd":
+                assert record["workspace_rule"] is None
+                continue
+            if record["role"] == "bwd_reduce":
+                # after every main record of the route (the host launches the
+                # admitted records in route order)
+                assert all(
+                    loader.MODULES[other]["role"] == "bwd_reduce"
+                    for other in names[names.index(name) :]
+                ), (arch, route)
+                assert record["workspace_rule"] is None
+                assert record["grid_rule"]["kind"] == "fixed"
+                assert record["launch"]["use_pdl"] is True
+                assert record["logical"]["partial"] == "partial"
+                continue
+            assert record["workspace_rule"]["kind"] in loader.WORKSPACE_KINDS
+            single = record["workspace_rule"]["kind"] == "claim_sum_f64"
+            # the claim ticket, then the completion counts (none for a single
+            # kernel that keeps no sums, the column form: one word)
             assert (
-                layout["counters_offset"] == 0
-                and layout["partial_offset"] == loader.COUNTERS_BYTES
+                1
+                <= record["workspace_rule"]["counters"]
+                <= (loader.SINGLE_COUNTERS_BYTES if single else loader.COUNTERS_BYTES)
+                // 4
             )
-            assert layout["slots"] == slots
-            assert layout["n_chunks"] == loader.n_chunks(
-                rows,
-                slots,
-                int(record["grid_rule"]["rows_per_issue"]),
-                *loader.chunk_taper(record["grid_rule"]),
+            if single:
+                sum_bytes = record["workspace_rule"]["sum_bytes"]
+                assert 0 <= sum_bytes <= loader.SUMS_BYTES and sum_bytes % 8 == 0
+                assert set(record["workspace_rule"]) == {
+                    "counters",
+                    "kind",
+                    "sum_bytes",
+                }
+            rule = record["grid_rule"]
+            assert rule["kind"] == "claimed_chunks"
+            assert rule["ctas_per_sm"] == min(
+                rule["grid_factor"], rule["launch_bound_ctas_per_sm"]
             )
-            assert (
-                layout["n_chunks"]
-                <= layout["capacity_chunks"]
-                == min(rows, loader.MAX_ROUNDS * slots)
-            )
-            assert layout["partial_bytes"] == 4 * layout["capacity_chunks"] * hidden
-            assert (
-                layout["total_bytes"]
-                == loader.COUNTERS_BYTES + -(-layout["partial_bytes"] // 256) * 256
-            )
-            assert loader.launch_grid(record, rows, device_index=0) == (
-                min(slots, layout["n_chunks"]),
-                1,
-                1,
-            )
-        # a record without its taper is refused, not cut at the defaults
-        stripped = {
-            **record,
-            "grid_rule": {
-                key: value
-                for key, value in record["grid_rule"].items()
-                if key != "tail_div"
-            },
+            assert loader.chunk_taper(rule) == (rule["tail_div"], rule["max_halving"])
+            assert record["launch"]["cooperative"] is False
+            assert record["logical"]["rows_per_chunk"] == "slots"
+            assert record["logical"]["partial"] == "partial"
+
+
+def _check_constant_offsets() -> None:
+    """The package-constant regions, back to back and 256-byte aligned: the pair
+    counters, the single counters, the FP64 sums (the largest ``sum_bytes`` of
+    the registry), the pair partial rows."""
+    assert loader.SINGLE_COUNTERS_OFFSET == loader.COUNTERS_BYTES
+    assert (
+        loader.SUMS_OFFSET
+        == loader.SINGLE_COUNTERS_OFFSET + loader.SINGLE_COUNTERS_BYTES
+    )
+    assert loader.PAIR_ROWS_OFFSET == loader.SUMS_OFFSET + loader.SUMS_BYTES
+    for value in (loader.SUMS_OFFSET, loader.SUMS_BYTES, loader.PAIR_ROWS_OFFSET):
+        assert value % 256 == 0, value
+    largest = max(
+        (
+            record["workspace_rule"]["sum_bytes"]
+            for record in loader.MODULES.values()
+            if record["workspace_rule"] is not None
+            and record["workspace_rule"]["kind"] == "claim_sum_f64"
+        ),
+        default=0,
+    )
+    expected = -(-largest // 256) * 256
+    assert expected == loader.SUMS_BYTES
+
+
+def _check_family_layout(arch: str, hidden: int, residual: bool, sms: int) -> int:
+    """The workspace layout of every workspace owner of one family for a range of
+    token counts; returns the number of single-kernel owners checked."""
+
+    _check_constant_offsets()
+    singles = 0
+    for w_dtype in loader.weight_dtypes(arch, hidden, "bwd", residual):
+        for name in loader.route_modules(arch, hidden, "bwd", residual, w_dtype):
+            record = loader.MODULES[name]
+            if record["workspace_rule"] is None:
+                continue
+            rule = record["grid_rule"]
+            single = record["workspace_rule"]["kind"] == "claim_sum_f64"
+            singles += single
+            for rows in (1, 2, 7, 64, 257, 1000, 4096, 16385, 65536):
+                layout = loader.workspace_layout(record, rows, device_index=0)
+                slots = rule["ctas_per_sm"] * sms
+                assert layout["slots"] == slots
+                table = loader.chunk_table(
+                    rows, slots, rule["rows_per_issue"], *loader.chunk_taper(rule)
+                )
+                assert layout["n_chunks"] == len(table)
+                assert table[0][0] == 0 and table[-1][1] == rows
+                assert all(a[1] == b[0] for a, b in zip(table, table[1:], strict=False))
+                # bulk-reduction destination / partial row alignment
+                assert layout["partial_offset"] % 256 == 0
+                if single:
+                    # the single counters and sums at their constant offsets,
+                    # whatever rows: never the pair counters or partial rows
+                    sum_bytes = record["workspace_rule"]["sum_bytes"]
+                    assert layout["counters_offset"] == loader.SINGLE_COUNTERS_OFFSET
+                    assert 4 * layout["counters"] <= loader.SINGLE_COUNTERS_BYTES
+                    assert layout["partial_offset"] == loader.SUMS_OFFSET
+                    assert layout["partial_bytes"] == sum_bytes
+                    assert layout["total_bytes"] == loader.SUMS_OFFSET + (
+                        -(-sum_bytes // 256) * 256
+                    )
+                    assert layout["total_bytes"] <= loader.PAIR_ROWS_OFFSET
+                else:
+                    # the pair counters first, the partial rows after the sums: a
+                    # pair call never touches the single kernel's counters or sums
+                    assert layout["counters_offset"] == 0
+                    assert 4 * layout["counters"] <= loader.COUNTERS_BYTES
+                    assert layout["partial_offset"] == loader.PAIR_ROWS_OFFSET
+                    assert layout["capacity_chunks"] >= layout["n_chunks"]
+                    assert (
+                        layout["partial_bytes"]
+                        == 4 * layout["capacity_chunks"] * hidden
+                    )
+                    assert (
+                        layout["total_bytes"]
+                        >= layout["partial_offset"] + layout["partial_bytes"]
+                    )
+                grid = loader.launch_grid(record, rows, device_index=0)
+                assert grid == (min(slots, len(table)), 1, 1)
+    return singles
+
+
+@pytest.mark.parametrize("sms", SM_COUNTS)
+def test_chunk_tables_cover_the_rows(sms: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(loader, "sm_count", lambda device_index: sms)
+    families = {
+        (arch, hidden, residual)
+        for arch, route in _routes()
+        for kind, hidden, residual, _w_dtype in [_parse(route)]
+        if kind == "bwd"
+    }
+    assert families
+    for family in sorted(families):
+        _check_family_layout(*family, sms)
+
+
+def _with_single(
+    monkeypatch: pytest.MonkeyPatch, route: str, at_most: int, sizes: tuple[int, ...]
+) -> tuple[str, int, bool]:
+    """Put single-kernel records into the first ``at_most`` tokens of an sm_100a
+    route (one per entry of ``sizes``, its ``sum_bytes`` that many FP64 rows of
+    ``hidden``, splitting that window; the det pair keeps the rest) of a copy of
+    the registry, with the package's sums region resized as the registry sizes
+    it; returns the family."""
+
+    kind, hidden, residual, _w_dtype = _parse(route)
+    modules = dict(loader.MODULES)
+    routes = {arch: dict(by_route) for arch, by_route in loader.ROUTES.items()}
+    names = list(routes["sm_100a"][route])
+    pair = next(
+        n for n in names if modules[n]["workspace_rule"]["kind"] == "chunk_partials"
+    )
+    singles, above = [], 0
+    for index, count in enumerate(sizes):
+        top = at_most * (index + 1) // len(sizes)
+        record = json.loads(json.dumps(modules[pair]))
+        record["workspace_rule"] = {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 8 * hidden * count,
         }
-        with pytest.raises(ValueError, match="tail_div"):
-            loader.launch_grid(stripped, 4096, device_index=0)
-        with pytest.raises(ValueError, match="tail_div"):
-            loader.workspace_layout(stripped, 4096, device_index=0)
-    workspace = pkg.cake_rmsnorm_train_backward_workspace(65536, hidden, device)
-    assert workspace.dtype == torch.uint8 and workspace.numel() == sizes[-1]
-    assert torch.count_nonzero(workspace[: loader.COUNTERS_BYTES]) == 0
+        record["select_rule"] = {"above": above, "at_most": top, "kind": "rows_between"}
+        name = f"test_single_{index}"
+        modules[name] = record
+        singles.append(name)
+        above = top
+    kept = []
+    for name in names:
+        record = modules[name]
+        low, high = _window(record)
+        if high is not None and high <= at_most:
+            continue  # a window the singles now cover (its main record and dw reduce)
+        if low < at_most:
+            record = json.loads(json.dumps(record))
+            record["select_rule"] = {
+                "above": at_most,
+                "at_most": high,
+                "kind": "rows_between",
+            }
+            modules[name] = record
+        kept.append(name)
+    mains = [n for n in kept if modules[n]["role"] != "bwd_reduce"]
+    reduces = [n for n in kept if modules[n]["role"] == "bwd_reduce"]
+    routes["sm_100a"][route] = [*singles, *mains, *reduces]
+    monkeypatch.setattr(loader, "MODULES", modules)
+    monkeypatch.setattr(loader, "ROUTES", routes)
+    sums = max(
+        (
+            record["workspace_rule"]["sum_bytes"]
+            for record in modules.values()
+            if record["workspace_rule"] is not None
+            and record["workspace_rule"]["kind"] == "claim_sum_f64"
+        ),
+        default=0,
+    )
+    monkeypatch.setattr(loader, "SUMS_BYTES", -(-sums // 256) * 256)
+    monkeypatch.setattr(
+        loader, "PAIR_ROWS_OFFSET", loader.SUMS_OFFSET + loader.SUMS_BYTES
+    )
+    return "sm_100a", hidden, residual
+
+
+def _pair_led_route() -> int:
+    """The hidden size of an sm_100a BF16-weight backward route without residual
+    whose windows at 1 and 257 tokens run the det pair (the mixed-form test
+    puts single kernels into its first 256 tokens)."""
+
+    for route in sorted(loader.ROUTES["sm_100a"]):
+        kind, hidden, residual, w_dtype = _parse(route)
+        if kind != "bwd" or residual or w_dtype != "bf16":
+            continue
+        forms = [
+            loader.MODULES[name]["workspace_rule"]["kind"]
+            for rows in (1, 257)
+            for name in loader.selected_modules(
+                "sm_100a", hidden, "bwd", False, rows=rows
+            )
+            if loader.MODULES[name]["workspace_rule"] is not None
+        ]
+        if forms == ["chunk_partials", "chunk_partials"]:
+            return hidden
+    raise AssertionError(
+        "no sm_100a BF16 backward route runs the det pair at 1 and 257 tokens"
+    )
+
+
+@pytest.mark.parametrize("sizes", [(1,), (4,), (4, 4), (4, 2)])
+def test_a_family_mixing_both_forms_keeps_its_regions_apart(
+    sizes: tuple[int, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The single-kernel layout on a copy of the registry whose first sm_100a
+    route that runs the det pair at 1 and 257 tokens runs single kernels up to
+    256 tokens: the single counters and sums at their constant offsets (the sums
+    region sized by the largest ``sum_bytes``), the pair counters before them
+    and the pair partial rows after them, for every token count of both forms."""
+
+    monkeypatch.setattr(loader, "sm_count", lambda device_index: 148)
+    hidden = _pair_led_route()
+    shipped = _check_family_layout("sm_100a", hidden, False, 148)  # the registry's own
+    largest = max(
+        (
+            record["workspace_rule"]["sum_bytes"]
+            for record in loader.MODULES.values()
+            if record["workspace_rule"] is not None
+            and record["workspace_rule"]["kind"] == "claim_sum_f64"
+        ),
+        default=0,
+    )
+    family = _with_single(monkeypatch, f"bwd_h{hidden}", 256, sizes)
+    assert list(loader.selected_modules(family[0], hidden, "bwd", False, rows=1)) == [
+        "test_single_0"
+    ]
+    assert len(loader.selected_modules(family[0], hidden, "bwd", False, rows=257)) == 2
+    expected = -(-max(largest, 8 * hidden * max(sizes)) // 256) * 256
+    assert expected == loader.SUMS_BYTES
+    assert _check_family_layout(*family, 148) == shipped + len(sizes)
+
+
+def test_every_backward_route_ships_the_single_kernel_or_is_listed() -> None:
+    """Every backward route -- architecture, hidden size, residual flag and
+    weight dtype -- runs the single kernel (a ``claim_sum_f64`` record) in at
+    least one window, or is listed with its measured reason in the exporter's
+    ``DET_PAIR_ROUTES`` (rendered into ``cake_windows``); a listed route ships
+    no single-kernel window and is a backward route of the registry."""
+
+    missing, stale = [], []
+    for arch, route in _routes():
+        if not route.startswith("bwd"):
+            continue
+        ships = any(
+            loader.MODULES[names[0]]["workspace_rule"]["kind"] == "claim_sum_f64"
+            for _above, _at_most, names in _launches(arch, route)
+        )
+        listed = route in windows.DET_PAIR_ROUTES.get(arch, {})
+        if ships and listed:
+            stale.append((arch, route))
+        elif not ships and not listed:
+            missing.append((arch, route))
+    unknown = [
+        (arch, route)
+        for arch, listed in windows.DET_PAIR_ROUTES.items()
+        for route in listed
+        if not route.startswith("bwd") or route not in loader.ROUTES.get(arch, {})
+    ]
+    assert all(
+        isinstance(reason, str) and reason.strip()
+        for listed in windows.DET_PAIR_ROUTES.values()
+        for reason in listed.values()
+    )
+    assert not stale and not unknown, (stale, unknown)
+    assert not missing, (
+        f"{len(missing)} backward routes run the det pair in every window and are "
+        f"not listed in DET_PAIR_ROUTES: {missing[:8]}"
+    )
+
+
+def test_windows_module_is_the_registry() -> None:
+    for arch, route in _routes():
+        kind, hidden, residual, w_dtype = _parse(route)
+        assert windows.PROGRAM_WINDOWS[arch][route] == loader.program_windows(
+            arch, hidden, kind, residual, w_dtype
+        ), (arch, route)
+    assert set(windows.SECTIONS) == {"fwd", "bwd"}
+    assert "not bitwise reproducible" in windows.NOTES
+    # the windows that run a det pair are marked on the backward section's route
+    # lines: the BF16 routes and the FP32-weight routes the section lists (re-cut
+    # for the FP32 weight, with windows of their own); an FP32-weight route it
+    # does not list has its BF16 route's windows
+    route_line = re.compile(
+        r"^\* ``(sm_\d+a)`` ``(\w+)``: \(\d+, (?:\d+\]|inf\)) [0-9a-f]{8}"
+    )
+    listed = {
+        m.groups()
+        for line in windows.SECTIONS["bwd"].splitlines()
+        if (m := route_line.match(line))
+    }
+    for arch, route in _routes():
+        kind, hidden, residual, w_dtype = _parse(route)
+        if kind == "bwd" and w_dtype == "f32" and (arch, route) not in listed:
+            base = loader.route_key(hidden, kind, residual, "bf16")
+            assert [(a, b) for a, b, _n in _launches(arch, route)] == [
+                (a, b) for a, b, _n in _launches(arch, base)
+            ], (arch, route, "not listed, but its windows are not its BF16 route's")
+    pairs = sum(
+        1
+        for arch, route in _routes()
+        for _a, _b, names in _launches(arch, route)
+        if len(names) == 2 and (_parse(route)[3] != "f32" or (arch, route) in listed)
+    )
+    marked = {
+        kind: sum(
+            line.count("(det pair)")
+            for line in windows.SECTIONS[kind].splitlines()
+            if line.startswith(("* ``", "  "))
+        )
+        for kind in ("fwd", "bwd")
+    }
+    assert marked == {"fwd": 0, "bwd": pairs}, (marked, pairs)
+
+
+def test_build_manifest_builds_every_library() -> None:
+    manifest = json.loads((Path(loader.__file__).parent / "build.json").read_text())
+    built = {entry["name"] for entry in manifest["libraries"]}
+    wanted = {
+        loader.library_name(name, arch)
+        for name, record in loader.MODULES.items()
+        for arch in record["arches"]
+    }
+    assert wanted <= built, sorted(wanted - built)[:5]
+    assert manifest["package"] == "flashinfer.cake_rmsnorm_train_backend"
+    assert all(name.startswith("cake_rmsnorm_train_") for name in built)

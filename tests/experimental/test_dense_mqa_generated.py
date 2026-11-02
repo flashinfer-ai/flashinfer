@@ -44,7 +44,8 @@ _FP4_LUT = (
 # counts that are not 1, 16 or 128 (partial four-query blocks, 33 and 132
 # queries, and 2052/2053 queries on the unbounded metadata tier), plus one row
 # per two-launch route at the first KV length above its single-launch class's
-# policy bound, two rows past the fused Q <= 2048 route's union bound (the
+# policy bound (and one at the bound of the single-query chains and the FP8
+# Q = 128 text), two rows past the fused Q <= 2048 route's union bound (the
 # le2048 tier pairs), and the two 32-head rows whose KV length is not a multiple
 # of 256 (served where the served route record's ``kv_alignment`` is 1 for the
 # device's architecture; skipped elsewhere).
@@ -78,15 +79,18 @@ CASES = [
     ("fp8", 132, 2048),
     ("fp8", 33, 8192),
     ("fp8", 1, 1048832),
+    ("fp8", 1, 1049088),
     ("fp8", 16, 1048832),
     ("fp8", 3, 1048832),
     ("fp8", 128, 131328),
+    ("fp8", 128, 131584),
     ("fp8", 33, 1048832),
     ("fp8", 132, 8448),
     ("fp8", 130, 8448),
     ("fp8", 2052, 8448),
     ("fp8", 2053, 8448),
     ("fp4", 1, 131328),
+    ("fp4", 1, 131584),
     ("fp4", 16, 1048832),
     ("fp4", 33, 1048832),
     ("fp4", 130, 65792),
@@ -286,6 +290,13 @@ def _deep_gemm_check(
     assert torch.equal(plan.metadata[span:], meta[span:])
 
 
+def _logits_route(precision, queries, keys, arch):
+    """The route a 32-head logits plan serves on ``arch``: the device's own route
+    (``served_route``), not the logical ``route_name``, which applies the most
+    permissive architecture's bound (the FP4 scan-class bounds are per arch)."""
+    return _runtime.served_route(precision, queries, keys, arch=arch)
+
+
 @pytest.mark.parametrize("precision,queries,keys", CASES)
 def test_dense_mqa_logits(precision, queries, keys):
     _skip_unless_exported()
@@ -298,7 +309,7 @@ def test_dense_mqa_logits(precision, queries, keys):
     plan = prepare_dense_mqa_logits(
         precision, q, kv, weights, starts, ends, q_scales=qs, kv_scales=ks
     )
-    assert plan.route_name == _runtime.route_name(precision, queries, keys)
+    assert plan.route_name == _logits_route(precision, queries, keys, arch)
     # One submission per stage, or one for a prepared sequence; a ``:short``
     # route is a single logits launch that writes the schedule itself.
     assert plan.launch_count == (
@@ -353,30 +364,41 @@ def test_dense_mqa_logits(precision, queries, keys):
         # (smallest covering block ceiling, its own KV bound), then the pair.
         ("fp4", 1, 4096, "fp4:q1:short"),
         ("fp4", 1, 131072, "fp4:q1:short"),
-        ("fp4", 1, 131328, "fp4:q1"),
+        ("fp4", 1, 131328, "fp4:q1:short"),
+        ("fp4", 1, 131584, "fp4:q1"),
         ("fp4", 7, 2048, "fp4:le32:short"),
         ("fp4", 16, 1048576, "fp4:le32:short"),
-        ("fp4", 16, 1048832, "fp4:le16"),
+        # the FP4 scan-class bounds are per architecture (fp4.fused_scan32_max_kv sm_100a 1048576,
+        # sm_103a 1048832): the logical name applies the most permissive one, served_route the device's
+        # (test_dense_fp4_scan_bounds_are_per_arch)
+        ("fp4", 16, 1048832, "fp4:le32:short"),
+        ("fp4", 16, 1049088, "fp4:le16"),
         ("fp4", 17, 2048, "fp4:le32:short"),
         ("fp4", 128, 4096, "fp4:le32:short"),
-        ("fp4", 33, 1048832, "fp4:le128"),
+        ("fp4", 33, 1048832, "fp4:le32:short"),
+        ("fp4", 33, 1049088, "fp4:le128"),
         # the 1024-block FP4 class: the first-tile-prefetch program at and below the policy's query bound
         # (``fp4.first_tile_prefetch_max_queries_scan1024``, 1024), the plain CTA-scan program above it
         ("fp4", 130, 65536, "fp4:qle1024:short"),
-        ("fp4", 130, 65792, "fp4:le2048"),
+        # fp4.fused_scan1024_max_kv: sm_100a 65536, sm_103a 65792 (logical name: the most permissive)
+        ("fp4", 130, 65792, "fp4:qle1024:short"),
+        ("fp4", 130, 66048, "fp4:le2048"),
         ("fp4", 1024, 2048, "fp4:qle1024:short"),
         ("fp4", 1025, 2048, "fp4:le1024:short"),
         ("fp4", 2049, 4096, "fp4:le1024:short"),
-        ("fp4", 2052, 65792, "fp4:any"),
+        ("fp4", 2052, 65792, "fp4:le1024:short"),
+        ("fp4", 2052, 66048, "fp4:any"),
         ("fp4", 4100, 2048, "fp4:any"),  # 1025 query blocks: no scan class
         # FP8: fused Q1 chain, plain Q1 pair, fused Q128 text, the scan class
         # qualified by block kind (Q = 128 never takes a class), then the pair.
         ("fp8", 1, 4096, "fp8:q1:short"),
         ("fp8", 1, 1048576, "fp8:q1:short"),
-        ("fp8", 1, 1048832, "fp8:q1"),
+        ("fp8", 1, 1048832, "fp8:q1:short"),
+        ("fp8", 1, 1049088, "fp8:q1"),
         ("fp8", 128, 4096, "fp8:q128:short"),
         ("fp8", 128, 131072, "fp8:q128:short"),
-        ("fp8", 128, 131328, "fp8:full:le128"),
+        ("fp8", 128, 131328, "fp8:q128:short"),
+        ("fp8", 128, 131584, "fp8:full:le128"),
         (
             "fp8",
             128,
@@ -388,7 +410,7 @@ def test_dense_mqa_logits(precision, queries, keys):
             "fp8",
             128,
             131077,
-            "fp8:full:le128",
+            "fp8:q128:short",
         ),  # never the le32 class, never the fused Q <= 128 text (K > 4352)
         # On the overlap tiers (le128: 1 < Q <= 128, le2048: 128 < Q <= 2048) the published
         # ``single_launch_precedence`` of the tier decides between the v9 scan class and
@@ -480,9 +502,13 @@ def test_dense_mqa_logits(precision, queries, keys):
         ("fp8", 1024, 65536, "fp8:qle2048:short"),
         ("fp8", 2048, 65537, "fp8:full:le2048"),
         ("fp8", 1024, 65792, "fp8:full:le2048"),
-        ("fp8", 132, 65792, "fp8:full:le2048"),
-        ("fp8", 130, 65792, "fp8:partial:le2048"),
-        ("fp8", 129, 65537, "fp8:partial:le2048"),
+        # the sm_103a small-Q band (Q <= fused_qle2048_small_q_max_queries, K <= fused_qle2048_small_q_max_kv): the
+        # logical name applies the most permissive bound, served_route the device's; one block further, the pair
+        ("fp8", 132, 65792, "fp8:qle2048:short"),
+        ("fp8", 130, 65792, "fp8:qle2048:short"),
+        ("fp8", 129, 65537, "fp8:qle2048:short"),
+        ("fp8", 132, 66048, "fp8:full:le2048"),
+        ("fp8", 130, 66048, "fp8:partial:le2048"),
         ("fp8", 2052, 2048, "fp8:full:le768:short"),
         ("fp8", 2052, 4096, "fp8:full:le768:short"),
         ("fp8", 2052, 8448, "fp8:full:any"),
@@ -507,10 +533,18 @@ def test_dense_mqa_route_selection(precision, queries, keys, route):
     if route == "fp8:qle128:short":
         assert _runtime._catalog()["policy"]["fused_qle128_max_kv"] == 4352
     if route == "fp8:qle2048:short":
-        bounds = _runtime._catalog()["policy"]["fused_qle2048_max_kv"]
-        assert bounds == {"sm_100a": 34048, "sm_103a": 65536}
-        # the served route applies the device's own bound: the two-launch tier of the query count past it
+        policy = _runtime._catalog()["policy"]
+        assert policy["fused_qle2048_max_kv"] == {"sm_100a": 34048, "sm_103a": 65536}
+        assert policy["fused_qle2048_small_q_max_kv"] == {
+            "sm_100a": 34048,
+            "sm_103a": 65792,
+        }
+        # the served route applies the device's own bound for the query count: the two-launch tier past it
         tier = f"fp8:{'full' if queries % 4 == 0 else 'partial'}:le2048"
+        bounds = {
+            a: _runtime._fused_qle2048_bound(a, queries)
+            for a in sorted(_runtime._catalog()["arches"])
+        }
         for arch, bound in bounds.items():
             served = _runtime.served_route(precision, queries, keys, arch=arch)
             assert served == (route if keys <= int(bound) else tier), (arch, served)
@@ -540,8 +574,12 @@ def test_dense_single_launch_policy_is_published():
         ceilings = [int(c) for c in table["fused_scan_ceilings"]]
         assert ceilings == sorted(ceilings) and ceilings[0] >= 1, precision
         for ceiling in ceilings:
-            bound = int(table[f"fused_scan{ceiling}_max_kv"])
-            assert bound >= 256 and bound % 256 == 0, (precision, ceiling)
+            value = table[f"fused_scan{ceiling}_max_kv"]
+            if isinstance(value, dict):  # a per-architecture map (the FP4 scan classes)
+                assert sorted(value) == arches, (precision, ceiling)
+            for arch in arches:
+                bound = _runtime._scan_bound(value, arch)
+                assert bound >= 256 and bound % 256 == 0, (precision, ceiling, arch)
         q1_bound = int(table["fused_q1_max_kv"])
         assert q1_bound >= 256 and q1_bound % 256 == 0, precision
     assert int(policy["fused_q128_max_kv"]) % 256 == 0
@@ -550,6 +588,16 @@ def test_dense_single_launch_policy_is_published():
     qle2048_bounds = {a: int(v) for a, v in policy["fused_qle2048_max_kv"].items()}
     assert sorted(qle2048_bounds) == arches
     assert all(v >= 256 and v % 256 == 0 for v in qle2048_bounds.values())
+    # the small-Q band of the fused Q <= 2048 route, per architecture: a query bound in the tier's range (128 = none) and
+    # a KV bound at or above the architecture's own bound, whole blocks
+    small_q = {
+        a: int(v) for a, v in policy["fused_qle2048_small_q_max_queries"].items()
+    }
+    small_kv = {a: int(v) for a, v in policy["fused_qle2048_small_q_max_kv"].items()}
+    assert sorted(small_q) == sorted(small_kv) == arches
+    for arch in arches:
+        assert 128 <= small_q[arch] <= _runtime.FUSED_QLE2048_MAX_Q, arch
+        assert small_kv[arch] >= qle2048_bounds[arch] and small_kv[arch] % 256 == 0
     short = {
         route
         for route, record in catalog["routes"].items()
@@ -600,11 +648,12 @@ def test_dense_single_launch_policy_is_published():
     ):
         blocks = (max_q + _runtime.BLOCK_Q - 1) // _runtime.BLOCK_Q
         ceiling = next(c for c in ceilings if blocks <= c)
-        class_bound = int(policy[f"fused_scan{ceiling}_max_kv"])
         for arch in arches:
             bounds = {
                 "qle": qle128_bound if tier == "le128" else qle2048_bounds[arch],
-                "le_class": class_bound,
+                "le_class": _runtime._scan_bound(
+                    policy[f"fused_scan{ceiling}_max_kv"], arch
+                ),
             }
             order = list(policy["single_launch_precedence"][arch][tier])
             if "qle" not in order:
@@ -624,6 +673,167 @@ def test_dense_single_launch_policy_is_published():
         assert int(record["kv_min"]) == divisor, route
         assert sorted(record["kv_alignment"]) == arches, route
         assert all(int(v) == divisor for v in record["kv_alignment"].values()), route
+
+
+def test_dense_fp4_scan_bounds_are_per_arch():
+    """Host-only: the FP4 scan-class KV bounds are per architecture -- ``fp4.fused_scan32_max_kv`` /
+    ``fp4.fused_scan1024_max_kv`` are ``{"sm_100a": 1048576, "sm_103a": 1048832}`` / ``{"sm_100a": 65536,
+    "sm_103a": 65792}`` (each measured on its device): ``served_route`` applies the device's bound, the logical
+    ``route_name`` the most permissive one, and ``served_route`` without an architecture refuses the KV lengths the
+    architectures disagree on."""
+    fp4 = _runtime._catalog()["policy"]["fp4"]
+    assert fp4["fused_scan32_max_kv"] == {"sm_100a": 1048576, "sm_103a": 1048832}
+    assert fp4["fused_scan1024_max_kv"] == {"sm_100a": 65536, "sm_103a": 65792}
+    assert _runtime._scan_bound(fp4["fused_scan32_max_kv"], "sm_100a") == 1048576
+    assert _runtime._scan_bound(fp4["fused_scan32_max_kv"], "sm_103a") == 1048832
+    assert _runtime._scan_bound(fp4["fused_scan32_max_kv"], None) == 1048832
+    assert (
+        _runtime._scan_bound(4096, "sm_100a")
+        == _runtime._scan_bound(4096, None)
+        == 4096
+    )
+    # (queries, keys): {arch: served route}, the logical name = the most permissive architecture's route
+    cases = {
+        (16, 1048576): {"sm_100a": "fp4:le32:short", "sm_103a": "fp4:le32:short"},
+        (16, 1048832): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le32:short"},
+        (33, 1048832): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le32:short"},
+        (128, 1048832): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le32:short"},
+        (16, 1049088): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le16"},
+        (130, 65536): {"sm_100a": "fp4:qle1024:short", "sm_103a": "fp4:qle1024:short"},
+        (130, 65792): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:qle1024:short"},
+        (1025, 65792): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:le1024:short"},
+        (2052, 65792): {"sm_100a": "fp4:any", "sm_103a": "fp4:le1024:short"},
+        (130, 66048): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:le2048"},
+    }
+    for (queries, keys), served in cases.items():
+        for arch, route in served.items():
+            assert _runtime.served_route("fp4", queries, keys, arch=arch) == route, (
+                queries,
+                keys,
+                arch,
+            )
+        assert _runtime.route_name("fp4", queries, keys) == served["sm_103a"], (
+            queries,
+            keys,
+        )
+        if len(set(served.values())) == 1:
+            assert _runtime.served_route("fp4", queries, keys) == served["sm_103a"]
+        else:
+            with pytest.raises(ValueError, match="pass arch"):
+                _runtime.served_route("fp4", queries, keys)
+    # the FP8 scan-class bounds stay one value on every architecture
+    policy = _runtime._catalog()["policy"]
+    assert isinstance(policy["fused_scan32_max_kv"], int) and isinstance(
+        policy["fused_scan768_max_kv"], int
+    )
+
+
+def test_dense_fp8_qle2048_small_q_band_is_per_arch():
+    """Host-only: the small-Q band of the fused Q <= 2048 route. On each architecture
+    a 32-head FP8 call with 128 < Q <= ``fused_qle2048_small_q_max_queries[arch]``
+    takes ``fp8:qle2048:short`` up to ``fused_qle2048_small_q_max_kv[arch]``, every
+    other query count of the tier up to ``fused_qle2048_max_kv[arch]``; past its
+    bound the call takes the two-launch tier pair. sm_100a has no band (128), so
+    its routes are those of the plain bound."""
+    policy = _runtime._catalog()["policy"]
+    small_q = policy["fused_qle2048_small_q_max_queries"]
+    small_kv = policy["fused_qle2048_small_q_max_kv"]
+    plain = policy["fused_qle2048_max_kv"]
+    assert int(small_q["sm_100a"]) == 128 and int(small_kv["sm_100a"]) == int(
+        plain["sm_100a"]
+    )
+    qstar, kv = int(small_q["sm_103a"]), int(small_kv["sm_103a"])
+    assert 132 <= qstar < 2048 and kv == int(plain["sm_103a"]) + 256
+
+    def tier(q):
+        return f"fp8:{'full' if q % 4 == 0 else 'partial'}:le2048"
+
+    for queries in (129, 130, 132, qstar):
+        assert _runtime._fused_qle2048_bound("sm_103a", queries) == kv
+        assert _runtime._fused_qle2048_bound("sm_100a", queries) == int(
+            plain["sm_100a"]
+        )
+        for keys in (kv - 255, kv):
+            assert (
+                _runtime.served_route("fp8", queries, keys, arch="sm_103a")
+                == "fp8:qle2048:short"
+            ), (queries, keys)
+            assert _runtime.served_route("fp8", queries, keys, arch="sm_100a") == tier(
+                queries
+            )
+            assert _runtime.route_name("fp8", queries, keys) == "fp8:qle2048:short"
+            with pytest.raises(ValueError, match="pass arch"):
+                _runtime.served_route("fp8", queries, keys)
+        for arch in ("sm_100a", "sm_103a"):
+            assert _runtime.served_route("fp8", queries, kv + 256, arch=arch) == tier(
+                queries
+            )
+    # one query past the band: the plain bound on sm_103a
+    above = qstar + 1
+    assert _runtime._fused_qle2048_bound("sm_103a", above) == int(plain["sm_103a"])
+    assert _runtime.served_route("fp8", above, kv, arch="sm_103a") == tier(above)
+    assert (
+        _runtime.served_route("fp8", above, int(plain["sm_103a"]), arch="sm_103a")
+        == "fp8:qle2048:short"
+    )
+    assert _runtime.route_name("fp8", above, kv) == tier(above)
+
+
+def test_dense_logits_route_expectation_is_per_arch():
+    """Host-only: the route ``test_dense_mqa_logits`` expects on every catalog
+    architecture. Where the architectures serve different routes for a logits case
+    (the FP4 scan-class KV bounds, the FP8 small-Q fused Q <= 2048 band), the
+    expectation follows the device and is listed here; at the next KV block both
+    architectures agree again."""
+    per_arch = {
+        ("fp4", 16, 1048832): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le32:short"},
+        ("fp4", 33, 1048832): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le32:short"},
+        ("fp4", 130, 65792): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:qle1024:short"},
+        ("fp4", 2052, 65792): {"sm_100a": "fp4:any", "sm_103a": "fp4:le1024:short"},
+        ("fp4", 16, 1049088): {"sm_100a": "fp4:le16", "sm_103a": "fp4:le16"},
+        ("fp4", 33, 1049088): {"sm_100a": "fp4:le128", "sm_103a": "fp4:le128"},
+        ("fp4", 130, 66048): {"sm_100a": "fp4:le2048", "sm_103a": "fp4:le2048"},
+        ("fp4", 2052, 66048): {"sm_100a": "fp4:any", "sm_103a": "fp4:any"},
+        ("fp8", 130, 65792): {
+            "sm_100a": "fp8:partial:le2048",
+            "sm_103a": "fp8:qle2048:short",
+        },
+        ("fp8", 132, 65792): {
+            "sm_100a": "fp8:full:le2048",
+            "sm_103a": "fp8:qle2048:short",
+        },
+        ("fp8", 130, 66048): {
+            "sm_100a": "fp8:partial:le2048",
+            "sm_103a": "fp8:partial:le2048",
+        },
+        ("fp8", 132, 66048): {
+            "sm_100a": "fp8:full:le2048",
+            "sm_103a": "fp8:full:le2048",
+        },
+    }
+    arches = sorted(_runtime._catalog()["arches"])
+    for (precision, queries, keys), served in per_arch.items():
+        assert sorted(served) == arches
+        for arch, route in served.items():
+            assert _runtime.dense_route_available(
+                32, queries, keys, precision, arch=arch
+            )
+            assert _logits_route(precision, queries, keys, arch) == route, (
+                precision,
+                queries,
+                keys,
+                arch,
+            )
+    # every logits case whose served route differs between architectures (so the
+    # logical route name is not every device's route) has its routes listed above
+    for case in CASES:
+        routes = {
+            arch: _logits_route(*case, arch)
+            for arch in arches
+            if _runtime.dense_route_available(32, case[1], case[2], case[0], arch=arch)
+        }
+        if len(set(routes.values())) > 1:
+            assert case in per_arch, case
 
 
 @pytest.mark.parametrize("sm_count", [132, 148, 152])
@@ -744,8 +954,12 @@ def test_dense_route_table_is_catalog_driven():
     # order-independent points
     assert _runtime.route_name("fp8", 1, 4096) == "fp8:q1:short"
     assert _runtime.route_name("fp8", 16, scan32 + 256) == "fp8:full:le16"
+    small_q_max_kv = max(
+        int(v) for v in policy["fused_qle2048_small_q_max_kv"].values()
+    )  # the small-Q band's most permissive bound (at or above the plain bound)
     assert (
-        _runtime.route_name("fp8", 130, fused_2048_max_kv + 256) == "fp8:partial:le2048"
+        _runtime.route_name("fp8", 130, max(fused_2048_max_kv, small_q_max_kv) + 256)
+        == "fp8:partial:le2048"
     )
     assert _runtime.route_name("fp8", 130, scan768 + 256) == "fp8:qle2048:short"
     assert _runtime.route_name("fp8", 2049, 8192) == "fp8:partial:le768:short"
@@ -1235,17 +1449,62 @@ def _bucket_window(window, queries, keys):
     return starts.to(torch.int32), ends.to(torch.int32)
 
 
+# Per route of the shipped catalog that carries a stage bucket: the query counts the bucket test runs on it. Each
+# count names that route at the route's smallest served K (for a ``:short`` route, the first multiple of its
+# ``kv_alignment`` from ``kv_min`` up that the route serves at that count), at a bucket's ``kv_max`` and at the next
+# served K above it (``kv_max`` plus the route's ``kv_alignment``) on every architecture the route has a bucket on; a
+# route with a bucket that this table does not list fails the test.
+_BUCKET_QUERIES = {
+    "fp8:h64:full:qle2048:kvsplit": (66, 128, 302, 1024),
+    "fp8:h64:partial:qle128:kvsplit": (3, 37, 63),
+    "fp4:le32:short": (7, 16, 36, 37, 128),
+    "fp8:q128:short": (128,),
+    "fp8:full:le32:short": (4, 16, 124),
+    "fp8:qle2048:short": (129, 136, 137),
+}
+
+
+def _bucket_inputs(precision, queries, keys, heads):
+    """``(q, kv, scales, weights)`` of a bucket test call: FP8 E4M3 q/kv with FP32 kv scales, or FP4 packed E2M1
+    q/kv with UE8M0 q and kv scales (``scales`` holds the plan's scale keywords)."""
+    torch.manual_seed(7)
+    if precision == "fp4":
+        q = torch.randint(
+            0, 256, (queries, heads, 64), device="cuda", dtype=torch.uint8
+        )
+        kv = torch.randint(0, 256, (keys, 64), device="cuda", dtype=torch.uint8)
+        scales = {
+            "q_scales": torch.randint(
+                124, 131, (queries, heads, 4), device="cuda", dtype=torch.uint8
+            ),
+            "kv_scales": torch.randint(
+                124, 131, (keys, 4), device="cuda", dtype=torch.uint8
+            ),
+        }
+    else:
+        q = torch.randn(queries, heads, 128, device="cuda").to(torch.float8_e4m3fn)
+        kv = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
+        scales = {
+            "kv_scales": (torch.rand(_runtime.align4(keys), device="cuda") + 0.5)[:keys]
+        }
+    weights = torch.randn(queries, heads, device="cuda")
+    return q, kv, scales, weights
+
+
 @pytest.mark.parametrize("window", ["full", "causal", "multiseq2"])
-@pytest.mark.parametrize("side", ["low", "kv_max", "kv_max+1"])
-@pytest.mark.parametrize("queries", [66, 128, 302, 1024])
+@pytest.mark.parametrize("side", ["low", "kv_max", "above"])
+@pytest.mark.parametrize(
+    "queries", sorted({q for counts in _BUCKET_QUERIES.values() for q in counts})
+)
 def test_dense_stage_bucket_program_is_bitwise_to_the_default(
     queries, side, window, monkeypatch
 ):
     """On the device's SM count, every stage bucket of a served route on the device's architecture: the shipped
     catalog's plan launches the bucket's programs for ``K <= kv_max`` and the route's own above; the bucket's
-    programs forced over every K and the route's own (the bucket removed) compute bitwise-identical in-window
-    logits and ScheduleMeta words, each arm on caller-owned output and metadata poisoned differently, at the
-    route's smallest served K, at ``kv_max`` and at ``kv_max + 1``."""
+    programs forced over every K and the route's own (the bucket removed) compute bitwise-identical logits (the
+    in-window cells of a ``raw`` route, every cell of a ``fused`` one) and ScheduleMeta words, each arm on
+    caller-owned output and metadata poisoned differently, at the route's smallest served K, at ``kv_max`` and at
+    the next served K above it -- on every route :data:`_BUCKET_QUERIES` lists the query count for."""
     _skip_unless_exported()
     arch = _runtime.device_arch(torch.device("cuda"))
     shipped = _runtime._catalog()
@@ -1256,36 +1515,56 @@ def test_dense_stage_bucket_program_is_bitwise_to_the_default(
     ]
     if not pairs:
         pytest.skip(f"no stage bucket on {arch}")
+    assert {route for route, _entry in pairs} <= set(_BUCKET_QUERIES), pairs
+    listed = {route for route, _entry in pairs if queries in _BUCKET_QUERIES[route]}
+    if not listed:
+        pytest.skip(
+            f"Q = {queries} is listed for no route with a stage bucket on {arch}"
+        )
     sms = _runtime.device_facts(torch.cuda.current_device())[1]
     gate = shipped["policy"]["dense_kvsplit"]
-    checked = 0
+    checked = set()
     for route, entry in pairs:
+        if route not in listed:
+            continue
         record = shipped["routes"][route]
+        precision = route.split(":")[0]
         heads, bq = int(record["num_heads"]), int(record["block_q"])
+        align = int(record["kv_alignment"][arch])
         bound = int(entry["kv_max"])
         blocks = (queries + bq - 1) // bq
-        low = 1 + int(
-            gate["min_kv"]
-            if blocks < int(gate["sm_count"][arch])
-            else gate["fullgrid_min_kv"]
-        )
-        keys = {"low": low, "kv_max": bound, "kv_max+1": bound + 1}[side]
-        if _runtime.served_route("fp8", queries, keys, heads, arch=arch) != route:
-            continue
-        assert record["clean_logits"] == "raw", route
+        if route.endswith(":kvsplit"):
+            low = 1 + int(
+                gate["min_kv"]
+                if blocks < int(gate["sm_count"][arch])
+                else gate["fullgrid_min_kv"]
+            )
+        else:
+            low = -(-int(record["kv_min"]) // align) * align
+            while (
+                low < bound
+                and _runtime.served_route(precision, queries, low, heads, arch=arch)
+                != route
+            ):
+                low += align
+        keys = {"low": low, "kv_max": bound, "above": bound + align}[side]
+        served_route = _runtime.served_route(precision, queries, keys, heads, arch=arch)
+        assert served_route == route, (route, queries, keys, served_route)
+        assert record["clean_logits"] in ("raw", "fused"), route
         bucket = [program for _stage, program in entry["stages"]]
         default = [_runtime.stage_program(stage, arch) for stage in record["stages"]]
-        torch.manual_seed(7)
-        q = torch.randn(queries, heads, 128, device="cuda").to(torch.float8_e4m3fn)
-        kv = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
-        scales = (torch.rand(_runtime.align4(keys), device="cuda") + 0.5)[:keys]
-        weights = torch.randn(queries, heads, device="cuda")
+        q, kv, scales, weights = _bucket_inputs(precision, queries, keys, heads)
         starts, ends = _bucket_window(window, queries, keys)
         monkeypatch.setattr(_runtime, "_catalog", functools.cache(lambda: shipped))
         served = _runtime.DenseMqaPlan(
-            "fp8", q, kv, weights, starts, ends, kv_scales=scales
+            precision, q, kv, weights, starts, ends, **scales
         )
-        assert served.program_names == (bucket if keys <= bound else default), (
+        selected = _first_stages(
+            record, shipped["routes"][route]["stage_buckets"][arch], keys, queries
+        )
+        assert served.program_names == [
+            _runtime.stage_program(stage, arch) for stage in selected
+        ], (
             route,
             keys,
             served.program_names,
@@ -1297,6 +1576,8 @@ def test_dense_stage_bucket_program_is_bitwise_to_the_default(
         plain = copy.deepcopy(shipped)
         del plain["routes"][route]["stage_buckets"]
         words = _runtime.metadata_words(queries, sms, heads)
+        # the FP4 programs address the padded query rows of the final tile
+        rows = blocks * bq if precision == "fp4" else queries
         arms = {}
         for arm, catalog, expected, poison in (
             ("forced", forced, bucket, (0x7FC00001, -1)),
@@ -1305,23 +1586,24 @@ def test_dense_stage_bucket_program_is_bitwise_to_the_default(
             monkeypatch.setattr(
                 _runtime, "_catalog", functools.cache(lambda catalog=catalog: catalog)
             )
-            output = torch.empty(
-                (queries, _runtime.logits_stride(keys)),
+            backing = torch.empty(
+                (rows, _runtime.logits_stride(keys)),
                 dtype=torch.float32,
                 device="cuda",
             )
-            output.view(torch.int32).fill_(poison[0])
+            backing.view(torch.int32).fill_(poison[0])
+            output = backing[:queries]
             metadata = torch.full((words,), poison[1], dtype=torch.int32, device="cuda")
             plan = _runtime.DenseMqaPlan(
-                "fp8",
+                precision,
                 q,
                 kv,
                 weights,
                 starts,
                 ends,
-                kv_scales=scales,
                 output=output,
                 metadata=metadata,
+                **scales,
             )
             assert plan.route_name == route and plan.program_names == expected, (
                 arm,
@@ -1336,12 +1618,14 @@ def test_dense_stage_bucket_program_is_bitwise_to_the_default(
         )
         position = torch.arange(keys, device="cuda")[None, :]
         inside = (position >= starts[:, None]) & (position < ends[:, None])
+        if record["clean_logits"] == "fused":
+            inside = torch.ones_like(inside)
         assert torch.equal(forced_out[inside], plain_out[inside]), (route, keys, window)
         span = (3 * sms + 1) // 2 * 2
         assert torch.equal(forced_meta[: 3 * sms], plain_meta[: 3 * sms]), route
         assert torch.equal(forced_meta[span:], plain_meta[span:]), route
-        checked += 1
-    assert checked >= 1, (queries, side, window)
+        checked.add(route)
+    assert checked == listed, (queries, side, window, checked, listed)
 
 
 _LADDER = re.compile(
@@ -1529,18 +1813,42 @@ _CALL_KEYS = ("arg_plan", "compile_flags", "ffi_entry", "kind", "role", "standal
 _ROUTE_KEYS = ("num_heads", "block_q", "clean_logits", "kv_min", "kv_alignment")
 _BUCKET_ROUTE = "fp8:h64:full:qle2048:kvsplit"
 _BUCKET_TWIN = "fp8:h64:partial:qle2048:kvsplit"
+_SELF_BUCKET_ROUTE = "fp8:h64:partial:qle128:kvsplit"
+_SHORT_BUCKET_ROUTE = "fp4:le32:short"
+
+
+def _first_stages(record, entries, keys, queries):
+    """The stages the bucket rule selects: the first entry with ``keys <= kv_max`` whose ``max_queries`` (if any) the
+    query count ``queries`` (``None``: not given, which no ``max_queries`` entry admits) is at most; else the
+    record's ``stages``."""
+    for entry in entries:
+        cap = entry.get("max_queries")
+        if keys <= entry["kv_max"] and (
+            cap is None or (queries is not None and queries <= cap)
+        ):
+            return entry["stages"]
+    return record["stages"]
 
 
 def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
     """Host-only: a route record's ``stage_buckets`` (``{arch: [{"kv_max": K, "stages": [[stage, program],
     ...]}]}``) sits only on a ``:kvsplit`` route of the full kind whose partial-kind twin is catalogued and agrees on
-    the route keys; each entry keeps the record's stage names and names, per stage, the twin's program on that
-    architecture -- not the record's own -- with the same host call; ``route_stages`` launches the first entry with
-    ``K <= kv_max`` and the record's ``stages`` otherwise.  The shipped bucket splits
-    ``fp8:h64:full:qle2048:kvsplit`` on sm_103a at K = 8192, served on both sides; sm_100a is unchanged; a withheld
-    route falls back to a route without buckets."""
+    the route keys, or on a route that is its own bucket home (a ``:kvsplit`` route of the partial kind, a ``:short``
+    route); each entry keeps the record's stage names and names, per stage, the twin's program on that architecture
+    (a self-homed route: a program of its own) -- not the record's own -- with the same host call; ``route_stages``
+    launches the first entry with ``K <= kv_max`` (and, where it spells ``max_queries``, at most that many queries)
+    and the record's ``stages`` otherwise.  The shipped buckets split ``fp8:h64:full:qle2048:kvsplit`` on sm_103a at
+    K = 8192, ``fp8:h64:partial:qle128:kvsplit`` on sm_100a at K = 8192 and ``fp4:le32:short`` on sm_100a at
+    K = 4096 and, for at most 36 queries, at K = 32768, served on both sides; the other architecture is unchanged; a
+    withheld route falls back to a route without buckets."""
     catalog = _runtime._catalog()
     routes, programs, arches = catalog["routes"], catalog["programs"], catalog["arches"]
+    staged = {
+        p
+        for rec in routes.values()
+        for stage in rec["stages"]
+        for p in _runtime.stage_programs(stage, arches).values()
+    }
     seen = 0
     for r, rec in routes.items():
         buckets = rec.get("stage_buckets")
@@ -1550,8 +1858,11 @@ def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
                     assert _runtime.route_stages(rec, a, k) is rec["stages"], (r, a, k)
             continue
         seen += 1
-        assert r.endswith(":kvsplit") and ":full:" in r, r
-        h = r.replace(":full:", ":partial:")
+        kvsplit = r.endswith(":kvsplit") and (":full:" in r or ":partial:" in r)
+        assert kvsplit or r.endswith(":short"), r
+        # a full-kind KV-split route's bucket names its partial-kind twin's program; a partial-kind KV-split route's
+        # and a ``:short`` route's, one of its own
+        h = r.replace(":full:", ":partial:") if kvsplit else r
         assert h in routes, r
         assert all(rec[k] == routes[h][k] for k in _ROUTE_KEYS), r
         assert not rec.get("sequence"), r
@@ -1569,25 +1880,45 @@ def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
                 for b in bounds
             ), (r, a)
             assert bounds == sorted(set(bounds)), (r, a)
-            for i, entry in enumerate(entries):
-                assert set(entry) == {"kv_max", "stages"}, (r, a)
+            for entry in entries:
+                assert set(entry) in (
+                    {"kv_max", "stages"},
+                    {"kv_max", "max_queries", "stages"},
+                ), (r, a)
+                cap = entry.get("max_queries")
+                assert cap is None or (
+                    isinstance(cap, int) and not isinstance(cap, bool) and cap >= 1
+                ), (r, a)
                 assert [stage for stage, _p in entry["stages"]] == stage_names, (r, a)
                 for n, (_stage, p) in enumerate(entry["stages"]):
                     default = _runtime.stage_program(rec["stages"][n], a)
                     twin_p = _runtime.stage_program(routes[h]["stages"][n], a)
                     assert isinstance(p, str), (r, a, p)
-                    assert p == twin_p, (r, a, p)
+                    if h != r:
+                        assert p == twin_p, (r, a, p)
+                    else:
+                        assert p not in staged, (r, a, p)
                     assert p != default and p in programs, (r, a, p)
                     assert a in programs[p]["arches"], (r, a, p)
                     assert all(
                         programs[p][k] == programs[default][k] for k in _CALL_KEYS
                     ), (r, a, p)
                 bound = entry["kv_max"]
-                assert _runtime.route_stages(rec, a, bound) is entry["stages"]
-                after = (
-                    entries[i + 1]["stages"] if i + 1 < len(entries) else rec["stages"]
+                inside = cap if cap is not None else 1
+                assert _runtime.route_stages(rec, a, bound, inside) is _first_stages(
+                    rec, entries, bound, inside
                 )
-                assert _runtime.route_stages(rec, a, bound + 1) is after
+                assert _runtime.route_stages(
+                    rec, a, bound + 1, inside
+                ) is _first_stages(rec, entries, bound + 1, inside)
+                if cap is not None:
+                    # one query more than the bound passes the entry by, as does a call without a query count
+                    assert _runtime.route_stages(
+                        rec, a, bound, cap + 1
+                    ) is _first_stages(rec, entries, bound, cap + 1)
+                    assert _runtime.route_stages(rec, a, bound) is _first_stages(
+                        rec, entries, bound, None
+                    )
     assert seen >= 1
 
     # the shipped bucket: K <= 8192 of the full-kind qle2048 KV-split route on sm_103a launches the twin's program
@@ -1621,6 +1952,59 @@ def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
             assert selected == [default_100], (queries, keys)
     assert _runtime.program_names(_BUCKET_ROUTE, "sm_103a") == [default_103, twin]
     assert _runtime.program_names(_BUCKET_ROUTE, "sm_100a") == [default_100]
+
+    # the shipped partial-kind bucket: K <= 8192 of the qle128 KV-split route on sm_100a launches its own program
+    rec = routes[_SELF_BUCKET_ROUTE]
+    default_100 = _runtime.stage_program(rec["stages"][0], "sm_100a")
+    default_103 = _runtime.stage_program(rec["stages"][0], "sm_103a")
+    (own,) = [p for _s, p in rec["stage_buckets"]["sm_100a"][0]["stages"]]
+    assert rec["stage_buckets"] == {
+        "sm_100a": [{"kv_max": 8192, "stages": [["logits", own]]}]
+    }
+    for queries in (3, 37, 63):
+        for keys in (257, 4137, 8192, 8193, 131114):
+            for arch, expected in (
+                ("sm_100a", [own] if keys <= 8192 else [default_100]),
+                ("sm_103a", [default_103]),
+            ):
+                route = _runtime.served_route("fp8", queries, keys, 64, arch=arch)
+                assert route == _SELF_BUCKET_ROUTE, (queries, keys, arch, route)
+                selected = [
+                    _runtime.stage_program(stage, arch)
+                    for stage in _runtime.route_stages(rec, arch, keys)
+                ]
+                assert selected == expected, (queries, keys, arch)
+    assert _runtime.program_names(_SELF_BUCKET_ROUTE, "sm_100a") == [default_100, own]
+    assert _runtime.program_names(_SELF_BUCKET_ROUTE, "sm_103a") == [default_103]
+
+    # the shipped :short buckets: K <= 4096 of the FP4 le32 scan route on sm_100a, and K <= 32768 for at most 36
+    # queries, launch its own program
+    rec = routes[_SHORT_BUCKET_ROUTE]
+    default_100 = _runtime.stage_program(rec["stages"][0], "sm_100a")
+    default_103 = _runtime.stage_program(rec["stages"][0], "sm_103a")
+    (own,) = [p for _s, p in rec["stage_buckets"]["sm_100a"][0]["stages"]]
+    assert rec["stage_buckets"] == {
+        "sm_100a": [
+            {"kv_max": 4096, "stages": [["logits", own]]},
+            {"kv_max": 32768, "max_queries": 36, "stages": [["logits", own]]},
+        ]
+    }
+    for queries in (7, 16, 33, 36, 37, 128):
+        for keys in (256, 2048, 4096, 4352, 8192, 32768, 33024, 131072):
+            bucketed = keys <= 4096 or (queries <= 36 and keys <= 32768)
+            for arch, expected in (
+                ("sm_100a", [own] if bucketed else [default_100]),
+                ("sm_103a", [default_103]),
+            ):
+                route = _runtime.served_route("fp4", queries, keys, 32, arch=arch)
+                assert route == _SHORT_BUCKET_ROUTE, (queries, keys, arch, route)
+                selected = [
+                    _runtime.stage_program(stage, arch)
+                    for stage in _runtime.route_stages(rec, arch, keys, queries)
+                ]
+                assert selected == expected, (queries, keys, arch)
+    assert _runtime.program_names(_SHORT_BUCKET_ROUTE, "sm_100a") == [default_100, own]
+    assert _runtime.program_names(_SHORT_BUCKET_ROUTE, "sm_103a") == [default_103]
 
     # a withheld route falls back to a grid-stride route, which carries no bucket
     withheld = copy.deepcopy(catalog)
@@ -1882,11 +2266,17 @@ def _route_point(route_name, record):
         table = policy if precision == "fp8" else policy["fp4"]
         bounds = [int(table["fused_q1_max_kv"])]
         for ceiling in table["fused_scan_ceilings"]:
-            bounds.append(int(table[f"fused_scan{int(ceiling)}_max_kv"]))
+            value = table[f"fused_scan{int(ceiling)}_max_kv"]
+            bounds.extend(
+                int(v) for v in (value.values() if isinstance(value, dict) else [value])
+            )
         if precision == "fp8":
             bounds.append(int(policy["fused_q128_max_kv"]))
             bounds.append(int(policy["fused_qle128_max_kv"]))
             bounds.extend(int(v) for v in policy["fused_qle2048_max_kv"].values())
+            bounds.extend(
+                int(v) for v in policy["fused_qle2048_small_q_max_kv"].values()
+            )
         candidates = [512] + sorted({bound + 256 for bound in bounds})
     elif route_name.endswith(":short"):
         # the 64-head one-split routes at K <= dense_short.max_kv

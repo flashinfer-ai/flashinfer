@@ -146,7 +146,7 @@ SM100_FAMILY_ROUTES = [
     (8, 2864, 4096, False, None),
     (2, 2048, 3072, False, None),
     (7, 4112, 2056, False, None),
-    (8, 4096, 6208, False, None),
+    (8, 3072, 6152, False, None),
     (4, 2880, 2880, True, None),
     (8, 4096, 4096, True, None),
     # PACKED with a bias on 9 to 16 rows: from 2880 output features and K 2112
@@ -273,8 +273,7 @@ SM100_NARROW_ROUTES = [
 # multiple of 64 and PACKED_BOX8 on the others; PACKED_M64_N8 in its three other
 # windows (corners and inside points).  The shapes just past each edge, off a
 # multiple of 64 where a window needs one, on 9 rows or with a bias go to the next
-# window or keep their kernels; 8 rows at 3584 to 4608 output features from an input
-# of 6152 keep the reference, and the other 8-row shapes outside the 8192 and 12288
+# window or keep their kernels; the other 8-row shapes outside the 8192 and 12288
 # windows keep their kernels or go to the last windows, listed below.
 SM100_BOX8_M64_N8_ROUTES = [
     (1, 4480, 2048, False, "PACKED_BOX8"),
@@ -290,8 +289,8 @@ SM100_BOX8_M64_N8_ROUTES = [
     (3, 4096, 6144, False, "PACKED"),
     (3, 3568, 7168, False, "PACKED_M64_N8"),
     (3, 3584, 8256, False, None),
-    (8, 4096, 7168, False, None),
-    (8, 4608, 8192, False, None),
+    (8, 4096, 7168, False, "PACKED_BOX8"),
+    (8, 4608, 8192, False, "PACKED_BOX8"),
     (8, 8192, 2048, False, "PACKED_M64_N8"),
     (8, 8192, 8192, False, "PACKED_M64_N8"),
     (1, 8192, 2112, False, "PACKED_M64_N8"),
@@ -316,7 +315,7 @@ SM100_BOX8_M64_N8_ROUTES = [
     (2, 7680, 8256, False, None),
     (5, 6992, 7168, False, None),
     (8, 4480, 2048, False, "PACKED_M64_N8"),
-    (8, 4608, 6152, False, None),
+    (8, 4608, 6152, False, "PACKED_BOX8"),
     (8, 10000, 3000, False, None),
     (8, 8208, 4104, False, None),
     (8, 16384, 6152, False, None),
@@ -339,10 +338,10 @@ SM100_BOX8_M64_N8_ROUTES = [
 # PACKED_M64_N8 on 8 rows at inputs that are a multiple of 64 (4480 to 7167 output
 # features at inputs of 2048 to 4352 and 5632 to 6144, 7168 to 16384 at 2048 to 6144,
 # 7168 to 9216 above 6152 up to 8192), PACKED on 9 to 16 rows from 4224 output
-# features, PACKED_BOX8 at 4112 to 4464, and PACKED_M64_N8 and PACKED_BOX8 in the
-# windows past those.  Corners, inside points and inputs that are not a multiple of 64;
-# the shapes just past an edge, on other row counts or with a bias go to another window
-# or keep their kernels.
+# features, PACKED_BOX8 at 4112 to 4464, and PACKED_M64_N8, PACKED_BOX8 and PACKED in
+# the windows past those.  Corners, inside points and inputs that are not a multiple of
+# 64; the shapes just past an edge, on other row counts or with a bias go to another
+# window or keep their kernels.
 SM100_LAST_WINDOWS_ROUTES = [
     # 8 rows at 4480 to 7167 output features, inputs of 2048 to 4352 and 5632 to 6144
     (8, 4480, 2112, False, "PACKED_M64_N8"),
@@ -385,7 +384,6 @@ SM100_LAST_WINDOWS_ROUTES = [
     (16, 16384, 12288, False, "PACKED"),
     (12, 8192, 6152, False, "PACKED"),
     (16, 10240, 3080, False, "PACKED"),
-    (9, 4208, 4096, False, None),
     (16, 16400, 4096, False, None),
     (9, 6144, 12296, False, None),
     (9, 6144, 2040, False, None),
@@ -399,7 +397,6 @@ SM100_LAST_WINDOWS_ROUTES = [
     (7, 4464, 6144, False, "PACKED_BOX8"),
     (4, 4288, 4096, False, "PACKED_BOX8"),
     (4, 4288, 4104, False, None),
-    (8, 4464, 6152, False, None),
     (8, 4096, 5120, False, "PACKED"),
     (9, 4288, 4096, False, "PACKED"),
     (8, 4288, 4104, True, None),
@@ -407,7 +404,6 @@ SM100_LAST_WINDOWS_ROUTES = [
     (1, 9216, 2048, False, "PACKED_M64_N8"),
     (7, 16384, 4096, False, "PACKED_M64_N8"),
     (4, 12288, 3072, False, "PACKED_M64_N8"),
-    (1, 9200, 2048, False, None),
     (7, 16400, 4096, False, None),
     (4, 12288, 4160, False, None),
     (4, 12288, 3080, False, None),
@@ -477,6 +473,58 @@ SM100_LAST_WINDOWS_ROUTES = [
     (8, 14336, 6152, False, None),
     (8, 14336, 2040, False, None),
     (8, 14336, 4104, True, None),
+    # 8 rows at 4480 to 4608 output features and inputs of 2048 to 8192 that the
+    # PACKED_M64_N8 windows above do not take
+    (8, 4480, 2056, False, "PACKED_BOX8"),
+    (8, 4608, 2056, False, "PACKED_BOX8"),
+    (8, 4480, 8192, False, "PACKED_BOX8"),
+    (8, 4544, 4800, False, "PACKED_BOX8"),
+    (8, 4544, 4104, False, "PACKED_BOX8"),
+    (8, 4496, 7688, False, "PACKED_BOX8"),
+    (8, 4592, 6144, False, "PACKED_M64_N8"),
+    (8, 4624, 7168, False, None),
+    (8, 4480, 8200, False, None),
+    (8, 4480, 2040, False, None),
+    (9, 4544, 4800, False, "PACKED"),
+    (7, 4544, 4800, False, "PACKED_BOX8"),
+    (8, 4544, 4800, True, None),
+    # 8 rows at 3584 to 4479 output features and inputs of 6152 to 8192
+    (8, 3584, 6152, False, "PACKED_BOX8"),
+    (8, 4464, 8192, False, "PACKED_BOX8"),
+    (8, 3584, 8192, False, "PACKED_BOX8"),
+    (8, 4464, 6152, False, "PACKED_BOX8"),
+    (8, 3840, 7176, False, "PACKED_BOX8"),
+    (8, 4224, 6400, False, "PACKED_BOX8"),
+    (8, 3568, 7176, False, None),
+    (8, 4096, 8200, False, None),
+    (8, 4096, 6144, False, "PACKED"),
+    (9, 4096, 7168, False, None),
+    (7, 4096, 7168, False, "PACKED_BOX8"),
+    (8, 4096, 7168, True, None),
+    # 1 to 7 rows at 8193 to 9215 output features and inputs of 2048 to 4096 that are
+    # a multiple of 64
+    (1, 8208, 2048, False, "PACKED_M64_N8"),
+    (7, 9200, 4096, False, "PACKED_M64_N8"),
+    (1, 9200, 2048, False, "PACKED_M64_N8"),
+    (7, 8208, 4096, False, "PACKED_M64_N8"),
+    (4, 8704, 3072, False, "PACKED_M64_N8"),
+    (4, 8704, 3080, False, None),
+    (4, 8704, 4160, False, None),
+    (4, 8704, 2040, False, None),
+    (8, 8704, 3072, False, "PACKED_M64_N8"),
+    (4, 8704, 3072, True, None),
+    # PACKED on 9 to 16 rows at 4097 to 4223 output features and inputs of 2048 to 12288
+    (9, 4112, 2048, False, "PACKED"),
+    (16, 4208, 12288, False, "PACKED"),
+    (16, 4112, 12288, False, "PACKED"),
+    (9, 4208, 4096, False, "PACKED"),
+    (12, 4160, 7176, False, "PACKED"),
+    (9, 4096, 8192, False, None),
+    (9, 4160, 12296, False, None),
+    (16, 4160, 2040, False, None),
+    (17, 4160, 4096, False, None),
+    (8, 4160, 4096, False, "PACKED_BOX8"),
+    (12, 4160, 4096, True, None),
 ]
 # sm_103a, rows without a bias from 3584 output features: PACKED_BOX8 on 8 rows at
 # 4480 to 4608 output features and inputs of 2048 to 12288; at 8192 output features
@@ -865,7 +913,7 @@ SM107_ROUTES = [
     (8, 3584, 2040, False, None),
     (8, 4096, 2056, False, "PACKED_BOX8"),
     (7, 8192, 2048, False, None),
-    (9, 8192, 2048, False, None),
+    (9, 8192, 2048, False, "PACKED"),
     (8, 4096, 2048, True, None),
     (8, 7168, 2112, False, "PACKED_M64_N8"),
     (8, 7168, 8192, False, "PACKED_M64_N8"),
@@ -891,7 +939,7 @@ SM107_ROUTES = [
     (8, 4624, 4096, False, "PACKED_M64_N8"),
     (8, 4096, 8256, False, None),
     (7, 4096, 4160, False, None),
-    (9, 4608, 4160, False, None),
+    (9, 4608, 4160, False, "PACKED"),
     (8, 4096, 2112, False, "PACKED_BOX8"),
     (8, 5120, 2560, False, "PACKED_BOX8"),
     (8, 4608, 2120, False, "PACKED_BOX8"),
@@ -947,7 +995,7 @@ SM107_ROUTES = [
 # to 6144 that are a multiple of 64 (corners and inside points).  The tests
 # count 148 SMs, where PACKED_BOX8's one-wave windows end at 4736 output features.
 # The shapes just past each edge, off a multiple of 64 where a window needs one, on
-# other rows or with a bias go to the earlier windows or keep their kernels.
+# other rows or with a bias go to another window or keep their kernels.
 SM107_BOX8_M64_ROUTES = [
     (8, 4112, 2624, False, "PACKED_M64_N8"),
     (8, 6128, 8192, False, "PACKED_M64_N8"),
@@ -956,7 +1004,7 @@ SM107_BOX8_M64_ROUTES = [
     (8, 6128, 8256, False, None),
     (8, 4096, 3008, False, "PACKED"),
     (8, 6144, 4096, False, "PACKED_M64_N8"),
-    (9, 5120, 5120, False, None),
+    (9, 5120, 5120, False, "PACKED"),
     (8, 5120, 5120, True, None),
     (8, 6144, 2624, False, "PACKED_M64_N8"),
     (8, 6784, 3008, False, "PACKED_M64_N8"),
@@ -976,7 +1024,7 @@ SM107_BOX8_M64_ROUTES = [
     (8, 6784, 8184, False, None),
     (8, 4096, 8200, False, None),
     (8, 3568, 7000, False, None),
-    (9, 4608, 5000, False, None),
+    (9, 4608, 5000, False, "PACKED"),
     (8, 4608, 5000, True, None),
     (4, 4112, 3072, False, "PACKED_M64_N4"),
     (4, 6144, 6144, False, "PACKED_M64_N4"),
@@ -1002,10 +1050,12 @@ SM107_BOX8_M64_ROUTES = [
 # PACKED_M64_N8 on 8 rows above 6784 and up to 7167 output features at inputs of 2112
 # to 2304 that are a multiple of 64, on 6 and 7 rows at 4096 output features and an
 # input of 2048, and on 8 rows above 6784 and up to 7056 output features at inputs of
-# 7169 to 8184 that are not a multiple of 64.  Corners, inside points and inputs that
-# are not a multiple of 64; the shapes just past an edge, at inputs a window does not
-# take, on other row counts or with a bias go to an earlier window or keep their
-# kernels.
+# 7169 to 8184 that are not a multiple of 64; then PACKED on 9 to 16 rows at 4097 to
+# 16384 output features and inputs of 1024 to 16384, except above 6784 output features
+# at inputs above 12288, where PACKED_M64_N16 serves them.  Corners, inside points,
+# the edges between windows and inputs that are not a multiple of 64; the shapes just
+# past an edge, at inputs a window does not take, on other row counts or with a bias
+# go to another window or keep their kernels.
 SM107_LAST_WINDOWS_ROUTES = [
     # 8 rows, 6785 to 7167 output features, inputs of 2112 to 2304
     (8, 6800, 2112, False, "PACKED_M64_N8"),
@@ -1017,7 +1067,7 @@ SM107_LAST_WINDOWS_ROUTES = [
     (8, 7152, 2368, False, None),
     (8, 6976, 2120, False, None),
     (7, 6976, 2176, False, None),
-    (9, 6976, 2176, False, None),
+    (9, 6976, 2176, False, "PACKED"),
     (8, 6976, 2176, True, None),
     # 6 and 7 rows, 4096 output features, an input of 2048
     (6, 4096, 2048, False, "PACKED_M64_N8"),
@@ -1041,8 +1091,43 @@ SM107_LAST_WINDOWS_ROUTES = [
     (8, 6800, 7160, False, None),
     (8, 6912, 8200, False, None),
     (7, 6912, 7432, False, None),
-    (9, 6912, 7432, False, None),
+    (9, 6912, 7432, False, "PACKED"),
     (8, 6912, 7432, True, None),
+    # 9 to 16 rows, 4097 to 16384 output features, inputs of 1024 to 16384
+    (9, 4112, 1024, False, "PACKED"),
+    (16, 6784, 16384, False, "PACKED"),
+    (9, 6784, 16384, False, "PACKED"),
+    (16, 4112, 1024, False, "PACKED"),
+    (12, 5120, 7176, False, "PACKED"),
+    (13, 6144, 12296, False, "PACKED"),
+    (9, 6800, 1024, False, "PACKED"),
+    (16, 16384, 12288, False, "PACKED"),
+    (16, 6800, 12288, False, "PACKED"),
+    (9, 16384, 1024, False, "PACKED"),
+    (11, 12288, 4104, False, "PACKED"),
+    (14, 8192, 8192, False, "PACKED"),
+    (10, 9216, 12280, False, "PACKED"),
+    (9, 6800, 12296, False, "PACKED_M64_N16"),
+    (16, 16384, 16384, False, "PACKED_M64_N16"),
+    (16, 6800, 16384, False, "PACKED_M64_N16"),
+    (9, 16384, 12296, False, "PACKED_M64_N16"),
+    (10, 10240, 14344, False, "PACKED_M64_N16"),
+    (15, 7168, 16384, False, "PACKED_M64_N16"),
+    (12, 6784, 12296, False, "PACKED"),
+    (12, 8192, 12288, False, "PACKED"),
+    (12, 4096, 4096, False, "PACKED"),
+    (12, 4096, 12288, False, None),
+    (12, 16400, 8192, False, None),
+    (12, 16400, 16384, False, None),
+    (12, 6784, 1016, False, None),
+    (12, 12288, 1016, False, None),
+    (12, 6784, 16392, False, None),
+    (12, 12288, 16392, False, None),
+    (8, 8192, 8192, False, "PACKED_M64_N8"),
+    (17, 8192, 8192, False, None),
+    (17, 12288, 16384, False, None),
+    (12, 8192, 8192, True, None),
+    (12, 12288, 16384, True, None),
 ]
 ROUTES = (
     [
@@ -1082,19 +1167,57 @@ def test_tinygemm2_tcgen05_windows(
 
     monkeypatch.setattr(routergemm, "get_compute_capability", lambda _: capability)
     monkeypatch.setattr(routergemm, "_multiprocessor_count", lambda _: 148)
+    # The routes do not depend on the toolkit: take the CUDA 13.4 side of the
+    # sm_107a check, and clear the cached enable check around the case.
+    monkeypatch.setattr(routergemm, "is_cuda_version_at_least", lambda _: True)
     monkeypatch.delenv("FLASHINFER_DISABLE_TINYGEMM2_TCGEN05", raising=False)
     input = torch.empty(batch_size, input_features, dtype=torch.bfloat16)
     weight = torch.empty(output_features, input_features, dtype=torch.bfloat16)
     out = torch.empty(batch_size, output_features, dtype=torch.bfloat16)
-    program = routergemm._tinygemm2_tcgen05_program(
-        input, weight, out, has_bias, use_pdl
-    )
+    enabled = routergemm._tinygemm2_tcgen05_enabled
+    enabled.cache_clear()
+    try:
+        program = routergemm._tinygemm2_tcgen05_program(
+            input, weight, out, has_bias, use_pdl
+        )
+    finally:
+        enabled.cache_clear()
     expected = (
         None
         if tile is None
         else tile + ("" if has_bias else "_NOBIAS") + ("_PDL" if use_pdl else "")
     )
     assert program == expected
+
+
+def test_tinygemm2_tcgen05_sm107_needs_cuda_13_4(monkeypatch):
+    """On SM107 the generated programs serve a call only with CUDA 13.4 or later;
+    older toolkits keep the reference kernel."""
+    import flashinfer.gemm.routergemm as routergemm
+
+    monkeypatch.setattr(routergemm, "get_compute_capability", lambda _: (10, 7))
+    monkeypatch.setattr(routergemm, "_multiprocessor_count", lambda _: 212)
+    input = torch.empty(9, 2048, dtype=torch.bfloat16)
+    weight = torch.empty(4224, 2048, dtype=torch.bfloat16)
+    out = torch.empty(9, 4224, dtype=torch.bfloat16)
+    # The enable check is cached per (escape hatch, capability): clear it around
+    # each patched toolkit version and after the test.
+    enabled = routergemm._tinygemm2_tcgen05_enabled
+    try:
+        monkeypatch.setattr(routergemm, "is_cuda_version_at_least", lambda _: True)
+        enabled.cache_clear()
+        assert (
+            routergemm._tinygemm2_tcgen05_program(input, weight, out, False, False)
+            == "PACKED_NOBIAS"
+        )
+        monkeypatch.setattr(routergemm, "is_cuda_version_at_least", lambda _: False)
+        enabled.cache_clear()
+        assert (
+            routergemm._tinygemm2_tcgen05_program(input, weight, out, False, False)
+            is None
+        )
+    finally:
+        enabled.cache_clear()
 
 
 def test_tinygemm2_tcgen05_disabled_and_unaligned(monkeypatch):

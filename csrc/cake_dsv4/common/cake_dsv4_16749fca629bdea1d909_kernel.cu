@@ -329,6 +329,16 @@ kernel_cake_dsv4_16749fca629bdea1d909(const __grid_constant__ CUtensorMap tmap_q
     const int smem_indices_addr = smem + 197888;
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&tmap_q))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&tmap_swa_kv))) : "memory");
+#if __CUDA_ARCH__ == 1030
+    if (warp >= 12 && warp <= 15) {
+        int prefetch_offset = (warp - 12) * 16 + lane % 16 + lane / 16 * 64;
+        if (prefetch_offset < sparse_topk) {
+            int prefetch_query = (blockIdx.x >> 2) / num_head_tiles;
+            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(swa_indices + (prefetch_query * swa_index_stride) + prefetch_offset)));
+        }
+    }
+#else
+#endif
 
     // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 16 barriers)
     // Mbarriers at smem_raw[0..128)
@@ -1436,7 +1446,18 @@ kernel_cake_dsv4_16749fca629bdea1d909(const __grid_constant__ CUtensorMap tmap_q
             int index_offset = load_warp_rank * 16 + lane % 16 + lane / 16 * 64;
             int sparse_row = -1;
             if (index_offset < sparse_topk) {
+#if __CUDA_ARCH__ == 1030
+                int index_word[1];
+                {
+                    uint32_t _scalar_bits_0;
+                    asm volatile("ld.global.nc.b32 %0, [%1];"
+                        : "=r"(_scalar_bits_0) : "l"((const void*)(row_ptr + index_offset + (0))));
+                    index_word[0] = (int32_t)_scalar_bits_0;
+                }
+                sparse_row = index_word[0];
+#else
                 sparse_row = row_ptr[index_offset];
+#endif
             }
             if (load_warp_rank == 0) {
                 if (elect_sync()) {
@@ -1453,13 +1474,23 @@ kernel_cake_dsv4_16749fca629bdea1d909(const __grid_constant__ CUtensorMap tmap_q
             unsigned int invalid_hi = invalid_indices >> 16;
             int valid_prefix_lo = 16;
             if (invalid_lo != 0) {
+#if __CUDA_ARCH__ == 1030
+                int _find_first_set_1 = __ffs(invalid_lo);
+                valid_prefix_lo = _find_first_set_1 - 1;
+#else
                 int _find_first_set_0 = __ffs(invalid_lo);
                 valid_prefix_lo = _find_first_set_0 - 1;
+#endif
             }
             int valid_prefix_hi = 16;
             if (invalid_hi != 0) {
+#if __CUDA_ARCH__ == 1030
+                int _find_first_set_2 = __ffs(invalid_hi);
+                valid_prefix_hi = _find_first_set_2 - 1;
+#else
                 int _find_first_set_1 = __ffs(invalid_hi);
                 valid_prefix_hi = _find_first_set_1 - 1;
+#endif
             }
             if (elect_sync()) {
                 smem_index_flags[load_warp_rank] = valid_prefix_lo;

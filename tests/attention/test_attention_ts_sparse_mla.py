@@ -1293,7 +1293,18 @@ def test_softmax_rescale_threshold_log2_rejected(dtype, threshold):
     "heads,precision,rows,topk",
     [(h, "nvfp4", 160, 513) for h in (8, 12, 16, 32, 64, 128)]
     + [(16, "nvfp4", 4, 2049), (32, "nvfp4", 32, 513)]
-    + [(h, p, 160, 513) for h in (64, 128) for p in ("fp8", "bf16")],
+    + [(h, p, 160, 513) for h in (64, 128) for p in ("fp8", "bf16")]
+    # D576 FP8 head counts between qualified schedules run the next count's
+    # Q tile with masked rows: H24 persistent M64 and short-list split (its
+    # cluster schedule falls back to the raw count), H48 split M64, and H96
+    # split M64 pairs and persistent 2CTA.
+    + [
+        (24, "fp8", 4, 513),
+        (24, "fp8", 160, 2048),
+        (48, "nvfp4", 4, 2048),
+        (96, "nvfp4", 4, 2048),
+        (96, "fp8", 160, 2048),
+    ],
 )
 def test_d576_sparse_graph(heads, precision, rows, topk, prefix=False):
     """Native352 cache mapping, tails, holes and live graph inputs on both families."""

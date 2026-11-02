@@ -286,16 +286,6 @@ class MsaSparseAttn:
             (MMA_M, PG),
             warpgroup.OperandSource.SMEM,
         )
-        qk_mma2 = sm90_utils.make_trivial_tiled_mma(
-            f8,
-            f8,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            self.f32,
-            (1, 1, 1),
-            (MMA_M, PG),
-            warpgroup.OperandSource.SMEM,
-        )
         # f32 accumulation: f16 partial sums over up to TOPK * PG keys cost
         # ~6e-4 relative error and have far less headroom.
         pv_mma = sm90_utils.make_trivial_tiled_mma(
@@ -345,7 +335,6 @@ class MsaSparseAttn:
 
         self.kernel(
             qk_mma,
-            qk_mma2,
             pv_mma,
             tma_atom,
             gKV,
@@ -370,7 +359,6 @@ class MsaSparseAttn:
     def kernel(
         self,
         qk_mma,
-        qk_mma2,
         pv_mma,
         tma_atom,
         gKV,
@@ -511,13 +499,16 @@ class MsaSparseAttn:
         )
         a2b = (tidx, warp, srcT, dstT, cv8, cv16)
 
-        # j runs to nblk-2, so block j+1 always exists: no predicate on the refills.
         # K is refilled as soon as the QK GEMM has drained (a full body of lead
-        # time); V right after the second half-conversion has consumed it.
-        for j in cutlass.range(nblk - 1, unroll=1):
+        # time); V right after the second half-conversion has consumed it. The
+        # last block runs in the loop with its refills predicated off rather
+        # than peeled after it: the peeled copy segfaults the cu12 build of the
+        # CuTe DSL's compiler at opt-level >= 1 (flashinfer-ai/flashinfer#7915).
+        for j in cutlass.range(nblk, unroll=1):
             self._p1(j, qk_mma, *a1)
-            pgn = cute.arch.make_warp_uniform(meta[TOPK + j + 1])
-            if warp == 0:
+            more = j + 1 < nblk
+            pgn = cute.arch.make_warp_uniform(meta[TOPK + cutlass.min(j + 1, nblk - 1)])
+            if warp == 0 and more:
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar + 0, KVBYTES)
                 cute.copy(
@@ -527,7 +518,7 @@ class MsaSparseAttn:
                     tma_bar_ptr=mbar + 0,
                 )
             self._p2(j, *a2t, 1, *a2b)
-            if warp == 0:
+            if warp == 0 and more:
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar + 1, KVBYTES)
                 cute.copy(
@@ -536,8 +527,6 @@ class MsaSparseAttn:
                     tKVs[(None, 1)],
                     tma_bar_ptr=mbar + 1,
                 )
-        self._p1(nblk - 1, qk_mma2, *a1)
-        self._p2(nblk - 1, *a2t, 1, *a2b)
 
         # ---- epilogue ----------------------------------------------------
         for i in cutlass.range_constexpr(2):
@@ -1054,6 +1043,16 @@ def _blk(
                 tma_bar_ptr=mbar + 0,
             )
 
+    # Each band's P is staged in f32 and the fp8 fragments are written once,
+    # whole, after both bands. Storing a band straight into p_hi / p_lo (four
+    # bytes per register, two bands interleaved) fed the PV gemm a wrong band-1
+    # P under the CUDA 12 ptxas of the cu12 CuTe DSL at -O1 and up: band 1
+    # (GQA 16 rows 8-15) came out wrong on every token and NaN on a varying ~5%
+    # (flashinfer-ai/flashinfer#7915). The PTX was the same under cu13, whose
+    # ptxas got it right. fp8 values are exact in f32, so the round trip
+    # changes no bit.
+    phf = cute.make_rmem_tensor_like(p_hi, f32)
+    plf = cute.make_rmem_tensor_like(p_lo, f32)
     # Only warp 0 owns live rows. Both of its row bands go through the softmax
     # so that the GQA-8 band of zero Q rows stores a finite P.
     if warp == 0:
@@ -1093,8 +1092,10 @@ def _blk(
             l_i[i] = l_i[i] + (ph.to(f32) + pl.to(f32)).reduce(
                 cute.ReductionOp.ADD, f32(0.0), 0
             )
-            _p_half(p_hi, i).store(ph)
-            _p_half(p_lo, i).store(pl)
+            _p_half(phf, i).store(ph.to(f32))
+            _p_half(plf, i).store(pl.to(f32))
+        p_hi.store(phf.load().to(f8))
+        p_lo.store(plf.load().to(f8))
 
     # P.V into the dead S registers, then f32-added to acc_o: see the per-block
     # promotion in sparse_prefill_sm90.

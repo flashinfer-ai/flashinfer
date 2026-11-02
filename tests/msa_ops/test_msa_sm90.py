@@ -1370,6 +1370,68 @@ def test_sparse_prefill_fp32_accuracy(
 
 
 @sm90_only
+@pytest.mark.parametrize("hq", [8, 16])
+@pytest.mark.parametrize("qlen", [64, 2048])  # f16 PV body, fp8 PV body
+@pytest.mark.parametrize("nvalid", [1, 5])
+def test_single_token_prefill_short_block_lists(hq, qlen, nvalid):
+    """The one-token-per-CTA schedule with -1 padded block lists.
+
+    Both PV bodies run their last selected block inside the block loop with the
+    next-block refills predicated off (#7915), so a list of one block runs the
+    loop once and refills nothing. 4100 pages has no Cake program, so this
+    reaches the CuTe DSL schedule on either backend.
+    """
+    torch.manual_seed(hq + qlen + nvalid)
+    hkv, prefix_pages = 1, 4100
+    seq = prefix_pages * BLK_KV + qlen
+    width = -(-seq // BLK_KV)
+    page_table = torch.randperm(width, device="cuda").to(torch.int32).view(1, width)
+    kv = (torch.randn(width, hkv, BLK_KV, 2 * HEAD_DIM, device="cuda") * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    k, v = kv[..., :HEAD_DIM], kv[..., HEAD_DIM:]
+    q = torch.randn(qlen, hq, HEAD_DIM, device="cuda").to(torch.bfloat16)
+    cu_q = torch.tensor([0, qlen], dtype=torch.int32, device="cuda")
+    seqused_k = torch.tensor([seq], dtype=torch.int32, device="cuda")
+    own = torch.arange(seq - qlen, seq, device="cuda") // BLK_KV
+    # own block + (nvalid - 1) random older ones, ascending, then -1 padding
+    score = torch.rand(qlen, width, device="cuda")
+    score[torch.arange(width, device="cuda")[None, :] >= own[:, None]] = -1.0
+    older = score.topk(nvalid - 1, dim=-1).indices
+    sel = torch.cat([older, own[:, None]], dim=-1).sort(dim=-1).values
+    idx = torch.full((qlen, TOPK), -1, dtype=torch.int32, device="cuda")
+    idx[:, :nvalid] = sel.to(torch.int32)
+    idx = idx[None].contiguous()
+
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    out = msa_sparse_attention(
+        q,
+        k,
+        v,
+        idx,
+        cu_q,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+        softmax_scale=scale,
+    )
+    assert torch.isfinite(out.float()).all()
+    rows = torch.linspace(0, qlen - 1, 32).long().unique().tolist()
+    ref = _ref_attn_rows(
+        q,
+        kv,
+        idx,
+        page_table,
+        seqused_k,
+        scale,
+        rows,
+        lambda r: (0, seq - qlen + r),
+    )
+    err = (out[rows].float() - ref).norm() / ref.norm()
+    assert err < 3e-3, f"rel-L2 {err:.2e} vs fp32 reference"
+
+
+@sm90_only
 @pytest.mark.parametrize(
     "fill", ["nan", "nan_k_only", "nan_v_only", "garbage", "zeros"]
 )

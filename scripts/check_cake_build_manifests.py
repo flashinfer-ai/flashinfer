@@ -11,7 +11,7 @@ through FlashInfer.  The package registries (``cake_jit.py`` / ``jit.py`` /
 
 The manifest's ``package`` field is the dotted import path of the package
 directory (``flashinfer.experimental.cake_mok_bf16``,
-``flashinfer.cake_rmsnorm_train_backend``): the one spelling every exporter
+``flashinfer.cake_rmsnorm_det_train_backend``): the one spelling every exporter
 writes and this checker compares (``Package.name``); a directory path is not
 accepted.  ``name`` is the unique key of ``libraries``; ``closure_sha256`` is
 not unique (two entries of one program and architecture, for example two tile
@@ -40,7 +40,11 @@ In-tree checks (``--in-tree``, the default):
 * package-data coverage in ``pyproject.toml`` for ``build.json``,
   ``csrc/cake_ffi_checks.h`` and every manifest source (wheels ship them);
 * the ``cake_build.py`` files of all checked packages are byte-identical;
-* ``common.requires.tvm_ffi.python`` equals line 1 of ``requirements.txt``.
+* ``common.requires.tvm_ffi.python`` equals line 1 of ``requirements.txt``;
+* every package a package requires (``Package.requires``: a package it imports
+  as its sibling, as the numerical-mode ``dense_projection_gemm`` imports the
+  deterministic ``dense_projection_det_gemm``) is a row of this table with the
+  same parent package.
 
 Vendored gate (``--vendored-gate``; combinable with ``--package``): the form
 of a consumer that vendors a package and builds it from ``build.json`` with its
@@ -53,7 +57,16 @@ directory the gate created is removed and a pre-existing one loses only the
 entries the gate wrote into it):
 
 1. copy the package directory to ``<work>/vendored_<directory name>/``
-   without ``aot/`` and ``__pycache__/`` (``shutil.copytree``);
+   without ``aot/`` and ``__pycache__/`` (``shutil.copytree``).  A package
+   with ``requires`` is vendored together with the packages it requires, as
+   siblings under one parent: ``<work>/vendored_<directory name>/`` is then
+   a namespace directory holding ``<directory name>/`` and one
+   ``<required directory name>/`` per required package, imported as
+   ``vendored_<directory name>.<directory name>`` (the package resolves its
+   sibling there, as it resolves it under ``flashinfer.experimental``); every
+   step below runs for the required copies too (their entries of the
+   selected architectures compiled, their sidecars written, their libraries
+   load-checked, their table keys patched for the suite);
 2. compile every manifest entry of a selected architecture (``--arch``,
    repeatable; default: the ``compute_cap`` of the visible GPUs from
    ``nvidia-smi`` as ``sm_<major><minor>a``, intersected with ``arch_flags``;
@@ -101,7 +114,8 @@ entries the gate wrote into it):
    arguments are split like a shell) -- a second ``<python> -I`` child with the
    same blocker, the repository root on ``sys.path`` and
    ``tests.test_helpers.cake_package.PACKAGES[<key>]`` pointed at the copy
-   (the key whose import path is the package's, read from that table), runs
+   (the key whose import path is the package's, read from that table; with
+   ``requires``, also every key of a required package pointed at its copy), runs
    ``pytest TESTFILE --noconftest -p no:cacheprovider -q -rfEs --junitxml
    <work>/<key>-suite.xml`` from the repository root (``tests/conftest.py``
    imports flashinfer, hence ``--noconftest``; the backend suites import
@@ -253,18 +267,18 @@ def refs_generic(package_dir: Path, loader: str) -> set[str]:
     return generic_library_refs(module_literals(package_dir / loader))
 
 
-def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
+def refs_lm_head_det_loss(package_dir: Path, loader: str) -> set[str]:
     """Compact rows ``[unit, arg_plan, launch, grid_x, grid_y, grid_z]`` per stage of a per-architecture record;
-    the stage's library stem is ``cake_lm_head_loss_<unit>``."""
+    the stage's library stem is ``cake_lm_head_det_loss_<unit>``."""
     registry = module_literals(package_dir / loader)["_REGISTRY"]
     return {
-        f"cake_lm_head_loss_{row[0]}_{compact['arch']}"
+        f"cake_lm_head_det_loss_{row[0]}_{compact['arch']}"
         for compact in registry.values()
         for row in compact["stages"].values()
     }
 
 
-def refs_moe_grouped_gemm(package_dir: Path, loader: str) -> set[str]:
+def refs_moe_grouped_det_gemm(package_dir: Path, loader: str) -> set[str]:
     """Route stages bind a program and its compile-line specializations; the build is
     ``<library><tag>_<arch>`` for every architecture the route and the program share."""
     literals = module_literals(package_dir / loader)
@@ -285,6 +299,11 @@ def refs_moe_grouped_gemm(package_dir: Path, loader: str) -> set[str]:
     return refs
 
 
+# The non-deterministic package ``flashinfer.experimental.cake.cake_moe_grouped_gemm`` has the same registry shape
+# (``PROGRAMS`` + ``ROUTES`` with per-stage specializations).
+refs_moe_grouped_gemm = refs_moe_grouped_det_gemm
+
+
 def refs_stepfun(package_dir: Path, loader: str) -> set[str]:
     """Compact rows keyed by the 20-hex program digest (``_PROGRAMS``; the library stem is
     ``_PREFIX + digest``), every program built for every architecture of ``ARCHES``."""
@@ -303,6 +322,14 @@ def refs_shipped_modules(package_dir: Path, loader: str) -> set[str]:
     return generic_library_refs(module_literals(package_dir / loader)["MODULES"])
 
 
+def refs_with_kcp(package_dir: Path, loader: str) -> set[str]:
+    """A package whose ``build.json`` also lists the programs of its context-parallel registry ``kcp_jit.py``: the
+    generic walk over ``loader`` and the ``MODULES`` records of ``kcp_jit.py``."""
+    return refs_generic(package_dir, loader) | refs_shipped_modules(
+        package_dir, "kcp_jit.py"
+    )
+
+
 def refs_mok_bf16(package_dir: Path, loader: str) -> set[str]:
     """``sources.json``: role -> {library, arches, arguments}."""
     registry = json.loads((package_dir / loader).read_text())
@@ -319,9 +346,12 @@ class Package:
     path: str  # repository-relative directory
     loader: str  # registry file inside the package
     refs: Callable[[Path, str], set[str]]
+    # dotted import paths of the packages this one imports as its siblings (rows of PACKAGES with the same parent
+    # package); the vendored gate vendors them beside it
+    requires: tuple[str, ...] = ()
 
 
-# dsa_train, kda_train, dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
+# dsa_train, kda_det_train (and its non-deterministic counterpart cake.cake_kda_train), dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
 # block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention, the SM90 VSA,
 # the Kimi-K3 AttnRes, the experimental FP8 1D1D GEMM (deepgemm_fp8_gemm) and the experimental batched FP8 projection (deepgemm_batched_gemm) backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
 # ``arch`` scope).  Their exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself
@@ -329,20 +359,38 @@ class Package:
 # nvfp4_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm and deepgemm_batched_gemm MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
+        "flashinfer.cake_rmsnorm_det_train_backend",
+        "flashinfer/cake_rmsnorm_det_train_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
         "flashinfer.cake_rmsnorm_train_backend",
         "flashinfer/cake_rmsnorm_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_causal_conv1d_train_backend",
-        "flashinfer/cake_causal_conv1d_train_backend",
+        "flashinfer.cake_causal_conv1d_det_train_backend",
+        "flashinfer/cake_causal_conv1d_det_train_backend",
         "cake_jit.py",
-        refs_generic,
+        refs_with_kcp,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_causal_conv1d_train_backend",
+        "flashinfer/experimental/cake/cake_causal_conv1d_train_backend",
+        "cake_jit.py",
+        refs_with_kcp,
     ),
     Package(
         "flashinfer.cake_gated_act_mxfp8_backend",
         "flashinfer/cake_gated_act_mxfp8_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.cake_rmsnorm_silu_gate_det_train_backend",
+        "flashinfer/cake_rmsnorm_silu_gate_det_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
@@ -377,14 +425,20 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_mhc_train_backend",
-        "flashinfer/cake_mhc_train_backend",
+        "flashinfer.cake_mhc_det_train_backend",
+        "flashinfer/cake_mhc_det_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.cake_mhc_train_head_backend",
-        "flashinfer/cake_mhc_train_head_backend",
+        "flashinfer.cake_mhc_det_train_head_backend",
+        "flashinfer/cake_mhc_det_train_head_backend",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_mhc_train_backend",
+        "flashinfer/experimental/cake/cake_mhc_train_backend",
         "cake_jit.py",
         refs_generic,
     ),
@@ -395,34 +449,70 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_dsa_indexer",
-        "flashinfer/experimental/cake_dsa_indexer",
+        "flashinfer.experimental.cake_dsa_indexer_det",
+        "flashinfer/experimental/cake_dsa_indexer_det",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_kda_train",
-        "flashinfer/experimental/cake_kda_train",
+        "flashinfer.experimental.cake_msa_icp_indexer",
+        "flashinfer/experimental/cake_msa_icp_indexer",
         "cake_jit.py",
         refs_generic,
     ),
     Package(
-        "flashinfer.experimental.cake_gdn_train",
-        "flashinfer/experimental/cake_gdn_train",
+        "flashinfer.experimental.cake_kda_det_train",
+        "flashinfer/experimental/cake_kda_det_train",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_kda_train",
+        "flashinfer/experimental/cake/cake_kda_train",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_kda_det_train_kcp",
+        "flashinfer/experimental/cake_kda_det_train_kcp",
+        "cake_kcp_jit.py",
+        refs_shipped_modules,
+    ),
+    Package(
+        "flashinfer.experimental.cake_kda_train_kcp",
+        "flashinfer/experimental/cake_kda_train_kcp",
+        "cake_kcp_jit.py",
+        refs_shipped_modules,
+    ),
+    Package(
+        "flashinfer.experimental.cake_gdn_det_train_kcp",
+        "flashinfer/experimental/cake_gdn_det_train_kcp",
         "cake_jit.py",
         refs_shipped_modules,
     ),
     Package(
-        "flashinfer.experimental.cake_moe_grouped_gemm",
-        "flashinfer/experimental/cake_moe_grouped_gemm",
+        "flashinfer.experimental.cake_gdn_train_kcp",
+        "flashinfer/experimental/cake_gdn_train_kcp",
+        "cake_jit.py",
+        refs_shipped_modules,
+    ),
+    Package(
+        "flashinfer.experimental.cake_moe_grouped_det_gemm",
+        "flashinfer/experimental/cake_moe_grouped_det_gemm",
+        "cake_jit.py",
+        refs_moe_grouped_det_gemm,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_moe_grouped_gemm",
+        "flashinfer/experimental/cake/cake_moe_grouped_gemm",
         "cake_jit.py",
         refs_moe_grouped_gemm,
     ),
     Package(
-        "flashinfer.experimental.cake_lm_head_loss",
-        "flashinfer/experimental/cake_lm_head_loss",
+        "flashinfer.experimental.cake_lm_head_det_loss",
+        "flashinfer/experimental/cake_lm_head_det_loss",
         "cake_jit.py",
-        refs_lm_head_loss,
+        refs_lm_head_det_loss,
     ),
     Package(
         "flashinfer.experimental.cake_mok_bf16",
@@ -431,10 +521,18 @@ PACKAGES: tuple[Package, ...] = (
         refs_mok_bf16,
     ),
     Package(
+        "flashinfer.experimental.dense_projection_det_gemm",
+        "flashinfer/experimental/dense_projection_det_gemm",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
         "flashinfer.experimental.dense_projection_gemm",
         "flashinfer/experimental/dense_projection_gemm",
         "cake_jit.py",
         refs_generic,
+        # its deterministic path calls the deterministic package's programs
+        requires=("flashinfer.experimental.dense_projection_det_gemm",),
     ),
     Package(
         "flashinfer.experimental.cake_stepfun_moe",
@@ -487,6 +585,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.cake_gdn_det_train",
         "flashinfer/experimental/cake_gdn_det_train",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_gdn_train",
+        "flashinfer/experimental/cake/cake_gdn_train",
         "cake_jit.py",
         refs_generic,
     ),
@@ -846,8 +950,36 @@ def select(names: Iterable[str] | None) -> list[Package]:
     return chosen
 
 
+def package_named(name: str) -> Package | None:
+    """The row of :data:`PACKAGES` whose dotted import path is ``name``."""
+    return next((p for p in PACKAGES if p.name == name), None)
+
+
+def check_requires(package: Package) -> list[Finding]:
+    """Every package ``package`` requires is a row of :data:`PACKAGES` and its
+    sibling (the same parent package), and not ``package`` itself."""
+    found: list[Finding] = []
+    parent = package.name.rpartition(".")[0]
+    for name in package.requires:
+        if name == package.name or package_named(name) is None:
+            found.append(
+                Finding(package.name, f"requires {name}: not another row of PACKAGES")
+            )
+        elif name.rpartition(".")[0] != parent:
+            found.append(
+                Finding(
+                    package.name,
+                    f"requires {name}: not a sibling (parent {parent!r}); the package "
+                    "imports a required package from its own parent",
+                )
+            )
+    return found
+
+
 def run_in_tree(root: Path, packages: list[Package]) -> list[Finding]:
     findings: list[Finding] = []
+    for package in packages:
+        findings.extend(check_requires(package))
     table = package_data(root / "pyproject.toml")
     checked: dict[str, Path] = {}
     for package in packages:
@@ -1031,7 +1163,7 @@ def suite():
     # interpreters a test spawns pick up <work>/sitecustomize.py from here
     os.environ["PYTHONPATH"] = os.pathsep.join(CONFIG["paths"])
     table = importlib.import_module("tests.test_helpers.cake_package")
-    table.PACKAGES[CONFIG["key"]] = CONFIG["neutral"]
+    table.PACKAGES.update(CONFIG["table"])
     import pytest
 
     return int(pytest.main(CONFIG["pytest_args"]))
@@ -1048,14 +1180,13 @@ sys.exit(load() if MODE == "load" else suite())
 # imports this module at startup and sees the copy the way the suite child does.
 SITECUSTOMIZE = """\
 # Generated by scripts/check_cake_build_manifests.py --vendored-gate for one
-# --suite run: block flashinfer and point the cake_package table at the copy in
+# --suite run: block flashinfer and point the cake_package table at the copies in
 # every interpreter started with this directory on PYTHONPATH.
 import importlib
 import importlib.abc
 import sys
 
-KEY = {key}
-NEUTRAL = {neutral}
+TABLE = {table}
 
 
 class Block(importlib.abc.MetaPathFinder):
@@ -1067,7 +1198,7 @@ class Block(importlib.abc.MetaPathFinder):
 
 sys.meta_path.insert(0, Block())
 sys.modules["flashinfer"] = None
-importlib.import_module("tests.test_helpers.cake_package").PACKAGES[KEY] = NEUTRAL
+importlib.import_module("tests.test_helpers.cake_package").PACKAGES.update(TABLE)
 """
 
 
@@ -1254,8 +1385,16 @@ def gate_entries(child: Path, reports: list[dict[str, Any]]) -> list[Path]:
     wrote no suite lists none of its files)."""
     entries = [child]
     for report in reports:
+        if (
+            "vendor_root" in report
+        ):  # the namespace directory of a package and its required packages
+            entries.append(Path(report["vendor_root"]))
         if "copy" in report:
             entries.append(Path(report["copy"]))
+        for required in report.get("requires") or ():
+            load = required.get("load") or {}
+            if load.get("log"):
+                entries.append(Path(load["log"]))
         load = report.get("load") or {}
         suite = report.get("suite") or {}
         paths = (
@@ -1282,11 +1421,19 @@ def discard_work(work: Path, created: bool, entries: list[Path]) -> None:
     print(f"work dir kept (pre-existing): {work}")
 
 
-def copy_package(package_dir: Path, work: Path) -> tuple[str, Path]:
-    """Step 1: the package under ``<work>/vendored_<directory name>/`` without
-    ``aot/`` and ``__pycache__/``, with an empty ``aot/`` for the builds."""
-    neutral = f"vendored_{package_dir.name}"
-    copy = work / neutral
+def copy_package(
+    package_dir: Path, work: Path, parent: str | None = None
+) -> tuple[str, Path]:
+    """Step 1: the package under ``<work>/vendored_<directory name>/`` -- or, with
+    ``parent``, under the namespace directory ``<work>/<parent>/<directory name>/``
+    (imported as ``<parent>.<directory name>``) -- without ``aot/`` and
+    ``__pycache__/``, with an empty ``aot/`` for the builds."""
+    if parent is None:
+        neutral = f"vendored_{package_dir.name}"
+        copy = work / neutral
+    else:
+        neutral = f"{parent}.{package_dir.name}"
+        copy = work / parent / package_dir.name
     if copy.exists():
         shutil.rmtree(copy)
     shutil.copytree(
@@ -1566,11 +1713,25 @@ def suite_key(root: Path, package: Package) -> str | None:
     return None
 
 
+def suite_keys(root: Path, names: Iterable[str]) -> dict[str, str]:
+    """Every ``tests.test_helpers.cake_package.PACKAGES`` key importing one of the
+    packages ``names`` -> that package's dotted import path."""
+    wanted = set(names)
+    table = module_literals(root / PACKAGE_TABLE).get("PACKAGES") or {}
+    return {str(key): str(path) for key, path in table.items() if path in wanted}
+
+
 def run_suite(
-    gate: Gate, package: Package, neutral: str, testfile: Path
+    gate: Gate,
+    package: Package,
+    neutral: str,
+    testfile: Path,
+    required: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any] | None, list[Finding]]:
     """Step 5: the backend suite ``testfile`` against the copy, flashinfer blocked
-    in the suite child and in every interpreter its tests spawn."""
+    in the suite child and in every interpreter its tests spawn.  ``required``
+    (the dotted import path of each required package -> the import path of its
+    copy) points every table key of a required package at its copy too."""
     key = suite_key(gate.root, package)
     if key is None:
         message = (
@@ -1578,6 +1739,11 @@ def run_suite(
             f"the suite {testfile} cannot be pointed at the copy"
         )
         return None, [Finding(package.name, message)]
+    table = {
+        k: (required or {})[path]
+        for k, path in suite_keys(gate.root, (required or {}).keys()).items()
+    }
+    table[key] = neutral
     junit = gate.work / f"{key}-suite.xml"
     log = gate.work / f"{key}-suite.log"
     sitecustomize = gate.work / SITECUSTOMIZE_NAME
@@ -1594,13 +1760,10 @@ def run_suite(
     ]
     config = {
         "paths": [str(gate.root), str(gate.work), *gate.paths],
-        "key": key,
-        "neutral": neutral,
+        "table": table,
         "pytest_args": pytest_args,
     }
-    sitecustomize.write_text(
-        SITECUSTOMIZE.format(key=json.dumps(key), neutral=json.dumps(neutral))
-    )
+    sitecustomize.write_text(SITECUSTOMIZE.format(table=json.dumps(table)))
     # a reused work directory may hold the junit file of an earlier run; pytest
     # writes its own only at session finish, so a child that dies before that
     # must not have the old counts attributed to it
@@ -1614,6 +1777,7 @@ def run_suite(
     summary.update(
         rc=proc.returncode,
         key=key,
+        table=table,
         testfile=str(testfile),
         junit=str(junit),
         log=str(log),
@@ -1666,12 +1830,28 @@ def gate_package(gate: Gate, package: Package) -> tuple[dict[str, Any], list[Fin
                 "not_run": "package skipped (no selected architecture)",
             }
         return report, []
+    parent = None
+    findings: list[Finding] = []
+    required: list[dict[str, Any]] = []
+    if package.requires:
+        # the package and the packages it requires, siblings under one namespace directory
+        parent = f"vendored_{package_dir.name}"
+        vendor_root = gate.work / parent
+        if vendor_root.exists():
+            shutil.rmtree(vendor_root)
+        vendor_root.mkdir(parents=True)
+        report["vendor_root"] = str(vendor_root)
+        for name in package.requires:
+            record, found = vendor_required(gate, package, name, parent)
+            required.append(record)
+            findings.extend(found)
+        report["requires"] = required
     entries = [e for e in manifest["libraries"] if e["arch"] in arches]
     skipped = [e["name"] for e in entries if version_pair(e["min_cuda"]) > gate.cuda]
     to_build = [e for e in entries if e["name"] not in set(skipped)]
-    neutral, copy = copy_package(package_dir, gate.work)
+    neutral, copy = copy_package(package_dir, gate.work, parent)
     records = compile_entries(gate, copy, manifest, to_build)
-    findings = compile_findings(package, copy, records)
+    findings.extend(compile_findings(package, copy, records))
     compiled = [r for r in records if compiled_ok(r)]
     built_arches = [a for a in arches if any(r["arch"] == a for r in compiled)]
     report.update(
@@ -1690,13 +1870,66 @@ def gate_package(gate: Gate, package: Package) -> tuple[dict[str, Any], list[Fin
         )
         findings.extend(found)
         if testfile is not None:
-            report["suite"], found = run_suite(gate, package, neutral, testfile)
+            copies = {r["package"]: r["neutral"] for r in required if "neutral" in r}
+            report["suite"], found = run_suite(gate, package, neutral, testfile, copies)
             findings.extend(found)
     elif testfile is not None:
         findings.append(
             Finding(package.name, f"suite {testfile} not run: no entry compiled")
         )
     return report, findings
+
+
+def vendor_required(
+    gate: Gate, package: Package, name: str, parent: str
+) -> tuple[dict[str, Any], list[Finding]]:
+    """Steps 1-4 for the package ``name`` that ``package`` requires: its copy
+    under the namespace directory ``<work>/<parent>/``, its entries of the
+    selected architectures compiled, its sidecar written and its libraries
+    load-checked.  A required package without an entry of those architectures
+    is copied only (the package's calls into it then need flashinfer's JIT and
+    fail in the suite, a gap the suite reports)."""
+    record: dict[str, Any] = {"package": name}
+    required = package_named(name)
+    if required is None:
+        record["error"] = f"required by {package.name}: not a row of PACKAGES"
+        return record, [Finding(package.name, f"requires {name}: {record['error']}")]
+    required_dir = gate.root / required.path
+    manifest_path = required_dir / "build.json"
+    if not manifest_path.is_file():
+        record["error"] = "build.json is missing"
+        return record, [
+            Finding(name, f"required by {package.name}: build.json is missing")
+        ]
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except json.JSONDecodeError as error:
+        record["error"] = f"build.json is not valid JSON: {error}"
+        return record, [Finding(name, f"required by {package.name}: {record['error']}")]
+    arches = [arch for arch in gate.arches if arch in manifest["arch_flags"]]
+    entries = [e for e in manifest["libraries"] if e["arch"] in arches]
+    skipped = [e["name"] for e in entries if version_pair(e["min_cuda"]) > gate.cuda]
+    to_build = [e for e in entries if e["name"] not in set(skipped)]
+    neutral, copy = copy_package(required_dir, gate.work, parent)
+    records = compile_entries(gate, copy, manifest, to_build)
+    findings = compile_findings(required, copy, records)
+    compiled = [r for r in records if compiled_ok(r)]
+    built_arches = [a for a in arches if any(r["arch"] == a for r in compiled)]
+    record.update(
+        neutral=neutral,
+        copy=str(copy),
+        arches=arches,
+        skipped_min_cuda=skipped,
+        compiled=records,
+        build_info=write_build_info(copy, gate.cuda, built_arches, gate.nvcc_line),
+        load=None,
+    )
+    if compiled:
+        record["load"], found = load_check(
+            gate, required, neutral, copy, compiled, built_arches
+        )
+        findings.extend(found)
+    return record, findings
 
 
 def suite_text(suite: dict[str, Any] | None) -> str:
@@ -1735,7 +1968,20 @@ def summary_line(report: dict[str, Any]) -> str:
         passed = bool(checks) and load["rc"] == 0 and all(c["ok"] for c in checks)
         version = "ok" if passed else "FAILED"
         text += f", loaded {loaded} of {ok}, build_cuda_version {version}"
+    for required in report.get("requires") or ():
+        text += f"; requires {required['package']}: " + (
+            required["error"] if "error" in required else load_text(required)
+        )
     return text + suite_text(report["suite"])
+
+
+def load_text(record: dict[str, Any]) -> str:
+    """``compiled N of M, loaded N of N`` of a required package's record."""
+    records = record["compiled"]
+    ok = sum(1 for r in records if compiled_ok(r))
+    checks = (record["load"] or {}).get("checks") or []
+    loaded = sum(1 for c in checks if c["check"] == "load" and c["ok"])
+    return f"compiled {ok} of {len(records)}, loaded {loaded} of {ok}"
 
 
 def run_vendored_gate(

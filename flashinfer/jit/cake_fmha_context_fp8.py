@@ -20,12 +20,16 @@ read them from device scalars; the RUNTIME_PACK programs take the lengths, head 
 m-block count, page size and scale source as launch arguments (PAGE64: 64-token pages
 only; PX: sm_103a, a 4-stage K/V ring and the P tile in the other stage's S columns, the
 others on sm_103a for launches of at most 128 keys; Q1: one query stage per tile, for
-launches whose tiles hold at most one stage of query tokens); the RUNTIME_SK programs
-are the same schedule with the key range of a tile split over several work units, whose
-FP32 partials the tile's last unit merges. The host module ``flashinfer.cake_fmha``
-selects the program from the head counts, the page size, the planned maximum lengths and
-the kind of scale arguments of a launch, computes the grid and launches it; other shapes
-keep the module's other context routes.
+launches whose tiles hold at most one stage of query tokens, the every-page-size ones
+also on sm_103a for launches of at most 128 keys; MW: without the short-KV chain, for
+sm_100a launches of many tiles over few keys; OW: stage 0 stored as soon as its last PV
+is in, or for a Q1 program the short-KV chain, for sm_100a launches of one tile per
+CTA); the RUNTIME_SK programs are the same schedule with the key range of a tile split
+over several work units, whose FP32 partials the tile's last unit merges (S2: two units
+per split tile at most, the merging unit's own term from its TMEM O, for sm_100a). The
+host module ``flashinfer.cake_fmha`` selects the program from the head counts, the page
+size, the planned maximum lengths and the kind of scale arguments of a launch, computes
+the grid and launches it; other shapes keep the module's other context routes.
 
 Generated file: every value below is derived from the exported sources and checked
 against them; do not edit.
@@ -391,12 +395,12 @@ B256_SCALE_PTR_KV4 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK8 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_d3b2c5fd94e8f560864e",
+    name="cake_fmha_context_fp8_27799c2f9548e951013e",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_d3b2c5fd94e8f560864e",
+    kernel="kernel_cake_fmha_context_fp8_27799c2f9548e951013e",
     sources=(
-        "cake_fmha_context_fp8_d3b2c5fd94e8f560864e_kernel.cu",
-        "cake_fmha_context_fp8_d3b2c5fd94e8f560864e_binding.cu",
+        "cake_fmha_context_fp8_27799c2f9548e951013e_kernel.cu",
+        "cake_fmha_context_fp8_27799c2f9548e951013e_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -460,12 +464,12 @@ RUNTIME_PACK8 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK4 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_d11c6f225efe76b29d99",
+    name="cake_fmha_context_fp8_e193fed2eff47620b919",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_d11c6f225efe76b29d99",
+    kernel="kernel_cake_fmha_context_fp8_e193fed2eff47620b919",
     sources=(
-        "cake_fmha_context_fp8_d11c6f225efe76b29d99_kernel.cu",
-        "cake_fmha_context_fp8_d11c6f225efe76b29d99_binding.cu",
+        "cake_fmha_context_fp8_e193fed2eff47620b919_kernel.cu",
+        "cake_fmha_context_fp8_e193fed2eff47620b919_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -529,12 +533,12 @@ RUNTIME_PACK4 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK2 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_922e982c210fb18a9cd8",
+    name="cake_fmha_context_fp8_f873d11e318ec3392f47",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_922e982c210fb18a9cd8",
+    kernel="kernel_cake_fmha_context_fp8_f873d11e318ec3392f47",
     sources=(
-        "cake_fmha_context_fp8_922e982c210fb18a9cd8_kernel.cu",
-        "cake_fmha_context_fp8_922e982c210fb18a9cd8_binding.cu",
+        "cake_fmha_context_fp8_f873d11e318ec3392f47_kernel.cu",
+        "cake_fmha_context_fp8_f873d11e318ec3392f47_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -598,12 +602,12 @@ RUNTIME_PACK2 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_bf79e546564cb529a650",
+    name="cake_fmha_context_fp8_ab6de9d118422d291f84",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_bf79e546564cb529a650",
+    kernel="kernel_cake_fmha_context_fp8_ab6de9d118422d291f84",
     sources=(
-        "cake_fmha_context_fp8_bf79e546564cb529a650_kernel.cu",
-        "cake_fmha_context_fp8_bf79e546564cb529a650_binding.cu",
+        "cake_fmha_context_fp8_ab6de9d118422d291f84_kernel.cu",
+        "cake_fmha_context_fp8_ab6de9d118422d291f84_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -667,12 +671,12 @@ RUNTIME_PACK1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK8_PAGE64 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_c617124c1dc667eced14",
+    name="cake_fmha_context_fp8_541cc008db776c108277",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_c617124c1dc667eced14",
+    kernel="kernel_cake_fmha_context_fp8_541cc008db776c108277",
     sources=(
-        "cake_fmha_context_fp8_c617124c1dc667eced14_kernel.cu",
-        "cake_fmha_context_fp8_c617124c1dc667eced14_binding.cu",
+        "cake_fmha_context_fp8_541cc008db776c108277_kernel.cu",
+        "cake_fmha_context_fp8_541cc008db776c108277_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -736,12 +740,12 @@ RUNTIME_PACK8_PAGE64 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK4_PAGE64 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_67ded606256f2dbc29cf",
+    name="cake_fmha_context_fp8_bf040e8cb8577f37d708",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_67ded606256f2dbc29cf",
+    kernel="kernel_cake_fmha_context_fp8_bf040e8cb8577f37d708",
     sources=(
-        "cake_fmha_context_fp8_67ded606256f2dbc29cf_kernel.cu",
-        "cake_fmha_context_fp8_67ded606256f2dbc29cf_binding.cu",
+        "cake_fmha_context_fp8_bf040e8cb8577f37d708_kernel.cu",
+        "cake_fmha_context_fp8_bf040e8cb8577f37d708_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -805,12 +809,12 @@ RUNTIME_PACK4_PAGE64 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK2_PAGE64 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_efa3c990ddbded7e30c1",
+    name="cake_fmha_context_fp8_e5d2537ba897c1e551a3",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_efa3c990ddbded7e30c1",
+    kernel="kernel_cake_fmha_context_fp8_e5d2537ba897c1e551a3",
     sources=(
-        "cake_fmha_context_fp8_efa3c990ddbded7e30c1_kernel.cu",
-        "cake_fmha_context_fp8_efa3c990ddbded7e30c1_binding.cu",
+        "cake_fmha_context_fp8_e5d2537ba897c1e551a3_kernel.cu",
+        "cake_fmha_context_fp8_e5d2537ba897c1e551a3_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -874,12 +878,12 @@ RUNTIME_PACK2_PAGE64 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK1_PAGE64 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_c3c1952b0d5adb9ceff3",
+    name="cake_fmha_context_fp8_8c22dd8f00a06a0700ed",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_c3c1952b0d5adb9ceff3",
+    kernel="kernel_cake_fmha_context_fp8_8c22dd8f00a06a0700ed",
     sources=(
-        "cake_fmha_context_fp8_c3c1952b0d5adb9ceff3_kernel.cu",
-        "cake_fmha_context_fp8_c3c1952b0d5adb9ceff3_binding.cu",
+        "cake_fmha_context_fp8_8c22dd8f00a06a0700ed_kernel.cu",
+        "cake_fmha_context_fp8_8c22dd8f00a06a0700ed_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -943,12 +947,12 @@ RUNTIME_PACK1_PAGE64 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK8_PX = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_f5f4f0477b7355ea49aa",
+    name="cake_fmha_context_fp8_974dea25a1bcbc06775c",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_f5f4f0477b7355ea49aa",
+    kernel="kernel_cake_fmha_context_fp8_974dea25a1bcbc06775c",
     sources=(
-        "cake_fmha_context_fp8_f5f4f0477b7355ea49aa_kernel.cu",
-        "cake_fmha_context_fp8_f5f4f0477b7355ea49aa_binding.cu",
+        "cake_fmha_context_fp8_974dea25a1bcbc06775c_kernel.cu",
+        "cake_fmha_context_fp8_974dea25a1bcbc06775c_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1009,12 +1013,12 @@ RUNTIME_PACK8_PX = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK4_PX = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_44a395d5bdfbdb97ee60",
+    name="cake_fmha_context_fp8_479df0d88cefb094c3e7",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_44a395d5bdfbdb97ee60",
+    kernel="kernel_cake_fmha_context_fp8_479df0d88cefb094c3e7",
     sources=(
-        "cake_fmha_context_fp8_44a395d5bdfbdb97ee60_kernel.cu",
-        "cake_fmha_context_fp8_44a395d5bdfbdb97ee60_binding.cu",
+        "cake_fmha_context_fp8_479df0d88cefb094c3e7_kernel.cu",
+        "cake_fmha_context_fp8_479df0d88cefb094c3e7_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1075,12 +1079,12 @@ RUNTIME_PACK4_PX = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK2_PX = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_a99be36278f1e5d18f8d",
+    name="cake_fmha_context_fp8_b8d0dbb525f2696d3e03",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_a99be36278f1e5d18f8d",
+    kernel="kernel_cake_fmha_context_fp8_b8d0dbb525f2696d3e03",
     sources=(
-        "cake_fmha_context_fp8_a99be36278f1e5d18f8d_kernel.cu",
-        "cake_fmha_context_fp8_a99be36278f1e5d18f8d_binding.cu",
+        "cake_fmha_context_fp8_b8d0dbb525f2696d3e03_kernel.cu",
+        "cake_fmha_context_fp8_b8d0dbb525f2696d3e03_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1141,12 +1145,12 @@ RUNTIME_PACK2_PX = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK1_PX = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_eae0511881e362ffc582",
+    name="cake_fmha_context_fp8_933bdbad91945bcf2d21",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_eae0511881e362ffc582",
+    kernel="kernel_cake_fmha_context_fp8_933bdbad91945bcf2d21",
     sources=(
-        "cake_fmha_context_fp8_eae0511881e362ffc582_kernel.cu",
-        "cake_fmha_context_fp8_eae0511881e362ffc582_binding.cu",
+        "cake_fmha_context_fp8_933bdbad91945bcf2d21_kernel.cu",
+        "cake_fmha_context_fp8_933bdbad91945bcf2d21_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1207,12 +1211,12 @@ RUNTIME_PACK1_PX = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK8_PAGE64_PX = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_748c0c9e6ada1f018f9d",
+    name="cake_fmha_context_fp8_1222348d842644950386",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_748c0c9e6ada1f018f9d",
+    kernel="kernel_cake_fmha_context_fp8_1222348d842644950386",
     sources=(
-        "cake_fmha_context_fp8_748c0c9e6ada1f018f9d_kernel.cu",
-        "cake_fmha_context_fp8_748c0c9e6ada1f018f9d_binding.cu",
+        "cake_fmha_context_fp8_1222348d842644950386_kernel.cu",
+        "cake_fmha_context_fp8_1222348d842644950386_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1273,12 +1277,12 @@ RUNTIME_PACK8_PAGE64_PX = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK4_PAGE64_PX = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_fcb32e2d1b4093984320",
+    name="cake_fmha_context_fp8_29cdc45592b5623137c6",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_fcb32e2d1b4093984320",
+    kernel="kernel_cake_fmha_context_fp8_29cdc45592b5623137c6",
     sources=(
-        "cake_fmha_context_fp8_fcb32e2d1b4093984320_kernel.cu",
-        "cake_fmha_context_fp8_fcb32e2d1b4093984320_binding.cu",
+        "cake_fmha_context_fp8_29cdc45592b5623137c6_kernel.cu",
+        "cake_fmha_context_fp8_29cdc45592b5623137c6_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1339,12 +1343,12 @@ RUNTIME_PACK4_PAGE64_PX = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK2_PAGE64_PX = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_82debe692de1baf9c207",
+    name="cake_fmha_context_fp8_733558922a0144e96b0f",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_82debe692de1baf9c207",
+    kernel="kernel_cake_fmha_context_fp8_733558922a0144e96b0f",
     sources=(
-        "cake_fmha_context_fp8_82debe692de1baf9c207_kernel.cu",
-        "cake_fmha_context_fp8_82debe692de1baf9c207_binding.cu",
+        "cake_fmha_context_fp8_733558922a0144e96b0f_kernel.cu",
+        "cake_fmha_context_fp8_733558922a0144e96b0f_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1405,12 +1409,12 @@ RUNTIME_PACK2_PAGE64_PX = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK1_PAGE64_PX = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_1c2e852a19f3b2b19d2b",
+    name="cake_fmha_context_fp8_290a4ce6ad5aa95368d1",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_1c2e852a19f3b2b19d2b",
+    kernel="kernel_cake_fmha_context_fp8_290a4ce6ad5aa95368d1",
     sources=(
-        "cake_fmha_context_fp8_1c2e852a19f3b2b19d2b_kernel.cu",
-        "cake_fmha_context_fp8_1c2e852a19f3b2b19d2b_binding.cu",
+        "cake_fmha_context_fp8_290a4ce6ad5aa95368d1_kernel.cu",
+        "cake_fmha_context_fp8_290a4ce6ad5aa95368d1_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -1471,15 +1475,18 @@ RUNTIME_PACK1_PAGE64_PX = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK8_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_f681db469a848459f224",
+    name="cake_fmha_context_fp8_98519e1561f69cc77fda",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_f681db469a848459f224",
+    kernel="kernel_cake_fmha_context_fp8_98519e1561f69cc77fda",
     sources=(
-        "cake_fmha_context_fp8_f681db469a848459f224_kernel.cu",
-        "cake_fmha_context_fp8_f681db469a848459f224_binding.cu",
+        "cake_fmha_context_fp8_98519e1561f69cc77fda_kernel.cu",
+        "cake_fmha_context_fp8_98519e1561f69cc77fda_binding.cu",
     ),
-    targets=("sm_100a",),
-    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -1537,15 +1544,18 @@ RUNTIME_PACK8_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK4_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_b7dcfbdacbecc093692d",
+    name="cake_fmha_context_fp8_69371659c5de83d1c6f3",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_b7dcfbdacbecc093692d",
+    kernel="kernel_cake_fmha_context_fp8_69371659c5de83d1c6f3",
     sources=(
-        "cake_fmha_context_fp8_b7dcfbdacbecc093692d_kernel.cu",
-        "cake_fmha_context_fp8_b7dcfbdacbecc093692d_binding.cu",
+        "cake_fmha_context_fp8_69371659c5de83d1c6f3_kernel.cu",
+        "cake_fmha_context_fp8_69371659c5de83d1c6f3_binding.cu",
     ),
-    targets=("sm_100a",),
-    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -1603,15 +1613,18 @@ RUNTIME_PACK4_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK2_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_bd6fc47806824d1c070e",
+    name="cake_fmha_context_fp8_d00439888f9ecc52cf8e",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_bd6fc47806824d1c070e",
+    kernel="kernel_cake_fmha_context_fp8_d00439888f9ecc52cf8e",
     sources=(
-        "cake_fmha_context_fp8_bd6fc47806824d1c070e_kernel.cu",
-        "cake_fmha_context_fp8_bd6fc47806824d1c070e_binding.cu",
+        "cake_fmha_context_fp8_d00439888f9ecc52cf8e_kernel.cu",
+        "cake_fmha_context_fp8_d00439888f9ecc52cf8e_binding.cu",
     ),
-    targets=("sm_100a",),
-    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -1669,15 +1682,18 @@ RUNTIME_PACK2_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK1_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_0c2cbb608777b46cf890",
+    name="cake_fmha_context_fp8_23ccecb73487c64c88e4",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_0c2cbb608777b46cf890",
+    kernel="kernel_cake_fmha_context_fp8_23ccecb73487c64c88e4",
     sources=(
-        "cake_fmha_context_fp8_0c2cbb608777b46cf890_kernel.cu",
-        "cake_fmha_context_fp8_0c2cbb608777b46cf890_binding.cu",
+        "cake_fmha_context_fp8_23ccecb73487c64c88e4_kernel.cu",
+        "cake_fmha_context_fp8_23ccecb73487c64c88e4_binding.cu",
     ),
-    targets=("sm_100a",),
-    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
     args=(
         "Q",
         "K",
@@ -1735,12 +1751,12 @@ RUNTIME_PACK1_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK8_PAGE64_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_51366a2f7759481ba225",
+    name="cake_fmha_context_fp8_66d9c3d0a157c6288c8f",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_51366a2f7759481ba225",
+    kernel="kernel_cake_fmha_context_fp8_66d9c3d0a157c6288c8f",
     sources=(
-        "cake_fmha_context_fp8_51366a2f7759481ba225_kernel.cu",
-        "cake_fmha_context_fp8_51366a2f7759481ba225_binding.cu",
+        "cake_fmha_context_fp8_66d9c3d0a157c6288c8f_kernel.cu",
+        "cake_fmha_context_fp8_66d9c3d0a157c6288c8f_binding.cu",
     ),
     targets=("sm_100a",),
     compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
@@ -1801,12 +1817,12 @@ RUNTIME_PACK8_PAGE64_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK4_PAGE64_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_659d365cc519f17145a9",
+    name="cake_fmha_context_fp8_09891a177f5196571b27",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_659d365cc519f17145a9",
+    kernel="kernel_cake_fmha_context_fp8_09891a177f5196571b27",
     sources=(
-        "cake_fmha_context_fp8_659d365cc519f17145a9_kernel.cu",
-        "cake_fmha_context_fp8_659d365cc519f17145a9_binding.cu",
+        "cake_fmha_context_fp8_09891a177f5196571b27_kernel.cu",
+        "cake_fmha_context_fp8_09891a177f5196571b27_binding.cu",
     ),
     targets=("sm_100a",),
     compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
@@ -1867,12 +1883,12 @@ RUNTIME_PACK4_PAGE64_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK2_PAGE64_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_fbcfd6d640bedc993798",
+    name="cake_fmha_context_fp8_b82165c563e4cb32b133",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_fbcfd6d640bedc993798",
+    kernel="kernel_cake_fmha_context_fp8_b82165c563e4cb32b133",
     sources=(
-        "cake_fmha_context_fp8_fbcfd6d640bedc993798_kernel.cu",
-        "cake_fmha_context_fp8_fbcfd6d640bedc993798_binding.cu",
+        "cake_fmha_context_fp8_b82165c563e4cb32b133_kernel.cu",
+        "cake_fmha_context_fp8_b82165c563e4cb32b133_binding.cu",
     ),
     targets=("sm_100a",),
     compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
@@ -1933,12 +1949,12 @@ RUNTIME_PACK2_PAGE64_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK1_PAGE64_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_e1ac044d4082c31ebe27",
+    name="cake_fmha_context_fp8_888c8c0de1e167c1212c",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_e1ac044d4082c31ebe27",
+    kernel="kernel_cake_fmha_context_fp8_888c8c0de1e167c1212c",
     sources=(
-        "cake_fmha_context_fp8_e1ac044d4082c31ebe27_kernel.cu",
-        "cake_fmha_context_fp8_e1ac044d4082c31ebe27_binding.cu",
+        "cake_fmha_context_fp8_888c8c0de1e167c1212c_kernel.cu",
+        "cake_fmha_context_fp8_888c8c0de1e167c1212c_binding.cu",
     ),
     targets=("sm_100a",),
     compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
@@ -1999,12 +2015,12 @@ RUNTIME_PACK1_PAGE64_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK8_PX_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_4f34c8c6d58c0b96c60e",
+    name="cake_fmha_context_fp8_b193daaab958d4babaac",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_4f34c8c6d58c0b96c60e",
+    kernel="kernel_cake_fmha_context_fp8_b193daaab958d4babaac",
     sources=(
-        "cake_fmha_context_fp8_4f34c8c6d58c0b96c60e_kernel.cu",
-        "cake_fmha_context_fp8_4f34c8c6d58c0b96c60e_binding.cu",
+        "cake_fmha_context_fp8_b193daaab958d4babaac_kernel.cu",
+        "cake_fmha_context_fp8_b193daaab958d4babaac_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -2065,12 +2081,12 @@ RUNTIME_PACK8_PX_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK4_PX_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_2313db68d6003f9159d3",
+    name="cake_fmha_context_fp8_ec3760f97265869bb4d8",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_2313db68d6003f9159d3",
+    kernel="kernel_cake_fmha_context_fp8_ec3760f97265869bb4d8",
     sources=(
-        "cake_fmha_context_fp8_2313db68d6003f9159d3_kernel.cu",
-        "cake_fmha_context_fp8_2313db68d6003f9159d3_binding.cu",
+        "cake_fmha_context_fp8_ec3760f97265869bb4d8_kernel.cu",
+        "cake_fmha_context_fp8_ec3760f97265869bb4d8_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -2131,12 +2147,12 @@ RUNTIME_PACK4_PX_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK2_PX_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_2f67edac2abdb7a9bee9",
+    name="cake_fmha_context_fp8_55b399c09e7b9e963664",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_2f67edac2abdb7a9bee9",
+    kernel="kernel_cake_fmha_context_fp8_55b399c09e7b9e963664",
     sources=(
-        "cake_fmha_context_fp8_2f67edac2abdb7a9bee9_kernel.cu",
-        "cake_fmha_context_fp8_2f67edac2abdb7a9bee9_binding.cu",
+        "cake_fmha_context_fp8_55b399c09e7b9e963664_kernel.cu",
+        "cake_fmha_context_fp8_55b399c09e7b9e963664_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -2197,12 +2213,12 @@ RUNTIME_PACK2_PX_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK1_PX_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_4959ded18999626f39eb",
+    name="cake_fmha_context_fp8_e3820dae3c8125209907",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_4959ded18999626f39eb",
+    kernel="kernel_cake_fmha_context_fp8_e3820dae3c8125209907",
     sources=(
-        "cake_fmha_context_fp8_4959ded18999626f39eb_kernel.cu",
-        "cake_fmha_context_fp8_4959ded18999626f39eb_binding.cu",
+        "cake_fmha_context_fp8_e3820dae3c8125209907_kernel.cu",
+        "cake_fmha_context_fp8_e3820dae3c8125209907_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -2263,12 +2279,12 @@ RUNTIME_PACK1_PX_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK8_PAGE64_PX_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_1d47fdfe426734591b0f",
+    name="cake_fmha_context_fp8_33898a252fbaa5722dae",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_1d47fdfe426734591b0f",
+    kernel="kernel_cake_fmha_context_fp8_33898a252fbaa5722dae",
     sources=(
-        "cake_fmha_context_fp8_1d47fdfe426734591b0f_kernel.cu",
-        "cake_fmha_context_fp8_1d47fdfe426734591b0f_binding.cu",
+        "cake_fmha_context_fp8_33898a252fbaa5722dae_kernel.cu",
+        "cake_fmha_context_fp8_33898a252fbaa5722dae_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -2329,12 +2345,12 @@ RUNTIME_PACK8_PAGE64_PX_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK4_PAGE64_PX_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_0a0656db8e220f88ff4d",
+    name="cake_fmha_context_fp8_b167e399fff8871743fc",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_0a0656db8e220f88ff4d",
+    kernel="kernel_cake_fmha_context_fp8_b167e399fff8871743fc",
     sources=(
-        "cake_fmha_context_fp8_0a0656db8e220f88ff4d_kernel.cu",
-        "cake_fmha_context_fp8_0a0656db8e220f88ff4d_binding.cu",
+        "cake_fmha_context_fp8_b167e399fff8871743fc_kernel.cu",
+        "cake_fmha_context_fp8_b167e399fff8871743fc_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -2395,12 +2411,12 @@ RUNTIME_PACK4_PAGE64_PX_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK2_PAGE64_PX_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_7a18734297cb8a01346a",
+    name="cake_fmha_context_fp8_6934061567e1564d7aa0",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_7a18734297cb8a01346a",
+    kernel="kernel_cake_fmha_context_fp8_6934061567e1564d7aa0",
     sources=(
-        "cake_fmha_context_fp8_7a18734297cb8a01346a_kernel.cu",
-        "cake_fmha_context_fp8_7a18734297cb8a01346a_binding.cu",
+        "cake_fmha_context_fp8_6934061567e1564d7aa0_kernel.cu",
+        "cake_fmha_context_fp8_6934061567e1564d7aa0_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -2461,12 +2477,12 @@ RUNTIME_PACK2_PAGE64_PX_Q1 = cake_program.CakeProgram(
 )
 
 RUNTIME_PACK1_PAGE64_PX_Q1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_46a6a321da75ece12aa6",
+    name="cake_fmha_context_fp8_b42343b75e9525f7d215",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_46a6a321da75ece12aa6",
+    kernel="kernel_cake_fmha_context_fp8_b42343b75e9525f7d215",
     sources=(
-        "cake_fmha_context_fp8_46a6a321da75ece12aa6_kernel.cu",
-        "cake_fmha_context_fp8_46a6a321da75ece12aa6_binding.cu",
+        "cake_fmha_context_fp8_b42343b75e9525f7d215_kernel.cu",
+        "cake_fmha_context_fp8_b42343b75e9525f7d215_binding.cu",
     ),
     targets=("sm_103a",),
     compile_options=(("sm_103a", ("--use_fast_math", "--fmad=true")),),
@@ -2526,13 +2542,475 @@ RUNTIME_PACK1_PAGE64_PX_Q1 = cake_program.CakeProgram(
     needs_device_linking=False,
 )
 
-RUNTIME_SK_PACK8 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_ee373474e6d16691cab7",
+RUNTIME_PACK2_PAGE64_Q1_MW = cake_program.CakeProgram(
+    name="cake_fmha_context_fp8_dd2e6e339330c40630fa",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_ee373474e6d16691cab7",
+    kernel="kernel_cake_fmha_context_fp8_dd2e6e339330c40630fa",
     sources=(
-        "cake_fmha_context_fp8_ee373474e6d16691cab7_kernel.cu",
-        "cake_fmha_context_fp8_ee373474e6d16691cab7_binding.cu",
+        "cake_fmha_context_fp8_dd2e6e339330c40630fa_kernel.cu",
+        "cake_fmha_context_fp8_dd2e6e339330c40630fa_binding.cu",
+    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "softmax_scale_log2",
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+        "scale_source",
+        "num_m_blocks",
+        "full_sections",
+        "num_bh_units",
+        "num_q_heads",
+        "heads_per_group",
+        "page_shift",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=86528,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+RUNTIME_PACK1_PAGE64_Q1_MW = cake_program.CakeProgram(
+    name="cake_fmha_context_fp8_d3093a512d060fdfad20",
+    operator_dir="cake_fmha_context_fp8",
+    kernel="kernel_cake_fmha_context_fp8_d3093a512d060fdfad20",
+    sources=(
+        "cake_fmha_context_fp8_d3093a512d060fdfad20_kernel.cu",
+        "cake_fmha_context_fp8_d3093a512d060fdfad20_binding.cu",
+    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "softmax_scale_log2",
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+        "scale_source",
+        "num_m_blocks",
+        "full_sections",
+        "num_bh_units",
+        "num_q_heads",
+        "heads_per_group",
+        "page_shift",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=86528,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+RUNTIME_PACK8_OW = cake_program.CakeProgram(
+    name="cake_fmha_context_fp8_c42e0614ab8103e2499a",
+    operator_dir="cake_fmha_context_fp8",
+    kernel="kernel_cake_fmha_context_fp8_c42e0614ab8103e2499a",
+    sources=(
+        "cake_fmha_context_fp8_c42e0614ab8103e2499a_kernel.cu",
+        "cake_fmha_context_fp8_c42e0614ab8103e2499a_binding.cu",
+    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "softmax_scale_log2",
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+        "scale_source",
+        "num_m_blocks",
+        "full_sections",
+        "num_bh_units",
+        "num_q_heads",
+        "heads_per_group",
+        "page_shift",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=86528,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+RUNTIME_PACK8_Q1_OW = cake_program.CakeProgram(
+    name="cake_fmha_context_fp8_024e5f82f5e94b38d2ff",
+    operator_dir="cake_fmha_context_fp8",
+    kernel="kernel_cake_fmha_context_fp8_024e5f82f5e94b38d2ff",
+    sources=(
+        "cake_fmha_context_fp8_024e5f82f5e94b38d2ff_kernel.cu",
+        "cake_fmha_context_fp8_024e5f82f5e94b38d2ff_binding.cu",
+    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "softmax_scale_log2",
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+        "scale_source",
+        "num_m_blocks",
+        "full_sections",
+        "num_bh_units",
+        "num_q_heads",
+        "heads_per_group",
+        "page_shift",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=86528,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+RUNTIME_PACK4_Q1_OW = cake_program.CakeProgram(
+    name="cake_fmha_context_fp8_7421f1ee37279a2bea13",
+    operator_dir="cake_fmha_context_fp8",
+    kernel="kernel_cake_fmha_context_fp8_7421f1ee37279a2bea13",
+    sources=(
+        "cake_fmha_context_fp8_7421f1ee37279a2bea13_kernel.cu",
+        "cake_fmha_context_fp8_7421f1ee37279a2bea13_binding.cu",
+    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "softmax_scale_log2",
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+        "scale_source",
+        "num_m_blocks",
+        "full_sections",
+        "num_bh_units",
+        "num_q_heads",
+        "heads_per_group",
+        "page_shift",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=86528,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+RUNTIME_PACK2_Q1_OW = cake_program.CakeProgram(
+    name="cake_fmha_context_fp8_e22e25d0e0baa16f1cb7",
+    operator_dir="cake_fmha_context_fp8",
+    kernel="kernel_cake_fmha_context_fp8_e22e25d0e0baa16f1cb7",
+    sources=(
+        "cake_fmha_context_fp8_e22e25d0e0baa16f1cb7_kernel.cu",
+        "cake_fmha_context_fp8_e22e25d0e0baa16f1cb7_binding.cu",
+    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "softmax_scale_log2",
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+        "scale_source",
+        "num_m_blocks",
+        "full_sections",
+        "num_bh_units",
+        "num_q_heads",
+        "heads_per_group",
+        "page_shift",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=86528,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+RUNTIME_PACK1_Q1_OW = cake_program.CakeProgram(
+    name="cake_fmha_context_fp8_3e5440ae1066e6902e1d",
+    operator_dir="cake_fmha_context_fp8",
+    kernel="kernel_cake_fmha_context_fp8_3e5440ae1066e6902e1d",
+    sources=(
+        "cake_fmha_context_fp8_3e5440ae1066e6902e1d_kernel.cu",
+        "cake_fmha_context_fp8_3e5440ae1066e6902e1d_binding.cu",
+    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "softmax_scale_log2",
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+        "scale_source",
+        "num_m_blocks",
+        "full_sections",
+        "num_bh_units",
+        "num_q_heads",
+        "heads_per_group",
+        "page_shift",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=86528,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+RUNTIME_SK_PACK8 = cake_program.CakeProgram(
+    name="cake_fmha_context_fp8_2b603161717df80f5fad",
+    operator_dir="cake_fmha_context_fp8",
+    kernel="kernel_cake_fmha_context_fp8_2b603161717df80f5fad",
+    sources=(
+        "cake_fmha_context_fp8_2b603161717df80f5fad_kernel.cu",
+        "cake_fmha_context_fp8_2b603161717df80f5fad_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -2605,12 +3083,12 @@ RUNTIME_SK_PACK8 = cake_program.CakeProgram(
 )
 
 RUNTIME_SK_PACK4 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_074b1da06353ee6d95c6",
+    name="cake_fmha_context_fp8_65810993ed3b69e0ec02",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_074b1da06353ee6d95c6",
+    kernel="kernel_cake_fmha_context_fp8_65810993ed3b69e0ec02",
     sources=(
-        "cake_fmha_context_fp8_074b1da06353ee6d95c6_kernel.cu",
-        "cake_fmha_context_fp8_074b1da06353ee6d95c6_binding.cu",
+        "cake_fmha_context_fp8_65810993ed3b69e0ec02_kernel.cu",
+        "cake_fmha_context_fp8_65810993ed3b69e0ec02_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -2683,12 +3161,12 @@ RUNTIME_SK_PACK4 = cake_program.CakeProgram(
 )
 
 RUNTIME_SK_PACK2 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_2208354a624a713e3455",
+    name="cake_fmha_context_fp8_af67d1eeceafba84dcfa",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_2208354a624a713e3455",
+    kernel="kernel_cake_fmha_context_fp8_af67d1eeceafba84dcfa",
     sources=(
-        "cake_fmha_context_fp8_2208354a624a713e3455_kernel.cu",
-        "cake_fmha_context_fp8_2208354a624a713e3455_binding.cu",
+        "cake_fmha_context_fp8_af67d1eeceafba84dcfa_kernel.cu",
+        "cake_fmha_context_fp8_af67d1eeceafba84dcfa_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -2761,12 +3239,12 @@ RUNTIME_SK_PACK2 = cake_program.CakeProgram(
 )
 
 RUNTIME_SK_PACK1 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_a93f4040f2fe5b5a85bb",
+    name="cake_fmha_context_fp8_1a415e1054807d030032",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_a93f4040f2fe5b5a85bb",
+    kernel="kernel_cake_fmha_context_fp8_1a415e1054807d030032",
     sources=(
-        "cake_fmha_context_fp8_a93f4040f2fe5b5a85bb_kernel.cu",
-        "cake_fmha_context_fp8_a93f4040f2fe5b5a85bb_binding.cu",
+        "cake_fmha_context_fp8_1a415e1054807d030032_kernel.cu",
+        "cake_fmha_context_fp8_1a415e1054807d030032_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -2839,12 +3317,12 @@ RUNTIME_SK_PACK1 = cake_program.CakeProgram(
 )
 
 RUNTIME_SK_PACK8_PAGE64 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_617e3a6b50380cf6e0a5",
+    name="cake_fmha_context_fp8_795ed70e65c7e13a5f23",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_617e3a6b50380cf6e0a5",
+    kernel="kernel_cake_fmha_context_fp8_795ed70e65c7e13a5f23",
     sources=(
-        "cake_fmha_context_fp8_617e3a6b50380cf6e0a5_kernel.cu",
-        "cake_fmha_context_fp8_617e3a6b50380cf6e0a5_binding.cu",
+        "cake_fmha_context_fp8_795ed70e65c7e13a5f23_kernel.cu",
+        "cake_fmha_context_fp8_795ed70e65c7e13a5f23_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -2917,12 +3395,12 @@ RUNTIME_SK_PACK8_PAGE64 = cake_program.CakeProgram(
 )
 
 RUNTIME_SK_PACK4_PAGE64 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_1ea3c441ffa379d0978f",
+    name="cake_fmha_context_fp8_77d3ca81fef2a7f7b7cc",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_1ea3c441ffa379d0978f",
+    kernel="kernel_cake_fmha_context_fp8_77d3ca81fef2a7f7b7cc",
     sources=(
-        "cake_fmha_context_fp8_1ea3c441ffa379d0978f_kernel.cu",
-        "cake_fmha_context_fp8_1ea3c441ffa379d0978f_binding.cu",
+        "cake_fmha_context_fp8_77d3ca81fef2a7f7b7cc_kernel.cu",
+        "cake_fmha_context_fp8_77d3ca81fef2a7f7b7cc_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -2995,12 +3473,12 @@ RUNTIME_SK_PACK4_PAGE64 = cake_program.CakeProgram(
 )
 
 RUNTIME_SK_PACK2_PAGE64 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_c76354901ca9c86f4fec",
+    name="cake_fmha_context_fp8_7fa02b4209c5bbac7b59",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_c76354901ca9c86f4fec",
+    kernel="kernel_cake_fmha_context_fp8_7fa02b4209c5bbac7b59",
     sources=(
-        "cake_fmha_context_fp8_c76354901ca9c86f4fec_kernel.cu",
-        "cake_fmha_context_fp8_c76354901ca9c86f4fec_binding.cu",
+        "cake_fmha_context_fp8_7fa02b4209c5bbac7b59_kernel.cu",
+        "cake_fmha_context_fp8_7fa02b4209c5bbac7b59_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -3073,12 +3551,12 @@ RUNTIME_SK_PACK2_PAGE64 = cake_program.CakeProgram(
 )
 
 RUNTIME_SK_PACK1_PAGE64 = cake_program.CakeProgram(
-    name="cake_fmha_context_fp8_9697d1fcd36a1f4a023e",
+    name="cake_fmha_context_fp8_f96322ad196e7e677281",
     operator_dir="cake_fmha_context_fp8",
-    kernel="kernel_cake_fmha_context_fp8_9697d1fcd36a1f4a023e",
+    kernel="kernel_cake_fmha_context_fp8_f96322ad196e7e677281",
     sources=(
-        "cake_fmha_context_fp8_9697d1fcd36a1f4a023e_kernel.cu",
-        "cake_fmha_context_fp8_9697d1fcd36a1f4a023e_binding.cu",
+        "cake_fmha_context_fp8_f96322ad196e7e677281_kernel.cu",
+        "cake_fmha_context_fp8_f96322ad196e7e677281_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -3150,6 +3628,81 @@ RUNTIME_SK_PACK1_PAGE64 = cake_program.CakeProgram(
     needs_device_linking=False,
 )
 
+RUNTIME_SK_PACK1_PAGE64_S2 = cake_program.CakeProgram(
+    name="cake_fmha_context_fp8_2f52275266d147049a48",
+    operator_dir="cake_fmha_context_fp8",
+    kernel="kernel_cake_fmha_context_fp8_2f52275266d147049a48",
+    sources=(
+        "cake_fmha_context_fp8_2f52275266d147049a48_kernel.cu",
+        "cake_fmha_context_fp8_2f52275266d147049a48_binding.cu",
+    ),
+    targets=("sm_100a",),
+    compile_options=(("sm_100a", ("--use_fast_math", "--fmad=true")),),
+    args=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "softmax_scale_log2",
+        "output_scale",
+        "total_bh",
+        "page_row_stride",
+        "num_ctas",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "bmm1_is_log2",
+        "scale_source",
+        "num_m_blocks",
+        "full_sections",
+        "num_bh_units",
+        "num_q_heads",
+        "heads_per_group",
+        "page_shift",
+        "split_tiles",
+        "split_blocks",
+        "num_splits",
+        "partial_o",
+        "partial_ml",
+        "tile_counters",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "sinks",
+        "page_table_k",
+        "page_table_v",
+        "seq_lens_q",
+        "seq_lens_kv",
+        "cu_seq_lens_q",
+        "dynamic_counter",
+        "bmm1_scale_ptr",
+        "bmm2_scale_ptr",
+        "partial_o",
+        "partial_ml",
+        "tile_counters",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=160256,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
 PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     B256,
     B256_SCALE_PTR,
@@ -3189,6 +3742,13 @@ PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     RUNTIME_PACK4_PAGE64_PX_Q1,
     RUNTIME_PACK2_PAGE64_PX_Q1,
     RUNTIME_PACK1_PAGE64_PX_Q1,
+    RUNTIME_PACK2_PAGE64_Q1_MW,
+    RUNTIME_PACK1_PAGE64_Q1_MW,
+    RUNTIME_PACK8_OW,
+    RUNTIME_PACK8_Q1_OW,
+    RUNTIME_PACK4_Q1_OW,
+    RUNTIME_PACK2_Q1_OW,
+    RUNTIME_PACK1_Q1_OW,
     RUNTIME_SK_PACK8,
     RUNTIME_SK_PACK4,
     RUNTIME_SK_PACK2,
@@ -3197,6 +3757,7 @@ PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     RUNTIME_SK_PACK4_PAGE64,
     RUNTIME_SK_PACK2_PAGE64,
     RUNTIME_SK_PACK1_PAGE64,
+    RUNTIME_SK_PACK1_PAGE64_S2,
 )
 
 
@@ -3244,6 +3805,13 @@ __all__ = [
     "RUNTIME_PACK4_PAGE64_PX_Q1",
     "RUNTIME_PACK2_PAGE64_PX_Q1",
     "RUNTIME_PACK1_PAGE64_PX_Q1",
+    "RUNTIME_PACK2_PAGE64_Q1_MW",
+    "RUNTIME_PACK1_PAGE64_Q1_MW",
+    "RUNTIME_PACK8_OW",
+    "RUNTIME_PACK8_Q1_OW",
+    "RUNTIME_PACK4_Q1_OW",
+    "RUNTIME_PACK2_Q1_OW",
+    "RUNTIME_PACK1_Q1_OW",
     "RUNTIME_SK_PACK8",
     "RUNTIME_SK_PACK4",
     "RUNTIME_SK_PACK2",
@@ -3252,6 +3820,7 @@ __all__ = [
     "RUNTIME_SK_PACK4_PAGE64",
     "RUNTIME_SK_PACK2_PAGE64",
     "RUNTIME_SK_PACK1_PAGE64",
+    "RUNTIME_SK_PACK1_PAGE64_S2",
     "PROGRAMS",
     "aot_specs",
 ]

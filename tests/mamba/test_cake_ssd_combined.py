@@ -1136,6 +1136,36 @@ def test_cake_ssd_combined_varlen_without_initial_states_needs_a_count():
         SSDCombined(**constructor, backend="cake").run(*tensors, **arguments)
 
 
+@pytest.mark.parametrize("total,rows", ((600, 2), (1200, 4), (2048, 2)))
+def test_cake_ssd_combined_triple_refuses_batch_rows(total, rows):
+    """The ``seq_idx`` / ``chunk_indices`` / ``chunk_offsets`` triple describes
+    one packed ``[1, total]`` stream: the same tokens viewed as ``[rows, total /
+    rows]`` are refused before any launch, and the packed call made after the
+    refusal is bitwise the packed call made before it."""
+
+    _skip_unless_cake_arch()
+    constructor, tensors, arguments = _case(varlen=True, lengths=(total,))
+    runner = SSDCombined(**constructor, backend="cake")
+    expected = [value.clone() for value in runner.run(*tensors, **arguments)]
+
+    def rows_view(value):
+        return value.view(rows, total // rows, *value.shape[2:])
+
+    x, dt, A, B, C = tensors
+    split = (rows_view(x), rows_view(dt), A, rows_view(B), rows_view(C))
+    split_arguments = dict(
+        arguments, z=rows_view(arguments["z"]), seq_idx=rows_view(arguments["seq_idx"])
+    )
+    with pytest.raises(
+        ValueError, match=rf"packed \[1, total\] stream \(got batch={rows}\)"
+    ):
+        runner.run(*split, **split_arguments)
+    actual = runner.run(*tensors, **arguments)
+    torch.cuda.synchronize()
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+
+
 @pytest.mark.parametrize("table_source", ("preprocess", "caller"))
 @pytest.mark.parametrize("initial_states", (True, False), ids=("initial", "zero"))
 @pytest.mark.parametrize(
@@ -1671,7 +1701,13 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     published, so the triple runs the fused program of the cu_seqlens form
     wherever the fused window admits it (trusted-table fused route) and the two
     forms are then bitwise again; outside the window it runs the two-kernel
-    program of the derived triple (last block)."""
+    program of the derived triple (last block).
+
+    On SM107 a single-sequence triple deriving its table runs the batched
+    view's fused program with the seq_idx check CTA where
+    ``single_sequence_batched_variant`` takes it; the cu_seqlens form and the
+    caller's trusted table keep their programs, and every form still compares
+    bitwise."""
 
     _skip_unless_cake_arch()
     constructor, tensors, arguments = _case(
@@ -1711,6 +1747,7 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
     # in both forms, so they compare bitwise.
     same_arithmetic = True
     fused = False
+    check_variant = None
     if program_triple.startswith("chunkpar_"):
         assert program_cu == program_triple, (
             f"cu_seqlens form ran {program_cu}, the triple {program_triple}"
@@ -1727,23 +1764,44 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
             mode_varlen=True,
             total_tokens=sum(lengths),
         )
-        assert program_triple.split("_", 1)[0] == (
-            _derived_family(module, lengths) if fused else two_kernel
-        ), (
-            program_triple,
-            fused,
-        )
-        ring_triple = _without_table_form(
-            module,
-            program_triple,
-            state_dtype=state_dtype,
+        derived_family = _derived_family(module, lengths) if fused else two_kernel
+        # SM107: the single-sequence triple deriving its table runs the
+        # batched [1, T] view's fused program with the seq_idx check CTA.
+        check_variant = module.single_sequence_batched_variant(
+            capability=torch.cuda.get_device_capability(),
+            mode_varlen=True,
+            batch=1,
             num_sequences=len(lengths),
-            total_tokens=sum(lengths),
+            derives_table=True,
+            checkpoint_state_count=0,
+            state_dtype=cake.state_dtype,
+            nheads=cake.nheads,
+            nchunks=-(-sum(lengths) // 128),
+            sm_count=torch.cuda.get_device_properties(out.device).multi_processor_count,
+            has_z=cake.has_z,
+            varlen_family=derived_family,
+            chunk_parallel_mode=module._chunk_parallel_mode(),
         )
-        assert program_cu.split("_", 1)[1] == ring_triple.split("_", 1)[1], (
-            program_cu,
-            program_triple,
-        )
+        if check_variant is not None:
+            assert program_triple == module._program_name(
+                "exactfused", state_dtype, False, check_variant
+            ), (program_triple, check_variant)
+        else:
+            assert program_triple.split("_", 1)[0] == derived_family, (
+                program_triple,
+                fused,
+            )
+            ring_triple = _without_table_form(
+                module,
+                program_triple,
+                state_dtype=state_dtype,
+                num_sequences=len(lengths),
+                total_tokens=sum(lengths),
+            )
+            assert program_cu.split("_", 1)[1] == ring_triple.split("_", 1)[1], (
+                program_cu,
+                program_triple,
+            )
         assert program_cu.split("_", 1)[0] == ("exactfused" if fused else two_kernel), (
             program_cu,
             fused,
@@ -1800,9 +1858,16 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
         )
         assert torch.equal(out_trusted, out) and torch.equal(final_trusted, final)
     else:
-        assert program_trusted == program_triple, (
-            f"trusted-table triple ran {program_trusted}, derived {program_triple}"
-        )
+        if check_variant is not None:
+            # the check program serves only the derived table: the trusted
+            # table keeps the two-kernel program of the triple
+            assert program_trusted.split("_", 1)[0] == two_kernel, (
+                f"trusted-table triple ran {program_trusted}, derived {program_triple}"
+            )
+        else:
+            assert program_trusted == program_triple, (
+                f"trusted-table triple ran {program_trusted}, derived {program_triple}"
+            )
         assert torch.equal(out_trusted, out_triple)
         assert torch.equal(final_trusted, final_triple)
     # The public functional entry takes the same form (it infers the state
@@ -3364,6 +3429,11 @@ def _source_cake_varlen_arguments(runner, tensors):
             "chunk_size=256: the seq_idx / chunk_indices / chunk_offsets triple is "
             "the chunk-128 logical segmentation",
         ),
+        (
+            "triple_batch_rows",
+            "the seq_idx / chunk_indices / chunk_offsets triple describes a packed "
+            r"\[1, total\] stream \(got batch=2\)",
+        ),
     ),
 )
 def test_source_public_cake_domain_validation_without_gpu(invalid, match):
@@ -4822,7 +4892,9 @@ def test_source_program_table_names_shipped_sources():
         "exactone_f32_varlen_tablefirst",
         "exactone_f32_varlen_tableroles",
     } | {f"exactpre_{state}_varlen_tailone" for state in ("bf16", "f16", "f32")} | {
-        f"exactfused_{state}_batched_zpf" for state in ("bf16", "f32")
+        f"exactfused_{state}_batched_{variant}"
+        for state in ("bf16", "f32")
+        for variant in ("zpf", "chk", "zpfchk")
     } | {
         "exactpre_bf16_varlen_unit",
         "exactpre_f32_varlen_unit",
@@ -4833,8 +4905,8 @@ def test_source_program_table_names_shipped_sources():
     # The sm_107a-only programs (the claim programs, the two-kernel and fused
     # initial-state bulk programs, the two-kernel one-CTA pair and wrap-plan
     # programs, the one-launch programs in the tablefirst / tableroles prologue
-    # forms, the fused batched z-prefetch programs and the one-CTA-cluster
-    # twins): their
+    # forms, the fused batched z-prefetch and seq_idx check programs and the
+    # one-CTA-cluster twins): their
     # ``_SM107_MODULES`` entry is their sole source.
     assert {
         "exactpre_bf16_varlen_claim",
@@ -4854,6 +4926,10 @@ def test_source_program_table_names_shipped_sources():
         "exactone_f32_varlen_tableroles",
         "exactfused_bf16_batched_zpf",
         "exactfused_f32_batched_zpf",
+        "exactfused_bf16_batched_chk",
+        "exactfused_f32_batched_chk",
+        "exactfused_bf16_batched_zpfchk",
+        "exactfused_f32_batched_zpfchk",
         "exactpre_bf16_varlen_unit",
         "exactpre_f32_varlen_unit",
         "exactone_bf16_varlen_tablefirstunit",
@@ -4935,7 +5011,7 @@ def test_source_program_table_names_shipped_sources():
         }
         | module._SM107_ONLY_PROGRAMS
     )
-    assert len(module._SM107_MODULES) == 64
+    assert len(module._SM107_MODULES) == 68
     assert set(module._SM107_MODULES) <= set(module._PROGRAMS)
     assert set(module._PROGRAMS) - set(module._SM107_MODULES) == {
         name for name in module._PROGRAMS if name.startswith(("exact_", "exactmeta_"))
@@ -5014,6 +5090,8 @@ def test_source_program_table_names_shipped_sources():
                 "tablefirst",
                 "tableroles",
                 "zpf",
+                "chk",
+                "zpfchk",
                 "unit",
                 "tablefirstunit",
                 "tablerolesunit",
@@ -5043,7 +5121,7 @@ def test_source_program_table_names_shipped_sources():
                 "tablerolesunit",
             ):
                 assert family == "exactone" and mode == "varlen"
-            if variant_name == "zpf":
+            if variant_name in ("zpf", "chk", "zpfchk"):
                 assert family == "exactfused" and mode == "batched"
                 assert state_key in ("bf16", "f32")
             if variant_name == "unit":
@@ -5059,6 +5137,8 @@ def test_source_program_table_names_shipped_sources():
                 "tablefirst",
                 "tableroles",
                 "zpf",
+                "chk",
+                "zpfchk",
                 "unit",
                 "tablefirstunit",
                 "tablerolesunit",
@@ -5082,6 +5162,8 @@ def test_source_program_table_names_shipped_sources():
                     ("exactpre", "wrap"): module._EXACTPRE_TAILONE_SMEM_BYTES,
                     ("exactfused", "ibulk"): module._EXACTFUSED_IBULK_SMEM_BYTES,
                     ("exactfused", "zpf"): module._EXACTFUSED_SMEM_BYTES,
+                    ("exactfused", "chk"): module._EXACTFUSED_SMEM_BYTES,
+                    ("exactfused", "zpfchk"): module._EXACTFUSED_SMEM_BYTES,
                     ("exactpre", "unit"): module._EXACTPRE_SMEM_BYTES,
                     ("exactone", "tablefirstunit"): module._EXACTONE_SMEM_BYTES,
                     ("exactone", "tablerolesunit"): module._EXACTONE_SMEM_BYTES,
@@ -7314,10 +7396,11 @@ def test_source_exact_scan_variant_programs():
                 assert a.main.module != b.main.module
     # the retained and the fused family: six ring programs and the five
     # ``_noring`` programs the variant rule can select; the fused family also
-    # the two sm_107a-only ``_ibulk`` and the two ``_zpf`` programs
+    # the two sm_107a-only ``_ibulk``, the two ``_zpf`` and the four seq_idx
+    # check (``_chk``, ``_zpfchk``) programs
     assert len([name for name in module._PROGRAMS if name.startswith("exact_")]) == 11
     assert (
-        len([name for name in module._PROGRAMS if name.startswith("exactfused_")]) == 15
+        len([name for name in module._PROGRAMS if name.startswith("exactfused_")]) == 19
     )
     # the two-kernel family: six ring and six ``_tail`` programs, no ``_noring``,
     # and the sm_107a-only programs: two ``_claim``, two ``_ibulk``, three
@@ -7342,7 +7425,7 @@ def test_source_exact_scan_variant_programs():
     assert (
         len([name for name in module._PROGRAMS if name.startswith("exactone_")]) == 14
     )
-    assert len(module._PROGRAMS) == 80
+    assert len(module._PROGRAMS) == 84
 
 
 @pytest.mark.parametrize(

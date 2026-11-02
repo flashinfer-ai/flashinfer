@@ -3194,6 +3194,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
               ``[max_num_pages, 2, num_kv_heads, page_size, head_dim]`` if
               :attr:`kv_layout` is ``HND``. Where ``paged_kv_cache[:, 0]`` is the key-cache and
               ``paged_kv_cache[:, 1]`` is the value-cache.
+
+            For NVFP4 ``torch.uint8`` caches, the last dimension is
+            ``head_dim // 2`` because each byte stores two FP4 values.
         *args
             Additional arguments for the custom kernel.
         q_scale : Optional[float]
@@ -3246,7 +3249,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
             Both tensors have dtype ``torch.float8_e4m3fn``.
 
-            Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
+            Currently, NVFP4 KV supports the ``fa2`` and ``trtllm-gen`` backends;
+            ``fa2`` requires ``use_tensor_cores=True``.
 
             With ``use_token_head_sf=True`` (plan time), ``kv_cache_sf`` must be a
             ``(k_sf, v_sf)`` tuple of ``float32`` tensors mirroring the KV layout
@@ -3257,11 +3261,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
-            If :attr:`return_lse` is ``False``, the attention output, shape: ``[batch_size, num_qo_heads, head_dim]``.
+            If :attr:`return_lse` is ``False``, the attention output, shape:
+            ``[batch_size * q_len_per_req, num_qo_heads, head_dim]``.
             If :attr:`return_lse` is ``True``, a tuple of two tensors:
 
-            * attention output, shape: ``[batch_size, num_qo_heads, head_dim]``
-            * logsumexp of attention scores, shape: ``[batch_size, num_qo_heads]``.
+            * attention output, shape:
+              ``[batch_size * q_len_per_req, num_qo_heads, head_dim]``
+            * logsumexp of attention scores, shape:
+              ``[batch_size * q_len_per_req, num_qo_heads]``.
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)

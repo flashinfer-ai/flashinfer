@@ -1,258 +1,225 @@
-# Cake dense projection GEMM backend (SM100 / SM107)
+# Cake dense projection GEMM backend with an explicit numerical mode (SM100 / SM103 / SM107)
 
-Experimental backend for the GLM-5.2 training GEMMs: the BF16 dense projection
-GEMM (K1 -- BF16 operands, FP32 accumulation, BF16 or FP32 output, strided
-views, ragged token counts, batched head projections) and the FP32 router-gate
-GEMM through split-BF16x3 tensor-core emulation with chunked FP32 promotion
-(K2).  Tracking issue: flashinfer-ai/flashinfer#5677.
+Experimental backend for the GLM-5.2 training GEMMs -- the BF16 dense projection GEMM (K1: BF16 operands, FP32
+accumulation, BF16 or FP32 output, strided views, ragged token counts, batched head projections) and the FP32
+router-gate GEMM through split-BF16x3 tensor-core emulation (K2) -- with a selectable numerical mode.  Family issue:
+flashinfer-ai/flashinfer#5677.
+
+The deterministic implementation is the package `flashinfer.experimental.dense_projection_det_gemm`
+(flashinfer-ai/flashinfer#5677, #7043; see its README for the view contract, the host paths and the per-architecture
+programs).  This package keeps its operations, dtypes, accuracy budgets and host paths, and adds programs whose
+split-K reductions add the partials in the order they finish.  Only run-to-run bitwise reproducibility is relaxed,
+and only where a row adds more than two partials.
 
 Both the API and the backend are experimental: no compatibility guarantee.
-SM107 (Rubin R200) is the primary architecture; SM100 (B200 / GB200) is built
-from the same sources and, for five input-gradient rows, ships the knob-free
-eight-warp CTA form of the GEMM (one program, measured on GB200); SM103 (B300 /
-GB300) ships its own builds of the same programs and, for six input-gradient
-rows, the eight-warp CTA form in two programs (`cake_jit.KERNELS` lists the registered architectures).  A device whose architecture the registry does not
-list raises `NotImplementedError` naming the missing instance.  The feature has
-no core entry point yet (importing this package is
-the explicit opt-in) and does not participate in automatic backend selection,
-autotuning or trace-apply.  Its libraries are loaded prebuilt from `aot/` when
-the package ships them and JIT-built by FlashInfer from `build.json` otherwise
-(see "Layout of this package").
 
-## Entry points (`cake_backend.py`)
+## Numerical mode
 
-```python
-from flashinfer.experimental.dense_projection_gemm import cake_backend as gemm
+Every entry point of `cake_backend` takes the keyword-only `deterministic: bool = True`.
 
-# K1: strided-view GEMM  out[l, m, n] = sum_k A[l, m, k] B[l, k, n]
-gemm.dense_projection_gemm(A, B, out, transposed_out=False)   # convenience path (cached plan)
-gemm.projection_forward(X, W, out=None)               # out[T, N] = X[T, K] @ W[N, K].T
-gemm.projection_dgrad(G, W, out=None, out_dtype=None)  # out[T, K] = G[T, N] @ W[N, K]
-gemm.projection_wgrad(G, X, out=None, out_dtype=None)  # out[N, K] = G[T, N].T @ X[T, K]
-prepared = gemm.prepare_dense_projection_gemm(A, B, out, transposed_out=False)
-prepared = gemm.prepare_projection_wgrad(G, X, out)
-prepared.launch()   # allocation-free; prepared.template / .grid / .module_name / .plan
-
-# K2: FP32 router GEMM through split-BF16x3 emulation
-gemm.router_fp32_gemm(A, B, out, splits=None)                  # convenience path (cached plan)
-gemm.router_forward(X, W, out=None, splits=4)          # out[T, N] = X[T, K] @ W[N, K].T
-gemm.router_dgrad(G, W, out=None)                      # out[T, K] = G[T, N] @ W[N, K]
-gemm.router_wgrad(G, X, out=None, splits=6)            # out[N, K] = G[T, N].T @ X[T, K]
-prepared = gemm.prepare_router_fp32_gemm(A, B, out, splits=None)
-prepared.launch()   # re-splits B, launches, reduces the split-K partials; .splits
-```
-
-### Host paths
-
-Both paths run the same planner once per binding and bind the same generated
-module; they differ in who owns the plan and the workspace.
-
-| | prepared path (`prepare_*` + `launch()`) | convenience path (`dense_projection_gemm`, `projection_*`, `router_*`) |
-|---|---|---|
-| planning | once, in `prepare_*` | once per cache key, on the first call |
-| workspace (K1: stream-K slabs + slice counters; K2: BF16x3 stack, the torch-chain split's fp32 scratch, split-K partials) | owned by the prepared object | carved out of the workspace arena of the (device, stream): one growable buffer per kind shared by every cached entry of that device and stream, grown to the largest requirement seen, never per entry |
-| per call | bind nothing: launch the bound views | rebind the caller's views (view objects only), resolve the workspace views of the arena (memoised until the arena grows), launch; `out` is allocated only when the caller passes none |
-| device queries | none after `prepare_*` | none after the first call |
-| cache | none | per process, per kind (K1 / K2), `CONVENIENCE_CACHE_SIZE` = 64 entries, least recently used first out; the arena of a (device, stream) is released with its last entry and by `clear_convenience_caches()` |
-| memory held | the prepared object's workspace | bounded by the largest geometry seen per workspace kind, however many token counts the cache has planned (a ragged T adds entries, not workspace) |
-| CUDA Graphs | capture `launch()` | do not capture (a later growth replaces, an eviction frees, the workspace a graph replays) |
-
-The orientation of `projection_wgrad` / `prepare_projection_wgrad` follows the
-row's measured rule when the rule table keys the row in exactly one orientation
-(the swapped `X.T @ G` form with the transposed store, or the direct `G.T @
-X`), else the launcher's padded-tile-work rule (N < 256 and N = 576 swap);
-`wgrad_views(G, X, arch=..., out_f32=...)` exposes the decision.
-
-The cache key is `(device index, raw stream, flags / knobs, geometry of A, B,
-out)` where a view's geometry is its shape, strides, dtype, storage offset and
-the 16-byte alignment residue of its first element -- never its address, so new
-tensors of the same geometry hit (a training step with fresh activations) and
-an entry never holds a caller's tensor.  Launches on different streams never
-share a workspace (the stream is in the key and each (device, stream) has its
-own arena); launches of one device and stream -- the only users of its arena --
-are ordered by that stream, which is what makes one buffer per kind safe to
-share: the K2 split rewrites the BF16x3 stack and its scratch in full before
-every launch, the split-K partials are reduced into `out` right after the
-launch, and growing a buffer replaces it while an earlier launch may still be
-in flight on the old one -- safe because PyTorch's caching allocator is
-stream-ordered (a freed block is handed out again only to a later allocation on
-the stream it was freed on, or after a device-synchronising `cudaFree`).  The
-stream-K slice counters are zero-initialised once and reused without a memset:
-the kernel resets every counter it uses (the last arriver of a tail tile's slice
-writes zero after the fixup), so the shared counter buffer is zero again when
-each launch completes -- the same contract the Cake launcher's per-device
-counters rely on.  Threads: planning and the arena bookkeeping (creation,
-growth, reference counts, insertion, eviction, `clear_convenience_caches()`)
-are serialised by a module lock (a miss re-checks the cache under it, so a key
-is planned once; a growth keeps the larger buffer); the K2 hit path holds its
-arena's lock from the carve of the workspace views through the split-K
-reduction, because one router call is three stream operations (split, kernel,
-reduction) on the shared BF16x3 stack and partials that two threads issuing on
-one stream must not interleave; the K1 hit path (one self-contained kernel per
-call) and the cache lookup take no lock.  The stream-ordering argument assumes
-one issuer per stream at a time, as CUDA stream semantics do.  The device facts
-a plan depends on (architecture tag, SM count, L2 size) are read once per
-device index (`device_facts`).
-
-### K1 contract
-
-* `A` BF16 `[L, M, K]` (or `[M, K]`) with unit stride on `m` or `k`; `B`
-  BF16 `[L, K, N]` (or `[K, N]`) with unit stride on `k` or `n`.  The other
-  matrix stride and the batch stride are multiples of 8 elements (16 bytes);
-  every view starts at a 16-byte aligned address.
-* `out` BF16 or FP32 `[L, M, N]` / `[M, N]` with unit stride on `n` and
-  16-byte aligned rows and batches, or -- with `transposed_out` -- `[L, N, M]`
-  / `[N, M]` with unit stride on `m` (element `(m, n)` lands at `out[l, n,
-  m]`).  The caller's view is written in place; nothing is copied or
-  re-laid-out.  The row and batch strides the kernel receives (`ldo`, `out_l`,
-  in elements; `rows` / `cols` = `M` / `N`, or `N` / `M` under `transposed_out`)
-  satisfy `ldo >= cols`, `out_l >= cols` and one of two layouts: batch-major,
-  `out_l >= rows * ldo` (each batch holds its matrix), or interleaved within a
-  row, `ldo >= L * out_l` (a `[T, H, D]` projection written as `[H, T, D]`:
-  `out_l = D`, `ldo = H * D`).  A batch of one passes its view's batch stride
-  when that spans the matrix and the matrix span `rows * ldo` otherwise
-  (`_out_strides`); any other layout is refused at launch.
-* `M, K >= 1` and `N` a positive multiple of 8 are runtime values (no
-  padding: TMA zero-fills out-of-bounds boxes, the epilogue masks rows `>= M`
-  and columns `>= N`); `L` is arbitrary and the batch strides follow the
-  layout rule above, so the token-major head views of the MLA projections
-  (`[T, H, D]` permuted to `[H, T, D]`, `D` a slice of a wider slot) run
-  without copies.
-* The three training layouts map onto the operator: forward `X @ W.T`
-  (`A` K-major, `B = W.T` K-major), input gradient `G @ W` (`B` MN-major),
-  weight gradient `G.T @ X` (both MN-major, `K = T` ragged).  A weight
-  gradient with fewer than 256 output rows runs the swapped `X.T @ G` with
-  the transposed store (`projection_wgrad` / `prepare_projection_wgrad`).
-* Numerics: BF16 x BF16 products exact in FP32, tensor-core FP32
-  accumulation, one rounding at the store.  BF16 outputs match an FP64
-  reference to `atol = rtol = 1e-2` elementwise; FP32 outputs carry the
-  accumulation error (`rel_fro <= 5e-5`, `max_abs <= 1e-3 * max|ref|`).
-
-### Host planning (mirror of the Cake launcher)
-
-The host selects one traced kernel instance per (A layout, B layout, tile
-width, tile height, output kind, epilogue path, raster group, TMA L2 eviction
-hints); every
-rule is a verbatim copy of the Cake kernel host's (each function names its
-source line range).  Two device facts enter the plan: the SM count (CTA pairs:
-stream-K split, raster group, wave working set) and the L2 size (hint gate);
-`prepare_*` and the convenience path read both once per device index
-(`device_facts`: `device_sm_count`, `device_l2_bytes` =
-`torch.cuda.get_device_properties(...).L2_cache_size`, falling back to
-`cuDeviceGetAttribute`), `plan_dense_projection_gemm` takes them as inputs:
-
-| choice | rule |
+| call | runs |
 |---|---|
-| operand layout | `operand_view`: the contraction axis contiguous -> K-major, else the M/N axis contiguous -> MN-major |
-| `BLOCK_N` | `default_block_n`: 128 when `N <= 128`, 192 when `N` is a multiple of 192 but not of 256 (`N = 576`: three exact tiles), else 256.  The menu is `BLOCK_N_CHOICES = (128, 160, 192, 224, 256)`: 160 / 224 (Cake round 9) are wave-quantization fits a rule or caller selects; their 80 / 112-column warp slices take the register epilogue |
-| `CTA_ROWS` | `default_cta_rows`: 128.  The 256-row tall-tile family (`cta_rows=256`, symbol `_m256`) and the 64-row Layout-B family (`cta_rows=64`, Cake round 9: 128 x `BLOCK_N` pair tiles through the M=128 `cta_group::2` MMA, four TMEM buffers; symbol `_m64`) are rule or caller selections (`CTA_ROWS_CHOICES = (64, 128, 256)`).  A caller-forced `cta_rows` outside the row's rule (or default) family drops the rule's `stages` / `slots` / `epi`; its other knobs still apply |
-| epilogue | `epi_mode`: a warp slice is `epi_cols = BLOCK_N / 2` columns (`BLOCK_N / 4` on 64-row tiles; always a multiple of 16).  Transposed output -> register stores (`reg`); row-major fp32 -> TMA stores (`tma`) when the slice is whole 32-column chunks (`epi="reg"` is an opt-in float4 register path; 160 / 224-wide and 64-row 192-wide slices have no TMA path); row-major bf16 -> `tma` when `K <= 1024` and the slice is whole 64-column chunks (`BLOCK_N = 256` at any height, 128 at 128 / 256 rows), else `reg`; `quad_store` (rule-selected, `_q`) is the bf16 `reg` variant for whole-64-column slices that transposes 32-byte row segments across lane quads so each lane issues one 256-bit store per 4-row group |
-| staging slots | `epi_slots`: 1 with the TMA-store epilogue (2 only when `K <= K_TWO_SLOTS = 0` and the slice's chunk count is even), 0 otherwise |
-| stages | `default_stages(slots, cta_rows, block_n, b_mn)`: 7 / 6 / 5 for 0 / 1 / 2 slots at `BLOCK_N = 160 / 192 / 224 / 256`, 9 / 8 / 6 at `BLOCK_N = 128`, 4 / 4 / 3 for tall (256-row) tiles; 64-row tiles take the deepest pipeline that fits the 227 KiB opt-in beside the staging (32 KiB per slot), at most 12 (9 / 8 / 6 at `BLOCK_N = 256`, 12 / 12 / 10 at 128; `b_mn` sizes the MN-major B panels); the single-CTA form (`cta1`, round 19: its B stage streams the whole `BLOCK_N` columns per CTA, `b_stage_bytes(..., cta_group=1)`, so 48 KiB stages at `BLOCK_N = 256` and 32 KiB at 128) takes the deepest fit the same way (4 / 4 / 3 and 7 / 6 / 5).  A rule or caller `stages` is bounded by `smem_limit_for(arch)`: the 232448 B opt-in, or 334336 B on `sm_107a` (CUDA 13.4 oversized shared-memory mode, `SMEM_OVERSIZED`); the limit is not part of the instance key, so an instance has one symbol on every architecture |
-| raster group | `default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs)`: 16 CTA row tiles per cluster-launch-control raster group (a launch parameter since round 11, not an instance-key field) (even, so the two CTAs of a pair are the row halves of one 256-row tile) on every row; a 4-row group for one-to-two-wave weight-gradient rows measured no gain in the production configuration and is not applied.  A non-default group would carry the symbol suffix `_g<n>` |
-| L2 hints | `default_hints(a_mn, b_mn, m_tiles, n_tiles, K, group_m, pairs, l2_bytes)`: no hint while one wave's operand panels fit the L2 (`wave_working_set(m_tiles, n_tiles, K, group_m, pairs) <= l2_bytes`); otherwise `A` streams `evict_first` when there is one column tile (`n_tiles == 1`); every other row gets no hint (reuse-ratio hints on the weight-gradient class measured 0..-4 percent in the production stream-K configuration).  Symbol suffix `_h<a><b>` (first letters): `_hen` = A evict_first, B none |
-| L2 promotion, prefetch | `default_promo` = `none`, `default_pf` = 0 (measured, off); the symbol carries `_<promo>` / `_pf<n>` when set |
-| CTA form | `form`: `""` (the ten-warp pipeline of every other program) or one of `W8_FORMS = ("w8r", "w8rs", "w8")`, the eight-warp CTA form of the same GEMM measured for six `sm_103a` input-gradient rows (`w8r` / `w8rs`) and five `sm_100a` input-gradient rows (`w8`, the knob-free program): four epilogue warps, a loader, a scheduler (`w8r`; `w8` = the same without the early accumulator release) or the loader's elected lane issuing the cluster-launch-control queries in its place (`w8rs`) and the MMA warp on CTA-pair 256 x 256 tiles over six 32 KiB stages, whole tiles only, the BF16 output through the TMA store, the raster quotients resolved by four fast divisors the host passes (`fd_tiles_l` / `fd_tiles_g` / `fd_group` / `fd_last`: launch arguments of these programs alone).  Symbols `_tma1_w8r` / `_tma1_w8rs` / `_tma1_w8` (the form token is the last knob suffix; `instance_key` field 37).  A rule's form yields where the plan is not whole-tile or a caller forces a pipeline, tile, output, epilogue, tail or raster knob (the row's ten-warp program runs the plan asked for; the rule's `pd` / `pro` / `lw` / `mg` / `sw` are its program there, and the `sm_103a` 4096 -> 48 rule carries none, so the architecture default one-slot program runs there; forcing `epi` `tma`, two slots, `htail`, `lw` and `pro` 15 plans its previous half-tail program); where the form stands, those knobs are cleared from the key.  A caller-forced form is refused there (`instance_key`; the planner for stream-K units) |
-| template | `instance_symbol(instance_key(...))`, e.g. `dense_proj_gemm_kk_n256`, `dense_proj_gemm_kk_n128_hen`, `dense_proj_gemm_kn_n256_f32_tma1`, `dense_proj_gemm_nn_n256_f32_tma1`, `dense_proj_gemm_nn_n128_hen_t`, `dense_proj_gemm_kk_n256_m64`, `dense_proj_gemm_kk_n256_m256_ov_ht`, `dense_proj_gemm_nn_n160_m256_bz64`, `dense_proj_gemm_nn_n128_hen_t_skx`, `dense_proj_gemm_kn_n256_tma1_bg8`, `dense_proj_gemm_kn_n256_f32_v8_ef_s9`, `dense_proj_gemm_nn_n256_m256_sks_sb2`, `dense_proj_gemm_kk_n128_hen_c1`, `dense_proj_gemm_kn_n256_tma1_w8r`, `dense_proj_gemm_kn_n256_tma1_w8rs`, `dense_proj_gemm_kn_n256_tma1_w8` (round 13: `_pk` parked / `_ov` overlapped single-TMEM-buffer / `_ht` half-height-tail-wave tall epilogues; `htail` replaces the stream-K tail plan by 2 x tail whole-K half items when they fit the CTA pairs, so `ws_f32_elems = 0` and `sk_iters = sk_units * k_blocks`; `_bz64` = 32-column MN-major B panels (`b_swz` 64, smaller stages, deeper default pipeline), `_skx` = exact p-way K split of the tail tiles (`sk_exact`, pre-empts `sk_parts` / `htail`, p travels in `sk_iters`); `_sks` = synchronised stream-K tail (round 18: `sk_sync`, the tail tiles' main units over K steps [0, s) plus collector units over the leftovers, one fp32 slab per tail tile and a deterministic two-addend fixup; `sk_iters` = the main-unit count, `iters_per_unit` = s = ceil((q K + `sk_sync_m`) / (q + 1)); yields to `sk_exact`, pre-empts `sk_parts` / `htail`); `_bg8` = eight adjacent batch entries (heads) interleaved across the CTA pairs (`batch_group`, batched MLA rows only, 0 for a batch of one); `_ef` = fp32 v8 register stores with `L1::no_allocate.L2::evict_first` (`store_ef`), `_s9` = nine pipeline stages (oversized dynamic shared memory on sm_107a); round 19: `_sb<n>` = the slab path of the synchronised fixup (`sk_slab`: 1 early arrival, 2 + the bulk slab read through the dead mainloop stages, 3 + the fp32 output as the slab - the same `_sks` plan, forced to 0 without `sk_sync`; a rule's 3 yields to 2 when a caller forces the row-major fp32 register epilogue, a rule's 2 to 0 when the eight warp slabs do not fit a caller-forced pipeline), `_c1` = the single-CTA form (`cta1`: one `CTA_ROWS` x `BLOCK_N` tile per CTA with cluster dims (1, 1, 1), so `m_tiles` is not rounded to pairs, `pair_tiles` counts CTA tiles, `sm_pairs` is the SM count (`sm_units`), the grid is `num_full` CTAs and the form carries no tail policy; 128-row family only); `_skf` directly after `_skx` = the tail-first order of the exact split (`sk_first`: pair work items `[0, sk_units)` are the K parts of the tail tiles, then the whole tiles; the same plan, counters and slabs as `_skx`), `_lw` between `_or` and `_pro` = the load warp leaving the pair prelude before the post-allocation CTA rendezvous (`lw`; pair programs whose MMA warp allocates TMEM, `pro` bit 4), `_mg` directly after `_lw` = the whole-tile tile resolve (`mg`: the load warp and the MMA warp walk whole tiles, one segment per item, with the raster quotients resolved through corrected fp32 reciprocals; whole tiles only - no batch raster, column-grouped raster, half-height tail or stream-K form, and the plan carries no stream-K unit); `_sw<n>` directly after `_mg` = the paced output stores (`sw`: each epilogue warp of the bf16 TMA-store pd-2 drain delays its bulk tensor store issue, after the staging write and its fences, by a per-warp number of steps of `n` dependent u32 multiply-adds seeded by a clock sample, so each per-item eight-store burst becomes a seven-step ramp; the stores and bytes are unchanged; needs `slots` > 0, `pd` 2 and a bf16 output; 0 = off); `_w8r` / `_w8rs` / `_w8` directly after `_pro<n>` = the eight-warp CTA form (`form`, the CTA form row above)) |
-| rules | `ROW_RULES[(arch, A MN-major, B MN-major, fp32 out, transposed out, batched, N, K, M)]` (the ragged token count never keys a rule: `M = None` for forward / input gradients, `K = None` for weight gradients) lays per-row knobs over the defaults above, merged over `ARCH_RULE_DEFAULTS` (`pro` 7 on `sm_100a`, `sm_103a` and `sm_107a`).  Rounds 2-33 mirror the Cake table byte for byte; the shapes tranche (`sm_100a` and `sm_103a`: forward / input gradient / weight gradient rows at K 4096-17408, N 32-17408, measured at T 16172-16384 on GB200 / GB300 against cuBLAS) and its kernel-level round 2 (the half-tail column-grouped 4096 squares, 12-column raster groups on the N 5120 rows, the load-warp thin input gradients with the `l2_256b` promotion of the N 512 rows on `sm_103a`, the tail-first 16-way exact split of the 4096 x 12288 weight gradients) extend it per architecture.  A rule's `sk_first` / `lw` yield where the planned program cannot carry them (an exact split the arithmetic does not admit, the single-CTA form, a `pro` without bit 4, a caller-forced tile family).  Three `sm_103a` input-gradient rules (4096 -> 512, 5120 -> 512, the kv_a 6144 -> 576) carry `mg` with `sk: False` (the whole-tile tile resolve measured faster than the row's program above the pair spread at both T on GB300); a rule's `mg` yields where the plan carries stream-K units or exceeds the kernel's cluster-tile bound (a caller `sk` / `sk_max_units` / `sk_parts` / exact or synchronised split), where a caller forces a raster or tail form the `_mg` program excludes (`batch_group` / `cgrp` / `htail` / `sk_first` / `stt`), the single-CTA form or another tile family, and a caller-forced `mg` is refused on such a plan (`sk_units` is 0 on every `_mg` program).  Two `sm_103a` input-gradient rules (5120 -> 512, 5120 -> 1024) carry `sw` 25 (the paced output stores measured faster than the row's program above the pair spread at both T on GB300); a rule's `sw` yields where the planned program is not the bf16 TMA-store pd-2 drain (a caller-forced register epilogue or `slots` 0, another `pd`, the fp32 output) or the single-CTA form, and a caller-forced `sw` is refused there.  Six `sm_103a` input-gradient rules (4096 -> 512, 4096 -> 1024 and the kv_a 6144 -> 576 with `w8rs`; 4096 -> 48, 5120 -> 512 and 5120 -> 1024 with `w8r`) carry `form`: the eight-warp CTA form measured faster than the row's program above the pair spread at both T on GB300 (the `sm_103a` rules govern B300 as well, where no measurement exists), with raster groups of 8 row tiles on 4096 -> 1024, 12 on 5120 -> 512, 5120 -> 1024 and kv_a, and 16 on the other two; the knobs after it stay the row's program where the form yields (4096 -> 48: the architecture default program).  Five `sm_100a` input-gradient rules (4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024 and the kv_a 6144 -> 576) carry `form` `w8`: the knob-free eight-warp program measured faster than the row's program above the pair spread at both T on GB200 (the `sm_100a` rules govern B200 as well, where no measurement exists), with raster groups of 12 row tiles on 4096 -> 512 and 12 on kv_a and 8 on the other three rows; the knobs after it stay the row's program where the form yields.  A rule's `htail` names the program (`_ht`); the half-tail fit (`0 < 2 * tail <= pairs`) selects only the plan (`plan.htail_plan`): where the half items do not fit the device's pairs (the K 5120 thin input gradients: 1280 tiles on 76 pairs, tail 64; the 4096 x 12288 projections: tail 56) the `_ht` program runs the row's plain whole-tile plan (never linearised stream-K units, whatever `sk` the row or the caller asked for), as measured.  `sm_103a` registers every `sm_100a` program and its lanes measured the shapes tranche alone: a row without an `sm_103a` rule plans with the `sm_100a` rule (`RULE_PARENT`; the same knobs, so the same program, kept where the `sm_103a` registry has it), a rule `sm_103a` measured itself always wins, and the weight-gradient orientation follows the same lookup; `sm_100a` and `sm_107a` inherit nothing |
-| exact-wave gate | a rule's `BLOCK_N` 224 (`EXACT_WAVE_BLOCK_N`) was measured for the whole-wave fit of its tiles on the 76-pair devices (`exact_waves`: 152 tall tiles of the 4096 x 4096 weight gradient = two waves, 76 tiles of 4096 -> 1024 = one); on a device whose pairs do not fit them in whole waves and where the default tile needs fewer waves (74 pairs of a 148-SM part) the rule's `BLOCK_N` yields to the default tile (`plan.wave_fallback`; the rule's other knobs stay); a caller-forced `block_n` is never touched, and the plan is the launcher's where the fit is exact or both tiles need the same waves (152 and 160 SMs) |
-| registry fallback | a plan whose template this architecture's registry lacks is redone without the batched small-M swap (`plan.swap_fallback`), then without the row's measured rule (`plan.rule_fallback`: the architecture default `pro` form), then lands on the nearest generated program of the row's layout / output class (`plan.knob_fallback`): the hand-ordered knob variants first (plain TMA L2 policy, the single-CTA form, the 64-row pair family, the tall tile, the register epilogue, BLOCK_N 128, each in the three `pro` forms), then every generated program of the class, nearest symbol first, with the knobs its symbol decodes to; a caller-forced knob always wins.  Only a class without any generated program on the architecture raises (`NotImplementedError` at binding) |
-| grid | `(num_full + sk_units) * 2` CTAs: one cluster of two CTAs per `2 * CTA_ROWS` x `BLOCK_N` output tile plus the stream-K units; under `cta1` (round 19) `num_full` CTAs, one per `CTA_ROWS` x `BLOCK_N` tile, launched with the module's recorded cluster dims (1, 1, 1) |
-| stream-K | `stream_k_plan(pair_tiles, k_blocks, sm_count // 2, sk="auto")`: only when the whole problem is one partial wave of CTA pairs whose halves fit the pairs (`pair_tiles <= pairs`, `2 * tail <= pairs`) and `k_blocks >= 16`, the tiles' linearised K steps are cut into units of `iters_per_unit = ceil(k_blocks / 2)` (two K-aligned halves per tile on an even `k_blocks`), `sk_units = ceil(pair_tiles * k_blocks / iters_per_unit)` so that every unit holds a K step, with an in-kernel deterministic fixup; otherwise every work item is a whole tile (multi-wave tails stay data-parallel).  `sk=True` is the linearised-units policy (up to `pairs` units of >= 8 K steps), `sk="tiles"` the whole-tile diagnostic, `sk=False` off.  A measured `sk_parts = p` rule, or the caller knob `sk_parts`, instead splits every tail tile `p` ways when `p * tail` units fit the pairs and each keeps >= 8 K steps (`sk_parts_plan`).  The host asserts `tail_tiles * 16 <= 4096` slice counters, and `check_stream_k_plan` refuses a plan outside the kernel's launch contract: a unit without a K step on the `pd` 2 / `sk_slab` 2 / `stt` programs (they hand off the work in an item's last segment, so such a unit never finishes), or synchronised collectors outside `[1, tail_tiles]` (`[1, ...)` on the other `sk_sync` programs) |
+| `deterministic=True` (default) | the deterministic package's canonical entry point with the same arguments: the same programs, the same bits, the same errors |
+| `deterministic=False` | this package's programs on the rows that carry a measured verdict for the device (below); the deterministic programs for every other row and operation |
+| `deterministic=False` under `torch.use_deterministic_algorithms(True)` | `RuntimeError`; with `warn_only=True` a `UserWarning` and the deterministic path |
 
-`plan_dense_projection_gemm(A, B, out, sm_count=..., l2_bytes=...)` exposes
-the plan (`GemmPlan`, including `wave_working_set_bytes`) without a device;
-the prepared launch resolves the template
-through `cake_jit.KERNELS[arch][template]`, owns its stream-K partial slabs
-(`(sk_units + tail_tiles) * 2 * CTA_ROWS * BLOCK_N` fp32), its slice counters
-(`max(8192, tail_tiles * 16)` u32: the lane-spread dummy counters above index
-4096 must be addressable), and binds the
-module's argument plan by keyword (`bind_launch`, fails closed on an unknown
-name).  Given the same device the result is bitwise identical to the Cake
-launcher's.
+*Table: what a call runs, by its `deterministic` argument.  The default does not read PyTorch's setting: it is
+deterministic already.*
 
-### K2 contract
+| operation | `deterministic=False` |
+|---|---|
+| K1 forward (`projection_forward`, `kk` layouts) | deterministic program (whole output tiles; a recomputed forward reproduces its result) |
+| K1 input gradient (`projection_dgrad`, `kn` layouts) | deterministic program (whole output tiles) |
+| K1 weight gradient (`projection_wgrad`, `nn` layouts) | the rows of `K1_SPLIT_RULES`: split-K over the ragged token count -- every split writes its FP32 partial tile to a workspace slot; the last split of a tile to arrive (a per-tile ticket counter) adds the other slots in arrival order and rounds once into `out`, then returns the counter to zero.  Every other row: deterministic program |
+| K2 forward (`router_forward`, `kk`) | deterministic program (its four splits) on every row; an explicit `splits` of 1 or 2 runs this package's stream-K program (at most two partials per element) |
+| K2 input gradient (`router_dgrad`, `kn`) | deterministic program (one split) |
+| K2 weight gradient (`router_wgrad`, `nn_t`) | the rows of `ROUTER_RULES` with a partition: stream-K over the K blocks, in spans alike or in long head spans and short tail spans (the head/tail program) -- whole tiles store the one-split result, tiles split between units TMA reduce-add into `out` (zeroed before the program, on the same stream).  Every other row: deterministic program (its six splits) |
+| BF16x3 split (`split_fp32_to_bf16x3_`) | the deterministic stage (exact) |
 
-* `A`, `B`, `out` FP32 2-D views: `A [M, K]` with unit stride on `m` or `k`
-  (other stride a multiple of 4), `B [K, N]` with unit stride on `k` or `n`,
-  `out [M, N]` with unit inner stride and 16-byte rows; `N` a multiple of 8.
-* The operand layouts select the instance and the production split-K count:
-  `kk` (forward, 4 splits), `kn` (input gradient, 1), both MN-major -> the
-  swapped transposed-store weight gradient `nn_t` (6 splits; `out.T = B.T
-  A.T`).  An MN-major `A` with a K-major `B` has no instance.
-* Every `launch()` re-splits the second operand into the retained
-  `[3, outer, inner]` BF16 stack in the operand's own layout (exact three-way
-  split, no allocation: one launch of the fused split program
-  `split_fp32_bf16x3` when this checkout registers it for the device, else a
-  five-op torch chain through an fp32 scratch -- the same bits either way),
-  launches, and sums the split-K partials on the host in a fixed order.  Splits, chunk boundaries and the reduction order are
-  fixed: bit-exact run to run.  Error against an FP64 reference: FP32-class
-  (`rel_fro` about 2e-7 to 4e-7 on the GLM-5.2 router shapes).
+*Table: the routing of `deterministic=False` (`cake_backend.ROUTES`).*
+
+## Numerics, architectures and parallelism
+
+| property | contract |
+|---|---|
+| operands and accumulation | BF16 operands with FP32 accumulation (K1); FP32 operands split exactly into three BF16 terms with FP32 accumulation (K2).  No silent TF32 or BF16 for the router |
+| accuracy | the deterministic package's budgets against FP64 of the exact operands, worst over repeated runs: BF16 out `atol = rtol = 1e-2`; FP32 out relative Frobenius error `<= 5e-5` and max error `<= 1e-3 * max abs(ref)`; router `<= 2e-6` relative Frobenius error and no row whose top-8 experts differ from FP64 (outside near ties of the 8th and 9th logits) |
+| rounding | each output element is rounded once, from its complete FP32 sum |
+| subnormals | kept: K1 adds the partials with IEEE round-to-nearest adds, K2 reduces with the TMA reduce-add; nothing flushes to zero |
+| run-to-run bits, K1 | two splits (every `sm_100a` and `sm_103a` row, `sm_107a` `8192 -> 128`): repeat bit for bit (one add of two values); one split (`sm_107a` rows marked `p = 1` below): repeat bit for bit (whole tiles); three or four splits (the other `sm_107a` rows): vary in the last bits |
+| run-to-run bits, K2 | forward: the deterministic program's bits; weight gradient on a `ROUTER_RULES` partition: varies in the last bits (more than two partials per element); with an explicit forward `splits` of 1 or 2: repeats bit for bit (`0 + a + b == 0 + b + a`), so recomputed router logits and top-k match |
+| architectures | `sm_100a`, `sm_103a`, `sm_107a`: one `-gencode=arch=compute_<arch>,code=sm_<arch>` build per program, minimum CUDA 12.8 / 12.9 / 13.4 (`build.json`) |
+| streams and threads | planning takes a module lock; the convenience path keeps one workspace arena per (device, stream); prepared launches own their workspace |
+| CUDA graphs | prepared launches allocate nothing on the device and capture into a CUDA graph (K2: the split, the memset of `out`, the program); no host synchronization |
+| other kernels on the device | the programs walk their work persistently over at most `sm_count // 2` CTA pairs and wait on no CTA that is not resident; every routed row was measured next to a kernel holding 8, 16 or 32 SMs on another stream (no more than 3 % slower than the deterministic plan there) |
+| context parallelism (KCP) | not applicable: a local operator on the caller's CP-local shards; no collectives; the reduction of parameter gradients across ranks stays with the caller |
+| autograd, checkpointing, gradient accumulation | none in either package: callers compose the forward and both gradients; `out` is overwritten, not accumulated into |
+
+*Table: the numerical, architecture and parallelism matrix of `deterministic=False`.*
+
+## Planners and rule tables
+
+A planner decides, per row and device, whether `deterministic=False` runs this package's program and with which
+parameters; a row it leaves runs the deterministic program (`plan_dense_projection_gemm` / `plan_router_fp32_gemm`
+say which).  Only measured rows carry a program: a row runs this package's program where that program was faster
+than the deterministic package's shipped plan of the row in every measurement run: a one-sided paired sign test
+(p < 0.05) with a median time ratio below 0.99, both in eager launches and in CUDA graph replays, and no more than
+3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another stream.  A `None` entry is a measured
+row that missed; a row without an entry was not measured.  Both run the deterministic program.
+
+The K1 verdicts were measured at 16172 to 16384 tokens.  Those of `K1_SPLIT_RULES` hold at every token count their split
+count fits (`num_splits * 64 <= T + 63`); the tables of `K1_SPLIT_RULES_BY_SM` hold only at 16172 to 16384 tokens
+(`K1_SPLIT_RULES_BY_SM_TOKENS`).  The router verdicts hold only inside token windows (`ROUTER_RULES`; the last table
+below) and pass a stricter rule: measured in one long-lived process and in a fresh process per token count, and no more
+than 3 % slower than the deterministic plan next to such a kernel both in the same launch order and with the router
+partition launched before that kernel against the deterministic plan launched after it.  Every other token count of a
+router row runs the deterministic program.  The K1 verdicts hold from the floor of `K1_MIN_SM_COUNT` /
+`K1_RULE_MIN_SM_COUNT` up (a part with more SMs than the measured ones takes them without a measurement, a part with
+fewer runs the deterministic program); the tables of `K1_SPLIT_RULES_BY_SM` hold for exactly 208 and 212 SMs.  The
+router windows hold only on the SM count they were measured on (`ROUTER_SM_COUNT`: 152 on `sm_100a` / `sm_103a`, 216 on
+`sm_107a`); every other SM count runs the deterministic plan, except in the `"waves"` windows, which keep the earlier SM
+condition of `"waves"` (the deterministic plan's last wave below 80 % full).  The measured parts have 148 and 152 SMs
+(`sm_100a` / `sm_103a` K1), 152 SMs (`sm_100a` / `sm_103a` router) and 216 SMs (`sm_107a`).
+
+| table | key | value |
+|---|---|---|
+| `K1_SPLIT_RULES` | `(arch, L, M, N, out_dtype)`: the transposed-store launch `out[l, n, m]` (`M` = the stored inner extent, `d_in` of a weight gradient; `N` = its rows, `d_out`), `out_dtype` `"bf16"` / `"f32"` | `(block_n, num_splits)` (this package's program) or `None` (the deterministic program) |
+| `K1_MIN_SM_COUNT` | `arch` | the fewest SMs for the K1 verdicts of the architecture (`sm_100a` / `sm_103a`: 148, `sm_107a`: 216) |
+| `K1_RULE_MIN_SM_COUNT` | a key of `K1_SPLIT_RULES` | the fewest SMs for that row's verdict where it is above `K1_MIN_SM_COUNT` (`sm_103a` `4096 -> 48`: 152) |
+| `K1_SPLIT_RULES_BY_SM` | `(arch, sm_count)` | the K1 verdicts of the parts with exactly `sm_count` SMs below a row's floor (keys and values as in `K1_SPLIT_RULES`), at the token counts of `K1_SPLIT_RULES_BY_SM_TOKENS` only; a part without a table, and every other token count, runs every K1 row below the floor on the deterministic program (`sm_107a`: 208 and 212 SMs) |
+| `K1_SPLIT_RULES_BY_SM_TOKENS` | -- | `(min_tokens, max_tokens)`: the token counts (`K` of the weight gradient) the tables of `K1_SPLIT_RULES_BY_SM` hold for, `(16172, 16384)` (where they were measured) |
+| `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`) or `"nn_t"` (weight gradient, `hidden` = the launch's `M`), `experts` = the launch's `N` | `None` (the deterministic program), token windows `((min_tokens, max_tokens, spec), ...)` (the spec of the window that holds the token count -- `K` of the weight gradient, `M` of the forward; every other token count: the deterministic program) or a spec alone (every token count: a plan a test or a measurement forces).  A spec is `"waves"`, `"H<f>x<k>"`, `"H<f>x<k>p<h>"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"` or a unit count |
+| `ROUTER_SM_COUNT` | `arch` | the SM count of the router verdicts of the architecture (`sm_100a` / `sm_103a`: 152, `sm_107a`: 216); a device with any other SM count runs the deterministic program, except in a `"waves"` window (the condition of `router_waves`) |
+
+*Table: the rule tables.*
+
+| architecture | K1 weight gradient `d_in -> d_out` (`block_n`, `num_splits`), BF16 and FP32 out unless marked | K2 forward | K2 weight gradient |
+|---|---|---|---|
+| `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token windows of the last table: on 152 SMs hidden 4096 `"H1x5p44"` and hidden 5120 `"H0.5x3"`; hidden 5120 `"waves"` on every SM count where it applies.  Every other token count and SM count, and hidden 6144: deterministic (6 splits) |
+| `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token windows of the last table: on 152 SMs hidden 5120 `"H0.5x3"`; hidden 5120 `"waves"` on every SM count where it applies.  Every other token count and SM count, hidden 4096 (`"H1x4p44"` up to 7.6 % slower when launched before a resident kernel) and hidden 6144: deterministic (6 splits) |
+| `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1`; `5120 -> 1024` (256, 1) `p = 1`.  `4096 -> 64` BF16, `4096 -> 128`, `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed) | deterministic (4 splits) | deterministic (6 splits); hidden 4096 measured, missed (`"H0.5x4"` loses next to a kernel holding 16 SMs that starts during it); hidden 6144: `"H0.5x4"` leaves the backward pass no faster |
+| `sm_107a` (208 SMs, 16172 to 16384 tokens) | `4096 -> 32, 48, 64`, `5120 -> 32, 48, 64` FP32: (64, 3); `4096 -> 512`, `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024`, `5120 -> 1024` FP32: (256, 1) `p = 1`.  `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict: its stream-K program did not complete next to a resident kernel); `4096 -> 512` BF16, `5120 -> 1024` BF16, `4096 -> 4096` FP32, `8192 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | deterministic (6 splits) |
+| `sm_107a` (212 SMs, 16172 to 16384 tokens) | `4096 -> 32, 48, 64` FP32 (64, 3); `5120 -> 32, 48, 64` FP32 (64, 3); `8192 -> 128` (128, 2); `4096 -> 512`, `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024`, `5120 -> 1024`, `4096 -> 4096` FP32: (256, 1) `p = 1`.  `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict, as on 208 SMs); `4096 -> 512` BF16: deterministic (measured, missed); `5120 -> 1024` BF16: deterministic (1.3 to 2.5 % faster here, missed on 208 SMs) | deterministic (4 splits) | deterministic (6 splits) |
+
+*Table: the rows that run this package's programs.  `4096 -> 128` misses on `sm_100a` / `sm_103a` next to a kernel
+holding 32 SMs (its 128 CTAs no longer fit the free SMs) and on `sm_107a` at 16384 tokens; on `sm_107a`,
+`4096 -> 512` BF16 (192 CTAs) and `4096 -> 4096` FP32 (216 CTAs) miss next to a kernel holding 32 SMs the same way.
+`4096 -> 64` (`sm_103a`; `sm_107a` BF16) and `4096 -> 48` on 148-SM `sm_103a` parts are not faster than the
+deterministic plan in every run.  The `sm_107a` one-split rows store whole tiles: they win where the deterministic
+package's `sm_107a` program of the row is slower.  Every K1 choice also needs `num_splits * 64 <= T + 63` (shorter
+token counts run the deterministic program); the 208-SM and 212-SM choices hold only at 16172 to 16384 tokens
+(`K1_SPLIT_RULES_BY_SM_TOKENS`).*
+
+`"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
+units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six
+splits fill their last wave below 80 % (`w / ceil(w)`, `w = 6 * tiles / pairs`); otherwise the row runs the
+deterministic program.  At hidden 5120 on 152 SMs that is 80 units at 64 tokens (at most one unit per (tile,
+K block) step) and 380 units at 16k tokens; on 148 SMs the deterministic plan's last wave is 81 % full and the row
+runs the deterministic program.
+
+`"H<f>x<k>"` (`router_partition_of`, the weight gradient only) runs the head/tail program
+`router_fp32_gemm_atomic_nn_t_ht_c3_nreg`: one head unit per CTA pair, whose spans share about the fraction `f` of
+the (row-tile pair, K block) steps, then `k` tail units per CTA pair over the rest (each count a multiple of the
+column tile count).  Every pair starts a long head span at once; the short tail spans go to the pairs that finish
+first, so a kernel holding SMs on another stream delays a short span rather than a long one.  At 152 SMs `"H0.5x3"`
+is 76 head and 228 tail units, at 216 SMs `"H0.5x4"` 108 head and 432 tail units; a token count too short for one
+step per span runs the deterministic program.
+`"H<f>x<k>p<h>"` starts only `h` head units (at most one per CTA pair), each about `f` of a pair's even share of the
+steps; the other pairs start on the tail spans, so a kernel holding the SMs of up to `pairs - h` CTA pairs delays no
+head span.  At 152 SMs `"H1x5p44"` is 44 head and 380 tail units.
+
+| row of `ROUTER_RULES` (weight gradient, 256 experts) | token window | measured at (tokens) | part | time / deterministic plan, alone | worst next to a resident kernel: same launch order / router launched first |
+|---|---|---|---|---|---|
+| `sm_100a` hidden 4096 `"H1x5p44"` | 10240 to 16384 | 10240, 12288, 16172, 16231, 16384 | GB200, 152 SMs | x0.917-0.943 | x1.024 / x0.983 |
+| `sm_100a` hidden 5120 `"waves"` | 1 to 128 | 64, 128 | GB200, 152 SMs | x0.691-0.884 | x0.864 / x0.846 |
+| `sm_100a` hidden 5120 `"H0.5x3"` | 10240 to 32768 | 10240, 12288, 16172, 16231, 16384, 32768 | GB200, 152 SMs | x0.750-0.883 | x1.003 / x1.011 |
+| `sm_103a` hidden 5120 `"waves"` | 1 to 192 | 64, 128, 192 | GB300, 152 SMs | x0.706-0.919 | x1.005 / x0.917 |
+| `sm_103a` hidden 5120 `"H0.5x3"` | 16172 to 32768 | 16172, 16231, 16384, 32768 | GB300, 152 SMs | x0.820-0.875 | x0.984 / x1.020 |
+
+*Table: the token windows of the router weight gradient (eager launches and CUDA graph replays, one long-lived process
+and a fresh process per token count; the resident kernel holds 8, 16 or 32 SMs).  The `"waves"` rows are the FI-main
+`"waves"` plan (same kernel text, measured on this package's host path).  On GB200 the rows from 10240 tokens up ran at
+the GPU's software power cap: after 21 of their 24 runs `nvidia-smi` read `clocks_throttle_reasons` 0x4, at SM clocks of
+1297-1912 MHz (2062 MHz maximum); the arms of each row were measured interleaved, in paired groups.  Inside the
+head/tail windows cuBLAS FP32 in `CUBLAS_FP32_EMULATED_BF16X9_MATH` (the benchmark's `bf16x9` arm) took x1.455-1.565
+(GB200 hidden 4096), x1.516-1.594 (GB200 hidden 5120) and x1.534-1.610 (GB300) of the partition's time: at least x1.455.
+The head/tail windows hold only on the SM count of their part (`ROUTER_SM_COUNT`), the `"waves"` windows on every SM
+count where `"waves"` applies (`router_waves`); every other token count and SM count runs the deterministic plan.
+Hidden 5120 on `sm_100a` / `sm_103a` ran `"waves"` at every token count before these windows: below 64 tokens the
+`"waves"` windows keep it without a measurement; between the two windows and above 32768 tokens the row now runs the
+deterministic plan -- there `"waves"` was more than 3 % slower than that plan next to a resident kernel at every
+measured token count from 224 to 10240 (x1.046-1.156 on GB200 at 224 to 12288 tokens, x1.059-1.167 on GB300 at 224 to
+10240 tokens), and above 32768 tokens nothing was measured.*
+
+`prepare_*` and `plan_*` take `splits` (and, for K1, `block_n`) to force a plan, for tests and measurements; the K2
+forward takes at most two splits.  `benchmarks/bench_cake_dense_projection_gemm.py` prints, per row, the
+`rule_key` / `rule_value` of the plan it measured, in the format of these tables.
+
+## Workspace
+
+A K1 launch with more than one split uses an FP32 slot workspace (`tiles * num_splits * 256 * block_n` elements,
+zero at creation: the last split of a partial tile reads the padding columns no split writes, and discards them) and
+the ticket counters (`tiles * 512` words, zero at creation, zero again after every complete launch).  A prepared
+launch owns both; the convenience path keeps them in an arena per (device, stream), so concurrent launches on
+different streams never share them.  After an aborted launch, call `PreparedAtomicGemm.reset_counters()` (or
+`clear_convenience_caches()`).  A K2 launch with part tiles zeroes `out` on the launch stream (one memset) between
+the split and the program; prepared launches of both programs allocate nothing and can be captured in a CUDA graph.
+A prepared K2 launch binds everything but the stream when prepared (its FFI arguments are converted once), so a call
+issues its launches back to back.
+
+## Benchmark
+
+`benchmarks/bench_cake_dense_projection_gemm.py` times every row of the deterministic family's benchmark with the
+arms `det` (the deterministic package's prepared launch), `atomic` (`deterministic=False`), `atomic_p1` (the same
+program at one split), `cublas` (`torch.matmul`), `cublaslt` (a cuBLASLt heuristic sweep) and `bf16x9` (cuBLAS FP32
+in `CUBLAS_FP32_EMULATED_BF16X9_MATH`, the router rows), in paired groups, eager and in CUDA graphs; `--resident`
+re-times `det` and `atomic` next to a kernel holding `--resident-sms` SMs on another stream.
+
+## Names
+
+This import path held the dense projection GEMM package until #8046 renamed it to `dense_projection_det_gemm`; #8046
+left it as an alias of the renamed modules.  The names keep their spelling and, with the default, their behavior:
+
+| name before #8046 (`dense_projection_gemm.cake_backend`) | deterministic package (`dense_projection_det_gemm.cake_backend`) | this path |
+|---|---|---|
+| `dense_projection_gemm` | `dense_projection_det_gemm` | `dense_projection_gemm(..., deterministic=True)` |
+| `projection_forward`, `projection_dgrad`, `projection_wgrad` | `projection_det_forward`, `projection_det_dgrad`, `projection_det_wgrad` | the same names with `deterministic=` |
+| `prepare_dense_projection_gemm`, `prepare_projection_wgrad` | `prepare_dense_projection_det_gemm`, `prepare_projection_det_wgrad` | the same names with `deterministic=` |
+| `plan_dense_projection_gemm` | `plan_dense_projection_det_gemm` | the same name with `deterministic=` |
+| `router_fp32_gemm`, `router_forward`, `router_dgrad`, `router_wgrad` | `router_fp32_det_gemm`, `router_det_forward`, `router_det_dgrad`, `router_det_wgrad` | the same names with `deterministic=` |
+| `prepare_router_fp32_gemm`, `plan_router_fp32_gemm` | `prepare_router_fp32_det_gemm`, `plan_router_fp32_det_gemm` | the same names with `deterministic=` |
+| `split_fp32_to_bf16x3_` | `split_fp32_to_bf16x3_det_` | the same name with `deterministic=` (the deterministic stage in both modes) |
+| `instance_symbol`, `router_symbol` | `instance_symbol`, `router_symbol` | the same names with `deterministic=` |
+| `GemmPlan`, `PreparedGemm` | `DetGemmPlan`, `PreparedDetGemm` | read through; `deterministic=False` plans `AtomicGemmPlan`, `PreparedAtomicGemm` |
+| `RouterPlan`, `PreparedRouterGemm` | `RouterDetPlan`, `PreparedRouterDetGemm` | read through; `deterministic=False` plans `AtomicRouterPlan`, `PreparedAtomicRouterGemm` |
+| every other module name (`ROW_RULES`, `stream_k_plan`, `wgrad_views`, ...) | the same name | read through to the deterministic package |
+| program templates `dense_proj_gemm_*`, `router_fp32_gemm_<layout>`, `split_fp32_bf16x3` | `dense_proj_det_gemm_*`, `router_fp32_det_gemm_<layout>`, `split_fp32_det_bf16x3` | this package's templates are new: `dense_proj_gemm_atomic_nn_n<64\|128\|256>[_f32]_t`, `router_fp32_gemm_atomic_{kk,nn_t,nn_t_ht_c3_nreg}` |
+
+*Table: the names before #8046, their deterministic names, and what this path offers
+(`cake_backend.DETERMINISTIC_NAMES`).*
+
+| name (`flashinfer.experimental.dense_projection_gemm`) | default | `deterministic=False` |
+|---|---|---|
+| the entry points of the table above | the deterministic package's `*_det_*` object | this package's schedule (routing table above) |
+| `cake_backend.clear_convenience_caches` | clears the caches and arenas of both packages | -- |
+| `cake_jit.{MODULES, KERNELS, ARG_PLANS}` | this package's programs only | -- |
+| `cake_jit.select_module`, `cake_jit.load_cake_dense_projection_gemm_module` | a deterministic template or program resolves through the deterministic package | -- |
+| `cake_build` | this package's loader (byte-identical to every Cake package's) | -- |
+
+*Table: the names of this path and what they reach.*
+
+A module-level assignment through this path (for example `CONVENIENCE_CACHE_SIZE`) does not reach the deterministic
+package; set it there.
 
 ## Layout of this package
 
-* `cake_jit.py` -- the registry (schema v2) and the loader glue.  Three
-  literals filled by the generated-program export, each wrapped in
-  `# fmt: off` / `# fmt: on` and rendered one record per line (the export
-  replaces a literal from its head line up to the next `# fmt: on`):
-  `ARG_PLANS` (the distinct argument plans -- the ordered `[kind, name]` pairs
-  a generated entry takes -- keyed by the first 12 hex digits of the SHA-256
-  of the plan's compact JSON, `arg_plan_key`; one plan serves every K1 program
-  and one every K2 program), `MODULES` (one record per generated program:
-  template, kernel symbol, the architecture-free `library` stem, FFI entry,
-  `arg_plan` key -- `arg_plan_of` resolves it and still accepts an inline
-  list -- launch geometry, `arches`) and `KERNELS` (`arch -> template ->
-  module name`).  `ARCHES` names the registered architectures;
-  `load_cake_dense_projection_gemm_module(name, arch)` loads the build
-  `<library>_<arch>` through `cake_build`.
-* `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
-  package (byte-identical copies) and this package's build manifest (schema
-  `cake-build/1`, written by the export): one entry per `<library>_<arch>`
-  with its translation units, digests, nvcc flags, closure digest and
-  `aot/<name>.so` path.  `cake_build.load_library(name)` loads the prebuilt
-  library when `aot/` holds it and otherwise JIT-builds the entry through
-  FlashInfer (`gen_jit_spec`, sources digest-verified first);
-  `cake_jit.specs_for_arch(arch)` lists the JIT specs of an architecture for
-  `flashinfer.jit.build_jit_specs`.  `cake_build.jit_spec(name)` /
-  `jit_specs(arch)` gate an entry on its `min_cuda` only (`sm_107a` entries
-  need CUDA 13.0): a 13.0 toolkit whose `nvcc` does not emit `compute_107a`
-  fails inside the JIT build with nvcc's own message.
-* `cake_backend.py` -- view validation, instance selection, stream-K
-  planning, argument-plan binding, the prepared launches and the eager entry
-  points.
-* `csrc/cake_dense_projection_gemm/` -- generated kernel and binding
-  translation units (`.clang-format` disables formatting: the sources are
-  identity-checked by the manifest's digests); `csrc/cake_ffi_checks.h` -- the
-  tvm-ffi tensor checks the bindings include (shipped with the package, no
-  FlashInfer header).
+| file | content |
+|---|---|
+| `__init__.py` | imports nothing; `cake_backend`, `cake_jit`, `cake_build` load on first attribute access |
+| `cake_backend.py` | entry points, mode resolution, routing, the planners, rule tables and the convenience state of this package's programs |
+| `cake_jit.py` | the registry of this package's programs (`ARG_PLANS`, `MODULES`, `KERNELS`) and the loader |
+| `cake_build.py`, `build.json`, `csrc/cake_dense_projection_gemm/` | the `cake-build/1` loader, manifest and generated sources of this package's programs (written by the Cake exporter) |
 
-## Status
-
-The registries hold the generated programs of the current export lock: the
-Cake exporter (`exports/dense_projection_gemm` of the Cake repository) emits
-one program per template, shared by `sm_100a` and `sm_107a` wherever the generated text is the same (the per-architecture
-template lists are `KERNELS` in `cake_jit.py`; `K1_TEMPLATES` of the exporter
-is the source of truth and is regenerated whenever `ROW_RULES` resolve a new
-instance).  `build.json` ships the builds of the architectures `cake_jit.KERNELS`
-lists (`sm_100a`, `sm_103a` and `sm_107a`); the eight-warp form ships for
-`sm_103a` (two programs) and `sm_100a` (the knob-free program); every program the measured
-`sm_100a` / `sm_103a` rules name is registered, so the registry fallback only
-serves a caller that forces a template no export generated.  An entry point raises
-`NotImplementedError` naming the missing instance for a template that no
-export has generated and for every template on a device whose architecture the
-registry does not list.
-
-CUDA Graphs: prepare outside capture and replay the prepared launch
-(`prepare_*` once, `launch` many times).  The convenience entry points
-(`dense_projection_gemm`, `projection_*`, `router_*`) reuse a cached planned
-launch per (device, stream, geometry) key and the shared workspace arena of its
-(device, stream); capture a prepared launch object rather than the convenience
-entry points (see "Host paths").
-
-Tests: `tests/experimental/test_cake_dense_projection_gemm.py` (host-side
-planning tests run everywhere; the GPU tests skip without a registered
-generated instance -- a device of an architecture `cake_jit.KERNELS` lists).  Benchmark:
-`benchmarks/bench_cake_dense_projection_gemm.py` (the 11 GLM-5.2 projection
-rows x fwd / dgrad / wgrad x T in {16231, 16172}, the router rows and the two
-batched MLA rows, paired against `torch.matmul`; `--host-overhead` adds the
-host time per call of the prepared launch and of the convenience entry point).
+The deterministic package is resolved as this package's sibling on first use; the package never imports `flashinfer`
+by absolute name.  A consumer that vendors this package vendors the deterministic package too and binds it with
+`cake_backend.use_deterministic_backend(<its cake_backend module>)`.
