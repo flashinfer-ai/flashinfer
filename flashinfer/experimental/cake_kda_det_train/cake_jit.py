@@ -210,12 +210,14 @@ PATHS = ("fwd", "fwd_nosave", "light", "light_states", "tape", "replay")
 STAGES_FWD = (
     "table",
     "seg_table",
+    "qk_l2norm",
     "fwd_intra",
     "wy_fwd",
     "fwdh",
     "fwdh_p3",
 )
 STAGES_BWD = (
+    "qk_apply",
     "bwd_prep",
     "wy",
     "fwdh",
@@ -224,12 +226,15 @@ STAGES_BWD = (
     "dhu",
     "dqkg",
     "glm_intra",
+    "qk_pullback",
     "gate_epilogue",
     "param_finalize",
 )
 STAGES = (
     "table",
     "seg_table",
+    "qk_l2norm",
+    "qk_apply",
     "fwd_intra",
     "wy_fwd",
     "wy",
@@ -241,6 +246,7 @@ STAGES = (
     "dhu",
     "dqkg",
     "glm_intra",
+    "qk_pullback",
     "gate_epilogue",
     "param_finalize",
 )
@@ -262,6 +268,24 @@ OPTIONAL_STAGES = (
     "dav",
     "gate_epilogue",
     "param_finalize",
+    "qk_l2norm",
+    "qk_apply",
+    "qk_pullback",
+)
+# The in-kernel Q/K L2 norm modes (``use_qk_l2norm_in_kernel``): ``"off"`` (the
+# caller passes normalized q / k), ``"fused"`` (the default of the flag: the
+# first q / k reader of every path normalizes the raw rows -- the l2n intra
+# record on the forward and where the replay runs it first, the l2n prep
+# record on the other backward paths -- and the l2n GLM intra programs pull the
+# gradients back before their one BF16 dq / dk store) and ``"fallback"`` (the
+# token-local ``qk_l2norm`` / ``qk_apply`` / ``qk_pullback`` stages around the
+# plain readers and the GLM intra capture programs; a test route, reached only
+# through an explicit plan).  The stages of :data:`L2N_STAGES` select within
+# the class of the call's mode: a record's ``l2n`` key lists the modes it
+# serves (absent: ``["off"]``); every other stage's records serve every mode.
+L2N_MODES = ("off", "fused", "fallback")
+L2N_STAGES = frozenset(
+    {"fwd_intra", "bwd_prep", "glm_intra", "qk_l2norm", "qk_apply", "qk_pullback"}
 )
 # The stages whose records are filtered by the call's gate mode (a record's
 # ``gate``: ``"g"``, the default when the key is absent, or ``"raw"``); the
@@ -413,6 +437,11 @@ LOGICAL_TENSORS = (
     "ddt_bias",
     "part2",
     "ticket",
+    "q_raw",
+    "k_raw",
+    "qn",
+    "kn",
+    "qk_rstd",
 )
 # ``segments`` is the per-document segment count ``seg_table`` expands;
 # ``seg_arg`` the walk programs' segment scalar (``segments``, or
@@ -449,6 +478,15 @@ LOGICAL_SCALARS = (
     "g_raw_row_stride",
     "g_raw_head_stride",
     "seg_cap",
+    "num_tokens",
+    "q_raw_row_stride",
+    "q_raw_head_stride",
+    "k_raw_row_stride",
+    "k_raw_head_stride",
+    "dq_row_stride",
+    "dk_row_stride",
+    "read_rstd",
+    "write_rstd",
 )
 
 # Filled mechanically by the exporter (the derived leaves ``kernel_symbol``, ``launch``, ``arg_plan``,
@@ -6539,12 +6577,18 @@ def select_record(
     arch: str,
     path: str,
     gate: str = "g",
+    l2n: str = "off",
 ) -> str | None:
     """The one record of ``stage`` the host scalars select (``None`` for an
     optional stage no record of which admits the problem), among the records
     of the call's ``gate`` class for a stage of ``GATE_STAGES``
     (:func:`records_of_stage`; every other stage selects the same record in
     both modes).
+
+    ``l2n`` is the in-kernel Q/K L2 norm mode of the call (:data:`L2N_MODES`):
+    a stage of :data:`L2N_STAGES` selects among its records whose ``l2n`` list
+    holds the mode (absent: ``["off"]``); a non-optional stage with no record
+    of the mode is refused (the architecture's records do not serve it).
 
     ``ctas = num_chunks_pad * num_heads`` is the chunk-shaped CTA count the
     preparation stages switch on (``ctas_at_least`` / ``ctas_below`` /
@@ -6571,7 +6615,20 @@ def select_record(
         raise ValueError(f"arch {arch!r} is not one of {ARCHES}")
     if path not in PATHS:
         raise ValueError(f"path {path!r} is not one of {PATHS}")
+    if l2n not in L2N_MODES:
+        raise ValueError(f"l2n {l2n!r} is not one of {L2N_MODES}")
     num_segments = segment_plan(num_seqs, num_heads, sm_count, arch)[2]
+    candidates = tuple(
+        name
+        for name in records_of_stage(stage, gate)
+        if stage not in L2N_STAGES or l2n in MODULES[name].get("l2n", ["off"])
+    )
+    if stage in L2N_STAGES and not candidates and stage not in OPTIONAL_STAGES:
+        raise ValueError(
+            f"stage {stage!r}: no record serves the in-kernel Q/K L2 norm mode "
+            f"{l2n!r} (use_qk_l2norm_in_kernel); the exported records do not "
+            "implement it"
+        )
 
     def admits(name: str) -> bool:
         return _admits(
@@ -6587,7 +6644,7 @@ def select_record(
 
     admitted = [
         name
-        for name in records_of_stage(stage, gate)
+        for name in candidates
         if MODULES[name]["select_rule"]["kind"] != "otherwise" and admits(name)
     ]
     if len(admitted) > 1:
@@ -6600,7 +6657,7 @@ def select_record(
         return admitted[0]
     fallback = [
         name
-        for name in records_of_stage(stage, gate)
+        for name in candidates
         if MODULES[name]["select_rule"]["kind"] == "otherwise"
     ]
     if not fallback and stage in OPTIONAL_STAGES:
@@ -6635,6 +6692,7 @@ def launch_grid(
     num_segments: int = 0,
     launch: int = 0,
     gsize: int = 0,
+    num_tokens: int = 0,
 ) -> tuple[int, int, int]:
     """The launch grid of record ``name`` under its recorded grid rule (of its
     ``launch``-th launch, for a record its stage launches more than once;
@@ -6671,6 +6729,9 @@ def launch_grid(
     ``head_chunk_blocks`` launches ``(num_heads, ceil(num_chunks_pad /
     per_cta), 1)``, at least one block (``param_finalize``: one CTA per head
     and segment of ``per_cta`` chunks; the grid's ``y`` is its ``seg_cap``).
+    ``tokens`` launches ``(ceil(num_tokens / 64), num_heads, 1)`` (the token-local Q/K L2
+    norm programs of the fallback route, one CTA per 64 tokens and head; at
+    least one block).
     """
     rule = MODULES[name]["grid_rule"]
     kind = rule["kind"]
@@ -6682,6 +6743,8 @@ def launch_grid(
         return (x, y, z)
     if kind == "chunks":
         return (int(rule["x_factor"]) * nc, h, 1)
+    if kind == "tokens":
+        return (max(1, -(-int(num_tokens) // CHUNK)), h, 1)
     if kind == "chunk_blocks":
         return (max(1, -(-nc // int(rule["per_cta"]))), 1, 1)
     if kind == "pairs_bounded":
@@ -6838,6 +6901,8 @@ __all__ = [
     "GATES",
     "GATE_STAGES",
     "HEAD_DIM",
+    "L2N_MODES",
+    "L2N_STAGES",
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
     "MODULES",
