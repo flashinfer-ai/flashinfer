@@ -2387,8 +2387,7 @@ def _resolve_sparse_mla_plan(
     if not isinstance(assume_valid_prefix, bool):
         raise TypeError("assume_valid_prefix must be bool")
     device, _ = _resolve_cuda_device(device)
-    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
-        raise NotImplementedError("sparse TS MLA requires SM100 or SM103")
+    _validate_runtime_device(device)
     for name, value in (
         ("batch_size", batch_size),
         ("num_qo_heads", num_qo_heads),
