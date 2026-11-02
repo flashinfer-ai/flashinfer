@@ -32,7 +32,6 @@ Key differences from MXFP4:
 
 import functools
 import os
-import warnings
 from typing import Callable, Optional, Tuple, Union, cast
 
 import cutlass
@@ -2542,7 +2541,7 @@ def _nvfp4_outputs(
     return fp4_out, flat[:scale_output_size]
 
 
-def _nvfp4_quantize_cute_dsl(
+def nvfp4_quantize_cute_dsl(
     input: torch.Tensor,
     global_scale: float | torch.Tensor,
     sf_layout: int = SF_LAYOUT_128x4,
@@ -2552,6 +2551,11 @@ def _nvfp4_quantize_cute_dsl(
     out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to NVFP4 format using the CuTe-DSL kernel.
+
+    .. deprecated::
+        Not part of the public API. Call :func:`flashinfer.fp4_quantize` or
+        :func:`flashinfer.nvfp4_quantize` with ``backend="cute-dsl"`` instead;
+        this entry point remains supported.
 
     GPU implementation matching :func:`flashinfer.quantization.nvfp4_quantize`:
 
@@ -2868,38 +2872,6 @@ def _nvfp4_quantize_cute_dsl(
     return fp4_output, scale_output
 
 
-def nvfp4_quantize_cute_dsl(
-    input: torch.Tensor,
-    global_scale: float | torch.Tensor,
-    sf_layout: int = SF_LAYOUT_128x4,
-    enable_pdl: bool | None = None,
-    nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
-    out: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize input tensor to NVFP4 format using the CuTe-DSL kernel.
-
-    .. deprecated::
-        Call :func:`flashinfer.fp4_quantize` or :func:`flashinfer.nvfp4_quantize`
-        with ``backend="cute-dsl"`` instead. This entry point remains supported
-        and is scheduled for removal in a future release.
-    """
-    warnings.warn(
-        "nvfp4_quantize_cute_dsl is deprecated and will be removed in a future "
-        "release. Use flashinfer.fp4_quantize or flashinfer.nvfp4_quantize with "
-        'backend="cute-dsl" instead.',
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return _nvfp4_quantize_cute_dsl(
-        input,
-        global_scale,
-        sf_layout=sf_layout,
-        enable_pdl=enable_pdl,
-        nvfp4_4over6=nvfp4_4over6,
-        out=out,
-    )
-
-
 def nvfp4_quantize_smooth_cute_dsl(
     input: torch.Tensor,
     pre_quant_scale: torch.Tensor,
@@ -2911,7 +2883,7 @@ def nvfp4_quantize_smooth_cute_dsl(
     """Fuse BF16 channel smoothing into the 128x4 NVFP4 quantizer.
 
     ``nvfp4_4over6`` follows the same three-state contract as
-    :func:`flashinfer.nvfp4_quantize`.
+    :func:`nvfp4_quantize_cute_dsl`.
     """
     from ...utils import device_support_pdl
 
@@ -2937,7 +2909,7 @@ def nvfp4_quantize_smooth_cute_dsl(
         pre_quant_scale = pre_quant_scale.clone()
     global_scale_arg = global_scale.float().reshape(1).contiguous().to(input.device)
     enable_pdl = device_support_pdl(input.device) if enable_pdl is not False else False
-    # Resolved before the empty-input return, see _nvfp4_quantize_cute_dsl.
+    # Resolved before the empty-input return, see nvfp4_quantize_cute_dsl.
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
 
     num_sf_blocks_per_row = k // NVFP4_SF_VEC_SIZE
@@ -3044,7 +3016,7 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
     m = 1
     for dim in input.shape[:-1]:
         m *= int(dim)
-    # Resolved before the empty-input return, see _nvfp4_quantize_cute_dsl.
+    # Resolved before the empty-input return, see nvfp4_quantize_cute_dsl.
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
 
     # Return empty outputs without compiling or launching.
@@ -3174,7 +3146,7 @@ def nvfp4_quantize_per_token_cute_dsl(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Per-token NVFP4 activation quantization using the CuTe-DSL kernel.
 
-    Unlike :func:`flashinfer.nvfp4_quantize`, which applies a single global
+    Unlike :func:`nvfp4_quantize_cute_dsl`, which applies a single global
     scale, this variant computes one quantization scale **per row (token)** of
     the activation. Each row is scaled independently so that its largest
     magnitude maps to the NVFP4 dynamic range, and the resulting per-token

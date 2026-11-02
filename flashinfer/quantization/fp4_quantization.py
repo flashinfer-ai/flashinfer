@@ -1327,7 +1327,7 @@ def _fp4_quantize_cute_dsl(
         else:
             sf_layout = _nvfp4_kernels.SF_LAYOUT_128x4
 
-        return _nvfp4_kernels._nvfp4_quantize_cute_dsl(
+        return _nvfp4_kernels.nvfp4_quantize_cute_dsl(
             input,
             global_scale,
             sf_layout=sf_layout,
@@ -1825,7 +1825,7 @@ def nvfp4_quantize(
             SF_LAYOUT_128x4,
             SF_LAYOUT_8x4,
             SF_LAYOUT_LINEAR,
-            _nvfp4_quantize_cute_dsl,
+            nvfp4_quantize_cute_dsl,
         )
 
         _sf_layout_map = {
@@ -1839,7 +1839,7 @@ def nvfp4_quantize(
         else:
             sf_layout_int = _sf_layout_map[sfLayout]
 
-        a_fp4, a_sf = _nvfp4_quantize_cute_dsl(
+        a_fp4, a_sf = nvfp4_quantize_cute_dsl(
             a.cuda(),
             a_global_sf,
             sf_layout=sf_layout_int,

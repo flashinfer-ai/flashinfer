@@ -647,14 +647,14 @@ def test_nvfp4_quantize_smooth_sm120_misaligned_inputs():
 def test_nvfp4_quantizers_sm120_empty_inputs(m, k):
     _skip_unless_sm120()
     from flashinfer.quantization.kernels.nvfp4_quantize import (
-        _nvfp4_quantize_cute_dsl,
+        nvfp4_quantize_cute_dsl,
     )
 
     x = torch.empty(m, k, dtype=torch.bfloat16, device="cuda")
     pqs = torch.ones(k, dtype=torch.bfloat16, device="cuda")
     global_sf = torch.ones(1, dtype=torch.float32, device="cuda")
     xq, sf = nvfp4_quantize_smooth(x, pqs, global_sf, backend="cute-dsl")
-    plain_xq, plain_sf = _nvfp4_quantize_cute_dsl(x, global_sf)
+    plain_xq, plain_sf = nvfp4_quantize_cute_dsl(x, global_sf)
 
     assert xq.shape == (m, k // 2) and xq.dtype == torch.uint8
     assert sf.shape == (0,) and sf.dtype == torch.uint8

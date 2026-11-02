@@ -2506,7 +2506,7 @@ def test_cute_dsl_nvfp4_quantize_resolves_recipe_on_empty_input():
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
     from flashinfer.quantization.kernels.nvfp4_quantize import (
-        _nvfp4_quantize_cute_dsl,
+        nvfp4_quantize_cute_dsl,
         silu_and_mul_nvfp4_quantize_cute_dsl,
     )
 
@@ -2514,9 +2514,9 @@ def test_cute_dsl_nvfp4_quantize_resolves_recipe_on_empty_input():
     empty_bf16 = torch.empty(0, 64, dtype=torch.bfloat16, device=device)
     empty_fp8 = torch.empty(0, 64, dtype=torch.float8_e4m3fn, device=device)
     with pytest.raises(TypeError, match="nvfp4_4over6"):
-        _nvfp4_quantize_cute_dsl(empty_bf16, global_scale, nvfp4_4over6="yes")
+        nvfp4_quantize_cute_dsl(empty_bf16, global_scale, nvfp4_4over6="yes")
     with pytest.raises(ValueError, match="requires fp16 or bf16"):
-        _nvfp4_quantize_cute_dsl(
+        nvfp4_quantize_cute_dsl(
             empty_fp8, global_scale, nvfp4_4over6=NVFP44Over6Config()
         )
     with pytest.raises(TypeError, match="nvfp4_4over6"):
@@ -2526,41 +2526,10 @@ def test_cute_dsl_nvfp4_quantize_resolves_recipe_on_empty_input():
             nvfp4_4over6="yes",
         )
     # A valid explicit recipe on an empty input still returns empty outputs.
-    q, sf = _nvfp4_quantize_cute_dsl(
+    q, sf = nvfp4_quantize_cute_dsl(
         empty_bf16, global_scale, nvfp4_4over6=NVFP44Over6Config()
     )
     assert q.shape == (0, 32) and sf.shape[0] == 0
-
-
-def test_nvfp4_quantize_cute_dsl_is_deprecated():
-    """The public name warns and still delegates to the CuTe-DSL kernel."""
-    device = torch.device("cuda")
-    if not _is_fp4_supported(device):
-        pytest.skip("Nvfp4 Requires compute capability of 10 or above")
-    if not _is_cute_dsl_available():
-        pytest.skip("CuTe-DSL not available")
-    import warnings
-
-    from flashinfer.quantization import fp4_quantize
-    from flashinfer.quantization.kernels.nvfp4_quantize import (
-        nvfp4_quantize_cute_dsl,
-    )
-
-    global_scale = torch.ones(1, dtype=torch.float32, device=device)
-    x = torch.randn(128, 64, dtype=torch.bfloat16, device=device)
-    with pytest.warns(DeprecationWarning, match="nvfp4_quantize_cute_dsl"):
-        q, sf = nvfp4_quantize_cute_dsl(x, global_scale, nvfp4_4over6=None)
-    assert q.shape == (128, 32)
-
-    # The backend="cute-dsl" dispatch must not route through the deprecated name.
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        ref_q, ref_sf = fp4_quantize(
-            x, global_scale, backend="cute-dsl", nvfp4_4over6=None
-        )
-    assert not any("nvfp4_quantize_cute_dsl" in str(w.message) for w in caught)
-    assert torch.equal(q, ref_q)
-    assert torch.equal(sf.reshape(-1), ref_sf.reshape(-1))
 
 
 def _silu_4over6_case_id(value):
