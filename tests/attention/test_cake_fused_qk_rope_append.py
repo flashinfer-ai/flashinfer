@@ -686,6 +686,16 @@ def test_every_stage_binds_the_public_argument_plan():
         ), name
 
 
+# The 8/1 pdl builds whose SM100 library takes the CTA cap in its own binding: the
+# prefill builds (two preload rounds, 256-bit loads, with and without the
+# pre-rotation sum of squares).  Their SM103 libraries and every other library
+# compile the shared binding.
+_SM100_CAPPED = (
+    "hq8_hkv1_lookup_rounds2_wide_f32_loads1_pdl",
+    "hq8_hkv1_lookup_rounds2_wide_f32_loads1_pre_rot_ss1_pdl",
+)
+
+
 def test_registry_records_reference_the_build_manifest():
     """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
 
@@ -757,9 +767,13 @@ def test_registry_records_reference_the_build_manifest():
             entry = libraries[library]
             assert entry["arch"] == arch
             assert entry["entry"] == "run"
+            # The capped 8/1 prefill pdl builds compile their own SM100 binding.
+            own = name in _SM100_CAPPED and arch == "sm_100a"
             assert entry["sources"] == [
                 f"csrc/{record['library']}_kernel.cu",
-                f"csrc/{record['library']}_binding.cu",
+                f"csrc/{record['library']}_{arch}_binding.cu"
+                if own
+                else f"csrc/{record['library']}_binding.cu",
             ]
             assert set(entry["sha256"]) == set(entry["sources"])
             for source in entry["sources"]:
@@ -775,6 +789,72 @@ def test_registry_records_reference_the_build_manifest():
         }
         assert set(loader.stages_for(arch)) == shipped
         assert shipped, arch
+
+
+def test_the_capped_builds_ship_their_own_sm100_binding():
+    """The capped builds' SM100 binding is the shared binding plus the CTA cap: it
+    adds lines only (``CtaCap`` of the SM count and the grid, the occupancy-sized
+    dynamic shared memory, the ``cta_cap`` export) and launches as the shared
+    binding does; no other file ships an architecture's own binding."""
+    own_files = sorted(
+        path.name for path in (PACKAGE_DIR / "csrc").glob("*_sm_*_binding.cu")
+    )
+    libraries = [loader.MODULES[name]["library"] for name in _SM100_CAPPED]
+    assert own_files == sorted(f"{lib}_sm_100a_binding.cu" for lib in libraries)
+    for name, library in zip(_SM100_CAPPED, libraries, strict=True):
+        assert loader.MODULES[name]["arches"] == ["sm_100a", "sm_103a"], name
+        shared = (PACKAGE_DIR / f"csrc/{library}_binding.cu").read_text()
+        own = (PACKAGE_DIR / f"csrc/{library}_sm_100a_binding.cu").read_text()
+        assert "CtaCap" not in shared and "max_ctas_per_sm" not in shared, name
+        for spelled in (
+            "int64_t CtaCap(int64_t sms, int64_t ctas) {",
+            "case 148:",
+            "case 152:",
+            "cudaDevAttrMultiProcessorCount",
+            "config.dynamicSmemBytes = CtaCapSmemBytes(dev.device_id, cap);",
+            f"TVM_FFI_DLL_EXPORT_TYPED_FUNC(cta_cap, cake_binding_kernel_{library}::CtaCap);",
+            "cudaLaunchAttributeProgrammaticStreamSerialization",
+        ):
+            assert spelled in own, (name, spelled)
+        remaining = iter(own.splitlines())
+        assert all(
+            any(line == other for other in remaining) for line in shared.splitlines()
+        ), name
+
+
+# (SM count, grid CTAs) -> the CTA cap the SM100 binding of a capped build takes:
+# the CTAs per SM, rounded up, inside B200's [152, 296] and GB200's [140, 144],
+# at every edge and one CTA beyond it; any other SM count takes none.
+_SM100_CAPS = {
+    (148, 139): 0,
+    (148, 140): 0,
+    (148, 148): 0,
+    (148, 149): 0,
+    (148, 151): 0,
+    (148, 152): 2,
+    (148, 296): 2,
+    (148, 297): 0,
+    (152, 139): 0,
+    (152, 140): 1,
+    (152, 144): 1,
+    (152, 145): 0,
+    (152, 152): 0,
+    (152, 264): 0,
+    (152, 305): 0,
+    (132, 140): 0,
+    (144, 144): 0,
+    (160, 152): 0,
+    (148, 0): 0,
+}
+
+
+@pytest.mark.parametrize("name", _SM100_CAPPED)
+@pytest.mark.parametrize("sms_ctas", list(_SM100_CAPS), ids=str)
+def test_the_sm100_binding_cta_cap_table(name, sms_ctas):
+    if _arch() != "sm_100a":
+        pytest.skip("the CTA cap is an SM100 library's")
+    module = loader.load(name, "sm_100a")
+    assert int(module.cta_cap(*sms_ctas)) == _SM100_CAPS[sms_ctas]
 
 
 def test_stage_policy_table_is_well_formed():
