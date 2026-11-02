@@ -6326,3 +6326,399 @@ def test_device_logprob_keep_lifetimes(glm_weight, monkeypatch):
     assert runner.plan.logprob_keep
     with pytest.raises(NotImplementedError, match="eager entry points"):
         runner.forward()
+
+
+# ---------------------------------------------------------------------------
+# Zero-gradient row skip of the log-probability backward
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _zero_dlogp_floor(rows):
+    """Run under the zero-gradient row skip's floor ``rows`` (:func:`cake_backend.set_zero_dlogp_min_rows`; ``None``:
+    never), then restore the previous."""
+    previous = cake_backend.set_zero_dlogp_min_rows(rows)
+    try:
+        yield
+    finally:
+        cake_backend.set_zero_dlogp_min_rows(previous)
+
+
+def _with_zero_dlogp(inp, zero, *, negative_zero=True):
+    """``inp`` with ``dlogp`` 0 on ``zero`` (``-0.0`` on every other zero row with ``negative_zero``)."""
+    d = inp.dlogp.clone()
+    d[zero] = 0.0
+    if negative_zero:
+        rows = zero.nonzero().squeeze(1)
+        d[rows[::2]] = -0.0
+    return dataclasses.replace(inp, dlogp=d.contiguous())
+
+
+def _zero_dlogp_set(inp, kind):
+    """:func:`_zero_weight_set` plus ``"single"`` (every valid row zero but one in the middle) and ``"last"`` (every
+    valid row zero but those of the last 4096-row chunk of the valid rows)."""
+    valid = inp.labels >= 0
+    rows = valid.nonzero().squeeze(1)
+    if kind == "single":
+        zero = valid.clone()
+        zero[rows[rows.numel() // 2]] = False
+        return zero
+    if kind == "last":
+        zero = valid.clone()
+        zero[rows[(rows.numel() - 1) // 4096 * 4096 :]] = False
+        return zero
+    return _zero_weight_set(inp, kind)
+
+
+def _logprob_call(inp, C=4096, *, package="nd"):
+    """One autograd log-probability call (forward + ``backward(dlogp)``) of ``package`` on the generated programs."""
+    return _run(inp, C, package=package, entry="logprob", backend="cake")
+
+
+def test_zero_dlogp_partition_orders_the_live_rows_first():
+    """``zero_dlogp_partition``: the valid rows of a nonzero ``dlogp`` (NaN included) first, then the zero-gradient
+    rows (``+0`` and ``-0``), each group in ascending order; ``lse`` in that order; the inclusive scan of the live rows
+    over ``[T]``; the per-chunk live counts, at least one in the first chunk."""
+    labels = torch.tensor([3, -100, 5, 7, 1, 2, -100, 4, 0], dtype=torch.int64)
+    d = torch.tensor([1.0, 0.0, 0.0, -0.0, float("nan"), -2.0, 3.0, 0.0, 0.5])
+    index = (labels >= 0).nonzero().squeeze(1)
+    lse = torch.arange(7, dtype=torch.float32)
+    order, lse_o, scan, counts = cake_backend.zero_dlogp_partition(
+        labels, d, index, lse, 4
+    )
+    assert order.tolist() == [0, 4, 5, 8, 2, 3, 7]
+    assert lse_o.tolist() == [0.0, 3.0, 4.0, 6.0, 1.0, 2.0, 5.0]
+    assert scan.dtype == torch.int32
+    assert scan.tolist() == [1, 1, 1, 1, 2, 3, 3, 3, 4]
+    assert counts.dtype == torch.int32 and counts.tolist() == [4, 0]
+    order, _, scan, counts = cake_backend.zero_dlogp_partition(
+        labels, torch.zeros(9), index, lse, 4
+    )
+    assert order.tolist() == index.tolist() and int(scan[-1]) == 0
+    # the first chunk's weight-gradient GEMM stores one K step (of zeros): its count is at least one
+    assert counts.tolist() == [1, 0]
+    order, lse_o, _, counts = cake_backend.zero_dlogp_partition(
+        labels, torch.ones(9), index, lse, 3
+    )
+    assert order.tolist() == index.tolist() and lse_o.tolist() == lse.tolist()
+    assert counts.tolist() == [3, 3, 1]
+
+
+def test_zero_dlogp_floor_switch():
+    """``set_zero_dlogp_min_rows`` returns the previous floor; ``None`` turns the skip off; a negative or non-integer
+    floor is refused."""
+    default = cake_backend.zero_dlogp_min_rows()
+    assert default == cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT
+    with _zero_dlogp_floor(8192):
+        assert cake_backend.zero_dlogp_min_rows() == 8192
+        with _zero_dlogp_floor(None):
+            assert cake_backend.zero_dlogp_min_rows() is None
+        assert cake_backend.zero_dlogp_min_rows() == 8192
+    assert cake_backend.zero_dlogp_min_rows() == default
+    for bad in (-1, 1.5, True, "8192"):
+        with pytest.raises((TypeError, ValueError)):
+            cake_backend.set_zero_dlogp_min_rows(bad)
+    assert cake_backend.zero_dlogp_min_rows() == default
+
+
+def test_dcnt_stage_names_round_trip():
+    """The ``_dcnt`` forms: the dz arm, the K-sliced dX reduction (not its swapped tile; the one-slice plain store has
+    none), the weight-gradient accumulate (plain and blocked) and the bf16 fused cast (not its TMA store); every
+    registered ``_dcnt`` name parses back to its base and knobs."""
+    sv = cake_backend.stage_variant
+    assert sv("gemm_logits_dz", dcnt=True) == cake_backend.LOGPROB_DZ_DCNT_STAGE
+    assert sv("gemm_dx_red", tile_n=256, dcnt=True) == "gemm_dx_red_tn256_dcnt"
+    assert (
+        sv("gemm_dx_red", stages=3, split=True, dcnt=True)
+        == "gemm_dx_red_st3_split_dcnt"
+    )
+    assert sv("gemm_dw_acc", blocked=True, dcnt=True) == "gemm_dw_acc_gn_dcnt"
+    assert sv("gemm_dw_cast_bf16", dcnt=True) == "gemm_dw_cast_bf16_dcnt"
+    for base, kw in (
+        ("gemm_dx_red", dict(swab=True)),
+        ("gemm_dw_cast_bf16", dict(epi_store="tma")),
+        ("gemm_dw_acc", dict(epi_store="tma")),
+        ("gemm_dx", {}),
+        ("gemm_logits", {}),
+    ):
+        with pytest.raises(ValueError):
+            sv(base, dcnt=True, **kw)
+    assert cake_backend.dx_stage(1, dcnt=True) == "gemm_dx"
+    assert cake_backend.dx_stage(3, dcnt=True) == "gemm_dx_red_dcnt"
+    counted = [stage for stage in cake_jit.STAGES if stage.endswith("_dcnt")]
+    assert len(counted) == 9
+    for stage in counted:
+        base, knobs = cake_backend.parse_stage(stage)
+        assert base in cake_backend.DCNT_BASES and knobs["dcnt"]
+        assert sv(base, **knobs) == stage
+        assert stage.removesuffix("_dcnt") in cake_jit.STAGES
+
+
+def test_plan_runs_the_counted_forms():
+    """``make_plan(dcnt=True)`` (a log-probability plan with the dz arm on a registered architecture): the recompute,
+    the K-sliced dX chunks and the weight-gradient GEMMs take their ``_dcnt`` forms, a one-slice dX chunk its plain
+    store; without the dz arm, or with a chunk on a form without a counted one, the plan keeps the shipped forms; the
+    binding key tells the two apart."""
+    g = cake_backend.Geometry.from_record(
+        {"geometry": {"hidden": 6144, "vocab": 154880}}
+    )
+    common = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        dx_finalize=True,
+        logprob_dz=True,
+    )
+    # 12000 rows: three chunks, the last of 3808 rows (above the TMA fused cast's last-chunk bound)
+    problem = _keep_problem(12000, 6144, 154880, 4096, entry="logprob")
+    counted = 0
+    for arch in ("sm_100a", "sm_103a"):
+        kw = dict(common, arch=arch)
+        plain = cake_backend.make_plan(problem, valid_rows=12000, **kw)
+        plan = cake_backend.make_plan(problem, valid_rows=12000, dcnt=True, **kw)
+        if any(
+            v.dx_swab or v.dw_epi_store not in (None, "redsm") or v.dw_cast_tma
+            for v in plan.variants
+        ):
+            assert not plan.dcnt and plan.stages == plain.stages
+            continue
+        assert plan.dcnt and not plain.dcnt
+        counted += 1
+        assert plan.chunks == plain.chunks and plan.dx_slices == plain.dx_slices
+        for i in range(plan.num_chunks):
+            assert plan.recompute_stage(i) == "gemm_logits_dz_dcnt"
+            assert plan.dx_stage_of(i).endswith("_dcnt") == (
+                plan.dx_slices_of(i) > 1
+            ), plan.dx_stage_of(i)
+            assert plan.dx_stage_of(i).removesuffix("_dcnt") == plain.dx_stage_of(i)
+        assert all(s.endswith("_dcnt") for s in plan.stages if s.startswith("gemm_dw"))
+        assert {s.removesuffix("_dcnt") for s in plan.stages} == set(plain.stages)
+        assert not cake_backend.make_plan(
+            problem, valid_rows=12000, dcnt=True, **dict(kw, logprob_dz=False)
+        ).dcnt
+    assert counted, "no architecture ran the counted forms"
+    assert not cake_backend.make_plan(
+        problem, valid_rows=12000, dcnt=True, **common
+    ).dcnt  # the reference path (no arch)
+    loss = _keep_problem(12000, 6144, 154880, 4096)
+    assert not cake_backend.make_plan(
+        loss,
+        valid_rows=12000,
+        dcnt=True,
+        **dict(common, logprob_dz=False, arch="sm_100a"),
+    ).dcnt
+    key = functools.partial(
+        cake_backend.logprob_backward_binding_key,
+        *(torch.empty(s) for s in ((8, 64), (128, 64), (8,), (8,), (8,))),
+        chunk_size=4096,
+        need_dx=True,
+        need_dw=True,
+    )
+    assert key(zero_dlogp=True) != key() == key(zero_dlogp=False)
+
+
+ZERO_DLOGP_DEVICE_CASES = [
+    (4097, "none"),
+    (4097, "one"),
+    (4097, "single"),
+    (8117, ("random", 0.166)),
+    (8117, ("random", 0.5)),
+    (12289, ("group", 0.5)),
+    (12289, "last"),
+    (12289, "all"),
+    (2048, ("random", 0.3)),
+]
+
+
+@pytest.mark.parametrize("T, kind", ZERO_DLOGP_DEVICE_CASES, ids=str)
+def test_device_zero_dlogp_rows_skip(glm_weight, T, kind):
+    """The zero-gradient row skip on the device against the same backward without it (``set_zero_dlogp_min_rows(None)``)
+    and the FP64 oracle: ``logp`` the same bits; the deterministic suite's gates; the zero rows' and the ignored rows'
+    ``dX`` rows exact ``+0``; the other ``dX`` rows equal to the backward without the skip within one BF16 rounding
+    (the K-sliced reductions add in any order); a second call from the remembered binding gives the first's ``dW``
+    within the FP32 reduction order.  Every valid row zero: zero gradients."""
+    _require_program(entry="logprob")
+    base = _device_inputs(T, "ce", W=glm_weight)
+    zero = _zero_dlogp_set(base, kind)
+    inp = _with_zero_dlogp(base, zero)
+    cake_backend.BINDING_CACHE.clear()
+    with _zero_dlogp_floor(0):
+        nd = _logprob_call(inp)
+        again = _logprob_call(inp)
+    with _zero_dlogp_floor(None):
+        plain = _logprob_call(inp)
+    valid = inp.labels >= 0
+    live = valid & ~zero
+    assert _same_bits(nd["logp"], plain["logp"])
+    for run in (nd, again):
+        assert not bool(_bits(run["dX"][zero | ~valid]).any())
+    if not bool(live.any()):
+        assert not bool(_bits(nd["dX"]).any()) and not bool(nd["dW"].float().any())
+        return
+    scale = float(plain["dX"][live].float().abs().max())
+    dx_diff = float((nd["dX"][live].float() - plain["dX"][live].float()).abs().max())
+    assert dx_diff <= scale * 2**-7, (dx_diff, scale)
+    _check_against_references(nd, inp, entry="logprob", ceiling=True)
+    _check_against_references(again, inp, entry="logprob", ceiling=True)
+    dw_rel = float(
+        (nd["dW"].float() - plain["dW"].float()).norm() / plain["dW"].float().norm()
+    )
+    print(
+        f"\nzero-dlogp skip T={T} {kind} zero {int(zero.sum())}/{int(valid.sum())}: dW rel-L2 vs no skip "
+        f"{dw_rel:.2e}, dX max|skip - no skip| {dx_diff:.2e}"
+    )
+
+
+def test_device_zero_dlogp_rows_repeat(glm_weight):
+    """``REPEATS`` runs with 16.6 % zero-gradient rows (T 12289, chunks of 4096), each after poisoning the free
+    allocator memory: every run passes the deterministic suite's gates and keeps the zero rows' ``dX`` exact ``+0``; the
+    worst error per metric is printed beside the deterministic package's on the same inputs."""
+    _require_program(entry="logprob")
+    base = _device_inputs(12289, "ce", W=glm_weight)
+    zero = _zero_dlogp_set(base, ("random", 0.166))
+    inp = _with_zero_dlogp(base, zero)
+    oracle = reference_fp64(inp, entry="logprob")
+    b0 = error_report(reference_unchunked(inp, entry="logprob"), oracle, inp.labels)
+    det = error_report(_logprob_call(inp, package="det"), oracle, inp.labels)
+    worst = {}
+    with _zero_dlogp_floor(0):
+        for _ in range(REPEATS):
+            _poison_allocator(1 << 30)
+            run = _logprob_call(inp)
+            assert not bool(_bits(run["dX"][zero]).any())
+            errors = error_report(run, oracle, inp.labels)
+            assert not errors["nan"] and errors["logp_ignored_zero"]
+            assert errors["dX_ignored_zero"]
+            for key, tiny in GATE_TINY.items():
+                if key in errors:
+                    assert errors[key] <= GATE_MARGIN * b0[key] + tiny, key
+                    worst[key] = max(worst.get(key, 0.0), errors[key])
+    print(
+        "\nzero-dlogp skip repeat worst: "
+        + ", ".join(
+            f"{k} {v:.3e} (det {det.get(k, float('nan')):.3e}, b0 {b0[k]:.3e})"
+            for k, v in worst.items()
+        )
+    )
+
+
+def test_device_zero_dlogp_floor_keeps_small_calls_unskipped(glm_weight):
+    """A backward of fewer valid rows than the floor runs without the skip: ``logp`` / ``dW`` the bits of the backward
+    with the skip off, the zero rows' ``dX`` rows zeros either way."""
+    _require_program(entry="logprob")
+    base = _device_inputs(4097, "ce", W=glm_weight)
+    zero = _zero_dlogp_set(base, ("random", 0.3))
+    inp = _with_zero_dlogp(base, zero, negative_zero=False)
+    with _zero_dlogp_floor(8192):
+        nd = _logprob_call(inp)
+    with _zero_dlogp_floor(None):
+        plain = _logprob_call(inp)
+    for key in ("logp", "dW"):
+        assert _same_bits(nd[key], plain[key]), key
+    assert not bool(nd["dX"][zero].float().any())
+
+
+def test_device_zero_dlogp_rows_keep_a_nan_upstream_row_live(glm_weight):
+    """A NaN ``dlogp`` row is a live row: NaN in its ``dX`` row and in ``dW``, as without the skip."""
+    _require_program(entry="logprob")
+    base = _device_inputs(4097, "ce", W=glm_weight)
+    rows = (base.labels >= 0).nonzero().squeeze(1)
+    zero = torch.zeros_like(base.labels, dtype=torch.bool)
+    zero[rows[1:300]] = True
+    inp = _with_zero_dlogp(base, zero)
+    d = inp.dlogp.clone()
+    d[rows[0]] = float("nan")
+    with _zero_dlogp_floor(0):
+        nd = _logprob_call(dataclasses.replace(inp, dlogp=d))
+    assert bool(torch.isnan(nd["dX"][rows[0]].float()).all())
+    assert bool(torch.isnan(nd["dW"].float()).any())
+    assert not bool(_bits(nd["dX"][zero]).any())
+
+
+def test_device_zero_dlogp_skip_adds_no_synchronization(glm_weight):
+    """The backward with the skip runs under PyTorch's synchronization debug mode ``"error"``, binding (first call) and
+    from the remembered binding (second call)."""
+    _require_program(entry="logprob")
+    base = _device_inputs(8117, "ce", W=glm_weight)
+    zero = _zero_dlogp_set(base, ("random", 0.3))
+    inp = _with_zero_dlogp(base, zero)
+    cake_backend.BINDING_CACHE.clear()
+
+    def backward_under_error_mode():
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        logp = cake_backend.chunked_lm_head_logprob(
+            X, W, inp.labels, chunk_size=4096, backend="cake", **ND
+        )
+        torch.cuda.synchronize()
+        previous = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            logp.backward(inp.dlogp)
+        finally:
+            torch.cuda.set_sync_debug_mode(previous)
+        torch.cuda.synchronize()
+        return X.grad
+
+    with _zero_dlogp_floor(0):
+        for _ in range(2):
+            dx = backward_under_error_mode()
+            assert not bool(_bits(dx[zero]).any())
+
+
+def test_device_zero_dlogp_backward_cuda_graph(glm_weight):
+    """The log-probability backward with the skip captured in a CUDA graph (after a warm-up that binds it on the
+    capture stream): replays with other ``dlogp`` values -- other zero rows and live counts per chunk, none and every
+    row zero -- written into the captured input give the eager backward's results on those values (``dW`` within
+    the FP32 reduction order, the zero rows' ``dX`` exact ``+0``)."""
+    _require_program(entry="logprob")
+    base = _device_inputs(12289, "ce", W=glm_weight)
+    kw = dict(chunk_size=4096, **ND)
+    fr = cake_backend.forward_logprob(base.X, base.W, base.labels, **kw)
+    torch.cuda.synchronize()
+    assert fr.row_index is not None
+    dlogp = base.dlogp.clone()
+
+    def backward(d):
+        return cake_backend.backward_logprob(
+            base.X, base.W, base.labels, fr.lse, d, row_index=fr.row_index, **kw
+        )
+
+    with _zero_dlogp_floor(0):
+        cake_backend.BINDING_CACHE.clear()
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            backward(dlogp)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            dx_g, dw_g = backward(dlogp)
+        valid = base.labels >= 0
+        for kind in (("random", 0.166), ("group", 0.5), "none", "last", "all"):
+            zero = _zero_dlogp_set(base, kind)
+            new = _with_zero_dlogp(base, zero).dlogp
+            dlogp.copy_(new)
+            graph.replay()
+            torch.cuda.synchronize()
+            got_dx, got_dw = dx_g.clone(), dw_g.clone()
+            want_dx, want_dw = backward(new.clone())
+            torch.cuda.synchronize()
+            assert not bool(_bits(got_dx[zero | ~valid]).any()), kind
+            live = valid & ~zero
+            if not bool(live.any()):
+                assert not bool(got_dw.float().any()), kind
+                continue
+            scale = float(want_dx[live].float().abs().max())
+            assert (
+                float((got_dx[live].float() - want_dx[live].float()).abs().max())
+                <= scale * 2**-7
+            ), kind
+            dw_rel = float(
+                (got_dw.float() - want_dw.float()).norm() / want_dw.float().norm()
+            )
+            assert dw_rel <= 1e-3, (kind, dw_rel)

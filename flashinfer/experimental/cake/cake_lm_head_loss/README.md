@@ -24,6 +24,7 @@ from `build.json` otherwise (see "Layout of this package").
 | public call | `chunked_lm_head_det_*(...)`, or `chunked_lm_head_*(...)` with the default `deterministic=True` | `chunked_lm_head_*(..., deterministic=False)` |
 | `loss`, `logp`, `lse` | fixed order, bitwise run to run | fixed order, bitwise run to run (the same programs) |
 | zero-weight policy rows (`loss_weights == 0`) | in the chunk loop | left out of the gradient path (see "Zero-weight policy rows") |
+| log-probability rows with `dlogp == 0` | in the chunk loop | ordered last; the backward's GEMMs skip their work (see "Zero-gradient rows of the log-probability backward") |
 | `dW` | chunk order, bitwise run to run | chunk order (the same programs); no run-to-run promise |
 | `dX` of a K-sliced chunk | slice 0 stored, slices `>= 1` in FP32 slabs added in slab order | one launch per chunk adds every slice into the `-0.0`-filled FP32 accumulator rows in an unordered FP32 reduction; a one-slice chunk stores its rows as the deterministic package does |
 | precision boundaries | BF16 logits and `dlogits`, FP32 loss arithmetic, FP32 `dX` / `dW` accumulation, one final cast each | the same |
@@ -214,6 +215,7 @@ the previous value; an entry call reads them once):
 | `cake_backend.set_dx_slice_policy` | `"det"` | the dX slice rule (see "Kernel structure of one token chunk"); part of every binding key |
 | `cake_backend.set_dx_red_min_rows` | `0` | a chunk of fewer rows keeps one K slice (the plain store); part of every binding key |
 | `cake_backend.set_zero_weight_min_rows` | `4096` | a call of fewer rows `T` keeps its zero-weight rows in the chunk loop (see "Zero-weight policy rows") |
+| `cake_backend.set_zero_dlogp_min_rows` | `0` | a log-probability backward of fewer valid rows runs without the zero-gradient row skip; `None` turns the skip off (see "Zero-gradient rows of the log-probability backward"); part of the backward binding key |
 | `cake_backend.set_gradient_placement` | `"auto"` | where the loss entries (`chunked_lm_head_loss` of both modules, every form) run the dX / dW GEMMs. `"auto"`: a call no backward can follow (grad mode off, or neither `X` nor `W` trainable) computes the loss (and `logp`) only; inside a non-reentrant `torch.utils.checkpoint` (its own saved-tensor hooks innermost) the checkpointed forward computes the loss only and saves its inputs, and the recomputation in the backward runs the fused forward and hands the gradient accumulators to the checkpointed call's backward, so a checkpointed step forms them once and keeps no FP32 accumulator from the forward to the backward (paired per checkpoint frame and graph by call order and checked against the inputs' metadata and the call's options; without a handed result the backward runs the fused forward itself, with a `RuntimeWarning`); other hooks innermost (CPU offload), torch's deterministic algorithms, or a torch whose checkpoint lacks those hooks keep the fused forward. Under selective activation checkpointing (`context_fn` of `create_selective_checkpoint_contexts`, whose recomputation replays the checkpointed forward's operators by position) every entry of this package -- the loss, log-probability (default, budget, kept logits) and candidate-support entries -- runs its forward with all active torch dispatch modes popped, the checkpoint's and any user mode on the stack (a `FlopCounterMode` does not see the entry's operators; a tracing mode such as `FakeTensorMode` or a `torch.compile` trace gets real launches on fake inputs and fails loudly), and behaves as in a plain non-reentrant checkpoint; the per-device constant cells and the calling thread's count cells and `arange` constant are formed outside active dispatch modes. `"forward"`: every call with a trainable input forms the gradients in its forward (the previous behavior). The same kernels on the same operands either way: the same loss, `logp` and dW bits, and dX up to the order of its unordered K-slice reduction (the same bits with one dX slice) |
 | `cake_backend.set_dx_fill_side_stream` | `False` | `True`: a remembered binding issues the `-0.0` fill of `dX_acc` on the calling thread's fill stream (its own allocator pool, joined before the first dX GEMM), so it runs beside the queued chunk-0 logits GEMM; not under CUDA graph capture, not in the prepared runner; `True` keeps up to `T * H * 4` bytes more reserved in the fill stream's pool |
 
@@ -279,13 +281,55 @@ row out of the gradient path:
 
 Not applied (the plain path runs, every valid row in the chunk loop): a call
 below the row floor above, `compact_rows=False`, `objective="ce"` (no weights), the log-probability entry
-(a zero `dlogp` row is known only in the backward), the prepared runner
+(a zero `dlogp` row is known only in the backward; see the next section), the prepared runner
 (`prepare_lm_head_loss`, a fixed row set) and a caller-given
 `num_valid_rows` (its plan needs no readback, so the split count is not
 available).  `memory_mode="budget"` splits the rows too: its chunk loop and
 step-peak model run over the gradient rows, its bound still counts every valid
 row, and the model adds the logp-only pass as one more phase
 (`memory_plan(..., zero_rows=...)`).
+
+## Zero-gradient rows of the log-probability backward
+
+A valid row whose upstream gradient `dlogp` is exactly zero (`+0` or `-0`;
+for example a token the caller's loss masks) contributes exact zeros to `dX`
+and `dW`.  The log-probability backward knows `dlogp` only when it runs, so
+it handles these rows on the device, without a host synchronization:
+
+* The backward orders the forward's valid rows so that the live rows (a
+  nonzero `dlogp`, NaN included) come first, each group in ascending order,
+  and forms the per-chunk count of live rows in device memory (a few small
+  kernels per call; `zero_dlogp_partition`).
+* The chunk's dz arm of the logits GEMM, its K-sliced dX reduction, its
+  weight-gradient accumulate and its bf16 fused cast run their `_dcnt` forms:
+  each reads the chunk's count and skips the work items (or the K steps) past
+  it.  The launch shape stays the chunk's full row count, so the call is the
+  same set of launches for every `dlogp` and a CUDA graph capture of the
+  backward replays for other `dlogp` values.  A chunk with no live row runs
+  its launches without their GEMM work.
+* The fused dX finalize writes exact `+0` rows for the zero-gradient rows (as
+  for an ignored row); `dX` of a live row is the same mathematics as without
+  the skip.  `dW` sums the same nonzero products over the live rows in the new
+  row order (FP32 accumulation; bits may differ within the accuracy budgets).
+* The skip applies to a compacted backward that reuses the forward's row index
+  (the autograd entries), with the dz arm (`logprob_dz`) and, when it forms
+  `dX`, the fused dX finalize, on a record that registers the `_dcnt` forms,
+  and of at least `cake_backend.zero_dlogp_min_rows()` valid rows (default 0,
+  `set_zero_dlogp_min_rows`; `None` = never).  A chunk plan with a form that has
+  no counted form (the swapped dX tile, the weight-gradient TMA epilogue)
+  runs the shipped forms over the reordered rows (the same results).
+
+Non-finite values: a NaN `dlogp` keeps its row live (NaN in its `dX` row and
+in `dW`, as without the skip).  A non-finite `X` row of a zero-gradient row
+makes `dW` NaN without the skip (`0 * inf`); with the skip it still does when
+the row falls within the 63 rows after a chunk's live rows (the weight-gradient
+GEMM's last 64-row K step), and not elsewhere.  Its `dX` row is an exact zero
+either way.
+
+Not applied: `compact_rows=False`, a backward that recounts its valid rows,
+the kept-logits entry, `memory_mode="budget"`, the prepared runner and the
+reference backend.  The one-slice dX chunks (the plain store) compute every
+row of the chunk.
 
 ## Kernel structure of one token chunk
 
