@@ -68,12 +68,13 @@ than the deterministic package's shipped plan of the row in every measurement ru
 row that missed; a row without an entry was not measured.  Both run the deterministic program.
 
 The K1 verdicts were measured at 16172 to 16384 tokens.  Those of `K1_SPLIT_RULES` hold at every token count their split
-count fits (`num_splits * 64 <= T + 63`); the tables of `K1_SPLIT_RULES_BY_SM` hold only at 16172 to 16384 tokens
-(`K1_SPLIT_RULES_BY_SM_TOKENS`).  The router verdicts hold only inside token windows (`ROUTER_RULES`; the last table
-below) and pass a stricter rule: measured in one long-lived process and in a fresh process per token count, and no more
-than 3 % slower than the deterministic plan next to such a kernel both in the same launch order and with the router
-partition launched before that kernel against the deterministic plan launched after it.  Every other token count of a
-router row runs the deterministic program.  The K1 verdicts hold from the floor of `K1_MIN_SM_COUNT` /
+count fits (`num_splits * 64 <= T + 63`), except, on `sm_100a` / `sm_103a` parts of 152 SMs or more, the token counts of
+`K1_SPLIT_RULE_EXCLUDED_TOKENS` (the K1 token table below); the tables of `K1_SPLIT_RULES_BY_SM` hold only at 16172 to
+16384 tokens (`K1_SPLIT_RULES_BY_SM_TOKENS`).  The router verdicts hold only inside token windows (`ROUTER_RULES`; the
+last table below) and pass a stricter rule: measured in one long-lived process and in a fresh process per token count,
+and no more than 3 % slower than the deterministic plan next to such a kernel both in the same launch order and with the
+router partition launched before that kernel against the deterministic plan launched after it.  Every other token count
+of a router row runs the deterministic program.  The K1 verdicts hold from the floor of `K1_MIN_SM_COUNT` /
 `K1_RULE_MIN_SM_COUNT` up (a part with more SMs than the measured ones takes them without a measurement, a part with
 fewer runs the deterministic program); the tables of `K1_SPLIT_RULES_BY_SM` hold for exactly 208 and 212 SMs.  The
 router windows hold only on the SM count they were measured on (`ROUTER_SM_COUNT`: 152 on `sm_100a` / `sm_103a`, 216 on
@@ -87,6 +88,7 @@ condition of `"waves"` (the deterministic plan's last wave below 80 % full).  Th
 | `K1_MIN_SM_COUNT` | `arch` | the fewest SMs for the K1 verdicts of the architecture (`sm_100a` / `sm_103a`: 148, `sm_107a`: 216) |
 | `K1_RULE_MIN_SM_COUNT` | a key of `K1_SPLIT_RULES` | the fewest SMs for that row's verdict where it is above `K1_MIN_SM_COUNT` (`sm_103a` `4096 -> 48`: 152) |
 | `K1_SPLIT_RULES_BY_SM` | `(arch, sm_count)` | the K1 verdicts of the parts with exactly `sm_count` SMs below a row's floor (keys and values as in `K1_SPLIT_RULES`), at the token counts of `K1_SPLIT_RULES_BY_SM_TOKENS` only; a part without a table, and every other token count, runs every K1 row below the floor on the deterministic program (`sm_107a`: 208 and 212 SMs) |
+| `K1_SPLIT_RULE_EXCLUDED_TOKENS` | a key of `K1_SPLIT_RULES` on `sm_100a` / `sm_103a` | `((min_sm_count, min_tokens, max_tokens), ...)`: on a part of at least `min_sm_count` SMs the row runs the deterministic program at a token count from `min_tokens` to `max_tokens` (`None`: no upper bound); every other token count keeps the verdict |
 | `K1_SPLIT_RULES_BY_SM_TOKENS` | -- | `(min_tokens, max_tokens)`: the token counts (`K` of the weight gradient) the tables of `K1_SPLIT_RULES_BY_SM` hold for, `(16172, 16384)` (where they were measured) |
 | `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`) or `"nn_t"` (weight gradient, `hidden` = the launch's `M`), `experts` = the launch's `N` | `None` (the deterministic program), token windows `((min_tokens, max_tokens, spec), ...)` (the spec of the window that holds the token count -- `K` of the weight gradient, `M` of the forward; every other token count: the deterministic program) or a spec alone (every token count: a plan a test or a measurement forces).  A spec is `"waves"`, `"H<f>x<k>"`, `"H<f>x<k>p<h>"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"` or a unit count |
 | `ROUTER_SM_COUNT` | `arch` | the SM count of the router verdicts of the architecture (`sm_100a` / `sm_103a`: 152, `sm_107a`: 216); a device with any other SM count runs the deterministic program, except in a `"waves"` window (the condition of `router_waves`) |
@@ -106,9 +108,48 @@ holding 32 SMs (its 128 CTAs no longer fit the free SMs) and on `sm_107a` at 163
 `4096 -> 512` BF16 (192 CTAs) and `4096 -> 4096` FP32 (216 CTAs) miss next to a kernel holding 32 SMs the same way.
 `4096 -> 64` (`sm_103a`; `sm_107a` BF16) and `4096 -> 48` on 148-SM `sm_103a` parts are not faster than the
 deterministic plan in every run.  The `sm_107a` one-split rows store whole tiles: they win where the deterministic
-package's `sm_107a` program of the row is slower.  Every K1 choice also needs `num_splits * 64 <= T + 63` (shorter
-token counts run the deterministic program); the 208-SM and 212-SM choices hold only at 16172 to 16384 tokens
+package's `sm_107a` program of the row is slower.  Every K1 choice also needs `num_splits * 64 <= T + 63` (shorter token
+counts run the deterministic program); on `sm_100a` / `sm_103a` parts of 152 SMs or more the token counts of the K1
+token table below run the deterministic program; the 208-SM and 212-SM choices hold only at 16172 to 16384 tokens
 (`K1_SPLIT_RULES_BY_SM_TOKENS`).*
+
+| K1 row `d_in -> d_out` | `sm_100a` BF16 | `sm_100a` FP32 | `sm_103a` BF16 | `sm_103a` FP32 |
+|---|---|---|---|---|
+| `4096 -> 32` | 512 | -- | 512; 65536 | 512; 32768 to 65536 |
+| `4096 -> 48` | 512; 65536 | 512 | 512; 32768 to 65536 | 512; 32768 to 65536 |
+| `4096 -> 64` | 512 | 512 | no verdict | no verdict |
+| `5120 -> 32` | 512 | 512 | 512; 32768 and up‡ | 512 |
+| `5120 -> 48` | 512 to 2048 | 512 to 2048 | 512 to 2048; 32768 and up‡ | 512 to 2048 |
+| `5120 -> 64` | 512 to 2048; 8192 | 512 to 2048; 8192 | 512 to 2048; 32768 and up‡ | 512 to 2048 |
+| `5120 -> 128` | no verdict | no verdict | 512 to 8192; 32768 and up‡ | 512 to 4096 |
+| `6144 -> 32` | 1024 | -- | 512 | 512 |
+| `6144 -> 128` | no verdict | no verdict | 512 to 8192 | 512 to 8192 |
+
+*Table: the K1 token counts that run the deterministic program on `sm_100a` / `sm_103a` parts of 152 SMs or more
+(`K1_SPLIT_RULE_EXCLUDED_TOKENS`; `--`: none; `no verdict`: the row runs the deterministic program at every token
+count).  Every other token count keeps the row's verdict.  Measured at 512, 1024, 2048, 4096, 8192, 16231, 32768 and
+65536 tokens on two 152-SM parts of each architecture (GB200, GB300): a screen of 9 paired groups per row and token
+count in one long-lived process per GPU, eager launches and CUDA graph replays, next to a kernel holding 8, 16 or 32 SMs
+in both launch orders (a launch order without paired groups: the slowest split-program time against the fastest
+deterministic time), with the backward pass and the checkpointed step timed; where a screen run failed, 15 paired groups
+in a long-lived process and in a fresh process per row, on two parts per token count (one part for `sm_100a`
+`6144 -> 32` FP32 at 1024 tokens); and the FP64 error of 5 seeds per part (prepared launches, CUDA graph replays, the
+convenience call) next to the deterministic program's on the same operands.  A measured token count runs the
+deterministic program where the split program failed in at least one run (the K1 rule above; the backward pass or the
+checkpointed step more than 1.3 % slower than with the deterministic program; or the deterministic package's FP64 error
+budget missed) and the deterministic program leaves the backward pass and the checkpointed step no more than 1.3 %
+slower (medians and paired medians, eager launches and graph replays), or where the split program's error exceeded the
+deterministic program's by more than 2 % for the same seed on both parts (relative Frobenius error or BF16 error-budget
+ratio; marked ‡).  A token count between two consecutive such measured token counts runs the deterministic program too
+(not measured), and so does every token count above 65536 of a row marked ‡ at 65536 tokens.  Token counts below 512,
+above 65536 (other rows), between two measured token counts with different outcomes, and on parts with fewer than 152
+SMs were not measured and keep the verdict.  Measured token counts that failed the rule but keep the verdict, because
+the deterministic program makes the backward pass or the checkpointed step more than 1.3 % slower there: BF16 output at
+1024 tokens on `sm_103a` `4096 -> 48`, `6144 -> 32`; BF16 output at 2048 tokens on `sm_100a` `5120 -> 32`, `6144 -> 32`;
+`sm_103a` `4096 -> 48`; BF16 output at 65536 tokens on `sm_100a` `4096 -> 32, 64`, `5120 -> 32, 48, 64`, `6144 -> 32`;
+`sm_103a` `6144 -> 32, 128`; FP32 output at 512 tokens on `sm_100a` `4096 -> 32`, `6144 -> 32`; FP32 output at 1024
+tokens on `sm_100a` `6144 -> 32`; FP32 output at 8192 tokens on `sm_103a` `4096 -> 48`, `5120 -> 128`.  At 65536 tokens
+neither program meets the BF16 error budget.*
 
 `"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
 units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six

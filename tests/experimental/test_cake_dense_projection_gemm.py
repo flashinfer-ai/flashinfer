@@ -767,6 +767,79 @@ def test_k1_small_token_counts_run_the_deterministic_program():
     assert cake_backend.k1_splits_fit(1, 1) and not cake_backend.k1_splits_fit(0, 64)
 
 
+def test_k1_excluded_token_counts():
+    """On sm_100a / sm_103a a row of :data:`K1_SPLIT_RULES` runs the deterministic program at the token counts of its
+    :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` entries, from the entry's SM count up: every entry belongs to a row with a
+    verdict on those architectures, at an SM count from the row's floor up; its ranges are closed, disjoint and not
+    adjacent, start at a measured token count (512 to 65536) and end at one or have no upper bound; the row runs the
+    deterministic program at both ends and keeps its verdict one token outside a range, on a part with fewer SMs than
+    the entry, and above 65536 tokens unless a range has no upper bound."""
+    table = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS
+    routed = {
+        k
+        for k, v in cake_backend.K1_SPLIT_RULES.items()
+        if v is not None and k[0] in ("sm_100a", "sm_103a")
+    }
+    assert table and set(table) <= routed
+    for key, entries in table.items():
+        arch, L, M, N, dt = key
+        floor = max(
+            cake_backend.K1_MIN_SM_COUNT[arch],
+            cake_backend.K1_RULE_MIN_SM_COUNT.get(key, 0),
+        )
+        kw = dict(arch=arch, L=L, M=M, N=N, out_f32=dt == "f32")
+        want = tuple(cake_backend.K1_SPLIT_RULES[key])
+        assert entries, key
+        spans = sorted((e[1], e[2]) for e in entries)
+        for (_lo, b), (c, _hi) in zip(spans, spans[1:], strict=False):
+            assert b is not None and b + 1 < c, key
+        for min_sm_count, a, b in entries:
+            assert min_sm_count >= floor and 512 <= a <= 65536, key
+            assert b is None or a <= b <= 65536, key
+
+            def inside(T, spans=spans):
+                return any(lo <= T and (hi is None or hi >= T) for lo, hi in spans)
+
+            ends = (a,) if b is None else (a, b)
+            for sm_count in (min_sm_count, min_sm_count + 64):
+                for T in ends + ((65537, 131072) if b is None else ()):
+                    got = cake_backend.k1_plan(K=T, sm_count=sm_count, **kw)
+                    assert got is None, (key, sm_count, T)
+                for T in (a - 1,) + (() if b is None else (b + 1,)):
+                    if not inside(T):
+                        got = cake_backend.k1_plan(K=T, sm_count=sm_count, **kw)
+                        assert got == want, (key, sm_count, T)
+            if min_sm_count - 1 >= floor:
+                for T in ends:
+                    got = cake_backend.k1_plan(K=T, sm_count=min_sm_count - 1, **kw)
+                    assert got == want, (key, T)
+        if not any(e[2] is None for e in entries):
+            got = cake_backend.k1_plan(K=65537, sm_count=152, **kw)
+            assert got == want, key
+    kw = dict(arch="sm_100a", L=1, M=4096, N=32, out_f32=False)
+    assert cake_backend.k1_plan(K=512, sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(K=511, sm_count=152, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=512, sm_count=151, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=131072, sm_count=152, **kw) == (64, 2)
+    kw = dict(arch="sm_103a", L=1, M=4096, N=32, out_f32=False)
+    assert cake_backend.k1_plan(K=512, sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(K=511, sm_count=152, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=512, sm_count=151, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=131072, sm_count=152, **kw) == (64, 2)
+    kw = dict(arch="sm_103a", L=1, M=5120, N=32, out_f32=False)
+    assert cake_backend.k1_plan(K=512, sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(K=511, sm_count=152, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=512, sm_count=151, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=32768, sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(K=131072, sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(K=131072, sm_count=148, **kw) == (64, 2)
+    # a row without an entry keeps its verdict at every token count its split count fits
+    kw = dict(arch="sm_100a", L=1, M=4096, N=32, out_f32=True, sm_count=152)
+    assert ("sm_100a", 1, 4096, 32, "f32") not in table
+    for T in (65, 512, 16231, 65536, 131072):
+        assert cake_backend.k1_plan(K=T, **kw) == (64, 2), T
+
+
 def test_k1_rule_table_entries_decide_the_row(monkeypatch):
     kw = dict(L=1, M=4096, N=32, K=16231, out_f32=True)
     key = ("sm_103a", 1, 4096, 32, "f32")
@@ -2066,8 +2139,8 @@ def _k1_prepare(G, X, out, arch, splits, block_n=None):
 
 @pytest.fixture
 def k1_rule(monkeypatch):
-    """``k1_rule(G, X, out, splits)``: a verdict for the row (and no SM-count floor), so the convenience path runs
-    this package's program at that split count; returns the template."""
+    """``k1_rule(G, X, out, splits)``: a verdict for the row (and no SM-count floor or excluded token counts), so the
+    convenience path runs this package's program at that split count; returns the template."""
 
     def force(G, X, out, splits, block_n=None):
         arch = det_backend.arch_for(out.device)
@@ -2078,6 +2151,9 @@ def k1_rule(monkeypatch):
         key = (arch, 1, K, N, "f32" if f32 else "bf16")
         monkeypatch.setitem(cake_backend.K1_MIN_SM_COUNT, arch, 0)
         monkeypatch.delitem(cake_backend.K1_RULE_MIN_SM_COUNT, key, raising=False)
+        monkeypatch.delitem(
+            cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS, key, raising=False
+        )
         monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key, (block_n, splits))
         cake_backend.clear_convenience_caches()
         return cake_backend.atomic_k1_template(block_n, f32)
