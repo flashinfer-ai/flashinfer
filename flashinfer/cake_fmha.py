@@ -73,6 +73,7 @@ class CakeFmhaDecodeRoute:
         "decode_aligned_fp16",
         "decode_aligned_bf16_hd64",
         "decode_aligned_bf16_hd256",
+        "decode_aligned_bf16_mtp_q32",
         "decode_balanced_bf16",
         "decode_balanced_fp16",
         "decode_balanced_fp8",
@@ -102,7 +103,10 @@ class CakeFmhaDecodeRoute:
     # that ``aligned_hd64_selected`` chose; aligned hd256 q1 decode: the
     # identifier (``flashinfer.jit.cake_fmha_aligned_hd256.ALIGNED_HD256_BF16`` /
     # ``ALIGNED_HD256_CGA2_BF16`` / ``ALIGNED_HD256_CGA4_BF16``) of the program
-    # ``aligned_hd256_program`` named; ``None`` on every other route.
+    # ``aligned_hd256_program`` named; aligned speculative decode (1 to 4 query
+    # tokens per request): the identifier
+    # ``flashinfer.jit.cake_fmha_aligned_mtp_q32.ALIGNED_MTP_Q32_CGA2_BF16`` of the
+    # program ``spec_q32_cga_program`` named; ``None`` on every other route.
     aligned_program: str | None = None
     # Generated decode program: ``(family, identifier)`` of the in-tree program
     # (``flashinfer.jit.cake_fmha_<family>.<identifier>``) the route launches,
@@ -367,6 +371,51 @@ _ALIGNED_HD256_HOST_PARAMS = (
 # The kernels' correction-skip threshold: 0 disables the skip (the value every
 # validation of the programs used).
 _ALIGNED_HD256_SKIP_CORR_THRESHOLD = 0.0
+
+
+# The aligned speculative-decode (MTP verify) program is likewise a generated
+# in-tree unit, ``csrc/cake_fmha_aligned_mtp_q32/`` with the loader
+# ``flashinfer.jit.cake_fmha_aligned_mtp_q32``: one BF16 program shipped for
+# sm_100a and sm_103a whose 32-row query tile holds the 1 to 4 query tokens of a
+# KV head's eight query heads (row ``token x 8 + head``), so a request's KV head
+# is read once for every one of its tokens.  The program splits each (request,
+# KV head) tile's KV sequence over a cluster of 2 CTAs and merges the partials
+# through distributed shared memory, under the causal speculative-decode mask
+# (token ``j`` of a request of ``L`` tokens attends the first
+# ``L - (q_len - 1 - j)``).  ``spec_q32_cga_program`` names a launch's program as
+# ``("cga", CTAs per tile)``; the route's component chain is that program's
+# identifier below.  The table pins the delivered record's name and a loader
+# whose record differs fails closed at load.
+_ALIGNED_MTP_Q32_COMPONENT = "decode_aligned_bf16_mtp_q32"
+# ``spec_q32_cga_program`` verdict -> the program identifier.
+_ALIGNED_MTP_Q32_PROGRAM_IDS: dict[tuple[str, int], str] = {
+    ("cga", 2): "ALIGNED_MTP_Q32_CGA2_BF16",
+}
+# Program identifier -> (CTAs per (request, KV head) tile, program name): the
+# CTAs are the launch grid's x extent and the record's cluster ``(CTAs, 1, 1)``.
+_ALIGNED_MTP_Q32_PROGRAMS: dict[str, tuple[int, str]] = {
+    "ALIGNED_MTP_Q32_CGA2_BF16": (2, "cake_fmha_aligned_mtp_q32_a1e5ddfa63d266952503"),
+}
+# The binding's host parameters, in the kernel's order (then the grid).
+_ALIGNED_MTP_Q32_HOST_PARAMS = (
+    "Q",
+    "K",
+    "V",
+    "O",
+    "page_table",
+    "seq_lens_kv",
+    "max_pages_per_seq",
+    "softmax_scale_log2",
+    "num_q_heads",
+    "num_kv_heads",
+    "heads_per_kv",
+    "batch_size",
+    "seq_len_q",
+    "skip_corr_threshold",
+)
+# The kernel's correction-skip threshold: 0 disables the skip (the value every
+# validation of the program used).
+_ALIGNED_MTP_Q32_SKIP_CORR_THRESHOLD = 0.0
 
 
 # The generated paged context programs: the units ``csrc/cake_fmha_context_bf16/``,
@@ -1164,9 +1213,38 @@ def cake_fmha_aligned_hd256_launch_grid(
     return int(program.cluster[0]), int(num_kv_heads), int(batch_size)
 
 
+def _aligned_mtp_q32_route_program(
+    route: CakeFmhaDecodeRoute,
+) -> tuple[int, str] | None:
+    """``(CTAs per tile, pinned program name)`` of an aligned speculative-decode
+    route, or ``None`` when the route's program identifier is not the module's."""
+
+    if route.component != _ALIGNED_MTP_Q32_COMPONENT or route.aligned_program is None:
+        return None
+    return _ALIGNED_MTP_Q32_PROGRAMS.get(route.aligned_program)
+
+
+def cake_fmha_aligned_mtp_q32_launch_grid(
+    program, batch_size: int, num_kv_heads: int
+) -> tuple[int, int, int]:
+    """The launch grid of one aligned speculative decode: ``(CTAs, num_kv_heads,
+    batch_size)``, one cluster of the program's CTAs per (request, KV head) tile
+    (``blockIdx.x`` the cluster rank, ``blockIdx.y`` the KV head, ``blockIdx.z``
+    the request); the tile's 32-row query tile holds every query token of the
+    request.  ``program`` is the generated loader's ``CakeProgram`` record; its
+    ``cluster`` is ``(CTAs, 1, 1)``."""
+
+    return int(program.cluster[0]), int(num_kv_heads), int(batch_size)
+
+
 def _route_components(
     route: CakeFmhaDecodeRoute | CakeFmhaContextRoute,
 ) -> tuple[str, ...]:
+    if (
+        isinstance(route, CakeFmhaDecodeRoute)
+        and route.component == _ALIGNED_MTP_Q32_COMPONENT
+    ):
+        return (route.aligned_program,) if route.aligned_program is not None else ()
     if (
         isinstance(route, CakeFmhaDecodeRoute)
         and route.component == _ALIGNED_HD256_COMPONENT
@@ -1220,6 +1298,11 @@ def cake_fmha_route_is_optimized(
 
     if route is None:
         return False
+    if (
+        isinstance(route, CakeFmhaDecodeRoute)
+        and route.component == _ALIGNED_MTP_Q32_COMPONENT
+    ):
+        return _aligned_mtp_q32_route_program(route) is not None
     if (
         isinstance(route, CakeFmhaDecodeRoute)
         and route.component == _ALIGNED_HD256_COMPONENT
@@ -1915,6 +1998,91 @@ def aligned_hd256_program(
         return None
     kv_ctas = -(-max_seq_len_kv // SEL_HD256_KV_PER_CTA_SPLIT)
     ctas_kv = min(kv_ctas, max(1, sm_count // tiles))
+    return program if ctas_kv == program[1] else None
+
+
+# ---------------------------------------------------------------------------
+# Aligned speculative-decode grouped decode selector: a Python mirror of the
+# source selector.
+#
+# Source of truth: the kernel source's selector (module
+# ``trtllm_fmha_forgen_bf16_q32_grouped_cga`` of the
+# ``attention_decode_bf16_paged_spec`` family: ``SEL_Q32CGA_*``,
+# ``spec_q32_cga_program``).  The constants and comments are copied verbatim
+# (names and values; the formatter re-wraps long code lines) and the function
+# keeps the source's signature and semantics; change the source first, then
+# re-copy.  ``None`` keeps the present route ``decode_balanced_bf16``;
+# ``("cga", N)`` selects the aligned speculative-decode program of cluster size
+# N.  ``arch`` is the source's target spelling and ``sm_count`` the device's
+# multiprocessor count.
+#
+# Copied at source revision ``1e504c05e3b59b960735759fc085c5edcc606da1``;
+# ``tests/attention/test_cake_fmha_aligned_mtp_q32.py`` holds the source selector
+# test's expectations.
+# ---------------------------------------------------------------------------
+SEL_Q32CGA_ARCHS = ("sm_100a", "sm_103a")
+# Query heads per KV head of the port (its kernel_requires); other groups keep the present route.
+SEL_Q32CGA_GROUP = 8
+# Query tokens per request the port's 32-row Q tile holds (its kernel_requires: 1 <= q_len <= 4).
+SEL_Q32CGA_MAX_Q_LEN = 4
+# FlashInfer's trtllm-gen split puts a sequence's KV on at most ceil(max_kv / SEL_Q32CGA_KV_PER_CTA_SPLIT) CTAs
+# (twice the class's 256-token KV step).
+SEL_Q32CGA_KV_PER_CTA_SPLIT = 512
+# FlashInfer takes the CGA reduction only for a split of 2 to SEL_Q32CGA_MAX_CGA_CTAS CTAs (the largest cluster).
+SEL_Q32CGA_MAX_CGA_CTAS = 16
+# Pinned points per target: ((batch_size, num_kv_heads, max_seq_len_kv, q_len), program), program ("cga", N) = the
+# cluster-of-N config; an empty tuple = the present route everywhere on that target.
+SEL_Q32CGA_PINS = {
+    "sm_100a": (  # derived at 148 SMs
+        ((8, 8, 4096, 3), ("cga", 2)),  # uniform_b8_hkv8_s4096_mtp3
+    ),
+    "sm_103a": (),  # derived at 152 SMs: the present route serves the mtp3 row
+}
+
+
+def spec_q32_cga_program(
+    batch_size: int,
+    num_kv_heads: int,
+    max_seq_len_kv: int,
+    *,
+    q_len: int,
+    num_q_heads: int,
+    arch: str,
+    sm_count: int,
+) -> "tuple[str, int] | None":
+    """The cluster config of this program for one launch, or ``None`` for the host's present route, from host
+    metadata only.
+
+    ``None`` unless ``1 <= q_len <= SEL_Q32CGA_MAX_Q_LEN``, exactly ``SEL_Q32CGA_GROUP`` query heads per KV head and
+    ``arch`` in ``SEL_Q32CGA_ARCHS``.  Otherwise the target's pinned points on ``(batch_size, num_kv_heads,
+    max_seq_len_kv, q_len)`` decide.  A program ``("cga", N)`` is returned only when FlashInfer's trtllm-gen split at
+    ``sm_count`` SMs picks the CGA class at the same cluster size: ``N == min(ceil(max_kv /
+    SEL_Q32CGA_KV_PER_CTA_SPLIT), max(1, sm_count // tiles))`` with ``tiles = batch_size * num_kv_heads`` (one Q tile
+    per (request, KV head) at ``q_len <= 4``, so the split's base CTAs are ``tiles``) and ``1 < N <=
+    SEL_Q32CGA_MAX_CGA_CTAS``.  Selection is a performance choice only: each config handles any lengths up to
+    ``max_pages_per_seq * PAGE_SIZE``.
+    """
+    if not 1 <= q_len <= SEL_Q32CGA_MAX_Q_LEN:
+        return None
+    if num_q_heads != SEL_Q32CGA_GROUP * num_kv_heads:
+        return None
+    if arch not in SEL_Q32CGA_ARCHS:
+        return None
+    tiles = batch_size * num_kv_heads
+    if batch_size <= 0 or num_kv_heads <= 0 or max_seq_len_kv <= 0 or sm_count <= 0:
+        return None
+    program = None
+    point = (batch_size, num_kv_heads, max_seq_len_kv, q_len)
+    for pin, pinned in SEL_Q32CGA_PINS[arch]:
+        if pin == point:
+            program = pinned
+            break
+    if program is None:
+        return None
+    kv_ctas = -(-max_seq_len_kv // SEL_Q32CGA_KV_PER_CTA_SPLIT)
+    ctas_kv = min(kv_ctas, max(1, sm_count // tiles))
+    if not 1 < ctas_kv <= SEL_Q32CGA_MAX_CGA_CTAS:
+        return None
     return program if ctas_kv == program[1] else None
 
 
@@ -4223,6 +4391,35 @@ def select_cake_fmha_decode_route(
                 counter_buffer=multi_ctas_kv_counter_buffer,
             )
         ):
+            # Eight query heads per KV head and 1 to 4 query tokens per request
+            # (``q_len x 8`` rows: one 32-row query tile per (request, KV
+            # head)): the aligned speculative-decode program where the source
+            # selector pins it faster than the balanced route below and the
+            # trtllm-gen split at this device's SM count picks its cluster size.
+            # It reads the K / V pools and the query in place (contiguous; its
+            # TMA maps derive every stride from the shapes) with an int32 page
+            # table and lengths.
+            if (
+                key_cache.is_contiguous()
+                and value_cache.is_contiguous()
+                and block_tables.dtype == torch.int32
+                and seq_lens.dtype == torch.int32
+            ):
+                aligned_mtp = spec_q32_cga_program(
+                    batch_size,
+                    num_kv_heads,
+                    max_seq_len,
+                    q_len=q_len,
+                    num_q_heads=num_q_heads,
+                    arch=_ALIGNED_PROGRAM_TARGET[_cake_fmha_target(device)],
+                    sm_count=smallm_sm_count,
+                )
+                if aligned_mtp in _ALIGNED_MTP_Q32_PROGRAM_IDS:
+                    return route(
+                        _ALIGNED_MTP_Q32_COMPONENT,
+                        selected_page_size=16,
+                        aligned_program=_ALIGNED_MTP_Q32_PROGRAM_IDS[aligned_mtp],
+                    )
             # Long-context / ragged decode: the on-device balanced scheduler
             # splits long requests into chunks and merges them on device.
             return route("decode_balanced_bf16", selected_page_size=16)
@@ -5019,6 +5216,138 @@ def _run_cake_fmha_aligned_hd256_decode(
         module.entry(*arguments)
 
 
+@dataclass(frozen=True)
+class CakeFmhaAlignedMtpQ32DecodeModule:
+    """One loaded aligned speculative-decode program: the route it serves, the
+    ``CakeProgram`` record, its exact target and the binding's ``run`` entry.
+    Distinct from the aligned single-token module classes (hd128
+    :class:`CakeFmhaAlignedDecodeModule`, hd64
+    :class:`CakeFmhaAlignedHd64DecodeModule`, hd256
+    :class:`CakeFmhaAlignedHd256DecodeModule`): this one launches the program
+    whose query tile holds every query token of a request."""
+
+    route: CakeFmhaDecodeRoute
+    program: Any
+    target: str
+    entry: Any
+
+
+def _load_cake_fmha_aligned_mtp_q32_decode_module(
+    route: CakeFmhaDecodeRoute,
+) -> CakeFmhaAlignedMtpQ32DecodeModule:
+    """Build and load the aligned speculative-decode program of ``route`` on the
+    route's target.
+
+    The loader ``flashinfer.jit.cake_fmha_aligned_mtp_q32`` is generated by the
+    Cake export beside ``csrc/cake_fmha_aligned_mtp_q32/``; it is imported here,
+    lazily, so route selection never needs it.  The record's launch facts and
+    argument names are checked against the host launch once, at load.
+    """
+
+    from .jit import cake_fmha_aligned_mtp_q32
+    from .jit.cake_program import GRID_ARGS, CakeProgram
+
+    pinned = _aligned_mtp_q32_route_program(route)
+    if pinned is None:
+        raise RuntimeError(
+            f"Cake FMHA aligned MTP decode route names no program: {route.aligned_program!r}"
+        )
+    ctas, program_name = pinned
+    program = getattr(cake_fmha_aligned_mtp_q32, route.aligned_program, None)
+    if not isinstance(program, CakeProgram):
+        raise RuntimeError(
+            f"flashinfer.jit.cake_fmha_aligned_mtp_q32 publishes no CakeProgram {route.aligned_program!r}"
+        )
+    if program.name != program_name:
+        raise RuntimeError(
+            f"flashinfer.jit.cake_fmha_aligned_mtp_q32.{route.aligned_program} is "
+            f"{program.name}; this module pins {program_name}"
+        )
+    target = _ALIGNED_PROGRAM_TARGET[route.target]
+    if target not in program.targets:
+        raise RuntimeError(
+            f"{program.name} ships no {target!r} build; its targets are {list(program.targets)}"
+        )
+    if tuple(program.args) != (*_ALIGNED_MTP_Q32_HOST_PARAMS, *GRID_ARGS):
+        raise RuntimeError(
+            f"the generated {program.name} binding takes {list(program.args)}; "
+            f"the host spells {[*_ALIGNED_MTP_Q32_HOST_PARAMS, *GRID_ARGS]}"
+        )
+    if tuple(program.cluster) != (ctas, 1, 1):
+        raise RuntimeError(
+            f"{program.name} launches cluster {tuple(program.cluster)}; the route "
+            f"expects {(ctas, 1, 1)}"
+        )
+    return CakeFmhaAlignedMtpQ32DecodeModule(
+        route=route,
+        program=program,
+        target=target,
+        entry=program.entry(target),
+    )
+
+
+def _run_cake_fmha_aligned_mtp_q32_decode(
+    module: CakeFmhaAlignedMtpQ32DecodeModule,
+    *,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    out: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    bmm1_scale: float,
+) -> None:
+    """Launch one aligned speculative decode on the current torch stream.
+
+    The binding's host parameters, in the kernel's order: the query token rows
+    (``Q``, TMA source, ``[batch x q_len, num_q_heads, 128]``), the K and V pools
+    (TMA sources; the contiguous ``[pages, num_kv_heads, 16, 128]`` HND pools
+    viewed as ``[pages x num_kv_heads, 16, 128]``), the output rows (``[batch x
+    q_len x num_q_heads, 128]``), the page table, the device lengths,
+    ``max_pages_per_seq`` (the page table's row width), the log2-domain softmax
+    scale, the head counts, ``heads_per_kv`` (the query heads per KV head: a
+    plain int the binding turns into the kernel's fast divisor), the batch size,
+    ``seq_len_q`` (the uniform query tokens per request) and the correction-skip
+    threshold (0: disabled); then the grid of
+    :func:`cake_fmha_aligned_mtp_q32_launch_grid`.
+    """
+
+    route = module.route
+    if (
+        tuple(query.shape) != (route.batch_size * route.q_len, route.num_q_heads, 128)
+        or key_cache.shape[1] != route.num_kv_heads
+        or tuple(block_tables.shape[:1]) != (route.batch_size,)
+    ):
+        raise RuntimeError(
+            "Cake FMHA aligned MTP decode launch does not match its selected route"
+        )
+    grid = cake_fmha_aligned_mtp_q32_launch_grid(
+        module.program, route.batch_size, route.num_kv_heads
+    )
+    values = {
+        "Q": query,
+        "K": key_cache.view(-1, 16, 128),
+        "V": value_cache.view(-1, 16, 128),
+        "O": out.view(-1, 128),
+        "page_table": block_tables,
+        "seq_lens_kv": seq_lens,
+        "max_pages_per_seq": int(block_tables.shape[1]),
+        "softmax_scale_log2": float(bmm1_scale) * log2e,
+        "num_q_heads": route.num_q_heads,
+        "num_kv_heads": route.num_kv_heads,
+        "heads_per_kv": route.num_q_heads // route.num_kv_heads,
+        "batch_size": route.batch_size,
+        "seq_len_q": route.q_len,
+        "skip_corr_threshold": _ALIGNED_MTP_Q32_SKIP_CORR_THRESHOLD,
+        "grid_x": grid[0],
+        "grid_y": grid[1],
+        "grid_z": grid[2],
+    }
+    arguments = [values[name] for name in module.program.args]
+    with torch.cuda.device(query.device), tvm_ffi.use_torch_stream():
+        module.entry(*arguments)
+
+
 def _resolve_cake_fmha_decode_module(
     device: torch.device, route: CakeFmhaDecodeRoute | None
 ) -> tuple[Any, bool]:
@@ -5030,7 +5359,9 @@ def _resolve_cake_fmha_decode_module(
     :class:`CakeFmhaAlignedHd64DecodeModule` (launched by
     :func:`_run_cake_fmha_aligned_hd64_decode`), an aligned hd256 q1 route to
     a :class:`CakeFmhaAlignedHd256DecodeModule` (launched by
-    :func:`_run_cake_fmha_aligned_hd256_decode`), a generated decode program
+    :func:`_run_cake_fmha_aligned_hd256_decode`), an aligned speculative-decode
+    route to a :class:`CakeFmhaAlignedMtpQ32DecodeModule` (launched by
+    :func:`_run_cake_fmha_aligned_mtp_q32_decode`), a generated decode program
     route to a :class:`CakeFmhaDecodeProgramModule` (launched by
     :func:`_run_cake_fmha_decode_program`), every other optimized route to a
     module exposing ``cake_paged_attention_decode``.
@@ -5049,6 +5380,8 @@ def _resolve_cake_fmha_decode_module(
         return load_cake_fmha_compat_module(_cake_fmha_target(device)), False
     if route.target != _cake_fmha_target(device):
         raise RuntimeError("Cake FMHA decode route target does not match the device")
+    if route.component == _ALIGNED_MTP_Q32_COMPONENT:
+        return _load_cake_fmha_aligned_mtp_q32_decode_module(route), True
     if route.component == _ALIGNED_HD256_COMPONENT:
         return _load_cake_fmha_aligned_hd256_decode_module(route), True
     if route.component == _ALIGNED_HD64_COMPONENT:
