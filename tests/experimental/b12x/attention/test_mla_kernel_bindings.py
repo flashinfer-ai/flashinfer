@@ -399,18 +399,17 @@ def test_prefill_mg_heads8_uses_flat_valid_hpb_launcher(monkeypatch) -> None:
 
 
 def test_sm120_prefill_dual_non_eligible_raises() -> None:
-    # DSV4 dual-cache prefill is MG-only (topk==128, heads divisible by 8);
-    # everything else RAISEs (the decode-reuse has_extra fallback was removed).
-    # topk != 128 (here topk == 64) is non-eligible -> ValueError, raised in the
-    # Python dispatch BEFORE any kernel launch (so this runs on CPU tensors).
+    # DSV4 now pads short top-k rows to a supported MG container. Use a
+    # genuinely unsupported width with valid cache page strides to isolate
+    # the dispatch rejection before any kernel launch.
     __import__("b12x.attention._shared.mla.prefill")
     from b12x.attention._shared.mla.prefill import run_unified_prefill
 
-    topk = 64  # != 128 -> non-eligible dual
+    topk = 4096  # outside the supported dual-cache containers
     q = torch.empty((2, 32, 512), dtype=torch.bfloat16)
-    kv_cache = torch.empty((4, 1024), dtype=torch.uint8)
+    kv_cache = torch.empty((4, 37440), dtype=torch.uint8)
     topk_indices = torch.zeros((2, topk), dtype=torch.int32)
-    extra_kv_cache = torch.empty((4, 1024), dtype=torch.uint8)
+    extra_kv_cache = torch.empty((4, 1168), dtype=torch.uint8)
     extra_indices = torch.zeros((2, 64), dtype=torch.int32)
 
     with pytest.raises(ValueError, match="requires MG dispatch"):
