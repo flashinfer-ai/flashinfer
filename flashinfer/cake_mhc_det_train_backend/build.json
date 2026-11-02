@@ -55,9 +55,9 @@
     }
   },
   "generator": {
-    "cake_revision": "7bd33c10ee718400e478cc5a928b9167f690d2b4",
+    "cake_revision": "c8aba95d41221c1e7fbf08de8f997dd93d86ab49",
     "cuda": "13.4.92",
-    "rendered_at": "2026-11-02T01:39:39Z"
+    "rendered_at": "2026-11-02T03:51:06Z"
   },
   "libraries": [
     {
@@ -1060,30 +1060,31 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "161528c6577435befe4615ac4192d3da4f9c49a4ab385a3c8cf3669f11091d13",
+      "closure_sha256": "dcaff4b9bb2469b86cbf0695c58a596dea461097406ff05b8869ae1a95c98b06",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
-      "name": "cake_mhc_det_train_bwd_slab__xrsg_sm_100a",
+      "name": "cake_mhc_det_train_bwd_slab__xrsg_p160_sm_100a",
       "nvcc_flags": [
         "--prec-div=true",
         "--prec-sqrt=true",
-        "--ftz=false"
+        "--ftz=false",
+        "--ptxas-options=--maxrregcount=160"
       ],
       "nvcc_flags_if": [],
-      "path": "aot/cake_mhc_det_train_bwd_slab__xrsg_sm_100a.so",
+      "path": "aot/cake_mhc_det_train_bwd_slab__xrsg_p160_sm_100a.so",
       "sha256": {
-        "csrc/cake_mhc_det_train_bwd_slab__xrsg_binding.cu": "131736cf02d927630214ea55d3582444e58fb13f983f37cf5bc26c2006224df9",
-        "csrc/cake_mhc_det_train_bwd_slab__xrsg_kernel.cu": "251846eaeaa756bd11f900acc0473ab9cfda60fc36beeeb806aac885fe9ae2e4"
+        "csrc/cake_mhc_det_train_bwd_slab__xrsg_p160_binding.cu": "74f5665855efdb677db9c69672da793c17680126c022299f0799726d2fb1bc0b",
+        "csrc/cake_mhc_det_train_bwd_slab__xrsg_p160_kernel.cu": "7d3ff18f1b0695e154908ead812624a8e94c6f4861b5336e191b914384bfb5c2"
       },
       "sources": [
-        "csrc/cake_mhc_det_train_bwd_slab__xrsg_kernel.cu",
-        "csrc/cake_mhc_det_train_bwd_slab__xrsg_binding.cu"
+        "csrc/cake_mhc_det_train_bwd_slab__xrsg_p160_kernel.cu",
+        "csrc/cake_mhc_det_train_bwd_slab__xrsg_p160_binding.cu"
       ]
     },
     {
       "arch": "sm_107a",
-      "closure_sha256": "677f79b7ddc0ae25d34f7312817732e92dea1000d8b9a3e0dfafafe6a4ade9d9",
+      "closure_sha256": "7aae2fc3a7f390949a6bb7d4729e843c6a8a7913fbee5b228c9f3d791e187c03",
       "entry": "run",
       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
       "min_cuda": "13.4",
@@ -1097,7 +1098,7 @@
       "path": "aot/cake_mhc_det_train_bwd_slab__xrsg_sm_107a.so",
       "sha256": {
         "csrc/cake_mhc_det_train_bwd_slab__xrsg_binding.cu": "131736cf02d927630214ea55d3582444e58fb13f983f37cf5bc26c2006224df9",
-        "csrc/cake_mhc_det_train_bwd_slab__xrsg_kernel.cu": "251846eaeaa756bd11f900acc0473ab9cfda60fc36beeeb806aac885fe9ae2e4"
+        "csrc/cake_mhc_det_train_bwd_slab__xrsg_kernel.cu": "126d89fd0a7790a11b7576cac33594f54578aec4879ee92ab64a23a28f61b7c0"
       },
       "sources": [
         "csrc/cake_mhc_det_train_bwd_slab__xrsg_kernel.cu",
