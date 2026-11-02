@@ -32,6 +32,7 @@ from b12x.moe.fused_moe._impl import (
     b12x_sparse_moe_fp4,
 )
 import b12x.moe.fused_moe._impl as tp_moe_impl
+from b12x.moe.fused_moe._tuning import MoeDecodeConfig
 from b12x.testing.reference.helpers import run_tp_moe_fp4
 
 
@@ -204,6 +205,9 @@ def test_sparse_moe_fp4_matches_manual_qwen_gate_path(m: int) -> None:
     sparse_output, routing = b12x_sparse_moe_fp4(
         binding=build_tp_moe_sparse_fp4_binding(
             scratch=_make_scratch(),
+            decode_config=MoeDecodeConfig(
+                backend="dynamic", route_planner="internal", max_active_clusters=None
+            ),
             hidden_states=hidden_states,
             experts=experts,
             top_k=spec.top_k,
@@ -250,6 +254,9 @@ def test_sparse_moe_fp4_matches_manual_qwen_router_logits(m: int) -> None:
     sparse_output, routing = b12x_sparse_moe_fp4(
         binding=build_tp_moe_sparse_fp4_binding(
             scratch=_make_scratch(),
+            decode_config=MoeDecodeConfig(
+                backend="dynamic", route_planner="internal", max_active_clusters=None
+            ),
             hidden_states=hidden_states,
             experts=experts,
             top_k=spec.top_k,
