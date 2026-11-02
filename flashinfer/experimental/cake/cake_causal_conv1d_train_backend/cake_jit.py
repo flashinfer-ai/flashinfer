@@ -71,7 +71,7 @@ from __future__ import annotations
 
 import functools
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, NamedTuple, Sequence
 
 import tvm_ffi
 
@@ -2641,6 +2641,17 @@ def selected_modules(
     token floor decides, is a ``ValueError``.
     """
 
+    candidates, fallback = _ranked_candidates(arch, kind, C)
+    for name in candidates:
+        if _admits(select_rule(MODULES[name]), arch=arch, C=C, S=S):
+            return (name,)
+    return (fallback,)
+
+
+def _ranked_candidates(arch: str, kind: str, C: int) -> tuple[tuple[str, ...], str]:
+    """``(candidates, fallback)`` of :func:`selected_modules`: the records of ``kind`` on ``arch`` whose channel
+    threshold ``C`` reaches, highest threshold first, and the route's fallback record (registry errors as there)."""
+
     names = route_modules(arch, kind)
     candidates: list[tuple[int, str]] = []
     fallback: list[str] = []
@@ -2665,10 +2676,23 @@ def selected_modules(
             f"programs for C={int(C)} at one threshold {candidates[0][0]} ({tied}); "
             "thresholds must be distinct"
         )
-    for _threshold_c, name in candidates:
-        if _admits(select_rule(MODULES[name]), arch=arch, C=C, S=S):
-            return (name,)
-    return (fallback[0],)
+    return tuple(name for _threshold_c, name in candidates), fallback[0]
+
+
+def tokens_select(arch: str, kind: str, C: int) -> bool:
+    """Whether ``S`` enters :func:`selected_modules` for ``C`` channels of ``kind`` on ``arch``.
+
+    A record whose channel threshold ``C`` reaches admits the call unless its
+    rule has a token floor, so the selection reads ``S`` exactly when the
+    highest-threshold record ``C`` reaches has one (in this registry the
+    sm_107a ``bwd`` route at ``256 <= C < 512``); every other row selects one
+    program whatever ``S``.
+    """
+
+    candidates, _ = _ranked_candidates(arch, kind, C)
+    return bool(candidates) and (
+        _tokens(select_rule(MODULES[candidates[0]]), arch=arch) is not None
+    )
 
 
 def backward_kinds(arch: str) -> tuple[str, ...]:
@@ -3006,18 +3030,32 @@ def plan(
     S, C, num_docs = int(S), int(C), int(num_docs)
     if S < 0 or num_docs < 0:
         raise ValueError(f"S and num_docs must be non-negative, got {(S, num_docs)}")
-    ct_vec, n_sub, n_ch_tiles = channel_split(
-        C, geometry=geometry, role=role, legacy=legacy
-    )
+    split = channel_split(C, geometry=geometry, role=role, legacy=legacy)
     if role == "bwd" and not legacy and arch is not None and route is not None:
         override = tile_override(arch, route, C, S)
         if override is not None:
-            ct_vec, n_sub, n_ch_tiles = _override_split(override, C, geometry)
+            split = _override_split(override, C, geometry)
+    return _plan_scalars(S, C, num_docs, split)
+
+
+def search_steps(num_docs: int) -> int:
+    """The ``search_steps`` scalar of :func:`plan`: the halvings of the device-side binary search over
+    ``cu_seqlens`` for ``num_docs`` documents, ``max(1, ceil(log2 num_docs))``."""
+
+    return max(1, (int(num_docs) - 1).bit_length())
+
+
+def _plan_scalars(
+    S: int, C: int, num_docs: int, split: tuple[int, int, int]
+) -> dict[str, int]:
+    """The :data:`PLAN_SCALARS` of one call from its ints and its ``(ct_vec, n_sub, n_ch_tiles)`` split."""
+
+    ct_vec, n_sub, n_ch_tiles = split
     return {
         "S": S,
         "C": C,
         "num_docs": num_docs,
-        "search_steps": max(1, (num_docs - 1).bit_length()),
+        "search_steps": search_steps(num_docs),
         "ct_vec": ct_vec,
         "n_sub": n_sub,
         "n_ch_tiles": n_ch_tiles,
@@ -3253,6 +3291,80 @@ def launch_grid(
             f"unknown Cake causal conv1d training grid rule: {kind!r} (known: {GRID_KINDS})"
         )
     return (max(1, grid_x), 1, 1)
+
+
+class RowPlan(NamedTuple):
+    """The host plan of one call row -- ``(arch, route, C, device, bwd_grid_mult)`` -- for every ``S`` and
+    ``num_docs`` (:func:`plan_row`); :func:`row_launch` completes it for one call."""
+
+    # The programs the row launches (:func:`selected_modules`) and the record of the first.
+    names: tuple[str, ...]
+    record: dict[str, Any]
+    C: int
+    # :func:`plan`'s ``(ct_vec, n_sub, n_ch_tiles)`` outside the override's token range.
+    split: tuple[int, int, int]
+    # ``(S_min, S_max, split)`` of the record's :data:`TILE_OVERRIDES` row, ``None`` without one.
+    override: tuple[int, int, tuple[int, int, int]] | None
+    # The launch grid, ``None`` where :func:`launch_grid` may trim it by ``S`` (planned per call).
+    grid: tuple[int, int, int] | None
+
+
+def plan_row(
+    arch: str, kind: str, C: int, *, device_index: int, bwd_grid_mult: int = 1
+) -> RowPlan | None:
+    """The :class:`RowPlan` of the calls of route ``kind`` with ``C`` channels on device ``device_index`` (of
+    architecture ``arch``) launching ``bwd_grid_mult`` times the untrimmed backward grid (1: the default grid), or
+    ``None`` where the program selection reads ``S`` (:func:`tokens_select`).
+
+    ``S`` enters a call's host plan only through a token floor of the
+    route's selection rules, the ``[S_min, S_max]`` range of the record's
+    :data:`TILE_OVERRIDES` row and the trim of :func:`launch_grid` (an
+    ``occupancy`` record at ``C % 32`` on the default grid), and ``num_docs``
+    only through :func:`search_steps`; so with this row :func:`row_launch`
+    returns what :func:`plan` and :func:`launch_grid` return for the call
+    (the planning a backward ``_launch`` does: ``plan(..., arch=, route=)``
+    with the record's route) without selecting, splitting or sizing the grid
+    again.  Registry errors raise as in :func:`selected_modules`.
+    """
+
+    C = int(C)
+    if tokens_select(arch, kind, C):
+        return None
+    names = selected_modules(arch, kind, C=C)
+    record = MODULES[names[0]]
+    rule = record["grid_rule"]
+    geometry, role = rule["geometry"], record["role"]
+    split = channel_split(C, geometry=geometry, role=role)
+    override = None
+    if role == "bwd":
+        entry = TILE_OVERRIDES.get(arch, {}).get((record_route(record, arch), C))
+        if entry is not None:
+            ct_vec, s_min, s_max = (int(value) for value in entry)
+            override = (s_min, s_max, _override_split(ct_vec, C, geometry))
+    if bwd_grid_mult != 1:
+        grid = (launch_grid(record, device_index=device_index)[0] * bwd_grid_mult, 1, 1)
+    elif rule["kind"] == "occupancy" and C % 32:
+        grid = None
+    else:
+        grid = launch_grid(record, device_index=device_index)
+    return RowPlan(names, record, C, split, override, grid)
+
+
+def row_launch(
+    row: RowPlan, S: int, num_docs: int, *, device_index: int
+) -> tuple[dict[str, int], tuple[int, int, int]]:
+    """``(scalars, grid)`` of one call of ``row`` with ``S`` tokens and ``num_docs`` documents: :func:`plan`'s
+    scalars (the override's split when ``S_min <= S <= S_max``) and the row's grid, or :func:`launch_grid` of the
+    call where the row has none."""
+
+    split = row.split
+    override = row.override
+    if override is not None and override[0] <= S <= override[1]:
+        split = override[2]
+    grid = row.grid
+    if grid is None:
+        grid = launch_grid(row.record, device_index=device_index, C=row.C, S=S)
+    return _plan_scalars(S, row.C, num_docs, split), grid
 
 
 def _align(nbytes: int) -> int:
