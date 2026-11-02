@@ -2,9 +2,8 @@
 Tests for the cuBLASLt GEMM runners' algorithm-descriptor tactics.
 
 The cuBLAS FP8 (``bmm_fp8(backend="cublas")``) and cuBLASLt BF16
-(``mm_bf16(backend="cublaslt")`` and the cuBLASLt fallback of
-``backend="cute-dsl"``) runners use a ``cublasLtMatmulAlgo_t`` descriptor as
-their tactic. Candidates are enumerated at the tuning bucket's M, the cache
+(``mm_bf16(backend="cublaslt")``) runners use a ``cublasLtMatmulAlgo_t``
+descriptor as their tactic. Candidates are enumerated at the tuning bucket's M, the cache
 key carries no exact M, and a descriptor that does not apply to the actual
 problem runs the heuristic default instead.
 
@@ -182,11 +181,6 @@ def _skip_unless_backend(backend):
         return
     if not mm_bf16.is_backend_supported(backend, cc):
         pytest.skip(f"mm_bf16 {backend} backend not supported on sm{cc}.")
-    if backend == "cute-dsl":
-        from flashinfer.cute_dsl.utils import is_cute_dsl_available
-
-        if not is_cute_dsl_available():
-            pytest.skip("nvidia-cutlass-dsl is not available.")
 
 
 class _Problem:
@@ -290,7 +284,6 @@ def descriptor_runs(monkeypatch):
 _CUBLAS_RUNNERS = {
     "cublas": "CublasFp8GemmRunner",
     "cublaslt": "CublasltBf16GemmRunner",
-    "cute-dsl": "CuteDSLCublasltFallbackBf16Runner",
 }
 
 
@@ -305,7 +298,7 @@ def _bucket_winner(tuner, runner_name, bucket_m):
     return winners[0]
 
 
-@pytest.mark.parametrize("backend", ["cublas", "cublaslt", "cute-dsl"])
+@pytest.mark.parametrize("backend", ["cublas", "cublaslt"])
 def test_tuned_descriptor_reused_across_bucket(
     backend, tuner, profiled, descriptor_runs
 ):
@@ -334,7 +327,7 @@ def test_tuned_descriptor_reused_across_bucket(
         assert descriptor_runs == [(1, winner)]
 
 
-@pytest.mark.parametrize("backend", ["cublas", "cublaslt", "cute-dsl"])
+@pytest.mark.parametrize("backend", ["cublas", "cublaslt"])
 def test_graph_capture_inside_outer_autotune(backend, tuner, profiled):
     _skip_unless_backend(backend)
     with autotune(True):

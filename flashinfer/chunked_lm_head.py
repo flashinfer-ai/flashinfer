@@ -1109,7 +1109,7 @@ def _nd_loss(
 @flashinfer_experimental_api(feature=_FEATURE)
 def chunked_lm_head_loss(*args: Any, deterministic: bool = True, **kwargs: Any):
     r"""Differentiable chunked LM-head projection + loss with a selectable
-    numerical mode, SM100 / SM103 only.
+    numerical mode, SM100 / SM103 / SM107 only.
 
     The computation, the arguments and the outputs are those of
     :func:`chunked_lm_head_det_loss` (each switch keyword left at ``None``
@@ -1245,7 +1245,7 @@ def chunked_lm_head_logprob(
     *args: Any, deterministic: bool = True, **kwargs: Any
 ) -> torch.Tensor:
     r"""Differentiable chunked selected-token log-probability with a selectable
-    numerical mode, SM100 / SM103 only.
+    numerical mode, SM100 / SM103 / SM107 only.
 
     The computation and the arguments are those of
     :func:`chunked_lm_head_det_logprob`.  ``deterministic=True`` (default):
@@ -1284,7 +1284,7 @@ def chunked_lm_head_preload(
     temperature: bool = False,
 ):
     r"""Do part of the one-time work of a process's first chunked LM-head call
-    ahead of it, then wait for the device once (SM100 / SM103 only).
+    ahead of it, then wait for the device once (SM100 / SM103 / SM107 only).
 
     ``deterministic=True`` (default): :func:`chunked_lm_head_det_preload`
     (the deterministic package's libraries and per-device state);
@@ -1365,7 +1365,7 @@ def chunked_lm_head_support_logprob(
     *args: Any, deterministic: bool = True, **kwargs: Any
 ) -> torch.Tensor:
     r"""Differentiable log-probabilities over a ragged candidate support per
-    token with a selectable numerical mode, SM100 / SM103 only.
+    token with a selectable numerical mode, SM100 / SM103 / SM107 only.
 
     The computation and the other arguments are those of
     :func:`chunked_lm_head_det_support_logprob`.  ``deterministic=True``
@@ -1446,7 +1446,7 @@ def _nd_support_kl(
 @flashinfer_experimental_api(feature=_FEATURE)
 def chunked_lm_head_support_kl(*args: Any, deterministic: bool = True, **kwargs: Any):
     r"""Unreduced forward KL from a detached teacher over a ragged candidate
-    support with a selectable numerical mode, SM100 / SM103 only.
+    support with a selectable numerical mode, SM100 / SM103 / SM107 only.
 
     The computation and the other arguments are those of
     :func:`chunked_lm_head_det_support_kl`; ``deterministic`` as in

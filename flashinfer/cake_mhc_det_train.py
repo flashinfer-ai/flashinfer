@@ -51,7 +51,10 @@ recomputes them in the backward; with
 recomputed from ``X`` in the backward with bitwise the same gradients
 (checkpoint replay).  The finish node's backward hands ``dY`` and the gradient
 statistics to the prepare node's backward on autograd edges, so nothing of a
-connection stays alive once its backward has run.  Workspaces are caller-held
+connection stays alive once its backward has run; on SM100 / SM103 at hidden
+4096 and up to 1024 tokens the replay also writes the transposed split of
+``fn`` (3 MiB), handed on one more edge, so the backward does not split ``fn``
+again.  Workspaces are caller-held
 (``*_workspace_bytes`` / ``*_workspace``) and the submit path allocates
 nothing; a workspace serves the calls of the hidden size it was sized for
 (``hidden=``, default 4096) up to ``T`` tokens.  All tensors are contiguous:

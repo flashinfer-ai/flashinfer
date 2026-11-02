@@ -221,3 +221,26 @@ def test_tinygemm2_sm100_dispatch_and_escape_hatch(monkeypatch):
 
     monkeypatch.setenv("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0")
     assert routergemm._use_tinygemm2_sm100(input.device)
+
+
+@pytest.mark.parametrize("use_pdl", [False, True])
+def test_tinygemm2_sm100_output_past_int32_index(use_pdl):
+    """batch_size * output_features > 2^31: the last rows lie past the int32
+    index range and must still be stored in place."""
+    _skip_if_not_sm100_family()
+    from flashinfer.gemm.routergemm import get_tinygemm2_sm100_module
+
+    batch_size, output_features, input_features = 2**14 + 8, 2**17, 128
+    if torch.cuda.mem_get_info()[0] < 3 * batch_size * output_features:
+        pytest.skip("needs a 4.3 GB output")
+    input, weight, bias = _make_case(batch_size, output_features, input_features)
+    out = torch.full(
+        (batch_size, output_features), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+
+    get_tinygemm2_sm100_module().tinygemm2_sm100_op(input, weight, bias, out, use_pdl)
+    torch.cuda.synchronize()
+
+    rows = [0, 1] + list(range(batch_size - 8, batch_size))
+    ref = F.linear(input[rows].float(), weight.float(), bias.float())
+    torch.testing.assert_close(out[rows].float(), ref, atol=1e-2, rtol=1e-2)
