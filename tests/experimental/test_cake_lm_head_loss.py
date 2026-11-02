@@ -6594,7 +6594,7 @@ def test_zero_dlogp_floor_switch():
 
 def test_dcnt_stage_names_round_trip():
     """The ``_dcnt`` forms: the dz arm, the K-sliced dX reduction (not its swapped tile; the one-slice plain store has
-    none), the weight-gradient accumulate (plain and blocked) and the bf16 fused cast (not its TMA store); every
+    none), the weight-gradient accumulate (plain and blocked) and the bf16 fused cast (its TMA store too); every
     registered ``_dcnt`` name parses back to its base and knobs."""
     sv = cake_backend.stage_variant
     assert sv("gemm_logits_dz", dcnt=True) == cake_backend.LOGPROB_DZ_DCNT_STAGE
@@ -6605,9 +6605,13 @@ def test_dcnt_stage_names_round_trip():
     )
     assert sv("gemm_dw_acc", blocked=True, dcnt=True) == "gemm_dw_acc_gn_dcnt"
     assert sv("gemm_dw_cast_bf16", dcnt=True) == "gemm_dw_cast_bf16_dcnt"
+    assert (
+        sv("gemm_dw_cast_bf16", epi_store="tma", dcnt=True)
+        == cake_backend.DW_CAST_TMA_DCNT_STAGE
+        == "gemm_dw_cast_bf16_tma_dcnt"
+    )
     for base, kw in (
         ("gemm_dx_red", dict(swab=True)),
-        ("gemm_dw_cast_bf16", dict(epi_store="tma")),
         ("gemm_dw_acc", dict(epi_store="tma")),
         ("gemm_dx", {}),
         ("gemm_logits", {}),
@@ -6617,7 +6621,7 @@ def test_dcnt_stage_names_round_trip():
     assert cake_backend.dx_stage(1, dcnt=True) == "gemm_dx"
     assert cake_backend.dx_stage(3, dcnt=True) == "gemm_dx_red_dcnt"
     counted = [stage for stage in cake_jit.STAGES if stage.endswith("_dcnt")]
-    assert len(counted) == 9
+    assert len(counted) == 10
     for stage in counted:
         base, knobs = cake_backend.parse_stage(stage)
         assert base in cake_backend.DCNT_BASES and knobs["dcnt"]
@@ -6652,8 +6656,7 @@ def test_plan_runs_the_counted_forms():
         plain = cake_backend.make_plan(problem, valid_rows=12000, **kw)
         plan = cake_backend.make_plan(problem, valid_rows=12000, dcnt=True, **kw)
         if any(
-            v.dx_swab or v.dw_epi_store not in (None, "redsm") or v.dw_cast_tma
-            for v in plan.variants
+            v.dx_swab or v.dw_epi_store not in (None, "redsm") for v in plan.variants
         ):
             assert not plan.dcnt and plan.stages == plain.stages
             continue
@@ -6694,10 +6697,11 @@ def test_plan_runs_the_counted_forms():
 
 def test_plan_counts_the_short_last_chunk_of_a_long_call():
     """A log-probability call whose last chunk takes the TMA-epilogue bf16 cast in the shipped plan (61779 valid rows:
-    fifteen chunks of 4096 and one of 339, the T = 65031 timing row) keeps the counted forms: its counted plan casts
-    the last chunk through the counted shipped cast, every other chunk's forms unchanged, and no chunk takes the
-    swapped dX tile (the swap rule serves the cross-entropy loss only).  An explicitly pinned weight-gradient TMA
-    epilogue, or swapped dX tile, keeps the shipped plan."""
+    fifteen chunks of 4096 and one of 339, the T = 65031 timing row) keeps the counted forms: its counted plan runs the
+    shipped plan's chunk forms, the last chunk's cast through the TMA cast's counted form, and no chunk takes the
+    swapped dX tile (the swap rule serves the cross-entropy loss only); with ``counted_tma_cast`` off (a record without
+    that form) it casts the last chunk through the counted shipped cast, every other chunk's forms unchanged.  An
+    explicitly pinned weight-gradient TMA epilogue, or swapped dX tile, keeps the shipped plan."""
     g = cake_backend.Geometry.from_record(
         {"geometry": {"hidden": 6144, "vocab": 154880}}
     )
@@ -6718,28 +6722,40 @@ def test_plan_counts_the_short_last_chunk_of_a_long_call():
         kw = dict(common, arch=arch)
         plain = cake_backend.make_plan(problem, valid_rows=rows, **kw)
         plan = cake_backend.make_plan(problem, valid_rows=rows, dcnt=True, **kw)
+        old = cake_backend.make_plan(
+            problem, valid_rows=rows, dcnt=True, counted_tma_cast=False, **kw
+        )
         assert plain.num_chunks == 16 and plain.chunks[-1] == (15 * 4096, 339)
         assert not plain.dcnt and plain.variants[-1].dw_cast_tma
         assert plain.dw_cast_stage == "gemm_dw_cast_bf16_tma"
-        assert plan.dcnt, arch
-        assert plan.chunks == plain.chunks and plan.dx_slices == plain.dx_slices
+        assert plan.dcnt and old.dcnt, arch
         assert not any(v.dx_swab or v.dw_cast_tma for v in plain.variants[:-1])
-        assert not any(v.dx_swab or v.dw_cast_tma for v in plan.variants)
-        assert plan.variants[:-1] == plain.variants[:-1]
+        assert not any(v.dx_swab for v in plan.variants)
+        assert plan.variants == plain.variants
+        assert plan.dw_cast_stage == cake_backend.DW_CAST_TMA_DCNT_STAGE
+        assert {s.removesuffix("_dcnt") for s in plan.stages} == set(plain.stages)
+        assert old.variants[:-1] == plain.variants[:-1]
         assert (
-            dataclasses.replace(plan.variants[-1], dw_cast_tma=True)
+            dataclasses.replace(old.variants[-1], dw_cast_tma=True)
             == plain.variants[-1]
         )
-        assert plan.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
-        for i in range(plan.num_chunks):
-            assert plan.recompute_stage(i) == "gemm_logits_dz_dcnt"
-            assert plan.dx_stage_of(i).endswith("_dcnt") == (
-                plan.dx_slices_of(i) > 1
-            ), plan.dx_stage_of(i)
-        assert all(s.endswith("_dcnt") for s in plan.stages if s.startswith("gemm_dw"))
-        assert {s.removesuffix("_dcnt") for s in plan.stages} == (
+        assert old.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
+        assert {s.removesuffix("_dcnt") for s in old.stages} == (
             set(plain.stages) - {"gemm_dw_cast_bf16_tma"}
         ) | {"gemm_dw_cast_bf16"}
+        for counted_plan in (plan, old):
+            assert counted_plan.chunks == plain.chunks
+            assert counted_plan.dx_slices == plain.dx_slices
+            for i in range(counted_plan.num_chunks):
+                assert counted_plan.recompute_stage(i) == "gemm_logits_dz_dcnt"
+                assert counted_plan.dx_stage_of(i).endswith("_dcnt") == (
+                    counted_plan.dx_slices_of(i) > 1
+                ), counted_plan.dx_stage_of(i)
+            assert all(
+                s.endswith("_dcnt")
+                for s in counted_plan.stages
+                if s.startswith("gemm_dw")
+            )
         pins = [{"dw": {"epi_store": "tma"}}]
         if arch in cake_backend.DX_SWAB_ARCHES:
             pins.append({"dx": {"swap_ab": True, "tile_n": 512}})
@@ -6950,8 +6966,8 @@ def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
 ):
     """A backward whose last chunk the shipped plan casts through the TMA-epilogue bf16 cast (two chunks, the second of
     about 650 rows) keeps the skip: the partition runs (binding and remembered binding), the remembered plan casts the
-    last chunk through the counted shipped cast, and the results pass the skip suite's checks against the backward
-    without the skip and the FP64 oracle."""
+    last chunk through the TMA cast's counted form where the record registers it (else the counted shipped cast), and
+    the results pass the skip suite's checks against the backward without the skip and the FP64 oracle."""
     _require_zero_dlogp_skip()
     _module_name, record = cake_backend.record_for(CUDA)
     base = _device_inputs(5000, "ce", W=glm_weight)
@@ -6981,7 +6997,12 @@ def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
     assert shipped.dw_cast_stage == (
         "gemm_dw_cast_bf16_tma" if tma else "gemm_dw_cast_bf16"
     )
-    assert skip_plan.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
+    stages = cake_jit.registered_stages(_module_name)
+    assert skip_plan.dw_cast_stage == (
+        cake_backend.DW_CAST_TMA_DCNT_STAGE
+        if tma and cake_backend.DW_CAST_TMA_DCNT_STAGE in stages
+        else "gemm_dw_cast_bf16_dcnt"
+    )
     live = valid & ~zero
     assert _same_bits(nd["logp"], plain["logp"])
     scale = float(plain["dX"][live].float().abs().max())

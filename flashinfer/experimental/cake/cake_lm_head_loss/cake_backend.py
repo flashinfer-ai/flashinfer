@@ -472,6 +472,12 @@ DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
 DW_CAST_TMA_MAX_ROWS: dict[str, int] = {"sm_100a": 1792, "sm_103a": 1792}
 
 
+# Its form under the zero-gradient row skip (:data:`DCNT_BASES`): the same TMA cast with the K steps bounded by the
+# last chunk's device count of live rows, so a counted plan keeps the rule's cast (a record without it: the shipped
+# cast's counted form).
+DW_CAST_TMA_DCNT_STAGE = "gemm_dw_cast_bf16_tma_dcnt"
+
+
 def dw_cast_tma_rule(num_chunks: int, rows_last: int, arch: Optional[str]) -> bool:
     """Does the deferred BF16 dW cast of a call of ``num_chunks`` chunks, whose last chunk has ``rows_last``
     rows, run the TMA-epilogue form on ``arch``?"""
@@ -647,7 +653,8 @@ STAGE_KNOBS = (
 # and the K-sliced dX reduction skip the work items whose pair of row tiles starts at or past the count (their rows keep
 # what they held: never read), the weight-gradient accumulate and bf16 fused cast run ``ceil(count / 64)`` of its K
 # steps (one at least on a first chunk; none leaves the accumulator as it was, and the cast writes ``bf16(g * WS)``).
-# The bases that have the form (not the swapped dX tile, not the TMA-epilogue forms):
+# The bases that have the form (not the swapped dX tile, not the accumulate's TMA epilogue; the bf16 fused cast's TMA
+# store has it too, :data:`DW_CAST_TMA_DCNT_STAGE`):
 DCNT_BASES = ("gemm_logits_dz", "gemm_dx_red", "gemm_dw_acc", "gemm_dw_cast_bf16")
 
 
@@ -674,7 +681,8 @@ def stage_variant(
     weight-gradient accumulate / fp32 fused cast on the 2-D blocked raster
     (``group_n`` set); ``epi_store="tma"``: the weight-gradient accumulate's TMA reduce-add or the bf16 fused cast's
     TMA store (:func:`dw_cast_tma_rule`); ``dcnt``: the form bounded by the device count of the chunk's live rows
-    (:data:`DCNT_BASES`, the zero-gradient row skip).  The slice count, the raster height and the block width
+    (:data:`DCNT_BASES`, the zero-gradient row skip; the bf16 fused cast's TMA store has one too,
+    :data:`DW_CAST_TMA_DCNT_STAGE`).  The slice count, the raster height and the block width
     themselves are launch scalars (:func:`gemm_scalars`), not part of the name."""
     if base not in BASE_STAGES:
         raise ValueError(f"unknown base stage {base!r}")
@@ -728,9 +736,13 @@ def stage_variant(
             )
         name += "_tma"
     if dcnt:
-        if base not in DCNT_BASES or swab or name.endswith("_tma"):
+        if (
+            base not in DCNT_BASES
+            or swab
+            or (name.endswith("_tma") and base != "gemm_dw_cast_bf16")
+        ):
             raise ValueError(
-                f"{base}: the device-count row bound exists for {DCNT_BASES} only (not the swapped or TMA-epilogue forms)"
+                f"{base}: the device-count row bound exists for {DCNT_BASES} only (not the swapped or the accumulate's TMA-epilogue forms)"
             )
         name += "_dcnt"
     return name
@@ -3453,6 +3465,7 @@ def make_plan(
     dx_red_min_rows: Optional[int] = None,
     logprob_keep: bool = False,
     dcnt: bool = False,
+    counted_tma_cast: bool = True,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (the K-sliced reduction form registered) picks each chunk's slice count
     with :func:`dx_slices` under ``dx_slice_policy`` (``None`` = :func:`dx_slice_policy`; ``dx_resident`` = the device's
@@ -3470,8 +3483,9 @@ def make_plan(
     (:attr:`Plan.logprob_dz`, :attr:`Plan.logprob_lbl`).  ``logprob_keep`` (a log-probability plan, a registered
     program): the kept-logits plan (:class:`_KeptPlan`), which runs neither arm.  ``dcnt`` (a log-probability plan
     with the dz arm, a registered program): the zero-gradient row skip's ``_dcnt`` forms (:attr:`Plan.dcnt`), the
-    last chunk's bf16 fused cast in its shipped form instead of the TMA epilogue (:func:`dw_cast_tma_rule`); off when a
-    chunk takes a form without one (an explicitly pinned weight-gradient TMA epilogue or swapped dX tile)."""
+    last chunk's bf16 fused cast in the TMA epilogue's counted form where :func:`dw_cast_tma_rule` takes the TMA
+    epilogue (``counted_tma_cast=False``, a record without that form: the shipped cast's counted form instead); off when
+    a chunk takes a form without one (an explicitly pinned weight-gradient TMA epilogue or swapped dX tile)."""
     if (logprob_dz or logprob_lbl or logprob_keep) and problem.entry != "logprob":
         raise ValueError("the logits GEMM arms belong to the log-probability entry")
     if logprob_keep:
@@ -3543,15 +3557,16 @@ def make_plan(
     )
     if (
         variants
-        and not dcnt
+        and (not dcnt or counted_tma_cast)
         and need_dw
         and fuse_dw_cast
         and not (problem.entry == "loss" and problem.grad_weight_dtype == torch.float32)
         and "epi_store" not in tuning.get("dw", {})
         and dw_cast_tma_rule(len(chunks), chunks[-1][1], arch)
     ):
-        # the deferred last chunk's bf16 cast takes the TMA epilogue; an explicit ``epi_store`` keeps the shipped cast,
-        # and so does a counted plan (the shipped cast has the counted form, the TMA one has none; the same dW bits)
+        # the deferred last chunk's bf16 cast takes the TMA epilogue (a counted plan its counted form,
+        # DW_CAST_TMA_DCNT_STAGE, unless ``counted_tma_cast`` is off); an explicit ``epi_store`` keeps the shipped
+        # cast (the same dW bits)
         variants = variants[:-1] + (replace(variants[-1], dw_cast_tma=True),)
     hidden_group: Optional[int] = None
     if hidden_count:
@@ -5579,6 +5594,9 @@ def prepare_lm_head_loss(
         logprob_keep=keep,
     )
     plan = plan_of(dcnt=dcnt is not None)
+    if plan.dcnt and any(s not in stages for s in plan.stages):
+        # a record without the counted TMA cast: the counted plan with the shipped cast's counted form
+        plan = plan_of(dcnt=True, counted_tma_cast=False)
     if plan.dcnt and any(s not in stages for s in plan.stages):
         # a record without the counted forms: the shipped plan, every row computed
         plan = plan_of(dcnt=False)
