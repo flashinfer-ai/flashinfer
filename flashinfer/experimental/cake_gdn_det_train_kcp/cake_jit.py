@@ -64,6 +64,21 @@ Programs (``*`` = new program package, ``=`` = reused verbatim):
                              the (chunk, Q/K head) groups drawn from the ``ticket`` word
   #9 * ``gate_epilogue``     reverse cumsum of the dg partials + the chunk term; grid ceil(NC x HV / 128)
 
+In-kernel Q / K L2 norm (option ``use_qk_l2norm_in_kernel``; three programs, records named after the program):
+
+  #1 * ``fwd_prep_l2n``      #1 on the raw ``q`` / ``k`` that first writes ``qn`` / ``kn`` (BF16 ``[T, H_qk, 128]``)
+                             and the FP32 ``q_rstd`` / ``k_rstd`` ``[T, H_qk]`` (token stride ``rstd_tstride``) and
+                             runs #1's body on them; grid (NC, H_qk), two resident CTAs per SM as #1
+  #8 * ``bwd_dqkg_l2n``      #8 on ``qn`` / ``kn`` with the pullback of the norm before the one BF16 rounding of
+                             ``dq`` / ``dk`` (raw rows ``q_raw`` / ``k_raw`` with ``q_raw_tstride`` /
+                             ``k_raw_tstride``, the rstd rows); ``group_reduce = 1`` only
+     * ``qk_apply``          ``qn = bf16(q_raw * q_rstd)``, ``kn`` likewise, from the saved rstd (the backward of
+                             ``save_mode="full"`` and of the kept recompute tapes); grid (NC, H_qk)
+
+``MODULES`` holds one record of each (the exporter renders them with the other programs); a registry without them
+leaves ``records_of_program`` empty and ``select_record`` refuses them (:func:`l2n_records_shipped` says which).
+:data:`L2N_RECORD_PLANS` is their host plan, which the records repeat.
+
 Provenance of the rules: ``flashinfer/experimental/cake_kda_train/cake_kcp_jit.py`` (records_of_program,
 select_record, launch_grid; sha256 c405e7dcd36c9cbe0ff01e3e3194fd760491504655bda28a646c2067a23b4c90) at
 FlashInfer 13d7fcf4041635f5b7f573bb0dbab23570ae1034, adapted to the GDN vocabulary; the loader glue moved to
@@ -117,7 +132,12 @@ PROGRAMS = (
     "kcp_dhu_tape",
     "bwd_dqkg",
     "gate_epilogue",
+    "fwd_prep_l2n",
+    "bwd_dqkg_l2n",
+    "qk_apply",
 )
+# The programs of the in-kernel Q / K L2 norm (``use_qk_l2norm_in_kernel``).
+L2N_PROGRAMS = ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
 WALK_PROGRAMS = (
     "kcp_fwdh_offset",
     "kcp_fwdh_tape",
@@ -125,7 +145,16 @@ WALK_PROGRAMS = (
     "kcp_dhu_offset",
     "kcp_dhu_tape",
 )
-LOCAL_PROGRAMS = ("fwd_prep", "fwd_o", "bwd_prep", "bwd_dqkg", "gate_epilogue")
+LOCAL_PROGRAMS = (
+    "fwd_prep",
+    "fwd_o",
+    "bwd_prep",
+    "bwd_dqkg",
+    "gate_epilogue",
+    "fwd_prep_l2n",
+    "bwd_dqkg_l2n",
+    "qk_apply",
+)
 
 # Logical argument names :func:`.cake_backend.run_module` binds; every record maps its kernel parameter names onto this
 # vocabulary (``record["logical"]``).  Operands: ``q`` / ``k`` bf16 ``[T, H_qk, 128]``, ``v`` / ``do``
@@ -141,7 +170,10 @@ LOCAL_PROGRAMS = ("fwd_prep", "fwd_o", "bwd_prep", "bwd_dqkg", "gate_epilogue")
 # persistent programs #5 / #6 / #8 -- zero before the launch, left at zero by the kernel; one slot per launch site in the
 # caller's workspace, zeroed once when the workspace is (re)allocated, never read back by the host; the merge's FP32 tile pools ``m`` / ``c`` / ``x0`` / ``y`` and its chain
 # tables ``chain_start`` (int32 ``[n_chains + 1]``), ``elem_m`` / ``elem_c`` / ``elem_y`` (int64 per element),
-# ``x0_index`` / ``y_final`` (int64 ``[n_chains]``).
+# ``x0_index`` / ``y_final`` (int64 ``[n_chains]``).  In-kernel Q / K L2 norm: ``qn`` / ``kn`` bf16 ``[T, H_qk, 128]``
+# contiguous (the normalized rows; #1_l2n's outputs, #8_l2n's TMA operands ``q`` / ``k``), ``q_rstd`` / ``k_rstd`` f32
+# ``[T, H_qk]`` with token stride ``rstd_tstride``, ``q_raw`` / ``k_raw`` the raw bf16 rows (global loads with token
+# strides ``q_raw_tstride`` / ``k_raw_tstride`` in elements).
 LOGICAL_TENSORS = (
     "q",
     "k",
@@ -195,6 +227,12 @@ LOGICAL_TENSORS = (
     "elem_y",
     "x0_index",
     "y_final",
+    "qn",
+    "kn",
+    "q_rstd",
+    "k_rstd",
+    "q_raw",
+    "k_raw",
 )
 LOGICAL_SCALARS = (
     "num_heads",
@@ -220,6 +258,9 @@ LOGICAL_SCALARS = (
     "transpose_m",
     "write_states",
     "cols_per_cta",
+    "rstd_tstride",
+    "q_raw_tstride",
+    "k_raw_tstride",
 )
 
 
@@ -317,6 +358,104 @@ MODULES: dict[str, dict[str, Any]] = {
             "vn_tma": "v_new",
         },
         "program": "bwd_dqkg",
+        "select_rule": {"kind": "always"},
+        "variant": None,
+    },
+    "bwd_dqkg_l2n": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "q_tma"],
+            ["buffer", "k_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "h_tma"],
+            ["buffer", "dh_tma"],
+            ["buffer", "vn_tma"],
+            ["buffer", "dvn_tma"],
+            ["buffer", "akk_tma"],
+            ["buffer", "beta"],
+            ["buffer", "g_cum"],
+            ["buffer", "dq"],
+            ["buffer", "dk"],
+            ["buffer", "dv"],
+            ["buffer", "dbeta"],
+            ["buffer", "dg_part"],
+            ["buffer", "gamma_dot"],
+            ["buffer", "dq_part"],
+            ["buffer", "dk_part"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "num_heads"],
+            ["parameter", "scale"],
+            ["parameter", "dqk_tstride"],
+            ["parameter", "dv_tstride"],
+            ["parameter", "group_reduce"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "q_raw"],
+            ["buffer", "k_raw"],
+            ["buffer", "q_rstd"],
+            ["buffer", "k_rstd"],
+            ["parameter", "q_raw_tstride"],
+            ["parameter", "k_raw_tstride"],
+            ["parameter", "rstd_tstride"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "chunks_qk_heads_persistent"},
+        "kernel_symbol": "kernel_cake_gdn_det_train_3e6562c2f739184a3765",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 227328,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_3e6562c2f739184a3765",
+        "logical": {
+            "akk_tma": "akk",
+            "beta": "beta",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dbeta": "dbeta",
+            "dg_part": "dg_part",
+            "dh_tma": "dh_tape",
+            "dk": "dk",
+            "dk_part": "dk_part",
+            "do_tma": "do",
+            "dq": "dq",
+            "dq_part": "dq_part",
+            "dqk_tstride": "dqk_tstride",
+            "dv": "dv",
+            "dv_tstride": "dv_tstride",
+            "dvn_tma": "dv_new",
+            "g_cum": "g_cum",
+            "gamma_dot": "gamma_dot",
+            "group_reduce": "group_reduce",
+            "h_tma": "h_tape",
+            "k_raw": "k_raw",
+            "k_raw_tstride": "k_raw_tstride",
+            "k_rstd": "k_rstd",
+            "k_tma": "k",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_qk_heads",
+            "num_seqs": "num_seqs",
+            "q_raw": "q_raw",
+            "q_raw_tstride": "q_raw_tstride",
+            "q_rstd": "q_rstd",
+            "q_tma": "q",
+            "rstd_tstride": "rstd_tstride",
+            "scale": "scale",
+            "seq_chunk_start": "seq_chunk_start",
+            "ticket": "ticket",
+            "v_tma": "v",
+            "vn_tma": "v_new",
+        },
+        "program": "bwd_dqkg_l2n",
         "select_rule": {"kind": "always"},
         "variant": None,
     },
@@ -482,6 +621,76 @@ MODULES: dict[str, dict[str, Any]] = {
             "w_out": "w",
         },
         "program": "fwd_prep",
+        "select_rule": {"kind": "always"},
+        "variant": None,
+    },
+    "fwd_prep_l2n": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "q_tma"],
+            ["buffer", "k_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "g"],
+            ["buffer", "beta"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "w_out"],
+            ["buffer", "u_out"],
+            ["buffer", "aqk_out"],
+            ["buffer", "akk_out"],
+            ["buffer", "g_cum"],
+            ["buffer", "rowscale"],
+            ["buffer", "qscale"],
+            ["buffer", "gamma"],
+            ["buffer", "qn_out"],
+            ["buffer", "kn_out"],
+            ["buffer", "q_rstd"],
+            ["buffer", "k_rstd"],
+            ["parameter", "rstd_tstride"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "chunks_by_qk_heads"},
+        "kernel_symbol": "kernel_cake_gdn_det_train_09ade88178a6d04c8619",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 113664,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_09ade88178a6d04c8619",
+        "logical": {
+            "akk_out": "akk",
+            "aqk_out": "aqk",
+            "beta": "beta",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "g": "g",
+            "g_cum": "g_cum",
+            "gamma": "gamma",
+            "k_rstd": "k_rstd",
+            "k_tma": "k",
+            "kn_out": "kn",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_qk_heads",
+            "q_rstd": "q_rstd",
+            "q_tma": "q",
+            "qn_out": "qn",
+            "qscale": "qscale",
+            "rowscale": "rowscale",
+            "rstd_tstride": "rstd_tstride",
+            "scale": "scale",
+            "u_out": "u",
+            "v_tma": "v",
+            "w_out": "w",
+        },
+        "program": "fwd_prep_l2n",
         "select_rule": {"kind": "always"},
         "variant": None,
     },
@@ -1257,6 +1466,54 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {"kind": "always"},
         "variant": None,
     },
+    "qk_apply": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "q_raw"],
+            ["buffer", "k_raw"],
+            ["buffer", "q_rstd"],
+            ["buffer", "k_rstd"],
+            ["buffer", "qn"],
+            ["buffer", "kn"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "q_raw_tstride"],
+            ["parameter", "k_raw_tstride"],
+            ["parameter", "rstd_tstride"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "chunks_by_qk_heads"},
+        "kernel_symbol": "kernel_cake_gdn_det_train_dd20d92fd03ad2cf563d",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_dd20d92fd03ad2cf563d",
+        "logical": {
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "k_raw": "k_raw",
+            "k_raw_tstride": "k_raw_tstride",
+            "k_rstd": "k_rstd",
+            "kn": "kn",
+            "num_qk_heads": "num_qk_heads",
+            "q_raw": "q_raw",
+            "q_raw_tstride": "q_raw_tstride",
+            "q_rstd": "q_rstd",
+            "qn": "qn",
+            "rstd_tstride": "rstd_tstride",
+        },
+        "program": "qk_apply",
+        "select_rule": {"kind": "always"},
+        "variant": None,
+    },
 }
 TEST_MODULES: dict[str, dict[str, Any]] = {
     "kcp_transfer_walk_plain_tf32": {
@@ -1388,14 +1645,53 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
 }
 # --- END GENERATED REGISTRY ---
 
+# The host plan of the in-kernel Q / K L2 norm records (hand-written; the exporter adds the derived leaves --
+# ``library``, ``kernel_symbol``, ``launch``, ``arg_plan``, ``logical`` -- when it renders the programs into
+# ``MODULES``).  ``resident_ctas_per_sm``: the occupancy the program keeps (#1_l2n keeps #1's two CTAs per SM under its
+# 168-register cap; #8_l2n keeps #8's one), a kernel gate, not a grid input (neither grid is persistent by SM count
+# beyond #8's own rule).
+L2N_RECORD_PLANS: dict[str, dict[str, Any]] = {
+    "fwd_prep_l2n": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "grid_rule": {"kind": "chunks_by_qk_heads"},
+        "program": "fwd_prep_l2n",
+        "resident_ctas_per_sm": 2,
+        "select_rule": {"kind": "always"},
+        "variant": None,
+    },
+    "bwd_dqkg_l2n": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "grid_rule": {"kind": "chunks_qk_heads_persistent"},
+        "program": "bwd_dqkg_l2n",
+        "resident_ctas_per_sm": 1,
+        "select_rule": {"kind": "always"},
+        "variant": None,
+    },
+    "qk_apply": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "grid_rule": {"kind": "chunks_by_qk_heads"},
+        "program": "qk_apply",
+        "resident_ctas_per_sm": None,
+        "select_rule": {"kind": "always"},
+        "variant": None,
+    },
+}
+
 
 def records_of_program(program: str) -> tuple[str, ...]:
-    """The shipped record names of ``program`` in registry order."""
+    """The shipped record names of ``program`` in registry order (empty for an in-kernel L2 norm program whose
+    record is not rendered yet)."""
     if program not in PROGRAMS:
         raise ValueError(
             f"unknown GDN KCP program {program!r}; the programs are {PROGRAMS}"
         )
     return tuple(name for name, rec in MODULES.items() if rec["program"] == program)
+
+
+def l2n_records_shipped() -> bool:
+    """Whether ``MODULES`` holds a record of every in-kernel Q / K L2 norm program (``use_qk_l2norm_in_kernel`` can
+    run on the kernel backend only then)."""
+    return all(records_of_program(p) for p in L2N_PROGRAMS)
 
 
 def _admits(rule: Mapping[str, Any], *, ncols: int | None, ctas_per_head: int) -> bool:
@@ -1458,6 +1754,11 @@ def select_record(
                 f"program {program!r}: {len(matches)} test-only records match {wanted} ({matches}); expected one"
             )
         return matches[0]
+    if program in L2N_PROGRAMS and not records_of_program(program):
+        raise ValueError(
+            f"program {program!r} has no shipped record: the in-kernel Q / K L2 norm programs are not rendered into "
+            "this package yet (use_qk_l2norm_in_kernel needs them on the kernel backend)"
+        )
     admitted = [
         name
         for name in records_of_program(program)
@@ -1508,7 +1809,8 @@ def launch_grid(
     ``n_walk x HV <= sm_count``, else 1; both forms write bitwise-identical tapes / pools; a passed ``ctas_per_head``
     must agree with the record), ``kcp_chains`` ``(n_chains x ncols / cols_per_cta, 1, 1)``.  An empty
     problem (no chunk, no walked segment, no chain) has no launch: the caller skips it (``ValueError`` here)."""
-    record = MODULES.get(name) or TEST_MODULES.get(name)
+    # an in-kernel L2 norm record not rendered yet: its host plan's grid rule (the fake backend's launch record)
+    record = MODULES.get(name) or TEST_MODULES.get(name) or L2N_RECORD_PLANS.get(name)
     if record is None:
         raise KeyError(f"{name!r} is not a GDN KCP record")
     rule = record["grid_rule"]
@@ -1579,6 +1881,8 @@ __all__ = [
     "CHUNK",
     "HEAD_DIM",
     "LIBRARY_PREFIX",
+    "L2N_PROGRAMS",
+    "L2N_RECORD_PLANS",
     "LOCAL_PROGRAMS",
     "LOGICAL_SCALARS",
     "LOGICAL_TENSORS",
@@ -1592,6 +1896,7 @@ __all__ = [
     "TEST_MODULES",
     "TILE",
     "WALK_PROGRAMS",
+    "l2n_records_shipped",
     "launch_grid",
     "records_of_program",
     "select_record",
