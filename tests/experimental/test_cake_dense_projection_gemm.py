@@ -2162,6 +2162,8 @@ def test_gpu_k1_row_major_program(shape, transposed_out, k1_rule):
     repeats bit for bit and stores what the deterministic budget allows; the tickets are zero after every launch; the
     profiler shows this package's program."""
     device, arch = _atomic_device_or_skip()
+    if arch != "sm_107a":
+        pytest.skip("the 192-wide row-major program ships on sm_107a only")
     template = cake_backend.atomic_k1_template(192, True)
     _require_template(arch, template)
     d_out, d_in, T, splits = shape
