@@ -6404,6 +6404,75 @@ def test_zero_dlogp_partition_orders_the_live_rows_first():
     assert counts.tolist() == [3, 3, 1]
 
 
+# The partition kernel against its PyTorch reference: (T, chunk, the zero-gradient rows).  700 rows: a call below the
+# host-count row bound (``HOST_COUNT_MAX_ROWS``) in one partial tile; 4096 / 4097: one whole tile and one row past it;
+# 262147 rows: 65 tiles, also with 128-row chunks (2049 counts).
+ZERO_DLOGP_PARTITION_CASES = [
+    (1, 4096, "none"),
+    (700, 4096, ("random", 0.3)),
+    (4096, 4096, "all"),
+    (4097, 1024, "last"),
+    (8117, 4096, ("random", 0.166)),
+    (8117, 4096, "single"),
+    (12289, 4096, "last"),
+    (16231, 4096, ("group", 0.5)),
+    (65031, 4096, ("random", 0.166)),
+    (65031, 4096, "none"),
+    (262147, 4096, ("random", 0.5)),
+    (262147, 128, ("group", 0.25)),
+]
+
+
+@pytest.mark.parametrize("T, chunk, kind", ZERO_DLOGP_PARTITION_CASES, ids=str)
+def test_device_zero_dlogp_partition_kernel_is_the_reference(T, chunk, kind):
+    """``zero_dlogp_partition`` on the device is one launch of the partition kernel and gives
+    ``zero_dlogp_partition_reference``'s outputs bit for bit -- the order, the reordered ``lse``, the ``[T]`` scan and the
+    per-chunk counts (at least one in the first chunk) -- over random, 512-row group, all-zero, single-live,
+    last-chunk-live and no-zero gradients, with signed zeros, NaN gradients (live on a valid row, ignored rows
+    included) and NaN statistics among them."""
+    _require_program(entry="logprob")
+    module_name, _record = cake_backend.record_for(CUDA)
+    assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in cake_jit.registered_stages(
+        module_name
+    )
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(SEED + T)
+    labels = torch.randint(0, 1000, (T,), generator=gen)
+    if T > 1:
+        labels[torch.rand(T, generator=gen) < 0.1] = -100
+    labels = labels.to(CUDA)
+    dlogp = torch.randn(T, generator=gen).to(CUDA)
+    dlogp[::97] = float("nan")
+    zero = _zero_dlogp_set(SimpleNamespace(labels=labels), kind)
+    dlogp[zero] = 0.0
+    dlogp[zero.nonzero().squeeze(1)[::2]] = -0.0
+    index = (labels >= 0).nonzero().squeeze(1)
+    lse = torch.randn(int(index.numel()), generator=gen).to(CUDA)
+    lse[::131] = float("nan")
+    launched = []
+    original = cake_backend._eager_launch
+
+    def recording(record, module_name, stage, *args, **kwargs):
+        launched.append(stage)
+        return original(record, module_name, stage, *args, **kwargs)
+
+    cake_backend._eager_launch = recording
+    try:
+        got = cake_backend.zero_dlogp_partition(labels, dlogp, index, lse, chunk)
+    finally:
+        cake_backend._eager_launch = original
+    assert launched == [cake_backend.ZERO_DLOGP_PARTITION_STAGE]
+    want = cake_backend.zero_dlogp_partition_reference(labels, dlogp, index, lse, chunk)
+    torch.cuda.synchronize()
+    for name, g, w in zip(
+        ("row_index", "lse", "scan", "counts"), got, want, strict=True
+    ):
+        assert g.dtype == w.dtype and g.shape == w.shape and g.device == w.device, name
+        same = _same_bits(g, w) if g.is_floating_point() else torch.equal(g, w)
+        assert same, name
+    assert int(got[3][0]) >= 1
+
+
 def test_zero_dlogp_floor_switch():
     """``set_zero_dlogp_min_rows`` returns the previous floor; ``None`` turns the skip off; a negative or non-integer
     floor is refused."""
@@ -6571,6 +6640,47 @@ def test_device_zero_dlogp_rows_skip(glm_weight, T, kind):
         f"\nzero-dlogp skip T={T} {kind} zero {int(zero.sum())}/{int(valid.sum())}: dW rel-L2 vs no skip "
         f"{dw_rel:.2e}, dX max|skip - no skip| {dx_diff:.2e}"
     )
+
+
+def test_device_zero_dlogp_skip_runs_the_partition_kernel(glm_weight, monkeypatch):
+    """The backward with the skip forms its row order with the partition kernel, never the PyTorch reference, and gives
+    the backward that forms it with the reference the same ``dW`` bits (the same row order) and the same exact ``+0``
+    zero rows of ``dX``."""
+    _require_program(entry="logprob")
+    module_name, _record = cake_backend.record_for(CUDA)
+    assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in cake_jit.registered_stages(
+        module_name
+    )
+    base = _device_inputs(8117, "ce", W=glm_weight)
+    zero = _zero_dlogp_set(base, ("random", 0.3))
+    inp = _with_zero_dlogp(base, zero)
+    reference = cake_backend.zero_dlogp_partition_reference
+    partition = cake_backend.zero_dlogp_partition
+    calls = []
+
+    def refused(*args, **kwargs):
+        raise AssertionError("the skip ran the PyTorch reference partition")
+
+    def counted(*args, **kwargs):
+        calls.append(int(args[2].numel()))
+        return partition(*args, **kwargs)
+
+    cake_backend.BINDING_CACHE.clear()
+    with _zero_dlogp_floor(0):
+        monkeypatch.setattr(cake_backend, "zero_dlogp_partition_reference", refused)
+        monkeypatch.setattr(cake_backend, "zero_dlogp_partition", counted)
+        kernel = _logprob_call(inp)
+        assert calls, "the backward did not run the zero-gradient row skip"
+        monkeypatch.setattr(cake_backend, "zero_dlogp_partition_reference", reference)
+        monkeypatch.setattr(
+            cake_backend, "zero_dlogp_partition", lambda *a, **k: reference(*a)
+        )
+        torch_order = _logprob_call(inp)
+    valid = inp.labels >= 0
+    assert _same_bits(kernel["logp"], torch_order["logp"])
+    assert _same_bits(kernel["dW"], torch_order["dW"])
+    for run in (kernel, torch_order):
+        assert not bool(_bits(run["dX"][zero | ~valid]).any())
 
 
 def test_device_zero_dlogp_rows_repeat(glm_weight):

@@ -383,6 +383,15 @@ STAGE_TENSORS = {
     "scale_cast_f32": ("acc", "g", "out"),
     "scale_cast_scatter_bf16": ("acc", "g", "scan", "idx_lo", "out"),
     "gather_rows_bf16": ("x", "idx_lo", "count", "out"),
+    "zero_dlogp_partition": (
+        "labels",
+        "dlogp",
+        "lse",
+        "order",
+        "lse_out",
+        "scan",
+        "counts",
+    ),
 }
 COMMON_TENSORS = ("workspace", "tma_descriptor_workspace")
 COMMON_SCALARS = (
@@ -488,6 +497,8 @@ HIDDEN_COUNT_STAGE = "gather_rows_bf16"
 # (default on: :func:`logprob_dz_default` / :func:`logprob_lbl_default`) when the record registers them.
 LOGPROB_DZ_STAGE = "gemm_logits_dz"
 LOGPROB_DZ_DCNT_STAGE = "gemm_logits_dz_dcnt"  # its form under the zero-gradient row skip (:data:`DCNT_BASES`)
+# The zero-gradient row skip's row order (:func:`zero_dlogp_partition`): one launch per backward, before the chunk loop.
+ZERO_DLOGP_PARTITION_STAGE = "zero_dlogp_partition"
 LOGPROB_LBL_STAGE = "gemm_logits_lbl"
 LOGITS_BASES = (
     "gemm_logits",
@@ -2546,9 +2557,76 @@ def zero_dlogp_partition(
     row_index: torch.Tensor,
     lse: torch.Tensor,
     chunk: int,
+    *,
+    backend: str = "cake",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The zero-gradient row skip's row order of a compacted log-probability backward, on the device (no host
-    synchronization; capturable): ``(row_index, lse, scan, counts)``.
+    synchronization; capturable): ``(row_index, lse, scan, counts)``, the outputs of
+    :func:`zero_dlogp_partition_reference` bit for bit.
+
+    On a CUDA device whose record registers the partition kernel (:data:`ZERO_DLOGP_PARTITION_STAGE`) and
+    ``backend="cake"`` this is ONE launch: the reference's sixteen small kernels each pay a host launch at the start of
+    the backward, ahead of its first GEMM.  The kernel reads ``labels`` for the valid rows instead of ``row_index``,
+    which must be the ascending index of the rows with a non-negative label (the forward's valid-row index, as the
+    backward passes it).  Any other call (another device or backend, a record without the kernel, an int64 / FP32
+    contract the inputs do not meet) runs the reference."""
+    rows = int(row_index.numel())
+    device = dlogp.device
+    if (
+        backend != "cake"
+        or device.type != "cuda"
+        or rows == 0
+        or labels.dtype != torch.int64
+        or row_index.dtype != torch.int64
+        or lse.dtype != torch.float32
+        or dlogp.dtype != torch.float32
+    ):
+        return zero_dlogp_partition_reference(labels, dlogp, row_index, lse, chunk)
+    module_name, record = record_for(device)
+    if ZERO_DLOGP_PARTITION_STAGE not in registered_stages(module_name):
+        return zero_dlogp_partition_reference(labels, dlogp, row_index, lse, chunk)
+    record_abi(record)
+    geometry = Geometry.from_record(record)
+    T = int(labels.numel())
+    num_chunks = -(-rows // int(chunk))
+    order = torch.empty((rows,), dtype=torch.int64, device=device)
+    lse_ordered = torch.empty((rows,), dtype=torch.float32, device=device)
+    scan = torch.empty((T,), dtype=torch.int32, device=device)
+    counts = torch.empty((num_chunks,), dtype=torch.int32, device=device)
+    values: dict[str, Any] = {name: None for name in COMMON_TENSORS}
+    values.update({name: 0 for name in COMMON_SCALARS})
+    values.update(
+        labels=labels.reshape(-1).contiguous(),
+        dlogp=dlogp.reshape(-1).contiguous(),
+        lse=lse.reshape(-1).contiguous(),
+        order=order,
+        lse_out=lse_ordered,
+        scan=scan,
+        counts=counts,
+        T=T,
+        chunk=int(chunk),
+        num_chunks=num_chunks,
+    )
+    launch, arguments = _eager_launch(
+        record, module_name, ZERO_DLOGP_PARTITION_STAGE, values, device, geometry
+    )
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    with _ffi_stream_context(int(index)):
+        if launch.prepare is not None:
+            launch.prepare(*arguments)
+        launch.entry(*arguments)
+    return order, lse_ordered, scan, counts
+
+
+def zero_dlogp_partition_reference(
+    labels: torch.Tensor,
+    dlogp: torch.Tensor,
+    row_index: torch.Tensor,
+    lse: torch.Tensor,
+    chunk: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The PyTorch form of :func:`zero_dlogp_partition` (any device; no host synchronization): ``(row_index, lse, scan,
+    counts)``.
 
     A valid row whose upstream gradient ``dlogp`` (FP32 ``[T]``) is ``+0`` or ``-0`` contributes exact zeros to ``dX``
     and ``dW``; the others (a NaN included) are the live rows.  The returned ``row_index`` holds the forward's valid
@@ -7656,7 +7734,8 @@ def _zero_dlogp_skip(
     """Whether a log-probability backward that reuses the forward's row index runs the zero-gradient row skip: a
     compacted call (``row_index`` given) of at least :func:`zero_dlogp_min_rows` rows on the ``cake`` backend, with the
     ``dz`` arm and, when it produces ``dX``, the fused dX finalize (which writes the skipped rows' exact zeros), on a
-    record that registers the counted dz arm (:data:`LOGPROB_DZ_DCNT_STAGE`)."""
+    record that registers the counted dz arm (:data:`LOGPROB_DZ_DCNT_STAGE`) and the partition kernel
+    (:data:`ZERO_DLOGP_PARTITION_STAGE`)."""
     floor = zero_dlogp_min_rows()
     if (
         floor is None
@@ -7669,7 +7748,8 @@ def _zero_dlogp_skip(
     ):
         return False
     module_name, _record = record_for(device)
-    return LOGPROB_DZ_DCNT_STAGE in registered_stages(module_name)
+    stages = registered_stages(module_name)
+    return LOGPROB_DZ_DCNT_STAGE in stages and ZERO_DLOGP_PARTITION_STAGE in stages
 
 
 def backward_logprob(

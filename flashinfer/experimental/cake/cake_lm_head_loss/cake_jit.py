@@ -373,6 +373,21 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "zero_dlogp_partition": [
+        ["buffer", "labels"],
+        ["buffer", "dlogp"],
+        ["buffer", "lse"],
+        ["buffer", "order"],
+        ["buffer", "lse_out"],
+        ["buffer", "scan"],
+        ["buffer", "counts"],
+        ["parameter", "T"],
+        ["parameter", "chunk"],
+        ["parameter", "num_chunks"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "scale_cast_bf16": [
         ["buffer", "acc"],
         ["buffer", "g"],
@@ -546,6 +561,7 @@ _LAUNCHES: dict[str, dict[str, list[int]]] = {
     "b224_c2": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
     "b128_c1": {"block": [128, 1, 1], "cluster": [1, 1, 1]},
     "b320_c1": {"block": [320, 1, 1], "cluster": [1, 1, 1]},
+    "b1024_c1": {"block": [1024, 1, 1], "cluster": [1, 1, 1]},
 }
 _REGISTRY: dict[str, dict[str, Any]] = {
     "cake_lm_head_loss_sm_100a": {
@@ -619,6 +635,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 "gemm_logits_dz",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "zero_dlogp_partition": [
+                "c4e7e9ccc838c461277a",
+                "zero_dlogp_partition",
+                "b1024_c1",
+                "max(1, T/4096)",
                 1,
                 1,
             ],
@@ -1056,6 +1080,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 "gemm_logits_dz_tma",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//256))*2",
+                1,
+                1,
+            ],
+            "zero_dlogp_partition": [
+                "c4e7e9ccc838c461277a",
+                "zero_dlogp_partition",
+                "b1024_c1",
+                "max(1, T/4096)",
                 1,
                 1,
             ],
@@ -1517,6 +1549,13 @@ MODULES: dict[str, dict[str, Any]] = _expand_registry(_REGISTRY, _ARG_PLANS, _LA
 #                          gradient in its epilogue: dz_c = bf16(dlogp_t *
 #                          (1[v = y_t] - exp(z - lse_t))) in place of z_c
 #                          (bitwise ``gemm_logits_nostats`` + ``row_grad``).
+# ``zero_dlogp_partition``  once per log-probability backward that skips
+#                          its zero-gradient rows, before the chunk loop:
+#                          the valid rows with a nonzero dlogp first (each
+#                          group in row order) and the forward's lse in
+#                          that order, the inclusive count of those rows
+#                          over the call and their count per chunk (the
+#                          ``_dcnt`` forms' ``CNT``), in one launch.
 # ``gemm_logits_lbl``      the log-probability forward's logits GEMM: the
 #                          statistics plus z_c at the label column alone (the
 #                          one element ``row_finalize`` reads).
@@ -1570,6 +1609,7 @@ STAGES = (
     "gemm_logits_nostats",
     "gemm_logits_nostats_mcnt",
     "gemm_logits_dz",
+    "zero_dlogp_partition",
     "gemm_logits_dz_dcnt",
     "gemm_logits_lbl",
     "row_finalize",
@@ -1633,12 +1673,14 @@ STAGES = (
 # a compacted ``dX``) is the fused dX finalize's kernel
 # (``cake_backend.DX_FINALIZE_STAGES``); a row kernel, geometry-generic.
 # ``gather_rows_bf16`` (chunk 0's row gather of the hidden valid-row count path,
-# ``cake_backend.HIDDEN_COUNT_STAGE``) is a row kernel too.
+# ``cake_backend.HIDDEN_COUNT_STAGE``) is a row kernel too, as is
+# ``zero_dlogp_partition`` (``cake_backend.ZERO_DLOGP_PARTITION_STAGE``).
 BASE_STAGES = (
     "gather_rows_bf16",
     "gemm_logits",
     "gemm_logits_nostats",
     "gemm_logits_dz",
+    "zero_dlogp_partition",
     "gemm_logits_lbl",
     "row_finalize",
     "loss_reduce",
@@ -1655,6 +1697,7 @@ BASE_STAGES = (
 GEMM_STAGES = tuple(stage for stage in STAGES if stage.startswith("gemm_"))
 ROW_STAGES = (
     "gather_rows_bf16",
+    "zero_dlogp_partition",
     "row_finalize",
     "loss_reduce",
     "row_grad",

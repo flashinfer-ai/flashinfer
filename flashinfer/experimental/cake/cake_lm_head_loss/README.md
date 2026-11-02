@@ -298,8 +298,9 @@ it handles these rows on the device, without a host synchronization:
 
 * The backward orders the forward's valid rows so that the live rows (a
   nonzero `dlogp`, NaN included) come first, each group in ascending order,
-  and forms the per-chunk count of live rows in device memory (a few small
-  kernels per call; `zero_dlogp_partition`).
+  and forms the per-chunk count of live rows in device memory, in one kernel
+  launch per call (`zero_dlogp_partition`; the same outputs as its PyTorch
+  reference `zero_dlogp_partition_reference`, bit for bit).
 * The chunk's dz arm of the logits GEMM, its K-sliced dX reduction, its
   weight-gradient accumulate and its bf16 fused cast run their `_dcnt` forms:
   each reads the chunk's count and skips the work items (or the K steps) past
@@ -313,8 +314,9 @@ it handles these rows on the device, without a host synchronization:
   row order (FP32 accumulation; bits may differ within the accuracy budgets).
 * The skip applies to a compacted backward that reuses the forward's row index
   (the autograd entries), with the dz arm (`logprob_dz`) and, when it forms
-  `dX`, the fused dX finalize, on a record that registers the `_dcnt` forms,
-  and of at least `cake_backend.zero_dlogp_min_rows()` valid rows (default 0,
+  `dX`, the fused dX finalize, on a record that registers the `_dcnt` forms
+  and the partition kernel, and of at least
+  `cake_backend.zero_dlogp_min_rows()` valid rows (default 0,
   `set_zero_dlogp_min_rows`; `None` = never).  A chunk plan with a form that has
   no counted form (the swapped dX tile, the weight-gradient TMA epilogue)
   runs the shipped forms over the reordered rows (the same results).
