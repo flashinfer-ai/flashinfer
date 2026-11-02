@@ -44,12 +44,13 @@ LIMITS = pytest.mark.parametrize("swiglu_limit", [None, 0.75], ids=["plain", "cl
 
 
 @pytest.fixture(autouse=True)
-def _exact_matmul(monkeypatch):
-    # Newer PyTorch rejects restoring the legacy ``allow_tf32`` flag on teardown.
-    if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
-        monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
-    else:
-        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+def _exact_matmul():
+    # Save and restore by hand: monkeypatch's undo deletes this module attribute.
+    matmul = torch.backends.cuda.matmul
+    previous = matmul.allow_tf32
+    matmul.allow_tf32 = False
+    yield
+    matmul.allow_tf32 = previous
 
 
 def _setup(hidden, intermediate, seed, experts=4, tokens=512, topk=2):
