@@ -360,7 +360,8 @@ def test_each_supported_architecture_has_its_record_and_libraries():
     """The supported compute capabilities name exactly the architectures of the registry's records (``(10, 7)``
     only with an ``sm_107a`` record), ``build.json`` builds exactly those architectures, and every registered stage
     of each record has its ``<library>_<arch>`` entry.  The ``sm_107a`` record registers the ``sm_103a`` record's
-    stages and programs."""
+    stages and programs but the zero-gradient row skip's (the ``_dcnt`` forms and the partition kernel), which
+    ``sm_107a`` does not build: its log-probability backward never runs the skip."""
     assert cake_backend.SUPPORTED_COMPUTE_CAPABILITIES == {
         (10, 0): "sm_100a",
         (10, 3): "sm_103a",
@@ -388,7 +389,16 @@ def test_each_supported_architecture_has_its_record_and_libraries():
                 stage,
             )
     sm107, sm103 = by_arch["sm_107a"], by_arch["sm_103a"]
-    assert cake_jit.registered_stages(sm107) == cake_jit.registered_stages(sm103)
+    skip_stages = {
+        stage
+        for stage in cake_jit.registered_stages(sm103)
+        if stage.endswith("_dcnt") or stage == cake_backend.ZERO_DLOGP_PARTITION_STAGE
+    }
+    assert cake_backend.LOGPROB_DZ_DCNT_STAGE in skip_stages
+    assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in skip_stages
+    assert cake_jit.registered_stages(sm107) == tuple(
+        stage for stage in cake_jit.registered_stages(sm103) if stage not in skip_stages
+    )
     for stage in cake_jit.registered_stages(sm107):
         assert (
             cake_jit.MODULES[sm107][stage]["library"]
@@ -6445,6 +6455,28 @@ def _logprob_call(inp, C=4096, *, package="nd"):
     return _run(inp, C, package=package, entry="logprob", backend="cake")
 
 
+def _has_zero_dlogp_skip():
+    """Whether this device's record registers the zero-gradient row skip: the counted dz arm
+    (``LOGPROB_DZ_DCNT_STAGE``) and the partition kernel (``ZERO_DLOGP_PARTITION_STAGE``); the ``sm_107a`` record
+    has neither."""
+    module_name, _record = cake_backend.record_for(CUDA)
+    stages = cake_jit.registered_stages(module_name)
+    return (
+        cake_backend.LOGPROB_DZ_DCNT_STAGE in stages
+        and cake_backend.ZERO_DLOGP_PARTITION_STAGE in stages
+    )
+
+
+def _require_zero_dlogp_skip():
+    """Skip a test of the skip itself on a device whose record does not register it
+    (:func:`test_device_zero_dlogp_skip_is_off_without_the_counted_forms` covers that record)."""
+    _require_program(entry="logprob")
+    if not _has_zero_dlogp_skip():
+        pytest.skip(
+            "this device's record registers no zero-gradient row skip (no counted forms, no partition kernel)"
+        )
+
+
 def test_zero_dlogp_partition_orders_the_live_rows_first():
     """``zero_dlogp_partition``: the valid rows of a nonzero ``dlogp`` (NaN included) first, then the zero-gradient
     rows (``+0`` and ``-0``), each group in ascending order; ``lse`` in that order; the inclusive scan of the live rows
@@ -6500,7 +6532,7 @@ def test_device_zero_dlogp_partition_kernel_is_the_reference(T, chunk, kind):
     per-chunk counts (at least one in the first chunk) -- over random, 512-row group, all-zero, single-live,
     last-chunk-live and no-zero gradients, with signed zeros, NaN gradients (live on a valid row, ignored rows
     included) and NaN statistics among them."""
-    _require_program(entry="logprob")
+    _require_zero_dlogp_skip()
     module_name, _record = cake_backend.record_for(CUDA)
     assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in cake_jit.registered_stages(
         module_name
@@ -6776,7 +6808,7 @@ def test_device_zero_dlogp_skip_runs_the_partition_kernel(glm_weight, monkeypatc
     """The backward with the skip forms its row order with the partition kernel, never the PyTorch reference, and gives
     the backward that forms it with the reference the same ``dW`` bits (the same row order) and the same exact ``+0``
     zero rows of ``dX``."""
-    _require_program(entry="logprob")
+    _require_zero_dlogp_skip()
     module_name, _record = cake_backend.record_for(CUDA)
     assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in cake_jit.registered_stages(
         module_name
@@ -6830,7 +6862,7 @@ def test_device_zero_dlogp_plan_without_counted_forms_runs_the_shipped_backward(
     (first call) and from the remembered binding (second call) -- and runs the backward without the skip: the plan and
     launch sequence of the backward with the skip off, the same ``logp`` and ``dW`` bits, ``dX`` within its unordered
     K-slice reduction, the zero rows' ``dX`` zeros."""
-    _require_program(entry="logprob")
+    _require_zero_dlogp_skip()
     base = _device_inputs(8117, "ce", W=glm_weight)
     zero = _zero_dlogp_set(base, ("random", 0.3))
     inp = _with_zero_dlogp(base, zero, negative_zero=False)
@@ -6866,6 +6898,53 @@ def test_device_zero_dlogp_plan_without_counted_forms_runs_the_shipped_backward(
         assert dx_diff <= scale * 2**-7, (dx_diff, scale)
 
 
+def test_device_zero_dlogp_skip_is_off_without_the_counted_forms(
+    glm_weight, monkeypatch
+):
+    """On a record that registers no zero-gradient row skip (``sm_107a``: no counted forms, no partition kernel) a
+    backward that would be eligible elsewhere (floor 0, compacted, the dz arm) is not eligible and runs the shipped
+    backward: no partition, binding (first call) and from the remembered binding (second call); every remembered plan
+    without counted forms; the same ``logp`` and ``dW`` bits as the backward with the skip off, ``dX`` within its
+    unordered K-slice reduction, the zero rows' ``dX`` zeros."""
+    _require_program(entry="logprob")
+    if _has_zero_dlogp_skip():
+        pytest.skip("this device's record registers the zero-gradient row skip")
+    _module_name, record = cake_backend.record_for(CUDA)
+    base = _device_inputs(8117, "ce", W=glm_weight)
+    zero = _zero_dlogp_set(base, ("random", 0.3))
+    inp = _with_zero_dlogp(base, zero, negative_zero=False)
+    valid = inp.labels >= 0
+    index = valid.nonzero().squeeze(1)
+    with _zero_dlogp_floor(0):
+        assert not cake_backend._zero_dlogp_skip(CUDA, index, "cake", True, True, True)
+
+    def refused(*args, **kwargs):
+        raise AssertionError("a record without the counted forms ran the partition")
+
+    cake_backend.BINDING_CACHE.clear()
+    monkeypatch.setattr(cake_backend, "zero_dlogp_partition", refused)
+    with _zero_dlogp_floor(0):
+        runs = [_logprob_call(inp), _logprob_call(inp)]
+    with _zero_dlogp_floor(None):
+        plain = _logprob_call(inp)
+    plans = _logprob_bwd_plans()
+    assert plans and not any(plan.dcnt for plan, _run in plans)
+    live = valid & ~zero
+    scale = float(plain["dX"][live].float().abs().max())
+    for run in runs:
+        for key in ("logp", "dW"):
+            assert _same_bits(run[key], plain[key]), key
+        assert not bool(run["dX"][zero | ~valid].float().any())
+        dx_diff = float(
+            (run["dX"][live].float() - plain["dX"][live].float()).abs().max()
+        )
+        assert dx_diff <= scale * 2**-7, (dx_diff, scale)
+    print(
+        f"\nzero-dlogp skip on {record['arch']}: off (no counted forms, no partition kernel); "
+        f"{len(plans)} remembered backward plan(s), none counted"
+    )
+
+
 def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
     glm_weight, monkeypatch
 ):
@@ -6873,7 +6952,7 @@ def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
     about 650 rows) keeps the skip: the partition runs (binding and remembered binding), the remembered plan casts the
     last chunk through the counted shipped cast, and the results pass the skip suite's checks against the backward
     without the skip and the FP64 oracle."""
-    _require_program(entry="logprob")
+    _require_zero_dlogp_skip()
     _module_name, record = cake_backend.record_for(CUDA)
     base = _device_inputs(5000, "ce", W=glm_weight)
     zero = _zero_dlogp_set(base, ("random", 0.5))
@@ -6920,7 +6999,7 @@ def test_device_zero_dlogp_default_floor_is_one_row_above_a_chunk(
 ):
     """The default floor is one row above a default 4096-row chunk: a backward of 4096 valid rows runs without the skip,
     one of 4097 valid rows runs it (the zero rows' ``dX`` zeros either way)."""
-    _require_program(entry="logprob")
+    _require_zero_dlogp_skip()
     assert (
         cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT
         == cake_backend.DEFAULT_CHUNK_SIZE + 1
