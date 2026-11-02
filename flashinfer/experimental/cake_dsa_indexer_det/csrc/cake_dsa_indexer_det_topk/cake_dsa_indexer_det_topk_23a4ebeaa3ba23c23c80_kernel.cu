@@ -235,6 +235,9 @@ kernel_cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80(const __grid_constant__ CU
     #define verdict_bar_addr (mbar_base + 160)
 #if __CUDA_ARCH__ == 1030
     #define tk_ack_addr (mbar_base + 168)
+    #define verdict_ack_addr (mbar_base + 184)
+#else
+    #define verdict_ack_addr (mbar_base + 168)
 #endif
 
     const int bid = blockIdx.x;
@@ -266,11 +269,11 @@ kernel_cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80(const __grid_constant__ CU
     if (warp == 8) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
 
 #if __CUDA_ARCH__ == 1030
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 23 barriers)
-    // Mbarriers at smem_raw[0..184)
+    // Mbarrier init (9 pipeline groups, 0 ordered-sequence groups, 24 barriers)
+    // Mbarriers at smem_raw[0..192)
 #else
-    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 21 barriers)
-    // Mbarriers at smem_raw[0..168)
+    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 22 barriers)
+    // Mbarriers at smem_raw[0..176)
 #endif
 
     if (warp == 9) {
@@ -313,6 +316,13 @@ kernel_cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80(const __grid_constant__ CU
             // tk_ack: 2 barriers, init_count=10
             mbarrier_init(smem + 168, 10);
             mbarrier_init(smem + 176, 10);
+            // --- pipeline 'verdict_pipe' ---
+#endif
+            // verdict_ack: 1 barriers, init_count=2
+#if __CUDA_ARCH__ == 1030
+            mbarrier_init(smem + 184, 2);
+#else
+            mbarrier_init(smem + 168, 2);
 #endif
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
@@ -322,15 +332,15 @@ kernel_cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80(const __grid_constant__ CU
 
     // TMEM alloc (512 columns, 512 used)
 #if __CUDA_ARCH__ == 1030
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 184);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 192);
 #else
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 168);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 176);
 #endif
     if (warp == 10) {
 #if __CUDA_ARCH__ == 1030
-        int _tmem_hold = smem + 184;
+        int _tmem_hold = smem + 192;
 #else
-        int _tmem_hold = smem + 168;
+        int _tmem_hold = smem + 176;
 #endif
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
@@ -380,8 +390,12 @@ kernel_cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80(const __grid_constant__ CU
             unsigned int _phase_q_empty = 1;
 #if __CUDA_ARCH__ == 1030
             unsigned int _phase_tk_ack = 1;
-#endif
             unsigned int _phase_verdict_bar = 0;
+#endif
+            unsigned int _phase_verdict_ack = 1;
+#if __CUDA_ARCH__ != 1030
+            unsigned int _phase_verdict_bar = 0;
+#endif
             if (elect_sync()) {
                 int unit_base_q = 0;
                 unsigned int vphase_q = 0;
@@ -427,8 +441,8 @@ kernel_cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80(const __grid_constant__ CU
                                 mbarrier_wait(q_empty_addr + (load_q_stage) * 8, _phase_q_empty);
                                 tma_3d_gmem2smem(smem_q_addr + load_q_stage * 32768, (&Q), 0, (q0 + blk * 4) * 32, 0, q_full_addr + (load_q_stage) * 8);
                                 tma_2d_gmem2smem(smem_w_addr + load_q_stage * 512, (&W), 0, q0 + blk * 4, q_full_addr + (load_q_stage) * 8);
-#if __CUDA_ARCH__ == 1030
                                 if (attempt == 0) {
+#if __CUDA_ARCH__ == 1030
                                     if (nunit_q >= 1) {
                                         mbarrier_wait(tk_ack_addr + (ack_q) * 8, _phase_tk_ack);
                                     }
@@ -442,8 +456,11 @@ kernel_cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80(const __grid_constant__ CU
                                     } else {
                                         tk_q = n_tot_q;
                                     }
-                                }
+#else
+                                    mbarrier_wait(verdict_ack_addr, _phase_verdict_ack);
+                                    _phase_verdict_ack ^= 1;
 #endif
+                                }
                                 mbarrier_arrive_expect_tx(q_full_addr + (load_q_stage) * 8, 33280);
                                 load_q_stage += 1;
                                 if (load_q_stage == 2) { load_q_stage = 0; _phase_q_empty ^= 1; }
@@ -451,11 +468,15 @@ kernel_cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80(const __grid_constant__ CU
                                     mbarrier_wait(verdict_bar_addr, _phase_verdict_bar);
                                     _phase_verdict_bar ^= 1;
 #if __CUDA_ARCH__ == 1030
+                                    _phase_verdict_ack ^= 1;
                                     ack_q += 1;
                                     if (ack_q == 2) { ack_q = 0; _phase_tk_ack ^= 1; }
                                     nunit_q += 1;
 #endif
                                     int f = s_fail[0] | s_fail[1] | s_fail[2] | s_fail[3];
+#if __CUDA_ARCH__ == 1030
+                                    mbarrier_wait(verdict_ack_addr, _phase_verdict_ack);
+#endif
                                     if (f == 0) {
                                         break;
                                     }
@@ -592,6 +613,7 @@ kernel_cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80(const __grid_constant__ CU
                                     if (ack_k == 2) { ack_k = 0; }
 #endif
                                     int f_1 = s_fail[0] | s_fail[1] | s_fail[2] | s_fail[3];
+                                    mbarrier_arrive(verdict_ack_addr);
                                     if (f_1 == 0) {
                                         break;
                                     }
@@ -799,6 +821,9 @@ kernel_cake_dsa_indexer_det_topk_23a4ebeaa3ba23c23c80(const __grid_constant__ CU
                                 ack_m += 1;
                                 if (ack_m == 2) { ack_m = 0; }
 #endif
+                                if (lane == 0) {
+                                    mbarrier_arrive(verdict_ack_addr);
+                                }
                                 if (vword_m == 0) {
                                     break;
                                 }

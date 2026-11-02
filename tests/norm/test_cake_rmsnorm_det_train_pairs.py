@@ -40,7 +40,9 @@ windows = cake_package("cake_rmsnorm_det_train", "cake_windows")
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 HIDDEN_SIZES = (6144, 5120, 4096, 2048, 1536, 512, 256)
 REDUCE_ROLE = "bwd_reduce"
-SHIPPED_SLABS = (16, 32, 64)
+# The column widths of the dw reduce slabs, one CTA each: 4 for the column-split H = 256 reduce (one column of a
+# four-column slab per lane).
+SHIPPED_SLABS = (4, 16, 32, 64)
 # Row counts of the contract: the small counts, both sides of every backward window edge of every route
 # (``test_rows_cover_every_backward_window_edge``) and the training shapes.
 ROWS = (
@@ -245,7 +247,8 @@ def test_rendered_windows_match_the_registry() -> None:
     """The exporter's ``cake_windows`` module is the registry: its table is ``program_windows`` of every route, its
     edges are the windows' upper bounds with a known class, and its sections (the docstring notes of the forward and
     backward) name every BF16 route of their kind and cover the FP32-weight routes in one sentence (they select among
-    the twins over the same windows), the re-cut ones (``RECUT_FP32_ROUTES``) as lines of their own."""
+    the twins over the same windows), the re-cut and swapped ones (``RECUT_FP32_ROUTES``,
+    ``SWAPPED_FP32_ROUTES``) as lines of their own."""
     assert set(windows.PROGRAM_WINDOWS) == set(loader.ROUTES) == set(windows.EDGES)
     assert set(windows.EDGE_CLASSES) == {"same", "ulp", "dx", "unmeasured"}
     for arch, routes in loader.ROUTES.items():
@@ -269,9 +272,10 @@ def test_rendered_windows_match_the_registry() -> None:
             )
             listed = f"``{arch}`` ``{route}``:" in windows.SECTIONS[kind]
             if w_dtype == "f32":
-                # an FP32-weight route is one sentence of the section, a re-cut one a line of its own; its base
-                # route is a line either way
-                recut = (arch, hidden, kind, residual) in RECUT_FP32_ROUTES
+                # an FP32-weight route is one sentence of the section, a re-cut or swapped one a line of its
+                # own; its base route is a line either way
+                key = (arch, hidden, kind, residual)
+                recut = key in RECUT_FP32_ROUTES or key in SWAPPED_FP32_ROUTES
                 assert listed == recut, (arch, route)
                 base = loader.route_key(hidden, kind, residual)
                 assert f"``{arch}`` ``{base}``:" in windows.SECTIONS[kind], (
@@ -317,12 +321,14 @@ def test_rows_cover_every_backward_window_edge() -> None:
 # five-CTA ring at issue distance three without the L2 hint (``a3``), both at ``tail_div=4``, in two sessions per
 # architecture (BF16 and FP32 weight alike); sm_107a runs the pipeline to 65536 rows and the ring above.  Above the
 # ring's dw accuracy edge of each architecture (80896 rows on sm_100a, 99840 on sm_103a, 70656 on sm_107a) the ring
-# with compensated dw sums (``dc``) runs instead, and above 1572864 rows its form with hi / lo partial rows
+# with compensated dw sums (``dc``; on sm_100a and sm_107a its lean form ``dcln``, two rows per iteration with the
+# same arithmetic in the same order) runs instead, and above 1572864 rows its form with hi / lo partial rows
 # (``dchl``).
 H256_BWD_PROGRAMS = {
     "pd4": "rmsnorm_train_bwd_h256_t128x4_pd4_k_s32_split_pts_cl_td4",
     "a3": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhkc8_k_s32_split_pts_cl_td4_cs",
     "dc": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdf_k_s32_split_pts_cl_td4_cs",
+    "dcln": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfln_k_s32_split_pts_cl_td4_cs",
     "dchl": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfhl_k_s32_split_pts_cl_td4_cs",
 }
 H256_BWD_SPLIT = {
@@ -333,18 +339,18 @@ H256_BWD_SPLIT = {
             (5120, 12288, "a3"),
             (12288, 40960, "pd4"),
             (40960, edge, "a3"),
-            (edge, hl, "dc"),
+            (edge, hl, dc),
             (hl, None, "dchl"),
         )
-        for arch, edge, hl in (
-            ("sm_100a", 80896, 1572864),
-            ("sm_103a", 99840, 1572864),
+        for arch, edge, hl, dc in (
+            ("sm_100a", 80896, 1572864, "dcln"),
+            ("sm_103a", 99840, 1572864, "dc"),
         )
     },
     "sm_107a": (
         (0, 65536, "pd4"),
         (65536, 70656, "a3"),
-        (70656, 1572864, "dc"),
+        (70656, 1572864, "dcln"),
         (1572864, None, "dchl"),
     ),
 }
@@ -410,6 +416,12 @@ RECUT_FP32_ROUTES: dict[
     ),
     ("sm_107a", 5120, "fwd", False): ((49152, None),),
 }
+
+
+# The FP32-weight routes whose window runs the FP32-weight twin of another program than the BF16 route's there, under
+# a record of the same host plan (the window, grid rule and workspace of the BF16 record): SM103 H = 1536 above
+# 40448 rows, where the register-compensated program is faster with the FP32 weight and not with the BF16 weight.
+SWAPPED_FP32_ROUTES = {("sm_103a", 1536, "bwd", False)}
 
 
 def _window(record) -> tuple[int | None, int | None]:

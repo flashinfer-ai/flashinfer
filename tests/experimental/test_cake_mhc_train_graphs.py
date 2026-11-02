@@ -51,11 +51,15 @@ per element (``P`` the chunk count of the column-slab pass, ``u = 2^-24``,
 each of three calls, each compared the same way with eager calls on the same
 values.  A captured ``backward_finish`` on a caller workspace sized for a
 larger token count, replayed with new inputs copied in place between eager
-calls at the larger count, closes the module.
+calls at the larger count, closes the module.  Where the deterministic
+``backward_finish`` runs its group-row forms (``BWD_ROW_BANDS``, which this
+package does not copy), its ``dscale`` / ``dbase`` reference is its per-CTA
+reduction's (:func:`_det_backward`).
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import gc
 
@@ -623,8 +627,45 @@ def _nd_backward(i: dict, prep: dict, **kwargs) -> dict:
     )
 
 
+def _clear_det_caches() -> None:
+    """Drop the deterministic package's cached host plans, workspace envelopes, layouts and route plans (each binds
+    the token-owner and reduction forms and the parameter region of its token count)."""
+    det_loader.host_plan.cache_clear()
+    det_loader.workspace_bytes_upto.cache_clear()
+    det._LAYOUTS.clear()
+    det._PLANS.clear()
+    det._FAST_ROUTES.clear()
+
+
+@contextlib.contextmanager
+def _det_per_cta():
+    """The deterministic package with its group-row forms off (``cake_jit.bwd_group_rows`` False at every call): the
+    per-CTA token owner and reduction whose ``dscale`` / ``dbase`` this package's column slab reproduces.  Its caches
+    are dropped on entry and on exit, also when the body fails (:func:`_clear_det_caches`)."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(det_loader, "bwd_group_rows", lambda *_args, **_kwargs: False)
+        _clear_det_caches()
+        try:
+            yield
+        finally:
+            patch.undo()
+            _clear_det_caches()
+
+
 def _det_backward(i: dict, prep: dict) -> dict:
-    return _backward(det.cake_mhc_det_train_backward_finish, i, prep)
+    """The deterministic backward (``test_cake_mhc_train.py``'s ``_det_backward``): where it runs its group-row forms
+    (``cake_jit.bwd_group_rows``), ``dscale`` and ``dbase`` are those of its per-CTA run (:func:`_det_per_cta`) on a
+    workspace of the per-CTA sizing; ``dX`` and ``dfn`` stay the shipped backward's."""
+    T, hidden = i["X"].shape[0], i["X"].shape[2]
+    out = _backward(det.cake_mhc_det_train_backward_finish, i, prep)
+    if det_loader.bwd_group_rows(T, _sm_count(), _arch(), hidden):
+        with _det_per_cta():
+            ws = det.cake_mhc_det_train_backward_workspace(T, _device(), hidden=hidden)
+            per_cta = _backward(
+                det.cake_mhc_det_train_backward_finish, i, prep, workspace=ws
+            )
+        out.update(dscale=per_cta["dscale"], dbase=per_cta["dbase"])
+    return out
 
 
 def _assert_exact_outputs(got: dict, want: dict, label: str) -> None:

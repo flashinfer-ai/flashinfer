@@ -54,9 +54,9 @@ _ARCH_FLAGS: dict[tuple[int, int], tuple[str, list[str]]] = {
 # Capabilities whose target needs a newer CUDA toolkit than FlashInfer's minimum.
 _MIN_CUDA: dict[tuple[int, int], str] = {(10, 7): "13.4"}
 # Two-CTA clusters of the fused kernel's static grid (CAKE_MEGAMOE_GRID_CLUSTERS of the generated body and binding):
-# 72 (144 CTAs, the GB300 schedule) unless listed. R200 (212 or 216 SMs) runs the 96-cluster schedule.
+# 72 (144 CTAs, the GB300 schedule) unless listed. R200 (212 or 216 SMs) runs the 104-cluster schedule.
 _DEFAULT_GRID_CLUSTERS = 72
-_GRID_CLUSTERS: dict[tuple[int, int], int] = {(10, 7): 96}
+_GRID_CLUSTERS: dict[tuple[int, int], int] = {(10, 7): 104}
 SUPPORTED_CAPABILITIES = tuple(sorted(_ARCH_FLAGS))
 # The CuTe-DSL backend has one generated program per admitted architecture.
 CUTE_DSL_CAPABILITIES = SUPPORTED_CAPABILITIES

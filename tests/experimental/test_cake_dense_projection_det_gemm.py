@@ -3125,10 +3125,11 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # 86 sm_103a keys and re-values seven round-33 sm_100a keys (MEASURED_SHAPE_ROWS); the whole-tile tile resolve
     # adds one sm_103a key (the kv_a input gradient, test_mg_rules_plan_the_whole_tile_programs); the N = 128 weight
     # gradients of the 4096 / 5120 / 8192 rows add six sm_107a keys (test_sm107a_n128_wgrad_rules_plan); the thin and
-    # 512 / 1024 BF16 projection rows add 26 sm_107a keys
-    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26
+    # 512 / 1024 BF16 projection rows add 26 sm_107a keys; the thin FP32 input gradients, thin BF16 forwards and FP32
+    # weight gradients add 34 sm_107a keys (17 ragged, 17 T-exact weight-gradient keys at T 16231 / 16384)
+    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34
     assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79
-    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26
+    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34
     assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
@@ -8119,11 +8120,14 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
 
 
 def _n224_rule_rows():
-    """Every (key, T) of a ``ROW_RULES`` entry that selects the exact-wave tile (BLOCK_N 224)."""
+    """Every (key, T) of a ragged ``ROW_RULES`` entry that selects the exact-wave tile (BLOCK_N 224); a T-exact key
+    (the sm_107a weight-gradient rules at T 16231 / 16384) names its own token count and was measured on its own device."""
     return [
         (key, T)
         for key, rule in sorted(ROW_RULES.items(), key=repr)
-        if rule.get("block_n") == cake_backend.EXACT_WAVE_BLOCK_N and not key[5]
+        if rule.get("block_n") == cake_backend.EXACT_WAVE_BLOCK_N
+        and not key[5]
+        and None in key[7:]
         for T in (16231, 16384)
     ]
 

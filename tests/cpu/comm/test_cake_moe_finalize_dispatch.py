@@ -218,6 +218,7 @@ def _program_table(binding: str, name: str) -> list[str | None]:
         ("kLargeTokenKernels", "_lt", (2,)),
         ("kTwoShotKernels", "_ts", (4, 8)),
         ("kTwoShotDeferKernels", "_tsd", (4, 8)),
+        ("kTwoShotEarlyKernels", "_tse", (4, 8)),
     ],
 )
 def test_program_tables_list_one_program_kind(
@@ -254,6 +255,7 @@ def test_program_tables_cover_the_module_records() -> None:
             "kLargeTokenKernels",
             "kTwoShotKernels",
             "kTwoShotDeferKernels",
+            "kTwoShotEarlyKernels",
         )
         for kernel in _program_table(binding, table)
         if kernel is not None
@@ -345,3 +347,89 @@ def test_small_token_extension_covers_every_class_at_world_size_4(
                         assert (
                             eval(branch_code, {"__builtins__": {}}, scope) == expected
                         ), (world_size, top_k, use_shared, capacity, tokens)
+
+
+def _as_python(expression: str) -> str:
+    """A selection expression of the binding as Python: its (world_size == 8 ? A : B)
+    choices, an outer (C) ? A : B, the null tests and the logical operators."""
+    expression = " ".join(expression.split())
+    expression = re.sub(
+        r"\(world_size == 8 \? (\w+) : (\w+)\)",
+        r"(\1 if world_size == 8 else \2)",
+        expression,
+    )
+    outer = re.fullmatch(r"\((.*)\) \? (\w+) : (\w+)", expression)
+    if outer is not None:
+        expression = f"({outer.group(2)} if ({outer.group(1)}) else {outer.group(3)})"
+    return (
+        expression.replace(" != nullptr", " is not None")
+        .replace("&&", "and")
+        .replace("||", "or")
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_two_shot_early_program_runs_up_to_128_tokens(world_size: int) -> None:
+    """At small_token_max 16, the binding runs a two-shot batch of up to 128 tokens on
+    the two-shot early program and one of 129 tokens on the two-shot program, at world
+    sizes 4 and 8 (and the world size 8 batches above small_token_max that the
+    small-token program does not take, from 17 tokens); the choice reads the token count
+    and the world size alone."""
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    constants = {
+        name: int(value)
+        for name, value in re.findall(
+            r"^constexpr int64_t (kTwoShot\w+) = (\d+);$", binding, re.M
+        )
+    }
+    assert constants["kTwoShotEarlyMaxTokensWorldSize4"] == 128
+    assert constants["kTwoShotEarlyMaxTokensWorldSize8"] == 128
+    early_now = re.search(r"const void\* two_shot_now =(.*?);", binding, re.S)
+    first = re.search(r"if \((two_shot != nullptr &&.*?)\) \{", binding, re.S)
+    above_small = re.search(
+        r"\} else if \((two_shot != nullptr && world_size == 8)\) \{", binding
+    )
+    assert early_now is not None and first is not None and above_small is not None
+    two_shot_kernel = "kernel = two_shot_deferred ? two_shot_defer : two_shot_now;"
+    assert binding.count(two_shot_kernel) == 2
+    _, branch_expression = _small_token_test(binding)
+    codes = {
+        name: compile(_as_python(expression), name, "eval")
+        for name, expression in (
+            ("two_shot_now", early_now.group(1)),
+            ("two_shot_first", first.group(1)),
+            ("two_shot_above_small", above_small.group(1)),
+            ("small_token", branch_expression),
+        )
+    }
+
+    def program(tokens: int) -> str:
+        scope: dict[str, object] = {
+            **constants,
+            "world_size": world_size,
+            "top_k": 8,
+            "v_has_shared_expert": 1,
+            "tokens": tokens,
+            "small_token_max": 16,
+            "small_token_extended": world_size == 4,
+            "kSmallTokenExtendedMax": 71,
+            "capacity": 0,
+            "two_shot": "_ts",
+            "two_shot_early": "_tse",
+        }
+        if eval(codes["two_shot_first"], {"__builtins__": {}}, scope):
+            return eval(codes["two_shot_now"], {"__builtins__": {}}, scope)
+        if eval(codes["small_token"], {"__builtins__": {}}, scope):
+            return "_small"
+        if eval(codes["two_shot_above_small"], {"__builtins__": {}}, scope):
+            return eval(codes["two_shot_now"], {"__builtins__": {}}, scope)
+        return "persistent"
+
+    assert program(128) == "_tse"
+    assert program(129) == "_ts"
+    assert program(16) == "_small"
+    assert program(17) == ("_tse" if world_size == 8 else "persistent")
