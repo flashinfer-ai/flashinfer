@@ -197,8 +197,11 @@ the launches its key matches, the most specific key first.  On B200 with 148
 SMs the collapse (forward) and the backward prepare (checkpointed backward) are
 off in (2944, 3456] tokens as well, where the mapping pass runs 24 to 27 token
 tiles, and the column-slab pass (checkpointed backward) has its own bands per
-hidden size; on GB300 with 152 SMs the column-slab pass (checkpointed backward)
-has its own bands per hidden size; every other board keeps ``PDL_OFF_BANDS``.
+hidden size; on GB200 (sm_100a with 152 SMs) the collapse and the backward
+prepare are off in (2944, 3584] tokens, 24 to 28 token tiles, and the
+column-slab pass has its own bands per hidden size; on GB300 with 152 SMs the
+column-slab pass (checkpointed backward) has its own bands per hidden size;
+every other board keeps ``PDL_OFF_BANDS``.
 """
 
 from __future__ import annotations
@@ -8380,8 +8383,16 @@ PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
 # run; from 1025 to 1151 tokens off was faster in one run and slower in
 # another); at 4096 and 5120 the deterministic (4096, 8192] band stays, and the
 # other edges keep PDL_OFF_BANDS.
-# GB200 (sm_100a, 152 SMs), B300 (sm_103a, 148 SMs) and sm_107a are not
-# measured and keep PDL_OFF_BANDS.
+# On GB200 (sm_100a, 152 SMs), per-edge scans of the same graphs at 22 to 44
+# token counts per hidden size: the collapse (K1->K3, forward) and the backward
+# prepare (K1->K5, checkpoint) stall with the attribute on in (2944, 3584]
+# tokens, 24 to 28 token tiles (off there, the forward is 3.3..6.5 us and the
+# checkpointed step 9.6..20.5 us faster per edge, 16 of 16 groups at hidden
+# 4096, 5120 and 7168; at 2944 and from 3648 tokens off gained nothing).  The
+# column slab (K6->K7, checkpoint) is off in (1024, 2112] at hidden 4096 and in
+# (1024, 1984] at 5120 and on above (0.28..1.00 us faster from 2176 and from
+# 2047 tokens, 13 to 16 of 16 groups), and off from 769 tokens on at 7168.
+# B300 (sm_103a, 148 SMs) and sm_107a are not measured and keep PDL_OFF_BANDS.
 PDL_BAND_OVERRIDES: dict[
     tuple[str, int | None, int | None],
     dict[str, dict[str, tuple[tuple[int, int | None], ...]]],
@@ -8407,6 +8418,29 @@ PDL_BAND_OVERRIDES: dict[
     ("sm_100a", 148, 7168): {
         "K6->K7": {
             "checkpoint": ((896, 8192),),
+        },
+    },
+    ("sm_100a", 152, None): {
+        "K1->K3": {
+            "forward": ((2944, 3584), (4096, 8192)),
+        },
+        "K1->K5": {
+            "checkpoint": ((2944, 3584), (4096, 8192)),
+        },
+    },
+    ("sm_100a", 152, 4096): {
+        "K6->K7": {
+            "checkpoint": ((1024, 2112),),
+        },
+    },
+    ("sm_100a", 152, 5120): {
+        "K6->K7": {
+            "checkpoint": ((1024, 1984),),
+        },
+    },
+    ("sm_100a", 152, 7168): {
+        "K6->K7": {
+            "checkpoint": ((768, None),),
         },
     },
     ("sm_103a", 152, 4096): {
