@@ -3378,7 +3378,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                         ),
                         acc_layout,
                     )
-                    epilogue.run_overlapping_fc1(
+                    Sm100BlockScaledMoeEpilogue.run_overlapping_fc1(
+                        epilogue,
                         epi_accumulator,
                         output,
                         output_sf,
@@ -3411,7 +3412,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                             ),
                             acc_layout,
                         )
-                        epilogue.run(
+                        Sm100BlockScaledMoeEpilogue.run(
+                            epilogue,
                             epi_accumulator,
                             output,
                             output_sf,
