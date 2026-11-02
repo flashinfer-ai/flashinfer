@@ -31,7 +31,7 @@ deterministic already.*
 | K1 forward (`projection_forward`, `kk` layouts) | deterministic program (whole output tiles; a recomputed forward reproduces its result) |
 | K1 input gradient (`projection_dgrad`, `kn` layouts) | deterministic program (whole output tiles) |
 | K1 weight gradient (`projection_wgrad`, `nn` layouts) | the rows of `K1_SPLIT_RULES`: split-K over the ragged token count -- every split writes its FP32 partial tile to a workspace slot; the last split of a tile to arrive (a per-tile ticket counter) adds the other slots in arrival order and rounds once into `out`, then returns the counter to zero.  Every other row: deterministic program |
-| K2 forward (`router_forward`, `kk`) | deterministic program (its four splits) on every row; an explicit `splits` of 1 or 2 runs this package's stream-K program (at most two partials per element) |
+| K2 forward (`router_forward`, `kk`) | deterministic program (its four splits) on every row -- without a split count, while no router table gives the forward a verdict, the call goes straight to the deterministic package's convenience path; an explicit `splits` of 1 or 2 runs this package's stream-K program (at most two partials per element) |
 | K2 input gradient (`router_dgrad`, `kn`) | deterministic program (one split) |
 | K2 weight gradient (`router_wgrad`, `nn_t`) | the rows of `ROUTER_RULES` with a partition: stream-K over the K blocks, in spans alike or in long head spans and short tail spans (the head/tail program) -- whole tiles store the one-split result, tiles split between units TMA reduce-add into `out` (zeroed before the program, on the same stream).  Every other row: deterministic program (its six splits) |
 | BF16x3 split (`split_fp32_to_bf16x3_`) | the deterministic stage (exact) |
@@ -255,7 +255,10 @@ issues its launches back to back.  A cached K2 launch of the convenience path or
 and converts the arena's BF16x3 stack once per arena growth, so a call converts only the caller's views; a K2 call
 without a split count whose row has no verdict in the router table of the device's SM count (`ROUTER_RULES`, or the
 part's own table in `ROUTER_RULES_BY_SM`) calls the deterministic package's convenience path directly (nothing is
-planned or cached here for it).
+planned or cached here for it).  Whether a row has a verdict is kept per device and view geometry, and whether any
+router table gives the forward one is kept too, until a router table changes: the router tables count their changes,
+so a verdict set or removed at run time is seen at the next call (a table rebound to a plain `dict` is read on every
+call).
 
 ## Benchmark
 
