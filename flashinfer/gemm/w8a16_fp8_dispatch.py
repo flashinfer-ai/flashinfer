@@ -399,9 +399,11 @@ def _get_reduce_kernel(
     pointer_specs: Tuple,
     stream,
 ):
-    """The split-K reduce (sum of slices, scale, bias, cast), compiled once per
-    specialization: the compile target, the activation dtype, bias presence, the
-    slice count and the pointer alignments / dtypes of ``pointer_specs``."""
+    """The split-K reduce (sum of slices, scale, bias, cast), compiled and cached
+    once per compile target, activation dtype, bias presence and slice count.
+    ``pointer_specs`` is not part of that key: every call of one specialization
+    must supply the same operand dtypes and alignment guarantees (the caller's
+    invariant), while the addresses themselves are passed at run time."""
     import cutlass.cute as cute
 
     from .kernels.cute_dsl.w8a16_fp8_splitk_reduce import W8A16SplitKReduce
