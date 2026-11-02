@@ -900,8 +900,8 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cudnn_grouped_gemm_fp8_per_tensor` | `CudnnGroupedGemmFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_grouped_gemm_mxfp8` | `CudnnGroupedGemmMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
 | `cudnn_grouped_gemm_nvfp4` | `CudnnGroupedGemmNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `GELU`, `ReLU`, `SiLU`, `Identity` |
-| `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
-| `cute_dsl` | `CuteDslConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
+| `cute_dsl` | `CuteDslConfig` | `MXFP4×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
+| `cute_dsl` | `CuteDslConfig` | `MXFP8×MXFP8` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×BF16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cute_dsl` | `CuteDslConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
 | `cutile_bf16` | `CuTileBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
@@ -968,6 +968,9 @@ while other runner-specific restrictions remain in `check_support()`.
 
 TRT-LLM FP4 SiTU is supported on SM100/SM103 but rejected on SM107 while the
 pinned Rubin BMM artifact predates `SiTuGlu`.
+
+CuTe-DSL SiTU with MXFP4×MXFP8 or MXFP8×MXFP8 requires
+`CuteDslConfig(swap_ab=True)` on SM100/SM103.
 
 CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
 `situ_linear_beta`); its flat kernel does not expose a separate SiTU

@@ -317,6 +317,7 @@ class PipelineUmmaAsync(PipelineAsync):
         consumer_group: CooperativeGroup,
         barrier_storage: cute.Pointer = None,
         cta_layout_vmnk: Optional[cute.Layout] = None,
+        defer_sync: bool = False,
     ):
         """
         This helper function computes any necessary attributes and returns an instance of PipelineUmmaAsync.
@@ -327,6 +328,7 @@ class PipelineUmmaAsync(PipelineAsync):
             producer_group (CooperativeGroup): CooperativeGroup for the producer agent.
             consumer_group (CooperativeGroup): CooperativeGroup for the consumer agent.
             cta_layout_vmnk (cute.Layout or None): Layout of the cluster shape.
+            defer_sync (bool): Defer the barrier initialization fence to the caller.
 
         Returns:
             PipelineUmmaAsync: An instance of PipelineUmmaAsync.
@@ -371,7 +373,8 @@ class PipelineUmmaAsync(PipelineAsync):
             else cute.nvgpu.tcgen05.CtaGroup.TWO
         )
 
-        pipeline_init_wait(cta_layout_vmnk)
+        if not defer_sync:
+            pipeline_init_wait(cta_layout_vmnk)
 
         return PipelineUmmaAsync(
             sync_object_full,
