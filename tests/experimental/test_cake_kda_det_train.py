@@ -589,8 +589,12 @@ def test_registry_records_are_well_formed() -> None:
                     n for n in names if mode in cake_jit.MODULES[n].get("l2n", ["off"])
                 ]
                 kinds = [cake_jit.MODULES[n]["select_rule"]["kind"] for n in mnames]
-                if not mnames:
-                    assert mode != "off" or not names, (stage, gate, mode)
+                if not mnames:  # the fallback stages serve no other mode
+                    assert mode != "off" or stage in OPTIONAL_STAGES, (
+                        stage,
+                        gate,
+                        mode,
+                    )
                 elif len(mnames) == 1 and stage in OPTIONAL_STAGES:
                     assert kinds[0] not in ("always", "otherwise"), (stage, gate, mode)
                 elif len(mnames) == 1:
