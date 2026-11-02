@@ -23,6 +23,7 @@ import dataclasses
 import importlib
 import inspect
 import pathlib
+import types
 
 import pytest
 import torch
@@ -287,6 +288,145 @@ def test_test_knobs_are_a_keyword_dict_with_known_keys() -> None:
         make_options(test_knobs=["schedule"])
     with pytest.raises(KeyError):
         o.knob("walk_geometry")
+
+
+def test_walk_pair_knob_is_off_by_default() -> None:
+    assert opt.TEST_KNOB_DEFAULTS["walk_pair"] == 0
+    assert make_options().knob("walk_pair") == 0
+    assert make_options(test_knobs={"walk_pair": 1}).knob("walk_pair") == 1
+    for bad in (2, -1, True, "1"):
+        with pytest.raises(ValueError):
+            make_options(test_knobs={"walk_pair": bad})
+    assert make_options(test_knobs={"walk_pair": 1}).key() != make_options().key()
+
+
+@pytest.mark.parametrize(
+    "knob, layout, world, on",
+    [
+        (1, "zigzag", 2, True),
+        (1, "zigzag", 8, True),
+        (1, "zigzag_per_document", 8, True),
+        (1, "zigzag", 16, False),
+        (1, "zigzag_per_document", 16, False),
+        (1, "contiguous", 8, False),
+        (1, "explicit", 8, False),
+        (0, "zigzag", 8, False),
+        (0, "zigzag_per_document", 4, False),
+    ],
+)
+def test_walk_pair_is_on_for_zigzag_partitions_up_to_8_ranks(
+    knob, layout, world, on
+) -> None:
+    kcp = _mod("cake_kcp")
+    assert kcp.WALK_PAIR_LAYOUTS == ("zigzag", "zigzag_per_document")
+    assert kcp.WALK_PAIR_MAX_WORLD == 8
+    ctx = types.SimpleNamespace(
+        partition=types.SimpleNamespace(layout=layout, world_size=world)
+    )
+    assert kcp._walk_pair_enabled(knob, ctx) is on
+    assert kcp._walk_pair_enabled(knob, types.SimpleNamespace()) is False
+
+
+class _Stream:
+    def __init__(self, name: str, log: list) -> None:
+        self.name, self.log = name, log
+
+    def wait_event(self, event) -> None:
+        self.log.append(("wait", self.name, event.name))
+
+
+def _walk_pair_stub(monkeypatch, *, walk_pair: bool, device: str):
+    """A stand-in call for ``cake_kcp._walk_pair`` with CPU stand-ins for the CUDA stream / event API: every
+    stream operation and every backend launch (with the stream it was issued on) goes to the returned log; the call's
+    ``kernel`` is the host module's own ``CallDetKcp.kernel`` (the deferral under test)."""
+    kcp = _mod("cake_kcp")
+    log: list = []
+    current, side = _Stream("current", log), _Stream("side", log)
+    active = [current]
+    names = iter(f"ev{i}" for i in range(100))
+
+    class _Event:
+        def __init__(self) -> None:
+            self.name = next(names)
+
+        def record(self, stream) -> None:
+            log.append(("record", self.name, stream.name))
+
+    class _StreamContext:
+        def __init__(self, stream) -> None:
+            self.stream = stream
+
+        def __enter__(self) -> None:
+            active.append(self.stream)
+
+        def __exit__(self, *exc) -> None:
+            active.pop()
+
+    class _Backend:
+        def run(self, name: str, args: dict) -> None:
+            log.append(("run", name, active[-1].name))
+
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: current)
+    monkeypatch.setattr(torch.cuda, "stream", _StreamContext)
+    monkeypatch.setattr(kcp, "_side_stream", lambda device: side)
+    call = types.SimpleNamespace(
+        walk_pair=walk_pair,
+        device=torch.device(device),
+        _deferred=None,
+        backend=_Backend(),
+        counters={"launches": 0},
+        sequence=[],
+    )
+
+    def launch(name: str):
+        return lambda: kcp.CallDetKcp.kernel(call, name, 1)
+
+    return kcp, call, log, launch
+
+
+def test_walk_pair_forks_and_joins_around_the_side_launches(monkeypatch) -> None:
+    """``walk_pair=1``: the offset walk's launch is resolved first and issued on the side stream after the side stream
+    waits on a fork event recorded on the current stream; the transfer walk follows on the current stream, which then
+    waits on the side stream's join event.  The call's launch sequence is the one-stream order."""
+    kcp, call, log, launch = _walk_pair_stub(monkeypatch, walk_pair=True, device="cuda")
+    paired = kcp.WALK_PAIR_STATS["paired"]
+    kcp._walk_pair(call, launch("kcp_fwdh_offset"), launch("kcp_transfer_walk"))
+    assert call.sequence == ["kcp_fwdh_offset", "kcp_transfer_walk"]
+    assert call._deferred is None
+    assert log == [
+        ("record", "ev0", "current"),
+        ("wait", "side", "ev0"),
+        ("run", "kcp_fwdh_offset", "side"),
+        ("record", "ev1", "side"),
+        ("run", "kcp_transfer_walk", "current"),
+        ("wait", "current", "ev1"),
+    ]
+    assert kcp.WALK_PAIR_STATS["paired"] == paired + 1
+
+
+@pytest.mark.parametrize("walk_pair, device", [(False, "cuda"), (True, "cpu")])
+def test_walk_pair_off_or_on_the_cpu_is_one_stream(
+    monkeypatch, walk_pair, device
+) -> None:
+    kcp, call, log, launch = _walk_pair_stub(
+        monkeypatch, walk_pair=walk_pair, device=device
+    )
+    kcp._walk_pair(call, launch("kcp_fwdh_offset"), launch("kcp_transfer_walk"))
+    assert log == [
+        ("run", "kcp_fwdh_offset", "current"),
+        ("run", "kcp_transfer_walk", "current"),
+    ]
+    assert call.sequence == ["kcp_fwdh_offset", "kcp_transfer_walk"]
+
+
+def test_walk_pair_with_an_empty_side_walk_issues_on_the_current_stream(
+    monkeypatch,
+) -> None:
+    kcp, call, log, launch = _walk_pair_stub(monkeypatch, walk_pair=True, device="cuda")
+    kcp._walk_pair(call, lambda: None, launch("kcp_transfer_walk"))
+    assert log == [("run", "kcp_transfer_walk", "current")]
+    assert call._deferred is None
 
 
 def test_options_from_instance_mapping_and_keywords_agree() -> None:

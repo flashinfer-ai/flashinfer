@@ -52,7 +52,8 @@ again go to the owners (``b1``); the owner walks each chain backwards
 fragment's ``dS_out`` (``b2``); the adjoint tape walk (#7 ``program=tape``)
 runs from it; ``bwd_dqkg`` (#8, the FP32 group reduction of the ``r`` value
 heads' ``dq`` / ``dk`` fused) and ``gate_epilogue`` (#9) finish the gradients.
-One compute stream; the collectives are asynchronous on the caller's process
+One compute stream (test knob ``walk_pair=1`` on a zigzag / zigzag-per-document partition of at most 8 ranks: the
+summaries' offset walk on a side stream beside the transfer walk, fork / join with CUDA events); the collectives are asynchronous on the caller's process
 group and waited at their first consumer; the issue order is the same on
 every rank, so a checkpoint replay re-runs the same program order.  With a recompute handle
 (``recompute_handle``, :class:`RecomputeHandleDetKcp`) the original forward stores its ``S_in`` in the handle and torch's
@@ -108,7 +109,7 @@ queries) is :mod:`.cake_kcp_plan` / :mod:`.cake_bytes`.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
@@ -2786,6 +2787,9 @@ class CallDetKcp:
         self.schedule = str(opts.knob("schedule"))
         self.cols_rule = str(opts.knob("cols_rule"))
         self.debug_sequence = bool(opts.knob("debug_sequence"))
+        self.walk_pair = _walk_pair_enabled(opts.knob("walk_pair"), ctx)
+        # (name, args) of the launches resolved while _walk_pair defers them (issued on its side stream); else None
+        self._deferred: list[tuple[str, dict[str, Any]]] | None = None
         if int(tb.fused_walks) != int(opts.knob("fused_walks")):
             raise ValueError(
                 f"tables built with fused_walks={tb.fused_walks}, the call asks for {opts.knob('fused_walks')}"
@@ -2915,6 +2919,9 @@ class CallDetKcp:
         self.sequence.append(name)
         args["_call"] = self
         args["_grid"] = int(grid)
+        if self._deferred is not None:
+            self._deferred.append((name, args))
+            return
         self.backend.run(name, args)
 
     def _walk_common(self, walk: Sequence[int]) -> dict[str, Any]:
@@ -3776,6 +3783,92 @@ def _ring_backward(call: CallDetKcp, *, walk_ends: bool = False) -> None:
 # Launch sequences (one compute stream; waits at first consumption; shipped schedule wait_first + fused tape walks)
 
 
+# Test knob ``walk_pair`` (default 0): the summaries' offset walk and transfer walk read the same tapes (k, w, u,
+# rowscale, gamma) and the tables only and write disjoint tiles, so the offset walk may run beside the transfer walk.
+# Its launch is resolved on the current stream (pools, tapes and device tables are bound and uploaded there: nothing
+# is allocated on the side stream) and issued on a per-device side stream after a fork event recorded on the current
+# stream; the transfer walk follows on the current stream, which then waits on the side stream's join event before
+# anything else is enqueued.  The deferred launch arguments stay referenced until that wait is enqueued, so no tensor
+# the side stream reads returns to the allocator (and to the current stream's reuse) before the join; every later use
+# or free is ordered after it.  No host synchronization, no device-to-host copy; the launches, their arguments and
+# outputs and the call's sequence / records are those of walk_pair=0.  Under graph="replay" the side stream joins and
+# leaves the capture through the same two events.
+# The pair is enabled on the zigzag partitions only (WALK_PAIR_LAYOUTS) of at most WALK_PAIR_MAX_WORLD ranks; a
+# contiguous or explicit partition, or a larger world, keeps the walk_pair=0 path (GB300 CP8: the contiguous rows, three
+# summaries per rank, ran 1-3 % slower paired; GB300 CP16: one summary per rank, no measured gain).
+WALK_PAIR_LAYOUTS = ("zigzag", "zigzag_per_document")
+WALK_PAIR_MAX_WORLD = 8
+_SIDE_STREAMS: dict[int, torch.cuda.Stream] = {}
+WALK_PAIR_STATS: dict[str, int] = {
+    "paired": 0,  # walk pairs issued as fork / join
+    "single": 0,  # walk pairs with the knob on that had one side empty (issued on the current stream only)
+}
+
+
+def _walk_pair_enabled(knob: int, ctx: Any) -> bool:
+    """The ``walk_pair`` test knob as applied to the call: on only for a context whose partition layout is in
+    :data:`WALK_PAIR_LAYOUTS` and whose world has at most :data:`WALK_PAIR_MAX_WORLD` ranks."""
+    part = getattr(ctx, "partition", None)
+    layout, world = getattr(part, "layout", None), getattr(part, "world_size", None)
+    return (
+        bool(knob)
+        and layout in WALK_PAIR_LAYOUTS
+        and world is not None
+        and world <= WALK_PAIR_MAX_WORLD
+    )
+
+
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _SIDE_STREAMS.get(index)
+    if stream is None:
+        # torch draws every torch.cuda.Stream from a per-device, per-priority pool of 32 (round robin): a default-priority
+        # stream would also be every 32nd later default-priority stream of the process (a caller's side stream, the
+        # process group's streams), and the offset walk would queue behind that stream's work.  The greatest priority
+        # level's pool is not drawn by default-priority users.
+        greatest = torch.cuda.Stream.priority_range()[1]
+        stream = _SIDE_STREAMS[index] = torch.cuda.Stream(
+            device=index, priority=greatest
+        )
+    return stream
+
+
+def _walk_pair(
+    call: CallDetKcp, side: Callable[[], None], main: Callable[[], None]
+) -> None:
+    """``side()`` then ``main()``: in this order on the current stream (``walk_pair=0``, a CPU device), or with the
+    launches of ``side()`` on the side stream concurrently with ``main()`` (``walk_pair=1``, see above)."""
+    if not call.walk_pair or call.device.type != "cuda":
+        side()
+        main()
+        return
+    pending: list[tuple[str, dict[str, Any]]] = []
+    call._deferred = pending
+    try:
+        side()
+    finally:
+        call._deferred = None
+    if not pending:
+        WALK_PAIR_STATS["single"] += 1
+        main()
+        return
+    current = torch.cuda.current_stream(call.device)
+    stream = _side_stream(call.device)
+    fork = torch.cuda.Event()
+    fork.record(current)
+    stream.wait_event(fork)
+    with torch.cuda.stream(stream):
+        for name, args in pending:
+            call.backend.run(name, args)
+    join = torch.cuda.Event()
+    join.record(stream)
+    n_main = call.counters["launches"]
+    main()
+    current.wait_event(join)
+    WALK_PAIR_STATS["paired" if call.counters["launches"] > n_main else "single"] += 1
+    pending.clear()  # the side launches' arguments are released only after the join is enqueued
+
+
 def _offset_walk(call: CallDetKcp, walk: Sequence[int], out: Indexed) -> None:
     """The offset ``B_f`` / ``b_seg`` of the segments ``walk`` from the zero state into ``out``: the #2 offset walk
     from zero with the local rounding points (``offset_class="fla"``, the default) or the #3 transfer walk
@@ -3800,28 +3893,38 @@ def _summaries(call: CallDetKcp) -> None:
     family -> ``M_f``, transposed into the pairs)."""
     tb = call.tb
     if tb.P == 1:
-        _offset_walk(
-            call, tb.walk_offset, call.indexed("c1_send", tb.out_index, tb.c1_b_tiles)
+        _walk_pair(
+            call,
+            lambda: _offset_walk(
+                call,
+                tb.walk_offset,
+                call.indexed("c1_send", tb.out_index, tb.c1_b_tiles),
+            ),
+            lambda: call.walk(
+                "kcp_transfer_walk",
+                tb.walk_offset,
+                out=call.indexed("c1_send", tb.out_index, tb.c1_m_tiles),
+                init_mode=0,
+                use_u=0,
+                write_transposed=0,
+            ),
         )
-        call.walk(
+        return
+    _walk_pair(
+        call,
+        lambda: _offset_walk(
+            call,
+            tb.walk_offset,
+            call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+        ),
+        lambda: call.walk(
             "kcp_transfer_walk",
             tb.walk_offset,
-            out=call.indexed("c1_send", tb.out_index, tb.c1_m_tiles),
+            out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
             init_mode=0,
             use_u=0,
             write_transposed=0,
-        )
-        return
-    _offset_walk(
-        call, tb.walk_offset, call.indexed("stage_b", tb.seg_index, tb.stage_tiles)
-    )
-    call.walk(
-        "kcp_transfer_walk",
-        tb.walk_offset,
-        out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
-        init_mode=0,
-        use_u=0,
-        write_transposed=0,
+        ),
     )
     call.merge(
         "map"
@@ -4061,17 +4164,28 @@ def _replay_from_states(call: CallDetKcp, *, have_m: bool) -> None:
     if (
         tb.P > 1
     ):  # the forward carries again: b_seg (and M_seg^T unless saved) -> carries from 0 / S_in
-        _offset_walk(
-            call, tb.walk_all, call.indexed("stage_b", tb.seg_index, tb.stage_tiles)
-        )
-        if not have_m:
-            call.walk(
-                "kcp_transfer_walk",
+
+        def offset() -> None:
+            _offset_walk(
+                call,
                 tb.walk_all,
-                out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
-                init_mode=0,
-                use_u=0,
-                write_transposed=0,
+                call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+            )
+
+        if have_m:
+            offset()
+        else:
+            _walk_pair(
+                call,
+                offset,
+                lambda: call.walk(
+                    "kcp_transfer_walk",
+                    tb.walk_all,
+                    out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
+                    init_mode=0,
+                    use_u=0,
+                    write_transposed=0,
+                ),
             )
         call.merge("carry_start")
         call.merge("carry_in")
