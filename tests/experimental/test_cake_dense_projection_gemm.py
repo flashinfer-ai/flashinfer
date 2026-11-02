@@ -400,12 +400,12 @@ def test_k1_routes(monkeypatch, layout):
         assert kwargs["transposed_out"] is False and kwargs["own"] == {}
         assert kwargs["det_call"]() is det.result  # a row the planner does not take
         assert det.calls == [
-            ((A, B, out), {"transposed_out": False, "enable_pdl": False})
+            ((A, B, out), {"transposed_out": False, "enable_pdl": None})
         ]
     else:
         assert result is det.result and not atomic.calls
         assert det.calls == [
-            ((A, B, out), {"transposed_out": False, "enable_pdl": False})
+            ((A, B, out), {"transposed_out": False, "enable_pdl": None})
         ]
 
 
@@ -3175,6 +3175,33 @@ def test_gpu_det_then_atomic_share_a_stream_not_a_workspace(k1_rule):
     }
     theirs = {id(b) for a in det_backend._ARENAS.values() for b in a.buffers.values()}
     assert ours and not ours & theirs
+    assert _arena_tickets_zero()
+
+
+@pytest.mark.parametrize("splits", [1, 2])
+def test_gpu_k1_pdl_waits_for_an_early_producer(splits, k1_rule):
+    """This package's weight gradient as a programmatic dependent launch: the deterministic forward before it
+    (K = 8192) triggers its dependents at entry and writes ``G``; the weight gradient starts while it runs and must
+    still read every row it wrote, and its tickets end zero for the next launch on the stream."""
+    device, arch = _atomic_device_or_skip()
+    N, K = K1_ROWS["indexer_k"]
+    T = 4096
+    g = torch.Generator(device=device).manual_seed(SEED + 60)
+    H = _bf16((T, 8192), device, g)
+    Wg = (torch.randn(N, 8192, device=device, generator=g) * 8192**-0.5).to(
+        torch.bfloat16
+    )
+    X = _bf16((T, K), device, g)
+    G = torch.empty(T, N, device=device, dtype=torch.bfloat16)
+    out = torch.empty(N, K, device=device, dtype=torch.bfloat16)
+    k1_rule(G, X, out, splits)
+    for _ in range(3):
+        G.fill_(float("nan"))
+        out.fill_(float("nan"))
+        cake_backend.projection_forward(H, Wg, G, enable_pdl=True)
+        cake_backend.projection_wgrad(G, X, out, deterministic=False, enable_pdl=True)
+        torch.cuda.synchronize()
+        _k1_check(out, G.double().t() @ X.double())
     assert _arena_tickets_zero()
 
 

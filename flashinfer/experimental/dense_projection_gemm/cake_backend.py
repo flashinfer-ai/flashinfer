@@ -750,8 +750,10 @@ def _k1_values(
     counters: Any,
     ldo: int,
     out_l: int,
+    enable_pdl: int,
 ) -> dict[str, Any]:
-    """The keyword arguments of a K1 launch of this package (ordered by the program's argument plan)."""
+    """The keyword arguments of a K1 launch of this package (ordered by the program's argument plan); ``enable_pdl``
+    is the launch's PDL flag (0 or 1)."""
     return dict(
         A=A,
         B=B,
@@ -765,6 +767,7 @@ def _k1_values(
         num_splits=plan.splits,
         ldo=ldo,
         out_l=out_l,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1861,7 +1864,13 @@ def _split_knobs(knobs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]
 
 
 def _prepare_atomic_k1(
-    plan: AtomicGemmPlan, a_desc, b_desc, out3, out: torch.Tensor, arch: str
+    plan: AtomicGemmPlan,
+    a_desc,
+    b_desc,
+    out3,
+    out: torch.Tensor,
+    arch: str,
+    enable_pdl: Optional[bool],
 ) -> PreparedAtomicGemm:
     det = deterministic_backend()
     device = out.device
@@ -1883,6 +1892,7 @@ def _prepare_atomic_k1(
         counters=counters,
         ldo=ldo,
         out_l=out_l,
+        enable_pdl=int(det.pdl_enabled(enable_pdl, device)),
     )
     launch = bind_launch(module_name, values, plan.grid, arch)
     return PreparedAtomicGemm(
@@ -1919,14 +1929,22 @@ def _atomic_k1(
     det_call: Callable[[], Any],
     arch: Optional[str] = None,
     sm_count: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> Any:
     """This package's K1 GEMM ``out = A @ B`` (both MN-major): ``op`` is ``"plan"`` (returns the plan),
     ``"prepare"`` (the prepared launch) or ``"launch"`` (the convenience path, returns ``out``); ``own`` holds this
     package's knobs (``splits``, ``block_n``).  A row :func:`plan_atomic_gemm` keeps on the deterministic program
-    returns ``det_call()``: the deterministic package's object of the entry point and ``op``, with its knobs."""
+    returns ``det_call()``: the deterministic package's object of the entry point and ``op``, with its knobs.
+    ``enable_pdl`` (default: the device supports it) launches the program as a programmatic dependent launch."""
     if op == "launch":
         return _launch_cached_atomic_k1(
-            A, B, out, transposed_out=transposed_out, own=own, det_call=det_call
+            A,
+            B,
+            out,
+            transposed_out=transposed_out,
+            own=own,
+            det_call=det_call,
+            enable_pdl=enable_pdl,
         )
     arch, sm_count = _k1_arch_and_sms(A, B, out, arch, sm_count)
     plan, a_desc, b_desc, out3, _ = plan_atomic_gemm(
@@ -1936,7 +1954,7 @@ def _atomic_k1(
         return det_call()
     if op == "plan":
         return plan
-    return _prepare_atomic_k1(plan, a_desc, b_desc, out3, out, arch)
+    return _prepare_atomic_k1(plan, a_desc, b_desc, out3, out, arch, enable_pdl)
 
 
 def _prepare_atomic_k2(
@@ -2227,6 +2245,7 @@ def _launch_cached_atomic_k1(
     transposed_out: bool,
     own: dict[str, Any],
     det_call: Callable[[], Any],
+    enable_pdl: Optional[bool],
 ) -> Any:
     det = deterministic_backend()
     device = det._same_cuda_device(A, B, out)
@@ -2291,6 +2310,7 @@ def _launch_cached_atomic_k1(
         counters=counters,
         ldo=ldo,
         out_l=out_l,
+        enable_pdl=int(det.pdl_enabled(enable_pdl, index)),
     )
     arguments = _order_atomic_arguments(
         entry.module_name, entry.arg_plan, values, plan.grid
@@ -2484,6 +2504,12 @@ def clear_convenience_caches() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _pdl_kw(enable_pdl: Optional[bool]) -> dict[str, Any]:
+    """``enable_pdl`` as the keyword a deterministic entry point receives: passed only when the caller set it, so the
+    default is the deterministic package's (the device's support) and a call without it is the same call."""
+    return {} if enable_pdl is None else {"enable_pdl": enable_pdl}
+
+
 def _splits_kw(splits: Optional[int]) -> dict[str, Any]:
     """The ``splits`` keyword for a deterministic call: absent when the caller gave none, so the deterministic
     package's own default (its production split count) applies."""
@@ -2561,7 +2587,8 @@ def prepare_dense_projection_gemm(
     """Validate one K1 binding, plan it for the device and prepare its allocation-free launch: the deterministic
     package's ``prepare_dense_projection_det_gemm`` with the same keywords (``transposed_out`` and the planner
     knobs); with ``deterministic=False`` a weight-gradient layout prepares this package's split-K program (its
-    workspace is owned by the prepared object; ``splits`` / ``block_n`` as for :func:`plan_dense_projection_gemm`)."""
+    workspace is owned by the prepared object; ``splits`` / ``block_n`` as for :func:`plan_dense_projection_gemm`).
+    ``enable_pdl`` (default: the device supports it) makes either launch a programmatic dependent launch."""
     if (
         _resolve_deterministic(deterministic, "prepare_dense_projection_gemm")
         or _route(_k1_layout(A, B)) == "det"
@@ -2578,6 +2605,7 @@ def prepare_dense_projection_gemm(
         det_call=lambda: _det_entry("prepare_dense_projection_gemm")(
             A, B, out, **det_kwargs
         ),
+        enable_pdl=det_kwargs.get("enable_pdl"),
     )
 
 
@@ -2588,14 +2616,15 @@ def dense_projection_gemm(
     *,
     transposed_out: bool = False,
     deterministic: bool = True,
-    enable_pdl: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[l, m, n] = sum_k A[l, m, k] B[l, k, n]`` for strided views (the cached convenience path; see the
     deterministic package for the view contract).  ``deterministic=False`` runs a weight-gradient layout (both
     operands MN-major) on this package's split-K program where the planner takes the row; every other layout and
-    row runs the deterministic program.  ``enable_pdl`` reaches the deterministic program, whose swapped
-    small-token forward launches as a programmatic dependent launch (see its ``dense_projection_det_gemm``); this
-    package's programs launch without the attribute."""
+    row runs the deterministic program.  ``enable_pdl`` (default: the device supports it) launches either program
+    as a programmatic dependent launch (see the deterministic package's ``dense_projection_det_gemm`` for the
+    swapped small-token forward's contract on ``B``); this package's program waits for the preceding kernel before
+    its first global access."""
     if _resolve_deterministic(deterministic, "dense_projection_gemm") or (
         _route(_k1_layout(A, B)) == "det"
     ):
@@ -2612,6 +2641,7 @@ def dense_projection_gemm(
         det_call=lambda: _det_entry("dense_projection_gemm")(
             A, B, out, transposed_out=transposed_out, enable_pdl=enable_pdl
         ),
+        enable_pdl=enable_pdl,
     )
 
 
@@ -2621,11 +2651,13 @@ def projection_forward(
     out: Optional[torch.Tensor] = None,
     *,
     deterministic: bool = True,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default).  The deterministic program in both modes (a
-    forward has no cross-CTA reduction, and a recomputed forward must reproduce its result)."""
+    forward has no cross-CTA reduction, and a recomputed forward must reproduce its result); ``enable_pdl`` as for
+    :func:`dense_projection_gemm`."""
     _resolve_deterministic(deterministic, "projection_forward")
-    return _det_entry("projection_forward")(X, W, out)
+    return _det_entry("projection_forward")(X, W, out, **_pdl_kw(enable_pdl))
 
 
 def projection_dgrad(
@@ -2635,10 +2667,14 @@ def projection_dgrad(
     *,
     out_dtype=None,
     deterministic: bool = True,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, K] = G[T, N] @ W[N, K]``.  The deterministic program in both modes (whole output tiles)."""
+    """``out[T, K] = G[T, N] @ W[N, K]``.  The deterministic program in both modes (whole output tiles);
+    ``enable_pdl`` as for :func:`dense_projection_gemm`."""
     _resolve_deterministic(deterministic, "projection_dgrad")
-    return _det_entry("projection_dgrad")(G, W, out, out_dtype=out_dtype)
+    return _det_entry("projection_dgrad")(
+        G, W, out, out_dtype=out_dtype, **_pdl_kw(enable_pdl)
+    )
 
 
 def prepare_projection_wgrad(
@@ -2649,14 +2685,15 @@ def prepare_projection_wgrad(
     sk: bool | str = "auto",
     cta_rows: Optional[int] = None,
     deterministic: bool = True,
+    enable_pdl: Optional[bool] = None,
 ) -> Any:
     """Prepared ``out[N, K] = G[T, N].T @ X[T, K]``.  ``deterministic=False`` prepares this package's split-K
     program as the transposed-store GEMM ``X.T @ G`` (``M = K``, ``N = N``) where the planner takes the row; a row it
     does not take prepares the deterministic package's ``prepare_projection_det_wgrad`` (its orientation, ``sk``,
-    ``cta_rows``)."""
+    ``cta_rows``).  ``enable_pdl`` as for :func:`prepare_dense_projection_gemm`."""
     if _resolve_deterministic(deterministic, "prepare_projection_wgrad"):
         return _det_entry("prepare_projection_wgrad")(
-            G, X, out, sk=sk, cta_rows=cta_rows
+            G, X, out, sk=sk, cta_rows=cta_rows, **_pdl_kw(enable_pdl)
         )
     return _atomic_k1(
         "prepare",
@@ -2666,8 +2703,9 @@ def prepare_projection_wgrad(
         transposed_out=True,
         own={},
         det_call=lambda: _det_entry("prepare_projection_wgrad")(
-            G, X, out, sk=sk, cta_rows=cta_rows
+            G, X, out, sk=sk, cta_rows=cta_rows, **_pdl_kw(enable_pdl)
         ),
+        enable_pdl=enable_pdl,
     )
 
 
@@ -2680,13 +2718,21 @@ def projection_wgrad(
     sk: bool | str = "auto",
     cta_rows: Optional[int] = None,
     deterministic: bool = True,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[N, K] = G[T, N].T @ X[T, K]`` (ragged reduction length ``T``).  ``deterministic=False`` runs this
     package's split-K program where the planner takes the row (the split partials summed in the order they finish,
-    the output rounded once), else the deterministic package's ``projection_det_wgrad``."""
+    the output rounded once), else the deterministic package's ``projection_det_wgrad``; ``enable_pdl`` as for
+    :func:`dense_projection_gemm`."""
     if _resolve_deterministic(deterministic, "projection_wgrad"):
         return _det_entry("projection_wgrad")(
-            G, X, out, out_dtype=out_dtype, sk=sk, cta_rows=cta_rows
+            G,
+            X,
+            out,
+            out_dtype=out_dtype,
+            sk=sk,
+            cta_rows=cta_rows,
+            **_pdl_kw(enable_pdl),
         )
     if out is None:
         out = torch.empty(
@@ -2703,8 +2749,15 @@ def projection_wgrad(
         transposed_out=True,
         own={},
         det_call=lambda: _det_entry("projection_wgrad")(
-            G, X, out, out_dtype=out_dtype, sk=sk, cta_rows=cta_rows
+            G,
+            X,
+            out,
+            out_dtype=out_dtype,
+            sk=sk,
+            cta_rows=cta_rows,
+            **_pdl_kw(enable_pdl),
         ),
+        enable_pdl=enable_pdl,
     )
 
 

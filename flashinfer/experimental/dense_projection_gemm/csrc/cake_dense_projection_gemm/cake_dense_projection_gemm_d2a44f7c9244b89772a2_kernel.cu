@@ -47,44 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_CHUNK_ACC_OFFSET 0
-#define TMEM_SMALL_ACC_OFFSET 256
-#define NUM_TMA_PIPE_STAGES 4
-#define NUM_CHUNK_PIPE_STAGES 2
-#define NUM_MAINLOOP_PIPE_STAGES 2
-#define NUM_WORK_PIPE_STAGES 4
-#define SMEM_A32_OFF 1024
-#define SMEM_A32_STAGE_BYTES 16384
-#define SMEM_A32_STRIDE 53248
-#define SMEM_A1_OFF 17408
-#define SMEM_A1_STAGE_BYTES 8192
-#define SMEM_A1_STRIDE 53248
-#define SMEM_A2_OFF 25600
-#define SMEM_A2_STAGE_BYTES 8192
-#define SMEM_A2_STRIDE 53248
-#define SMEM_A3_OFF 33792
-#define SMEM_A3_STAGE_BYTES 8192
-#define SMEM_A3_STRIDE 53248
-#define SMEM_B1_OFF 41984
-#define SMEM_B1_STAGE_BYTES 4096
-#define SMEM_B1_STRIDE 53248
-#define SMEM_B2_OFF 46080
-#define SMEM_B2_STAGE_BYTES 4096
-#define SMEM_B2_STRIDE 53248
-#define SMEM_B3_OFF 50176
-#define SMEM_B3_STAGE_BYTES 4096
-#define SMEM_B3_STRIDE 53248
-#define SMEM_BOX_OFF 214016
-#define SMEM_BOX_STAGE_BYTES 16384
-#define SMEM_BOX_STRIDE 16384
-#define SMEM_WORK_RESPONSE_OFF 230400
-#define SMEM_WORK_RESPONSE_STAGE_BYTES 16
-#define SMEM_WORK_RESPONSE_STRIDE 16
-#define SMEM_TOTAL 230528
-#define THREADS 448
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {

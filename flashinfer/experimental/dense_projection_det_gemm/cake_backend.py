@@ -55,8 +55,12 @@ registered module (``cake_jit.MODULES`` / ``cake_jit.KERNELS``).  The result
 is bitwise identical to the Cake launcher's on the same device.
 The convenience path runs a batched forward of at most 256 tokens on the
 swapped program instead (the weight rows in the MMA's M, at most two waves of
-single-CTA tiles over the caller's strided views; :func:`swap_ab_template`),
-which takes ``enable_pdl`` per call (:func:`dense_projection_det_gemm`).
+single-CTA tiles over the caller's strided views; :func:`swap_ab_template`).
+Every K1 program launches as a programmatic dependent launch under
+``enable_pdl`` (default: the device supports it, which every architecture the
+package serves does): each CTA lets the next kernel launch at entry, and the
+planner's programs wait for the preceding kernel before their first global
+access (operands, output and workspace), so their prologue overlaps its tail.
 
 K2 -- FP32 router GEMM through split-BF16x3 emulation
 ----------------------------------------------------
@@ -288,6 +292,15 @@ def device_facts(device: Any = None) -> DeviceFacts:
             l2_bytes=int(l2),
         )
     return facts
+
+
+def pdl_enabled(enable_pdl: Optional[bool], device: Any = None) -> bool:
+    """``enable_pdl`` resolved for a launch on ``device``: as given, or, when ``None``, whether the device supports
+    programmatic dependent launch (compute capability 9.0 or newer: every architecture the package serves, so a
+    device :func:`device_facts` resolves an architecture for)."""
+    if enable_pdl is not None:
+        return bool(enable_pdl)
+    return device_facts(device).arch is not None
 
 
 def arch_for(device: Optional[torch.device] = None) -> Optional[str]:
@@ -3982,11 +3995,13 @@ def _k1_values(
     counters: Any,
     ldo: int,
     out_l: int,
+    enable_pdl: Any,
 ) -> dict[str, Any]:
     """The keyword arguments of a K1 launch (:func:`bind_launch` orders them by the module's plan).  ``A`` /
     ``B`` / ``out3`` / ``o_alias`` are the operand views and ``ws`` / ``counters`` the workspace -- or
     :class:`_Slot` markers for a cached launch that rebinds the views on every call and resolves the workspace
-    out of its arena; the plan decides which of the operands the instance dereferences."""
+    out of its arena; the plan decides which of the operands the instance dereferences.  ``enable_pdl`` is the
+    launch's PDL flag (0 or 1), or a :class:`_Slot` a cached launch fills per call."""
     dummy16, dummy32 = _dummy(device, torch.bfloat16), _dummy(device, torch.float32)
     tma_out, out_f32 = plan.tma_out, plan.out_f32
     return dict(
@@ -4019,6 +4034,7 @@ def _k1_values(
         fd_tiles_g=plan.group_m * plan.n_tiles,
         fd_group=plan.group_m,
         fd_last=plan.m_tiles % plan.group_m or plan.group_m,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -4061,10 +4077,13 @@ def prepare_dense_projection_det_gemm(
     stt: Optional[bool] = None,
     pro: Optional[int] = None,
     form: Optional[str] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> PreparedDetGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
-    knobs default to the Cake launcher's choices."""
+    knobs default to the Cake launcher's choices.  ``enable_pdl`` (default: the device supports it) makes every
+    ``launch()`` a programmatic dependent launch: the program waits for the preceding kernel before its first global
+    access and lets the next one launch at its entry."""
     knobs: dict[str, Any] = dict(
         sk=sk,
         block_n=block_n,
@@ -4121,6 +4140,7 @@ def prepare_dense_projection_det_gemm(
         counters=counters,
         ldo=ldo,
         out_l=out_l,
+        enable_pdl=int(pdl_enabled(enable_pdl, device)),
     )
     launch = bind_launch(module_name, values, plan.grid, arch)
     return PreparedDetGemm(
@@ -4237,6 +4257,7 @@ def _prepare_cached_gemm(
         counters=_Slot("counters"),
         ldo=ldo,
         out_l=out_l,
+        enable_pdl=_Slot("enable_pdl"),
     )
     entry, template = _bind(module_name, values, plan.grid, arch)
     # the workspace is a slot: grow the arena only once the module and the grid are known to be good
@@ -4254,11 +4275,13 @@ def _launch_cached_gemm(
     out: torch.Tensor,
     *,
     transposed_out: bool = False,
+    enable_pdl: Optional[bool] = None,
     **knobs: Any,
 ) -> torch.Tensor:
     """The convenience path of K1: plan on the first call for a (device, stream, geometry, knobs) key; rebind
     the caller's views, resolve the workspace out of the arena of the device and stream and launch on every
-    call (no planning, no device query, no allocation)."""
+    call (no planning, no device query, no allocation), as a programmatic dependent launch under ``enable_pdl``
+    (default: the device supports it)."""
     device = _same_cuda_device(A, B, out)
     index = _cuda_index(device)
     stream = _current_raw_stream(index)
@@ -4281,7 +4304,13 @@ def _launch_cached_gemm(
     if operands is None:
         operands = _k1_views(A, B, out, swapped=cached.swapped)
     a_desc, b_desc, O3 = operands
-    views = dict(A=a_desc, B=b_desc, out3=O3, o_alias=flat_alias(O3))
+    views = dict(
+        A=a_desc,
+        B=b_desc,
+        out3=O3,
+        o_alias=flat_alias(O3),
+        enable_pdl=int(pdl_enabled(enable_pdl, index)),
+    )
     views.update(_entry_views(cached))
     arguments = _resolve_arguments(cached.template, views)
     with _ffi_stream_context(index, stream):
@@ -4464,32 +4493,40 @@ def dense_projection_det_gemm(
     out: torch.Tensor,
     *,
     transposed_out: bool = False,
-    enable_pdl: bool = False,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
     """``out[l, m, n] = sum_k A[l, m, k] B[l, k, n]`` for strided views (the cached convenience path:
     planned once per device, stream and view geometry, then rebound and launched).
 
     A batched forward row of few tokens (:func:`swap_small_m`) runs the swapped program (:func:`swap_ab_template`),
-    every other row the planner's program.  ``enable_pdl`` launches the swapped program as a programmatic dependent
-    launch: its weight loads start before the predecessor grid completes and its token loads wait for it, so ``B``
-    must not be written by a kernel still in flight on the stream.  The planner's programs take no PDL wait and
-    always launch without the attribute."""
+    every other row the planner's program.  ``enable_pdl`` (default: the device supports it) launches either as a
+    programmatic dependent launch: every CTA lets the next kernel launch at its entry; the planner's program waits
+    for the preceding kernel before its first global access, the swapped program before its token loads only, its
+    weight loads starting while the preceding kernel finishes, so ``B`` must not be written by a kernel still in
+    flight on the stream (a weight is a parameter of the model).  Pass ``enable_pdl=False`` when it is."""
     swap = _swap_ab_cached(A, B, out, transposed_out)
     if swap is not None:
-        return _run_swap_ab(swap, A, B, out, enable_pdl)
-    return _launch_cached_gemm(A, B, out, transposed_out=transposed_out)
+        return _run_swap_ab(swap, A, B, out, pdl_enabled(enable_pdl, out.device))
+    return _launch_cached_gemm(
+        A, B, out, transposed_out=transposed_out, enable_pdl=enable_pdl
+    )
 
 
 # --- the training operations as thin wrappers (the Cake entry points) ---------------------
 
 
 def projection_det_forward(
-    X: torch.Tensor, W: torch.Tensor, out: Optional[torch.Tensor] = None
+    X: torch.Tensor,
+    W: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default)."""
+    """``out[T, N] = X[T, K] @ W[N, K].T`` (bf16 out by default); ``enable_pdl`` as for
+    :func:`dense_projection_det_gemm`."""
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.bfloat16)
-    return dense_projection_det_gemm(X, W.t(), out)
+    return dense_projection_det_gemm(X, W.t(), out, enable_pdl=enable_pdl)
 
 
 def projection_det_dgrad(
@@ -4498,13 +4535,14 @@ def projection_det_dgrad(
     out: Optional[torch.Tensor] = None,
     *,
     out_dtype=None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[T, K] = G[T, N] @ W[N, K]``."""
+    """``out[T, K] = G[T, N] @ W[N, K]``; ``enable_pdl`` as for :func:`dense_projection_det_gemm`."""
     if out is None:
         out = torch.empty(
             G.shape[0], W.shape[1], device=G.device, dtype=out_dtype or torch.bfloat16
         )
-    return dense_projection_det_gemm(G, W, out)
+    return dense_projection_det_gemm(G, W, out, enable_pdl=enable_pdl)
 
 
 def wgrad_views(
@@ -4569,14 +4607,22 @@ def prepare_projection_det_wgrad(
     *,
     sk: bool | str = "auto",
     cta_rows: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> PreparedDetGemm:
     """Prepared ``out[N, K] = G[T, N].T @ X[T, K]``; the orientation follows the row's measured rule, else the
-    small-``N`` swap rule of the Cake launcher (``wgrad_swapped``)."""
+    small-``N`` swap rule of the Cake launcher (``wgrad_swapped``); ``enable_pdl`` as for
+    :func:`prepare_dense_projection_det_gemm`."""
     A, B, transposed = wgrad_views(
         G, X, arch=arch_for(out.device), out_f32=out.dtype == torch.float32
     )
     return prepare_dense_projection_det_gemm(
-        A, B, out, transposed_out=transposed, sk=sk, cta_rows=cta_rows
+        A,
+        B,
+        out,
+        transposed_out=transposed,
+        sk=sk,
+        cta_rows=cta_rows,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -4588,8 +4634,10 @@ def projection_det_wgrad(
     out_dtype=None,
     sk: bool | str = "auto",
     cta_rows: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
 ) -> torch.Tensor:
-    """``out[N, K] = G[T, N].T @ X[T, K]`` (ragged reduction length ``T``); see :func:`wgrad_views`."""
+    """``out[N, K] = G[T, N].T @ X[T, K]`` (ragged reduction length ``T``); see :func:`wgrad_views`;
+    ``enable_pdl`` as for :func:`dense_projection_det_gemm`."""
     N, K = int(G.shape[1]), int(X.shape[1])
     if out is None:
         out = torch.empty(N, K, device=G.device, dtype=out_dtype or torch.bfloat16)
@@ -4597,7 +4645,13 @@ def projection_det_wgrad(
         G, X, arch=arch_for(out.device), out_f32=out.dtype == torch.float32
     )
     return _launch_cached_gemm(
-        A, B, out, transposed_out=transposed, sk=sk, cta_rows=cta_rows
+        A,
+        B,
+        out,
+        transposed_out=transposed,
+        enable_pdl=enable_pdl,
+        sk=sk,
+        cta_rows=cta_rows,
     )
 
 

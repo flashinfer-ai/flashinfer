@@ -7952,7 +7952,9 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
             counters=dummy,
             ldo=plan.N,
             out_l=plan.M * plan.N,
+            enable_pdl=1,
         )
+        assert values["enable_pdl"] == 1
         assert values["fd_tiles_l"] == plan.m_tiles * plan.n_tiles
         assert values["fd_tiles_g"] == plan.group_m * plan.n_tiles
         assert values["fd_group"] == plan.group_m
@@ -9347,3 +9349,95 @@ def test_swapped_forward_replays_in_a_cuda_graph_with_pdl():
     torch.cuda.synchronize()
     _check(out, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
     _check(out2, torch.einsum("gtd,gdr->gtr", A2.double(), B2.double()))
+
+
+# ---------------------------------------------------------------------------
+# Programmatic dependent launch of the planner's programs
+# ---------------------------------------------------------------------------
+
+
+def test_every_k1_program_takes_enable_pdl_per_call():
+    """Every K1 program (the planner's, the eight-warp form and the swapped forward) takes the per-call PDL flag right
+    before the grid; the router and its split kernel launch without the attribute."""
+    for name, record in cake_jit.MODULES.items():
+        plan = [list(item) for item in cake_jit.arg_plan_of(record)]
+        k1 = record["template"].startswith(("dense_proj_det_gemm_", "swap_ab_"))
+        assert (plan[-4] == ["launch", "enable_pdl"]) == k1, (name, plan[-4])
+        assert sum(kind == "launch" for kind, _ in plan) == int(k1), name
+
+
+def test_enable_pdl_defaults_to_device_support():
+    if not _device_supported():
+        pytest.skip("requires a device with a registered generated instance")
+    device = torch.device("cuda")
+    assert cake_backend.pdl_enabled(None, device) is True
+    assert cake_backend.pdl_enabled(False, device) is False
+    assert cake_backend.pdl_enabled(True, device) is True
+
+
+def _pdl_chain_inputs(T, D1, R1, R2, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(T, D1, device="cuda", generator=g).to(torch.bfloat16)
+    w1 = (torch.randn(R1, D1, device="cuda", generator=g) * D1**-0.5).to(torch.bfloat16)
+    w2 = (torch.randn(R2, R1, device="cuda", generator=g) * R1**-0.5).to(torch.bfloat16)
+    return x, w1, w2
+
+
+@pytest.mark.parametrize("T", [256, 4096])
+def test_planner_pdl_waits_for_an_early_producer(T):
+    """A chain of programmatic dependent launches through the planner's programs: the first projection (K = 16384)
+    triggers its dependent at entry and writes the activation the second reads.  The second starts while the first
+    runs and must still read every row the first wrote, and at 256 rows both run stream-K out of one workspace arena
+    (the slabs and slice counters of the stream), which the second may touch only after the first completes."""
+    if not _device_supported():
+        pytest.skip("requires a device with a registered generated instance")
+    x, w1, w2 = _pdl_chain_inputs(T, 16384, 2048, 1024, SEED + 6)
+    mid = torch.empty(T, 2048, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(T, 1024, device="cuda", dtype=torch.bfloat16)
+    for _ in range(3):
+        mid.fill_(float("nan"))
+        y.fill_(float("nan"))
+        cake_backend.projection_det_forward(x, w1, mid, enable_pdl=True)
+        cake_backend.projection_det_forward(mid, w2, y, enable_pdl=True)
+        torch.cuda.synchronize()
+        _check(mid, x.double() @ w1.double().t())
+        _check(y, mid.double() @ w2.double().t())
+    # the default (the device supports PDL) gives the same bits
+    first = y.clone()
+    cake_backend.projection_det_forward(x, w1, mid)
+    cake_backend.projection_det_forward(mid, w2, y)
+    torch.cuda.synchronize()
+    assert torch.equal(y, first)
+
+
+def test_prepared_pdl_chain_replays_in_a_cuda_graph():
+    """Prepared launches fix ``enable_pdl`` at prepare time: a PDL chain of two prepared projections (the second reading the
+    first's output) captured into a CUDA graph replays on new values written into the bound views."""
+    if not _device_supported():
+        pytest.skip("requires a device with a registered generated instance")
+    T = 512
+    x, w1, w2 = _pdl_chain_inputs(T, 4096, 2048, 1024, SEED + 7)
+    mid = torch.empty(T, 2048, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(T, 1024, device="cuda", dtype=torch.bfloat16)
+    first = cake_backend.prepare_dense_projection_det_gemm(
+        x, w1.t(), mid, enable_pdl=True
+    )
+    second = cake_backend.prepare_dense_projection_det_gemm(
+        mid, w2.t(), y, enable_pdl=True
+    )
+    first()
+    second()
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        first()
+        second()
+    x.copy_(torch.randn(x.shape, device="cuda").to(torch.bfloat16))
+    mid.fill_(float("nan"))
+    y.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _check(mid, x.double() @ w1.double().t())
+    _check(y, mid.double() @ w2.double().t())
