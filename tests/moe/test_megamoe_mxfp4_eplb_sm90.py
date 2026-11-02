@@ -20,6 +20,20 @@ if _REPO_ROOT not in sys.path:
 from tests.moe.test_megamoe_fp4_sm90 import _gather, _reference, _weights  # noqa: E402
 
 RELATIVE_L2_TOLERANCE = 0.015
+# Above this many tokens per rank the fused kernel's combine order is not fixed
+# between runs on identical inputs (the remap kernel hands each CTA its replica
+# ordinals with an atomic add), so a repeat is checked for closeness instead.
+BITWISE_REPEAT_MAX_TOKENS = 128
+
+
+def _assert_repeat_stable(y, first, m, label):
+    """A repeated run must match: bitwise at small ``m``, within tolerance above."""
+    if m <= BITWISE_REPEAT_MAX_TOKENS:
+        assert torch.equal(y, first), label
+        return
+    _assert_close(y, first, label)
+    changed = (y != first).any(dim=-1).float().mean().item()
+    assert changed <= 0.02, (label, f"{changed:.3%} rows differ")
 
 
 def _skewed_routing(m, experts, topk, hot, hot_share, generator):
@@ -245,8 +259,8 @@ def _worker(rank, args):
             expected_stats * 2,
             ("replicated, in-kernel copy of nothing", m),
         )
-        assert torch.equal(y, first), (
-            "in-kernel copy of an empty list changed the output"
+        _assert_repeat_stable(
+            y, first, m, "in-kernel copy of an empty list changed the output"
         )
 
         # (c) Remap-only on changed routing under the same tables.
@@ -296,13 +310,13 @@ def _worker(rank, args):
         slots.remap(m, block_m)
         run(y, stats, True)
         torch.cuda.synchronize()
-        assert torch.equal(y, first), "repeat changed the output"
+        _assert_repeat_stable(y, first, m, "repeat changed the output")
         dist.barrier()
         torch.cuda.synchronize()
         for replay in _run_graph(
             buffer, idx, lambda: slots.remap(m, block_m), lambda: run(y, stats, True)
         ):
-            assert torch.equal(y, first), "CUDA graph replay changed the output"
+            _assert_repeat_stable(y, first, m, "CUDA graph replay changed the output")
             assert torch.equal(stats.long(), expected_stats * (3 + replay))
         if rank == 0:
             print(f"PASS mxfp4 slots ep={ep} S={S} M={m} block_m={block_m}", flush=True)
@@ -668,7 +682,9 @@ def _planner_worker(rank, args):
         assert again[:2] == (slot_expert, copies) and int(slots.copy_count.item()) == 0
         run(y, stats)
         torch.cuda.synchronize()
-        assert torch.equal(y, first), "replanning the same routing changed the output"
+        _assert_repeat_stable(
+            y, first, m, "replanning the same routing changed the output"
+        )
 
         # Cold plan: every slot forgotten, so every assigned slot is listed and
         # the kernel refills all of them before their tasks. The split may
@@ -720,7 +736,9 @@ def _planner_worker(rank, args):
             buffer, idx, lambda: slots.plan_and_remap(m, block_m), lambda: run(y, stats)
         ):
             stats_expected += steady_expected
-            assert torch.equal(y, steady_y), "CUDA graph replay changed the output"
+            _assert_repeat_stable(
+                y, steady_y, m, "CUDA graph replay changed the output"
+            )
             assert torch.equal(stats.long(), stats_expected), ("replay", m)
             assert int(slots.plan_generation.item()) == generation + 1 + replay
             assert tables()[:2] == steady
@@ -747,6 +765,22 @@ def test_mxfp4_in_kernel_planner(ep):
 # ---------------------------------------------------------------------------
 # CPU-only checks
 # ---------------------------------------------------------------------------
+
+
+def test_slot_arena_keeps_the_fixed_block_size():
+    """The token block is sized by the routed experts, not the slot arena."""
+    from flashinfer.megamoe import select_mxfp4_fused_plan
+
+    for m in (8, 16, 32, 64, 128, 1024):
+        fixed = select_mxfp4_fused_plan(132, 8, 256, 6, 7168, 2048, 8448, m)
+        slots = select_mxfp4_fused_plan(
+            132, 8, 288, 6, 7168, 2048, 8448, m, num_logical_experts=256
+        )
+        assert slots.block_m == fixed.block_m, m
+    with pytest.raises(ValueError):
+        select_mxfp4_fused_plan(
+            132, 8, 288, 6, 7168, 2048, 8448, 32, num_logical_experts=512
+        )
 
 
 def test_mxfp4_jit_cache_distinguishes_in_kernel_copy():

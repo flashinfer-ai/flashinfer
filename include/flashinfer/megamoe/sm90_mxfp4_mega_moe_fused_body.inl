@@ -723,7 +723,13 @@ if (warp_idx < kNumDispatchWarps) {
       [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); }, true, false);
   if (thread_idx == 0) stamp_max(8);
   // In-kernel weight copy: the copy list is consumed. Every CTA of every rank
-  // has passed the barrier above, so none can still be reading it.
+  // has passed the barrier above, so none can still be reading it: the copier
+  // reads `copy_count` before its first copy, and the weight-loader warp reads
+  // it once, before its first bulk copy, so on every CTA with a GEMM task that
+  // read precedes the epilogue's last stage, the dispatch-epilogue barrier and
+  // this CTA's arrival at the grid barrier; a CTA without a task never waits on
+  // a slot. The slot readiness itself is published through `copy_done`, which
+  // the planner resets per listed slot, not through this counter.
   if constexpr (kInKernelWeightCopy) {
     if (sm_idx == 0 and thread_idx == 0) *in_kernel_copy.copy_count = 0;
   }

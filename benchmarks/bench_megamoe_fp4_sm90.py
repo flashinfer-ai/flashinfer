@@ -310,6 +310,7 @@ def _worker(rank, args):
                         ih,
                         args.capacity,
                         m,
+                        num_logical_experts=slots.num_experts,
                     )
                     slot_module = gen_megamoe_sm90_mxfp4_module(
                         slot_plan,

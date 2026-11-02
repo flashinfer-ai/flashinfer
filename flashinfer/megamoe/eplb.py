@@ -373,6 +373,7 @@ class MegaMoEExpertSlots:
             b.intermediate_hidden,
             b.num_max_tokens_per_rank,
             num_tokens,
+            num_logical_experts=self.num_experts,
         ).block_m
 
     def remap(self, num_tokens: int, block_m: Optional[int] = None) -> None:

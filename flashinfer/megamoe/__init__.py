@@ -645,6 +645,7 @@ def mxfp4_mega_moe(
         b.intermediate_hidden,
         b.num_max_tokens_per_rank,
         m,
+        num_logical_experts=None if expert_slots is None else expert_slots.num_experts,
     )
     entry = "megamoe_sm90_mxfp4_fused"
     extra_jit_args: Tuple[Any, ...] = ()
