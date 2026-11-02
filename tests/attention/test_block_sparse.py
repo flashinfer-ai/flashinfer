@@ -133,6 +133,10 @@ def _run_block_sparse_attention_case(
         pytest.skip("BSR test dimensions require M % R == 0 and N % C == 0")
 
     if backend == "vsa_blackwell":
+        try:
+            import quack  # noqa: F401
+        except ImportError as e:
+            pytest.skip(f"vsa_blackwell requires an importable quack package: {e}")
         if get_compute_capability(torch.device(0)) == (10, 7):
             pytest.skip("vsa_blackwell supports SM100 and SM103, not SM107")
         if not is_sm100a_supported(torch.device(0)):
