@@ -1,4 +1,4 @@
-# Cake chunked LM-head + loss training backend (SM100 / SM103)
+# Cake chunked LM-head + loss training backend (SM100 / SM103 / SM107)
 
 Experimental backend for the chunked large-vocabulary LM-head projection with
 a fused log-sum-exp / cross-entropy / policy-gradient loss and a
@@ -7,8 +7,9 @@ memory-bounded backward (GLM-5.2 geometry: hidden size 6144, vocabulary
 chunk 4096).  Tracking issue: flashinfer-ai/flashinfer#5680.
 
 Both the API and the backend are experimental: no compatibility guarantee,
-SM100 (B200 / GB200) is the acceptance architecture and SM103 (B300 / GB300)
-is compiled from the same sources.  The feature does not participate in
+SM100 (B200 / GB200) is the acceptance architecture; SM103 (B300 / GB300) and
+SM107 (R200) are compiled from the same sources (SM107 runs SM103's programs,
+built for `sm_107a`, under the base dispatch rules).  The feature does not participate in
 automatic backend selection, autotuning or trace-apply.  Its libraries are
 loaded prebuilt from `aot/` when the package ships them and JIT-built by
 FlashInfer from `build.json` otherwise (see "Layout of this package").
@@ -835,24 +836,28 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
 
 ## Status
 
-The registry holds one record per architecture (`sm_100a`, `sm_103a`),
-`cake_lm_head_det_loss_<arch>`, geometry-free (`H` / `V` and the rules' outputs are
-launch scalars: every `H` a multiple of 512 and `V` a multiple of 256 runs on
-it), with the sixteen base stages above plus the sixteen structural forms the
-rules can reach (`abi = lm_head_loss_v1`), the four temperature forms of the
-log-probability entry and the fourteen candidate-support
-programs (`cake_support.SUPPORT_STAGES`: the validation stage per index width,
-the two row stages, the gather and scatter of the dense form, the support
-logits gather GEMM and the segment gather-accumulate dX / dW / combine kernels
-in their BF16 and FP32-accumulate modes), exported from the kernel snapshot
-named in the pull request.  `tests/experimental/test_cake_lm_head_det_support.py`
-tests the candidate-support entries (host rules and the reference backend on
-any device, the cake backend on a registered device).
+The registry holds one record per architecture (`sm_100a`, `sm_103a`,
+`sm_107a`), `cake_lm_head_det_loss_<arch>`, geometry-free (`H` / `V` and the rules'
+outputs are launch scalars: every `H` a multiple of 512 and `V` a multiple of
+256 runs on it), with the sixteen base stages above plus the sixteen structural
+forms the rules can reach on `sm_100a` and `sm_103a` (`abi = lm_head_loss_v1`),
+the four temperature forms of the log-probability entry and the fourteen
+candidate-support programs (`cake_support.SUPPORT_STAGES`: the validation stage
+per index width, the two row stages, the gather and scatter of the dense form,
+the support logits gather GEMM and the segment gather-accumulate dX / dW /
+combine kernels in their BF16 and FP32-accumulate modes), exported from the
+kernel snapshot named in the pull request.  The `sm_107a` record registers
+every stage of the `sm_103a` record; no structural-form rule table lists
+`sm_107a`, so its rules reach five of the sixteen forms (the device-count
+logits forms and the K-sliced and 256-wide dX tiles).
+`tests/experimental/test_cake_lm_head_det_support.py` tests the candidate-support
+entries (host rules and the reference backend on any device, the cake backend
+on a registered device).
 
 Tests: `tests/experimental/test_cake_lm_head_det_loss.py` and the public-API suite
 `tests/experimental/test_cake_lm_head_det_loss_api.py` (the host-layer tests
 run on any device through the reference path; the device tests skip without a
-registered program or a compute capability 10.0 / 10.3 device), and the
+registered program or a compute capability 10.0 / 10.3 / 10.7 device), and the
 CPU-only `tests/experimental/test_cake_lm_head_det_loss_standalone.py` (a copy of
 the package imports with `flashinfer` blocked and raises its host-side errors;
 `scripts/check_cake_build_manifests.py --vendored-gate` builds and loads the
@@ -865,7 +870,8 @@ the loader refuses an older toolkit: `cake_build.jit_spec` raises and the JIT
 spec lists leave the entry out.  CUDA 12.8's ptxas cannot build the 256-bit
 global loads and stores (`ld.global.v8.b32` / `st.global.v8.b32`) of eight
 `sm_100a` programs, the logits GEMM among them ("Illegal vector size: 8");
-`sm_103a` needs 12.9 by its architecture floor.
+`sm_103a` needs 12.9 and `sm_107a` 13.4 by their architecture floors (every
+`sm_107a` entry has `min_cuda` 13.4).
 
 The `sm_100a` 2-CTA GEMM producer loops (logits, dX and dW) have two orders,
 and the toolkit that compiles them selects one.  Built by nvcc 12.9 or 13.0,
