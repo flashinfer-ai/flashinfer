@@ -120,6 +120,13 @@ context-parallel-only programs (`kcp_*`); the kernel symbol of a library is
   bitwise.  Gradient accumulation (`.backward()` twice) accumulates.
 * No cooperative launch anywhere in the package; every program is a plain
   stream-ordered launch.
+* On `sm_100a` and `sm_103a`, with a zigzag or zigzag-per-document partition
+  of at most 8 ranks, the summaries' offset walk runs on a side stream beside
+  the transfer walk (fork / join with CUDA events; the same launches,
+  arguments and bitwise the same outputs).  `sm_107a` keeps one stream: on a
+  212-SM R200 the CP4 zigzag rows ran 1.2-2.5 % slower paired, and there is
+  no 216-SM measurement.  The private lever `test_knobs={"walk_pair": 0}` (or
+  `1`) forces one stream (or the pair on a zigzag partition).
 
 ### Partition and context
 
