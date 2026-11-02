@@ -27,6 +27,7 @@ source "${SCRIPT_DIR}/jit_cache_build_common.sh"
 
 run_uncached() {
     unset FLASHINFER_CXX_LAUNCHER FLASHINFER_NVCC_LAUNCHER
+    unset FLASHINFER_SCCACHE_ACTIVE FLASHINFER_SCCACHE_STATS_COLLECTED
     exec "$@"
 }
 
