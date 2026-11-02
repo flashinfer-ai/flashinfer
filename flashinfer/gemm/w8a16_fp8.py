@@ -22,6 +22,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import w8a16_fp8_gemm_trace_dispatch
 from ..utils import (
+    BackendSupportedError,
     backend_requirement,
     get_compute_capability,
     register_custom_op,
@@ -82,15 +83,22 @@ def _check_disjoint(
         )
 
 
+# The one definition of the supported devices: the call's @backend_requirement
+# (and ``is_compute_capability_supported``) and the workspace query both use it.
+_SUPPORTED_CCS = (90, 100, 103)
+
+
 def _check_arch(device: torch.device) -> None:
-    major = get_compute_capability(device)[0]
-    if major not in (9, 10):
-        raise RuntimeError(
-            f"w8a16_fp8_gemm needs Hopper (sm_90a) or Blackwell (sm_100a), got SM {major}x"
+    major, minor = get_compute_capability(device)
+    cc = major * 10 + minor
+    if cc not in _SUPPORTED_CCS:
+        raise BackendSupportedError(
+            f"w8a16_fp8_gemm does not support compute capability {cc}; supported "
+            f"compute capabilities: {list(_SUPPORTED_CCS)}"
         )
 
 
-@register_custom_op("flashinfer::w8a16_fp8_gemm", mutates_args=("out",))
+@register_custom_op("flashinfer::w8a16_fp8_gemm", mutates_args=("out", "workspace"))
 def _w8a16_fp8_gemm_impl(
     out: torch.Tensor,
     act: torch.Tensor,
@@ -156,8 +164,9 @@ def w8a16_fp8_gemm_workspace_bytes(
         does, so query with the arguments you will call with; a caller serving
         several shapes from one buffer takes the maximum over them.
     act_dtype: torch.dtype
-        The activation dtype the call will use.  The size is the same for
-        fp16 and bf16; the argument is accepted for callers that pass it.
+        The activation dtype the call will use, ``float16`` or ``bfloat16``
+        (anything else is rejected as the call would).  The size is the same
+        for both.
 
     Returns
     -------
@@ -169,14 +178,17 @@ def w8a16_fp8_gemm_workspace_bytes(
     Raises
     ------
     ValueError
-        A shape outside the bounds above, an unknown ``algo``, or a non-CUDA
-        device.
-    RuntimeError
-        A device that is not Hopper or Blackwell.
-    ValueError
-        A split-K ``algo`` on a ``k`` that cannot be sliced (for ``m > 0``).
+        A shape outside the bounds above, an unknown ``algo``, an ``act_dtype``
+        other than fp16 / bf16, a non-CUDA device, or a split-K ``algo`` on a
+        ``k`` that cannot be sliced (for ``m > 0``).
+    BackendSupportedError
+        A device the kernels do not support (anything but compute capability
+        9.0, 10.0 or 10.3), as the call raises.
     """
+    if act_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(f"act_dtype must be float16 or bfloat16, got {act_dtype}")
     device = _resolve_device(device)
+    _check_arch(device)
     _check_dims(m, n, k)
     algo_code = _algo_code(algo, device)
     if m == 0:
@@ -261,7 +273,7 @@ def _algo_code(algo: Optional[str], device: torch.device) -> int:
         raise ValueError(f"unknown algo {algo!r}; one of {sorted(table)}") from None
 
 
-@supported_compute_capability([90, 100, 103])
+@supported_compute_capability(_SUPPORTED_CCS)
 def _w8a16_fp8_gemm_check(
     act: torch.Tensor,
     weight: torch.Tensor,
@@ -338,21 +350,30 @@ def w8a16_fp8_gemm(
         running on another stream would be reading what the next call
         overwrites.
     algo: Optional[str]
-        Pins one kernel variant instead of the launcher's choice: a key of
-        ``W8A16_FP8_GEMM_ALGOS_SM100`` on Blackwell or of
+        Selects a tile or a split policy instead of the launcher's choice: a
+        key of ``W8A16_FP8_GEMM_ALGOS_SM100`` on Blackwell or of
         ``W8A16_FP8_GEMM_ALGOS_SM90`` on Hopper
         (``<weight rows>x<activation rows>[_streamk|_splitk]``).
         ``None`` / ``"auto"`` = the launcher decides.  This is the only
-        override; there are no environment variables.  A ``_splitk`` variant
-        is rejected with a ValueError on a ``K`` it cannot slice (Hopper:
-        ``K`` a multiple of 64 whose 64-deep tile count divides into 2..8
-        equal slices of at least 8 tiles; Blackwell: ``K`` a multiple of 128
-        whose 128-deep tile count has a divisor in 2..8).  On Hopper the
-        split-K variants reduce their slices inside the kernel, which needs
-        all slices of the grid resident at once: forced on a grid of more
-        tiles than that allows, they run the tile plain (no workspace).  The
-        ``_streamk`` names select the best of the other variants for the
-        problem (there is no stream-K kernel).
+        override; there are no environment variables.  A plain name runs
+        every output tile whole on that tile shape.  A ``_splitk`` name cuts
+        the tiles into K-slices with fp32 partials in the workspace; it is
+        rejected with a ValueError on a ``K`` it cannot slice (Hopper: ``K``
+        a multiple of 64 whose 64-deep tile count divides into 2..8 equal
+        slices of at least 8 tiles; Blackwell: ``K`` a multiple of 128 whose
+        128-deep tile count has a divisor in 2..8), and falls back to the
+        plain tile (no workspace) where the split cannot run: on Hopper the
+        slices of a tile reduce it among themselves and must all be resident,
+        so a grid of more tiles than that allows runs plain; on Blackwell the
+        slices' partials are stacked as one output of ``splits x M`` rows,
+        which must stay below ``2**31``.  A ``_streamk`` name is a policy on
+        the named tile, not a stream-K kernel: on Hopper it runs the whole
+        waves of that tile plain and cuts only the last partial wave into
+        K-slices over the idle SMs (plain when the tail is at least half a
+        wave or ``K`` too short); on Blackwell it picks, by a wave-fill cost
+        model, between the plain 2SM tiles and a split-K run of the 256x128
+        tile.  :func:`w8a16_fp8_gemm_workspace_bytes` reports what the
+        resolved policy needs.
 
     Notes
     -----
@@ -403,9 +424,11 @@ def w8a16_fp8_gemm(
         Any argument outside the contract above (dtype, shape, device,
         contiguity, alignment, aliasing, an unknown ``algo``, a ``workspace``
         shorter than the query's answer), before anything is launched.
+    BackendSupportedError
+        A device the kernels do not support (anything but compute capability
+        9.0, 10.0 or 10.3).
     RuntimeError
-        A device that is not Hopper or Blackwell, or a launch failure reported
-        by the CUDA runtime.
+        A launch failure reported by the CUDA runtime.
     """
     if act.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"act must be float16 or bfloat16, got {act.dtype}")
@@ -413,12 +436,17 @@ def w8a16_fp8_gemm(
         raise ValueError(f"weight must be float8_e4m3fn, got {weight.dtype}")
     if weight.dim() != 2:
         raise ValueError(f"weight must be 2D [N, K], got shape {tuple(weight.shape)}")
+    if act.dim() == 0:
+        raise ValueError("act must have at least one dimension (..., K)")
     k = act.shape[-1]
     n = weight.shape[0]
     if weight.shape[1] != k:
         raise ValueError(f"K mismatch: act[..., {k}] vs weight[{n}, {weight.shape[1]}]")
-    if weight_scale.numel() != 1:
-        raise ValueError("weight_scale is one per-tensor value")
+    if tuple(weight_scale.shape) not in ((), (1,)):
+        raise ValueError(
+            f"weight_scale is one per-tensor value of shape () or (1,), got shape "
+            f"{tuple(weight_scale.shape)}"
+        )
     lead_shape = act.shape[:-1]
     m = act.numel() // k if k else 0
     _check_dims(m, n, k)

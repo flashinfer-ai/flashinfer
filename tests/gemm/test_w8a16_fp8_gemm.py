@@ -415,6 +415,15 @@ def test_w8a16_fp8_gemm_rejects_bad_inputs():
     for bad in (scale.half(), scale.to(torch.bfloat16), scale.double()):
         with pytest.raises(ValueError, match="weight_scale must be float32"):
             w8a16_fp8_gemm(act, w_fp8, bad)
+    # The scale is shape () or (1,), as documented and traced; one element in any
+    # other shape is rejected, as is a 0-d activation.
+    for bad in (scale.reshape(1, 1), scale.reshape(1, 1, 1)):
+        with pytest.raises(ValueError, match="weight_scale is one per-tensor value"):
+            w8a16_fp8_gemm(act, w_fp8, bad)
+    with pytest.raises(ValueError, match="at least one dimension"):
+        w8a16_fp8_gemm(act[0, 0], w_fp8, scale)
+    with pytest.raises(ValueError, match="act_dtype must be float16 or bfloat16"):
+        w8a16_fp8_gemm_workspace_bytes(4, 32, 64, dev, act_dtype=torch.float32)
     assert torch.equal(
         w8a16_fp8_gemm(act, w_fp8, scale.half().float()),
         w8a16_fp8_gemm(act, w_fp8, scale.half().float().reshape(())),

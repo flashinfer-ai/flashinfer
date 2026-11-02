@@ -26,20 +26,49 @@ replaced and validated against it shape by shape.
 
 import functools
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, NamedTuple, Optional, Tuple
 
 import torch
 
 from ..utils import get_compute_capability, get_device_sm_count
 
-# Blackwell tile configurations by algo code: (weight rows, activation
-# rows, k) per MMA tile, 2SM MMA, cluster, transformed A kept in smem.
-_SM100_TILES: Dict[int, Tuple[Tuple[int, int, int], bool, Tuple[int, int], bool]] = {
-    1: ((256, 128, 128), True, (2, 1), False),  # 2sm256x128
-    2: ((128, 128, 128), False, (1, 1), False),  # 1sm128x128
-    3: ((256, 256, 64), True, (2, 1), True),  # 2sm256x256, A in smem
-    4: ((256, 192, 128), True, (2, 1), False),  # 2sm256x192
-    7: ((256, 160, 128), True, (2, 1), False),  # 2sm256x160
+
+class _Sm100Tile(NamedTuple):
+    """A Blackwell kernel variant."""
+
+    mma_tiler: Tuple[int, int, int]  # (weight rows, activation rows, k) per MMA tile
+    two_sm: bool  # 2SM MMA
+    cluster: Tuple[int, int]
+    a_in_smem: bool  # transformed weight kept in smem
+
+
+class _Sm100Plan(NamedTuple):
+    """How a Blackwell call runs: the cached decision of :func:`_sm100_plan`."""
+
+    algo: int  # a key of _SM100_TILES (the variant actually launched)
+    splits: int  # K-slices (1 = plain; > 1 = partials + reduce)
+    swizzle_size: int
+    raster_along_m: bool
+    max_active_clusters: int  # persistent grid size, in clusters
+
+
+class _Sm90Plan(NamedTuple):
+    """How a Hopper call runs: the cached decision of :func:`_sm90_plan`."""
+
+    tile_algo: int  # a key of _SM90_TILES (the tile actually launched)
+    body_items: int  # tiles run whole; the tiles after them are the split tail
+    tail_splits: int  # K-slices of each tail tile (1 = no tail)
+    tail_tiles: int  # 0 = no tail, no workspace
+    group: int  # activation tiles per L2 group (1 = ungrouped)
+
+
+# Blackwell tile configurations by algo code.
+_SM100_TILES: Dict[int, _Sm100Tile] = {
+    1: _Sm100Tile((256, 128, 128), True, (2, 1), False),  # 2sm256x128
+    2: _Sm100Tile((128, 128, 128), False, (1, 1), False),  # 1sm128x128
+    3: _Sm100Tile((256, 256, 64), True, (2, 1), True),  # 2sm256x256, A in smem
+    4: _Sm100Tile((256, 192, 128), True, (2, 1), False),  # 2sm256x192
+    7: _Sm100Tile((256, 160, 128), True, (2, 1), False),  # 2sm256x160
 }
 _SM100_SPLITK = 5
 _SM100_STREAMK = 6
@@ -406,7 +435,7 @@ def _max_active_clusters(device_index: int, cluster_size: int) -> int:
         )
 
 
-def _sm100_plan(algo: int, m: int, n: int, k: int, device: torch.device) -> Tuple:
+def _sm100_plan(algo: int, m: int, n: int, k: int, device: torch.device) -> _Sm100Plan:
     """(algo, splits, swizzle, raster_along_m, max active clusters) of a Blackwell
     call.  A pure function of the shape and the device, cached: the cost model is
     most of the host cost of a call otherwise."""
@@ -436,13 +465,13 @@ def _sm100_plan(algo: int, m: int, n: int, k: int, device: torch.device) -> Tupl
         # and derives its row coordinates in 32-bit arithmetic: a stacked extent
         # past that runs the 256x128 tile plain (no workspace), as the query reports.
         splits = 1
-    mma_tiler, two_sm, cluster, _ = _SM100_TILES[algo]
-    plan = (
+    tile = _SM100_TILES[algo]
+    plan = _Sm100Plan(
         algo,
         splits,
         sm100_pick_swizzle(m, n, k),
-        sm100_raster_along_m(m, n, mma_tiler, two_sm),
-        _max_active_clusters(device_index, cluster[0] * cluster[1]),
+        sm100_raster_along_m(m, n, tile.mma_tiler, tile.two_sm),
+        _max_active_clusters(device_index, tile.cluster[0] * tile.cluster[1]),
     )
     _PLAN_CACHE[key] = plan
     return plan
@@ -458,14 +487,14 @@ def w8a16_fp8_gemm_workspace_bytes(
     the device's SM count; ``algo`` as :func:`launch_w8a16_fp8_gemm`."""
     num_sms = get_device_sm_count(device)
     if get_compute_capability(device)[0] == 9:
-        tile_algo, _body_items, tail_splits, tail_tiles, _group = _sm90_plan(
-            algo, m, n, k, num_sms
-        )
-        tile_w, tile_a = _SM90_TILES[tile_algo]
-        if tail_tiles == 0:
+        plan = _sm90_plan(algo, m, n, k, num_sms)
+        tile_w, tile_a = _SM90_TILES[plan.tile_algo]
+        if plan.tail_tiles == 0:
             return 0
-        return _sm90_workspace_layout(tail_tiles, tail_splits, tile_a, tile_w)[2]
-    _algo, splits, _swizzle, _raster, _clusters = _sm100_plan(algo, m, n, k, device)
+        return _sm90_workspace_layout(
+            plan.tail_tiles, plan.tail_splits, tile_a, tile_w
+        )[2]
+    splits = _sm100_plan(algo, m, n, k, device).splits
     return splits * m * n * 4 if splits > 1 else 0
 
 
@@ -597,8 +626,9 @@ _SM90_TILES: Dict[int, Tuple[int, int]] = {
     6: (64, 256),
     9: (64, 128),
 }
-# Stream-K codes run the plain tile (CUTLASS's stream-K scheduler is not ported);
-# split-K codes run the tile over K-slices.
+# The policy codes map to the tile they run.  Stream-K codes run the whole waves of
+# that tile plain and cut only the last partial wave into K-slices (sm90_tail_plan;
+# CUTLASS's stream-K scheduler itself is not ported); split-K codes cut every tile.
 _SM90_STREAMK_TILE: Dict[int, int] = {7: 2, 8: 3}
 _SM90_SPLITK_TILE: Dict[int, int] = {10: 5, 11: 2, 12: 9}
 _SM90_TILE_K = 64
@@ -878,7 +908,7 @@ def sm90_tail_plan(
     return tile_algo, full * num_sms, best_s
 
 
-def _sm90_plan(algo: int, m: int, n: int, k: int, num_sms: int) -> Tuple:
+def _sm90_plan(algo: int, m: int, n: int, k: int, num_sms: int) -> _Sm90Plan:
     """(tile algo, body items, tail splits, tail tiles, L2 group) of a Hopper call:
     the variant choice and the tail plan, pure functions of the shape, cached."""
     key = ("sm90", algo, m, n, k, num_sms)
@@ -902,7 +932,7 @@ def _sm90_plan(algo: int, m: int, n: int, k: int, num_sms: int) -> Tuple:
     tail_tiles = tiles - body_items
     if tail_splits < 2 or tail_tiles * tail_splits > num_sms:
         body_items, tail_splits, tail_tiles = tiles, 1, 0
-    plan = (
+    plan = _Sm90Plan(
         tile_algo,
         body_items,
         tail_splits,
