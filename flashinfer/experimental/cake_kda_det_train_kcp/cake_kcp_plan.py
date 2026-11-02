@@ -3234,6 +3234,39 @@ def _qk_l2norm_problem(
     return None if why is None else f"the single-rank registry ({where}): {why}"
 
 
+# A passed capability check per (mode, gate, arch), with the objects it read (:func:`_qk_l2norm_inputs`): every
+# flag-on entry, workspace and byte query runs the check, and its full grid made a call with a per-call default
+# workspace (``workspace=None``) host-bound.  A replaced input (a test's monkeypatch) is another object, so the
+# check runs again; a refusal is never kept.
+_QK_L2NORM_SERVED: dict[tuple[str, str, str | None], tuple[Any, ...]] = {}
+
+
+def _qk_l2norm_inputs() -> tuple[Any, ...]:
+    """The objects :func:`qk_l2norm_missing` reads: the existing backend's entry point, plan, layout table, registry
+    and libraries query, and this module's stages, grid, SM counts, layouts, slots and helpers."""
+    from ..cake_kda_det_train import cake_backend, cake_build, cake_jit
+
+    return (
+        cake_backend.chunk_kda_det_fwd,
+        cake_backend.plan,
+        cake_backend.lifetime_table,
+        cake_jit.select_record,
+        cake_jit.library_name,
+        cake_jit.MODULES,
+        getattr(cake_jit, "L2N_MODES", None),
+        cake_jit.ARCHES,
+        cake_build.libraries_by_name,
+        QK_L2NORM_STAGES,
+        QK_L2NORM_GRID,
+        QK_L2NORM_SMS,
+        QK_L2NORM_SMS_ANY,
+        QK_L2NORM_LAYOUTS,
+        QK_L2NORM_SLOTS,
+        _qk_l2norm_problem,
+        _qk_l2norm_readers,
+    )
+
+
 def qk_l2norm_missing(
     mode: str = QK_L2NORM_FORM_DEFAULT, gate: str = "g", arch: str | None = None
 ) -> str | None:
@@ -3245,7 +3278,23 @@ def qk_l2norm_missing(
     do not take ``use_qk_l2norm_in_kernel``; its plan, layout table or record selection has no such mode (or gate
     mode); a stage of :data:`QK_L2NORM_STAGES` selects no record for a problem of the grid, or one not delivered or
     not exported for the architecture; the selected readers do not give the route's order (:func:`_qk_l2norm_readers`);
-    or a layout of :data:`QK_L2NORM_LAYOUTS` lacks the :data:`QK_L2NORM_SLOTS` views."""
+    or a layout of :data:`QK_L2NORM_LAYOUTS` lacks the :data:`QK_L2NORM_SLOTS` views.  A passed
+    check is kept while the objects it read are the same objects."""
+    if mode == "off":
+        return None
+    key = (mode, gate, arch)
+    inputs = _qk_l2norm_inputs()
+    kept = _QK_L2NORM_SERVED.get(key)
+    if kept is not None and all(a is b for a, b in zip(kept, inputs, strict=True)):
+        return None
+    why = _qk_l2norm_missing(mode, gate, arch)
+    if why is None:
+        _QK_L2NORM_SERVED[key] = inputs
+    return why
+
+
+def _qk_l2norm_missing(mode: str, gate: str, arch: str | None) -> str | None:
+    """The uncached check of :func:`qk_l2norm_missing`."""
     if mode == "off":
         return None
     from ..cake_kda_det_train import cake_backend, cake_build, cake_jit

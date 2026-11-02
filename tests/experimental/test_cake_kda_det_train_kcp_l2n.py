@@ -1314,7 +1314,8 @@ def test_l2n_capability_check() -> None:
     one only above or at most 256 documents, or on one architecture --, selects a record not delivered or not
     exported for the architecture, the fused form's readers do not give exactly one normalizing first reader on
     each path (the fallback form's none), or a layout of the route lacks the ``qn_int`` / ``kn_int`` views (named
-    in the reason); ``None`` once all hold.  The signature reads are cached per callable."""
+    in the reason); ``None`` once all hold.  The signature reads are cached per callable (a passed check is kept:
+    :func:`test_l2n_capability_check_is_kept`)."""
     assert list(inspect.signature(cake_kcp_plan.qk_l2norm_missing).parameters) == [
         "mode",
         "gate",
@@ -1462,7 +1463,7 @@ def test_l2n_capability_check() -> None:
                 _fake_registry(m)
                 assert cake_kcp_plan.qk_l2norm_missing(form, gate) is None
                 hits = cake_kcp_plan._takes.cache_info().hits
-                assert cake_kcp_plan.qk_l2norm_missing(form, gate) is None
+                assert cake_kcp_plan._qk_l2norm_missing(form, gate, None) is None
                 assert cake_kcp_plan._takes.cache_info().hits > hits
 
                 def plain(S, N, H, sm, arch=None, *, gate="g"):
@@ -1485,6 +1486,47 @@ def test_l2n_capability_check() -> None:
         with pytest.raises(NotImplementedError) as info:
             cake_kcp_plan.require_qk_l2norm("fused")
         assert str(info.value) == f"{cake_kcp_plan.QK_L2NORM_PENDING} (why)"
+
+
+def test_l2n_capability_check_is_kept() -> None:
+    """A passed :func:`cake_kcp_plan.qk_l2norm_missing` is kept per (form, gate, arch) with the objects it read: the
+    same call again selects nothing; another architecture or a replaced input (a constant of the grid, the layout
+    table) is checked again; a refusal is never kept.  Every flag-on entry and workspace runs the check, and with a
+    per-call default workspace (``workspace=None``) the full grid ran on every call."""
+    for form in ("fused", "fallback"):
+        for gate in ("g", "raw"):
+            with pytest.MonkeyPatch.context() as m:
+                _fake_registry(m)
+                select = cake_jit.select_record
+                calls: list = []
+
+                def counting(*a, **k):
+                    calls.append(a[0])
+                    return select(*a, **k)
+
+                m.setattr(cake_jit, "select_record", functools.wraps(select)(counting))
+                assert cake_kcp_plan.qk_l2norm_missing(form, gate) is None
+                n = len(calls)
+                assert n > 0
+                assert cake_kcp_plan.qk_l2norm_missing(form, gate) is None
+                assert len(calls) == n, (form, gate)
+                assert cake_kcp_plan.qk_l2norm_missing(form, gate, "sm_100a") is None
+                assert len(calls) > n
+                n = len(calls)
+                grid = tuple(list(cake_kcp_plan.QK_L2NORM_GRID))
+                m.setattr(cake_kcp_plan, "QK_L2NORM_GRID", grid)
+                assert cake_kcp_plan.qk_l2norm_missing(form, gate) is None
+                assert len(calls) > n
+
+                def no_views(layout, *, gate="g", l2n="off"):
+                    return []
+
+                m.setattr(cake_backend, "lifetime_table", no_views)
+                why = cake_kcp_plan.qk_l2norm_missing(form, gate)
+                assert why is not None and "views" in why, why
+                n = len(calls)
+                assert cake_kcp_plan.qk_l2norm_missing(form, gate) == why
+                assert len(calls) > n
 
 
 def test_l2n_stage_values_merge() -> None:
