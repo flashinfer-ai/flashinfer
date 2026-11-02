@@ -152,7 +152,10 @@ void CutlassGroupGemmNVFP4GroupwiseScaledSM120(TensorView int_workspace_buffer,
                       static_cast<cutlass_t_out*>(D.data_ptr()),
                       alpha.numel() == 0 ? nullptr : static_cast<float*>(alpha.data_ptr()),
                       static_cast<int*>(m_indptr.data_ptr()), n, k, num_groups, stream, device_id);
-                  return status == cudaSuccess;
+                  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
+                      << "Failed to run cutlass nvfp4 group gemm groupwise scaled sm120: "
+                      << cudaGetErrorString(status);
+                  return true;
                 } else {
                   TVM_FFI_ICHECK(false) << "Unsupported input data type";
                   return false;
