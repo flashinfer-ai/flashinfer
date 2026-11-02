@@ -117,8 +117,8 @@ feature                                         sm_100a         sm_103a         
 ``wgrad`` 256-wide k tile, ordered tail reduce  yes             yes             yes
 ``wgrad`` 512-wide k tile, unordered split tail yes             yes             yes
 ``wgrad`` 512 wave-synchronised builds          yes             yes             --
-``wgrad`` 512 half-release builds               planned walk    planned walk    yes
-``wgrad`` 512 k256-tail twin                    --              --              yes
+``wgrad`` 512 half-release builds               planned walk    planned walk    planned, slack
+``wgrad`` 512 k256-tail twin                    --              --              slack tail
 ``wgrad`` output dtypes                         bf16, fp32      bf16, fp32      bf16, fp32
 CUDA toolkit floor                              12.8            12.9            13.4
 =============================================== =============== =============== ===============
