@@ -63,7 +63,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(448) void
-kernel_cake_kimi_k3_tp12_tail_892885d9a24abe9f000e(__nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ shared, __nv_bfloat16* y, __nv_bfloat16* __restrict__ gamma, __nv_bfloat16* __restrict__ w_slice, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ mcast_ptr, __nv_bfloat16* __restrict__ local_unicast_ptr, unsigned int* __restrict__ buffer_flags, long long* __restrict__ k3_peer_ptrs, __nv_bfloat16* __restrict__ k3_mcast_ptr, unsigned int* __restrict__ k3_flags, int num_tokens, int rank, int my_col_begin, int k23_ctas, float epsilon)
+kernel_cake_kimi_k3_tp12_tail_df718bc5c520454ce90d(__nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ shared, __nv_bfloat16* y, __nv_bfloat16* __restrict__ gamma, __nv_bfloat16* __restrict__ w_slice, __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ mcast_ptr, __nv_bfloat16* __restrict__ local_unicast_ptr, unsigned int* __restrict__ buffer_flags, long long* __restrict__ k3_peer_ptrs, __nv_bfloat16* __restrict__ k3_mcast_ptr, unsigned int* __restrict__ k3_flags, int num_tokens, int rank, int my_col_begin, int k23_ctas, float epsilon)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -203,7 +203,7 @@ kernel_cake_kimi_k3_tp12_tail_892885d9a24abe9f000e(__nv_bfloat16* __restrict__ r
             asm volatile("barrier.arrive 3, 448;" ::: "memory");
         }
         if (tid == 0) {
-            asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+            asm volatile("red.async.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
         }
         uint8_t* bytes_base = reinterpret_cast<uint8_t*>(local_unicast_ptr);
         unsigned int dirty = (unsigned int)_vec_load_1[1];
@@ -1073,7 +1073,7 @@ kernel_cake_kimi_k3_tp12_tail_892885d9a24abe9f000e(__nv_bfloat16* __restrict__ r
             asm volatile("barrier.arrive 2, 448;" ::: "memory");
         }
         if (tid == 0) {
-            asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(k3_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+            asm volatile("red.async.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(k3_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
         }
         uint8_t* bytes_base_0 = reinterpret_cast<uint8_t*>(reinterpret_cast<__nv_bfloat16*>(k3_peer_ptrs[rank]));
         unsigned int dirty_0 = (unsigned int)_vec_load_3[1];
@@ -1154,7 +1154,7 @@ kernel_cake_kimi_k3_tp12_tail_892885d9a24abe9f000e(__nv_bfloat16* __restrict__ r
             asm volatile("barrier.arrive 3, 448;" ::: "memory");
         }
         if (tid == 0) {
-            asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+            asm volatile("red.async.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
         }
         uint8_t* bytes_base_2 = reinterpret_cast<uint8_t*>(local_unicast_ptr);
         unsigned int dirty_2 = (unsigned int)_vec_load_1[1];
@@ -2330,7 +2330,7 @@ kernel_cake_kimi_k3_tp12_tail_892885d9a24abe9f000e(__nv_bfloat16* __restrict__ r
             asm volatile("barrier.arrive 2, 448;" ::: "memory");
         }
         if (tid == 0) {
-            asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(k3_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+            asm volatile("red.async.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(k3_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
         }
         int g_1 = kb * 448 + tid;
         if (g_1 < num_tokens * 896) {

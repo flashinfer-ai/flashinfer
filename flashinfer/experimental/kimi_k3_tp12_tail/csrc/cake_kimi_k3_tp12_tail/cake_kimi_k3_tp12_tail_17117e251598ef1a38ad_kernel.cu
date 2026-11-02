@@ -59,7 +59,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(448) void
-kernel_cake_kimi_k3_tp12_tail_d8c899e3a52286b889c9(__nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ shared, __nv_bfloat16* __restrict__ y_out, __nv_bfloat16* __restrict__ gamma, __nv_bfloat16* __restrict__ mcast_ptr, __nv_bfloat16* __restrict__ local_unicast_ptr, unsigned int* __restrict__ buffer_flags, long long* __restrict__ k3_peer_ptrs, __nv_bfloat16* __restrict__ k3_mcast_ptr, unsigned int* __restrict__ k3_flags, int num_tokens, int rank, float epsilon)
+kernel_cake_kimi_k3_tp12_tail_17117e251598ef1a38ad(__nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ shared, __nv_bfloat16* __restrict__ y_out, __nv_bfloat16* __restrict__ gamma, __nv_bfloat16* __restrict__ mcast_ptr, __nv_bfloat16* __restrict__ local_unicast_ptr, unsigned int* __restrict__ buffer_flags, long long* __restrict__ k3_peer_ptrs, __nv_bfloat16* __restrict__ k3_mcast_ptr, unsigned int* __restrict__ k3_flags, int num_tokens, int rank, float epsilon)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -324,7 +324,7 @@ kernel_cake_kimi_k3_tp12_tail_d8c899e3a52286b889c9(__nv_bfloat16* __restrict__ r
         asm volatile("barrier.arrive 1, 448;" ::: "memory");
     }
     if (tid == 0) {
-        asm volatile("red.async.release.global.gpu.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
+        asm volatile("red.async.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(buffer_flags) + (8))), "r"(static_cast<unsigned int>(1)) : "memory");
     }
     uint8_t* bytes_base = reinterpret_cast<uint8_t*>(local_unicast_ptr);
     unsigned int dirty = (unsigned int)_vec_load_0[1];
