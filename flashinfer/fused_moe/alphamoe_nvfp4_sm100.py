@@ -318,11 +318,27 @@ def _alphamoe_nvfp4_aligned_moe_impl(
     w1_scale_prepared: Optional[torch.Tensor] = None,
     w2_scale_prepared: Optional[torch.Tensor] = None,
 ) -> None:
-    # Seed from the caller's output to preserve additive semantics. This
-    # temporary and both casts use the current stream; during graph capture
-    # its storage belongs to PyTorch's graph memory pool.
-    accumulator = out.to(torch.float32)
-    get_alphamoe_nvfp4_sm100_module().nvfp4_current_aligned_moe_op(
+    # Seed from the caller's output to preserve additive semantics: the FP32
+    # word of a BF16 value is its bits shifted left by 16, eight values per
+    # thread. This temporary, the seed and the copy back use the current
+    # stream; during graph capture its storage belongs to PyTorch's graph
+    # memory pool. An output the seed kernel does not take (not a contiguous,
+    # 16-byte aligned 2D BF16 CUDA tensor of a multiple of eight elements)
+    # keeps the cast, and the aligned op reports why it refuses it.
+    module = get_alphamoe_nvfp4_sm100_module()
+    if (
+        out.is_cuda
+        and out.dtype == torch.bfloat16
+        and out.dim() == 2
+        and out.is_contiguous()
+        and out.numel() % 8 == 0
+        and out.data_ptr() % 16 == 0
+    ):
+        accumulator = torch.empty(out.shape, dtype=torch.float32, device=out.device)
+        module.nvfp4_seed_accumulator_op(out, accumulator)
+    else:
+        accumulator = out.to(torch.float32)
+    module.nvfp4_current_aligned_moe_op(
         hidden_states,
         hidden_states_scale,
         gemm1_weights,

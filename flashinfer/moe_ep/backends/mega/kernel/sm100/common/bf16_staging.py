@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from ......core.validation.common import MoEEpConfigError, validate_mega_forward_inputs
@@ -15,6 +17,17 @@ def stage_mega_moe_inputs(
     topk_idx_out: torch.Tensor,
     topk_weights_out: torch.Tensor,
 ) -> None:
+    """Stage live BF16 inputs and mask the full routing tail on every call."""
+    if (
+        hidden_states.is_cuda
+        and os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
+    ):
+        from ......kernel_src.sm100.cutedsl_megamoe import fused_bf16_stage
+
+        if fused_bf16_stage(
+            hidden_states, topk_ids, topk_weights, x, topk_idx_out, topk_weights_out
+        ):
+            return
     num_tokens = hidden_states.shape[0]
     x[:num_tokens].copy_(hidden_states)
     topk_idx_out[:num_tokens].copy_(topk_ids)

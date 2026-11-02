@@ -1717,8 +1717,8 @@ def test_prefill_resolver_routes_many_short_full_dv_tiles_to_the_gatestream_twin
 def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() -> None:
     """The ``_gatestream_full`` twin is exported for the head geometries the representative rows reach; a key
     whose twin is not in the manifest (here the Qwen3.5-397B TP4 Hq4/Hv16 FP32-state record, 64 x 256 full-DV
-    tiles) resolves to its base ``_initial`` record on every architecture that ships it -- the route upstream
-    served before the twin existed -- while the Hq16/Hv32 key of the same shape takes the twin."""
+    tiles, on SM100a/SM103a) resolves to its base ``_initial`` record -- the route upstream served before the
+    twin existed -- while the Hq16/Hv32 key of the same shape takes the twin.  SM107a ships the TP4 twin."""
     shape = dict(
         io_dtype="bfloat16",
         state_dtype="float32",
@@ -1751,9 +1751,9 @@ def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() 
         assert twin.variant_name.startswith(
             "prefill_flashinfer_blackwell_gdn_prefill_initial_gatestream_full"
         ), twin
-    # CC 10.7 runs the TP4 key through its `i64meta` twin record (the sm_107a default body:
-    # the same schedule reading int32 or int64 metadata directly); the base record lists the
-    # other architectures only.  No gatestream twin exists for the key on any architecture.
+    # CC 10.7 ships the gate-stream twin for the TP4 key: its `i64meta` record (the sm_107a
+    # default body: the same schedule reading int32 or int64 metadata directly); the base
+    # record lists the other architectures only.
     seven = _prefill(
         arch="sm_107a", num_q_heads=4, num_k_heads=4, num_v_heads=16, **shape
     )
@@ -1762,7 +1762,7 @@ def test_prefill_resolver_runs_the_base_record_where_no_gatestream_twin_ships() 
     assert seven.metadata_i64 is True and base.metadata_i64 is False
     seven_record = cake_gdn._kernel_record(seven.variant_name)
     assert seven_record["source_schedule"].endswith(
-        ":flashinfer_blackwell_gdn_prefill_initial_sm107a_i64meta"
+        ":flashinfer_blackwell_gdn_prefill_initial_gatestream_full_sm107a_i64meta"
     )
     assert seven_record["architectures"] == ["sm_107a"]
     assert seven_record["specializations"] == record["specializations"]
@@ -1775,7 +1775,7 @@ def test_prefill_resolver_runs_an_i64_metadata_twin_for_every_key_on_sm_107a() -
     declares ``metadata_i64`` (the routed vec2 bodies and the ``i64meta`` default alike); on the
     other architectures the resolved record never declares it."""
     keys = (
-        # full-DV ``_initial`` TP4 key (64 x 256 tokens, Hq4/Hv16): the ``i64meta`` default body
+        # full-DV ``_initial`` TP4 key (64 x 256 tokens, Hq4/Hv16): the gate-stream twin's ``i64meta`` body
         dict(
             io_dtype="bfloat16",
             num_seqs=64,
@@ -2100,6 +2100,104 @@ def test_prefill_geometries_mirror_the_resolver(arch) -> None:
                         ".dvsplit" if dvsplit else ".full_dv"
                     ), route.route_id
                     assert _prefill_geometry_of(route) == geometry, route
+
+
+# Keys whose DV-split schedule ships no record while the full-DV schedule ships
+# the key: (io_dtype, num_seqs, max_seq_len, Hq, Hv, initial + final state,
+# gates, geometry).  2 * num_seqs * Hv = 192 in the first and third rows fits
+# only sm_107a's 212 clusters (not 148 / 160); the other rows fit every arch.
+_DVSPLIT_KEYS_WITHOUT_A_RECORD = (
+    ("float16", 16, 256, 2, 6, True, False, (-1, 0, -1)),
+    ("float16", 1, 256, 1, 3, True, False, (-1, 0, -1)),
+    ("float16", 2, 256, 16, 48, True, False, (-1, 0, -1)),
+    ("bfloat16", 1, 300, 16, 64, False, False, (2, 0, 6)),
+    ("bfloat16", 1, 300, 16, 64, False, True, (2, 0, 6)),
+    ("float16", 1, 300, 16, 64, False, False, (2, 0, 6)),
+    ("float16", 1, 300, 16, 64, False, True, (2, 0, 6)),
+)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+@pytest.mark.parametrize(
+    ("io_dtype", "num_seqs", "max_seq_len", "hq", "hv", "state", "gates", "geometry"),
+    _DVSPLIT_KEYS_WITHOUT_A_RECORD,
+)
+def test_prefill_dvsplit_key_without_a_record_runs_the_full_dv_record_on_sm107a(
+    arch, io_dtype, num_seqs, max_seq_len, hq, hv, state, gates, geometry
+) -> None:
+    # The non-gatepipe4 DV-split schedules ship no (-1, 0, -1) geometry (Hv / Hq
+    # and Hv both not powers of two) and the no-state DV-split schedule no
+    # (2, 0, 6); the full-DV schedule ships both.  On sm_107a such a DV-split
+    # key runs the full-DV record of the key; sm_100a / sm_103a do not fall
+    # back (a key over their cluster count is full-DV by the tile rule, any
+    # other still fails closed).
+    contract = {
+        "arch": arch,
+        "io_dtype": io_dtype,
+        "state_dtype": "float32",
+        "use_initial_state": state,
+        "store_final_state": state,
+    }
+    assert geometry not in cake_gdn.cake_gdn_prefill_geometries(
+        **contract, dvsplit=True
+    )
+    assert geometry in cake_gdn.cake_gdn_prefill_geometries(**contract, dvsplit=False)
+    call = {
+        **contract,
+        "num_seqs": num_seqs,
+        "total_seq_len": num_seqs * max_seq_len,
+        "max_seq_len": max_seq_len,
+        "num_q_heads": hq,
+        "num_k_heads": hq,
+        "num_v_heads": hv,
+        "gates_present": gates,
+    }
+    dvsplit = 2 * num_seqs * hv <= cake_gdn._ARCH_ACTIVE_CLUSTERS[arch]
+    if arch != "sm_107a" and dvsplit:
+        with pytest.raises(
+            cake_gdn.CakeGDNUnsupportedError, match="no exact frozen Cake GDN variant"
+        ):
+            _prefill(**call)
+        return
+    # sm_107a: the tile rule picks DV-split, so a full-DV route is the fallback.
+    assert dvsplit == (arch == "sm_107a")
+    route = _prefill(**call)
+    assert route.route_id == "flashinfer.gdn_prefill.noncp.full_dv", route
+    assert "_dvsplit_" not in route.variant_name, route
+    assert _prefill_geometry_of(route) == geometry
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+def test_prefill_shipped_and_unshipped_dvsplit_keys_are_unchanged(arch) -> None:
+    # A shipped DV-split key keeps its DV-split record.
+    shipped = _prefill(
+        arch=arch,
+        num_seqs=4,
+        total_seq_len=4 * 256,
+        max_seq_len=256,
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=8,
+    )
+    assert shipped.route_id == "flashinfer.gdn_prefill.noncp.dvsplit", shipped
+    assert _prefill_geometry_of(shipped) == (2, 0, 3)
+    # A geometry neither schedule ships still fails closed on every arch
+    # (FP16 I/O, gated Hq4/Hv8 x 4: no schedule ships (1, 0, 3)).
+    with pytest.raises(
+        cake_gdn.CakeGDNUnsupportedError, match="no exact frozen Cake GDN variant"
+    ):
+        _prefill(
+            arch=arch,
+            num_seqs=4,
+            total_seq_len=4 * 2048,
+            max_seq_len=2048,
+            num_q_heads=4,
+            num_k_heads=4,
+            num_v_heads=8,
+            gates_present=True,
+        )
 
 
 @pytest.mark.cpu_only

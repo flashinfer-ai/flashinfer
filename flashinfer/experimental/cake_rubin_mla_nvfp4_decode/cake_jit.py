@@ -15,7 +15,7 @@ limitations under the License.
 
 Registry and loader glue of the Cake dense NVFP4 MLA decode on Rubin (SM107):
 the query quantizer, the mixed-cluster decode (its three builds) and the
-split-KV merge (its six routed forms).
+split-KV merge (its seven routed forms).
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled for ``sm_107a``.  A
@@ -49,12 +49,13 @@ skips the double-item test at each item's end; ``decode_full_pairpipe``
 taking the plans whose scalars lie in its ``plan_within`` boxes (inclusive
 ``[rows_lo, rows_hi, n_full_lo, n_full_hi, items_lo, items_hi, splits_lo,
 splits_hi]``, a ``hi`` of 0 unbounded), which the ``all_full`` rule of
-``decode_full`` excepts.  The ``merge`` stage has six forms of one kernel, chosen
+``decode_full`` excepts.  The ``merge`` stage has seven forms of one kernel, chosen
 by the row count and the partials per row (the ``rows_splits_within`` boxes
 of the records: one warp per row above 2048 rows or four up to 2048 rows at
 17-32 partials, the two- and eight-warp forms and the four-warp column form
 that issue their loads ahead of the merged-row probe elsewhere, the eight-warp
-form's 48-slot program for rows of up to 384 at 33-48 partials); the host
+form's 48-slot program for rows of up to 384 at 33-48 partials and the
+four-warp form's 24-slot program for 449-2048 rows at 17-24 partials); the host
 launches it only when the plan has more than one split.  The ``quantize`` stage has one program.
 
 The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
@@ -258,7 +259,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "ctas_per_item", "ctas": 4},
-        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_a91f9079af0188f9b47c",
+        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_cc4e037c904cf429533d",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (2, 1, 1),
@@ -266,7 +267,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 332800,
             "use_pdl": "runtime",
         },
-        "library": "cake_rubin_mla_nvfp4_decode_a91f9079af0188f9b47c",
+        "library": "cake_rubin_mla_nvfp4_decode_cc4e037c904cf429533d",
         "logical": {
             "CKS": "CKS",
             "CKV": "CKV",
@@ -345,7 +346,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "ctas_per_item", "ctas": 4},
-        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_06e6c38c07d47bffc22e",
+        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_51f42014896b9a71c0e9",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (2, 1, 1),
@@ -353,7 +354,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 332800,
             "use_pdl": "runtime",
         },
-        "library": "cake_rubin_mla_nvfp4_decode_06e6c38c07d47bffc22e",
+        "library": "cake_rubin_mla_nvfp4_decode_51f42014896b9a71c0e9",
         "logical": {
             "CKS": "CKS",
             "CKV": "CKV",
@@ -564,10 +565,52 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "select_rule": {
             "kind": "rows_splits_within",
-            "boxes": [[449, 2048, 17, 32]],
+            "boxes": [[449, 2048, 25, 32]],
         },
         "stage": "merge",
         "variant": "w4",
+    },
+    "merge_w4_b24": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "partial_o"],
+            ["buffer", "partial_lse"],
+            ["buffer", "O"],
+            ["buffer", "lse"],
+            ["parameter", "rows"],
+            ["parameter", "num_split"],
+            ["parameter", "has_lse"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "rows_per_cta", "rows": 2},
+        "kernel_symbol": "kernel_cake_rubin_mla_nvfp4_decode_ed7a88b839ebde5e8d2d",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 2048,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_rubin_mla_nvfp4_decode_ed7a88b839ebde5e8d2d",
+        "logical": {
+            "O": "O",
+            "has_lse": "has_lse",
+            "lse": "lse",
+            "num_split": "num_split",
+            "partial_lse": "partial_lse",
+            "partial_o": "partial_o",
+            "rows": "rows",
+        },
+        "select_rule": {
+            "kind": "rows_splits_within",
+            "boxes": [[449, 2048, 17, 24]],
+        },
+        "stage": "merge",
+        "variant": "w4_b24",
     },
     "merge_w2_pal": {
         "arches": ["sm_107a"],
@@ -851,9 +894,11 @@ def select_record(
     (``plan_within``: inclusive boxes of rows, full-tile items, items and
     splits, which ``decode_full``'s rule excepts), else ``decode_full`` when
     ``n_full == items`` (no half tile), else ``decode``.  The ``merge`` stage switches on the row count and the
-    partials per row ``splits`` (``rows_splits_within``: inclusive boxes of rows and partials; eight warps per row up to 384 rows, its 48-slot program at 33-48 partials, or, up to 2048 rows, over 32 partials; otherwise up to 2048 rows the fewest
-    warps whose one load round holds the partials, one up to 8, two up to 16, four up to 32, two staying up to
-    1664 rows; one warp above 2048 rows); whether the
+    partials per row ``splits`` (``rows_splits_within``: inclusive boxes of rows and partials; eight warps per row
+    up to 384 rows, its 48-slot program at 33-48 partials, or, up to 2048 rows, over 32 partials; otherwise up to
+    2048 rows the fewest warps whose one load round holds the partials, one up to 8, two up to 16, four up to 32
+    (for 449-2048 rows the four-warp form's 24-slot program at 17-24 partials and the four-warp form itself at
+    25-32), two staying up to 1664 rows; one warp above 2048 rows); whether the
     merge runs at all (``max_splits > 1``) is the host's decision, not a rule.
     ``always`` is the rule of a single-program stage.  Exactly one record
     admits every problem, or the registry is inconsistent.

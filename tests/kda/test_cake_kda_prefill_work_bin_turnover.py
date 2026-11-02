@@ -292,6 +292,7 @@ def _stub_routes(monkeypatch, arch, **tables):
         "_RENDERED_MAP_FOLD_ROUTES",
         "_RENDERED_PAIR_SHARE_ROUTES",
         "_RENDERED_WORK_BIN_TURN_ROUTES",
+        "_RENDERED_M64_OWNER_HELPER_ROUTES",
     ):
         monkeypatch.setattr(jit, table, {arch: tables.get(table, {})})
     monkeypatch.setattr(jit, "PreparedKernel", _Kernel)
@@ -467,6 +468,7 @@ def test_turnover_programs_of_the_loader(monkeypatch, arch):
             "_RENDERED_FOLD_ROUTES",
             "_RENDERED_MAP_FOLD_ROUTES",
             "_RENDERED_PAIR_SHARE_ROUTES",
+            "_RENDERED_M64_OWNER_HELPER_ROUTES",
         )
     }
     heads = {
@@ -488,6 +490,7 @@ def test_turnover_programs_of_the_loader(monkeypatch, arch):
                 "_RENDERED_FOLD_ROUTES",
                 "_RENDERED_MAP_FOLD_ROUTES",
                 "_RENDERED_PAIR_SHARE_ROUTES",
+                "_RENDERED_M64_OWNER_HELPER_ROUTES",
             ):
                 assert module not in by_module, (table, module)
         keys = [key for key, row in rows.items() if row == module]

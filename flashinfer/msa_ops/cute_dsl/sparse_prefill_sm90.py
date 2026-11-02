@@ -22,9 +22,26 @@ this schedule ships; the routing does not.
 # bandwidth bound, so that reuse is the whole game.  A per-block NT-bit mask
 # says which row bands are live; a dead band skips the softmax and stores P = 0.
 #
-#   S = Q K^T   FP8 WGMMA, A = sQ (64,128) fp8 K-major, B = sK (128,128) K-major
+#   S = Q K^T   FP8 WGMMA, A = sQ + sQl (64,128) fp8 K-major hi / lo pair,
+#               B = sK (128,128) K-major
 #   P = online softmax in registers (exp2 domain)
-#   O += P V    FP8 WGMMA, A = P (RMEM relabel of the S accumulator), B = sV
+#   O += P V    FP8 WGMMA into f32, A = P as an fp8 hi / lo pair of register
+#               fragments (two gemms), B = sV with keys permuted (see SLOT)
+#
+# One e4m3 operand keeps 3 mantissa bits: fp8 Q and fp8 P each cost ~1-3e-2
+# relative error in O against an fp32 reference. Feeding each as hi + lo
+# (lo = fp8 of the residual) keeps ~7 bits for four extra QK k-steps and a
+# second PV gemm, which brings the kernel to the bf16 output-rounding floor.
+#
+# SLOT: the f32 S accumulator gives a thread, per row and 8-key group, the two
+# keys 8j + 2t + {0,1} (t = lane % 4). An fp8 A register holds four k of ONE
+# row, k = 4t + {0..3} (+16 for the upper half of the k32 step). P is packed
+# straight into those registers when key 8j + 2t + q of each 32-key step sits
+# at k = 16 * (j >> 1) + 4t + 2 * (j & 1) + q, and the transpose pre-pass writes
+# V^T in that k order. Within each 16-key group this is
+# V^T row 16c + i <- key 16c + _SLOT_KEY[i]. Staging P through SMEM instead
+# cost a CTA barrier pair and 64 byte stores per thread per operand, which is
+# where the hi / lo split spent its time.
 import math
 import torch
 
@@ -43,6 +60,9 @@ MMA_M = 64  # WGMMA M (hardware fixed)
 NTHR = 128  # one warpgroup
 VTHR = 256  # two warpgroups keep the transpose CTA's memory path busy
 QSC = 16.0  # Q prescale before fp8 quantization
+PSC = (
+    16.0  # P prescale before the fp8 hi/lo split (keeps small P out of fp8 subnormals)
+)
 LOG2E = 1.4426950408889634
 KVBYTES = PG * D  # bytes of one fp8 (128,128) tile
 NEG = 1.0e30  # mask sentinel (finite: keeps the running max finite)
@@ -50,6 +70,8 @@ F8_LO = -448.0  # e4m3 finite range; clamping maps NaN into it
 F8_HI = 448.0
 OSTR = 136  # padded bf16 row stride of the smem epilogue buffer
 SPAD = 144  # padded fp8 smem row stride in the transpose pre-pass
+# V^T row 16c + i holds key 16c + _SLOT_KEY[i] (header comment, SLOT).
+_SLOT_KEY = tuple(8 * ((i >> 1) & 1) + 2 * (i >> 2) + (i & 1) for i in range(16))
 
 
 def _views(hkv, pkv, pvt, npg):
@@ -88,90 +110,6 @@ def _i32t(ptr, shape, stride):
     )
 
 
-class VTranspose:
-    """kv[p, h, key, D:2D] -> vt[p, h, d, key]  (fp8, keys innermost).
-
-    slot(n) = 32*(n>>5) + 16*(n&1) + 4*((n>>1)&3) + ((n>>3)&3) makes the FP8
-    WGMMA A fragment a bit-identical relabel of the QK f32 accumulator.
-    """
-
-    def __init__(self, hkv):
-        """Record the KV head count the transpose grid is sized for."""
-        self.hkv = hkv
-        self.f8 = cutlass.Float8E4M3FN
-
-    @cute.jit
-    def __call__(self, pkv, pvt, npg, stream):
-        """Launch the V transpose, one CTA per (page, KV head)."""
-        f8 = self.f8
-        mKV, mVT = _views(self.hkv, pkv, pvt, npg)
-
-        @cute.struct
-        class TShared:
-            sIn: cute.struct.Align[cute.struct.MemRange[f8, 128 * SPAD], 1024]
-            sOut: cute.struct.Align[cute.struct.MemRange[f8, 128 * SPAD], 1024]
-
-        self.tshared = TShared
-        self.kernel(mKV, mVT).launch(
-            grid=[npg, self.hkv, 1],
-            block=[VTHR, 1, 1],
-            smem=TShared.size_in_bytes(),
-            stream=stream,
-        )
-
-    @cute.kernel
-    def kernel(self, mKV, mVT):
-        """Transpose one page's V half into keys-innermost order."""
-        f8 = self.f8
-        tidx, _, _ = cute.arch.thread_idx()
-        pg, h, _ = cute.arch.block_idx()
-
-        smem = utils.SmemAllocator()
-        st = smem.allocate(self.tshared)
-        sIn = st.sIn.get_tensor(cute.make_layout(128 * SPAD)).iterator
-        sOut = st.sOut.get_tensor(cute.make_layout(128 * SPAD)).iterator
-
-        gIn = cute.zipped_divide(mKV[None, None, h, pg], (1, 16))
-        gOut = cute.zipped_divide(mVT[None, None, h, pg], (1, 16))
-        buf = cute.make_rmem_tensor(cute.make_layout((1, 16)), f8)
-        l16 = cute.make_layout((1, 16))
-
-        for it in cutlass.range_constexpr(4):
-            c = cutlass.Int32(tidx) + it * VTHR
-            cute.autovec_copy(gIn[(None, None), (c // 8, 8 + c % 8)], buf)
-            cute.autovec_copy(
-                buf, cute.make_tensor(sIn + (c // 8) * SPAD + (c % 8) * 16, l16)
-            )
-
-        cute.arch.sync_threads()
-
-        vb = cute.make_rmem_tensor(cute.make_layout((1, 16)), f8)
-        d = cutlass.Int32(tidx) % D
-        sInC = cute.make_tensor(sIn + d, cute.make_layout(128, stride=SPAD))
-        for kci in cutlass.range_constexpr(4):
-            kc = 4 * (cutlass.Int32(tidx) // D) + kci
-            for i in cutlass.range_constexpr(16):
-                # Defensive NaN clamp on V. The causal mask only sanitizes the
-                # SCORES; a NaN in V survives it because 0 * NaN = NaN in the PV
-                # matmul, so page bytes past seqused_k would poison the output.
-                # fmax(NaN, x) returns x (IEEE maxNum). Cheap here: the transpose
-                # is a memory-bound copy run once per page, not once per
-                # (page, query-tile) visit.
-                xv = cutlass.Float32(sInC[kc * 16 + i])
-                xv = cute.arch.fmin(cute.arch.fmax(xv, F8_LO), F8_HI)
-                vb[0, i] = xv.to(f8)
-            cute.autovec_copy(vb, cute.make_tensor(sOut + d * SPAD + kc * 16, l16))
-
-        cute.arch.sync_threads()
-
-        for it in cutlass.range_constexpr(4):
-            c = cutlass.Int32(tidx) + it * VTHR
-            cute.autovec_copy(
-                cute.make_tensor(sOut + (c // 8) * SPAD + (c % 8) * 16, l16), buf
-            )
-            cute.autovec_copy(buf, gOut[(None, None), (c // 8, c % 8)])
-
-
 # --- plain-Python (undecorated) helpers: trace-time loops, safe to call from
 # --- inside a dynamic `if` where range_constexpr is rejected.
 def _mask_half(i, acc_s, klim):
@@ -194,7 +132,7 @@ def _mask_half(i, acc_s, klim):
             )
 
 
-def _soft_half(i, acc_s, l_i, m_i, acc_o, slog2):
+def _soft_half(i, acc_s, l_i, m_i, acc_o, slog2, p_hi, p_lo):
     """Online-softmax numerator for the 8 rows of half i.
 
     This thread's row-i scores sit at 4*k + 2*i + {0,1}: a (2, n) view with
@@ -227,13 +165,34 @@ def _soft_half(i, acc_s, l_i, m_i, acc_o, slog2):
         acc_o[e] = (acc_o[e].to(f32) * corr).to(acc_o.element_type)
         acc_o[e + 1] = (acc_o[e + 1].to(f32) * corr).to(acc_o.element_type)
     m_i[i] = mnew
-    pv = cute.math.exp2(sv - mnew, fastmath=True)
-    # Round to the fp8 the PV gemm will actually consume BEFORE summing: the
-    # numerator sees fp8(P) and the denominator must see the same values, or a
-    # one-key window returns V scaled by fp8(P)/P.
-    pv = pv.to(cutlass.Float8E4M3FN).to(f32)
-    rs.store(pv)
-    l_i[i] = l_i[i] + pv.reduce(cute.ReductionOp.ADD, f32(0.0), 0)
+    # P * PSC in [0, PSC] reaches the PV gemm as the fp8 pair hi + lo. Sum the
+    # same two fp8 values: the numerator sees hi + lo and the denominator must
+    # too, or a one-key window returns V scaled by (hi + lo) / P.
+    pv = cute.math.exp2(sv - mnew, fastmath=True) * f32(PSC)
+    ph = pv.to(cutlass.Float8E4M3FN)
+    pl = (pv - ph.to(f32)).to(cutlass.Float8E4M3FN)
+    l_i[i] = l_i[i] + (ph.to(f32) + pl.to(f32)).reduce(
+        cute.ReductionOp.ADD, f32(0.0), 0
+    )
+    # Every value above is computed before either store: with DSL 4.8, an fp8
+    # SSA value converted back to f32 AFTER being stored into a fragment fed a
+    # wrong lo operand to the PV gemm (2x the output).
+    _p_half(p_hi, i).store(ph)
+    _p_half(p_lo, i).store(pl)
+
+
+def _p_half(frag, i):
+    """Row half i of a PV A fragment, indexed like rs in _soft_half.
+
+    frag is ((4, 2, 2), 1, 4):((1, 4, 8), 0, 16): byte k + 4 * row + 8 * khalf
+    + 16 * kstep, four bytes of one row per register. S element (q, j) of row
+    half i -- key 8j + 2t + q -- goes to k-step j >> 2 at k = 2 * (j & 1) + q,
+    khalf = (j >> 1) & 1, which is the SLOT order of the V^T tile.
+    """
+    return cute.make_tensor(
+        frag.iterator + 4 * i,
+        cute.make_layout((2, (2, 2, PG // 32)), stride=(1, (2, 8, 16))),
+    )
 
 
 class MsaSparseAttnFp8:
@@ -296,15 +255,17 @@ class MsaSparseAttnFp8:
             (MMA_M, PG),
             warpgroup.OperandSource.SMEM,
         )
+        # f32 accumulation: f16 partial sums of PSC-scaled P over up to
+        # NT * TOPK blocks would cost accuracy and overflow headroom.
         pv_mma = sm90_utils.make_trivial_tiled_mma(
             f8,
             f8,
             OperandMajorMode.K,
             OperandMajorMode.K,
-            self.f16,
+            self.f32,
             (1, 1, 1),
             (MMA_M, D),
-            warpgroup.OperandSource.SMEM,
+            warpgroup.OperandSource.RMEM,
         )
 
         ka = warpgroup.make_smem_layout_atom(
@@ -315,7 +276,6 @@ class MsaSparseAttnFp8:
         lV1 = cute.tile_to_shape(ka, (D, PG), order=(0, 1))
         lK = cute.tile_to_shape(ka, (PG, D, 1), order=(0, 1, 2))
         lV = cute.tile_to_shape(ka, (D, PG, 1), order=(0, 1, 2))
-        lP = cute.tile_to_shape(ka, (MMA_M, PG, 1), order=(0, 1, 2))
 
         k_atom, tK = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(), mKV, lK1, (PG, D)
@@ -339,7 +299,7 @@ class MsaSparseAttnFp8:
             sV: cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(lV)], 1024]
             sK: cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(lK)], 1024]
             sQ: cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(lQ)], 1024]
-            sP: cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(lP)], 1024]
+            sQl: cute.struct.Align[cute.struct.MemRange[f8, cute.cosize(lQ)], 1024]
 
         self.shared_storage = SharedStorage
         gK = cute.group_modes(cute.flat_divide(tK, (PG, D)), 0, 2)
@@ -378,7 +338,6 @@ class MsaSparseAttnFp8:
             lQ,
             lK,
             lV,
-            lP,
             mCu,
             nb,
         ).launch(
@@ -386,7 +345,10 @@ class MsaSparseAttnFp8:
             block=[NTHR, 1, 1],
             smem=SharedStorage.size_in_bytes(),
             stream=stream,
-            min_blocks_per_mp=4,
+            # The f32 P.V accumulator and the hi / lo P fragments need more
+            # than the 128 registers a 4-CTA bound leaves (it spills). Three
+            # fit, and beat two by 5-10% at 8192 tokens on H100.
+            min_blocks_per_mp=3,
         )
 
     @cute.kernel
@@ -427,7 +389,7 @@ class MsaSparseAttnFp8:
                 # fmax(NaN, x) returns x (IEEE maxNum). Cheap here: the transpose
                 # is a memory-bound copy run once per page, not once per
                 # (page, query-tile) visit.
-                xv = cutlass.Float32(sInC[kc * 16 + i])
+                xv = cutlass.Float32(sInC[kc * 16 + _SLOT_KEY[i]])
                 xv = cute.arch.fmin(cute.arch.fmax(xv, F8_LO), F8_HI)
                 vb[0, i] = xv.to(f8)
             cute.autovec_copy(vb, cute.make_tensor(sOut + d * SPAD + kc * 16, l16))
@@ -459,7 +421,6 @@ class MsaSparseAttnFp8:
         lQ,
         lK,
         lV,
-        lP,
         mCu,
         nb,
     ):
@@ -488,10 +449,9 @@ class MsaSparseAttnFp8:
         upg = st.upg.get_tensor(cute.make_layout(nent))
         umsk = st.umsk.get_tensor(cute.make_layout(nent))
         sQ = st.sQ.get_tensor(lQ.outer, swizzle=lQ.inner)
+        sQl = st.sQl.get_tensor(lQ.outer, swizzle=lQ.inner)
         sK = st.sK.get_tensor(lK.outer, swizzle=lK.inner)
         sV = st.sV.get_tensor(lV.outer, swizzle=lV.inner)
-        sP = st.sP.get_tensor(lP.outer, swizzle=lP.inner)
-        sPw = sP[None, None, 0]
 
         if warp == 0:
             with cute.arch.elect_one():
@@ -543,13 +503,16 @@ class MsaSparseAttnFp8:
                 qmeta[tidx] = qbase + qoff
         ubits[tidx] = cutlass.Int32(0)
 
-        # ---- Q: bf16 -> fp8 (prescaled); rows of dead tokens zeroed ------
+        # ---- Q: bf16 -> fp8 hi / lo pair (prescaled); dead rows zeroed ---
         sQt = cute.zipped_divide(sQ, (1, 16))
+        sQlt = cute.zipped_divide(sQl, (1, 16))
         fbf = cute.make_rmem_tensor(cute.make_layout((1, 16)), self.obf)
         l8 = cute.make_layout((1, 8))
         fb0 = cute.make_tensor(fbf.iterator, l8)
         fb1 = cute.make_tensor(fbf.iterator + 8, l8)
         ff8 = cute.make_rmem_tensor(cute.make_layout((1, 16)), f8)
+        ff8l = cute.make_rmem_tensor(cute.make_layout((1, 16)), f8)
+        ff32 = cute.make_rmem_tensor(cute.make_layout((1, 16)), f32)
         nvec = D // 16
         for it in cutlass.range_constexpr((MMA_M * nvec) // NTHR):
             idx = cutlass.Int32(tidx) + it * NTHR
@@ -565,8 +528,11 @@ class MsaSparseAttnFp8:
             gQt = cute.zipped_divide(mQ[tok0 + tsafe, None, None], (1, 8))
             cute.autovec_copy(gQt[(None, None), (hkv * g + h, 2 * c)], fb0)
             cute.autovec_copy(gQt[(None, None), (hkv * g + h, 2 * c + 1)], fb1)
-            ff8.store((fbf.load().to(f32) * mul).to(f8))
+            ff32.store(fbf.load().to(f32) * mul)
+            ff8.store(ff32.load().to(f8))
+            ff8l.store((ff32.load() - ff8.load().to(f32)).to(f8))
             cute.autovec_copy(ff8, sQt[(None, None), (r, c)])
+            cute.autovec_copy(ff8l, sQlt[(None, None), (r, c)])
 
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_threads()
@@ -655,16 +621,14 @@ class MsaSparseAttnFp8:
         qk_thr = qk_mma.get_slice(0)
         pv_thr = pv_mma.get_slice(0)
         tSrQ = qk_thr.make_fragment_A(qk_thr.partition_A(sQ))
+        tSrQl = qk_thr.make_fragment_A(qk_thr.partition_A(sQl))
         tSrK = qk_thr.make_fragment_B(qk_thr.partition_B(sK))[(None, None, None, 0)]
         tOrV = pv_thr.make_fragment_B(pv_thr.partition_B(sV))[(None, None, None, 0)]
-        tOrP = pv_thr.make_fragment_A(pv_thr.partition_A(sP))[(None, None, None, 0)]
-        tScS = qk_mma.get_slice(tidx).partition_C(
-            cute.make_identity_tensor((MMA_M, PG))
-        )
+        p_hi = pv_thr.make_fragment_A(pv_thr.partition_shape_A((MMA_M, PG)))
+        p_lo = pv_thr.make_fragment_A(pv_thr.partition_shape_A((MMA_M, PG)))
         acc_s = qk_thr.make_fragment_C(qk_thr.partition_shape_C((MMA_M, PG)))
         acc_o = pv_thr.make_fragment_C(pv_thr.partition_shape_C((MMA_M, D)))
         acc_o.fill(0.0)
-        pv_mma.set(warpgroup.Field.ACCUMULATE, True)
 
         l_i = cute.make_rmem_tensor(cute.make_layout(2), f32)
         m_i = cute.make_rmem_tensor(cute.make_layout(2), f32)
@@ -711,6 +675,15 @@ class MsaSparseAttnFp8:
                 cute.gemm(
                     qk_mma, acc_s, tSrQ[(None, None, kb)], tSrK[(None, None, kb)], acc_s
                 )
+            qk_mma.set(warpgroup.Field.ACCUMULATE, True)
+            for kb in cutlass.range_constexpr(D // 32):
+                cute.gemm(
+                    qk_mma,
+                    acc_s,
+                    tSrQl[(None, None, kb)],
+                    tSrK[(None, None, kb)],
+                    acc_s,
+                )
             warpgroup.commit_group()
             warpgroup.wait_group(0)
 
@@ -732,27 +705,34 @@ class MsaSparseAttnFp8:
             if live0:
                 if blk >= ow0:
                     _mask_half(0, acc_s, (qp0 - base).to(f32))
-                _soft_half(0, acc_s, l_i, m_i, acc_o, slog2)
+                _soft_half(0, acc_s, l_i, m_i, acc_o, slog2, p_hi, p_lo)
+            else:
+                _p_half(p_hi, 0).fill(0.0)
+                _p_half(p_lo, 0).fill(0.0)
             if live1:
                 if blk >= ow1:
                     _mask_half(1, acc_s, (qp1 - base).to(f32))
-                _soft_half(1, acc_s, l_i, m_i, acc_o, slog2)
+                _soft_half(1, acc_s, l_i, m_i, acc_o, slog2, p_hi, p_lo)
+            else:
+                _p_half(p_hi, 1).fill(0.0)
+                _p_half(p_lo, 1).fill(0.0)
 
-            # The f32 accumulator hands a thread two consecutive columns per
-            # 8-wide group; the fp8 WGMMA A operand wants four consecutive k in
-            # one register, and those live in a different lane.  Stage P through
-            # SMEM (what sparse_decode does) rather than relabelling registers.
-            cute.arch.barrier()
-            for e in cutlass.range_constexpr(cute.size(acc_s)):
-                lv = live0 if cutlass.const_expr(((e >> 1) & 1) == 0) else live1
-                sPw[tScS[e]] = (acc_s[e] if lv else f32(0.0)).to(f8)
-            cute.arch.fence_proxy("async.shared", space="cta")
-            cute.arch.barrier()
+            # P never touches SMEM: see SLOT in the header comment.
             cute.arch.mbarrier_wait(mbar + 1, j % 2)
             warpgroup.fence()
-            cute.gemm(pv_mma, acc_o, tOrP, tOrV, acc_o)
+            # The block's P.V goes to a fresh accumulator (the dead S registers)
+            # and is added to acc_o in f32. FP8 WGMMA accumulation keeps fewer
+            # bits than f32: chained into acc_o across blocks, it lost ~1% of a
+            # constant V by the fifth block; per-block promotion bounds that
+            # loss to the block's eight k-steps.
+            pv_mma.set(warpgroup.Field.ACCUMULATE, False)
+            cute.gemm(pv_mma, acc_s, p_hi, tOrV, acc_s)
+            pv_mma.set(warpgroup.Field.ACCUMULATE, True)
+            cute.gemm(pv_mma, acc_s, p_lo, tOrV, acc_s)
             warpgroup.commit_group()
             warpgroup.wait_group(0)
+            for e in cutlass.range_constexpr(cute.size(acc_o)):
+                acc_o[e] = acc_o[e] + acc_s[e]
 
             if j + 1 < nblk:
                 if warp == 0:
@@ -817,7 +797,7 @@ def _pick_nt(hq, hkv, sq, nb, mpg):
     if hq == 8 and hkv == 1 and nb == 2 and sq == 1024 and mpg >= 2048:
         return nt
     active_blocks = max(1.0, mpg - sq / 256.0)
-    slots = 528  # 132 SMs x 4 resident CTAs for this 128-thread, ~43 KiB kernel
+    slots = 396  # 132 SMs x 3 resident CTAs (min_blocks_per_mp=3 above)
 
     def occupancy(ncta):
         return ncta / float(slots * ((ncta + slots - 1) // slots))

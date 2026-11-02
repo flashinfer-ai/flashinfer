@@ -40,10 +40,10 @@ SHARDS = ("12_1", "6_1")
 LENS = (100, 2300, 0, 303)
 
 
-def _geometry(name):
+def _geometry(name, **over):
     from flashinfer.qwen_3_8_block import Qwen38BlockGeometry
 
-    return Qwen38BlockGeometry(**GEOMETRIES[name])
+    return Qwen38BlockGeometry(**dict(GEOMETRIES[name], **over))
 
 
 def _plan(case, g, **kw):
@@ -172,6 +172,47 @@ def test_decode_matches_the_two_stage_oracle(name, q_len):
     assert not plan.supports(hidden_states=case.hidden_states[:1], **case.decode_args())
 
 
+@pytest.mark.parametrize("q_len", [1, 4])
+def test_decode_over_an_e4m3_compressed_key_cache(q_len):
+    """The e4m3 compressed-key cache on the decode step (served since the 4c8e24355 re-vendor; ``Qwen38BlockGeometry.index_cache_dtype``):
+    the prefix primed through the vendored compress kernel's e4m3 store arm, the step's completed blocks bitwise that chain, the scorer's
+    e4m3 read arm against the two-stage oracle over the kernel's own e4m3 operands; the plan key carries the dtype."""
+    g = _geometry("24_2", index_cache_dtype=torch.float8_e4m3fn)
+    case = Qsa38PagedCase(g, LENS, q_len, page_size=16, seed=41)
+    assert (
+        case.index_kv_cache.dtype == torch.float8_e4m3fn
+        and case.cache_dtype == torch.float8_e4m3fn
+    )
+    case.prime()
+    plan = _plan(case, g)
+    assert (
+        plan.index_cache_dtype == torch.float8_e4m3fn
+        and plan.declaration["index_cache_dtype"] == torch.float8_e4m3fn
+    )
+    assert plan.index_compress_rounding == "single"
+    out = _run(plan, case)
+    stats, completed = _check_step(case, plan, out, f"decode e4m3 cache q{q_len}")
+    want = sum(
+        1 for L in LENS if L for j in range(q_len) if (L - q_len + j + 1) % 4 == 0
+    )
+    assert completed == want, (completed, want)
+    assert _qi(plan).dtype == torch.float8_e4m3fn
+    # a bf16-cache plan refuses the e4m3 buffer by dtype
+    bf = _plan(
+        Qsa38PagedCase(_geometry("24_2"), LENS, q_len, page_size=16, seed=41),
+        _geometry("24_2"),
+    )
+    with pytest.raises(ValueError, match="index_kv_cache must be torch.bfloat16"):
+        bf.run(
+            case.hidden_states,
+            None,
+            None,
+            case.weights38,
+            case.w_o,
+            **case.decode_args(),
+        )
+
+
 @pytest.mark.parametrize("name", SHARDS)
 def test_tp_shard_slabs_are_declined_by_name(name, monkeypatch):
     """The TP 2 / TP 4 shard geometries: the probe declines them under ``proj_slab_route`` (their slabs are off the capture-safe
@@ -200,6 +241,74 @@ def test_tp_shard_slabs_are_declined_by_name(name, monkeypatch):
     case = Qsa38PagedCase(g, (64,), 1, page_size=16, seed=31)
     with pytest.raises(NotImplementedError, match="small-M projection route"):
         _plan(case, g)
+
+
+def test_plan_time_decline_past_the_launch_grid_bound_is_typed_before_any_vendored_code(
+    monkeypatch,
+):
+    """ONE decode run holds at most ``EXTEND_ROWS_GRID_MAX`` = 65,535 rows at this pin (the DECODE step's query compress shares the extend
+    step's launch: the run's row count as a CUDA grid dimension): batch 4096 x ``q_len`` 16 = 65,536 rows is the typed ``NotImplementedError``
+    naming the bound, the rows and the remedy through the public decode entry -- at ``prepare`` and at the workspace query -- BEFORE any
+    vendored code (host only: nothing declared, nothing compiled, the block table sample never read); 4095 x 16 passes the light gate.  The
+    probe carries the row on the decode record with the same text as the extend / prefill records."""
+    from flashinfer.experimental.qwen_3_8_block import api as impl
+    from flashinfer.experimental.qwen_3_8_block import support
+    from flashinfer.qwen_3_8_block import (
+        prepare_qwen_3_8_block_bf16,
+        qwen_3_8_block_support,
+        qwen_3_8_block_workspace_size,
+    )
+
+    g = _geometry("24_2")
+    sup = qwen_3_8_block_support(torch.device("cuda", 0), g)
+    grid = support.EXTEND_GRID_ROWS_KEY
+    assert sup.extend_rows_grid_max == support.EXTEND_ROWS_GRID_MAX == 65535
+    assert (
+        grid in sup.decode.declines
+        and sup.decode.declines[grid] == sup.extend.declines[grid]
+    )
+    assert "65535" in sup.decode.declines[grid]
+
+    def reached():
+        raise AssertionError(
+            "the vendored declaration was reached past the launch-grid bound"
+        )
+
+    monkeypatch.setattr(impl, "_frost_block", reached)
+    case = Qsa38PagedCase(g, (64,), 1, page_size=16, seed=37)
+    with pytest.raises(NotImplementedError, match="65535") as info:
+        prepare_qwen_3_8_block_bf16(
+            "decode",
+            geometry=g,
+            device="cuda",
+            weights=case.weights38,
+            w_o=case.w_o,
+            kv_cache=case.kv_cache,
+            page_size=16,
+            batch_size=4096,
+            q_len_per_req=16,
+            block_table=case.block_table,
+            **case.plan_args(),
+        )
+    msg = str(info.value)
+    assert msg.startswith("qwen_3_8_block (decode):"), msg
+    assert (
+        "= 65536 rows" in msg
+        and "several decode steps" in msg
+        and "smaller batch" in msg
+    ), msg
+    with pytest.raises(NotImplementedError, match="65535") as info:
+        qwen_3_8_block_workspace_size(
+            "decode",
+            geometry=g,
+            device="cuda",
+            page_size=16,
+            batch_size=4096,
+            q_len_per_req=16,
+            max_pages=8,
+        )
+    assert str(info.value).startswith("qwen_3_8_block (decode):"), str(info.value)
+    impl._light_decode_gates(g, 16, 16, None, None, "auto", batch_size=4095)
 
 
 @pytest.mark.parametrize("page", [32, 64, 128])

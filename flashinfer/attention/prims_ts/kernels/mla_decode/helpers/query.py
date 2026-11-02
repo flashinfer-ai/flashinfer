@@ -76,7 +76,7 @@ class FlatQueryTileLayout:
 def query_batch_bounds(
     cu_seqlens_q,
     batch_idx,
-    logical_seq_len_q: cutlass.Constexpr[int],
+    logical_seq_len_q: Int32,
 ):
     """Return the compact-storage offset and logical Q length for a batch.
 
@@ -98,7 +98,7 @@ def runtime_flat_query_tile_valid_rows(
     query_tile_idx,
     tile_size_q: cutlass.Constexpr[int],
     logical_num_heads_q: cutlass.Constexpr[int],
-    logical_seq_len_q: cutlass.Constexpr[int],
+    logical_seq_len_q: Int32,
     cu_seqlens_q=None,
     batch_idx=None,
 ):
@@ -123,7 +123,7 @@ def runtime_flat_query_tile_has_rows(
     query_tile_idx,
     tile_size_q: cutlass.Constexpr[int],
     logical_num_heads_q: cutlass.Constexpr[int],
-    logical_seq_len_q: cutlass.Constexpr[int],
+    logical_seq_len_q: Int32,
     cu_seqlens_q=None,
     batch_idx=None,
 ):
@@ -145,7 +145,7 @@ def flat_query_row_state(
     query_tile_idx,
     tile_size_q: cutlass.Constexpr[int],
     logical_num_heads_q: cutlass.Constexpr[int],
-    logical_seq_len_q: cutlass.Constexpr[int],
+    logical_seq_len_q: Int32,
     cu_seqlens_q=None,
     batch_idx=None,
 ):
@@ -159,8 +159,24 @@ def flat_query_row_state(
     local_flat_query_row = Int32(query_tile_idx) * Int32(tile_size_q) + Int32(
         row_in_tile
     )
-    logical_q_idx = local_flat_query_row // Int32(logical_num_heads_q)
-    logical_head_idx = local_flat_query_row - logical_q_idx * Int32(logical_num_heads_q)
+    if cutlass.const_expr(
+        not isinstance(logical_seq_len_q, int)
+        and tile_size_q % logical_num_heads_q == 0
+    ):
+        # Runtime Q benefits from factoring the tile/head ratio. Static Q keeps
+        # the shared flat-coordinate quotient/remainder to limit live values
+        # in the fused RoPE/quantization epilogue.
+        row_q_idx = Int32(row_in_tile) // Int32(logical_num_heads_q)
+        logical_q_idx = (
+            Int32(query_tile_idx) * Int32(tile_size_q // logical_num_heads_q)
+            + row_q_idx
+        )
+        logical_head_idx = Int32(row_in_tile) - row_q_idx * Int32(logical_num_heads_q)
+    else:
+        logical_q_idx = local_flat_query_row // Int32(logical_num_heads_q)
+        logical_head_idx = local_flat_query_row - logical_q_idx * Int32(
+            logical_num_heads_q
+        )
     q_start, q_len = query_batch_bounds(
         cu_seqlens_q,
         batch_idx,
@@ -209,31 +225,21 @@ def split_o_element_offset(
 ):
     """Return a batch-dynamic partial-O offset with 64-bit-safe products.
 
-    Batch size is intentionally absent from the compile signature, so the
-    complete workspace extent cannot prove that every offset fits in Int32.
-    The within-batch layout is still compile-time constant, however. Keep that
-    common bounded part in 32-bit arithmetic and widen only the batch-stride
-    product. Use fully widened arithmetic when a profile's per-batch layout
-    alone exceeds Int32.
+    Batch and Q extents are runtime values. Widen their tile index, but keep
+    the bounded head/split offset in 32-bit arithmetic to avoid carrying wide
+    intermediates through the output epilogue.
     """
 
-    elements_per_batch = (
-        cfg.seq_len_q * cfg.num_heads_q * cfg.num_ctas_per_seq_kv * cfg.head_dim_v
-    )
-    if cutlass.const_expr(elements_per_batch <= (1 << 31) - 1):
-        within_batch_offset = (
-            (Int32(q_idx) * Int32(cfg.num_heads_q) + Int32(head_idx))
-            * Int32(cfg.num_ctas_per_seq_kv)
-            + Int32(split_idx)
+    elements_per_tile = cfg.num_heads_q * cfg.num_ctas_per_seq_kv * cfg.head_dim_v
+    tile_idx = Int64(batch_idx) * Int64(cfg.seq_len_q) + Int64(q_idx)
+    if cutlass.const_expr(elements_per_tile <= (1 << 31) - 1):
+        within_tile_offset = (
+            Int32(head_idx) * Int32(cfg.num_ctas_per_seq_kv) + Int32(split_idx)
         ) * Int32(cfg.head_dim_v) + Int32(dim_idx)
-        return Int64(batch_idx) * Int64(elements_per_batch) + Int64(within_batch_offset)
+        return tile_idx * Int64(elements_per_tile) + Int64(within_tile_offset)
 
     return (
-        (
-            (Int64(batch_idx) * Int64(cfg.seq_len_q) + Int64(q_idx))
-            * Int64(cfg.num_heads_q)
-            + Int64(head_idx)
-        )
+        (tile_idx * Int64(cfg.num_heads_q) + Int64(head_idx))
         * Int64(cfg.num_ctas_per_seq_kv)
         + Int64(split_idx)
     ) * Int64(cfg.head_dim_v) + Int64(dim_idx)

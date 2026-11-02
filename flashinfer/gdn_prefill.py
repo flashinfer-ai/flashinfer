@@ -770,6 +770,29 @@ _CAKE_GDN_CP_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 # ``max_seqlen`` admitted to the band.
 _CAKE_GDN_CP_SM107A_MAX_PARALLEL_STATES = 52
 _CAKE_GDN_CP_SM107A_MIN_MAX_SEQLEN = 4096
+# The band admits FP16 I/O only.  With BF16 I/O the SM107 CP program adds the
+# token-serial BF16 state repair recurrences (``_recurrence_requirements`` in
+# ``cake_gdn_cp_backend``), so the route costs about 25 us per token on R200
+# (51-433 ms per call at 4096-16384 tokens).
+_CAKE_GDN_CP_SM107A_IO_DTYPES = (torch.float16,)
+# BF16 I/O with FP32 initial+final state on SM107 (``use_cp="auto"``): the
+# (longest sequence, parallel states) bands where the non-CP Cake kernel is
+# slower than the default route on R200.  ``backend="cake_gdn"`` fails closed
+# there.  A row is in a band when its longest sequence is at least the first
+# value and ``num_seqs * num_sab_heads`` is at most the second.
+_CAKE_GDN_SM107A_FP32_STATE_FAIL_CLOSED_BANDS = ((8192, 32), (4096, 8))
+
+
+def _cake_gdn_sm107a_fp32_state_fails_closed(
+    *, num_seqs: int, num_sab_heads: int, max_seqlen: int
+) -> bool:
+    parallel_states = num_seqs * num_sab_heads
+    return any(
+        max_seqlen >= min_max_seqlen and parallel_states <= max_parallel_states
+        for min_max_seqlen, max_parallel_states in (
+            _CAKE_GDN_SM107A_FP32_STATE_FAIL_CLOSED_BANDS
+        )
+    )
 
 
 def _cake_gdn_cp_sm107a_plan_pays(
@@ -1154,7 +1177,7 @@ def chunk_gated_delta_rule(
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
     _cp_chunk_len: Optional[int] = None,
-    backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn"] = "auto",
+    backend: Literal["auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"] = "auto",
     max_seqlen: Optional[int] = None,
     *,
     gate_domain: Literal["linear", "log"] = "linear",
@@ -1298,7 +1321,7 @@ def chunk_gated_delta_rule(
         Internal context-parallel chunk-length override used for testing and
         tuning. ``None`` lets the CP backend select the length automatically;
         an explicit value must be a multiple of 64.
-    backend : {"auto", "flashinfer", "cake_gdn", "cudnn"}
+    backend : {"auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"}
         ``auto`` uses the native SM90/SM100/SM120 kernels and context-parallel
         routing, and may select cuDNN for measured SM100 raw-gate inference
         workloads. Automatic cuDNN selection requires both gate-fusion flags,
@@ -1332,8 +1355,10 @@ def chunk_gated_delta_rule(
         ``(HEAD_GROUP_LOG2, IS_GQA, NUM_O_HEADS_LOG2)`` geometry set of each
         contract is enumerated by
         :func:`flashinfer.jit.cake_gdn.cake_gdn_prefill_geometries` from
-        ``csrc/gdn/cake/manifest.json``; an unlisted geometry, schedule or
-        architecture raises ``CakeGDNUnsupportedError``. The BF16-I/O
+        ``csrc/gdn/cake/manifest.json``; on SM107 a DV-split key whose
+        geometry only the full-DV set lists runs the full-DV record, and an
+        unlisted geometry, schedule or architecture raises
+        ``CakeGDNUnsupportedError``. The BF16-I/O
         FP32-state initial+final contract covers the Qwen3-Next / Qwen3.5
         per-rank geometries for TP1, TP2, TP4 and TP8 in both physical
         schedules (DV-split and full-DV).
@@ -1376,7 +1401,9 @@ def chunk_gated_delta_rule(
         same values (vLLM's ``query_start_loc_cpu``, the prefix sums of
         SGLang's ``extend_seq_lens_cpu``). Used by ``backend="cake_gdn"``
         without CP, and on SM8x by the ``use_cp="auto"`` and V32 rules, which
-        need the exact longest sequence and keep the fused path without it. When given, the Cake
+        need the exact longest sequence and keep the fused path without it.
+        It is also required by the explicit experimental ``sm120_cute`` route.
+        When given, the Cake
         route validates it on the host (non-decreasing, first entry ``0``,
         last entry ``total_seq_len``; a mismatch raises before any launch),
         takes the exact longest sequence as the bound for variant selection,
@@ -1458,6 +1485,12 @@ def chunk_gated_delta_rule(
 
     Notes
     -----
+    - ``backend="sm120_cute"`` explicitly selects the experimental RTX 6000D
+      SM120 D=128 CuTe implementation. Fast calls require native finite FP32
+      log gates (``gate_domain="log"``), FP32 beta/state and matching immutable
+      ``cu_seqlens_cpu`` metadata. Unsupported calls, including checkpoints,
+      state pools, linear/raw gates and low-precision state, use FlashInfer's
+      official implementation. Stable automatic dispatch never selects it.
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
@@ -1474,8 +1507,40 @@ def chunk_gated_delta_rule(
       ``cu_seqlens_cpu`` gives a longest sequence of at least 8192 tokens and
       ``num_seqs * max(num_q_heads, num_v_heads)`` is at most 16.
     """
-    if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn"):
+    if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn", "sm120_cute"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if backend == "sm120_cute":
+        from .api_logging import warn_experimental_backend_once
+        from .experimental.gdn_sm120_cute import run
+
+        warn_experimental_backend_once("chunk_gated_delta_rule", "sm120_cute")
+        return run(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output=output,
+            output_state=output_state,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            use_cp=use_cp,
+            state_indices=state_indices,
+            _cp_chunk_len=_cp_chunk_len,
+            max_seqlen=max_seqlen,
+            gate_domain=gate_domain,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            beta_is_logit=beta_is_logit,
+            cu_seqlens_cpu=cu_seqlens_cpu,
+        )
     if backend != "cudnn" and (
         gate_domain != "linear"
         or use_gate_in_kernel
@@ -1799,6 +1864,7 @@ def chunk_gated_delta_rule(
         cake_cp_domain_matches
         and use_cp == "auto"
         and _device_capability == (10, 7)
+        and q.dtype in _CAKE_GDN_CP_SM107A_IO_DTYPES
         and num_seqs * num_sab_heads <= _CAKE_GDN_CP_SM107A_MAX_PARALLEL_STATES
         and cp_max_seqlen >= _CAKE_GDN_CP_SM107A_MIN_MAX_SEQLEN
         and _cake_gdn_cp_sm107a_plan_pays(
@@ -2068,6 +2134,29 @@ def chunk_gated_delta_rule(
     # against the existing prefill kernels. Keep them opt-in until automatic
     # dispatch has a performance-qualified domain.
     if backend == "cake_gdn":
+        if (
+            use_cp == "auto"
+            and _device_capability == (10, 7)
+            and q.dtype == torch.bfloat16
+            and initial_state is not None
+            and initial_state.dtype == torch.float32
+            and output_final_state
+            and _cake_gdn_sm107a_fp32_state_fails_closed(
+                num_seqs=num_seqs,
+                num_sab_heads=num_sab_heads,
+                max_seqlen=_cake_gdn_cp_band_max_seqlen(
+                    max_seqlen,
+                    total_seq_len,
+                    num_seqs,
+                    cu_seqlens_cpu=cu_seqlens_cpu,
+                ),
+            )
+        ):
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                "Cake GDN BF16 prefill with FP32 state is not qualified on SM107 "
+                "for long sequences with few parallel states; use the default "
+                "backend"
+            )
         return _run_cake_gdn_prefill(
             q=q,
             k=k,

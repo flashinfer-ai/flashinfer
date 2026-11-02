@@ -418,25 +418,25 @@ kernel_cake_deepgemm_dense_mqa_b0ed173eed7ef3e30556(const __grid_constant__ CUte
         ps_value1 = ((unsigned long long)splits_1 << 32) + (unsigned long long)cost_1;
     }
     unsigned long long lane_sum = ps_value0 + ps_value1;
-    unsigned long long synced = __shfl_up_sync(0xFFFFFFFF, lane_sum, 1, 32);
+    unsigned long long synced_4_0 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 1, 32);
     if (lane >= 1) {
-        lane_sum += synced;
+        lane_sum += synced_4_0;
     }
-    unsigned long long synced_0 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 2, 32);
+    unsigned long long synced_4_1 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 2, 32);
     if (lane >= 2) {
-        lane_sum += synced_0;
+        lane_sum += synced_4_1;
     }
-    unsigned long long synced_1 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 4, 32);
+    unsigned long long synced_4_2 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 4, 32);
     if (lane >= 4) {
-        lane_sum += synced_1;
+        lane_sum += synced_4_2;
     }
-    unsigned long long synced_2 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 8, 32);
+    unsigned long long synced_4_3 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 8, 32);
     if (lane >= 8) {
-        lane_sum += synced_2;
+        lane_sum += synced_4_3;
     }
-    unsigned long long synced_3 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 16, 32);
+    unsigned long long synced_4_4 = __shfl_up_sync(0xFFFFFFFF, lane_sum, 16, 32);
     if (lane >= 16) {
-        lane_sum += synced_3;
+        lane_sum += synced_4_4;
     }
     if (lane == 31) {
         scan_warp_sums[warp] = lane_sum;
@@ -447,25 +447,25 @@ kernel_cake_deepgemm_dense_mqa_b0ed173eed7ef3e30556(const __grid_constant__ CUte
         warp_total = scan_warp_sums[lane];
     }
     unsigned long long warp_sum = warp_total;
-    unsigned long long synced_w = __shfl_up_sync(0xFFFFFFFF, warp_sum, 1, 32);
+    unsigned long long synced_w_1_0 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 1, 32);
     if (lane >= 1) {
-        warp_sum += synced_w;
+        warp_sum += synced_w_1_0;
     }
-    unsigned long long synced_w_4 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 2, 32);
+    unsigned long long synced_w_1_1 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 2, 32);
     if (lane >= 2) {
-        warp_sum += synced_w_4;
+        warp_sum += synced_w_1_1;
     }
-    unsigned long long synced_w_5 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 4, 32);
+    unsigned long long synced_w_1_2 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 4, 32);
     if (lane >= 4) {
-        warp_sum += synced_w_5;
+        warp_sum += synced_w_1_2;
     }
-    unsigned long long synced_w_6 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 8, 32);
+    unsigned long long synced_w_1_3 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 8, 32);
     if (lane >= 8) {
-        warp_sum += synced_w_6;
+        warp_sum += synced_w_1_3;
     }
-    unsigned long long synced_w_7 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 16, 32);
+    unsigned long long synced_w_1_4 = __shfl_up_sync(0xFFFFFFFF, warp_sum, 16, 32);
     if (lane >= 16) {
-        warp_sum += synced_w_7;
+        warp_sum += synced_w_1_4;
     }
     unsigned long long preceding = __shfl_sync(0xFFFFFFFF, warp_sum - warp_total, warp);
     unsigned long long ps_incl1 = lane_sum + preceding;
@@ -524,49 +524,49 @@ kernel_cake_deepgemm_dense_mqa_b0ed173eed7ef3e30556(const __grid_constant__ CUte
                 }
             }
         }
-        unsigned int ps_count0;
-        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(ps_count0) : "r"(ps_below0));
-        unsigned int ps_cost_before0;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(ps_cost_before0) : "r"(ps_cost_below0));
-        unsigned int ps_work_before0;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(ps_work_before0) : "r"(ps_work_below0));
-        unsigned int ps_work_at0;
-        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(ps_work_at0) : "r"(ps_work_above0));
-        unsigned int ps_block0 = num_q_blocks;
-        unsigned int ps_split0 = 0;
-        unsigned int ps_coordinate0 = ps_total_work;
+        unsigned int count;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(count) : "r"(ps_below0));
+        unsigned int cost_before;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cost_before) : "r"(ps_cost_below0));
+        unsigned int work_before;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(work_before) : "r"(ps_work_below0));
+        unsigned int work_at;
+        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(work_at) : "r"(ps_work_above0));
+        unsigned int block = num_q_blocks;
+        unsigned int split = 0;
+        unsigned int coordinate = ps_total_work;
         if (ps_target0 != ps_total_cost) {
-            ps_block0 = ps_count0;
-            unsigned int _max_17 = ((ps_target0 - ps_cost_before0) > (1) ? (ps_target0 - ps_cost_before0) : (1));
-            unsigned int _min_16 = ((_max_17 - 1) < (ps_work_at0 - ps_work_before0 - 1) ? (_max_17 - 1) : (ps_work_at0 - ps_work_before0 - 1));
-            ps_split0 = _min_16;
-            ps_coordinate0 = ps_work_before0 + ps_split0;
+            block = count;
+            unsigned int _max_17 = ((ps_target0 - cost_before) > (1) ? (ps_target0 - cost_before) : (1));
+            unsigned int _min_16 = ((_max_17 - 1) < (work_at - work_before - 1) ? (_max_17 - 1) : (work_at - work_before - 1));
+            split = _min_16;
+            coordinate = work_before + split;
         }
-        unsigned int ps_count1;
-        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(ps_count1) : "r"(ps_below1));
-        unsigned int ps_cost_before1;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(ps_cost_before1) : "r"(ps_cost_below1));
-        unsigned int ps_work_before1;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(ps_work_before1) : "r"(ps_work_below1));
-        unsigned int ps_work_at1;
-        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(ps_work_at1) : "r"(ps_work_above1));
-        unsigned int ps_block1 = num_q_blocks;
-        unsigned int ps_split1 = 0;
-        unsigned int ps_coordinate1 = ps_total_work;
+        unsigned int count_0;
+        asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(count_0) : "r"(ps_below1));
+        unsigned int cost_before_0;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cost_before_0) : "r"(ps_cost_below1));
+        unsigned int work_before_0;
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(work_before_0) : "r"(ps_work_below1));
+        unsigned int work_at_0;
+        asm volatile("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(work_at_0) : "r"(ps_work_above1));
+        unsigned int block_0 = num_q_blocks;
+        unsigned int split_0 = 0;
+        unsigned int coordinate_0 = ps_total_work;
         if (ps_target1 != ps_total_cost) {
-            ps_block1 = ps_count1;
-            unsigned int _max_19 = ((ps_target1 - ps_cost_before1) > (1) ? (ps_target1 - ps_cost_before1) : (1));
-            unsigned int _min_18 = ((_max_19 - 1) < (ps_work_at1 - ps_work_before1 - 1) ? (_max_19 - 1) : (ps_work_at1 - ps_work_before1 - 1));
-            ps_split1 = _min_18;
-            ps_coordinate1 = ps_work_before1 + ps_split1;
+            block_0 = count_0;
+            unsigned int _max_19 = ((ps_target1 - cost_before_0) > (1) ? (ps_target1 - cost_before_0) : (1));
+            unsigned int _min_18 = ((_max_19 - 1) < (work_at_0 - work_before_0 - 1) ? (_max_19 - 1) : (work_at_0 - work_before_0 - 1));
+            split_0 = _min_18;
+            coordinate_0 = work_before_0 + split_0;
         }
         if (tid == 0) {
-            local_header[0] = ps_block0;
-            local_header[1] = ps_split0;
-            local_header[2] = ps_coordinate1 - ps_coordinate0;
-            ScheduleMeta[2 * bid] = ps_block0;
-            ScheduleMeta[2 * bid + 1] = ps_split0;
-            ScheduleMeta[2 * SM_COUNT + bid] = ps_coordinate1 - ps_coordinate0;
+            local_header[0] = block;
+            local_header[1] = split;
+            local_header[2] = coordinate_0 - coordinate;
+            ScheduleMeta[2 * bid] = block;
+            ScheduleMeta[2 * bid + 1] = split;
+            ScheduleMeta[2 * SM_COUNT + bid] = coordinate_0 - coordinate;
         }
     }
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -907,8 +907,8 @@ kernel_cake_deepgemm_dense_mqa_b0ed173eed7ef3e30556(const __grid_constant__ CUte
                             }
                             unsigned int _max_0 = ((coverage_end) > (clean_begin) ? (coverage_end) : (clean_begin));
                             unsigned int aligned_start_0 = (_max_0 + 3) / 4 * 4;
-                            unsigned int aligned_end_1 = clean_end / 4 * 4;
-                            if (aligned_start_0 >= aligned_end_1) {
+                            unsigned int aligned_end_0 = clean_end / 4 * 4;
+                            if (aligned_start_0 >= aligned_end_0) {
                                 for (unsigned int j_4 = _max_0 + (unsigned int)lane; j_4 < clean_end; j_4 += 32) {
                                     {
                                         auto _gst_4 = row_ptr + j_4;
@@ -925,7 +925,7 @@ kernel_cake_deepgemm_dense_mqa_b0ed173eed7ef3e30556(const __grid_constant__ CUte
                                         *(reinterpret_cast<float*>(_gst_5) + (0)) = -CUDART_INF_F;
                                     }
                                 }
-                                for (unsigned int j_6 = aligned_end_1 + (unsigned int)lane; j_6 < clean_end; j_6 += 32) {
+                                for (unsigned int j_6 = aligned_end_0 + (unsigned int)lane; j_6 < clean_end; j_6 += 32) {
                                     {
                                         auto _gst_6 = row_ptr + j_6;
                                         __builtin_assume(__isGlobal(_gst_6));
@@ -934,8 +934,8 @@ kernel_cake_deepgemm_dense_mqa_b0ed173eed7ef3e30556(const __grid_constant__ CUte
                                 }
                                 __syncwarp();
                                 if (elect_sync()) {
-                                    for (unsigned int j_7 = aligned_start_0; j_7 < aligned_end_1; j_7 += 1024) {
-                                        unsigned int bulk_elems_1 = ((aligned_end_1 - j_7) < (1024) ? (aligned_end_1 - j_7) : (1024));
+                                    for (unsigned int j_7 = aligned_start_0; j_7 < aligned_end_0; j_7 += 1024) {
+                                        unsigned int bulk_elems_1 = ((aligned_end_0 - j_7) < (1024) ? (aligned_end_0 - j_7) : (1024));
                                         {
                                             void* _cpbulk_dst_7 = reinterpret_cast<void*>(row_ptr + j_7);
                                             asm volatile(
@@ -1115,18 +1115,18 @@ kernel_cake_deepgemm_dense_mqa_b0ed173eed7ef3e30556(const __grid_constant__ CUte
                             }
                         }
                         float2 sum0_0 = make_float2(0.0f, 0.0f);
-                        float2 sum1_1 = make_float2(0.0f, 0.0f);
+                        float2 sum1_0 = make_float2(0.0f, 0.0f);
                         #pragma unroll
                         for (int j_9 = 0; j_9 < 32; j_9 += 4) {
                             float2 doubled0_1 = add_f32x2_noftz(make_float2(_tmem_load_1[j_9], _tmem_load_1[j_9 + 1]), make_float2(fabsf(_tmem_load_1[j_9]), fabsf(_tmem_load_1[j_9 + 1])));
                             sum0_0 = fma_f32x2_rn_noftz(doubled0_1, make_float2(weights_reg[32 + j_9], weights_reg[32 + j_9 + 1]), sum0_0);
                             float2 doubled1_1 = add_f32x2_noftz(make_float2(_tmem_load_1[j_9 + 2], _tmem_load_1[j_9 + 3]), make_float2(fabsf(_tmem_load_1[j_9 + 2]), fabsf(_tmem_load_1[j_9 + 3])));
-                            sum1_1 = fma_f32x2_rn_noftz(doubled1_1, make_float2(weights_reg[32 + j_9 + 2], weights_reg[32 + j_9 + 3]), sum1_1);
+                            sum1_0 = fma_f32x2_rn_noftz(doubled1_1, make_float2(weights_reg[32 + j_9 + 2], weights_reg[32 + j_9 + 3]), sum1_0);
                         }
-                        float2 total_2 = add_f32x2_noftz(sum0_0, sum1_1);
-                        float relu_wsum_3 = (total_2.x + total_2.y) * 0.5f;
+                        float2 total_0 = add_f32x2_noftz(sum0_0, sum1_0);
+                        float relu_wsum_0 = (total_0.x + total_0.y) * 0.5f;
                         int q_row_4 = q_start_0 + 1;
-                        float in_range_result_5 = scale_kv * relu_wsum_3;
+                        float in_range_result_5 = scale_kv * relu_wsum_0;
                         {
                             float materialized_result_1 = in_range_result_5;
                             unsigned int rel_kv_1 = (unsigned int)kv_pos - dense_start[1];
@@ -1140,19 +1140,19 @@ kernel_cake_deepgemm_dense_mqa_b0ed173eed7ef3e30556(const __grid_constant__ CUte
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
-                        float2 sum0_6 = make_float2(0.0f, 0.0f);
-                        float2 sum1_7 = make_float2(0.0f, 0.0f);
+                        float2 sum0_1 = make_float2(0.0f, 0.0f);
+                        float2 sum1_1 = make_float2(0.0f, 0.0f);
                         #pragma unroll
                         for (int j_10 = 0; j_10 < 32; j_10 += 4) {
                             float2 doubled0_2 = add_f32x2_noftz(make_float2(_tmem_load_2[j_10], _tmem_load_2[j_10 + 1]), make_float2(fabsf(_tmem_load_2[j_10]), fabsf(_tmem_load_2[j_10 + 1])));
-                            sum0_6 = fma_f32x2_rn_noftz(doubled0_2, make_float2(weights_reg[64 + j_10], weights_reg[64 + j_10 + 1]), sum0_6);
+                            sum0_1 = fma_f32x2_rn_noftz(doubled0_2, make_float2(weights_reg[64 + j_10], weights_reg[64 + j_10 + 1]), sum0_1);
                             float2 doubled1_2 = add_f32x2_noftz(make_float2(_tmem_load_2[j_10 + 2], _tmem_load_2[j_10 + 3]), make_float2(fabsf(_tmem_load_2[j_10 + 2]), fabsf(_tmem_load_2[j_10 + 3])));
-                            sum1_7 = fma_f32x2_rn_noftz(doubled1_2, make_float2(weights_reg[64 + j_10 + 2], weights_reg[64 + j_10 + 3]), sum1_7);
+                            sum1_1 = fma_f32x2_rn_noftz(doubled1_2, make_float2(weights_reg[64 + j_10 + 2], weights_reg[64 + j_10 + 3]), sum1_1);
                         }
-                        float2 total_8 = add_f32x2_noftz(sum0_6, sum1_7);
-                        float relu_wsum_9 = (total_8.x + total_8.y) * 0.5f;
+                        float2 total_1 = add_f32x2_noftz(sum0_1, sum1_1);
+                        float relu_wsum_1 = (total_1.x + total_1.y) * 0.5f;
                         int q_row_10 = q_start_0 + 2;
-                        float in_range_result_11 = scale_kv * relu_wsum_9;
+                        float in_range_result_11 = scale_kv * relu_wsum_1;
                         {
                             float materialized_result_2 = in_range_result_11;
                             unsigned int rel_kv_2 = (unsigned int)kv_pos - dense_start[2];
@@ -1163,19 +1163,19 @@ kernel_cake_deepgemm_dense_mqa_b0ed173eed7ef3e30556(const __grid_constant__ CUte
                                 *(reinterpret_cast<float*>(Logits + out_elem_u32_2) + (0)) = materialized_result_2;
                             }
                         }
-                        float2 sum0_12 = make_float2(0.0f, 0.0f);
-                        float2 sum1_13 = make_float2(0.0f, 0.0f);
+                        float2 sum0_2 = make_float2(0.0f, 0.0f);
+                        float2 sum1_2 = make_float2(0.0f, 0.0f);
                         #pragma unroll
                         for (int j_11 = 0; j_11 < 32; j_11 += 4) {
                             float2 doubled0_3 = add_f32x2_noftz(make_float2(_tmem_load_3[j_11], _tmem_load_3[j_11 + 1]), make_float2(fabsf(_tmem_load_3[j_11]), fabsf(_tmem_load_3[j_11 + 1])));
-                            sum0_12 = fma_f32x2_rn_noftz(doubled0_3, make_float2(weights_reg[96 + j_11], weights_reg[96 + j_11 + 1]), sum0_12);
+                            sum0_2 = fma_f32x2_rn_noftz(doubled0_3, make_float2(weights_reg[96 + j_11], weights_reg[96 + j_11 + 1]), sum0_2);
                             float2 doubled1_3 = add_f32x2_noftz(make_float2(_tmem_load_3[j_11 + 2], _tmem_load_3[j_11 + 3]), make_float2(fabsf(_tmem_load_3[j_11 + 2]), fabsf(_tmem_load_3[j_11 + 3])));
-                            sum1_13 = fma_f32x2_rn_noftz(doubled1_3, make_float2(weights_reg[96 + j_11 + 2], weights_reg[96 + j_11 + 3]), sum1_13);
+                            sum1_2 = fma_f32x2_rn_noftz(doubled1_3, make_float2(weights_reg[96 + j_11 + 2], weights_reg[96 + j_11 + 3]), sum1_2);
                         }
-                        float2 total_14 = add_f32x2_noftz(sum0_12, sum1_13);
-                        float relu_wsum_15 = (total_14.x + total_14.y) * 0.5f;
+                        float2 total_2 = add_f32x2_noftz(sum0_2, sum1_2);
+                        float relu_wsum_2 = (total_2.x + total_2.y) * 0.5f;
                         int q_row_16 = q_start_0 + 3;
-                        float in_range_result_17 = scale_kv * relu_wsum_15;
+                        float in_range_result_17 = scale_kv * relu_wsum_2;
                         {
                             float materialized_result_3 = in_range_result_17;
                             unsigned int rel_kv_3 = (unsigned int)kv_pos - dense_start[3];

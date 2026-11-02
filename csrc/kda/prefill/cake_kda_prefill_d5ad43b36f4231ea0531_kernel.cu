@@ -230,62 +230,62 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
         if (place % 2 == 1) {
             wanted = seq_count - 1 - place / 2;
         }
-        int rank = 0;
+        int rank_0 = 0;
         if (windows[1] > windows[0]) {
-            rank = rank + 1;
+            rank_0 = rank_0 + 1;
         }
         if (windows[2] > windows[0]) {
-            rank = rank + 1;
+            rank_0 = rank_0 + 1;
         }
         if (windows[3] > windows[0]) {
-            rank = rank + 1;
+            rank_0 = rank_0 + 1;
         }
-        if (rank == wanted) {
+        if (rank_0 == wanted) {
             sequence = 0;
             part_begin = bounds[0];
             part_stop = bounds[1];
         }
-        int rank_0 = 0;
+        int rank_1 = 0;
         if (windows[0] >= windows[1]) {
-            rank_0 = rank_0 + 1;
+            rank_1 = rank_1 + 1;
         }
         if (windows[2] > windows[1]) {
-            rank_0 = rank_0 + 1;
+            rank_1 = rank_1 + 1;
         }
         if (windows[3] > windows[1]) {
-            rank_0 = rank_0 + 1;
+            rank_1 = rank_1 + 1;
         }
-        if (rank_0 == wanted) {
+        if (rank_1 == wanted) {
             sequence = 1;
             part_begin = bounds[1];
             part_stop = bounds[2];
         }
-        int rank_1 = 0;
+        int rank_2 = 0;
         if (windows[0] >= windows[2]) {
-            rank_1 = rank_1 + 1;
+            rank_2 = rank_2 + 1;
         }
         if (windows[1] >= windows[2]) {
-            rank_1 = rank_1 + 1;
+            rank_2 = rank_2 + 1;
         }
         if (windows[3] > windows[2]) {
-            rank_1 = rank_1 + 1;
+            rank_2 = rank_2 + 1;
         }
-        if (rank_1 == wanted) {
+        if (rank_2 == wanted) {
             sequence = 2;
             part_begin = bounds[2];
             part_stop = bounds[3];
         }
-        int rank_2 = 0;
+        int rank_3 = 0;
         if (windows[0] >= windows[3]) {
-            rank_2 = rank_2 + 1;
+            rank_3 = rank_3 + 1;
         }
         if (windows[1] >= windows[3]) {
-            rank_2 = rank_2 + 1;
+            rank_3 = rank_3 + 1;
         }
         if (windows[2] >= windows[3]) {
-            rank_2 = rank_2 + 1;
+            rank_3 = rank_3 + 1;
         }
-        if (rank_2 == wanted) {
+        if (rank_3 == wanted) {
             sequence = 3;
             part_begin = bounds[3];
             part_stop = bounds[4];

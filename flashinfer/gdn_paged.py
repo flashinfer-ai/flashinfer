@@ -113,8 +113,8 @@ class GDNPagedPrefillSlots(NamedTuple):
     """Page holding the last prefix token, read as the initial state (``-1``:
     empty prefix, zero state)."""
     output_state_indices: torch.Tensor
-    """Last page, written with the final state (``-1``: no new token, or the
-    final state is the checkpoint of a page that ends there)."""
+    """Last page, written with the final state. ``-1`` means there is no new
+    token or the final state is the checkpoint of a page that ends there."""
     checkpoint_cu_starts: torch.Tensor
     """``page_indices`` entry of the first page boundary the new tokens cross."""
     prefix_lens: torch.Tensor

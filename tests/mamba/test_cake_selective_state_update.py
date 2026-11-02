@@ -1147,6 +1147,9 @@ def test_every_route_build_ships_for_its_architecture() -> None:
             for build in builds:
                 module = cake.PROGRAMS[build]
                 assert arch in cake.MODULES[module].get("arches", [arch]), (build, arch)
+        for build in cake._L2H_SHAPES.get((arch, sms), {}):
+            module = cake.PROGRAMS[f"{build}_l2h"]
+            assert arch in cake.MODULES[module].get("arches", [arch]), (build, arch)
 
 
 @requires_blackwell
@@ -1173,14 +1176,11 @@ _PAIRED_ROWS_CASES = (
     (("dim128_hpc2", 48, 64, 8, 128, 128, 0), False, "stp_dim128_hpc2"),
     (("dim128_hpc1", 32, 16, 16, 128, 128, 0), False, "stp_dim128_hpc1_s2w4"),
     (("dim128_hpc1_mb4", 40, 16, 16, 128, 128, 0), False, "stp_dim128_hpc1_mb4"),
-    # Batch 64: the z-gated one-token ring on B200, the persistent build on GB300.
+    # Batch 64: the z-gated one-token ring on B200 and GB300.
     (
         ("dim128_z", 64, 64, 8, 128, 128, 0),
         True,
-        {
-            "sm_100a": "mtp_short_ring_heads64_groups8_t1_stp_z",
-            "sm_103a": "stp_dim128_z_balanced",
-        },
+        "mtp_short_ring_heads64_groups8_t1_stp_z",
     ),
     (("dim128_z_b16", 16, 64, 8, 128, 128, 0), True, "stp_dim128_z_gated"),
     (("dim128_z_hpc1", 32, 16, 16, 128, 128, 0), True, "stp_dim128_z_gated"),
@@ -2409,22 +2409,24 @@ def test_stp_ring_route_keeps_the_single_token_programs_off_its_layout(
 
 
 # The same ring with the gate ``z`` (64 heads in 8 groups): BF16 single-token calls of that shape with ``z`` take
-# it at the measured batch on sm_100a at 148 SMs.
+# it at the measured batch on sm_100a at 148 SMs and sm_103a at 152 SMs.
 _STP_RING_Z = "mtp_short_ring_heads64_groups8_t1_stp_z"
 
 
 def test_stp_ring_programs_follow_the_measured_shapes() -> None:
-    """The z-gated ring runs 64 heads in 8 groups with ``z`` at batch 64, on sm_100a at 148 SMs alone; a call of
-    64 heads without ``z`` keeps the 64-head ring's intervals."""
-    devices = (("sm_103a", 152), ("sm_103a", 148), ("sm_100a", 152), ("sm_100a", 132))
+    """The z-gated ring runs 64 heads in 8 groups with ``z`` at batch 64, on sm_100a at 148 SMs and sm_103a at
+    152 SMs alone; a call of 64 heads without ``z`` keeps the 64-head ring's intervals (none on sm_103a)."""
+    devices = (("sm_103a", 148), ("sm_100a", 152), ("sm_100a", 132))
     for batch_size in range(1, 4097):
         program = cake.dim128_stp_ring_program
-        gated = program(batch_size, 64, 8, 148, "sm_100a", True)
-        assert gated == (_STP_RING_Z if batch_size == 64 else None)
+        for arch, sm_count in (("sm_100a", 148), ("sm_103a", 152)):
+            gated = program(batch_size, 64, 8, sm_count, arch, True)
+            assert gated == (_STP_RING_Z if batch_size == 64 else None)
         ring = cake.dim128_stp_ring(batch_size, 64, 8, 148, "sm_100a")
         assert program(batch_size, 64, 8, 148, "sm_100a", False) == (
             _STP_RING if ring else None
         )
+        assert program(batch_size, 64, 8, 152, "sm_103a", False) is None
         for arch, sm_count in devices:
             assert program(batch_size, 64, 8, sm_count, arch, False) is None
             assert program(batch_size, 64, 8, sm_count, arch, True) is None
@@ -2494,6 +2496,87 @@ def test_stp_ring_z_is_bitwise_the_single_token_build(
     assert cake_hits == [True]
     assert torch.equal(out_candidate, out_ring.view(out_candidate.shape))
     assert torch.equal(candidate["state"], ring_arm["state"])
+
+
+# The L2 read-ahead builds of the sm_100a lean P-split builds at five CTAs per SM, which launches of the measured
+# shapes on sm_100a at 148 SMs take: (case, lean build).
+_L2H_CASES = (
+    (("l2h_dim128", 257, 128, 8, 128, 128, 0), "stp_dim128_hpc2_s2w4_mb5_lean"),
+    (("l2h_hd64", 320, 128, 8, 64, 128, 0), "stp_hd64_paired_hpc2_s2w4_mb5_lean"),
+)
+_L2H_BUILDS = tuple(build for _, build in _L2H_CASES)
+
+
+def test_l2h_programs_follow_the_measured_shapes() -> None:
+    """A launch of a lean P-split build at five CTAs per SM runs its L2 read-ahead build at the measured shape, on
+    sm_100a at 148 SMs alone; every other build, shape or device keeps the build."""
+    for case, build in _L2H_CASES:
+        _, batch_size, nheads, ngroups = case[:4]
+        program = cake.l2h_program
+        assert (
+            program(build, batch_size, nheads, ngroups, 148, "sm_100a")
+            == f"{build}_l2h"
+        )
+        for b in (batch_size - 1, batch_size + 1, 2 * batch_size):
+            assert program(build, b, nheads, ngroups, 148, "sm_100a") == build
+        assert program(build, batch_size, nheads // 2, ngroups, 148, "sm_100a") == build
+        assert program(build, batch_size, nheads, ngroups * 2, 148, "sm_100a") == build
+        for arch, sm_count in (
+            ("sm_103a", 152),
+            ("sm_103a", 148),
+            ("sm_100a", 152),
+            ("sm_100a", 132),
+        ):
+            assert program(build, batch_size, nheads, ngroups, sm_count, arch) == build
+        other = [b for b in _L2H_BUILDS if b != build][0]
+        assert program(other, batch_size, nheads, ngroups, 148, "sm_100a") == other
+        assert program(
+            build.removesuffix("_lean"), batch_size, nheads, ngroups, 148, "sm_100a"
+        ) == (build.removesuffix("_lean"))
+
+
+@requires_blackwell
+@pytest.mark.parametrize("case, build", _L2H_CASES, ids=[c[0][0] for c in _L2H_CASES])
+def test_l2h_build_is_bitwise_the_lean_build(
+    case, build, monkeypatch, cake_hits
+) -> None:
+    """The L2 read-ahead build writes the output and state of the lean build the launch runs without it, bit for
+    bit, on the same inputs (every output position written), and matches FlashInfer."""
+    inputs = _make_case((*case, torch.bfloat16, "auto", False, None))
+    reference = dict(inputs, state=inputs["state"].clone())
+    out_reference = selective_state_update(**reference, backend="flashinfer")
+    l2h_arm, lean_arm = _split_arms(inputs)
+    l2h_plan = _route(l2h_arm)
+    if l2h_plan is None or l2h_plan.program != f"{build}_l2h":
+        pytest.skip("the route takes no L2 read-ahead build on this device")
+    measured = cake._L2H_SHAPES
+    monkeypatch.setattr(cake, "_L2H_SHAPES", {})
+    lean_plan = _route(lean_arm)
+    assert lean_plan is not None and lean_plan.program == build
+    assert (lean_plan.grid, lean_plan.arch) == (l2h_plan.grid, l2h_plan.arch)
+    for plan in (l2h_plan, lean_plan):
+        plan.bindings["output"].fill_(float("nan"))
+    with torch.cuda.device(l2h_plan.device_index):
+        for plan in (l2h_plan, lean_plan):
+            cake._program(plan.program, plan.arch, plan.defines).launch(
+                plan.grid, plan.bindings
+            )
+    out_l2h, out_lean = l2h_plan.bindings["output"], lean_plan.bindings["output"]
+    assert not out_l2h.isnan().any(), (
+        "the L2 read-ahead build left output positions unwritten"
+    )
+    assert torch.equal(out_l2h, out_lean)
+    assert torch.equal(l2h_arm["state"], lean_arm["state"])
+    torch.testing.assert_close(out_l2h, out_reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        l2h_arm["state"], reference["state"], atol=1e-2, rtol=1e-2
+    )
+    monkeypatch.setattr(cake, "_L2H_SHAPES", measured)
+    candidate = dict(inputs, state=inputs["state"].clone())
+    out_candidate = cake_selective_state_update(**candidate)
+    assert cake_hits == [True]
+    assert torch.equal(out_candidate, out_l2h.view(out_candidate.shape))
+    assert torch.equal(candidate["state"], l2h_arm["state"])
 
 
 @requires_blackwell
@@ -2867,14 +2950,16 @@ def test_registry_names_every_program() -> None:
     # build) and the six-token cache producer instantiated per projection layout (layouts beyond the rendered
     # three).
     carried = {"stp_hd64_rows_fp32", "mtp_cache_c4_t6"}
-    assert set(cake.PROGRAMS) == set(paired_rows) | rows | multi_token | carried
-    assert len(cake.PROGRAMS) == 76
+    # The L2 read-ahead builds of the lean P-split builds at their measured shapes on sm_100a.
+    l2h = {f"{build}_l2h" for build in _L2H_BUILDS}
+    assert set(cake.PROGRAMS) == set(paired_rows) | l2h | rows | multi_token | carried
+    assert len(cake.PROGRAMS) == 78
     # A build shipping on one architecture spells it; every other record serves both.
     expected_arches = dict(
         paired_rows,
         **{
             _STP_RING: b200,
-            _STP_RING_Z: b200,
+            **{f"{build}_l2h": b200 for build in _L2H_BUILDS},
             _JR_RING: b200,
             _JR_HB_RING: gb300,
         },

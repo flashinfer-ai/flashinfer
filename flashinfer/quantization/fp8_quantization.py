@@ -17,6 +17,10 @@ from ..jit.cake_grouped_mxfp8_quantize import (
     BULK_BF16 as _CAKE_GROUPED_MXFP8_BULK_BF16,
     BULK_F16 as _CAKE_GROUPED_MXFP8_BULK_F16,
     F16 as _CAKE_GROUPED_MXFP8_F16,
+    HEAD2048_BF16 as _CAKE_GROUPED_MXFP8_HEAD2048_BF16,
+    HEAD2048_F16 as _CAKE_GROUPED_MXFP8_HEAD2048_F16,
+    HEAD4096_BF16 as _CAKE_GROUPED_MXFP8_HEAD4096_BF16,
+    HEAD4096_F16 as _CAKE_GROUPED_MXFP8_HEAD4096_F16,
     TILED_BF16 as _CAKE_GROUPED_MXFP8_TILED_BF16,
     TILED_F16 as _CAKE_GROUPED_MXFP8_TILED_F16,
     TILED_K2048_BF16 as _CAKE_GROUPED_MXFP8_TILED_K2048_BF16,
@@ -480,7 +484,7 @@ def get_mxfp8_grouped_quantization_module():
     )
 
 
-# Generated Cake programs of the grouped MXFP8 quantizer: six programs per
+# Generated Cake programs of the grouped MXFP8 quantizer: eight programs per
 # input dtype, all writing the same bytes.  Every program reads two-byte
 # elements through one bfloat16 pointer (the float16 programs widen with their
 # own conversion), so the host selects the program by dtype and shape and
@@ -492,6 +496,19 @@ def get_mxfp8_grouped_quantization_module():
 _CAKE_GROUPED_MXFP8_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
     torch.bfloat16: _CAKE_GROUPED_MXFP8_BF16,
     torch.float16: _CAKE_GROUPED_MXFP8_F16,
+}
+# The head-window programs are the row-2D kernel with two L2 prefetches: the
+# first CTA warms L2 with the mask, and each CTA whose slice of the input
+# starts in the first 2 MiB (or 4 MiB) of the input warms L2 with that slice
+# as soon as it has issued its mask-word load.  The mask prefetch is a bulk
+# prefetch of the mask's address, which must be a multiple of 16 bytes.
+_CAKE_GROUPED_MXFP8_HEAD2048_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_HEAD2048_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_HEAD2048_F16,
+}
+_CAKE_GROUPED_MXFP8_HEAD4096_PROGRAMS: Dict[torch.dtype, CakeProgram] = {
+    torch.bfloat16: _CAKE_GROUPED_MXFP8_HEAD4096_BF16,
+    torch.float16: _CAKE_GROUPED_MXFP8_HEAD4096_F16,
 }
 # The bulk kernel has the row-2D grid and copies the CTA's blocks to shared
 # memory before it reads the mask word, so the two round trips overlap.  It
@@ -544,6 +561,14 @@ _CAKE_TILED_PROGRAMS_BY_K: Dict[int, Dict[torch.dtype, CakeProgram]] = {
     4096: _CAKE_GROUPED_MXFP8_TILED_K4096_PROGRAMS,
     2048: _CAKE_GROUPED_MXFP8_TILED_K2048_PROGRAMS,
 }
+# Problems of exactly these (B, M, K) that would take the row-2D program take
+# a head-window program instead when the mask is 16-byte aligned.
+_CAKE_HEAD_PROGRAMS_BY_SHAPE: Dict[
+    Tuple[int, int, int], Dict[torch.dtype, CakeProgram]
+] = {
+    (8, 512, 2048): _CAKE_GROUPED_MXFP8_HEAD2048_PROGRAMS,
+    (64, 128, 4096): _CAKE_GROUPED_MXFP8_HEAD4096_PROGRAMS,
+}
 _CAKE_QUANT_BLOCK = 32
 # One block row per M and one grid slice per B: CUDA caps grid.y and grid.z at 65535.
 _CAKE_MAX_GRID_YZ = 65535
@@ -592,14 +617,21 @@ def is_cake_grouped_mxfp8_quantize_available(
 
 
 def cake_grouped_mxfp8_quantize_program(
-    dtype: torch.dtype, b: int, m: int, k: int, padded_k: Optional[int] = None
+    dtype: torch.dtype,
+    b: int,
+    m: int,
+    k: int,
+    padded_k: Optional[int] = None,
+    mask_aligned: bool = True,
 ) -> CakeProgram:
     """The program that quantizes ``b`` groups of ``m`` rows of ``k`` elements of
     ``dtype`` into rows of ``padded_k`` codes (default ``round_up(k, 128)``),
     chosen from the shape alone (the host never reads the mask).
 
-    The bulk and tiled programs take rows padded to ``round_up(k, 128)``; a wider
-    padded row keeps the row-2D program, whose CTAs past ``k`` read nothing.
+    The bulk, tiled and head-window programs take rows padded to
+    ``round_up(k, 128)``; a wider padded row keeps the row-2D program, whose CTAs
+    past ``k`` read nothing.  ``mask_aligned`` says whether the mask's address is
+    a multiple of 16 bytes; the head-window programs need it.
     """
     programs = (
         _CAKE_GROUPED_MXFP8_PROGRAMS,
@@ -617,6 +649,9 @@ def cake_grouped_mxfp8_quantize_program(
         return bulk
     if b * m >= _CAKE_TILED_MIN_ROWS:
         return tiled
+    head_window = _CAKE_HEAD_PROGRAMS_BY_SHAPE.get((b, m, k))
+    if head_window is not None and mask_aligned:
+        return head_window[dtype]
     return row2d
 
 
@@ -697,7 +732,9 @@ def cake_grouped_mxfp8_quantize_launch(
             "scales must have shape [B, padded_M, padded_K / 32] with padded_M a "
             f"multiple of {_CAKE_SCALE_TILE} and >= M={m}, got {list(scales_shape)}"
         )
-    program = cake_grouped_mxfp8_quantize_program(a.dtype, b, m, k, padded_k)
+    program = cake_grouped_mxfp8_quantize_program(
+        a.dtype, b, m, k, padded_k, mask.data_ptr() % 16 == 0
+    )
     target = _cake_grouped_mxfp8_target(program, a.device)
     pm_tiles = padded_m // _CAKE_SCALE_TILE
     pk_tiles = padded_k // _CAKE_SCALE_TILE

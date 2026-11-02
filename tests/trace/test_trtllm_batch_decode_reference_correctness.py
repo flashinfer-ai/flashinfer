@@ -87,3 +87,34 @@ def test_trtllm_batch_decode_reference_correctness(shape_kwargs):
     _check(trtllm_batch_decode_trace, ref_out, api_out, atol=1e-2, rtol=1e-2)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize(
+    "shape_kwargs",
+    [
+        pytest.param(
+            dict(num_tokens=4, num_heads=16, head_dim=256, sparse_top_k=512),
+            id="T4-Hq16-D256-K512",
+        ),
+        pytest.param(
+            dict(num_tokens=7, num_heads=8, head_dim=256, sparse_top_k=2048),
+            id="T7-Hq8-D256-K2048",
+        ),
+    ],
+)
+def test_trtllm_batch_decode_token_sparse_reference_correctness(shape_kwargs):
+    """trtllm_batch_decode token-sparse kernel vs reference (SM100/103)."""
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+    from flashinfer.trace.templates.attention import (
+        _trtllm_batch_decode_token_sparse_init,
+        trtllm_batch_decode_token_sparse_trace,
+    )
+
+    _skip_if_not_sm100_or_103()
+    inputs = _trtllm_batch_decode_token_sparse_init(**shape_kwargs, device="cuda")
+    api_out = trtllm_batch_decode_with_kv_cache(**inputs)
+    ref_out = trtllm_batch_decode_token_sparse_trace.reference(**inputs)
+    # Matches tests/attention/test_trtllm_gen_token_sparse.py's BF16 tolerance.
+    _check(
+        trtllm_batch_decode_token_sparse_trace, ref_out, api_out, atol=1e-2, rtol=1e-2
+    )

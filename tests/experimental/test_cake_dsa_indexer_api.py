@@ -15,8 +15,8 @@ limitations under the License.
 
 Tests of the flashinfer public entry point of the experimental Cake DSA
 indexer top-k backend (flashinfer-ai/flashinfer#5676):
-``flashinfer.dsa_indexer.dsa_indexer_topk`` and
-``dsa_indexer_topk_workspace_size`` against the backend package, and the
+``flashinfer.dsa_indexer.dsa_indexer_det_topk`` and
+``dsa_indexer_det_topk_workspace_size`` against the backend package, and the
 experimental-API warning contract of that entry point.  The backend contract
 itself (registry, dispatch policy, validation, binding, the reference and the
 operator tests) lives in ``test_cake_dsa_indexer.py``, which imports only the
@@ -25,16 +25,20 @@ device with registered generated programs and skips otherwise.
 """
 
 import contextlib
+import importlib
 import warnings
 
 import pytest
 import torch
 from flashinfer.api_logging import ExperimentalWarning
-from flashinfer.dsa_indexer import dsa_indexer_topk, dsa_indexer_topk_workspace_size
-from flashinfer.experimental.cake_dsa_indexer import cake_backend
-from flashinfer.experimental.cake_dsa_indexer.cake_backend import (
+from flashinfer.dsa_indexer import (
+    dsa_indexer_det_topk,
+    dsa_indexer_det_topk_workspace_size,
+)
+from flashinfer.experimental.cake_dsa_indexer_det import cake_backend
+from flashinfer.experimental.cake_dsa_indexer_det.cake_backend import (
     SUPPORTED_COMPUTE_CAPABILITIES,
-    dsa_indexer_workspace_size,
+    dsa_indexer_det_workspace_size,
     generated_program_available,
 )
 
@@ -63,7 +67,7 @@ def _quiet_experimental():
 
 def _run(inputs: ref.IndexerInputs, **extra):
     """The backend call the public entry point must reproduce bit for bit."""
-    out = cake_backend.dsa_indexer_topk(
+    out = cake_backend.dsa_indexer_det_topk(
         inputs.q,
         inputs.k,
         inputs.w,
@@ -77,7 +81,7 @@ def _run(inputs: ref.IndexerInputs, **extra):
 
 
 def test_public_api_is_marked_experimental():
-    assert dsa_indexer_topk.is_experimental
+    assert dsa_indexer_det_topk.is_experimental
 
 
 def test_public_entry_point_matches_backend_and_warns_once():
@@ -87,7 +91,7 @@ def test_public_entry_point_matches_backend_and_warns_once():
     )
     expected = _run(inputs)
     with pytest.warns(ExperimentalWarning):
-        got = dsa_indexer_topk(
+        got = dsa_indexer_det_topk(
             inputs.q,
             inputs.k,
             inputs.w,
@@ -98,7 +102,7 @@ def test_public_entry_point_matches_backend_and_warns_once():
     assert ref.same_bits(got, expected)
     with warnings.catch_warnings():
         warnings.simplefilter("error", ExperimentalWarning)
-        again = dsa_indexer_topk(
+        again = dsa_indexer_det_topk(
             inputs.q,
             inputs.k,
             inputs.w,
@@ -109,13 +113,13 @@ def test_public_entry_point_matches_backend_and_warns_once():
             max_seqlen_k=max(inputs.seg_k_len),
         )
     assert ref.same_bits(again, expected)
-    assert dsa_indexer_topk_workspace_size(
+    assert dsa_indexer_det_topk_workspace_size(
         inputs.num_queries,
         inputs.num_keys,
         inputs.num_segments,
         top_k=128,
         device=inputs.device,
-    ) == dsa_indexer_workspace_size(
+    ) == dsa_indexer_det_workspace_size(
         inputs.num_queries,
         inputs.num_keys,
         inputs.num_segments,
@@ -123,7 +127,7 @@ def test_public_entry_point_matches_backend_and_warns_once():
         device=inputs.device,
     )
     with pytest.raises(ValueError, match="backend"), _quiet_experimental():
-        dsa_indexer_topk(
+        dsa_indexer_det_topk(
             inputs.q,
             inputs.k,
             inputs.w,
@@ -131,3 +135,59 @@ def test_public_entry_point_matches_backend_and_warns_once():
             inputs.cu_seqlens_k,
             backend="other",
         )
+
+
+# -- previous names: aliases of the canonical objects (identity, not copies) ----------------------------------------
+
+PUBLIC_ALIASES = (
+    ("dsa_indexer_topk", "dsa_indexer_det_topk"),
+    ("dsa_indexer_topk_workspace_size", "dsa_indexer_det_topk_workspace_size"),
+)
+BACKEND_ALIASES = (
+    ("DSAIndexerRunner", "DSAIndexerDetRunner"),
+    ("dsa_indexer_topk", "dsa_indexer_det_topk"),
+    ("dsa_indexer_workspace_size", "dsa_indexer_det_workspace_size"),
+    ("plan_dsa_indexer_topk", "plan_dsa_indexer_det_topk"),
+    ("prepare_dsa_indexer_topk", "prepare_dsa_indexer_det_topk"),
+    ("validate_dsa_indexer_inputs", "validate_dsa_indexer_det_inputs"),
+)
+CANONICAL_PACKAGE = "flashinfer.experimental.cake_dsa_indexer_det"
+PREVIOUS_PACKAGE = "flashinfer.experimental.cake_dsa_indexer"
+
+
+@pytest.mark.parametrize("previous,canonical", PUBLIC_ALIASES)
+def test_public_previous_names_are_the_canonical_objects(previous, canonical):
+    api = importlib.import_module("flashinfer.dsa_indexer")
+    obj = getattr(api, canonical)
+    assert getattr(api, previous) is obj
+    assert obj.__name__ == canonical
+
+
+@pytest.mark.parametrize("previous,canonical", BACKEND_ALIASES)
+def test_backend_previous_names_are_the_canonical_objects(previous, canonical):
+    obj = getattr(cake_backend, canonical)
+    assert getattr(cake_backend, previous) is obj
+    assert obj.__name__ == canonical
+    assert previous in cake_backend.__all__ and canonical in cake_backend.__all__
+
+
+@pytest.mark.parametrize(
+    "submodule", ["cake_backend", "cake_build", "cake_jit", "cake_policy"]
+)
+def test_previous_package_path_resolves_to_the_canonical_modules(submodule):
+    canonical = importlib.import_module(f"{CANONICAL_PACKAGE}.{submodule}")
+    assert canonical.__name__ == f"{CANONICAL_PACKAGE}.{submodule}"
+    assert importlib.import_module(f"{PREVIOUS_PACKAGE}.{submodule}") is canonical
+    assert getattr(importlib.import_module(PREVIOUS_PACKAGE), submodule) is canonical
+
+
+def test_previous_package_path_serves_the_previous_names():
+    from flashinfer.experimental.cake_dsa_indexer import cake_backend as previous
+    from flashinfer.experimental.cake_dsa_indexer.cake_backend import (
+        DSAIndexerRunner,
+        dsa_indexer_topk,
+    )
+
+    assert previous is cake_backend
+    assert DSAIndexerRunner is cake_backend.DSAIndexerDetRunner
+    assert dsa_indexer_topk is cake_backend.dsa_indexer_det_topk

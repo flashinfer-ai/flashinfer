@@ -462,6 +462,79 @@ def test_zero_length_plans_keep_semantic_fixup_and_skip_empty_grids(
     assert empty.cp_grid[0] == 0
 
 
+def _sm107_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    num_sms: int,
+) -> gdn_cp.GDNCPPrefillPlan:
+    monkeypatch.setattr(gdn_cp, "_arch_for", lambda _device: "sm_107a")
+    monkeypatch.setattr(
+        gdn_cp.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=num_sms),
+    )
+    total = sum(seq_lens)
+    device = SimpleNamespace()
+    q = SimpleNamespace(shape=(total, heads, 128), device=device, dtype=torch.float16)
+    k = SimpleNamespace(shape=(total, heads, 128))
+    v = SimpleNamespace(shape=(total, heads, 128))
+    return gdn_cp._build_plan(
+        q, k, v, num_seqs=len(seq_lens), max_seqlen=max(seq_lens, default=0)
+    )
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "heads", "num_sms", "expected"),
+    [
+        # More than 2 CTAs per SM over sequences of one length: 3 CTAs per SM.
+        ((16384,), 16, 212, "state_fixup_simt_row4_mb3"),
+        ((8192, 8192), 16, 212, "state_fixup_simt_row4_mb3"),
+        ((2048,) * 4, 8, 212, "state_fixup_simt_row4_mb3"),
+        ((1024,) * 8, 8, 212, "state_fixup_simt_row4_mb3"),
+        ((16384,), 14, 216, "state_fixup_simt_row4_mb3"),
+        # At most 2 CTAs per SM: the default build.
+        ((16384,), 8, 212, "state_fixup_simt_row4"),
+        ((8192, 8192), 4, 212, "state_fixup_simt_row4"),
+        ((16384,), 14, 224, "state_fixup_simt_row4"),
+        ((4096,), 13, 208, "state_fixup_simt_row4"),
+        # Unequal sequences keep the default build at any grid: 8 heads over
+        # 6144 + 2048 tokens is 512 CTAs, where the 3-CTA build is slower.
+        ((6144, 2048), 8, 212, "state_fixup_simt_row4"),
+        ((2048, 6144), 16, 212, "state_fixup_simt_row4"),
+        ((0, 64, 0), 64, 148, "state_fixup_simt_row4"),
+    ],
+)
+def test_sm107_fixup_takes_three_ctas_per_sm_past_two_over_equal_sequences(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    num_sms: int,
+    expected: str,
+) -> None:
+    plan = _sm107_plan(monkeypatch, seq_lens, heads, num_sms)
+    assert plan.fixup_kernel == expected
+    assert plan.fixup_grid == (len(seq_lens) * heads * 32, 1, 1)
+    assert gdn_cp_jit.has_gdn_cp_kernel(expected, "sm_107a")
+
+
+def test_sm107_fixup_gate_needs_the_shipped_three_cta_program(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert gdn_cp_jit.has_gdn_cp_kernel("state_fixup_simt_row4_mb3", "sm_107a")
+    for arch in ("sm_100a", "sm_103a"):
+        assert not gdn_cp_jit.has_gdn_cp_kernel("state_fixup_simt_row4_mb3", arch)
+    shipped = gdn_cp_jit.program_for("state_fixup_simt_row4", "sm_107a")
+    mb3 = gdn_cp_jit.program_for("state_fixup_simt_row4_mb3", "sm_107a")
+    assert mb3 != shipped
+    records = gdn_cp_jit.MODULES
+    assert records[mb3]["arg_plan"] == records[shipped]["arg_plan"]
+    assert records[mb3]["arches"] == ["sm_107a"]
+    monkeypatch.setattr(gdn_cp, "has_gdn_cp_kernel", lambda _name, _arch: False)
+    plan = _sm107_plan(monkeypatch, (16384,), 16, 212)
+    assert plan.fixup_kernel == "state_fixup_simt_row4"
+
+
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 @pytest.mark.parametrize("io_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_qk_l2norm_in_kernel", [False, True])
@@ -3116,3 +3189,128 @@ def test_sm107_auto_band_follows_the_measured_plan(
         )
         is expected
     )
+
+
+# R200 rows of the BF16-I/O FP32-state records: (num_seqs, state heads, longest
+# sequence) and whether the non-CP Cake kernel loses to the default route.
+@pytest.mark.parametrize(
+    ("num_seqs", "heads", "max_seqlen", "expected"),
+    [
+        (1, 4, 16384, True),
+        (1, 32, 16384, True),
+        (2, 16, 8192, True),
+        (2, 32, 8192, False),
+        (1, 8, 4096, True),
+        (1, 4, 4096, True),
+        (1, 16, 4096, False),
+        (1, 32, 4096, False),
+        (4, 4, 2048, False),
+        (8, 4, 1024, False),
+        (16, 4, 8192, False),
+        (1, 4, 2048, False),
+    ],
+)
+def test_sm107_fp32_state_fail_closed_band_follows_the_measured_rows(
+    num_seqs: int, heads: int, max_seqlen: int, expected: bool
+) -> None:
+    assert (
+        gdn_prefill._cake_gdn_sm107a_fp32_state_fails_closed(
+            num_seqs=num_seqs, num_sab_heads=heads, max_seqlen=max_seqlen
+        )
+        is expected
+    )
+
+
+def _sm107_fp32_state_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    dtype: torch.dtype,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    use_cp: str | bool = "auto",
+) -> list[str]:
+    calls: list[str] = []
+    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: 212)
+    monkeypatch.setattr(gdn_prefill, "get_compute_capability", lambda _device: (10, 7))
+    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "test GPU")
+    monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "13.0")
+    monkeypatch.setattr(
+        gdn_prefill,
+        "_chunk_gated_delta_rule_gdn_cp_sm100",
+        lambda *_args, **_kwargs: calls.append("gdn_cp"),
+    )
+
+    def cake_non_cp(**kwargs):
+        calls.append("cake_non_cp")
+        return kwargs["output"], kwargs["output_state"]
+
+    monkeypatch.setattr(gdn_prefill, "_run_cake_gdn_prefill", cake_non_cp)
+    tokens = sum(seq_lens)
+    q = torch.zeros((tokens, heads // 2, 128), dtype=dtype)
+    v = torch.zeros((tokens, heads, 128), dtype=dtype)
+    gates = torch.zeros((tokens, heads), dtype=torch.float32)
+    starts = [0]
+    for length in seq_lens:
+        starts.append(starts[-1] + length)
+    gdn_prefill.chunk_gated_delta_rule(
+        q,
+        q,
+        v,
+        g=gates,
+        beta=gates,
+        initial_state=torch.zeros((len(seq_lens), heads, 128, 128)),
+        output_final_state=True,
+        cu_seqlens=torch.tensor(starts, dtype=torch.int32),
+        use_cp=use_cp,
+        backend="cake_gdn",
+    )
+    return calls
+
+
+def test_sm107_auto_band_keeps_fp16_and_skips_bf16(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 1 x 4096 at 16 state heads is in the measured CP plan; BF16 I/O would add
+    # the token-serial state repair, so only FP16 enters Cake CP.
+    assert _sm107_fp32_state_dispatch(
+        monkeypatch, dtype=torch.float16, seq_lens=(4096,), heads=16
+    ) == ["gdn_cp"]
+    assert _sm107_fp32_state_dispatch(
+        monkeypatch, dtype=torch.bfloat16, seq_lens=(4096,), heads=16
+    ) == ["cake_non_cp"]
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "heads"), [((4096,), 8), ((8192, 8192), 16), ((16384,), 32)]
+)
+def test_sm107_bf16_fp32_state_fails_closed_in_the_losing_band(
+    monkeypatch: pytest.MonkeyPatch, seq_lens: tuple[int, ...], heads: int
+) -> None:
+    with pytest.raises(gdn_prefill._cake_gdn.CakeGDNUnsupportedError):
+        _sm107_fp32_state_dispatch(
+            monkeypatch, dtype=torch.bfloat16, seq_lens=seq_lens, heads=heads
+        )
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "heads", "use_cp"),
+    [
+        ((2048,) * 4, 4, "auto"),
+        ((1024,) * 8, 4, "auto"),
+        ((8192, 8192), 32, "auto"),
+        ((4096,), 8, False),
+    ],
+)
+def test_sm107_bf16_fp32_state_keeps_cake_outside_the_losing_band(
+    monkeypatch: pytest.MonkeyPatch,
+    seq_lens: tuple[int, ...],
+    heads: int,
+    use_cp: str | bool,
+) -> None:
+    assert _sm107_fp32_state_dispatch(
+        monkeypatch,
+        dtype=torch.bfloat16,
+        seq_lens=seq_lens,
+        heads=heads,
+        use_cp=use_cp,
+    ) == ["cake_non_cp"]

@@ -368,13 +368,26 @@ def test_overlap_width_follows_the_plan(bounds, num_sms, width) -> None:
         ((0, 2048, 4096), 56, 170, "default"),
         ((0, 2047, 4094), 56, 170, None),
         ((0, 24576), 56, 188, "default"),
-        ((0, 24577), 56, 188, None),
+        ((0, 24577), 56, 188, "head_major"),
         ((0, 257, 4567, 4824), 56, 188, "burst"),
         ((0, 8368, 16736, 25104, 33472), 56, 170, "default"),
         # other head counts and SM counts keep the sequential launches
         ((0, 257, 4567, 4824), 8, 170, None),
         ((0, 257, 4567, 4824), 56, 132, None),
         ((0, 0, 129, 129, 500), 56, 170, None),
+        # above the band: 56 heads on 170 or 188 SMs take the head-major producers, other head and
+        # SM counts the statistics and quantizer launches
+        ((0, 33472), 56, 170, "head_major"),
+        ((0, 3000, 44000, 53000), 56, 188, "head_major"),
+        ((0, 24577), 8, 188, None),
+        ((0, 24577), 56, 132, None),
+        # past the token bound (65536 on 170 SMs, 98304 on 188 SMs) the statistics and quantizer
+        # launches again
+        ((0, 65536), 56, 170, "head_major"),
+        ((0, 65537), 56, 170, None),
+        ((0, 65537), 56, 188, "head_major"),
+        ((0, 98304), 56, 188, "head_major"),
+        ((0, 98305), 56, 188, None),
     ],
 )
 def test_the_overlapped_form_serves_the_overlap_band(
@@ -383,9 +396,13 @@ def test_the_overlapped_form_serves_the_overlap_band(
     plan = ops.MiniMaxH3VarlenPlan(bounds, heads, torch.device("cpu"), num_sms)
     lengths = [b - a for a, b in zip(bounds, bounds[1:], strict=False)]
     assert plan.work == sum(length * length for length in lengths)
-    assert plan.overlap is (overlap is not None)
+    assert plan.overlap is (overlap not in (None, "head_major"))
+    assert plan.head_major is (overlap == "head_major")
     programs = ops.minimax_h3_sm120_quant_varlen_attention_programs(plan)
-    if overlap:
+    if overlap == "head_major":
+        # the head-major producers over every SM, then the sequential attention
+        assert programs == (PREPROCESS_HEAD_MAJOR, ATTENTION)
+    elif overlap:
         # launch order: producers (plain; the burst build for a plan of overlap width 32 on 188
         # SMs), lead attention, tail attention
         producers = (
