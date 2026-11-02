@@ -7,6 +7,8 @@ Two oracles, as in the other FlashInfer MXFP8 tests:
 * tier 2 -- a PyTorch reference that applies the same E8M0 quantize/dequantize
   to the weights, the input and the GEMM1->GEMM2 intermediate (tight tolerance;
   catches scale-layout and ordering errors that cosine similarity hides).
+  Unfused swap-AB cases additionally require exact output storage bits against
+  the shared block-scaled reference.
 
 The MoE is a non-gated ReLU^2 MoE: out = sum_k w_k * (relu(x @ W1[e].T)^2 @ W2[e].T).
 """
@@ -88,7 +90,7 @@ def _reference(x, w1, w2, topk_ids, topk_w, quantized: bool):
     return out
 
 
-def _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts, tactic=None):
+def _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts, tactic=None, swap_ab=False):
     from flashinfer import cute_dsl_fused_moe
     from flashinfer.fp8_quantization import mxfp8_quantize
 
@@ -98,7 +100,7 @@ def _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts, tactic=None):
     x_q, x_sf = mxfp8_quantize(x, is_sf_swizzled_layout=False, alignment=128)
     x_sf = x_sf.view(torch.uint8).reshape(num_tokens, hidden // MXFP8_BLOCK)
     ones = torch.ones(num_experts, dtype=torch.float32, device=x.device)
-    return cute_dsl_fused_moe(
+    inputs = dict(
         x=x_q,
         x_sf=x_sf,
         token_selected_experts=topk_ids,
@@ -110,14 +112,34 @@ def _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts, tactic=None):
         w2_weight=w2_q,
         w2_weight_sf=w2_sf,
         w2_alpha=ones,
+        output_dtype=torch.bfloat16,
+        activation_type=ActivationType.Relu2.value,
+    )
+    out = cute_dsl_fused_moe(
+        **inputs,
         num_experts=num_experts,
         top_k=topk_ids.shape[1],
         num_local_experts=num_experts,
-        output_dtype=torch.bfloat16,
-        activation_type=ActivationType.Relu2.value,
         quant_mode="mxfp8",
         tactic=tactic,
+        swap_ab=swap_ab,
+        use_fused_finalize=not swap_ab,
     )
+    if swap_ab:
+        from tests.test_helpers.cute_dsl_moe_swap_ab_reference import (
+            assert_cute_dsl_moe_bits,
+            cute_dsl_moe_reference,
+        )
+
+        reference = cute_dsl_moe_reference(
+            **inputs,
+            a_dtype="float8_e4m3fn",
+            b_dtype="float8_e4m3fn",
+            sf_vec_size=32,
+            swap_ab=True,
+        )
+        assert_cute_dsl_moe_bits(out, reference)
+    return out
 
 
 def _gemm1_n192_tactic(tile):
@@ -144,6 +166,7 @@ def _cos(a, b):
     return F.cosine_similarity(a.reshape(-1).float(), b.reshape(-1).float(), dim=0)
 
 
+@pytest.mark.parametrize("swap_ab", [False, True])
 @pytest.mark.parametrize(
     "num_tokens,hidden,inter,num_experts,top_k",
     [
@@ -152,11 +175,11 @@ def _cos(a, b):
         (64, 640, 3584, 384, 8),
     ],
 )
-def test_mxfp8_relu2_moe(num_tokens, hidden, inter, num_experts, top_k):
+def test_mxfp8_relu2_moe(num_tokens, hidden, inter, num_experts, top_k, swap_ab):
     x, w1, w2, topk_ids, topk_w = _make_case(
         num_tokens, hidden, inter, num_experts, top_k
     )
-    out = _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts).float()
+    out = _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts, swap_ab=swap_ab).float()
 
     ref_bf16 = _reference(x, w1, w2, topk_ids, topk_w, quantized=False)
     cos = _cos(out, ref_bf16)

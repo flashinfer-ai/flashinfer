@@ -2573,7 +2573,13 @@ class CuteDslConfig:
     """CuteDSL block-scaled backend for W4A4, W4A8, MXFP8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
+    ``swap_ab=True`` selects the Blackwell activations-on-B implementation and
+    its 16-row gated weight layout. Prepare weights with the same option.
+    W4A16 always uses activations on B; False selects its in-kernel transpose
+    for compatibility with the original 64-row layout.
     """
+
+    swap_ab: bool = False
 
     @classmethod
     def supported(cls, arch: int) -> bool:
@@ -2592,12 +2598,14 @@ class CuteDslConfig:
         activation: Optional[ActivationConfig] = None,
         device=None,
         nvfp4_4over6: Optional[NVFP44Over6Config] = None,
+        swap_ab: bool = False,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
         ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
         (CuTe-DSL W4A16). Defaults to NVFP4×NVFP4.
+        ``swap_ab`` must match the layer's ``CuteDslConfig.swap_ab``.
 
         ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
         (see that field): it selects the NVFP4×NVFP4 pack's
@@ -2616,6 +2624,7 @@ class CuteDslConfig:
             activation=activation,
             device=device,
             nvfp4_4over6=nvfp4_4over6,
+            swap_ab=swap_ab,
         )
 
     @staticmethod
@@ -2637,6 +2646,8 @@ class CuteDslConfig:
         return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
 
     def __repr__(self) -> str:
+        if self.swap_ab:
+            return "CuteDslConfig(swap_ab=True)"
         return "CuteDslConfig()"
 
 

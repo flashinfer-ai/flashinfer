@@ -191,6 +191,7 @@ from .core import (
 )
 
 from .prepare import (
+    interleave_cute_dsl_moe_weights,
     interleave_moe_scales_for_sm90_mixed_gemm,
     interleave_moe_weights_for_sm90_mixed_gemm,
     preprocess_moe_weights_for_sm90_mixed_gemm_humming,
@@ -447,6 +448,7 @@ __all__ = [
     "cutlass_fused_moe",
     "cutlass_fused_moe_workspace_size",
     "interleave_moe_scales_for_sm90_mixed_gemm",
+    "interleave_cute_dsl_moe_weights",
     "interleave_moe_weights_for_sm90_mixed_gemm",
     "preprocess_moe_weights_for_sm90_mixed_gemm_humming",
     "gen_cutlass_fused_moe_sm120_module",
