@@ -254,7 +254,7 @@ CuTe-DSL Quantization Kernels (experimental)
 
 The CuTe-DSL backends are conditionally available when the
 ``nvidia-cutlass-dsl`` package is installed. At runtime they are also
-re-exported as ``flashinfer.quantization.{nvfp4,mxfp4,mxfp8}_quantize_cute_dsl``
+re-exported as ``flashinfer.quantization.{mxfp4,mxfp8}_quantize_cute_dsl``
 when available; documenting them here via their canonical submodule
 path keeps the docs build from depending on the CuTe-DSL stack being
 importable.
@@ -264,7 +264,6 @@ importable.
 .. autosummary::
     :toctree: ../generated
 
-    nvfp4_quantize_cute_dsl
     nvfp4_quantize_per_token_cute_dsl
 
 .. currentmodule:: flashinfer.quantization.kernels.mxfp4_quantize
