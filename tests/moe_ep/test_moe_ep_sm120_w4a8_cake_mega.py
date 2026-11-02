@@ -20,7 +20,7 @@ Launch on 4 or 8 sm_120 GPUs of one host (NCCL 2.30.7 with the Device API), or o
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_sm120_w4a8_cake_mega.py \
         -m "gpu_4 and arch_sm120" -v
 
-``CAKE_SM120_MEGAMOE_CASES`` selects ``shape:variant[:l<L>]`` cases (default
+``CAKE_SM120_MEGAMOE_CASES`` selects ``shape:variant[:l<L>][:int8]`` cases (default
 :data:`DEFAULT_CASES`; shapes in :data:`SHAPES`) and ``CAKE_SM120_MEGAMOE_TABLE`` the
 transport table (default ``all_gin``; ``all_lsa`` / ``lsa_where_reachable`` / ``auto``).
 
@@ -51,6 +51,11 @@ boundary, as the kernel's own validators define it:
 * W2 accumulates in FP32 and rounds to BF16 per route (and for the shared expert);
 * the combine sums the BF16 route partials in FP32 in slot order, adds the BF16
   shared-expert partial in FP32 and rounds once.
+
+``:int8`` cases build the kernel with ``return_codec="int8"``: each route partial reaches
+the combine as ``q * s`` per 64-value block (``s = max(bf16(amax / 127), 2^-126)``,
+``q = rne(x * (1 / s))`` clamped to +-127), which the oracle applies to its BF16 route partials
+before the sum.
 """
 
 from __future__ import annotations
@@ -88,6 +93,8 @@ class Shape:
     top_k: int
     # > 0: the expert count scales with the EP world size (experts = per-rank x ranks).
     experts_per_rank: int = 0
+    # Kernel-config activation fields as (name, value) pairs; () = SwiGLU.
+    activation: tuple = ()
 
     def for_world(self, world_size: int) -> "Shape":
         if not self.experts_per_rank:
@@ -98,6 +105,7 @@ class Shape:
             self.intermediate,
             self.experts_per_rank * world_size,
             self.top_k,
+            activation=self.activation,
         )
 
 
@@ -108,14 +116,69 @@ SHAPES = {
     "qwen3_30b": Shape("qwen3_30b", 2048, 768, 128, 8),
     "v41flash": Shape("v41flash", 5120, 2304, 384, 6),
     "local3": Shape("local3", 4096, 2048, 0, 6, experts_per_rank=3),
+    "minimax_m3": Shape(
+        "minimax_m3",
+        6144,
+        3072,
+        128,
+        4,
+        activation=(("swiglu_alpha", 1.702), ("swiglu_beta", 1.0)),
+    ),
+    "kimi_k3": Shape(
+        "kimi_k3",
+        3584,
+        3072,
+        896,
+        16,
+        activation=(
+            ("activation", "situ"),
+            ("situ_beta", 4.0),
+            ("situ_linear_beta", 25.0),
+        ),
+    ),
+    # Kimi-K3 geometry and activation with 512 experts (128 per rank at EP4; K3 itself has 896).
+    "kimi_k3_e512": Shape(
+        "kimi_k3_e512",
+        3584,
+        3072,
+        512,
+        16,
+        activation=(
+            ("activation", "situ"),
+            ("situ_beta", 4.0),
+            ("situ_linear_beta", 25.0),
+        ),
+    ),
+    "qwen38_flash": Shape("qwen38_flash", 2560, 640, 512, 10),
+    # Activation-parameter variants on small geometries: swiglu_beta != 1 and SiTU without
+    # the up-branch transform (situ_linear_beta unset).
+    "swiglu_ab": Shape(
+        "swiglu_ab",
+        2048,
+        768,
+        128,
+        8,
+        activation=(("swiglu_alpha", 1.702), ("swiglu_beta", 0.5)),
+    ),
+    "situ_nolb": Shape(
+        "situ_nolb",
+        2048,
+        768,
+        128,
+        16,
+        activation=(("activation", "situ"), ("situ_beta", 4.0)),
+    ),
 }
 V4FLASH = SHAPES["v4flash"]
-# ``shape:variant`` builds with the V4 clamp (L = 10); ``shape:variant:l<L>`` with MOE_SWIGLU_LIMIT=L.
+# ``shape:variant`` builds with the V4 clamp (L = 10; SiTU shapes: L = 0); ``shape:variant:l<L>`` with
+# MOE_SWIGLU_LIMIT=L.
 DEFAULT_CASES = (
     "v4flash:noshared,v4flash:fp8shared,dsv3:fp8shared,"
     "qwen3_235b:noshared,qwen3_30b:noshared,"
     "dsv3:noshared:l0,qwen3_235b:fp8shared:l0,qwen3_30b:fp8shared:l0,"
-    "v41flash:noshared,v41flash:fp8shared,local3:fp8shared"
+    "v41flash:noshared,v41flash:fp8shared,local3:fp8shared,"
+    "v41flash:noshared:int8,v41flash:fp8shared:int8,dsv3:fp8shared:int8,qwen3_30b:noshared:l0:int8,"
+    "swiglu_ab:fp8shared:l7,situ_nolb:noshared:l0,situ_nolb:fp8shared:l0:int8"
 )
 # Weight scales 2^-9 .. 2^-6 keep the random-weight W1 outputs O(1), so the
 # SwiGLU clamps stay mostly inactive and the test discriminates the math.
@@ -134,6 +197,7 @@ class Case:
     shape: Shape
     variant: str
     swiglu_limit: int = DEFAULT_SWIGLU_LIMIT
+    return_codec: str = "bf16"
 
     @property
     def w13_exponent_shift(self) -> int:
@@ -148,6 +212,8 @@ class Case:
             if self.swiglu_limit == DEFAULT_SWIGLU_LIMIT
             else f"-l{self.swiglu_limit}"
         )
+        if self.return_codec != "bf16":
+            suffix += f"-{self.return_codec}"
         return f"{self.shape.name}-{self.variant}{suffix}"
 
 
@@ -198,11 +264,17 @@ def _cases() -> list[Case]:
     cases = []
     for item in raw.split(","):
         if item.strip():
-            shape, variant, *limit = item.strip().split(":")
-            swiglu_limit = (
-                int(limit[0].removeprefix("l")) if limit else DEFAULT_SWIGLU_LIMIT
-            )
-            cases.append(Case(SHAPES[shape], variant, swiglu_limit))
+            shape, variant, *options = item.strip().split(":")
+            # SiTU takes no clamp.
+            situ = dict(SHAPES[shape].activation).get("activation") == "situ"
+            swiglu_limit = 0 if situ else DEFAULT_SWIGLU_LIMIT
+            return_codec = "bf16"
+            for option in options:
+                if option == "int8":
+                    return_codec = option
+                else:
+                    swiglu_limit = int(option.removeprefix("l"))
+            cases.append(Case(SHAPES[shape], variant, swiglu_limit, return_codec))
     return cases
 
 
@@ -422,13 +494,19 @@ def requantize_k32(values: torch.Tensor) -> torch.Tensor:
     return (codes.float() * scale.unsqueeze(2)).reshape(rows, cols)
 
 
+def _sigmoid_exp2(x: torch.Tensor) -> torch.Tensor:
+    return 1.0 / (1.0 + torch.exp2((0.0 - x) * LOG2_E))
+
+
 def swiglu_kernel_boundary(
     fc1_bf16: torch.Tensor,
     route_weight: torch.Tensor,
     swiglu_limit: int = DEFAULT_SWIGLU_LIMIT,
+    activation: tuple = (),
 ) -> torch.Tensor:
-    """SwiGLU with the kernel's clamp (``swiglu_limit``; 0 = none), FP32 exp2 sigmoid and
-    FP32 route weight."""
+    """The gated activation with the kernel's clamp (``swiglu_limit``; 0 = none), FP32 exp2
+    sigmoid and FP32 route weight.  ``activation``: kernel-config fields (() = SwiGLU);
+    tanh as ``2 * sigmoid(2x) - 1``, as in the kernel."""
 
     intermediate = fc1_bf16.shape[1] // 2
     gate = fc1_bf16[:, :intermediate].float()
@@ -436,8 +514,23 @@ def swiglu_kernel_boundary(
     if swiglu_limit > 0:
         gate = gate.clamp(max=float(swiglu_limit))
         up = up.clamp(min=-float(swiglu_limit), max=float(swiglu_limit))
-    sigmoid_gate = 1.0 / (1.0 + torch.exp2((0.0 - gate) * LOG2_E))
-    return gate * sigmoid_gate * up * route_weight.unsqueeze(1)
+    fields = dict(activation)
+    kind = fields.get("activation", "swiglu")
+    if kind == "swiglu" and "swiglu_alpha" in fields:
+        value = (
+            gate
+            * _sigmoid_exp2(gate * fields["swiglu_alpha"])
+            * (up + fields["swiglu_beta"])
+        )
+    elif kind == "situ":
+        beta, linear_beta = fields["situ_beta"], fields.get("situ_linear_beta")
+        if linear_beta is not None:
+            up = linear_beta * (2.0 * _sigmoid_exp2(up * (2.0 / linear_beta)) - 1.0)
+        gate_term = beta * (2.0 * _sigmoid_exp2(gate * (2.0 / beta)) - 1.0)
+        value = gate_term * _sigmoid_exp2(gate) * up
+    else:
+        value = gate * _sigmoid_exp2(gate) * up
+    return value * route_weight.unsqueeze(1)
 
 
 def expert_partial(
@@ -446,14 +539,27 @@ def expert_partial(
     w2: torch.Tensor,
     route_weight: torch.Tensor,
     swiglu_limit: int = DEFAULT_SWIGLU_LIMIT,
+    activation: tuple = (),
 ) -> torch.Tensor:
     """One expert's BF16 partial on the kernel boundary (dense fp32 weights)."""
 
     fc1 = (x @ w13.t()).to(torch.bfloat16)
     intermediate = requantize_k32(
-        swiglu_kernel_boundary(fc1, route_weight, swiglu_limit)
+        swiglu_kernel_boundary(fc1, route_weight, swiglu_limit, activation)
     )
     return (intermediate @ w2.t()).to(torch.bfloat16)
+
+
+def int8_return_roundtrip(partial: torch.Tensor) -> torch.Tensor:
+    """What the ``return_codec="int8"`` wire delivers for BF16 route partials [n, H] (fp32):
+    per 64-value block ``s = max(bf16(amax / 127), 2^-126)``, ``q = rne(clamp(x * (1 / s), +-127))``,
+    value ``q * s`` -- the kernel's encode / decode, bit for bit."""
+
+    x = partial.float().reshape(partial.shape[0], -1, 64)
+    scale = (x.abs().amax(dim=-1, keepdim=True) / 127.0).to(torch.bfloat16).float()
+    scale = scale.clamp(min=2.0**-126)
+    codes = torch.round((x * torch.reciprocal(scale)).clamp(-127.0, 127.0))
+    return (codes * scale).reshape(partial.shape)
 
 
 def reference_output(
@@ -464,8 +570,13 @@ def reference_output(
     decode_w2,
     shared: tuple[torch.Tensor, torch.Tensor] | None = None,
     swiglu_limit: int = DEFAULT_SWIGLU_LIMIT,
+    activation: tuple = (),
+    return_codec: str = "bf16",
 ) -> torch.Tensor:
     """Slot-ordered FP32 sum of the routed BF16 partials (+ shared partial), one BF16 round.
+
+    ``return_codec="int8"`` passes each routed partial through :func:`int8_return_roundtrip`
+    (the shared partial stays on its rank and is not coded).
 
     ``decode_w13(expert) -> fp32 [2I, H]`` (canonical gate rows then up rows) and
     ``decode_w2(expert) -> fp32 [H, I]`` supply the dense routed expert weights;
@@ -479,20 +590,26 @@ def reference_output(
     )
     for expert in torch.unique(topk_ids[topk_ids >= 0]).tolist():
         row, slot = torch.where(topk_ids == expert)
-        partials[row, slot] = expert_partial(
+        partial = expert_partial(
             x_dequant[row],
             decode_w13(expert),
             decode_w2(expert),
             topk_weights[row, slot],
             swiglu_limit,
-        ).float()
+            activation,
+        )
+        partials[row, slot] = (
+            int8_return_roundtrip(partial)
+            if return_codec == "int8"
+            else partial.float()
+        )
     out = torch.zeros(rows, hidden, dtype=torch.float32, device=x_dequant.device)
     for slot in range(top_k):
         out += partials[:, slot]
     if shared is not None and rows:
         ones = torch.ones(rows, dtype=torch.float32, device=x_dequant.device)
         out += expert_partial(
-            x_dequant, shared[0], shared[1], ones, swiglu_limit
+            x_dequant, shared[0], shared[1], ones, swiglu_limit, activation
         ).float()
     return out.to(torch.bfloat16)
 
@@ -520,9 +637,16 @@ class Oracle:
     """Dense global weights (all ranks' routed experts + the shared expert)."""
 
     def __init__(
-        self, weights, shared: bool, swiglu_limit: int = DEFAULT_SWIGLU_LIMIT
+        self,
+        weights,
+        shared: bool,
+        swiglu_limit: int = DEFAULT_SWIGLU_LIMIT,
+        activation: tuple = (),
+        return_codec: str = "bf16",
     ) -> None:
         self.swiglu_limit = swiglu_limit
+        self.activation = activation
+        self.return_codec = return_codec
         self.w13 = all_gather_cat(weights.w13)
         self.w2 = all_gather_cat(weights.w2)
         self.w13_scale = all_gather_cat(weights.w13_scale)
@@ -560,7 +684,9 @@ class Oracle:
             total += fc1.numel()
         return outside / max(total, 1)
 
-    def __call__(self, tensors, swiglu_limit: int | None = None) -> torch.Tensor:
+    def __call__(
+        self, tensors, swiglu_limit: int | None = None, activation: tuple | None = None
+    ) -> torch.Tensor:
         return reference_output(
             self._x(tensors),
             tensors.topk_ids,
@@ -569,6 +695,8 @@ class Oracle:
             lambda e: decode_fp4(self.w2[e], self.w2_scale[e]),
             self.shared,
             self.swiglu_limit if swiglu_limit is None else swiglu_limit,
+            self.activation if activation is None else activation,
+            self.return_codec,
         )
 
 
@@ -585,6 +713,7 @@ def make_layer(
     max_rows=MAX_ROWS,
     shape: Shape = V4FLASH,
     swiglu_limit: int = DEFAULT_SWIGLU_LIMIT,
+    return_codec: str = "bf16",
 ):
     from flashinfer.moe_ep import BootstrapConfig, FleetParams, MegaConfig, MoEEpLayer
     from flashinfer.moe_ep.backends.mega.kernel.sm120.mxfp4_mxfp8_bf16_cake import (
@@ -606,6 +735,8 @@ def make_layer(
                 intermediate_size=shape.intermediate,
                 top_k=shape.top_k,
                 swiglu_limit=swiglu_limit,
+                **dict(shape.activation),
+                return_codec=return_codec,
                 shared_expert="fp8_in_kernel" if variant == "fp8shared" else None,
                 transport_table=table,
             ),
@@ -624,6 +755,10 @@ def ep_layer(request):
     shape, variant = case.shape.for_world(world_size), case.variant
     if shape.experts % world_size:
         pytest.skip(f"{shape.name}: {shape.experts} experts on {world_size} ranks")
+    if shape.experts // world_size > 128:
+        pytest.skip(
+            f"{shape.name}: more than 128 experts per rank on {world_size} ranks"
+        )
     shared = variant == "fp8shared"
     weights = local_weights(
         rank,
@@ -633,7 +768,9 @@ def ep_layer(request):
         shape=shape,
         w13_exponent_shift=case.w13_exponent_shift,
     )
-    oracle = Oracle(weights, shared, case.swiglu_limit)
+    oracle = Oracle(
+        weights, shared, case.swiglu_limit, shape.activation, case.return_codec
+    )
     layer = make_layer(
         rank,
         world_size,
@@ -642,6 +779,7 @@ def ep_layer(request):
         table=table_spec(),
         shape=shape,
         swiglu_limit=case.swiglu_limit,
+        return_codec=case.return_codec,
     )
     layer.warmup(make_inputs(256, seed=1, shape=shape))
     torch.cuda.synchronize()
@@ -800,6 +938,34 @@ def test_swiglu_limit_is_compiled_in(ep_layer) -> None:
 
 @pytest.mark.arch_sm120
 @pytest.mark.gpu_4
+def test_activation_is_compiled_in(ep_layer) -> None:
+    """A non-SwiGLU build matches its own activation's oracle and not SwiGLU's."""
+
+    rank, world_size, layer, oracle, shape = ep_layer
+    if not oracle.activation:
+        pytest.skip("SwiGLU build")
+    tensors = make_inputs(512, seed=760 + rank, shape=shape)
+    out = layer(tensors)
+    torch.cuda.synchronize()
+    own = oracle(tensors).float()
+    check_close(out, own)
+    swiglu = oracle(tensors, activation=()).float()
+
+    def rel_l2(ref: torch.Tensor) -> float:
+        return float(
+            torch.linalg.norm(out.float() - ref)
+            / torch.linalg.norm(ref).clamp_min(1e-6)
+        )
+
+    # Far from the SwiGLU oracle compared with both the tolerance and the distance to its own.
+    assert rel_l2(swiglu) > max(2 * REL_L2_MAX, 5 * rel_l2(own)), (
+        f"output is not distinguishable from the SwiGLU oracle "
+        f"(relative L2 {rel_l2(swiglu):.4f} vs own {rel_l2(own):.4f})"
+    )
+
+
+@pytest.mark.arch_sm120
+@pytest.mark.gpu_4
 def test_device_epoch_advances_once_per_launch(ep_layer) -> None:
     """The kernel owns its epoch: +1 per launched call (both schedules), +0 per skipped call."""
 
@@ -845,10 +1011,13 @@ def test_first_call_on_a_non_default_stream(ep_layer) -> None:
     rank, world_size, layer, _, shape = ep_layer
     variant = layer._megakernel_config.variant
     swiglu_limit = layer._megakernel_config.swiglu_limit
+    return_codec = layer._megakernel_config.return_codec
     weights = local_weights(
         rank, world_size, seed=20261011, shared=variant == "fp8shared", shape=shape
     )
-    oracle = Oracle(weights, variant == "fp8shared", swiglu_limit)
+    oracle = Oracle(
+        weights, variant == "fp8shared", swiglu_limit, shape.activation, return_codec
+    )
     tensors = make_inputs(512, seed=1100 + rank, shape=shape)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -862,6 +1031,7 @@ def test_first_call_on_a_non_default_stream(ep_layer) -> None:
             table=table_spec(),
             shape=shape,
             swiglu_limit=swiglu_limit,
+            return_codec=return_codec,
         )
         torch.cuda._sleep(int(2e8))
         out = fresh(tensors)
