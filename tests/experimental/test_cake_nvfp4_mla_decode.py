@@ -29,6 +29,7 @@ covered by ``test_cake_nvfp4_mla_decode_api.py``.
 
 import hashlib
 import importlib
+import itertools
 import json
 import math
 import re
@@ -1319,6 +1320,18 @@ def _reduce_inputs(kv_lens, num_sms, *, q_len=6, num_heads=64, tiles_per_split=2
 )
 def test_split_row_range(row_splits, want):
     assert split_row_range(row_splits) == want
+    assert split_row_range(tuple(row_splits)) == want
+
+
+def test_two_split_rows_match_split_row_range():
+    """The selector's list scans over the counts of a plan of at most two
+    splits per row find the range split_row_range finds, for every count
+    sequence of up to seven rows."""
+    for n in range(8):
+        for row_splits in itertools.product((0, 1, 2), repeat=n):
+            want = split_row_range(row_splits)
+            assert cake_backend._two_split_rows(list(row_splits)) == want
+            assert cake_backend._two_split_rows(row_splits) == want
 
 
 @pytest.mark.parametrize(
@@ -2307,3 +2320,98 @@ def test_two_splits_reduce_matches_the_reduce_bitwise(
     assert_programs_match_bitwise(
         monkeypatch, REDUCE_TWO_SPLITS_RECORD, kv_lens, **options
     )
+
+
+def test_two_splits_reduce_binds_once_per_buffer_set():
+    """prepare binds the two-split combine once per caller buffer set: another
+    prepare into the same buffers reuses the bound arguments, other buffers
+    bind their own, and every runner writes the same bits."""
+    reason = _gpu_skip_reason()
+    if reason:
+        pytest.skip(reason)
+    arch = cake_jit.arch_for_capability(torch.cuda.get_device_capability())
+    record = cake_jit.MODULES.get(REDUCE_TWO_SPLITS_RECORD)
+    if record is None or arch not in record["arches"]:
+        pytest.skip(f"no {REDUCE_TWO_SPLITS_RECORD} program registered for {arch}")
+    num_sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    kv_lens, q_len, num_heads = [256, 300], 6, 64
+    total_q = len(kv_lens) * q_len
+    plan = build_work_plan(
+        kv_lens, num_heads=num_heads, num_sms=num_sms, q_len=q_len, tiles_per_split=2
+    )
+    splits = token_splits(
+        plan,
+        _q_indptr(len(kv_lens), q_len),
+        q_len=q_len,
+        num_heads=num_heads,
+        total_q=total_q,
+    )
+    facts = dict(num_sms=num_sms, row_splits=splits)
+    if select_reduce_record(plan, arch, **facts) != REDUCE_TWO_SPLITS_RECORD:
+        pytest.skip(f"the selector keeps the reduce program at {num_sms} SMs")
+    inputs = make_inputs(
+        kv_lens, num_heads, q_len=q_len, enable_sink=True, device="cuda"
+    )
+    nbytes = max_nvfp4_mla_decode_workspace_size(len(kv_lens), num_heads, q_len=q_len)
+
+    def buffers():
+        return (
+            torch.empty((nbytes,), dtype=torch.uint8, device="cuda"),
+            torch.empty(
+                (total_q, num_heads, HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+            ),
+            torch.empty((total_q, num_heads), dtype=torch.float32, device="cuda"),
+        )
+
+    def prepare(workspace, out, lse):
+        return cake_backend.prepare_nvfp4_batch_decode_with_kv_cache_mla(
+            inputs["query"],
+            inputs["query_scale"],
+            inputs["kv_cache"],
+            inputs["kv_scale"],
+            inputs["block_tables"],
+            inputs["seq_lens"],
+            workspace,
+            sm_scale=inputs["sm_scale"],
+            sinks=inputs["sinks"],
+            out=out,
+            lse=lse,
+            return_lse=True,
+            tiles_per_split=2,
+        )
+
+    def pointers(runner):
+        return [
+            a.data_ptr() if isinstance(a, torch.Tensor) else a
+            for a in runner.reduce_arguments
+        ]
+
+    def run(runner):
+        result = runner()
+        torch.cuda.synchronize()
+        return result[0].clone(), result[1].clone()
+
+    one, two = buffers(), buffers()
+    first = prepare(*one)
+    assert first.reduce_program == record["library"]
+    want = run(first)
+    again = prepare(*one)
+    assert again.reduce_arguments is first.reduce_arguments
+    assert again.launches[1][1] is first.launches[1][1]
+    assert again.reduce_kwargs is not first.reduce_kwargs
+    assert again.reduce_kwargs["grid"] == first.reduce_kwargs["grid"]
+    other = prepare(*two)
+    assert other.launches[1][1] is not first.launches[1][1]
+    assert pointers(other) != pointers(first)
+    assert_bound_to_the_record(other.reduce_arguments, record, other.reduce_kwargs)
+    # Buffers prepare allocates itself are bound per call.
+    fresh = prepare(one[0], None, None)
+    assert fresh.launches[1][1] is not first.launches[1][1]
+    for runner in (again, other, fresh, first):
+        out, lse = run(runner)
+        assert torch.equal(out, want[0]) and torch.equal(lse, want[1])
+    for _ in range(cake_backend._TWO_SPLIT_BINDINGS_MAX + 1):
+        prepare(*buffers())
+    assert len(cake_backend._TWO_SPLIT_BINDINGS) <= cake_backend._TWO_SPLIT_BINDINGS_MAX

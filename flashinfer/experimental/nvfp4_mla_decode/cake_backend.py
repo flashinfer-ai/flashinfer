@@ -140,6 +140,13 @@ REDUCE_TWO_SPLITS_TARGETS = frozenset(
 SHORT_DECODE_RECORDS = frozenset(
     {SHORT_RECORD, SHORT_EPI_RECORD, SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD}
 )
+# The two-split combine's bound arguments per caller buffer set and plan shape
+# (``prepare``): its arguments are the data pointers of offset views of the
+# caller's workspace, ``out`` and ``lse``, so a caller that prepares every step
+# into the same buffers binds them once. An entry keeps its buffers' storage
+# alive; the memo is emptied when it holds ``_TWO_SPLIT_BINDINGS_MAX`` entries.
+_TWO_SPLIT_BINDINGS: dict = {}
+_TWO_SPLIT_BINDINGS_MAX = 4
 WORKSPACE_ALIGNMENT = 256
 
 # Keyword names the two stages are bound with (arg plans refer to these names).
@@ -704,6 +711,19 @@ def split_row_range(row_splits: Sequence[int]) -> Optional[tuple]:
     return rows[0], len(rows)
 
 
+def _two_split_rows(row_splits: Sequence[int]) -> Optional[tuple]:
+    """``split_row_range`` of the counts of a plan of at most two splits per
+    row (``select_reduce_record``'s ``max_splits == 2`` plans): the rows of
+    more than one split are the rows of two, found by list scans."""
+    count = row_splits.count(2)
+    if not count:
+        return None
+    first = row_splits.index(2)
+    if row_splits[first : first + count].count(2) != count:
+        return None
+    return first, count
+
+
 def select_reduce_record(
     plan: WorkPlan,
     arch: str,
@@ -741,7 +761,7 @@ def select_reduce_record(
         and (arch, num_sms // CLUSTER_PAIR) in REDUCE_TWO_SPLITS_TARGETS
         and (decode_record or select_decode_record(plan, arch, num_sms))
         in SHORT_DECODE_RECORDS
-        and split_row_range(row_splits) is not None
+        and _two_split_rows(row_splits) is not None
     ):
         return REDUCE_TWO_SPLITS_RECORD
     return "reduce"
@@ -1428,12 +1448,28 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         # range's first row; total_q stays the full count (the split stride).
         # Every other combine runs all total_q rows. select_reduce_record
         # picked it only for a contiguous range (split_row_range) of rows of
-        # two splits, so the range is the first such row and their count.
-        # The combine's row_splits is carved here, from its first row on (the
-        # decode does not take it).
+        # two splits, so the range is the first such row and their count;
+        # _bind_two_split_plan binds it. The combine's row_splits is carved
+        # here, from its first row on (the decode does not take it).
         first, rows = 0, total_q
         if reduce_record == REDUCE_TWO_SPLITS_RECORD:
             first, rows = row_splits_host.index(2), row_splits_host.count(2)
+            return _bind_two_split_plan(
+                arch,
+                plan,
+                main_kwargs,
+                out,
+                lse,
+                return_lse,
+                tables,
+                decode_record,
+                flat=flat,
+                layout=layout,
+                table_span=table_span,
+                first=first,
+                rows=rows,
+                tensors=tensors,
+            )
         splits_first = (layout["row_splits"][0] - table_base) // 4 + first
         reduce_kwargs = dict(
             o=out[first:] if first else out,
@@ -1459,4 +1495,147 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         tables,
         decode_record=decode_record,
         reduce_record=reduce_record,
+    )
+
+
+def _bind_two_split_plan(
+    arch: str,
+    plan: WorkPlan,
+    main_kwargs: dict,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    return_lse: bool,
+    tables: torch.Tensor,
+    decode_record: str,
+    *,
+    flat: torch.Tensor,
+    layout: dict,
+    table_span: torch.Tensor,
+    first: int,
+    rows: int,
+    tensors: list,
+) -> NVFP4MLADecodeRunner:
+    """``prepare``'s binding of a plan the two-split combine runs, over the
+    ``rows`` split rows from ``first`` on (every per-row pointer offset to
+    ``first``; ``total_q`` stays the full count, the split stride).
+
+    The combine's arguments are the data pointers of offset views of the
+    workspace, ``out`` and ``lse`` and the plan's scalars, so when ``out`` and
+    ``lse`` are the caller's (among the validated ``tensors``) they are bound
+    once per buffer set and plan shape (``_TWO_SPLIT_BINDINGS``): the same
+    storage pointers, region offsets and scalars bind the same arguments.
+    """
+    combine = MODULES[REDUCE_TWO_SPLITS_RECORD]
+    num_heads, max_splits = main_kwargs["num_heads"], main_kwargs["max_splits"]
+    total_q = main_kwargs["rows_total"] // num_heads
+    table_base = layout["work_table"][0]
+    splits_first = (layout["row_splits"][0] - table_base) // 4 + first
+    key = None
+    if any(t is out for t in tensors) and any(t is lse for t in tensors):
+        key = (
+            flat.data_ptr(),
+            out.data_ptr(),
+            lse.data_ptr(),
+            layout["partial_o"][0],
+            layout["partial_lse"][0],
+            table_base,
+            splits_first,
+            total_q,
+            num_heads,
+            max_splits,
+            first,
+            rows,
+        )
+        bound = _TWO_SPLIT_BINDINGS.get(key)
+        if bound is not None and bound[0] is combine:
+            assert tuple(main_kwargs) == MAIN_KWARGS
+            return _bind_with_bound_combine(
+                arch,
+                plan,
+                main_kwargs,
+                dict(bound[1]),
+                out,
+                lse,
+                return_lse,
+                tables,
+                decode_record,
+                bound[2],
+            )
+    partial_o, partial_lse = main_kwargs["partial_o"], main_kwargs["partial_lse"]
+    reduce_kwargs = dict(
+        o=out[first:] if first else out,
+        lse=lse[first:] if first else lse,
+        partial_o=main_kwargs["PO"][first * num_heads :] if first else partial_o,
+        partial_lse=partial_lse[first:] if first else partial_lse,
+        row_splits=table_span[splits_first : splits_first + total_q - first],
+        total_q=total_q,
+        num_heads=num_heads,
+        max_splits=max_splits,
+        grid=launch_grid(combine, total_q=rows, num_heads=num_heads),
+    )
+    assert tuple(main_kwargs) == MAIN_KWARGS
+    assert tuple(reduce_kwargs) == REDUCE_KWARGS
+    runner = bind_decode_payload(
+        arch,
+        plan,
+        main_kwargs,
+        reduce_kwargs,
+        out,
+        lse,
+        return_lse,
+        tables,
+        decode_record=decode_record,
+        reduce_record=REDUCE_TWO_SPLITS_RECORD,
+    )
+    if key is not None:
+        if len(_TWO_SPLIT_BINDINGS) >= _TWO_SPLIT_BINDINGS_MAX:
+            _TWO_SPLIT_BINDINGS.clear()
+        _TWO_SPLIT_BINDINGS[key] = (
+            combine,
+            dict(reduce_kwargs),
+            (runner.reduce_arguments, runner.launches[1][1]),
+        )
+    return runner
+
+
+def _bind_with_bound_combine(
+    arch: str,
+    plan: WorkPlan,
+    main_kwargs: dict,
+    reduce_kwargs: dict,
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    return_lse: bool,
+    tables: torch.Tensor,
+    decode_record: str,
+    reduce_bound: tuple,
+) -> NVFP4MLADecodeRunner:
+    """``bind_decode_payload`` for the two-split combine whose ``(arguments,
+    launch form)`` of ``reduce_kwargs`` are already bound (``reduce_bound``)."""
+    main_record = _check_record(decode_record)
+    combine = _check_record(REDUCE_TWO_SPLITS_RECORD)
+    main_entry = getattr(load(decode_record, arch), main_record["ffi_entry"])
+    reduce_entry = getattr(load(REDUCE_TWO_SPLITS_RECORD, arch), combine["ffi_entry"])
+    main_arguments = launch_args(main_record, main_kwargs, main_kwargs["grid"])
+    reduce_arguments, reduce_launch = reduce_bound
+    return NVFP4MLADecodeRunner(
+        arch,
+        main_record["library"],
+        combine["library"],
+        plan,
+        main_kwargs,
+        reduce_kwargs,
+        out,
+        lse,
+        return_lse,
+        main_entry,
+        main_arguments,
+        reduce_entry,
+        reduce_arguments,
+        tables,
+        (
+            (main_entry, _launch_form(main_arguments)),
+            (reduce_entry, reduce_launch),
+        ),
+        (out, lse) if return_lse else out,
     )
