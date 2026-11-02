@@ -506,6 +506,11 @@ class Sm90W8A16Fp8GemmKernel:
             tidx // self.num_threads_per_warp_group
         )
         pipeline.pipeline_init_wait(cluster_shape_mn=(1, 1))
+        # Every wgmma accumulates (the accumulators are zeroed per work item).  Set
+        # once here, in the kernel body: the flag rewrites the tiled MMA value, and a
+        # rewrite inside a role branch would not dominate the other branch's uses
+        # (the ping-pong kernel traces the consumer once per branch).
+        tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
 
         # ---- producer warpgroup: warp 0 loads both operands of every k-tile.
         if warp_group_idx < self.num_dma_warp_groups:
@@ -1105,7 +1110,6 @@ class Sm90W8A16Fp8GemmKernel:
         num_k_blocks = cute.size(tCrA_mma, mode=[2])
         k_wait_max = min(num_k_blocks - 1, 7)
         accumulators.fill(0.0)
-        tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
         read_state.reset_count()
         release_state.reset_count()
 
