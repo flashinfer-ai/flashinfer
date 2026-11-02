@@ -357,28 +357,66 @@ others.  The phase comes from `torch._C._current_graph_task_id()`; a torch
 without it refuses the handle.
 
 Checkpoint hand-off (`chunk_kda_kcp(..., checkpoint_handoff="auto" | "on" |
-"off")`): under `torch.utils.checkpoint` (reentrant or not) the forward of
-both passes keeps its tape set -- the `h` tape, `v_new`, `w` and the internal
-`Aqk` / `Akk` rows its own launches write -- in the saved set, and the
-backward reads it instead of re-running the intra program, WY, the K1 tape
-walk and, at `P > 1`, the offset re-walk and the carry merges.  The launch list
-of the forward and every collective are unchanged; the outputs and gradients
-are bitwise those of `"off"` on the verified rows.  Non-reentrant checkpoint
-drops the original forward's set at its return and keeps the recompute's until
-the node's backward: `kda_handoff_bytes_kcp(ctx, H=...)` (1280 B per internal
-token-head per rank) in both places; `kda_saved_bytes_kcp(..., checkpoint_handoff=True)`
-is the recompute's saved set (no carry plane).  `"auto"` (the default) engages
-at the head counts of `KCP_HANDOFF_HEADS` on the (architecture, SM count,
-toolkit) devices of `KCP_HANDOFF_VERIFIED`; `"on"` wherever the call supports
-it; `"off"` never.  The call keeps the light set outside a checkpoint pass,
-with `graph="replay"`, `spec3_probe`, `boundary_mode="replay"`, inside a
-CUDA-graph capture, under `torch.compile` tracing and under a Python dispatch
-mode (a selective-checkpoint policy).  The rule reads the saved-tensor hooks,
-the graph task and the call's static keys only, so both passes of a
-checkpoint take the same branch; the choice is rank-local and moves no
-collective.  It combines with a recompute handle.  `kcp_handoff_stats()`
-counts the forwards that kept a set, the backwards that read one and the
-refused requests by reason.
+"off")`): under `torch.utils.checkpoint` the forward keeps its tape set --
+the `h` tape, `v_new`, `w` and the internal `Aqk` / `Akk` rows its own
+launches write -- in the saved set, and the backward reads it instead of
+re-running the intra program, WY, the K1 tape walk and, at `P > 1`, the
+offset re-walk and the carry merges.  Non-reentrant checkpoint keeps the set
+in both passes (the original forward's goes at its return); reentrant
+checkpoint runs its first pass under no_grad, so only its recompute keeps
+one.  The forward's launch list and every collective are unchanged.  On the
+devices of `KCP_HANDOFF_VERIFIED` the outputs and gradients are bitwise those
+of `"off"` (the hand-off rows of
+`tests/experimental/test_cake_kda_train_kcp_handoff.py`); `"on"` on another
+device has no such evidence.
+
+`"auto"` (the default) engages where `cake_kcp_plan.kcp_handoff_auto_refusal`
+admits the call, `"on"` wherever the call supports it, `"off"` never:
+
+```text
+(architecture, SM count, toolkit) in KCP_HANDOFF_VERIFIED
+    = (sm_100a, 148, 13.4) B200, (sm_103a, 148, 13.4) B300,
+      (sm_103a, 152, 13.4) GB300, (sm_107a, 212, 13.4) R200
+and H in KCP_HANDOFF_HEADS = {4, 8, 16, 32, 64}
+and H * (total packed tokens // world size) >= KCP_HANDOFF_MIN_HEAD_TOKENS = 393216
+```
+
+The rule comes from the `ckpt` step (time with the hand-off off / on) at
+261392 packed tokens in 4 documents, BF16, head dim 128: H16 and H64
+1.07-1.14 on every row; H4 at CP2 (H * T / W = 522784) 1.05-1.10; H4 at CP4
+(261392) 1.01-1.04 on B200, B300 and R200 but 0.978-0.996 on GB300; H4 at
+CP8 (130696) 0.979-1.010 on B200 and B300.  The bound admits every row that
+gains 5 % or more and refuses every loss.  H, the batch's total and the
+world size are the same on every rank, so the ranks of a group of one device
+kind decide alike; a rank that decides otherwise (a rank without tokens never
+keeps a set) still runs the same collectives, because the launches the
+hand-off skips are rank-local.
+
+Memory: the set costs `kda_handoff_bytes_kcp(ctx, H=...)` =
+`NC_pad * H * 32768 + R * H * 768` bytes (1280 B per internal token-head) on
+each rank and lives from the recompute to the end of the node's backward
+(non-reentrant: also inside the original forward call).  An engaged call
+raises the checkpoint peak by that much; measured with `"on"`: +152 MiB per
+rank at CP8 H4 to +10196 MiB at CP2 H64 (T = 261392).
+`kda_saved_bytes_kcp(..., checkpoint_handoff=True)` is the saved set of an
+engaged call (no carry plane); the facade `flashinfer.cake_kda_train_kcp`
+exports `kda_saved_bytes_kcp(..., checkpoint_handoff=...)`,
+`kda_handoff_bytes_kcp` (`0` with `deterministic=True`) and
+`kcp_handoff_stats()` (the forwards that kept a set, the backwards that read
+one and the refused requests by reason).  To opt out, pass
+`checkpoint_handoff="off"`; the deterministic package has no hand-off and
+`deterministic=True` ignores the keyword.
+
+The call keeps the light set outside a checkpoint pass, with
+`graph="replay"`, `spec3_probe`, `boundary_mode="replay"`, inside a
+CUDA-graph capture, under `torch.compile` tracing and under a Python
+dispatch mode (a selective-checkpoint policy).  A non-reentrant checkpoint
+decides once per call: the original forward reads these states and the
+static keys and records its decision on the checkpoint frame, and the
+recompute replays it in call order without reading its own state, so both
+passes save the same tensors (torch raises `CheckpointError` otherwise) even
+when a capture, `torch.compile` or a dispatch mode is active in one pass
+only.  It combines with a recompute handle.
 
 One halo exchange for a layer's q / k / v convolutions:
 `cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)` returns the
@@ -477,6 +515,9 @@ registries and manifests, no device needed),
 the comparison against the deterministic package),
 `tests/experimental/test_cake_kda_train_kcp_api.py` (the public entry
 points, the mode keyword, the names and the import isolation),
+`tests/experimental/test_cake_kda_train_kcp_handoff.py` (the checkpoint
+hand-off: multi-GPU rows bitwise against `"off"`, the admission rule, the
+once-per-call decision, the byte queries),
 `_fsdp_walk.py`, `_shared_ws.py` and `_upload.py`; benchmark
 `benchmarks/bench_cake_kda_train_kcp.py` (`torchrun`, one process per
 rank; the deterministic and the non-deterministic package interleaved).

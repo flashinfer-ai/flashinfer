@@ -97,16 +97,21 @@ Before the timing, one ``step`` of ``det`` and one of ``nd`` on the same shard
 are compared: ``out``, ``dq``, ``dk``, ``dv``, ``dbeta`` (and ``y``, ``dx``,
 ``dweight`` with the convolution) must be bitwise equal; ``dg`` differs by FP32
 rounding on the ranks whose backward runs the ``S1`` pair (its rel-RMS and
-max-abs difference are reported).  With ``nd_off``, one ``ckpt`` step of
-``nd`` and one of ``nd_off`` are compared too: ``out``, ``dq``, ``dk``,
-``dv``, ``dg``, ``dbeta`` (and the convolution's) must be bitwise equal
-(``handoff``: the package's hand-off counters of each step are recorded).  With ``fla_cp``, one untimed forward of it
-and of ``det`` compares ``out`` in global token order (``fla_cp_out``: rel-RMS
-and max-abs difference, recorded only).  The report also lists, per rank, the
+max-abs difference are reported).  With ``nd_off`` or ``--ckpt-handoff on``,
+one ``ckpt`` step of ``nd`` and one of ``nd_off`` are compared too: ``out``,
+``dq``, ``dk``, ``dv``, ``dg``, ``dbeta`` (and the convolution's) must have
+the same bit patterns, and the hand-off must engage as the mode says
+(``handoff``: ``"on"`` on every rank with tokens, ``"auto"`` where the
+package's admission rule admits the call, ``"off"`` nowhere; ``nd_off``
+never; the package's hand-off counters of each step are recorded).  With
+``fla_cp``, one untimed forward of it and of ``det`` compares ``out`` in
+global token order (``fla_cp_out``: rel-RMS and max-abs difference, recorded
+only).  The report also lists, per rank, the
 local backward records (``dqkg`` and ``glm_intra`` on the replay path) the plan
 of each package selects.  Rank 0 prints the table and writes ``--json``.  The
 exit status is 0 when every boundary's control ratio is in band and its drift
-is at most 2 %, and the bitwise comparison holds.
+is at most 2 %, the bitwise comparisons hold and the hand-off engaged as its
+mode says (so ``--ckpt-handoff on`` fails when it did not engage).
 
 Example::
 
@@ -151,7 +156,9 @@ from flashinfer.cake_kda_train import chunk_kda  # noqa: E402
 from flashinfer.cake_kda_train_kcp import (  # noqa: E402
     build_context_kcp,
     chunk_kda_kcp,
+    kcp_handoff_stats,
     kda_comm_bytes_kcp,
+    kda_handoff_bytes_kcp,
     kda_saved_bytes_kcp,
     kda_workspace_bytes_kcp,
     partition_kcp,
@@ -635,7 +642,39 @@ def _agreement(
 
 
 def _handoff_counts() -> dict[str, int]:
-    return dict(nd_kcp.HANDOFF_STATS)
+    return kcp_handoff_stats()
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    """The bit pattern of ``t`` (-0.0 / +0.0 and NaN payloads differ; equal NaNs agree)."""
+    return t.contiguous().view(torch.int16 if t.element_size() == 2 else torch.int32)
+
+
+def _same_bits(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
+    return (
+        a is not None
+        and b is not None
+        and a.dtype == b.dtype
+        and a.shape == b.shape
+        and torch.equal(_bits(a), _bits(b))
+    )
+
+
+def _handoff_expected(problem: dict[str, Any], device: torch.device) -> bool:
+    """Whether the ``nd`` arm's mode engages the hand-off on this rank's ``ckpt`` step: ``"on"`` yes, ``"off"`` no,
+    ``"auto"`` where the package's admission rule (``kcp_handoff_auto_refusal`` of this device's key, the head count,
+    the batch's total and the world size) admits it."""
+    mode = problem["ckpt_handoff"]
+    if mode != "auto":
+        return mode == "on"
+    ctx = problem["ctx"]["nd"]
+    reason = nd_kcp.cake_kcp_plan.kcp_handoff_auto_refusal(
+        nd_kcp._handoff_key(device),
+        int(problem["local"]["v"].shape[-2]),
+        ctx.partition.total,
+        ctx.world_size,
+    )
+    return reason is None
 
 
 def _handoff_delta(before: dict[str, int]) -> dict[str, int]:
@@ -650,8 +689,10 @@ def _handoff_agreement(
     problem: dict[str, Any], conv: bool, device: torch.device
 ) -> dict[str, Any]:
     """One ``ckpt`` step of ``nd`` (the ``--ckpt-handoff`` mode) and one of ``nd_off`` on the same shard: every
-    output and gradient bitwise (``dg`` included: the same package), and the hand-off counters of each step (rank 0's;
-    ``engaged`` = some rank's ``nd`` step kept and read a tape set)."""
+    output and gradient with the same bit pattern (``dg`` included: the same package), and the hand-off counters of
+    each step (rank 0's).  ``engaged``: some rank's ``nd`` step kept and read a tape set; ``engaged_all``: every rank
+    with tokens did; ``expected``: the mode engages on every rank (:func:`_handoff_expected`); ``engagement_ok``:
+    ``engaged_all`` where expected, else no rank engaged, and ``nd_off`` engaged nowhere."""
     results: dict[str, dict[str, torch.Tensor]] = {}
     counts: dict[str, dict[str, int]] = {}
     local = problem["local"]
@@ -679,28 +720,37 @@ def _handoff_agreement(
         results[arm] = res
     on, off = results["nd"], results["nd_off"]
     names = [n for n in HANDOFF_BITWISE if n in on]
-    equal = torch.tensor(
-        [
-            int(on[n] is not None and off[n] is not None and torch.equal(on[n], off[n]))
-            for n in names
+    bound = counts["nd"].get("bound", 0) > 0
+    # MIN over ranks: every bit pattern equal, every rank with tokens engaged, every rank expected to engage
+    all_ranks = torch.tensor(
+        [int(_same_bits(on[n], off[n])) for n in names]
+        + [
+            int(bound or problem["tokens_local"] == 0),
+            int(_handoff_expected(problem, device)),
         ],
         dtype=torch.int64,
         device=device,
     )
-    dist.all_reduce(equal, op=dist.ReduceOp.MIN)
-    engaged = torch.tensor(
-        [int(counts["nd"].get("bound", 0) > 0), int(bool(counts["nd_off"]))],
-        dtype=torch.int64,
-        device=device,
+    dist.all_reduce(all_ranks, op=dist.ReduceOp.MIN)
+    # MAX over ranks: some rank engaged (nd / nd_off)
+    any_rank = torch.tensor(
+        [int(bound), int(bool(counts["nd_off"]))], dtype=torch.int64, device=device
     )
-    dist.all_reduce(engaged, op=dist.ReduceOp.MAX)
-    bitwise = {n: bool(e) for n, e in zip(names, equal.tolist(), strict=True)}
+    dist.all_reduce(any_rank, op=dist.ReduceOp.MAX)
+    flags = all_ranks.tolist()
+    bitwise = {n: bool(e) for n, e in zip(names, flags[: len(names)], strict=True)}
+    engaged_all, expected = bool(flags[-2]), bool(flags[-1])
+    engaged, off_engaged = bool(any_rank[0].item()), bool(any_rank[1].item())
+    engagement_ok = (engaged_all if expected else not engaged) and not off_engaged
     return {
         "mode": problem["ckpt_handoff"],
         "bitwise": bitwise,
         "bitwise_ok": all(bitwise.values()),
-        "engaged": bool(engaged[0].item()),
-        "off_engaged": bool(engaged[1].item()),
+        "engaged": engaged,
+        "engaged_all": engaged_all,
+        "expected": expected,
+        "off_engaged": off_engaged,
+        "engagement_ok": engagement_ok,
         "counts_rank0": counts,
     }
 
@@ -864,7 +914,9 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
         else None
     )
     agreement["handoff"] = (
-        _handoff_agreement(problem, conv, device) if "nd_off" in arms else None
+        _handoff_agreement(problem, conv, device)
+        if "nd_off" in arms or args.ckpt_handoff == "on"
+        else None
     )
     records = _local_records(problem, args.heads, device)
     boundaries = {
@@ -890,7 +942,10 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
         "nd": {
             "workspace": kda_workspace_bytes_kcp(ctx_nd, H=H, C=C, deterministic=False),
             "saved": kda_saved_bytes_kcp(ctx_nd, H=H, C=C, deterministic=False),
-            "handoff": nd_kcp.kda_handoff_bytes_kcp(ctx_nd, H=H),
+            "saved_handoff": kda_saved_bytes_kcp(
+                ctx_nd, H=H, C=C, checkpoint_handoff=True, deterministic=False
+            ),
+            "handoff": kda_handoff_bytes_kcp(ctx_nd, H=H, deterministic=False),
             "comm": kda_comm_bytes_kcp(ctx_nd, H=H, C=C, deterministic=False),
         },
     }
@@ -968,7 +1023,9 @@ def _print(report: dict[str, Any]) -> None:
         bad_ho = [n for n, ok in ho["bitwise"].items() if not ok]
         print(
             f"  nd ({ho['mode']}) vs nd_off ckpt: bitwise {'ok' if ho['bitwise_ok'] else 'MISMATCH ' + ','.join(bad_ho)}; "
-            f"hand-off engaged={ho['engaged']} off_engaged={ho['off_engaged']} counts(rank0)={ho['counts_rank0']}"
+            f"hand-off engaged={ho['engaged']} (every rank: {ho['engaged_all']}, expected: {ho['expected']}) "
+            f"off_engaged={ho['off_engaged']} -> {'ok' if ho['engagement_ok'] else 'ENGAGEMENT MISMATCH'}; "
+            f"counts(rank0)={ho['counts_rank0']}"
         )
     if agree["fla_cp_out"] is not None:
         print(
@@ -1073,7 +1130,7 @@ def main() -> int:
     handoff = report["agreement"].get("handoff")
     ok = (
         report["agreement"]["bitwise_ok"]
-        and (handoff is None or handoff["bitwise_ok"])
+        and (handoff is None or (handoff["bitwise_ok"] and handoff["engagement_ok"]))
         and all(
             res["control_ok"] and res["drift_ok"]
             for res in report["boundaries"].values()

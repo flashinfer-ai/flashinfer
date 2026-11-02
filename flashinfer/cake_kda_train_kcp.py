@@ -17,7 +17,8 @@ Context-parallel (KCP) packed KDA (Kimi Delta Attention) chunked training
 (SM100 / SM103 / SM107), the Cake backend, with a choice of numerical mode.
 
 Every entry takes ``deterministic: bool = True`` and rejects a value that is not
-a ``bool`` (``TypeError``):
+a ``bool`` (``TypeError``); ``kcp_handoff_stats`` (the non-deterministic
+package's checkpoint hand-off counters) takes none:
 
 * ``deterministic=True`` (the default) runs the deterministic package
   ``flashinfer.experimental.cake_kda_det_train_kcp`` (the objects behind
@@ -486,9 +487,15 @@ def chunk_kda_kcp(
     r"""Autograd-enabled context-parallel packed KDA chunked training step of this rank's fragments (the forward of
     :func:`chunk_kda_fwd_kcp`; the backward of :func:`chunk_kda_bwd_kcp` from its saved set).
 
-    ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``): the non-deterministic package's checkpoint hand-off
-    (its README: under ``torch.utils.checkpoint`` the forward keeps its tape set and the backward skips the local
-    recompute; every result is unchanged); the deterministic package has no hand-off and ignores it.
+    ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``; another value raises ``ValueError`` in both modes): the
+    non-deterministic package's checkpoint hand-off (its README): under ``torch.utils.checkpoint`` the forward keeps
+    its tape set in the saved set and the backward skips the local recompute.  On the devices of
+    ``KCP_HANDOFF_VERIFIED`` the outputs and gradients are bitwise those of ``"off"``; ``"on"`` elsewhere has no such
+    evidence.  ``"auto"`` (the default) engages where ``cake_kcp_plan.kcp_handoff_auto_refusal`` admits the call (a
+    verified device, ``H`` in ``KCP_HANDOFF_HEADS``, ``H * (total tokens // world size) >= 393216``).  An engaged
+    call raises the checkpoint peak of this rank by :func:`kda_handoff_bytes_kcp` (its saved set is
+    ``kda_saved_bytes_kcp(..., checkpoint_handoff=True)``); ``"off"`` opts out.  The deterministic package has no
+    hand-off: ``deterministic=True`` ignores the value and never engages.
 
     ``recompute_handle`` / ``checkpoint_keep``: the checkpoint recompute without the forward state exchange, as for
     :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_kcp` (a ``RecomputeHandleKcp`` or any object with an
@@ -610,17 +617,30 @@ def kda_saved_bytes_kcp(
     with_conv: bool = True,
     C: int = 8192,
     checkpoint_keep: Optional[str] = None,
+    checkpoint_handoff: bool = False,
     deterministic: bool = True,
 ) -> int:
     """Bytes of this rank's KCP saved set for ``H`` heads on the package ``deterministic`` selects (the same for both
     values); see :func:`flashinfer.cake_kda_det_train_kcp.kda_det_saved_bytes_kcp` for ``save_transfer``,
-    ``with_conv``, ``C`` and ``checkpoint_keep``."""
+    ``with_conv``, ``C`` and ``checkpoint_keep``.  ``checkpoint_handoff`` (``False`` by default: the light set):
+    ``True`` is the saved set of a ``deterministic=False`` forward that the checkpoint hand-off engages on (plus
+    :func:`kda_handoff_bytes_kcp`, without the carry plane; see :func:`chunk_kda_kcp`).  The deterministic package
+    has no hand-off: ``deterministic=True`` ignores it and returns that package's figure."""
     det = _deterministic(deterministic, "kda_saved_bytes_kcp")
     plan = _det_plan() if det else _nd_plan()
     if save_transfer is None and checkpoint_keep is None:
         save_transfer = False
-    query = plan.kda_det_saved_bytes_kcp if det else plan.kda_saved_bytes_kcp
-    return query(
+    if det:
+        return plan.kda_det_saved_bytes_kcp(
+            ctx,
+            H=H,
+            save_mode=save_mode,
+            save_transfer=save_transfer,
+            with_conv=with_conv,
+            C=C,
+            checkpoint_keep=checkpoint_keep,
+        )
+    return plan.kda_saved_bytes_kcp(
         ctx,
         H=H,
         save_mode=save_mode,
@@ -628,7 +648,31 @@ def kda_saved_bytes_kcp(
         with_conv=with_conv,
         C=C,
         checkpoint_keep=checkpoint_keep,
+        checkpoint_handoff=checkpoint_handoff,
     )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def kda_handoff_bytes_kcp(
+    ctx: Any,
+    *,
+    H: int = 64,
+    deterministic: bool = True,
+) -> int:
+    """Bytes by which the checkpoint hand-off raises this rank's checkpoint peak for one engaged call with ``H`` heads
+    (its tape set: ``1280 * R * H``; see :func:`chunk_kda_kcp`).  ``deterministic=False`` reads the
+    non-deterministic package; ``deterministic=True`` returns ``0`` (the deterministic package has no hand-off)."""
+    if _deterministic(deterministic, "kda_handoff_bytes_kcp"):
+        return 0
+    return _nd_plan().kda_handoff_bytes_kcp(ctx, H=H)
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def kcp_handoff_stats() -> dict:
+    """A copy of the non-deterministic package's checkpoint hand-off counters (``"save"``: forwards that kept a tape
+    set, ``"bound"``: backwards that read one, ``"refused_<reason>"``: requests the static keys refused); calls with
+    ``deterministic=True`` never change them."""
+    return _nd_kcp().kcp_handoff_stats()
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -701,7 +745,9 @@ __all__ = [
     "chunk_kda_bwd_kcp",
     "chunk_kda_fwd_kcp",
     "chunk_kda_kcp",
+    "kcp_handoff_stats",
     "kda_comm_bytes_kcp",
+    "kda_handoff_bytes_kcp",
     "kda_saved_bytes_kcp",
     "kda_workspace_bytes_kcp",
     "partition_kcp",

@@ -18,11 +18,16 @@ Multi-GPU rows (the checkpoint rows ``CKPT_ROWS`` of ``test_cake_kda_train_kcp_d
 ``out``, the five gradients and ``dw`` (the checkpointed function returns ``out * w``) with the hand-off on are
 bitwise those with it off and those of the direct pass, for ``use_reentrant`` False and True, with a recompute handle
 (both tiers), on a lean arena and a per-call workspace; the forward's launches and every collective are unchanged;
-the backward launches no intra program, WY or K1 tape walk; a NaN-filled tape set, poisoned free blocks and a
-poisoned local arena (between the recompute and the backward) change no bit; the refusals (``"off"``, no checkpoint,
-a blocked state such as a CUDA-graph capture, a selective-checkpoint policy, ``"auto"`` off the verified devices)
-keep the light set in both passes and change no bit; a checkpointed forward with the hand-off retains nothing.
-Single-process rows: the static rule, the phase probe and the saved set's tape members.
+the backward launches no intra program, WY or K1 tape walk; the saved set grows by the byte query's difference; a
+NaN-filled tape set, poisoned free blocks and a poisoned local arena (between the recompute and the backward) change
+no bit; ranks that decide differently (``"on"`` on some, ``"off"`` on others) change no bit; the refusals (``"off"``,
+no checkpoint, a blocked state such as a CUDA-graph capture, a selective-checkpoint policy, ``"auto"`` off the
+verified devices) keep the light set in both passes and change no bit; a Python dispatch mode in one pass only
+follows the original forward's decision in both; ``"auto"`` engages exactly where the admission rule admits the
+call; the facade ``flashinfer.cake_kda_train_kcp`` forwards the mode under ``deterministic=False`` and never engages
+under ``deterministic=True``; a checkpointed forward with the hand-off retains nothing.
+Single-process rows: the static rule, the admission table, the phase probe, the once-per-call decision, the saved
+set's tape members and the byte queries of the package and the facade.
 """
 
 from __future__ import annotations
@@ -33,11 +38,14 @@ import json
 import os
 import tempfile
 import traceback
+import types
 
 import pytest
 import torch
 import torch.distributed as dist
+from torch.utils._python_dispatch import TorchDispatchMode
 
+import flashinfer.cake_kda_train_kcp as kcp_api
 from tests.experimental.test_cake_kda_train_kcp_dist import (
     CKPT_ROWS,
     _bound_rank_threads,
@@ -57,6 +65,17 @@ from tests.test_helpers.cake_kda_det_train_reference import make_inputs
 TENSORS = ("out", "dq", "dk", "dv", "dg", "dbeta", "dw")
 # the launches the hand-off's backward drops (the forward's tape set stands in for their outputs)
 SKIPPED = ("fwd_intra", "wy", "kcp_fwdh_tape")
+# the shipped admission rule of "auto" (cake_kcp_plan.kcp_handoff_auto_refusal)
+VERIFIED_KEYS = frozenset(
+    {
+        ("sm_100a", 148, "13.4"),
+        ("sm_103a", 148, "13.4"),
+        ("sm_103a", 152, "13.4"),
+        ("sm_107a", 212, "13.4"),
+    }
+)
+AUTO_HEADS = frozenset({4, 8, 16, 32, 64})
+MIN_HEAD_TOKENS = 393216
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -75,6 +94,13 @@ def _same(a: dict, b: dict) -> bool:
 
 def _collectives(seq) -> list:
     return [x for x in seq if x.startswith(("a2a:", "ring:"))]
+
+
+class _PassThroughMode(TorchDispatchMode):
+    """A Python dispatch mode that runs every op unchanged (a stand-in for a debug or flop-counting mode)."""
+
+    def __torch_dispatch__(self, func, _types, args=(), kwargs=None):
+        return func(*args, **(kwargs or {}))
 
 
 class _ArenaPoison:
@@ -150,9 +176,12 @@ def _run_rank_handoff(
         context_fn=None,
         poison_free: bool = False,
         poison_tape: bool = False,
+        fwd_mode: bool = False,
+        bwd_mode: bool = False,
     ):
         """One checkpointed (or direct) step of ``out * w``: the results and the LAST_CALL records of the original
-        forward, the recompute (None without one) and the backward."""
+        forward, the recompute (None without one) and the backward.  ``fwd_mode`` / ``bwd_mode``: a pass-through
+        Python dispatch mode around the forward / the backward (the recompute) only."""
         if poison_free:
             _poison(device)
         lv = leaves()
@@ -183,20 +212,22 @@ def _run_rank_handoff(
         prev = cake_kcp._HANDOFF_POISON
         cake_kcp._HANDOFF_POISON = bool(poison_tape)
         try:
-            if not ckpt:
-                out = top(*lv, wl)
-            elif reentrant:
-                out = checkpoint(top, *lv, wl, use_reentrant=True)
-            elif context_fn is not None:
-                out = checkpoint(
-                    top, *lv, wl, use_reentrant=False, context_fn=context_fn
-                )
-            else:
-                out = checkpoint(top, *lv, wl, use_reentrant=False)
+            with _PassThroughMode() if fwd_mode else contextlib.nullcontext():
+                if not ckpt:
+                    out = top(*lv, wl)
+                elif reentrant:
+                    out = checkpoint(top, *lv, wl, use_reentrant=True)
+                elif context_fn is not None:
+                    out = checkpoint(
+                        top, *lv, wl, use_reentrant=False, context_fn=context_fn
+                    )
+                else:
+                    out = checkpoint(top, *lv, wl, use_reentrant=False)
             rec_orig = dict(cake_kcp.LAST_CALL["fwd"])
             if ckpt:
                 cake_kcp.LAST_CALL.pop("fwd")
-            out.backward(dout)
+            with _PassThroughMode() if bwd_mode else contextlib.nullcontext():
+                out.backward(dout)
         finally:
             cake_kcp._HANDOFF_POISON = prev
         rec_fwd = cake_kcp.LAST_CALL.get("fwd")
@@ -254,6 +285,24 @@ def _run_rank_handoff(
         recs_on["fwd"].get("checkpoint_handoff_bytes") == want_bytes
         and recs_on["bwd"].get("checkpoint_handoff_bytes") == want_bytes
     )
+    # the saved set: the hand-off forward's minus the light forward's is the byte query's difference (the tape set
+    # in, the carry plane out); the absolute figures are recorded (the query also counts the int32 tables)
+    st = recs_on["fwd"]["save_transfer"]
+    query = {
+        flag: cake_kcp_plan.kda_saved_bytes_kcp(
+            ctx, H=H, with_conv=False, save_transfer=st, checkpoint_handoff=flag
+        )
+        for flag in (False, True)
+    }
+    got = {"off": recs_base["fwd"]["saved_bytes"], "on": recs_on["fwd"]["saved_bytes"]}
+    info["saved_bytes"] = {
+        "got": got,
+        "query": query,
+        "tables": cake_kcp_plan.tables_bytes(ctx.NC_pad, ctx.n_frag, ctx.heads(H).NSEG),
+    }
+    flags["on_saved_bytes"] = got["on"] - got["off"] == (
+        query[True] - query[False] if T_r > 0 else 0
+    )
     off_r, recs_off_r = run("off", reentrant=True)
     on_r, recs_on_r = run("on", reentrant=True)
     flags["on_reentrant_bitwise"] = _same(on_r, base) and _same(off_r, base)
@@ -291,6 +340,12 @@ def _run_rank_handoff(
     flags["poison_arena_off_bitwise"] = _same(res_pa_off, base)
     flags["poison_arena_on_bitwise"] = _same(res_pa_on, base)
     flags["poison_arena_engaged"] = engaged(recs_pa)
+    # ranks that decide differently ("on" on the even ranks, "off" on the odd ones): the hand-off moves no
+    # collective, so nothing hangs and no bit changes
+    mixed = "on" if rank % 2 == 0 else "off"
+    res_mx, recs_mx = run(mixed)
+    flags["mixed_ranks_bitwise"] = _same(res_mx, base)
+    flags["mixed_ranks_engaged"] = engaged(recs_mx) if mixed == "on" else light(recs_mx)
     # refusals: no checkpoint (no phase), a blocked state (CUDA-graph capture / torch.compile tracing, simulated in both
     # passes), a selective-checkpoint policy (a dispatch mode in both passes), "auto" off the verified set
     res_nc, recs_nc = run("on", ckpt=False)
@@ -321,28 +376,102 @@ def _run_rank_handoff(
         except Exception:  # noqa: BLE001 - recorded; the flag fails
             info["sac_error"] = traceback.format_exc()[-1500:]
             flags["refuse_sac"] = False
-    verified = cake_kcp.KCP_HANDOFF_VERIFIED
-    stats0 = cake_kcp.kcp_handoff_stats()
-    cake_kcp.KCP_HANDOFF_VERIFIED = frozenset()
+    # a Python dispatch mode in one pass only: the original forward decides (refused under the mode, engaged without
+    # it) and the recompute replays that decision, so the two passes save the same tensors
     try:
+        res_fm_off, _ = run("off", fwd_mode=True)
+    except Exception:  # noqa: BLE001 - the light path itself does not run under the mode: nothing to compare
+        info["dispatch_mode_unsupported"] = traceback.format_exc()[-1500:]
+        res_fm_off = None
+    if res_fm_off is None:
+        flags["mode_fwd_only"] = flags["mode_bwd_only"] = True
+    else:
+        try:
+            res_fm, recs_fm = run("on", fwd_mode=True)
+            flags["mode_fwd_only"] = (
+                _same(res_fm, res_fm_off) and _same(res_fm, base) and light(recs_fm)
+            )
+        except Exception:  # noqa: BLE001 - recorded; the flag fails
+            info["mode_fwd_only_error"] = traceback.format_exc()[-1500:]
+            flags["mode_fwd_only"] = False
+        try:
+            res_bm, recs_bm = run("on", bwd_mode=True)
+            flags["mode_bwd_only"] = _same(res_bm, base) and engaged(recs_bm)
+        except Exception:  # noqa: BLE001 - recorded; the flag fails
+            info["mode_bwd_only_error"] = traceback.format_exc()[-1500:]
+            flags["mode_bwd_only"] = False
+    total = ctx.partition.total
+    verified = cake_kcp_plan.KCP_HANDOFF_VERIFIED
+    stats0 = cake_kcp.kcp_handoff_stats()
+    cake_kcp_plan.KCP_HANDOFF_VERIFIED = frozenset()
+    try:
+        want_refusal = "refused_" + cake_kcp_plan.kcp_handoff_auto_refusal(
+            key, H, total, W
+        )
         res_un, recs_un = run("auto")
     finally:
-        cake_kcp.KCP_HANDOFF_VERIFIED = verified
+        cake_kcp_plan.KCP_HANDOFF_VERIFIED = verified
     stats1 = cake_kcp.kcp_handoff_stats()
-    want_refusal = (
-        "refused_heads" if H not in cake_kcp.KCP_HANDOFF_HEADS else "refused_unverified"
-    )
+    # decided once per checkpointed call: counted in the original forward only
     flags["refuse_auto_unverified"] = (
         _same(res_un, base)
         and light(recs_un)
-        and stats1[want_refusal] - stats0[want_refusal] == 2
+        and stats1[want_refusal] - stats0[want_refusal] == 1
     )
-    # "auto" on the shipped set: engaged exactly where the key and the head count are verified
+    # "auto" on the shipped set: engaged exactly where the admission rule admits the call
     res_auto, recs_auto = run("auto")
-    auto_on = key in cake_kcp.KCP_HANDOFF_VERIFIED and H in cake_kcp.KCP_HANDOFF_HEADS
+    auto_on = cake_kcp_plan.kcp_handoff_auto_refusal(key, H, total, W) is None
     info["auto_engages"] = auto_on
     flags["auto_bitwise"] = _same(res_auto, base)
     flags["auto_rule"] = engaged(recs_auto) if auto_on else light(recs_auto)
+
+    # the facade: deterministic=False forwards the mode (engaged as the package decides), deterministic=True runs
+    # the deterministic package, which has no hand-off (the counters do not move; every mode gives the same bits)
+    def run_facade(mode: str, det: bool):
+        lv = leaves()
+        wl = torch.ones_like(dout).requires_grad_(True)
+
+        def top(q_, k_, v_, g_, b_, w_):
+            y = kcp_api.chunk_kda_kcp(
+                q_,
+                k_,
+                v_,
+                g_,
+                b_,
+                ctx,
+                workspace=None if det else ws,
+                checkpoint_handoff=mode,
+                deterministic=det,
+            )
+            return y * w_
+
+        before = kcp_api.kcp_handoff_stats()
+        out = checkpoint(top, *lv, wl, use_reentrant=False)
+        out.backward(dout)
+        after = kcp_api.kcp_handoff_stats()
+        res = {"out": out.detach(), "dw": wl.grad}
+        res.update(
+            {
+                f"d{n}": lf.grad
+                for n, lf in zip(("q", "k", "v", "g", "beta"), lv, strict=True)
+            }
+        )
+        return res, {k: after[k] - before[k] for k in after if after[k] != before[k]}
+
+    kept = {"save": 2, "bound": 1} if T_r > 0 else {}
+    det_res = {}
+    for mode in ("auto", "on", "off"):
+        res_f, delta = run_facade(mode, False)
+        want = kept if (mode == "on" or (mode == "auto" and auto_on)) else {}
+        flags[f"facade_nd_{mode}_bitwise"] = _same(res_f, base)
+        flags[f"facade_nd_{mode}_engaged"] = {
+            k: n for k, n in delta.items() if k in ("save", "bound")
+        } == want
+        det_res[mode], delta = run_facade(mode, True)
+        flags[f"facade_det_{mode}_never_engages"] = delta == {}
+    flags["facade_det_modes_bitwise"] = _same(det_res["on"], det_res["off"]) and _same(
+        det_res["auto"], det_res["off"]
+    )
     # #7039: a checkpointed forward with the hand-off retains nothing (its original forward's set goes at return),
     # after one warm-up step of the same form: per call, on this row's workspace and on a fresh caller-held workspace
     # (its first backward binds a new backward arena that no intra program of the hand-off backward touches)
@@ -442,42 +571,122 @@ def test_checkpoint_handoff_rows(row) -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# single process: the static rule, the phase probe, the saved set
+# single process: the static rule, the admission table, the phase probe, the once-per-call decision, the saved set,
+# the byte queries
 
 
 def test_handoff_static_rule_and_modes() -> None:
-    """The modes, the shipped keys, the refusal reasons of the static rule and the mode check of the entry."""
+    """The modes, the shipped admission constants, the refusal reasons of the static rule and the mode check of the
+    entry."""
     assert cake_kcp.KCP_HANDOFF_MODES == ("auto", "on", "off")
     assert cake_kcp.KCP_HANDOFF_DEFAULT == "auto"
     assert cake_kcp.KCP_HANDOFF_VERIFIED is cake_kcp_plan.KCP_HANDOFF_VERIFIED
-    assert all(
-        isinstance(a, str) and isinstance(s, int) and isinstance(t, str)
-        for a, s, t in cake_kcp.KCP_HANDOFF_VERIFIED
+    assert cake_kcp.KCP_HANDOFF_HEADS is cake_kcp_plan.KCP_HANDOFF_HEADS
+    assert (
+        cake_kcp.KCP_HANDOFF_MIN_HEAD_TOKENS
+        == cake_kcp_plan.KCP_HANDOFF_MIN_HEAD_TOKENS
+        == MIN_HEAD_TOKENS
     )
+    assert cake_kcp_plan.KCP_HANDOFF_VERIFIED == VERIFIED_KEYS
+    assert cake_kcp_plan.KCP_HANDOFF_HEADS == AUTO_HEADS
     assert cake_kcp_plan.KCP_HANDOFF_BUFFERS == cake_kcp.SavedKcp._TAPE
     with pytest.raises(ValueError, match="checkpoint_handoff"):
         cake_kcp._handoff_mode("yes")
     opts = cake_kcp._options({})
     v_cpu = torch.zeros(8, 4, 128)
-    assert cake_kcp._handoff_refusal("on", opts, "replay", v_cpu) == "boundary"
+    assert cake_kcp._handoff_refusal("on", opts, "replay", v_cpu, None) == "boundary"
     assert (
         cake_kcp._handoff_refusal(
-            "on", cake_kcp._options({"graph": "replay"}), "saved", v_cpu
+            "on", cake_kcp._options({"graph": "replay"}), "saved", v_cpu, None
         )
         == "graph"
     )
     assert (
         cake_kcp._handoff_refusal(
-            "on", cake_kcp._options({"spec3_probe": "record"}), "saved", v_cpu
+            "on", cake_kcp._options({"spec3_probe": "record"}), "saved", v_cpu, None
         )
         == "spec3"
     )
-    assert cake_kcp._handoff_refusal("on", opts, "saved", v_cpu) == "device"
+    assert cake_kcp._handoff_refusal("on", opts, "saved", v_cpu, None) == "device"
     # outside any checkpoint pass there is no request
     x = torch.zeros(2, requires_grad=True)
     assert cake_kcp._handoff_phase(x) is None
     with torch.no_grad():
         assert cake_kcp._handoff_phase(x) is None
+
+
+def _auto_want(key, H: int, total: int, W: int) -> str | None:
+    if H not in AUTO_HEADS:
+        return "heads"
+    if H * (total // W) < MIN_HEAD_TOKENS:
+        return "work"
+    return None if key in VERIFIED_KEYS else "unverified"
+
+
+def test_handoff_auto_admission_table() -> None:
+    """``"auto"``'s admission rule over device keys x head counts x world sizes x batch sizes, and the measured rows
+    it was set from (T = 261392 packed tokens): H4 engages at CP2 (H * T // W = 522784) and not at CP4 (261392, the
+    GB300 loss) or CP8; H16 and H64 engage at CP2, CP4 and CP8 (H16 CP8: 522784)."""
+    other_keys = [
+        ("sm_100a", 132, "13.4"),
+        ("sm_103a", 152, "13.3"),
+        ("sm_103a", 152, None),
+        ("sm_107a", 216, "13.4"),
+        ("sm_90a", 132, "13.4"),
+    ]
+    T = 261392
+    for key in sorted(VERIFIED_KEYS) + other_keys:
+        for H in (1, 2, 4, 8, 12, 16, 32, 48, 64, 128):
+            for W in (1, 2, 4, 8, 16):
+                for total in (T, 65536, 98304, 1 << 20):
+                    got = cake_kcp_plan.kcp_handoff_auto_refusal(key, H, total, W)
+                    assert got == _auto_want(key, H, total, W), (key, H, W, total)
+    for key in VERIFIED_KEYS:
+        assert cake_kcp_plan.kcp_handoff_auto_refusal(key, 4, T, 2) is None
+        assert cake_kcp_plan.kcp_handoff_auto_refusal(key, 4, T, 4) == "work"
+        assert cake_kcp_plan.kcp_handoff_auto_refusal(key, 4, T, 8) == "work"
+        for H in (16, 64):
+            for W in (2, 4, 8):
+                assert cake_kcp_plan.kcp_handoff_auto_refusal(key, H, T, W) is None
+        # the bound is inclusive
+        assert cake_kcp_plan.kcp_handoff_auto_refusal(key, 4, 98304, 1) is None
+        assert cake_kcp_plan.kcp_handoff_auto_refusal(key, 4, 98303, 1) == "work"
+
+
+def test_handoff_auto_decides_alike_on_every_rank(monkeypatch) -> None:
+    """``"auto"`` reads the partition's total and world size, not the rank's share: every rank of an uneven
+    partition (ranks with different token counts, some without tokens) refuses or admits alike."""
+    backend = cake_kcp.KernelBackend()
+    monkeypatch.setattr(cake_kcp, "get_backend", lambda: backend)
+    opts = cake_kcp._options({})
+    lengths = (200000, 100, 61292)  # T = 261392
+    layouts = {
+        1: "ragged:261392",
+        2: "ragged:200000,61392",
+        4: "ragged:200000,0,40000,21392",
+        8: "ragged:1,1,1,3,0,2,200000,61384",
+    }
+    contexts = {}
+    for W, layout in layouts.items():
+        part, _cu = _partition(lengths, W, layout)
+        contexts[W] = [
+            cake_kcp_plan.build_context_kcp(part, None, r, "cpu", 4, sm_count=148)
+            for r in range(W)
+        ]
+    for key in (("sm_103a", 152, "13.4"), ("sm_90a", 132, "13.4")):
+        monkeypatch.setattr(cake_kcp, "_handoff_key", lambda device, _k=key: _k)
+        for W, ctxs in contexts.items():
+            shares = [ctx.T_r for ctx in ctxs]
+            assert W == 1 or len(set(shares)) > 1, shares
+            assert W < 4 or min(shares) == 0, shares
+            for H in (4, 8, 16, 64, 128):
+                got = set()
+                for ctx in ctxs:
+                    v = types.SimpleNamespace(
+                        device=torch.device("cuda", 0), shape=(ctx.T_r, H, 128)
+                    )
+                    got.add(cake_kcp._handoff_refusal("auto", opts, "saved", v, ctx))
+                assert got == {_auto_want(key, H, 261392, W)}, (key, W, H, got)
 
 
 def test_handoff_phase_probe_reads_the_checkpoint_passes() -> None:
@@ -515,6 +724,176 @@ def test_handoff_is_blocked_inside_a_cuda_graph_capture() -> None:
         inside = cake_kcp._handoff_blocked()
         side.add_(1.0)
     assert inside
+
+
+def test_handoff_decision_is_made_once_per_checkpointed_call(monkeypatch) -> None:
+    """A non-reentrant checkpoint decides the hand-off in its original forward and every recompute of the region
+    replays those decisions call by call, whatever capture, compile or dispatch-mode state it runs under, so the two
+    passes save the same tensors (torch raises CheckpointError otherwise): a dispatch mode around the forward only
+    refuses in both passes, one around the backward only engages in both, a state blocked in the recompute only or in
+    one call of the original forward changes nothing in the recompute, each backward of a ``retain_graph`` step
+    replays from the first call.  A frame the hooks do not expose keeps the light set in both passes; a reentrant
+    checkpoint decides in its recompute (its first pass runs under no_grad); the decisions go with their frame."""
+    from torch.utils.checkpoint import checkpoint
+
+    assert cake_kcp._handoff_frames_readable()
+    monkeypatch.setattr(cake_kcp, "_handoff_refusal", lambda *a: None)
+    # no capture or tracing (the capture read itself is test_handoff_is_blocked_inside_a_cuda_graph_capture's): the
+    # decisions below also run on a host without CUDA, where that read raises and so blocks
+    monkeypatch.setattr(cake_kcp, "_handoff_blocked", lambda: False)
+    opts = cake_kcp._options({})
+    seen: list = []
+    gc.collect()
+    frames_before = len(cake_kcp._HANDOFF_DECISIONS)
+
+    def fn(x):
+        for _ in range(2):  # two calls per region: replayed in call order
+            seen.append(
+                cake_kcp._handoff_decide("on", opts, "saved", None, x, x, x, x, x)
+            )
+        return x * x  # saves x: the backward unpacks it and recomputes the region
+
+    def step(fwd_mode=False, bwd_mode=False, backwards=1, reentrant=False) -> list:
+        seen.clear()
+        x = torch.ones(4, requires_grad=True)
+        with _PassThroughMode() if fwd_mode else contextlib.nullcontext():
+            y = checkpoint(fn, x, use_reentrant=reentrant).sum()
+        for i in range(backwards):
+            with _PassThroughMode() if bwd_mode else contextlib.nullcontext():
+                y.backward(retain_graph=i + 1 < backwards)
+        return list(seen)
+
+    assert step() == [True] * 4
+    assert step(fwd_mode=True) == [False] * 4
+    assert step(bwd_mode=True) == [True] * 4
+    assert step(backwards=2) == [True] * 6
+    assert step(reentrant=True) == [False, False, True, True]
+    blocked = cake_kcp._handoff_blocked
+
+    def blocked_in_backward() -> bool:
+        return cake_kcp._handoff_task() not in (None, -1)
+
+    monkeypatch.setattr(cake_kcp, "_handoff_blocked", blocked_in_backward)
+    assert step() == [True] * 4
+    calls = []
+
+    def second_call_blocked() -> bool:
+        calls.append(None)
+        return len(calls) == 2
+
+    monkeypatch.setattr(cake_kcp, "_handoff_blocked", second_call_blocked)
+    assert step() == [True, False, True, False]
+    monkeypatch.setattr(cake_kcp, "_handoff_blocked", blocked)
+    frame = cake_kcp._handoff_frame
+    monkeypatch.setattr(cake_kcp, "_handoff_frame", lambda phase: None)
+    assert step() == [False] * 4
+    monkeypatch.setattr(cake_kcp, "_handoff_frame", frame)
+    gc.collect()
+    assert len(cake_kcp._HANDOFF_DECISIONS) == frames_before
+
+
+def test_handoff_byte_queries_and_counters_are_public() -> None:
+    """The package root and the facade export ``kda_handoff_bytes_kcp`` and ``kcp_handoff_stats``; the facade's
+    ``kda_saved_bytes_kcp`` takes ``checkpoint_handoff`` (default ``False``, the light set), forwards it under
+    ``deterministic=False`` and ignores it under ``deterministic=True`` (the deterministic package's figure); the
+    facade's ``kda_handoff_bytes_kcp`` is the package's under ``deterministic=False`` and ``0`` under ``True``."""
+    import importlib
+    import inspect
+
+    package = importlib.import_module("flashinfer.experimental.cake_kda_train_kcp")
+    assert package.kda_handoff_bytes_kcp is cake_kcp_plan.kda_handoff_bytes_kcp
+    assert package.kcp_handoff_stats is cake_kcp.kcp_handoff_stats
+    for name in ("kda_handoff_bytes_kcp", "kcp_handoff_stats"):
+        assert name in package.__all__ and name in kcp_api.__all__, name
+    p = inspect.signature(kcp_api.kda_saved_bytes_kcp).parameters["checkpoint_handoff"]
+    assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is False
+    p = inspect.signature(kcp_api.kda_handoff_bytes_kcp).parameters["deterministic"]
+    assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is True
+    stats = kcp_api.kcp_handoff_stats()
+    assert stats == cake_kcp.kcp_handoff_stats() and stats is not cake_kcp.HANDOFF_STATS
+    assert set(stats) == set(cake_kcp.HANDOFF_STATS)
+    det_plan = importlib.import_module(
+        "flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp_plan"
+    )
+    cu = [0, 1000, 1700, 3000]
+    for W in (1, 2, 4):
+        nd_part = kcp_api.partition_kcp(
+            cu, W, "zigzag_per_document", deterministic=False
+        )
+        det_part = kcp_api.partition_kcp(cu, W, "zigzag_per_document")
+        for rank in range(W):
+            nd_ctx = kcp_api.build_context_kcp(
+                nd_part, None, rank, "cpu", sm_count=148, deterministic=False
+            )
+            det_ctx = kcp_api.build_context_kcp(
+                det_part, None, rank, "cpu", sm_count=148
+            )
+            for H in (4, 64):
+                hb = cake_kcp_plan.kda_handoff_bytes_kcp(nd_ctx, H=H)
+                assert (
+                    kcp_api.kda_handoff_bytes_kcp(nd_ctx, H=H, deterministic=False)
+                    == hb
+                )
+                assert kcp_api.kda_handoff_bytes_kcp(det_ctx, H=H) == 0
+                for handoff in (False, True):
+                    assert kcp_api.kda_saved_bytes_kcp(
+                        nd_ctx, H=H, checkpoint_handoff=handoff, deterministic=False
+                    ) == cake_kcp_plan.kda_saved_bytes_kcp(
+                        nd_ctx, H=H, save_transfer=False, checkpoint_handoff=handoff
+                    )
+                    assert kcp_api.kda_saved_bytes_kcp(
+                        det_ctx, H=H, checkpoint_handoff=handoff
+                    ) == det_plan.kda_det_saved_bytes_kcp(
+                        det_ctx, H=H, save_transfer=False
+                    )
+                assert kcp_api.kda_saved_bytes_kcp(
+                    nd_ctx, H=H, checkpoint_handoff=False, deterministic=False
+                ) == kcp_api.kda_saved_bytes_kcp(det_ctx, H=H)
+
+
+def test_facade_checkpoint_handoff_routing(monkeypatch) -> None:
+    """The facade's ``chunk_kda_kcp`` refuses a mode outside ``auto`` / ``on`` / ``off`` under both values of
+    ``deterministic`` before any work, forwards the mode to this package under ``deterministic=False`` and never
+    passes it to the deterministic package."""
+    import importlib
+
+    det_kcp = importlib.import_module(
+        "flashinfer.experimental.cake_kda_det_train_kcp.cake_kcp"
+    )
+    seen: list = []
+
+    def recorder(tag):
+        def fn(*args, **kwargs):
+            seen.append((tag, kwargs))
+            return tag
+
+        return fn
+
+    monkeypatch.setattr(cake_kcp, "chunk_kda_kcp", recorder("nd"))
+    monkeypatch.setattr(det_kcp, "chunk_kda_det_kcp", recorder("det"))
+    t = torch.zeros(1)
+    for det in (True, False):
+        for bad in ("yes", None, True, "ON"):
+            with pytest.raises(ValueError, match="checkpoint_handoff"):
+                kcp_api.chunk_kda_kcp(
+                    t, t, t, t, t, object(), checkpoint_handoff=bad, deterministic=det
+                )
+    assert seen == []
+    for mode in ("auto", "on", "off"):
+        assert (
+            kcp_api.chunk_kda_kcp(
+                t, t, t, t, t, object(), checkpoint_handoff=mode, deterministic=False
+            )
+            == "nd"
+        )
+        assert seen[-1][1]["checkpoint_handoff"] == mode
+        assert (
+            kcp_api.chunk_kda_kcp(
+                t, t, t, t, t, object(), checkpoint_handoff=mode, deterministic=True
+            )
+            == "det"
+        )
+        assert "checkpoint_handoff" not in seen[-1][1]
 
 
 def test_saved_set_tape_members_round_trip() -> None:

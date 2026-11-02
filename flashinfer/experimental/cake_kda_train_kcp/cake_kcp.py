@@ -4481,6 +4481,10 @@ def _record(kind: str, call: CallKcp) -> None:
         "checkpoint_handoff_bytes": call.scratch.get(
             "checkpoint_handoff_bytes"
         ),  # bytes of that tape set (kda_handoff_bytes_kcp), None without one
+        "saved_bytes": call.scratch.get(
+            "saved_bytes"
+        ),  # bytes of the forward's saved set (SavedKcp.bytes: no int32 tables), None without one
+        "save_transfer": call.opts.save_transfer,
         "graph": call.opts.graph,
         "graph_event": "eager",
         "graph_key": None,
@@ -5737,8 +5741,8 @@ def _fwd_body(
 ) -> tuple[torch.Tensor, SavedKcp | None]:
     """The forward's allocations and launches (eagerly or inside a capture): ``out`` and the saved set.  ``bound``:
     the tensors of a recompute handle's entry (:func:`_forward`); the saved set then holds them.  ``tape``: the
-    checkpoint hand-off's request (the autograd Function's, :func:`_handoff_refusal`): a saving call of a rank with
-    tokens and local stages keeps its tape set (:func:`_tape_alloc`) in the saved set instead of the carry plane."""
+    checkpoint hand-off's decision (:func:`_handoff_decide`): a saving call of a rank with tokens and local stages
+    keeps its tape set (:func:`_tape_alloc`) in the saved set instead of the carry plane."""
     call.out = _alloc((call.T_r, call.H, D), call.backend.dtypes["out"], call.device)
     kept = (
         _tape_alloc(call)
@@ -5774,6 +5778,7 @@ def _fwd_body(
             ctx=ctx,
             transfer_walk=call.transfer_walk,
         )
+        call.scratch["saved_bytes"] = saved.bytes
     return call.out, saved
 
 
@@ -6264,26 +6269,32 @@ def _fwd_handle(
 # its tape set -- the h tape, v_new, w and the internal Aqk / Akk rows its own launches write (``KCP_HANDOFF_BUFFERS``)
 # -- in the saved set, and the backward reads it instead of re-running the intra program, WY, the K1 tape walk and,
 # at P > 1, the offset re-walk and the carry merges that feed it.  Non-reentrant checkpoint keeps the recompute's
-# saved set from the recompute to the node's backward and drops the original forward's at its return, so the set is
-# the recompute's hand-off to the backward, owned by autograd: no side channel, record, stamp or byte budget.
+# saved set from the recompute to the node's backward and drops the original forward's at its return; reentrant
+# checkpoint runs its first pass under no_grad (nothing kept) and keeps the recompute's.  The set is the recompute's
+# hand-off to the backward, owned by autograd: no side channel or byte budget.
 #
-# Rule (read in the caller's frame by chunk_kda_kcp, the same in both passes of a checkpoint, which must save the same
-# tensors or torch raises CheckpointError): grad mode on and an input that requires grad; the innermost default
-# saved-tensor hooks are torch.utils.checkpoint's (the non-reentrant original forward's or recompute's pack hook), or
-# none inside a backward's graph task (the reentrant recompute; its first pass runs under no_grad); no CUDA-graph
-# capture, torch.compile tracing or Python dispatch mode (a selective-checkpoint policy runs both passes under one, so
-# both take the light set).  Then, in the autograd Function: boundary_mode="saved", graph="off", spec3_probe="off",
-# the kernel backend with local stages; "auto" also needs a KCP_HANDOFF_HEADS head count on a KCP_HANDOFF_VERIFIED
-# (architecture, SM count, toolkit) device.  A rank without tokens keeps no set.  The choice is rank-local: the
-# collectives are the same in count, order and bytes either way, so ranks may differ without a hang.
-# The package reads no environment variable; a benchmark selects the mode through the keyword.
+# Decision (chunk_kda_kcp, once per checkpointed call, _handoff_decide): grad mode on and an input that requires grad;
+# the innermost default saved-tensor hooks are torch.utils.checkpoint's (the non-reentrant original forward's or
+# recompute's pack hook), or none inside a backward's graph task (the reentrant recompute).  The non-reentrant original
+# forward and the reentrant recompute then read the dynamic state -- no CUDA-graph capture, torch.compile tracing or
+# Python dispatch mode (a selective-checkpoint policy, a debug mode) -- and the static keys (_handoff_refusal:
+# boundary_mode="saved", graph="off", spec3_probe="off", the kernel backend with local stages, a CUDA device; "auto"
+# also cake_kcp_plan.kcp_handoff_auto_refusal).  The original forward records its decision on its checkpoint frame
+# (_HANDOFF_DECISIONS) and the recompute of that frame replays it in call order without reading its own state: the
+# two passes save the same tensors (or torch raises CheckpointError) whatever capture, compile or dispatch-mode state
+# either pass runs under.  A frame the hooks do not expose keeps the light set in both passes.  A rank without tokens
+# keeps no set.  The choice is rank-local: the collectives are the same in count, order and bytes either way, so ranks
+# may differ without a hang.  The package reads no environment variable; a benchmark selects the mode through the
+# keyword.
 
 KCP_HANDOFF_MODES = cake_kcp_plan.KCP_HANDOFF_MODES
 KCP_HANDOFF_DEFAULT = cake_kcp_plan.KCP_HANDOFF_DEFAULT
 KCP_HANDOFF_VERIFIED = cake_kcp_plan.KCP_HANDOFF_VERIFIED
 KCP_HANDOFF_HEADS = cake_kcp_plan.KCP_HANDOFF_HEADS
+KCP_HANDOFF_MIN_HEAD_TOKENS = cake_kcp_plan.KCP_HANDOFF_MIN_HEAD_TOKENS
 kda_handoff_bytes_kcp = cake_kcp_plan.kda_handoff_bytes_kcp
-# calls recorded with a kept ("save") / read ("bound") tape set, and requests the Function refused, by reason
+# calls recorded with a kept ("save") / read ("bound") tape set, and the requests refused by the static keys, by reason
+# (counted where the decision is made: the original forward / the reentrant recompute)
 HANDOFF_STATS: dict[str, int] = {
     "save": 0,
     "bound": 0,
@@ -6293,6 +6304,7 @@ HANDOFF_STATS: dict[str, int] = {
     "refused_backend": 0,
     "refused_device": 0,
     "refused_heads": 0,
+    "refused_work": 0,
     "refused_unverified": 0,
 }
 # tests only: NaN-fill the tape set before the forward's launches, so a byte the forward does not write and the
@@ -6306,6 +6318,9 @@ _TOP_HOOKS = getattr(
 _CHECKPOINT_MODULE = "torch.utils.checkpoint"
 _RECOMPUTE_PACK = "_recomputation_hook.__init__.<locals>.pack_hook"
 _ORIGINAL_PACK = "_checkpoint_hook.__init__.<locals>.pack_hook"
+# the decisions of the non-reentrant original forwards by checkpoint frame (weakly keyed: they go with the frame):
+# frame -> (the decisions in call order, the next index per backward ``gid`` of the frame's recomputes)
+_HANDOFF_DECISIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def kcp_handoff_stats() -> dict[str, int]:
@@ -6332,6 +6347,15 @@ def _handoff_task() -> int | None:
     return task if isinstance(task, int) and not isinstance(task, bool) else None
 
 
+def _handoff_top_pack() -> Any:
+    """This thread's innermost default pack hook, ``None`` without one (raises when the binding is unusable)."""
+    try:
+        top = _TOP_HOOKS(True)  # ignore_is_tracing
+    except TypeError:  # a torch whose binding takes no argument
+        top = _TOP_HOOKS()
+    return None if top is None else top[0]
+
+
 def _handoff_hooks() -> str | None:
     """This thread's innermost default saved-tensor hooks: ``"none"``, ``"recompute"`` (the non-reentrant checkpoint's
     recompute), ``"original"`` (a checkpoint region's original forward, also an inner region's forward that an outer
@@ -6339,14 +6363,11 @@ def _handoff_hooks() -> str | None:
     if _TOP_HOOKS is None:
         return None
     try:
-        try:
-            top = _TOP_HOOKS(True)  # ignore_is_tracing
-        except TypeError:  # a torch whose binding takes no argument
-            top = _TOP_HOOKS()
-        if top is None:
+        pack = _handoff_top_pack()
+        if pack is None:
             return "none"
-        module = getattr(top[0], "__module__", None)
-        name = getattr(top[0], "__qualname__", None)
+        module = getattr(pack, "__module__", None)
+        name = getattr(pack, "__qualname__", None)
     except Exception:  # noqa: BLE001
         return None
     if module == _CHECKPOINT_MODULE and name == _RECOMPUTE_PACK:
@@ -6354,6 +6375,48 @@ def _handoff_hooks() -> str | None:
     if module == _CHECKPOINT_MODULE and name == _ORIGINAL_PACK:
         return "original"
     return "other"
+
+
+@functools.cache
+def _handoff_frames_readable() -> bool:
+    """Whether both pack hooks of torch.utils.checkpoint hold their frame in their closure (the original forward's
+    ``frame``; the recompute's ``target_frame_ref`` and ``gid``), read once from their code objects: an original
+    forward keeps a set only where its recompute can find the decision."""
+    try:
+        from torch.utils import checkpoint as torch_checkpoint
+
+        def free(cls: Any) -> set[str]:
+            return {
+                name
+                for c in cls.__init__.__code__.co_consts
+                if isinstance(c, types.CodeType) and c.co_name == "pack_hook"
+                for name in c.co_freevars
+            }
+
+        original = free(torch_checkpoint._checkpoint_hook)
+        recompute = free(torch_checkpoint._recomputation_hook)
+        return "frame" in original and {"target_frame_ref", "gid"} <= recompute
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _handoff_frame(phase: str) -> tuple[Any, Any] | None:
+    """The checkpoint frame of this pass (``"original"`` or ``"recompute"``) and, in a recompute, its backward's
+    ``gid``, from the closure of the innermost pack hook (through ``functools.wraps`` wrappers such as
+    ``torch._dynamo.disable``); ``None`` when it cannot be read."""
+    if not _handoff_frames_readable():
+        return None
+    try:
+        fn = _handoff_top_pack()
+        while getattr(fn, "__wrapped__", None) is not None:
+            fn = fn.__wrapped__
+        cells = dict(zip(fn.__code__.co_freevars, fn.__closure__ or (), strict=True))
+        if phase == "original":
+            return cells["frame"].cell_contents, None
+        frame = cells["target_frame_ref"].cell_contents()
+        return None if frame is None else (frame, cells["gid"].cell_contents)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _handoff_blocked() -> bool:
@@ -6390,33 +6453,35 @@ def _handoff_toolkit(arch: str) -> str | None:
         return None
 
 
+def _handoff_key(device: torch.device) -> tuple[str, int, str | None]:
+    """The (architecture, SM count, Cake build toolkit) key of a CUDA device (:data:`KCP_HANDOFF_VERIFIED`)."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    arch = cake_jit.device_arch(index)
+    return arch, int(cake_jit.sm_count(index)), _handoff_toolkit(arch)
+
+
 def _handoff_phase(*inputs: Any) -> str | None:
     """The checkpoint pass this call runs in (``"original"``, ``"recompute"`` or ``"reentrant"``), ``None`` outside
-    one (see the rule above)."""
+    one (see the rule above): the saved-tensor hooks and the graph task only."""
     if not torch.is_grad_enabled() or not any(
         isinstance(t, torch.Tensor) and t.requires_grad for t in inputs
     ):
         return None
     hooks = _handoff_hooks()
     if hooks in ("original", "recompute"):
-        phase = hooks
-    elif hooks == "none":
+        return hooks
+    if hooks == "none":
         task = _handoff_task()
-        if task is None or task == -1:
-            return None
-        phase = "reentrant"
-    else:
-        return None
-    if _handoff_blocked() or _handoff_dispatch_modes():
-        return None
-    return phase
+        return None if task is None or task == -1 else "reentrant"
+    return None
 
 
 def _handoff_refusal(
-    mode: str, opts: OptionsKcp, boundary_mode: str, v: torch.Tensor
+    mode: str, opts: OptionsKcp, boundary_mode: str, v: torch.Tensor, ctx: Any
 ) -> str | None:
-    """Why a request the phase rule admitted keeps the light set (``None``: the forward keeps its tape set): the static
-    keys of the call only, so both passes of a checkpoint decide alike."""
+    """Why a request the phase admitted keeps the light set (``None``: the forward keeps its tape set): the static
+    keys of the call; under ``"auto"`` also :func:`cake_kcp_plan.kcp_handoff_auto_refusal` of this device's key, the
+    head count and the partition's total and world size."""
     if boundary_mode != "saved":
         return "boundary"
     if opts.graph != "off":
@@ -6429,18 +6494,58 @@ def _handoff_refusal(
     if v.device.type != "cuda":
         return "device"
     if mode == "auto":
-        if int(v.shape[-2]) not in KCP_HANDOFF_HEADS:
-            return "heads"
-        index = (
-            v.device.index
-            if v.device.index is not None
-            else torch.cuda.current_device()
+        return cake_kcp_plan.kcp_handoff_auto_refusal(
+            _handoff_key(v.device),
+            int(v.shape[-2]),
+            ctx.partition.total,
+            ctx.world_size,
         )
-        arch = cake_jit.device_arch(index)
-        key = (arch, int(cake_jit.sm_count(index)), _handoff_toolkit(arch))
-        if key not in KCP_HANDOFF_VERIFIED:
-            return "unverified"
     return None
+
+
+def _handoff_replayed() -> bool:
+    """The recompute's decision: the one its frame's original forward recorded for the same call (call order, one
+    index per backward ``gid``); ``False`` without one."""
+    found = _handoff_frame("recompute")
+    entry = None if found is None else _HANDOFF_DECISIONS.get(found[0])
+    if entry is None:
+        return False
+    decisions, cursors = entry
+    i = cursors.get(found[1], 0)
+    cursors[found[1]] = i + 1
+    return i < len(decisions) and decisions[i]
+
+
+def _handoff_decide(
+    mode: str, opts: OptionsKcp, boundary_mode: str, ctx: Any, *inputs: Any
+) -> bool:
+    """Whether this call keeps its tape set, decided once per checkpointed call (see the rule above): no outside a
+    checkpoint pass; in a non-reentrant recompute the original forward's decision (:func:`_handoff_replayed`); in the
+    original forward and the reentrant recompute the dynamic state and :func:`_handoff_refusal` (``inputs`` = ``q, k,
+    v, g, beta``), the original forward recording the result on its frame."""
+    if mode == "off":
+        return False
+    phase = _handoff_phase(*inputs)
+    if phase is None:
+        return False
+    if phase == "recompute":
+        return _handoff_replayed()
+    decisions = None
+    if phase == "original":
+        found = _handoff_frame("original")
+        if found is None:
+            return False
+        decisions = _HANDOFF_DECISIONS.setdefault(found[0], ([], {}))[0]
+    if _handoff_blocked() or _handoff_dispatch_modes():
+        keep = False
+    else:
+        reason = _handoff_refusal(mode, opts, boundary_mode, inputs[2], ctx)
+        if reason is not None:
+            HANDOFF_STATS["refused_" + reason] += 1
+        keep = reason is None
+    if decisions is not None:
+        decisions.append(keep)
+    return keep
 
 
 def _fwd_tape(
@@ -6481,9 +6586,8 @@ class ChunkKDAFunctionKcp(torch.autograd.Function):
     ``S_in``; ``True``: also the c1 receive tensor; :func:`chunk_kda_kcp` sets it from ``checkpoint_keep``).  A
     handle is refused with graph replay, inside a CUDA-graph capture, with ``debug_sequence``, ``spec3_probe`` and
     ``boundary_mode="replay"``.  The node records the mode of its forward (``deterministic=False``, the only mode of
-    this package) and its backward runs that mode.  ``handoff``: the checkpoint hand-off request of
-    :func:`chunk_kda_kcp` (``(mode, phase)`` or ``None``); where the call's static keys admit it
-    (:func:`_handoff_refusal`) the forward keeps its tape set and the backward reads it."""
+    this package) and its backward runs that mode.  ``handoff``: :func:`chunk_kda_kcp`'s checkpoint hand-off decision
+    (:func:`_handoff_decide`); ``True``: the forward keeps its tape set and the backward reads it."""
 
     @staticmethod
     def forward(
@@ -6500,17 +6604,10 @@ class ChunkKDAFunctionKcp(torch.autograd.Function):
         workspace,
         options,
         handle=None,
-        handoff=None,
+        handoff=False,
     ):
-        # the checkpoint hand-off: (mode, phase) of chunk_kda_kcp's request (None: no checkpoint pass, or "off"),
-        # then the call's static keys; the same decision in both passes of a checkpoint
-        tape = False
-        if handoff is not None:
-            reason = _handoff_refusal(handoff[0], _options(options), boundary_mode, v)
-            if reason is None:
-                tape = True
-            else:
-                HANDOFF_STATS["refused_" + reason] += 1
+        # the checkpoint hand-off: chunk_kda_kcp's decision, made once per checkpointed call (both passes alike)
+        tape = bool(handoff)
         if handle is None and tape:
             out, saved = _fwd_tape(
                 q,
@@ -6621,15 +6718,21 @@ def chunk_kda_kcp(
     """The differentiable KCP forward (the KCP contract §3.2 signature): ``out`` like ``v``; gradients for ``q, k, v, g, beta``.
 
     ``checkpoint_handoff`` (keyword-only; ``"auto"`` default, ``"on"``, ``"off"``): under ``torch.utils.checkpoint``
-    (reentrant or not) the forward of both passes keeps its tape set (``h``, ``v_new``, ``w`` and the internal
-    ``Aqk`` / ``Akk`` rows, :func:`kda_handoff_bytes_kcp`: 1280 B per internal token-head) in the saved set and the
-    backward reads it instead of re-running the intra program, WY, the K1 tape walk and the ``P > 1`` re-walk; the
-    collectives and every result are unchanged (the hand-off rows check them bitwise).  ``"auto"`` engages at the head
-    counts of :data:`KCP_HANDOFF_HEADS` on the devices of :data:`KCP_HANDOFF_VERIFIED`, ``"on"`` wherever the call
-    supports it, ``"off"`` never; outside a checkpoint pass, with ``graph="replay"``, ``spec3_probe``,
-    ``boundary_mode="replay"``, inside a CUDA-graph capture, under ``torch.compile`` tracing or a Python dispatch mode
-    (a selective-checkpoint policy) the call keeps the light set.  The set lives inside the original forward call and
-    from the recompute to the end of the node's backward (``kda_saved_bytes_kcp(..., checkpoint_handoff=True)``).
+    the forward keeps its tape set (``h``, ``v_new``, ``w`` and the internal ``Aqk`` / ``Akk`` rows,
+    :func:`kda_handoff_bytes_kcp`: 1280 B per internal token-head) in the saved set -- non-reentrant: in both passes;
+    reentrant: in the recompute only (its first pass runs under no_grad) -- and the backward reads it instead of
+    re-running the intra program, WY, the K1 tape walk and the ``P > 1`` re-walk.  The collectives are unchanged, and
+    on the devices of :data:`KCP_HANDOFF_VERIFIED` the outputs and gradients are bitwise those of ``"off"`` (the
+    hand-off rows); ``"on"`` elsewhere has no such evidence.  ``"auto"`` engages where
+    :func:`cake_kcp_plan.kcp_handoff_auto_refusal` admits the call (a verified device, ``H`` in
+    :data:`KCP_HANDOFF_HEADS` and ``H * (total tokens // world size) >= KCP_HANDOFF_MIN_HEAD_TOKENS``), ``"on"``
+    wherever the call supports it, ``"off"`` never.  Outside a checkpoint pass, with ``graph="replay"``,
+    ``spec3_probe``, ``boundary_mode="replay"``, inside a CUDA-graph capture, under ``torch.compile`` tracing or a
+    Python dispatch mode (a selective-checkpoint policy) the call keeps the light set.  The non-reentrant original
+    forward decides and its recompute replays that decision, so both passes save the same tensors whatever state the
+    recompute runs under.  Memory: the set lives from the recompute to the end of the node's backward (and inside the
+    original forward call), so the checkpoint peak per engaged call rises by :func:`kda_handoff_bytes_kcp` (the saved
+    set is ``kda_saved_bytes_kcp(..., checkpoint_handoff=True)``); ``"off"`` keeps the light set.
 
     ``recompute_handle`` (keyword-only; ``None`` = unchanged): a :class:`RecomputeHandleKcp` (any object with an
     ``entries`` dict) makes torch's checkpoint recompute of this call run without the forward state exchange -- the
@@ -6651,12 +6754,11 @@ def chunk_kda_kcp(
         raise ValueError(
             f"boundary_mode must be one of {BOUNDARY_MODES}, got {boundary_mode!r}"
         )
-    # the checkpoint hand-off's request, read in the caller's frame (the same in both passes of a checkpoint)
-    handoff = None
-    if _handoff_mode(checkpoint_handoff) != "off":
-        phase = _handoff_phase(q, k, v, g, beta)
-        if phase is not None:
-            handoff = (checkpoint_handoff, phase)
+    # the checkpoint hand-off, decided in the caller's frame once per checkpointed call (the recompute replays the
+    # original forward's decision)
+    handoff = _handoff_decide(
+        _handoff_mode(checkpoint_handoff), opts, boundary_mode, ctx, q, k, v, g, beta
+    )
     if recompute_handle is None:
         if checkpoint_keep is not None:
             raise ValueError(
@@ -6761,6 +6863,7 @@ __all__ = [
     "HANDOFF_STATS",
     "KCP_HANDOFF_DEFAULT",
     "KCP_HANDOFF_HEADS",
+    "KCP_HANDOFF_MIN_HEAD_TOKENS",
     "KCP_HANDOFF_MODES",
     "KCP_HANDOFF_VERIFIED",
     "kcp_handoff_stats",

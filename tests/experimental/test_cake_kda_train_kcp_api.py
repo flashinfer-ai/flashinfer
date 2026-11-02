@@ -471,7 +471,8 @@ def test_facade_byte_queries_resolve_save_transfer_like_the_deterministic_facade
     monkeypatch,
 ) -> None:
     """The byte queries forward the same keywords on both routes (an unset ``save_transfer`` resolves as the
-    deterministic facade resolves it), so the two routes answer the same query."""
+    deterministic facade resolves it), so the two routes answer the same query; ``kda_saved_bytes_kcp`` also passes
+    ``checkpoint_handoff`` (default ``False``) to this package, whose deterministic counterpart has no hand-off."""
     seen = _route_recorders(monkeypatch)
     ctx = object()
     for det in (True, False):
@@ -479,6 +480,8 @@ def test_facade_byte_queries_resolve_save_transfer_like_the_deterministic_facade
         kcp_api.kda_saved_bytes_kcp(ctx, checkpoint_keep="states", deterministic=det)
         kcp_api.kda_comm_bytes_kcp(ctx, H=4, deterministic=det)
     by_route = [kw for _tag, kw in seen]
+    assert "checkpoint_handoff" not in by_route[1]
+    assert by_route[4].pop("checkpoint_handoff") is False
     assert by_route[:3] == by_route[3:]
     assert by_route[0]["save_transfer"] is _mod("cake_kcp_plan").SAVE_TRANSFER_DEFAULT
     assert (
