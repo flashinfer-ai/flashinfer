@@ -62,6 +62,28 @@ long route, the plan reads the request boundaries and the per-row counts to
 the host: the route synchronizes in an eager call and is captured only through
 an ``MSASparseAttentionWorkspace`` warmed by an eager call with the exact
 tensors.
+
+Uniform FP8 decode route.  A decode call with FP8 Q, K and V (paged, causal,
+``force_fused=True``, 1-32 query tokens per request, no explicit ``q_offset``)
+is served by the lean swapped-orientation program in the launch tier its
+host rule resolves from the work items, the SM count and the page-table width
+(``_lean_launch_plan``: split count 1 / 2 / 4 / 8, K/V ring 8 or 11 stages,
+the occupancy-2 entry on compute capability 10.3).  The context bound of the
+tier is the page-table width times 128 tokens (``_lean_kv_len_bound``), a host
+quantity: no call reads ``seqused_k`` to the host, eager or captured, and the
+kernel reads each request's context on the device.  Every tier threshold is a
+multiple of 128 tokens, so a page table of ceil(longest context / 128) pages
+resolves the tier of the longest context; a page table wider than the longest
+context can resolve a slower tier.  An eager call without a workspace on
+compute capability 10.0 or 10.3 whose launch lies in the narrow box (32 Q
+heads over 4 KV heads, eight query tokens per request, at least 64 requests,
+context bound at most 2048 tokens) is served by the eight-token fused program
+instead
+(``_uniform_fp8_uses_fuseq8``).  CUDA graph capture, and
+the eager calls that carry a workspace (its warm-up), never select the fused
+program: the program has a hard context bound and a replay does not pass the
+host's guard, while a captured decode is typically replayed as the contexts
+grow.
 """
 
 from __future__ import annotations
@@ -166,7 +188,319 @@ def _prefill_launch_grid(
     return (tiles, heads, 1)
 
 
-_UNIFORM_FP8_EVEN_WAVE_GRID = 128
+# Lean uniform-FP8 paged decode: the swapped-orientation program behind every
+# ``decode_uniform_fp8:paged:lean:*`` route, one program per launch tier.  The
+# host resolves the tier from quantities the launch has -- the work items
+# (tokens x KV heads), the device's SM count and the page-table width, whose
+# context bound is width x 128 tokens -- and never guesses one:
+#   splits: one split when the page table holds fewer than four page pairs
+#   (16 selected blocks at most, two per pair) or the items alone fill more
+#   than half the SMs, else the largest of 2 / 4 / 8 with one page pair per
+#   split and items x splits CTAs at most the SMs.  Four and eight splits run
+#   one cluster of ``splits`` CTAs per item (the partial merge goes through
+#   distributed shared memory; the grid is exactly items x splits); two splits
+#   merge through fp32 partial pools; one and two splits run the persistent
+#   grid min(items x splits, SMs).
+#   K/V ring: 11 stages when the context bound is at most
+#   ``_LEAN_KV_TIER_MAX_KV_LEN`` tokens, else 8.
+#   occupancy 2 (the targets of ``_LEAN_OCC2_TARGETS``): a one-split launch
+#   with more items than SMs and a context bound at most
+#   ``_LEAN_OCC2_MAX_KV_LEN``, or in the long band up to
+#   ``_LEAN_OCC2_LONG_MAX_KV_LEN`` with items at most
+#   ``_LEAN_OCC2_LONG_WAVE_FACTOR`` x SMs or at least
+#   ``_LEAN_OCC2_LONG_ITEMS_FACTOR`` x SMs, takes the two-CTA entry (five
+#   stages, two P^T slots) on the grid min(items, 2 x SMs).
+# The context bound is the page-table width x ``_BLOCK_SIZE`` tokens
+# (``_lean_kv_len_bound``): a host quantity, so no call reads ``seqused_k`` to
+# the host, eager or captured.  It is at least every request's context (the
+# kernel reads those on the device), and every tier threshold below is a
+# multiple of ``_BLOCK_SIZE``, so a page table of ceil(longest context / 128)
+# pages resolves the tier the kernel's host rule resolves from the longest
+# context; a wider page table can resolve a slower tier.  Every constant
+# mirrors the kernel's host rule.
+_LEAN_ROUTE = "decode_uniform_fp8:paged:lean"
+_LEAN_TOPK = 16
+_LEAN_SPLIT_COUNTS = (1, 2, 4, 8)
+_LEAN_CLUSTER_SPLITS = (4, 8)
+_LEAN_KV_STAGES = 8
+_LEAN_KV_STAGES_SHORT = 11
+_LEAN_KV_TIER_MAX_KV_LEN = 16384
+_LEAN_OCC2_TARGETS = ("sm103a",)
+_LEAN_OCC2_MAX_KV_LEN = 8192
+_LEAN_OCC2_ITEMS_FACTOR = (1, 1)
+_LEAN_OCC2_KV_STAGES = 5
+_LEAN_OCC2_MIN_BLOCKS = 2
+_LEAN_OCC2_LONG_MAX_KV_LEN = 16384
+_LEAN_OCC2_LONG_WAVE_FACTOR = 2
+_LEAN_OCC2_LONG_ITEMS_FACTOR = 8
+_LEAN_PARTIAL_ROWS_PER_SPLIT = 128
+
+
+class _LeanLaunchPlan(NamedTuple):
+    """One lean launch: its split count, K/V ring depth, grid and CTAs per SM."""
+
+    splits: int
+    kv_stages: int
+    grid: int
+    min_blocks: int
+
+
+def _lean_max_pairs(max_pages: int) -> int:
+    return (min(int(max_pages), _LEAN_TOPK) + 1) // 2
+
+
+def _lean_splits(*, items: int, num_sms: int, max_pages: int) -> int:
+    if items <= 0 or num_sms <= 0 or max_pages <= 0:
+        raise ValueError(
+            "lean uniform FP8 decode: items, num_sms and max_pages must be positive"
+        )
+    pairs = _lean_max_pairs(max_pages)
+    if pairs < 4 or items * 2 > num_sms:
+        return 1
+    best = 1
+    for splits in _LEAN_SPLIT_COUNTS[1:]:
+        if splits <= pairs and items * splits <= num_sms:
+            best = splits
+    return best
+
+
+def _lean_kv_stages(*, max_kv_len: int) -> int:
+    if max_kv_len <= 0:
+        raise ValueError("lean uniform FP8 decode: max_kv_len must be positive")
+    if max_kv_len <= _LEAN_KV_TIER_MAX_KV_LEN:
+        return _LEAN_KV_STAGES_SHORT
+    return _LEAN_KV_STAGES
+
+
+def _lean_occupancy(
+    *,
+    target: BlackwellMSATarget,
+    items: int,
+    num_sms: int,
+    splits: int,
+    max_kv_len: int,
+) -> int:
+    if target not in _LEAN_OCC2_TARGETS or splits != 1:
+        return 1
+    num, den = _LEAN_OCC2_ITEMS_FACTOR
+    if items * den > num_sms * num and max_kv_len <= _LEAN_OCC2_MAX_KV_LEN:
+        return _LEAN_OCC2_MIN_BLOCKS
+    long_band = _LEAN_OCC2_MAX_KV_LEN < max_kv_len <= _LEAN_OCC2_LONG_MAX_KV_LEN
+    long_items = (
+        items <= _LEAN_OCC2_LONG_WAVE_FACTOR * num_sms
+        or items >= _LEAN_OCC2_LONG_ITEMS_FACTOR * num_sms
+    )
+    if items > num_sms and long_band and long_items:
+        return _LEAN_OCC2_MIN_BLOCKS
+    return 1
+
+
+def _lean_grid(*, items: int, splits: int, num_sms: int, min_blocks: int) -> int:
+    if splits in _LEAN_CLUSTER_SPLITS:
+        return items * splits
+    return min(items * splits, num_sms * min_blocks)
+
+
+def _lean_launch_plan(
+    *,
+    target: BlackwellMSATarget,
+    items: int,
+    num_sms: int,
+    max_pages: int,
+    max_kv_len: int,
+) -> _LeanLaunchPlan:
+    items, num_sms = int(items), int(num_sms)
+    max_pages, max_kv_len = int(max_pages), int(max_kv_len)
+    kv_stages = _lean_kv_stages(max_kv_len=max_kv_len)
+    splits = _lean_splits(items=items, num_sms=num_sms, max_pages=max_pages)
+    min_blocks = _lean_occupancy(
+        target=target,
+        items=items,
+        num_sms=num_sms,
+        splits=splits,
+        max_kv_len=max_kv_len,
+    )
+    if min_blocks == _LEAN_OCC2_MIN_BLOCKS:
+        kv_stages = _LEAN_OCC2_KV_STAGES
+    grid = _lean_grid(
+        items=items, splits=splits, num_sms=num_sms, min_blocks=min_blocks
+    )
+    return _LeanLaunchPlan(splits, kv_stages, grid, min_blocks)
+
+
+def _lean_route(plan: _LeanLaunchPlan) -> str:
+    """Route key (without its stage) of the program that runs ``plan``."""
+    if plan.min_blocks == _LEAN_OCC2_MIN_BLOCKS:
+        return f"{_LEAN_ROUTE}:occ2"
+    return f"{_LEAN_ROUTE}:s{plan.splits}:kv{plan.kv_stages}"
+
+
+def _lean_kv_len_bound(max_pages: int) -> int:
+    """The context bound of one lean launch: the page-table width x
+    ``_BLOCK_SIZE`` tokens.  A host quantity -- no device read, eager or under
+    CUDA graph capture -- and at least every request's context."""
+    max_pages = int(max_pages)
+    if max_pages <= 0:
+        raise ValueError("lean uniform FP8 decode: max_pages must be positive")
+    return max_pages * _BLOCK_SIZE
+
+
+def _lean_split_pools(
+    workspace: Optional[MSASparseAttentionWorkspace],
+    *,
+    items: int,
+    splits: int,
+    lse: torch.Tensor,
+    q2k_indices: torch.Tensor,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """The split pools of one lean launch: two splits merge through fp32
+    partials (``items x 2 x 128`` rows of ``O^T``, one ``M`` and one ``D`` per
+    row) and a completion counter per item; one split and the cluster tiers
+    never read them, so the LSE and the selection stand in.  The program resets
+    each item's counter after its merge, so the counter is zeroed when it is
+    created -- once per warmed workspace, or once per (device, stream) without
+    one (``_lean_completion_counter``) -- and only re-bound afterwards."""
+    if splits != 2:
+        alias = lse.reshape(-1)
+        return {
+            "partial_O": alias,
+            "partial_M": alias,
+            "partial_D": alias,
+            "split_completion": q2k_indices.reshape(-1),
+        }
+    rows = items * splits * _LEAN_PARTIAL_ROWS_PER_SPLIT
+    previous = None
+    if workspace is not None:
+        previous = workspace._buffers.get("lean_split_completion")
+    pools = {
+        "partial_O": _workspace_buffer(
+            workspace,
+            "lean_partial_o",
+            (rows, _HEAD_DIM),
+            dtype=torch.float32,
+            device=device,
+        ),
+        "partial_M": _workspace_buffer(
+            workspace, "lean_partial_m", (rows,), dtype=torch.float32, device=device
+        ),
+        "partial_D": _workspace_buffer(
+            workspace, "lean_partial_d", (rows,), dtype=torch.float32, device=device
+        ),
+    }
+    if workspace is None:
+        pools["split_completion"] = _lean_completion_counter(device, items)
+        return pools
+    pools["split_completion"] = _workspace_buffer(
+        workspace,
+        "lean_split_completion",
+        (items,),
+        dtype=torch.int32,
+        device=device,
+    )
+    if pools["split_completion"] is not previous:
+        pools["split_completion"].zero_()
+    return pools
+
+
+# Eight-token fused uniform-FP8 paged decode: the program behind
+# ``decode_uniform_fp8:paged:fuseq8``, chosen before the lean tiers on the
+# narrow box of the kernel's host selector -- exactly ``_FUSEQ8_NUM_Q_HEADS``
+# Q heads over ``_FUSEQ8_NUM_KV_HEADS`` KV heads, ``_FUSEQ8_SEQLEN_Q`` query
+# tokens per request, at least ``_FUSEQ8_MIN_BATCH`` requests and a context
+# bound of at most ``_FUSEQ8_KV_MAX`` tokens; every other launch takes its
+# lean tier.  One work item per (request, KV head) on the persistent grid
+# min(items, SMs); the program never reads the split pools, so the one-split
+# stand-ins of ``_lean_split_pools`` are passed.  The context bound is the
+# lean tiers' ``_lean_kv_len_bound`` (page-table width x 128 tokens, at least
+# every request's context, so the program's context bound holds).  Every
+# constant mirrors the kernel's host
+# rule.  Only the targets of ``_FUSEQ8_TARGETS`` take part; a launch on any
+# other target is outside the box and keeps the lean path unchanged.  Capture
+# never selects the fused program, and neither does an eager call with a
+# workspace (the warm-up a capture must match launch for launch): the program
+# has a hard context bound and a graph replay does not pass the host's guard
+# (``_uniform_fp8_uses_fuseq8``).
+_FUSEQ8_ROUTE = "decode_uniform_fp8:paged:fuseq8"
+_FUSEQ8_TARGETS = ("sm100a", "sm103a")
+_FUSEQ8_NUM_Q_HEADS = 32
+_FUSEQ8_NUM_KV_HEADS = 4
+_FUSEQ8_SEQLEN_Q = 8
+_FUSEQ8_MIN_BATCH = 64
+_FUSEQ8_KV_MAX = 2048
+
+
+def _fuseq8_narrow_applies(
+    *,
+    target: BlackwellMSATarget,
+    total_q: int,
+    seqlen_q: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    max_kv_len: int,
+) -> bool:
+    """Whether one uniform FP8 decode launch runs the fused program (the
+    kernel's ``uniform_fp8_program``).  A launch on a target outside
+    ``_FUSEQ8_TARGETS``, or whose head counts or query tokens per request are
+    not the box's, keeps its lean path unchecked; inside them, a token count
+    that is not a whole number of requests or a non-positive batch or context
+    is an error, never a lean fallback."""
+    if target not in _FUSEQ8_TARGETS:
+        return False
+    if not (
+        int(num_q_heads) == _FUSEQ8_NUM_Q_HEADS
+        and int(num_kv_heads) == _FUSEQ8_NUM_KV_HEADS
+        and int(seqlen_q) == _FUSEQ8_SEQLEN_Q
+    ):
+        return False
+    total_q, seqlen_q = int(total_q), int(seqlen_q)
+    if seqlen_q <= 0 or total_q % seqlen_q:
+        raise ValueError(
+            f"MSA uniform FP8 decode: {total_q} query tokens are not a whole "
+            f"number of {seqlen_q}-token requests"
+        )
+    batch, max_kv_len = total_q // seqlen_q, int(max_kv_len)
+    if batch <= 0 or max_kv_len <= 0:
+        raise ValueError(
+            f"MSA uniform FP8 decode: batch ({batch}) and the context bound "
+            f"({max_kv_len}) must be positive"
+        )
+    return batch >= _FUSEQ8_MIN_BATCH and max_kv_len <= _FUSEQ8_KV_MAX
+
+
+def _uniform_fp8_uses_fuseq8(
+    *,
+    workspace: Optional[MSASparseAttentionWorkspace],
+    capturing: bool,
+    target: BlackwellMSATarget,
+    total_q: int,
+    seqlen_q: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    max_kv_len: int,
+) -> bool:
+    """Whether one uniform FP8 decode launch runs the fused program: never
+    under CUDA graph capture and never with a workspace (the capture's eager
+    warm-up, whose launches the capture must repeat), since the fused program
+    has a hard context bound and a replay does not pass the host's guard;
+    otherwise ``_fuseq8_narrow_applies``.  The numerics of either program are
+    unchanged; only the route differs."""
+    if capturing or workspace is not None:
+        return False
+    return _fuseq8_narrow_applies(
+        target=target,
+        total_q=total_q,
+        seqlen_q=seqlen_q,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        max_kv_len=max_kv_len,
+    )
+
+
+def _fuseq8_grid(*, items: int, num_sms: int) -> int:
+    """The fused program's persistent grid: one CTA per SM at most."""
+    return min(int(items), int(num_sms))
+
 
 _LONG_WORK_GROUP_BUCKETS = (128, 64, 32, 16, 8, 4, 2, 1)
 _LONG_GROUP_BOUNDARIES = _LONG_WORK_GROUP_BUCKETS[:-1]
@@ -223,8 +557,9 @@ class MSASparseAttentionWorkspace:
 
     The multi-request long-prefill route and the persistent K-major route read
     the request boundaries from ``cu_seqlens_q`` and ``cu_seqlens_k`` /
-    ``seqused_k`` to the host in the eager warm call and keep them for that
-    binding: pass the same tensor
+    ``seqused_k`` to the host in the eager warm call (the uniform FP8 decode
+    route reads nothing: its tier comes from the page-table width); the
+    workspace keeps them for that binding: pass the same tensor
     objects to every later call (a rebuilt ``cu_seqlens`` tensor -- a new
     object, even at the old address -- is read again at the cost of one
     synchronization) and rewrite their contents only through torch operations,
@@ -463,6 +798,17 @@ _implicit_long_prefill_states: dict[tuple, dict] = {}
 _implicit_long_prefill_states_lock = threading.Lock()
 _implicit_kmaj_p_states: dict[tuple, dict] = {}
 _implicit_kmaj_p_states_lock = threading.Lock()
+# The two-split lean completion counters of workspace-free calls, one per
+# (device, stream): zeroed once when created, then reset by the program itself
+# (each item's second arrival merges and stores 0).  Only launches that
+# complete in order on one stream may share a counter, so the key is the launch
+# stream (the one ``_bind_workspace`` binds); ``cudaStreamPerThread`` (handle 2)
+# names a different stream in each thread, so its key adds the thread.  An
+# external stream destroyed with work pending, whose handle a new stream then
+# reuses, is outside this contract -- the torch caching allocator assumes the
+# same of stream handles.
+_lean_completion_counters: dict[tuple[int, int, int], torch.Tensor] = {}
+_lean_completion_counters_lock = threading.Lock()
 
 
 def is_blackwell_msa_device(device: torch.device | str) -> bool:
@@ -656,6 +1002,29 @@ def _eager_dummy(
             tensor = torch.empty(shape, dtype=dtype, device=device)
             _eager_dummies[key] = tensor
     return tensor
+
+
+def _lean_completion_counter(device: torch.device, items: int) -> torch.Tensor:
+    """The completion counter of one workspace-free two-split lean launch: the
+    first ``items`` entries of this (device, stream)'s counter.  Two splits run
+    only at ``items * 2 <= num_sms``, so ``num_sms // 2`` entries hold every
+    launch, and the counter never grows."""
+
+    index, stream = _device_index(device), _stream_ptr(device)
+    key = (index, stream, threading.get_ident() if stream == 2 else 0)
+    with _lean_completion_counters_lock:
+        counter = _lean_completion_counters.get(key)
+        if counter is None:
+            counter = torch.zeros(
+                _num_sms(device) // 2, dtype=torch.int32, device=device
+            )
+            _lean_completion_counters[key] = counter
+    if items > counter.numel():
+        raise RuntimeError(
+            f"lean two-split launch of {items} items exceeds the completion "
+            f"counter's num_sms // 2 = {counter.numel()} entries"
+        )
+    return counter[:items]
 
 
 def _tensor_signature(tensor: torch.Tensor) -> tuple:
@@ -1125,27 +1494,6 @@ def _fp8_q1_schedule(
     if not paged and batch_size == 32 and k_outer_dim == 262144 and max_pages == 0:
         return "q1_flat_xform2"
     return ""
-
-
-_UNIFORM_FP8_SINGLE_ROUTE = "decode_uniform_fp8:paged"
-
-
-def _uniform_fp8_decode_grid(
-    *, total_work_items: int, num_sms: int, seqlen_q: int
-) -> int:
-    physical_grid = min(total_work_items, num_sms)
-    default_waves = (total_work_items + physical_grid - 1) // physical_grid
-    even_waves = (
-        total_work_items + _UNIFORM_FP8_EVEN_WAVE_GRID - 1
-    ) // _UNIFORM_FP8_EVEN_WAVE_GRID
-    if (
-        seqlen_q >= 4
-        and num_sms >= _UNIFORM_FP8_EVEN_WAVE_GRID
-        and total_work_items % _UNIFORM_FP8_EVEN_WAVE_GRID == 0
-        and even_waves == default_waves
-    ):
-        return _UNIFORM_FP8_EVEN_WAVE_GRID
-    return physical_grid
 
 
 _LONG_MIN_REQUEST_LEN = 8192
@@ -2997,9 +3345,13 @@ def _run_fp8_direct(
     workspace: Optional[MSASparseAttentionWorkspace],
     capturing: bool,
 ) -> None:
-    """One direct FP8-MMA decode program (BF16-Q xform2 or uniform FP8 Q/K/V)."""
+    """One direct FP8-MMA decode program: a BF16-Q xform2 specialization, or
+    a uniform FP8 Q/K/V program -- the fused program where
+    ``_uniform_fp8_uses_fuseq8`` admits it, else the lean program of the tier
+    ``_lean_launch_plan`` resolves (``route`` is ``_LEAN_ROUTE``; the full route
+    key names the program and tier)."""
 
-    uniform = route == _UNIFORM_FP8_SINGLE_ROUTE
+    uniform = route == _LEAN_ROUTE
     total_q, num_q_heads, _ = (int(value) for value in q.shape)
     num_kv_heads = int(k.shape[1])
     arguments: dict[str, Any] = {
@@ -3019,27 +3371,50 @@ def _run_fp8_direct(
         "num_kv_heads": num_kv_heads,
     }
     if uniform:
-        total_work_items = total_q * num_kv_heads
+        max_kv_len = _lean_kv_len_bound(max_pages)
+        num_sms = _num_sms(q.device)
+        if _uniform_fp8_uses_fuseq8(
+            workspace=workspace,
+            capturing=capturing,
+            target=target,
+            total_q=total_q,
+            seqlen_q=seqlen_q,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            max_kv_len=max_kv_len,
+        ):
+            items = (total_q // int(seqlen_q)) * num_kv_heads
+            route = _FUSEQ8_ROUTE
+            splits = 1
+            grid_x = _fuseq8_grid(items=items, num_sms=num_sms)
+        else:
+            items = total_q * num_kv_heads
+            plan = _lean_launch_plan(
+                target=target,
+                items=items,
+                num_sms=num_sms,
+                max_pages=max_pages,
+                max_kv_len=max_kv_len,
+            )
+            route = _lean_route(plan)
+            splits = plan.splits
+            grid_x = plan.grid
         arguments.update(
             total_q=total_q,
             seqlen_q=seqlen_q,
             output_scale=output_scale,
             K_scale=k.view(torch.uint8),
             V_scale=v.view(torch.uint8),
-            partial_O=lse.reshape(-1),
-            partial_M=lse.reshape(-1),
-            partial_D=lse.reshape(-1),
-            split_completion=q2k_indices.reshape(-1),
-        )
-        grid = (
-            _uniform_fp8_decode_grid(
-                total_work_items=total_work_items,
-                num_sms=_num_sms(q.device),
-                seqlen_q=seqlen_q,
+            **_lean_split_pools(
+                workspace,
+                items=items,
+                splits=splits,
+                lse=lse,
+                q2k_indices=q2k_indices,
+                device=q.device,
             ),
-            1,
-            1,
         )
+        grid = (grid_x, 1, 1)
     else:
         arguments["num_requests"] = total_q
         grid = (total_q, num_kv_heads, 1)
@@ -3616,7 +3991,10 @@ def blackwell_msa_sparse_decode_attention(
     """Run sparse decode on compute capability 10.0 or 10.3.
 
     ``out``, when given, is the destination of every route and the returned
-    tensor; the routes never copy into it.
+    tensor; the routes never copy into it.  The uniform FP8 route resolves its
+    launch tier from the page-table width (``max_pages`` x 128 tokens; module
+    docstring): it reads nothing to the host, and a page table wider than the
+    longest context can resolve a slower tier.
     """
 
     del partial_dtype
@@ -3739,7 +4117,7 @@ def blackwell_msa_sparse_decode_attention(
                     "force_fused=True, and no explicit q_offset"
                 )
             _run_fp8_direct(
-                route=_UNIFORM_FP8_SINGLE_ROUTE,
+                route=_LEAN_ROUTE,
                 output_scale=output_scale,
                 **common,
             )
