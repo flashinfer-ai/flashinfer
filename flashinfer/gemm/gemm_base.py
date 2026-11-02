@@ -8072,6 +8072,61 @@ def _check_mm_fp4_problem_size(
     return True
 
 
+def _fp4_scale_byte_order_problem(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
+    block_size: int,
+    a_is_128x4: bool = True,
+) -> Optional[str]:
+    """Describe a 128x4 block-scale tensor that is a transposed copy of the quantizer output.
+
+    The CUTLASS, b12x and TRT-LLM backends, and CuTe DSL on SM100 (its SM12x path
+    checks shape and stride itself), read the scale tensors' bytes from the data
+    pointer in the order fp4 quantization writes them; shape and strides do not
+    change what they read. So any tensor over the quantizer's bytes gives the
+    documented result: A's scales as returned, the transpose of B's, a view of
+    either, or a reshape to another shape. A copy that holds the same values in a
+    different byte order gives a wrong result. Shape and strides identify two such
+    copies of an ``(r, c)`` quantizer output when ``r != c``: a contiguous ``(c,
+    r)`` tensor (a contiguous copy of the transpose) and an ``(r, c)`` tensor with
+    transposed strides (that copy transposed back). The quantizer output reshaped to
+    ``(c, r)`` looks the same as the first copy and is rejected too. Every other
+    layout, including 1-D and 3-D scale tensors, is left to the backend. A's scales
+    are checked only when ``a_is_128x4`` (TRT-LLM can take them in its 8x4 layout).
+    Returns ``None`` when neither scale tensor is such a copy, else a message.
+    """
+    sf_m, sf_n, sf_k = _calculate_block_scale_dims(
+        a.shape[0], b.shape[1], a.shape[1] * 2, block_size
+    )
+
+    def transposed_copy(t: torch.Tensor, rows: int, cols: int) -> bool:
+        if t.dim() != 2 or rows == cols:
+            return False
+        if t.is_contiguous():
+            return tuple(t.shape) == (cols, rows)
+        return tuple(t.shape) == (rows, cols) and t.t().is_contiguous()
+
+    problems = []
+    if a_is_128x4 and transposed_copy(a_descale, sf_m, sf_k):
+        problems.append(
+            "a_descale must hold the block scales in the order fp4 quantization of A "
+            "writes them; pass them as returned. Got shape "
+            f"{tuple(a_descale.shape)} with stride {tuple(a_descale.stride())}, the "
+            "layout a transposed copy of the scales has."
+        )
+    if transposed_copy(b_descale, sf_n, sf_k):
+        problems.append(
+            "b_descale must hold the block scales in the order fp4 quantization of B "
+            "writes them; pass the transpose of the (n, k // block_size) quantizer "
+            "output as a view (that output's .T). Got shape "
+            f"{tuple(b_descale.shape)} with stride {tuple(b_descale.stride())}, the "
+            "layout a transposed copy of the scales has."
+        )
+    return " ".join(problems) if problems else None
+
+
 @supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cudnn_gemm_fp4_requirement(
     a: torch.Tensor,
@@ -8168,7 +8223,7 @@ def _cudnn_gemm_fp4_requirement(
                     "quantization of B (n, k) writes, so b_descale must be the "
                     f"transposed view of those scales, with stride {(1, sf_k)}; got "
                     f"stride {tuple(b_descale.stride())}. Pass the transpose of the "
-                    "quantized scales, not a contiguous copy of it."
+                    "quantizer output as a view (that output's .T)."
                 )
             raise ValueError(" ".join(problems))
 
@@ -8177,18 +8232,16 @@ def _cudnn_gemm_fp4_requirement(
 
 @supported_compute_capability([100, 103, 107])
 def _trtllm_gemm_fp4_requirement(
-    a: torch.Tensor,  # unused
-    b: torch.Tensor,  # unused
-    a_descale: torch.Tensor,  # unused
-    b_descale: torch.Tensor,  # unused
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,  # unused
-    block_size: int = 16,  # unused
-    use_8x4_sf_layout: bool = False,  # unused
-    backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
-    ] = "auto",  # unused
+    block_size: int = 16,
+    use_8x4_sf_layout: bool = False,
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -8199,23 +8252,34 @@ def _trtllm_gemm_fp4_requirement(
             f"Unsupported output dtype: {out_dtype}. "
             f"Only torch.bfloat16 is supported for TRTLLM FP4 GEMM operations."
         )
+    # B's scales are 128x4 in both modes; A's are 8x4 when use_8x4_sf_layout is set
+    problem = _fp4_scale_byte_order_problem(
+        a,
+        b,
+        a_descale,
+        b_descale,
+        block_size,
+        a_is_128x4=not use_8x4_sf_layout,
+    )
+    if problem is not None:
+        if backend != "trtllm":
+            return False
+        raise ValueError(f"TRTLLM FP4 GEMM: {problem}")
     return True
 
 
 @supported_compute_capability([100, 103, 107, 110, 120, 121])
 def _cutlass_gemm_fp4_requirement(
-    a: torch.Tensor,  # unused
-    b: torch.Tensor,  # unused
-    a_descale: torch.Tensor,  # unused
-    b_descale: torch.Tensor,  # unused
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,
-    block_size: int = 16,  # unused
+    block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
-    ] = "auto",  # unused
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -8227,6 +8291,11 @@ def _cutlass_gemm_fp4_requirement(
         raise ValueError(
             "The CUTLASS FP4 GEMM backend requires a contiguous output tensor."
         )
+    problem = _fp4_scale_byte_order_problem(a, b, a_descale, b_descale, block_size)
+    if problem is not None:
+        if backend != "cutlass":
+            return False
+        raise ValueError(f"CUTLASS FP4 GEMM: {problem}")
     return True
 
 
@@ -8234,12 +8303,12 @@ def _cutlass_gemm_fp4_requirement(
 def _cute_dsl_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
-    a_descale: torch.Tensor,  # unused
-    b_descale: torch.Tensor,  # unused
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,  # unused
-    block_size: int = 16,  # unused
+    block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
@@ -8284,6 +8353,11 @@ def _cute_dsl_gemm_fp4_requirement(
                 "CuTe-DSL FP4 GEMM per-token alpha is implemented on SM100/SM103 "
                 f"only, got SM{major}{minor}."
             )
+    problem = _fp4_scale_byte_order_problem(a, b, a_descale, b_descale, block_size)
+    if problem is not None:
+        if backend != "cute-dsl":
+            return False
+        raise ValueError(f"CuTe-DSL FP4 GEMM: {problem}")
     _check_cute_dsl_availability()
     _check_cute_dsl_arch(a.device)
     return True
@@ -8298,7 +8372,7 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
     alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,  # unused
-    block_size: int = 16,  # unused
+    block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal["cutedsl_low_latency", "auto"] = "auto",
     use_nvfp4: bool = True,
@@ -8323,6 +8397,11 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
         raise ValueError(
             f"cutedsl_low_latency FP4 GEMM requires M <= 8 and K divisible by {k_alignment}"
         )
+    problem = _fp4_scale_byte_order_problem(a, b, a_descale, b_descale, block_size)
+    if problem is not None:
+        if backend != "cutedsl_low_latency":
+            return False
+        raise ValueError(f"cutedsl_low_latency FP4 GEMM: {problem}")
     return True
 
 
@@ -8330,16 +8409,14 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
 def _b12x_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
-    a_descale: torch.Tensor,  # unused
-    b_descale: torch.Tensor,  # unused
+    a_descale: torch.Tensor,
+    b_descale: torch.Tensor,
     alpha: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     out: Optional[torch.Tensor] = None,  # unused
-    block_size: int = 16,  # unused
+    block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
-    ] = "auto",  # unused
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
@@ -8363,6 +8440,11 @@ def _b12x_gemm_fp4_requirement(
             "b12x FP4 GEMM requires the contraction dim K to be a multiple of 32 "
             f"(TMA 16-byte alignment). Got K={real_k}."
         )
+    problem = _fp4_scale_byte_order_problem(a, b, a_descale, b_descale, block_size)
+    if problem is not None:
+        if backend != "b12x":
+            return False
+        raise ValueError(f"b12x FP4 GEMM: {problem}")
     _check_cute_dsl_availability()
     return True
 

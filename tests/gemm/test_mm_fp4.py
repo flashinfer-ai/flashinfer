@@ -20,9 +20,18 @@ from flashinfer.utils import (
     version_at_least,
     LibraryError,
 )
+from packaging.version import Version
+
+from flashinfer.cute_dsl import is_cute_dsl_available
+from flashinfer.jit.cpp_ext import get_cuda_version
 from flashinfer.gemm.gemm_base import (
     CUDNN_FP4_MXFP4_SM120_CUDNN_VERSION_ERROR,
+    _b12x_gemm_fp4_requirement,
     _cudnn_gemm_fp4_requirement,
+    _cute_dsl_gemm_fp4_requirement,
+    _cutedsl_low_latency_gemm_fp4_requirement,
+    _cutlass_gemm_fp4_requirement,
+    _trtllm_gemm_fp4_requirement,
 )
 
 
@@ -786,7 +795,7 @@ def test_mm_fp4_cudnn_rejects_contiguous_copy_of_b_descale_transpose(use_nvfp4):
         512,
         use_nvfp4,
         lambda b_sf: b_sf.T.contiguous(),
-        "not a contiguous copy",
+        "transposed view of those scales",
     )
 
 
@@ -803,7 +812,7 @@ def test_mm_fp4_cudnn_rejects_untransposed_b_descale_square(use_nvfp4):
         128 * block_size,
         use_nvfp4,
         lambda b_sf: b_sf,
-        "not a contiguous copy",
+        "transposed view of those scales",
     )
 
 
@@ -860,6 +869,221 @@ def test_mm_fp4_cudnn_auto_declines_untransposed_b_descale(use_nvfp4):
         raise
     assert accepted(b_sf.T) is True
     assert accepted(b_sf) is False
+
+
+# The CUTLASS, b12x and TRT-LLM backends, and CuTe DSL on SM100, read the block-scale
+# bytes as given (the SM12x CuTe DSL path checks shape and stride itself). A
+# transposed copy of the A or B scales holds the same values in a different byte order
+# and used to give wrong results silently on some architecture; it now raises
+# ValueError. Views over the quantizer's bytes, and reshapes to shapes a copy cannot
+# have, keep their behaviour.
+_BYTE_ORDER_BACKENDS = [
+    ("cutlass", "nvfp4"),
+    ("b12x", "nvfp4"),
+    ("b12x", "mxfp4"),
+    ("trtllm", "nvfp4"),
+    ("cute-dsl", "nvfp4"),
+    ("cute-dsl", "mxfp4"),
+    ("cutedsl_low_latency", "nvfp4"),
+    ("cutedsl_low_latency", "mxfp4"),
+]
+
+# (a_descale, b_descale) built from the quantizer outputs a_sf and b_sf
+_BLOCK_SCALE_VIEWS = {
+    "untransposed_b": lambda a_sf, b_sf: (a_sf, b_sf),
+    "a_transposed_view": lambda a_sf, b_sf: (a_sf.T, b_sf.T),
+    "a_reshaped_to_one_row": lambda a_sf, b_sf: (a_sf.reshape(1, -1), b_sf.T),
+    "b_reshaped_to_one_row": lambda a_sf, b_sf: (a_sf, b_sf.reshape(1, -1)),
+}
+_BLOCK_SCALE_TRANSPOSED_COPIES = {
+    "b_contiguous_transpose": lambda a_sf, b_sf: (a_sf, b_sf.T.contiguous()),
+    "b_contiguous_transpose_transposed_back": lambda a_sf, b_sf: (
+        a_sf,
+        b_sf.T.contiguous().T,
+    ),
+    "a_contiguous_transpose_transposed_back": lambda a_sf, b_sf: (
+        a_sf.T.contiguous().T,
+        b_sf.T,
+    ),
+    "a_contiguous_transpose": lambda a_sf, b_sf: (a_sf.T.contiguous(), b_sf.T),
+    # B is checked even when A's scales are passed flattened
+    "b_contiguous_transpose_with_flat_a": lambda a_sf, b_sf: (
+        a_sf.reshape(-1),
+        b_sf.T.contiguous(),
+    ),
+}
+
+
+def _byte_order_case(backend, fp4_type):
+    """Skip where the backend cannot run; else quantize A and B and return the inputs."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    cc = get_compute_capability(torch.device("cuda"))
+    sm12x = cc[0] == 12
+    if not mm_fp4.is_backend_supported(backend, cc[0] * 10 + cc[1]):
+        pytest.skip(f"{backend} FP4 GEMM is not supported on this GPU.")
+    if backend == "cute-dsl" and sm12x and fp4_type == "mxfp4":
+        pytest.skip("The SM12x CuTe DSL path takes NVFP4 only.")
+    if (
+        backend == "cute-dsl"
+        and sm12x
+        and not version_at_least(torch.version.cuda, "13.0")
+    ):
+        pytest.skip("The SM12x CuTe DSL path requires CUDA 13+.")
+    # b12x runs on CuTe DSL too
+    if (
+        backend in ("cute-dsl", "cutedsl_low_latency", "b12x")
+        and not is_cute_dsl_available()
+    ):
+        pytest.skip("Please `pip install nvidia-cutlass-dsl`")
+    min_cuda = "12.9" if fp4_type == "nvfp4" else "13.0"
+    if backend == "b12x" and get_cuda_version() < Version(min_cuda):
+        pytest.skip(f"b12x {fp4_type} FP4 GEMM requires CUDA {min_cuda}+.")
+    m, n, k = (8 if backend == "cutedsl_low_latency" else 128), 256, 512
+    use_nvfp4 = fp4_type == "nvfp4"
+    torch.manual_seed(0)
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    if use_nvfp4:
+        ga = (448 * 6) / a.float().abs().nan_to_num().max()
+        gb = (448 * 6) / b.float().abs().nan_to_num().max()
+        a_fp4, a_sf = nvfp4_quantize(a, ga)
+        # the TRT-LLM backend takes B shuffled, as in _test_mm_fp4
+        b_fp4, b_sf = nvfp4_quantize(b, gb, do_shuffle=backend == "trtllm")
+        alpha = 1.0 / (ga * gb)
+    else:
+        (a_fp4, a_sf), (b_fp4, b_sf), alpha = mxfp4_quantize(a), mxfp4_quantize(b), None
+    return dict(
+        a_fp4=a_fp4,
+        b_fp4=b_fp4,
+        a_sf=a_sf,
+        b_sf=b_sf,
+        alpha=alpha,
+        m=m,
+        n=n,
+        block_size=16 if use_nvfp4 else 32,
+        use_nvfp4=use_nvfp4,
+        sm12x=sm12x,
+    )
+
+
+def _run_byte_order_case(case, backend, a_descale, b_descale):
+    out = torch.empty([case["m"], case["n"]], device="cuda", dtype=torch.bfloat16)
+    mm_fp4(
+        case["a_fp4"],
+        case["b_fp4"].T,
+        a_descale,
+        b_descale,
+        case["alpha"],
+        torch.bfloat16,
+        out,
+        block_size=case["block_size"],
+        backend=backend,
+        use_nvfp4=case["use_nvfp4"],
+        skip_check=False,
+    )
+    return out
+
+
+@pytest.mark.parametrize("form", list(_BLOCK_SCALE_VIEWS))
+@pytest.mark.parametrize("backend, fp4_type", _BYTE_ORDER_BACKENDS)
+def test_mm_fp4_keeps_block_scale_views(backend, fp4_type, form):
+    """A view over the quantizer's bytes gives the documented result, or the
+    backend's own error where it already refused it (the C++ contiguity checks on
+    SM100, the SM12x CuTe DSL check), never the transposed-copy error."""
+    case = _byte_order_case(backend, fp4_type)
+    reference = _run_byte_order_case(case, backend, case["a_sf"], case["b_sf"].T)
+    a_descale, b_descale = _BLOCK_SCALE_VIEWS[form](case["a_sf"], case["b_sf"])
+    try:
+        out = _run_byte_order_case(case, backend, a_descale, b_descale)
+    except (RuntimeError, ValueError) as err:
+        assert "the layout a transposed copy of the scales has" not in str(err)
+    else:
+        assert torch.equal(out, reference)
+
+
+@pytest.mark.parametrize("form", list(_BLOCK_SCALE_TRANSPOSED_COPIES))
+@pytest.mark.parametrize("backend, fp4_type", _BYTE_ORDER_BACKENDS)
+def test_mm_fp4_rejects_transposed_block_scale_copy(backend, fp4_type, form):
+    case = _byte_order_case(backend, fp4_type)
+    a_descale, b_descale = _BLOCK_SCALE_TRANSPOSED_COPIES[form](
+        case["a_sf"], case["b_sf"]
+    )
+    # the SM12x CuTe DSL path refuses them with its own check first
+    own_check = backend == "cute-dsl" and case["sm12x"]
+    with pytest.raises(
+        ValueError,
+        match=None if own_check else "the layout a transposed copy of the scales has",
+    ):
+        _run_byte_order_case(case, backend, a_descale, b_descale)
+
+
+@pytest.mark.parametrize("backend, fp4_type", _BYTE_ORDER_BACKENDS)
+def test_mm_fp4_auto_declines_transposed_block_scale_copy(backend, fp4_type):
+    """With backend="auto" the requirement check returns False instead of raising,
+    so a transposed copy takes the backend out of the candidates."""
+    case = _byte_order_case(backend, fp4_type)
+    if backend == "cute-dsl" and case["sm12x"]:
+        pytest.skip("The SM12x CuTe DSL path is never selected by auto.")
+    requirement = {
+        "cutlass": _cutlass_gemm_fp4_requirement,
+        "b12x": _b12x_gemm_fp4_requirement,
+        "trtllm": _trtllm_gemm_fp4_requirement,
+        "cute-dsl": _cute_dsl_gemm_fp4_requirement,
+        "cutedsl_low_latency": _cutedsl_low_latency_gemm_fp4_requirement,
+    }[backend]
+    assert not requirement(
+        case["a_fp4"],
+        case["b_fp4"].T,
+        case["a_sf"],
+        case["b_sf"].T.contiguous(),
+        case["alpha"],
+        block_size=case["block_size"],
+        backend="auto",
+        use_nvfp4=case["use_nvfp4"],
+    )
+
+
+def test_mm_fp4_trtllm_8x4_rejects_transposed_b_scale_copy():
+    """With A's scales in the 8x4 layout, B's are still 128x4 and read raw, so a
+    transposed copy of them raises ValueError too."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    cc = get_compute_capability(torch.device("cuda"))
+    if not mm_fp4.is_backend_supported("trtllm", cc[0] * 10 + cc[1]):
+        pytest.skip("trtllm FP4 GEMM is not supported on this GPU.")
+    m, n, k = 128, 256, 512
+    torch.manual_seed(0)
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    ga = (448 * 6) / a.float().abs().nan_to_num().max()
+    gb = (448 * 6) / b.float().abs().nan_to_num().max()
+    a_fp4, a_sf = nvfp4_quantize(a, ga, sfLayout=SfLayout.layout_8x4, do_shuffle=False)
+    b_fp4, b_sf = nvfp4_quantize(b, gb, sfLayout=SfLayout.layout_128x4, do_shuffle=True)
+
+    def run(b_descale):
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_sf,
+            b_descale,
+            1.0 / (ga * gb),
+            torch.bfloat16,
+            out,
+            block_size=16,
+            use_8x4_sf_layout=True,
+            backend="trtllm",
+            skip_check=False,
+        )
+        return out
+
+    run(b_sf.T)
+    for b_descale in (b_sf.T.contiguous(), b_sf.T.contiguous().T):
+        with pytest.raises(
+            ValueError, match="the layout a transposed copy of the scales has"
+        ):
+            run(b_descale)
 
 
 if __name__ == "__main__":
