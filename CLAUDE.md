@@ -128,7 +128,7 @@ GitHub PR Test GPU jobs keep a different, per-runner cache: they set
 `ci/bash.sh` namespaces it by runner and the pulled image's immutable ID.
 `CI_COMPILE_CACHE_MODE=read-only` (the default) mounts a read-only seed and runs
 against a private writable copy, discarded even after test failures. The PR Test
-workflow selects `read-write` only for pushes to `main`. A stable per-runner lock
+workflow selects `read-write` only for scheduled runs on `main`. A stable per-runner lock
 protects maintenance and execution, including accidentally shared workspaces.
 Other `ci/bash.sh` callers leave caching unset and run cold.
 Before each trusted writable job its runner's cache is cleared when it exceeds
@@ -142,6 +142,22 @@ since a fresh checkout rebuilds nvcc modules anyway. Each test job's
 `scripts/summarize_jit_builds.py` in the job summary.
 See [`ci/COMPILE_CACHE.md`](ci/COMPILE_CACHE.md) for lifecycle tests and trust
 boundaries.
+
+A shared S3 layer sits under it (`ci/compile_cache_s3.sh`), so new EC2 leases and
+new runners do not start cold: one tarball per image ID, GPU and lane under
+`s3://<SCCACHE_BUCKET>/compile-cache/main/`, readable anonymously by every job.
+Pull request jobs keep a per-runner mirror of it (refreshed by ETag); the job's
+entrypoint copies the mirror first and fills its gaps from the seed, taking a
+CuTe-DSL module whole when absent and adding objects only when its `meta.json` is
+identical. Only scheduled runs on `main` write, through the OIDC role in the
+`COMPILE_CACHE_S3_ROLE_ARN` repository variable, whose IAM trust policy accepts
+only `refs/heads/main`; until it is set they update seeds as before. A writer
+retires its runner's seeds, compiles in a new `runner.temp` directory on top of
+the S3 tarball alone (without the shared pip cache), then uploads it as one
+object, so concurrent writers never interleave a module. It skips the upload when
+it built nothing new or its restore failed. A tarball over
+`CI_COMPILE_CACHE_S3_MAX_MB` (default 4096) is cut down to that job's own builds,
+dropping kernels it reused. Restore and upload failures only warn.
 
 ## cuDNN linear attention
 

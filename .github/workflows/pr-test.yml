@@ -389,6 +389,15 @@ jobs:
       needs.setup.outputs.test_count != '0'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
+    permissions:
+      contents: read
+      actions: read
+      # Scheduled runs on main request the compile-cache upload role (see
+      # "Get compile cache upload credentials"). The role's trust policy, not
+      # this file, restricts it to refs/heads/main: a pull request run, even
+      # one that edits this workflow, gets a token whose subject the policy
+      # rejects.
+      id-token: write
     strategy:
       fail-fast: ${{ github.event_name != 'schedule' }}
       matrix: ${{ fromJSON(needs.setup.outputs.test_matrix) }}
@@ -477,6 +486,36 @@ jobs:
             -e SCCACHE_STATS_DIR /workspace/sccache-stats \
             --no-gpu "./scripts/${TEST_SCRIPT}"
 
+      - name: Configure compile cache
+        if: matrix.kind != 'aot'
+        env:
+          S3_BUCKET: ${{ vars.SCCACHE_BUCKET || 'flashinfer-build-cache' }}
+          S3_REGION: ${{ vars.SCCACHE_REGION || 'us-west-2' }}
+          UPLOAD_ROLE: ${{ vars.COMPILE_CACHE_S3_ROLE_ARN }}
+        run: |
+          # Shared S3 layer of the compile cache (see ci/compile_cache_s3.sh):
+          # one tarball per CI image ID, GPU and lane. A10G shards test different
+          # files, so each shard is its own lane; targeted runs share the lane
+          # of the bare run they narrow.
+          case "${TEST_SCRIPT}" in
+            task_jit_run_tests_part[1-5].sh) LANE="${TEST_SCRIPT#task_jit_run_tests_}"; LANE="${LANE%.sh}" ;;
+            *) LANE=all ;;
+          esac
+          if [ -n "${S3_BUCKET}" ] && [ -n "${S3_REGION}" ]; then
+            echo "CI_COMPILE_CACHE_S3_URL=https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/compile-cache/main" >> "${GITHUB_ENV}"
+            echo "CI_COMPILE_CACHE_S3_LANE=${CI_GPU_NAME}/${LANE}" >> "${GITHUB_ENV}"
+            # Only scheduled runs on main write, and only once an admin has
+            # created the upload role. A writer compiles in a directory no
+            # earlier job on this runner (any of them a pull request) can have
+            # touched: a new path per job, and no shared pip cache, which PR
+            # containers write as root.
+            if [ "${GITHUB_EVENT_NAME}" = "schedule" ] && [ "${GITHUB_REF}" = "refs/heads/main" ] \
+                && [ -n "${UPLOAD_ROLE}" ]; then
+              echo "CI_COMPILE_CACHE_WRITER_DIR=$(mktemp -u "${RUNNER_TEMP}/compile-cache-writer.XXXXXXXX")" >> "${GITHUB_ENV}"
+              echo "CI_PIP_CACHE_DIR=" >> "${GITHUB_ENV}"
+            fi
+          fi
+
       - name: Run Test
         if: matrix.kind != 'aot'
         env:
@@ -490,8 +529,10 @@ jobs:
           # large NVMe work volume rather than the small root filesystem.
           CI_COMPILE_CACHE_DIR: ${{ runner.workspace }}/flashinfer-compile-cache
           CI_COMPILE_CACHE_RUNNER: ${{ runner.name }}
-          # PR/manual runs consume private copies. Only main pushes update seeds.
-          CI_COMPILE_CACHE_MODE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
+          # PR/manual runs consume private copies. Only scheduled runs on main
+          # update seeds; main has no push trigger, so a push condition here
+          # would leave every seed empty.
+          CI_COMPILE_CACHE_MODE: ${{ github.event_name == 'schedule' && github.ref == 'refs/heads/main' && 'read-write' || 'read-only' }}
         run: |
           case "${TEST_SCRIPT}" in
             task_jit_run_tests_part[1-5].sh|task_jit_run_tests_t4.sh|task_run_unit_tests.sh) ;;
@@ -557,6 +598,34 @@ jobs:
           else
             bash ci/bash.sh "${DOCKER_IMAGE}" "${DOCKER_ARGS[@]}" "${LANE_COMMAND[@]}" "${TEST_RUNNER_ARGS[@]}"
           fi
+
+      # Runs even when tests fail or the run is cancelled: whatever was
+      # compiled is still valid. Credentials are requested only now, so they
+      # never reach the test step and stay short-lived.
+      - name: Get compile cache upload credentials
+        if: always() && env.CI_COMPILE_CACHE_WRITER_DIR != ''
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.COMPILE_CACHE_S3_ROLE_ARN }}
+          aws-region: ${{ vars.SCCACHE_REGION || 'us-west-2' }}
+          role-session-name: compile-cache-${{ github.run_id }}
+          role-duration-seconds: 900
+
+      - name: Upload compile cache
+        if: always() && env.CI_COMPILE_CACHE_WRITER_DIR != ''
+        env:
+          S3_BUCKET: ${{ vars.SCCACHE_BUCKET || 'flashinfer-build-cache' }}
+        run: |
+          # Keyed by the immutable image ID, as ci/compile_cache.sh restores it.
+          IMAGE_ID=$(docker image inspect --format '{{.Id}}' "${DOCKER_IMAGE}" 2>/dev/null || true)
+          if [[ ${IMAGE_ID} =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            bash ci/compile_cache_s3.sh upload "s3://${S3_BUCKET}/compile-cache/main" \
+              "${IMAGE_ID#sha256:}" "${CI_COMPILE_CACHE_S3_LANE}" "${CI_COMPILE_CACHE_WRITER_DIR}" || true
+          else
+            echo "::warning::image ID of ${DOCKER_IMAGE} unavailable; compile cache not uploaded"
+          fi
+          sudo -n rm -rf "${CI_COMPILE_CACHE_WRITER_DIR}" || rm -rf "${CI_COMPILE_CACHE_WRITER_DIR}" || true
 
       - name: Display sccache stats
         if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
