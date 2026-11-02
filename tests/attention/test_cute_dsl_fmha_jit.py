@@ -44,8 +44,9 @@ from flashinfer.cute_dsl.attention.fmha.fmha_blockscaled import (
     create_scale_factor_tensor,
 )
 from flashinfer.cute_dsl.attention.fmha.helpers import fmha_helpers as fmha_utils
-from flashinfer.cute_dsl.attention.fmha.helpers.expcast import (
-    expcast_pack_decode4,
+from flashinfer.attention.prims_ts.kernels.fmha_context.helpers import (
+    expcast_e4m3_quad_relu,
+    f16x2_sum4,
 )
 from flashinfer.cute_dsl.attention.fmha.compile import _ex2_emulation_enabled
 
@@ -375,6 +376,7 @@ def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse, p_exp_mode):
         enable_skip_correction=True,
         qk_sf_vec_size=sf_vec,
         p_exp_mode=p_exp_mode,
+        rescale_threshold=2**-8,
         use_tma_store=True,  # non-varlen
     )
     stream = _default_stream()
@@ -446,71 +448,51 @@ def test_cute_dsl_fmha_blockscaled_jit(qk_mode, causal, with_lse, p_exp_mode):
 
 
 @cute.kernel
-def _expcast_test_kernel(
-    scores: cute.Tensor,
-    packed: cute.Tensor,
-    decoded: cute.Tensor,
-    remove_clamps: cutlass.Constexpr[bool],
-):
-    idx = cute.arch.thread_idx()[0] + cute.arch.block_idx()[0] * 128
-    if idx < cute.size(packed):
-        code, p0, p1, p2, p3 = expcast_pack_decode4(
-            scores[idx * 4],
-            scores[idx * 4 + 1],
-            scores[idx * 4 + 2],
-            scores[idx * 4 + 3],
-            remove_clamps=remove_clamps,
-        )
-        packed[idx] = code
-        decoded[idx * 4] = p0
-        decoded[idx * 4 + 1] = p1
-        decoded[idx * 4 + 2] = p2
-        decoded[idx * 4 + 3] = p3
+def _expcast_test_kernel(codes: cute.Tensor, packed: cute.Tensor, sums: cute.Tensor):
+    row = cute.arch.thread_idx()[0] + cute.arch.block_idx()[0] * 128
+    if row < codes.shape[0]:
+        acc = [Int32(0)] * 4
+        for quad in cutlass.range_constexpr(codes.shape[1] // 4):
+            chain = 2 * (quad % 2)
+            word, lo, hi = expcast_e4m3_quad_relu(
+                codes[row, 4 * quad],
+                codes[row, 4 * quad + 1],
+                codes[row, 4 * quad + 2],
+                codes[row, 4 * quad + 3],
+                acc[chain],
+                acc[chain + 1],
+                quad < 2,
+            )
+            acc[chain], acc[chain + 1] = lo, hi
+            packed[row, quad] = word
+        sums[row] = f16x2_sum4(acc[0], acc[1], acc[2], acc[3])
 
 
 @cute.jit
-def _expcast_test_launch(
-    scores: cute.Tensor,
-    packed: cute.Tensor,
-    decoded: cute.Tensor,
-    remove_clamps: cutlass.Constexpr[bool],
-):
-    _expcast_test_kernel(scores, packed, decoded, remove_clamps).launch(
-        grid=[cute.ceil_div(cute.size(packed), 128), 1, 1], block=[128, 1, 1]
+def _expcast_test_launch(codes: cute.Tensor, packed: cute.Tensor, sums: cute.Tensor):
+    _expcast_test_kernel(codes, packed, sums).launch(
+        grid=[cute.ceil_div(codes.shape[0], 128), 1, 1], block=[128, 1, 1]
     )
 
 
-@pytest.mark.parametrize("remove_clamps", [False, True])
-def test_expcast_encoding_and_exact_decode(remove_clamps):
-    scores = torch.linspace(-30, 8 if remove_clamps else 20, 4092, device=DEVICE)
-    scores = torch.cat(
-        (
-            scores,
-            torch.tensor(
-                [-torch.inf, -20.0 if remove_clamps else torch.inf, 0.0, 8.0],
-                device=DEVICE,
-            ),
-        )
-    )
-    packed = torch.empty(scores.numel() // 4, device=DEVICE, dtype=torch.int32)
-    decoded = torch.empty_like(scores)
+def test_expcast_shared_encoding_and_fp16_partial_sums():
+    codes = torch.linspace(-100, 126.49, 4096, device=DEVICE).reshape(32, 128)
+    codes[0].fill_(-torch.inf)
+    codes[1].fill_(119.65)  # Uniform E4M3 weight 256; sums must not overflow.
+    codes[2] = torch.tensor([119.49, 118.51, -torch.inf, 0.0], device=DEVICE).repeat(32)
+    packed = torch.empty(32, 32, device=DEVICE, dtype=torch.int32)
+    sums = torch.empty(32, device=DEVICE, dtype=torch.float32)
     compiled = cute.compile(
-        _expcast_test_launch,
-        from_dlpack(scores),
-        from_dlpack(packed),
-        from_dlpack(decoded),
-        remove_clamps,
+        _expcast_test_launch, from_dlpack(codes), from_dlpack(packed), from_dlpack(sums)
     )
-    compiled(from_dlpack(scores), from_dlpack(packed), from_dlpack(decoded))
-    # Emulate the single-rounding FP32 FMA before rounding to an integer code.
-    bias = torch.tensor(55.65, dtype=torch.float32).double()
-    expected_codes = (
-        (scores.double() * 8 + bias).float().clamp(0, 126).round().to(torch.uint8)
-    )
+    compiled(from_dlpack(codes), from_dlpack(packed), from_dlpack(sums))
+    # The shared packer rounds through FP16 before integer-code rounding.
+    expected_codes = codes.clamp_min(0).half().float().round().to(torch.uint8)
     torch.testing.assert_close(packed.view(torch.uint8), expected_codes, rtol=0, atol=0)
-    torch.testing.assert_close(
-        decoded, expected_codes.view(torch.float8_e4m3fn).float(), rtol=0, atol=0
-    )
-    assert (
-        decoded[-4] == 0
-    )  # Masked -inf must contribute neither numerator nor denominator.
+    weights = expected_codes.view(torch.float8_e4m3fn).half()
+    partial = torch.zeros(32, 8, device=DEVICE, dtype=torch.float16)
+    for start in range(0, 128, 8):
+        partial = (partial + weights[:, start : start + 8]).half()
+    torch.testing.assert_close(sums, partial.float().sum(-1), rtol=0, atol=0)
+    assert sums[0] == 0  # Masked scores must not contribute to normalization.
+    assert sums[1] == 128 * 256

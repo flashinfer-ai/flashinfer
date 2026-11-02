@@ -50,7 +50,6 @@ from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
 from .helpers import fmha_helpers as fmha_utils
-from .helpers.expcast import expcast_pack_decode4
 
 """
 A fused multi-head attention (FMHA) example where Bmm1(Q@K) is block-scaled with MXFP8 or NVFP4 for
@@ -265,6 +264,14 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         if p_exp_mode not in ("exp2", "expcast"):
             raise ValueError(f"Unsupported p_exp_mode: {p_exp_mode!r}")
         self.p_exp_mode = p_exp_mode
+        if p_exp_mode == "expcast":
+            from flashinfer.attention.prims_ts.kernels.fmha_context.helpers import (
+                expcast_e4m3_quad_relu,
+                f16x2_sum4,
+            )
+
+            self.expcast_encode = expcast_e4m3_quad_relu
+            self.expcast_sum = f16x2_sum4
         self.qk_acc_dtype = qk_acc_dtype
         self.pv_acc_dtype = pv_acc_dtype
         if mma_tiler != (128, 128):
@@ -462,11 +469,12 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         # more of E4M3's [0, 448] range, improving quantization precision.
         # Derived from rescale_threshold to guarantee P*2^offset <= 448.
         self.p_fp8_prescale_log2 = max(0.0, math.floor(math.log2(448) - self.rescale_threshold))
-        # With deferred rescaling, x <= threshold + prescale. Saturating byte
-        # packing handles the lower bound; omit clamps only with a proven cap.
-        self.expcast_remove_clamps = (
-            8.0 * (max(0.0, self.rescale_threshold) + self.p_fp8_prescale_log2) + 55.65 < 126.5
-        )
+        # The shared Prims-TS packer supplies the lower clamp via ReLU but
+        # has no upper clamp. Bound the rounded code below E4M3's NaN byte.
+        if self.p_exp_mode == "expcast" and (
+            8.0 * (max(0.0, self.rescale_threshold) + self.p_fp8_prescale_log2) + 55.65 >= 126.5
+        ):
+            raise ValueError("expcast requires an upper code bound below 126.5")
         # ln(2) * offset correction for LSE when pre-scale is active
         self.p_fp8_prescale_lse_correction = self.p_fp8_prescale_log2 * math.log(2)
         # For most cases, seq barrier is needed to help keep the pipeline stable
@@ -2477,32 +2485,37 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         :rtype: Tuple[float, cute.Tensor]
         """
         if cutlass.const_expr(self.p_exp_mode == "expcast"):
-            # Sum exact decoded weights in the original single-pair reduction.
-            # The first FMA_COUNT scores were already scaled by softmax_step.
+            # Fold score scaling and the E4M3 code map into one FMA per value.
+            code_scale = scale * Float32(8.0)
+            code_bias = minus_row_max_scale * Float32(8.0) + Float32(
+                55.65 + 8.0 * self.p_fp8_prescale_log2
+            )
+            acc = [Int32(0)] * 4
             for i in cutlass.range_constexpr(0, cute.size(tTMEM_LOADrS), 4):
-                if cutlass.const_expr(i + FMA_COUNT < cute.size(tTMEM_LOADrS)):
-                    for j in cutlass.range_constexpr(0, 4, 2):
-                        tTMEM_LOADrS[i + FMA_COUNT + j], tTMEM_LOADrS[i + FMA_COUNT + j + 1] = (
-                            cute.arch.fma_packed_f32x2(
-                                (tTMEM_LOADrS[i + FMA_COUNT + j], tTMEM_LOADrS[i + FMA_COUNT + j + 1]),
-                                (scale, scale),
-                                (minus_row_max_scale, minus_row_max_scale),
-                            )
-                        )
-                packed, p0, p1, p2, p3 = expcast_pack_decode4(
-                    tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1],
-                    tTMEM_LOADrS[i + 2], tTMEM_LOADrS[i + 3],
-                    remove_clamps=self.expcast_remove_clamps,
+                c0, c1 = cute.arch.fma_packed_f32x2(
+                    (tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1]),
+                    (code_scale, code_scale),
+                    (code_bias, code_bias),
                 )
-                local_row_sum = cute.arch.add_packed_f32x2(local_row_sum, (p0, p1))
-                local_row_sum = cute.arch.add_packed_f32x2(local_row_sum, (p2, p3))
-                cute.recast_tensor(tTMEM_STORErS_x4_e_cvt[None, i // 4], Int32)[0] = packed
+                c2, c3 = cute.arch.fma_packed_f32x2(
+                    (tTMEM_LOADrS[i + 2], tTMEM_LOADrS[i + 3]),
+                    (code_scale, code_scale),
+                    (code_bias, code_bias),
+                )
+                chain = 2 * ((i // 4) % 2)
+                word, acc_lo, acc_hi = self.expcast_encode(
+                    c0, c1, c2, c3, acc[chain], acc[chain + 1], i < 8
+                )
+                acc[chain], acc[chain + 1] = acc_lo, acc_hi
+                cute.recast_tensor(tTMEM_STORErS_x4_e_cvt[None, i // 4], Int32)[0] = word
                 if cutlass.const_expr(i == cute.size(tTMEM_LOADrS) - ARV_COUNT):
                     if cutlass.const_expr(self.enable_sequence_barrier):
                         if cutlass.const_expr(stage == 0):
                             self.sequence_s1_s0_barrier.arrive()
                         else:
                             self.sequence_s0_s1_barrier.arrive()
+            tile_sum = self.expcast_sum(acc[0], acc[1], acc[2], acc[3])
+            local_row_sum = (local_row_sum[0] + tile_sum, local_row_sum[1])
             inplace_peek_status = inplace_consumer.try_wait()
             inplace_consumer.wait_and_advance(inplace_peek_status)
             return local_row_sum, inplace_consumer
@@ -2890,7 +2903,11 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         )
         scale = scale_softmax_log2
         minus_row_max_scale = (0.0 - row_max_safe) * scale
-        if cutlass.const_expr(self.v_dtype.width == 8 and self.p_fp8_prescale_log2 > 0):
+        if cutlass.const_expr(
+            self.v_dtype.width == 8
+            and self.p_fp8_prescale_log2 > 0
+            and self.p_exp_mode != "expcast"
+        ):
             minus_row_max_scale = minus_row_max_scale + self.p_fp8_prescale_log2
 
         ARV_COUNT = 4
@@ -2904,12 +2921,13 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         tTMEM_STORErS_x4_e_cvt = cute.logical_divide(
             tTMEM_STORErS_x4_e, cute.make_layout(CVT_PER_STEP)
         )
-        for i in cutlass.range_constexpr(0, FMA_COUNT, 2):
-            tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1] = cute.arch.fma_packed_f32x2(
-                (tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1]),
-                (scale, scale),
-                (minus_row_max_scale, minus_row_max_scale),
-            )
+        if cutlass.const_expr(self.p_exp_mode != "expcast"):
+            for i in cutlass.range_constexpr(0, FMA_COUNT, 2):
+                tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1] = cute.arch.fma_packed_f32x2(
+                    (tTMEM_LOADrS[i], tTMEM_LOADrS[i + 1]),
+                    (scale, scale),
+                    (minus_row_max_scale, minus_row_max_scale),
+                )
         vec_i_handle = si_corr_producer.acquire_and_advance(vec_i_peek_status)
         cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
         cute.arch.fence_view_async_tmem_store()
@@ -3040,7 +3058,6 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
             inplace_consumer,
         )
         return stats_args, pipeline_args
-
 
     # For both softmax0 and softmax1 warp group
     @cute.jit

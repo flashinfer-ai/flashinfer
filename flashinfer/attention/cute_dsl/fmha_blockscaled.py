@@ -176,7 +176,8 @@ def cute_dsl_fmha_blockscaled_prefill(
 
     ``p_exp_mode="expcast"`` opts into a direct approximate exponential-to-E4M3
     mapping with fixed beta=-0.35. It requires E4M3 V and uses the generated
-    FP8 weights for both PV and the denominator (including approximate LSE).
+    FP8 weights for PV, with FP16 partial sums reduced into the FP32 denominator
+    (including approximate LSE), using the shared Prims-TS encoding helpers.
     Expcast variants are JIT-only; the default retains artifact-first loading.
 
     The per-tensor scales accept a Python float or a 0-d tensor (as returned by the
