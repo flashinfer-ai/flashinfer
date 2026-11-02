@@ -1077,6 +1077,17 @@ def test_ctor_nccl_backend_never_touches_ipc_jit(gloo_pg, monkeypatch):
 
 
 @requires_cuda
+def test_ctor_legacy_element_capacity(gloo_pg, monkeypatch):
+    forbid_ipc_and_jit(monkeypatch)
+    comm = UlyssesCommunicator(
+        gloo_pg, max_elems=1024, dtype=torch.float16, backend="nccl"
+    )
+    assert comm.max_bytes == 1024 * torch.float16.itemsize
+    assert comm.max_elems == 1024
+    comm.close()
+
+
+@requires_cuda
 def test_ctor_auto_fallback_never_touches_ipc_jit(gloo_pg, monkeypatch):
     forbid_ipc_and_jit(monkeypatch)
     _patch_probe_mesh(monkeypatch, 1)
@@ -1110,6 +1121,13 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
         (dict(max_bytes="big", dtype=torch.float16), "max_bytes"),
         (dict(max_bytes=True, dtype=torch.float16), "max_bytes"),
         (dict(max_bytes=2**33, dtype=torch.float16), "int32"),
+        (dict(max_elems=0, dtype=torch.float16), "max_elems"),
+        (dict(max_elems=2**31, dtype=torch.float16), "max_elems"),
+        (
+            dict(max_bytes=2048, max_elems=1024, dtype=torch.float16),
+            "only one of max_bytes or max_elems",
+        ),
+        (dict(dtype=torch.float16), "either max_bytes or max_elems"),
         (dict(max_bytes=2048, dtype=torch.int32), "dtype"),
         (dict(max_bytes=2048, dtype="float16"), "dtype"),
         (dict(max_bytes=2048, dtype=torch.float16, device="cpu"), "CUDA device"),
@@ -1443,7 +1461,8 @@ def _worker_main(rank, world_size, rendezvous, body_name, arg, allow_skip, q):
     hardware limitation. Runtime init/JIT/IPC failures always FAIL, except
     that PCIe bodies pre-probe the verbs/mlx5 toolchain and re-raise a missing
     one as UlyssesBackendError so a machine without RDMA headers skips."""
-    body = globals()[body_name]
+    # Lowp tests reuse this runner with a top-level, spawn-safe callable.
+    body = body_name if callable(body_name) else globals()[body_name]
     outcome = None
     try:
         group = _init_pg(
@@ -1541,14 +1560,7 @@ def _destination_passing_body(rank, world_size, group, backend):
     for iteration in range(3):
         torch.manual_seed(1000 + iteration + rank)
         x = torch.randn(B, S_local, H, D, dtype=torch.bfloat16, device="cuda")
-        scatter_out = torch.empty(
-            B,
-            S_local * world_size,
-            H // world_size,
-            D,
-            dtype=x.dtype,
-            device=x.device,
-        )
+        scatter_out = comm.allocate_output(x, "scatter_heads")
         returned = comm.scatter_heads(x, out=scatter_out, workspace=workspace)
         ref = _ref_scatter_heads(x, world_size, rank, group)
         torch.cuda.synchronize()
@@ -1557,7 +1569,7 @@ def _destination_passing_body(rank, world_size, group, backend):
 
         torch.manual_seed(2000 + iteration + rank)
         y = torch.randn_like(scatter_out)
-        gather_out = torch.empty_like(x)
+        gather_out = comm.allocate_output(y, "gather_heads")
         returned = comm.gather_heads(y, out=gather_out, workspace=workspace)
         ref = _ref_gather_heads(y, world_size, rank, group)
         torch.cuda.synchronize()

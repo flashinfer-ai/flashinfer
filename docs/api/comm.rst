@@ -663,12 +663,39 @@ for the full integration)::
         o_ = attention(q_, k_, v_)
         o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
 
+Existing callers can continue passing ``max_elems=...`` instead of
+``max_bytes=...``; the constructor multiplies it by ``dtype.itemsize``.
+Pass only one capacity argument. ``comm.max_elems`` remains available in the
+construction dtype, while ``comm.max_bytes`` is the byte capacity used by the
+new packed-chunk API.
+
 Preallocated outputs and NCCL staging can be reused across serialized calls::
 
     workspace = comm.create_workspace()
     q_global = torch.empty(B, S_global, H_local, D,
                            dtype=q.dtype, device=q.device)
     comm.scatter_heads(q, out=q_global, workspace=workspace)
+
+**Packed chunk exchange.** ``exchange_chunks`` follows the byte-oriented
+communicator API: it accepts contiguous ``[1, 1, P, C]`` tensors, sends chunk
+``r`` to rank ``r``, and receives chunks in source-rank order. A packed Lowp
+payload uses ``dtype=torch.uint8``; this describes its existing encoding and
+does not quantize or cast it. The NCCL and NVLink backends use NCCL for
+this operation; the fused NVLink kernel applies only to ordinary head-layout
+transforms. The experimental PCIe backend retains its registered-output path.
+A one-rank exchange without an explicit output is an identity; explicit outputs
+must not overlap the input.
+
+For chunk exchange on NCCL or NVLink, ``allocate_output(x, "exchange_chunks",
+dtype=...)`` creates ordinary PyTorch receive storage. PCIe chunk outputs and
+NVLink Cake direct head-transform outputs follow the registration and lifetime
+rules described above. ``create_workspace(max_elems=...)`` and
+``UlyssesWorkspace`` retain their element-based staging capacities::
+
+    # send_u8: destination-major, contiguous uint8 [P, chunk_bytes].
+    chunks = send_u8.view(1, 1, P, -1)
+    received = comm.allocate_output(chunks, "exchange_chunks", dtype=torch.uint8)
+    comm.exchange_chunks(chunks, out=received, dtype=torch.uint8)
 
 .. autoclass:: UlyssesCommunicator
     :members:
@@ -681,6 +708,66 @@ Preallocated outputs and NCCL staging can be reused across serialized calls::
     :show-inheritance:
 
     .. automethod:: __init__
+
+Prepared Low-Precision QKV Exchange
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The public Lowp interface is :class:`UlyssesCommunicator` together with
+:class:`UlyssesQKVWorkspace` and :class:`UlyssesQKV`. Statistics, quantization
+and payload primitives are private implementation details. See the
+:download:`design document <../design_docs/ulysses_lowp.md>` for the numerical
+contract and kernel-level validation.
+
+``prepare_qkv`` is a collective preparation method; all ranks call it in the
+same order before attention. It allocates a dedicated mixed-dtype workspace
+from the local QKV shape. Ordinary ``create_workspace`` remains rank-local.
+``scatter_qkv`` currently supports the SageAttention2 encoding only::
+
+    # The original floating Q/K/V total is a conservative wire-byte budget.
+    with UlyssesCommunicator(group, max_bytes=3 * q.nbytes, dtype=q.dtype,
+                             device=q.device, backend="nccl") as comm:
+        workspace = comm.prepare_qkv(q.shape, used_sequence=used)
+        encoded = comm.scatter_qkv(q, k, v, workspace=workspace)
+        # A framework adapter calls Sage with encoded.q/k/v and the scales.
+        # It returns [B, P*L, H/P, D], in encoded.input_dtype, with a zero tail.
+        output = comm.gather_heads(sage_adapter(encoded))
+        # After the previous attention has consumed the buffers:
+        encoded = comm.scatter_qkv(q_next, k_next, v_next,
+                                   workspace=workspace, out=encoded)
+
+The result contains INT8 Q/K, FP8 E4M3 V, three FP32 scales, the Sage layout,
+logical and used sequence lengths, and the original input dtype. It accepts
+FP16/BF16 inputs on homogeneous SM90 or SM120 groups, D=64/128, and P=2/4/8.
+The last input dimension is dense and each row must be 16-byte aligned;
+projection views need not be fully contiguous. The input padding after the
+used global prefix must already be zero.
+
+Statistics use NCCL on the communicator's group. The packed payload goes
+through ``exchange_chunks``; its current NCCL and NVLink backend implementations
+both use NCCL without another layout conversion or payload copy.
+``workspace.transport`` reports that actual transport. Preparation checks NCCL
+capability even for an NVLink communicator. The prepared Lowp API accepts
+NCCL and NVLink communicators; it collectively rejects the experimental PCIe
+backend before JIT or workspace allocation.
+``max_bytes`` must cover the full combined Q/K/V payload, including scales and
+chunk alignment. Preparation computes and validates the exact requirement;
+one floating Q tensor's byte size is generally insufficient. The example's
+``3 * q.nbytes`` covers both supported layouts. NCCL preparation allocates the
+actual payload size, not the full budget. Statistics and final outputs are
+additional allocations, so ``max_bytes`` is not a total memory budget.
+
+``out=None`` returns independent storage. ``out=`` requires matching tensor
+geometry and metadata, including the exact used length and original dtype.
+Output fields must not overlap one another, inputs or workspace scratch.
+A workspace belongs to its creating communicator and cannot be used after
+that communicator closes. Calls are serialized on the current CUDA stream.
+Prepared QKV workspaces and ordinary staging workspaces are not interchangeable.
+
+.. autoclass:: UlyssesQKV
+    :members:
+
+.. autoclass:: UlyssesQKVWorkspace
+    :members:
 
 Head-Chunk Layout and Transport Primitives
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
