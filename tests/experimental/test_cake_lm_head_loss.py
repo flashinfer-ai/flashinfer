@@ -7020,20 +7020,26 @@ def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
     glm_weight, monkeypatch, last
 ):
     """Without zero-gradient rows (z = 0) a two-chunk backward under the skip gives the bits of the backward without
-    it: the partition runs, every row stays live, and ``dW`` and ``logp`` are bitwise those of the skip-off run.  A
-    last chunk of 650 or 1792 rows (``dw_cast_tma_rule`` holds) casts through the TMA cast's counted form
-    ``gemm_dw_cast_bf16_tma_dcnt``; 1793 rows (one row above the rule's bound, the negative control) takes the counted
-    per-thread cast, as the plan without the skip takes the per-thread cast."""
+    it: the partition runs, every row stays live, and ``dW`` and ``logp`` are bitwise those of the skip-off run.  One
+    ignored row makes the call compacted (the skip needs the forward's row index).  A last chunk of 650 or 1792 valid
+    rows (``dw_cast_tma_rule`` holds) casts through the TMA cast's counted form ``gemm_dw_cast_bf16_tma_dcnt``; 1793
+    rows (one row above the rule's bound, the negative control) takes the counted per-thread cast, as the plan without
+    the skip takes the per-thread cast."""
     _require_zero_dlogp_skip()
     module_name, record = cake_backend.record_for(CUDA)
     rows = cake_backend.DEFAULT_CHUNK_SIZE + last
-    inp = _device_inputs(rows, "ce", W=glm_weight, ignore_frac=0.0)
+    inp = _device_inputs(rows + 1, "ce", W=glm_weight, ignore_frac=0.0)
+    labels = inp.labels.clone()
+    # one ignored row: a compacted call of ``rows`` valid rows
+    labels[rows // 2] = -100
     dlogp = inp.dlogp
     inp = dataclasses.replace(
         inp,
+        labels=labels,
         dlogp=torch.where(dlogp == 0, torch.ones_like(dlogp), dlogp).contiguous(),
     )
-    assert bool((inp.labels >= 0).all()) and bool((inp.dlogp != 0).all())
+    valid = inp.labels >= 0
+    assert int(valid.sum()) == rows and bool((inp.dlogp[valid] != 0).all())
     partition = cake_backend.zero_dlogp_partition
     calls = []
 
@@ -7064,6 +7070,7 @@ def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
         assert skip_plan.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
     for key in ("logp", "dW"):
         assert _same_bits(nd[key], plain[key]), key
+    assert not bool(_bits(nd["dX"][~valid]).any())
     scale = float(plain["dX"].float().abs().max())
     dx_diff = float((nd["dX"].float() - plain["dX"].float()).abs().max())
     assert dx_diff <= scale * 2**-7, (dx_diff, scale)
