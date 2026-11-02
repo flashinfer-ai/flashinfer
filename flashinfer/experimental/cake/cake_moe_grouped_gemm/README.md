@@ -194,7 +194,7 @@ only); the 512-wide k tile's routes bind the unordered-tail builds.
 | `dgrad` probed queue split | yes | yes | - |
 | `wgrad` k256 `main` + ordered `tail_reduce` | yes | yes | yes |
 | `wgrad` k256 `main_wave` | yes | yes | - |
-| `wgrad` k512 unordered tail: `main`, `main_halves` | yes (planned walk) | yes (planned walk) | yes (planned walk, slack tail) |
+| `wgrad` k512 unordered tail: `main`, `main_halves` | yes (planned walk, slack tail) | yes (planned walk, slack tail) | yes (planned walk, slack tail) |
 | `wgrad` k512 unordered tail: `main_wave`, `main_wave_halves` (wp8) | yes | yes | - |
 | `wgrad` k512 unordered tail: `main_halves_k256t` | - | - | yes (slack tail) |
 | `wgrad` output dtypes | bf16, fp32 | bf16, fp32 | bf16, fp32 |

@@ -1955,17 +1955,48 @@ def _build_trtllm_moe_namespace(module):
             routing_metadata: TrtllmMoERoutingMetadataSlot,
             body_workspace: Sequence[torch.Tensor],
             **kwargs,
-        ) -> None:
-            """Launch one fixed body without routing, allocation, or DA policy lookup."""
+        ) -> List[Any]:
+            """Launch one fixed body without routing, allocation, or DA policy lookup.
+
+            Returns the native body outputs: the finalized output, or the FC2 output,
+            expert weights and expanded-to-permuted map when ``do_finalize`` is false.
+            """
             if body.tile_n != routing_metadata.tile_n:
                 raise ValueError("DA body and routing metadata tile_n must match")
-            self._moe_runner.forward(
+            return self._moe_runner.forward(
                 inputs,
                 tactic=[body.tile_n, body.tactic],
                 da_routing_metadata=routing_metadata.tensors(),
                 da_body_workspace=tuple(body_workspace),
                 **kwargs,
             )
+
+    def _run_fp4_body_from_routing_metadata(
+        moe_runner: "TrtllmMoERunner",
+        inputs: List[torch.Tensor],
+        runner_kwargs: Mapping[str, Any],
+        routing_metadata: TrtllmMoERoutingMetadataSlot,
+        *,
+        tactic: Any,
+        output: torch.Tensor,
+        do_finalize: bool,
+    ) -> List[torch.Tensor]:
+        """Launch the FP4 expert body from routing metadata populated by the caller."""
+        # Keep the tuned config only when it was chosen for the metadata's tile.
+        config = -1
+        if tactic != -1 and int(tactic[0]) == routing_metadata.tile_n:
+            config = int(tactic[1])
+        body = DABody(tactic=config, tile_n=routing_metadata.tile_n)
+        body_runner = DABodyRunner(moe_runner)
+        workspace = body_runner.prepare_body(
+            inputs, body, routing_metadata, **runner_kwargs
+        )
+        result = body_runner.forward_from_metadata(
+            inputs, body, routing_metadata, workspace, **runner_kwargs
+        )
+        if do_finalize:
+            return [output]
+        return [_torch_view_of_ffi_tensor(tensor) for tensor in result]
 
     class DAProfileRunner(TunableRunner):
         """Measure native replay preamble and typed body as one complete DA operation."""
@@ -3570,6 +3601,8 @@ def _build_trtllm_moe_namespace(module):
         workspace_buffer: Optional[torch.Tensor] = None,
         # 4over6 recipe (nvfp4_4over6_code()); the default reads the env.
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
+        routing_metadata: Optional[List[torch.Tensor]] = None,
+        routing_metadata_tile_n: int = -1,
     ) -> List[torch.Tensor]:
         if routing_logits is None:
             assert topk_ids is not None, (
@@ -3590,6 +3623,15 @@ def _build_trtllm_moe_namespace(module):
             num_experts,
             routing_method_type,
         )
+        if routing_metadata is not None and (
+            gemm1_lora_delta is not None
+            or n_fused_shared
+            or workspace_buffer is not None
+        ):
+            raise ValueError(
+                "routing_metadata supports neither gemm1_lora_delta, fused shared experts "
+                "nor workspace_buffer"
+            )
         total_experts_per_token = top_k + n_fused_shared
         # GEMM2's N (what the FC2 weights are sized for) and the narrower
         # caller-visible output width. They differ exactly when valid_hidden_size
@@ -3738,6 +3780,19 @@ def _build_trtllm_moe_namespace(module):
             moe_inputs.to_list(),
             **runner_kwargs,
         )
+
+        if routing_metadata is not None:
+            return _run_fp4_body_from_routing_metadata(
+                moe_runner,
+                moe_inputs.to_list(),
+                runner_kwargs,
+                TrtllmMoERoutingMetadataSlot(
+                    routing_metadata_tile_n, *routing_metadata
+                ),
+                tactic=tactic,
+                output=output,
+                do_finalize=do_finalize,
+            )
 
         def run_selected_tactic(tactic: Any) -> List[torch.Tensor]:
             """Launch the unchanged monolithic FP4 operation with one fixed tactic."""
@@ -3900,10 +3955,13 @@ def _build_trtllm_moe_namespace(module):
         workspace_buffer: Optional[torch.Tensor] = None,
         hidden_states_scale_layout: Optional[int] = None,
         nvfp4_4over6_code: int = NVFP4_4OVER6_CODE_FROM_ENV,
+        routing_metadata: Optional[List[torch.Tensor]] = None,
+        routing_metadata_tile_n: int = -1,
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out, valid_intermediate_size
         _ = hidden_states_scale_layout, nvfp4_4over6_code
+        _ = routing_metadata, routing_metadata_tile_n
         # Derive the padded hidden size exactly as the eager op does (NVFP4
         # activations arrive uint8-packed, two values per byte); GEMM2 then computes
         # roundUp(valid_hidden_size, 128) columns while finalize hands back only the
@@ -6883,6 +6941,7 @@ def trtllm_fp4_block_scale_routed_moe(
     hidden_states_scale_layout: Optional[SfLayout] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    routing_metadata: Optional[TrtllmMoERoutingMetadataSlot] = None,
 ) -> List[torch.Tensor]:
     """FP4 block scale MoE operation with pre-computed routing.
 
@@ -7070,6 +7129,21 @@ def trtllm_fp4_block_scale_routed_moe(
           no other path has a 4over6 requantization, so a pinned recipe
           raises :class:`ValueError`.
 
+    routing_metadata : Optional[TrtllmMoERoutingMetadataSlot]
+        A slot of routing metadata allocated with
+        :func:`trtllm_moe_allocate_routing_metadata_multi_tile` and already built
+        from ``topk_ids`` by :func:`populate_trtllm_moe_routing_metadata_`. When given, the call
+        skips the routing kernel and launches only the expert GEMMs with the
+        slot's tile, so the routing can run earlier, for example on another
+        stream while the activations are quantized. The caller must populate
+        the slot from the same ``topk_ids`` and order that population before
+        this call. Autotuning still profiles the ordinary routed operation,
+        routing included; the autotuned config is used only when the tuner chose
+        the slot's tile, otherwise that tile's default config runs. The body
+        allocates its own buffers. Not supported with ``gemm1_lora_delta``,
+        fused shared experts or ``workspace_buffer`` (``ValueError``).
+        Default ``None`` (route inside the call).
+
     Returns
     -------
     torch.Tensor or List[torch.Tensor]
@@ -7156,6 +7230,12 @@ def trtllm_fp4_block_scale_routed_moe(
         hidden_states_scale_layout,
         workspace_buffer=workspace_buffer,
         nvfp4_4over6_code=nvfp4_4over6_code_value,
+        routing_metadata=(
+            None if routing_metadata is None else list(routing_metadata.tensors())
+        ),
+        routing_metadata_tile_n=(
+            -1 if routing_metadata is None else routing_metadata.tile_n
+        ),
     )
 
 

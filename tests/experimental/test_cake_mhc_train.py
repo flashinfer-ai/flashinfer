@@ -26,15 +26,19 @@ token-owner pass as its programmatic dependent; it also clears ``dfn`` without
 ``accumulate``) and its atomic column-slab pass, which adds
 the ``dfn`` partial of every (column slab, token chunk) unit into ``dfn`` with
 FP32 reductions and folds ``dscale`` / ``dbase`` in fixed order; there is no
-reduction kernel.  ``dX``, ``dscale`` and ``dbase`` are the deterministic
-package's bits; each ``dfn`` element sums ``P`` per-chunk FP32 partials (``P``
-the column slab's chunk count: ``cake_jit.k7_chunks``, or the two-size
-geometry where ``cake_jit.lpt_chunks`` fires; at most 32) in an order that may
-change from run to run.  Every entry point takes ``deterministic=False`` (any
-other value is a ``ValueError``, checked without a device by
-``test_cake_mhc_train_rules.py``).  The deterministic package
-(``flashinfer.cake_mhc_det_train_backend``) is the same-input reference
-throughout, never a source of tolerances.  This module checks:
+reduction kernel.  ``dX`` is the deterministic package's bits, ``dscale`` and
+``dbase`` the bits of its per-CTA reduction (inside its group-row bands,
+``BWD_ROW_BANDS``, the deterministic package sums them in another fixed order,
+which this package does not copy: the reference there is its backward with
+those forms off, :func:`_det_backward`); each ``dfn`` element sums ``P``
+per-chunk FP32 partials (``P`` the column slab's chunk count:
+``cake_jit.k7_chunks``, or the two-size geometry where ``cake_jit.lpt_chunks``
+fires; at most 32) in an order that may change from run to run.  Every entry
+point takes ``deterministic=False`` (any other value is a ``ValueError``,
+checked without a device by ``test_cake_mhc_train_rules.py``).  The
+deterministic package (``flashinfer.cake_mhc_det_train_backend``) is the
+same-input reference throughout, never a source of tolerances.  This module
+checks:
 
 * accuracy against the FP64 reference of ``test_cake_mhc_det_train.py`` under
   its bars, on the worst of 5 launches of every draw: BF16 ``dX`` at atol =
@@ -44,7 +48,8 @@ throughout, never a source of tolerances.  This module checks:
   the saturated-sigmoid tail clause and the single-cast cancellation band in
   the deterministic suite's form;
 * against the deterministic backward on the same inputs: ``dX``, ``dscale``,
-  ``dbase`` bitwise; ``|dfn - dfn_det| <= F u (|carried| + 1.02 sum_t |dz'_t|
+  ``dbase`` bitwise (``dscale`` / ``dbase``: its per-CTA reduction's, as
+  above); ``|dfn - dfn_det| <= F u (|carried| + 1.02 sum_t |dz'_t|
   |x_t|)`` per element (``u = 2^-24``; the FP64 absolute-value contraction of
   the reference bounds the magnitude of every partial sum either order forms):
   ``F = 2 P`` where the column slab runs ``dynr`` or its slab-fastest copy
@@ -193,7 +198,8 @@ T_BENCH = (1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096, 8192, 14928, 15288, 1
 BF16, F32, F64 = torch.bfloat16, torch.float32, torch.float64
 _PARAMETER = ("dfn", "dscale", "dbase")
 _OUTPUTS = ("dX", "dfn", "dscale", "dbase")
-_EXACT = ("dX", "dscale", "dbase")  # bitwise the deterministic package's
+# Bitwise the deterministic package's (dscale / dbase: its per-CTA reduction's, _det_backward).
+_EXACT = ("dX", "dscale", "dbase")
 _ALERT = "does not have a deterministic implementation"
 SLAB = "cake_mhc_train_bwd_slab_atomic__dynr"
 LPT = "cake_mhc_train_bwd_slab_atomic__lpt"
@@ -690,8 +696,51 @@ def _nd_backward(i: dict, prep: dict, **kwargs) -> dict:
     return _backward(backward_finish, i, prep, deterministic=False, **kwargs)
 
 
+def _clear_det_caches() -> None:
+    """Drop the deterministic package's cached host plans, workspace envelopes, layouts and route plans (each binds
+    the token-owner and reduction forms and the parameter region of its token count)."""
+    det_loader.host_plan.cache_clear()
+    det_loader.workspace_bytes_upto.cache_clear()
+    det._LAYOUTS.clear()
+    det._PLANS.clear()
+    det._FAST_ROUTES.clear()
+
+
+@contextlib.contextmanager
+def _det_per_cta():
+    """The deterministic package with its group-row forms off (``cake_jit.bwd_group_rows`` False at every call): the
+    per-CTA token owner and reduction whose ``dscale`` / ``dbase`` this package's column slab reproduces.  Its caches
+    are dropped on entry and on exit, also when the body fails (:func:`_clear_det_caches`)."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(det_loader, "bwd_group_rows", lambda *_args, **_kwargs: False)
+        _clear_det_caches()
+        try:
+            yield
+        finally:
+            patch.undo()
+            _clear_det_caches()
+
+
 def _det_backward(i: dict, prep: dict, **kwargs) -> dict:
-    return _backward(det_backward_finish, i, prep, **kwargs)
+    """The deterministic backward of a case.  Where it runs its group-row forms (``cake_jit.bwd_group_rows`` of the
+    case's token count and hidden size on this device: ``BWD_ROW_BANDS``, which this package does not copy), its
+    ``dscale`` and ``dbase`` are overwritten in place with those of its per-CTA run (:func:`_det_per_cta`) on copies
+    of the call's arguments and a workspace of the per-CTA sizing; ``dX`` and ``dfn`` stay the shipped backward's."""
+    T, hidden = i["X"].shape[0], _hidden_of(i)
+    if not det_loader.bwd_group_rows(T, _sm_count(), _arch(), hidden):
+        return _backward(det_backward_finish, i, prep, **kwargs)
+    copies = {
+        k: v.clone() if isinstance(v, torch.Tensor) else v
+        for k, v in kwargs.items()
+        if k != "workspace"
+    }
+    out = _backward(det_backward_finish, i, prep, **kwargs)
+    with _det_per_cta():
+        ws = det.cake_mhc_det_train_backward_workspace(T, _device(), hidden=hidden)
+        per_cta = _backward(det_backward_finish, i, prep, workspace=ws, **copies)
+    for k in ("dscale", "dbase"):
+        out[k].copy_(per_cta[k])
+    return out
 
 
 def _snapshot(out: dict) -> dict:
@@ -1195,7 +1244,8 @@ def _matches_the_deterministic_backward(hidden: int, T: int) -> None:
 
 @pytest.mark.parametrize(("hidden", "T"), _hidden_cases(T_COMPARE, T_COMPARE_NEW))
 def test_matches_the_deterministic_backward(hidden: int, T: int) -> None:
-    """On the same inputs as the deterministic backward: ``dX``, ``dscale``, ``dbase`` bitwise; every ``dfn`` element
+    """On the same inputs as the deterministic backward: ``dX``, ``dscale``, ``dbase`` bitwise (``dscale`` / ``dbase``
+    against its per-CTA reduction where it runs its group-row forms, :func:`_det_backward`); every ``dfn`` element
     within ``F u sum_t |dz'_t| |x_t|`` (``F`` = :func:`_dfn_factor`: ``2 P`` under ``dynr`` / ``dynr_os``,
     ``2 max(P, P_k7) + 10`` where the column slab runs ``lpt`` / ``lpt_os`` at ``T`` on this device).  The launches
     alternate between the default workspace with fresh outputs and one caller workspace (non-ticket bytes 0xFF before
@@ -1350,9 +1400,9 @@ def test_two_size_schedule_at_forced_geometries(
     selection's column slab is that record, the only column slab ``backward_finish`` loads, launched over
     ``min(SMs, H / 64 x P)`` CTAs with ``slab_plan`` = the geometry.  On two launches -- fresh outputs on the default
     workspace, then NaN outputs (the carried-in values under ``accumulate``) on a caller workspace whose non-ticket
-    bytes are 0xFF -- ``dX``, ``dscale``, ``dbase`` are bitwise the deterministic backward's, every ``dfn`` element
-    lies within ``_dfn_factor(T, hidden) u (|carried| + sum_t |dz'_t| |x_t|)`` and the ticket region is zero; the
-    largest ratio to the bound is printed."""
+    bytes are 0xFF -- ``dX``, ``dscale``, ``dbase`` are bitwise the deterministic backward's (:func:`_det_backward`),
+    every ``dfn`` element lies within ``_dfn_factor(T, hidden) u (|carried| + sum_t |dz'_t| |x_t|)`` and the ticket
+    region is zero; the largest ratio to the bound is printed."""
     _require_lpt(hidden, order)
     arch, sm, index = _arch(), _sm_count(), _device().index
     forced_order(hidden, order)

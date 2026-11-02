@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import math
 import re
+import sys
 import threading
 import warnings
 from collections import OrderedDict
@@ -145,9 +146,23 @@ def use_deterministic_backend(module: ModuleType) -> None:
     cake_jit.bind_deterministic_package(module.__name__.rpartition(".")[0])
 
 
+# The module :func:`deterministic_backend` last resolved: ``(bound package, module name, module)``.
+_BOUND_BACKEND: tuple[Optional[str], str, Optional[ModuleType]] = (None, "", None)
+
+
 def deterministic_backend() -> ModuleType:
-    """The deterministic package's ``cake_backend`` module (see :func:`use_deterministic_backend`)."""
-    return cake_jit.deterministic_module("cake_backend")
+    """The deterministic package's ``cake_backend`` module (see :func:`use_deterministic_backend`).  Every call of
+    the convenience and prepared paths reads it: the module resolved last is returned while the bound package is the
+    same and ``sys.modules`` still holds it under its name (the module an import would return), so a call costs no
+    import-system lookup."""
+    global _BOUND_BACKEND
+    package = cake_jit._det_package
+    bound, name, module = _BOUND_BACKEND
+    if module is not None and bound == package and sys.modules.get(name) is module:
+        return module
+    module = cake_jit.deterministic_module("cake_backend")
+    _BOUND_BACKEND = (package, module.__name__, module)
+    return module
 
 
 def _det_entry(name: str) -> Callable[..., Any]:
@@ -243,7 +258,11 @@ ROUTER_BLOCK_K = 32  # fp32 elements per router K block
 K1_PAIR_ROWS = 256  # rows of a K1 tile (a CTA pair, 2 x 128)
 K1_BLOCK_K = 64  # K elements per K1 K block
 K1_COUNTER_WORDS = 512  # ticket words per K1 tile: 16 epilogue warp slices x 32 lanes
-K1_BLOCK_N_CHOICES = (64, 128, 256)
+K1_BLOCK_N_CHOICES = (64, 128, 192, 256)
+#: The tile widths of :data:`K1_BLOCK_N_CHOICES` this package runs as its row-major-store program, with the operands
+#: exchanged (:attr:`AtomicGemmPlan.out_t` false): a CTA pair's tile is 256 rows of the transposed-store launch's ``N``
+#: by ``block_n`` columns of its ``M``.  The other widths run as transposed-store programs.
+K1_ROW_MAJOR_BLOCK_N: tuple[int, ...] = (192,)
 
 # ---------------------------------------------------------------------------
 # K1 planner: the measured verdicts
@@ -254,13 +273,15 @@ K1_BLOCK_N_CHOICES = (64, 128, 256)
 # ``dW[d_out, d_in] = G[T, d_out].T @ X[T, d_in]`` has ``A = X``, ``B = G``, ``M = d_in``, ``N = d_out``, ``K = T``.
 
 #: Per-row verdicts of the K1 weight gradient, ``(arch, L, M, N, out_dtype) -> (block_n, num_splits)`` (this
-#: package's program with that tile width and split count) or ``-> None`` (the deterministic program); ``M`` / ``N``
-#: as above, ``out_dtype`` ``"bf16"`` or ``"f32"``.  A row carries a program only where that program was measured
+#: package's program with that tile width and split count; a width of :data:`K1_ROW_MAJOR_BLOCK_N` runs the row-major
+#: program with the operands exchanged) or ``-> None`` (the deterministic program); ``M`` / ``N`` as above,
+#: ``out_dtype`` ``"bf16"`` or ``"f32"``.  A row carries a program only where that program was measured
 #: faster than the deterministic package's shipped plan of the row in every measurement run: a one-sided paired sign
 #: test (p < 0.05) with a median time ratio below 0.99, in eager launches and in CUDA graph replays, at token counts
 #: 16172 to 16384, and no more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another
 #: stream.  A ``None`` entry is a measured row that missed; a row without an entry was not measured.  Both run the
-#: deterministic program.
+#: deterministic program.  On sm_100a and sm_103a parts of 152 SMs or more a verdict does not hold at the token counts
+#: of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`.
 # fmt: off
 K1_SPLIT_RULES: dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] = {
     # sm_100a: two splits of 64-wide tiles (one wave of the CTA pairs; two partials, bitwise reproducible).  d_out 128
@@ -319,6 +340,56 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
     ("sm_103a", 1, 4096, 48, "bf16"): 152,
     ("sm_103a", 1, 4096, 48, "f32"): 152,
 }
+#: Token counts at which a row of :data:`K1_SPLIT_RULES` on sm_100a / sm_103a does not take its verdict,
+#: ``key -> ((min_sm_count, min_tokens, max_tokens), ...)``: on a part of at least ``min_sm_count`` SMs, a token count
+#: (``K`` of the weight gradient) from ``min_tokens`` to ``max_tokens`` (``None``: no upper bound) runs the
+#: deterministic program; every other token count, and a part with fewer SMs, keeps the row's verdict.  The verdicts
+#: were measured at 16172 to 16384 tokens.  The entries come from a re-measurement at 512, 1024, 2048, 4096, 8192,
+#: 16231, 32768 and 65536 tokens on two 152-SM parts per row and token count (GB200, GB300; the strict runs of 8 GB300
+#: points ran on two other parts, four GB300 parts in all; the protocol is in the K1 token table of the README).  A
+#: measured token count is an entry where the split program failed in at least one run (the rule above; the backward
+#: pass or the checkpointed step more than 1.3 % slower than with the deterministic program; or the deterministic
+#: package's FP64 error budget missed with an error above the deterministic program's) and the deterministic program
+#: leaves the backward pass and the checkpointed step no more than 1.3 % slower, or where the split program's FP64 error
+#: (relative Frobenius error or BF16 error-budget ratio) exceeded the deterministic program's by more than 2 % for some
+#: seed on both parts.  A token count between two consecutive measured entries is an entry too (not measured), and so is
+#: every token count above 65536 of a row whose split program failed that FP64 comparison at 65536 tokens.  Unmeasured
+#: token counts keep the verdict: below 512, above 65536 (except those rows), between two measured token counts with
+#: different outcomes, and on parts with fewer than 152 SMs.
+# fmt: off
+K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
+    tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
+] = {
+    ("sm_100a", 1, 4096, 32, "bf16"): ((152, 512, 512),),
+    ("sm_100a", 1, 4096, 48, "bf16"): ((152, 512, 512),),
+    ("sm_100a", 1, 4096, 48, "f32"): ((152, 512, 512),),
+    ("sm_100a", 1, 4096, 64, "bf16"): ((152, 512, 512),),
+    ("sm_100a", 1, 4096, 64, "f32"): ((152, 512, 512),),
+    ("sm_100a", 1, 5120, 32, "bf16"): ((152, 512, 512),),
+    ("sm_100a", 1, 5120, 32, "f32"): ((152, 512, 512),),
+    ("sm_100a", 1, 5120, 48, "bf16"): ((152, 512, 2048),),
+    ("sm_100a", 1, 5120, 48, "f32"): ((152, 512, 2048),),
+    ("sm_100a", 1, 5120, 64, "bf16"): ((152, 512, 2048), (152, 8192, 8192)),
+    ("sm_100a", 1, 5120, 64, "f32"): ((152, 512, 2048), (152, 8192, 8192)),
+    ("sm_100a", 1, 6144, 32, "bf16"): ((152, 1024, 1024),),
+    ("sm_103a", 1, 4096, 32, "bf16"): ((152, 512, 512), (152, 65536, 65536)),
+    ("sm_103a", 1, 4096, 32, "f32"): ((152, 512, 512), (152, 32768, 65536)),
+    ("sm_103a", 1, 4096, 48, "bf16"): ((152, 512, 512), (152, 32768, 65536)),
+    ("sm_103a", 1, 4096, 48, "f32"): ((152, 512, 512), (152, 32768, 65536)),
+    ("sm_103a", 1, 5120, 32, "bf16"): ((152, 512, 512), (152, 32768, None)),
+    ("sm_103a", 1, 5120, 32, "f32"): ((152, 512, 512),),
+    ("sm_103a", 1, 5120, 48, "bf16"): ((152, 512, 2048), (152, 32768, None)),
+    ("sm_103a", 1, 5120, 48, "f32"): ((152, 512, 2048),),
+    ("sm_103a", 1, 5120, 64, "bf16"): ((152, 512, 2048), (152, 32768, None)),
+    ("sm_103a", 1, 5120, 64, "f32"): ((152, 512, 2048),),
+    ("sm_103a", 1, 5120, 128, "bf16"): ((152, 512, 8192), (152, 32768, None)),
+    ("sm_103a", 1, 5120, 128, "f32"): ((152, 512, 4096),),
+    ("sm_103a", 1, 6144, 32, "bf16"): ((152, 512, 512),),
+    ("sm_103a", 1, 6144, 32, "f32"): ((152, 512, 512),),
+    ("sm_103a", 1, 6144, 128, "bf16"): ((152, 512, 8192),),
+    ("sm_103a", 1, 6144, 128, "f32"): ((152, 512, 8192),),
+}
+# fmt: on
 #: Per-SM-count verdicts of the parts of an architecture with fewer SMs than its :data:`K1_MIN_SM_COUNT`,
 #: ``(arch, sm_count) -> {key: (block_n, num_splits) or None}`` (keys and values as in :data:`K1_SPLIT_RULES`, measured
 #: on parts of exactly that SM count under the same rule, in two jobs on different parts, at 16172 to 16384 tokens).
@@ -332,7 +403,9 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: more than 3 % slower than the deterministic plan in some graph replays behind a kernel holding 8 to 32 SMs.  Not
 #: faster than the deterministic plan in every run on 208 SMs (one of the parts runs at a lower SM clock):
 #: ``8192 -> 128``, ``4096 -> 4096`` FP32 and ``5120 -> 1024`` BF16; the last also runs the deterministic program on 212
-#: SMs, where it is 1.3 to 2.5 % faster.
+#: SMs, where it is 1.3 to 2.5 % faster.  On 212 SMs ``4096 -> 1024`` FP32 takes the 192-wide row-major program at one
+#: split (88 tiles of 256 ``d_out`` rows by 192 ``d_in`` columns, 176 CTAs, one wave next to a kernel holding 32 SMs),
+#: which keeps more SMs busy than the 128 CTAs of the 256-wide transposed tile.
 # fmt: off
 K1_SPLIT_RULES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]]
@@ -357,7 +430,7 @@ K1_SPLIT_RULES_BY_SM: dict[
         ("sm_107a", 1, 4096, 48, "f32"): (64, 3),
         ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
         ("sm_107a", 1, 4096, 512, "bf16"): None, ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
-        ("sm_107a", 1, 4096, 1024, "f32"): (256, 1),
+        ("sm_107a", 1, 4096, 1024, "f32"): (192, 1),
         ("sm_107a", 1, 4096, 4096, "f32"): (256, 1),
         ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 3),
         ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
@@ -394,14 +467,22 @@ def k1_plan(
     """``(block_n, num_splits)`` of this package's K1 program for the transposed-store launch ``out[l, n, m]``
     (``M``, ``N`` as in the comment above; ``K`` the token count) on a device of ``sm_count`` SMs, or ``None``: the
     row runs the deterministic program.  The row's verdict in :data:`K1_SPLIT_RULES` from the SM-count floor of the
-    row (:data:`K1_MIN_SM_COUNT`, :data:`K1_RULE_MIN_SM_COUNT`), below it the row's verdict in the table of
+    row (:data:`K1_MIN_SM_COUNT`, :data:`K1_RULE_MIN_SM_COUNT`) up, except at a ``K`` of the row's entries in
+    :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` (sm_100a / sm_103a); below the floor the row's verdict in the table of
     :data:`K1_SPLIT_RULES_BY_SM` for exactly ``sm_count``, only at a ``K`` of :data:`K1_SPLIT_RULES_BY_SM_TOKENS`; a row
-    without a verdict, every other ``K`` below the floor and a ``K`` too short for the split count
-    (:func:`k1_splits_fit`) run the deterministic program."""
+    without a verdict, a ``K`` of those entries, every other ``K`` below the floor and a ``K`` too short for the split
+    count (:func:`k1_splits_fit`) run the deterministic program."""
     key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
     floor = max(K1_MIN_SM_COUNT.get(arch, 0), K1_RULE_MIN_SM_COUNT.get(key, 0))
     if int(sm_count) >= floor:
         choice = K1_SPLIT_RULES.get(key)
+        for min_sms, lo, hi in K1_SPLIT_RULE_EXCLUDED_TOKENS.get(key, ()):
+            if (
+                int(sm_count) >= min_sms
+                and lo <= int(K)
+                and (hi is None or int(K) <= hi)
+            ):
+                choice = None
     elif K1_SPLIT_RULES_BY_SM_TOKENS[0] <= int(K) <= K1_SPLIT_RULES_BY_SM_TOKENS[1]:
         choice = K1_SPLIT_RULES_BY_SM.get((arch, int(sm_count)), {}).get(key)
     else:
@@ -415,17 +496,19 @@ def k1_plan(
 
 
 def k1_block_n(N: int) -> int:
-    """Column tile of a K1 launch with an explicit split count and no tile width: the choice of
+    """Column tile of a K1 launch with an explicit split count and no tile width: the transposed-store choice of
     :data:`K1_BLOCK_N_CHOICES` that pads ``N`` least (the wider tile on a tie)."""
-    return min(K1_BLOCK_N_CHOICES, key=lambda bn: (_ceil_div(N, bn) * bn, -bn))
+    widths = [bn for bn in K1_BLOCK_N_CHOICES if bn not in K1_ROW_MAJOR_BLOCK_N]
+    return min(widths, key=lambda bn: (_ceil_div(N, bn) * bn, -bn))
 
 
 def atomic_k1_template(block_n: int, out_f32: bool) -> str:
-    """The registry template of this package's K1 program (both operands MN-major, transposed store)."""
+    """The registry template of this package's K1 program (both operands MN-major): the transposed-store program of
+    the tile width, or the row-major-store one for a width of :data:`K1_ROW_MAJOR_BLOCK_N`."""
     return (
         f"{cake_jit.TEMPLATE_PREFIXES[0]}nn_n{int(block_n)}"
         + ("_f32" if out_f32 else "")
-        + "_t"
+        + ("" if int(block_n) in K1_ROW_MAJOR_BLOCK_N else "_t")
     )
 
 
@@ -437,10 +520,11 @@ def atomic_k1_template(block_n: int, out_f32: bool) -> str:
 @dataclass(frozen=True)
 class AtomicGemmPlan:
     """The host plan of one K1 launch of this package: the transposed-store GEMM ``out[l, n, m] = sum_k A[l, k, m]
-    B[l, k, n]`` over the ``[L, K, M]`` / ``[L, K, N]`` operand views, ``L x m_tiles x n_tiles`` tiles of
-    ``256 x block_n`` each cut into ``splits`` K ranges, walked persistently by at most ``sm_pairs`` CTA pairs.
-    ``transposed_out`` is the caller's: without it the caller's ``out[l, m, n]`` is this launch with the caller's
-    operands exchanged (``swapped``)."""
+    B[l, k, n]`` (``out_t``), or the row-major-store GEMM ``out[l, m, n]`` (``out_t`` false: the widths of
+    :data:`K1_ROW_MAJOR_BLOCK_N`), over the launch's ``[L, K, M]`` / ``[L, K, N]`` operand views, ``L x m_tiles x
+    n_tiles`` tiles of ``256 x block_n`` each cut into ``splits`` K ranges, walked persistently by at most ``sm_pairs``
+    CTA pairs.  ``M`` and ``N`` are the launch's.  ``transposed_out`` is the caller's: the launch takes the caller's
+    operands exchanged (``swapped``) when its store form differs from the caller's output layout."""
 
     L: int
     M: int
@@ -454,10 +538,11 @@ class AtomicGemmPlan:
     n_tiles: int
     sm_pairs: int
     template: str
+    out_t: bool = True
 
     @property
     def swapped(self) -> bool:
-        return not self.transposed_out
+        return self.transposed_out != self.out_t
 
     @property
     def tiles(self) -> int:
@@ -519,9 +604,10 @@ def plan_atomic_gemm(
     package's program does not take (dtypes, a K-major operand, extents not multiples of 8, an output row or batch
     stride not a multiple of 8 elements, an output not 16-byte aligned), a template this checkout does not register
     for ``arch``, or the planner (:func:`k1_plan`).  An explicit ``splits`` / ``block_n`` replaces the planner's
-    choice (the other one from the planner, else ``1`` split / :func:`k1_block_n`) and runs this package's program
-    whenever the view and the registry allow it.  Raises ``ValueError`` for inconsistent shapes (as the
-    deterministic planner does) and for an explicit choice the program cannot run."""
+    choice (the other one from the planner, else ``1`` split / :func:`k1_block_n`) and runs this package's program of
+    that width (the row-major-store program for a width of :data:`K1_ROW_MAJOR_BLOCK_N`) whenever the view and the
+    registry allow it.  Raises ``ValueError`` for inconsistent shapes (as the deterministic planner does) and for an
+    explicit choice the program cannot run."""
     det = deterministic_backend()
     A3, B3, O3 = (
         det.as_batched(A, "A"),
@@ -598,6 +684,10 @@ def plan_atomic_gemm(
     template = atomic_k1_template(bn, out_f32)
     if template not in cake_jit.KERNELS.get(arch, {}):
         return (*none, f"{template} is not registered for {arch}")
+    out_t = bn not in K1_ROW_MAJOR_BLOCK_N
+    if not out_t:
+        # the row-major-store launch: the transposed-store launch with its operands and extents exchanged
+        a_launch, b_launch, M_, N_ = b_launch, a_launch, N_, M_
     plan = AtomicGemmPlan(
         L=L,
         M=M_,
@@ -611,6 +701,7 @@ def plan_atomic_gemm(
         n_tiles=_ceil_div(N_, bn),
         sm_pairs=max(1, int(sm_count) // 2),
         template=template,
+        out_t=out_t,
     )
     return plan, a_launch, b_launch, O3, ""
 
@@ -678,7 +769,7 @@ def _k1_values(
 #: (64 tokens) unmeasured.  A token count outside the windows was not measured or missed, a ``None`` entry is a
 #: measured row that missed, a row without an entry was not measured: all of them run the deterministic program, and
 #: so does every window but a ``"waves"`` one on a device whose SM count is not the measured one,
-#: :data:`ROUTER_SM_COUNT`.
+#: :data:`ROUTER_SM_COUNT`, unless :data:`ROUTER_RULES_BY_SM` has a table for that SM count.
 # fmt: off
 ROUTER_RULES: dict[
     tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]
@@ -722,6 +813,32 @@ ROUTER_RULES: dict[
 #: window, which keeps the condition of :func:`router_waves` on every SM count (the plan of these rows before the
 #: windows).  An explicit ``splits`` is not affected.
 ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 216}
+#: Per-SM-count router verdicts of the parts of an architecture whose SM count is not :data:`ROUTER_SM_COUNT`,
+#: ``(arch, sm_count) -> {key: rule}`` (keys and rules as in :data:`ROUTER_RULES`, measured on parts of exactly that SM
+#: count under the same rule, in two jobs on different parts).  Such a part takes the table of its own SM count only:
+#: a row without an entry in it, and every token count outside its windows, runs the deterministic program.
+#: The sm_107a tables were measured on 208-SM and 212-SM R200 parts at 16172 to 16384 tokens: hidden 5120 takes
+#: "H0.5x4" there (104 head and 416 tail units on 208 SMs, 106 and 424 on 212); hidden 4096 and 6144 and the forward
+#: keep the deterministic plan, as on 216 SMs.
+# fmt: off
+ROUTER_RULES_BY_SM: dict[
+    tuple[str, int],
+    dict[tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]],
+] = {
+    ("sm_107a", 208): {
+        ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
+        ("sm_107a", "nn_t", 4096, 256): None,
+        ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+        ("sm_107a", "nn_t", 6144, 256): None,
+    },
+    ("sm_107a", 212): {
+        ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
+        ("sm_107a", "nn_t", 4096, 256): None,
+        ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+        ("sm_107a", "nn_t", 6144, 256): None,
+    },
+}
+# fmt: on
 #: The template suffix of the weight gradient's head/tail program (``router_fp32_gemm_atomic_nn_t`` + suffix): the
 #: head/tail partition on three TMEM chunk buffers, with register reallocation between its warpgroups.
 ROUTER_HEAD_TAIL_SUFFIX = "_ht_c3_nreg"
@@ -737,6 +854,19 @@ ROUTER_WAVE_K_BLOCKS = 68
 #: ... and only where the deterministic plan fills its last wave of CTA pairs below this fraction
 #: (``w / ceil(w)``, ``w = ROUTER_DET_WGRAD_SPLITS * tiles / pairs``).
 ROUTER_WAVE_MAX_DET_FILL = 0.8
+
+
+def router_rules(
+    arch: str, sm_count: int
+) -> tuple[dict[tuple[str, str, int, int], Any], bool]:
+    """``(rules, measured)``: the router verdicts a device of ``sm_count`` SMs takes -- the table of
+    :data:`ROUTER_RULES_BY_SM` for exactly ``(arch, sm_count)``, else :data:`ROUTER_RULES` -- and whether their
+    windows other than ``"waves"`` hold on it (always for a table of its own; for :data:`ROUTER_RULES` only on
+    :data:`ROUTER_SM_COUNT` SMs)."""
+    table = ROUTER_RULES_BY_SM.get((arch, int(sm_count)))
+    if table is not None:
+        return table, True
+    return ROUTER_RULES, int(sm_count) == ROUTER_SM_COUNT.get(arch)
 
 
 def router_waves(
@@ -894,6 +1024,21 @@ def _router_grid(M: int, N: int, K: int) -> tuple[int, int, int]:
     return m_tiles, _ceil_div(N, ROUTER_BLOCK_N), _ceil_div(K, ROUTER_BLOCK_K)
 
 
+def _router_rule_spec(
+    layout: str, *, arch: str, sm_count: int, M: int, N: int, K: int
+) -> Optional[Union[str, int]]:
+    """The verdict for the launched GEMM ``[M, N] = [M, K] @ [K, N]`` of the layout class ``layout`` (``kk`` /
+    ``nn_t``) in the router table of a device of ``arch`` with ``sm_count`` SMs (:func:`router_rules`: the table of
+    its own in :data:`ROUTER_RULES_BY_SM`, else :data:`ROUTER_RULES`): the row's spec, or the spec of its token window
+    that holds the token count (``K`` of the weight gradient, ``M`` of the forward).  ``None``: no verdict -- a launch
+    without a caller's split count runs the deterministic program (:func:`router_partition`)."""
+    hidden, tokens = (K, M) if layout == "kk" else (M, K)
+    rule = router_rules(arch, sm_count)[0].get((arch, layout, int(hidden), int(N)))
+    if isinstance(rule, tuple):  # token windows (min_tokens, max_tokens, spec)
+        return next((s for lo, hi, s in rule if lo <= int(tokens) <= hi), None)
+    return rule
+
+
 def router_partition(
     layout: str,
     *,
@@ -913,11 +1058,12 @@ def router_partition(
     * a caller's ``splits``: ``splits`` units per tile (``1``: every tile stored whole, the deterministic program's
       one-split bits -- the control of a measurement); the forward takes at most
       :data:`ROUTER_FORWARD_MAX_SPLITS`.
-    * otherwise the row's verdict in :data:`ROUTER_RULES`: the spec of its token window that holds the launch's token
-      count (``K`` of the weight gradient, ``M`` of the forward), on a device of :data:`ROUTER_SM_COUNT` SMs (a
-      ``"waves"`` window on every device where :func:`router_waves` gives a partition); a row, token count or SM
-      count without one, or a head/tail partition the token count cannot hold (:func:`router_partition_fits`), runs
-      the deterministic program.
+    * otherwise the row's verdict in :data:`ROUTER_RULES` (on a device with a table of its own in
+      :data:`ROUTER_RULES_BY_SM`, that table; :func:`router_rules`): the spec of its token window that holds the
+      launch's token count (``K`` of the weight gradient, ``M`` of the forward), on a device of
+      :data:`ROUTER_SM_COUNT` SMs or one with a table of its own (a ``"waves"`` window on every device where
+      :func:`router_waves` gives a partition); a row, token count or SM count without one, or a head/tail partition
+      the token count cannot hold (:func:`router_partition_fits`), runs the deterministic program.
 
     A forward partition must give every element at most two partials (:func:`router_at_most_two_partials`) and
     cannot be a head/tail partition: ``ValueError`` otherwise."""
@@ -940,15 +1086,10 @@ def router_partition(
             )
         spec = f"S{s}"
     else:
-        hidden, tokens = (K, M) if layout == "kk" else (M, K)
-        rule = ROUTER_RULES.get((arch, layout, int(hidden), int(N)))
-        if isinstance(rule, tuple):  # token windows (min_tokens, max_tokens, spec)
-            spec = next((s for lo, hi, s in rule if lo <= int(tokens) <= hi), None)
-        else:
-            spec = rule
+        spec = _router_rule_spec(layout, arch=arch, sm_count=sm_count, M=M, N=N, K=K)
         if spec == "waves":  # its own SM-count condition, on every SM count
             spec = router_waves(m_pairs, n_tiles, k_iters, sm_count)
-        elif int(sm_count) != ROUTER_SM_COUNT.get(arch):
+        elif not router_rules(arch, sm_count)[1]:
             return None
         if spec is None:
             return None
@@ -1153,14 +1294,101 @@ def plan_atomic_router(
     return plan, ""
 
 
+#: The geometry of a K2 call the convenience path reads once (one call per tensor attribute):
+#: ``(A.shape, B.shape, out.shape, A.stride(), B.stride(), (A.dtype, B.dtype, out.dtype))``.
+_K2Geometry = tuple
+
+
+def _k2_geometry(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor) -> _K2Geometry:
+    return (
+        A.shape,
+        B.shape,
+        out.shape,
+        A.stride(),
+        B.stride(),
+        (A.dtype, B.dtype, out.dtype),
+    )
+
+
+def _k2_geometry_without_verdict(
+    geometry: _K2Geometry, arch: str, sm_count: int
+) -> bool:
+    """:func:`_k2_row_without_verdict` of a call's :func:`_k2_geometry`."""
+    sa, sb, so, a_st, b_st, dtypes = geometry
+    f32 = torch.float32
+    if (
+        dtypes[0] != f32
+        or dtypes[1] != f32
+        or dtypes[2] != f32
+        or len(sa) != 2
+        or len(sb) != 2
+        or len(so) != 2
+    ):
+        return False
+    M, K = sa
+    Kb, N = sb
+    if Kb != K or so[0] != M or so[1] != N or min(M, K, N) < 1:
+        return False
+    # the planner's operand classes (_router_a_mn / _router_b_mn) from the strides
+    a_mn = False if a_st[1] == 1 else (True if a_st[0] == 1 else None)
+    b_mn = False if b_st[0] == 1 else (True if b_st[1] == 1 else None)
+    if a_mn is None or a_mn != b_mn:
+        return False
+    if a_mn:  # nn_t: the swapped launch [N, M] = [N, K] @ [K, M]
+        spec = _router_rule_spec("nn_t", arch=arch, sm_count=sm_count, M=N, N=M, K=K)
+    else:
+        spec = _router_rule_spec("kk", arch=arch, sm_count=sm_count, M=M, N=N, K=K)
+    return spec is None
+
+
+def _k2_row_without_verdict(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, arch: str, sm_count: int
+) -> bool:
+    """Whether :func:`plan_atomic_router` keeps a launch without a caller's split count on the deterministic program
+    for want of a verdict: valid 2-D fp32 views of the ``kk`` / ``nn_t`` class whose row has no spec on a device of
+    ``arch`` with ``sm_count`` SMs (:func:`_router_rule_spec` of the launched GEMM), when no other check of the
+    planner can give a plan.  ``False`` leaves the decision (and every refusal of an invalid binding) to the
+    planner."""
+    return _k2_geometry_without_verdict(_k2_geometry(A, B, out), arch, sm_count)
+
+
+def _k2_key(
+    index: int,
+    stream: int,
+    splits: Optional[int],
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    geometry: _K2Geometry,
+    out_ptr: int,
+) -> tuple:
+    """The convenience key of a K2 call (the deterministic package's ``convenience_key(index, stream, ("k2",
+    splits), A, B, out)``) from its :func:`_k2_geometry` and ``out``'s data pointer, read once."""
+    sa, sb, so, a_st, b_st, (da, db, do) = geometry
+    return (
+        int(index),
+        int(stream),
+        ("k2", splits),
+        (tuple(sa), a_st, da, A.storage_offset(), A.data_ptr() & 15),
+        (tuple(sb), b_st, db, B.storage_offset(), B.data_ptr() & 15),
+        (tuple(so), out.stride(), do, out.storage_offset(), out_ptr & 15),
+    )
+
+
 def _k2_views(
     A: torch.Tensor, B: torch.Tensor, plan: AtomicRouterPlan
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(a_view, split_src)``: the streamed operand as its ``[1, M, K]`` / ``[1, K, M]`` TMA span and the source of
-    the BF16x3 split of the second operand (the deterministic package's convention), after the swap."""
-    A_eff, B_eff = (B.t(), A.t()) if plan.swapped else (A, B)
-    split_src = B_eff if plan.b_mn else B_eff.t()
-    a_view = A_eff.t().unsqueeze(0) if plan.a_mn else A_eff.unsqueeze(0)
+    the BF16x3 split of the second operand (the deterministic package's convention), after the swap.  The swapped
+    operands are the transposes ``A_eff = B.t()``, ``B_eff = A.t()``, so ``A_eff.t()`` is ``B`` and ``B_eff.t()`` is
+    ``A``: each view is taken in at most two view operations of the caller's tensor (the same sizes, strides, storage
+    offset and data pointer as the views of the swapped operands)."""
+    if plan.swapped:
+        split_src = A.t() if plan.b_mn else A
+        a_view = (B if plan.a_mn else B.t()).unsqueeze(0)
+    else:
+        split_src = B if plan.b_mn else B.t()
+        a_view = (A.t() if plan.a_mn else A).unsqueeze(0)
     return a_view, split_src
 
 
@@ -1260,19 +1488,31 @@ class _OutFill:
     pitch: int
 
     def __call__(self, stream: int) -> None:
-        cu = _CU_DRIVER
-        if cu and torch.cuda.current_device() == self.index:
-            if self.rows == 1 or self.pitch == 4 * self.cols:
-                (status,) = cu.cuMemsetD32Async(
-                    self.ptr, 0, self.rows * self.cols, stream
-                )
-            else:
-                (status,) = cu.cuMemsetD2D32Async(
-                    self.ptr, self.pitch, 0, self.cols, self.rows, stream
-                )
-            if status == cu.CUresult.CUDA_SUCCESS:
-                return
-        self.out.zero_()
+        _fill_rows(
+            self.out, self.index, self.ptr, self.rows, self.cols, self.pitch, stream
+        )
+
+
+def _fill_rows(
+    out: torch.Tensor,
+    index: int,
+    ptr: int,
+    rows: int,
+    cols: int,
+    pitch: int,
+    stream: int,
+) -> None:
+    """The fill of :class:`_OutFill` with its fields given (the convenience path binds the geometry once per cached
+    launch and passes the caller's pointer on every call)."""
+    cu = _CU_DRIVER
+    if cu and torch.cuda.current_device() == index:
+        if rows == 1 or pitch == 4 * cols:
+            (status,) = cu.cuMemsetD32Async(ptr, 0, rows * cols, stream)
+        else:
+            (status,) = cu.cuMemsetD2D32Async(ptr, pitch, 0, cols, rows, stream)
+        if status == cu.CUresult.CUDA_SUCCESS:
+            return
+    out.zero_()
 
 
 def _out_fill(out: torch.Tensor, index: int) -> _OutFill:
@@ -1634,8 +1874,12 @@ def _atomic_k2(
 # stream) and zero again after every complete launch, so a launch needs no memset; the K1 split slots are zeroed when
 # allocated or grown (the last split reads the never-written padding columns of a partial tile and discards them) and
 # need no memset per launch either.  A row the planner keeps on the deterministic program is cached
-# as such and calls the deterministic package's convenience path.  After a launch that did not complete,
-# :func:`clear_convenience_caches` drops the arenas (fresh tickets on the next call).
+# as such and calls the deterministic package's convenience path; a K2 call without a split count whose row has no
+# verdict (:func:`_k2_row_without_verdict`) calls it without planning or caching its key here.  A K2 entry binds its
+# argument lists once (:class:`_K2Binding`: the plan's values in the program's order, the arena's BF16x3 stack carved
+# and converted once per arena growth), so a call converts only the caller's views and fills ``out`` with the bound
+# geometry.  After a launch that did not complete, :func:`clear_convenience_caches` drops the arenas (fresh tickets
+# on the next call).
 
 #: workspace kind -> (dtype, zeroed when allocated)
 _ATOMIC_ARENA_KINDS: dict[str, tuple[torch.dtype, bool]] = {
@@ -1702,11 +1946,95 @@ def _atomic_arena_for(index: int, stream: int, device: torch.device) -> _AtomicA
     return arena
 
 
+class _Arg:
+    """A per-call argument of a cached launch's argument template (a view of the caller's tensors, or the arena's
+    BF16x3 stack), replaced by its value when the launch is bound."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return f"_Arg({self.name!r})"
+
+
+#: The per-call arguments of a cached K2 launch, in the order of the views a call converts: the streamed operand's
+#: span, ``out`` as the store pointer and as the reduce-add map, the fused split's source.
+_K2_CALL_ARGS = (_Arg("A"), _Arg("out32"), _Arg("D"), _Arg("src"))
+_K2_PARTS_ARG = _Arg("parts")
+
+
+def _arg_slots(template: list) -> tuple[tuple[int, int], ...]:
+    """``(position, index into _K2_CALL_ARGS)`` of every per-call argument of a bound template."""
+    return tuple(
+        (i, _K2_CALL_ARGS.index(a)) for i, a in enumerate(template) if type(a) is _Arg
+    )
+
+
+@dataclass
+class _K2Binding:
+    """The bound arguments of a cached K2 launch: the kernel's and the fused split's argument lists in the order of
+    their argument plans (fixed by the plan and the view geometry of the cache key), with the arena's BF16x3 stack
+    carved and converted once per arena growth (``version``) and the caller's views left as ``slots``; the geometry of
+    the zero fill of ``out`` (rows, columns, row pitch in bytes; ``None`` without part tiles)."""
+
+    kernel_template: list
+    split_template: Optional[list]
+    split_shape: tuple[int, ...]
+    fill: Optional[tuple[int, int, int]]
+    out_contiguous: bool
+    version: int = -1
+    parts: Optional[torch.Tensor] = None
+    resid: Optional[torch.Tensor] = None
+    kernel_args: list = field(default_factory=list)
+    kernel_slots: tuple[tuple[int, int], ...] = ()
+    split_args: list = field(default_factory=list)
+    split_slots: tuple[tuple[int, int], ...] = ()
+
+    def carve(self, arena: "_AtomicArena", torch_chain: bool) -> None:
+        """Carve the BF16x3 stack (and the torch chain's fp32 scratch) out of ``arena`` and bind the stack into the
+        argument lists (called under the arena's lock when the arena grew since the last carve)."""
+        # the version is read before carving: a growth that interleaves leaves the binding stale
+        version = arena.version
+        n = math.prod(self.split_shape)
+        self.parts = arena.buffers["k2_stack"][: 3 * n].view(3, *self.split_shape)
+        self.resid = (
+            arena.buffers["k2_split_scratch"][:n].view(self.split_shape)
+            if torch_chain
+            else None
+        )
+        parts = tvm_ffi.from_dlpack(self.parts, require_contiguous=False)
+        self.kernel_args = [
+            parts if a is _K2_PARTS_ARG else a for a in self.kernel_template
+        ]
+        self.kernel_slots = _arg_slots(self.kernel_args)
+        if self.split_template is not None:
+            self.split_args = [
+                parts if a is _K2_PARTS_ARG else a for a in self.split_template
+            ]
+            self.split_slots = _arg_slots(self.split_args)
+        self.version = version
+
+    def arguments(self, views: tuple) -> tuple[list, Optional[list]]:
+        """The kernel's and the fused split's argument lists of one call: the bound lists with the call's converted
+        views (in the order of :data:`_K2_CALL_ARGS`) in place (``None``: no fused split)."""
+        kernel = self.kernel_args.copy()
+        for i, k in self.kernel_slots:
+            kernel[i] = views[k]
+        if self.split_template is None:
+            return kernel, None
+        split = self.split_args.copy()
+        for i, k in self.split_slots:
+            split[i] = views[k]
+        return kernel, split
+
+
 @dataclass
 class _CachedAtomic:
     """A planned launch of the convenience path: the plan (``None``: the row runs the deterministic program), the
     program entry and argument plan, the arena of its (device, stream) and, for K2, the fused split's module with its
-    entry and argument plan."""
+    entry and argument plan, and the bound arguments (:class:`_K2Binding`)."""
 
     plan: Any
     arch: str = ""
@@ -1717,6 +2045,7 @@ class _CachedAtomic:
     split_module: Optional[str] = None
     split_entry: Optional[Callable[..., Any]] = field(default=None, repr=False)
     split_arg_plan: Optional[list] = field(default=None, repr=False)
+    k2: Optional[_K2Binding] = field(default=None, repr=False)
 
 
 def _release_atomic_entry(entry: _CachedAtomic) -> None:
@@ -1822,6 +2151,48 @@ def _launch_cached_atomic_k1(
     return out
 
 
+def _k2_binding(
+    plan: AtomicRouterPlan,
+    out: torch.Tensor,
+    split_src: torch.Tensor,
+    module_name: str,
+    arg_plan: list,
+    split_module: Optional[str],
+    split_arg_plan: Optional[list],
+) -> _K2Binding:
+    """The :class:`_K2Binding` of a planned K2 launch (its argument lists ordered once, fail-closed as
+    :func:`_order_atomic_arguments`: the values a call of the key passes, with the per-call views as
+    :data:`_K2_CALL_ARGS`)."""
+    a_arg, out32_arg, d_arg, src_arg = _K2_CALL_ARGS
+    values = _k2_values(plan, A=a_arg, parts=_K2_PARTS_ARG, out=out)
+    values.update(out32=out32_arg, D=d_arg)
+    kernel_template = _order_atomic_arguments(module_name, arg_plan, values, plan.grid)
+    split_template = None
+    n = split_src.numel()
+    if split_module is not None:
+        det = deterministic_backend()
+        split_template = _order_atomic_arguments(
+            split_module,
+            split_arg_plan,
+            det._split_values(src_arg, _K2_PARTS_ARG, n),
+            det._split_grid(n),
+        )
+    fill = None
+    if plan.part_tiles:
+        fill = (
+            int(out.shape[0]),
+            int(out.shape[1]),
+            int(out.stride(0)) * out.element_size(),
+        )
+    return _K2Binding(
+        kernel_template=kernel_template,
+        split_template=split_template,
+        split_shape=tuple(int(s) for s in split_src.shape),
+        fill=fill,
+        out_contiguous=out.is_contiguous(),
+    )
+
+
 def _launch_cached_atomic_k2(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1830,15 +2201,30 @@ def _launch_cached_atomic_k2(
     splits: Optional[int],
 ) -> torch.Tensor:
     det = deterministic_backend()
-    device = det._same_cuda_device(A, B, out)
-    index = det._device_index(device)
+    # the call's geometry is read once (one call per tensor attribute) for the checks and the key below
+    index = out.get_device()
+    if index < 0 or A.get_device() != index or B.get_device() != index:
+        # A, B and out are not on one CUDA device: raises
+        det._same_cuda_device(A, B, out)
+    geometry = _k2_geometry(A, B, out)
+    if splits is None:
+        # a row without a verdict runs the deterministic program: call it without planning (or caching) the key here
+        facts = det.device_facts(out.device)
+        if facts.arch is not None and _k2_geometry_without_verdict(
+            geometry, facts.arch, facts.sm_count
+        ):
+            return getattr(det, DETERMINISTIC_NAMES["router_fp32_gemm"])(
+                A, B, out, splits=None
+            )
     stream = det._current_raw_stream(index)
-    key = det.convenience_key(index, stream, ("k2", splits), A, B, out)
+    out_ptr = out.data_ptr()
+    key = _k2_key(index, stream, splits, A, B, out, geometry, out_ptr)
     entry = det._cache_get(_K2_ATOMIC_CACHE, key)
     if entry is None:
         with _ATOMIC_PLAN_LOCK:
             entry = det._cache_get(_K2_ATOMIC_CACHE, key)
             if entry is None:
+                device = out.device
                 arch = det.require_arch(device)
                 plan, _ = plan_atomic_router(
                     A,
@@ -1869,6 +2255,17 @@ def _launch_cached_atomic_k2(
                             record["ffi_entry"],
                         )
                         split_arg_plan = det.arg_plan_of(record)
+                    if plan.part_tiles:
+                        _cu_driver()
+                    binding = _k2_binding(
+                        plan,
+                        out,
+                        split_src,
+                        module_name,
+                        arg_plan,
+                        split_module,
+                        split_arg_plan,
+                    )
                     entry = _CachedAtomic(
                         plan=plan,
                         arch=arch,
@@ -1879,44 +2276,47 @@ def _launch_cached_atomic_k2(
                         split_module=split_module,
                         split_entry=split_fn,
                         split_arg_plan=split_arg_plan,
+                        k2=binding,
                     )
                 entry = _cache_insert(_K2_ATOMIC_CACHE, key, entry)
     plan = entry.plan
     if plan is None:
-        return _det_entry("router_fp32_gemm")(A, B, out, splits=splits)
+        return getattr(det, DETERMINISTIC_NAMES["router_fp32_gemm"])(
+            A, B, out, splits=splits
+        )
     a_view, split_src = _k2_views(A, B, plan)
-    arena, fn = entry.arena, entry.entry
-    assert arena is not None and fn is not None
+    arena, fn, bound = entry.arena, entry.entry, entry.k2
+    assert arena is not None and fn is not None and bound is not None
+    split_fn = entry.split_entry
     # the split, the memset and the kernel share the arena's BF16x3 stack
     with arena.lock:
-        n = split_src.numel()
-        parts = arena.buffers["k2_stack"][: 3 * n].view(3, *split_src.shape)
-        if entry.split_module is None:
-            resid = arena.buffers["k2_split_scratch"][:n].view(split_src.shape)
-            det.split_fp32_to_bf16x3_det_(split_src, parts, resid)
-        # the arguments are converted and the fill bound before the first launch: the launches go back to back
-        values = _k2_values(plan, A=a_view, parts=parts, out=out)
-        arguments = _ffi_tensors(
-            _order_atomic_arguments(
-                entry.module_name, entry.arg_plan, values, plan.grid
-            )
+        if bound.version != arena.version:
+            bound.carve(arena, split_fn is None)
+        if split_fn is None:
+            det.split_fp32_to_bf16x3_det_(split_src, bound.parts, bound.resid)
+        # the caller's views are converted before the first launch (the launches go back to back) into the argument
+        # lists bound when the key was planned; ``out`` is converted once for both of its arguments
+        out_ffi = tvm_ffi.from_dlpack(out, require_contiguous=False)
+        views = (
+            tvm_ffi.from_dlpack(a_view, require_contiguous=False),
+            out_ffi
+            if bound.out_contiguous
+            else tvm_ffi.from_dlpack(det.flat_alias(out), require_contiguous=False),
+            out_ffi,
+            None
+            if split_fn is None
+            else tvm_ffi.from_dlpack(split_src, require_contiguous=False),
         )
-        split_arguments = None
-        if entry.split_entry is not None:
-            split_arguments = _ffi_tensors(
-                _order_atomic_arguments(
-                    entry.split_module,
-                    entry.split_arg_plan,
-                    det._split_values(split_src, parts, n),
-                    det._split_grid(n),
-                )
-            )
-        fill = _out_fill(out, index) if plan.part_tiles else None
+        arguments, split_arguments = bound.arguments(views)
+        fill = bound.fill
+        if fill is not None and _CU_DRIVER is None:
+            _cu_driver()
         with det._ffi_stream_context(index, stream):
-            if split_arguments is not None:
-                entry.split_entry(*split_arguments)
+            if split_fn is not None and split_arguments is not None:
+                split_fn(*split_arguments)
             if fill is not None:
-                fill(stream)
+                rows, cols, pitch = fill
+                _fill_rows(out, index, out_ptr, rows, cols, pitch, stream)
             fn(*arguments)
     return out
 
@@ -2264,8 +2664,9 @@ def router_wgrad(
 ) -> torch.Tensor:
     """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store;
     ``splits`` defaults to the deterministic package's production count (6), or with ``deterministic=False`` to the
-    partition of the row's verdict in :data:`ROUTER_RULES` (:func:`router_partition`; a row or token count without
-    one runs the deterministic program)."""
+    partition of the row's verdict in :data:`ROUTER_RULES` or, on a part with a table of its own, in
+    :data:`ROUTER_RULES_BY_SM` (:func:`router_partition`; a row or token count without one runs the deterministic
+    program)."""
     if _resolve_deterministic(deterministic, "router_wgrad"):
         return _det_entry("router_wgrad")(G, X, out, **_splits_kw(splits))
     if out is None:

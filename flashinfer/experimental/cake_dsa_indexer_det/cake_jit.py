@@ -728,6 +728,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "pair_rule": [128.0, 256.0, 512],
         "pair_units": ["l6"],
         "l6_solo_rule": None,
+        "l6_solo_unsampled_max_queries": 16384,
         "wide_pair_snake_only": False,
         "snake_default": False,
         "snake_rule": None,
@@ -804,6 +805,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "pair_rule": [64.0, 1024.0, 512],
         "pair_units": ["l6"],
         "l6_solo_rule": None,
+        "l6_solo_unsampled_max_queries": 16384,
         "wide_pair_snake_only": False,
         "snake_default": False,
         "snake_rule": None,
@@ -880,6 +882,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "pair_rule": [0.0, 4096.0, 512],
         "pair_units": ["l6", "narrow", "wide"],
         "l6_solo_rule": [128.0, 2],
+        "l6_solo_unsampled_max_queries": None,
         "wide_pair_snake_only": True,
         "snake_default": False,
         "snake_rule": [

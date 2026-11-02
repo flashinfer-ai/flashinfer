@@ -45,7 +45,10 @@ from . import jit as _jit
 _FUSED_RANKS: tuple[int, ...] = (1, 1, 1, 3, 2, 3, 3, 1, 3, 2, 3, 3, 1, 1)
 _FUSED_RANKS += (1,) * 14
 _REDUCE_RANKS = (1, 1)
-_FUSED_GRID = (144, 1, 1)  # 72 two-CTA clusters, all co-resident
+# CTAs of each architecture's generated fused program: two-CTA clusters, all
+# co-resident, one CTA per SM. The program's static schedule fixes the grid:
+# 72 clusters, or 104 on sm_107a. The grid size also bounds the launch epoch.
+FUSED_GRID_CTAS: dict[str, int] = {"sm_100a": 144, "sm_103a": 144, "sm_107a": 208}
 _REDUCE_THREADS = 128  # eight hidden columns per thread
 _PEER_CAPACITY = 32
 
@@ -194,6 +197,10 @@ class _Runner:
             raise ValueError("CuTe-DSL requires the 66-word rank-barrier workspace")
         self._device = device
         self._tokens = tokens_per_rank
+        arch = _jit.device_arch(
+            _jit.require_cute_dsl_capability(torch.cuda.get_device_capability(device))
+        )
+        self._grid_ctas = FUSED_GRID_CTAS[arch]
         # Keep the symmetric handles, original tensors, and all views alive.
         self._weights = weights
         self._workspace = workspace
@@ -238,7 +245,9 @@ class _Runner:
             _peer_table(w.published_topk_weights),
             route_terms,
             _peer_table(w.route_terms),
-            *_FUSED_GRID,
+            self._grid_ctas,
+            1,
+            1,
         )
         self._output = w.output_bf16
         reduce_grid = tokens_per_rank * 3072 // 8 // _REDUCE_THREADS
@@ -283,7 +292,7 @@ class _Runner:
         launch_epoch: int,
         out: torch.Tensor,
     ) -> None:
-        _backend._validate_launch_epoch(launch_epoch)
+        _backend._validate_launch_epoch(launch_epoch, self._grid_ctas)
         if out.data_ptr() != self._output.data_ptr():
             raise ValueError("CuTe-DSL output must alias the session workspace")
         tensors = (hidden_states, topk_ids, topk_weights)
