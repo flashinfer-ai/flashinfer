@@ -8364,9 +8364,10 @@ PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
 # and 7168).  The column slab (K6->K7, checkpoint) is on in (2048, 4096] at
 # hidden 4096 (the checkpointed step 0.80 us faster at 2304, 16 of 16; 0.25 us
 # at 2560, 15 of 16) and from 2048 tokens at 5120 (1.13 us at 2048 and 0.86 us
-# at 2304, 16 of 16; 3.51 us at 8192, 12 of 16), and off from 705 tokens at
-# 7168 (2.20 us at 1024, 16 of 16); at 7168 the band stops at 8192 because the
-# gains above it did not repeat.
+# at 2304, 16 of 16; 3.51 us at 8192, 12 of 16), and off from 897 tokens at
+# 7168 (0.68..2.86 us faster from 913 to 1024 tokens, 15 or 16 of 16; from 705
+# to 897 tokens off gained nothing and lost up to 0.52 us); at 7168 the band
+# stops at 8192 because the gains above it did not repeat.
 # GB200 (sm_100a, 152 SMs), sm_103a and sm_107a are not measured and keep
 # PDL_OFF_BANDS.
 PDL_BAND_OVERRIDES: dict[
@@ -8393,7 +8394,7 @@ PDL_BAND_OVERRIDES: dict[
     },
     ("sm_100a", 148, 7168): {
         "K6->K7": {
-            "checkpoint": ((704, 8192),),
+            "checkpoint": ((896, 8192),),
         },
     },
 }

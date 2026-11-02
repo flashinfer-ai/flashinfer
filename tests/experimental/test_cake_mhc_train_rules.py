@@ -910,7 +910,7 @@ PDL_OVERRIDES = {
     },
     ("sm_100a", 148, 4096): {"K6->K7": {"checkpoint": ((1024, 2048), (4096, 8192))}},
     ("sm_100a", 148, 5120): {"K6->K7": {"checkpoint": ((1024, 2047),)}},
-    ("sm_100a", 148, 7168): {"K6->K7": {"checkpoint": ((704, 8192),)}},
+    ("sm_100a", 148, 7168): {"K6->K7": {"checkpoint": ((896, 8192),)}},
 }
 # The boards the per-call PDL argument is checked on: the boards of record and GB200 (sm_100a with 152 SMs).
 PDL_BOARDS = (*det.RULES_BOARDS, ("sm_100a", 152))
@@ -927,7 +927,7 @@ PDL_POINTS = (
     (4096, "K6->K7", "checkpoint", 2049, 1, 0), (4096, "K6->K7", "checkpoint", 4096, 1, 0),
     (4096, "K6->K7", "checkpoint", 4097, 0, 0), (5120, "K6->K7", "checkpoint", 2047, 0, 0),
     (5120, "K6->K7", "checkpoint", 2048, 1, 0), (5120, "K6->K7", "checkpoint", 8192, 1, 0),
-    (7168, "K6->K7", "checkpoint", 704, 1, 1), (7168, "K6->K7", "checkpoint", 705, 0, 1),
+    (7168, "K6->K7", "checkpoint", 896, 1, 1), (7168, "K6->K7", "checkpoint", 897, 0, 1),
     (7168, "K6->K7", "checkpoint", 1024, 0, 1), (7168, "K6->K7", "checkpoint", 8192, 0, 0),
     (7168, "K6->K7", "checkpoint", 8193, 1, 1),
 )  # fmt: skip
