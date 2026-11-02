@@ -219,6 +219,13 @@ struct Data {
   // Only read when one of the pointers above is set.
   int32_t const* ctaIdxXyToBatchIdx = nullptr;
   int32_t tileTokensDim{0};
+
+  // Row-parallel DeepSeek FP8 activation (activationDeepSeekKernelV2): the permuted row -> token
+  // map (-1 for the padding rows inside an expert's last tile) and the row count of the permuted
+  // buffers (the allocation bound; the live count is *totalNumPaddedTokens, on the device). When
+  // the pointer is null or the count is 0 the pair-parallel activationDeepSeekKernel runs instead.
+  int32_t const* permutedIdxToTokenIdx = nullptr;
+  int32_t totalMaxPaddedTokens{0};
 };
 
 template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
@@ -247,6 +254,9 @@ struct KernelParams {
   int32_t const* ctaIdxXyToBatchIdx = nullptr;
   int32_t tileTokensDim{0};
 
+  int32_t const* permutedIdxToTokenIdx = nullptr;
+  int32_t totalMaxPaddedTokens{0};
+
   static KernelParams setKernelParams(Data const& data) {
     KernelParams params;
 
@@ -268,6 +278,9 @@ struct KernelParams {
     params.gatedActClampLimitPtr = data.gatedActClampLimitPtr;
     params.ctaIdxXyToBatchIdx = data.ctaIdxXyToBatchIdx;
     params.tileTokensDim = data.tileTokensDim;
+
+    params.permutedIdxToTokenIdx = data.permutedIdxToTokenIdx;
+    params.totalMaxPaddedTokens = data.totalMaxPaddedTokens;
 
     return params;
   }
