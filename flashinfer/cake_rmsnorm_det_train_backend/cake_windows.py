@@ -499,12 +499,12 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
         "bwd_h5120": (
             (0, 4096, "cake_rmsnorm_det_train_838c077df3a6d35d55b7"),
             (4096, 19968, "cake_rmsnorm_det_train_6816fb80e97380f1bcbc"),
-            (19968, None, "cake_rmsnorm_det_train_fbe20dbb79637adb019a"),
+            (19968, None, "cake_rmsnorm_det_train_47da668e7e96652f840b"),
         ),
         "bwd_w32_h5120": (
             (0, 4096, "cake_rmsnorm_det_train_cd612de56c0985bb4caa"),
             (4096, 19968, "cake_rmsnorm_det_train_468cc4d1b8128187b4b3"),
-            (19968, None, "cake_rmsnorm_det_train_6cc2c92c1ce973e25c90"),
+            (19968, None, "cake_rmsnorm_det_train_de0cf457cd240f9c6422"),
         ),
         "bwd_h6144": (
             (0, 19456, "cake_rmsnorm_det_train_5d292172df772adb17ae"),
@@ -819,8 +819,8 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
         ),
         "bwd_h512": ((1024, "same"), (4096, "same"), (16384, "unmeasured")),
         "bwd_w32_h512": ((1024, "same"), (4096, "same"), (16384, "unmeasured")),
-        "bwd_h5120": ((4096, "unmeasured"), (19968, "same")),
-        "bwd_w32_h5120": ((4096, "unmeasured"), (19968, "same")),
+        "bwd_h5120": ((4096, "unmeasured"), (19968, "unmeasured")),
+        "bwd_w32_h5120": ((4096, "unmeasured"), (19968, "unmeasured")),
         "bwd_h6144": ((19456, "same"),),
         "bwd_w32_h6144": ((19456, "same"),),
         "bwd_residual_h6144": (),
@@ -1177,8 +1177,8 @@ its own windows.
   (1024, 4096] d41a514f = (4096, 24064] ee4a9053 = (24064, inf) 99a01f2a
 * ``sm_107a`` ``bwd_h512``: (0, 1024] 3feed502 = (1024, 4096] 3feed502 =
   (4096, 16384] dfaf378a ? (16384, inf) eb141cc9
-* ``sm_107a`` ``bwd_h5120``: (0, 4096] 838c077d ? (4096, 19968] 6816fb80 =
-  (19968, inf) fbe20dbb
+* ``sm_107a`` ``bwd_h5120``: (0, 4096] 838c077d ? (4096, 19968] 6816fb80 ?
+  (19968, inf) 47da668e
 * ``sm_107a`` ``bwd_h6144``: (0, 19456] 5d292172 = (19456, inf) 19e18371
 * ``sm_107a`` ``bwd_residual_h6144``: (0, inf) 0dcdc563
 """
