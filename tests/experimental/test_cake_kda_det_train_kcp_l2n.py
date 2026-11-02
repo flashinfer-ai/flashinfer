@@ -370,6 +370,56 @@ def _snapshot(kw: dict, H: int = 4) -> dict:
     return _jsonable(snap)
 
 
+# The literal flag-off expectations of :func:`_snapshot` ({}), captured once by executing the base of this change on
+# the CPU (no CUDA device: the byte queries plan for the first exported architecture) with this file copied onto it:
+# ``_golden_view(_snapshot({}))``.  The capture's provenance is under ``"captured"``.
+GOLDEN_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "test_cake_kda_det_train_kcp_l2n_golden.json",
+)
+
+
+def _golden_view(snap: dict) -> dict:
+    """The parts of a :func:`_snapshot` the golden file holds: the graph keys' kind, flags and key tensor count, the
+    fingerprint modes of both tiers, the saved set's tensor roles, flags and meta keys, the saved and workspace bytes
+    and the existing backend's plan / byte calls behind the workspace query."""
+    return {
+        "graph_keys": [
+            [k["kind"], k["flags"], len(k["tensors"])] for k in snap["graph_keys"]
+        ],
+        "fingerprint_modes": {
+            keep: dict(fp)["modes"] for keep, fp in sorted(snap["fingerprints"].items())
+        },
+        "saved_roles": [t[0] for t in snap["saved"]["tensors"]],
+        "saved_flags": snap["saved"]["flags"],
+        "saved_meta_keys": sorted(snap["saved"]["meta"]),
+        "saved_bytes": snap["saved_bytes"],
+        "workspace_bytes": snap["workspace_bytes"],
+        "plan_calls": snap["plan_calls"],
+    }
+
+
+def _golden() -> dict:
+    """The committed golden expectations (:data:`GOLDEN_PATH`) without their provenance; where a CUDA device is
+    visible, without the workspace bytes too (the existing backend then plans for the device's architecture, the
+    golden for the first exported one)."""
+    with open(GOLDEN_PATH) as fh:
+        golden = json.load(fh)
+    golden.pop("captured", None)
+    if torch.cuda.is_available():
+        golden.pop("workspace_bytes", None)
+    return golden
+
+
+def _as_golden(snap: dict) -> dict:
+    """:func:`_golden_view` of ``snap`` in the golden file's JSON form, with the workspace bytes kept where
+    :func:`_golden` keeps them."""
+    view = json.loads(json.dumps(_golden_view(snap)))
+    if torch.cuda.is_available():
+        view.pop("workspace_bytes", None)
+    return view
+
+
 # --------------------------------------------------------------------------- CPU rows: the keyword
 
 
@@ -484,10 +534,14 @@ def test_l2n_form_knob(capable) -> None:
 
 
 def test_l2n_flag_off_identity() -> None:
-    """The omitted keyword and an explicit ``False`` give the same forward / backward graph keys, recompute-handle
-    fingerprints (both tiers), operands, saved-set tensors / flags / meta, saved and workspace bytes and existing-backend
-    plan calls; nothing in them names the mode."""
+    """The omitted keyword and an explicit ``False`` give the forward / backward graph keys, recompute-handle
+    fingerprints (both tiers), saved-set tensors / flags / meta, saved and workspace bytes and existing-backend plan
+    calls of the base of this change, as literal expectations (:data:`GOLDEN_PATH`, captured by executing the base),
+    and the same operands as each other; nothing in them names the mode."""
     omitted, explicit = _snapshot({}), _snapshot(OFF)
+    golden = _golden()
+    assert _as_golden(omitted) == golden
+    assert _as_golden(explicit) == golden
     assert omitted == explicit
     assert [k["kind"] for k in omitted["graph_keys"]] == ["fwd", "bwd"]
     assert sorted(omitted["fingerprints"]) == ["states", "transfer"]
@@ -562,6 +616,24 @@ def test_l2n_flag_on_keys_and_fingerprint(capable) -> None:
         assert dict(cn[2]) == {**dict(co[2]), "l2n": "fused"}
     if "l2n" not in inspect.signature(cake_backend.plan).parameters:
         assert on["workspace_bytes"] == off["workspace_bytes"]
+    # the same deltas against the literal flag-off expectations of the base of this change
+    golden, view = _golden(), _as_golden(on)
+    assert [v[:2] for v in view["graph_keys"]] == [
+        [kind, flags + ["qk_l2norm"]] for kind, flags, _n in golden["graph_keys"]
+    ]
+    assert [v[2] for v in view["graph_keys"]] == [
+        n + (kind == "bwd") for kind, _f, n in golden["graph_keys"]
+    ]
+    for keep, modes in golden["fingerprint_modes"].items():
+        assert view["fingerprint_modes"][keep] == sorted(modes + [["l2n", "fused"]])
+    assert view["saved_roles"] == golden["saved_roles"] + ["qk_rstd"]
+    assert view["saved_flags"] == golden["saved_flags"]
+    assert view["saved_meta_keys"] == sorted(golden["saved_meta_keys"] + ["qk_l2norm"])
+    base_saved = [n - d for n, d in zip(view["saved_bytes"], deltas, strict=True)]
+    assert base_saved == golden["saved_bytes"]
+    assert len(view["plan_calls"]) == len(golden["plan_calls"])
+    for g, c in zip(golden["plan_calls"], view["plan_calls"], strict=True):
+        assert c[:2] == g[:2] and dict(c[2]) == {**dict(g[2]), "l2n": "fused"}
 
 
 # --------------------------------------------------------------------------- CPU rows: the saved set
@@ -582,7 +654,8 @@ def test_l2n_saved_set_round_trip_and_checks(capable) -> None:
     assert off.qk_rstd is None and off.qk_l2norm is False
     assert "qk_l2norm" not in off.meta() and cake_kcp.KCP_SAVED_VERSION == 2
     rstd = torch.rand(2, T, H)
-    on = _cpu_saved(fwd, qk_rstd=rstd, qk_l2norm=True)
+    # the flag-off set's own tensors plus the mode's fields: the mode only appends the rstd
+    on = dataclasses.replace(off, qk_rstd=rstd, qk_l2norm=True)
     t_on, t_off = on.tensors(), off.tensors()
     assert len(t_on) == len(t_off) + 1 and t_on[-1] is rstd
     assert all(a is b for a, b in zip(t_on[:-1], t_off, strict=True))
@@ -1782,6 +1855,8 @@ def test_gpu_l2n_flag_off_identity_w1() -> None:
                 q, k, v, g, beta, ctx, dout, saved=saved, workspace=ws, **kw
             )
             rec_b = dict(cake_kcp.LAST_CALL["bwd"])
+            # as on the base of this change: a flag-off launch record carries no key of the mode
+            assert not {"l2n", "l2n_rstd"} & (set(rec_f) | set(rec_b)), tag
             got[tag] = {
                 "tensors": {"out": out, **dict(zip(TOKEN_GRADS, grads, strict=True))},
                 "record": {
@@ -1795,6 +1870,8 @@ def test_gpu_l2n_flag_off_identity_w1() -> None:
         assert _same(a["tensors"], b["tensors"], ("out",) + TOKEN_GRADS), (lengths, H)
         assert a["record"] == b["record"], (lengths, H)
         assert "qk_l2norm" not in json.dumps(a["record"]["saved"])
+        # the saved set's meta keys of the base of this change (the golden file, captured by executing the base)
+        assert sorted(a["record"]["saved"]["meta"]) == _golden()["saved_meta_keys"]
         key = f"s{'_'.join(map(str, lengths))}-h{H}"
         record[key] = a["record"]
         tensors_of[key] = {n: t.detach().cpu() for n, t in a["tensors"].items()}
