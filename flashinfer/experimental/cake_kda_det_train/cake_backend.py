@@ -1720,9 +1720,10 @@ def output_bytes(S: int, H: int, *, backward: bool, gate: str = "g") -> int:
     and ``d dt_bias`` FP32 ``[H * 128]``.  The raw backward's per-call parameter partials (:func:`_raw_partials_bytes`)
     are transient, not outputs: :func:`memory_report` reports them."""
     S, H = int(S), int(H)
+    raw = _check_gate(gate) == "raw"
     if not backward:
         return S * H * D * 2
-    if _check_gate(gate) == "raw":
+    if raw:
         return 3 * S * H * D * 2 + S * H * 2 + S * H * D * 2 + 4 * H + 4 * H * D
     return 3 * S * H * D * 2 + S * H * 2 + S * H * D * 4
 
@@ -1765,8 +1766,13 @@ def lifetime_table(
         slots = _slots_of(mode, tail_passes, plan.R, plan.H, plan.NC_pad, plan.NSEG)
     else:
         slots = _slots_of(mode, tail_passes, 0, 1, 0, 0)
+    raw = (plan.gate if plan is not None else gate) == "raw"
     if gate_fused is None:
-        gate_fused = plan.gate_fused if plan is not None else gate == "raw"
+        gate_fused = plan.gate_fused if plan is not None else raw
+    elif raw and not gate_fused:
+        raise ValueError(
+            "lifetime_table: the raw gate mode has no gate epilogue, so gate_fused must be True"
+        )
     if gate_fused:
         slots = tuple(
             kept

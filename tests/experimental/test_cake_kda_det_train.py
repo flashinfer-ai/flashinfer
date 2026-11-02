@@ -2436,6 +2436,8 @@ def test_raw_gate_plans_select_the_raw_class_and_the_fused_layouts() -> None:
                 }
                 with pytest.raises(ValueError, match="gate"):
                     cake_backend.lifetime_table("bwd", plan=pr, gate="g")
+                with pytest.raises(ValueError, match="gate_fused"):
+                    cake_backend.lifetime_table("bwd", plan=pr, gate_fused=False)
                 report = cake_backend.memory_report(S, N, heads, gate="raw", **q)
                 assert report["gate_fused"] is True
                 # the raw backward's per-call partials (hi, lo) FP32 [NC_pad, H, 128, 2], twice, outside the arena
@@ -2444,6 +2446,11 @@ def test_raw_gate_plans_select_the_raw_class_and_the_fused_layouts() -> None:
                 assert report["out_bwd"] == cake_backend.output_bytes(
                     S, heads, backward=True, gate="raw"
                 )
+    with pytest.raises(ValueError, match="gate_fused"):
+        cake_backend.lifetime_table("bwd", gate="raw", gate_fused=False)
+    for backward in (False, True):
+        with pytest.raises(ValueError, match="gate"):
+            cake_backend.output_bytes(1, 1, backward=backward, gate="fp32")
     for arch in ARCHES:
         assert cake_backend._gate_fused(arch, "raw") is True
         assert cake_backend._gate_fused(arch) is _gate_fused(arch)
