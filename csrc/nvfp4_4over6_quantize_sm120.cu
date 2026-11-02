@@ -641,6 +641,302 @@ __global__ void __launch_bounds__(THREADS)
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// SVDQuant LoRA-down fused into the dynamic quantization:
+//   down[i, r] = bf16(fp32(sum_k x[i, k] * lora_down[r, k]) / alpha),
+// with alpha = deq * weight_global_scale formed from the same amax by the same expression as the
+// alpha the quantization publishes, so the FP4 GEMM's alpha and down agree bit for bit.
+// mm_nvfp4_svdquant then computes alpha * (x_q @ wᵀ + down @ lora_upᵀ), i.e. alpha * x_q @ wᵀ + (x
+// @ lora_downᵀ) @ lora_upᵀ.
+
+constexpr int kLoraThreads = 256;
+constexpr int kLoraMaxIters = 8;  // K <= kLoraMaxIters * kLoraThreads * 8 = 16384
+
+__device__ __forceinline__ float lora_dot8(const uint4& a, const uint4& b, float acc) {
+  const __nv_bfloat162* ha = reinterpret_cast<const __nv_bfloat162*>(&a);
+  const __nv_bfloat162* hb = reinterpret_cast<const __nv_bfloat162*>(&b);
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float2 fa = __bfloat1622float2(ha[j]);
+    const float2 fb = __bfloat1622float2(hb[j]);
+    acc = fmaf(fa.x, fb.x, acc);
+    acc = fmaf(fa.y, fb.y, acc);
+  }
+  return acc;
+}
+
+// One rank row r of the LoRA-down for rows i < m <= MAX_M, computed by one kLoraThreads block
+// (contains a block barrier, so every thread of the block must call it). The threads split K and
+// stage their lora_down chunks in registers first so all weight loads are in flight together; the
+// FP32 sums are reduced in a fixed order (deterministic, no atomics) and rounded once.
+template <int MAX_M>
+__device__ __forceinline__ void lora_row(const __nv_bfloat16* __restrict__ x,
+                                         const __nv_bfloat16* __restrict__ lora_down, float alpha,
+                                         __nv_bfloat16* __restrict__ down, int m, int k, int rank,
+                                         int r) {
+  const int chunks = k / 8;
+  const uint4* wrow = reinterpret_cast<const uint4*>(lora_down + static_cast<int64_t>(r) * k);
+  const uint4* xv = reinterpret_cast<const uint4*>(x);
+  uint4 w[kLoraMaxIters];
+#pragma unroll
+  for (int it = 0; it < kLoraMaxIters; ++it) {
+    const int c = threadIdx.x + it * kLoraThreads;
+    if (c < chunks) w[it] = wrow[c];
+  }
+  float acc[MAX_M];
+#pragma unroll
+  for (int i = 0; i < MAX_M; ++i) acc[i] = 0.f;
+#pragma unroll
+  for (int it = 0; it < kLoraMaxIters; ++it) {
+    const int c = threadIdx.x + it * kLoraThreads;
+    if (c < chunks) {
+#pragma unroll
+      for (int i = 0; i < MAX_M; ++i) {
+        if (i < m) acc[i] = lora_dot8(xv[static_cast<int64_t>(i) * chunks + c], w[it], acc[i]);
+      }
+    }
+  }
+  __shared__ float partial[kLoraThreads / 32][MAX_M];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+  for (int i = 0; i < MAX_M; ++i) {
+    float v = acc[i];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off);
+    if (lane == 0) partial[warp][i] = v;
+  }
+  __syncthreads();
+  if (threadIdx.x < m) {
+    float s = 0.f;
+#pragma unroll
+    for (int wi = 0; wi < kLoraThreads / 32; ++wi) s += partial[wi][threadIdx.x];
+    down[static_cast<int64_t>(threadIdx.x) * rank + r] = __float2bfloat16_rn(__fdiv_rn(s, alpha));
+  }
+}
+
+// dynamic, small inputs (nblk <= 8 * 256, m <= LORA_M <= 8) with the LoRA-down in the same launch:
+// blocks [0, quant_ctas) work as quant_4o6_dyn_small_kernel<256>; blocks [quant_ctas, quant_ctas +
+// rank) reduce the same amax and each compute one LoRA-down rank row; the remaining blocks only
+// zero scale padding.
+template <int LOADS, bool V8, int LORA_M>
+__global__ void __launch_bounds__(kLoraThreads)
+    quant_4o6_dyn_small_lora_kernel(Args a, float rcp_q, const float* __restrict__ wgs,
+                                    float* __restrict__ inv_out, float* __restrict__ alpha_out,
+                                    const __nv_bfloat16* __restrict__ lora_down,
+                                    __nv_bfloat16* __restrict__ down, int rank, int k,
+                                    uint32_t quant_ctas, bool trigger) {
+  constexpr int THREADS = kLoraThreads;
+  pdl_wait();
+  const uint32_t first = blockIdx.x * THREADS + threadIdx.x;
+  const uint32_t stride = gridDim.x * THREADS;
+  const bool quant_block = blockIdx.x < quant_ctas;
+  if (!quant_block && blockIdx.x >= quant_ctas + static_cast<uint32_t>(rank)) {
+    zero_sf_padding_disjoint(a.sf, a.m, a.num_kb, a.m_padded, first, stride);  // padding-only block
+    return;
+  }
+  Blk stage[LOADS];
+#pragma unroll
+  for (int j = 0; j < LOADS; ++j) {
+    const uint32_t bi = threadIdx.x + j * THREADS;
+    stage[j] = bi < a.nblk ? load_blk<V8>(a.x + bi) : Blk{};
+  }
+  __nv_bfloat162 m2 = absmax2(stage[0]);
+#pragma unroll
+  for (int j = 1; j < LOADS; ++j) m2 = __hmax2(m2, absmax2(stage[j]));
+  const float amax = block_max<THREADS>(__bfloat162float(__hmax(m2.x, m2.y)));
+  if (quant_block) {
+    const float sf_scale = finalize_scale(amax, rcp_q, wgs, inv_out, alpha_out, first == 0);
+    const Recipe r = make_recipe(sf_scale);
+    Blk v = stage[0];
+#pragma unroll
+    for (int j = 1; j < LOADS; ++j) {
+      if (j == static_cast<int>(blockIdx.x)) v = stage[j];
+    }
+    if (first < a.nblk) quant_store(v, first, r, a.kb_div, (a.num_kb + 3) / 4, a.out, a.sf);
+  } else {
+    const float deq =
+        fmaxf(amax, 1.0e-12f) * rcp_q;  // finalize_scale's expressions: the same alpha bits
+    const float alpha = deq * (*wgs);
+    lora_row<LORA_M>(reinterpret_cast<const __nv_bfloat16*>(a.x), lora_down, alpha, down,
+                     static_cast<int>(a.m), k, rank, static_cast<int>(blockIdx.x - quant_ctas));
+  }
+  if (trigger) pdl_trigger();
+  zero_sf_padding_disjoint(a.sf, a.m, a.num_kb, a.m_padded, first, stride);
+}
+
+// dynamic, mid-size inputs with a rank-64 LoRA-down (m <= 64, K a multiple of 256, K / 256 <= 64):
+// one cooperative launch. Block (g, s) owns rows [16g, 16g + 16) and columns [256s, 256s + 256): it
+// stages that x tile (taking |x| max on the way) and lora_down[:, 256s : 256s + 256] in shared
+// memory and writes the partial sums P[s][row][r] over its columns with tensor-core MMAs. After the
+// grid barrier one thread per output sums down[row][r] = bf16(sum_s P[s][row][r] / alpha) in slice
+// order (deterministic), then the grid quantizes with the lane-pair layout.
+constexpr int kCoopRows = 16;
+constexpr int kCoopSliceK = 256;
+constexpr int kCoopRank = 64;
+constexpr int kCoopLoraMaxM = 64;
+constexpr int kCoopMaxSlices = 64;
+constexpr int kCoopPitch =
+    kCoopSliceK + 8;  // bf16 per shared row; the extra 16 B keeps the loads conflict-free
+constexpr int kCoopSmemBytes = (kCoopRows + kCoopRank) * kCoopPitch * 2;
+static_assert(kThreads / 32 * 8 == kCoopRank && kCoopRows == 16,
+              "warp w: mma tile rows 0..15 x ranks 8w..8w+7");
+
+__global__ void __launch_bounds__(kThreads)
+    quant_4o6_dyn_lora_coop_kernel(Args a, float rcp_q, const float* __restrict__ wgs,
+                                   float* __restrict__ inv_out, float* __restrict__ alpha_out,
+                                   float* __restrict__ block_maxima,
+                                   const __nv_bfloat16* __restrict__ lora_down,
+                                   __nv_bfloat16* __restrict__ down, float* __restrict__ partials,
+                                   int k, bool trigger) {
+  pdl_wait();
+  cg::grid_group grid = cg::this_grid();
+  __shared__ __align__(16) unsigned char smem[kCoopSmemBytes];
+  auto xs = reinterpret_cast<__nv_bfloat16(*)[kCoopPitch]>(smem);
+  auto ws = reinterpret_cast<__nv_bfloat16(*)[kCoopPitch]>(smem + kCoopRows * kCoopPitch * 2);
+  constexpr int kSliceChunks = kCoopSliceK / 8;
+
+  const int64_t m = a.m;
+  const uint32_t chunks = a.nblk * 2;
+  const int64_t cpr = k / 8;
+  const int slices = k / kCoopSliceK;
+  const int s = static_cast<int>(blockIdx.x) % slices;
+  const int64_t row0 = static_cast<int64_t>(blockIdx.x / slices) * kCoopRows;
+  const uint32_t stride = gridDim.x * kThreads;
+  const uint32_t first = blockIdx.x * kThreads + threadIdx.x;
+  const uint4* xv = reinterpret_cast<const uint4*>(a.x);
+  const uint4* wv = reinterpret_cast<const uint4*>(lora_down);
+
+  // All staging loads are issued before any shared store, so each thread's loads are in flight
+  // together.
+  constexpr int kXLoads = kCoopRows * kSliceChunks / kThreads;  // 2
+  constexpr int kWLoads = kCoopRank * kSliceChunks / kThreads;  // 8
+  static_assert(kCoopRows * kSliceChunks % kThreads == 0 &&
+                kCoopRank * kSliceChunks % kThreads == 0);
+  uint4 xr[kXLoads], wr[kWLoads];
+#pragma unroll
+  for (int j = 0; j < kWLoads; ++j) {
+    const int i = threadIdx.x + j * kThreads, rr = i / kSliceChunks, cc = i % kSliceChunks;
+    wr[j] = wv[static_cast<int64_t>(rr) * cpr + static_cast<int64_t>(s) * kSliceChunks + cc];
+  }
+#pragma unroll
+  for (int j = 0; j < kXLoads; ++j) {
+    const int i = threadIdx.x + j * kThreads, rr = i / kSliceChunks, cc = i % kSliceChunks;
+    xr[j] = row0 + rr < m ? xv[(row0 + rr) * cpr + static_cast<int64_t>(s) * kSliceChunks + cc]
+                          : make_uint4(0u, 0u, 0u, 0u);
+  }
+  __nv_bfloat162 m2 = __float2bfloat162_rn(0.f);
+#pragma unroll
+  for (int j = 0; j < kXLoads; ++j) {
+    const int i = threadIdx.x + j * kThreads, rr = i / kSliceChunks, cc = i % kSliceChunks;
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&xr[j]);
+#pragma unroll
+    for (int q = 0; q < 4; ++q) m2 = __hmax2(m2, __habs2(h[q]));
+    *reinterpret_cast<uint4*>(&xs[rr][cc * 8]) = xr[j];
+  }
+#pragma unroll
+  for (int j = 0; j < kWLoads; ++j) {
+    const int i = threadIdx.x + j * kThreads, rr = i / kSliceChunks, cc = i % kSliceChunks;
+    *reinterpret_cast<uint4*>(&ws[rr][cc * 8]) = wr[j];
+  }
+  // block_max's barrier also publishes the staged tiles
+  const float b = block_max<kThreads>(__bfloat162float(__hmax(m2.x, m2.y)));
+  if (threadIdx.x == 0) block_maxima[blockIdx.x] = b;
+
+  // LoRA partial on tensor cores: warp w computes rows [0, 16) x ranks [8w, 8w + 8) over the 256
+  // staged columns with 16 mma.m16n8k16 (BF16 in, FP32 accumulate; fixed hardware order, so
+  // deterministic). A = x tile (row-major), B = the lora_down slice stored [rank][k], i.e. the
+  // column-major operand mma.row.col expects.
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  float c[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int k0 = 0; k0 < kCoopSliceK; k0 += 16) {
+    uint32_t af[4], bf[2];
+    const uint32_t a_addr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(&xs[lane % 16][k0 + (lane / 16) * 8]));
+    const uint32_t b_addr = static_cast<uint32_t>(
+        __cvta_generic_to_shared(&ws[warp * 8 + lane % 8][k0 + ((lane / 8) % 2) * 8]));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                 : "=r"(af[0]), "=r"(af[1]), "=r"(af[2]), "=r"(af[3])
+                 : "r"(a_addr));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                 : "=r"(bf[0]), "=r"(bf[1])
+                 : "r"(b_addr));
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+        "{%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(af[0]), "r"(af[1]), "r"(af[2]), "r"(af[3]), "r"(bf[0]), "r"(bf[1]));
+  }
+  // accumulator fragment: c0/c1 at row lane/4, c2/c3 at row lane/4 + 8; columns (lane % 4) * 2 +
+  // {0, 1}
+  const int col = warp * 8 + (lane % 4) * 2;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const int64_t row = row0 + lane / 4 + h * 8;
+    if (row < m) {
+      float2* dst = reinterpret_cast<float2*>(
+          &partials[(static_cast<int64_t>(s) * m + row) * kCoopRank + col]);
+      *dst = make_float2(c[2 * h], c[2 * h + 1]);
+    }
+  }
+  grid.sync();
+
+  float part = 0.f;
+  for (int i = threadIdx.x; i < static_cast<int>(gridDim.x); i += kThreads) {
+    part = fmaxf(part, __ldcg(&block_maxima[i]));
+  }
+  const float amax = block_max<kThreads>(part);
+  const float sf_scale = finalize_scale(amax, rcp_q, wgs, inv_out, alpha_out, first == 0);
+  const float deq =
+      fmaxf(amax, 1.0e-12f) * rcp_q;  // finalize_scale's expressions: the same alpha bits
+  const float alpha = deq * (*wgs);
+  for (int64_t o = first; o < m * kCoopRank; o += stride) {
+    float pv[kCoopMaxSlices];  // load every slice's partial first, then add them in slice order
+#pragma unroll
+    for (int ss = 0; ss < kCoopMaxSlices; ++ss) {
+      pv[ss] = ss < slices ? __ldcg(&partials[static_cast<int64_t>(ss) * m * kCoopRank + o]) : 0.f;
+    }
+    float sum = 0.f;
+#pragma unroll
+    for (int ss = 0; ss < kCoopMaxSlices; ++ss) {
+      if (ss < slices) sum += pv[ss];
+    }
+    down[o] = __float2bfloat16_rn(__fdiv_rn(sum, alpha));
+  }
+  const Recipe r = make_recipe(sf_scale);
+  const uint32_t nkt = (a.num_kb + 3) / 4;
+  uint32_t* out = reinterpret_cast<uint32_t*>(a.out);
+  // stride is a multiple of 32 and chunks even, so both lanes of a pair are always active together
+  for (uint32_t ci = first; ci < chunks; ci += stride) {
+    quant8_pair_store(__ldg(xv + ci), ci, r, __activemask(), a.kb_div, nkt, out, a.sf);
+  }
+  if (trigger) pdl_trigger();
+  zero_sf_padding_disjoint(a.sf, a.m, a.num_kb, a.m_padded, first, stride);
+}
+
+// Stand-alone LoRA-down for decode-sized inputs whose quantization launch could not carry it: one
+// block per rank row, FP32 sums, one rounding.
+template <int MAX_M>
+__global__ void __launch_bounds__(kLoraThreads)
+    lora_down_kernel(const __nv_bfloat16* __restrict__ x,
+                     const __nv_bfloat16* __restrict__ lora_down, const float* __restrict__ alpha,
+                     __nv_bfloat16* __restrict__ down, int m, int k, int rank) {
+  pdl_wait();
+  lora_row<MAX_M>(x, lora_down, *alpha, down, m, k, rank, blockIdx.x);
+}
+
+// down = bf16(float(down) / alpha) in place, after a BF16 GEMM computed x @ lora_downᵀ.
+__global__ void div_by_alpha_kernel(__nv_bfloat162* __restrict__ d, int64_t pairs,
+                                    const float* __restrict__ alpha) {
+  pdl_wait();
+  const float av = *alpha;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < pairs;
+       i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const float2 v = __bfloat1622float2(d[i]);
+    d[i] = __floats2bfloat162_rn(__fdiv_rn(v.x, av), __fdiv_rn(v.y, av));
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // host
 
 #define NVFP4_4O6_CUDA_CHECK(expr)                                                        \
@@ -997,6 +1293,98 @@ void check_scalar_f32(TensorView t, TensorView input, const char* name) {
   check_same_device(t, input, name, "input");
 }
 
+// The small fused path: m <= 8 rows in at most 8 * 256 blocks, K <= 16384 (lora_row's register
+// staging).
+bool small_lora_fits(int64_t m, int64_t k, int64_t nblk) {
+  return m >= 1 && m <= 8 && nblk <= 8 * kLoraThreads &&
+         k <= int64_t{kLoraMaxIters} * kLoraThreads * 8;
+}
+
+template <int LOADS, bool V8>
+void launch_small_lora_m(const Prepared& p, float rcp_q, const float* wgs, float* inv, float* alpha,
+                         const __nv_bfloat16* l2, __nv_bfloat16* d, int rank, int k,
+                         uint32_t quant_ctas, int grid) {
+  if (p.a.m <= 1) {
+    launch_ex(quant_4o6_dyn_small_lora_kernel<LOADS, V8, 1>, grid, kLoraThreads, p, false, p.a,
+              rcp_q, wgs, inv, alpha, l2, d, rank, k, quant_ctas, p.trigger);
+  } else if (p.a.m <= 2) {
+    launch_ex(quant_4o6_dyn_small_lora_kernel<LOADS, V8, 2>, grid, kLoraThreads, p, false, p.a,
+              rcp_q, wgs, inv, alpha, l2, d, rank, k, quant_ctas, p.trigger);
+  } else if (p.a.m <= 4) {
+    launch_ex(quant_4o6_dyn_small_lora_kernel<LOADS, V8, 4>, grid, kLoraThreads, p, false, p.a,
+              rcp_q, wgs, inv, alpha, l2, d, rank, k, quant_ctas, p.trigger);
+  } else {
+    launch_ex(quant_4o6_dyn_small_lora_kernel<LOADS, V8, 8>, grid, kLoraThreads, p, false, p.a,
+              rcp_q, wgs, inv, alpha, l2, d, rank, k, quant_ctas, p.trigger);
+  }
+}
+
+void launch_small_lora(const Prepared& p, float rcp_q, const float* wgs, float* inv, float* alpha,
+                       const __nv_bfloat16* l2, __nv_bfloat16* d, int rank, int k) {
+  const uint32_t quant_ctas = (p.a.nblk + kLoraThreads - 1) / kLoraThreads;
+  const int loads = quant_ctas <= 1 ? 1 : quant_ctas <= 2 ? 2 : quant_ctas <= 4 ? 4 : 8;
+  const int grid = static_cast<int>(
+      std::max<int64_t>(int64_t{quant_ctas} + rank, padding_ctas(p.a, kLoraThreads)));
+  switch (loads) {
+    case 1:
+      launch_small_lora_m<1, true>(p, rcp_q, wgs, inv, alpha, l2, d, rank, k, quant_ctas, grid);
+      break;
+    case 2:
+      launch_small_lora_m<2, true>(p, rcp_q, wgs, inv, alpha, l2, d, rank, k, quant_ctas, grid);
+      break;
+    case 4:
+      launch_small_lora_m<4, true>(p, rcp_q, wgs, inv, alpha, l2, d, rank, k, quant_ctas, grid);
+      break;
+    default:
+      launch_small_lora_m<8, true>(p, rcp_q, wgs, inv, alpha, l2, d, rank, k, quant_ctas, grid);
+      break;
+  }
+}
+
+// Grid of the cooperative LoRA path, or 0 when the shape does not fit it (rank 64, m <= 64, K a
+// multiple of 256 and at most 64 slices, the whole grid co-resident, enough partials scratch).
+int coop_lora_grid(const Prepared& p, int64_t k, int64_t rank, int64_t scratch_numel,
+                   int64_t partials_numel) {
+  const int64_t m = p.a.m;
+  if (rank != kCoopRank || m < 1 || m > kCoopLoraMaxM || k % kCoopSliceK != 0 ||
+      k / kCoopSliceK > kCoopMaxSlices) {
+    return 0;
+  }
+  const int64_t slices = k / kCoopSliceK;
+  const int64_t grid = (m + kCoopRows - 1) / kCoopRows * slices;
+  const int occ =
+      blocks_per_sm(reinterpret_cast<const void*>(quant_4o6_dyn_lora_coop_kernel), kThreads, p.dev);
+  if (grid > int64_t{occ} * sm_count(p.dev) || grid > scratch_numel ||
+      slices * m * kCoopRank > partials_numel) {
+    return 0;
+  }
+  return static_cast<int>(grid);
+}
+
+bool lora_down_kernel_fits(int64_t m, int64_t k) {
+  // Every block re-reads all of x, so the one-launch kernel only wins while x is small.
+  return m >= 1 && m <= 16 && m * k <= 49152 && k % 8 == 0 &&
+         k <= int64_t{kLoraMaxIters} * kLoraThreads * 8;
+}
+
+void check_lora_down(TensorView lora_down, TensorView input, int64_t k) {
+  CHECK_INPUT(lora_down);
+  check_dtype(lora_down, dl_bfloat16, "lora_down");
+  TVM_FFI_ICHECK_EQ(lora_down.ndim(), 2) << "lora_down must be 2-D [rank, K]";
+  TVM_FFI_ICHECK_EQ(lora_down.size(1), k) << "lora_down must be [rank, K]";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(lora_down.data_ptr()) % 16 == 0)
+      << "lora_down must be 16-byte aligned";
+  check_same_device(lora_down, input, "lora_down", "input");
+}
+
+void check_down(TensorView down, TensorView input, int64_t m, int64_t rank) {
+  CHECK_INPUT(down);
+  check_dtype(down, dl_bfloat16, "out_down");
+  TVM_FFI_ICHECK(down.ndim() == 2 && down.size(0) == m && down.size(1) == rank)
+      << "out_down must be [M, rank]";
+  check_same_device(down, input, "out_down", "input");
+}
+
 }  // namespace
 
 void nvfp4_4over6_quantize_sm120(TensorView input, TensorView global_scale, TensorView out_fp4,
@@ -1056,6 +1444,124 @@ void nvfp4_4over6_dynamic_quantize_sm120(TensorView input, TensorView global_sca
   }
 }
 
+// Dynamic 4over6 quantization plus the SVDQuant LoRA-down in one launch where a fused path fits.
+// path: -1 auto, 0 quantize only, 1 small fused, 2 cooperative fused. Returns the path taken; on 0
+// out_down is left untouched and the caller computes it (nvfp4_lora_down_scaled_sm120 or a BF16
+// GEMM followed by nvfp4_div_by_alpha_sm120).
+int64_t nvfp4_4over6_dynamic_quantize_lora_down_sm120(TensorView input, TensorView global_scale_out,
+                                                      TensorView alpha_out,
+                                                      TensorView weight_global_scale, double rcp_q,
+                                                      TensorView scratch, TensorView lora_down,
+                                                      TensorView lora_partials, TensorView out_fp4,
+                                                      TensorView out_sf, TensorView out_down,
+                                                      int64_t path, int64_t pdl) {
+  check_scalar_f32(global_scale_out, input, "global_scale_out");
+  check_scalar_f32(alpha_out, input, "alpha_out");
+  check_scalar_f32(weight_global_scale, input, "weight_global_scale");
+  check_scalar_f32(scratch, input, "scratch");
+  check_scalar_f32(lora_partials, input, "lora_partials");
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  Prepared p = prepare(input, out_fp4, out_sf);
+  TVM_FFI_ICHECK(p.a.nblk > 0) << "dynamic quantization needs a non-empty input";
+  const int64_t k = input.size(1), rank = lora_down.size(0);
+  check_lora_down(lora_down, input, k);
+  check_down(out_down, input, p.a.m, rank);
+  TVM_FFI_ICHECK(path >= -1 && path <= 2) << "path must be -1 (auto), 0, 1 or 2";
+  set_pdl(p, pdl, 2);
+  set_order(p, -1);
+  const float rq = static_cast<float>(rcp_q);
+  float* inv = static_cast<float*>(global_scale_out.data_ptr());
+  float* alpha = static_cast<float*>(alpha_out.data_ptr());
+  const float* wgs = static_cast<const float*>(weight_global_scale.data_ptr());
+  const auto* l2 = static_cast<const __nv_bfloat16*>(lora_down.data_ptr());
+  auto* d = static_cast<__nv_bfloat16*>(out_down.data_ptr());
+  const bool small_fits = small_lora_fits(p.a.m, k, p.a.nblk);
+  const int coop_grid = coop_lora_grid(p, k, rank, scratch.numel(), lora_partials.numel());
+  if (path < 0) path = small_fits ? 1 : coop_grid > 0 ? 2 : 0;
+  if (path == 1) {
+    TVM_FFI_ICHECK(small_fits)
+        << "the small fused path needs M <= 8, M * K / 16 <= 2048 and K <= 16384";
+    launch_small_lora(p, rq, wgs, inv, alpha, l2, d, static_cast<int>(rank), static_cast<int>(k));
+  } else if (path == 2) {
+    TVM_FFI_ICHECK(coop_grid > 0)
+        << "the cooperative fused path needs rank 64, M <= 64, K a multiple of 256 "
+           "(at most 16384) and a co-resident grid";
+    launch_ex(quant_4o6_dyn_lora_coop_kernel, coop_grid, kThreads, p, true, p.a, rq, wgs, inv,
+              alpha, static_cast<float*>(scratch.data_ptr()), l2, d,
+              static_cast<float*>(lora_partials.data_ptr()), static_cast<int>(k), p.trigger);
+  } else {
+    dispatch_dyn<true>(p, rq, wgs, inv, alpha, static_cast<float*>(scratch.data_ptr()),
+                       scratch.numel(), 0, 0, 0);
+  }
+  return path;
+}
+
+bool nvfp4_lora_down_supported_sm120(int64_t m, int64_t k) { return lora_down_kernel_fits(m, k); }
+
+// down = bf16(fp32(x @ lora_downᵀ) / alpha) in one launch for decode-sized x
+// (nvfp4_lora_down_supported_sm120).
+void nvfp4_lora_down_scaled_sm120(TensorView x, TensorView lora_down, TensorView alpha,
+                                  TensorView out_down, bool enable_pdl) {
+  CHECK_INPUT(x);
+  check_dtype(x, dl_bfloat16, "x");
+  TVM_FFI_ICHECK_EQ(x.ndim(), 2) << "x must be 2-D [M, K]";
+  const int64_t m = x.size(0), k = x.size(1);
+  TVM_FFI_ICHECK(lora_down_kernel_fits(m, k)) << "unsupported lora_down shape";
+  TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0)
+      << "x must be 16-byte aligned";
+  check_lora_down(lora_down, x, k);
+  check_scalar_f32(alpha, x, "alpha");
+  const int64_t rank = lora_down.size(0);
+  check_down(out_down, x, m, rank);
+  ffi::CUDADeviceGuard device_guard(x.device().device_id);
+  Prepared p;
+  p.stream = get_stream(x.device());
+  p.dev = x.device().device_id;
+  p.pdl = enable_pdl;
+  p.trigger = false;
+  const auto* xp = static_cast<const __nv_bfloat16*>(x.data_ptr());
+  const auto* l2 = static_cast<const __nv_bfloat16*>(lora_down.data_ptr());
+  const auto* ap = static_cast<const float*>(alpha.data_ptr());
+  auto* d = static_cast<__nv_bfloat16*>(out_down.data_ptr());
+  const int mi = static_cast<int>(m), ki = static_cast<int>(k), ri = static_cast<int>(rank);
+  if (m <= 1) {
+    launch_ex(lora_down_kernel<1>, ri, kLoraThreads, p, false, xp, l2, ap, d, mi, ki, ri);
+  } else if (m <= 2) {
+    launch_ex(lora_down_kernel<2>, ri, kLoraThreads, p, false, xp, l2, ap, d, mi, ki, ri);
+  } else if (m <= 4) {
+    launch_ex(lora_down_kernel<4>, ri, kLoraThreads, p, false, xp, l2, ap, d, mi, ki, ri);
+  } else if (m <= 8) {
+    launch_ex(lora_down_kernel<8>, ri, kLoraThreads, p, false, xp, l2, ap, d, mi, ki, ri);
+  } else {
+    launch_ex(lora_down_kernel<16>, ri, kLoraThreads, p, false, xp, l2, ap, d, mi, ki, ri);
+  }
+}
+
+// down = bf16(float(down) / alpha), in place.
+void nvfp4_div_by_alpha_sm120(TensorView down, TensorView alpha, bool enable_pdl) {
+  CHECK_INPUT(down);
+  check_dtype(down, dl_bfloat16, "down");
+  TVM_FFI_ICHECK(down.numel() % 2 == 0) << "down must hold an even number of elements";
+  check_scalar_f32(alpha, down, "alpha");
+  ffi::CUDADeviceGuard device_guard(down.device().device_id);
+  Prepared p;
+  p.stream = get_stream(down.device());
+  p.dev = down.device().device_id;
+  p.pdl = enable_pdl;
+  p.trigger = false;
+  const int64_t pairs = down.numel() / 2;
+  const int blocks =
+      static_cast<int>(std::max<int64_t>(1, std::min<int64_t>((pairs + 255) / 256, 1024)));
+  launch_ex(div_by_alpha_kernel, blocks, 256, p, false,
+            static_cast<__nv_bfloat162*>(down.data_ptr()), pairs,
+            static_cast<const float*>(alpha.data_ptr()));
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_4over6_quantize_sm120, nvfp4_4over6_quantize_sm120);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_4over6_dynamic_quantize_sm120,
                               nvfp4_4over6_dynamic_quantize_sm120);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_4over6_dynamic_quantize_lora_down_sm120,
+                              nvfp4_4over6_dynamic_quantize_lora_down_sm120);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_lora_down_supported_sm120, nvfp4_lora_down_supported_sm120);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_lora_down_scaled_sm120, nvfp4_lora_down_scaled_sm120);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(nvfp4_div_by_alpha_sm120, nvfp4_div_by_alpha_sm120);

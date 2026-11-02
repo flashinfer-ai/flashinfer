@@ -140,7 +140,7 @@ STATIC_VARIANTS = [
 @pytest.mark.parametrize("ctas_per_sm", [0, 1, 8])
 def test_static_variants(m, k, variant, ctas_per_sm):
     _skip_unless_sm12x()
-    module, _, _ = get_nvfp4_4over6_quantize_sm120_module()
+    module = get_nvfp4_4over6_quantize_sm120_module()[0]
     unroll, v8, order = variant
     x = make_input(m, k, "tails", m + k)
     gs = global_scale_for(x, MSE_256)
@@ -206,7 +206,7 @@ def test_dynamic_variants(m, k, variant):
         pytest.skip("input too large for the lane-pair small path")
     if 0 < small_threads < 2000 and nblk > 8 * small_threads:
         pytest.skip("input too large for the small path")
-    module, _, _ = get_nvfp4_4over6_quantize_sm120_module()
+    module = get_nvfp4_4over6_quantize_sm120_module()[0]
     x = make_input(m, k, "tails", m * 3 + k)
     wgs = torch.tensor([1.5], device=DEVICE)
     gs, alpha = torch.empty(1, device=DEVICE), torch.empty(1, device=DEVICE)

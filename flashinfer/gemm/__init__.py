@@ -73,6 +73,9 @@ from .gemm_svdquant import (
     nvfp4_quantize_smooth as nvfp4_quantize_smooth,
     svdquant_linear as svdquant_linear,
 )
+from .svdquant_4over6_sm120 import (
+    nvfp4_4over6_svdquant_linear_sm120 as nvfp4_4over6_svdquant_linear_sm120,
+)
 from .cake_quant_lora_gemm import (
     PreparedNvFp4LoraAdapter as PreparedNvFp4LoraAdapter,
     StaleAdapterError as StaleAdapterError,

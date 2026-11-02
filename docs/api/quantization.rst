@@ -191,6 +191,7 @@ and the FP4 GEMM ``alpha`` in the same launch.
 
     nvfp4_4over6_quantize_sm120
     nvfp4_4over6_dynamic_quantize_sm120
+    nvfp4_4over6_dynamic_quantize_lora_down_sm120
 
 .. note::
 

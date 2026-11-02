@@ -117,6 +117,7 @@ from .quantization.fp4_quantization import (
     nvfp4_kv_quantize,
 )
 from .quantization.nvfp4_4over6_sm120 import (
+    nvfp4_4over6_dynamic_quantize_lora_down_sm120 as nvfp4_4over6_dynamic_quantize_lora_down_sm120,
     nvfp4_4over6_dynamic_quantize_sm120 as nvfp4_4over6_dynamic_quantize_sm120,
     nvfp4_4over6_quantize_sm120 as nvfp4_4over6_quantize_sm120,
 )
@@ -253,6 +254,9 @@ from .gemm import PreparedNvFp4LoraAdapter as PreparedNvFp4LoraAdapter
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import StaleAdapterError as StaleAdapterError
 from .gemm import svdquant_linear as svdquant_linear
+from .gemm import (
+    nvfp4_4over6_svdquant_linear_sm120 as nvfp4_4over6_svdquant_linear_sm120,
+)
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8

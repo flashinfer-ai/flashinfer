@@ -42,6 +42,7 @@ from .nvfp4_quantization_utils import NVFP44Over6Config, NVFP44Over6ErrMode
 DEFAULT_NVFP4_4OVER6_SM120 = NVFP44Over6Config(e4m3_max=256, err_mode="MSE")
 
 _scratch: Dict[torch.device, torch.Tensor] = {}
+_lora_partials: Dict[torch.device, torch.Tensor] = {}
 
 
 def _check_recipe(config: NVFP44Over6Config) -> None:
@@ -74,6 +75,21 @@ def _check_input(input: torch.Tensor) -> None:
 
 def _sf_numel(m: int, k: int) -> int:
     return round_up(m, 128) * round_up(k // 16, 4)
+
+
+def _device_scratch(device: torch.device) -> torch.Tensor:
+    scratch = _scratch.get(device)
+    if scratch is None:
+        # One float per cooperative block; every launch rewrites the slots it reads, so the buffer
+        # needs no reset and is safe to reuse across CUDA-graph replays.
+        scratch = torch.zeros(8192, dtype=torch.float32, device=device)
+        _scratch[device] = scratch
+    return scratch
+
+
+def _default_rcp_quant_range(config: NVFP44Over6Config) -> float:
+    q = torch.tensor(6.0 * config.e4m3_max, dtype=torch.float32)
+    return float(torch.tensor(1.0, dtype=torch.float32) / q)
 
 
 @functools.cache
@@ -117,12 +133,7 @@ def get_nvfp4_4over6_quantize_sm120_module():
         m, k = input.shape
         out_fp4 = torch.empty((m, k // 2), dtype=torch.uint8, device=input.device)
         out_sf = torch.empty((_sf_numel(m, k),), dtype=torch.uint8, device=input.device)
-        scratch = _scratch.get(input.device)
-        if scratch is None:
-            # One float per cooperative block; every launch rewrites the slots it reads, so the buffer
-            # needs no reset and is safe to reuse across CUDA-graph replays.
-            scratch = torch.zeros(8192, dtype=torch.float32, device=input.device)
-            _scratch[input.device] = scratch
+        scratch = _device_scratch(input.device)
         module.nvfp4_4over6_dynamic_quantize_sm120(
             input,
             global_scale_out,
@@ -156,7 +167,77 @@ def get_nvfp4_4over6_quantize_sm120_module():
             input.new_empty((_sf_numel(m, k),), dtype=torch.uint8),
         )
 
-    return module, quantize, dynamic_quantize
+    @register_custom_op(
+        "flashinfer::nvfp4_4over6_dynamic_quantize_lora_down_sm120",
+        mutates_args=("global_scale_out", "alpha_out"),
+    )
+    def dynamic_quantize_lora_down(
+        input: torch.Tensor,
+        lora_down: torch.Tensor,
+        global_scale_out: torch.Tensor,
+        alpha_out: torch.Tensor,
+        weight_global_scale: torch.Tensor,
+        rcp_quant_range: float,
+        pdl: int,
+        path: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        m, k = input.shape
+        rank = lora_down.shape[0]
+        out_fp4 = torch.empty((m, k // 2), dtype=torch.uint8, device=input.device)
+        out_sf = torch.empty((_sf_numel(m, k),), dtype=torch.uint8, device=input.device)
+        down = torch.empty((m, rank), dtype=torch.bfloat16, device=input.device)
+        scratch = _device_scratch(input.device)
+        partials = _lora_partials.get(input.device)
+        if partials is None:
+            # rank-64 partial sums of the cooperative path: 64 slices x 64 rows x rank 64 (K <= 16384, M <= 64)
+            partials = torch.empty(
+                64 * 64 * 64, dtype=torch.float32, device=input.device
+            )
+            _lora_partials[input.device] = partials
+        taken = module.nvfp4_4over6_dynamic_quantize_lora_down_sm120(
+            input,
+            global_scale_out,
+            alpha_out,
+            weight_global_scale,
+            rcp_quant_range,
+            scratch,
+            lora_down,
+            partials,
+            out_fp4,
+            out_sf,
+            down,
+            path,
+            pdl,
+        )
+        if taken == 0:  # quantized only: LoRA-down after it, reading the alpha it wrote
+            if module.nvfp4_lora_down_supported_sm120(m, k):
+                module.nvfp4_lora_down_scaled_sm120(
+                    input, lora_down, alpha_out, down, pdl != 0
+                )
+            else:
+                torch.mm(input, lora_down.t(), out=down)
+                module.nvfp4_div_by_alpha_sm120(down, alpha_out, pdl != 0)
+        return out_fp4, out_sf, down
+
+    @register_fake_op("flashinfer::nvfp4_4over6_dynamic_quantize_lora_down_sm120")
+    def _fake_dynamic_quantize_lora_down(
+        input: torch.Tensor,
+        lora_down: torch.Tensor,
+        global_scale_out: torch.Tensor,
+        alpha_out: torch.Tensor,
+        weight_global_scale: torch.Tensor,
+        rcp_quant_range: float,
+        pdl: int,
+        path: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        m, k = input.shape
+        return (
+            input.new_empty((m, k // 2), dtype=torch.uint8),
+            input.new_empty((_sf_numel(m, k),), dtype=torch.uint8),
+            input.new_empty((m, lora_down.shape[0]), dtype=torch.bfloat16),
+        )
+
+    return module, quantize, dynamic_quantize, dynamic_quantize_lora_down
 
 
 @flashinfer_api
@@ -200,7 +281,7 @@ def nvfp4_4over6_quantize_sm120(
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
     global_scale = global_scale.to(device=input.device, dtype=torch.float32)
-    _, quantize, _ = get_nvfp4_4over6_quantize_sm120_module()
+    _, quantize, _, _ = get_nvfp4_4over6_quantize_sm120_module()
     x_q, sf = quantize(matrix, global_scale, 1 if enable_pdl else 0)
     return x_q.reshape(*lead, k // 2), sf
 
@@ -261,8 +342,7 @@ def nvfp4_4over6_dynamic_quantize_sm120(
     else:
         weight_global_scale = weight_global_scale.to(device=device, dtype=torch.float32)
     if rcp_quant_range is None:
-        q = torch.tensor(6.0 * nvfp4_4over6.e4m3_max, dtype=torch.float32)
-        rcp_quant_range = float(torch.tensor(1.0, dtype=torch.float32) / q)
+        rcp_quant_range = _default_rcp_quant_range(nvfp4_4over6)
     if global_scale_out is None:
         global_scale_out = torch.empty(1, dtype=torch.float32, device=device)
     if alpha_out is None:
@@ -270,8 +350,98 @@ def nvfp4_4over6_dynamic_quantize_sm120(
     if enable_pdl is None:
         enable_pdl = device_support_pdl(device)
     pdl = (1 if trigger_dependents else 2) if enable_pdl else 0
-    _, _, dynamic_quantize = get_nvfp4_4over6_quantize_sm120_module()
+    _, _, dynamic_quantize, _ = get_nvfp4_4over6_quantize_sm120_module()
     x_q, sf = dynamic_quantize(
         matrix, global_scale_out, alpha_out, weight_global_scale, rcp_quant_range, pdl
     )
     return x_q.reshape(*lead, k // 2), sf, global_scale_out, alpha_out
+
+
+@flashinfer_api
+def nvfp4_4over6_dynamic_quantize_lora_down_sm120(
+    input: torch.Tensor,
+    lora_down: torch.Tensor,
+    weight_global_scale: Optional[torch.Tensor] = None,
+    nvfp4_4over6: NVFP44Over6Config = DEFAULT_NVFP4_4OVER6_SM120,
+    rcp_quant_range: Optional[float] = None,
+    enable_pdl: Optional[bool] = None,
+    global_scale_out: Optional[torch.Tensor] = None,
+    alpha_out: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Dynamic NVFP4 4over6 quantization plus the SVDQuant LoRA-down, for SM12x and BF16 input.
+
+    Quantizes ``input`` exactly as :func:`nvfp4_4over6_dynamic_quantize_sm120` (same packed values, scale
+    buffer, ``global_scale`` and ``alpha``) and also returns
+    ``down = bf16((input @ lora_downᵀ) / alpha)``, the LoRA-down operand that
+    :func:`flashinfer.gemm.mm_nvfp4_svdquant` turns into ``alpha * (x_q @ wᵀ + down @ lora_upᵀ)``. Dividing
+    by the dynamic ``alpha`` here, instead of pre-dividing ``lora_up`` offline, keeps ``lora_up`` unchanged
+    when the activation scale changes every call.
+
+    ``down`` is computed in the quantization launch where that fits: up to 8 rows (at most 2048 scale
+    blocks, K <= 16384) every block reduces the amax and the extra blocks compute one rank row each (FP32
+    sums, one rounding); with a rank-64 ``lora_down``, up to 64 rows and K a multiple of 256 (at most
+    16384), one cooperative launch computes it on tensor cores (FP32 sums in a fixed order, one rounding).
+    Otherwise the quantization runs first and ``down`` follows it, from a one-launch kernel for
+    decode-sized inputs or a BF16 GEMM and an in-place division (two BF16 roundings).
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        ``[..., K]`` bfloat16, ``K`` a multiple of 16, 32-byte aligned, at least one row.
+    lora_down : torch.Tensor
+        ``[rank, K]`` bfloat16, 16-byte aligned: the SVDQuant down projection ``L2`` (``x @ L2ᵀ``).
+    weight_global_scale, nvfp4_4over6, rcp_quant_range, enable_pdl, global_scale_out, alpha_out
+        As in :func:`nvfp4_4over6_dynamic_quantize_sm120`.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(x_q, sf, down, global_scale, alpha)``; ``down`` is ``[..., rank]`` bfloat16.
+    """
+    _check_recipe(nvfp4_4over6)
+    _check_input(input)
+    lead, k = input.shape[:-1], input.shape[-1]
+    matrix = input.reshape(-1, k).contiguous()
+    if matrix.shape[0] == 0:
+        raise ValueError("dynamic quantization needs at least one row")
+    if (
+        lora_down.dim() != 2
+        or lora_down.shape[1] != k
+        or lora_down.dtype != torch.bfloat16
+    ):
+        raise ValueError(
+            f"lora_down must be a [rank, {k}] bfloat16 tensor, got {tuple(lora_down.shape)}"
+        )
+    lora_down = lora_down.contiguous()
+    device = input.device
+    if weight_global_scale is None:
+        weight_global_scale = torch.ones(1, dtype=torch.float32, device=device)
+    else:
+        weight_global_scale = weight_global_scale.to(device=device, dtype=torch.float32)
+    if rcp_quant_range is None:
+        rcp_quant_range = _default_rcp_quant_range(nvfp4_4over6)
+    if global_scale_out is None:
+        global_scale_out = torch.empty(1, dtype=torch.float32, device=device)
+    if alpha_out is None:
+        alpha_out = torch.empty(1, dtype=torch.float32, device=device)
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(device)
+    _, _, _, dynamic_quantize_lora_down = get_nvfp4_4over6_quantize_sm120_module()
+    x_q, sf, down = dynamic_quantize_lora_down(
+        matrix,
+        lora_down,
+        global_scale_out,
+        alpha_out,
+        weight_global_scale,
+        rcp_quant_range,
+        2 if enable_pdl else 0,
+        -1,
+    )
+    rank = lora_down.shape[0]
+    return (
+        x_q.reshape(*lead, k // 2),
+        sf,
+        down.reshape(*lead, rank),
+        global_scale_out,
+        alpha_out,
+    )
