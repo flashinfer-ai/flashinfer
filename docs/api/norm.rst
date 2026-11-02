@@ -171,10 +171,10 @@ took its ``det`` names. Every entry point takes the keyword ``deterministic``
   (``flashinfer.cake_rmsnorm_silu_gate_train_backend``, whose compute and
   workspace entry points take ``deterministic=False`` only): the same forward
   kernel (on SM100 and SM103 up to 10 rows per SM, a forward with 16 threads
-  to a row, and from 976 rows per SM, a forward whose CTAs each walk several
-  row blocks: the same bits) and a one-kernel backward: ``dx``
-  and ``dz`` are the deterministic backward's bits, and the CTAs take row
-  blocks (each CTA its own block when
+  to a row, and from 976 rows per SM on SM100 and SM103 and from 800 on SM107,
+  a forward whose CTAs each walk several row blocks: the same bits) and a
+  one-kernel backward: ``dx`` and ``dz`` are the deterministic backward's
+  bits, and the CTAs take row blocks (each CTA its own block when
   the grid has a CTA for every block; past one wave of CTAs they claim the
   blocks in chunks from the workspace's claim counter) and add their FP64
   weight-gradient column sums into FP64 accumulators of the workspace in the
