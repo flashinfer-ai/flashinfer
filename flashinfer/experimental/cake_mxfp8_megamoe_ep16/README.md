@@ -59,7 +59,7 @@ FlashInfer build target (`FLASHINFER_CUDA_ARCH_LIST` or the visible devices):
 `sm_100a`, `sm_103a` and `sm_107a`. The `sm_107a` target needs CUDA 13.4 or
 newer. The fused kernel runs a static schedule on a cooperative grid of
 two-CTA clusters, one CTA per SM: 72 clusters (144 CTAs), except the CUDA
-module for SM107, which defines `CAKE_MEGAMOE_GRID_CLUSTERS=96` (192 CTAs).
+module for SM107, which defines `CAKE_MEGAMOE_GRID_CLUSTERS=104` (208 CTAs).
 The CUDA backend refuses a device with fewer SMs than its grid has CTAs. The
 manifest lists the sources and launch facts; it does not re-verify digests at
 import time.

@@ -379,7 +379,7 @@ def test_cute_dsl_backend_targets_every_supported_capability(monkeypatch) -> Non
     (
         ((10, 0), "compute_100a", 144),
         ((10, 3), "compute_103a", 144),
-        ((10, 7), "compute_107a", 192),
+        ((10, 7), "compute_107a", 208),
     ),
 )
 def test_jit_spec_is_exact_per_capability(
@@ -402,7 +402,7 @@ def test_jit_spec_is_exact_per_capability(
     assert grid_flags == (
         [] if grid_ctas == 144 else [f"-DCAKE_MEGAMOE_GRID_CLUSTERS={grid_ctas // 2}"]
     )
-    assert _max_launch_epoch(grid_ctas) == {144: 14913079, 192: 11184809}[grid_ctas]
+    assert _max_launch_epoch(grid_ctas) == {144: 14913079, 208: 10324439}[grid_ctas]
 
 
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
@@ -508,7 +508,7 @@ def test_host_calls_bridge_the_torch_stream() -> None:
         assert len(bridged_calls) == 1
 
 
-@pytest.mark.parametrize("grid_ctas", (144, 192))
+@pytest.mark.parametrize("grid_ctas", (144, 208))
 def test_launch_epoch_guard_prevents_grid_counter_overflow(grid_ctas) -> None:
     _validate_launch_epoch(0, grid_ctas)
     _validate_launch_epoch(_max_launch_epoch(grid_ctas), grid_ctas)
