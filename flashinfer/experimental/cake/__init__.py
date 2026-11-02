@@ -13,7 +13,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Experimental Cake packages without a run-to-run bitwise contract.  Each
-subpackage is standalone (import it by its full name); this module imports
-nothing.
+Experimental Cake packages without a run-to-run bitwise contract: the
+non-deterministic counterparts of the deterministic (``*_det_*``) Cake training
+packages.  Each one has a facade whose ``deterministic: bool = True`` keyword
+routes to the deterministic package and whose ``deterministic=False`` runs the
+package's own non-deterministic programs.  Each subpackage is standalone
+(import it by its full name); this module imports nothing.
 """

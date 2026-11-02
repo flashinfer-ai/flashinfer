@@ -51,7 +51,7 @@ normalization dimension differs from the absorbed query width.
 
 | Feature | Support |
 |---|---|
-| GPU families | SM100/SM103 Blackwell; NVFP4 paths qualified locally on GB300 |
+| GPU families | SM100/SM103 Blackwell and SM107 Rubin; NVFP4 paths qualified locally on GB300 and Rubin |
 | Query shape | Fixed `[B,Sq,H,D]` or packed `[total_q,H,D]` with query offsets |
 | Query heads | Native automatic policy admits supported positive counts; NVFP4 qualification covers H8/H16/H32/H64/H128 |
 | Dense cache pages | 16, 32, 64 or 128 tokens; dense or bottom-right causal masking |

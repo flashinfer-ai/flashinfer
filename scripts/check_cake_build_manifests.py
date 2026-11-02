@@ -278,6 +278,17 @@ def refs_lm_head_det_loss(package_dir: Path, loader: str) -> set[str]:
     }
 
 
+def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
+    """The non-deterministic package ``flashinfer.experimental.cake.cake_lm_head_loss``: the registry shape of
+    :func:`refs_lm_head_det_loss`; the stage's library stem is ``cake_lm_head_loss_<unit>``."""
+    registry = module_literals(package_dir / loader)["_REGISTRY"]
+    return {
+        f"cake_lm_head_loss_{row[0]}_{compact['arch']}"
+        for compact in registry.values()
+        for row in compact["stages"].values()
+    }
+
+
 def refs_moe_grouped_det_gemm(package_dir: Path, loader: str) -> set[str]:
     """Route stages bind a program and its compile-line specializations; the build is
     ``<library><tag>_<arch>`` for every architecture the route and the program share."""
@@ -513,6 +524,12 @@ PACKAGES: tuple[Package, ...] = (
         "flashinfer/experimental/cake_lm_head_det_loss",
         "cake_jit.py",
         refs_lm_head_det_loss,
+    ),
+    Package(
+        "flashinfer.experimental.cake.cake_lm_head_loss",
+        "flashinfer/experimental/cake/cake_lm_head_loss",
+        "cake_jit.py",
+        refs_lm_head_loss,
     ),
     Package(
         "flashinfer.experimental.cake_mok_bf16",

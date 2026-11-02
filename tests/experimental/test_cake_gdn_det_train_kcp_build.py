@@ -45,7 +45,8 @@ PREFIX = "cake_gdn_det_train"
 KCP_SUFFIX = "_kcp"  # the context-parallel-only programs (``kcp_*``)
 _W = "sm100_sm103_sm107"
 
-# The nine programs of a step (the shipped records by program name: sixteen libraries) and the two test-only records.
+# The nine programs of a step (the shipped records by program name: sixteen libraries), the three programs of the
+# in-kernel Q / K L2 norm (one library each) and the two test-only records.
 SHIPPED_PROGRAMS = (
     "fwd_prep",
     "kcp_fwdh_offset",
@@ -58,6 +59,9 @@ SHIPPED_PROGRAMS = (
     "kcp_dhu_tape",
     "bwd_dqkg",
     "gate_epilogue",
+    "fwd_prep_l2n",
+    "bwd_dqkg_l2n",
+    "qk_apply",
 )
 TEST_RECORDS = ("kcp_transfer_walk_three_mma", "kcp_transfer_walk_plain_tf32")
 # The identity rule: ``cake_gdn_det_train_<20 hex of sha256("<kernel module>\\n<sorted JSON of the build keywords>")>``,
@@ -133,6 +137,18 @@ IDENTITIES = {
     ),
     "gate_epilogue": (
         f"tart.gdn_chunk_train_gate_epilogue.{_W}.gdn_chunk_det_train_gate_epilogue_v1",
+        {},
+    ),
+    "fwd_prep_l2n": (
+        f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_l2n_v1",
+        {},
+    ),
+    "bwd_dqkg_l2n": (
+        f"tart.gdn_chunk_train_bwd_dqkg_fused.{_W}.gdn_chunk_det_train_bwd_dqkg_l2n_v1",
+        {},
+    ),
+    "qk_apply": (
+        f"tart.gdn_chunk_train_qk_apply.{_W}.gdn_chunk_det_train_qk_apply_v1",
         {},
     ),
 }

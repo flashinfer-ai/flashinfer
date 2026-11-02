@@ -2169,6 +2169,101 @@ MODULES: dict[str, dict[str, Any]] = {
             "work": "uint32",
         },
     },
+    # Route ``bwd``: the single-launch build of the det program
+    # ``cake_causal_conv1d_det_train_8f872e5b653a26ab365d`` (the same build keywords, body and grid; selected
+    # from C = 264 on sm_100a and sm_103a: the single-tile channel counts 264 <= C < 512, whose channel vectors
+    # are no multiple of 32, copy each sub-tile's rows in one bulk copy per row group).  Every per-thread and
+    # per-CTA FP32 step and ``dx`` are bitwise the det program's; only the cross-CTA reduction differs: each CTA
+    # adds its CTA row into the FP32 accumulator ``acc`` (``[C x 4]``), takes a ticket on its channel tile's
+    # ``work`` counter (uint32 ``[n_ch_tiles]``), and the tile's last CTA stores FP32 ``dw`` once (one rounding
+    # from FP32) and zeroes its accumulators and counter, so ``acc`` / ``work`` are zero before and after every
+    # launch.  No reduce program, no host synchronization, no cooperative launch.
+    "cake_causal_conv1d_train_e8e950fb254d3376db52": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "dw_acc"],
+            ["buffer", "work"],
+            ["buffer", "dw"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 3,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_100a": 1,
+                "sm_103a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_train_e8e950fb254d3376db52",
+        "kernel_symbol": "kernel_cake_causal_conv1d_train_e8e950fb254d3376db52",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 66560,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_train_e8e950fb254d3376db52",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dw": "dw",
+            "dw_acc": "acc",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "search_steps": "search_steps",
+            "w": "w",
+            "work": "work",
+            "x": "x",
+            "x_map": "x",
+        },
+        "role": "bwd",
+        "select_rule": {
+            "channels": {
+                "sm_100a": 264,
+                "sm_103a": 264,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "acc": "float32",
+            "slots": 1,
+            "kind": "accumulators",
+            "taps": 4,
+            "work": "uint32",
+        },
+    },
 }
 
 # architecture -> route -> the records the route may launch (fallback first).
@@ -2177,6 +2272,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "bwd": [
             "cake_causal_conv1d_train_ea326ebe0f84d8cf2adb",
             "cake_causal_conv1d_train_461d358d7090642c65de",
+            "cake_causal_conv1d_train_e8e950fb254d3376db52",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_train_befc06774f6fee7c36ce",
@@ -2209,6 +2305,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_train_ea326ebe0f84d8cf2adb",
             "cake_causal_conv1d_train_461d358d7090642c65de",
             "cake_causal_conv1d_train_efd2e6f9ac3d58ab92ab",
+            "cake_causal_conv1d_train_e8e950fb254d3376db52",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_train_befc06774f6fee7c36ce",
@@ -2787,6 +2884,95 @@ def _lane_use(channel_vectors: int, width: int, threads: int) -> float:
     )
 
 
+# The narrower channel tiles of the backward programs, ``{arch: {(route, C):
+# (ct_vec, S_min, S_max)}}``: at exactly these channel counts, on these routes
+# and at ``S_min <= S <= S_max`` a backward call runs ``ct_vec``-vector tiles
+# instead of :func:`channel_split`'s wider ones (:func:`tile_override`).  More
+# tiles split the tail of a launch: each tile's accumulator words take the adds
+# of fewer CTAs, and more tiles' last CTAs share the finish.  ``dx`` does not
+# depend on the tiling; ``dweight`` / ``dbias`` add in another partition.  The
+# workspace takes one ticket per tile (:func:`backward_workspace_bytes` covers
+# the largest tile count of every row, whatever ``S``).  Written by the exporter
+# from the backward kernel generator's table; every other channel count, route,
+# ``S`` and architecture keeps :func:`channel_split`.
+TILE_OVERRIDES: dict[str, dict[tuple[str, int], tuple[int, int, int]]] = {
+    "sm_100a": {
+        ("bwd_bias", 768): (32, 62585, 500680),
+        ("bwd_bias_fp32g", 768): (32, 31292, 500680),
+        ("bwd_dt", 768): (32, 62585, 500680),
+        ("bwd_fp32g", 768): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 1536): (32, 31292, 500680),
+        ("bwd_dt", 1536): (32, 31292, 125170),
+        ("bwd_fp32g", 1536): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 2048): (32, 31292, 500680),
+        ("bwd_fp32g", 2048): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 2560): (32, 31292, 125170),
+        ("bwd_fp32g", 2560): (32, 31292, 125170),
+        ("bwd", 3072): (32, 31292, 125170),
+        ("bwd_bias", 3072): (64, 31292, 500680),
+        ("bwd_bias_fp32g", 3072): (64, 31292, 500680),
+        ("bwd_dt", 3072): (64, 31292, 500680),
+        ("bwd_fp32g", 3072): (64, 31292, 500680),
+    },
+    "sm_103a": {
+        ("bwd", 768): (32, 62585, 500680),
+        ("bwd_bias", 768): (32, 62585, 500680),
+        ("bwd_bias_fp32g", 768): (32, 31292, 500680),
+        ("bwd_dt", 768): (32, 62585, 500680),
+        ("bwd_fp32g", 768): (32, 62585, 500680),
+        ("bwd", 1536): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 1536): (32, 31292, 500680),
+        ("bwd_dt", 1536): (32, 31292, 500680),
+        ("bwd_fp32g", 1536): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 2048): (32, 31292, 500680),
+        ("bwd_fp32g", 2048): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 2560): (32, 31292, 250340),
+        ("bwd_fp32g", 2560): (32, 31292, 250340),
+        ("bwd", 3072): (32, 31292, 500680),
+        ("bwd_bias", 3072): (64, 31292, 500680),
+        ("bwd_bias_fp32g", 3072): (32, 31292, 500680),
+        ("bwd_dt", 3072): (32, 31292, 500680),
+        ("bwd_fp32g", 3072): (32, 31292, 500680),
+        ("bwd_bias_fp32g", 4096): (32, 31292, 500680),
+        ("bwd_fp32g", 4096): (32, 31292, 500680),
+    },
+    "sm_107a": {},
+}
+
+
+def tile_override(arch: str, route: str, C: int, S: int) -> int | None:
+    """The ``ct_vec`` of :data:`TILE_OVERRIDES` for a backward call of ``route``
+    on ``arch`` with ``C`` channels and ``S`` tokens (``S_min <= S <= S_max``,
+    both bounds included), else ``None`` (:func:`channel_split` plans it)."""
+
+    entry = TILE_OVERRIDES.get(arch, {}).get((route, int(C)))
+    if entry is None:
+        return None
+    ct_vec, s_min, s_max = entry
+    return int(ct_vec) if int(s_min) <= int(S) <= int(s_max) else None
+
+
+def _override_split(
+    ct_vec: int, C: int, geometry: dict[str, int]
+) -> tuple[int, int, int]:
+    """``(ct_vec, n_sub, n_ch_tiles)`` of an override's ``ct_vec``: ``threads //
+    ct_vec`` token sub-tiles and ``ceil(C / vec / ct_vec)`` channel tiles."""
+
+    threads, vec = int(geometry["threads"]), int(geometry["vec"])
+    return ct_vec, threads // ct_vec, _ceil_div(int(C) // vec, ct_vec)
+
+
+def override_tiles(arch: str, route: str, C: int, geometry: dict[str, int]) -> int:
+    """The channel tiles of the :data:`TILE_OVERRIDES` row of ``(arch, route,
+    C)`` under ``geometry`` (0 without a row), whatever ``S``: the workspace
+    bound of the row's launches."""
+
+    entry = TILE_OVERRIDES.get(arch, {}).get((route, int(C)))
+    if entry is None:
+        return 0
+    return _override_split(int(entry[0]), C, geometry)[2]
+
+
 def plan(
     S: int,
     C: int,
@@ -2795,6 +2981,8 @@ def plan(
     geometry: dict[str, int],
     role: str | None = None,
     legacy: bool = False,
+    arch: str | None = None,
+    route: str | None = None,
 ) -> dict[str, int]:
     """The kernel's launch scalars for one problem under a record's build geometry and role.
 
@@ -2808,7 +2996,11 @@ def plan(
     geometry and the role: the host never reads ``cu_seqlens``, and the kernel
     derives its token ranges from ``S`` and the grid.  The ``flags`` scalar of
     the ``dtype_flags`` programs is not a plan value: the host derives it from
-    the tensors of the call.
+    the tensors of the call.  Given the backward record's ``arch`` and
+    ``route`` (:func:`record_route`), a row of :data:`TILE_OVERRIDES`
+    (:func:`tile_override`) replaces the split by ``(ct_vec, threads //
+    ct_vec, ceil(C / vec / ct_vec))``; without them, for the forward role and
+    under ``legacy`` the split is :func:`channel_split`'s.
     """
 
     S, C, num_docs = int(S), int(C), int(num_docs)
@@ -2817,6 +3009,10 @@ def plan(
     ct_vec, n_sub, n_ch_tiles = channel_split(
         C, geometry=geometry, role=role, legacy=legacy
     )
+    if role == "bwd" and not legacy and arch is not None and route is not None:
+        override = tile_override(arch, route, C, S)
+        if override is not None:
+            ct_vec, n_sub, n_ch_tiles = _override_split(override, C, geometry)
     return {
         "S": S,
         "C": C,
@@ -3142,15 +3338,18 @@ def backward_workspace_bytes(arch: str, C: int) -> int:
 
     The largest :func:`accumulator_layout` over every backward program of every
     backward route of the architecture (each planned with its own geometry and
-    role), so one zeroed buffer serves whichever program a call selects.  It
-    depends on ``C`` and the architecture only (not on ``S``, the SM count or
-    the grid).
+    role, at the larger of :func:`channel_split`'s tile count and its route's
+    :func:`override_tiles`), so one zeroed buffer serves whichever program and
+    plan a call selects.  It depends on ``C`` and the architecture only (not on
+    ``S``, the SM count or the grid).
     """
 
     nbytes = 0
     for owner in workspace_owners(arch):
-        _, _, n_ch_tiles = channel_split(
-            C, geometry=owner["grid_rule"]["geometry"], role=owner["role"]
+        geometry = owner["grid_rule"]["geometry"]
+        _, _, n_ch_tiles = channel_split(C, geometry=geometry, role=owner["role"])
+        n_ch_tiles = max(
+            n_ch_tiles, override_tiles(arch, record_route(owner, arch), C, geometry)
         )
         nbytes = max(
             nbytes, int(accumulator_layout(owner, C, n_ch_tiles)["total_bytes"])
