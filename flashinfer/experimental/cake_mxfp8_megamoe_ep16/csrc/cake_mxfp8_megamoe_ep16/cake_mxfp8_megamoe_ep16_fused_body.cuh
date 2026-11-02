@@ -22,9 +22,54 @@
 #if !defined(CAKE_MEGAMOE_FUSED_SYMBOL) || !defined(CAKE_MEGAMOE_RETURN_ALL_CTA)
 #error "cake_mxfp8_megamoe_ep16_fused_body.cuh needs CAKE_MEGAMOE_FUSED_SYMBOL and CAKE_MEGAMOE_RETURN_ALL_CTA"
 #endif
+#ifndef CAKE_MEGAMOE_SCHEDULE_DEFINED
+#define CAKE_MEGAMOE_SCHEDULE_DEFINED
+// Static FC schedule of the grid's CAKE_MEGAMOE_GRID_CLUSTERS two-CTA clusters (all co-resident): every cluster streams
+// the same number of weight K tiles, whole-K items only.  FC1 runs FC1_SHORT_ITEMS waves over every cluster, then
+// FC1_LONG_ITEMS - FC1_SHORT_ITEMS more over clusters [0, FC1_LONG_CLUSTERS); the other clusters take FC2 items
+// [0, FC2_EARLY_ITEMS) (experts whose FC1 finished in the shared waves), [0, FC1_LONG_CLUSTERS) take the rest.
+// 72 clusters (144 CTAs, 640 K tiles per cluster) by default (sm_100a, sm_103a); the sm_107a build (R200, 212 or 216
+// SMs) defines 96 (192 CTAs, 480 K tiles per cluster).  The binding launches the same grid.
+#ifndef CAKE_MEGAMOE_GRID_CLUSTERS
+#define CAKE_MEGAMOE_GRID_CLUSTERS 72
+#endif
+#if CAKE_MEGAMOE_GRID_CLUSTERS == 72
+#define CAKE_MEGAMOE_FC1_LONG_CLUSTERS 40
+#define CAKE_MEGAMOE_FC1_LONG_ITEMS 20
+#define CAKE_MEGAMOE_FC1_SHORT_ITEMS 15
+#define CAKE_MEGAMOE_FC2_SHORT_ITEMS 4
+#define CAKE_MEGAMOE_FC2_LONG_ITEMS 7
+#elif CAKE_MEGAMOE_GRID_CLUSTERS == 96
+#define CAKE_MEGAMOE_FC1_LONG_CLUSTERS 64
+#define CAKE_MEGAMOE_FC1_LONG_ITEMS 15
+#define CAKE_MEGAMOE_FC1_SHORT_ITEMS 10
+#define CAKE_MEGAMOE_FC2_SHORT_ITEMS 3
+#define CAKE_MEGAMOE_FC2_LONG_ITEMS 6
+#else
+#error "CAKE_MEGAMOE_GRID_CLUSTERS must be 72 or 96"
+#endif
+#define CAKE_MEGAMOE_FC1_SHORT_CLUSTERS (CAKE_MEGAMOE_GRID_CLUSTERS - CAKE_MEGAMOE_FC1_LONG_CLUSTERS)
+#define CAKE_MEGAMOE_FC2_EARLY_ITEMS (CAKE_MEGAMOE_FC1_SHORT_CLUSTERS * CAKE_MEGAMOE_FC2_LONG_ITEMS)
+// CTAs per source rank in dispatch (9 or 12): CTA b serves source rank b % 16 and its tokens b / 16 + j * this.
+#define CAKE_MEGAMOE_DISPATCH_CTAS_PER_SOURCE (CAKE_MEGAMOE_GRID_CLUSTERS * 2 / 16)
+static_assert(CAKE_MEGAMOE_FC1_SHORT_ITEMS * CAKE_MEGAMOE_GRID_CLUSTERS
+              + (CAKE_MEGAMOE_FC1_LONG_ITEMS - CAKE_MEGAMOE_FC1_SHORT_ITEMS) * CAKE_MEGAMOE_FC1_LONG_CLUSTERS == 32 * 40,
+              "every FC1 item (32 experts x 40 row tiles) once");
+static_assert(CAKE_MEGAMOE_FC2_EARLY_ITEMS + CAKE_MEGAMOE_FC2_SHORT_ITEMS * CAKE_MEGAMOE_FC1_LONG_CLUSTERS == 32 * 12,
+              "every FC2 item (32 experts x 12 row tiles) once");
+static_assert(CAKE_MEGAMOE_FC1_LONG_ITEMS * 24 + CAKE_MEGAMOE_FC2_SHORT_ITEMS * 40
+              == CAKE_MEGAMOE_FC1_SHORT_ITEMS * 24 + CAKE_MEGAMOE_FC2_LONG_ITEMS * 40, "equal K tiles per cluster");
+static_assert(CAKE_MEGAMOE_FC1_LONG_CLUSTERS < CAKE_MEGAMOE_GRID_CLUSTERS
+              && CAKE_MEGAMOE_GRID_CLUSTERS < 2 * CAKE_MEGAMOE_FC1_LONG_CLUSTERS
+              && CAKE_MEGAMOE_FC1_LONG_ITEMS < 2 * CAKE_MEGAMOE_FC1_SHORT_ITEMS, "late_cluster and item / short in {0, 1}");
+static_assert((CAKE_MEGAMOE_FC2_EARLY_ITEMS + 11) / 12 * 40 <= CAKE_MEGAMOE_FC1_SHORT_ITEMS * CAKE_MEGAMOE_GRID_CLUSTERS,
+              "the early FC2 items need only experts whose FC1 the shared waves finish");
+static_assert(CAKE_MEGAMOE_GRID_CLUSTERS * 2 % 16 == 0, "whole CTAs per source rank");
+#endif
 #ifndef CAKE_MEGAMOE_DISPATCH_ROWS_DEFINED
 #define CAKE_MEGAMOE_DISPATCH_ROWS_DEFINED
-// The 144-CTA grid has exactly nine CTAs per source rank.  Each CTA keeps one peer fixed and serves every ninth source token of it;
+// The grid has CAKE_MEGAMOE_DISPATCH_CTAS_PER_SOURCE CTAs per source rank (nine of 144, twelve of 192).  Each CTA
+// keeps one peer fixed and serves every CAKE_MEGAMOE_DISPATCH_CTAS_PER_SOURCE-th source token of it;
 // its 12 warps take those tokens in parallel, one token per warp.  Lanes 0-7 of the warp claim the owner-local expert
 // rows of the token's eight routes, a shuffle hands each claimed row to the whole warp, and the warp copies the 6 KiB
 // BF16 row once (12 raw 16-byte words per lane, in two passes of six) to every claimed row.  A source hidden row is
@@ -41,10 +86,11 @@ static __device__ __forceinline__ void cake_megamoe_dispatch_rows(
     const int* remote_ids = reinterpret_cast<const int*>(published_topk_ids_i32_peers[source_rank]);
     const float* remote_weights = reinterpret_cast<const float*>(published_topk_weights_f32_peers[source_rank]);
     const uint4* remote_hidden = reinterpret_cast<const uint4*>(published_hidden_bf16_peers[source_rank]);
-    const int local_tokens = (tokens_per_rank - source_token_begin + 8) / 9;
+    const int local_tokens = (tokens_per_rank - source_token_begin + CAKE_MEGAMOE_DISPATCH_CTAS_PER_SOURCE - 1)
+        / CAKE_MEGAMOE_DISPATCH_CTAS_PER_SOURCE;
     #pragma unroll 1
     for (int local_token = warp; local_token < local_tokens; local_token += 12) {
-        const int source_token = source_token_begin + local_token * 9;
+        const int source_token = source_token_begin + local_token * CAKE_MEGAMOE_DISPATCH_CTAS_PER_SOURCE;
         const int routes_per_source = tokens_per_rank * 8;
         const int source_route_lane = source_token * 8 + lane;
         int row_index_lane = -1;
@@ -106,11 +152,12 @@ static __device__ __forceinline__ void cake_megamoe_dispatch_rows_early(
     const float* mailbox_weights = route_weights_mailbox + source_rank * tokens_per_rank * 8;
     // The source rank's rows, pushed into this rank's row mailbox slot before rank barrier 0 (local loads).
     const uint4* remote_hidden = reinterpret_cast<const uint4*>(row_mailbox + source_rank * tokens_per_rank * 3072);
-    const int local_tokens = (tokens_per_rank - source_token_begin + 8) / 9;
+    const int local_tokens = (tokens_per_rank - source_token_begin + CAKE_MEGAMOE_DISPATCH_CTAS_PER_SOURCE - 1)
+        / CAKE_MEGAMOE_DISPATCH_CTAS_PER_SOURCE;
     constexpr int kWords = kOnePass ? 12 : 6;
     #pragma unroll 1
     for (int local_token = slot; local_token < local_tokens; local_token += 12) {
-        const int source_token = source_token_begin + local_token * 9;
+        const int source_token = source_token_begin + local_token * CAKE_MEGAMOE_DISPATCH_CTAS_PER_SOURCE;
         const int routes_per_source = tokens_per_rank * 8;
         const int source_route_lane = source_token * 8 + lane;
         int global_expert = 0;
@@ -626,17 +673,22 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
             unsigned int _phase_acc_full = 0;
             #pragma unroll
             for (int phase = 0; phase < 2; phase++) {
-                // Every cluster streams 640 weight K tiles: clusters [0, 40) take 20 FC1 + 4 FC2 items, [40, 72) take
-                // 15 FC1 + 7 FC2. FC1 runs 15 waves over every cluster, then 5 over [0, 40); [40, 72) take FC2 items
-                // [0, 224) (experts whose FC1 finished in the shared waves), [0, 40) take [224, 384).
-                const int late_cluster = (int)cluster_id / 40;
-                const int work_count = ((phase == 0) ? 20 - 5 * late_cluster : 4 + 3 * late_cluster);
+                // Every cluster streams the same number of weight K tiles (CAKE_MEGAMOE_SCHEDULE_DEFINED above): 640 on the
+                // 72-cluster grid, where clusters [0, 40) take 20 FC1 + 4 FC2 items and [40, 72) 15 FC1 + 7 FC2 (FC2 [0, 224) /
+                // [224, 384)); 480 on the 96-cluster grid, [0, 64) 15 FC1 + 3 FC2 and [64, 96) 10 FC1 + 6 FC2 (FC2 [0, 192) / [192, 384)).
+                const int late_cluster = (int)cluster_id / CAKE_MEGAMOE_FC1_LONG_CLUSTERS;
+                const int work_count = ((phase == 0)
+                    ? CAKE_MEGAMOE_FC1_LONG_ITEMS - (CAKE_MEGAMOE_FC1_LONG_ITEMS - CAKE_MEGAMOE_FC1_SHORT_ITEMS) * late_cluster
+                    : CAKE_MEGAMOE_FC2_SHORT_ITEMS + (CAKE_MEGAMOE_FC2_LONG_ITEMS - CAKE_MEGAMOE_FC2_SHORT_ITEMS) * late_cluster);
                 int m_tiles_per_expert = ((phase == 0) ? 40 : 12);
                 #pragma unroll 1
                 for (int item = 0; item < work_count; ++item) {
                     const int work = ((phase == 0)
-                        ? item * 72 + (int)cluster_id - (item / 15) * (item - 15) * 32
-                        : 224 + item * 40 + (int)cluster_id - late_cluster * (264 + item * 8));
+                        ? item * CAKE_MEGAMOE_GRID_CLUSTERS + (int)cluster_id
+                            - (item / CAKE_MEGAMOE_FC1_SHORT_ITEMS) * (item - CAKE_MEGAMOE_FC1_SHORT_ITEMS) * CAKE_MEGAMOE_FC1_SHORT_CLUSTERS
+                        : CAKE_MEGAMOE_FC2_EARLY_ITEMS + item * CAKE_MEGAMOE_FC1_LONG_CLUSTERS + (int)cluster_id
+                            - late_cluster * (CAKE_MEGAMOE_FC2_EARLY_ITEMS + CAKE_MEGAMOE_FC1_LONG_CLUSTERS
+                                + item * (CAKE_MEGAMOE_FC1_LONG_CLUSTERS - CAKE_MEGAMOE_FC1_SHORT_CLUSTERS)));
                     int expert_1 = work / m_tiles_per_expert;
                     int weight_m_tile = work - expert_1 * m_tiles_per_expert;
                     int route_count = (int)route_counts_u32[expert_1];
@@ -1670,17 +1722,22 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
             if (cta_rank == 0) {
                 #pragma unroll
                 for (int phase_1 = 0; phase_1 < 2; phase_1++) {
-                    // Every cluster streams 640 weight K tiles: clusters [0, 40) take 20 FC1 + 4 FC2 items, [40, 72) take
-                    // 15 FC1 + 7 FC2. FC1 runs 15 waves over every cluster, then 5 over [0, 40); [40, 72) take FC2 items
-                    // [0, 224) (experts whose FC1 finished in the shared waves), [0, 40) take [224, 384).
-                    const int late_cluster_1 = (int)cluster_id / 40;
-                    const int work_count_1 = ((phase_1 == 0) ? 20 - 5 * late_cluster_1 : 4 + 3 * late_cluster_1);
+                    // Every cluster streams the same number of weight K tiles (CAKE_MEGAMOE_SCHEDULE_DEFINED above): 640 on the
+                    // 72-cluster grid, where clusters [0, 40) take 20 FC1 + 4 FC2 items and [40, 72) 15 FC1 + 7 FC2 (FC2 [0, 224) /
+                    // [224, 384)); 480 on the 96-cluster grid, [0, 64) 15 FC1 + 3 FC2 and [64, 96) 10 FC1 + 6 FC2 (FC2 [0, 192) / [192, 384)).
+                    const int late_cluster_1 = (int)cluster_id / CAKE_MEGAMOE_FC1_LONG_CLUSTERS;
+                    const int work_count_1 = ((phase_1 == 0)
+                        ? CAKE_MEGAMOE_FC1_LONG_ITEMS - (CAKE_MEGAMOE_FC1_LONG_ITEMS - CAKE_MEGAMOE_FC1_SHORT_ITEMS) * late_cluster_1
+                        : CAKE_MEGAMOE_FC2_SHORT_ITEMS + (CAKE_MEGAMOE_FC2_LONG_ITEMS - CAKE_MEGAMOE_FC2_SHORT_ITEMS) * late_cluster_1);
                     int m_tiles_per_expert_1 = ((phase_1 == 0) ? 40 : 12);
                     #pragma unroll 1
                     for (int item_1 = 0; item_1 < work_count_1; ++item_1) {
                         const int work_1 = ((phase_1 == 0)
-                            ? item_1 * 72 + (int)cluster_id - (item_1 / 15) * (item_1 - 15) * 32
-                            : 224 + item_1 * 40 + (int)cluster_id - late_cluster_1 * (264 + item_1 * 8));
+                            ? item_1 * CAKE_MEGAMOE_GRID_CLUSTERS + (int)cluster_id
+                                - (item_1 / CAKE_MEGAMOE_FC1_SHORT_ITEMS) * (item_1 - CAKE_MEGAMOE_FC1_SHORT_ITEMS) * CAKE_MEGAMOE_FC1_SHORT_CLUSTERS
+                            : CAKE_MEGAMOE_FC2_EARLY_ITEMS + item_1 * CAKE_MEGAMOE_FC1_LONG_CLUSTERS + (int)cluster_id
+                                - late_cluster_1 * (CAKE_MEGAMOE_FC2_EARLY_ITEMS + CAKE_MEGAMOE_FC1_LONG_CLUSTERS
+                                    + item_1 * (CAKE_MEGAMOE_FC1_LONG_CLUSTERS - CAKE_MEGAMOE_FC1_SHORT_CLUSTERS)));
                         int expert_3 = work_1 / m_tiles_per_expert_1;
                         int weight_m_tile_1 = work_1 - expert_3 * m_tiles_per_expert_1;
                         int route_count_1 = (int)route_counts_u32[expert_3];
@@ -1939,7 +1996,7 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
                 if (elect_sync()) {
                     #pragma unroll 1
                     for (int pf_item = 0; pf_item < 1; pf_item++) {
-                        const int pf_work = pf_item * 72 + (int)cluster_id;
+                        const int pf_work = pf_item * CAKE_MEGAMOE_GRID_CLUSTERS + (int)cluster_id;
                         const int pf_expert = pf_work / 40;
                         const int pf_m_tile = pf_work - pf_expert * 40;
                         #pragma unroll 1
@@ -2048,17 +2105,22 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
             unsigned int _phase_scale_free = 1;
             #pragma unroll
             for (int phase_2 = 0; phase_2 < 2; phase_2++) {
-                // Every cluster streams 640 weight K tiles: clusters [0, 40) take 20 FC1 + 4 FC2 items, [40, 72) take
-                // 15 FC1 + 7 FC2. FC1 runs 15 waves over every cluster, then 5 over [0, 40); [40, 72) take FC2 items
-                // [0, 224) (experts whose FC1 finished in the shared waves), [0, 40) take [224, 384).
-                const int late_cluster_2 = (int)cluster_id / 40;
-                const int work_count_2 = ((phase_2 == 0) ? 20 - 5 * late_cluster_2 : 4 + 3 * late_cluster_2);
+                // Every cluster streams the same number of weight K tiles (CAKE_MEGAMOE_SCHEDULE_DEFINED above): 640 on the
+                // 72-cluster grid, where clusters [0, 40) take 20 FC1 + 4 FC2 items and [40, 72) 15 FC1 + 7 FC2 (FC2 [0, 224) /
+                // [224, 384)); 480 on the 96-cluster grid, [0, 64) 15 FC1 + 3 FC2 and [64, 96) 10 FC1 + 6 FC2 (FC2 [0, 192) / [192, 384)).
+                const int late_cluster_2 = (int)cluster_id / CAKE_MEGAMOE_FC1_LONG_CLUSTERS;
+                const int work_count_2 = ((phase_2 == 0)
+                    ? CAKE_MEGAMOE_FC1_LONG_ITEMS - (CAKE_MEGAMOE_FC1_LONG_ITEMS - CAKE_MEGAMOE_FC1_SHORT_ITEMS) * late_cluster_2
+                    : CAKE_MEGAMOE_FC2_SHORT_ITEMS + (CAKE_MEGAMOE_FC2_LONG_ITEMS - CAKE_MEGAMOE_FC2_SHORT_ITEMS) * late_cluster_2);
                 int m_tiles_per_expert_2 = ((phase_2 == 0) ? 40 : 12);
                 #pragma unroll 1
                 for (int item_2 = 0; item_2 < work_count_2; ++item_2) {
                     const int work_2 = ((phase_2 == 0)
-                        ? item_2 * 72 + (int)cluster_id - (item_2 / 15) * (item_2 - 15) * 32
-                        : 224 + item_2 * 40 + (int)cluster_id - late_cluster_2 * (264 + item_2 * 8));
+                        ? item_2 * CAKE_MEGAMOE_GRID_CLUSTERS + (int)cluster_id
+                            - (item_2 / CAKE_MEGAMOE_FC1_SHORT_ITEMS) * (item_2 - CAKE_MEGAMOE_FC1_SHORT_ITEMS) * CAKE_MEGAMOE_FC1_SHORT_CLUSTERS
+                        : CAKE_MEGAMOE_FC2_EARLY_ITEMS + item_2 * CAKE_MEGAMOE_FC1_LONG_CLUSTERS + (int)cluster_id
+                            - late_cluster_2 * (CAKE_MEGAMOE_FC2_EARLY_ITEMS + CAKE_MEGAMOE_FC1_LONG_CLUSTERS
+                                + item_2 * (CAKE_MEGAMOE_FC1_LONG_CLUSTERS - CAKE_MEGAMOE_FC1_SHORT_CLUSTERS)));
                     int expert_5 = work_2 / m_tiles_per_expert_2;
                     int weight_m_tile_2 = work_2 - expert_5 * m_tiles_per_expert_2;
                     int num_k_tiles_1 = ((phase_2 == 0) ? 24 : 40);
@@ -2311,17 +2373,22 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
             unsigned int _phase_b_free = 1;
             #pragma unroll
             for (int phase_3 = 0; phase_3 < 2; phase_3++) {
-                // Every cluster streams 640 weight K tiles: clusters [0, 40) take 20 FC1 + 4 FC2 items, [40, 72) take
-                // 15 FC1 + 7 FC2. FC1 runs 15 waves over every cluster, then 5 over [0, 40); [40, 72) take FC2 items
-                // [0, 224) (experts whose FC1 finished in the shared waves), [0, 40) take [224, 384).
-                const int late_cluster_3 = (int)cluster_id / 40;
-                const int work_count_3 = ((phase_3 == 0) ? 20 - 5 * late_cluster_3 : 4 + 3 * late_cluster_3);
+                // Every cluster streams the same number of weight K tiles (CAKE_MEGAMOE_SCHEDULE_DEFINED above): 640 on the
+                // 72-cluster grid, where clusters [0, 40) take 20 FC1 + 4 FC2 items and [40, 72) 15 FC1 + 7 FC2 (FC2 [0, 224) /
+                // [224, 384)); 480 on the 96-cluster grid, [0, 64) 15 FC1 + 3 FC2 and [64, 96) 10 FC1 + 6 FC2 (FC2 [0, 192) / [192, 384)).
+                const int late_cluster_3 = (int)cluster_id / CAKE_MEGAMOE_FC1_LONG_CLUSTERS;
+                const int work_count_3 = ((phase_3 == 0)
+                    ? CAKE_MEGAMOE_FC1_LONG_ITEMS - (CAKE_MEGAMOE_FC1_LONG_ITEMS - CAKE_MEGAMOE_FC1_SHORT_ITEMS) * late_cluster_3
+                    : CAKE_MEGAMOE_FC2_SHORT_ITEMS + (CAKE_MEGAMOE_FC2_LONG_ITEMS - CAKE_MEGAMOE_FC2_SHORT_ITEMS) * late_cluster_3);
                 int m_tiles_per_expert_3 = ((phase_3 == 0) ? 40 : 12);
                 #pragma unroll 1
                 for (int item_3 = 0; item_3 < work_count_3; ++item_3) {
                     const int work_3 = ((phase_3 == 0)
-                        ? item_3 * 72 + (int)cluster_id - (item_3 / 15) * (item_3 - 15) * 32
-                        : 224 + item_3 * 40 + (int)cluster_id - late_cluster_3 * (264 + item_3 * 8));
+                        ? item_3 * CAKE_MEGAMOE_GRID_CLUSTERS + (int)cluster_id
+                            - (item_3 / CAKE_MEGAMOE_FC1_SHORT_ITEMS) * (item_3 - CAKE_MEGAMOE_FC1_SHORT_ITEMS) * CAKE_MEGAMOE_FC1_SHORT_CLUSTERS
+                        : CAKE_MEGAMOE_FC2_EARLY_ITEMS + item_3 * CAKE_MEGAMOE_FC1_LONG_CLUSTERS + (int)cluster_id
+                            - late_cluster_3 * (CAKE_MEGAMOE_FC2_EARLY_ITEMS + CAKE_MEGAMOE_FC1_LONG_CLUSTERS
+                                + item_3 * (CAKE_MEGAMOE_FC1_LONG_CLUSTERS - CAKE_MEGAMOE_FC1_SHORT_CLUSTERS)));
                     int expert_7 = work_3 / m_tiles_per_expert_3;
                     int weight_m_tile_3 = work_3 - expert_7 * m_tiles_per_expert_3;
                     int route_count_2 = (int)route_counts_u32[expert_7];
@@ -2830,17 +2897,22 @@ CAKE_MEGAMOE_FUSED_SYMBOL(__nv_bfloat16* __restrict__ source_hidden_bf16, long l
             unsigned int _phase_transformed_free = 1;
             #pragma unroll
             for (int phase_4 = 0; phase_4 < 2; phase_4++) {
-                // Every cluster streams 640 weight K tiles: clusters [0, 40) take 20 FC1 + 4 FC2 items, [40, 72) take
-                // 15 FC1 + 7 FC2. FC1 runs 15 waves over every cluster, then 5 over [0, 40); [40, 72) take FC2 items
-                // [0, 224) (experts whose FC1 finished in the shared waves), [0, 40) take [224, 384).
-                const int late_cluster_4 = (int)cluster_id / 40;
-                const int work_count_4 = ((phase_4 == 0) ? 20 - 5 * late_cluster_4 : 4 + 3 * late_cluster_4);
+                // Every cluster streams the same number of weight K tiles (CAKE_MEGAMOE_SCHEDULE_DEFINED above): 640 on the
+                // 72-cluster grid, where clusters [0, 40) take 20 FC1 + 4 FC2 items and [40, 72) 15 FC1 + 7 FC2 (FC2 [0, 224) /
+                // [224, 384)); 480 on the 96-cluster grid, [0, 64) 15 FC1 + 3 FC2 and [64, 96) 10 FC1 + 6 FC2 (FC2 [0, 192) / [192, 384)).
+                const int late_cluster_4 = (int)cluster_id / CAKE_MEGAMOE_FC1_LONG_CLUSTERS;
+                const int work_count_4 = ((phase_4 == 0)
+                    ? CAKE_MEGAMOE_FC1_LONG_ITEMS - (CAKE_MEGAMOE_FC1_LONG_ITEMS - CAKE_MEGAMOE_FC1_SHORT_ITEMS) * late_cluster_4
+                    : CAKE_MEGAMOE_FC2_SHORT_ITEMS + (CAKE_MEGAMOE_FC2_LONG_ITEMS - CAKE_MEGAMOE_FC2_SHORT_ITEMS) * late_cluster_4);
                 int m_tiles_per_expert_4 = ((phase_4 == 0) ? 40 : 12);
                 #pragma unroll 1
                 for (int item_4 = 0; item_4 < work_count_4; ++item_4) {
                     const int work_4 = ((phase_4 == 0)
-                        ? item_4 * 72 + (int)cluster_id - (item_4 / 15) * (item_4 - 15) * 32
-                        : 224 + item_4 * 40 + (int)cluster_id - late_cluster_4 * (264 + item_4 * 8));
+                        ? item_4 * CAKE_MEGAMOE_GRID_CLUSTERS + (int)cluster_id
+                            - (item_4 / CAKE_MEGAMOE_FC1_SHORT_ITEMS) * (item_4 - CAKE_MEGAMOE_FC1_SHORT_ITEMS) * CAKE_MEGAMOE_FC1_SHORT_CLUSTERS
+                        : CAKE_MEGAMOE_FC2_EARLY_ITEMS + item_4 * CAKE_MEGAMOE_FC1_LONG_CLUSTERS + (int)cluster_id
+                            - late_cluster_4 * (CAKE_MEGAMOE_FC2_EARLY_ITEMS + CAKE_MEGAMOE_FC1_LONG_CLUSTERS
+                                + item_4 * (CAKE_MEGAMOE_FC1_LONG_CLUSTERS - CAKE_MEGAMOE_FC1_SHORT_CLUSTERS)));
                     int expert_10 = work_4 / m_tiles_per_expert_4;
                     int weight_m_tile_4 = work_4 - expert_10 * m_tiles_per_expert_4;
                     int num_k_tiles_3 = ((phase_4 == 0) ? 24 : 40);
