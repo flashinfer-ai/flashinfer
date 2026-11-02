@@ -475,7 +475,8 @@ def _check_operands(
 ) -> tuple[int, int, int, tuple]:
     """dtype, rank and shape of the three required operands; the resolved
     ``(M, N, K, act's leading shape)``.  A 0-d ``act`` is rejected before its
-    last dimension is read; the scale's shape before it is reshaped."""
+    last dimension is read.  ``weight_scale`` is one fp32 value of shape ``()``
+    or ``(1,)`` and goes to the launcher as given."""
     if act.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"act must be float16 or bfloat16, got {act.dtype}")
     if weight.dtype != torch.float8_e4m3fn:
