@@ -434,7 +434,10 @@ def _get_reduce_kernel(
     return compiled
 
 
-_PLAN_CACHE: Dict[Tuple, Tuple] = {}
+# Resolved plans by (device / SM count, algo, shape): the cost models run once per
+# distinct call signature.
+_SM100_PLAN_CACHE: Dict[Tuple, "_Sm100Plan"] = {}
+_SM90_PLAN_CACHE: Dict[Tuple, "_Sm90Plan"] = {}
 
 
 def _device_index(device: torch.device) -> int:
@@ -469,8 +472,8 @@ def _sm100_plan(algo: int, m: int, n: int, k: int, device: torch.device) -> _Sm1
     call.  A pure function of the shape and the device, cached: the cost model is
     most of the host cost of a call otherwise."""
     device_index = _device_index(device)
-    key = ("sm100", device_index, algo, m, n, k)
-    plan = _PLAN_CACHE.get(key)
+    key = (device_index, algo, m, n, k)
+    plan = _SM100_PLAN_CACHE.get(key)
     if plan is not None:
         return plan
     num_sms = get_device_sm_count(device)
@@ -502,7 +505,7 @@ def _sm100_plan(algo: int, m: int, n: int, k: int, device: torch.device) -> _Sm1
         sm100_raster_along_m(m, n, tile.mma_tiler, tile.two_sm),
         _max_active_clusters(device_index, tile.cluster[0] * tile.cluster[1]),
     )
-    _PLAN_CACHE[key] = plan
+    _SM100_PLAN_CACHE[key] = plan
     return plan
 
 
@@ -943,8 +946,8 @@ def sm90_tail_plan(
 def _sm90_plan(algo: int, m: int, n: int, k: int, num_sms: int) -> _Sm90Plan:
     """(tile algo, body items, tail splits, tail tiles, L2 group) of a Hopper call:
     the variant choice and the tail plan, pure functions of the shape, cached."""
-    key = ("sm90", algo, m, n, k, num_sms)
-    plan = _PLAN_CACHE.get(key)
+    key = (num_sms, algo, m, n, k)
+    plan = _SM90_PLAN_CACHE.get(key)
     if plan is not None:
         return plan
     if algo == 0:
@@ -971,7 +974,7 @@ def _sm90_plan(algo: int, m: int, n: int, k: int, num_sms: int) -> _Sm90Plan:
         tail_tiles,
         sm90_pick_group(m, n, k, tile_w),
     )
-    _PLAN_CACHE[key] = plan
+    _SM90_PLAN_CACHE[key] = plan
     return plan
 
 

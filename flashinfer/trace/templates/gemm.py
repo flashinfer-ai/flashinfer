@@ -2910,7 +2910,7 @@ def _w8a16_fp8_gemm_trace(act_ndim: int, scale_ndim: int) -> TraceTemplate:
     leading shape on ``act`` and a ``()`` or ``(1,)`` scale, and the trace names
     the ranks it actually saw.  ``K`` is read off ``act``'s last dimension."""
     lead = _w8a16_act_dims(act_ndim)
-    axes = {name: Var() for name in lead}
+    axes: "dict[str, Var | Const]" = {name: Var() for name in lead}
     axes["N"] = Const()
     axes["K"] = Const(extract=lambda kw: int(kw["act"].shape[-1]))
     scale_dims = []
