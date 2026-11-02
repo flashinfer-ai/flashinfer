@@ -770,7 +770,7 @@ def _require_program():
         torch.cuda.is_available()
         and torch.cuda.get_device_capability(0) in SUPPORTED_COMPUTE_CAPABILITIES
     ):
-        pytest.skip("requires a compute capability 10.0 / 10.3 device")
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
     for entry in ("loss", "logprob"):
         if not generated_program_available(CUDA, entry=entry):
             pytest.skip(
