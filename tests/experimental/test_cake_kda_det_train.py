@@ -2513,15 +2513,19 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
         "u",
         "gate",
         "lower_bound",
+        "qk_rstd",
+        "qk_l2norm",
     ]
-    for name in ("h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u"):
+    for name in ("h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u", "qk_rstd"):
         assert KdaChunkSaved.__dataclass_fields__[name].default is None, name
     # the gate mode's metadata (no tensor, the same format in both modes: the version is not bumped)
     assert KdaChunkSaved.__dataclass_fields__["gate"].default == "g"
     assert KdaChunkSaved.__dataclass_fields__["lower_bound"].default is None
+    # the in-kernel Q/K L2 norm's mode (metadata) and FP32 reciprocal norms, the last extra of both versions (#7817)
+    assert KdaChunkSaved.__dataclass_fields__["qk_l2norm"].default is False
     assert cake_backend._EXTRA_FIELDS == {
-        4: ("qg", "hseg", "seg_state", "w", "u"),
-        2: ("h", "v_new", "seg_m"),
+        4: ("qg", "hseg", "seg_state", "w", "u", "qk_rstd"),
+        2: ("h", "v_new", "seg_m", "qk_rstd"),
     }
     t = torch.empty(0)
     light = KdaChunkSaved(4, t, t, None, 1, 1, 1, SCALE, qg=t)

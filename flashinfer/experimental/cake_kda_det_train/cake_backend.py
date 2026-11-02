@@ -201,6 +201,9 @@ TABLE_NAMES = (
 # recurrence; the tables only when the saved set carries none).  The two forward paths launch the same stages:
 # their records differ (the saving forward's token-row forms).
 _FWD_STAGES = tuple(s for s in STAGES if s in STAGES_FWD or s == "seg_carry")
+# The token-local stages of the in-kernel Q/K L2 norm's fallback route: a plan carries them (in its records) only in
+# that mode, so a flag-off plan's records, stages and launch counts are the plan without the feature.
+_L2N_FALLBACK_STAGES = ("qk_l2norm", "qk_apply", "qk_pullback")
 _PATH_STAGES: dict[str, tuple[str, ...]] = {
     "fwd": _FWD_STAGES,
     "fwd_nosave": _FWD_STAGES,
@@ -937,6 +940,7 @@ def _plan(
                 stage, gate, **scalars, arch=arch, path=path, **_l2n_kw(l2n)
             )
             for stage in _PATH_STAGES[path]
+            if l2n == "fallback" or stage not in _L2N_FALLBACK_STAGES
         }
         for path in PATHS
         if path != "light_states" or recur == "seg"
