@@ -594,6 +594,10 @@ def gather_key_sample(
             f"Scales must be [pages, {PAGE}, {SCALES_PER_KEY}] and "
             f"[requests, capacity, {SCALES_PER_KEY}]"
         )
+    if sample_keys.dtype != key_cache.dtype or (
+        key_scales is not None and sample_scales.dtype != key_scales.dtype
+    ):
+        raise ValueError("Samples must have the dtypes of the keys and their scales")
     if (
         key_cache.shape[1:] != (PAGE, width)
         or sample_ends.shape[0] != requests

@@ -764,6 +764,8 @@ def test_gather_key_sample_rejects_bad_shapes() -> None:
     ):
         with pytest.raises(ValueError, match="Scales must be"):
             run(**wrong)
+    with pytest.raises(ValueError, match="dtypes"):  # uint8 scale bytes
+        run(sample_scales=args["sample_scales"].view(torch.uint8))
     with pytest.raises(ValueError, match="Mismatched"):  # BF16 keys, 32 a page
         run(
             key_cache=zeros(4, 32, 128, dtype=torch.bfloat16),
