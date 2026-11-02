@@ -855,9 +855,7 @@ def gen_tgv_gemm_sm10x_module(
             "--expt-relaxed-constexpr",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
         ]
-        + sm100f_nvcc_flags
-        if use_sm_100f
-        else sm100a_nvcc_flags,
+        + (sm100f_nvcc_flags if use_sm_100f else sm100a_nvcc_flags),
         extra_include_paths=[
             jit_env.FLASHINFER_INCLUDE_DIR,
             jit_env.FLASHINFER_CSRC_DIR,
