@@ -81,6 +81,132 @@ def test_mxfp4_weights_have_independent_dtype_and_packing():
         _config(quant_kind="mxfp4_mxfp8", intermediate=192)
 
 
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+def test_mxfp4_w4a4_config_and_candidates(variant):
+    from flashinfer.moe_ep import Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import sm107_candidates
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache import (
+        default_knobs,
+    )
+
+    public = Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(128, 2)
+    assert public.kind == "mxfp4"
+    assert create_mega_kernel(public).kernel_name() == public.kernel_name
+    knobs = default_knobs(3, quant_kind="mxfp4", kernel_variant=variant)
+    cfg = _config(quant_kind="mxfp4", intermediate=128, kernel_variant=variant, **knobs)
+    assert cfg.torch_act_data_dtype == getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+    assert cfg.torch_weight_data_dtype == cfg.torch_act_data_dtype
+    assert cfg.torch_act_sf_dtype == torch.float8_e8m0fnu
+    assert cfg.sf_vec_size == 32
+    assert cfg.instruction_k == 128
+    assert cfg.resolved_mma_tiler_mnk == (256, 128, 256)
+    candidates = sm107_candidates(quant_kind="mxfp4", kernel_variant=variant)
+    assert candidates
+    assert all(c["mma_tiler_mnk"][2] in (256, 512) for c in candidates)
+
+
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("early", [False, True])
+@pytest.mark.parametrize("finalize", [False, True])
+def test_mxfp4_w4a4_cli_dispatch(monkeypatch, variant, early, finalize):
+    from flashinfer.moe_ep import tune
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl import (
+        tuner,
+    )
+
+    calls = []
+
+    def run(args, kind):
+        calls.append((kind, args.kernel_variant, args.apply_routing_weights_before_fc2))
+        return 0
+
+    monkeypatch.setattr(tuner, "_run_tuning", run)
+    argv = [
+        "--dtype",
+        "mxfp4",
+        "--arch",
+        "sm107",
+        "--hidden",
+        "512",
+        "--intermediate",
+        "256",
+        "--num-experts",
+        "8",
+        "--topk",
+        "4",
+        "--max-tokens",
+        "128",
+        "--apply-routing-weights-before-fc2"
+        if early
+        else "--no-apply-routing-weights-before-fc2",
+        "--do-finalize" if finalize else "--no-do-finalize",
+    ]
+    assert tune.main([*argv, "--kernel-variant", variant]) == (0 if finalize else 2)
+    assert calls == ([("mxfp4", variant, early)] if finalize else [])
+
+
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("early", [False, True])
+def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
+    from flashinfer.moe_ep import tune, Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import forward_tuning, tuning
+    from flashinfer.moe_ep.core.kernel import registry
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+
+    args = tune._parse_args(
+        [
+            "--dtype",
+            "mxfp4",
+            "--arch",
+            "sm107",
+            "--hidden",
+            "512",
+            "--intermediate",
+            "256",
+            "--num-experts",
+            "8",
+            "--topk",
+            "4",
+            "--max-tokens",
+            "128",
+            "--kernel-variant",
+            variant,
+            "--sweep",
+            "schedule",
+            "--apply-routing-weights-before-fc2"
+            if early
+            else "--no-apply-routing-weights-before-fc2",
+        ]
+    )
+    backend = mock.Mock()
+    create = mock.Mock(return_value=backend)
+    resolve = mock.Mock(return_value=({}, "default"))
+    execution = mock.Mock()
+    monkeypatch.setattr(registry, "create_mega_kernel", create)
+    monkeypatch.setattr(tuning, "_dummy_transformed_weights", lambda *a: (None, None))
+    monkeypatch.setattr(
+        tuning, "_dummy_inputs", lambda *a: mock.Mock(spec=MoEEpTensors)
+    )
+    monkeypatch.setattr(torch, "empty", mock.Mock())
+    monkeypatch.setattr(forward_tuning, "ForwardExecution", execution)
+    monkeypatch.setattr(package, "resolve_knobs", resolve)
+    monkeypatch.setattr(package, "sm107_schedule_candidates", lambda *a, **k: [{}])
+    finish = mock.Mock(return_value={"fc2_use_bulk": True})
+    monkeypatch.setattr(tuning, "finish_sweep", finish)
+
+    assert tuning.tune_one(args, 0, 2, 128, "mxfp4") == {"fc2_use_bulk": True}
+    config = create.call_args.args[0]
+    assert isinstance(config, Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig)
+    assert config.kernel_variant == variant
+    assert config.apply_routing_weights_before_fc2 is early
+    assert resolve.call_args.kwargs["dtype"] == "mxfp4"
+    assert resolve.call_args.kwargs["kernel_variant"] == variant
+    assert resolve.call_args.kwargs["apply_routing_weights_before_fc2"] is early
+    assert execution.call_args.kwargs["quantize_input"] is True
+    backend._allocate_workspace.return_value.destroy.assert_called_once()
+
+
 def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():
     from flashinfer.moe_ep import (
         PrequantizedMoEWeights,

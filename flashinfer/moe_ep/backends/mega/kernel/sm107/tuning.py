@@ -21,6 +21,8 @@ def _backend_module(quant_kind: str, name: str):
     backend = (
         "nvfp4_nvfp4_bf16_cutedsl"
         if quant_kind == "nvfp4"
+        else "mxfp4_mxfp4_bf16_cutedsl"
+        if quant_kind == "mxfp4"
         else "mxfp8_mxfp4_bf16_cutedsl"
         if quant_kind == "mxfp4_mxfp8"
         else "mxfp8_mxfp8_bf16_cutedsl"
@@ -41,7 +43,9 @@ def _dummy_transformed_weights(args, rank: int, world_size: int, quant_kind: str
     )
 
     weights_mod = _backend_module(quant_kind, "weights")
-    extra = {} if quant_kind in ("nvfp4", "mxfp4_mxfp8") else {"kind": quant_kind}
+    extra = (
+        {} if quant_kind in ("nvfp4", "mxfp4", "mxfp4_mxfp8") else {"kind": quant_kind}
+    )
 
     experts_per_rank = args.num_experts // world_size
     generator = torch.Generator(device="cuda").manual_seed(args.seed + 7 * rank)
@@ -143,10 +147,15 @@ def tune_one(
         from .mxfp8_mxfp4_bf16_cutedsl.config import (
             Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
         )
+        from .mxfp4_mxfp4_bf16_cutedsl.config import (
+            Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        )
 
         config_type = (
             Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
             if quant_kind == "nvfp4"
+            else Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+            if quant_kind == "mxfp4"
             else Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
             if quant_kind == "mxfp4_mxfp8"
             else Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
@@ -167,7 +176,7 @@ def tune_one(
             }
             if quant_kind == "nvfp4"
             else {}
-            if quant_kind == "mxfp4_mxfp8"
+            if quant_kind in ("mxfp4", "mxfp4_mxfp8")
             else {"kind": quant_kind}
         )
         config = config_type(
@@ -177,6 +186,7 @@ def tune_one(
             kernel_variant=args.kernel_variant,
             combine_dtype=args.combine_dtype,
             gate_up_clamp=args.gate_up_clamp,
+            apply_routing_weights_before_fc2=args.apply_routing_weights_before_fc2,
             activation=args.activation,
             situ_beta=args.situ_beta,
             situ_linear_beta=args.situ_linear_beta,
@@ -224,6 +234,7 @@ def tune_one(
                     situ_beta=args.situ_beta,
                     situ_linear_beta=args.situ_linear_beta,
                     gate_up_clamp=args.gate_up_clamp,
+                    apply_routing_weights_before_fc2=args.apply_routing_weights_before_fc2,
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")
