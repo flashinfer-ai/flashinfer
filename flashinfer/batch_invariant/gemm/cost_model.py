@@ -20,6 +20,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import warnings
 from dataclasses import asdict, dataclass, replace
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -156,13 +157,21 @@ FITS_PATH = os.path.join(os.path.dirname(__file__), "cost_model_fits.json")
 
 def _load_fits() -> Dict[str, Fit]:
     out: Dict[str, Fit] = {}
-    if os.path.exists(FITS_PATH):
-        with open(FITS_PATH) as f:
-            for name, d in json.load(f).items():
-                # a family's entry: its constants plus a `_meta` provenance block (part, date, driver, method)
-                out[name] = Fit(
-                    **{k: v for k, v in d.items() if k in Fit.__dataclass_fields__}
-                )
+    if not os.path.exists(FITS_PATH):
+        # the dispatcher then runs on the first-principles defaults: the same bits (R3), another speed profile
+        warnings.warn(
+            f"{FITS_PATH} is missing: the batch-invariant GEMM dispatcher falls back to its default constants "
+            "(correct bits, untuned configuration choices); the file ships with the package",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return out
+    with open(FITS_PATH) as f:
+        for name, d in json.load(f).items():
+            # a family's entry: its constants plus a `_meta` provenance block (part, date, driver, method)
+            out[name] = Fit(
+                **{k: v for k, v in d.items() if k in Fit.__dataclass_fields__}
+            )
     return out
 
 

@@ -31,7 +31,8 @@ def compute_capability(device: torch.device) -> Tuple[int, int]:
     """The device's compute capability as FlashInfer reports it."""
     from ..utils import get_compute_capability
 
-    return tuple(get_compute_capability(device))
+    major, minor = get_compute_capability(device)
+    return (int(major), int(minor))
 
 
 def _arch_names(archs: Iterable[Tuple[int, int]]) -> str:
