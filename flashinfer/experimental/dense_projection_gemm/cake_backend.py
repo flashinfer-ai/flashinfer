@@ -345,22 +345,23 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: (``K`` of the weight gradient) from ``min_tokens`` to ``max_tokens`` (``None``: no upper bound) runs the
 #: deterministic program; every other token count, and a part with fewer SMs, keeps the row's verdict.  The verdicts
 #: were measured at 16172 to 16384 tokens.  The entries come from a re-measurement at 512, 1024, 2048, 4096, 8192,
-#: 16231, 32768 and 65536 tokens on two 152-SM parts of each architecture (GB200, GB300; the protocol is in the K1 token
-#: table of the README).  A measured token count is an entry where the split program failed in at least one run (the
-#: rule above; the backward pass or the checkpointed step more than 1.3 % slower than with the deterministic program; or
-#: the deterministic package's FP64 error budget missed) and the deterministic program leaves the backward pass and the
-#: checkpointed step no more than 1.3 % slower, or where the split program's FP64 error (relative Frobenius error or
-#: BF16 error-budget ratio) exceeded the deterministic program's by more than 2 % for some seed on both parts.  A token
-#: count between two consecutive measured entries is an entry too (not measured), and so is every token count above
-#: 65536 of a row whose split program failed that FP64 comparison at 65536 tokens.  Unmeasured token counts keep the
-#: verdict: below 512, above 65536 (except those rows), between two measured token counts with different outcomes, and
-#: on parts with fewer than 152 SMs.
+#: 16231, 32768 and 65536 tokens on two 152-SM parts per row and token count (GB200, GB300; the strict runs of 8 GB300
+#: points ran on two other parts, four GB300 parts in all; the protocol is in the K1 token table of the README).  A
+#: measured token count is an entry where the split program failed in at least one run (the rule above; the backward
+#: pass or the checkpointed step more than 1.3 % slower than with the deterministic program; or the deterministic
+#: package's FP64 error budget missed with an error above the deterministic program's) and the deterministic program
+#: leaves the backward pass and the checkpointed step no more than 1.3 % slower, or where the split program's FP64 error
+#: (relative Frobenius error or BF16 error-budget ratio) exceeded the deterministic program's by more than 2 % for some
+#: seed on both parts.  A token count between two consecutive measured entries is an entry too (not measured), and so is
+#: every token count above 65536 of a row whose split program failed that FP64 comparison at 65536 tokens.  Unmeasured
+#: token counts keep the verdict: below 512, above 65536 (except those rows), between two measured token counts with
+#: different outcomes, and on parts with fewer than 152 SMs.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
 ] = {
     ("sm_100a", 1, 4096, 32, "bf16"): ((152, 512, 512),),
-    ("sm_100a", 1, 4096, 48, "bf16"): ((152, 512, 512), (152, 65536, 65536)),
+    ("sm_100a", 1, 4096, 48, "bf16"): ((152, 512, 512),),
     ("sm_100a", 1, 4096, 48, "f32"): ((152, 512, 512),),
     ("sm_100a", 1, 4096, 64, "bf16"): ((152, 512, 512),),
     ("sm_100a", 1, 4096, 64, "f32"): ((152, 512, 512),),
