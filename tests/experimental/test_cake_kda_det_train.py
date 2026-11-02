@@ -169,6 +169,10 @@ OPTIONAL_STAGES = (
     "dav",
     "gate_epilogue",
     "param_finalize",
+    # the in-kernel Q/K L2 norm's token-local stages (#7817): dispatched in the fallback mode alone
+    "qk_l2norm",
+    "qk_apply",
+    "qk_pullback",
 )
 # The raw-gate mode (``use_gate_in_kernel=True``): the stages whose records come in a ``g`` and a ``raw`` class (a
 # record's ``gate``, ``"g"`` when absent), the raw class's records of the per-mode stages (one twin per g-mode record
@@ -340,6 +344,7 @@ SELECT_KINDS = (
     "carry_chain",
     "arch_in",
     "path_in",
+    "l2n_in",  # the in-kernel Q/K L2 norm mode (#7817)
 )
 GRID_KINDS = (
     "fixed",
@@ -354,6 +359,7 @@ GRID_KINDS = (
     "carry_groups",
     "segments_heads",
     "head_chunk_blocks",
+    "tokens",  # the Q/K L2 norm's token-local fallback programs (#7817)
 )
 # the records delivered for a subset of the architectures (every other record ships on all three, the two-level
 # carry and the no-kb prep among them): the gate epilogue and its unfused GLM intra program on sm_100a, the fused
@@ -455,9 +461,10 @@ def _route_rule(route: str) -> dict:
 
 
 def test_registry_records_are_well_formed() -> None:
-    # the 67 g-mode records and the 8 raw-gate ones (each raw record its own library)
-    assert len(cake_jit.MODULES) == 75
-    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 73
+    # the 67 g-mode records, the 8 raw-gate ones (each raw record its own library) and the 3 programs of the
+    # in-kernel Q/K L2 norm's fallback route
+    assert len(cake_jit.MODULES) == 78
+    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 76
     assert tuple(cake_jit.PATHS) == PATHS
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
     assert frozenset(cake_jit.GATE_STAGES) == GATE_STAGES
@@ -2513,15 +2520,19 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
         "u",
         "gate",
         "lower_bound",
+        "qk_rstd",
+        "qk_l2norm",
     ]
-    for name in ("h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u"):
+    for name in ("h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u", "qk_rstd"):
         assert KdaChunkSaved.__dataclass_fields__[name].default is None, name
     # the gate mode's metadata (no tensor, the same format in both modes: the version is not bumped)
     assert KdaChunkSaved.__dataclass_fields__["gate"].default == "g"
     assert KdaChunkSaved.__dataclass_fields__["lower_bound"].default is None
+    # the in-kernel Q/K L2 norm's mode (metadata) and FP32 reciprocal norms, the last extra of both versions (#7817)
+    assert KdaChunkSaved.__dataclass_fields__["qk_l2norm"].default is False
     assert cake_backend._EXTRA_FIELDS == {
-        4: ("qg", "hseg", "seg_state", "w", "u"),
-        2: ("h", "v_new", "seg_m"),
+        4: ("qg", "hseg", "seg_state", "w", "u", "qk_rstd"),
+        2: ("h", "v_new", "seg_m", "qk_rstd"),
     }
     t = torch.empty(0)
     light = KdaChunkSaved(4, t, t, None, 1, 1, 1, SCALE, qg=t)
@@ -3497,16 +3508,16 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    # The 73 programs of cake_jit.MODULES (65 of the g gate plus the 8 raw-gate programs), each built for the
-    # architectures its record delivers (69 on all three, the four of RECORD_ARCHES on one each: 211 libraries);
-    # the KCP programs have their own package.
+    # The 76 programs of cake_jit.MODULES (65 of the g gate, the 8 raw-gate programs and the 3 of the Q/K L2 norm's
+    # fallback route), each built for the architectures its record delivers (72 on all three, the four of
+    # RECORD_ARCHES on one each: 220 libraries); the KCP programs have their own package.
     train_libraries = {
         (record["library"], arch)
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
-    assert len(train_libraries) == 211
-    assert len(names) == len(set(names)) == 211
+    assert len(train_libraries) == 220
+    assert len(names) == len(set(names)) == 220
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"
