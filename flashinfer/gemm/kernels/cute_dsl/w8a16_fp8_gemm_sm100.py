@@ -747,8 +747,7 @@ class Sm100W8A16Fp8GemmKernel:
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, bidy, bidz = cute.arch.block_idx()
-        gdx, gdy, _ = cute.arch.grid_dim()
+        bidx, _, bidz = cute.arch.block_idx()
         if warp_idx == self.epilog_warp_id[0]:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
@@ -1327,7 +1326,7 @@ class Sm100W8A16Fp8GemmKernel:
         tile_info_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
         )
-        work_tile, tile_l = self._first_work_tile(
+        work_tile, _ = self._first_work_tile(
             tensor_c, cta_m_in_cluster, act_in_cluster, fd_total, fd_major
         )
         a_load2trans_consumer_state = pipeline.make_pipeline_state(
@@ -1359,7 +1358,7 @@ class Sm100W8A16Fp8GemmKernel:
                 )
             )
             xf_k_parity = (xf_k_parity + k_tile_cnt) % 2
-            work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
+            work_tile, tile_info_consumer_state, _ = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
         trans2mma_pipeline.producer_tail(trans2mma_producer_state)
@@ -1403,7 +1402,7 @@ class Sm100W8A16Fp8GemmKernel:
         tile_info_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
         )
-        work_tile, tile_l = self._first_work_tile(
+        work_tile, _ = self._first_work_tile(
             tensor_c, cta_m_in_cluster, act_in_cluster, fd_total, fd_major
         )
         trans2mma_consumer_state = pipeline.make_pipeline_state(
@@ -1467,7 +1466,7 @@ class Sm100W8A16Fp8GemmKernel:
                         )
                 acc_pipeline.producer_commit(acc_producer_state)
             acc_producer_state.advance()
-            work_tile, tile_info_consumer_state, tile_l = self._next_work_tile(
+            work_tile, tile_info_consumer_state, _ = self._next_work_tile(
                 tile_info_pipeline, tile_info_consumer_state, sTile_info
             )
         acc_pipeline.producer_tail(acc_producer_state)
@@ -1712,7 +1711,7 @@ class Sm100W8A16Fp8GemmKernel:
         lin = cutlass.Int32(bidz)
         (
             act_rows,
-            act_tiles,
+            _,
             major_clusters,
             minor_clusters,
             total_clusters,

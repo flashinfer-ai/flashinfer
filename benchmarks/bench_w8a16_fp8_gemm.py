@@ -331,7 +331,7 @@ def _time_kernel_cupti(args, run_fn: Callable[[], None], tag: str, iters: int):
     return _compute_stats([(span.end - span.start) / 1e3 for span in spans])
 
 
-def _time_kernel_cuda_graph(args, run_fn: Callable[[], None], tag: str, iters: int):
+def _time_kernel_cuda_graph(args, run_fn: Callable[[], None], iters: int):
     """CUDA-event fallback (includes graph launch overhead; CUPTI preferred)."""
     g_reset, g_run = _capture_graphs(args, run_fn)
     latencies_us: list[float] = []
@@ -370,7 +370,7 @@ def _time_kernel(args, run_fn: Callable[[], None], tag: str, iters: int):
                 _CUPTI_UNAVAILABLE_WARNED = True
         else:
             return _time_kernel_cupti(args, run_fn, tag, iters)
-    return _time_kernel_cuda_graph(args, run_fn, tag, iters)
+    return _time_kernel_cuda_graph(args, run_fn, iters)
 
 
 # ---------------------------------------------------------------------------
@@ -684,12 +684,6 @@ def format_row(r: Row, args) -> str:
     return line + f"{gate:>6}"
 
 
-def print_table(rows: list[Row], args) -> None:
-    print(table_header(args))
-    for r in rows:
-        print(format_row(r, args))
-
-
 def write_csv(rows: list[Row], path: str, args) -> None:
     variants = [
         name for name, _ in _kernel_variants(args) if name.startswith("kernel:")
@@ -708,10 +702,8 @@ def write_csv(rows: list[Row], path: str, args) -> None:
                 "cast_us",
                 "cublas_us",
                 "kernel_us",
-                "kernel_prep_us",
                 "kernel_max_abs",
                 "kernel_max_rel",
-                "kernel_prep_max_abs",
                 "cast_max_abs",
                 "cast_max_rel",
                 "gate",
@@ -732,10 +724,8 @@ def write_csv(rows: list[Row], path: str, args) -> None:
                     r.us.get("cast", ""),
                     r.us.get("cublas", ""),
                     r.us.get("kernel", ""),
-                    r.us.get("kernel_prep", ""),
                     r.max_abs.get("kernel", ""),
                     r.max_rel.get("kernel", ""),
-                    r.max_abs.get("kernel_prep", ""),
                     r.max_abs.get("cast", ""),
                     r.max_rel.get("cast", ""),
                     "" if r.passed is None else ("ok" if r.passed else "FAIL"),

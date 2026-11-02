@@ -169,7 +169,6 @@ class Sm90W8A16Fp8GemmKernel:
         )
         mma_inst_shape_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
         assert self.tile_shape_mnk[2] % mma_inst_shape_k == 0
-        self.num_k_blocks = self.tile_shape_mnk[2] // mma_inst_shape_k
 
         tile_m, tile_a, tile_k = self.tile_shape_mnk
         # Epilogue subtile: all weight rows of the tile x 32 activation rows.
@@ -394,8 +393,6 @@ class Sm90W8A16Fp8GemmKernel:
     ):
         tile_m, tile_a, tile_k = self.tile_shape_mnk
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        gdx, _, _ = cute.arch.grid_dim()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -651,7 +648,7 @@ class Sm90W8A16Fp8GemmKernel:
         16 + lane / 4`` of the warpgroup's 64 rows and ``c0 = (lane % 4) * 2``.  The
         stage is K_SW64 (64-byte rows, Swizzle<2, 4, 3>: bits [5:4] ^= bits [8:7]).
         ``ctid``: the thread's index among the consumer threads."""
-        tile_m, _tile_a, tile_k = self.tile_shape_mnk
+        tile_k = self.tile_shape_mnk[2]
         assert tile_k == 64, "the hand-swizzled A addressing assumes 64-byte rows"
         lane = ctid % 32
         wg_rows0 = 0 if self.pingpong else (ctid // 128) * 64
@@ -797,7 +794,7 @@ class Sm90W8A16Fp8GemmKernel:
         tiles_done = cutlass.Int32(0)
         k_skip = cutlass.Int32(0)  # loop-carried: a stable type on every path
         while lin < total_work:
-            tile_idx, m_tile, n_tile, k_base, k_tile_cnt, is_tail, slice_idx = (
+            tile_idx, m_tile, n_tile, _, k_tile_cnt, is_tail, slice_idx = (
                 self._work_item(
                     lin,
                     body_items,
