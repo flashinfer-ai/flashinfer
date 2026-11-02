@@ -28,7 +28,10 @@ deterministic suite's budget, ``|dw - dw64| <= |dw64| * 2^-7 + sum|terms| *
 head counts (``H = 48`` and small or irregular row counts), ``[T, H, 128]``
 strided and flattened layouts, near-zero variance, saturated gates, FP32 and
 BF16 weight gradients, accumulation, ``compute_grad_weight=False``, grids of 1,
-3 and 7 CTAs (every CTA claims), empty work, a workspace reused across shapes
+3 and 7 CTAs (every CTA claims), the short backward on SM100 and SM103 (one
+cluster up to 256 rows: ``dw`` the same bits on every launch, no workspace
+made or touched, a caller workspace checked and left as it is, the first row
+count past it on the backward), empty work, a workspace reused across shapes
 (zero after every call), a workspace with nonzero scratch returned to zero by
 ``cake_rmsnorm_silu_gate_train_reset_workspace``, two streams with their own
 workspaces, CUDA Graph capture and replay (captured calls without a
@@ -546,8 +549,10 @@ def test_reset_workspace_clears_nonzero_scratch():
     reset_workspace(ws)
     torch.cuda.synchronize()
     assert not bool(ws.any())
+    # 37 x 7 = 259 rows: past the short backward's 256, so both calls use the
+    # workspace
     for i, (T, H, dtype) in enumerate(
-        ((1031, 48, torch.bfloat16), (33, 7, torch.float32))
+        ((1031, 48, torch.bfloat16), (37, 7, torch.float32))
     ):
         x, z, w, dy = make(T, H, seed=61 + i)
         gw = (
@@ -986,7 +991,8 @@ def test_registry_records_reference_the_build_manifest():
     every module record names its ``build.json`` library (schema
     ``cake-build/1``), whose entries carry the package's kernel and binding
     sources and the precise-arithmetic flags; the backward records size their
-    workspace from their accumulator slots."""
+    workspace from their accumulator slots, the short backward records launch
+    one cluster and take no workspace."""
     manifest = cake_build.manifest()
     assert manifest["schema"] == "cake-build/1"
     assert manifest["package"] == "flashinfer.cake_rmsnorm_silu_gate_train_backend"
@@ -994,7 +1000,7 @@ def test_registry_records_reference_the_build_manifest():
     package = Path(cake_build.__file__).parent
     for arch in loader.ARCHES:
         routed = set(loader.ROUTES[arch])
-        tiers = loader.LONG_ROLES + loader.MID_ROLES
+        tiers = loader.LONG_ROLES + loader.MID_ROLES + loader.SHORT_ROLES
         assert set(loader.ROLES) <= routed <= set(loader.ROLES + tiers)
         for role, name in loader.ROUTES[arch].items():
             record = loader.MODULES[name]
@@ -1009,10 +1015,19 @@ def test_registry_records_reference_the_build_manifest():
         assert record["grid_rule"]["kind"] in loader.GRID_KINDS
         assert record["launch"]["cooperative"] is False
         assert record["launch"]["use_pdl"] is False
-        if record["role"] == "fwd":
+        clustered = record["grid_rule"]["kind"] == "cluster"
+        assert (record["launch"]["cluster"] != (1, 1, 1)) == clustered, name
+        if record["role"] in ("fwd", "fwd_short"):
             assert record["grid_rule"]["kind"] == "row_blocks"
         elif record["role"] in ("fwd_long", "fwd_mid"):
             assert record["grid_rule"]["kind"] == "persistent_row_blocks"
+        elif record["role"] in ("bwd_bf16_short", "bwd_f32_short"):
+            assert clustered
+            assert record["launch"]["cluster"] == (record["grid_rule"]["cluster"], 1, 1)
+            plan = [key for _kind, key in record["arg_plan"]]
+            assert {"dw", "weight_grad"} <= set(plan), name
+            assert not {"dw_sums", "dw_done"} & set(plan), name
+            assert "dw_slots" not in record and loader.workspace_elements(name) == 0
         else:
             assert record["grid_rule"]["kind"] == "row_claims"
             plan = [key for _kind, key in record["arg_plan"]]
@@ -1064,10 +1079,43 @@ TIER_ROUTES = {
 }
 
 
+# The short roles each architecture routes, with the bound of their rows: rows
+# per SM (``max_rows_per_sm``: the short forward, whose grid of one CTA per
+# row block grows with the rows) or rows (``max_rows``: the short backward,
+# whose grid is one cluster of 16 CTAs whatever the rows).
+SHORT_ROUTES = {
+    "sm_100a": {
+        "fwd_short": ("max_rows_per_sm", 10),
+        "bwd_bf16_short": ("max_rows", 256),
+        "bwd_f32_short": ("max_rows", 256),
+    },
+    "sm_103a": {
+        "fwd_short": ("max_rows_per_sm", 10),
+        "bwd_bf16_short": ("max_rows", 256),
+        "bwd_f32_short": ("max_rows", 256),
+    },
+    "sm_107a": {},
+}
+
+
+def _short_end(arch, role, sm_count):
+    """The most rows ``role``'s short module runs by ``SHORT_ROUTES``, or
+    ``None`` where ``arch`` routes none."""
+    short = SHORT_ROUTES[arch].get(role + "_short")
+    if short is None:
+        return None
+    key, bound = short
+    return bound * sm_count if key == "max_rows_per_sm" else bound
+
+
 def _tier_module(arch, role, rows, sm_count):
-    """The module of ``role`` for ``rows`` rows by ``TIER_ROUTES``: the long
-    module from its rows per SM, else the mid module from its own, else the
-    role's module."""
+    """The module of ``role`` for ``rows`` rows by ``SHORT_ROUTES`` and
+    ``TIER_ROUTES``: the short module up to its rows (per SM or in all), else
+    the long module from its rows per SM, else the mid module from its own,
+    else the role's module."""
+    end = _short_end(arch, role, sm_count)
+    if end is not None and rows <= end:
+        return loader.ROUTES[arch][role + "_short"]
     for tier in ("_long", "_mid"):
         start = TIER_ROUTES[arch].get(role + tier)
         if start is not None and rows >= start * sm_count:
@@ -1076,13 +1124,24 @@ def _tier_module(arch, role, rows, sm_count):
 
 
 @pytest.mark.parametrize("sm_count", [148, 152, 212, 216])
-def test_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
-    """``module_for_rows``: a role's long module from ``min_rows_per_sm *
-    sm_count`` rows of its grid rule, below that its mid module from its own
+def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
+    """``module_for_rows``: a role's short module up to ``max_rows`` rows of
+    its grid rule (the short backward) or ``max_rows_per_sm * sm_count`` (the
+    short forward), above that its long module from ``min_rows_per_sm *
+    sm_count`` rows of its own rule, below that its mid module from its own
     rule's rows (on the architectures that route them), the role's module
-    below both and on the others."""
+    between and on the others."""
     assert loader.TIERS == ("_long", "_mid")
+    assert loader.SHORT_ROLES == ("fwd_short", "bwd_bf16_short", "bwd_f32_short")
     for arch in loader.ARCHES:
+        shorts = {}
+        for role, name in loader.ROUTES[arch].items():
+            if role in loader.SHORT_ROLES:
+                rule = loader.MODULES[name]["grid_rule"]
+                key = "max_rows" if "max_rows" in rule else "max_rows_per_sm"
+                assert ("max_rows" in rule) != ("max_rows_per_sm" in rule), name
+                shorts[role] = (key, rule[key])
+        assert shorts == SHORT_ROUTES[arch], arch
         tiers = {
             role: loader.MODULES[name]["grid_rule"]["min_rows_per_sm"]
             for role, name in loader.ROUTES[arch].items()
@@ -1091,30 +1150,43 @@ def test_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
         assert tiers == TIER_ROUTES[arch], arch
         for role, name in loader.ROUTES[arch].items():
             assert loader.MODULES[name]["role"] == role
-        edges = {1, 48, 2**31 - 1}
-        for start in (1280, 976, 1024, 2400):
+        edges = {1, 48, 255, 256, 257, 2**31 - 1}
+        for start in (10, 1280, 976, 1024, 2400):
             edges |= {start * sm_count - 1, start * sm_count, start * sm_count + 1}
         for role in loader.ROLES:
             for rows in sorted(edges):
                 want = _tier_module(arch, role, rows, sm_count)
                 got = loader.module_for_rows(arch, role, rows, sm_count)
                 assert got == want, (arch, role, rows)
-    # the forward on sm_100a: the forward, then the mid forward from 976 rows
-    # per SM, then the long forward from 2400
+    # the forward on sm_100a: the short forward up to 10 rows per SM, the
+    # forward above, then the mid forward from 976 rows per SM, then the long
+    # forward from 2400
     routes = loader.ROUTES["sm_100a"]
     for rows, role in (
+        (1, "fwd_short"),
+        (10 * sm_count, "fwd_short"),
+        (10 * sm_count + 1, "fwd"),
         (976 * sm_count - 1, "fwd"),
         (976 * sm_count, "fwd_mid"),
         (2400 * sm_count - 1, "fwd_mid"),
         (2400 * sm_count, "fwd_long"),
     ):
         assert loader.module_for_rows("sm_100a", "fwd", rows, sm_count) == routes[role]
-    # the backward on sm_100a: the backward, then the long backward from 1280
-    # rows per SM
+    # the backward on sm_100a: the short backward up to 256 rows whatever the
+    # SMs, the backward, then the long backward from 1280 rows per SM; on
+    # sm_107a the backward from one row
     for role in ("bwd_bf16", "bwd_f32"):
-        for rows, tier in ((1280 * sm_count - 1, ""), (1280 * sm_count, "_long")):
+        for rows, tier in (
+            (1, "_short"),
+            (256, "_short"),
+            (257, ""),
+            (1280 * sm_count - 1, ""),
+            (1280 * sm_count, "_long"),
+        ):
             got = loader.module_for_rows("sm_100a", role, rows, sm_count)
             assert got == routes[role + tier], (role, rows)
+        got = loader.module_for_rows("sm_107a", role, 1, sm_count)
+        assert got == loader.route_module("sm_107a", role), role
 
 
 # (rows, SMs, CTAs) of the long forward: 32-row blocks, the fewest whole waves
@@ -1202,6 +1274,183 @@ def test_mid_forward_grid_is_whole_waves_of_at_most_two_blocks_a_cta(
     assert ctas == blocks or ctas % wave == 0
     assert ctas == blocks or (ctas - wave) * 2 < blocks
     assert loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=7) == grid
+
+
+# (rows, SMs) of the short forward: one CTA per 16-row block, up to 10 rows per
+# SM, so fewer CTAs than SMs.
+SHORT_FORWARD_GRIDS = [
+    (1, 148),
+    (48, 148),  # T 1, H 48: 3 blocks
+    (13 * 7, 148),
+    (21 * 48, 148),  # 6.8 rows per SM on B200
+    (10 * 148, 148),  # B200 at 10 rows per SM: 93 blocks
+    (10 * 152, 152),  # GB300 at 10 rows per SM: 95 blocks
+]
+
+
+@pytest.mark.parametrize(("rows", "sm_count"), SHORT_FORWARD_GRIDS)
+def test_short_forward_grid_is_one_cta_a_block_below_one_cta_per_sm(rows, sm_count):
+    for arch in ("sm_100a", "sm_103a"):
+        name = loader.ROUTES[arch]["fwd_short"]
+        assert name == loader.ROUTES["sm_100a"]["fwd_short"]
+        assert loader.module_for_rows(arch, "fwd", rows, sm_count) == name
+    assert "fwd_short" not in loader.ROUTES["sm_107a"]
+    record = loader.MODULES[name]
+    assert record["grid_rule"] == {
+        "kind": "row_blocks",
+        "max_rows_per_sm": 10,
+        "rows_per_cta": 16,
+    }
+    assert record["launch"]["block"] == (256, 1, 1)
+    assert record["launch"]["dynamic_smem_bytes"] == 0
+    assert record["arches"] == ["sm_100a", "sm_103a"]
+    grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
+    assert grid == (-(-rows // 16), 1, 1)
+    assert grid[0] < sm_count
+    assert loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=7) == grid
+    # the deterministic forward's grid: one 128-thread CTA per 16-row block
+    fwd = loader.MODULES[loader.route_module("sm_100a", "fwd")]
+    assert loader.launch_grid(fwd, rows=rows, sm_count=sm_count) == grid
+
+
+# (rows, SMs) of the short backward: one cluster of 16 CTAs whatever the rows
+# and the SMs, up to 256 rows, so no CTA takes more than one 16-row block.
+SHORT_BACKWARD_GRIDS = [
+    (1, 148),
+    (48, 148),  # T 1, H 48
+    (13 * 7, 152),
+    (5 * 48, 148),
+    (256, 148),
+    (256, 152),
+    (256, 160),
+]
+
+
+@pytest.mark.parametrize(("rows", "sm_count"), SHORT_BACKWARD_GRIDS)
+def test_short_backward_is_one_cluster_up_to_256_rows(rows, sm_count):
+    for role in ("bwd_bf16", "bwd_f32"):
+        name = loader.ROUTES["sm_100a"][role + "_short"]
+        assert loader.ROUTES["sm_103a"][role + "_short"] == name
+        assert role + "_short" not in loader.ROUTES["sm_107a"]
+        for arch in ("sm_100a", "sm_103a"):
+            assert loader.module_for_rows(arch, role, rows, sm_count) == name
+            base = loader.route_module(arch, role)
+            assert loader.module_for_rows(arch, role, 257, sm_count) == base
+        base = loader.route_module("sm_107a", role)
+        assert loader.module_for_rows("sm_107a", role, rows, sm_count) == base
+        record = loader.MODULES[name]
+        assert record["grid_rule"] == {
+            "cluster": 16,
+            "kind": "cluster",
+            "max_rows": 256,
+        }
+        assert record["launch"]["block"] == (256, 1, 1)
+        assert record["launch"]["cluster"] == (16, 1, 1)
+        assert record["launch"]["dynamic_smem_bytes"] == 6144
+        assert record["arches"] == ["sm_100a", "sm_103a"]
+        assert loader.backward_ctas(name, rows, sm_count) == 16
+        grid = loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=16)
+        assert grid == (16, 1, 1)
+        assert -(-rows // 16) <= grid[0]
+        assert loader.workspace_elements(name) == 0
+
+
+# Short-backward shapes (T, H, layout): T * H rows up to 256 in every layout,
+# and the first row counts past it.
+SHORT_BACKWARD_SHAPES = [
+    (1, 1, "contiguous"),
+    (1, 48, "contiguous"),
+    (2, 48, "contiguous"),
+    (5, 48, "contiguous"),
+    (13, 7, "contiguous"),
+    (8, 32, "contiguous"),
+    (16, 16, "contiguous"),
+    (256, 1, "flat"),
+    (5, 48, "projection"),
+    (13, 7, "head_major"),
+    (2, 48, "misaligned"),
+    (257, 1, "flat"),
+    (37, 7, "contiguous"),
+]
+
+
+def _short_backward(rows: int, dw_dtype: torch.dtype) -> tuple[str, str | None]:
+    """``(the module module_for_rows runs, the short backward module or None)``
+    for ``rows`` rows and a ``dw_dtype`` weight gradient on this device."""
+    device_index = torch.cuda.current_device()
+    arch = loader.device_arch(device_index)
+    role = "bwd_f32" if dw_dtype == torch.float32 else "bwd_bf16"
+    name = loader.module_for_rows(
+        arch, role, rows, loader.device_sm_count(device_index)
+    )
+    return name, (name if name == loader.ROUTES[arch].get(role + "_short") else None)
+
+
+@pytest.mark.parametrize("T,H,layout", SHORT_BACKWARD_SHAPES)
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+def test_short_backward_dw_is_the_same_bits_and_takes_no_workspace(
+    T, H, layout, dw_dtype, launches, monkeypatch
+):
+    """Within the FP64 budgets on every launch (``check_all``), the module
+    ``module_for_rows`` names launched; on the short backward (SM100 and
+    SM103 up to 256 rows) ``dw`` is the same bits on every launch, no stream
+    workspace is made, a caller workspace holding anything is left as it is
+    (the results the same bits) and one that is not a workspace is refused."""
+    monkeypatch.setattr(pkg, "_STREAM_WORKSPACES", {})
+    x, z, w, dy = make(T, H, layout=layout, seed=80)
+    name, short = _short_backward(T * H, dw_dtype)
+    patterns = check_all(x, z, w, dy, EPS, dw_dtype=dw_dtype, repeats=5)
+    assert launches[1:] == [name] * 5, launches
+    if short is None:
+        return
+    assert patterns == 1, f"{patterns} dw bit patterns over 5 launches"
+    assert pkg._STREAM_WORKSPACES == {}
+
+    def out():
+        return torch.empty(D, dtype=dw_dtype, device=x.device)
+
+    want = backward(dy, x, z, w, EPS, grad_weight=out())
+    ws = workspace_for(T * H, x.device)
+    ws.fill_(7.0)
+    got = backward(dy, x, z, w, EPS, grad_weight=out(), workspace=ws)
+    torch.cuda.synchronize()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a, b)
+    assert bool((ws == 7.0).all()), "the short backward wrote the workspace"
+    with pytest.raises(ValueError, match="FP64"):
+        backward(dy, x, z, w, EPS, workspace=ws.float())
+    assert pkg._STREAM_WORKSPACES == {}
+
+
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+def test_short_backward_accumulates_and_skips_the_weight_gradient(dw_dtype):
+    """On the short backward: ``accumulate_grad_weight`` adds to the
+    accumulator before the one rounding (within the budget of two roundings),
+    ``compute_grad_weight=False`` leaves ``grad_weight`` as it is, and ``dx``
+    and ``dz`` are the same bits either way."""
+    x, z, w, dy = make(5, 48, seed=81)
+    _name, short = _short_backward(5 * 48, dw_dtype)
+    if short is None:
+        pytest.skip("this architecture routes no short backward")
+    dx_d, dz_d, _ = backward(dy, x, z, w, EPS)
+    dw64, mag = fp64_reference(dy, x, z, w, EPS)[3], magnitudes(dy, x, z, EPS)
+    main = torch.full((D,), 0.25, dtype=dw_dtype, device="cuda")
+    dx, dz, dw = backward(
+        dy, x, z, w, EPS, grad_weight=main, accumulate_grad_weight=True
+    )
+    assert dw is main
+    assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d)
+    assert_dw_within(main, 0.25 + dw64, mag, what=f"accumulated dw {dw_dtype}")
+    main = torch.full((D,), 3.0, dtype=dw_dtype, device="cuda")
+    dx, dz, dw = backward(dy, x, z, w, EPS, grad_weight=main, compute_grad_weight=False)
+    torch.cuda.synchronize()
+    assert dw is None
+    assert torch.equal(dx, dx_d) and torch.equal(dz, dz_d)
+    assert torch.equal(main, torch.full_like(main, 3.0))
 
 
 @pytest.mark.parametrize("sm_count", [208, 212, 216])

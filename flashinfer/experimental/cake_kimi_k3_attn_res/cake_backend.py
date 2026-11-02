@@ -490,7 +490,8 @@ _PERSISTENT_FLAG_REGISTER_CARRY_ONLY = 4
 # ``_two_ctas_per_sm`` and the grid policy is ``clc_token_queue``.  A fallback never crosses the
 # ``_fm`` / ``_crfnone`` / ``_crheld`` / ``_rcp`` / ``_write`` / ``_cta2`` lines and never
 # resolves to a ``_clc`` program: on any grid but its cell's ``M`` CTAs it would leave tokens
-# unwritten or schedule tokens beyond ``M``.
+# unwritten or schedule tokens beyond ``M``.  A snapshot-write cell may name a ``_clc`` key (round
+# 29): its write variant keeps the grammar's order, ``..._write_clc`` (``_write_key``).
 _PERSISTENT_KEY = re.compile(
     r"^persistent:k(?P<K>\d+)_nc(?P<nc>\d+)_d(?P<depth>\d+)_f(?P<bits>[01]+)"
     r"(?P<fm>_fm)?(?P<crfnone>_crfnone)?(?P<crheld>_crheld)?(?P<rcp>_rcp)?(?P<write>_write)?"
@@ -594,12 +595,20 @@ def _small_m_plan(
     )
 
 
+def _write_key(dense_key: str) -> str:
+    """The key of the snapshot-write variant of the dense persistent key ``dense_key``: ``_write``
+    goes before a ``_clc`` suffix, so the write variant of a token-queue program is ``..._write_clc``."""
+    if dense_key.endswith("_clc"):
+        return f"{dense_key.removesuffix('_clc')}_write_clc"
+    return f"{dense_key}_write"
+
+
 def _cell_pinned_write_keys(arch: Optional[str]) -> frozenset[str]:
     """The write programs that ``WRITE_PERSISTENT_KEY_CELLS`` pins to cells on ``arch``.  They
     serve those cells only: an unregistered derived write key never resolves to one of them, so
     pinning a write cell changes no other route."""
     return frozenset(
-        f"{key}_write"
+        _write_key(key)
         for by_cell in (_WRITE_PERSISTENT_KEY_CELLS.get(arch) or {}).values()
         for value in by_cell.values()
         for key in (value if isinstance(value, tuple) else (value,))
@@ -866,7 +875,7 @@ def _plan_route_exact(
         schedule_id = f"{dense.schedule_id}_write"
         return RoutePlan(
             "persistent",
-            f"{dense.kernel_key}_write",
+            _write_key(dense.kernel_key),
             dense.grid_x,
             dense.threads,
             schedule_id,

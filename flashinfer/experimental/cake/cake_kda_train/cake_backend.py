@@ -1734,6 +1734,7 @@ def workspace_bytes(
     arena: KdaArena | None = None,
     doc_lengths: Sequence[int] | None = None,
     fwd_layout: str = "fwd",
+    gate: str = "g",
 ) -> int:
     """Arena bytes a :class:`KdaWorkspace` of the problem allocates (``backward=False``: the forward's layout only,
     ``fwd_layout`` of :data:`FWD_LAYOUTS`; a backward workspace takes the larger of the saved-set paths' layout and
@@ -1743,7 +1744,9 @@ def workspace_bytes(
     and, through the segmented route's segment count, of
     ``sm_count`` and ``arch`` (:func:`_arch_sms`: the current device's SM count when ``sm_count`` is ``None``, the
     current device's architecture when ``arch`` is ``None``).  The outputs and the saved set are allocated per
-    call: :func:`saved_bytes`, :func:`output_bytes`."""
+    call: :func:`saved_bytes`, :func:`output_bytes`.  ``gate``: the deterministic query's gate mode; ``"g"`` only
+    (the explicit gate), ``"raw"`` is refused (:func:`_refuse_gate_layout`)."""
+    _refuse_gate_layout(gate, "workspace_bytes")
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"workspace_bytes: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
@@ -2184,9 +2187,12 @@ class KdaChunkSaved:
     ``v_new`` BF16 ``[R, H, 128]`` (internal layout, pad rows zero) and, on the segmented route, ``seg_m`` FP32
     ``[NSEG, H, 128, 128]`` (``None`` on the serial route) instead, and no ``qg`` / ``w`` / ``u`` (its prep writes
     them).  Versions 1 and 3 (the light sets without ``qg``) are no longer produced or accepted.  ``S``, ``H``,
-    ``num_docs`` and ``scale`` identify the problem.  ``deterministic`` is the mode of the forward that wrote the
-    set (``False``: this package).  The forward programs are copies of the deterministic package's, so both
-    packages write the same versions in the same format, and the backward reads a set of either.
+    ``num_docs`` and ``scale`` identify the problem.  ``gate`` and ``lower_bound`` are the deterministic package's
+    gate-mode fields (FlashInfer #7816): this package's forward writes ``"g"`` and ``None`` (the explicit FP32
+    gate), and its backward refuses a set of the raw gate mode (``"raw"``, ``use_gate_in_kernel=True``).
+    ``deterministic`` is the mode of the forward that wrote the set (``False``: this package).  The forward
+    programs are copies of the deterministic package's, so both packages write the same versions in the same
+    format, and the backward reads a set of either in the explicit gate mode.
     """
 
     version: int
@@ -2209,6 +2215,10 @@ class KdaChunkSaved:
     qg: torch.Tensor | None = None
     w: torch.Tensor | None = None
     u: torch.Tensor | None = None
+    # the gate mode of the forward that wrote the set ("g": the explicit FP32 gate, the only one this package runs;
+    # "raw": the deterministic package's use_gate_in_kernel=True) and the raw mode's lower bound (None in "g" mode)
+    gate: str = "g"
+    lower_bound: float | None = None
     # the mode of the forward that wrote the set (this package's forward: False)
     deterministic: bool = False
 
@@ -2603,11 +2613,14 @@ class KdaWorkspace:
         arena: KdaArena | None = None,
         doc_lengths: Sequence[int] | None = None,
         fwd_layout: str = "fwd",
+        gate: str = "g",
         deterministic: bool = True,
     ) -> KdaWorkspace:
         """A workspace for ``S`` tokens in ``num_docs`` documents with ``H`` heads on ``device``
-        (``deterministic=False`` required, refused before the device is read)."""
+        (``deterministic=False`` required and ``gate="g"``, the explicit gate, the only one: both refused before the
+        device is read)."""
         _require_deterministic_false(deterministic, "KdaWorkspace")
+        _refuse_gate_layout(gate, "KdaWorkspace")
         index = _device_index(torch.device(device))
         return cls(
             plan(S, num_docs, H, cake_jit.sm_count(index), cake_jit.device_arch(index)),
@@ -3500,6 +3513,62 @@ def _require_deterministic_false(deterministic: object, entry: str) -> None:
         )
 
 
+def _refuse_raw_gate(
+    entry: str,
+    use_gate_in_kernel: object,
+    A_log: object,
+    dt_bias: object,
+    lower_bound: object,
+) -> None:
+    """Refuse the deterministic package's raw gate mode (FlashInfer #7816): ``use_gate_in_kernel`` other than
+    ``False`` or any of ``A_log`` / ``dt_bias`` / ``lower_bound`` other than ``None`` (by identity) is a
+    ``ValueError`` naming ``deterministic=True``.  The off values are this package's explicit FP32 gate, so a call
+    that spells them out runs unchanged; a call never changes mode silently."""
+    on = [
+        name
+        for name, value, off in (
+            ("use_gate_in_kernel", use_gate_in_kernel, False),
+            ("A_log", A_log, None),
+            ("dt_bias", dt_bias, None),
+            ("lower_bound", lower_bound, None),
+        )
+        if value is not off
+    ]
+    if on:
+        raise ValueError(
+            f"{entry}: {', '.join(on)} given: the raw gate mode (use_gate_in_kernel=True with A_log, dt_bias and "
+            "lower_bound) runs on the deterministic package only; pass deterministic=True "
+            "(flashinfer.cake_kda_train) or call flashinfer.experimental.cake_kda_det_train"
+        )
+
+
+def _refuse_saved_mode(saved: object, entry: str) -> None:
+    """Refuse a saved set this package's backward cannot read: one of the deterministic package's raw gate mode
+    (``gate`` other than ``"g"``) or of its in-kernel q / k L2 norm (``qk_l2norm`` true, FlashInfer #7817): its
+    tensors were formed from another gate or from normalized q / k.  ``ValueError`` naming ``deterministic=True``."""
+    gate = getattr(saved, "gate", "g")
+    if gate != "g":
+        raise ValueError(
+            f"{entry}: saved: written by a forward in gate mode {gate!r} (use_gate_in_kernel=True); the raw gate "
+            "mode runs on the deterministic package only: pass deterministic=True"
+        )
+    if getattr(saved, "qk_l2norm", False):
+        raise ValueError(
+            f"{entry}: saved: written by a forward with the in-kernel q / k L2 norm (use_qk_l2norm_in_kernel=True), "
+            "which runs on the deterministic package only: pass deterministic=True"
+        )
+
+
+def _refuse_gate_layout(gate: object, entry: str) -> None:
+    """Refuse a workspace query or allocation in the deterministic package's raw gate mode (``gate="raw"``): this
+    package runs the explicit gate (``"g"``) only."""
+    if gate != "g":
+        raise ValueError(
+            f"{entry}: gate={gate!r}: this package runs the explicit FP32 gate ('g') only; the raw gate mode "
+            "(use_gate_in_kernel=True) runs on the deterministic package: pass deterministic=True"
+        )
+
+
 def chunk_kda_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3514,6 +3583,10 @@ def chunk_kda_fwd(
     save_mode: str | None = None,
     arena: KdaArena | None = None,
     doc_lengths: Sequence[int] | None = None,
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
     deterministic: bool = True,
 ) -> tuple[torch.Tensor, KdaChunkSaved | None]:
     """The forward: ``out`` BF16 like ``v`` (a fresh tensor) and the saved set (``None`` without
@@ -3554,8 +3627,11 @@ def chunk_kda_fwd(
     carry writes its carried states straight into the saved ``hseg`` and its offsets / transfers are contiguous
     copies; otherwise they are scattered by index.  The outputs are bitwise the whole problem's (:class:`KdaArena`
     on the sign of exact zeros).  ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`).
+    ``use_gate_in_kernel`` / ``A_log`` / ``dt_bias`` / ``lower_bound``: the deterministic package's raw gate mode,
+    refused here unless off (:func:`_refuse_raw_gate`).
     """
     _require_deterministic_false(deterministic, "chunk_kda_fwd")
+    _refuse_raw_gate("chunk_kda_fwd", use_gate_in_kernel, A_log, dt_bias, lower_bound)
     return _fwd_call(
         q,
         k,
@@ -4060,6 +4136,10 @@ def chunk_kda_bwd(
     workspace: KdaWorkspace | None = None,
     arena: KdaArena | None = None,
     doc_lengths: Sequence[int] | None = None,
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
     deterministic: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The backward: fresh ``(dq, dk, dv, dbeta, dg)`` ranked like the inputs.
@@ -4099,9 +4179,14 @@ def chunk_kda_bwd(
     ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`).  The pair of the fused gradient
     and the GLM intra program follows the path: the checkpoint replay and a saved-set backward can take different
     pairs on some rows (:data:`cake_jit.S1_RECORDS`), and their ``dg`` then differ by FP32 rounding.  A saved set
-    of the deterministic package's forward has the same format and is read as it is.
+    of the deterministic package's forward has the same format and is read as it is, in the explicit gate mode: a
+    set of the raw gate mode or the in-kernel q / k L2 norm is refused (:func:`_refuse_saved_mode`), as are the raw
+    gate keywords unless off (:func:`_refuse_raw_gate`).
     """
     _require_deterministic_false(deterministic, "chunk_kda_bwd")
+    _refuse_raw_gate("chunk_kda_bwd", use_gate_in_kernel, A_log, dt_bias, lower_bound)
+    if saved is not None:
+        _refuse_saved_mode(saved, "chunk_kda_bwd")
     return _bwd_call(
         q,
         k,
@@ -5485,6 +5570,10 @@ def chunk_kda(
     save_mode: str | None = None,
     arena: KdaArena | None = None,
     doc_lengths: Sequence[int] | None = None,
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
     checkpoint_handoff: str = "auto",
     deterministic: bool = True,
 ) -> torch.Tensor:
@@ -5505,9 +5594,10 @@ def chunk_kda(
     ``checkpoint_handoff`` (``"auto"``, ``"on"`` or ``"off"``) and ``CAKE_KDA_CKPT_HANDOFF``: the checkpoint
     hand-off (the module docstring).
     ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`); the node's backward is this
-    package's.
+    package's.  The raw gate keywords are refused unless off (:func:`_refuse_raw_gate`).
     """
     _require_deterministic_false(deterministic, "chunk_kda")
+    _refuse_raw_gate("chunk_kda", use_gate_in_kernel, A_log, dt_bias, lower_bound)
     mode = _handoff_mode(checkpoint_handoff)
     if not torch.is_grad_enabled():
         mode = "off"  # no node is recorded: no backward would take a record

@@ -1019,11 +1019,11 @@ kernel_cake_kda_det_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorM
                         : "=r"(*reinterpret_cast<uint32_t*>(&kraw2[q_12 * 4])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2[(q_12 * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2[(q_12 * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2[(q_12 * 4) + 3]))
                         : "r"((k_s_addr + (unsigned int)((col0 + q_12 * 8) / 64 * 8192 + t_row * 128 + (col0 + q_12 * 8) % 64 * 2 ^ ((col0 + q_12 * 8) / 64 * 8192 + t_row * 128 + (col0 + q_12 * 8) % 64 * 2 >> 7 & 7) << 4))));
                 }
-                float unpack_bf16_1[16];
+                float unpack_bf16_3[16];
                 #pragma unroll
                 for (int _pair = 0; _pair < 8; _pair++) {
-                    (&unpack_bf16_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw2[_pair]) << 16);
-                    (&unpack_bf16_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw2[_pair]) & 0xffff0000u);
+                    (&unpack_bf16_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw2[_pair]) << 16);
+                    (&unpack_bf16_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw2[_pair]) & 0xffff0000u);
                 }
                 unsigned int qraw2[8];
                 unsigned int vraw2[8];
@@ -1036,11 +1036,11 @@ kernel_cake_kda_det_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorM
                         : "=r"(*reinterpret_cast<uint32_t*>(&vraw2[q_13 * 4])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2[(q_13 * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2[(q_13 * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2[(q_13 * 4) + 3]))
                         : "r"((v_k_addr + (unsigned int)((col0 + q_13 * 8) / 64 * 8192 + t_row * 128 + (col0 + q_13 * 8) % 64 * 2 ^ ((col0 + q_13 * 8) / 64 * 8192 + t_row * 128 + (col0 + q_13 * 8) % 64 * 2 >> 7 & 7) << 4))));
                 }
-                float unpack_bf16_1_0[16];
+                float unpack_bf16_1[16];
                 #pragma unroll
                 for (int _pair = 0; _pair < 8; _pair++) {
-                    (&unpack_bf16_1_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(qraw2[_pair]) << 16);
-                    (&unpack_bf16_1_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(qraw2[_pair]) & 0xffff0000u);
+                    (&unpack_bf16_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(qraw2[_pair]) << 16);
+                    (&unpack_bf16_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(qraw2[_pair]) & 0xffff0000u);
                 }
                 float unpack_bf16_2[16];
                 #pragma unroll
@@ -1063,8 +1063,8 @@ kernel_cake_kda_det_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorM
                     e_g2[j_7] = _exp2_11;
                     float _exp2_12 = approx_exp2(gkv2[j_7 + 1]);
                     e_g2[j_7 + 1] = _exp2_12;
-                    kgf2[0] = unpack_bf16_1[j_7] * e_g2[j_7];
-                    kgf2[1] = unpack_bf16_1[j_7 + 1] * e_g2[j_7 + 1];
+                    kgf2[0] = unpack_bf16_3[j_7] * e_g2[j_7];
+                    kgf2[1] = unpack_bf16_3[j_7 + 1] * e_g2[j_7 + 1];
                     dvo0[j_7] = tmem_load_3[j_7] * beta_t;
                     dvo0[j_7 + 1] = tmem_load_3[j_7 + 1] * beta_t;
                     #pragma unroll
@@ -1072,7 +1072,7 @@ kernel_cake_kda_det_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorM
                         float kgf = kgf2[jj_2];
                         db_acc0 = __fmaf_rn(tmem_load_3[j_7 + jj_2], unpack_bf16_2[j_7 + jj_2], db_acc0);
                         db_acc0 = __fmaf_rn(tmem_load_1_1[j_7 + jj_2], kgf, db_acc0);
-                        float dgj = __fmaf_rn(kgf * tmem_load_1_1[j_7 + jj_2], beta_t, __fmaf_rn(unpack_bf16_1_0[j_7 + jj_2], dqc0[j_7 + jj_2], -(unpack_bf16_1[j_7 + jj_2] * dk2[j_7 + jj_2])));
+                        float dgj = __fmaf_rn(kgf * tmem_load_1_1[j_7 + jj_2], beta_t, __fmaf_rn(unpack_bf16_1[j_7 + jj_2], dqc0[j_7 + jj_2], -(unpack_bf16_3[j_7 + jj_2] * dk2[j_7 + jj_2])));
                         if (t_row == 63) {
                             dgj = dgj + dgk_s[col0 + j_7 + jj_2];
                         }
@@ -1223,11 +1223,11 @@ kernel_cake_kda_det_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorM
                         : "=r"(*reinterpret_cast<uint32_t*>(&kraw2_0[q_16 * 4])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2_0[(q_16 * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2_0[(q_16 * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2_0[(q_16 * 4) + 3]))
                         : "r"((k_s_addr + (unsigned int)((col1 + q_16 * 8) / 64 * 8192 + t_row * 128 + (col1 + q_16 * 8) % 64 * 2 ^ ((col1 + q_16 * 8) / 64 * 8192 + t_row * 128 + (col1 + q_16 * 8) % 64 * 2 >> 7 & 7) << 4))));
                 }
-                float unpack_bf16_3[16];
+                float unpack_bf16_4[16];
                 #pragma unroll
                 for (int _pair = 0; _pair < 8; _pair++) {
-                    (&unpack_bf16_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw2_0[_pair]) << 16);
-                    (&unpack_bf16_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw2_0[_pair]) & 0xffff0000u);
+                    (&unpack_bf16_4[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw2_0[_pair]) << 16);
+                    (&unpack_bf16_4[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw2_0[_pair]) & 0xffff0000u);
                 }
                 unsigned int qraw2_0[8];
                 unsigned int vraw2_0[8];
@@ -1240,11 +1240,11 @@ kernel_cake_kda_det_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorM
                         : "=r"(*reinterpret_cast<uint32_t*>(&vraw2_0[q_17 * 4])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2_0[(q_17 * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2_0[(q_17 * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2_0[(q_17 * 4) + 3]))
                         : "r"((v_k_addr + (unsigned int)((col1 + q_17 * 8) / 64 * 8192 + t_row * 128 + (col1 + q_17 * 8) % 64 * 2 ^ ((col1 + q_17 * 8) / 64 * 8192 + t_row * 128 + (col1 + q_17 * 8) % 64 * 2 >> 7 & 7) << 4))));
                 }
-                float unpack_bf16_1_1[16];
+                float unpack_bf16_1_0[16];
                 #pragma unroll
                 for (int _pair = 0; _pair < 8; _pair++) {
-                    (&unpack_bf16_1_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(qraw2_0[_pair]) << 16);
-                    (&unpack_bf16_1_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(qraw2_0[_pair]) & 0xffff0000u);
+                    (&unpack_bf16_1_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(qraw2_0[_pair]) << 16);
+                    (&unpack_bf16_1_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(qraw2_0[_pair]) & 0xffff0000u);
                 }
                 float unpack_bf16_2_0[16];
                 #pragma unroll
@@ -1267,8 +1267,8 @@ kernel_cake_kda_det_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorM
                     e_g2_0[j_8] = _exp2_18;
                     float _exp2_19 = approx_exp2(gkv2_0[j_8 + 1]);
                     e_g2_0[j_8 + 1] = _exp2_19;
-                    kgf2_0[0] = unpack_bf16_3[j_8] * e_g2_0[j_8];
-                    kgf2_0[1] = unpack_bf16_3[j_8 + 1] * e_g2_0[j_8 + 1];
+                    kgf2_0[0] = unpack_bf16_4[j_8] * e_g2_0[j_8];
+                    kgf2_0[1] = unpack_bf16_4[j_8 + 1] * e_g2_0[j_8 + 1];
                     dvo1[j_8] = tmem_load_4[j_8] * beta_t;
                     dvo1[j_8 + 1] = tmem_load_4[j_8 + 1] * beta_t;
                     #pragma unroll
@@ -1276,7 +1276,7 @@ kernel_cake_kda_det_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorM
                         float kgf_1 = kgf2_0[jj_5];
                         db_acc1 = __fmaf_rn(tmem_load_4[j_8 + jj_5], unpack_bf16_2_0[j_8 + jj_5], db_acc1);
                         db_acc1 = __fmaf_rn(tmem_load_1_2[j_8 + jj_5], kgf_1, db_acc1);
-                        float dgj_1 = __fmaf_rn(kgf_1 * tmem_load_1_2[j_8 + jj_5], beta_t, __fmaf_rn(unpack_bf16_1_1[j_8 + jj_5], dqc1[j_8 + jj_5], -(unpack_bf16_3[j_8 + jj_5] * dk2_0[j_8 + jj_5])));
+                        float dgj_1 = __fmaf_rn(kgf_1 * tmem_load_1_2[j_8 + jj_5], beta_t, __fmaf_rn(unpack_bf16_1_0[j_8 + jj_5], dqc1[j_8 + jj_5], -(unpack_bf16_4[j_8 + jj_5] * dk2_0[j_8 + jj_5])));
                         if (t_row == 63) {
                             dgj_1 = dgj_1 + dgk_s[col1 + j_8 + jj_5];
                         }

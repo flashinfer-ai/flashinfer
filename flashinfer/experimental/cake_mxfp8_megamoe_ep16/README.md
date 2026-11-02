@@ -57,8 +57,12 @@ forward path.
 The JIT loader builds one module per admitted architecture that is also a
 FlashInfer build target (`FLASHINFER_CUDA_ARCH_LIST` or the visible devices):
 `sm_100a`, `sm_103a` and `sm_107a`. The `sm_107a` target needs CUDA 13.4 or
-newer. The manifest lists the sources and launch facts; it does not re-verify
-digests at import time.
+newer. The fused kernel runs a static schedule on a cooperative grid of
+two-CTA clusters, one CTA per SM: 72 clusters (144 CTAs), except the CUDA
+module for SM107, which defines `CAKE_MEGAMOE_GRID_CLUSTERS=96` (192 CTAs).
+The CUDA backend refuses a device with fewer SMs than its grid has CTAs. The
+manifest lists the sources and launch facts; it does not re-verify digests at
+import time.
 
 ## Supported contract
 
@@ -98,8 +102,8 @@ that rank's slot on the ranks that own the row's experts, so dispatch reads rows
 and routes from local memory. Neither implementation allocates device storage in
 the forward path. CUDA Graph capture is not supported.
 Calls on one session must be serialized on a single CUDA stream. Recreate the
-session after 14,913,080 forwards, before its signed grid-counter epoch would
-overflow.
+session after 14,913,080 forwards (11,184,810 for the SM107 CUDA module),
+before its signed grid-counter epoch would overflow.
 
 The backend does not participate in automatic routing, autotuning, trace
 apply, or AOT packaging. It provides no compatibility guarantee while it is

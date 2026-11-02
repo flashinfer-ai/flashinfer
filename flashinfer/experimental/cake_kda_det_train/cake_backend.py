@@ -26,6 +26,17 @@ gradients ``dq, dk, dv, dbeta`` BF16 and ``dg`` FP32.  The leading batch axis
 of 1 is optional on every operand and the outputs take the rank of the inputs.
 Every operand is contiguous; a strided view is refused, never copied.
 
+Raw gate mode (``use_gate_in_kernel=True``, FLA's keyword names): ``g`` is the
+raw gate BF16 ``[1, S, H, 128]`` (any view with unit innermost stride and
+16-byte multiple outer strides, :func:`_check_raw`; never copied) with
+``A_log`` FP32 ``[H]``, ``dt_bias`` FP32 ``[H * 128]`` or ``[H, 128]`` and the
+host float ``lower_bound`` (``-5 <= lower_bound < 0``); the kernels form the
+activated gate ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` in their
+prefix passes, and the backward returns the BF16 ``d g`` with ``dA_log`` /
+``d dt_bias`` (the GLM intra program writes per-chunk partials, outside the
+arena, which one ``param_finalize`` launch reduces in a fixed order).  The
+mode is part of the plan (:attr:`Plan.gate`), the workspace and the saved set.
+
 The host reads no tensor contents: the chunk tables are built on the device
 from ``cu_seqlens`` -- on the segmented route up to 256 documents by the intra
 program ``fwd_intra_v14`` (the block table too; no table launch) on the forward
@@ -131,11 +142,13 @@ import collections
 import contextlib
 import dataclasses
 import functools
+import math
+import struct
 import threading
 import types
 import weakref
 from collections.abc import Callable, Iterator, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
@@ -405,7 +418,11 @@ class Plan:
     every stage of the path (:data:`cake_jit.PATHS`; ``light_states`` on the segmented route only) to the registry
     record its ``select_rule`` admits (``None`` for an optional stage the path or route does not launch) and
     ``grids`` every selected record to its launch grids, one per launch of the record by its stage
-    (``cake_jit.launch_grid``).
+    (``cake_jit.launch_grid``).  ``gate`` is the gate mode the records serve (``cake_jit.GATES``: ``"g"`` the
+    activated FP32 gate, ``"raw"`` the raw BF16 gate of ``use_gate_in_kernel``): the stages of
+    ``cake_jit.GATE_STAGES`` select within that class, every other stage selects the same record in both modes;
+    in raw mode ``gate_fused`` is True on every architecture (no raw gate epilogue) and ``param_finalize`` runs
+    once per backward.  The forward layouts do not depend on it.
     """
 
     S: int
@@ -425,6 +442,7 @@ class Plan:
     gate_fused: bool
     records: dict[str, dict[str, str | None]]
     grids: dict[str, tuple[tuple[int, int, int], ...]]
+    gate: str = "g"
 
     def dispatched(self, stage: str, path: str) -> bool:
         """Whether ``path`` launches a record of ``stage``."""
@@ -731,6 +749,7 @@ class Plan:
             gate_fused=self.gate_fused,
             records=self.records,
             grids=grids,
+            gate=self.gate,
         )
 
     def table_layout(self) -> tuple[tuple[str, int, int], ...]:
@@ -765,7 +784,43 @@ def _plan_arch(arch: str | None) -> str:
     return cake_jit.ARCHES[0]
 
 
-def plan(S: int, num_docs: int, H: int, sm_count: int, arch: str | None = None) -> Plan:
+def _gates() -> tuple[str, ...]:
+    """The gate modes the rendered records serve: ``cake_jit.GATES`` (``"g"``, ``"raw"``) of a render that carries
+    the raw-gate records, ``("g",)`` of one that does not (its ``select_record`` has no ``gate`` class)."""
+    return tuple(getattr(cake_jit, "GATES", ("g",)))
+
+
+def _check_gate(gate: str) -> str:
+    """``gate`` when it is a gate mode of the rendered records (:func:`_gates`), else ``ValueError``: ``"raw"``
+    is refused by a render without the raw-gate records."""
+    gates = _gates()
+    if gate not in gates:
+        raise ValueError(
+            f"gate must be one of {gates}, got {gate!r}"
+            + ("" if gate != "raw" else " (this build renders no raw-gate records)")
+        )
+    return gate
+
+
+def _select_record(stage: str, gate: str, **scalars: Any) -> str | None:
+    """``cake_jit.select_record`` of ``stage`` in gate class ``gate`` (checked by :func:`_check_gate`).  The
+    default ``"g"`` calls it without ``gate``, which every render accepts; ``"raw"`` passes ``gate``, which only a
+    render with the raw-gate records (``cake_jit.GATES``) takes."""
+    if _check_gate(gate) == "g":
+        return cake_jit.select_record(stage, **scalars)
+    select: Callable[..., str | None] = cake_jit.select_record
+    return select(stage, gate=gate, **scalars)
+
+
+def plan(
+    S: int,
+    num_docs: int,
+    H: int,
+    sm_count: int,
+    arch: str | None = None,
+    *,
+    gate: str = "g",
+) -> Plan:
     """The :class:`Plan` of a packed problem; reads no tensor.
 
     ``arch`` selects the architecture's records and, on the few-chain segmented rows, its segment count
@@ -776,18 +831,24 @@ def plan(S: int, num_docs: int, H: int, sm_count: int, arch: str | None = None) 
     would overflow: ``H * 128 * 64`` per chunk, ``R * H * 64`` over the padded rows of the ``[R, H, 64]``
     intra-chunk buffers.
 
-    The plan is a pure function of ``(S, num_docs, H, sm_count, arch)`` and is cached on them: a repeated problem
-    returns the same :class:`Plan` object (its record and grid tables are shared, never modified), so the calls
-    of the default entry plan a repeated shape once.
+    ``gate`` (keyword-only, ``"g"`` by default) is the gate mode (:attr:`Plan.gate`): ``"raw"`` selects the raw
+    class of the gate-dependent stages (``cake_jit.GATE_STAGES``) for ``use_gate_in_kernel``; every other stage
+    selects the same record in both modes.
+
+    The plan is a pure function of ``(S, num_docs, H, sm_count, arch, gate)`` and is cached on them: a repeated
+    problem returns the same :class:`Plan` object (its record and grid tables are shared, never modified), so the
+    calls of the default entry plan a repeated shape once.
     """
     arch = _plan_arch(arch)
     if arch not in cake_jit.ARCHES:
         raise ValueError(f"plan: arch {arch!r} is not one of {cake_jit.ARCHES}")
-    return _plan(int(S), int(num_docs), int(H), int(sm_count), arch)
+    return _plan(int(S), int(num_docs), int(H), int(sm_count), arch, _check_gate(gate))
 
 
 @functools.lru_cache(maxsize=256)
-def _plan(S: int, num_docs: int, H: int, sm_count: int, arch: str) -> Plan:
+def _plan(
+    S: int, num_docs: int, H: int, sm_count: int, arch: str, gate: str = "g"
+) -> Plan:
     """:func:`plan` of the normalized scalars (the cache; a refused problem raises every time)."""
     nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sm_count)
     recur, segments, num_segments = cake_jit.segment_plan(num_docs, H, sm_count, arch)
@@ -801,7 +862,7 @@ def _plan(S: int, num_docs: int, H: int, sm_count: int, arch: str) -> Plan:
     # the saved-state path exists on the segmented route only (the serial route has no segment states)
     records = {
         path: {
-            stage: cake_jit.select_record(stage, **scalars, arch=arch, path=path)
+            stage: _select_record(stage, gate, **scalars, arch=arch, path=path)
             for stage in _PATH_STAGES[path]
         }
         for path in PATHS
@@ -856,17 +917,20 @@ def _plan(S: int, num_docs: int, H: int, sm_count: int, arch: str) -> Plan:
         gate_fused=records["light"]["gate_epilogue"] is None,
         records=records,
         grids=grids,
+        gate=gate,
     )
 
 
-def _gate_fused(arch: str | None) -> bool:
+def _gate_fused(arch: str | None, gate: str = "g") -> bool:
     """Whether ``arch``'s GLM intra program writes the gate gradients itself (no ``gate_epilogue`` record admits
     its rows; the layouts then carry no ``dg_int`` / ``db_int``).  ``arch=None`` (a byte query without an exported
-    device at hand) takes the first exported architecture's records, as :func:`plan` does there."""
+    device at hand) takes the first exported architecture's records, as :func:`plan` does there.  ``gate="raw"``
+    reads the raw class, which has no gate epilogue: True on every architecture."""
     arch = cake_jit.ARCHES[0] if arch is None else arch
     return (
-        cake_jit.select_record(
+        _select_record(
             "gate_epilogue",
+            gate,
             num_chunks_pad=2,
             num_seqs=1,
             num_heads=1,
@@ -921,7 +985,9 @@ def arena_for_budget(
     (``doc_lengths`` required from the batched steps on: the floor is the longest document, and a smaller budget
     could only fail inside the calls).  An option the row refuses (lean on the rows with the separate ``dav``
     program, batching on the proportional rows) is skipped; the batched steps take the lean four-pass layouts where
-    the row admits them.  ``ValueError`` naming the smallest arena seen when nothing fits."""
+    the row admits them.  ``ValueError`` naming the smallest arena seen when nothing fits.  The layouts are those
+    of the plan's gate mode (:attr:`Plan.gate`; the raw mode's backward layouts drop the gate epilogue's buffers on
+    every architecture)."""
     budget = int(arena_budget_bytes)
     smallest: int | None = None
 
@@ -1552,6 +1618,7 @@ def workspace_bytes(
     arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
     fwd_layout: str = "fwd",
+    gate: str = "g",
 ) -> int:
     """Arena bytes a :class:`KdaDetWorkspace` of the problem allocates (``backward=False``: the forward's layout only,
     ``fwd_layout`` of :data:`FWD_LAYOUTS`; a backward workspace takes the larger of the saved-set paths' layout and
@@ -1560,16 +1627,19 @@ def workspace_bytes(
     group).  A function of the host scalars
     and, through the segmented route's segment count, of
     ``sm_count`` and ``arch`` (:func:`_arch_sms`: the current device's SM count when ``sm_count`` is ``None``, the
-    current device's architecture when ``arch`` is ``None``).  The outputs and the saved set are allocated per
-    call: :func:`saved_bytes`, :func:`output_bytes`."""
+    current device's architecture when ``arch`` is ``None``).  ``gate`` is the gate mode (:attr:`Plan.gate`): the
+    raw mode's backward layouts carry no ``dg_int`` / ``db_int`` on any architecture (the forward layouts are the
+    same in both modes).  The outputs, the saved set and the raw mode's per-call parameter partials are allocated
+    per call: :func:`saved_bytes`, :func:`output_bytes`, :func:`memory_report`."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"workspace_bytes: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
         )
+    _check_gate(gate)
     arch, sms = _arch_sms(sm_count, arch)
     S, num_docs, H = int(S), int(num_docs), int(H)
     if arena is not None and (arena.lean or arena.batched):
-        return plan(S, num_docs, H, sms, arch).arena_bytes(
+        return plan(S, num_docs, H, sms, arch, gate=gate).arena_bytes(
             backward=backward,
             save_mode=save_mode,
             arena=arena,
@@ -1586,7 +1656,7 @@ def workspace_bytes(
         backward=backward,
         save_mode=save_mode,
         arena=arena,
-        gate_fused=_gate_fused(arch),
+        gate_fused=_gate_fused(arch, gate),
         fwd_layout=fwd_layout,
     )
 
@@ -1663,12 +1733,51 @@ def saved_bytes(
     return total
 
 
-def output_bytes(S: int, H: int, *, backward: bool) -> int:
-    """Bytes of one call's outputs: ``out`` BF16 (forward) or ``dq, dk, dv, dbeta`` BF16 + ``dg`` FP32 (backward)."""
+def output_bytes(S: int, H: int, *, backward: bool, gate: str = "g") -> int:
+    """Bytes of one call's outputs: ``out`` BF16 (forward) or ``dq, dk, dv, dbeta`` BF16 + ``dg`` FP32 (backward);
+    with ``gate="raw"`` the backward's ``dg`` is the BF16 gradient of the raw gate, plus ``dA_log`` FP32 ``[H]``
+    and ``d dt_bias`` FP32 ``[H * 128]``.  The raw backward's per-call parameter partials (:func:`_raw_partials_bytes`)
+    are transient, not outputs: :func:`memory_report` reports them."""
     S, H = int(S), int(H)
+    raw = _check_gate(gate) == "raw"
     if not backward:
         return S * H * D * 2
+    if raw:
+        return 3 * S * H * D * 2 + S * H * 2 + S * H * D * 2 + 4 * H + 4 * H * D
     return 3 * S * H * D * 2 + S * H * 2 + S * H * D * 4
+
+
+# ``param_finalize``'s chunks per segment (the ``per_cta`` of its ``head_chunk_blocks`` grid rule: one CTA per head and
+# segment, ``seg_cap = ceil(NC_pad / 128)`` segments, at least one).
+FINALIZE_SEGMENT = 128
+
+
+def _finalize_segments(NC_pad: int) -> int:
+    """``param_finalize``'s ``seg_cap`` for ``NC_pad`` chunks: its grid's ``y`` and ``part2``'s segment extent."""
+    return max(1, -(-int(NC_pad) // FINALIZE_SEGMENT))
+
+
+def _raw_finalize_scratch(NC_pad: int, H: int, device: torch.device) -> dict[str, Any]:
+    """``param_finalize``'s per-call scratch for ``NC_pad`` partial rows and ``H`` heads: ``part2`` FP32
+    ``[H, seg_cap, 128, 4]`` (every slot it reads is written by the same launch), the per-head u32 ``ticket``
+    ``[H]`` (zero; the last CTA of each head sets it back to zero) and ``seg_cap`` (:func:`_finalize_segments`).
+    The single-rank and KCP backwards both take their scratch here; :func:`_raw_partials_bytes` counts it."""
+    seg_cap = _finalize_segments(NC_pad)
+    return {
+        "part2": _alloc((int(H), seg_cap, D, 4), torch.float32, device),
+        "seg_cap": seg_cap,
+        "ticket": torch.zeros((int(H),), dtype=torch.int32, device=device).view(
+            torch.uint32
+        ),
+    }
+
+
+def _raw_partials_bytes(NC_pad: int, H: int) -> int:
+    """The raw backward's per-call parameter partials ``dA_part`` / ``db_part``: FP32 ``[NC_pad, H, 128, 2]`` each
+    (the per-chunk ``(hi, lo)`` pairs of the GLM intra program), plus ``param_finalize``'s FP32 per-segment scratch
+    ``part2`` ``[H, seg_cap, 128, 4]`` and its u32 ticket ``[H]``, outside the arena, freed with the call."""
+    part2 = int(H) * _finalize_segments(NC_pad) * D * 4 * 4
+    return 2 * int(NC_pad) * int(H) * D * 2 * 4 + part2 + 4 * int(H)
 
 
 def lifetime_table(
@@ -1677,14 +1786,23 @@ def lifetime_table(
     *,
     plan: Plan | None = None,
     gate_fused: bool | None = None,
+    gate: str | None = None,
 ) -> list[dict[str, Any]]:
     """The layout as rows ``{slot, buffer, kind, unit, ..., first_write, last_read}``: token kinds in bytes per
     internal token-head (a tape entry of 32768 B per chunk-head spreads over the chunk's 64 rows), the segmented
     route's state blocks (``unit="seg_block"``) in bytes per (segment, head), present only when the plan
     dispatches that route.  The lean layouts (:data:`LEAN_MODES`) take ``tail_passes``; from two passes on their
     per-pass buffers (``unit="R_b*H"``: bytes per internal token-head of one tail range) are packed by the
-    problem's geometry, so a ``plan`` is required there.  ``gate_fused`` (``None``: the plan's, else ``False``)
-    drops the gate epilogue's ``dg_int`` / ``db_int`` (the architectures whose GLM intra program fuses it)."""
+    problem's geometry, so a ``plan`` is required there.  ``gate_fused`` (``None``: the plan's, else whether
+    ``gate`` is ``"raw"``) drops the gate epilogue's ``dg_int`` / ``db_int`` (the architectures whose GLM intra
+    program fuses it, and the raw gate mode on every architecture).  ``gate`` (``None``: the plan's, else ``"g"``)
+    must match a given plan's."""
+    if gate is not None:
+        _check_gate(gate)
+        if plan is not None and plan.gate != gate:
+            raise ValueError(
+                f"lifetime_table: gate={gate!r}, the plan is of gate mode {plan.gate!r}"
+            )
     if mode in LEAN_MODES and tail_passes > 1:
         if plan is None:
             raise ValueError(
@@ -1694,8 +1812,13 @@ def lifetime_table(
         slots = _slots_of(mode, tail_passes, plan.R, plan.H, plan.NC_pad, plan.NSEG)
     else:
         slots = _slots_of(mode, tail_passes, 0, 1, 0, 0)
+    raw = (plan.gate if plan is not None else gate) == "raw"
     if gate_fused is None:
-        gate_fused = plan.gate_fused if plan is not None else False
+        gate_fused = plan.gate_fused if plan is not None else raw
+    elif raw and not gate_fused:
+        raise ValueError(
+            "lifetime_table: the raw gate mode has no gate epilogue, so gate_fused must be True"
+        )
     if gate_fused:
         slots = tuple(
             kept
@@ -1750,6 +1873,7 @@ def memory_report(
     arch: str | None = None,
     arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
+    gate: str = "g",
 ) -> dict[str, Any]:
     """Bytes one problem needs beyond its inputs: the arena (forward-only and full, with the saved-set paths' and
     the replay's backward layouts apart), the saved set, the outputs and the totals of the three boundaries (arena
@@ -1764,17 +1888,22 @@ def memory_report(
     the group with the most segments; a group gathers its blocks of the saved states only where they are not one
     run of them, at most three per segment) and
     ``arena_floor_batched`` (one document per group under the lean four-pass layouts: ``2820 * R_min * H + 3 * P *
-    H * 64 KiB``, ``R_min`` the internal rows of the longest document; 2052 for the tape forms)."""
+    H * 64 KiB``, ``R_min`` the internal rows of the longest document; 2052 for the tape forms).  ``gate`` is the
+    gate mode (:attr:`Plan.gate`): with ``"raw"`` the backward layouts drop ``dg_int`` / ``db_int`` on every
+    architecture, ``out_bwd`` is the raw mode's outputs (:func:`output_bytes`) and ``bwd_partials`` the per-call
+    parameter partials ``dA_part`` / ``db_part`` (``2 * NC_pad * H * 128 * 8`` bytes, allocated by the backward
+    outside the arena; 0 in ``"g"`` mode), which the backward totals include."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"memory_report: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
         )
+    _check_gate(gate)
     tape = save_mode == "tape"
     arch, sms = _arch_sms(sm_count, arch)
     S, num_docs, H = int(S), int(num_docs), int(H)
     arena = KdaDetArena() if arena is None else arena
     p = (
-        plan(S, num_docs, H, sms, arch)
+        plan(S, num_docs, H, sms, arch, gate=gate)
         if (arena.lean or arena.batched or doc_lengths is not None)
         else None
     )
@@ -1782,7 +1911,7 @@ def memory_report(
         p.check_arena(arena)
     _nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sms)
     recur, segments, num_segments = cake_jit.segment_plan(num_docs, H, sms, arch)
-    gf = _gate_fused(arch)
+    gf = _gate_fused(arch, gate)
     arena_fwd = _arena_bytes(
         rows,
         H,
@@ -1854,7 +1983,10 @@ def memory_report(
             segments * H * D * D * 4 if recur == "seg" else 0
         )
     saved = saved_bytes(S, H, num_docs, save_mode=save_mode, sm_count=sms, arch=arch)
-    out_f, out_b = output_bytes(S, H, backward=False), output_bytes(S, H, backward=True)
+    out_f = output_bytes(S, H, backward=False)
+    out_b = output_bytes(S, H, backward=True, gate=gate)
+    # the raw backward's per-call parameter partials (outside the arena, live from GLM intra to param_finalize)
+    partials = _raw_partials_bytes(nc_pad, H) if gate == "raw" else 0
     # The per-call segment states in the saved set: tape two blocks (seg_state, its transfer half is the saved
     # seg_m), light three (hseg and the seg_state pair, version 4) when the size rule holds; none on the serial route.
     if recur != "seg":
@@ -1867,6 +1999,7 @@ def memory_report(
         "save_mode": save_mode,
         "sm_count": sms,
         "arch": arch,
+        "gate": gate,
         "gate_fused": gf,
         "recur": recur,
         "segments": segments,
@@ -1904,17 +2037,21 @@ def memory_report(
         "saved": saved,
         "out_fwd": out_f,
         "out_bwd": out_b,
+        "bwd_partials": partials,
         "fwd_total_fwd_arena": arena_fwd_conf
         + out_f
         + saved,  # a forward-only workspace
         "fwd_total_bwd_arena": arena_bwd_conf
         + out_f
         + saved,  # the same workspace serving every boundary
-        "bwd_total": arena_bwd_conf + out_b,  # the saved set exists before the call
+        "bwd_total": arena_bwd_conf
+        + out_b
+        + partials,  # the saved set exists before the call
         "replay_total": arena_bwd
         + out_f
         + saved
-        + out_b,  # the default arena: lean serves no replay
+        + out_b
+        + partials,  # the default arena: lean serves no replay
     }
 
 
@@ -1951,7 +2088,10 @@ class KdaDetChunkSaved:
     ``v_new`` BF16 ``[R, H, 128]`` (internal layout, pad rows zero) and, on the segmented route, ``seg_m`` FP32
     ``[NSEG, H, 128, 128]`` (``None`` on the serial route) instead, and no ``qg`` / ``w`` / ``u`` (its prep writes
     them).  Versions 1 and 3 (the light sets without ``qg``) are no longer produced or accepted.  ``S``, ``H``,
-    ``num_docs`` and ``scale`` identify the problem.
+    ``num_docs`` and ``scale`` identify the problem; ``gate`` (``"g"`` or ``"raw"``) and ``lower_bound`` (the raw
+    mode's FP32 lower bound as a host float, ``None`` in ``"g"`` mode) the gate mode of the forward that wrote it:
+    the tensors and the version are the same in both modes, and a backward in another mode or with another lower
+    bound is refused.
     """
 
     version: int
@@ -1974,6 +2114,9 @@ class KdaDetChunkSaved:
     qg: torch.Tensor | None = None
     w: torch.Tensor | None = None
     u: torch.Tensor | None = None
+    # the gate mode of the forward that wrote the set (metadata: the tensors and their layout are the same in both)
+    gate: str = "g"
+    lower_bound: float | None = None
 
 
 def _device_index(device: torch.device) -> int:
@@ -2041,18 +2184,21 @@ class _Packing:
     the whole problem's rule, so its chains keep their relative order), else ``None`` and the group's block
     indices (``index``; ``None`` on the serial route too, which has no blocks); the real chunk count of every
     tail range of every group at each of its chunk bounds where the group runs more than one tail pass
-    (:func:`_group_tail_passes`, :func:`_tail_passes`); and the device copy of these integers (``None`` until a
-    call makes it; :func:`_entry_release` drops it)."""
+    (:func:`_group_tail_passes`, :func:`_tail_passes`); in raw gate mode the pack's real chunk count (the bound
+    of ``param_finalize``, ``total_at``; ``None`` in ``"g"`` mode); and the device copy of these integers (``None``
+    until a call makes it; :func:`_entry_release` drops it)."""
 
     batches: tuple[Batch, ...]
     P: int
     blocks: tuple[int | None, ...]
-    # the int32 words of the copy: the lengths, then the tail counts ((group, chunk bound) -> (first word, words))
+    # the int32 words of the copy: the lengths, then the tail counts ((group, chunk bound) -> (first word, words)),
+    # then (raw gate mode) the real chunk count of the pack (word total_at)
     words: tuple[int, ...]
     tail_at: dict[tuple[int, int], tuple[int, int]]
     # the int64 words: the block indices of the groups whose blocks are not one run (group -> (first word, words))
     index: tuple[int, ...]
     index_at: dict[int, tuple[int, int]]
+    total_at: int | None = None
     words_dev: torch.Tensor | None = None
     index_dev: torch.Tensor | None = None
 
@@ -2082,6 +2228,16 @@ class _Packing:
         at = self.tail_at.get((group, nc_pad))
         return None if at is None else self.words_dev[at[0] : at[0] + at[1]]
 
+    @property
+    def total_chunks(self) -> torch.Tensor:
+        """The one-entry device count of the pack's real chunks, ``sum(ceil(L_d / 64))`` (raw gate mode: the
+        ``seq_chunk_start`` operand of ``param_finalize`` with ``num_seqs = 0``)."""
+        if self.total_at is None:
+            raise RuntimeError(
+                "_Packing: the real chunk count is recorded in raw gate mode only"
+            )
+        return self.words_dev[self.total_at : self.total_at + 1]
+
     def take(self, group: int, states: torch.Tensor) -> torch.Tensor:
         """The group's blocks of the whole problem's states ``[NSEG, ...]`` in the group's block order: a view where
         they are one run, else gathered by index."""
@@ -2104,7 +2260,8 @@ def _host_packing(
     save_mode: str,
 ) -> _Packing:
     """The host part of :class:`_Packing` for ``lengths`` (checked) on plan ``p`` under the batched ``arena``, for a
-    workspace of ``nbytes`` and ``save_mode`` (the groups' tail passes: :func:`_group_tail_passes`)."""
+    workspace of ``nbytes`` and ``save_mode`` (the groups' tail passes: :func:`_group_tail_passes`); on a raw-mode
+    plan (:attr:`Plan.gate`) also the pack's real chunk count, ``param_finalize``'s bound."""
     batches = p.batches(arena, lengths)
     ranks = _chain_ranks(lengths) if p.recur == "seg" else None
     words = list(lengths)
@@ -2136,8 +2293,20 @@ def _host_packing(
             blocks.append(None)
             index_at[i] = (len(index), p.P * len(starts))
             index += [s + j for s in starts for j in range(p.P)]
+    total_at = None
+    if p.gate == "raw":
+        # param_finalize's bound over the whole pack (the groups' partials are views of one per-call buffer)
+        total_at = len(words)
+        words.append(sum(-(-n // BT) for n in lengths))
     return _Packing(
-        batches, p.P, tuple(blocks), tuple(words), tail_at, tuple(index), index_at
+        batches,
+        p.P,
+        tuple(blocks),
+        tuple(words),
+        tail_at,
+        tuple(index),
+        index_at,
+        total_at,
     )
 
 
@@ -2164,7 +2333,10 @@ class KdaDetWorkspace:
     for: ``"fwd"``, or ``"fwd_kcp"`` for the context-parallel route's forward (:data:`FWD_KCP_SLOTS`; this module's
     forward does not fit in it); a backward workspace keeps ``"fwd"``.  ``layouts`` (another route's; off by default)
     sizes the arena for exactly those ``(mode, tail passes)`` layouts (registered by that route) in place of the
-    option's; ``views`` takes each of them at its passes (kept per mode in :attr:`layout_passes`).
+    option's; ``views`` takes each of them at its passes (kept per mode in :attr:`layout_passes`).  :attr:`gate` is
+    the gate mode of the plan (:attr:`Plan.gate`; ``gate=`` must match it when given): a call in the other mode is
+    refused with ``ValueError`` (the raw mode's layouts carry no gate epilogue buffers, the ``"g"`` mode's records
+    read the activated FP32 gate).
     """
 
     def __init__(
@@ -2180,10 +2352,16 @@ class KdaDetWorkspace:
         doc_lengths: Sequence[int] | None = None,
         fwd_layout: str = "fwd",
         layouts: Sequence[tuple[str, int]] | None = None,
+        gate: str | None = None,
     ) -> None:
         if save_mode not in SAVE_MODES:
             raise ValueError(
                 f"KdaDetWorkspace: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
+            )
+        if gate is not None and _check_gate(gate) != plan.gate:
+            raise ValueError(
+                f"KdaDetWorkspace: gate={gate!r}, the plan selects the records of gate mode {plan.gate!r} "
+                "(cake_backend.plan(..., gate=...))"
             )
         if layouts is not None and (
             not layouts
@@ -2331,6 +2509,11 @@ class KdaDetWorkspace:
         return self._epoch[0]
 
     @property
+    def gate(self) -> str:
+        """The gate mode this workspace serves (:attr:`Plan.gate`: ``"g"`` or ``"raw"``)."""
+        return self.plan.gate
+
+    @property
     def fwd(self) -> types.SimpleNamespace:
         return self.views("fwd")
 
@@ -2352,11 +2535,20 @@ class KdaDetWorkspace:
         arena: KdaDetArena | None = None,
         doc_lengths: Sequence[int] | None = None,
         fwd_layout: str = "fwd",
+        gate: str = "g",
     ) -> KdaDetWorkspace:
-        """A workspace for ``S`` tokens in ``num_docs`` documents with ``H`` heads on ``device``."""
+        """A workspace for ``S`` tokens in ``num_docs`` documents with ``H`` heads on ``device`` in gate mode
+        ``gate`` (``"raw"``: the calls with ``use_gate_in_kernel=True``)."""
         index = _device_index(torch.device(device))
         return cls(
-            plan(S, num_docs, H, cake_jit.sm_count(index), cake_jit.device_arch(index)),
+            plan(
+                S,
+                num_docs,
+                H,
+                cake_jit.sm_count(index),
+                cake_jit.device_arch(index),
+                gate=gate,
+            ),
             device,
             backward=backward,
             save_mode=save_mode,
@@ -2379,12 +2571,21 @@ class KdaDetWorkspace:
         backward: bool = True,
         save_mode: str = "light",
         launcher: Launcher | None = None,
+        gate: str = "g",
     ) -> KdaDetWorkspace:
         """A workspace of the first arena option whose arena fits ``arena_budget_bytes`` (:func:`arena_for_budget`:
         the default, lean, two tail passes, four, then four passes over document groups halving from half the pack
-        down to one document per group, which needs ``doc_lengths``); ``ValueError`` when none fits."""
+        down to one document per group, which needs ``doc_lengths``); ``ValueError`` when none fits.  ``gate``: the
+        gate mode, as :meth:`for_problem`."""
         index = _device_index(torch.device(device))
-        p = plan(S, num_docs, H, cake_jit.sm_count(index), cake_jit.device_arch(index))
+        p = plan(
+            S,
+            num_docs,
+            H,
+            cake_jit.sm_count(index),
+            cake_jit.device_arch(index),
+            gate=gate,
+        )
         option = arena_for_budget(
             p,
             arena_budget_bytes,
@@ -2418,10 +2619,14 @@ class KdaDetWorkspace:
 
     def with_plan(self, plan: Plan) -> KdaDetWorkspace:
         """A workspace sharing this arena under another plan of the same ``(S, num_docs, H)`` problem (its layouts
-        must fit the arena when used)."""
+        must fit the arena when used) and the same gate mode."""
         if (plan.S, plan.N, plan.H) != (self.plan.S, self.plan.N, self.plan.H):
             raise ValueError(
                 "with_plan: the plan must describe the same (S, num_docs, H) problem"
+            )
+        if plan.gate != self.plan.gate:
+            raise ValueError(
+                f"with_plan: the plan is of gate mode {plan.gate!r}, the workspace of {self.plan.gate!r}"
             )
         return self._view(plan)
 
@@ -2570,10 +2775,11 @@ def _entry_acquire(
     save_mode: str,
     arena: KdaDetArena | None,
     doc_lengths: Sequence[int] | None,
+    gate: str = "g",
 ) -> tuple[KdaDetWorkspace, tuple[Any, ...] | None]:
     """The workspace of one call without a workspace argument, with its arena storage allocated, and its pool key
     (``None``: a workspace of this call alone, under CUDA-graph capture, whose device allocations belong to the
-    graph; a batched arena is refused there, :meth:`KdaDetWorkspace.batches`)."""
+    graph; a batched arena is refused there, :meth:`KdaDetWorkspace.batches`).  ``gate``: the call's gate mode."""
     if torch.cuda.is_current_stream_capturing():
         ws = KdaDetWorkspace.for_problem(
             S,
@@ -2584,6 +2790,7 @@ def _entry_acquire(
             save_mode=save_mode,
             arena=arena,
             doc_lengths=doc_lengths,
+            gate=gate,
         )
         return ws, None
     index = _device_index(device)
@@ -2603,6 +2810,7 @@ def _entry_acquire(
         save_mode,
         option,
         lengths,
+        gate,
     )
     with _entry_lock:
         free = _entry_pool.get(key)
@@ -2617,6 +2825,7 @@ def _entry_acquire(
             save_mode=save_mode,
             arena=option,
             doc_lengths=doc_lengths,
+            gate=gate,
         )
     else:
         if doc_lengths is not None and lengths is None:
@@ -2658,9 +2867,10 @@ def _workspace(
     save_mode: str | None = None,
     arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
+    gate: str = "g",
 ) -> Iterator[KdaDetWorkspace]:
-    """The workspace of one call: the caller's (checked against the problem) or, without one, the call's own,
-    whose device memory lives for the call alone (:func:`_entry_acquire`)."""
+    """The workspace of one call: the caller's (checked against the problem and the gate mode) or, without one,
+    the call's own, whose device memory lives for the call alone (:func:`_entry_acquire`)."""
     if workspace is None:
         ws, key = _entry_acquire(
             S,
@@ -2671,6 +2881,7 @@ def _workspace(
             save_mode="light" if save_mode is None else save_mode,
             arena=arena,
             doc_lengths=doc_lengths,
+            gate=gate,
         )
         try:
             yield ws
@@ -2695,6 +2906,13 @@ def _workspace(
     if backward and not workspace.backward:
         raise ValueError(
             "workspace: allocated with backward=False; the backward needs its layout"
+        )
+    if workspace.gate != gate:
+        raise ValueError(
+            f"workspace: allocated for gate mode {workspace.gate!r} "
+            f"(use_gate_in_kernel={workspace.gate == 'raw'}), the call runs gate mode {gate!r} "
+            f"(use_gate_in_kernel={gate == 'raw'}); allocate the workspace with "
+            f"use_gate_in_kernel={gate == 'raw'} (gate={gate!r})"
         )
     yield workspace
 
@@ -2737,9 +2955,163 @@ def _check(
         raise ValueError(f"{name}: on {x.device}, expected {device}")
 
 
-def _operands(q, k, v, g, beta, cu_seqlens):
+def _check_raw(x: torch.Tensor, S: int, H: int, device: torch.device) -> torch.Tensor:
+    """The raw gate operand of ``use_gate_in_kernel=True`` (without its batch axis): BF16 ``[S, H, 128]`` on
+    ``device``, any view with strides ``(s_t, s_h, 1)`` in elements such that ``s_h >= 128`` when ``H > 1``,
+    ``s_t >= (H - 1) * s_h + 128`` when ``S > 1`` (no two elements share an address), ``s_h % 8 == 0`` and
+    ``s_t % 8 == 0`` (16-byte strides, as the TMA descriptor and the stride scalars of the kernels need) and a
+    16-byte aligned address: a contiguous tensor, a column slice ``out[:, c0:c0 + 128 * H].view(S, H, 128)`` of a
+    fused projection with ``c0 % 8 == 0``, a head-interleaved split.  ``ValueError`` otherwise; the host never
+    copies it.  The programs that read it through a plain pointer check no layout of their own (their bindings
+    take a strided view as is), so this predicate is the only full check.  An axis of extent 1 has no stride that
+    matters: it is viewed with the canonical one (the same elements, no copy)."""
+    if tuple(x.shape) != (S, H, D):
+        raise ValueError(
+            f"g: the raw gate (use_gate_in_kernel=True) has shape {(S, H, D)} (or a leading batch axis of 1), got "
+            f"{tuple(x.shape)}"
+        )
+    if x.dtype != torch.bfloat16:
+        raise ValueError(
+            f"g: the raw gate (use_gate_in_kernel=True) is torch.bfloat16, got {x.dtype}; the activated FP32 gate "
+            "is passed with use_gate_in_kernel=False"
+        )
+    if x.device != device:
+        raise ValueError(f"g: on {x.device}, expected {device}")
+    s_t, s_h, s_d = (int(s) for s in x.stride())
+    if s_d != 1:
+        raise ValueError(
+            f"g: the raw gate needs a unit innermost stride, got strides {tuple(x.stride())}"
+        )
+    if H == 1:
+        s_h = D
+    if S == 1:
+        s_t = H * s_h
+    if (s_t, s_h) != tuple(int(s) for s in x.stride()[:2]):
+        x = x.as_strided((S, H, D), (s_t, s_h, 1), x.storage_offset())
+    if (
+        (H > 1 and s_h < D)
+        or (S > 1 and s_t < (H - 1) * s_h + D)
+        or s_h % 8
+        or s_t % 8
+        or x.data_ptr() % 16
+    ):
+        raise ValueError(
+            f"g: the raw gate's strides {(s_t, s_h, 1)} (elements) or address are not accepted: the token stride "
+            "s_t and the head stride s_h must be multiples of 8 elements (16 bytes) with s_h >= 128 (H > 1) and "
+            "s_t >= (H - 1) * s_h + 128 (S > 1), and the address 16-byte aligned; a strided view is never copied"
+        )
+    return x
+
+
+def _gate_mode(use_gate_in_kernel: bool) -> str:
+    """``"raw"`` for ``use_gate_in_kernel=True``, ``"g"`` for ``False``; ``ValueError`` for a non-bool."""
+    if not isinstance(use_gate_in_kernel, bool):
+        raise ValueError(
+            f"use_gate_in_kernel must be a bool, got {use_gate_in_kernel!r}"
+        )
+    return "raw" if use_gate_in_kernel else "g"
+
+
+def _f32(x: float) -> float:
+    """``x`` rounded to the nearest FP32 value (the kernels' scalar), as a host float."""
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class _GateParams:
+    """The raw gate's parameters of one call (:func:`_gate_params`): ``A_log`` FP32 ``[H]``, ``dt_bias`` FP32 viewed
+    as ``[H * 128]`` (``dt_bias_shape`` the caller's shape, which its gradient takes) and ``lower_bound`` the FP32
+    value of the caller's float."""
+
+    A_log: torch.Tensor
+    dt_bias: torch.Tensor
+    dt_bias_shape: tuple[int, ...]
+    lower_bound: float
+
+
+def _gate_params(
+    gate: str,
+    A_log: torch.Tensor | None,
+    dt_bias: torch.Tensor | None,
+    lower_bound: float | None,
+    H: int,
+    device: torch.device,
+) -> _GateParams | None:
+    """The checked raw gate parameters (``None`` in ``"g"`` mode, where passing any of them is a ``ValueError``):
+    ``A_log`` FP32 ``[H]`` and ``dt_bias`` FP32 ``[H * 128]`` or ``[H, 128]``, contiguous on ``device``;
+    ``lower_bound`` a finite host float with ``-5 <= lower_bound < 0`` after rounding to FP32 (required: no
+    kernel implements a softplus gate)."""
+    if gate == "g":
+        given = [
+            name
+            for name, x in (
+                ("A_log", A_log),
+                ("dt_bias", dt_bias),
+                ("lower_bound", lower_bound),
+            )
+            if x is not None
+        ]
+        if given:
+            raise ValueError(
+                f"{', '.join(given)}: the raw gate's parameters are taken with use_gate_in_kernel=True only; "
+                "with use_gate_in_kernel=False g is the activated FP32 gate"
+            )
+        return None
+    if lower_bound is None:
+        raise ValueError(
+            "lower_bound: use_gate_in_kernel=True needs the gate's lower bound (a float, -5.0 <= lower_bound "
+            "< 0.0); the kernels implement the bounded sigmoid gate only"
+        )
+    out_of_range = ValueError(
+        f"lower_bound must satisfy -5.0 <= lower_bound < 0.0 (as an FP32 value), got {lower_bound!r}"
+    )
+    if isinstance(lower_bound, bool) or not isinstance(lower_bound, (int, float)):
+        raise ValueError(
+            f"lower_bound must be a finite Python float with -5.0 <= lower_bound < 0.0, got {lower_bound!r}"
+        )
+    try:
+        x = float(lower_bound)  # an int beyond the float range overflows here
+    except OverflowError:
+        raise out_of_range from None
+    if not math.isfinite(x):
+        raise ValueError(
+            f"lower_bound must be a finite Python float with -5.0 <= lower_bound < 0.0, got {lower_bound!r}"
+        )
+    try:
+        lb = _f32(x)  # a float beyond the FP32 range overflows here
+    except OverflowError:
+        raise out_of_range from None
+    if not -5.0 <= lb < 0.0:
+        raise out_of_range
+    if A_log is None or dt_bias is None:
+        missing = [n for n, x in (("A_log", A_log), ("dt_bias", dt_bias)) if x is None]
+        raise ValueError(
+            f"{', '.join(missing)}: use_gate_in_kernel=True needs A_log FP32 [H] and dt_bias FP32 [H * 128] or "
+            "[H, 128]"
+        )
+    _check(A_log, "A_log", (H,), torch.float32, device)
+    shape = tuple(dt_bias.shape)
+    if shape not in ((H * D,), (H, D)):
+        raise ValueError(f"dt_bias: expected shape {(H * D,)} or {(H, D)}, got {shape}")
+    _check(dt_bias, "dt_bias", shape, torch.float32, device)
+    return _GateParams(A_log, dt_bias.view(H * D), shape, lb)
+
+
+def _raw_values(g_raw: torch.Tensor, gp: _GateParams) -> dict[str, Any]:
+    """The logical values of the raw gate operands: the view, its element strides and the parameters."""
+    return {
+        "g_raw": g_raw,
+        "g_raw_row_stride": int(g_raw.stride(0)),
+        "g_raw_head_stride": int(g_raw.stride(1)),
+        "A_log": gp.A_log,
+        "dt_bias": gp.dt_bias,
+        "lower_bound": gp.lower_bound,
+    }
+
+
+def _operands(q, k, v, g, beta, cu_seqlens, *, gate: str = "g"):
     """The operands without their optional batch axis, the problem scalars and whether the inputs carried a batch
-    axis (the outputs take the same rank)."""
+    axis (the outputs take the same rank).  ``gate="raw"``: ``g`` is the raw gate (:func:`_check_raw`)."""
     v = _squeeze_batch(v, "v", 3)
     S, H = int(v.shape[0]), int(v.shape[1])
     if cu_seqlens.dim() != 1 or cu_seqlens.numel() < 2:
@@ -2755,7 +3127,10 @@ def _operands(q, k, v, g, beta, cu_seqlens):
     _check(q, "q", (S, H, D), torch.bfloat16, device)
     _check(k, "k", (S, H, D), torch.bfloat16, device)
     _check(v, "v", (S, H, D), torch.bfloat16, device)
-    _check(g, "g", (S, H, D), torch.float32, device)
+    if gate == "raw":
+        g = _check_raw(g, S, H, device)
+    else:
+        _check(g, "g", (S, H, D), torch.float32, device)
     _check(beta, "beta", (S, H), torch.bfloat16, device)
     _check(cu_seqlens, "cu_seqlens", (N + 1,), torch.int32, device)
     return q, k, v, g, beta, S, N, H, batched
@@ -3032,7 +3407,8 @@ def _tail_passes(
     h: torch.Tensor,
     nc_vec: torch.Tensor | None = None,
 ) -> None:
-    """Steps 6-8 of the backward (the fused gradient, GLM intra and, where it launches, the gate epilogue) once per tail range
+    """Steps 6-8 of the backward (the fused gradient, GLM intra and, where it launches, the gate epilogue; never
+    ``param_finalize``, which runs once per call) once per tail range
     (:func:`_tail_ranges`) of a lean workspace with ``tail_passes > 1`` (a group's view: its own).  Per range: the
     whole-sequence arena buffers (``gk``, ``v_new``, ``dv2``, ``beta_int``, the ``h`` / ``dh`` tapes) as leading-axis
     views offset by the range's first chunk, the chunk tables as the range's slices, ``seq_chunk_start`` as the
@@ -3076,6 +3452,11 @@ def _tail_passes(
             "num_seqs": 0,
             "num_chunks_pad": length,
         }
+        if "dA_part" in values:
+            # raw gate mode: the per-chunk parameter partials (indexed by chunk) offset by the range's first chunk,
+            # like gk's rows; param_finalize runs once after the last range
+            pass_values["dA_part"] = values["dA_part"][c0:]
+            pass_values["db_part"] = values["db_part"][c0:]
         for stage in ("dqkg", "glm_intra", "gate_epilogue"):
             if not p.dispatched(stage, path):
                 continue  # the fused GLM intra program writes dg / dbeta itself
@@ -3132,18 +3513,20 @@ def _forward_launches(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
+    g: torch.Tensor | None,
     beta: torch.Tensor,
     scale: float,
     qg: torch.Tensor | None = None,
     w: torch.Tensor | None = None,
     u: torch.Tensor | None = None,
+    gate_values: dict[str, Any] | None = None,
 ) -> None:
     """The launches of one forward on ``ws`` (the whole problem, or one document group through its view, its
     ``cu_seqlens`` slice, its tables and its tape slices; the token tensors always whole): the intra program (the
     GLM prep folded in), WY where the plan dispatches it, the state recurrence.  ``qg`` / ``w`` / ``u`` are the
     light saving forward's per-call tensors (version 4): the same writes as into the arena's slots, another
-    destination, and every consumer of the call reads them there."""
+    destination, and every consumer of the call reads them there.  ``gate_values`` are the raw gate mode's
+    operands (:func:`_raw_values`; ``g`` is then ``None``): the plan's raw intra record reads them."""
     p = ws.plan
     values = _values(
         ws,
@@ -3163,6 +3546,8 @@ def _forward_launches(
         out=out,
         scale=scale,
     )
+    if gate_values:
+        values.update(gate_values)
     _saved_rows(values, p, qg=qg, w=w, u=u)
     _fwd_intra(
         ws,
@@ -3193,6 +3578,10 @@ def chunk_kda_det_fwd(
     save_mode: str | None = None,
     arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
 ) -> tuple[torch.Tensor, KdaDetChunkSaved | None]:
     """The forward: ``out`` BF16 like ``v`` (a fresh tensor) and the saved set (``None`` without
     ``save_for_backward``; fresh ``Aqk`` / ``Akk`` and tables and, with ``save_mode="light"`` (version 4), the
@@ -3232,8 +3621,19 @@ def chunk_kda_det_fwd(
     carry writes its carried states straight into the saved ``hseg`` and its offsets / transfers are contiguous
     copies; otherwise they are scattered by index.  The outputs are bitwise the whole problem's (:class:`KdaDetArena`
     on the sign of exact zeros).
+
+    ``use_gate_in_kernel=True`` (raw gate mode) takes ``g`` as the raw gate BF16 ``[1, S, H, 128]`` (a strided
+    view is accepted under :func:`_check_raw`'s rule, never copied) with ``A_log`` FP32 ``[H]``, ``dt_bias`` FP32
+    ``[H * 128]`` or ``[H, 128]`` and ``lower_bound`` (``-5 <= lower_bound < 0``, required): the intra program
+    activates the gate in its prefix pass (``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``), the same
+    launches otherwise, and the saved set records the mode and the lower bound.  The workspace must be of the same
+    mode (:attr:`KdaDetWorkspace.gate`).  With ``use_gate_in_kernel=False`` the three parameters must be ``None``.
     """
-    q, k, v, g, beta, S, N, H, batched = _operands(q, k, v, g, beta, cu_seqlens)
+    gate = _gate_mode(use_gate_in_kernel)
+    q, k, v, g, beta, S, N, H, batched = _operands(
+        q, k, v, g, beta, cu_seqlens, gate=gate
+    )
+    gp = _gate_params(gate, A_log, dt_bias, lower_bound, H, v.device)
     with _workspace(
         workspace,
         S,
@@ -3244,6 +3644,7 @@ def chunk_kda_det_fwd(
         save_mode=save_mode,
         arena=arena,
         doc_lengths=doc_lengths,
+        gate=gate,
     ) as ws:
         out, saved = _forward(
             ws,
@@ -3257,6 +3658,7 @@ def chunk_kda_det_fwd(
             save_for_backward=save_for_backward,
             save_mode=save_mode,
             doc_lengths=doc_lengths,
+            gate_params=gp,
         )
     return _ranked(out, batched), saved
 
@@ -3274,9 +3676,10 @@ def _forward(
     save_for_backward: bool,
     save_mode: str | None,
     doc_lengths: Sequence[int] | None,
+    gate_params: _GateParams | None = None,
 ) -> tuple[torch.Tensor, KdaDetChunkSaved | None]:
     """:func:`chunk_kda_det_fwd` on the call's workspace, the operands without their batch axis: ``out`` ``[S, H, 128]``
-    and the saved set."""
+    and the saved set.  ``gate_params``: the raw gate mode's parameters (``g`` is then the raw gate view)."""
     p = ws.plan
     S, N, H = p.S, p.N, p.H
     save_mode = ws.save_mode if save_mode is None else save_mode
@@ -3338,9 +3741,10 @@ def _forward(
         "q": q,
         "k": k,
         "v": v,
-        "g": g,
+        "g": g if gate_params is None else None,
         "beta": beta,
         "scale": float(scale),
+        "gate_values": None if gate_params is None else _raw_values(g, gate_params),
     }
     if packing is None:
         a = ws.views(mode)
@@ -3434,6 +3838,12 @@ def _forward(
             v_new[BT * (last.c0 + ws_last.plan.NC_pad) :].zero_()
     saved = None
     if save_for_backward:
+        # the gate mode of the set (metadata; "g" sets keep the defaults)
+        mode_fields: dict[str, Any] = (
+            {}
+            if gate_params is None
+            else {"gate": "raw", "lower_bound": gate_params.lower_bound}
+        )
         if tape:
             saved = KdaDetChunkSaved(
                 SAVED_VERSION_TAPE,
@@ -3447,6 +3857,7 @@ def _forward(
                 h=h,
                 v_new=v_new,
                 seg_m=seg_m,
+                **mode_fields,
             )
         else:
             saved = KdaDetChunkSaved(
@@ -3463,6 +3874,7 @@ def _forward(
                 qg=qg_saved,
                 w=w_saved,
                 u=u_saved,
+                **mode_fields,
             )
     return out, saved
 
@@ -3486,19 +3898,20 @@ def _backward_launches(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
+    g: torch.Tensor | None,
     beta: torch.Tensor,
     dout: torch.Tensor,
     dq: torch.Tensor,
     dk: torch.Tensor,
     dv: torch.Tensor,
-    dg: torch.Tensor,
+    dg: torch.Tensor | None,
     dbeta: torch.Tensor,
     scale: float,
     qg: torch.Tensor | None = None,
     w: torch.Tensor | None = None,
     u: torch.Tensor | None = None,
     nc_vec: torch.Tensor | None = None,
+    gate_values: dict[str, Any] | None = None,
 ) -> None:
     """The launches of one backward on ``ws`` (the whole problem, or one document group through its view, its
     ``cu_seqlens`` slice, its tables, its tape slices, its slices of the saved ``qg`` / ``w`` / ``u``, its blocks of
@@ -3506,7 +3919,10 @@ def _backward_launches(
     gradients always whole): the replay's intra recompute, the prep, WY, the recurrence recompute, dA / dv, the
     adjoint recurrence and the tail (once, or per range of a lean workspace's ``tail_passes``, a group view's own),
     each where the path and the plan dispatch it.  ``seg_m`` is the forward's transfers where they do not come from
-    ``seg_state[1]`` (a tape set's ``seg_m``, a group's blocks of the saved ``seg_state[1]``)."""
+    ``seg_state[1]`` (a tape set's ``seg_m``, a group's blocks of the saved ``seg_state[1]``).  ``gate_values`` are
+    the raw gate mode's operands and outputs (``g`` / ``dg`` are then ``None``): the raw gate view and parameters,
+    ``dg_raw``, and the per-chunk partials ``dA_part`` / ``db_part`` as views at the group's first chunk;
+    ``param_finalize`` is never launched here (once per call, by :func:`_backward`)."""
     p = ws.plan
     b = views
     # The operand sources of the backward programs: the saved Aqk / Akk token rows and the user's dout on the
@@ -3536,6 +3952,8 @@ def _backward_launches(
         dbeta=dbeta,
         scale=scale,
     )
+    if gate_values:
+        values.update(gate_values)
     _saved_rows(values, p, qg=qg, w=w, u=u)
 
     # The replay recomputes the internal Aqk / Akk rows with the intra program (write_prep = 0: the prep buffers are
@@ -3602,8 +4020,14 @@ def chunk_kda_det_bwd(
     workspace: KdaDetWorkspace | None = None,
     arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The backward: fresh ``(dq, dk, dv, dbeta, dg)`` ranked like the inputs.
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
+) -> tuple[torch.Tensor, ...]:
+    """The backward: fresh ``(dq, dk, dv, dbeta, dg)`` ranked like the inputs; with ``use_gate_in_kernel=True``
+    fresh ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the raw gate (contiguous,
+    ranked like ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 shaped like ``dt_bias``.
 
     The path (:data:`cake_jit.PATHS`) follows from ``saved``: ``light`` from a version-4 set without the
     segment-boundary states (every serial problem; a segmented short pack: the full recurrence recompute),
@@ -3636,8 +4060,23 @@ def chunk_kda_det_bwd(
     and on a lean workspace its tail in the fewest passes, up to the option's, whose layout fits the arena
     (:func:`_group_tail_passes`) with their chunk counts from the host.  The gradients are bitwise the whole
     problem's (:class:`KdaDetArena` on the sign of exact zeros).
+
+    Raw gate mode (``use_gate_in_kernel=True``, the forward's ``A_log`` / ``dt_bias`` / ``lower_bound``): the raw
+    prep and intra records activate the gate again, the raw GLM intra program writes ``dg`` and the per-chunk
+    ``(hi, lo)`` partials of the two parameter gradients into per-call buffers outside the arena (FP32
+    ``[NC_pad, H, 128, 2]`` each; the groups and the tail ranges take views at their first chunk), and one
+    ``param_finalize`` launch after the last group / range reduces them in an order fixed by the global chunk
+    alone (one CTA per head; the bound is ``seq_chunk_start[num_docs]``, or on a batched call the pack's real chunk
+    count from ``doc_lengths``), so the parameter gradients are bitwise the same under every arena option.  No
+    gate epilogue runs.  A saved set of the other mode, or with another ``lower_bound`` (its FP32 value), is
+    refused with ``ValueError``, as is a workspace of the other mode.
     """
-    q, k, v, g, beta, S, N, H, batched = _operands(q, k, v, g, beta, cu_seqlens)
+    gate = _gate_mode(use_gate_in_kernel)
+    raw_batched = g.dim() == 4
+    q, k, v, g, beta, S, N, H, batched = _operands(
+        q, k, v, g, beta, cu_seqlens, gate=gate
+    )
+    gp = _gate_params(gate, A_log, dt_bias, lower_bound, H, v.device)
     dout = _squeeze_batch(dout, "dout", 3)
     _check(dout, "dout", (S, H, D), torch.bfloat16, v.device)
     option = (
@@ -3670,6 +4109,7 @@ def chunk_kda_det_bwd(
         save_mode="tape" if lean_tape else None,
         arena=arena,
         doc_lengths=doc_lengths,
+        gate=gate,
     ) as ws:
         grads = _backward(
             ws,
@@ -3683,8 +4123,17 @@ def chunk_kda_det_bwd(
             saved=saved,
             scale=scale,
             doc_lengths=doc_lengths,
+            gate_params=gp,
         )
-    return tuple(_ranked(x, batched) for x in grads)
+    if gp is None:
+        return tuple(_ranked(x, batched) for x in grads)
+    dq, dk, dv, dbeta, d_raw, dA_log, ddt_bias = grads
+    return (
+        *(_ranked(x, batched) for x in (dq, dk, dv, dbeta)),
+        _ranked(d_raw, raw_batched),
+        dA_log,
+        ddt_bias.view(gp.dt_bias_shape),
+    )
 
 
 def _backward(
@@ -3700,11 +4149,14 @@ def _backward(
     saved: KdaDetChunkSaved | None,
     scale: float,
     doc_lengths: Sequence[int] | None,
+    gate_params: _GateParams | None = None,
 ) -> tuple[torch.Tensor, ...]:
     """:func:`chunk_kda_det_bwd` on the call's workspace, the operands without their batch axis: ``(dq, dk, dv, dbeta,
-    dg)``."""
+    dg)``; in raw gate mode (``gate_params``; ``g`` the raw gate view) ``(dq, dk, dv, dbeta, dg, dA_log,
+    ddt_bias)`` with ``dg`` BF16 ``[S, H, 128]`` and ``ddt_bias`` ``[H * 128]``."""
     p = ws.plan
     S, N, H = p.S, p.N, p.H
+    gp = gate_params
     seg = p.recur == "seg"
     replay = saved is None
     tape = False
@@ -3720,6 +4172,7 @@ def _backward(
                 f"saved: for S={saved.S}, H={saved.H}, num_docs={saved.num_docs}; the operands are S={S}, "
                 f"H={H}, num_docs={N}"
             )
+        _check_saved_gate(saved, gp)
         _check(saved.Aqk, "saved.Aqk", (S, H, BT), torch.bfloat16, ws.device)
         _check(saved.Akk, "saved.Akk", (S, H, BT), torch.bfloat16, ws.device)
         if saved.tables is not None:
@@ -3812,8 +4265,33 @@ def _backward(
     dq = _alloc((S, H, D), torch.bfloat16, ws.device)
     dk = _alloc((S, H, D), torch.bfloat16, ws.device)
     dv = _alloc((S, H, D), torch.bfloat16, ws.device)
-    dg = _alloc((S, H, D), torch.float32, ws.device)
+    # the gate's gradient: FP32 dg, or in raw mode the raw gate's BF16 gradient (contiguous token rows)
+    dg = _alloc((S, H, D), torch.float32 if gp is None else torch.bfloat16, ws.device)
     dbeta = _alloc((S, H), torch.bfloat16, ws.device)
+    # raw mode: the parameter gradients and their per-chunk (hi, lo) partials, per call and outside the arena (GLM
+    # intra writes the partials of the real chunks only; param_finalize reads those alone)
+    raw_out: dict[str, torch.Tensor] = {}
+    if gp is not None:
+        raw_out = {
+            "dg_raw": dg,
+            "dA_part": _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
+            "db_part": _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
+            "dA_log": _alloc((H,), torch.float32, ws.device),
+            "ddt_bias": _alloc((H * D,), torch.float32, ws.device),
+        }
+
+    def gate_values(c0: int = 0) -> dict[str, Any] | None:
+        """The raw mode's operands and outputs of a launch sequence whose chunks start at the pack's chunk ``c0``
+        (a group's first chunk): the partials as views offset by it, like the per-chunk rows of ``gk``."""
+        if gp is None:
+            return None
+        return {
+            **_raw_values(g, gp),
+            **raw_out,
+            "dA_part": raw_out["dA_part"][c0:],
+            "db_part": raw_out["db_part"][c0:],
+        }
+
     # the version-4 rows the light paths read from the set (the groups of a batched option take their slices)
     light_rows = not (replay or tape)
     qg_saved = saved.qg if light_rows else None
@@ -3828,13 +4306,13 @@ def _backward(
         "q": q,
         "k": k,
         "v": v,
-        "g": g,
+        "g": g if gp is None else None,
         "beta": beta,
         "dout": dout,
         "dq": dq,
         "dk": dk,
         "dv": dv,
-        "dg": dg,
+        "dg": dg if gp is None else None,
         "dbeta": dbeta,
         "scale": float(scale),
     }
@@ -3867,8 +4345,12 @@ def _backward(
             qg=qg_saved,
             w=w_saved,
             u=u_saved,
+            gate_values=gate_values(),
             **common,
         )
+        if gp is not None:
+            # the whole problem's tables bound the reduction: seq_chunk_start[num_docs] real chunks
+            _param_finalize(ws, path, raw_out, tables[2], p.N)
     else:
         # the groups' views of whole-problem row tensors (the saved tape, the saved qg / w / u) take the tape geometry
         row_slices = tape or qg_saved is not None or w_saved is not None
@@ -3922,9 +4404,81 @@ def _backward(
                 w=None if w_saved is None else w_saved[rows_b],
                 u=None if u_saved is None else u_saved[rows_b],
                 nc_vec=packing.tail_counts(i, pb.NC_pad),
+                gate_values=gate_values(batch.c0),
                 **common,
             )
+        if gp is not None:
+            # once, after the last group: the pack's real chunk count from doc_lengths (one-entry count,
+            # num_seqs = 0), over the groups' partials in the pack's chunk order
+            _param_finalize(ws, path, raw_out, packing.total_chunks, 0)
+    if gp is not None:
+        return dq, dk, dv, dbeta, dg, raw_out["dA_log"], raw_out["ddt_bias"]
     return dq, dk, dv, dbeta, dg
+
+
+class _GateSaved(Protocol):
+    """What :func:`_check_saved_gate` reads of a saved set (``KdaDetChunkSaved``, and the KCP saved set)."""
+
+    @property
+    def gate(self) -> str: ...
+
+    @property
+    def lower_bound(self) -> float | None: ...
+
+
+def _check_saved_gate(saved: _GateSaved, gp: _GateParams | None) -> None:
+    """``ValueError`` when the saved set's gate mode or (raw mode) the FP32 bits of its ``lower_bound`` differ from
+    the call's: the set's tensors were formed from the other gate."""
+    gate = "g" if gp is None else "raw"
+    saved_gate = saved.gate
+    if saved_gate != gate:
+        raise ValueError(
+            f"saved: written by a forward in gate mode {saved_gate!r} (use_gate_in_kernel={saved_gate == 'raw'}); "
+            f"this backward runs gate mode {gate!r} (use_gate_in_kernel={gate == 'raw'})"
+        )
+    if gp is None:
+        return
+    lb = saved.lower_bound
+    if lb is None or struct.pack("<f", float(lb)) != struct.pack("<f", gp.lower_bound):
+        raise ValueError(
+            f"saved: written with lower_bound={lb!r}; this backward has lower_bound={gp.lower_bound!r} (the FP32 "
+            "values must be the same)"
+        )
+
+
+def _param_finalize(
+    ws: KdaDetWorkspace,
+    path: str,
+    raw_out: dict[str, torch.Tensor],
+    seq_chunk_start: torch.Tensor,
+    num_seqs: int,
+) -> None:
+    """The raw mode's ``param_finalize`` launch (once per backward, grid ``(H, seg_cap, 1)``: one CTA per head and
+    segment of :data:`FINALIZE_SEGMENT` chunks of the partials' ``NC_pad`` rows): ``dA_log`` / ``ddt_bias`` from the
+    per-chunk partials of the chunks ``[0, seq_chunk_start[num_seqs])``.  The per-segment scratch ``part2`` and the
+    per-head ticket (zero; the last CTA of each head sets it back to zero) are this call's."""
+    H = ws.plan.H
+    seg_cap = _finalize_segments(raw_out["dA_part"].shape[0])
+    grid = ws.plan.grid("param_finalize", path, 0)
+    if tuple(grid) != (H, seg_cap, 1):
+        raise ValueError(
+            f"param_finalize: plan grid {tuple(grid)} != (H, seg_cap, 1) = {(H, seg_cap, 1)} for "
+            f"{raw_out['dA_part'].shape[0]} partial rows"
+        )
+    ws.run(
+        "param_finalize",
+        {
+            "dA_part": raw_out["dA_part"],
+            "db_part": raw_out["db_part"],
+            "seq_chunk_start": seq_chunk_start,
+            "num_seqs": int(num_seqs),
+            **_raw_finalize_scratch(raw_out["dA_part"].shape[0], H, ws.device),
+            "dA_log": raw_out["dA_log"],
+            "ddt_bias": raw_out["ddt_bias"],
+            "num_heads": H,
+        },
+        path=path,
+    )
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -3958,7 +4512,10 @@ class ChunkKDADetFunction(torch.autograd.Function):
     re-run in the backward and the saved set recomputed; no special casing.  The node keeps nothing but the saved
     tensors alive: the caller's workspace is held through a weak reference, so a workspace the caller dropped
     after the forward (a per-call one, or any workspace of a checkpointed forward whose frame is gone) is freed,
-    and the backward then allocates its own (:func:`chunk_kda_det_bwd` without ``workspace``)."""
+    and the backward then allocates its own (:func:`chunk_kda_det_bwd` without ``workspace``).  In raw gate mode
+    (``use_gate_in_kernel``) the node saves the raw gate (the caller's view) and ``A_log`` / ``dt_bias`` in place of
+    an FP32 gate, records the mode and ``lower_bound`` and returns the gradients of the raw gate, ``A_log`` and
+    ``dt_bias``."""
 
     @staticmethod
     def forward(
@@ -3974,6 +4531,10 @@ class ChunkKDADetFunction(torch.autograd.Function):
         save_mode,
         arena,
         doc_lengths,
+        use_gate_in_kernel=False,
+        A_log=None,
+        dt_bias=None,
+        lower_bound=None,
     ):
         out, saved = chunk_kda_det_fwd(
             q,
@@ -3988,8 +4549,14 @@ class ChunkKDADetFunction(torch.autograd.Function):
             save_mode=save_mode,
             arena=arena,
             doc_lengths=doc_lengths,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
         )
         extra, ctx.extra_fields = _saved_extra(saved)
+        # raw mode: the gate parameters ride after cu_seqlens (g is the raw gate view)
+        params = (A_log, dt_bias) if saved.gate == "raw" else ()
         ctx.save_for_backward(
             q,
             k,
@@ -3997,11 +4564,14 @@ class ChunkKDADetFunction(torch.autograd.Function):
             g,
             beta,
             cu_seqlens,
+            *params,
             saved.Aqk,
             saved.Akk,
             *saved.tables,
             *extra,
         )
+        # the set's FP32 lower bound (None in g mode): the backward's set and call carry the same bits
+        ctx.gate, ctx.lower_bound = saved.gate, saved.lower_bound
         ctx.scale = scale
         # a weak reference: the node must not keep a per-call arena alive until the backward (under activation
         # checkpointing that would be one arena per layer)
@@ -4022,7 +4592,12 @@ class ChunkKDADetFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
-        q, k, v, g, beta, cu_seqlens, Aqk, Akk, *rest = ctx.saved_tensors
+        q, k, v, g, beta, cu_seqlens, *rest = ctx.saved_tensors
+        raw = ctx.gate == "raw"
+        A_log = dt_bias = None
+        if raw:
+            A_log, dt_bias, *rest = rest
+        Aqk, Akk, *rest = rest
         tables, extra = tuple(rest[: ctx.n_tables]), rest[ctx.n_tables :]
         saved = KdaDetChunkSaved(
             ctx.version,
@@ -4032,13 +4607,15 @@ class ChunkKDADetFunction(torch.autograd.Function):
             *ctx.problem,
             ctx.scale,
             **dict(zip(ctx.extra_fields, extra, strict=True)),
+            gate=ctx.gate,
+            lower_bound=ctx.lower_bound,
         )
         if not dout.is_contiguous():
             dout = (
                 dout.contiguous()
             )  # autograd may hand over an expanded or permuted gradient
         workspace = None if ctx.workspace_ref is None else ctx.workspace_ref()
-        dq, dk, dv, dbeta, dg = chunk_kda_det_bwd(
+        grads = chunk_kda_det_bwd(
             q,
             k,
             v,
@@ -4051,8 +4628,16 @@ class ChunkKDADetFunction(torch.autograd.Function):
             workspace=workspace,
             arena=None if workspace is not None else ctx.arena,
             doc_lengths=ctx.doc_lengths,
+            use_gate_in_kernel=raw,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=ctx.lower_bound,
         )
-        return dq, dk, dv, dg, dbeta, None, None, None, None, None, None
+        dq, dk, dv, dbeta, dg = grads[:5]
+        dA_log, ddt_bias = grads[5:] if raw else (None, None)
+        # (q, k, v, g, beta), (cu_seqlens, scale, workspace, save_mode, arena, doc_lengths), use_gate_in_kernel,
+        # A_log, dt_bias, lower_bound
+        return (dq, dk, dv, dg, dbeta, *(None,) * 6, None, dA_log, ddt_bias, None)
 
 
 def chunk_kda_det(
@@ -4068,8 +4653,13 @@ def chunk_kda_det(
     save_mode: str | None = None,
     arena: KdaDetArena | None = None,
     doc_lengths: Sequence[int] | None = None,
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
 ) -> torch.Tensor:
-    """The autograd entry: ``out`` with gradients to ``q, k, v, g, beta``.
+    """The autograd entry: ``out`` with gradients to ``q, k, v, g, beta`` (and with ``use_gate_in_kernel=True`` to
+    the raw gate ``g``, BF16, and to ``A_log`` / ``dt_bias``, FP32: :func:`chunk_kda_det_fwd` for the raw operands).
 
     With a ``workspace`` the forward and the backward both run in it (the backward overwrites the forward's
     intermediates, not its saved set, which autograd holds) as long as the caller keeps it: the autograd node
@@ -4085,7 +4675,21 @@ def chunk_kda_det(
     (the documents' token counts, host integers) is required under a batched option and recorded by the node.
     """
     return ChunkKDADetFunction.apply(
-        q, k, v, g, beta, cu_seqlens, scale, workspace, save_mode, arena, doc_lengths
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        scale,
+        workspace,
+        save_mode,
+        arena,
+        doc_lengths,
+        use_gate_in_kernel,
+        A_log,
+        dt_bias,
+        lower_bound,
     )
 
 

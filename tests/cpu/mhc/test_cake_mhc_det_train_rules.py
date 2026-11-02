@@ -138,6 +138,7 @@ RUN_TIME_ITERS = {
 }
 SLAB_LIBRARY = {
     "xrsg": "cake_mhc_det_train_bwd_slab__xrsg",
+    "xrsg_p160": "cake_mhc_det_train_bwd_slab__xrsg_p160",
     "dynr": "cake_mhc_det_train_bwd_slab__dynr",
     "dynl": "cake_mhc_det_train_bwd_slab__dynl",
 }
@@ -200,7 +201,8 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__dynl": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
-    "cake_mhc_det_train_bwd_slab__xrsg": ("sm_100a", "sm_107a"),
+    "cake_mhc_det_train_bwd_slab__xrsg": ("sm_107a",),
+    "cake_mhc_det_train_bwd_slab__xrsg_p160": ("sm_100a",),
     "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr": (
         "sm_100a",
         "sm_103a",
@@ -296,11 +298,10 @@ MULTI_RECORDS = {
         "cake_mhc_det_train_bwd_token__dot_ao8__a3",
     ],
     "cake_mhc_det_train_bwd_slab__xrsg": [
-        "cake_mhc_det_train_bwd_slab__xrsg",
         "cake_mhc_det_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 67, 51
+N_RECORDS, N_LIBRARIES = 67, 52
 RECORD_SCALARS = {
     "cake_mhc_det_train_fn_split": {"want_t": 0},
     "cake_mhc_det_train_fn_split__tv128__t": {"want_t": 1},
@@ -357,7 +358,7 @@ TABLES = {
     "BWD_SLAB_FIT": {
         "sm_100a": (
             "dynl",
-            "xrsg",
+            "xrsg_p160",
             (),
             (
                 (7, 1536, 1792),
@@ -610,39 +611,39 @@ DISPATCH_EXPECTED = (
     (1024, 'sm_103a', 152, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1024, 'sm_107a', 208, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
     (1024, 'sm_107a', 216, 16, 128, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_rf3_pd1_l2l_ntr', 'xrsg', 's27_wcvt_spred', 411),
-    (1152, 'sm_100a', 148, 16, 144, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1152, 'sm_100a', 148, 16, 144, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (1152, 'sm_103a', 152, 16, 144, 'nsx_st5_mb1', 'st16_w4_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1152, 'sm_107a', 208, 16, 144, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1152, 'sm_107a', 216, 16, 144, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1153, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1153, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (1153, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1153, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1153, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1176, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1176, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'st16_w4_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (1176, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1176, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1176, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1177, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1177, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (1177, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1177, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1177, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1208, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1208, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (1208, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1208, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1208, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1209, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1209, 'sm_100a', 148, 32, 320, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (1209, 'sm_103a', 152, 32, 320, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1209, 'sm_107a', 208, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1209, 'sm_107a', 216, 16, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1656, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1656, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (1656, 'sm_103a', 152, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1656, 'sm_107a', 208, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1656, 'sm_107a', 216, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1657, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1657, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (1657, 'sm_103a', 152, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1657, 'sm_107a', 208, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1657, 'sm_107a', 216, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1664, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1664, 'sm_100a', 148, 32, 416, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (1664, 'sm_103a', 152, 32, 416, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1664, 'sm_107a', 208, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1664, 'sm_107a', 216, 16, 208, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
@@ -658,11 +659,11 @@ DISPATCH_EXPECTED = (
     (1721, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1721, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1721, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1792, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1792, 'sm_100a', 148, 8, 112, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (1792, 'sm_103a', 152, 32, 448, 'nsx', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1792, 'sm_107a', 208, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1792, 'sm_107a', 216, 32, 448, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (1793, 'sm_100a', 148, 8, 120, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (1793, 'sm_100a', 148, 8, 120, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (1793, 'sm_103a', 152, 8, 120, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (1793, 'sm_107a', 208, 32, 480, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (1793, 'sm_107a', 216, 32, 480, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
@@ -670,15 +671,15 @@ DISPATCH_EXPECTED = (
     (2049, 'sm_103a', 152, 8, 136, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2049, 'sm_107a', 208, 32, 544, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2049, 'sm_107a', 216, 32, 544, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2304, 'sm_100a', 148, 8, 144, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4_spred', 411),
+    (2304, 'sm_100a', 148, 8, 144, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 'wpu4_spred', 411),
     (2304, 'sm_103a', 152, 8, 144, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2304, 'sm_107a', 208, 32, 576, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2304, 'sm_107a', 216, 32, 576, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2305, 'sm_100a', 148, 32, 608, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (2305, 'sm_100a', 148, 32, 608, 'ns96_g2_ol2l', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (2305, 'sm_103a', 152, 8, 152, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2305, 'sm_107a', 208, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2305, 'sm_107a', 216, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2432, 'sm_100a', 148, 32, 608, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (2432, 'sm_100a', 148, 32, 608, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (2432, 'sm_103a', 152, 8, 152, 'nsx_st5_mb1', 'qe_mb10_tree', 8, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2432, 'sm_107a', 208, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2432, 'sm_107a', 216, 32, 608, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
@@ -686,11 +687,11 @@ DISPATCH_EXPECTED = (
     (2433, 'sm_103a', 152, 32, 640, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2433, 'sm_107a', 208, 8, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2433, 'sm_107a', 216, 32, 640, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2560, 'sm_100a', 148, 32, 640, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (2560, 'sm_100a', 148, 32, 640, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (2560, 'sm_103a', 152, 32, 640, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2560, 'sm_107a', 208, 8, 160, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2560, 'sm_107a', 216, 32, 640, 'nsx_g2_ol2l', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
-    (2561, 'sm_100a', 148, 32, 672, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 's27_wcvt_fadd_fshfl', 411),
+    (2561, 'sm_100a', 148, 32, 672, 'ns96_g2_ol2l', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_tma_ntr', 'xrsg_p160', 's27_wcvt_fadd_fshfl', 411),
     (2561, 'sm_103a', 152, 32, 672, 'nsx', 'qe_mb10_tree', 16, 'ao22_rae7_pd1_ntr', 'dynr', 'pt64', 1563),
     (2561, 'sm_107a', 208, 8, 168, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
     (2561, 'sm_107a', 216, 8, 168, 'nsx_st5_mb1', 'pfl2_qmt', 8, 'ao22_rae7_pd1_tma_ntr', 'xrsg', 'wpu4', 411),
@@ -1216,7 +1217,7 @@ LAUNCH_FACTS = {
     "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a7": ((256, 1, 1), 91136, 2),
     "cake_mhc_det_train_bwd_slab__dynl": ((384, 1, 1), 228480, 1),
     "cake_mhc_det_train_bwd_slab__dynr": ((384, 1, 1), 228480, 1),
-    "cake_mhc_det_train_bwd_slab__xrsg": ((384, 1, 1), 232448, 1),
+    "cake_mhc_det_train_bwd_slab__xrsg_p160": ((384, 1, 1), 230912, 1),
     "cake_mhc_det_train_bwd_slab__xrsg__a7": ((384, 1, 1), 232448, 1),
     "cake_mhc_det_train_bwd_reduce__pt64": ((64, 1, 1), 2688, 1),
     "cake_mhc_det_train_bwd_reduce__pt32": ((32, 1, 1), 2432, 1),
@@ -1285,7 +1286,7 @@ RECORD_ARCHES = {
     "cake_mhc_det_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_bwd_slab__dynl": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
-    "cake_mhc_det_train_bwd_slab__xrsg": ("sm_100a",),
+    "cake_mhc_det_train_bwd_slab__xrsg_p160": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__xrsg__a7": ("sm_107a",),
     "cake_mhc_det_train_bwd_reduce__pt64": ("sm_103a",),
     "cake_mhc_det_train_bwd_reduce__pt32": ("sm_103a",),
@@ -1701,7 +1702,7 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
         for _above, _at_most, program in loader.BWD_SLAB_BANDS[arch]:
             assert SLAB_LIBRARY[program] in LIBRARY_ARCHES, (arch, program)
     # the column-slab programs of record: on sm_100a the late-claim form dynl for 1024 < T <= 4096 (its
-    # token-count band) but where BWD_SLAB_FIT keeps xrsg (the K7 units fit the SMs in one round, the runs
+    # token-count band) but where BWD_SLAB_FIT replaces it with xrsg_p160 (the K7 units fit the SMs in one round, the runs
     # P = 7 1537..1792 and 1921..2240, P = 9 2177..2304, P = 19 2305..2432 and 3585..3648), the dynamic-schedule
     # form dynr at the other token counts on sm_100a and at every token count on sm_103a, xrsg at every token count
     # on sm_107a
@@ -1713,7 +1714,7 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     assert loader.BWD_SLAB_FIT == {
         "sm_100a": (
             "dynl",
-            "xrsg",
+            "xrsg_p160",
             (),
             (
                 (7, 1536, 1792),
@@ -1742,20 +1743,20 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
                     or (P == 19 and 2304 < T <= 2432)
                     or (P == 19 and 3584 < T <= 3648)
                 )
-                k7 = "xrsg" if units <= sm or run else "dynl"
+                k7 = "xrsg_p160" if units <= sm or run else "dynl"
             slab = [loader.bwd_slab_program(T, sm, arch) for arch in ARCHES]
             assert slab == [k7, "dynr", "xrsg"], (T, sm)
-    # the band's edges on 148 SMs (xrsg from 1025 to 2048 tokens, dynl from 2049: P = 11; 4096: P = 16) and the
-    # P = 7 / P = 19 rows of the 152-SM sm_100a board (dynl at 1216, 2560, 4032; xrsg at 1728, 2048, 3616)
+    # the band's edges on 148 SMs (xrsg_p160 from 1025 to 2048 tokens, dynl from 2049: P = 11; 4096: P = 16) and the
+    # P = 7 / P = 19 rows of the 152-SM sm_100a board (dynl at 1216, 2560, 4032; xrsg_p160 at 1728, 2048, 3616)
     assert [
         loader.bwd_slab_program(T, 148, "sm_100a") for T in (1, 1024, 1025, 2048, 2049, 4096, 4097, 65536)
     ] == [
-        "dynr", "dynr", "xrsg", "xrsg", "dynl", "dynl", "dynr", "dynr"
+        "dynr", "dynr", "xrsg_p160", "xrsg_p160", "dynl", "dynl", "dynr", "dynr"
     ]  # fmt: skip
     assert [
         loader.bwd_slab_program(T, 152, "sm_100a") for T in (1216, 1728, 2048, 2560, 3616, 4032)
     ] == [
-        "dynl", "xrsg", "xrsg", "dynl", "xrsg", "dynl"
+        "dynl", "xrsg_p160", "xrsg_p160", "dynl", "xrsg_p160", "dynl"
     ]  # fmt: skip
     with pytest.raises(KeyError):
         loader.k1_units(16263, 148, "sm_120a")
@@ -2433,7 +2434,7 @@ def test_launch_facts_of_record() -> None:
             assert facts[name] == ((256, 1, 1), base[1] + 2048, 2), name
             continue
         assert facts[name] == ((256, 1, 1), 91136, 2), name
-    for name in SLAB_LIBRARY.values():
+    for name in (n for n in facts if _is(n, "cake_mhc_det_train_bwd_slab")):
         assert facts[name][0] == (384, 1, 1) and facts[name][2] == 1, name
         assert facts[name][1] + 1024 <= 228 * 1024, name
     reduce_facts = {
@@ -2578,7 +2579,9 @@ def test_launch_grids_follow_the_rules(
             ), (arch, T, selected)
         for name in (*TOKEN_LIBRARY.values(), "cake_mhc_det_train_bwd_token__rt64"):
             assert grid(name) == (row["G6"], 1, 1), name
-        for name in SLAB_LIBRARY.values():
+        for name in (
+            n for n in modules if modules[n]["library"] in SLAB_LIBRARY.values()
+        ):
             assert grid(name) == (row["k7_grid"], 1, 1), name
         for program, name in REDUCE_LIBRARY.items():
             assert grid(name) == (REDUCE_GRID[program], 1, 1), name

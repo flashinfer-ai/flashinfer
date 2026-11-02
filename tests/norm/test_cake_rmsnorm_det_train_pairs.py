@@ -46,9 +46,9 @@ SHIPPED_SLABS = (16, 32, 64)
 ROWS = (
     1, 2, 7, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025, 2048, 2049, 3072, 3073, 4096, 4097,
     5120, 5121, 6144, 6145, 12288, 12289, 14928, 14929, 15566, 15567, 16231, 16263, 16384, 16385, 19456, 19457, 19968,
-    19969, 20480, 20481, 24064, 24065, 32768, 32769, 36352, 36353, 40448, 40449, 40960, 40961, 42496, 42497, 45056,
-    45057, 48640, 48641, 50688, 50689, 52736, 52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656, 70657, 80896,
-    80897, 81920, 81921, 114688, 114689, 139264, 139265, 1179648, 1179649, 1572864, 1572865,
+    19969, 20480, 20481, 24064, 24065, 32768, 32769, 36352, 36353, 40448, 40449, 40960, 40961, 42496, 42497, 44032,
+    44033, 45056, 45057, 48640, 48641, 50688, 50689, 52736, 52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656,
+    70657, 80896, 80897, 81920, 81921, 99840, 99841, 114688, 114689, 139264, 139265, 1179648, 1179649, 1572864, 1572865,
 )  # fmt: skip
 # The row count standing in for an unbounded window's upper edge.
 OPEN_WINDOW_ROWS = 65536
@@ -316,7 +316,7 @@ def test_rows_cover_every_backward_window_edge() -> None:
 # The H = 256 backward route: per sm_100a / sm_103a window the faster of the four-CTA pipeline (``pd4``) and the
 # five-CTA ring at issue distance three without the L2 hint (``a3``), both at ``tail_div=4``, in two sessions per
 # architecture (BF16 and FP32 weight alike); sm_107a runs the pipeline to 65536 rows and the ring above.  Above the
-# ring's dw accuracy edge of each architecture (80896 rows on sm_100a, 114688 on sm_103a, 70656 on sm_107a) the ring
+# ring's dw accuracy edge of each architecture (80896 rows on sm_100a, 99840 on sm_103a, 70656 on sm_107a) the ring
 # with compensated dw sums (``dc``) runs instead, and above 1572864 rows its form with hi / lo partial rows
 # (``dchl``).
 H256_BWD_PROGRAMS = {
@@ -338,7 +338,7 @@ H256_BWD_SPLIT = {
         )
         for arch, edge, hl in (
             ("sm_100a", 80896, 1572864),
-            ("sm_103a", 114688, 1572864),
+            ("sm_103a", 99840, 1572864),
         )
     },
     "sm_107a": (
@@ -562,14 +562,14 @@ ACCURACY_EDGES = {
         "h1536": 36352,
         "h2048": 58880,
         "h256": 80896,
-        "h4096": 52736,
+        "h4096": 44032,
         "h5120": 6144,
         "h6144": 42496,
     },
     "sm_103a": {
         "h1536": 40448,
         "h2048": 55296,
-        "h256": 114688,
+        "h256": 99840,
         "h4096": 48640,
         "h5120": 5120,
         "h6144": 48640,

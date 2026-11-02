@@ -22,7 +22,9 @@ turns ``False`` into the deterministic package with one ``UserWarning`` per proc
 facade's marking, signatures and dispatch table (the package functions replaced by recorders), its refusal of a
 non-bool mode, the refusal of every mode but ``deterministic=False`` by the package entries, its autograd node
 ``ChunkKDAFunction`` and its workspace ``KdaWorkspace`` (also under torch's
-deterministic mode, which they do not alert: the S1 schedule has no unordered reduction), the legacy names
+deterministic mode, which they do not alert: the S1 schedule has no unordered reduction), the deterministic package's
+raw gate mode (#7816: the facade forwards it with ``deterministic=True``; the package refuses it and a saved set of it),
+the legacy names
 (``flashinfer.kda_train``, ``flashinfer.experimental.cake_kda_train``) that stay the deterministic objects, the
 deferred imports of the facade and the package's isolation from the deterministic modules, and a dispatch sweep
 over architecture x path x heads 1..128 (one record per stage, the fused gradient and the GLM intra program agreeing
@@ -39,6 +41,7 @@ import json
 import os
 import subprocess
 import sys
+import types
 import warnings
 from pathlib import Path
 
@@ -558,6 +561,154 @@ def test_package_workspace_refuses_every_mode_but_false() -> None:
         with pytest.raises(ValueError, match="CUDA devices") as info:
             call(deterministic=False)
         assert "cake_kda_det_train" not in str(info.value), name
+
+
+# the raw gate mode (#7816): the deterministic package's keywords at their off values
+GATE_OFF = {
+    "use_gate_in_kernel": False,
+    "A_log": None,
+    "dt_bias": None,
+    "lower_bound": None,
+}
+_RAW_GATE = "runs on the deterministic package only"
+
+
+def _gate_on() -> list:
+    return [
+        {"use_gate_in_kernel": True},
+        {"use_gate_in_kernel": 1},
+        {"A_log": torch.zeros(4)},
+        {"dt_bias": torch.zeros(4, 128)},
+        {"lower_bound": -5.0},
+    ]
+
+
+@pytest.mark.parametrize("name", EXPERIMENTAL_ENTRIES)
+def test_package_refuses_the_raw_gate(name) -> None:
+    """The raw gate mode runs on the deterministic package only: with ``deterministic=False`` each entry raises
+    ``ValueError`` naming ``deterministic=True`` for any of its keywords on, before its host checks; the off values
+    reach the host checks, as omitted keywords do."""
+    call = PACKAGE_CALLS[name]
+    for kw in _gate_on():
+        with pytest.raises(ValueError, match=_RAW_GATE) as info:
+            call(deterministic=False, **kw)
+        assert str(info.value).startswith(name), (kw, str(info.value))
+        assert "deterministic=True" in str(info.value), kw
+    with pytest.raises(ValueError, match="v: expected 3-D"):
+        call(deterministic=False, **GATE_OFF)
+
+
+def test_package_backward_refuses_a_saved_set_it_cannot_read() -> None:
+    """A saved set of the deterministic package's raw gate mode (``gate="raw"``) or of its in-kernel q / k L2 norm
+    (``qk_l2norm``) was formed from another gate or from normalized q / k: the backward refuses it, of either
+    package's type, before its host checks; a set of the explicit gate (``"g"``) passes the refusal."""
+    t = torch.empty(0)
+    scale = cake_backend.SCALE
+    for saved_type in (cake_backend.KdaChunkSaved, det_backend.KdaDetChunkSaved):
+        raw = saved_type(
+            4, t, t, None, 1, 1, 1, scale, qg=t, gate="raw", lower_bound=-5.0
+        )
+        with pytest.raises(ValueError, match="gate mode 'raw'") as info:
+            PACKAGE_CALLS["chunk_kda_bwd"](saved=raw, deterministic=False)
+        assert "deterministic=True" in str(info.value), saved_type
+        explicit = saved_type(4, t, t, None, 1, 1, 1, scale, qg=t)
+        with pytest.raises(Exception) as info:  # noqa: B017 - the stand-in operands' error, never the refusal
+            PACKAGE_CALLS["chunk_kda_bwd"](saved=explicit, deterministic=False)
+        assert "gate mode" not in str(info.value), str(info.value)
+    l2n = types.SimpleNamespace(gate="g", qk_l2norm=True)
+    with pytest.raises(ValueError, match="in-kernel q / k L2 norm"):
+        PACKAGE_CALLS["chunk_kda_bwd"](saved=l2n, deterministic=False)
+
+
+def test_package_workspace_refuses_the_raw_gate_layout() -> None:
+    """``workspace_bytes`` and ``KdaWorkspace.for_problem`` take the deterministic package's ``gate``: ``"g"`` only
+    (the bytes of the omitted keyword); any other value is a ``ValueError`` naming ``deterministic=True``, raised
+    before the device is read."""
+    S, N, H = 129, 1, 4
+    assert cake_backend.workspace_bytes(
+        S, N, H, sm_count=148, gate="g"
+    ) == cake_backend.workspace_bytes(S, N, H, sm_count=148)
+    for gate in ("raw", None, "G"):
+        with pytest.raises(ValueError, match="deterministic=True"):
+            cake_backend.workspace_bytes(S, N, H, sm_count=148, gate=gate)
+        with pytest.raises(ValueError, match="deterministic=True"):
+            cake_backend.KdaWorkspace.for_problem(
+                S, N, H, "cpu", gate=gate, deterministic=False
+            )
+    with pytest.raises(ValueError, match="CUDA devices"):
+        cake_backend.KdaWorkspace.for_problem(
+            S, N, H, "cpu", gate="g", deterministic=False
+        )
+
+
+def test_facade_forwards_the_raw_gate(monkeypatch) -> None:
+    """``deterministic=True`` hands the raw gate keywords (the same objects) to the deterministic package, and
+    ``use_gate_in_kernel`` to its workspace and byte query as ``gate="raw"``; ``deterministic=False`` hands the
+    off values to this package (whose entries refuse any other); under torch's deterministic mode the
+    deterministic package receives them."""
+    log = _recorders(monkeypatch)
+    operands = tuple(object() for _ in range(6))
+    gate = {
+        "use_gate_in_kernel": True,
+        "A_log": object(),
+        "dt_bias": object(),
+        "lower_bound": -5.0,
+    }
+    calls = {
+        "chunk_kda_fwd": lambda **kw: facade.chunk_kda_fwd(*operands, **kw),
+        "chunk_kda_bwd": lambda **kw: facade.chunk_kda_bwd(*operands, object(), **kw),
+        "chunk_kda": lambda **kw: facade.chunk_kda(*operands, **kw),
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for name, call in calls.items():
+            assert call(**gate) == "det", name
+            for key, value in gate.items():
+                assert log[-1][2][key] is value, (name, key)
+            assert call(deterministic=False) == "nd", name
+            assert {key: log[-1][2][key] for key in GATE_OFF} == GATE_OFF, name
+        with _TorchDeterministic():
+            for name, call in calls.items():
+                assert call(deterministic=False, **gate) == "det", name
+                assert log[-1][2]["use_gate_in_kernel"] is True, name
+        assert (
+            facade.kda_train_workspace(1, 1, 1, "cpu", use_gate_in_kernel=True) == "det"
+        )
+        assert log[-1][2]["gate"] == "raw"
+        assert facade.kda_train_workspace(1, 1, 1, "cpu", deterministic=False) == "nd"
+        assert log[-1][2]["gate"] == "g"
+        assert (
+            facade.kda_train_workspace_bytes(
+                1, 1, 1, sm_count=148, use_gate_in_kernel=True
+            )
+            == "det"
+        )
+        assert log[-1][2]["gate"] == "raw"
+        for bad in (1, None, "True"):
+            with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
+                facade.kda_train_workspace_bytes(
+                    1, 1, 1, sm_count=148, use_gate_in_kernel=bad
+                )
+
+
+def test_facade_refuses_the_raw_gate_on_the_non_deterministic_package() -> None:
+    """Without recorders: ``deterministic=False`` reaches this package, whose entries and byte query refuse the
+    raw gate (``ValueError`` naming ``deterministic=True``)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        for name, args in (
+            ("chunk_kda_fwd", _bad_operands()),
+            ("chunk_kda_bwd", (*_bad_operands(), torch.zeros(4, 1, 128))),
+            ("chunk_kda", _bad_operands()),
+        ):
+            with pytest.raises(ValueError, match=_RAW_GATE):
+                getattr(facade, name)(
+                    *args, use_gate_in_kernel=True, deterministic=False
+                )
+        with pytest.raises(ValueError, match="deterministic=True"):
+            facade.kda_train_workspace_bytes(
+                129, 1, 4, sm_count=148, use_gate_in_kernel=True, deterministic=False
+            )
 
 
 def test_package_exports_the_det_free_names_only() -> None:

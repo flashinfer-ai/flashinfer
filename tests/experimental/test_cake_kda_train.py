@@ -413,8 +413,23 @@ RECORD_ARCHES = {
     "dqkg_int_davq": ("sm_103a",),
 }
 # The deterministic package's records no cell of this package launches: the sm_107a rows from 16 heads (the only
-# rows of the builds with the L2 hints off) run the S1 pair on every backward path.
-DET_RECORDS_NOT_LAUNCHED = frozenset(("dqkg_davq_nohint", "dqkg_int_davq_nohint"))
+# rows of the builds with the L2 hints off) run the S1 pair on every backward path, and the raw forget-gate class
+# (gate "raw": the forward intra, backward prep and GLM intra programs that read the raw gate, and the backward's
+# A_log / dt_bias gradient finalize) runs only under use_gate_in_kernel=True, which this package refuses.
+DET_RECORDS_NOT_LAUNCHED = frozenset(
+    (
+        "dqkg_davq_nohint",
+        "dqkg_int_davq_nohint",
+        "fwd_intra_raw",
+        "fwd_intra_v14_raw",
+        "bwd_prep_g8_raw",
+        "bwd_prep_g8_replay_raw",
+        "bwd_prep_g8_noqg_raw",
+        "bwd_prep_g8_noqg_nokb_raw",
+        "glm_intra_raw",
+        "param_finalize",
+    )
+)
 # The checkpoint hand-off's intra twins, intra record -> twin: new programs that also write every gk row and the
 # internal beta (``beta_int``); no path selects them, the hand-off's recompute launches one in place of its record.
 HANDOFF_TWINS = {"fwd_intra": "fwd_intra_v20", "fwd_intra_v14": "fwd_intra_v19"}
@@ -425,10 +440,10 @@ TAPE_TWINS = {"wy_bwd": "wy_bwd_v9"}
 TAPE_WY_RECORDS = frozenset(TAPE_TWINS.values())
 # The logical names of the WY record's parameters the twin does not take: u and the operands only u reads.
 TAPE_WY_DROPPED = frozenset({"v", "beta", "u"})
-# The registry's size: the deterministic package's 67 records, less those, plus the seven S1 records, the hand-off
+# The registry's size: the deterministic package's 75 records, less those, plus the seven S1 records, the hand-off
 # twins and the tape WY twin.
 MODULE_COUNT = (
-    67 - len(DET_RECORDS_NOT_LAUNCHED) + 7 + len(TWIN_RECORDS) + len(TAPE_WY_RECORDS)
+    75 - len(DET_RECORDS_NOT_LAUNCHED) + 7 + len(TWIN_RECORDS) + len(TAPE_WY_RECORDS)
 )
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
@@ -2446,10 +2461,16 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
         "qg",
         "w",
         "u",
+        "gate",
+        "lower_bound",
         "deterministic",
     ]
     for name in ("h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u"):
         assert KdaChunkSaved.__dataclass_fields__[name].default is None, name
+    # the deterministic package's gate-mode fields (#7816), at its defaults: this package's forward writes the
+    # explicit gate and its backward refuses a raw-mode set
+    assert KdaChunkSaved.__dataclass_fields__["gate"].default == "g"
+    assert KdaChunkSaved.__dataclass_fields__["lower_bound"].default is None
     # the mode of the forward that wrote the set: this package's forward writes False (the deterministic package's
     # sets have the same format, and the backward reads either)
     assert KdaChunkSaved.__dataclass_fields__["deterministic"].default is False
