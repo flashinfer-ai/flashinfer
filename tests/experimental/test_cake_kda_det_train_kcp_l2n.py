@@ -18,12 +18,15 @@ flag-off identity (the omitted keyword and an explicit ``False`` give the same g
 fingerprints, saved-set tensors / flags / meta, byte queries and existing-backend plan calls) and a hook that compares
 that snapshot with one taken on the base of this change; what the flag adds to the keys, the fingerprint and the plan
 calls; the saved set's ``qk_rstd`` round trip and the backward's checks of it; the strided-input rule, its metadata
-checked alike on every rank; the workspace's mode; the byte queries; the values the call binds for every local stage
-(the existing backend's logical names and ``read_rstd`` / ``write_rstd``), the stage order of both forms and the
-capability check (records, their modes, architectures and exports, the layouts' slot views); and, while the existing
-backend lacks the mode's programs, the ``NotImplementedError`` of every flag-on call, workspace and byte query before
-any workspace sizing, plan or collective, with the same message on a rank with tokens and on one without, also in
-spawned CPU groups of 2 and 4 ranks (gloo).  Once it has them: every record the real forward / backward drivers
+checked alike on every rank; the workspace's mode; the byte queries (the flag-off ones make no CUDA call; the flag-on
+ones check the contexts' device and the call's gate mode); the values the call binds for every local stage (the
+existing backend's logical names and ``read_rstd`` / ``write_rstd``), the stage order of both forms, the fallback
+form's stages never skipped, and the capability check (the existing backend's selection of every stage of the form
+over a fixed problem grid, the records' architectures and exports, the first readers, the layouts' slot views); the
+refusal before the operand checks; and, while the existing backend lacks the mode's programs, the
+``NotImplementedError`` of every flag-on call, workspace and byte query before any workspace sizing, plan or
+collective, with the same message on a rank with tokens and on one without, also in spawned CPU groups of 2 and 4
+ranks (gloo), a rank with a misaligned view too.  Once it has them: every record the real forward / backward drivers
 launch in either form binds all its logical names.  The flag-on CPU rows of the host plumbing run with the
 capability check passed (:func:`capable`; nothing launches on the CPU).
 
@@ -123,6 +126,12 @@ def capable(monkeypatch):
     """The capability check passed (``qk_l2norm_missing`` -> ``None``): the CPU rows of the flag-on host plumbing
     run before the existing backend has the mode's programs (nothing launches on the CPU)."""
     monkeypatch.setattr(cake_kcp_plan, "qk_l2norm_missing", lambda *a, **k: None)
+
+
+def _missing(reason: str | None):
+    """A stand-in for ``cake_kcp_plan.qk_l2norm_missing`` that gives ``reason`` for every mode, gate and
+    architecture."""
+    return lambda *a, **k: reason
 
 
 # --------------------------------------------------------------------------- CPU helpers
@@ -256,18 +265,44 @@ def _saved_summary(saved) -> dict:
     }
 
 
-def _plan_recorder(name: str, real, calls: list):
-    """``real`` (the existing backend's ``plan`` / ``workspace_bytes``) recording its calls; a backend whose function
-    does not take ``l2n`` yet is called without it (the flag-off arena: the recorded keywords are the point)."""
+def _plan_recorder(name: str, real, calls: list, results: list | None = None):
+    """``real`` (the existing backend's ``plan`` / ``workspace_bytes`` / ``tables_bytes``) recording its calls in
+    ``calls`` and, with ``results``, each call's ``(name, args, keywords, result)``; a backend whose function does not
+    take ``l2n`` yet is called without it (the flag-off arena: the recorded keywords are the point)."""
     takes_l2n = "l2n" in inspect.signature(real).parameters
 
     def wrapped(*a, **k):
         calls.append([name, _jsonable(a), _jsonable(sorted(k.items()))])
         if not takes_l2n:
             k = {x: v for x, v in k.items() if x != "l2n"}
-        return real(*a, **k)
+        out = real(*a, **k)
+        if results is not None:
+            results.append((name, _jsonable(a), _jsonable(sorted(k.items())), out))
+        return out
 
     return wrapped
+
+
+def _recording(m, calls: list, results: list) -> None:
+    """Patch (``m``) the existing backend's ``plan`` / ``workspace_bytes`` to record their calls in ``calls`` and,
+    with its ``tables_bytes``, their results in ``results`` (:func:`_local_bytes`)."""
+    for name in ("plan", "workspace_bytes", "tables_bytes"):
+        log = [] if name == "tables_bytes" else calls
+        real = getattr(cake_backend, name)
+        m.setattr(cake_backend, name, _plan_recorder(name, real, log, results))
+
+
+def _local_bytes(results: list) -> int:
+    """The local part of one workspace byte query from the existing backend's ``results`` behind it
+    (:func:`_recording`): the largest arena plus the scratch table set of every distinct problem that has one
+    (``cake_kcp_plan.kda_det_workspace_bytes_kcp``; the rest, the KCP pools, does not depend on the l2n mode)."""
+    arenas = [int(out) for name, _a, _k, out in results if name == "workspace_bytes"]
+    tables = {
+        json.dumps([a, k]): int(out)
+        for name, a, k, out in results
+        if name == "tables_bytes"
+    }
+    return max(arenas, default=0) + sum(tables.values())
 
 
 def _snapshot(kw: dict, H: int = 4) -> dict:
@@ -353,19 +388,20 @@ def _snapshot(kw: dict, H: int = 4) -> dict:
         for extra in ({}, {"save_transfer": False}, {"checkpoint_keep": "states"})
     ]
     plan_calls: list = []
+    snap["workspace_bytes"], snap["local_bytes"] = [], []
     with pytest.MonkeyPatch.context() as m:
-        for name in ("plan", "workspace_bytes"):
-            m.setattr(
-                cake_backend,
-                name,
-                _plan_recorder(name, getattr(cake_backend, name), plan_calls),
-            )
-        snap["workspace_bytes"] = [
-            cake_kcp_plan.kda_det_workspace_bytes_kcp(c, H=h, backward=b, **kw)
-            for c in (ctxs[0], ctxs[2], ctxs)
-            for h in (4, 64)
-            for b in (True, False)
-        ]
+        results: list = []
+        _recording(m, plan_calls, results)
+        for c in (ctxs[0], ctxs[2], ctxs):
+            for h in (4, 64):
+                for b in (True, False):
+                    results.clear()
+                    snap["workspace_bytes"].append(
+                        cake_kcp_plan.kda_det_workspace_bytes_kcp(
+                            c, H=h, backward=b, **kw
+                        )
+                    )
+                    snap["local_bytes"].append(_local_bytes(results))
     snap["plan_calls"] = plan_calls
     return _jsonable(snap)
 
@@ -574,7 +610,8 @@ def test_l2n_flag_on_keys_and_fingerprint(capable) -> None:
     key tensors (last); ``l2n="fused"`` to the fingerprint's modes (both tiers; every other entry, the operands and
     the options included, is the flag-off one); the rstd (last) and ``"qk_l2norm": True`` to the saved set; ``8 T_r H``
     to the saved bytes (a handle's bytes unchanged); and ``l2n="fused"`` to every plan call of the workspace query
-    (the same calls otherwise)."""
+    (the same calls otherwise), whose bytes move by the existing backend's local arena delta of the mode only (zero
+    while it has none), against the flag-off run and the literal flag-off expectations alike."""
     H = 4
     off, on = _snapshot(OFF, H), _snapshot(L2N, H)
     assert on["call"] == off["call"]
@@ -614,8 +651,11 @@ def test_l2n_flag_on_keys_and_fingerprint(capable) -> None:
     for co, cn in zip(off["plan_calls"], on["plan_calls"], strict=True):
         assert cn[:2] == co[:2]
         assert dict(cn[2]) == {**dict(co[2]), "l2n": "fused"}
-    if "l2n" not in inspect.signature(cake_backend.plan).parameters:
-        assert on["workspace_bytes"] == off["workspace_bytes"]
+    # the workspace bytes move by the local arena's delta only (the existing backend's own bytes of the mode, zero
+    # while it has none; the KCP pools do not depend on it)
+    local = [n - o for n, o in zip(on["local_bytes"], off["local_bytes"], strict=True)]
+    pairs = zip(on["workspace_bytes"], off["workspace_bytes"], strict=True)
+    assert [n - o for n, o in pairs] == local
     # the same deltas against the literal flag-off expectations of the base of this change
     golden, view = _golden(), _as_golden(on)
     assert [v[:2] for v in view["graph_keys"]] == [
@@ -634,6 +674,9 @@ def test_l2n_flag_on_keys_and_fingerprint(capable) -> None:
     assert len(view["plan_calls"]) == len(golden["plan_calls"])
     for g, c in zip(golden["plan_calls"], view["plan_calls"], strict=True):
         assert c[:2] == g[:2] and dict(c[2]) == {**dict(g[2]), "l2n": "fused"}
+    if "workspace_bytes" in golden:  # no CUDA device: the golden's architecture
+        base_ws = [n - d for n, d in zip(view["workspace_bytes"], local, strict=True)]
+        assert base_ws == golden["workspace_bytes"]
 
 
 # --------------------------------------------------------------------------- CPU rows: the saved set
@@ -812,6 +855,42 @@ def test_l2n_operands_take_packed_views_without_a_copy(capable) -> None:
     assert call.ops["k"].data_ptr() == k.data_ptr()
 
 
+def test_l2n_refusal_precedes_the_operand_checks() -> None:
+    """With the flag on, the capability refusal and the workspace's checks run before the operand checks, on
+    rank-independent inputs only (the context's device, the workspace's modes): a rank whose q view is misaligned
+    (the one per-rank view check) raises the others' ``NotImplementedError`` from every entry, not ``ValueError``,
+    and a workspace that is not a ``WorkspaceDetKcp`` the others' ``TypeError``; past the check the same view raises
+    ``ValueError``.  Without the flag the operand checks come first, as before the mode."""
+    H = 4
+    ctx = _cpu_ctx()
+    ops = _cpu_ops(ctx, H)
+    T = int(ctx.T_r)
+    wide = torch.zeros(T, H * D + 8, dtype=torch.bfloat16)
+    q = wide[:, 1 : 1 + H * D].view(T, H, D)  # 2 bytes past the 16-byte alignment
+    assert T > 0 and q.data_ptr() % 16 == 2
+    args = (q, *_args(ops, ctx)[1:])
+    dout = ops["dout"]
+    entries = {
+        "fwd": lambda **kw: cake_kcp.chunk_kda_det_fwd_kcp(*args, **kw),
+        "bwd": lambda **kw: cake_kcp.chunk_kda_det_bwd_kcp(*args, dout, **kw),
+        "autograd": lambda **kw: cake_kcp.chunk_kda_det_kcp(*args, **kw),
+    }
+    for entry in entries.values():
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(cake_kcp_plan, "qk_l2norm_missing", _missing("forced"))
+            with pytest.raises(NotImplementedError, match="forced"):
+                entry(**L2N)
+            with pytest.raises(TypeError, match="must be a WorkspaceDetKcp"):
+                entry(workspace=object(), **L2N)
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(cake_kcp_plan, "qk_l2norm_missing", _missing(None))
+            with pytest.raises(ValueError):
+                entry(**L2N)
+        for kw in ({}, {"workspace": object()}):
+            with pytest.raises(ValueError, match="must be contiguous"):
+                entry(**kw)
+
+
 # --------------------------------------------------------------------------- CPU rows: workspace and byte queries
 
 
@@ -867,7 +946,8 @@ def test_l2n_workspace_mode_is_pinned(capable) -> None:
 def test_l2n_byte_queries(capable) -> None:
     """``kda_det_saved_bytes_kcp(..., use_qk_l2norm_in_kernel=True)`` is ``8 T_r H`` more than without (zero on a rank
     without tokens; every tier of a recompute handle unchanged); ``kda_det_workspace_bytes_kcp`` plans the local arena
-    with ``l2n="fused"`` added to the same calls, for one context and for a list; the communication query does not take
+    with ``l2n="fused"`` added to the same calls, for one context and for a list, and its bytes move by the existing
+    backend's local arena delta of the mode only (the KCP pools unchanged); the communication query does not take
     the keyword."""
     ctxs = [_cpu_ctx(rank=0), _cpu_ctx(rank=1)] + [_cpu_zero_ctx(r) for r in range(4)]
     assert any(int(c.T_r) == 0 for c in ctxs)
@@ -881,30 +961,81 @@ def test_l2n_byte_queries(capable) -> None:
                 assert cake_kcp_plan.kda_det_saved_bytes_kcp(
                     c, H=H, checkpoint_keep=keep, **L2N
                 ) == cake_kcp_plan.kda_det_saved_bytes_kcp(c, H=H, checkpoint_keep=keep)
-    takes_l2n = "l2n" in inspect.signature(cake_backend.plan).parameters
     for target in (ctxs[0], ctxs[1], ctxs):
         for H in (4, 64):
             for backward in (True, False):
                 got = {}
                 for tag, kw in (("off", {}), ("on", L2N)):
                     calls: list = []
+                    results: list = []
                     with pytest.MonkeyPatch.context() as m:
-                        for name in ("plan", "workspace_bytes"):
-                            real = getattr(cake_backend, name)
-                            m.setattr(
-                                cake_backend, name, _plan_recorder(name, real, calls)
-                            )
+                        _recording(m, calls, results)
                         n = cake_kcp_plan.kda_det_workspace_bytes_kcp(
                             target, H=H, backward=backward, **kw
                         )
-                    got[tag] = (n, calls)
+                    got[tag] = (n, calls, _local_bytes(results))
                 c_off, c_on = got["off"][1], got["on"][1]
                 assert c_off and len(c_on) == len(c_off)
                 for (n0, a0, k0), (n1, a1, k1) in zip(c_off, c_on, strict=True):
                     assert (n0, a0) == (n1, a1)
                     assert dict(k1) == {**dict(k0), "l2n": "fused"}
-                if not takes_l2n:
-                    assert got["on"][0] == got["off"][0], (H, backward)
+                # the local arena's delta only: the pools do not depend on the mode
+                delta = got["on"][2] - got["off"][2]
+                assert got["on"][0] - got["off"][0] == delta, (H, backward)
+
+
+def test_l2n_byte_queries_device_and_gate() -> None:
+    """With the flag off the byte queries never read a device architecture (``qk_l2norm_arch`` raising) and, where
+    the existing backend plans nothing (the saved bytes of every rank, the workspace bytes of ranks without tokens),
+    make no CUDA call at all (``torch.cuda.is_available`` raising), with unchanged bytes.  With the flag on, the
+    workspace query checks the mode on the architecture of its contexts' device (not the current CUDA device) in its
+    gate mode, the saved query on its context's device in the call's gate mode (``use_gate_in_kernel``, a bool)."""
+
+    def no_cuda(*_a, **_k):
+        raise AssertionError("a flag-off byte query read the device")
+
+    def saved_bytes(cs) -> list:
+        return [
+            cake_kcp_plan.kda_det_saved_bytes_kcp(c, H=4, **kw)
+            for c in cs
+            for kw in ({}, OFF)
+        ]
+
+    def workspace_bytes(cs) -> list:
+        return [
+            cake_kcp_plan.kda_det_workspace_bytes_kcp(t, H=4, backward=b, **kw)
+            for t in (*cs, cs)
+            for b in (True, False)
+            for kw in ({}, OFF)
+        ]
+
+    ctxs = [_cpu_ctx(rank=0), _cpu_ctx(rank=1), _cpu_zero_ctx(1), _cpu_zero_ctx(2)]
+    zero = [c for c in ctxs if int(c.T_r) == 0]
+    assert zero and len(zero) < len(ctxs)
+    want = (saved_bytes(ctxs), workspace_bytes(ctxs), workspace_bytes(zero))
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(cake_kcp_plan, "qk_l2norm_arch", no_cuda)
+        assert (saved_bytes(ctxs), workspace_bytes(ctxs)) == want[:2]
+    with pytest.MonkeyPatch.context() as m:
+        for name in ("is_available", "current_device", "get_device_capability"):
+            m.setattr(torch.cuda, name, no_cuda)
+        assert (saved_bytes(ctxs), workspace_bytes(zero)) == (want[0], want[2])
+    checks: list = []
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(cake_kcp_plan, "qk_l2norm_arch", lambda device=None: f"arch:{device}")
+        m.setattr(cake_kcp_plan, "require_qk_l2norm", lambda *a: checks.append(a))
+        for gate in (False, True):
+            cake_kcp_plan.kda_det_workspace_bytes_kcp(
+                zero, H=4, use_gate_in_kernel=gate, **L2N
+            )
+            cake_kcp_plan.kda_det_saved_bytes_kcp(
+                ctxs[0], H=4, use_gate_in_kernel=gate, **L2N
+            )
+    arch = f"arch:{ctxs[0].device}"
+    assert checks == [("fused", g, arch) for g in ("g", "g", "raw", "raw")]
+    for bad in (1, None, "raw"):
+        with pytest.raises(ValueError, match="use_gate_in_kernel must be a bool"):
+            cake_kcp_plan.kda_det_saved_bytes_kcp(ctxs[0], H=4, use_gate_in_kernel=bad)
 
 
 # --------------------------------------------------------------------------- CPU rows: the values and the stage order
@@ -1059,12 +1190,50 @@ def test_l2n_stage_order() -> None:
     assert not cake_kcp_plan.qk_l2norm_intra_first(Plan("fwd_intra_v14"))
 
 
-def _fake_registry(m, *, drop=(), serve=None, arches=None, unexported=(), layouts=None):
-    """Install a fake existing backend whose signatures take the mode, with every record of
-    :data:`cake_kcp_plan.QK_L2NORM_RECORDS` (but ``drop``) serving ``serve`` (record -> modes; default every mode),
-    delivered for ``arches`` (record -> architectures; default all) and exported but for the ``unexported`` libraries,
-    and whose layout tables are ``layouts`` (layout -> buffer names, or an exception to raise; default the slot
-    views everywhere)."""
+def _fake_pick(stage: str, path: str, mode: str, docs: int, heads: int, arch: str):
+    """The fake registry's selection, shaped as the existing backend's: the intra programs switch above 256
+    documents; fused, the forward's intra program is the ``_l2n`` twin and on the replay the intra program (at most
+    256 documents) or the prep (above) is; the GLM intra program per architecture (fused, its twin; fallback, its
+    capture form); the fallback form's separate programs (none in the fused form)."""
+    few = docs <= 256
+    twin = "_l2n" if mode == "fused" else ""
+    if stage == "fwd_intra":
+        first = path == cake_kcp.LOCAL_PATH_FWD or few
+        return ("fwd_intra_v14" if few else "fwd_intra") + (twin if first else "")
+    if stage == "bwd_prep":
+        return "bwd_prep_g8_replay" + ("" if few else twin)
+    if stage == "glm_intra":
+        glm = {"sm_100a": "glm_intra", "sm_103a": "glm_intra_v14"}
+        return glm.get(arch, "glm_intra_v18") + (twin or "_cap")
+    return stage if mode == "fallback" else None
+
+
+def _pick_but(when, out):
+    """:func:`_fake_pick`, but ``out`` (a record, ``None`` or an exception to raise) where ``when(stage, path, mode,
+    docs, heads, arch)``."""
+
+    def pick(*key):
+        return out if when(*key) else _fake_pick(*key)
+
+    return pick
+
+
+def _fake_registry(
+    m,
+    *,
+    pick=None,
+    select_modes=("l2n", "gate"),
+    arches=None,
+    unexported=(),
+    layouts=None,
+    seen=None,
+):
+    """Install a fake existing backend whose entry points and plan take the mode: its ``select_record`` takes the
+    keywords ``select_modes`` of ``("l2n", "gate")`` and selects ``pick(stage, path, mode, docs, heads, arch)``
+    (default :func:`_fake_pick`; an exception is raised), each call's keywords appended to ``seen``; its records
+    are delivered for ``arches`` (record -> architectures; default all) and exported but for the ``unexported``
+    libraries (``lib_<record>_<arch>``); its layout tables are ``layouts`` (layout -> buffer names, or an exception
+    to raise; default the slot views everywhere)."""
 
     def fwd(*a, use_qk_l2norm_in_kernel: bool = False, **k):
         raise AssertionError("never called")
@@ -1080,103 +1249,150 @@ def _fake_registry(m, *, drop=(), serve=None, arches=None, unexported=(), layout
             raise got
         return [{"slot": i, "buffer": b} for i, b in enumerate(("u", "w", *got))]
 
-    names = {
-        n
-        for entries in cake_kcp_plan.QK_L2NORM_RECORDS.values()
-        for e in entries
-        for n in e
-    }
-    modules = {
-        n: {
-            "library": f"lib_{n}",
-            "arches": list((arches or {}).get(n, cake_jit.ARCHES)),
-            "l2n": list((serve or {}).get(n, ("off", "fused", "fallback"))),
-        }
-        for n in names - set(drop)
-    }
-    libraries = {
-        f"lib_{n}_{a}": {} for n, rec in modules.items() for a in rec["arches"]
-    }
-    for lib in unexported:
-        libraries.pop(lib, None)
+    def select(stage, **kw):
+        if seen is not None:
+            seen.append({"stage": stage, **kw})
+        key = (kw["path"], kw.get("l2n", "off"), kw["num_seqs"], kw["num_heads"])
+        got = (pick or _fake_pick)(stage, *key, kw["arch"])
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    names = ("num_chunks_pad", "num_seqs", "num_heads", "sm_count", "arch", "path")
+    kw_only = inspect.Parameter.KEYWORD_ONLY
+    params = [inspect.Parameter("stage", inspect.Parameter.POSITIONAL_ONLY)]
+    params += [inspect.Parameter(n, kw_only) for n in names + tuple(select_modes)]
+    select.__signature__ = inspect.Signature(params)
+
+    class Modules(dict):
+        def __missing__(self, name):
+            return {"arches": list((arches or {}).get(name, cake_jit.ARCHES))}
+
+    class Libraries:
+        def __contains__(self, lib):
+            return lib not in unexported
+
     m.setattr(cake_backend, "chunk_kda_det_fwd", fwd)
     m.setattr(cake_backend, "plan", plan)
     m.setattr(cake_backend, "lifetime_table", lifetime_table)
     m.setattr(cake_jit, "L2N_MODES", ("off", "fused", "fallback"), raising=False)
-    m.setattr(cake_jit, "MODULES", modules)
-    m.setattr(cake_build, "libraries_by_name", lambda: libraries)
+    m.setattr(cake_jit, "select_record", select)
+    m.setattr(cake_jit, "MODULES", Modules())
+    m.setattr(cake_jit, "library_name", lambda name, arch: f"lib_{name}_{arch}")
+    m.setattr(cake_build, "libraries_by_name", Libraries)
 
 
 def test_l2n_capability_check() -> None:
     """:func:`cake_kcp_plan.qk_l2norm_missing` (form, gate, arch): rank-independent inputs only (no context, no token
-    count, no plan).  The record list covers every record the route's stages of the mode can select on its local
-    paths (the forward's and the replay's intra programs in both variants, the replay prep -- its ``_l2n`` twin or
-    the plain record serving the mode --, the GLM intra program; in the fallback form the separate programs, the
-    plain readers serving the form and the capture program).  A reason while the existing backend's entry points
-    lack ``use_qk_l2norm_in_kernel``, its plan or layout table lacks ``l2n`` or the mode, a record entry has no
-    record that serves the mode, is delivered for the architecture (``None``: every one it lists) and is exported
-    there, or a layout of the route lacks the ``qn_int`` / ``kn_int`` views (named in the reason); ``None`` once
-    all hold.  The signature reads are cached per callable."""
+    count, no plan).  It selects through the existing backend's ``select_record(..., l2n=form)`` (and ``gate=`` in
+    the raw gate mode) every stage of :data:`cake_kcp_plan.QK_L2NORM_STAGES` of the form on the route's two local
+    paths, over the fixed grid :data:`cake_kcp_plan.QK_L2NORM_GRID` at each SM count of the architecture
+    (:data:`cake_kcp_plan.QK_L2NORM_SMS`; every exported architecture for ``None``), each problem once; the grid
+    holds both document regimes (at most and above 256) on both recurrence routes (segmented and serial) on every
+    architecture.  A reason while the existing backend's entry points lack ``use_qk_l2norm_in_kernel``, its plan or
+    layout table lacks ``l2n`` or the mode, its selection takes no ``l2n`` (the base of this change) or no ``gate``
+    in the raw gate mode, a stage selects nothing (``ValueError`` or ``None``) for any problem of the grid -- also
+    one only above or at most 256 documents, or on one architecture --, selects a record not delivered or not
+    exported for the architecture, the fused form's readers do not give exactly one normalizing first reader on
+    each path (the fallback form's none), or a layout of the route lacks the ``qn_int`` / ``kn_int`` views (named
+    in the reason); ``None`` once all hold.  The signature reads are cached per callable."""
     assert list(inspect.signature(cake_kcp_plan.qk_l2norm_missing).parameters) == [
         "mode",
         "gate",
         "arch",
     ]
-    records = cake_kcp_plan.QK_L2NORM_RECORDS
-    assert set(records) == {(f, g) for f in ("fused", "fallback") for g in ("g", "raw")}
-    assert records[("fused", "g")] == (
-        ("fwd_intra_l2n",),
-        ("fwd_intra_v14_l2n",),
-        ("bwd_prep_g8_replay_l2n", "bwd_prep_g8_replay"),
-        ("glm_intra_l2n",),
-    )
-    assert records[("fused", "raw")] == (
-        ("fwd_intra_raw_l2n",),
-        ("fwd_intra_v14_raw_l2n",),
-        ("bwd_prep_g8_replay_raw_l2n", "bwd_prep_g8_replay_raw"),
-        ("glm_intra_raw_l2n",),
-    )
-    for gate in ("g", "raw"):
-        flat = {n for e in records[("fallback", gate)] for n in e}
-        assert {"qk_l2norm", "qk_l2norm_apply", "qk_pullback"} <= flat
+    F, B = cake_kcp.LOCAL_PATH_FWD, cake_kcp.LOCAL_PATH_BWD
+    readers = ((F, "fwd_intra"), (B, "fwd_intra"), (B, "bwd_prep"), (B, "glm_intra"))
+    separate = ((F, "qk_l2norm"), (B, "qk_l2norm"), (B, "qk_apply"), (B, "qk_pullback"))
+    stages = cake_kcp_plan.QK_L2NORM_STAGES
+    assert stages == {"fused": readers, "fallback": readers + separate}
     assert cake_kcp_plan.QK_L2NORM_LAYOUTS == ("fwd", "fwd_kcp", "replay")
-    # every flag-off record the existing backend selects for the route's intra stage (forward and replay paths) and
-    # replay prep, on every architecture over a spread of problems, has its twin listed (gate "g")
-    fused = {n for e in records[("fused", "g")] for n in e}
-    fallback = {n for e in records[("fallback", "g")] for n in e}
-    sms = {"sm_100a": 148, "sm_103a": 152, "sm_107a": 216}
-    selected = set()
-    problems = ((64, 4, 4), (1024, 1, 4), (1024, 2, 64), (512, 300, 64))
+    # the grid: both document regimes on both routes, on every architecture at each of its SM counts
+    grid, sms = cake_kcp_plan.QK_L2NORM_GRID, cake_kcp_plan.QK_L2NORM_SMS
+    assert set(sms) == set(cake_jit.ARCHES)
+    both = {(few, route) for few in (True, False) for route in ("seg", "serial")}
     for arch in cake_jit.ARCHES:
-        for nc, docs, heads in problems:
-            for stage, path in (
-                ("fwd_intra", cake_kcp.LOCAL_PATH_FWD),
-                ("fwd_intra", cake_kcp.LOCAL_PATH_BWD),
-                ("bwd_prep", cake_kcp.LOCAL_PATH_BWD),
-            ):
-                name = cake_jit.select_record(
-                    stage, num_chunks_pad=nc, num_seqs=docs, num_heads=heads,
-                    sm_count=sms.get(arch, 148), arch=arch, path=path,
-                )  # fmt: skip
-                if name is not None:
-                    selected.add(name)
-                    assert name + "_l2n" in fused and name in fallback, (arch, name)
-    assert {"fwd_intra", "fwd_intra_v14", "bwd_prep_g8_replay"} <= selected, selected
+        for sm in sms[arch]:
+            regimes = {
+                (docs <= 256, cake_jit.segment_plan(docs, heads, sm, arch)[0])
+                for _nc, docs, heads in grid
+            }
+            assert regimes == both, (arch, sm, regimes)
+    # every stage of the form, every problem, every SM count, once; the mode keywords
+    fields = "arch sm_count num_chunks_pad num_seqs num_heads path stage".split()
+    for form in ("fused", "fallback"):
+        for gate in ("g", "raw"):
+            for arch in (None, "sm_103a"):
+                seen: list = []
+                with pytest.MonkeyPatch.context() as m:
+                    _fake_registry(m, seen=seen)
+                    assert cake_kcp_plan.qk_l2norm_missing(form, gate, arch) is None
+                want = {
+                    (a, sm, *problem, path, stage)
+                    for a in (cake_jit.ARCHES if arch is None else (arch,))
+                    for sm in sms[a]
+                    for problem in grid
+                    for path, stage in stages[form]
+                }
+                got = [tuple(k[f] for f in fields) for k in seen]
+                assert len(got) == len(want) and set(got) == want, (form, gate, arch)
+                assert {k["l2n"] for k in seen} == {form}
+                gates = {k.get("gate", "-") for k in seen}
+                assert gates == {"-" if gate == "g" else gate}
+    where = "sm_100a, 148 SMs, 257 documents, 4 heads, 257 chunks"
+    bad = ValueError("no record serves the mode")
     cases = [
+        # (the fake registry's keywords, only this form, the reason holds)
         ({}, None, None),
-        ({"drop": ("fwd_intra_v14_l2n",)}, "fused", "no record fwd_intra_v14_l2n"),
-        ({"drop": ("bwd_prep_g8_replay_l2n",)}, None, None),  # the plain prep serves the mode
+        ({"select_modes": ("gate",)}, None, "selects no record by Q/K L2 norm mode"),
         (
-            {
-                "drop": ("bwd_prep_g8_replay_l2n",),
-                "serve": {"bwd_prep_g8_replay": ["off", "fallback"]},
-            },
-            "fused",
-            "record bwd_prep_g8_replay does not serve l2n='fused'",
+            {"pick": _pick_but(lambda s, *k: s == "glm_intra", bad)},
+            None,
+            f"selects no glm_intra on {B} (sm_100a, 148 SMs, 1 documents, 4 heads, 1 chunks): {bad}",
         ),
-        ({"serve": {"fwd_intra": ["off"]}}, "fallback", "record fwd_intra does not serve"),
-        ({"drop": ("qk_pullback",)}, "fallback", "no record qk_pullback"),
-        ({"serve": {"glm_intra_l2n": ["off"]}}, "fused", "glm_intra_l2n does not serve"),
+        (
+            {"pick": _pick_but(lambda s, p, m, d, h, a: s == "fwd_intra" and d > 256, bad)},
+            None,
+            f"selects no fwd_intra on {F} ({where}): {bad}",
+        ),
+        (
+            {"pick": _pick_but(lambda s, p, m, d, h, a: s == "bwd_prep" and d <= 256, None)},
+            None,
+            f"selects no bwd_prep on {B} (sm_100a, 148 SMs, 1 documents, 4 heads, 1 chunks)",
+        ),
+        (
+            {"pick": _pick_but(lambda s, p, m, d, h, a: s == "glm_intra" and h == 16 and a == "sm_107a", bad)},
+            None,
+            f"selects no glm_intra on {B} (sm_107a, 212 SMs, 1 documents, 16 heads, 1 chunks)",
+        ),
+        ({"pick": _pick_but(lambda s, *k: s == "qk_pullback", None)}, "fallback", f"selects no qk_pullback on {B}"),
+        (
+            {"pick": _pick_but(lambda s, p, m, d, h, a: s == "qk_apply" and d > 256, None)},
+            "fallback",
+            f"selects no qk_apply on {B} ({where})",
+        ),
+        ({"pick": _pick_but(lambda s, p, *k: s == "qk_l2norm" and p == F, bad)}, "fallback", f"qk_l2norm on {F}"),
+        # the fused form's first readers: both / neither on the replay, a plain forward intra program
+        (
+            {"pick": _pick_but(lambda s, p, m, *k: s == "bwd_prep" and m == "fused", "bwd_prep_g8_replay_l2n")},
+            "fused",
+            "2 of the replay's records fwd_intra_v14_l2n / bwd_prep_g8_replay_l2n normalize",
+        ),
+        (
+            {"pick": _pick_but(lambda s, p, m, *k: s == "bwd_prep" and m == "fused", "bwd_prep_g8_replay")},
+            "fused",
+            f"registry ({where}): 0 of the replay's records fwd_intra / bwd_prep_g8_replay normalize",
+        ),
+        (
+            {"pick": _pick_but(lambda s, p, m, d, h, a: s == "fwd_intra" and p == F and d > 256, "fwd_intra")},
+            "fused",
+            f"registry ({where}): the forward's intra record fwd_intra does not normalize",
+        ),
+        (
+            {"pick": _pick_but(lambda s, p, m, *k: s == "bwd_prep" and m == "fallback", "bwd_prep_g8_replay_l2n")},
+            "fallback",
+            "the fallback form's readers fwd_intra_v14 / fwd_intra_v14 / bwd_prep_g8_replay_l2n normalize",
+        ),
         ({"layouts": {"replay": ("qn_int",)}}, None, "layout 'replay' has no kn_int views"),
         ({"layouts": {"fwd_kcp": ()}}, None, "layout 'fwd_kcp' has no qn_int / kn_int views"),
         ({"layouts": {"fwd": ValueError("bad mode")}}, None, "layout 'fwd' has no l2n="),
@@ -1186,23 +1402,32 @@ def test_l2n_capability_check() -> None:
             with pytest.MonkeyPatch.context() as m:
                 _fake_registry(m, **kw)
                 got = cake_kcp_plan.qk_l2norm_missing(form, "g")
-                if want is None or (only is not None and only != form):
-                    assert got is None, (form, kw, got)
-                else:
-                    assert got is not None and want in got, (form, kw, got)
-    # the architecture: its records' "arches" and the build.json libraries there
-    with pytest.MonkeyPatch.context() as m:
-        _fake_registry(m, arches={"glm_intra_l2n": ["sm_100a"]})
-        assert cake_kcp_plan.qk_l2norm_missing("fused", "g", "sm_100a") is None
-        got = cake_kcp_plan.qk_l2norm_missing("fused", "g", "sm_103a")
-        assert "record glm_intra_l2n is not delivered for sm_103a" in got
-        assert cake_kcp_plan.qk_l2norm_missing("fused", "g") is None
-    with pytest.MonkeyPatch.context() as m:
-        _fake_registry(m, unexported=("lib_fwd_intra_l2n_sm_103a",))
-        assert cake_kcp_plan.qk_l2norm_missing("fused", "g", "sm_100a") is None
-        for arch in ("sm_103a", None):
-            got = cake_kcp_plan.qk_l2norm_missing("fused", "g", arch)
-            assert "record fwd_intra_l2n has no exported library for sm_103a" in got
+            if want is None or (only is not None and only != form):
+                assert got is None, (form, kw, got)
+            else:
+                assert got is not None and want in got, (form, kw, got)
+    # the architecture: the selected records' "arches" and the build.json libraries there
+    what = f"fwd_intra on {F} (sm_103a, 148 SMs, 1 documents, 4 heads, 1 chunks)"
+    deliver = {"fwd_intra_v14_l2n": ["sm_100a", "sm_107a"]}
+    for name, kw in (
+        ("is not delivered", {"arches": deliver}),
+        ("has no exported library", {"unexported": ("lib_fwd_intra_v14_l2n_sm_103a",)}),
+    ):
+        want = f"record fwd_intra_v14_l2n ({what}) {name} for sm_103a"
+        with pytest.MonkeyPatch.context() as m:
+            _fake_registry(m, **kw)
+            for arch in ("sm_100a", "sm_107a"):
+                assert cake_kcp_plan.qk_l2norm_missing("fused", "g", arch) is None
+            assert cake_kcp_plan.qk_l2norm_missing("fallback", "g", "sm_103a") is None
+            for arch in ("sm_103a", None):
+                assert cake_kcp_plan.qk_l2norm_missing("fused", "g", arch) == want
+    # the gate mode: the raw gate mode needs a selection by gate mode
+    raw = "the single-rank registry selects no record of gate mode 'raw'"
+    for form in ("fused", "fallback"):
+        with pytest.MonkeyPatch.context() as m:
+            _fake_registry(m, select_modes=("l2n",))
+            assert cake_kcp_plan.qk_l2norm_missing(form, "g") is None
+            assert cake_kcp_plan.qk_l2norm_missing(form, "raw") == raw
     # the signatures and the modes
     for form in ("fused", "fallback"):
         for gate in ("g", "raw"):
@@ -1277,6 +1502,57 @@ def test_l2n_stage_values_merge() -> None:
     assert launches[2] == ("rec_dqkg", {**base, **mode})
     assert launches[3] == ("rec_glm_intra", {**base, **mode})
     assert launches[4] == ("rec_dqkg", {**base, "q": "qn", "x": 3})
+
+
+def test_l2n_fallback_stages_are_never_skipped() -> None:
+    """``KernelBackend.stage`` launches a stage of the fallback form (``qk_l2norm`` / ``qk_apply`` / ``qk_pullback``,
+    :data:`cake_kcp.L2N_FALLBACK_STAGES`) the plan dispatches and raises ``RuntimeError`` for one it does not, on
+    the forward and the backward path, where an optional stage the plan fuses away (the gate epilogue) launches
+    nothing."""
+    launches: list = []
+
+    class Plan:
+        def __init__(self, on: bool) -> None:
+            self.on = on
+
+        def record(self, stage, path):
+            return f"rec_{stage}"
+
+        def grid(self, stage, path):
+            return (1, 1, 1)
+
+        def dispatched(self, stage, path):
+            return self.on
+
+    class Arena:
+        device_index = 0
+
+        def __init__(self, on: bool) -> None:
+            self.plan = Plan(on)
+
+        def launcher(self, record, values, *, grid, device_index):
+            launches.append(record)
+
+    def call(on: bool, backward: bool):
+        return types.SimpleNamespace(
+            local_values={}, scratch={"views": None}, local=Arena(on), out=None, grads=None,
+            backward=backward, host_trim=0,
+        )  # fmt: skip
+
+    backend = cake_kcp.KernelBackend(programs=object())
+    assert cake_kcp.L2N_FALLBACK_STAGES == ("qk_l2norm", "qk_apply", "qk_pullback")
+    for name in cake_kcp.L2N_FALLBACK_STAGES:
+        for backward in (False, True):
+            path = cake_kcp.LOCAL_PATH_BWD if backward else cake_kcp.LOCAL_PATH_FWD
+            launches.clear()
+            backend.stage(name, call(True, backward))
+            assert launches == [f"rec_{name}"], (name, path)
+            with pytest.raises(RuntimeError, match=f"dispatches no {name} on '{path}'"):
+                backend.stage(name, call(False, backward))
+            assert launches == [f"rec_{name}"], (name, path)
+    launches.clear()
+    backend.stage("gate_epilogue", call(False, True))
+    assert launches == []
 
 
 # PENDING(single-rank in-kernel Q/K L2 norm programs): delete these rows once the existing backend serves the mode
@@ -1416,7 +1692,11 @@ def _refusal_rank(rank: int, W: int, layout: str, port: int, out_dir: str) -> No
         H = 4
         ops = _cpu_ops(ctx, H)
         args = _args(ops, ctx)
-        bad = torch.zeros(int(ctx.T_r), H, 2 * D, dtype=torch.bfloat16)[..., :D]
+        T = int(ctx.T_r)
+        bad = torch.zeros(T, H, 2 * D, dtype=torch.bfloat16)[..., :D]
+        # a base address 2 bytes past the 16-byte alignment (the one per-rank view check, where the rank has tokens)
+        wide = torch.zeros(T, H * D + 8, dtype=torch.bfloat16)
+        misaligned = wide[:, 1 : 1 + H * D].view(T, H, D)
         handle = cake_kcp.RecomputeHandleDetKcp
         calls = {
             "fwd": lambda: cake_kcp.chunk_kda_det_fwd_kcp(*args, **L2N),
@@ -1438,15 +1718,23 @@ def _refusal_rank(rank: int, W: int, layout: str, port: int, out_dir: str) -> No
             "saved_bytes": lambda: cake_kcp_plan.kda_det_saved_bytes_kcp(
                 ctx, H=H, **L2N
             ),
+            "misaligned_q": lambda: cake_kcp.chunk_kda_det_fwd_kcp(
+                misaligned, *args[1:], **L2N
+            ),
             "bad_head_stride": lambda: cake_kcp.chunk_kda_det_fwd_kcp(
                 bad, *args[1:], **L2N
             ),
         }
         got: dict = {}
-        with pytest.MonkeyPatch.context() as m:
-            if _l2n_missing() is None:
-                m.setattr(cake_kcp_plan, "qk_l2norm_missing", lambda *a, **k: "forced")
-            for name, fn in calls.items():
+        forced = _l2n_missing() is None
+        for name, fn in calls.items():
+            with pytest.MonkeyPatch.context() as m:
+                # past the capability check, the view rule's own refusal; else the check's reason (one stand-in
+                # once the existing backend serves the mode)
+                if name == "bad_head_stride":
+                    m.setattr(cake_kcp_plan, "qk_l2norm_missing", _missing(None))
+                elif forced:
+                    m.setattr(cake_kcp_plan, "qk_l2norm_missing", _missing("forced"))
                 try:
                     fn()
                     got[name] = None
@@ -1467,9 +1755,10 @@ def _refusal_rank(rank: int, W: int, layout: str, port: int, out_dir: str) -> No
 def test_l2n_refusal_is_rank_symmetric(W, layout) -> None:
     """In a spawned CPU group of ``W`` ranks (gloo) with a rank without tokens, every flag-on entry (forward, replay
     forward, replay backward, the autograd entry with and without a recompute handle, ``WorkspaceDetKcp`` with and
-    without a context, the byte queries) raises on every rank the same ``NotImplementedError`` with the same message,
-    and a view with a bad head stride the same ``ValueError``; the ranks then meet in one all-gather, so no rank
-    entered a collective alone (no hang)."""
+    without a context, the byte queries, a forward on a misaligned q view, misaligned on the ranks with tokens only)
+    raises on every rank the same ``NotImplementedError`` with the same message, and past the capability check a
+    view with a bad head stride the same ``ValueError``; the ranks then meet in one all-gather, so no rank entered a
+    collective alone (no hang)."""
     if not dist.is_available() or not dist.is_gloo_available():
         pytest.skip("torch.distributed with the gloo backend required")
     with tempfile.TemporaryDirectory(prefix="cake_kcp_l2n_refusal_") as tmp:
