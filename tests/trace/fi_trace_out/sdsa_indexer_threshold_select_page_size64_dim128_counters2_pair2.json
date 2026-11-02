@@ -175,6 +175,7 @@
         "rows"
       ],
       "dtype": "int32",
+      "optional": true,
       "param": "ranges"
     },
     "counters": {

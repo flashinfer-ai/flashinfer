@@ -78,7 +78,9 @@ indexer_threshold_select_trace = TraceTemplate(
     },
     outputs={
         "thresholds": Tensor(["rows"], dtype="float32", param="thresholds"),
-        "ranges": Tensor(["range", "rows"], dtype="int32", param="ranges"),
+        "ranges": Tensor(
+            ["range", "rows"], dtype="int32", param="ranges", optional=True
+        ),
         "counters": Tensor(["rows", "counters"], dtype="int32", param="counters"),
         "candidates": Tensor(
             ["rows", "slots", "pair"], dtype="int32", param="candidates"
@@ -123,6 +125,7 @@ quantize_write_index_qk_nvfp4_trace = TraceTemplate(
         ),
         "key_scales": Tensor(
             ["pages", "page_size", "scales"],
+            dtype_from="key_scales",
             dtype="float8_e4m3fn",
             param="key_scales",
         ),
@@ -130,7 +133,10 @@ quantize_write_index_qk_nvfp4_trace = TraceTemplate(
             ["rows", "packed_dim"], dtype="uint8", param="packed_query"
         ),
         "query_scales": Tensor(
-            ["rows", "scales"], dtype="float8_e4m3fn", param="query_scales"
+            ["rows", "scales"],
+            dtype_from="query_scales",
+            dtype="float8_e4m3fn",
+            param="query_scales",
         ),
     },
     tags=["arch:sm100", "arch:sm103"],
