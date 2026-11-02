@@ -1,4 +1,5 @@
 import gc
+import importlib
 import json
 import random
 import tracemalloc
@@ -1490,7 +1491,7 @@ def test_cold_l2_policy_reprofiles_legacy_hot_cache(monkeypatch):
 
     assert seen_policies == [
         ("cuda_graph_profile_replays", 1, "l2_cache_policy", "hot"),
-        ("cuda_graph_profile_replays", 1, "l2_cache_policy", "cold"),
+        ("cuda_graph_profile_replays", 1, "l2_cache_policy", "cold-read"),
     ]
 
 
@@ -1515,16 +1516,16 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
         cuda_graph_profile_replays=2,
     )
     allocations = []
-    original_empty = torch.empty
+    implementation = importlib.import_module("flashinfer.autotuner.autotuner")
+    original_make = implementation._make_l2_flush_buffer
 
-    def tracked_empty(*args, **kwargs):
-        result = original_empty(*args, **kwargs)
-        if kwargs.get("dtype") == torch.int8:
-            allocations.append((result.numel(), result.device))
+    def tracked_make(num_bytes, device):
+        result = original_make(num_bytes, device)
+        allocations.append((result.numel() * result.element_size(), result.device))
         return result
 
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id: 4096)
-    monkeypatch.setattr(torch, "empty", tracked_empty)
+    monkeypatch.setattr(implementation, "_make_l2_flush_buffer", tracked_make)
     monkeypatch.setattr(
         "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
     )
@@ -1642,11 +1643,11 @@ def test_cold_chain_profiling_policy_labels():
         cold_chain_launches=8,
         profile_arena_input_indices=(0,),
     )
-    assert l2_policy(chain) == "cold-chain:8"
-    assert l2_policy(replace(chain, profile_arena_input_indices=())) == "cold"
+    assert l2_policy(chain) == "cold-read-chain:8"
+    assert l2_policy(replace(chain, profile_arena_input_indices=())) == "cold-read"
     assert l2_policy(replace(chain, use_cold_l2_cache=False)) == "hot"
-    assert l2_policy(gemm_base._BF16_GEMM_SM100_TUNING_CONFIG) == "cold-chain:8"
-    assert l2_policy(gemm_base._MM_MXFP8_CUTE_DSL_TUNING_CONFIG) == "cold"
+    assert l2_policy(gemm_base._BF16_GEMM_SM100_TUNING_CONFIG) == "cold-read-chain:8"
+    assert l2_policy(gemm_base._MM_MXFP8_CUTE_DSL_TUNING_CONFIG) == "cold-read"
 
 
 def test_tuning_overrides_keep_cold_chain():

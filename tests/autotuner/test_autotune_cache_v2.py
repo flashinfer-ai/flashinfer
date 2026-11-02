@@ -1006,7 +1006,7 @@ def test_effective_profiling_policy_reuse(cache_root, monkeypatch, hydrate, inhe
         "cuda_graph_profile_replays",
         20,
         "l2_cache_policy",
-        "cold",
+        "cold-read",
     ]
     if hydrate == "lazy":
         del entry["key_fields"]
