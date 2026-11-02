@@ -182,15 +182,15 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (1152, 4096, "cake_rmsnorm_train_9a830956447d4e304914"),
             (4096, 4608, "cake_rmsnorm_train_35a0b0ca6b2060313255"),
             (4608, 36864, "cake_rmsnorm_train_15e157d2ee9080d206a9"),
-            (36864, 52736, "cake_rmsnorm_train_35a0b0ca6b2060313255"),
-            (52736, None, "cake_rmsnorm_train_15e157d2ee9080d206a9"),
+            (36864, 44032, "cake_rmsnorm_train_35a0b0ca6b2060313255"),
+            (44032, None, "cake_rmsnorm_train_15e157d2ee9080d206a9"),
         ),
         "bwd_w32_h4096": (
             (0, 1792, "cake_rmsnorm_train_8616070567821eaa3e35"),
             (1792, 3584, "cake_rmsnorm_train_0c84999caf2b86c2e09e"),
             (3584, 36864, "cake_rmsnorm_train_f7573bcb748c0784f3ec"),
-            (36864, 52736, "cake_rmsnorm_train_626aed743358c27513f1"),
-            (52736, None, "cake_rmsnorm_train_f7573bcb748c0784f3ec"),
+            (36864, 44032, "cake_rmsnorm_train_626aed743358c27513f1"),
+            (44032, None, "cake_rmsnorm_train_f7573bcb748c0784f3ec"),
         ),
         "bwd_h5120": (
             (0, 896, "cake_rmsnorm_train_080e0a6c3b18e9bad790"),
@@ -329,8 +329,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (4608, 5120, "cake_rmsnorm_train_195c4317b51bb4ea1137"),
             (5120, 12288, "cake_rmsnorm_train_a385ae1681a2c078344e"),
             (12288, 40960, "cake_rmsnorm_train_af005462cd6a301f31c4"),
-            (40960, 114688, "cake_rmsnorm_train_a385ae1681a2c078344e"),
-            (114688, 139264, "cake_rmsnorm_train_172a47a15d4c1a76c061"),
+            (40960, 93184, "cake_rmsnorm_train_a385ae1681a2c078344e"),
+            (93184, 139264, "cake_rmsnorm_train_172a47a15d4c1a76c061"),
             (139264, 1572864, "cake_rmsnorm_train_0291949ba535c646c3a8"),
             (1572864, None, "cake_rmsnorm_train_c18297d75c0d424978fd"),
         ),
@@ -339,8 +339,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (4608, 5120, "cake_rmsnorm_train_8de0131445eed6eeabb7"),
             (5120, 12288, "cake_rmsnorm_train_420788e663a2c3a810f6"),
             (12288, 40960, "cake_rmsnorm_train_b7d9577ff884de98ea06"),
-            (40960, 114688, "cake_rmsnorm_train_420788e663a2c3a810f6"),
-            (114688, 139264, "cake_rmsnorm_train_7c2aa4b429538da06a2a"),
+            (40960, 93184, "cake_rmsnorm_train_420788e663a2c3a810f6"),
+            (93184, 139264, "cake_rmsnorm_train_7c2aa4b429538da06a2a"),
             (139264, 1572864, "cake_rmsnorm_train_89505762fa1cbf33cb8f"),
             (1572864, None, "cake_rmsnorm_train_f788ef57163552825d27"),
         ),
@@ -710,13 +710,13 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (4096, "same"),
             (4608, "same"),
             (36864, "same"),
-            (52736, "unmeasured"),
+            (44032, "unmeasured"),
         ),
         "bwd_w32_h4096": (
             (1792, "same"),
             (3584, "same"),
             (36864, "same"),
-            (52736, "unmeasured"),
+            (44032, "unmeasured"),
         ),
         "bwd_h5120": ((896, "same"), (6144, "same"), (65536, "same")),
         "bwd_w32_h5120": ((256, "same"), (6144, "same"), (65536, "same")),
@@ -765,7 +765,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (5120, "same"),
             (12288, "same"),
             (40960, "same"),
-            (114688, "unmeasured"),
+            (93184, "unmeasured"),
             (139264, "unmeasured"),
             (1572864, "same"),
         ),
@@ -774,7 +774,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (5120, "same"),
             (12288, "same"),
             (40960, "same"),
-            (114688, "unmeasured"),
+            (93184, "unmeasured"),
             (139264, "unmeasured"),
             (1572864, "same"),
         ),
@@ -1200,7 +1200,7 @@ scheduling-dependent order: its ``dw`` is not bitwise reproducible, even for a f
 ``T``.  The top window of ``bwd_h256`` on sm_100a and sm_107a, on sm_103a of
 ``bwd_h1536``, ``bwd_h2048``, ``bwd_h4096``, ``bwd_h5120``, ``bwd_h6144`` and
 ``bwd_residual_h6144`` and on sm_107a of ``bwd_h2048`` (and of their FP32-weight
-routes), and the sm_103a ``bwd_h256`` window from 114688 to 139264 rows, run a twosum
+routes), and the sm_103a ``bwd_h256`` window from 93184 to 139264 rows, run a twosum
 single kernel: each thread keeps its ``dw`` column sums exact (error-free FP32 products,
 TwoSum compensation) and adds them to the FP64 sums once, so the ``dw`` error does not
 grow with ``T``; its ``dw`` is not bitwise reproducible either.  A window marked
@@ -1212,7 +1212,7 @@ on sm_107a run the deterministic package's compensated programs (compensated per
 qualified range, on sm_100a, up to T 61952 on sm_103a and up to T 49152 on sm_107a,
 the single kernel above.  On sm_103a ``bwd_h256`` (both weight dtypes) the windows
 above 5120 rows run the deterministic package's pairs in its own windows, except from
-114688 to 139264 rows, where the twosum single kernel runs, for ``dw`` accuracy.  On
+93184 to 139264 rows, where the twosum single kernel runs, for ``dw`` accuracy.  On
 sm_103a ``bwd_w32_h512`` runs from T 960 to 32768 the det pair the deterministic
 package runs from T 4096, for ``dw`` accuracy.
 """
@@ -1236,7 +1236,7 @@ scheduling-dependent order: its ``dw`` is not bitwise reproducible, even for a f
 ``T``.  The top window of ``bwd_h256`` on sm_100a and sm_107a, on sm_103a of
 ``bwd_h1536``, ``bwd_h2048``, ``bwd_h4096``, ``bwd_h5120``, ``bwd_h6144`` and
 ``bwd_residual_h6144`` and on sm_107a of ``bwd_h2048`` (and of their FP32-weight
-routes), and the sm_103a ``bwd_h256`` window from 114688 to 139264 rows, run a twosum
+routes), and the sm_103a ``bwd_h256`` window from 93184 to 139264 rows, run a twosum
 single kernel: each thread keeps its ``dw`` column sums exact (error-free FP32 products,
 TwoSum compensation) and adds them to the FP64 sums once, so the ``dw`` error does not
 grow with ``T``; its ``dw`` is not bitwise reproducible either.  A window marked
@@ -1248,7 +1248,7 @@ on sm_107a run the deterministic package's compensated programs (compensated per
 qualified range, on sm_100a, up to T 61952 on sm_103a and up to T 49152 on sm_107a,
 the single kernel above.  On sm_103a ``bwd_h256`` (both weight dtypes) the windows
 above 5120 rows run the deterministic package's pairs in its own windows, except from
-114688 to 139264 rows, where the twosum single kernel runs, for ``dw`` accuracy.  On
+93184 to 139264 rows, where the twosum single kernel runs, for ``dw`` accuracy.  On
 sm_103a ``bwd_w32_h512`` runs from T 960 to 32768 the det pair the deterministic
 package runs from T 4096, for ``dw`` accuracy.
 
@@ -1358,7 +1358,7 @@ scheduling-dependent order: its ``dw`` is not bitwise reproducible, even for a f
 ``T``.  The top window of ``bwd_h256`` on sm_100a and sm_107a, on sm_103a of
 ``bwd_h1536``, ``bwd_h2048``, ``bwd_h4096``, ``bwd_h5120``, ``bwd_h6144`` and
 ``bwd_residual_h6144`` and on sm_107a of ``bwd_h2048`` (and of their FP32-weight
-routes), and the sm_103a ``bwd_h256`` window from 114688 to 139264 rows, run a twosum
+routes), and the sm_103a ``bwd_h256`` window from 93184 to 139264 rows, run a twosum
 single kernel: each thread keeps its ``dw`` column sums exact (error-free FP32 products,
 TwoSum compensation) and adds them to the FP64 sums once, so the ``dw`` error does not
 grow with ``T``; its ``dw`` is not bitwise reproducible either.  A window marked
@@ -1370,7 +1370,7 @@ on sm_107a run the deterministic package's compensated programs (compensated per
 qualified range, on sm_100a, up to T 61952 on sm_103a and up to T 49152 on sm_107a,
 the single kernel above.  On sm_103a ``bwd_h256`` (both weight dtypes) the windows
 above 5120 rows run the deterministic package's pairs in its own windows, except from
-114688 to 139264 rows, where the twosum single kernel runs, for ``dw`` accuracy.  On
+93184 to 139264 rows, where the twosum single kernel runs, for ``dw`` accuracy.  On
 sm_103a ``bwd_w32_h512`` runs from T 960 to 32768 the det pair the deterministic
 package runs from T 4096, for ``dw`` accuracy.
 
@@ -1474,9 +1474,9 @@ Beside those, leave some SMs free of the resident kernel.
   (15403, 45056] ba7dbf6a = (45056, 58880] 7e6a0b63 (det pair) ? (58880, inf) ba7dbf6a
 * ``sm_100a`` ``bwd_h4096``: (0, 1152] 4822793e = (1152, 4096] 9a830956 (det pair) =
   (4096, 4608] 35a0b0ca (det pair) = (4608, 36864] 15e157d2 =
-  (36864, 52736] 35a0b0ca (det pair) ? (52736, inf) 15e157d2
+  (36864, 44032] 35a0b0ca (det pair) ? (44032, inf) 15e157d2
 * ``sm_100a`` ``bwd_w32_h4096``: (0, 1792] 86160705 = (1792, 3584] 0c84999c (det pair) =
-  (3584, 36864] f7573bcb = (36864, 52736] 626aed74 (det pair) ? (52736, inf) f7573bcb
+  (3584, 36864] f7573bcb = (36864, 44032] 626aed74 (det pair) ? (44032, inf) f7573bcb
 * ``sm_100a`` ``bwd_h5120``: (0, 896] 080e0a6c = (896, 6144] b482c84d (det pair) =
   (6144, 65536] c145ef19 (det pair) = (65536, inf) 2f05000c
 * ``sm_100a`` ``bwd_w32_h5120``: (0, 256] 6042554b (det pair) =
@@ -1489,7 +1489,7 @@ Beside those, leave some SMs free of the resident kernel.
   (3584, inf) a562656c
 * ``sm_103a`` ``bwd_h256``: (0, 4608] 5450d398 (det pair) = (4608, 5120] 195c4317 =
   (5120, 12288] a385ae16 (det pair) = (12288, 40960] af005462 (det pair) =
-  (40960, 114688] a385ae16 (det pair) ? (114688, 139264] 172a47a1 ?
+  (40960, 93184] a385ae16 (det pair) ? (93184, 139264] 172a47a1 ?
   (139264, 1572864] 0291949b (det pair) = (1572864, inf) c18297d7 (det pair)
 * ``sm_103a`` ``bwd_h512``: (0, 1024] 09601d42 (det pair) =
   (1024, 4096] 8e7f4d81 (det pair) = (4096, 32768] 274b0055 (det pair) =

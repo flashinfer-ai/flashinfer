@@ -722,7 +722,7 @@ DX_BITWISE_WITH = {
     "cake_rmsnorm_train_0fa4f255caf709d09f66": "cake_rmsnorm_det_train_ceeef043ac64f37fc529",
     # sm_100a H4096 column (0, 1152]; det module at T 257
     "cake_rmsnorm_train_4822793ea0c954c11af6": "cake_rmsnorm_det_train_59270fb249dcba1ff679",
-    # sm_100a H4096 help row (4608, 36864] and (52736, inf); det module at T 16385
+    # sm_100a H4096 help row (4608, 36864] and (44032, inf); det module at T 16385
     # and 65536
     "cake_rmsnorm_train_15e157d2ee9080d206a9": "cake_rmsnorm_det_train_35a0b0ca6b2060313255",
     # sm_100a H6144 column (0, 1152]; det module at T 257 (the help row differs)
