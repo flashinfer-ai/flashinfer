@@ -23,8 +23,8 @@ through the autograd wrapper under ``torch.utils.checkpoint`` (non-reentrant,
 early stop off so that every arm recomputes its forward), both gradients included.
 Opt-in autograd rows over the same distributions: ``step_es``, that step with
 checkpoint early stop on (the torch default: an arm whose inputs are saved
-before its GEMM launches, ``cake`` and ``torch._grouped_mm``, skips the
-recomputed forward); ``block`` / ``block_es``, one checkpointed MoE expert
+before its GEMM launches, ``cake_det``, ``cake`` and ``torch._grouped_mm``,
+skips the recomputed forward); ``block`` / ``block_es``, one checkpointed MoE expert
 block with early stop off / on -- gate_up, ``silu(a) * b`` on its two halves,
 down, with the gradients of ``x``, ``w1`` and ``w2`` -- in which only the
 recompute of the down GEMM can be skipped.  The rate of these rows counts the
@@ -263,9 +263,9 @@ def _step(autograd_fn, t, early_stop=False):
     Early stop off (the ``step`` rows): every arm recomputes its forward GEMM,
     ``2 x forward + backward``.  On (the torch default, the ``step_es`` rows): the
     recompute stops once the region saved its last tensor, so an arm whose inputs are
-    saved before its GEMM launches (``torch._grouped_mm``, ``cake_grouped_mm``) does one
-    GEMM less, and one that launches inside ``Function.forward`` (``cake_det``,
-    ``cake_inforward``) still recomputes it."""
+    saved before its GEMM launches (``torch._grouped_mm``, ``cake_grouped_det_mm``,
+    ``cake_grouped_mm``) does one GEMM less, and one that launches inside
+    ``Function.forward`` (``cake_inforward``) still recomputes it."""
     return _checkpointed(autograd_fn, t, ("x", "w"), early_stop)
 
 
