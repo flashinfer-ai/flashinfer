@@ -1312,7 +1312,10 @@ _DTYPE = {
         out_dtype=torch.bfloat16,
         # A 160-seed GB200 (SM100) sweep exercised 17 MxInt4 cases; seed 18
         # requires atol_frac ~= 0.062 after the relative-tolerance contribution.
-        # Keep a small SM100-calibrated margin; SM103/SM107 remain uncalibrated.
+        # Keep a small SM100-calibrated margin. On B300 (SM103), the 93 finalized
+        # MxInt4 cases among the curated seeds and seeds 0-959 need at most
+        # 0.049 (seed 18: 0.028), so the same value holds there; SM107 gets its
+        # own floor in the comparison below.
         atol_frac=0.065,
         rtol=0.3,
     ),
@@ -1586,6 +1589,10 @@ _FROMLOGITS_MAX_EXPERTS = {
     RoutingMethodType.SigmoidRenorm: 256,
     RoutingMethodType.Llama4: 128,
 }
+# The in-kernel DeepSeekV3 router scores each expert group with one warp, so with
+# n_group > 1 a FromLogits config may put at most 32 experts in a group
+# (csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu).
+_FROMLOGITS_DSV3_MAX_EXPERTS_PER_GROUP = 32
 # Routing logits dtype axis: fp32 router logits are the #2796 class; bf16 is the common case.
 _LOGITS_DTYPE = {"bf16": torch.bfloat16, "fp32": torch.float32}
 
@@ -1764,6 +1771,23 @@ def _gen(seed):
         # topk_group<=min(4,n_group); top_k < topk_group*ne/n_group (experts reachable after the
         # group mask) and <= local. ne is always %4==0 (every _EXPERTS entry is).
         n_group = rng.choice([g for g in (1, 2, 4, 8) if g < ne and ne % g == 0])
+        if (
+            fromlogits
+            and n_group > 1
+            and ne // n_group > _FROMLOGITS_DSV3_MAX_EXPERTS_PER_GROUP
+        ):
+            # Take the smallest group count the in-kernel router accepts, or no
+            # grouping if none fits. Only configs that would fail its launch check
+            # change, so the stream locked by test_random_seed_stream_is_unchanged
+            # stays the same.
+            n_group = next(
+                (
+                    g
+                    for g in (2, 4, 8)
+                    if ne % g == 0 and ne // g <= _FROMLOGITS_DSV3_MAX_EXPERTS_PER_GROUP
+                ),
+                1,
+            )
         topk_group = rng.randint(1, min(4, n_group))
         reachable = topk_group * ne // n_group
         valid_k = [t for t in _TOPK if t < reachable and t <= local]
@@ -2394,6 +2418,21 @@ def test_random_seed_stream_is_unchanged():
         hashlib.sha256(payload).hexdigest()
         == "14cf80f6bc0bf77170acc447d4b80603dafdea02eef4fe07f567cdab7b0d6242"
     )
+
+
+def test_fromlogits_deepseek_v3_groups_fit_the_in_kernel_router():
+    """Seeds past the default 160 used to draw FromLogits DeepSeekV3 groups the
+    router rejects at launch (seed 293: 160 experts in 4 groups)."""
+    for seed in range(2000):
+        cfg = _gen(seed)
+        if (
+            cfg.is_fromlogits
+            and cfg.routing_method == RoutingMethodType.DeepSeekV3
+            and cfg.n_group > 1
+        ):
+            assert (
+                cfg.num_experts // cfg.n_group <= _FROMLOGITS_DSV3_MAX_EXPERTS_PER_GROUP
+            ), cfg.label
 
 
 def test_contract_handler_inventory_is_single_backend_and_non_deterministic():
