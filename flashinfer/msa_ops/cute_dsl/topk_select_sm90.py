@@ -916,6 +916,14 @@ def _topk_kernel(
     # the score width is max_model_len's tile count while a token's extent is
     # its own: reading the -inf tail cost 3-4x the kernel at 8k context.
     Te = nvp_c
+    if cutlass.const_expr(FILTER and MASK):
+        # The compactor votes once per group, so its trip count n must be
+        # warp-uniform, or the vote deadlocks.  A warp is 32 adjacent tokens
+        # of one tile group, and a prefix that is not page-aligned puts a page
+        # boundary between them.  The warp's widest extent is still exact:
+        # tiles past a lane's own nvp_c load as NEG_BIG.
+        for _d in cutlass.range_constexpr(5):
+            Te = max(Te, cute.arch.shuffle_sync_bfly(Te, offset=16 >> _d, mask=FULL))
 
     # Tile group w owns t = t00 + j*step, j = 0 .. n-1.
     if cutlass.const_expr(DENSE):

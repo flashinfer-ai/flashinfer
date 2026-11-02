@@ -564,6 +564,33 @@ def test_topk_select_wide_score_buffer_matches_reference(batch):
 
 
 @sm90_only
+@pytest.mark.parametrize("prefix", [642539, 642560])
+def test_topk_select_long_chunk_unaligned_prefix(sm90_regression_backend, prefix):
+    """A chunked-prefill step whose prefix is not page-aligned: 32 adjacent
+    tokens straddle a page boundary, so a CTA's columns disagree on
+    num_valid_pages.  The CuTe threshold compactor used to hang on it, since
+    its per-group vote needs a warp-uniform trip count.  The aligned prefix
+    is the control."""
+    nq = 8124
+    tiles = -(-(prefix + nq) // BLK_KV)
+    g = torch.Generator(device="cuda").manual_seed(prefix)
+    pos = torch.arange(prefix, prefix + nq, device="cuda")
+    nvp = (pos // BLK_KV + 1).to(torch.int32)
+    valid = torch.arange(tiles, device="cuda")[:, None] < nvp[None, :]
+    scores = torch.randn(1, tiles, nq, generator=g, device="cuda")
+    scores = scores.masked_fill(~valid[None], float("-inf"))
+    out = msa_topk_select(
+        scores, TOPK, num_valid_pages=nvp, force_begin_blocks=0, force_end_blocks=1
+    )
+    # Every token has thousands of valid pages, so the reference is the
+    # forced last page plus the top 15 of the rest, ascending.
+    ref = scores[0].T.clone()
+    ref[torch.arange(nq, device="cuda"), nvp.long() - 1] = float("inf")
+    ref = torch.topk(ref, TOPK, dim=1).indices.sort(dim=1).values.to(torch.int32)
+    assert torch.equal(out[:, 0], ref)
+
+
+@sm90_only
 def test_topk_select_matches_reference_with_valid_pages_and_forced_blocks():
     """Per-token num_valid_pages clamps the candidates; forced sink / window
     blocks are selected regardless of their scores."""
