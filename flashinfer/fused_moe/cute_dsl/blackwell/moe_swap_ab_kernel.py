@@ -41,6 +41,7 @@ uses the tactic width while each MMA descriptor rounds the live routed-token
 count to 16 columns.
 """
 
+from copy import copy
 from math import lcm
 from typing import Optional
 
@@ -628,7 +629,7 @@ class Sm100BlockScaledMoeEpilogue:
         self.transpose_barrier = pipeline.NamedBarrier(6, 128)
 
     @cute.jit
-    def _activate(self, up, gate, alpha, clamped_relu2_params=None):
+    def _activate(self, up, gate, alpha):
         result = cute.make_rmem_tensor((16,), cutlass.Float32)
         for i in cutlass.range_constexpr(0, 16, 2):
             u = cute.arch.mul_packed_f32x2((up[i], up[i + 1]), (alpha, alpha))
@@ -636,7 +637,8 @@ class Sm100BlockScaledMoeEpilogue:
                 if cutlass.const_expr(
                     self.activation_type == ActivationType.ClampedRelu2.value
                 ):
-                    limit, inv_limit = clamped_relu2_params
+                    limit = self.clamped_relu2_limit
+                    inv_limit = self.clamped_relu2_inv_limit
                     u = cute.arch.mul_packed_f32x2(u, (inv_limit, inv_limit))
                     u = cute.arch.mul_packed_f32x2(
                         (
@@ -854,7 +856,6 @@ class Sm100BlockScaledMoeEpilogue:
         output_sf_tensor,
         alpha,
         norm_const,
-        clamped_relu2_params,
         per_token_scale,
         token_mapping,
         channel_start,
@@ -982,8 +983,8 @@ class Sm100BlockScaledMoeEpilogue:
                     output_row = fc2_output_row
                     scale = fc2_scale
             if cutlass.const_expr(self.nongated):
-                top = self._activate(top, None, scale, clamped_relu2_params)
-                bottom = self._activate(bottom, None, scale, clamped_relu2_params)
+                top = self._activate(top, None, scale)
+                bottom = self._activate(bottom, None, scale)
             elif cutlass.const_expr(self.activation_type is None):
                 for i in cutlass.range_constexpr(0, 16, 2):
                     top[i], top[i + 1] = cute.arch.mul_packed_f32x2(
@@ -1034,7 +1035,6 @@ class Sm100BlockScaledMoeEpilogue:
         output_sf_tensor,
         alpha,
         norm_const,
-        clamped_relu2_params,
         per_token_scale,
         token_mapping,
         channel_start,
@@ -1069,7 +1069,6 @@ class Sm100BlockScaledMoeEpilogue:
                     output_sf_tensor,
                     alpha,
                     norm_const,
-                    clamped_relu2_params,
                     per_token_scale,
                     token_mapping,
                     channel_start + channel_tile * channel_stride,
@@ -1299,7 +1298,6 @@ class Sm100BlockScaledMoeEpilogue:
                             None,
                             alpha,
                             None,
-                            None,
                             per_token_scale,
                             token_mapping,
                             channel_start,
@@ -1339,7 +1337,6 @@ class Sm100BlockScaledMoeEpilogue:
         output_sf_tensor,
         alpha,
         norm_const,
-        clamped_relu2_params,
         per_token_scale,
         token_mapping,
         token_final_scales,
@@ -1404,7 +1401,6 @@ class Sm100BlockScaledMoeEpilogue:
                         output_sf_tensor,
                         alpha,
                         norm_const,
-                        None,
                         per_token_scale,
                         token_mapping,
                         channel_start,
@@ -1435,7 +1431,6 @@ class Sm100BlockScaledMoeEpilogue:
                         output_sf_tensor,
                         alpha,
                         norm_const,
-                        clamped_relu2_params,
                         per_token_scale,
                         token_mapping,
                         channel_start,
@@ -3334,14 +3329,16 @@ class Sm100BlockScaledGroupedGemmKernel:
             norm = cutlass.Float32(1.0)
             if cutlass.const_expr(norm_const is not None):
                 norm = norm_const[0]
-            # Read the runtime clamp after the PDL wait, once per epilogue
-            # thread and outside the persistent tile loop.
-            clamped_relu2_params = None
+            # Keep runtime activation state local to this kernel compilation.
+            epilogue = copy(self.epilogue)
             if cutlass.const_expr(
-                self.epilogue.activation_type == ActivationType.ClampedRelu2.value
+                epilogue.activation_type == ActivationType.ClampedRelu2.value
             ):
-                limit = clamped_relu2_limit[0]
-                clamped_relu2_params = (limit, cutlass.Float32(1.0) / limit)
+                # The PDL wait precedes this load; both values are tile-invariant.
+                epilogue.clamped_relu2_limit = clamped_relu2_limit[0]
+                epilogue.clamped_relu2_inv_limit = (
+                    cutlass.Float32(1.0) / epilogue.clamped_relu2_limit
+                )
             consumer = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.acc_stages
             )
@@ -3381,13 +3378,12 @@ class Sm100BlockScaledGroupedGemmKernel:
                         ),
                         acc_layout,
                     )
-                    self.epilogue.run_overlapping_fc1(
+                    epilogue.run_overlapping_fc1(
                         epi_accumulator,
                         output,
                         output_sf,
                         alpha[expert],
                         norm,
-                        clamped_relu2_params,
                         per_token_scale,
                         token_mapping,
                         channel_start,
@@ -3415,13 +3411,12 @@ class Sm100BlockScaledGroupedGemmKernel:
                             ),
                             acc_layout,
                         )
-                        self.epilogue.run(
+                        epilogue.run(
                             epi_accumulator,
                             output,
                             output_sf,
                             alpha[expert],
                             norm,
-                            clamped_relu2_params,
                             per_token_scale,
                             token_mapping,
                             token_final_scales,
