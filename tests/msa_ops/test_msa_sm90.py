@@ -1728,7 +1728,8 @@ def test_cute_prefill_single_masks_blocks_past_the_extent(monkeypatch):
     fp8 single-token schedule transposes V only below that extent, so such a
     block must not read its never-written transpose page: the transpose's
     memory is poisoned with fp8 NaN here, which 0 * NaN would carry through
-    the causal mask into the output."""
+    the causal mask into the output.  A token left with no live block must
+    skip the mainloop rather than run it on block -1."""
     from flashinfer.msa_ops import cake_hopper_sm90
 
     monkeypatch.setattr(
@@ -1789,6 +1790,16 @@ def test_cute_prefill_single_masks_blocks_past_the_extent(monkeypatch):
     out = run(idx)
     assert torch.isfinite(out.float()).all(), "an untransposed V page reached the PV"
     assert torch.equal(out, run(clean))
+
+    # A token left with no live block -- every entry -1, or only blocks past
+    # the extent -- attends nothing: its output is zero, the others unchanged.
+    none = idx.clone()
+    none[0, :16] = -1
+    none[0, 8:16, :2] = past.to(torch.int32)
+    out_none = run(none)
+    assert torch.isfinite(out_none.float()).all()
+    assert not out_none[:16].any()
+    assert torch.equal(out_none[16:], out[16:])
 
 
 @sm90_only

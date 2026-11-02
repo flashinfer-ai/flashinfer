@@ -974,9 +974,12 @@ class MsaSparseAttnFp8:
             tVs,
             hkv,
         )
-        for j in cutlass.range(nblk - 1, unroll=1):
-            _blk(True, j, qk_mma, pv_mma, *args)
-        _blk(False, nblk - 1, qk_mma2, pv_mma2, *args)
+        # A token with no live block (all -1, or all past the extent) issued no
+        # TMA above: skip the mainloop and write zeros.
+        if nblk > 0:
+            for j in cutlass.range(nblk - 1, unroll=1):
+                _blk(True, j, qk_mma, pv_mma, *args)
+            _blk(False, nblk - 1, qk_mma2, pv_mma2, *args)
 
         for i in cutlass.range_constexpr(2):
             l_i[i] = cute.arch.warp_reduction_sum(l_i[i], threads_in_group=4)
