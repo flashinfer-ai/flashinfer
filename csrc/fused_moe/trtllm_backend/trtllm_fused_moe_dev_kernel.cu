@@ -20,6 +20,8 @@
 #include <cutlass/numeric_types.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
@@ -41,6 +43,23 @@ __host__ __device__ constexpr static U arrayConvert(T const& input) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace moe::dev {
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// A/B switch for the rewritten glue kernels (activationDeepSeekKernelV2, finalizeKernelV2):
+// FLASHINFER_MOE_GLUE_V1=1 restores the previous kernel selection. Read once per process.
+// Temporary: to be removed with the old kernels once the end-to-end comparison is done.
+inline bool useLegacyGlueKernels() {
+  static bool const legacy = [] {
+    char const* v = std::getenv("FLASHINFER_MOE_GLUE_V1");
+    return v != nullptr && v[0] == '1';
+  }();
+  return legacy;
+}
+
+inline bool isAligned16(void const* ptr) {
+  return (reinterpret_cast<std::uintptr_t>(ptr) & 15u) == 0;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -375,6 +394,217 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Row-parallel DeepSeek FP8 activation: SwiGLU on the FC1 output and re-quantization to e4m3 with
+// one fp32 scale per 128 columns.
+//
+// activationDeepSeekKernel above walks (token, top-k slot) pairs: one byte per thread per load, a
+// cub block reduce and three barriers per slot, and under expert parallelism most slots are not on
+// this GPU (expandedIdxToPermutedIdx == -1) yet still cost the reduce. This kernel walks the
+// permuted rows instead (the local pairs plus the tile padding, 1/EP of the pairs): a group of
+// kThreadsPerSfBlock lanes owns one 128-column scale block of one row, each lane 16 consecutive
+// bytes of it (one 16-byte load from the linear half, one from the gate half, one 16-byte store),
+// and the block amax is a register max followed by log2(kThreadsPerSfBlock) shuffles. No shared
+// memory, no block barrier, and the grid is sized by the row count instead of numTokens x topK.
+//
+// Numerics are those of activationDeepSeekKernel, operation for operation: x = scale * float(e4m3),
+// silu(x2) * x1 (gatedSilu with the OAI controls), scale = max(amax / 448, FLT_MIN) and
+// e4m3(out / scale) with the saturating round-to-nearest-even conversion. Every row the old kernel
+// wrote gets the same bytes. Padding rows inside an expert's last tile (permutedIdxToTokenIdx ==
+// -1), which the old kernel left with stale bytes, get zeros and the FLT_MIN scale: GEMM2 reads
+// them as tile rows but nobody reads its result rows, and a defined buffer is cheaper to reason
+// about. Rows at or past *totalNumPaddedTokens are not touched.
+
+constexpr int DEEP_SEEK_ACTIVATION_V2_THREADS_PER_CTA = 128;
+constexpr int DEEP_SEEK_ACTIVATION_V2_NUM_ELTS_PER_SF = 128;
+// Grid cap: one resident wave at 128 threads and up to 64 registers per thread, so the CTAs that
+// find their row past the live count never wait for a slot.
+constexpr int DEEP_SEEK_ACTIVATION_V2_MAX_CTAS_PER_SM = 8;
+
+// Loads one lane's 16 bytes of the linear half and of the gate half of permuted row `row`, column
+// block `colBlock`, and the two block scales.
+template <typename Type>
+__device__ __forceinline__ void loadDeepSeekActivationInputs(
+    Type const* inPtr, float const* inDqSfsPtr, int row, int colBlock, int col, int innerDim,
+    int outDim, int totalNumPaddedTokens, int numSfBlocksPerRow, uint4& x1Raw, uint4& x2Raw,
+    float& scale1, float& scale2) {
+  // Use int64_t to avoid overflow when row * innerDim > INT32_MAX
+  int64_t const rowBase = (int64_t)row * innerDim;
+  // The linear term is the first half of the FC1 row, the gate the second half; the gate's scale
+  // blocks follow the linear ones in the column-block-major scale tensor.
+  x1Raw = *reinterpret_cast<uint4 const*>(inPtr + rowBase + col);
+  x2Raw = *reinterpret_cast<uint4 const*>(inPtr + rowBase + outDim + col);
+  scale1 = inDqSfsPtr[(int64_t)row + (int64_t)totalNumPaddedTokens * colBlock];
+  scale2 =
+      inDqSfsPtr[(int64_t)row + (int64_t)totalNumPaddedTokens * (colBlock + numSfBlocksPerRow)];
+}
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(DEEP_SEEK_ACTIVATION_V2_THREADS_PER_CTA)
+    activationDeepSeekKernelV2(KernelParams params) {
+  using Type = typename KernelParams::Type;
+  // 16 bytes per lane per load / store.
+  constexpr int kEltsPerVec = 16 / sizeof(Type);
+  constexpr int kThreadsPerSfBlock = DEEP_SEEK_ACTIVATION_V2_NUM_ELTS_PER_SF / kEltsPerVec;
+  constexpr int kSfBlocksPerCta = DEEP_SEEK_ACTIVATION_V2_THREADS_PER_CTA / kThreadsPerSfBlock;
+  static_assert(kThreadsPerSfBlock >= 1 && kThreadsPerSfBlock <= 32 &&
+                    (kThreadsPerSfBlock & (kThreadsPerSfBlock - 1)) == 0,
+                "a scale block must map to a power-of-two number of lanes within one warp");
+  static_assert(kEltsPerVec * sizeof(Type) == 16, "a lane owns one 16-byte vector");
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // immediately trigger the secondary kernel when using PDL, then wait on primary
+  if constexpr (KernelParams::UsePdl) {
+    cudaTriggerProgrammaticLaunchCompletion();
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  // The largest (finite) value that can be represented using E4m3.
+  float constexpr E4m3MaxVal{448.f};
+
+  int const outDim = params.innerDim / 2;
+  int const numSfBlocksPerRow = outDim / DEEP_SEEK_ACTIVATION_V2_NUM_ELTS_PER_SF;
+  int const totalMaxPaddedTokens = params.totalMaxPaddedTokens;
+  int const groupIdx = threadIdx.x / kThreadsPerSfBlock;
+  int const laneInGroup = threadIdx.x % kThreadsPerSfBlock;
+  // Lanes of this scale-block group: the shuffles below only involve them, because groups of one
+  // warp can sit in different rows and leave the loop at different times.
+  unsigned const groupMask =
+      kThreadsPerSfBlock == 32
+          ? 0xffffffffu
+          : ((1u << kThreadsPerSfBlock) - 1u)
+                << ((threadIdx.x % 32) / kThreadsPerSfBlock * kThreadsPerSfBlock);
+
+  // CTA index -> (row, column block). A CTA covers kSfBlocksPerCta scale blocks: whole rows when
+  // a row has at most that many (rowsPerCta of them; the surplus groups idle when the row count
+  // does not divide), otherwise a kSfBlocksPerCta-wide slice of one row (ctasPerRow CTAs per row;
+  // the surplus groups of the last slice idle). All 32-bit: a 64-bit division by a runtime value
+  // costs more than a memory round trip at decode sizes.
+  bool const wholeRows = numSfBlocksPerRow <= kSfBlocksPerCta;
+  int const rowsPerCta = wholeRows ? kSfBlocksPerCta / numSfBlocksPerRow : 1;
+  int const ctasPerRow =
+      wholeRows ? 1 : (numSfBlocksPerRow + kSfBlocksPerCta - 1) / kSfBlocksPerCta;
+  int const localRow = groupIdx / numSfBlocksPerRow;  // 0 for sliced rows
+  int const localColBlock = groupIdx - localRow * numSfBlocksPerRow;
+  if (localRow >= rowsPerCta) {
+    return;  // idle group; uniform within the group, and nothing below synchronizes the CTA
+  }
+  int const ctaStride = gridDim.x;
+
+  // Software pipeline over this CTA's rows: the token index is fetched two rows ahead, the data
+  // one row ahead, so each row costs one memory round trip at most and the first row two (the live
+  // count and the first two token indices go out together, then the first row's data).
+  int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
+  int cta0 = blockIdx.x;
+  int row0 = (cta0 / ctasPerRow) * rowsPerCta + localRow;
+  int colBlock0 = (cta0 % ctasPerRow) * kSfBlocksPerCta + localColBlock;
+  int cta1 = cta0 + ctaStride;
+  int row1 = (cta1 / ctasPerRow) * rowsPerCta + localRow;
+  int colBlock1 = (cta1 % ctasPerRow) * kSfBlocksPerCta + localColBlock;
+  // permutedIdxToTokenIdx has totalMaxPaddedTokens + 1 entries: any row < totalMaxPaddedTokens is
+  // in bounds, live or not.
+  int tokenIdx0 = row0 < totalMaxPaddedTokens ? params.permutedIdxToTokenIdx[row0] : -1;
+  int tokenIdx1 = row1 < totalMaxPaddedTokens ? params.permutedIdxToTokenIdx[row1] : -1;
+  uint4 x1Raw = make_uint4(0u, 0u, 0u, 0u);
+  uint4 x2Raw = make_uint4(0u, 0u, 0u, 0u);
+  float scale1 = 0.0f;
+  float scale2 = 0.0f;
+  if (row0 < totalNumPaddedTokens && colBlock0 < numSfBlocksPerRow && tokenIdx0 != -1) {
+    loadDeepSeekActivationInputs<Type>(
+        params.inPtr, params.inDqSfsPtr, row0, colBlock0,
+        colBlock0 * DEEP_SEEK_ACTIVATION_V2_NUM_ELTS_PER_SF + laneInGroup * kEltsPerVec,
+        params.innerDim, outDim, totalNumPaddedTokens, numSfBlocksPerRow, x1Raw, x2Raw, scale1,
+        scale2);
+  }
+
+  // Rows grow with the CTA index, so once this group's row is past the live count all later ones
+  // are too.
+  while (row0 < totalNumPaddedTokens) {
+    // Prefetch: token index two rows ahead, data one row ahead.
+    int const cta2 = cta1 + ctaStride;
+    int const row2 = (cta2 / ctasPerRow) * rowsPerCta + localRow;
+    int const colBlock2 = (cta2 % ctasPerRow) * kSfBlocksPerCta + localColBlock;
+    int const tokenIdx2 = row2 < totalMaxPaddedTokens ? params.permutedIdxToTokenIdx[row2] : -1;
+    uint4 x1Next = make_uint4(0u, 0u, 0u, 0u);
+    uint4 x2Next = make_uint4(0u, 0u, 0u, 0u);
+    float scale1Next = 0.0f;
+    float scale2Next = 0.0f;
+    if (row1 < totalNumPaddedTokens && colBlock1 < numSfBlocksPerRow && tokenIdx1 != -1) {
+      loadDeepSeekActivationInputs<Type>(
+          params.inPtr, params.inDqSfsPtr, row1, colBlock1,
+          colBlock1 * DEEP_SEEK_ACTIVATION_V2_NUM_ELTS_PER_SF + laneInGroup * kEltsPerVec,
+          params.innerDim, outDim, totalNumPaddedTokens, numSfBlocksPerRow, x1Next, x2Next,
+          scale1Next, scale2Next);
+    }
+
+    if (colBlock0 < numSfBlocksPerRow) {
+      bool const isPadding = tokenIdx0 == -1;
+      Type const* x1Vec = reinterpret_cast<Type const*>(&x1Raw);
+      Type const* x2Vec = reinterpret_cast<Type const*>(&x2Raw);
+      float out[kEltsPerVec];
+      float aMax = 0.0f;
+#pragma unroll
+      for (int i = 0; i < kEltsPerVec; ++i) {
+        float const x1 = scale1 * static_cast<float>(x1Vec[i]);
+        float const x2 = scale2 * static_cast<float>(x2Vec[i]);
+        // Padding rows carry zeros; skip the per-expert lookup for them as the old kernel does.
+        out[i] = isPadding ? silu(x2) * x1 : gatedSilu(params, row0, x1, x2);
+        aMax = fmaxf(aMax, fabsf(out[i]));
+      }
+#pragma unroll
+      for (int offset = kThreadsPerSfBlock / 2; offset > 0; offset /= 2) {
+        aMax = fmaxf(aMax, __shfl_xor_sync(groupMask, aMax, offset));
+      }
+      // Make sure the scale is strictly positive to avoid division by zero in case the maximum is
+      // zero.
+      float const scaleOut = fmaxf(aMax / E4m3MaxVal, std::numeric_limits<float>::min());
+      uint4 outRaw;
+      Type* outVec = reinterpret_cast<Type*>(&outRaw);
+#pragma unroll
+      for (int i = 0; i < kEltsPerVec; ++i) {
+        outVec[i] = static_cast<Type>(out[i] / scaleOut);
+      }
+      int const col =
+          colBlock0 * DEEP_SEEK_ACTIVATION_V2_NUM_ELTS_PER_SF + laneInGroup * kEltsPerVec;
+      *reinterpret_cast<uint4*>(params.outPtr + (int64_t)row0 * outDim + col) = outRaw;
+      if (laneInGroup == 0) {
+        params.outDqSfsPtr[(int64_t)row0 + (int64_t)totalNumPaddedTokens * colBlock0] = scaleOut;
+      }
+    }
+
+    cta0 = cta1;
+    row0 = row1;
+    colBlock0 = colBlock1;
+    tokenIdx0 = tokenIdx1;
+    x1Raw = x1Next;
+    x2Raw = x2Next;
+    scale1 = scale1Next;
+    scale2 = scale2Next;
+    cta1 = cta2;
+    row1 = row2;
+    colBlock1 = colBlock2;
+    tokenIdx1 = tokenIdx2;
+  }
+}
+
+// Launches the row-parallel activation with NumTokensPerCta fixed to 1 (the parameter is unused
+// there), i.e. one instantiation per element type and PDL mode.
+#define LAUNCH_ACTIVATION_V2(data, kernel, numBlocks, numThreads, smemSize, stream)              \
+  if (data.mDtypeElt == tg::Dtype::Fp16) {                                                       \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::half_t, 1), kernel, numBlocks, numThreads,       \
+               smemSize, stream);                                                                \
+  } else if (data.mDtypeElt == tg::Dtype::E4m3) {                                                \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::float_e4m3_t, 1), kernel, numBlocks, numThreads, \
+               smemSize, stream);                                                                \
+  } else if (data.mDtypeElt == tg::Dtype::Bfloat16) {                                            \
+    LAUNCH_PDL(data, false, LAUNCH_ESC(cutlass::bfloat16_t, 1), kernel, numBlocks, numThreads,   \
+               smemSize, stream);                                                                \
+  } else {                                                                                       \
+    FLASHINFER_WARN("Unsupported dtypeElt");                                                     \
+  }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void run(Data const& data, void* stream) {
   if (data.mDtypeElt == tg::Dtype::E2m1) {
     // Note: this should be unreachable because the options are checked beforehand.
@@ -394,6 +624,37 @@ void run(Data const& data, void* stream) {
 
     // Output dimension is innerDim / 2, and each scale block is 128 elements
     int const outputDim = data.innerDim / 2;
+
+    // The row-parallel kernel needs the row -> token map and the row count (callers that build
+    // activation::Data without them, such as the standalone activation op, keep the old kernel),
+    // whole 128-column scale blocks (the scale indexing of both kernels assumes it) and 16-byte
+    // aligned rows.
+    int const eltBytes = tg::dtypeGetNumBits(data.mDtypeElt) / 8;
+    bool const useRowParallel = !useLegacyGlueKernels() && data.permutedIdxToTokenIdx != nullptr &&
+                                data.totalMaxPaddedTokens > 0 && outputDim % NUM_ELTS_PER_SF == 0 &&
+                                (outputDim * eltBytes) % 16 == 0 && isAligned16(data.inPtr) &&
+                                isAligned16(data.outPtr);
+    if (useRowParallel) {
+      int const numSfBlocksPerRow = outputDim / NUM_ELTS_PER_SF;
+      int const sfBlocksPerCta = DEEP_SEEK_ACTIVATION_V2_THREADS_PER_CTA /
+                                 (NUM_ELTS_PER_SF / (16 / eltBytes));  // 16 for e4m3
+      // A CTA covers whole rows (sfBlocksPerCta / numSfBlocksPerRow of them) or, for rows wider
+      // than a CTA, one sfBlocksPerCta-wide slice of a row; see the kernel. The live row count is
+      // only known on the device, so the grid is sized by the allocation bound, capped at one
+      // resident wave, and the kernel grid-strides and stops at the live count.
+      int64_t const numCtasNeeded =
+          numSfBlocksPerRow <= sfBlocksPerCta
+              ? ((int64_t)data.totalMaxPaddedTokens + (sfBlocksPerCta / numSfBlocksPerRow) - 1) /
+                    (sfBlocksPerCta / numSfBlocksPerRow)
+              : (int64_t)data.totalMaxPaddedTokens *
+                    ((numSfBlocksPerRow + sfBlocksPerCta - 1) / sfBlocksPerCta);
+      int const numCtas = static_cast<int>(std::min<int64_t>(
+          numCtasNeeded, (int64_t)numSms * DEEP_SEEK_ACTIVATION_V2_MAX_CTAS_PER_SM));
+      LAUNCH_ACTIVATION_V2(data, activationDeepSeekKernelV2, dim3(numCtas),
+                           DEEP_SEEK_ACTIVATION_V2_THREADS_PER_CTA, 0, stream);
+      return;
+    }
+
     int const numScaleBlocks = (outputDim + NUM_ELTS_PER_SF - 1) / NUM_ELTS_PER_SF;
     int const gridSizeX = (numScaleBlocks + NUM_ELTS_PER_LOAD - 1) / NUM_ELTS_PER_LOAD;
 
@@ -1076,6 +1337,118 @@ __global__ void __launch_bounds__(SMALL_BATCH_FINALIZE_THREADS)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Finalize over a 2-D grid of (token, hidden-dim slice): CTA (blockIdx.x = token, blockIdx.y =
+// slice) of FINALIZE_V2_THREADS_PER_CTA threads owns one 16-byte vector of the output row per
+// thread. finalizeKernelVecLoad gives one CTA of 256 threads to a whole token, which at decode
+// batch sizes leaves most SMs idle and serializes the top-k loads of each thread behind its
+// accumulation; here every thread issues all of its top-k loads (in rounds of
+// FINALIZE_V2_LOADS_IN_FLIGHT) before it uses any of them, and the grid covers the GPU from a few
+// tokens on. The token's permuted indices and weights are read straight from global memory by
+// every thread (the same addresses for the whole CTA: one transaction per warp, L1 hits across
+// warps), so there is no shared memory and no barrier.
+//
+// Numerics are those of finalizeKernelVecLoad: fp32 accumulation in slot order k = 0 .. topK - 1
+// of weight_k * value_k (the second input, when present, is added to the value first), slots with
+// permutedIdx == -1 skipped, one conversion to the output type at the end; tokens without a local
+// slot store zeros.
+
+constexpr int FINALIZE_V2_THREADS_PER_CTA = 128;
+constexpr int FINALIZE_V2_LOADS_IN_FLIGHT = 8;
+// Largest grid, in CTAs per SM, for which this kernel is selected (about four resident waves).
+constexpr int FINALIZE_V2_MAX_CTAS_PER_SM = 32;
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(FINALIZE_V2_THREADS_PER_CTA)
+    finalizeKernelV2(KernelParams params) {
+  using Type = typename KernelParams::Type;
+  using TypeExpW = typename KernelParams::TypeExpW;
+  constexpr int ElemPerVec = 128 / cutlass::sizeof_bits<Type>::value;
+  using VecElem = cutlass::Array<Type, ElemPerVec>;
+  using ComputeElem = cutlass::Array<float, ElemPerVec>;
+
+  int64_t const tokenIdx = blockIdx.x;
+  int const vecIdx = blockIdx.y * FINALIZE_V2_THREADS_PER_CTA + threadIdx.x;
+  int const numVecs = params.hiddenDim / ElemPerVec;
+  int64_t const numVecsPadded = params.hiddenDimPadded / ElemPerVec;
+  bool const active = vecIdx < numVecs;
+  bool const useScale = params.expertWeightsPtr != nullptr;
+  int64_t const expandedBase = tokenIdx * params.topK;
+
+  // The permutation and the expert weights come from routing, which completed before the GEMMs
+  // this kernel depends on could start, so the first round is read before waiting on the primary
+  // kernel (as in finalizeKernelVecLoad). Only the GEMM output is read after the wait.
+  int permutedIdx[FINALIZE_V2_LOADS_IN_FLIGHT];
+  float scale[FINALIZE_V2_LOADS_IN_FLIGHT];
+#pragma unroll
+  for (int j = 0; j < FINALIZE_V2_LOADS_IN_FLIGHT; ++j) {
+    permutedIdx[j] = -1;
+    scale[j] = 1.0f;
+    if (j < params.topK) {
+      permutedIdx[j] = params.expandedIdxToPermutedIdx[expandedBase + j];
+      if (useScale) {
+        scale[j] = static_cast<float>(params.expertWeightsPtr[expandedBase + j]);
+      }
+    }
+  }
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+  // wait on primary kernel when using PDL
+  if constexpr (KernelParams::UsePdl) {
+    cudaGridDependencySynchronize();
+  }
+#endif
+
+  ComputeElem threadOutput;
+  threadOutput.fill(0);
+  auto const* inVecPtr = reinterpret_cast<float4 const*>(params.inPtr);
+  auto const* inVecPtr2 = reinterpret_cast<float4 const*>(params.inPtr2);
+  for (int k0 = 0; k0 < params.topK; k0 += FINALIZE_V2_LOADS_IN_FLIGHT) {
+    if (k0 > 0) {
+#pragma unroll
+      for (int j = 0; j < FINALIZE_V2_LOADS_IN_FLIGHT; ++j) {
+        int const k = k0 + j;
+        permutedIdx[j] = -1;
+        scale[j] = 1.0f;
+        if (k < params.topK) {
+          permutedIdx[j] = params.expandedIdxToPermutedIdx[expandedBase + k];
+          if (useScale) {
+            scale[j] = static_cast<float>(params.expertWeightsPtr[expandedBase + k]);
+          }
+        }
+      }
+    }
+    float4 inRaw[FINALIZE_V2_LOADS_IN_FLIGHT];
+    float4 inRaw2[FINALIZE_V2_LOADS_IN_FLIGHT];
+#pragma unroll
+    for (int j = 0; j < FINALIZE_V2_LOADS_IN_FLIGHT; ++j) {
+      if (active && permutedIdx[j] != -1) {
+        inRaw[j] = vectorizedLoadPtx(inVecPtr + permutedIdx[j] * numVecsPadded + vecIdx);
+        if constexpr (KernelParams::UseSecondInput) {
+          inRaw2[j] = vectorizedLoadPtx(inVecPtr2 + permutedIdx[j] * numVecsPadded + vecIdx);
+        }
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < FINALIZE_V2_LOADS_IN_FLIGHT; ++j) {
+      if (active && permutedIdx[j] != -1) {
+        ComputeElem expertResult =
+            arrayConvert<VecElem, ComputeElem>(*reinterpret_cast<VecElem const*>(&inRaw[j]));
+        if constexpr (KernelParams::UseSecondInput) {
+          expertResult = expertResult + arrayConvert<VecElem, ComputeElem>(
+                                            *reinterpret_cast<VecElem const*>(&inRaw2[j]));
+        }
+        threadOutput = threadOutput + scale[j] * expertResult;
+      }
+    }
+  }
+  if (active) {
+    reinterpret_cast<VecElem*>(params.outPtr + tokenIdx * params.hiddenDim)[vecIdx] =
+        arrayConvert<ComputeElem, VecElem>(threadOutput);
+  }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 template <typename KernelParams>
 __global__ void finalizeDeepSeekKernel(KernelParams params) {
   using Type = typename KernelParams::Type;
@@ -1159,13 +1532,33 @@ void run(Data const& data, void* stream) {
     int64_t const finalizeElemsPerVector = 128 / tg::dtypeGetNumBits(data.mDtypeElt);
     bool const vectorWidthAligned = data.hiddenDim % finalizeElemsPerVector == 0 &&
                                     data.hiddenDimPadded % finalizeElemsPerVector == 0;
+    // The (token, slice) grid kernel replaces the per-token vectorized kernel and the small-batch
+    // split while its grid is at most a few waves (measured: 1.3-1.7x faster than them at 64 and
+    // 256 tokens of width 6144, 0.8x at 2048, where the per-token kernel's longer-lived CTAs keep
+    // more bytes in flight); above that the per-token vectorized kernel stays. The scalar
+    // finalizeKernel stays for rows that are not 16-byte vectors.
+    int device{-1};
+    cudaGetDevice(&device);
+    int numSms = 0;
+    cudaDeviceGetAttribute(&numSms, cudaDevAttrMultiProcessorCount, device);
+    int64_t const numVecs = data.hiddenDim / finalizeElemsPerVector;
+    int64_t const numSlices =
+        (numVecs + FINALIZE_V2_THREADS_PER_CTA - 1) / FINALIZE_V2_THREADS_PER_CTA;
+    bool const useSliceGrid =
+        !useLegacyGlueKernels() && vectorWidthAligned && data.topK <= MaxTopK &&
+        isAligned16(data.inPtr) && (data.inPtr2 == nullptr || isAligned16(data.inPtr2)) &&
+        isAligned16(data.outPtr) &&
+        (int64_t)data.numTokens * numSlices <= (int64_t)numSms * FINALIZE_V2_MAX_CTAS_PER_SM;
     // With topK <= SMALL_BATCH_FINALIZE_MAX_LOADS there is a single topK group, and the
     // shared-memory reduction costs more than the split saves.
     bool const useSmallBatch =
-        numBlocksX * numBlocksY < 1184 && vectorWidthAligned &&
+        !useSliceGrid && numBlocksX * numBlocksY < 1184 && vectorWidthAligned &&
         data.topK > SMALL_BATCH_FINALIZE_MAX_LOADS &&
         data.topK <= SMALL_BATCH_FINALIZE_MAX_TOPK_GROUPS * SMALL_BATCH_FINALIZE_MAX_LOADS;
-    if (useSmallBatch) {
+    if (useSliceGrid) {
+      dim3 numBlocks(data.numTokens, static_cast<unsigned>(numSlices));
+      LAUNCH_TOPK_EXPW(data, finalizeKernelV2, numBlocks, FINALIZE_V2_THREADS_PER_CTA, 0, stream);
+    } else if (useSmallBatch) {
       // Fewest topK groups that keep each thread at SMALL_BATCH_FINALIZE_MAX_LOADS loads or fewer.
       int kSplit = 1;
       while (kSplit * SMALL_BATCH_FINALIZE_MAX_LOADS < data.topK) {
