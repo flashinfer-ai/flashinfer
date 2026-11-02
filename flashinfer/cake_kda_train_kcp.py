@@ -91,8 +91,8 @@ Raw gate mode (``use_gate_in_kernel=True`` with ``A_log``, ``dt_bias`` and
 ``lower_bound``; FlashInfer #7816) runs on the deterministic package only: the
 compute entries forward the keywords, ``chunk_kda_bwd_kcp`` then returns seven
 tensors (``dA_log`` / ``ddt_bias`` this rank's partial sums, summed over the
-group with :func:`reduce_gate_param_grads_kcp`), and ``kda_workspace_bytes_kcp``
-takes ``use_gate_in_kernel``.  The in-kernel q / k L2 norm
+group with :func:`reduce_gate_param_grads_kcp`), and ``kda_workspace_bytes_kcp`` /
+``kda_saved_bytes_kcp`` take ``use_gate_in_kernel``.  The in-kernel q / k L2 norm
 (``use_qk_l2norm_in_kernel=True``, #7817) runs on the deterministic package too:
 the compute entries forward it, and ``kda_workspace_bytes_kcp`` /
 ``kda_saved_bytes_kcp`` take it.  ``deterministic=False`` raises ``ValueError``
@@ -606,13 +606,15 @@ def kda_saved_bytes_kcp(
     with_conv: bool = True,
     C: int = 8192,
     checkpoint_keep: Optional[str] = None,
+    use_gate_in_kernel: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     deterministic: bool = True,
 ) -> int:
     """Bytes of this rank's KCP saved set for ``H`` heads on the package ``deterministic`` selects (the same for both
     values); see :func:`flashinfer.cake_kda_det_train_kcp.kda_det_saved_bytes_kcp` for ``save_transfer``,
-    ``with_conv``, ``C``, ``checkpoint_keep`` and ``use_qk_l2norm_in_kernel`` (the saved set of the in-kernel q / k L2
-    norm; ``True`` with ``deterministic=False`` raises ``ValueError``)."""
+    ``with_conv``, ``C``, ``checkpoint_keep``, ``use_gate_in_kernel`` (the saved set's gate mode, the raw gate mode
+    of ``WorkspaceDetKcp(use_gate_in_kernel=True)``) and ``use_qk_l2norm_in_kernel`` (the saved set of the in-kernel
+    q / k L2 norm).  Either ``True`` with ``deterministic=False`` raises ``ValueError``."""
     det = _deterministic(deterministic, "kda_saved_bytes_kcp")
     plan = _det_plan() if det else _nd_plan()
     if save_transfer is None and checkpoint_keep is None:
@@ -626,6 +628,7 @@ def kda_saved_bytes_kcp(
         with_conv=with_conv,
         C=C,
         checkpoint_keep=checkpoint_keep,
+        use_gate_in_kernel=use_gate_in_kernel,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 

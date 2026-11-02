@@ -485,6 +485,7 @@ def test_facade_byte_queries_resolve_save_transfer_like_the_deterministic_facade
         by_route[1]["save_transfer"] is None and by_route[2]["save_transfer"] is False
     )
     assert by_route[0]["use_gate_in_kernel"] is False
+    assert by_route[1]["use_gate_in_kernel"] is False
     assert by_route[0]["use_qk_l2norm_in_kernel"] is False
     assert by_route[1]["use_qk_l2norm_in_kernel"] is False
 
@@ -556,8 +557,9 @@ def test_package_entries_accept_the_modes_off(entry) -> None:
 
 
 def test_package_byte_query_refuses_the_raw_gate() -> None:
-    """The package's workspace byte query takes the deterministic query's ``use_gate_in_kernel``: ``False`` gives the
-    bytes of the omitted keyword, any other value is a ``ValueError`` before the context is read."""
+    """The package's workspace and saved-set byte queries take the deterministic queries' ``use_gate_in_kernel``:
+    ``False`` gives the bytes of the omitted keyword, any other value is a ``ValueError`` naming
+    ``deterministic=True``, before the context is read; the facade's ``deterministic=False`` route raises the same."""
     plan = _mod("cake_kcp_plan")
     ctx = kcp_api.build_context_kcp(
         kcp_api.partition_kcp(MODE_CU, 2, deterministic=False),
@@ -567,16 +569,22 @@ def test_package_byte_query_refuses_the_raw_gate() -> None:
         sm_count=148,
         deterministic=False,
     )
-    assert plan.kda_workspace_bytes_kcp(
-        ctx, H=4, use_gate_in_kernel=False
-    ) == plan.kda_workspace_bytes_kcp(ctx, H=4)
-    for value in (True, 1, None):
-        with pytest.raises(ValueError, match="raw gate mode runs on the deterministic"):
-            plan.kda_workspace_bytes_kcp(object(), use_gate_in_kernel=value)
-    with pytest.raises(ValueError, match="raw gate mode runs on the deterministic"):
-        kcp_api.kda_workspace_bytes_kcp(
-            object(), use_gate_in_kernel=True, deterministic=False
-        )
+    for query in ("kda_workspace_bytes_kcp", "kda_saved_bytes_kcp"):
+        fn = getattr(plan, query)
+        assert fn(ctx, H=4, use_gate_in_kernel=False) == fn(ctx, H=4), query
+        for value in (True, 1, None):
+            with pytest.raises(
+                ValueError, match="raw gate mode runs on the deterministic"
+            ) as info:
+                fn(object(), use_gate_in_kernel=value)
+            assert "deterministic=True" in str(info.value), query
+        with pytest.raises(
+            ValueError, match="raw gate mode runs on the deterministic"
+        ) as info:
+            getattr(kcp_api, query)(
+                object(), use_gate_in_kernel=True, deterministic=False
+            )
+        assert "deterministic=True" in str(info.value), query
 
 
 def test_package_byte_queries_refuse_the_in_kernel_qk_norm() -> None:
@@ -621,21 +629,31 @@ def test_facade_byte_queries_forward_the_in_kernel_qk_norm(
         assert seen[-1][1]["use_qk_l2norm_in_kernel"] is True, query
         assert getattr(kcp_api, query)(ctx, deterministic=False) == f"nd:{query}", query
         assert seen[-1][1]["use_qk_l2norm_in_kernel"] is False, query
-    kcp_api.kda_workspace_bytes_kcp(
-        ctx, use_gate_in_kernel=True, use_qk_l2norm_in_kernel=True
-    )
-    assert seen[-1][1]["use_gate_in_kernel"] is True
-    assert seen[-1][1]["use_qk_l2norm_in_kernel"] is True
+    for query in ("kda_workspace_bytes_kcp", "kda_saved_bytes_kcp"):
+        assert (
+            getattr(kcp_api, query)(
+                ctx, use_gate_in_kernel=True, use_qk_l2norm_in_kernel=True
+            )
+            == f"det:{FACADE_DET_NAMES[query]}"
+        ), query
+        assert seen[-1][1]["use_gate_in_kernel"] is True, query
+        assert seen[-1][1]["use_qk_l2norm_in_kernel"] is True, query
+        assert getattr(kcp_api, query)(ctx, deterministic=False) == f"nd:{query}"
+        assert seen[-1][1]["use_gate_in_kernel"] is False, query
     owner = sys.modules[kcp_api._deterministic.__module__]
     monkeypatch.setattr(owner, "_DET_FALLBACK_WARNED", True)
     torch.use_deterministic_algorithms(True)
     for query in ("kda_workspace_bytes_kcp", "kda_saved_bytes_kcp"):
         assert (
             getattr(kcp_api, query)(
-                ctx, use_qk_l2norm_in_kernel=True, deterministic=False
+                ctx,
+                use_gate_in_kernel=True,
+                use_qk_l2norm_in_kernel=True,
+                deterministic=False,
             )
             == f"det:{FACADE_DET_NAMES[query]}"
         ), query
+        assert seen[-1][1]["use_gate_in_kernel"] is True, query
         assert seen[-1][1]["use_qk_l2norm_in_kernel"] is True, query
 
 

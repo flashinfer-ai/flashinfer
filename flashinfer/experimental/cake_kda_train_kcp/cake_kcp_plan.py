@@ -2470,6 +2470,7 @@ def kda_saved_bytes_kcp(
     C: int = 8192,
     saved_carry: bool = True,
     checkpoint_keep: str | None = None,
+    use_gate_in_kernel: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kda_saved_bytes_kcp(ctx, ...)``)::
@@ -2507,8 +2508,11 @@ def kda_saved_bytes_kcp(
     The tier fixes ``save_transfer`` (``False`` / ``True``; ``None``, the default, is ``SAVE_TRANSFER_DEFAULT``
     without a tier; an explicit value that contradicts the tier raises ``ValueError``, as the entry point does);
     ``save_mode`` and ``saved_carry`` are not read.  The saved set itself is released by the checkpoint as before
-    (#7039).  ``use_qk_l2norm_in_kernel``: ``False`` only (:func:`_refuse_qk_l2norm`)."""
+    (#7039).  ``use_gate_in_kernel``: ``False`` only (:func:`_refuse_gate_in_kernel`; the deterministic query reads it
+    for its capability checks, the bytes are those of the explicit gate).  ``use_qk_l2norm_in_kernel``: ``False`` only
+    (:func:`_refuse_qk_l2norm`)."""
     _refuse_qk_l2norm(use_qk_l2norm_in_kernel, "kda_saved_bytes_kcp")
+    _refuse_gate_in_kernel(use_gate_in_kernel, "kda_saved_bytes_kcp")
     _check_save_mode(save_mode)
     save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
     H, C = int(H), int(C)
@@ -3019,6 +3023,18 @@ def _refuse_qk_l2norm(use_qk_l2norm_in_kernel: object, entry: str) -> None:
         )
 
 
+def _refuse_gate_in_kernel(use_gate_in_kernel: object, entry: str) -> None:
+    """The byte queries take the deterministic queries' ``use_gate_in_kernel`` (FlashInfer #7816): ``False`` (by
+    identity) is this package's mode, the explicit gate; any other value raises ``ValueError`` naming
+    ``deterministic=True``, before the context is read."""
+    if use_gate_in_kernel is not False:
+        raise ValueError(
+            f"{entry}: use_gate_in_kernel={use_gate_in_kernel!r}: the raw gate mode runs on the "
+            f"deterministic package only (kda_det_{entry.removeprefix('kda_')}, or flashinfer.cake_kda_train_kcp.{entry} "
+            "with deterministic=True)"
+        )
+
+
 def kda_workspace_bytes_kcp(
     ctx: ContextKcp | Sequence[ContextKcp],
     *,
@@ -3054,14 +3070,10 @@ def kda_workspace_bytes_kcp(
     ``lean_passes``: the tail passes a lean arena is sized for (``WorkspaceKcp(lean_passes=...)``; ``None``:
     :data:`LEAN_PASSES_DEFAULT`).  ``use_gate_in_kernel``: ``False`` only (the explicit gate, this package's mode);
     ``True``, the raw gate mode of the deterministic package's ``kda_det_workspace_bytes_kcp``, raises
-    ``ValueError``.  ``use_qk_l2norm_in_kernel``: ``False`` only (:func:`_refuse_qk_l2norm`)."""
+    ``ValueError`` (:func:`_refuse_gate_in_kernel`).  ``use_qk_l2norm_in_kernel``: ``False`` only
+    (:func:`_refuse_qk_l2norm`)."""
     _refuse_qk_l2norm(use_qk_l2norm_in_kernel, "kda_workspace_bytes_kcp")
-    if use_gate_in_kernel is not False:
-        raise ValueError(
-            f"kda_workspace_bytes_kcp: use_gate_in_kernel={use_gate_in_kernel!r}: the raw gate mode runs on the "
-            "deterministic package only (kda_det_workspace_bytes_kcp, or flashinfer.cake_kda_train_kcp."
-            "kda_workspace_bytes_kcp with deterministic=True)"
-        )
+    _refuse_gate_in_kernel(use_gate_in_kernel, "kda_workspace_bytes_kcp")
     _check_save_mode(save_mode)
     check_lean_passes(lean_passes)
     lean = (
