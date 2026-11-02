@@ -6408,7 +6408,7 @@ def prepare_descriptors(prepared):
                 getattr(owner, "_part3", None),
                 getattr(owner, "_part4", None),
                 getattr(owner, "_part5", None),
-            ):  # OH17 arm
+            ):  # _part3.._part5: mixed-length split parts
                 if child is not None:
                     prepare_descriptors(child)
             if owner._use_output_projection:

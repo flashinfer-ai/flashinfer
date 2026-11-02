@@ -4287,12 +4287,12 @@ class FlashKDABlackwellBF16FusedLaunch:
                     ),
                     device=q.device,
                 )
-                # OH17 timing arm: a forced owner/helper part of a mixed-length
-                # split takes H helpers whatever its shortest sequence is.
-                _oh17_forced = getattr(self, "_oh17_force_helpers", 0)
-                if _oh17_forced:
+                # The owner/helper part of a mixed-length split takes its fixed
+                # helper count whatever its shortest sequence is.
+                forced_helpers = getattr(self, "_forced_m64_owner_helpers", 0)
+                if forced_helpers:
                     m64_owner_helpers = min(
-                        _oh17_forced,
+                        forced_helpers,
                         M64_OWNER_HELPER_MAX_HELPERS,
                         _m64_cooperative_capacity(q.device) // total_tasks - 2,
                     )
@@ -7340,7 +7340,7 @@ AFFINE_SUB_LAUNCHES = (
     "_part3",
     "_part4",
     "_part5",
-)  # OH17 arm: + mixed-length split parts
+)  # _part3.._part5: the extra parts of a mixed-length split
 # Parts whose plan-cache rebinds may be applied after the first chain kernel.
 AFFINE_DEFERRED_PARTS = ("_map", "_correction")
 AFFINE_REBIND_ATTRIBUTES = (
@@ -7724,30 +7724,29 @@ def _apply_rebind_specs(
     return tma_moved
 
 
-# ---- OH17 (CAKE-1348 round 17) timing arm: OH-MIXLEN runtime split (diagnostic, never shipped) ----
-OH17_LONG_MIN = 1024
-OH17_MIXLEN_ARCHES = (
-    "sm_100a",
-    "sm_103a",
-)  # C3: the arches the mixed-length split may plan on (GB300 after the C2 host cut)
-OH17_HELPERS = 2
-_OH17_PART_NAMES = ("_main", "_map", "_correction", "_part3", "_part4", "_part5")
+# Mixed-length M64 split: a launch whose sequences mix long (>= MIXLEN_LONG_MIN
+# tokens) and short ones runs the long sequences as an owner/helper part and
+# the short ones as plain M64 parts, instead of one M64 value-split launch.
+MIXLEN_LONG_MIN = 1024
+MIXLEN_ARCHES = frozenset({"sm_100a", "sm_103a"})
+MIXLEN_HELPERS = 2
+_MIXLEN_PART_NAMES = ("_main", "_map", "_correction", "_part3", "_part4", "_part5")
 
 
-class _OH17ForcedM64Launch(FlashKDABlackwellFP32M64Launch):
-    """OH17 arm part: the M64 FP32-state value split (plain or pair-share build by its own rule)."""
+class _MixLenM64Launch(FlashKDABlackwellFP32M64Launch):
+    """A short-sequence part: the M64 FP32-state value split (plain or pair-share build by its own rule)."""
 
-    _oh17_force_helpers = 0
-
-
-class _OH17ForcedOHLaunch(FlashKDABlackwellFP32M64Launch):
-    """OH17 arm part: the M64 owner/helper build with OH17_HELPERS helpers per task."""
-
-    _oh17_force_helpers = OH17_HELPERS
+    _forced_m64_owner_helpers = 0
 
 
-class _OH17MixLenSplitLaunch:
-    """OH17 arm: the parts of one mixed-length launch; side-stream parts co-run between a fork and a join."""
+class _MixLenOwnerHelperLaunch(FlashKDABlackwellFP32M64Launch):
+    """A long-sequence part: the M64 owner/helper build with MIXLEN_HELPERS helpers per task."""
+
+    _forced_m64_owner_helpers = MIXLEN_HELPERS
+
+
+class _MixLenSplitLaunch:
+    """The parts of one mixed-length launch; side-stream parts co-run between a fork and a join."""
 
     _descriptors_stale = False
     _use_output_projection = False
@@ -7762,25 +7761,25 @@ class _OH17MixLenSplitLaunch:
     def __init__(self, parts, device, mode):
         import torch
 
-        self._oh17_layout = []
+        self._layout = []
         sides = sorted({side for _, side, _ in parts if side})
-        for name, (launch, side, seqs) in zip(_OH17_PART_NAMES, parts, strict=False):
+        for name, (launch, side, seqs) in zip(_MIXLEN_PART_NAMES, parts, strict=False):
             setattr(self, name, launch)
-            self._oh17_layout.append((name, side, seqs))
+            self._layout.append((name, side, seqs))
         self._launch_device = device
-        self._oh17_streams = {side: torch.cuda.Stream(device=device) for side in sides}
-        self._oh17_fork = torch.cuda.Event() if sides else None
-        self._oh17_join = {side: torch.cuda.Event() for side in sides}
-        self.oh17_mode = mode
+        self._streams = {side: torch.cuda.Stream(device=device) for side in sides}
+        self._fork = torch.cuda.Event() if sides else None
+        self._join = {side: torch.cuda.Event() for side in sides}
+        self.split_mode = mode
         self.schedule = (
-            f"oh17_mixlen_{mode}["
+            f"mixlen_{mode}["
             + "+".join(
                 f"{getattr(self, name).schedule}@{seqs[0]}-{seqs[1]}{'/s%d' % side if side else ''}"
-                for name, side, seqs in self._oh17_layout
+                for name, side, seqs in self._layout
             )
             + "]"
         )
-        first = getattr(self, self._oh17_layout[0][0])
+        first = getattr(self, self._layout[0][0])
         self.route = first.route
         self.gate_kind = first.gate_kind
         self.gpu_arch = first.gpu_arch
@@ -7800,11 +7799,11 @@ class _OH17MixLenSplitLaunch:
         stale = self._descriptors_stale
         self._descriptors_stale = False
         device = self._launch_device
-        # C2 stage: settle every part on the caller stream before the fork, so no
-        # host work is left between the part launches.
+        # Settle every part (descriptors, launch records) on the caller stream
+        # before the fork, so no host work is left between the part launches.
         staged = []
         with _ffi_stream_context(device):
-            for name, side, _ in self._oh17_layout:
+            for name, side, _ in self._layout:
                 part = getattr(self, name)
                 if stale:
                     part._descriptors_stale = True
@@ -7818,8 +7817,8 @@ class _OH17MixLenSplitLaunch:
                 )
                 staged.append((side, records, torch_ops))
         current = torch.cuda.current_stream(device)
-        if self._oh17_fork is not None:
-            self._oh17_fork.record(current)
+        if self._fork is not None:
+            self._fork.record(current)
         index = (
             device.index if device.index is not None else torch.cuda.current_device()
         )
@@ -7827,42 +7826,35 @@ class _OH17MixLenSplitLaunch:
         if ffi_device is None:
             ffi_device = _TVM_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
         raw = getattr(tvm_ffi, "use_raw_stream", None)
-        # C2 fire: the staged records of every part back to back.
+        # Launch the staged records of every part back to back.
         for side, records, torch_ops in staged:
             if side:
-                stream = self._oh17_streams[side]
-                stream.wait_event(self._oh17_fork)
+                stream = self._streams[side]
+                stream.wait_event(self._fork)
                 if torch_ops or raw is None:
                     with torch.cuda.stream(stream), _ffi_stream_context(device):
                         _run_launch_records(records)
                 else:
                     with raw(ffi_device, stream.cuda_stream):
                         _run_launch_records(records)
-                self._oh17_join[side].record(stream)
+                self._join[side].record(stream)
             else:
                 with _ffi_stream_context(device):
                     _run_launch_records(records)
-        for side in sorted(self._oh17_join):
-            current.wait_event(self._oh17_join[side])
+        for side in sorted(self._join):
+            current.wait_event(self._join[side])
 
     def close(self) -> None:
-        for name, _, _ in self._oh17_layout:
+        for name, _, _ in self._layout:
             getattr(self, name).close()
 
 
-def _oh17_mixlen_split(stock, args, kwargs):
-    """The OH17 split of a launch whose stock plan is ``stock``, or ``None`` (keep ``stock``)."""
-    import os
-
+def _mixlen_split(stock, args, kwargs):
+    """The mixed-length split of a launch whose plan is ``stock``, or ``None`` (keep ``stock``)."""
     import torch
 
-    arches = os.environ.get("OH17_MIXLEN_ARCHES")
-    arches = tuple(arches.split(",")) if arches else OH17_MIXLEN_ARCHES
-    if getattr(stock, "gpu_arch", None) not in arches:
+    if getattr(stock, "gpu_arch", None) not in MIXLEN_ARCHES:
         return None  # other arches keep the stock impl object
-    mode = os.environ.get("OH17_MIXLEN", "auto")
-    if mode == "off":
-        return None
     if type(stock) is not FlashKDABlackwellFP32FusedM128Launch:
         return None
     schedule = str(getattr(stock, "schedule", ""))
@@ -7895,7 +7887,7 @@ def _oh17_mixlen_split(stock, args, kwargs):
     if torch.cuda.is_current_stream_capturing():
         return None  # the plan-time cu_seqlens check below synchronizes
     lengths = tuple(int(n) for n in lengths)
-    longs = [n >= OH17_LONG_MIN for n in lengths]
+    longs = [n >= MIXLEN_LONG_MIN for n in lengths]
     if not any(longs) or all(longs):
         return None
     offsets = [0]
@@ -7919,7 +7911,7 @@ def _oh17_mixlen_split(stock, args, kwargs):
     num_seqs = len(lengths)
     first = longs.index(True)
     last = num_seqs - 1 - longs[::-1].index(True)
-    rng_fits = (last - first + 1) * num_heads * (2 + OH17_HELPERS) <= capacity
+    rng_fits = (last - first + 1) * num_heads * (2 + MIXLEN_HELPERS) <= capacity
     runs = []  # maximal runs of equal class: (i0, i1, long)
     i = 0
     while i < num_seqs:
@@ -7930,15 +7922,17 @@ def _oh17_mixlen_split(stock, args, kwargs):
         i = j + 1
     cc_fits = (
         sum(
-            (i1 - i0 + 1) * num_heads * (2 + OH17_HELPERS)
+            (i1 - i0 + 1) * num_heads * (2 + MIXLEN_HELPERS)
             for i0, i1, is_long in runs
             if is_long
         )
         <= capacity
     )
-    if mode == "auto":
-        mode = "rng" if rng_fits else "cc" if cc_fits else "off"
-    if mode == "rng" and rng_fits:
+    # "rng": one owner/helper part over the first..last long sequence, then the
+    # short head / tail parts, all on the caller stream.  "cc": one side-stream
+    # owner/helper part per run of long sequences, short runs on the caller stream.
+    if rng_fits:
+        mode = "rng"
         plan = []
         if first > 0:
             plan.append((0, first - 1, False, 0))
@@ -7947,7 +7941,8 @@ def _oh17_mixlen_split(stock, args, kwargs):
             plan.append((last + 1, num_seqs - 1, False, 0))
         # owner/helper part first, the short tails after it
         plan.sort(key=lambda part: not part[2])
-    elif mode == "cc" and cc_fits:
+    elif cc_fits:
+        mode = "cc"
         plan = []
         side = 0
         for i0, i1, is_long in runs:
@@ -7959,7 +7954,7 @@ def _oh17_mixlen_split(stock, args, kwargs):
                 plan.append((i0, i1, False, 0))
     else:
         return None
-    if len(plan) > len(_OH17_PART_NAMES):
+    if len(plan) > len(_MIXLEN_PART_NAMES):
         return None
     initial_state = kwargs.get("initial_state")
     final_state = kwargs.get("final_state")
@@ -8021,23 +8016,23 @@ def _oh17_mixlen_split(stock, args, kwargs):
                 dt_bias,
                 lower_bound,
             )
-            cls = _OH17ForcedOHLaunch if is_long else _OH17ForcedM64Launch
+            cls = _MixLenOwnerHelperLaunch if is_long else _MixLenM64Launch
             part = cls(*sub_args, **sub_kwargs)
             parts.append((part, side, (i0, i1)))
             if is_long and part.m64_owner_helpers < 2:
-                raise RuntimeError("OH17: owner/helper part did not take two helpers")
-    except Exception as error:  # noqa: BLE001 - the arm keeps the stock plan on any refusal
+                raise RuntimeError("owner/helper part did not take two helpers")
+    except Exception as error:  # noqa: BLE001 - any refusal keeps the stock plan
         for part, _, _ in parts:
             part.close()
         from flashinfer.jit.core import logger
 
         logger.warning(
-            "OH17 mixed-length split refused (%s: %s); stock plan kept",
+            "mixed-length split refused (%s: %s); stock plan kept",
             type(error).__name__,
             error,
         )
         return None
-    return _OH17MixLenSplitLaunch(parts, device, mode)
+    return _MixLenSplitLaunch(parts, device, mode)
 
 
 class FlashKDABlackwellLaunch:
@@ -8089,10 +8084,10 @@ class FlashKDABlackwellLaunch:
         else:
             impl = FlashKDABlackwellBF16FusedLaunch
         self._impl = impl(*args, **kwargs)
-        _oh17_split = _oh17_mixlen_split(self._impl, args, kwargs)
-        if _oh17_split is not None:
+        split = _mixlen_split(self._impl, args, kwargs)
+        if split is not None:
             self._impl.close()
-            self._impl = _oh17_split
+            self._impl = split
 
     def __getattr__(self, name):
         return getattr(self._impl, name)
