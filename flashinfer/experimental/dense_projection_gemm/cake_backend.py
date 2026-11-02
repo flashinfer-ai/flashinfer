@@ -777,7 +777,7 @@ class _VerdictTable(dict):
         super().__delitem__(key)
         _verdicts_changed()
 
-    def __ior__(self, other: Any) -> Any:
+    def __ior__(self, other: Any) -> Any:  # type: ignore[misc]
         try:
             return super().__ior__(other)
         finally:
@@ -810,6 +810,7 @@ class _VerdictTable(dict):
             super().update(*args, **kwargs)
         finally:
             _verdicts_changed()
+
 
 #: Per-row verdicts of the router, ``(arch, layout, hidden, experts) -> rule``: ``layout`` ``"kk"`` (the forward,
 #: ``hidden = K``) or ``"nn_t"`` (the swapped weight gradient, ``hidden`` = the launch's ``M``), ``experts`` = the

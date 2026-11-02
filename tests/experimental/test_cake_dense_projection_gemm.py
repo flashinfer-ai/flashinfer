@@ -2014,7 +2014,7 @@ def test_router_tables_count_their_changes():
     for change in changes:
         before = cake_backend._VERDICT_GENERATION
         change()
-        assert cake_backend._VERDICT_GENERATION > before
+        assert before < cake_backend._VERDICT_GENERATION
     assert table == {}
 
 
