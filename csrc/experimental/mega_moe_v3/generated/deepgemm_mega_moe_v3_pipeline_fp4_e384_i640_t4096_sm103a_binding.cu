@@ -1,7 +1,7 @@
 // Portions derived from DeepGEMM, Copyright (c) 2025 DeepSeek.
 // DeepGEMM portions are licensed under MIT; see DEEPGEMM_NOTICE.txt.
 
-// tvm-ffi direct-source launcher for Deepgemm kernel 'kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a'.
+// tvm-ffi direct-source launcher for Deepgemm kernel 'kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a'.
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -11,10 +11,10 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a(int* __restrict__ topk_idx_i32, float* __restrict__ topk_weights, int* __restrict__ x_fp8, unsigned int* __restrict__ x_sf, const __grid_constant__ CUtensorMap A, int* __restrict__ pool_fp8, unsigned int* __restrict__ pool_sf, float* __restrict__ routing_weight_pool, int* __restrict__ token_to_permuted, int* __restrict__ meta_token, int* __restrict__ meta_slot, int* __restrict__ expert_counts, int* __restrict__ expert_row_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ total_m_tiles_out, const __grid_constant__ CUtensorMap B1, const __grid_constant__ CUtensorMap SFB1, const __grid_constant__ CUtensorMap I_fp8_w, uint8_t* __restrict__ SF_I_w, __nv_bfloat16* __restrict__ l1_bf16_capture, const __grid_constant__ CUtensorMap A2, unsigned int* __restrict__ SFA2, const __grid_constant__ CUtensorMap B2, const __grid_constant__ CUtensorMap SFB2, __nv_bfloat16* __restrict__ expert_output, __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ histogram_done, unsigned int* __restrict__ prefix_done, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ l1_arrival, unsigned int* __restrict__ l2_done, int num_tokens, int top_k, int num_experts, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles, int M_total, float activation_clamp, unsigned int* __restrict__ PrivateCounters, unsigned long long* __restrict__ PrivateMasks, unsigned int* __restrict__ PublicExpertOutput, unsigned int* __restrict__ PrivateSFBlockOffsets, const __grid_constant__ CUtensorMap PrivateSF1, const __grid_constant__ CUtensorMap PrivateSF2, unsigned int* __restrict__ PrivateSF1Words, uint8_t* __restrict__ PrivateSF2Bytes, int local_expert_offset);
+extern "C" __global__ void kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict__ topk_idx_i32, float* __restrict__ topk_weights, int* __restrict__ x_fp8, unsigned int* __restrict__ x_sf, const __grid_constant__ CUtensorMap A, int* __restrict__ pool_fp8, unsigned int* __restrict__ pool_sf, float* __restrict__ routing_weight_pool, int* __restrict__ token_to_permuted, int* __restrict__ meta_token, int* __restrict__ meta_slot, int* __restrict__ expert_counts, int* __restrict__ expert_row_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ total_m_tiles_out, const __grid_constant__ CUtensorMap B1, const __grid_constant__ CUtensorMap SFB1, const __grid_constant__ CUtensorMap I_fp8_w, uint8_t* __restrict__ SF_I_w, __nv_bfloat16* __restrict__ l1_bf16_capture, const __grid_constant__ CUtensorMap A2, unsigned int* __restrict__ SFA2, const __grid_constant__ CUtensorMap B2, const __grid_constant__ CUtensorMap SFB2, __nv_bfloat16* __restrict__ expert_output, __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ histogram_done, unsigned int* __restrict__ prefix_done, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ l1_arrival, unsigned int* __restrict__ l2_done, int num_tokens, int top_k, int num_experts, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles, int M_total, float activation_clamp, unsigned int* __restrict__ PrivateCounters, unsigned long long* __restrict__ PrivateMasks, unsigned int* __restrict__ PublicExpertOutput, unsigned int* __restrict__ PrivateSFBlockOffsets, const __grid_constant__ CUtensorMap PrivateSF1, const __grid_constant__ CUtensorMap PrivateSF2, unsigned int* __restrict__ PrivateSF1Words, uint8_t* __restrict__ PrivateSF2Bytes, int local_expert_offset);
 
 
-namespace deepgemm_host_shim_pipeline_fp4_e96_i2304_t1024 {
+namespace deepgemm_host_shim_pipeline_fp4_e384_i640_t4096 {
 
 using tvm::ffi::TensorView;
 
@@ -59,7 +59,7 @@ inline CUtensorMap EncodeTma_A(const TensorView& t) {
   uint64_t global_dim[2] = {(uint64_t)(d1), (uint64_t)(outer1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0, ValueError)
       << "TMA descriptor for 'A' resolved a non-positive global dim";
-  uint32_t box_dim[2] = {128u, 16u};
+  uint32_t box_dim[2] = {128u, 32u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ") exceeds resolved global dims for 'A'";
   int64_t carrier_stride_0 = s2;
@@ -87,39 +87,56 @@ inline CUtensorMap EncodeTma_A(const TensorView& t) {
 // 2D TMA descriptor for buffer 'B1' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_B1(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'B1' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() == 3, ValueError)
+      << "TMA source 'B1' must have 3 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'B1' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
   int64_t d2 = t.size(t.ndim() - 2);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+  int64_t d3 = t.size(t.ndim() - 3);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'B1' trailing dims must be positive";
-  uint64_t global_dim[2] = {(uint64_t)((2 * d1)), (uint64_t)(d2)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0, ValueError)
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  int64_t s3 = t.stride(t.ndim() - 3) * 1;
+  TVM_FFI_CHECK(s2 > 0 && s3 > 0, ValueError)
+      << "TMA source 'B1' physical strides must be positive";
+  TVM_FFI_CHECK((s2 == d1), ValueError)
+      << "TMA source 'B1' requires (s2 == d1)";
+  uint64_t global_dim[3] = {(uint64_t)((2 * d1)), (uint64_t)(d2), (uint64_t)(d3)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'B1' resolved a non-positive global dim";
-  uint32_t box_dim[2] = {128u, 128u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
-      << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ") exceeds resolved global dims for 'B1'";
-  int64_t carrier_stride_0 = (2 * d1);
+  uint32_t box_dim[3] = {128u, 128u, 1u};
+  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
+      << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ", " << box_dim[2] << ") exceeds resolved global dims for 'B1'";
+  int64_t carrier_stride_0 = (2 * s2);
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
       << "TMA descriptor for 'B1' resolved global stride 1 negative";
   TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
       << "TMA descriptor for 'B1' resolved global stride 1 zero while global dimension 1 is not 1";
   TVM_FFI_CHECK((carrier_stride_0 * 4) % 8 == 0, ValueError)
       << "TMA descriptor for 'B1' resolved global stride 1 to a non-whole-byte offset";
-  uint64_t global_strides[1] = {
+  int64_t carrier_stride_1 = (2 * s3);
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'B1' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'B1' resolved global stride 2 zero while global dimension 2 is not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 4) % 8 == 0, ValueError)
+      << "TMA descriptor for 'B1' resolved global stride 2 to a non-whole-byte offset";
+  uint64_t global_strides[2] = {
       (uint64_t)((carrier_stride_0 * 4) / 8),
+      (uint64_t)((carrier_stride_1 * 4) / 8),
   };
-  uint32_t elem_strides[2] = {1u, 1u};
+  TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0, ValueError)
+      << "TMA descriptor for 'B1' resolved a global stride that is not a multiple of 16 bytes";
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm{};
   const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
   CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B, 2, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      &tm, CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B, 3, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (2D, 'B1') failed: CUresult=" << (int)r;
+      << "cuTensorMapEncodeTiled (3D, 'B1') failed: CUresult=" << (int)r;
   return tm;
 }
 
@@ -184,7 +201,7 @@ inline CUtensorMap EncodeTma_I_fp8_w(const TensorView& t) {
   uint64_t global_dim[2] = {(uint64_t)(d1), (uint64_t)(outer1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0, ValueError)
       << "TMA descriptor for 'I_fp8_w' resolved a non-positive global dim";
-  uint32_t box_dim[2] = {64u, 16u};
+  uint32_t box_dim[2] = {64u, 32u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ") exceeds resolved global dims for 'I_fp8_w'";
   int64_t carrier_stride_0 = s2;
@@ -227,7 +244,7 @@ inline CUtensorMap EncodeTma_A2(const TensorView& t) {
   uint64_t global_dim[2] = {(uint64_t)(d1), (uint64_t)(outer1)};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0, ValueError)
       << "TMA descriptor for 'A2' resolved a non-positive global dim";
-  uint32_t box_dim[2] = {128u, 16u};
+  uint32_t box_dim[2] = {128u, 64u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
       << "TMA box (" << box_dim[0] << ", " << box_dim[1] << ") exceeds resolved global dims for 'A2'";
   int64_t carrier_stride_0 = s2;
@@ -476,7 +493,7 @@ void Run(TensorView arg_topk_idx_i32, TensorView arg_topk_weights, TensorView ar
   check_contiguous(arg_total_m_tiles_out, "total_m_tiles_out");
   check_cuda_tensor(arg_B1, "B1");
   check_dtype(arg_B1, DLDataType{kDLUInt, 8, 1}, "B1");
-  check_contiguous(arg_B1, "B1");
+  // B1 may be a strided view: EncodeTma_B1 checks the strides the kernel reads.
   check_cuda_tensor(arg_SFB1, "SFB1");
   check_dtype(arg_SFB1, DLDataType{kDLUInt, 32, 1}, "SFB1");
   check_cuda_tensor(arg_I_fp8_w, "I_fp8_w");
@@ -689,7 +706,7 @@ void Run(TensorView arg_topk_idx_i32, TensorView arg_topk_weights, TensorView ar
   void* kargs[] = {&p_topk_idx_i32, &p_topk_weights, &p_x_fp8, &p_x_sf, &p_A, &p_pool_fp8, &p_pool_sf, &p_routing_weight_pool, &p_token_to_permuted, &p_meta_token, &p_meta_slot, &p_expert_counts, &p_expert_row_offsets, &p_expert_scatter_offsets, &p_tile_expert, &p_tile_m_local, &p_total_m_tiles_out, &p_B1, &p_SFB1, &p_I_fp8_w, &p_SF_I_w, &p_l1_bf16_capture, &p_A2, &p_SFA2, &p_B2, &p_SFB2, &p_expert_output, &p_y, &p_histogram_done, &p_prefix_done, &p_dispatch_done, &p_l1_arrival, &p_l2_done, &v_num_tokens, &v_top_k, &v_num_experts, &v_N1, &v_K1, &v_grid_n1, &v_K1_tiles, &v_N2, &v_K2, &v_grid_n2, &v_K2_tiles, &v_total_m_tiles, &v_M_total, &v_activation_clamp, &p_PrivateCounters, &p_PrivateMasks, &p_PublicExpertOutput, &p_PrivateSFBlockOffsets, &p_PrivateSF1, &p_PrivateSF2, &p_PrivateSF1Words, &p_PrivateSF2Bytes, &v_local_expert_offset};
 
   static const bool smem_ready = DeepgemmSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a), 230784);
+      reinterpret_cast<const void*>(kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a), 227328);
   (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(512u, 1u, 1u);
@@ -711,17 +728,17 @@ void Run(TensorView arg_topk_idx_i32, TensorView arg_topk_weights, TensorView ar
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 230784u;
+  config.dynamicSmemBytes = 227328u;
   config.stream = stream;
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a), kargs);
+      &config, reinterpret_cast<const void*>(kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t1024_sm103a failed: "
+      << "cudaLaunchKernelExC for kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a failed: "
       << cudaGetErrorString(launch_status);
 }
 
-}  // namespace deepgemm_host_shim_pipeline_fp4_e96_i2304_t1024
+}  // namespace deepgemm_host_shim_pipeline_fp4_e384_i640_t4096
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, deepgemm_host_shim_pipeline_fp4_e96_i2304_t1024::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, deepgemm_host_shim_pipeline_fp4_e384_i640_t4096::Run);
