@@ -502,7 +502,13 @@ def _prims_ts_sparse_pattern_trace(
 
 def _prims_ts_trace_scale_values(kwargs, names, *, bound):
     """Resolve scale bindings without inspecting device-resident values."""
+    from flashinfer.attention.prims_ts._scales import normalize_scale
+
     state = getattr(kwargs.get("self"), "_plan_state", None) if bound else None
+    device = getattr(state, "device", None)
+    if device is None:
+        query = kwargs.get("q", kwargs.get("query"))
+        device = getattr(query, "device", torch.device("cpu"))
     values = {}
     for name in names:
         planned = getattr(state, name, None)
@@ -513,7 +519,13 @@ def _prims_ts_trace_scale_values(kwargs, names, *, bound):
             planned, torch.Tensor
         ):
             raise ValueError(f"{name} must retain its planned float or tensor type")
-        if isinstance(value, torch.Tensor):
+        if (
+            isinstance(value, torch.Tensor)
+            and device.type != "cuda"
+            and value.device.type in ("cpu", "meta")
+        ):
+            # CPU/meta inputs describe schemas without running attention. Real
+            # CUDA calls retain the runtime scale/device contract below.
             if (
                 value.numel() != 1
                 or value.ndim > 1
@@ -525,6 +537,8 @@ def _prims_ts_trace_scale_values(kwargs, names, *, bound):
                 )
             if value.ndim == 0:
                 value = value.view(1)
+        elif value is not None:
+            value = normalize_scale(value, name, device)
         values[name] = value
     return values
 

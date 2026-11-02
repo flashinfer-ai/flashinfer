@@ -39,6 +39,19 @@ from flashinfer.api_logging import _TRACE_DISPATCHERS, _TRACE_REGISTRY
 from flashinfer.trace.templates.attention import _prims_ts_scale_trace_variant
 
 
+_INVALID_HOST_SCALES = [
+    (0.0, ValueError),
+    (-1.0, ValueError),
+    (float("nan"), ValueError),
+    (float("inf"), ValueError),
+    (float("-inf"), ValueError),
+    (True, TypeError),
+    (1e40, ValueError),
+    (1e-50, ValueError),
+    ("0.25", TypeError),
+]
+
+
 def _trace_case(family, bound, scales):
     q = torch.empty(2, 1, 8, 128, dtype=torch.bfloat16)
     k = torch.empty(2, 2, 32, 128, dtype=q.dtype)
@@ -226,6 +239,64 @@ def test_prims_ts_trace_rejects_invalid_scale_metadata(
             match=f"{names[scale_index]} must be a contiguous float32 tensor",
         ):
             fi_trace(api, **kwargs, **{names[scale_index]: invalid})
+
+
+@pytest.mark.parametrize(
+    "family", ["decode", "mla", "block_sparse", "paged_block_sparse"]
+)
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("scale_index", [0, 1])
+@pytest.mark.parametrize("invalid,error_type", _INVALID_HOST_SCALES)
+def test_prims_ts_trace_rejects_invalid_host_scales(
+    family, bound, scale_index, invalid, error_type
+):
+    scales = [0.25, 1.0]
+    scales[scale_index] = invalid
+    api, kwargs, names = _trace_case(family, bound, scales)
+    with pytest.raises(error_type, match=names[scale_index]):
+        fi_trace(api, **kwargs)
+    if bound:
+        api, kwargs, _ = _trace_case(family, True, (0.25, 1.0))
+        with pytest.raises(error_type, match=names[scale_index]):
+            fi_trace(api, **kwargs, **{names[scale_index]: invalid})
+
+
+@pytest.mark.parametrize(
+    "family", ["decode", "mla", "block_sparse", "paged_block_sparse"]
+)
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("scale_index", [0, 1])
+@pytest.mark.parametrize("scale_device", ["cpu", "meta", "cuda:1"])
+def test_prims_ts_trace_checks_expected_scale_device(
+    family, bound, scale_index, scale_device
+):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        valid = torch.empty((), device="cuda:0", dtype=torch.float32)
+        invalid = torch.empty((), device=scale_device, dtype=torch.float32)
+    scales = [0.25, 1.0]
+    scales[scale_index] = valid
+    api, kwargs, names = _trace_case(family, bound, scales)
+    query_name = "query" if family == "mla" else "q"
+    with FakeTensorMode():
+        kwargs[query_name] = torch.empty(
+            kwargs[query_name].shape,
+            dtype=kwargs[query_name].dtype,
+            device="cuda:1" if bound else "cuda:0",
+        )
+    if bound:
+        # Scale placement follows the actual plan device, even when a metadata
+        # trace uses a query stand-in on another device.
+        api.__self__._plan_state.device = torch.device("cuda:0")
+    definition = fi_trace(api, **kwargs)
+    assert definition["inputs"][names[scale_index]]["shape"] == ["global_scale_size"]
+    with pytest.raises(ValueError, match=f"{names[scale_index]} .* on cuda:0"):
+        fi_trace(api, **{**kwargs, names[scale_index]: invalid})
+    if bound:
+        setattr(api.__self__._plan_state, names[scale_index], invalid)
+        with pytest.raises(ValueError, match=f"{names[scale_index]} .* on cuda:0"):
+            fi_trace(api, **kwargs)
 
 
 @pytest.mark.parametrize(

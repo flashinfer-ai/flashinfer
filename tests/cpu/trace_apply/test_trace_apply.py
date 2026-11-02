@@ -606,6 +606,30 @@ def test_prims_ts_device_scale_routes(family, bound, scale_types, scalar_tensor)
     assert ta.stats()[fi_api]["hit"] == (3 if bound else 1)
 
 
+def _assert_prims_ts_scale_fallback(
+    api, kwargs, definition, error_type, expected_error
+):
+    # Establish the real API's rejection without requiring a GPU or replacing
+    # its implementation. Apply must preserve that fallback, not run a solution.
+    with pytest.raises(error_type, match=expected_error):
+        api(**kwargs)
+    calls = []
+
+    def solution(**inputs):
+        calls.append(inputs)
+        return kwargs["q"]
+
+    ta.enable_apply({definition["name"]: solution})
+    target = (
+        api.__self__.run
+        if hasattr(api, "__self__")
+        else getattr(importlib.import_module(api.__module__), api.__name__)
+    )
+    with pytest.raises(error_type, match=expected_error):
+        target(**kwargs)
+    assert not calls
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("bound", [False, True])
 @pytest.mark.parametrize("scale_index", [0, 1])
@@ -640,25 +664,78 @@ def test_prims_ts_invalid_scale_metadata_falls_back(bound, scale_index, shape, d
     else:
         expected_error = "block_tables must be a CUDA tensor"
 
-    # Establish the real API's rejection without requiring a GPU or replacing
-    # its implementation. Apply must preserve that fallback, not run a solution.
-    with pytest.raises(ValueError, match=expected_error):
-        api(**kwargs)
-    calls = []
+    _assert_prims_ts_scale_fallback(api, kwargs, definition, ValueError, expected_error)
 
-    def solution(**inputs):
-        calls.append(inputs)
-        return kwargs["q"]
 
-    ta.enable_apply({definition["name"]: solution})
-    target = (
-        api.__self__.run
-        if bound
-        else getattr(importlib.import_module(api.__module__), api.__name__)
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("scale_index", [0, 1])
+@pytest.mark.parametrize("other_tensor", [False, True])
+@pytest.mark.parametrize(
+    "invalid", [0.0, -1.0, float("nan"), float("inf"), True, 1e40, 1e-50]
+)
+def test_prims_ts_invalid_host_scale_falls_back(
+    bound, scale_index, other_tensor, invalid
+):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from tests.trace.test_prims_ts_global_scales import _trace_case
+
+    scales = [0.25, 1.0]
+    if other_tensor:
+        with FakeTensorMode():
+            scales[1 - scale_index] = torch.empty(
+                1, device="cuda:0" if bound else "meta"
+            )
+    api, kwargs, names = _trace_case(
+        "block_sparse" if bound else "decode", bound, scales
     )
-    with pytest.raises(ValueError, match=expected_error):
-        target(**kwargs)
-    assert not calls
+    if bound:
+        state = api.__self__._plan_state
+        state.device = torch.device("cuda:0")
+        state.use_kv_valid_bits = False
+        state.dummy_kv_valid_bits = None
+        kwargs.update(validate=False, out=kwargs["q"])
+    definition = flashinfer.fi_trace(api, **kwargs)
+    kwargs[names[scale_index]] = invalid
+    error_type = TypeError if bound and isinstance(invalid, bool) else ValueError
+    expected_error = (
+        names[scale_index] if bound else "block_tables must be a CUDA tensor"
+    )
+    _assert_prims_ts_scale_fallback(api, kwargs, definition, error_type, expected_error)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("scale_index", [0, 1])
+@pytest.mark.parametrize("scale_device", ["cpu", "meta", "cuda:1"])
+def test_prims_ts_wrong_scale_device_falls_back(bound, scale_index, scale_device):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from tests.trace.test_prims_ts_global_scales import _trace_case
+
+    with FakeTensorMode():
+        valid = torch.empty(1, device="cuda:0")
+        invalid = torch.empty(1, device=scale_device)
+    scales = [0.25, 1.0]
+    scales[scale_index] = valid
+    api, kwargs, names = _trace_case(
+        "block_sparse" if bound else "decode", bound, scales
+    )
+    if bound:
+        state = api.__self__._plan_state
+        state.device = torch.device("cuda:0")
+        state.use_kv_valid_bits = False
+        state.dummy_kv_valid_bits = None
+        kwargs.update(validate=False, out=kwargs["q"])
+        expected_error = f"{names[scale_index]} .* on cuda:0"
+    else:
+        with FakeTensorMode():
+            kwargs["q"] = torch.empty(
+                kwargs["q"].shape, dtype=kwargs["q"].dtype, device="cuda:0"
+            )
+        expected_error = "block_tables must be a CUDA tensor"
+    definition = flashinfer.fi_trace(api, **kwargs)
+    kwargs[names[scale_index]] = invalid
+    _assert_prims_ts_scale_fallback(api, kwargs, definition, ValueError, expected_error)
 
 
 @pytest.mark.cpu_only
