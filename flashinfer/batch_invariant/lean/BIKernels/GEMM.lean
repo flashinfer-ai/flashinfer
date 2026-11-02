@@ -14,6 +14,8 @@ Two consistency classes per step:
 The fp8 classes' epilogue chain multiplies the fold by `alpha = mul.rn(a_scale, b_scale)` (the two per-tensor
 scales of `bmm_fp8`, runtime scalars: the `sym` leaves; their product formed on the device by one correctly rounded
 multiply) before the single conversion (`outputElem true`); the bf16 class converts directly (`outputElem false`).
+Each has a biased chain (`outputElemBias`): the bias of the output column, a leaf, added once to the whole fold before the
+single conversion; every identity below lifts to it by congruence.
 
 What is modelled: the per-element dataflow, the split kernel's index-addressed workspace, and the batched launch
 (rows -> per-row kernel). What is *not* modelled, and is covered by the hardware tests: that the tile shape / cluster
