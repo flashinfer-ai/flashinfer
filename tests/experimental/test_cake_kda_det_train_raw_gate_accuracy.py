@@ -35,11 +35,16 @@ Critical value: per (tensor, row) the ``1 - alpha / m`` quantile of ``U`` over
 ``B_BOOT`` bootstrap resamples of the A/A log-ratios (``E_T`` against ``E_T``
 with the activated gate moved by a seeded +-1 ulp, seeds 2000-2031),
 ``alpha = 0.05`` and ``m`` the Bonferroni count of the family (8 tensors x the
-rows of the device's family x the explicit arms present).  Test (seeds
-1000-1031): for every explicit arm, tensor and row, ``U(log(err_R / err_X)) <=
-c``.  Rows A-F run on ``sm_100a``; rows A, B, D and E elsewhere.  Every error
-array, every ``U``, every ``c``, ``alpha``, ``m``, the seeds, the host and the
-job are recorded as JSON.
+rows of the device's family x the explicit arms present).  Test (128 seeds
+3000-3127, ``t_{0.975, 127}``): for every explicit arm, tensor and row,
+``U(log(err_R / err_X)) <= c``.  Sanity: ``R`` has no non-finite element and
+every element within ``1e-2 + 1e-2 |ref|``, except the parameter gradients
+``dA_log`` / ``ddt_bias`` (sums over every token of a head, whose elementwise
+error is the explicit arms' order too): there ``R``'s worst normalized error per
+seed is at most ``max(1, 2 x`` the explicit arms' worst``)``.  Rows A-F run
+on ``sm_100a``; rows A, B, D and E elsewhere.  Every error array, every
+``U``, every ``c``, ``alpha``, ``m``, the seeds, the host and the job are
+recorded as JSON.
 
 The protocol takes minutes per row, so the default suite skips it.  Run it on
 a compute node::
@@ -114,9 +119,12 @@ RUN = _flag(ENV_RUN)
 
 # ---- the protocol, declared before the first run ----------------------------------------------------------------
 ALPHA = 0.05
-TEST_SEEDS = tuple(range(1000, 1032))
+# the test seeds: 128, disjoint from the A/A seeds and from the 32 pilot seeds 1000-1031, whose U intervals were too
+# wide to decide every row; the A/A calibration (32 seeds), c and every margin are the same for both
+TEST_SEEDS = tuple(range(3000, 3128))
 AA_SEEDS = tuple(range(2000, 2032))
-N_SEEDS = 32
+N_SEEDS = len(TEST_SEEDS)
+N_AA = len(AA_SEEDS)
 B_BOOT = 100_000
 BOOT_SEED = 7816
 # the +-1 ulp signs of the A/A arm: a CPU generator seeded PERTURB_SEED_BASE + seed
@@ -125,6 +133,10 @@ QUANTILE_METHOD = "linear"
 TENSORS = ("out", "dq", "dk", "dv", "dbeta", "dg", "dA_log", "ddt_bias")
 EXPLICIT_ARMS = ("E_T", "E_F")
 ELEMENTWISE_ATOL = ELEMENTWISE_RTOL = 1e-2
+# the parameter gradients are sums over every token of a head: their elementwise error is the explicit arms' order
+# too, so R's sanity gate there is its worst normalized error per seed against max(1, 2 x the explicit arms' worst)
+PARAM_TENSORS = ("dA_log", "ddt_bias")
+PARAM_SANITY_FACTOR = 2.0
 # rows: (lengths, heads, dt_bias shift); default gate: mean activated gate about -2.5; D: s -> 1 (dt_bias ~ +6 +
 # 0.5 N, the cancellation case of the explicit sigma'); E: slow decay (dt_bias ~ -6 + 0.5 N, g ~ -0.012)
 ROWS: dict[str, tuple[tuple[int, ...], int, float]] = {
@@ -243,6 +255,37 @@ def bootstrap_critical_value(ell_aa: Sequence[float], tq: float, m: int) -> floa
     return float(torch.quantile(u, level, interpolation=QUANTILE_METHOD).item())
 
 
+def _max_normalized_error(cand: torch.Tensor, ref: torch.Tensor) -> float:
+    """``max |cand - ref| / (atol + rtol |ref|)`` in FP64 (``inf`` for a non-finite element)."""
+    c = cand.detach().to(torch.float64)
+    r = ref.detach().to(torch.float64)
+    norm = (c - r).abs() / (ELEMENTWISE_ATOL + ELEMENTWISE_RTOL * r.abs())
+    norm = torch.where(torch.isfinite(c), norm, torch.full_like(norm, math.inf))
+    return float(norm.max().item())
+
+
+def _sanity(elementwise: dict, explicit_arms: Sequence[str]) -> dict:
+    """``R``'s elementwise sanity verdict per tensor and seed: no non-finite element; every element within
+    ``atol + rtol |ref|``, or for :data:`PARAM_TENSORS` a worst normalized error at most ``max(1, factor x`` the
+    explicit arms' worst on that seed ``)``."""
+    out: dict = {}
+    for t in TENSORS:
+        verdicts = []
+        for i, r in enumerate(elementwise["R"][t]):
+            if r["nonfinite"]:
+                verdicts.append(False)
+            elif t in PARAM_TENSORS:
+                worst = max(
+                    (elementwise[a][t][i]["max_norm"] for a in explicit_arms),
+                    default=0.0,
+                )
+                verdicts.append(r["max_norm"] <= max(1.0, PARAM_SANITY_FACTOR * worst))
+            else:
+                verdicts.append(r["mismatch"] == 0)
+        out[t] = verdicts
+    return out
+
+
 def _log_ratio(num: float, den: float) -> float:
     floor = 1e-300
     return math.log(max(num, floor) / max(den, floor))
@@ -343,7 +386,8 @@ def run_row(
     *,
     arms: dict[str, GateFn],
     m: int,
-    tq: float,
+    tq_aa: float,
+    tq_test: float,
     log: Callable[[str], None] = print,
 ) -> dict:
     """The A/A calibration and the test of one row: every error array, the log-ratios, ``c`` and ``U`` per tensor
@@ -383,38 +427,38 @@ def run_row(
         ]
         for t in TENSORS
     }
-    c = {t: bootstrap_critical_value(ell_aa[t], tq, m) for t in TENSORS}
+    c = {t: bootstrap_critical_value(ell_aa[t], tq_aa, m) for t in TENSORS}
     rec["aa"] = {
         "seeds": list(AA_SEEDS),
         "err": aa_err,
         "ell": ell_aa,
-        "U": {t: u_stat(ell_aa[t], tq) for t in TENSORS},
+        "U": {t: u_stat(ell_aa[t], tq_aa) for t in TENSORS},
         "c": c,
     }
     log(f"row {row}: A/A done in {time.time() - t0:.0f} s; c = {c}")
     # the test
     test_err: dict = {arm: {t: [] for t in TENSORS} for arm in ("R", *arms)}
-    sanity: dict = {t: [] for t in TENSORS}
+    elementwise: dict = {arm: {t: [] for t in TENSORS} for arm in ("R", *arms)}
+
+    def record(arm: str, res: dict, ref: dict) -> None:
+        err = _errors(res, ref)
+        for t in TENSORS:
+            test_err[arm][t].append(err[t])
+            gate_res = elementwise_gate(
+                res[t], ref[t], ELEMENTWISE_ATOL, ELEMENTWISE_RTOL
+            )
+            entry = {k: gate_res[k] for k in ("mismatch", "nonfinite", "numel")}
+            entry["max_norm"] = _max_normalized_error(res[t], ref[t])
+            elementwise[arm][t].append(entry)
+
     for seed in TEST_SEEDS:
         inputs = inputs_of(seed)
         ref = _reference(inputs)
-        raw_res = arm_raw(inputs)
-        for t in TENSORS:
-            gate_res = elementwise_gate(
-                raw_res[t], ref[t], ELEMENTWISE_ATOL, ELEMENTWISE_RTOL
-            )
-            sanity[t].append(
-                {k: gate_res[k] for k in ("mismatch", "nonfinite", "numel")}
-            )
-        err = _errors(raw_res, ref)
-        for t in TENSORS:
-            test_err["R"][t].append(err[t])
-        del raw_res
+        record("R", arm_raw(inputs), ref)
         for arm, fn in arms.items():
-            err = _errors(arm_explicit(inputs, fn), ref)
-            for t in TENSORS:
-                test_err[arm][t].append(err[t])
+            record(arm, arm_explicit(inputs, fn), ref)
         del inputs, ref
+    sanity = _sanity(elementwise, tuple(arms))
     ell = {
         arm: {
             t: [
@@ -425,7 +469,7 @@ def run_row(
         }
         for arm in arms
     }
-    u = {arm: {t: u_stat(ell[arm][t], tq) for t in TENSORS} for arm in arms}
+    u = {arm: {t: u_stat(ell[arm][t], tq_test) for t in TENSORS} for arm in arms}
     verdict = {arm: {t: bool(u[arm][t] <= c[t]) for t in TENSORS} for arm in arms}
     nonfinite = {
         arm: [t for t in TENSORS if not all(math.isfinite(e) for e in test_err[arm][t])]
@@ -438,12 +482,9 @@ def run_row(
         "U": u,
         "pass": verdict,
         "nonfinite_err": nonfinite,
+        "elementwise": elementwise,
         "elementwise_R": sanity,
-        "elementwise_R_pass": all(
-            s["mismatch"] == 0 and s["nonfinite"] == 0
-            for t in TENSORS
-            for s in sanity[t]
-        ),
+        "elementwise_R_pass": all(all(ok) for ok in sanity.values()),
     }
     rec["pass"] = (
         all(all(v.values()) for v in verdict.values())
@@ -498,9 +539,11 @@ class Protocol:
                     f"E_F required: FLA_COMMIT={env} but the imported checkout is at {found} ({fla_info})"
                 )
         self.m = family_size(self.arch, tuple(self.arms))
+        self.tq_aa = t_quantile(0.975, N_AA - 1)
         self.tq = t_quantile(0.975, N_SEEDS - 1)
+        assert abs(self.tq_aa - 2.0395134464) < 1e-8, self.tq_aa
         # the declared constant, against a tabulated value of t_{0.975, 31}
-        assert abs(self.tq - 2.0395134464) < 1e-8, self.tq
+        assert abs(self.tq - 1.9788195347) < 1e-8, self.tq
         self.json_path = json_path
         self.record: dict = {
             "protocol": {
@@ -517,6 +560,9 @@ class Protocol:
                 "boot_rng": "torch CPU Generator seeded boot_seed per (tensor, row); torch.randint(0, N, (B, N))",
                 "quantile": f"torch.quantile(U, 1 - alpha / m, interpolation={QUANTILE_METHOD!r})",
                 "t_0975_df": [self.tq, N_SEEDS - 1],
+                "t_0975_df_aa": [self.tq_aa, N_AA - 1],
+                "revision": 2,
+                "param_tensors_sanity": [list(PARAM_TENSORS), PARAM_SANITY_FACTOR],
                 "perturb_seed_base": PERTURB_SEED_BASE,
                 "lower_bound": LOWER_BOUND,
                 "metric": "rel_rms = rms(cand - ref) / rms(ref), FP64 reference",
@@ -547,7 +593,15 @@ class Protocol:
         return tuple(dict.fromkeys(requested))
 
     def run(self, row: str, log: Callable[[str], None] = print) -> dict:
-        rec = run_row(row, self.device, arms=self.arms, m=self.m, tq=self.tq, log=log)
+        rec = run_row(
+            row,
+            self.device,
+            arms=self.arms,
+            m=self.m,
+            tq_aa=self.tq_aa,
+            tq_test=self.tq,
+            log=log,
+        )
         self.record["rows"][row] = rec
         rows_run = list(self.record["rows"])
         self.record["rows_run"] = rows_run
