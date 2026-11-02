@@ -19,15 +19,19 @@ W8A16 FP8 GEMM benchmark on the Cosmos3-Super Linear shapes.
 
 The weight is FP8 e4m3 with ONE per-tensor fp32 scale (the layout TRT-LLM's
 FP8QDQ loader produces); the activation is bf16 or fp16, the output is the
-activation dtype.  TRT-LLM's ``W8A16FP8LinearMethod.apply`` today is a
-cast-copy -- ``weight.to(dtype).mul_(scale.to(dtype))`` then ``F.linear``: the
-scale is rounded to the activation dtype, then the product is -- and this
-script benchmarks the FlashInfer fused kernel (``flashinfer.gemm.w8a16_fp8_gemm``,
-weight dequantized on the fly, never materialised) against it.
+activation dtype.  The baseline this script runs is the cast-copy path --
+``weight.to(dtype).mul_(scale.to(dtype))`` then ``F.linear`` (the scale is
+rounded to the activation dtype, then the product is), the form of TRT-LLM's
+``W8A16FP8LinearMethod`` -- against the FlashInfer fused kernel
+(``flashinfer.gemm.w8a16_fp8_gemm``, weight dequantized on the fly, never
+materialised).
 
 Columns reported per (layer, TP, M) row:
 
-    us         median GPU time (CUPTI kernel span, L2 flushed per iteration)
+    us         median GPU time: the CUPTI kernel span when cupti-python is
+               installed and ``--no-cupti`` is not given, else CUDA-graph
+               replays timed with events; L2 flushed before every iteration
+               unless ``--no-l2-flush``
     TFLOP/s    2*M*N*K / t
     GB/s(W8)   N*K bytes of FP8 weight / t  (the memory-bound view of decode)
     vs cast    cast-copy time / kernel time   (>1 means the kernel is faster)
@@ -307,7 +311,8 @@ _CUPTI_UNAVAILABLE_WARNED = False
 
 
 def _time_kernel(args, run_fn: Callable[[], None], tag: str, iters: int):
-    """Median / min / max latency of ``run_fn`` over ``iters`` timed replays."""
+    """(median, p95, p99) latency in us of ``run_fn`` over ``iters`` timed replays:
+    CUPTI kernel spans when available and requested, else CUDA-graph timing."""
     if args.l2_flush:
         _init_l2_flush()
     if args.cupti:
@@ -364,9 +369,10 @@ def make_kernel(
     algo: str | None = None,
     out: torch.Tensor | None = None,
 ) -> Callable[[], torch.Tensor]:
-    """FlashInfer kernel; ``algo`` pins a kernel variant (``--algo``; Hopper or
-    Blackwell names).  A kernel column was asked for, so an import failure is a
-    failure of the run (not a silently skipped column)."""
+    """FlashInfer kernel; ``algo`` selects a tile or split policy (``--algo``; Hopper
+    or Blackwell names, a policy may resolve to another tile or run plain).  A kernel
+    column was asked for, so an import failure is a failure of the run (not a
+    silently skipped column)."""
     try:
         from flashinfer.gemm import w8a16_fp8_gemm
     except ImportError as e:

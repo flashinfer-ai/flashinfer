@@ -224,8 +224,9 @@ def _check_dims(m: int, n: int, k: int) -> None:
         raise ValueError(f"N must be a multiple of 8 (16-byte output rows), got N={n}")
 
 
-# Blackwell kernel variants selectable through ``algo`` (``_SM100_TILES`` in
-# w8a16_fp8_dispatch.py).  The stream-K code runs the best of the other variants.
+# Blackwell variants selectable through ``algo`` (``_SM100_TILES`` in
+# w8a16_fp8_dispatch.py).  The stream-K code is a policy: a wave-fill cost model
+# over the plain 2SM tiles (256x128, 256x160, 256x192) and split-K on 256x128.
 W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
     "auto": 0,
     "2sm256x128": 1,
@@ -357,23 +358,21 @@ def w8a16_fp8_gemm(
         ``None`` / ``"auto"`` = the launcher decides.  This is the only
         override; there are no environment variables.  A plain name runs
         every output tile whole on that tile shape.  A ``_splitk`` name cuts
-        the tiles into K-slices with fp32 partials in the workspace; it is
+        the tiles into K-slices (fp32 partials in the workspace); it is
         rejected with a ValueError on a ``K`` it cannot slice (Hopper: ``K``
         a multiple of 64 whose 64-deep tile count divides into 2..8 equal
         slices of at least 8 tiles; Blackwell: ``K`` a multiple of 128 whose
-        128-deep tile count has a divisor in 2..8), and falls back to the
-        plain tile (no workspace) where the split cannot run: on Hopper the
-        slices of a tile reduce it among themselves and must all be resident,
-        so a grid of more tiles than that allows runs plain; on Blackwell the
-        slices' partials are stacked as one output of ``splits x M`` rows,
-        which must stay below ``2**31``.  A ``_streamk`` name is a policy on
-        the named tile, not a stream-K kernel: on Hopper it runs the whole
-        waves of that tile plain and cuts only the last partial wave into
-        K-slices over the idle SMs (plain when the tail is at least half a
-        wave or ``K`` too short); on Blackwell it picks, by a wave-fill cost
-        model, between the plain 2SM tiles and a split-K run of the 256x128
-        tile.  :func:`w8a16_fp8_gemm_workspace_bytes` reports what the
-        resolved policy needs.
+        128-deep tile count has a divisor in 2..8), and runs the tile plain
+        (no workspace) where the split cannot run (Hopper: a grid too large
+        for all slices of a tile to be resident; Blackwell: ``splits x M`` at
+        or above ``2**31``).  A ``_streamk`` name is a policy on the named
+        tile, not a stream-K kernel: on Hopper it runs the whole waves of that
+        tile plain and splits only the last partial wave over the idle SMs
+        (plain when that tail is at least half a wave or ``K`` is short); on
+        Blackwell it picks, by a wave-fill cost model, between the plain 2SM
+        tiles and split-K on the 256x128 tile.
+        :func:`w8a16_fp8_gemm_workspace_bytes` reports what the resolved
+        policy needs.
 
     Notes
     -----
@@ -381,16 +380,16 @@ def w8a16_fp8_gemm(
     ``w8a16_fp8_gemm.is_compute_capability_supported(cc)`` answers for a
     device.  The kernels are CuTe-DSL, compiled on first use per architecture,
     tile variant, activation dtype and bias presence, and are not part of the
-    AOT packages.  Compiled kernels go to the on-disk CuTe-DSL cache under the
-    JIT workspace (``cached_ops/w8a16_fp8_gemm_<arch>_cute_dsl/``), so a later
-    process reloads them instead of recompiling; ``FLASHINFER_DISABLE_JIT`` and
-    ``FLASHINFER_CUTE_DSL_DISABLE_CACHE`` apply as to every CuTe-DSL kernel.
+    AOT packages.  Compiled kernels are cached on disk under the JIT workspace
+    like every CuTe-DSL kernel, so a later process reloads instead of
+    recompiling; ``FLASHINFER_DISABLE_JIT`` and
+    ``FLASHINFER_CUTE_DSL_DISABLE_CACHE`` apply.
 
     Shapes and layout: ``K`` must be a multiple of 16 and ``N`` a multiple of
     8, both non-zero, and ``M`` (the product of ``act``'s leading dimensions,
     not each of them), ``N`` and ``K`` each at most ``2**31 - 512``, with
-    ``ceil(M / 64) * ceil(N / 64)`` at most ``2**28 - 1`` (an output of about
-    a terabyte; the kernels count tiles in 32-bit ints).  Every tensor
+    ``ceil(M / 64) * ceil(N / 64)`` at most ``2**28 - 1`` (the kernels'
+    tile-count limit).  Every tensor
     among ``act`` / ``weight`` / ``bias`` / ``out`` / ``workspace`` must start
     at a 16-byte aligned address (a view into a larger buffer at an odd
     storage offset does not; contiguity alone is not enough).  Nothing is

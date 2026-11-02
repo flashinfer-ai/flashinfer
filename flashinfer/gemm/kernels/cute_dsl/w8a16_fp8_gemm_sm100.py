@@ -14,12 +14,14 @@ convert the TMA-landed weight tile in registers
 TMEM, or to smem for the tile whose two accumulator stages take all of TMEM
 (``a_in_smem``).  The MMA warp issues tcgen05.mma with A from there and B from smem.
 The epilogue applies the per-tensor scale (fp32, read on device) and the optional
-per-N bias in fp32 and stores through TMA (SIMT for a partial last activation tile).
+per-N bias in fp32 and stores through TMA, which clips a partial last activation
+tile of the final output; only a split-K partial tile that is not whole stores
+through predicated SIMT (the slices' partials abut in memory).
 
 Warp roles (16 warps): 0-3 epilogue, 4 MMA, 5 scheduler, 6 weight TMA, 7 activation
 TMA, 8-15 transform.  Same structure as FlashInfer's dense W4A16 kernel
 (``dense_gemm_bf16_fp4_sm100.py``), from which this file is derived, and as the
-CUTLASS C++ W8A16 kernel this port replaced.
+CUTLASS C++ mixed-input W8A16 kernel.
 """
 
 from math import ceil, log2
@@ -176,9 +178,8 @@ class Sm100W8A16Fp8GemmKernel:
         )
         # 64 activation columns per epilogue subtile where the tile allows (the helper
         # picks 32 for a 16-bit C): half the subtiles, so half the named-barrier and
-        # TMA-store round trips per tile, which is what the epilogue's time is (GB200,
-        # 2sm256x128 tile: 1.5 -> 1.0 us per tile).  The smem per stage doubles and
-        # the stage count halves, same footprint.
+        # TMA-store round trips per tile, which is what the epilogue's time is.  The
+        # smem per stage doubles and the stage count halves, same footprint.
         # (The helper's tile entries may be layouts rather than ints, hence cute.size.)
         if (
             self.c_dtype.width == 16
@@ -1673,7 +1674,7 @@ class Sm100W8A16Fp8GemmKernel:
     ):
         """The CTA's first work item, derived from its cluster index by every warp role
         itself (the scheduler warp publishes from the second item on): saves the
-        scheduler-to-consumer hop at kernel start, ~0.6 us on GB200."""
+        scheduler-to-consumer hop at kernel start."""
         _, _, bidz = cute.arch.block_idx()
         lin = cutlass.Int32(bidz)
         (
@@ -1807,10 +1808,9 @@ class Sm100W8A16Fp8GemmKernel:
             sBias[(epi_tidx, bias_buf)] = bias_val
             self.epilog_sync_barrier.arrive_and_wait()
         subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-        # Unrolled (the count is static).  Loading the next subtile's
-        # accumulator ahead of the current one's store was tried and bought
-        # nothing: the subtile's cost is the smem write, two named barriers
-        # and the TMA store issue, not the TMEM load (GB200 timeline).
+        # Unrolled (the count is static); the accumulator load is not pipelined
+        # across subtiles: a subtile's cost is the smem write, the two named
+        # barriers and the TMA store issue, not the TMEM load.
         for subtile_idx in cutlass.range_constexpr(subtile_cnt):
             cute.copy(
                 tiled_copy_t2r,
@@ -1838,9 +1838,8 @@ class Sm100W8A16Fp8GemmKernel:
             # when the output is the final one: the TMA clips the rows past the
             # tensor's extent.  Only split-K partials, whose slices abut in
             # memory, need the predicated SIMT store (a clipped TMA store would
-            # run into the next slice).  The SIMT path costs a partial-tile CTA
-            # ~1.7 us and set the kernel's end on every M not a multiple of the
-            # tile (GB200 gen.qkv / attn.out M=1024 on the 160-wide tile).
+            # run into the next slice).  The SIMT path is much slower per tile, so
+            # it is kept to that case.
             tma_store_ok = work_tile.distance_to_boundary >= self.cta_tile_shape_mnk[1]
             if cutlass.const_expr(self.splits == 1):
                 tma_store_ok = cutlass.Boolean(True)
@@ -1928,8 +1927,7 @@ class Sm100W8A16Fp8GemmKernel:
         # One accumulator stage is the CTA tile's 128 lanes x N fp32 columns.  Counted
         # exactly, not rounded up to a power of two as the TMEM *allocation* is: the
         # 160- and 192-wide tiles would otherwise be charged 256 columns a stage and
-        # fall back to a single stage, exposing the whole epilogue after every tile
-        # (GB200: 2sm256x160 84 us vs 71 us for the C++, which keeps two stages).
+        # fall back to a single stage, exposing the whole epilogue after every tile.
         assert cta_tile_shape_mnk[0] == 128, "the accumulator spans all 128 TMEM lanes"
         num_tmem_acc_col_per_stage = cta_tile_shape_mnk[1]
         sm100_tmem_columns = cute.arch.get_max_tmem_alloc_cols("sm_100")

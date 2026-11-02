@@ -20,8 +20,13 @@ limitations under the License.
 entry with its argument checks is ``flashinfer.gemm.w8a16_fp8_gemm``.  This module
 holds the variant selection (``algo`` codes, cost models, tile walk) and the
 launch of the Hopper and Blackwell CuTe-DSL kernels under ``kernels/cute_dsl/``.
-The selection rules were ported from the CUTLASS C++ implementation this port
-replaced and validated against it shape by shape.
+The selection rules follow those of the CUTLASS C++ mixed-input W8A16 kernels.
+
+Workspace: a split-K call writes fp32 partials there (Blackwell: the slices'
+partials stacked as one output of ``splits x M`` rows, reduced by a second
+kernel; Hopper: one block per tail (tile, slice) plus one arrival counter per
+tail tile, the slices reducing the tile among themselves in the kernel).  The
+public query ``w8a16_fp8_gemm_workspace_bytes`` reports the resolved need.
 """
 
 import functools
@@ -156,7 +161,7 @@ def _sm100_streamk_substitute(m: int, n: int, k: int, num_sms: int) -> Tuple[int
     stream-K kernel, so the plain tiles and the split-K slice counts are scored by wave
     quantization (whole waves of k-tiles, the last wave counted whole) plus the
     split-K reduce (its fp32 partial traffic in k-tile-waves), and the cheapest wins.
-    Falls back to the plain 256x128 tile when K cannot be sliced."""
+    When K cannot be sliced only the plain candidates compete."""
     clusters = num_sms // 2 if num_sms > 1 else 1
     ktiles = k // 128
 
@@ -205,7 +210,8 @@ def sm100_pick_algo(m: int, n: int, k: int, num_sms: int) -> int:
         tile_a = _SM100_TILES[algo].mma_tiler[1]
         return _sm100_plain_waves(m, n, algo, clusters) * tile_a / eff
 
-    # The widest tile wins ties here (one wave of 192-row tiles beats one of 128).
+    # 192 rows when it is no costlier than either other width; else 160 rows when
+    # strictly cheaper than 128; else 128.
     c128, c160, c192 = (cost(algo, eff) for algo, eff in _SM100_PLAIN_CANDIDATES)
     if c192 <= c128 and c192 <= c160:
         return 4
@@ -999,10 +1005,9 @@ def _w8a16_fp8_gemm_sm90(
             workspace = torch.empty(total_bytes, dtype=torch.uint8, device=act.device)
         partials = _scratch(workspace, (tail_blocks, tile_a, tile_w), torch.float32)
         counters = _scratch(workspace, (tail_tiles,), torch.int64, counters_offset)
-        # The arrival counters start every call at zero (a stride boundary of the
-        # kernel's monotonic scheme): one memset on the call's stream, so the counters
-        # of a call are ordered with its kernel and a caller's reused buffer holds
-        # nothing the kernel trusts.
+        # The kernel's precondition: the arrival counters are zero at launch.  One
+        # memset on the call's stream, so the counters of a call are ordered with its
+        # kernel and a caller's reused buffer holds nothing the kernel trusts.
         counters.zero_()
     else:
         # Unused by the kernel, which still builds its workspace TMA descriptor and

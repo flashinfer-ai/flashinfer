@@ -13,18 +13,21 @@ rows), the activation operand B (kernel N = activation rows), C[n, m] column-maj
 ``out`` row-major.
 
 Persistent, warp-specialized: a producer warpgroup whose warp 0 TMA-loads the fp8
-weight tile and the 16-bit activation tile of every k-tile, and one or two consumer
-warpgroups.  A consumer warpgroup pulls its 64 weight rows of a k-block from smem into
-registers, converts e4m3 -> bf16/fp16 (``w8a16_fp8_gemm_sm100_utils.convert_e4m3_fragment``)
-and issues wgmma with A from registers and B from smem, software-pipelined over the
-k-blocks of a stage as CUTLASS's register-sourced mixed-input mainloop does.  The
-epilogue applies the per-tensor scale and the per-weight-row bias in fp32, converts and
-TMA-stores (tile_m x 32) subtiles.
+weight tile and the 16-bit activation tile of every k-tile, and two consumer
+warpgroups.  A consumer warpgroup loads its 64 weight rows of a k-block from smem as
+e4m3 pairs (``load_e4m3_unit``), converts them to bf16 / fp16 in registers
+(``convert_e4m3_words``) and issues wgmma with A from registers and B from smem,
+software-pipelined over the k-blocks of a stage as CUTLASS's register-sourced
+mixed-input mainloop does.  The epilogue applies the per-tensor scale and the
+per-weight-row bias in fp32, converts and TMA-stores (tile_m x 32) subtiles.
 
-Tiles: (128, A) with two consumer warpgroups (the C++ cooperative tiles), (64, A) with one
-(the C++ ping-pong tiles run as single-warpgroup tiles here).  The tile walk is the C++
-grouped order: consecutive work items take the weight tiles of one activation tile;
-``group_size`` activation tiles form an L2 group that walks all weight tiles together.
+Tiles: a CTA always runs two consumer warpgroups.  On a (128, A) tile they cooperate,
+64 weight rows each (CUTLASS's cooperative schedule); on a (64, A) tile each owns
+every other tile of the CTA's sequence and the two alternate, one's epilogue
+overlapping the other's mainloop (CUTLASS's ping-pong schedule).  The tile walk is
+the grouped order of the CUTLASS W8A16 kernels: consecutive work items take the
+weight tiles of one activation tile; ``group_size`` activation tiles form an L2
+group that walks all weight tiles together.
 
 Work decomposition: the first ``body_items`` tiles are plain (whole K, output written
 by the epilogue); the tiles after them are the *tail*, each cut into ``tail_splits``
@@ -55,13 +58,15 @@ from .w8a16_fp8_gemm_sm100_utils import (
     nanosleep,
 )
 
-# The tail tiles' arrival counters only ever grow.  Every slice of a tile adds
-# ``TAIL_COUNTER_STRIDE // splits``, so a complete tile advances its counter by exactly
-# one stride whatever its split count (the stride is lcm(1..16); 16 is the most slices
-# a tile is cut into), and a slice waits for the next stride boundary above the value
-# it saw.  No reset, so no second round trip, and a counter that a different launch
-# used with another split count is still at a boundary.  Launches to overflow a
-# 64-bit counter: 2^63 / 720720, never.
+# The tail tiles' arrival counters: one 64-bit word per tail tile, owned by the call's
+# workspace and zeroed on the call's stream before the launch (the dispatcher's
+# precondition).  Every slice of a tile adds ``TAIL_COUNTER_STRIDE // splits`` with
+# release semantics after publishing its partial block, so the tile is complete when
+# its counter reaches one stride whatever its split count (the stride is lcm(1..16);
+# 16 is the most slices a tile is cut into); a slice then waits, with acquire loads,
+# for the counter to reach the stride boundary above the value its own add returned.
+# The add's return value also tells the last slice it is last, so only the others
+# poll.
 TAIL_COUNTER_STRIDE = 720720
 
 
@@ -103,9 +108,10 @@ class Sm90W8A16Fp8GemmKernel:
         has_tail: bool = False,
         enable_pdl: bool = False,
     ):
-        # tile_shape_mn: (weight rows, activation rows) per CTA tile; 128 weight rows run
-        # on two consumer warpgroups, 64 on one.  Activation rows: a multiple of 8, at
-        # most 256 (the wgmma N extent).
+        # tile_shape_mn: (weight rows, activation rows) per CTA tile.  The CTA always
+        # has two consumer warpgroups: a 128-row tile is shared by both (64 rows each),
+        # a 64-row tile is owned whole by one, the two alternating tiles (ping-pong).
+        # Activation rows: a multiple of 8, at most 256 (the wgmma N extent).
         tile_w, tile_a = tile_shape_mn
         if tile_w not in (64, 128):
             raise ValueError(
@@ -1216,8 +1222,9 @@ class Sm90W8A16Fp8GemmKernel:
         it (bulk stores complete, release), count in on the tile's counter, wait for
         the tile's ``tail_splits`` slices, then reduce this slice's share of the tile's
         activation columns over all blocks, apply scale and bias and store the 16-bit
-        output.  The counter is monotonic (see ``TAIL_COUNTER_STRIDE``): the add's
-        return value tells the last slice it is last, so only the others poll."""
+        output.  The counter arrives zeroed for this call (see ``TAIL_COUNTER_STRIDE``);
+        the add's return value tells the last slice it is last, so only the others
+        poll."""
         tile_m, tile_a, _ = self.tile_shape_mnk
         epi_barrier = pipeline.NamedBarrier(
             barrier_id=barrier_id, num_threads=self.num_epi_threads
@@ -1415,7 +1422,8 @@ class Sm90W8A16Fp8GemmKernel:
         is C[n, m, 1].  The workspace holds ``tail_blocks`` fp32 tiles of
         (tile_m, tile_a), one per tail work item, as W[tile_m, tail_blocks * tile_a, 1]
         (weight rows contiguous, as C); ``counters`` are the tail tiles' 64-bit
-        monotonic arrival counters (``TAIL_COUNTER_STRIDE``), one per tail tile."""
+        arrival counters (``TAIL_COUNTER_STRIDE``), one per tail tile, zeroed by the
+        caller on this stream before the launch."""
         tile_m, tile_a, _ = self.tile_shape_mnk
         weight = cute.make_tensor(
             weight_ptr, cute.make_ordered_layout((n, k, 1), order=(1, 0, 2))

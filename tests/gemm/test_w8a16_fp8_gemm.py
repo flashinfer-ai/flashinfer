@@ -198,7 +198,7 @@ def test_w8a16_fp8_gemm_caller_workspace():
     assert (
         w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo) == need
     )  # pure in its inputs
-    # Same answer from the fp16 module: the size does not depend on the activation dtype.
+    # Same answer for fp16: the size does not depend on the activation dtype.
     assert (
         w8a16_fp8_gemm_workspace_bytes(m, n, k, dev, algo, act_dtype=torch.float16)
         == need
@@ -232,14 +232,14 @@ _MAX_TILES64 = 2**28 - 1  # the admitted bound on ceil(M / 64) x ceil(N / 64)
 
 
 def test_w8a16_fp8_gemm_workspace_bytes_extreme_dims():
-    """The workspace query runs the dispatch cost models and, for stream-K, CUTLASS's
-    own scheduler sizing without allocating anything, so it reaches the largest
-    dimensions the launcher admits (a single dimension at the bound is a 32 GiB weight
-    or output, so it is reachable; the tile-count bound is not).  Every variant's query
-    must answer there (the tile-count arithmetic must not overflow), and one past the
-    bound is rejected: a dimension over 2**31 - 512 would overflow CUTLASS's 32-bit
-    tile-count ceiling division, which adds the tile (up to 256) before subtracting one,
-    an output beyond 2**28 - 1 tiles of 64x64 its 32-bit tile product."""
+    """The workspace query runs the dispatcher's cost models and tail / split planning
+    without allocating anything, so it reaches the largest dimensions the launcher
+    admits (a single dimension at the bound is a 32 GiB weight or output, so it is
+    reachable; the tile-count bound is not).  Every variant's query must answer there
+    (the tile-count arithmetic must not overflow), and one past the bound is rejected:
+    a dimension over 2**31 - 512 would overflow the kernels' 32-bit tile-count ceiling
+    division, which adds the tile (up to 256) before subtracting one, an output beyond
+    2**28 - 1 tiles of 64x64 their 32-bit tile product."""
     dev = torch.device("cuda")
     big = _MAX_DIM
     algos = [None] + (_ALGOS_SM100 if _major() == 10 else _ALGOS_SM90)
