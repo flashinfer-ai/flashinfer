@@ -899,10 +899,12 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
         nd.enable_pdl(SLAB, 1, arch, "sideways")
 
 
-# This package's own PDL bands of record (``cake_jit.PDL_BAND_OVERRIDES``, measured on B200 with 148 SMs): the
-# collapse (``K1->K3``, forward) and the backward prepare (``K1->K5``, checkpointed backward) off in (2944, 3456]
-# beside the deterministic (4096, 8192] at every hidden size, and the column slab (``K6->K7``, checkpointed backward)
-# per hidden size.  Every other board (GB200: sm_100a with 152 SMs, sm_103a, sm_107a) keeps the deterministic bands.
+# This package's own PDL bands of record (``cake_jit.PDL_BAND_OVERRIDES``, measured on B200 with 148 SMs and on GB300
+# with 152 SMs).  B200: the collapse (``K1->K3``, forward) and the backward prepare (``K1->K5``, checkpointed backward)
+# off in (2944, 3456] beside the deterministic (4096, 8192] at every hidden size, and the column slab (``K6->K7``,
+# checkpointed backward) per hidden size.  GB300: the column slab (checkpointed backward) per hidden size, open above
+# at 5120 and 7168.  Every other board (GB200: sm_100a with 152 SMs, B300: sm_103a with 148 SMs, sm_107a) keeps the
+# deterministic bands.
 PDL_OVERRIDES = {
     ("sm_100a", 148, None): {
         "K1->K3": {"forward": ((2944, 3456), (4096, 8192))},
@@ -911,9 +913,19 @@ PDL_OVERRIDES = {
     ("sm_100a", 148, 4096): {"K6->K7": {"checkpoint": ((1024, 2048), (4096, 8192))}},
     ("sm_100a", 148, 5120): {"K6->K7": {"checkpoint": ((1024, 2047),)}},
     ("sm_100a", 148, 7168): {"K6->K7": {"checkpoint": ((896, 8192),)}},
+    ("sm_103a", 152, 4096): {"K6->K7": {"checkpoint": ((1024, 2112), (4096, 8192))}},
+    ("sm_103a", 152, 5120): {
+        "K6->K7": {"checkpoint": ((1087, 1920), (4096, 8192), (24576, None))}
+    },
+    ("sm_103a", 152, 7168): {"K6->K7": {"checkpoint": ((831, None),)}},
 }
-# The boards the per-call PDL argument is checked on: the boards of record and GB200 (sm_100a with 152 SMs).
-PDL_BOARDS = (*det.RULES_BOARDS, ("sm_100a", 152))
+# The boards with bands of their own (B200 and GB300).
+PDL_OVERRIDE_BOARDS = {
+    (arch, sm) for arch, sm, _hidden in PDL_OVERRIDES if sm is not None
+}
+# The boards the per-call PDL argument is checked on: the boards of record, GB200 (sm_100a with 152 SMs) and B300
+# (sm_103a with 148 SMs).
+PDL_BOARDS = (*det.RULES_BOARDS, ("sm_100a", 152), ("sm_103a", 148))
 # B200 at the band edges and measured token counts: (hidden, or None for every size; edge; path; T; value with 148
 # SMs; deterministic value).
 PDL_POINTS = (
@@ -930,6 +942,16 @@ PDL_POINTS = (
     (7168, "K6->K7", "checkpoint", 896, 1, 1), (7168, "K6->K7", "checkpoint", 897, 0, 1),
     (7168, "K6->K7", "checkpoint", 1024, 0, 1), (7168, "K6->K7", "checkpoint", 8192, 0, 0),
     (7168, "K6->K7", "checkpoint", 8193, 1, 1),
+)  # fmt: skip
+# GB300 at the column slab's band edges and measured token counts: (hidden, T, value with 152 SMs, deterministic
+# value).
+PDL_POINTS_GB300 = (
+    (4096, 1024, 1, 1), (4096, 1025, 0, 1), (4096, 1536, 0, 1), (4096, 2112, 0, 1), (4096, 2113, 1, 1),
+    (4096, 4096, 1, 1), (4096, 4097, 0, 0), (4096, 8192, 0, 0), (4096, 8193, 1, 1), (4096, 65536, 1, 1),
+    (5120, 1025, 1, 1), (5120, 1087, 1, 1), (5120, 1088, 0, 1), (5120, 1920, 0, 1), (5120, 1921, 1, 1),
+    (5120, 4097, 0, 0), (5120, 8193, 1, 1), (5120, 24576, 1, 1), (5120, 24577, 0, 1), (5120, 65536, 0, 1),
+    (7168, 768, 1, 1), (7168, 831, 1, 1), (7168, 832, 0, 1), (7168, 4096, 0, 1), (7168, 8192, 0, 0),
+    (7168, 8193, 0, 1), (7168, 32768, 0, 1), (7168, 65536, 0, 1),
 )  # fmt: skip
 
 
@@ -988,7 +1010,7 @@ def test_pdl_band_overrides_are_well_formed() -> None:
     architecture, an SM count (a positive int) or ``None`` and a hidden size the architecture serves or ``None``,
     never both ``None`` (that cell is ``PDL_OFF_BANDS``'s); each cell sits on an edge of ``PDL_EDGES`` and a path of
     ``PDL_PATHS`` and holds non-empty, sorted, disjoint bands ``(above, at_most]`` of ints with
-    ``0 <= above < at_most``."""
+    ``0 <= above < at_most``, where only the last band may leave ``at_most`` ``None`` (no upper end)."""
     assert nd.PDL_BAND_OVERRIDES == PDL_OVERRIDES
     assert "PDL_BAND_OVERRIDES" in nd.__all__
     edges = set(nd.PDL_EDGES.values())
@@ -1004,9 +1026,14 @@ def test_pdl_band_overrides_are_well_formed() -> None:
             for path, bands in paths.items():
                 assert path in nd.PDL_PATHS and bands, (key, edge, path)
                 last = None
-                for above, at_most in bands:
-                    assert type(above) is type(at_most) is int, (key, edge, bands)
-                    assert 0 <= above < at_most, (key, edge, path, bands)
+                for i, (above, at_most) in enumerate(bands):
+                    assert type(above) is int, (key, edge, bands)
+                    if at_most is None:
+                        assert i == len(bands) - 1, (key, edge, path, bands)
+                    else:
+                        assert type(at_most) is int, (key, edge, bands)
+                    assert above >= 0, (key, edge, path, bands)
+                    assert at_most is None or above < at_most, (key, edge, path, bands)
                     assert last is None or last <= above, (key, edge, path, bands)
                     last = at_most
 
@@ -1014,11 +1041,12 @@ def test_pdl_band_overrides_are_well_formed() -> None:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(("arch", "sm"), PDL_BOARDS)
 def test_pdl_band_overrides_by_board(arch: str, sm: int) -> None:
-    """On every board (the boards of record and GB200), hidden size, path, record that takes the per-call PDL argument
-    and token count (:func:`_pdl_token_counts`), ``enable_pdl`` with the board's SM count reads 0 exactly inside the
-    bands of :func:`_pdl_cell` and 1 outside, and without an SM count the deterministic bands (the four-argument value,
-    the deterministic record's for the copied records: the collapse and the backward prepare).  Only B200 with 148
-    SMs reads other values than the deterministic bands; every other board reads the value without an SM count."""
+    """On every board (the boards of record, GB200 and B300), hidden size, path, record that takes the per-call PDL
+    argument and token count (:func:`_pdl_token_counts`), ``enable_pdl`` with the board's SM count reads 0 exactly
+    inside the bands of :func:`_pdl_cell` and 1 outside, and without an SM count the deterministic bands (the
+    four-argument value, the deterministic record's for the copied records: the collapse and the backward prepare).
+    Only the boards with bands of their own (:data:`PDL_OVERRIDE_BOARDS`: B200 with 148 SMs, GB300 with 152) read other
+    values than the deterministic bands; every other board reads the value without an SM count."""
     differs = 0
     for hidden in _arch_sizes(arch):
         names = _runtime_pdl_records(arch, hidden)
@@ -1040,10 +1068,10 @@ def test_pdl_band_overrides_by_board(arch: str, sm: int) -> None:
                     assert without == _pdl_value(T, base), what
                     if copied:
                         assert without == det.enable_pdl(det_name, T, arch, path), what
-                    if (arch, sm) != ("sm_100a", 148):
+                    if (arch, sm) not in PDL_OVERRIDE_BOARDS:
                         assert value == without, what
                     differs += value != without
-    assert (differs > 0) == ((arch, sm) == ("sm_100a", 148)), differs
+    assert (differs > 0) == ((arch, sm) in PDL_OVERRIDE_BOARDS), differs
     with pytest.raises(ValueError):
         nd.enable_pdl(SLAB, 1, arch, "sideways", sm_count=sm)
 
@@ -1068,6 +1096,46 @@ def test_pdl_band_overrides_at_the_measured_points() -> None:
                 assert nd.enable_pdl(name, T, arch, path, sm_count=148) == b200, what
                 assert nd.enable_pdl(name, T, arch, path, sm_count=152) == base, what
                 assert nd.enable_pdl(name, T, arch, path) == base, what
+
+
+@pytest.mark.cpu_only
+def test_pdl_band_overrides_at_the_measured_points_gb300() -> None:
+    """On GB300 the per-call argument at the column slab's band edges and measured token counts
+    (:data:`PDL_POINTS_GB300`) of every column-slab record at the point's hidden size, on the checkpointed backward:
+    with 152 SMs the GB300 value, with 148 SMs (B300) and without an SM count the deterministic one; the forward and
+    the backward from saved statistics and the other edges keep the deterministic values."""
+    arch = "sm_103a"
+    for hidden in _arch_sizes(arch):
+        slabs = [
+            name
+            for name in _runtime_pdl_records(arch, hidden)
+            if nd.pdl_edge(nd.MODULES[name]["library"]) == "K6->K7"
+        ]
+        others = [
+            name for name in _runtime_pdl_records(arch, hidden) if name not in slabs
+        ]
+        assert slabs and others, (hidden, slabs, others)
+        points = [p for p in PDL_POINTS_GB300 if p[0] == hidden]
+        assert points, hidden
+        for _hidden, T, gb300, base in points:
+            for name in slabs:
+                what = (hidden, name, T)
+                assert (
+                    nd.enable_pdl(name, T, arch, "checkpoint", sm_count=152) == gb300
+                ), what
+                assert (
+                    nd.enable_pdl(name, T, arch, "checkpoint", sm_count=148) == base
+                ), what
+                assert nd.enable_pdl(name, T, arch, "checkpoint") == base, what
+                for path in ("forward", "backward"):
+                    assert nd.enable_pdl(
+                        name, T, arch, path, sm_count=152
+                    ) == nd.enable_pdl(name, T, arch, path), what
+            for name in others:
+                for path in nd.PDL_PATHS:
+                    assert nd.enable_pdl(
+                        name, T, arch, path, sm_count=152
+                    ) == nd.enable_pdl(name, T, arch, path), (hidden, name, path, T)
 
 
 # A test table for the order of the keys: one band per key on the column slab's edge of sm_100a.  (sm_100a, 148, 5120)

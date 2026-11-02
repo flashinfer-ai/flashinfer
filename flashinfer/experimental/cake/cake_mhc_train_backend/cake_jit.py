@@ -197,7 +197,8 @@ the launches its key matches, the most specific key first.  On B200 with 148
 SMs the collapse (forward) and the backward prepare (checkpointed backward) are
 off in (2944, 3456] tokens as well, where the mapping pass runs 24 to 27 token
 tiles, and the column-slab pass (checkpointed backward) has its own bands per
-hidden size; every other board keeps ``PDL_OFF_BANDS``.
+hidden size; on GB300 with 152 SMs the column-slab pass (checkpointed backward)
+has its own bands per hidden size; every other board keeps ``PDL_OFF_BANDS``.
 """
 
 from __future__ import annotations
@@ -8313,7 +8314,8 @@ def selected_modules(
 # ``hidden`` (``None``: any).  The most specific key that holds the cell wins:
 # ``(arch, sm_count, hidden)``, then ``(arch, sm_count, None)``, then
 # ``(arch, None, hidden)``, then ``PDL_OFF_BANDS``.  A launch without an SM
-# count matches only the keys without one.
+# count matches only the keys without one.  An override band ``(above, None)``
+# has no upper end.
 
 PDL_PATHS = ("forward", "backward", "checkpoint")
 # Library stem -> the edge its records sit on (predecessor -> dependent).  The
@@ -8368,11 +8370,20 @@ PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
 # 7168 (0.68..2.86 us faster from 913 to 1024 tokens, 15 or 16 of 16; from 705
 # to 897 tokens off gained nothing and lost up to 0.52 us); at 7168 the band
 # stops at 8192 because the gains above it did not repeat.
-# GB200 (sm_100a, 152 SMs), sm_103a and sm_107a are not measured and keep
+# On GB300 (sm_103a, 152 SMs), the same A/B at 22 to 34 token counts per hidden
+# size: the column slab (K6->K7, checkpoint) is off from 832 tokens on at hidden
+# 7168 (the checkpointed step 0.53..6.29 us faster from 832 to 4096 tokens and
+# 2.16..42.17 us from 9216 to 65536, 13 to 16 of 16 groups), in (1087, 1920] at
+# 5120 (2.43..6.81 us, 15 or 16 of 16; at 1025 tokens off was faster in one run
+# and slower in the next) and above 24576 (0.50..12.68 us, 13 to 15 of 16), and
+# in (1024, 2112] at 4096 (up to 1.63 us faster, no token count slower); at 4096
+# and 5120 the deterministic (4096, 8192] band stays, and the other edges keep
 # PDL_OFF_BANDS.
+# GB200 (sm_100a, 152 SMs), B300 (sm_103a, 148 SMs) and sm_107a are not
+# measured and keep PDL_OFF_BANDS.
 PDL_BAND_OVERRIDES: dict[
     tuple[str, int | None, int | None],
-    dict[str, dict[str, tuple[tuple[int, int], ...]]],
+    dict[str, dict[str, tuple[tuple[int, int | None], ...]]],
 ] = {
     ("sm_100a", 148, None): {
         "K1->K3": {
@@ -8395,6 +8406,21 @@ PDL_BAND_OVERRIDES: dict[
     ("sm_100a", 148, 7168): {
         "K6->K7": {
             "checkpoint": ((896, 8192),),
+        },
+    },
+    ("sm_103a", 152, 4096): {
+        "K6->K7": {
+            "checkpoint": ((1024, 2112), (4096, 8192)),
+        },
+    },
+    ("sm_103a", 152, 5120): {
+        "K6->K7": {
+            "checkpoint": ((1087, 1920), (4096, 8192), (24576, None)),
+        },
+    },
+    ("sm_103a", 152, 7168): {
+        "K6->K7": {
+            "checkpoint": ((831, None),),
         },
     },
 }
