@@ -321,8 +321,11 @@ def _cell_admitted_here(batch, max_seq_len):
     )
 
 
-# Two cells measured faster on B200 (sm_100a, 148 SMs) and one measured slower there (16 x 2048).
-@pytest.mark.parametrize("batch,kv_len", [(2, 32768), (128, 512), (16, 2048)])
+# Per AUTO_ADMITTED_CELLS: 128 x 512 is admitted on B200 (sm_100a, 148 SMs) and GB300 (sm_103a, 152 SMs);
+# 2 x 32768 and 64 x 8192 on B200 only; 16 x 2048 on neither (the incumbent stays).
+@pytest.mark.parametrize(
+    "batch,kv_len", [(2, 32768), (128, 512), (64, 8192), (16, 2048)]
+)
 def test_decode_q1_auto_follows_the_measured_cells(cake_auto_calls, batch, kv_len):
     """backend="auto" routes a 12-head decode here exactly when AUTO_ADMITTED_CELLS lists its cell for the
     device, and then matches the explicit tolerance; any other cell keeps the incumbent."""
@@ -352,7 +355,7 @@ def test_decode_sink_key_rows_auto(cake_auto_calls):
     """The sink-row case of test_decode_sink_key_rows reached through backend="auto"."""
     _skip_unless_sm100_family()
     device = torch.device("cuda")
-    # A cell measured faster on B200 (128 x 512); skipped where the table lists no such cell.
+    # A cell measured faster on B200 and GB300 (128 x 512); skipped where the table lists no such cell.
     kv_lens = _spread_kv_lens(128, 512)
     if not _cell_admitted_here(128, 512):
         pytest.skip("AUTO_ADMITTED_CELLS lists no 128 x 512 cell for this device")

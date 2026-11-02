@@ -732,6 +732,14 @@ AUTO_ADMITTED_CELLS: dict[tuple[str, int], dict[int, frozenset[int]]] = {
         128: _KV_ALL,
         256: _KV_ALL,
     },
+    # GB300 (sm_103a, 152 SMs).  64 x 8192 ties CuTe DSL within the noise band there: not admitted.
+    ("sm_103a", 152): {
+        16: frozenset((16384, 32768)),
+        32: frozenset((8192, 16384, 32768)),
+        64: frozenset((4096, 16384, 32768)),
+        128: _KV_ALL,
+        256: _KV_ALL,
+    },
 }
 
 

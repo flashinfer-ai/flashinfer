@@ -2940,23 +2940,36 @@ def test_cake_kimi_k3_auto_reason_admits_only_listed_cells(cake_auto_request):
     assert "AUTO_ADMITTED_CELLS" in _auto_reason(request, compute_capability=(10, 3))
 
 
-def test_cake_kimi_k3_auto_admitted_cells_are_the_measured_b200_set():
-    """The shipped table: the B200 (sm_100a, 148 SMs) cells of the measured grid, exact points only."""
+def test_cake_kimi_k3_auto_admitted_cells_are_the_measured_sets():
+    """The shipped table: the measured B200 (sm_100a, 148 SMs) and GB300 (sm_103a, 152 SMs) cells, exact points only."""
     admitted = cake_kimi.cake_kimi_k3_mla_auto_cell_admitted
     grid_kv = (512, 1024, 2048, 4096, 8192, 16384, 32768)
     expected = {
-        2: (32768,),
-        4: (16384, 32768),
-        8: (16384, 32768),
-        16: (4096, 8192, 16384, 32768),
-        32: (2048, 4096, 8192, 16384, 32768),
-        64: (4096, 8192, 16384, 32768),
-        128: grid_kv,
-        256: grid_kv,
+        ("sm_100a", 148): {
+            2: (32768,),
+            4: (16384, 32768),
+            8: (16384, 32768),
+            16: (4096, 8192, 16384, 32768),
+            32: (2048, 4096, 8192, 16384, 32768),
+            64: (4096, 8192, 16384, 32768),
+            128: grid_kv,
+            256: grid_kv,
+        },
+        ("sm_103a", 152): {
+            16: (16384, 32768),
+            32: (8192, 16384, 32768),
+            64: (4096, 16384, 32768),
+            128: grid_kv,
+            256: grid_kv,
+        },
     }
-    b200 = cake_kimi.AUTO_ADMITTED_CELLS[("sm_100a", 148)]
-    assert {b: tuple(sorted(kv)) for b, kv in b200.items()} == expected
-    assert sum(len(kv) for kv in expected.values()) == 32
+    shipped = {
+        key: {b: tuple(sorted(kv)) for b, kv in cells.items()}
+        for key, cells in cake_kimi.AUTO_ADMITTED_CELLS.items()
+    }
+    assert shipped == expected
+    assert sum(len(kv) for kv in expected[("sm_100a", 148)].values()) == 32
+    assert sum(len(kv) for kv in expected[("sm_103a", 152)].values()) == 22
     for (arch, sm_count), cells in cake_kimi.AUTO_ADMITTED_CELLS.items():
         assert arch in ("sm_100a", "sm_103a") and sm_count > 0
         assert all(b in (1, 2, 4, 8, 16, 32, 64, 128, 256) for b in cells)
@@ -2969,6 +2982,14 @@ def test_cake_kimi_k3_auto_admitted_cells_are_the_measured_b200_set():
     assert not admitted("sm_100a", 148, 256, 65536)
     assert not admitted("sm_100a", 132, 256, 4096)
     assert not admitted("sm_107a", 148, 256, 4096)
+    # Per architecture: each admits its own measured cells only.
+    assert admitted("sm_100a", 148, 2, 32768)
+    assert not admitted("sm_103a", 152, 2, 32768)
+    assert admitted("sm_100a", 148, 64, 8192)
+    assert not admitted("sm_103a", 152, 64, 8192)
+    assert admitted("sm_103a", 152, 64, 4096)
+    assert admitted("sm_103a", 152, 64, 16384)
+    assert not admitted("sm_103a", 148, 256, 4096)
 
 
 def test_auto_selects_cake_kimi_k3_for_the_qualified_decode(
