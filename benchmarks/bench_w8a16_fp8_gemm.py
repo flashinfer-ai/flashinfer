@@ -94,7 +94,7 @@ import sys
 import time
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -201,14 +201,81 @@ def _capture_graphs(args, run_fn: Callable[[], None]):
     return g_reset, g_run
 
 
+class _Launch(NamedTuple):
+    """A runtime / driver API record: the host-side launch of a device activity."""
+
+    start: int
+    end: int
+    correlation_id: int
+
+
+class _DeviceActivity(NamedTuple):
+    """A kernel, memcpy or memset span on the device (``name`` None for the latter)."""
+
+    start: int
+    end: int
+    correlation_id: int
+    name: str | None
+
+
+class _IterationSpan(NamedTuple):
+    start: int  # earliest device activity start of the iteration (ns)
+    end: int  # latest device activity end (ns)
+    activities: list  # the iteration's _DeviceActivity records
+
+
+def _iteration_spans(
+    launches: list[_Launch],
+    activities: list[_DeviceActivity],
+    iter_timestamps: list[tuple[int, int]],
+) -> list[_IterationSpan]:
+    """Attribute device activities to iterations through their launches: an
+    iteration owns every launch whose start lies within its host timestamps
+    (inclusive), and every device activity sharing a correlation id with one of
+    those launches, whatever order the records arrived in.  An iteration without
+    device activity is an error (nothing was measured)."""
+    by_correlation: dict[int, list[_DeviceActivity]] = {}
+    for a in activities:
+        by_correlation.setdefault(a.correlation_id, []).append(a)
+    sorted_launches = sorted(launches, key=lambda launch: launch.start)
+    launch_starts = [launch.start for launch in sorted_launches]
+    spans: list[_IterationSpan] = []
+    for idx, (t0, t1) in enumerate(iter_timestamps):
+        li = bisect.bisect_left(launch_starts, t0)
+        ri = bisect.bisect_right(launch_starts, t1)
+        corr_ids = {sorted_launches[i].correlation_id for i in range(li, ri)}
+        mine: list[_DeviceActivity] = []
+        for cid in corr_ids:
+            mine.extend(by_correlation.get(cid, []))
+        if not mine:
+            raise ValueError(f"No kernel activities recorded for iteration {idx}")
+        spans.append(
+            _IterationSpan(min(a.start for a in mine), max(a.end for a in mine), mine)
+        )
+    return spans
+
+
+def _print_iteration_debug(tag: str, span: _IterationSpan) -> None:
+    print(
+        f"\n[CUPTI-DEBUG] tag={tag} n_kernels={len(span.activities)}", file=sys.stderr
+    )
+    for a in sorted(span.activities, key=lambda r: r.start):
+        nm = a.name if a.name is not None else "<memcpy/memset>"
+        print(
+            f"  start={(a.start - span.start) / 1e3:8.3f}  "
+            f"end={(a.end - span.start) / 1e3:8.3f} us  {nm}",
+            file=sys.stderr,
+        )
+
+
 def _time_kernel_cupti(args, run_fn: Callable[[], None], tag: str, iters: int):
     from cupti import cupti
 
     def _buf_requested():
         return 8 * 1024 * 1024, 0
 
-    def _buf_completed(launches, kernels, activities):
-        for a in activities:
+    def _buf_completed(launches, activities, records):
+        for a in records:
             if a.kind in (
                 cupti.ActivityKind.CONCURRENT_KERNEL,
                 cupti.ActivityKind.MEMCPY,
@@ -217,14 +284,16 @@ def _time_kernel_cupti(args, run_fn: Callable[[], None], tag: str, iters: int):
                 name = (
                     a.name if a.kind == cupti.ActivityKind.CONCURRENT_KERNEL else None
                 )
-                kernels.append((a.start, a.end, a.correlation_id, name))
+                activities.append(
+                    _DeviceActivity(a.start, a.end, a.correlation_id, name)
+                )
             elif a.kind in (cupti.ActivityKind.RUNTIME, cupti.ActivityKind.DRIVER):
-                launches.append((a.start, a.end, a.correlation_id))
+                launches.append(_Launch(a.start, a.end, a.correlation_id))
 
     g_reset, g_run = _capture_graphs(args, run_fn)
 
-    launches: list[tuple[int, int, int]] = []
-    kernels: list[tuple[int, int, int, str | None]] = []
+    launches: list[_Launch] = []
+    activities: list[_DeviceActivity] = []
     iter_timestamps: list[tuple[int, int]] = []
 
     kinds = [
@@ -237,7 +306,7 @@ def _time_kernel_cupti(args, run_fn: Callable[[], None], tag: str, iters: int):
     for kind in kinds:
         cupti.activity_enable(kind)
     cupti.activity_register_callbacks(
-        _buf_requested, partial(_buf_completed, launches, kernels)
+        _buf_requested, partial(_buf_completed, launches, activities)
     )
 
     torch.cuda.nvtx.range_push(tag)
@@ -256,38 +325,10 @@ def _time_kernel_cupti(args, run_fn: Callable[[], None], tag: str, iters: int):
         cupti.activity_disable(kind)
     # No cupti.finalize() here: once per process, in main().
 
-    corr_to_kernels: dict[int, list] = {}
-    for k in kernels:
-        corr_to_kernels.setdefault(k[2], []).append(k)
-    sorted_launches = sorted(launches, key=lambda launch: launch[0])
-    launch_starts = [launch[0] for launch in sorted_launches]
-
-    latencies_us: list[float] = []
-    for idx, (t0, t1) in enumerate(iter_timestamps):
-        li = bisect.bisect_left(launch_starts, t0)
-        ri = bisect.bisect_right(launch_starts, t1)
-        corr_ids = {sorted_launches[i][2] for i in range(li, ri)}
-        iter_kernels = []
-        for cid in corr_ids:
-            iter_kernels.extend(corr_to_kernels.get(cid, []))
-        if not iter_kernels:
-            raise ValueError(f"No kernel activities recorded for iteration {idx}")
-        min_start = min(k[0] for k in iter_kernels)
-        max_end = max(k[1] for k in iter_kernels)
-        latencies_us.append((max_end - min_start) / 1e3)
-        if os.environ.get("W8A16_CUPTI_DEBUG") and idx == 0:
-            print(
-                f"\n[CUPTI-DEBUG] tag={tag} n_kernels={len(iter_kernels)}",
-                file=sys.stderr,
-            )
-            for k in sorted(iter_kernels, key=lambda r: r[0]):
-                nm = k[3] if k[3] is not None else "<memcpy/memset>"
-                print(
-                    f"  start={(k[0] - min_start) / 1e3:8.3f}  "
-                    f"end={(k[1] - min_start) / 1e3:8.3f} us  {nm}",
-                    file=sys.stderr,
-                )
-    return _compute_stats(latencies_us)
+    spans = _iteration_spans(launches, activities, iter_timestamps)
+    if os.environ.get("W8A16_CUPTI_DEBUG"):
+        _print_iteration_debug(tag, spans[0])
+    return _compute_stats([(span.end - span.start) / 1e3 for span in spans])
 
 
 def _time_kernel_cuda_graph(args, run_fn: Callable[[], None], tag: str, iters: int):

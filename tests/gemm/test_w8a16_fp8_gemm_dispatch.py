@@ -17,6 +17,8 @@ limitations under the License.
 """Host-side contracts of the W8A16 dispatcher's kernel cache, with the compile
 mocked out: no GPU, no CuTe-DSL compile."""
 
+import sys
+
 import pytest
 import torch
 
@@ -193,3 +195,53 @@ def test_max_active_clusters_is_probed_per_device(monkeypatch):
         assert constructed == [0, 1, 1]
     finally:
         dispatch._max_active_clusters.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# The benchmark's CUPTI span attribution, on synthetic records
+# ---------------------------------------------------------------------------
+
+
+def _load_bench():
+    import importlib.util
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[2] / "benchmarks" / "bench_w8a16_fp8_gemm.py"
+    )
+    spec = importlib.util.spec_from_file_location("bench_w8a16_fp8_gemm", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses resolve annotations through it
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_bench_iteration_spans_attribute_by_correlation_id():
+    """Activities reach an iteration through the launch sharing their correlation id,
+    whatever order the records arrive in; one launch may own several activities
+    (a memset and a kernel); the span is the earliest start to the latest end; a
+    launch outside every iteration's host window is ignored; an iteration with no
+    device activity is an error."""
+    b = _load_bench()
+    launches = [
+        b._Launch(1000, 1010, 7),  # iteration 0
+        b._Launch(1020, 1030, 8),  # iteration 0
+        b._Launch(5000, 5010, 9),  # iteration 1
+        b._Launch(9000, 9010, 10),  # no iteration owns it
+    ]
+    activities = [  # out of order on purpose
+        b._DeviceActivity(5100, 5300, 9, "gemm"),
+        b._DeviceActivity(1200, 1500, 8, "gemm"),
+        b._DeviceActivity(1100, 1150, 7, None),  # the memset of iteration 0
+        b._DeviceActivity(1090, 1120, 8, None),
+        b._DeviceActivity(9100, 9200, 10, "stray"),
+    ]
+    spans = b._iteration_spans(launches, activities, [(1000, 1030), (4990, 5010)])
+    assert (spans[0].start, spans[0].end) == (1090, 1500)
+    assert sorted(a.correlation_id for a in spans[0].activities) == [7, 8, 8]
+    assert (spans[1].start, spans[1].end) == (5100, 5300)
+    # Inclusive host boundaries: a launch starting exactly at the window's end counts.
+    spans = b._iteration_spans(launches, activities, [(1020, 1020)])
+    assert sorted(a.correlation_id for a in spans[0].activities) == [8, 8]
+    with pytest.raises(ValueError, match="iteration 0"):
+        b._iteration_spans(launches, activities, [(2000, 3000)])

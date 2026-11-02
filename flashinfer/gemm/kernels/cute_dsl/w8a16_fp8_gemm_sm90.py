@@ -178,9 +178,8 @@ class Sm90W8A16Fp8GemmKernel:
         # storing warp then waits until at most one store is still reading smem (the
         # previous subtile's), so the buffer the next subtile writes is free and the
         # previous store's smem read is off the critical path (two buffers need a
-        # wait for every outstanding store, ~0.3 us per 128x256 tile).  Two buffers
-        # where a third would cost a mainloop stage (the 64x256 tile: 6 -> 5 stages
-        # lost more than the epilogue gained).
+        # wait for every outstanding store).  Two buffers where a third would cost a
+        # mainloop stage: the mainloop depth is worth more than the epilogue overlap.
         self.epi_stage = 2
         self.ab_stage = self._compute_stages()
         self.epi_stage = 3
@@ -644,6 +643,27 @@ class Sm90W8A16Fp8GemmKernel:
         ab_pipeline.producer_tail(producer_state)
 
     # ------------------------------------------------------------- consumer
+    def _a_fragment_offsets(self, ctid, num_k_blocks: int) -> list:
+        """Byte offsets, within one smem stage of the fp8 weight tile, of the 16-bit
+        units a consumer thread feeds its wgmma A fragments: per k-block, the m64k16
+        fragment of a thread is four units (two consecutive k of one row) at rows
+        ``r0`` and ``r0 + 8`` and k offsets ``c0`` and ``c0 + 8``, with ``r0 = warp *
+        16 + lane / 4`` of the warpgroup's 64 rows and ``c0 = (lane % 4) * 2``.  The
+        stage is K_SW64 (64-byte rows, Swizzle<2, 4, 3>: bits [5:4] ^= bits [8:7]).
+        ``ctid``: the thread's index among the consumer threads."""
+        tile_m, _tile_a, tile_k = self.tile_shape_mnk
+        assert tile_k == 64, "the hand-swizzled A addressing assumes 64-byte rows"
+        lane = ctid % 32
+        wg_rows0 = 0 if self.pingpong else (ctid // 128) * 64
+        r0 = wg_rows0 + ((ctid % 128) // 32) * 16 + lane // 4
+        c0 = (lane % 4) * 2
+        offsets = []
+        for kb in range(num_k_blocks):  # static bounds; plain Python, not a jit body
+            for i in range(4):
+                off = (r0 + 8 * (i & 1)) * tile_k + 16 * kb + c0 + 8 * (i >> 1)
+                offsets.append(off ^ (((off >> 7) & 3) << 4))
+        return offsets
+
     @cute.jit
     def _consumer(
         self,
@@ -700,23 +720,10 @@ class Sm90W8A16Fp8GemmKernel:
         # fp8 fragment of the same shape the smem copy fills.
         tCrA_mma = thr_mma.make_fragment_A(tCsA[(None, None, None, 0)])
         num_k_blocks = cute.size(tCrA_mma, mode=[2])
-        # A fragment loads: the wgmma m64k16 A fragment of a thread is four 16-bit units
-        # (two consecutive k of one row): rows r0 and r0 + 8, k offsets c0 and c0 + 8
-        # within the k-block, r0 = warp * 16 + lane / 4 of its 64 rows, c0 = (lane % 4)
-        # * 2.  Their byte offsets within the stage's K_SW64 layout (64-byte rows,
-        # Swizzle<2, 4, 3>: bits [5:4] ^= bits [8:7]) are computed once per thread; the
-        # loop adds the stage base, loads each pair with load_e4m3_unit and converts
-        # the loaded words with convert_e4m3_words.
-        assert tile_k == 64, "the hand-swizzled A addressing assumes 64-byte rows"
-        lane = ctid % 32
-        wg_rows0 = 0 if self.pingpong else (ctid // 128) * 64
-        r0 = wg_rows0 + ((ctid % 128) // 32) * 16 + lane // 4
-        c0 = (lane % 4) * 2
-        a_unit_off = []
-        for kb in cutlass.range_constexpr(num_k_blocks):
-            for i in cutlass.range_constexpr(4):
-                off = (r0 + 8 * (i & 1)) * tile_k + 16 * kb + c0 + 8 * (i >> 1)
-                a_unit_off.append(off ^ (((off >> 7) & 3) << 4))
+        # Byte offsets of this thread's A pairs within a stage, computed once; the
+        # mainloop adds the stage base, loads each pair with load_e4m3_unit and
+        # converts the loaded words with convert_e4m3_words.
+        a_unit_off = self._a_fragment_offsets(ctid, num_k_blocks)
         a_smem_addr = sA_base.toint()
         a_stage_bytes = tile_m * tile_k
 

@@ -429,6 +429,49 @@ def w8a16_fp8_gemm(
     RuntimeError
         A launch failure reported by the CUDA runtime.
     """
+    m, n, k, lead_shape = _check_operands(act, weight, weight_scale)
+    weight_scale = weight_scale.reshape(1)  # () or (1,): a view either way
+    device = _resolve_device(act.device)
+    if weight.device != act.device or weight_scale.device != act.device:
+        raise ValueError(
+            f"weight and weight_scale must be on act's device {act.device}, got "
+            f"{weight.device} and {weight_scale.device}"
+        )
+    _check_arch(device)
+    algo_code = _algo_code(algo, device)
+    # No implicit copies: a non-contiguous act (row slice, transposed last dim,
+    # permuted leading dims) is the caller's to .contiguous() if they want that.
+    if not act.is_contiguous():
+        raise ValueError(
+            "act must be contiguous (this function does not copy; pass "
+            "act.contiguous() if a copy is acceptable)"
+        )
+    if bias is not None:
+        _check_bias(bias, act, n)
+    out = _prepare_out(out, act, tuple(lead_shape) + (n,))
+    _check_buffers(workspace, weight, bias, act.device)
+    _check_aliasing(out, workspace, act, weight, weight_scale, bias)
+    if m == 0:
+        # Nothing to compute; the tile schedulers would divide by zero tiles.
+        # Everything above applies to the empty call too; only act and out are
+        # empty here, and an empty tensor has no address to align.
+        return out
+    act2d = act.view(-1, k)
+    out2d = out.view(-1, n)
+    _check_aligned(act2d, "act")
+    _check_aligned(out2d, "out")
+    ws_bytes = _workspace_bytes(m, n, k, device.index, algo_code)
+    ws = _select_workspace(workspace, ws_bytes, act.device)
+    _w8a16_fp8_gemm_impl(out2d, act2d, weight, weight_scale, bias, ws, algo_code)
+    return out
+
+
+def _check_operands(
+    act: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
+) -> tuple[int, int, int, tuple]:
+    """dtype, rank and shape of the three required operands; the resolved
+    ``(M, N, K, act's leading shape)``.  A 0-d ``act`` is rejected before its
+    last dimension is read; the scale's shape before it is reshaped."""
     if act.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"act must be float16 or bfloat16, got {act.dtype}")
     if weight.dtype != torch.float8_e4m3fn:
@@ -452,35 +495,32 @@ def w8a16_fp8_gemm(
     if weight_scale.dtype != torch.float32:
         # No implicit conversions either: the caller casts if they want that.
         raise ValueError(f"weight_scale must be float32, got {weight_scale.dtype}")
-    weight_scale = weight_scale.reshape(1)  # () or (1,): a view either way
-    device = _resolve_device(act.device)
-    if weight.device != act.device or weight_scale.device != act.device:
-        raise ValueError(
-            f"weight and weight_scale must be on act's device {act.device}, got "
-            f"{weight.device} and {weight_scale.device}"
-        )
-    _check_arch(device)
-    algo_code = _algo_code(algo, device)
-    # No implicit copies: a non-contiguous act (row slice, transposed last dim,
-    # permuted leading dims) is the caller's to .contiguous() if they want that.
-    if not act.is_contiguous():
-        raise ValueError(
-            "act must be contiguous (this function does not copy; pass "
-            "act.contiguous() if a copy is acceptable)"
-        )
-    if bias is not None:
-        if bias.dtype != act.dtype or tuple(bias.shape) != (n,):
-            raise ValueError(
-                f"bias must be ({n},) in {act.dtype}, got {tuple(bias.shape)} in {bias.dtype}"
-            )
-        if bias.device != act.device:
-            raise ValueError(f"bias must be on act's device, got {bias.device}")
-        if not bias.is_contiguous():
-            raise ValueError("bias must be contiguous")
+    return m, n, k, lead_shape
 
-    out = _prepare_out(out, act, tuple(lead_shape) + (n,))
+
+def _check_bias(bias: torch.Tensor, act: torch.Tensor, n: int) -> None:
+    """``bias`` is ``(N,)`` in ``act``'s dtype, on its device, contiguous."""
+    if bias.dtype != act.dtype or tuple(bias.shape) != (n,):
+        raise ValueError(
+            f"bias must be ({n},) in {act.dtype}, got {tuple(bias.shape)} in {bias.dtype}"
+        )
+    if bias.device != act.device:
+        raise ValueError(f"bias must be on act's device, got {bias.device}")
+    if not bias.is_contiguous():
+        raise ValueError("bias must be contiguous")
+
+
+def _check_buffers(
+    workspace: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    device: torch.device,
+) -> None:
+    """Layout of the buffers the kernels address directly: a contiguous, 16-byte
+    aligned ``workspace`` on ``device`` when given, a contiguous aligned ``weight``,
+    an aligned ``bias`` (its shape and contiguity were checked with its dtype)."""
     if workspace is not None:
-        if workspace.device != act.device or not workspace.is_contiguous():
+        if workspace.device != device or not workspace.is_contiguous():
             raise ValueError("workspace must be a contiguous tensor on act's device")
         _check_aligned(workspace, "workspace")
     if not weight.is_contiguous():
@@ -488,20 +528,6 @@ def w8a16_fp8_gemm(
     _check_aligned(weight, "weight")
     if bias is not None:
         _check_aligned(bias, "bias")
-    _check_aliasing(out, workspace, act, weight, weight_scale, bias)
-    if m == 0:
-        # Nothing to compute; the tile schedulers would divide by zero tiles.
-        # Everything above applies to the empty call too; only act and out are
-        # empty here, and an empty tensor has no address to align.
-        return out
-    act2d = act.view(-1, k)
-    out2d = out.view(-1, n)
-    _check_aligned(act2d, "act")
-    _check_aligned(out2d, "out")
-    ws_bytes = _workspace_bytes(m, n, k, device.index, algo_code)
-    ws = _select_workspace(workspace, ws_bytes, act.device)
-    _w8a16_fp8_gemm_impl(out2d, act2d, weight, weight_scale, bias, ws, algo_code)
-    return out
 
 
 def _prepare_out(

@@ -25,7 +25,7 @@ CUTLASS C++ mixed-input W8A16 kernel.
 """
 
 from math import ceil, log2
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -76,6 +76,40 @@ def _fast_divmod(x: cutlass.Int32, d: cutlass.Int32, magic: cutlass.Int64):
     else:
         q = ((x.to(cutlass.Int64) * magic) >> _FAST_DIVMOD_SHIFT).to(cutlass.Int32)
     return q, x - q * d
+
+
+class _TmemBudget(NamedTuple):
+    """TMEM split of one CTA (``_tmem_budget``)."""
+
+    acc_stages: int  # accumulator stages (1 or 2)
+    acc_cols: int  # TMEM columns of all accumulator stages
+    a_cols_per_stage: int  # TMEM columns of one transformed-A stage (0: A in smem)
+    transform_limit: int  # transform stages TMEM allows (-1: A in smem)
+
+
+class _SmemBytes(NamedTuple):
+    """Shared memory costs of one CTA (``_smem_stage_bytes``)."""
+
+    carveout: int  # fixed: epilogue stages, tile-info ring, bias tile, barriers
+    ab_load: int  # one raw-weight + activation load stage, with its barriers
+    b_load: int  # one activation stage alone
+    a_transform: int  # one transformed-A stage (barrier only when A is in TMEM)
+    barrier_bytes: int
+    c_stages: int
+    tile_info_stages: int
+
+
+class _Sm100Stages(NamedTuple):
+    """Pipeline depths and TMEM columns of a Blackwell kernel variant."""
+
+    load2trans: int  # raw weight + activation TMA stages feeding the transform
+    trans2mma: int  # transformed-A stages feeding the MMA
+    acc: int  # accumulator stages
+    c: int  # epilogue smem stages
+    b: int  # activation stages feeding the MMA (deeper than load2trans)
+    tile_info: int  # scheduler ring depth
+    acc_tmem_cols: int
+    a_tmem_cols: int
 
 
 class Sm100W8A16Fp8GemmKernel:
@@ -188,16 +222,7 @@ class Sm100W8A16Fp8GemmKernel:
         ):
             self.epi_tile = (self.epi_tile[0], 64)
 
-        (
-            self.num_load2trans_stage,
-            self.num_trans2mma_stage,
-            self.num_acc_stage,
-            self.num_c_stage,
-            self.num_b_stage,
-            self.num_tile_info_stage,
-            self.num_acc_tmem_cols,
-            self.num_a_tmem_cols,
-        ) = self._compute_stages_and_tmem_cols(
+        stages = self._compute_stages_and_tmem_cols(
             tiled_mma,
             self.cta_tile_shape_mnk,
             self.epi_tile,
@@ -208,6 +233,14 @@ class Sm100W8A16Fp8GemmKernel:
             self.transform_a_source,
             self.smem_buffer_align_bytes,
         )
+        self.num_load2trans_stage = stages.load2trans
+        self.num_trans2mma_stage = stages.trans2mma
+        self.num_acc_stage = stages.acc
+        self.num_c_stage = stages.c
+        self.num_b_stage = stages.b
+        self.num_tile_info_stage = stages.tile_info
+        self.num_acc_tmem_cols = stages.acc_tmem_cols
+        self.num_a_tmem_cols = stages.a_tmem_cols
 
         # TMEM allocation requires power-of-two column alignment.
         self.num_tmem_alloc_cols = cute.round_up(
@@ -1907,7 +1940,40 @@ class Sm100W8A16Fp8GemmKernel:
 
     # --------------------------------------------------------------- sizing
     @staticmethod
-    def _compute_stages_and_tmem_cols(
+    def _tmem_budget(
+        tiled_mma: cute.TiledMma,
+        cta_tile_shape_mnk: tuple[int, int, int],
+        transform_a_source: tcgen05.OperandSource,
+    ) -> "_TmemBudget":
+        """Accumulator stages and TMEM columns: two accumulator stages when the
+        accumulator leaves room (the epilogue of one tile then overlaps the mainloop
+        of the next), one otherwise; with A in TMEM the transform stages take the
+        columns the accumulators leave."""
+        # One accumulator stage is the CTA tile's 128 lanes x N fp32 columns.  Counted
+        # exactly, not rounded up to a power of two as the TMEM *allocation* is: the
+        # 160- and 192-wide tiles would otherwise be charged 256 columns a stage and
+        # fall back to a single stage, exposing the whole epilogue after every tile.
+        assert cta_tile_shape_mnk[0] == 128, "the accumulator spans all 128 TMEM lanes"
+        a_in_tmem = transform_a_source == tcgen05.OperandSource.TMEM
+        acc_cols_per_stage = cta_tile_shape_mnk[1]
+        tmem_columns = cute.arch.get_max_tmem_alloc_cols("sm_100")
+        acc_stages = tmem_columns // acc_cols_per_stage
+        if a_in_tmem:
+            acc_stages = 2 if acc_cols_per_stage < 256 else 1
+        elts_per_col = 32 // tiled_mma.op.a_dtype.width
+        a_cols_per_stage = cute.round_up(
+            cta_tile_shape_mnk[2] // elts_per_col if a_in_tmem else 0, 4
+        )
+        acc_cols = cute.round_up(acc_stages * acc_cols_per_stage, 4)
+        transform_limit = (
+            (tmem_columns - acc_cols) // a_cols_per_stage if a_in_tmem else -1
+        )
+        if a_in_tmem and transform_limit <= 0:
+            raise ValueError("Not enough TMEM capacity for selected tile size")
+        return _TmemBudget(acc_stages, acc_cols, a_cols_per_stage, transform_limit)
+
+    @staticmethod
+    def _smem_stage_bytes(
         tiled_mma: cute.TiledMma,
         cta_tile_shape_mnk: tuple[int, int, int],
         epi_tile: cute.Tile,
@@ -1917,75 +1983,29 @@ class Sm100W8A16Fp8GemmKernel:
         c_layout: utils.LayoutEnum,
         transform_a_source: tcgen05.OperandSource,
         smem_buffer_align_bytes: int,
-    ) -> tuple[int, int, int, int, int, int, int, int]:
-        """Fit the load, transform, accumulator and epilogue pipelines into smem and TMEM.
-
-        Accumulator stages: two when the accumulator leaves room for them (so the
-        epilogue of one tile overlaps the mainloop of the next), one otherwise.  With
-        A in TMEM the transform stages take the TMEM columns the accumulators leave.
-        """
-        # One accumulator stage is the CTA tile's 128 lanes x N fp32 columns.  Counted
-        # exactly, not rounded up to a power of two as the TMEM *allocation* is: the
-        # 160- and 192-wide tiles would otherwise be charged 256 columns a stage and
-        # fall back to a single stage, exposing the whole epilogue after every tile.
-        assert cta_tile_shape_mnk[0] == 128, "the accumulator spans all 128 TMEM lanes"
-        num_tmem_acc_col_per_stage = cta_tile_shape_mnk[1]
-        sm100_tmem_columns = cute.arch.get_max_tmem_alloc_cols("sm_100")
-        accumulator_stage_count = sm100_tmem_columns // num_tmem_acc_col_per_stage
-        if transform_a_source == tcgen05.OperandSource.TMEM:
-            accumulator_stage_count = 2 if num_tmem_acc_col_per_stage < 256 else 1
-        num_elts_per_tmem_col = 32 // tiled_mma.op.a_dtype.width
-        num_tmem_cols_a_per_stage = cute.round_up(
-            (
-                cta_tile_shape_mnk[2] // num_elts_per_tmem_col
-                if transform_a_source == tcgen05.OperandSource.TMEM
-                else 0
-            ),
-            4,
-        )
-
-        bytes_per_pipeline_stage = 16
-        num_tile_info_stage = 3
+        acc_stages: int,
+    ) -> "_SmemBytes":
+        """Shared memory per pipeline stage of each kind, and the fixed carve-out
+        (epilogue stages, tile-info ring, bias tile, accumulator barriers)."""
+        barrier_bytes = 16
+        tile_info_stages = 3
         tile_info_bytes = (
-            cute.size_in_bytes(cute.Int32, cute.make_layout((8, num_tile_info_stage)))
-            + bytes_per_pipeline_stage * num_tile_info_stage
+            cute.size_in_bytes(cute.Int32, cute.make_layout((8, tile_info_stages)))
+            + barrier_bytes * tile_info_stages
         )
         bias_bytes = 2 * 4 * cta_tile_shape_mnk[0]
-        c_stage_count = 2
-        c_smem_layout_staged_one = sm100_utils.make_smem_layout_epi(
-            c_dtype, c_layout, epi_tile, 1
-        )
-        c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
-        c_bytes = c_bytes_per_stage * c_stage_count
-
-        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
-        carveout_smem_bytes = (
-            bytes_per_pipeline_stage * accumulator_stage_count
-            + c_bytes
-            + tile_info_bytes
-            + bias_bytes
-        )
-        num_tmem_acc_cols = cute.round_up(
-            accumulator_stage_count * num_tmem_acc_col_per_stage, 4
-        )
-        transform2mma_stage_count_a_source_tmem_potential = (
-            (sm100_tmem_columns - num_tmem_acc_cols) // num_tmem_cols_a_per_stage
-            if transform_a_source == tcgen05.OperandSource.TMEM
-            else -1
-        )
-        if (
-            transform_a_source == tcgen05.OperandSource.TMEM
-            and transform2mma_stage_count_a_source_tmem_potential <= 0
-        ):
-            raise ValueError("Not enough TMEM capacity for selected tile size")
-        a_load_bytes_per_stage = cute.round_up(
+        c_stages = 2
+        c_layout_one = sm100_utils.make_smem_layout_epi(c_dtype, c_layout, epi_tile, 1)
+        c_bytes = cute.size_in_bytes(c_dtype, c_layout_one) * c_stages
+        carveout = barrier_bytes * acc_stages + c_bytes + tile_info_bytes + bias_bytes
+        a_load = cute.round_up(
             cute.size_in_bytes(
                 a_dtype,
                 cute.make_layout((cta_tile_shape_mnk[0], cta_tile_shape_mnk[2])),
             ),
             smem_buffer_align_bytes,
         )
-        b_load_bytes_per_stage = cute.round_up(
+        b_load = cute.round_up(
             cute.size_in_bytes(
                 b_dtype,
                 cute.make_layout(
@@ -1997,12 +2017,8 @@ class Sm100W8A16Fp8GemmKernel:
             ),
             smem_buffer_align_bytes,
         )
-        ab_load_bytes_per_stage = (
-            a_load_bytes_per_stage
-            + b_load_bytes_per_stage
-            + 2 * bytes_per_pipeline_stage
-        )
-        a_transform_bytes_per_stage = (
+        ab_load = a_load + b_load + 2 * barrier_bytes
+        a_transform = (
             cute.round_up(
                 cute.size_in_bytes(
                     tiled_mma.op.a_dtype,
@@ -2012,50 +2028,78 @@ class Sm100W8A16Fp8GemmKernel:
             )
             if transform_a_source == tcgen05.OperandSource.SMEM
             else 0
-        ) + bytes_per_pipeline_stage
-        transform2mma_stage_count_a_source_smem_potential = (
-            smem_capacity - carveout_smem_bytes
-        ) // (ab_load_bytes_per_stage + a_transform_bytes_per_stage)
-        transform2mma_stage_count = (
-            min(
-                transform2mma_stage_count_a_source_tmem_potential,
-                transform2mma_stage_count_a_source_smem_potential,
-            )
-            if transform_a_source == tcgen05.OperandSource.TMEM
-            else transform2mma_stage_count_a_source_smem_potential
+        ) + barrier_bytes
+        return _SmemBytes(
+            carveout,
+            ab_load,
+            b_load,
+            a_transform,
+            barrier_bytes,
+            c_stages,
+            tile_info_stages,
         )
-        load2transform_stage_count = (
-            smem_capacity
-            - carveout_smem_bytes
-            - (transform2mma_stage_count * a_transform_bytes_per_stage)
-        ) // ab_load_bytes_per_stage
-        if (
-            load2transform_stage_count < 2
-            or transform2mma_stage_count < 2
-            or accumulator_stage_count < 1
-        ):
+
+    @staticmethod
+    def _compute_stages_and_tmem_cols(
+        tiled_mma: cute.TiledMma,
+        cta_tile_shape_mnk: tuple[int, int, int],
+        epi_tile: cute.Tile,
+        a_dtype: type[cutlass.Numeric],
+        b_dtype: type[cutlass.Numeric],
+        c_dtype: type[cutlass.Numeric],
+        c_layout: utils.LayoutEnum,
+        transform_a_source: tcgen05.OperandSource,
+        smem_buffer_align_bytes: int,
+    ) -> "_Sm100Stages":
+        """Fit the load, transform, accumulator and epilogue pipelines into smem and
+        TMEM: the TMEM budget, the per-stage smem costs, then the stage counts.  The
+        transform pipeline takes as many stages as TMEM and smem allow, the raw load
+        pipeline what smem then leaves; both need two.  Smem left after that deepens
+        the activation (B) pipeline alone: the TMA latency of a first-touch k-tile
+        exceeds several stages' worth of MMA time, while two epilogue stages are all
+        the epilogue overlaps."""
+        a_in_tmem = transform_a_source == tcgen05.OperandSource.TMEM
+        tmem = Sm100W8A16Fp8GemmKernel._tmem_budget(
+            tiled_mma, cta_tile_shape_mnk, transform_a_source
+        )
+        smem = Sm100W8A16Fp8GemmKernel._smem_stage_bytes(
+            tiled_mma,
+            cta_tile_shape_mnk,
+            epi_tile,
+            a_dtype,
+            b_dtype,
+            c_dtype,
+            c_layout,
+            transform_a_source,
+            smem_buffer_align_bytes,
+            tmem.acc_stages,
+        )
+        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        free = smem_capacity - smem.carveout
+        trans2mma_by_smem = free // (smem.ab_load + smem.a_transform)
+        trans2mma_stages = (
+            min(tmem.transform_limit, trans2mma_by_smem)
+            if a_in_tmem
+            else trans2mma_by_smem
+        )
+        load2trans_stages = (free - trans2mma_stages * smem.a_transform) // smem.ab_load
+        if load2trans_stages < 2 or trans2mma_stages < 2 or tmem.acc_stages < 1:
             raise ValueError("Not enough SMEM or TMEM capacity for selected tile size")
-        num_tmem_a_cols = transform2mma_stage_count * num_tmem_cols_a_per_stage
-        # The smem left over goes to extra activation (B) stages: the MMA waited 6-10%
-        # of its time for B with the B pipeline as deep as the raw-weight one (the TMA
-        # latency of a first-touch k-tile exceeds five stages' worth of MMA time), and
-        # two epilogue stages are all the epilogue overlaps.
         leftover = (
-            smem_capacity
-            - carveout_smem_bytes
-            - load2transform_stage_count * ab_load_bytes_per_stage
-            - transform2mma_stage_count * a_transform_bytes_per_stage
+            free
+            - load2trans_stages * smem.ab_load
+            - trans2mma_stages * smem.a_transform
         )
-        b_stage_count = load2transform_stage_count + leftover // (
-            b_load_bytes_per_stage + 2 * bytes_per_pipeline_stage
+        b_stages = load2trans_stages + leftover // (
+            smem.b_load + 2 * smem.barrier_bytes
         )
-        return (
-            load2transform_stage_count,
-            transform2mma_stage_count,
-            accumulator_stage_count,
-            c_stage_count,
-            b_stage_count,
-            num_tile_info_stage,
-            num_tmem_acc_cols,
-            num_tmem_a_cols,
+        return _Sm100Stages(
+            load2trans_stages,
+            trans2mma_stages,
+            tmem.acc_stages,
+            smem.c_stages,
+            b_stages,
+            smem.tile_info_stages,
+            tmem.acc_cols,
+            trans2mma_stages * tmem.a_cols_per_stage,
         )
