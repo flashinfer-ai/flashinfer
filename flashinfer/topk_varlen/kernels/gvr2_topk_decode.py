@@ -42,9 +42,18 @@ collapsed histogram dropping the +inf).  FlashInfer-local changes: module
 rename, this note, the ``_persist`` hook that routes the four
 ``get_compiled*`` builders through FlashInfer's on-disk CuTe-DSL kernel
 cache, ``_base_compile_opts`` (explicit ``--gpu-arch`` for the current
-device), and the main-family varlen prologue clamping each row's length to
-the envelope in launch slot ``n`` instead of the row stride.  Keep future
-diffs against upstream mechanical.
+device), the main-family varlen prologue clamping each row's length to
+the envelope in launch slot ``n`` instead of the row stride, the clus
+family's solo rows (``GvrClusKernel`` ``solo``), the in-kernel register
+paths of the main and clus families (``GvrMainKernel`` / ``GvrClusKernel``
+``reg_vpt``, which call ``GvrTopkRegKernel.row_topk``, the register kernel
+body split out of ``kern``), the decode rows of n <= k columns, whose output
+one CTA writes right after the length read while the row's other CTAs leave
+(``_short_row_out``), and the main family's cluster register path
+(``GvrMainKernel`` ``clus_cs``, which calls ``GvrRegClusKernel.row_topk``,
+the clustered register kernel body split out of ``kern``, with
+``embedded``: a finite-only bracket whose top also covers runs spread over
+the row).  Keep future diffs against upstream mechanical.
 """
 
 import contextlib
@@ -257,6 +266,14 @@ def fmax_f32(a, b):
     return cute.arch.fmax(a, b)
 
 
+@dsl_user_op
+def fabs_f32(x, *, loc=None, ip=None):
+    """fabsf as math.absf (llvm.fabs), FlashInfer-local. ptxas folds it into a
+    compare's |x| operand, so `fabs_f32(v) != inf` is one FSETP; the sign-mask
+    spelling (_fabsf) costs a LOP3 per value on top."""
+    return cutlass.Float32(mlir_math.absf(x.ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+
+
 # ---------------------------------------------------------------------------
 # ballot / popc / clz / ffs wrappers
 # ---------------------------------------------------------------------------
@@ -384,21 +401,26 @@ def atomic_or_cta(ptr, val):
 
 
 # ---------------------------------------------------------------------------
-# gpu-scope fences + global u64 atomicAdd (SPLIT slab protocol)
+# gpu-scope acq_rel global u64 atomicAdd (SPLIT slab protocol)
 # ---------------------------------------------------------------------------
-def threadfence_gpu():
-    """__threadfence() == fence.acq_rel.gpu — required on BOTH the release and
-    acquire sides of the slab hand-off."""
-    cute.arch.fence_acq_rel_gpu()
+def atomic_add_u64_acq_rel_gpu(ptr, val):
+    """atom.acq_rel.gpu.global.add.u64 returning the OLD value: the slab arrival.
 
-
-def atomic_add_u64_gpu(ptr, val):
-    """atom.global.add.u64 returning the OLD value (arrival RMW).
+    One RMW is both halves of the hand-off. Its release half publishes the
+    calling CTA's slab entries (every thread's stores, ordered before it by a
+    CTA barrier); in the row's last arrival its acquire half covers every
+    earlier arrival's entries (each published by its own RMW on this word), and
+    a CTA barrier after it extends that to every thread of the CTA. (PTX: the
+    barriers synchronize, observation order runs through atomic RMWs, causality
+    order is transitive.) It replaces a fence.acq_rel.gpu before a relaxed RMW
+    plus one after it in the last CTA: ptxas lowers both forms' release half to
+    the same MEMBAR.ALL.GPU, while the acquire half needs only CCTL.IVALL, so
+    the last CTA no longer pays a second GPU-scope fence.
 
     ptr: cute Pointer to an Int64 gmem word; val: cutlass.Int64.
     Packed arrival word: `cutlass.Int64(1 << 32) + cutlass.Int64(myn)`.
     """
-    return cutlass.Int64(cute.arch.atomic_add(ptr, val))
+    return cutlass.Int64(cute.arch.atomic_add(ptr, val, sem="acq_rel", scope="gpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -1421,6 +1443,16 @@ def _red_shared_add1(addr, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _exit_thread(*, loc=None, ip=None):
+    """PTX ``exit``: CUDA's ``if (...) return;``, which the DSL has no runtime
+    form of (FlashInfer-local, the main and clus families' register paths and
+    every family's rows of n <= k columns; callers branch on a CTA-uniform
+    predicate, so the whole CTA leaves, and only where it owes no barrier or
+    DSMEM access)."""
+    nvvm.exit(loc=loc, ip=ip)
+
+
 def _pt_xf(pre_idx, req, v, ps: int):
     """Paged output: physical KV slot of a VALID (>= 0) column index ``v`` of request
     ``req`` — the paged compiles carry the page table [batch, max_pages] in the pre_idx
@@ -1431,6 +1463,55 @@ def _pt_xf(pre_idx, req, v, ps: int):
     return (pre_idx[req, v >> cutlass.Int32(ps)] << cutlass.Int32(ps)) | (
         v & cutlass.Int32((1 << ps) - 1)
     )
+
+
+@cute.jit
+def _short_row_out(
+    out,
+    row,
+    pre_idx,
+    req,
+    n,
+    k,
+    tid,
+    slots: cutlass.Constexpr,
+    blk: cutlass.Constexpr,
+    paged: cutlass.Constexpr,
+    ps: cutlass.Constexpr,
+):
+    """Output row of a decode row of n <= k columns (FlashInfer-local): every
+    live column is selected, so position i holds column i (paged: its KV slot,
+    as ``_pt_xf``) for i < n and -1 for n <= i < k. One CTA writes it in
+    coalesced stores; a thread's positions are tid + j * blk (j < slots), and
+    the page-table entries of its live ones are all read before its first
+    store, so the row waits on one global read instead of one per position.
+    Positions past slots * blk take the strided tail (one read per position)."""
+    orow = out[row, None]
+    pv = cute.make_rmem_tensor((slots,), cutlass.Int32)
+    if cutlass.const_expr(paged):
+        prow = pre_idx[req, None]
+        for j in cutlass.range_constexpr(slots):
+            i = tid + cutlass.Int32(j * blk)
+            if i < n:
+                pv[j] = prow[i >> cutlass.Int32(ps)]
+    for j in cutlass.range_constexpr(slots):
+        i = tid + cutlass.Int32(j * blk)
+        if i < k:
+            ov = cutlass.Int32(-1)
+            if i < n:
+                ov = i
+                if cutlass.const_expr(paged):
+                    ov = (pv[j] << cutlass.Int32(ps)) | (i & cutlass.Int32((1 << ps) - 1))
+            orow[i] = ov
+    i = tid + cutlass.Int32(slots * blk)
+    while i < k:
+        ov = cutlass.Int32(-1)
+        if i < n:
+            ov = i
+            if cutlass.const_expr(paged):
+                ov = _pt_xf(pre_idx, req, i, ps)
+        orow[i] = ov
+        i = i + cutlass.Int32(blk)
 
 
 class GvrMainKernel:
@@ -1456,6 +1537,9 @@ class GvrMainKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         pdl: bool = False,
+        reg_vpt: int = 0,
+        clus_cs: int = 0,
+        clus_stage: bool = False,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1520,13 +1604,11 @@ class GvrMainKernel:
             )
         # TSH-floor staging arm.  SPLIT-only compile-time key; the CUDA form
         # is a grid-uniform runtime gate over the same predicate
-        # (b > 15 && k <= 1024 && n4 <= 32768).  varlen mode compiles the
-        # machinery in whenever SPLIT and gates it per row at runtime
-        # (tsh_en && n4 <= 32768) — mirroring the CUDA runtime gate.
-        if self.varlen:
-            self.tshg = bool(split)
-        else:
-            self.tshg = bool(tshg) and bool(split)
+        # (b > 15 && k <= 1024 && n4 <= 32768).  FlashInfer-local: in varlen
+        # mode the rows that gate admits (tsh_en && n4 <= 32768, per row)
+        # sample 4x denser instead (see the ladder), so the floor is not
+        # compiled in.
+        self.tshg = bool(tshg) and bool(split) and not self.varlen
         # derived constexprs (bit-identical to the CUDA)
         self.hb = nbs
         self.kbig = (kpt >= 2) and (kpt * blk >= 2048)
@@ -1543,6 +1625,98 @@ class GvrMainKernel:
         assert self.ck_off % 16 == 0, "ck64 must stay 16B aligned (ulonglong2)"
         self.dyn_bytes = self.ck_off + (self.cmpb + 1) * 8
         self.lb = self.nbs.bit_length() - 1  # log2(NBS)=8
+        # In-kernel register path (FlashInfer-local, decode, 512/1024 threads). Under
+        # a CUDA graph the launch is planned for the capacity, so this streaming
+        # kernel gets rows far shorter than that, which the register family ranks
+        # ~2x faster. With reg_vpt > 0, a row of k < n <= BLK * reg_vpt * 4 columns
+        # runs that family's body (GvrTopkRegKernel.row_topk)
+        # on its own CTA instead of streaming: the narrowest of VPT 2 and VPT 4
+        # that holds it (the rungs route() picks for this CTA shape, NBH 2 * BLK), as
+        # SGLang's topk_v2 picks Register2 / Register4 per row. The kernel takes
+        # that branch as soon as it knows the row's length and then exits, so the
+        # smem window can start at the smem base and the streaming body never sees
+        # such a row.
+        self.reg_vpt = int(reg_vpt)
+        self.regs = []  # (row capacity, embedded body, smem window bytes), narrowest first
+        if self.reg_vpt:
+            assert self.varlen and not self.prefill and blk in (512, 1024) and self.reg_vpt in (2, 4)
+            nbh = 2 * blk
+            for vpt in (2, 4)[: self.reg_vpt // 2]:
+                cap = blk * vpt * 4
+                # page-table entries a register row can span (the reg family's rule)
+                reg_pt = 0
+                if self.paged:
+                    pages = (cap + (1 << self.page_shift) - 1) >> self.page_shift
+                    if pages <= 1024:
+                        reg_pt = 1 << max(pages - 1, 0).bit_length()
+                body = GvrTopkRegKernel(
+                    blk,
+                    vpt,
+                    minb,
+                    kpt,
+                    cur=True,
+                    deg=False,
+                    img=False,
+                    nbh=nbh,
+                    varlen=True,
+                    next_n=self.next_n,
+                    cr_shift=self.cr_shift,
+                    hint_free=self.hint_free,
+                    paged=self.paged,
+                    page_shift=self.page_shift,
+                    pt_smem=reg_pt,
+                    # staged emit for one-wave launches (_reg_stage_out): 1024-thread
+                    # main is one wave by construction (rows * R <= 148); 512-thread
+                    # main serves more rows than SMs
+                    stage_out=blk == 1024,
+                    embedded=True,
+                )
+                win = STATIC_BYTES + (nbh + 2 * REG_CMP) * 4 + 4 * reg_pt
+                # + k staged outputs (k <= KPT * BLK)
+                assert win + 4 * kpt * blk <= self.dyn_bytes, "register window must fit the smem"
+                self.regs.append((cap, body, win))
+            self.reg_cap = self.regs[-1][0]
+        # Cluster register path (FlashInfer-local, decode SPLIT engines with the
+        # register path). With clus_cs > 0 the launch groups each row's parts into
+        # clusters of clus_cs (R a multiple of it), and a row too long for the
+        # register path but of at most clus_cs * BLK * 16 columns runs the
+        # clustered register family's body (GvrRegClusKernel.row_topk, embedded) on
+        # the first cluster of its parts, part p as rank p, as route() ranks such a
+        # row at a launch sized to it; every other part leaves at once and longer
+        # rows stream as before. Bodies: the narrowest of VPT 2 and VPT 4 that holds
+        # the row (VPT 2 only where it holds more than the register path), each
+        # with live slots where its rows can need fewer than VPT.
+        self.clus_cs = int(clus_cs)
+        self.rcs = []  # (row capacity, embedded body), narrowest first
+        if self.clus_cs:
+            assert self.reg_vpt and self.split and self.clus_cs in (2, 4, 8)
+            assert self.r_const % self.clus_cs == 0
+            rc_pt = 0 if clus_stage else self.pt_smem
+            lo = self.reg_cap
+            for vpt in (2, 4):
+                cap = self.clus_cs * blk * vpt * 4
+                if cap <= lo:
+                    continue
+                body = GvrRegClusKernel(
+                    blk,
+                    vpt,
+                    self.clus_cs,
+                    varlen=True,
+                    next_n=self.next_n,
+                    cr_shift=self.cr_shift,
+                    hint_free=self.hint_free,
+                    paged=self.paged,
+                    page_shift=self.page_shift,
+                    pt_smem=rc_pt,
+                    stage_out=bool(clus_stage),
+                    embedded=True,
+                    live=lo < cap - self.clus_cs * blk * 4,
+                )
+                self.rcs.append((cap, body))
+                lo = cap
+            # the window (+ k staged outputs) at the smem base of every CTA
+            win = SMEM_BYTES + 4 * rc_pt + (4 * kpt * blk if clus_stage else 0)
+            assert win <= self.dyn_bytes, "cluster register window must fit the smem"
 
     # ------------------------------------------------------------------
     # GVR_EMITC: classify+stage one survivor.
@@ -1640,6 +1814,43 @@ class GvrMainKernel:
                 v & cutlass.Int32((1 << ps) - 1)
             )
         return self._ox_g(pre_idx, v)
+
+    @cute.jit
+    def _reg_arm(self, logits, pre_idx, kv_lens, out, n_row, k, row, part, sbase):
+        """In-kernel register path (reg_vpt > 0, see the ctor). Only part 0 of a
+        SPLIT row ranks it; the other parts never touch the slab, so the row
+        owes no arrivals and its g_off / g_don stay zero."""
+        if part == cutlass.Int32(0):
+            if cutlass.const_expr(len(self.regs) == 1):
+                self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+            else:
+                if n_row <= cutlass.Int32(self.regs[0][0]):
+                    self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+                else:
+                    self._reg_rank(1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+
+    @cute.jit
+    def _reg_rank(self, vi: cutlass.Constexpr, logits, pre_idx, kv_lens, out, n_row, k, row, sbase):
+        _, body, win = self.regs[vi]
+        smem_bytes = cutlass.Int32(win)
+        if cutlass.const_expr(body.stage_out):
+            smem_bytes = smem_bytes + k * cutlass.Int32(4)
+        # n = the row's own length: the body's prologue clamps to it and its
+        # envelope-bounded early load reads exactly the row. QC: the O(mc^2)
+        # rank gate route() gives these rungs (QUADC while one wave, 1024 above).
+        body.row_topk(
+            logits,
+            pre_idx,
+            kv_lens,
+            out,
+            n_row,
+            cutlass.Int32(REG_CMP),
+            cutlass.Int32(QUADC if self.blk == 1024 else 1024),
+            smem_bytes,
+            row,
+            sbase,
+        )
+
     @cute.kernel
     def kern(
         self,
@@ -1678,6 +1889,75 @@ class GvrMainKernel:
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
 
+        if cutlass.const_expr(self.varlen and not self.prefill):
+            # Decode rows of n <= k columns (FlashInfer-local): every live column
+            # is selected, so the output follows from the row's length alone. The
+            # row's first CTA writes it (_short_row_out) and every CTA of the row
+            # leaves here, before any other work, so the code below never sees
+            # such a row (a SPLIT row then owes the slab nothing). Row length as in
+            # the varlen prologue below.
+            tid_s, _, _ = cute.arch.thread_idx()
+            bx_s, row_s, _ = cute.arch.block_idx()
+            req_s = row_s // cutlass.Int32(self.next_n)
+            own_s = cutlass.Int32(1)
+            if cutlass.const_expr(self.split):
+                if bx_s != cutlass.Int32(0):
+                    own_s = cutlass.Int32(0)
+            kv_s = kv_lens[req_s]
+            nv_s = (
+                kv_s
+                - cutlass.Int32(self.next_n)
+                + row_s % cutlass.Int32(self.next_n)
+                + cutlass.Int32(1)
+            ) >> cutlass.Int32(self.cr_shift)
+            if nv_s < cutlass.Int32(0):
+                nv_s = cutlass.Int32(0)
+            if nv_s > n:
+                nv_s = n
+            if nv_s <= k:
+                if own_s != cutlass.Int32(0):
+                    _short_row_out(
+                        out, row_s, pre_idx, req_s, nv_s, k, tid_s,
+                        KPT, BLK, self.paged, self.page_shift,
+                    )
+                _exit_thread()
+
+        if cutlass.const_expr(self.reg_vpt > 0):
+            # In-kernel register path (see the ctor): a row of at most reg_cap
+            # columns is ranked by part 0 with the register body, and every CTA
+            # of the row leaves before any other work, so the code below never
+            # sees such a row. Row length as in the varlen prologue below.
+            bx0, row0, _ = cute.arch.block_idx()
+            rr0 = row0 % cutlass.Int32(self.next_n)
+            kv0 = kv_lens[row0 // cutlass.Int32(self.next_n)]
+            nv0 = (kv0 - cutlass.Int32(self.next_n) + rr0 + cutlass.Int32(1)) >> cutlass.Int32(
+                self.cr_shift
+            )
+            if nv0 < cutlass.Int32(0):
+                nv0 = cutlass.Int32(0)
+            if nv0 > n:
+                nv0 = n
+            if nv0 <= cutlass.Int32(self.reg_cap):
+                part0 = cutlass.Int32(0)
+                if cutlass.const_expr(self.split):
+                    part0 = bx0
+                sbase0 = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()
+                self._reg_arm(logits, pre_idx, kv_lens, out, nv0, k, row0, part0, sbase0)
+                _exit_thread()
+            if cutlass.const_expr(self.clus_cs > 0):
+                # cluster register path (see the ctor)
+                if nv0 <= cutlass.Int32(self.rcs[-1][0]):
+                    if bx0 < cutlass.Int32(self.clus_cs):
+                        sbase0 = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()
+                        if cutlass.const_expr(len(self.rcs) == 1):
+                            self.rcs[0][1].row_topk(logits, pre_idx, kv_lens, out, nv0, row0, bx0, sbase0)
+                        else:
+                            if nv0 <= cutlass.Int32(self.rcs[0][0]):
+                                self.rcs[0][1].row_topk(logits, pre_idx, kv_lens, out, nv0, row0, bx0, sbase0)
+                            else:
+                                self.rcs[1][1].row_topk(logits, pre_idx, kv_lens, out, nv0, row0, bx0, sbase0)
+                    _exit_thread()
+
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, _ = cute.arch.block_idx()  # 2-D grid (part, row)
         row = by
@@ -1695,8 +1975,9 @@ class GvrMainKernel:
         # envelope the per-row length is clamped to).  n <= k rows have no runtime
         # `return` in CuTe DSL: they run the body as a zero-work pass
         # (n = 0, TGT = INT_MAX so no rung ever accepts) and the identity/pad
-        # emission happens in the epilogue at the end of the kernel.  Every
-        # value below is a pure function of `row`, so all R split CTAs of a
+        # emission happens in the epilogue at the end of the kernel (FlashInfer:
+        # prefill windows only; decode rows of n <= k left at the kernel top).
+        # Every value below is a pure function of `row`, so all R split CTAs of a
         # row (and all threads) compute identical scalars — grid-uniform per
         # row by construction.
         short = cutlass.Int32(0)
@@ -1783,7 +2064,7 @@ class GvrMainKernel:
                 else:
                     Q = cutlass.Int32(0)
             # per-row TSH-floor runtime gate (CUDA parity: b>15 && k<=1024 in
-            # tsh_en, n4 <= 32768 per row)
+            # tsh_en, n4 <= 32768 per row); here it selects the denser sample
             tsh_run = cutlass.Int32(0)
             if tsh_en != cutlass.Int32(0):
                 if (n >> cutlass.Int32(2)) <= cutlass.Int32(32768):
@@ -1966,11 +2247,11 @@ class GvrMainKernel:
         # the mirror chain (runtime divides + isqrt fixups) per thread costs
         # more instructions than the rest of the kernel on 1-row launches.
         # warp0 alone walks the chain and publishes the four derived scalars
-        # through s_lad; the other warps spend the wait issuing L2 prefetch
-        # hints for this CTA's own P3 slice (register-free, so zero pressure
-        # on the 64-register arms — the PRIME-LATE register loads below are
-        # untouched and simply hit L2).  Values are bit-identical to the
-        # per-thread derivation this replaces.
+        # through s_lad; in prefill the other warps spend the wait issuing L2
+        # prefetch hints for this CTA's own P3 slice (register-free, so zero
+        # pressure on the 64-register arms — the PRIME-LATE register loads
+        # below are untouched and simply hit L2).  Values are bit-identical to
+        # the per-thread derivation this replaces.
         if cutlass.const_expr(self.varlen):
             if tidx < cutlass.Int32(32):
                 if short == cutlass.Int32(0):
@@ -2006,22 +2287,36 @@ class GvrMainKernel:
                         aim = k
                     n4w = n >> cutlass.Int32(2)
                     # pair-sample gate: (n > SCAP or small_dense) and n4 >= 4;
-                    # small_dense = k > 1024 and not big and n <= SCAP and n > 2k
-                    # (k/big folded into the launch-constant sd_en flag).
+                    # small_dense = sd_en != 0 and max(2k, sd_en) < n <= SCAP
+                    # (the launch constant sd_en folds k, the regime and the
+                    # plan's break-even row length; 1 admits every row above 2k).
                     gate = cutlass.Int32(0)
                     if n > scap_c:
                         gate = cutlass.Int32(1)
                     if sd_en != cutlass.Int32(0):
                         if n <= scap_c:
                             if n > (k << cutlass.Int32(1)):
-                                gate = cutlass.Int32(1)
+                                if n > sd_en:
+                                    gate = cutlass.Int32(1)
                     if n4w < cutlass.Int32(4):
                         gate = cutlass.Int32(0)
                     if gate != cutlass.Int32(0):
                         # sel = sfac*n // aim via rcp (sfac*n <= 2^24: f32-exact
                         # to the last unit; quotient error < 1 => +-1 drift)
+                        # FlashInfer-local: a row the TSH floor would guard samples
+                        # 4x denser instead. The sample comes in runs of 8 adjacent
+                        # values and its rank-TGT rung sits at about sfac (16), so two
+                        # runs over a cluster of high scores can put the rung above
+                        # the k-th value (real DSv4 rows: count(>= T) down to 0.94 k);
+                        # the floor (rank 2 * TGT) catches that by staging about twice
+                        # the candidates for the last CTA. At 4x the rung needs eight
+                        # such runs (captured V4.1/DSv4 rows: count >= 2.4 k), and the
+                        # last CTA ranks half as many candidates.
+                        sfr = sfac
+                        if tsh_run != cutlass.Int32(0):
+                            sfr = sfac * cutlass.Int32(4)
                         sel = cutlass.Int32(
-                            cutlass.Float32(sfac * n) * cute.arch.rcp_approx(cutlass.Float32(aim))
+                            cutlass.Float32(sfr * n) * cute.arch.rcp_approx(cutlass.Float32(aim))
                         )
                         if sel < cutlass.Int32(256):
                             sel = cutlass.Int32(256)
@@ -2076,26 +2371,27 @@ class GvrMainKernel:
                         else:
                             s_ofs[0] = cutlass.Int32(0) - lead
             # Register-free L2 hints for the first U-batch of this CTA's own
-            # P3 slice (clamped in-row): the data P3 touches first starts
-            # flowing while warp0 walks the chain. Short rows clamp every
-            # hint to the row's last line — harmless.
-            # prefill: the base is shifted to col0, so clamp within the row's own
-            # window [col0, ke) — n4-1 is the last full in-window float4.
+            # P3 slice, prefill only: the data P3 touches first starts flowing
+            # while warp0 walks the chain. The base is shifted to col0, so
+            # clamp within the row's own window [col0, ke) — n4-1 is the last
+            # full in-window float4. Decode issues none: one hint per float4
+            # is eight per L2 line, and on a short row or a SPLIT part's small
+            # slice nearly every hint clamps to one line. Without them decode
+            # is faster on every main plan at the serving capacity (B200,
+            # 708 cells: SPLIT 0.87x, one CTA per row 0.97x geomean).
             if cutlass.const_expr(self.prefill):
                 plim4 = n4 - cutlass.Int32(1)
                 if plim4 < cutlass.Int32(0):
                     plim4 = cutlass.Int32(0)
-            else:
-                plim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)
-            for uu in cutlass.range_constexpr(U):
-                # NOTE: names must not collide with the PRIME-LATE block's
-                # i_/ic — the DSL kills inner-scope names at region exit and
-                # a later same-name assignment inside a dynamic `if` trips
-                # "is None prior to this if".
-                pic = c0 + tidx + cutlass.Int32(uu * BLK)
-                if pic >= c1:
-                    pic = plim4
-                C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
+                for uu in cutlass.range_constexpr(U):
+                    # NOTE: names must not collide with the PRIME-LATE block's
+                    # i_/ic — the DSL kills inner-scope names at region exit and
+                    # a later same-name assignment inside a dynamic `if` trips
+                    # "is None prior to this if".
+                    pic = c0 + tidx + cutlass.Int32(uu * BLK)
+                    if pic >= c1:
+                        pic = plim4
+                    C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
             cute.arch.barrier()  # publish s_lad (also covers the smem inits)
             SMP = s_lad[0]
             SS2 = s_lad[1]
@@ -2341,8 +2637,8 @@ class GvrMainKernel:
                 # count(>=TSH) >= k.  TSH miss falls to GMIN/degen unchanged.
                 cute.arch.barrier()
                 t5s = s_tsh[0]
-                # varlen: per-row runtime gate (tsh_run == 1 always in legacy
-                # mode, so legacy codegen semantics are unchanged)
+                # legacy mode only (tsh_run == 1): varlen compiles the floor
+                # out and samples the rows it would guard 4x denser instead
                 if tsh_run != cutlass.Int32(0):
                     if t5s > cutlass.Float32(_NEG_INF):
                         if t5s < T:
@@ -2601,15 +2897,14 @@ class GvrMainKernel:
                                     )
                             i = i + cutlass.Int32(BLK)
                     cute.arch.barrier()  # ---- barrier (slab publish) ----
-                    if tidx == cutlass.Int32(0):  # release + RMW
-                        C.threadfence_gpu()
+                    if tidx == cutlass.Int32(0):  # release + acquire RMW
                         pdon = cute.make_ptr(
                             cutlass.Int64,
                             gdon_addr + row64 * cutlass.Int64(8),
                             cute.AddressSpace.gmem,
                             assumed_align=8,
                         )
-                        s_pk[0] = C.atomic_add_u64_gpu(
+                        s_pk[0] = C.atomic_add_u64_acq_rel_gpu(
                             pdon, cutlass.Int64(1 << 32) + cutlass.Int64(myn)
                         )
                     cute.arch.barrier()  # ---- barrier (arrival word) ----
@@ -2618,7 +2913,8 @@ class GvrMainKernel:
                     if cutlass.Int32(pk >> cutlass.Int64(32)) == R - cutlass.Int32(1):
                         alive = cutlass.Int32(1)
                     if alive != cutlass.Int32(0):
-                        C.threadfence_gpu()  # acquire
+                        # thread 0's RMW acquired every part's entries and the barrier
+                        # above orders this CTA's reads after it: no fence here
                         if tidx == cutlass.Int32(0):  # ZERO-RESTORE
                             _st_g_u32(goff_addr + row64 * cutlass.Int64(4), cutlass.Int32(0))
                             _st_g_u64(gdon_addr + row64 * cutlass.Int64(8), cutlass.Uint64(0))
@@ -2959,6 +3255,14 @@ class GvrMainKernel:
                                     nlo = cutlass.Uint32(rlo) + (cutlass.Uint32(sB) << sh2u)
                                     if sB != cutlass.Int32(NBS - 1):
                                         rhi = nlo + ((cutlass.Uint32(1) << sh2u) - cutlass.Uint32(1))
+                                        # FlashInfer-local: the range starts at the
+                                        # least staged key, so a 2^24-key bin holding
+                                        # keys of scores above 2^127 (+inf) can end
+                                        # past 0xFFFFFFFF. Wrapped, rhi fell below
+                                        # rlo and the descent stopped under the
+                                        # crossing keys: nothing was emitted.
+                                        if cutlass.Uint32(rhi) < nlo:
+                                            rhi = cutlass.Uint32(0xFFFFFFFF)
                                     rlo = nlo
                                     lev = lev + cutlass.Int32(1)
                             if tidx == cutlass.Int32(0):
@@ -3271,7 +3575,8 @@ class GvrMainKernel:
         # convention): every valid position is in the top-K — emit identity
         # indices and pad the tail with -1.  The body above is skipped for
         # these rows (block-uniform `short`, so its barriers stay converged)
-        # and nothing was written; only part 0 of a SPLIT row emits.
+        # and nothing was written; only part 0 of a SPLIT row emits. Prefill
+        # windows only (decode rows of n <= k left at the kernel top).
         if cutlass.const_expr(self.varlen):
             if short != cutlass.Int32(0):
                 if part == cutlass.Int32(0):
@@ -3347,6 +3652,7 @@ class GvrMainKernel:
         ).launch(
             grid=(R, b, 1),
             block=(self.blk, 1, 1),
+            cluster=(self.clus_cs, 1, 1) if self.clus_cs else None,
             stream=stream,
             min_blocks_per_mp=self.minb,
             use_pdl=self.pdl,
@@ -3369,12 +3675,15 @@ def get_compiled(
     page_shift: int = 0,
     pt_smem: int = 0,
     pdl: bool = False,
+    reg_vpt: int = 0,
+    clus_cs: int = 0,
+    clus_stage: bool = False,
 ):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG, NEXT_N, CR_SHIFT, R_CONST)
-    — per-row varlen mode (TSHG slot is ignored: varlen compiles the TSH
-    machinery in whenever SPLIT and gates it per row at runtime).
+    — per-row varlen mode (TSHG slot is ignored: varlen engines never compile
+    the TSH floor; the rows it would guard sample 4x denser instead).
     ``hint_free`` compiles the hint-gather sites out (part of the key).
 
     ``prefill`` selects the per-row [ks, ke) window mode (TRT-LLM #18702). It
@@ -3382,11 +3691,19 @@ def get_compiled(
     so it is part of the cache key and the persist name; the compile retypes
     the pre_idx ABI slot to a 1-D align-4 fake (it carries row_starts; the
     kv_lens slot carries the window lengths and ke = ks + len is formed on
-    device)."""
+    device).
+
+    ``reg_vpt`` (decode tuple only) compiles in the per-row register path for
+    rows of at most BLK * reg_vpt * 4 columns (``GvrMainKernel``); 0 = off.
+    ``clus_cs`` (SPLIT, with the register path) launches the parts in clusters of
+    that size with the cluster register path; ``clus_stage`` selects its staged
+    emit. 0 = off."""
     prefill_abs = bool(prefill_abs) and bool(prefill)
     paged = bool(paged)
     if paged and not (hint_free and len(tpl) == 10 and not prefill):
         raise RuntimeError("paged compile requires the hint-free varlen (decode) tuple")
+    if reg_vpt and (len(tpl) != 10 or prefill):
+        raise RuntimeError("the register path needs the varlen decode tuple")
     key = (
         tuple(tpl),
         options_extra,
@@ -3397,6 +3714,9 @@ def get_compiled(
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
         bool(pdl),
+        int(reg_vpt),
+        int(clus_cs),
+        bool(clus_stage) if clus_cs else False,
         C._compile_arch_token(),
     )
     if prefill and len(tpl) != 10:
@@ -3430,6 +3750,9 @@ def get_compiled(
             page_shift=int(page_shift) if paged else 0,
             pt_smem=int(pt_smem) if paged else 0,
             pdl=bool(pdl),
+            reg_vpt=int(reg_vpt),
+            clus_cs=int(clus_cs),
+            clus_stage=bool(clus_stage),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3493,6 +3816,10 @@ def get_compiled(
             name += f"_pts{int(pt_smem)}"
     if pdl:
         name += "_pdl1"
+    if reg_vpt:
+        name += f"_rg{int(reg_vpt)}"
+    if clus_cs:
+        name += f"_cl{int(clus_cs)}" + ("s" if clus_stage else "")
     compiled = C._persist(name, _compile_fn)
     _COMPILE_CACHE[key] = compiled
     return compiled
@@ -3600,6 +3927,7 @@ __launch_bounds__ sets no carveout either); `.reqntid`/`.minnctapersm`
 NB__reg = 1024  # NBH default
 STATIC_WORDS = 128  # DSL smem prelude (static-__shared__ mirror)
 STATIC_BYTES = STATIC_WORDS * 4
+REG_CMP = 2560  # crossing-slot cap of the non-DEG rungs (route(): CMP = min(n, 2560))
 _NEG_INF__reg = float("-inf")
 _POS_INF = float("inf")
 
@@ -3789,10 +4117,18 @@ class GvrTopkRegKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         stage_out: bool = True,
+        embedded: bool = False,
     ):
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
         assert nbh % blk == 0 or blk % nbh == 0
+        # embedded: `row_topk` runs inside another family's kernel (the main
+        # and clus families' in-kernel register paths, GvrMainKernel /
+        # GvrClusKernel `reg_vpt`) instead of being launched as this kernel.
+        # That host kernel waits on PDL, owns the smem window, and its (part or
+        # rank, row) grid carries the row on block_idx.y.
+        self.embedded = bool(embedded)
+        assert not (self.embedded and (pdl or prefill))
         self.blk = blk
         self.vpt = vpt
         self.minb = minb
@@ -3866,6 +4202,8 @@ class GvrTopkRegKernel:
     def _pt_req(self):
         # request of this CTA's row, re-derived from the block index (no live register)
         bx, by, _ = cute.arch.block_idx()
+        if self.embedded:
+            return by // cutlass.Int32(self.next_n)
         return bx // cutlass.Int32(self.next_n)
 
     def _ox_g(self, pre_idx, v):
@@ -3897,6 +4235,16 @@ class GvrTopkRegKernel:
         qc: cutlass.Int32,
         smem_bytes: cutlass.Int32,
     ):
+        row, _, _ = cute.arch.block_idx()
+        sbase = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()  # Int32 shared addr
+        self.row_topk(logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, row, sbase)
+
+    @cute.jit
+    def row_topk(self, logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, row, sbase):
+        """Register-resident top-K of row ``row``: the whole kernel body, with the
+        smem window (map in the family docstring) at byte address ``sbase``.
+        Separate from ``kern`` so the main and clus families can call it for
+        rows that fit their CTA's registers."""
         BLK = cutlass.const_expr(self.blk)
         VPT = cutlass.const_expr(self.vpt)
         KPT = cutlass.const_expr(self.kpt)
@@ -3909,7 +4257,6 @@ class GvrTopkRegKernel:
             cute.arch.griddepcontrol_wait()  # knob default off
 
         tid, _, _ = cute.arch.thread_idx()
-        row, _, _ = cute.arch.block_idx()
         lane = tid & cutlass.Int32(31)
 
         # ---- early row load (decode): the float4 batch is bounded by the launch
@@ -3942,6 +4289,9 @@ class GvrTopkRegKernel:
         # tail here (k can exceed BLK on this family -> strided loop, unlike
         # the reg_clus k <= BLK single predicate) and SKIP the body entirely:
         # a zero-work pass would reach the degenerate emitter and poison out.
+        # FlashInfer-local: a decode short row writes its output with
+        # _short_row_out and the CTA leaves (embedded, the host kernel has
+        # already sent such rows away); prefill windows keep the loop below.
         short = cutlass.Int32(0)
         prow = row
         # prefill window frame (0 in every non-prefill compile): lead = ks & 3
@@ -3990,6 +4340,14 @@ class GvrTopkRegKernel:
                     nv = cutlass.Int32(0)
                 if nv > n:
                     nv = n
+                if cutlass.const_expr(not self.embedded):
+                    if nv <= kq:
+                        # 2048 // BLK positions per thread: the API's largest k
+                        _short_row_out(
+                            out, row, pre_idx, req, nv, kq, tid,
+                            2048 // BLK, BLK, self.paged, self.page_shift,
+                        )
+                        _exit_thread()
             if nv <= kq:
                 short = cutlass.Int32(1)
             if short == cutlass.Int32(0):
@@ -4047,8 +4405,6 @@ class GvrTopkRegKernel:
         it = cutlass.Int32(0)
         it2 = cutlass.Int32(0)
         idv = cutlass.Int32(0)
-        q1e = cutlass.Int32(0)
-        q2e = cutlass.Int32(0)
         q1f = cutlass.Int32(0)
         q2f = cutlass.Int32(0)
         b_lv = cutlass.Int32(0)
@@ -4131,10 +4487,7 @@ class GvrTopkRegKernel:
                 if tid == cutlass.Int32(0):
                     lmask = (cutlass.Int32(0xF) << lead) & cutlass.Int32(0xF)
 
-            # ---- shared-memory window (map in module docstring) ----
-            sptr = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16)
-            sbase = sptr.toint()  # Int32 shared addr
-
+            # ---- shared-memory window at sbase (map in module docstring) ----
             s_res = _smem_view(cutlass.Int32, sbase, 0, 6)
             s_cnt = _smem_view(cutlass.Int32, sbase, 6, 2)  # [0]=s_o1 [1]=s_oc
             s_kmm = _smem_view(cutlass.Uint32, sbase, 8, 2)  # [0]=s_kmin [1]=s_kmax
@@ -4271,11 +4624,13 @@ class GvrTopkRegKernel:
                 for t in cutlass.range_constexpr(KPT):
                     p = pvs[t]
                     if cutlass.Uint32(p) < cutlass.Uint32(n):
-                        uk = fkey(img_f[p])
-                        if uk < lmin:
-                            lmin = uk
-                        if uk > lmax:
-                            lmax = uk
+                        xi = img_f[p]
+                        if fabs_f32(xi) != cutlass.Float32(_POS_INF):  # finite bracket, see below
+                            uk = fkey(xi)
+                            if uk < lmin:
+                                lmin = uk
+                            if uk > lmax:
+                                lmax = uk
                 cute.arch.barrier()  # img dies
             elif cutlass.const_expr(self.use_bm):
                 nbw = (n + cutlass.Int32(31)) >> cutlass.Int32(5)
@@ -4303,15 +4658,18 @@ class GvrTopkRegKernel:
                         )
                     for cbit in cutlass.range_constexpr(4):
                         if (w & cutlass.Uint32(1 << cbit)) != cutlass.Uint32(0):
-                            lmn = fmin_f32(lmn, _val(frags, 4 * u + cbit))
-                            lmx = fmax_f32(lmx, _val(frags, 4 * u + cbit))
+                            v = _val(frags, 4 * u + cbit)
+                            if fabs_f32(v) != cutlass.Float32(_POS_INF):  # finite bracket
+                                lmn = fmin_f32(lmn, v)
+                                lmx = fmax_f32(lmx, v)
                 if tid < ntail:
                     wt = cutlass.Uint32(bm[tix >> cutlass.Int32(5)]) >> cutlass.Uint32(
                         tix & cutlass.Int32(31)
                     )
                     if (wt & cutlass.Uint32(1)) != cutlass.Uint32(0):
-                        lmn = fmin_f32(lmn, tval)
-                        lmx = fmax_f32(lmx, tval)
+                        if fabs_f32(tval) != cutlass.Float32(_POS_INF):
+                            lmn = fmin_f32(lmn, tval)
+                            lmx = fmax_f32(lmx, tval)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)  # monotone
                 cute.arch.barrier()  # bm dies
@@ -4331,8 +4689,9 @@ class GvrTopkRegKernel:
                     if pos >= lead:
                         if pos < k + lead:
                             v = _val(frags, s)
-                            lmn = fmin_f32(lmn, v)
-                            lmx = fmax_f32(lmx, v)
+                            if fabs_f32(v) != cutlass.Float32(_POS_INF):  # finite bracket
+                                lmn = fmin_f32(lmn, v)
+                                lmx = fmax_f32(lmx, v)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)
             elif cutlass.const_expr(self.deg):
@@ -4344,12 +4703,13 @@ class GvrTopkRegKernel:
                     if cutlass.const_expr(self.prefill and s < 4):
                         okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
                     if okl != cutlass.Int32(0):
-                        if v > cutlass.Float32(_NEG_INF__reg):
+                        if fabs_f32(v) != cutlass.Float32(_POS_INF):  # finite bracket
                             lmn = fmin_f32(lmn, v)
                             lmx = fmax_f32(lmx, v)
                 if tid < ntail:
-                    lmn = fmin_f32(lmn, tval)
-                    lmx = fmax_f32(lmx, tval)
+                    if fabs_f32(tval) != cutlass.Float32(_POS_INF):
+                        lmn = fmin_f32(lmn, tval)
+                        lmx = fmax_f32(lmx, tval)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)
             else:
@@ -4362,11 +4722,12 @@ class GvrTopkRegKernel:
                     xs.append(xv)
                 for t in cutlass.range_constexpr(KPT):
                     if cutlass.Uint32(pvs[t]) < cutlass.Uint32(n):
-                        uk = fkey(xs[t])
-                        if uk < lmin:
-                            lmin = uk
-                        if uk > lmax:
-                            lmax = uk
+                        if fabs_f32(xs[t]) != cutlass.Float32(_POS_INF):  # finite bracket
+                            uk = fkey(xs[t])
+                            if uk < lmin:
+                                lmin = uk
+                            if uk > lmax:
+                                lmax = uk
 
             # ---- block min/max in ONE barrier; publishes hist clear
             lmin = warp_min_u32(lmin)
@@ -4390,11 +4751,21 @@ class GvrTopkRegKernel:
             # and folds every value into bin 0, dropping the +inf; reject it
             # here (okc=0) and force the key-space escape below.
             # (upstream TensorRT-LLM PR #18625, ported verbatim.)
+            # FlashInfer-local: the bracket arms above fold only scores that
+            # are not +-inf, so an infinite score no longer makes the width
+            # infinite. Upstream sent every such row to the escape, which doubled
+            # this kernel on DeepSeek-V4.1 block top-k, whose newest key is
+            # always +inf (B200, K=2048, 4,101 keys, DEG rung: 7.6 vs 3.9 us).
+            # Infinite scores still rank exactly: the bin maps saturate +inf
+            # into the top bin and -inf into bin 0 (BRL) or below the histogram
+            # (non-BRL), and the escape tests below cover the crossings that
+            # this leaves to the histogram.
             okc = cutlass.Int32(0)
             if Tv < GMAX:
                 w_ = GMAX - Tv
-                # w_ < 3.5e38 (> FLT_MAX) rejects an infinite bracket width.
-                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(3.5e38):
+                # w_ < +inf rejects an infinite bracket width (the former
+                # Float32(3.5e38) overflowed to the same +inf, with a DSL warning).
+                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(_POS_INF):
                     okc = cutlass.Int32(1)
             if okc == cutlass.Int32(0):
                 Tv = cutlass.Float32(SENT_LO)
@@ -4501,6 +4872,22 @@ class GvrTopkRegKernel:
             # (upstream TensorRT-LLM PR #18625, ported verbatim.)
             if okc == cutlass.Int32(0):
                 esc = cutlass.Int32(1)
+            # FlashInfer-local, with the finite bracket (see the collapse guard):
+            # two crossings the float histogram cannot rank take the escape too.
+            # (a) BRL bin 0 is a trash bin: it counts everything under the
+            # bracket (-inf, fill lanes, scores below Tv) while the emit stages
+            # only its q >= 0 part, so a crossing there (fewer than k scores at
+            # or above Tv) would refine over unstaged slots.
+            # (b) The ballot emit (CUR off) sends q >= HIf above the crossing,
+            # and HIf is +inf when the crossing is the top bin, which the q of a
+            # +inf score (counted in the top bin) would pass.
+            if cutlass.const_expr(self.brl):
+                if Bv == cutlass.Int32(0):
+                    esc = cutlass.Int32(1)
+            if cutlass.const_expr(not self.cur):
+                if whole == cutlass.Int32(0):
+                    if Bv == cutlass.Int32(self.nbh - 1):
+                        esc = cutlass.Int32(1)
             if esc == cutlass.Int32(1):
                 if tid == cutlass.Int32(0):
                     s_cnt[0] = cutlass.Int32(0)
@@ -4622,84 +5009,69 @@ class GvrTopkRegKernel:
                 ofs_e = cutlass.Int32(0) - lead
                 if cutlass.const_expr(self.prefill_abs):
                     ofs_e = ks & cutlass.Int32(-4)
-                lml = cutlass.Int32(cute.arch.lanemask_lt())
-                for s in cutlass.range_constexpr(S):
-                    ixv = (
-                        (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
-                    ) + cutlass.Int32(s % 4)
+                # FlashInfer-local: this thread's winners (key > ethr) and ties (key ==
+                # ethr) as two bit masks over its S register slots and its tail element (bit
+                # S); one warp scan and one pair of block atomics per warp place them, and a
+                # walk over the set bits writes them (ties past nT dropped). The per-slot
+                # ballot / atomic / shuffle steps this replaces were S times the code of a
+                # path that rows almost never take, laid out ahead of the common emit.
+                m1 = cutlass.Int32(0)
+                m2 = cutlass.Int32(0)
+                for s in cutlass.range_constexpr(S + 1):
                     u64 = cutlass.Int64(-1)
-                    okl = cutlass.Int32(1)
-                    if cutlass.const_expr(self.prefill and s < 4):
-                        okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
-                    if ixv < nvec:
-                        if okl != cutlass.Int32(0):
-                            u64 = cutlass.Int64(fkey(_val(frags, s)))
-                    q1e = cutlass.Int32(0)
-                    q2e = cutlass.Int32(0)
+                    if cutlass.const_expr(s < S):
+                        ixv = (
+                            (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
+                        ) + cutlass.Int32(s % 4)
+                        okl = cutlass.Int32(1)
+                        if cutlass.const_expr(self.prefill and s < 4):
+                            okl = (lmask >> cutlass.Int32(s)) & cutlass.Int32(1)
+                        if ixv < nvec:
+                            if okl != cutlass.Int32(0):
+                                u64 = cutlass.Int64(fkey(_val(frags, s)))
+                    else:
+                        if tid < ntail:
+                            u64 = cutlass.Int64(fkey(tval))
                     if u64 > ethr:
-                        q1e = cutlass.Int32(1)
+                        m1 = m1 | cutlass.Int32(1 << s)
                     if u64 == ethr:
-                        q2e = cutlass.Int32(1)
-                    n1 = ballot(q1e == cutlass.Int32(1))
-                    n2 = ballot(q2e == cutlass.Int32(1))
-                    b1 = cutlass.Int32(0)
-                    b2 = cutlass.Int32(0)
-                    if lane == cutlass.Int32(0):
-                        if n1 != cutlass.Int32(0):
-                            b1 = atomic_add_cta(s_e12.iterator, popc(n1))
-                        if n2 != cutlass.Int32(0):
-                            b2 = atomic_add_cta(s_e12.iterator + 1, popc(n2))
-                    b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
-                    b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
-                    p1e = b1 + popc(n1 & lml)
-                    p2e = b2 + popc(n2 & lml)
-                    if q1e == cutlass.Int32(1):
+                        m2 = m2 | cutlass.Int32(1 << s)
+                c1 = popc(m1)
+                c2 = popc(m2)
+                s1, s2 = warp_incl_scan_add2(c1, c2, lane)
+                b1 = cutlass.Int32(0)
+                b2 = cutlass.Int32(0)
+                if lane == cutlass.Int32(31):
+                    b1 = atomic_add_cta(s_e12.iterator, s1)
+                    b2 = atomic_add_cta(s_e12.iterator + 1, s2)
+                b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(31))
+                b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(31))
+                p1e = b1 + (s1 - c1)
+                p2e = b2 + (s2 - c2)
+                wm = m1 | m2  # sparse set-bit walk
+                while wm != cutlass.Int32(0):
+                    sdyn = ffs_m1(wm)
+                    ixv = (
+                        (tid + (sdyn >> cutlass.Int32(2)) * cutlass.Int32(self.blk))
+                        << cutlass.Int32(2)
+                    ) + (sdyn & cutlass.Int32(3))
+                    if sdyn == cutlass.Int32(S):
+                        ixv = tix
+                    if ((m1 >> sdyn) & cutlass.Int32(1)) != cutlass.Int32(0):
                         if p1e < nA:
                             if cutlass.const_expr(self.stage_out):
                                 s_out[p1e] = ixv + ofs_e
                             else:
                                 out_row[p1e] = self._ox(pre_idx, s_pt, ixv + ofs_e)
-                    if q2e == cutlass.Int32(1):
+                        p1e = p1e + cutlass.Int32(1)
+                    else:
                         if p2e < nT:
                             if cutlass.const_expr(self.stage_out):
                                 s_out[nA + p2e] = ixv + ofs_e
                             else:
                                 out_row[nA + p2e] = self._ox(pre_idx, s_pt, ixv + ofs_e)
-                # tail element
-                u64 = cutlass.Int64(-1)
-                if tid < ntail:
-                    u64 = cutlass.Int64(fkey(tval))
-                q1e = cutlass.Int32(0)
-                q2e = cutlass.Int32(0)
-                if u64 > ethr:
-                    q1e = cutlass.Int32(1)
-                if u64 == ethr:
-                    q2e = cutlass.Int32(1)
-                n1 = ballot(q1e == cutlass.Int32(1))
-                n2 = ballot(q2e == cutlass.Int32(1))
-                b1 = cutlass.Int32(0)
-                b2 = cutlass.Int32(0)
-                if lane == cutlass.Int32(0):
-                    if n1 != cutlass.Int32(0):
-                        b1 = atomic_add_cta(s_e12.iterator, popc(n1))
-                    if n2 != cutlass.Int32(0):
-                        b2 = atomic_add_cta(s_e12.iterator + 1, popc(n2))
-                b1 = cute.arch.shuffle_sync(b1, cutlass.Int32(0))
-                b2 = cute.arch.shuffle_sync(b2, cutlass.Int32(0))
-                p1e = b1 + popc(n1 & lml)
-                p2e = b2 + popc(n2 & lml)
-                if q1e == cutlass.Int32(1):
-                    if p1e < nA:
-                        if cutlass.const_expr(self.stage_out):
-                            s_out[p1e] = tix + ofs_e
-                        else:
-                            out_row[p1e] = self._ox(pre_idx, s_pt, tix + ofs_e)
-                if q2e == cutlass.Int32(1):
-                    if p2e < nT:
-                        if cutlass.const_expr(self.stage_out):
-                            s_out[nA + p2e] = tix + ofs_e
-                        else:
-                            out_row[nA + p2e] = self._ox(pre_idx, s_pt, tix + ofs_e)
+                        p2e = p2e + cutlass.Int32(1)
+                    wm = wm & (wm - cutlass.Int32(1))
                 # (CUDA returns here — everything below is the else-arm)
             else:
                 # ---- emit
@@ -5275,6 +5647,24 @@ Cluster ops: merge = _merge_scan0_local, a LOCAL patched copy of
 Every rung/ladder decision is cluster-uniform by construction (identical
 sample locations on every rank; merged tot; block-uniform gather) — the
 conditional retry clus.sync cannot deadlock.
+
+FlashInfer-local: solo rows. U, and with it the STEPC chunk, comes from the
+capture capacity, so in a large-capacity graph (U = 8: 32K-column chunks) a
+row of <= one chunk already ran on rank 0 alone, while the other ranks idled
+through the sample, the merge and both cluster barriers. With `solo`, such a
+row (n4 <= STEPC float4s) runs on rank 0 alone outright: ranks != 0 exit
+before any cluster barrier or DSMEM access (a cluster-uniform branch, like
+the short-row skip), and rank 0, whose chunk 0 is the whole row, merges its
+own histogram and uses CTA barriers in place of the clus.sync. Rows of more
+than one chunk keep the cluster path unchanged.
+
+FlashInfer-local: register rows. A solo row still streams (sample, row pass,
+staged emit, refine: a ~6 us floor), where the register family ranks the same
+row in ~3-4 us. With `reg_vpt`, a row of k < n <= BLK * reg_vpt * 4 columns
+(short = 2) skips the ladder and the streaming body on every rank, like a
+short row, and rank 0 ranks it with that family's body
+(GvrTopkRegKernel.row_topk, embedded) in the body guard's else arm; ranks != 0
+leave as a solo row's do.
 """
 
 
@@ -5321,11 +5711,15 @@ class GvrClusKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         pdl: bool = False,
+        solo: bool = False,
+        reg_vpt: int = 0,
     ):
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
         assert nbs == 256, "SNB must stay 256"
         assert u in (1, 2, 4, 8) and cs in (2, 4, 8)
+        # solo rows: a row of at most one STEPC chunk runs on rank 0 alone
+        self.solo = bool(solo)
         # programmatic dependent launch (griddepcontrol.wait first, see GvrMainKernel)
         self.pdl = bool(pdl)
         # per-row varlen mode (production heuristicTopKDecode contract, same
@@ -5369,6 +5763,43 @@ class GvrClusKernel:
         self.ck_off = self.cbuf_bytes  # inside the blob
         self.dyn_bytes = nbs * 4 + self.cbuf_bytes + cmp_ * 8 + nbs * 4
         # == host smc = SNB*8 + (SCAP+4)*8 + CMP*8
+        # In-kernel register path (FlashInfer-local, varlen decode only; see the
+        # family note): rows of k < n <= BLK * reg_vpt * 4 columns run the register
+        # family's body on rank 0, at route()'s rung for this CTA shape (NBH 2048,
+        # CUR, non-DEG, CMP 2560). Its smem window is the cbuf | ck64c blob, which
+        # such a row never touches.
+        self.reg_vpt = int(reg_vpt)
+        if self.reg_vpt:
+            assert self.varlen
+            self.reg_cap = blk * self.reg_vpt * 4
+            # page-table entries a register row can span (the reg family's rule)
+            reg_pt = 0
+            if self.paged:
+                pages = (self.reg_cap + (1 << self.page_shift) - 1) >> self.page_shift
+                if pages <= 1024:
+                    reg_pt = 1 << max(pages - 1, 0).bit_length()
+            self.reg_body = GvrTopkRegKernel(
+                blk,
+                self.reg_vpt,
+                minb,
+                1,  # KPT: k <= BLK in this family
+                cur=True,
+                deg=False,
+                img=False,
+                nbh=2 * NB__reg,
+                varlen=True,
+                next_n=self.next_n,
+                cr_shift=self.cr_shift,
+                hint_free=self.hint_free,
+                paged=self.paged,
+                page_shift=self.page_shift,
+                pt_smem=reg_pt,
+                stage_out=True,  # one wave: rows * CS <= 148
+                embedded=True,
+            )
+            self.reg_win = STATIC_BYTES + (2 * NB__reg + 2 * REG_CMP) * 4 + 4 * reg_pt
+            # + k <= BLK staged outputs
+            assert self.reg_win + 4 * blk <= self.cbuf_bytes + cmp_ * 8, "register window must fit the blob"
 
     # ------------------------------------------------------------------
     # GVR_EMITK: classify+stage one survivor.
@@ -5428,11 +5859,14 @@ class GvrClusKernel:
     # Semantics, the DSMEM v4 load spelling, the register accumulation and
     # the prefix-biased STS.128 cursor write are IDENTICAL to merge_scan0.
     # NO barrier inside (caller pays the merge-publish barrier).
+    # ncs: ranks merged, a compile-time CS, or 1 for a solo row (its peers
+    # have exited); a runtime bound would serialize the remote loads.
     # ------------------------------------------------------------------
     @cute.jit
-    def _merge_scan0_local(self, s_hist, s_mrg, rank, target, tidx, s_res):
+    def _merge_scan0_local(
+        self, s_hist, s_mrg, rank, target, tidx, s_res, ncs: cutlass.Constexpr
+    ):
         NBS = self.nbs
-        CS = self.cs
         BPT = NBS // 32
         NV = BPT // 4
         if tidx < cutlass.Int32(32):
@@ -5447,7 +5881,7 @@ class GvrClusKernel:
                 boff = (lane * cutlass.Int32(BPT) + cutlass.Int32(4 * q)) * cutlass.Int32(4)
                 t = [cutlass.Int32(0)] * 4
                 p = [cutlass.Int32(0)] * 4
-                for r in cutlass.range_constexpr(CS):
+                for r in cutlass.range_constexpr(ncs):
                     mapped = C._mapa_shared_cluster_addr(
                         hbase + boff, cutlass.Int32(r)
                     )  # per-use mapa
@@ -5592,7 +6026,8 @@ class GvrClusKernel:
         # untested; sampling only steers the rung — exactness is
         # schedule-invariant). All values are pure functions of `row`, so the
         # whole-body guard and the cluster barriers stay cluster-uniform.
-        # Short rows (n <= k): rank 0 emits identity + (-1); body is SKIPped.
+        # Short rows (n <= k): rank 0 writes the row (_short_row_out) and every
+        # rank leaves before any cluster barrier or DSMEM access.
         short = cutlass.Int32(0)
         prow = row
         if cutlass.const_expr(self.varlen):
@@ -5612,6 +6047,19 @@ class GvrClusKernel:
                 nv = n
             if nv <= kq:
                 short = cutlass.Int32(1)
+            if short == cutlass.Int32(1):
+                if rank == cutlass.Int32(0):
+                    _short_row_out(
+                        out, row, pre_idx, req, nv, kq, tidx, 1, BLK, self.paged, self.page_shift
+                    )
+                _exit_thread()
+            if cutlass.const_expr(self.reg_vpt > 0):
+                # register-path row (see the family note): short = 2. Like a
+                # short row it skips the ladder and, on every rank, the
+                # streaming body; rank 0 ranks it in the body guard's else arm.
+                if short == cutlass.Int32(0):
+                    if nv <= cutlass.Int32(self.reg_cap):
+                        short = cutlass.Int32(2)
             if short == cutlass.Int32(0):
                 n = nv
                 # ---- aim ladder (cheap mirror, all-thread) ----
@@ -5644,8 +6092,6 @@ class GvrClusKernel:
                 if r6 > aim:
                     aim = r6
                 amin = cutlass.Int32(3) * k
-                if cutlass.const_expr(self.cs != 2):
-                    amin = (cutlass.Int32(7) * k) >> cutlass.Int32(1)
                 if aim < amin:
                     aim = amin
                 if aim > (SCAP >> cutlass.Int32(1)):
@@ -5655,10 +6101,17 @@ class GvrClusKernel:
                 # ---- QUAD sample geometry (route_dynamic clus override,
                 # always-on per the deviation note above; k <= 1024 for this
                 # family so sfac has no k > 1024 arm).
+                # FlashInfer-local: every cluster size takes the CS = 2 ladder
+                # (sfac 32, amin 3k; upstream: 16 and 3.5k above CS = 2). Its
+                # quads are 16 adjacent values and the rank-TGT rung sits at about
+                # sfac, so at 16 a single quad over a run of high scores can set
+                # the rung: on captured DSv4 Pro / Flash rows of 32K-262K columns
+                # the first attempt kept fewer than k values on 75 of 342 rows
+                # (down to 0.02 k) and the row streamed again from the floor.
                 n4v = nv >> cutlass.Int32(2)
                 sel = cutlass.Int32(
                     cutlass.Float32(nv)
-                    * cutlass.Float32(32.0 if self.cs == 2 else 16.0)
+                    * cutlass.Float32(32.0)
                     * cute.arch.rcp_approx(cutlass.Float32(aim))
                 )
                 if sel < cutlass.Int32(256):
@@ -5698,13 +6151,6 @@ class GvrClusKernel:
                     TGT2 = cutlass.Int32(1)
                 # NB: the Q launch slot is dead in this family (no in-kernel
                 # consumer); chunk ownership derives from n4/STEPC below.
-            if short != cutlass.Int32(0):
-                if rank == cutlass.Int32(0):
-                    if tidx < kq:
-                        ov = cutlass.Int32(-1)
-                        if tidx < nv:
-                            ov = self._ox_g(pre_idx, tidx)
-                        out[row, tidx] = ov
 
         # ---- shared memory (CUDA dynamic map order, then static allocs) ----
         smem = SmemAllocator()
@@ -5773,11 +6219,24 @@ class GvrClusKernel:
             cute.make_layout((self.cmp,)),
         )
 
+        # ---- solo rows (see the family note): `n` is a pure function of
+        # `row` like `short`, so the flag is cluster-uniform and ranks != 0
+        # leave with the short rows, before any cluster barrier or DSMEM
+        # access; no rank ever waits on a peer that has exited ----
+        solo = cutlass.Int32(0)
+        if cutlass.const_expr(self.solo):
+            if (n >> cutlass.Int32(2)) <= cutlass.Int32(self.stepc):
+                solo = cutlass.Int32(1)
+        skip = short
+        if solo != cutlass.Int32(0):
+            if rank != cutlass.Int32(0):
+                skip = cutlass.Int32(1)
+
         # ---- whole-body short-row guard (cluster-uniform: `short` is a pure
         # function of `row`, identical across all CS ranks and threads, so
         # every cluster barrier below stays aligned; short rows already
         # emitted identity + -1 tail in the prologue) ----
-        if short == cutlass.Int32(0):
+        if skip == cutlass.Int32(0):
             # ---- row bases (pre_idx is request-level under varlen) ----
             row64 = cutlass.Int64(row)
             x_addr = logits.iterator.toint() + row64 * cutlass.Int64(npad) * cutlass.Int64(4)
@@ -6036,7 +6495,10 @@ class GvrClusKernel:
                             if ic >= n4:
                                 ic = lim4
                             C.ld_g_f32x4(atom128, x_addr, ic, pf[uu])
-                    C._cluster_sync_aligned()  # ==== clus.sync (retry) ====
+                    # solo: no peer reads this CTA's hist; the reset barrier
+                    # below orders the clear after the merge's local reads
+                    if solo == cutlass.Int32(0):
+                        C._cluster_sync_aligned()  # ==== clus.sync (retry) ====
                     if tidx < cutlass.Int32(NBS):
                         s_hist[tidx] = cutlass.Int32(0)
                     if tidx == cutlass.Int32(0):
@@ -6163,10 +6625,16 @@ class GvrClusKernel:
                             ) | cutlass.Uint64(C.u32_of_f32(x))
                     i = i + cutlass.Int32(BLK)
 
-                # ---- cluster merge ----
-                C._cluster_sync_aligned()  # ==== clus.sync (merge) ====
+                # ---- cluster merge (solo: this CTA's histogram alone) ----
+                if solo == cutlass.Int32(0):
+                    C._cluster_sync_aligned()  # ==== clus.sync (merge) ====
+                else:
+                    cute.arch.barrier()  # ---- barrier (solo row pass done) ----
                 myn = s_scal[0]
-                self._merge_scan0_local(s_hist, s_mrg, rank, k, tidx, s_res)
+                if solo == cutlass.Int32(0):
+                    self._merge_scan0_local(s_hist, s_mrg, rank, k, tidx, s_res, self.cs)
+                else:
+                    self._merge_scan0_local(s_hist, s_mrg, rank, k, tidx, s_res, 1)
                 cute.arch.barrier()  # ---- barrier (merge publish) ----
                 tot = s_res[C.RES_TOT]
                 acc = cutlass.Int32(0)
@@ -6283,8 +6751,12 @@ class GvrClusKernel:
             # ============ EXIT RENDEZVOUS ============
             # all DSMEM traffic retired; the ONLY exit rendezvous. rank!=0
             # falls through to the kernel end (post-barrier asymmetric exit);
-            # NO later cluster barrier.
-            C._cluster_sync_aligned()  # ==== clus.sync (exit) ====
+            # NO later cluster barrier. Solo: rank 0's own candidate stores
+            # only need a CTA barrier before the refine reads them.
+            if solo == cutlass.Int32(0):
+                C._cluster_sync_aligned()  # ==== clus.sync (exit) ====
+            else:
+                cute.arch.barrier()  # ---- barrier (solo candidates staged) ----
 
             if rank == cutlass.Int32(0):
                 if degen == cutlass.Int32(0):
@@ -6323,19 +6795,22 @@ class GvrClusKernel:
                                     )
                                 i = i + cutlass.Int32(BLK)
                         else:
-                            # key-space narrowing over ck64c
+                            # key-space narrowing over ck64c. This arm and the degen
+                            # fallback below are rare (wide crossing bins, degenerate
+                            # rows), and their loops stay rolled (unroll=1). In serving
+                            # the kernel's code is cold, and the register path is laid
+                            # out after this streaming body: LLVM's unrolled ballot
+                            # emits put it ~6 KiB further from the entry.
                             if tidx == cutlass.Int32(0):
                                 s_kmm[0] = cutlass.Uint32(0xFFFFFFFF)
                                 s_kmm[1] = cutlass.Uint32(0)
                             if tidx < cutlass.Int32(NBS):  # cleared ONCE
                                 s_hist[tidx] = cutlass.Int32(0)
                             cute.arch.barrier()  # ---- barrier (narrowing init) ----
-                            i = tidx
-                            while i < mc:
+                            for i in cutlass.range(tidx, mc, BLK, unroll=1):
                                 kk = cutlass.Uint32(s_ck64[i] >> cutlass.Uint64(32))
                                 C.atomic_min_cta(s_kmm.iterator + 0, kk)
                                 C.atomic_max_cta(s_kmm.iterator + 1, kk)
-                                i = i + cutlass.Int32(BLK)
                             cute.arch.barrier()  # ---- barrier (key range) ----
                             rlo = s_kmm[0]
                             rhi = s_kmm[1]
@@ -6366,8 +6841,7 @@ class GvrClusKernel:
                                     if sh2 < cutlass.Int32(0):
                                         sh2 = cutlass.Int32(0)
                                     sh2u = cutlass.Uint32(sh2)
-                                    i = tidx
-                                    while i < mc:  # re-bin
+                                    for i in cutlass.range(tidx, mc, BLK, unroll=1):  # re-bin
                                         uq = cutlass.Uint32(s_ck64[i] >> cutlass.Uint64(32))
                                         if uq >= cutlass.Uint32(rlo):
                                             if uq <= cutlass.Uint32(rhi):
@@ -6378,7 +6852,6 @@ class GvrClusKernel:
                                                     s_hist.iterator + cutlass.Int32(du),
                                                     cutlass.Int32(1),
                                                 )
-                                        i = i + cutlass.Int32(BLK)
                                     cute.arch.barrier()  # ---- barrier (level hist) ----
                                     C.scan_cross0(
                                         s_hist,
@@ -6401,6 +6874,10 @@ class GvrClusKernel:
                                         rhi = nlo + (
                                             (cutlass.Uint32(1) << sh2u) - cutlass.Uint32(1)
                                         )
+                                        # FlashInfer-local: saturate a wrapped rhi
+                                        # (as in gvr_main's P6 narrowing)
+                                        if cutlass.Uint32(rhi) < nlo:
+                                            rhi = cutlass.Uint32(0xFFFFFFFF)
                                     rlo = nlo
                                     lev = lev + cutlass.Int32(1)
                             if tidx == cutlass.Int32(0):
@@ -6408,8 +6885,7 @@ class GvrClusKernel:
                                 s_scal[2] = cutlass.Int32(0)
                             cute.arch.barrier()  # ---- barrier (emit counters) ----
                             it2 = (mc + cutlass.Int32(BLK - 1)) // cutlass.Int32(BLK)
-                            it = cutlass.Int32(0)
-                            while it < it2:  # ballot emit
+                            for it in cutlass.range(it2, unroll=1):  # ballot emit
                                 i = it * cutlass.Int32(BLK) + tidx
                                 p1 = cutlass.Int32(0)
                                 p2 = cutlass.Int32(0)
@@ -6438,10 +6914,10 @@ class GvrClusKernel:
                                     pre_idx,
                                     s_pt,
                                 )
-                                it = it + cutlass.Int32(1)
                 else:
                     # ---- degen fallback: whole-row key-space narrowing
                     # (per-level clear + scan_cross w/ ws) ----
+                    # Its loops stay rolled too (see the narrowing above).
                     rlo = cutlass.Uint32(0)
                     rhi = cutlass.Uint32(0xFFFFFFFF)
                     above2 = cutlass.Int32(0)
@@ -6476,8 +6952,7 @@ class GvrClusKernel:
                             if tidx < cutlass.Int32(NBS):  # per-level clear
                                 s_hist[tidx] = cutlass.Int32(0)
                             cute.arch.barrier()  # ---- barrier (level clear) ----
-                            i = tidx
-                            while i < n:  # whole row
+                            for i in cutlass.range(tidx, n, BLK, unroll=1):  # whole row
                                 uq = C.fkey(C.ldg_f32(x_addr, i))
                                 if uq >= cutlass.Uint32(rlo):
                                     if uq <= cutlass.Uint32(rhi):
@@ -6487,7 +6962,6 @@ class GvrClusKernel:
                                         C.atomic_add_cta(
                                             s_hist.iterator + cutlass.Int32(du), cutlass.Int32(1)
                                         )
-                                i = i + cutlass.Int32(BLK)
                             cute.arch.barrier()  # ---- barrier (level hist) ----
                             # block-parallel scan (ONE internal barrier; only
                             # use of ws in this kernel)
@@ -6522,8 +6996,7 @@ class GvrClusKernel:
                         nA = above2
                         nT = need2
                     it2 = (n + cutlass.Int32(BLK - 1)) // cutlass.Int32(BLK)
-                    it = cutlass.Int32(0)
-                    while it < it2:
+                    for it in cutlass.range(it2, unroll=1):
                         i = it * cutlass.Int32(BLK) + tidx
                         p1 = cutlass.Int32(0)
                         p2 = cutlass.Int32(0)
@@ -6538,7 +7011,27 @@ class GvrClusKernel:
                         self._ballot_pair_emit(
                             p1, p2, i, cutlass.Int32(0), nA, nA, nT, out_row, s_scal, lane, pre_idx, s_pt
                         )
-                        it = it + cutlass.Int32(1)
+        else:
+            # ---- in-kernel register path (see the family note). Here, after the
+            # streaming body, it leaves that body's SASS as compiled without it
+            # up to register names and scheduling ----
+            if cutlass.const_expr(self.reg_vpt > 0):
+                if short == cutlass.Int32(2):
+                    if rank == cutlass.Int32(0):
+                        # n = the row's own length: the body's prologue clamps to
+                        # it and its envelope-bounded early load reads exactly the row
+                        self.reg_body.row_topk(
+                            logits,
+                            pre_idx,
+                            kv_lens,
+                            out,
+                            nv,
+                            cutlass.Int32(REG_CMP),
+                            cutlass.Int32(QUADC),  # O(mc^2) rank gate of a one-wave launch
+                            cutlass.Int32(self.reg_win) + k * cutlass.Int32(4),  # + k staged outputs
+                            row,
+                            sbase,
+                        )
 
     # ------------------------------------------------------------------
     # host launcher: grid dim3(CS, b) + cluster (CS,1,1);
@@ -6601,10 +7094,15 @@ def get_compiled__clus(
     page_shift: int = 0,
     pt_smem: int = 0,
     pdl: bool = False,
+    solo: bool = False,
+    reg_vpt: int = 0,
 ):
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
-    reachable route has 8192/2048 — asserted by run__clus())."""
+    reachable route has 8192/2048 — asserted by run__clus()). solo: rows of
+    at most one BLK * U chunk run on rank 0 alone (see the family note).
+    reg_vpt (varlen only): rows of at most BLK * reg_vpt * 4 columns run the
+    register family's body on rank 0 (see the family note); 0 = off."""
     key = (
         tuple(tpl),
         scap,
@@ -6618,6 +7116,8 @@ def get_compiled__clus(
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
         bool(pdl),
+        bool(solo),
+        int(reg_vpt),
         C._compile_arch_token(),
     )
     if paged and not (varlen and hint_free):
@@ -6642,6 +7142,8 @@ def get_compiled__clus(
         page_shift=int(page_shift) if paged else 0,
         pt_smem=int(pt_smem) if paged else 0,
         pdl=bool(pdl),
+        solo=bool(solo),
+        reg_vpt=int(reg_vpt),
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -6680,6 +7182,8 @@ def get_compiled__clus(
         + (f"_pg{int(page_shift)}" if paged else "")
         + (f"_pts{int(pt_smem)}" if (paged and pt_smem) else "")
         + ("_pdl1" if pdl else "")
+        + ("_solo" if solo else "")
+        + (f"_rg{int(reg_vpt)}" if reg_vpt else "")
     )
     if options_extra:
         name += "_opt_" + options_extra
@@ -6878,9 +7382,28 @@ class GvrRegClusKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         stage_out: bool = False,
+        embedded: bool = False,
+        live: bool = False,
     ):
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
+        # embedded (FlashInfer-local): `row_topk` runs inside the main family's
+        # kernel (its cluster register path, GvrMainKernel `clus_cs`) on rows of
+        # any length up to this body's capacity, not on rows sized to the launch.
+        # The bracket then folds only finite scores (as the register family's
+        # does), and its top also covers NW runs of 32 columns spread over the
+        # row (hint-free): a row whose scores rise past its first values would
+        # otherwise pile its top-k into the top bin and refine thousands of
+        # candidates on rank 0 (B200: 2-4x slower than streaming it).
+        self.embedded = bool(embedded)
+        assert not (self.embedded and pdl)
+        # live slots (embedded only): a row of n4 float4s takes vl = ceil(n4 /
+        # (CS * BLK)) <= VPT slots per thread, rank r holding [r * vl * BLK,
+        # (r + 1) * vl * BLK), and the histogram skips the others, so a row a
+        # narrower VPT would hold is spread over every rank instead of piling
+        # onto the low ones
+        self.live = bool(live)
+        assert self.embedded or not self.live
         self.blk = blk
         self.vpt = vpt
         self.cs = cs
@@ -6964,6 +7487,16 @@ class GvrRegClusKernel:
         out: cute.Tensor,
         n: cutlass.Int32,
     ):
+        rank, row, _ = cute.arch.block_idx()  # bx=rank
+        sbase = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()  # Int32 shared addr
+        self.row_topk(logits, pre_idx, kv_lens, out, n, row, rank, sbase)
+
+    @cute.jit
+    def row_topk(self, logits, pre_idx, kv_lens, out, n, row, rank, sbase):
+        """Top-K of row ``row`` by cluster rank ``rank``: the whole kernel body,
+        with the smem window (map in the family docstring) at byte address
+        ``sbase`` in every CTA of the cluster. Separate from ``kern`` so the main
+        family can call it for rows that fit a cluster's registers."""
         BLK = cutlass.const_expr(self.blk)
         VPT = cutlass.const_expr(self.vpt)
         CS = cutlass.const_expr(self.cs)
@@ -6974,7 +7507,6 @@ class GvrRegClusKernel:
             cute.arch.griddepcontrol_wait()  # knob default off
 
         tid, _, _ = cute.arch.thread_idx()
-        rank, row, _ = cute.arch.block_idx()  # bx=rank
         lane = tid & cutlass.Int32(31)
 
         # ============ per-row varlen prologue — shared contract lives in ======
@@ -6982,8 +7514,9 @@ class GvrRegClusKernel:
         # envelope arg; the launcher admits this family only when the envelope
         # fits its capacity window). Pure functions of `row` keep the body
         # guard and cluster barriers cluster-uniform. Short rows (n <= k):
-        # rank 0 emits identity + (-1) and the body is SKIPped — a zero-work
-        # pass would reach the crossing-overflow emitter and poison the output.
+        # rank 0 writes the row (_short_row_out) and every rank leaves, before
+        # any cluster barrier — a zero-work pass would reach the
+        # crossing-overflow emitter and poison the output.
         short = cutlass.Int32(0)
         prow = row
         if cutlass.const_expr(self.varlen):
@@ -7003,19 +7536,16 @@ class GvrRegClusKernel:
                 nv = n
             if nv <= kq:
                 short = cutlass.Int32(1)
-            if short == cutlass.Int32(0):
-                n = nv
             if short != cutlass.Int32(0):
                 if rank == cutlass.Int32(0):
-                    # k may exceed BLK (K = 2048 rows are admitted to this
-                    # family): stride the identity write
-                    jq = tid
-                    while jq < kq:
-                        ov = cutlass.Int32(-1)
-                        if jq < nv:
-                            ov = self._ox_g(pre_idx, jq)
-                        out[row, jq] = ov
-                        jq = jq + cutlass.Int32(BLK)
+                    # one position per thread (k <= BLK); K = 2048 rows, admitted
+                    # to this family, take the strided tail
+                    _short_row_out(
+                        out, row, pre_idx, req, nv, kq, tid, 1, BLK, self.paged, self.page_shift
+                    )
+                _exit_thread()
+            if short == cutlass.Int32(0):
+                n = nv
 
         # ------------------------------------------------------------------
         # Predeclarations (DSL AST rule: every scalar (re)assigned under a
@@ -7088,10 +7618,7 @@ class GvrRegClusKernel:
             x_addr = logits[row, None].iterator.toint()  # Int64 gmem byte base
             p_addr = pre_idx[prow, None].iterator.toint()  # request-level under varlen
 
-            # ---- shared-memory window (map in module docstring) ----
-            sptr = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16)
-            sbase = sptr.toint()  # Int32 shared addr
-
+            # ---- shared-memory window at sbase (map in module docstring) ----
             s_res = _smem_view__regclus(cutlass.Int32, sbase, 0, 6)
             s_cnt = _smem_view__regclus(cutlass.Int32, sbase, 6, 2)  # [0]=s_o1 [1]=s_o2
             s_kmm = _smem_view__regclus(cutlass.Uint32, sbase, 8, 2)  # [0]=s_kmin [1]=s_kmax
@@ -7147,7 +7674,15 @@ class GvrRegClusKernel:
 
             n4 = n >> cutlass.Int32(2)
             ntail = n - (n4 << cutlass.Int32(2))
-            base4 = rank * cutlass.Int32(self.span)
+            # slots per thread holding the row, and the end of this rank's part
+            vl = cutlass.Int32(VPT)
+            lim4 = n4
+            if cutlass.const_expr(self.live):
+                vl = (n4 + cutlass.Int32(CS * BLK - 1)) >> cutlass.Int32((CS * BLK).bit_length() - 1)
+                lim4 = (rank + cutlass.Int32(1)) * vl * cutlass.Int32(BLK)
+                if lim4 > n4:
+                    lim4 = n4
+            base4 = rank * vl * cutlass.Int32(BLK)
             tix = (n4 << cutlass.Int32(2)) + tid  # CUDA `tidx`
 
             # ---- P0: redundant hint gather, EVERY CTA. One coalesced word per
@@ -7171,11 +7706,11 @@ class GvrRegClusKernel:
             frags = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(VPT)]
             for u in cutlass.range_constexpr(VPT):
                 i = base4 + tid + cutlass.Int32(u * self.blk)
-                if i < n4:
+                if i < lim4:
                     ld_g_f32x4(atom128, x_addr, i, frags[u])
             for u in cutlass.range_constexpr(VPT):
                 i = base4 + tid + cutlass.Int32(u * self.blk)
-                if i >= n4:  # -INFINITY fill
+                if i >= lim4:  # -INFINITY fill
                     for z in cutlass.range_constexpr(4):
                         frags[u][z] = cutlass.Float32(_NEG_INF__regclus)
             # tail element: rank 0 only
@@ -7193,10 +7728,26 @@ class GvrRegClusKernel:
             # ---- P3: GMIN/GMAX from the hint, ONE barrier fold.
             lmin = cutlass.Uint32(0xFFFFFFFF)
             lmax = cutlass.Uint32(0)
-            if cutlass.Uint32(pv0) < cutlass.Uint32(n):
-                uk = fkey(ldg_f32(x_addr, pv0))  # __ldg(X+pv0)
-                lmin = uk
-                lmax = uk
+            if cutlass.const_expr(not self.embedded):
+                if cutlass.Uint32(pv0) < cutlass.Uint32(n):
+                    uk = fkey(ldg_f32(x_addr, pv0))  # __ldg(X+pv0)
+                    lmin = uk
+                    lmax = uk
+            else:
+                # finite scores only, and (hint-free) a top that also covers warp
+                # w's 32 columns at w * n / NW (see the ctor)
+                if cutlass.Uint32(pv0) < cutlass.Uint32(n):
+                    xb = ldg_f32(x_addr, pv0)
+                    if fabs_f32(xb) != cutlass.Float32(_POS_INF__regclus):
+                        lmin = fkey(xb)
+                        lmax = lmin
+                if cutlass.const_expr(self.hint_free):
+                    run = n >> cutlass.Int32((self.blk // 32).bit_length() - 1)
+                    xr = ldg_f32(x_addr, (tid >> cutlass.Int32(5)) * run + lane)
+                    if fabs_f32(xr) != cutlass.Float32(_POS_INF__regclus):
+                        uk = fkey(xr)
+                        if uk > lmax:
+                            lmax = uk
             lmin = warp_min_u32(lmin)
             lmax = warp_max_u32(lmax)
             if lane == cutlass.Int32(0):
@@ -7219,7 +7770,7 @@ class GvrRegClusKernel:
             okc = cutlass.Int32(0)
             if Tv < GMAX:
                 w_ = GMAX - Tv
-                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(3.5e38):
+                if w_ > cutlass.Float32(1e-30) and w_ < cutlass.Float32(_POS_INF__regclus):
                     okc = cutlass.Int32(1)
             if okc == cutlass.Int32(0):
                 Tv = cutlass.Float32(SENT_LO)
@@ -7239,9 +7790,10 @@ class GvrRegClusKernel:
             # ---- P4: histogram; tval add UNCONDITIONAL (trash bin swallows
             # -INFINITY via the saturating cvt).
             for s in cutlass.range_constexpr(S):
-                qv = _fmaf__regclus(_val__regclus(frags, s), SC, CQ)
-                bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
-                atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
+                if cutlass.Int32(s // 4) < vl:  # (always, unless live)
+                    qv = _fmaf__regclus(_val__regclus(frags, s), SC, CQ)
+                    bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
+                    atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
             qv = _fmaf__regclus(tval, SC, CQ)
             bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
             atomic_add_cta(s_hist.iterator + cutlass.Int32(bn), cutlass.Int32(1))
