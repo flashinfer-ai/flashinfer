@@ -1718,8 +1718,13 @@ cudaError_t SplitRowRejectionSamplingFromProb(uint32_t cluster_size, T* probs, I
     cudaFuncAttributes attr;
     FLASHINFER_CUDA_CALL(cudaFuncGetAttributes(&attr, kernel));
     if (attr.ptxVersion < 90) return cudaErrorNotSupported;
+    // The limit is per kernel, so a concurrent launch with a smaller chunk must not lower it.
+    int device, max_smem;
+    FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
     FLASHINFER_CUDA_CALL(
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+    FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              max_smem - static_cast<int>(attr.sharedSizeBytes)));
     cudaLaunchAttribute attribute[1];
     attribute[0].id = cudaLaunchAttributeClusterDimension;
     attribute[0].val.clusterDim.x = cluster_size;
