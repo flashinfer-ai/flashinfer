@@ -27,11 +27,13 @@ and record scalars of every hidden size on its boards of record
 (``RULES_BOARDS``) and token counts of record (``RULES_T_VALUES``):
 
 * the program set is the deterministic set without its column-slab
-  (``bwd_slab__*``) and final-reduction (``bwd_reduce__*``) records, renamed
-  and otherwise equal field for field, plus the programs of this package: at
-  hidden 4096 ``cake_mhc_train_fn_split_atomic__tv128_dep`` on sm_100a /
-  sm_103a, ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` on sm_107a,
-  ``cake_mhc_train_bwd_slab_atomic__dynr`` and
+  (``bwd_slab__*``) and final-reduction (``bwd_reduce__*``) records and its
+  token owner's group-row forms, renamed and otherwise equal field for field
+  (a per-CTA token owner may select by the ``R`` regimes of its program where
+  the deterministic record names that program), plus the programs of this
+  package: at hidden 4096 ``cake_mhc_train_fn_split_atomic__tv128_dep`` on
+  sm_100a / sm_103a, ``cake_mhc_train_fn_split_atomic__tv128_t128_dep`` on
+  sm_107a, ``cake_mhc_train_bwd_slab_atomic__dynr`` and
   ``cake_mhc_train_bwd_slab_atomic__lpt`` on all three and their slab-fastest
   copies ``cake_mhc_train_bwd_slab_atomic__dynr_os`` /
   ``cake_mhc_train_bwd_slab_atomic__lpt_os`` on sm_100a / sm_103a; at 5120
@@ -63,17 +65,17 @@ and record scalars of every hidden size on its boards of record
   regions at the same offsets without the trailing ``dfn_part``, at every
   hidden size;
 * the host rules are copies (equal outputs, not the deterministic objects;
-  the per-size tables the deterministic ones without the column-slab and
-  reduction tables), but this package's own column-slab rule
+  the per-size tables the deterministic ones without the column-slab,
+  reduction and group-row tables), but this package's own column-slab rule
   (``BWD_SLAB_LPT``, ``BWD_SLAB_LPT_HIDDEN``, ``BWD_SLAB_ORDER``,
   ``lpt_chunks``, ``bwd_slab_order``, ``bwd_slab_atomic_program``,
-  ``slab_plan``; ``host_plan`` itself is the deterministic one): its
-  geometries, its token-count bands (the unit order of record, and the banded
-  calibration form under a test table) and its selection at every hidden
-  size (where the size's table calibrates the architecture: every
-  architecture at 4096, sm_100a at 5120 and 7168; elsewhere the one-size
-  chunks of ``k7_chunks`` without running the screen), its call-time lookup
-  and a workspace envelope that never runs its screen;
+  ``slab_plan``; ``host_plan`` itself is the deterministic one without its
+  group-row keys): its geometries, its token-count bands (the unit order of
+  record, and the banded calibration form under a test table) and its
+  selection at every hidden size (where the size's table calibrates the
+  architecture: every architecture at 4096, sm_100a at 5120 and 7168; elsewhere
+  the one-size chunks of ``k7_chunks`` without running the screen), its
+  call-time lookup and a workspace envelope that never runs its screen;
 * the package is standalone: no source file imports another flashinfer package
   (the shared ``cake_build.py`` JIT fallback aside, inside a function), and a
   copy under another name imports and plans with ``flashinfer`` blocked;
@@ -84,6 +86,14 @@ and record scalars of every hidden size on its boards of record
   launch), and the alert's wording;
 * the wiring: the test-helper key, the package data, the build-manifest
   checker's row and ``build.json``.
+
+The deterministic group-row forms (``BWD_ROW_BANDS``: the token owner's
+``_trows_dyn`` and the reduction's ``_trows`` programs, the group-row parameter
+region and the host plan's ``groups`` / ``group_rows`` / ``param_dim0`` /
+``param_dim1``) have no copy: the column slab folds the token owner's per-CTA
+partials.  The comparisons above read the deterministic rules with those forms
+off (``bwd_group_rows`` False: its per-CTA rules), and the calls where the two
+packages diverge are checked as such.
 """
 
 from __future__ import annotations
@@ -222,6 +232,21 @@ LPT_FIRES_HIDDEN = (
 # splits, whose libraries the forward does not share, have no copy either).
 DROPPED = (DET_PREFIX + "bwd_slab__", DET_PREFIX + "bwd_reduce__")
 DROPPED_ROLES = ("bwd_slab", "bwd_reduce")
+# The deterministic group-row forms, which this package does not copy either (its column slab folds the token owner's
+# per-CTA partials): the token-owner records whose program ends in GROUP_ROWS (the reduction's "_trows" forms go with
+# the dropped reduction), the per-size table and rule that select them (BWD_ROW_BANDS, bwd_group_rows) and the host-plan
+# keys of the group-row parameter region; PER_CTA_DIMS: the per-CTA value of each dimension of that region ([G6, 32],
+# this package's ["chunks", 32]).  The mirror checks read the deterministic rules with bwd_group_rows off
+# (_det_per_cta).
+GROUP_ROWS = "_trows_dyn"
+DET_GROUP_ROWS = frozenset(
+    name
+    for name, record in det.MODULES.items()
+    if (record["select_rule"] or {}).get("program", "").endswith(GROUP_ROWS)
+)
+GROUP_ROW_RULES = ("BWD_ROW_BANDS", "bwd_group_rows")
+GROUP_ROW_KEYS = ("groups", "group_rows", "param_dim0", "param_dim1")
+PER_CTA_DIMS = {"param_dim0": "chunks", "param_dim1": det.PARAM_COLS}
 # Sinkhorn counts other than the count of record: the token-owner pass runs its run-time-count record.
 RUN_TIME_ITERS = (1, 7, 64)
 T_VALUES = tuple(T for T in det.RULES_T_VALUES if T > 0)
@@ -400,6 +425,62 @@ def _det_role(name: str) -> str:
     return det.MODULES[name]["role"]
 
 
+def _det_program(name: str) -> str:
+    return det.MODULES[name]["select_rule"]["program"]
+
+
+@contextlib.contextmanager
+def _det_per_cta():
+    """The deterministic rules with their group-row forms off (``bwd_group_rows`` False at every call): the per-CTA
+    token owner and parameter region this package copies, and the per-CTA reduction whose ``dscale`` / ``dbase`` its
+    column slab reproduces.  The deterministic host plans and workspace envelopes cached under either setting are
+    dropped on entry and on exit, also when the body fails."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(det, "bwd_group_rows", lambda *_args, **_kwargs: False)
+        det.host_plan.cache_clear()
+        det.workspace_bytes_upto.cache_clear()
+        try:
+            yield
+        finally:
+            patch.undo()
+            det.host_plan.cache_clear()
+            det.workspace_bytes_upto.cache_clear()
+
+
+@pytest.fixture
+def det_per_cta():
+    """:func:`_det_per_cta` for the whole test."""
+    with _det_per_cta():
+        yield
+
+
+def _per_cta_plan(plan: dict) -> dict:
+    """A deterministic host plan under :func:`_det_per_cta` without its group-row keys (this package's plan holds none
+    of them), after checking that its parameter region is the per-CTA one (:data:`PER_CTA_DIMS`)."""
+    assert not plan["group_rows"], plan
+    for dim, per_cta in PER_CTA_DIMS.items():
+        want = plan[per_cta] if isinstance(per_cta, str) else per_cta
+        assert plan[dim] == want, (dim, plan)
+    return {key: value for key, value in plan.items() if key not in GROUP_ROW_KEYS}
+
+
+def _regime_ranges(program: str, arch: str, hidden: int) -> list:
+    """The ``R`` ranges ``[lo, hi]`` (``hi`` None: unbounded) on which the deterministic ``bwd_token_program`` of
+    ``arch`` at ``hidden`` names ``program`` outside its token-count bands and its group-row bands: the
+    ``BWD_TOKEN_REGIMES`` entries of ``program`` and, for the architecture's ``BWD_TOKEN_PROGRAM``, every gap between
+    the regimes (the rule in ``chunk_rows_band`` form)."""
+    regimes = det._tab("BWD_TOKEN_REGIMES", hidden)[arch]
+    ranges = [[lo, hi] for name, lo, hi in regimes if name == program]
+    if program == det._tab("BWD_TOKEN_PROGRAM", hidden)[arch]:
+        start = 0
+        for _name, lo, hi in sorted(regimes, key=lambda regime: regime[1]):
+            if lo > start:
+                ranges.append([start, lo - 1])
+            start = hi + 1
+        ranges.append([start, None])
+    return sorted(ranges, key=lambda bounds: bounds[0])
+
+
 @contextlib.contextmanager
 def _torch_deterministic(mode: bool, *, warn_only: bool = False):
     previous = (
@@ -421,11 +502,14 @@ def _torch_deterministic(mode: bool, *, warn_only: bool = False):
 def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_split() -> (
     None
 ):
-    """``MODULES`` = every deterministic record of every hidden size but ``bwd_slab__*`` / ``bwd_reduce__*`` and the
-    backward fn splits under the ``cake_mhc_train_`` prefix (the record equal field for field after the rename:
-    arches, hidden size, build knobs, launch, arguments, rules) plus the programs of this package (``ATOMIC``); the
-    dropped records are exactly the deterministic column-slab and reduction roles, and the backward fn splits are the
-    only other records without a copy."""
+    """``MODULES`` = every deterministic record of every hidden size but ``bwd_slab__*`` / ``bwd_reduce__*``, the
+    backward fn splits and the token owner's group-row forms (``DET_GROUP_ROWS``) under the ``cake_mhc_train_`` prefix
+    (the record equal field for field after the rename: arches, hidden size, build knobs, launch, arguments, rules;
+    a token-owner record whose deterministic rule names its program through ``bwd_token_program`` may select by the
+    ``R`` regimes of that program instead, ``chunk_rows_band``: the same calls on its architectures, which have no
+    token-count band, outside the group-row bands) plus the programs of this package (``ATOMIC``); the dropped records
+    are exactly the deterministic column-slab and reduction roles, and the backward fn splits and the group-row token
+    owners are the only other records without a copy (no record of this package names a group-row program)."""
     assert tuple(det.HIDDEN_SIZES) == HIDDEN_SIZES
     assert {record["hidden"] for record in DET_MODULES.values()} == set(HIDDEN_SIZES)
     assert DET_MODULES == det.MODULES
@@ -440,17 +524,35 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
         name for name in DET_MODULES if _det_role(name) == "fn_split_bwd"
     }
     assert backward_splits and not backward_splits & dropped
+    assert {_det_role(name) for name in DET_GROUP_ROWS} <= {"bwd_token"}
     copied = {
         _renamed(name): name
         for name in DET_MODULES
-        if name not in dropped and name not in backward_splits
+        if name not in dropped
+        and name not in backward_splits
+        and name not in DET_GROUP_ROWS
     }
     assert all(name.startswith(ND_PREFIX) for name in copied)
     assert not set(copied) & set(ATOMIC)
     expected = set(copied) | set(ATOMIC)
     assert set(nd.MODULES) == expected, sorted(set(nd.MODULES) ^ expected)
+    assert not [name for name in nd.MODULES if GROUP_ROWS in name]
     for name, det_name in copied.items():
-        assert nd.MODULES[name] == _renamed(det.MODULES[det_name]), name
+        record, reference = nd.MODULES[name], _renamed(det.MODULES[det_name])
+        rule = reference["select_rule"]
+        if record["select_rule"] != rule:
+            # the per-CTA rule in chunk_rows_band form: the R regimes of the program the deterministic rule names
+            assert (rule or {}).get("kind") == "program", name
+            assert rule["rule"] == "bwd_token_program", name
+            hidden = record["hidden"]
+            for arch in record["arches"]:
+                assert not det._tab("BWD_TOKEN_BANDS", hidden)[arch], (name, arch)
+                assert record["select_rule"] == {
+                    "kind": "chunk_rows_band",
+                    "ranges": _regime_ranges(rule["program"], arch, hidden),
+                }, (name, arch)
+            reference = {**reference, "select_rule": record["select_rule"]}
+        assert record == reference, name
     for name, record in nd.MODULES.items():
         assert record["kernel_symbol"] == f"kernel_{record['kernel']}", name
         assert record["library"] == record["kernel"], name
@@ -599,9 +701,10 @@ def test_no_record_references_a_deterministic_library() -> None:
 @pytest.mark.cpu_only
 def test_records_speak_the_vocabulary() -> None:
     """Every record binds logical names of this package's vocabulary (``LOGICAL_TENSORS`` = the deterministic one
-    without ``dfn_part``; ``LOGICAL_SCALARS`` = the deterministic one and the lpt record's chunk scalars; tensors as
-    buffers, scalars as parameters), one logical name per kernel parameter, the
-    per-call PDL argument exactly when ``use_pdl`` is ``"runtime"`` (just before the grid).  The host binds every
+    without ``dfn_part``; ``LOGICAL_SCALARS`` = the deterministic one without its group-row scalars, ``groups``, and
+    with the lpt record's chunk scalars; tensors as buffers, scalars as parameters), one logical name per kernel
+    parameter, the per-call PDL argument exactly when ``use_pdl`` is ``"runtime"`` (just before the grid).  The host
+    binds every
     argument of every routed record: each logical name is a call value, a workspace region, a host-plan scalar of
     the route's fast plan or a scalar the record fixes (the run-time-count records also take ``sinkhorn_iters``,
     which the full path passes), and every workspace value names a region of the route's workspace."""
@@ -609,7 +712,8 @@ def test_records_speak_the_vocabulary() -> None:
         t for t in det.LOGICAL_TENSORS if t != "dfn_part"
     ]
     assert "dfn_part" in det.LOGICAL_TENSORS
-    assert nd.LOGICAL_SCALARS == det.LOGICAL_SCALARS + LPT_HOST_KEYS
+    kept = tuple(name for name in det.LOGICAL_SCALARS if name not in GROUP_ROW_KEYS)
+    assert kept + LPT_HOST_KEYS == nd.LOGICAL_SCALARS
     assert set(pkg._HOST_VALUES["bwd_finish"]) >= set(LPT_HOST_KEYS)
     tensors, scalars = set(nd.LOGICAL_TENSORS), set(nd.LOGICAL_SCALARS)
     for name, record in nd.MODULES.items():
@@ -670,9 +774,10 @@ def test_records_speak_the_vocabulary() -> None:
 def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
     """``ROUTES``: the deterministic architectures and route keys of every hidden size (5120 and 7168 on sm_100a /
     sm_103a only); every route the renamed deterministic route except ``bwd_finish``, which is the deterministic
-    token-owner records (renamed, in route order), the atomic fn split of the architecture and size and the column
-    slab's forms of the size (``dynr``, ``lpt``, ``dynr_os``, ``lpt_os``; on sm_107a ``dynr`` and ``lpt``; on sm_103a
-    at 5120 and 7168 ``dynr`` and ``dynr_os``).  Every record is routed, on exactly its architectures."""
+    token-owner records but the group-row forms (renamed, in route order), the atomic fn split of the architecture
+    and size and the column slab's forms of the size (``dynr``, ``lpt``, ``dynr_os``, ``lpt_os``; on sm_107a ``dynr``
+    and ``lpt``; on sm_103a at 5120 and 7168 ``dynr`` and ``dynr_os``).  Every record is routed, on exactly its
+    architectures."""
     assert set(nd.ROUTES) == set(det.ROUTES) == set(det.ARCHES)
     routed: dict[str, set] = {}
     for arch in det.ARCHES:
@@ -694,7 +799,11 @@ def test_routes_are_the_deterministic_routes_but_bwd_finish() -> None:
                 assert route == _renamed(det_route), (arch, key)
                 continue
             hidden = _route_hidden(key)
-            tokens = [_renamed(n) for n in det_route if _det_role(n) == "bwd_token"]
+            tokens = [
+                _renamed(n)
+                for n in det_route
+                if _det_role(n) == "bwd_token" and n not in DET_GROUP_ROWS
+            ]
             assert tokens, (arch, key)
             slabs = _slabs(arch, hidden)
             assert route == [*tokens, _atomic_split(arch, hidden), *slabs], (arch, key)
@@ -715,18 +824,21 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
     arch: str, sm: int
 ) -> None:
     """At every hidden size of the board's architecture, on every token count of record at the count of record and at
-    run-time counts: every kind selects the renamed deterministic records, except ``bwd_finish``: (the deterministic
-    token-owner record(s) of the call renamed, the atomic fn split of the size, the column slab's form of the call --
-    the size's ``lpt`` record where ``lpt_chunks`` gives a geometry of the size under the table of record, else its
-    ``dynr`` record, as its ``_os`` copy where the size's ``BWD_SLAB_ORDER`` band is ``"slab"``) -- one fn split, one
-    column slab, no reduction."""
+    run-time counts: every kind selects the renamed deterministic records of the per-CTA rules (:func:`_det_per_cta`),
+    except ``bwd_finish``: (the deterministic token-owner record(s) of the call renamed, the atomic fn split of the
+    size, the column slab's form of the call -- the size's ``lpt`` record where ``lpt_chunks`` gives a geometry of the
+    size under the table of record, else its ``dynr`` record, as its ``_os`` copy where the size's ``BWD_SLAB_ORDER``
+    band is ``"slab"``) -- one fn split, one column slab, no reduction.  The deterministic selection of record holds
+    the group-row form (``GROUP_ROWS``) of that token owner's program where ``bwd_group_rows`` holds at the count of
+    record, that token owner itself everywhere else."""
     for hidden, T in ((h, T) for h in _arch_sizes(arch) for T in T_VALUES):
         for iters in (det.SINKHORN_ITERS, *RUN_TIME_ITERS):
             for kind in det.KINDS:
                 what = (arch, sm, hidden, T, iters, kind)
-                det_names = det.selected_modules(
-                    arch, hidden, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
-                )
+                with _det_per_cta():
+                    det_names = det.selected_modules(
+                        arch, hidden, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
+                    )
                 names = nd.selected_modules(
                     arch, hidden, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
                 )
@@ -748,6 +860,23 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
                 assert (run_time == "run_time_iters") == (
                     iters != det.SINKHORN_ITERS
                 ), what
+                per_cta = [n for n in det_names if _det_role(n) == "bwd_token"]
+                shipped = [
+                    n
+                    for n in det.selected_modules(
+                        arch, hidden, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
+                    )
+                    if _det_role(n) == "bwd_token"
+                ]
+                if (
+                    det.bwd_group_rows(T, sm, arch, hidden)
+                    and iters == det.SINKHORN_ITERS
+                ):
+                    assert [_det_program(n) for n in shipped] == [
+                        _det_program(n) + GROUP_ROWS for n in per_cta
+                    ], (what, shipped)
+                else:
+                    assert shipped == per_cta, (what, shipped)
 
 
 def _possible_programs(arch: str, hidden: int) -> set[str]:
@@ -879,7 +1008,9 @@ def test_pdl_follows_the_deterministic_edges(arch: str, sm: int) -> None:
         n
         for route in DET_ROUTES[arch].values()
         for n in route
-        if not _dropped(n) and _det_role(n) != "fn_split_bwd"
+        if not _dropped(n)
+        and _det_role(n) != "fn_split_bwd"
+        and n not in DET_GROUP_ROWS
     ]
     for T in sorted(set(T_VALUES) | {t for t in boundaries if t > 0}):
         for path in det.PDL_PATHS:
@@ -1171,18 +1302,23 @@ def _round256(n: int) -> int:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.usefixtures("det_per_cta")
 @pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
 def test_workspace_is_the_deterministic_layout_without_the_partials(
     arch: str, sm: int
 ) -> None:
     """At every hidden size of the board's architecture: ``fwd`` is the deterministic forward workspace; the ``bwd``
-    regions are the deterministic ``bwd`` regions but the last (``dfn_part``, ``P x 24 x 4H`` FP32) at identical
-    offsets, sizes, dtypes and shapes, the ticket region first; the total is the deterministic total less the rounded
-    ``dfn_part`` bytes; ``T == 0`` has no regions."""
+    regions are the deterministic per-CTA ``bwd`` regions (:func:`_det_per_cta`; the parameter region the per-CTA
+    partials ``[chunks, 32]`` at every token count, the group rows of ``BWD_ROW_BANDS`` nowhere) but the last
+    (``dfn_part``, ``P x 24 x 4H`` FP32) at identical offsets, sizes, dtypes and shapes, the ticket region first; the
+    total is the deterministic total less the rounded ``dfn_part`` bytes; ``T == 0`` has no regions."""
     assert set(nd.WORKSPACE_REGIONS) == set(det.WORKSPACE_REGIONS) == {"fwd", "bwd"}
     assert nd.WORKSPACE_REGIONS["fwd"] == det.WORKSPACE_REGIONS["fwd"]
     assert det.WORKSPACE_REGIONS["bwd"][-1]["name"] == "dfn_part"
-    assert nd.WORKSPACE_REGIONS["bwd"] == det.WORKSPACE_REGIONS["bwd"][:-1]
+    assert nd.WORKSPACE_REGIONS["bwd"] == [
+        {**region, "shape": [PER_CTA_DIMS.get(dim, dim) for dim in region["shape"]]}
+        for region in det.WORKSPACE_REGIONS["bwd"][:-1]
+    ]
     assert nd.WORKSPACE_OF_KIND == det.WORKSPACE_OF_KIND
     for hidden, T in ((h, T) for h in _arch_sizes(arch) for T in det.RULES_T_VALUES):
         what = (hidden, T)
@@ -1203,6 +1339,10 @@ def test_workspace_is_the_deterministic_layout_without_the_partials(
             assert region == reference["regions"][name], (what, name)
         assert layout["regions"]["ticket"]["offset"] == 0
         assert layout["regions"]["ticket"]["bytes"] == 4 * det.TICKET_WORDS
+        assert layout["regions"]["param_partial"]["shape"] == (
+            nd.host_plan(T, sm, arch, hidden)["chunks"],
+            det.PARAM_COLS,
+        ), what
         part = reference["regions"]["dfn_part"]
         parts = det.k7_chunks(T, sm, hidden=hidden)[0]
         assert part["shape"] == (parts, 24, 4 * hidden), what
@@ -1292,11 +1432,13 @@ _OWN_RULES = (
 
 
 @pytest.mark.cpu_only
+@pytest.mark.usefixtures("det_per_cta")
 @pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
 def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> None:
     """The constants and tables of the host rules equal the deterministic ones; the rule functions are this
-    package's own objects with the deterministic outputs on every token count of record; the deterministic
-    column-slab and reduction rules are absent and ``PROGRAM_RULES`` drops them for this package's column-slab rule
+    package's own objects with the deterministic per-CTA outputs (:func:`_det_per_cta`; the host plan without its
+    group-row keys) on every token count of record; the deterministic column-slab, reduction and group-row rules
+    (``GROUP_ROW_RULES``) are absent and ``PROGRAM_RULES`` drops the first two for this package's column-slab rule
     (``bwd_slab_atomic_program``, with ``BWD_SLAB_LPT``, ``BWD_SLAB_LPT_HIDDEN``, ``BWD_SLAB_ORDER``,
     ``lpt_chunks``, ``bwd_slab_order`` and ``slab_plan``: none of them in the deterministic registry); a rules row is
     the deterministic row without its column-slab and reduction program columns, with this package's backward
@@ -1304,17 +1446,21 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
     for name in _SHARED_TABLES:
         assert getattr(nd, name) == getattr(det, name), name
     # The hidden sizes: the deterministic ones; the per-size table names are the deterministic ones without the
-    # column-slab and reduction tables, and the tables of each size other than 4096 the deterministic tables of those
-    # names (the tables of record above are the H 4096 ones).
+    # column-slab, reduction and group-row tables, and the tables of each size other than 4096 the deterministic tables
+    # of those names (the tables of record above are the H 4096 ones).
     assert tuple(nd.HIDDEN_SIZES) == tuple(det.HIDDEN_SIZES) == HIDDEN_SIZES
-    kept = tuple(name for name in det.H_TABLE_NAMES if name not in _DROPPED_RULES)
+    kept = tuple(
+        name
+        for name in det.H_TABLE_NAMES
+        if name not in _DROPPED_RULES and name not in GROUP_ROW_RULES
+    )
     assert kept == nd.H_TABLE_NAMES
     assert HIDDEN not in det.H_TABLES and set(det.H_TABLES) == set(NEW_HIDDEN_SIZES)
     assert {
         hidden: {name: det.H_TABLES[hidden][name] for name in nd.H_TABLE_NAMES}
         for hidden in NEW_HIDDEN_SIZES
     } == nd.H_TABLES
-    for name in _DROPPED_RULES:
+    for name in (*_DROPPED_RULES, *GROUP_ROW_RULES):
         assert hasattr(det, name) and not hasattr(nd, name), name
     for name in _OWN_RULES:
         assert hasattr(nd, name) and not hasattr(det, name), name
@@ -1346,7 +1492,7 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
         assert row == expected, T
         if T == 0:
             continue
-        assert nd.host_plan(T, sm, arch) == det.host_plan(T, sm, arch), T
+        assert nd.host_plan(T, sm, arch) == _per_cta_plan(det.host_plan(T, sm, arch)), T
         for rule in (
             "fwd_map_program",
             "fwd_coef_program",
@@ -1363,14 +1509,16 @@ def test_host_rules_are_copies_of_the_deterministic_ones(arch: str, sm: int) -> 
 
 
 @pytest.mark.cpu_only
+@pytest.mark.usefixtures("det_per_cta")
 @pytest.mark.parametrize(("arch", "sm"), det.RULES_BOARDS)
 def test_host_rules_at_the_new_hidden_sizes(arch: str, sm: int) -> None:
     """At hidden 5120 and 7168 on every board (the rules are functions of the size's tables; sm_107a routes neither
     size): a rules row is the deterministic row without its column-slab and reduction program columns, with this
     package's backward workspace bytes, on every token count of record; the host plan and every copied rule give the
-    deterministic outputs; the per-size tables are read through ``_tab`` (a size it does not spell is a ``KeyError``,
-    never the H 4096 value; the column slab's ``BWD_SLAB_LPT`` / ``BWD_SLAB_LPT_HIDDEN`` / ``BWD_SLAB_ORDER`` are no
-    per-size tables of ``_tab``).  ``rules_table()`` holds the H 4096 rows, then each other size's."""
+    deterministic per-CTA outputs (:func:`_det_per_cta`; the host plan without its group-row keys); the per-size
+    tables are read through ``_tab`` (a size it does not spell is a ``KeyError``, never the H 4096 value; the column
+    slab's ``BWD_SLAB_LPT`` / ``BWD_SLAB_LPT_HIDDEN`` / ``BWD_SLAB_ORDER`` are no per-size tables of ``_tab``).
+    ``rules_table()`` holds the H 4096 rows, then each other size's."""
     dropped_columns = {"bwd_slab_program", "bwd_reduce_program", "bwd_reduce_grid"}
     for hidden in NEW_HIDDEN_SIZES:
         for name in nd.H_TABLE_NAMES:
@@ -1396,8 +1544,8 @@ def test_host_rules_at_the_new_hidden_sizes(arch: str, sm: int) -> None:
             assert row == expected, what
             if T == 0:
                 continue
-            assert nd.host_plan(T, sm, arch, hidden) == det.host_plan(
-                T, sm, arch, hidden
+            assert nd.host_plan(T, sm, arch, hidden) == _per_cta_plan(
+                det.host_plan(T, sm, arch, hidden)
             ), what
             for rule in (
                 "fwd_map_program",
