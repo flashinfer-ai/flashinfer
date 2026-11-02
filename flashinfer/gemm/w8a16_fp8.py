@@ -431,7 +431,8 @@ def w8a16_fp8_gemm(
         A launch failure reported by the CUDA runtime.
     """
     m, n, k, lead_shape = _check_operands(act, weight, weight_scale)
-    weight_scale = weight_scale.reshape(1)  # () or (1,): a view either way
+    # weight_scale goes down as given: () or (1,), one fp32 value either way, and
+    # the launcher reads only its address.
     device = _resolve_device(act.device)
     if weight.device != act.device or weight_scale.device != act.device:
         raise ValueError(
@@ -457,8 +458,10 @@ def w8a16_fp8_gemm(
         # Everything above applies to the empty call too; only act and out are
         # empty here, and an empty tensor has no address to align.
         return out
-    act2d = act.view(-1, k)
-    out2d = out.view(-1, n)
+    # The kernels take [M, K] / [M, N]: the tensors themselves when already 2-D,
+    # otherwise metadata-only views of the same contiguous storage (no copy).
+    act2d = act if act.dim() == 2 else act.view(-1, k)
+    out2d = out if out.dim() == 2 else out.view(-1, n)
     _check_aligned(act2d, "act")
     _check_aligned(out2d, "out")
     ws_bytes = _workspace_bytes(m, n, k, device.index, algo_code)
