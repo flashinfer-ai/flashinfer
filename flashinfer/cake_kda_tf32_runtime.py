@@ -4136,6 +4136,17 @@ class FlashKDABlackwellBF16FusedLaunch:
                     ),
                     device=q.device,
                 )
+                # OH17 timing arm: a forced owner/helper part of a mixed-length
+                # split takes H helpers whatever its shortest sequence is.
+                _oh17_forced = getattr(self, "_oh17_force_helpers", 0)
+                if _oh17_forced:
+                    m64_owner_helpers = min(
+                        _oh17_forced,
+                        M64_OWNER_HELPER_MAX_HELPERS,
+                        _m64_cooperative_capacity(q.device) // total_tasks - 2,
+                    )
+                    if m64_owner_helpers < 1:
+                        m64_owner_helpers = 0
             m64_factory = partial(
                 _m64_pair_share_factory if pair_share else _factory,
                 "compiled_bf16_fused_m64",
@@ -7153,7 +7164,14 @@ class RebindPlan:
 # Split-sequence affine composites hold three prepared part launches plus a
 # few caller-aliasing attributes of their own; their containers are addressed
 # as "<sub launch>.<container>" so one rebind plan covers the whole DAG.
-AFFINE_SUB_LAUNCHES = ("_main", "_map", "_correction")
+AFFINE_SUB_LAUNCHES = (
+    "_main",
+    "_map",
+    "_correction",
+    "_part3",
+    "_part4",
+    "_part5",
+)  # OH17 arm: + mixed-length split parts
 # Parts whose plan-cache rebinds may be applied after the first chain kernel.
 AFFINE_DEFERRED_PARTS = ("_map", "_correction")
 AFFINE_REBIND_ATTRIBUTES = (
@@ -7537,6 +7555,322 @@ def _apply_rebind_specs(
     return tma_moved
 
 
+# ---- OH17 (CAKE-1348 round 17) timing arm: OH-MIXLEN runtime split (diagnostic, never shipped) ----
+OH17_LONG_MIN = 1024
+OH17_MIXLEN_ARCHES = (
+    "sm_100a",
+    "sm_103a",
+)  # C3: the arches the mixed-length split may plan on (GB300 after the C2 host cut)
+OH17_HELPERS = 2
+_OH17_PART_NAMES = ("_main", "_map", "_correction", "_part3", "_part4", "_part5")
+
+
+class _OH17ForcedM64Launch(FlashKDABlackwellFP32M64Launch):
+    """OH17 arm part: the M64 FP32-state value split (plain or pair-share build by its own rule)."""
+
+    _oh17_force_helpers = 0
+
+
+class _OH17ForcedOHLaunch(FlashKDABlackwellFP32M64Launch):
+    """OH17 arm part: the M64 owner/helper build with OH17_HELPERS helpers per task."""
+
+    _oh17_force_helpers = OH17_HELPERS
+
+
+class _OH17MixLenSplitLaunch:
+    """OH17 arm: the parts of one mixed-length launch; side-stream parts co-run between a fork and a join."""
+
+    _descriptors_stale = False
+    _use_output_projection = False
+    _apply_route = False
+    _main = None
+    _map = None
+    _correction = None
+    _part3 = None
+    _part4 = None
+    _part5 = None
+
+    def __init__(self, parts, device, mode):
+        import torch
+
+        self._oh17_layout = []
+        sides = sorted({side for _, side, _ in parts if side})
+        for name, (launch, side, seqs) in zip(_OH17_PART_NAMES, parts, strict=False):
+            setattr(self, name, launch)
+            self._oh17_layout.append((name, side, seqs))
+        self._launch_device = device
+        self._oh17_streams = {side: torch.cuda.Stream(device=device) for side in sides}
+        self._oh17_fork = torch.cuda.Event() if sides else None
+        self._oh17_join = {side: torch.cuda.Event() for side in sides}
+        self.oh17_mode = mode
+        self.schedule = (
+            f"oh17_mixlen_{mode}["
+            + "+".join(
+                f"{getattr(self, name).schedule}@{seqs[0]}-{seqs[1]}{'/s%d' % side if side else ''}"
+                for name, side, seqs in self._oh17_layout
+            )
+            + "]"
+        )
+        first = getattr(self, self._oh17_layout[0][0])
+        self.route = first.route
+        self.gate_kind = first.gate_kind
+        self.gpu_arch = first.gpu_arch
+        self.sm_count = first.sm_count
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.__dict__["_main"], name)
+
+    def launch(self) -> None:
+        import torch
+
+        import tvm_ffi
+
+        flush_deferred_rebind(self)
+        stale = self._descriptors_stale
+        self._descriptors_stale = False
+        device = self._launch_device
+        # C2 stage: settle every part on the caller stream before the fork, so no
+        # host work is left between the part launches.
+        staged = []
+        with _ffi_stream_context(device):
+            for name, side, _ in self._oh17_layout:
+                part = getattr(self, name)
+                if stale:
+                    part._descriptors_stale = True
+                if part._descriptors_stale:
+                    part._prepare_descriptors_in_stream()
+                records = part._launch_records
+                if records is None:
+                    records = part._launch_records = tuple(part._build_launch_records())
+                torch_ops = bool(getattr(part, "_token_storage_refreshes", ())) or (
+                    getattr(part, "_beta_tma_valid", None) is not None
+                )
+                staged.append((side, records, torch_ops))
+        current = torch.cuda.current_stream(device)
+        if self._oh17_fork is not None:
+            self._oh17_fork.record(current)
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        ffi_device = _TVM_DEVICES.get(index)
+        if ffi_device is None:
+            ffi_device = _TVM_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+        raw = getattr(tvm_ffi, "use_raw_stream", None)
+        # C2 fire: the staged records of every part back to back.
+        for side, records, torch_ops in staged:
+            if side:
+                stream = self._oh17_streams[side]
+                stream.wait_event(self._oh17_fork)
+                if torch_ops or raw is None:
+                    with torch.cuda.stream(stream), _ffi_stream_context(device):
+                        _run_launch_records(records)
+                else:
+                    with raw(ffi_device, stream.cuda_stream):
+                        _run_launch_records(records)
+                self._oh17_join[side].record(stream)
+            else:
+                with _ffi_stream_context(device):
+                    _run_launch_records(records)
+        for side in sorted(self._oh17_join):
+            current.wait_event(self._oh17_join[side])
+
+    def close(self) -> None:
+        for name, _, _ in self._oh17_layout:
+            getattr(self, name).close()
+
+
+def _oh17_mixlen_split(stock, args, kwargs):
+    """The OH17 split of a launch whose stock plan is ``stock``, or ``None`` (keep ``stock``)."""
+    import os
+
+    import torch
+
+    arches = os.environ.get("OH17_MIXLEN_ARCHES")
+    arches = tuple(arches.split(",")) if arches else OH17_MIXLEN_ARCHES
+    if getattr(stock, "gpu_arch", None) not in arches:
+        return None  # other arches keep the stock impl object
+    mode = os.environ.get("OH17_MIXLEN", "auto")
+    if mode == "off":
+        return None
+    if type(stock) is not FlashKDABlackwellFP32FusedM128Launch:
+        return None
+    schedule = str(getattr(stock, "schedule", ""))
+    if not schedule.startswith("fused_m64_independent_dvsplit_fp32_state") or getattr(
+        stock, "m64_owner_helpers", 0
+    ):
+        return None
+    if len(args) != 10:
+        return None
+    allowed = {
+        "initial_state",
+        "final_state",
+        "cu_seqlens",
+        "sequence_lengths",
+        "state_indices",
+        "state_checkpoints",
+        "checkpoint_cu_starts",
+        "checkpoint_every_n_tokens",
+        "compute_dtype",
+    }
+    if set(kwargs) - allowed or kwargs.get("compute_dtype", "bf16") != "bf16":
+        return None
+    q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound = args
+    cu_seqlens = kwargs.get("cu_seqlens")
+    lengths = kwargs.get("sequence_lengths")
+    if cu_seqlens is None or lengths is None or q.ndim != 4 or q.shape[0] != 1:
+        return None
+    if q.device.type != "cuda":
+        return None  # meta / CPU tensors (route-only planning) keep the stock plan
+    if torch.cuda.is_current_stream_capturing():
+        return None  # the plan-time cu_seqlens check below synchronizes
+    lengths = tuple(int(n) for n in lengths)
+    longs = [n >= OH17_LONG_MIN for n in lengths]
+    if not any(longs) or all(longs):
+        return None
+    offsets = [0]
+    for n in lengths:
+        offsets.append(offsets[-1] + n)
+    if [int(x) for x in cu_seqlens.tolist()] != offsets:
+        return None
+    every = int(kwargs.get("checkpoint_every_n_tokens", 0) or 0)
+    state_checkpoints = kwargs.get("state_checkpoints")
+    checkpoint_cu_starts = kwargs.get("checkpoint_cu_starts")
+    ckpt_offsets = None
+    if state_checkpoints is not None:
+        ckpt_offsets = [0]
+        for n in lengths:
+            ckpt_offsets.append(ckpt_offsets[-1] + (n + every - 1) // every)
+        if [int(x) for x in checkpoint_cu_starts.tolist()] != ckpt_offsets:
+            return None
+    num_heads = int(q.shape[2])
+    device = q.device
+    capacity = _m64_cooperative_capacity(device)
+    num_seqs = len(lengths)
+    first = longs.index(True)
+    last = num_seqs - 1 - longs[::-1].index(True)
+    rng_fits = (last - first + 1) * num_heads * (2 + OH17_HELPERS) <= capacity
+    runs = []  # maximal runs of equal class: (i0, i1, long)
+    i = 0
+    while i < num_seqs:
+        j = i
+        while j + 1 < num_seqs and longs[j + 1] == longs[i]:
+            j += 1
+        runs.append((i, j, longs[i]))
+        i = j + 1
+    cc_fits = (
+        sum(
+            (i1 - i0 + 1) * num_heads * (2 + OH17_HELPERS)
+            for i0, i1, is_long in runs
+            if is_long
+        )
+        <= capacity
+    )
+    if mode == "auto":
+        mode = "rng" if rng_fits else "cc" if cc_fits else "off"
+    if mode == "rng" and rng_fits:
+        plan = []
+        if first > 0:
+            plan.append((0, first - 1, False, 0))
+        plan.append((first, last, True, 0))
+        if last < num_seqs - 1:
+            plan.append((last + 1, num_seqs - 1, False, 0))
+        # owner/helper part first, the short tails after it
+        plan.sort(key=lambda part: not part[2])
+    elif mode == "cc" and cc_fits:
+        plan = []
+        side = 0
+        for i0, i1, is_long in runs:
+            if is_long:
+                side += 1
+                plan.append((i0, i1, True, side))
+        for i0, i1, is_long in runs:
+            if not is_long:
+                plan.append((i0, i1, False, 0))
+    else:
+        return None
+    if len(plan) > len(_OH17_PART_NAMES):
+        return None
+    initial_state = kwargs.get("initial_state")
+    final_state = kwargs.get("final_state")
+    state_indices = kwargs.get("state_indices")
+    in_place = initial_state is final_state
+    parts = []
+    try:
+        for i0, i1, is_long, side in plan:
+            s, e = offsets[i0], offsets[i1 + 1]
+            sub_lengths = lengths[i0 : i1 + 1]
+            sub_offsets = [x - s for x in offsets[i0 : i1 + 2]]
+            sub_kwargs = dict(
+                cu_seqlens=torch.tensor(
+                    sub_offsets, dtype=cu_seqlens.dtype, device=device
+                ),
+                sequence_lengths=sub_lengths,
+                checkpoint_every_n_tokens=kwargs.get("checkpoint_every_n_tokens", 0),
+                compute_dtype="bf16",
+            )
+            if state_indices is not None:
+                sub_kwargs.update(
+                    initial_state=initial_state,
+                    final_state=final_state,
+                    state_indices=state_indices[i0 : i1 + 1],
+                )
+            else:
+                sub_initial = (
+                    None if initial_state is None else initial_state[i0 : i1 + 1]
+                )
+                sub_final = (
+                    sub_initial
+                    if in_place
+                    else (None if final_state is None else final_state[i0 : i1 + 1])
+                )
+                sub_kwargs.update(
+                    initial_state=sub_initial, final_state=sub_final, state_indices=None
+                )
+            if state_checkpoints is not None:
+                c0, c1 = ckpt_offsets[i0], ckpt_offsets[i1 + 1]
+                sub_kwargs.update(
+                    state_checkpoints=state_checkpoints[c0:c1],
+                    checkpoint_cu_starts=torch.tensor(
+                        [x - c0 for x in ckpt_offsets[i0 : i1 + 2]],
+                        dtype=checkpoint_cu_starts.dtype,
+                        device=device,
+                    ),
+                )
+            else:
+                sub_kwargs.update(state_checkpoints=None, checkpoint_cu_starts=None)
+            sub_args = (
+                q[:, s:e],
+                k[:, s:e],
+                v[:, s:e],
+                g[:, s:e],
+                beta[:, s:e],
+                scale,
+                out[:, s:e],
+                A_log,
+                dt_bias,
+                lower_bound,
+            )
+            cls = _OH17ForcedOHLaunch if is_long else _OH17ForcedM64Launch
+            part = cls(*sub_args, **sub_kwargs)
+            parts.append((part, side, (i0, i1)))
+            if is_long and part.m64_owner_helpers < 2:
+                raise RuntimeError("OH17: owner/helper part did not take two helpers")
+    except Exception as error:  # noqa: BLE001 - the arm keeps the stock plan on any refusal
+        for part, _, _ in parts:
+            part.close()
+        from flashinfer.jit.core import logger
+
+        logger.warning(
+            "OH17 mixed-length split refused (%s: %s); stock plan kept",
+            type(error).__name__,
+            error,
+        )
+        return None
+    return _OH17MixLenSplitLaunch(parts, device, mode)
+
+
 class FlashKDABlackwellLaunch:
     """Dispatch shared BF16/FP32 schedules and retain FP32 compatibility."""
 
@@ -7586,6 +7920,10 @@ class FlashKDABlackwellLaunch:
         else:
             impl = FlashKDABlackwellBF16FusedLaunch
         self._impl = impl(*args, **kwargs)
+        _oh17_split = _oh17_mixlen_split(self._impl, args, kwargs)
+        if _oh17_split is not None:
+            self._impl.close()
+            self._impl = _oh17_split
 
     def __getattr__(self, name):
         return getattr(self._impl, name)

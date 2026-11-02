@@ -6388,7 +6388,14 @@ def prepare_descriptors(prepared):
         flush_deferred_rebind(owner)
     with tvm_ffi.use_torch_stream():
         if hasattr(owner, "_main"):
-            for child in (owner._main, owner._map, owner._correction):
+            for child in (
+                owner._main,
+                owner._map,
+                owner._correction,
+                getattr(owner, "_part3", None),
+                getattr(owner, "_part4", None),
+                getattr(owner, "_part5", None),
+            ):  # OH17 arm
                 if child is not None:
                     prepare_descriptors(child)
             if owner._use_output_projection:
