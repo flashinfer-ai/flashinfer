@@ -44,7 +44,8 @@ CUDA Graph capture / replay and through the autograd entry (plain and checkpoint
 The narrower channel tiles of ``TILE_OVERRIDES``: one row per architecture (``OVERRIDE_CASES``) launches the row's
 tiles, on a caller-owned workspace of the public size and on the package's, with ``dx`` bitwise the deterministic
 package's, the gradients within budget of the reference and of the deterministic package, and the workspace zero
-after the call.
+after the call.  On an architecture whose rows the package withholds (``WITHHELD_OVERRIDE_ARCHES``) the case has no
+override and launches ``channel_split``'s tiles, under the same checks.
 
 This suite names its package once, through ``tests.test_helpers.cake_package`` (key
 ``cake.cake_causal_conv1d_train``), and the deterministic package for the parity checks through the same table;
@@ -122,11 +123,15 @@ REPEAT_CASES = (
 )
 PRECISION_CASES = ((250340, 512, "perf"), (250340, 1280, "perf"))
 # One row of ``TILE_OVERRIDES`` per architecture (route, S, C): the backward runs its narrower channel tiles there.
+# On an architecture of ``WITHHELD_OVERRIDE_ARCHES`` the package carries no rows: the case plans ``channel_split``.
 OVERRIDE_CASES = {
     "sm_100a": ("bwd_bias_fp32g", 62585, 2048),
     "sm_103a": ("bwd", 62585, 1536),
     "sm_107a": ("bwd_dt", 62585, 768),
 }
+# The architectures whose ``TILE_OVERRIDES`` rows the package withholds (an empty table): sm_107a's rows wait for
+# timing on its 216-SM boards.
+WITHHELD_OVERRIDE_ARCHES = frozenset({"sm_107a"})
 # Wide channel counts on every route: C = 4096 (four documents, one empty) and C = 10240 (a packed q / k / v
 # projection width), at small S.
 WIDE_CASES = ((4097, 4096, (1000, 0, 3, 3094)), (2048, 10240, "perf"))
@@ -902,27 +907,35 @@ def test_tile_override_row(own_workspace, monkeypatch, record_property) -> None:
     (``ct_vec``, ``threads // ct_vec`` sub-tiles, ``ceil(C / vec / ct_vec)`` tiles) on a caller-owned workspace of
     the public size, or the package's: ``dx`` within budget of the reference and bitwise the deterministic package's
     (when importable), ``dweight`` / ``dbias`` within the route's budget of the reference and of the deterministic
-    package, the workspace zero after the call."""
+    package, the workspace zero after the call.  On an architecture of ``WITHHELD_OVERRIDE_ARCHES`` the case has no
+    override (``tile_override`` is ``None``) and launches ``channel_split``'s tiles, under the same checks."""
 
     arch, device = _arch(), _device()
     kind, S, C = OVERRIDE_CASES[arch]
     _require_route(kind)
     ct_vec = loader.tile_override(arch, kind, C, S)
-    assert ct_vec is not None, f"{arch} {kind} C={C} S={S} is no TILE_OVERRIDES row"
     (name,) = loader.selected_modules(arch, kind, C=C, S=S)
     geometry = loader.MODULES[name]["grid_rule"]["geometry"]
-    wanted = {
-        "ct_vec": ct_vec,
-        "n_sub": geometry["threads"] // ct_vec,
-        "n_ch_tiles": -(-(C // geometry["vec"]) // ct_vec),
-    }
-    assert wanted != dict(
+    split = dict(
         zip(
             ("ct_vec", "n_sub", "n_ch_tiles"),
             loader.channel_split(C, geometry=geometry, role="bwd"),
             strict=True,
         )
-    ), "the row must differ from the default split"
+    )
+    if arch in WITHHELD_OVERRIDE_ARCHES:
+        assert ct_vec is None, (
+            f"{arch} {kind} C={C} S={S}: the package withholds {arch}'s TILE_OVERRIDES rows, yet plans ct_vec={ct_vec}"
+        )
+        wanted = split
+    else:
+        assert ct_vec is not None, f"{arch} {kind} C={C} S={S} is no TILE_OVERRIDES row"
+        wanted = {
+            "ct_vec": ct_vec,
+            "n_sub": geometry["threads"] // ct_vec,
+            "n_ch_tiles": -(-(C // geometry["vec"]) // ct_vec),
+        }
+        assert wanted != split, "the row must differ from the default split"
     seen = []
     launch = pkg.run_module
 
@@ -931,7 +944,7 @@ def test_tile_override_row(own_workspace, monkeypatch, record_property) -> None:
         return launch(name, values, device_index=device_index, grid=grid)
 
     monkeypatch.setattr(pkg, "run_module", record_launch)
-    label = f"{arch} {kind} S={S} C={C} ct_vec={ct_vec}"
+    label = f"{arch} {kind} S={S} C={C} ct_vec={wanted['ct_vec']}"
     x, w, cu, dy, b, policy = _route_inputs(S, C, "perf", kind, key=9)
     workspace = (
         pkg.cake_causal_conv1d_train_backward_workspace(
