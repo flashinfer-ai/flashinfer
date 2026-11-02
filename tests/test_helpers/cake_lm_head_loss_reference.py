@@ -48,6 +48,7 @@ dedicated test built around the implementation's own FP32 ``logp``.
 
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass
 from typing import Optional
@@ -114,13 +115,21 @@ class Inputs:
         return sum(t.numel() * t.element_size() for t in tensors if t is not None)
 
 
+def _host_generator(seed: int) -> torch.Generator:
+    """The CPU generator every input draw uses, whatever the target device: a CUDA generator's values depend on the
+    device's SM count (PyTorch sizes its random-number grid from it), so one ``(T, seed)`` would give each GPU model
+    another problem."""
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    return gen
+
+
 def _randn_rows(shape, gen, device, scale: float) -> torch.Tensor:
     out = torch.empty(*shape, dtype=torch.bfloat16, device=device)
     for r0 in range(0, shape[0], _ROW_CHUNK):
         r1 = min(shape[0], r0 + _ROW_CHUNK)
-        out[r0:r1].copy_(
-            torch.randn(r1 - r0, *shape[1:], device=device, generator=gen) * scale
-        )
+        draw = torch.randn(r1 - r0, *shape[1:], generator=gen) * scale
+        out[r0:r1].copy_(draw.to(torch.bfloat16))
     return out
 
 
@@ -129,9 +138,7 @@ def make_weight(
 ) -> torch.Tensor:
     """``W [V, H]`` BF16 ~ ``N(0, 1/H)`` from its own generator (shareable between problems)."""
     device = torch.device(device)
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
-    return _randn_rows((V, H), gen, device, 1.0 / math.sqrt(H))
+    return _randn_rows((V, H), _host_generator(seed), device, 1.0 / math.sqrt(H))
 
 
 def make_inputs(
@@ -161,27 +168,26 @@ def make_inputs(
     ``regime`` (0 / 2; 3 = random); a random row whose ``logp - infer`` falls
     within ``KNEE_MARGIN`` of ``ln 2`` is pushed to the edge of that band on
     its own side, so no row sits at the clip knee.  ``loss_weights ~ N(0, 1)``
-    FP32, 0 on ignored rows.  Every draw comes from one generator in a fixed
-    order, so ``(T, seed)`` fixes the problem.
+    FP32, 0 on ignored rows.  Every draw comes from one CPU generator in a
+    fixed order and moves to ``device`` afterwards, so ``(T, seed)`` fixes the
+    problem on every device.
     """
     if objective not in ("ce", "policy"):
         raise ValueError(f"objective must be 'ce' or 'policy', got {objective!r}")
     T, H, V = int(T), int(H), int(V)
     device = torch.device(device)
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
+    gen = _host_generator(seed)
     full = _randn_rows((T, H + int(ld_pad)), gen, device, 0.5)
     X = full[:, :H] if ld_pad else full
-    labels = torch.randint(0, V, (T,), generator=gen, device=device, dtype=torch.int64)
+    labels = torch.randint(0, V, (T,), generator=gen, dtype=torch.int64)
     num_ignored = int(round(float(ignore_frac) * T))
     if num_ignored:
-        order = torch.randperm(T, generator=gen, device=device)
+        order = torch.randperm(T, generator=gen)
         labels[order[:num_ignored]] = IGNORE_INDEX
+    labels = labels.to(device)
     valid = labels >= 0
     zero = torch.zeros((T,), dtype=torch.float32, device=device)
-    dlogp = torch.where(
-        valid, torch.randn(T, generator=gen, device=device) * 0.05, zero
-    )
+    dlogp = torch.where(valid, (torch.randn(T, generator=gen) * 0.05).to(device), zero)
     if W is None:
         W = make_weight(V, H, seed=seed + 1000003, device=device)
     elif (
@@ -192,14 +198,14 @@ def make_inputs(
     if objective == "policy":
         logp32 = _logp_fp64(X, W, labels).float()
         # random rows: delta = logp - infer ~ 0.5 N(0, 1), pushed out of the band |delta - ln 2| < KNEE_MARGIN
-        delta = torch.randn(T, generator=gen, device=device) * 0.5
+        delta = (torch.randn(T, generator=gen) * 0.5).to(device)
         edge = LN2 + torch.where(
             delta >= LN2,
             torch.full_like(delta, KNEE_MARGIN),
             torch.full_like(delta, -KNEE_MARGIN),
         )
         delta = torch.where((delta - LN2).abs() < KNEE_MARGIN, edge, delta)
-        u = torch.rand(T, generator=gen, device=device)
+        u = torch.rand(T, generator=gen).to(device)
         below = valid & (u < _BOUNDARY_FRACTION)  # ratio e^-1
         above = (
             valid & (u >= _BOUNDARY_FRACTION) & (u < 2 * _BOUNDARY_FRACTION)
@@ -210,7 +216,7 @@ def make_inputs(
         regime = torch.full((T,), 3, dtype=torch.int8, device=device)
         regime[below], regime[above], regime[~valid] = 0, 2, -1
         loss_weights = torch.where(
-            valid, torch.randn(T, generator=gen, device=device), zero
+            valid, torch.randn(T, generator=gen).to(device), zero
         ).contiguous()
     return Inputs(
         X=X,
@@ -328,6 +334,35 @@ def reference_fp64(
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _unsplit_gemms():
+    """Every CUDA GEMM inside runs as one FP32 accumulation over the whole K
+    dimension: cuBLASLt with split-K turned off.  cuBLAS otherwise picks
+    split-K by the device's SM count for a small output grid (fixed K slices
+    added in FP32 -- other roundings of the same BF16 product), so the same
+    inputs would get another baseline on each GPU model.  The previous
+    settings are restored on exit; a PyTorch without the split-K switch runs
+    its default GEMMs."""
+    matmul = torch.backends.cuda.matmul
+    if not torch.cuda.is_available() or not hasattr(
+        matmul, "allow_bf16_reduced_precision_reduction_split_k"
+    ):
+        yield
+        return
+    library = torch.backends.cuda.preferred_blas_library()
+    reduction = (
+        matmul.allow_bf16_reduced_precision_reduction,
+        matmul.allow_bf16_reduced_precision_reduction_split_k,
+    )
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+    matmul.allow_bf16_reduced_precision_reduction = (False, False)
+    try:
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = reduction
+        torch.backends.cuda.preferred_blas_library(library)
+
+
 def reference_unchunked(
     inp: Inputs,
     *,
@@ -338,7 +373,9 @@ def reference_unchunked(
 ) -> dict:
     """The plain autograd path at the contract's rounding boundaries: BF16
     ``z = X @ W^T`` promoted to FP32, ``torch.logsumexp``, gather, the objective,
-    ``loss.backward()``.  Returns ``loss`` (FP32 0-dim), ``logp`` (FP32 ``[T]``),
+    ``loss.backward()``.  Each GEMM accumulates its whole K dimension in one
+    FP32 sum (no split-K, see :func:`_unsplit_gemms`), the same form on every
+    GPU.  Returns ``loss`` (FP32 0-dim), ``logp`` (FP32 ``[T]``),
     ``dX`` (BF16 or ``None``) and ``dW`` (BF16 by construction, upcast to
     ``grad_weight_dtype`` when FP32 is requested, or ``None``)."""
     if entry not in ("loss", "logprob"):
@@ -347,7 +384,7 @@ def reference_unchunked(
     W = inp.W.detach().requires_grad_(bool(need_dw))
     labels = inp.labels
     valid = labels >= 0
-    with torch.enable_grad():
+    with torch.enable_grad(), _unsplit_gemms():
         z = (X @ W.t()).float()
         lse = torch.logsumexp(z, dim=-1)
         index = torch.where(valid, labels, torch.zeros_like(labels))
