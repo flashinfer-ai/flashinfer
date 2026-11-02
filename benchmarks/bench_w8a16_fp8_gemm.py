@@ -221,7 +221,7 @@ class _DeviceActivity(NamedTuple):
 class _IterationSpan(NamedTuple):
     start: int  # earliest device activity start of the iteration (ns)
     end: int  # latest device activity end (ns)
-    activities: list  # the iteration's _DeviceActivity records
+    activities: list[_DeviceActivity]  # the iteration's device activities
 
 
 def _iteration_spans(
@@ -446,9 +446,9 @@ class Row:
     m: int
     n: int
     k: int
-    us: dict  # impl -> median us
-    max_abs: dict  # impl -> max abs err vs fp32 ref
-    max_rel: dict  # impl -> max rel err vs fp32 ref
+    us: dict[str, float]  # per implementation: median latency (us)
+    max_abs: dict[str, float]  # per implementation: max abs error vs fp32 ref
+    max_rel: dict[str, float]  # per implementation: max rel error vs fp32 ref
     passed: bool | None  # None when the kernel was not run
 
 

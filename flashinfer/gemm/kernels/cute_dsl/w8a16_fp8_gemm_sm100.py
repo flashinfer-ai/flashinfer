@@ -86,6 +86,16 @@ class _TmemBudget(NamedTuple):
     transform_limit: int  # transform stages TMEM allows (-1: A in smem)
 
 
+def _aligned_tile_bytes(
+    dtype: type[cutlass.Numeric], rows: int, cols: int, align: int
+) -> int:
+    """Bytes of a dense ``rows x cols`` tile of ``dtype`` in shared memory, rounded
+    up to the buffer alignment."""
+    return cute.round_up(
+        cute.size_in_bytes(dtype, cute.make_layout((rows, cols))), align
+    )
+
+
 class _SmemBytes(NamedTuple):
     """Shared memory costs of one CTA (``_smem_stage_bytes``)."""
 
@@ -1989,37 +1999,20 @@ class Sm100W8A16Fp8GemmKernel:
         c_layout_one = sm100_utils.make_smem_layout_epi(c_dtype, c_layout, epi_tile, 1)
         c_bytes = cute.size_in_bytes(c_dtype, c_layout_one) * c_stages
         carveout = barrier_bytes * acc_stages + c_bytes + tile_info_bytes + bias_bytes
-        a_load = cute.round_up(
-            cute.size_in_bytes(
-                a_dtype,
-                cute.make_layout((cta_tile_shape_mnk[0], cta_tile_shape_mnk[2])),
-            ),
-            smem_buffer_align_bytes,
-        )
-        b_load = cute.round_up(
-            cute.size_in_bytes(
-                b_dtype,
-                cute.make_layout(
-                    (
-                        cta_tile_shape_mnk[1] // cute.size(tiled_mma.thr_id),
-                        cta_tile_shape_mnk[2],
-                    )
-                ),
-            ),
-            smem_buffer_align_bytes,
-        )
+        # Per-stage operand tiles: the whole weight tile (rows x K) as loaded and,
+        # under the SMEM transform source, again in the MMA dtype; this CTA's share
+        # of the activation tile (the MMA's CTA pair splits the activation rows).
+        weight_rows, act_rows, tile_k = cta_tile_shape_mnk
+        act_rows_per_cta = act_rows // cute.size(tiled_mma.thr_id)
+        align = smem_buffer_align_bytes
+        a_load = _aligned_tile_bytes(a_dtype, weight_rows, tile_k, align)
+        b_load = _aligned_tile_bytes(b_dtype, act_rows_per_cta, tile_k, align)
         ab_load = a_load + b_load + 2 * barrier_bytes
-        a_transform = (
-            cute.round_up(
-                cute.size_in_bytes(
-                    tiled_mma.op.a_dtype,
-                    cute.make_layout((cta_tile_shape_mnk[0], cta_tile_shape_mnk[2])),
-                ),
-                smem_buffer_align_bytes,
+        a_transform = barrier_bytes
+        if transform_a_source == tcgen05.OperandSource.SMEM:
+            a_transform += _aligned_tile_bytes(
+                tiled_mma.op.a_dtype, weight_rows, tile_k, align
             )
-            if transform_a_source == tcgen05.OperandSource.SMEM
-            else 0
-        ) + barrier_bytes
         return _SmemBytes(
             carveout,
             ab_load,
