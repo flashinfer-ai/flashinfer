@@ -618,6 +618,9 @@ SB_SPLIT_ROUTES = {
         },
     ),
 }
+# The TP8 tail cells served by the staged-rows resident-B instance with the routed partials staged in shared memory:
+# {(SM count, architecture): {tokens: most partials (from 2)}}.
+STAGED_PARTIALS_ROUTES = {(152, "sm_103a"): {1: 2}}
 # The programs no route of the qualified parts reaches since the split rows and the 148-SM 224-wide tail took their
 # cells over (the TP8 ``_sbn_ppf`` instance, the 148-SM six-stage 256-wide fused-norm tail); they stay registered.
 SUPERSEDED_KEYS = frozenset(
@@ -2020,6 +2023,7 @@ _EPS_SCALE_ROWS = (
     (1, 0, 100, 2),
     (8, 0, 8, 1),
     (8, 1, 16, 1),
+    (8, 1, 1, 2),
     (8, 1, 3, 2),
     (8, 1, 6, 2),
     (8, 1, 4, 4),
@@ -2569,6 +2573,150 @@ def test_tail_sb_split_is_bitwise_the_resident_b_arithmetic(
         base()
         torch.cuda.synchronize()
         _assert_bitwise((y_b, out_b), first, "instance without the split rows")
+    finally:
+        monkeypatch.undo()
+        decode_tail_plan.cache_clear()
+
+
+def test_tail_staged_partials_rules(monkeypatch):
+    """The cells of ``TAIL_STAGED_PARTIALS_ROUTES`` take the TP8 staged-rows resident-B instance of the row with the
+    partials staged in shared memory (``_mp``) on the table's parts: its plan is the row's one-partial plan (the
+    ``_sb_rs`` instance, N_PAD 8) but for the flag, at most 8 staged rows; every other cell keeps its plan; and every
+    cell taken is a cell the planner without the table sends to the resident-B arithmetic."""
+    assert cb.TAIL_STAGED_PARTIALS_ROUTES == STAGED_PARTIALS_ROUTES
+    taken = {}
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
+            most = cb.TAIL_STAGED_PARTIALS_ROUTES.get((sm_count, arch), {})
+            for tp in SUPPORTED_TP:
+                for tokens in range(1, DECODE_MAX_T + 1):
+                    for num_partials in range(1, 18):
+                        plan = decode_tail_plan(
+                            tokens, i_local_for_tp(tp), tp, num_partials, sm_count, arch
+                        )
+                        routed = (
+                            tp == 8
+                            and tokens in most
+                            and 2 <= num_partials <= most[tokens]
+                        )
+                        assert bool(plan.get("staged_partials")) is routed, (
+                            sm_count,
+                            arch,
+                            tp,
+                            tokens,
+                            num_partials,
+                        )
+                        assert (
+                            cb.tail_staged_partials(
+                                tokens, tp, num_partials, arch, sm_count
+                            )
+                            is routed
+                        )
+                        key = decode_kernel_key(plan)
+                        assert key.endswith("_mp") is routed
+                        if not routed:
+                            continue
+                        assert num_partials * tokens <= 8
+                        one = cb.decode_tail_instance_plan(
+                            tokens, i_local_for_tp(tp), tp, 1, sm_count
+                        )
+                        assert (
+                            one["smem_b1"]
+                            and one["rows_smem"]
+                            and one["n_pad"] == 8
+                            and one["stages"] == 8
+                        )
+                        assert plan == dict(one, staged_partials=True)
+                        assert key == decode_kernel_key(one) + "_mp"
+                        assert key in KERNELS and cake_jit.route_available(arch, (key,))
+                        taken[sm_count, arch, tp, tokens, num_partials] = key
+    assert set(taken) == {(152, "sm_103a", 8, 1, 2)}
+    monkeypatch.setattr(cb, "TAIL_STAGED_PARTIALS_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    try:
+        for sm_count, arch, tp, tokens, num_partials in taken:
+            default = decode_tail_plan(
+                tokens, i_local_for_tp(tp), tp, num_partials, sm_count, arch
+            )
+            assert not default.get("staged_partials")
+            assert default["sb_norm"] or default["smem_b1"], (arch, tp, tokens)
+    finally:
+        monkeypatch.undo()
+        decode_tail_plan.cache_clear()
+
+
+@pytest.mark.parametrize(("tp", "tokens", "num_partials"), ((8, 1, 2),))
+def test_tail_staged_partials_is_bitwise_the_resident_b_arithmetic(
+    monkeypatch, tp, tokens, num_partials
+):
+    """The staged partials change no output: the ``_mp`` instance reproduces the instance the planner takes without
+    ``TAIL_STAGED_PARTIALS_ROUTES`` bit for bit, partial sums that flush to ``-0.0`` and subnormal partials of both
+    signs included, in the first launch, re-launches over NaN-filled outputs and graph replays, with the control
+    words back at zero."""
+    rank = tp - 1
+    device = _require_program("tail", tp, tokens, num_partials)
+    sm_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    if not cb.tail_staged_partials(tokens, tp, num_partials, _gpu_arch(), sm_count):
+        pytest.skip(
+            f"tp{tp} T={tokens} P={num_partials}: no staged partials on {_gpu_arch()} with {sm_count} SMs"
+        )
+    seed = 6400 + 97 * tp + 13 * tokens + num_partials
+    w, routed, shared_act, out, y = _tail_case(
+        device, tp, rank, tokens, num_partials, seed
+    )
+    gen = torch.Generator(device="cpu").manual_seed(seed + 1)
+    parts = routed.double().cpu()
+    pick = torch.rand(tokens, LATENT, generator=gen)
+    a = 2.0**-126 * (
+        1.0 + torch.randint(16, 128, (tokens, LATENT), generator=gen).double() / 128.0
+    )
+    m = torch.randint(1, 16, (tokens, LATENT), generator=gen).double()
+    cancel = pick < 0.25
+    parts[0] = torch.where(cancel, -a, parts[0])
+    parts[1] = torch.where(cancel, a - m * 2.0**-133, parts[1])
+    parts = torch.where((pick >= 0.25) & (pick < 0.5), parts * 2.0**-130, parts)
+    routed.copy_(parts.to(torch.float32).to(torch.bfloat16).to(device))
+    args = (
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+    )
+    runner = prepare_kimi_k3_latent_moe_tail(
+        *args, out, tp=tp, rank=rank, y_workspace=y
+    )
+    assert runner.plan["staged_partials"] and runner.kernel_keys[0].endswith("_mp")
+    runner()
+    torch.cuda.synchronize()
+    first = _snapshot((y, out))
+    assert int((first[0] == -32768).sum()) > 0, "no -0.0 in y"
+    _assert_words_zero(runner, "first launch")
+    for rnd in range(3):
+        _nan_fill((y, out))
+        runner()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"re-launch {rnd}")
+    graph = _graph_replay(runner)
+    for rnd in range(3):
+        _nan_fill((y, out))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"replay {rnd}")
+        _assert_words_zero(runner, f"replay {rnd}")
+    monkeypatch.setattr(cb, "TAIL_STAGED_PARTIALS_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    try:
+        out_b = torch.full_like(out, float("nan"))
+        y_b = torch.full_like(y, float("nan"))
+        base = prepare_kimi_k3_latent_moe_tail(
+            *args, out_b, tp=tp, rank=rank, y_workspace=y_b
+        )
+        assert not base.plan.get("staged_partials")
+        assert base.plan["sb_norm"] or base.plan["smem_b1"]
+        base()
+        torch.cuda.synchronize()
+        _assert_bitwise((y_b, out_b), first, "instance without the staged partials")
     finally:
         monkeypatch.undo()
         decode_tail_plan.cache_clear()

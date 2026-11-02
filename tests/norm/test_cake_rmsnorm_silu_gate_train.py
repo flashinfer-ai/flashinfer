@@ -994,7 +994,7 @@ def test_registry_records_reference_the_build_manifest():
     package = Path(cake_build.__file__).parent
     for arch in loader.ARCHES:
         routed = set(loader.ROUTES[arch])
-        tiers = loader.LONG_ROLES + loader.MID_ROLES
+        tiers = loader.LONG_ROLES + loader.MID_ROLES + loader.SHORT_ROLES
         assert set(loader.ROLES) <= routed <= set(loader.ROLES + tiers)
         for role, name in loader.ROUTES[arch].items():
             record = loader.MODULES[name]
@@ -1009,7 +1009,7 @@ def test_registry_records_reference_the_build_manifest():
         assert record["grid_rule"]["kind"] in loader.GRID_KINDS
         assert record["launch"]["cooperative"] is False
         assert record["launch"]["use_pdl"] is False
-        if record["role"] == "fwd":
+        if record["role"] in ("fwd", "fwd_short"):
             assert record["grid_rule"]["kind"] == "row_blocks"
         elif record["role"] in ("fwd_long", "fwd_mid"):
             assert record["grid_rule"]["kind"] == "persistent_row_blocks"
@@ -1064,10 +1064,23 @@ TIER_ROUTES = {
 }
 
 
+# The short roles each architecture routes, with the rows per SM they run up
+# to.
+SHORT_ROUTES = {
+    "sm_100a": {"fwd_short": 10},
+    "sm_103a": {"fwd_short": 10},
+    "sm_107a": {},
+}
+
+
 def _tier_module(arch, role, rows, sm_count):
-    """The module of ``role`` for ``rows`` rows by ``TIER_ROUTES``: the long
+    """The module of ``role`` for ``rows`` rows by ``SHORT_ROUTES`` and
+    ``TIER_ROUTES``: the short module up to its rows per SM, else the long
     module from its rows per SM, else the mid module from its own, else the
     role's module."""
+    end = SHORT_ROUTES[arch].get(role + "_short")
+    if end is not None and rows <= end * sm_count:
+        return loader.ROUTES[arch][role + "_short"]
     for tier in ("_long", "_mid"):
         start = TIER_ROUTES[arch].get(role + tier)
         if start is not None and rows >= start * sm_count:
@@ -1076,13 +1089,20 @@ def _tier_module(arch, role, rows, sm_count):
 
 
 @pytest.mark.parametrize("sm_count", [148, 152, 212, 216])
-def test_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
-    """``module_for_rows``: a role's long module from ``min_rows_per_sm *
-    sm_count`` rows of its grid rule, below that its mid module from its own
-    rule's rows (on the architectures that route them), the role's module
-    below both and on the others."""
+def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
+    """``module_for_rows``: a role's short module up to ``max_rows_per_sm *
+    sm_count`` rows of its grid rule, above that its long module from
+    ``min_rows_per_sm * sm_count`` rows of its own rule, below that its mid
+    module from its own rule's rows (on the architectures that route them),
+    the role's module between and on the others."""
     assert loader.TIERS == ("_long", "_mid")
     for arch in loader.ARCHES:
+        shorts = {
+            role: loader.MODULES[name]["grid_rule"]["max_rows_per_sm"]
+            for role, name in loader.ROUTES[arch].items()
+            if role in loader.SHORT_ROLES
+        }
+        assert shorts == SHORT_ROUTES[arch], arch
         tiers = {
             role: loader.MODULES[name]["grid_rule"]["min_rows_per_sm"]
             for role, name in loader.ROUTES[arch].items()
@@ -1092,17 +1112,21 @@ def test_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
         for role, name in loader.ROUTES[arch].items():
             assert loader.MODULES[name]["role"] == role
         edges = {1, 48, 2**31 - 1}
-        for start in (1280, 976, 1024, 2400):
+        for start in (10, 1280, 976, 1024, 2400):
             edges |= {start * sm_count - 1, start * sm_count, start * sm_count + 1}
         for role in loader.ROLES:
             for rows in sorted(edges):
                 want = _tier_module(arch, role, rows, sm_count)
                 got = loader.module_for_rows(arch, role, rows, sm_count)
                 assert got == want, (arch, role, rows)
-    # the forward on sm_100a: the forward, then the mid forward from 976 rows
-    # per SM, then the long forward from 2400
+    # the forward on sm_100a: the short forward up to 10 rows per SM, the
+    # forward above, then the mid forward from 976 rows per SM, then the long
+    # forward from 2400
     routes = loader.ROUTES["sm_100a"]
     for rows, role in (
+        (1, "fwd_short"),
+        (10 * sm_count, "fwd_short"),
+        (10 * sm_count + 1, "fwd"),
         (976 * sm_count - 1, "fwd"),
         (976 * sm_count, "fwd_mid"),
         (2400 * sm_count - 1, "fwd_mid"),
@@ -1202,6 +1226,43 @@ def test_mid_forward_grid_is_whole_waves_of_at_most_two_blocks_a_cta(
     assert ctas == blocks or ctas % wave == 0
     assert ctas == blocks or (ctas - wave) * 2 < blocks
     assert loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=7) == grid
+
+
+# (rows, SMs) of the short forward: one CTA per 16-row block, up to 10 rows per
+# SM, so fewer CTAs than SMs.
+SHORT_FORWARD_GRIDS = [
+    (1, 148),
+    (48, 148),  # T 1, H 48: 3 blocks
+    (13 * 7, 148),
+    (21 * 48, 148),  # 6.8 rows per SM on B200
+    (10 * 148, 148),  # B200 at 10 rows per SM: 93 blocks
+    (10 * 152, 152),  # GB300 at 10 rows per SM: 95 blocks
+]
+
+
+@pytest.mark.parametrize(("rows", "sm_count"), SHORT_FORWARD_GRIDS)
+def test_short_forward_grid_is_one_cta_a_block_below_one_cta_per_sm(rows, sm_count):
+    for arch in ("sm_100a", "sm_103a"):
+        name = loader.ROUTES[arch]["fwd_short"]
+        assert name == loader.ROUTES["sm_100a"]["fwd_short"]
+        assert loader.module_for_rows(arch, "fwd", rows, sm_count) == name
+    assert "fwd_short" not in loader.ROUTES["sm_107a"]
+    record = loader.MODULES[name]
+    assert record["grid_rule"] == {
+        "kind": "row_blocks",
+        "max_rows_per_sm": 10,
+        "rows_per_cta": 16,
+    }
+    assert record["launch"]["block"] == (256, 1, 1)
+    assert record["launch"]["dynamic_smem_bytes"] == 0
+    assert record["arches"] == ["sm_100a", "sm_103a"]
+    grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
+    assert grid == (-(-rows // 16), 1, 1)
+    assert grid[0] < sm_count
+    assert loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=7) == grid
+    # the deterministic forward's grid: one 128-thread CTA per 16-row block
+    fwd = loader.MODULES[loader.route_module("sm_100a", "fwd")]
+    assert loader.launch_grid(fwd, rows=rows, sm_count=sm_count) == grid
 
 
 @pytest.mark.parametrize("sm_count", [208, 212, 216])

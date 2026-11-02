@@ -864,7 +864,14 @@ _HOST_VALUES: dict[str, tuple[str, ...]] = {
     "fwd_recompute": ("m_tiles", "log2_pk", "p_k", "t_pad"),
     "fwd_finish": (),
     "bwd_prepare": (),
-    "bwd_finish": ("t_pad", "rows_per_cta", "parts", "rows_per_chunk", "chunks"),
+    "bwd_finish": (
+        "t_pad",
+        "rows_per_cta",
+        "parts",
+        "rows_per_chunk",
+        "chunks",
+        "groups",
+    ),
 }
 
 
@@ -1774,6 +1781,7 @@ def _backward_finish(
         "dscale": dscale,
         "dbase": dbase,
         "chunks": plan["chunks"],
+        "groups": plan["groups"],
         "accumulate": 1 if accumulate else 0,
     }
     _run_route(

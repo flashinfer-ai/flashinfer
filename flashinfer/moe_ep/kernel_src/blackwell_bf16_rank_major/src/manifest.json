@@ -1,5 +1,8 @@
 {
-  "arch": "sm_100a",
+  "archs": [
+    "sm_100a",
+    "sm_107a"
+  ],
   "compile_flags": [
     "--use_fast_math"
   ],
@@ -32,7 +35,7 @@
     "kernel_rank_major_combine_v6"
   ],
   "schema_version": 1,
-  "source_sha256": "cf3ee38bd13efac4ec0d415d7a2a9a3347b91b85f0f6070f236a6d24410b9b24",
+  "source_sha256": "4202ae8e99ff768d370acc1e33466d42161507a6ad77c16b5383c3e07c2e68d4",
   "stages": [
     {
       "bindings": [

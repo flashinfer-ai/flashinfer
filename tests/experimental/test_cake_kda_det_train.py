@@ -499,6 +499,9 @@ def test_registry_records_are_well_formed() -> None:
             if record["variant"] is None
             else f"{record['stage']}_{record['variant']}"
         )
+        # the one name outside stage[_variant]: the Q/K L2 norm fallback's apply program (#7817), stage qk_apply
+        if name == "qk_l2norm_apply":
+            expected_name = name if record["stage"] == "qk_apply" else expected_name
         assert name == expected_name, name
         # every record ships on all three architectures but the few of RECORD_ARCHES, each on an ordered subset
         assert list(record["arches"]) == list(RECORD_ARCHES.get(name, ARCHES)), name

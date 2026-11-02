@@ -25,7 +25,9 @@ they share with the package functions, the once-only ``ExperimentalWarning`` tha
 the package functions never emit, and the deferred import that keeps the package
 out of ``import flashinfer.grouped_mm`` -- and checks the stable route on a GPU
 against the per-group fp64 reference (including the rows past ``m_indptr[-1]``,
-which belong to no group) and against the options the Cake backend does not take.
+which belong to no group) and against the options the Cake backend does not take,
+and that a non-reentrant checkpoint of the core ``cake_grouped_det_mm`` with early stop
+on skips the recomputed forward GEMM.
 The backend tests of the package live in ``test_cake_moe_grouped_det_gemm.py``, which
 imports the package only through ``tests.test_helpers.cake_package``.
 """
@@ -40,6 +42,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.utils.checkpoint
 
 import flashinfer.api_logging as api_logging
 import flashinfer.experimental.cake_moe_grouped_det_gemm as pkg
@@ -276,3 +279,54 @@ def test_grouped_mm_bf16_cake_backend_rejects_unsupported_options():
         grouped_mm_bf16(x, w, m_indptr, out_dtype=torch.float32, backend="cake")
     with pytest.raises(ValueError):
         grouped_mm_bf16(x, w, m_indptr, backend="cake", tactic=0)
+
+
+@pytest.mark.parametrize(
+    "early_stop", [True, False], ids=["early_stop", "no_early_stop"]
+)
+def test_core_autograd_checkpoint_early_stop_skips_the_forward_launch(
+    early_stop, monkeypatch
+):
+    """``flashinfer.grouped_mm.cake_grouped_det_mm`` hands off to the package's wrapper,
+    which launches its forward after autograd saved the inputs: a non-reentrant
+    checkpoint of one GEMM launches the forward once with early stop on (the
+    recomputation stops before it) and twice with it off, with the bits of the plain
+    call for ``Y``, ``dX`` and ``dW``."""
+    device = _require_program("fwd")
+    _require_program("dgrad")
+    _require_program("wgrad", torch.bfloat16)
+    from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_autograd
+
+    x0, w0, g, offs = _inputs(RAGGED_E4, 512, 256, device, seed=55)
+    launches = []
+    fwd_op = cake_autograd._fwd_op
+
+    def counted(*args):
+        launches.append(args[3].shape)
+        fwd_op(*args)
+
+    monkeypatch.setattr(cake_autograd, "_fwd_op", counted)
+
+    def gemm(x, w):
+        return grouped_mm.cake_grouped_det_mm(x, w, offs)
+
+    def run(checkpointed):
+        launches.clear()
+        x = x0.clone().requires_grad_(True)
+        w = w0.clone().requires_grad_(True)
+        with torch.utils.checkpoint.set_checkpoint_early_stop(early_stop):
+            if checkpointed:
+                y = torch.utils.checkpoint.checkpoint(gemm, x, w, use_reentrant=False)
+            else:
+                y = gemm(x, w)
+            y.backward(g)
+        torch.cuda.synchronize()
+        return y.detach(), x.grad, w.grad, len(launches)
+
+    *plain, n0 = run(False)
+    *checkpointed, n1 = run(True)
+    assert n0 == 1
+    assert n1 == (1 if early_stop else 2)
+    for a, b in zip(checkpointed, plain, strict=True):
+        assert torch.equal(a, b)
+    _assert_bf16_close(plain[0], _reference_fwd(x0, w0, RAGGED_E4))

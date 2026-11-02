@@ -17,9 +17,10 @@ limitations under the License.
 # CuTe-DSL launch adapter for the fixed-shape EP16 session. Imported only for
 # the explicit backend="cute_dsl" choice. Compilation and workspace bindings
 # are prepared during session creation; the session owns validation,
-# collective setup, and the current-stream context. The generated device
-# sources live beside the CUDA closure under csrc/ and are compiled for the
-# device's exact architecture through FlashInfer's CuTe JIT cache.
+# collective setup, and the current-stream context. The generated programs
+# live beside the CUDA closure under csrc/, one per architecture and return
+# protocol, and are compiled for the device's exact architecture through
+# FlashInfer's CuTe JIT cache.
 
 from __future__ import annotations
 
@@ -37,15 +38,28 @@ from ...moe_ep.cake_mxfp8_megamoe_ep16 import CakeMxfp8MegaMoeEp16Weights
 from . import backend as _backend
 from . import jit as _jit
 
+# Host-tensor ranks the generated launch is compiled for, in its argument order:
+# pointer-only carriers flat (1), the TMA sources [expert, row, column] (3) and
+# the packed scale planes [n, 128] (2), then the published rows, ids, weights and
+# route terms (1 each).
+_FUSED_RANKS: tuple[int, ...] = (1, 1, 1, 3, 2, 3, 3, 1, 3, 2, 3, 3, 1, 1)
+_FUSED_RANKS += (1,) * 14
+_REDUCE_RANKS = (1, 1)
+_FUSED_GRID = (144, 1, 1)  # 72 two-CTA clusters, all co-resident
+_REDUCE_THREADS = 128  # eight hidden columns per thread
+_PEER_CAPACITY = 32
 
-def _source_files() -> tuple[str, ...]:
-    """Use one complete source key for every kernel in this op family."""
+
+_ROLES = ("fused", "fused_return_all_cta", "topk_reduce")
+
+
+def _source_files(arch: str) -> tuple[str, ...]:
+    """Use one complete source key for every kernel of this architecture."""
 
     package = Path(__file__).resolve().parent
     flashinfer = package.parent.parent
     paths = [
-        _jit.cute_dsl_source("fused"),
-        _jit.cute_dsl_source("topk_reduce"),
+        *(_jit.cute_dsl_source(role, arch) for role in _ROLES),
         package / "cute_dsl.py",
         package / "backend.py",
         package / "jit.py",
@@ -70,33 +84,53 @@ def _import_source(path: Path) -> ModuleType:
 
 
 @functools.cache
-def _load_kernels(device_index: int, return_all_cta: bool) -> tuple[Any, Any]:
+def _load_kernels(
+    device_index: int, return_all_cta: bool
+) -> tuple[Any, Any, ModuleType, ModuleType]:
     with torch.cuda.device(device_index):
-        arch = _jit.device_arch(torch.cuda.get_device_capability())
-        # The generated host functions select the architecture explicitly. Do not
-        # let the JIT cache label the same object with an incompatible target.
+        arch = _jit.device_arch(
+            _jit.require_cute_dsl_capability(torch.cuda.get_device_capability())
+        )
+        # Each generated program fixes its target architecture. Do not let the
+        # JIT cache label the same object with an incompatible target.
         requested = os.environ.get("CUTE_DSL_ARCH")
         if requested and requested.replace("_", "") != arch.replace("_", ""):
             raise ValueError(
                 f"CUTE_DSL_ARCH={requested} does not match the device architecture {arch}"
             )
-        sources = _source_files()
-        fused_module = _import_source(_jit.cute_dsl_source("fused"))
-        reducer_module = _import_source(_jit.cute_dsl_source("topk_reduce"))
-        variant = "fused_all_ctas" if return_all_cta else "fused_cta0"
+        sources = _source_files(arch)
+        fused_role = "fused_return_all_cta" if return_all_cta else "fused"
+        reducer_role = "topk_reduce"
+        fused_module = _import_source(_jit.cute_dsl_source(fused_role, arch))
+        reducer_module = _import_source(_jit.cute_dsl_source(reducer_role, arch))
         fused = cute_dsl_core.build_and_load_cute_dsl_kernel(
             "cake_mxfp8_megamoe_ep16",
-            f"{variant}_{arch}",
-            functools.partial(fused_module.compile_program, return_all_cta, arch),
+            f"{fused_role}_{arch}",
+            functools.partial(
+                fused_module.compile_program,
+                ranks=_FUSED_RANKS,
+                aligned=(True,) * len(_FUSED_RANKS),
+            ),
             extra_key_files=sources,
         )
         reducer = cute_dsl_core.build_and_load_cute_dsl_kernel(
             "cake_mxfp8_megamoe_ep16",
-            f"topk_reduce_{arch}",
-            functools.partial(reducer_module.compile_program, arch),
+            f"{reducer_role}_{arch}",
+            functools.partial(
+                reducer_module.compile_program,
+                ranks=_REDUCE_RANKS,
+                aligned=(True,) * len(_REDUCE_RANKS),
+            ),
             extra_key_files=sources,
         )
-    return fused, reducer
+    return fused, reducer, fused_module, reducer_module
+
+
+def _host_check(module: ModuleType) -> Any:
+    names = [name for name in vars(module) if name.startswith("check_launch_")]
+    if len(names) != 1:
+        raise RuntimeError("generated CuTe-DSL program must define one host check")
+    return getattr(module, names[0])
 
 
 def _flat(tensor: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
@@ -107,42 +141,25 @@ def _flat(tensor: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
     return tensor.view(-1)
 
 
-def _tma_4d(tensor: torch.Tensor, *, inner: int) -> tuple[Any, ...]:
-    """Flatten a contiguous [expert, row, column] tensor and its TMA ABI.
+def _tma_source(tensor: torch.Tensor) -> torch.Tensor:
+    """A contiguous [expert, row, column] TMA source, 16-byte aligned."""
 
-    Descriptor dimensions are [inner, row, column / inner, expert]. The
-    following three strides are in 16-byte units, not elements or bytes.
-    """
-
-    if tensor.ndim != 3 or tensor.shape[-1] % inner:
-        raise ValueError("invalid four-dimensional TMA source geometry")
-    experts, rows, columns = (int(size) for size in tensor.shape)
-    if min(experts, rows, columns) <= 0:
-        raise ValueError("TMA source dimensions must be positive")
-    byte_strides = tuple(
-        stride * tensor.element_size() for stride in (columns, inner, rows * columns)
-    )
-    if any(stride % 16 for stride in byte_strides):
-        raise ValueError("TMA strides must be multiples of 16 bytes")
-    return (
-        _flat(tensor, dtype=tensor.dtype),
-        inner,
-        rows,
-        columns // inner,
-        experts,
-        *(stride // 16 for stride in byte_strides),
-    )
+    if tensor.ndim != 3 or min(int(size) for size in tensor.shape) <= 0:
+        raise ValueError("invalid three-dimensional TMA source geometry")
+    _flat(tensor, dtype=tensor.dtype)
+    return tensor
 
 
-def _tma_scale(tensor: torch.Tensor) -> tuple[Any, ...]:
+def _scale_plane(tensor: torch.Tensor) -> torch.Tensor:
     # Packed scales use uint8 storage with a 128-byte innermost dimension.
-    packed = tensor.view(-1, 128)
-    return (_flat(packed, dtype=torch.uint8), 128, int(packed.shape[0]), 8)
+    return _flat(tensor, dtype=torch.uint8).view(-1, 128)
 
 
-def _peer_arguments(symm: Any) -> tuple[int, ...]:
+def _peer_table(symm: Any) -> torch.Tensor:
+    """The by-value peer table the generated launch reads on the host."""
+
     pointers = symm.peer_pointers
-    if not isinstance(pointers, tuple) or len(pointers) != 32:
+    if not isinstance(pointers, tuple) or len(pointers) != _PEER_CAPACITY:
         raise ValueError("CuTe-DSL peer tables must contain 32 host addresses")
     if any(
         type(pointer) is not int or not 0 < pointer < 2**64 for pointer in pointers[:16]
@@ -150,9 +167,10 @@ def _peer_arguments(symm: Any) -> tuple[int, ...]:
         raise ValueError("EP16 requires 16 nonzero unsigned peer addresses")
     if any(type(pointer) is not int or pointer != 0 for pointer in pointers[16:]):
         raise ValueError("unused CuTe-DSL peer slots must be zero")
-    # Preserve all address bits through the generated signed Int64 host ABI.
-    return tuple(
-        pointer if pointer < 2**63 else pointer - 2**64 for pointer in pointers
+    # Preserve all address bits through the signed int64 host table.
+    return torch.tensor(
+        [pointer if pointer < 2**63 else pointer - 2**64 for pointer in pointers],
+        dtype=torch.int64,
     )
 
 
@@ -173,30 +191,27 @@ class _Runner:
         if device.type != "cuda" or device.index is None:
             raise ValueError("CuTe-DSL requires an explicit CUDA device index")
         if tuple(workspace.flags.tensor.shape) != (66,):
-            raise ValueError("CuTe-DSL requires the 66-word owner-warp flag workspace")
+            raise ValueError("CuTe-DSL requires the 66-word rank-barrier workspace")
         self._device = device
         self._tokens = tokens_per_rank
-        # Keep the symmetric handles, original tensors, and all flat views alive.
+        # Keep the symmetric handles, original tensors, and all views alive.
         self._weights = weights
         self._workspace = workspace
         w = workspace
-        fc1_weight = _tma_4d(weights.w13.view(torch.uint8), inner=128)
-        fc2_weight = _tma_4d(weights.w2.view(torch.uint8), inner=128)
-        activation = _tma_4d(w.activation_bf16, inner=64)
-        fc1_workspace = _tma_4d(w.fc1_workspace_bf16, inner=64)
-        # Physical host parameters between the three input carriers and epoch.
-        # Each TMA parameter expands to its carrier, dimensions, then strides.
+        activation = _tma_source(w.activation_bf16)
+        fc1_workspace = _tma_source(w.fc1_workspace_bf16)
+        # Launch arguments between the three per-call inputs and the epoch.
         self._before_epoch = (
-            *fc1_weight,
-            *_tma_scale(weights.w13_scale),
-            *activation,
-            *activation,  # N16 map has the same global dimensions and strides.
-            activation[0],
-            *fc2_weight,
-            *_tma_scale(weights.w2_scale),
-            *fc1_workspace,
-            *fc1_workspace,
-            fc1_workspace[0],
+            _tma_source(weights.w13.view(torch.uint8)),
+            _scale_plane(weights.w13_scale),
+            activation,
+            activation,  # The N16 map reads the same carrier.
+            _flat(activation, dtype=torch.bfloat16),
+            _tma_source(weights.w2.view(torch.uint8)),
+            _scale_plane(weights.w2_scale),
+            fc1_workspace,
+            fc1_workspace,
+            _flat(fc1_workspace, dtype=torch.bfloat16),
             _flat(w.fc2_output_bf16, dtype=torch.bfloat16),
             _flat(w.route_map_i32, dtype=torch.int32),
             _flat(w.route_scale_f32, dtype=torch.float32),
@@ -214,35 +229,47 @@ class _Runner:
             tokens_per_rank,
             16,
             rank,
-            *_peer_arguments(w.flags),
+            _peer_table(w.flags),
             _flat(w.published_hidden.tensor, dtype=torch.bfloat16),
-            *_peer_arguments(w.published_hidden),
+            _peer_table(w.published_hidden),
             _flat(w.published_topk_ids.tensor, dtype=torch.int32),
-            *_peer_arguments(w.published_topk_ids),
+            _peer_table(w.published_topk_ids),
             _flat(w.published_topk_weights.tensor, dtype=torch.float32),
-            *_peer_arguments(w.published_topk_weights),
+            _peer_table(w.published_topk_weights),
             route_terms,
-            *_peer_arguments(w.route_terms),
-            144,
-            1,
-            1,
+            _peer_table(w.route_terms),
+            *_FUSED_GRID,
         )
-        if len(self._before_epoch) != 69 or len(self._after_epoch) != 170:
-            raise RuntimeError(
-                "CuTe-DSL fused physical argument layout is inconsistent"
-            )
         self._output = w.output_bf16
+        reduce_grid = tokens_per_rank * 3072 // 8 // _REDUCE_THREADS
         self._reduce_args = (
             route_terms,
             _flat(self._output, dtype=torch.bfloat16),
             tokens_per_rank,
-            3 * tokens_per_rank,  # 384 eight-element tiles per token / 128 threads.
+            reduce_grid,
             1,
             1,
         )
         # 32 tokens per rank keep the all-CTA return protocol; 16 and 64 use the
-        # CTA-0 coordinator. Both are one generated source behind a compile-time flag.
-        self._fused, self._reduce = _load_kernels(device.index, tokens_per_rank == 32)
+        # CTA-0 coordinator. Each protocol is its own generated program.
+        self._fused, self._reduce, fused_module, reducer_module = _load_kernels(
+            device.index, tokens_per_rank == 32
+        )
+        # The generated host checks validate the bound geometry once and return
+        # the signature (ranks, 16-byte alignment) the launch was compiled for.
+        sample = (
+            torch.empty((tokens_per_rank * 3072,), dtype=torch.bfloat16, device=device),
+            torch.empty((tokens_per_rank * 8,), dtype=torch.int64, device=device),
+            torch.empty((tokens_per_rank * 8,), dtype=torch.float32, device=device),
+        )
+        signature = _host_check(fused_module)(
+            *sample, *self._before_epoch, 0, *self._after_epoch[:-3]
+        )
+        if signature != (_FUSED_RANKS, (True,) * len(_FUSED_RANKS)):
+            raise RuntimeError("CuTe-DSL fused launch signature is inconsistent")
+        signature = _host_check(reducer_module)(*self._reduce_args[:3])
+        if signature != (_REDUCE_RANKS, (True,) * len(_REDUCE_RANKS)):
+            raise RuntimeError("CuTe-DSL reduce launch signature is inconsistent")
         self._input_tensors: tuple[torch.Tensor, ...] = ()
         self._input_views: tuple[torch.Tensor, ...] = ()
         self._input_signature: tuple[Any, ...] = ()
@@ -274,7 +301,7 @@ class _Runner:
             self._input_signature = signature
         # The enclosing session supplies the TVM-FFI current Torch stream.
         # These calls allocate no device storage and perform no host-to-device
-        # peer-table copies or descriptor uploads.
+        # copies; the peer tables are read on the host.
         self._fused(
             *self._input_views,
             *self._before_epoch,

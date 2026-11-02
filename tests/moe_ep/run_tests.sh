@@ -7,7 +7,7 @@
 #   bash tests/moe_ep/run_tests.sh multirank     # 4-GPU split path (NCCL-EP)
 #   bash tests/moe_ep/run_tests.sh comm          # MoEEpCommunication backends (NVLink one-sided, Cake, two-sided)
 #   bash tests/moe_ep/run_tests.sh mega          # Blackwell mega multirank
-#   bash tests/moe_ep/run_tests.sh bf16-rank-major # 8x B200 BF16 rank-major GPU regression
+#   bash tests/moe_ep/run_tests.sh bf16-rank-major # 8-rank B200/R200 BF16 rank-major GPU regression
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90 pull FP8 + BF16 mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm90_mxfp4 # 4-GPU Hopper MXFP4 accuracy
 #   bash tests/moe_ep/run_tests.sh mega_sm90_nvfp4 # 4-GPU Hopper NVFP4 accuracy + graph replay
@@ -37,8 +37,9 @@
 #   - mega: Blackwell (sm_100+), nvshmem, deep_gemm, triton
 #   - mega_sm120_cake: >=4 sm_120 GPUs (NPROC_CAKE_SM120), NCCL 2.30.7 with the
 #     Device API (NCCL_HOME or the nvidia-nccl-cu13==2.30.7 wheel), CUDA 13 nvcc
-#   - bf16-rank-major: one x86_64 node with 8x B200, CUDA 12.8+ nvcc,
-#     cuda-bindings, and PyTorch CUDA symmetric-memory support
+#   - bf16-rank-major: eight B200 (SM100) or R200 (SM107) GPUs in one NVLink
+#     domain, CUDA 12.8+ nvcc (13.4+ for R200), cuda-bindings, and PyTorch
+#     NVSHMEM symmetric-memory support; NNODES>1 needs RDZV_ENDPOINT
 #   - optional NIXL smoke: BUILD_NIXL_EP=1 install
 
 set -uo pipefail
@@ -367,24 +368,40 @@ run_mega() {
 # The rank-major source bundle has an exact eight-rank contract. Keep this
 # separate from the four-rank mega/all targets and do not honor NPROC_MULTIRANK.
 # See docs/design_docs/moe_ep_bf16_rank_major_gpu_tests.md for requirements.
+# One node runs all eight ranks. With NNODES=2 (for example two 4-GPU R200
+# nodes in one NVLink domain), run this target on every node with the same
+# RDZV_ENDPOINT=host:port.
 run_bf16_rank_major() {
+  local nnodes="${NNODES:-1}"
+  if (( nnodes < 1 || 8 % nnodes != 0 )); then
+    echo "BF16 rank-major regression: NNODES must divide 8, got ${nnodes}" >&2
+    return 1
+  fi
+  local nproc=$(( 8 / nnodes ))
   "${PY}" -c '
-import platform
+import sys
 import torch
 
-if platform.machine() != "x86_64":
-    raise SystemExit("BF16 rank-major regression requires x86_64")
-if torch.cuda.device_count() != 8:
-    raise SystemExit("BF16 rank-major regression requires exactly 8 visible B200 GPUs")
-for device in range(8):
+nproc = int(sys.argv[1])
+if torch.cuda.device_count() != nproc:
+    raise SystemExit(f"BF16 rank-major regression requires exactly {nproc} visible GPUs per node")
+for device in range(nproc):
     props = torch.cuda.get_device_properties(device)
-    if (props.major, props.minor) != (10, 0) or "B200" not in props.name:
-        raise SystemExit(f"BF16 rank-major regression requires B200; GPU {device}: {props.name}")
-' || return 1
-  "${TORCHRUN}" --standalone --nproc_per_node=8 -m pytest \
-    "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_moe_ep_bf16_rank_major_cuda_multirank.py -v \
-    -m "gpu_8 and arch_blackwell"
+    if (props.major, props.minor) not in ((10, 0), (10, 7)):
+        raise SystemExit(f"BF16 rank-major regression requires B200 or R200; GPU {device}: {props.name}")
+' "${nproc}" || return 1
+  local launch=(--standalone)
+  if (( nnodes > 1 )); then
+    if [[ -z "${RDZV_ENDPOINT:-}" ]]; then
+      echo "BF16 rank-major regression on ${nnodes} nodes needs RDZV_ENDPOINT=host:port" >&2
+      return 1
+    fi
+    launch=(--nnodes="${nnodes}" --rdzv_backend=c10d
+      --rdzv_endpoint="${RDZV_ENDPOINT}" --rdzv_id="${RDZV_ID:-bf16-rank-major}")
+  fi
+  "${TORCHRUN}" "${launch[@]}" --nproc_per_node="${nproc}" \
+    -m pytest "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_bf16_rank_major_cuda_multirank.py -v -m gpu_8
 }
 
 # Single-GPU Rubin oracle and kernel-boundary tests.
@@ -613,7 +630,7 @@ case "${1:-all}" in
   split_path_correctness_nvfp4) run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4; print_summary ;;
   split_path_correctness_ht) run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht; print_summary ;;
   mega) run_section "mega multirank (Blackwell)" run_mega; print_summary ;;
-  bf16-rank-major) run_section "BF16 rank-major GPU regression (8 B200 GPUs)" run_bf16_rank_major; print_summary ;;
+  bf16-rank-major) run_section "BF16 rank-major GPU regression (8 B200/R200 GPUs)" run_bf16_rank_major; print_summary ;;
   mega_sm120_cake) run_section "sm120_mxfp4_mxfp8_bf16_cake mega multirank (Blackwell-consumer, NCCL LSA + GIN)" run_mega_sm120_cake; print_summary ;;
   mega_sm90) run_section "sm90 pull FP8 + BF16 mega multirank (Hopper)" run_mega_sm90; print_summary ;;
   mega_sm90_nvfp4) run_section "sm90_fp8_nvfp4_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90_nvfp4; print_summary ;;
