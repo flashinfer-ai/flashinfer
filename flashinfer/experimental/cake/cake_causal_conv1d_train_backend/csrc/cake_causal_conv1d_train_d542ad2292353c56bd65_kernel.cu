@@ -1466,7 +1466,6 @@ kernel_cake_causal_conv1d_train_d542ad2292353c56bd65(__nv_bfloat16* __restrict__
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    __threadfence();
     __syncthreads();
     if (tid == 0) {
         uint32_t done;
@@ -1481,7 +1480,6 @@ kernel_cake_causal_conv1d_train_d542ad2292353c56bd65(__nv_bfloat16* __restrict__
     __syncthreads();
     float last = red[0];
     if (last != 0.0f) {
-        __threadfence();
         int ch0 = ct * ct_vec * 8;
 #if __CUDA_ARCH__ == 1000
         float a4[4];

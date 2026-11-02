@@ -1323,7 +1323,6 @@ kernel_cake_causal_conv1d_train_ea326ebe0f84d8cf2adb(__nv_bfloat16* __restrict__
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    __threadfence();
     __syncthreads();
     if (tid == 0) {
         uint32_t done;
@@ -1338,7 +1337,6 @@ kernel_cake_causal_conv1d_train_ea326ebe0f84d8cf2adb(__nv_bfloat16* __restrict__
     __syncthreads();
     float last = red[0];
     if (last != 0.0f) {
-        __threadfence();
         int ch0 = ct * ct_vec * 8;
         int lim = ((C) < (ch0 + ct_vec * 8) ? (C) : (ch0 + ct_vec * 8));
         float z4[4];

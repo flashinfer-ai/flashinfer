@@ -1653,7 +1653,6 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
             }
         }
     }
-    __threadfence();
     __syncthreads();
     if (tid == 0) {
         uint32_t done;
@@ -1668,7 +1667,6 @@ kernel_cake_causal_conv1d_train_777e24f8771c3f7abdf8_kcp(__nv_bfloat16* __restri
     __syncthreads();
     float last = red[0];
     if (last != 0.0f) {
-        __threadfence();
         int ch0 = ct * ct_vec * 8;
         float a4[4];
         float z4[4];
