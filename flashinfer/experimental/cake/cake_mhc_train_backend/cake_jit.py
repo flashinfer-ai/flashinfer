@@ -8376,9 +8376,10 @@ PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
 # 2.16..42.17 us from 9216 to 65536, 13 to 16 of 16 groups), in (1087, 1920] at
 # 5120 (2.43..6.81 us, 15 or 16 of 16; at 1025 tokens off was faster in one run
 # and slower in the next) and above 24576 (0.50..12.68 us, 13 to 15 of 16), and
-# in (1024, 2112] at 4096 (up to 1.63 us faster, no token count slower); at 4096
-# and 5120 the deterministic (4096, 8192] band stays, and the other edges keep
-# PDL_OFF_BANDS.
+# in (1151, 2112] at 4096 (0.47..2.37 us faster at 1536, 2048 and 2112 in every
+# run; from 1025 to 1151 tokens off was faster in one run and slower in
+# another); at 4096 and 5120 the deterministic (4096, 8192] band stays, and the
+# other edges keep PDL_OFF_BANDS.
 # GB200 (sm_100a, 152 SMs), B300 (sm_103a, 148 SMs) and sm_107a are not
 # measured and keep PDL_OFF_BANDS.
 PDL_BAND_OVERRIDES: dict[
@@ -8410,7 +8411,7 @@ PDL_BAND_OVERRIDES: dict[
     },
     ("sm_103a", 152, 4096): {
         "K6->K7": {
-            "checkpoint": ((1024, 2112), (4096, 8192)),
+            "checkpoint": ((1151, 2112), (4096, 8192)),
         },
     },
     ("sm_103a", 152, 5120): {
