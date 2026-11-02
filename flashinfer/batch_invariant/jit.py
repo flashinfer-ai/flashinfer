@@ -30,7 +30,8 @@ _PKG_DIR = Path(__file__).resolve().parent
 
 #: Root files of every cache module; the module's closure is the transitive relative-import closure of these files.
 MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
-    "batch_invariant_gemm_bf16": ("gemm/blocks/compile.py",),
+    # the GEMM kernels and the split-K fixup share one module: both roots, so an edit to either invalidates its objects
+    "batch_invariant_gemm_bf16": ("gemm/blocks/compile.py", "gemm/fixup.py"),
 }
 
 
