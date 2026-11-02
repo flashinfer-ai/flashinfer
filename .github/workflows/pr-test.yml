@@ -466,7 +466,7 @@ jobs:
           # Provider builds overlapped per job (see the script). The repository
           # variable AOT_PROVIDER_CONCURRENCY overrides it, and 1 restores the
           # serial loop, for A/B timing without a code change.
-          AOT_PROVIDER_CONCURRENCY: ${{ vars.AOT_PROVIDER_CONCURRENCY || '2' }}
+          AOT_PROVIDER_CONCURRENCY: ${{ vars.AOT_PROVIDER_CONCURRENCY || '1' }}
         run: |
           if [ "${TEST_SCRIPT}" != "task_test_jit_cache_package_build_import.sh" ]; then
             echo "::error::Unexpected AOT test script: ${TEST_SCRIPT}"
