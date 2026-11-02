@@ -22,14 +22,21 @@ H=64, K=V=128 geometry:
 * batched  ``[B, 1]`` + ``ssm_state_indices``, no ``cu_seqlens``
 * batched  ``[B, 1]`` with a contiguous state slice and no indices
 
-All three must produce bit-identical outputs and final states, and each call
-must be exactly one device launch. The full-census assertion (every kernel,
-memcpy, and memset per call, not just the decode kernel's name) is
-intentional: the batched + ``ssm_state_indices`` form currently wraps the
-same decode kernel in a host-side gather/scatter of the full state pool
-(5 launches per call), which a name-filtered census does not see. That case
-is marked xfail until the batched indexed form is routed onto the packed
-kernel path (#6560); when the routing lands it flips to a passing census.
+The state-pool forms use permuted indices into a pool larger than the batch,
+so an implementation that reads ``state[row]`` instead of ``state[idx[row]]``
+fails, and slots outside the indices must come through untouched. All three
+forms must produce bit-identical outputs and final states, and each call must
+be exactly one device launch. The full-census assertion (every kernel and
+memcpy per call, via ``tests.test_helpers.cake_profiler``, not a
+name-filtered count) is intentional: the batched + ``ssm_state_indices`` form
+currently wraps the same decode kernel in a gather and scatter of the B
+selected state rows (5 launches per call: two int32->int64 index casts, the
+gather, the decode kernel, and the scatter), which a name-filtered census
+does not see. That case is a strict xfail: the PR that routes the batched
+indexed form onto the packed kernel path (#6560) must remove the mark. On a
+part where the profiler raises or returns no device records, the census
+helper skips, so the census tests (the strict xfail included) report skipped
+there rather than a false pass or XPASS.
 
 The state-dtype contract is pinned as well: the serving frameworks hold
 float32 state pools, and the CuTe decode path must refuse them with a
@@ -40,6 +47,7 @@ import pytest
 import torch
 
 from flashinfer.utils import is_sm100a_supported
+from tests.test_helpers.cake_profiler import cuda_kernel_names
 
 try:
     from flashinfer import recurrent_kda
@@ -56,7 +64,6 @@ K = V = 128
 LOWER_BOUND = -5.0
 SCALE = K**-0.5
 BATCHES = (1, 8)
-PROFILE_ITERS = 4
 
 
 @pytest.fixture(autouse=True)
@@ -69,14 +76,22 @@ def _require_recurrent_kda():
         pytest.skip("recurrent_kda kernel not available (missing cutlass DSL deps)")
 
 
-def _inputs(B, layout, state_dtype, with_indices=True, seed=0):
-    """Build one call form's inputs; identical values across layouts/seeds."""
+def _inputs(B, layout, state_dtype, indexed=True, seed=0):
+    """Build one call form's inputs; identical values across layouts.
+
+    The state pool holds ``2 * B + 3`` slots and the B sequences select
+    permuted slots, so slot i does not hold sequence i's state: a route that
+    ignores ``ssm_state_indices`` reads the wrong rows and fails the
+    bit-identical checks. The contiguous (``indexed=False``) form gets the
+    same selected rows as its ``[B, ...]`` ``initial_state``.
+    """
     gen = torch.Generator(device="cpu").manual_seed(seed)
     dev = "cuda"
 
     def r(*shape):
         return torch.randn(*shape, generator=gen).to(torch.bfloat16).to(dev)
 
+    pool_slots = 2 * B + 3
     shape4 = (1, B) if layout == "packed" else (B, 1)
     p = dict(
         q=r(*shape4, H, K),
@@ -86,14 +101,23 @@ def _inputs(B, layout, state_dtype, with_indices=True, seed=0):
         beta=r(*shape4, HV),
         A_log=(torch.rand(HV, generator=gen) * 3.0 + 0.1).log().float().to(dev),
         dt_bias=(torch.randn(HV * K, generator=gen) * 0.5).float().to(dev),
-        state=(torch.randn(B, HV, V, K, generator=gen) * 0.1)
-        .to(state_dtype)
-        .to(dev)
-        .contiguous(),
         out=torch.empty(*shape4, HV, V, dtype=torch.bfloat16, device=dev),
     )
-    if with_indices:
-        p["idx"] = torch.arange(B, dtype=torch.int32, device=dev)
+    pool = (
+        (torch.randn(pool_slots, HV, V, K, generator=gen) * 0.1)
+        .to(state_dtype)
+        .to(dev)
+        .contiguous()
+    )
+    idx = torch.randperm(pool_slots, generator=gen)[:B].to(torch.int32).to(dev)
+    p["base_pool"] = pool.clone()
+    p["idx"] = idx
+    if indexed:
+        p["state"] = pool
+        p["pass_idx"] = True
+    else:
+        p["state"] = pool[idx.long()].contiguous()
+        p["pass_idx"] = False
     if layout == "packed":
         p["cu"] = torch.arange(0, B + 1, dtype=torch.int32, device=dev)
     return p
@@ -118,37 +142,35 @@ def _call(p):
         output=p["out"],
         backend="auto",
     )
-    if "idx" in p:
+    if p["pass_idx"]:
         kw["ssm_state_indices"] = p["idx"]
     if "cu" in p:
         kw["cu_seqlens"] = p["cu"]
     return recurrent_kda(**kw)
 
 
-def _device_launch_census(run):
-    """Count EVERY device-side launch per call: kernels, memcpys, memsets.
+def _selected_final_state(p, final_state, B):
+    """The B sequences' final states of one call form, in sequence order.
 
-    A census filtered on the decode kernel's name misses the host-side
-    gather/scatter copies around the batched indexed form, so everything
-    with device time is counted (#6560).
+    The returned-state shape is per form: the packed state-pool call returns
+    the whole pool (indexed by slot), while the batched indexed call returns
+    its gathered per-sequence copy and the contiguous-slice call returns the
+    B rows, both already in sequence order. Falls back to the
+    in-place-updated ``initial_state`` when the call returned no state
+    tensor.
     """
-    from torch.profiler import ProfilerActivity, profile
-
-    run()  # warmup: JIT compile / caches outside the profiled window
-    torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CUDA]) as prof:
-        for _ in range(PROFILE_ITERS):
-            run()
-        torch.cuda.synchronize()
-    census = {}
-    for ev in prof.key_averages():
-        if getattr(ev, "self_device_time_total", 0) > 0:
-            census[ev.key] = ev.count / PROFILE_ITERS
-    return census
+    idx = p["idx"].long()
+    state = final_state if final_state is not None else p["state"]
+    if state.shape[0] == B:
+        return state
+    assert state.shape[0] == p["base_pool"].shape[0], (
+        f"unexpected final-state shape {list(state.shape)}"
+    )
+    return state[idx]
 
 
-def _run_form(B, layout, with_indices):
-    p = _inputs(B, layout, torch.bfloat16, with_indices=with_indices)
+def _run_form(B, layout, indexed):
+    p = _inputs(B, layout, torch.bfloat16, indexed=indexed)
     out, final_state = _call(p)
     torch.cuda.synchronize()
     return p, out, final_state
@@ -157,70 +179,89 @@ def _run_form(B, layout, with_indices):
 @pytest.mark.parametrize("B", BATCHES)
 def test_call_forms_bit_identical(B):
     """The three single-token call forms are the same computation: outputs and
-    final states must be bit-identical across them."""
+    final states must be bit-identical across them, and pool slots outside
+    ``ssm_state_indices`` must come through untouched."""
     forms = {
-        "packed": _run_form(B, "packed", with_indices=True),
-        "batched_indexed": _run_form(B, "batched", with_indices=True),
-        "batched_contiguous": _run_form(B, "batched", with_indices=False),
+        "packed": _run_form(B, "packed", indexed=True),
+        "batched_indexed": _run_form(B, "batched", indexed=True),
+        "batched_contiguous": _run_form(B, "batched", indexed=False),
     }
-    _, ref_out, _ = forms["packed"]
-    ref_out = ref_out.reshape(B, HV, V)
-    ref_state = forms["packed"][0]["state"]
+    p_ref, out_ref, state_ref = forms["packed"]
+    out_ref = out_ref.reshape(B, HV, V)
+    sel_ref = _selected_final_state(p_ref, state_ref, B)
     for name, (p, out, final_state) in forms.items():
         out = out.reshape(B, HV, V)
-        assert torch.equal(ref_out, out), f"{name} output differs from packed"
-        # Indexed forms update the pool in place; compare pool contents too.
-        assert torch.equal(ref_state, p["state"]), (
-            f"{name} final state pool differs from packed"
-        )
-        if final_state is not None:
-            assert torch.equal(
-                ref_state, final_state.reshape(B, HV, V, K).to(ref_state.dtype)
-            ), f"{name} returned final state differs from packed"
+        assert torch.equal(out_ref, out), f"{name} output differs from packed"
+        sel = _selected_final_state(p, final_state, B)
+        assert torch.equal(sel_ref, sel), f"{name} final state differs from packed"
+        if p["pass_idx"]:
+            untouched = torch.ones(
+                p["base_pool"].shape[0], dtype=torch.bool, device=p["idx"].device
+            )
+            untouched[p["idx"].long()] = False
+            assert torch.equal(p["state"][untouched], p["base_pool"][untouched]), (
+                f"{name} modified pool slots outside ssm_state_indices"
+            )
 
 
-def _assert_single_launch(B, layout, with_indices):
-    p = _inputs(B, layout, torch.bfloat16, with_indices=with_indices)
-    census = _device_launch_census(lambda: _call(p))
-    total = sum(census.values())
-    assert total == pytest.approx(1.0), (
-        f"single-token decode ({layout}, indices={with_indices}, B={B}) should be "
-        f"exactly one device launch per call, got {total}: {census}"
+def _census(B, layout, indexed):
+    """Every device launch of one call (kernels and copies), or a skip when
+    the profiler loses its records (``cake_profiler``'s sentinel protocol)."""
+    p = _inputs(B, layout, torch.bfloat16, indexed=indexed)
+    _call(p)  # warmup: JIT compile / caches outside the profiled window
+    torch.cuda.synchronize()
+    try:
+        return cuda_kernel_names(lambda: _call(p), exclude=())
+    except RuntimeError as ex:  # profiler unavailable on this host
+        pytest.skip(f"torch.profiler unavailable: {ex}")
+
+
+def _assert_single_launch(B, layout, indexed):
+    names = _census(B, layout, indexed)
+    assert len(names) == 1, (
+        f"single-token decode ({layout}, indexed={indexed}, B={B}) should be "
+        f"exactly one device launch per call, got {len(names)}: {names}"
     )
 
 
 @pytest.mark.parametrize("B", BATCHES)
 def test_packed_decode_is_one_launch(B):
     """Packed [1, B] + cu_seqlens + ssm_state_indices: one launch per call."""
-    _assert_single_launch(B, "packed", with_indices=True)
+    _assert_single_launch(B, "packed", indexed=True)
 
 
 @pytest.mark.parametrize("B", BATCHES)
 def test_batched_contiguous_decode_is_one_launch(B):
     """Batched [B, 1] with a contiguous state slice and no indices runs at the
     packed speed: one launch per call."""
-    _assert_single_launch(B, "batched", with_indices=False)
+    _assert_single_launch(B, "batched", indexed=False)
 
 
 @pytest.mark.parametrize("B", BATCHES)
 @pytest.mark.xfail(
-    reason="batched [B,1] + ssm_state_indices pays a host-side gather/scatter "
-    "of the full state pool (5 launches per call) until it is routed onto the "
-    "packed kernel path; see #6560",
-    strict=False,
+    reason="batched [B,1] + ssm_state_indices gathers and scatters the B "
+    "selected state rows around the same decode kernel (5 launches per call: "
+    "two int32->int64 index casts, the gather, the decode kernel, the "
+    "scatter); remove this mark when the batched indexed form is routed onto "
+    "the packed kernel path, see #6560",
+    strict=True,
 )
 def test_batched_indexed_decode_is_one_launch(B):
     """Batched [B, 1] + ssm_state_indices is the issue's 4-6x call form: the
-    full census fails it until the routing lands, then flips to passing."""
-    _assert_single_launch(B, "batched", with_indices=True)
+    full census fails it (strictly) until the routing lands; the routing PR
+    removes the xfail mark. Where the profiler cannot read launches, the
+    census helper skips, so this never XPASSes for lack of records."""
+    _assert_single_launch(B, "batched", indexed=True)
 
 
 @pytest.mark.parametrize("layout", ("packed", "batched"))
 def test_fp32_state_pool_raises_type_error(layout):
     """The serving frameworks hold float32 state pools; the CuTe decode path
-    requires bfloat16 state and must refuse fp32 with TypeError (#6893). A
-    future fp32-state decode variant flips this to a passing path."""
+    requires bfloat16 state and must refuse fp32 with a TypeError naming the
+    state-dtype contract (#6893). A future fp32-state decode variant replaces
+    this test (with dtype-parametrized equivalence cases) rather than
+    flipping it."""
     p = _inputs(8, layout, torch.float32)
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match="bfloat16 state"):
         _call(p)
         torch.cuda.synchronize()
