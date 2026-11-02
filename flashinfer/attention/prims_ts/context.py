@@ -172,6 +172,7 @@ class _ContextPlanGeometry:
     causal_single_kv_tile: bool
     packed_dense_k_mask: bool
     head_dim_vo: int | None = None
+    store_softmax_stats: bool = False
     # VC-Attention recipe, or ``None`` for a plain plan.
     vc: Optional[VCAttentionConfig] = None
     # The plan's Sage recipe, part of the compile identity; ``None`` without
@@ -197,6 +198,7 @@ class _ContextPlanState:
     lse_mode: str = "none"
     use_attention_sinks: bool = False
     sage: Optional[SagePreparedScales] = None
+    softmax_scale: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -222,6 +224,7 @@ class _PagedContextPlanGeometry:
     has_q_offset: bool
     paged_v_tail_is_zero: bool
     packed_dense_k_mask: bool
+    store_softmax_stats: bool = False
 
 
 @dataclass(frozen=True)
@@ -235,6 +238,7 @@ class _PagedContextPlanState:
     policy: tuple[tuple[str, object], ...]
     lse_mode: str = "none"
     use_attention_sinks: bool = False
+    softmax_scale: Optional[float] = None
 
 
 _ContextScheduler = Literal[
@@ -276,6 +280,7 @@ class _ContextCompileSpec:
     packed_dense_k_mask: bool
     scheduler: _ContextScheduler
     head_dim_vo: int | None = None
+    store_softmax_stats: bool = False
     two_cta_umma: bool = False
     vc: Optional[VCAttentionConfig] = None
     lse_mode: str = "none"
@@ -311,6 +316,7 @@ class _PagedContextCompileSpec:
     lse_mode: str = "none"
     use_attention_sinks: bool = False
     runtime_lengths: bool = False
+    store_softmax_stats: bool = False
     shape_signature: tuple[int, ...] = ()
 
 
@@ -339,6 +345,7 @@ def _make_context_kernel(
     max_kv_len: int | None = None,
     vc_attention: str | None = None,
     sage_scale_layout: _SageScaleLayout | None = None,
+    store_softmax_stats: bool = False,
 ):
     """Build one context kernel from its batch-independent static topology."""
 
@@ -383,7 +390,7 @@ def _make_context_kernel(
         head_paired=head_paired,
         window_size_left=window_left if window_left > 0 else 0,
         h_r=num_qo_heads // num_kv_heads,
-        enable_skip_correction=True,
+        enable_skip_correction=not store_softmax_stats,
         uses_ldtm_stat=uses_ldtm_stat,
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
         vc_attention=vc_attention,
@@ -1359,10 +1366,13 @@ def _resolve_context_plan_geometry(
     window_left: int,
     out_dtype: torch.dtype,
     sage: SageAttentionConfig | None = None,
+    store_softmax_stats: bool = False,
 ) -> _ContextPlanGeometry:
     """Validate explicit static bounds for a reusable contiguous plan."""
 
     _validate_context_dtype_pair(qk_dtype, qk_dtype, pv_dtype, out_dtype)
+    if not isinstance(store_softmax_stats, bool):
+        raise TypeError("store_softmax_stats must be a bool")
     _validate_mask(mask_type)
     window_left = _validate_window_left(window_left, mask_type)
     if not isinstance(packed_query, bool):
@@ -1436,6 +1446,7 @@ def _resolve_context_plan_geometry(
         ),
         packed_dense_k_mask=packed_query and mask_type == "dense",
         sage=sage,
+        store_softmax_stats=store_softmax_stats,
     )
     if sage is not None:
         _validate_context_sage_config(geometry, sage)
@@ -1571,6 +1582,7 @@ def _make_context_scheduler_probe(
         torch.int8: cutlass.Int8,
     }
     probe = _make_context_kernel(
+        store_softmax_stats=geometry.store_softmax_stats,
         device_index=geometry.device_index,
         input_qk_dtype=dtype_map[geometry.qk_dtype],
         input_pv_dtype=dtype_map[geometry.pv_dtype],
@@ -1625,8 +1637,11 @@ def _resolve_paged_plan_geometry(
     uniform_packed_lengths: bool = False,
     has_q_offset: bool = True,
     paged_v_tail_is_zero: bool = False,
+    store_softmax_stats: bool = False,
 ) -> _PagedContextPlanGeometry:
     """Validate explicit static bounds for a reusable paged specialization."""
+    if not isinstance(store_softmax_stats, bool):
+        raise TypeError("store_softmax_stats must be a bool")
 
     _validate_paged_dtype_pair(qk_dtype, qk_dtype, pv_dtype, out_dtype)
     _validate_mask(mask_type)
@@ -1688,6 +1703,7 @@ def _resolve_paged_plan_geometry(
             mask_type == "dense"
             and (not uniform_packed_lengths or max_kv_len % _CONTEXT_KV_TILE_N != 0)
         ),
+        store_softmax_stats=store_softmax_stats,
     )
 
 
@@ -1910,6 +1926,7 @@ def _context_compile_spec(
         qk_dtype_key=_dtype_key(geometry.qk_dtype),
         pv_dtype_key=_dtype_key(geometry.pv_dtype),
         out_dtype_key=_dtype_key(geometry.out_dtype),
+        store_softmax_stats=geometry.store_softmax_stats,
         mask_type=geometry.mask_type,
         window_left=geometry.window_left,
         packed_query=geometry.packed_query,
@@ -1967,6 +1984,7 @@ def _paged_context_compile_spec(
         lse_mode=lse_mode,
         use_attention_sinks=use_attention_sinks,
         scheduler=_resolve_paged_context_scheduler(geometry),
+        store_softmax_stats=geometry.store_softmax_stats,
     )
 
 
@@ -2020,6 +2038,7 @@ def _get_compiled_context(
         max_active_clusters = get_max_active_clusters(1)
     fmha = _make_context_kernel(
         device_index=device_index,
+        store_softmax_stats=compile_spec.store_softmax_stats,
         input_qk_dtype=input_qk_dtype,
         input_pv_dtype=input_pv_dtype,
         out_dtype=out_dtype,
@@ -2105,12 +2124,14 @@ def _get_compiled_context(
         vc_q_scale: cute.Tensor | None,
         vc_k_scale: cute.Tensor | None,
         sage_scales: cute.Tensor | None,
+        softmax_stats: cute.Tensor | None,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed_query: cutlass.Constexpr[bool],
         max_q_len: cutlass.Int32,
         runtime_max_seq_len_k: cutlass.Int32,
         static_vc_repair_tiles: cutlass.Constexpr[int],
+        stats_scale: cutlass.Float32 | None,
     ) -> None:
         """Adapt torch TVM-FFI tensors to the FmhaTs host entry point."""
 
@@ -2137,6 +2158,8 @@ def _get_compiled_context(
                 vc_repair_tiles=static_vc_repair_tiles,
                 lse_output=lse,
                 attention_sinks=attention_sinks,
+                softmax_stats=softmax_stats,
+                stats_scale=stats_scale,
             )
         else:
             fmha(
@@ -2158,6 +2181,8 @@ def _get_compiled_context(
                 lse_output=lse,
                 attention_sinks=attention_sinks,
                 sage_scales=sage_scales,
+                softmax_stats=softmax_stats,
+                stats_scale=stats_scale,
             )
 
     # Describe row-major symbolic extents; assumed_align is in bytes.
@@ -2199,6 +2224,11 @@ def _get_compiled_context(
     k_fake = fake_compact(input_qk_dtype, kv_shape, 16)
     v_fake = fake_compact(input_pv_dtype, (*kv_shape[:-1], head_dim_vo), 16)
     out_fake = fake_compact(out_dtype, out_shape, 16)
+    softmax_stats_fake = (
+        fake_compact(cutlass.Float32, (*out_shape[:-1], 2), 4)
+        if compile_spec.store_softmax_stats
+        else None
+    )
     lse_fake = (
         fake_compact(cutlass.Float32, out_fake.shape[:-1], 4)
         if compile_spec.lse_mode != "none"
@@ -2304,12 +2334,14 @@ def _get_compiled_context(
                 vc_q_scale_fake,
                 vc_k_scale_fake,
                 sage_scales_fake,
+                softmax_stats_fake,
                 stream_fake,
                 max_active_clusters,
                 packed_query,
                 cutlass.Int32(0),
                 cutlass.Int32(0),
                 compile_spec.vc.repair_tiles if vc_attention else 0,
+                scale_fake if compile_spec.store_softmax_stats else None,
                 options=_COMPILE_OPTIONS,
             ),
             extra=(max_active_clusters,),
@@ -2366,6 +2398,7 @@ def _get_compiled_paged_context(
         max_active_clusters = get_max_active_clusters(1)
     fmha = _make_context_kernel(
         device_index=device_index,
+        store_softmax_stats=compile_spec.store_softmax_stats,
         input_qk_dtype=input_qk_dtype,
         input_pv_dtype=input_pv_dtype,
         out_dtype=out_dtype,
@@ -2422,10 +2455,12 @@ def _get_compiled_paged_context(
         qo_indptr: cute.Tensor,
         block_tables: cute.Tensor,
         seq_lens_kv: cute.Tensor,
+        softmax_stats: cute.Tensor | None,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         max_q_len: cutlass.Int32,
         runtime_max_kv_len: cutlass.Int32,
+        stats_scale: cutlass.Float32 | None,
     ) -> None:
         fmha(
             q,
@@ -2443,6 +2478,8 @@ def _get_compiled_paged_context(
             seq_lens_kv=seq_lens_kv,
             lse_output=lse,
             attention_sinks=attention_sinks,
+            softmax_stats=softmax_stats,
+            stats_scale=stats_scale,
         )
 
     # Describe compact metadata or Q/O storage with byte-aligned pointers.
@@ -2478,6 +2515,11 @@ def _get_compiled_paged_context(
     k_fake = fake_paged_cache(input_qk_dtype)
     v_fake = fake_paged_cache(input_pv_dtype)
     out_fake = fake_compact(out_dtype, (runtime_total_q, num_qo_heads, head_dim), 16)
+    softmax_stats_fake = (
+        fake_compact(cutlass.Float32, (runtime_total_q, num_qo_heads, 2), 4)
+        if compile_spec.store_softmax_stats
+        else None
+    )
     lse_fake = (
         fake_compact(cutlass.Float32, out_fake.shape[:-1], 4)
         if compile_spec.lse_mode != "none"
@@ -2521,10 +2563,12 @@ def _get_compiled_paged_context(
                 qo_indptr_fake,
                 block_tables_fake,
                 seq_lens_fake,
+                softmax_stats_fake,
                 stream_fake,
                 max_active_clusters,
                 cutlass.Int32(0),
                 cutlass.Int32(0),
+                scale_fake if compile_spec.store_softmax_stats else None,
                 options=_COMPILE_OPTIONS,
             ),
             extra=(max_active_clusters,),
@@ -2588,6 +2632,10 @@ def _validate_runtime_inputs(
             )
         total_q = int(q.shape[0])
         total_k = int(k.shape[0])
+        if geometry.store_softmax_stats and total_k == 0:
+            raise ValueError(
+                "softmax statistics require at least one physical K/V token"
+            )
         _validate_padded_data_extent(total_q, "total_q")
         _validate_padded_data_extent(total_k, "total_k")
         if total_q > (geometry.batch_size * geometry.max_q_len):
@@ -2638,6 +2686,10 @@ def _validate_runtime_inputs(
             for batch_idx, (q_length, k_length) in enumerate(
                 zip(q_lengths, k_lengths, strict=True)
             ):
+                if geometry.store_softmax_stats and k_length == 0:
+                    raise ValueError(
+                        "causal softmax statistics require positive KV lengths"
+                    )
                 if k_length > 0 and q_length > k_length:
                     raise ValueError(
                         "bottom-right causal context requires Sq <= Sk for each "
@@ -2793,6 +2845,8 @@ def _validate_paged_runtime_metadata(
                 f"max_kv_len={geometry.max_kv_len}; batch {batch_idx} has "
                 f"{kv_length}"
             )
+        if geometry.store_softmax_stats and kv_length == 0:
+            raise ValueError("paged softmax statistics require positive KV lengths")
         if geometry.uniform_packed_lengths and kv_length != geometry.max_kv_len:
             raise ValueError(
                 "uniform_packed_lengths=True requires every seq_lens_kv entry "
@@ -2845,6 +2899,23 @@ def _prepare_out(
     _validate_compact(out, "out", layout)
     _validate_alignment(out, "out", 16)
     return out
+
+
+def _validate_softmax_stats(softmax_stats, *, q, enabled, validate):
+    if enabled != (softmax_stats is not None):
+        raise ValueError(
+            "softmax_stats must be supplied exactly when "
+            "store_softmax_stats=True was planned"
+        )
+    if validate and softmax_stats is not None:
+        if softmax_stats.dtype != torch.float32:
+            raise ValueError("softmax_stats must have dtype float32")
+        if softmax_stats.device != q.device:
+            raise ValueError("softmax_stats must be on the same device as q")
+        if tuple(softmax_stats.shape) != (*q.shape[:-1], 2):
+            raise ValueError("softmax_stats must have shape [*q.shape[:-1], 2]")
+        _validate_compact(softmax_stats, "softmax_stats", "[*q.shape[:-1], 2]")
+        _validate_alignment(softmax_stats, "softmax_stats", 4)
 
 
 def _variable_window_buffers(geometry, empty_i32):
@@ -2901,6 +2972,7 @@ class BatchPrefillTSWrapper:
         v_dtype: Optional[torch.dtype] = None,
         out_dtype: Optional[torch.dtype] = None,
         packed_query: bool = False,
+        store_softmax_stats: bool = False,
         mask_type: Literal["dense", "causal", "variable_window"] = "dense",
         window_left: int = -1,
         softmax_scale: Optional[float] = None,
@@ -2930,11 +3002,21 @@ class BatchPrefillTSWrapper:
         Sage V-mean restoration cannot be combined with attention sinks.
         Equivalent plans reuse policy and compiled-kernel caches.
         VC runs sharing a plan must not overlap.
+
+        store_softmax_stats adds caller-owned FP32 (m, s) merge statistics,
+        independent of the optional LSE output. Plain attention only is supported;
+        statistics cannot be combined with VC, Sage, or attention sinks.
         """
 
         lse_mode = validate_lse_mode(lse_mode)
         if not isinstance(use_attention_sinks, bool):
             raise TypeError("use_attention_sinks must be a bool")
+        if store_softmax_stats and (
+            vc_config is not None or sage is not None or use_attention_sinks
+        ):
+            raise NotImplementedError(
+                "softmax statistics do not support VC, Sage, or attention sinks"
+            )
         if out_dtype is not None:
             resolved_out_dtype = out_dtype
         elif sage is not None:
@@ -2964,6 +3046,7 @@ class BatchPrefillTSWrapper:
             window_left=window_left,
             out_dtype=resolved_out_dtype,
             sage=sage,
+            store_softmax_stats=store_softmax_stats,
         )
         if sage is not None and sage.v_mean and use_attention_sinks:
             raise NotImplementedError(
@@ -3036,6 +3119,7 @@ class BatchPrefillTSWrapper:
         self._plan_state = _ContextPlanState(
             geometry=geometry,
             scale_softmax_log2=scale_softmax_log2,
+            softmax_scale=_validate_scale(softmax_scale, "softmax_scale"),
             output_scale=output_scale,
             empty_i32=empty_i32,
             variable_window_padded_starts=variable_window_padded_starts,
@@ -3064,6 +3148,7 @@ class BatchPrefillTSWrapper:
         max_q_len: int | None = None,
         max_kv_len: int | None = None,
         out: Optional[torch.Tensor] = None,
+        softmax_stats: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
@@ -3102,7 +3187,17 @@ class BatchPrefillTSWrapper:
         Sage plans require matching SageAttentionParams; their prepared scales
         are refreshed on the current stream before attention.
         VC plans require vc=VCAttentionParams(...) with permuted K and residual V;
-        its per-channel V scale multiplies output_scale in the plan-owned buffer."""
+        its per-channel V scale multiplies output_scale in the plan-owned buffer.
+
+        softmax_stats is required exactly when store_softmax_stats was planned.
+        It is a compact FP32 tensor [*q.shape[:-1], 2], storing the maximum scaled
+        logit m in natural-log units and s = sum(exp(logit - m)). Empty rows write
+        (-inf, 0) and zero output in dense mode; causal statistics require positive
+        KV lengths. Packed K/V storage must contain at least one
+        physical token. Statistics are independent of output_scale;
+        merged outputs must use a common output scale. The buffer must not alias
+        inputs, output, LSE, or plan-owned storage; overlap is a caller precondition.
+        """
 
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
@@ -3111,6 +3206,9 @@ class BatchPrefillTSWrapper:
         if state is None:
             raise RuntimeError("plan() must be called before run()")
         geometry = state.geometry
+        _validate_softmax_stats(
+            softmax_stats, q=q, enabled=geometry.store_softmax_stats, validate=validate
+        )
         if geometry.mask_type != "variable_window" and (
             variable_window_token_starts is not None
             or variable_window_token_ends is not None
@@ -3242,6 +3340,12 @@ class BatchPrefillTSWrapper:
                 "softmax_scale * log2(e)",
             )
         )
+        if geometry.store_softmax_stats:
+            softmax_scale = (
+                state.softmax_scale
+                if softmax_scale is None
+                else _validate_scale(softmax_scale, "softmax_scale")
+            )
         output_scale = (
             state.output_scale
             if output_scale is None
@@ -3303,8 +3407,10 @@ class BatchPrefillTSWrapper:
             vc_q_scale,
             vc_k_scale,
             runtime_sage_scales,
+            softmax_stats,
             max_q_len,
             max_kv_len,
+            softmax_scale if geometry.store_softmax_stats else None,
         )
         return (out, lse) if return_lse else out
 
@@ -3349,6 +3455,7 @@ class BatchPrefillPagedTSWrapper:
         uniform_packed_lengths: bool = False,
         has_q_offset: bool = True,
         paged_v_tail_is_zero: bool = False,
+        store_softmax_stats: bool = False,
     ) -> None:
         """Select/cache one execution policy, obtain compiled kernels, and bind resources.
 
@@ -3360,12 +3467,20 @@ class BatchPrefillPagedTSWrapper:
         resources and invalidates previous graphs; finish their launches first.
         lse_mode='base2' enables final LSE stores, and use_attention_sinks enables
         a per-run sink binding. Context scales are positive host scalar defaults.
-        Equivalent plans reuse policy and compiled-kernel caches."""
+        Equivalent plans reuse policy and compiled-kernel caches.
+
+        store_softmax_stats adds caller-owned FP32 (m, s) merge statistics,
+        independent of LSE. Statistics cannot be combined with attention sinks.
+        """
 
         lse_mode = validate_lse_mode(lse_mode)
         if not isinstance(use_attention_sinks, bool):
             raise TypeError("use_attention_sinks must be a bool")
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
+        if store_softmax_stats and use_attention_sinks:
+            raise NotImplementedError(
+                "softmax statistics do not support attention sinks"
+            )
         resolved_v_dtype = k_dtype if v_dtype is None else v_dtype
         if k_dtype != q_dtype:
             raise NotImplementedError(
@@ -3389,6 +3504,7 @@ class BatchPrefillPagedTSWrapper:
             uniform_packed_lengths=uniform_packed_lengths,
             has_q_offset=has_q_offset,
             paged_v_tail_is_zero=paged_v_tail_is_zero,
+            store_softmax_stats=store_softmax_stats,
         )
         if softmax_scale is None:
             softmax_scale = geometry.head_dim**-0.5
@@ -3413,6 +3529,7 @@ class BatchPrefillPagedTSWrapper:
         self._plan_state = _PagedContextPlanState(
             geometry=geometry,
             scale_softmax_log2=scale_softmax_log2,
+            softmax_scale=_validate_scale(softmax_scale, "softmax_scale"),
             output_scale=output_scale,
             compiled=compiled,
             policy=policy,
@@ -3433,6 +3550,7 @@ class BatchPrefillPagedTSWrapper:
         max_q_len: int | None = None,
         max_kv_len: int | None = None,
         out: Optional[torch.Tensor] = None,
+        softmax_stats: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
@@ -3476,7 +3594,15 @@ class BatchPrefillPagedTSWrapper:
         Scale overrides are finite positive host scalars in the same units as the
         contiguous wrapper. Enabled attention_sinks is a compact CUDA FP32 [Hq]
         vector of finite or -inf natural-log sink logits after QK scaling, with zero
-        V contribution. Sink values and cache zero-tail promises are caller-owned."""
+        V contribution. Sink values and cache zero-tail promises are caller-owned.
+
+        softmax_stats follows BatchPrefillTSWrapper.run's natural-log (m, s)
+        contract, with compact FP32 shape [total_q, Hq, 2]. Supply it exactly
+        when store_softmax_stats was planned; it must be disjoint from every
+        input, output, LSE, and plan-owned allocation.
+        Statistics require positive KV lengths for every paged request, including
+        trusted runs; empty chunks are supported by the contiguous wrapper.
+        """
 
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
@@ -3488,6 +3614,9 @@ class BatchPrefillPagedTSWrapper:
         if self._kv_layout == "NHD":
             k_cache = k_cache.transpose(1, 2)
             v_cache = v_cache.transpose(1, 2)
+        _validate_softmax_stats(
+            softmax_stats, q=q, enabled=geometry.store_softmax_stats, validate=validate
+        )
         if validate:
             _validate_paged_runtime_inputs(q, k_cache, v_cache, geometry)
             actual_q, actual_kv = _validate_paged_runtime_metadata(
@@ -3522,6 +3651,12 @@ class BatchPrefillPagedTSWrapper:
                 "softmax_scale * log2(e)",
             )
         )
+        if geometry.store_softmax_stats:
+            softmax_scale = (
+                state.softmax_scale
+                if softmax_scale is None
+                else _validate_scale(softmax_scale, "softmax_scale")
+            )
         output_scale = (
             state.output_scale
             if output_scale is None
@@ -3557,8 +3692,10 @@ class BatchPrefillPagedTSWrapper:
             qo_indptr,
             block_tables,
             seq_lens_kv,
+            softmax_stats,
             max_q_len,
             max_kv_len,
+            softmax_scale if geometry.store_softmax_stats else None,
         )
         return (out, lse) if return_lse else out
 
@@ -3579,6 +3716,8 @@ def batch_prefill(
     output_scale: float = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
+    store_softmax_stats: bool = False,
+    softmax_stats: Optional[torch.Tensor] = None,
     vc: Optional[VCAttentionParams] = None,
     vc_config: Optional[VCAttentionConfig] = None,
     lse: Optional[torch.Tensor] = None,
@@ -3626,6 +3765,12 @@ def batch_prefill(
         otherwise the query dtype.
     out : torch.Tensor, optional
         Caller-owned output tensor.
+    store_softmax_stats : bool
+        Compile an additional final maximum/denominator output; defaults to False.
+    softmax_stats : torch.Tensor, optional
+        Caller-owned contiguous float32 tensor shaped ``[*q.shape[:-1], 2]``.
+        Required exactly when ``store_softmax_stats=True``. See
+        :meth:`BatchPrefillTSWrapper.run` for the numerical contract.
 
     Returns
     -------
@@ -3704,6 +3849,7 @@ def batch_prefill(
         v_dtype=geometry.pv_dtype,
         out_dtype=geometry.out_dtype,
         packed_query=geometry.packed_query,
+        store_softmax_stats=store_softmax_stats,
         mask_type=mask_type,
         window_left=window_left,
         softmax_scale=softmax_scale,
@@ -3726,6 +3872,7 @@ def batch_prefill(
         max_kv_len=geometry.max_seq_len_k,
         out=out,
         vc=vc,
+        softmax_stats=softmax_stats,
         lse=lse,
         return_lse=return_lse,
         attention_sinks=attention_sinks,
@@ -3749,6 +3896,8 @@ def batch_prefill_with_paged_kv_cache(
     output_scale: float = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
+    store_softmax_stats: bool = False,
+    softmax_stats: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     attention_sinks: Optional[torch.Tensor] = None,
@@ -3801,6 +3950,12 @@ def batch_prefill_with_paged_kv_cache(
         otherwise the query dtype.
     out : torch.Tensor, optional
         Caller-owned output tensor.
+    store_softmax_stats : bool
+        Compile an additional final maximum/denominator output; defaults to False.
+    softmax_stats : torch.Tensor, optional
+        Caller-owned contiguous float32 tensor shaped ``[total_q, Hq, 2]``.
+        Required exactly when ``store_softmax_stats=True``. See
+        :meth:`BatchPrefillPagedTSWrapper.run` for the numerical contract.
 
     Returns
     -------
@@ -3880,6 +4035,7 @@ def batch_prefill_with_paged_kv_cache(
         uniform_packed_lengths=False,
         has_q_offset=geometry.has_q_offset,
         paged_v_tail_is_zero=geometry.paged_v_tail_is_zero,
+        store_softmax_stats=store_softmax_stats,
     )
     return wrapper.run(
         q,
@@ -3891,6 +4047,7 @@ def batch_prefill_with_paged_kv_cache(
         max_q_len=geometry.max_q_len,
         max_kv_len=geometry.max_kv_len,
         out=out,
+        softmax_stats=softmax_stats,
         lse=lse,
         return_lse=return_lse,
         attention_sinks=attention_sinks,

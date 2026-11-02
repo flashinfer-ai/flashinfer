@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1600,6 +1601,98 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
     ] == [64, 64, 64, 128]
     assert "mask:causal" in mla_definitions[0]["tags"]
     assert "mask:dense" in mla_definitions[1]["tags"]
+
+
+@pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
+@pytest.mark.parametrize("rank4_cache", (False, True), ids=("rank3", "rank4"))
+@pytest.mark.parametrize("store_softmax_stats", (False, True), ids=("output", "stats"))
+def test_prims_ts_mla_kv_bounds_trace_contract(
+    packed_query: bool, rank4_cache: bool, store_softmax_stats: bool
+) -> None:
+    """Bounded traces describe local prefixes, including empty rank-local KV."""
+    from flashinfer.attention.prims_ts.mla_decode import (
+        BatchMLADecodePagedTSWrapper,
+        batch_mla_decode_with_paged_kv_cache,
+    )
+    from flashinfer.fi_trace import fi_trace
+    from flashinfer.trace.templates.attention import (
+        prims_ts_decode_mla_one_shot_trace_dispatch,
+        prims_ts_decode_mla_wrapper_trace_dispatch,
+    )
+
+    query_shape = (7, 8, 576) if packed_query else (2, 6, 8, 576)
+    cache_shape = (2, 1, 64, 576) if rank4_cache else (2, 64, 576)
+    query = torch.empty(query_shape, dtype=torch.bfloat16)
+    kwargs = {
+        "query": query,
+        "kv_cache": torch.empty(cache_shape, dtype=torch.bfloat16),
+        "block_tables": torch.tensor(((-1, -1), (0, 1)), dtype=torch.int32),
+        "seq_lens_kv": torch.tensor((0, 65), dtype=torch.int32),
+    }
+    if packed_query:
+        kwargs["qo_indptr"] = torch.tensor((0, 6, 7), dtype=torch.int32)
+    if store_softmax_stats:
+        kwargs["softmax_stats"] = torch.empty((*query.shape[:-1], 2))
+    bounds = torch.tensor(
+        [0] * 6 + ([1] if packed_query else [0, 1, 63, 64, 65, 65]),
+        dtype=torch.int32,
+    )
+    wrapper = BatchMLADecodePagedTSWrapper()
+    wrapper._plan_state = SimpleNamespace(
+        packed_query=packed_query,
+        mask_type="causal",
+        max_q_len=6,
+        max_kv_len=128,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        store_softmax_stats=store_softmax_stats,
+        use_kv_bounds=False,
+    )
+    ordinary = fi_trace(wrapper.run, **kwargs)
+    wrapper._plan_state.use_kv_bounds = True
+    for missing_bounds in ({}, {"kv_bounds": None}):
+        with pytest.raises(ValueError, match="kv_bounds"):
+            fi_trace(wrapper.run, **kwargs, **missing_bounds)
+    bounded = fi_trace(wrapper.run, **kwargs, kv_bounds=bounds)
+    assert ordinary["name"] != bounded["name"]
+    assert bounded["axes"]["causal"]["value"] == 0
+    assert ordinary["axes"]["causal"]["value"] == 1
+    assert "min(seq_lens_kv) >= 0" in bounded["constraints"]
+    assert "min(seq_lens_kv) >= 1" not in bounded["constraints"]
+    assert "min(seq_lens_kv) >= 1" in ordinary["constraints"]
+    assert "mask:kv_prefix" in bounded["tags"]
+    assert "mask:causal" not in bounded["tags"]
+    assert "kv_bounds" not in ordinary["inputs"]
+
+    one_shot_kwargs = {**kwargs, "store_softmax_stats": store_softmax_stats}
+    ordinary_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(**one_shot_kwargs)
+    bounded_one_shot = batch_mla_decode_with_paged_kv_cache.fi_trace(
+        **one_shot_kwargs, kv_bounds=bounds
+    )
+    assert ordinary_one_shot["name"] != bounded_one_shot["name"]
+    assert "kv_bounds" not in ordinary_one_shot["inputs"]
+    expected_count = (
+        "num_kv_bounds == total_q"
+        if packed_query
+        else "num_kv_bounds == batch_size * seq_len_q"
+    )
+    for definition in (bounded, bounded_one_shot):
+        assert "_kv_bounds" in definition["name"]
+        assert definition["axes"]["use_kv_bounds"]["value"] == 1
+        assert definition["inputs"]["kv_bounds"]["shape"] == ["num_kv_bounds"]
+        assert definition["inputs"]["kv_bounds"]["dtype"] == "int32"
+        assert not definition["inputs"]["kv_bounds"].get("optional", False)
+        assert expected_count in definition["constraints"]
+        assert "unknown" not in str(definition["inputs"])
+    for template in (
+        prims_ts_decode_mla_wrapper_trace_dispatch(
+            self=wrapper, **kwargs, kv_bounds=bounds
+        ),
+        prims_ts_decode_mla_one_shot_trace_dispatch(
+            **one_shot_kwargs, kv_bounds=bounds
+        ),
+    ):
+        assert_template_constraints_valid(template, label=template.name_prefix)
 
 
 # ---------------------------------------------------------------------------

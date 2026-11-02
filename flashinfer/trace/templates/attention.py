@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1129,9 +1130,33 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str, plan_stat
 
 # fi_trace retains builders by template identity, so repeated traces must reuse
 # their templates, including each supported encoded fragment size.
+def _with_prims_ts_softmax_stats(
+    template: TraceTemplate, *, enabled: bool, one_shot: bool = False
+) -> TraceTemplate:
+    """Add the caller-owned statistics output only to enabled specializations."""
+    if enabled:
+        template.name_prefix += "_softmax_stats"
+        template.axes["softmax_stats_width"] = Const(abbrev="", value=2)
+        template.axes["store_softmax_stats"] = Const(abbrev="", value=1)
+        template.outputs["softmax_stats"] = Tensor(
+            [*template.outputs["output"].dim_names[:-1], "softmax_stats_width"],
+            dtype="float32",
+            param="softmax_stats",
+            description="Scaled natural-log token maximum and unscaled denominator.",
+        )
+        if one_shot:
+            template.inputs["store_softmax_stats"] = Scalar("bool")
+    return template
+
+
 @lru_cache(maxsize=None)
 def _make_attention_ts_decode_trace(
-    *, combined: bool, out_dtype: str | None, q_mode: str, encoded_page_size: int = 0
+    *,
+    combined: bool,
+    out_dtype: str | None,
+    q_mode: str,
+    encoded_page_size: int = 0,
+    store_softmax_stats: bool = False,
 ):
     cache_form = "combined" if combined else "tuple"
     storage_axis = "storage_page_size" if encoded_page_size else "page_size"
@@ -1235,7 +1260,7 @@ def _make_attention_ts_decode_trace(
         constraints.append("seq_len_q >= 2")
     else:
         constraints.append("seq_len_q == 1")
-    return _FmhaDecodeTraceTemplatePatch(
+    template = _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=f"attention_ts_decode_{cache_form}{page_suffix}{output_suffix}{q_suffix}",
         description=(
@@ -1256,6 +1281,9 @@ def _make_attention_ts_decode_trace(
         },
         constraints=constraints,
         tags=["stage:decode", "backend:prims-ts", "status:experimental"],
+    )
+    return _with_prims_ts_softmax_stats(
+        template, enabled=store_softmax_stats, one_shot=True
     )
 
 
@@ -1291,6 +1319,7 @@ def attention_ts_decode_trace_dispatch(**kwargs):
         out_dtype=out_dtype,
         q_mode=q_mode,
         encoded_page_size=_fmha_encoded_page_size(kwargs, cache_param="paged_kv_cache"),
+        store_softmax_stats=bool(kwargs.get("store_softmax_stats", False)),
     )
 
 
@@ -1313,6 +1342,7 @@ def _make_prims_ts_decode_wrapper_trace(
     plan_owns_seq_lens: bool,
     encoded_page_size: int = 0,
     split_kv: bool = True,
+    store_softmax_stats: bool = False,
 ):
     """Describe one plan-bound ``BatchDecodePagedTSWrapper.run`` call."""
 
@@ -1460,7 +1490,7 @@ def _make_prims_ts_decode_wrapper_trace(
         constraints.append("kv_planes == 2")
     if q_mode == _Q_FIXED_MULTI:
         constraints.append("seq_len_q >= 2")
-    return _FmhaDecodeTraceTemplatePatch(
+    template = _FmhaDecodeTraceTemplatePatch(
         op_type="gqa_paged",
         name_prefix=(
             f"prims_ts_decode_wrapper_{cache_form}{page_suffix}{output_suffix}{q_suffix}_{mask_type}"
@@ -1500,6 +1530,7 @@ def _make_prims_ts_decode_wrapper_trace(
             f"seq-lens-source:{'plan' if plan_owns_seq_lens else 'run'}",
         ],
     )
+    return _with_prims_ts_softmax_stats(template, enabled=store_softmax_stats)
 
 
 # Finite examples support trace discovery and schema-consistency tests. Bound
@@ -1549,6 +1580,7 @@ def _get_prims_ts_decode_wrapper_trace(
     plan_owns_seq_lens: bool,
     encoded_page_size: int = 0,
     split_kv: bool = True,
+    store_softmax_stats: bool = False,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen FMHA plan identity."""
 
@@ -1565,6 +1597,7 @@ def _get_prims_ts_decode_wrapper_trace(
         plan_owns_seq_lens=plan_owns_seq_lens,
         encoded_page_size=encoded_page_size,
         split_kv=split_kv,
+        store_softmax_stats=store_softmax_stats,
     )
 
 
@@ -1651,6 +1684,9 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         encoded_page_size=encoded_page_size,
         # Preserve caller permission, not whether this shape actually splits.
         split_kv=bool(dict(getattr(state, "policy", ())).get("split_kv_allowed", True)),
+        store_softmax_stats=bool(
+            getattr(getattr(state, "config", None), "store_softmax_stats", False)
+        ),
     )
 
 
@@ -1659,7 +1695,52 @@ prims_ts_decode_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-de
 )
 
 
-def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query: bool):
+def _with_prims_ts_mla_kv_bounds(
+    template: TraceTemplate, *, enabled: bool, packed_query: bool
+) -> TraceTemplate:
+    """Describe explicit per-query prefixes rather than bottom-right causality."""
+    if enabled:
+        template.name_prefix += "_kv_bounds"
+        template.axes["use_kv_bounds"] = Const(abbrev="", value=1)
+        template.axes["num_kv_bounds"] = Var(description="Number of logical Q tokens.")
+        template.inputs["kv_bounds"] = Tensor(
+            ["num_kv_bounds"],
+            dtype="int32",
+            description=(
+                "Per-query KV prefix counts, shared by all heads. Nondecreasing "
+                "within each request and in [0, seq_lens_kv[request]]. Overrides mask_type."
+            ),
+        )
+        template.constraints.append(
+            "num_kv_bounds == total_q"
+            if packed_query
+            else "num_kv_bounds == batch_size * seq_len_q"
+        )
+        template.constraints = [
+            "min(seq_lens_kv) >= 0" if item == "min(seq_lens_kv) >= 1" else item
+            for item in template.constraints
+        ]
+        if "min(seq_lens_kv) >= 0" not in template.constraints:
+            template.constraints.append("min(seq_lens_kv) >= 0")
+        if "causal" in template.axes:
+            template.axes["causal"] = Const(abbrev="", value=0)
+        template.tags = [tag for tag in template.tags if not tag.startswith("mask:")]
+        template.tags.append("mask:kv_prefix")
+        template.description += (
+            " Explicit kv_bounds replaces dense/causal visibility. Zero prefixes "
+            "produce zero output and, when requested, softmax stats (-inf, 0)."
+        )
+    return template
+
+
+@lru_cache(maxsize=None)
+def _make_prims_ts_decode_mla_one_shot_trace(
+    *,
+    rank4_cache: bool,
+    packed_query: bool,
+    store_softmax_stats: bool = False,
+    use_kv_bounds: bool = False,
+):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
     axes: dict[str, Var | Const] = {
@@ -1691,7 +1772,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
         cache_dims = ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"]
     else:
         cache_dims = ["num_pages", "page_size", "head_dim_qk"]
-    return TraceTemplate(
+    template = TraceTemplate(
         op_type="mla_paged",
         name_prefix=f"prims_ts_decode_mla_one_shot{cache_suffix}{q_suffix}",
         description=(
@@ -1740,6 +1821,13 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
         ],
         tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
     )
+    return _with_prims_ts_mla_kv_bounds(
+        _with_prims_ts_softmax_stats(
+            template, enabled=store_softmax_stats, one_shot=True
+        ),
+        enabled=use_kv_bounds,
+        packed_query=packed_query,
+    )
 
 
 _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
@@ -1753,11 +1841,12 @@ _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
 
 def prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs):
     kv_cache = kwargs.get("kv_cache")
-    key = (
-        isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
-        kwargs.get("qo_indptr") is not None,
+    return _make_prims_ts_decode_mla_one_shot_trace(
+        rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
+        packed_query=kwargs.get("qo_indptr") is not None,
+        store_softmax_stats=bool(kwargs.get("store_softmax_stats", False)),
+        use_kv_bounds=kwargs.get("kv_bounds") is not None,
     )
-    return _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES[key]
 
 
 prims_ts_decode_mla_one_shot_trace_dispatch.templates = list(  # type: ignore[attr-defined]
@@ -1775,6 +1864,8 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
+    store_softmax_stats: bool = False,
+    use_kv_bounds: bool = False,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
@@ -1854,7 +1945,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         cache_dims = ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"]
     else:
         cache_dims = ["num_pages", "page_size", "head_dim_qk"]
-    return TraceTemplate(
+    template = TraceTemplate(
         op_type="mla_paged",
         name_prefix=(
             f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}_{mask_type}"
@@ -1923,6 +2014,11 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             *threshold_tags,
         ],
     )
+    return _with_prims_ts_mla_kv_bounds(
+        _with_prims_ts_softmax_stats(template, enabled=store_softmax_stats),
+        enabled=use_kv_bounds,
+        packed_query=packed_query,
+    )
 
 
 # Finite examples support trace discovery and schema-consistency tests. Bound
@@ -1955,6 +2051,8 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     softmax_rescale_threshold_log2: float = 0.0,
+    store_softmax_stats: bool = False,
+    use_kv_bounds: bool = False,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen MLA plan identity."""
 
@@ -1967,6 +2065,8 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        store_softmax_stats=store_softmax_stats,
+        use_kv_bounds=use_kv_bounds,
     )
 
 
@@ -1984,10 +2084,12 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
     if state is None:
         raise RuntimeError("plan() must be called before run()")
     packed_query = bool(state.packed_query)
+    use_kv_bounds = bool(getattr(state, "use_kv_bounds", False))
     required_metadata = (
         "block_tables",
         "seq_lens_kv",
         *(("qo_indptr",) if packed_query else ()),
+        *(("kv_bounds",) if use_kv_bounds else ()),
     )
     _require_bound_trace_tensors(
         kwargs,
@@ -2007,6 +2109,8 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         softmax_rescale_threshold_log2=float(
             getattr(state, "softmax_rescale_threshold_log2", 0.0)
         ),
+        store_softmax_stats=bool(getattr(state, "store_softmax_stats", False)),
+        use_kv_bounds=use_kv_bounds,
     )
 
 

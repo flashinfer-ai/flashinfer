@@ -167,7 +167,7 @@ the page table is contiguous within each row but may have padding between
 rows. A caller-provided `out` must not overlap Q, K/V page
 storage, run-time metadata, or caller-owned workspace. This is an unchecked
 caller precondition in both validation modes. The default API returns O;
-plans with LSE enabled can also return final FP32 LSE. Intermediate split-KV
+plans with LSE enabled can also return final FP32 LSE. An optional caller-owned `softmax_stats` buffer stores final maximum/denominator pairs. Intermediate split-KV
 statistics remain internal scratch.
 
 The fixed table controls logical-to-physical lookup only. Native TMA tensor
@@ -358,6 +358,37 @@ run-owned metadata and workspace storage at stable addresses, and pass a
 preallocated compact, 16-byte-aligned `out` tensor. Replanning invalidates captured graphs and requires recapture.
 
 ## Limitations
+
+### Softmax statistics
+
+Set `store_softmax_stats=True` during planning (or in the one-shot call), and
+pass a contiguous caller-owned FP32 `softmax_stats` tensor of shape
+`[*out.shape[:-1], 2]` to each run. Its fields are the scaled token-logit maximum
+in natural-log units and the denominator relative to that maximum. FP8 P's
+internal quantization scale is removed; value/output scales do not affect the statistics.
+The output return value remains unchanged. The flag and buffer must agree even
+with `validate=False`, and all buffers must have disjoint storage.
+
+Direct, fused-GMEM, and cluster-SMEM output owners export their existing final
+max/sum pair. Standalone reducers reserve an additional FP32 raw QK maximum and
+unscaled denominator beside each split's LSE. The final row owner merges these
+max/sum states independently of the existing O/LSE reduction, avoiding precision
+loss from reconstructing denominators with large absolute LSE values. Raw maxima
+are subtracted before scaling so small gaps between large logits are preserved.
+Statistics-disabled workspace and reduction algorithms are unchanged.
+Statistics-enabled Keeps kernels update the exact maximum instead of using
+the default delayed exponent anchor; default performance policies are unchanged.
+Statistics-enabled P producers also subtract the raw maximum before scaling
+scores, preserving the denominator for large logits without changing the
+statistics-disabled exponent expressions or the internal FP8 probability bias.
+Sage attention does not support statistics export; stats-OFF Sage behavior is unchanged.
+Inactive nonpositive-KV requests leave caller output and statistics untouched.
+Statistics and optional base-2 LSE can be requested together. Attention sinks
+contribute once to the denominator without changing the exported token maximum.
+Preallocate statistics along with output for graph capture and retain both
+addresses across replay.
+
+### Input restrictions
 
 - HND and NHD paged K/V are supported; contiguous K/V is outside this API.
   NHD separate caches use `[num_pages, page_size, Hkv, D]`; combined caches

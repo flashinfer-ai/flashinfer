@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -480,6 +481,7 @@ def build_throughput_latency_mla_task_manager(
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
+    kv_bounds=None,
     head_idx=None,
     batch_idx=None,
     cta_idx_q=None,
@@ -494,6 +496,8 @@ def build_throughput_latency_mla_task_manager(
     lse_tensor=None,
     acc_o_tensor=None,
     acc_lse_tensor=None,
+    softmax_stats=None,
+    softmax_stats_scale=None,
     tile_sched_params=None,
     clc_response_ptr=None,
     use_clc_dynamic_scheduler: bool = False,
@@ -538,6 +542,7 @@ def build_throughput_latency_mla_task_manager(
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,
+            kv_bounds=kv_bounds,
             head_idx=head_idx,
             batch_idx=batch_idx,
             cta_idx_q=cta_idx_q,
@@ -552,6 +557,8 @@ def build_throughput_latency_mla_task_manager(
             lse_tensor=lse_tensor,
             acc_o_tensor=acc_o_tensor,
             acc_lse_tensor=acc_lse_tensor,
+            softmax_stats=softmax_stats,
+            softmax_stats_scale=softmax_stats_scale,
             tile_sched_params=tile_sched_params,
             clc_response_ptr=clc_response_ptr,
             use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
@@ -766,6 +773,7 @@ def build_throughput_latency_mla_task_manager(
     )
     tmem_s0 = TmemSResource(
         cfg=cfg,
+        kv_bounds=kv_bounds,
         pipeline_config=tmem_s_cfg,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
@@ -781,6 +789,7 @@ def build_throughput_latency_mla_task_manager(
     )
     tmem_s1 = TmemSResource(
         cfg=cfg,
+        kv_bounds=kv_bounds,
         pipeline_config=tmem_s1_cfg,
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
@@ -801,6 +810,7 @@ def build_throughput_latency_mla_task_manager(
     )
     smem_p0 = SmemPResource(
         cfg=cfg,
+        store_softmax_stats=softmax_stats is not None,
         pipeline_config=smem_p0_cfg,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
@@ -810,6 +820,7 @@ def build_throughput_latency_mla_task_manager(
     )
     smem_p1 = SmemPResource(
         cfg=cfg,
+        store_softmax_stats=softmax_stats is not None,
         pipeline_config=smem_p1_cfg,
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
@@ -858,6 +869,8 @@ def build_throughput_latency_mla_task_manager(
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
         acc_lse_tensor=acc_lse_tensor,
+        softmax_stats=softmax_stats,
+        softmax_stats_scale=softmax_stats_scale,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
@@ -880,6 +893,8 @@ def build_throughput_latency_mla_task_manager(
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
         acc_lse_tensor=acc_lse_tensor,
+        softmax_stats=softmax_stats,
+        softmax_stats_scale=softmax_stats_scale,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
@@ -1199,6 +1214,7 @@ def _make_single_kv_pipe_task_graph(
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
+    kv_bounds=None,
     head_idx=None,
     batch_idx=None,
     cta_idx_q=None,
@@ -1213,6 +1229,8 @@ def _make_single_kv_pipe_task_graph(
     lse_tensor=None,
     acc_o_tensor=None,
     acc_lse_tensor=None,
+    softmax_stats=None,
+    softmax_stats_scale=None,
     tile_sched_params=None,
     clc_response_ptr=None,
     use_clc_dynamic_scheduler: bool = False,
@@ -1412,6 +1430,7 @@ def _make_single_kv_pipe_task_graph(
         smem_page_offsets.nv_target = smem_kv
     tmem_s = (TmemSResource if cfg.one_insts_kv_swap else TmemSKeepsResource)(
         cfg=cfg,
+        kv_bounds=kv_bounds,
         page_offsets=page_offsets,
         pipeline_config=tmem_s_cfg,
         inst_id=0,
@@ -1431,6 +1450,7 @@ def _make_single_kv_pipe_task_graph(
     if cfg.one_insts_kv_swap:
         p_resource = SmemPResource(
             cfg=cfg,
+            store_softmax_stats=softmax_stats is not None,
             pipeline_config=p_pipeline_cfg,
             inst_id=0,
             scale_softmax_log2=scale_softmax_log2,
@@ -1440,6 +1460,7 @@ def _make_single_kv_pipe_task_graph(
     else:
         p_resource = TmemPResource(
             cfg=cfg,
+            store_softmax_stats=softmax_stats is not None,
             pipeline_config=p_pipeline_cfg,
             inst_id=0,
             scale_softmax_log2=scale_softmax_log2,
@@ -1488,6 +1509,8 @@ def _make_single_kv_pipe_task_graph(
         lse_tensor=lse_tensor,
         acc_o_tensor=acc_o_tensor,
         acc_lse_tensor=acc_lse_tensor,
+        softmax_stats=softmax_stats,
+        softmax_stats_scale=softmax_stats_scale,
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
@@ -1768,12 +1791,14 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         reduction_policy_splits: int | None = None,
         explicit_persistent: bool | None = None,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        use_kv_bounds: bool = False,
         sparse_profile=None,
         finalize_output: bool = False,
         softmax_rescale_threshold_log2: float = 0.0,
         kv_cache_format: str = "native",
         extra_kv_cache_format: str = "native",
         fixed_seqlen: bool = False,
+        store_softmax_stats: bool = False,
     ):
         """Initialize one selected physical tile profile over logical flat Q rows.
 
@@ -1788,6 +1813,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             lse_dtype = _cutlass.Float32
 
         self.batch_size = batch_size
+        self.store_softmax_stats = store_softmax_stats
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
         self.seq_len_k = seq_len_k
@@ -1807,6 +1833,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.split_kv_capacity = split_kv_capacity
         self.explicit_persistent = explicit_persistent
         self.mask_type = normalize_mask_type(mask_type)
+        self.use_kv_bounds = use_kv_bounds
         self.sparse_profile = sparse_profile
         self.kv_cache_format = kv_cache_format
         self.extra_kv_cache_format = extra_kv_cache_format
@@ -1958,6 +1985,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.acc_dtype,
             self.lse_dtype,
             self.runtime_split_kv,
+            self.store_softmax_stats,
             self.use_parallel_reduction,
             self.parallel_reduction_topology,
             self.parallel_reduction_elements_per_slice,
@@ -2002,6 +2030,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             kv_cache_format=self.kv_cache_format,
             extra_kv_cache_format=self.extra_kv_cache_format,
         )
+        cfg = dataclass_replace(cfg, use_kv_bounds=self.use_kv_bounds)
         if self.sparse_profile is not None:
             cfg = configure_sparse_mla(
                 cfg,
@@ -2128,6 +2157,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         stream: object,
         output_quant_args=None,
         max_q_len: cutlass.Int32 = 0,
+        softmax_stats=None,
+        kv_bounds=None,
     ):
         """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
         cfg = self.runtime_config(max_q_len)
@@ -2474,6 +2505,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 split_kv,
                 cute.fast_divmod_create_divisor(split_kv * Int32(cfg.num_insts_kv)),
             )
+        if cutlass.const_expr(self.use_kv_bounds):
+            from ..helpers.kv_bounds import initialize_empty_rows
+
+            initialize_empty_rows(o, lse, softmax_stats, kv_bounds, stream)
         self.dense_kernel(
             tma_desc_q_latent,
             tma_desc_q_rope,
@@ -2500,6 +2535,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             q_latent,
             requested_splits=requested_splits,
             max_q_len=max_q_len,
+            softmax_stats=softmax_stats,
+            softmax_stats_scale=softmax_scale,
+            kv_bounds=kv_bounds,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -2547,6 +2585,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                     output_quant_args,
                     requested_splits=requested_splits,
                     max_q_len=max_q_len,
+                    softmax_stats=softmax_stats,
+                    softmax_stats_scale=softmax_scale,
                 )
                 if cutlass.const_expr(topology.cluster_size == 1):
                     parallel_reducer.launch(
@@ -2593,6 +2633,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 cutlass.Int32(reduction_ctas),
                 requested_splits=requested_splits,
                 max_q_len=max_q_len,
+                softmax_stats=softmax_stats,
+                softmax_stats_scale=softmax_scale,
             ).launch(
                 grid=reduction_grid,
                 block=[reduction_threads, 1, 1],
@@ -2630,6 +2672,9 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         q_nope_tensor: cute.Tensor = None,
         requested_splits=None,
         max_q_len: cutlass.Int32 = 0,
+        softmax_stats=None,
+        softmax_stats_scale=None,
+        kv_bounds: cute.Tensor | None = None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self.runtime_config(max_q_len)
@@ -2793,6 +2838,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,
+            kv_bounds=kv_bounds,
             head_idx=head_idx,
             batch_idx=batch_idx,
             cta_idx_q=cta_idx_q,
@@ -2809,6 +2855,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             lse_tensor=lse,
             acc_o_tensor=acc_o,
             acc_lse_tensor=acc_lse,
+            softmax_stats=softmax_stats,
+            softmax_stats_scale=softmax_stats_scale,
             tile_sched_params=tile_sched_params,
             clc_response_ptr=clc_response_ptr,
             use_clc_dynamic_scheduler=use_clc_dynamic,
@@ -2934,6 +2982,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         num_reduction_ctas: cutlass.Int32,
         requested_splits=None,
         max_q_len: cutlass.Int32 = 0,
+        softmax_stats=None,
+        softmax_stats_scale=None,
     ):
         """Dispatch the throughput-latency split-KV reduction body."""
         cfg = self.runtime_config(max_q_len)
@@ -2948,6 +2998,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             cfg,
             num_reduction_ctas,
             requested_splits=requested_splits,
+            softmax_stats=softmax_stats,
+            softmax_stats_scale=softmax_stats_scale,
         )
 
     @cute.kernel
@@ -2963,6 +3015,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         output_quant_args=None,
         requested_splits=None,
         max_q_len: cutlass.Int32 = 0,
+        softmax_stats=None,
+        softmax_stats_scale=None,
     ):
         """Dispatch the automatically selected parallel standalone reducer."""
 
@@ -2985,4 +3039,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             self.output_quant,
             output_quant_args,
             requested_splits=requested_splits,
+            softmax_stats=softmax_stats,
+            softmax_stats_scale=softmax_stats_scale,
         )
