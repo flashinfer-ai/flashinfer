@@ -1351,6 +1351,26 @@ def _all_ranks_hit_cache(local_hit: bool, selection: Any = None) -> bool:
     return not status and agreed
 
 
+def _sticky_cuda_error() -> Exception | None:
+    """Return the error that left the CUDA context unusable, if any.
+
+    The first synchronize may fail just to report the failed tactic itself. A
+    sticky error (an illegal memory access, a device-side assert, ...) cannot
+    be cleared and fails every later CUDA call, so it fails the second too.
+    """
+    with contextlib.suppress(Exception):
+        torch.cuda.synchronize()
+    if not torch.cuda.is_initialized():
+        return None
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        torch.cuda.synchronize()
+    except Exception as error:
+        return error
+    return None
+
+
 @dataclass(frozen=True)
 class ProfilingCacheKey:
     """Immutable key identifying a profiled (op, runner, shape) combination.
@@ -3044,18 +3064,6 @@ class AutoTuner:
                                         f"[Autotuner]: Failed when profiling {r} {tac}, shapes={shapes}. Error occurred: {e}"
                                     )
 
-                                    # Clear any pending async CUDA errors (e.g.
-                                    # cudaErrorIllegalInstruction from a failed
-                                    # kernel warmup run) so they don't surface
-                                    # later during CUDA graph capture.
-                                    # torch.cuda.synchronize() surfaces the error
-                                    # but does NOT clear the sticky CUDA error flag;
-                                    # only cudaGetLastError() resets it.
-                                    with contextlib.suppress(Exception):
-                                        torch.cuda.synchronize()
-                                    with contextlib.suppress(Exception):
-                                        torch.cuda.cudart().cudaGetLastError()
-
                                     # Record the failed tactic value for the
                                     # blocklist generator.
                                     self.stats.failed_tactics.setdefault(
@@ -3078,6 +3086,9 @@ class AutoTuner:
                                             tuning_config,
                                             r.get_cache_key_extras(tensors),
                                         )
+                                    )
+                                    self._stop_on_lost_cuda_context(
+                                        e, custom_op, r, tac, tensors
                                     )
 
                                     # Set time_measured to inf to notify the failure of the tactic. This can happen when `get_valid_tactics` mistakenly return wrong tactics
@@ -3462,10 +3473,7 @@ class AutoTuner:
                         f"[Autotuner]: Skipping tactic {runner} {tac} while "
                         f"ranking {custom_op}: {e}"
                     )
-                    with contextlib.suppress(Exception):
-                        torch.cuda.synchronize()
-                    with contextlib.suppress(Exception):
-                        torch.cuda.cudart().cudaGetLastError()
+                    self._stop_on_lost_cuda_context(e, custom_op, runner, tac, tensors)
                     time_measured = float("inf")
                 scored.append((time_measured, tac))
 
@@ -3497,6 +3505,31 @@ class AutoTuner:
             ranked_cache[cache_key] = (policy, tuple(ranked))
 
             return ranked[:k]
+
+    def _stop_on_lost_cuda_context(
+        self,
+        error: Exception,
+        custom_op: str,
+        runner: TunableRunner,
+        tactic: Any,
+        inputs: list[Any],
+    ) -> None:
+        """Stop tuning when a failed tactic left the CUDA context unusable.
+
+        Every later CUDA call in the process fails then, so skipping the tactic
+        only moves the failure to an unrelated runner. A tuning-group member
+        stops too: it cannot rejoin the per-tactic reduces on a dead context.
+        """
+        lost = _sticky_cuda_error()
+        if lost is None:
+            return
+        cause = str(lost).partition("\n")[0]
+        raise RuntimeError(
+            f"[Autotuner]: {type(runner).__name__} tactic {tactic!r} failed while "
+            f"tuning {custom_op} with input shapes {self._get_input_sizes(inputs)} "
+            f"and left the CUDA context unusable ({cause}); every later CUDA call "
+            "in this process fails."
+        ) from error
 
     def _get_input_sizes(self, inputs: list[Any]) -> tuple[tuple[int, ...], ...]:
         """Return ``torch.Size`` for each input, using ``(0,)`` for non-Tensor values."""

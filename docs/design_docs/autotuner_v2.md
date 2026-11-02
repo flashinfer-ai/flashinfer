@@ -397,6 +397,12 @@ Persistence and orchestration stay separate responsibilities.
   nested shortlist preparation. It does not recover sticky CUDA errors or
   failures inside arbitrary runner collectives. Delegated protocols still own
   their distributed coordination.
+- **Sticky CUDA errors**: a failed tactic is skipped only while the CUDA context
+  stays usable. After an illegal memory access or a device-side assert, tuning
+  stops with an error naming the op, runner, tactic and input shapes, instead of
+  failing later in an unrelated runner. A tuning-group member stops the same
+  way, since it cannot rejoin the per-tactic reduces on a dead context; its
+  peers then fail at their next collective or the process-group timeout.
 - **Cache agreement**: each profile reduces its hit flag and a digest of the
   cached runner/tactic. Only an all-hit group with matching selections skips
   profiling; any miss or disagreement makes all ranks discard that profile's
