@@ -498,6 +498,53 @@ def test_cute_dsl_fallback_k_splits_selector():
     assert pick(512, 512, 2048, 84) == 1
 
 
+def test_cute_dsl_autotune_split_k_makespan_gate(monkeypatch):
+    """Pin the autotuner's split-K makespan gate across occupancy levels.
+
+    Underfilled decode grids offer both occ=1 and occ=2 split-K tactics, while
+    multi-wave prefill buckets reject split-K so the 32*M*N partial buffer is
+    not allocated at large M.
+    """
+    import flashinfer.gemm.gemm_bf16_fp4_cute_dsl as mod
+    from flashinfer.autotuner import OptimizationProfile, StaticDim
+
+    runner = mod._cute_dsl_bf16_fp4_runner(enable_pdl=True)
+    monkeypatch.setattr(mod, "get_compute_capability", lambda _: (12, 0))
+
+    def valid_split_k_configs(m_opt: int, n: int, k: int, sm_count: int):
+        monkeypatch.setattr(mod, "get_device_sm_count", lambda _: sm_count)
+        a = torch.empty((m_opt, k), dtype=torch.bfloat16, device="meta")
+        b = torch.empty((k // 16, n * 2), dtype=torch.int32, device="meta")
+        inputs = [a, b, None, None, torch.bfloat16, None, 16]
+        profile = OptimizationProfile([[StaticDim(m_opt), StaticDim(k)]], [None])
+        tactic_ids = runner.get_valid_tactics(inputs, profile)
+        configs = mod._bf16_fp4_cute_dsl_tactic_configs(n, k, sm_count)
+        return [
+            configs[i]
+            for i in tactic_ids
+            if configs[i][7] == "mma" and configs[i][5] > 1
+        ]
+
+    # Small decode shape (m=1, n=2048, k=7168 -> 32 tiles on 84 SMs):
+    # both occ=1 and occ=2 split-K tactics shrink the single wave and are offered.
+    decode_splits = valid_split_k_configs(1, 2048, 7168, 84)
+    assert any(cfg[6] == 1 for cfg in decode_splits)
+    assert any(cfg[6] == 2 for cfg in decode_splits)
+
+    # Narrow-n grid where 64 tiles spill a second wave at occ=1 on 84 SMs on
+    # splits=2 (128 > 84) but fit in one wave at occ=2 (128 <= 168 slots).
+    occ2_only_splits2 = [
+        cfg[6] for cfg in valid_split_k_configs(1, 4096, 4096, 84) if cfg[5] == 2
+    ]
+    assert occ2_only_splits2 == [2]
+
+    # Once a grid spans >= 4 waves (tiles > 3 * slots), splitting cannot reduce
+    # makespan by >= 25%, so prefill buckets never admit split-K tactics.
+    for sm_count in (48, 84, 170, 188):
+        for m_opt in (256, 2048, 8192):
+            assert valid_split_k_configs(m_opt, 12288, 4096, sm_count) == []
+
+
 def test_cute_dsl_sm100_fallback_tactic_selector():
     """Pin the SM100/103 no-autotune tactic pick on a 148-SM part."""
     from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
