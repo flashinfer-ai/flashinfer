@@ -47,6 +47,7 @@ FACADE_PAIRS = (
     ("kcp_workspace_bytes", "kda_det_workspace_bytes_kcp"),
     ("kcp_saved_bytes", "kda_det_saved_bytes_kcp"),
     ("kcp_comm_bytes", "kda_det_comm_bytes_kcp"),
+    ("kcp_reduce_gate_param_grads", "reduce_gate_param_grads_det_kcp"),
 )
 # (previous name, det name) of the types the facades resolve on first access
 TYPE_PAIRS = (
@@ -293,3 +294,60 @@ def test_recompute_handle_keywords_are_forwarded(
     assert "RecomputeHandleDetKcp" in kcp_api.__all__
     with pytest.raises(AttributeError):
         _ = kcp_api.NoSuchName  # type: ignore[attr-defined]
+
+
+def test_public_module_forwards_the_raw_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The raw gate mode on the public module (issue #7816): the KCP wrappers forward ``use_gate_in_kernel`` /
+    ``A_log`` / ``dt_bias`` / ``lower_bound`` through ``**options`` unchanged, ``kda_det_workspace_bytes_kcp``
+    forwards ``use_gate_in_kernel`` and ``reduce_gate_param_grads_det_kcp`` forwards to the KCP module's helper,
+    which the package lists in ``__all__``; ``flashinfer.kda_train`` binds ``kcp_reduce_gate_param_grads`` to the
+    same object.  Device-free (recorders)."""
+    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp, cake_kcp_plan
+
+    package = importlib.import_module(PACKAGE)
+    assert "reduce_gate_param_grads_det_kcp" in package.__all__
+    assert (
+        package.reduce_gate_param_grads_det_kcp
+        is cake_kcp.reduce_gate_param_grads_det_kcp
+    )
+    calls = []
+
+    def recorder(name):
+        def fake(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return name
+
+        return fake
+
+    monkeypatch.setattr(cake_kcp, "chunk_kda_det_fwd_kcp", recorder("fwd"))
+    monkeypatch.setattr(cake_kcp, "chunk_kda_det_bwd_kcp", recorder("bwd"))
+    monkeypatch.setattr(cake_kcp, "chunk_kda_det_kcp", recorder("autograd"))
+    monkeypatch.setattr(cake_kcp, "reduce_gate_param_grads_det_kcp", recorder("reduce"))
+    monkeypatch.setattr(cake_kcp_plan, "kda_det_workspace_bytes_kcp", recorder("bytes"))
+    operands = tuple(object() for _ in range(6))
+    kw = {
+        "use_gate_in_kernel": True,
+        "A_log": object(),
+        "dt_bias": object(),
+        "lower_bound": -5.0,
+    }
+    reduce_args = (object(), object(), object())
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        assert kcp_api.chunk_kda_det_fwd_kcp(*operands, **kw) == "fwd"
+        assert kcp_api.chunk_kda_det_bwd_kcp(*operands, object(), **kw) == "bwd"
+        assert kcp_api.chunk_kda_det_kcp(*operands, **kw) == "autograd"
+        assert (
+            kcp_api.kda_det_workspace_bytes_kcp(object(), use_gate_in_kernel=True)
+            == "bytes"
+        )
+        assert kcp_api.reduce_gate_param_grads_det_kcp(*reduce_args) == "reduce"
+    for name, _, got in calls[:3]:
+        assert all(got[k] is v for k, v in kw.items()), name
+    assert calls[3][2]["use_gate_in_kernel"] is True
+    assert calls[4] == ("reduce", reduce_args, {})
+    assert "reduce_gate_param_grads_det_kcp" in kcp_api.__all__
+    assert (
+        kda_train.kcp_reduce_gate_param_grads is kcp_api.reduce_gate_param_grads_det_kcp
+    )
+    assert "kcp_reduce_gate_param_grads" in kda_train.__all__
