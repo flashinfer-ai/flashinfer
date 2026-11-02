@@ -1495,10 +1495,13 @@ def _kind_bytes(
     return n * _element_size(dtype), shape
 
 
-# The forward layouts that carry the in-kernel Q/K L2 norm's transient ``qn`` / ``kn`` (``l2n != "off"``): views at
-# sub-offset 0 of the ``u`` / ``w`` slots, written by the first q / k reader (the fused intra program at 1, the
-# fallback's qk_l2norm at 0) and read last by the intra program (1), before WY writes u / w (2); bytes unchanged.
-_L2N_FWD_LAYOUTS = ("fwd", "fwd_tape", "fwd_kcp")
+# The layouts that carry the in-kernel Q/K L2 norm's transient internal rows ``qn_int`` / ``kn_int`` (``l2n !=
+# "off"``, contract v1.1): ``[R, H, 128]`` BF16 at sub-offset 0 of the ``u`` / ``w`` slots, written and read by the
+# fused intra program alone (each CTA its own 64 chunk rows, zeros past ``chunk_len``: no cross-CTA read) at 1,
+# before WY writes u / w (2); the forward layouts and the replay's (whose intra program runs first on the segmented
+# rows up to 256 documents).  The fallback's token-layout forward ``qn`` / ``kn`` (qk_l2norm at 0, the plain intra
+# program at 1) are the first ``S`` rows of the same bytes.  Bytes unchanged.
+_L2N_FWD_LAYOUTS = ("fwd", "fwd_tape", "fwd_kcp", "replay", "replay_tape")
 # the per-pass gradient buffers the fallback route's qk_pullback reads after GLM intra (step 8)
 _L2N_PULLBACK_BUFFERS = ("dq_f", "dk_f")
 
@@ -1506,8 +1509,8 @@ _L2N_PULLBACK_BUFFERS = ("dq_f", "dk_f")
 def _l2n_slots(
     slots: tuple[tuple[Occupant, ...], ...], mode: str, l2n: str
 ) -> tuple[tuple[Occupant, ...], ...]:
-    """``slots`` of layout ``mode`` under the in-kernel Q/K L2 norm mode ``l2n``: the forward layouts gain ``qn`` /
-    ``kn`` on the ``u`` / ``w`` slots (lifetime ``(0, 1)``); in ``"fallback"`` the backward's ``dq_f`` / ``dk_f``
+    """``slots`` of layout ``mode`` under the in-kernel Q/K L2 norm mode ``l2n``: the forward and replay layouts
+    gain ``qn_int`` / ``kn_int`` on the ``u`` / ``w`` slots (lifetime ``(0, 1)``); in ``"fallback"`` the backward's ``dq_f`` / ``dk_f``
     live until the pullback (``(6, 8)``).  ``"off"`` returns ``slots`` unchanged."""
     if l2n == "off":
         return slots
@@ -1515,7 +1518,9 @@ def _l2n_slots(
     for slot in slots:
         names = [o[0] for o in slot]
         if mode in _L2N_FWD_LAYOUTS and names[0] in ("u", "w"):
-            slot = (("qn" if names[0] == "u" else "kn", "B16", 0, (0, 1)),) + tuple(slot)
+            slot = (
+                ("qn_int" if names[0] == "u" else "kn_int", "B16", 0, (0, 1)),
+            ) + tuple(slot)
         if l2n == "fallback":
             slot = tuple(
                 (name, kind, sub, (life[0], 8))
@@ -3300,6 +3305,21 @@ def _record_l2n(prefix: str, **tensors: Any) -> None:
         record[f"{prefix}.{name}"] = x.clone() if isinstance(x, torch.Tensor) else x
 
 
+def _internal_to_tokens(
+    rows: torch.Tensor,
+    chunk_bos: torch.Tensor,
+    chunk_len: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Scatter the internal rows ``rows [64 * NC, H, 128]`` (row ``64 c + i`` of chunk ``c``) of the real tokens
+    (``i < chunk_len[c]``) to their token rows ``chunk_bos[c] + i`` of ``out [S, H, 128]`` (the test hook only)."""
+    nc = int(chunk_bos.numel())
+    r = torch.arange(nc * BT, device=rows.device)
+    c, i = r // BT, r % BT
+    keep = i < chunk_len.to(torch.int64)[c]
+    out[(chunk_bos.to(torch.int64)[c] + i)[keep]] = rows[: nc * BT][keep]
+
+
 def _l2n_values(
     q_raw: torch.Tensor,
     k_raw: torch.Tensor,
@@ -3309,14 +3329,24 @@ def _l2n_values(
     *,
     read_rstd: int,
     write_rstd: int,
+    write_qkn: int = 1,
+    qn_int: torch.Tensor | None = None,
+    kn_int: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """The logical values of the in-kernel Q/K L2 norm (contract section 3): the raw views and their element strides,
     the normalized rows (``qn`` / ``kn``, also bound as ``q`` / ``k`` so every plain record reads normalized rows),
     the reciprocal norms ``qk_rstd`` (one ``[2, S, H]`` tensor), ``num_tokens`` and the first reader's ``read_rstd``
     / ``write_rstd`` (1 / -: load the given rstd; 0 / 1: compute and store it; 0 / 0: compute only).  ``dq`` /
-    ``dk`` are the contiguous per-call outputs (row stride ``128 * H``)."""
+    ``dk`` are the contiguous per-call outputs (row stride ``128 * H``).  ``qn_int`` / ``kn_int`` (contract v1.1)
+    are the fused intra program's CTA-private internal rows (the ``u`` / ``w`` slot views; ``qn`` / ``kn`` stand in
+    where the layout has none: no record reading them is launched there) and ``write_qkn`` whether that program also
+    writes the token-layout ``qn`` / ``kn`` (0 on the forward, whose later programs read none; 1 on the replay,
+    whose later readers bind them)."""
     S, H = int(q_raw.shape[0]), int(q_raw.shape[1])
     return {
+        "qn_int": qn if qn_int is None else qn_int,
+        "kn_int": kn if kn_int is None else kn_int,
+        "write_qkn": int(write_qkn),
         "q_raw": q_raw,
         "k_raw": k_raw,
         "qn": qn,
@@ -4120,11 +4150,40 @@ def _forward(
         write_rstd = 1 if (save_for_backward or l2n == "fallback") else 0
         qk_rstd = _alloc((2, S, H) if write_rstd else (1,), torch.float32, ws.device)
 
-    def l2n_values(qn: torch.Tensor, kn: torch.Tensor) -> dict[str, Any] | None:
+    # Contract v1.1: the fused intra program normalizes into its CTA-private internal rows qn_int / kn_int (the
+    # u / w slots, zeros past chunk_len) and writes no token-layout qn / kn (write_qkn = 0: no later forward program
+    # reads them), so the token-layout pointers it takes are placeholders (the slot views); the fallback's
+    # qk_l2norm writes token-layout qn / kn (the first S rows of the slots, or per-call under a batched arena) and
+    # the plain intra program reads them as q / k.
+    fallback = l2n == "fallback"
+    # the test hook's token-layout copies of the forward's normalized rows (only when the hook is on)
+    hook = _l2n_record is not None and l2n != "off"
+    qn_tok = kn_tok = None
+    if hook and not fallback:
+        qn_tok = _alloc((S, H, D), torch.bfloat16, ws.device)
+        kn_tok = _alloc((S, H, D), torch.bfloat16, ws.device)
+
+    def l2n_values(
+        a: types.SimpleNamespace, qn: torch.Tensor | None, kn: torch.Tensor | None
+    ) -> dict[str, Any] | None:
+        """The l2n values of one launch sequence on the views ``a`` (``qn`` / ``kn``: the token-layout rows, the
+        slot views where ``None``)."""
         if l2n == "off":
             return None
+        if qn is None:  # the slot views: token layout for the fallback, placeholders of the fused program
+            qn = a.qn_int[:S] if fallback else a.qn_int
+            kn = a.kn_int[:S] if fallback else a.kn_int
         return _l2n_values(
-            q, k, qn, kn, qk_rstd, read_rstd=0, write_rstd=write_rstd
+            q,
+            k,
+            qn,
+            kn,
+            qk_rstd,
+            read_rstd=0,
+            write_rstd=write_rstd,
+            write_qkn=0,
+            qn_int=a.qn_int,
+            kn_int=a.kn_int,
         )
 
     def qk_l2norm(lv: dict[str, Any] | None) -> None:
@@ -4132,9 +4191,14 @@ def _forward(
         if lv is not None and p.dispatched("qk_l2norm", path):
             ws.run("qk_l2norm", {**lv, "num_heads": H}, path=path)
 
-    def record_fwd(qn: torch.Tensor, kn: torch.Tensor) -> None:
-        _record_l2n(
-            "fwd", qn=qn, kn=kn, **({"qk_rstd": qk_rstd} if write_rstd else {})
+    def record_rows(a: types.SimpleNamespace, tables_a: tuple[torch.Tensor, ...]):
+        """The hook's copy of the fused intra program's internal rows into token layout (right after the intra
+        launch, before WY overwrites the slots)."""
+        if not hook or fallback:
+            return None
+        return lambda: (
+            _internal_to_tokens(a.qn_int, tables_a[0], tables_a[1], qn_tok),
+            _internal_to_tokens(a.kn_int, tables_a[0], tables_a[1], kn_tok),
         )
 
     qn = kn = None
@@ -4164,11 +4228,10 @@ def _forward(
     if packing is None:
         a = ws.views(mode)
         tables = _tables(ws, cu_seqlens, path)
-        lv = record = None
-        if l2n != "off":  # the transient normalized rows in the u / w slots (written at 0 / 1, dead before WY)
-            qn, kn = a.qn[:S], a.kn[:S]
-            lv = l2n_values(qn, kn)
-            record = lambda: record_fwd(qn, kn)  # noqa: E731
+        lv = l2n_values(a, None, None)
+        if fallback:
+            qn, kn = lv["qn"], lv["kn"]
+        record = record_rows(a, tables)
         qk_l2norm(lv)
         _forward_launches(
             ws,
@@ -4191,13 +4254,11 @@ def _forward(
             **common,
         )
     else:
-        # the groups' intra programs write their own tokens of whole-problem qn / kn (per-call tensors: a group's
-        # u / w slots are sized for the group)
-        lv = None
-        if l2n != "off":
+        # the fallback's token-layout qn / kn of the whole problem are per-call tensors (a group's u / w slots are
+        # sized for the group); the fused intra program of each group uses its view's slots
+        if fallback:
             qn = _alloc((S, H, D), torch.bfloat16, ws.device)
             kn = _alloc((S, H, D), torch.bfloat16, ws.device)
-            lv = l2n_values(qn, kn)
         views_b = [
             (batch, ws.batch_view(batch, tape=row_slices)) for batch in packing.batches
         ]
@@ -4209,7 +4270,8 @@ def _forward(
         # the whole problem's tables for the saved set, by the saved-set paths' table program (the forward's intra
         # program writes the tables of its own call only: here the groups')
         tables = _tables(ws, cu_seqlens, "light") if save_for_backward else None
-        qk_l2norm(lv)
+        if fallback:
+            qk_l2norm(l2n_values(views_b[0][1].views(mode), qn, kn))
         # the groups' state blocks go into the whole problem's saved states by chain rank (from doc_lengths on the
         # host, :class:`_Packing`)
         scatter = seg and (save_states or seg_m is not None)
@@ -4249,7 +4311,8 @@ def _forward(
                 qg=None if qg_saved is None else qg_saved[rows_b],
                 w=None if w_saved is None else w_saved[rows_b],
                 u=None if u_saved is None else u_saved[rows_b],
-                l2n_values=lv,
+                l2n_values=l2n_values(a, qn, kn),
+                after_intra=record_rows(a, tables_b),
                 **common,
             )
             if run is not None:  # one run: contiguous copies of the halves
@@ -4268,8 +4331,13 @@ def _forward(
         if tape:  # the last group's slice ends inside the whole tape: no group writes the v_new pad rows after it
             last, ws_last = views_b[-1]
             v_new[BT * (last.c0 + ws_last.plan.NC_pad) :].zero_()
-    if l2n != "off" and packing is not None:
-        record_fwd(qn, kn)
+    if hook:
+        _record_l2n(
+            "fwd",
+            qn=qn if fallback else qn_tok,
+            kn=kn if fallback else kn_tok,
+            **({"qk_rstd": qk_rstd} if write_rstd else {}),
+        )
     saved = None
     if save_for_backward:
         # the gate mode of the set (metadata; "g" sets keep the defaults)
@@ -4398,6 +4466,8 @@ def _backward_launches(
         values.update(gate_values)
     if l2n_values:
         values.update(l2n_values)
+        if hasattr(b, "qn_int"):  # the replay's fused intra program's CTA-private rows (contract v1.1)
+            values.update(qn_int=b.qn_int, kn_int=b.kn_int)
     _saved_rows(values, p, qg=qg, w=w, u=u)
 
     # The replay recomputes the internal Aqk / Akk rows with the intra program (write_prep = 0: the prep buffers are
@@ -4766,7 +4836,14 @@ def _backward(
         else:
             qk_rstd, read_rstd, write_rstd = saved.qk_rstd, 1, 0
         lv = _l2n_values(
-            q, k, qn, kn, qk_rstd, read_rstd=read_rstd, write_rstd=write_rstd
+            q,
+            k,
+            qn,
+            kn,
+            qk_rstd,
+            read_rstd=read_rstd,
+            write_rstd=write_rstd,
+            write_qkn=1,
         )
         if p.dispatched("qk_apply", path) and not replay:
             ws.run("qk_apply", {**lv, "num_heads": H}, path=path)

@@ -442,6 +442,8 @@ LOGICAL_TENSORS = (
     "qn",
     "kn",
     "qk_rstd",
+    "qn_int",
+    "kn_int",
 )
 # ``segments`` is the per-document segment count ``seg_table`` expands;
 # ``seg_arg`` the walk programs' segment scalar (``segments``, or
@@ -487,6 +489,7 @@ LOGICAL_SCALARS = (
     "dk_row_stride",
     "read_rstd",
     "write_rstd",
+    "write_qkn",
 )
 
 # Filled mechanically by the exporter (the derived leaves ``kernel_symbol``, ``launch``, ``arg_plan``,

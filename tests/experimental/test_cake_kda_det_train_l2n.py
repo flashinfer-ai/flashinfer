@@ -135,7 +135,7 @@ def test_l2n_modes_are_the_registrys() -> None:
     for stage in ("qk_l2norm", "qk_apply", "qk_pullback"):
         assert stage in cake_jit.STAGES and stage in cake_jit.OPTIONAL_STAGES
         assert stage in cake_jit.L2N_STAGES
-    for name in ("q_raw", "k_raw", "qn", "kn", "qk_rstd"):
+    for name in ("q_raw", "k_raw", "qn", "kn", "qk_rstd", "qn_int", "kn_int"):
         assert name in cake_jit.LOGICAL_TENSORS
     for name in (
         "num_tokens",
@@ -147,6 +147,7 @@ def test_l2n_modes_are_the_registrys() -> None:
         "dk_row_stride",
         "read_rstd",
         "write_rstd",
+        "write_qkn",
     ):
         assert name in cake_jit.LOGICAL_SCALARS
 
@@ -214,13 +215,16 @@ def _rows(mode: str, **kwargs) -> dict[str, dict]:
     return {r["buffer"]: r for r in cake_backend.lifetime_table(mode, **kwargs)}
 
 
-@pytest.mark.parametrize("mode", ["fwd", "fwd_tape", "fwd_kcp"])
+@pytest.mark.parametrize("mode", ["fwd", "fwd_tape", "fwd_kcp", "replay", "replay_tape"])
 @pytest.mark.parametrize("l2n", ["fused", "fallback"])
-def test_forward_layouts_carry_transient_qn_kn_on_the_u_w_slots(mode: str, l2n: str) -> None:
+def test_layouts_carry_transient_qn_kn_int_on_the_u_w_slots(mode: str, l2n: str) -> None:
+    """Contract v1.1: the fused intra program's CTA-private internal rows qn_int / kn_int ride at sub-offset 0 of the
+    u / w slots of the forward and replay layouts, lifetime (0, 1), bytes unchanged; the saved-set backward layouts
+    have none."""
     off = _rows(mode)
     on = _rows(mode, l2n=l2n)
-    assert "qn" not in off and "kn" not in off
-    for name, host in (("qn", "u"), ("kn", "w")):
+    assert "qn_int" not in off and "kn_int" not in off
+    for name, host in (("qn_int", "u"), ("kn_int", "w")):
         r = on[name]
         assert r["slot"] == on[host]["slot"] and r["kind"] == "B16"
         assert r["sub_offset_per_th"] == 0
@@ -230,6 +234,11 @@ def test_forward_layouts_carry_transient_qn_kn_on_the_u_w_slots(mode: str, l2n: 
     assert cake_backend._mode_bytes(R, H, NC, 0, mode, 1, True, l2n) == cake_backend._mode_bytes(
         R, H, NC, 0, mode, 1, True, "off"
     )
+
+
+@pytest.mark.parametrize("mode", ["bwd", "bwd_tape"])
+def test_saved_set_backward_layouts_have_no_internal_qn(mode: str) -> None:
+    assert "qn_int" not in _rows(mode, l2n="fused") and "kn_int" not in _rows(mode, l2n="fused")
 
 
 @pytest.mark.parametrize("mode", ["bwd", "replay", "bwd_tape", "replay_tape"])
@@ -301,6 +310,39 @@ def test_l2n_values_bind_normalized_rows_under_q_and_k() -> None:
     assert v["q_raw_head_stride"] == v["k_raw_head_stride"] == D
     assert v["dq_row_stride"] == v["dk_row_stride"] == H * D
     assert (v["read_rstd"], v["write_rstd"]) == (1, 0)
+    # contract v1.1: the internal rows default to the token rows (no record reads them there), write_qkn to 1
+    assert v["qn_int"] is qn and v["kn_int"] is kn and v["write_qkn"] == 1
+    qi, ki = torch.empty(64, H, D, dtype=torch.bfloat16), torch.empty(64, H, D, dtype=torch.bfloat16)
+    v = cake_backend._l2n_values(
+        q, k, qn, kn, rstd, read_rstd=0, write_rstd=1, write_qkn=0, qn_int=qi, kn_int=ki
+    )
+    assert v["qn_int"] is qi and v["kn_int"] is ki and v["write_qkn"] == 0
+
+
+def test_internal_rows_scatter_to_token_rows() -> None:
+    """The hook's map of the internal rows (row 64 c + i of chunk c) to token rows chunk_bos[c] + i, real tokens
+    only."""
+    H = 1
+    lengths = (3, 64, 70)
+    bos, ln = [], []
+    t = 0
+    for n in lengths:
+        for c0 in range(0, n, 64):
+            bos.append(t + c0)
+            ln.append(min(64, n - c0))
+        t += n
+    bos += [0]  # a pad chunk
+    ln += [0]
+    S, nc = t, len(bos)
+    tok = torch.arange(S, dtype=torch.float32)
+    rows = torch.full((nc * 64, H, D), -1.0)
+    for c in range(nc):
+        rows[64 * c : 64 * c + ln[c], :, :] = tok[bos[c] : bos[c] + ln[c], None, None]
+    out = torch.full((S, H, D), -2.0)
+    cake_backend._internal_to_tokens(
+        rows, torch.tensor(bos, dtype=torch.int32), torch.tensor(ln, dtype=torch.int32), out
+    )
+    assert torch.equal(out[:, 0, 0], tok)
 
 
 def test_record_hook_clones_and_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
