@@ -122,14 +122,17 @@ def _l2n_missing(form: str = "fused", gate: str = "g") -> str | None:
     return cake_kcp_plan.qk_l2norm_missing(form, gate, cake_kcp_plan.qk_l2norm_arch())
 
 
-# the unpatched check (``capable`` replaces it)
-_QK_L2NORM_MISSING = cake_kcp_plan.qk_l2norm_missing
+# the unpatched check (``capable`` replaces it); absent on the base of this change, where this file is executed for
+# the flag-off golden capture
+_QK_L2NORM_MISSING = getattr(cake_kcp_plan, "qk_l2norm_missing", None)
 
 
 @functools.cache
 def _backend_serves(mode: str, gate: str) -> bool:
     """Whether the existing backend serves l2n mode ``mode`` in gate mode ``gate`` on every exported architecture
-    (the unpatched capability check)."""
+    (the unpatched capability check; never without it)."""
+    if _QK_L2NORM_MISSING is None:
+        return False
     return _QK_L2NORM_MISSING(mode, gate, None) is None
 
 
