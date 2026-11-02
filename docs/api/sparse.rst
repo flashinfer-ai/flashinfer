@@ -53,6 +53,25 @@ Build grouped key unions and masks for masked dense attention.
     group_union_masks
 
 
+SDSA Indexer
+------------
+
+Score, select and quantize the keys of the SDSA (Simplified DSA) indexer, which
+has one query head and no head weights.
+
+.. currentmodule:: flashinfer.sdsa
+
+.. autosummary::
+    :toctree: ../generated
+
+    indexer_scores
+    indexer_threshold_select
+    top_k_from_candidates
+    gather_key_sample
+    thresholds_from_sample
+    quantize_write_index_qk_nvfp4
+
+
 .. currentmodule:: flashinfer.sparse
 
 

@@ -72,6 +72,9 @@ gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
+indexer_scores_page_size64_dim128.json
+indexer_scores_page_size64_dim64.json
+indexer_threshold_select_page_size64_dim128_counters2_pair2.json
 layernorm_h768.json
 layernorm_quant_h768.json
 linear_nvfp4_svdquant_N3072_K3072_K_packed1536_rank32.json
@@ -143,9 +146,6 @@ rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
-single_head_paged_mqa_logits_page_size64_dim128.json
-single_head_paged_mqa_logits_page_size64_dim64.json
-single_head_paged_mqa_threshold_select_page_size64_dim128_counters2_pair2.json
 thresholds_from_sample_counters2.json
 token_sparse_kv_indices_top_k2048_lists2.json
 top_k_from_candidates_pair2_range2.json
@@ -3492,17 +3492,17 @@ group_union_masks.fi_trace(
     num_keys=16384,
 )
 
-# ── Single-head paged MQA logits ──────────────────────────────────────────────
-from flashinfer.attn_scores import (
+# ── SDSA indexer ──────────────────────────────────────────────────────────────
+from flashinfer.sdsa import (
     gather_key_sample,
+    indexer_scores,
+    indexer_threshold_select,
     quantize_write_index_qk_nvfp4,
-    single_head_paged_mqa_logits,
-    single_head_paged_mqa_threshold_select,
     thresholds_from_sample,
     top_k_from_candidates,
 )
 
-single_head_paged_mqa_logits.fi_trace(
+indexer_scores.fi_trace(
     save_dir=SAVE_DIR,
     query=torch.empty(8, 128, dtype=torch.bfloat16),
     key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
@@ -3512,7 +3512,7 @@ single_head_paged_mqa_logits.fi_trace(
     scores=torch.empty(8, 1024),
 )
 
-single_head_paged_mqa_logits.fi_trace(
+indexer_scores.fi_trace(
     save_dir=SAVE_DIR,
     query=torch.empty(8, 64, dtype=torch.uint8),
     key_cache=torch.empty(64, 64, 64, dtype=torch.uint8),
@@ -3536,7 +3536,7 @@ quantize_write_index_qk_nvfp4.fi_trace(
     query_scales=torch.empty(16, 8, dtype=torch.float8_e4m3fn),
 )
 
-single_head_paged_mqa_threshold_select.fi_trace(
+indexer_threshold_select.fi_trace(
     save_dir=SAVE_DIR,
     query=torch.empty(256, 128, dtype=torch.bfloat16),
     key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),

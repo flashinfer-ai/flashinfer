@@ -1,9 +1,9 @@
 {
-  "name": "single_head_paged_mqa_threshold_select_page_size64_dim128_counters2_pair2",
+  "name": "indexer_threshold_select_page_size64_dim128_counters2_pair2",
   "description": "Keys of each query row's request scoring above the row's threshold, with one query head over paged BF16 or NVFP4 keys, written as (key, score) candidate and tie slots. SM100/SM103.",
-  "op_type": "single_head_paged_mqa_threshold_select",
+  "op_type": "indexer_threshold_select",
   "tags": [
-    "fi_api:flashinfer.attn_scores.single_head.single_head_paged_mqa_threshold_select",
+    "fi_api:flashinfer.sdsa.indexer_threshold_select",
     "arch:sm100",
     "arch:sm103"
   ],

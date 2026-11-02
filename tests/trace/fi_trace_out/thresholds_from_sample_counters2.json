@@ -3,7 +3,7 @@
   "description": "Each query row's threshold as the least of its sampled Top scores, with its threshold-select counters zeroed.",
   "op_type": "thresholds_from_sample",
   "tags": [
-    "fi_api:flashinfer.attn_scores.single_head.thresholds_from_sample",
+    "fi_api:flashinfer.sdsa.thresholds_from_sample",
     "arch:sm100",
     "arch:sm103"
   ],

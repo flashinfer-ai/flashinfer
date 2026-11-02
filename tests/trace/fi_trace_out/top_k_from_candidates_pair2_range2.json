@@ -3,7 +3,7 @@
   "description": "Each query row's exact Top-K keys among the (key, score bits) candidate and tie pairs that single-head threshold select stored in its range of slots.",
   "op_type": "top_k_from_candidates",
   "tags": [
-    "fi_api:flashinfer.attn_scores.single_head.top_k_from_candidates",
+    "fi_api:flashinfer.sdsa.top_k_from_candidates",
     "arch:sm100",
     "arch:sm103"
   ],

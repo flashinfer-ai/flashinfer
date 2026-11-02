@@ -1,28 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 by FlashInfer team.
 
-"""Single-head paged MQA logits, for sparse attention whose indexer scores keys
-with one query head and no head weights."""
+"""SDSA (Simplified DSA) indexer APIs. The SDSA indexer scores keys with one
+query head and no head weights. These APIs score its keys, select the keys that
+score above a threshold, set the thresholds from a key sample, write the Top-K
+keys of the selection, and quantize its keys and queries to NVFP4."""
 
 from typing import Optional
 
 import torch
 
-from ..api_logging import flashinfer_api
-from ..cute_dsl.availability import is_cute_dsl_experimental_available
-from ..trace.templates.attn_scores import (
+from .api_logging import flashinfer_api
+from .cute_dsl.availability import is_cute_dsl_experimental_available
+from .trace.templates.sdsa import (
     gather_key_sample_trace,
+    indexer_scores_trace,
+    indexer_threshold_select_trace,
     quantize_write_index_qk_nvfp4_trace,
-    single_head_paged_mqa_logits_trace,
-    single_head_paged_mqa_threshold_select_trace,
     thresholds_from_sample_trace,
     top_k_from_candidates_trace,
 )
-from ..utils import get_compute_capability, get_device_sm_count
+from .utils import get_compute_capability, get_device_sm_count
 
 
-@flashinfer_api(trace=single_head_paged_mqa_logits_trace)
-def single_head_paged_mqa_logits(
+@flashinfer_api(trace=indexer_scores_trace)
+def indexer_scores(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     block_table: torch.Tensor,
@@ -73,7 +75,7 @@ def single_head_paged_mqa_logits(
         E4M3 ``[pages, 64, 8]`` for NVFP4 keys, paged like the keys. None for
         BF16.
     """
-    from .single_head_shapes import DIM, MAX_ROWS, PAGE
+    from .attn_scores.single_head_shapes import DIM, MAX_ROWS, PAGE
 
     max_context = scores.shape[1]
     batch, width = requests.shape[0], block_table.shape[1]
@@ -111,7 +113,7 @@ def single_head_paged_mqa_logits(
                 "Queries, keys, scores, lengths, requests and the block table "
                 "must have contiguous rows"
             )
-        from ..triton.kernels.single_head_scorer import single_head_scorer_kernel
+        from .triton.kernels.single_head_scorer import single_head_scorer_kernel
 
         single_head_scorer_kernel[(batch, -(-max_context // PAGE))](
             query,
@@ -129,8 +131,8 @@ def single_head_paged_mqa_logits(
         )
         return
     if not is_cute_dsl_experimental_available():
-        raise RuntimeError("single_head_paged_mqa_logits needs CuTe DSL 4.7 or newer")
-    from .kernels.single_head_scorer import CTAS_PER_SM, TILE, TILES_PER_CTA
+        raise RuntimeError("indexer_scores needs CuTe DSL 4.7 or newer")
+    from .attn_scores.kernels.single_head_scorer import CTAS_PER_SM, TILE, TILES_PER_CTA
 
     # CTAs per request group: two per SM in all, and enough that a CTA's run over
     # the whole capacity fits the TILES_PER_CTA tiles whose pages it stages (the
@@ -148,9 +150,14 @@ def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
     """Check the key format, then run the scorer in `mode` for `rows` query rows
     per job. `keys` is (query, query_scales, key_cache, key_scales), and `args`
     holds the kernel's other arguments."""
-    from ..cute_dsl.launch import argument_kind, compiled
-    from .kernels import single_head_scorer
-    from .kernels.single_head_scorer import DIM, PACKED_DIM, PAGE, SCALES_PER_KEY
+    from .cute_dsl.launch import argument_kind, compiled
+    from .attn_scores.kernels import single_head_scorer
+    from .attn_scores.kernels.single_head_scorer import (
+        DIM,
+        PACKED_DIM,
+        PAGE,
+        SCALES_PER_KEY,
+    )
 
     query, query_scales, key_cache, key_scales = keys
     nvfp4 = key_cache.dtype == torch.uint8
@@ -202,8 +209,8 @@ def _score(mode: str, rows: int, keys: tuple, args: tuple) -> None:
     function(*args)
 
 
-@flashinfer_api(trace=single_head_paged_mqa_threshold_select_trace)
-def single_head_paged_mqa_threshold_select(
+@flashinfer_api(trace=indexer_threshold_select_trace)
+def indexer_threshold_select(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     row_ends: torch.Tensor,
@@ -243,9 +250,9 @@ def single_head_paged_mqa_threshold_select(
     Parameters
     ----------
     query : torch.Tensor
-        As in :func:`single_head_paged_mqa_logits`, in tiles of 128 rows.
+        As in :func:`indexer_scores`, in tiles of 128 rows.
     key_cache : torch.Tensor
-        As in :func:`single_head_paged_mqa_logits`.
+        As in :func:`indexer_scores`.
     row_ends : torch.Tensor
         int32 ``[rows]``: row ``r`` sees keys below ``row_ends[r]``.
     tile_requests : torch.Tensor
@@ -268,7 +275,7 @@ def single_head_paged_mqa_threshold_select(
     top_k : int
         The number of tie slots.
     query_scales, key_scales : torch.Tensor, optional
-        NVFP4 scales, as in :func:`single_head_paged_mqa_logits`.
+        NVFP4 scales, as in :func:`indexer_scores`.
     arrivals : torch.Tensor, optional
         int32 ``[tiles]``: zeroed once, and left zeroed by every call.
     ranges : torch.Tensor, optional
@@ -277,7 +284,7 @@ def single_head_paged_mqa_threshold_select(
     """
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("Threshold select needs CuTe DSL 4.7 or newer")
-    from .kernels.single_head_scorer import (
+    from .attn_scores.kernels.single_head_scorer import (
         COUNTERS,
         PAGE,
         SELECT_CTAS_PER_TILE,
@@ -346,7 +353,7 @@ def top_k_from_candidates(
     top_keys: torch.Tensor,
 ) -> None:
     """Write each query row's exact Top-K keys from the candidates and ties that
-    :func:`single_head_paged_mqa_threshold_select` stored in its range of slots.
+    :func:`indexer_threshold_select` stored in its range of slots.
 
     The select stores scores that keep the order of the row's scores, so the
     keys of the row's ``top_k`` largest stored scores are the keys of its
@@ -371,10 +378,10 @@ def top_k_from_candidates(
     """
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("top_k_from_candidates needs CuTe DSL 4.7 or newer")
-    from ..cute_dsl.launch import launch
-    from ..topk_varlen.kernels import block_scan
-    from .kernels import single_head_scorer
-    from .kernels.single_head_scorer import TOP_K_THREADS
+    from .cute_dsl.launch import launch
+    from .topk_varlen.kernels import block_scan
+    from .attn_scores.kernels import single_head_scorer
+    from .attn_scores.kernels.single_head_scorer import TOP_K_THREADS
 
     rows = candidates.shape[0]
     if (
@@ -418,7 +425,7 @@ def quantize_write_index_qk_nvfp4(
 ) -> None:
     """Quantize indexer keys and queries to NVFP4 in one launch: the keys into a
     paged key cache and the queries into rows, the layouts
-    :func:`single_head_paged_mqa_logits` reads.
+    :func:`indexer_scores` reads.
 
     Each key and query gets one E4M3 scale per 16 values: their amax over 6.
     There is no per-tensor global scale, so queries and keys are quantized the
@@ -454,9 +461,9 @@ def quantize_write_index_qk_nvfp4(
     """
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("quantize_write_index_qk_nvfp4 needs CuTe DSL 4.7 or newer")
-    from ..cute_dsl.launch import launch
-    from .kernels import single_head_scorer
-    from .kernels.single_head_scorer import (
+    from .cute_dsl.launch import launch
+    from .attn_scores.kernels import single_head_scorer
+    from .attn_scores.kernels.single_head_scorer import (
         DIM,
         PACKED_DIM,
         PAGE,
@@ -529,16 +536,16 @@ def gather_key_sample(
 ) -> None:
     """Copy a strided random sample of each request's paged keys into dense
     sample rows, whose scores give thresholds for
-    :func:`single_head_paged_mqa_threshold_select`.
+    :func:`indexer_threshold_select`.
 
     Viewed as 64-key pages (``sample_keys.view(-1, 64, d)``), the sample can be
-    scored by :func:`single_head_paged_mqa_logits`. It runs as one launch
+    scored by :func:`indexer_scores`. It runs as one launch
     without host synchronization, so it can be captured in a CUDA graph.
 
     Parameters
     ----------
     key_cache : torch.Tensor
-        As in :func:`single_head_paged_mqa_logits`.
+        As in :func:`indexer_scores`.
     block_table : torch.Tensor
         int32 ``[requests, blocks]``: each request's pages of 64 keys.
     offsets : torch.Tensor
@@ -555,15 +562,15 @@ def gather_key_sample(
     pages_per_run : int
         Pages per run.
     key_scales : torch.Tensor, optional
-        NVFP4 key scales, as in :func:`single_head_paged_mqa_logits`.
+        NVFP4 key scales, as in :func:`indexer_scores`.
     sample_scales : torch.Tensor, optional
         ``[requests, capacity, 8]``, output: the sampled keys' NVFP4 scales.
     """
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("gather_key_sample needs CuTe DSL 4.7 or newer")
-    from ..cute_dsl.launch import launch
-    from .kernels import single_head_scorer
-    from .kernels.single_head_scorer import PAGE, SCALES_PER_KEY, TILE
+    from .cute_dsl.launch import launch
+    from .attn_scores.kernels import single_head_scorer
+    from .attn_scores.kernels.single_head_scorer import PAGE, SCALES_PER_KEY, TILE
 
     requests, capacity, width = sample_keys.shape
     if capacity % TILE or (key_scales is None) != (sample_scales is None):
@@ -609,7 +616,7 @@ def thresholds_from_sample(
     counters: torch.Tensor,
 ) -> None:
     """Set each query row's threshold for
-    :func:`single_head_paged_mqa_threshold_select` from a sample of its scores,
+    :func:`indexer_threshold_select` from a sample of its scores,
     and zero its counters. It runs as one launch without host synchronization,
     so it can be captured in a CUDA graph.
 
@@ -628,9 +635,9 @@ def thresholds_from_sample(
     """
     if not is_cute_dsl_experimental_available():
         raise RuntimeError("thresholds_from_sample needs CuTe DSL 4.7 or newer")
-    from ..cute_dsl.launch import launch
-    from .kernels import single_head_scorer
-    from .kernels.single_head_scorer import COUNTERS, THRESHOLD_ROWS_PER_CTA
+    from .cute_dsl.launch import launch
+    from .attn_scores.kernels import single_head_scorer
+    from .attn_scores.kernels.single_head_scorer import COUNTERS, THRESHOLD_ROWS_PER_CTA
 
     rows, rank = sample_top.shape
     if {sample_scores.shape[0], thresholds.shape[0], counters.shape[0]} != {rows}:

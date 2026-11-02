@@ -2,15 +2,15 @@
 
 DeepSeek Sparse Attention (DSA) attends each query token to its Top-K keys. An
 indexer gives the scores that pick these keys. The DSA indexer has many heads
-(`fp8_paged_mqa_logits`, `fp4_paged_mqa_logits`). The kernels in
-`flashinfer.attn_scores.single_head` serve an indexer with one query head and no
-head weights: a score is the dot product of a query row and a key. The module
-has five parts:
+(`fp8_paged_mqa_logits`, `fp4_paged_mqa_logits`). The SDSA (Simplified DSA)
+indexer has one query head and no head weights: a score is the dot product of a
+query row and a key. The APIs in `flashinfer.sdsa` serve this indexer. The
+module has five parts:
 
-- decode scores: `single_head_paged_mqa_logits` scores 1 to 8 query rows of a
-  request against all its keys;
-- prefill selection: `single_head_paged_mqa_threshold_select` writes only the
-  keys that score at or above a threshold for each query row;
+- decode scores: `indexer_scores` scores 1 to 8 query rows of a request against
+  all its keys;
+- prefill selection: `indexer_threshold_select` writes only the keys that score
+  at or above a threshold for each query row;
 - Top-K from the selection: `top_k_from_candidates` writes the Top-K keys of
   each query row from its selected keys;
 - thresholds from a key sample: `gather_key_sample` and `thresholds_from_sample`;
@@ -23,12 +23,12 @@ token-sparse attention
 
 ## Public API
 
-All functions are in `flashinfer.attn_scores`.
+All functions are in `flashinfer.sdsa`.
 
 | API | Purpose |
 | --- | --- |
-| `single_head_paged_mqa_logits(query, key_cache, block_table, context_lengths, *, requests, scores, query_scales=None, key_scales=None)` | Write the FP32 score of each query row with each key of its request. |
-| `single_head_paged_mqa_threshold_select(query, key_cache, row_ends, tile_requests, block_table, *, thresholds, counters, candidates, max_context, top_k, query_scales=None, key_scales=None, arrivals=None, ranges=None)` | Keep the keys at or above the threshold of each query row, as (key, score) pairs. |
+| `indexer_scores(query, key_cache, block_table, context_lengths, *, requests, scores, query_scales=None, key_scales=None)` | Write the FP32 score of each query row with each key of its request. |
+| `indexer_threshold_select(query, key_cache, row_ends, tile_requests, block_table, *, thresholds, counters, candidates, max_context, top_k, query_scales=None, key_scales=None, arrivals=None, ranges=None)` | Keep the keys at or above the threshold of each query row, as (key, score) pairs. |
 | `top_k_from_candidates(candidates, ranges, *, top_keys)` | Write the Top-K keys of each query row from the pairs in its range. |
 | `gather_key_sample(key_cache, block_table, offsets, sample_ends, *, sample_keys, samples_per_run, pages_per_run, key_scales=None, sample_scales=None)` | Copy a strided random sample of the keys of each request into dense rows. |
 | `thresholds_from_sample(sample_scores, sample_top, *, thresholds, counters)` | Set the threshold of each query row from its sampled Top scores, and zero its counters. |
@@ -173,7 +173,7 @@ A good threshold makes the repair rare:
 
 1. `gather_key_sample` copies a strided random sample of the keys of each
    request.
-2. `single_head_paged_mqa_logits` scores the sample, as pages of 64 keys.
+2. `indexer_scores` scores the sample, as pages of 64 keys.
 3. A Top-K kernel ranks the sampled scores of each row.
 4. `thresholds_from_sample` sets the threshold of each row to the least of its
    sampled Top scores, and zeroes its counters. A -1 position or a NaN score
@@ -195,7 +195,7 @@ quantized the same way, so their scores stay comparable.
   query rows.
 - The block table must cover `max_context`.
 - The CuTe-DSL kernels need CuTe DSL 4.7 or newer. The scorer and the select
-  need SM10x. Off SM10x, `single_head_paged_mqa_logits` runs the Triton kernel,
+  need SM10x. Off SM10x, `indexer_scores` runs the Triton kernel,
   which takes only BF16 queries and keys, with contiguous rows.
 - `gather_key_sample` takes sample rows of whole 128-key tiles.
 - `top_k_from_candidates` takes `top_k` below 65536.

@@ -10,12 +10,12 @@ import pytest
 import torch
 
 from flashinfer import nvfp4_kv_dequantize
-from flashinfer.attn_scores import single_head
-from flashinfer.attn_scores import (
+from flashinfer import sdsa
+from flashinfer.sdsa import (
     gather_key_sample,
+    indexer_scores,
+    indexer_threshold_select,
     quantize_write_index_qk_nvfp4,
-    single_head_paged_mqa_logits,
-    single_head_paged_mqa_threshold_select,
     thresholds_from_sample,
     top_k_from_candidates,
 )
@@ -83,7 +83,7 @@ def dequantize(values: torch.Tensor, scales: torch.Tensor | None) -> torch.Tenso
 @pytest.mark.parametrize("rows", [1, 3, 8])
 @pytest.mark.parametrize("keys", ["bf16", "bf16_triton", "nvfp4", "nvfp4_packed"])
 @torch.inference_mode()
-def test_single_head_paged_mqa_logits_match_reference_and_replay(
+def test_indexer_scores_match_reference_and_replay(
     lengths, rows, keys, monkeypatch
 ) -> None:
     """Keys on shuffled pages; table entries past a length would fault if read,
@@ -93,7 +93,7 @@ def test_single_head_paged_mqa_logits_match_reference_and_replay(
     if keys.startswith("nvfp4") and not SM10X:
         pytest.skip("Off SM10x, keys are BF16 (scored by Triton)")
     if keys == "bf16_triton":  # the path off SM10x, also on SM10x
-        monkeypatch.setattr(single_head, "get_compute_capability", lambda _: (9, 0))
+        monkeypatch.setattr(sdsa, "get_compute_capability", lambda _: (9, 0))
         keys = "bf16"
     torch.manual_seed(rows)
     nvfp4 = keys != "bf16"
@@ -143,7 +143,7 @@ def test_single_head_paged_mqa_logits_match_reference_and_replay(
             )
 
     def run() -> None:
-        single_head_paged_mqa_logits(
+        indexer_scores(
             query,
             key_cache,
             table,
@@ -180,7 +180,7 @@ def test_single_head_paged_mqa_logits_match_reference_and_replay(
 @pytest.mark.parametrize("repair", [False, True])
 @pytest.mark.parametrize("top_k", [64, 512, 2048])
 @torch.inference_mode()
-def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
+def test_indexer_threshold_select_matches_reference_and_replay(
     query_lens, context_lens, top_k, keys, repair
 ) -> None:
     """Causal 128-row tiles, odd ones reversed; rows 2 mod 8 score 0 (ties past
@@ -223,7 +223,7 @@ def test_single_head_paged_mqa_threshold_select_matches_reference_and_replay(
         thresholds.copy_(requested)
         counters.zero_()
         candidates.fill_(-1)
-        single_head_paged_mqa_threshold_select(
+        indexer_threshold_select(
             *(query, key_cache, ends, requests, table),
             thresholds=thresholds,
             counters=counters,
@@ -566,7 +566,7 @@ def test_quantize_write_index_qk_nvfp4_rejects_bad_inputs(monkeypatch) -> None:
         with pytest.raises(ValueError, match="key and query must be BF16 or FP16"):
             run(**wrong)
     monkeypatch.setattr(
-        "flashinfer.attn_scores.single_head.get_compute_capability",
+        "flashinfer.sdsa.get_compute_capability",
         lambda device: (9, 0),
     )
     with pytest.raises(ValueError, match="requires SM10x"):
@@ -574,14 +574,14 @@ def test_quantize_write_index_qk_nvfp4_rejects_bad_inputs(monkeypatch) -> None:
 
 
 @torch.inference_mode()
-def test_single_head_paged_mqa_logits_rejects_bad_shapes() -> None:
+def test_indexer_scores_rejects_bad_shapes() -> None:
     query = torch.zeros(4, 128, dtype=torch.bfloat16, device="cuda")
     key_cache = torch.zeros(4, 64, 128, dtype=torch.bfloat16, device="cuda")
     table = torch.zeros(2, 2, dtype=torch.int32, device="cuda")
     context = torch.zeros(2, dtype=torch.int32, device="cuda")
     requests = torch.zeros(2, dtype=torch.int32, device="cuda")
     scores = torch.zeros(4, 128, device="cuda")
-    run = single_head_paged_mqa_logits
+    run = indexer_scores
     with pytest.raises(ValueError, match="block table must cover"):
         run(query, key_cache, table[:, :1], context, requests=requests, scores=scores)
     with pytest.raises(ValueError, match="both BF16 or both NVFP4"):
@@ -610,7 +610,7 @@ def test_single_head_paged_mqa_logits_rejects_bad_shapes() -> None:
 
 @sm10x_only
 @torch.inference_mode()
-def test_single_head_paged_mqa_threshold_select_rejects_bad_shapes() -> None:
+def test_indexer_threshold_select_rejects_bad_shapes() -> None:
     query = torch.zeros(128, 128, dtype=torch.bfloat16, device="cuda")
     key_cache = torch.zeros(4, 64, 128, dtype=torch.bfloat16, device="cuda")
     ends = torch.ones(128, dtype=torch.int32, device="cuda")
@@ -627,7 +627,7 @@ def test_single_head_paged_mqa_threshold_select_rejects_bad_shapes() -> None:
         counters=torch.zeros(128, 2, 2, dtype=torch.int32, device="cuda"),
         candidates=torch.zeros(128, 64, dtype=torch.int32, device="cuda"),
     )
-    run = single_head_paged_mqa_threshold_select
+    run = indexer_threshold_select
     # The kernel addresses the pairs of a row as int32, so int64 must not pass.
     long_pairs = dict(outputs, candidates=outputs["candidates"].long())
     with pytest.raises(ValueError, match="must be int32"):
@@ -672,18 +672,18 @@ def test_single_head_paged_mqa_threshold_select_rejects_bad_shapes() -> None:
 
 
 @torch.inference_mode()
-def test_single_head_paged_mqa_logits_off_sm10x_rejects_bad_layouts(
+def test_indexer_scores_off_sm10x_rejects_bad_layouts(
     monkeypatch,
 ) -> None:
     """The Triton path off SM10x checks the layouts its kernel assumes."""
-    monkeypatch.setattr(single_head, "get_compute_capability", lambda _: (9, 0))
+    monkeypatch.setattr(sdsa, "get_compute_capability", lambda _: (9, 0))
     query = torch.zeros(4, 128, dtype=torch.bfloat16, device="cuda")
     key_cache = torch.zeros(4, 64, 128, dtype=torch.bfloat16, device="cuda")
     table = torch.zeros(2, 2, dtype=torch.int32, device="cuda")
     context = torch.zeros(2, dtype=torch.int32, device="cuda")
     requests = torch.zeros(2, dtype=torch.int32, device="cuda")
     scores = torch.zeros(4, 128, device="cuda")
-    run = partial(single_head_paged_mqa_logits, requests=requests)
+    run = partial(indexer_scores, requests=requests)
     with pytest.raises(ValueError, match="Keys must be"):
         run(query[:, :64], key_cache[..., :64], table, context, scores=scores)
     with pytest.raises(ValueError, match="contiguous rows"):
@@ -760,9 +760,7 @@ def test_gather_key_sample_rejects_bad_shapes() -> None:
 def test_sample_helpers_need_cute_dsl_4_7(monkeypatch) -> None:
     """Without CuTe DSL 4.7 the sample and Top-K helpers say so, like the other
     CuTe single-head APIs, before they import the CuTe scorer."""
-    monkeypatch.setattr(
-        single_head, "is_cute_dsl_experimental_available", lambda: False
-    )
+    monkeypatch.setattr(sdsa, "is_cute_dsl_experimental_available", lambda: False)
     zeros = partial(torch.zeros, device="cuda")
     with pytest.raises(RuntimeError, match="needs CuTe DSL 4.7"):
         gather_key_sample(

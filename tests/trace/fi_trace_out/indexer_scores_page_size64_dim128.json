@@ -1,9 +1,9 @@
 {
-  "name": "single_head_paged_mqa_logits_page_size64_dim128",
+  "name": "indexer_scores_page_size64_dim128",
   "description": "Single-head paged MQA logits: FP32 dot products of query rows with their request's paged BF16 or NVFP4 keys (no head weights or ReLU). SM100/SM103.",
-  "op_type": "single_head_paged_mqa_logits",
+  "op_type": "indexer_scores",
   "tags": [
-    "fi_api:flashinfer.attn_scores.single_head.single_head_paged_mqa_logits",
+    "fi_api:flashinfer.sdsa.indexer_scores",
     "arch:sm100",
     "arch:sm103"
   ],

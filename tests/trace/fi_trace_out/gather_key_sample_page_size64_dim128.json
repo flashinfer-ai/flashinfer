@@ -3,7 +3,7 @@
   "description": "A strided random sample of each request's paged BF16 or NVFP4 keys, copied into dense sample rows.",
   "op_type": "gather_key_sample",
   "tags": [
-    "fi_api:flashinfer.attn_scores.single_head.gather_key_sample",
+    "fi_api:flashinfer.sdsa.gather_key_sample",
     "arch:sm100",
     "arch:sm103"
   ],
