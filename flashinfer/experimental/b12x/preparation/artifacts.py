@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-import fcntl
 import os
+
+# Windows has no fcntl; publishing then runs without the advisory lock.
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,7 +52,8 @@ class CuTeArtifactCache:
             return False
         with self.path(key, ".lock").open("a") as lock:
             try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if fcntl is not None:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 return self.has(key)
             try:
@@ -60,4 +66,5 @@ class CuTeArtifactCache:
                 _fsync_directory(self.path(key, ".o").parent)
                 return True
             finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

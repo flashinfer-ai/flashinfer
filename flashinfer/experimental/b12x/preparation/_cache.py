@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
+
+# Windows has no fcntl; the cache then updates without the advisory lock.
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import json
 import os
 import tempfile
@@ -164,7 +169,8 @@ class SelectionCache:
         self._validate(update)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.with_suffix(".lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            if fcntl is not None:
+                fcntl.flock(lock, fcntl.LOCK_EX)
             records = self._read()
             records.update(update)
             temporary = None

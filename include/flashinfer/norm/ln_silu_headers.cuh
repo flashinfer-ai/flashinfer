@@ -96,6 +96,8 @@ struct is_same<T, T> : true_type {};
 // They are only needed for CGA/cluster support (USE_CLUSTER=true), which this
 // OSS engine does not use. All USE_CLUSTER code paths are guarded with
 // "if constexpr" so dead branches are not compiled.
+// The MSVC-hosted nvcc front end still resolves the names inside those dead
+// branches, so the cluster code is also excluded under _MSC_VER.
 
 // ============================================================
 // Fixed-width integer typedefs for NVRTC (no <cstdint> available)
@@ -694,7 +696,7 @@ struct Reducer : public Reducer<T, 1, WARPS_M, WARPS_N, USE_CLUSTER, WHOLE_CTA> 
     data = Base::reduce(data, op, warps_m);
 
     if constexpr (USE_CLUSTER) {
-#if (__CUDA_ARCH__ >= 900) && (CUDART_VERSION >= 12080)
+#if (__CUDA_ARCH__ >= 900) && (CUDART_VERSION >= 12080) && !defined(_MSC_VER)
       auto cluster = cooperative_groups::this_cluster();
 
       // NOTE: right now only lane 0 has the valid value so that a intra-warp broadcast is required
@@ -1021,7 +1023,7 @@ struct Stats {
         block_stats_.template compute<isRMSNorm, LDGS, NUM_ELTS>(elts, block_rn, warps_m);
 
     if constexpr (USE_CLUSTER) {
-#if (__CUDA_ARCH__ >= 900) && (CUDART_VERSION >= 12080)
+#if (__CUDA_ARCH__ >= 900) && (CUDART_VERSION >= 12080) && !defined(_MSC_VER)
       auto cluster = cooperative_groups::this_cluster();
 
       // Broadcast local results to other CTAs inside the CGA
