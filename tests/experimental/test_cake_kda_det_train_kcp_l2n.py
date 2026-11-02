@@ -1941,6 +1941,14 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
         ops["g"] = torch.zeros(1)
         grad_names = ("dq", "dk", "dv", "dg", "dbeta")
     grads = {n: torch.zeros(1) for n in grad_names}
+    fin_scratch: dict = {}
+    if gate == "raw":
+        # param_finalize's per-call scratch, as the raw backward of a rank with tokens binds it (cake_kcp._bwd_body)
+        fin = cake_backend._raw_finalize_scratch(
+            int(plans[form].NC_pad), H, torch.device("cpu")
+        )
+        grads.update(part2=fin["part2"], ticket=fin["ticket"])
+        fin_scratch["seg_cap"] = int(fin["seg_cap"])
     saved = types.SimpleNamespace(
         S_in=torch.zeros(1), c1_recv=None, M_seg=None, carry=None
     )
@@ -1952,7 +1960,7 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
         backward = kind.startswith("bwd")
         call = _DriveCall(
             local=Arena(plans[mode]), ctx=ctx, tb=tb, T_r=T, H=H, backward=backward, host_trim=int(opts.host_trim),
-            ops={**ops, **({"dout": torch.zeros(1)} if backward else {})}, scale=0.5, scratch={},
+            ops={**ops, **({"dout": torch.zeros(1)} if backward else {})}, scale=0.5, scratch=dict(fin_scratch),
             local_values=None, out=None if backward else torch.zeros(1), grads=grads if backward else None,
             device=torch.device("cpu"), opts=opts, gate=gate, l2n=mode != "off", l2n_mode=mode, l2n_values=None,
             backend=backend, schedule=str(opts.schedule), exchange="a2a", merge_fuse=str(opts.merge_fuse),
