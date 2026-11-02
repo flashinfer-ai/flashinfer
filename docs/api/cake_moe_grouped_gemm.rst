@@ -43,8 +43,11 @@ of the same programs), and so is ``dW`` wherever the 256-wide k tile runs.  With
 clusters; each unit adds its fp32 accumulator into the tile's fp32 sum with unordered
 reductions, and the last unit to arrive rounds the sum once and stores it, in the same
 launch (the deterministic package writes fp32 partials and sums them in a fixed order in
-a second launch).  Every whole tile is reduced by one CTA pair over the group's rows in a
-fixed order.  The operands (bf16), the accumulation (fp32), the one round-to-nearest
+a second launch).  With the slack tail placement, a launch whose tail tiles all fit in
+the room the full waves leave on the least-loaded clusters runs each tail tile whole on
+one cluster instead and touches no sum or ticket; otherwise its tail splits as above.
+Every whole tile is reduced by one CTA pair over the group's rows in a fixed order.  The
+operands (bf16), the accumulation (fp32), the one round-to-nearest
 rounding to bf16 (or the fp32 store), the layouts, the device-resident group offsets (no
 host synchronisation, no caller padding), the exact zeros of empty groups and the error
 budgets are those of the deterministic package.  The split tail's fp32 sums and tickets
@@ -117,7 +120,7 @@ feature                                         sm_100a         sm_103a         
 ``wgrad`` 256-wide k tile, ordered tail reduce  yes             yes             yes
 ``wgrad`` 512-wide k tile, unordered split tail yes             yes             yes
 ``wgrad`` 512 wave-synchronised builds          yes             yes             --
-``wgrad`` 512 half-release builds               planned walk    planned walk    planned, slack
+``wgrad`` 512 half-release builds               planned, slack  planned, slack  planned, slack
 ``wgrad`` 512 k256-tail twin                    --              --              slack tail
 ``wgrad`` output dtypes                         bf16, fp32      bf16, fp32      bf16, fp32
 CUDA toolkit floor                              12.8            12.9            13.4
