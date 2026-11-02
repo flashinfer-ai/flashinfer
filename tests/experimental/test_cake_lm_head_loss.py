@@ -7015,7 +7015,6 @@ def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
         _check_against_references(run, inp, entry="logprob", ceiling=True)
 
 
-
 @pytest.mark.parametrize("last", [650, 1792, 1793])
 def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
     glm_weight, monkeypatch, last
