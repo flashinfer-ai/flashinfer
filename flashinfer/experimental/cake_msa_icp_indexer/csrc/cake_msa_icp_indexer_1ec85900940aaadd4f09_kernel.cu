@@ -91,7 +91,7 @@ kernel_cake_msa_icp_indexer_1ec85900940aaadd4f09(int* __restrict__ recv, int* __
     int t = (int)blockIdx.x * 4 + (int)warp;
     int h = (int)blockIdx.y;
     int mode = ((tagged != 0) ? 2 : 1);
-    if (mode == 2 && world == 2) {
+    if (mode == 2) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if (t < num_tokens) {
