@@ -2857,7 +2857,8 @@ def _w8a16_fp8_gemm_reference(
     **_unused,
 ) -> torch.Tensor:
     """``act @ (weight.float() * weight_scale).T + bias`` with the e4m3 weight
-    dequantized exactly in fp32 and one rounding into ``act``'s dtype."""
+    dequantized exactly in fp32 and one rounding into ``act``'s dtype.  ``act``
+    is ``(..., K)``; its leading dimensions are kept."""
     a = act.to(torch.float32)
     w = weight.to(torch.float32) * weight_scale.to(torch.float32).reshape(())
     res = a @ w.T
@@ -2875,7 +2876,7 @@ def _w8a16_fp8_gemm_init(
     device: str = "cuda",
     seed: int = 0,
 ):
-    """Build inputs for ``flashinfer.gemm.w8a16_fp8_gemm``.
+    """Build inputs for ``flashinfer.gemm.w8a16_fp8_gemm`` (2-D activation).
 
     Sourced from ``tests/gemm/test_w8a16_fp8_gemm.py``: a ``randn`` bf16
     activation and a ``randn`` weight quantized per tensor to e4m3 (mirrored
@@ -2889,37 +2890,85 @@ def _w8a16_fp8_gemm_init(
     return {"act": act, "weight": weight, "weight_scale": inv_scale.reshape(1)}
 
 
-w8a16_fp8_gemm_trace = TraceTemplate(
-    op_type="gemm_w8a16_fp8",
-    name_prefix="w8a16_fp8_gemm",
-    description=(
-        "W8A16 GEMM: out = act @ (weight * weight_scale).T + bias. act is "
-        "bf16 / fp16 [M, K]; weight is float8_e4m3fn [N, K] with one per-tensor "
-        "fp32 scale, dequantized inside the kernel."
-    ),
-    axes={
-        "M": Var(),
-        "N": Const(),
-        "K": Const(),
-        "scalar": Var(description="weight_scale tensor length (1)."),
-    },
-    inputs={
-        "act": Tensor(["M", "K"]),
-        "weight": Tensor(
-            ["N", "K"],
-            dtype="float8_e4m3fn",
-            description="FP8 e4m3 weight in torch.nn.Linear layout [N, K].",
+def _w8a16_act_dims(act_ndim: int):
+    """Leading dimension names of an ``(..., K)`` activation of ``act_ndim``
+    dimensions: none for a vector, ``M`` for a matrix, ``batch`` / ``seq_len``
+    for the usual 3-D hidden state, ``lead<i>`` beyond that."""
+    if act_ndim <= 1:
+        return []
+    if act_ndim == 2:
+        return ["M"]
+    if act_ndim == 3:
+        return ["batch", "seq_len"]
+    return [f"lead{i}" for i in range(act_ndim - 1)]
+
+
+@functools.lru_cache(maxsize=None)
+def _w8a16_fp8_gemm_trace(act_ndim: int, scale_ndim: int) -> TraceTemplate:
+    """The template for an ``act`` of ``act_ndim`` dimensions and a
+    ``weight_scale`` of ``scale_ndim`` (0 or 1) dimensions: the API accepts any
+    leading shape on ``act`` and a ``()`` or ``(1,)`` scale, and the trace names
+    the ranks it actually saw.  ``K`` is read off ``act``'s last dimension."""
+    lead = _w8a16_act_dims(act_ndim)
+    axes = {name: Var() for name in lead}
+    axes["N"] = Const()
+    axes["K"] = Const(extract=lambda kw: int(kw["act"].shape[-1]))
+    scale_dims = []
+    scale_desc = "Per-tensor dequant scale, a 0-d fp32 tensor."
+    if scale_ndim == 1:
+        axes["scalar"] = Var(description="weight_scale tensor length (1).")
+        scale_dims = ["scalar"]
+        scale_desc = "Per-tensor dequant scale, shape (1,)."
+    common = act_ndim == 2 and scale_ndim == 1
+    name_prefix = "w8a16_fp8_gemm"
+    if not common:
+        name_prefix += f"_act{act_ndim}d" + ("_scale0d" if scale_ndim == 0 else "")
+    return TraceTemplate(
+        op_type="gemm_w8a16_fp8",
+        name_prefix=name_prefix,
+        description=(
+            "W8A16 GEMM: out = act @ (weight * weight_scale).T + bias. act is "
+            "bf16 / fp16 (..., K); weight is float8_e4m3fn [N, K] with one "
+            "per-tensor fp32 scale, dequantized inside the kernel."
         ),
-        "weight_scale": Tensor(
-            ["scalar"], dtype="float32", description="Per-tensor dequant scale."
-        ),
-        "bias": Tensor(["N"], optional=True, description="Bias in act's dtype."),
-    },
-    outputs={
-        "out": Tensor(["M", "N"], dtype_from="act"),
-    },
-    tags=["status:verified", "quantization:float8_e4m3fn"],
-    reference=_w8a16_fp8_gemm_reference,
-    check=_gemm_check,
-    init=_w8a16_fp8_gemm_init,
-)
+        axes=axes,
+        inputs={
+            "act": Tensor(lead + ["K"]),
+            "weight": Tensor(
+                ["N", "K"],
+                dtype="float8_e4m3fn",
+                description="FP8 e4m3 weight in torch.nn.Linear layout [N, K].",
+            ),
+            "weight_scale": Tensor(scale_dims, dtype="float32", description=scale_desc),
+            "bias": Tensor(["N"], optional=True, description="Bias in act's dtype."),
+        },
+        outputs={
+            "out": Tensor(lead + ["N"], dtype_from="act"),
+        },
+        tags=["status:verified", "quantization:float8_e4m3fn"],
+        reference=_w8a16_fp8_gemm_reference,
+        check=_gemm_check,
+        init=_w8a16_fp8_gemm_init if common else None,
+    )
+
+
+w8a16_fp8_gemm_trace = _w8a16_fp8_gemm_trace(2, 1)
+
+
+def w8a16_fp8_gemm_trace_dispatch(**kwargs):
+    """Return the ``w8a16_fp8_gemm`` TraceTemplate matching the call's ranks.
+    Pass as ``trace=w8a16_fp8_gemm_trace_dispatch`` to ``@flashinfer_api``."""
+    act = kwargs.get("act")
+    scale = kwargs.get("weight_scale")
+    act_ndim = act.ndim if act is not None else 2
+    scale_ndim = min(scale.ndim, 1) if scale is not None else 1
+    return _w8a16_fp8_gemm_trace(act_ndim, scale_ndim)
+
+
+# Registered for the consistency tests (the generic sample builder cannot form a
+# 0-d input, so the scale0d variants are covered by tests/trace/test_w8a16_fp8_gemm_trace.py).
+w8a16_fp8_gemm_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    w8a16_fp8_gemm_trace,
+    _w8a16_fp8_gemm_trace(1, 1),
+    _w8a16_fp8_gemm_trace(3, 1),
+]

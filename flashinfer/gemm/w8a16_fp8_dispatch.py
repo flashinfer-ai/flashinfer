@@ -252,7 +252,16 @@ def _dtype_tag(dtype: torch.dtype) -> str:
     return "bf16" if dtype == torch.bfloat16 else "fp16"
 
 
+def _target(device: torch.device) -> Tuple[int, int]:
+    """The compile target of ``device`` as its (major, minor) capability: part of
+    every in-process cache key, as the arch is of the on-disk module name, so a
+    process driving two different GPUs (sm_100a and sm_103a, say) never hands one
+    device a kernel built for the other."""
+    return get_compute_capability(device)
+
+
 def _get_sm100_kernel(
+    target: Tuple[int, int],
     algo: int,
     act_dtype: torch.dtype,
     has_bias: bool,
@@ -277,6 +286,8 @@ def _get_sm100_kernel(
     # is one k-tile (no pipelining to overlap), 32 otherwise (as the W4A16 kernel).
     transform_fragment_size = 128 if k == mma_tiler[2] else 32
     key = (
+        "sm100",
+        target,
         algo,
         act_dtype,
         has_bias,
@@ -328,7 +339,12 @@ def _get_sm100_kernel(
 
 
 def _get_reduce_kernel(
-    act_dtype: torch.dtype, has_bias: bool, splits: int, pointer_specs: Tuple, stream
+    target: Tuple[int, int],
+    act_dtype: torch.dtype,
+    has_bias: bool,
+    splits: int,
+    pointer_specs: Tuple,
+    stream,
 ):
     """The split-K reduce (sum of slices, scale, bias, cast), compiled once per
     activation dtype, bias presence and slice count."""
@@ -336,7 +352,7 @@ def _get_reduce_kernel(
 
     from .kernels.cute_dsl.w8a16_fp8_splitk_reduce import W8A16SplitKReduce
 
-    key = ("reduce", act_dtype, has_bias, splits)
+    key = ("reduce", target, act_dtype, has_bias, splits)
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
         return compiled
@@ -360,11 +376,14 @@ def _get_reduce_kernel(
 _PLAN_CACHE: Dict[Tuple, Tuple] = {}
 
 
-def _sm100_plan(algo: int, m: int, n: int, k: int, num_sms: int) -> Tuple:
+def _sm100_plan(
+    algo: int, m: int, n: int, k: int, num_sms: int, target: Tuple[int, int]
+) -> Tuple:
     """(algo, splits, swizzle, raster_along_m, max active clusters) of a Blackwell
-    call.  A pure function of the shape, cached: the cost model is most of the host
-    cost of a call otherwise."""
-    key = ("sm100", algo, m, n, k, num_sms)
+    call.  A pure function of the shape and the device, cached: the cost model is
+    most of the host cost of a call otherwise.  The occupancy query reads the
+    current CUDA device, so the caller runs this under ``target``'s device."""
+    key = ("sm100", target, algo, m, n, k, num_sms)
     plan = _PLAN_CACHE.get(key)
     if plan is not None:
         return plan
@@ -411,7 +430,10 @@ def w8a16_fp8_gemm_workspace_bytes(
         )
         tile_w, tile_a = _SM90_TILES[tile_algo]
         return tail_tiles * tail_splits * tile_a * tile_w * 4
-    _algo, splits, _swizzle, _raster, _clusters = _sm100_plan(algo, m, n, k, num_sms)
+    with torch.cuda.device(device):
+        _algo, splits, _swizzle, _raster, _clusters = _sm100_plan(
+            algo, m, n, k, num_sms, _target(device)
+        )
     return splits * m * n * 4 if splits > 1 else 0
 
 
@@ -432,14 +454,33 @@ def launch_w8a16_fp8_gemm(
     architecture's table (0 = the model's choice).  ``workspace``: a buffer of at
     least :func:`w8a16_fp8_gemm_workspace_bytes` bytes, or None to allocate when
     needed."""
+    # The DSL resolves its compile target and the occupancy query reads the
+    # current CUDA device: run the call under act's device, which need not be the
+    # current one.
+    with torch.cuda.device(act.device):
+        if _target(act.device)[0] == 9:
+            _w8a16_fp8_gemm_sm90(act, weight, weight_scale, bias, out, algo, workspace)
+        else:
+            _w8a16_fp8_gemm_sm100(act, weight, weight_scale, bias, out, algo, workspace)
+
+
+def _w8a16_fp8_gemm_sm100(
+    act: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: torch.Tensor,
+    algo: int,
+    workspace: Optional[torch.Tensor],
+) -> None:
+    """The Blackwell path of ``launch_w8a16_fp8_gemm`` (inputs already validated,
+    act's device current)."""
     import cutlass
 
     m, k = act.shape
     n = weight.shape[0]
-    if get_compute_capability(act.device)[0] == 9:
-        _w8a16_fp8_gemm_sm90(act, weight, weight_scale, bias, out, algo, workspace)
-        return
-    plan = _sm100_plan(algo, m, n, k, get_device_sm_count(act.device))
+    target = _target(act.device)
+    plan = _sm100_plan(algo, m, n, k, get_device_sm_count(act.device), target)
     algo, splits, swizzle_size, raster_along_m, max_active_clusters = plan
     # Split-K: the 256x128 tile over `splits` K-slices writing fp32 partials, then
     # the reduce.  The GEMM's `out` is then the partials buffer and the kernel does
@@ -463,6 +504,7 @@ def launch_w8a16_fp8_gemm(
     )
     stream = _raw_stream(act.device)
     compiled = _get_sm100_kernel(
+        target,
         algo,
         act.dtype,
         has_bias,
@@ -495,7 +537,9 @@ def launch_w8a16_fp8_gemm(
             (bias_ctype, bias_tensor.data_ptr(), 16),
             (act_ctype, out.data_ptr(), 16),
         )
-        reduce = _get_reduce_kernel(act.dtype, has_bias, splits, reduce_specs, stream)
+        reduce = _get_reduce_kernel(
+            target, act.dtype, has_bias, splits, reduce_specs, stream
+        )
         reduce(
             partials.data_ptr(),
             weight_scale.data_ptr(),
@@ -684,6 +728,7 @@ def sm90_pick_group(m: int, n: int, k: int, tile_w: int) -> int:
 
 
 def _get_sm90_kernel(
+    target: Tuple[int, int],
     tile_algo: int,
     act_dtype: torch.dtype,
     has_bias: bool,
@@ -701,7 +746,16 @@ def _get_sm90_kernel(
 
     from .kernels.cute_dsl.w8a16_fp8_gemm_sm90 import Sm90W8A16Fp8GemmKernel
 
-    key = ("sm90", tile_algo, act_dtype, has_bias, group, num_persistent, has_tail)
+    key = (
+        "sm90",
+        target,
+        tile_algo,
+        act_dtype,
+        has_bias,
+        group,
+        num_persistent,
+        has_tail,
+    )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is not None:
         return compiled
@@ -832,11 +886,13 @@ def _w8a16_fp8_gemm_sm90(
     algo: int,
     workspace: Optional[torch.Tensor],
 ) -> None:
-    """The Hopper path of ``launch_w8a16_fp8_gemm`` (inputs already validated)."""
+    """The Hopper path of ``launch_w8a16_fp8_gemm`` (inputs already validated,
+    act's device current)."""
     import cutlass
 
     m, k = act.shape
     n = weight.shape[0]
+    target = _target(act.device)
     num_sms = get_device_sm_count(act.device)
     tile_algo, body_items, tail_splits, tail_tiles, group = _sm90_plan(
         algo, m, n, k, num_sms
@@ -865,6 +921,7 @@ def _w8a16_fp8_gemm_sm90(
     )
     stream = _raw_stream(act.device)
     compiled = _get_sm90_kernel(
+        target,
         tile_algo,
         act.dtype,
         has_bias,

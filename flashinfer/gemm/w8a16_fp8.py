@@ -20,7 +20,7 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
-from ..trace.templates.gemm import w8a16_fp8_gemm_trace
+from ..trace.templates.gemm import w8a16_fp8_gemm_trace_dispatch
 from ..utils import (
     backend_requirement,
     get_compute_capability,
@@ -276,7 +276,7 @@ def _w8a16_fp8_gemm_check(
 
 
 @backend_requirement({}, common_check=_w8a16_fp8_gemm_check)
-@flashinfer_api(trace=w8a16_fp8_gemm_trace)
+@flashinfer_api(trace=w8a16_fp8_gemm_trace_dispatch)
 def w8a16_fp8_gemm(
     act: torch.Tensor,
     weight: torch.Tensor,
