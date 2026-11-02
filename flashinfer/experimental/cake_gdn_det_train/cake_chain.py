@@ -59,7 +59,8 @@ records' ``select`` tables.
 
 Where the ``dhu_tc2`` adjoint scan feeds ``tail_g2_bf16`` on one stream and
 takes at most half the SMs, or on ``sm_100a`` is the pass 2 of a split plan
-with more CTAs than SMs, the backward runs them as the wavefront pair
+with more CTAs than SMs on a call of enough tokens x value heads, the backward
+runs them as the wavefront pair
 ``dhu_tc2_wavefront`` / ``tail_g2_bf16_wavefront`` (:func:`wavefront_engaged`,
 :func:`wavefront_split_engaged`): the tail of a chunk starts once the scan has
 stored it, counted per tile in a workspace; the same math and the same bits.
@@ -1450,15 +1451,20 @@ def _side_stream(device_index: int, main: torch.cuda.Stream) -> torch.cuda.Strea
 # adjoint scan on ``dhu_tc2`` on the caller's stream (no two-stream groups) beside the ``tail_g2_bf16`` tail.
 # On an architecture of ``WAVEFRONT_SPLIT_ARCHS`` the pass 2 of a split plan (the pre-scan and the stitch, then
 # ``dhu_tc2`` from the stitched states) whose ``segments x HV`` CTAs outnumber the SMs runs the pair at any value-head
-# count (:func:`wavefront_split_engaged`): its GPU work hides the pair's host cost, the pre-scan and the stitch run on
-# the caller's stream before the fork, and the entry count reaches ``segments x HV`` only once the last CTA of the
-# second round has started, after the first round has given back the SMs it needs, so again the waiting tail never
-# holds an SM a scan CTA still needs.
+# count once the call's ``tokens x HV`` reach ``WAVEFRONT_SPLIT_MIN_TOKEN_HEADS`` (:func:`wavefront_split_engaged`):
+# its GPU work then hides the pair's host cost, the pre-scan and the stitch run on the caller's stream before the
+# fork, and the entry count reaches ``segments x HV`` only once the last CTA of the second round has started, after
+# the first round has given back the SMs it needs, so again the waiting tail never holds an SM a scan CTA still needs.
 WAVEFRONT_ARCHS = ("sm_100a", "sm_103a")
 # sm_100a: the host path of a call with fewer value heads outlasts its GPU work, so the pair's host cost is not hidden
 WAVEFRONT_MIN_V_HEADS = {"sm_100a": 32}
-# the split pass 2 of more CTAs than SMs: the pair at any value-head count
+# the split pass 2 of more CTAs than SMs: the pair at any value-head count, on a call of enough work
 WAVEFRONT_SPLIT_ARCHS = ("sm_100a",)
+# the split side's work floor, total tokens x value heads (393216): the pair's wait form adds host time to every
+# backward (its counter workspace and reset, the fork and join events, the stream wait; about 75-115 us on B200),
+# and below this much work the call is host-bound (its host path outlasts its GPU work, as 16384 tokens at 16 value
+# heads), so the host cost is not hidden and the call slows down although the pair shortens its GPU span
+WAVEFRONT_SPLIT_MIN_TOKEN_HEADS = 3 * 2**17
 _WAVEFRONT_EVENTS: dict[tuple[int, int], tuple[torch.cuda.Event, torch.cuda.Event]] = {}
 
 
@@ -1467,10 +1473,16 @@ def wavefront_engaged(num_segments: int, num_v_heads: int, sm_count: int) -> boo
     return 2 * int(num_segments) * int(num_v_heads) <= int(sm_count)
 
 
-def wavefront_split_engaged(num_segments: int, num_v_heads: int, sm_count: int) -> bool:
+def wavefront_split_engaged(
+    num_segments: int, num_v_heads: int, sm_count: int, num_tokens: int
+) -> bool:
     """The rule's split side: the split pass 2's ``segments x HV`` CTAs outnumber the ``sm_count`` SMs (two
-    rounds)."""
-    return int(num_segments) * int(num_v_heads) > int(sm_count)
+    rounds), and the call's ``num_tokens x HV`` reach ``WAVEFRONT_SPLIT_MIN_TOKEN_HEADS`` (GPU work enough to hide
+    the pair's host cost)."""
+    return (
+        int(num_segments) * int(num_v_heads) > int(sm_count)
+        and int(num_tokens) * int(num_v_heads) >= WAVEFRONT_SPLIT_MIN_TOKEN_HEADS
+    )
 
 
 def wavefront_order(seg_chunk_start) -> list[int]:
@@ -1489,7 +1501,8 @@ def wavefront_order(seg_chunk_start) -> list[int]:
 def _wavefront_table(meta: ChunkMeta, num_v_heads: int, device_index: int) -> bool:
     """The table's side of the wavefront rule: a host-built table on an architecture of ``WAVEFRONT_ARCHS`` with the
     pair's records, and either at least ``WAVEFRONT_MIN_V_HEADS`` value heads and an adjoint scan of at most half the
-    SMs, or on an architecture of ``WAVEFRONT_SPLIT_ARCHS`` a split adjoint plan of more pass-2 CTAs than SMs."""
+    SMs, or on an architecture of ``WAVEFRONT_SPLIT_ARCHS`` a split adjoint plan of more pass-2 CTAs than SMs and at
+    least ``WAVEFRONT_SPLIT_MIN_TOKEN_HEADS`` tokens x value heads."""
     if meta.seq_lens is None:
         return False
     arch = cake_backend.device_arch(device_index)
@@ -1506,7 +1519,9 @@ def _wavefront_table(meta: ChunkMeta, num_v_heads: int, device_index: int) -> bo
         arch in WAVEFRONT_SPLIT_ARCHS
         and segs.segment_len > 0
         and segs.num_segments > meta.num_seqs
-        and wavefront_split_engaged(segs.num_segments, num_v_heads, sm_count)
+        and wavefront_split_engaged(
+            segs.num_segments, num_v_heads, sm_count, sum(meta.seq_lens)
+        )
     ):
         return True
     if num_v_heads < WAVEFRONT_MIN_V_HEADS.get(arch, 0):

@@ -38,9 +38,9 @@ rejected input raises before the first launch, a host tensor at the low-level en
 check, and the device route does not synchronize.  The wavefront pair (``dhu_tc2_wavefront`` / ``tail_g2_bf16_wavefront``): its chunk
 order and its rule per architecture without a device; on a device the pair against the separate launches with the
 adjoint workspaces poisoned (serial, with an empty sequence, and a split pass 2), repeated calls, the shipped rule on
-the device's architecture (serial plans and split pass 2s), the rows the rule leaves alone launching exactly what the
-rule turned off launches, a CUDA graph capture (the separate launches), accumulated gradients, strided views and a
-checkpointed call.  The
+the device's architecture (serial plans, and split pass 2s below and above the split side's work floor), the rows the
+rule leaves alone launching exactly what the rule turned off launches, a CUDA graph capture (the separate launches),
+accumulated gradients, strided views and a checkpointed call.  The
 training-loop contracts: the head pairs (16, 48), (8, 24),
 (4, 12), (16, 32) and (8, 16) on their fused tails (the groups of three also with the split pass 2 on two streams
 and the serial adjoint scan on one),
@@ -1309,12 +1309,13 @@ def test_split_pass2_two_streams_match_one_stream(
         runs[form] = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, lpt=lpt,
                           **{**SPLIT_STREAM_PINS, **pins})  # fmt: skip
         # beside tail_g2_bf16 the tcgen05 pass 2 of more CTAs than the SMs the planner sees runs as the wavefront pair
-        # on the architectures of the rule's split side (the same launches in another form, the tail on the side
-        # stream)
+        # on the architectures of the rule's split side on a call of enough tokens x value heads (the same launches
+        # in another form, the tail on the side stream); this layout stays below the work floor
         pair = (
             form != "reg"
             and tail == "tail_g2_bf16"
             and arch in cake_chain.WAVEFRONT_SPLIT_ARCHS
+            and sum(seq_lens) * heads[1] >= cake_chain.WAVEFRONT_SPLIT_MIN_TOKEN_HEADS
         )
         stages = stage_lists[form] = [
             stage.removesuffix("_wavefront") for stage, _stream in launches[start:]
@@ -1721,15 +1722,21 @@ def test_wavefront_order_follows_the_scan() -> None:
 
 # (sequences, HV, adjoint segment chunks) -> whether the table's side of the rule holds on (sm_100a 148 SMs, sm_103a
 # 152, sm_107a 212 / 216): 2 x segments x HV <= SMs, and on sm_100a HV >= 32; on sm_100a also a split adjoint plan of
-# more than SMs pass-2 CTAs (segments x HV) at any HV; never on sm_107a (not in WAVEFRONT_ARCHS)
+# more than SMs pass-2 CTAs (segments x HV) at any HV with tokens x HV >= 3 x 2^17; never on sm_107a (not in
+# WAVEFRONT_ARCHS)
 WAVEFRONT_TABLE_ROWS = {
     "r01_4x4096_hv16": ((4096,) * 4, 16, 0, (False, True, False, False)),
     "r07_1x16384_hv16": ((16384,), 16, 0, (False, True, False, False)),
     "r10_1x16384_hv32": ((16384,), 32, 0, (True, True, False, False)),
     "r03_8x4096_hv16": ((4096,) * 8, 16, 0, (False, False, False, False)),
     "3x4096_hv32": ((4096,) * 3, 32, 0, (False, False, False, False)),
-    # split: 13 segments x HV 16 = 208 pass-2 CTAs
+    # split: 13 segments x HV 16 = 208 pass-2 CTAs, 30100 tokens x 16 = 481600 (above the work floor)
     "r04_7x4.3k_hv16_split46": ((4199, 2781, 4282, 4448, 4723, 5804, 3863), 16, 46, (True, False, False, False)),
+    # split: 13 x 16 = 208 CTAs, 12750 tokens x 16 = 204000 (below the work floor: host-bound)
+    "r02_3x4.25k_hv16_split17": ((5406, 3448, 3896), 16, 17, (False, False, False, False)),
+    # split: 12 x 32 = 384 CTAs at the work floor (12288 x 32) and one chunk below it (12224 x 32)
+    "1x12288_hv32_split16": ((12288,), 32, 16, (True, False, False, False)),
+    "1x12224_hv32_split16": ((12224,), 32, 16, (False, False, False, False)),
     # split: 4 x 16 = 64 CTAs (sm_100a: below the SMs and HV < 32)
     "1x16384_hv16_split64": ((16384,), 16, 64, (False, True, False, False)),
     # split: 8 x 32 = 256 CTAs
@@ -1750,12 +1757,16 @@ def test_wavefront_rule_per_architecture(row, monkeypatch) -> None:
     assert cake_chain.WAVEFRONT_ARCHS == ("sm_100a", "sm_103a")
     assert cake_chain.WAVEFRONT_MIN_V_HEADS == {"sm_100a": 32}
     assert cake_chain.WAVEFRONT_SPLIT_ARCHS == ("sm_100a",)
+    assert cake_chain.WAVEFRONT_SPLIT_MIN_TOKEN_HEADS == 393216
     assert cake_chain.wavefront_engaged(4, 8, 148)
     assert not cake_chain.wavefront_engaged(10, 8, 148)
     assert not cake_chain.wavefront_engaged(38, 2, 148)
-    assert cake_chain.wavefront_split_engaged(13, 16, 148)
-    assert not cake_chain.wavefront_split_engaged(37, 4, 148)
-    assert not cake_chain.wavefront_split_engaged(4, 16, 148)
+    assert cake_chain.wavefront_split_engaged(13, 16, 148, 30100)
+    assert cake_chain.wavefront_split_engaged(12, 32, 148, 12288)
+    assert not cake_chain.wavefront_split_engaged(12, 32, 148, 12287)
+    assert not cake_chain.wavefront_split_engaged(13, 16, 148, 12750)
+    assert not cake_chain.wavefront_split_engaged(37, 4, 148, 1 << 20)
+    assert not cake_chain.wavefront_split_engaged(4, 16, 148, 1 << 20)
     seq_lens, num_v_heads, segment_chunks, want = WAVEFRONT_TABLE_ROWS[row]
     plans = (
         cake_chain.ScanPlan((32, 2), 0),
@@ -1853,14 +1864,16 @@ def test_wavefront_pair_repeats_bitwise(device, monkeypatch) -> None:
 # (layout, heads, pins, architectures that engage): the shipped rule on the device's architecture.  A serial plan on
 # dhu_tc2: HV 4 engages on sm_103a, not on sm_100a (HV < 32); HV 32 over two sequences (128 scan CTAs) engages on
 # sm_100a and sm_103a.  A split (64, 1) plan with its pass 2 on dhu_tc2 (24 + 2 + 10 chunks in segments of 4 = 10
-# segments): HV 4 (40 CTAs, below the SMs) engages on sm_103a only; HV 32 (320 CTAs, more than the SMs) on sm_100a
-# only.  sm_107a never
+# segments): HV 4 (40 CTAs, below the SMs) engages on sm_103a only; HV 32 (320 CTAs, more than the SMs) nowhere, as
+# 2217 tokens x 32 stay below the split side's work floor; over 94 + 2 + 100 chunks (50 segments, 1600 CTAs; 12477
+# tokens x 32, above the floor) on sm_100a only.  sm_107a never
 WAVEFRONT_SPLIT_PINS = {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"}
 WAVEFRONT_DEFAULT_ROWS = {
     "hv4": ((300, 77, 640), (2, 4), WAVEFRONT_PINS, ("sm_103a",)),
     "hv32": ((300, 640), (16, 32), WAVEFRONT_PINS, ("sm_100a", "sm_103a")),
     "split-hv4": ((1500, 77, 640), (2, 4), WAVEFRONT_SPLIT_PINS, ("sm_103a",)),
-    "split-hv32": ((1500, 77, 640), (16, 32), WAVEFRONT_SPLIT_PINS, ("sm_100a",)),
+    "split-hv32-small": ((1500, 77, 640), (16, 32), WAVEFRONT_SPLIT_PINS, ()),
+    "split-hv32": ((6000, 77, 6400), (16, 32), WAVEFRONT_SPLIT_PINS, ("sm_100a",)),
 }
 
 
