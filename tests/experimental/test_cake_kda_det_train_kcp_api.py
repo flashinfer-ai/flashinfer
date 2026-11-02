@@ -353,3 +353,48 @@ def test_public_module_forwards_the_raw_gate(monkeypatch: pytest.MonkeyPatch) ->
         kda_train.kcp_reduce_gate_param_grads is kcp_api.reduce_gate_param_grads_det_kcp
     )
     assert "kcp_reduce_gate_param_grads" in kda_train.__all__
+
+
+def test_public_module_forwards_the_qk_l2norm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The in-kernel Q / K L2 norm on the public module (issue #7817): ``use_qk_l2norm_in_kernel`` is a keyword-only
+    ``bool = False`` of the three KCP wrappers and the workspace / saved byte queries, and each forwards it to the
+    KCP module unchanged.  Device-free (recorders)."""
+    from flashinfer.experimental.cake_kda_det_train_kcp import cake_kcp, cake_kcp_plan
+
+    for name in (
+        "chunk_kda_det_fwd_kcp",
+        "chunk_kda_det_bwd_kcp",
+        "chunk_kda_det_kcp",
+        "kda_det_workspace_bytes_kcp",
+        "kda_det_saved_bytes_kcp",
+    ):
+        p = inspect.signature(getattr(kcp_api, name)).parameters[
+            "use_qk_l2norm_in_kernel"
+        ]
+        assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is False, name
+    calls = []
+
+    def recorder(name):
+        def fake(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return name
+
+        return fake
+
+    monkeypatch.setattr(cake_kcp, "chunk_kda_det_fwd_kcp", recorder("fwd"))
+    monkeypatch.setattr(cake_kcp, "chunk_kda_det_bwd_kcp", recorder("bwd"))
+    monkeypatch.setattr(cake_kcp, "chunk_kda_det_kcp", recorder("autograd"))
+    monkeypatch.setattr(cake_kcp_plan, "kda_det_workspace_bytes_kcp", recorder("ws"))
+    monkeypatch.setattr(cake_kcp_plan, "kda_det_saved_bytes_kcp", recorder("saved"))
+    operands = tuple(object() for _ in range(6))
+    kw = {"use_qk_l2norm_in_kernel": True}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        assert kcp_api.chunk_kda_det_fwd_kcp(*operands, **kw) == "fwd"
+        assert kcp_api.chunk_kda_det_bwd_kcp(*operands, object(), **kw) == "bwd"
+        assert kcp_api.chunk_kda_det_kcp(*operands, **kw) == "autograd"
+        assert kcp_api.kda_det_workspace_bytes_kcp(object(), **kw) == "ws"
+        assert kcp_api.kda_det_saved_bytes_kcp(object(), **kw) == "saved"
+    assert [c[0] for c in calls] == ["fwd", "bwd", "autograd", "ws", "saved"]
+    for name, _, got in calls:
+        assert got["use_qk_l2norm_in_kernel"] is True, name
