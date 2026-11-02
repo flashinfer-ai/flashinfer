@@ -567,6 +567,21 @@ class _PrimsTSScaleTraceTemplate(TraceTemplate):
         # Preserve storage-specific names such as packed NVFP4 decode.
         return self._base.definition_name(axis_values) + self._scale_suffix
 
+    def _build_axis_extractors(self):
+        extractors = super()._build_axis_extractors()
+
+        def global_scale_size(namespace):
+            # TraceApply skips build_fi_trace_fn and forwards this namespace to
+            # the solution: inherit plan operands and normalize scalar tensors.
+            namespace.update(
+                _prims_ts_trace_scale_values(
+                    namespace, self._scale_names, bound=self._bound
+                )
+            )
+            return 1
+
+        return {**extractors, "global_scale_size": global_scale_size}
+
     def build_fi_trace_fn(self, fi_api):
         build = super().build_fi_trace_fn(fi_api)
 
@@ -592,6 +607,17 @@ def _prims_ts_scale_trace(
     values = _prims_ts_trace_scale_values(kwargs, names, bound=bound)
     scale_types = tuple(isinstance(values[name], torch.Tensor) for name in names)
     return _prims_ts_scale_trace_variant(base, names, scale_types, bound=bound)
+
+
+def _prims_ts_scale_trace_templates(
+    bases, *, names=("softmax_scale", "output_scale"), bound=False
+):
+    """Publish the same canonical scale variants returned by the dispatcher."""
+    return [
+        _prims_ts_scale_trace_variant(base, names, scale_types, bound=bound)
+        for base in bases
+        for scale_types in ((False, False), (False, True), (True, False), (True, True))
+    ]
 
 
 def _make_prims_ts_block_sparse_trace(
@@ -765,11 +791,16 @@ def prims_ts_block_sparse_trace_dispatch(**kwargs):
     return _prims_ts_scale_trace(base, kwargs, names=("sm_scale", "output_scale"))
 
 
-prims_ts_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    _prims_ts_sparse_pattern_trace(template, shared, bound=False)
-    for template in _PRIMS_TS_BLOCK_SPARSE_TRACES.values()
-    for shared in (False, True)
-] + [_PRIMS_TS_DENSE_TRACE]
+prims_ts_block_sparse_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    [
+        _prims_ts_sparse_pattern_trace(template, shared, bound=False)
+        for template in _PRIMS_TS_BLOCK_SPARSE_TRACES.values()
+        for shared in (False, True)
+    ]
+    + [_PRIMS_TS_DENSE_TRACE],
+    names=("sm_scale", "output_scale"),
+    bound=False,
+)
 
 
 def _make_prims_ts_paged_block_sparse_trace(
@@ -958,11 +989,15 @@ def prims_ts_paged_block_sparse_trace_dispatch(**kwargs):
     return _prims_ts_scale_trace(base, kwargs, names=("sm_scale", "output_scale"))
 
 
-prims_ts_paged_block_sparse_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    _prims_ts_sparse_pattern_trace(template, shared, bound=False)
-    for template in _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES.values()
-    for shared in (False, True)
-]
+prims_ts_paged_block_sparse_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    [
+        _prims_ts_sparse_pattern_trace(template, shared, bound=False)
+        for template in _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES.values()
+        for shared in (False, True)
+    ],
+    names=("sm_scale", "output_scale"),
+    bound=False,
+)
 
 
 _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES = {
@@ -1021,11 +1056,18 @@ def prims_ts_block_sparse_wrapper_trace_dispatch(**kwargs):
     )
 
 
-prims_ts_block_sparse_wrapper_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    _prims_ts_sparse_pattern_trace(template, shared, bound=True)
-    for template in _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES.values()
-    for shared in (False, True)
-] + [_PRIMS_TS_DENSE_WRAPPER_TRACE]
+prims_ts_block_sparse_wrapper_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    _prims_ts_scale_trace_templates(
+        [
+            _prims_ts_sparse_pattern_trace(template, shared, bound=True)
+            for template in _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACES.values()
+            for shared in (False, True)
+        ]
+        + [_PRIMS_TS_DENSE_WRAPPER_TRACE],
+        names=("sm_scale", "output_scale"),
+        bound=True,
+    )
+)
 
 
 _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES = {
@@ -1051,11 +1093,17 @@ def prims_ts_paged_block_sparse_wrapper_trace_dispatch(**kwargs):
     )
 
 
-prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates = [  # type: ignore[attr-defined]
-    _prims_ts_sparse_pattern_trace(template, shared, bound=True)
-    for template in _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES.values()
-    for shared in (False, True)
-]
+prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    _prims_ts_scale_trace_templates(
+        [
+            _prims_ts_sparse_pattern_trace(template, shared, bound=True)
+            for template in _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES.values()
+            for shared in (False, True)
+        ],
+        names=("sm_scale", "output_scale"),
+        bound=True,
+    )
+)
 
 
 # PrimTS decode schemas. Query storage is part of the public ABI, so fixed SQ1,
@@ -1409,8 +1457,8 @@ def attention_ts_decode_trace_dispatch(**kwargs):
     return _prims_ts_scale_trace(base, kwargs)
 
 
-attention_ts_decode_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _ATTENTION_TS_DECODE_TRACES.values()
+attention_ts_decode_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    _ATTENTION_TS_DECODE_TRACES.values(), bound=False
 )
 
 
@@ -1773,8 +1821,8 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     return _prims_ts_scale_trace(base, kwargs, bound=True)
 
 
-prims_ts_decode_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES.values()
+prims_ts_decode_wrapper_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    _PRIMS_TS_DECODE_WRAPPER_TRACE_EXAMPLES.values(), bound=True
 )
 
 
@@ -1879,8 +1927,8 @@ def prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs):
     return _prims_ts_scale_trace(_PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES[key], kwargs)
 
 
-prims_ts_decode_mla_one_shot_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES.values()
+prims_ts_decode_mla_one_shot_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES.values(), bound=False
 )
 
 
@@ -2130,8 +2178,8 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
     return _prims_ts_scale_trace(base, kwargs, bound=True)
 
 
-prims_ts_decode_mla_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
-    _PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES.values()
+prims_ts_decode_mla_wrapper_trace_dispatch.templates = _prims_ts_scale_trace_templates(  # type: ignore[attr-defined]
+    _PRIMS_TS_DECODE_MLA_WRAPPER_TRACE_EXAMPLES.values(), bound=True
 )
 
 # ── GQA paged prefill ────────────────────────────────────────────────────────

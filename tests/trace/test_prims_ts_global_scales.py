@@ -15,6 +15,7 @@
 """CPU contracts for scale schemas; meta scales cannot be read back as scalars."""
 
 from types import SimpleNamespace
+import inspect
 
 import pytest
 import torch
@@ -34,6 +35,8 @@ from flashinfer.attention.prims_ts.mla_decode import (
     batch_mla_decode_with_paged_kv_cache,
 )
 from flashinfer.fi_trace import fi_trace
+from flashinfer.api_logging import _TRACE_DISPATCHERS, _TRACE_REGISTRY
+from flashinfer.trace.templates.attention import _prims_ts_scale_trace_variant
 
 
 def _trace_case(family, bound, scales):
@@ -87,11 +90,25 @@ def _trace_case(family, bound, scales):
             kv = torch.empty(2, 32, 2, 128, dtype=q.dtype)
             kwargs = dict(q=q, k=kv, v=kv)
             if not bound:
-                kwargs["use_block_sparse"] = False
+                kwargs.update(
+                    use_block_sparse=False,
+                    block_indptr=None,
+                    block_indices=None,
+                    q_block_size=2,
+                    kv_block_size=32,
+                )
         else:
             api = block_sparse_attention_with_paged_kv_cache
             wrapper = BlockSparsePagedTSWrapper()
             kwargs = dict(q=q, paged_kv_cache=(k, k), **common)
+            kwargs.update(
+                block_indptr=torch.arange(5, dtype=torch.int32)
+                .unfold(0, 2, 1)
+                .reshape(2, 2, 2),
+                block_indices=torch.zeros(4, dtype=torch.int32),
+            )
+            if not bound:
+                kwargs.update(q_block_size=2, kv_block_size=32, max_seq_len_kv=32)
         names = ("sm_scale", "output_scale")
     if family in ("decode", "mla"):
         names = ("softmax_scale", "output_scale")
@@ -172,3 +189,48 @@ def test_prims_ts_scalar_tensor_trace(bound):
     assert definition["inputs"][names[0]]["shape"] == ["global_scale_size"]
     assert definition["axes"]["global_scale_size"]["value"] == 1
     assert definition == fi_trace(api, **{**kwargs, names[0]: scalar.view(1)})
+
+
+@pytest.mark.parametrize(
+    "family", ["decode", "mla", "block_sparse", "paged_block_sparse"]
+)
+@pytest.mark.parametrize("bound", [False, True])
+def test_prims_ts_scale_variants_are_registered(family, bound):
+    api, _, names = _trace_case(family, bound, (0.25, 1.0))
+    original = inspect.unwrap(api)
+    if inspect.ismethod(original):
+        original = original.__func__
+    dispatch = _TRACE_DISPATCHERS[original]
+    templates = dispatch.templates
+    registered = [template for func, template, _ in _TRACE_REGISTRY if func is original]
+    assert len(templates) == len({id(template) for template in templates})
+    assert len(templates) == len({template.name_prefix for template in templates})
+    assert [id(template) for template in registered] == [
+        id(template) for template in templates
+    ]
+    bases = [
+        template for template in templates if "_scales_" not in template.name_prefix
+    ]
+    assert len(templates) == 4 * len(bases)
+    for base in bases:
+        assert (
+            _prims_ts_scale_trace_variant(base, names, (False, False), bound=bound)
+            is base
+        )
+        for kinds in ((False, True), (True, False), (True, True)):
+            variant = _prims_ts_scale_trace_variant(base, names, kinds, bound=bound)
+            assert any(template is variant for template in templates)
+    for kinds in ((False, False), (False, True), (True, False), (True, True)):
+        scales = tuple(
+            torch.empty((), device="meta") if tensor else 0.25 for tensor in kinds
+        )
+        api, kwargs, _ = _trace_case(family, bound, scales)
+        if bound:
+            kwargs["self"] = api.__self__
+        selected = dispatch(**kwargs)
+        if bound and family in ("decode", "mla"):
+            # These wrappers deliberately synthesize plan-specific schemas;
+            # TraceApply must continue falling back for dynamic identities.
+            assert all(template is not selected for template in templates)
+        else:
+            assert any(template is selected for template in templates)

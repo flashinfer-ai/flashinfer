@@ -14,6 +14,8 @@ Two layers, one file:
 
 from __future__ import annotations
 
+import importlib
+
 import pytest
 import torch
 
@@ -532,6 +534,76 @@ def test_enable_apply_dispatches_to_callable():
 
     assert ta.stats().get(FI_API, {}).get("hit", 0) >= 1
     assert calls  # the solution actually executed
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "family,bound",
+    [
+        ("decode", False),
+        ("mla", False),
+        ("block_sparse", False),
+        ("paged_block_sparse", False),
+        ("block_sparse", True),
+        ("paged_block_sparse", True),
+    ],
+)
+@pytest.mark.parametrize("scale_types", [(False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("scalar_tensor", [False, True])
+def test_prims_ts_device_scale_routes(family, bound, scale_types, scalar_tensor):
+    from tests.trace.test_prims_ts_global_scales import _trace_case
+
+    def make_scales(scalar, host_value):
+        return tuple(
+            torch.empty(() if scalar else (1,), device="meta", dtype=torch.float32)
+            if tensor
+            else host_value
+            for tensor in scale_types
+        )
+
+    scales = make_scales(scalar_tensor, 0.25)
+    api, kwargs, names = _trace_case(family, bound, scales)
+    definition = flashinfer.fi_trace(api, **kwargs)
+    calls = []
+    query = kwargs.get("q", kwargs.get("query"))
+    expected_output = torch.full_like(query, SENTINEL)
+
+    def solution(**inputs):
+        calls.append(inputs)
+        return expected_output
+
+    ta.enable_apply({definition["name"]: solution})
+    # Resolve the public callable after enable_apply installs the replacement.
+    target = (
+        api.__self__.run
+        if bound
+        else getattr(importlib.import_module(api.__module__), api.__name__)
+    )
+
+    def check_call(arguments, expected_scales):
+        assert target(**arguments) is expected_output
+        received = calls[-1]
+        for name, expected in zip(names, expected_scales, strict=True):
+            actual = received[name]
+            if isinstance(expected, torch.Tensor):
+                # Meta operands cannot be read back. Both accepted input ranks
+                # reach the solution in the traced one-element tensor ABI.
+                assert actual.shape == (1,)
+                assert actual is expected or actual._base is expected
+            else:
+                assert actual == expected
+
+    check_call(kwargs, scales)
+    if bound:
+        overrides = make_scales(not scalar_tensor, 0.75)
+        check_call({**kwargs, **dict(zip(names, overrides, strict=True))}, overrides)
+        check_call(kwargs, scales)
+    fi_api = next(
+        tag.removeprefix("fi_api:")
+        for tag in definition["tags"]
+        if tag.startswith("fi_api:")
+    )
+    assert ta.stats()[fi_api]["hit"] == (3 if bound else 1)
 
 
 @pytest.mark.cpu_only
