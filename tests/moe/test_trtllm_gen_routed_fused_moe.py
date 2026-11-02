@@ -1267,19 +1267,22 @@ def test_trtllm_gen_mxint4_routed_fused_moe(
 
 
 @pytest.mark.parametrize(
-    "activation_type",
+    "activation_type, precision",
     [
-        pytest.param(ActivationType.Swiglu.value, id="Swiglu"),
-        pytest.param(ActivationType.Geglu.value, id="Geglu"),
-        pytest.param(ActivationType.Relu2.value, id="Relu2"),
+        pytest.param(ActivationType.Swiglu.value, "mxfp8", id="Swiglu"),
+        pytest.param(ActivationType.Geglu.value, "mxfp8", id="Geglu"),
+        pytest.param(ActivationType.Relu2.value, "mxfp8", id="Relu2"),
+        pytest.param(ActivationType.ClampedRelu2.value, "mxfp8", id="ClampedRelu2"),
+        pytest.param(ActivationType.ClampedRelu2.value, "bf16", id="ClampedRelu2-bf16"),
     ],
 )
 @pytest.mark.parametrize("routing_format", ["packed", "unpacked_fp32"])
-def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
+def test_trtllm_gen_routed_activation_parity(
     activation_type: int,
+    precision: str,
     routing_format: Literal["packed", "unpacked_fp32"],
 ):
-    """MXFP8 routed path should match non-routed reference for gated and non-gated activations."""
+    """Check activation numerics, routing parity, and live parameters during replay."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
@@ -1320,12 +1323,32 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
         dtype=torch.bfloat16,
     )
 
-    quant_impl = FP8BlockScaleMoe(fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8)
-    quant_weights = quant_impl.quantize_weights(
-        gemm1_weights, gemm2_weights, hidden_states
-    )
-    quant_inputs = quant_impl.quantize_inputs(hidden_states)
-    epilogue_tile_m = 128
+    clamp_limit = None
+    if activation_type == ActivationType.ClampedRelu2.value:
+        # Exact input/weight values isolate activation, per-expert scales, and routing.
+        # Each MXFP8 block holds one value, avoiding cancellation or underflow.
+        values = torch.tensor([-4, 0, 0.5, 1, 2, 4, 8, 32], device=device)
+        hidden_states = (
+            values.repeat_interleave(64).repeat(num_tokens, 1).to(torch.bfloat16)
+        )
+        eye = torch.eye(hidden_size, device=device, dtype=torch.bfloat16)
+        gemm1_weights = (0.5 * eye).repeat(num_experts, 1, 1)
+        gemm2_weights = (0.25 * eye).repeat(num_experts, 1, 1)
+        clamp_limit = (1 + torch.arange(num_experts, device=device) % 4).float()
+
+    if precision == "mxfp8":
+        quant_impl = FP8BlockScaleMoe(
+            fp8_quantization_type=QuantMode.FP8_BLOCK_SCALE_MXFP8
+        )
+        quant_weights = quant_impl.quantize_weights(
+            gemm1_weights, gemm2_weights, hidden_states
+        )
+        quant_inputs = quant_impl.quantize_inputs(hidden_states)
+        epilogue_tile_m = 128
+    else:
+        quant_weights = {"gemm1_weights": gemm1_weights, "gemm2_weights": gemm2_weights}
+        quant_inputs = {"hidden_states": hidden_states}
+        epilogue_tile_m = 128
     w13_rows = (2 if is_gated else 1) * intermediate_size
     gemm1_weights_shuffled = []
     gemm1_scales_shuffled = []
@@ -1333,10 +1356,8 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
     gemm2_scales_shuffled = []
     for i in range(num_experts):
         w1_interleaved = quant_weights["gemm1_weights"][i].clone().reshape(w13_rows, -1)
-        s1_interleaved = quant_weights["gemm1_scales"][i].clone().reshape(w13_rows, -1)
         if is_gated:
             w1_interleaved = reorder_rows_for_gated_act_gemm(w1_interleaved)
-            s1_interleaved = reorder_rows_for_gated_act_gemm(s1_interleaved)
         gemm1_weights_shuffled.append(
             shuffle_matrix_a(w1_interleaved.view(torch.uint8), epilogue_tile_m)
             .contiguous()
@@ -1349,38 +1370,63 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
             .contiguous()
             .view(quant_weights["gemm2_weights"].dtype)
         )
-        gemm1_scales_shuffled.append(
-            shuffle_matrix_sf_a(
-                s1_interleaved.view(torch.uint8).reshape(w13_rows, -1),
-                epilogue_tile_m,
+        if precision == "bf16":
+            gemm1_weights_shuffled[-1] = convert_to_block_layout(
+                gemm1_weights_shuffled[-1].view(torch.uint8), 128
+            ).view(torch.bfloat16)
+            gemm2_weights_shuffled[-1] = convert_to_block_layout(
+                gemm2_weights_shuffled[-1].view(torch.uint8), 128
+            ).view(torch.bfloat16)
+        else:
+            s1_interleaved = (
+                quant_weights["gemm1_scales"][i].clone().reshape(w13_rows, -1)
             )
-            .contiguous()
-            .view(quant_weights["gemm1_scales"].dtype)
-        )
-        gemm2_scales_shuffled.append(
-            shuffle_matrix_sf_a(
-                quant_weights["gemm2_scales"][i]
-                .view(torch.uint8)
-                .reshape(hidden_size, -1),
-                epilogue_tile_m,
+            if is_gated:
+                s1_interleaved = reorder_rows_for_gated_act_gemm(s1_interleaved)
+            gemm1_scales_shuffled.append(
+                shuffle_matrix_sf_a(
+                    s1_interleaved.view(torch.uint8).reshape(w13_rows, -1),
+                    epilogue_tile_m,
+                )
+                .contiguous()
+                .view(quant_weights["gemm1_scales"].dtype)
             )
-            .contiguous()
-            .view(quant_weights["gemm2_scales"].dtype)
-        )
+            gemm2_scales_shuffled.append(
+                shuffle_matrix_sf_a(
+                    quant_weights["gemm2_scales"][i]
+                    .view(torch.uint8)
+                    .reshape(hidden_size, -1),
+                    epilogue_tile_m,
+                )
+                .contiguous()
+                .view(quant_weights["gemm2_scales"].dtype)
+            )
     gemm1_weights_kernel = torch.stack(gemm1_weights_shuffled)
-    gemm1_scales_kernel = torch.stack(gemm1_scales_shuffled)
     gemm2_weights_kernel = torch.stack(gemm2_weights_shuffled)
-    gemm2_scales_kernel = torch.stack(gemm2_scales_shuffled)
 
-    output_ref = trtllm_fp8_block_scale_moe(
+    precision_kwargs = {}
+    if precision == "mxfp8":
+        precision_kwargs = dict(
+            hidden_states_scale=quant_inputs["hidden_states_scale"],
+            gemm1_weights_scale=torch.stack(gemm1_scales_shuffled),
+            gemm2_weights_scale=torch.stack(gemm2_scales_shuffled),
+            fp8_quantization_type=Fp8QuantizationType.MxFp8,
+        )
+    moe_op = trtllm_fp8_block_scale_moe if precision == "mxfp8" else trtllm_bf16_moe
+    routed_op = (
+        trtllm_fp8_block_scale_routed_moe
+        if precision == "mxfp8"
+        else trtllm_bf16_routed_moe
+    )
+    weight_layout = (
+        WeightLayout.MajorK if precision == "mxfp8" else WeightLayout.BlockMajorK
+    )
+    output_ref = moe_op(
         routing_logits=routing_logits,
         routing_bias=None,
         hidden_states=quant_inputs["hidden_states"],
-        hidden_states_scale=quant_inputs["hidden_states_scale"],
         gemm1_weights=gemm1_weights_kernel,
-        gemm1_weights_scale=gemm1_scales_kernel,
         gemm2_weights=gemm2_weights_kernel,
-        gemm2_weights_scale=gemm2_scales_kernel,
         num_experts=num_experts,
         top_k=top_k,
         n_group=None,
@@ -1391,10 +1437,11 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
         routed_scaling_factor=None,
         routing_method_type=routing_method_type.value,
         use_shuffled_weight=True,
-        weight_layout=WeightLayout.MajorK.value,
+        weight_layout=weight_layout.value,
         enable_pdl=enable_pdl,
-        fp8_quantization_type=Fp8QuantizationType.MxFp8,
         activation_type=activation_type,
+        gemm1_clamp_limit=clamp_limit,
+        **precision_kwargs,
     ).to(torch.float)
 
     permute_info, expert_weights_full = routing_reference_renormalize(
@@ -1413,30 +1460,34 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
         else (topk_ids, expert_weights.to(torch.float32))
     )
 
-    output_routed = trtllm_fp8_block_scale_routed_moe(
-        topk_ids=routing_input,
-        routing_bias=None,
-        hidden_states=quant_inputs["hidden_states"],
-        hidden_states_scale=quant_inputs["hidden_states_scale"],
-        gemm1_weights=gemm1_weights_kernel,
-        gemm1_weights_scale=gemm1_scales_kernel,
-        gemm2_weights=gemm2_weights_kernel,
-        gemm2_weights_scale=gemm2_scales_kernel,
-        num_experts=num_experts,
-        top_k=top_k,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=intermediate_size,
-        local_expert_offset=0,
-        local_num_experts=num_experts,
-        routed_scaling_factor=None,
-        routing_method_type=routing_method_type.value,
-        use_shuffled_weight=True,
-        weight_layout=WeightLayout.MajorK.value,
-        enable_pdl=enable_pdl,
-        fp8_quantization_type=Fp8QuantizationType.MxFp8,
-        activation_type=activation_type,
-    ).to(torch.float)
+    def run_routed(**overrides):
+        kwargs = dict(
+            topk_ids=routing_input,
+            hidden_states=quant_inputs["hidden_states"],
+            gemm1_weights=gemm1_weights_kernel,
+            gemm2_weights=gemm2_weights_kernel,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=routing_method_type.value,
+            use_shuffled_weight=True,
+            weight_layout=weight_layout.value,
+            enable_pdl=enable_pdl,
+            activation_type=activation_type,
+            gemm1_clamp_limit=clamp_limit,
+            **precision_kwargs,
+        )
+        if precision == "mxfp8":
+            kwargs["routing_bias"] = None
+        kwargs.update(overrides)
+        return routed_op(**kwargs)
+
+    output_routed = run_routed().float()
 
     close = torch.isclose(output_ref, output_routed, atol=1e-2, rtol=1e-2)
     mismatch_pct = (~close).float().mean().item() * 100
@@ -1444,6 +1495,41 @@ def test_trtllm_gen_fp8_mxfp8_routed_activation_parity(
         f"Mismatch percentage is {mismatch_pct:.2f}%"
         f"{routing_format} mismatch percentage is {mismatch_pct:.2f}%"
     )
+
+    if clamp_limit is not None:
+        with pytest.raises(ValueError, match="requires gemm1_clamp_limit"):
+            run_routed(gemm1_clamp_limit=None)
+        with pytest.raises(ValueError, match="float32"):
+            run_routed(gemm1_clamp_limit=clamp_limit.bfloat16())
+        with pytest.raises(ValueError, match="accepts gemm1_clamp_limit only"):
+            run_routed(gemm1_alpha=clamp_limit)
+        with pytest.raises(Exception, match="shape"):
+            run_routed(gemm1_clamp_limit=clamp_limit[:-1])
+
+        def reference():
+            scales = clamp_limit[topk_ids.long()].unsqueeze(-1)
+            fc1 = hidden_states.float().unsqueeze(1) * 0.5
+            activated = (scales * torch.tanh(fc1.relu() / scales)).square()
+            return (activated * expert_weights.float().unsqueeze(-1)).sum(1) * 0.25
+
+        # Intermediate E4M3 (<= 1/16 relative) or BF16 rounding, plus BF16 output.
+        rtol = 0.07 if precision == "mxfp8" else 0.01
+        torch.testing.assert_close(output_ref, reference(), rtol=rtol, atol=1e-4)
+        torch.testing.assert_close(output_routed, reference(), rtol=rtol, atol=1e-4)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run_routed()
+        for shift in (1, 3):
+            clamp_limit.mul_(0.5)
+            topk_ids.copy_((topk_ids + shift) % num_experts)
+            packed_topk_ids.copy_(
+                (topk_ids << 16) | expert_weights.view(torch.int16).to(torch.int32)
+            )
+            graph.replay()
+            torch.testing.assert_close(
+                captured.float(), reference(), rtol=rtol, atol=1e-4
+            )
+            torch.testing.assert_close(captured, run_routed(), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 32])
