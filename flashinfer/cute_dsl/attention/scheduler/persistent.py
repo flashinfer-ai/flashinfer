@@ -132,9 +132,6 @@ class FmhaStaticTileScheduler:
             (blk_coord[1], blk_coord[2]),
         )
 
-        # FlashInfer-owned type: the nested coordinate does not fit the flat
-        # (m, n, l) form CUTLASS DSL 4.7 Task Scheduling installs on
-        # cutlass.utils.WorkTileInfo.
         return WorkTileInfo(cur_tile_coord, is_valid)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
