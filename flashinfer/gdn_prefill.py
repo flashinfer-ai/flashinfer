@@ -1480,7 +1480,8 @@ def chunk_gated_delta_rule(
     - The final state layout is ``[N, H, V, K]``.
     - Requires SM8x (Ampere), SM90 (Hopper), SM100 (Blackwell), SM110 or SM120.
       SM110 runs the SM100 non-CP and CP CuTe-DSL kernels (not ``cake_gdn``).
-      The SM100 and SM110 path requires CUDA 13 and ``head_size == 128``.
+      The SM100 CuTe-DSL kernels, which SM110 also uses, require CUDA 13 and
+      ``head_size == 128``.
       On SM100/SM103, ``gdn_cp`` supports structurally legal equal-head, GQA,
       and GVA shapes on
       CUDA 12.8, CUDA 12.9, and CUDA 13; SM107 supports the same shapes with
