@@ -71,7 +71,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_kda_det_train_fd4c92787fcc18446b14(int* __restrict__ seq_chunk_start, int* __restrict__ seq_order, int num_seqs, int segments, int proportional, int* __restrict__ seg_table)
+kernel_cake_kda_det_train_1cf34765c0945c104046(int* __restrict__ seq_chunk_start, int* __restrict__ seq_order, int num_seqs, int segments, int proportional, int* __restrict__ seg_table)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -304,7 +304,14 @@ kernel_cake_kda_det_train_fd4c92787fcc18446b14(int* __restrict__ seq_chunk_start
             int du = seq_order[ru];
             int c0u = seq_chunk_start[du];
             int n_u = seq_chunk_start[du + 1] - c0u;
-            seg_table[base + i_1 + ru] = c0u + pu * n_u / segments;
+            int off_u = pu * n_u / segments;
+            int tail_u = n_u / (4 * segments);
+            if (segments >= 2) {
+                if (tail_u >= 1) {
+                    off_u = pu * (n_u - tail_u) / (segments - 1);
+                }
+            }
+            seg_table[base + i_1 + ru] = c0u + off_u;
             if (pu == segments - 1) {
                 seg_table[base + i_1 + ru + 1] = c0u + n_u;
             }
