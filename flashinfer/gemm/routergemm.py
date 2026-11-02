@@ -429,7 +429,7 @@ def mm_M1_16_K7168_N128(
 
 
 @backend_requirement({}, common_check=_mm_M1_16_K7168_N256_shape_checks)
-@flashinfer_api(trace=mm_M1_16_K7168_N256_trace)
+@flashinfer_api(trace=mm_M1_16_K7168_N256_trace, pdl_static=("mat_b",))
 def mm_M1_16_K7168_N256(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
@@ -475,7 +475,7 @@ def mm_M1_16_K7168_N256(
 
 
 @backend_requirement({}, common_check=_mm_M1_16_K6144_N256_shape_checks)
-@flashinfer_api(trace=mm_M1_16_K6144_N256_trace)
+@flashinfer_api(trace=mm_M1_16_K6144_N256_trace, pdl_static=("mat_b",))
 def mm_M1_16_K6144_N256(
     mat_a: torch.Tensor,
     mat_b: torch.Tensor,
@@ -1944,7 +1944,7 @@ def _tinygemm_bf16_cake(
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
-@flashinfer_api(trace=tinygemm_bf16_trace)
+@flashinfer_api(trace=tinygemm_bf16_trace, pdl_static=("weight",))
 def tinygemm_bf16(
     input: torch.Tensor,
     weight: torch.Tensor,
