@@ -9345,6 +9345,24 @@ def test_device_cache_miss_peaks_like_a_hit(glm_weight, memory_mode, objective):
     if memory_mode == "fast":
         kw["num_valid_rows"] = int(inp.valid.sum())  # the opt-in form of "fast"
     cache = opt_in.BINDING_CACHE
+    # A process's first step also allocates memory that no binding owns and that later steps reuse: the int32 count
+    # constant (4 bytes per row, grown to the longest call so far) and the device constant cells.  Run alone, this
+    # test's miss would count them (65536 + 3 x 512 bytes at T = 16384).  A step of the same rows with another
+    # valid-row count (another binding, cleared below) forms them first, so the miss counts only its own binding.
+    warm = make_inputs(
+        16384,
+        objective=objective,
+        seed=SEED + 7547,
+        device=CUDA,
+        W=glm_weight,
+        ignore_frac=0.25,
+    )
+    assert int(warm.valid.sum()) != int(inp.valid.sum())
+    warm_kw = dict(memory_mode=memory_mode)
+    if memory_mode == "fast":
+        warm_kw["num_valid_rows"] = int(warm.valid.sum())
+    _budget_step(warm, 4096, "loss", **warm_kw)
+    del warm
     cache.clear()
     results, peaks, counts = [], [], []
     for _ in range(2):  # a miss, then a hit of the same binding
