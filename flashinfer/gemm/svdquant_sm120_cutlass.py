@@ -25,7 +25,7 @@ from ..autotuner import (
 from ..autotuner.initializers import autotuner_initializer_empty
 from ..jit.gemm.svdquant_sm120 import gen_gemm_sm120_module_cutlass_nvfp4_svdquant
 from ..utils import (
-    _get_cache_buf,
+    _get_stream_cache_buf,
     device_support_pdl,
     get_compute_capability,
 )
@@ -903,7 +903,7 @@ def mm_nvfp4_svdquant(
         DEFAULT_WORKSPACE_SIZE,
         _sm120_max_workspace_bytes(a.device, m, n, k, rank),
     )
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "nvfp4_svdquant_gemm_workspace", workspace_bytes, a.device
     )
 
@@ -968,7 +968,7 @@ def svdquant_linear(
     workspace_bytes = max(
         DEFAULT_WORKSPACE_SIZE, _sm120_max_workspace_bytes(x.device, m, n, k, rank)
     )
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "nvfp4_svdquant_gemm_workspace", workspace_bytes, x.device
     )
     inputs = [
