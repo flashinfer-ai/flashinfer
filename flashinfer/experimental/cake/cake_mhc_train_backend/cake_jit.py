@@ -42,8 +42,11 @@ six programs of this package take their place:
   nothing) instead of writing one partial slot per token chunk, and folds the
   parameter gradients ``dscale`` / ``dbase`` from the token-owner pass's per-CTA
   partials in one warp of each of the first 27 CTAs (the deterministic
-  reduction's sequence: an FP64 chain in ascending order, the carried-in value
-  last, one rounding), so they are bitwise the deterministic package's;
+  reduction's per-CTA sequence: an FP64 chain in ascending order, the
+  carried-in value last, one rounding), so they are bitwise the deterministic
+  package's per-CTA reduction (at hidden 4096 above 14927 tokens on sm_100a and
+  sm_103a the deterministic package sums them over 8-token group rows instead,
+  ``BWD_ROW_BANDS``, so their low-order bits can differ from its values there);
 * ``cake_mhc_train_bwd_slab_atomic__lpt`` (every architecture): the same
   column slab under the two-size tail schedule (``schedule="lpt"``).  It runs
   ``p_big`` chunks of ``rpc`` tokens first, then ``P - p_big`` smaller chunks
@@ -87,8 +90,10 @@ varies from run to run: each element sums at most ``P`` per-chunk partials
 under ``lpt``, whose chunks can cover other token ranges, so its total can also
 differ from the deterministic ``dfn`` in the low-order bits), so it lies within
 ``P`` FP32 roundings of the fixed-order sum of those partials, and the FP32
-reduction flushes subnormal addends and results to zero.  ``dX``, ``dscale``,
-``dbase`` and every other route's outputs are the deterministic package's bits.
+reduction flushes subnormal addends and results to zero.  ``dX`` and every other
+route's outputs are the deterministic package's bits; ``dscale`` and ``dbase``
+are its per-CTA reduction's bits, which are its values except where it runs the
+group-row forms (hidden 4096 above 14927 tokens on sm_100a and sm_103a).
 The deterministic package's backward fn splits (``fn_split__tv128__t``,
 ``fn_split__tv128_t128__t``, ``fn_split__tv128__h<H>__t``) have no copy here:
 the atomic fn splits replace them.
