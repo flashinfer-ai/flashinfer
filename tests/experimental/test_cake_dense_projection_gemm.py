@@ -975,6 +975,85 @@ def test_k1_planner_keeps_rows_it_cannot_serve_on_the_deterministic_program(
     ]
 
 
+def test_k1_row_major_verdict_runs_the_row_major_program(monkeypatch):
+    """A 192-wide verdict (:data:`K1_ROW_MAJOR_BLOCK_N`) runs the row-major-store program with the operands of the
+    transposed-store launch exchanged: ``A = G`` ``[L, T, d_out]``, ``B = X`` ``[L, T, d_in]``, ``M = d_out``,
+    ``N = d_in``, tiles of 256 ``d_out`` rows by 192 ``d_in`` columns, the caller's ``out[d_out, d_in]`` stored row by
+    row; either orientation of the caller's views gives that launch.  An explicit ``block_n=192`` takes the same
+    program; :func:`k1_block_n` never picks it."""
+    arch, T, d_in, d_out = "sm_107a", 16231, 4096, 1024
+    G = torch.zeros(T, d_out, dtype=torch.bfloat16)
+    X = torch.zeros(T, d_in, dtype=torch.bfloat16)
+    out = torch.zeros(d_out, d_in, dtype=torch.float32)
+    key = (arch, 1, d_in, d_out, "f32")
+    tables = {k: dict(v) for k, v in cake_backend.K1_SPLIT_RULES_BY_SM.items()}
+    tables[(arch, 212)][key] = (192, 1)
+    monkeypatch.setattr(cake_backend, "K1_SPLIT_RULES_BY_SM", tables)
+    _register_k1(monkeypatch, arch)
+    kw = dict(arch=arch, sm_count=212)
+    assert cake_backend.k1_plan(L=1, M=d_in, N=d_out, K=T, out_f32=True, **kw) == (
+        192,
+        1,
+    )
+    for A, B, transposed_out in ((X.t(), G, True), (G.t(), X, False)):
+        plan, a_desc, b_desc, out3, reason = cake_backend.plan_atomic_gemm(
+            A, B, out, transposed_out=transposed_out, **kw
+        )
+        assert isinstance(plan, cake_backend.AtomicGemmPlan) and reason == ""
+        assert plan.template == "dense_proj_gemm_atomic_nn_n192_f32"
+        assert not plan.out_t
+        assert (plan.L, plan.M, plan.N, plan.K, plan.block_n, plan.splits) == (
+            1,
+            d_out,
+            d_in,
+            T,
+            192,
+            1,
+        )
+        assert (plan.m_tiles, plan.n_tiles, plan.tiles) == (4, 22, 88)
+        assert plan.grid == (176, 1, 1)
+        assert plan.ws_f32_elems == 0 and plan.counters_u32 == 0
+        assert plan.swapped == transposed_out
+        assert a_desc.data_ptr() == G.data_ptr() and tuple(a_desc.shape) == (
+            1,
+            T,
+            d_out,
+        )
+        assert b_desc.data_ptr() == X.data_ptr() and tuple(b_desc.shape) == (1, T, d_in)
+        assert a_desc.stride(-1) == 1 and b_desc.stride(-1) == 1
+        assert tuple(out3.shape) == (1, d_out, d_in) and out3.stride(1) == d_in
+        views = cake_backend._k1_launch_views(A, B, out, plan)
+        assert (
+            views[0].data_ptr() == G.data_ptr() and views[1].data_ptr() == X.data_ptr()
+        )
+    # an explicit 192-wide choice is the same program, at any split count; the planner's other rows are untouched
+    kwt = dict(transposed_out=True, **kw)
+    plan = cake_backend.plan_atomic_gemm(X.t(), G, out, block_n=192, splits=2, **kwt)[0]
+    assert (plan.template, plan.out_t, plan.splits, plan.items) == (
+        "dense_proj_gemm_atomic_nn_n192_f32",
+        False,
+        2,
+        176,
+    )
+    assert plan.ws_f32_elems == 176 * 256 * 192 and plan.counters_u32 == 88 * 512
+    assert cake_backend.k1_block_n(192) == 64 and cake_backend.k1_block_n(384) == 128
+    # a part that does not register the row-major program keeps the row on the deterministic program
+    monkeypatch.setitem(
+        cake_jit.KERNELS,
+        arch,
+        {
+            t: n
+            for t, n in cake_jit.KERNELS[arch].items()
+            if t != "dense_proj_gemm_atomic_nn_n192_f32"
+        },
+    )
+    plan, *_, reason = cake_backend.plan_atomic_gemm(X.t(), G, out, **kwt)
+    assert plan is None and "not registered" in reason
+    assert (
+        cake_backend.atomic_k1_template(192, False) == "dense_proj_gemm_atomic_nn_n192"
+    )
+
+
 # ---------------------------------------------------------------------------
 # K2 planner (CPU)
 # ---------------------------------------------------------------------------
@@ -1187,7 +1266,8 @@ def test_router_units_policy(monkeypatch):
         assert cake_backend.router_units("kn", arch=arch, sm_count=sms, **fwd) is None
     # weight gradient at T = 16231 (508 K blocks), inside the token windows (test_router_wgrad_token_windows):
     # sm_100a hidden 4096 "H1x5p44" (44 head units, then 5 tail units per CTA pair), hidden 5120 "H0.5x3" on sm_100a /
-    # sm_103a (76 head + 228 tail units); hidden 6144, sm_103a hidden 4096 and sm_107a: the deterministic plan
+    # sm_103a (76 head + 228 tail units) and "H0.5x4" on sm_107a (108 head + 432 tail units); hidden 6144, sm_103a
+    # hidden 4096 and sm_107a hidden 4096: the deterministic plan
     for arch in ("sm_100a", "sm_103a"):
         assert cake_backend.ROUTER_RULES[(arch, "nn_t", 6144, 256)] is None
         assert (
@@ -1213,7 +1293,10 @@ def test_router_units_policy(monkeypatch):
         assert cake_backend.router_partition(
             "nn_t", arch=arch, sm_count=152, **wgrad5120
         ) == (304, 38, 20 * 508 // 2)
-    for hidden in (4096, 5120, 6144):
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_107a", sm_count=216, **wgrad5120
+    ) == (540, 54, 20 * 508 // 2)
+    for hidden in (4096, 6144):
         assert cake_backend.ROUTER_RULES[("sm_107a", "nn_t", hidden, 256)] is None
         assert (
             cake_backend.router_partition(
@@ -1320,6 +1403,7 @@ ROUTER_WGRAD_WINDOWS = {
     ("sm_100a", 4096): ((10240, 16384, "H1x5p44"),),
     ("sm_100a", 5120): ((1, 128, "waves"), (10240, 32768, "H0.5x3")),
     ("sm_103a", 5120): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
+    ("sm_107a", 5120): ((16172, 16384, "H0.5x4"),),
 }
 
 
@@ -1699,9 +1783,9 @@ def test_registry_is_disjoint_from_the_deterministic_package():
 
 
 def test_registered_templates_are_the_ones_the_planners_name():
-    """Every template this checkout registers is one the host plans: the transposed-store K1 programs
-    (``dense_proj_gemm_atomic_nn_n<64|128|256>[_f32]_t``), the two router classes and the weight gradient's
-    head/tail program."""
+    """Every template this checkout registers is one the host plans: the K1 programs of each tile width
+    (``dense_proj_gemm_atomic_nn_n<64|128|256>[_f32]_t`` and the row-major ``dense_proj_gemm_atomic_nn_n192[_f32]``),
+    the two router classes and the weight gradient's head/tail program."""
     wanted = {
         cake_backend.atomic_k1_template(bn, f32)
         for bn in cake_backend.K1_BLOCK_N_CHOICES
@@ -2060,6 +2144,63 @@ def test_gpu_k1_explicit_split_counts(splits):
         torch.cuda.synchronize()
         _k1_check(out, G.double().t() @ X.double())
         assert prepared.counters_are_zero()
+
+
+# The 192-wide row-major program (sm_107a): ``(d_out, d_in, T, splits)``, the 4096 -> 1024 row it serves (22 column
+# tiles of ``d_in``, the last 64 columns wide: its first CTA's third 32-column B box and its second CTA lie past ``N``)
+# and a ragged one (``d_in`` 4104 cuts a B box, ``d_out`` 1032 a pair tile; two splits).
+K1_ROW_MAJOR_ROWS = ((1024, 4096, 16231, 1), (1032, 4104, 1001, 2))
+
+
+@pytest.mark.parametrize("transposed_out", [True, False])
+@pytest.mark.parametrize(
+    "shape", K1_ROW_MAJOR_ROWS, ids=lambda s: "x".join(map(str, s))
+)
+def test_gpu_k1_row_major_program(shape, transposed_out, k1_rule):
+    """The row-major-store program (operands exchanged) meets the FP32 budget against FP64 for either orientation of
+    the caller's views, prepared and through the convenience path, each launch into a NaN-poisoned ``out``; one split
+    repeats bit for bit and stores what the deterministic budget allows; the tickets are zero after every launch; the
+    profiler shows this package's program."""
+    device, arch = _atomic_device_or_skip()
+    template = cake_backend.atomic_k1_template(192, True)
+    _require_template(arch, template)
+    d_out, d_in, T, splits = shape
+    g = torch.Generator(device=device).manual_seed(SEED + 7)
+    G, X = _bf16((T, d_out), device, g), _bf16((T, d_in), device, g)
+    out = torch.full((d_out, d_in), float("nan"), device=device, dtype=torch.float32)
+    ref = G.double().t() @ X.double()
+    A, B = (X.t(), G) if transposed_out else (G.t(), X)
+    prepared = cake_backend.prepare_dense_projection_gemm(
+        A,
+        B,
+        out,
+        transposed_out=transposed_out,
+        deterministic=False,
+        splits=splits,
+        block_n=192,
+    )
+    assert isinstance(prepared, cake_backend.PreparedAtomicGemm)
+    assert prepared.template == template and not prepared.plan.out_t
+    assert prepared.plan.swapped == transposed_out
+    _assert_ran(prepared.launch, prepared.module_name)
+    first = None
+    for i in range(3):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        _k1_check(out, ref, f"prepared rerun {i}")
+        assert prepared.counters_are_zero(), i
+        if splits == 1:
+            first = out.clone() if first is None else first
+            assert torch.equal(out, first), i
+    if transposed_out:
+        assert k1_rule(G, X, out, splits, block_n=192) == template
+        for i in range(2):
+            out.fill_(float("nan"))
+            cake_backend.projection_wgrad(G, X, out, deterministic=False)
+            torch.cuda.synchronize()
+            _k1_check(out, ref, f"convenience rerun {i}")
+        assert _arena_tickets_zero()
 
 
 def test_gpu_k1_batched_mla_head_views():

@@ -256,7 +256,7 @@ kernel_cake_causal_conv1d_train_f5497330bfd286211643(__nv_bfloat16* __restrict__
     for (int k0 = 0; k0 < 2; k0++) {
         int qn = cells[4 + k0];
         if (qn < nch) {
-            int stage_t0 = qn * n_sub * 8 + (int)((unsigned int)k0 % 1) * 8;
+            int stage_t0 = qn * n_sub * 8 + 0 * 8;
             if (tid == 0) {
                 int rem = S - stage_t0;
                 int _max_2 = ((rem) > (0) ? (rem) : (0));
@@ -310,7 +310,7 @@ kernel_cake_causal_conv1d_train_f5497330bfd286211643(__nv_bfloat16* __restrict__
         }
         int kn = k + 2;
         int grab = 0;
-        if (tid == 0 && (unsigned int)kn % 1 == 0) {
+        if (tid == 0 && 0 == 0) {
             grab = 1;
         }
         int pend = 0;
@@ -318,7 +318,7 @@ kernel_cake_causal_conv1d_train_f5497330bfd286211643(__nv_bfloat16* __restrict__
             int _atomic_fetch_add_6 = atomicAdd(&work[ct], 1);
             pend = _atomic_fetch_add_6;
         }
-        int kst = (int)((unsigned int)k % 1);
+        int kst = 0;
         int ts = q * chunk + sub * 8 + kst * 8;
         int rows_k = 0;
         if (lane_on != 0) {
@@ -548,7 +548,7 @@ kernel_cake_causal_conv1d_train_f5497330bfd286211643(__nv_bfloat16* __restrict__
         __syncthreads();
         int qn_1 = cells[(int)((unsigned int)kn % 4)];
         if (qn_1 < nch) {
-            int stage_t0_1 = qn_1 * n_sub * 8 + (int)((unsigned int)(k + 2) % 1) * 8;
+            int stage_t0_1 = qn_1 * n_sub * 8 + 0 * 8;
             if (tid == 0) {
                 int rem_1 = S - stage_t0_1;
                 int _max_25 = ((rem_1) > (0) ? (rem_1) : (0));

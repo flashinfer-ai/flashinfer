@@ -112,8 +112,8 @@ def validate_forward_metadata(
         raise MoEEpConfigError("hidden_states must be 2D [num_tokens, hidden]")
     tokens, cols = hidden_states.shape
     hidden = fleet_params.token_hidden_size
-    fp4 = quant_kind == "nvfp4"
-    if quant_kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"):
+    fp4 = quant_kind in ("nvfp4", "mxfp4")
+    if quant_kind not in ("nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"):
         raise MoEEpConfigError(f"unsupported quant_kind {quant_kind!r}")
     expected_cols = hidden // 2 if fp4 and not quantize_input else hidden
     if tokens > fleet_params.max_tokens_per_rank or cols != expected_cols:
@@ -149,7 +149,7 @@ def validate_forward_metadata(
             raise MoEEpConfigError(
                 "MoEEpTensors.scales is required when quantize_input=False"
             )
-        sf_cols = hidden // (16 if fp4 else 32)
+        sf_cols = hidden // (16 if quant_kind == "nvfp4" else 32)
         padded_cols = (sf_cols + 3) // 4 * 4
         if (
             scales.ndim != 2
@@ -159,7 +159,9 @@ def validate_forward_metadata(
             raise MoEEpConfigError(
                 f"scales must have {tokens} rows and {sf_cols}..{padded_cols} columns"
             )
-        expected_sf = torch.float8_e4m3fn if fp4 else torch.float8_e8m0fnu
+        expected_sf = (
+            torch.float8_e4m3fn if quant_kind == "nvfp4" else torch.float8_e8m0fnu
+        )
         if scales.dtype not in (expected_sf, torch.uint8):
             raise MoEEpConfigError(
                 f"scales must have dtype {expected_sf} or uint8 containing its raw bytes"
