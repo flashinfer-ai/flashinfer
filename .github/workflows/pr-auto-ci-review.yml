@@ -27,5 +27,11 @@ jobs:
       && github.event.pull_request.base.ref == 'main'
     runs-on: ubuntu-latest
     steps:
-      - run: |
-          echo "Approval on PR #${{ github.event.pull_request.number }}; pr-auto-ci.yml will pick this up via workflow_run"
+      # Block scalar on purpose: in a plain YAML scalar, " #" starts a
+      # comment, which silently truncated this command to `echo "Approval on PR`
+      # (unterminated quote, exit 2).
+      - name: Relay approval
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          echo "Approval on PR #${PR_NUMBER}; pr-auto-ci.yml will pick this up via workflow_run"
