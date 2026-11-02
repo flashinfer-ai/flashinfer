@@ -30,7 +30,7 @@ leaf when the digit's ``identity_note`` justifies that this is bit-exact.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 LEVELS = ("reg", "lane", "warp", "cta", "grid")
 LANES = 32
@@ -145,7 +145,7 @@ class Placement:
         raise KeyError(name)
 
     @staticmethod
-    def make(factors: Dict[str, Sequence[Tuple[int, str]]], **free) -> "Placement":
+    def make(factors: Mapping[str, Sequence[Tuple[int, str]]], **free) -> "Placement":
         return Placement(
             tuple(
                 (n, tuple(Factor(r, l) for r, l in fs if r != 1))
@@ -274,7 +274,7 @@ class Plan:
     def reg_keys(self, exclude: Optional[int] = None) -> List[tuple]:
         """All reg keys, earliest reg factor most significant. ``exclude`` sets that
         position to None (used to enumerate the outer keys of a fused first step)."""
-        keys = [()]
+        keys: List[tuple] = [()]
         for i, (_, _, r) in enumerate(self.reg_factors):
             keys = [
                 k + ((v,) if i != exclude else (None,))
@@ -496,10 +496,13 @@ def trace(
     states, starts = {}, set()
     for u in units:
         coords = {"cta": u[0], "warp": u[1], "lane": u[2], "grid": 0}
-        st, start = init_state(
-            p, fp, lambda key, c=coords: leaf_of(fp, p.leaf_index(c, key))
-        )
-        states[u], _ = st, starts.add(start)
+
+        def loader(key: tuple, c: Dict[str, int] = coords) -> Any:
+            return leaf_of(fp, p.leaf_index(c, key))
+
+        st, start = init_state(p, fp, loader)
+        states[u] = st
+        starts.add(start)
     (start,) = starts
     for s in p.steps[start:]:
         if stop_before is not None and s.digit == stop_before:

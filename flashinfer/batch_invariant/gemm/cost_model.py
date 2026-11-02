@@ -49,14 +49,31 @@ class Arch:
 
 
 # The parts, as (family, SM count); the SM count is the only difference the model sees within a family.
-_SM100 = dict(clock_ghz=1.55, hbm_tbps=7.4, l2_bytes=126 << 20, smem_bytes=232448)
+
+
+def _sm100_part(
+    name: str, sm_count: int, family: str, placeholder: bool = False
+) -> Arch:
+    """A part with the SM100-generation memory system (the sm_103 parts are placeholders: public figures only)."""
+    return Arch(
+        name,
+        sm_count,
+        1.55,
+        hbm_tbps=7.4,
+        l2_bytes=126 << 20,
+        smem_bytes=232448,
+        placeholder=placeholder,
+        family=family,
+    )
+
+
 ARCHS: Dict[str, Arch] = {
     "sm_107": Arch("sm_107", 204, 2.3),
     "sm_107_224": Arch("sm_107_224", 224, 2.3),
-    "sm_100": Arch("sm_100", 148, family="sm_100", **_SM100),
-    "sm_100_152": Arch("sm_100_152", 152, family="sm_100", **_SM100),
-    "sm_103": Arch("sm_103", 148, family="sm_103", placeholder=True, **_SM100),
-    "sm_103_152": Arch("sm_103_152", 152, family="sm_103", placeholder=True, **_SM100),
+    "sm_100": _sm100_part("sm_100", 148, "sm_100"),
+    "sm_100_152": _sm100_part("sm_100_152", 152, "sm_100"),
+    "sm_103": _sm100_part("sm_103", 148, "sm_103", placeholder=True),
+    "sm_103_152": _sm100_part("sm_103_152", 152, "sm_103", placeholder=True),
 }
 #: The parts as (family, SM count): what the dispatcher serves, what the generated Lean cases and the tests enumerate.
 PARTS = tuple((a.family, a.sm_count) for a in ARCHS.values())
@@ -69,7 +86,7 @@ FIT_FALLBACK = {
 
 def family_of(cc: Tuple[int, int]) -> str:
     """The architecture family of a compute capability (the fits' key); the API passes the operand device's."""
-    return FAMILY_OF_CC.get(tuple(cc), "sm_107")
+    return FAMILY_OF_CC.get((int(cc[0]), int(cc[1])), "sm_107")
 
 
 def arch_for(
@@ -171,12 +188,10 @@ def _epi_tile(ctm: int, ctn: int, two: bool, out_bytes: int) -> Tuple[int, int]:
     try:
         from cutlass.utils.blackwell_helpers import compute_epilogue_tile_size
 
-        return tuple(
-            int(v)
-            for v in compute_epilogue_tile_size(
-                ctm, ctn, two, out_bytes * 8, None, False, True
-            )
+        rows, cols = compute_epilogue_tile_size(
+            ctm, ctn, two, out_bytes * 8, None, False, True
         )
+        return (int(rows), int(cols))
     except Exception:  # noqa: BLE001  (no DSL at hand)
         return (ctm, min(ctn, 32 if ctm == 128 else 64))
 
