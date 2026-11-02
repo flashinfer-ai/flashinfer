@@ -268,8 +268,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (2048, 5120, "cake_rmsnorm_det_train_af005462cd6a301f31c4"),
             (5120, 12288, "cake_rmsnorm_det_train_a385ae1681a2c078344e"),
             (12288, 40960, "cake_rmsnorm_det_train_af005462cd6a301f31c4"),
-            (40960, 139264, "cake_rmsnorm_det_train_a385ae1681a2c078344e"),
-            (139264, 1572864, "cake_rmsnorm_det_train_0291949ba535c646c3a8"),
+            (40960, 114688, "cake_rmsnorm_det_train_a385ae1681a2c078344e"),
+            (114688, 1572864, "cake_rmsnorm_det_train_0291949ba535c646c3a8"),
             (1572864, None, "cake_rmsnorm_det_train_c18297d75c0d424978fd"),
         ),
         "bwd_w32_h256": (
@@ -277,8 +277,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (2048, 5120, "cake_rmsnorm_det_train_b7d9577ff884de98ea06"),
             (5120, 12288, "cake_rmsnorm_det_train_420788e663a2c3a810f6"),
             (12288, 40960, "cake_rmsnorm_det_train_b7d9577ff884de98ea06"),
-            (40960, 139264, "cake_rmsnorm_det_train_420788e663a2c3a810f6"),
-            (139264, 1572864, "cake_rmsnorm_det_train_89505762fa1cbf33cb8f"),
+            (40960, 114688, "cake_rmsnorm_det_train_420788e663a2c3a810f6"),
+            (114688, 1572864, "cake_rmsnorm_det_train_89505762fa1cbf33cb8f"),
             (1572864, None, "cake_rmsnorm_det_train_f788ef57163552825d27"),
         ),
         "bwd_h4096": (
@@ -752,7 +752,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (5120, "same"),
             (12288, "same"),
             (40960, "same"),
-            (139264, "unmeasured"),
+            (114688, "unmeasured"),
             (1572864, "unmeasured"),
         ),
         "bwd_w32_h256": (
@@ -760,7 +760,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (5120, "same"),
             (12288, "same"),
             (40960, "same"),
-            (139264, "unmeasured"),
+            (114688, "unmeasured"),
             (1572864, "unmeasured"),
         ),
         "bwd_h4096": (
@@ -938,8 +938,8 @@ ACCURACY_EDGES: dict[str, dict[str, int]] = {
         "bwd_w32_h1536": 40448,
         "bwd_h2048": 55296,
         "bwd_w32_h2048": 55296,
-        "bwd_h256": 139264,
-        "bwd_w32_h256": 139264,
+        "bwd_h256": 114688,
+        "bwd_w32_h256": 114688,
         "bwd_h4096": 48640,
         "bwd_w32_h4096": 48640,
         "bwd_h5120": 5120,
@@ -1192,8 +1192,8 @@ its own windows.
   (4096, 16384] caf6978e = (16384, 32768] caf6978e = (32768, 55296] 302f64db ?
   (55296, inf) 018f0cd7
 * ``sm_103a`` ``bwd_h256``: (0, 2048] a385ae16 = (2048, 5120] af005462 =
-  (5120, 12288] a385ae16 = (12288, 40960] af005462 = (40960, 139264] a385ae16 ?
-  (139264, 1572864] 0291949b ? (1572864, inf) c18297d7
+  (5120, 12288] a385ae16 = (12288, 40960] af005462 = (40960, 114688] a385ae16 ?
+  (114688, 1572864] 0291949b ? (1572864, inf) c18297d7
 * ``sm_103a`` ``bwd_h4096``: (0, 256] 50044ee3 = (256, 1024] ad2bb26e =
   (1024, 4096] 24643edc = (4096, 48640] 35a0b0ca ? (48640, inf) 850eec3a
 * ``sm_103a`` ``bwd_h512``: (0, 1024] 09601d42 ~ (1024, 4096] 8e7f4d81 =
