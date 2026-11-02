@@ -14,6 +14,7 @@ from ..activations import ACTIVATIONS, is_gated
 
 _TAG = "cudnn_frost-mxfp8-fma-v1"
 _ROOT = Path(__file__).parent
+_DEVICE_ROOT = _ROOT.parents[1] / "frost_low_latency" / "fma" / "mxfp8"
 _KERNELS = ("fma_fc1.py", "fma_fc2.py", "fma_common.py")
 
 
@@ -35,9 +36,12 @@ def source_digest(mixed=False):
     # Include imported conversion helpers and the native launch ABI. A change
     # must invalidate both persistent compilation and autotuning results.
     paths = [
-        *(_ROOT / name for name in _KERNELS),
+        *(_DEVICE_ROOT / name for name in _KERNELS),
         Path(__file__),
-        _ROOT.parent / "fma_activations.py",
+        _DEVICE_ROOT.parents[1] / "activation.py",
+        _DEVICE_ROOT.parents[1] / "quantization.py",
+        _DEVICE_ROOT.parents[1] / "io.py",
+        _DEVICE_ROOT.parent / "activations.py",
         _ROOT.parent / "activations.py",
         _ROOT.parents[3] / "cute_dsl" / "fp4_common.py",
         _ROOT.parents[3] / "quantization" / "quantization_cute_dsl_utils.py",
@@ -57,8 +61,11 @@ def _requirements():
     return tuple(
         (path, common._digest(path))
         for path in (
-            *(_ROOT / name for name in _KERNELS),
-            _ROOT.parent / "fma_activations.py",
+            *(_DEVICE_ROOT / name for name in _KERNELS),
+            _DEVICE_ROOT.parent / "activations.py",
+            _DEVICE_ROOT.parents[1] / "activation.py",
+            _DEVICE_ROOT.parents[1] / "quantization.py",
+            _DEVICE_ROOT.parents[1] / "io.py",
         )
     )
 
@@ -101,16 +108,23 @@ def compile():
     mid_sf = _fake(cutlass.Uint8, (t * k, i // 32))
     ids = _fake(cutlass.Int32, (t, k), 4)
     if first:
+        weight_sf = cute.runtime.make_fake_tensor(
+            sdtype,
+            ((2 if _GATED else 1), e, i, h // sdivisor),
+            stride=(cute.sym_int64(), cute.sym_int64(), h // sdivisor, 1),
+            assumed_align=16,
+        )
         args = [
             _fake(cutlass.Float8E4M3FN, (t, h)),
             _fake(cutlass.Uint8, (1, 128 * h // 32) if swizzled else (t, h // 32)),
             _fake(wdtype, (e, (2 if _GATED else 1) * i, h // divisor)),
-            _fake(sdtype, ((2 if _GATED else 1), e, i, h // sdivisor)), ids, mid, mid_sf,
+            weight_sf,
+            _fake(cutlass.Float32, (e,), 4), ids, mid, mid_sf,
         ]
     else:
         args = [
             mid, mid_sf, _fake(wdtype, (e, h, i // divisor)),
-            _fake(sdtype, (e, h, i // sdivisor)), ids,
+            _fake(sdtype, (e, h, i // sdivisor)), _fake(cutlass.Float32, (e,), 4), ids,
             _fake(cutlass.Float32, (t, k), 4),
             _fake(cutlass.BFloat16, (t, h)),
         ]
@@ -132,6 +146,8 @@ def _source(
     first,
     mixed=False,
     activation="swiglu",
+    *,
+    source_identity,
 ):
     from .....jit.env import FLASHINFER_GEN_SRC_DIR
 
@@ -139,8 +155,8 @@ def _source(
     config = (tokens, hidden, intermediate, experts, topk, swizzled, first, mixed)
     activation = activation if first else "identity"
     source = (
-        (_ROOT / name).read_text()
-        + f"\n# FMA source identity: {source_digest(mixed)}\n_FMA_CONFIG = {config!r}\n"
+        (_DEVICE_ROOT / name).read_text()
+        + f"\n# FMA source identity: {source_identity}\n_FMA_CONFIG = {config!r}\n"
         + f"_ACTIVATION = {activation!r}\n_GATED = {is_gated(activation)!r}\n"
         + _COMPILE
     )
@@ -176,6 +192,7 @@ def build(
         tokens, hidden, intermediate, experts, topk, activation
     ):
         raise ValueError("Unsupported MXFP8 FMA geometry/architecture")
+    source_identity = source_digest.__wrapped__(mixed)
     return tuple(
         common._load_source(
             *_source(
@@ -188,6 +205,7 @@ def build(
                 first,
                 mixed,
                 activation,
+                source_identity=source_identity,
             ),
             arch,
             device.index,

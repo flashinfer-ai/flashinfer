@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer import sm110_gqa_decode
+from flashinfer.experimental.sm110_gqa_decode import backend
 from flashinfer.testing import bench_gpu_time_with_cupti
 
 
@@ -111,11 +112,15 @@ def _measure_shape(
     torch.cuda.synchronize()
     candidate_ms = _measure(candidate)
     torch_ms = _measure(torch_sdpa)
+    route, num_splits, grid = backend.route(batch, capacity, None)
     return {
         "label": label,
         "batch": batch,
         "capacity": capacity,
         "sequence_lengths": lengths,
+        "route": route,
+        "num_splits": num_splits,
+        "grid": list(grid),
         "sm110_gqa_decode_ms": candidate_ms,
         "torch_sdpa_ms": torch_ms,
         "speedup_vs_torch_sdpa": torch_ms / candidate_ms,

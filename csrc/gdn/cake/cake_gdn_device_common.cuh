@@ -30,9 +30,6 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -229,3 +226,8 @@ __device__ __forceinline__ void tmem_st_x32_f32(int tmem_addr, const float* src)
            "f"(src[24]), "f"(src[25]), "f"(src[26]), "f"(src[27]),
            "f"(src[28]), "f"(src[29]), "f"(src[30]), "f"(src[31]));
 }
+
+// Added after the shipped text (append-only delivery): device helpers the delivered kernels take that the
+// header did not define.
+#include "cake_device_helpers/cake_f32_mul_f64const_rn_reference_b66ea4f5da5a92dc.cuh"
+#include "cake_device_helpers/cake_f32_mul_f64const_rn_c45c9c808ac06b93.cuh"

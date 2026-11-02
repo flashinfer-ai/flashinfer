@@ -5,7 +5,7 @@ flashinfer.testing
 
 .. currentmodule:: flashinfer.testing
 
-This module provides comprehensive testing utilities for benchmarking, performance analysis in FlashInfer.
+This module provides comprehensive testing utilities for benchmarking and performance analysis in FlashInfer.
 
 Test Environment Setup
 ----------------------

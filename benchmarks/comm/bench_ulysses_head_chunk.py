@@ -279,14 +279,14 @@ def main():
     whole_output_elems = args.batch * local_seq * args.heads * args.head_dim
     input_comm = UlyssesCommunicator(
         input_group,
-        max_elems=whole_input_elems,
+        max_bytes=whole_input_elems * dtype.itemsize,
         dtype=dtype,
         backend=args.backend,
         device=device,
     )
     output_comm = UlyssesCommunicator(
         output_group,
-        max_elems=whole_output_elems,
+        max_bytes=whole_output_elems * dtype.itemsize,
         dtype=dtype,
         backend=args.backend,
         device=device,

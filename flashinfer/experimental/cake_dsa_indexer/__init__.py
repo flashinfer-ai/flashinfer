@@ -14,9 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Experimental Cake backend: fused DSA indexer scoring + deterministic exact
-# top-k selection for training (flashinfer-ai/flashinfer#5676; GLM-5.2
-# geometry: 32 indexer heads, head dimension 128, top-k 2048) on SM100 / SM103 /
-# SM107.  The public entry point is ``flashinfer.dsa_indexer.dsa_indexer_topk``;
-# the host binding, workspace policy, JIT registration and the generated kernel
-# sources live in this package.
+"""Previous import path of :mod:`flashinfer.experimental.cake_dsa_indexer_det`.
+
+The package and its submodules ``cake_backend``, ``cake_build``, ``cake_jit`` and ``cake_policy`` resolve to the
+module objects of ``flashinfer.experimental.cake_dsa_indexer_det``.
+"""
+
+from .. import cake_dsa_indexer_det as _canonical
+
+
+def __getattr__(name):
+    return getattr(_canonical, name)
+
+
+def __dir__():
+    return sorted(set(globals()) | set(dir(_canonical)))

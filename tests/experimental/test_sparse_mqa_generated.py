@@ -214,6 +214,106 @@ def test_sparse_metadata_stream_and_replay(fmt, paged):
         assert not bool(torch.count_nonzero(metadata.workspace[[0, 32, 64]]))
 
 
+def _logits_takes_pdl(fmt, paged):
+    layout = "paged" if paged else "contiguous"
+    return _runtime.logits_takes_pdl(_runtime.ROUTES[f"logits:{fmt}:{layout}"])
+
+
+def test_sparse_logits_pdl_default_table_is_exported():
+    """Host-only: the exported programmatic-dependent-launch default covers every (architecture, format, layout)
+    with a bool, and every logits program takes the launch argument exactly when LIMITS["pdl_chain"] is set."""
+    arches = sorted(
+        {a for record in _runtime.MODULES.values() for a in record["arches"]}
+    )
+    assert arches, "registry exports no architecture"
+    table = _runtime.LIMITS["pdl_default"]
+    assert sorted(table) == arches
+    keys = {
+        f"{fmt}:{layout}"
+        for fmt in ("mxfp4", "mxfp8")
+        for layout in ("contiguous", "paged")
+    }
+    for arch in arches:
+        assert set(table[arch]) == keys
+        assert all(type(value) is bool for value in table[arch].values())
+    for fmt in ("mxfp4", "mxfp8"):
+        for paged in (False, True):
+            assert _logits_takes_pdl(fmt, paged) is bool(_runtime.LIMITS["pdl_chain"])
+    if not _runtime.LIMITS["pdl_chain"]:
+        assert not any(value for row in table.values() for value in row.values())
+
+
+@pytest.mark.parametrize("fmt", ["mxfp4", "mxfp8"])
+@pytest.mark.parametrize("paged", [False, True])
+def test_sparse_logits_pdl_launch_forms(fmt, paged):
+    """The default launch form binds the exported table's value; the explicit forms (use_pdl False / True) produce
+    the same values eagerly and under graph capture and replay."""
+    _skip_unless_exported()
+    case = analytical_case(fmt, paged)
+    metadata = prepare_sparse_mqa_metadata(case["sparse"], **case["kwargs"])
+    expected = analytical_expected(case, False)
+    layout = "paged" if paged else "contiguous"
+    takes_pdl = _logits_takes_pdl(fmt, paged)
+
+    def plan_with(use_pdl):
+        output = torch.full(
+            (case["queries"], case["capacity"] * case["block"]),
+            -1,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        plan = prepare_sparse_mqa_logits(
+            case["q"],
+            case["sf_q"],
+            case["kv"],
+            case["sf_kv"],
+            case["weights"],
+            metadata,
+            output=output,
+            use_pdl=use_pdl,
+        )
+        return plan, output
+
+    with pytest.raises(ValueError, match="use_pdl must be"):
+        plan_with("runtime")
+    plan, output = plan_with(None)
+    if takes_pdl:
+        assert plan.enable_pdl == int(
+            _runtime.LIMITS["pdl_default"][metadata.arch][f"{fmt}:{layout}"]
+        )
+    else:
+        assert plan.enable_pdl is None
+    plan.run()
+    torch.cuda.synchronize()
+    assert torch.equal(output, expected)
+    if not takes_pdl:
+        with pytest.raises(NotImplementedError):
+            plan_with(True)
+        plan, output = plan_with(False)
+        assert plan.enable_pdl is None
+        plan.run()
+        torch.cuda.synchronize()
+        assert torch.equal(output, expected)
+        return
+    for use_pdl in (False, True):
+        plan, output = plan_with(use_pdl)
+        assert plan.enable_pdl == int(use_pdl)
+        plan.run()
+        torch.cuda.synchronize()
+        assert torch.equal(output, expected)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                plan.run()
+            output.fill_(-1)
+            graph.replay()
+        stream.synchronize()
+        assert torch.equal(output, expected)
+        assert not bool(torch.count_nonzero(metadata.workspace[[0, 32, 64]]))
+
+
 def decode_metadata(words, *, blocks_per_split, num_sms):
     """Decode the packed metadata into split headers, records and schedule entries."""
     total, waves, unaligned = int(words[0]), int(words[1]), int(words[2])

@@ -51,6 +51,13 @@ class GroupedGemm(Protocol):
     ``offsets`` is the ``int64 [E + 1]`` expert-major row prefix written by the
     protocol's prefix kernel; rows beyond ``offsets[E]`` are never read as
     valid output (the kernels guard stores by the per-expert row bound).
+
+    The runner passes ``pdl`` on every call: ``True`` asks for a programmatic
+    dependent launch of the kernel. It passes ``sched`` only to an implementation
+    whose ``supports_early_start`` attribute is true, and only in early-start
+    rounds, to both calls of the round: FC1 releases per-m-tile readiness
+    counters into it, and FC2, launched next on the same stream, claims its
+    tiles as they become ready.
     """
 
     def fc1(
@@ -59,6 +66,9 @@ class GroupedGemm(Protocol):
         w13: torch.Tensor,
         offsets: torch.Tensor,
         out: torch.Tensor,
+        *,
+        pdl: bool = False,
+        sched: torch.Tensor | None = None,
     ) -> None:
         """``out[m, I] = silu(a @ gate.T) * (a @ up.T)`` with gate/up-interleaved ``w13``."""
 
@@ -68,10 +78,20 @@ class GroupedGemm(Protocol):
         w2: torch.Tensor,
         offsets: torch.Tensor,
         out: torch.Tensor,
+        *,
+        pdl: bool = False,
+        sched: torch.Tensor | None = None,
     ) -> None:
         """``out[m, H] = h @ w2[e].T``."""
 
     def destroy(self) -> None: ...
+
+
+# WCX decode rounds (runner ``wcx_max_tokens``): an implementation whose
+# ``supports_wcx`` attribute is true also provides
+#   fc1_wcx(a, wcx, offsets, out, *, pdl, sched) and fc2_wcx(h, wcx, offsets, out, *, pdl, sched)
+# with ``wcx`` a ``Sm90CakeWcxWeights``: the swap-AB early-start pair that reads
+# the compressed copies; same tiles, same bits as fc1 / fc2 with ``sched``.
 
 
 def validate_grouped_gemm_geometry(
@@ -161,6 +181,42 @@ def _check_geometry(
     return int(num_experts), int(shape_n), int(shape_k)
 
 
+def _check_wcx_geometry(
+    *,
+    gated: bool,
+    a: torch.Tensor,
+    wc: torch.Tensor,
+    stage_bytes: int,
+    offsets: torch.Tensor,
+    out: torch.Tensor,
+) -> tuple[int, int, int]:
+    num_experts, n_stages, k_stages, sb = wc.shape
+    shape_n, shape_k = n_stages * BLOCK_N, k_stages * BLOCK_K
+    n_out = shape_n // 2 if gated else shape_n
+    if wc.dtype != torch.uint8 or sb != stage_bytes:
+        raise ValueError("WCX weights must be uint8 [E, N / 256, K / 64, stage_bytes]")
+    if a.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+        raise ValueError("grouped GEMM activations must be bf16")
+    if a.shape[1] != shape_k or out.shape[1] != n_out or out.shape[0] != a.shape[0]:
+        raise ValueError(
+            f"WCX grouped GEMM geometry mismatch: a={tuple(a.shape)} wc={tuple(wc.shape)} out={tuple(out.shape)}"
+        )
+    if a.shape[0] % BLOCK_M != 0:
+        raise ValueError(
+            f"activation row capacity must be a multiple of {BLOCK_M}, got {a.shape[0]}"
+        )
+    if offsets.dtype != torch.int64 or offsets.numel() != num_experts + 1:
+        raise ValueError("offsets must be int64 [E + 1]")
+    if not (
+        a.is_contiguous()
+        and wc.is_contiguous()
+        and out.is_contiguous()
+        and offsets.is_contiguous()
+    ):
+        raise ValueError("grouped GEMM operands must be contiguous")
+    return int(num_experts), int(shape_n), int(shape_k)
+
+
 class ExportedGroupedGemm:
     """Shipped launcher: the generated, manifest-sealed FlashInfer JIT modules.
 
@@ -177,8 +233,54 @@ class ExportedGroupedGemm:
         fc1_stage = "fc1_gated_clamp" if clamp is not None else "fc1_gated"
         self._fc1 = gen_sm90_cake_bf16_grouped_gemm_module(fc1_stage).build_and_load()
         self._fc2 = gen_sm90_cake_bf16_grouped_gemm_module("fc2").build_and_load()
+        self._early_fc1_stage = f"{fc1_stage}_signal"
+        self._early: tuple[Any, Any] | None = None
+        self._wcx_fc1_stage = f"{fc1_stage}_signal_swap"
+        self._wcx: tuple[Any, Any] | None = None
         self._sm_count: dict[int, int] = {}
         self._destroyed = False
+
+    # FC2 early start: FC1 releases per-m-tile readiness counters into ``sched``
+    # and FC2 claims its tiles dynamically without griddepcontrol.wait, so FC2
+    # tiles run on the SMs that FC1's tail wave leaves free (same tiles, same
+    # bits).  Separate sealed modules; the FC1 / FC2 modules above are untouched.
+    supports_early_start = True
+
+    def _early_modules(self) -> tuple[Any, Any]:
+        if self._early is None:
+            from .cake_jit import gen_sm90_cake_bf16_grouped_gemm_module
+
+            self._early = (
+                gen_sm90_cake_bf16_grouped_gemm_module(
+                    self._early_fc1_stage
+                ).build_and_load(),
+                gen_sm90_cake_bf16_grouped_gemm_module("fc2_early").build_and_load(),
+            )
+        return self._early
+
+    # WCX decode rounds: the swap-AB early-start pair reading compressed weights
+    # (W rows decoded in registers as the RS wgmma A operand, tokens as the smem
+    # B operand); same readiness / tile-claim protocol as the early pair, same
+    # bits.  Separate modules; built when the runner enables WCX.
+    supports_wcx = True
+
+    def _wcx_modules(self) -> tuple[Any, Any]:
+        if self._wcx is None:
+            from .cake_jit import gen_sm90_cake_bf16_grouped_gemm_module
+
+            self._wcx = (
+                gen_sm90_cake_bf16_grouped_gemm_module(
+                    self._wcx_fc1_stage
+                ).build_and_load(),
+                gen_sm90_cake_bf16_grouped_gemm_module(
+                    "fc2_early_swap"
+                ).build_and_load(),
+            )
+        return self._wcx
+
+    def prepare_wcx(self) -> None:
+        """Build and load the WCX modules now (the runner calls it at init when WCX is on)."""
+        self._wcx_modules()
 
     def _grid_x(self, device: torch.device) -> int:
         index = (
@@ -199,13 +301,15 @@ class ExportedGroupedGemm:
         w: torch.Tensor,
         offsets: torch.Tensor,
         out: torch.Tensor,
+        pdl: bool = False,
+        extra: tuple[Any, ...] = (),
     ) -> None:
         if self._destroyed:
             raise RuntimeError("ExportedGroupedGemm has been destroyed")
         num_experts, shape_n, shape_k = _check_geometry(
             gated=gated, a=a, w=w, offsets=offsets, out=out
         )
-        module.run(
+        (module.run_pdl if pdl else module.run)(
             num_experts,
             shape_n,
             shape_k,
@@ -214,6 +318,7 @@ class ExportedGroupedGemm:
             w,
             offsets,
             out,
+            *extra,
             self._grid_x(a.device),
             1,
             1,
@@ -225,8 +330,26 @@ class ExportedGroupedGemm:
         w13: torch.Tensor,
         offsets: torch.Tensor,
         out: torch.Tensor,
+        *,
+        pdl: bool = False,
+        sched: torch.Tensor | None = None,
     ) -> None:
-        self._launch(self._fc1, gated=True, a=a, w=w13, offsets=offsets, out=out)
+        # early-start pair: release per-m-tile readiness into sched
+        if sched is not None:
+            self._launch(
+                self._early_modules()[0],
+                gated=True,
+                a=a,
+                w=w13,
+                offsets=offsets,
+                out=out,
+                pdl=pdl,
+                extra=(sched,),
+            )
+            return
+        self._launch(
+            self._fc1, gated=True, a=a, w=w13, offsets=offsets, out=out, pdl=pdl
+        )
 
     def fc2(
         self,
@@ -234,8 +357,106 @@ class ExportedGroupedGemm:
         w2: torch.Tensor,
         offsets: torch.Tensor,
         out: torch.Tensor,
+        *,
+        pdl: bool = False,
+        sched: torch.Tensor | None = None,
     ) -> None:
-        self._launch(self._fc2, gated=False, a=h, w=w2, offsets=offsets, out=out)
+        # early-start pair: must follow fc1(..., sched=sched) on the same stream
+        if sched is not None:
+            self._launch(
+                self._early_modules()[1],
+                gated=False,
+                a=h,
+                w=w2,
+                offsets=offsets,
+                out=out,
+                pdl=pdl,
+                extra=(sched, sched, 0),  # no per-expert FC2 completion counters
+            )
+            return
+        self._launch(
+            self._fc2, gated=False, a=h, w=w2, offsets=offsets, out=out, pdl=pdl
+        )
+
+    def _launch_wcx(
+        self,
+        module: Any,
+        *,
+        gated: bool,
+        a: torch.Tensor,
+        wc: torch.Tensor,
+        stage_bytes: int,
+        offsets: torch.Tensor,
+        out: torch.Tensor,
+        pdl: bool,
+        extra: tuple[Any, ...],
+    ) -> None:
+        if self._destroyed:
+            raise RuntimeError("ExportedGroupedGemm has been destroyed")
+        num_experts, shape_n, shape_k = _check_wcx_geometry(
+            gated=gated, a=a, wc=wc, stage_bytes=stage_bytes, offsets=offsets, out=out
+        )
+        (module.run_pdl if pdl else module.run)(
+            num_experts,
+            shape_n,
+            shape_k,
+            self._clamp,
+            a,
+            wc,
+            int(stage_bytes),
+            offsets,
+            out,
+            *extra,
+            self._grid_x(a.device),
+            1,
+            1,
+        )
+
+    def fc1_wcx(
+        self,
+        a: torch.Tensor,
+        wcx: Any,
+        offsets: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        pdl: bool = False,
+        sched: torch.Tensor,
+    ) -> None:
+        """FC1 of a WCX round (early-start pair with ``fc2_wcx`` on the same stream)."""
+        self._launch_wcx(
+            self._wcx_modules()[0],
+            gated=True,
+            a=a,
+            wc=wcx.w13c,
+            stage_bytes=wcx.stage_bytes13,
+            offsets=offsets,
+            out=out,
+            pdl=pdl,
+            extra=(sched,),
+        )
+
+    def fc2_wcx(
+        self,
+        h: torch.Tensor,
+        wcx: Any,
+        offsets: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        pdl: bool = False,
+        sched: torch.Tensor,
+    ) -> None:
+        """FC2 of a WCX round: must follow ``fc1_wcx(..., sched=sched)`` on the same stream."""
+        self._launch_wcx(
+            self._wcx_modules()[1],
+            gated=False,
+            a=h,
+            wc=wcx.w2c,
+            stage_bytes=wcx.stage_bytes2,
+            offsets=offsets,
+            out=out,
+            pdl=pdl,
+            extra=(sched, sched, 0),  # no per-expert FC2 completion counters
+        )
 
     def destroy(self) -> None:
         self._destroyed = True

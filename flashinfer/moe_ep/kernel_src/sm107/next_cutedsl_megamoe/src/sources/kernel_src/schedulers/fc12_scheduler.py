@@ -803,17 +803,24 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         work_id_worker: NonClcMixedCgaSchedulerWorker,
         task_mapping_state,
     ) -> Boolean:
-        """Wait until the static FC1 watermark or the smaller runtime stream end is claimed."""
+        """Wait until the static FC1 watermark or the smaller runtime stream end is claimed.
+
+        FlashInfer local fix (VENDOR.md "Local differences"): the peek below is one CTA-local load of a counter
+        that other clusters keep incrementing, so CTAs of one cluster (and the physical clusters of one fallback
+        group) can observe different values. The observation therefore only decides how long this CTA waits; it
+        never changes the scheduler state. Upstream set ``fc1_exhausted`` when the peek missed the watermark and the
+        runtime FC1 stream ends before it: a CTA that peeked just before the last terminal FC1 claims crossed the
+        watermark then disagreed with its cluster peers on ``fc1_exhausted``, the peers then mapped the same
+        broadcast work ID to different phases (each CTA uses its own stream choice), and the cluster deadlocked
+        (some CTAs left the claim loop while the leader kept claiming, or the 2-CTA MMA / multicast pairs ran
+        different tiles). FC1 exhaustion is now always learned from a claimed ID, which every CTA sees alike.
+        """
         if not fc1_exhausted:
             fc1_counter_pointer = work_id_worker.get_atomic_counter_pointer(Int32(0))
             minimum_claim_count = Int32(self.minimum_global_fc1_claims)
             if not spin_peek(fc1_counter_pointer, lambda value: value >= minimum_claim_count):
-                claim_target, stream_ends_before_target = resolve_phase_interleaved_fc1_claim_target(
-                    minimum_claim_count, task_mapping_state
-                )
+                claim_target, _ = resolve_phase_interleaved_fc1_claim_target(minimum_claim_count, task_mapping_state)
                 spin_wait(fc1_counter_pointer, lambda value: value >= claim_target)
-                if stream_ends_before_target:
-                    fc1_exhausted = Boolean(True)
         return fc1_exhausted
 
     @cute.jit

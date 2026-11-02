@@ -1,10 +1,16 @@
 """Prepared v3 full pipeline and grouped FP4 compute surfaces on SM100a/SM103a."""
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
-from ..deepgemm_common import load_catalog
-from .preparation import prepare_pipeline_bindings, build_tile_lists
+from ..deepgemm_common import UnsupportedDevice, load_catalog
+from .preparation import (
+    PIPELINE_KEY_FIELDS,
+    build_tile_lists,
+    pipeline_route_args,
+    prepare_pipeline_bindings,
+)
 
 LABEL = "Generated MegaMoE v3"
 
@@ -22,8 +28,11 @@ def device_arch(device):
 
 
 def supported_num_sms(arch):
-    """SM counts with catalogued routes for ``arch``."""
-    return list(catalog().supported_num_sms(arch))
+    """SM counts with catalogued routes for ``arch`` (every count a route admits)."""
+    counts = set()
+    for route in catalog().routes(arch).values():
+        counts.update(route_admitted_num_sms(route, arch))
+    return sorted(counts)
 
 
 def stage_program(stage, arch):
@@ -40,15 +49,7 @@ def load_program(arch, name, num_sms):
 
 def key(surface, args):
     names = (
-        (
-            "num_tokens",
-            "num_experts",
-            "top_k",
-            "hidden",
-            "intermediate",
-            "routed_weight_dtype",
-            "activation_clamp",
-        )
+        PIPELINE_KEY_FIELDS
         if surface == "pipeline"
         else (
             ("num_experts", "per_expert_M", "N", "K")
@@ -61,26 +62,105 @@ def key(surface, args):
     )
 
 
-def _route(arch, surface, args):
-    """Catalogued route for ``surface``/``args``; unknown routes raise."""
+# The shape fields a missing-route error lists per catalogued route.
+_SHAPE_SUMMARY = {
+    "pipeline": ("num_experts", "intermediate", "num_tokens", "routed_weight_dtype")
+}
+
+
+def _shape_summary(surface, fields):
+    names = _SHAPE_SUMMARY.get(surface)
+    if names is None:
+        return json.dumps(fields, sort_keys=True, separators=(",", ":"))
+    return tuple(fields.get(name) for name in names)
+
+
+def _route(arch, surface, args, *, note=""):
+    """Catalogued route for ``surface``/``args``.
+
+    An unknown route raises a ``RuntimeError`` that names the requested key
+    fields and the shapes the ``arch`` catalog does carry for ``surface``
+    (``_SHAPE_SUMMARY`` fields, every key field for the other surfaces).
+    """
+    routes = catalog().routes(arch)
+    route_key = key(surface, args)
     try:
-        return catalog().routes(arch)[key(surface, args)]
+        return routes[route_key]
     except KeyError as error:
+        wanted = json.loads(route_key)[1]
+        catalogued = sorted(
+            (
+                _shape_summary(surface, json.loads(k)[1])
+                for k in routes
+                if json.loads(k)[0] == surface
+            ),
+            key=str,
+        )
+        fields = _SHAPE_SUMMARY.get(surface, "key fields")
         raise RuntimeError(
-            f"No exported {arch} {surface} schedule for {args}"
+            f"No exported {arch} {surface} schedule for "
+            + ", ".join(f"{k}={v}" for k, v in wanted.items())
+            + f"{note}; the {arch} catalog lists {len(catalogued)} {surface} "
+            f"route(s) by {fields}: {catalogued}"
         ) from error
 
 
+def _per_arch(value, arch):
+    """A route field given per architecture (``{arch: value}``) or once."""
+    return value[arch] if isinstance(value, Mapping) else value
+
+
+def route_admitted_num_sms(route, arch):
+    """The physical SM counts ``route`` runs on for ``arch``.
+
+    A route names one count (``n``, or ``{arch: n}`` when it ships for several
+    architectures) or, for a program that takes the count from its compile
+    line, the list of counts it admits (``[n, ...]``).
+    """
+    admitted = _per_arch(route["num_sms"], arch)
+    if isinstance(admitted, (list, tuple)):
+        return tuple(int(n) for n in admitted)
+    return (int(admitted),)
+
+
+def route_grid(route, arch, num_sms):
+    """The launch grid of ``route`` on ``arch`` at ``num_sms`` SMs.
+
+    A route states its grid (``[x, y, z]``, or ``{arch: [x, y, z]}``); a route
+    that admits several SM counts omits it and runs the persistent grid of one
+    CTA per SM.
+    """
+    grid = _per_arch(route.get("grid"), arch)
+    if grid is None:
+        return (int(num_sms), 1, 1)
+    return tuple(int(v) for v in grid)
+
+
+def _device_num_sms(device):
+    import torch
+
+    return int(
+        torch.cuda.get_device_properties(torch.device(device)).multi_processor_count
+    )
+
+
 def _route_arch(route, device):
-    """Architecture of ``device``; it must carry the SM count ``route`` was generated for."""
+    """``(arch, num_sms)`` of ``device``: its architecture and physical SM count,
+    which ``route`` must admit."""
     arch = device_arch(device)
-    sms = catalog().device_num_sms(device, arch)
-    if sms != route["num_sms"][arch]:
-        raise RuntimeError(
-            f"The exported {arch} {route['metadata']['surface']} schedule was generated "
-            f"for {route['num_sms'][arch]} physical SMs; this device has {sms}"
+    sms = _device_num_sms(device)
+    if sms not in supported_num_sms(arch):
+        raise UnsupportedDevice(
+            f"{LABEL}: the exported {arch} programs are specialized for "
+            f"{supported_num_sms(arch)} physical SMs; {device} has {sms}"
         )
-    return arch
+    admitted = route_admitted_num_sms(route, arch)
+    if sms not in admitted:
+        raise UnsupportedDevice(
+            f"The exported {arch} {route['metadata']['surface']} schedule was generated "
+            f"for {list(admitted)} physical SMs; this device has {sms}"
+        )
+    return arch, sms
 
 
 class _Stage:
@@ -159,8 +239,7 @@ class V3Plan:
             for v in b.values()
             if isinstance(v, torch.Tensor)
         )
-        self.arch = _route_arch(route, t.device)
-        self.num_sms = route["num_sms"][self.arch]
+        self.arch, self.num_sms = _route_arch(route, t.device)
         self.route, self.outputs = route, outputs
         self.reset_storage, self.reset_buffers = reset_storage, tuple(reset_buffers)
         # Declared per architecture by the exported catalog route; absent means
@@ -258,7 +337,8 @@ def bind_prepared(
     arch = device_arch(t.device)
     route = _route(arch, surface, args)
     main = stage_bindings[route["stages"][-1]["name"]]
-    if tuple(main["grid"]) != tuple(route["grid"][arch]):
+    _, num_sms = _route_arch(route, t.device)
+    if tuple(main["grid"]) != route_grid(route, arch, num_sms):
         raise ValueError("No exported scheduling specialization for this prepared grid")
     return V3Plan(
         route,
@@ -277,19 +357,36 @@ def prepare_pipeline(inputs):
     Required dictionary fields: num_experts/top_k/num_tokens/hidden/intermediate,
     routed_weight_dtype/activation_clamp, x_fp8_packed/x_sf_packed,
     topk_idx(int64)/topk_weights(FP32), w1_fp4/w2_fp4 (or w1_fp8/w2_fp8),
-    and w1_sf/w2_sf (FP32 powers-of-two, granularity32). Gate/up weights are
-    logical halves; preparation applies the selected 8-way interleave and
-    source-schedule scale permutation. No upstream library is imported. The
-    counter workspace is allocated zeroed and the self-cleaning kernel never
-    needs it zeroed again.
+    and w1_sf/w2_sf (FP32 powers-of-two, granularity32). ``intermediate`` is
+    the model's logical width (a multiple of 32): the route is the one
+    generated for the next multiple of 128, and preparation pads the weights
+    and scales to that physical width with exact zeros when the two differ.
+    Optional ``local_expert_offset`` (default 0) and ``num_global_experts``
+    (default ``num_experts``) describe this rank's window of the global
+    expert space: ``topk_idx`` holds global ids, a slot outside the window
+    routes to no expert like a -1 slot, and the output is the rank's partial
+    sum over its local routes (zero rows for tokens without one). Gate/up
+    weights are logical halves; preparation applies the selected 8-way
+    interleave and source-schedule scale permutation. No upstream library is
+    imported. The counter workspace is allocated zeroed and the self-cleaning
+    kernel never needs it zeroed again.
     """
     arch = device_arch(inputs["x_fp8_packed"].device)
-    route = _route(arch, "pipeline", inputs)
-    # The persistent grid derives from the SM count the route was generated for.
-    data = prepare_pipeline_bindings(inputs, route["num_sms"][arch])
+    args = pipeline_route_args(inputs)
+    logical = int(inputs["intermediate"])
+    note = (
+        ""
+        if args["intermediate"] == logical
+        else f" (logical intermediate {logical} pads to {args['intermediate']})"
+    )
+    route = _route(arch, "pipeline", args, note=note)
+    # The persistent grid derives from the device's SM count, which the route
+    # must admit; the route's metadata names the program's source-schedule form.
+    _, num_sms = _route_arch(route, inputs["x_fp8_packed"].device)
+    data = prepare_pipeline_bindings(inputs, num_sms, route_metadata=route["metadata"])
     return bind_prepared(
         "pipeline",
-        inputs,
+        args,
         {"pipeline": data["bindings"]},
         data["output"],
         reset_storage=data["reset_storage"],
@@ -321,9 +418,10 @@ def prepare_grouped_l2(
     )
     arch = device_arch(A.device)
     route = _route(arch, "grouped_l2", args)
+    _, num_sms = _route_arch(route, A.device)
     tiles = te.numel()
     main = dict(
-        grid=tuple(route["grid"][arch]),
+        grid=route_grid(route, arch, num_sms),
         A=A.view(torch.uint8),
         B=B.view(torch.uint8),
         SFA=packed_a,

@@ -39,6 +39,10 @@ from flashinfer.utils import (
 )
 
 
+# H100 CI peak GPU memory: 44.4 GiB.
+pytestmark = pytest.mark.gpu_exclusive
+
+
 @pytest.fixture(
     autouse=not has_flashinfer_jit_cache(),
     scope="module",

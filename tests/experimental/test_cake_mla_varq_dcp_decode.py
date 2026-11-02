@@ -48,6 +48,10 @@ from flashinfer.experimental.cake_mla_varq_dcp_decode.cake_backend import (
 
 _LATENT_DIM = HEAD_DIM_V
 _SOFTMAX_SCALE = 1.0 / math.sqrt(_LATENT_DIM)
+# Inputs of magnitude 0.5 give a peaked softmax, so a score read from the wrong
+# keys moves the output well past the tolerance; near-uniform probabilities
+# from small inputs would hide it.
+_INPUT_SCALE = 0.5
 _PAGE_PERMUTATION_RANK_STRIDE = 7919
 
 
@@ -309,7 +313,7 @@ def _make_batched_inputs(
             device=device,
             dtype=storage_dtype,
         )
-        * 0.1
+        * _INPUT_SCALE
     ).to(dtype)
     query = torch.cat([dense[b, :q] for b, q in enumerate(q_lens)])
     global_kv = (
@@ -320,7 +324,7 @@ def _make_batched_inputs(
             device=device,
             dtype=storage_dtype,
         )
-        * 0.1
+        * _INPUT_SCALE
     ).to(dtype)
     cum_seq_lens_q = torch.tensor(
         [0, *torch.cumsum(torch.tensor(q_lens), 0).tolist()],

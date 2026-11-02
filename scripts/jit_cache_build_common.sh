@@ -4,6 +4,7 @@
 #   - scripts/build_flashinfer_jit_cache_whl.sh         (release/nightly)
 #   - scripts/build_jit_cache_provider_wheelhouse.sh    (provider experiment)
 #   - scripts/task_test_jit_cache_package_build_import.sh (PR tests)
+#   - scripts/run_with_test_sccache.sh                  (PR GPU test lanes)
 
 SCCACHE_VERSION="0.18.0"
 
@@ -97,8 +98,9 @@ validate_jit_cache_cuda_toolchain() {
   echo "nvcc CUDA version check passed: ${nvcc_cuda_version}"
 }
 
-# Install the matrix-selected PyTorch build environment and constrain the
-# isolated PEP 517 build to that exact distribution.
+# Install the matrix-selected PyTorch build environment and constrain every
+# later pip install, including the wheel's build requirements, to that exact
+# distribution.
 #
 # Args:
 #   $1 - Python executable used to invoke the build frontend.
@@ -285,7 +287,13 @@ setup_sccache() {
   local source_root=$2
   local sccache_arch
   sccache_arch=$(uname -m)
-  install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
+  if [ "$(sccache --version 2>/dev/null)" = "sccache ${SCCACHE_VERSION}" ]; then
+    # Already installed (e.g. by run_with_test_sccache.sh's fail-open probe).
+    export FLASHINFER_SCCACHE_INSTALL_SOURCE="${FLASHINFER_SCCACHE_INSTALL_SOURCE:-preinstalled}"
+    export FLASHINFER_SCCACHE_REVISION="${FLASHINFER_SCCACHE_REVISION:-v${SCCACHE_VERSION}}"
+  else
+    install_sccache "${SCCACHE_VERSION}" "${sccache_arch}"
+  fi
 
   export SCCACHE_REGION="${SCCACHE_REGION:-us-west-2}"
   export SCCACHE_BASEDIRS="${source_root}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
@@ -314,7 +322,9 @@ setup_sccache() {
   fi
   (( _sccache_xtrace )) && set -x
 
-  sccache --start-server
+  # Explicit return: a caller that guards setup_sccache with `if` runs it with
+  # errexit off, and must still see a failed startup.
+  sccache --start-server || return $?
   sccache --zero-stats
   export FLASHINFER_SCCACHE_ACTIVE=true
   echo "sccache version: $(sccache --version)"

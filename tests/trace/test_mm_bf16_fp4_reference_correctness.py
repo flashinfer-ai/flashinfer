@@ -23,6 +23,7 @@ def test_mm_bf16_fp4_reference_correctness(backend, shape_kwargs):
     unswizzles the 128x4 scale buffer).
     """
     import flashinfer
+    from flashinfer.gemm.gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout
     from flashinfer.trace.templates.gemm import (
         mm_bf16_fp4_cudnn_trace,
         mm_bf16_fp4_cute_dsl_sm100_trace,
@@ -34,7 +35,7 @@ def test_mm_bf16_fp4_reference_correctness(backend, shape_kwargs):
         pytest.skip("mm_bf16_fp4 requires a CUDA device")
     if backend == "cudnn":
         tpl = mm_bf16_fp4_cudnn_trace
-    elif torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+    elif _cute_dsl_uses_sm100_layout(*torch.cuda.get_device_capability()):
         tpl = mm_bf16_fp4_cute_dsl_sm100_trace
     else:
         tpl = mm_bf16_fp4_cute_dsl_trace
@@ -69,6 +70,20 @@ def test_mm_bf16_fp4_reference_correctness(backend, shape_kwargs):
         max_mismatch_pct=100.0,
         min_cos_sim=0.99,
     )
+    if backend == "cute-dsl" and _cute_dsl_uses_sm100_layout(
+        *torch.cuda.get_device_capability()
+    ):
+        from tests.test_helpers.w4a16_reference import (
+            assert_w4a16_bits,
+            dense_w4a16_reference,
+        )
+
+        # Keep the exported trace contract above and separately qualify the
+        # full-K SM100-family kernel against the shared exact W4A16 oracle.
+        expected = dense_w4a16_reference(
+            inputs["a"], inputs["b"], inputs["b_descale"], inputs["alpha"]
+        )
+        assert_w4a16_bits(api, expected)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 

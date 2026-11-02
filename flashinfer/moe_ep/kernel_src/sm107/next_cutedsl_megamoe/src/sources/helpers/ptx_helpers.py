@@ -749,3 +749,18 @@ __all__ = [
     "stg_f32",
     "tma_load_1d",
 ]
+
+
+@dsl_user_op
+def barrier_sync_unaligned(barrier_id, num_threads, *, loc=None, ip=None):
+    llvm.inline_asm(
+        res=None,
+        operands_=[Int32(barrier_id).ir_value(loc=loc, ip=ip), Int32(num_threads).ir_value(loc=loc, ip=ip)],
+        asm_string="barrier.cta.sync $0, $1;",
+        constraints="r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )

@@ -610,6 +610,39 @@ def test_cake_unbounded_direct_variants_use_exact_warp_launch_geometry():
         assert metadata.launch_threads == 32 * expected_warps
 
 
+def test_cake_unbounded_direct_variants_share_one_templated_body_cpu():
+    body_file = cake_decode_jit_module.CAKE_KDA_DECODE_BODY_FILE
+    assert body_file == "cake_kda_decode_d128_t1_unbounded_softplus_direct.cu"
+    csrc_dir = cake_decode_jit_module._get_csrc_dir()
+    body = (csrc_dir / body_file).read_text()
+    assert "#define THREADS CAKE_KDA_DECODE_LAUNCH_THREADS" in body
+    # variant -> (CAKE_KDA_DECODE_VALUE_SPLIT, _WARPS_PER_CTA, _LAUNCH_THREADS)
+    expected_defines = {
+        "d128_t1_unbounded_softplus_direct_split4": (4, 1, 32),
+        "d128_t1_unbounded_softplus_direct_split16": (16, 1, 32),
+        "d128_t1_unbounded_softplus_direct_split8": (8, 1, 32),
+        "d128_t1_unbounded_softplus_direct_split8_warp2": (8, 2, 64),
+    }
+    variants = cake_decode_jit_module.CAKE_KDA_DECODE_VARIANTS
+    assert set(expected_defines) == set(variants)
+    for variant, (value_split, warps, threads) in expected_defines.items():
+        metadata = cake_decode_jit_module.CAKE_KDA_DECODE_VARIANT_METADATA[variant]
+        binding = cake_decode_jit_module._get_binding_cu(metadata)
+        assert f'#define CAKE_KDA_DECODE_BODY_FILE "{body_file}"' in binding
+        assert f"#define CAKE_KDA_DECODE_VALUE_SPLIT {value_split}" in binding
+        assert f"#define CAKE_KDA_DECODE_WARPS_PER_CTA {warps}" in binding
+        assert f"#define CAKE_KDA_DECODE_LAUNCH_THREADS {threads}" in binding
+        assert "#define CAKE_KDA_DECODE_DIRECT_IMPL 1" in binding
+    # Every split- or warp-specific line is selected from the binding defines.
+    guards = {line for line in body.splitlines() if line.startswith("#if CAKE_KDA_")}
+    assert guards == {
+        "#if CAKE_KDA_DECODE_VALUE_SPLIT == 16",
+        "#if CAKE_KDA_DECODE_VALUE_SPLIT == 8",
+        "#if CAKE_KDA_DECODE_WARPS_PER_CTA == 2",
+    }
+    assert not list(csrc_dir.glob("cake_kda_decode_d128_t1_*_split*.cu"))
+
+
 @pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
 def test_exact_cpu_contract_selects_frozen_variant(monkeypatch, cc):
     _patch_cpu_selector_environment(monkeypatch, cc=cc)

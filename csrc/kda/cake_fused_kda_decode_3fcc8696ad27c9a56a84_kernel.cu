@@ -39,6 +39,15 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -91,16 +100,34 @@ __device__ __forceinline__ float2 fma_f32x2_rn_ftz(float2 a, float2 b, float2 c)
 extern "C" {
 
 __global__ __launch_bounds__(256) void
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+kernel_cake_fused_kda_decode_8b697d61d1b15a6fac4d(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int use_lower_bound, float lower_bound_log2, float norm_eps)
+#else
 kernel_cake_fused_kda_decode_3fcc8696ad27c9a56a84(__nv_bfloat16* __restrict__ x, float* __restrict__ weight, __nv_bfloat16* __restrict__ conv_state, __nv_bfloat16* __restrict__ raw_gate, __nv_bfloat16* __restrict__ raw_beta, float* __restrict__ A_log, float* __restrict__ dt_bias, int* __restrict__ state_indices, __nv_bfloat16* __restrict__ state, __nv_bfloat16* __restrict__ output_gate, float* __restrict__ norm_weight, __nv_bfloat16* __restrict__ output, int x_row_stride, int conv_slot_stride, int beta_row_stride, int state_slot_stride, int output_gate_row_stride, int H, int use_lower_bound, float lower_bound_log2, float norm_eps)
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
 {
     const int tid = threadIdx.x;
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+#else
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
     uint32_t lane;
     asm("mov.u32 %0, %%laneid;" : "=r"(lane));
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
+#else
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -146,6 +173,9 @@ kernel_cake_fused_kda_decode_3fcc8696ad27c9a56a84(__nv_bfloat16* __restrict__ x,
     is_live = ((requested_slot > 0) ? 1 : 0);
     float state_regs[32];
     unsigned int state_carriers[4];
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+    unsigned int next_state_carriers[16];
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
     float r_q[8];
     float r_k[8];
     float r_decay[8];
@@ -165,12 +195,20 @@ kernel_cake_fused_kda_decode_3fcc8696ad27c9a56a84(__nv_bfloat16* __restrict__ x,
                 state_regs[width_idx * 4 + 3] = _v4.w;
             }
         }
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+        long long conv_base = (long long)slot * (long long)conv_slot_stride + (long long)channel_base;
+#else
         int conv_base = slot * conv_slot_stride + channel_base;
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
         #pragma unroll
         for (int history_idx = 0; history_idx < 3; history_idx++) {
             {
                 uint2 _vld_1;
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+                _vld_1 = *reinterpret_cast<const uint2*>(conv_state + conv_base + (long long)(history_idx * qkv_size));
+#else
                 _vld_1 = *reinterpret_cast<const uint2*>(conv_state + conv_base + history_idx * qkv_size);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
                 uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
                 #pragma unroll
                 for (int _pair = 0; _pair < 2; _pair++) {
@@ -249,14 +287,22 @@ kernel_cake_fused_kda_decode_3fcc8696ad27c9a56a84(__nv_bfloat16* __restrict__ x,
                 __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                 _pk[0] = __floats2bfloat162_rn(state_regs[24 + 0], state_regs[24 + 1]);
                 _pk[1] = __floats2bfloat162_rn(state_regs[24 + 2], state_regs[24 + 3]);
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(conv_state))[conv_base + (long long)qkv_size]) = _pk2;
+#else
                 *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(conv_state))[conv_base + qkv_size]) = _pk2;
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
             }
             {
                 uint2 _pk2;
                 __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
                 _pk[0] = __floats2bfloat162_rn(r_q[0 + 0], r_q[0 + 1]);
                 _pk[1] = __floats2bfloat162_rn(r_q[0 + 2], r_q[0 + 3]);
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(conv_state))[conv_base + (long long)(2 * qkv_size)]) = _pk2;
+#else
                 *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(conv_state))[conv_base + 2 * qkv_size]) = _pk2;
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
             }
         }
     }
@@ -296,12 +342,21 @@ kernel_cake_fused_kda_decode_3fcc8696ad27c9a56a84(__nv_bfloat16* __restrict__ x,
             sBeta[0] = _tanh_approx_6 * 0.5f + 0.5f;
         }
     }
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+    long long state_head_base = (long long)slot * (long long)state_slot_stride + (long long)(head * 128 * 128);
+    long long state_group_base = state_head_base + (long long)(state_owner_row_base * 128) + (long long)k_start;
+#else
     int state_head_base = slot * state_slot_stride + head * 128 * 128;
     int state_group_base = state_head_base + state_owner_row_base * 128 + k_start;
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
     #pragma unroll
     for (int local_row = 0; local_row < 4; local_row++) {
         {
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+            const uint4* _vptr_2 = reinterpret_cast<const uint4*>(state + state_group_base + (long long)(local_row * 128));
+#else
             const uint4* _vptr_2 = reinterpret_cast<const uint4*>(state + state_group_base + local_row * 128);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
             uint4* _vdst_2 = reinterpret_cast<uint4*>(&state_carriers[0]);
             #pragma unroll
             for (int _blk = 0; _blk < 1; _blk++) {
@@ -372,15 +427,35 @@ kernel_cake_fused_kda_decode_3fcc8696ad27c9a56a84(__nv_bfloat16* __restrict__ x,
         float _rsqrt_1 = rsqrtf(k_sq + 1e-06f);
         k_scale = _rsqrt_1;
     }
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+    float _shfl_0;
+    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_0) : "f"(q_scale), "r"(lane_group));
+#else
     float _shfl_0 = __shfl_sync(0xFFFFFFFF, q_scale, lane_group);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
     q_scale = _shfl_0;
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+    float _shfl_1;
+    asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_1) : "f"(k_scale), "r"(lane_group));
+#else
     float _shfl_1 = __shfl_sync(0xFFFFFFFF, k_scale, lane_group);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
     k_scale = _shfl_1;
     #pragma unroll
     for (int i_1 = 0; i_1 < 8; i_1++) {
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+        float _shfl_2;
+        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_2) : "f"(r_q[i_1]), "r"(lane_group));
+#else
         float _shfl_2 = __shfl_sync(0xFFFFFFFF, r_q[i_1], lane_group);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
         r_q[i_1] = _shfl_2;
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+        float _shfl_3;
+        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_3) : "f"(r_k[i_1]), "r"(lane_group));
+#else
         float _shfl_3 = __shfl_sync(0xFFFFFFFF, r_k[i_1], lane_group);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
         r_k[i_1] = _shfl_3;
     }
     float beta = sBeta[0];
@@ -394,12 +469,20 @@ kernel_cake_fused_kda_decode_3fcc8696ad27c9a56a84(__nv_bfloat16* __restrict__ x,
     #pragma unroll
     for (int value_tile = 0; value_tile < 2; value_tile++) {
         int tile_base = value_tile * 64;
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+        long long state_tile_base = state_group_base + (long long)(tile_base * 128);
+#else
         int state_tile_base = state_group_base + tile_base * 128;
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
         if (value_tile > 0) {
             #pragma unroll
             for (int local_row_1 = 0; local_row_1 < 4; local_row_1++) {
                 {
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+                    const uint4* _vptr_3 = reinterpret_cast<const uint4*>(next_state_carriers + local_row_1 * 4);
+#else
                     const uint4* _vptr_3 = reinterpret_cast<const uint4*>(state + state_tile_base + local_row_1 * 128);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
                     uint4* _vdst_3 = reinterpret_cast<uint4*>(&state_carriers[0]);
                     #pragma unroll
                     for (int _blk = 0; _blk < 1; _blk++) {
@@ -517,7 +600,11 @@ kernel_cake_fused_kda_decode_3fcc8696ad27c9a56a84(__nv_bfloat16* __restrict__ x,
                     _pk[1] = __floats2bfloat162_rn(state_regs[local_row_a * 8 + 2], state_regs[local_row_a * 8 + 3]);
                     _pk[2] = __floats2bfloat162_rn(state_regs[local_row_a * 8 + 4], state_regs[local_row_a * 8 + 5]);
                     _pk[3] = __floats2bfloat162_rn(state_regs[local_row_a * 8 + 6], state_regs[local_row_a * 8 + 7]);
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + (long long)(local_row_a * 128) + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#else
                     *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + local_row_a * 128 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
                 }
                 {
                     __nv_bfloat162 _pk[4];
@@ -525,7 +612,24 @@ kernel_cake_fused_kda_decode_3fcc8696ad27c9a56a84(__nv_bfloat16* __restrict__ x,
                     _pk[1] = __floats2bfloat162_rn(state_regs[local_row_b * 8 + 2], state_regs[local_row_b * 8 + 3]);
                     _pk[2] = __floats2bfloat162_rn(state_regs[local_row_b * 8 + 4], state_regs[local_row_b * 8 + 5]);
                     _pk[3] = __floats2bfloat162_rn(state_regs[local_row_b * 8 + 6], state_regs[local_row_b * 8 + 7]);
+#if CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
+                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + (long long)(local_row_b * 128) + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                }
+            }
+            if (value_tile == 0 && row_group == 0) {
+                #pragma unroll
+                for (int next_row = 0; next_row < 4; next_row++) {
+                    {
+                        const uint4* _vptr_4 = reinterpret_cast<const uint4*>(state + state_group_base + 8192 + (long long)(next_row * 128));
+                        uint4* _vdst_4 = reinterpret_cast<uint4*>(&next_state_carriers[next_row * 4]);
+                        #pragma unroll
+                        for (int _blk = 0; _blk < 1; _blk++) {
+                            _vdst_4[_blk] = _vptr_4[_blk];
+                        }
+                    }
+#else
                     *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(state))[state_tile_base + local_row_b * 128 + 0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+#endif  // CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS
                 }
             }
             recurrence_value_a = state_query_pair_a.x + state_query_pair_a.y;

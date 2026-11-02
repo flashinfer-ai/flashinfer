@@ -1,0 +1,44 @@
+{
+  "cake_deepgemm_kgroup_gemm_13fd0136f53e4f96d245": {
+    "sha256": "2e1a62b445f384bd232ba25aa949478d204d680f2b5e95a8b6b4068565d04610"
+  },
+  "cake_deepgemm_kgroup_gemm_17c13b05632f7e35a40a": {
+    "sha256": "40de9b15e2f8f513aa7621fac1010f8f07a50380336924edadd4151974fe4af5"
+  },
+  "cake_deepgemm_kgroup_gemm_32deb9eceb840861d8fd": {
+    "sha256": "b5230b7d2bc17602005b70c262996f42ceace8676a60c2f4ec3c5b3b59d077e4"
+  },
+  "cake_deepgemm_kgroup_gemm_4cf43df98269cf45687f": {
+    "sha256": "b466b2a4ab4d436c65324d821c3cd581ee0ceb5e789037a2b674ebdc451ee04a"
+  },
+  "cake_deepgemm_kgroup_gemm_5f64733856f419815bf4": {
+    "sha256": "d32a4800a201b88e24d572b46dfa3e845c734dbc7786738ba930963803262c72"
+  },
+  "cake_deepgemm_kgroup_gemm_9963ef84a27e91f39d4b": {
+    "sha256": "2f7bd21f0663cb2c84989deae7b195594cc9c3c4c431792f332f4003ab07900f"
+  },
+  "cake_deepgemm_kgroup_gemm_a3a7d99202be6ef5c1b4": {
+    "sha256": "954c8b3ee2a0f9952870cbf987882c39cad9f8be8385397c5dda31c8f16cc5a5"
+  },
+  "cake_deepgemm_kgroup_gemm_aedbc6111772fd8ae334": {
+    "sha256": "f2a158c18faccf14f6c502f86bdbd03805fddd5b3e4d4bb57f3f2c1e615ae5bf"
+  },
+  "cake_deepgemm_kgroup_gemm_c56d23bb498806956523": {
+    "sha256": "d3e48c56e81059e470c126b44d9a062b0037fc99f635f389bbcf0f30d43c8da0"
+  },
+  "cake_deepgemm_kgroup_gemm_dac63f432b808c5518c8": {
+    "sha256": "f54b7d1ba41964c70e23660ec938844a38764ba810d81b760c0d732a3a0b3003"
+  },
+  "cake_deepgemm_kgroup_gemm_ebba63e7dd09c531e462": {
+    "sha256": "32100766046a3fb885f0f53cbfc8e0b8a837375a1d036e8a0938aac4462e8c53"
+  },
+  "cake_deepgemm_kgroup_gemm_ebbd2f224302623b9ec9": {
+    "sha256": "c6e70d0049e81aafab1e31076e467f203793ac65b6138dd0d8fc962ccb60a29c"
+  },
+  "cake_deepgemm_kgroup_gemm_eef388c8414e0475a6c8": {
+    "sha256": "66e181a17ef7429cdd152d822ac0f7e788500cb08f37df128653093c0a485089"
+  },
+  "cake_deepgemm_kgroup_gemm_f1dd5c4a99ab550df7a1": {
+    "sha256": "bc00a3751f2e2074b0d582f70eb33f35f2c0bfcec773dd85e9c3851c0f6ac20d"
+  }
+}

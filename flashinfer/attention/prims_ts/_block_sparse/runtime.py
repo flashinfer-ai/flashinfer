@@ -28,8 +28,9 @@ from ..decode import (
     _validate_exact_compact_strides,
     _validate_scale,
 )
-from ..sage import SageAttentionParams, sage_adapter_slots, validate_sage_params
+from ..sage.config import SageAttentionParams, validate_sage_params
 from .common import (
+    sage_adapter_slots,
     _SIGNED_INT32_MAX,
     _num_sparse_pattern_heads,
     _validate_dense_contiguous_plan_inputs,
@@ -146,7 +147,7 @@ def validate_block_sparse_metadata(
     batch_size: int,
     seq_len_q: int,
     seq_len_kv: int,
-    num_kv_heads: int,
+    num_pattern_heads: int,
     q_block_size: int,
     kv_block_size: int,
     use_kv_valid_bits: bool,
@@ -167,7 +168,7 @@ def validate_block_sparse_metadata(
             ndim=3,
             dtype=torch.int32,
             expected_device=device,
-            expected_shape=(batch_size, num_kv_heads, num_q_blocks + 1),
+            expected_shape=(batch_size, num_pattern_heads, num_q_blocks + 1),
         )
         _validate_metadata_tensor(
             block_indices,
@@ -194,7 +195,7 @@ def validate_block_sparse_metadata(
             expected_device=device,
             expected_shape=(
                 batch_size,
-                num_kv_heads,
+                num_pattern_heads,
                 num_q_blocks,
                 (num_kv_blocks + 31) // 32,
             ),
@@ -362,7 +363,7 @@ def validate_block_sparse_run(
             batch_size=state.batch_size,
             seq_len_q=state.seq_len_q,
             seq_len_kv=state.seq_len_kv,
-            num_kv_heads=_num_sparse_pattern_heads(
+            num_pattern_heads=_num_sparse_pattern_heads(
                 state.num_kv_heads, state.share_pattern_across_kv_heads
             ),
             q_block_size=state.q_block_size,
@@ -522,7 +523,8 @@ def prepare_block_sparse_run_unchecked(
 
     Only the work every launch needs happens here: K/V view selection, the
     plan-owned dummy token mask when the plan disabled token bits, the default
-    softmax scale, and allocation of an omitted output tensor.
+    softmax scale, the Sage scale tensors in adapter slot order, and allocation
+    of an omitted output tensor.
     """
 
     paged_kv: _PagedKVLaunchPayload | None = None
@@ -652,6 +654,7 @@ def launch_block_sparse(
             run_args.kv_valid_bits,
             state.row_route_offsets,
             state.route_workspace,
+            state.sage_scales,
             0 if state.max_blocks_per_row is None else state.max_blocks_per_row,
             *run_args.sage_slots,
             run_args.sm_scale,

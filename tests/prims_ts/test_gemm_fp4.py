@@ -453,14 +453,81 @@ def test_nvfp4_overlap_prepared_and_config_isolation(mma_k):
         {"epilogue_warps": 4},
         {"epilogue_warps": 7},
         {"operand_format": "fp8_e4m3", "nvfp4_mma_k": 64},
-        {"epilogue": "swiglu"},
-        {"epilogue": "qkv_qknorm_rope"},
+        {"epilogue": "qkv_qknorm_rope", "head_dim": 128, "is_neox": False},
         {"output_format": "fp8_e4m3"},
     ],
 )
 def test_nvfp4_overlap_rejects_unsupported_config(overrides):
     with pytest.raises(ValueError, match="overlap|epilogue_warps"):
         _load_kernel(replace(_overlap_config(), **overrides))
+
+
+@pytest.mark.parametrize("mma_k", [64, 96])
+@pytest.mark.parametrize("k", [256, 3072])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.uint8])
+def test_nvfp4_swiglu_overlap_matches_plain(mma_k, k, out_dtype):
+    _require_sm103("Overlap comparison requires SM103")
+    # Overlap changes only the accumulator schedule: SwiGLU output, including
+    # the packed NVFP4 payload and its scales, must be bit-identical.
+    m, n = 4097, 2048
+    a, asf, b, bsf = _fp4_problem(m, n, k)
+    sfa, sfb = _swizzled(asf, bsf)
+    kwargs = dict(out_dtype=out_dtype, mma_k=mma_k)
+    if out_dtype == torch.uint8:
+        kwargs["output_quant_scale"] = torch.tensor([0.25], device="cuda")
+    plain = prepare_fp4_linear_swiglu(b, sfb, 1.0, 1.0, **kwargs)
+    overlap = prepare_fp4_linear_swiglu(b, sfb, 1.0, 1.0, tmem_overlap=True, **kwargs)
+    assert overlap._module.acc_stages == 2
+    assert plain.config != overlap.config
+    expected, actual = plain(a, sfa), overlap(a, sfa)
+    if out_dtype == torch.uint8:
+        # Scale rows past M in the last 128-row block are padding that neither
+        # kernel writes, so compare the payload and the decoded real rows.
+        torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+        scale = kwargs["output_quant_scale"]
+        torch.testing.assert_close(
+            dequantize_nvfp4_128x4(actual[0], actual[1], scale),
+            dequantize_nvfp4_128x4(expected[0], expected[1], scale),
+            rtol=0,
+            atol=0,
+        )
+    else:
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        linear = F.linear(dequantize_nvfp4(a, asf, 1.0), dequantize_nvfp4(b, bsf, 1.0))
+        reference = linear[:, 0::2] * F.silu(linear[:, 1::2])
+        torch.testing.assert_close(actual.float(), reference, atol=1.0, rtol=6e-2)
+
+
+@pytest.mark.parametrize("k", [256, 3072])
+@pytest.mark.parametrize("has_qkv_scale", [False, True])
+def test_nvfp4_qkv_overlap_matches_plain(k, has_qkv_scale):
+    _require_sm103("Overlap comparison requires SM103")
+    # The early release happens after the QKNorm sum pass; output must be
+    # bit-identical to the single-accumulator schedule.
+    m, head_dim, num_heads = 4097, 128, 4
+    n = 3 * num_heads * head_dim
+    a, asf, b, bsf = _fp4_problem(m, n, k)
+    sfa, sfb = _swizzled(asf, bsf)
+    q_weight = torch.rand((head_dim,), device="cuda", dtype=torch.bfloat16)
+    k_weight = torch.rand((head_dim,), device="cuda", dtype=torch.bfloat16)
+    qkv_scale = torch.tensor([0.5, 1.5, 2.0], device="cuda") if has_qkv_scale else None
+    angles = torch.randn((m, head_dim // 2), device="cuda")
+    cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).contiguous()
+    positions = torch.arange(m, device="cuda", dtype=torch.int64)
+    kwargs = dict(
+        num_q_heads=num_heads,
+        num_kv_heads=num_heads,
+        head_dim=head_dim,
+        qkv_scale=qkv_scale,
+    )
+    overlap = prepare_fp4_qkv_qknorm_rope(
+        b, sfb, 1.0, 1.0, q_weight, k_weight, tmem_overlap=True, **kwargs
+    )
+    plain = prepare_fp4_qkv_qknorm_rope(b, sfb, 1.0, 1.0, q_weight, k_weight, **kwargs)
+    assert overlap._module.acc_stages == 2
+    expected = plain(a, sfa, cos_sin=cos_sin, positions=positions)
+    actual = overlap(a, sfa, cos_sin=cos_sin, positions=positions)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_nvfp4_overlap_epilogue_warp_config_isolation():

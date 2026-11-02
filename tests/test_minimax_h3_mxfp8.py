@@ -14,11 +14,16 @@
 
 """MiniMax-H3 MXFP8 pre-attention: prepared API, zero-input smoke and numerical reference.
 
-The numerical tests emulate both generated stages in PyTorch at the kernel's own
-rounding points (BF16 RMSNorm and AdaLN, UE8M0 block-32 scales rounded up to the
-next power of two, E4M3 round-to-nearest) and the CUTLASS MXFP8 GEMM between
-them, over representative, tail (one row around a production center) and smoke
-token counts.
+The numerical tests emulate the norm stage in PyTorch at its own rounding points
+(BF16 RMSNorm and AdaLN, UE8M0 block-32 scales rounded up to the next power of
+two, E4M3 round-to-nearest) over its caller-owned intermediates, and the fused
+GEMM's Q/K RMSNorm, RoPE and MXFP8 pack over the BF16 projection FlashInfer's
+CUTLASS MXFP8 GEMM computes from those intermediates: the fused GEMM accumulates
+in that GEMM's K order, so the projection its epilogue reads is that GEMM's
+output.  V passes the epilogue unchanged, so its packed bytes and scale codes
+are compared byte for byte with the MXFP8 quantization of that projection: a
+change of the fused GEMM's K order fails the test.  The token counts are
+representative, tail (one row around a production center) and smoke counts.
 """
 
 from __future__ import annotations
@@ -106,28 +111,41 @@ def test_prepared_api_preserves_caller_owned_outputs(monkeypatch) -> None:
 
 @pytest.mark.parametrize(
     ("capability", "expected"),
-    [((10, 0), "sm100a"), ((10, 3), "sm103a")],
+    [((10, 0), "sm_100a"), ((10, 3), "sm_103a")],
 )
 def test_exact_architecture_router(monkeypatch, capability, expected) -> None:
-    loader = pytest.importorskip("flashinfer.jit.cake_minimax_h3_mxfp8")
+    host = pytest.importorskip("flashinfer.diffusion_ops.cake_minimax_h3_mxfp8")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
-    assert loader.minimax_h3_mxfp8_target(torch.device("cuda")) == expected
+    assert host.minimax_h3_mxfp8_target(torch.device("cuda")) == expected
 
 
 def test_architecture_router_rejects_cross_routing(monkeypatch) -> None:
-    loader = pytest.importorskip("flashinfer.jit.cake_minimax_h3_mxfp8")
+    host = pytest.importorskip("flashinfer.diffusion_ops.cake_minimax_h3_mxfp8")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
     with pytest.raises(RuntimeError, match="exact compute capability 10.0 or 10.3"):
-        loader.minimax_h3_mxfp8_target(torch.device("cuda"))
+        host.minimax_h3_mxfp8_target(torch.device("cuda"))
 
 
-def test_unlisted_token_count_has_no_route() -> None:
-    loader = pytest.importorskip("flashinfer.jit.cake_minimax_h3_mxfp8")
-    with pytest.raises(RuntimeError, match="no exact MiniMax-H3 MXFP8 route"):
-        loader.minimax_h3_mxfp8_require_route(2, 8)
+@pytest.mark.parametrize(
+    ("M", "norm_ctas", "gemm_ctas"),
+    [
+        (1, 1, 2 * 84),  # one row tile, padded to a CTA pair
+        (128, 128, 2 * 84),
+        (129, 129, 2 * 84),  # two row tiles: one CTA pair
+        (257, 257, 4 * 84),  # three row tiles, padded to two CTA pairs
+        (32640, 32640, 256 * 84),
+    ],
+)
+def test_launch_grid_follows_the_token_count(M, norm_ctas, gemm_ctas) -> None:
+    host = pytest.importorskip("flashinfer.diffusion_ops.cake_minimax_h3_mxfp8")
+    assert host.minimax_h3_mxfp8_launch_grid("norm", M) == (norm_ctas, 1, 1)
+    assert host.minimax_h3_mxfp8_launch_grid("gemm", M) == (gemm_ctas, 1, 1)
+    with pytest.raises(ValueError, match="unknown stage"):
+        host.minimax_h3_mxfp8_launch_grid("post", M)
 
 
-def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
+def _zero_smoke_tensors(adaln_index: int, M: int = 1, P: int = 8):
+    """The run tensors and the intermediates of a smoke preparation."""
     if not _supported():
         pytest.skip("requires SM100a or SM103a")
     from flashinfer.gemm import gemm_base
@@ -164,23 +182,85 @@ def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
         ),
         "out_sf": torch.full((P, out_sf_stride), 255, dtype=torch.uint8, device=device),
     }
-    operation = MiniMaxH3Mxfp8PreAttention(
-        **values,
-        activation_q=torch.empty(
+    intermediates = {
+        "activation_q": torch.empty(
             (M, _HIDDEN), dtype=torch.float8_e4m3fn, device=device
         ),
-        activation_sf=torch.empty(
+        "activation_sf": torch.empty(
             (activation_sf_len,), dtype=torch.uint8, device=device
         ),
-        qkv_bf16=torch.empty((M, _QKV_WIDTH), dtype=torch.bfloat16, device=device),
-        gemm_workspace=torch.empty(
+        "qkv_bf16": torch.empty((M, _QKV_WIDTH), dtype=torch.bfloat16, device=device),
+        "gemm_workspace": torch.empty(
             (int(gemm_base.DEFAULT_WORKSPACE_SIZE),),
             dtype=torch.uint8,
             device=device,
         ),
-        P=P,
-    )
+    }
+    return values, intermediates
+
+
+def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
+    values, intermediates = _zero_smoke_tensors(adaln_index, M, P)
+    operation = MiniMaxH3Mxfp8PreAttention(**values, **intermediates, P=P)
     return operation, values
+
+
+def _offset_copy(tensor: torch.Tensor, offset: int) -> torch.Tensor:
+    """A contiguous copy of ``tensor`` at ``offset`` bytes past a 256-byte boundary."""
+    size = tensor.numel() * tensor.element_size()
+    storage = torch.zeros((size + 256,), dtype=torch.uint8, device=tensor.device)
+    view = storage[offset : offset + size].view(tensor.dtype).view(tensor.shape)
+    view.copy_(tensor)
+    assert view.is_contiguous() and view.data_ptr() % 256 == offset
+    return view
+
+
+@pytest.mark.parametrize(
+    ("name", "offset"),
+    [
+        ("x", 8),
+        ("q_norm_weight", 8),
+        ("k_norm_weight", 8),
+        ("rope_cos_sin", 8),
+        ("qkv_weight_sf", 8),
+        ("activation_q", 8),
+        ("activation_sf", 4),
+        ("out_q", 4),
+        ("out_sf", 1),
+        ("out_sf", 2),
+        ("debug_q_bf16", 8),
+    ],
+)
+def test_misaligned_tensors_are_rejected_at_preparation(name, offset) -> None:
+    values, intermediates = _zero_smoke_tensors(-1)
+    tensors = {**values, **intermediates}
+    if name.startswith("debug_"):
+        tensors["debug_q_bf16"] = torch.zeros(
+            (1, _HEADS, _HEAD_DIM), dtype=torch.bfloat16, device="cuda"
+        )
+        tensors["debug_k_bf16"] = torch.zeros_like(tensors["debug_q_bf16"])
+    tensors[name] = _offset_copy(tensors[name], offset)
+    with pytest.raises(ValueError, match=f"^{name} must have a"):
+        MiniMaxH3Mxfp8PreAttention(**tensors, P=8)
+
+
+def test_word_aligned_out_sf_matches_an_aligned_one() -> None:
+    """``out_sf`` needs 4-byte alignment only: one 32-bit store per output row."""
+    results = []
+    for offset in (0, 4):
+        values, intermediates = _zero_smoke_tensors(0)
+        values["adaln_shift"][0].fill_(1)
+        values["qkv_weight_q"].fill_(1)
+        values["qkv_weight_sf"].fill_(127)
+        values["out_sf"] = _offset_copy(values["out_sf"], offset)
+        operation = MiniMaxH3Mxfp8PreAttention(**values, **intermediates, P=8)
+        actual_q, actual_sf = operation.run(**values)
+        torch.cuda.synchronize()
+        assert actual_sf is values["out_sf"]
+        results.append((actual_q.view(torch.uint8).clone(), actual_sf.clone()))
+    assert torch.count_nonzero(results[0][1]).item() > 0
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
 
 
 @pytest.mark.parametrize("invalid_index", [-1, 9, -(2**31), 2**31 - 1])
@@ -290,6 +370,34 @@ def _assert_tight_block_scales(q: torch.Tensor, codes: torch.Tensor) -> None:
     assert torch.all(block_max[nonzero] >= _E4M3_MAX / 2)
     assert torch.all(block_max[nonzero] <= _E4M3_MAX)
     assert torch.all(block_max[~nonzero] == 0)
+
+
+def _mxfp8_quantize_rows(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """E4M3 bytes and UE8M0 codes of FP32 rows ``[..., K]``, as the epilogue packs.
+
+    The block scale is ``amax * RN(1 / 448)`` (the device's ``rcp.approx`` of
+    448), its UE8M0 code the scale's biased exponent rounded up to a power of
+    two (0 for an all-zero block) and each element code the E4M3
+    round-to-nearest of ``value * 2^(127 - code)``.
+    """
+    blocks = values.reshape(*values.shape[:-1], -1, _SCALE_BLOCK)
+    rcp = torch.tensor(1.0 / _E4M3_MAX, dtype=torch.float32, device=values.device)
+    scale = blocks.abs().amax(dim=-1) * rcp
+    bits = scale.view(torch.int32)
+    exponent = (bits >> 23) & 0xFF
+    mantissa = bits & 0x7FFFFF
+    round_up = (mantissa != 0) & ((exponent != 0) | (mantissa > 0x400000))
+    codes = torch.where(
+        scale > 0, (exponent + round_up.int()).clamp(max=254), torch.zeros_like(bits)
+    )
+    inverse = torch.where(
+        (codes > 0) & (codes < 254),
+        torch.exp2(127.0 - codes.float()),
+        torch.zeros_like(scale),
+    )
+    quantized = (blocks * inverse[..., None]).clamp(-_E4M3_MAX, _E4M3_MAX)
+    quantized = quantized.reshape(values.shape).to(torch.float8_e4m3fn)
+    return quantized.view(torch.uint8), codes.to(torch.uint8)
 
 
 def _make_inputs(M: int, P: int, seed: int, device: torch.device) -> dict:
@@ -424,13 +532,29 @@ def _reference_qkv(qkv_bf16: torch.Tensor, inputs: dict) -> tuple[torch.Tensor, 
     return q, k, v, q_magnitude, k_magnitude
 
 
+def _reference_projection(
+    activation_q: torch.Tensor, activation_sf: torch.Tensor, inputs: dict
+) -> torch.Tensor:
+    """The BF16 QKV projection FlashInfer's CUTLASS MXFP8 GEMM computes from the stage-1 bytes."""
+    from flashinfer.gemm import mm_mxfp8
+
+    return mm_mxfp8(
+        activation_q,
+        inputs["qkv_weight_q"].t(),
+        activation_sf,
+        inputs["qkv_weight_sf"],
+        out_dtype=torch.bfloat16,
+        backend="cutlass",
+    )
+
+
 def _assert_gemm_matches_dequantized_operands(
     qkv_bf16: torch.Tensor,
     activation_q: torch.Tensor,
     activation_codes: torch.Tensor,
     inputs: dict,
 ) -> None:
-    """The CUTLASS GEMM consumed the stage-1 bytes in the layout stage 1 wrote them."""
+    """The reference GEMM consumed the stage-1 bytes in the layout stage 1 wrote them."""
     weight_codes = _unswizzle_sf(
         inputs["qkv_weight_sf"], _QKV_WIDTH, _HIDDEN // _SCALE_BLOCK
     )
@@ -526,16 +650,19 @@ def test_numerical_reference_both_stages(M: int, P: int) -> None:
     assert torch.all(activation_q[invalid].view(torch.uint8) == 0)
     assert torch.all(activation_codes[invalid] == 0)
 
-    # GEMM: the BF16 projection equals the dequantized stage-1 operand times the
-    # dequantized prepacked weight (proves the swizzled scale layout end to end).
+    # GEMM: the reference BF16 projection equals the dequantized stage-1 operand
+    # times the dequantized prepacked weight (proves the swizzled scale layout
+    # end to end).  The fused GEMM keeps its projection on chip; the epilogue
+    # outputs below are checked against this projection.
+    projection = _reference_projection(activation_q, activation_sf, inputs)
     _assert_gemm_matches_dequantized_operands(
-        qkv_bf16, activation_q, activation_codes, inputs
+        projection, activation_q, activation_codes, inputs
     )
 
     # Stage 2: per-head Q/K RMSNorm + split-half NeoX RoPE, checked on the BF16
     # debug copies, then destination-major MXFP8 packing of Q, K and V.
     expected_q, expected_k, expected_v, q_magnitude, k_magnitude = _reference_qkv(
-        qkv_bf16, inputs
+        projection, inputs
     )
     _assert_within_round_points(
         debug_q, expected_q, q_magnitude, atol=1e-2, rtol=1e-2, what="debug_q_bf16"
@@ -549,6 +676,13 @@ def test_numerical_reference_both_stages(M: int, P: int) -> None:
     magnitude = torch.stack((q_magnitude, k_magnitude, expected_v.float().abs()), dim=2)
     magnitude = magnitude.view(M, P, heads_per_destination, _KINDS, _HEAD_DIM)
     magnitude = magnitude.permute(1, 0, 2, 3, 4)
+    # V passes the epilogue unchanged: its bytes and codes are exact.
+    expected_v_q, expected_v_codes = _mxfp8_quantize_rows(expected_v.float())
+    expected_v_q = expected_v_q.view(M, P, heads_per_destination, _HEAD_DIM)
+    expected_v_q = expected_v_q.permute(1, 0, 2, 3)
+    expected_v_codes = expected_v_codes.view(
+        M, P, heads_per_destination, _HEAD_DIM // _SCALE_BLOCK
+    ).permute(1, 0, 2, 3)
     for destination in range(P):
         codes = _unswizzle_sf(
             out_sf[destination], rows_per_destination, _HEAD_DIM // _SCALE_BLOCK
@@ -559,6 +693,16 @@ def test_numerical_reference_both_stages(M: int, P: int) -> None:
         )
         packed = out_q[destination]
         _assert_tight_block_scales(packed, codes)
+        differing = int(
+            (packed[:, :, 2].view(torch.uint8) != expected_v_q[destination])
+            .sum()
+            .item()
+        )
+        assert differing == 0, (
+            f"destination {destination}: {differing} V bytes differ from the MXFP8 "
+            "quantization of the CUTLASS projection"
+        )
+        assert torch.equal(codes[:, :, 2], expected_v_codes[destination])
         _assert_within_round_points(
             _dequantize_blocks(packed, codes),
             expected[destination],

@@ -50,6 +50,8 @@ from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
 from .device_target import gdn_compile_options, gdn_device_target, target_arch
 from .dtype_compat import as_bf16
+from . import _softplus
+from ._softplus import softplus_fp32
 
 
 def _mark_slot_dynamic(torch_t: torch.Tensor, *, assumed_align: int = 16):
@@ -311,13 +313,7 @@ def _mtp_precompute_replayssm_step(
     r_a = cutlass.Float32(a[i_n, i_t, i_hv])
     r_b = cutlass.Float32(b[i_n, i_t, i_hv])
     x = r_a + r_dt_bias
-    beta_x = softplus_beta * x
-    # Avoid evaluating exp on the linear softplus branch.
-    softplus_x = x
-    if beta_x <= softplus_threshold:
-        softplus_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-            cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=True), fastmath=True
-        )
+    softplus_x = softplus_fp32(x, softplus_beta, softplus_threshold)
     r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
     r_beta = cutlass.Float32(1.0) / (
         cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=True)
@@ -334,7 +330,7 @@ def _mtp_precompute_replayssm_step(
 @cute.kernel
 def gdn_verify_kernel_mtp(
     h0_source: cute.Tensor,  # 3D [pool*HV, V, K] when use_pool_indexing=False; 4D [pool, HV, V, K] when True
-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] - intermediate state cache
+    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] - intermediate state cache
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
@@ -359,6 +355,7 @@ def gdn_verify_kernel_mtp(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -600,21 +597,7 @@ def gdn_verify_kernel_mtp(
                 r_b = cutlass.Float32(b[i_n, i_t, i_hv])
 
                 x = r_a + r_dt_bias
-                beta_x = softplus_beta * x
-
-                exp_beta_x = cute.exp(beta_x, fastmath=True)
-                softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x, fastmath=True
-                )
-                use_softplus = (
-                    cutlass.Float32(1.0)
-                    if beta_x <= softplus_threshold
-                    else cutlass.Float32(0.0)
-                )
-                softplus_x = (
-                    use_softplus * softplus_val
-                    + (cutlass.Float32(1.0) - use_softplus) * x
-                )
+                softplus_x = softplus_fp32(x, softplus_beta, softplus_threshold)
 
                 r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
                 r_beta = cutlass.Float32(1.0) / (
@@ -867,7 +850,7 @@ def gdn_verify_kernel_mtp(
                         # Cache intermediate state if needed
                         if not cutlass.const_expr(cache_replayssm):
                             if cache_intermediate_states:
-                                flat_idx = i_n * T * HV + i_t * HV + i_hv
+                                flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                                 it0 = cute.local_tile(
                                     intermediate_states,
                                     (1, 1, vec_size),
@@ -1461,7 +1444,7 @@ def gdn_verify_kernel_mtp(
                         # Cache intermediate state LAST in timestep (fire-and-forget stores
                         # overlap with next timestep's compute)
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -1636,7 +1619,7 @@ def gdn_verify_kernel_mtp(
 
                         # Cache intermediate state if needed
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -1759,6 +1742,7 @@ def run_gdn_verify_kernel_mtp(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -1831,6 +1815,7 @@ def run_gdn_verify_kernel_mtp(
         scale,
         HV,
         T,
+        cache_steps,
         H,
         K,
         V,
@@ -1858,7 +1843,7 @@ def run_gdn_verify_kernel_mtp(
 @cute.kernel
 def gdn_verify_kernel_mtp_inline(
     h0_source: cute.Tensor,  # 3D [pool*HV, V, K] when use_pool_indexing=False; 4D [pool, HV, V, K] when True
-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] - intermediate state cache
+    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] - intermediate state cache
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
@@ -1883,6 +1868,7 @@ def gdn_verify_kernel_mtp_inline(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -2050,14 +2036,7 @@ def gdn_verify_kernel_mtp_inline(
             r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
             r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
             x_val = r_a_val + r_dt_bias
-            beta_x_val = softplus_beta * x_val
-            # A masked 0 * exp(large_x) would still produce NaN.
-            sp_x = x_val
-            if beta_x_val <= softplus_threshold:
-                sp_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + cute.exp(beta_x_val, fastmath=True),
-                    fastmath=True,
-                )
+            sp_x = softplus_fp32(x_val, softplus_beta, softplus_threshold)
             r_g_value = -cute.exp(r_A_log, fastmath=True) * sp_x
             r_g_arr[i_t] = cute.exp(r_g_value, fastmath=True)
             r_beta_value = cutlass.Float32(1.0) / (
@@ -2225,7 +2204,7 @@ def gdn_verify_kernel_mtp_inline(
 
                         # Cache intermediate state if needed
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -2559,7 +2538,7 @@ def gdn_verify_kernel_mtp_inline(
 
                         # Cache intermediate state
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -2679,6 +2658,7 @@ def run_gdn_verify_kernel_mtp_inline(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -2744,6 +2724,7 @@ def run_gdn_verify_kernel_mtp_inline(
         scale,
         HV,
         T,
+        cache_steps,
         H,
         K,
         V,
@@ -3177,14 +3158,14 @@ def run_mtp_decode(
                 mode=0, stride_order=(0, 1, 2), divisibility=1
             )
         )
-        A_log_tensor = from_dlpack(A_log, assumed_align=16)
+        A_log_tensor = from_dlpack(A_log)
         # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
-        a_tensor = from_dlpack(a, assumed_align=16).mark_layout_dynamic()
-        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
+        a_tensor = from_dlpack(a).mark_layout_dynamic()
+        dt_bias_tensor = from_dlpack(dt_bias)
         q_tensor = from_dlpack(q, assumed_align=16).mark_layout_dynamic()
         k_tensor = from_dlpack(k, assumed_align=16).mark_layout_dynamic()
         v_tensor = from_dlpack(v, assumed_align=16).mark_layout_dynamic()
-        b_tensor = from_dlpack(b, assumed_align=16).mark_layout_dynamic()
+        b_tensor = from_dlpack(b).mark_layout_dynamic()
         o_tensor = from_dlpack(output, assumed_align=16).mark_layout_dynamic()
         h0_indices_tensor = from_dlpack(
             initial_state_indices, assumed_align=16
@@ -3241,6 +3222,7 @@ def run_mtp_decode(
                     scale=scale,
                     HV=HV,
                     T=T,
+                    cache_steps=cache_steps,
                     H=H,
                     K=K,
                     V=V,
@@ -3261,7 +3243,7 @@ def run_mtp_decode(
                     cache_replayssm=cache_replayssm,
                     stream=stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             )
         else:
             compiled = build_and_load_cute_dsl_kernel(
@@ -3292,6 +3274,7 @@ def run_mtp_decode(
                     scale=scale,
                     HV=HV,
                     T=T,
+                    cache_steps=cache_steps,
                     H=H,
                     K=K,
                     V=V,
@@ -3312,7 +3295,7 @@ def run_mtp_decode(
                     cache_replayssm=cache_replayssm,
                     stream=stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             )
         cache["compiled"] = compiled
     else:

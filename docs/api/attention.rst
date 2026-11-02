@@ -195,6 +195,10 @@ single kernel launch.
 
     .. automethod:: __init__
 
+.. autoclass:: BatchDecodeWithAttentionSinkWrapper
+
+    .. automethod:: __init__
+
 
 SM120 NVFP4 Attention
 ---------------------
@@ -216,6 +220,12 @@ MLA (Multi-head Latent Attention) is an attention mechanism proposed in DeepSeek
 and `DeepSeek-R1 <https://arxiv.org/abs/2501.12948>`_).
 
 .. currentmodule:: flashinfer.mla
+
+Sliding-window MLA (SM90)
+-------------------------
+
+.. autofunction:: batch_decode_with_kv_cache_mla_swa
+.. autofunction:: get_mla_swa_workspace_size_bytes
 
 PageAttention for MLA
 ---------------------
@@ -250,10 +260,10 @@ PageAttention for MLA
 
 .. note::
 
-    With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), one
-    query token runs the Cake split decode kernel and several tokens run the
-    decode or the single-launch prefill kernel as chosen by
-    ``cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`` (DeepSeek-V4 sparse MLA
+    With ``backend="cake"`` on SM120/SM121 (``kv_cache_format="nvfp4"``), every
+    call runs the Cake split decode kernel or the single-launch prefill kernel
+    as chosen by ``cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`` from the
+    token, head and candidate counts and the SM count (DeepSeek-V4 sparse MLA
     SM120 tracker: flashinfer#4254).
 
 .. note::

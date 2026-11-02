@@ -9,30 +9,39 @@ from __future__ import annotations
 
 import functools
 from itertools import product
-from typing import Any
 
 import torch
 
-from .....autotuner import TuningConfig
 from .....fused_moe.api import QuantFormat, RoutingInputMode, SwiGLU
 from .....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from .....utils import get_compute_capability
 from . import fc2, fma, runtime
+from .support import large_bf16_moe
 from ..cache import (
-    LRUCache,
     require_graph_resource_retention,
-    retain_graph_resources,
+)
+from ..engine import (
+    FrostEngine,
+    FrostRunnerMixin,
+    PackedInputs as _Inputs,
+    allocate_workspace,
+    SelectionSnapshot,
+    capture_fma_selection,
+    make_kernel_selector,
+    seal_kernels,
 )
 from ..capabilities import require_compiler
 from ..activations import ACTIVATIONS, activation_name
-from ..support import weight_view
+from ..support import SUPPORTED_ARCHS, weight_view
 from ..compiler import require_moe_assembler
-from .support import large_bf16_moe
+from ..shortlist import capture_profiles
+from ..shortlist import _read
+from ..catalog import can_implement, select_kernels as select_catalog
+from ..heuristics import POLICY_VERSION
+from ..tuning import prepared_state, ranked_tactics
 
 _WEIGHT_KEYS = frozenset(("fc1_expert_weights", "fc2_expert_weights"))
 _TAG = "cudnn_frost-bf16-moe-v2"
-# Architectures with packaged BF16 sources.
-_SUPPORTED_ARCHS = ("sm_107a", "sm_120a")
 _UNSUPPORTED = "cuDNN Frost BF16 MoE kernels require SM107a or SM120a"
 
 
@@ -61,29 +70,24 @@ def _matching_kernels(roots, arch, rows, hidden, intermediate, experts, name):
     first = tuple(
         k
         for k in runtime._discover(roots)
-        if k.arch == arch
-        and k.activation == name
-        and all(
-            runtime._dimension_matches(v, k.contract.get(d)) for d, v in values.items()
-        )
+        if k.arch == arch and k.activation == name and can_implement(k, values)
     )
     values = dict(s=rows, n=hidden, k=intermediate, experts=experts, groups=experts)
     second = tuple(
-        k
-        for k in fc2.discover(roots)
-        if k.arch == arch
-        and all(
-            runtime._dimension_matches(v, k.contract.get(d)) for d, v in values.items()
-        )
+        k for k in fc2.discover(roots) if k.arch == arch and can_implement(k, values)
     )
     return first, second
 
 
 def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activation):
+    if not 0 < tokens <= 1 << 20:
+        return (), ()
     return _selected_kernels_cached(
         runtime._artifact_roots(),
         runtime._artifact_cache_version,
+        runtime._tactic_digest(POLICY_VERSION),
         runtime._arch_for(device),
+        torch.cuda.get_device_properties(device).multi_processor_count,
         tokens,
         hidden,
         intermediate,
@@ -95,26 +99,35 @@ def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activ
 
 @functools.lru_cache(maxsize=128)
 def _selected_kernels_cached(
-    roots, artifact_version, arch, tokens, hidden, intermediate, experts, topk, name
+    roots,
+    artifact_version,
+    compiler_key,
+    arch,
+    sm_count,
+    tokens,
+    hidden,
+    intermediate,
+    experts,
+    topk,
+    name,
 ):
     # Admission and packing share sealed artifact metadata, never runtime tensors
     # or pointers. Explicit artifact refresh advances the version in this key.
-    from ..shortlist import select
-
     first, second = _matching_kernels(
         roots, arch, tokens * topk, hidden, intermediate, experts, name
     )
-    return select(
-        roots,
-        arch,
-        name,
-        tokens,
-        hidden,
-        intermediate,
-        experts,
-        topk,
+    profiles = _read(roots).get((arch, name, experts, hidden, intermediate, topk), {})
+    return select_catalog(
         first,
         second,
+        (),
+        profiles,
+        tokens=tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        experts=experts,
+        topk=topk,
+        sm_count=sm_count,
     )
 
 
@@ -135,11 +148,18 @@ def _fma_tactic(tokens, hidden, intermediate, experts, topk, activation, device)
     return fma.tactic(activation_name(activation))
 
 
-class _Inputs(list):
-    def __init__(self, tensors, state, tuning_config):
-        super().__init__(tensors)
-        self.launch_state = state
-        self.tuning_config = tuning_config
+def _capture_selection(roots, arch, sm_count, activation):
+    name = activation_name(activation)
+    first = seal_kernels(runtime._discover(roots))
+    second = seal_kernels(fc2.discover(roots))
+    select_fma, validate_fma_sources = capture_fma_selection(fma, name, arch)
+    return SelectionSnapshot(
+        make_kernel_selector(
+            first, second, (), capture_profiles(roots), arch, name, sm_count
+        ),
+        select_fma,
+        validate_fma_sources,
+    )
 
 
 class _Plans:
@@ -154,78 +174,95 @@ class _Plans:
         first,
         second,
         workspace_pool,
+        executor_cache,
         fma_tactic=None,
+        validate_fma_sources=None,
     ):
+        first = tuple(runtime.bind_kernel(k, device) for k in first)
+        second = tuple(runtime.bind_kernel(k, device) for k in second)
+        self.first, self.second = first, second
         self.plans = {}
         self.launches = {}
         required = 0
         module = _module(runtime._arch_for(device))
         for a, b in product(first, second):
             key = (_TAG, a.tactic, b.tactic)
-            plan = module.make_plan(
-                runtime._load_kernel(a, device),
-                runtime._load_kernel(b, device),
-                tokens,
-                hidden,
-                intermediate,
-                experts,
-                topk,
-                device.index,
-                a.workspace_bytes,
-                b.workspace_bytes,
-                a.gated,
-                [
-                    {"output": -1, "scale": 0, "gate_scale": 1, "linear_scale": 2}[name]
-                    for name in a.launch_tail
-                ],
-                a.swap_ab,
-                b.swap_ab,
-                False,
-            )
-            # Retain Module ownership: its run Function borrows the native plan.
+            executor_key = (hidden, intermediate, experts, topk, False, key)
+            plan = executor_cache.get(executor_key)
+            if plan is None:
+                plan = module.make_runner(
+                    [runtime._load_kernel(a, device)],
+                    [runtime._load_kernel(b, device)],
+                    hidden,
+                    intermediate,
+                    experts,
+                    topk,
+                    device.index,
+                    a.workspace_bytes,
+                    b.workspace_bytes,
+                    a.gated,
+                    [
+                        {"output": -1, "scale": 0, "gate_scale": 1, "linear_scale": 2}[
+                            name
+                        ]
+                        for name in a.launch_tail
+                    ],
+                    a.swap_ab,
+                    b.swap_ab,
+                    False,
+                )
+                executor_cache[executor_key] = plan
+            # Packed states retain Modules whose run Functions borrow them.
             self.plans[key] = plan
             self.launches[key] = plan["run"]
-            required = max(required, plan["workspace_size"]())
+            required = max(required, plan["workspace_size"](tokens))
         if fma_tactic is not None:
-            first_fma, second_fma = fma.build(
-                tokens, hidden, intermediate, experts, topk, device, fma_tactic[1]
-            )
-            plan = module.make_plan(
-                first_fma,
-                second_fma,
-                tokens,
-                hidden,
-                intermediate,
-                experts,
-                topk,
-                device.index,
-                0,
-                0,
-                first[0].gated,
-                [],
-                False,
-                False,
-                True,
-            )
+            executor_key = (hidden, intermediate, experts, topk, False, fma_tactic)
+            plan = executor_cache.get(executor_key)
+            if plan is None:
+                if validate_fma_sources is not None:
+                    validate_fma_sources()
+                variants = [
+                    fma.build(
+                        t, hidden, intermediate, experts, topk, device, fma_tactic[1]
+                    )
+                    for t in range(1, 5)
+                    if fma.supported(
+                        t, hidden, intermediate, experts, topk, fma_tactic[1]
+                    )
+                ]
+                plan = module.make_runner(
+                    [pair[0] for pair in variants],
+                    [pair[1] for pair in variants],
+                    hidden,
+                    intermediate,
+                    experts,
+                    topk,
+                    device.index,
+                    0,
+                    0,
+                    first[0].gated,
+                    [],
+                    False,
+                    False,
+                    True,
+                )
+                if validate_fma_sources is not None:
+                    validate_fma_sources()
+                executor_cache[executor_key] = plan
             self.plans[fma_tactic], self.launches[fma_tactic] = plan, plan["run"]
-            required = max(required, plan["workspace_size"]())
-        # Exact-shape host plans must not imply one large GPU allocation per
-        # token count. Share geometrically grown storage on this runner's stream.
-        # Older graph-captured plans keep their original allocation alive.
-        capacity = min((size for size in workspace_pool if size >= required), default=0)
-        if not capacity:
-            capacity = 1 << (max(required, 1) - 1).bit_length()
-            workspace_pool[capacity] = torch.empty(
-                capacity, dtype=torch.uint8, device=device
-            )
-        self.workspace = workspace_pool[capacity][:required]
+            required = max(required, plan["workspace_size"](tokens))
+        # A bucket owns capacity storage; native executors use the call's actual
+        # token count. Older packed calls and graphs retain their allocation.
+        self.workspace = allocate_workspace(required, device, workspace_pool)
 
 
-class CudnnFrostBf16MoeRunner(MoERunner):
+class CudnnFrostBf16MoeRunner(FrostRunnerMixin, MoERunner):
     """A full MoE candidate, not a GEMM1 override in another backend."""
 
-    requires_exact_shape = True
     backend_key = "cudnn_frost_bf16"
+    weight_view_aliases = ("cutlass_bf16",)
+    _input_support = staticmethod(large_bf16_moe)
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = ((QuantFormat.BF16, QuantFormat.BF16),)
     supported_activation_classes = tuple(ACTIVATIONS.values())
@@ -237,15 +274,15 @@ class CudnnFrostBf16MoeRunner(MoERunner):
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
-        self._plans = LRUCache()
-        self._workspace_pool = {}
+        self._engine = None
+        self._plans, self._workspace_pool = {}, {}
 
     def _check_support(self):
         super()._check_support()
         if self.device.type != "cuda":
             raise NotImplementedError(_UNSUPPORTED)
         major, minor = get_compute_capability(self.device)
-        if f"sm_{major}{minor}a" not in _SUPPORTED_ARCHS:
+        if f"sm_{major}{minor}a" not in SUPPORTED_ARCHS:
             raise NotImplementedError(_UNSUPPORTED)
         name = activation_name(self.config.activation)
         if not self.config.finalize.do_finalize:
@@ -278,14 +315,35 @@ class CudnnFrostBf16MoeRunner(MoERunner):
         require_compiler(arch, sources)
 
     def _build(self):
-        # Shape-dependent native resources are prepared at pack time, never in capture.
-        pass
+        device, activation = self.device, self.config.activation
+        self._engine = FrostEngine(
+            device,
+            token_ceiling=self.config.execution.tune_max_num_tokens,
+            artifact_roots=runtime._artifact_roots,
+            artifact_version=lambda: runtime._artifact_cache_version,
+            policy_version=POLICY_VERSION,
+            tactic_tag=_TAG,
+            require_assembler=get_compute_capability(device) == (10, 7),
+            refresh_artifacts=runtime.clear_artifact_cache,
+            capture_selection=lambda roots, arch, sm_count: _capture_selection(
+                roots, arch, sm_count, activation
+            ),
+            build_plan=lambda shape, metadata, workspace_pool, executor_cache: _Plans(
+                *shape,
+                device,
+                metadata.first,
+                metadata.second,
+                workspace_pool,
+                executor_cache,
+                metadata.fma_tactic,
+                metadata.validate_fma_sources,
+            ),
+        )
+        self._plans = self._engine.plans
+        self._workspace_pool = self._engine.workspace_pool
 
-    def _validate_pack(self, act, weights):
-        # SM120 sources do not patch tensor maps, so the SM107 assembler
-        # workaround must not exclude their previously supported toolchains.
-        if get_compute_capability(self.device) == (10, 7):
-            require_moe_assembler()
+    def pack_inputs(self, act, weights):
+        self._require_built()
         self._validate_pack_contract(act)
         x = act.hidden_states_q
         if x.ndim != 2 or x.dtype != torch.bfloat16:
@@ -330,149 +388,59 @@ class CudnnFrostBf16MoeRunner(MoERunner):
             )
         if any(v.data_ptr() % 16 for v in (x, w1, w2)):
             raise ValueError("cuDNN Frost BF16 MoE requires 16B-aligned data")
-        return t, h, i, e, k, w1, w2
-
-    def accepts(self, act, weights):
-        """Per-call auto eligibility, including both artifacts and semantic overrides."""
-        major, minor = get_compute_capability(self.device)
-        if not large_bf16_moe(self.config, act, major * 10 + minor):
-            return False
-        try:
-            t, h, i, e, k, _, _ = self._validate_pack(act, weights)
-        except (KeyError, ValueError, TypeError, NotImplementedError):
-            return False
-        first, second = _selected_kernels(
-            t, h, i, e, k, self.device, self.config.activation
-        )
-        return bool(first and second)
-
-    def pack_inputs(self, act, weights):
-        self._require_built()
-        t, h, i, e, k, w1, w2 = self._validate_pack(act, weights)
-        first, second = _selected_kernels(
-            t, h, i, e, k, self.device, self.config.activation
-        )
-        if not first or not second:
-            raise ValueError("No matching cuDNN Frost FC1/FC2 source kernels")
-        fma_tactic = _fma_tactic(t, h, i, e, k, self.config.activation, self.device)
-        key = (
-            t,
-            h,
-            i,
-            e,
-            k,
-            tuple(a.tactic for a in first),
-            tuple(b.tactic for b in second),
-            fma_tactic,
-        )
-        if key not in self._plans:
-            with torch.cuda.device(self.device):
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "Prepare cuDNN Frost MoE outside CUDA Graph capture"
-                    )
-                self._plans[key] = _Plans(
-                    t,
-                    h,
-                    i,
-                    e,
-                    k,
-                    self.device,
-                    first,
-                    second,
-                    self._workspace_pool,
-                    fma_tactic,
-                )
-        output = torch.empty_like(act.hidden_states_q)
-        # Exact shapes: a fixed native plan cannot execute a rounded profile.
-        # Reuse this call's routing distribution when profiling, instead of random
-        # int32 expert ids. The hook is bound to the pack, not mutable runner state.
+        shape = (t, h, i, e, k)
+        state = self._engine.state(shape)
+        output = torch.empty_like(x)
         ids, scores = act.topk_ids, act.topk_weights
-
-        def preserve_routing(tensors):
-            tensors[2], tensors[3] = ids, scores
-            return tensors
-
-        # Warm the captured graph and measure sustained replay, as the layer's
-        # cross-backend selection does. A single first replay can mis-rank the
-        # compound plans even when their steady-state gap is substantial.
-        tuning = TuningConfig(
-            use_cuda_graph=True,
-            cuda_graph_profile_replays=3,
-            inputs_pre_hook=preserve_routing,
-        )
-        return _Inputs(
-            [output, act.hidden_states_q, ids, scores, w1, w2], self._plans[key], tuning
-        )
+        return _Inputs([output, x, ids, scores, w1, w2], state)
 
     def get_valid_tactics(self, inputs, profile):
         self._require_built()
-        state = self.launch_state_for(inputs)
+        state = prepared_state(self, inputs)
         if state is not None:
-            return list(state.launches)
+            return ranked_tactics(state, inputs, _TAG)
         # The autotuner synthesizes a plain tensor list for a profile, so the
         # original pack's launch metadata is not available here. Reapply the
         # same shape shortlist without compiling or building any native plans.
         tokens, hidden = inputs[1].shape
-        first, second = _selected_kernels(
-            tokens,
-            hidden,
-            self.config.experts.intermediate_size,
-            self.config.routing.num_experts,
-            self.config.routing.top_k,
-            self.device,
-            self.config.activation,
+        return self._engine.valid_tactics(
+            inputs,
+            shape=(
+                tokens,
+                hidden,
+                self.config.experts.intermediate_size,
+                self.config.routing.num_experts,
+                self.config.routing.top_k,
+            ),
         )
-        tactics = [(_TAG, a.tactic, b.tactic) for a, b in product(first, second)]
-        fma_tactic = _fma_tactic(
-            tokens,
-            hidden,
-            self.config.experts.intermediate_size,
-            self.config.routing.num_experts,
-            self.config.routing.top_k,
-            self.config.activation,
-            self.device,
-        )
-        if fma_tactic is not None:
-            tactics.append(fma_tactic)
-        return tactics
 
     def _input_cache_key_extras(self, inputs):
-        return (tuple(self.get_valid_tactics(inputs, None)),)
+        # Profiling uses plain lists; keep its key tied to the full prepared
+        # launch pool, just like PackedInputs, rather than the ranked shortlist.
+        state = prepared_state(self, inputs)
+        if state is not None:
+            key, tactics = state.preparation_key, tuple(state.launches)
+        else:
+            t, h = inputs[1].shape
+            metadata = self._engine.prepare(
+                (
+                    t,
+                    h,
+                    self.config.experts.intermediate_size,
+                    self.config.routing.num_experts,
+                    self.config.routing.top_k,
+                )
+            )
+            key, tactics = (
+                metadata.plan_key,
+                tuple(self.get_valid_tactics(inputs, None)),
+            )
+        return (POLICY_VERSION, key, tactics)
 
     def validate_tactic(self, inputs, tactic):
-        return tactic == -1 or tactic in self.get_valid_tactics(inputs, None)
-
-    def forward(
-        self,
-        inputs,
-        tactic: Any = -1,
-        do_preparation=False,
-        *,
-        launch_state=None,
-        **kwargs: Any,
-    ):
-        self._require_built()
-        state = launch_state or self.launch_state_for(inputs)
-        if state is None:
-            raise ValueError(
-                "Preserve packed cuDNN Frost inputs or pass their launch_state"
-            )
-        if tactic == -1:
-            tactic = next(iter(state.launches))
-        if tactic not in state.launches:
-            raise ValueError(f"Unknown or stale cuDNN Frost MoE tactic: {tactic!r}")
-        retain_graph_resources(state, inputs)
-        state.launches[tactic](*inputs, state.workspace)
-        return inputs[0]
-
-
-def automatic_candidate(config, device):
-    """Construct only a semantically supported candidate; no compilation here."""
-    runner = CudnnFrostBf16MoeRunner(config, device)
-    try:
-        runner.check_support()
-    except (NotImplementedError, ValueError):
-        return None
-    runner.build()
-    return runner
+        state = prepared_state(self, inputs)
+        return tactic == -1 or tactic in (
+            state.launches
+            if state is not None
+            else self.get_valid_tactics(inputs, None)
+        )

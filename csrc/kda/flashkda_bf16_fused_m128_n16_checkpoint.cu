@@ -688,8 +688,8 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
   unsigned int* smem_work_item_resolved = reinterpret_cast<unsigned int*>(smem_raw + 116756);
   const int smem_work_item_resolved_addr = smem + 116756;
 
-  // Mbarrier init (25 groups, 107 barriers)
-  // Mbarriers at smem_raw[0..856)
+  // Mbarrier init (25 groups, 122 barriers)
+  // Mbarriers at smem_raw[0..976)
 
   if (warp == 10) {
     // --- pipeline 'chunk_pipe' ---
@@ -697,8 +697,8 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
     // gate_raw_full: 5 barriers, init_count=1
     // qk_raw_full: 5 barriers, init_count=1
     // v_full: 5 barriers, init_count=1
-    // v_free: 5 barriers, init_count=4
-    // smem_free: 5 barriers, init_count=4
+    // v_free: 5 barriers, init_count=128
+    // smem_free: 5 barriers, init_count=128
     // raw_inputs_free: 5 barriers, init_count=1
     // state_inp_ready: 5 barriers, init_count=4
     // state_inp_left_ready: 5 barriers, init_count=4
@@ -716,16 +716,18 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
     // prep_diag_ready: 5 barriers, init_count=2
     // prep_inv16_ready: 5 barriers, init_count=2
     // work_item_ready: 1 barriers, init_count=1
-    // aux_pairwise_inputs_ready: 5 barriers, init_count=1
-    // aux_pairwise_consumed: 5 barriers, init_count=1
-    // aux_inverse_ready: 5 barriers, init_count=1
+    // --- pipeline 'aux_handoff_pipe' ---
+    // aux_pairwise_inputs_ready: 10 barriers, init_count=1
+    // aux_pairwise_consumed: 10 barriers, init_count=1
+    // aux_inverse_ready: 10 barriers, init_count=1
+    // --- pipeline 'chunk_pipe' ---
     // short_beta_ready: 5 barriers, init_count=1
     // Warp-cooperative initialization, grouped by equal arrival count.
     for (int _bar = lane; _bar < 20; _bar += 32) {
       mbarrier_init(smem + 0 + _bar * 8, 1);
     }
     for (int _bar = lane; _bar < 10; _bar += 32) {
-      mbarrier_init(smem + 160 + _bar * 8, 4);
+      mbarrier_init(smem + 160 + _bar * 8, 128);
     }
     for (int _bar = lane; _bar < 5; _bar += 32) {
       mbarrier_init(smem + 240 + _bar * 8, 1);
@@ -760,7 +762,7 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
     for (int _bar = lane; _bar < 10; _bar += 32) {
       mbarrier_init(smem + 608 + _bar * 8, 2);
     }
-    for (int _bar = lane; _bar < 21; _bar += 32) {
+    for (int _bar = lane; _bar < 36; _bar += 32) {
       mbarrier_init(smem + 688 + _bar * 8, 1);
     }
     asm volatile("fence.mbarrier_init.release.cluster;");
@@ -769,9 +771,9 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
   __syncwarp();
 
   // TMEM alloc (256 columns, 240 used)
-  volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 856);
+  volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 976);
   if (warp == 0) {
-    int _tmem_hold = smem + 856;
+    int _tmem_hold = smem + 976;
     asm volatile(
         "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(_tmem_hold),
         "r"(256)
@@ -805,9 +807,9 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
 #define prep_inv16_ready_addr (mbar_base + 648)
 #define work_item_ready_addr (mbar_base + 688)
 #define aux_pairwise_inputs_ready_addr (mbar_base + 696)
-#define aux_pairwise_consumed_addr (mbar_base + 736)
-#define aux_inverse_ready_addr (mbar_base + 776)
-#define short_beta_ready_addr (mbar_base + 816)
+#define aux_pairwise_consumed_addr (mbar_base + 776)
+#define aux_inverse_ready_addr (mbar_base + 856)
+#define short_beta_ready_addr (mbar_base + 936)
   const int taddr = tmem_addr_storage[0];
 
   // Kernel post-init ops
@@ -1289,8 +1291,8 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
           }
         }
         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+        mbarrier_arrive(v_free_addr + (compute_stage) * 8);
         if (elect_sync()) {
-          mbarrier_arrive(v_free_addr + (compute_stage) * 8);
           mbarrier_arrive(u_inp_ready_addr + (compute_stage) * 8);
         }
         mbarrier_wait(u2_acc_ready_addr + (compute_stage) * 8, _phase_u2_acc_ready);
@@ -1334,9 +1336,7 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
           mbarrier_arrive(u2_inp_ready_addr + (compute_stage) * 8);
         }
         mbarrier_wait(final_ready_addr + (compute_stage) * 8, _phase_final_ready);
-        if (elect_sync()) {
-          mbarrier_arrive(smem_free_addr + (compute_stage) * 8);
-        }
+        mbarrier_arrive(smem_free_addr + (compute_stage) * 8);
         {
           int checkpoint_token = (chunk_idx + 1) * 16;
         }
@@ -1606,7 +1606,6 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
   // ---- Role: aux_mma ----
   if (warp >= 10 && warp <= 11) {
     {  // aux_mma_main
-      unsigned int _phase_aux_pairwise_inputs_ready = 0;
       {
         int task_idx_2 = blockIdx.x;
         int seq_idx_2 = seq_order[task_idx_2 / num_heads];
@@ -1622,8 +1621,8 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
         for (int aux_iter = 0; aux_iter < num_aux_iters; aux_iter++) {
           int chunk_idx_2 = aux_iter * 2 + aux_instance;
           int stage_f32 = aux_stage * 5376;
-          mbarrier_wait(aux_pairwise_inputs_ready_addr + (aux_stage) * 8,
-                        _phase_aux_pairwise_inputs_ready);
+          mbarrier_wait(aux_pairwise_inputs_ready_addr + ((unsigned int)chunk_idx_2 % 10) * 8,
+                        (unsigned int)chunk_idx_2 / 10 % 2);
           unsigned int a_frag[4];
           unsigned int b_frag[4];
           float acc[8];
@@ -2706,7 +2705,7 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
           __syncwarp();
           if (elect_sync()) {
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            mbarrier_arrive(aux_pairwise_consumed_addr + (aux_stage) * 8);
+            mbarrier_arrive(aux_pairwise_consumed_addr + ((unsigned int)chunk_idx_2 % 10) * 8);
           }
           int lane_row = lane % 16;
           int lane_col = lane / 16 * 8;
@@ -2737,17 +2736,15 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
           if (elect_sync()) {
             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             mbarrier_arrive(qk_full_addr + (aux_stage) * 8);
-            mbarrier_arrive(aux_inverse_ready_addr + (aux_stage) * 8);
+            mbarrier_arrive(aux_inverse_ready_addr + ((unsigned int)chunk_idx_2 % 10) * 8);
           }
           aux_stage += 1;
           if (aux_stage == 5) {
             aux_stage = 0;
-            _phase_aux_pairwise_inputs_ready ^= 1;
           }
           aux_stage += 1;
           if (aux_stage == 5) {
             aux_stage = 0;
-            _phase_aux_pairwise_inputs_ready ^= 1;
           }
         }
       }
@@ -2970,10 +2967,8 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
       unsigned int _phase_v_free = 1;
       unsigned int _phase_qk_raw_full = 0;
       unsigned int _phase_short_beta_ready = 0;
-      unsigned int _phase_aux_pairwise_consumed = 0;
       unsigned int _phase_prep_diag_ready = 0;
       unsigned int _phase_prep_inv16_ready = 0;
-      unsigned int _phase_aux_inverse_ready = 0;
 #pragma unroll 1
       for (int prep_iter = 0; prep_iter < num_prep_iters; prep_iter++) {
         int chunk_idx_3 = prep_iter * 5 + prep_instance;
@@ -3546,7 +3541,8 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
           if (prep_local_warp == 0) {
             if (elect_sync()) {
               asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-              mbarrier_arrive(aux_pairwise_inputs_ready_addr + (prep_stage) * 8);
+              mbarrier_arrive(aux_pairwise_inputs_ready_addr +
+                              ((unsigned int)chunk_idx_3 % 10) * 8);
             }
           }
         }
@@ -3555,8 +3551,8 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
         float acc_1[8];
         long long tape_scaled_base = 0;
         {
-          mbarrier_wait(aux_pairwise_consumed_addr + (prep_stage) * 8,
-                        _phase_aux_pairwise_consumed);
+          mbarrier_wait(aux_pairwise_consumed_addr + ((unsigned int)chunk_idx_3 % 10) * 8,
+                        (unsigned int)chunk_idx_3 / 10 % 2);
         }
         {
           int stage_f32_0 = prep_stage * 5376;
@@ -3634,7 +3630,8 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
           }
         }
         {
-          mbarrier_wait(aux_inverse_ready_addr + (prep_stage) * 8, _phase_aux_inverse_ready);
+          mbarrier_wait(aux_inverse_ready_addr + ((unsigned int)chunk_idx_3 % 10) * 8,
+                        (unsigned int)chunk_idx_3 / 10 % 2);
         }
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         asm volatile("barrier.sync %0, 128;" ::"r"(10 + prep_instance) : "memory");
@@ -3698,10 +3695,8 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
             _phase_v_free ^= 1;
             _phase_qk_raw_full ^= 1;
             _phase_short_beta_ready ^= 1;
-            _phase_aux_pairwise_consumed ^= 1;
             _phase_prep_diag_ready ^= 1;
             _phase_prep_inv16_ready ^= 1;
-            _phase_aux_inverse_ready ^= 1;
           }
         }
       }

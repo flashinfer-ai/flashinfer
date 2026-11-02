@@ -753,6 +753,27 @@ def fence_proxy_async_shared_cta(*, loc=None, ip=None) -> None:
 
 
 @dsl_user_op
+def atomic_add_global_i32(address: Int64, value: Int32, *, loc=None, ip=None) -> Int32:
+    """Relaxed GPU-scope atomic add on a global int32; returns the old value."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Int64(address).ir_value(loc=loc, ip=ip),
+                Int32(value).ir_value(loc=loc, ip=ip),
+            ],
+            "atom.global.add.s32 $0, [$1], $2;",
+            "=r,l,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def remote_release_add1_u32(address: Int64, *, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None,
@@ -881,6 +902,116 @@ def stmc_bf16x8(
             "}"
         ),
         "l,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def load_f32x8(base: cute.Tensor, offset: Int64):
+    pointer = cute.make_ptr(
+        Float32,
+        (base.iterator + offset).llvm_ptr,
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    fragment = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
+    cute.autovec_copy(
+        cute.make_tensor(pointer, cute.make_layout((VEC_BF16,))), fragment
+    )
+    return fragment.load()
+
+
+@cute.jit
+def store_f32x8(base: cute.Tensor, offset: Int64, values) -> None:
+    pointer = cute.make_ptr(
+        Float32,
+        (base.iterator + offset).llvm_ptr,
+        cute.AddressSpace.gmem,
+        assumed_align=32,
+    )
+    fragment = cute.make_rmem_tensor(cute.make_layout((VEC_BF16,)), Float32)
+    fragment.store(values)
+    cute.autovec_copy(
+        fragment, cute.make_tensor(pointer, cute.make_layout((VEC_BF16,)))
+    )
+
+
+@cute.jit
+def load_bf16x8_as_f32(base: cute.Tensor, offset: Int64):
+    pointer = cute.make_ptr(
+        BFloat16,
+        (base.iterator + offset).llvm_ptr,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    return packed_u32x4_to_bf16x8(load_global_u32x4(pointer)).to(Float32)
+
+
+@dsl_user_op
+def store_shared_u32x4_address(
+    shared_address: Int32, packed, *, loc=None, ip=None
+) -> None:
+    """Store four words to a 16-byte-aligned ``shared::cta`` address."""
+    words = [packed[index].ir_value(loc=loc, ip=ip) for index in range(4)]
+    llvm.inline_asm(
+        None,
+        [shared_address.ir_value(loc=loc, ip=ip), *words],
+        "st.shared.v4.u32 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def bulk_store_shared_to_global(
+    global_address: Int64,
+    shared_address: Int32,
+    size_bytes: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """Copy ``size_bytes`` from shared to global memory as one bulk async-group.
+
+    Both addresses must be 16-byte aligned and ``size_bytes`` a multiple of 16.
+    The shared source must be made visible to the async proxy first
+    (``fence_proxy_async_shared_cta`` after the stores that fill it), and may
+    only be overwritten after ``bulk_wait_group_read`` has retired the group.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            global_address.ir_value(loc=loc, ip=ip),
+            shared_address.ir_value(loc=loc, ip=ip),
+            size_bytes.ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;\n\t"
+        "cp.async.bulk.commit_group;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def bulk_wait_group_read(pending: cutlass.Constexpr[int], *, loc=None, ip=None) -> None:
+    """Wait until at most ``pending`` of this thread's bulk groups still read shared memory."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"cp.async.bulk.wait_group.read {pending};",
+        "",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

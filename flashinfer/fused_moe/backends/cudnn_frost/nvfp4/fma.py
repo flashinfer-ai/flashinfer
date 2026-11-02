@@ -14,6 +14,7 @@ from ..activations import ACTIVATIONS, is_gated
 
 _TAG = "cudnn_frost-nvfp4-fma-v1"
 _ROOT = Path(__file__).parent
+_DEVICE_ROOT = _ROOT.parents[1] / "frost_low_latency" / "fma" / "nvfp4"
 _KERNELS = ("fma_fc1_o2.py", "fma_fc1_o4.py", "fma_fc2.py")
 
 
@@ -35,9 +36,9 @@ def source_digest():
     # Include imported conversion helpers and the native launch ABI. A change
     # must invalidate both persistent compilation and autotuning results.
     paths = [
-        *(_ROOT / name for name in _KERNELS),
+        *(_DEVICE_ROOT / name for name in _KERNELS),
         Path(__file__),
-        _ROOT.parent / "fma_activations.py",
+        _DEVICE_ROOT.parent / "activations.py",
         _ROOT.parent / "activations.py",
         _ROOT.parents[3] / "cute_dsl" / "fp4_common.py",
         _ROOT.parent / "csrc" / "moe_nvfp4.cu",
@@ -54,8 +55,8 @@ def _requirements():
     return tuple(
         (path, common._digest(path))
         for path in (
-            *(_ROOT / name for name in _KERNELS),
-            _ROOT.parent / "fma_activations.py",
+            *(_DEVICE_ROOT / name for name in _KERNELS),
+            _DEVICE_ROOT.parent / "activations.py",
         )
     )
 
@@ -92,11 +93,17 @@ def compile():
     t, h, i, e, k, swizzled, first = _FMA_CONFIG
     s = t * k
     if first:
+        weight_sf = cute.runtime.make_fake_tensor(
+            cutlass.Uint8,
+            ((2 if _GATED else 1), e, i, h // 16),
+            stride=(cute.sym_int64(), cute.sym_int64(), h // 16, 1),
+            assumed_align=16,
+        )
         args = [
             _fake(cutlass.Uint8, (t, h // 2)),
             _fake(cutlass.Uint8, (1, 128 * h // 16) if swizzled else (t, h // 16)),
             _fake(cutlass.Uint8, (e, (2 if _GATED else 1) * i, h // 2)),
-            _fake(cutlass.Uint8, ((2 if _GATED else 1), e, i, h // 16)),
+            weight_sf,
             _fake(cutlass.Float32, (e,), 4),
             _fake(cutlass.Int32, (t, k), 4),
             _fake(cutlass.Uint8, (s * i // 2,)),
@@ -123,7 +130,16 @@ def compile():
 
 @functools.cache
 def _source(
-    tokens, hidden, intermediate, experts, topk, swizzled, first, activation="swiglu"
+    tokens,
+    hidden,
+    intermediate,
+    experts,
+    topk,
+    swizzled,
+    first,
+    activation="swiglu",
+    *,
+    source_identity,
 ):
     from .....jit.env import FLASHINFER_GEN_SRC_DIR
 
@@ -131,8 +147,8 @@ def _source(
     config = (tokens, hidden, intermediate, experts, topk, swizzled, first)
     activation = activation if first else "identity"
     source = (
-        (_ROOT / name).read_text()
-        + f"\n# FMA source identity: {source_digest()}\n_FMA_CONFIG = {config!r}\n"
+        (_DEVICE_ROOT / name).read_text()
+        + f"\n# FMA source identity: {source_identity}\n_FMA_CONFIG = {config!r}\n"
         + f"_ACTIVATION = {activation!r}\n_GATED = {is_gated(activation)!r}\n"
         + _COMPILE
     )
@@ -159,10 +175,19 @@ def build(
         tokens, hidden, intermediate, experts, topk, activation
     ):
         raise ValueError("Unsupported NVFP4 FMA geometry/architecture")
+    source_identity = source_digest.__wrapped__()
     return tuple(
         common._load_source(
             *_source(
-                tokens, hidden, intermediate, experts, topk, swizzled, first, activation
+                tokens,
+                hidden,
+                intermediate,
+                experts,
+                topk,
+                swizzled,
+                first,
+                activation,
+                source_identity=source_identity,
             ),
             arch,
             device.index,

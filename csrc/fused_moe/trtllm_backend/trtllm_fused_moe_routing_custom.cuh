@@ -112,6 +112,10 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
   // then wait on primary grid
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
+    // Downstream kernels wait on this grid before reading any routing output (the batched
+    // GEMMs guard every routing-dependent load with a grid dependency), so they can launch
+    // and run their prologue while this kernel computes the routing.
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
 
@@ -313,14 +317,6 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
       }
     }
   }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  // Trigger the secondary kernel AFTER all global memory writes (including permutation indices).
-  // The downstream kernels depend on all routing outputs being visible.
-  if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
 }
 
 // Returns whether a compiled tier covered the runtime (numExperts, topK) and the
@@ -442,6 +438,10 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   if (params.mUsePdl) {
     cudaGridDependencySynchronize();
+    // Downstream kernels wait on this grid before reading any routing output (the batched
+    // GEMMs guard every routing-dependent load with a grid dependency), so they can launch
+    // and run their prologue while this kernel computes the routing.
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
 
@@ -651,12 +651,6 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
       }
     }
   }
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  if (params.mUsePdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
 }
 
 // Returns whether a compiled tier covered the runtime (numExperts, topK) and the
@@ -1616,22 +1610,16 @@ void run(Data const& data, void* stream) {
   // The two kernels overlap via cudaTriggerProgrammaticLaunchCompletion()
   // and cudaGridDependencySynchronize().
   //
-  // Dispatch rule (derived from a policy × (E, K) × BS sweep, see
-  // `bench_routing_sweep.py` + `bench_routing_analyze.py`):
+  // Dispatch rule (derived from a routing-only sweep of every routingCustom policy over
+  // E in {128..1024}, K in {4..22}, BS in [1, 256] on SM100, SM103 and SM107):
   //
-  //   useSplit = useSingleCluster && !useSingleBlock && numExperts >= 160
+  //   Few experts (E < 160): split when K >= 8 and BS * K >= 1536, where the fused kernel's
+  //   per-thread K-sized state dominates (up to 2.4x for E=128, K=22).
+  //   Sigmoid+bias policies (DeepSeekV3 nGroup=1, MiniMax2) with E >= 160: always split.
+  //   Other policies with E >= 160: split when BS > 64, or when E >= 512, 10 <= K <= 16 and
+  //   BS >= 32. Below that the fused single-cluster kernel is faster than the scores kernel
+  //   plus the PDL handoff.
   //   plus the bounded high-E/high-K static-block boundary selected above.
-  //
-  // Why this rule (measured on B200 across {Default, Renormalize,
-  // DeepSeekV3_nGrp1, MiniMax2} policies, BS ∈ [17, 256]):
-  //   - At `numExperts >= 160` split wins on average for every policy:
-  //     1.17× (Renormalize 160/8) up to 3.62× (DeepSeekV3 1024/32).
-  //   - At `numExperts = 128`, split's two-kernel overhead (launch + PDL
-  //     handoff) approximately cancels the single-cluster savings.  Default
-  //     128/8 is ~1.0×; DeepSeekV3 / MiniMax2 128/8 show ~1.11× but
-  //     Renormalize 128/8 is ~1.06× — not worth the complexity.
-  //   - Below the cluster range, block/dynblock remains the default; the bounded high-E/high-K
-  //     static-block boundary above is the measured exception.
   //
   // Env-var override for benchmarking, applies to *both* the single-cluster
   // split path and the large-BS topK kernel choice:
@@ -1662,8 +1650,18 @@ void run(Data const& data, void* stream) {
         "support block-per-token; the request is ignored.");
   }
 
-  bool useSplitTopKPath = useSingleCluster && !useSingleBlock && policySupportsBlockPerToken &&
-                          (data.mNumExperts >= NumExperts160Experts);
+  bool const splitBeatsFusedCluster = [&] {
+    if (data.mNumExperts < NumExperts160Experts) {
+      return data.mTopK >= 8 && data.mNumTokens * data.mTopK >= 1536;
+    }
+    if (data.mPreprocessType == RoutingPreprocessType::SigmoidBias) {
+      return true;
+    }
+    return data.mNumTokens > 64 || (data.mNumExperts >= 512 && data.mTopK >= 10 &&
+                                    data.mTopK <= 16 && data.mNumTokens >= 32);
+  }();
+  bool useSplitTopKPath =
+      useSingleCluster && !useSingleBlock && policySupportsBlockPerToken && splitBeatsFusedCluster;
   if (forceMode == ForceMode::kOn && useSingleCluster && !useSingleBlock &&
       policySupportsBlockPerToken) {
     useSplitTopKPath = true;

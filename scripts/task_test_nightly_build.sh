@@ -51,6 +51,7 @@ pip install --no-deps "${DIST_PYTHON_DIR}"/*.tar.gz
 # Verify installation
 echo "Verifying installation..."
 # Run from /tmp to avoid importing local flashinfer/ source directory
+(cd /tmp && python "${SOURCE_WORKSPACE}/scripts/validate_nightly_packages.py")
 (cd /tmp && python -m flashinfer show-config)
 
 # Copy test sources and their benchmark fixtures into an isolated directory so
@@ -58,6 +59,10 @@ echo "Verifying installation..."
 cp -a "${SOURCE_WORKSPACE}/tests" "${TEST_RUN_DIR}/"
 cp -a "${SOURCE_WORKSPACE}/benchmarks" "${TEST_RUN_DIR}/"
 cp -a "${SOURCE_WORKSPACE}/pytest.ini" "${TEST_RUN_DIR}/"
+mkdir -p "${TEST_RUN_DIR}/scripts"
+cp -a "${SOURCE_WORKSPACE}/scripts/__init__.py" "${TEST_RUN_DIR}/scripts/"
+cp -a "${SOURCE_WORKSPACE}/scripts/test_sharding" \
+  "${TEST_RUN_DIR}/scripts/"
 
 # Run test shard
 echo "Running test shard ${TEST_SHARD}..."

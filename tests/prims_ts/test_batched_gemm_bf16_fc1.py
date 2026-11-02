@@ -26,6 +26,7 @@ from flashinfer.utils import is_sm100a_supported
 
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
     uniform_pipeline_stage_overrides,
+    ActKind,
     BatchMode,
     DType,
 )
@@ -46,8 +47,7 @@ BF16_FC1_BASE = dict(
     tile_scheduler=0,
     act_kind=0,
     sf_layout_b=1,
-    cluster_m=1,
-    tile_m=128,
+    umma_cta_count=1,
     mma_m=128,
     mma_k=16,
     dtype_a=int(DType.BF16),
@@ -56,7 +56,7 @@ BF16_FC1_BASE = dict(
     epilogue_regs=160,
     mma_regs=48,
     load_regs=48,
-    gather_regs=48,
+    load_b_regs=48,
     padding_regs=48,
     use_unroll_loop_2x_for_mma=0,
     use_max_tmem_overlap=0,
@@ -113,6 +113,14 @@ class TestBf16Fc1TmaRoute:
         top_k=1,
         swap_ab=False,
         act_kind=0,
+        pipeline_stages=4,
+        umma_cta_count=1,
+        cluster_dim_x=0,
+        cluster_dim_y=1,
+        fallback_cluster_dim_x=0,
+        fallback_cluster_dim_y=1,
+        problem_n=None,
+        require_mixed_cga_runtime=False,
     ):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -123,7 +131,16 @@ class TestBf16Fc1TmaRoute:
             "batch_mode": int(BatchMode.BATCH_N if swap_ab else BatchMode.BATCH_M),
             "transpose_mma_output": int(swap_ab),
             "act_kind": act_kind,
+            "umma_cta_count": umma_cta_count,
+            "cluster_dim_x": cluster_dim_x,
+            "cluster_dim_y": cluster_dim_y,
+            "fallback_cluster_dim_x": fallback_cluster_dim_x,
+            "fallback_cluster_dim_y": fallback_cluster_dim_y,
         }
+        if umma_cta_count >= 2:
+            cfg["mma_m"] = 256
+            cfg["tile_scheduler"] = 1
+            cfg["num_stages_tmem_acc"] = 2
         result = reference_check(
             num_experts=num_experts,
             num_tokens=num_tokens,
@@ -132,7 +149,9 @@ class TestBf16Fc1TmaRoute:
             tile_k=128,
             mma_n=tile_n,
             epi_tile_n=tile_n,
-            **uniform_pipeline_stage_overrides(4),
+            problem_n=problem_n,
+            require_mixed_cga_runtime=require_mixed_cga_runtime,
+            **uniform_pipeline_stage_overrides(pipeline_stages),
             **cfg,
         )
         assert result
@@ -175,6 +194,34 @@ class TestBf16Fc1TmaRoute:
 
     def test_tma_route_nonrounded_topk(self):
         self._run(num_experts=3, num_tokens=130, top_k=2, swap_ab=False)
+
+    @pytest.mark.parametrize("tile_n", [16, 32, 128])
+    def test_tma_route_swap_partial_tile(self, tile_n):
+        self._run(
+            num_experts=3,
+            num_tokens=130,
+            top_k=2,
+            swap_ab=True,
+            tile_n=tile_n,
+            pipeline_stages=3,
+        )
+
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    def test_tma_route_mixed_cga(self, swap_ab):
+        """TMA gather4 multicasts routed activation tiles in a mixed CGA."""
+        self._run(
+            tile_n=64,
+            num_experts=2,
+            num_tokens=256,
+            swap_ab=swap_ab,
+            umma_cta_count=2,
+            cluster_dim_x=4,
+            cluster_dim_y=2,
+            fallback_cluster_dim_x=2,
+            fallback_cluster_dim_y=1,
+            problem_n=8192 if swap_ab else 4096,
+            require_mixed_cga_runtime=True,
+        )
 
 
 class TestBf16Fc1ActivationValidation:
@@ -230,8 +277,14 @@ class TestBf16Fc1GatherGPU:
         num_tokens=128,
         top_k=1,
         swap_ab=False,
-        cluster_m=1,
+        umma_cta_count=1,
+        cluster_dim_x=0,
+        cluster_dim_y=1,
+        fallback_cluster_dim_x=0,
+        fallback_cluster_dim_y=1,
         problem_k=None,
+        problem_n=None,
+        require_mixed_cga_runtime=False,
     ):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
             reference_check,
@@ -241,13 +294,17 @@ class TestBf16Fc1GatherGPU:
             **BF16_FC1_BASE,
             "batch_mode": int(BatchMode.BATCH_N if swap_ab else BatchMode.BATCH_M),
             "transpose_mma_output": int(swap_ab),
-            "cluster_m": cluster_m,
+            "umma_cta_count": umma_cta_count,
+            "cluster_dim_x": cluster_dim_x,
+            "cluster_dim_y": cluster_dim_y,
+            "fallback_cluster_dim_x": fallback_cluster_dim_x,
+            "fallback_cluster_dim_y": fallback_cluster_dim_y,
         }
-        if cluster_m >= 2:
+        if umma_cta_count >= 2:
             cfg["mma_m"] = 256
             cfg["tile_scheduler"] = 1
             cfg["num_stages_tmem_acc"] = 2
-            # num_gather_warps computed by kernel's compute_warp_layout
+            # Routed operand loader width is resolved by compute_warp_layout
         result = reference_check(
             num_experts=num_experts,
             num_tokens=num_tokens,
@@ -257,11 +314,13 @@ class TestBf16Fc1GatherGPU:
             mma_n=tile_n,
             epi_tile_n=tile_n,
             problem_k=problem_k,
+            problem_n=problem_n,
+            require_mixed_cga_runtime=require_mixed_cga_runtime,
             **uniform_pipeline_stage_overrides(pipeline_stages),
             **cfg,
         )
         assert result, (
-            f"FC1 gather failed: tile_n={tile_n}, swap={swap_ab}, cluster={cluster_m}"
+            f"FC1 gather failed: tile_n={tile_n}, swap={swap_ab}, cluster={umma_cta_count}"
         )
 
     def test_gather_noswap_tile8(self):
@@ -295,7 +354,7 @@ class TestBf16Fc1GatherGPU:
         self._run(
             tile_n=64,
             swap_ab=False,
-            cluster_m=2,
+            umma_cta_count=2,
             num_experts=2,
             num_tokens=256,
             pipeline_stages=4,
@@ -305,10 +364,72 @@ class TestBf16Fc1GatherGPU:
         self._run(
             tile_n=64,
             swap_ab=True,
-            cluster_m=2,
+            umma_cta_count=2,
             num_experts=2,
             num_tokens=256,
             pipeline_stages=4,
+        )
+
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    def test_gather_2cta_mixed_cga(self, swap_ab):
+        """Exercise both 4x2 and fallback 2x1 CGAs for non-TMA FC1."""
+        self._run(
+            tile_n=64,
+            swap_ab=swap_ab,
+            umma_cta_count=2,
+            cluster_dim_x=4,
+            cluster_dim_y=2,
+            fallback_cluster_dim_x=2,
+            fallback_cluster_dim_y=1,
+            num_experts=2,
+            num_tokens=256,
+            problem_n=8192 if swap_ab else 4096,
+            pipeline_stages=4,
+            require_mixed_cga_runtime=True,
+        )
+
+    @pytest.mark.parametrize(
+        (
+            "swap_ab",
+            "cluster_dim_x",
+            "cluster_dim_y",
+            "fallback_cluster_dim_x",
+            "fallback_cluster_dim_y",
+        ),
+        [
+            (False, 4, 1, 2, 1),
+            (True, 4, 1, 2, 1),
+            (False, 2, 2, 2, 1),
+            (True, 2, 2, 2, 1),
+            (False, 4, 4, 2, 2),
+            (True, 4, 4, 2, 2),
+        ],
+    )
+    def test_gather_mixed_cga_topologies(
+        self,
+        swap_ab,
+        cluster_dim_x,
+        cluster_dim_y,
+        fallback_cluster_dim_x,
+        fallback_cluster_dim_y,
+    ):
+        """Cover X-only, Y-only, and 16-CTA preferred physical CGAs."""
+        self._run(
+            tile_n=64,
+            swap_ab=swap_ab,
+            umma_cta_count=2,
+            cluster_dim_x=cluster_dim_x,
+            cluster_dim_y=cluster_dim_y,
+            fallback_cluster_dim_x=fallback_cluster_dim_x,
+            fallback_cluster_dim_y=fallback_cluster_dim_y,
+            num_experts=2,
+            num_tokens=256,
+            # Batch-N needs more logical CGAs for the driver to select the
+            # smaller physical shape on SM103.  4096 launches only 32 CGAs
+            # here, which can all use the preferred 4-CTA shape.
+            problem_n=8192 if swap_ab else 4096,
+            pipeline_stages=4,
+            require_mixed_cga_runtime=True,
         )
 
     @pytest.mark.parametrize("swap_ab", [False, True])
@@ -317,11 +438,30 @@ class TestBf16Fc1GatherGPU:
         self._run(
             tile_n=64,
             swap_ab=swap_ab,
-            cluster_m=2,
+            umma_cta_count=2,
             num_experts=1,
             num_tokens=64,
             problem_k=1024,
             pipeline_stages=4,
+        )
+
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    def test_gather_mixed_cga_multistage_wrap(self, swap_ab):
+        """Reuse LDGSTS full/empty barriers under both physical CGA sizes."""
+        self._run(
+            tile_n=64,
+            swap_ab=swap_ab,
+            umma_cta_count=2,
+            cluster_dim_x=4,
+            cluster_dim_y=2,
+            fallback_cluster_dim_x=2,
+            fallback_cluster_dim_y=1,
+            num_experts=2,
+            num_tokens=256,
+            problem_n=8192 if swap_ab else 4096,
+            problem_k=1024,
+            pipeline_stages=4,
+            require_mixed_cga_runtime=True,
         )
 
 
@@ -471,11 +611,48 @@ class TestBf16Fc1ReLU2:
         self._run_relu2(swap_ab=False, has_gather=True)
 
 
+class TestBf16Fc1SiLU:
+    def _run_silu(self, *, tile_n=16, swap_ab=False, has_gather=False):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        cfg = {
+            **BF16_FC1_BASE,
+            "act_kind": int(ActKind.SILU),
+            "batch_mode": int(BatchMode.BATCH_N if swap_ab else BatchMode.BATCH_M),
+            "transpose_mma_output": int(swap_ab),
+        }
+        if not has_gather:
+            cfg["route_act"] = 0  # NONE — no gather
+        result = reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            tile_n=tile_n,
+            tile_k=128,
+            mma_n=tile_n,
+            epi_tile_n=tile_n,
+            **uniform_pipeline_stage_overrides(4),
+            **cfg,
+        )
+        assert result
+
+    def test_silu_noswap(self):
+        self._run_silu(swap_ab=False)
+
+    def test_silu_swap(self):
+        self._run_silu(swap_ab=True)
+
+    def test_silu_gather(self):
+        self._run_silu(swap_ab=False, has_gather=True)
+
+
 class TestBf16Fc1HighThroughput:
     HT_CFG = {
         **BF16_FC1_BASE,
         "route_act": 1,
-        "cluster_m": 2,
+        "umma_cta_count": 2,
         "mma_m": 256,
         "tile_scheduler": 1,
         "num_stages_tmem_acc": 2,
@@ -484,7 +661,7 @@ class TestBf16Fc1HighThroughput:
         "epilogue_regs": 168,
         "mma_regs": 96,
         "load_regs": 96,
-        "gather_regs": 96,
+        "load_b_regs": 96,
         "padding_regs": 96,
         "workid_regs": 96,
     }
@@ -531,7 +708,7 @@ class TestBf16Fc1HighThroughput:
             "act_kind": 1,
             "bias_type": 0,
             "has_gemm1_clamp_limit": 1,
-            "route_sfs_act": 0,
+            "route_sfs_act": -1,
             "use_clc_fast_drain": 0,
             "use_early_exit": 1,
             "use_tma_oob_opt": 1,
@@ -551,3 +728,68 @@ class TestBf16Fc1HighThroughput:
             **cfg,
         )
         assert result
+
+    @pytest.mark.parametrize("tile_n", [128, 256])
+    @pytest.mark.parametrize("use_shuffled_matrix", [0, 1])
+    def test_ht_batch_m_streamed_epi128(self, tile_n, use_shuffled_matrix):
+        """Drain one epi128 tile in two register steps into one TMA box."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        cfg = {
+            **self.HT_CFG,
+            "batch_mode": int(BatchMode.BATCH_M),
+            "transpose_mma_output": 0,
+            "act_kind": int(ActKind.SWIGLU),
+            "use_shuffled_matrix": use_shuffled_matrix,
+            "use_tma_store": 1,
+            "cta_raster_order": 1,
+        }
+        assert reference_check(
+            num_experts=3,
+            num_tokens=769,
+            top_k=2,
+            problem_n=512,
+            problem_k=512,
+            repeat_launches=3,
+            output_guard_elements=256,
+            tile_n=tile_n,
+            tile_k=64,
+            mma_n=tile_n,
+            epi_tile_n=128,
+            **uniform_pipeline_stage_overrides(4),
+            **cfg,
+        )
+
+    def test_ht_batch_m_bf16_max_tmem_overlap(self):
+        """Unscaled BF16 Batch-M shares only the epi64 accumulator window."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        cfg = {
+            **self.HT_CFG,
+            "batch_mode": int(BatchMode.BATCH_M),
+            "transpose_mma_output": 0,
+            "route_act": 0,
+            "act_kind": int(ActKind.SWIGLU),
+            "num_stages_tmem_acc": 1,
+            "use_max_tmem_overlap": 1,
+            "use_tma_store": 1,
+        }
+        assert reference_check(
+            num_experts=3,
+            num_tokens=769,
+            top_k=2,
+            problem_n=512,
+            problem_k=512,
+            repeat_launches=3,
+            output_guard_elements=256,
+            tile_n=256,
+            tile_k=64,
+            mma_n=256,
+            epi_tile_n=64,
+            **uniform_pipeline_stage_overrides(4),
+            **cfg,
+        )

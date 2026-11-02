@@ -3778,6 +3778,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     def is_valid_mma_tiler_and_cluster_shape(
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
+        gated: bool = True,
     ) -> bool:
         """
         Check if the mma tiler and cluster shape are valid
@@ -3788,6 +3789,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type mma_tiler_mn: Tuple[int, int]
         :param cluster_shape_mn: The (ClusterM, ClusterN) shape of the CTA cluster
         :type cluster_shape_mn: Tuple[int, int]
+        :param gated: Whether the fused activation is gated (SwiGLU family).
+            Non-gated ones (e.g. ReLU2 in Nemotron MoE models) also allow N=192.
+        :type gated: bool
 
         :return: True if the mma tiler and cluster shape are valid, False otherwise
         :rtype: bool
@@ -3799,8 +3803,10 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             is_valid = False
         # Skip invalid mma tile n
         # SwiGlu Fusion requires even epi_tile counts,
-        # based on epi_tile_n = 64, only mma_tiler_n = 128 and 256 are supported
-        if mma_tiler_mn[1] not in (128, 256):
+        # based on epi_tile_n = 64, only mma_tiler_n = 128 and 256 are supported.
+        # Non-gated activations have no gate/up pairing, so 192 (three epi tiles)
+        # also works.
+        if mma_tiler_mn[1] not in ((128, 256) if gated else (128, 192, 256)):
             is_valid = False
 
         # Skip illegal cluster shape
@@ -3916,6 +3922,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         a_major: str,
         b_major: str,
         c_major: str,
+        gated: bool = True,
     ) -> bool:
         """
         Check if the gemm can be implemented
@@ -3948,6 +3955,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         :type b_major: str
         :param c_major: The major axis of the C tensor
         :type c_major: str
+        :param gated: Whether the fused activation is gated (SwiGLU family).
+            Non-gated ones (e.g. ReLU2 in Nemotron MoE models) also allow N=192.
+        :type gated: bool
 
         :return: True if the gemm can be implemented, False otherwise
         :rtype: bool
@@ -3966,7 +3976,9 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             can_implement = False
 
         # Skip invalid mma tile shape and cluster shape
-        if not cls.is_valid_mma_tiler_and_cluster_shape(mma_tiler_mn, cluster_shape_mn):
+        if not cls.is_valid_mma_tiler_and_cluster_shape(
+            mma_tiler_mn, cluster_shape_mn, gated
+        ):
             can_implement = False
         # Skip illegal problem shape for load/store alignment
         if not cls.is_valid_tensor_alignment(

@@ -15,9 +15,15 @@ from typing import Any
 
 import torch
 
-_MANIFEST = "cudnn_frost_selected_kernels.json"
+from .manifest import MANIFEST_FILENAME, read_manifest
+from .catalog import dimension_matches
+
+_MANIFEST = MANIFEST_FILENAME
+_read_manifest = read_manifest
+_dimension_matches = dimension_matches
 
 
+@functools.cache
 def artifact_root(dtype: str) -> Path:
     """Return the packaged artifact directory for an explicit dtype."""
     return _safe_child(Path(__file__).resolve().parent / "artifacts", dtype)
@@ -25,7 +31,7 @@ def artifact_root(dtype: str) -> Path:
 
 def _validate_abi(raw: dict[str, Any], op: str) -> bool:
     swap = raw.get("tactic", {}).get("swap_ab", False)
-    expected = f"cudnn_frost_{op}{'_swap_ab' if swap else ''}_v2"
+    expected = f"cudnn_frost_{op}{'_swap_ab' if swap else ''}"
     if not isinstance(swap, bool) or raw.get("abi") != expected:
         raise RuntimeError(
             f"unsupported or inconsistent cuDNN Frost ABI: {raw.get('id')}"
@@ -58,21 +64,6 @@ def _digest(path: Path) -> str:
 def _arch_for(device: torch.device) -> str:
     major, minor = torch.cuda.get_device_capability(device)
     return f"sm_{major}{minor}a"
-
-
-def _dimension_matches(value: int, rule: Any) -> bool:
-    if isinstance(rule, int):
-        return value == rule
-    if not isinstance(rule, dict):
-        return False
-    multiple = int(rule.get("multiple_of", 1))
-    if multiple <= 0:
-        raise RuntimeError("cuDNN Frost dimension 'multiple_of' must be positive")
-    return (
-        value >= int(rule.get("min", 0))
-        and ("max" not in rule or value <= int(rule["max"]))
-        and value % multiple == 0
-    )
 
 
 def _read_source(root: Path, raw: dict[str, Any]) -> tuple[Path, str]:
@@ -108,7 +99,78 @@ def _tactic_digest(source_sha256: str) -> str:
     return _cached_tactic_digest(source_sha256, identity_key())
 
 
+def bind_kernel(kernel, device):
+    """Resolve a dimension-catalog recipe for the preparation device."""
+    from dataclasses import replace
+    from .device import device_facts, specialize_parameters
+    from .source_template import materialize_source
+
+    if hasattr(kernel, "original"):
+        return kernel._replace(original=bind_kernel(kernel.original, device))
+
+    parameters = getattr(kernel, "source_parameters", None)
+    if parameters is None:
+        return kernel
+    device = torch.device(device)
+    if device.type != "cuda":
+        return kernel
+    index = torch.cuda.current_device() if device.index is None else device.index
+    facts = device_facts(index)
+    if facts.arch != kernel.arch:
+        raise ValueError("Frost kernel architecture does not match preparation device")
+    resolved, workspace = specialize_parameters(parameters, facts)
+    path, digest = materialize_source(kernel.template_path, resolved)
+    return replace(
+        kernel, source_path=path, source_sha256=digest, workspace_bytes=workspace
+    )
+
+
+def source_binding(root, raw, digest):
+    parameters = raw["source"].get("parameters", {})
+    if not parameters.get("device_dependent"):
+        return {}
+    return dict(
+        source_parameters=parameters,
+        template_path=_safe_child(root, raw["source"]["path"]),
+        source_identity=digest,
+    )
+
+
+def discovery_binding(kernel):
+    """Bind matching CUDA metadata, omitting unsupported device geometries."""
+    if (
+        getattr(kernel, "source_parameters", None) is not None
+        and torch.cuda.is_available()
+    ):
+        device = torch.device("cuda", torch.cuda.current_device())
+        if kernel.arch == _arch_for(device):
+            try:
+                return bind_kernel(kernel, device)
+            except NotImplementedError:
+                return None
+    return kernel
+
+
+def cache_discovery(function):
+    """Keep device-specific bindings and candidate filtering in separate caches."""
+
+    @functools.lru_cache(maxsize=8)
+    def cached(index, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    @functools.wraps(function)
+    def discover(*args, **kwargs):
+        index = torch.cuda.current_device() if torch.cuda.is_available() else None
+        return cached(index, *args, **kwargs)
+
+    discover.cache_clear = cached.cache_clear
+    discover.cache_info = cached.cache_info
+    discover.cache_parameters = cached.cache_parameters
+    return discover
+
+
 def _load_kernel(kernel, device: torch.device) -> Any:
+    kernel = bind_kernel(kernel, device)
     with torch.cuda.device(device):
         arch = _arch_for(device)
         if kernel.arch != arch:

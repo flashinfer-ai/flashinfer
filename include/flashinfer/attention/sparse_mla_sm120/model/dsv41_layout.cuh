@@ -12,13 +12,22 @@ struct Dsv41Geometry {
   static constexpr bool V_HAS_ROPE = false;
 };
 
-using Dsv41Fp8Scales = ScaleSpec<ScaleFormat::UE8M0_BYTE, 32, false>;
-struct Dsv41Fp8Layout : Dsv41Geometry,
-                        FooterScaleLayout<Dsv41Geometry::D_NOPE,
-                                          Dsv41Fp8Scales::bytes_per_token(Dsv41Geometry::D_NOPE)> {
+// The FP8 cache stores either scale placement: the footer form (DSV4_1) or
+// FlashMLA's inline-scale records (DSV4_1_INLINE). Only addressing differs.
+template <bool Inline>
+using Dsv41Fp8ScalesT = ScaleSpec<ScaleFormat::UE8M0_BYTE, 32, Inline>;
+template <bool Inline>
+struct Dsv41Fp8LayoutT
+    : Dsv41Geometry,
+      ScalePlacement<Inline, Dsv41Geometry::D_NOPE,
+                     Dsv41Fp8ScalesT<Inline>::bytes_per_token(Dsv41Geometry::D_NOPE)> {
   using Geometry = Dsv41Geometry;
   using Encoding = E4m3Encoding;
-  using Scales = Dsv41Fp8Scales;
+  using Scales = Dsv41Fp8ScalesT<Inline>;
+  using Placement =
+      ScalePlacement<Inline, Dsv41Geometry::D_NOPE, Scales::bytes_per_token(Dsv41Geometry::D_NOPE)>;
+  using Placement::BYTES_PER_TOKEN;
+  using Placement::SCALE_BYTES;
   static constexpr int QUANT_TILE = Scales::GROUP;
   static constexpr int NUM_SCALES = Scales::count(D_NOPE);
   static constexpr ScaleFormat SCALE_FORMAT = Scales::FORMAT;
@@ -28,14 +37,18 @@ struct Dsv41Fp8Layout : Dsv41Geometry,
   static constexpr int SCALE_DATA_PREFIX_BYTES = Scales::data_prefix_bytes(D_NOPE, 0);
   static constexpr bool V_HAS_ROPE = false;
 };
+using Dsv41Fp8Scales = Dsv41Fp8ScalesT<false>;
+using Dsv41Fp8Layout = Dsv41Fp8LayoutT<false>;
+using Dsv41Fp8InlineLayout = Dsv41Fp8LayoutT<true>;
 
 // Copyright (c) 2026 by FlashInfer team.
 // SPDX-License-Identifier: Apache-2.0
 namespace flashinfer::sparse_mla_sm120 {
 
-struct Dsv41Fp4Layout : FooterScaleLayout<Dsv41Geometry::D_QK * E2m1Encoding::BITS / 8,
-                                          Dsv41Geometry::D_QK / E4m3G16ScaleSpec::GROUP *
-                                              E4m3G16ScaleSpec::BYTES_PER_SCALE> {
+template <bool Inline>
+struct Dsv41Fp4LayoutT : ScalePlacement<Inline, Dsv41Geometry::D_QK * E2m1Encoding::BITS / 8,
+                                        Dsv41Geometry::D_QK / E4m3G16ScaleSpec::GROUP *
+                                            E4m3G16ScaleSpec::BYTES_PER_SCALE> {
   using Geometry = Dsv41Geometry;
   using Encoding = E2m1Encoding;
   using Scales = E4m3G16ScaleSpec;
@@ -43,5 +56,11 @@ struct Dsv41Fp4Layout : FooterScaleLayout<Dsv41Geometry::D_QK * E2m1Encoding::BI
   static constexpr int SCALE_GROUP = Scales::GROUP;
   static constexpr int NUM_SCALES = DIMS / SCALE_GROUP;
 };
+using Dsv41Fp4Layout = Dsv41Fp4LayoutT<false>;
+using Dsv41Fp4InlineLayout = Dsv41Fp4LayoutT<true>;
+static_assert(Dsv41Fp4InlineLayout::BYTES_PER_TOKEN == 288 &&
+              Dsv41Fp4InlineLayout::BYTES_PER_TOKEN % 16 == 0);
+static_assert(Dsv41Fp8InlineLayout::BYTES_PER_TOKEN == 528 &&
+              Dsv41Fp8InlineLayout::BYTES_PER_TOKEN % 16 == 0);
 
 }  // namespace flashinfer::sparse_mla_sm120

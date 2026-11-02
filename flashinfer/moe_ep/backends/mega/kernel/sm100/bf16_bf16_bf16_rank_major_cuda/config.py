@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig:
-    """Fixed production coordinate for the SM100 rank-major CUDA backend."""
+    """Fixed production coordinate for the rank-major CUDA backend (SM100 and SM107)."""
 
     intermediate_size: int = 2048
     top_k: int = 8

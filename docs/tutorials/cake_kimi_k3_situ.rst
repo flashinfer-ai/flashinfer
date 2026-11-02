@@ -69,9 +69,11 @@ Caller-owned execution
 
 The size query uses host metadata only. Explicit preparation initializes default
 SiTU constants and loads the route before capture; it allocates no tensor
-storage. For ordinary N8 routes, the workspace includes a four-byte work counter
-appended after the output scratch. Preparation resolves the FC2 pool from the
-current GPU's SM count; the first kernel resets this counter on every call.
+storage. For the pooled FC2 routes (8, 16, 32, 64, 128, 256, 512 and 1024
+tokens), the workspace includes a four-byte work counter appended after the
+output scratch. Preparation resolves the FC2 pool (from the current GPU's SM
+count on the 8- and 16-token routes, a fixed row count otherwise); the routing
+launch seeds this counter on every call.
 Prepare every token count before its first submission. A maximum-size
 buffer can hold every smaller prepared shape. Preparation and use must have
 normal stream ordering; each concurrently executing call needs separate output

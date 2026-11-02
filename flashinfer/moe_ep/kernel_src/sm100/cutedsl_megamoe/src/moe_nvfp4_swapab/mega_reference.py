@@ -20,7 +20,7 @@ import torch
 import cutlass
 
 from common.megamoe_constants import Nvfp4BlockSize, Nvfp4E2M1RcpLimit
-from common.host_utils import get_cutedsl_target_arch, mxfp8_quantize_per_block_32
+from common.host_utils import get_cutedsl_target_arch, mxfp8_quantize_per_block_32_row
 from moe_nvfp4_swapab.runner_common import (
     nvfp4_quantize_per_block_16,
     swiglu_fold_interleave,
@@ -94,7 +94,7 @@ def reference_expert_fc12(
     gate_up_clamp: Optional[float],
     topk_weights: Optional[torch.Tensor],
     ref_compute_graph: Literal["transformers", "deepgemm"],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single-expert fused fc1+fc2 reference shared by the single-rank tester
     and the multi-rank MegaMoE reference.
 
@@ -103,24 +103,19 @@ def reference_expert_fc12(
     K-major ``b`` and raw SF formats are identical for the per-expert single-rank
     and gathered multi-rank tensors.  Returns the fc2 fp32 output (``deepgemm``:
     topk pre-multiplied into SwiGLU; ``transformers``: left unweighted for the
-    caller to apply), the fc1 NVFP4 hand-off ``(fc1_q, fc1_sf)`` used by the
-    fc1-phase ablation, and the raw fc1 fp32 pre-SwiGLU activations.
+    caller to apply), plus the fc1 NVFP4 hand-off ``(fc1_q, fc1_sf)`` used by the
+    fc1-phase ablation.
     """
     intermediate_downproj = intermediate // 2
     fc1_fp32 = ref_scaled_mm(
-        a=act_packed,
-        sfa=act_sf,
-        b=fc1_weight_packed,
-        sfb=fc1_weight_sf,
-        n=intermediate,
-        k=hidden,
+        a=act_packed, sfa=act_sf,
+        b=fc1_weight_packed, sfb=fc1_weight_sf,
+        n=intermediate, k=hidden,
     )
     fc1_fp32 = fc1_fp32 * fc1_alpha
 
     swiglu = swiglu_fold_interleave(
-        fc1_fp32,
-        gate_up_interleave,
-        gate_up_clamp=gate_up_clamp,
+        fc1_fp32, gate_up_interleave, gate_up_clamp=gate_up_clamp,
     )
     if ref_compute_graph == "deepgemm":
         swiglu = swiglu * topk_weights.unsqueeze(-1)
@@ -128,12 +123,9 @@ def reference_expert_fc12(
     fc1_q, fc1_sf_out = quantize_fn(swiglu, fc1_norm_const)
 
     fc2_fp32 = ref_scaled_mm(
-        a=fc1_q,
-        sfa=fc1_sf_out,
-        b=fc2_weight_packed,
-        sfb=fc2_weight_sf,
-        n=hidden,
-        k=intermediate_downproj,
+        a=fc1_q, sfa=fc1_sf_out,
+        b=fc2_weight_packed, sfb=fc2_weight_sf,
+        n=hidden, k=intermediate_downproj,
     )
     fc2_fp32 = fc2_fp32 * fc2_alpha
     return fc2_fp32, fc1_q, fc1_sf_out, fc1_fp32
@@ -154,7 +146,7 @@ _combine_snr_floor_db = {
 
 
 def combine_roundtrip_to_fp32(
-    terms_fp32: torch.Tensor,  # (..., hidden) fp32 per-(token, topk) fc2 terms
+    terms_fp32: torch.Tensor,           # (..., hidden) fp32 per-(token, topk) fc2 terms
     combine_format: CombineFormat,
 ) -> torch.Tensor:
     """Round-trip the fc2 terms through the combine wire format.
@@ -198,7 +190,7 @@ def combine_roundtrip_to_fp32(
         cutlass.Float8E5M2: torch.float8_e5m2,
     }[combine_format.act_dtype]
     flat = terms_fp32.reshape(-1, hidden)
-    codes, scale_e8m0 = mxfp8_quantize_per_block_32(flat, torch_act_dtype)
+    codes, scale_e8m0 = mxfp8_quantize_per_block_32_row(flat, torch_act_dtype)
     deq = dequant_block_scale_to_fp32(codes, scale_e8m0, block)
     return deq.reshape(*lead, hidden)
 
@@ -207,17 +199,17 @@ def compute_megamoe_reference(
     # NVFP4 tensors below carry STORAGE shape: a logical dim of size N is
     # stored as a packed dim of size N // 2 (one byte holds two fp4 values).
     # ``unpack_fp4_to_f32`` reverses the packing by doubling the packed dim.
-    input_activation: torch.Tensor,  # storage (num_ranks, num_tokens_per_rank, hidden//2)
-    input_activation_sf: torch.Tensor,  # (num_ranks, num_tokens_per_rank, hidden//Nvfp4BlockSize) fp8 plain K-major
-    input_topk_idx: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) int64
-    input_topk_weights: torch.Tensor,  # (num_ranks, num_tokens_per_rank, num_topk) fp32
-    fc1_weight: torch.Tensor,  # storage (num_ranks, num_experts_per_rank, hidden//2, intermediate); hidden is the packed dim
-    fc1_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, intermediate, hidden//Nvfp4BlockSize) fp8 plain
-    fc2_weight: torch.Tensor,  # storage (num_ranks, num_experts_per_rank, intermediate//4, hidden); intermediate//2 is the packed dim
-    fc2_weight_sf: torch.Tensor,  # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//Nvfp4BlockSize) fp8 plain
-    fc1_alpha: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
-    fc2_alpha: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
-    fc1_norm_const: torch.Tensor,  # (num_ranks, num_experts_per_rank) fp32
+    input_activation: torch.Tensor,        # storage (num_ranks, num_tokens_per_rank, hidden//2)
+    input_activation_sf: torch.Tensor,     # (num_ranks, num_tokens_per_rank, hidden//Nvfp4BlockSize) fp8 plain K-major
+    input_topk_idx: torch.Tensor,          # (num_ranks, num_tokens_per_rank, num_topk) int64
+    input_topk_weights: torch.Tensor,      # (num_ranks, num_tokens_per_rank, num_topk) fp32
+    fc1_weight: torch.Tensor,              # storage (num_ranks, num_experts_per_rank, hidden//2, intermediate); hidden is the packed dim
+    fc1_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, intermediate, hidden//Nvfp4BlockSize) fp8 plain
+    fc2_weight: torch.Tensor,              # storage (num_ranks, num_experts_per_rank, intermediate//4, hidden); intermediate//2 is the packed dim
+    fc2_weight_sf: torch.Tensor,           # (num_ranks, num_experts_per_rank, hidden, (intermediate//2)//Nvfp4BlockSize) fp8 plain
+    fc1_alpha: torch.Tensor,                # (num_ranks, num_experts_per_rank) fp32
+    fc2_alpha: torch.Tensor,                # (num_ranks, num_experts_per_rank) fp32
+    fc1_norm_const: torch.Tensor,           # (num_ranks, num_experts_per_rank) fp32
     ref_compute_graph: Literal["transformers", "deepgemm"],
     combine_format: CombineFormat,
     gate_up_clamp: Optional[float] = None,
@@ -338,13 +330,9 @@ def compute_megamoe_reference(
             quantize_fn=nvfp4_quantize_per_block_16,
             act_packed=gathered_act,
             act_sf=gathered_act_sf,
-            fc1_weight_packed=_byte_select_expert(
-                fc1_weight, target_rank, local_expert
-            ),
+            fc1_weight_packed=_byte_select_expert(fc1_weight, target_rank, local_expert),
             fc1_weight_sf=_byte_select_expert(fc1_weight_sf, target_rank, local_expert),
-            fc2_weight_packed=_byte_select_expert(
-                fc2_weight, target_rank, local_expert
-            ),
+            fc2_weight_packed=_byte_select_expert(fc2_weight, target_rank, local_expert),
             fc2_weight_sf=_byte_select_expert(fc2_weight_sf, target_rank, local_expert),
             intermediate=intermediate,
             hidden=hidden,
@@ -375,8 +363,7 @@ def compute_megamoe_reference(
         signal = ideal_terms.pow(2).mean()
         noise = (terms_fp32 - ideal_terms).pow(2).mean()
         snr_db = (
-            float("inf")
-            if noise.item() == 0
+            float("inf") if noise.item() == 0
             else 10.0 * torch.log10(signal / noise).item()
         )
         floor_db = _combine_snr_floor_db.get(combine_format.name)
@@ -404,6 +391,7 @@ def compute_megamoe_reference(
         combine_output=combine_ref,
         combine_reduced_output=reduced_ref,
     )
+
 
 
 import cuda.bindings.driver as cuda
@@ -742,7 +730,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.mma_inst_shape_mn,
         )
 
-        # For 2CTA blockscaled kernels, SFB needs to be replicated across peer CTAs.
         tiled_mma_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
             self.b_dtype,
@@ -823,7 +810,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             internal_type=cutlass.Int16,
         )
 
-        # This modifies the layout to handle overlapping 256x(# of scale factors for a single column of B (nNSF)) logical blocks for SFB when cta_tile_shape_n=192
         if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
             x = tma_tensor_sfb.stride[0][1]
             y = cute.ceil_div(tma_tensor_sfb.shape[0][1], 4)
@@ -1297,7 +1283,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
                 ]
 
-                # Apply SFB slicing hack when cta_tile_shape_n=64
                 slice_n = mma_tile_coord_mnl[1]
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     slice_n = mma_tile_coord_mnl[1] // 2
@@ -1475,7 +1460,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state)
 
-                # Apply TMEM pointer offset hack when cta_tile_shape_n=192 or cta_tile_shape_n=64
                 tCtSFB_mma = tCtSFB
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] in {64, 192}):
                     # If this is an ODD tile, shift the TMEM start address for cta_tile_shape_n=192 case by two words (ignores first 64 columns of SFB)
@@ -1684,7 +1668,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     real_subtile_idx = subtile_idx
                     if cutlass.const_expr(self.overlapping_accum):
                         if reverse_subtile:
-                            # Subtile always iterates on N dimension as we only have 4x1DP tmem load pattern for cta_tile_m = 128 cases.
                             real_subtile_idx = (
                                 self.cta_tile_shape_mnk[1] // self.epi_tile_n
                                 - 1
@@ -2251,10 +2234,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             is_valid = False
         if b_dtype is cutlass.Float4E2M1FN and b_major != "k":
             is_valid = False
-        # TODO: Currently we don't support m major output for Float4E2M1FN
         if c_dtype is cutlass.Float4E2M1FN and c_major == "m":
             is_valid = False
-
         return is_valid
 
     @staticmethod
@@ -2593,7 +2574,7 @@ class _BlockScaledGemmReferenceLauncher:
                 stream,
             )
             self._compiled[key] = compiled
-
+        
         compiled(
             a_cute,
             b_cute,
@@ -2605,6 +2586,7 @@ class _BlockScaledGemmReferenceLauncher:
         )
         torch.cuda.current_stream().synchronize()
         return c_3d.squeeze(-1)
+
 
 
 __all__ = ["MegaMoEReference", "compute_megamoe_reference", "Nvfp4BlockSize"]

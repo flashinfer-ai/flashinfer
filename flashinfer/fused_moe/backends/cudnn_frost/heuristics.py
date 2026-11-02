@@ -11,15 +11,16 @@ from __future__ import annotations
 import math
 import re
 
-POLICY_VERSION = "frost-stage-heuristic-v2"
+POLICY_VERSION = "frost-stage-heuristic-v4"
 STAGE_BUDGET = 4
 FUSED_BUDGET = 2
+_ELEMENT_BYTES = {"bfloat16": 2, "float8_e4m3fn": 1, "float4_e2m1fn_x2": 0.5}
 
 
 def _tile(kernel):
     meta = kernel.tactic_metadata
     tile = meta["cta_tile"]
-    cluster = re.search(r"_cluster(\d+)x(\d+)_", meta["tile"])
+    cluster = re.search(r"_cluster(\d+)x(\d+)(?:_|$)", meta["tile"])
     if cluster is None:
         raise ValueError(f"Missing Frost cluster geometry: {meta['tile']}")
     cm, cn = map(int, cluster.groups())
@@ -50,21 +51,14 @@ def stage_candidates(kernels, *, rows, n, k, experts, sm_count, budget=STAGE_BUD
         waves = math.ceil(clusters / capacity)
         # K is determined by the wider operand. Mixed FP8/FP4 still uses
         # FP8's reduction tile; two FP4 operands double the element count.
-        elements = (
-            2
-            if all(
-                "float4" in kernel.contract[d] for d in ("token_dtype", "weight_dtype")
-            )
-            else 1
-        )
-        iterations = math.ceil(k / (kb * elements))
+        token_bytes = _ELEMENT_BYTES[kernel.contract["token_dtype"]]
+        weight_bytes = _ELEMENT_BYTES[kernel.contract["weight_dtype"]]
+        iterations = math.ceil(k * max(token_bytes, weight_bytes) / kb)
         padding = (math.ceil(tm / cm) * cm * m * math.ceil(nn / cn) * cn * tn) / (
             rm * rn
         )
         # A larger tile amortizes loads when there is enough parallel work.
-        token_bytes = 0.5 if "float4" in kernel.contract["token_dtype"] else 1
-        weight_bytes = 0.5 if "float4" in kernel.contract["weight_dtype"] else 1
-        weight_bytes *= 2 if kernel.gated else 1
+        weight_bytes *= 2 if getattr(kernel, "gated", False) else 1
         am, bn = (
             (weight_bytes, token_bytes)
             if kernel.swap_ab

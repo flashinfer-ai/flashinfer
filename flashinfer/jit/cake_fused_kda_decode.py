@@ -17,12 +17,15 @@ limitations under the License.
 from __future__ import annotations
 
 import functools
+import hashlib
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Any, Literal, Sequence
 
+from . import env as jit_env
 from ._kda_jit_common import get_flashinfer_include_dir, get_kda_csrc_dir
 from .core import JitSpec, gen_jit_spec, logger, sm100a_nvcc_flags, sm103a_nvcc_flags
 
@@ -45,43 +48,21 @@ _TARGET_NVCC_FLAGS = {
 }
 _TARGET_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 
-# Generated programs: one device/binding source pair per physical schedule,
-# shared by every target architecture (the exporter writes this registry).
+# Generated programs, shared by every target architecture (the exporter
+# writes this registry).  The 64-bit slot-offset twin of a schedule and the
+# LAUNCH_MIN_BLOCKS=1 instantiation of the wide512 positive-FP32 schedule
+# compile the same ``_kernel.cu`` body as their base program; ``defines``
+# lists the ``-D`` knobs (``CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS``,
+# ``CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS``) that select one member's text, so
+# the body's ``#if`` blocks expand to exactly the former per-program source.
+# The tvm-ffi binding of a program is rendered from the template of its launch
+# ABI (``render_cake_fused_kda_decode_binding``); every program exports the same
+# ``run`` entry point and is built with the same ``--use_fast_math`` flag.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_fused_kda_decode_0743aa5d22f746909b3c": {
-        "sources": [
-            "cake_fused_kda_decode_0743aa5d22f746909b3c_kernel.cu",
-            "cake_fused_kda_decode_0743aa5d22f746909b3c_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_0743aa5d22f746909b3c_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_0743aa5d22f746909b3c",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 36480,
@@ -91,42 +72,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "b6ccb815c6e67337b2763e20ac3400b4a0a4a9be9a1ab9532d20e516e06cc2a1",
             "sm_103a": "4e3ac89dcf270dc3ccb4055f1533bb01bf44b03f0167820cc482d0f933d42bdf",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_1105a251fd33b55719ae": {
-        "sources": [
-            "cake_fused_kda_decode_1105a251fd33b55719ae_kernel.cu",
-            "cake_fused_kda_decode_1105a251fd33b55719ae_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_7e841caca37f5c48f0a3_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_1105a251fd33b55719ae",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 9344,
@@ -136,42 +86,14 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "2f090a8d65ea80dd384a731f5611e76c04e2e23291240dd25a0bd21b67540e62",
             "sm_103a": "39384e8ce7cd0bd4b0ebd898e8daa3ed8507d9bcfe57a14f7b8d15f36f3d1e62",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_23498e31ce2702fee03c": {
-        "sources": [
-            "cake_fused_kda_decode_23498e31ce2702fee03c_kernel.cu",
-            "cake_fused_kda_decode_23498e31ce2702fee03c_binding.cu",
+        "sources": ["cake_fused_kda_decode_f415905e21bbc11b4581_kernel.cu"],
+        "defines": [
+            "CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",
+            "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=1",
         ],
         "kernel_symbol": "kernel_cake_fused_kda_decode_23498e31ce2702fee03c",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -181,42 +103,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "8d2a722baadd2e243376a847c5c3211b86b0b2f3fd81d064dfa81b303a79d6a4",
             "sm_103a": "58fd4e63326f0f4acf3d0fe59bb0b0e7d6161a8f2833169612d8b370043dc57e",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_26bd2da2218a44305e35": {
-        "sources": [
-            "cake_fused_kda_decode_26bd2da2218a44305e35_kernel.cu",
-            "cake_fused_kda_decode_26bd2da2218a44305e35_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_26bd2da2218a44305e35_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_26bd2da2218a44305e35",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -226,43 +117,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "3559f735e57b6690b1e6ebf3aaa9cedb02d2a07ea29867ff678e65e6ccb1a253",
             "sm_103a": "e82bad2cffb796b637a0e77c1e78d0525d4d5d2b0ed9ea7346c7655538bed6d4",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_3109b5a8356a11c3dabb": {
-        "sources": [
-            "cake_fused_kda_decode_3109b5a8356a11c3dabb_kernel.cu",
-            "cake_fused_kda_decode_3109b5a8356a11c3dabb_rows_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_97a7e6ab6064b0fa1bc8_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_3109b5a8356a11c3dabb",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "rows"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -272,43 +131,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "52a02103350c7b74d53cefbb4eaf263ce33216b5ba7222c8264f095365aa3622",
             "sm_103a": "3fcec670d4d35449ac5143e720daaffdc8324eae19d68461537ee2fa874bb018",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_3d014ff47814a933a847": {
-        "sources": [
-            "cake_fused_kda_decode_3d014ff47814a933a847_kernel.cu",
-            "cake_fused_kda_decode_3d014ff47814a933a847_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_3d014ff47814a933a847_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_3d014ff47814a933a847",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "rows"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 70272,
@@ -318,42 +145,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "ce27e9ef2460dbcf4630c51741ae603c48ac6effef7e0720fabd2a009fe99400",
             "sm_103a": "ced39d189683873ac724e4ab937083bf49e882cf37e7464f5cdf7fc8fd305f10",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_3fcc8696ad27c9a56a84": {
-        "sources": [
-            "cake_fused_kda_decode_3fcc8696ad27c9a56a84_kernel.cu",
-            "cake_fused_kda_decode_3fcc8696ad27c9a56a84_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_3fcc8696ad27c9a56a84_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_3fcc8696ad27c9a56a84",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -363,42 +159,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "ae2f7f66d714b33525d4cb43d533dac3e7b0e537d04ae9481b362ee3c1dad2fc",
             "sm_103a": "fc7d63b192f7bd0776860e9ec0366aeba2c562036c6ff842d8b0148d0a7ab5ed",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_47e6858f50f60799991b": {
-        "sources": [
-            "cake_fused_kda_decode_47e6858f50f60799991b_kernel.cu",
-            "cake_fused_kda_decode_47e6858f50f60799991b_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_9fb82e69235a7fdd5f96_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_47e6858f50f60799991b",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 28288,
@@ -408,42 +173,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "f26bc67cbb17202221666e61ae698587a8fbcd443efaac83c1e568a65ca1c6bb",
             "sm_103a": "8b0bad2fa314944d852fcfcac35339997586b623e8e5c1ada58bd58442a67fb3",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_4d1216db0b67e580d6f7": {
-        "sources": [
-            "cake_fused_kda_decode_4d1216db0b67e580d6f7_kernel.cu",
-            "cake_fused_kda_decode_4d1216db0b67e580d6f7_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_4d1216db0b67e580d6f7_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_4d1216db0b67e580d6f7",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 36480,
@@ -453,42 +187,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "4d1d4294a92b2d441d4a01e91dc50d8777924bf8e0ea7d16b3a3b6cf937a7aba",
             "sm_103a": "5a6f0cdfd784c526e9ab0edf686c9c23eb533b5a970981242f9ff6445a8bea1a",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_4dc09b8c1d1bab526c64": {
-        "sources": [
-            "cake_fused_kda_decode_4dc09b8c1d1bab526c64_kernel.cu",
-            "cake_fused_kda_decode_4dc09b8c1d1bab526c64_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_0743aa5d22f746909b3c_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_4dc09b8c1d1bab526c64",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 36480,
@@ -498,42 +201,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "c54c4903790f27e46785191e76c895c7a4938dabb54001bf89e15be668e348b0",
             "sm_103a": "2db6cb410f718d20caa515d0985fa14a75c198823b243653ce8b334d776eda02",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_583b3404f8230ee830a8": {
-        "sources": [
-            "cake_fused_kda_decode_583b3404f8230ee830a8_kernel.cu",
-            "cake_fused_kda_decode_583b3404f8230ee830a8_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_59e2055a73df5c6ec7fa_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_583b3404f8230ee830a8",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 36480,
@@ -543,42 +215,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "95ce5d231a8b59149d4aa356759ef10e3a32f3cc467b1b2f40017a060ee2a2dc",
             "sm_103a": "2fb83a39f2e902e3e6cb3a07bd24a05be74770b23ab0b7195df6df87392264e9",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_59e2055a73df5c6ec7fa": {
-        "sources": [
-            "cake_fused_kda_decode_59e2055a73df5c6ec7fa_kernel.cu",
-            "cake_fused_kda_decode_59e2055a73df5c6ec7fa_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_59e2055a73df5c6ec7fa_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_59e2055a73df5c6ec7fa",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 36480,
@@ -588,42 +229,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "3fdebd37ae963396d006ffffc5afeee5847127271761d08763dbebb082f2879d",
             "sm_103a": "5c674b65b77777dd9953803d4c134604c28d31f10cf306311d41deb3f4352644",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_5b7fd31f6c4783cbe2c6": {
-        "sources": [
-            "cake_fused_kda_decode_5b7fd31f6c4783cbe2c6_kernel.cu",
-            "cake_fused_kda_decode_5b7fd31f6c4783cbe2c6_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_903332461e85b6c8df36_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_5b7fd31f6c4783cbe2c6",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -633,42 +243,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "24a6b0ac37bc2839624ade793b62b0aa3b868a8955034cf78d4e8b3be260842a",
             "sm_103a": "d10ae39bb55ddde9d94d9e24ec20b65fd789c7b99adba6af19282517d8648e1b",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_753293b369d11fb0880f": {
-        "sources": [
-            "cake_fused_kda_decode_753293b369d11fb0880f_kernel.cu",
-            "cake_fused_kda_decode_753293b369d11fb0880f_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_753293b369d11fb0880f_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_753293b369d11fb0880f",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -678,42 +257,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "b87fd5ff1bce588af8094d2dfdd24c6e0083c0de88ba41c17670d1947ad36e22",
             "sm_103a": "48b58f7d589849d47646d41b1472ebcd04c9240dfbbf589fb38bf67748a5cbfe",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_7c97fb1858b20c965ee0": {
-        "sources": [
-            "cake_fused_kda_decode_7c97fb1858b20c965ee0_kernel.cu",
-            "cake_fused_kda_decode_7c97fb1858b20c965ee0_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_7e5629eb5984e1177160_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_7c97fb1858b20c965ee0",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -723,42 +271,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "b63991695d6987c5caaef8b9234b3805cde656c38f88967d36f5d78f7a4b520c",
             "sm_103a": "0a6433e6c76c5a12b6c0d30f29ffc730febf41a228b1e9a6c1fa9ff220a6945f",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_7caf25be4378d6f0f0ed": {
-        "sources": [
-            "cake_fused_kda_decode_7caf25be4378d6f0f0ed_kernel.cu",
-            "cake_fused_kda_decode_7caf25be4378d6f0f0ed_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_7caf25be4378d6f0f0ed_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_7caf25be4378d6f0f0ed",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 28288,
@@ -768,42 +285,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "414b11bdb03ef6c69a89089f7aefbc4e7e436af9a8efe24a02a69d5d406c420e",
             "sm_103a": "2e2a5b43f8d70793c26555b192dcdd7ca4e3c83cca9b4c4662c0437d31a82621",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_7e5629eb5984e1177160": {
-        "sources": [
-            "cake_fused_kda_decode_7e5629eb5984e1177160_kernel.cu",
-            "cake_fused_kda_decode_7e5629eb5984e1177160_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_7e5629eb5984e1177160_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_7e5629eb5984e1177160",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -813,42 +299,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "c1e2e7f3f6b6603bad05fac3dd2aac1e8d1f50a42c8834edcd2a9b826e3d4855",
             "sm_103a": "8b5ca26bbd6e805775ca07a47eefe8fcc21d869200a9371945e27234fba0a79a",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_7e841caca37f5c48f0a3": {
-        "sources": [
-            "cake_fused_kda_decode_7e841caca37f5c48f0a3_kernel.cu",
-            "cake_fused_kda_decode_7e841caca37f5c48f0a3_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_7e841caca37f5c48f0a3_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_7e841caca37f5c48f0a3",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 9344,
@@ -858,43 +313,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "69c7e1a21aa46907f1bef5c450df9871960d9330a6f915d140eaab18dc4d1979",
             "sm_103a": "b4d35b3f4e625a3e9233ebc4a4ef30316ad3f1a81a51ee11bc954822c11ff05b",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_82fc564c161daa575154": {
-        "sources": [
-            "cake_fused_kda_decode_82fc564c161daa575154_kernel.cu",
-            "cake_fused_kda_decode_82fc564c161daa575154_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_3d014ff47814a933a847_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_82fc564c161daa575154",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "rows"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 70272,
@@ -904,42 +327,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "2602257b1ec3ef1c077b6ed481af937d150ad57af2e09016c48d386526fb37a9",
             "sm_103a": "ae82a1461620a1df9f6712697beb9ae71a838bf10afe5039704bc57dda47d53b",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_836d666a9d0b6decc492": {
-        "sources": [
-            "cake_fused_kda_decode_836d666a9d0b6decc492_kernel.cu",
-            "cake_fused_kda_decode_836d666a9d0b6decc492_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_a07c16f264b1fc295f84_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_836d666a9d0b6decc492",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 20096,
@@ -949,42 +341,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "1581a8aaa9270d1827a41100cdfb0afc42723d1eebe6942d5ce0ca707529aa30",
             "sm_103a": "0f895d0ab32407ff0d86372e6650c1d939f6d7e2d96a0012963c069c1822f4fa",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_8b697d61d1b15a6fac4d": {
-        "sources": [
-            "cake_fused_kda_decode_8b697d61d1b15a6fac4d_kernel.cu",
-            "cake_fused_kda_decode_8b697d61d1b15a6fac4d_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_3fcc8696ad27c9a56a84_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_8b697d61d1b15a6fac4d",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -994,42 +355,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "596c857ef2d889a10e4ba1c4e058cc17261d990e0da3532229fce6feaf294c46",
             "sm_103a": "be81f3a605f2c5a395ba2f2820cec85a23c418402cca9f68caaeec1ba68d8c33",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_903332461e85b6c8df36": {
-        "sources": [
-            "cake_fused_kda_decode_903332461e85b6c8df36_kernel.cu",
-            "cake_fused_kda_decode_903332461e85b6c8df36_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_903332461e85b6c8df36_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_903332461e85b6c8df36",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -1039,43 +369,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "3c8a37525cd5ec15ba314e13604ca329b370531eded37b83ec9ebf3a50d207c5",
             "sm_103a": "fbac3fe121b1dcbe6fa3cf004c18c6574bdd275ac292b43198adfc6a0a48f92d",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_97a7e6ab6064b0fa1bc8": {
-        "sources": [
-            "cake_fused_kda_decode_97a7e6ab6064b0fa1bc8_kernel.cu",
-            "cake_fused_kda_decode_97a7e6ab6064b0fa1bc8_rows_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_97a7e6ab6064b0fa1bc8_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_97a7e6ab6064b0fa1bc8",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "rows"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -1085,43 +383,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "63330d200a80cda1049274a77505b233b503a8b8e6fc36eb7ae9c39abda454c9",
             "sm_103a": "061993608e849e1cee2bec3c562209c3300bad907a5ea5969d369b392b1f924e",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_9823df19f9a25b5b670e": {
-        "sources": [
-            "cake_fused_kda_decode_9823df19f9a25b5b670e_kernel.cu",
-            "cake_fused_kda_decode_9823df19f9a25b5b670e_rows_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_dd24f0fe2c61f6730898_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_9823df19f9a25b5b670e",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "rows"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -1131,42 +397,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "a31bf3eacc2a07fe270f7e09483fe4e956f2874ac7bb50d2af70d669917cb51f",
             "sm_103a": "f1f73bdbb78c4261a1a5348fa0618bf28ab8287bed1718b8a2a608f7e2dc0948",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_9dc0bb23b72067eaee2f": {
-        "sources": [
-            "cake_fused_kda_decode_9dc0bb23b72067eaee2f_kernel.cu",
-            "cake_fused_kda_decode_9dc0bb23b72067eaee2f_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_7caf25be4378d6f0f0ed_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_9dc0bb23b72067eaee2f",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 28288,
@@ -1176,42 +411,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "a5e2a1be2f597b74b93d46873d7339042619aa16db94b6a90bd549bfac35e700",
             "sm_103a": "f79f5d24df250f2b497f2077c0d5d064817fb87b00a23ced31f568a450e6df9b",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_9fb82e69235a7fdd5f96": {
-        "sources": [
-            "cake_fused_kda_decode_9fb82e69235a7fdd5f96_kernel.cu",
-            "cake_fused_kda_decode_9fb82e69235a7fdd5f96_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_9fb82e69235a7fdd5f96_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_9fb82e69235a7fdd5f96",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 28288,
@@ -1221,42 +425,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "fb80aa8d366df4e73dfecbbe1f040454f374fca795e070271defe71139596f9c",
             "sm_103a": "8371254bfdd00c78b395a78bd3a5ce36660f3c14f1708cff3d98cefab6745554",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_a07c16f264b1fc295f84": {
-        "sources": [
-            "cake_fused_kda_decode_a07c16f264b1fc295f84_kernel.cu",
-            "cake_fused_kda_decode_a07c16f264b1fc295f84_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_a07c16f264b1fc295f84_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_a07c16f264b1fc295f84",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 20096,
@@ -1266,42 +439,14 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "bd26229606257ecd4e849cba84d875e53ce1b284621a6713345921b0b984f418",
             "sm_103a": "e3e19a6277faeb3f703df8d69c1fed2d773acadeb565c8614921bcfb54c6a12e",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_c988ce55655115a24ea5": {
-        "sources": [
-            "cake_fused_kda_decode_c988ce55655115a24ea5_kernel.cu",
-            "cake_fused_kda_decode_c988ce55655115a24ea5_binding.cu",
+        "sources": ["cake_fused_kda_decode_f415905e21bbc11b4581_kernel.cu"],
+        "defines": [
+            "CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1",
+            "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=2",
         ],
         "kernel_symbol": "kernel_cake_fused_kda_decode_c988ce55655115a24ea5",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -1311,42 +456,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "531364a86d9dfee8f7e7058797b279a64cd9874b421e3ed14c2bbfb727178367",
             "sm_103a": "a09bc2a949a722449bff8f4d0def9b5054bfe8e1e3b86b499cbf7dd872a01df4",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_ceb0985ab93695f02817": {
-        "sources": [
-            "cake_fused_kda_decode_ceb0985ab93695f02817_kernel.cu",
-            "cake_fused_kda_decode_ceb0985ab93695f02817_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_753293b369d11fb0880f_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_ceb0985ab93695f02817",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -1356,43 +470,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "38de31ef9ec8fdeb10bda411d0c07e18c84fddb5b54e0c82e32b0df9625d20b8",
             "sm_103a": "bce7d3e30be483d0db91b3ddd4e029bb5de72bb13194e450fdd7f0b216488b95",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_dd24f0fe2c61f6730898": {
-        "sources": [
-            "cake_fused_kda_decode_dd24f0fe2c61f6730898_kernel.cu",
-            "cake_fused_kda_decode_dd24f0fe2c61f6730898_rows_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_dd24f0fe2c61f6730898_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_dd24f0fe2c61f6730898",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "rows"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -1402,42 +484,14 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "562dceac882b91bb008e2d7d706bb56be5adf3c47a328410804c5f76fa6587c8",
             "sm_103a": "c073bd565e4811603e74e11497a9398334102a09eb77a01a1eb80b51e570cc67",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_e71bdc5861ac91ffb4bc": {
-        "sources": [
-            "cake_fused_kda_decode_e71bdc5861ac91ffb4bc_kernel.cu",
-            "cake_fused_kda_decode_e71bdc5861ac91ffb4bc_binding.cu",
+        "sources": ["cake_fused_kda_decode_f415905e21bbc11b4581_kernel.cu"],
+        "defines": [
+            "CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",
+            "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=1",
         ],
         "kernel_symbol": "kernel_cake_fused_kda_decode_e71bdc5861ac91ffb4bc",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -1447,42 +501,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "6dbaf3003cef0668ec9fef82041d125ca61eba76d899fe9bbbb7ec0ad78112fc",
             "sm_103a": "677be823a99cdf9dd1026640df6c0acafae476fd776beaafb6d7c78e4c550994",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_f2aada6c39fd5dce4bee": {
-        "sources": [
-            "cake_fused_kda_decode_f2aada6c39fd5dce4bee_kernel.cu",
-            "cake_fused_kda_decode_f2aada6c39fd5dce4bee_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_4d1216db0b67e580d6f7_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_f2aada6c39fd5dce4bee",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [256, 1, 1],
             "dynamic_smem_bytes": 36480,
@@ -1492,42 +515,14 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "c9ed1d546b59559483cd3dfac739cfa295c8ec43df05aabd6e02ef0875c062cb",
             "sm_103a": "21d30b5d6ac2b3e376f7de3c0567762ef7c1f3ef13b40afda9e10125b656b1ca",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_f415905e21bbc11b4581": {
-        "sources": [
-            "cake_fused_kda_decode_f415905e21bbc11b4581_kernel.cu",
-            "cake_fused_kda_decode_f415905e21bbc11b4581_binding.cu",
+        "sources": ["cake_fused_kda_decode_f415905e21bbc11b4581_kernel.cu"],
+        "defines": [
+            "CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=0",
+            "CAKE_FUSED_KDA_LAUNCH_MIN_BLOCKS=2",
         ],
         "kernel_symbol": "kernel_cake_fused_kda_decode_f415905e21bbc11b4581",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -1537,42 +532,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "4763ee0205472fe15d4ff06f61ef1a786683ac992be4e7fd27a19cdc30bf64c3",
             "sm_103a": "07626becd74faa005488986682263b35032d30afd255f0e248cb6eb608c898cc",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_fused_kda_decode_fd601115ded1c0f96ee1": {
-        "sources": [
-            "cake_fused_kda_decode_fd601115ded1c0f96ee1_kernel.cu",
-            "cake_fused_kda_decode_fd601115ded1c0f96ee1_binding.cu",
-        ],
+        "sources": ["cake_fused_kda_decode_26bd2da2218a44305e35_kernel.cu"],
+        "defines": ["CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS=1"],
         "kernel_symbol": "kernel_cake_fused_kda_decode_fd601115ded1c0f96ee1",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["buffer", "x"],
-            ["buffer", "weight"],
-            ["buffer", "conv_state"],
-            ["buffer", "raw_gate"],
-            ["buffer", "raw_beta"],
-            ["buffer", "A_log"],
-            ["buffer", "dt_bias"],
-            ["buffer", "state_indices"],
-            ["buffer", "state"],
-            ["buffer", "output_gate"],
-            ["buffer", "norm_weight"],
-            ["buffer", "output"],
-            ["parameter", "x_row_stride"],
-            ["parameter", "conv_slot_stride"],
-            ["parameter", "beta_row_stride"],
-            ["parameter", "state_slot_stride"],
-            ["parameter", "output_gate_row_stride"],
-            ["parameter", "H"],
-            ["parameter", "use_lower_bound"],
-            ["parameter", "lower_bound_log2"],
-            ["parameter", "norm_eps"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "compile_flags": ["--use_fast_math"],
         "launch": {
             "block": [512, 1, 1],
             "dynamic_smem_bytes": 3712,
@@ -1582,7 +546,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "9ef865553cecc42426c86e334d97325ee401978f58e46b998e1828862052b8eb",
             "sm_103a": "c1046c6cadcba9c70edc2bb1067ee080e71a03780fdc71d1e3e7421eef5fbb35",
         },
-        "arches": ["sm_100a", "sm_103a"],
     },
 }
 # Logical kernel key (variant name) -> generated program.
@@ -1701,7 +664,7 @@ class CakeFusedKDADecodeVariant:
     target: CakeFusedKDADecodeTarget
     module: str
     body_path: Path
-    binding_path: Path
+    binding_template: Path
     source_sha256: str
     kernel_symbol: str
     ffi_entry: str
@@ -1808,7 +771,11 @@ def _variant(
 
 
 def _twins(name: str, **spec: Any) -> tuple[dict[str, Any], ...]:
-    """The 64-bit slot-offset program and its 32-bit twin share one launch contract."""
+    """The 64-bit slot-offset program and its 32-bit twin share one launch contract.
+
+    Both compile the base schedule's kernel body; the program's ``defines``
+    (``CAKE_FUSED_KDA_WIDE_SLOT_OFFSETS``) select the member's text.
+    """
 
     return (
         _variant(f"{name}_wide_slot_offsets", slot_offset_bits=64, **spec),
@@ -1924,8 +891,7 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         **_F32,
         eligibility=_rules(
             _NULLABLE, {8: ((19, 37), (56, 147)), **_DIRECT_NULLABLE_BANDS}
-        )
-        + _rules(_POSITIVE, {24: ((19, 49),), 96: ((5, 12),)}),
+        ),
     ),
     *_twins(
         "direct_bf16",
@@ -1940,6 +906,32 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         eligibility=_rules(_POSITIVE, {12: _OPEN, 24: _OPEN}),
     ),
 )
+# Every generated program exports one tvm-ffi entry point and is built with the
+# exporter's module-wide fast-math flag (the registry used to repeat both).
+_FFI_ENTRY = "run"
+_EXPORTED_COMPILE_FLAGS: tuple[str, ...] = ("--use_fast_math",)
+_GRID_PLAN: tuple[tuple[str, str], ...] = (
+    ("grid", "grid_x"),
+    ("grid", "grid_y"),
+    ("grid", "grid_z"),
+)
+# The tvm-ffi binding of a program is rendered from the template of its launch
+# ABI (``csrc/kda/cake_fused_kda_decode_templates/``, keyed by ABI kind and
+# cluster launch); the rendered text is byte-identical to the former per-program
+# binding file.  ``@NAME@`` placeholders take the kernel symbol, the entry point,
+# the host-shim namespace, the state dtype tokens and the launch constants.
+_BINDING_TEMPLATE_DIR = "cake_fused_kda_decode_templates"
+_BINDING_TEMPLATES: dict[tuple[str, bool], str] = {
+    ("standard", False): "standard_binding.cu.in",
+    ("standard", True): "standard_cluster_binding.cu.in",
+    ("persistent_rows", False): "persistent_rows_binding.cu.in",
+    ("repeated_safe", False): "repeated_safe_binding.cu.in",
+}
+_BINDING_PLACEHOLDER = re.compile(r"@([A-Z][A-Z0-9_]*)@")
+_STATE_DTYPE_TOKENS: dict[str, tuple[str, str]] = {
+    "float32": ("float", "DLDataType{kDLFloat, 32, 1}"),
+    "bfloat16": ("__nv_bfloat16", "DLDataType{kDLBfloat, 16, 1}"),
+}
 # Preserve three resident CTAs when NVCC allocates more registers than the
 # source compiler for this wide-offset staged schedule.
 _OCCUPANCY_FLAGS: dict[str, tuple[str, ...]] = {
@@ -1969,6 +961,13 @@ def _source_path(relative: str) -> Path:
     return (get_kda_csrc_dir() / Path(relative).name).resolve()
 
 
+def _binding_template_path(abi_kind: str, cluster_x: int) -> Path:
+    """Resolve the binding template of one launch ABI under ``csrc/kda``."""
+
+    template = _BINDING_TEMPLATES[(abi_kind, cluster_x != 1)]
+    return (get_kda_csrc_dir() / _BINDING_TEMPLATE_DIR / template).resolve()
+
+
 @functools.cache
 def get_cake_fused_kda_decode_variants(
     target: CakeFusedKDADecodeTarget = "sm100a",
@@ -1985,13 +984,14 @@ def get_cake_fused_kda_decode_variants(
         if name not in ROUTES:
             raise ValueError(f"Cake fused KDA variant {name} has no generated program")
         record = MODULES[ROUTES[name]]
-        device, binding = (_source_path(path) for path in record["sources"])
-        for path in (device, binding):
-            if not path.name.startswith("cake_fused_kda_decode_"):
-                raise ValueError(f"invalid Cake fused KDA source path: {path}")
-            if not path.is_file():
-                raise FileNotFoundError(f"Cake fused KDA source not found: {path}")
-        if _TARGET_ARCH[target] not in record["arches"]:
+        (device_source,) = record["sources"]
+        device = _source_path(device_source)
+        if not device.name.startswith("cake_fused_kda_decode_"):
+            raise ValueError(f"invalid Cake fused KDA source path: {device}")
+        if not device.is_file():
+            raise FileNotFoundError(f"Cake fused KDA source not found: {device}")
+        # One closure digest per exported architecture.
+        if _TARGET_ARCH[target] not in record["closure_sha256"]:
             raise ValueError(
                 f"Cake fused KDA program {ROUTES[name]} does not support {target}"
             )
@@ -2013,13 +1013,20 @@ def get_cake_fused_kda_decode_variants(
             raise ValueError(
                 f"Cake fused KDA cluster variant {name} must use the standard launch ABI"
             )
+        binding_template = _binding_template_path(item["abi_kind"], cluster_x)
+        if not binding_template.is_file():
+            raise FileNotFoundError(
+                f"Cake fused KDA binding template not found: {binding_template}"
+            )
+        abi = CAKE_FUSED_KDA_DECODE_ABIS[item["abi_kind"]]
+        arg_plan = tuple((kind, argument) for kind, argument, _dtype in abi)
         result.append(
             CakeFusedKDADecodeVariant(
                 name=name,
                 target=target,
                 module=ROUTES[name],
                 body_path=device,
-                binding_path=binding,
+                binding_template=binding_template,
                 # record["closure_sha256"] is {arch: digest} (one build per
                 # exported architecture); CakeFusedKDADecodeVariant.source_sha256
                 # is this *target's* single digest, matching
@@ -2027,17 +1034,18 @@ def get_cake_fused_kda_decode_variants(
                 # closure digest per generated program").
                 source_sha256=record["closure_sha256"][_TARGET_ARCH[target]],
                 kernel_symbol=record["kernel_symbol"],
-                ffi_entry=record["ffi_entry"],
-                arg_plan=tuple(tuple(entry) for entry in record["arg_plan"]),
+                ffi_entry=_FFI_ENTRY,
+                arg_plan=arg_plan + _GRID_PLAN,
                 abi_kind=item["abi_kind"],
                 state_dtype=item["state_dtype"],
                 slot_offset_bits=item["slot_offset_bits"],
                 extra_cuda_cflags=tuple(
                     flag
-                    for flag in record["compile_flags"]
+                    for flag in _EXPORTED_COMPILE_FLAGS
                     if name not in _PRECISE_MATH_VARIANTS
                     or flag not in _FAST_MATH_FLAGS
                 )
+                + tuple(f"-D{define}" for define in record["defines"])
                 + _OCCUPANCY_FLAGS.get(name, ()),
                 threads=int(record["launch"]["block"][0]),
                 dynamic_smem_bytes=int(record["launch"]["dynamic_smem_bytes"]),
@@ -2313,18 +1321,75 @@ def get_cake_fused_kda_decode_uri(name: str, target: CakeFusedKDADecodeTarget) -
     return f"cake_fused_kda_decode_{name}_{variant.source_sha256[:16]}_{target}"
 
 
+def render_cake_fused_kda_decode_binding(variant: CakeFusedKDADecodeVariant) -> str:
+    """Render the tvm-ffi binding translation unit of one generated program.
+
+    The template of the variant's launch ABI takes the kernel symbol, the entry
+    point, the host-shim namespace (``cake_host_shim_`` plus the first 16 hex
+    digits of the SHA-256 of the program name), the state dtype tokens and the
+    launch constants.  The result is byte-identical to the former per-program
+    binding file (``tests/kda/cake_fused_kda_decode_binding_sha256.json`` pins it).
+    """
+
+    state_ctype, state_dltype = _STATE_DTYPE_TOKENS[variant.state_dtype]
+    program_digest = hashlib.sha256(variant.module.encode("utf-8")).hexdigest()
+    values = {
+        "KERNEL_SYMBOL": variant.kernel_symbol,
+        "FFI_ENTRY": variant.ffi_entry,
+        "SHIM_NAMESPACE": f"cake_host_shim_{program_digest[:16]}",
+        "STATE_CTYPE": state_ctype,
+        "STATE_DLTYPE": state_dltype,
+        "THREADS": str(variant.threads),
+        "DYNAMIC_SMEM_BYTES": str(variant.dynamic_smem_bytes),
+    }
+    if variant.cluster_x != 1:
+        values["CLUSTER_X"] = str(variant.cluster_x)
+    template = variant.binding_template.read_text(encoding="utf-8")
+    unused = set(values)
+
+    def substitute(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key not in values:
+            raise RuntimeError(
+                f"{variant.binding_template.name} needs {key!r} for {variant.name}"
+            )
+        unused.discard(key)
+        return values[key]
+
+    text = _BINDING_PLACEHOLDER.sub(substitute, template)
+    if unused:
+        raise RuntimeError(
+            f"unused binding values for {variant.name}: {sorted(unused)}"
+        )
+    return text
+
+
+def _write_rendered_binding(path: Path, text: str) -> None:
+    """Write the rendered binding when its text changed.
+
+    Explicit UTF-8: the generated header line contains an em dash.
+    """
+
+    if path.exists() and path.read_text(encoding="utf-8") == text:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
 @functools.cache
 def gen_cake_fused_kda_decode_module(
     name: str, target: CakeFusedKDADecodeTarget
 ) -> JitSpec:
-    """Build a Cake module from its generated device and binding translation units."""
+    """Build a Cake module from its device source and its rendered binding."""
 
     variant = get_cake_fused_kda_decode_variant(name, target)
     csrc_dir = get_kda_csrc_dir()
     uri = get_cake_fused_kda_decode_uri(name, target)
+    binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_fused_kda_decode_binding.cu"
+    _write_rendered_binding(binding, render_cake_fused_kda_decode_binding(variant))
     spec = gen_jit_spec(
         name=uri,
-        sources=[variant.body_path, variant.binding_path],
+        sources=[variant.body_path, binding],
         extra_cuda_cflags=[*_TARGET_NVCC_FLAGS[target], *variant.extra_cuda_cflags],
         extra_include_paths=[csrc_dir, csrc_dir.parent, get_flashinfer_include_dir()],
         use_fast_math=name not in _PRECISE_MATH_VARIANTS,
@@ -2359,5 +1424,6 @@ __all__ = [
     "get_cake_fused_kda_decode_variant",
     "get_cake_fused_kda_decode_variants",
     "load_cake_fused_kda_decode_module",
+    "render_cake_fused_kda_decode_binding",
     "select_cake_fused_kda_decode_variant",
 ]

@@ -37,6 +37,8 @@ static constexpr float kFP8E4M3Max = 448.0f;
 // produce a zero scale.
 static constexpr float kFP8E4M3MinSubnormal = 1.0f / 512.0f;
 static constexpr float kDynamicFP8MinScale = kFP8E4M3MinSubnormal / kFP8E4M3Max;
+// MXFP8: 32 consecutive elements share one UE8M0 scale.
+static constexpr int kMXFP8SFVecSize = 32;
 
 }  // namespace details
 
@@ -807,6 +809,112 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(vec_t<T, VEC_SIZE>& vec, float SFScaleV
 
 #endif
 
+// UE8M0 biased exponent of ceil_pow2(value), saturated to [0, 254]. Bit-exact with
+// __nv_cvt_float_to_e8m0(value, __NV_SATFINITE, cudaRoundPosInf) and with FlashInfer's
+// CuTe-DSL mxfp8_quantize (float_to_ue8m0_fast).
+__device__ __forceinline__ uint32_t float_to_ue8m0_ceil(float value) {
+  if (value <= 0.f) {
+    return 0u;
+  }
+  uint32_t bits = __float_as_uint(value);
+  uint32_t exp_biased = (bits >> 23) & 0xffu;
+  uint32_t mantissa = bits & 0x7fffffu;
+  uint32_t bump = mantissa != 0u ? 1u : 0u;
+  if (exp_biased == 0u && mantissa <= 0x400000u) {
+    bump = 0u;
+  }
+  uint32_t result = exp_biased + bump;
+  return result > 254u ? 254u : result;
+}
+
+// Byte offset of MXFP8 scale factor (row, sf_col) in the LINEAR or SWIZZLED_128x4 layout.
+__device__ __forceinline__ int64_t mxfp8_sf_offset(int row, int sf_col, int num_sf_cols,
+                                                   QuantizationSFLayout layout) {
+  if (layout == QuantizationSFLayout::LINEAR) {
+    return static_cast<int64_t>(row) * num_sf_cols + sf_col;
+  }
+  // SWIZZLED_128x4: [numMTiles, numKTiles, 32 (mTile), 4 (mTile), 4 (kTile)]
+  int num_k_tiles = (num_sf_cols + 3) / 4;
+  return static_cast<int64_t>(row / 128) * num_k_tiles * 512 +
+         static_cast<int64_t>(sf_col / 4) * 512 + (row % 32) * 16 + ((row % 128) / 32) * 4 +
+         (sf_col % 4);
+}
+
+// MXFP8 quantization (E4M3 data, one UE8M0 scale per 32 elements) of one thread's VEC_SIZE
+// consecutive elements vals = x[row, col : col + VEC_SIZE), shared by the allreduce fusion kernels.
+//
+// The kMXFP8SFVecSize / VEC_SIZE threads holding one 32-element scale group must be consecutive,
+// lane-aligned lanes of one warp (col / VEC_SIZE == lane modulo the group size) and must call this
+// together; they reduce the group's amax with warp shuffles. Numerics match FlashInfer's
+// mxfp8_quantize (backend="cute-dsl") applied to the same bf16/fp16 values:
+// scale = ue8m0_ceil(amax * (1 / 448)), q = satfinite_rn(clamp(x * 2^-scale)).
+//
+// quant_out is [rows, hidden_dim] E4M3. scale_out holds the scales of every row; for the swizzled
+// layout the group leader of the last group also zeroes its row's column padding. Padding rows
+// [rows, round_up(rows, 128)) are left unwritten: a GEMM row only reads its own scales, so they
+// reach only output rows that are never stored.
+template <typename T, int VEC_SIZE>
+__device__ __forceinline__ void mxfp8_quantize_store(T const* vals, int row, int col,
+                                                     int hidden_dim, QuantizationSFLayout layout,
+                                                     void* quant_out, void* scale_out) {
+  constexpr int kSfVec = details::kMXFP8SFVecSize;
+  constexpr int kThreadsPerSf = kSfVec / VEC_SIZE;
+  static_assert(kSfVec % VEC_SIZE == 0 && kThreadsPerSf <= 32, "Invalid MXFP8 vector size");
+  static_assert(VEC_SIZE % 2 == 0, "MXFP8 packing converts element pairs");
+
+  float amax = 0.f;
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    amax = fmaxf(amax, fabsf(static_cast<float>(vals[i])));
+  }
+  constexpr unsigned int kGroupLanes =
+      kThreadsPerSf >= 32 ? 0xffffffffu : ((1u << kThreadsPerSf) - 1u);
+  unsigned int const mask = kGroupLanes << ((threadIdx.x & 31) & ~(kThreadsPerSf - 1));
+#pragma unroll
+  for (int offset = 1; offset < kThreadsPerSf; offset *= 2) {
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, offset));
+  }
+
+  constexpr float kInvE4M3Max = 1.0f / details::kFP8E4M3Max;
+  uint32_t sf = float_to_ue8m0_ceil(amax * kInvE4M3Max);
+  // 2^(127 - sf): exact inverse of the UE8M0 scale; 0 for sf == 0.
+  float inv_scale =
+      sf == 0u ? 0.f
+               : __uint_as_float(static_cast<uint32_t>(max(254 - static_cast<int>(sf), 0)) << 23);
+
+  using PackedQuantizedType = std::conditional_t<VEC_SIZE == 4, float, float2>;
+  static_assert(sizeof(PackedQuantizedType) == VEC_SIZE, "Unsupported MXFP8 vector size");
+  PackedQuantizedType ret;
+#pragma unroll
+  for (int i = 0; i < VEC_SIZE; i += 2) {
+    float2 f;
+    f.x = static_cast<float>(vals[i]) * inv_scale;
+    f.y = static_cast<float>(vals[i + 1]) * inv_scale;
+    f.x = fmaxf(fminf(f.x, details::kFP8E4M3Max), -details::kFP8E4M3Max);
+    f.y = fmaxf(fminf(f.y, details::kFP8E4M3Max), -details::kFP8E4M3Max);
+    reinterpret_cast<__nv_fp8x2_storage_t*>(&ret)[i / 2] =
+        __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
+  }
+  int64_t const elem_offset = static_cast<int64_t>(row) * hidden_dim + col;
+  *reinterpret_cast<PackedQuantizedType*>(reinterpret_cast<uint8_t*>(quant_out) + elem_offset) =
+      ret;
+
+  if ((col / VEC_SIZE) % kThreadsPerSf != 0) {
+    return;
+  }
+  uint8_t* sf_out = reinterpret_cast<uint8_t*>(scale_out);
+  int const num_sf_cols = hidden_dim / kSfVec;
+  int const sf_col = col / kSfVec;
+  sf_out[mxfp8_sf_offset(row, sf_col, num_sf_cols, layout)] = static_cast<uint8_t>(sf);
+  if (layout != QuantizationSFLayout::SWIZZLED_128x4 || sf_col != num_sf_cols - 1) {
+    return;
+  }
+  int const padded_cols = (num_sf_cols + 3) / 4 * 4;
+  for (int c = num_sf_cols; c < padded_cols; ++c) {
+    sf_out[mxfp8_sf_offset(row, c, num_sf_cols, layout)] = 0;
+  }
+}
+
 }  // namespace utils
 
 template <typename T, uint32_t VEC_SIZE>
@@ -835,6 +943,12 @@ enum class AllReduceFusionPattern : int {
   kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9,
   kARResidualRMSNormDynamicFP8Quant = 10,
   kARResidualRMSNormOutDynamicFP8Quant = 11,
+  // 12 is kMoEFinalizeARResidualRMSNormFP8Quant (MNNVL CuTe DSL only, Python side).
+  // MXFP8 quantization (E4M3 data, one UE8M0 scale per 32 elements) with the
+  // scale factors written in the SWIZZLED_128x4 (or LINEAR) layout.
+  kARResidualRMSNormMXFP8Quant = 13,
+  // Same as above but also outputs the norm result
+  kARResidualRMSNormOutMXFP8Quant = 14,
 };
 
 enum class QuantType : int {
@@ -843,6 +957,7 @@ enum class QuantType : int {
   kFP4 = 2,
   kPerTokenGroupFP8Packed = 3,  // Per-token-group FP8 with dynamic UE8M0 scales
   kDynamicFP8 = 4,
+  kMXFP8 = 5,
 };
 
 template <AllReduceFusionPattern Pattern>
@@ -881,6 +996,10 @@ DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormDynamicFP
                              true, true, false, QuantType::kDynamicFP8);
 DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutDynamicFP8Quant, false,
                              true, true, true, true, QuantType::kDynamicFP8);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormMXFP8Quant, false, true,
+                             true, true, false, QuantType::kMXFP8);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant, false, true,
+                             true, true, true, QuantType::kMXFP8);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
@@ -1271,6 +1390,8 @@ class FusedOp {
           write_group_scale(group_idx_in_row, group_absmax);
         }
       }
+    } else if constexpr (GetQuantType<Pattern> == QuantType::kMXFP8) {
+      mxfp8_quant(val, token_id);
     } else if constexpr (GetQuantType<Pattern> == QuantType::kDynamicFP8) {
       float token_scale = dynamic_token_fp8_scale(val, token_id);
       using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
@@ -1288,6 +1409,12 @@ class FusedOp {
   }
 
  protected:
+  __device__ __forceinline__ void mxfp8_quant(vec_t<T, VEC_SIZE> const& val, int token_id) {
+    utils::mxfp8_quantize_store<T, VEC_SIZE>(
+        reinterpret_cast<T const*>(&val), token_id, m_access_id_in_token * VEC_SIZE,
+        m_params.hidden_dim, m_params.layout, m_params.quant_out, m_params.scale_out);
+  }
+
   __device__ __forceinline__ vec_t<T, VEC_SIZE> rms_norm(vec_t<T, VEC_SIZE> const& residual,
                                                          vec_t<T, VEC_SIZE> const& gamma) {
     __shared__ float s_val;
@@ -1831,6 +1958,25 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
                      "a multiple of block_quant_group_size");
   }
 
+  if constexpr (GetQuantType<Pattern> == QuantType::kMXFP8) {
+    FLASHINFER_CHECK(params.hidden_dim % details::kMXFP8SFVecSize == 0,
+                     "hidden_dim must be divisible by 32 for MXFP8 quant");
+    FLASHINFER_CHECK(params.scale_out != nullptr && params.quant_out != nullptr,
+                     "quant_out and scale_out are required for MXFP8 quant");
+    FLASHINFER_CHECK(params.layout == QuantizationSFLayout::SWIZZLED_128x4 ||
+                         params.layout == QuantizationSFLayout::LINEAR,
+                     "MXFP8 quant supports the SWIZZLED_128x4 and LINEAR scale layouts");
+    // A 32-element scale group spans kMXFP8SFVecSize / VEC_SIZE consecutive threads; keep
+    // every group inside one block (and therefore inside one warp) by widening the block.
+    while (cluster_size > 1 && (threads_per_block * VEC_SIZE) % details::kMXFP8SFVecSize != 0) {
+      threads_per_block *= 2;
+      cluster_size /= 2;
+    }
+    block_size = threads_per_block;
+    FLASHINFER_CHECK((block_size * VEC_SIZE) % details::kMXFP8SFVecSize == 0,
+                     "block elements must be a multiple of 32 for MXFP8 quant");
+  }
+
   // Check conditions using the final block_size (not threads_per_block)
   FLASHINFER_CHECK(oneshot || block_size >= params.nranks, "not oneshot, or block_size < nranks");
   FLASHINFER_CHECK(block_size <= 1024 && cluster_size > 0,
@@ -1928,6 +2074,12 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
       break;                                                                                      \
     case AllReduceFusionPattern::kARResidualRMSNormOutDynamicFP8Quant:                            \
       DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutDynamicFP8Quant, NRanks); \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormMXFP8Quant:                                    \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormMXFP8Quant, NRanks);         \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant:                                 \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant, NRanks);      \
       break;                                                                                      \
     default:                                                                                      \
       FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern");                            \
