@@ -1293,10 +1293,30 @@ def test_fp8_prefill_keeps_batch_and_cache_layout_predicates(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
 def test_unexported_variant_fails(arch):
     with pytest.raises(ValueError, match="no generated source contract"):
         get_cake_dsv4_spec("unexported_variant", arch=arch)
+
+
+@pytest.mark.cpu_only
+def test_sm107a_registers_the_fp8_decode_route_only():
+    """SM107 builds the FP8 programs the decode route picks, each from its own
+    sm_107a/ sources, and has no BF16 or NVFP4 variant."""
+    from flashinfer.jit.cake_dsv4 import _ARCH_REGISTRATIONS
+
+    assert set(_ARCH_REGISTRATIONS["sm_107a"]["variants"]) == {
+        "fp8_h128_prefill_source_persistent",
+        "fp8_h128_prefill_source_persistent_uniform",
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "fp8_lowhead_prefill",
+    }
+    for spec in _ARCH_REGISTRATIONS["sm_107a"]["variants"].values():
+        assert all(source.startswith("sm_107a/") for source in spec["sources"])
+        assert ("launch", "enable_pdl") in spec["arg_plan"]
+    with pytest.raises(ValueError, match="SM107 runs the FP8 decode route"):
+        get_cake_dsv4_spec("bf16_h128_prefill_v42", arch="sm_107a")
 
 
 @pytest.mark.cpu_only

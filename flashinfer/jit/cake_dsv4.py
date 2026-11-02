@@ -1,8 +1,10 @@
 """JIT loader for the Cake-generated DeepSeek V4 sparse MLA kernels.
 
 Every variant is one device kernel plus its TVM-FFI launcher under
-``csrc/cake_dsv4/<arch>/`` (``common/`` when both architectures compile the same
-source). ``_ARCH_REGISTRATIONS`` is the per-architecture build and argument
+``csrc/cake_dsv4/<arch>/`` (``common/`` when both SM100 and SM103 compile the
+same source). SM107 (``sm_107a``) routes only the FP8 decode variants whose Cake
+programs build for it, each from its own ``sm_107a/`` sources, and has no NVFP4
+records. ``_ARCH_REGISTRATIONS`` is the per-architecture build and argument
 contract: the host (``flashinfer.mla.cake_dsv4``) binds every ``arg_plan`` entry
 by name and passes the launch grid, so a regenerated registration only needs
 names from the host vocabulary.
@@ -34,11 +36,16 @@ from .core import (
     logger,
     sm100a_nvcc_flags,
     sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
 )
 from .cpp_ext import get_cuda_version, is_cuda_version_at_least
 
 
-_ARCH_NVCC_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
+_ARCH_NVCC_FLAGS = {
+    "sm_100a": sm100a_nvcc_flags,
+    "sm_103a": sm103a_nvcc_flags,
+    "sm_107a": sm107a_nvcc_flags,
+}
 
 # The launch grid that ends every argument plan.
 _GRID = (("grid", "grid_x"), ("grid", "grid_y"), ("grid", "grid_z"))
@@ -598,6 +605,36 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "fp8_lowhead_prefill": [
+        ["tma_buffer", "tmap_q"],
+        ["tma_buffer", "tmap_swa_kv"],
+        ["tma_buffer", "tmap_compressed_kv"],
+        ["buffer", "O"],
+        ["buffer", "partial_lse"],
+        ["buffer", "swa_indices"],
+        ["buffer", "compressed_indices"],
+        ["buffer", "sparse_topk_lens"],
+        ["buffer", "sinks"],
+        ["buffer", "bmm1_scale"],
+        ["buffer", "bmm2_scale"],
+        ["parameter", "num_heads"],
+        ["parameter", "swa_index_stride"],
+        ["parameter", "compressed_index_stride"],
+        ["parameter", "sparse_topk_lens_offset"],
+        ["parameter", "num_query_tokens"],
+        ["parameter", "sparse_topk"],
+        ["parameter", "has_sinks"],
+        ["parameter", "total_work_items"],
+        ["buffer", "seq_lens"],
+        ["buffer", "cum_seq_lens_q"],
+        ["parameter", "ragged_query"],
+        ["parameter", "max_q_len"],
+        ["parameter", "batch_size"],
+        ["launch", "enable_pdl"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "fp8_lowhead_qlayout": [
         ["tma_buffer", "tmap_q"],
         ["tma_buffer", "tmap_swa_kv"],
@@ -878,6 +915,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a": "56e39a54a6c54528942d4755a15a8e1e8e4e00d1cfbb3656da64042c9cb255ca",
         },
     },
+    "cake_dsv4_4a6718b7a2ca825d8800": {
+        "sources": [
+            "sm_107a/cake_dsv4_4a6718b7a2ca825d8800_kernel.cu",
+            "sm_107a/cake_dsv4_4a6718b7a2ca825d8800_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_uniform",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "954684e567b70122d1e315f5b6ed7a98f1ee4b272f7586676147da5cfbdfa388",
+        },
+    },
     "cake_dsv4_50a2c6ca93259d30db6b": {
         "sources": [
             "common/cake_dsv4_50a2c6ca93259d30db6b_kernel.cu",
@@ -944,6 +993,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "e6e5b87fd8a983b27441821bef344529d5ee4590768197309b782583f469a393",
         },
     },
+    "cake_dsv4_77fc7066e2ba5bebb062": {
+        "sources": [
+            "sm_107a/cake_dsv4_77fc7066e2ba5bebb062_kernel.cu",
+            "sm_107a/cake_dsv4_77fc7066e2ba5bebb062_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math", "-Xptxas=--register-usage-level=10"],
+        "arg_plan": "fp8_h128_prefill_source_persistent_uniform",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "e1e02c8bf09123ce9837336807bb88ecd36a0509d1ba018a72ffc2c179065474",
+        },
+    },
     "cake_dsv4_7850190a53cc07aba85a": {
         "sources": [
             "sm_103a/cake_dsv4_7850190a53cc07aba85a_kernel.cu",
@@ -992,6 +1053,18 @@ MODULES: dict[str, dict[str, Any]] = {
         "identity": {
             "sm_100a": "2f99b2a7afaaebd7155d2f7a9eb549cd251617145789bcfec11db0eb325baf70",
             "sm_103a": "bddd4c2730d1e8ff49a6499206753612675f3349a2ead78db4c100590f761eb3",
+        },
+    },
+    "cake_dsv4_8625d6529808d0d51fc2": {
+        "sources": [
+            "sm_107a/cake_dsv4_8625d6529808d0d51fc2_kernel.cu",
+            "sm_107a/cake_dsv4_8625d6529808d0d51fc2_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_lowhead_prefill",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "19bb53cd64734c4426604fce1f650444be92dd808a6a46fb92cf4e07c33638a2",
         },
     },
     "cake_dsv4_88757d413062636b5640": {
@@ -1100,10 +1173,22 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a/cake_dsv4_d9d623599c9697a9ccf3_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
-        "arg_plan": "fp8_lowhead_qlayout",
+        "arg_plan": "fp8_lowhead_prefill",
         "arches": ["sm_100a"],
         "identity": {
-            "sm_100a": "d5c40003f771b5418f4c624996bc4b45cb7d42b4ea5cf9052e7b34148719fc5b",
+            "sm_100a": "b1b2c3108dcfb7ea8b54a57f7dde80f561fff8fd5010c93fa4b1ee3a738bdb18",
+        },
+    },
+    "cake_dsv4_df5d069562864950e48b": {
+        "sources": [
+            "sm_107a/cake_dsv4_df5d069562864950e48b_kernel.cu",
+            "sm_107a/cake_dsv4_df5d069562864950e48b_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "e8e84bca5329e94abf29f10e4e48b2748eb9fb4900579c27dfae0ccbce55464e",
         },
     },
     "cake_dsv4_e21760e2024d7c1e85c9": {
@@ -1112,10 +1197,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a/cake_dsv4_e21760e2024d7c1e85c9_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
-        "arg_plan": "fp8_lowhead_qlayout",
+        "arg_plan": "fp8_lowhead_prefill",
         "arches": ["sm_103a"],
         "identity": {
-            "sm_103a": "f72c10581feba412230aa3755fabd8c44d5aa4e4fda7629a3d1d90a546acf3b5",
+            "sm_103a": "bbaa5da7cb0f8fc63684d3daf1d5d2156b9c441e87068d2c666b6361df61b840",
         },
     },
     "cake_dsv4_e5e9d7f2a2798aec29ff": {
@@ -1193,6 +1278,18 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a": "85f6e251ee2272c1f34b4ec404e3e76aaa5e13fc25ba50cd303d5007808ac69d",
         },
     },
+    "cake_dsv4_ffa4216b35dae8d46543": {
+        "sources": [
+            "sm_107a/cake_dsv4_ffa4216b35dae8d46543_kernel.cu",
+            "sm_107a/cake_dsv4_ffa4216b35dae8d46543_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "arg_plan": "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        "arches": ["sm_107a"],
+        "identity": {
+            "sm_107a": "51bb8a9cd443715fd5af3ae320e63c7bda722b0b3aa3f13fdbe147e690679e61",
+        },
+    },
 }
 
 VARIANTS: dict[str, dict[str, str]] = {
@@ -1254,6 +1351,13 @@ VARIANTS: dict[str, dict[str, str]] = {
         "fp8_lowhead_prefill": "cake_dsv4_e21760e2024d7c1e85c9",
         "split_reduce": "cake_dsv4_5f640d72462f26d33803",
     },
+    "sm_107a": {
+        "fp8_h128_prefill_source_persistent": "cake_dsv4_77fc7066e2ba5bebb062",
+        "fp8_h128_prefill_source_persistent_uniform": "cake_dsv4_4a6718b7a2ca825d8800",
+        "fp8_h64_prefill_source_persistent_m64": "cake_dsv4_df5d069562864950e48b",
+        "fp8_h64_prefill_source_persistent_m64_multi_tile": "cake_dsv4_ffa4216b35dae8d46543",
+        "fp8_lowhead_prefill": "cake_dsv4_8625d6529808d0d51fc2",
+    },
 }
 
 
@@ -1278,9 +1382,11 @@ def _registration(arch: str, variant: str) -> dict[str, object]:
 
 
 def _arch_registration(arch: str) -> dict[str, dict[str, dict[str, object]]]:
-    """Every variant of ``arch`` (BF16 / FP8 and NVFP4), in key order."""
-    variants = {variant: _registration(arch, variant) for variant in VARIANTS[arch]}
-    nvfp4 = _nvfp4_variants(arch)
+    """Every variant of ``arch`` (BF16 / FP8 and, where it has them, NVFP4), in key order."""
+    variants = {
+        variant: _registration(arch, variant) for variant in VARIANTS.get(arch, {})
+    }
+    nvfp4 = _nvfp4_variants(arch) if arch in _NVFP4_IDENTITIES else {}
     shared = sorted(set(variants) & set(nvfp4))
     if shared:
         raise ValueError(f"CAKE DSv4 variant keys registered twice on {arch}: {shared}")
@@ -1326,7 +1432,13 @@ def get_cake_dsv4_spec(variant: str, *, arch: str) -> dict:
         return _ARCH_REGISTRATIONS[arch]["variants"][variant]
     except KeyError as exc:
         raise ValueError(
-            f"CAKE DSv4 variant has no generated source contract: {variant}"
+            f"CAKE DSv4 variant has no generated source contract: {variant} ({arch})"
+            + (
+                " (SM107 runs the FP8 decode route's persistent, M64 and low-head "
+                "prefill programs only)"
+                if arch == "sm_107a"
+                else ""
+            )
         ) from exc
 
 
