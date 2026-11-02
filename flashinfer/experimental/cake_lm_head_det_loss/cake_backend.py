@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Cake backend: chunked large-vocabulary LM-head projection + loss with a
-memory-bounded backward for training on SM100 / SM103
+memory-bounded backward for training on SM100 / SM103 / SM107
 (flashinfer-ai/flashinfer#5680).
 
 Contract
@@ -223,7 +223,11 @@ GRAD_WEIGHT_DTYPES = (torch.bfloat16, torch.float32)
 # ``mode`` scalar of ``row_finalize`` / ``loss_reduce``: which per-row quantities the stage forms.
 MODE_CE, MODE_POLICY, MODE_EXTERNAL, MODE_NONE = 0, 1, 2, 3
 WORKSPACE_ALIGN = 256
-SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+SUPPORTED_COMPUTE_CAPABILITIES = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
+}
 
 # Host binding profile: the keyword set of the generated kernels (see
 # :func:`stage_values`: the host provides, per stage, the kernel's own argument
@@ -1295,7 +1299,7 @@ def record_for(device: Optional[torch.device] = None) -> tuple[str, dict[str, An
     arch = arch_for(device)
     if arch is None:
         raise ValueError(
-            "the chunked LM-head + loss kernels require compute capability 10.0 or 10.3"
+            "the chunked LM-head + loss kernels require compute capability 10.0, 10.3 or 10.7"
         )
     name = select_module(arch)
     return name, MODULES[name]

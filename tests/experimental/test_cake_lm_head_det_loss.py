@@ -132,7 +132,7 @@ def _device_supported() -> bool:
 
 def _require_program(*, entry: str = "loss"):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 device")
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
     if not generated_program_available(torch.device("cuda"), entry=entry):
         pytest.skip(
             f"generated chunked LM-head program ({entry} entry) not registered for this device"
@@ -7064,7 +7064,7 @@ def test_budget_plan_keys():
 
 
 # ---------------------------------------------------------------------------
-# Device tests (compute capability 10.0 / 10.3 with a registered program; the pinned
+# Device tests (compute capability 10.0 / 10.3 / 10.7 with a registered program; the pinned
 # GLM-class geometry H = 6144, V = 154880 with small T)
 # ---------------------------------------------------------------------------
 
@@ -7910,7 +7910,9 @@ def test_device_dw_cast_tma_is_bitwise_the_shipped_cast(glm_weight, tail):
     """The bf16 fused cast's TMA store on the last chunk of a 2- or 3-chunk call (tails 1 .. 1792; 1793 keeps the
     shipped cast) gives the bits of the shipped cast (``"dw": {"epi_store": None}``) on every entry and objective."""
     _require_program(entry="loss")
-    module_name, _ = cake_backend.record_for(CUDA)
+    module_name, record = cake_backend.record_for(CUDA)
+    if record["arch"] not in cake_backend.DW_CAST_TMA_MAX_ROWS:
+        pytest.skip(f"no TMA-store dW cast on {record['arch']}")
     assert "gemm_dw_cast_bf16_tma" in cake_jit.registered_stages(module_name)
     C = 2048
     shipped = {"gemm_tuning": {"dw": {"epi_store": None}}}
@@ -7935,7 +7937,9 @@ def test_device_dw_cast_tma_adversarial_old_sum_is_bitwise(glm_weight):
     overflow): the TMA store (rows 1 .. 1792, the default) and the shipped cast (an explicit ``epi_store``) give the
     same bf16 bits for every tail and upstream scale, and the old sum is only read."""
     _require_program(entry="loss")
-    module_name, _ = cake_backend.record_for(CUDA)
+    module_name, record = cake_backend.record_for(CUDA)
+    if record["arch"] not in cake_backend.DW_CAST_TMA_MAX_ROWS:
+        pytest.skip(f"no TMA-store dW cast on {record['arch']}")
     assert "gemm_dw_cast_bf16_tma" in cake_jit.registered_stages(module_name)
     H, V = DEFAULT_H, DEFAULT_V
     gen = torch.Generator(device=CUDA).manual_seed(SEED + 97)
