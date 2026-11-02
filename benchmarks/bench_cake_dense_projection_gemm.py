@@ -356,6 +356,8 @@ def plan_record(prepared):
         p = prepared.plan
         record.update(
             units=p.units,
+            head_spans=p.head_spans,
+            head_steps=p.head_steps,
             tiles=p.tiles,
             k_iters=p.k_iters,
             part_tiles=p.part_tiles,

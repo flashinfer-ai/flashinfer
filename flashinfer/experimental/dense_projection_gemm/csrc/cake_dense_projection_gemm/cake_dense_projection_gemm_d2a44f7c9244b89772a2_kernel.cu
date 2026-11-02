@@ -219,7 +219,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(448) __cluster_dims__(2,1,1) void
-kernel_cake_dense_projection_gemm_5c912a20d4917fc98c98(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ out32, const __grid_constant__ CUtensorMap D, int M, int N, int m_tiles, int n_tiles, int k_iters, int ldo, int units)
+kernel_cake_dense_projection_gemm_d2a44f7c9244b89772a2(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ out32, const __grid_constant__ CUtensorMap D, int M, int N, int m_tiles, int n_tiles, int k_iters, int ldo, int units)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
