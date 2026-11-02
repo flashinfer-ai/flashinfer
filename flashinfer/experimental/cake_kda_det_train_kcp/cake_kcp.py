@@ -277,10 +277,10 @@ for K4's states (c1 / b1 pairs, ``tile_stride`` 2) and the carry plane; under ``
 
 from __future__ import annotations
 
-import copy
 import ctypes
 import dataclasses
 import functools
+import types
 import warnings
 import weakref
 from collections.abc import Sequence
@@ -6497,7 +6497,7 @@ def _l2n_bwd_rows(
     if hosts:
         views = call.scratch["views"]
         # the arena's views are cached per layout: never rebind them
-        moved = copy.copy(views)
+        moved = types.SimpleNamespace(**vars(views))
         for buf, out in _L2N_ROW_HOSTS:
             host = hosts.get(buf)
             if host is None:
