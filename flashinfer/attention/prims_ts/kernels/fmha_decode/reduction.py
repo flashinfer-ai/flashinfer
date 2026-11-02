@@ -15,9 +15,12 @@
 """Standalone GMEM reducers for FMHA decode TS split-KV profiles.
 
 The decode kernel publishes one normalized 16-bit O vector and one FP32
-log2-LSE scalar per ``(batch, kv_head, split_kv, output_row)``. Reducer threads
-own 16-byte output fragments and combine those normalized states with the
-shared log2-LSE recurrence.
+log2-LSE scalar per ``(batch, kv_head, split_kv, output_row)``. Statistics-enabled
+specializations append the raw QK maximum and actual unscaled denominator.
+Reducer threads own 16-byte output fragments and combine normalized states with
+the shared log2-LSE
+recurrence; only the final row owner additionally merges the optional max/sum
+states independently of the rounded absolute LSE.
 
 The production schedule is selected from the split count:
 
@@ -34,6 +37,8 @@ schedules merge the optional attention-sink denominator, pack the requested
 output dtype, and write final O. Batch and KV head remain grid dimensions;
 only split-KV is reduced here.
 """
+
+import math
 
 import cutlass
 import cutlass.cute as cute
@@ -158,11 +163,14 @@ def _reduce_exact_splits_body(
     wait_for_pdl_producer: cutlass.Constexpr[bool] = False,
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
+    g_softmax_stats: cute.Pointer | None = None,
+    stats_scale: Float32 = 1.0,
 ) -> None:
     """Fold every split in one 512-thread CTA over one 8 KiB output slice.
 
     ``g_partial_stats`` stores one log2-LSE scalar for each split and output
-    row. ``g_partial_o`` stores the corresponding normalized 16-bit O fragment.
+    row, or an interleaved (log2-LSE, raw QK maximum, denominator) triple when
+    exporting statistics. ``g_partial_o`` stores the normalized 16-bit O fragment.
     This body is shared by the serial reference kernel and the compact S2-S4
     production schedule. The production caller requests its PDL acquire after
     this body's local register state is initialized and before partial reads.
@@ -266,7 +274,12 @@ def _reduce_exact_splits_body(
                     cfg,
                 )
                 stats_offset = workspace_row * Int64(
-                    SEPARATE_REDUCTION_LSE_VALUES_PER_ROW * FP32_BYTES
+                    (
+                        3
+                        if cfg.store_softmax_stats
+                        else SEPARATE_REDUCTION_LSE_VALUES_PER_ROW
+                    )
+                    * FP32_BYTES
                 )
                 stats_src = cutlass.inttoptr(
                     g_partial_stats.toint() + stats_offset,
@@ -314,6 +327,13 @@ def _reduce_exact_splits_body(
             grid_h_k,
             attention_sink_head_idx,
             cfg,
+            g_softmax_stats=g_softmax_stats,
+            g_partial_stats=g_partial_stats,
+            logical_kv_idx=logical_kv_idx,
+            logical_output_row_idx=reduce_row_idx,
+            rows_per_split=g_q_output_rows,
+            active_splits_kv=active_splits_kv,
+            stats_scale=stats_scale,
             lse_ptr=lse_ptr,
         )
 
@@ -331,6 +351,8 @@ def decode_gen_separate_reduction_kernel(
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
+    g_softmax_stats: cute.Pointer | None = None,
+    stats_scale: Float32 = 1.0,
 ) -> None:
     """Run the 512-thread exact-split reference schedule."""
 
@@ -346,6 +368,8 @@ def decode_gen_separate_reduction_kernel(
         static_full_split_prefix,
         lse_ptr=lse_ptr,
         requested_splits=requested_splits,
+        g_softmax_stats=g_softmax_stats,
+        stats_scale=stats_scale,
     )
 
 
@@ -391,12 +415,20 @@ def _store_parallel_reduction_output(
     attention_sink_head_idx: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     lse_ptr: cute.Pointer | None = None,
+    g_softmax_stats: cute.Pointer | None = None,
+    g_partial_stats: cute.Pointer | None = None,
+    logical_kv_idx: Int64 = 0,
+    logical_output_row_idx: Int32 = 0,
+    rows_per_split: Int32 = 0,
+    active_splits_kv: Int32 = 0,
+    stats_scale: Float32 = 1.0,
 ) -> None:
     """Merge the optional sink and store one normalized output fragment.
 
     Producer CTAs already fold the softmax scale into log2-LSE and, for FP8
     output, fold the output quantization scale into normalized partial O. The
-    standalone reducer therefore only merges normalized states here.
+    output reduction therefore only merges normalized states here. Statistics
+    retain raw maxima and apply the runtime scale only after subtraction.
     """
 
     split_weight = _final_output_lse(
@@ -408,6 +440,60 @@ def _store_parallel_reduction_output(
         h_k_idx * attention_sink_h_r + attention_sink_head_idx,
         reduce_col_idx == Int32(0),
     )
+    if cutlass.const_expr(cfg.store_softmax_stats):
+        if reduce_col_idx == Int32(0):
+            # Only the final row owner merges the optional max/sum states.
+            # The original LSE/O recurrence and cluster communication stay unchanged;
+            # statistics-disabled kernels allocate no additional state.
+            raw_maximum = Float32(-Float32.inf)
+            for split_idx in cutlass.range(active_splits_kv):
+                workspace_row = _separate_workspace_row_offset(
+                    logical_kv_idx,
+                    split_idx,
+                    logical_output_row_idx,
+                    rows_per_split,
+                    cfg,
+                )
+                partial_max = (
+                    g_partial_stats + workspace_row * Int64(3) + Int64(1)
+                ).load()
+                raw_maximum = cute.math.max(raw_maximum, partial_max, ftz=True)
+            denominator = Float32(0.0)
+            maximum = Float32(-Float32.inf)
+            if raw_maximum != Float32(-Float32.inf):
+                maximum = raw_maximum * stats_scale
+                scale_log2 = stats_scale * Float32(math.log2(math.e))
+                for split_idx in cutlass.range(active_splits_kv):
+                    workspace_row = _separate_workspace_row_offset(
+                        logical_kv_idx,
+                        split_idx,
+                        logical_output_row_idx,
+                        rows_per_split,
+                        cfg,
+                    )
+                    partial_ptr = g_partial_stats + workspace_row * Int64(3)
+                    partial_max = (partial_ptr + Int64(1)).load()
+                    partial_sum = (partial_ptr + Int64(2)).load()
+                    # Preserve small differences between large finite raw
+                    # maxima before conversion to base-2 exponent units.
+                    denominator += partial_sum * cute.math.exp2(
+                        (partial_max - raw_maximum) * scale_log2, fastmath=True
+                    )
+                if cutlass.const_expr(cfg.use_attention_sinks):
+                    # Load the unscaled sink directly: adding/removing the FP8
+                    # probability scale in absolute LSE can itself lose bits.
+                    head_idx = cute.math.min(
+                        h_k_idx * attention_sink_h_r + attention_sink_head_idx,
+                        attention_sink_h_r * grid_h_k - Int32(1),
+                    )
+                    sink_delta = g_attention_sinks[head_idx] - maximum
+                    denominator += cute.math.exp2(
+                        sink_delta * Float32(math.log2(math.e)), fastmath=True
+                    )
+            (g_softmax_stats + Int64(output_row_idx) * Int64(2)).store(maximum)
+            (g_softmax_stats + Int64(output_row_idx) * Int64(2) + Int64(1)).store(
+                denominator
+            )
 
     final_regs = cutlass.Array(
         Int32,
@@ -483,6 +569,8 @@ def decode_gen_parallel_separate_reduction_kernel(
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
     compact_schedule: cutlass.Constexpr[bool] = False,
+    g_softmax_stats: cute.Pointer | None = None,
+    stats_scale: Float32 = 1.0,
 ) -> None:
     """Reduce split partials with a compact or clustered constexpr schedule.
 
@@ -509,6 +597,8 @@ def decode_gen_parallel_separate_reduction_kernel(
             cfg.use_parallel_separate_reduction_pdl,
             lse_ptr=lse_ptr,
             requested_splits=requested_splits,
+            g_softmax_stats=g_softmax_stats,
+            stats_scale=stats_scale,
         )
         return
 
@@ -664,7 +754,12 @@ def decode_gen_parallel_separate_reduction_kernel(
                     cfg,
                 )
                 stats_offset = workspace_row * Int64(
-                    SEPARATE_REDUCTION_LSE_VALUES_PER_ROW * FP32_BYTES
+                    (
+                        3
+                        if cfg.store_softmax_stats
+                        else SEPARATE_REDUCTION_LSE_VALUES_PER_ROW
+                    )
+                    * FP32_BYTES
                 )
                 stats_src = cutlass.inttoptr(
                     g_partial_stats.toint() + stats_offset,
@@ -784,6 +879,13 @@ def decode_gen_parallel_separate_reduction_kernel(
                 grid_h_k,
                 attention_sink_head_idx,
                 cfg,
+                g_softmax_stats=g_softmax_stats,
+                g_partial_stats=g_partial_stats,
+                logical_kv_idx=logical_kv_idx,
+                logical_output_row_idx=reduce_row_idx,
+                rows_per_split=g_q_output_rows,
+                active_splits_kv=active_splits_kv,
+                stats_scale=stats_scale,
                 lse_ptr=lse_ptr,
             )
         return
@@ -941,6 +1043,13 @@ def decode_gen_parallel_separate_reduction_kernel(
             grid_h_k,
             attention_sink_head_idx,
             cfg,
+            g_softmax_stats=g_softmax_stats,
+            g_partial_stats=g_partial_stats,
+            logical_kv_idx=logical_kv_idx,
+            logical_output_row_idx=reduce_row_idx,
+            rows_per_split=g_q_output_rows,
+            active_splits_kv=active_splits_kv,
+            stats_scale=stats_scale,
             lse_ptr=lse_ptr,
         )
 
@@ -966,6 +1075,7 @@ def fmha_decode_separate_reduction_launch(
     lse_ptr: cute.Pointer | None = None,
     requested_splits=None,
     runtime_q_capacity_rows: Int32 = 0,
+    softmax_stats_iter: cute.Pointer | None = None,
 ) -> None:
     """Launch the standalone reducer after the main split-KV decode kernel.
 
@@ -974,6 +1084,7 @@ def fmha_decode_separate_reduction_launch(
     maps cluster ranks into grid.x for each 2 KiB slice. ``softmax_scale`` and
     ``output_scale`` remain parameters for launch-ABI compatibility; producer
     CTAs already applied them to log2-LSE and normalized partial O, respectively.
+    Statistics merge raw maxima and denominators using ``softmax_scale``.
     ``seqlens_kv_iter`` is internal reducer metadata used only to
     bound the runtime split prefix; the decode launch ABI remains unchanged.
     """
@@ -1036,6 +1147,8 @@ def fmha_decode_separate_reduction_launch(
                     cfg,
                     static_full_split_prefix,
                     lse_ptr=lse_ptr,
+                    g_softmax_stats=softmax_stats_iter,
+                    stats_scale=softmax_scale,
                     requested_splits=requested_splits,
                     compact_schedule=True,
                 ).launch(
@@ -1057,6 +1170,8 @@ def fmha_decode_separate_reduction_launch(
                     cfg,
                     static_full_split_prefix,
                     lse_ptr=lse_ptr,
+                    g_softmax_stats=softmax_stats_iter,
+                    stats_scale=softmax_scale,
                     requested_splits=requested_splits,
                 ).launch(
                     grid=(num_parallel_slices * cluster_size, h_k, b),
@@ -1077,6 +1192,8 @@ def fmha_decode_separate_reduction_launch(
                 cfg,
                 static_full_split_prefix,
                 lse_ptr=lse_ptr,
+                g_softmax_stats=softmax_stats_iter,
+                stats_scale=softmax_scale,
                 requested_splits=requested_splits,
             ).launch(
                 grid=(num_parallel_slices * cluster_size, h_k, b),
@@ -1098,6 +1215,8 @@ def fmha_decode_separate_reduction_launch(
         static_full_split_prefix,
         lse_ptr=lse_ptr,
         requested_splits=requested_splits,
+        g_softmax_stats=softmax_stats_iter,
+        stats_scale=softmax_scale,
     ).launch(
         grid=(num_reduction_slices, h_k, b),
         # Reduction parallelism is entirely in block.x; y/z are singleton
