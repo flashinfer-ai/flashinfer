@@ -77,7 +77,8 @@ Public fields (defaults are the shipped behaviour)::
                                             saved set gains the FP32 r of q and k ([2, T_r, H_qk]) and the gradient is
                                             the exact derivative at the stored point; the backward needs the same value
     test_knobs      None | dict             private levers (schedule, fused_walks, cols_rule, debug_sequence,
-                                            record_states, record_qk, p_rule, fwdh_vh, dhu_vh) and the names of the test-only values above;
+                                            record_states, record_qk, p_rule, fwdh_vh, dhu_vh, walk_pair) and the names of the
+                                            test-only values above;
                                             keyword argument only, never an environment variable
 """
 
@@ -153,6 +154,10 @@ TEST_KNOBS: dict[str, tuple[Any, ...] | None] = {
         False,
         True,
     ),  # use_qk_l2norm_in_kernel: keep qn / kn / rstd copies (and regen rstd == saved) in LAST_CALL for the oracles
+    # 1 = the summaries' offset walk (#2 offset / FP32-class #3) runs on a side stream concurrently with the #3 transfer
+    # walk (fork / join with CUDA events; same launches, arguments and outputs); 0 = one stream; None (shipped) = auto:
+    # on for zigzag partitions of <= 8 ranks on sm_100a / sm_103a (cake_kcp._walk_pair_enabled)
+    "walk_pair": (None, 0, 1),
 }
 TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "schedule": SCHEDULE_DEFAULT,
@@ -165,6 +170,7 @@ TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "fwdh_vh": None,
     "dhu_vh": None,
     "record_qk": False,
+    "walk_pair": None,
 }
 
 
