@@ -8389,9 +8389,11 @@ PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
 # tokens, 24 to 28 token tiles (off there, the forward is 3.3..6.5 us and the
 # checkpointed step 9.6..20.5 us faster per edge, 16 of 16 groups at hidden
 # 4096, 5120 and 7168; at 2944 and from 3648 tokens off gained nothing).  The
-# column slab (K6->K7, checkpoint) is off in (1024, 2112] at hidden 4096 and in
-# (1024, 1984] at 5120 and on above (0.28..1.00 us faster from 2176 and from
-# 2047 tokens, 13 to 16 of 16 groups), and off from 769 tokens on at 7168.
+# column slab (K6->K7, checkpoint) is off in (1024, 2159] at hidden 4096 (on was
+# 0.66..1.50 us slower at 2113 to 2144 tokens and 0.55..0.63 us faster from
+# 2160) and on above, off in (1024, 1984] and (7168, 8192] at 5120 (on was
+# 0.67..1.39 us faster from 1985 to 2046 tokens, 16 of 16 groups, and 0.39 us
+# slower at 8192) and on between, and off from 769 tokens on at 7168.
 # B300 (sm_103a, 148 SMs) and sm_107a are not measured and keep PDL_OFF_BANDS.
 PDL_BAND_OVERRIDES: dict[
     tuple[str, int | None, int | None],
@@ -8430,12 +8432,12 @@ PDL_BAND_OVERRIDES: dict[
     },
     ("sm_100a", 152, 4096): {
         "K6->K7": {
-            "checkpoint": ((1024, 2112),),
+            "checkpoint": ((1024, 2159),),
         },
     },
     ("sm_100a", 152, 5120): {
         "K6->K7": {
-            "checkpoint": ((1024, 1984),),
+            "checkpoint": ((1024, 1984), (7168, 8192)),
         },
     },
     ("sm_100a", 152, 7168): {
