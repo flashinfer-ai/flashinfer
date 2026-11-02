@@ -20,8 +20,8 @@ limitations under the License.
 # per-document zigzag / ragged partitions (head dimension 128, chunk 64) on
 # SM100 / SM103 / SM107.  The public entry points are
 # ``flashinfer.cake_gdn_det_train_kcp.partition_det_kcp``, ``build_context_det_kcp``,
-# ``chunk_gdn_det_kcp``, ``chunk_gdn_det_fwd_kcp``, ``chunk_gdn_det_bwd_kcp`` and
-# the byte queries; the partition / context plan, the host orchestration, the
+# ``chunk_gdn_det_kcp``, ``chunk_gdn_det_fwd_kcp``, ``chunk_gdn_det_bwd_kcp``,
+# ``packed_qkv_views_det_kcp`` and the byte queries; the partition / context plan, the host orchestration, the
 # options, the registry and the generated sources live here.  This package
 # imports itself, torch and torch.distributed only (never ``cake_kda_train``) and
 # reads no environment variable.  The pre-rename names (``chunk_gdn_kcp``,
@@ -38,6 +38,7 @@ from .cake_kcp import (
     ChunkGDNDetFunctionKcp,
     FakeBackend,
     KernelBackend,
+    PackedQKVSplitDetKcp,
     RecomputeHandleDetKcp,
     SavedDetKcp,
     WorkspaceDetKcp,
@@ -49,6 +50,7 @@ from .cake_kcp import (
     gdn_det_workspace_bytes_kcp,
     get_backend,
     graph_cache_clear,
+    packed_qkv_views_det_kcp,
     set_backend,
 )
 from .cake_kcp_plan import (
@@ -73,6 +75,7 @@ __all__ = [
     "FragmentDetKcp",
     "KernelBackend",
     "OptionsDetKcp",
+    "PackedQKVSplitDetKcp",
     "PartitionDetKcp",
     "RecomputeHandleDetKcp",
     "SavedDetKcp",
@@ -87,6 +90,7 @@ __all__ = [
     "get_backend",
     "graph_cache_clear",
     "make_options",
+    "packed_qkv_views_det_kcp",
     "partition_det_kcp",
     "set_backend",
     "validate_heads",

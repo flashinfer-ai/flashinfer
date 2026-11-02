@@ -40,14 +40,17 @@ windows = cake_package("cake_rmsnorm_det_train", "cake_windows")
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 HIDDEN_SIZES = (6144, 5120, 4096, 2048, 1536, 512, 256)
 REDUCE_ROLE = "bwd_reduce"
-SHIPPED_SLABS = (16, 32, 64)
+# The column widths of the dw reduce slabs, one CTA each: 4 for the column-split H = 256 reduce (one column of a
+# four-column slab per lane).
+SHIPPED_SLABS = (4, 16, 32, 64)
 # Row counts of the contract: the small counts, both sides of every backward window edge of every route
 # (``test_rows_cover_every_backward_window_edge``) and the training shapes.
 ROWS = (
     1, 2, 7, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1023, 1024, 1025, 2048, 2049, 3072, 3073, 4096, 4097,
-    5120, 5121, 6144, 6145, 12288, 12289, 14928, 14929, 15566, 15567, 16231, 16263, 16384, 16385, 19968, 19969,
-    20480, 20481, 32768, 32769, 40960, 40961, 65536, 65537, 70656, 70657, 80896, 80897, 81920, 81921, 114688, 114689,
-    139264, 139265, 1179648, 1179649, 1572864, 1572865,
+    5120, 5121, 6144, 6145, 12288, 12289, 14928, 14929, 15566, 15567, 16231, 16263, 16384, 16385, 19456, 19457, 19968,
+    19969, 20480, 20481, 24064, 24065, 32768, 32769, 36352, 36353, 40448, 40449, 40960, 40961, 42496, 42497, 44032,
+    44033, 45056, 45057, 48640, 48641, 50688, 50689, 52736, 52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656,
+    70657, 80896, 80897, 81920, 81921, 99840, 99841, 114688, 114689, 139264, 139265, 1179648, 1179649, 1572864, 1572865,
 )  # fmt: skip
 # The row count standing in for an unbounded window's upper edge.
 OPEN_WINDOW_ROWS = 65536
@@ -244,7 +247,8 @@ def test_rendered_windows_match_the_registry() -> None:
     """The exporter's ``cake_windows`` module is the registry: its table is ``program_windows`` of every route, its
     edges are the windows' upper bounds with a known class, and its sections (the docstring notes of the forward and
     backward) name every BF16 route of their kind and cover the FP32-weight routes in one sentence (they select among
-    the twins over the same windows), the re-cut ones (``RECUT_FP32_ROUTES``) as lines of their own."""
+    the twins over the same windows), the re-cut and swapped ones (``RECUT_FP32_ROUTES``,
+    ``SWAPPED_FP32_ROUTES``) as lines of their own."""
     assert set(windows.PROGRAM_WINDOWS) == set(loader.ROUTES) == set(windows.EDGES)
     assert set(windows.EDGE_CLASSES) == {"same", "ulp", "dx", "unmeasured"}
     for arch, routes in loader.ROUTES.items():
@@ -268,9 +272,10 @@ def test_rendered_windows_match_the_registry() -> None:
             )
             listed = f"``{arch}`` ``{route}``:" in windows.SECTIONS[kind]
             if w_dtype == "f32":
-                # an FP32-weight route is one sentence of the section, a re-cut one a line of its own; its base
-                # route is a line either way
-                recut = (arch, hidden, kind, residual) in RECUT_FP32_ROUTES
+                # an FP32-weight route is one sentence of the section, a re-cut or swapped one a line of its
+                # own; its base route is a line either way
+                key = (arch, hidden, kind, residual)
+                recut = key in RECUT_FP32_ROUTES or key in SWAPPED_FP32_ROUTES
                 assert listed == recut, (arch, route)
                 base = loader.route_key(hidden, kind, residual)
                 assert f"``{arch}`` ``{base}``:" in windows.SECTIONS[kind], (
@@ -315,13 +320,15 @@ def test_rows_cover_every_backward_window_edge() -> None:
 # The H = 256 backward route: per sm_100a / sm_103a window the faster of the four-CTA pipeline (``pd4``) and the
 # five-CTA ring at issue distance three without the L2 hint (``a3``), both at ``tail_div=4``, in two sessions per
 # architecture (BF16 and FP32 weight alike); sm_107a runs the pipeline to 65536 rows and the ring above.  Above the
-# ring's dw accuracy edge of each architecture (80896 rows on sm_100a, 139264 on sm_103a, 70656 on sm_107a) the ring
-# with compensated dw sums (``dc``) runs instead, and above 1572864 rows its form with hi / lo partial rows
+# ring's dw accuracy edge of each architecture (80896 rows on sm_100a, 99840 on sm_103a, 70656 on sm_107a) the ring
+# with compensated dw sums (``dc``; on sm_100a and sm_107a its lean form ``dcln``, two rows per iteration with the
+# same arithmetic in the same order) runs instead, and above 1572864 rows its form with hi / lo partial rows
 # (``dchl``).
 H256_BWD_PROGRAMS = {
     "pd4": "rmsnorm_train_bwd_h256_t128x4_pd4_k_s32_split_pts_cl_td4",
     "a3": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhkc8_k_s32_split_pts_cl_td4_cs",
     "dc": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdf_k_s32_split_pts_cl_td4_cs",
+    "dcln": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfln_k_s32_split_pts_cl_td4_cs",
     "dchl": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfhl_k_s32_split_pts_cl_td4_cs",
 }
 H256_BWD_SPLIT = {
@@ -332,18 +339,18 @@ H256_BWD_SPLIT = {
             (5120, 12288, "a3"),
             (12288, 40960, "pd4"),
             (40960, edge, "a3"),
-            (edge, hl, "dc"),
+            (edge, hl, dc),
             (hl, None, "dchl"),
         )
-        for arch, edge, hl in (
-            ("sm_100a", 80896, 1572864),
-            ("sm_103a", 139264, 1572864),
+        for arch, edge, hl, dc in (
+            ("sm_100a", 80896, 1572864, "dcln"),
+            ("sm_103a", 99840, 1572864, "dc"),
         )
     },
     "sm_107a": (
         (0, 65536, "pd4"),
         (65536, 70656, "a3"),
-        (70656, 1572864, "dc"),
+        (70656, 1572864, "dcln"),
         (1572864, None, "dchl"),
     ),
 }
@@ -409,6 +416,12 @@ RECUT_FP32_ROUTES: dict[
     ),
     ("sm_107a", 5120, "fwd", False): ((49152, None),),
 }
+
+
+# The FP32-weight routes whose window runs the FP32-weight twin of another program than the BF16 route's there, under
+# a record of the same host plan (the window, grid rule and workspace of the BF16 record): SM103 H = 1536 above
+# 40448 rows, where the register-compensated program is faster with the FP32 weight and not with the BF16 weight.
+SWAPPED_FP32_ROUTES = {("sm_103a", 1536, "bwd", False)}
 
 
 def _window(record) -> tuple[int | None, int | None]:
@@ -554,11 +567,33 @@ def test_fp32_weight_routes_mirror_their_bf16_routes(arch: str) -> None:
 # The SM counts of devices per architecture at or above the guard's: the measured boards (B200 148, GB300 152,
 # R200 212 and 216) and a device of the same architecture with more SMs (GB200 152, a 160-SM GB300).
 BOARD_SMS = {"sm_100a": (148, 152), "sm_103a": (152, 160), "sm_107a": (212, 216)}
-# The accuracy edges: H = 5120 plain -> block-compensated, H = 256 ring -> compensated-dot ring.
+# The accuracy edges: the plain programs of H = 1536 / 2048 / 4096 / 5120 / 6144 -> their block-compensated forms,
+# the H = 256 ring -> the compensated-dot ring.
 ACCURACY_EDGES = {
-    "sm_100a": {"h5120": 6144, "h256": 80896},
-    "sm_103a": {"h5120": 5120, "h256": 139264},
-    "sm_107a": {"h5120": 19968, "h256": 70656},
+    "sm_100a": {
+        "h1536": 36352,
+        "h2048": 58880,
+        "h256": 80896,
+        "h4096": 44032,
+        "h5120": 6144,
+        "h6144": 42496,
+    },
+    "sm_103a": {
+        "h1536": 40448,
+        "h2048": 55296,
+        "h256": 99840,
+        "h4096": 48640,
+        "h5120": 5120,
+        "h6144": 48640,
+    },
+    "sm_107a": {
+        "h1536": 45056,
+        "h2048": 50688,
+        "h256": 70656,
+        "h4096": 24064,
+        "h5120": 19968,
+        "h6144": 19456,
+    },
 }
 
 
@@ -579,8 +614,9 @@ def _launched_library(arch: str, route: str, rows: int) -> str:
 
 
 def test_accuracy_guard_names_the_measured_sm_counts_and_edges() -> None:
-    """The guard's tables: the smallest measured SM count per architecture and, for the BF16 and FP32-weight H = 5120
-    and H = 256 backward routes alone, the edge where the route's compensated programs start."""
+    """The guard's tables: the smallest measured SM count per architecture and, for the BF16 and FP32-weight
+    backward routes with a compensated program (every one but H = 512 and the residual H = 6144), the edge where the
+    route's compensated programs start."""
     assert windows.ACCURACY_MIN_SMS == {"sm_100a": 148, "sm_103a": 152, "sm_107a": 212}
     assert set(windows.ACCURACY_EDGES) == set(loader.ROUTES)
     for arch, edges in ACCURACY_EDGES.items():
@@ -951,7 +987,7 @@ def test_workspace_puts_the_counters_first_and_grows_with_the_rows(hidden: int) 
     not _supported(),
     reason="needs an SM100 / SM103 / SM107 device with exported routes",
 )
-@pytest.mark.parametrize("hidden", (5120, 256))
+@pytest.mark.parametrize("hidden", (6144, 5120, 4096, 2048, 1536, 256))
 def test_workspace_holds_the_compensated_programs_below_the_measured_sm_count(
     hidden: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:

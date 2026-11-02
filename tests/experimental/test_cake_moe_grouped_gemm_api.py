@@ -622,13 +622,19 @@ def test_autograd_backward_alerts_and_facade_falls_back():
 
 
 @pytest.mark.parametrize(
+    "deterministic", [False, True], ids=["nondeterministic", "deterministic"]
+)
+@pytest.mark.parametrize(
     "early_stop", [True, False], ids=["early_stop", "no_early_stop"]
 )
-def test_facade_checkpoint_early_stop_skips_the_forward_launch(early_stop, monkeypatch):
-    """Through the facade with ``deterministic=False`` the package's wrapper launches its
-    forward after autograd saved the inputs: a non-reentrant checkpoint of one GEMM
-    launches the forward once with early stop on (the recomputation stops before it) and
-    twice with it off, with the bits of the plain call for ``Y`` and ``dX``."""
+def test_facade_checkpoint_early_stop_skips_the_forward_launch(
+    early_stop, deterministic, monkeypatch
+):
+    """Through the facade, with ``deterministic=False`` (this package) or ``True`` (the
+    deterministic package), the package's wrapper launches its forward after autograd
+    saved the inputs: a non-reentrant checkpoint of one GEMM launches the forward once
+    with early stop on (the recomputation stops before it) and twice with it off, with
+    the bits of the plain call for ``Y`` and ``dX``."""
     device = _require_device()
     sizes = [300, 0, 1, 700]
     offs = torch.tensor(sizes, dtype=torch.int32, device=device).cumsum(
@@ -638,16 +644,17 @@ def test_facade_checkpoint_early_stop_skips_the_forward_launch(early_stop, monke
     w0 = (torch.randn(4, 512, 256, device=device) / 16).to(torch.bfloat16)
     g = torch.randn(sum(sizes), 512, device=device).to(torch.bfloat16)
     launches = []
-    fwd_op = cake_autograd._fwd_op
+    module = det_autograd if deterministic else cake_autograd
+    fwd_op = module._fwd_op
 
     def counted(*args):
         launches.append(args[3].shape)
         fwd_op(*args)
 
-    monkeypatch.setattr(cake_autograd, "_fwd_op", counted)
+    monkeypatch.setattr(module, "_fwd_op", counted)
 
     def gemm(x, w):
-        return facade.cake_grouped_mm(x, w, offs, False)
+        return facade.cake_grouped_mm(x, w, offs, deterministic)
 
     def run(checkpointed):
         launches.clear()

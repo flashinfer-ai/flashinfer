@@ -41,6 +41,8 @@ from .cake_jit import (
     HIDDEN,
     HIDDEN_SIZES,
     MAPPING_ROWS,
+    N_PAD,
+    PIECES,
     RMS_EPS,
     SINKHORN_ITERS,
     SINKHORN_ITERS_MAX,
@@ -707,7 +709,7 @@ class _Launch:
         self.run, self.template, self.slots = run, template, slots
 
 
-_PLANS: dict[tuple[str, str, int, int, int, str, bool], tuple[_Launch, ...]] = {}
+_PLANS: dict[tuple[str, str, int, int, int, str, bool, bool], tuple[_Launch, ...]] = {}
 
 
 def _route_plan(
@@ -718,6 +720,7 @@ def _route_plan(
     device_index: int,
     path: str,
     sinkhorn_iters: int = SINKHORN_ITERS,
+    carry: bool = False,
 ) -> tuple[_Launch, ...]:
     """The launches of one route for ``rows`` tokens of hidden size ``hidden`` on
     ``device_index`` along ``path`` (one of ``cake_jit.PDL_PATHS``: it fixes the
@@ -726,15 +729,16 @@ def _route_plan(
     record selects the run-time-count records; the count itself is a launch
     value, so one plan serves every such count.  A route that exports no
     run-time-count program raises ``NotImplementedError`` for such a count
-    (``cake_jit.selected_modules``)."""
+    (``cake_jit.selected_modules``).  ``carry`` names the launches of the
+    checkpoint carry instead (``cake_jit.carried_modules``)."""
 
     run_time = int(sinkhorn_iters) != SINKHORN_ITERS
-    key = (arch, kind, rows, hidden, device_index, path, run_time)
+    key = (arch, kind, rows, hidden, device_index, path, run_time, carry)
     plan = _PLANS.get(key)
     if plan is None:
         launches = []
         sm_count = _loader.sm_count(device_index)
-        for name in selected_modules(
+        for name in (_loader.carried_modules if carry else selected_modules)(
             arch,
             hidden,
             kind,
@@ -864,7 +868,30 @@ _HOST_VALUES: dict[str, tuple[str, ...]] = {
     "fwd_recompute": ("m_tiles", "log2_pk", "p_k", "t_pad"),
     "fwd_finish": (),
     "bwd_prepare": (),
-    "bwd_finish": ("t_pad", "rows_per_cta", "parts", "rows_per_chunk", "chunks"),
+    "bwd_finish": (
+        "t_pad",
+        "rows_per_cta",
+        "parts",
+        "rows_per_chunk",
+        "chunks",
+        "groups",
+    ),
+}
+# The checkpoint carry (``cake_jit.FN_SPLIT_CARRY``): the replay's dual-layout fn
+# split writes the transposed layout into a caller buffer, the call value ``fnTp``,
+# and the backward's route without its fn split reads that buffer instead of the
+# workspace region.
+_CARRY_CALL_VALUES: dict[str, tuple[str, ...]] = {
+    "fwd_recompute": _CALL_VALUES["fwd_recompute"] + ("fnTp",),
+    "bwd_finish": _CALL_VALUES["bwd_finish"] + ("fnTp",),
+}
+_CARRY_WORKSPACE_VALUES: dict[str, tuple[tuple[str, str], ...]] = {
+    kind: tuple(
+        (name, region)
+        for name, region in _WORKSPACE_VALUES[kind]
+        if name not in ("fnTp", "fnp") or (kind == "fwd_recompute" and name == "fnp")
+    )
+    for kind in _CARRY_CALL_VALUES
 }
 
 
@@ -887,16 +914,22 @@ class _FastRoute:
         self.workspace, self.x_flat = workspace, x_flat
 
 
-_FAST_ROUTES: dict[tuple[str, int, int, int, str], _FastRoute] = {}
+_FAST_ROUTES: dict[tuple[str, int, int, int, str, bool], _FastRoute] = {}
 
 
 def _fast_route(
-    arch: str, kind: str, rows: int, hidden: int, device_index: int, path: str
+    arch: str,
+    kind: str,
+    rows: int,
+    hidden: int,
+    device_index: int,
+    path: str,
+    carry: bool = False,
 ) -> _FastRoute:
-    key = (kind, hidden, rows, device_index, path)
+    key = (kind, hidden, rows, device_index, path, carry)
     found = _FAST_ROUTES.get(key)
     if found is None:
-        found = _build_fast_route(arch, kind, rows, hidden, device_index, path)
+        found = _build_fast_route(arch, kind, rows, hidden, device_index, path, carry)
         if len(_FAST_ROUTES) >= _CACHE_ENTRIES:
             _FAST_ROUTES.clear()
         _FAST_ROUTES[key] = found
@@ -904,11 +937,18 @@ def _fast_route(
 
 
 def _build_fast_route(
-    arch: str, kind: str, rows: int, hidden: int, device_index: int, path: str
+    arch: str,
+    kind: str,
+    rows: int,
+    hidden: int,
+    device_index: int,
+    path: str,
+    carry: bool = False,
 ) -> _FastRoute:
-    plan = _route_plan(arch, kind, rows, hidden, device_index, path)
-    workspace_values = _WORKSPACE_VALUES[kind]
-    names = _CALL_VALUES[kind] + tuple(name for name, _ in workspace_values)
+    plan = _route_plan(arch, kind, rows, hidden, device_index, path, carry=carry)
+    workspace_values = (_CARRY_WORKSPACE_VALUES if carry else _WORKSPACE_VALUES)[kind]
+    call_values = (_CARRY_CALL_VALUES if carry else _CALL_VALUES)[kind]
+    names = call_values + tuple(name for name, _ in workspace_values)
     position_of = {name: position for position, name in enumerate(names)}
     host: dict[str, Any] = {"rows": rows}
     if _HOST_VALUES[kind]:
@@ -980,9 +1020,12 @@ def _run_route(
     device: torch.device,
     path: str,
     sinkhorn_iters: int = SINKHORN_ITERS,
+    carry: bool = False,
 ) -> None:
     device_index = _device_index(device)
-    plan = _route_plan(arch, kind, rows, hidden, device_index, path, sinkhorn_iters)
+    plan = _route_plan(
+        arch, kind, rows, hidden, device_index, path, sinkhorn_iters, carry=carry
+    )
     stream = _current_stream(device_index)
     with _tvm_ffi().use_raw_stream(_tvm_device(device_index), stream):
         for launch in plan:
@@ -1268,6 +1311,39 @@ def cake_mhc_det_train_forward_stats(
     The launches run on the current torch stream of the tensors' device.
     """
 
+    return _forward_stats(
+        X,
+        fn,
+        scale,
+        base,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        stats_out=stats_out,
+        workspace=workspace,
+        fnTp=None,
+    )
+
+
+def _forward_stats(
+    X: torch.Tensor,
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    stats_out: Optional[torch.Tensor],
+    workspace: Optional[torch.Tensor],
+    fnTp: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """:func:`cake_mhc_det_train_forward_stats`; with ``fnTp`` (a BF16 ``[3, 4H, 32]``
+    buffer of the checkpoint carry, ``cake_jit.FN_SPLIT_CARRY``) the replay's fn split is
+    the dual-layout record, which also writes the transposed layout of the backward into
+    ``fnTp`` (the autograd checkpoint path alone passes it)."""
+
+    carry = fnTp is not None
     fast = _fast_forward(
         X, fn, scale, base, rms_eps, hc_eps, sinkhorn_iters, "fwd_recompute"
     )
@@ -1280,12 +1356,22 @@ def cake_mhc_det_train_forward_stats(
                 _empty((rows, STATS_COLS), _F32, X) if stats_out is None else stats_out
             )
             route = _fast_route(
-                arch, "fwd_recompute", rows, hidden, index, _PATH_CHECKPOINT
+                arch, "fwd_recompute", rows, hidden, index, _PATH_CHECKPOINT, carry
             )
             views = _fast_workspace(workspace, "fwd", rows, hidden, index, X)
+            fast_values = (
+                fn,
+                X,
+                X.view(route.x_flat),
+                scale,
+                base,
+                stats,
+                rms_eps,
+                hc_eps,
+            )
             _launch_route(
                 route,
-                (fn, X, X.view(route.x_flat), scale, base, stats, rms_eps, hc_eps)
+                (fast_values + (fnTp,) if carry else fast_values)
                 + route.workspace(views),
                 index,
             )
@@ -1318,6 +1404,8 @@ def cake_mhc_det_train_forward_stats(
         hc_eps=hc_eps,
         sinkhorn_iters=sinkhorn_iters,
     )
+    if carry:
+        values["fnTp"] = fnTp
     _run_route(
         arch,
         "fwd_recompute",
@@ -1327,6 +1415,7 @@ def cake_mhc_det_train_forward_stats(
         device=device,
         path=_PATH_CHECKPOINT,
         sinkhorn_iters=sinkhorn_iters,
+        carry=carry,
     )
     return stats
 
@@ -1617,6 +1706,7 @@ def cake_mhc_det_train_backward_finish(
         dscale=dscale,
         dbase=dbase,
         path=_PATH_BACKWARD,
+        fnTp=None,
     )
 
 
@@ -1641,11 +1731,16 @@ def _backward_finish(
     dscale: Optional[torch.Tensor],
     dbase: Optional[torch.Tensor],
     path: str,
+    fnTp: Optional[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """:func:`cake_mhc_det_train_backward_finish` along ``path`` (``_PATH_BACKWARD`` from
     saved statistics, ``_PATH_CHECKPOINT`` after the forward prefix was replayed: the
     autograd nodes know which): the path fixes the per-call PDL argument of the
-    column-slab and reduction records (:func:`cake_jit.enable_pdl`)."""
+    column-slab and reduction records (:func:`cake_jit.enable_pdl`).  ``fnTp``: the
+    transposed fn split the checkpoint carry's replay wrote (the prepare node's
+    backward passes it); the route then launches no fn split and reads it."""
+
+    carry = fnTp is not None
 
     fast = _fast_forward(
         X, fn, scale, base, rms_eps, hc_eps, sinkhorn_iters, "bwd_finish"
@@ -1673,7 +1768,7 @@ def _backward_finish(
                 dscale = _empty(_SCALE_SHAPE, _F32, X)
             if dbase is None:
                 dbase = _empty(_BASE_SHAPE, _F32, X)
-            route = _fast_route(arch, "bwd_finish", rows, hidden, index, path)
+            route = _fast_route(arch, "bwd_finish", rows, hidden, index, path, carry)
             views = _fast_workspace(workspace, "bwd", rows, hidden, index, X)
             _launch_route(
                 route,
@@ -1694,6 +1789,7 @@ def _backward_finish(
                     dbase,
                     1 if accumulate else 0,
                 )
+                + ((fnTp,) if carry else ())
                 + route.workspace(views),
                 index,
             )
@@ -1774,8 +1870,11 @@ def _backward_finish(
         "dscale": dscale,
         "dbase": dbase,
         "chunks": plan["chunks"],
+        "groups": plan["groups"],
         "accumulate": 1 if accumulate else 0,
     }
+    if carry:
+        values["fnTp"] = fnTp
     _run_route(
         arch,
         "bwd_finish",
@@ -1785,6 +1884,7 @@ def _backward_finish(
         device=device,
         path=path,
         sinkhorn_iters=sinkhorn_iters,
+        carry=carry,
     )
     return dX, dfn, dscale, dbase
 
@@ -1811,6 +1911,16 @@ class _MHCTrainState:
     state only from a finish node without those edges whose prepare node is
     ``recorded`` (a finish forward rerun by a reentrant checkpoint region that
     starts after the prepare); the prepare node's backward empties them.
+
+    The checkpoint carry (``save_stats=False`` inside a band of
+    ``cake_jit.FN_SPLIT_CARRY``): the prepare node has one more edge, a stand-in
+    of the BF16 ``[3, 4H, 32]`` transposed fn split; the finish node's backward
+    replays the statistics with the dual-layout split into a fresh buffer and
+    hands it on that edge, and the prepare node's backward launches its route
+    without the split when ``fn`` is still the tensor and version the replay
+    split (``fn_key``), else the full route.  The buffer exists from the replay
+    to the end of the prepare node's backward (3 MiB at H 4096); the forward
+    keeps nothing more.
     """
 
     __slots__ = (
@@ -1827,6 +1937,7 @@ class _MHCTrainState:
         "sinkhorn_iters",
         "workspace",
         "backward_workspace",
+        "fn_key",
     )
 
     def __init__(
@@ -1845,11 +1956,18 @@ class _MHCTrainState:
         self.save_stats = bool(save_stats)
         self.rms_eps, self.hc_eps, self.sinkhorn_iters = rms_eps, hc_eps, sinkhorn_iters
         self.workspace, self.backward_workspace = workspace, backward_workspace
+        self.fn_key: Optional[tuple[Any, ...]] = None
 
-    def replay(self, X: torch.Tensor) -> torch.Tensor:
-        """The bitwise-identical replay of the forward prefix's ``stats``."""
+    def replay(
+        self, X: torch.Tensor, fnTp: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """The bitwise-identical replay of the forward prefix's ``stats``; with ``fnTp``
+        the checkpoint carry's replay, which also writes the transposed fn split
+        into it and records the identity of ``fn`` it split."""
 
-        return cake_mhc_det_train_forward_stats(
+        if fnTp is not None:
+            self.fn_key = _fn_key(self.fn)
+        return _forward_stats(
             X,
             self.fn,
             self.scale,
@@ -1857,7 +1975,9 @@ class _MHCTrainState:
             rms_eps=self.rms_eps,
             hc_eps=self.hc_eps,
             sinkhorn_iters=self.sinkhorn_iters,
+            stats_out=None,
             workspace=self.workspace,
+            fnTp=fnTp,
         )
 
     def take(
@@ -1888,27 +2008,46 @@ class _MHCTrainHandle:
         self.state, self.edges = state, edges
 
 
-# The edge stand-ins per (device, token count, hidden size, save_stats).  No
+def _fn_key(fn: torch.Tensor) -> tuple[Any, ...]:
+    """What the checkpoint carry checks before reusing the transposed split of ``fn``:
+    its storage, its version counter, its shape and dtype."""
+
+    return (fn.data_ptr(), fn._version, tuple(fn.shape), fn.dtype, fn.device)
+
+
+def _carries(rows: int, hidden: int, device: torch.device, save_stats: bool) -> bool:
+    """Whether a prepare call of ``rows`` tokens takes the checkpoint carry's edge."""
+
+    return (
+        not save_stats
+        and _loader.fn_split_carry(rows, _device_arch(device), hidden) is not None
+    )
+
+
+# The edge stand-ins per (device, token count, hidden size, save_stats, carry).  No
 # kernel reads or writes an edge, so the edges of every prepare call alias these
 # one-element buffers; each call takes its own tensors (``detach``), so the
 # edges of two connections are distinct autograd outputs, and allocates no
 # memory.
-_EDGES: dict[tuple[torch.device, int, int, bool], tuple[torch.Tensor, ...]] = {}
+_EDGES: dict[tuple[torch.device, int, int, bool, bool], tuple[torch.Tensor, ...]] = {}
 
 
 def _edges(
-    rows: int, hidden: int, device: torch.device, save_stats: bool
+    rows: int, hidden: int, device: torch.device, save_stats: bool, carry: bool = False
 ) -> tuple[torch.Tensor, ...]:
     """One-element, zero-stride stand-ins of BF16 ``dY`` ``[T, 4, H]``, the FP32
-    gradient statistics ``[T, 32]`` and, under ``save_stats=False``, the FP32
-    statistics ``[T, 64]``: the prepare node's edge outputs."""
+    gradient statistics ``[T, 32]``, under ``save_stats=False`` the FP32
+    statistics ``[T, 64]`` and, with the checkpoint carry, the BF16 transposed fn
+    split ``[3, 4H, 32]``: the prepare node's edge outputs."""
 
-    key = (device, rows, hidden, save_stats)
+    key = (device, rows, hidden, save_stats, carry)
     edges = _EDGES.get(key)
     if edges is None:
         shapes = [((rows, STREAMS, hidden), _BF16), ((rows, GSTATS_COLS), _F32)]
         if not save_stats:
             shapes.append(((rows, STATS_COLS), _F32))
+        if carry:
+            shapes.append(((PIECES, STREAMS * hidden, N_PAD), _BF16))
         edges = tuple(
             torch.empty_strided(shape, (0,) * len(shape), dtype=dtype, device=device)
             for shape, dtype in shapes
@@ -1916,9 +2055,7 @@ def _edges(
         if len(_EDGES) >= _CACHE_ENTRIES:
             _EDGES.clear()
         _EDGES[key] = edges
-    if save_stats:
-        return edges[0].detach(), edges[1].detach()
-    return edges[0].detach(), edges[1].detach(), edges[2].detach()
+    return tuple(edge.detach() for edge in edges)
 
 
 def _as_bf16(
@@ -1963,13 +2100,19 @@ class CakeMHCDetTrainPrepareFunction(torch.autograd.Function):
         ctx.state = state
         # An output the backward did not reach arrives as ``None``, not as zeros.
         ctx.set_materialize_grads(False)
-        return (U,) + _edges(X.shape[0], X.shape[2], X.device, state.save_stats)
+        rows, hidden = X.shape[0], X.shape[2]
+        carry = _carries(rows, hidden, X.device, state.save_stats)
+        return (U,) + _edges(rows, hidden, X.device, state.save_stats, carry)
 
     @staticmethod
-    def backward(ctx, dU, dY, grad_stats, stats=None):
+    def backward(ctx, dU, dY, grad_stats, stats=None, fnTp=None):
         X, *saved = ctx.saved_tensors
         state = ctx.state
         held = state.take()
+        # The carried transposed split serves only the fn the replay split.
+        key, state.fn_key = state.fn_key, None
+        if fnTp is not None and key != _fn_key(state.fn):
+            fnTp = None
         if dY is None:
             # No edge gradient: a finish node rerun by a reentrant checkpoint left
             # them on the state, or the finish node's backward never ran (``Y``
@@ -2005,6 +2148,7 @@ class CakeMHCDetTrainPrepareFunction(torch.autograd.Function):
             dscale=None,
             dbase=None,
             path=_PATH_BACKWARD if saved else _PATH_CHECKPOINT,
+            fnTp=fnTp,
         )
         return dX, dfn, dscale, dbase, None
 
@@ -2048,7 +2192,20 @@ class CakeMHCDetTrainFinishFunction(torch.autograd.Function):
     def backward(ctx, dY):
         X, B, *saved = ctx.saved_tensors
         state = ctx.state
-        stats = saved[0] if saved else state.replay(X)
+        edges = len(ctx.needs_input_grad) - 3
+        to_prepare = bool(edges) and ctx.needs_input_grad[3]
+        fnTp = None
+        if saved:
+            stats = saved[0]
+        elif to_prepare and edges == 4:
+            # The checkpoint carry: the replay also writes the transposed fn split,
+            # handed to the prepare node's backward on the fourth edge.
+            fnTp = torch.empty(
+                (PIECES, STREAMS * X.shape[2], N_PAD), dtype=_BF16, device=X.device
+            )
+            stats = state.replay(X, fnTp)
+        else:
+            stats = state.replay(X)
         dY = _as_bf16(dY, shape=(X.shape[0], STREAMS, X.shape[2]), device=X.device)
         dB, grad_stats = _backward_prepare(
             dY,
@@ -2060,8 +2217,9 @@ class CakeMHCDetTrainFinishFunction(torch.autograd.Function):
             path=_PATH_BACKWARD if saved else _PATH_CHECKPOINT,
         )
         handed = (dY, grad_stats) if saved else (dY, grad_stats, stats)
-        edges = len(ctx.needs_input_grad) - 3
-        if edges and ctx.needs_input_grad[3]:
+        if to_prepare:
+            if edges == 4:
+                handed += (fnTp,)
             return (None, dB, None, *handed)
         if state.recorded:
             # No edge reaches the prepare node (a finish rerun by a reentrant

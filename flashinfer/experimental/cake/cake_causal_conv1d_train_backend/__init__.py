@@ -92,6 +92,14 @@ Host design (the knobs are keywords; no environment variable):
   set and one counter per channel tile, whatever the grid).
 - The forward workspace (int32 token-chunk counters) follows the det
   package's rules.
+- Host plan: the first call of a row (architecture, route, ``C``, device,
+  ``bwd_grid_mult``) selects its program, splits ``C`` into channel tiles,
+  reads the row's ``TILE_OVERRIDES`` entry and sizes the grid
+  (``cake_jit.plan_row``); later calls of the row only compare ``S`` with the
+  override's token range (and size the grid where ``launch_grid`` trims it
+  by ``S``), so they launch the values a per-call plan gives.  A row whose
+  program selection reads ``S`` plans every call.  :func:`plan_cache_clear`
+  drops the rows.
 """
 
 from __future__ import annotations
@@ -172,6 +180,16 @@ _LAYOUTS: dict[tuple, dict] = {}
 # equality on every lookup); an entry only serves the workspace its weak reference still names, and the reference's
 # callback drops the entry when the workspace dies.
 _ACCUMULATOR_VIEWS: dict[int, tuple[weakref.ref, dict]] = {}
+# The host plan of each call row, planned by the row's first call: ``(arch, route kind, C, device index,
+# bwd_grid_mult) -> (cake_jit.RowPlan or None, {n_ch_tiles: the forward's counter words or the backward's accumulator
+# layout})``.  Selecting the route's program, splitting C into channel tiles, looking up the TILE_OVERRIDES row and
+# sizing the grid cost several us of host time in front of every launch; with the row's plan a call only compares
+# ``S`` with the override's token range (``cake_jit.row_launch``).  A row whose program selection reads ``S``
+# (``cake_jit.tokens_select``) holds ``None`` and plans every call.  At most ``_ROW_PLANS_MAX`` rows (then emptied);
+# :func:`plan_cache_clear` empties it (needed after a change of the registry tables, the SM count or the
+# architecture a device reports, which the rows were planned from).
+_ROW_PLANS: dict[tuple, tuple[Optional[_loader.RowPlan], dict]] = {}
+_ROW_PLANS_MAX = 1024
 # The torch dtype of each accumulator / counter dtype name of a workspace rule.
 _TORCH_DTYPES = {
     "float32": torch.float32,
@@ -495,6 +513,7 @@ def _launch(
     num_docs: int,
     *,
     device_index: int,
+    arch: str,
     bwd_grid_mult: int = 1,
 ) -> tuple[dict[str, int], tuple[int, int, int]]:
     """The kernel scalars and the grid of one launch of ``record`` (the host plan of ``cake_jit``).
@@ -506,7 +525,10 @@ def _launch(
     unwritten.  The caller launches this grid, so a call plans it once.  A
     backward ``bwd_grid_mult`` above 1 launches that many times the record's
     untrimmed grid (``launch_grid`` without the row), never trimmed to whole
-    channel-tile ranks; the scalars do not depend on the grid.
+    channel-tile ranks; the scalars do not depend on the grid.  A backward
+    record's plan takes the device's architecture ``arch`` and the record's
+    route, so a row of ``cake_jit.TILE_OVERRIDES`` runs its narrower channel
+    tiles.
     """
 
     scalars = plan(
@@ -515,17 +537,92 @@ def _launch(
         num_docs,
         geometry=record["grid_rule"]["geometry"],
         role=record["role"],
+        arch=arch,
+        route=_loader.record_route(record, arch),
     )
     if bwd_grid_mult == 1:
         grid = launch_grid(record, device_index=device_index, C=C, S=S)
     else:
         grid = (launch_grid(record, device_index=device_index)[0] * bwd_grid_mult, 1, 1)
-    if scalars["n_ch_tiles"] > grid[0]:
+    _check_tiles(C, scalars["n_ch_tiles"], grid)
+    return scalars, grid
+
+
+def _check_tiles(C: int, n_ch_tiles: int, grid: tuple[int, int, int]) -> None:
+    """Refuse a launch whose ``grid`` has fewer CTAs than ``C``'s ``n_ch_tiles`` channel tiles (``ValueError``)."""
+
+    if n_ch_tiles > grid[0]:
         raise ValueError(
-            f"C={C} spans {scalars['n_ch_tiles']} channel tiles but the launch grid on this "
+            f"C={C} spans {n_ch_tiles} channel tiles but the launch grid on this "
             f"device is {grid[0]} CTAs; every channel tile needs a CTA"
         )
-    return scalars, grid
+
+
+def _route_needs(policy: Optional[str]) -> str:
+    """What a call needs, for the error of a route the architecture lacks: the forward's (``policy`` ``None``) or
+    the backward's."""
+
+    if policy is None:
+        return "this forward (bias / BF16 taps)"
+    return f"this backward (bias / BF16 taps or dweight / silu_grad_preactivation={policy!r})"
+
+
+def _call_plan(
+    arch: str,
+    kind: str,
+    S: int,
+    C: int,
+    num_docs: int,
+    *,
+    device_index: int,
+    policy: Optional[str] = None,
+    bwd_grid_mult: int = 1,
+) -> tuple[tuple[str, ...], dict, dict[str, int], tuple[int, int, int], dict]:
+    """``(names, record, scalars, grid, per_tiles)`` of one call of route ``kind``: the programs :func:`_route`
+    selects, the first one's record, the :data:`cake_jit.PLAN_SCALARS` and the grid :func:`_launch` plans (same
+    values, same errors), from the call's ``_ROW_PLANS`` row; ``per_tiles`` is the row's dict for the host values
+    of each channel tile count (empty and not kept for a row planned per call).  ``policy`` is the backward's
+    ``silu_grad_preactivation`` (``None`` for the forward) and only names the route in an error."""
+
+    key = (arch, kind, C, device_index, bwd_grid_mult)
+    hit = _ROW_PLANS.get(key)
+    if hit is None:
+        # A missing route or a registry error raises as in a per-call plan.
+        _route(arch, kind, needs=_route_needs(policy), C=C, S=S)
+        row = _loader.plan_row(
+            arch, kind, C, device_index=device_index, bwd_grid_mult=bwd_grid_mult
+        )
+        if len(_ROW_PLANS) >= _ROW_PLANS_MAX:
+            _ROW_PLANS.clear()
+        hit = _ROW_PLANS[key] = (row, {})
+    row, per_tiles = hit
+    if row is None:
+        names = _route(arch, kind, needs=_route_needs(policy), C=C, S=S)
+        record = _loader.MODULES[names[0]]
+        scalars, grid = _launch(
+            record,
+            S,
+            C,
+            num_docs,
+            device_index=device_index,
+            arch=arch,
+            bwd_grid_mult=bwd_grid_mult,
+        )
+        return names, record, _scalars(scalars), grid, {}
+    scalars, grid = _loader.row_launch(row, S, num_docs, device_index=device_index)
+    _check_tiles(C, scalars["n_ch_tiles"], grid)
+    return row.names, row.record, scalars, grid, per_tiles
+
+
+def plan_cache_clear() -> int:
+    """Drop the host plans of the single-rank calls (``_ROW_PLANS``), planned again by the next call of each row;
+    returns the number of rows dropped.  Call it after changing what the rows were planned from: the registry
+    tables of ``cake_jit`` (``MODULES``, ``ROUTES``, ``TILE_OVERRIDES``, the grid-trim tables), its
+    ``sm_count`` or ``device_arch``."""
+
+    n = len(_ROW_PLANS)
+    _ROW_PLANS.clear()
+    return n
 
 
 def _check_shape_args(S: int, C: int) -> tuple[int, int]:
@@ -945,24 +1042,26 @@ def cake_causal_conv1d_train_forward(
     if S == 0:
         return y
     kind = forward_route(bias=b is not None, bf16_taps=w.dtype == torch.bfloat16)
-    names = _route(arch, kind, needs="this forward (bias / BF16 taps)", C=C, S=S)
     device_index = _device_index(device)
-    scalars, grid = _launch(
-        _loader.MODULES[names[0]], S, C, num_docs, device_index=device_index
+    names, _, scalars, grid, per_tiles = _call_plan(
+        arch, kind, S, C, num_docs, device_index=device_index
     )
     values: dict[str, object] = {
         "x": x_flat,
         "w": w,
         "cu": cu,
         "y": y.view(S, C),
-        **_scalars(scalars),
+        **scalars,
         "flags": _flags(w, b=b),
     }
     if b is not None:
         values["b"] = b
-    words = max(
-        counter_words(_loader.MODULES[name], scalars["n_ch_tiles"]) for name in names
-    )
+    n_ch_tiles = scalars["n_ch_tiles"]
+    words = per_tiles.get(n_ch_tiles)
+    if words is None:
+        words = per_tiles[n_ch_tiles] = max(
+            counter_words(_loader.MODULES[name], n_ch_tiles) for name in names
+        )
     work = _forward_work(workspace, words, device=device, device_index=device_index)
     if work is not None:
         values["work"] = work
@@ -1101,19 +1200,21 @@ def cake_causal_conv1d_train_backward(
         fp32_grad=policy == "fp32",
         bf16_taps_or_dweight=torch.bfloat16 in (w.dtype, dw_out.dtype),
     )
-    names = _route(
+    device_index = _device_index(device)
+    names, record, scalars, grid, per_tiles = _call_plan(
         arch,
         kind,
-        needs=f"this backward (bias / BF16 taps or dweight / silu_grad_preactivation={policy!r})",
-        C=C,
-        S=S,
+        S,
+        C,
+        num_docs,
+        device_index=device_index,
+        policy=policy,
+        bwd_grid_mult=bwd_grid_mult,
     )
-    record = _loader.MODULES[names[0]]
-    device_index = _device_index(device)
-    scalars, grid = _launch(
-        record, S, C, num_docs, device_index=device_index, bwd_grid_mult=bwd_grid_mult
-    )
-    layout = _accumulator_layout(record, C, scalars["n_ch_tiles"])
+    n_ch_tiles = scalars["n_ch_tiles"]
+    layout = per_tiles.get(n_ch_tiles)
+    if layout is None:
+        layout = per_tiles[n_ch_tiles] = _accumulator_layout(record, C, n_ch_tiles)
     acc, work = _backward_accumulators(
         workspace,
         layout,
@@ -1130,7 +1231,7 @@ def cake_causal_conv1d_train_backward(
         "dw": dw_out,
         "acc": acc,
         "work": work,
-        **_scalars(scalars),
+        **scalars,
         "flags": _flags(w, dw_out, b, db_out),
     }
     if b is not None:
@@ -1258,4 +1359,5 @@ __all__ = [
     "cake_causal_conv1d_train_forward_workspace",
     "cake_causal_conv1d_train_forward_workspace_bytes",
     "is_cake_causal_conv1d_train_supported",
+    "plan_cache_clear",
 ]

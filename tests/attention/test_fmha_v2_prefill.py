@@ -1542,7 +1542,7 @@ def run_trtllm_fmha_v2_prefill_case(
         #
         # The stored max format differs by architecture:
         # - SM90 (Hopper) warp-spec: Softmax_saver_tma stores max / sqrt(head_dim),
-        #   and uses exp2f with scale_bmm1 * M_LOG2E. The max tracks raw (unscaled)
+        #   and uses exp2f with scale_bmm1 * flashinfer::math::log2e_f. The max tracks raw (unscaled)
         #   QK^T values, so max / sqrt(d) == max * sm_scale.
         # - SM120 (Blackwell) tiled: Softmax_saver stores max directly (no sqrt(d)
         #   division). Elements are pre-scaled by scale_bmm1 during unpack, so

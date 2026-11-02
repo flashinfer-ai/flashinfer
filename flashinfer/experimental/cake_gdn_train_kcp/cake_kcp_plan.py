@@ -57,11 +57,15 @@ ownership ``Hg = ceil(HV / W)``, ``owner(h) = h // Hg``, the split sizes of the
 collectives, the merge chain tables, the segment plan ``P`` / ``NSEG`` and the
 segment table) is derived on demand by ``ctx.heads(HV)`` and cached.
 
-Segment plan rule.  The shipped default of this package is ``"fill_small"`` (this package's faster schedule):
+Segment plan rule.  The shipped default of this package is ``"fill_small_guard"`` (this package's faster schedule):
 the deterministic twin's ``"row_cost_lpt"`` vector (below), then every rank of a row with ``HV <=
 SMALL_ONE_HV_MAX = 12`` whose fragments all have at most ``SMALL_ONE_NC_MAX = 160`` chunks runs ``P = 1`` (no segment
 merges, compose chain or staging planes), and on every other row each rank below the chain cap takes ``min(P,
-wave_fill P)`` (the one-wave fill); it never raises a rank's ``P`` (``"row_cost_lpt"`` stays selectable).
+wave_fill P)`` (the one-wave fill); on ``sm_count >= FILL_GUARD_SM_MIN = 153`` a row whose every rank holds at least
+two fragments keeps the ``"row_cost_lpt"`` vector when the fill would walk a fragment of at least ``FILL_GUARD_NC_MIN =
+200`` chunks as one chain (``P = 1`` below its ``"row_cost_lpt"`` P) and that raises the row's slowest-rank B3 walk steps
+(:func:`walk_steps_rank_b3`) above those of the ``"row_cost_lpt"`` vector; it never raises a rank's ``P``
+(``"row_cost_lpt"``, ``"fill_small"`` and ``"fill_down"`` stay selectable).
 ``kcp_plan_row(row_tables(part), HV, sm_count)`` (the legacy
 ``"row_cost"`` rule, selectable; ``"row_cost_lpt"`` below starts from
 its plan) picks the segments per fragment ``P`` of every rank (``NSEG =
@@ -139,6 +143,8 @@ P_RULES = (
     "fill_down",
     "small_one",
     "fill_small",
+    "fill_down_guard",
+    "fill_small_guard",
 )  # P rules.  Per-rank rules (kcp_plan): "wave_fill1" = "wave" + the one-wave
 # fill on one-fragment ranks below the chain cap (the shipped default before "row_cost"); "wave" = the earlier rule (lever
 # L-C); "occ" = the design note §7.2 rule; "wave_fill" = the fill on every rank with n_frag <= 3 (implemented, not adopted);
@@ -152,13 +158,13 @@ P_RULES = (
 # the simpler program takes a model tie).  The per-rank rules stay selectable through
 # the keyword-only ``p_rule`` argument (options-object test knob) for the A/B record.  Every rule is a pure function of
 # (the fragment tables, HV, SM count), identical on every rank, so G3 holds under any of them.
-P_RULE_DEFAULT = "fill_small"
-# The plan rule of a context built for CUDA-graph replay (build_context_kcp(..., graph_replay=True)): "fill_small"
+P_RULE_DEFAULT = "fill_small_guard"
+# The plan rule of a context built for CUDA-graph replay (build_context_kcp(..., graph_replay=True)): the default
 # without its "small_one" rows.  The P = 1 rows trade segment merges for longer walks, which pays while the host
 # launches every program; under graph replay the launch cost is gone and those walks are measured slower than the
 # deterministic twin's plan on small-head packs, while the one-wave fill of the other rows stays faster under graph
 # replay as well.
-P_RULE_GRAPH = "fill_down"
+P_RULE_GRAPH = "fill_down_guard"
 ROW_COST_BASE = "wave_fill1"  # the per-rank program the row rule starts from
 ROW_COST_POLICIES = ("occ", "one")  # the whole-row alternatives it may switch to
 ROW_COST_COMPOSE_K = 2  # compose-term multiplier: the merge launches measured about twice the one-step compose model
@@ -187,6 +193,8 @@ ROW_RULES = (
     "fill_down",
     "small_one",
     "fill_small",
+    "fill_down_guard",
+    "fill_small_guard",
 )
 # "fill_down" (candidate): every rank BELOW THE CHAIN CAP (0 < NC_max_frag < WAVE_MIN_NC_MAX_FRAG) takes the smaller
 # of its "row_cost_lpt" P and its "wave_fill" P (the one-wave fill, floor(SM / (n_frag HV)), on ranks with n_frag <=
@@ -195,6 +203,22 @@ ROW_RULES = (
 # (candidate): at HV <= SMALL_ONE_HV_MAX, when no fragment of any rank exceeds SMALL_ONE_NC_MAX chunks, every rank runs
 # P = 1 (no segment merges, compose chain or staging planes); every other row keeps "row_cost_lpt".  "fill_small":
 # "small_one" on its rows, "fill_down" on every other row.  None of them raises a rank's P.
+# "fill_down_guard" / "fill_small_guard" (the shipped graph / eager rules): "fill_down" / "fill_small" with a row guard.
+# The row keeps "row_cost_lpt" bitwise when all four conditions hold: (1) sm_count >= FILL_GUARD_SM_MIN; (2) every rank
+# holds at least two fragments (whatever the layout); (3) the fill sends some rank to P = 1 below its "row_cost_lpt" P
+# while that rank's longest fragment has at least FILL_GUARD_NC_MIN chunks; (4) the fill's slowest-rank B3 walk steps
+# (walk_steps_rank_b3, the largest over the ranks) exceed those of the "row_cost_lpt" vector.  Otherwise the row keeps
+# the fill.  On R200 (212 / 216 SMs) the one-wave fill of a three-fragment rank is floor(SM / (3 HV)) = 1 at HV = 48
+# while the two-fragment ranks keep P = 2, so the long fragment becomes the row's slowest walk: on the 212-SM records
+# (K3E / P1 / P2 / P3 / P5 (16,48) CP8 zigzag, 237 / 256-chunk fragments) "row_cost_lpt" is 7-10 % faster in the
+# forward and 5-6 % in the checkpointed step (1-3 % with graph replay), 0-3 % slower in forward + backward (fewer
+# segments keep the backward cheaper).  Condition (4) leaves the rows whose fill already walks fewer steps, e.g. a
+# contiguous CP2 row whose P = 1 rank holds 224-chunk fragments next to a rank with a 384-chunk fragment.  Shorter
+# fragments (<= 128 chunks) and rows with single-fragment ranks measured faster with the fill (or within 1 %), so the
+# guard leaves them.  The fill was calibrated on the 148 / 152-SM rows of record; the guard starts above that range, so
+# B200 / GB300 plans are those of "fill_down" / "fill_small" bitwise.
+FILL_GUARD_SM_MIN = 153
+FILL_GUARD_NC_MIN = 200
 SMALL_ONE_HV_MAX = 12
 SMALL_ONE_NC_MAX = 160
 # "rank_lpt" (a rejected faster-schedule candidate): every rank takes the smaller of its "row_cost_lpt" P and the LPT
@@ -1039,12 +1063,20 @@ def kcp_plan_row(
                 )
             )
         return tuple(out)
-    if p_rule in ("fill_down", "small_one", "fill_small"):
+    if p_rule in (
+        "fill_down",
+        "small_one",
+        "fill_small",
+        "fill_down_guard",
+        "fill_small_guard",
+    ):
         shipped = kcp_plan_row(tables, HV, sm_count, P_bal=P_bal, p_rule="row_cost_lpt")
         one = HV <= SMALL_ONE_HV_MAX and all(
             nc <= SMALL_ONE_NC_MAX for table in tables for nc, _ in table
         )
-        if p_rule == "small_one" or (p_rule == "fill_small" and one):
+        if p_rule == "small_one" or (
+            p_rule in ("fill_small", "fill_small_guard") and one
+        ):
             return tuple(
                 dataclasses.replace(
                     seg,
@@ -1067,6 +1099,29 @@ def kcp_plan_row(
                     seg, P=P_new, NSEG=seg.n_frag * P_new, p_rule=p_rule
                 )
             )
+
+        def slowest_walk(plans: "tuple[KcpSegmentPlan, ...]") -> int:
+            return max(
+                (
+                    walk_steps_rank_b3(table, HV, sm_count, seg.P)
+                    for table, seg in zip(tables, plans, strict=True)
+                    if table
+                ),
+                default=0,
+            )
+
+        if (
+            p_rule in ("fill_down_guard", "fill_small_guard")
+            and sm_count >= FILL_GUARD_SM_MIN
+            and all(len(table) >= 2 for table in tables)
+            and any(
+                new.P == 1 < old.P and max(nc for nc, _ in table) >= FILL_GUARD_NC_MIN
+                for new, old, table in zip(out, shipped, tables, strict=True)
+            )
+            and slowest_walk(tuple(out)) > slowest_walk(shipped)
+        ):
+            # the row guard: the fill would walk a long fragment as one chain and so lengthen the row's slowest walks
+            return tuple(dataclasses.replace(seg, p_rule=p_rule) for seg in shipped)
         return tuple(out)
 
     def program(rule: str) -> tuple[KcpSegmentPlan, ...]:
@@ -2039,7 +2094,7 @@ class ContextKcp:
     tables: dict[str, torch.Tensor]
     halo: KcpHaloPlan
     halo_tables: dict[str, torch.Tensor]
-    p_rule: str  # plan rule: "fill_small" shipped ("row_cost_lpt" / "row_cost" stay selectable); the per-rank rules via the test knob
+    p_rule: str  # plan rule: "fill_small_guard" shipped ("row_cost_lpt" / "row_cost" stay selectable); the per-rank rules via the test knob
     sequence: KcpSequence
     _head_plans: dict[int, KcpHeadPlan]
     # GDN table bundles of ``cake_tables`` (built once per context at first use, device-resident, keyed by HV)
@@ -2240,8 +2295,9 @@ def build_context_kcp(
     CUDA device's multiprocessor count; ``1`` on a non-CUDA device = no occupancy pressure, ``P = P_chain``).
     Out-of-range problems are rejected here, before any launch: ``n_frag > 65536`` (the layout table's document
     search), int32 overflows of the kernels' offsets (``heads(HV)``).  ``p_rule`` (keyword-only; a test knob of the
-    options object) selects the plan's ``P`` rule for this context (``None``: :data:`P_RULE_DEFAULT` = ``"fill_small"``, this
-    package's faster schedule, or :data:`P_RULE_GRAPH` = ``"fill_down"`` with ``graph_replay=True``;
+    options object) selects the plan's ``P`` rule for this context (``None``: :data:`P_RULE_DEFAULT` =
+    ``"fill_small_guard"``, this package's faster schedule, or :data:`P_RULE_GRAPH` = ``"fill_down_guard"`` with
+    ``graph_replay=True``; ``"fill_small"`` / ``"fill_down"`` = the same rules without the row guard;
     ``"row_cost_lpt"`` = the deterministic twin's default;
     ``"row_cost"`` = the selectable legacy row rule of :func:`kcp_plan_row`; ``"wave_fill1"`` = its base program and
     the former default, ``"wave"`` = the
@@ -2249,7 +2305,7 @@ def build_context_kcp(
     three fragments, ``"chain_min"`` / ``"one"`` = the minimal-segment programs, ``"row_cost_lpt"`` = the row rule with
     the per-rank LPT argmin on the wave-regime ranks, all kept for the A/B record); the public API never selects a rule
     other than the default.  ``graph_replay`` (keyword-only, public): the context serves calls with ``graph="replay"``;
-    its plan is :data:`P_RULE_GRAPH` (``"fill_small"`` without its ``P = 1`` rows) unless ``p_rule`` names a rule.
+    its plan is :data:`P_RULE_GRAPH` (``"fill_small_guard"`` without its ``P = 1`` rows) unless ``p_rule`` names a rule.
     A context serves calls of either graph mode; the hint only selects the plan.
     """
     if not isinstance(part, PartitionKcp):

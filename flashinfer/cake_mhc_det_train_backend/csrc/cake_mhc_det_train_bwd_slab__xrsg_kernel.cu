@@ -40,99 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCW_OFFSET 0
-#define TMEM_DFB0_OFFSET 256
-#define TMEM_DFB1_OFFSET 320
-#define TMEM_DFS0_OFFSET 384
-#define TMEM_DFS1_OFFSET 448
-#define NUM_STAGE_PIPE_STAGES 2
-#define NUM_FN_PIPE_STAGES 1
-#define NUM_ACC_PIPE_STAGES 2
-#define SMEM_WTV_OFF 222208
-#define SMEM_WTV_STAGE_BYTES 10240
-#define SMEM_WTV_STRIDE 10240
-#define SMEM_X0_1_0_OFF 1024
-#define SMEM_X0_1_0_STAGE_BYTES 8192
-#define SMEM_X0_1_0_STRIDE 86016
-#define SMEM_DY0_1_0_OFF 33792
-#define SMEM_DY0_1_0_STAGE_BYTES 8192
-#define SMEM_DY0_1_0_STRIDE 86016
-#define SMEM_X0_1_1_OFF 9216
-#define SMEM_X0_1_1_STAGE_BYTES 8192
-#define SMEM_X0_1_1_STRIDE 86016
-#define SMEM_DY0_1_1_OFF 41984
-#define SMEM_DY0_1_1_STAGE_BYTES 8192
-#define SMEM_DY0_1_1_STRIDE 86016
-#define SMEM_X0_1_2_OFF 17408
-#define SMEM_X0_1_2_STAGE_BYTES 8192
-#define SMEM_X0_1_2_STRIDE 86016
-#define SMEM_DY0_1_2_OFF 50176
-#define SMEM_DY0_1_2_STAGE_BYTES 8192
-#define SMEM_DY0_1_2_STRIDE 86016
-#define SMEM_X0_1_3_OFF 25600
-#define SMEM_X0_1_3_STAGE_BYTES 8192
-#define SMEM_X0_1_3_STRIDE 86016
-#define SMEM_DY0_1_3_OFF 58368
-#define SMEM_DY0_1_3_STAGE_BYTES 8192
-#define SMEM_DY0_1_3_STRIDE 86016
-#define SMEM_DUS_OFF 66560
-#define SMEM_DUS_STAGE_BYTES 8192
-#define SMEM_DUS_STRIDE 86016
-#define SMEM_DZ0_1_0_OFF 74752
-#define SMEM_DZ0_1_0_STAGE_BYTES 4096
-#define SMEM_DZ0_1_0_STRIDE 86016
-#define SMEM_DZ0_1_1_OFF 78848
-#define SMEM_DZ0_1_1_STAGE_BYTES 4096
-#define SMEM_DZ0_1_1_STRIDE 86016
-#define SMEM_DZ0_1_2_OFF 82944
-#define SMEM_DZ0_1_2_STAGE_BYTES 4096
-#define SMEM_DZ0_1_2_STRIDE 86016
-#define SMEM_FN0_0_OFF 173056
-#define SMEM_FN0_0_STAGE_BYTES 8192
-#define SMEM_FN0_0_STRIDE 8192
-#define SMEM_FN0_1_OFF 181248
-#define SMEM_FN0_1_STAGE_BYTES 8192
-#define SMEM_FN0_1_STRIDE 8192
-#define SMEM_FN1_0_OFF 189440
-#define SMEM_FN1_0_STAGE_BYTES 8192
-#define SMEM_FN1_0_STRIDE 8192
-#define SMEM_FN1_1_OFF 197632
-#define SMEM_FN1_1_STAGE_BYTES 8192
-#define SMEM_FN1_1_STRIDE 8192
-#define SMEM_FN2_2_OFF 205824
-#define SMEM_FN2_2_STAGE_BYTES 8192
-#define SMEM_FN2_2_STRIDE 8192
-#define SMEM_FN2_3_OFF 214016
-#define SMEM_FN2_3_STAGE_BYTES 8192
-#define SMEM_FN2_3_STRIDE 8192
-#define SMEM_FNW0_1_OFF 173056
-#define SMEM_FNW0_1_STAGE_BYTES 16384
-#define SMEM_FNW0_1_STRIDE 16384
-#define SMEM_FNW0_1_0_OFF 189440
-#define SMEM_FNW0_1_0_STAGE_BYTES 16384
-#define SMEM_FNW0_1_0_STRIDE 16384
-#define SMEM_FNW0_1_1_OFF 205824
-#define SMEM_FNW0_1_1_STAGE_BYTES 16384
-#define SMEM_FNW0_1_1_STRIDE 16384
-#define SMEM_XA0_1_OFF 1024
-#define SMEM_XA0_1_STAGE_BYTES 16384
-#define SMEM_XA0_1_STRIDE 86016
-#define SMEM_XA0_1_0_OFF 17408
-#define SMEM_XA0_1_0_STAGE_BYTES 16384
-#define SMEM_XA0_1_0_STRIDE 86016
-#define SMEM_DZN0_OFF 74752
-#define SMEM_DZN0_STAGE_BYTES 4096
-#define SMEM_DZN0_STRIDE 86016
-#define SMEM_DZN1_OFF 78848
-#define SMEM_DZN1_STAGE_BYTES 4096
-#define SMEM_DZN1_STRIDE 86016
-#define SMEM_DZN2_OFF 82944
-#define SMEM_DZN2_STAGE_BYTES 4096
-#define SMEM_DZN2_STRIDE 86016
-#define SMEM_TOTAL 232448
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -604,13 +511,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                         mbarrier_wait(acc_empty_addr + (acc_mm) * 8, _phase_acc_empty);
                         mbarrier_wait(stage_full_z_addr + (mm_stage) * 8, _phase_stage_full_z);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_0 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
                         int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x7FFF);
-#else
-                        int _mma_a_lo_0 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_0 = make_warp_uniform(((fnw0_addr_1_1) >> 4) & 0x3FFF);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -635,13 +537,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_accw + (acc_mm * 128))), "r"(0) : "memory");
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_1 = make_warp_uniform((((dz0_addr_1_2) >> 4) & 0x7FFF) + (mm_stage) * 5376);
                         int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1) >> 4) & 0x7FFF);
-#else
-                        int _mma_a_lo_1 = make_warp_uniform((((dz0_addr_1_2) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_1 = make_warp_uniform(((fnw0_addr_1) >> 4) & 0x3FFF);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -666,13 +563,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_2 = make_warp_uniform((((dz0_addr_1_1) >> 4) & 0x7FFF) + (mm_stage) * 5376);
                         int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x7FFF);
-#else
-                        int _mma_a_lo_2 = make_warp_uniform((((dz0_addr_1_1) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-                        int _mma_b_lo_2 = make_warp_uniform(((fnw0_addr_1_0) >> 4) & 0x3FFF);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -697,11 +589,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_2), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_3 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
-#else
-                        int _mma_a_lo_3 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -726,11 +614,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_3), "r"(_mma_b_lo_2), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_4 = make_warp_uniform((((dz0_addr_1_1) >> 4) & 0x7FFF) + (mm_stage) * 5376);
-#else
-                        int _mma_a_lo_4 = make_warp_uniform((((dz0_addr_1_1) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -755,11 +639,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.ws.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_1), "r"((tmem_accw + (acc_mm * 128))), "r"(1) : "memory");
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_5 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x7FFF) + (mm_stage) * 5376);
-#else
-                        int _mma_a_lo_5 = make_warp_uniform((((dz0_addr_1_0) >> 4) & 0x3FFF) + (mm_stage) * 5376);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -790,13 +670,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                         int in_grp = tile_1 % 16;
                         int small_init = ((in_grp == 0) ? 1 : 0);
                         unsigned int sbuf = grp_mm % 2;
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_3 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
-#else
-                        int _mma_a_lo_6 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_3 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -831,13 +706,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_3), "r"((tmem_dfb0 + (acc_mm * 32))), "r"(0) : "memory");
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_4 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
-#else
-                        int _mma_a_lo_7 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_4 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -872,13 +742,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_7), "r"(_mma_b_lo_4), "r"((tmem_dfs0 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_5 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
-#else
-                        int _mma_a_lo_8 = make_warp_uniform(((((xa0_addr_1) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_5 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -913,13 +778,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_8), "r"(_mma_b_lo_5), "r"((tmem_dfs0 + (sbuf * 32))), "r"(1) : "memory");
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_6 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
-#else
-                        int _mma_a_lo_9 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_6 = make_warp_uniform(((((dzn0_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -954,13 +814,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_9), "r"(_mma_b_lo_6), "r"((tmem_dfb1 + (acc_mm * 32))), "r"(0) : "memory");
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_7 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
-#else
-                        int _mma_a_lo_10 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_7 = make_warp_uniform(((((dzn1_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -995,13 +850,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg(const __grid_constant__ CUtensorMap X, 
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_10), "r"(_mma_b_lo_7), "r"((tmem_dfs1 + (sbuf * 32))), "r"(((small_init) ? 0 : 1)) : "memory");
-#if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x7FFF) | 0x2000000) + (mm_stage) * 5376);
                         int _mma_b_lo_8 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x7FFF) | 0x1000000) + (mm_stage) * 5376);
-#else
-                        int _mma_a_lo_11 = make_warp_uniform(((((xa0_addr_1_0) >> 4) & 0x3FFF) | 0x2000000) + (mm_stage) * 5376);
-                        int _mma_b_lo_8 = make_warp_uniform(((((dzn2_addr) >> 4) & 0x3FFF) | 0x1000000) + (mm_stage) * 5376);
-#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"

@@ -866,7 +866,31 @@ RAW_DETERMINISTIC_TAIL_TOKENS = [[16, 47], [128, 1024]]
 # plain program's split count and launch, so the same outputs), ahead of the
 # fast-division and fast coefficient-chain routes: the token counts of
 # RAW_TAIL_TOKENS (inclusive ranges).
-RAW_TAIL_TOKENS = [[129, 384], [833, 1023]]
+RAW_TAIL_TOKENS = [[129, 384], [833, 968]]
+# The chain-packing forms of programs on sm_107a (the same launch and outputs;
+# the one-wave schedule's fifth-round coefficient-chain tokens packed four per
+# CTA): the FP8 group-128 tailpipe program's ("raw_tail"), in the raw scale
+# mode, and the FP8 group-128 UE8M0 program's ("ue8m0_plain"), in the UE8M0
+# mode. The loader launches each in the plain variant's regime outside the
+# deterministic mode at the token counts of CHAIN_PACK_TOKENS (inclusive
+# ranges), ahead of the routes of the program it is the form of, and on the
+# devices of an SM count alone at that count's CHAIN_PACK_SM_TOKENS (routes
+# keyed on "num_sms"; a selection without the SM count takes none of those).
+CHAIN_PACK_PROGRAMS = {
+    "raw_tail": "cake_mega_mhc_92ff09be7d50b8019d50",
+    "ue8m0_plain": "cake_mega_mhc_5763c0f20d1a1aceb24f",
+}
+CHAIN_PACK_TOKENS = {
+    "raw_tail": [[969, 1023]],
+    "ue8m0_plain": [],
+}
+CHAIN_PACK_SM_TOKENS = {
+    208: {
+        "raw_tail": [[929, 968]],
+        "ue8m0_plain": [[930, 936], [952, 968]],
+    },
+}
+CHAIN_PACK_ARCHES = ["sm_107a"]
 
 
 def _fast_chain_program(layout, regime, arch, tokens, deterministic, ue8m0=None):
@@ -920,6 +944,35 @@ def _raw_tail_program(regime, tokens, deterministic):
         for first, last in ranges:
             if first <= tokens <= last:
                 return VARIANT_PROGRAMS["fp8_group128"]["tailpipe"]
+    return None
+
+
+def _chain_pack_program(
+    layout, regime, arch, tokens, deterministic, ue8m0=None, num_sms=None
+):
+    """The chain-packing program a launch of ``layout`` in ``regime`` on ``arch``
+    takes (``ue8m0``: the FP8 scale mode, "raw_tail" in the raw mode and
+    "ue8m0_plain" in the UE8M0 mode, so a selection without the mode takes none;
+    ``num_sms``: the device's SM count, whose CHAIN_PACK_SM_TOKENS ranges join
+    CHAIN_PACK_TOKENS), or None where the routes of the program it is the form of
+    keep the launch."""
+    if (
+        layout != "fp8_group128"
+        or arch not in CHAIN_PACK_ARCHES
+        or regime != "bf16"
+        or deterministic
+        or ue8m0 is None
+    ):
+        return None
+    key = "ue8m0_plain" if ue8m0 else "raw_tail"
+    if key not in CHAIN_PACK_PROGRAMS:
+        return None
+    ranges = [
+        *CHAIN_PACK_TOKENS[key],
+        *CHAIN_PACK_SM_TOKENS.get(num_sms, {}).get(key, []),
+    ]
+    if any(first <= tokens <= last for first, last in ranges):
+        return CHAIN_PACK_PROGRAMS[key]
     return None
 
 
@@ -1517,6 +1570,7 @@ def test_h4096_tailpipe_programs_are_bitwise_the_bf16_program(monkeypatch):
         fp8_sf_ue8m0=None,
         tokens=None,
         deterministic=None,
+        num_sms=None,
     ):
         assert (hidden, sf_layout) == (4096, "bf16") and regime != "bf16"
         return select(
@@ -1530,6 +1584,7 @@ def test_h4096_tailpipe_programs_are_bitwise_the_bf16_program(monkeypatch):
             fp8_sf_ue8m0=fp8_sf_ue8m0,
             tokens=tokens,
             deterministic=deterministic,
+            num_sms=num_sms,
         )
 
     for t in tokens:
@@ -1587,6 +1642,7 @@ def test_h4096_variant_tail_forms_are_bitwise_the_plain_variant(monkeypatch, lay
         fp8_sf_ue8m0=None,
         tokens=None,
         deterministic=None,
+        num_sms=None,
     ):
         assert (hidden, sf_layout) == (4096, layout) and regime != "bf16"
         return select(
@@ -1600,6 +1656,7 @@ def test_h4096_variant_tail_forms_are_bitwise_the_plain_variant(monkeypatch, lay
             fp8_sf_ue8m0=fp8_sf_ue8m0,
             tokens=tokens,
             deterministic=deterministic,
+            num_sms=num_sms,
         )
 
     for t in tokens:
@@ -1762,7 +1819,8 @@ def test_launch_records_match_their_bindings():
 def test_h4096_every_program_ships_for_every_listed_architecture():
     """Each hidden-4096 record lists the same three architectures, sm_107a first,
     except the quantized variants' four tail forms, which list VARIANT_TAIL_ARCHES
-    alone; the routes select the same BF16-output program and the same plain
+    alone, and the sm_107a-only forms (the UE8M0, fast-division, fast
+    coefficient-chain and chain-packing programs), which list their own; the routes select the same BF16-output program and the same plain
     variant on each architecture, and a tail form on sm_107a alone; hidden 5120
     stays unexported on sm_107a."""
     h4096 = [
@@ -1775,7 +1833,9 @@ def test_h4096_every_program_ships_for_every_listed_architecture():
     }
     pow2 = set(UE8M0_PROGRAMS.values())
     chain = set(FAST_CHAIN_PROGRAMS.values())
-    assert len(h4096) == 19 and len(tails) == 4 and tails < set(h4096)
+    pack = set(CHAIN_PACK_PROGRAMS.values())
+    assert len(h4096) == 21 and len(tails) == 4 and tails < set(h4096)
+    assert len(pack) == 2 and pack < set(h4096) and not pack & (tails | chain)
     assert len(chain) == 6 and chain < set(h4096) and not chain & tails
     assert len(pow2) == 3 and pow2 < set(h4096) and not pow2 & tails
     assert FAST_DIV_PROGRAM in h4096 and FAST_DIV_PROGRAM not in pow2 | tails
@@ -1785,6 +1845,8 @@ def test_h4096_every_program_ships_for_every_listed_architecture():
             if name == FAST_DIV_PROGRAM
             else FAST_CHAIN_ARCHES
             if name in chain
+            else CHAIN_PACK_ARCHES
+            if name in pack
             else UE8M0_ARCHES
             if name in pow2
             else VARIANT_TAIL_ARCHES
@@ -1917,7 +1979,8 @@ def test_h4096_fp8_raw_fast_div_routes_select_the_fast_div_program():
     at the launches its routes name: the token counts of FAST_DIV_TOKENS and, with
     FAST_DIV_DETERMINISTIC, every deterministic launch the FP8 group-128
     tailpipe program's routes leave (RAW_DETERMINISTIC_TAIL_TOKENS, ahead of
-    them, the same shape keyed on "tokens"). Every other launch, a
+    them, the same shape keyed on "tokens"; the chain-packing routes ahead of
+    both, their own test). Every other launch, a
     selection without the launch or the mode, the UE8M0 mode, the tail forms'
     regimes and sm_100a / sm_103a keep their programs. Its record is the plain
     variant's record on FAST_DIV_ARCHES alone with its own kernel; its routes are
@@ -1971,7 +2034,11 @@ def test_h4096_fp8_raw_fast_div_routes_select_the_fast_div_program():
     assert record["compile_options"] == base["compile_options"]
     edges = {
         e + d
-        for pair in (*FAST_DIV_TOKENS, *RAW_TAIL_TOKENS)
+        for pair in (
+            *FAST_DIV_TOKENS,
+            *RAW_TAIL_TOKENS,
+            *(pair for ranges in CHAIN_PACK_TOKENS.values() for pair in ranges),
+        )
         for e in pair
         for d in (-1, 0, 1)
     }
@@ -1995,8 +2062,12 @@ def test_h4096_fp8_raw_fast_div_routes_select_the_fast_div_program():
                 chain = _fast_chain_program(
                     "fp8_group128", regime, "sm_107a", t, deterministic, False
                 )
-                expected = _raw_tail_program(regime, t, deterministic) or (
-                    FAST_DIV_PROGRAM if served else chain or programs[regime]
+                expected = (
+                    _chain_pack_program(
+                        "fp8_group128", regime, "sm_107a", t, deterministic, False
+                    )
+                    or _raw_tail_program(regime, t, deterministic)
+                    or (FAST_DIV_PROGRAM if served else chain or programs[regime])
                 )
                 assert _runtime.select_program(
                     *key, "sm_107a", regime=regime, fp8_sf_ue8m0=False, **launch
@@ -2119,7 +2190,15 @@ def test_h4096_fast_chain_routes_select_the_fast_chain_programs():
                             held = raw_tail or kept
                         else:
                             held = kept
-                        assert got == (raw_tail or want or held, {}), (
+                        pack = _chain_pack_program(
+                            layout,
+                            other,
+                            "sm_107a",
+                            t,
+                            deterministic,
+                            mode.get("fp8_sf_ue8m0"),
+                        )
+                        assert got == (pack or raw_tail or want or held, {}), (
                             name,
                             other,
                             t,
@@ -2145,6 +2224,241 @@ def test_h4096_fast_chain_routes_select_the_fast_chain_programs():
                             continue
                         assert got[0] != program, (arch, name, other, t)
         assert served
+
+
+def test_h4096_chain_pack_routes_select_the_chain_pack_programs():
+    """The chain-packing programs on sm_107a (CHAIN_PACK_PROGRAMS: the same
+    launch as the program each is the form of, the one-wave schedule's
+    fifth-round coefficient-chain tokens packed four per CTA): each takes the
+    plain variant's regime outside the deterministic mode, in the scale mode of
+    its key, at the token counts of CHAIN_PACK_TOKENS on every device and of
+    CHAIN_PACK_SM_TOKENS on the devices of that SM count alone; every other
+    launch, the other scale mode, a selection without the launch, the mode or
+    (for the SM-count ranges) the SM count, the other SM counts, the other
+    regimes and sm_100a / sm_103a never take it. Each record is its program's
+    record on CHAIN_PACK_ARCHES alone with its own kernel; each of its routes is
+    the shape of that program's routes of the plain regime, ahead of them, the
+    SM-count routes keyed on "num_sms"."""
+    bases = {
+        "raw_tail": VARIANT_PROGRAMS["fp8_group128"]["tailpipe"],
+        "ue8m0_plain": UE8M0_PROGRAMS["bf16"],
+    }
+    assert set(CHAIN_PACK_PROGRAMS) == set(CHAIN_PACK_TOKENS) <= set(bases)
+    assert set(CHAIN_PACK_SM_TOKENS) <= set(H4096_SM_COUNTS)
+    assert all(
+        set(table) <= set(CHAIN_PACK_PROGRAMS)
+        for table in CHAIN_PACK_SM_TOKENS.values()
+    )
+    pack = set(CHAIN_PACK_PROGRAMS.values())
+    assert len(pack) == len(CHAIN_PACK_PROGRAMS)
+    launch_keys = ("tokens", "deterministic", "num_sms", "program")
+    for name, program in CHAIN_PACK_PROGRAMS.items():
+        base = bases[name]
+        record, plain = _runtime.PROGRAMS[program], _runtime.PROGRAMS[base]
+        assert _runtime.record_arches(record) == CHAIN_PACK_ARCHES
+        assert record["hidden"] == plain["hidden"] == 4096
+        assert record["arg_plan"] == plain["arg_plan"]
+        assert record["launch"] == plain["launch"]
+        assert record["compile_options"] == plain["compile_options"]
+        assert record["kernel_symbol"] != plain["kernel_symbol"]
+        routes = [r for r in _runtime.ROUTES if r["program"] == program]
+        assert [r["tokens"] for r in routes if "num_sms" not in r] == (
+            [CHAIN_PACK_TOKENS[name]] if CHAIN_PACK_TOKENS[name] else []
+        )
+        assert {
+            count: r["tokens"]
+            for r in routes
+            if "num_sms" in r
+            for count in r["num_sms"]
+        } == {
+            count: table[name]
+            for count, table in CHAIN_PACK_SM_TOKENS.items()
+            if table.get(name)
+        }
+        assert all(len(r.get("num_sms", ())) <= 1 for r in routes)
+        held = [
+            r
+            for r in _runtime.ROUTES
+            if r["program"] == base and _runtime.route_regime(r) == "bf16"
+        ]
+        assert routes and held
+        for route in routes:
+            assert route["deterministic"] is False
+            assert route["fp8_sf_ue8m0"] is (name == "ue8m0_plain")
+            assert _runtime.route_regime(route) == "bf16"
+            for r in held:
+                assert _runtime.ROUTES.index(route) < _runtime.ROUTES.index(r)
+                rest = {k: v for k, v in r.items() if k not in launch_keys}
+                assert rest == {k: v for k, v in route.items() if k not in launch_keys}
+    edges = {
+        e + d
+        for table in (CHAIN_PACK_TOKENS, *CHAIN_PACK_SM_TOKENS.values())
+        for ranges in table.values()
+        for pair in ranges
+        for e in pair
+        for d in (-1, 0, 1)
+    }
+    tokens = sorted(
+        t
+        for t in {*H4096_TOKENS, *H4096_RULE_TOKENS, *edges}
+        if 1 <= t <= _runtime.MAX_TOKENS
+    )
+    counts = (None, *H4096_SM_COUNTS)
+    served = set()
+    for regime, splits in (("bf16", 64), ("tailpipe", 16), ("tailpipe_wsmem", 16)):
+        key = (4096, splits, False, False, "fp8_group128")
+        for kw in ({}, {"fp8_sf_ue8m0": False}, {"fp8_sf_ue8m0": True}):
+            for count in counts:
+                sms = {} if count is None else {"num_sms": count}
+                got = _runtime.select_program(
+                    *key, "sm_107a", regime=regime, **kw, **sms
+                )
+                assert got[0] not in pack, (regime, kw, count)
+        for t in tokens:
+            for deterministic in (False, True):
+                launch = {"tokens": t, "deterministic": deterministic}
+                for ue8m0 in (None, False, True):
+                    mode = {} if ue8m0 is None else {"fp8_sf_ue8m0": ue8m0}
+                    for count in counts:
+                        sms = {} if count is None else {"num_sms": count}
+                        want = _chain_pack_program(
+                            "fp8_group128",
+                            regime,
+                            "sm_107a",
+                            t,
+                            deterministic,
+                            ue8m0,
+                            count,
+                        )
+                        got = _runtime.select_program(
+                            *key, "sm_107a", regime=regime, **mode, **launch, **sms
+                        )
+                        if want is None:
+                            assert got[0] not in pack, (
+                                regime,
+                                t,
+                                deterministic,
+                                mode,
+                                count,
+                            )
+                        else:
+                            assert got == (want, {}), (
+                                regime,
+                                t,
+                                deterministic,
+                                mode,
+                                count,
+                            )
+                            served.add(want)
+                        for arch in ("sm_100a", "sm_103a"):
+                            try:
+                                got = _runtime.select_program(
+                                    *key, arch, regime=regime, **mode, **launch, **sms
+                                )
+                            except NotImplementedError:
+                                continue
+                            assert got[0] not in pack, (arch, regime, t, count)
+    assert served == pack
+    # Every edge of every SM-count range: its SM count selects the program at
+    # both ends, every other SM count and a selection without one do not, and
+    # one past each end the program is not selected (outside its other ranges).
+    key = (4096, 64, False, False, "fp8_group128", "sm_107a")
+    for count, table in CHAIN_PACK_SM_TOKENS.items():
+        for name, sm_ranges in table.items():
+            program = CHAIN_PACK_PROGRAMS[name]
+            mode = {"fp8_sf_ue8m0": name == "ue8m0_plain"}
+            inside = [*CHAIN_PACK_TOKENS[name], *sm_ranges]
+            for first, last in sm_ranges:
+                for t in (first, last):
+                    launch = {"tokens": t, "deterministic": False, **mode}
+                    got = _runtime.select_program(
+                        *key, regime="bf16", **launch, num_sms=count
+                    )
+                    assert got == (program, {}), (name, count, t)
+                    for other in counts:
+                        if other == count:
+                            continue
+                        sms = {} if other is None else {"num_sms": other}
+                        got = _runtime.select_program(
+                            *key, regime="bf16", **launch, **sms
+                        )
+                        if not any(a <= t <= b for a, b in CHAIN_PACK_TOKENS[name]):
+                            assert got[0] != program, (name, other, t)
+                for t in (first - 1, last + 1):
+                    if any(a <= t <= b for a, b in inside):
+                        continue
+                    launch = {"tokens": t, "deterministic": False, **mode}
+                    got = _runtime.select_program(
+                        *key, regime="bf16", **launch, num_sms=count
+                    )
+                    assert got[0] != program, (name, count, t)
+
+
+@pytest.mark.parametrize("ue8m0", (False, True))
+def test_h4096_chain_pack_plans_follow_the_device_sm_count(monkeypatch, ue8m0):
+    """On an sm_107a device, a plan of the FP8 group-128 layout outside the
+    deterministic mode at the edges of every CHAIN_PACK_SM_TOKENS range of its
+    scale mode takes the program the model names for the device's SM count
+    (the chain-packing program inside the ranges of that count), and writes
+    bitwise the outputs of the plan selected without the SM count, at the same
+    split count and grid."""
+    _skip_unless_exported(4096, "fp8_group128")
+    arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    if arch not in CHAIN_PACK_ARCHES:
+        pytest.skip(f"the chain-packing programs ship for {CHAIN_PACK_ARCHES} alone")
+    name = "ue8m0_plain" if ue8m0 else "raw_tail"
+    tokens = sorted(
+        {
+            e + d
+            for table in CHAIN_PACK_SM_TOKENS.values()
+            for pair in table.get(name, [])
+            for e in pair
+            for d in (-1, 0, 1)
+        }
+    )
+    if not tokens:
+        pytest.skip(f"no SM-count chain-packing range in this scale mode ({name})")
+    select = _runtime.select_program
+
+    def without_sms(*args, **kw):
+        kw.pop("num_sms", None)
+        return select(*args, **kw)
+
+    pack = set(CHAIN_PACK_PROGRAMS.values())
+    served = 0
+    for t in tokens:
+        values = inputs_h4096(t)
+        plan = prepare_mega_mhc(
+            **values, sf_layout="fp8_group128", fp8_sf_ue8m0=ue8m0, deterministic=False
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(_runtime, "select_program", without_sms)
+            base = prepare_mega_mhc(
+                **values,
+                sf_layout="fp8_group128",
+                fp8_sf_ue8m0=ue8m0,
+                deterministic=False,
+            )
+        regime = plan.config["regime"]
+        want = _chain_pack_program("fp8_group128", regime, arch, t, False, ue8m0, sms)
+        shared = _chain_pack_program("fp8_group128", regime, arch, t, False, ue8m0)
+        assert plan.program == (want or base.program), (t, sms)
+        assert base.program == (shared or base.program)
+        assert (base.program in pack) == (shared is not None), (t, base.program)
+        served += want is not None and shared is None
+        assert base.config["num_splits"] == plan.config["num_splits"]
+        assert base.config["num_launch_sms"] == plan.config["num_launch_sms"]
+        for each in (plan, base):
+            poison(each.outputs)
+            each.run()
+        torch.cuda.synchronize()
+        check_h4096_layout(plan.outputs, values, "fp8_group128", fp8_sf_ue8m0=ue8m0)
+        for out in (*BF16_OUTPUTS, *QUANT_OUTPUTS["fp8_group128"]):
+            assert bitwise_equal(plan.outputs[out], base.outputs[out]), (t, out)
+    assert bool(served) == bool(CHAIN_PACK_SM_TOKENS.get(sms, {}).get(name)), (
+        sms,
+        served,
+    )
 
 
 def test_h4096_quant_keyword_rules():
