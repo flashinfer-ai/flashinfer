@@ -13205,12 +13205,21 @@ def bmm_mxfp8(
         (do NOT call ``.contiguous()`` on the transpose).
 
     A_scale: torch.Tensor
-        Scale tensor for A, uint8 (fp8 e8m0 format), in the F8_128x4 swizzled
-        layout produced by ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
+        Scale tensor for A, uint8 (fp8 e8m0 format), flat 1D in the F8_128x4
+        swizzled layout, exactly as ``mxfp8_quantize(A_hp,
+        is_sf_swizzled_layout=True)`` returns it for the 3D ``[b, m, k]``
+        input: ``b`` is folded into the row dimension, so the length is
+        ``round_up(b * m, 128) * round_up(k / 32, 4)`` and the 128-row
+        padding is applied once to the folded ``b * m`` rows, not per batch.
+        With ``b > 1`` this folded layout only matches the kernels'
+        per-batch descale when ``m`` is a multiple of 128; other shapes
+        return wrong values or NaN (#3604).
 
     B_scale: torch.Tensor
-        Scale tensor for B, uint8 (fp8 e8m0 format), in the F8_128x4 swizzled
-        layout, as returned by quantizing the [b, n, k] weight (see ``B``).
+        Scale tensor for B, uint8 (fp8 e8m0 format), flat 1D in the F8_128x4
+        swizzled layout, as returned by quantizing the ``[b, n, k]`` weight
+        (see ``B``): length ``round_up(b * n, 128) * round_up(k / 32, 4)``,
+        with the same folded-row convention as ``A_scale``.
 
     dtype: torch.dtype
         out dtype, bf16 or fp16.
