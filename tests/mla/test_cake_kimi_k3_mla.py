@@ -329,7 +329,12 @@ def test_decode_q1_auto_follows_the_measured_cells(cake_auto_calls, batch, kv_le
     _skip_unless_sm100_family()
     device = torch.device("cuda")
     case = _make_case(
-        batch, [1] * batch, _spread_kv_lens(batch, kv_len), 12, seed=645001, device=device
+        batch,
+        [1] * batch,
+        _spread_kv_lens(batch, kv_len),
+        12,
+        seed=645001,
+        device=device,
     )
     admitted = _cell_admitted_here(batch, int(case["block_tables"].shape[1]) * PAGE)
     out = _run(case, fixed_q_len=1, backend="auto")
