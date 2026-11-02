@@ -286,8 +286,10 @@ def mxfp8_quantize(x, return_normal=True, return_transposed=True):
     ``None``. ``fp8`` is E4M3 with the input shape and ``scales`` is uint8
     ``[E * M // 128, N // 128, 32, 16]``; the transposed pair quantizes
     ``x.transpose(-1, -2)`` the same way. M and N must be multiples of 128.
-    CUDA tensors are quantized by one fused Triton kernel per layout; without
-    Triton (or off CUDA) PyTorch operations produce the same bytes.
+    Contiguous CUDA tensors that request both layouts are quantized by one
+    Triton kernel that reads each tile once; a single layout (or a
+    non-contiguous input) uses one Triton kernel per layout. Without Triton
+    (or off CUDA) PyTorch operations produce the same bytes.
     """
     if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16:
         raise ValueError("x must be a BF16 tensor")
