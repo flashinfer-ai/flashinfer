@@ -199,7 +199,9 @@ and does not change the launch sequence.
   hidden width that is a multiple of 512, and its forward and recompute roles
   need an nvcc of CUDA 13.1 or newer (the 13.0 ptxas rejects
   `cvt.rn.satfinite.e4m3x2.bf16x2`: "Unexpected instruction types specified for
-  'cvt'"; the backward roles carry a guard and compile with 13.0). Common physical source capacity is
+  'cvt'"; the backward roles carry a guard and compile with 13.0). Every sm_107a
+  (Rubin) library needs CUDA 13.4, the first nvcc that accepts `compute_107a`.
+  Common physical source capacity is
   aligned for tiles/metadata and is at least 512 rows. Communication-SM counts
   are positive and even, leaving compute SMs available.
 - Imbalance-aware split (`MoKConfig.imbalance_comm_sms` / `imbalance_threshold`;
