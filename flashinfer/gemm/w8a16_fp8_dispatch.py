@@ -25,7 +25,6 @@ replaced and validated against it shape by shape.
 """
 
 import math
-import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -104,8 +103,8 @@ def sm100_splits_for(m: int, n: int, k: int, num_sms: int) -> int:
 
 
 def _sm100_streamk_substitute(m: int, n: int, k: int, num_sms: int) -> Tuple[int, int]:
-    """(algo, splits) for a problem the C++ dispatcher runs as stream-K: the DSL has
-    no stream-K, so the plain tiles and the split-K slice counts are scored by wave
+    """(algo, splits) for a problem whose grid would suit stream-K: there is no
+    stream-K kernel, so the plain tiles and the split-K slice counts are scored by wave
     quantization (whole waves of k-tiles, the last wave counted whole) plus the
     split-K reduce (its fp32 partial traffic in k-tile-waves), and the cheapest wins.
     Falls back to the plain 256x128 tile when K cannot be sliced."""
@@ -225,7 +224,6 @@ def _get_sm100_kernel(
     k: int,
     stream,
     enable_pdl: bool = False,
-    debug: bool = False,
     partial_output: bool = False,
     splits: int = 1,
 ):
@@ -246,7 +244,6 @@ def _get_sm100_kernel(
         transform_fragment_size,
         max_active_clusters,
         enable_pdl,
-        debug,
         partial_output,
         splits,
     )
@@ -263,7 +260,6 @@ def _get_sm100_kernel(
         raster_along_m=raster_along_m,
         transform_fragment_size=transform_fragment_size,
         enable_pdl=enable_pdl,
-        debug=debug,
         partial_output=partial_output,
     )
     compiled = cute.compile(
@@ -277,14 +273,6 @@ def _get_sm100_kernel(
         stream=stream,
         options="--opt-level 2 --enable-tvm-ffi",
     )
-    if debug:
-        print(
-            f"w8a16 dsl kernel algo {algo}: stages load2trans "
-            f"{kernel.num_load2trans_stage} trans2mma {kernel.num_trans2mma_stage} acc "
-            f"{kernel.num_acc_stage} c {kernel.num_c_stage} b {kernel.num_b_stage}, tmem cols "
-            f"{kernel.num_tmem_alloc_cols}",
-            flush=True,
-        )
     _KERNEL_CACHE[key] = compiled
     return compiled
 
@@ -361,7 +349,7 @@ def w8a16_fp8_gemm_workspace_bytes(
     """Scratch bytes a call needs (0 = none): the fp32 partials of a Blackwell
     split-K run (``splits * m * n * 4``) or of a Hopper split tail (one
     ``tile_a x tile_w`` fp32 block per tail slice).  A pure function of the
-    shape and the device's SM count; ``algo`` as :func:`w8a16_fp8_gemm_cute_dsl`."""
+    shape and the device's SM count; ``algo`` as :func:`launch_w8a16_fp8_gemm`."""
     num_sms = get_device_sm_count(device)
     if get_compute_capability(device)[0] == 9:
         tile_algo, _body_items, tail_splits, tail_tiles, _group = _sm90_plan(
@@ -373,7 +361,7 @@ def w8a16_fp8_gemm_workspace_bytes(
     return splits * m * n * 4 if splits > 1 else 0
 
 
-def w8a16_fp8_gemm_cute_dsl(
+def launch_w8a16_fp8_gemm(
     act: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -381,7 +369,6 @@ def w8a16_fp8_gemm_cute_dsl(
     out: torch.Tensor,
     algo: int = 0,
     workspace: Optional[torch.Tensor] = None,
-    debug_buffer: Optional[torch.Tensor] = None,
 ) -> None:
     """Launch the W8A16 GEMM (``out = act @ dequant(weight).T + bias``) on
     validated 2-D tensors: ``act`` [M, K] fp16 / bf16, ``weight`` [N, K] e4m3,
@@ -390,15 +377,12 @@ def w8a16_fp8_gemm_cute_dsl(
     :func:`flashinfer.gemm.w8a16_fp8_gemm` checks that).  ``algo``: a code of the
     architecture's table (0 = the model's choice).  ``workspace``: a buffer of at
     least :func:`w8a16_fp8_gemm_workspace_bytes` bytes, or None to allocate when
-    needed.  ``debug_buffer`` (Blackwell): an Int32 tensor of at least 64 * 4096
-    entries the kernel's debug build writes its per-CTA progress into."""
+    needed."""
     import cutlass
 
     m, k = act.shape
     n = weight.shape[0]
     if get_compute_capability(act.device)[0] == 9:
-        if debug_buffer is not None:
-            raise ValueError("debug_buffer is a Blackwell-kernel feature")
         _w8a16_fp8_gemm_sm90(act, weight, weight_scale, bias, out, algo, workspace)
         return
     plan = _sm100_plan(algo, m, n, k, get_device_sm_count(act.device))
@@ -416,14 +400,12 @@ def w8a16_fp8_gemm_cute_dsl(
     bias_ctype = act_ctype if has_bias else cutlass.Float32
     gemm_out = partials if partials is not None else out
     gemm_out_ctype = cutlass.Float32 if partials is not None else act_ctype
-    debug_tensor = debug_buffer if debug_buffer is not None else weight_scale
     pointer_specs = (
         (cutlass.Float8E4M3FN, weight.data_ptr(), 16),
         (act_ctype, act.data_ptr(), 16),
         (cutlass.Float32, weight_scale.data_ptr(), 4),
         (bias_ctype, bias_tensor.data_ptr(), 4),
         (gemm_out_ctype, gemm_out.data_ptr(), 16),
-        (cutlass.Int32, debug_tensor.data_ptr(), 4),
     )
     stream = _raw_stream(act.device)
     compiled = _get_sm100_kernel(
@@ -438,7 +420,6 @@ def w8a16_fp8_gemm_cute_dsl(
         m,
         k_slice,
         stream,
-        debug=debug_buffer is not None,
         partial_output=partials is not None,
         splits=splits,
     )
@@ -448,7 +429,6 @@ def w8a16_fp8_gemm_cute_dsl(
         weight_scale.data_ptr(),
         bias_tensor.data_ptr(),
         gemm_out.data_ptr(),
-        debug_tensor.data_ptr(),
         n,
         m,
         k_slice,
@@ -690,12 +670,6 @@ def _get_sm90_kernel(
         stream=stream,
         options="--opt-level 2 --enable-tvm-ffi",
     )
-    if os.environ.get("W8A16_DSL_VERBOSE") == "1":
-        print(
-            f"w8a16 dsl sm90 tile {_SM90_TILES[tile_algo]}: ab stages {kernel.ab_stage}, epi "
-            f"stages {kernel.epi_stage}, group {group}, tail {has_tail}",
-            flush=True,
-        )
     _KERNEL_CACHE[key] = compiled
     return compiled
 
@@ -797,7 +771,7 @@ def _w8a16_fp8_gemm_sm90(
     algo: int,
     workspace: Optional[torch.Tensor],
 ) -> None:
-    """The Hopper path of ``w8a16_fp8_gemm_cute_dsl`` (inputs already validated)."""
+    """The Hopper path of ``launch_w8a16_fp8_gemm`` (inputs already validated)."""
     import cutlass
 
     m, k = act.shape

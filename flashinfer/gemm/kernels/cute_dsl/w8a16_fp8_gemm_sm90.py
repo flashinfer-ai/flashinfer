@@ -511,152 +511,127 @@ class Sm90W8A16Fp8GemmKernel:
         if warp_group_idx < self.num_dma_warp_groups:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
             if warp_idx == self.load_warp_id:
-                producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.ab_stage
+                self._producer_warp(
+                    ab_pipeline,
+                    tma_atom_a,
+                    tAgA,
+                    tAsA,
+                    tma_atom_b,
+                    tBgB,
+                    tBsB,
+                    body_items,
+                    tail_splits,
+                    k_tiles_total,
+                    weight_tiles,
+                    act_tiles,
+                    total_work,
+                    group,
                 )
-                lin = cutlass.Int32(bidx)
-                while lin < total_work:
-                    tile_idx, m_tile, n_tile, k_base, k_tile_cnt, is_tail, _ = (
-                        self._work_item(
-                            lin,
-                            body_items,
-                            tail_splits,
-                            k_tiles_total,
-                            weight_tiles,
-                            act_tiles,
-                            group,
-                        )
-                    )
-                    for k in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                        ab_pipeline.producer_acquire(producer_state)
-                        cute.copy(
-                            tma_atom_a,
-                            tAgA[(None, m_tile, k_base + k, 0)],
-                            tAsA[(None, producer_state.index)],
-                            tma_bar_ptr=ab_pipeline.producer_get_barrier(
-                                producer_state
-                            ),
-                        )
-                        cute.copy(
-                            tma_atom_b,
-                            tBgB[(None, n_tile, k_base + k, 0)],
-                            tBsB[(None, producer_state.index)],
-                            tma_bar_ptr=ab_pipeline.producer_get_barrier(
-                                producer_state
-                            ),
-                        )
-                        ab_pipeline.producer_commit(producer_state)
-                        producer_state.advance()
-                    lin += gdx
-                ab_pipeline.producer_tail(producer_state)
 
         # ---- consumer warpgroups: register-sourced wgmma mainloop, fused epilogue.
         if warp_group_idx >= self.num_dma_warp_groups:
             cute.arch.setmaxregister_increase(self.mma_register_requirement)
+            consumer_args = (
+                tiled_mma,
+                ab_pipeline,
+                order_bar,
+                sA,
+                storage.sA.data_ptr(),
+                a_smem_layout_staged,
+                sB,
+                sC,
+                sW,
+                sBias,
+                tma_atom_c,
+                gC_mnl,
+                tma_atom_w,
+                gW_mnl,
+                wv,
+                cv,
+                bv,
+                counters,
+                scale,
+                bias,
+                weight_rows,
+                act_rows,
+                weight_tiles,
+                act_tiles,
+                k_tiles_total,
+                body_items,
+                tail_splits,
+                total_work,
+                group,
+            )
             if cutlass.const_expr(self.pingpong):
+                # Ping-pong: each consumer warpgroup is its own group (0 or 1).
                 if warp_group_idx == self.num_dma_warp_groups:
-                    self._consumer(
-                        0,
-                        cutlass.Int32(0),
-                        tiled_mma,
-                        ab_pipeline,
-                        order_bar,
-                        sA,
-                        storage.sA.data_ptr(),
-                        a_smem_layout_staged,
-                        sB,
-                        sC,
-                        sW,
-                        sBias,
-                        tma_atom_c,
-                        gC_mnl,
-                        tma_atom_w,
-                        gW_mnl,
-                        wv,
-                        cv,
-                        bv,
-                        counters,
-                        scale,
-                        bias,
-                        weight_rows,
-                        act_rows,
-                        weight_tiles,
-                        act_tiles,
-                        k_tiles_total,
-                        body_items,
-                        tail_splits,
-                        total_work,
-                        group,
-                    )
+                    self._consumer(0, cutlass.Int32(0), *consumer_args)
                 else:
-                    self._consumer(
-                        1,
-                        cutlass.Int32(0),
-                        tiled_mma,
-                        ab_pipeline,
-                        order_bar,
-                        sA,
-                        storage.sA.data_ptr(),
-                        a_smem_layout_staged,
-                        sB,
-                        sC,
-                        sW,
-                        sBias,
-                        tma_atom_c,
-                        gC_mnl,
-                        tma_atom_w,
-                        gW_mnl,
-                        wv,
-                        cv,
-                        bv,
-                        counters,
-                        scale,
-                        bias,
-                        weight_rows,
-                        act_rows,
-                        weight_tiles,
-                        act_tiles,
-                        k_tiles_total,
-                        body_items,
-                        tail_splits,
-                        total_work,
-                        group,
-                    )
+                    self._consumer(1, cutlass.Int32(0), *consumer_args)
             else:
+                # Cooperative: both warpgroups form group 0, each with its MMA slice.
                 self._consumer(
                     0,
                     (warp_group_idx - self.num_dma_warp_groups)
                     * self.num_threads_per_warp_group,
-                    tiled_mma,
-                    ab_pipeline,
-                    order_bar,
-                    sA,
-                    storage.sA.data_ptr(),
-                    a_smem_layout_staged,
-                    sB,
-                    sC,
-                    sW,
-                    sBias,
-                    tma_atom_c,
-                    gC_mnl,
-                    tma_atom_w,
-                    gW_mnl,
-                    wv,
-                    cv,
-                    bv,
-                    counters,
-                    scale,
-                    bias,
-                    weight_rows,
-                    act_rows,
-                    weight_tiles,
-                    act_tiles,
-                    k_tiles_total,
-                    body_items,
-                    tail_splits,
-                    total_work,
-                    group,
+                    *consumer_args,
                 )
+
+    # ------------------------------------------------------------- producer
+    @cute.jit
+    def _producer_warp(
+        self,
+        ab_pipeline: pipeline.PipelineTmaAsync,
+        tma_atom_a: cute.CopyAtom,
+        tAgA: cute.Tensor,
+        tAsA: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
+        tBgB: cute.Tensor,
+        tBsB: cute.Tensor,
+        body_items: cutlass.Int32,
+        tail_splits: cutlass.Int32,
+        k_tiles_total: cutlass.Int32,
+        weight_tiles: cutlass.Int32,
+        act_tiles: cutlass.Int32,
+        total_work: cutlass.Int32,
+        group: cutlass.Int32,
+    ):
+        """The TMA warp: for every work item of this CTA (bidx, bidx + grid, ...), the
+        weight and activation tiles of each of its k-tiles into one stage."""
+        bidx, _, _ = cute.arch.block_idx()
+        gdx, _, _ = cute.arch.grid_dim()
+        producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.ab_stage
+        )
+        lin = cutlass.Int32(bidx)
+        while lin < total_work:
+            _, m_tile, n_tile, k_base, k_tile_cnt, _, _ = self._work_item(
+                lin,
+                body_items,
+                tail_splits,
+                k_tiles_total,
+                weight_tiles,
+                act_tiles,
+                group,
+            )
+            for k in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                ab_pipeline.producer_acquire(producer_state)
+                cute.copy(
+                    tma_atom_a,
+                    tAgA[(None, m_tile, k_base + k, 0)],
+                    tAsA[(None, producer_state.index)],
+                    tma_bar_ptr=ab_pipeline.producer_get_barrier(producer_state),
+                )
+                cute.copy(
+                    tma_atom_b,
+                    tBgB[(None, n_tile, k_base + k, 0)],
+                    tBsB[(None, producer_state.index)],
+                    tma_bar_ptr=ab_pipeline.producer_get_barrier(producer_state),
+                )
+                ab_pipeline.producer_commit(producer_state)
+                producer_state.advance()
+            lin += gdx
+        ab_pipeline.producer_tail(producer_state)
 
     # ------------------------------------------------------------- consumer
     @cute.jit
@@ -716,7 +691,6 @@ class Sm90W8A16Fp8GemmKernel:
         # fp8 fragment of the same shape the smem copy fills.
         tCrA_mma = thr_mma.make_fragment_A(tCsA[(None, None, None, 0)])
         num_k_blocks = cute.size(tCrA_mma, mode=[2])
-        k_wait_max = min(num_k_blocks - 1, 7)
         # A fragment loads: the wgmma m64k16 A fragment of a thread is four 16-bit units
         # (two consecutive k of one row): rows r0 and r0 + 8, k offsets c0 and c0 + 8
         # within the k-block, r0 = warp * 16 + lane / 4 of its 64 rows, c0 = (lane % 4)
@@ -821,90 +795,19 @@ class Sm90W8A16Fp8GemmKernel:
                 cute.arch.mbarrier_wait(order_bar + cg, order_phase)
 
             # ---- mainloop
-            accumulators.fill(0.0)
-            tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
-            read_state.reset_count()
-            release_state.reset_count()
-
-            # First k-tile: no wgmma in flight, so no wait before the converts.  The
-            # stage index is taken before the state advances so the next stage's full
-            # barrier can be probed early (below); a tile's k-blocks all read `stage`.
-            ab_pipeline.consumer_wait(read_state)
-            stage = cutlass.Int32(read_state.index)
-            read_state.advance()
-            # Loads run two k-blocks ahead of the wgmma, converts one ahead, as the
-            # CUTLASS mainloop: the smem latency and the ALU work hide behind the
-            # tensor core.
-            stage_addr = a_smem_addr + stage * a_stage_bytes
-            a_words = {}
-            a_words[0] = self._a_loads(0, stage_addr, a_unit_off)
-            if cutlass.const_expr(num_k_blocks > 1):
-                a_words[1] = self._a_loads(1, stage_addr, a_unit_off)
-            self._a_convert(tCrA_mma, 0, a_words[0])
-            warpgroup.fence()
-            next_full = cutlass.Boolean(False)
-            for kb in cutlass.range_constexpr(num_k_blocks):
-                cute.gemm(
-                    tiled_mma,
-                    accumulators,
-                    tCrA_mma[(None, None, kb)],
-                    tCrB[(None, None, kb, stage)],
-                    accumulators,
-                )
-                warpgroup.commit_group()
-                if cutlass.const_expr(kb == 0):
-                    # Probe the next stage now; the wait at the top of the next
-                    # k-tile then blocks only if the probe failed (the CUTLASS
-                    # mainloop does the same: a cold try_wait costs ~100 cycles).
-                    # Only when a next k-tile exists: try_wait on a stage nobody
-                    # fills suspends the thread until the hardware time limit.
-                    if k_tile_cnt > 1:
-                        next_full = ab_pipeline.consumer_try_wait(read_state)
-                if cutlass.const_expr(kb + 2 < num_k_blocks):
-                    a_words[kb + 2] = self._a_loads(kb + 2, stage_addr, a_unit_off)
-                if cutlass.const_expr(kb + 1 < num_k_blocks):
-                    self._a_convert(tCrA_mma, kb + 1, a_words[kb + 1])
-            warpgroup.fence()
-
-            # Steady state: the wgmma of k-block kb issued, at most k_wait_max groups
-            # pending, then the previous stage is released at the last k-block (all
-            # its wgmma are done) and the registers of k-block kb + 1 are refilled
-            # (their reader, k-block kb + 1 of the previous k-tile, is done).
-            for _k_tile in cutlass.range(1, k_tile_cnt, 1, unroll=1):
-                ab_pipeline.consumer_wait(read_state, next_full)
-                stage = cutlass.Int32(read_state.index)
-                read_state.advance()
-                stage_addr_k = a_smem_addr + stage * a_stage_bytes
-                a_words_k = {}
-                a_words_k[0] = self._a_loads(0, stage_addr_k, a_unit_off)
-                if cutlass.const_expr(num_k_blocks > 1):
-                    a_words_k[1] = self._a_loads(1, stage_addr_k, a_unit_off)
-                warpgroup.wait_group(k_wait_max)
-                self._a_convert(tCrA_mma, 0, a_words_k[0])
-                warpgroup.fence()
-                for kb in cutlass.range_constexpr(num_k_blocks):
-                    cute.gemm(
-                        tiled_mma,
-                        accumulators,
-                        tCrA_mma[(None, None, kb)],
-                        tCrB[(None, None, kb, stage)],
-                        accumulators,
-                    )
-                    warpgroup.commit_group()
-                    warpgroup.wait_group(k_wait_max)
-                    if cutlass.const_expr(kb == 0):
-                        if _k_tile + 1 < k_tile_cnt:
-                            next_full = ab_pipeline.consumer_try_wait(read_state)
-                    if cutlass.const_expr(kb == num_k_blocks - 1):
-                        ab_pipeline.consumer_release(release_state)
-                        release_state.advance()
-                    if cutlass.const_expr(kb + 2 < num_k_blocks):
-                        a_words_k[kb + 2] = self._a_loads(
-                            kb + 2, stage_addr_k, a_unit_off
-                        )
-                    if cutlass.const_expr(kb + 1 < num_k_blocks):
-                        self._a_convert(tCrA_mma, kb + 1, a_words_k[kb + 1])
-                warpgroup.fence()
+            self._mainloop(
+                ab_pipeline,
+                read_state,
+                release_state,
+                tiled_mma,
+                accumulators,
+                tCrA_mma,
+                tCrB,
+                a_smem_addr,
+                a_stage_bytes,
+                a_unit_off,
+                k_tile_cnt,
+            )
             if cutlass.const_expr(self.pingpong):
                 # The other group's mainloop may start; this one drains behind it.
                 cute.arch.mbarrier_arrive(order_bar + (1 - cg))
@@ -1177,6 +1080,109 @@ class Sm90W8A16Fp8GemmKernel:
                 warp_idx,
                 epi_store_warp,
             )
+
+    @cute.jit
+    def _mainloop(
+        self,
+        ab_pipeline: pipeline.PipelineTmaAsync,
+        read_state: pipeline.PipelineState,
+        release_state: pipeline.PipelineState,
+        tiled_mma: cute.TiledMma,
+        accumulators: cute.Tensor,
+        tCrA_mma: cute.Tensor,
+        tCrB: cute.Tensor,
+        a_smem_addr: cutlass.Int32,
+        a_stage_bytes: cutlass.Constexpr,
+        a_unit_off: cutlass.Constexpr,
+        k_tile_cnt: cutlass.Int32,
+    ):
+        """One work item's k-tiles into ``accumulators``: per k-tile the fp8 weight
+        fragments are loaded from the stage and converted in registers while the
+        wgmma of the previous k-block runs; stages are released one behind."""
+        num_k_blocks = cute.size(tCrA_mma, mode=[2])
+        k_wait_max = min(num_k_blocks - 1, 7)
+        accumulators.fill(0.0)
+        tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+        read_state.reset_count()
+        release_state.reset_count()
+
+        # First k-tile: no wgmma in flight, so no wait before the converts.  The
+        # stage index is taken before the state advances so the next stage's full
+        # barrier can be probed early (below); a tile's k-blocks all read `stage`.
+        ab_pipeline.consumer_wait(read_state)
+        stage = cutlass.Int32(read_state.index)
+        read_state.advance()
+        # Loads run two k-blocks ahead of the wgmma, converts one ahead, as the
+        # CUTLASS mainloop: the smem latency and the ALU work hide behind the
+        # tensor core.
+        stage_addr = a_smem_addr + stage * a_stage_bytes
+        a_words = {}
+        a_words[0] = self._a_loads(0, stage_addr, a_unit_off)
+        if cutlass.const_expr(num_k_blocks > 1):
+            a_words[1] = self._a_loads(1, stage_addr, a_unit_off)
+        self._a_convert(tCrA_mma, 0, a_words[0])
+        warpgroup.fence()
+        next_full = cutlass.Boolean(False)
+        for kb in cutlass.range_constexpr(num_k_blocks):
+            cute.gemm(
+                tiled_mma,
+                accumulators,
+                tCrA_mma[(None, None, kb)],
+                tCrB[(None, None, kb, stage)],
+                accumulators,
+            )
+            warpgroup.commit_group()
+            if cutlass.const_expr(kb == 0):
+                # Probe the next stage now; the wait at the top of the next
+                # k-tile then blocks only if the probe failed (the CUTLASS
+                # mainloop does the same: a cold try_wait costs ~100 cycles).
+                # Only when a next k-tile exists: try_wait on a stage nobody
+                # fills suspends the thread until the hardware time limit.
+                if k_tile_cnt > 1:
+                    next_full = ab_pipeline.consumer_try_wait(read_state)
+            if cutlass.const_expr(kb + 2 < num_k_blocks):
+                a_words[kb + 2] = self._a_loads(kb + 2, stage_addr, a_unit_off)
+            if cutlass.const_expr(kb + 1 < num_k_blocks):
+                self._a_convert(tCrA_mma, kb + 1, a_words[kb + 1])
+        warpgroup.fence()
+
+        # Steady state: the wgmma of k-block kb issued, at most k_wait_max groups
+        # pending, then the previous stage is released at the last k-block (all
+        # its wgmma are done) and the registers of k-block kb + 1 are refilled
+        # (their reader, k-block kb + 1 of the previous k-tile, is done).
+        for _k_tile in cutlass.range(1, k_tile_cnt, 1, unroll=1):
+            ab_pipeline.consumer_wait(read_state, next_full)
+            stage = cutlass.Int32(read_state.index)
+            read_state.advance()
+            stage_addr_k = a_smem_addr + stage * a_stage_bytes
+            a_words_k = {}
+            a_words_k[0] = self._a_loads(0, stage_addr_k, a_unit_off)
+            if cutlass.const_expr(num_k_blocks > 1):
+                a_words_k[1] = self._a_loads(1, stage_addr_k, a_unit_off)
+            warpgroup.wait_group(k_wait_max)
+            self._a_convert(tCrA_mma, 0, a_words_k[0])
+            warpgroup.fence()
+            for kb in cutlass.range_constexpr(num_k_blocks):
+                cute.gemm(
+                    tiled_mma,
+                    accumulators,
+                    tCrA_mma[(None, None, kb)],
+                    tCrB[(None, None, kb, stage)],
+                    accumulators,
+                )
+                warpgroup.commit_group()
+                warpgroup.wait_group(k_wait_max)
+                if cutlass.const_expr(kb == 0):
+                    if _k_tile + 1 < k_tile_cnt:
+                        next_full = ab_pipeline.consumer_try_wait(read_state)
+                if cutlass.const_expr(kb == num_k_blocks - 1):
+                    ab_pipeline.consumer_release(release_state)
+                    release_state.advance()
+                if cutlass.const_expr(kb + 2 < num_k_blocks):
+                    a_words_k[kb + 2] = self._a_loads(kb + 2, stage_addr_k, a_unit_off)
+                if cutlass.const_expr(kb + 1 < num_k_blocks):
+                    self._a_convert(tCrA_mma, kb + 1, a_words_k[kb + 1])
+            warpgroup.fence()
 
     # ---------------------------------------------------------- tail fix-up
     @cute.jit

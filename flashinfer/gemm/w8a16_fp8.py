@@ -21,7 +21,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
-from . import w8a16_fp8_cute_dsl as _dsl
+from . import w8a16_fp8_dispatch as _dispatch
 
 
 def _resolve_device(device: Optional[torch.device]) -> torch.device:
@@ -93,7 +93,7 @@ def _w8a16_fp8_gemm_impl(
     workspace: Optional[torch.Tensor],
     algo: int,
 ) -> None:
-    _dsl.w8a16_fp8_gemm_cute_dsl(
+    _dispatch.launch_w8a16_fp8_gemm(
         act, weight, weight_scale, bias, out, algo, workspace=workspace
     )
 
@@ -117,7 +117,7 @@ def _workspace_bytes(m: int, n: int, k: int, device_index: int, algo: int) -> in
     partials of a split-K run, when the variant (forced or chosen) splits K."""
     device = torch.device("cuda", device_index)
     _check_arch(device)
-    return _dsl.w8a16_fp8_gemm_workspace_bytes(m, n, k, device, algo)
+    return _dispatch.w8a16_fp8_gemm_workspace_bytes(m, n, k, device, algo)
 
 
 def w8a16_fp8_gemm_workspace_bytes(
@@ -205,7 +205,7 @@ def _check_dims(m: int, n: int, k: int) -> None:
 
 
 # Blackwell kernel variants selectable through ``algo`` (``_SM100_TILES`` in
-# w8a16_fp8_cute_dsl.py).  The stream-K code runs the best of the other variants.
+# w8a16_fp8_dispatch.py).  The stream-K code runs the best of the other variants.
 W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
     "auto": 0,
     "2sm256x128": 1,
@@ -220,7 +220,7 @@ W8A16_FP8_GEMM_ALGOS_SM100: dict[str, int] = {
 
 # Hopper kernel variants selectable through ``algo`` (weight rows x activation rows per
 # CTA tile, plus the stream-K and split-K decompositions; ``_SM90_TILES`` in
-# w8a16_fp8_cute_dsl.py).  Code 1 is reserved.
+# w8a16_fp8_dispatch.py).  Code 1 is reserved.
 W8A16_FP8_GEMM_ALGOS_SM90: dict[str, int] = {
     "auto": 0,
     "128x256": 2,
