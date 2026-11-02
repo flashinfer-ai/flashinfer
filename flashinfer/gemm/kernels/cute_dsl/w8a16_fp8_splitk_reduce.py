@@ -59,9 +59,9 @@ class W8A16SplitKReduce:
     ):
         # The views are built here, in units of 8-element vectors, with every stride
         # spelled as 8 * (a vector count): the compiler then sees that each vector
-        # is 16-byte aligned and keeps the 16-byte loads and stores.  (A stride
-        # computed on the host arrives as an opaque integer and the second slice's
-        # loads came out as eight 4-byte loads.)
+        # is 16-byte aligned and keeps the 16-byte loads and stores.  A stride
+        # computed on the host would arrive as an opaque integer with no visible
+        # alignment, and the loads would fall back to narrower ones.
         partials = cute.make_tensor(
             partials_ptr,
             cute.make_layout(

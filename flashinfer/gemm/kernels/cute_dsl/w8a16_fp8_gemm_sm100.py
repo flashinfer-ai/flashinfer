@@ -55,8 +55,7 @@ def _fast_divmod_magic(d: cutlass.Int32, x_max: cutlass.Int32) -> cutlass.Int64:
     ceil(2^40 / d), with which x // d == (x * magic) >> 40 exactly whenever
     x * d < 2^40 (the rounding error is x * (magic * d - 2^40) / (d * 2^40), below
     one quotient step under that bound).  0 when the bound does not hold for every
-    dividend: ``_fast_divmod`` then divides exactly.  Work items and cluster counts
-    are far below 2^20 on any real problem; the admitted bounds reach beyond."""
+    dividend: ``_fast_divmod`` then divides exactly."""
     d64 = d.to(cutlass.Int64)
     magic = (cutlass.Int64(_FAST_DIVMOD_LIMIT) + d64 - 1) // d64
     if x_max.to(cutlass.Int64) * d64 >= _FAST_DIVMOD_LIMIT:
@@ -1163,7 +1162,7 @@ class Sm100W8A16Fp8GemmKernel:
                 )
                 # Tight poll (no suspend) until the stage is free: the MMA frees B
                 # stages one k-tile at a time and the reload must go out at once,
-                # or the MMA starves on B (measured 6-10% of its time).
+                # or the MMA starves on B.
                 while not b_stage_free:
                     b_stage_free = b_load2mma_pipeline.producer_try_acquire(
                         b_load2mma_producer_state

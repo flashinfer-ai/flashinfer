@@ -1351,9 +1351,10 @@ class Sm90W8A16Fp8GemmKernel:
         group: cutlass.Int32,
     ):
         """Work item ``lin`` -> (tile index, weight tile, activation tile, first k-tile,
-        k-tile count, is_tail).  Items below ``body_items`` are whole tiles; the tail
-        tiles follow as ``tail_splits`` consecutive items each (near-equal K-slices,
-        the first ``k_tiles % splits`` slices one k-tile longer)."""
+        k-tile count, is_tail, slice index).  Items below ``body_items`` are whole
+        tiles (slice index 0); the tail tiles follow as ``tail_splits`` consecutive
+        items each (near-equal K-slices, the first ``k_tiles % splits`` slices one
+        k-tile longer; the slice index is the item's position among them)."""
         tile_idx = lin
         slice_idx = cutlass.Int32(0)
         is_tail = lin >= body_items

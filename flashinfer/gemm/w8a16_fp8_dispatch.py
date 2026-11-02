@@ -400,7 +400,8 @@ def _get_reduce_kernel(
     stream,
 ):
     """The split-K reduce (sum of slices, scale, bias, cast), compiled once per
-    activation dtype, bias presence and slice count."""
+    specialization: the compile target, the activation dtype, bias presence, the
+    slice count and the pointer alignments / dtypes of ``pointer_specs``."""
     import cutlass.cute as cute
 
     from .kernels.cute_dsl.w8a16_fp8_splitk_reduce import W8A16SplitKReduce
@@ -439,8 +440,10 @@ def _max_active_clusters(device_index: int, cluster_size: int) -> int:
     (the persistent grid size), asked of the DSL's occupancy probe for that device.
     Per device: the shared helper of ``flashinfer.cute_dsl.utils`` probes device 0 and
     caches by cluster size alone.  Falls back to one CTA per SM when the probe fails
-    (a spawned process without a current driver context, say): the kernel's CTAs
-    never wait on one another, so a grid beyond the resident capacity only serializes."""
+    (a spawned process without a current driver context, say).  The fallback is
+    safe because clusters are independent of one another: the CTAs of a 2SM
+    cluster do synchronize among themselves, but no cluster waits on another, so
+    a grid beyond the resident capacity only has whole clusters run in turn."""
     import cutlass.utils
 
     try:
@@ -529,8 +532,10 @@ def launch_w8a16_fp8_gemm(
     """Launch the W8A16 GEMM (``out = act @ dequant(weight).T + bias``) on
     validated 2-D tensors: ``act`` [M, K] fp16 / bf16, ``weight`` [N, K] e4m3,
     ``weight_scale`` one fp32, ``bias`` [N] or None, ``out`` [M, N], all
-    contiguous and 16-byte aligned on one Hopper or Blackwell device (the public
-    :func:`flashinfer.gemm.w8a16_fp8_gemm` checks that).  ``algo``: a code of the
+    contiguous and on one Hopper or Blackwell device; ``act``, ``weight``,
+    ``bias``, ``out`` and ``workspace`` 16-byte aligned, ``weight_scale`` only
+    4-byte aligned (a one-element view at any fp32 offset is fine; the public
+    :func:`flashinfer.gemm.w8a16_fp8_gemm` checks all of that).  ``algo``: a code of the
     architecture's table (0 = the model's choice).  ``workspace``: a buffer of at
     least :func:`w8a16_fp8_gemm_workspace_bytes` bytes; None only when that is 0.
     The public op owns allocation; this layer never allocates."""

@@ -115,8 +115,10 @@ def convert_e4m3_fragment(
     ip=None,
 ) -> cute.TensorSSA:
     """Convert a fragment of e4m3 bytes (``Uint8`` SSA, a multiple of 4 long) to
-    ``mma_dtype`` values in the same order.  ``native_cvt=False`` forces the ALU bf16
-    path (``cvt.rn.bf16x2.e4m3x2`` is sm_100+; the Hopper kernel passes it)."""
+    ``mma_dtype`` values in the same order.  ``native_cvt=False`` forces the ALU
+    bf16 path: the native ``cvt.rn.bf16x2.e4m3x2`` exists on sm_100+ only, so a
+    kernel compiled for Hopper must pass False for bf16 (fp16 converts natively on
+    both).  The Blackwell kernel is the caller of this fragment form."""
     count = cute.size(packed_fragment.shape)
     assert count % 4 == 0, "e4m3 fragments convert four bytes (one word) at a time"
     num_words = count // 4
@@ -213,7 +215,9 @@ def convert_e4m3_words(
     ip=None,
 ) -> cute.TensorSSA:
     """Convert e4m3 pairs held zero-extended in 32-bit registers (``Uint32`` each, from
-    ``load_e4m3_unit``) to ``mma_dtype``; ``2 * len(words)`` values in order."""
+    ``load_e4m3_unit``) to ``mma_dtype``; ``2 * len(words)`` values in order.
+    ``native_cvt`` as in :func:`convert_e4m3_fragment`: the Hopper kernel, the
+    caller of this word form, passes False since its bf16 ``cvt`` is sm_100+."""
     asm = _asm_for_pair(mma_dtype, native_cvt)
     out_words: list[ir.Value] = []
     for w in words:

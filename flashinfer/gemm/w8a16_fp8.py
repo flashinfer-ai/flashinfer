@@ -355,8 +355,9 @@ def w8a16_fp8_gemm(
         key of ``W8A16_FP8_GEMM_ALGOS_SM100`` on Blackwell or of
         ``W8A16_FP8_GEMM_ALGOS_SM90`` on Hopper
         (``<weight rows>x<activation rows>[_streamk|_splitk]``).
-        ``None`` / ``"auto"`` = the launcher decides.  This is the only
-        override; there are no environment variables.  A plain name runs
+        ``None`` / ``"auto"`` = the launcher decides.  This is the only way
+        to override the algorithm choice; no environment variable does (the
+        JIT / cache variables under Notes do not affect selection).  A plain name runs
         every output tile whole on that tile shape.  A ``_splitk`` name cuts
         the tiles into K-slices (fp32 partials in the workspace); it is
         rejected with a ValueError on a ``K`` it cannot slice (Hopper: ``K``
@@ -378,11 +379,11 @@ def w8a16_fp8_gemm(
     -----
     Runs on Hopper (``sm_90a``) and Blackwell (``sm_100a`` / ``sm_103a``);
     ``w8a16_fp8_gemm.is_compute_capability_supported(cc)`` answers for a
-    device.  The kernels are CuTe-DSL, compiled on first use per architecture,
-    tile variant, activation dtype and bias presence, and are not part of the
-    AOT packages.  Compiled kernels are cached on disk under the JIT workspace
-    like every CuTe-DSL kernel, so a later process reloads instead of
-    recompiling; ``FLASHINFER_DISABLE_JIT`` and
+    device.  The kernels are CuTe-DSL, compiled on first use of each kernel
+    variant a call resolves to (so the first call of a new configuration is
+    slow), and are not part of the AOT packages.  Compiled kernels are cached
+    on disk under the JIT workspace like every CuTe-DSL kernel, so a later
+    process reloads instead of recompiling; ``FLASHINFER_DISABLE_JIT`` and
     ``FLASHINFER_CUTE_DSL_DISABLE_CACHE`` apply.
 
     Shapes and layout: ``K`` must be a multiple of 16 and ``N`` a multiple of
