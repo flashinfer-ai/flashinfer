@@ -251,8 +251,14 @@ def _launch(case, **public_kwargs):
 def _public_route(case):
     """The frozen route the public adapter resolves for ``case`` on the live arch."""
 
+    return cake_gdn.select_cake_gdn_prefill_variant(**_public_route_kwargs(case))
+
+
+def _public_route_kwargs(case):
+    """The resolver arguments of ``_public_route`` (no host lengths)."""
+
     major, minor = torch.cuda.get_device_capability(case["q"].device)
-    return cake_gdn.select_cake_gdn_prefill_variant(
+    return dict(
         arch=cake_gdn.arch_for_compute_capability(major, minor),
         io_dtype={torch.bfloat16: "bfloat16", torch.float16: "float16"}[
             case["q"].dtype
@@ -702,6 +708,68 @@ def test_public_cake_gdn_prefill_fp32_state_short_tiles_match_independent_recurr
     torch.testing.assert_close(
         state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
     )
+
+
+def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_matches_independent_recurrence(
+    monkeypatch,
+):
+    # A ragged FP32-state batch over the DV-split tile budget (2 * 16 * 16 = 512 half
+    # tiles on 212 SMs) whose critical path is its long first sequence: with
+    # ``cu_seqlens_cpu`` sm_107a runs the DV-split body with one CTA per half tile (a
+    # grid above the SM count); without it, the full-DV body on the grid rule's grid.
+    # Both match the reference recurrence and repeat bitwise.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the ragged DV-split route is sm_107a only")
+    seq_lens = (4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1, 1)
+    case = _make_case(seq_lens=seq_lens, num_q_heads=8, num_k_heads=8, num_v_heads=16)
+    initial_state = case["initial_state"].clone()
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    unrouted = _public_route(case)
+    assert unrouted.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+    assert unrouted.one_cta_per_tile is False
+    routed = cake_gdn.select_cake_gdn_prefill_variant(
+        **_public_route_kwargs(case), host_seq_lens=seq_lens
+    )
+    assert routed.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert routed.one_cta_per_tile is True
+    assert "_dvsplit_initial_sm107a_l7_vec2_" in routed.variant_name
+    # The launched grid, observed where the launch sizes its per-CTA workspace.
+    grids = []
+    workspace = prefill_mod._cake_gdn_tensormap_workspace
+
+    def recording(device_index, stream, grid_x):
+        grids.append(grid_x)
+        return workspace(device_index, stream, grid_x)
+
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_tensormap_workspace", recording)
+    sm_count = torch.cuda.get_device_properties(case["q"].device).multi_processor_count
+    full_dv_tiles = len(seq_lens) * 16
+    full_dv_grid = cake_gdn._cake_gdn_prefill_grid_x(
+        full_dv_tiles, sm_count, False, sum(seq_lens)
+    )
+    assert full_dv_grid <= sm_count < 2 * full_dv_tiles
+    for host_copy, expected_grid in (
+        ({"cu_seqlens_cpu": _host_cu_seqlens(seq_lens)}, 2 * full_dv_tiles),
+        ({}, full_dv_grid),
+    ):
+        runs = []
+        grids.clear()
+        for _ in range(2):
+            case["output"].fill_(float("nan"))
+            case["output_state"].copy_(initial_state)
+            out, state = _launch(case, **host_copy)
+            torch.cuda.synchronize()
+            runs.append((out.clone(), state.clone()))
+        torch.testing.assert_close(
+            runs[0][0].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            runs[0][1].float(), expected_state.float(), atol=1e-2, rtol=1e-2
+        )
+        assert torch.equal(runs[0][0], runs[1][0])
+        assert torch.equal(runs[0][1], runs[1][1])
+        assert grids == [expected_grid, expected_grid]
 
 
 def _carry_segment(case, start, stop, initial_state):

@@ -645,6 +645,63 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
+    "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap",
+        "kernel_symbol": "kernel_cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 114944,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "tk_nsx_g2_ol2l_ct_ef_cap",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": {
         "arches": [
             "sm_100a",
@@ -7224,6 +7281,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk",
             "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3",
             "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
+            "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap",
             "cake_mhc_det_train_fwd_coef__st16_w4_tree",
             "cake_mhc_det_train_fwd_coef__qe_mb10_tree",
             "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
@@ -7242,6 +7300,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk",
             "cake_mhc_det_train_fwd_map__nsx_g2_ol2l__a3",
             "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
+            "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap",
             "cake_mhc_det_train_fwd_coef__st16_w4_tree",
             "cake_mhc_det_train_fwd_coef__qe_mb10_tree",
             "cake_mhc_det_train_fwd_coef__st16_lp2_as_el_qd",
@@ -7869,27 +7928,39 @@ FWD_MAP_FIT = {
     "sm_103a": ("nsx", "nsx_st5_mb1"),
     "sm_107a": ("nsx_g2_ol2l", "nsx_st5_mb1"),
 }
-# FWD_MAP_CLAIM: (program, ticket form, tail form) per architecture -- the schedule of the routed program by the K units
-# per CTA, u = units / grid of k1_units. The ticket form (schedule="ticket" with the control records at the tail of
-# the ring; bitwise the program) claims each next K unit from the self-resetting ticket word, so when a concurrent
-# kernel holds SMs the CTAs that start late take only the units left. It runs where u >= 4: unloaded 0.9937-1.0031 of
-# the program in two sessions on two nodes per board (GB300, GB200, B200), and the forward path at 1.003-1.073 x its
-# unloaded time with SMs held by a side kernel or an NCCL replica, where the program reads 1.158-1.291 x. Where
-# 3 <= u < 4 the static schedule already gives every CTA 3 or 4 units and the claim costs up to 1.8 %; where u <= 1
-# every CTA owns one unit and the claim balances nothing (1.0057-1.0102). There the program runs, or at u <= 1 its
-# tail form where one exists (the static schedule with the control records at the tail, bitwise; sm_103a T 4096:
-# 1.0011 / 0.9988 of the program, 1.11 x vs 1.29 x its unloaded time with one side CTA per SM; sm_100a
-# ns96_g2_ol2l_ct, T 4096 on 148 SMs: 1.0000 / 0.9993 of the program, the mapping pass 1.01 x vs 1.43 x its
-# unloaded time with one side CTA per SM; nsx_g2_ol2l has no tail form: no sm_100a row with u <= 1 was measured
-# on it). sm_107a has no 216-SM timing session and is not routed.
+# FWD_MAP_CLAIM: (program, ticket form, tail form, cap form) per architecture -- the schedule of the routed program by
+# the K units per CTA, u = units / grid of k1_units. The ticket form (schedule="ticket" with the control records at the
+# tail of the ring; bitwise the program) claims each next K unit from the self-resetting ticket word, so when a
+# concurrent kernel holds SMs the CTAs that start late take only the units left. It runs where u >= 4: unloaded
+# 0.9937-1.0031 of the program in two sessions on two nodes per board (GB300, GB200, B200), and the forward path at
+# 1.003-1.073 x its unloaded time with SMs held by a side kernel or an NCCL replica, where the program reads
+# 1.158-1.291 x. Where 3 <= u < 4 the static schedule already gives every CTA 3 or 4 units and the claim costs up to
+# 1.8 %; where u <= 1 every CTA owns one unit and the claim balances nothing (1.0057-1.0102). There the program runs, or
+# at u <= 1 its tail form where one exists (the static schedule with the control records at the tail, bitwise; sm_103a T
+# 4096: 1.0011 / 0.9988 of the program, 1.11 x vs 1.29 x its unloaded time with one side CTA per SM; sm_100a
+# ns96_g2_ol2l_ct, T 4096 on 148 SMs: 1.0000 / 0.9993 of the program, the mapping pass 1.01 x vs 1.43 x its unloaded
+# time with one side CTA per SM; on 152 SMs at T 3585-4864 (u <= 1) 0.9967-1.0021 of the program in four GB200 sessions
+# and within +0.0051 of it with SMs held, except one session's +0.0118 at 4864 with 16 SMs held, which two more sessions
+# at 4736-4864 with 8 repeats did not reproduce; nsx_g2_ol2l has no tail form: no sm_100a row with u <= 1 was measured
+# on it). The cap form of sm_100a nsx_g2_ol2l (the ticket form with the first draw issued at kernel entry,
+# first_draw="early", and a per-SM cap, claim="cap": while every CTA of the grid has started, an SM claims a next unit
+# only below ceil(units / SMs), the static schedule's most per SM; once a CTA has not started the cap lifts and the last
+# CTA to exit takes what is left; bitwise the program) runs where P_K = 8, 3 <= u < 4 and the cap leaves at least
+# ceil(SMs / 8) claim seats free (slack = SMs x ceil(units / SMs) - units): GB200 (152 SMs) T 14928 / 15288 / 16263
+# unloaded 0.9982 / 0.9987 / 1.0008 of the program, and forward_prepare with 16 x 640 side CTAs 1.004-1.007 x its
+# unloaded time where the program reads 1.163-1.172 x. With less slack fewer than one SM in eight can take a unit beyond
+# the static share and the claim cost buys no placement (14592 on 152 SMs, slack 0: 1.0121): the program. At P_K = 16
+# (8193-8448 on 152 SMs) the pass is about 113 us with half-size units, so the cap's fixed per-claim cost weighs twice
+# as much (8193 / 8320 / 8448: 1.0114 / 1.0064 / 1.0131): the program. sm_107a has no 216-SM timing session and is not
+# routed.
 FWD_MAP_CLAIM = {
     "sm_100a": (
-        ("ns96_g2_ol2l", "tk_ns96_g2_ol2l_ct", "ns96_g2_ol2l_ct"),
-        ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None),
+        ("ns96_g2_ol2l", "tk_ns96_g2_ol2l_ct", "ns96_g2_ol2l_ct", None),
+        ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None, "tk_nsx_g2_ol2l_ct_ef_cap"),
     ),
     "sm_103a": (
-        ("nsx", "tk_nsx_ct", "nsx_ct"),
-        ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None),
+        ("nsx", "tk_nsx_ct", "nsx_ct", None),
+        ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None, None),
     ),
     "sm_107a": (),
 }
@@ -8505,16 +8576,23 @@ def fwd_map_program(
     for above, at_most, band in _tab("FWD_MAP_BANDS", hidden)[arch]:
         if above < T and (at_most is None or at_most >= T):
             program = band
-    _, units, grid = k1_units(T, sm_count, arch, hidden)
+    pk, units, grid = k1_units(T, sm_count, arch, hidden)
     fit = _tab("FWD_MAP_FIT", hidden)[arch]
     if fit is not None and program == fit[0] and units <= sm_count:
         program = fit[1]
-    for base, ticket, tail in _tab("FWD_MAP_CLAIM", hidden)[
+    for base, ticket, tail, cap in _tab("FWD_MAP_CLAIM", hidden)[
         arch
-    ]:  # the schedule by units per CTA (u = units / grid)
+    ]:  # the schedule by u = units / grid
         if program == base:
             if ticket is not None and units >= 4 * grid:
                 program = ticket
+            elif (
+                cap is not None
+                and pk == 8
+                and units >= 3 * grid
+                and -units % sm_count >= -(-sm_count // 8)
+            ):
+                program = cap
             elif tail is not None and units <= grid:
                 program = tail
     return program

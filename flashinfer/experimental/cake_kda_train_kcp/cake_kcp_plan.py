@@ -3015,6 +3015,7 @@ def kda_workspace_bytes_kcp(
     C: int = 8192,
     local_arena: str | None = None,
     lean_passes: int | None = None,
+    use_gate_in_kernel: bool = False,
 ) -> int:
     """Caller-held workspace bytes of one rank: the local arena for ``(T_r, n_frag, H)`` (zero on a rank without
     tokens; the existing backend's arena, ``kda_train_workspace_bytes``, or for a backward workspace under
@@ -3036,7 +3037,15 @@ def kda_workspace_bytes_kcp(
     ``reserve`` binds it), and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
     ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context.
     ``lean_passes``: the tail passes a lean arena is sized for (``WorkspaceKcp(lean_passes=...)``; ``None``:
-    :data:`LEAN_PASSES_DEFAULT`)."""
+    :data:`LEAN_PASSES_DEFAULT`).  ``use_gate_in_kernel``: ``False`` only (the explicit gate, this package's mode);
+    ``True``, the raw gate mode of the deterministic package's ``kda_det_workspace_bytes_kcp``, raises
+    ``ValueError``."""
+    if use_gate_in_kernel is not False:
+        raise ValueError(
+            f"kda_workspace_bytes_kcp: use_gate_in_kernel={use_gate_in_kernel!r}: the raw gate mode runs on the "
+            "deterministic package only (kda_det_workspace_bytes_kcp, or flashinfer.cake_kda_train_kcp."
+            "kda_workspace_bytes_kcp with deterministic=True)"
+        )
     _check_save_mode(save_mode)
     check_lean_passes(lean_passes)
     lean = (

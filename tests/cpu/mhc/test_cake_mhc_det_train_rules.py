@@ -102,6 +102,7 @@ MAP_LIBRARY = {
     "ns96_g2_ol2l_ct": "cake_mhc_det_train_fwd_map__ns96_g2_ol2l_ct",
     "nsx_ct": "cake_mhc_det_train_fwd_map__nsx_ct",
     "tk_nsx_g2_ol2l_ct": "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct",
+    "tk_nsx_g2_ol2l_ct_ef_cap": "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap",
     # nsx's ticket form is not exported: where the rule names it (no SM count of record) its __tk record runs nsx
     "tk_nsx_ct": "cake_mhc_det_train_fwd_map__nsx",
     # likewise ns96_g2_ol2l's ticket form (sm_100a): its __tk record runs ns96_g2_ol2l
@@ -250,6 +251,7 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap": ("sm_100a",),
 }
 # Libraries launched under several records (one record per selection rule, in registry order).
 MULTI_RECORDS = {
@@ -339,12 +341,12 @@ TABLES = {
     },
     "FWD_MAP_CLAIM": {
         "sm_100a": (
-            ("ns96_g2_ol2l", "tk_ns96_g2_ol2l_ct", "ns96_g2_ol2l_ct"),
-            ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None),
+            ("ns96_g2_ol2l", "tk_ns96_g2_ol2l_ct", "ns96_g2_ol2l_ct", None),
+            ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None, "tk_nsx_g2_ol2l_ct_ef_cap"),
         ),
         "sm_103a": (
-            ("nsx", "tk_nsx_ct", "nsx_ct"),
-            ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None),
+            ("nsx", "tk_nsx_ct", "nsx_ct", None),
+            ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None, None),
         ),
         "sm_107a": (),
     },
@@ -825,67 +827,67 @@ DISPATCH_EXPECTED = (
     (14208, 'sm_103a', 152, 16, 1776, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 48, 'dot_ao8', 'dynr', 'pt32', 3099),
     (14208, 'sm_107a', 208, 16, 1776, 'nsx_g2_ol2l', 'g2_el', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411),
     (14208, 'sm_107a', 216, 16, 1776, 'nsx_g2_ol2l', 'g2_el', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (14209, 'sm_100a', 148, 8, 896, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr', 'dynr', 'wpu4_fadd', 411),
+    (14209, 'sm_100a', 148, 8, 896, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr', 'dynr', 'wpu4_fadd', 411),
     (14209, 'sm_103a', 152, 16, 1792, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 48, 'dot_ao8', 'dynr', 'pt32', 3099),
     (14209, 'sm_107a', 208, 16, 1792, 'nsx_g2_ol2l', 'g2_el', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411),
     (14209, 'sm_107a', 216, 16, 1792, 'nsx_g2_ol2l', 'g2_el', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (14592, 'sm_100a', 148, 8, 912, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (14592, 'sm_100a', 148, 8, 912, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr', 'dynr', 'wpu4_spred', 411),
     (14592, 'sm_103a', 152, 16, 1824, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 48, 'dot_ao8', 'dynr', 'pt32', 3099),
     (14592, 'sm_107a', 208, 16, 1824, 'nsx_g2_ol2l', 'g2_el', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (14592, 'sm_107a', 216, 16, 1824, 'nsx_g2_ol2l', 'g2_el', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (14593, 'sm_100a', 148, 8, 920, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr', 'dynr', 'wpu4_spred', 411),
+    (14593, 'sm_100a', 148, 8, 920, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr', 'dynr', 'wpu4_spred', 411),
     (14593, 'sm_103a', 152, 16, 1840, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr', 'dynr', 'pt32', 3099),
     (14593, 'sm_107a', 208, 16, 1840, 'nsx_g2_ol2l', 'g2_el', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (14593, 'sm_107a', 216, 16, 1840, 'nsx_g2_ol2l', 'g2_el', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (14928, 'sm_100a', 148, 8, 936, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (14928, 'sm_100a', 148, 8, 936, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (14928, 'sm_103a', 152, 16, 1872, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (14928, 'sm_107a', 208, 16, 1872, 'nsx_g2_ol2l', 'g2_el', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (14928, 'sm_107a', 216, 16, 1872, 'nsx_g2_ol2l', 'g2_el', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (15288, 'sm_100a', 148, 8, 960, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_fadd_trows', 411),
+    (15288, 'sm_100a', 148, 8, 960, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_fadd_trows', 411),
     (15288, 'sm_103a', 152, 16, 1920, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (15288, 'sm_107a', 208, 8, 960, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411),
     (15288, 'sm_107a', 216, 16, 1920, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (15392, 'sm_100a', 148, 8, 968, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (15392, 'sm_100a', 148, 8, 968, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (15392, 'sm_103a', 152, 16, 1936, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (15392, 'sm_107a', 208, 8, 968, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (15392, 'sm_107a', 216, 16, 1936, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411),
-    (15393, 'sm_100a', 148, 8, 968, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (15393, 'sm_100a', 148, 8, 968, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (15393, 'sm_103a', 152, 16, 1936, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (15393, 'sm_107a', 208, 8, 968, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (15393, 'sm_107a', 216, 16, 1936, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411),
-    (15566, 'sm_100a', 148, 8, 976, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (15566, 'sm_100a', 148, 8, 976, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (15566, 'sm_103a', 152, 16, 1952, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (15566, 'sm_107a', 208, 8, 976, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (15566, 'sm_107a', 216, 8, 976, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (15590, 'sm_100a', 148, 8, 976, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (15590, 'sm_100a', 148, 8, 976, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (15590, 'sm_103a', 152, 16, 1952, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (15590, 'sm_107a', 208, 8, 976, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (15590, 'sm_107a', 216, 8, 976, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (15808, 'sm_100a', 148, 8, 992, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (15808, 'sm_100a', 148, 8, 992, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (15808, 'sm_103a', 152, 16, 1984, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (15808, 'sm_107a', 208, 8, 992, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (15808, 'sm_107a', 216, 8, 992, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (15809, 'sm_100a', 148, 8, 992, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (15809, 'sm_100a', 148, 8, 992, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (15809, 'sm_103a', 152, 16, 1984, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (15809, 'sm_107a', 208, 8, 992, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (15809, 'sm_107a', 216, 8, 992, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (15984, 'sm_100a', 148, 8, 1000, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (15984, 'sm_100a', 148, 8, 1000, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (15984, 'sm_103a', 152, 16, 2000, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (15984, 'sm_107a', 208, 8, 1000, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (15984, 'sm_107a', 216, 8, 1000, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (15985, 'sm_100a', 148, 8, 1000, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (15985, 'sm_100a', 148, 8, 1000, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (15985, 'sm_103a', 152, 16, 2000, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (15985, 'sm_107a', 208, 8, 1000, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (15985, 'sm_107a', 216, 8, 1000, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (16114, 'sm_100a', 148, 8, 1008, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (16114, 'sm_100a', 148, 8, 1008, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (16114, 'sm_103a', 152, 16, 2016, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (16114, 'sm_107a', 208, 8, 1008, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (16114, 'sm_107a', 216, 8, 1008, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (16132, 'sm_100a', 148, 8, 1016, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (16132, 'sm_100a', 148, 8, 1016, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (16132, 'sm_103a', 152, 16, 2032, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (16132, 'sm_107a', 208, 8, 1016, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (16132, 'sm_107a', 216, 8, 1016, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (16164, 'sm_100a', 148, 8, 1016, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (16164, 'sm_100a', 148, 8, 1016, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (16164, 'sm_103a', 152, 16, 2032, 'tk_nsx_g2_ol2l_ct', 'st16_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (16164, 'sm_107a', 208, 8, 1016, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (16164, 'sm_107a', 216, 8, 1016, 'nsx_g2_ol2l', 'qe_mb10_tree', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
@@ -909,35 +911,35 @@ DISPATCH_EXPECTED = (
     (16417, 'sm_103a', 152, 8, 1032, 'nsx_g2_ol2l', 'st8_lp2', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (16417, 'sm_107a', 208, 8, 1032, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (16417, 'sm_107a', 216, 8, 1032, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (16576, 'sm_100a', 148, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (16576, 'sm_100a', 148, 8, 1040, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2_as_el_qd', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (16576, 'sm_103a', 152, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (16576, 'sm_107a', 208, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (16576, 'sm_107a', 216, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (16577, 'sm_100a', 148, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (16577, 'sm_100a', 148, 8, 1040, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (16577, 'sm_103a', 152, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (16577, 'sm_107a', 208, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (16577, 'sm_107a', 216, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (16640, 'sm_100a', 148, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (16640, 'sm_100a', 148, 8, 1040, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (16640, 'sm_103a', 152, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (16640, 'sm_107a', 208, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (16640, 'sm_107a', 216, 8, 1040, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (16641, 'sm_100a', 148, 8, 1048, 'nsx_g2_ol2l', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (16641, 'sm_100a', 148, 8, 1048, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (16641, 'sm_103a', 152, 8, 1048, 'nsx_g2_ol2l', 'st8_lp2', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (16641, 'sm_107a', 208, 16, 2096, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 48, 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411),
     (16641, 'sm_107a', 216, 8, 1048, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (17024, 'sm_100a', 148, 8, 1064, 'nsx_g2_ol2l', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (17024, 'sm_100a', 148, 8, 1064, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (17024, 'sm_103a', 152, 8, 1064, 'nsx_g2_ol2l', 'st8_lp2', 56, 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (17024, 'sm_107a', 208, 16, 2128, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 48, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (17024, 'sm_107a', 216, 8, 1064, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (17025, 'sm_100a', 148, 8, 1072, 'nsx_g2_ol2l', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (17025, 'sm_100a', 148, 8, 1072, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (17025, 'sm_103a', 152, 8, 1072, 'nsx_g2_ol2l', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (17025, 'sm_107a', 208, 16, 2144, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 48, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (17025, 'sm_107a', 216, 8, 1072, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (17280, 'sm_100a', 148, 8, 1080, 'nsx_g2_ol2l', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
+    (17280, 'sm_100a', 148, 8, 1080, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_spred_trows', 411),
     (17280, 'sm_103a', 152, 8, 1080, 'nsx_g2_ol2l', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (17280, 'sm_107a', 208, 16, 2160, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 48, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (17280, 'sm_107a', 216, 8, 1080, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 40, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
-    (17281, 'sm_100a', 148, 8, 1088, 'nsx_g2_ol2l', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_fadd_trows', 411),
+    (17281, 'sm_100a', 148, 8, 1088, 'tk_nsx_g2_ol2l_ct_ef_cap', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'wpu4_fadd_trows', 411),
     (17281, 'sm_103a', 152, 8, 1088, 'nsx_g2_ol2l', 'st8_lp2', 64, 'dot_ao8_trows_dyn', 'dynr', 'pt32_trows', 3099),
     (17281, 'sm_107a', 208, 16, 2176, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 48, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
     (17281, 'sm_107a', 216, 16, 2176, 'nsx_g2_ol2l', 'st8_lp2_tree_asel_qd', 48, 'dot_ao8_l2l', 'xrsg', 'wpu4', 411),
@@ -1122,31 +1124,31 @@ RULES_ROWS = (
     (8192, 152, 'sm_103a', 8192, True, 16, 1024, 304, 7, 448, 152, 1216, 304, 32, 512, 608, 16384, 4096, 8192, 16253184, 16554240, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao22_rae7_pd1_ntr', 'dynr', 'pt32', 3099, 't128', 'production'),
     (8192, 208, 'sm_107a', 8192, True, 16, 1024, 416, 13, 832, 208, 640, 416, 24, 512, 832, 16384, 8192, 8192, 16253184, 26005760, 'b16', 'tv128_t128', 256, 512, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (8192, 216, 'sm_107a', 8192, True, 16, 1024, 432, 10, 640, 216, 832, 432, 24, 512, 864, 16384, 8192, 8192, 16253184, 21289216, 'b16', 'tv128_t128', 256, 512, 'st16_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao22_rae7_pd1_ntr', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (14928, 148, 'sm_100a', 14976, True, 8, 936, 296, 9, 576, 148, 1664, 296, 56, 933, 592, 29856, 7464, 7464, 15126784, 22032896, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
+    (14928, 148, 'sm_100a', 14976, True, 8, 936, 296, 9, 576, 148, 1664, 296, 56, 933, 592, 29856, 7464, 7464, 15126784, 22032896, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct_ef_cap', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
     (14928, 152, 'sm_103a', 14976, True, 16, 1872, 304, 7, 448, 152, 2176, 304, 56, 933, 608, 29856, 7464, 7464, 27107584, 18887168, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099, 'production', 'production'),
     (14928, 208, 'sm_107a', 14976, True, 16, 1872, 416, 13, 832, 208, 1152, 416, 40, 933, 832, 29856, 14928, 14928, 27107584, 27959552, 'b16', 'tv128_t128', 256, 512, 'g2_el', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (14928, 216, 'sm_107a', 14976, True, 16, 1872, 432, 10, 640, 216, 1536, 432, 40, 933, 864, 29856, 14928, 14928, 27107584, 23243008, 'b16', 'tv128_t128', 256, 512, 'g2_el', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (15288, 148, 'sm_100a', 15360, True, 8, 960, 296, 16, 1024, 148, 960, 296, 56, 956, 592, 30576, 7644, 7644, 15433984, 33163776, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_fadd_trows', 411, 'production', 'production'),
+    (15288, 148, 'sm_100a', 15360, True, 8, 960, 296, 16, 1024, 148, 960, 296, 56, 956, 592, 30576, 7644, 7644, 15433984, 33163776, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct_ef_cap', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_fadd_trows', 411, 'production', 'production'),
     (15288, 152, 'sm_103a', 15360, True, 16, 1920, 304, 7, 448, 152, 2240, 304, 56, 956, 608, 30576, 7644, 7644, 27721984, 19008000, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099, 'production', 'production'),
     (15288, 208, 'sm_107a', 15360, True, 8, 960, 416, 16, 1024, 208, 960, 416, 40, 956, 832, 30576, 15288, 15288, 15433984, 32788736, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4_fadd', 411, 't128', 'r2'),
     (15288, 216, 'sm_107a', 15360, True, 16, 1920, 432, 10, 640, 216, 1536, 432, 40, 956, 864, 30576, 15288, 15288, 27721984, 23353600, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (15566, 148, 'sm_100a', 15616, True, 8, 976, 296, 9, 576, 148, 1792, 296, 56, 973, 592, 31132, 7783, 7783, 15638784, 22235136, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
+    (15566, 148, 'sm_100a', 15616, True, 8, 976, 296, 9, 576, 148, 1792, 296, 56, 973, 592, 31132, 7783, 7783, 15638784, 22235136, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct_ef_cap', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
     (15566, 152, 'sm_103a', 15616, True, 16, 1952, 304, 7, 448, 152, 2240, 304, 56, 973, 608, 31132, 7783, 7783, 28131584, 19089408, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099, 'production', 'production'),
     (15566, 208, 'sm_107a', 15616, True, 8, 976, 416, 13, 832, 208, 1216, 416, 40, 973, 832, 31132, 15566, 15566, 15638784, 28143872, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (15566, 216, 'sm_107a', 15616, True, 8, 976, 432, 10, 640, 216, 1600, 432, 40, 973, 864, 31132, 15566, 15566, 15638784, 23427328, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (15590, 148, 'sm_100a', 15616, True, 8, 976, 296, 9, 576, 148, 1792, 296, 56, 975, 592, 31180, 7795, 7795, 15638784, 22235904, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
+    (15590, 148, 'sm_100a', 15616, True, 8, 976, 296, 9, 576, 148, 1792, 296, 56, 975, 592, 31180, 7795, 7795, 15638784, 22235904, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct_ef_cap', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
     (15590, 152, 'sm_103a', 15616, True, 16, 1952, 304, 7, 448, 152, 2240, 304, 56, 975, 608, 31180, 7795, 7795, 28131584, 19090176, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099, 'production', 'production'),
     (15590, 208, 'sm_107a', 15616, True, 8, 976, 416, 13, 832, 208, 1216, 416, 40, 975, 832, 31180, 15590, 15590, 15638784, 28143872, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (15590, 216, 'sm_107a', 15616, True, 8, 976, 432, 10, 640, 216, 1600, 432, 40, 975, 864, 31180, 15590, 15590, 15638784, 23427328, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (16114, 148, 'sm_100a', 16128, True, 8, 1008, 296, 9, 576, 148, 1792, 296, 56, 1008, 592, 32228, 8057, 8057, 16048384, 22398208, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
+    (16114, 148, 'sm_100a', 16128, True, 8, 1008, 296, 9, 576, 148, 1792, 296, 56, 1008, 592, 32228, 8057, 8057, 16048384, 22398208, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct_ef_cap', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
     (16114, 152, 'sm_103a', 16128, True, 16, 2016, 304, 7, 448, 152, 2304, 304, 56, 1008, 608, 32228, 8057, 8057, 28950784, 19252480, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099, 'production', 'production'),
     (16114, 208, 'sm_107a', 16128, True, 8, 1008, 416, 13, 832, 208, 1280, 416, 40, 1008, 832, 32228, 16114, 16114, 16048384, 28291328, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (16114, 216, 'sm_107a', 16128, True, 8, 1008, 432, 10, 640, 216, 1664, 432, 40, 1008, 864, 32228, 16114, 16114, 16048384, 23574784, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (16132, 148, 'sm_100a', 16256, True, 8, 1016, 296, 23, 1472, 148, 704, 296, 56, 1009, 592, 32264, 8066, 8066, 16150784, 44455424, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
+    (16132, 148, 'sm_100a', 16256, True, 8, 1016, 296, 23, 1472, 148, 704, 296, 56, 1009, 592, 32264, 8066, 8066, 16150784, 44455424, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct_ef_cap', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
     (16132, 152, 'sm_103a', 16256, True, 16, 2032, 304, 7, 448, 152, 2368, 304, 56, 1009, 608, 32264, 8066, 8066, 29155584, 19289600, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099, 'production', 'production'),
     (16132, 208, 'sm_107a', 16256, True, 8, 1016, 416, 13, 832, 208, 1280, 416, 40, 1009, 832, 32264, 16132, 16132, 16150784, 28328192, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (16132, 216, 'sm_107a', 16256, True, 8, 1016, 432, 10, 640, 216, 1664, 432, 40, 1009, 864, 32264, 16132, 16132, 16150784, 23611648, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
-    (16164, 148, 'sm_100a', 16256, True, 8, 1016, 296, 23, 1472, 148, 704, 296, 56, 1011, 592, 32328, 8082, 8082, 16150784, 44456448, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'nsx_g2_ol2l', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
+    (16164, 148, 'sm_100a', 16256, True, 8, 1016, 296, 23, 1472, 148, 704, 296, 56, 1011, 592, 32328, 8082, 8082, 16150784, 44456448, 'b16', 'tv128', 256, 256, 'st8_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct_ef_cap', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'wpu4_spred_trows', 411, 'production', 'production'),
     (16164, 152, 'sm_103a', 16256, True, 16, 2032, 304, 7, 448, 152, 2368, 304, 56, 1011, 608, 32328, 8082, 8082, 29155584, 19290624, 'b16', 'tv128', 256, 256, 'st16_lp2_as_el_qd', 'tk_nsx_g2_ol2l_ct', 'ao15_rae8_tma_ntr_trows_dyn', 'dynr', 'pt32_trows', 3099, 'production', 'production'),
     (16164, 208, 'sm_107a', 16256, True, 8, 1016, 416, 13, 832, 208, 1280, 416, 40, 1011, 832, 32328, 16164, 16164, 16150784, 28328192, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
     (16164, 216, 'sm_107a', 16256, True, 8, 1016, 432, 10, 640, 216, 1664, 432, 40, 1011, 864, 32328, 16164, 16164, 16150784, 23611648, 'b16', 'tv128_t128', 256, 512, 'qe_mb10_tree', 'nsx_g2_ol2l', 'dot_ao8_l2l', 'xrsg', 'wpu4', 411, 't128', 'r2'),
@@ -1180,6 +1182,7 @@ LAUNCH_FACTS = {
     "cake_mhc_det_train_fwd_map__nsx_ct": ((192, 1, 1), 114816, 2),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": ((192, 1, 1), 115712, 2),
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ((192, 1, 1), 114944, 2),
+    "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap": ((192, 1, 1), 114944, 2),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": ((192, 1, 1), 144384, 1),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ((192, 1, 1), 115712, 2),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk": ((192, 1, 1), 115712, 2),
@@ -1254,6 +1257,7 @@ RECORD_ARCHES = {
     "cake_mhc_det_train_fwd_map__nsx_ct": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx_g2_ol2l": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1__a3": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l": ("sm_100a",),
     "cake_mhc_det_train_fwd_map__ns96_g2_ol2l__tk": ("sm_100a",),
@@ -1608,20 +1612,32 @@ def test_dispatch_of_record_at_the_boundaries() -> None:
     for name, value in TABLES.items():
         assert getattr(loader, name) == value, name
     # the mapping pass's schedule form by its K units per CTA u = units / grid (FWD_MAP_CLAIM): the ticket form
-    # where u >= 4, the tail form where u <= 1, the program between; nsx's and ns96_g2_ol2l's ticket forms are
-    # named on no SM count of record (their programs' records stand in for them elsewhere)
+    # where u >= 4, the tail form where u <= 1, the cap form where P_K = 8, 3 <= u < 4 and the cap leaves at least
+    # ceil(SMs / 8) claim seats free (slack = SMs x ceil(units / SMs) - units), the program elsewhere; nsx's and
+    # ns96_g2_ol2l's ticket forms are named on no SM count of record (their programs' records stand in for them
+    # elsewhere)
     for T in DISPATCH_T:
         for arch, sm in ((a, s) for a in ARCHES for s in SM_COUNTS):
-            _, units, grid = loader.k1_units(T, sm, arch)
+            p_k, units, grid = loader.k1_units(T, sm, arch)
             program = loader.fwd_map_program(T, sm, arch)
             assert program not in ("tk_nsx_ct", "tk_ns96_g2_ol2l_ct"), (T, arch, sm)
-            for _base, ticket, tail in loader.FWD_MAP_CLAIM[arch]:
+            for _base, ticket, tail, cap in loader.FWD_MAP_CLAIM[arch]:
                 assert program != ticket or units >= 4 * grid, (T, arch, sm)
                 assert program != tail or units <= grid, (T, arch, sm)
+                slack = sm * -(-units // sm) - units
+                assert program != cap or (
+                    p_k == 8 and 3 * grid <= units < 4 * grid and slack >= -(-sm // 8)
+                ), (T, arch, sm)
     assert loader.fwd_map_program(4096, 152, "sm_103a") == "nsx_ct"
     assert loader.fwd_map_program(8192, 152, "sm_103a") == "nsx_g2_ol2l"
     assert loader.fwd_map_program(16263, 152, "sm_103a") == "tk_nsx_g2_ol2l_ct"
+    # slack 12 < 19
     assert loader.fwd_map_program(16263, 148, "sm_100a") == "nsx_g2_ol2l"
+    assert loader.fwd_map_program(14928, 148, "sm_100a") == "tk_nsx_g2_ol2l_ct_ef_cap"
+    assert loader.fwd_map_program(16263, 152, "sm_100a") == "tk_nsx_g2_ol2l_ct_ef_cap"
+    # 912 units = 6 x 152: slack 0
+    assert loader.fwd_map_program(14592, 152, "sm_100a") == "nsx_g2_ol2l"
+    assert loader.fwd_map_program(8320, 152, "sm_100a") == "nsx_g2_ol2l"  # P_K 16
     assert loader.fwd_map_program(32768, 148, "sm_100a") == "tk_nsx_g2_ol2l_ct"
     assert loader.fwd_map_program(4096, 148, "sm_100a") == "ns96_g2_ol2l_ct"
     assert loader.K5_GRID_BANDS == {
@@ -2428,9 +2444,10 @@ def test_launch_facts_of_record() -> None:
     pools = {4 * 28672 + 1024: 2, 3 * 28672 + 1024: 2, 5 * 28672 + 1024: 1}
     for name in (n for n in H4096_MODULES if _is(n, "cake_mhc_det_train_fwd_map")):
         block, smem, pcs = facts[name]
-        if H4096_MODULES[name]["library"].endswith("_ct"):
-            # the tail-control forms keep the control records after the ring, not in the 1024-byte prefix:
-            # their pools are the render's figures (LAUNCH_FACTS pins them), below the prefix form's
+        if H4096_MODULES[name]["library"].endswith(("_ct", "_ct_ef_cap")):
+            # the tail-control forms (and the cap form of the ticket one) keep the control records after the ring,
+            # not in the 1024-byte prefix: their pools are the render's figures (LAUNCH_FACTS pins them), below the
+            # prefix form's
             assert block == (192, 1, 1) and pcs == 2 and smem < 4 * 28672 + 1024, name
             continue
         assert block == (192, 1, 1) and smem in pools and pcs == pools[smem], name
