@@ -698,6 +698,7 @@ kernel_cake_stepfun_moe_c16c727913eac39c7f25(const __grid_constant__ CUtensorMap
                     asm volatile("cp.async.commit_group;");
                     if (iter_k_1 > 0) {
                         asm volatile("cp.async.wait_group 1;");
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         asm volatile(
                             "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                             :: "r"((sfb_full_addr + (prev_stage) * 8) & 0xFEFFFFFF) : "memory");
@@ -707,6 +708,7 @@ kernel_cake_stepfun_moe_c16c727913eac39c7f25(const __grid_constant__ CUtensorMap
                     if (stage_1 == 3) { stage_1 = 0; _phase_k_done_1 ^= 1; }
                 }
                 asm volatile("cp.async.wait_group 0;");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile(
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                     :: "r"((sfb_full_addr + (prev_stage) * 8) & 0xFEFFFFFF) : "memory");

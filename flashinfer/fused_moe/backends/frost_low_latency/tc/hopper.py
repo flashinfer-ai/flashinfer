@@ -29,7 +29,8 @@
 """Grouped BF16/FP16 Hopper projection, adapted from CUTLASS dense_gemm.py.
 
 One CTA discovers up to eight live routes to one expert. Weight-only TMA
-feeds WGMMA while the producer warp gathers the small activation vectors.
+feeds WGMMA while four warps gather disjoint activation rows. BF16/FP16
+issue weight TMA before gathering; FP8 retains gather-before-TMA scheduling.
 FC1 reads the original up/gate layout and applies the shared activation;
 FC2 writes typed expert partials for fixed-order combine.
 """
@@ -404,12 +405,35 @@ class HopperGroupedProjection:
                 mainloop_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
-                if warp_idx == 0:
-                    for _prefetch_idx in cutlass.range(prefetch_k_tile_cnt, unroll=1):
+                for _prefetch_idx in cutlass.range(prefetch_k_tile_cnt, unroll=1):
+                    tAgA_k = tAgA_mkl[None, mainloop_producer_state.count]
+                    tAsA_pipe = tAsA[None, mainloop_producer_state.index]
+                    if warp_idx == 0:
                         mainloop_pipeline.producer_acquire(mainloop_producer_state)
-                        tAgA_k = tAgA_mkl[None, mainloop_producer_state.count]
-                        tAsA_pipe = tAsA[None, mainloop_producer_state.index]
-                        for bn in cutlass.range_constexpr(8):
+                        if cutlass.const_expr(self.a_dtype != cutlass.Float8E4M3FN):
+                            cute.copy(
+                                tma_atom_a,
+                                tAgA_k,
+                                tAsA_pipe,
+                                tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                    mainloop_producer_state
+                                ),
+                                mcast_mask=a_mcast_mask,
+                            )
+                            if cutlass.const_expr(self.split_gate):
+                                cute.copy(
+                                    tma_atom_a,
+                                    tGgA_mkl[None, mainloop_producer_state.count],
+                                    tGsA[None, mainloop_producer_state.index],
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                    mcast_mask=a_mcast_mask,
+                                )
+                            mainloop_pipeline.producer_commit(mainloop_producer_state)
+                    cute.arch.sync_threads()
+                    for bn in cutlass.range_constexpr(8):
+                        if warp_idx == bn % 4:
                             for segment in cutlass.range_constexpr(
                                 self.tile_shape_mnk[2] // 32
                             ):
@@ -431,30 +455,31 @@ class HopperGroupedProjection:
                                             members[bn] // self.input_route_divisor,
                                         ]
                                 sB[bn, bk, mainloop_producer_state.index] = bv
-                        # Publish gathered activation stores before the weight-TMA barrier.
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        cute.arch.sync_warp()
-                        cute.copy(
-                            tma_atom_a,
-                            tAgA_k,
-                            tAsA_pipe,
-                            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                mainloop_producer_state
-                            ),
-                            mcast_mask=a_mcast_mask,
-                        )
-                        if cutlass.const_expr(self.split_gate):
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_threads()
+                    if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                        if warp_idx == 0:
                             cute.copy(
                                 tma_atom_a,
-                                tGgA_mkl[None, mainloop_producer_state.count],
-                                tGsA[None, mainloop_producer_state.index],
+                                tAgA_k,
+                                tAsA_pipe,
                                 tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                                     mainloop_producer_state
                                 ),
                                 mcast_mask=a_mcast_mask,
                             )
-                        mainloop_pipeline.producer_commit(mainloop_producer_state)
-                        mainloop_producer_state.advance()
+                            if cutlass.const_expr(self.split_gate):
+                                cute.copy(
+                                    tma_atom_a,
+                                    tGgA_mkl[None, mainloop_producer_state.count],
+                                    tGsA[None, mainloop_producer_state.index],
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                    mcast_mask=a_mcast_mask,
+                                )
+                            mainloop_pipeline.producer_commit(mainloop_producer_state)
+                    mainloop_producer_state.advance()
                 k_pipe_mmas = 1
                 mainloop_consumer_read_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer, self.ab_stage
@@ -611,55 +636,84 @@ class HopperGroupedProjection:
                         peek_ab_full_status = mainloop_pipeline.consumer_try_wait(
                             mainloop_consumer_read_state
                         )
-                    if warp_idx == 0 and mainloop_producer_state.count < k_tile_cnt:
-                        mainloop_pipeline.producer_acquire(mainloop_producer_state)
+                    if mainloop_producer_state.count < k_tile_cnt:
                         tAgA_k = tAgA_mkl[None, mainloop_producer_state.count]
                         tAsA_pipe = tAsA[None, mainloop_producer_state.index]
-                        for bn in cutlass.range_constexpr(self.group_size):
-                            for segment in cutlass.range_constexpr(
-                                self.tile_shape_mnk[2] // 32
-                            ):
-                                bk = tidx % 32 + segment * 32
-                                bv = self.b_dtype(0)
-                                if cutlass.const_expr(bn < self.group_size):
-                                    if (
-                                        members[bn] >= 0
-                                        and mainloop_producer_state.count
-                                        * self.tile_shape_mnk[2]
-                                        + bk
-                                        < cute.size(raw_b, mode=[1])
-                                    ):
-                                        bv = raw_b[
-                                            0,
-                                            mainloop_producer_state.count
-                                            * self.tile_shape_mnk[2]
-                                            + bk,
-                                            members[bn] // self.input_route_divisor,
-                                        ]
-                                sB[bn, bk, mainloop_producer_state.index] = bv
-                        # Publish gathered activation stores before the weight-TMA barrier.
-                        cute.arch.fence_proxy("async.shared", space="cta")
-                        cute.arch.sync_warp()
-                        cute.copy(
-                            tma_atom_a,
-                            tAgA_k,
-                            tAsA_pipe,
-                            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                mainloop_producer_state
-                            ),
-                            mcast_mask=a_mcast_mask,
-                        )
-                        if cutlass.const_expr(self.split_gate):
-                            cute.copy(
-                                tma_atom_a,
-                                tGgA_mkl[None, mainloop_producer_state.count],
-                                tGsA[None, mainloop_producer_state.index],
-                                tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                        if warp_idx == 0:
+                            mainloop_pipeline.producer_acquire(mainloop_producer_state)
+                            if cutlass.const_expr(self.a_dtype != cutlass.Float8E4M3FN):
+                                cute.copy(
+                                    tma_atom_a,
+                                    tAgA_k,
+                                    tAsA_pipe,
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                    mcast_mask=a_mcast_mask,
+                                )
+                                if cutlass.const_expr(self.split_gate):
+                                    cute.copy(
+                                        tma_atom_a,
+                                        tGgA_mkl[None, mainloop_producer_state.count],
+                                        tGsA[None, mainloop_producer_state.index],
+                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                            mainloop_producer_state
+                                        ),
+                                        mcast_mask=a_mcast_mask,
+                                    )
+                                mainloop_pipeline.producer_commit(
                                     mainloop_producer_state
-                                ),
-                                mcast_mask=a_mcast_mask,
-                            )
-                        mainloop_pipeline.producer_commit(mainloop_producer_state)
+                                )
+                        cute.arch.sync_threads()
+                        for bn in cutlass.range_constexpr(self.group_size):
+                            if warp_idx == bn % 4:
+                                for segment in cutlass.range_constexpr(
+                                    self.tile_shape_mnk[2] // 32
+                                ):
+                                    bk = tidx % 32 + segment * 32
+                                    bv = self.b_dtype(0)
+                                    if cutlass.const_expr(bn < self.group_size):
+                                        if (
+                                            members[bn] >= 0
+                                            and mainloop_producer_state.count
+                                            * self.tile_shape_mnk[2]
+                                            + bk
+                                            < cute.size(raw_b, mode=[1])
+                                        ):
+                                            bv = raw_b[
+                                                0,
+                                                mainloop_producer_state.count
+                                                * self.tile_shape_mnk[2]
+                                                + bk,
+                                                members[bn] // self.input_route_divisor,
+                                            ]
+                                    sB[bn, bk, mainloop_producer_state.index] = bv
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        cute.arch.sync_threads()
+                        if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                            if warp_idx == 0:
+                                cute.copy(
+                                    tma_atom_a,
+                                    tAgA_k,
+                                    tAsA_pipe,
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                    mcast_mask=a_mcast_mask,
+                                )
+                                if cutlass.const_expr(self.split_gate):
+                                    cute.copy(
+                                        tma_atom_a,
+                                        tGgA_mkl[None, mainloop_producer_state.count],
+                                        tGsA[None, mainloop_producer_state.index],
+                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                            mainloop_producer_state
+                                        ),
+                                        mcast_mask=a_mcast_mask,
+                                    )
+                                mainloop_pipeline.producer_commit(
+                                    mainloop_producer_state
+                                )
                         mainloop_producer_state.advance()
                 cute.nvgpu.warpgroup.wait_group(0)
                 if cute.size(self.cluster_shape_mn) > 1:

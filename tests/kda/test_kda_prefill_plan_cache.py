@@ -410,15 +410,27 @@ def test_dense_h12_beta_matches_the_strided_carrier_on_the_unbounded_gate(
     _assert_same(_snapshot(d), want)
 
 
-def _run_affine_epilogue(d, fused, monkeypatch, *, checkpoints, lower_bound):
+def _run_affine_epilogue(
+    d, fused, monkeypatch, *, checkpoints, lower_bound, merge=True
+):
     import flashinfer.cake_kda_tf32_runtime as runtime
 
+    routed = runtime._correction_merge_routed(d["q"].device)
     monkeypatch.setattr(
         runtime, "_fused_affine_epilogue_enabled", lambda: fused, raising=True
     )
+    if not merge:
+        monkeypatch.setattr(
+            runtime, "_correction_merge_routed", lambda device: False, raising=True
+        )
     call = _run(d, checkpoints=checkpoints, lower_bound=lower_bound)
-    assert "affine" in str(call.schedule)
-    assert ("_fused_epilogue" in str(call.schedule)) == fused
+    schedule = str(call.schedule)
+    assert "affine" in schedule
+    # A bounded chain whose correction windows merge themselves into the
+    # composite launches no epilogue kernel after them.
+    merged = fused and merge and routed and lower_bound is not None
+    assert ("_correction_merge" in schedule) == merged
+    assert ("_fused_epilogue" in schedule) == (fused and not merged)
     return _snapshot(d)
 
 
@@ -438,7 +450,8 @@ def test_affine_fused_epilogue_matches_torch_epilogue_bitwise(
 ):
     # The fused epilogue kernel (checkpoint-row merge + scatter, output tail
     # add, final-state select/add and pool scatter) replaces ~10 torch launches
-    # and must reproduce them bit for bit on every row it writes.
+    # and must reproduce them bit for bit on every row it writes; so must the
+    # bounded chain's correction windows that merge themselves (no epilogue).
     d = _inputs(lengths, 12, seed=11)
     pool = d["pool"].clone()
     want = _run_affine_epilogue(
@@ -451,6 +464,21 @@ def test_affine_fused_epilogue_matches_torch_epilogue_bitwise(
         d, True, monkeypatch, checkpoints=checkpoints, lower_bound=lower_bound
     )
     _assert_same(got, want)
+    if lower_bound is not None:
+        # The bounded chain with the epilogue kernel after its correction
+        # windows (no merging build): the same bits again.
+        d["pool"].copy_(pool)
+        d["out"].zero_()
+        d["state_checkpoints"].zero_()
+        got = _run_affine_epilogue(
+            d,
+            True,
+            monkeypatch,
+            checkpoints=checkpoints,
+            lower_bound=lower_bound,
+            merge=False,
+        )
+        _assert_same(got, want)
 
 
 @pytest.mark.parametrize(

@@ -126,18 +126,94 @@ class AmpereGroupedProjection:
 
     @cute.jit
     def load_b(self, inputs, ids, members, sB, tidx, tile, slot):
-        if tidx < 32:
+        if cutlass.const_expr(self.tile_k == 128):
+            # Guard the vectorized copy before constructing aligned copy pointers.
+            # Public inputs are 16-byte aligned; retain the scalar device fallback.
+            # Row stride and K-tile offsets are multiples of 128 elements.
+            if inputs.iterator.toint() % 16 == 0:
+                atom = cute.make_copy_atom(
+                    cute.nvgpu.cpasync.CopyG2SOp(
+                        cache_mode=cute.nvgpu.cpasync.LoadCacheMode.GLOBAL
+                    ),
+                    inputs.element_type,
+                    num_bits_per_copy=128,
+                )
+                column = (tidx % 16) * 8
+                for member in cutlass.range_constexpr(8):
+                    if tidx // 16 == member:
+                        valid = cutlass.Boolean(False)
+                        if cutlass.const_expr(member < self.group_size):
+                            valid = members[member] >= 0
+                        if valid:
+                            offset = (
+                                (members[member] // self.input_route_divisor)
+                                * inputs.stride[0]
+                                + tile * self.tile_k
+                                + column
+                            )
+                            src = cute.make_tensor(
+                                cute.make_ptr(
+                                    inputs.element_type,
+                                    (inputs.iterator + offset).toint(),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout((8,)),
+                            )
+                            dst = cute.make_tensor(
+                                cute.make_ptr(
+                                    inputs.element_type,
+                                    (
+                                        sB.iterator + sB.layout((member, column, slot))
+                                    ).toint(),
+                                    cute.AddressSpace.smem,
+                                    assumed_align=16,
+                                ),
+                                cute.make_layout((8,)),
+                            )
+                            cute.copy(atom, src, dst)
+                        else:
+                            for element in cutlass.range_constexpr(8):
+                                sB[member, column + element, slot] = (
+                                    inputs.element_type(0)
+                                )
+            else:
+                self.load_b_scalar(inputs, ids, members, sB, tidx, tile, slot)
+        else:
+            self.load_b_scalar(inputs, ids, members, sB, tidx, tile, slot)
+
+    @cute.jit
+    def load_b_scalar(self, inputs, ids, members, sB, tidx, tile, slot):
+        if cutlass.const_expr(self.tile_k == 128):
+            # Each warp owns disjoint rows. Member indices stay compile-time constants
+            # so register-held route membership never needs dynamic indexing.
+            warp = tidx // 32
+            lane = tidx % 32
             for member in cutlass.range_constexpr(8):
-                for segment in cutlass.range_constexpr(self.tile_k // 32):
-                    column = tidx + segment * 32
-                    value = inputs.element_type(0)
-                    if cutlass.const_expr(member < self.group_size):
-                        if members[member] >= 0:
-                            value = inputs[
-                                members[member] // self.input_route_divisor,
-                                tile * self.tile_k + column,
-                            ]
-                    sB[member, column, slot] = value
+                if warp == member % 4:
+                    for segment in cutlass.range_constexpr(self.tile_k // 32):
+                        column = lane + segment * 32
+                        value = inputs.element_type(0)
+                        if cutlass.const_expr(member < self.group_size):
+                            if members[member] >= 0:
+                                value = inputs[
+                                    members[member] // self.input_route_divisor,
+                                    tile * self.tile_k + column,
+                                ]
+                        sB[member, column, slot] = value
+        else:
+            if tidx < 32:
+                for member in cutlass.range_constexpr(8):
+                    for segment in cutlass.range_constexpr(self.tile_k // 32):
+                        column = tidx + segment * 32
+                        value = inputs.element_type(0)
+                        if cutlass.const_expr(member < self.group_size):
+                            if members[member] >= 0:
+                                value = inputs[
+                                    members[member] // self.input_route_divisor,
+                                    tile * self.tile_k + column,
+                                ]
+                        sB[member, column, slot] = value
 
     @cute.kernel
     def kernel(

@@ -42,6 +42,7 @@ def _msa_kernel(
     TN: cutlass.Constexpr,
     batch_fast: cutlass.Constexpr,
 ):
+    """Score one decode token's pages against the fp8 index cache."""
     NG = cutlass.const_expr(TN // 8)
     NJ = cutlass.const_expr(1 if nq == 1 else 2)
     NV = cutlass.const_expr(NG * NJ)
@@ -217,6 +218,7 @@ def _msa_host(
     TN: cutlass.Constexpr,
     batch_fast: cutlass.Constexpr,
 ):
+    """Build the tiled MMA and launch the decode scoring grid."""
     tiled_mma = sm90_utils.make_trivial_tiled_mma(
         FP8,
         FP8,
@@ -293,6 +295,7 @@ _KF_STREAMS: dict = {}
 
 
 def _kf_stream():
+    """CUstream for the current torch stream, cached per handle."""
     h = torch.cuda.current_stream().cuda_stream
     s = _KF_STREAMS.get(h)
     if s is None:
@@ -305,6 +308,7 @@ _CACHE: dict = {}
 
 
 def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
+    """Compute MSA proxy scores for a decode batch. Writes ``max_score``."""
     total_q, Hq, D = q.shape
     num_pages = k.shape[0]
     # The caller's score buffer is (hq, max_k_tiles, total_q) where max_k_tiles

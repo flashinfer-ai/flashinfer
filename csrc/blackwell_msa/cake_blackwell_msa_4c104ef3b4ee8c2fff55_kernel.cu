@@ -288,6 +288,7 @@ __device__ __forceinline__ void tma_3d_gmem2smem(
 
 
 
+#ifndef CAKE_L2_EVICT_FIRST
 __device__ __forceinline__ void tma_4d_gmem2smem(
     int dst, const void *tmap_ptr, int x, int y, int z, int w, int mbar_addr) {
     asm volatile(
@@ -298,6 +299,7 @@ __device__ __forceinline__ void tma_4d_gmem2smem(
            "r"(mbar_addr) : "memory");
 }
 
+#endif
 
 
 
@@ -309,10 +311,13 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     return result;
 }
 
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_blackwell_msa_4c104ef3b4ee8c2fff55
+#endif
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_blackwell_msa_4c104ef3b4ee8c2fff55(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_prefill, __nv_bfloat16* __restrict__ Q_prefill_raw, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap K_prefill_pair, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, const __grid_constant__ CUtensorMap V_prefill_pair, const __grid_constant__ CUtensorMap KV, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ qo_indptr, int* __restrict__ kv_indptr, int* __restrict__ kv_len_arr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int* __restrict__ task_q_tile, int* __restrict__ task_split, int* __restrict__ task_kv_tile_begin, int* __restrict__ task_kv_tile_end, int* __restrict__ task_qo_begin, int* __restrict__ task_qo_end, int* __restrict__ task_page_begin, int* __restrict__ task_page_end, int* __restrict__ status, int num_requests, int num_q_heads, int num_kv_heads, int max_kv_tiles, int max_splits, int max_task_claims, float softmax_scale_log2, float k_global_scale, float v_global_scale, int attention_mode, int is_causal, int derive_q_offset, int record_tasks, int msa_max_pages, int msa_split_policy)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap Q_prefill, __nv_bfloat16* __restrict__ Q_prefill_raw, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap K_prefill_pair, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, const __grid_constant__ CUtensorMap V_prefill_pair, const __grid_constant__ CUtensorMap KV, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ qo_indptr, int* __restrict__ kv_indptr, int* __restrict__ kv_len_arr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int* __restrict__ task_q_tile, int* __restrict__ task_split, int* __restrict__ task_kv_tile_begin, int* __restrict__ task_kv_tile_end, int* __restrict__ task_qo_begin, int* __restrict__ task_qo_end, int* __restrict__ task_page_begin, int* __restrict__ task_page_end, int* __restrict__ status, int num_requests, int num_q_heads, int num_kv_heads, int max_kv_tiles, int max_splits, int max_task_claims, float softmax_scale_log2, float k_global_scale, float v_global_scale, int attention_mode, int is_causal, int derive_q_offset, int record_tasks, int msa_max_pages, int msa_split_policy)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -609,6 +614,9 @@ kernel_cake_blackwell_msa_4c104ef3b4ee8c2fff55(const __grid_constant__ CUtensorM
                     int query_in_batch = msa_request - batch * record_tasks;
                     int selected_block = task_kind[(msa_kv_head * num_requests + msa_request) * 16 + msa_block_position];
                     int kv_len = task_kv_head[batch];
+#ifdef CAKE_FLAT_KV
+                    kv_len = kv_indptr[batch + 1] - kv_indptr[batch];
+#endif
                     int valid_cols = 0;
                     if (selected_block >= 0) {
                         int block_start = selected_block * 128;
@@ -635,6 +643,11 @@ kernel_cake_blackwell_msa_4c104ef3b4ee8c2fff55(const __grid_constant__ CUtensorM
                     }
                     int token_base = 0;
                     int page_head = 0;
+#ifdef CAKE_FLAT_KV
+                    int safe_block = ((selected_block >= 0) ? selected_block : 0);
+                    token_base = kv_indptr[batch] + safe_block * 128;
+                    page_head = msa_kv_head;
+#else
                     int physical_page = 0;
                     if (selected_block >= 0) {
                         physical_page = kv_indices[batch * msa_max_pages + selected_block];
@@ -644,6 +657,7 @@ kernel_cake_blackwell_msa_4c104ef3b4ee8c2fff55(const __grid_constant__ CUtensorM
                         }
                     }
                     page_head = physical_page * num_kv_heads + msa_kv_head;
+#endif
                     msa_softmax_token_base = token_base;
                     msa_softmax_page_head = page_head;
                     msa_valid_cols = valid_cols;
@@ -1731,6 +1745,9 @@ kernel_cake_blackwell_msa_4c104ef3b4ee8c2fff55(const __grid_constant__ CUtensorM
                             int query_in_batch_1 = direct_request_2 - batch_1 * record_tasks;
                             int selected_block_1 = task_kind[(kv_head_1 * num_requests + direct_request_2) * 16 + selected_position];
                             int kv_len_1 = task_kv_head[batch_1];
+#ifdef CAKE_FLAT_KV
+                            kv_len_1 = kv_indptr[batch_1 + 1] - kv_indptr[batch_1];
+#endif
                             int valid_cols_1 = 0;
                             if (selected_block_1 >= 0) {
                                 int block_start_1 = selected_block_1 * 128;
@@ -1757,6 +1774,11 @@ kernel_cake_blackwell_msa_4c104ef3b4ee8c2fff55(const __grid_constant__ CUtensorM
                             }
                             int token_base_1 = 0;
                             int page_head_1 = 0;
+#ifdef CAKE_FLAT_KV
+                            int safe_block_1 = ((selected_block_1 >= 0) ? selected_block_1 : 0);
+                            token_base_1 = kv_indptr[batch_1] + safe_block_1 * 128;
+                            page_head_1 = kv_head_1;
+#else
                             int physical_page_1 = 0;
                             if (selected_block_1 >= 0) {
                                 physical_page_1 = kv_indices[batch_1 * msa_max_pages + selected_block_1];
@@ -1766,6 +1788,7 @@ kernel_cake_blackwell_msa_4c104ef3b4ee8c2fff55(const __grid_constant__ CUtensorM
                                 }
                             }
                             page_head_1 = physical_page_1 * num_kv_heads + kv_head_1;
+#endif
                             smem_page_indices[block_ordinal] = valid_cols_1;
                             smem_page_indices[16 + block_ordinal] = token_base_1;
                             smem_page_indices[32 + block_ordinal] = page_head_1;
@@ -1776,12 +1799,37 @@ kernel_cake_blackwell_msa_4c104ef3b4ee8c2fff55(const __grid_constant__ CUtensorM
                             mbarrier_arrive_expect_tx(kv_full_addr + (stage) * 8, 32768);
                             int token0 = token_base_1;
                             int token1 = token_base_1 + 64;
+#ifndef CAKE_FLAT_KV
                             token0 = 0;
                             token1 = 64;
+#endif
+#ifdef CAKE_L2_EVICT_FIRST
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_kv_addr + (unsigned int)(stage * 32768)), "l"((&K)), "r"(0), "r"(token0), "r"(0), "r"(page_head_1),
+                                   "r"(kv_full_addr + (stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_kv_addr + (unsigned int)(stage * 32768) + 8192), "l"((&K)), "r"(0), "r"(token1), "r"(0), "r"(page_head_1),
+                                   "r"(kv_full_addr + (stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_kv_addr + (unsigned int)(stage * 32768) + 16384), "l"((&K)), "r"(0), "r"(token0), "r"(1), "r"(page_head_1),
+                                   "r"(kv_full_addr + (stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_kv_addr + (unsigned int)(stage * 32768) + 24576), "l"((&K)), "r"(0), "r"(token1), "r"(1), "r"(page_head_1),
+                                   "r"(kv_full_addr + (stage) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#else
                             tma_4d_gmem2smem(smem_kv_addr + (unsigned int)(stage * 32768), (&K), 0, token0, 0, page_head_1, kv_full_addr + (stage) * 8);
                             tma_4d_gmem2smem(smem_kv_addr + (unsigned int)(stage * 32768) + 8192, (&K), 0, token1, 0, page_head_1, kv_full_addr + (stage) * 8);
                             tma_4d_gmem2smem(smem_kv_addr + (unsigned int)(stage * 32768) + 16384, (&K), 0, token0, 1, page_head_1, kv_full_addr + (stage) * 8);
                             tma_4d_gmem2smem(smem_kv_addr + (unsigned int)(stage * 32768) + 24576, (&K), 0, token1, 1, page_head_1, kv_full_addr + (stage) * 8);
+#endif
                         }
                         #pragma unroll
                         for (int inst_1 = 0; inst_1 < 2; inst_1++) {
@@ -1795,12 +1843,37 @@ kernel_cake_blackwell_msa_4c104ef3b4ee8c2fff55(const __grid_constant__ CUtensorM
                             mbarrier_arrive_expect_tx(kv_full_addr + (stage_1) * 8, 32768);
                             int token0_1 = token_base_2;
                             int token1_1 = token_base_2 + 64;
+#ifndef CAKE_FLAT_KV
                             token0_1 = 0;
                             token1_1 = 64;
+#endif
+#ifdef CAKE_L2_EVICT_FIRST
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_kv_addr + (unsigned int)(stage_1 * 32768)), "l"((&V)), "r"(0), "r"(token0_1), "r"(0), "r"(page_head_2),
+                                   "r"(kv_full_addr + (stage_1) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_kv_addr + (unsigned int)(stage_1 * 32768) + 8192), "l"((&V)), "r"(0), "r"(token1_1), "r"(0), "r"(page_head_2),
+                                   "r"(kv_full_addr + (stage_1) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_kv_addr + (unsigned int)(stage_1 * 32768) + 16384), "l"((&V)), "r"(0), "r"(token0_1), "r"(1), "r"(page_head_2),
+                                   "r"(kv_full_addr + (stage_1) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(smem_kv_addr + (unsigned int)(stage_1 * 32768) + 24576), "l"((&V)), "r"(0), "r"(token1_1), "r"(1), "r"(page_head_2),
+                                   "r"(kv_full_addr + (stage_1) * 8), "l"(0x12F0000000000000ULL) : "memory");
+#else
                             tma_4d_gmem2smem(smem_kv_addr + (unsigned int)(stage_1 * 32768), (&V), 0, token0_1, 0, page_head_2, kv_full_addr + (stage_1) * 8);
                             tma_4d_gmem2smem(smem_kv_addr + (unsigned int)(stage_1 * 32768) + 8192, (&V), 0, token1_1, 0, page_head_2, kv_full_addr + (stage_1) * 8);
                             tma_4d_gmem2smem(smem_kv_addr + (unsigned int)(stage_1 * 32768) + 16384, (&V), 0, token0_1, 1, page_head_2, kv_full_addr + (stage_1) * 8);
                             tma_4d_gmem2smem(smem_kv_addr + (unsigned int)(stage_1 * 32768) + 24576, (&V), 0, token1_1, 1, page_head_2, kv_full_addr + (stage_1) * 8);
+#endif
                         }
                     }
                 }

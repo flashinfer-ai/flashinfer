@@ -98,7 +98,7 @@ kind, and both paths hand the inner kernel the same `SplitKernelContext`:
 
 | Backend | Config | Interface | Transport |
 |---|---|---|---|
-| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
+| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back; optional CFT counted writes over the NVLink fabric (SM100+, CUDA 13.4+, driver 615+); a Lamport transport for small steps (SM100 / SM103, up to 64 ranks; `include/flashinfer/comm/moe_alltoall_lamport.cuh`); up to 256 ranks. Kernels follow TensorRT-LLM's (`kernels/moe/communication/`) |
 | `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | One-sided put/get like `nvlink_one_sided`, running generated Cake kernels (`cake/kernels.py`, `csrc/cake_moe_alltoall*`); SM100/SM103 only |
 | `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`nvlink_two_sided/kernels.py`, `csrc/nvlink_two_sided_*`); `num_experts % 4 == 0` |
 | `nccl_ep` | `NcclEpConfig` | Fleet/Handle | see below |
@@ -303,7 +303,7 @@ Kernels register via `@register_split_kernel` / `@register_mega_kernel` when `ba
 | `MegaConfig` | `megakernel`, `quantize_input`, `preprocess_weights`, optional `transformed_weights` |
 | `FleetAlgoKnobFaultTolerance` | Opt-in rank masking (`enabled`, `timeout_ms`, reconcile budgets) — see **Fault tolerance** |
 
-**Split:** pass `SplitConfig(comm=..., kernel=...)` or a comm string/config (kernel defaults to `IdentityConfig`). `fleet_knobs` tune Fleet transports. The Fleet (or `MoEEpCommunication`) is lazy-created on first `forward()`; Fleet transports get a new Handle per forward. CUDA-graph capture goes through `create_graph_state()` for both kinds of comm backend; a `MoEEpCommunication` is already long-lived, so its graph state only pins the bound buffers, and `create_graph_state()` rejects backends with `supports_cuda_graph=False`. `MoEEpSplitLayer.enable_timing` optionally records per-stage GPU ms in `last_timings_ms`.
+**Split:** pass `SplitConfig(comm=..., kernel=...)` or a comm string/config (kernel defaults to `IdentityConfig`). `fleet_knobs` tune Fleet transports. The Fleet (or `MoEEpCommunication`) is lazy-created on first `forward()`; Fleet transports get a new Handle per forward. CUDA-graph capture goes through `create_graph_state()` for both kinds of comm backend; a `MoEEpCommunication` is already long-lived, so its graph state only pins the bound buffers, and `create_graph_state()` rejects backends with `supports_cuda_graph=False`. `MoEEpSplitLayer.enable_timing` optionally records per-stage GPU ms (`MoEEpSplitLayer.STAGES`: quantize, dispatch, compute, combine) in `last_timings_ms`; `stage_hook` brackets the same stages without synchronizing, for timing under CUDA graph capture.
 
 **Split compute:** the `fused_moe` kernel bridges the 3D EP dispatch buffer to `flashinfer.fused_moe` (a token-major `MoEActivationPack`) via `backends/split/kernel/fused_moe/bridge.py`:
 
@@ -319,6 +319,58 @@ selected knob dictionary. Pass it as `knobs` when constructing a fixed layer
 with the same kernel configuration and capacity. The getter performs no tuning
 or file access and raises before a successful automatic search or after layer
 destruction. `warmup()` continues to return `None`.
+
+On Rubin, `kernel_variant="auto"` together with `knobs="auto"` selects between
+inference and GenPhase. An enabled `autotune_v2()` warmup selects each variant's
+knobs, then compares the winners. Candidate measurements
+include input staging, compute and output handling at both levels.
+The same numerical settings apply to both variants;
+GenPhase is excluded when its capacity or combine requirements are not met.
+Explicit inference or GenPhase with `knobs="auto"` uses the same complete-forward
+boundary, restricted to that variant. The Rubin offline CLI also measures staging,
+compute and writing an owned output, matching the default layer forward with
+BF16 inputs. Output copies are measured when the selected path requires them. Input generation, weight preparation, compilation and correctness
+checks are outside measurement. Match the deployment's input and output layouts
+when reusing automatic results; kernel-only records do not satisfy this objective.
+
+Each variant's winning knobs are stored in its fixed-variant managed-cache
+records and the MegaMoE compatibility file when persistence is enabled. The
+overall selection has a separate managed entry containing the variant and knobs,
+matched to the workspace capacity, per-rank live-token counts, eligible variants
+and execution contract. On an overall miss, tuning reuses compatible fixed-variant
+records, including token-bucket fallbacks, and searches missing variants. Cached
+partial-batch records stay within their workspace capacity; full-capacity records
+can supply knobs for another capacity, following fixed-variant lookup. Cached
+knobs are checked and timed at the current workload before comparing variants;
+a rejected cached choice triggers a fresh search within that variant. Reused
+records retain their original workload and score. An explicit fresh search
+bypasses both levels. Skipping fixed-variant tuning compares heuristic knobs
+without publishing fixed-variant managed records. A variant-selection replay
+miss uses the inference heuristic and leaves selection pending. Low-level tuning
+of already-staged workspaces remains available for kernel measurements.
+
+Use `layer.get_tuned_config()` to reconstruct a fixed layer after variant
+selection. It returns the concrete kernel config with the selected variant and
+knobs. The knobs-only getter retains its meaning; those knobs alone do not
+identify the variant. Weight preprocessing is shared between Rubin variants.
+Automatic workspace handles own separate selection state. Later selection can
+replace a captured default workspace while its old storage remains available to
+existing graphs; captured explicit handles require a new handle.
+
+Rubin automatic workspaces reuse their agreed configuration during ordinary
+eager execution, without selection collectives or cache lookups on each forward.
+Calling the layer inside an explicit tuning or replay context performs collective
+checks; the first bare forward afterward reconciles the ambient cache and controls.
+Unrelated contexts, including tuning on another thread, do not invalidate a
+prepared workspace. Use `cache_scope="context"` for rank-local cache contexts.
+Process-wide store changes and `autotune_v2_reload()` must be coordinated across
+EP ranks before serving resumes. When changing the attached store, call the layer
+in a replay or tuning context on every rank, including ranks already using that
+store. After a coordinated reload, the next eager forward reconciles the reloaded
+records. A rank-local `AutoTuner.clear_cache()` alone does not change a
+prepared workspace during bare serving; call the layer in a replay or tuning
+context on every rank to adopt the change. CUDA graph replay keeps its captured
+configuration and storage.
 
 For serving several token capacities with one layer and one transformed weight
 set, allocate explicit profiles before capture:

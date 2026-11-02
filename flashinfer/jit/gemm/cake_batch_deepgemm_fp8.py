@@ -170,17 +170,29 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88",
+    "cake_batch_deepgemm_fp8_0af0ccf65f4c55c383f4": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_0af0ccf65f4c55c383f4",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0af0ccf65f4c55c383f4_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0af0ccf65f4c55c383f4_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
-        "arches": ["sm_100a"],
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_0db53ce746a8da419343": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_0db53ce746a8da419343",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0db53ce746a8da419343_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_0db53ce746a8da419343_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_103a"],
     },
     "cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b",
@@ -218,17 +230,17 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6",
+    "cake_batch_deepgemm_fp8_1f648c51c814b0a20548": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_1f648c51c814b0a20548",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1f648c51c814b0a20548_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_1f648c51c814b0a20548_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
-        "arches": ["sm_100a"],
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9",
@@ -254,18 +266,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan1",
         "arches": ["sm_100a"],
     },
-    "cake_batch_deepgemm_fp8_26a4bc38b0aa6b7acaad": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_26a4bc38b0aa6b7acaad",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_26a4bc38b0aa6b7acaad_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_26a4bc38b0aa6b7acaad_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan1",
-        "arches": ["sm_100a", "sm_103a"],
-    },
     "cake_batch_deepgemm_fp8_2c120bce2db6a19bf130": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_2c120bce2db6a19bf130",
         "sources": [
@@ -278,11 +278,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_39395937e1b02f1d7aa8": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_39395937e1b02f1d7aa8",
+    "cake_batch_deepgemm_fp8_32ea93306bd09dedba46": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_32ea93306bd09dedba46",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_39395937e1b02f1d7aa8_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_39395937e1b02f1d7aa8_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_32ea93306bd09dedba46_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_32ea93306bd09dedba46_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -290,17 +290,53 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_3982d376aa7b9dbf4dcb": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_3982d376aa7b9dbf4dcb",
+    "cake_batch_deepgemm_fp8_373c73aa591bb7f4ed7f": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_373c73aa591bb7f4ed7f",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_3982d376aa7b9dbf4dcb_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_3982d376aa7b9dbf4dcb_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_373c73aa591bb7f4ed7f_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_373c73aa591bb7f4ed7f_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
         "arches": ["sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_41af09e0c42e80bf1963": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_41af09e0c42e80bf1963",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_41af09e0c42e80bf1963_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_41af09e0c42e80bf1963_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_442708989397f5a42bd2": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_442708989397f5a42bd2",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_442708989397f5a42bd2_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_442708989397f5a42bd2_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_46272696cde7145a5da4": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_46272696cde7145a5da4",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_46272696cde7145a5da4_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_46272696cde7145a5da4_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan1",
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_batch_deepgemm_fp8_53f48f6693638d36fbc2": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_53f48f6693638d36fbc2",
@@ -326,23 +362,35 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_57c401152579ac3ac327": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_57c401152579ac3ac327",
+    "cake_batch_deepgemm_fp8_572e5ae5b0712365bee3": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_572e5ae5b0712365bee3",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_57c401152579ac3ac327_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_57c401152579ac3ac327_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_572e5ae5b0712365bee3_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_572e5ae5b0712365bee3_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
-        "arg_plan": "plan3",
-        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": "plan0",
+        "arches": ["sm_103a"],
     },
     "cake_batch_deepgemm_fp8_59edc7df733ec03c53d5": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_59edc7df733ec03c53d5",
         "sources": [
             "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_59edc7df733ec03c53d5_kernel.cu",
             "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_59edc7df733ec03c53d5_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -362,59 +410,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan2",
         "arches": ["sm_100a"],
     },
-    "cake_batch_deepgemm_fp8_5ef7e95b2b466da8875d": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_5ef7e95b2b466da8875d",
+    "cake_batch_deepgemm_fp8_5c5bed387a6f65778b39": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_5c5bed387a6f65778b39",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_5ef7e95b2b466da8875d_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_5ef7e95b2b466da8875d_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_646c28382e13d4a9eabe": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_646c28382e13d4a9eabe",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_646c28382e13d4a9eabe_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_646c28382e13d4a9eabe_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan1",
-        "arches": ["sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_6762afe719bc00c74cb8": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_6762afe719bc00c74cb8",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_6762afe719bc00c74cb8_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_6762afe719bc00c74cb8_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan1",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_6a1dec9afccecea359db": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_6a1dec9afccecea359db",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_6a1dec9afccecea359db_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_6a1dec9afccecea359db_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_71bde7c4a72fbaf55012": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_71bde7c4a72fbaf55012",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_71bde7c4a72fbaf55012_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_71bde7c4a72fbaf55012_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_5c5bed387a6f65778b39_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_5c5bed387a6f65778b39_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -457,6 +457,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan4",
         "arches": ["sm_100a"],
+    },
+    "cake_batch_deepgemm_fp8_896b65115baf37c01d60": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_896b65115baf37c01d60",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_896b65115baf37c01d60_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_896b65115baf37c01d60_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_103a"],
     },
     "cake_batch_deepgemm_fp8_8c4067fce6c805ee9300": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_8c4067fce6c805ee9300",
@@ -518,17 +530,29 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
+    "cake_batch_deepgemm_fp8_967f03d4b4e131c6805e": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_967f03d4b4e131c6805e",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_967f03d4b4e131c6805e_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_967f03d4b4e131c6805e_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_9b61544d1069fbfd8991": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_9b61544d1069fbfd8991",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_9b61544d1069fbfd8991_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_9b61544d1069fbfd8991_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a"],
     },
     "cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2",
@@ -554,41 +578,53 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan1",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_b6d143c6475ade2655a3": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_b6d143c6475ade2655a3",
+    "cake_batch_deepgemm_fp8_a7f7bdd074d89a3b5a42": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_a7f7bdd074d89a3b5a42",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b6d143c6475ade2655a3_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b6d143c6475ade2655a3_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_b9135507532a235be639": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_b9135507532a235be639",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b9135507532a235be639_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b9135507532a235be639_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_b9f7146048e524aaea2a": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_b9f7146048e524aaea2a",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b9f7146048e524aaea2a_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b9f7146048e524aaea2a_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_a7f7bdd074d89a3b5a42_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_a7f7bdd074d89a3b5a42_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
         "arches": ["sm_100a"],
+    },
+    "cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_abcc0d30303f2186e2e3": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_abcc0d30303f2186e2e3",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_abcc0d30303f2186e2e3_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_abcc0d30303f2186e2e3_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_b43e6452d8e025211a6b": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_b43e6452d8e025211a6b",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b43e6452d8e025211a6b_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_b43e6452d8e025211a6b_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan1",
+        "arches": ["sm_100a", "sm_103a"],
     },
     "cake_batch_deepgemm_fp8_ba92e96364e30012640e": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_ba92e96364e30012640e",
@@ -626,6 +662,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan7",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_batch_deepgemm_fp8_c7570735254ecd7e16c0": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_c7570735254ecd7e16c0",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c7570735254ecd7e16c0_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_c7570735254ecd7e16c0_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan1",
+        "arches": ["sm_103a"],
+    },
     "cake_batch_deepgemm_fp8_c9415f6c743e6bb72fc7": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_c9415f6c743e6bb72fc7",
         "sources": [
@@ -649,6 +697,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan1",
         "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_batch_deepgemm_fp8_cfd6d6c2315ea339e1fb": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_cfd6d6c2315ea339e1fb",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_cfd6d6c2315ea339e1fb_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_cfd6d6c2315ea339e1fb_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a"],
     },
     "cake_batch_deepgemm_fp8_d074b0a27a9bdf70184d": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_d074b0a27a9bdf70184d",
@@ -674,11 +734,11 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
-    "cake_batch_deepgemm_fp8_d74da5f79ee356250373": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_d74da5f79ee356250373",
+    "cake_batch_deepgemm_fp8_d5da7d7f624fde4d51c8": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_d5da7d7f624fde4d51c8",
         "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d74da5f79ee356250373_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d74da5f79ee356250373_binding.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d5da7d7f624fde4d51c8_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_d5da7d7f624fde4d51c8_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
         "ffi_entry": "run",
@@ -698,18 +758,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a"],
     },
-    "cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
     "cake_batch_deepgemm_fp8_eb727f8d280f83b52730": {
         "kernel": "kernel_cake_batch_deepgemm_fp8_eb727f8d280f83b52730",
         "sources": [
@@ -720,30 +768,6 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         "tma_abi": "grid_constant",
         "arg_plan": "plan6",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
-        "arches": ["sm_100a", "sm_103a"],
-    },
-    "cake_batch_deepgemm_fp8_f257a19ccc7a31cca355": {
-        "kernel": "kernel_cake_batch_deepgemm_fp8_f257a19ccc7a31cca355",
-        "sources": [
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_f257a19ccc7a31cca355_kernel.cu",
-            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_f257a19ccc7a31cca355_binding.cu",
-        ],
-        "compile_flags": ["--use_fast_math"],
-        "ffi_entry": "run",
-        "tma_abi": "grid_constant",
-        "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
     "cake_batch_deepgemm_fp8_f376efa5168590657e71": {
@@ -770,6 +794,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a": {
+        "kernel": "kernel_cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a",
+        "sources": [
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a_kernel.cu",
+            "cake_batch_deepgemm_fp8/cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a_binding.cu",
+        ],
+        "compile_flags": ["--use_fast_math"],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan3",
+        "arches": ["sm_100a", "sm_103a"],
+    },
 }
 
 MODULES: dict[str, dict[str, str]] = {
@@ -781,9 +817,17 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_02cd3d43724acdbda982",
     },
-    "cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88_sm_100a": {
+    "cake_batch_deepgemm_fp8_0af0ccf65f4c55c383f4_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88",
+        "program": "cake_batch_deepgemm_fp8_0af0ccf65f4c55c383f4",
+    },
+    "cake_batch_deepgemm_fp8_0af0ccf65f4c55c383f4_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_0af0ccf65f4c55c383f4",
+    },
+    "cake_batch_deepgemm_fp8_0db53ce746a8da419343_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_0db53ce746a8da419343",
     },
     "cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b_sm_100a": {
         "arch": "sm_100a",
@@ -805,9 +849,13 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_1b7b5278ee7b1be99f15",
     },
-    "cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6_sm_100a": {
+    "cake_batch_deepgemm_fp8_1f648c51c814b0a20548_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6",
+        "program": "cake_batch_deepgemm_fp8_1f648c51c814b0a20548",
+    },
+    "cake_batch_deepgemm_fp8_1f648c51c814b0a20548_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_1f648c51c814b0a20548",
     },
     "cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9_sm_100a": {
         "arch": "sm_100a",
@@ -821,14 +869,6 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_215f20f0a5f44903608b",
     },
-    "cake_batch_deepgemm_fp8_26a4bc38b0aa6b7acaad_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_26a4bc38b0aa6b7acaad",
-    },
-    "cake_batch_deepgemm_fp8_26a4bc38b0aa6b7acaad_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_26a4bc38b0aa6b7acaad",
-    },
     "cake_batch_deepgemm_fp8_2c120bce2db6a19bf130_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_2c120bce2db6a19bf130",
@@ -837,13 +877,37 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_2c120bce2db6a19bf130",
     },
-    "cake_batch_deepgemm_fp8_39395937e1b02f1d7aa8_sm_103a": {
+    "cake_batch_deepgemm_fp8_32ea93306bd09dedba46_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_39395937e1b02f1d7aa8",
+        "program": "cake_batch_deepgemm_fp8_32ea93306bd09dedba46",
     },
-    "cake_batch_deepgemm_fp8_3982d376aa7b9dbf4dcb_sm_103a": {
+    "cake_batch_deepgemm_fp8_373c73aa591bb7f4ed7f_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_3982d376aa7b9dbf4dcb",
+        "program": "cake_batch_deepgemm_fp8_373c73aa591bb7f4ed7f",
+    },
+    "cake_batch_deepgemm_fp8_41af09e0c42e80bf1963_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_41af09e0c42e80bf1963",
+    },
+    "cake_batch_deepgemm_fp8_41af09e0c42e80bf1963_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_41af09e0c42e80bf1963",
+    },
+    "cake_batch_deepgemm_fp8_442708989397f5a42bd2_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_442708989397f5a42bd2",
+    },
+    "cake_batch_deepgemm_fp8_442708989397f5a42bd2_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_442708989397f5a42bd2",
+    },
+    "cake_batch_deepgemm_fp8_46272696cde7145a5da4_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_46272696cde7145a5da4",
+    },
+    "cake_batch_deepgemm_fp8_46272696cde7145a5da4_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_46272696cde7145a5da4",
     },
     "cake_batch_deepgemm_fp8_53f48f6693638d36fbc2_sm_100a": {
         "arch": "sm_100a",
@@ -857,13 +921,9 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_54ec41340241b946c14e",
     },
-    "cake_batch_deepgemm_fp8_57c401152579ac3ac327_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_57c401152579ac3ac327",
-    },
-    "cake_batch_deepgemm_fp8_57c401152579ac3ac327_sm_103a": {
+    "cake_batch_deepgemm_fp8_572e5ae5b0712365bee3_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_57c401152579ac3ac327",
+        "program": "cake_batch_deepgemm_fp8_572e5ae5b0712365bee3",
     },
     "cake_batch_deepgemm_fp8_59edc7df733ec03c53d5_sm_100a": {
         "arch": "sm_100a",
@@ -873,37 +933,21 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_59edc7df733ec03c53d5",
     },
+    "cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1",
+    },
+    "cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1",
+    },
     "cake_batch_deepgemm_fp8_5c3089a67f23fe866223_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_5c3089a67f23fe866223",
     },
-    "cake_batch_deepgemm_fp8_5ef7e95b2b466da8875d_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_5ef7e95b2b466da8875d",
-    },
-    "cake_batch_deepgemm_fp8_646c28382e13d4a9eabe_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_646c28382e13d4a9eabe",
-    },
-    "cake_batch_deepgemm_fp8_6762afe719bc00c74cb8_sm_100a": {
+    "cake_batch_deepgemm_fp8_5c5bed387a6f65778b39_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_6762afe719bc00c74cb8",
-    },
-    "cake_batch_deepgemm_fp8_6762afe719bc00c74cb8_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_6762afe719bc00c74cb8",
-    },
-    "cake_batch_deepgemm_fp8_6a1dec9afccecea359db_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_6a1dec9afccecea359db",
-    },
-    "cake_batch_deepgemm_fp8_6a1dec9afccecea359db_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_6a1dec9afccecea359db",
-    },
-    "cake_batch_deepgemm_fp8_71bde7c4a72fbaf55012_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_71bde7c4a72fbaf55012",
+        "program": "cake_batch_deepgemm_fp8_5c5bed387a6f65778b39",
     },
     "cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4_sm_100a": {
         "arch": "sm_100a",
@@ -924,6 +968,10 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_87a3c50a96af69fbae87_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_87a3c50a96af69fbae87",
+    },
+    "cake_batch_deepgemm_fp8_896b65115baf37c01d60_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_896b65115baf37c01d60",
     },
     "cake_batch_deepgemm_fp8_8c4067fce6c805ee9300_sm_100a": {
         "arch": "sm_100a",
@@ -965,13 +1013,13 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_929a5561abc99caa7f4f",
     },
-    "cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
-    },
-    "cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6_sm_103a": {
+    "cake_batch_deepgemm_fp8_967f03d4b4e131c6805e_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6",
+        "program": "cake_batch_deepgemm_fp8_967f03d4b4e131c6805e",
+    },
+    "cake_batch_deepgemm_fp8_9b61544d1069fbfd8991_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_9b61544d1069fbfd8991",
     },
     "cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2_sm_100a": {
         "arch": "sm_100a",
@@ -989,17 +1037,29 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a",
     },
-    "cake_batch_deepgemm_fp8_b6d143c6475ade2655a3_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_b6d143c6475ade2655a3",
-    },
-    "cake_batch_deepgemm_fp8_b9135507532a235be639_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_b9135507532a235be639",
-    },
-    "cake_batch_deepgemm_fp8_b9f7146048e524aaea2a_sm_100a": {
+    "cake_batch_deepgemm_fp8_a7f7bdd074d89a3b5a42_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_b9f7146048e524aaea2a",
+        "program": "cake_batch_deepgemm_fp8_a7f7bdd074d89a3b5a42",
+    },
+    "cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc",
+    },
+    "cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc",
+    },
+    "cake_batch_deepgemm_fp8_abcc0d30303f2186e2e3_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_abcc0d30303f2186e2e3",
+    },
+    "cake_batch_deepgemm_fp8_b43e6452d8e025211a6b_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_b43e6452d8e025211a6b",
+    },
+    "cake_batch_deepgemm_fp8_b43e6452d8e025211a6b_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_b43e6452d8e025211a6b",
     },
     "cake_batch_deepgemm_fp8_ba92e96364e30012640e_sm_100a": {
         "arch": "sm_100a",
@@ -1025,6 +1085,10 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_c580972984193a63c3c2",
     },
+    "cake_batch_deepgemm_fp8_c7570735254ecd7e16c0_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_c7570735254ecd7e16c0",
+    },
     "cake_batch_deepgemm_fp8_c9415f6c743e6bb72fc7_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_c9415f6c743e6bb72fc7",
@@ -1040,6 +1104,10 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_ce9db47474bd124735cc_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_ce9db47474bd124735cc",
+    },
+    "cake_batch_deepgemm_fp8_cfd6d6c2315ea339e1fb_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_cfd6d6c2315ea339e1fb",
     },
     "cake_batch_deepgemm_fp8_d074b0a27a9bdf70184d_sm_100a": {
         "arch": "sm_100a",
@@ -1057,25 +1125,17 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_d22ea585c19c028e29ae",
     },
-    "cake_batch_deepgemm_fp8_d74da5f79ee356250373_sm_100a": {
+    "cake_batch_deepgemm_fp8_d5da7d7f624fde4d51c8_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_d74da5f79ee356250373",
+        "program": "cake_batch_deepgemm_fp8_d5da7d7f624fde4d51c8",
     },
-    "cake_batch_deepgemm_fp8_d74da5f79ee356250373_sm_103a": {
+    "cake_batch_deepgemm_fp8_d5da7d7f624fde4d51c8_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_d74da5f79ee356250373",
+        "program": "cake_batch_deepgemm_fp8_d5da7d7f624fde4d51c8",
     },
     "cake_batch_deepgemm_fp8_e306f272ed478b53bd16_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_batch_deepgemm_fp8_e306f272ed478b53bd16",
-    },
-    "cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a",
-    },
-    "cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a",
     },
     "cake_batch_deepgemm_fp8_eb727f8d280f83b52730_sm_100a": {
         "arch": "sm_100a",
@@ -1084,22 +1144,6 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_batch_deepgemm_fp8_eb727f8d280f83b52730_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_eb727f8d280f83b52730",
-    },
-    "cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43",
-    },
-    "cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43",
-    },
-    "cake_batch_deepgemm_fp8_f257a19ccc7a31cca355_sm_100a": {
-        "arch": "sm_100a",
-        "program": "cake_batch_deepgemm_fp8_f257a19ccc7a31cca355",
-    },
-    "cake_batch_deepgemm_fp8_f257a19ccc7a31cca355_sm_103a": {
-        "arch": "sm_103a",
-        "program": "cake_batch_deepgemm_fp8_f257a19ccc7a31cca355",
     },
     "cake_batch_deepgemm_fp8_f376efa5168590657e71_sm_100a": {
         "arch": "sm_100a",
@@ -1117,16 +1161,24 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43",
     },
+    "cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a",
+    },
+    "cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a",
+    },
 }
 
 SERVING_PROGRAMS: dict[str, str] = {
     "n4096_k7168_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_1405732af0d574df0139",
-    "n4096_k7168_g32_s6e1_evict_normal_l2": "cake_batch_deepgemm_fp8_6762afe719bc00c74cb8",
+    "n4096_k7168_g32_s6e1_evict_normal_l2": "cake_batch_deepgemm_fp8_46272696cde7145a5da4",
     "n4096_k7168_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_ce9db47474bd124735cc",
-    "n4096_k7168_g64_s6e1_evict_normal_l2": "cake_batch_deepgemm_fp8_26a4bc38b0aa6b7acaad",
+    "n4096_k7168_g64_s6e1_evict_normal_l2": "cake_batch_deepgemm_fp8_b43e6452d8e025211a6b",
     "n7168_k2048_g32_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_8f4bdd22c19c1467e2e6",
     "n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_a7617f8e2deb15f1eb4a",
-    "sm_103a:n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_646c28382e13d4a9eabe",
+    "sm_103a:n7168_k2048_g32_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_c7570735254ecd7e16c0",
     "n7168_k2048_g64_s5e2_evict_normal_l8": "cake_batch_deepgemm_fp8_0fbe46cd4a67fa93336b",
     "n7168_k2048_g64_s5e3_evict_normal_l8": "cake_batch_deepgemm_fp8_90284e378e31f0382475",
 }
@@ -1404,18 +1456,18 @@ _ROUTES: tuple[_Route, ...] = (
     # side of the MMA) of each architecture.
     _point("sm_103a", "seed_masked_bn__b1_m128_n4096_k7168",
            ((1, 128, 4096, 7168),), None,
-           (("cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43", "masked_bn", 32, 256),),
+           (("cake_batch_deepgemm_fp8_1f648c51c814b0a20548", "masked_bn", 32, 256),),
            parent="seed_masked_bn"),
     _point(_BOTH, "seed_masked_bn__b1_m256_n4096_k7168",
            ((1, 256, 4096, 7168),), None,
-           (("cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a", "masked_bn", 64, 128),),
+           (("cake_batch_deepgemm_fp8_d5da7d7f624fde4d51c8", "masked_bn", 64, 128),),
            parent="seed_masked_bn"),
     _point("sm_100a", "seed_swap_bm",
            ((1, 1024, 7168, 2048), (4, 128, 7168, 2048), (4, 256, 7168, 2048),
             (8, 128, 4096, 7168), (8, 128, 7168, 2048), (8, 256, 4096, 7168),
             (64, 128, 4096, 7168), (64, 256, 4096, 7168), (64, 256, 7168, 2048),
             (128, 128, 4096, 7168), (128, 128, 7168, 2048)), None,
-           (("cake_batch_deepgemm_fp8_f257a19ccc7a31cca355", "masked_bn", 128, 128),),
+           (("cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
     _point("sm_100a", "seed_swap_bm__bm192",
            ((1, 8192, 4096, 7168), (4, 1024, 7168, 2048), (8, 256, 7168, 2048),
@@ -1425,20 +1477,20 @@ _ROUTES: tuple[_Route, ...] = (
     _point("sm_100a", "seed_swap_bm__bm224",
            ((1, 1024, 4096, 7168), (1, 8192, 7168, 2048), (1, 16384, 4096, 7168),
             (1, 16384, 7168, 2048), (4, 1024, 4096, 7168)), None,
-           (("cake_batch_deepgemm_fp8_6a1dec9afccecea359db", "masked_bn", 128, 128),),
+           (("cake_batch_deepgemm_fp8_41af09e0c42e80bf1963", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
     _point("sm_100a", "seed_swap_bm__b_evict_first",
            ((64, 128, 7168, 2048),), None,
-           (("cake_batch_deepgemm_fp8_d74da5f79ee356250373", "masked_bn", 128, 128),),
+           (("cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
     _point("sm_103a", "seed_swap_bm",
            ((1, 8192, 4096, 7168), (8, 128, 4096, 7168), (8, 256, 7168, 2048),
             (64, 256, 4096, 7168), (64, 256, 7168, 2048)), None,
-           (("cake_batch_deepgemm_fp8_f257a19ccc7a31cca355", "masked_bn", 128, 128),),
+           (("cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
     _point("sm_103a", "seed_swap_bm__bm160",
            ((1, 1024, 7168, 2048), (8, 256, 4096, 7168)), None,
-           (("cake_batch_deepgemm_fp8_5ef7e95b2b466da8875d", "masked_bn", 128, 128),),
+           (("cake_batch_deepgemm_fp8_abcc0d30303f2186e2e3", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
     _point("sm_103a", "seed_swap_bm__bm192",
            ((4, 1024, 4096, 7168), (4, 1024, 7168, 2048), (8, 1024, 4096, 7168)), None,
@@ -1447,16 +1499,16 @@ _ROUTES: tuple[_Route, ...] = (
     _point("sm_103a", "seed_swap_bm__bm208",
            ((1, 16384, 4096, 7168), (1, 16384, 7168, 2048),
             (8, 1024, 7168, 2048)), None,
-           (("cake_batch_deepgemm_fp8_39395937e1b02f1d7aa8", "masked_bn", 128, 128),),
+           (("cake_batch_deepgemm_fp8_32ea93306bd09dedba46", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
     _point("sm_103a", "seed_swap_bm__bm224",
            ((1, 8192, 7168, 2048),), None,
-           (("cake_batch_deepgemm_fp8_6a1dec9afccecea359db", "masked_bn", 128, 128),),
+           (("cake_batch_deepgemm_fp8_41af09e0c42e80bf1963", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
     _point("sm_103a", "seed_swap_bm__b_evict_first",
            ((64, 128, 4096, 7168), (64, 128, 7168, 2048), (128, 128, 4096, 7168),
             (128, 128, 7168, 2048)), None,
-           (("cake_batch_deepgemm_fp8_d74da5f79ee356250373", "masked_bn", 128, 128),),
+           (("cake_batch_deepgemm_fp8_abae21f2baf86ce43ebc", "masked_bn", 128, 128),),
            parent="seed_swap_bm"),
     # The N=512, K=128 geometry, by B, CTA = B * ceil(expected_m / 128) and M. A
     # one-shot n512_k128 grid covers every (group, M tile, N tile) a masked_m <= M
@@ -1492,23 +1544,23 @@ _ROUTES: tuple[_Route, ...] = (
     # Exact (B, M, N, K, expected_m) points of the masked BLOCK_N family.
     _point("sm_100a", "seed_masked_bn__b1_m128_n4096_k7168_em102",
            ((1, 128, 4096, 7168),), 102,
-           (("cake_batch_deepgemm_fp8_ec99719e1e649d9ddb43", "masked_bn", 32, 256),),
+           (("cake_batch_deepgemm_fp8_1f648c51c814b0a20548", "masked_bn", 32, 256),),
            parent="seed_masked_bn"),
     _point("sm_100a", "seed_masked_bn__b4_m256_n4096_k7168_em141",
            ((4, 256, 4096, 7168),), 141,
-           (("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128),),
+           (("cake_batch_deepgemm_fp8_0af0ccf65f4c55c383f4", "masked_bn", 192, 128),),
            parent="seed_masked_bn"),
     _point("sm_100a", "seed_masked_bn__b1_m8192_n128_k512_em5116",
            ((1, 8192, 128, 512),), 5116,
-           (("cake_batch_deepgemm_fp8_1eaf7d9c7921b59547f6", "masked_bn", 64, 256),),
+           (("cake_batch_deepgemm_fp8_cfd6d6c2315ea339e1fb", "masked_bn", 64, 256),),
            parent="seed_masked_bn"),
     _point("sm_100a", "seed_masked_bn__b4_m1024_n128_k512_em487",
            ((4, 1024, 128, 512),), 487,
-           (("cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88", "masked_bn", 32, 256),),
+           (("cake_batch_deepgemm_fp8_9b61544d1069fbfd8991", "masked_bn", 32, 256),),
            parent="seed_masked_bn"),
     _point("sm_100a", "seed_masked_bn__b8_m1024_n128_k512_em380",
            ((8, 1024, 128, 512),), 380,
-           (("cake_batch_deepgemm_fp8_0924c6ddd05c4e52de88", "masked_bn", 32, 256),),
+           (("cake_batch_deepgemm_fp8_9b61544d1069fbfd8991", "masked_bn", 32, 256),),
            parent="seed_masked_bn"),
     # N=4096, K=7168 bands of the masked family, by CTA = B * ceil(expected_m / 128).
     _band("seed_masked_bn__n4096_k7168_bn32", (4096, 7168),
@@ -1516,7 +1568,7 @@ _ROUTES: tuple[_Route, ...] = (
           {"sm_100a": ((None, 1),),
            "sm_103a": ((None, 1),)}),
     _band("seed_masked_bn__n4096_k7168_bn64", (4096, 7168),
-          ("cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a", "masked_bn", 64, 128),
+          ("cake_batch_deepgemm_fp8_d5da7d7f624fde4d51c8", "masked_bn", 64, 128),
           {"sm_100a": ((2, 2),)}),
     _band("seed_masked_bn__n4096_k7168_bn64", (4096, 7168),
           ("cake_batch_deepgemm_fp8_a51ac2146dc44e7c0fd2", "masked_bn", 64, 128),
@@ -1526,10 +1578,10 @@ _ROUTES: tuple[_Route, ...] = (
           {"sm_100a": ((3, 3),),
            "sm_103a": ((3, 3),)}),
     _band("seed_masked_bn__n4096_k7168_bn112", (4096, 7168),
-          ("cake_batch_deepgemm_fp8_71bde7c4a72fbaf55012", "masked_bn", 112, 128),
+          ("cake_batch_deepgemm_fp8_a7f7bdd074d89a3b5a42", "masked_bn", 112, 128),
           {"sm_100a": ((4, 4),)}),
     _band("seed_masked_bn__n4096_k7168_bn112", (4096, 7168),
-          ("cake_batch_deepgemm_fp8_9cb48a4615c58feb00f6", "masked_bn", 112, 128),
+          ("cake_batch_deepgemm_fp8_967f03d4b4e131c6805e", "masked_bn", 112, 128),
           {"sm_103a": ((4, 4),)}),
     _band("seed_masked_bn__n4096_k7168_bn128", (4096, 7168),
           ("cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4", "masked_bn", 128, 128),
@@ -1540,7 +1592,7 @@ _ROUTES: tuple[_Route, ...] = (
           {"sm_100a": ((5, 5), (10, 10)),
            "sm_103a": ((5, 5), (10, 10))}),
     _band("seed_masked_bn__n4096_k7168_bn192", (4096, 7168),
-          ("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128),
+          ("cake_batch_deepgemm_fp8_0af0ccf65f4c55c383f4", "masked_bn", 192, 128),
           {"sm_100a": ((6, 6), (11, 11), (12, 12), (13, 13), (17, 17), (18, 18),
                        (19, 20), (25, 26), (33, 33)),
            "sm_103a": ((6, 6), (11, 11), (12, 12), (13, 13), (17, 17), (18, 19),
@@ -1555,8 +1607,10 @@ _ROUTES: tuple[_Route, ...] = (
           ("cake_batch_deepgemm_fp8_02cd3d43724acdbda982", "masked_bn", 224, 128),
           {"sm_100a": ((15, 15), (23, 23), (30, 31), (38, 38), (45, 46), (52, 54),
                        (60, 62), (67, 70), (75, 77), (83, 85), (91, 93), (99, 101),
-                       (107, 109), (116, 116), (124, 124), (132, 132), (140, 140)),
-           "sm_103a": ((8, 8), (16, 16), (23, 24), (31, 32), (39, 40), (46, 48),
+                       (107, 109), (116, 116), (124, 124), (132, 132), (140, 140))}),
+    _band("seed_masked_bn__n4096_k7168_bn224", (4096, 7168),
+          ("cake_batch_deepgemm_fp8_0db53ce746a8da419343", "masked_bn", 224, 128),
+          {"sm_103a": ((8, 8), (16, 16), (23, 24), (31, 32), (39, 40), (46, 48),
                        (54, 56), (61, 64), (69, 72), (77, 80), (85, 88), (93, 96),
                        (102, 104), (110, 112), (119, 120), (127, 128), (136, 136),
                        (144, 144))}),
@@ -1571,16 +1625,16 @@ _ROUTES: tuple[_Route, ...] = (
                        (121, 126), (129, 135), (137, 143), (145, None))}),
     # N=7168, K=2048 bands of the masked family, by CTA = B * ceil(expected_m / 128).
     _band("seed_masked_bn__n7168_k2048_bn64", (7168, 2048),
-          ("cake_batch_deepgemm_fp8_e40c2e351b7ee1f9e07a", "masked_bn", 64, 128),
+          ("cake_batch_deepgemm_fp8_d5da7d7f624fde4d51c8", "masked_bn", 64, 128),
           {"sm_100a": ((None, 1),)}),
     _band("seed_masked_bn__n7168_k2048_bn112", (7168, 2048),
-          ("cake_batch_deepgemm_fp8_71bde7c4a72fbaf55012", "masked_bn", 112, 128),
+          ("cake_batch_deepgemm_fp8_a7f7bdd074d89a3b5a42", "masked_bn", 112, 128),
           {"sm_100a": ((2, 2),)}),
     _band("seed_masked_bn__n7168_k2048_bn128", (7168, 2048),
           ("cake_batch_deepgemm_fp8_741ad4b48907eb89c3f4", "masked_bn", 128, 128),
           {"sm_100a": ((5, 5),)}),
     _band("seed_masked_bn__n7168_k2048_bn48", (7168, 2048),
-          ("cake_batch_deepgemm_fp8_b6d143c6475ade2655a3", "masked_bn", 48, 128),
+          ("cake_batch_deepgemm_fp8_896b65115baf37c01d60", "masked_bn", 48, 128),
           {"sm_103a": ((None, 1),)}),
     _band("seed_masked_bn__n7168_k2048_bn96", (7168, 2048),
           ("cake_batch_deepgemm_fp8_fe5a14cba1d988faaf43", "masked_bn", 96, 128),
@@ -1589,7 +1643,7 @@ _ROUTES: tuple[_Route, ...] = (
           ("cake_batch_deepgemm_fp8_8c4067fce6c805ee9300", "masked_bn", 144, 128),
           {"sm_103a": ((3, 3), (6, 6))}),
     _band("seed_masked_bn__n7168_k2048_bn192", (7168, 2048),
-          ("cake_batch_deepgemm_fp8_20c8e0726c5c51b098d9", "masked_bn", 192, 128),
+          ("cake_batch_deepgemm_fp8_0af0ccf65f4c55c383f4", "masked_bn", 192, 128),
           {"sm_100a": ((3, 3), (6, 6), (7, 7), (10, 10), (11, 11), (15, 15)),
            "sm_103a": ((4, 4), (7, 7), (8, 8), (11, 11), (12, 12), (16, 16))}),
     _band("seed_masked_bn__n7168_k2048_bn208", (7168, 2048),
@@ -1599,8 +1653,10 @@ _ROUTES: tuple[_Route, ...] = (
     _band("seed_masked_bn__n7168_k2048_bn224", (7168, 2048),
           ("cake_batch_deepgemm_fp8_02cd3d43724acdbda982", "masked_bn", 224, 128),
           {"sm_100a": ((9, 9), (13, 13), (17, 18), (22, 23), (26, 27), (30, 32),
-                       (35, 37), (40, 41), (45, 46), (50, 50), (55, 55), (60, 60)),
-           "sm_103a": ((9, 9), (14, 14), (18, 19), (22, 23), (27, 28), (31, 33),
+                       (35, 37), (40, 41), (45, 46), (50, 50), (55, 55), (60, 60))}),
+    _band("seed_masked_bn__n7168_k2048_bn224", (7168, 2048),
+          ("cake_batch_deepgemm_fp8_0db53ce746a8da419343", "masked_bn", 224, 128),
+          {"sm_103a": ((9, 9), (14, 14), (18, 19), (22, 23), (27, 28), (31, 33),
                        (36, 38), (41, 42), (46, 47), (51, 52), (56, 57), (61, 61),
                        (66, 66), (71, 71))}),
     _band("seed_masked_bn__n7168_k2048_bn240", (7168, 2048),
@@ -1612,23 +1668,23 @@ _ROUTES: tuple[_Route, ...] = (
                        (62, 65), (67, 70), (72, None))}),
     # N=128, K=512 bands of the masked family, by CTA = B * ceil(expected_m / 128).
     _band("seed_masked_bn__n128_k512_bn32", (128, 512),
-          ("cake_batch_deepgemm_fp8_b9f7146048e524aaea2a", "masked_bn", 32, 128),
+          ("cake_batch_deepgemm_fp8_5c5bed387a6f65778b39", "masked_bn", 32, 128),
           {"sm_100a": ((None, 18), (19, 37))}),
     _band("seed_masked_bn__n128_k512_bn32", (128, 512),
-          ("cake_batch_deepgemm_fp8_3982d376aa7b9dbf4dcb", "masked_bn", 32, 128),
+          ("cake_batch_deepgemm_fp8_373c73aa591bb7f4ed7f", "masked_bn", 32, 128),
           {"sm_103a": ((None, 19), (20, 38))}),
     _band("seed_masked_bn__n128_k512_bn48", (128, 512),
           ("cake_batch_deepgemm_fp8_d22ea585c19c028e29ae", "masked_bn", 48, 128),
           {"sm_100a": ((38, 49),)}),
     _band("seed_masked_bn__n128_k512_bn48", (128, 512),
-          ("cake_batch_deepgemm_fp8_b9135507532a235be639", "masked_bn", 48, 128),
+          ("cake_batch_deepgemm_fp8_572e5ae5b0712365bee3", "masked_bn", 48, 128),
           {"sm_103a": ((39, 50),)}),
     _band("seed_masked_bn__n128_k512_bn64", (128, 512),
           ("cake_batch_deepgemm_fp8_2c120bce2db6a19bf130", "masked_bn", 64, 128),
           {"sm_100a": ((50, 74),),
            "sm_103a": ((51, 76),)}),
     _band("seed_masked_bn__n128_k512_bn128", (128, 512),
-          ("cake_batch_deepgemm_fp8_c1541da977c9a379e49b", "masked_bn", 128, 128),
+          ("cake_batch_deepgemm_fp8_442708989397f5a42bd2", "masked_bn", 128, 128),
           {"sm_100a": ((75, None),),
            "sm_103a": ((77, None),)}),
     # The remaining N=128, K=512 shapes (B > 8).
@@ -1669,13 +1725,13 @@ _ROUTES: tuple[_Route, ...] = (
               "m224"),
     # The remaining shapes of the large geometries.
     _nk("seed_large_nk_n6144_k7168", (6144, 7168),
-        ("cake_batch_deepgemm_fp8_57c401152579ac3ac327", "large_nk")),
+        ("cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a", "large_nk")),
     _nk("seed_large_nk_n7168_k3072", (7168, 3072),
-        ("cake_batch_deepgemm_fp8_57c401152579ac3ac327", "large_nk")),
+        ("cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a", "large_nk")),
     _nk("seed_large_nk_n4096_k4096", (4096, 4096),
-        ("cake_batch_deepgemm_fp8_57c401152579ac3ac327", "large_nk")),
+        ("cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a", "large_nk")),
     _nk("seed_large_nk_n4096_k2048", (4096, 2048),
-        ("cake_batch_deepgemm_fp8_57c401152579ac3ac327", "large_nk")),
+        ("cake_batch_deepgemm_fp8_fe5c9d56b105b23df15a", "large_nk")),
 )
 # fmt: on
 

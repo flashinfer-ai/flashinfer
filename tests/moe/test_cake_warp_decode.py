@@ -1117,12 +1117,12 @@ _GPU_SEED = 20260205
 
 # Token counts are the schedule / route-packer boundaries of each geometry plus
 # the rows that reach kernels no boundary row launches (named by the short hash
-# of their generated source file).
+# of their generated source file). Rows that differ only in workfeed CTAs launch
+# the same kernels and are not listed.
 _GPU_GEOMETRIES = (
-    _GpuGeometry("e512_i512_k10", 2048, 512, 512, 10, (1, 3, 4, 32)),
-    _GpuGeometry(
-        "e60_i1536_k4", 2048, 1536, 60, 4, (1, 4, 5, 10, 11, 12, 14, 15, 16, 17, 32)
-    ),
+    # T2: sm103 finalize ecc88726. T4: sm100 FC2 984506f0. T5: sm103 finalize b13a3c73.
+    _GpuGeometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 3, 4, 5, 32)),
+    _GpuGeometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 4, 5, 10, 11, 12, 14, 15, 32)),
     _GpuGeometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 32), SiLU()),
     _GpuGeometry("e384_i768_k4", 2560, 768, 384, 4, (1, 32)),
     # T7: sm100 FC2 5c23234a. T11: sm103 FC1 5304d683. T18: sm100 finalize
@@ -1130,10 +1130,9 @@ _GPU_GEOMETRIES = (
     _GpuGeometry(
         "e128_i768_k8", 2048, 768, 128, 8, (1, 7, 8, 9, 10, 11, 15, 16, 18, 21, 32)
     ),
-    _GpuGeometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 11, 12, 32)),
-    # T16: sm103 FC1 57d9c60c and FC2 8acc0c77.
-    _GpuGeometry("e256_i512_k8", 2048, 512, 256, 8, (1, 15, 16, 32)),
-    _GpuGeometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 32)),
+    _GpuGeometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 6, 11, 12, 32)),
+    _GpuGeometry("e256_i512_k8", 2048, 512, 256, 8, (1, 15, 16, 18, 19, 30, 32)),
+    _GpuGeometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 5, 6, 8, 25, 26, 32)),
     _GpuGeometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 15, 16, 32)),
     _GpuGeometry(
         "e128_i3072_k4_swiglu_oa",
@@ -1141,8 +1140,10 @@ _GPU_GEOMETRIES = (
         3072,
         128,
         4,
-        # T4: first packed row. T5: sm100 FC1 5312a738 and FC2 8acc0c77; sm103 FC2 8acc0c77.
-        (1, 3, 4, 5, 32),
+        # T4: first sm100 packed row. T5: sm100 FC1 5312a738 and FC2 8acc0c77.
+        # sm103: fused route-pack FC1 dec95a54 (T1..T15) or 89860cc8 (T16..T32),
+        # then FC2 372605d6.
+        (1, 3, 4, 5, 15, 16, 32),
         SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
     ),
     _GpuGeometry(
@@ -1159,7 +1160,8 @@ _GPU_GEOMETRIES = (
     _GpuGeometry("h4096_e512_i512_k10", 4096, 512, 512, 10, (1, 2, 16, 32)),
     _GpuGeometry("h4096_e512_i256_k10", 4096, 256, 512, 10, (1, 2, 16, 32)),
     _GpuGeometry("h3072_e256_i768_k8", 3072, 768, 256, 8, (1, 2, 16, 32)),
-    _GpuGeometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 16, 32)),
+    # T8, T10: linear-grid FC2 cd21fb85 (T9 keeps the pool FC2 b0e329ce).
+    _GpuGeometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 8, 9, 10, 16, 32)),
 )
 _GPU_ROWS = [
     pytest.param(geometry, num_tokens, id=f"{geometry.name}-t{num_tokens:02d}")

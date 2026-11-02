@@ -187,17 +187,21 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
         self.occupancy = 1
         if impl_desc.get("architecture", "sm_100") != "sm_100":
             raise ValueError(f"Unsupported GenPhase architecture {self.architecture}.")
+        # Gather4 writes one complete 128-byte activation swizzle atom per row.
+        # Packed NVFP4 therefore uses K256, while FP8 activations use K128.
+        gather_tile_k = 1024 // int(self.b_dtype.width)
+        geometries = [((256, 128, gather_tile_k), (4, 1))]
+        if self.quant_kind in (QuantKind.mxfp8_e4m3, QuantKind.mxfp8_e5m2, QuantKind.mxfp4_mxfp8):
+            geometries.append(((256, 64, 128), (4, 1)))
+        if self.quant_kind in (QuantKind.mxfp8_e4m3, QuantKind.mxfp8_e5m2):
+            geometries.append(((256, 64, 128), (2, 1)))
         if (
-            self.quant_kind != QuantKind.mxfp8_e4m3
-            or (self.mma_tiler_mnk, self.cluster_shape_mn) not in (
-                ((256, 128, 128), (4, 1)),
-                ((256, 64, 128), (4, 1)),
-                ((256, 64, 128), (2, 1)),
-            )
+            self.quant_kind not in (QuantKind.nvfp4, QuantKind.mxfp8_e4m3, QuantKind.mxfp8_e5m2, QuantKind.mxfp4_mxfp8)
+            or (self.mma_tiler_mnk, self.cluster_shape_mn) not in geometries
             or self.schedule_mode != "grouped"
             or self.reduce_topk_in_kernel
         ):
-            raise ValueError("Blackwell GenPhase requires MXFP8 E4M3, N128/CGA4 or N64/CGA2/CGA4, grouped scheduling and separate reduction.")
+            raise ValueError("Blackwell GenPhase requires NVFP4, MXFP8 E4M3/E5M2 or mixed MXFP4/MXFP8, an admitted Gather4 geometry, grouped scheduling and separate reduction.")
         self.threads_per_cta = 12 * 32
         self.local_expert_count = self.expert_count // self.world_size
         self.cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
@@ -385,10 +389,10 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 self.cluster_shape_mn in ((2, 1), (4, 1))
                 and self.mma_tiler_mnk == (256, 64, 128)
                 and self.use_2cta_instrs
-                and (self.quant_kind == QuantKind.mxfp8_e4m3
+                and (self.quant_kind in (QuantKind.mxfp8_e4m3, QuantKind.mxfp8_e5m2)
                      or (self.quant_kind == QuantKind.mxfp4_mxfp8 and self.cluster_shape_mn == (4, 1)))
             ):
-                raise ValueError("GenPhase N64 requires MXFP8 E4M3 (or mixed FP4 at CGA4), tile (256, 64, 128), and cluster (2, 1) or (4, 1).")
+                raise ValueError("GenPhase N64 requires MXFP8 E4M3/E5M2 (or mixed FP4 at CGA4), tile (256, 64, 128), and cluster (2, 1) or (4, 1).")
         if mma_n not in (64, 128, 256):
             raise ValueError(f"mma_tiler N must be 64, 128, or 256, got {mma_n}.")
         if mma_k % instruction_k != 0:

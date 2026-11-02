@@ -43,7 +43,14 @@ def test_bf16_tc8_cap_preserves_unqualified_regions(
 @pytest.mark.parametrize("hidden,intermediate,top_k", [(256, 256, 3), (2048, 512, 10)])
 @pytest.mark.parametrize("workspace_kind", ["dispatch", "packed"])
 def test_bf16_tc8_matches_packed_routes_and_live_graph(
-    tokens, activation, hidden, intermediate, top_k, workspace_kind, monkeypatch
+    tokens,
+    activation,
+    hidden,
+    intermediate,
+    top_k,
+    workspace_kind,
+    monkeypatch,
+    experts=16,
 ):
     from flashinfer.utils import get_compute_capability
 
@@ -63,7 +70,7 @@ def test_bf16_tc8_matches_packed_routes_and_live_graph(
     from flashinfer.quantization.fp4_quantization import block_scale_interleave
 
     torch.manual_seed(7190 + tokens)
-    e, h, i, k = 16, hidden, intermediate, top_k
+    e, h, i, k = experts, hidden, intermediate, top_k
     branches = 2 if activation == "silu" else 1
     x = torch.randn(tokens, h, device="cuda", dtype=torch.bfloat16) * 0.1
     ids = (

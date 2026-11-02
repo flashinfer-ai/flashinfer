@@ -230,7 +230,13 @@ def require_cute_dsl_arch(device, native_only: bool = False) -> None:
     target ``device``'s architecture (see :func:`is_cute_dsl_arch_supported`)."""
     import torch
 
-    major, minor = torch.cuda.get_device_capability(device)
+    if isinstance(device, torch.device) and device.index is not None:
+        # Hot path (one call per GEMM dispatch): the cached per-device query.
+        from ..utils import get_compute_capability
+
+        major, minor = get_compute_capability(device)
+    else:
+        major, minor = torch.cuda.get_device_capability(device)
     if not is_cute_dsl_arch_supported(major, minor, native_only=native_only):
         hint = ""
         if not native_only:

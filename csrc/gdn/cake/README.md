@@ -15,10 +15,20 @@ with per-variant SASS equivalence checks against the generated originals.
   out its own `defines`: the decode bodies that bake their constants in-file
   take none, and some bodies take only a subset of the keys), and the
   template, kernel symbol and parameters of its host shim (`host_binding`).
+  Five fields are not stored: `flashinfer/jit/cake_gdn.py` derives them when
+  it loads the manifest, so the record name `<domain>_<schedule>_<12 hex>`
+  is load-bearing for the resolver key. `domain` is its first token,
+  `source_schedule` is `flashinfer.cake_gdn.generated.<domain>:<schedule>`,
+  `tma_abi` is `grid_constant` for prefill and `pointer` for decode,
+  `host_binding.entry` is `run_<name>`, and the record-level
+  `architectures` is the sorted union of its outputs' `architectures`. An
+  entry that spells one of these out must agree with the derived value; the
+  loader refuses a disagreeing entry.
 - `cuda/` holds one file per distinct kernel body. Kernels that run on
   several architectures carry each in `outputs[].architectures`; the
-  outputs of a record partition its `architectures`, and the loader
-  compiles the one output that lists the device's architecture. Genuine
+  outputs of a record are disjoint and their union is the record's derived
+  `architectures`; the loader compiles the one output that lists the
+  device's architecture. Genuine
   lowering differences sit behind exact `__CUDA_ARCH__` guards (SM107a takes
   the generic shared-address form, as Cake lowers it for every SM100-family
   target other than exact SM100a; the eight `fullgrid_vhold` prefill variants
@@ -63,15 +73,28 @@ with per-variant SASS equivalence checks against the generated originals.
   the templates take as `@NAME@` placeholders: `@ENTRY@`, `@MODULE_IDENT@`,
   `@CUDA_SYMBOL@` and `@SHIM_NAMESPACE@` come from `host_binding` (`entry`,
   `module_ident`, `cuda_symbol`, `shim_namespace`), every other placeholder
-  from `host_binding.params`. `flashinfer/jit/cake_gdn.py` renders the shim
-  text at load time; it is byte-identical to the former file
-  (`tests/gdn/cake_gdn_host_shim_sha256.json` pins it per variant). The
-  helpers the launchers share (device guard, tensor checks, dynamic
+  from `host_binding.params`. A `//@if metadata_i64` / `//@else` / `//@endif`
+  block of lines keeps its first arm for a record whose `metadata_i64` is true
+  and its second arm otherwise, so the int32-or-int64 metadata checks of the
+  SM107a prefill records render from their base's template; the directive
+  lines are dropped. `flashinfer/jit/cake_gdn.py` renders the shim
+  text at load time; `tests/cpu/gdn/cake_gdn_host_shim_sha256.json` pins
+  the rendered text per variant. The helpers the launchers share
+  (device guard, tensor checks, the `EncodeTma3D` TMA encoder, dynamic
   shared-memory opt-in) live in `host/cake_gdn_host_common.h`.
 
 `flashinfer/jit/cake_gdn.py` compiles the kernel to a cubin with `nvcc`,
 embeds it into the rendered host shim, and resolves requests to exactly one
 listed variant; requests outside the listed routes fail closed.
+
+Two more body-sharing `-D` knobs join `CAKE_GDN_KERNEL_SYMBOL` and `LAUNCH_MIN_BLOCKS`:
+`CAKE_GDN_METADATA_I64` (default 0 in-file) selects, inside the eight shared prefill bodies, the int32-or-int64 reads of
+`cu_seqlens` / `state_indices` / `checkpoint_cu_starts` and the `int metadata_i64_mask` kernel parameter (after `total_tiles`)
+(`CAKE_GDN_METADATA_I64_PARAM`); the SM107a `metadata_i64` records pass `-DCAKE_GDN_METADATA_I64=1` and their own
+kernel symbol and compile the same body as their SM100a/SM103a base record.  `CAKE_GDN_FP8_X2` (default `e4m3x2`)
+names the FP8 pair type inside the `cvt` instructions of the FP8-state bodies; the e5m2 records pass
+`-DCAKE_GDN_FP8_X2=e5m2x2`.  Expanding a shared body with a record's defines reproduces the former per-record file
+token for token (the e5m2 arm up to the names of a few local variables), under the per-variant SASS equivalence checks against the generated originals.
 
 ## Contracts
 

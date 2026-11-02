@@ -124,11 +124,12 @@ assert verify.route == "union"
 
 ## Generated sources
 
-`csrc/cake_msa_nvfp4_decode/` holds one device source and one host launcher
-per program, shared by every architecture the program compiles for, plus the
-family's device preamble (`*_device_common.cuh`). The device helpers that the
-preamble includes live in the repository's shared `csrc/cake_device_helpers/`;
-the host launchers include the shared host preamble
+`csrc/cake_msa_nvfp4_decode/` holds one device source per program and one host
+launcher per route, selected by the record's compile flags and shared by every
+architecture the program compiles for, plus the family's device preamble
+(`*_device_common.cuh`). The device helpers that the preamble includes live in
+the repository's shared `csrc/cake_device_helpers/`; the host launchers include
+the shared host preamble
 `csrc/blackwell_msa/cake_blackwell_msa_host_common.cuh`.
 `cake_jit.py` lists the programs once (`PROGRAMS`: architectures, route,
 split factor, last-round split or union query-group width and cluster flag,

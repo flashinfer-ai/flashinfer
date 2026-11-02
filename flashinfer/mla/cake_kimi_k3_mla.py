@@ -10,12 +10,15 @@ partials live in the caller's ``workspace_buffer``).
 Routing uses host-known scalars only.  Requests with more than ``WIDE_MIN_ROWS`` packed
 (token, head) rows whose longest KV is at least ``WIDE_MIN_KV`` tokens run the two-CTA wide
 kernel (``main_wide``: 128 rows per cluster of two CTAs); every other shape runs a swapped-AB
-row tile (``main_rt16`` .. ``main_rt96``: the smallest tile holding the request's rows).  Both
+row tile (``main_rt16`` .. ``main_rt96``: the smallest tile holding the request's rows).  A
+16- to 48-row tile plan that merges splits over at least ``LATE_TRIGGER_MIN_MAIN_CTAS`` main CTAs
+runs its tile's late-trigger program (``main_rt16_late`` .. ``main_rt48_late``).  Both routes
 share the split-KV merge kernels (warp-per-row reducers ``reduce_w4`` / ``reduce_w2`` /
-``reduce_w1`` for ``num_split <= 32``, the CTA reducer otherwise).  The plan (route, row tile,
-split count, grids, reducer) depends only on the batch shape, the longest KV and the device's
-SM count, so it is computed once per distinct shape (:func:`plan_attention`) and reused;
-device facts are read once per device.
+``reduce_w1`` for ``num_split <= 32``, a CTA reducer otherwise: ``reduce_cta_rt`` after a row
+tile whose reducer grid fits one wave, ``reduce_cta`` otherwise).  The plan (route, row tile,
+split count, grids, reducer) depends only on the batch shape, the longest KV and the device's SM
+count, so it is computed once per distinct shape (:func:`plan_attention`) and reused; device
+facts are read once per device.
 
 Query and KV views may be row-strided on every route: every row of ``query`` and every token
 row of ``kv_cache`` must be 576 contiguous FP8 elements, and rows must be equally spaced (a
@@ -44,7 +47,20 @@ MIN_TILES_PER_SPLIT = 2
 REDUCE_WARPS = 8  # warp reducer CTA: 256 threads
 REDUCE_WARP_MAX_SPLITS = 32  # lane s owns split s
 REDUCE_DIM_CHUNKS = 4  # CTA reducer: 128 latent dims per CTA
+REDUCE_CTA_FOLD_SPLITS = (
+    16  # CTA reducer: splits merged per fold iteration (8 warps x 2)
+)
+EMPTY_SPLIT_TRIM_MIN = (
+    2  # single-item CTA-reducer plans drop this many or more trailing empty splits
+)
 ROW_TILES = (16, 32, 48, 64, 96)
+# The late-trigger programs signal the reducer's launch (griddepcontrol.launch_dependents) after the
+# last PV commit; the other row-tile programs signal nothing, so the reducer launches when the main
+# grid exits.  The early launch pays off on grids of LATE_TRIGGER_MIN_MAIN_CTAS or more main CTAs
+# (32 to 152 measured on 152 SMs) and costs time on smaller ones (4 and 16 measured); a plan
+# without splits has no reducer.
+LATE_TRIGGER_TILES = (16, 32, 48)
+LATE_TRIGGER_MIN_MAIN_CTAS = 32
 # Two-CTA wide route: 128 packed rows per cluster of two CTAs, K tokens split across the pair.
 # Taken for requests with more than WIDE_MIN_ROWS packed rows whose longest KV is at least
 # WIDE_MIN_KV tokens: the lazy-E4M3 probability path of that schedule meets the uniform-profile
@@ -84,10 +100,28 @@ def swapped_rt(rows_per_request: int) -> int:
 
 
 def plan_num_split(items: int, max_seq_len: int, sm_count: int) -> int:
-    """One CTA per SM per wave over (work item, split) pairs without a ragged tail."""
+    """One CTA per SM per wave over (work item, split) pairs without a ragged tail.
+
+    The row-tile kernel deals each split ``ceil(tiles / num_split)`` of a row tile's own tiles. With one
+    work item of ``max_seq_len`` keys only ``ceil(tiles / ceil(tiles / num_split))`` splits hold tiles.
+    The plan drops the empty splits where that removes a CTA-reducer fold iteration of
+    ``REDUCE_CTA_FOLD_SPLITS`` splits (the same tile runs; the reducer merges fewer partials), or when at
+    least ``EMPTY_SPLIT_TRIM_MIN`` splits are empty: the reducer loads the partial rows of every split, an
+    empty split never writes its rows, so those loads miss L2 and the last fold iteration waits for DRAM.
+    With more items the count stays: a shorter row tile's runs depend on it.
+    """
     target = max(1, sm_count // max(1, items))
-    max_by_len = max(1, (max_seq_len + TILE_TOK - 1) // TILE_TOK // MIN_TILES_PER_SPLIT)
-    return max(1, min(target, MAX_SPLITS, max_by_len))
+    tiles = max(1, (max_seq_len + TILE_TOK - 1) // TILE_TOK)
+    max_by_len = max(1, tiles // MIN_TILES_PER_SPLIT)
+    splits = max(1, min(target, MAX_SPLITS, max_by_len))
+    if items == 1 and splits > REDUCE_WARP_MAX_SPLITS:
+        trimmed = -(-tiles // -(-tiles // splits))
+        fewer_folds = -(-trimmed // REDUCE_CTA_FOLD_SPLITS) < -(
+            -splits // REDUCE_CTA_FOLD_SPLITS
+        )
+        if fewer_folds or splits - trimmed >= EMPTY_SPLIT_TRIM_MIN:
+            splits = trimmed
+    return splits
 
 
 def use_wide_route(rows_per_request: int, max_seq_len: int) -> bool:
@@ -257,6 +291,16 @@ def plan_attention(
         grid_main = (WIDE_CLUSTER * (n_full_items + tail_items * splits), 1, 1)
     else:
         grid_main = (splits, m_tiles, batch)
+    if wide:
+        main_kind = "main_wide"
+    elif (
+        rt in LATE_TRIGGER_TILES
+        and splits > 1
+        and splits * m_tiles * batch >= LATE_TRIGGER_MIN_MAIN_CTAS
+    ):
+        main_kind = f"main_rt{rt}_late"
+    else:
+        main_kind = f"main_rt{rt}"
     # The merge covers the packed rows (uniform plan) or the rows of the split items only (tail plan).
     reduce_rows = rows_max if n_full_items == 0 else tail_items * tile_rows
     if splits <= REDUCE_WARP_MAX_SPLITS:
@@ -267,7 +311,10 @@ def plan_attention(
     else:
         reduce_warps = 0
         grid_reduce = (reduce_rows, REDUCE_DIM_CHUNKS, 1)
-        reduce_kind = "reduce_cta"
+        # The row tiles' CTA reducer prefetches every split's partials; its registers cost occupancy,
+        # so it serves only a row-tile plan whose reducer grid fits one wave.
+        one_wave = reduce_rows * REDUCE_DIM_CHUNKS <= sm_count
+        reduce_kind = "reduce_cta_rt" if not wide and one_wave else "reduce_cta"
     return AttentionPlan(
         wide=wide,
         rt=rt,
@@ -280,7 +327,7 @@ def plan_attention(
         reduce_warps=reduce_warps,
         grid_main=grid_main,
         grid_reduce=grid_reduce,
-        main_kind="main_wide" if wide else f"main_rt{rt}",
+        main_kind=main_kind,
         reduce_kind=reduce_kind,
     )
 

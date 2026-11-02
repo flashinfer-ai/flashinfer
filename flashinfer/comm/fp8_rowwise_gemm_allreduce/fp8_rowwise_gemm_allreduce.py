@@ -55,6 +55,32 @@ def fp8_rowwise_gemm_allreduce(
     the device's architecture and the group's world size; ``backend="auto"``
     selects the same route (no other implementation exists). Unsupported
     inputs raise instead of falling back.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        This rank's contiguous FP8 (e4m3) activation shard of shape
+        ``[M, K_l]``. ``a``, ``a_scale``, ``w``, and ``w_scale`` must be CUDA
+        tensors on one shared device.
+    a_scale : torch.Tensor
+        Contiguous FP32 row scales of shape ``[M]``.
+    w : torch.Tensor
+        This rank's contiguous FP8 (e4m3) weight shard of shape ``[N, K_l]``.
+    w_scale : torch.Tensor
+        Contiguous FP32 column scales of shape ``[N]``.
+    group : torch.distributed.ProcessGroup
+        NCCL process group on one node whose world size has a delivered
+        route on the device's architecture.
+    backend : str, optional
+        ``"auto"`` and ``"cake"`` both select the Cake backend.
+    out : torch.Tensor, optional
+        Contiguous BF16 output buffer of shape ``[M, N]``. A new tensor is
+        allocated when omitted.
+
+    Returns
+    -------
+    torch.Tensor
+        The reduced BF16 product of shape ``[M, N]`` on every rank.
     """
 
     if backend == "cake":
@@ -96,6 +122,34 @@ def prepare_fp8_rowwise_gemm_allreduce(
     delivered architectures and NCCL group world sizes, torch's default CUDA
     or NVSHMEM symmetric-memory backend). Unsupported inputs raise during
     preparation instead of falling back to another implementation.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Sample contiguous FP8 (e4m3) activation shard of shape ``[M, K_l]``.
+        ``a``, ``a_scale``, ``w``, and ``w_scale`` must be CUDA tensors on one
+        shared device.
+    a_scale : torch.Tensor
+        Sample contiguous FP32 row scales of shape ``[M]``.
+    w : torch.Tensor
+        Sample contiguous FP8 (e4m3) weight shard of shape ``[N, K_l]``.
+    w_scale : torch.Tensor
+        Sample contiguous FP32 column scales of shape ``[N]``.
+    group : torch.distributed.ProcessGroup
+        NCCL process group on one node whose world size has a delivered
+        route on the device's architecture.
+    backend : str, optional
+        ``"auto"`` and ``"cake"`` both select the Cake backend.
+    max_rows : int, optional
+        Maximum row count accepted by the returned launcher. Must be at least
+        the sample input's row count. Defaults to the sample input's row count
+        and must match on every rank.
+
+    Returns
+    -------
+    Callable
+        A CUDA-graph-capturable launcher with signature
+        ``launcher(a, a_scale, w, w_scale, *, out=None)``.
     """
 
     if backend not in {"auto", "cake"}:

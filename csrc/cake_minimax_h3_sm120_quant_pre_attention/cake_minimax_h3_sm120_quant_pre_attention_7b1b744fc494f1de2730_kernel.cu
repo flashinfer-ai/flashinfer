@@ -1015,28 +1015,25 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                 int w_srow_0 = role_tid >> 2;
                 int w_c_0 = role_tid & 3;
                 int w_grow_0 = tile_m * 256 + w_srow_0;
+                int w_chunk_lo_0 = ((w_c_0 < 3) ? w_c_0 * 16 : 96);
+                int w_chunk_hi_0 = ((w_c_0 < 3) ? w_chunk_lo_0 + 48 : 112);
                 if (w_grow_0 < M) {
-                    int w_row_head_0 = w_grow_0 * 56 + w_head;
-                    unsigned int w_st_words_0[4];
-                    float w_st_vals_0[16];
-                    int w_chunk_lo_0 = ((w_c_0 < 3) ? w_c_0 * 16 : 96);
-                    int w_chunk_hi_0 = ((w_c_0 < 3) ? w_chunk_lo_0 + 48 : 112);
                     unsigned int w_x_lo_0[8];
                     unsigned int w_x_hi_0[8];
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_lo_0 * 2 ^ (w_srow_0 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_lo_0 * 2 + 16 ^ (w_srow_0 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_hi_0 * 2 ^ (w_srow_0 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_hi_0 * 2 + 16 ^ (w_srow_0 & 7) << 4)));
                     if (w_c_0 < 3) {
                         if (w_kind < 2) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_lo_0 * 2 ^ (w_srow_0 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_lo_0 * 2 + 16 ^ (w_srow_0 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_hi_0 * 2 ^ (w_srow_0 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_hi_0 * 2 + 16 ^ (w_srow_0 & 7) << 4)));
                             float _unpack_bf16_8[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
@@ -1187,69 +1184,76 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_0[_lp*2 + 0], w_o_hi_0[_lp*2+1 + 0]));
                                 w_o_hi_0_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                            }
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_lo_0 * 2 ^ (w_srow_0 & 7) << 4)), "r"(w_o_lo_0_bf16[0]), "r"(w_o_lo_0_bf16[1]), "r"(w_o_lo_0_bf16[2]), "r"(w_o_lo_0_bf16[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_lo_0 * 2 + 16 ^ (w_srow_0 & 7) << 4)), "r"(w_o_lo_0_bf16[4]), "r"(w_o_lo_0_bf16[5]), "r"(w_o_lo_0_bf16[6]), "r"(w_o_lo_0_bf16[7]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_hi_0 * 2 ^ (w_srow_0 & 7) << 4)), "r"(w_o_hi_0_bf16[0]), "r"(w_o_hi_0_bf16[1]), "r"(w_o_hi_0_bf16[2]), "r"(w_o_hi_0_bf16[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_0 * 256) + (unsigned int)(w_chunk_hi_0 * 2 + 16 ^ (w_srow_0 & 7) << 4)), "r"(w_o_hi_0_bf16[4]), "r"(w_o_hi_0_bf16[5]), "r"(w_o_hi_0_bf16[6]), "r"(w_o_hi_0_bf16[7]) : "memory");
                         }
+                    }
+                }
+                __syncwarp();
+                int s_row_0_0 = (role_tid >> 5) * 8 + lane / 16;
+                int s_piece_0_0 = lane % 16;
+                unsigned int s_words_0_0[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_0_0 * 256) + (unsigned int)(s_piece_0_0 * 16 ^ (s_row_0_0 & 7) << 4)));
+                int s_dst_0_0 = ((tile_m * 256 + s_row_0_0) * 56 + w_head) * 64 + s_piece_0_0 * 4;
+                if (tile_m * 256 + s_row_0_0 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_0)[0] = reinterpret_cast<int4*>(s_words_0_0)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_0)[0] = reinterpret_cast<int4*>(s_words_0_0)[0];
                     } else {
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_lo_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0 + 4)[0];
-                        }
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0 * 64 + (w_chunk_hi_0 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_0_0)[0] = reinterpret_cast<int4*>(s_words_0_0)[0];
+                    }
+                }
+                int s_row_0_1 = (role_tid >> 5) * 8 + 2 + lane / 16;
+                int s_piece_0_1 = lane % 16;
+                unsigned int s_words_0_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_0_1 * 256) + (unsigned int)(s_piece_0_1 * 16 ^ (s_row_0_1 & 7) << 4)));
+                int s_dst_0_1 = ((tile_m * 256 + s_row_0_1) * 56 + w_head) * 64 + s_piece_0_1 * 4;
+                if (tile_m * 256 + s_row_0_1 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_1)[0] = reinterpret_cast<int4*>(s_words_0_1)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_1)[0] = reinterpret_cast<int4*>(s_words_0_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_0_1)[0] = reinterpret_cast<int4*>(s_words_0_1)[0];
+                    }
+                }
+                int s_row_0_2 = (role_tid >> 5) * 8 + 4 + lane / 16;
+                int s_piece_0_2 = lane % 16;
+                unsigned int s_words_0_2[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_2[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_0_2 * 256) + (unsigned int)(s_piece_0_2 * 16 ^ (s_row_0_2 & 7) << 4)));
+                int s_dst_0_2 = ((tile_m * 256 + s_row_0_2) * 56 + w_head) * 64 + s_piece_0_2 * 4;
+                if (tile_m * 256 + s_row_0_2 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_2)[0] = reinterpret_cast<int4*>(s_words_0_2)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_2)[0] = reinterpret_cast<int4*>(s_words_0_2)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_0_2)[0] = reinterpret_cast<int4*>(s_words_0_2)[0];
+                    }
+                }
+                int s_row_0_3 = (role_tid >> 5) * 8 + 6 + lane / 16;
+                int s_piece_0_3 = lane % 16;
+                unsigned int s_words_0_3[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_3[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_0_3 * 256) + (unsigned int)(s_piece_0_3 * 16 ^ (s_row_0_3 & 7) << 4)));
+                int s_dst_0_3 = ((tile_m * 256 + s_row_0_3) * 56 + w_head) * 64 + s_piece_0_3 * 4;
+                if (tile_m * 256 + s_row_0_3 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_3)[0] = reinterpret_cast<int4*>(s_words_0_3)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_3)[0] = reinterpret_cast<int4*>(s_words_0_3)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_0_3)[0] = reinterpret_cast<int4*>(s_words_0_3)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -1651,28 +1655,25 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                 int w_srow_1 = role_tid >> 2;
                 int w_c_1 = role_tid & 3;
                 int w_grow_1 = tile_m * 256 + 64 + w_srow_1;
+                int w_chunk_lo_1 = ((w_c_1 < 3) ? w_c_1 * 16 : 96);
+                int w_chunk_hi_1 = ((w_c_1 < 3) ? w_chunk_lo_1 + 48 : 112);
                 if (w_grow_1 < M) {
-                    int w_row_head_1 = w_grow_1 * 56 + w_head;
-                    unsigned int w_st_words_1[4];
-                    float w_st_vals_1[16];
-                    int w_chunk_lo_1 = ((w_c_1 < 3) ? w_c_1 * 16 : 96);
-                    int w_chunk_hi_1 = ((w_c_1 < 3) ? w_chunk_lo_1 + 48 : 112);
                     unsigned int w_x_lo_1[8];
                     unsigned int w_x_hi_1[8];
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_lo_1 * 2 ^ (w_srow_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_lo_1 * 2 + 16 ^ (w_srow_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_hi_1 * 2 ^ (w_srow_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_hi_1 * 2 + 16 ^ (w_srow_1 & 7) << 4)));
                     if (w_c_1 < 3) {
                         if (w_kind < 2) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_lo_1 * 2 ^ (w_srow_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_lo_1 * 2 + 16 ^ (w_srow_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_hi_1 * 2 ^ (w_srow_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_hi_1 * 2 + 16 ^ (w_srow_1 & 7) << 4)));
                             float _unpack_bf16_18[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
@@ -1823,69 +1824,76 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_1[_lp*2 + 0], w_o_hi_1[_lp*2+1 + 0]));
                                 w_o_hi_1_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                            }
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_lo_1 * 2 ^ (w_srow_1 & 7) << 4)), "r"(w_o_lo_1_bf16[0]), "r"(w_o_lo_1_bf16[1]), "r"(w_o_lo_1_bf16[2]), "r"(w_o_lo_1_bf16[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_lo_1 * 2 + 16 ^ (w_srow_1 & 7) << 4)), "r"(w_o_lo_1_bf16[4]), "r"(w_o_lo_1_bf16[5]), "r"(w_o_lo_1_bf16[6]), "r"(w_o_lo_1_bf16[7]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_hi_1 * 2 ^ (w_srow_1 & 7) << 4)), "r"(w_o_hi_1_bf16[0]), "r"(w_o_hi_1_bf16[1]), "r"(w_o_hi_1_bf16[2]), "r"(w_o_hi_1_bf16[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_1 * 256) + (unsigned int)(w_chunk_hi_1 * 2 + 16 ^ (w_srow_1 & 7) << 4)), "r"(w_o_hi_1_bf16[4]), "r"(w_o_hi_1_bf16[5]), "r"(w_o_hi_1_bf16[6]), "r"(w_o_hi_1_bf16[7]) : "memory");
                         }
+                    }
+                }
+                __syncwarp();
+                int s_row_1_0 = (role_tid >> 5) * 8 + lane / 16;
+                int s_piece_1_0 = lane % 16;
+                unsigned int s_words_1_0[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_1_0 * 256) + (unsigned int)(s_piece_1_0 * 16 ^ (s_row_1_0 & 7) << 4)));
+                int s_dst_1_0 = ((tile_m * 256 + 64 + s_row_1_0) * 56 + w_head) * 64 + s_piece_1_0 * 4;
+                if (tile_m * 256 + 64 + s_row_1_0 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_0)[0] = reinterpret_cast<int4*>(s_words_1_0)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_0)[0] = reinterpret_cast<int4*>(s_words_1_0)[0];
                     } else {
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_lo_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1 + 4)[0];
-                        }
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1 * 64 + (w_chunk_hi_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_1_0)[0] = reinterpret_cast<int4*>(s_words_1_0)[0];
+                    }
+                }
+                int s_row_1_1 = (role_tid >> 5) * 8 + 2 + lane / 16;
+                int s_piece_1_1 = lane % 16;
+                unsigned int s_words_1_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_1_1 * 256) + (unsigned int)(s_piece_1_1 * 16 ^ (s_row_1_1 & 7) << 4)));
+                int s_dst_1_1 = ((tile_m * 256 + 64 + s_row_1_1) * 56 + w_head) * 64 + s_piece_1_1 * 4;
+                if (tile_m * 256 + 64 + s_row_1_1 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1)[0];
+                    }
+                }
+                int s_row_1_2 = (role_tid >> 5) * 8 + 4 + lane / 16;
+                int s_piece_1_2 = lane % 16;
+                unsigned int s_words_1_2[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_2[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_1_2 * 256) + (unsigned int)(s_piece_1_2 * 16 ^ (s_row_1_2 & 7) << 4)));
+                int s_dst_1_2 = ((tile_m * 256 + 64 + s_row_1_2) * 56 + w_head) * 64 + s_piece_1_2 * 4;
+                if (tile_m * 256 + 64 + s_row_1_2 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_2)[0] = reinterpret_cast<int4*>(s_words_1_2)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_2)[0] = reinterpret_cast<int4*>(s_words_1_2)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_1_2)[0] = reinterpret_cast<int4*>(s_words_1_2)[0];
+                    }
+                }
+                int s_row_1_3 = (role_tid >> 5) * 8 + 6 + lane / 16;
+                int s_piece_1_3 = lane % 16;
+                unsigned int s_words_1_3[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_3[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_1_3 * 256) + (unsigned int)(s_piece_1_3 * 16 ^ (s_row_1_3 & 7) << 4)));
+                int s_dst_1_3 = ((tile_m * 256 + 64 + s_row_1_3) * 56 + w_head) * 64 + s_piece_1_3 * 4;
+                if (tile_m * 256 + 64 + s_row_1_3 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_3)[0] = reinterpret_cast<int4*>(s_words_1_3)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_3)[0] = reinterpret_cast<int4*>(s_words_1_3)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_1_3)[0] = reinterpret_cast<int4*>(s_words_1_3)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -2287,28 +2295,25 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                 int w_srow_2 = role_tid >> 2;
                 int w_c_2 = role_tid & 3;
                 int w_grow_2 = tile_m * 256 + 128 + w_srow_2;
+                int w_chunk_lo_2 = ((w_c_2 < 3) ? w_c_2 * 16 : 96);
+                int w_chunk_hi_2 = ((w_c_2 < 3) ? w_chunk_lo_2 + 48 : 112);
                 if (w_grow_2 < M) {
-                    int w_row_head_2 = w_grow_2 * 56 + w_head;
-                    unsigned int w_st_words_2[4];
-                    float w_st_vals_2[16];
-                    int w_chunk_lo_2 = ((w_c_2 < 3) ? w_c_2 * 16 : 96);
-                    int w_chunk_hi_2 = ((w_c_2 < 3) ? w_chunk_lo_2 + 48 : 112);
                     unsigned int w_x_lo_2[8];
                     unsigned int w_x_hi_2[8];
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_lo_2 * 2 ^ (w_srow_2 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_lo_2 * 2 + 16 ^ (w_srow_2 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_hi_2 * 2 ^ (w_srow_2 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_hi_2 * 2 + 16 ^ (w_srow_2 & 7) << 4)));
                     if (w_c_2 < 3) {
                         if (w_kind < 2) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_lo_2 * 2 ^ (w_srow_2 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_lo_2 * 2 + 16 ^ (w_srow_2 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_hi_2 * 2 ^ (w_srow_2 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_hi_2 * 2 + 16 ^ (w_srow_2 & 7) << 4)));
                             float _unpack_bf16_28[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
@@ -2459,69 +2464,76 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_2[_lp*2 + 0], w_o_hi_2[_lp*2+1 + 0]));
                                 w_o_hi_2_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                            }
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_lo_2 * 2 ^ (w_srow_2 & 7) << 4)), "r"(w_o_lo_2_bf16[0]), "r"(w_o_lo_2_bf16[1]), "r"(w_o_lo_2_bf16[2]), "r"(w_o_lo_2_bf16[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_lo_2 * 2 + 16 ^ (w_srow_2 & 7) << 4)), "r"(w_o_lo_2_bf16[4]), "r"(w_o_lo_2_bf16[5]), "r"(w_o_lo_2_bf16[6]), "r"(w_o_lo_2_bf16[7]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_hi_2 * 2 ^ (w_srow_2 & 7) << 4)), "r"(w_o_hi_2_bf16[0]), "r"(w_o_hi_2_bf16[1]), "r"(w_o_hi_2_bf16[2]), "r"(w_o_hi_2_bf16[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_2 * 256) + (unsigned int)(w_chunk_hi_2 * 2 + 16 ^ (w_srow_2 & 7) << 4)), "r"(w_o_hi_2_bf16[4]), "r"(w_o_hi_2_bf16[5]), "r"(w_o_hi_2_bf16[6]), "r"(w_o_hi_2_bf16[7]) : "memory");
                         }
+                    }
+                }
+                __syncwarp();
+                int s_row_2_0 = (role_tid >> 5) * 8 + lane / 16;
+                int s_piece_2_0 = lane % 16;
+                unsigned int s_words_2_0[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_2_0 * 256) + (unsigned int)(s_piece_2_0 * 16 ^ (s_row_2_0 & 7) << 4)));
+                int s_dst_2_0 = ((tile_m * 256 + 128 + s_row_2_0) * 56 + w_head) * 64 + s_piece_2_0 * 4;
+                if (tile_m * 256 + 128 + s_row_2_0 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_0)[0] = reinterpret_cast<int4*>(s_words_2_0)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_0)[0] = reinterpret_cast<int4*>(s_words_2_0)[0];
                     } else {
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_lo_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2 + 4)[0];
-                        }
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2 * 64 + (w_chunk_hi_2 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_2_0)[0] = reinterpret_cast<int4*>(s_words_2_0)[0];
+                    }
+                }
+                int s_row_2_1 = (role_tid >> 5) * 8 + 2 + lane / 16;
+                int s_piece_2_1 = lane % 16;
+                unsigned int s_words_2_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_2_1 * 256) + (unsigned int)(s_piece_2_1 * 16 ^ (s_row_2_1 & 7) << 4)));
+                int s_dst_2_1 = ((tile_m * 256 + 128 + s_row_2_1) * 56 + w_head) * 64 + s_piece_2_1 * 4;
+                if (tile_m * 256 + 128 + s_row_2_1 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_1)[0] = reinterpret_cast<int4*>(s_words_2_1)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_1)[0] = reinterpret_cast<int4*>(s_words_2_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_2_1)[0] = reinterpret_cast<int4*>(s_words_2_1)[0];
+                    }
+                }
+                int s_row_2_2 = (role_tid >> 5) * 8 + 4 + lane / 16;
+                int s_piece_2_2 = lane % 16;
+                unsigned int s_words_2_2[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_2[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_2_2 * 256) + (unsigned int)(s_piece_2_2 * 16 ^ (s_row_2_2 & 7) << 4)));
+                int s_dst_2_2 = ((tile_m * 256 + 128 + s_row_2_2) * 56 + w_head) * 64 + s_piece_2_2 * 4;
+                if (tile_m * 256 + 128 + s_row_2_2 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_2)[0] = reinterpret_cast<int4*>(s_words_2_2)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_2)[0] = reinterpret_cast<int4*>(s_words_2_2)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_2_2)[0] = reinterpret_cast<int4*>(s_words_2_2)[0];
+                    }
+                }
+                int s_row_2_3 = (role_tid >> 5) * 8 + 6 + lane / 16;
+                int s_piece_2_3 = lane % 16;
+                unsigned int s_words_2_3[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_3[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_2_3 * 256) + (unsigned int)(s_piece_2_3 * 16 ^ (s_row_2_3 & 7) << 4)));
+                int s_dst_2_3 = ((tile_m * 256 + 128 + s_row_2_3) * 56 + w_head) * 64 + s_piece_2_3 * 4;
+                if (tile_m * 256 + 128 + s_row_2_3 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_3)[0] = reinterpret_cast<int4*>(s_words_2_3)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_3)[0] = reinterpret_cast<int4*>(s_words_2_3)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_2_3)[0] = reinterpret_cast<int4*>(s_words_2_3)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -2923,28 +2935,25 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                 int w_srow_3 = role_tid >> 2;
                 int w_c_3 = role_tid & 3;
                 int w_grow_3 = tile_m * 256 + 192 + w_srow_3;
+                int w_chunk_lo_3 = ((w_c_3 < 3) ? w_c_3 * 16 : 96);
+                int w_chunk_hi_3 = ((w_c_3 < 3) ? w_chunk_lo_3 + 48 : 112);
                 if (w_grow_3 < M) {
-                    int w_row_head_3 = w_grow_3 * 56 + w_head;
-                    unsigned int w_st_words_3[4];
-                    float w_st_vals_3[16];
-                    int w_chunk_lo_3 = ((w_c_3 < 3) ? w_c_3 * 16 : 96);
-                    int w_chunk_hi_3 = ((w_c_3 < 3) ? w_chunk_lo_3 + 48 : 112);
                     unsigned int w_x_lo_3[8];
                     unsigned int w_x_hi_3[8];
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_lo_3 * 2 ^ (w_srow_3 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_lo_3 * 2 + 16 ^ (w_srow_3 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_hi_3 * 2 ^ (w_srow_3 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_hi_3 * 2 + 16 ^ (w_srow_3 & 7) << 4)));
                     if (w_c_3 < 3) {
                         if (w_kind < 2) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_lo_3 * 2 ^ (w_srow_3 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_lo_3 * 2 + 16 ^ (w_srow_3 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_hi_3 * 2 ^ (w_srow_3 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_hi_3 * 2 + 16 ^ (w_srow_3 & 7) << 4)));
                             float _unpack_bf16_38[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
@@ -3095,69 +3104,76 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_3[_lp*2 + 0], w_o_hi_3[_lp*2+1 + 0]));
                                 w_o_hi_3_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                            }
-                            if (w_kind == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                            } else if (w_kind == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                            }
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_lo_3 * 2 ^ (w_srow_3 & 7) << 4)), "r"(w_o_lo_3_bf16[0]), "r"(w_o_lo_3_bf16[1]), "r"(w_o_lo_3_bf16[2]), "r"(w_o_lo_3_bf16[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_lo_3 * 2 + 16 ^ (w_srow_3 & 7) << 4)), "r"(w_o_lo_3_bf16[4]), "r"(w_o_lo_3_bf16[5]), "r"(w_o_lo_3_bf16[6]), "r"(w_o_lo_3_bf16[7]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_hi_3 * 2 ^ (w_srow_3 & 7) << 4)), "r"(w_o_hi_3_bf16[0]), "r"(w_o_hi_3_bf16[1]), "r"(w_o_hi_3_bf16[2]), "r"(w_o_hi_3_bf16[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(w_srow_3 * 256) + (unsigned int)(w_chunk_hi_3 * 2 + 16 ^ (w_srow_3 & 7) << 4)), "r"(w_o_hi_3_bf16[4]), "r"(w_o_hi_3_bf16[5]), "r"(w_o_hi_3_bf16[6]), "r"(w_o_hi_3_bf16[7]) : "memory");
                         }
+                    }
+                }
+                __syncwarp();
+                int s_row_3_0 = (role_tid >> 5) * 8 + lane / 16;
+                int s_piece_3_0 = lane % 16;
+                unsigned int s_words_3_0[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_3_0 * 256) + (unsigned int)(s_piece_3_0 * 16 ^ (s_row_3_0 & 7) << 4)));
+                int s_dst_3_0 = ((tile_m * 256 + 192 + s_row_3_0) * 56 + w_head) * 64 + s_piece_3_0 * 4;
+                if (tile_m * 256 + 192 + s_row_3_0 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_0)[0] = reinterpret_cast<int4*>(s_words_3_0)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_0)[0] = reinterpret_cast<int4*>(s_words_3_0)[0];
                     } else {
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_lo_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3 + 4)[0];
-                        }
-                        if (w_kind == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                        } else if (w_kind == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3 * 64 + (w_chunk_hi_3 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_3_0)[0] = reinterpret_cast<int4*>(s_words_3_0)[0];
+                    }
+                }
+                int s_row_3_1 = (role_tid >> 5) * 8 + 2 + lane / 16;
+                int s_piece_3_1 = lane % 16;
+                unsigned int s_words_3_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_3_1 * 256) + (unsigned int)(s_piece_3_1 * 16 ^ (s_row_3_1 & 7) << 4)));
+                int s_dst_3_1 = ((tile_m * 256 + 192 + s_row_3_1) * 56 + w_head) * 64 + s_piece_3_1 * 4;
+                if (tile_m * 256 + 192 + s_row_3_1 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_1)[0] = reinterpret_cast<int4*>(s_words_3_1)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_1)[0] = reinterpret_cast<int4*>(s_words_3_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_3_1)[0] = reinterpret_cast<int4*>(s_words_3_1)[0];
+                    }
+                }
+                int s_row_3_2 = (role_tid >> 5) * 8 + 4 + lane / 16;
+                int s_piece_3_2 = lane % 16;
+                unsigned int s_words_3_2[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_2[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_3_2 * 256) + (unsigned int)(s_piece_3_2 * 16 ^ (s_row_3_2 & 7) << 4)));
+                int s_dst_3_2 = ((tile_m * 256 + 192 + s_row_3_2) * 56 + w_head) * 64 + s_piece_3_2 * 4;
+                if (tile_m * 256 + 192 + s_row_3_2 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_2)[0] = reinterpret_cast<int4*>(s_words_3_2)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_2)[0] = reinterpret_cast<int4*>(s_words_3_2)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_3_2)[0] = reinterpret_cast<int4*>(s_words_3_2)[0];
+                    }
+                }
+                int s_row_3_3 = (role_tid >> 5) * 8 + 6 + lane / 16;
+                int s_piece_3_3 = lane % 16;
+                unsigned int s_words_3_3[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_3[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage * 16384 + (unsigned int)(s_row_3_3 * 256) + (unsigned int)(s_piece_3_3 * 16 ^ (s_row_3_3 & 7) << 4)));
+                int s_dst_3_3 = ((tile_m * 256 + 192 + s_row_3_3) * 56 + w_head) * 64 + s_piece_3_3 * 4;
+                if (tile_m * 256 + 192 + s_row_3_3 < M) {
+                    if (w_kind == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_3)[0] = reinterpret_cast<int4*>(s_words_3_3)[0];
+                    } else if (w_kind == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_3)[0] = reinterpret_cast<int4*>(s_words_3_3)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_3_3)[0] = reinterpret_cast<int4*>(s_words_3_3)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -3962,28 +3978,25 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                 int w_srow_0_1 = role_tid_1 >> 2;
                 int w_c_0_1 = role_tid_1 & 3;
                 int w_grow_0_1 = tile_m_1 * 256 + w_srow_0_1;
+                int w_chunk_lo_0_1 = ((w_c_0_1 < 3) ? w_c_0_1 * 16 : 96);
+                int w_chunk_hi_0_1 = ((w_c_0_1 < 3) ? w_chunk_lo_0_1 + 48 : 112);
                 if (w_grow_0_1 < M) {
-                    int w_row_head_0_1 = w_grow_0_1 * 56 + w_head_1;
-                    unsigned int w_st_words_0_1[4];
-                    float w_st_vals_0_1[16];
-                    int w_chunk_lo_0_1 = ((w_c_0_1 < 3) ? w_c_0_1 * 16 : 96);
-                    int w_chunk_hi_0_1 = ((w_c_0_1 < 3) ? w_chunk_lo_0_1 + 48 : 112);
                     unsigned int w_x_lo_0_1[8];
                     unsigned int w_x_hi_0_1[8];
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_lo_0_1 * 2 ^ (w_srow_0_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_lo_0_1 * 2 + 16 ^ (w_srow_0_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_hi_0_1 * 2 ^ (w_srow_0_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_hi_0_1 * 2 + 16 ^ (w_srow_0_1 & 7) << 4)));
                     if (w_c_0_1 < 3) {
                         if (w_kind_1 < 2) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_lo_0_1 * 2 ^ (w_srow_0_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_0_1[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_lo_0_1 * 2 + 16 ^ (w_srow_0_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_hi_0_1 * 2 ^ (w_srow_0_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_0_1[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_hi_0_1 * 2 + 16 ^ (w_srow_0_1 & 7) << 4)));
                             float _unpack_bf16_48[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
@@ -4134,69 +4147,76 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_0_1[_lp*2 + 0], w_o_hi_0_1[_lp*2+1 + 0]));
                                 w_o_hi_0_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_0_bf16_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_0_bf16_1 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                            }
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_lo_0_1 * 2 ^ (w_srow_0_1 & 7) << 4)), "r"(w_o_lo_0_bf16_1[0]), "r"(w_o_lo_0_bf16_1[1]), "r"(w_o_lo_0_bf16_1[2]), "r"(w_o_lo_0_bf16_1[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_lo_0_1 * 2 + 16 ^ (w_srow_0_1 & 7) << 4)), "r"(w_o_lo_0_bf16_1[4]), "r"(w_o_lo_0_bf16_1[5]), "r"(w_o_lo_0_bf16_1[6]), "r"(w_o_lo_0_bf16_1[7]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_hi_0_1 * 2 ^ (w_srow_0_1 & 7) << 4)), "r"(w_o_hi_0_bf16_1[0]), "r"(w_o_hi_0_bf16_1[1]), "r"(w_o_hi_0_bf16_1[2]), "r"(w_o_hi_0_bf16_1[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_0_1 * 256) + (unsigned int)(w_chunk_hi_0_1 * 2 + 16 ^ (w_srow_0_1 & 7) << 4)), "r"(w_o_hi_0_bf16_1[4]), "r"(w_o_hi_0_bf16_1[5]), "r"(w_o_hi_0_bf16_1[6]), "r"(w_o_hi_0_bf16_1[7]) : "memory");
                         }
+                    }
+                }
+                __syncwarp();
+                int s_row_0_0_1 = (role_tid_1 >> 5) * 8 + lane / 16;
+                int s_piece_0_0_1 = lane % 16;
+                unsigned int s_words_0_0_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_0_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_0_0_1 * 256) + (unsigned int)(s_piece_0_0_1 * 16 ^ (s_row_0_0_1 & 7) << 4)));
+                int s_dst_0_0_1 = ((tile_m_1 * 256 + s_row_0_0_1) * 56 + w_head_1) * 64 + s_piece_0_0_1 * 4;
+                if (tile_m_1 * 256 + s_row_0_0_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_0_1)[0] = reinterpret_cast<int4*>(s_words_0_0_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_0_1)[0] = reinterpret_cast<int4*>(s_words_0_0_1)[0];
                     } else {
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_lo_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_0_1 + 4)[0];
-                        }
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_0_1 * 64 + (w_chunk_hi_0_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_0_1 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_0_0_1)[0] = reinterpret_cast<int4*>(s_words_0_0_1)[0];
+                    }
+                }
+                int s_row_0_1_1 = (role_tid_1 >> 5) * 8 + 2 + lane / 16;
+                int s_piece_0_1_1 = lane % 16;
+                unsigned int s_words_0_1_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_1_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_0_1_1 * 256) + (unsigned int)(s_piece_0_1_1 * 16 ^ (s_row_0_1_1 & 7) << 4)));
+                int s_dst_0_1_1 = ((tile_m_1 * 256 + s_row_0_1_1) * 56 + w_head_1) * 64 + s_piece_0_1_1 * 4;
+                if (tile_m_1 * 256 + s_row_0_1_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_1_1)[0] = reinterpret_cast<int4*>(s_words_0_1_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_1_1)[0] = reinterpret_cast<int4*>(s_words_0_1_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_0_1_1)[0] = reinterpret_cast<int4*>(s_words_0_1_1)[0];
+                    }
+                }
+                int s_row_0_2_1 = (role_tid_1 >> 5) * 8 + 4 + lane / 16;
+                int s_piece_0_2_1 = lane % 16;
+                unsigned int s_words_0_2_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_2_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_0_2_1 * 256) + (unsigned int)(s_piece_0_2_1 * 16 ^ (s_row_0_2_1 & 7) << 4)));
+                int s_dst_0_2_1 = ((tile_m_1 * 256 + s_row_0_2_1) * 56 + w_head_1) * 64 + s_piece_0_2_1 * 4;
+                if (tile_m_1 * 256 + s_row_0_2_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_2_1)[0] = reinterpret_cast<int4*>(s_words_0_2_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_2_1)[0] = reinterpret_cast<int4*>(s_words_0_2_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_0_2_1)[0] = reinterpret_cast<int4*>(s_words_0_2_1)[0];
+                    }
+                }
+                int s_row_0_3_1 = (role_tid_1 >> 5) * 8 + 6 + lane / 16;
+                int s_piece_0_3_1 = lane % 16;
+                unsigned int s_words_0_3_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_0_3_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_0_3_1 * 256) + (unsigned int)(s_piece_0_3_1 * 16 ^ (s_row_0_3_1 & 7) << 4)));
+                int s_dst_0_3_1 = ((tile_m_1 * 256 + s_row_0_3_1) * 56 + w_head_1) * 64 + s_piece_0_3_1 * 4;
+                if (tile_m_1 * 256 + s_row_0_3_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_0_3_1)[0] = reinterpret_cast<int4*>(s_words_0_3_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_0_3_1)[0] = reinterpret_cast<int4*>(s_words_0_3_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_0_3_1)[0] = reinterpret_cast<int4*>(s_words_0_3_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -4598,28 +4618,25 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                 int w_srow_1_1 = role_tid_1 >> 2;
                 int w_c_1_1 = role_tid_1 & 3;
                 int w_grow_1_1 = tile_m_1 * 256 + 64 + w_srow_1_1;
+                int w_chunk_lo_1_1 = ((w_c_1_1 < 3) ? w_c_1_1 * 16 : 96);
+                int w_chunk_hi_1_1 = ((w_c_1_1 < 3) ? w_chunk_lo_1_1 + 48 : 112);
                 if (w_grow_1_1 < M) {
-                    int w_row_head_1_1 = w_grow_1_1 * 56 + w_head_1;
-                    unsigned int w_st_words_1_1[4];
-                    float w_st_vals_1_1[16];
-                    int w_chunk_lo_1_1 = ((w_c_1_1 < 3) ? w_c_1_1 * 16 : 96);
-                    int w_chunk_hi_1_1 = ((w_c_1_1 < 3) ? w_chunk_lo_1_1 + 48 : 112);
                     unsigned int w_x_lo_1_1[8];
                     unsigned int w_x_hi_1_1[8];
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_lo_1_1 * 2 ^ (w_srow_1_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_lo_1_1 * 2 + 16 ^ (w_srow_1_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_hi_1_1 * 2 ^ (w_srow_1_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_hi_1_1 * 2 + 16 ^ (w_srow_1_1 & 7) << 4)));
                     if (w_c_1_1 < 3) {
                         if (w_kind_1 < 2) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_lo_1_1 * 2 ^ (w_srow_1_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_1_1[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_lo_1_1 * 2 + 16 ^ (w_srow_1_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_hi_1_1 * 2 ^ (w_srow_1_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_1_1[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_hi_1_1 * 2 + 16 ^ (w_srow_1_1 & 7) << 4)));
                             float _unpack_bf16_58[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
@@ -4770,69 +4787,76 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_1_1[_lp*2 + 0], w_o_hi_1_1[_lp*2+1 + 0]));
                                 w_o_hi_1_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_1_bf16_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_1_bf16_1 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                            }
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_lo_1_1 * 2 ^ (w_srow_1_1 & 7) << 4)), "r"(w_o_lo_1_bf16_1[0]), "r"(w_o_lo_1_bf16_1[1]), "r"(w_o_lo_1_bf16_1[2]), "r"(w_o_lo_1_bf16_1[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_lo_1_1 * 2 + 16 ^ (w_srow_1_1 & 7) << 4)), "r"(w_o_lo_1_bf16_1[4]), "r"(w_o_lo_1_bf16_1[5]), "r"(w_o_lo_1_bf16_1[6]), "r"(w_o_lo_1_bf16_1[7]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_hi_1_1 * 2 ^ (w_srow_1_1 & 7) << 4)), "r"(w_o_hi_1_bf16_1[0]), "r"(w_o_hi_1_bf16_1[1]), "r"(w_o_hi_1_bf16_1[2]), "r"(w_o_hi_1_bf16_1[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_1_1 * 256) + (unsigned int)(w_chunk_hi_1_1 * 2 + 16 ^ (w_srow_1_1 & 7) << 4)), "r"(w_o_hi_1_bf16_1[4]), "r"(w_o_hi_1_bf16_1[5]), "r"(w_o_hi_1_bf16_1[6]), "r"(w_o_hi_1_bf16_1[7]) : "memory");
                         }
+                    }
+                }
+                __syncwarp();
+                int s_row_1_0_1 = (role_tid_1 >> 5) * 8 + lane / 16;
+                int s_piece_1_0_1 = lane % 16;
+                unsigned int s_words_1_0_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_0_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_1_0_1 * 256) + (unsigned int)(s_piece_1_0_1 * 16 ^ (s_row_1_0_1 & 7) << 4)));
+                int s_dst_1_0_1 = ((tile_m_1 * 256 + 64 + s_row_1_0_1) * 56 + w_head_1) * 64 + s_piece_1_0_1 * 4;
+                if (tile_m_1 * 256 + 64 + s_row_1_0_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_0_1)[0] = reinterpret_cast<int4*>(s_words_1_0_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_0_1)[0] = reinterpret_cast<int4*>(s_words_1_0_1)[0];
                     } else {
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_lo_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_1_1 + 4)[0];
-                        }
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_1_1 * 64 + (w_chunk_hi_1_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_1_1 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_1_0_1)[0] = reinterpret_cast<int4*>(s_words_1_0_1)[0];
+                    }
+                }
+                int s_row_1_1_1 = (role_tid_1 >> 5) * 8 + 2 + lane / 16;
+                int s_piece_1_1_1 = lane % 16;
+                unsigned int s_words_1_1_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_1_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_1_1_1 * 256) + (unsigned int)(s_piece_1_1_1 * 16 ^ (s_row_1_1_1 & 7) << 4)));
+                int s_dst_1_1_1 = ((tile_m_1 * 256 + 64 + s_row_1_1_1) * 56 + w_head_1) * 64 + s_piece_1_1_1 * 4;
+                if (tile_m_1 * 256 + 64 + s_row_1_1_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_1_1_1)[0] = reinterpret_cast<int4*>(s_words_1_1_1)[0];
+                    }
+                }
+                int s_row_1_2_1 = (role_tid_1 >> 5) * 8 + 4 + lane / 16;
+                int s_piece_1_2_1 = lane % 16;
+                unsigned int s_words_1_2_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_2_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_1_2_1 * 256) + (unsigned int)(s_piece_1_2_1 * 16 ^ (s_row_1_2_1 & 7) << 4)));
+                int s_dst_1_2_1 = ((tile_m_1 * 256 + 64 + s_row_1_2_1) * 56 + w_head_1) * 64 + s_piece_1_2_1 * 4;
+                if (tile_m_1 * 256 + 64 + s_row_1_2_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_2_1)[0] = reinterpret_cast<int4*>(s_words_1_2_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_2_1)[0] = reinterpret_cast<int4*>(s_words_1_2_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_1_2_1)[0] = reinterpret_cast<int4*>(s_words_1_2_1)[0];
+                    }
+                }
+                int s_row_1_3_1 = (role_tid_1 >> 5) * 8 + 6 + lane / 16;
+                int s_piece_1_3_1 = lane % 16;
+                unsigned int s_words_1_3_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_1_3_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_1_3_1 * 256) + (unsigned int)(s_piece_1_3_1 * 16 ^ (s_row_1_3_1 & 7) << 4)));
+                int s_dst_1_3_1 = ((tile_m_1 * 256 + 64 + s_row_1_3_1) * 56 + w_head_1) * 64 + s_piece_1_3_1 * 4;
+                if (tile_m_1 * 256 + 64 + s_row_1_3_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_1_3_1)[0] = reinterpret_cast<int4*>(s_words_1_3_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_1_3_1)[0] = reinterpret_cast<int4*>(s_words_1_3_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_1_3_1)[0] = reinterpret_cast<int4*>(s_words_1_3_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -5234,28 +5258,25 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                 int w_srow_2_1 = role_tid_1 >> 2;
                 int w_c_2_1 = role_tid_1 & 3;
                 int w_grow_2_1 = tile_m_1 * 256 + 128 + w_srow_2_1;
+                int w_chunk_lo_2_1 = ((w_c_2_1 < 3) ? w_c_2_1 * 16 : 96);
+                int w_chunk_hi_2_1 = ((w_c_2_1 < 3) ? w_chunk_lo_2_1 + 48 : 112);
                 if (w_grow_2_1 < M) {
-                    int w_row_head_2_1 = w_grow_2_1 * 56 + w_head_1;
-                    unsigned int w_st_words_2_1[4];
-                    float w_st_vals_2_1[16];
-                    int w_chunk_lo_2_1 = ((w_c_2_1 < 3) ? w_c_2_1 * 16 : 96);
-                    int w_chunk_hi_2_1 = ((w_c_2_1 < 3) ? w_chunk_lo_2_1 + 48 : 112);
                     unsigned int w_x_lo_2_1[8];
                     unsigned int w_x_hi_2_1[8];
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_lo_2_1 * 2 ^ (w_srow_2_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_lo_2_1 * 2 + 16 ^ (w_srow_2_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_hi_2_1 * 2 ^ (w_srow_2_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_hi_2_1 * 2 + 16 ^ (w_srow_2_1 & 7) << 4)));
                     if (w_c_2_1 < 3) {
                         if (w_kind_1 < 2) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_lo_2_1 * 2 ^ (w_srow_2_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_2_1[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_lo_2_1 * 2 + 16 ^ (w_srow_2_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_hi_2_1 * 2 ^ (w_srow_2_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_2_1[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_hi_2_1 * 2 + 16 ^ (w_srow_2_1 & 7) << 4)));
                             float _unpack_bf16_68[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
@@ -5406,69 +5427,76 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_2_1[_lp*2 + 0], w_o_hi_2_1[_lp*2+1 + 0]));
                                 w_o_hi_2_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_2_bf16_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_2_bf16_1 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                            }
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_lo_2_1 * 2 ^ (w_srow_2_1 & 7) << 4)), "r"(w_o_lo_2_bf16_1[0]), "r"(w_o_lo_2_bf16_1[1]), "r"(w_o_lo_2_bf16_1[2]), "r"(w_o_lo_2_bf16_1[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_lo_2_1 * 2 + 16 ^ (w_srow_2_1 & 7) << 4)), "r"(w_o_lo_2_bf16_1[4]), "r"(w_o_lo_2_bf16_1[5]), "r"(w_o_lo_2_bf16_1[6]), "r"(w_o_lo_2_bf16_1[7]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_hi_2_1 * 2 ^ (w_srow_2_1 & 7) << 4)), "r"(w_o_hi_2_bf16_1[0]), "r"(w_o_hi_2_bf16_1[1]), "r"(w_o_hi_2_bf16_1[2]), "r"(w_o_hi_2_bf16_1[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_2_1 * 256) + (unsigned int)(w_chunk_hi_2_1 * 2 + 16 ^ (w_srow_2_1 & 7) << 4)), "r"(w_o_hi_2_bf16_1[4]), "r"(w_o_hi_2_bf16_1[5]), "r"(w_o_hi_2_bf16_1[6]), "r"(w_o_hi_2_bf16_1[7]) : "memory");
                         }
+                    }
+                }
+                __syncwarp();
+                int s_row_2_0_1 = (role_tid_1 >> 5) * 8 + lane / 16;
+                int s_piece_2_0_1 = lane % 16;
+                unsigned int s_words_2_0_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_0_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_2_0_1 * 256) + (unsigned int)(s_piece_2_0_1 * 16 ^ (s_row_2_0_1 & 7) << 4)));
+                int s_dst_2_0_1 = ((tile_m_1 * 256 + 128 + s_row_2_0_1) * 56 + w_head_1) * 64 + s_piece_2_0_1 * 4;
+                if (tile_m_1 * 256 + 128 + s_row_2_0_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_0_1)[0] = reinterpret_cast<int4*>(s_words_2_0_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_0_1)[0] = reinterpret_cast<int4*>(s_words_2_0_1)[0];
                     } else {
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_lo_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_2_1 + 4)[0];
-                        }
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_2_1 * 64 + (w_chunk_hi_2_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_2_1 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_2_0_1)[0] = reinterpret_cast<int4*>(s_words_2_0_1)[0];
+                    }
+                }
+                int s_row_2_1_1 = (role_tid_1 >> 5) * 8 + 2 + lane / 16;
+                int s_piece_2_1_1 = lane % 16;
+                unsigned int s_words_2_1_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_1_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_2_1_1 * 256) + (unsigned int)(s_piece_2_1_1 * 16 ^ (s_row_2_1_1 & 7) << 4)));
+                int s_dst_2_1_1 = ((tile_m_1 * 256 + 128 + s_row_2_1_1) * 56 + w_head_1) * 64 + s_piece_2_1_1 * 4;
+                if (tile_m_1 * 256 + 128 + s_row_2_1_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_1_1)[0] = reinterpret_cast<int4*>(s_words_2_1_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_1_1)[0] = reinterpret_cast<int4*>(s_words_2_1_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_2_1_1)[0] = reinterpret_cast<int4*>(s_words_2_1_1)[0];
+                    }
+                }
+                int s_row_2_2_1 = (role_tid_1 >> 5) * 8 + 4 + lane / 16;
+                int s_piece_2_2_1 = lane % 16;
+                unsigned int s_words_2_2_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_2_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_2_2_1 * 256) + (unsigned int)(s_piece_2_2_1 * 16 ^ (s_row_2_2_1 & 7) << 4)));
+                int s_dst_2_2_1 = ((tile_m_1 * 256 + 128 + s_row_2_2_1) * 56 + w_head_1) * 64 + s_piece_2_2_1 * 4;
+                if (tile_m_1 * 256 + 128 + s_row_2_2_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_2_1)[0] = reinterpret_cast<int4*>(s_words_2_2_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_2_1)[0] = reinterpret_cast<int4*>(s_words_2_2_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_2_2_1)[0] = reinterpret_cast<int4*>(s_words_2_2_1)[0];
+                    }
+                }
+                int s_row_2_3_1 = (role_tid_1 >> 5) * 8 + 6 + lane / 16;
+                int s_piece_2_3_1 = lane % 16;
+                unsigned int s_words_2_3_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_2_3_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_2_3_1 * 256) + (unsigned int)(s_piece_2_3_1 * 16 ^ (s_row_2_3_1 & 7) << 4)));
+                int s_dst_2_3_1 = ((tile_m_1 * 256 + 128 + s_row_2_3_1) * 56 + w_head_1) * 64 + s_piece_2_3_1 * 4;
+                if (tile_m_1 * 256 + 128 + s_row_2_3_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_2_3_1)[0] = reinterpret_cast<int4*>(s_words_2_3_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_2_3_1)[0] = reinterpret_cast<int4*>(s_words_2_3_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_2_3_1)[0] = reinterpret_cast<int4*>(s_words_2_3_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");
@@ -5870,28 +5898,25 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                 int w_srow_3_1 = role_tid_1 >> 2;
                 int w_c_3_1 = role_tid_1 & 3;
                 int w_grow_3_1 = tile_m_1 * 256 + 192 + w_srow_3_1;
+                int w_chunk_lo_3_1 = ((w_c_3_1 < 3) ? w_c_3_1 * 16 : 96);
+                int w_chunk_hi_3_1 = ((w_c_3_1 < 3) ? w_chunk_lo_3_1 + 48 : 112);
                 if (w_grow_3_1 < M) {
-                    int w_row_head_3_1 = w_grow_3_1 * 56 + w_head_1;
-                    unsigned int w_st_words_3_1[4];
-                    float w_st_vals_3_1[16];
-                    int w_chunk_lo_3_1 = ((w_c_3_1 < 3) ? w_c_3_1 * 16 : 96);
-                    int w_chunk_hi_3_1 = ((w_c_3_1 < 3) ? w_chunk_lo_3_1 + 48 : 112);
                     unsigned int w_x_lo_3_1[8];
                     unsigned int w_x_hi_3_1[8];
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_lo_3_1 * 2 ^ (w_srow_3_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_lo_3_1 * 2 + 16 ^ (w_srow_3_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(0) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_hi_3_1 * 2 ^ (w_srow_3_1 & 7) << 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(4) + 3]))
-                        : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_hi_3_1 * 2 + 16 ^ (w_srow_3_1 & 7) << 4)));
                     if (w_c_3_1 < 3) {
                         if (w_kind_1 < 2) {
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_lo_3_1 * 2 ^ (w_srow_3_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_lo_3_1[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_lo_3_1 * 2 + 16 ^ (w_srow_3_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(0) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_hi_3_1 * 2 ^ (w_srow_3_1 & 7) << 4)));
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w_x_hi_3_1[(4) + 3]))
+                                : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_hi_3_1 * 2 + 16 ^ (w_srow_3_1 & 7) << 4)));
                             float _unpack_bf16_78[16];
                             #pragma unroll
                             for (int _pair = 0; _pair < 8; _pair++) {
@@ -6042,69 +6067,76 @@ kernel_cake_minimax_h3_sm120_quant_pre_attention_7b1b744fc494f1de2730(const __gr
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(w_o_hi_3_1[_lp*2 + 0], w_o_hi_3_1[_lp*2+1 + 0]));
                                 w_o_hi_3_bf16_1[_lp] = *(uint32_t*)&_bf2;
                             }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_lo_3_bf16_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_o_hi_3_bf16_1 + 4)[0];
-                            }
-                        } else {
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                            }
-                            if (w_kind_1 == 0) {
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                            } else if (w_kind_1 == 1) {
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                            } else {
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                                reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                            }
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_lo_3_1 * 2 ^ (w_srow_3_1 & 7) << 4)), "r"(w_o_lo_3_bf16_1[0]), "r"(w_o_lo_3_bf16_1[1]), "r"(w_o_lo_3_bf16_1[2]), "r"(w_o_lo_3_bf16_1[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_lo_3_1 * 2 + 16 ^ (w_srow_3_1 & 7) << 4)), "r"(w_o_lo_3_bf16_1[4]), "r"(w_o_lo_3_bf16_1[5]), "r"(w_o_lo_3_bf16_1[6]), "r"(w_o_lo_3_bf16_1[7]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_hi_3_1 * 2 ^ (w_srow_3_1 & 7) << 4)), "r"(w_o_hi_3_bf16_1[0]), "r"(w_o_hi_3_bf16_1[1]), "r"(w_o_hi_3_bf16_1[2]), "r"(w_o_hi_3_bf16_1[3]) : "memory");
+                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(w_srow_3_1 * 256) + (unsigned int)(w_chunk_hi_3_1 * 2 + 16 ^ (w_srow_3_1 & 7) << 4)), "r"(w_o_hi_3_bf16_1[4]), "r"(w_o_hi_3_bf16_1[5]), "r"(w_o_hi_3_bf16_1[6]), "r"(w_o_hi_3_bf16_1[7]) : "memory");
                         }
+                    }
+                }
+                __syncwarp();
+                int s_row_3_0_1 = (role_tid_1 >> 5) * 8 + lane / 16;
+                int s_piece_3_0_1 = lane % 16;
+                unsigned int s_words_3_0_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_0_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_3_0_1 * 256) + (unsigned int)(s_piece_3_0_1 * 16 ^ (s_row_3_0_1 & 7) << 4)));
+                int s_dst_3_0_1 = ((tile_m_1 * 256 + 192 + s_row_3_0_1) * 56 + w_head_1) * 64 + s_piece_3_0_1 * 4;
+                if (tile_m_1 * 256 + 192 + s_row_3_0_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_0_1)[0] = reinterpret_cast<int4*>(s_words_3_0_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_0_1)[0] = reinterpret_cast<int4*>(s_words_3_0_1)[0];
                     } else {
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_lo_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_lo_3_1 + 4)[0];
-                        }
-                        if (w_kind_1 == 0) {
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(q_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                        } else if (w_kind_1 == 1) {
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(k_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                        } else {
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1)))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 0)[0];
-                            reinterpret_cast<int4*>(v_out + (w_row_head_3_1 * 64 + (w_chunk_hi_3_1 >> 1) + 4))[0] = reinterpret_cast<int4*>(w_x_hi_3_1 + 4)[0];
-                        }
+                        reinterpret_cast<int4*>(v_out + s_dst_3_0_1)[0] = reinterpret_cast<int4*>(s_words_3_0_1)[0];
+                    }
+                }
+                int s_row_3_1_1 = (role_tid_1 >> 5) * 8 + 2 + lane / 16;
+                int s_piece_3_1_1 = lane % 16;
+                unsigned int s_words_3_1_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_1_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_3_1_1 * 256) + (unsigned int)(s_piece_3_1_1 * 16 ^ (s_row_3_1_1 & 7) << 4)));
+                int s_dst_3_1_1 = ((tile_m_1 * 256 + 192 + s_row_3_1_1) * 56 + w_head_1) * 64 + s_piece_3_1_1 * 4;
+                if (tile_m_1 * 256 + 192 + s_row_3_1_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_1_1)[0] = reinterpret_cast<int4*>(s_words_3_1_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_1_1)[0] = reinterpret_cast<int4*>(s_words_3_1_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_3_1_1)[0] = reinterpret_cast<int4*>(s_words_3_1_1)[0];
+                    }
+                }
+                int s_row_3_2_1 = (role_tid_1 >> 5) * 8 + 4 + lane / 16;
+                int s_piece_3_2_1 = lane % 16;
+                unsigned int s_words_3_2_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_2_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_3_2_1 * 256) + (unsigned int)(s_piece_3_2_1 * 16 ^ (s_row_3_2_1 & 7) << 4)));
+                int s_dst_3_2_1 = ((tile_m_1 * 256 + 192 + s_row_3_2_1) * 56 + w_head_1) * 64 + s_piece_3_2_1 * 4;
+                if (tile_m_1 * 256 + 192 + s_row_3_2_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_2_1)[0] = reinterpret_cast<int4*>(s_words_3_2_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_2_1)[0] = reinterpret_cast<int4*>(s_words_3_2_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_3_2_1)[0] = reinterpret_cast<int4*>(s_words_3_2_1)[0];
+                    }
+                }
+                int s_row_3_3_1 = (role_tid_1 >> 5) * 8 + 6 + lane / 16;
+                int s_piece_3_3_1 = lane % 16;
+                unsigned int s_words_3_3_1[4];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&s_words_3_3_1[(0) + 3]))
+                    : "r"(A_stage_addr + free_stage_1 * 16384 + (unsigned int)(s_row_3_3_1 * 256) + (unsigned int)(s_piece_3_3_1 * 16 ^ (s_row_3_3_1 & 7) << 4)));
+                int s_dst_3_3_1 = ((tile_m_1 * 256 + 192 + s_row_3_3_1) * 56 + w_head_1) * 64 + s_piece_3_3_1 * 4;
+                if (tile_m_1 * 256 + 192 + s_row_3_3_1 < M) {
+                    if (w_kind_1 == 0) {
+                        reinterpret_cast<int4*>(q_out + s_dst_3_3_1)[0] = reinterpret_cast<int4*>(s_words_3_3_1)[0];
+                    } else if (w_kind_1 == 1) {
+                        reinterpret_cast<int4*>(k_out + s_dst_3_3_1)[0] = reinterpret_cast<int4*>(s_words_3_3_1)[0];
+                    } else {
+                        reinterpret_cast<int4*>(v_out + s_dst_3_3_1)[0] = reinterpret_cast<int4*>(s_words_3_3_1)[0];
                     }
                 }
                 asm volatile("barrier.sync 1, 256;" ::: "memory");

@@ -532,12 +532,15 @@ def compare(
 @pytest.fixture(scope="module")
 def cake_programs() -> None:
     """Skip the GPU tests unless the generated loader imports and publishes every
-    program when they run."""
+    program when they run, and the CUDA toolkit can run them."""
     if not cake.cake_w4a16_available():
         pytest.skip(
             f"the Cake W4A16 programs are not present ({cake.LOADER_MODULE} does not "
             "import or publishes no program)"
         )
+    unavailable = cake.cake_w4a16_toolkit_unavailable()
+    if unavailable is not None:
+        pytest.skip(unavailable)
 
 
 @pytest.fixture(scope="module")
@@ -930,6 +933,46 @@ class TestHostLogic:
             setattr(Full, identifier, object())
         monkeypatch.setattr(cake._Programs, "_loader", staticmethod(lambda: Full))
         assert cake.cake_w4a16_available()
+
+    def test_toolkit_gate(self, monkeypatch):
+        """``cake_w4a16_toolkit_unavailable`` names the toolkit floor and the
+        toolkit found below CUDA 13.0 and is ``None`` from 13.0 on; the loader
+        refuses to build a program on an older toolkit before it reads the
+        program's launch record."""
+        from packaging.version import Version
+
+        from flashinfer.jit import cpp_ext
+
+        assert cake.CAKE_W4A16_MIN_CUDA == "13.0"
+        monkeypatch.setattr(cpp_ext, "get_cuda_version", lambda: Version("12.9"))
+        reason = cake.cake_w4a16_toolkit_unavailable()
+        assert reason is not None
+        assert "CUDA 13.0" in reason and "12.9" in reason
+
+        class Program:
+            targets = ("sm_100a", "sm_103a")
+
+            @staticmethod
+            def target_for(compute_capability):
+                return "sm_100a"
+
+            @staticmethod
+            def launch_record():
+                raise AssertionError("the toolkit gate runs before the launch record")
+
+        class Loader:
+            FC1_N8 = Program()
+
+        monkeypatch.setattr(cake._Programs, "_loader", staticmethod(lambda: Loader))
+        monkeypatch.setattr(cake, "get_compute_capability", lambda device: (10, 0))
+        with pytest.raises(RuntimeError, match="FC1_N8: .*CUDA 13.0"):
+            cake._Programs().handle("FC1", cake.Cell(8), torch.device("cpu"))
+
+        for version in ("13.0", "13.4"):
+            monkeypatch.setattr(
+                cpp_ext, "get_cuda_version", lambda v=version: Version(v)
+            )
+            assert cake.cake_w4a16_toolkit_unavailable() is None
 
     def test_cells_and_identifiers(self):
         assert len(cake.CELLS) == 5

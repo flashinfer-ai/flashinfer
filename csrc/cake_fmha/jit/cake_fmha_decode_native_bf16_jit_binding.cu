@@ -322,6 +322,15 @@ void cake_paged_attention_decode(
   int64_t prefix_offset = 0;
   int64_t cursor = AlignUp(batch_size * static_cast<int64_t>(sizeof(int)), 16);
   bool needs_page_padding = source_pages < required_pages;
+#ifdef CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES
+  // The exact B256 sink member's page producer always publishes the page groups of 32 KV blocks
+  // and reads 256 page-table entries per row: it finishes only when max_seq_len evens to 30 or
+  // 32 blocks and the table holds 256 pages per row.
+  TVM_FFI_ICHECK(max_kv_len >= 3585 && max_kv_len <= 4096 && source_pages >= 256)
+      << "Cake FMHA decode-native BF16 exact sink member needs 3585 <= max_seq_len <= 4096 and "
+         "256 pages per row, got max_seq_len "
+      << max_kv_len << " and " << source_pages << " pages per row";
+#endif
   int64_t page_offset = cursor;
   if (needs_page_padding) {
     cursor += batch_size * required_pages * static_cast<int64_t>(sizeof(int));
@@ -408,6 +417,11 @@ void cake_paged_attention_decode(
     CAKE_FMHA_HAS_SINK == 0 && CAKE_FMHA_HAS_WINDOW == 0 && CAKE_FMHA_USE_SCALE_PTR == 0 && \
     CAKE_FMHA_RETAIN_KV_L2 == 1
   unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
+  // Each cluster owns one tile and arms its reduction barrier once: a cluster
+  // given a second tile (fewer SMs than tiles) would never finish.
+  TVM_FFI_ICHECK_GE(sm_count, static_cast<int64_t>(total_tiles))
+      << "Cake FMHA decode-native BF16 B4 member needs one cluster per tile: " << sm_count
+      << " SMs < " << total_tiles << " tiles";
   unsigned int logical_grid_x =
       std::min<unsigned int>(static_cast<unsigned int>(sm_count), total_tiles);
   grid_x = 2 * logical_grid_x;

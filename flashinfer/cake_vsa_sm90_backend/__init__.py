@@ -126,9 +126,12 @@ from .cake_planner import (  # noqa: F401
     SPLIT_CLUSTER_VARIANTS,
     SPLIT_KMAX_VARIANTS,
     _FP32_MAX,
+    bf16_gqa_queue_vf,
     cluster_capacity,
     cluster_cost,
     cluster_variant_for,
+    fp8_gqa_pin,
+    fp8_gqa_pin_vf,
     fp8_gqa_xshare,
     gqa_group,
     plan_small,
@@ -489,6 +492,9 @@ class CakeVsaSm90Plan:
                 # the Sage-FP8 route keeps the group-major split order (its split
                 # rows measured slower head-major); the BF16 route takes the default
                 split_tile_order="group" if self.fp8 else None,
+                # the Sage-FP8 route's grouped-query ragged pair plans join the queue
+                # earlier (FP8_POOL_RAGGED_PAIR_MIN_TILES)
+                fp8=self.fp8,
             )
             self.mode = plan["mode"]
             self.repair_split = bool(plan["repair_split"])
@@ -511,6 +517,17 @@ class CakeVsaSm90Plan:
                 # the Sage-FP8 route runs head-pair queue plans on the shared-transposer
                 # queue program; split-mode queue plans keep the queue program
                 xshare=self.fp8 and fp8_gqa_xshare(plan),
+                # ... and static plans whose lightest CTA runs at least PIN_MIN_CTA_LOOP_ITERS
+                # main-loop iterations on the position-selected static program (a plan key)
+                pin=self.fp8 and fp8_gqa_pin(plan),
+                # ... and pair-mode pin plans of long tiles whose lightest CTA runs at least
+                # PIN_VF_MIN_CTA_LOOP_ITERS main-loop iterations on the planner-routed second
+                # position-selected program (a plan key)
+                pin_vf=self.fp8 and fp8_gqa_pin_vf(plan),
+                # ... and the BF16 route runs pair-mode queue plans whose lightest CTA
+                # runs enough main-loop iterations for their tile length on the
+                # planner-routed second queue program (a plan key)
+                vf=(not self.fp8) and bf16_gqa_queue_vf(plan),
             )
             rule = _loader.workspace_rule(self.stage)
             assert rule is not None and rule["kind"] == "persistent"
@@ -832,9 +849,12 @@ __all__ = [
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "CakeVsaSm90Plan",
     "arch_for_capability",
+    "bf16_gqa_queue_vf",
     "cluster_capacity",
     "cluster_variant_for",
     "create_plan",
+    "fp8_gqa_pin",
+    "fp8_gqa_pin_vf",
     "fp8_gqa_xshare",
     "is_cake_vsa_sm90_supported",
     "persistent_stage",

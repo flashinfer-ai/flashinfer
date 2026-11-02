@@ -340,10 +340,13 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
     return u;
 }
 
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_blackwell_msa_37f16ecc96a0bc9d5335
+#endif
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_blackwell_msa_37f16ecc96a0bc9d5335(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap v, int* __restrict__ scheduler_metadata, int* __restrict__ k2q_row_ptr, int* __restrict__ k2q_qsplit_indices, uint8_t* __restrict__ partial_o, __nv_bfloat16* __restrict__ partial_scale, float* __restrict__ partial_lse, float* __restrict__ partial_temperature_lse, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ q_offsets, int* __restrict__ kv_lens, int* __restrict__ page_table, int q_group_segment_end_128, int q_group_segment_end_64, int q_group_segment_end_32, int q_group_segment_end_16, int q_group_segment_end_8, int q_group_segment_end_4, int q_group_segment_end_2, int total_q, int num_q_heads, int num_kv_heads, int total_rows, int nnz_per_head, int work_capacity, int num_work_items, int topk, int max_pages, int causal, int derive_q_offset, float softmax_scale_log2, float lse_temperature_scale, int return_temperature_lse)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, const __grid_constant__ CUtensorMap v, int* __restrict__ scheduler_metadata, int* __restrict__ k2q_row_ptr, int* __restrict__ k2q_qsplit_indices, uint8_t* __restrict__ partial_o, __nv_bfloat16* __restrict__ partial_scale, float* __restrict__ partial_lse, float* __restrict__ partial_temperature_lse, __nv_bfloat16* __restrict__ out, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int* __restrict__ q_offsets, int* __restrict__ kv_lens, int* __restrict__ page_table, int q_group_segment_end_128, int q_group_segment_end_64, int q_group_segment_end_32, int q_group_segment_end_16, int q_group_segment_end_8, int q_group_segment_end_4, int q_group_segment_end_2, int total_q, int num_q_heads, int num_kv_heads, int total_rows, int nnz_per_head, int work_capacity, int num_work_items, int topk, int max_pages, int causal, int derive_q_offset, float softmax_scale_log2, float lse_temperature_scale, int return_temperature_lse)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -2536,18 +2539,22 @@ kernel_cake_blackwell_msa_37f16ecc96a0bc9d5335(const __grid_constant__ CUtensorM
             }
             int token_base = k_batch_offset_5 + kv_block_5 * 128;
             int page_head = head_kv_5;
+#ifndef CAKE_FLAT_KV
             int physical_page = page_table[batch_5 * max_pages + kv_block_5];
             if (physical_page < 0) {
                 physical_page = 0;
             }
             token_base = 0;
             page_head = physical_page * num_kv_heads + head_kv_5;
+#endif
             if (elect_sync()) {
                 mbarrier_arrive_expect_tx(k_full_addr, 32768);
                 int token0 = token_base;
                 int token1 = token_base + 64;
+#ifndef CAKE_FLAT_KV
                 token0 = 0;
                 token1 = 64;
+#endif
                 asm volatile(
                     "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                     " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
@@ -2571,8 +2578,10 @@ kernel_cake_blackwell_msa_37f16ecc96a0bc9d5335(const __grid_constant__ CUtensorM
                 mbarrier_arrive_expect_tx(v_full_addr, 32768);
                 int token0_0 = token_base;
                 int token1_1 = token_base + 64;
+#ifndef CAKE_FLAT_KV
                 token0_0 = 0;
                 token1_1 = 64;
+#endif
                 asm volatile(
                     "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                     " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"

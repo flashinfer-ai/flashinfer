@@ -977,6 +977,7 @@ kernel_cake_nvfp4_attention_94fb7e2f8ee5c56bd085(const __grid_constant__ CUtenso
             s_f[61] = __uint_as_float((unsigned int)(s_acc[61] + 1262485504)) + smem_regs_14[1];
             s_f[62] = __uint_as_float((unsigned int)(s_acc[62] + 1262485504)) + smem_regs_14[0];
             s_f[63] = __uint_as_float((unsigned int)(s_acc[63] + 1262485504)) + smem_regs_14[1];
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncwarp();
             if (elect_sync()) {
                 mbarrier_arrive(k_empty_addr + (kv_stage) * 8);
@@ -1632,6 +1633,7 @@ kernel_cake_nvfp4_attention_94fb7e2f8ee5c56bd085(const __grid_constant__ CUtenso
                 : "+f"(o_acc[60]), "+f"(o_acc[(60) + 1]), "+f"(o_acc[(60) + 2]), "+f"(o_acc[(60) + 3])
                 : "r"(p_frag[4]), "r"(p_frag[(4) + 1]), "r"(p_frag[(4) + 2]), "r"(p_frag[(4) + 3]), "r"(v_frag[6]), "r"(v_frag[(6) + 1]), "r"((uint32_t)(psf[1])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(smem_regs_30[1])), "h"((uint16_t)0), "h"((uint16_t)0));
             asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
             __syncwarp();
             if (elect_sync()) {
                 mbarrier_arrive(v_empty_addr + (kv_stage) * 8);

@@ -29,7 +29,11 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
 
     ``kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next"`` selects the standard
     provider export. It accepts default or fixed ``knobs``, activation controls
-    and the finalization modes below. Online autotuning remains unavailable.
+    and the finalization modes below. With ``knobs="auto"``, warm up inside
+    ``autotune_v2()`` before capture to select and prepare a configuration.
+    ``kernel_variant="genphase"`` selects decoding with separate BF16
+    finalization and a K256/N128/CGA4 Gather4 tile. It supports standard SwiGLU
+    and early or late routing weights, without per-token FC1 scales.
     """
 
     intermediate_size: int
@@ -74,15 +78,23 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(num_max_tokens).
-    # "auto" -> online autotune at the first forward: collectively time the
+    # Legacy "auto" -> online autotune at the first forward: collectively time the
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
+    # The standard _cutedsl_next selector defers searches to autotune_v2().
     knobs: dict | str | None = None
+    # GenPhase is available through the _cutedsl_next selector.
+    kernel_variant: Literal["inference", "genphase"] = field(
+        default="inference", kw_only=True
+    )
+    mma_tiler_mnk: tuple[int, int, int] | None = field(default=None, kw_only=True)
+    cluster_shape_mn: tuple[int, int] | None = field(default=None, kw_only=True)
+    schedule_policy: tuple[str, int | None] | None = field(default=None, kw_only=True)
     # Uniform per-layer SwiGLU constants; None/None keeps standard SwiGLU.
     swiglu_alpha: float | None = None
     swiglu_beta: float | None = None
-    # NONE makes MoEEpMegaLayer.forward return per-route outputs for caller
-    # finalization; it requires fixed/offline-tuned knobs.
+    # NONE exposes per-route outputs through forward_unfinalized(). The legacy
+    # selector requires fixed/offline-tuned knobs for this mode.
     finalize_mode: FinalizeMode = FinalizeMode.AUTO
 
     def __post_init__(self) -> None:
@@ -95,7 +107,10 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
                     "finalize_mode=NONE requires enable_in_kernel_fc2_reduce=False "
                     "and combine_dtype='bf16'."
                 )
-            if self.knobs == "auto":
+            if (
+                self.knobs == "auto"
+                and self.kernel_name != "sm100_nvfp4_nvfp4_bf16_cutedsl_next"
+            ):
                 raise ValueError(
                     "finalize_mode=NONE requires fixed/offline-tuned knobs."
                 )

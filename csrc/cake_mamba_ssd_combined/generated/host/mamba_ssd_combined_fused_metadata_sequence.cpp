@@ -848,6 +848,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
 }
 
 inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
+  CAKE_SSD_MAIN_PDL_LAUNCH
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
       prepared.kernel->Launch(prepared.kargs, prepared.grid, prepared.block, stream, CAKE_SSD_MAIN_SMEM_BYTESu));
 }

@@ -62,14 +62,26 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   return product;
 }
 
-int64_t NonZero(int64_t divisor) {
-  TVM_FFI_CHECK(divisor != 0, ValueError) << KERNEL_NAME << ": a descriptor formula divides by zero";
-  return divisor;
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
 }
 
-int64_t CDiv(int64_t a, int64_t b) { return a / NonZero(b); }
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
 
-int64_t CMod(int64_t a, int64_t b) { return a % NonZero(b); }
+int64_t CDiv(int64_t a, int64_t b) {
+  if (b == 0 || (a == INT64_MIN && b == -1)) NoInt64(a, "/", b);
+  return a / b;
+}
+
+int64_t CMod(int64_t a, int64_t b) {
+  if (b == 0) NoInt64(a, "%", b);
+  return b == -1 ? 0 : a % b;
+}
 
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
@@ -91,10 +103,10 @@ CUtensorMap EncodeTma_A(const TensorView& t) {
   int64_t outer1 = NumelAbove(t, 1);
   check_dense_leading_dims(t, 1, "A");
   int64_t s2 = t.stride(-2) * 1;
-  TVM_FFI_CHECK((CMod(d1, 128) == 0), ValueError)
+  TVM_FFI_CHECK((CMod(d1, 128LL) == 0LL), ValueError)
       << KERNEL_NAME << ": descriptor 'A' requires (CMod(d1, 128) == 0)";
-  cuuint64_t global_dim[3] = {Extent(128, "A"), Extent(outer1, "A"), Extent(CDiv(d1, 128), "A")};
-  cuuint64_t global_strides[2] = {Stride(s2, "A"), Stride(128, "A")};
+  cuuint64_t global_dim[3] = {Extent(128LL, "A"), Extent(outer1, "A"), Extent(CDiv(d1, 128LL), "A")};
+  cuuint64_t global_strides[2] = {Stride(s2, "A"), Stride(128LL, "A")};
   cuuint32_t box_dim[3] = {128u, 128u, 1u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[2] <= global_dim[2], ValueError)
@@ -120,10 +132,10 @@ CUtensorMap EncodeTma_B(const TensorView& t) {
   int64_t outer1 = NumelAbove(t, 1);
   check_dense_leading_dims(t, 1, "B");
   int64_t s2 = t.stride(-2) * 1;
-  TVM_FFI_CHECK((CMod(d1, 128) == 0), ValueError)
+  TVM_FFI_CHECK((CMod(d1, 128LL) == 0LL), ValueError)
       << KERNEL_NAME << ": descriptor 'B' requires (CMod(d1, 128) == 0)";
-  cuuint64_t global_dim[3] = {Extent(128, "B"), Extent(outer1, "B"), Extent(CDiv(d1, 128), "B")};
-  cuuint64_t global_strides[2] = {Stride(s2, "B"), Stride(128, "B")};
+  cuuint64_t global_dim[3] = {Extent(128LL, "B"), Extent(outer1, "B"), Extent(CDiv(d1, 128LL), "B")};
+  cuuint64_t global_strides[2] = {Stride(s2, "B"), Stride(128LL, "B")};
   cuuint32_t box_dim[3] = {128u, 128u, 1u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
   TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
@@ -310,9 +322,9 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_SFA, TensorView a_SFB, Ten
   check_same_device(a_bias, a_A, "bias", "A");
   check_contiguous(a_out, "out");
   check_same_device(a_out, a_A, "out", "A");
-  TVM_FFI_CHECK((a_grid_n >= 1), ValueError)
+  TVM_FFI_CHECK((a_grid_n >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (grid_n >= 1)";
-  TVM_FFI_CHECK((a_N >= (a_grid_n * 128)), ValueError)
+  TVM_FFI_CHECK((a_N >= CheckedMul(a_grid_n, 128LL)), ValueError)
       << KERNEL_NAME << ": requires (N >= (grid_n * 128))";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

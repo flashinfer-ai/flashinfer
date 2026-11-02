@@ -348,13 +348,9 @@ def get_fp4_quantization_module(backend: str = "100"):
             out_sf_size = _compute_swizzled_layout_sf_size(
                 m, k // sf_vec_size, 8 if is_sf_8x4_layout else 128
             )
-            out_sf_size_padded = out_sf_size
         else:
             out_sf_size = m * k // sf_vec_size
-            out_sf_size_padded = round_up(m, 16) * k // sf_vec_size
-        out_sf = torch.empty(
-            (out_sf_size_padded,), dtype=torch.uint8, device=input.device
-        )
+        out_sf = torch.empty((out_sf_size,), dtype=torch.uint8, device=input.device)
         module.fp4_quantize(
             input,
             global_scale,
@@ -368,7 +364,7 @@ def get_fp4_quantization_module(backend: str = "100"):
             enable_pdl,
             nvfp4_4over6_code,
         )
-        return out_val, out_sf[:out_sf_size]
+        return out_val, out_sf
 
     @register_fake_op("flashinfer::fp4_quantize_sm100")
     def _fake_fp4_quantize_sm100(
@@ -694,11 +690,11 @@ def get_fp4_quantization_module(backend: str = "100"):
         when requested, and an optional global scale can be applied.
 
         Args:
-            input (torch.Tensor): Input tensor of shape [B, M, K] with dtype torch.float16,
-                torch.bfloat16, or an FP8-quantized dtype supported by the kernel.
-            mask (torch.Tensor): mask tensor of shape [B] with dtype torch.int32.
-            global_scale (torch.Tensor, optional): Global scale factor of shape [1] and
-                dtype float32.
+            input (torch.Tensor): Input tensor of shape [B, M, 2 * K] (gate half, then up
+                half) with dtype torch.float16 or torch.bfloat16.
+            mask (torch.Tensor): valid row count per group, shape [B], dtype torch.int32.
+            global_scale (torch.Tensor, optional): Global scale factor, one per group,
+                of shape [B] and dtype float32.
             nvfp4_4over6_code (int, optional): Packed NVFP4 4over6 recipe (see
                 flashinfer.quantization.nvfp4_4over6_code). ``-1`` lets the
                 kernel read the legacy FLASHINFER_NVFP4_4OVER6* environment
@@ -2262,9 +2258,11 @@ def scaled_fp4_grouped_quantize(
     a : torch.Tensor
         Input tensor of shape ``[B, M, K]`` with dtype fp16/bf16.
     mask : torch.Tensor
-        Mask tensor applied before quantization.
+        Valid row count per group, shape ``[B]``, dtype ``int32``. Only the
+        first ``mask[b]`` rows of group ``b`` are quantized; the entries of
+        ``x_q`` and ``sf`` for the remaining rows are unspecified.
     a_global_sf : torch.Tensor
-        Global scale factor of shape ``[1]`` with dtype ``float32``.
+        Global scale factor, one per group: shape ``[B]``, dtype ``float32``.
     nvfp4_4over6 : NVFP44Over6Config or None
         NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
 

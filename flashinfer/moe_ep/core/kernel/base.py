@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 if TYPE_CHECKING:
     import torch
 
+    from ....fused_moe.api import QuantFormat
+
     from ...config import BootstrapConfig, FleetParams
     from ...tensors import MoEEpTensors
     from ...weights import MoEWeightPack
@@ -25,7 +27,17 @@ class SplitKernelContext:
     fleet_params: "FleetParams"
     recv_topk_idx: Optional["torch.Tensor"] = None
     recv_topk_weights: Optional["torch.Tensor"] = None
+    # Id space of ``recv_topk_idx``. True: GLOBAL expert ids, as the
+    # MoEEpCommunication transports deliver them; picks outside this rank's
+    # local expert range (another rank's experts, ``invalid_expert_id``) are
+    # for the kernel to skip. False: ids local to this rank, with -1 for picks
+    # it does not own, as the Fleet/Handle transports deliver them.
+    recv_topk_idx_global: bool = False
     recv_count: Optional["torch.Tensor"] = None
+    # Per-token scale factors of ``expert_tensors`` when the tokens were
+    # quantized before dispatch (see SplitKernelBackend.dispatch_format), one
+    # row per received token; None when ``expert_tensors`` is unquantized.
+    expert_tensors_scale: Optional["torch.Tensor"] = None
 
 
 class SplitKernelBackend(ABC):
@@ -70,8 +82,42 @@ class SplitKernelBackend(ABC):
         budget)."""
         return x
 
+    @property
+    def packs_dispatch_payload(self) -> bool:
+        """Whether :meth:`pack_dispatch_payload` sends other bytes than the BF16
+        tokens, which the transport must then carry byte for byte."""
+        return False
+
+    def dispatch_format(self) -> "Optional[QuantFormat]":
+        """Activation format to quantize tokens to before a rank-major dispatch.
+
+        Applies only to the MoEEpCommunication path, whose transports carry
+        quantized rows plus a row-aligned scale payload. ``None`` (the default)
+        dispatches the unquantized tokens. A backend that returns a format
+        implements :meth:`quantize_for_dispatch` and accepts the received
+        values with ``SplitKernelContext.expert_tensors_scale`` in
+        :meth:`compute`.
+        """
+        return None
+
+    def quantize_for_dispatch(
+        self, x: "torch.Tensor"
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """Quantize ``[num_tokens, hidden]`` tokens to :meth:`dispatch_format`.
+
+        Returns ``(values, scales)``, each a 2D tensor with one row per token.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not quantize tokens before dispatch"
+        )
+
     @abstractmethod
     def compute(self, ctx: SplitKernelContext) -> "torch.Tensor": ...
+
+    def destroy(self) -> None:  # noqa: B027 - intentional no-op default
+        """Drop per-forward state, which may reference the transport's
+        receive buffers. The layer calls this before it destroys the
+        transport, whose buffers must not outlive it."""
 
 
 class MegaKernelBackend(ABC):
@@ -95,6 +141,19 @@ class MegaKernelBackend(ABC):
         self._ep_world_size: int = 0
         self._profile_knobs: dict[tuple[int, int | None], dict] = {}
         self._autotune_winner: dict[str, Any] | None = None
+
+    @classmethod
+    def create(cls, config: Any) -> MegaKernelBackend:
+        """Construct a backend, including an opt-in variant selector."""
+        return cls(config)
+
+    def get_tuned_config(self, workspace: Any = None) -> Any:
+        """Return a fixed kernel config for the selected automatic result."""
+        import dataclasses
+
+        if not dataclasses.is_dataclass(self._config) or isinstance(self._config, type):
+            raise TypeError("this MegaMoE backend does not expose a dataclass config")
+        return dataclasses.replace(self._config, knobs=self.get_tuned_knobs(workspace))
 
     def get_tuned_knobs(self, workspace: Any = None) -> dict[str, Any]:
         """Return a copy of the last completed automatic tuning result."""

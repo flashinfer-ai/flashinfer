@@ -128,7 +128,7 @@ def launch(
 
 def execute(inputs, config):
     # Use the same metadata-only compile cache and lock as the TC tactic.
-    from ..runtime import _COMPILED, _COMPILE_LOCK
+    from ..runtime import _COMPILED, _COMPILE_LOCK, _load_cross_compiled
 
     q, sf, ids, scores, w1, s1, w2, s2 = inputs[:8]
     mid, sf_storage, routes, output, narrow = inputs[10:]
@@ -196,6 +196,7 @@ def execute(inputs, config):
                         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                         options=f"--gpu-arch sm_{major}{minor}a --enable-tvm-ffi",
                     )
+                    compiled = _load_cross_compiled(compiled)
                     _COMPILED[key] = compiled
         compiled(*tensors)
         if finalize:

@@ -2570,7 +2570,7 @@ class CutlassHummingConfig:
 
 @dataclass(frozen=True)
 class CuteDslConfig:
-    """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
+    """CuteDSL block-scaled backend for W4A4, W4A8, MXFP8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
     """
@@ -2596,8 +2596,8 @@ class CuteDslConfig:
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
-        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
-        Defaults to NVFP4×NVFP4.
+        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
+        (CuTe-DSL W4A16). Defaults to NVFP4×NVFP4.
 
         ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
         (see that field): it selects the NVFP4×NVFP4 pack's
@@ -2617,6 +2617,24 @@ class CuteDslConfig:
             device=device,
             nvfp4_4over6=nvfp4_4over6,
         )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, quant: Optional[QuantConfig] = None):
+        """Quantize BF16 activations to MXFP8 for MXFP8×MXFP8.
+
+        Returns the canonical linear pack shared with
+        ``TrtllmFp8BlockConfig.prepare_activations``: E4M3 ``[M, H]`` and
+        row-major E8M0 scales ``[M, H // 32]``.
+        """
+        from .prepare import prepare_trtllm_fp8_block_activations
+
+        pair = (QuantFormat.MXFP8, QuantFormat.MXFP8)
+        quant = _mxfp8_activation_quant(quant, pair, "CuteDslConfig")
+        if quant.swizzled_scale_factors is True:
+            raise ValueError(
+                "CuteDslConfig consumes only the linear activation scale layout."
+            )
+        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
 
     def __repr__(self) -> str:
         return "CuteDslConfig()"
@@ -3014,6 +3032,15 @@ class FrostLowLatencyConfig:
     NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
     and top-k at most 32. It retains BF16 activation/expert rounding and
     separate FP32 multiply/add combine; the 4over6 recipe is not supported.
+
+    With MXFP8 activations and MXFP8/MXFP4 weights, or NVFP4 activations and
+    NVFP4 weights, expert IDs outside ``[0, num_experts)`` mark unrouted slots.
+    For these format pairs, finalization ignores those slots, including their
+    scores, and raw output writes zero rows with the usual identity route
+    mapping. Raw routing scores are returned unchanged apart from packed BF16
+    rounding; a downstream reducer must also exclude unrouted slots before
+    multiplying scores that may be NaN or Inf. Other format pairs require
+    expert IDs in ``[0, num_experts)``.
     """
 
     max_num_tokens: int = 2
@@ -3608,8 +3635,14 @@ class MoEActivationPack:
     # Pair-specific scales documented above; None for BF16 and per-tensor FP8.
     hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
-    # A negative id marks an unrouted slot (e.g. CUDA-graph padding) only on
-    # b12x for now; other backends define no behavior for negative ids.
+    # Runners that route through the TRT-LLM-Gen routing kernels (TRTLLM,
+    # Prims-TS, and CuteDSL via moe_sort) skip every id outside this rank's
+    # [local_expert_offset, local_expert_offset + local_num_experts), negative
+    # ids included. b12x treats a negative id as an unrouted slot (e.g.
+    # CUDA-graph padding). frost_low_latency accepts IDs outside [0, num_experts)
+    # as unrouted for its MXFP8 and NVFP4 activation paths; see
+    # FrostLowLatencyConfig for exact format pairs and finalized/raw semantics.
+    # Other backends define no behavior for negative IDs.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
     # float32 for TRTLLM UnpackedPrecomputed.

@@ -261,11 +261,12 @@ def test_unit_gate_calls_dispatch_to_the_unit_programs(monkeypatch) -> None:
 
 
 def test_cu_seqlens_cpu_reaches_the_cake_backend(monkeypatch) -> None:
-    """``cu_seqlens_cpu`` (the host copy of ``cu_seqlens``) is forwarded to the Cake backend, where the split rule
-    reads it: a long batch selects a split program; without it the backend synchronizes the copy and selects the
-    same program; a device tensor is refused."""
+    """``cu_seqlens_cpu`` (the host copy of ``cu_seqlens``) is forwarded to the Cake backend, where the body route
+    and the split rule read it: a merged-class batch (two sequences of 384 chunks over ten heads, the pinned row of
+    the route) selects the split program of the merged body; without it the backend synchronizes the copy and
+    selects the same program; a device tensor is refused."""
     inputs = _inputs(
-        3, (4097, 1000), 3, torch.Generator(device=_device()).manual_seed(SEED)
+        3, (8192, 8192), 10, torch.Generator(device=_device()).manual_seed(SEED)
     )
     launched = []
     monkeypatch.setattr(
@@ -273,10 +274,9 @@ def test_cu_seqlens_cpu_reaches_the_cake_backend(monkeypatch) -> None:
     )
     host = inputs["cu_seqlens"].cpu()
     chunk_gated_delta_product(**inputs, backend="cake", cu_seqlens_cpu=host)
-    assert (
-        len(launched) == 1
-        and loader.MODULES[launched[0]]["build"].get(loader.PREFILL_SPLIT_FLAG) is True
-    )
+    assert len(launched) == 1
+    assert loader.MODULES[launched[0]]["body"] == loader.ROUTE_BODY_P3
+    assert loader.MODULES[launched[0]]["build"].get(loader.PREFILL_SPLIT_FLAG) is True
     chunk_gated_delta_product(**inputs, backend="cake")
     assert launched == [launched[0]] * 2
     with pytest.raises(

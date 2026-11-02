@@ -1606,6 +1606,7 @@ class TmemSResource(DecodeGenResourceBase):
             self.seqlens_kv is not None
             and cfg.use_paged_kv
             and not cfg.use_split_kv
+            and cfg.fixed_seqlen
             and cfg.max_seq_len_q == 1
             and not cfg.use_sliding_window_causal
         )
@@ -1637,8 +1638,8 @@ class TmemSResource(DecodeGenResourceBase):
             element_mask_end_idx = seq_len_kv - self.seq_len_q + q_token_base + Int32(1)
         should_load_s = True
         if cutlass.const_expr(not use_sparse):
-            use_runtime_kv_domain = (
-                self.seqlens_kv is not None or cfg.uses_runtime_q_kv_union
+            use_runtime_kv_domain = self.seqlens_kv is not None or (
+                not cfg.fixed_seqlen or cfg.uses_runtime_q_kv_union
             )
             local_tile_idx = _softmax_tile_idx(cfg, stage_info, self.inst_id)
             if cutlass.const_expr(not use_runtime_kv_domain):
@@ -2019,7 +2020,7 @@ class TmemSResource(DecodeGenResourceBase):
             proxy_max_shift, tail_shift = self._proxy_score_shifts(
                 route_is_proxy_uniform
             )
-            if cutlass.const_expr(tail_log2_delta != 0.0):
+            if cutlass.const_expr(not cfg.fixed_seqlen or tail_log2_delta != 0.0):
                 if route_is_proxy_uniform:
                     for token_group_idx in cutlass.range_constexpr(4):
                         atom_origin, logical_summary = _swaps_routed_coordinate(
@@ -2525,7 +2526,7 @@ class TmemSResource(DecodeGenResourceBase):
         proxy_max_shift = Float32(0.0)
         tail_shift = Float32(0.0)
         tail_fragment_mask = Int32(0)
-        tail_lane: Constexpr[int] = 0
+        tail_lane = Int32(0)
         shifts_tail: Constexpr[bool] = False
         dequantizes_scores: Constexpr[bool] = (
             cfg.sage_score_scaling() is SageScoreScaling.DEQUANTIZED
@@ -2546,7 +2547,7 @@ class TmemSResource(DecodeGenResourceBase):
             )
             tail_summary_idx, tail_log2_delta = cfg.proxy_tail_summary
             tail_lane = tail_summary_idx % fragment_regs
-            shifts_tail = tail_log2_delta != 0.0
+            shifts_tail = not cfg.fixed_seqlen or tail_log2_delta != 0.0
             proxy_max_shift, tail_shift = self._proxy_score_shifts(route_is_proxy)
             if cutlass.const_expr(shifts_tail and cfg.use_sage_attention):
                 # Sage scores are quantized: the shift is divided by the row's
@@ -2554,17 +2555,17 @@ class TmemSResource(DecodeGenResourceBase):
                 tail_shift = tail_shift * cute.math.rcp(sage_q_scale, approx=True)
             if cutlass.const_expr(shifts_tail):
                 # One mask bit per fragment marks the one holding the ragged
-                # final summary, whose half and fragment are compile-time
-                # (``proxy_static_tail_fragment``). A thread holds it on a
+                # final summary. Its half and fragment follow the live KV
+                # length. A thread holds it on a
                 # proxy route of the last summary group, in the tail's half;
                 # with several groups, ``origin0`` identifies the last one.
-                tail_half, tail_fragment = cfg.proxy_static_tail_fragment
+                tail_half, tail_fragment = cfg.proxy_tail_fragment
                 holds_tail = cutlass.Boolean(
                     route_is_proxy
                     and _keeps_spatial_half(cfg, warp_grp_thread_idx)
                     == Int32(tail_half)
                 )
-                if cutlass.const_expr(cfg.num_proxy_groups > 1):
+                if cfg.num_proxy_groups > 1:
                     # The half's first atom is atom ``tail_half`` of the group.
                     tail_group_origin0 = (
                         cfg.num_proxy_groups - 1
@@ -2791,7 +2792,7 @@ class TmemSResource(DecodeGenResourceBase):
         may_hold_tail: Constexpr[bool],
         tail_fragment_mask: Int32,
         tail_shift: Float32,
-        tail_lane: Constexpr[int],
+        tail_lane: Int32,
     ) -> None:
         """Mask, fold and write back every fragment in one rolled loop.
 
@@ -2842,11 +2843,13 @@ class TmemSResource(DecodeGenResourceBase):
                         score = Float32(float("-inf"))
                     else:
                         score = _neg_max_f32()
-                if cutlass.const_expr(may_hold_tail and score_idx == tail_lane):
-                    if ((tail_fragment_mask >> Int32(fragment)) & Int32(1)) != Int32(0):
+                if cutlass.const_expr(may_hold_tail):
+                    if score_idx == tail_lane and (
+                        (tail_fragment_mask >> Int32(fragment)) & Int32(1)
+                    ) != Int32(0):
                         lane_shift = tail_shift
                         if cutlass.const_expr(cfg.use_sage_attention):
-                            tail_group: Constexpr[int] = tail_lane // (
+                            tail_group: Constexpr[int] = score_idx // (
                                 fragment_regs // groups
                             )
                             lane_shift = tail_shift * cute.math.rcp(

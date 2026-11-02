@@ -228,12 +228,15 @@ def silu_and_mul_scaled_nvfp4_experts_quantize(
     Parameters
     ----------
     a : torch.Tensor
-        Input tensor of shape ``[B, M, K]`` with dtype fp16/bf16.
+        Input tensor of shape ``[B, M, 2 * K]`` with dtype fp16/bf16: the
+        gate half followed by the up half along the last dimension. The
+        output covers ``K`` columns, ``silu(gate) * up``.
     mask : torch.Tensor
-        Mask tensor applied before quantization (typically the
-        expert-assignment mask).
+        Valid row count per expert, shape ``[B]``, dtype ``int32``. Only the
+        first ``mask[b]`` rows of expert ``b`` are quantized; the entries of
+        ``x_q`` and ``sf`` for the remaining rows are unspecified.
     a_global_sf : torch.Tensor
-        Global scale factor of shape ``[1]`` with dtype ``float32``.
+        Global scale factor, one per expert: shape ``[B]``, dtype ``float32``.
     nvfp4_4over6 : NVFP44Over6Config or None
         NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
 

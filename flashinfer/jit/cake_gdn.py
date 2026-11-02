@@ -44,6 +44,8 @@ CakeGDNArch = Literal["sm_100a", "sm_103a", "sm_107a"]
 
 _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
 _DEFINE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RECORD_NAME = re.compile(r"^(decode|prefill)_(.+)_[0-9a-f]{12}$")
+_RECORD_TMA_ABI = {"decode": "pointer", "prefill": "grid_constant"}
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
@@ -62,6 +64,9 @@ class CakeGDNRoute(NamedTuple):
     # directly (manifest field ``metadata_i64``: every sm_107a non-CP prefill record); the host
     # passes the caller's buffers without a per-call cast.  False on every other record.
     metadata_i64: bool = False
+    # The launch runs one CTA per work tile instead of the grid rule's persistent grid (the
+    # ragged DV-split route, ``_ragged_dvsplit_routes``).  False on every other route.
+    one_cta_per_tile: bool = False
 
 
 def _sha256(path: Path) -> str:
@@ -131,7 +136,47 @@ def _manifest() -> dict[str, Any]:
         raise RuntimeError(
             f"unexpected Cake GDN manifest schema at {path}: {manifest.get('schema')!r}"
         )
+    for record in manifest["variants"]:
+        _derive_record_fields(record)
     return manifest
+
+
+def _derive_record_fields(record: dict[str, Any]) -> None:
+    """Fill the record fields the export derives from its name and outputs.
+
+    ``<domain>_<schedule>_<12 hex>`` names every record: ``domain`` is its
+    first token, ``source_schedule`` is
+    ``flashinfer.cake_gdn.generated.<domain>:<schedule>``, ``tma_abi`` is
+    fixed per domain, ``host_binding.entry`` is ``run_<name>`` and the
+    record-level ``architectures`` is the sorted union of its outputs'.  A
+    field the manifest spells out must agree with the derived value.
+    """
+
+    name = record["name"]
+    match = _RECORD_NAME.match(name)
+    if match is None:
+        raise RuntimeError(f"unparseable Cake GDN record name {name!r}")
+    domain, schedule = match.groups()
+    derived: dict[str, Any] = {
+        "domain": domain,
+        "source_schedule": f"flashinfer.cake_gdn.generated.{domain}:{schedule}",
+        "tma_abi": _RECORD_TMA_ABI[domain],
+        "architectures": sorted(
+            {arch for output in record["outputs"] for arch in output["architectures"]}
+        ),
+    }
+    targets = [
+        (record, "", derived),
+        (record["host_binding"], "host_binding.", {"entry": f"run_{name}"}),
+    ]
+    for target, prefix, fields in targets:
+        for field, value in fields.items():
+            if field in target and target[field] != value:
+                raise RuntimeError(
+                    f"Cake GDN record {name!r} spells {prefix}{field}="
+                    f"{target[field]!r}; its name and outputs derive {value!r}"
+                )
+            target[field] = value
 
 
 def _kernel_record(name: str) -> dict[str, Any]:
@@ -283,12 +328,18 @@ def compile_cake_gdn_cubin(name: str, arch: CakeGDNArch) -> Path:
 
 
 _HOST_SHIM_PLACEHOLDER = re.compile(r"@([A-Z][A-Z0-9_]*)@")
+_HOST_SHIM_CONDITIONAL = re.compile(
+    r"^//@if (\w+)\n(.*?)^//@else\n(.*?)^//@endif\n", re.S | re.M
+)
 
 
 def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
     """Render the TVM-FFI host shim of one variant from its class template.
 
     ``host_binding.template`` names the template under ``host/templates/``.
+    A ``//@if metadata_i64`` / ``//@else`` / ``//@endif`` block of lines keeps
+    its first arm for a record whose ``metadata_i64`` is true and its second
+    arm otherwise; the directive lines are dropped before the placeholders.
     ``@ENTRY@``, ``@MODULE_IDENT@``, ``@CUDA_SYMBOL@`` and ``@SHIM_NAMESPACE@``
     come from ``host_binding``; every other ``@NAME@`` placeholder takes the
     value of ``host_binding.params[NAME]``.  The result is byte-identical to
@@ -297,6 +348,13 @@ def render_cake_gdn_host_shim(record: dict[str, Any]) -> str:
 
     host = record["host_binding"]
     template = (_source_dir() / host["template"]).read_text(encoding="utf-8")
+    flags = {"metadata_i64": bool(record.get("metadata_i64", False))}
+    template = _HOST_SHIM_CONDITIONAL.sub(
+        lambda match: match.group(2) if flags[match.group(1)] else match.group(3),
+        template,
+    )
+    if "//@" in template:
+        raise RuntimeError(f"{host['template']} has an unresolved host-shim directive")
     values = {
         "ENTRY": host["entry"],
         "MODULE_IDENT": host["module_ident"],
@@ -796,6 +854,110 @@ def _has_variant(
     return True
 
 
+# The ragged DV-split launch (``_ragged_dvsplit_routes``) wins when the batch's longest sequence
+# bounds the full-DV launch and loses on balanced batches (twice the CTAs).  The rule compares the
+# batch load ``max(Hq, Hv) * (total_seq_len + RAGGED_DVSPLIT_SEQ_TOKENS * num_seqs)`` (head-tokens;
+# each sequence's per-tile cost counted as that many tokens) with ``max_seq_len`` times a limit:
+# RAGGED_DVSPLIT_LOAD_LONGEST_FIRST when the longest sequence is the first one, whose half tiles
+# start at once, else the smaller RAGGED_DVSPLIT_LOAD, as its half tiles may wait for the first
+# wave.  At a load of 212 / 2 the half tiles would fill the 212 SMs for as long as the longest
+# sequence runs; both limits sit below the first slower batch.  Host integers only, O(1).
+# Fitted on VR200 CUPTI GPU spans of 859 ragged batches of the eight head geometries (a sweep of
+# 668 and a held-out sample of 191), where the DV-split launch ran 0.57x to 1.20x the full-DV
+# launch: the rule routes 190 of them, all at least 1.05x (the first slower batch is at 1.05x the
+# longest-first limit and 1.29x the other).  On a second held-out sample, every one of the 87
+# batches it routes was faster as well (at least 1.02x).
+RAGGED_DVSPLIT_SEQ_TOKENS = 384
+RAGGED_DVSPLIT_LOAD_LONGEST_FIRST = 90
+RAGGED_DVSPLIT_LOAD = 20
+
+
+@functools.cache
+def _ragged_dvsplit_routes() -> dict[str, CakeGDNRoute]:
+    """The ragged DV-split route: full-DV record name -> the route of its DV-split twin.
+
+    On sm_107a a BF16-I/O FP32-state full-DV batch with initial and final state (no
+    checkpoints, no state indices) is over the DV-split tile budget (``2 * num_seqs *
+    max(Hq, Hv) > 212``).  When its key also ships the DV-split record, a ragged batch runs
+    that record with one CTA per half tile (``one_cta_per_tile``; the launch grid is the
+    half-tile count): the two halves of a long sequence's tile run on two SMs and the short
+    sequences fill the others.  The resolver takes the route only for the batches whose longest
+    sequence bounds the launch (``RAGGED_DVSPLIT_LOAD``); on a balanced batch the doubled tile
+    count makes the DV-split launch slower.
+
+    Keys: the sm_107a-only full-DV base and gate-stream records of that contract whose exact
+    specializations also have a DV-split record (a key without either record is not here, so it
+    keeps its route or fails closed as before).  A resolved full-DV record of these keys is
+    over the tile budget: under it the key's own DV-split record is served first.  Built once
+    from the manifest.
+    """
+
+    arch: CakeGDNArch = "sm_107a"
+    stateful = {
+        "ENABLE_CHECKPOINTS": 0,
+        "SINGLE_CHUNK_NO_STATE": 0,
+        "STORE_FINAL_STATE": 1,
+        "UNIT_GATES": 0,
+        "USE_INITIAL_STATE": 1,
+        "USE_STATE_INDICES": 0,
+    }
+
+    def schedule(*, dvsplit: bool, gate_stream_full: bool) -> str:
+        return cake_gdn_prefill_seq_schedule(
+            arch,
+            _prefill_schedule_attr(
+                dvsplit=dvsplit,
+                use_initial_state=True,
+                io_dtype="bfloat16",
+                state_dtype="float32",
+                single_chunk=False,
+                gatepipe4=False,
+                fullgrid_vhold=False,
+                sm100a_state_inp_late=False,
+                sm103a_role_rebalanced=False,
+                gate_stream_full=gate_stream_full,
+            ),
+            use_state_indices=False,
+        )
+
+    prefix = "flashinfer.cake_gdn.generated.prefill:"
+    full_dv = {
+        prefix + schedule(dvsplit=False, gate_stream_full=gate_stream_full)
+        for gate_stream_full in (False, True)
+    }
+    split = schedule(dvsplit=True, gate_stream_full=False)
+    routes: dict[str, CakeGDNRoute] = {}
+    for record in _manifest()["variants"]:
+        specializations = record["specializations"]
+        if (
+            record["domain"] != "prefill"
+            or record["source_schedule"] not in full_dv
+            or record["tma_abi"] != "grid_constant"
+            or record["architectures"] != [arch]
+            or any(specializations.get(k) != v for k, v in stateful.items())
+            or not _has_variant(
+                arch=arch,
+                domain="prefill",
+                schedule_attr=split,
+                specializations=specializations,
+            )
+        ):
+            continue
+        twin = _variant_for(
+            arch=arch,
+            domain="prefill",
+            schedule_attr=split,
+            specializations=specializations,
+        )
+        routes[record["name"]] = CakeGDNRoute(
+            "flashinfer.gdn_prefill.noncp.dvsplit",
+            twin["name"],
+            bool(twin.get("metadata_i64", False)),
+            True,
+        )
+    return routes
+
+
 @functools.lru_cache(maxsize=4096)
 def select_cake_gdn_prefill_variant(
     *,
@@ -840,7 +1002,9 @@ def select_cake_gdn_prefill_variant(
     (a tuple in ``cu_seqlens`` order -- the resolver is memoised, so it must
     be hashable), derived from ``cu_seqlens_cpu`` only.  It enables the
     ragged-batch launch grid of ``_cake_gdn_prefill_grid_x`` so the
-    gate-stream twin follows the routed grid.  The resolver evaluates the
+    gate-stream twin follows the routed grid, and on sm_107a the ragged
+    DV-split route (``_ragged_dvsplit_routes``; the route then carries
+    ``one_cta_per_tile``).  The resolver evaluates the
     grid rule with the architecture's nominal active-cluster count while
     the launch uses the device's SM count; near the gain margin the two can
     differ on a device that exposes fewer SMs than the nominal count (a
@@ -1062,17 +1226,86 @@ def select_cake_gdn_prefill_variant(
     ):
         # The gate-stream twin is a performance specialization of the base body: the exporter
         # ships it for the head geometries its representative rows reach (the Hq16/Hv32,
-        # Hq8/Hv16 and Hq4/Hv8 families).  A key whose twin is not in the manifest runs its
-        # base record, exactly as the route did before the twin existed; only a missing base
-        # fails closed below.
+        # Hq8/Hv16 and Hq4/Hv8 families; on sm_107a the FP32-state twin also covers the
+        # Qwen3-Next / Qwen3.5 TP2/TP4/TP8 splits Hq2/Hv4, Hq8/Hv32, Hq4/Hv16 and Hq2/Hv8).
+        # A key whose twin is not in the manifest runs its base record, exactly as the route
+        # did before the twin existed; only a missing base fails closed below.
         gate_stream_full = False
         schedule_attr = _seq_schedule_attr(gate_stream_full=False)
+    if (
+        arch == "sm_107a"
+        and dvsplit
+        and not single_chunk
+        and not enable_checkpoints
+        and not use_state_indices
+        and not low_precision_state
+        and not _has_variant(
+            arch=arch,
+            domain="prefill",
+            schedule_attr=schedule_attr,
+            specializations=specializations,
+        )
+    ):
+        # sm_107a only.  DV-split is a physical-schedule choice (the tiles fit
+        # the active clusters), not part of the contract.  sm_107a's 212
+        # clusters put keys with 2 * num_seqs * max(Hq, Hv) in (148, 212] on
+        # DV-split where sm_100a runs full-DV (sm_103a only above 160; it
+        # fails closed on (148, 160]), and the non-gatepipe4
+        # DV-split schedules ship no (-1, 0, -1) geometry (Hv / Hq and Hv both
+        # not powers of two): e.g. FP16 I/O, FP32 initial + final state,
+        # ungated Hq2/Hv6 x 16 sequences.  On sm_107a a key the DV-split
+        # schedule does not ship runs the full-DV base record of the same key
+        # when one is shipped.
+        full_dv_schedule_attr = cake_gdn_prefill_seq_schedule(
+            arch,
+            _prefill_schedule_attr(
+                dvsplit=False,
+                use_initial_state=use_initial_state,
+                io_dtype=io_dtype,
+                state_dtype=state_dtype,
+                single_chunk=False,
+                gatepipe4=False,
+                fullgrid_vhold=False,
+                sm100a_state_inp_late=False,
+                sm103a_role_rebalanced=False,
+                gate_stream_full=False,
+            ),
+            use_state_indices=False,
+        )
+        if _has_variant(
+            arch=arch,
+            domain="prefill",
+            schedule_attr=full_dv_schedule_attr,
+            specializations=specializations,
+        ):
+            dvsplit = False
+            schedule_attr = full_dv_schedule_attr
     record = _variant_for(
         arch=arch,
         domain="prefill",
         schedule_attr=schedule_attr,
         specializations=specializations,
     )
+    # Ragged DV-split route (``_ragged_dvsplit_routes``): with the host lengths, a batch whose
+    # full-DV record has a DV-split twin runs that twin, one CTA per half tile, when its longest
+    # sequence bounds the launch.  The rule itself keeps equal lengths (``max_seq_len`` exact):
+    # their load exceeds ``num_seqs * num_o_heads * max_seq_len``, and over the tile budget
+    # ``num_seqs * num_o_heads > 106`` is above both limits.  A DV-split record (``dvsplit``) is
+    # never a key.  Host integers first, then one lookup on the resolved record; every other
+    # call returns as before.
+    if not dvsplit and host_seq_lens is not None:
+        limit = (
+            RAGGED_DVSPLIT_LOAD_LONGEST_FIRST
+            if host_seq_lens[0] == max_seq_len
+            else RAGGED_DVSPLIT_LOAD
+        )
+        if (
+            num_o_heads * (total_seq_len + RAGGED_DVSPLIT_SEQ_TOKENS * num_seqs)
+            <= max_seq_len * limit
+        ):
+            ragged = _ragged_dvsplit_routes().get(record["name"])
+            if ragged is not None:
+                return ragged
     if single_chunk:
         route = "flashinfer.gdn_prefill.noncp.single_chunk"
     elif enable_checkpoints:

@@ -138,6 +138,10 @@ def test_grouped_fp8_admitted_tactic_and_graph(tokens, activation, candidate):
         if hopper
         else [("warp_mma", group, 2, 128) for group in (2, 4)]
     )
+    if not hopper and (
+        activation in (SwiGLU(), SiTU()) or (tokens == 8 and activation == ReLU2())
+    ):
+        expected_choices += [("warp_mma", group, 2, 128, True) for group in (2, 4)]
     assert [v for v in choices if v[0] != "ffma"] == expected_choices
     tactic = expected_choices[candidate]
     runner.forward(inputs, tactic)
@@ -190,3 +194,129 @@ def test_grouped_fp8_unmeasured_cases_keep_fma(case):
     runner.build()
     inputs = runner.pack_inputs(MoEActivationPack(x, None, ids, scores), pack)
     assert all(v[0] == "ffma" for v in runner.get_valid_tactics(inputs, None))
+
+
+@pytest.mark.parametrize(
+    "tokens,activation",
+    [(4, SwiGLU()), (8, SwiGLU()), (4, SiTU()), (8, SiTU()), (8, ReLU2())],
+)
+@pytest.mark.parametrize("group", [2, 4])
+def test_sm120_fp8_weight_first_cache_and_live_graphs(
+    tokens, activation, group, monkeypatch
+):
+    _require_grouped_fp8()
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("FP8 weight-first choices are qualified on SM120")
+    from cutlass import cute
+    from flashinfer.fused_moe.backends.frost_low_latency import runtime
+
+    cache = {}
+    monkeypatch.setattr(runtime, "_COMPILED", cache)
+    cases = []
+    for _ in range(2):
+        cfg, x, ids, scores, pack, view = _admitted_inputs(
+            tokens=tokens, activation=activation
+        )
+        runner = FrostLowLatencyRunner(cfg, x.device)
+        runner.check_support()
+        runner.build()
+        inputs = runner.pack_inputs(MoEActivationPack(x, None, ids, scores), pack)
+        # Reference and mutate the buffers actually bound by execution.
+        live_view = dict(view)
+        for key, index in (
+            ("fc1_expert_weights", 3),
+            ("fc2_expert_weights", 4),
+            ("fc1_dequant_scale", 9),
+            ("fc2_act_quant_scale", 10),
+            ("fc2_dequant_scale", 11),
+        ):
+            live_view[key] = inputs[index]
+        cases.append((runner, inputs, live_view))
+    old = ("warp_mma", group, 2, 128)
+    overlap = (*old, True)
+    runner, inputs, _ = cases[0]
+    choices = runner.get_valid_tactics(inputs, None)
+    assert old in choices and overlap in choices
+    a = runner.forward(inputs, old).clone()
+    b = runner.forward(inputs, overlap).clone()
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+    assert len(cache) == 2 and {key[4] for key in cache} == {old, overlap}
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("New buffers with identical metadata recompiled")
+
+    monkeypatch.setattr(cute, "compile", unexpected)
+    graphs = []
+    for runner, inputs, _ in cases:
+        for tactic in (old, overlap):
+            runner.forward(inputs, tactic)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                runner.forward(inputs, tactic)
+            graphs.append(graph)
+    for epoch in range(2):
+        for index, (runner, inputs, view) in enumerate(cases):
+            x, ids, scores, w1, w2 = inputs[:5]
+            x.copy_((-x.float() * (0.5 if index else 0.75)).to(x.dtype))
+            w1.copy_((-w1.float()).to(w1.dtype))
+            w2.copy_((w2.float() * 0.5).to(w2.dtype))
+            ids.add_(1).remainder_(17)
+            scores.copy_(scores.flip(1))
+            view["fc1_dequant_scale"].mul_(1.1)
+            view["fc2_dequant_scale"].mul_(0.9)
+            view["fc2_act_quant_scale"].fill_(32.0 if epoch else 64.0)
+            if epoch:
+                ids[0, 0], ids[-1, -1] = -1, 17
+                scores[0, 0], scores[-1, -1] = float("nan"), float("inf")
+            valid_scores = scores.masked_fill((ids < 0) | (ids >= 17), 0)
+            _, expected, _ = _reference(
+                x, ids, valid_scores, view, runner.config.activation, True
+            )
+            for graph in graphs[2 * index : 2 * index + 2]:
+                for buf in inputs[5:8]:
+                    buf.fill_(float("nan"))
+                graph.replay()
+                _check(inputs[7], expected)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "tokens2",
+        "hidden",
+        "intermediate",
+        "topk",
+        "custom_swiglu",
+        "raw",
+        "tile",
+        "relu2_t4",
+    ],
+)
+def test_sm120_fp8_weight_first_rejects_unqualified_manual_tactics(case):
+    _require_grouped_fp8()
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("FP8 weight-first choices are qualified on SM120")
+    args = {}
+    if case == "tokens2":
+        args["tokens"] = 2
+    elif case == "hidden":
+        args["hidden"] = 256
+    elif case == "intermediate":
+        args["intermediate"] = 128
+    elif case == "topk":
+        args["topk"] = 8
+    elif case == "relu2_t4":
+        args.update(tokens=4, activation=ReLU2())
+    elif case == "custom_swiglu":
+        args["activation"] = SwiGLU(alpha=1.702)
+    cfg, x, ids, scores, pack, _ = _admitted_inputs(**args)
+    if case == "raw":
+        cfg = replace(cfg, finalize=MoEFinalizeConfig(do_finalize=False))
+    runner = FrostLowLatencyRunner(cfg, x.device)
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(MoEActivationPack(x, None, ids, scores), pack)
+    tactic = ("warp_mma", 8 if case == "tile" else 2, 2, 128, True)
+    assert tactic not in runner.get_valid_tactics(inputs, None)
+    with pytest.raises(ValueError, match="Weight-first FP8 decode requires"):
+        runner.forward(inputs, tactic)

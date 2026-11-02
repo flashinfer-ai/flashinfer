@@ -18,7 +18,6 @@ from .core import (
 )
 
 CakeFmhaTarget = Literal["sm100a", "sm103a"]
-CakeFmhaContextExactProfile = Literal["q511", "q257"]
 
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 # Build tag carried by every Cake FMHA JIT module name.  It is the tag of the
@@ -177,6 +176,7 @@ def _validate_decode_quant_fp8_specialization(
     page_size: int,
     *,
     full_blocks: bool,
+    fixed_split: bool = False,
 ) -> dict[str, int]:
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
@@ -184,13 +184,30 @@ def _validate_decode_quant_fp8_specialization(
         raise ValueError("batch_size must be positive")
     if q_len != 1:
         raise ValueError("decode-quant FP8 requires q_len=1")
+    if fixed_split and full_blocks:
+        raise ValueError(
+            "the fixed-split decode-quant FP8 member masks tails at run time"
+        )
     if num_q_heads <= 0 or num_kv_heads <= 0:
         raise ValueError("num_q_heads and num_kv_heads must be positive")
     if num_q_heads != 8 * num_kv_heads:
         raise ValueError("decode-quant FP8 requires a head-group ratio of 8")
     if page_size not in (16, 32):
         raise ValueError("decode-quant FP8 requires page_size 16 or 32")
-    return {"FULL_BLOCKS": int(full_blocks), "PAGE_SIZE": page_size}
+    selector = {"FULL_BLOCKS": int(full_blocks), "PAGE_SIZE": page_size}
+    if fixed_split:
+        selector.update(_DECODE_QUANT_FP8_FIXED_SPLIT)
+    return selector
+
+
+# The fixed split plan of the FP8 decode (8 splits x 16 blocks: perf_decode_b4_s16384_fp8 on B200 and GB300) with
+# PDL between the decode and its reducer; every other plan uses the runtime-plan member.
+_DECODE_QUANT_FP8_FIXED_SPLIT = {
+    "NUM_SPLITS": 8,
+    "BLOCKS_PER_SPLIT": 16,
+    "ENABLE_PDL": 1,
+}
+_DECODE_QUANT_FP8_REDUCE_FIXED_SPLIT = {"FIXED_NUM_SPLITS": 8, "USE_PDL": 1}
 
 
 def _validate_decode_quant_nvfp4_specialization(
@@ -397,7 +414,6 @@ def _validate_context_specialization(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
-    exact_profile: CakeFmhaContextExactProfile | None = None,
 ) -> dict[str, int]:
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
@@ -422,49 +438,7 @@ def _validate_context_specialization(
         "IS_CAUSAL": int(is_causal),
         "RETURN_LSE": int(return_lse),
     }
-    if exact_profile is None:
-        return selector
-    if exact_profile == "q511":
-        expected = (11, 10, 2, 5, 32, 1)
-        exact_selector = {
-            "HEADS_PER_GROUP": 5,
-            "L2_SWIZZLE": 1,
-            "NUM_M_BLOCKS": 11,
-            "NUM_Q_HEADS": 10,
-            "PACK_G": 5,
-            "PAGE_SIZE": 32,
-            "SINGLE_MASK_LOOP": 1,
-            "TOK_PER_STAGE": 25,
-        }
-    else:
-        expected = (6, 10, 2, 5, 1024, 8)
-        exact_selector = {
-            "HEADS_PER_GROUP": 5,
-            "L2_SWIZZLE": 8,
-            "NUM_M_BLOCKS": 6,
-            "NUM_Q_HEADS": 10,
-            "PACK_G": 5,
-            "PAGE_SIZE": 1024,
-            "SINGLE_MASK_LOOP": 1,
-            "TOK_PER_STAGE": 25,
-        }
-    actual = (
-        num_m_blocks,
-        num_q_heads,
-        num_kv_heads,
-        pack_g,
-        page_size,
-        l2_swizzle,
-    )
-    if actual != expected or selector != {
-        "ENABLE_SINK": 0,
-        "IS_CAUSAL": 1,
-        "RETURN_LSE": 0,
-    }:
-        raise ValueError(
-            f"context BF16 exact profile {exact_profile} does not match its fixed selector"
-        )
-    return {**selector, **exact_selector}
+    return selector
 
 
 def get_cake_fmha_context_bf16_uri(
@@ -479,7 +453,6 @@ def get_cake_fmha_context_bf16_uri(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
-    exact_profile: CakeFmhaContextExactProfile | None = None,
 ) -> str:
     selector = _validate_context_specialization(
         target,
@@ -492,7 +465,6 @@ def get_cake_fmha_context_bf16_uri(
         is_causal=is_causal,
         return_lse=return_lse,
         enable_sink=enable_sink,
-        exact_profile=exact_profile,
     )
     return (
         f"cake_fmha_context_bf16_{target}"
@@ -500,7 +472,6 @@ def get_cake_fmha_context_bf16_uri(
         f"_pack{pack_g}_page{page_size}_l2{l2_swizzle}"
         f"_causal{selector['IS_CAUSAL']}_lse{selector['RETURN_LSE']}"
         f"_sink{selector['ENABLE_SINK']}"
-        f"_exact{exact_profile or 'generic'}"
         f"_{CAKE_FMHA_JIT_TAG}"
     )
 
@@ -518,7 +489,6 @@ def gen_cake_fmha_context_bf16_module(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
-    exact_profile: CakeFmhaContextExactProfile | None = None,
 ) -> JitSpec:
     """Build one authenticated context BF16 specialization."""
 
@@ -533,7 +503,6 @@ def gen_cake_fmha_context_bf16_module(
         is_causal=is_causal,
         return_lse=return_lse,
         enable_sink=enable_sink,
-        exact_profile=exact_profile,
     )
     sources = _get_component_sources(
         "context_bf16", target, selector, _CONTEXT_BF16_JIT_BINDING
@@ -552,7 +521,6 @@ def gen_cake_fmha_context_bf16_module(
             is_causal=is_causal,
             return_lse=return_lse,
             enable_sink=enable_sink,
-            exact_profile=exact_profile,
         ),
         sources=list(sources),
         extra_cuda_cflags=[
@@ -588,7 +556,6 @@ def load_cake_fmha_context_bf16_module(
     is_causal: bool,
     return_lse: bool,
     enable_sink: bool,
-    exact_profile: CakeFmhaContextExactProfile | None = None,
 ):
     module = gen_cake_fmha_context_bf16_module(
         target,
@@ -601,7 +568,6 @@ def load_cake_fmha_context_bf16_module(
         is_causal=is_causal,
         return_lse=return_lse,
         enable_sink=enable_sink,
-        exact_profile=exact_profile,
     ).build_and_load()
     logger.info("Loaded Cake FMHA context BF16 module: %s", module)
     return module
@@ -2028,6 +1994,7 @@ def get_cake_fmha_decode_quant_fp8_uri(
     page_size: int,
     *,
     full_blocks: bool,
+    fixed_split: bool = False,
 ) -> str:
     selector = _validate_decode_quant_fp8_specialization(
         target,
@@ -2037,11 +2004,17 @@ def get_cake_fmha_decode_quant_fp8_uri(
         num_kv_heads,
         page_size,
         full_blocks=full_blocks,
+        fixed_split=fixed_split,
+    )
+    split = (
+        f"_split{selector['NUM_SPLITS']}x{selector['BLOCKS_PER_SPLIT']}_pdl"
+        if fixed_split
+        else ""
     )
     return (
         f"cake_fmha_decode_quant_fp8_{target}"
         f"_b{batch_size}_q{q_len}_hq{num_q_heads}_hkv{num_kv_heads}"
-        f"_page{selector['PAGE_SIZE']}_full{selector['FULL_BLOCKS']}"
+        f"_page{selector['PAGE_SIZE']}_full{selector['FULL_BLOCKS']}{split}"
         f"_{CAKE_FMHA_JIT_TAG}"
     )
 
@@ -2056,6 +2029,7 @@ def gen_cake_fmha_decode_quant_fp8_module(
     page_size: int,
     *,
     full_blocks: bool,
+    fixed_split: bool = False,
 ) -> JitSpec:
     """Build the authenticated FP8 decode plus split-KV reducer chain."""
 
@@ -2067,10 +2041,23 @@ def gen_cake_fmha_decode_quant_fp8_module(
         num_kv_heads,
         page_size,
         full_blocks=full_blocks,
+        fixed_split=fixed_split,
     )
+    reduce_selector = _DECODE_QUANT_FP8_REDUCE_FIXED_SPLIT if fixed_split else {}
     main_sources = _get_component_launch_sources("decode_quant_fp8", target, selector)
     reduce_sources = _get_component_launch_sources(
-        "decode_quant_fp8_reduce", target, {}
+        "decode_quant_fp8_reduce", target, reduce_selector
+    )
+    fixed_split_flags = (
+        [
+            f"-DCAKE_FMHA_FIXED_NUM_SPLITS={selector['NUM_SPLITS']}",
+            f"-DCAKE_FMHA_FIXED_BLOCKS_PER_SPLIT={selector['BLOCKS_PER_SPLIT']}",
+            f"-DCAKE_FMHA_ENABLE_PDL={selector['ENABLE_PDL']}",
+            f"-DCAKE_FMHA_REDUCE_FIXED_NUM_SPLITS={reduce_selector['FIXED_NUM_SPLITS']}",
+            f"-DCAKE_FMHA_REDUCE_USE_PDL={reduce_selector['USE_PDL']}",
+        ]
+        if fixed_split
+        else []
     )
     api_binding = get_cake_fmha_csrc_dir() / _DECODE_QUANT_FP8_JIT_BINDING
     if not api_binding.is_file():
@@ -2084,6 +2071,7 @@ def gen_cake_fmha_decode_quant_fp8_module(
             num_kv_heads,
             page_size,
             full_blocks=full_blocks,
+            fixed_split=fixed_split,
         ),
         sources=[*main_sources, *reduce_sources, api_binding],
         extra_cuda_cflags=[
@@ -2095,6 +2083,7 @@ def gen_cake_fmha_decode_quant_fp8_module(
             f"-DCAKE_FMHA_PAGE_SIZE={selector['PAGE_SIZE']}",
             f"-DCAKE_FMHA_FULL_BLOCKS={selector['FULL_BLOCKS']}",
             "-DCAKE_FMHA_NVFP4=0",
+            *fixed_split_flags,
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
     )
@@ -2112,6 +2101,7 @@ def load_cake_fmha_decode_quant_fp8_module(
     page_size: int,
     *,
     full_blocks: bool,
+    fixed_split: bool = False,
 ):
     module = gen_cake_fmha_decode_quant_fp8_module(
         target,
@@ -2121,6 +2111,7 @@ def load_cake_fmha_decode_quant_fp8_module(
         num_kv_heads,
         page_size,
         full_blocks=full_blocks,
+        fixed_split=fixed_split,
     ).build_and_load()
     logger.info("Loaded Cake FMHA FP8 decode/reduce module: %s", module)
     return module

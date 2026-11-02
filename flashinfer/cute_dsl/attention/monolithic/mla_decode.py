@@ -45,6 +45,11 @@ _CUDA_GRID_Y_MAX = 65_535
 _STATIC_REDUCER_MAX_SPLITS = 48
 # Cap for launches with too few work units to fill the GPU at 48 splits.
 _SMALL_LAUNCH_REDUCER_MAX_SPLITS = 128
+# A raised cap only pays off while every split still streams at least this
+# many 128-token KV tiles (1K tokens); with thinner splits the per-split setup
+# and the extra reducer partials cost more than the idle SMs did. In practice
+# the cap is raised only for contexts of roughly 50K tokens and more.
+_RAISED_SPLIT_MIN_KV_TILES = 8
 
 
 def _validate_nonpersistent_grid_y(
@@ -139,16 +144,22 @@ def _get_split_kv_and_workspace_size(
             "occupancy_q_tiles must be in "
             f"[1, {rectangular_q_tiles}], got {occupancy_q_tiles}"
         )
-    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
-        1,
-        occupancy_q_tiles,
-        max_active_blocks,
-        _reducer_split_cap(occupancy_q_tiles, max_active_blocks),
-    )
+    split_cap = _reducer_split_cap(occupancy_q_tiles, max_active_blocks)
     if max_seq_len is not None:
         if max_seq_len <= 0:
             raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
         k_tile_total = ceil_div(max_seq_len, mma_qk_tile_n)
+        if split_cap > _STATIC_REDUCER_MAX_SPLITS:
+            # Keep the static cap unless the raised one still leaves
+            # _RAISED_SPLIT_MIN_KV_TILES tiles in every split.
+            split_cap = max(
+                _STATIC_REDUCER_MAX_SPLITS,
+                min(split_cap, k_tile_total // _RAISED_SPLIT_MIN_KV_TILES),
+            )
+    split_kv = BlackwellMultiHeadLatentAttentionForwardFP16.get_split_kv_simplified(
+        1, occupancy_q_tiles, max_active_blocks, split_cap
+    )
+    if max_seq_len is not None:
         k_tiles_per_split = ceil_div(k_tile_total, split_kv)
         split_kv = ceil_div(k_tile_total, k_tiles_per_split)
     if num_kv_splits is not None and (

@@ -697,8 +697,8 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
     // gate_raw_full: 5 barriers, init_count=1
     // qk_raw_full: 5 barriers, init_count=1
     // v_full: 5 barriers, init_count=1
-    // v_free: 5 barriers, init_count=4
-    // smem_free: 5 barriers, init_count=4
+    // v_free: 5 barriers, init_count=128
+    // smem_free: 5 barriers, init_count=128
     // raw_inputs_free: 5 barriers, init_count=1
     // state_inp_ready: 5 barriers, init_count=4
     // state_inp_left_ready: 5 barriers, init_count=4
@@ -727,7 +727,7 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
       mbarrier_init(smem + 0 + _bar * 8, 1);
     }
     for (int _bar = lane; _bar < 10; _bar += 32) {
-      mbarrier_init(smem + 160 + _bar * 8, 4);
+      mbarrier_init(smem + 160 + _bar * 8, 128);
     }
     for (int _bar = lane; _bar < 5; _bar += 32) {
       mbarrier_init(smem + 240 + _bar * 8, 1);
@@ -1291,8 +1291,8 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
           }
         }
         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+        mbarrier_arrive(v_free_addr + (compute_stage) * 8);
         if (elect_sync()) {
-          mbarrier_arrive(v_free_addr + (compute_stage) * 8);
           mbarrier_arrive(u_inp_ready_addr + (compute_stage) * 8);
         }
         mbarrier_wait(u2_acc_ready_addr + (compute_stage) * 8, _phase_u2_acc_ready);
@@ -1336,9 +1336,7 @@ __global__ __launch_bounds__(1024) void kernel_flashkda_bf16_fused_m128(
           mbarrier_arrive(u2_inp_ready_addr + (compute_stage) * 8);
         }
         mbarrier_wait(final_ready_addr + (compute_stage) * 8, _phase_final_ready);
-        if (elect_sync()) {
-          mbarrier_arrive(smem_free_addr + (compute_stage) * 8);
-        }
+        mbarrier_arrive(smem_free_addr + (compute_stage) * 8);
         {
           int checkpoint_token = (chunk_idx + 1) * 16;
         }

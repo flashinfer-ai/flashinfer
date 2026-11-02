@@ -49,8 +49,8 @@
 #define CAKE_STR_(x) #x
 #define CAKE_STR(x) CAKE_STR_(x)
 
-extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_db015a53334184a3005e(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k_nope, const __grid_constant__ CUtensorMap tmap_k_rope, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ seq_lens_kv, int* __restrict__ page_table, float* __restrict__ sinks, float softmax_scale_log2, float bmm2_scale, int num_split, int total_work_items, int max_pages_per_seq, int enable_sink);
-extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_d1a68c90cbc4aa0fcd6e(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ sinks, int num_q_heads, int num_split, float bmm2_scale, int enable_sink);
+extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_a2109eb46daec2b60699(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k_nope, const __grid_constant__ CUtensorMap tmap_k_rope, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ seq_lens_kv, int* __restrict__ page_table, float* __restrict__ sinks, float softmax_scale_log2, float bmm2_scale, int num_split, int total_work_items, int max_pages_per_seq, int enable_sink);
+extern "C" __global__ void kernel_cake_trtllm_mla_blackwell_5a61778faf497dda81ba(__nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, __nv_bfloat16* __restrict__ O, float* __restrict__ sinks, int num_q_heads, int num_split, float bmm2_scale, int enable_sink);
 
 namespace CAKE_PROGRAM_SHIM {
 
@@ -395,7 +395,7 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   void* kargs[] = {&p_tmap_q, &p_tmap_k_nope, &p_tmap_k_rope, &p_tmap_v, &p_O, &p_partial_lse, &p_seq_lens_kv, &p_page_table, &p_sinks, &v_softmax_scale_log2, &v_bmm2_scale, &v_num_split, &v_total_work_items, &v_max_pages_per_seq, &v_enable_sink};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_db015a53334184a3005e), 231424);
+      reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_a2109eb46daec2b60699), 231424);
   (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(384u, 1u, 1u);
@@ -419,9 +419,9 @@ void Run(TensorView arg_tmap_q, TensorView arg_tmap_k_nope, TensorView arg_tmap_
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_db015a53334184a3005e), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_a2109eb46daec2b60699), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_db015a53334184a3005e failed: "
+      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_a2109eb46daec2b60699 failed: "
       << cudaGetErrorString(launch_status);
 }
 }  // namespace CAKE_VARIANT_NS_0
@@ -488,9 +488,9 @@ void Run(TensorView arg_partial_O, TensorView arg_partial_lse, TensorView arg_O,
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_d1a68c90cbc4aa0fcd6e), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_trtllm_mla_blackwell_5a61778faf497dda81ba), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_d1a68c90cbc4aa0fcd6e failed: "
+      << "cudaLaunchKernelExC for kernel_cake_trtllm_mla_blackwell_5a61778faf497dda81ba failed: "
       << cudaGetErrorString(launch_status);
 }
 }  // namespace CAKE_VARIANT_NS_1

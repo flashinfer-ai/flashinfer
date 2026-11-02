@@ -1524,6 +1524,57 @@ def test_mtp_large_kv_pool_high_pages_eager_and_graph(
     check(captured)
 
 
+@pytest.mark.parametrize("capture", [False, True])
+def test_mtp_prepared_kernel_reuses_split_buckets(monkeypatch, capture):
+    """Changing the split budget must reuse a warmed scalar kernel."""
+    pytest.importorskip("cutlass.utils.rubin_helpers")
+    from flashinfer.cute_dsl.attention.rubin_mtp import mla_decode
+
+    compiling = []
+
+    def compile_kernel(*args, **kwargs):
+        compiling.append(args[0])
+        return lambda *args: None
+
+    monkeypatch.setattr(mla_decode.cute, "compile", compile_kernel)
+    monkeypatch.setattr(mla_decode, "_check_compiler_compatibility", lambda: None)
+    monkeypatch.setattr(mla_decode, "get_num_sm", lambda device: 208)
+    monkeypatch.setattr(mla_decode, "get_compute_capability", lambda device: (10, 7))
+    monkeypatch.setattr(mla_decode, "cute_dsl_compile_arch", lambda *args: "sm_107a")
+    monkeypatch.setattr(mla_decode, "get_max_active_clusters", lambda size: 208 // size)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    options = dict(
+        device=torch.device("cuda:0"),
+        torch_dtype=torch.float8_e4m3fn,
+        torch_out_dtype=torch.float8_e4m3fn,
+        page_size=64,
+        batch_size=2,
+        num_heads=128,
+        seq_len_q=4,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        max_seq_len=32768,
+    )
+    mla_decode._get_compiled_mla_kernel.cache_clear()
+    try:
+        warm = mla_decode.prepare_cute_dsl_mla_decode(**options, num_kv_splits=3)
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capture)
+        for splits in (6, 13, 26, 32):
+            assert (
+                mla_decode.prepare_cute_dsl_mla_decode(**options, num_kv_splits=splits)
+                is warm
+            )
+        assert len(compiling) == 1
+        if capture:
+            # A genuinely new specialization still requires eager preparation.
+            with pytest.raises(RuntimeError, match="before CUDA graph capture"):
+                mla_decode.prepare_cute_dsl_mla_decode(
+                    **{**options, "page_size": 128}, num_kv_splits=3
+                )
+    finally:
+        mla_decode._get_compiled_mla_kernel.cache_clear()
+
+
 @pytest.mark.parametrize(
     "branch,q_len,page_size,scale,capacity",
     [

@@ -9,7 +9,7 @@ Historical `92dd334` knob profiles are candidate settings for this newer
 kernel, not new measurements; tuning caches from that drop are invalidated.
 
 Qualify correctness first using the [Rubin runbook](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
-NVFP4, MXFP8 E4M3/E5M2, and MXFP4/MXFP8 require native SM107 and
+NVFP4, MXFP4, MXFP8 E4M3/E5M2, and MXFP4/MXFP8 require native SM107 and
 a compatible CuTe DSL build. Export `CUTE_DSL_ARCH=sm_107a` before Python
 starts. Record the compiler stack and absolute latency with each result.
 
@@ -21,6 +21,42 @@ Use `--dtype mxfp4_mxfp8 --arch sm107` for mixed-format offline tuning, or
 MXFP8 activation staging and uses packed E2M1 weights with block-32 E8M0
 scales. Its tuning cache entries are separate from the MXFP8-weight entries.
 
+Use `Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig` for MXFP4 weights and
+activations (W4A4), or `--dtype mxfp4 --arch sm107` in the offline tuner.
+Both operands use packed E2M1 with per-32 E8M0 scales. Weight preparation
+is shared with MXFP4/MXFP8, including canonical prequantized weights without
+requantization. Hidden and intermediate sizes must be multiples of 128.
+BF16 inputs use fused quantization and route staging; `quantize_input=False`
+accepts packed FP4 input and E8M0 scales in `MoEEpTensors.scales`.
+
+W4A4 defaults to tile K256 with standard inference or GenPhase. GenPhase retains
+its N128/N256, uniform CGA4, BF16-combine and capacity constraints; the N64
+FP8 decode path is not admitted. Native tuning and caches distinguish W4A4
+from NVFP4 and mixed MXFP4/MXFP8. The benchmark accepts `--quant-kind mxfp4`.
+
+Routing value checks are disabled by default. With
+`FLASHINFER_SM107_MEGA_CHECK_ROUTES=1`, contiguous BF16 inputs and top-k up to 32
+use NVFP4, MXFP4 or MXFP8 staging to check route bounds, duplicate experts and
+finite unmasked scores in the quantization kernel. These checks remain active
+during graph replay. Unsupported layouts and prequantized inputs use separate
+routing validation. Set
+`FLASHINFER_SM107_FUSED_ROUTE_CHECK=0` to use separate validation for diagnostics.
+
+NVFP4, MXFP4 and MXFP8 staging also mask trailing routing rows in the quantization launch,
+including when replaying graphs with different live row counts in a shared
+workspace. Empty inputs and tails exceeding 16 routing elements per live CTA
+thread retain a separate parallel fill. Set
+`FLASHINFER_SM107_FUSED_TAIL_MASK=0` to use the separate tail clear for diagnostics.
+
+NVFP4 backend defaults for `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const`
+bind a workspace-owned read-only ones tensor instead of filling three tensors
+on every call. Explicit contiguous FP32 tensors are also bound directly; other
+layouts retain the copy path. The default tensor is separate from mutable
+workspace scalar storage so pooled layers and captured graphs cannot overwrite
+each other's default values. Valid strided FP32 vectors are accepted on the
+first invocation as well as after warmup; shape, device and positive-finite
+value checks still apply.
+
 ## What the benchmark measures
 
 `benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py` reports:
@@ -29,9 +65,11 @@ scales. Its tuning cache entries are separate from the MXFP8-weight entries.
   required output/reset operations and dispatch, both GEMMs, and combine.
 - `--mode compute`: inputs staged once, then backend `compute()` with a
   preallocated owned output reused across calls. Includes the backend wrapper,
-  required resets/reduction, kernel, and output copy, but no recurring input staging.
+  required resets/reduction and kernel, but no recurring input staging. Separate
+  reduction writes aligned contiguous outputs directly; other layouts and
+  in-kernel reduction use a workspace output followed by a copy.
 - `--mode forward`: public `MoEEpLayer.forward()` with BF16 inputs, including
-  validation, Torch quantization/staging, owned output handling, and the kernel.
+  validation, quantization/staging, owned output handling, and the kernel.
 - `--execution eager|graph`: eager launches or replay of a warmed CUDA
   graph. These are separate series, not interchangeable measurements.
 

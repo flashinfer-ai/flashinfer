@@ -383,9 +383,9 @@ def test_cake_fmha_context_bf16_generic_members_share_one_arch_source() -> None:
 
     members = get_cake_fmha_manifest()["components"]["context_bf16"]["source_family"]
     generic_members = [m for m in members if "NUM_M_BLOCKS" not in m["selector"]]
-    exact_members = [m for m in members if "NUM_M_BLOCKS" in m["selector"]]
-    assert len(generic_members) == 6
-    assert len(exact_members) == 2
+    # The q511 / q257 one-tile programs ship as the generated unit
+    # csrc/cake_fmha_context_bf16/, not as registry members.
+    assert len(generic_members) == len(members) == 6
     assert {
         member["sources"][arch]
         for member in generic_members
@@ -393,9 +393,7 @@ def test_cake_fmha_context_bf16_generic_members_share_one_arch_source() -> None:
     } == {"cuda/context_bf16/default.cu"}
     csrc_dir = get_cake_fmha_csrc_dir()
     for arch in ("sm_100a", "sm_103a"):
-        assert not (csrc_dir / f"cuda/context_bf16/{arch}/default.cu").exists()
-        for member in exact_members:
-            assert member["sources"][arch].startswith(f"cuda/context_bf16/{arch}/")
+        assert not (csrc_dir / f"cuda/context_bf16/{arch}").exists()
     text = (csrc_dir / "cuda/context_bf16/default.cu").read_text(encoding="utf-8")
     assert "#define __CUDA_ARCH__" not in text
     assert (
@@ -475,7 +473,12 @@ def test_cake_fmha_decode_quant_members_share_one_folded_source(
     """The page-size members compile one source whose PAGE_SIZE is a loader define."""
 
     members = get_cake_fmha_manifest()["components"][component]["source_family"]
-    assert sorted(member["selector"]["PAGE_SIZE"] for member in members) == [16, 32]
+    # Runtime split-plan members, one per page size; decode_quant_fp8 adds the fixed 8 x 16 split-plan
+    # members (NUM_SPLITS/BLOCKS_PER_SPLIT/ENABLE_PDL loader defines of the same source).
+    runtime = [member for member in members if "NUM_SPLITS" not in member["selector"]]
+    fixed = [member for member in members if "NUM_SPLITS" in member["selector"]]
+    assert sorted(member["selector"]["PAGE_SIZE"] for member in runtime) == [16, 32]
+    assert sorted(member["selector"]["PAGE_SIZE"] for member in fixed) in ([], [16, 32])
     for arch, source in sources.items():
         assert {member["sources"][arch] for member in members} == {source}
     for source in sorted(set(sources.values())):
@@ -498,7 +501,12 @@ def test_cake_fmha_decode_quant_fp8_members_share_one_arch_source() -> None:
     arches = ("sm_100a", "sm_103a")
     component = get_cake_fmha_manifest()["components"]["decode_quant_fp8"]
     members = component["source_family"]
-    assert sorted(member["selector"]["PAGE_SIZE"] for member in members) == [16, 32]
+    # Runtime split-plan members, one per page size; decode_quant_fp8 adds the fixed 8 x 16 split-plan
+    # members (NUM_SPLITS/BLOCKS_PER_SPLIT/ENABLE_PDL loader defines of the same source).
+    runtime = [member for member in members if "NUM_SPLITS" not in member["selector"]]
+    fixed = [member for member in members if "NUM_SPLITS" in member["selector"]]
+    assert sorted(member["selector"]["PAGE_SIZE"] for member in runtime) == [16, 32]
+    assert sorted(member["selector"]["PAGE_SIZE"] for member in fixed) in ([], [16, 32])
     sources = {member["sources"][arch] for member in members for arch in arches}
     assert sources == {folded}
     csrc_dir = get_cake_fmha_csrc_dir()
@@ -1037,7 +1045,7 @@ def test_cake_fmha_decode_quant_fp8_jit_selects_main_and_reducer(
         16,
         2,
         32,
-        full_blocks=True,
+        full_blocks=False,
     )
     assert spec.name == get_cake_fmha_decode_quant_fp8_uri(
         "sm103a",
@@ -1046,7 +1054,7 @@ def test_cake_fmha_decode_quant_fp8_jit_selects_main_and_reducer(
         16,
         2,
         32,
-        full_blocks=True,
+        full_blocks=False,
     )
     assert {Path(source).name for source in spec.sources} == {
         "default.cu",
@@ -1062,8 +1070,76 @@ def test_cake_fmha_decode_quant_fp8_jit_selects_main_and_reducer(
     assert "-DNUM_Q_HEADS=16" in spec.extra_cuda_cflags
     assert "-DNUM_KV_HEADS=2" in spec.extra_cuda_cflags
     assert "-DCAKE_FMHA_PAGE_SIZE=32" in spec.extra_cuda_cflags
-    assert "-DCAKE_FMHA_FULL_BLOCKS=1" in spec.extra_cuda_cflags
+    assert "-DCAKE_FMHA_FULL_BLOCKS=0" in spec.extra_cuda_cflags
     assert "-DCAKE_FMHA_NVFP4=0" in spec.extra_cuda_cflags
+    assert not any("FIXED_NUM_SPLITS" in flag for flag in spec.extra_cuda_cflags)
+
+
+def test_cake_fmha_decode_quant_fp8_jit_fixed_split_member(monkeypatch) -> None:
+    """The fixed 8 x 16 split-plan member: same sources, the plan and PDL as macros."""
+
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    spec = gen_cake_fmha_decode_quant_fp8_module(
+        "sm100a", 4, 1, 32, 4, 32, full_blocks=False, fixed_split=True
+    )
+    assert spec.name == get_cake_fmha_decode_quant_fp8_uri(
+        "sm100a", 4, 1, 32, 4, 32, full_blocks=False, fixed_split=True
+    )
+    assert "_split8x16_pdl_" in spec.name
+    assert spec.name != get_cake_fmha_decode_quant_fp8_uri(
+        "sm100a", 4, 1, 32, 4, 32, full_blocks=False
+    )
+    assert any(
+        str(source).endswith("cuda/decode_quant_fp8/default.cu")
+        for source in spec.sources
+    )
+    assert any(
+        str(source).endswith("cuda/decode_quant_fp8_reduce/default.cu")
+        for source in spec.sources
+    )
+    for flag in (
+        "-DCAKE_FMHA_FIXED_NUM_SPLITS=8",
+        "-DCAKE_FMHA_FIXED_BLOCKS_PER_SPLIT=16",
+        "-DCAKE_FMHA_ENABLE_PDL=1",
+        "-DCAKE_FMHA_REDUCE_FIXED_NUM_SPLITS=8",
+        "-DCAKE_FMHA_REDUCE_USE_PDL=1",
+        "-DCAKE_FMHA_FULL_BLOCKS=0",
+    ):
+        assert flag in spec.extra_cuda_cflags
+    with pytest.raises(ValueError):
+        gen_cake_fmha_decode_quant_fp8_module(
+            "sm100a", 4, 1, 32, 4, 32, full_blocks=True, fixed_split=True
+        )
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "num_kv_heads", "max_seq_len", "sm_count", "fixed"),
+    [
+        (4, 4, 16384, 148, True),
+        (4, 4, 16384, 152, True),
+        (8, 2, 16384, 148, True),
+        (4, 4, 16129, 148, True),
+        (4, 4, 16128, 148, False),
+        (4, 4, 16385, 148, False),
+        (4, 4, 8192, 148, False),
+        (256, 4, 8192, 148, False),
+        (4, 2, 16384, 148, False),
+    ],
+)
+def test_cake_fmha_fp8_decode_fixed_split_plan(
+    batch_size, num_kv_heads, max_seq_len, sm_count, fixed
+) -> None:
+    """The route takes the fixed-plan member exactly when the binding's host plan
+    (max_seq_len and the SM count only) is 8 splits x 16 blocks."""
+
+    assert (
+        cake_api._decode_quant_fp8_fixed_split(
+            batch_size, num_kv_heads, max_seq_len, sm_count
+        )
+        is fixed
+    )
 
 
 def test_cake_fmha_decode_quant_nvfp4_jit_selects_main_and_reducer(
@@ -1132,69 +1208,6 @@ def test_cake_fmha_context_bf16_jit_selects_one_manifest_member(
     assert "-DHEADS_PER_GROUP=2" in spec.extra_cuda_cflags
     assert "-DPACK_G=2" in spec.extra_cuda_cflags
     assert "-DTOK_PER_STAGE=64" in spec.extra_cuda_cflags
-
-
-@pytest.mark.parametrize(
-    ("profile", "args", "expected"),
-    [
-        (
-            "q511",
-            ("sm100a", 11, 10, 2, 5, 32, 1),
-            {
-                "ENABLE_SINK": 0,
-                "HEADS_PER_GROUP": 5,
-                "IS_CAUSAL": 1,
-                "L2_SWIZZLE": 1,
-                "NUM_M_BLOCKS": 11,
-                "NUM_Q_HEADS": 10,
-                "PACK_G": 5,
-                "PAGE_SIZE": 32,
-                "RETURN_LSE": 0,
-                "SINGLE_MASK_LOOP": 1,
-                "TOK_PER_STAGE": 25,
-            },
-        ),
-        (
-            "q257",
-            ("sm103a", 6, 10, 2, 5, 1024, 8),
-            {
-                "ENABLE_SINK": 0,
-                "HEADS_PER_GROUP": 5,
-                "IS_CAUSAL": 1,
-                "L2_SWIZZLE": 8,
-                "NUM_M_BLOCKS": 6,
-                "NUM_Q_HEADS": 10,
-                "PACK_G": 5,
-                "PAGE_SIZE": 1024,
-                "RETURN_LSE": 0,
-                "SINGLE_MASK_LOOP": 1,
-                "TOK_PER_STAGE": 25,
-            },
-        ),
-    ],
-)
-def test_cake_fmha_context_bf16_exact_profile_selector(profile, args, expected) -> None:
-    from flashinfer.jit import cake_fmha as cake_jit
-
-    assert (
-        cake_jit._validate_context_specialization(
-            *args,
-            is_causal=True,
-            return_lse=False,
-            enable_sink=False,
-            exact_profile=profile,
-        )
-        == expected
-    )
-    with pytest.raises(ValueError, match="does not match its fixed selector"):
-        cake_jit._validate_context_specialization(
-            *args[:-1],
-            8 if args[-1] == 1 else 1,
-            is_causal=True,
-            return_lse=False,
-            enable_sink=False,
-            exact_profile=profile,
-        )
 
 
 def test_cake_fmha_context_fp8_jit_selects_one_manifest_member(monkeypatch) -> None:
@@ -1714,6 +1727,10 @@ def test_cake_fmha_exact_b128_members_serve_caller_lse_from_generic_member(
         enable_block_sparse_attention=False,
     )
     route = cake_api.select_cake_fmha_decode_route(query.device, **kwargs)
+    # The generated DEC_B128 program serves the 2048 launch; the 1024 launch
+    # (at most nine KV blocks) and the 4096 launch (a tensor bmm1 with a host
+    # bmm2) stay on the JIT member.
+    program = ("decode_bf16", "DEC_B128") if max_seq_len == 2048 else None
     assert route == cake_api.CakeFmhaDecodeRoute(
         target=target,
         batch_size=batch_size,
@@ -1724,6 +1741,7 @@ def test_cake_fmha_exact_b128_members_serve_caller_lse_from_generic_member(
         has_window=False,
         use_scale_ptr=device_scale,
         retain_kv_l2=retain_kv_l2,
+        program=program,
     )
     assert cake_api.cake_fmha_route_is_optimized(route)
 
@@ -1731,6 +1749,7 @@ def test_cake_fmha_exact_b128_members_serve_caller_lse_from_generic_member(
     lse_route = cake_api.select_cake_fmha_decode_route(
         query.device, **{**kwargs, "lse": caller_lse}
     )
+    # A caller LSE keeps the route (and so its JIT member, which writes the LSE).
     assert lse_route == dataclasses.replace(route, return_lse=True)
     assert cake_api.cake_fmha_route_is_optimized(lse_route)
 
@@ -1788,6 +1807,7 @@ def test_cake_fmha_exact_sink_no_lse_member_falls_back_for_caller_lse(
         enable_block_sparse_attention=False,
     )
     route = cake_api.select_cake_fmha_decode_route(query.device, **kwargs)
+    # The generated DEC_SINK program serves the launch without an LSE.
     assert route == cake_api.CakeFmhaDecodeRoute(
         target="sm100a",
         batch_size=batch_size,
@@ -1798,6 +1818,7 @@ def test_cake_fmha_exact_sink_no_lse_member_falls_back_for_caller_lse(
         has_window=False,
         use_scale_ptr=False,
         retain_kv_l2=False,
+        program=("decode_bf16", "DEC_SINK"),
     )
     assert cake_api.cake_fmha_route_is_optimized(route)
 
@@ -2047,9 +2068,13 @@ def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) 
     )
 
 
-def test_cake_fmha_fp8_decode_route_requires_exact_full_block_bucket(
+def test_cake_fmha_fp8_decode_route_reads_only_host_scalars(
     monkeypatch,
 ) -> None:
+    """The FP8 route plans from ``max_seq_len`` alone: the kernel reads
+    ``seq_lens`` at run time and masks every tail, so odd block counts, tails
+    and shorter requests route without a device-to-host read of the lengths."""
+
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
     batch_size, num_q_heads, num_kv_heads, page_size = 2, 16, 2, 16
     query = torch.empty((batch_size, num_q_heads, 128), dtype=torch.float8_e4m3fn)
@@ -2089,8 +2114,20 @@ def test_cake_fmha_fp8_decode_route_requires_exact_full_block_bucket(
     assert route is not None
     assert route.component == "decode_quant_fp8"
     assert cake_api.cake_fmha_route_is_optimized(route)
-    assert select(torch.tensor([511, 512], dtype=torch.int32), 512) is None
-    assert select(torch.tensor([512, 640], dtype=torch.int32), 640) is None
+
+    def no_host_read(*args, **kwargs):
+        raise AssertionError("the FP8 decode route must not read seq_lens on the host")
+
+    for lengths, max_seq_len in (([511, 512], 512), ([512, 640], 640), ([0, 1], 4096)):
+        seq_lens = torch.tensor(lengths, dtype=torch.int32)
+        with monkeypatch.context() as patched:
+            for name in ("tolist", "item", "cpu", "numpy"):
+                patched.setattr(torch.Tensor, name, no_host_read)
+            route = select(seq_lens, max_seq_len)
+        assert route is not None and route.component == "decode_quant_fp8"
+    # Host scalars still bound the domain: fewer than four 128-token blocks.
+    short = select(torch.tensor([256, 256], dtype=torch.int32), 256)
+    assert short is None or short.component != "decode_quant_fp8"
 
 
 def test_cake_fmha_fp16_nhd_route_loads_its_authenticated_adapter(monkeypatch) -> None:
@@ -2241,8 +2278,14 @@ def test_cake_fmha_fp8_route_loads_its_authenticated_adapter(monkeypatch) -> Non
     )
     assert observed == {
         "args": ("sm103a", 2, 1, 16, 2, 16),
-        "kwargs": {"full_blocks": True},
+        "kwargs": {"full_blocks": False, "fixed_split": False},
     }
+    fixed_route = dataclasses.replace(route, num_split=8)
+    assert (
+        cake_api.get_cake_fmha_decode_module(torch.device("cpu"), fixed_route)
+        is fp8_sentinel
+    )
+    assert observed["kwargs"] == {"full_blocks": False, "fixed_split": True}
 
 
 def test_cake_fmha_nvfp4_route_loads_authenticated_adapter(monkeypatch) -> None:
@@ -2470,41 +2513,53 @@ def test_cake_fmha_context_hd256_route_requires_exact_workspace(
     assert select(misaligned) is None
 
 
-def test_cake_fmha_context_bf16_exact_route_loads_exact_member(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("target", "profile", "shape", "program"),
+    [
+        ("sm100a", "q511", (11, 10, 2, 5, 32, 1), "Q511_SM100A"),
+        ("sm103a", "q511", (11, 10, 2, 5, 32, 1), "Q511_SM103A"),
+        ("sm100a", "q257", (6, 10, 2, 5, 1024, 8), "Q257_SM100A"),
+        ("sm103a", "q257", (6, 10, 2, 5, 1024, 8), "Q257_SM103A"),
+    ],
+)
+def test_cake_fmha_context_bf16_exact_route_loads_generated_program(
+    monkeypatch, target, profile, shape, program
+) -> None:
     sentinel = object()
-    observed = {}
-
-    def load(*args, **kwargs):
-        observed["args"] = args
-        observed["kwargs"] = kwargs
-        return sentinel
-
-    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
-    monkeypatch.setattr(cake_api, "load_cake_fmha_context_bf16_module", load)
+    observed = []
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    monkeypatch.setattr(
+        cake_api,
+        "_load_cake_fmha_context_program",
+        lambda route: observed.append(route) or sentinel,
+    )
+    monkeypatch.setattr(
+        cake_api,
+        "load_cake_fmha_context_bf16_module",
+        lambda *args, **kwargs: pytest.fail("the JIT module serves no exact route"),
+    )
+    num_m_blocks, num_q_heads, num_kv_heads, pack_g, page_size, l2_swizzle = shape
     route = cake_api.CakeFmhaContextRoute(
-        target="sm103a",
+        target=target,
         component="context_bf16",
-        num_m_blocks=11,
-        num_q_heads=10,
-        num_kv_heads=2,
-        pack_g=5,
-        page_size=32,
-        l2_swizzle=1,
+        num_m_blocks=num_m_blocks,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        pack_g=pack_g,
+        page_size=page_size,
+        l2_swizzle=l2_swizzle,
         is_causal=True,
         return_lse=False,
         enable_sink=False,
-        exact_profile="q511",
+        exact_profile=profile,
+        program=program,
     )
     assert cake_api.get_cake_fmha_context_module(torch.device("cpu"), route) is sentinel
-    assert observed == {
-        "args": ("sm103a", 11, 10, 2, 5, 32, 1),
-        "kwargs": {
-            "is_causal": True,
-            "return_lse": False,
-            "enable_sink": False,
-            "exact_profile": "q511",
-        },
-    }
+    assert observed == [route]
+    with pytest.raises(RuntimeError, match="has no program"):
+        cake_api.get_cake_fmha_context_module(
+            torch.device("cpu"), dataclasses.replace(route, program=None)
+        )
 
 
 def test_cake_fmha_context_fp8_route_omits_bf16_exact_profile(monkeypatch) -> None:
@@ -2917,33 +2972,33 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         is_causal=True,
         return_lse=False,
         enable_sink=False,
+        program="B256_KV4",
     )
-    assert (
-        cake_api.select_cake_fmha_context_route(
-            fp8_query.device,
-            query=fp8_query,
-            key_cache=fp8_key,
-            value_cache=torch.empty_like(fp8_key),
-            out=torch.empty_like(fp8_query),
-            block_tables=torch.zeros((2, 2, 1), dtype=torch.int32),
-            seq_lens=torch.tensor([64, 64], dtype=torch.int32),
-            batch_size=2,
-            max_q_len=32,
-            max_kv_len=64,
-            window_left=-1,
-            bmm1_scale=torch.tensor(0.03125, dtype=torch.float32),
-            bmm2_scale=torch.tensor(0.75, dtype=torch.float32),
-            sinks=None,
-            uses_shared_paged_kv_idx=False,
-            cum_seq_lens_q=torch.tensor([0, 32, 64], dtype=torch.int32),
-            cum_seq_lens_kv=torch.tensor([0, 64, 128], dtype=torch.int32),
-            key_block_scales=None,
-            value_block_scales=None,
-            skip_softmax_threshold_scale_factor=1e-30,
-            is_causal=True,
-            lse=None,
-        )
-        == fp8_route
+    assert cake_api.select_cake_fmha_context_route(
+        fp8_query.device,
+        query=fp8_query,
+        key_cache=fp8_key,
+        value_cache=torch.empty_like(fp8_key),
+        out=torch.empty_like(fp8_query),
+        block_tables=torch.zeros((2, 2, 1), dtype=torch.int32),
+        seq_lens=torch.tensor([64, 64], dtype=torch.int32),
+        batch_size=2,
+        max_q_len=32,
+        max_kv_len=64,
+        window_left=-1,
+        bmm1_scale=torch.tensor(0.03125, dtype=torch.float32),
+        bmm2_scale=torch.tensor(0.75, dtype=torch.float32),
+        sinks=None,
+        uses_shared_paged_kv_idx=False,
+        cum_seq_lens_q=torch.tensor([0, 32, 64], dtype=torch.int32),
+        cum_seq_lens_kv=torch.tensor([0, 64, 128], dtype=torch.int32),
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=1e-30,
+        is_causal=True,
+        lse=None,
+    ) == dataclasses.replace(
+        fp8_route, device_scales=True, program="B256_SCALE_PTR_KV4"
     )
     assert cake_api.cake_fmha_route_is_optimized(fp8_route)
 
@@ -2963,7 +3018,7 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         ("q257", 257, 1024, 1024, False, 6, 8),
     ],
 )
-def test_cake_context_exact_mask_profile_requires_uniform_runtime_lengths(
+def test_cake_context_exact_mask_profile_selects_on_host_scalars(
     monkeypatch,
     profile,
     q_len,
@@ -3028,15 +3083,47 @@ def test_cake_context_exact_mask_profile_requires_uniform_runtime_lengths(
         return_lse=False,
         enable_sink=False,
         exact_profile=profile,
+        program=f"{profile.upper()}_SM103A",
     )
 
+    # The programs read the lengths at run time: shorter KV lengths keep the
+    # route, and selection never reads a tensor value (meta tensors).
     nonuniform = kwargs["seq_lens"].clone()
     nonuniform[-1] -= 1
+    assert (
+        cake_api.select_cake_fmha_context_route(
+            query.device, **{**kwargs, "seq_lens": nonuniform}
+        )
+        == route
+    )
+    meta = {
+        name: value.to("meta")
+        for name, value in kwargs.items()
+        if isinstance(value, torch.Tensor)
+    }
+    meta_route = cake_api.select_cake_fmha_context_route(
+        torch.device("meta"), **{**kwargs, **meta}
+    )
+    assert meta_route == route
+    # The switch back to uniform lengths: the host reads the lengths, serves a
+    # uniform batch and keeps a non-uniform one on the generic JIT route.
+    monkeypatch.setattr(cake_api, "_CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS", True)
+    assert cake_api.select_cake_fmha_context_route(query.device, **kwargs) == route
     generic = cake_api.select_cake_fmha_context_route(
         query.device, **{**kwargs, "seq_lens": nonuniform}
     )
     assert generic is not None
-    assert generic.exact_profile is None
+    assert generic.exact_profile is None and generic.program is None
+    monkeypatch.setattr(cake_api, "_CONTEXT_EXACT_PROFILE_NEEDS_UNIFORM_LENGTHS", False)
+    # A query row count off batch x max_q_len (ragged query lengths) keeps the
+    # generic program.
+    ragged = cake_api.select_cake_fmha_context_route(
+        query.device,
+        **{**kwargs, "query": query[:-1], "out": kwargs["out"][:-1]},
+    )
+    assert ragged is not None
+    assert ragged.exact_profile is None
+    assert ragged.program is None
 
 
 def test_cake_decode_public_entrypoint_forces_cake_backend(monkeypatch) -> None:
@@ -4987,54 +5074,6 @@ def test_cake_decode_balanced_fp8_family_matches_reference_and_replays(
     )
 
 
-_FP8_FULL_BLOCK_SM103_REASON = (
-    "decode_quant_fp8 attends to the wrong tokens on sm_103a: inside every "
-    "128-token block the kernel reads the K pages in a head-dependent XOR order "
-    "(page slot p is read as p ^ 5, p ^ 7 or p ^ 3 depending on the head row); "
-    "the V path, the page table and the output scaling are correct. "
-    "Pre-existing on main, which has no GPU test for this route."
-)
-_FP8_FULL_BLOCK_SM100_REASON = (
-    "decode_quant_fp8 faults on sm_100a with cudaErrorIllegalInstruction: the "
-    "JIT adapter encodes a 5-D KV tensor map while the sm_100a kernel issues "
-    "4-D TMA loads; the error is sticky and fails every later test in the "
-    "process, so the test is not run there. "
-    "Pre-existing on main, which has no GPU test for this route."
-)
-_FP8_FULL_BLOCK_ODD_REASON = (
-    " The odd-block-count cases also exercise the padding block that the "
-    "FULL_BLOCKS=1 kernel walks without masking while the selector admits "
-    "lengths that are not multiples of 256."
-)
-
-
-def _fp8_full_block_xfail(extra_reason=""):
-    """Capability-specific xfail marks for the fp8 full-block decode tests."""
-
-    marks = []
-    if torch.cuda.is_available():
-        capability = torch.cuda.get_device_capability()
-        if capability == (10, 0):
-            marks.append(
-                pytest.mark.xfail(
-                    run=False, reason=_FP8_FULL_BLOCK_SM100_REASON + extra_reason
-                )
-            )
-        elif capability == (10, 3):
-            marks.append(
-                pytest.mark.xfail(
-                    strict=True, reason=_FP8_FULL_BLOCK_SM103_REASON + extra_reason
-                )
-            )
-
-    def apply(fn):
-        for mark in marks:
-            fn = mark(fn)
-        return fn
-
-    return apply
-
-
 _FP8_FULL_BLOCK_SEQ_LENS = [
     # The smallest admitted shape: four 128-token blocks, one split.
     pytest.param([512, 512, 512, 512], id="512x4"),
@@ -5237,7 +5276,6 @@ def _check_fp8_full_block_decode(device, *, seq_lens, page_size, device_scale):
 @pytest.mark.parametrize(
     "device_scale", [False, True], ids=["host-scale", "device-scale"]
 )
-@_fp8_full_block_xfail()
 def test_cake_decode_fp8_full_block_route_matches_reference(
     seq_lens, page_size, device_scale
 ) -> None:
@@ -5259,31 +5297,256 @@ def test_cake_decode_fp8_full_block_route_matches_reference(
     )
 
 
+_FP8_RUNTIME_LENGTH_CASES = [
+    # Five- and six-block requests share the evened six-block bucket: the
+    # five-block request's padding block is masked token by token.
+    pytest.param([640, 768, 768, 640], 768, 16, id="odd-blocks"),
+    pytest.param([512, 300, 1, 777], 777, 32, id="nonuniform-tails"),
+    # Eight tiles below the SM count split; a zero-length request's tiles are
+    # empty (partial max -inf, sum 0) and its output row is zero.
+    pytest.param([0, 513, 0, 2048], 2048, 16, id="zero-lengths-split"),
+    pytest.param([0, 0, 0, 0], 1024, 16, id="all-zero"),
+    pytest.param([5, 17, 129, 3], 8192, 32, id="short-large-max"),
+    pytest.param([4095, 1, 2048, 4096], 4096, 16, id="split-tails"),
+]
+
+
+def _fp8_runtime_length_case(device, *, seq_lens, max_seq_len, page_size, seed):
+    """Every request owns ``max_seq_len`` tokens of pages (finite E4M3 data);
+    ``seq_lens`` (at most ``max_seq_len``) select the attended prefix."""
+
+    case = _fp8_full_block_decode_case(
+        device, seq_lens=[max_seq_len] * len(seq_lens), page_size=page_size, seed=seed
+    )
+    v_scale = case.bmm2_scale * case.o_scale
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+    expected = (
+        _balanced_reference_decode(
+            case.query,
+            case.kv_cache.float(),
+            case.block_tables,
+            seq_lens_t,
+            q_len=1,
+            scale=case.bmm1_scale,
+            page_size=page_size,
+        )
+        * v_scale
+    )
+    amax = float(expected.abs().amax())
+    o_scale = amax / 448.0 if amax > 0 else 1.0
+    case.seq_lens, case.seq_lens_t = list(seq_lens), seq_lens_t
+    case.expected, case.o_scale, case.atol = expected, o_scale, 0.1 * amax
+    case.bmm2_scale = v_scale / o_scale
+    return case
+
+
+def _run_fp8_runtime_length(case, *, max_seq_len, block_tables=None, out=None):
+    device = case.query.device
+    workspace = torch.zeros(4 * 1024 * 1024, dtype=torch.uint8, device=device)
+    out = torch.empty_like(case.query) if out is None else out
+    return cake_api.cake_batch_decode_with_kv_cache(
+        case.query,
+        case.kv_cache,
+        workspace,
+        case.block_tables if block_tables is None else block_tables,
+        case.seq_lens_t,
+        max_seq_len,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+        window_left=-1,
+        kv_layout="HND",
+        q_len_per_req=1,
+        out=out,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Cake FMHA requires SM100 or SM103",
+)
+@pytest.mark.parametrize(
+    ("seq_lens", "max_seq_len", "page_size"), _FP8_RUNTIME_LENGTH_CASES
+)
+def test_cake_decode_fp8_runtime_lengths_match_reference(
+    seq_lens, max_seq_len, page_size
+) -> None:
+    """Non-uniform, odd-block, tail, zero and short lengths under one host
+    ``max_seq_len``: the route never reads ``seq_lens``; zero-length requests
+    write zero bytes and the rest match the FP32 reference; reruns are bitwise."""
+
+    device = torch.device("cuda")
+    case = _fp8_runtime_length_case(
+        device,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        page_size=page_size,
+        seed=685_400 + page_size,
+    )
+    workspace = torch.zeros(4 * 1024 * 1024, dtype=torch.uint8, device=device)
+    route = _select_balanced_route(
+        device,
+        query=case.query,
+        kv_cache=case.kv_cache,
+        out=torch.empty_like(case.query),
+        workspace=workspace,
+        block_tables=case.block_tables,
+        seq_lens_t=case.seq_lens_t,
+        q_len=1,
+        max_seq_len=max_seq_len,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+    )
+    assert route is not None and route.component == "decode_quant_fp8"
+    actual = _run_fp8_runtime_length(case, max_seq_len=max_seq_len)
+    again = _run_fp8_runtime_length(case, max_seq_len=max_seq_len)
+    assert torch.equal(actual.view(torch.uint8), again.view(torch.uint8))
+    for b, length in enumerate(seq_lens):
+        if length == 0:
+            assert int(actual[b].view(torch.uint8).count_nonzero()) == 0
+    live = [b for b, length in enumerate(seq_lens) if length > 0]
+    if live:
+        dequant = actual[live].float() * case.o_scale
+        torch.testing.assert_close(
+            dequant, case.expected[live], atol=case.atol, rtol=0.1
+        )
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="Cake FMHA requires SM100 or SM103",
 )
 @pytest.mark.parametrize("page_size", [16, 32], ids=["page16", "page32"])
-@_fp8_full_block_xfail(_FP8_FULL_BLOCK_ODD_REASON)
-def test_cake_decode_fp8_full_block_route_odd_block_count_matches_reference(
+def test_cake_decode_fp8_runtime_lengths_ignore_page_table_past_lengths(
     page_size,
 ) -> None:
-    """Five- and six-block requests share the evened six-block bucket.
+    """Page-table entries past each request's pages (other pages, negative or
+    out-of-range ids) never change the output bytes."""
 
-    ``_decode_quant_fp8_seq_lens_supported`` admits ``[640, 768, 768, 640]``
-    (whole blocks, at least 512 tokens, one evened bucket) and the binding
-    keeps one split because 640 is not a multiple of 256.  The kernel walks
-    the evened block count of each request, so the five-block requests must
-    not attend to their sixth, padding block.
-    """
-
-    _check_fp8_full_block_decode(
-        torch.device("cuda"),
-        seq_lens=[640, 768, 768, 640],
+    device = torch.device("cuda")
+    seq_lens, max_seq_len = [0, 300, 1, 1500], 2048
+    case = _fp8_runtime_length_case(
+        device,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
         page_size=page_size,
-        device_scale=False,
+        seed=685_500 + page_size,
     )
+    clean = _run_fp8_runtime_length(case, max_seq_len=max_seq_len)
+    garbage = case.block_tables.clone()
+    generator = torch.Generator(device="cpu").manual_seed(7)
+    for b, length in enumerate(seq_lens):
+        used = (length + page_size - 1) // page_size
+        junk = torch.randint(
+            -(2**20),
+            2**30,
+            (garbage.shape[1] - used,),
+            generator=generator,
+            dtype=torch.int32,
+        )
+        garbage[b, used:] = junk.to(device)
+    noisy = _run_fp8_runtime_length(case, max_seq_len=max_seq_len, block_tables=garbage)
+    assert torch.equal(clean.view(torch.uint8), noisy.view(torch.uint8))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Cake FMHA requires SM100 or SM103",
+)
+def test_cake_decode_fp8_runtime_lengths_cuda_graph_replay() -> None:
+    """A graph captured under one ``max_seq_len`` replays new lengths: the
+    plan reads no device value, so the replay equals an eager call."""
+
+    device = torch.device("cuda")
+    max_seq_len, page_size = 2048, 16
+    case = _fp8_runtime_length_case(
+        device,
+        seq_lens=[2048, 1024, 640, 2048],
+        max_seq_len=max_seq_len,
+        page_size=page_size,
+        seed=685_600,
+    )
+    out = torch.empty_like(case.query)
+    _run_fp8_runtime_length(
+        case, max_seq_len=max_seq_len, out=out
+    )  # prewarm the binding's descriptors
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_fp8_runtime_length(case, max_seq_len=max_seq_len, out=out)
+    case.seq_lens_t.copy_(
+        torch.tensor([0, 513, 2047, 1], dtype=torch.int32, device=device)
+    )
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = out.clone()
+    eager = _run_fp8_runtime_length(case, max_seq_len=max_seq_len)
+    assert torch.equal(replayed.view(torch.uint8), eager.view(torch.uint8))
+    assert int(replayed[0].view(torch.uint8).count_nonzero()) == 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Cake FMHA requires SM100 or SM103",
+)
+@pytest.mark.parametrize("page_size", [16, 32], ids=["page16", "page32"])
+def test_cake_decode_fp8_fixed_split_matches_runtime_plan(
+    monkeypatch, page_size
+) -> None:
+    """The fixed 8 x 16 split-plan member (decode -> reducer PDL) writes the runtime-plan
+    member's bytes, also for zero, short and tail lengths, and matches the FP32 reference."""
+
+    device = torch.device("cuda")
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    seq_lens, max_seq_len = [16384, 1, 0, 16000, 8193, 300, 16384, 12345], 16384
+    if not cake_api._decode_quant_fp8_fixed_split(
+        len(seq_lens), 2, max_seq_len, sm_count
+    ):
+        pytest.skip(f"the host split plan is not 8 x 16 on {sm_count} SMs")
+    case = _fp8_runtime_length_case(
+        device,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        page_size=page_size,
+        seed=685_700 + page_size,
+    )
+    route_args = dict(
+        query=case.query,
+        kv_cache=case.kv_cache,
+        out=torch.empty_like(case.query),
+        workspace=torch.zeros(4 * 1024 * 1024, dtype=torch.uint8, device=device),
+        block_tables=case.block_tables,
+        seq_lens_t=case.seq_lens_t,
+        q_len=1,
+        max_seq_len=max_seq_len,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+    )
+    route = _select_balanced_route(device, **route_args)
+    assert (
+        route is not None
+        and route.component == "decode_quant_fp8"
+        and route.num_split == 8
+    )
+    fixed = _run_fp8_runtime_length(case, max_seq_len=max_seq_len)
+    again = _run_fp8_runtime_length(case, max_seq_len=max_seq_len)
+    assert torch.equal(fixed.view(torch.uint8), again.view(torch.uint8))
+    monkeypatch.setattr(cake_api, "_decode_quant_fp8_fixed_split", lambda *args: False)
+    route = _select_balanced_route(device, **route_args)
+    assert (
+        route is not None
+        and route.component == "decode_quant_fp8"
+        and route.num_split == 0
+    )
+    runtime = _run_fp8_runtime_length(case, max_seq_len=max_seq_len)
+    assert torch.equal(fixed.view(torch.uint8), runtime.view(torch.uint8))
+    assert int(fixed[2].view(torch.uint8).count_nonzero()) == 0
+    live = [b for b, length in enumerate(seq_lens) if length > 0]
+    dequant = fixed[live].float() * case.o_scale
+    torch.testing.assert_close(dequant, case.expected[live], atol=case.atol, rtol=0.1)
 
 
 @pytest.mark.skipif(

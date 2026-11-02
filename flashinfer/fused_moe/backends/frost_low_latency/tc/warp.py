@@ -26,10 +26,11 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Grouped BF16/FP16/per-tensor FP8 SM120 projection, adapted from CUTLASS dense_gemm.py.
+"""Grouped BF16/FP16/per-tensor FP8 and weight-only SM120 projection, adapted from CUTLASS dense_gemm.py.
 
 One CTA discovers up to eight live routes to one expert. Weight-only TMA
-feeds warp MMA while the producer warp gathers the small activation vectors.
+feeds warp MMA while producers gather the small activation vectors. Native FP8
+and T >= 8 typed decode overlap weight TMA with four-warp activation gathering.
 FC1 reads the original up/gate layout and applies the shared activation;
 FC2 writes typed expert partials for fixed-order combine.
 """
@@ -60,24 +61,29 @@ class WarpGroupedProjection:
         gated=True,
         parameters=None,
         block_scaled=False,
+        serial_gather=False,
+        weight_first=False,
     ):
         if (
             group_size not in (2, 4, 8)
             or stages not in (2, 4, 8)
-            or tile_k not in (64, 128)
+            or tile_k not in (64, 128, 256)
         ):
             raise ValueError("Unsupported grouped SM120 projection tactic")
-        if tile_k == 128 and stages == 8:
-            raise ValueError("K128 requires at most four stages on SM120")
+        if tile_k >= 128 and stages == 8:
+            raise ValueError("K128 and larger require at most four stages")
         self.fc1 = fc1
         self.split_gate = fc1 and gated
         self.group_size = group_size
         self.stages = stages
         self.tile_k = tile_k
+        self.top_k = top_k
         self.input_route_divisor = top_k if fc1 else 1
         self.activation = activation
         self.parameters = parameters
         self.block_scaled = block_scaled
+        self.serial_gather = serial_gather
+        self.weight_first = weight_first
         self.rows_per_tile = 32 if self.split_gate else 64
         self.acc_dtype = cutlass.Float32
         self.cluster_shape_mn = (1, 1)
@@ -93,11 +99,11 @@ class WarpGroupedProjection:
             raise ValueError("CTA tile shape M must be 64/128")
         if self.tile_shape_mnk[1] not in [8, 16, 32, 64, 128, 256]:
             raise ValueError("CTA tile shape N must be 64/128/256")
-        if self.a_dtype == cutlass.Float8E4M3FN:
+        if self.native_fp8:
             op = cute.nvgpu.warp.MmaFP8Op(self.a_dtype, self.acc_dtype, (16, 8, 32))
             mma_k = 32
         else:
-            op = cute.nvgpu.warp.MmaF16BF16Op(self.a_dtype, self.acc_dtype, (16, 8, 16))
+            op = cute.nvgpu.warp.MmaF16BF16Op(self.b_dtype, self.acc_dtype, (16, 8, 16))
             mma_k = 16
         self.tiled_mma = cute.make_tiled_mma(
             op, cute.make_layout((4, 1, 1)), permutation_mnk=(64, 8, mma_k)
@@ -171,16 +177,39 @@ class WarpGroupedProjection:
         self.a_layout = utils.LayoutEnum.from_tensor(a)
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.COL_MAJOR
+        self.weight_only = self.a_dtype == cutlass.Float8E4M3FN and self.b_dtype in (
+            cutlass.BFloat16,
+            cutlass.Float16,
+        )
+        self.native_fp8 = self.a_dtype == cutlass.Float8E4M3FN and not self.weight_only
         if cutlass.const_expr(
             self.a_dtype.width == 16 and self.a_dtype != self.b_dtype
         ):
             raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
-        if cutlass.const_expr(self.a_dtype.width != self.b_dtype.width):
+        if cutlass.const_expr(
+            not self.weight_only and self.a_dtype.width != self.b_dtype.width
+        ):
             raise TypeError(
                 f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}"
             )
         if cutlass.const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
             raise TypeError("a_dtype should be float16 or float8")
+        # E4M3 weights use cooperative gather unless a bounded W8A16 schedule
+        # explicitly selects the serial producer.
+        # Dense 16-bit weights use it at T >= 8 to overlap the weight copy;
+        # smaller dense decode retains the serial producer.
+        # The optional dense weight-first tactic retains a serial activation
+        # producer; the original tactics keep main's cooperative schedule.
+        self.cooperative_gather = not self.weight_first and (
+            (self.a_dtype == cutlass.Float8E4M3FN and not self.serial_gather)
+            or cute.size(ids) >= 8 * self.top_k
+        )
+        # Per-tensor FP8 benefits from initializing immutable padded rows once.
+        # Live route slots still need per-stage stores, including invalid-route
+        # and K-tail zeros. Typed and block-scaled paths keep their prior schedule.
+        self.static_padding_once = (
+            self.native_fp8 and not self.block_scaled and self.group_size < 8
+        )
         self._setup_attributes()
         if cutlass.const_expr(self.split_gate):
             weight_layout = cute.composition(
@@ -370,14 +399,21 @@ class WarpGroupedProjection:
                     )
                 tCsA = thr_mma.partition_A(sA)
                 tCsB = thr_mma.partition_B(sB)
-                tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
-                tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
-                copy_a = cute.make_tiled_copy_A(
-                    cute.make_copy_atom(
+                if cutlass.const_expr(self.weight_only):
+                    # Keep checkpoint weights compact through TMA/shared memory.
+                    # Convert unscaled E4M3 fragments exactly for 16-bit MMA.
+                    tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0].shape)
+                    rawA = cute.make_rmem_tensor(tCrA.shape, self.a_dtype)
+                    copy_atom_a = cute.make_copy_atom(
+                        cute.nvgpu.CopyUniversalOp(), self.a_dtype
+                    )
+                else:
+                    tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
+                    copy_atom_a = cute.make_copy_atom(
                         cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 4), self.a_dtype
-                    ),
-                    tiled_mma,
-                )
+                    )
+                tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
+                copy_a = cute.make_tiled_copy_A(copy_atom_a, tiled_mma)
                 copy_b = cute.make_tiled_copy_B(
                     cute.make_copy_atom(
                         cute.nvgpu.warp.LdMatrix8x8x16bOp(False, 2), self.b_dtype
@@ -388,13 +424,30 @@ class WarpGroupedProjection:
                 copy_b_thr = copy_b.get_slice(tidx)
                 copy_sa = copy_a_thr.partition_S(sA)
                 copy_sb = copy_b_thr.partition_S(sB)
-                copy_ra = copy_a_thr.retile(tCrA)
+                if cutlass.const_expr(self.weight_only):
+                    copy_ra = copy_a_thr.retile(rawA)
+                else:
+                    copy_ra = copy_a_thr.retile(tCrA)
                 copy_rb = copy_b_thr.retile(tCrB)
                 acc_shape = tCgC.shape
                 coordinates = tiled_mma.get_slice(tidx).partition_C(
                     cute.make_identity_tensor((64, 8))
                 )
                 accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+                if cutlass.const_expr(self.static_padding_once):
+                    for zero_row in cutlass.range_constexpr(self.group_size, 8):
+                        if warp_idx == zero_row % 4:
+                            for zero_slot in cutlass.range_constexpr(self.ab_stage):
+                                for zero_segment in cutlass.range_constexpr(
+                                    self.tile_k // 32
+                                ):
+                                    sB[
+                                        zero_row,
+                                        tidx % 32 + zero_segment * 32,
+                                        zero_slot,
+                                    ] = self.b_dtype(0)
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_threads()
                 pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
                 k_tile_cnt = cute.size(gA_mkl, mode=[2])
                 prefetch_k_tile_cnt = cutlass.max(
@@ -403,63 +456,104 @@ class WarpGroupedProjection:
                 mainloop_producer_state = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
-                if warp_idx == 0:
+                if cutlass.const_expr(self.cooperative_gather) or warp_idx == 0:
                     for _prefetch_idx in cutlass.range(prefetch_k_tile_cnt, unroll=1):
                         mainloop_pipeline.sync_object_empty.wait(
                             mainloop_producer_state.index, mainloop_producer_state.phase
                         )
                         tAgA_k = tAgA_mkl[None, mainloop_producer_state.count]
                         tAsA_pipe = tAsA[None, mainloop_producer_state.index]
-                        for bn in cutlass.range_constexpr(8):
-                            for segment in cutlass.range_constexpr(
-                                self.tile_shape_mnk[2] // 32
+                        if cutlass.const_expr(
+                            self.cooperative_gather or self.weight_first
+                        ):
+                            if warp_idx == 0:
+                                mainloop_pipeline.producer_acquire(
+                                    mainloop_producer_state, cutlass.Boolean(True)
+                                )
+                                cute.copy(
+                                    tma_atom_a,
+                                    tAgA_k,
+                                    tAsA_pipe,
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                    mcast_mask=a_mcast_mask,
+                                )
+                                if cutlass.const_expr(self.split_gate):
+                                    cute.copy(
+                                        tma_atom_a,
+                                        tGgA_mkl[None, mainloop_producer_state.count],
+                                        tGsA[None, mainloop_producer_state.index],
+                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                            mainloop_producer_state
+                                        ),
+                                        mcast_mask=a_mcast_mask,
+                                    )
+                                if cutlass.const_expr(self.cooperative_gather):
+                                    mainloop_pipeline.producer_commit(
+                                        mainloop_producer_state
+                                    )
+                        for bn in cutlass.range_constexpr(
+                            self.group_size if self.static_padding_once else 8
+                        ):
+                            if (
+                                cutlass.const_expr(not self.cooperative_gather)
+                                or warp_idx == bn % 4
                             ):
-                                bk = tidx % 32 + segment * 32
-                                bv = self.b_dtype(0)
-                                if cutlass.const_expr(bn < self.group_size):
-                                    if (
-                                        members[bn] >= 0
-                                        and mainloop_producer_state.count
-                                        * self.tile_shape_mnk[2]
-                                        + bk
-                                        < cute.size(raw_b, mode=[1])
-                                    ):
-                                        bv = raw_b[
-                                            0,
-                                            mainloop_producer_state.count
+                                for segment in cutlass.range_constexpr(
+                                    self.tile_shape_mnk[2] // 32
+                                ):
+                                    bk = tidx % 32 + segment * 32
+                                    bv = self.b_dtype(0)
+                                    if cutlass.const_expr(bn < self.group_size):
+                                        if (
+                                            members[bn] >= 0
+                                            and mainloop_producer_state.count
                                             * self.tile_shape_mnk[2]
-                                            + bk,
-                                            members[bn] // self.input_route_divisor,
-                                        ]
-                                sB[bn, bk, mainloop_producer_state.index] = bv
+                                            + bk
+                                            < cute.size(raw_b, mode=[1])
+                                        ):
+                                            bv = raw_b[
+                                                0,
+                                                mainloop_producer_state.count
+                                                * self.tile_shape_mnk[2]
+                                                + bk,
+                                                members[bn] // self.input_route_divisor,
+                                            ]
+                                    sB[bn, bk, mainloop_producer_state.index] = bv
                         cute.arch.fence_proxy("async.shared", space="cta")
-                        cute.arch.sync_warp()
-                        mainloop_pipeline.producer_acquire(
-                            mainloop_producer_state, cutlass.Boolean(True)
-                        )
-                        cute.copy(
-                            tma_atom_a,
-                            tAgA_k,
-                            tAsA_pipe,
-                            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                mainloop_producer_state
-                            ),
-                            mcast_mask=a_mcast_mask,
-                        )
-                        if cutlass.const_expr(self.split_gate):
-                            cute.copy(
-                                tma_atom_a,
-                                tGgA_mkl[None, mainloop_producer_state.count],
-                                tGsA[None, mainloop_producer_state.index],
-                                tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                    mainloop_producer_state
-                                ),
-                                mcast_mask=a_mcast_mask,
-                            )
-                        mainloop_pipeline.producer_commit(mainloop_producer_state)
+                        if cutlass.const_expr(self.cooperative_gather):
+                            cute.arch.sync_threads()
+                        else:
+                            cute.arch.sync_warp()
+                        if cutlass.const_expr(not self.cooperative_gather):
+                            if cutlass.const_expr(not self.weight_first):
+                                mainloop_pipeline.producer_acquire(
+                                    mainloop_producer_state, cutlass.Boolean(True)
+                                )
+                                cute.copy(
+                                    tma_atom_a,
+                                    tAgA_k,
+                                    tAsA_pipe,
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                    mcast_mask=a_mcast_mask,
+                                )
+                                if cutlass.const_expr(self.split_gate):
+                                    cute.copy(
+                                        tma_atom_a,
+                                        tGgA_mkl[None, mainloop_producer_state.count],
+                                        tGsA[None, mainloop_producer_state.index],
+                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                            mainloop_producer_state
+                                        ),
+                                        mcast_mask=a_mcast_mask,
+                                    )
+                            mainloop_pipeline.producer_commit(mainloop_producer_state)
                         mainloop_producer_state.advance()
                 accumulators.fill(0.0)
-                if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                if cutlass.const_expr(self.native_fp8):
                     total = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
                     total.fill(0.0)
                 consumer = pipeline.make_pipeline_state(
@@ -467,10 +561,14 @@ class WarpGroupedProjection:
                 )
                 for _k_tile in cutlass.range(k_tile_cnt, unroll=1):
                     mainloop_pipeline.consumer_wait(consumer)
+                    # The TMA barrier orders weights only. This CTA barrier also
+                    # waits for the software activation stores in either schedule.
                     cute.arch.sync_threads()
                     cute.copy(
                         copy_a, copy_sa[None, None, None, consumer.index], copy_ra
                     )
+                    if cutlass.const_expr(self.weight_only):
+                        tCrA.store(rawA.load().to(self.b_dtype))
                     cute.copy(
                         copy_b, copy_sb[None, None, None, consumer.index], copy_rb
                     )
@@ -484,7 +582,7 @@ class WarpGroupedProjection:
                             tCrB[None, None, kb],
                             accumulators,
                         )
-                        if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                        if cutlass.const_expr(self.native_fp8):
                             # Promote at most K64 per native FP8 partial sum,
                             # independent of the TMA tile's K64/K128 depth.
                             if (kb + 1) % 2 == 0 or kb + 1 == cute.size(tCrA, mode=[2]):
@@ -517,59 +615,102 @@ class WarpGroupedProjection:
                     cute.arch.sync_threads()
                     mainloop_pipeline.consumer_release(consumer)
                     consumer.advance()
-                    if warp_idx == 0 and mainloop_producer_state.count < k_tile_cnt:
+                    if (
+                        cutlass.const_expr(self.cooperative_gather) or warp_idx == 0
+                    ) and mainloop_producer_state.count < k_tile_cnt:
                         mainloop_pipeline.sync_object_empty.wait(
                             mainloop_producer_state.index, mainloop_producer_state.phase
                         )
                         tAgA_k = tAgA_mkl[None, mainloop_producer_state.count]
                         tAsA_pipe = tAsA[None, mainloop_producer_state.index]
-                        for bn in cutlass.range_constexpr(8):
-                            for segment in cutlass.range_constexpr(
-                                self.tile_shape_mnk[2] // 32
+                        if cutlass.const_expr(
+                            self.cooperative_gather or self.weight_first
+                        ):
+                            if warp_idx == 0:
+                                mainloop_pipeline.producer_acquire(
+                                    mainloop_producer_state, cutlass.Boolean(True)
+                                )
+                                cute.copy(
+                                    tma_atom_a,
+                                    tAgA_k,
+                                    tAsA_pipe,
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                    mcast_mask=a_mcast_mask,
+                                )
+                                if cutlass.const_expr(self.split_gate):
+                                    cute.copy(
+                                        tma_atom_a,
+                                        tGgA_mkl[None, mainloop_producer_state.count],
+                                        tGsA[None, mainloop_producer_state.index],
+                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                            mainloop_producer_state
+                                        ),
+                                        mcast_mask=a_mcast_mask,
+                                    )
+                                if cutlass.const_expr(self.cooperative_gather):
+                                    mainloop_pipeline.producer_commit(
+                                        mainloop_producer_state
+                                    )
+                        for bn in cutlass.range_constexpr(
+                            self.group_size if self.static_padding_once else 8
+                        ):
+                            if (
+                                cutlass.const_expr(not self.cooperative_gather)
+                                or warp_idx == bn % 4
                             ):
-                                bk = tidx % 32 + segment * 32
-                                bv = self.b_dtype(0)
-                                if cutlass.const_expr(bn < self.group_size):
-                                    if (
-                                        members[bn] >= 0
-                                        and mainloop_producer_state.count
-                                        * self.tile_shape_mnk[2]
-                                        + bk
-                                        < cute.size(raw_b, mode=[1])
-                                    ):
-                                        bv = raw_b[
-                                            0,
-                                            mainloop_producer_state.count
+                                for segment in cutlass.range_constexpr(
+                                    self.tile_shape_mnk[2] // 32
+                                ):
+                                    bk = tidx % 32 + segment * 32
+                                    bv = self.b_dtype(0)
+                                    if cutlass.const_expr(bn < self.group_size):
+                                        if (
+                                            members[bn] >= 0
+                                            and mainloop_producer_state.count
                                             * self.tile_shape_mnk[2]
-                                            + bk,
-                                            members[bn] // self.input_route_divisor,
-                                        ]
-                                sB[bn, bk, mainloop_producer_state.index] = bv
+                                            + bk
+                                            < cute.size(raw_b, mode=[1])
+                                        ):
+                                            bv = raw_b[
+                                                0,
+                                                mainloop_producer_state.count
+                                                * self.tile_shape_mnk[2]
+                                                + bk,
+                                                members[bn] // self.input_route_divisor,
+                                            ]
+                                    sB[bn, bk, mainloop_producer_state.index] = bv
                         cute.arch.fence_proxy("async.shared", space="cta")
-                        cute.arch.sync_warp()
-                        mainloop_pipeline.producer_acquire(
-                            mainloop_producer_state, cutlass.Boolean(True)
-                        )
-                        cute.copy(
-                            tma_atom_a,
-                            tAgA_k,
-                            tAsA_pipe,
-                            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                mainloop_producer_state
-                            ),
-                            mcast_mask=a_mcast_mask,
-                        )
-                        if cutlass.const_expr(self.split_gate):
-                            cute.copy(
-                                tma_atom_a,
-                                tGgA_mkl[None, mainloop_producer_state.count],
-                                tGsA[None, mainloop_producer_state.index],
-                                tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                    mainloop_producer_state
-                                ),
-                                mcast_mask=a_mcast_mask,
-                            )
-                        mainloop_pipeline.producer_commit(mainloop_producer_state)
+                        if cutlass.const_expr(self.cooperative_gather):
+                            cute.arch.sync_threads()
+                        else:
+                            cute.arch.sync_warp()
+                        if cutlass.const_expr(not self.cooperative_gather):
+                            if cutlass.const_expr(not self.weight_first):
+                                mainloop_pipeline.producer_acquire(
+                                    mainloop_producer_state, cutlass.Boolean(True)
+                                )
+                                cute.copy(
+                                    tma_atom_a,
+                                    tAgA_k,
+                                    tAsA_pipe,
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                    mcast_mask=a_mcast_mask,
+                                )
+                                if cutlass.const_expr(self.split_gate):
+                                    cute.copy(
+                                        tma_atom_a,
+                                        tGgA_mkl[None, mainloop_producer_state.count],
+                                        tGsA[None, mainloop_producer_state.index],
+                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                            mainloop_producer_state
+                                        ),
+                                        mcast_mask=a_mcast_mask,
+                                    )
+                            mainloop_pipeline.producer_commit(mainloop_producer_state)
                         mainloop_producer_state.advance()
                 if cute.size(self.cluster_shape_mn) > 1:
                     cute.arch.cluster_arrive()
@@ -578,7 +719,7 @@ class WarpGroupedProjection:
                     cute.arch.sync_threads()
                 thread_c = tiled_mma.get_slice(tidx).partition_C(sC[None, None, 0])
                 for element in cutlass.range_constexpr(cute.size(accumulators)):
-                    if cutlass.const_expr(self.a_dtype == cutlass.Float8E4M3FN):
+                    if cutlass.const_expr(self.native_fp8):
                         thread_c[element] = total[element]
                     else:
                         thread_c[element] = accumulators[element]
@@ -614,9 +755,15 @@ class WarpGroupedProjection:
 
     @cute.jit
     def epilogue(self, value, gate, dequant, mid_quant, expert):
-        if cutlass.const_expr(
-            self.a_dtype == cutlass.Float8E4M3FN and not self.block_scaled
-        ):
+        if cutlass.const_expr(self.weight_only):
+            # Apply live expert scales after the dot product; pre-scaling and
+            # rounding weights would change the checkpoint's numerical contract.
+            value = _mul(value, dequant[expert])
+            if cutlass.const_expr(self.fc1):
+                gate = _mul(gate, dequant[expert])
+                value = value.to(self.b_dtype).to(cutlass.Float32)
+                gate = gate.to(self.b_dtype).to(cutlass.Float32)
+        if cutlass.const_expr(self.native_fp8 and not self.block_scaled):
             value = _mul(value, dequant[expert])
             if cutlass.const_expr(self.fc1):
                 gate = _mul(gate, dequant[expert])
@@ -626,9 +773,7 @@ class WarpGroupedProjection:
             value = apply_activation(
                 value, gate, self.activation, False, self.parameters
             )
-            if cutlass.const_expr(
-                self.a_dtype == cutlass.Float8E4M3FN and not self.block_scaled
-            ):
+            if cutlass.const_expr(self.native_fp8 and not self.block_scaled):
                 value = (
                     cvt_f32_to_e4m3(_mul(value, mid_quant[0]))
                     .to(cutlass.Uint8)

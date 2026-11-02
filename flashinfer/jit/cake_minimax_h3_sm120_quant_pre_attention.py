@@ -15,9 +15,11 @@
 + quantize stage per operand format (NORM_FP8, NORM_NVFP4) and the fused QKV GEMM with
 the dequant, the Q/K RMSNorm, the RoPE and the output format in its epilogue, one
 program per operand format, FP8 MMA form and output format (FP8_*, FP8_MX_* in the unit-
-scaled block-scale MMA form, NVFP4_*), each shipped for sm_120a. The host module
+scaled block-scale MMA form, NVFP4_*; NVFP4_E4M3_G1 in raster groups of one M tile),
+each shipped for sm_120a. The host module
 ``flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_pre_attention`` picks the FP8 MMA
-form per device, computes the grids and launches the two stages.
+form and the NVFP4 E4M3-output program per device, computes the grids and launches the
+two stages.
 
 Generated file: every value below is derived from the exported sources and checked
 against them; do not edit.
@@ -509,12 +511,12 @@ FP8_MX_NVFP4 = cake_program.CakeProgram(
 )
 
 NVFP4_BF16 = cake_program.CakeProgram(
-    name="cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998",
+    name="cake_minimax_h3_sm120_quant_pre_attention_c2763f6ad934f528efdd",
     operator_dir="cake_minimax_h3_sm120_quant_pre_attention",
-    kernel="kernel_cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998",
+    kernel="kernel_cake_minimax_h3_sm120_quant_pre_attention_c2763f6ad934f528efdd",
     sources=(
-        "cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998_kernel.cu",
-        "cake_minimax_h3_sm120_quant_pre_attention_b52444656e4b4b573998_binding.cu",
+        "cake_minimax_h3_sm120_quant_pre_attention_c2763f6ad934f528efdd_kernel.cu",
+        "cake_minimax_h3_sm120_quant_pre_attention_c2763f6ad934f528efdd_binding.cu",
     ),
     targets=("sm_120a",),
     compile_options=(("sm_120a", ()),),
@@ -706,6 +708,72 @@ NVFP4_NVFP4 = cake_program.CakeProgram(
     needs_device_linking=False,
 )
 
+NVFP4_E4M3_G1 = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_quant_pre_attention_59b0462e7a98d6fbf9b7",
+    operator_dir="cake_minimax_h3_sm120_quant_pre_attention",
+    kernel="kernel_cake_minimax_h3_sm120_quant_pre_attention_59b0462e7a98d6fbf9b7",
+    sources=(
+        "cake_minimax_h3_sm120_quant_pre_attention_59b0462e7a98d6fbf9b7_kernel.cu",
+        "cake_minimax_h3_sm120_quant_pre_attention_59b0462e7a98d6fbf9b7_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "A",
+        "B",
+        "SFA",
+        "SFB",
+        "act_scale",
+        "w_scale",
+        "q_norm_weight",
+        "k_norm_weight",
+        "rope_cos_sin",
+        "q_out",
+        "k_out",
+        "v_out",
+        "q_sf",
+        "k_sf",
+        "v_sf",
+        "M",
+        "num_m_tiles",
+        "total_tiles",
+        "eps",
+        "alpha",
+        "out_scale_q",
+        "out_scale_k",
+        "out_scale_v",
+        "sf_mul_q",
+        "sf_mul_k",
+        "sf_mul_v",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "A",
+        "B",
+        "SFA",
+        "SFB",
+        "act_scale",
+        "w_scale",
+        "q_norm_weight",
+        "k_norm_weight",
+        "rope_cos_sin",
+        "q_out",
+        "k_out",
+        "v_out",
+        "q_sf",
+        "k_sf",
+        "v_sf",
+    ),
+    block=(256, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=86528,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
 PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     NORM_FP8,
     NORM_NVFP4,
@@ -718,6 +786,7 @@ PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     NVFP4_BF16,
     NVFP4_E4M3,
     NVFP4_NVFP4,
+    NVFP4_E4M3_G1,
 )
 
 
@@ -738,6 +807,7 @@ __all__ = [
     "NVFP4_BF16",
     "NVFP4_E4M3",
     "NVFP4_NVFP4",
+    "NVFP4_E4M3_G1",
     "PROGRAMS",
     "aot_specs",
 ]

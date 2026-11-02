@@ -76,12 +76,16 @@ whose tensor memory and shared-memory pool hold the SM); then the measured
 table `SPLIT_OVERRIDES` of the device's SM count replaces the formula where it
 names `(sm_count, rows)` (`(132, 4) -> 16`, `(132, 8) -> 8`, `(108, 64) -> 4`,
 `(108, 128) -> 2`, `(188, 4) -> 16`, `(188, 8) -> 11`, `(188, 16) -> 5`,
-`(188, 32) -> 3`; no entry for a tcgen05 device's SM count); then `splits <=
+`(188, 32) -> 3`, `(188, 64) -> 1`; no entry for a tcgen05 device's SM count); then
+`splits <=
 min(tiles, 128)`. The rule reads the architecture and the SM count alone. On a
 B200 (148 SMs) at the owner's 24 x 2 heads and 2051 selections the formula
 gives 33, 33, 18, 9, 4, 2, 1, 1 splits for rows 1, 2, 4, 8, 16, 32, 64, 128;
 on an RTX PRO 6000 (188 SMs, two CTAs per SM) it gives 33, 33, 33, 23, 11, 5,
-2, 1 and the table replaces rows 4, 8, 16 and 32 with 16, 11, 5 and 3.
+2, 1 and the table replaces rows 4, 8, 16 and 32 with 16, 11, 5 and 3, and rows
+64 with 1 (one whole-tile CTA of 33 tiles per (row, KV head), no merge: +5 to
++13 % whole call over two splits, measured on three units, both layouts, both L2
+flushes).
 Where the persistent walk serves the call (compute capability 10.3 and 10.7,
 program rule below) the split count is instead the walk's partial slots per
 (row, KV head) -- 2 for rows 128 on a GB300, 2 for rows 128 and 256 on an
@@ -148,8 +152,8 @@ tiles per CTA) take the whole-tile program. Measured paired on two A100s
 (80 GB and 40 GB PCIe) under a memset flush, the K-first program is 1-7 %
 faster at rows 64 and the whole-tile program 6-8 % faster at rows 128, on
 both units. On an RTX PRO 6000 (188 SMs) at the same heads and selections,
-rows 32 (3 splits, 11 tiles per CTA), 64 (2 splits, 17) and 128 (1 split, 33)
-are wide and rows 1-16 (at most 7 tiles per CTA) are not; measured paired
+rows 32 (3 splits, 11 tiles per CTA), 64 and 128 (1 split, 33 tiles) are wide
+and rows 1-16 (at most 7 tiles per CTA) are not; measured paired
 there under both L2 flushes, the whole-tile program is 2-9 % faster whole call
 at rows 32 / 64 / 128 and within noise or slower at rows 16 and below. The
 rule reads the architecture, the SM count and the call's tile and split
@@ -187,9 +191,12 @@ tile and split counts alone.
 counters uint32 `[rows * num_kv_heads]`. With `workspace_buffer` (a
 contiguous uint8 tensor on the device of `q`, of at least
 `qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)` bytes,
-256-byte aligned; checked on every call that passes one) they are carved
-from the caller's buffer: the call allocates nothing and is CUDA-graph
-capturable with a replay-stable layout. The counters are zeroed once, the
+256-byte aligned) they are carved from the caller's buffer -- checked (and,
+above one split, carved) on a tensor's first call, and from its second call
+on once per call shape into a plan that every later call passing the same
+tensor reuses (a tensor that dies or is rebound to other bytes, or
+`reset_workspace`, drops the plan): the call
+allocates nothing and is CUDA-graph capturable with a replay-stable layout. The counters are zeroed once, the
 first time a buffer's storage is seen for a `rows * num_kv_heads` (a new
 buffer at a freed buffer's address is a new storage and is zeroed again), and
 reset themselves after every launch; `reset_workspace(buffer)` forgets a

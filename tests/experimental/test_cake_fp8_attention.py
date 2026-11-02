@@ -705,9 +705,11 @@ def test_host_plan_of_the_records():
     stats_partials, stats_finalize, quantize, attention = (
         loader.MODULES[chain[stage]] for stage in loader.STAGES
     )
-    # The builds: the shipped ring depth of the attention; no record spells a ``qk_format`` -- the host states it.
+    # The builds: the shipped ring depth of the attention and the reduction unroll of the finalize; no record
+    # spells a ``qk_format`` -- the host states it.
     assert attention["build"] == {"num_stages": 2}
-    assert stats_partials["build"] == stats_finalize["build"] == quantize["build"] == {}
+    assert stats_finalize["build"] == {"unroll": 8}
+    assert stats_partials["build"] == quantize["build"] == {}
     assert backend.QK_FORMAT == "int8_blk"
     # The launch records: 256 threads on the stage kernels, one 128-thread warpgroup on the attention, and the
     # dynamic shared memory of each kernel (the attention: the 73728-byte Q + two-stage K / V^T ring behind

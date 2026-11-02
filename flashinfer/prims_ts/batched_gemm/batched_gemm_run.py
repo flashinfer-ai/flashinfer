@@ -21,12 +21,16 @@ Modes:
 """
 
 import argparse
+from bisect import bisect_right
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import gc
 import math
 import os
+import random
 
 from ..cutlass_dsl import task_scheduling_scope
+from ..utils import is_prims_ts_arch_available
 
 
 def _cute_compile_options() -> str:
@@ -38,6 +42,35 @@ def _env_flag_enabled(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _binary_cli_flag(value: str) -> int:
+    """Parse a CLI boolean while retaining the config's integer ABI."""
+    normalized = value.lower()
+    if normalized in {"1", "true"}:
+        return 1
+    if normalized in {"0", "false"}:
+        return 0
+    raise argparse.ArgumentTypeError("expected one of: true, false, 1, 0")
+
+
+def _auto_or_float_cli_arg(value: str) -> float | None:
+    """Parse ``auto`` as None, otherwise require a floating-point value."""
+    if value.lower() == "auto":
+        return None
+    try:
+        return float(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError("expected 'auto' or a float") from err
+
+
+def _routing_cli_arg(value: str) -> str:
+    """Validate a token-routing policy while preserving its CLI spelling."""
+    try:
+        _parse_routing(value)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(str(err)) from err
+    return value
 
 
 def _generate_line_info_enabled() -> bool:
@@ -54,14 +87,17 @@ from .batched_gemm_kernel import (
 )
 from .batched_gemm_config import (
     BatchMode,
+    CtaRasterOrder,
     RouteImpl,
     TileScheduler,
     ActKind,
     DType,
     SfLayout,
-    derive_problem_shape_constants,
+    resolve_problem_config,
     make_config,
     resolve_early_exit_max_token_ctas,
+    shuffled_matrix_row_indices,
+    validate_launch_grid,
 )
 from .batched_gemm_quant import (
     kaiming_uniform_tensor as _kaiming_uniform_tensor,
@@ -77,6 +113,44 @@ def get_default_stream():
     return _cutlass_torch.default_stream()
 
 
+def _torch_supports_cuda_arch(major: int, minor: int) -> bool:
+    """Whether this PyTorch build advertises native codegen for an SM target."""
+    arch_prefixes = (f"sm_{major}{minor}", f"compute_{major}{minor}")
+    return any(arch.startswith(arch_prefixes) for arch in torch.cuda.get_arch_list())
+
+
+def _quantize_block_scaled_for_reference(
+    data: torch.Tensor,
+    *,
+    dtype_kind: int,
+    uses_mx: bool,
+    sf_vec_size: int,
+):
+    """Quantize reference inputs, falling back to CPU for unsupported Rubin.
+
+    PyTorch builds that do not advertise SM107 generate an invalid NVRTC target
+    for the ``exp2`` used by MX scale quantization. Keep the fallback limited to
+    that combination; kernel compilation and execution remain on the GPU.
+    """
+    original_device = data.device
+    quant_data = data
+    if data.is_cuda and uses_mx:
+        major, minor = torch.cuda.get_device_capability(data.device)
+        if (major, minor) == (10, 7) and not _torch_supports_cuda_arch(major, minor):
+            quant_data = data.cpu()
+
+    storage, scales = _quantize_block_scaled(
+        quant_data,
+        dtype_kind=dtype_kind,
+        uses_mx=uses_mx,
+        sf_vec_size=sf_vec_size,
+    )
+    if quant_data.device != original_device:
+        storage = storage.to(original_device)
+        scales = scales.to(original_device)
+    return storage, scales
+
+
 DTYPE_NAME_TO_VALUE = {
     "fp32": DType.FP32,
     "fp16": DType.FP16,
@@ -86,6 +160,30 @@ DTYPE_NAME_TO_VALUE = {
     "mxe4m3": DType.MXE4M3,
     "e4m3": DType.E4M3,
 }
+
+DATA_DISTRIBUTIONS = ("default", "allZeros")
+
+
+def _uses_all_zero_input_data(data_distribution: str) -> bool:
+    """Validate the TRTLLM-gen-compatible input distribution setting."""
+    if data_distribution not in DATA_DISTRIBUTIONS:
+        raise ValueError(
+            f"unknown data distribution {data_distribution!r}; "
+            f"expected one of {DATA_DISTRIBUTIONS}"
+        )
+    return data_distribution == "allZeros"
+
+
+def _zero_input_data_tensors(*tensors: torch.Tensor | None) -> None:
+    """Zero numerical kernel inputs without touching routing metadata.
+
+    Callers pass token/weight storage and their scale-factor tensors after
+    layout expansion or quantization. Routing maps, tile indices, and token
+    limits are deliberately not accepted or modified here.
+    """
+    for tensor in tensors:
+        if tensor is not None:
+            tensor.zero_()
 
 
 def _per_token_torch_dtype(cfg):
@@ -105,13 +203,13 @@ def _per_token_cutlass_dtype(cfg):
 
 
 def _plain_output_torch_dtype(cfg):
-    if cfg.dtype_c_kind == int(DType.FP16):
+    if cfg.dtype_c == int(DType.FP16):
         return torch.float16
     return torch.bfloat16
 
 
 def _plain_output_cutlass_dtype(cfg):
-    if cfg.dtype_c_kind == int(DType.FP16):
+    if cfg.dtype_c == int(DType.FP16):
         return cutlass.Float16
     return cutlass.BFloat16
 
@@ -120,7 +218,6 @@ def _is_gated_act_kind(act_kind: int) -> bool:
     return act_kind in (
         int(ActKind.SWIGLU),
         int(ActKind.GEGLU),
-        int(ActKind.SILU),
         int(ActKind.SITU),
     )
 
@@ -167,7 +264,49 @@ class TokenLayout:
 
     @property
     def num_token_tiles(self) -> int:
+        """Number of CTA tiles along the padded token dimension."""
+        return self.total_padded_tokens // self.tile_size
+
+    @property
+    def num_token_cgas(self) -> int:
+        """Number of CGA-scoped routing metadata entries."""
         return len(self.tile_idx)
+
+    @property
+    def token_cluster_dim(self) -> int:
+        """Number of CTA token tiles represented by one metadata entry."""
+        return self.cga_tile_size // self.tile_size
+
+
+@dataclass(frozen=True)
+class ReferenceCheckDiagnostics:
+    """Structured numerical diagnostics with bool-compatible pass semantics."""
+
+    passed: bool
+    max_abs: float | None = None
+    mean_abs: float | None = None
+    max_rel: float | None = None
+    threshold: float | None = None
+    nan_count: int = 0
+    inf_count: int = 0
+    error: str | None = None
+    reason: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.passed
+
+
+@dataclass(frozen=True)
+class _CachedTokenLayout:
+    """Immutable host-only payload stored by the token-layout cache."""
+
+    cga_tile_size: int
+    tokens_per_expert: tuple[int, ...]
+    padded_starts: tuple[int, ...]
+    expanded_to_expert: tuple[int, ...]
+    expanded_to_token: tuple[int, ...]
+    tile_idx: tuple[int, ...]
+    mn_limit: tuple[int, ...]
 
 
 def _round_up(value: int, multiple: int) -> int:
@@ -176,28 +315,112 @@ def _round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
-def _make_token_layout(
+def _parse_routing(routing: str) -> tuple[str, float | None]:
+    """Validate a routing policy and return its normalized kind and parameter."""
+    if routing in ("balanced_round_robin", "uniform"):
+        return routing, None
+    if routing.startswith("zipf:"):
+        alpha_text = routing.removeprefix("zipf:")
+        try:
+            alpha = float(alpha_text)
+        except ValueError as err:
+            raise ValueError(
+                f"invalid Zipf routing alpha in {routing!r}; expected zipf:<alpha>"
+            ) from err
+        if not math.isfinite(alpha) or alpha <= 0:
+            raise ValueError(
+                f"Zipf routing alpha must be finite and positive, got {alpha_text!r}"
+            )
+        return "zipf", alpha
+    raise ValueError(
+        f"unknown routing policy {routing!r}; expected balanced_round_robin, "
+        "uniform, or zipf:<alpha>"
+    )
+
+
+def _sample_zipf_experts(
+    rng: random.Random,
     *,
+    cumulative_weights: tuple[float, ...],
+    top_k: int,
+    alpha: float,
+) -> tuple[int, ...]:
+    """Sample distinct Zipf-ranked experts using a deterministic host RNG."""
+    num_experts = len(cumulative_weights)
+    population = range(num_experts)
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    max_rejection_attempts = max(64, top_k * 32)
+    attempts = 0
+    while len(selected) < top_k and attempts < max_rejection_attempts:
+        draw = rng.random() * cumulative_weights[-1]
+        expert_idx = min(bisect_right(cumulative_weights, draw), num_experts - 1)
+        attempts += 1
+        if expert_idx not in selected_set:
+            selected.append(expert_idx)
+            selected_set.add(expert_idx)
+
+    # Highly concentrated Zipf distributions can make rejection sampling slow.
+    # Finish with exact weighted-without-replacement draws to guarantee progress.
+    while len(selected) < top_k:
+        remaining = [
+            expert_idx for expert_idx in population if expert_idx not in selected_set
+        ]
+        first_rank = remaining[0] + 1
+        remaining_weights = [
+            ((expert_idx + 1) / first_rank) ** -alpha for expert_idx in remaining
+        ]
+        expert_idx = rng.choices(remaining, weights=remaining_weights, k=1)[0]
+        selected.append(expert_idx)
+        selected_set.add(expert_idx)
+    return tuple(selected)
+
+
+@lru_cache(maxsize=16)
+def _make_token_layout_cached(
     num_tokens: int,
     num_experts: int,
     top_k: int,
     tile_size: int,
     cluster_dim_in_token: int,
-) -> TokenLayout:
-    """Build the MoE expanded/permuted token layout."""
-    if num_tokens < 0:
-        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
-    if num_experts <= 0:
-        raise ValueError(f"num_experts must be positive, got {num_experts}")
-    if top_k <= 0 or top_k > num_experts:
-        raise ValueError(f"top_k must be in [1, num_experts], got {top_k}")
-
+    routing: str,
+    routing_alpha: float | None,
+    routing_seed: int,
+) -> _CachedTokenLayout:
+    """Build and cache immutable host routing metadata (never GPU tensors)."""
     cga_tile_size = tile_size * cluster_dim_in_token
     tokens_per_expert = [0] * num_experts
     assignments: list[tuple[int, int, int]] = []
+    rng = random.Random(routing_seed)
+    zipf_cumulative_weights: tuple[float, ...] | None = None
+    if routing == "zipf":
+        assert routing_alpha is not None
+        cumulative = 0.0
+        cumulative_weights = []
+        for expert_idx in range(num_experts):
+            cumulative += (expert_idx + 1) ** -routing_alpha
+            cumulative_weights.append(cumulative)
+        zipf_cumulative_weights = tuple(cumulative_weights)
     for token_idx in range(num_tokens):
-        for k_idx in range(top_k):
-            expert_idx = (token_idx * top_k + k_idx) % num_experts
+        if routing == "balanced_round_robin":
+            token_experts = tuple(
+                (token_idx * top_k + k_idx) % num_experts for k_idx in range(top_k)
+            )
+        elif routing == "uniform":
+            token_experts = tuple(rng.sample(range(num_experts), top_k))
+        else:
+            assert (
+                routing == "zipf"
+                and routing_alpha is not None
+                and zipf_cumulative_weights is not None
+            )
+            token_experts = _sample_zipf_experts(
+                rng,
+                cumulative_weights=zipf_cumulative_weights,
+                top_k=top_k,
+                alpha=routing_alpha,
+            )
+        for expert_idx in token_experts:
             local_idx = tokens_per_expert[expert_idx]
             tokens_per_expert[expert_idx] += 1
             assignments.append((expert_idx, local_idx, token_idx))
@@ -214,26 +437,73 @@ def _make_token_layout(
         expanded_to_expert[expanded_idx] = expert_idx
         expanded_to_token[expanded_idx] = token_idx
 
-    num_token_tiles = total_padded // tile_size if total_padded > 0 else 1
-    tile_idx = [0] * num_token_tiles
-    mn_limit = [0] * num_token_tiles
+    num_token_cgas = total_padded // cga_tile_size if total_padded > 0 else 1
+    tile_idx = [0] * num_token_cgas
+    mn_limit = [0] * num_token_cgas
     for expert_idx, token_count in enumerate(tokens_per_expert):
         padded_start = padded_starts[expert_idx]
         padded_end = padded_starts[expert_idx + 1]
         valid_end = padded_start + token_count
-        for tile in range(padded_start // tile_size, padded_end // tile_size):
-            tile_idx[tile] = expert_idx
-            mn_limit[tile] = valid_end
+        for cga in range(padded_start // cga_tile_size, padded_end // cga_tile_size):
+            tile_idx[cga] = expert_idx
+            mn_limit[cga] = valid_end
 
+    return _CachedTokenLayout(
+        cga_tile_size=cga_tile_size,
+        tokens_per_expert=tuple(tokens_per_expert),
+        padded_starts=tuple(padded_starts),
+        expanded_to_expert=tuple(expanded_to_expert),
+        expanded_to_token=tuple(expanded_to_token),
+        tile_idx=tuple(tile_idx),
+        mn_limit=tuple(mn_limit),
+    )
+
+
+def _make_token_layout(
+    *,
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    tile_size: int,
+    cluster_dim_in_token: int,
+    routing: str = "balanced_round_robin",
+    routing_seed: int = 42,
+) -> TokenLayout:
+    """Build the MoE expanded/permuted token layout for a routing policy."""
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+    if tile_size <= 0:
+        raise ValueError(f"tile_size must be positive, got {tile_size}")
+    if cluster_dim_in_token <= 0:
+        raise ValueError(
+            f"cluster_dim_in_token must be positive, got {cluster_dim_in_token}"
+        )
+    if top_k > num_experts:
+        raise ValueError(f"top_k must be in [1, num_experts], got {top_k}")
+    routing_kind, routing_alpha = _parse_routing(routing)
+    cached = _make_token_layout_cached(
+        num_tokens,
+        num_experts,
+        top_k,
+        tile_size,
+        cluster_dim_in_token,
+        routing_kind,
+        routing_alpha,
+        int(routing_seed),
+    )
     return TokenLayout(
         tile_size=tile_size,
-        cga_tile_size=cga_tile_size,
-        tokens_per_expert=tokens_per_expert,
-        padded_starts=padded_starts,
-        expanded_to_expert=expanded_to_expert,
-        expanded_to_token=expanded_to_token,
-        tile_idx=tile_idx,
-        mn_limit=mn_limit,
+        cga_tile_size=cached.cga_tile_size,
+        tokens_per_expert=list(cached.tokens_per_expert),
+        padded_starts=list(cached.padded_starts),
+        expanded_to_expert=list(cached.expanded_to_expert),
+        expanded_to_token=list(cached.expanded_to_token),
+        tile_idx=list(cached.tile_idx),
+        mn_limit=list(cached.mn_limit),
     )
 
 
@@ -242,31 +512,33 @@ def _launch_metadata_lists(
     token_layout: TokenLayout,
     early_exit_max_token_ctas: int,
 ):
-    """Return CGA routing records plus the per-token route map."""
-    launch_token_tiles = token_layout.num_token_tiles
+    """Return CGA routing metadata and the CTA-row route map for launch."""
+    launch_token_ctas = token_layout.num_token_tiles
+    launch_token_cgas = token_layout.num_token_cgas
     if cfg.use_early_exit and cfg.is_persistent:
-        launch_token_tiles = max(launch_token_tiles, early_exit_max_token_ctas)
+        launch_token_ctas = max(launch_token_ctas, early_exit_max_token_ctas)
+        launch_token_cgas = max(
+            launch_token_cgas,
+            (launch_token_ctas + token_layout.token_cluster_dim - 1)
+            // token_layout.token_cluster_dim,
+        )
 
     tile_idx = list(token_layout.tile_idx)
     mn_limit = list(token_layout.mn_limit)
-    if launch_token_tiles > token_layout.num_token_tiles:
-        extra_tiles = launch_token_tiles - token_layout.num_token_tiles
-        # Persistent early-exit over-launches token CTAs for CUDA graph reuse.
+    if launch_token_cgas > token_layout.num_token_cgas:
+        extra_cgas = launch_token_cgas - token_layout.num_token_cgas
+        # Persistent early-exit over-launches token CGAs for CUDA graph reuse.
         # Extra metadata is inactive because the scheduler exits before those
-        # CTAs read routing tables.
-        tile_idx.extend([0] * extra_tiles)
-        mn_limit.extend([0] * extra_tiles)
+        # CGAs read routing tables.
+        tile_idx.extend([0] * extra_cgas)
+        mn_limit.extend([0] * extra_cgas)
 
     route_map = list(token_layout.expanded_to_token)
-    min_route_rows = launch_token_tiles * token_layout.tile_size
+    min_route_rows = launch_token_ctas * token_layout.tile_size
     if len(route_map) < min_route_rows:
         route_map.extend([0] * (min_route_rows - len(route_map)))
 
-    return (
-        tile_idx[:: cfg.token_metadata_stride],
-        mn_limit[:: cfg.token_metadata_stride],
-        route_map,
-    )
+    return tile_idx, mn_limit, route_map
 
 
 def _normalize_early_exit_launch_extent(
@@ -282,7 +554,7 @@ def _normalize_early_exit_launch_extent(
 
 def _runtime_config(cfg, in_hidden: int):
     """Normalize runtime options for a concrete K."""
-    if cfg.has_deepseek_fp8:
+    if cfg.use_deepseek_fp8:
         if cfg.tile_k != 128:
             raise ValueError(
                 "use_deepseek_fp8=1 requires tile_k=128 to match the "
@@ -293,18 +565,7 @@ def _runtime_config(cfg, in_hidden: int):
                 "use_deepseek_fp8=1 requires problem_k to be a multiple of "
                 f"tile_k={cfg.tile_k}, got problem_k={in_hidden}"
             )
-    num_k_tiles = (in_hidden + cfg.tile_k - 1) // cfg.tile_k
-    use_unroll_loop_2x_for_mma = cfg.use_unroll_loop_2x_for_mma
-    if use_unroll_loop_2x_for_mma and (num_k_tiles < 2 or num_k_tiles % 2 != 0):
-        # Keep the generated loop structure identical to Gen's 2x-unrolled
-        # steady state. Fall back when concrete K would require a scalar tail.
-        use_unroll_loop_2x_for_mma = 0
-    runtime_cfg = replace(
-        cfg,
-        use_unroll_loop_2x_for_mma=use_unroll_loop_2x_for_mma,
-    )
-    derive_problem_shape_constants(runtime_cfg, problem_mnk=(0, 0, in_hidden))
-    return runtime_cfg
+    return resolve_problem_config(cfg, in_hidden)
 
 
 def _expand_bf16_activations(
@@ -316,10 +577,25 @@ def _expand_bf16_activations(
         dtype=compact_activations.dtype,
         device=compact_activations.device,
     )
-    for expanded_idx, expert_idx in enumerate(token_layout.expanded_to_expert):
-        if expert_idx >= 0:
-            token_idx = token_layout.expanded_to_token[expanded_idx]
-            expanded[expanded_idx, :] = compact_activations[token_idx, :]
+    expanded_to_expert = torch.as_tensor(
+        token_layout.expanded_to_expert,
+        dtype=torch.long,
+        device=compact_activations.device,
+    )
+    valid_rows = torch.nonzero(expanded_to_expert >= 0, as_tuple=False).flatten()
+    if valid_rows.numel():
+        expanded_to_token = torch.as_tensor(
+            token_layout.expanded_to_token,
+            dtype=torch.long,
+            device=compact_activations.device,
+        )
+        expanded.index_copy_(
+            0,
+            valid_rows,
+            compact_activations.index_select(
+                0, expanded_to_token.index_select(0, valid_rows)
+            ),
+        )
     return expanded
 
 
@@ -327,16 +603,7 @@ def _expand_fp4_activations(
     compact_activations: torch.Tensor,
     token_layout: TokenLayout,
 ) -> torch.Tensor:
-    expanded = torch.zeros(
-        (token_layout.total_padded_tokens, compact_activations.shape[1]),
-        dtype=compact_activations.dtype,
-        device=compact_activations.device,
-    )
-    for expanded_idx, expert_idx in enumerate(token_layout.expanded_to_expert):
-        if expert_idx >= 0:
-            token_idx = token_layout.expanded_to_token[expanded_idx]
-            expanded[expanded_idx, :] = compact_activations[token_idx, :]
-    return expanded
+    return _expand_bf16_activations(compact_activations, token_layout)
 
 
 def _random_uint8(
@@ -404,7 +671,7 @@ def _cutlass_data_dtype(dtype_kind: int):
 
 
 def _sf_ab_cutlass_dtype(cfg):
-    if cfg.has_deepseek_fp8:
+    if cfg.use_deepseek_fp8:
         return cutlass.Float32
     return cutlass.Float8E8M0FNU if cfg.uses_mx_scale_factors else cutlass.Float8E4M3FN
 
@@ -438,7 +705,7 @@ def _create_deepseek_fp8_sf_tensors(
     Activation scales are K-major: ``sf_activations[k_block, token_row]``.
     Weight scales are per expert, output tile, and 128-K block.
     """
-    if not cfg.has_deepseek_fp8:
+    if not cfg.use_deepseek_fp8:
         raise ValueError("DeepSeek FP8 scale tensors require use_deepseek_fp8=1")
 
     ds_k_blocks = _round_up(in_hidden, 128) // 128
@@ -538,6 +805,53 @@ def _unpack_fp4_e2m1(packed: torch.Tensor, logical_cols: int) -> torch.Tensor:
     return fp4_table[nibbles[..., :logical_cols]]
 
 
+_NVFP4_OUTPUT_MAX = 6.0 * 448.0
+_AUTO_SCALE_C_ACT_KINDS = (
+    int(ActKind.SWIGLU),
+    int(ActKind.GEGLU),
+    int(ActKind.RELU2),
+)
+
+
+def _auto_scale_c_applies(cfg) -> bool:
+    """Whether the harness can predict this NVFP4 output's magnitude."""
+    return (
+        cfg.dtype_c == int(DType.E2M1)
+        and cfg.uses_global_scales
+        and not cfg.is_bf16_mma
+        and not cfg.has_cast_a
+        and not cfg.is_fp8_mma
+        and cfg.act_kind in _AUTO_SCALE_C_ACT_KINDS
+        and not cfg.has_gemm1_clamp_limit
+    )
+
+
+def _resolve_scale_c(
+    scale_c_value, *, cfg, in_hidden: int, scale_gate_value: float
+) -> float:
+    """Choose a power-of-two output scale that avoids NVFP4 saturation."""
+    if scale_c_value is not None:
+        return float(scale_c_value)
+    if not _auto_scale_c_applies(cfg):
+        return 1.0
+
+    # The fused-activation generator scales Kaiming-uniform inputs by sqrt(K),
+    # so each GEMM has variance K/9 and gated products scale as K/9. Keep the
+    # predicted peak below 75% of E2M1 max times E4M3 scale-factor max.
+    variance = in_hidden / 9.0
+    if cfg.act_kind == int(ActKind.RELU2):
+        # ReLU2 squares the gate-scaled GEMM output, so the peak is the square
+        # of the largest sample; budget a ~7 sigma tail for the ~1e9 outputs
+        # a large FC1 check compares.
+        predicted_peak = 48.0 * scale_gate_value**2 * variance
+    else:
+        predicted_peak = 12.0 * abs(scale_gate_value) * variance
+    target = 0.75 * _NVFP4_OUTPUT_MAX
+    if predicted_peak <= target:
+        return 1.0
+    return 2.0 ** math.floor(math.log2(target / predicted_peak))
+
+
 def _kaiming_quantized_block_scaled_inputs(
     *,
     num_experts: int,
@@ -574,7 +888,7 @@ def _kaiming_quantized_block_scaled_inputs(
     data_scale = math.sqrt(in_hidden)
 
     def _quant(data, dtype_kind):
-        return _quantize_block_scaled(
+        return _quantize_block_scaled_for_reference(
             data * data_scale,
             dtype_kind=dtype_kind,
             uses_mx=uses_mx,
@@ -668,41 +982,46 @@ def _kaiming_quantized_block_scaled_inputs(
 
 def _sf_offsets(
     *,
-    row_idx: int,
+    row_idx: int | torch.Tensor,
     sf_cols: int,
     layout: int,
     num_padded_sf_cols: int | None = None,
-    device: str,
+    device: str | torch.device,
 ) -> torch.Tensor:
-    """Scale-factor byte offsets for one data row.
+    """Scale-factor byte offsets for one or more data rows.
 
     Computes SF byte offsets for Linear, R8c4 and R128c4 layouts.
     Weight SF tensors use a single physical row coordinate
     with experts folded into the row dimension.
     """
     data_blk_cols = num_padded_sf_cols if num_padded_sf_cols is not None else sf_cols
-    kblk = torch.arange(sf_cols, dtype=torch.long, device=device)
+    rows = torch.as_tensor(row_idx, dtype=torch.long, device=device)
+    scalar_row = rows.ndim == 0
+    rows = rows.reshape(-1, 1)
+    kblk = torch.arange(sf_cols, dtype=torch.long, device=device).reshape(1, -1)
     if layout == int(SfLayout.LINEAR):
-        return row_idx * data_blk_cols + kblk
+        offsets = rows * data_blk_cols + kblk
+        return offsets[0] if scalar_row else offsets
 
     if layout == int(SfLayout.R8c4):
         rows_per_block = 8
         cols_per_block = 4
         bytes_per_block = 32
-        sf_row = row_idx % rows_per_block
+        sf_row = rows % rows_per_block
     elif layout == int(SfLayout.R128c4):
         rows_per_block = 128
         cols_per_block = 4
         bytes_per_block = 512
-        sf_row = (row_idx % 32) * 4 + (row_idx % rows_per_block) // 32
+        sf_row = (rows % 32) * 4 + (rows % rows_per_block) // 32
     else:
         raise ValueError(f"Unsupported FP4 SF layout for reference: {layout}")
 
-    sf_blk_row = row_idx // rows_per_block
+    sf_blk_row = rows // rows_per_block
     sf_blk_col = kblk // cols_per_block
     sf_blk_idx = sf_blk_row * (data_blk_cols // cols_per_block) + sf_blk_col
     sf_col = kblk % cols_per_block
-    return sf_blk_idx * bytes_per_block + sf_row * cols_per_block + sf_col
+    offsets = sf_blk_idx * bytes_per_block + sf_row * cols_per_block + sf_col
+    return offsets[0] if scalar_row else offsets
 
 
 def _fp4_sf_values_for_row(
@@ -724,7 +1043,7 @@ def _fp4_sf_values_for_row(
         num_padded_sf_cols=num_padded_sf_cols,
         device=sf.device,
     )
-    return sf.view(sf_torch_dtype).float()[offsets]
+    return sf.view(sf_torch_dtype)[offsets].float()
 
 
 def _apply_fp4_sf_to_row(
@@ -855,6 +1174,40 @@ def compute_reference_dsfp8(
     return ref_gemm
 
 
+def _dequantize_block_scaled_expert(
+    storage: torch.Tensor,
+    sf: torch.Tensor,
+    *,
+    expert_idx: int,
+    dtype_kind: int,
+    logical_cols: int,
+    layout: int,
+    sf_vec_size: int,
+    sf_torch_dtype,
+) -> torch.Tensor:
+    """Dequantize one expert's ``[rows, K-storage]`` weights to float32."""
+    decoded = _decode_quantized_storage(
+        storage[expert_idx],
+        dtype_kind=dtype_kind,
+        logical_cols=logical_cols,
+    )
+    rows_per_expert = storage.shape[1]
+    sf_cols = _round_up(logical_cols, sf_vec_size) // sf_vec_size
+    sf_rows = expert_idx * rows_per_expert + torch.arange(
+        rows_per_expert, dtype=torch.long, device=storage.device
+    )
+    sf_offsets = _sf_offsets(
+        row_idx=sf_rows,
+        sf_cols=sf_cols,
+        layout=layout,
+        device=sf.device,
+    )
+    sf_values = sf.view(sf_torch_dtype)[sf_offsets].float()
+    return decoded.mul_(
+        sf_values.repeat_interleave(sf_vec_size, dim=-1)[:, :logical_cols]
+    )
+
+
 def _dequantize_block_scaled_tensor(
     storage: torch.Tensor,
     sf: torch.Tensor,
@@ -866,28 +1219,22 @@ def _dequantize_block_scaled_tensor(
     sf_torch_dtype,
 ) -> torch.Tensor:
     """Dequantize ``[experts, rows, K-storage]`` block-scaled data to float32."""
-    unpacked = _decode_quantized_storage(
-        storage,
-        dtype_kind=dtype_kind,
-        logical_cols=logical_cols,
-    )
     out = torch.empty(
-        (*unpacked.shape[:-1], logical_cols),
+        (*storage.shape[:-1], logical_cols),
         dtype=torch.float32,
         device=storage.device,
     )
-    rows_per_expert = unpacked.shape[1]
-    for expert_idx in range(unpacked.shape[0]):
-        for row_idx in range(unpacked.shape[1]):
-            sf_row_idx = expert_idx * rows_per_expert + row_idx
-            out[expert_idx, row_idx, :] = _apply_fp4_sf_to_row(
-                unpacked[expert_idx, row_idx, :],
-                sf,
-                row_idx=sf_row_idx,
-                layout=layout,
-                sf_vec_size=sf_vec_size,
-                sf_torch_dtype=sf_torch_dtype,
-            )
+    for expert_idx in range(storage.shape[0]):
+        out[expert_idx] = _dequantize_block_scaled_expert(
+            storage,
+            sf,
+            expert_idx=expert_idx,
+            dtype_kind=dtype_kind,
+            logical_cols=logical_cols,
+            layout=layout,
+            sf_vec_size=sf_vec_size,
+            sf_torch_dtype=sf_torch_dtype,
+        )
     return out
 
 
@@ -921,41 +1268,32 @@ def _dequantize_fp4_activation_row(
 
 
 def _dequantize_block_scaled_activation_row(
-    compact_storage: torch.Tensor,
+    decoded_compact: torch.Tensor,
     sf_activations: torch.Tensor,
     *,
-    dtype_kind: int,
-    logical_cols: int,
     token_idx: int,
     expanded_idx: int,
-    expert_idx: int,
     cfg,
     activation_sf_layout: int,
-    num_experts: int,
     sf_k: int,
 ) -> torch.Tensor:
     """Dequantize one logical activation row for MX/NVFP4 input dtypes."""
-    decoded = _decode_quantized_storage(
-        compact_storage,
-        dtype_kind=dtype_kind,
-        logical_cols=logical_cols,
-    )
     if cfg.has_routed_sfs:
         return _apply_fp4_sf_to_row(
-            decoded[token_idx, :],
+            decoded_compact[token_idx, :],
             sf_activations,
             row_idx=token_idx,
             layout=int(SfLayout.LINEAR),
-            sf_vec_size=cfg.sf_vec_size,
+            sf_vec_size=cfg.input_sf_block_size_a,
             sf_torch_dtype=_sf_torch_dtype(cfg),
             num_padded_sf_cols=_round_up(sf_k, 16),
         )
     return _apply_fp4_sf_to_row(
-        decoded[token_idx, :],
+        decoded_compact[token_idx, :],
         sf_activations,
         row_idx=expanded_idx,
         layout=activation_sf_layout,
-        sf_vec_size=cfg.sf_vec_size,
+        sf_vec_size=cfg.input_sf_block_size_a,
         sf_torch_dtype=_sf_torch_dtype(cfg),
     )
 
@@ -1013,10 +1351,13 @@ def _sf_c_numel(
     sf_block_size: int = 16,
     *,
     is_swap_ab: bool = True,
+    pitch: int | None = None,
 ) -> int:
-    """Number of output SF bytes, grouped along the contiguous feature axis."""
+    """Number of output SF bytes for generated C SF layout."""
     if not is_swap_ab:
         output_m, n = n, output_m
+    elif pitch is not None:
+        output_m = pitch
     m_group = sf_block_size * 4
     m_groups = _round_up(output_m, m_group) // m_group
     if layout == int(SfLayout.R8c4):
@@ -1034,12 +1375,20 @@ def _dsfp8_c_numel(output_m: int, n: int, *, is_swap_ab: bool) -> int:
 
 
 def _dsfp8_c_scale_index_grid(
-    *, output_m: int, n: int, is_swap_ab: bool, device: str
+    *,
+    output_m: int,
+    n: int,
+    is_swap_ab: bool,
+    device: str,
+    scale_stride: int | None = None,
 ) -> torch.Tensor:
     m_idx = torch.arange(output_m, device=device).view(output_m, 1)
     n_idx = torch.arange(n, device=device).view(1, n)
     if is_swap_ab:
-        return (m_idx // 128) * n + n_idx
+        # The swapAB epilogue strides scale blocks by the routed padded token
+        # count, which is narrower than N when the caller declares a wider
+        # token capacity.
+        return (m_idx // 128) * (n if scale_stride is None else scale_stride) + n_idx
     return (n_idx // 128) * output_m + m_idx
 
 
@@ -1078,10 +1427,22 @@ def _sf_c_index_grid(
     n: int,
     sf_layout_c: int,
     sf_block_size: int,
+    is_swap_ab: bool,
     device: str,
+    pitch: int | None = None,
+    m_offset: int = 0,
 ) -> torch.Tensor:
     m_idx = torch.arange(output_m, device=device).view(output_m, 1)
     n_idx = torch.arange(n, device=device).view(1, n)
+    if not is_swap_ab:
+        if m_offset:
+            raise ValueError("SF-C m_offset is supported for swapAB only")
+        m_idx, n_idx = n_idx, m_idx
+        output_m = n
+    else:
+        m_idx += int(m_offset)
+        if pitch is not None:
+            output_m = pitch
     m_block = m_idx // sf_block_size
     m_groups = _round_up(output_m, sf_block_size * 4) // (sf_block_size * 4)
     if sf_layout_c == int(SfLayout.R8c4):
@@ -1111,9 +1472,12 @@ def _dequantize_fp4_output(
     is_swap_ab: bool,
     sf_layout_c: int,
     uses_mxfp4: bool,
+    pitch: int | None = None,
+    sf_c_m_offset: int = 0,
 ) -> torch.Tensor:
     """Decode packed E2M1 C and its NVFP4/MXFP4 SF-C into a logical view."""
-    elem_count = output_m * n
+    pitch = output_m if pitch is None else pitch
+    elem_count = (n - 1) * pitch + output_m
     packed = c_storage[: _round_up(elem_count, 2) // 2]
     fp4_table = _fp4_e2m1_values(c_storage.device)
     nibbles = torch.empty(
@@ -1124,19 +1488,20 @@ def _dequantize_fp4_output(
     fp4_vals = fp4_table[nibbles[:elem_count]]
 
     if is_swap_ab:
-        fp4_view = torch.as_strided(fp4_vals, (output_m, n), (1, output_m))
+        fp4_view = torch.as_strided(fp4_vals, (output_m, n), (1, pitch))
     else:
         fp4_view = fp4_vals.view(output_m, n)
 
     sf_idx = _sf_c_index_grid(
-        output_m=output_m if is_swap_ab else n,
-        n=n if is_swap_ab else output_m,
+        output_m=output_m,
+        n=n,
         sf_layout_c=sf_layout_c,
         sf_block_size=32 if uses_mxfp4 else 16,
+        is_swap_ab=is_swap_ab,
         device=c_storage.device,
+        pitch=pitch,
+        m_offset=sf_c_m_offset,
     )
-    if not is_swap_ab:
-        sf_idx = sf_idx.T
     sf_dtype = torch.float8_e8m0fnu if uses_mxfp4 else torch.float8_e4m3fn
     sf_vals = sf_c.view(sf_dtype).float()
     return fp4_view * sf_vals[sf_idx]
@@ -1150,12 +1515,15 @@ def _dequantize_mxfp8_output(
     n: int,
     is_swap_ab: bool,
     sf_layout_c: int,
+    pitch: int | None = None,
+    sf_c_m_offset: int = 0,
 ) -> torch.Tensor:
     """Decode E4M3 C and UE8M0 SF-C into a float32 logical view."""
-    elem_count = output_m * n
+    pitch = output_m if pitch is None else pitch
+    elem_count = (n - 1) * pitch + output_m
     fp8_vals = c_storage[:elem_count].view(torch.float8_e4m3fn).float()
     if is_swap_ab:
-        fp8_view = torch.as_strided(fp8_vals, (output_m, n), (1, output_m))
+        fp8_view = torch.as_strided(fp8_vals, (output_m, n), (1, pitch))
     else:
         fp8_view = fp8_vals.view(output_m, n)
 
@@ -1164,7 +1532,10 @@ def _dequantize_mxfp8_output(
         n=n,
         sf_layout_c=sf_layout_c,
         sf_block_size=32,
+        is_swap_ab=is_swap_ab,
         device=c_storage.device,
+        pitch=pitch,
+        m_offset=sf_c_m_offset,
     )
     sf_vals = sf_c.view(torch.float8_e8m0fnu).float()
     return fp8_view * sf_vals[sf_idx]
@@ -1176,12 +1547,14 @@ def _decode_fp8_output(
     output_m: int,
     n: int,
     is_swap_ab: bool,
+    pitch: int | None = None,
 ) -> torch.Tensor:
     """Decode plain per-tensor FP8 C storage into a logical float32 view."""
-    elem_count = output_m * n
+    pitch = output_m if pitch is None else pitch
+    elem_count = (n - 1) * pitch + output_m
     fp8_vals = c_storage[:elem_count].view(torch.float8_e4m3fn).float()
     if is_swap_ab:
-        return torch.as_strided(fp8_vals, (output_m, n), (1, output_m))
+        return torch.as_strided(fp8_vals, (output_m, n), (1, pitch))
     return fp8_vals.view(output_m, n)
 
 
@@ -1192,6 +1565,7 @@ def _dequantize_dsfp8_output(
     output_m: int,
     n: int,
     is_swap_ab: bool,
+    scale_stride: int | None = None,
 ) -> torch.Tensor:
     """Decode E4M3 C using DeepSeek FP32 per-128-hidden dequant scales."""
     fp8_view = _decode_fp8_output(
@@ -1205,48 +1579,9 @@ def _dequantize_dsfp8_output(
         n=n,
         is_swap_ab=is_swap_ab,
         device=c_storage.device,
+        scale_stride=scale_stride,
     )
     return fp8_view * sf_c.float()[sf_idx]
-
-
-# Row shuffle indices that reorder rows within blocks to optimize SMEM
-# write patterns in the
-# transposed-output (16dp256b) epilogue.
-_SHUFFLE_BLOCK_16 = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15]
-_SHUFFLE_BLOCK_32 = [
-    0,
-    8,
-    16,
-    24,
-    1,
-    9,
-    17,
-    25,
-    2,
-    10,
-    18,
-    26,
-    3,
-    11,
-    19,
-    27,
-    4,
-    12,
-    20,
-    28,
-    5,
-    13,
-    21,
-    29,
-    6,
-    14,
-    22,
-    30,
-    7,
-    15,
-    23,
-    31,
-]
 
 
 def reorder_rows_for_gated_act(tensor: torch.Tensor) -> torch.Tensor:
@@ -1264,11 +1599,9 @@ def reorder_rows_for_gated_act(tensor: torch.Tensor) -> torch.Tensor:
     M = tensor.shape[-2]
     assert M % 2 == 0, f"M must be even for gated act reorder, got {M}"
     half = M // 2
-    out = torch.empty_like(tensor)
-    for i in range(half):
-        out[..., 2 * i, :] = tensor[..., i, :]
-        out[..., 2 * i + 1, :] = tensor[..., i + half, :]
-    return out
+    rows = torch.arange(M, dtype=torch.long, device=tensor.device)
+    source_rows = torch.stack((rows[:half], rows[half:]), dim=1).flatten()
+    return tensor.index_select(-2, source_rows)
 
 
 def shuffle_matrix(tensor: torch.Tensor, epilogue_tile_m: int) -> torch.Tensor:
@@ -1284,21 +1617,30 @@ def shuffle_matrix(tensor: torch.Tensor, epilogue_tile_m: int) -> torch.Tensor:
     Returns:
         Shuffled tensor with same shape.
     """
-    block_size = 32 if epilogue_tile_m % 128 == 0 else 16
-    indices = _SHUFFLE_BLOCK_32 if block_size == 32 else _SHUFFLE_BLOCK_16
+    indices = shuffled_matrix_row_indices(epilogue_tile_m)
+    block_size = len(indices)
 
     M = tensor.shape[-2]
     if block_size > M:
         # Matrix too small for shuffling — return as-is.
         return tensor.clone()
-    out = torch.empty_like(tensor)
-    for mi in range(M):
-        block_idx = mi // block_size
-        src_in_block = mi % block_size
-        dst_in_block = indices[src_in_block]
-        dst_row = block_idx * block_size + dst_in_block
-        out[..., dst_row, :] = tensor[..., mi, :]
-    return out
+    if M % block_size != 0:
+        raise ValueError(
+            "Shuffled matrix rows must contain whole shuffle blocks, got "
+            f"M={M}, block_size={block_size}"
+        )
+    destination_rows = torch.as_tensor(indices, dtype=torch.long, device=tensor.device)
+    source_rows = torch.empty_like(destination_rows)
+    source_rows[destination_rows] = torch.arange(
+        block_size, dtype=torch.long, device=tensor.device
+    )
+    source_rows = (
+        source_rows.unsqueeze(0)
+        + torch.arange(
+            0, M, block_size, dtype=torch.long, device=tensor.device
+        ).unsqueeze(1)
+    ).flatten()
+    return tensor.index_select(-2, source_rows)
 
 
 def _block_major_k_weight_tensor(tensor: torch.Tensor, cfg) -> torch.Tensor:
@@ -1337,7 +1679,7 @@ def _kernel_weight_row_source_indices(
     *,
     is_gated: bool,
     epilogue_tile_m: int,
-    shuffle_for_swap_ab: bool,
+    shuffle_weight_rows: bool,
     device: torch.device,
 ) -> torch.Tensor:
     """Return the original weight row stored at each kernel weight row."""
@@ -1346,7 +1688,7 @@ def _kernel_weight_row_source_indices(
     )
     if is_gated:
         row_ids = reorder_rows_for_gated_act(row_ids)
-    if shuffle_for_swap_ab:
+    if shuffle_weight_rows:
         row_ids = shuffle_matrix(row_ids, epilogue_tile_m)
     return row_ids.view(num_rows)
 
@@ -1361,25 +1703,31 @@ def _permute_mma_sf_rows(
     sf_vec_size: int,
 ) -> torch.Tensor:
     """Permute tiled MMA scale-factor rows to match a data-row permutation."""
-    out = torch.empty_like(sf)
+    out = sf.clone()
     sf_cols = _round_up(logical_cols, sf_vec_size) // sf_vec_size
-    row_sources = [int(v) for v in row_source_indices.detach().cpu().tolist()]
-    rows_per_expert = len(row_sources)
-    for expert_idx in range(num_experts):
-        for dst_row, src_row in enumerate(row_sources):
-            src_offsets = _sf_offsets(
-                row_idx=expert_idx * rows_per_expert + src_row,
-                sf_cols=sf_cols,
-                layout=layout,
-                device=sf.device,
-            )
-            dst_offsets = _sf_offsets(
-                row_idx=expert_idx * rows_per_expert + dst_row,
-                sf_cols=sf_cols,
-                layout=layout,
-                device=sf.device,
-            )
-            out[dst_offsets] = sf[src_offsets]
+    row_sources = row_source_indices.to(dtype=torch.long, device=sf.device)
+    rows_per_expert = row_sources.numel()
+    expert_offsets = (
+        torch.arange(num_experts, dtype=torch.long, device=sf.device) * rows_per_expert
+    ).unsqueeze(1)
+    src_rows = (expert_offsets + row_sources.unsqueeze(0)).flatten()
+    dst_rows = (
+        expert_offsets
+        + torch.arange(rows_per_expert, dtype=torch.long, device=sf.device).unsqueeze(0)
+    ).flatten()
+    src_offsets = _sf_offsets(
+        row_idx=src_rows,
+        sf_cols=sf_cols,
+        layout=layout,
+        device=sf.device,
+    )
+    dst_offsets = _sf_offsets(
+        row_idx=dst_rows,
+        sf_cols=sf_cols,
+        layout=layout,
+        device=sf.device,
+    )
+    out[dst_offsets.flatten()] = sf[src_offsets.flatten()]
     return out
 
 
@@ -1392,17 +1740,17 @@ def _kernel_weight_sf(
     num_experts: int,
     is_gated: bool,
     weight_sf_layout: int | None,
-    shuffle_for_swap_ab: bool,
+    shuffle_weight_rows: bool,
 ) -> torch.Tensor | None:
     """Return weight SFs reordered to match kernel weight storage."""
-    if sf_weights is None or (not is_gated and not shuffle_for_swap_ab):
+    if sf_weights is None or (not is_gated and not shuffle_weight_rows):
         return sf_weights
     assert weight_sf_layout is not None
     row_source_indices = _kernel_weight_row_source_indices(
         out_hidden,
         is_gated=is_gated,
-        epilogue_tile_m=cfg.tile_m,
-        shuffle_for_swap_ab=shuffle_for_swap_ab,
+        epilogue_tile_m=cfg.epi_tile_m,
+        shuffle_weight_rows=shuffle_weight_rows,
         device=sf_weights.device,
     )
     return _permute_mma_sf_rows(
@@ -1411,7 +1759,7 @@ def _kernel_weight_sf(
         logical_cols=in_hidden,
         layout=weight_sf_layout,
         num_experts=num_experts,
-        sf_vec_size=cfg.sf_vec_size,
+        sf_vec_size=cfg.input_sf_block_size_a,
     )
 
 
@@ -1426,16 +1774,15 @@ def _parse_overrides(args):
                 "none": RouteImpl.NONE,
                 "tma": RouteImpl.TMA,
                 "ldgsts": RouteImpl.LDGSTS,
-                "ldgplussts": RouteImpl.LDG_PLUS_STS,
             }[args.route_act]
         ),
         "route_sfs_act": int(
             {
+                "auto": RouteImpl.AUTO,
                 "false": RouteImpl.NONE,
                 "none": RouteImpl.NONE,
                 "tma": RouteImpl.TMA,
                 "ldgsts": RouteImpl.LDGSTS,
-                "ldgplussts": RouteImpl.LDG_PLUS_STS,
             }[args.route_sfs_act]
         ),
         "tile_scheduler": int(
@@ -1444,7 +1791,14 @@ def _parse_overrides(args):
                 "persistent": TileScheduler.PERSISTENT,
             }[args.tile_scheduler]
         ),
+        "cta_raster_order": int(
+            {
+                "rasterizeAlongM": CtaRasterOrder.ALONG_M,
+                "rasterizeAlongN": CtaRasterOrder.ALONG_N,
+            }[args.cta_swizzle_type]
+        ),
         "transpose_mma_output": args.transpose_mma_output,
+        "use_shuffled_matrix": args.use_shuffled_matrix,
         "act_kind": int(
             {
                 "none": ActKind.NONE,
@@ -1482,8 +1836,11 @@ def _parse_overrides(args):
                 "r128c4": SfLayout.R128c4,
             }[args.sf_layout_c]
         ),
-        "cluster_m": args.cluster_m,
-        "tile_m": args.tile_m,
+        "umma_cta_count": args.umma_cta_count,
+        "cluster_dim_x": args.cluster_dim_x,
+        "cluster_dim_y": args.cluster_dim_y,
+        "fallback_cluster_dim_x": args.fallback_cluster_dim_x,
+        "fallback_cluster_dim_y": args.fallback_cluster_dim_y,
         "tile_n": args.tile_n,
         "tile_k": args.tile_k,
         "epi_tile_n": args.epi_tile_n,
@@ -1493,9 +1850,6 @@ def _parse_overrides(args):
         "dtype_a": int(DTYPE_NAME_TO_VALUE[args.dtype_a]),
         "dtype_b": int(DTYPE_NAME_TO_VALUE[args.dtype_b]),
         "dtype_c": int(DTYPE_NAME_TO_VALUE[args.dtype_c]),
-        "sf_block_size_a": args.sf_block_size_a,
-        "sf_block_size_b": args.sf_block_size_b,
-        "sf_block_size_c": args.sf_block_size_c,
         "num_stages_a": args.num_stages_a,
         "num_stages_b": args.num_stages_b,
         "num_stages_smem_sfa": args.num_stages_smem_sfa,
@@ -1504,9 +1858,12 @@ def _parse_overrides(args):
         "num_stages_tmem_sfa": args.num_stages_tmem_sfa,
         "num_stages_tmem_sfb": args.num_stages_tmem_sfb,
         "num_stages_c_smem": args.num_stages_c_smem,
+        "tmem_ldst_max_num_regs": args.tmem_ldst_max_num_regs,
         "use_tma_oob_opt": args.use_tma_oob_opt,
         "use_tma_store": args.use_tma_store,
+        "num_load_a_warps": args.num_load_a_warps,
         "num_load_b_warps": args.num_load_b_warps,
+        "num_load_sfa_warps": args.num_load_sfa_warps,
         "num_load_sfb_warps": args.num_load_sfb_warps,
         "epilogue_regs": args.epilogue_regs,
         "mma_regs": args.mma_regs,
@@ -1521,26 +1878,27 @@ def _parse_overrides(args):
         "padding_regs": args.padding_regs,
         "use_unroll_loop_2x_for_mma": args.use_unroll_loop_2x_for_mma,
         "use_max_tmem_overlap": args.use_max_tmem_overlap,
+        "fuse_sf_copy_to_mma": args.fuse_sf_copy_to_mma,
+        "fuse_operand_sf_loads": args.fuse_operand_sf_loads,
         "use_early_exit": args.use_early_exit,
         "use_clc_fast_drain": args.use_clc_fast_drain,
         "use_work_throttle": args.use_work_throttle,
         "use_pdl": args.use_pdl,
-        "do_pdl_wait_for_num_non_exiting_ctas": (
-            args.do_pdl_wait_for_num_non_exiting_ctas
-        ),
+        "skip_early_exit_pdl": args.skip_early_exit_pdl,
         "use_global_scales": args.use_global_scales,
         "use_per_token_sf_a": args.use_per_token_sf_a,
         "use_per_token_sf_b": args.use_per_token_sf_b,
         "per_token_sf_dtype": int(DTYPE_NAME_TO_VALUE[args.per_token_sf_dtype]),
         "use_deepseek_fp8": args.use_deepseek_fp8,
         # DeepSeek FP8 will use a single LoadSfAb warp.
-        "num_load_sfab_warps": int(args.use_deepseek_fp8 != 0),
         "load_sfab_regs": args.load_sfab_regs,
         "bias_type": args.bias_type,
         "has_gemm1_alpha": args.has_gemm1_alpha,
         "has_gemm1_beta": args.has_gemm1_beta,
         "has_gemm1_clamp_limit": args.has_gemm1_clamp_limit,
     }
+    if args.sm_arch is not None:
+        overrides["sm_arch"] = args.sm_arch
     return overrides
 
 
@@ -1552,6 +1910,7 @@ def validate_schedule(
     early_exit_max_token_ctas=0,
     **cfg_overrides,
 ):
+    cfg_overrides = _resolve_runtime_sm_arch(cfg_overrides)
     launch_early_exit_max_token_ctas = resolve_early_exit_max_token_ctas(
         num_tokens=num_tokens,
         num_experts=num_experts,
@@ -1575,15 +1934,100 @@ def validate_schedule(
     return True
 
 
+_C_STRIDE_SENTINEL_F = 123.0
+_C_STRIDE_SENTINEL_U8 = 0xA5
+
+# Poison for the region the epilogue is expected to write. A zero-filled output
+# cannot tell "stored a zero" from "never stored", which is how a swapAB
+# epilogue that dropped the upper half of every M group went unnoticed: the
+# unwritten elements read as zero and the numeric threshold is an absolute
+# floor, so a small-magnitude output still compared clean. NaN survives no
+# arithmetic, so any element left poisoned fails the existing NaN check.
+_C_UNWRITTEN_POISON_F = float("nan")
+# E4M3 encodes NaN at 0x7F, so poisoned FP8 storage decodes to NaN too. E2M1
+# has no NaN encoding, so FP4 output keeps its zero fill and is not covered.
+_C_UNWRITTEN_POISON_E4M3_U8 = 0x7F
+
+
+def _same_launch_output(first: torch.Tensor, current: torch.Tensor) -> bool:
+    """Whether two launches produced the same C buffer.
+
+    Elements the epilogue never stores keep their poison, so plain equality
+    would read the unwritten NaNs as a difference and report a deterministic
+    kernel as nondeterministic. Treat two NaNs in the same position as equal
+    and let the NaN coverage check downstream report them instead.
+    """
+    if torch.equal(first, current):
+        return True
+    if not first.dtype.is_floating_point:
+        return False
+    matches = (first == current) | (torch.isnan(first) & torch.isnan(current))
+    return bool(matches.all().item())
+
+
+def _partition_view(storage, width, cols, pitch):
+    """Logical [width, cols] view of one partition inside a pitch-strided buffer."""
+    return torch.as_strided(storage, (width, cols), (1, pitch))
+
+
+def _mixed_cga_wave_counts(
+    *,
+    logical_work_cgas,
+    physical_grid_ctas,
+    umma_cta_count,
+    preferred_shape,
+    fallback_shape,
+):
+    """Return logical work/grid CGA counts for both physical shapes.
+
+    A wider physical CGA contains multiple independent ``umma_cta_count x 1``
+    UMMA atoms.  Convert the logical work into the number of physical CGAs it
+    would occupy for each shape, and compare that with an all-preferred or
+    all-fallback wave using the actual persistent grid's CTA budget.
+    """
+
+    def counts(shape):
+        physical_size = math.prod(shape)
+        logical_cgas_per_physical_cga = physical_size // umma_cta_count
+        work_cgas = (
+            logical_work_cgas + logical_cgas_per_physical_cga - 1
+        ) // logical_cgas_per_physical_cga
+        wave_cgas = physical_grid_ctas // physical_size
+        return work_cgas, wave_cgas
+
+    return counts(preferred_shape), counts(fallback_shape)
+
+
+def _resolve_runtime_sm_arch(cfg_overrides: dict) -> dict:
+    """Fill ``sm_arch`` from the active CUDA device when it is not explicit."""
+    if "sm_arch" in cfg_overrides or not torch.cuda.is_available():
+        return cfg_overrides
+    major, minor = torch.cuda.get_device_capability()
+    detected = major * 10 + minor
+    if detected not in (100, 103, 107):
+        return cfg_overrides
+    if not is_prims_ts_arch_available(major, minor):
+        hint = "; install a Rubin-capable DSL" if (major, minor) == (10, 7) else ""
+        raise RuntimeError(
+            f"the installed CuTe DSL cannot natively target SM{detected}{hint}"
+        )
+    resolved = dict(cfg_overrides)
+    resolved["sm_arch"] = detected
+    return resolved
+
+
 def reference_check(
     *,
     num_experts,
     num_tokens,
     top_k,
+    routing="balanced_round_robin",
+    routing_seed=42,
     problem_n=None,
     problem_k=None,
     seed=42,
-    scale_c_value=1.0,
+    data_distribution="default",
+    scale_c_value=None,
     scale_gate_value=1.0,
     gemm1_alpha_value=None,
     gemm1_beta_value=None,
@@ -1591,7 +2035,11 @@ def reference_check(
     return_output=False,
     repeat_launches=1,
     output_guard_elements=0,
+    require_mixed_cga_runtime=False,
+    c_row_stride=None,
+    c_partition_offset=0,
     early_exit_max_token_ctas=0,
+    token_capacity=None,
     **cfg_overrides,
 ):
     """Compile, launch the kernel, compare to a PyTorch reference.
@@ -1606,9 +2054,26 @@ def reference_check(
     (single-tile test). Set them to realistic values (e.g. 4096) for
     multi-tile benchmarks. ``repeat_launches`` reuses the compiled kernel and
     requires bitwise-stable output and output scale buffers across launches.
+
+    ``token_capacity`` declares a token extent wider than the routed padded
+    count, the way the MoE runner must: its ``routed_token_capacity`` has to be
+    a host-known worst-case bound because the real count only exists on the
+    device. Token-axis buffers grow to the capacity and the kernel still reads
+    the routed count from ``total_num_padded_tokens``, so the padded tail stays
+    outside the compared output.
+
+    ``require_mixed_cga_runtime`` additionally requires
+    the logical work to exceed one persistent-grid wave for both the preferred
+    and fallback physical CGA shapes.
+
+    ``scale_c_value=None`` selects a power-of-two scale for generated fused
+    activations with NVFP4 output so the reference stays below the format's
+    saturation limit. Pass a float to use an explicit scale.
+
     """
     if repeat_launches < 1:
         raise ValueError(f"repeat_launches must be positive, got {repeat_launches}")
+    cfg_overrides = _resolve_runtime_sm_arch(cfg_overrides)
     launch_early_exit_max_token_ctas = resolve_early_exit_max_token_ctas(
         num_tokens=num_tokens,
         num_experts=num_experts,
@@ -1616,7 +2081,19 @@ def reference_check(
         cfg_overrides=cfg_overrides,
         explicit_early_exit_max_token_ctas=early_exit_max_token_ctas,
     )
+    all_zero_input_data = _uses_all_zero_input_data(data_distribution)
     cfg = make_config(**cfg_overrides)
+    if require_mixed_cga_runtime:
+        if cfg.fallback_cluster_shape is None:
+            raise ValueError(
+                "require_mixed_cga_runtime requires distinct preferred and "
+                "fallback cluster shapes"
+            )
+        if not cfg.is_persistent:
+            raise ValueError(
+                "require_mixed_cga_runtime requires the persistent tile scheduler"
+            )
+        cfg = replace(cfg, record_runtime_cga_shapes=1)
 
     torch.manual_seed(seed)
     device = "cuda"
@@ -1630,6 +2107,13 @@ def reference_check(
     out_hidden = problem_n if problem_n is not None else default_out_hidden
     in_hidden = problem_k if problem_k is not None else cfg.tile_k
     cfg = _runtime_config(cfg, in_hidden)
+    scale_c_is_auto = scale_c_value is None
+    scale_c_value = _resolve_scale_c(
+        scale_c_value,
+        cfg=cfg,
+        in_hidden=in_hidden,
+        scale_gate_value=scale_gate_value,
+    )
 
     if cfg.is_swap_ab and out_hidden % cfg.tile_m != 0:
         raise ValueError(
@@ -1637,26 +2121,60 @@ def reference_check(
             f"got {out_hidden}"
         )
 
-    token_tile_size = cfg.tile_n if cfg.is_swap_ab else cfg.tile_m
-    cluster_dim_in_token = cfg.token_metadata_stride
+    token_tile_size = cfg.token_tile_size
+    cluster_dim_in_token = cfg.token_cluster_dim
     token_layout = _make_token_layout(
         num_tokens=total_tokens,
         num_experts=num_experts,
         top_k=top_k,
         tile_size=token_tile_size,
         cluster_dim_in_token=cluster_dim_in_token,
+        routing=routing,
+        routing_seed=routing_seed,
     )
+    total_padded_tokens = token_layout.total_padded_tokens
+    if total_padded_tokens == 0:
+        raise ValueError(
+            "routing produced no assignments for the selected local expert slice"
+        )
+    declared_padded_tokens = total_padded_tokens
+    if token_capacity is not None:
+        declared_padded_tokens = int(token_capacity)
+        if not cfg.is_swap_ab or not cfg.use_deepseek_fp8:
+            raise ValueError(
+                "token_capacity currently covers swapAB DeepSeek FP8 only, "
+                "whose token-axis buffers are plain (rows, k) and "
+                "(k_blocks, rows) tensors that widen directly"
+            )
+        if declared_padded_tokens < total_padded_tokens:
+            raise ValueError(
+                f"token_capacity={declared_padded_tokens} is narrower than the "
+                f"routed padded token count {total_padded_tokens}"
+            )
+        if declared_padded_tokens % token_layout.cga_tile_size:
+            raise ValueError(
+                f"token_capacity={declared_padded_tokens} must be a multiple "
+                f"of the CGA token tile {token_layout.cga_tile_size}"
+            )
+        # Over-launch the token dimension so the routing metadata carries the
+        # inactive tail tiles, as it does for an over-declared MoE launch.
+        launch_early_exit_max_token_ctas = max(
+            int(launch_early_exit_max_token_ctas),
+            declared_padded_tokens // token_tile_size,
+        )
     launch_early_exit_max_token_ctas = _normalize_early_exit_launch_extent(
         cfg,
         token_layout,
         launch_early_exit_max_token_ctas,
     )
-    total_padded_tokens = token_layout.total_padded_tokens
 
     print(
         f"Reference check: tokens={total_tokens}, padded_tokens={total_padded_tokens}, "
+        f"declared_tokens={declared_padded_tokens}, "
         f"out_hidden={out_hidden}, in_hidden={in_hidden}, experts={num_experts}, "
-        f"top_k={top_k}, swap_ab={cfg.is_swap_ab}"
+        f"top_k={top_k}, routing={routing}, routing_seed={routing_seed}, "
+        f"swap_ab={cfg.is_swap_ab}, dist={data_distribution}, "
+        f"scale_c={scale_c_value:g}{' (auto)' if scale_c_is_auto else ''}"
     )
     print(
         f"  tile=({cfg.tile_m}x{cfg.tile_n}x{cfg.tile_k}), "
@@ -1705,7 +2223,7 @@ def reference_check(
         activation_sf_layout = None
         sf_weights = sf_activations = None
     elif cfg.has_cast_a:
-        sf_k = in_hidden // cfg.sf_vec_size
+        sf_k = in_hidden // cfg.input_sf_block_size_a
         weight_sf_layout = cfg.sf_layout_a
         if cfg.act_kind != int(ActKind.NONE):
             # Fused-activation: Kaiming-init + quantize the (MXFP4) weights and
@@ -1721,11 +2239,11 @@ def reference_check(
                 )
                 * data_scale
             )
-            w_storage, w_sf = _quantize_block_scaled(
+            w_storage, w_sf = _quantize_block_scaled_for_reference(
                 w_fp32,
-                dtype_kind=cfg.dtype_a_kind,
+                dtype_kind=cfg.dtype_a,
                 uses_mx=cfg.uses_mx_scale_factors,
-                sf_vec_size=cfg.sf_vec_size,
+                sf_vec_size=cfg.input_sf_block_size_a,
             )
             weights_torch = w_storage.reshape(num_experts, out_hidden, in_hidden // 2)
             w_sf_total = _create_sf_tensor_mma_layout(
@@ -1755,7 +2273,7 @@ def reference_check(
         else:
             weights_torch = _random_quantized_tensor(
                 (num_experts, out_hidden, in_hidden),
-                dtype_kind=cfg.dtype_a_kind,
+                dtype_kind=cfg.dtype_a,
                 fan_in=in_hidden,
                 device=device,
             )
@@ -1796,20 +2314,20 @@ def reference_check(
             if cfg.has_routed_act
             else _expand_bf16_activations(activation_compact_torch, token_layout)
         )
-        a_dtype = _cutlass_data_dtype(cfg.dtype_a_kind)
+        a_dtype = _cutlass_data_dtype(cfg.dtype_a)
         b_dtype = cutlass.BFloat16
         activation_sf_layout = None
         sf_activations = None
     elif cfg.is_fp8_mma:
         weights_torch = _random_quantized_tensor(
             (num_experts, out_hidden, in_hidden),
-            dtype_kind=cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind,
+            dtype_kind=cfg.dtype_a if cfg.is_swap_ab else cfg.dtype_b,
             fan_in=in_hidden,
             device=device,
         )
         activation_compact_torch = _random_quantized_tensor(
             (total_tokens, in_hidden),
-            dtype_kind=cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind,
+            dtype_kind=cfg.dtype_b if cfg.is_swap_ab else cfg.dtype_a,
             fan_in=in_hidden,
             device=device,
         )
@@ -1818,25 +2336,25 @@ def reference_check(
             if cfg.has_routed_act
             else _expand_fp4_activations(activation_compact_torch, token_layout)
         )
-        a_dtype = _cutlass_data_dtype(cfg.dtype_a_kind)
-        b_dtype = _cutlass_data_dtype(cfg.dtype_b_kind)
+        a_dtype = _cutlass_data_dtype(cfg.dtype_a)
+        b_dtype = _cutlass_data_dtype(cfg.dtype_b)
         weight_sf_layout = None
         activation_sf_layout = None
         sf_weights = sf_activations = None
-        if cfg.has_deepseek_fp8:
+        if cfg.use_deepseek_fp8:
             sf_weights, sf_activations = _create_deepseek_fp8_sf_tensors(
                 cfg,
                 num_experts=num_experts,
                 num_tokens=total_tokens,
                 out_hidden=out_hidden,
                 in_hidden=in_hidden,
-                total_padded_tokens=total_padded_tokens,
+                total_padded_tokens=declared_padded_tokens,
                 device=device,
             )
     else:
-        a_dtype = _cutlass_data_dtype(cfg.dtype_a_kind)
-        b_dtype = _cutlass_data_dtype(cfg.dtype_b_kind)
-        sf_vec_size = cfg.sf_vec_size
+        a_dtype = _cutlass_data_dtype(cfg.dtype_a)
+        b_dtype = _cutlass_data_dtype(cfg.dtype_b)
+        sf_vec_size = cfg.input_sf_block_size_a
 
         sf_k = in_hidden // sf_vec_size
 
@@ -1864,14 +2382,10 @@ def reference_check(
                 total_tokens=total_tokens,
                 total_padded_tokens=total_padded_tokens,
                 sf_k=sf_k,
-                weight_dtype_kind=(
-                    cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind
-                ),
-                activation_dtype_kind=(
-                    cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind
-                ),
+                weight_dtype_kind=(cfg.dtype_a if cfg.is_swap_ab else cfg.dtype_b),
+                activation_dtype_kind=(cfg.dtype_b if cfg.is_swap_ab else cfg.dtype_a),
                 uses_mx=cfg.uses_mx_scale_factors,
-                sf_vec=cfg.sf_vec_size,
+                sf_vec=cfg.input_sf_block_size_a,
                 weight_sf_layout=weight_sf_layout,
                 activation_sf_layout=activation_sf_layout,
                 has_routed_sfs=cfg.has_routed_sfs,
@@ -1882,13 +2396,13 @@ def reference_check(
         else:
             weights_torch = _random_quantized_tensor(
                 (num_experts, out_hidden, in_hidden),
-                dtype_kind=cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind,
+                dtype_kind=cfg.dtype_a if cfg.is_swap_ab else cfg.dtype_b,
                 fan_in=in_hidden,
                 device=device,
             )
             activation_compact_torch = _random_quantized_tensor(
                 (total_tokens, in_hidden),
-                dtype_kind=cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind,
+                dtype_kind=cfg.dtype_b if cfg.is_swap_ab else cfg.dtype_a,
                 fan_in=in_hidden,
                 device=device,
             )
@@ -1932,6 +2446,19 @@ def reference_check(
             else _expand_fp4_activations(activation_compact_torch, token_layout)
         )
 
+    if all_zero_input_data:
+        # Zero both compact and expanded activation storage: routed kernels use
+        # the former, while non-routed kernels consume the latter. Applying the
+        # distribution before weight/SF preprocessing lets every shuffled or
+        # block-major representation inherit the zero values.
+        _zero_input_data_tensors(
+            weights_torch,
+            activation_compact_torch,
+            activations_torch,
+            sf_weights,
+            sf_activations,
+        )
+
     # --- Map to kernel GEMM dimensions ---
     # Kernel computes C[M,N] = A[M,K] × B[N,K]^T per expert.
     # swapAB:     A=weights(out_hidden×in_hidden), B=activations(tokens×in_hidden)
@@ -1946,10 +2473,22 @@ def reference_check(
     if is_gated:
         preprocessed_weights = reorder_rows_for_gated_act(weights_torch)
 
+    if declared_padded_tokens > total_padded_tokens and not cfg.has_routed_act:
+        # Expanded activations are indexed by padded token row, so widening the
+        # declared token extent also widens the operand. Tail rows stay zero.
+        # Build the wider buffer by hand because F.pad rejects FP8 operands.
+        widened_activations = torch.zeros(
+            (declared_padded_tokens, activations_torch.shape[1]),
+            dtype=activations_torch.dtype,
+            device=activations_torch.device,
+        )
+        widened_activations[: activations_torch.shape[0]] = activations_torch
+        activations_torch = widened_activations
+
     if cfg.is_swap_ab:
-        M, N, K, L = out_hidden, total_padded_tokens, in_hidden, num_experts
+        M, N, K, L = out_hidden, declared_padded_tokens, in_hidden, num_experts
         # Shuffle weight rows for the 16x256b T2R epilogue pattern.
-        shuffled_weights = shuffle_matrix(preprocessed_weights, cfg.tile_m)
+        shuffled_weights = shuffle_matrix(preprocessed_weights, cfg.epi_tile_m)
         kernel_a = _block_major_k_weight_tensor(shuffled_weights, cfg)
         kernel_b = activations_torch
         sf_a = _kernel_weight_sf(
@@ -1960,16 +2499,16 @@ def reference_check(
             num_experts=num_experts,
             is_gated=is_gated,
             weight_sf_layout=weight_sf_layout,
-            shuffle_for_swap_ab=(not cfg.has_deepseek_fp8),
+            shuffle_weight_rows=(not cfg.use_deepseek_fp8),
         )
         sf_b = sf_activations
     else:
         M, N, K, L = total_padded_tokens, out_hidden, in_hidden, num_experts
         kernel_a = activations_torch
-        kernel_b = _block_major_k_weight_tensor(
-            shuffle_matrix(preprocessed_weights, 128),
-            cfg,
-        )
+        kernel_weights = preprocessed_weights
+        if cfg.uses_shuffled_matrix:
+            kernel_weights = shuffle_matrix(kernel_weights, cfg.epi_tile_m)
+        kernel_b = _block_major_k_weight_tensor(kernel_weights, cfg)
         sf_a = sf_activations
         sf_b = _kernel_weight_sf(
             sf_weights,
@@ -1979,21 +2518,64 @@ def reference_check(
             num_experts=num_experts,
             is_gated=is_gated,
             weight_sf_layout=weight_sf_layout,
-            shuffle_for_swap_ab=True,
+            shuffle_weight_rows=(cfg.uses_shuffled_matrix and not cfg.use_deepseek_fp8),
         )
 
     logical_output_m, logical_output_n = _logical_output_shape(cfg, M, N, is_gated)
     plain_output_dtype = _plain_output_torch_dtype(cfg)
-    if cfg.has_epilogue_quant:
+    c_pitch = int(c_row_stride) if c_row_stride else logical_output_m
+    sf_c_m_offset = 0
+    if c_row_stride:
+        if not cfg.is_swap_ab:
+            raise ValueError("c_row_stride reference checks cover swapAB only")
+        if c_pitch < logical_output_m:
+            raise ValueError(
+                f"c_row_stride={c_pitch} is narrower than the output width "
+                f"{logical_output_m}"
+            )
+        if c_pitch % 32:
+            raise ValueError(
+                f"c_row_stride={c_pitch} must be a multiple of 32 "
+                "(the C layout applies cute.assume(stride, 32))"
+            )
+        if cfg.has_deepseek_fp8_c_scale:
+            raise ValueError(
+                "c_row_stride reference checks do not cover DeepSeek FP8 C scales"
+            )
+    if c_partition_offset:
+        if not c_row_stride:
+            raise ValueError("c_partition_offset requires c_row_stride")
+        if c_partition_offset % 32:
+            raise ValueError(
+                f"c_partition_offset={c_partition_offset} must be a multiple of 32"
+            )
+        if cfg.has_output_block_scaling:
+            if c_partition_offset % cfg.output_sf_block_size_c:
+                raise ValueError(
+                    f"block-scaled c_partition_offset={c_partition_offset} must be "
+                    "a multiple of the SF block width "
+                    f"{cfg.output_sf_block_size_c}"
+                )
+            sf_c_m_offset = c_partition_offset
+        if c_partition_offset + logical_output_m > c_pitch:
+            raise ValueError(
+                f"partition at offset {c_partition_offset} with width "
+                f"{logical_output_m} does not fit inside pitch {c_pitch}"
+            )
+    c_storage_elems = logical_output_n * c_pitch
+    c_touched = None
+    sf_c_touched = None
+    if cfg.has_output_block_scaling:
         if output_guard_elements > 0:
             raise ValueError("output_guard_elements is not supported with FP4 C output")
-        c_storage = torch.zeros(
-            (_quantized_c_numel(cfg, logical_output_m, logical_output_n),),
+        c_storage = torch.full(
+            (_quantized_c_numel(cfg, c_pitch, logical_output_n),),
+            _C_STRIDE_SENTINEL_U8 if c_row_stride else 0,
             dtype=torch.uint8,
             device=device,
         )
         c_torch = None
-        sf_c_torch = torch.zeros(
+        sf_c_torch = torch.full(
             (
                 _sf_c_numel(
                     logical_output_m,
@@ -2001,21 +2583,60 @@ def reference_check(
                     cfg.sf_layout_c,
                     cfg.output_sf_block_size_c,
                     is_swap_ab=cfg.is_swap_ab,
+                    pitch=c_pitch,
                 ),
             ),
+            _C_STRIDE_SENTINEL_U8 if c_row_stride else 0,
             dtype=torch.uint8,
             device=device,
         )
+        if c_row_stride:
+            m_idx = torch.arange(logical_output_m, device=device).view(-1, 1)
+            n_idx = torch.arange(logical_output_n, device=device).view(1, -1)
+            c_elem_idx = n_idx * c_pitch + m_idx
+            c_storage_idx = (
+                c_elem_idx if cfg.uses_mxfp8_output_quant else c_elem_idx // 2
+            )
+            c_storage_idx = c_storage_idx + (
+                c_partition_offset
+                if cfg.uses_mxfp8_output_quant
+                else c_partition_offset // 2
+            )
+            c_touched = torch.zeros_like(c_storage, dtype=torch.bool)
+            c_touched[c_storage_idx.reshape(-1)] = True
+            c_storage[c_touched] = 0
+
+            sf_idx = _sf_c_index_grid(
+                output_m=logical_output_m,
+                n=logical_output_n,
+                sf_layout_c=cfg.sf_layout_c,
+                sf_block_size=cfg.output_sf_block_size_c,
+                is_swap_ab=cfg.is_swap_ab,
+                device=device,
+                pitch=c_pitch,
+                m_offset=sf_c_m_offset,
+            )
+            sf_c_touched = torch.zeros_like(sf_c_torch, dtype=torch.bool)
+            sf_c_touched[sf_idx.reshape(-1)] = True
+            sf_c_torch[sf_c_touched] = 0
         output_guard_value = None
         c_guard = None
     elif cfg.uses_fp8_output:
         if output_guard_elements > 0:
             raise ValueError("output_guard_elements is not supported with FP8 C output")
-        c_storage = torch.zeros(
-            (logical_output_m * logical_output_n,),
+        c_storage = torch.full(
+            (c_storage_elems,),
+            _C_STRIDE_SENTINEL_U8 if c_row_stride else _C_UNWRITTEN_POISON_E4M3_U8,
             dtype=torch.uint8,
             device=device,
         )
+        if c_row_stride:
+            _partition_view(
+                c_storage[c_partition_offset:],
+                logical_output_m,
+                logical_output_n,
+                c_pitch,
+            ).fill_(_C_UNWRITTEN_POISON_E4M3_U8)
         c_torch = None
         if cfg.has_deepseek_fp8_c_scale:
             sf_c_torch = torch.zeros(
@@ -2056,26 +2677,31 @@ def reference_check(
                 logical_output_m,
                 logical_output_n,
             )
-        c_torch.zero_()
+        c_torch.fill_(_C_UNWRITTEN_POISON_F)
         c_guard = c_storage[logical_output_m * logical_output_n :]
         sf_c_torch = torch.zeros((1,), dtype=torch.uint8, device=device)
     else:
         output_guard_value = None
         c_guard = None
         if cfg.is_swap_ab:
-            c_storage = torch.zeros(
-                (logical_output_m * logical_output_n,),
+            c_storage = torch.full(
+                (c_storage_elems,),
+                _C_STRIDE_SENTINEL_F if c_row_stride else _C_UNWRITTEN_POISON_F,
                 dtype=plain_output_dtype,
                 device=device,
             )
-            c_torch = torch.as_strided(
-                c_storage,
-                (logical_output_m, logical_output_n),
-                (1, logical_output_m),
+            c_torch = _partition_view(
+                c_storage[c_partition_offset:],
+                logical_output_m,
+                logical_output_n,
+                c_pitch,
             )
+            if c_row_stride:
+                c_torch.fill_(_C_UNWRITTEN_POISON_F)
         else:
-            c_torch = torch.zeros(
+            c_torch = torch.full(
                 (logical_output_m, logical_output_n),
+                _C_UNWRITTEN_POISON_F,
                 dtype=plain_output_dtype,
                 device=device,
             )
@@ -2090,6 +2716,9 @@ def reference_check(
     else:
         bias_logical_torch = torch.zeros((L, M), dtype=torch.float32, device=device)
         bias_torch = bias_logical_torch
+    if all_zero_input_data:
+        # TRTLLM-gen's allZeros distribution also clears an enabled bias.
+        _zero_input_data_tensors(bias_logical_torch, bias_torch)
     scale_c_torch = torch.full((L,), scale_c_value, dtype=torch.float32, device=device)
     scale_gate_torch = torch.full(
         (L,), scale_gate_value, dtype=torch.float32, device=device
@@ -2113,7 +2742,6 @@ def reference_check(
         device=device,
     )
 
-    num_token_tiles = token_layout.num_token_tiles
     tile_idx_list, mn_limit_list, route_map_list = _launch_metadata_lists(
         cfg,
         token_layout,
@@ -2144,7 +2772,7 @@ def reference_check(
     else:
         sfb_dp = b_dp  # unused
 
-    if cfg.has_epilogue_quant or cfg.uses_fp8_output:
+    if cfg.has_output_block_scaling or cfg.uses_fp8_output:
         c_dtype = (
             cutlass.Float8E4M3FN
             if cfg.uses_mxfp8_output_quant or cfg.uses_fp8_output
@@ -2152,7 +2780,13 @@ def reference_check(
         )
         c_dp = make_ptr(
             c_dtype,
-            c_storage.data_ptr(),
+            c_storage[
+                (
+                    c_partition_offset
+                    if cfg.uses_mxfp8_output_quant or cfg.uses_fp8_output
+                    else c_partition_offset // 2
+                ) :
+            ].data_ptr(),
             cutlass.AddressSpace.gmem,
             assumed_align=16,
         )
@@ -2228,6 +2862,13 @@ def reference_check(
             .uniform_(0.75, 1.25)
             .to(per_token_dtype)
         )
+    if all_zero_input_data:
+        # Dummy scale buffers stay at one; only scale factors enabled by the
+        # kernel configuration are part of the input-data distribution.
+        _zero_input_data_tensors(
+            per_token_sf_a_torch if cfg.has_per_token_sf_a else None,
+            per_token_sf_b_torch if cfg.has_per_token_sf_b else None,
+        )
     per_token_cutlass_dtype = _per_token_cutlass_dtype(cfg)
     per_token_sf_a_dp = make_ptr(
         per_token_cutlass_dtype,
@@ -2268,7 +2909,7 @@ def reference_check(
         cutlass.Int32, mn_limit.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
     )
     num_non_exiting_ctas = torch.tensor(
-        [num_token_tiles // cfg.token_metadata_stride], dtype=torch.int32, device=device
+        [token_layout.num_token_cgas, 0, 0], dtype=torch.int32, device=device
     )
     num_non_exiting_ctas_dp = make_ptr(
         cutlass.Int32,
@@ -2298,6 +2939,8 @@ def reference_check(
     # Package the launch pointers so the shared compile/launch helpers can be
     # reused (same single ``cute.compile`` path as compile/benchmark).
     ref_io = {
+        "c_row_stride": c_row_stride,
+        "sf_c_m_offset": sf_c_m_offset,
         "a_dp": a_dp,
         "b_dp": b_dp,
         "sfa_dp": sfa_dp,
@@ -2335,42 +2978,103 @@ def reference_check(
         if repeat_launches > 1:
             output_tensor = (
                 c_storage
-                if (cfg.has_epilogue_quant or cfg.uses_fp8_output)
+                if (cfg.has_output_block_scaling or cfg.uses_fp8_output)
                 else c_torch
             )
             if first_output is None:
                 first_output = output_tensor.detach().clone()
-                if cfg.has_epilogue_quant or cfg.has_deepseek_fp8_c_scale:
+                if cfg.has_output_block_scaling or cfg.has_deepseek_fp8_c_scale:
                     first_scale = sf_c_torch.detach().clone()
             else:
-                outputs_deterministic &= torch.equal(first_output, output_tensor)
+                outputs_deterministic &= _same_launch_output(
+                    first_output, output_tensor
+                )
                 if first_scale is not None:
-                    scales_deterministic &= torch.equal(first_scale, sf_c_torch)
+                    scales_deterministic &= _same_launch_output(first_scale, sf_c_torch)
+
+    runtime_cga_shapes_ok = True
+    if require_mixed_cga_runtime:
+        preferred_cgas, fallback_cgas = num_non_exiting_ctas[1:].detach().cpu().tolist()
+        print(
+            "Runtime physical CGAs: "
+            f"preferred={preferred_cgas}, fallback={fallback_cgas}"
+        )
+        observed_both_shapes = preferred_cgas > 0 and fallback_cgas > 0
+        if not observed_both_shapes:
+            print("FAIL: launch did not exercise both preferred and fallback CGAs")
+
+        problem_m_tiles = (M + cfg.tile_m - 1) // cfg.tile_m
+        problem_n_tiles = (N + cfg.tile_n - 1) // cfg.tile_n
+        if cfg.use_early_exit:
+            if cfg.is_swap_ab:
+                problem_n_tiles = launch_early_exit_max_token_ctas
+            else:
+                problem_m_tiles = launch_early_exit_max_token_ctas
+        logical_work_cgas = (
+            (problem_m_tiles + cfg.umma_cta_count - 1) // cfg.umma_cta_count
+        ) * problem_n_tiles
+        preferred_size = math.prod(cfg.preferred_cluster_shape)
+        fallback_size = math.prod(cfg.fallback_cluster_shape)
+        physical_grid_ctas = (
+            preferred_cgas * preferred_size + fallback_cgas * fallback_size
+        )
+        (preferred_work, preferred_wave), (fallback_work, fallback_wave) = (
+            _mixed_cga_wave_counts(
+                logical_work_cgas=logical_work_cgas,
+                physical_grid_ctas=physical_grid_ctas,
+                umma_cta_count=cfg.umma_cta_count,
+                preferred_shape=cfg.preferred_cluster_shape,
+                fallback_shape=cfg.fallback_cluster_shape,
+            )
+        )
+        print(
+            "Persistent physical-CGA work/wave counts: "
+            f"preferred={preferred_work}/{preferred_wave}, "
+            f"fallback={fallback_work}/{fallback_wave}"
+        )
+        has_multiwave_work = (
+            preferred_work > preferred_wave and fallback_work > fallback_wave
+        )
+        if not has_multiwave_work:
+            print(
+                "FAIL: logical work does not exceed one persistent-grid wave "
+                "for both physical CGA shapes"
+            )
+        runtime_cga_shapes_ok = observed_both_shapes and has_multiwave_work
     # Unload the per-check CUDA library at a deterministic point after the
     # launch is synchronized. Letting Python GC do this later can overlap
     # library unload with the next clustered persistent compile/launch.
     del compiled_fn
     gc.collect()
 
-    if cfg.has_epilogue_quant:
+    if cfg.has_output_block_scaling:
+        c_storage_offset = (
+            c_partition_offset
+            if cfg.uses_mxfp8_output_quant
+            else c_partition_offset // 2
+        )
         if cfg.uses_mxfp8_output_quant:
             c_logical = _dequantize_mxfp8_output(
-                c_storage,
+                c_storage[c_storage_offset:],
                 sf_c_torch,
                 output_m=logical_output_m,
                 n=logical_output_n,
                 is_swap_ab=cfg.is_swap_ab,
                 sf_layout_c=cfg.sf_layout_c,
+                pitch=c_pitch,
+                sf_c_m_offset=sf_c_m_offset,
             )
         else:
             c_logical = _dequantize_fp4_output(
-                c_storage,
+                c_storage[c_storage_offset:],
                 sf_c_torch,
                 output_m=logical_output_m,
                 n=logical_output_n,
                 is_swap_ab=cfg.is_swap_ab,
                 sf_layout_c=cfg.sf_layout_c,
                 uses_mxfp4=cfg.uses_mxfp4_output_quant,
+                pitch=c_pitch,
+                sf_c_m_offset=sf_c_m_offset,
             )
     elif cfg.has_deepseek_fp8_c_scale:
         c_logical = _dequantize_dsfp8_output(
@@ -2379,13 +3083,15 @@ def reference_check(
             output_m=logical_output_m,
             n=logical_output_n,
             is_swap_ab=cfg.is_swap_ab,
+            scale_stride=total_padded_tokens if cfg.is_swap_ab else None,
         )
     elif cfg.uses_fp8_output:
         c_logical = _decode_fp8_output(
-            c_storage,
+            c_storage[c_partition_offset:],
             output_m=logical_output_m,
             n=logical_output_n,
             is_swap_ab=cfg.is_swap_ab,
+            pitch=c_pitch,
         )
     else:
         c_logical = c_torch
@@ -2394,14 +3100,76 @@ def reference_check(
     print(
         f"Output sample (first 8 elements): {c_logical[0, : min(8, logical_output_n)]}"
     )
-    print(f"Output max: {c_logical.abs().max().item()}")
+    # C is poisoned with NaN, and the inactive padded-token tail is legitimately
+    # never written, so summarize over the elements that carry a stored value.
+    c_finite = c_logical[torch.isfinite(c_logical)]
+    print(
+        f"Output max: {c_finite.abs().max().item() if c_finite.numel() else 'none'}"
+        f" (over {c_finite.numel()}/{c_logical.numel()} stored elements)"
+    )
+
+    def _return_diagnostics(
+        passed: bool,
+        *,
+        max_abs: float | None = None,
+        mean_abs: float | None = None,
+        max_rel: float | None = None,
+        threshold: float | None = None,
+        nan_count: int = 0,
+        inf_count: int = 0,
+        error: str | None = None,
+        reason: str | None = None,
+    ):
+        diagnostics = ReferenceCheckDiagnostics(
+            passed=passed,
+            max_abs=max_abs,
+            mean_abs=mean_abs,
+            max_rel=max_rel,
+            threshold=threshold,
+            nan_count=nan_count,
+            inf_count=inf_count,
+            error=error,
+            reason=reason,
+        )
+        if return_output:
+            return diagnostics, c_logical.detach().clone()
+        return diagnostics
+
+    if c_row_stride:
+        if c_touched is None:
+            c_touched = torch.zeros_like(c_storage, dtype=torch.bool)
+            _partition_view(
+                c_touched[c_partition_offset:],
+                logical_output_m,
+                logical_output_n,
+                c_pitch,
+            ).fill_(True)
+        expect = (
+            _C_STRIDE_SENTINEL_U8
+            if cfg.has_output_block_scaling or cfg.uses_fp8_output
+            else _C_STRIDE_SENTINEL_F
+        )
+        if (c_storage.reshape(-1)[~c_touched] != expect).any().item():
+            print("Strided output wrote outside its partition")
+            return _return_diagnostics(
+                False, reason="strided output wrote outside its partition"
+            )
+        if (
+            sf_c_touched is not None
+            and (sf_c_torch.reshape(-1)[~sf_c_touched] != _C_STRIDE_SENTINEL_U8)
+            .any()
+            .item()
+        ):
+            print("Strided SF output wrote outside its partition")
+            return _return_diagnostics(
+                False, reason="strided scale output wrote outside its partition"
+            )
+
     if output_guard_elements > 0:
         guard_changed = (c_guard != output_guard_value).any().item()
         print(f"Output guard changed: {guard_changed}")
         if guard_changed:
-            if return_output:
-                return False, c_logical.detach().clone()
-            return False
+            return _return_diagnostics(False, reason="output guard was modified")
 
     # Routed MoE kernels are only required to write rows/columns that map to
     # real tokens. Expert padding remains outside the observable output, so do
@@ -2414,6 +3182,10 @@ def reference_check(
 
     def _active_routes(output):
         token_dim = 1 if cfg.is_swap_ab else 0
+        # A declared capacity wider than the routed count leaves a tail the
+        # kernel never writes, so drop it before selecting the routed rows.
+        if output.shape[token_dim] > active_route_mask.numel():
+            output = output.narrow(token_dim, 0, active_route_mask.numel())
         if output.shape[token_dim] != active_route_mask.numel():
             raise AssertionError(
                 "output token extent does not match routed metadata: "
@@ -2425,20 +3197,33 @@ def reference_check(
 
     # --- PyTorch reference ---
     c_active = _active_routes(c_logical)
-    has_nan = torch.isnan(c_active).any().item()
-    has_inf = torch.isinf(c_active).any().item()
-
-    def _return(result):
-        if return_output:
-            return result, c_logical.detach().clone()
-        return result
+    nan_count = int(torch.isnan(c_active).sum().item())
+    inf_count = int(torch.isinf(c_active).sum().item())
+    has_nan = nan_count > 0
+    has_inf = inf_count > 0
 
     if not outputs_deterministic or not scales_deterministic:
         print(
             "FAIL: repeated launches are nondeterministic "
             f"(output={outputs_deterministic}, scale={scales_deterministic})"
         )
-        return _return(False)
+        return _return_diagnostics(
+            False,
+            nan_count=nan_count,
+            inf_count=inf_count,
+            reason=(
+                "repeated launches were nondeterministic "
+                f"(output={outputs_deterministic}, scale={scales_deterministic})"
+            ),
+        )
+
+    if not runtime_cga_shapes_ok:
+        return _return_diagnostics(
+            False,
+            nan_count=nan_count,
+            inf_count=inf_count,
+            reason="runtime CGA shape validation failed",
+        )
 
     if has_nan or has_inf:
         print(f"FAIL: output has NaN={has_nan}, Inf={has_inf}")
@@ -2446,7 +3231,27 @@ def reference_check(
         bad_count = bad_mask.sum().item()
         bad_indices = bad_mask.nonzero(as_tuple=False)[:8].detach().cpu().tolist()
         print(f"Bad value count: {bad_count}, first indices: {bad_indices}")
-        return _return(False)
+        if has_nan:
+            # C is poisoned with NaN before the launch, so a NaN here is either
+            # a computed NaN or an element the epilogue never stored. Report the
+            # M extents affected: a store that drops part of a tile leaves a
+            # regular stride of M spans, which a computed NaN would not.
+            m_dim = 0 if cfg.is_swap_ab else 1
+            nan_m = torch.nonzero(torch.isnan(c_active).any(dim=1 - m_dim)).flatten()
+            print(
+                f"NaN M extents: {nan_m.numel()}/{c_active.shape[m_dim]}"
+                + (
+                    f", first={int(nan_m[0])} last={int(nan_m[-1])}"
+                    if nan_m.numel()
+                    else ""
+                )
+            )
+        return _return_diagnostics(
+            False,
+            nan_count=nan_count,
+            inf_count=inf_count,
+            reason="output contains NaN or Inf values",
+        )
 
     def _per_token_sf_b_ref_index(expanded_idx, token_idx):
         # Routed kernels load per-token SF-B through route_map; non-routed
@@ -2476,10 +3281,10 @@ def reference_check(
         weights_ref = _dequantize_block_scaled_tensor(
             weights_torch,
             sf_weights,
-            dtype_kind=cfg.dtype_a_kind,
+            dtype_kind=cfg.dtype_a,
             logical_cols=in_hidden,
             layout=weight_sf_layout,
-            sf_vec_size=cfg.sf_vec_size,
+            sf_vec_size=cfg.input_sf_block_size_a,
             sf_torch_dtype=_sf_torch_dtype(cfg),
         )
         ref_gemm = torch.zeros((M, N), dtype=torch.float32, device=device)
@@ -2493,8 +3298,8 @@ def reference_check(
             else:
                 ref_gemm[expanded_idx, :] = act_row @ weights_ref[expert_idx, :, :].T
     elif cfg.is_fp8_mma:
-        weight_dtype_kind = cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind
-        activation_dtype_kind = cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind
+        weight_dtype_kind = cfg.dtype_a if cfg.is_swap_ab else cfg.dtype_b
+        activation_dtype_kind = cfg.dtype_b if cfg.is_swap_ab else cfg.dtype_a
         weights_ref = _decode_quantized_storage(
             weights_torch,
             dtype_kind=weight_dtype_kind,
@@ -2505,7 +3310,7 @@ def reference_check(
             dtype_kind=activation_dtype_kind,
             logical_cols=in_hidden,
         )
-        if cfg.has_deepseek_fp8:
+        if cfg.use_deepseek_fp8:
             ref_gemm = compute_reference_dsfp8(
                 cfg=cfg,
                 weights_ref=weights_ref,
@@ -2536,46 +3341,72 @@ def reference_check(
                         value = value * per_token_sf_b_torch[:N].float()
                     ref_gemm[expanded_idx, :] = value
     else:
-        weight_dtype_kind = cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind
-        activation_dtype_kind = cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind
-        weights_ref = _dequantize_block_scaled_tensor(
-            weights_torch,
-            sf_weights,
-            dtype_kind=weight_dtype_kind,
+        weight_dtype_kind = cfg.dtype_a if cfg.is_swap_ab else cfg.dtype_b
+        activation_dtype_kind = cfg.dtype_b if cfg.is_swap_ab else cfg.dtype_a
+        decoded_activations = _decode_quantized_storage(
+            activation_compact_torch,
+            dtype_kind=activation_dtype_kind,
             logical_cols=in_hidden,
-            layout=weight_sf_layout,
-            sf_vec_size=cfg.sf_vec_size,
-            sf_torch_dtype=_sf_torch_dtype(cfg),
         )
         ref_gemm = torch.zeros((M, N), dtype=torch.float32, device=device)
+        routed_rows_by_expert = {}
         for expanded_idx, expert_idx in enumerate(token_layout.expanded_to_expert):
             if expert_idx < 0:
                 continue
             token_idx = token_layout.expanded_to_token[expanded_idx]
-            act_row = _dequantize_block_scaled_activation_row(
-                activation_compact_torch,
-                sf_activations,
-                dtype_kind=activation_dtype_kind,
-                logical_cols=in_hidden,
-                token_idx=token_idx,
-                expanded_idx=expanded_idx,
+            routed_rows_by_expert.setdefault(expert_idx, []).append(
+                (expanded_idx, token_idx)
+            )
+
+        for expert_idx, routed_rows in routed_rows_by_expert.items():
+            weights_ref = _dequantize_block_scaled_expert(
+                weights_torch,
+                sf_weights,
                 expert_idx=expert_idx,
-                cfg=cfg,
-                activation_sf_layout=activation_sf_layout,
-                num_experts=num_experts,
-                sf_k=sf_k,
+                dtype_kind=weight_dtype_kind,
+                logical_cols=in_hidden,
+                layout=weight_sf_layout,
+                sf_vec_size=cfg.input_sf_block_size_a,
+                sf_torch_dtype=_sf_torch_dtype(cfg),
+            )
+            expanded_indices = torch.tensor(
+                [expanded_idx for expanded_idx, _ in routed_rows],
+                dtype=torch.long,
+                device=device,
+            )
+            activation_rows = torch.stack(
+                [
+                    _dequantize_block_scaled_activation_row(
+                        decoded_activations,
+                        sf_activations,
+                        token_idx=token_idx,
+                        expanded_idx=expanded_idx,
+                        cfg=cfg,
+                        activation_sf_layout=activation_sf_layout,
+                        sf_k=sf_k,
+                    )
+                    for expanded_idx, token_idx in routed_rows
+                ]
             )
             if cfg.is_swap_ab:
-                value = weights_ref[expert_idx, :, :] @ act_row
+                value = weights_ref @ activation_rows.T
                 if cfg.has_per_token_sf_b:
-                    sf_idx = _per_token_sf_b_ref_index(expanded_idx, token_idx)
-                    value = value * per_token_sf_b_torch[sf_idx].float()
-                ref_gemm[:, expanded_idx] = value
+                    sf_indices = torch.tensor(
+                        [
+                            _per_token_sf_b_ref_index(expanded_idx, token_idx)
+                            for expanded_idx, token_idx in routed_rows
+                        ],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    value = value * per_token_sf_b_torch[sf_indices].float().view(1, -1)
+                ref_gemm[:, expanded_indices] = value
             else:
-                value = act_row @ weights_ref[expert_idx, :, :].T
+                value = activation_rows @ weights_ref.T
                 if cfg.has_per_token_sf_b:
                     value = value * per_token_sf_b_torch[:N].float()
-                ref_gemm[expanded_idx, :] = value
+                ref_gemm[expanded_indices, :] = value
+            del weights_ref
 
     if cfg.has_per_token_sf_a:
         if cfg.is_swap_ab:
@@ -2636,6 +3467,7 @@ def reference_check(
     is_situ = cfg.act_kind == int(ActKind.SITU)
     is_gated = _is_gated_act_kind(cfg.act_kind)
     is_relu2 = cfg.act_kind == int(ActKind.RELU2)
+    is_silu = cfg.act_kind == int(ActKind.SILU)
 
     if is_gated:
         # Gated activation: weights are logically [gate-half, up-half].
@@ -2714,30 +3546,43 @@ def reference_check(
         ref_torch = activated * _expert_scale_like(activated.shape, scale_c_torch)
         if cfg.uses_fp8_output:
             ref_torch = ref_torch.to(torch.float8_e4m3fn).float()
-        elif not cfg.has_epilogue_quant:
+        elif not cfg.has_output_block_scaling:
             ref_torch = ref_torch.to(plain_output_dtype)
         c_compare = c_logical
-    elif is_relu2:
-        ref_torch = torch.clamp(ref_gemm.float(), min=0).pow(2)
+    elif is_relu2 or is_silu:
+        ref_torch = ref_gemm.float()
+        if cfg.uses_global_scales:
+            ref_torch = ref_torch * _expert_scale_like(
+                ref_torch.shape, scale_gate_torch
+            )
+        if is_relu2:
+            ref_torch = torch.clamp(ref_torch, min=0).pow(2)
+        else:
+            ref_torch = torch.nn.functional.silu(ref_torch)
         ref_torch = ref_torch * _expert_scale_like(ref_torch.shape, scale_c_torch)
         if cfg.uses_fp8_output:
             ref_torch = ref_torch.to(torch.float8_e4m3fn).float()
-        elif not cfg.has_epilogue_quant:
+        elif not cfg.has_output_block_scaling:
             ref_torch = ref_torch.to(plain_output_dtype)
         c_compare = c_logical
     else:
         ref_torch = ref_gemm.float() * _expert_scale_like(ref_gemm.shape, scale_c_torch)
         if cfg.uses_fp8_output:
             ref_torch = ref_torch.to(torch.float8_e4m3fn).float()
-        elif not cfg.has_epilogue_quant:
+        elif not cfg.has_output_block_scaling:
             ref_torch = ref_torch.to(plain_output_dtype)
         c_compare = c_logical
 
     if cfg.has_deepseek_fp8_c_scale:
+        # The epilogue packs scale blocks at the routed padded token stride, so
+        # a wider declared capacity leaves an unwritten tail past that prefix.
+        sf_c_ref_source = ref_torch.float()
+        if cfg.is_swap_ab and declared_padded_tokens > total_padded_tokens:
+            sf_c_ref_source = sf_c_ref_source[:, :total_padded_tokens]
         expected_sf_c = _reference_dsfp8_c_scales(
-            ref_torch.float(), is_swap_ab=cfg.is_swap_ab
+            sf_c_ref_source, is_swap_ab=cfg.is_swap_ab
         )
-        sf_c_diff = (sf_c_torch.float() - expected_sf_c).abs()
+        sf_c_diff = (sf_c_torch.float()[: expected_sf_c.numel()] - expected_sf_c).abs()
         sf_c_max_abs = sf_c_diff.max().item()
         sf_c_ref_max = expected_sf_c.abs().max().item()
         sf_c_threshold = 1.0e-2 + 1.0e-2 * sf_c_ref_max
@@ -2750,13 +3595,26 @@ def reference_check(
                 "Reference check: FAILED "
                 f"(DeepSeek C scale max_abs={sf_c_max_abs:.6f} > {sf_c_threshold:.6f})"
             )
-            return _return(False)
+            return _return_diagnostics(
+                False,
+                max_abs=sf_c_max_abs,
+                threshold=sf_c_threshold,
+                nan_count=nan_count,
+                inf_count=inf_count,
+                reason="DeepSeek output scale comparison failed",
+            )
 
     c_compare_active = _active_routes(c_compare)
     ref_active = _active_routes(ref_torch)
     diff = (c_compare_active.float() - ref_active.float()).abs()
     max_abs = diff.max().item()
     mean_abs = diff.mean().item()
+    nonzero_ref = ref_active.float().abs() > 0
+    max_rel = None
+    if nonzero_ref.any().item():
+        max_rel = (
+            (diff[nonzero_ref] / ref_active.float().abs()[nonzero_ref]).max().item()
+        )
     ref_max = ref_active.float().abs().max().item()
     out_max = c_compare_active.float().abs().max().item()
     print(
@@ -2766,12 +3624,12 @@ def reference_check(
     if cfg.has_cast_a and cfg.is_swap_ab:
         # Operates on the actual output rows: gated activations halve the logical
         # output (M//2), so index by logical_output_m, not the full M.
-        shuffled_ref = shuffle_matrix(ref_torch, cfg.tile_m)
+        shuffled_ref = shuffle_matrix(ref_torch, cfg.epi_tile_m)
         unshuffle_idx = torch.empty(
             (logical_output_m,), dtype=torch.long, device=device
         )
-        block_size = 32 if cfg.tile_m % 128 == 0 else 16
-        indices = _SHUFFLE_BLOCK_32 if block_size == 32 else _SHUFFLE_BLOCK_16
+        indices = shuffled_matrix_row_indices(cfg.epi_tile_m)
+        block_size = len(indices)
         for mi in range(logical_output_m):
             block_idx = mi // block_size
             src_in_block = mi % block_size
@@ -2790,7 +3648,7 @@ def reference_check(
 
     if cfg.is_bf16_mma:
         threshold = 1e-1
-    elif cfg.has_epilogue_quant:
+    elif cfg.has_output_block_scaling:
         threshold = 0.75 + 0.35 * ref_max
     else:
         threshold = 0.75 + 0.05 * ref_max
@@ -2800,17 +3658,43 @@ def reference_check(
             "Reference check: FAILED "
             f"(all-zero output with non-zero reference max {ref_max:.6f})"
         )
-        return _return(False)
+        return _return_diagnostics(
+            False,
+            max_abs=max_abs,
+            mean_abs=mean_abs,
+            max_rel=max_rel,
+            threshold=threshold,
+            nan_count=nan_count,
+            inf_count=inf_count,
+            reason="all-zero output with non-zero reference",
+        )
 
     if max_abs <= threshold:
         print(f"Reference check: PASSED (max_abs={max_abs:.6f} <= {threshold:.6f})")
-        return _return(True)
+        return _return_diagnostics(
+            True,
+            max_abs=max_abs,
+            mean_abs=mean_abs,
+            max_rel=max_rel,
+            threshold=threshold,
+            nan_count=nan_count,
+            inf_count=inf_count,
+        )
     max_flat = diff.argmax()
     max_coord = torch.unravel_index(max_flat, diff.shape)
     max_coord_host = tuple(int(v.detach().cpu().item()) for v in max_coord)
     print(f"Reference max-diff index: {max_coord_host}")
     print(f"Reference check: FAILED (max_abs={max_abs:.6f} > {threshold:.6f})")
-    return _return(False)
+    return _return_diagnostics(
+        False,
+        max_abs=max_abs,
+        mean_abs=mean_abs,
+        max_rel=max_rel,
+        threshold=threshold,
+        nan_count=nan_count,
+        inf_count=inf_count,
+        reason="maximum absolute error exceeded threshold",
+    )
 
 
 def _build_launch_io(
@@ -2818,15 +3702,19 @@ def _build_launch_io(
     num_experts,
     num_tokens,
     top_k,
+    routing="balanced_round_robin",
+    routing_seed=42,
     problem_n=None,
     problem_k=None,
     seed=42,
-    scale_c_value=1.0,
+    data_distribution="default",
+    scale_c_value=None,
     scale_gate_value=1.0,
     gemm1_alpha_value=None,
     gemm1_beta_value=None,
     gemm1_clamp_limit_value=2.0,
     early_exit_max_token_ctas=0,
+    weight_cache=None,
     **cfg_overrides,
 ):
     """Build all device tensors + pointers for a single kernel launch.
@@ -2836,7 +3724,9 @@ def _build_launch_io(
     of device pointers, the ``(M, N, K, L, num_tokens)`` problem shape, the
     resolved config, and a ``_keepalive`` list that pins the backing torch
     tensors alive for as long as the pointers are dereferenced.
+
     """
+    cfg_overrides = _resolve_runtime_sm_arch(cfg_overrides)
     launch_early_exit_max_token_ctas = resolve_early_exit_max_token_ctas(
         num_tokens=num_tokens,
         num_experts=num_experts,
@@ -2844,6 +3734,7 @@ def _build_launch_io(
         cfg_overrides=cfg_overrides,
         explicit_early_exit_max_token_ctas=early_exit_max_token_ctas,
     )
+    all_zero_input_data = _uses_all_zero_input_data(data_distribution)
     cfg = make_config(**cfg_overrides)
 
     torch.manual_seed(seed)
@@ -2857,20 +3748,28 @@ def _build_launch_io(
     out_hidden = problem_n if problem_n is not None else default_out_hidden
     in_hidden = problem_k if problem_k is not None else cfg.tile_k
     cfg = _runtime_config(cfg, in_hidden)
+    scale_c_value = _resolve_scale_c(
+        scale_c_value,
+        cfg=cfg,
+        in_hidden=in_hidden,
+        scale_gate_value=scale_gate_value,
+    )
     if cfg.is_swap_ab and out_hidden % cfg.tile_m != 0:
         raise ValueError(
             f"swapAB requires out_hidden to be a multiple of tile_m={cfg.tile_m}, "
             f"got {out_hidden}"
         )
 
-    token_tile_size = cfg.tile_n if cfg.is_swap_ab else cfg.tile_m
-    cluster_dim_in_token = cfg.token_metadata_stride
+    token_tile_size = cfg.token_tile_size
+    cluster_dim_in_token = cfg.token_cluster_dim
     token_layout = _make_token_layout(
         num_tokens=num_tokens,
         num_experts=num_experts,
         top_k=top_k,
         tile_size=token_tile_size,
         cluster_dim_in_token=cluster_dim_in_token,
+        routing=routing,
+        routing_seed=routing_seed,
     )
     launch_early_exit_max_token_ctas = _normalize_early_exit_launch_extent(
         cfg,
@@ -2878,16 +3777,60 @@ def _build_launch_io(
         launch_early_exit_max_token_ctas,
     )
     total_padded_tokens = token_layout.total_padded_tokens
+    if total_padded_tokens == 0:
+        raise ValueError(
+            "routing produced no assignments for the selected local expert slice"
+        )
+
+    weight_cache_key = None
+    cached_weight_io = None
+    if weight_cache is not None and not cfg.use_deepseek_fp8:
+        weight_sf_layout_key = (
+            None
+            if cfg.is_bf16_mma or cfg.is_fp8_mma
+            else (cfg.sf_layout_a if cfg.is_swap_ab else cfg.sf_layout_b)
+        )
+        weight_cache_key = (
+            "prims-ts-launch-weight-v1",
+            int(num_experts),
+            int(out_hidden),
+            int(in_hidden),
+            int(seed),
+            str(data_distribution),
+            int(cfg.dtype_a),
+            int(cfg.dtype_b),
+            bool(cfg.is_bf16_mma),
+            bool(cfg.has_cast_a),
+            bool(cfg.is_fp8_mma),
+            bool(cfg.is_swap_ab),
+            int(cfg.act_kind),
+            int(cfg.epi_tile_m),
+            bool(cfg.uses_shuffled_matrix),
+            int(getattr(cfg, "weight_layout", 0)),
+            bool(cfg.uses_block_major_k_weight),
+            int(cfg.block_major_k_bytes),
+            weight_sf_layout_key,
+            int(cfg.input_sf_block_size_a),
+        )
+        cached_weight_io = weight_cache.get(weight_cache_key)
+        move_to_end = getattr(weight_cache, "move_to_end", None)
+        if cached_weight_io is not None and move_to_end is not None:
+            move_to_end(weight_cache_key)
 
     # Create domain tensors. Routed kernels consume compact activation rows;
     # non-routed kernels consume the expanded/padded expert-token layout.
+    weights_torch = None
+    sf_weights = None
     if cfg.is_bf16_mma:
-        weights_torch = _kaiming_uniform_tensor(
-            (num_experts, out_hidden, in_hidden),
-            fan_in=in_hidden,
-            dtype=torch.bfloat16,
-            device=device,
-        )
+        if cached_weight_io is None:
+            weights_torch = _kaiming_uniform_tensor(
+                (num_experts, out_hidden, in_hidden),
+                fan_in=in_hidden,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+        if weight_cache_key is not None:
+            torch.manual_seed(seed + 1)
         activation_compact_torch = _kaiming_uniform_tensor(
             (num_tokens, in_hidden),
             fan_in=in_hidden,
@@ -2902,14 +3845,28 @@ def _build_launch_io(
         a_dtype = b_dtype = cutlass.BFloat16
         weight_sf_layout = None
         activation_sf_layout = None
-        sf_weights = sf_activations = None
+        sf_activations = None
     elif cfg.has_cast_a:
-        weights_torch = _random_quantized_tensor(
-            (num_experts, out_hidden, in_hidden),
-            dtype_kind=cfg.dtype_a_kind,
-            fan_in=in_hidden,
-            device=device,
-        )
+        weight_sf_layout = cfg.sf_layout_a
+        sf_k = in_hidden // cfg.input_sf_block_size_a
+        if cached_weight_io is None:
+            weights_torch = _random_quantized_tensor(
+                (num_experts, out_hidden, in_hidden),
+                dtype_kind=cfg.dtype_a,
+                fan_in=in_hidden,
+                device=device,
+            )
+            if weight_cache_key is not None:
+                sf_weights = _create_sf_tensor_mma_layout(
+                    num_experts=num_experts,
+                    mn=out_hidden,
+                    sf_k=sf_k,
+                    layout=weight_sf_layout,
+                    device=device,
+                    cfg=cfg,
+                )
+        if weight_cache_key is not None:
+            torch.manual_seed(seed + 1)
         activation_compact_torch = _kaiming_uniform_tensor(
             (num_tokens, in_hidden),
             fan_in=in_hidden,
@@ -2921,29 +3878,31 @@ def _build_launch_io(
             if cfg.has_routed_act
             else _expand_bf16_activations(activation_compact_torch, token_layout)
         )
-        a_dtype = _cutlass_data_dtype(cfg.dtype_a_kind)
+        a_dtype = _cutlass_data_dtype(cfg.dtype_a)
         b_dtype = cutlass.BFloat16
-        sf_k = in_hidden // cfg.sf_vec_size
-        weight_sf_layout = cfg.sf_layout_a
-        sf_weights = _create_sf_tensor_mma_layout(
-            num_experts=num_experts,
-            mn=out_hidden,
-            sf_k=sf_k,
-            layout=weight_sf_layout,
-            device=device,
-            cfg=cfg,
-        )
+        if sf_weights is None and cached_weight_io is None:
+            sf_weights = _create_sf_tensor_mma_layout(
+                num_experts=num_experts,
+                mn=out_hidden,
+                sf_k=sf_k,
+                layout=weight_sf_layout,
+                device=device,
+                cfg=cfg,
+            )
         sf_activations = None
     elif cfg.is_fp8_mma:
-        weights_torch = _random_quantized_tensor(
-            (num_experts, out_hidden, in_hidden),
-            dtype_kind=cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind,
-            fan_in=in_hidden,
-            device=device,
-        )
+        if cached_weight_io is None:
+            weights_torch = _random_quantized_tensor(
+                (num_experts, out_hidden, in_hidden),
+                dtype_kind=cfg.dtype_a if cfg.is_swap_ab else cfg.dtype_b,
+                fan_in=in_hidden,
+                device=device,
+            )
+        if weight_cache_key is not None:
+            torch.manual_seed(seed + 1)
         activation_compact_torch = _random_quantized_tensor(
             (num_tokens, in_hidden),
-            dtype_kind=cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind,
+            dtype_kind=cfg.dtype_b if cfg.is_swap_ab else cfg.dtype_a,
             fan_in=in_hidden,
             device=device,
         )
@@ -2952,12 +3911,12 @@ def _build_launch_io(
             if cfg.has_routed_act
             else _expand_fp4_activations(activation_compact_torch, token_layout)
         )
-        a_dtype = _cutlass_data_dtype(cfg.dtype_a_kind)
-        b_dtype = _cutlass_data_dtype(cfg.dtype_b_kind)
+        a_dtype = _cutlass_data_dtype(cfg.dtype_a)
+        b_dtype = _cutlass_data_dtype(cfg.dtype_b)
         weight_sf_layout = None
         activation_sf_layout = None
-        sf_weights = sf_activations = None
-        if cfg.has_deepseek_fp8:
+        sf_activations = None
+        if cfg.use_deepseek_fp8:
             sf_weights, sf_activations = _create_deepseek_fp8_sf_tensors(
                 cfg,
                 num_experts=num_experts,
@@ -2968,15 +3927,30 @@ def _build_launch_io(
                 device=device,
             )
     else:
-        weights_torch = _random_quantized_tensor(
-            (num_experts, out_hidden, in_hidden),
-            dtype_kind=cfg.dtype_a_kind if cfg.is_swap_ab else cfg.dtype_b_kind,
-            fan_in=in_hidden,
-            device=device,
-        )
+        sf_k = in_hidden // cfg.input_sf_block_size_a
+        activation_sf_layout = cfg.sf_layout_b if cfg.is_swap_ab else cfg.sf_layout_a
+        weight_sf_layout = cfg.sf_layout_a if cfg.is_swap_ab else cfg.sf_layout_b
+        if cached_weight_io is None:
+            weights_torch = _random_quantized_tensor(
+                (num_experts, out_hidden, in_hidden),
+                dtype_kind=cfg.dtype_a if cfg.is_swap_ab else cfg.dtype_b,
+                fan_in=in_hidden,
+                device=device,
+            )
+            if weight_cache_key is not None:
+                sf_weights = _create_sf_tensor_mma_layout(
+                    num_experts=num_experts,
+                    mn=out_hidden,
+                    sf_k=sf_k,
+                    layout=weight_sf_layout,
+                    device=device,
+                    cfg=cfg,
+                )
+        if weight_cache_key is not None:
+            torch.manual_seed(seed + 1)
         activation_compact_torch = _random_quantized_tensor(
             (num_tokens, in_hidden),
-            dtype_kind=cfg.dtype_b_kind if cfg.is_swap_ab else cfg.dtype_a_kind,
+            dtype_kind=cfg.dtype_b if cfg.is_swap_ab else cfg.dtype_a,
             fan_in=in_hidden,
             device=device,
         )
@@ -2985,11 +3959,8 @@ def _build_launch_io(
             if cfg.has_routed_act
             else _expand_fp4_activations(activation_compact_torch, token_layout)
         )
-        a_dtype = _cutlass_data_dtype(cfg.dtype_a_kind)
-        b_dtype = _cutlass_data_dtype(cfg.dtype_b_kind)
-        sf_k = in_hidden // cfg.sf_vec_size
-        activation_sf_layout = cfg.sf_layout_b if cfg.is_swap_ab else cfg.sf_layout_a
-        weight_sf_layout = cfg.sf_layout_a if cfg.is_swap_ab else cfg.sf_layout_b
+        a_dtype = _cutlass_data_dtype(cfg.dtype_a)
+        b_dtype = _cutlass_data_dtype(cfg.dtype_b)
         if cfg.has_routed_sfs:
             sf_activations = _create_sf_linear(
                 num_tokens=num_tokens,
@@ -2997,23 +3968,25 @@ def _build_launch_io(
                 device=device,
                 cfg=cfg,
             )
-            sf_weights = _create_sf_tensor_mma_layout(
-                num_experts=num_experts,
-                mn=out_hidden,
-                sf_k=sf_k,
-                layout=weight_sf_layout,
-                device=device,
-                cfg=cfg,
-            )
+            if sf_weights is None and cached_weight_io is None:
+                sf_weights = _create_sf_tensor_mma_layout(
+                    num_experts=num_experts,
+                    mn=out_hidden,
+                    sf_k=sf_k,
+                    layout=weight_sf_layout,
+                    device=device,
+                    cfg=cfg,
+                )
         else:
-            sf_weights = _create_sf_tensor_mma_layout(
-                num_experts=num_experts,
-                mn=out_hidden,
-                sf_k=sf_k,
-                layout=weight_sf_layout,
-                device=device,
-                cfg=cfg,
-            )
+            if sf_weights is None and cached_weight_io is None:
+                sf_weights = _create_sf_tensor_mma_layout(
+                    num_experts=num_experts,
+                    mn=out_hidden,
+                    sf_k=sf_k,
+                    layout=weight_sf_layout,
+                    device=device,
+                    cfg=cfg,
+                )
             sf_activations = _create_sf_tensor_mma_layout(
                 num_experts=1,
                 mn=total_padded_tokens,
@@ -3023,19 +3996,30 @@ def _build_launch_io(
                 cfg=cfg,
             )
 
-    is_gated = _is_gated_act_kind(cfg.act_kind)
-    preprocessed_weights = weights_torch
-    if is_gated:
-        preprocessed_weights = reorder_rows_for_gated_act(weights_torch)
-
-    if cfg.is_swap_ab:
-        M, N, K, L = out_hidden, total_padded_tokens, in_hidden, num_experts
-        kernel_a = _block_major_k_weight_tensor(
-            shuffle_matrix(preprocessed_weights, cfg.tile_m),
-            cfg,
+    if all_zero_input_data:
+        # This is the perf-path counterpart of reference_check's distribution
+        # handling. It covers packed FP4/FP8 and plain BF16 data plus all
+        # operand scale factors, while leaving token routing metadata intact.
+        _zero_input_data_tensors(
+            weights_torch if cached_weight_io is None else None,
+            activation_compact_torch,
+            activations_torch,
+            sf_weights if cached_weight_io is None else None,
+            sf_activations,
         )
-        kernel_b = activations_torch
-        sf_a = _kernel_weight_sf(
+
+    is_gated = _is_gated_act_kind(cfg.act_kind)
+    if cached_weight_io is None:
+        assert weights_torch is not None
+        preprocessed_weights = weights_torch
+        if is_gated:
+            preprocessed_weights = reorder_rows_for_gated_act(weights_torch)
+        kernel_weights = preprocessed_weights
+        shuffle_weight_rows = cfg.is_swap_ab or cfg.uses_shuffled_matrix
+        if shuffle_weight_rows:
+            kernel_weights = shuffle_matrix(kernel_weights, cfg.epi_tile_m)
+        kernel_weights = _block_major_k_weight_tensor(kernel_weights, cfg)
+        kernel_weight_sf = _kernel_weight_sf(
             sf_weights,
             cfg=cfg,
             out_hidden=out_hidden,
@@ -3043,31 +4027,31 @@ def _build_launch_io(
             num_experts=num_experts,
             is_gated=is_gated,
             weight_sf_layout=weight_sf_layout,
-            shuffle_for_swap_ab=(not cfg.has_deepseek_fp8),
+            shuffle_weight_rows=(shuffle_weight_rows and not cfg.use_deepseek_fp8),
         )
+        if weight_cache_key is not None:
+            weight_cache[weight_cache_key] = (kernel_weights, kernel_weight_sf)
+            while len(weight_cache) > 2:
+                weight_cache.pop(next(iter(weight_cache)))
+    else:
+        kernel_weights, kernel_weight_sf = cached_weight_io
+
+    if cfg.is_swap_ab:
+        M, N, K, L = out_hidden, total_padded_tokens, in_hidden, num_experts
+        kernel_a = kernel_weights
+        kernel_b = activations_torch
+        sf_a = kernel_weight_sf
         sf_b = sf_activations
     else:
         M, N, K, L = total_padded_tokens, out_hidden, in_hidden, num_experts
         kernel_a = activations_torch
-        kernel_b = _block_major_k_weight_tensor(
-            shuffle_matrix(preprocessed_weights, 128),
-            cfg,
-        )
+        kernel_b = kernel_weights
         sf_a = sf_activations
-        sf_b = _kernel_weight_sf(
-            sf_weights,
-            cfg=cfg,
-            out_hidden=out_hidden,
-            in_hidden=in_hidden,
-            num_experts=num_experts,
-            is_gated=is_gated,
-            weight_sf_layout=weight_sf_layout,
-            shuffle_for_swap_ab=True,
-        )
+        sf_b = kernel_weight_sf
 
     logical_output_m, logical_output_n = _logical_output_shape(cfg, M, N, is_gated)
     plain_output_dtype = _plain_output_torch_dtype(cfg)
-    if cfg.has_epilogue_quant:
+    if cfg.has_output_block_scaling:
         c_storage = torch.zeros(
             (_quantized_c_numel(cfg, logical_output_m, logical_output_n),),
             dtype=torch.uint8,
@@ -3163,7 +4147,7 @@ def _build_launch_io(
         )
     else:
         sfb_dp = b_dp
-    if cfg.has_epilogue_quant or cfg.uses_fp8_output:
+    if cfg.has_output_block_scaling or cfg.uses_fp8_output:
         c_dtype = (
             cutlass.Float8E4M3FN
             if cfg.uses_mxfp8_output_quant or cfg.uses_fp8_output
@@ -3258,6 +4242,11 @@ def _build_launch_io(
     per_token_sf_b_torch = torch.ones(
         (per_token_count,), dtype=per_token_dtype, device=device
     )
+    if all_zero_input_data:
+        _zero_input_data_tensors(
+            per_token_sf_a_torch if cfg.has_per_token_sf_a else None,
+            per_token_sf_b_torch if cfg.has_per_token_sf_b else None,
+        )
     per_token_cutlass_dtype = _per_token_cutlass_dtype(cfg)
     per_token_sf_a_dp = make_ptr(
         per_token_cutlass_dtype,
@@ -3282,9 +4271,7 @@ def _build_launch_io(
         cutlass.Int32, mn_limit.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16
     )
     num_non_exiting_ctas = torch.tensor(
-        [token_layout.num_token_tiles // cfg.token_metadata_stride],
-        dtype=torch.int32,
-        device=device,
+        [token_layout.num_token_cgas, 0, 0], dtype=torch.int32, device=device
     )
     num_non_exiting_ctas_dp = make_ptr(
         cutlass.Int32,
@@ -3313,7 +4300,7 @@ def _build_launch_io(
     # buffer is the packed quant/fp8 storage or the bf16 output tensor, selected
     # by the same condition used to build c0_dp above.
     c_backing = (
-        c_storage if (cfg.has_epilogue_quant or cfg.uses_fp8_output) else c_torch
+        c_storage if (cfg.has_output_block_scaling or cfg.uses_fp8_output) else c_torch
     )
     _keepalive = [
         tensor
@@ -3349,7 +4336,12 @@ def _build_launch_io(
         "K": K,
         "L": L,
         "num_tokens": num_tokens,
+        "requested_num_tokens": num_tokens,
         "total_padded_tokens": total_padded_tokens,
+        "token_layout": token_layout,
+        "routing": routing,
+        "routing_seed": routing_seed,
+        "resolved_scale_c": scale_c_value,
         "out_hidden": out_hidden,
         "in_hidden": in_hidden,
         "logical_output_m": logical_output_m,
@@ -3430,17 +4422,39 @@ def _compile_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_clamp_limit_dp"],
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
+        _c_row_stride(io),
+        int(io.get("sf_c_m_offset", 0)),
         io["cfg"],
         stream,
     )
 
 
+def _c_row_stride(io: dict) -> int:
+    """Row pitch of the C buffer in elements; defaults to this launch's width."""
+    v = io.get("c_row_stride")
+    if v:
+        return int(v)
+    m = int(io["shape"][0])
+    cfg = io["cfg"]
+    if cfg.is_swap_ab and cfg.has_gated_epilogue:
+        return m // 2
+    return m
+
+
 def _launch_arg_tuple(io: dict, stream) -> tuple:
     """Positional args for a runtime launch of the compiled kernel.
 
-    Mirrors the ``JitArguments`` order in :func:`benchmark`: the constexpr
-    ``cfg`` operand is omitted at launch time.
+    The single launch-argument order, shared by :func:`run` and the
+    ``JitArguments`` workspaces in :func:`benchmark`: same as
+    :func:`_compile_arg_tuple` minus the constexpr ``cfg`` operand.
     """
+    problem_m, problem_n = (int(value) for value in io["shape"][:2])
+    validate_launch_grid(
+        io["cfg"],
+        problem_m=problem_m,
+        problem_n=problem_n,
+        early_exit_max_token_ctas=int(io["launch_early_exit_max_token_ctas"]),
+    )
     return (
         io["a_dp"],
         io["b_dp"],
@@ -3464,6 +4478,8 @@ def _launch_arg_tuple(io: dict, stream) -> tuple:
         io["gemm1_clamp_limit_dp"],
         io["shape"],
         io["launch_early_exit_max_token_ctas"],
+        _c_row_stride(io),
+        int(io.get("sf_c_m_offset", 0)),
         stream,
     )
 
@@ -3555,105 +4571,52 @@ def FLOPS_FORMULA(
     k = problem_k if problem_k is not None else tile_k
     if n is None or k is None:
         return float("nan")
-    return 2.0 * num_tokens * top_k * n * k
+    routed_tokens = num_tokens * top_k
+    return 2.0 * routed_tokens * n * k
 
 
-def benchmark(
+def benchmark_compiled(
+    compiled_fn,
+    io: dict,
+    stream,
     *,
-    num_experts,
-    num_tokens,
-    top_k,
-    problem_n=None,
-    problem_k=None,
-    seed=42,
-    scale_c_value=1.0,
-    scale_gate_value=1.0,
-    gemm1_alpha_value=None,
-    gemm1_beta_value=None,
-    gemm1_clamp_limit_value=2.0,
-    warmup_iters=10,
-    bench_iters=50,
-    num_rotated_buffers=None,
-    cuda_profiler_range=False,
-    early_exit_max_token_ctas=0,
-    use_cuda_graphs=True,
-    **cfg_overrides,
-):
-    """Benchmark the kernel using CUDA graph capture + replay."""
-    io = _build_launch_io(
-        num_experts=num_experts,
-        num_tokens=num_tokens,
-        top_k=top_k,
-        problem_n=problem_n,
-        problem_k=problem_k,
-        seed=seed,
-        scale_c_value=scale_c_value,
-        scale_gate_value=scale_gate_value,
-        gemm1_alpha_value=gemm1_alpha_value,
-        gemm1_beta_value=gemm1_beta_value,
-        gemm1_clamp_limit_value=gemm1_clamp_limit_value,
-        early_exit_max_token_ctas=early_exit_max_token_ctas,
-        **cfg_overrides,
-    )
-    cfg = io["cfg"]
-    M, N, K, L = io["M"], io["N"], io["K"], io["L"]
-    num_tokens = io["num_tokens"]
-    total_padded_tokens = io["total_padded_tokens"]
-    out_hidden, in_hidden = io["out_hidden"], io["in_hidden"]
-    logical_output_m = io["logical_output_m"]
-    logical_output_n = io["logical_output_n"]
-    plain_output_dtype = io["plain_output_dtype"]
-    a_dp = io["a_dp"]
-    b_dp = io["b_dp"]
-    sfa_dp = io["sfa_dp"]
-    sfb_dp = io["sfb_dp"]
-    sf_c_dp = io["sf_c_dp"]
-    tile_idx_dp = io["tile_idx_dp"]
-    route_map_dp = io["route_map_dp"]
-    mn_limit_dp = io["mn_limit_dp"]
-    num_non_exiting_ctas_dp = io["num_non_exiting_ctas_dp"]
-    total_num_padded_tokens_dp = io.get(
-        "total_num_padded_tokens_dp", num_non_exiting_ctas_dp
-    )
-    act_dp = io["act_dp"]
-    per_token_sf_a_dp = io["per_token_sf_a_dp"]
-    per_token_sf_b_dp = io["per_token_sf_b_dp"]
-    bias_dp = io["bias_dp"]
-    scale_c_dp = io["scale_c_dp"]
-    scale_gate_dp = io["scale_gate_dp"]
-    gemm1_alpha_dp = io["gemm1_alpha_dp"]
-    gemm1_beta_dp = io["gemm1_beta_dp"]
-    gemm1_clamp_limit_dp = io["gemm1_clamp_limit_dp"]
-    sf_c_torch = io["sf_c_torch"]
-    # Pin the domain tensors alive for the whole benchmark (pointers alias them).
-    _io_keepalive = io["_keepalive"]
-    # Use a non-default stream for CUDA graph support (same as FMHA benchmark)
-    import cuda.bindings.driver as cuda_drv
+    warmup_iters: int = 10,
+    bench_iters: int = 50,
+    num_rotated_buffers: int | None = None,
+    cuda_profiler_range: bool = False,
+    use_cuda_graphs: bool = True,
+) -> float:
+    """Time an already-compiled batched GEMM against one launch IO.
+
+    The generated workspace set rotates only C and SF-C output buffers. Inputs,
+    weights, scale factors, and routing data remain shared and can stay hot in
+    cache; the underlying helper flushes L2 once before its replay loop, not
+    before every iteration. Compilation is intentionally outside this helper
+    so sweep tools can compile once and measure many runtime shapes that share
+    the same compile signature.
+    """
     import cutlass.cute.testing as testing
     from cutlass.cute.runtime import make_ptr
 
-    _torch_stream = torch.cuda.Stream()
-    stream = cuda_drv.CUstream(_torch_stream.cuda_stream)
+    cfg = io["cfg"]
+    logical_output_m = io["logical_output_m"]
+    logical_output_n = io["logical_output_n"]
+    plain_output_dtype = io["plain_output_dtype"]
+    sf_c_dp = io["sf_c_dp"]
+    sf_c_torch = io["sf_c_torch"]
+    num_experts = io["L"]
+    num_tokens = io["num_tokens"]
+    out_hidden, in_hidden = io["out_hidden"], io["in_hidden"]
 
-    # Compile with the non-default stream
-    print(
-        f"Benchmark: tokens={num_tokens}, padded_tokens={total_padded_tokens}, "
-        f"experts={num_experts}, top_k={top_k}, M={M}, N={N}, K={K}, L={L}"
-    )
-    print(
-        f"  tile=({cfg.tile_m}x{cfg.tile_n}x{cfg.tile_k}), "
-        f"scheduler={'persistent' if cfg.is_persistent else 'static'}, "
-        f"swap_ab={cfg.is_swap_ab}"
-    )
-    compiled_fn = _compile_for_launch(io, stream)
+    # Pin the domain tensors alive for the whole benchmark (pointers alias them).
+    _io_keepalive = io["_keepalive"]
 
-    # Build workspace generator for cold-L2 / rotated buffers
     def generate_tensors():
-        if cfg.has_epilogue_quant or cfg.uses_fp8_output:
+        if cfg.has_output_block_scaling or cfg.uses_fp8_output:
             c_buf = torch.zeros(
                 (
                     _quantized_c_numel(cfg, logical_output_m, logical_output_n)
-                    if cfg.has_epilogue_quant
+                    if cfg.has_output_block_scaling
                     else logical_output_m * logical_output_n
                 ),
                 dtype=torch.uint8,
@@ -3693,34 +4656,11 @@ def benchmark(
             sf_c_buf = sf_c_torch
             sf_c_ptr = sf_c_dp
         args = testing.JitArguments(
-            a_dp,
-            b_dp,
-            sfa_dp,
-            sfb_dp,
-            c_ptr,
-            sf_c_ptr,
-            tile_idx_dp,
-            route_map_dp,
-            mn_limit_dp,
-            num_non_exiting_ctas_dp,
-            total_num_padded_tokens_dp,
-            act_dp,
-            per_token_sf_a_dp,
-            per_token_sf_b_dp,
-            bias_dp,
-            scale_c_dp,
-            scale_gate_dp,
-            gemm1_alpha_dp,
-            gemm1_beta_dp,
-            gemm1_clamp_limit_dp,
-            (M, N, K, L, num_tokens),
-            io["launch_early_exit_max_token_ctas"],
-            stream,
+            *_launch_arg_tuple({**io, "c0_dp": c_ptr, "sf_c_dp": sf_c_ptr}, stream)
         )
         args.add_to_scope([c_buf, sf_c_buf])
         return args
 
-    # Compute workspace count for cold L2
     if cfg.is_bf16_mma or cfg.has_cast_a:
         ab_elem_bytes = 2
     elif cfg.is_fp8_mma:
@@ -3732,7 +4672,7 @@ def benchmark(
         + int(num_tokens * in_hidden * ab_elem_bytes)
         + (
             logical_output_m * logical_output_n
-            if (cfg.has_epilogue_quant or cfg.uses_fp8_output)
+            if (cfg.has_output_block_scaling or cfg.uses_fp8_output)
             else logical_output_m * logical_output_n * 2
         )
         + (
@@ -3743,7 +4683,7 @@ def benchmark(
                 cfg.output_sf_block_size_c,
                 is_swap_ab=cfg.is_swap_ab,
             )
-            if cfg.has_epilogue_quant
+            if cfg.has_output_block_scaling
             else 0
         )
     )
@@ -3753,9 +4693,6 @@ def benchmark(
         bench_iters,
     )
     if num_rotated_buffers is not None:
-        # Rotated buffers are a boolean toggle.  Treat 0 as
-        # "disabled" and reuse one workspace so benchmark L2-cache behavior can
-        # be matched with `-rotateBuffers false`.
         workspace_count = (
             1 if num_rotated_buffers <= 0 else min(workspace_count, num_rotated_buffers)
         )
@@ -3764,19 +4701,107 @@ def benchmark(
         torch.cuda.synchronize()
         torch.cuda.cudart().cudaProfilerStart()
     try:
-        exec_time = testing.benchmark(
-            compiled_fn,
-            workspace_generator=generate_tensors,
-            workspace_count=workspace_count,
-            stream=stream,
-            warmup_iterations=warmup_iters,
-            iterations=bench_iters,
-            use_cuda_graphs=use_cuda_graphs,
+        return float(
+            testing.benchmark(
+                compiled_fn,
+                workspace_generator=generate_tensors,
+                workspace_count=workspace_count,
+                stream=stream,
+                warmup_iterations=warmup_iters,
+                iterations=bench_iters,
+                use_cuda_graphs=use_cuda_graphs,
+            )
         )
     finally:
         if cuda_profiler_range:
             torch.cuda.synchronize()
             torch.cuda.cudart().cudaProfilerStop()
+        # Keep aliases live through the final synchronization in the timer.
+        del _io_keepalive
+
+
+def benchmark(
+    *,
+    num_experts,
+    num_tokens,
+    top_k,
+    routing="balanced_round_robin",
+    routing_seed=42,
+    problem_n=None,
+    problem_k=None,
+    seed=42,
+    data_distribution="default",
+    scale_c_value=None,
+    scale_gate_value=1.0,
+    gemm1_alpha_value=None,
+    gemm1_beta_value=None,
+    gemm1_clamp_limit_value=2.0,
+    warmup_iters=10,
+    bench_iters=50,
+    num_rotated_buffers=None,
+    cuda_profiler_range=False,
+    early_exit_max_token_ctas=0,
+    use_cuda_graphs=True,
+    **cfg_overrides,
+):
+    """Benchmark with CUDA graphs and report logical GEMM throughput.
+
+    Effective bandwidth counts routed activations, the weights of experts that
+    receive at least one token, and output once, excluding padding, scale
+    factors, and auxiliary tensors.
+    """
+    io = _build_launch_io(
+        num_experts=num_experts,
+        num_tokens=num_tokens,
+        top_k=top_k,
+        routing=routing,
+        routing_seed=routing_seed,
+        problem_n=problem_n,
+        problem_k=problem_k,
+        seed=seed,
+        data_distribution=data_distribution,
+        scale_c_value=scale_c_value,
+        scale_gate_value=scale_gate_value,
+        gemm1_alpha_value=gemm1_alpha_value,
+        gemm1_beta_value=gemm1_beta_value,
+        gemm1_clamp_limit_value=gemm1_clamp_limit_value,
+        early_exit_max_token_ctas=early_exit_max_token_ctas,
+        **cfg_overrides,
+    )
+    cfg = io["cfg"]
+    M, N, K, L = io["M"], io["N"], io["K"], io["L"]
+    num_tokens = io["num_tokens"]
+    total_padded_tokens = io["total_padded_tokens"]
+    out_hidden, in_hidden = io["out_hidden"], io["in_hidden"]
+    # Use a non-default stream for CUDA graph support (same as FMHA benchmark)
+    import cuda.bindings.driver as cuda_drv
+
+    _torch_stream = torch.cuda.Stream()
+    stream = cuda_drv.CUstream(_torch_stream.cuda_stream)
+
+    # Compile with the non-default stream
+    print(
+        f"Benchmark: tokens={num_tokens}, padded_tokens={total_padded_tokens}, "
+        f"experts={num_experts}, top_k={top_k}, M={M}, N={N}, K={K}, L={L}, "
+        f"routing={routing}, routing_seed={routing_seed}, "
+        f"dist={data_distribution}"
+    )
+    print(
+        f"  tile=({cfg.tile_m}x{cfg.tile_n}x{cfg.tile_k}), "
+        f"scheduler={'persistent' if cfg.is_persistent else 'static'}, "
+        f"swap_ab={cfg.is_swap_ab}"
+    )
+    compiled_fn = _compile_for_launch(io, stream)
+    exec_time = benchmark_compiled(
+        compiled_fn,
+        io,
+        stream,
+        warmup_iters=warmup_iters,
+        bench_iters=bench_iters,
+        num_rotated_buffers=num_rotated_buffers,
+        cuda_profiler_range=cuda_profiler_range,
+        use_cuda_graphs=use_cuda_graphs,
+    )
     # Match the reference-check path: clustered persistent kernels are sensitive
     # to compiled CUDA library lifetime if unload overlaps the next compile or
     # launch in the same process.
@@ -3784,6 +4809,28 @@ def benchmark(
     gc.collect()
 
     print(f"  Average kernel time: {exec_time:.1f} µs ({exec_time / 1000:.4f} ms)")
+    routed_tokens = sum(io["token_layout"].tokens_per_expert)
+    flops = 2.0 * routed_tokens * out_hidden * in_hidden
+    # Only experts selected by this concrete routing layout read weights.
+    active_experts = sum(
+        token_count > 0 for token_count in io["token_layout"].tokens_per_expert
+    )
+    activation_bits = cfg.dtype_b_bits if cfg.is_swap_ab else cfg.dtype_a_bits
+    weight_bits = cfg.dtype_a_bits if cfg.is_swap_ab else cfg.dtype_b_bits
+    output_width = out_hidden // 2 if cfg.has_gated_epilogue else out_hidden
+    # Logical A/B reads plus C writes, independent of tile padding and routing
+    # reuse. This is an effective rate, not measured device-memory traffic.
+    io_bytes = (
+        routed_tokens * in_hidden * activation_bits
+        + active_experts * out_hidden * in_hidden * weight_bits
+        + routed_tokens * output_width * cfg.dtype_c_bits
+    ) / 8
+    print(f"  GEMM throughput: {flops / (exec_time * 1e6):.2f} TFLOPS")
+    print(
+        f"  Effective bandwidth (logical A+B+C): "
+        f"{io_bytes / (exec_time * 1e3):.2f} GB/s "
+        f"({io_bytes / (exec_time * 1e6):.3f} TB/s)"
+    )
     return exec_time
 
 
@@ -3816,20 +4863,38 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable cold-L2 workspace rotation (reuse a single workspace).",
     )
 
+    parser.add_argument(
+        "--sm-arch",
+        type=int,
+        choices=(100, 103, 107),
+        default=None,
+        help="Target SM architecture (default: the active CUDA device, else 100).",
+    )
     parser.add_argument("--num-experts", type=int, default=2)
     parser.add_argument("--num-tokens", type=int, default=128)
     parser.add_argument("--top-k", type=int, default=1)
-
+    parser.add_argument(
+        "--routing",
+        type=_routing_cli_arg,
+        default="balanced_round_robin",
+        help="Token routing policy: balanced_round_robin, uniform, or zipf:<alpha>.",
+    )
+    parser.add_argument(
+        "--routing-seed",
+        type=int,
+        default=42,
+        help="Deterministic host RNG seed for stochastic routing policies.",
+    )
     parser.add_argument("--batch-mode", choices=["n", "m"], default="n")
     parser.add_argument(
         "--route-act",
-        choices=["false", "none", "tma", "ldgsts", "ldgplussts"],
+        choices=["false", "none", "tma", "ldgsts"],
         default="none",
     )
     parser.add_argument(
         "--route-sfs-act",
-        choices=["false", "none", "tma", "ldgsts", "ldgplussts"],
-        default="none",
+        choices=["auto", "false", "none", "tma", "ldgsts"],
+        default="auto",
     )
     parser.add_argument(
         "--tile-scheduler",
@@ -3837,10 +4902,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="static",
     )
     parser.add_argument(
+        "--cta-swizzle-type",
+        choices=["rasterizeAlongM", "rasterizeAlongN"],
+        default="rasterizeAlongM",
+        help=(
+            "Persistent CLC CTA rasterization order; the option name and values "
+            "match TRTLLM-gen, but do not enable an additional CTA swizzle."
+        ),
+    )
+    parser.add_argument(
         "--transpose-mma-output",
         type=int,
         choices=[0, 1],
         default=1,
+    )
+    parser.add_argument(
+        "--use-shuffled-matrix",
+        type=_binary_cli_flag,
+        choices=[0, 1],
+        default=0,
+        help=(
+            "Use TRTLLM-gen shuffleMatrix weight/SF storage for batch-M. "
+            "Accepts true/false or 1/0. Batch-N always uses the shuffled "
+            "representation."
+        ),
     )
     parser.add_argument(
         "--act-kind",
@@ -3863,8 +4948,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="8x4",
     )
 
-    parser.add_argument("--cluster-m", type=int, default=1)
-    parser.add_argument("--tile-m", type=int, default=128)
+    parser.add_argument("--umma-cta-count", type=int, default=1)
+    parser.add_argument("--cluster-dim-x", type=int, default=0)
+    parser.add_argument("--cluster-dim-y", type=int, default=1)
+    parser.add_argument("--fallback-cluster-dim-x", type=int, default=0)
+    parser.add_argument("--fallback-cluster-dim-y", type=int, default=1)
     parser.add_argument("--tile-n", type=int, default=8)
     parser.add_argument("--tile-k", type=int, default=512)
     parser.add_argument("--epi-tile-n", type=int, default=8)
@@ -3886,9 +4974,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=sorted(DTYPE_NAME_TO_VALUE.keys()),
         default="bf16",
     )
-    parser.add_argument("--sf-block-size-a", type=int, default=0)
-    parser.add_argument("--sf-block-size-b", type=int, default=0)
-    parser.add_argument("--sf-block-size-c", type=int, default=0)
     parser.add_argument("--num-stages-a", type=int, default=5)
     parser.add_argument("--num-stages-b", type=int, default=5)
     parser.add_argument("--num-stages-smem-sfa", type=int, default=5)
@@ -3897,10 +4982,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-stages-tmem-sfa", type=int, default=5)
     parser.add_argument("--num-stages-tmem-sfb", type=int, default=5)
     parser.add_argument("--num-stages-c-smem", type=int, default=2)
+    parser.add_argument(
+        "--tmem-ldst-max-num-regs",
+        type=int,
+        choices=(32, 64),
+        default=32,
+        help="Maximum register width for TMEM load/store instructions.",
+    )
     parser.add_argument("--use-tma-oob-opt", type=int, default=1)
     parser.add_argument("--use-tma-store", type=int, default=0)
-    parser.add_argument("--num-load-b-warps", type=int, default=1)
-    parser.add_argument("--num-load-sfb-warps", type=int, default=1)
+    parser.add_argument("--num-load-a-warps", type=int, default=0)
+    parser.add_argument("--num-load-b-warps", type=int, default=0)
+    parser.add_argument("--num-load-sfa-warps", type=int, default=0)
+    parser.add_argument("--num-load-sfb-warps", type=int, default=0)
     parser.add_argument("--epilogue-regs", type=int, default=160)
     parser.add_argument("--mma-regs", type=int, default=48)
     parser.add_argument("--load-regs", type=int, default=48)
@@ -3919,15 +5013,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0,
     )
     parser.add_argument("--use-max-tmem-overlap", type=int, default=0)
+    parser.add_argument("--fuse-sf-copy-to-mma", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--fuse-operand-sf-loads", type=int, choices=(0, 1), default=0)
     parser.add_argument("--use-early-exit", type=int, default=0)
     parser.add_argument("--use-clc-fast-drain", type=int, default=0)
     parser.add_argument("--use-work-throttle", type=int, default=1)
     parser.add_argument("--use-pdl", type=int, default=0)
-    parser.add_argument(
-        "--do-pdl-wait-for-num-non-exiting-ctas",
-        type=int,
-        default=0,
-    )
+    parser.add_argument("--skip-early-exit-pdl", type=int, choices=(0, 1), default=0)
     parser.add_argument("--use-global-scales", type=int, default=1)
     parser.add_argument("--use-per-token-sf-a", type=int, default=0)
     parser.add_argument("--use-per-token-sf-b", type=int, default=0)
@@ -3971,7 +5063,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-rotated-buffers", type=int, default=60)
     parser.add_argument("--cuda-profiler-range", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--scale-c", type=float, default=1.0)
+    parser.add_argument(
+        "--dist",
+        choices=DATA_DISTRIBUTIONS,
+        default="default",
+        help=(
+            "Input-data distribution, matching TRTLLM-gen's -dist option. "
+            "allZeros clears token data, weight data, enabled bias, and input "
+            "scale factors, but preserves routing metadata."
+        ),
+    )
+    parser.add_argument(
+        "--scale-c",
+        type=_auto_or_float_cli_arg,
+        default=None,
+        metavar="AUTO_OR_FLOAT",
+        help="Output global scale (default: auto for eligible NVFP4 fused activations).",
+    )
     parser.add_argument("--scale-gate", type=float, default=1.0)
     parser.add_argument("--gemm1-alpha", type=float, default=1.0)
     parser.add_argument("--gemm1-beta", type=float, default=0.0)
@@ -3989,7 +5097,8 @@ def main(argv: list[str] | None = None) -> int:
       --benchmark     : timed benchmark (preceded by the correctness check
                         unless --skip-ref-check is given).
     """
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
     overrides = _parse_overrides(args)
 
     if args.validate_only:
@@ -4008,9 +5117,12 @@ def main(argv: list[str] | None = None) -> int:
             num_experts=args.num_experts,
             num_tokens=args.num_tokens,
             top_k=args.top_k,
+            routing=args.routing,
+            routing_seed=args.routing_seed,
             problem_n=args.problem_n,
             problem_k=args.problem_k,
             seed=args.seed,
+            data_distribution=args.dist,
             scale_c_value=args.scale_c,
             scale_gate_value=args.scale_gate,
             gemm1_alpha_value=args.gemm1_alpha,
@@ -4026,9 +5138,12 @@ def main(argv: list[str] | None = None) -> int:
             num_experts=args.num_experts,
             num_tokens=args.num_tokens,
             top_k=args.top_k,
+            routing=args.routing,
+            routing_seed=args.routing_seed,
             problem_n=args.problem_n,
             problem_k=args.problem_k,
             seed=args.seed,
+            data_distribution=args.dist,
             scale_c_value=args.scale_c,
             scale_gate_value=args.scale_gate,
             gemm1_alpha_value=args.gemm1_alpha,

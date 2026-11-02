@@ -770,12 +770,13 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       mProfileWorkspace =
           alloc_tensor({static_cast<int64_t>(profile_workspace_size)}, dl_int8, input.device());
 
-      mProfiler->prepare(num_rows, static_cast<char*>(mProfileWorkspace.data_ptr()),
+      mProfiler->prepare(num_rows, static_cast<char*>(mProfileWorkspace.value().data_ptr()),
                          expert_weights_ptr, enable_pdl, stream);
     }
 
     // Profile specific tactic. Assuming at least one preparation phase has been executed already.
-    mProfiler->runProfiler(num_rows, profile, static_cast<char*>(mProfileWorkspace.data_ptr()),
+    mProfiler->runProfiler(num_rows, profile,
+                           static_cast<char*>(mProfileWorkspace.value().data_ptr()),
                            expert_weights_ptr, enable_pdl, stream);
   }
 
@@ -892,14 +893,14 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         return static_cast<int64_t>(common::calculateTotalWorkspaceSize(ws.data(), ws.size()));
       });
     } else {
-      return Function(nullptr);
+      return std::nullopt;
     }
   }
 
  private:
   struct WorkspaceInfo {
-    Tensor workspace{};     // owns allocation when caller does not provide a buffer
-    void* workspace_ptr{};  // raw pointer valid in both cases
+    Optional<Tensor> workspace;  // owns allocation when caller does not provide a buffer
+    void* workspace_ptr{};       // raw pointer valid in both cases
     void* src_to_dest_map{};
   };
 
@@ -912,7 +913,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
   // number of elements packed into the inner dimension of a matrix
   // e.g. 16 nvfp4 elements are packed into a single int64 element
   int64_t mInnerDimMultiplier;
-  Tensor mProfileWorkspace;
+  Optional<Tensor> mProfileWorkspace;
 
   bool mUseDeepSeekFP8BlockScaling = false;
   bool mUseW4GroupScaling = false;
@@ -1166,7 +1167,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     } else {
       info.workspace =
           alloc_tensor({static_cast<int64_t>(total_workspace_size)}, dl_int8, expected_device);
-      info.workspace_ptr = info.workspace.data_ptr();
+      info.workspace_ptr = info.workspace.value().data_ptr();
     }
     info.src_to_dest_map =
         common::nextWorkspacePtr(static_cast<int8_t*>(info.workspace_ptr), moe_workspace_size);

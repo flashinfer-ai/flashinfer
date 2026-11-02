@@ -35,6 +35,13 @@ from .batched_gemm_config import (
     BatchedGemmConfig,
     SfSmemToTmemCopy,
 )
+from .batched_gemm_cga import (
+    operand_cga_policy,
+    CgaPolicy,
+    has_multiple_umma_atoms,
+    sfb_copy_uses_atom_leader,
+)
+from .mixed_cga_ts import CgaTask
 from .smem_misc_resources import BatchedGemmWorkQueue
 
 Constexpr = cutlass.Constexpr
@@ -132,6 +139,41 @@ def _pdl_launch_resources(pdl_launch_resource):
     return [pdl_launch_resource] if pdl_launch_resource is not None else []
 
 
+def _make_task(
+    cfg,
+    *,
+    cga_policy: CgaPolicy = CgaPolicy.ALL,
+    legacy_run_only_on_cta_id=None,
+    **kwargs,
+):
+    """Construct a topology-aware task only when its behavior requires one."""
+    dst_resources = kwargs.get("dst_resources", ())
+    needs_global_cga_signaling = any(
+        getattr(resource, "global_cga_producer_cta0", False)
+        for resource in dst_resources
+    )
+    if (
+        cga_policy != CgaPolicy.ALL
+        or needs_global_cga_signaling
+        or legacy_run_only_on_cta_id is not None
+    ):
+        run_only_on_cta_id = (
+            legacy_run_only_on_cta_id if cga_policy == CgaPolicy.ALL else None
+        )
+        return CgaTask(
+            cfg=cfg,
+            cga_policy=int(cga_policy),
+            run_only_on_cta_id=run_only_on_cta_id,
+            **kwargs,
+        )
+    return Task(run_only_on_cta_id=legacy_run_only_on_cta_id, **kwargs)
+
+
+def _resource_cga_policy(cfg, resource) -> CgaPolicy:
+    kind = getattr(resource, "mixed_cga_kind", None)
+    return CgaPolicy.ALL if kind is None else operand_cga_policy(cfg, kind)
+
+
 # ---------------------------------------------------------------------------
 # Load tasks
 # ---------------------------------------------------------------------------
@@ -204,7 +246,9 @@ def create_load_a_task(
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = load_a_schedule(gmem_a, smem_a, *extra_resources)
-    return Task(
+    return _make_task(
+        cfg,
+        cga_policy=_resource_cga_policy(cfg, smem_a),
         src_resources=(
             [gmem_a]
             + _pdl_wait_resources(pdl_wait_resource)
@@ -215,8 +259,8 @@ def create_load_a_task(
             + ([work_throttle] if has_work_throttle else [])
             + _pdl_launch_resources(pdl_launch_resource)
         ),
-        warp_idx=cfg.load_a_warp_idx,
-        num_warps=cfg.num_load_a_warps,
+        warp_idx=cfg.warp_layout.load_a_warp_idx,
+        num_warps=cfg.warp_layout.num_load_a_warps,
         schedule=captured_schedule,
         num_registers=cfg.load_a_task_regs,
         name="LoadATask",
@@ -289,7 +333,9 @@ def create_load_b_task(
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = load_b_schedule(gmem_b, smem_b, *extra_resources)
-    return Task(
+    return _make_task(
+        cfg,
+        cga_policy=_resource_cga_policy(cfg, smem_b),
         src_resources=(
             [gmem_b]
             + _pdl_wait_resources(pdl_wait_resource)
@@ -300,8 +346,8 @@ def create_load_b_task(
             + ([work_throttle] if has_work_throttle else [])
             + _pdl_launch_resources(pdl_launch_resource)
         ),
-        warp_idx=cfg.load_b_warp_idx,
-        num_warps=cfg.num_load_b_warps,
+        warp_idx=cfg.warp_layout.load_b_warp_idx,
+        num_warps=cfg.warp_layout.num_load_b_warps,
         schedule=captured_schedule,
         num_registers=cfg.load_b_task_regs,
         name="LoadBTask",
@@ -396,10 +442,20 @@ def create_gather_task(
             + ([work_queue] if cfg.is_persistent else [])
         ),
         dst_resources=[smem_gather] + _pdl_launch_resources(pdl_launch_resource),
-        warp_idx=cfg.gather_warp_idx,
-        num_warps=cfg.num_gather_warps,
+        warp_idx=(
+            cfg.warp_layout.load_b_warp_idx
+            if cfg.is_swap_ab
+            else cfg.warp_layout.load_a_warp_idx
+        ),
+        num_warps=(
+            cfg.warp_layout.num_load_b_warps
+            if cfg.is_swap_ab
+            else cfg.warp_layout.num_load_a_warps
+        ),
         schedule=captured_schedule,
-        num_registers=cfg.gather_regs,
+        num_registers=(
+            cfg.load_b_task_regs if cfg.is_swap_ab else cfg.load_a_task_regs
+        ),
         name="GatherTask",
     )
 
@@ -488,12 +544,14 @@ def create_fused_load_a_sfa_task(
         smem_sfa,
         *extra_resources,
     )
-    return Task(
+    return _make_task(
+        cfg,
+        cga_policy=_resource_cga_policy(cfg, smem_a),
         src_resources=[gmem_a, gmem_sfa] + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[smem_a, smem_sfa]
         + ([work_throttle] if has_work_throttle else []),
-        warp_idx=cfg.load_a_warp_idx,
-        num_warps=cfg.num_load_a_warps,
+        warp_idx=cfg.warp_layout.load_a_warp_idx,
+        num_warps=cfg.warp_layout.num_load_a_warps,
         schedule=captured_schedule,
         num_registers=max(cfg.load_a_task_regs, cfg.load_sfa_task_regs),
         name="FusedLoadASfATask",
@@ -649,10 +707,21 @@ def create_fused_gather_sfb_task(
             + ([work_queue] if cfg.is_persistent else [])
         ),
         dst_resources=[smem_b, smem_sfb] + _pdl_launch_resources(pdl_launch_resource),
-        warp_idx=cfg.gather_warp_idx,
-        num_warps=cfg.num_gather_warps,
+        warp_idx=(
+            cfg.warp_layout.load_b_warp_idx
+            if cfg.is_swap_ab
+            else cfg.warp_layout.load_a_warp_idx
+        ),
+        num_warps=(
+            cfg.warp_layout.num_load_b_warps
+            if cfg.is_swap_ab
+            else cfg.warp_layout.num_load_a_warps
+        ),
         schedule=captured_schedule,
-        num_registers=max(cfg.gather_regs, cfg.load_sfb_task_regs),
+        num_registers=max(
+            (cfg.load_b_task_regs if cfg.is_swap_ab else cfg.load_a_task_regs),
+            cfg.load_sfb_task_regs,
+        ),
         name="FusedGatherSfBTask",
     )
 
@@ -794,15 +863,17 @@ def create_load_sfa_task(
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = load_sfa_schedule(gmem_sfa, smem_sfa, *extra_resources)
-    return Task(
+    return _make_task(
+        cfg,
+        cga_policy=_resource_cga_policy(cfg, smem_sfa),
         src_resources=(
             [gmem_sfa]
             + _pdl_wait_resources(pdl_wait_resource)
             + ([work_queue] if cfg.is_persistent else [])
         ),
         dst_resources=[smem_sfa] + _pdl_launch_resources(pdl_launch_resource),
-        warp_idx=cfg.load_sfa_warp_idx,
-        num_warps=cfg.num_load_sfa_warps,
+        warp_idx=cfg.warp_layout.load_sfa_warp_idx,
+        num_warps=cfg.warp_layout.num_load_sfa_warps,
         schedule=captured_schedule,
         num_registers=cfg.load_sfa_task_regs,
         name="LoadSfATask",
@@ -893,15 +964,17 @@ def create_load_sfb_task(
     if is_persistent:
         extra_resources.append(work_queue)
     captured_schedule = load_sfb_schedule(gmem_sfb, smem_sfb, *extra_resources)
-    return Task(
+    return _make_task(
+        cfg,
+        cga_policy=_resource_cga_policy(cfg, smem_sfb),
         src_resources=(
             [gmem_sfb]
             + _pdl_wait_resources(pdl_wait_resource)
             + ([work_queue] if cfg.is_persistent else [])
         ),
         dst_resources=[smem_sfb] + _pdl_launch_resources(pdl_launch_resource),
-        warp_idx=cfg.load_sfb_warp_idx,
-        num_warps=cfg.num_load_sfb_warps,
+        warp_idx=cfg.warp_layout.load_sfb_warp_idx,
+        num_warps=cfg.warp_layout.num_load_sfb_warps,
         schedule=captured_schedule,
         num_registers=cfg.load_sfb_task_regs,
         name="LoadSfBTask",
@@ -943,15 +1016,27 @@ def create_copy_sfa_task(
     captured_schedule = _call_schedule_with_optional_work_queue(
         copy_sfa_schedule, is_persistent, work_queue, smem_sfa, tmem_sfa
     )
-    return Task(
+    copy_is_leader_scoped = cfg.uses_two_cta_mma and cfg.sfa_smem_to_tmem_copy == int(
+        SfSmemToTmemCopy.UTCCP
+    )
+    copy_policy = (
+        CgaPolicy.ATOM_LEADER
+        if copy_is_leader_scoped and has_multiple_umma_atoms(cfg)
+        else CgaPolicy.ALL
+    )
+    return _make_task(
+        cfg,
+        cga_policy=copy_policy,
+        # LDS+STTM consumes CTA-local SMEM and therefore runs in every CTA.
+        # Only UTCCP is owned by one CTA per UMMA atom.
+        legacy_run_only_on_cta_id=0 if copy_is_leader_scoped else None,
         src_resources=[smem_sfa] + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[tmem_sfa],
-        warp_idx=cfg.copy_sfa_warp_idx,
-        num_warps=cfg.num_copy_sfa_warps,
+        warp_idx=cfg.warp_layout.copy_sfa_warp_idx,
+        num_warps=cfg.warp_layout.num_copy_sfa_warps,
         schedule=captured_schedule,
         num_registers=cfg.copy_sfa_task_regs,
         name="CopySfATask",
-        run_only_on_cta_id=0 if cfg.has_cluster else None,
     )
 
 
@@ -974,9 +1059,12 @@ def create_copy_sfb_task(
         def issue_sfb_copy() -> None:
             smem.try_wait()
             smem.wait()
-            desc_b_s2t_base = smem.build_sfb_s2t_desc()
+            desc_b_s2t_base, smem_sfb_stage_ptr = smem.build_sfb_s2t_desc()
             tmem.acquire()
-            tmem.copy_sfb(desc_b_s2t_base=desc_b_s2t_base)
+            tmem.copy_sfb(
+                desc_b_s2t_base=desc_b_s2t_base,
+                smem_sfb_stage_ptr=smem_sfb_stage_ptr,
+            )
 
         with _k_tile_schedule_loop(cfg, wq, num_k_tiles):
             issue_sfb_copy()
@@ -986,21 +1074,26 @@ def create_copy_sfb_task(
     captured_schedule = _call_schedule_with_optional_work_queue(
         copy_sfb_schedule, is_persistent, work_queue, smem_sfb, tmem_sfb
     )
-    return Task(
+    copy_is_leader_scoped = sfb_copy_uses_atom_leader(cfg)
+    # A legacy 2-CTA CGA has one UMMA atom, so CTA0 ownership can remain a
+    # stock Task constraint.  Wider physical CGAs need CgaTask to select one
+    # leader from every atom; in that case run_only_on_cta_id must stay unset.
+    copy_policy = (
+        CgaPolicy.ATOM_LEADER
+        if copy_is_leader_scoped and has_multiple_umma_atoms(cfg)
+        else CgaPolicy.ALL
+    )
+    return _make_task(
+        cfg,
+        cga_policy=copy_policy,
+        legacy_run_only_on_cta_id=0 if copy_is_leader_scoped else None,
         src_resources=[smem_sfb] + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[tmem_sfb],
-        warp_idx=cfg.copy_sfb_warp_idx,
-        num_warps=cfg.num_copy_sfb_warps,
+        warp_idx=cfg.warp_layout.copy_sfb_warp_idx,
+        num_warps=cfg.warp_layout.num_copy_sfb_warps,
         schedule=captured_schedule,
         num_registers=cfg.copy_sfb_task_regs,
         name="CopySfBTask",
-        run_only_on_cta_id=0
-        if (
-            cfg.has_cluster
-            and cfg.sfb_smem_to_tmem_copy != int(SfSmemToTmemCopy.LDS_STTM)
-            and not (cfg.has_routed_sfs and cfg.uses_tma_routed_sfs and cfg.is_swap_ab)
-        )
-        else None,
     )
 
 
@@ -1031,12 +1124,13 @@ def create_copy_sfab_task(
             smem_a.wait()
             smem_b.wait()
             desc_a_s2t_base, smem_sfa_stage_ptr = smem_a.build_sfa_s2t_desc()
-            desc_b_s2t_base = smem_b.build_sfb_s2t_desc()
+            desc_b_s2t_base, smem_sfb_stage_ptr = smem_b.build_sfb_s2t_desc()
             tmem.acquire()
             tmem.copy_sfab(
                 desc_a_s2t_base=desc_a_s2t_base,
                 smem_sfa_stage_ptr=smem_sfa_stage_ptr,
                 desc_b_s2t_base=desc_b_s2t_base,
+                smem_sfb_stage_ptr=smem_sfb_stage_ptr,
             )
 
         def commit_previous_sfab_copy():
@@ -1059,16 +1153,20 @@ def create_copy_sfab_task(
         smem_sfb,
         tmem_sfab,
     )
-    return Task(
+    return _make_task(
+        cfg,
+        cga_policy=(
+            CgaPolicy.ATOM_LEADER if has_multiple_umma_atoms(cfg) else CgaPolicy.ALL
+        ),
+        legacy_run_only_on_cta_id=0 if cfg.uses_two_cta_mma else None,
         src_resources=[smem_sfa, smem_sfb]
         + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[tmem_sfab],
-        warp_idx=cfg.copy_sfa_warp_idx,
-        num_warps=cfg.num_copy_sfa_warps,
+        warp_idx=cfg.warp_layout.copy_sfa_warp_idx,
+        num_warps=cfg.warp_layout.num_copy_sfa_warps,
         schedule=captured_schedule,
         num_registers=cfg.copy_sfa_task_regs,
         name="CopySfAbTask",
-        run_only_on_cta_id=0 if cfg.has_cluster else None,
     )
 
 
@@ -1126,8 +1224,8 @@ def create_cast_a_task(
     return Task(
         src_resources=[smem_a, smem_sfa] + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[tmem_cast_a],
-        warp_idx=cfg.cast_a_warp_idx_first,
-        num_warps=cfg.num_cast_a_warps,
+        warp_idx=cfg.warp_layout.cast_a_warp_idx_first,
+        num_warps=cfg.warp_layout.num_cast_a_warps,
         schedule=captured_schedule,
         num_registers=cfg.cast_a_regs,
         name="CastATask",
@@ -1234,7 +1332,7 @@ def create_mma_task(
             _ = tmem_cast_a_res.init_mma_state()
 
         with _work_tile_schedule_loop(cfg, wq):
-            if cfg.has_deepseek_fp8:
+            if cfg.use_deepseek_fp8:
                 with domain_loop(0, num_k_tiles, 1):
                     tmem_c_res.try_acquire()
                     tmem_c_res.acquire()
@@ -1265,9 +1363,26 @@ def create_mma_task(
                     )
             else:
                 tmem_c_res.try_acquire()
-                tmem_c_res.acquire()
+                # Peel the first K tile so gate-independent descriptor/SF setup
+                # can run before the accumulator stage becomes available.  The
+                # explicit first-tile flag also keeps the accumulate predicate
+                # compile-time constant in both the peeled body and the loop.
+                _mma_loop_body(
+                    smem_a_res,
+                    smem_b_res,
+                    tmem_c_res,
+                    proxy,
+                    smem_sfa_res,
+                    smem_sfb_res,
+                    tmem_sfa_res,
+                    tmem_sfb_res,
+                    tmem_sfab_res,
+                    tmem_cast_a_res,
+                    acquire_accumulator=True,
+                    first_k_tile=True,
+                )
                 if getattr(cfg, "use_unroll_loop_2x_for_mma", 0):
-                    with domain_loop(0, num_k_tiles, 1, unroll=2):
+                    with domain_loop(1, num_k_tiles, 1, unroll=2):
                         _mma_loop_body(
                             smem_a_res,
                             smem_b_res,
@@ -1279,9 +1394,10 @@ def create_mma_task(
                             tmem_sfb_res,
                             tmem_sfab_res,
                             tmem_cast_a_res,
+                            first_k_tile=False,
                         )
                 else:
-                    with domain_loop(0, num_k_tiles, 1):
+                    with domain_loop(1, num_k_tiles, 1):
                         _mma_loop_body(
                             smem_a_res,
                             smem_b_res,
@@ -1293,9 +1409,10 @@ def create_mma_task(
                             tmem_sfb_res,
                             tmem_sfab_res,
                             tmem_cast_a_res,
+                            first_k_tile=False,
                         )
                 tmem_c_res.commit()
-                if cfg.use_tile256_tmem_overlap and cfg.num_epilogue_warps == 4:
+                if cfg.uses_tmem_overlap_window:
                     tmem_c_res.advance_mma_overlap_window()
 
     def _mma_loop_body(
@@ -1310,6 +1427,8 @@ def create_mma_task(
         tmem_sfab_res,
         tmem_cast_a_res,
         *,
+        acquire_accumulator: bool = False,
+        first_k_tile=None,
         release_sources: bool = True,
     ) -> None:
         if has_cast_a:
@@ -1350,10 +1469,13 @@ def create_mma_task(
         if has_cast_a:
             tmem_cast_a_addr = tmem_cast_a_res.publish_cast_a_addr()
             desc_b_mma_base, smem_b_stage_ptr = smem_b_res.build_mma_desc_b()
+            if acquire_accumulator:
+                tmem_c_res.acquire()
             tmem_c_res.mma_cast_a(
                 desc_b_mma_base=desc_b_mma_base,
                 smem_b_stage_ptr=smem_b_stage_ptr,
                 tmem_cast_a_addr=tmem_cast_a_addr,
+                first_k_tile=first_k_tile,
             )
         else:
             if has_proxy:
@@ -1372,19 +1494,27 @@ def create_mma_task(
                 desc_b_mma_base, smem_b_stage_ptr = smem_b_res.build_mma_desc_b()
             if has_fused_sf:
                 desc_a_s2t_base, smem_sfa_stage_ptr = smem_sfa_res.build_sfa_s2t_desc()
-                desc_b_s2t_base = smem_sfb_res.build_sfb_s2t_desc()
+                desc_b_s2t_base, smem_sfb_stage_ptr = smem_sfb_res.build_sfb_s2t_desc()
+                tmem_c_res.copy_fused_sf(
+                    desc_a_s2t_base=desc_a_s2t_base,
+                    smem_sfa_stage_ptr=smem_sfa_stage_ptr,
+                    desc_b_s2t_base=desc_b_s2t_base,
+                    smem_sfb_stage_ptr=smem_sfb_stage_ptr,
+                )
+                if acquire_accumulator:
+                    tmem_c_res.acquire()
                 tmem_c_res.mma_fused_sf(
                     desc_a_mma_base=desc_a_mma_base,
                     smem_a_stage_ptr=smem_a_stage_ptr,
                     desc_b_mma_base=desc_b_mma_base,
                     smem_b_stage_ptr=smem_b_stage_ptr,
-                    desc_a_s2t_base=desc_a_s2t_base,
-                    smem_sfa_stage_ptr=smem_sfa_stage_ptr,
-                    desc_b_s2t_base=desc_b_s2t_base,
+                    first_k_tile=first_k_tile,
                 )
             elif has_separate_sf:
                 sfa_stage_col_offset = tmem_sfa_res.publish_sfa_offset()
                 sfb_stage_col_offset = tmem_sfb_res.publish_sfb_offset()
+                if acquire_accumulator:
+                    tmem_c_res.acquire()
                 tmem_c_res.mma_separate_sf(
                     desc_a_mma_base=desc_a_mma_base,
                     smem_a_stage_ptr=smem_a_stage_ptr,
@@ -1392,11 +1522,14 @@ def create_mma_task(
                     smem_b_stage_ptr=smem_b_stage_ptr,
                     sfa_stage_col_offset=sfa_stage_col_offset,
                     sfb_stage_col_offset=sfb_stage_col_offset,
+                    first_k_tile=first_k_tile,
                 )
             elif has_combined_sf:
                 sfa_stage_col_offset, sfb_stage_col_offset = (
                     tmem_sfab_res.publish_sfab_offset()
                 )
+                if acquire_accumulator:
+                    tmem_c_res.acquire()
                 tmem_c_res.mma_separate_sf(
                     desc_a_mma_base=desc_a_mma_base,
                     smem_a_stage_ptr=smem_a_stage_ptr,
@@ -1404,13 +1537,17 @@ def create_mma_task(
                     smem_b_stage_ptr=smem_b_stage_ptr,
                     sfa_stage_col_offset=sfa_stage_col_offset,
                     sfb_stage_col_offset=sfb_stage_col_offset,
+                    first_k_tile=first_k_tile,
                 )
             else:
+                if acquire_accumulator:
+                    tmem_c_res.acquire()
                 tmem_c_res.mma(
                     desc_a_mma_base=desc_a_mma_base,
                     smem_a_stage_ptr=smem_a_stage_ptr,
                     desc_b_mma_base=desc_b_mma_base,
                     smem_b_stage_ptr=smem_b_stage_ptr,
+                    first_k_tile=first_k_tile,
                 )
         if release_sources:
             _release_mma_sources(
@@ -1479,16 +1616,19 @@ def create_mma_task(
         extra_resources.append(work_queue)
     captured_schedule = mma_schedule(smem_a, smem_b, tmem_c, *extra_resources)
 
-    return Task(
+    return _make_task(
+        cfg,
+        cga_policy=(
+            CgaPolicy.ATOM_LEADER if has_multiple_umma_atoms(cfg) else CgaPolicy.ALL
+        ),
+        legacy_run_only_on_cta_id=0 if cfg.uses_two_cta_mma else None,
         src_resources=src_resources,
         dst_resources=[tmem_c],
-        warp_idx=cfg.mma_warp_idx,
-        num_warps=cfg.num_mma_warps,
+        warp_idx=cfg.warp_layout.mma_warp_idx,
+        num_warps=cfg.warp_layout.num_mma_warps,
         schedule=captured_schedule,
         num_registers=cfg.mma_regs,
         name="MmaTask0",
-        # For 2-CTA: only leader CTA runs the MMA task (including pipeline ops).
-        run_only_on_cta_id=0 if cfg.has_cluster else None,
     )
 
 
@@ -1505,12 +1645,11 @@ def create_epilogue_task(
     num_k_tiles: int,
 ) -> Task:
     if cfg.is_swap_ab:
-        epi_warpgroup_count = max(1, cfg.num_epilogue_warps // 4)
+        epi_warpgroup_count = max(1, cfg.warp_layout.num_epilogue_warps // 4)
         epi_cols_per_call = cfg.epi_tile_n * epi_warpgroup_count
         epi_subtile_cnt = max(1, cfg.tile_n // max(1, epi_cols_per_call))
     else:
-        epi_t2r_repx = cfg.epi_tile_n // 4
-        epi_subtile_cnt = max(1, cfg.tile_n // max(1, epi_t2r_repx))
+        epi_subtile_cnt = cfg.non_swap_epilogue_subtile_cnt
     is_persistent = _is_persistent(cfg)
 
     @schedule
@@ -1524,31 +1663,45 @@ def create_epilogue_task(
             with domain_loop(0, num_k_tiles, 1):
                 pass
             _epilogue_tail(tmem, gmem)
-        if cfg.uses_non_swap_tma_store:
-            gmem.drain_non_swap_tma_stores()
-        if cfg.is_swap_ab and cfg.use_tma_store:
-            gmem.drain_swap_ab_tma_stores()
+        # Retire only the final outstanding group; per-tile scratch reuse is
+        # guarded inside GmemCResource so persistent tiles can overlap stores.
+        gmem.drain_store_tail()
 
     def _epilogue_tail(tmem, gmem) -> None:
         tmem.try_wait()
         tmem.wait()
-        if cfg.use_tile256_tmem_overlap and cfg.num_epilogue_warps == 4:
+        if cfg.uses_tmem_overlap_window:
             # Max-TMEM-overlap schedule: load the shared
             # middle D tile first, release TmemC so the next MMA can begin,
             # then consume/store that preloaded fragment and the remaining D
             # tiles. The corresponding T2R index remap must be SSA-safe; see
             # the tmem_c_resources.py comment around t2r_output_call_idx.
-            t2r_rmem, t2r_rmem_1, t2r_output_call_idx = tmem.consumer_work(
-                subtile_idx=0
-            )
-            tmem.release()
-            gmem.store_epilogue(
-                t2r_rmem=t2r_rmem,
-                t2r_rmem_1=t2r_rmem_1,
-                t2r_output_call_idx=t2r_output_call_idx,
-                subtile_idx=0,
-            )
-            for subtile_idx in range(max(0, epi_subtile_cnt - 1)):
+            if cfg.is_swap_ab:
+                t2r_rmem, t2r_rmem_1, t2r_output_call_idx = tmem.consumer_work(
+                    subtile_idx=0
+                )
+                tmem.release()
+                gmem.store_epilogue(
+                    t2r_rmem=t2r_rmem,
+                    t2r_rmem_1=t2r_rmem_1,
+                    t2r_output_call_idx=t2r_output_call_idx,
+                    subtile_idx=0,
+                )
+                overlap_loads = 1
+            else:
+                t2r_rmem, t2r_rmem_1, t2r_output_call_idx = (
+                    tmem.preload_non_swap_overlap()
+                )
+                tmem.release()
+                gmem.store_non_swap_overlap(
+                    t2r_rmem=t2r_rmem,
+                    t2r_rmem_1=t2r_rmem_1,
+                    t2r_output_call_idx=t2r_output_call_idx,
+                )
+                overlap_loads = (
+                    1 if cfg.has_gated_epilogue else cfg.non_swap_tmem_overlap_loads
+                )
+            for subtile_idx in range(max(0, epi_subtile_cnt - overlap_loads)):
                 t2r_rmem, t2r_rmem_1, t2r_output_call_idx = tmem.load_overlap_subtile(
                     subtile_idx=subtile_idx
                 )
@@ -1581,10 +1734,10 @@ def create_epilogue_task(
     return Task(
         src_resources=[tmem_c] + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[gmem_c],
-        warp_idx=cfg.epilogue_warp_idx,
-        num_warps=cfg.num_epilogue_warps,
+        warp_idx=cfg.warp_layout.epilogue_warp_idx,
+        num_warps=cfg.warp_layout.num_epilogue_warps,
         schedule=captured_schedule,
-        num_registers=cfg.epilogue_regs,
+        num_registers=cfg.warp_layout.epilogue_regs,
         name="EpilogueTask0",
     )
 
@@ -1648,8 +1801,8 @@ def create_load_sfab_task(
             + ([work_queue] if cfg.is_persistent else [])
         ),
         dst_resources=[smem_dsfp8_sfab] + _pdl_launch_resources(pdl_launch_resource),
-        warp_idx=cfg.load_sfab_warp_idx,
-        num_warps=cfg.num_load_sfab_warps,
+        warp_idx=cfg.warp_layout.load_sfab_warp_idx,
+        num_warps=cfg.warp_layout.num_load_sfab_warps,
         schedule=captured_schedule,
         num_registers=cfg.load_sfab_regs,
         name="LoadSfAbTask",
@@ -1732,9 +1885,9 @@ def create_epilogue_task_dsfp8(
                         t2r_output_call_idx=acc_tok[2],
                         subtile_idx=0,
                     )
-
-        if cfg.is_swap_ab and cfg.use_tma_store:
-            gmem.drain_swap_ab_tma_stores()
+        # DeepSeek uses a distinct epilogue schedule but the same asynchronous
+        # C-store lifetime and therefore needs the same once-per-kernel drain.
+        gmem.drain_store_tail()
 
     captured_schedule = _call_schedule_with_optional_work_queue(
         epi_schedule,
@@ -1748,10 +1901,10 @@ def create_epilogue_task_dsfp8(
         src_resources=[tmem_c, smem_dsfp8_sfab]
         + ([work_queue] if cfg.is_persistent else []),
         dst_resources=[gmem_c],
-        warp_idx=cfg.epilogue_warp_idx,
-        num_warps=cfg.num_epilogue_warps,
+        warp_idx=cfg.warp_layout.epilogue_warp_idx,
+        num_warps=cfg.warp_layout.num_epilogue_warps,
         schedule=captured_schedule,
-        num_registers=cfg.epilogue_regs,
+        num_registers=cfg.warp_layout.epilogue_regs,
         name="EpilogueTask0DsFp8",
     )
 
@@ -1795,16 +1948,17 @@ def create_workid_task(
         captured_schedule = workid_schedule(work_queue, work_throttle)
     else:
         captured_schedule = workid_schedule(work_queue)
-    return Task(
+    return _make_task(
+        cfg,
+        legacy_run_only_on_cta_id=0 if cfg.uses_two_cta_mma else None,
         src_resources=[work_queue]
         + ([work_throttle] if work_throttle is not None else []),
         dst_resources=[work_queue],
-        warp_idx=cfg.workid_warp_idx,
-        num_warps=cfg.num_workid_warps,
+        warp_idx=cfg.warp_layout.workid_warp_idx,
+        num_warps=cfg.warp_layout.num_workid_warps,
         schedule=captured_schedule,
         num_registers=cfg.workid_regs,
         name="WorkScheduleTask",
-        run_only_on_cta_id=0 if cfg.has_cluster else None,
     )
 
 
@@ -1831,8 +1985,8 @@ def create_padding_task(
     return Task(
         src_resources=[work_queue] if is_persistent else [],
         dst_resources=[],
-        warp_idx=cfg.padding_warp_idx,
-        num_warps=cfg.num_padding_warps,
+        warp_idx=cfg.warp_layout.padding_warp_idx,
+        num_warps=cfg.warp_layout.num_padding_warps,
         schedule=captured_schedule,
         num_registers=cfg.padding_regs,
         name="PaddingTask",

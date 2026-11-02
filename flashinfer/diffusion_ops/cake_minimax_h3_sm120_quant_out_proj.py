@@ -23,7 +23,12 @@ from ..api_logging import flashinfer_api
 from ..jit.cake_minimax_h3_sm120_quant_out_proj import (
     gen_minimax_h3_sm120_quant_out_proj_module,
 )
-from ..utils import register_custom_op, register_fake_op, supported_compute_capability
+from ..utils import (
+    register_custom_op,
+    register_fake_op,
+    supported_compute_capability,
+)
+from .cake_minimax_h3_sm120_quant_gate import require_sm120
 
 MINIMAX_H3_HIDDEN = 5376
 MINIMAX_H3_ATTN_DIM = 7168  # 56 heads x 128
@@ -82,6 +87,7 @@ def _check_common(
     if not 1 <= rows <= MINIMAX_H3_MAX_ROWS:
         raise ValueError(f"M must lie in [1, {MINIMAX_H3_MAX_ROWS}], got {rows}")
     device = attn_out.device
+    require_sm120(device, "output projection")
     _require("attn_out", attn_out, torch.bfloat16, (rows, MINIMAX_H3_ATTN_DIM), device)
     _require(
         "gate", gate, torch.bfloat16, (MINIMAX_H3_GATE_ROWS, MINIMAX_H3_HIDDEN), device

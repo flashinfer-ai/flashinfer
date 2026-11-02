@@ -906,13 +906,13 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         if not fc1_exhausted:
             fc1_counter_pointer = work_id_worker.get_atomic_counter_pointer(Int32(0))
             minimum_claim_count = Int32(self.minimum_global_fc1_claims)
+            # CTAs can observe different counter values. Only uniform work
+            # claims may change fc1_exhausted; this peek only controls waiting.
             if not spin_peek(fc1_counter_pointer, lambda value: value >= minimum_claim_count):
-                claim_target, stream_ends_before_target = resolve_phase_interleaved_fc1_claim_target(
+                claim_target, _ = resolve_phase_interleaved_fc1_claim_target(
                     minimum_claim_count, task_mapping_state
                 )
                 spin_wait(fc1_counter_pointer, lambda value: value >= claim_target)
-                if stream_ends_before_target:
-                    fc1_exhausted = Boolean(True)
         return fc1_exhausted
 
     @cute.jit

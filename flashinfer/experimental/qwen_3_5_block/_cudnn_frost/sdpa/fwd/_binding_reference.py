@@ -473,6 +473,31 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
 
     q, k, v, o = operand("q"), operand("k"), operand("v"), operand("o")
     geo = resolve_thd_geometry(spec, facts)
+    if getattr(spec, "origin_specs", None) is not None:
+        from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.thd_origins import ROLES
+
+        pointers = []
+        for role, origin in zip(ROLES, spec.origin_specs):
+            offset = facts.get(role)
+            if origin is None:
+                if offset is not None:
+                    raise ValueError("unexpected THD physical-offset operand")
+                pointers.append(None)
+                continue
+            if offset is None:
+                raise ValueError("THD physical-offset operand is required")
+            on_plan_device(role, offset)
+            if (
+                offset.dtype != f"int{origin[3]}"
+                or not offset.contiguous
+                or offset.numel != geo.b + 1
+                or 0 <= offset.span < geo.b + 1
+                or not offset.ptr
+                or offset.ptr % (origin[3] // 8)
+            ):
+                raise ValueError("THD physical offsets require contiguous declared-width B+1 storage")
+            pointers.append(offset.ptr)
+        frame[ix["thd_origin_ptrs"]] = tuple(pointers)
     frame[ix["q_ptr"]], frame[ix["k_ptr"]], frame[ix["v_ptr"]], frame[ix["o_ptr"]] = q.ptr, k.ptr, v.ptr, o.ptr
     for name, slot in (("q", "q_strides"), ("o", "o_strides")) + (() if spec.paged else (("k", "k_strides"), ("v", "v_strides"))):
         ts, hs, _es, _row = geo.roles[name]
@@ -555,6 +580,11 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
             frame[ix["k_strides"]] = (kh * d_qk, kh * d_qk, d_qk)
             frame[ix["v_ptr"]] = o.ptr
             frame[ix["v_strides"]] = (kh * d_v, kh * d_v, d_v)
+    if getattr(spec, "origin_specs", None) is not None and "thd_origin_caps" in ix:
+        # Each port's own token capacity, for a host that clips its origins to the buffer. Paged K/V carry no origin.
+        stats = 0 if not spec.has_lse else (lse_cap if lse_cap is not None else (lse_head_stride if spec.lse_head_major and lse_head_stride else t_q))
+        kv = (0, 0) if spec.paged else (_capacity(k, geo.roles["k"], "k"), _capacity(v, geo.roles["v"], "v"))
+        frame[ix["thd_origin_caps"]] = (_capacity(q, geo.roles["q"], "q"), *kv, _capacity(o, geo.roles["o"], "o"), stats)
     if spec.has_lse and spec.lse_head_major:
         frame[ix["lse_ext"]] = lse_head_stride or t_q
     frame[ix["problem_size"]] = (geo.b, spec.qh, spec.kh, t_q, t_kv, 0)
@@ -562,10 +592,18 @@ def _bind_thd_python(spec: ThdLaunchSpec, facts: Dict[str, Optional[BufferFacts]
     # bounded by ceil(T / tile) + B - 1. Observe only host-known capacity;
     # device lengths may change during replay within this captured bound.
     # Keep a persistent kernel's smaller resident-cluster limit as well.
-    units = ((t_q - 1) // spec.cga_tile_m + geo.b) * spec.qh
+    wave_geometry = getattr(spec, "wave_geometry", None)
+    unit_rows, unit_heads = (spec.cga_tile_m, spec.qh) if wave_geometry is None else wave_geometry[:2]
+    units = ((t_q - 1) // unit_rows + geo.b) * unit_heads
     if split is not None:
         units *= split.splits
     frame[ix["n_thd_units"]] = min(frame[ix["n_thd_units"]], units)
+    policy = getattr(spec, "wave_policy", None)
+    if policy is not None:
+        envelope, resident, initial_waves = policy
+        bound = min(envelope, units)
+        limit = resident * initial_waves if wave_geometry is None else wave_geometry[2]
+        frame[ix["n_thd_units"]] = bound if bound <= limit else resident
 
     sinks = facts.get("sinks")
     if spec.has_sink:
@@ -805,17 +843,17 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
             raise ValueError("cudnn.sdpa: this specialization was compiled without a sink; construct the API with has_sink")
         frame[ix["sinks_ptr"]] = 0  # HAS_SINK=False: dead slot; a null faults loudly if it is ever read (Rule 8)
 
-    def lens(name: str) -> int:
+    def lens(name: str, count: int = b) -> int:
         f = facts.get(name)
         if f is None:
             raise ValueError(f"cudnn.sdpa: {name} is required by this compiled specialization")
         _on_plan_device(spec, name, f)
-        if f.dtype != "int32" or not f.contiguous or f.numel < b:
-            raise ValueError(f"cudnn.sdpa: {name} must be a contiguous int32 tensor of at least {b} elements; got {f.dtype} x {f.numel}")
+        if f.dtype != "int32" or not f.contiguous or f.numel < count:
+            raise ValueError(f"cudnn.sdpa: {name} must be a contiguous int32 tensor of at least {count} elements; got {f.dtype} x {f.numel}")
         if f.ptr % _ALIGN_F32:
             raise ValueError(f"cudnn.sdpa: {name} must be 4-byte aligned")
-        if f.span >= 0 and f.span < b:
-            raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {b}")
+        if f.span >= 0 and f.span < count:
+            raise ValueError(f"cudnn.sdpa: {name} spans {f.span} elements; this launch reads {count}")
         return f.ptr
 
     # Dense hosts retain these pointer slots, but only SEQ_KV_PRESENT reads
@@ -823,7 +861,7 @@ def bind_dense(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFacts]], s
     frame[ix["o_desc_ptr"]] = 0
     frame[ix["meta_ptr"]] = lens("seq_kv_lens") if spec.seq_kv_present else 0
     if spec.seq_q_present:
-        frame[ix["seq_q_lens_addr"]] = lens("seq_q_lens")
+        frame[ix["seq_q_lens_addr"]] = lens("seq_q_lens", b + (1 if getattr(spec, "ragged_q_lens", 0) == 2 else 0))
 
     if spec.gate_expect is not None:
         g = _dense_role(spec, facts, "gate", spec.qh, spec.d_v, spec.s_q_max, spec.gate_expect)
@@ -877,6 +915,14 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
             raise ValueError("cudnn.sdpa: split output must match the declared (B, S_q)")
         o_ptr, o_strides = o.ptr, (*o.strides, 1)
         lse_ptr, lse_strides = _dense_lse(spec, facts.get("lse"), spec.b, spec.s_q_max, required=combine.has_stats)
+    if spec.quant is None:
+        workspace_end = workspace_ptr + combine.lse_offset + combine.lse.numel * 4
+        for name, fact in facts.items():
+            if fact is None or fact.numel == 0:
+                continue
+            span = fact.span if fact.span >= 0 else 1 + sum((n - 1) * st for n, st in zip(fact.shape, fact.strides, strict=True))
+            if workspace_ptr < fact.ptr + span * _buffers.DTYPE_ITEMSIZE[fact.dtype] and fact.ptr < workspace_end:
+                raise ValueError(f"cudnn.sdpa: split workspace overlaps {name}")
     lse_partial_ptr = workspace_ptr + combine.lse_offset
     partials = dict(facts, o=combine.o._replace(ptr=workspace_ptr), lse=combine.lse._replace(ptr=lse_partial_ptr))
     frame = bind_dense(spec, partials, stream, stream_int)
@@ -890,7 +936,9 @@ def bind_dense_split(spec: DenseLaunchSpec, facts: Dict[str, Optional[BufferFact
         o_strides,
         lse_strides,
         *ragged_args,
+        *((frame[spec.index["sinks_ptr"]],) if spec.has_sink else ()),
         stream,
+        *((frame[spec.index["seq_q_lens_addr"]],) if getattr(spec, "ragged_q_lens", 0) else ()),
     )
     return frame, combine_args
 
@@ -956,7 +1004,12 @@ class ReferenceThdBinder(_ReferenceBinder):
         from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.prepared import _NATIVE_THD_ROLES
 
         spec = self.spec
-        facts = self.facts(pack, indices, _NATIVE_THD_ROLES + _native_quant_roles(spec.quant))
+        roles = _NATIVE_THD_ROLES + _native_quant_roles(spec.quant)
+        if getattr(spec, "origin_specs", None) is not None:
+            from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.fwd.thd_origins import ROLES
+
+            roles += ROLES
+        facts = self.facts(pack, indices, roles)
         if spec.quant is not None:
             return execute_quantized(spec, facts, workspace, stream, int(stream), scale_softmax_log2=scale)
         return execute_thd(spec, facts, workspace, stream, int(stream), scale)

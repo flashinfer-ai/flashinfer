@@ -269,7 +269,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap W, const __grid_constant
                     if (res_stage_m == 4) { res_stage_m = 0; _phase_res_full ^= 1; }
                 }
                 m_prev_m = m_tile_m;
-                unsigned int cur_slot = res_stage_m - 1;
+                unsigned int cur_slot = (res_stage_m + 3u) % 4u;
                 #pragma unroll 1
                 for (int i_1 = 0; i_1 < k_count_1; i_1++) {
                     mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);

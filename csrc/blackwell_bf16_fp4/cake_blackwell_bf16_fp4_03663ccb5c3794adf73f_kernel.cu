@@ -230,6 +230,9 @@ kernel_cake_blackwell_bf16_fp4_03663ccb5c3794adf73f(const __grid_constant__ CUte
 
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 568);
+    int taddr;
+    int tmem_accum;
 
     // Kernel setup ops
     __nv_bfloat16* smem_a = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -284,29 +287,18 @@ kernel_cake_blackwell_bf16_fp4_03663ccb5c3794adf73f(const __grid_constant__ CUte
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-
-    // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 568);
-    if (warp == 0) {
-        int _tmem_hold = smem + 568;
-        asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
-        __syncwarp();
-        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
-    }
-
-    if (warp <= 4) {
-        asm volatile("barrier.sync.aligned %0, %1;" :: "r"(7), "r"(160) : "memory");
-    }
-    const int taddr = (warp <= 4) ? tmem_addr_storage[0] : 0;
-
     // Kernel post-init ops
-    const int tmem_accum = taddr;
+    __syncthreads();
 
     // ---- Role: epilogue ----
     if (warp <= 3) {
         { // epilogue_main
+            asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+            asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+            asm volatile("barrier.sync 7, 160;" ::: "memory");
+            asm volatile("tcgen05.fence::after_thread_sync;");
+            taddr = tmem_addr_storage[0];
+            tmem_accum = taddr;
             unsigned int epi_stage = 0;
             const int epi_warp = warp % 4;
             const int epi_tid = epi_warp * 32 + lane;
@@ -509,6 +501,16 @@ kernel_cake_blackwell_bf16_fp4_03663ccb5c3794adf73f(const __grid_constant__ CUte
     // ---- Role: mma ----
     if (warp == 4) {
         { // mma_main
+            asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+            asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+            int _tmem_alloc_hold = smem + 568;
+            asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_alloc_hold), "r"(256) : "memory");
+            __syncwarp();
+            asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
+            asm volatile("barrier.sync 7, 160;" ::: "memory");
+            asm volatile("tcgen05.fence::after_thread_sync;");
+            taddr = tmem_addr_storage[0];
+            tmem_accum = taddr;
             unsigned int mma_a_stage = 0;
             unsigned int mma_b_stage = 0;
             unsigned int mma_epi_stage = 0;
@@ -608,12 +610,14 @@ kernel_cake_blackwell_bf16_fp4_03663ccb5c3794adf73f(const __grid_constant__ CUte
     // ---- Role: load_a ----
     if (warp == 5) {
         { // load_a_main
+            asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
             unsigned int load_a_stage = 0;
             int num_iters_1 = K / 64;
             if (elect_sync()) {
                 asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory");
             }
             asm volatile("griddepcontrol.wait;" ::: "memory");
+            asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
             unsigned int _phase_smem_a_done = 1;
             if (elect_sync()) {
                 #pragma unroll 1
@@ -663,6 +667,7 @@ kernel_cake_blackwell_bf16_fp4_03663ccb5c3794adf73f(const __grid_constant__ CUte
     // ---- Role: load_b ----
     if (warp == 6) {
         { // load_b_main
+            asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
             unsigned int load_b_stage = 0;
             int num_groups = K / 256;
             unsigned int _phase_bsrc_done = 1;
@@ -686,11 +691,14 @@ kernel_cake_blackwell_bf16_fp4_03663ccb5c3794adf73f(const __grid_constant__ CUte
                     }
                 }
             }
+            __syncwarp();
+            asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         }
     }
     // ---- Role: load_b2 ----
     if (warp == 7) {
         { // load_b2_main
+            asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
             unsigned int load_b_stage_1 = 1;
             unsigned int sf_stage = 0;
             int num_groups_1 = K / 256;
@@ -722,11 +730,15 @@ kernel_cake_blackwell_bf16_fp4_03663ccb5c3794adf73f(const __grid_constant__ CUte
                     }
                 }
             }
+            __syncwarp();
+            asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         }
     }
     // ---- Role: convert ----
     if (warp >= 8 && warp <= 15) {
         { // convert_main
+            asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+            asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
             int warp_id_in_role = warp - 8;
             int group_2 = warp_id_in_role / 2;
             unsigned int cvt_stage = (unsigned int)group_2;

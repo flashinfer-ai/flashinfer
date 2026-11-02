@@ -74,7 +74,81 @@ def test_materializes_all_matching_candidates(monkeypatch, candidates, quant_pai
             assert preparer.call_args.kwargs["quant"] is cfg.quant
 
 
-def _bf16_moe_config(*, num_experts, local_num_experts, offset, intermediate, top_k=4):
+def test_materializes_trtllm_fp8_block_view(monkeypatch):
+    import dataclasses
+    from unittest.mock import Mock
+
+    import torch
+
+    from flashinfer.fused_moe.api import (
+        BackendOptions,
+        QuantConfig,
+        QuantFormat,
+        TrtllmFp8BlockConfig,
+    )
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
+        materialize_fused_moe_weights,
+    )
+
+    preparer = Mock(return_value={"weight": torch.tensor([0])})
+    monkeypatch.setattr(TrtllmFp8BlockConfig, "prepare_weights", preparer)
+    cfg = dataclasses.replace(
+        _nvfp4_moe_config(
+            num_experts=8, local_num_experts=2, offset=2, intermediate=128
+        ),
+        quant=QuantConfig(
+            weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+        ),
+        backend=BackendOptions(
+            candidates=(TrtllmFp8BlockConfig(), TrtllmFp8BlockConfig())
+        ),
+    )
+    weights = MoEWeightPack(
+        w13=torch.empty(2, 256, 256, dtype=torch.bfloat16),
+        w2=torch.empty(2, 256, 128, dtype=torch.bfloat16),
+    )
+    pack = materialize_fused_moe_weights(weights, cfg)
+    assert set(pack.native_views) == {"trtllm_fp8_block"}
+    assert pack.get_view("trtllm_fp8_block") is preparer.return_value
+    preparer.assert_called_once()
+    assert preparer.call_args.args[0] is weights.w13
+    assert preparer.call_args.args[1] is weights.w2
+    assert preparer.call_args.kwargs["num_local_experts"] == 2
+    assert preparer.call_args.kwargs["quant"] is cfg.quant
+
+
+def test_prequantized_weights_raise():
+    import torch
+
+    from flashinfer.moe_ep import MoEWeightPack, PrequantizedMoEWeights
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
+        materialize_fused_moe_weights,
+    )
+
+    weights = MoEWeightPack(
+        w13=torch.empty(2, 256, 128, dtype=torch.uint8),
+        w2=torch.empty(2, 256, 64, dtype=torch.uint8),
+        w13_scale=torch.empty(2, 256, 16, dtype=torch.uint8),
+        w2_scale=torch.empty(2, 256, 8, dtype=torch.uint8),
+    )
+    assert isinstance(weights, PrequantizedMoEWeights)
+    cfg = _nvfp4_moe_config(
+        num_experts=8, local_num_experts=2, offset=2, intermediate=128
+    )
+    with pytest.raises(NotImplementedError, match="PrequantizedMoEWeights"):
+        materialize_fused_moe_weights(weights, cfg)
+
+
+def _bf16_moe_config(
+    *,
+    num_experts,
+    local_num_experts,
+    offset,
+    intermediate,
+    top_k=4,
+    activation=None,
+):
     from flashinfer.fused_moe.api import (
         BackendOptions,
         ExecutionConfig,
@@ -86,6 +160,9 @@ def _bf16_moe_config(*, num_experts, local_num_experts, offset, intermediate, to
         TrtllmBf16Config,
     )
 
+    kwargs = {}
+    if activation is not None:
+        kwargs["activation"] = activation
     return MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
         quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
@@ -96,6 +173,7 @@ def _bf16_moe_config(*, num_experts, local_num_experts, offset, intermediate, to
         ),
         backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
         execution=ExecutionConfig(tune_max_num_tokens=512),
+        **kwargs,
     )
 
 
@@ -129,9 +207,16 @@ def _nvfp4_moe_config(*, num_experts, local_num_experts, offset, intermediate, t
     reason="CUDA required for weight layout transforms",
 )
 class TestMaterializeFusedMoeWeights:
-    def test_bf16_matches_manual_prepare(self):
+    @pytest.mark.parametrize("activation_name", ["swiglu", "relu2"])
+    def test_bf16_matches_manual_prepare(self, activation_name):
         import torch
 
+        from flashinfer.fused_moe.api import ReLU2, SwiGLU
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            convert_to_block_layout,
+            get_w2_permute_indices_with_cache,
+        )
         from flashinfer.moe_ep import MoEWeightPack
         from flashinfer.moe_ep.backends.split.kernel.fused_moe.weights import (
             materialize_fused_moe_weights,
@@ -139,9 +224,9 @@ class TestMaterializeFusedMoeWeights:
 
         device = "cuda"
         local_n, hidden, intermediate = 2, 256, 128
-        w13 = torch.randn(local_n, 2 * intermediate, hidden, device=device).to(
-            torch.bfloat16
-        )
+        activation = SwiGLU() if activation_name == "swiglu" else ReLU2()
+        gemm1_rows = intermediate * (2 if activation.is_gated else 1)
+        w13 = torch.randn(local_n, gemm1_rows, hidden, device=device).to(torch.bfloat16)
         w2 = torch.randn(local_n, hidden, intermediate, device=device).to(
             torch.bfloat16
         )
@@ -150,16 +235,62 @@ class TestMaterializeFusedMoeWeights:
             local_num_experts=local_n,
             offset=0,
             intermediate=intermediate,
+            activation=activation,
         )
         canonical = MoEWeightPack(w13=w13, w2=w2)
 
-        pack_a = materialize_fused_moe_weights(canonical, cfg)
-        pack_b = materialize_fused_moe_weights(canonical, cfg)
-        view_a = pack_a.get_view("trtllm_bf16_routed")
-        view_b = pack_b.get_view("trtllm_bf16_routed")
-        for key in ("gemm1_weights", "gemm2_weights"):
-            torch.testing.assert_close(view_a[key], view_b[key])
-        assert view_a["gemm1_weights"].dtype == torch.bfloat16
+        got = materialize_fused_moe_weights(canonical, cfg).get_view(
+            "trtllm_bf16_routed"
+        )
+        cache = {}
+        gemm1_expected = []
+        gemm2_expected = []
+        for expert in range(local_n):
+            w1_u8 = w13[expert].view(torch.uint8)
+            p1 = _maybe_get_cached_w3_w1_permute_indices(
+                cache,
+                w1_u8,
+                128,
+                is_gated_act_gemm=activation.is_gated,
+            )
+            gemm1_expected.append(
+                convert_to_block_layout(w1_u8[p1.to(device)].contiguous(), 128)
+            )
+
+            w2_u8 = w2[expert].view(torch.uint8)
+            p2 = get_w2_permute_indices_with_cache(
+                cache,
+                w2_u8,
+                128,
+                is_gated_act_gemm=activation.is_gated,
+            )
+            gemm2_expected.append(
+                convert_to_block_layout(w2_u8[p2.to(device)].contiguous(), 128)
+            )
+        expected = {
+            "gemm1_weights": torch.stack(gemm1_expected).view(torch.bfloat16),
+            "gemm2_weights": torch.stack(gemm2_expected).view(torch.bfloat16),
+        }
+        assert set(got) == set(expected)
+        for key in expected:
+            torch.testing.assert_close(got[key], expected[key])
+        assert got["gemm1_weights"].dtype == torch.bfloat16
+        if not activation.is_gated:
+            gated_cache = {}
+            gated_gemm1 = []
+            for expert in range(local_n):
+                w1_u8 = w13[expert].view(torch.uint8)
+                p1 = _maybe_get_cached_w3_w1_permute_indices(
+                    gated_cache,
+                    w1_u8,
+                    128,
+                    is_gated_act_gemm=True,
+                )
+                gated_gemm1.append(
+                    convert_to_block_layout(w1_u8[p1.to(device)].contiguous(), 128)
+                )
+            gated_gemm1 = torch.stack(gated_gemm1).view(torch.bfloat16)
+            assert not torch.equal(got["gemm1_weights"], gated_gemm1)
 
     def test_bf16_view_keys(self):
         import torch

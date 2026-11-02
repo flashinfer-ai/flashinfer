@@ -18,11 +18,33 @@ NEXT_GAIN_CENTER = 1.0
 BACKENDS = ("auto", "cake", "cute")
 
 
+def _cake_admits(inputs, post_weight=None) -> bool:
+    """Whether the Cake package ships a program whose window admits the call's
+    row count.  Its routes may leave declared gaps (sm_107a: scalar alpha with
+    post_weight, 255 rows or fewer), which ``"auto"`` serves through the CuTe
+    DSL kernel and an explicit ``"cake"`` call rejects; the support predicate
+    answers for the device and the variant."""
+    return bool(
+        norm._HAS_CAKE_FUSED_NORM
+        and norm._cake_gated_residual_next_rmsnorm_supported(
+            inputs[0].device,
+            tensor_alpha=isinstance(inputs[3], torch.Tensor),
+            has_post_weight=post_weight is not None,
+            rows=inputs[0].shape[0] or None,
+        )
+    )
+
+
 def _skip_unless_supported(inputs, backend, **kwargs):
     if not supports_gated_residual_next_rmsnorm(*inputs, **kwargs):
         pytest.skip("gated residual next RMSNorm requires SM100, SM103, or SM107")
     if not supports_gated_residual_next_rmsnorm(*inputs, backend=backend, **kwargs):
         pytest.skip(f"backend {backend!r} is not available on this device")
+    if backend == "cake" and not _cake_admits(inputs, kwargs.get("post_weight")):
+        pytest.skip(
+            f"the Cake package ships no program for {inputs[0].shape[0]} rows of"
+            " this form on this device"
+        )
 
 
 def _inputs(rows: int):
@@ -161,6 +183,77 @@ def test_cake_dispatch_prefers_the_package(
             gated_residual_next_rmsnorm(*inputs, backend="fast", **kwargs)
 
 
+@pytest.mark.parametrize("alpha", [1.0, None])
+@pytest.mark.parametrize("post_input_scale", [False, True])
+def test_dispatch_follows_the_package_windows(monkeypatch, alpha, post_input_scale):
+    # A row count in a gap of the package's windows: auto runs the call on the CuTe
+    # DSL kernel, while an explicit cake call reaches the package, which raises
+    # there.  The support predicates answer for the device and the variant (cake)
+    # or for the call (auto, cute): all three stay true.
+    monkeypatch.setattr(norm, "_HAS_CUTE_DSL_FUSED_NORM", True)
+    monkeypatch.setattr(norm, "_HAS_CAKE_FUSED_NORM", True)
+    monkeypatch.setattr(norm, "_is_aligned", lambda *_: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 7))
+    monkeypatch.setattr(norm, "_cute_dsl_supports_arch", lambda *_: True)
+    admitted_rows = {None, 1, 256}
+
+    def supported(device, *, tensor_alpha, has_post_weight, rows=None):
+        return rows in admitted_rows
+
+    monkeypatch.setattr(
+        norm, "_cake_gated_residual_next_rmsnorm_supported", supported, raising=False
+    )
+    cake_calls, cute_calls = [], []
+    monkeypatch.setattr(
+        norm,
+        "_cake_gated_residual_next_rmsnorm",
+        lambda *args, **kwargs: cake_calls.append((args, kwargs)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        norm,
+        "_gated_residual_next_rmsnorm_cute",
+        lambda *args: cute_calls.append(args),
+        raising=False,
+    )
+    with FakeTensorMode():
+        weight = torch.empty(HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        beta = torch.empty(HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        gate = torch.empty(HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        kwargs = (
+            {"post_weight": weight, "post_gain_center": 1.0} if post_input_scale else {}
+        )
+        post_weight = kwargs.get("post_weight")
+        for rows, admitted in ((1, True), (17, False), (256, True)):
+            branch = torch.empty(rows, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+            residual = torch.empty(
+                rows, HIDDEN_SIZE, dtype=torch.float32, device="cuda"
+            )
+            inputs = (branch, residual, weight, gate if alpha is None else alpha, beta)
+            for backend in BACKENDS:
+                assert supports_gated_residual_next_rmsnorm(
+                    *inputs, backend=backend, post_weight=post_weight
+                )
+            assert _cake_admits(inputs, post_weight) is admitted
+            before = (len(cake_calls), len(cute_calls))
+            gated_residual_next_rmsnorm(*inputs, backend="auto", **kwargs)
+            gated_residual_next_rmsnorm(*inputs, backend="cake", **kwargs)
+            after = (len(cake_calls), len(cute_calls))
+            if admitted:
+                assert after == (before[0] + 2, before[1])
+            else:
+                assert after == (before[0] + 1, before[1] + 1)
+        # An empty batch is never a gap.
+        empty = torch.empty(0, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        empty_residual = torch.empty(0, HIDDEN_SIZE, dtype=torch.float32, device="cuda")
+        empty_inputs = (empty, empty_residual, weight, gate if alpha is None else alpha, beta)  # fmt: skip
+        assert _cake_admits(empty_inputs, post_weight)
+        for backend in BACKENDS:
+            assert supports_gated_residual_next_rmsnorm(
+                *empty_inputs, backend=backend, post_weight=post_weight
+            )
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("rows", [0, 1, 17, 128, 2048])
 @pytest.mark.parametrize("post_gain_center", [None, 0.0, 1.0])
@@ -213,10 +306,77 @@ def test_scalar_alpha_matches_tensor(alpha, rows, post_input_scale, backend):
     assert supports_gated_residual_next_rmsnorm(
         *inputs, post_weight=kwargs.get("post_weight"), backend=backend
     )
+    if backend == "cake" and not _cake_admits(inputs, kwargs.get("post_weight")):
+        # A declared gap of the package's windows for the scalar form's row count
+        # (sm_107a: scalar alpha with post_weight, 255 rows or fewer) while it
+        # serves the tensor form: an explicit cake call is rejected there and
+        # "auto" runs those rows on the CuTe DSL kernel.
+        with pytest.raises(ValueError, match="no exported program"):
+            _call(inputs, backend=backend, **kwargs)
+        pytest.skip(
+            f"the Cake package ships no program for {rows} rows of the scalar-alpha"
+            f"{' post_weight' if post_input_scale else ''} form on this device"
+        )
     actual = _call(inputs, backend=backend, **kwargs)
     _assert_close(actual, _reference(inputs, **kwargs))
     inputs[3] = torch.full_like(inputs[4], alpha)
     _assert_close(actual, _call(inputs, backend=backend, **kwargs))
+
+
+@pytest.mark.parametrize("post_input_scale", [False, True])
+@pytest.mark.parametrize("tensor_alpha", [False, True])
+def test_cake_dispatch_matches_the_served_rows(tensor_alpha, post_input_scale):
+    """The Cake package serves exactly the row counts its windows admit: a row
+    count in a declared gap of its windows (sm_107a: scalar alpha with
+    post_weight, 255 rows or fewer) is rejected by an explicit cake call and
+    served by ``"auto"`` through the CuTe DSL kernel, with the reference's result
+    either way.  The support predicates answer for the device and the variant
+    throughout."""
+    if not norm._HAS_CAKE_FUSED_NORM or not supports_gated_residual_next_rmsnorm(
+        *_inputs(1), backend="cake"
+    ):
+        pytest.skip(
+            "gated residual next RMSNorm with the Cake package requires SM100, SM103, or SM107"
+        )
+    served = []
+    for rows in (1, 17, 255, 256, 257, 1024):
+        torch.manual_seed(2000 + rows)
+        inputs = list(_inputs(rows))
+        kwargs = {}
+        if post_input_scale:
+            kwargs = {
+                "post_weight": torch.randn_like(inputs[2]) * 0.1,
+                "post_gain_center": 1.0,
+            }
+        if not tensor_alpha:
+            inputs[3] = 0.5
+        post_weight = kwargs.get("post_weight")
+        assert supports_gated_residual_next_rmsnorm(
+            *inputs, backend="cake", post_weight=post_weight
+        )
+        if _cake_admits(inputs, post_weight):
+            served.append(rows)
+            _assert_close(
+                _call(inputs, backend="cake", **kwargs), _reference(inputs, **kwargs)
+            )
+        else:
+            with pytest.raises(ValueError, match="no exported program"):
+                _call(inputs, backend="cake", **kwargs)
+            if not supports_gated_residual_next_rmsnorm(
+                *inputs, backend="cute", post_weight=post_weight
+            ):
+                # no kernel serves the gap on this device: auto says so
+                assert not supports_gated_residual_next_rmsnorm(
+                    *inputs, backend="auto", post_weight=post_weight
+                )
+                continue
+        assert supports_gated_residual_next_rmsnorm(
+            *inputs, backend="auto", post_weight=post_weight
+        )
+        _assert_close(
+            _call(inputs, backend="auto", **kwargs), _reference(inputs, **kwargs)
+        )
+    assert served, "the Cake package serves no row count of this form on this device"
 
 
 def test_gated_residual_next_rmsnorm_rejects_unsafe_layouts():
@@ -265,7 +425,6 @@ def test_gated_residual_next_rmsnorm_cuda_graph_uses_changed_inputs(
     post_input_scale, alpha, backend
 ):
     inputs = list(_inputs(17))
-    _skip_unless_supported(inputs, backend)
     if alpha is not None:
         inputs[3] = alpha
     kwargs = {}
@@ -274,6 +433,7 @@ def test_gated_residual_next_rmsnorm_cuda_graph_uses_changed_inputs(
             "post_weight": torch.randn_like(inputs[2]) * 0.1,
             "post_gain_center": 1.0,
         }
+    _skip_unless_supported(inputs, backend, post_weight=kwargs.get("post_weight"))
     _call(inputs, backend=backend, **kwargs)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

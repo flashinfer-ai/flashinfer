@@ -1132,7 +1132,7 @@ def _benchmark_distributed_ep(
             hidden_states,
             topk_indices,
             topk_values,
-            max_tokens_per_rank=runtime_max_tokens_per_rank,
+            runtime_max_tokens_per_rank=runtime_max_tokens_per_rank,
         )
         return received.hidden_states, received.topk_ids, received.topk_weights
 

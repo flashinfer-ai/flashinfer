@@ -724,6 +724,20 @@ __device__ __host__ inline void assertClose(half a, half b, float threshold = 0.
   assertClose(__half2float(a), __half2float(b), threshold);
 }
 
+// bf16 from the f16 pairs of the sm_89+ e4m3 paths below, through f32 with rounding toward zero:
+// the steps of the per-element bf16 conversion, two elements at a time, so every e4m3 value (NaN
+// and -0 included) keeps its result.
+__device__ inline Vec<uint32_t, 2> convertF16PairsToBf16(Vec<uint32_t, 2> const& f16Pairs) {
+  Vec<uint32_t, 2> ret;
+#pragma unroll
+  for (uint32_t i = 0; i < 2; i++) {
+    float2 const f = __half22float2(reinterpret_cast<half2 const&>(f16Pairs[i]));
+    __nv_bfloat162 const b = __halves2bfloat162(__float2bfloat16_rz(f.x), __float2bfloat16_rz(f.y));
+    ret[i] = reinterpret_cast<uint32_t const&>(b);
+  }
+  return ret;
+}
+
 template <typename InputElem, typename CacheElem>
 __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16(uint32_t i8data) {
   static_assert(mha::is_same_v<InputElem, half> || mha::is_same_v<InputElem, __nv_bfloat16>,
@@ -741,6 +755,10 @@ __device__ inline Vec<uint32_t, 2> convertKCacheWordToF16(uint32_t i8data) {
         : "=r"(dst[0]), "=r"(dst[1])
         : "h"(src[0]), "h"(src[1]));
     return ret;
+  }
+  if constexpr (mha::is_same_v<InputElem, __nv_bfloat16> &&
+                mha::is_same_v<CacheElem, __nv_fp8_e4m3>) {
+    return convertF16PairsToBf16(convertKCacheWordToF16<half, CacheElem>(i8data));
   }
 #endif
   CacheElem const(&src)[4] = reinterpret_cast<CacheElem(&)[4]>(i8data);
@@ -842,6 +860,10 @@ __device__ inline Vec<uint32_t, 2> convertVCacheWordToF16(uint32_t i8data) {
         : "=r"(dst[0]), "=r"(dst[1])
         : "r"(i8data));
     return ret;
+  }
+  if constexpr (mha::is_same_v<InputElem, __nv_bfloat16> &&
+                mha::is_same_v<CacheElem, __nv_fp8_e4m3>) {
+    return convertF16PairsToBf16(convertVCacheWordToF16<half, CacheElem>(i8data));
   }
 #endif
   CacheElem const(&src)[2][2] = reinterpret_cast<CacheElem(&)[2][2]>(i8data);
