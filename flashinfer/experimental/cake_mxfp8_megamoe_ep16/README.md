@@ -102,7 +102,7 @@ that rank's slot on the ranks that own the row's experts, so dispatch reads rows
 and routes from local memory. Neither implementation allocates device storage in
 the forward path. CUDA Graph capture is not supported.
 Calls on one session must be serialized on a single CUDA stream. Recreate the
-session after 14,913,080 forwards (11,184,810 for the SM107 CUDA module),
+session after 14,913,080 forwards (10,324,440 for the SM107 CUDA module),
 before its signed grid-counter epoch would overflow.
 
 The backend does not participate in automatic routing, autotuning, trace
