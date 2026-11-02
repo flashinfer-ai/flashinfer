@@ -88,7 +88,7 @@ _FP8_TO_FP4_INPUT_DTYPES = (torch.float8_e4m3fn,)
 
 def _require_sm100_fp4_quantize(device: torch.device, op: str) -> None:
     if device.type != "cuda":
-        return
+        device = torch.device("cuda", torch.cuda.current_device())
     major, minor = get_compute_capability(device)
     if major < 10:
         raise ValueError(f"{op} requires SM100 or newer, got SM{major}{minor}")
@@ -1727,6 +1727,7 @@ def nvfp4_quantize(
                     "CuTe-DSL backend requested but CuTe-DSL is not available. "
                     "Please install the required dependencies."
                 )
+            _require_sm100_fp4_quantize(a.device, "nvfp4_quantize")
             from .kernels.nvfp4_quantize import (
                 SF_LAYOUT_128x4,
                 SF_LAYOUT_8x4,

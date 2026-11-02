@@ -2674,7 +2674,6 @@ def test_nvfp4_quantize_pdl_waits_for_global_scale(dtype, shape):
     torch.testing.assert_close(fp4, expected_fp4, rtol=0, atol=0)
 
 
-
 @pytest.mark.parametrize(
     "quantize",
     [
@@ -2684,6 +2683,9 @@ def test_nvfp4_quantize_pdl_waits_for_global_scale(dtype, shape):
         lambda x, gs: nvfp4_quantize(x, gs),
         lambda x, gs: nvfp4_quantize(x, gs, backend="cute-dsl"),
         lambda x, gs: nvfp4_quantize(x, gs, per_token_activation=True),
+        lambda x, gs: nvfp4_quantize(
+            x, gs, per_token_activation=True, backend="cute-dsl"
+        ),
         lambda x, gs: mxfp4_quantize(x),
         lambda x, gs: mxfp4_quantize(x, backend="cute-dsl"),
     ],
