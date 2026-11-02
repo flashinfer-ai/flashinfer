@@ -461,10 +461,10 @@ def _route_rule(route: str) -> dict:
 
 
 def test_registry_records_are_well_formed() -> None:
-    # the 67 g-mode records, the 8 raw-gate ones (each raw record its own library) and the 3 programs of the
-    # in-kernel Q/K L2 norm's fallback route
-    assert len(cake_jit.MODULES) == 78
-    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 76
+    # the 67 g-mode records, the 8 raw-gate ones (each raw record its own library), the 3 programs of the
+    # in-kernel Q/K L2 norm's fallback route and its 2 GLM intra capture forms (g, raw)
+    assert len(cake_jit.MODULES) == 80
+    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 78
     assert tuple(cake_jit.PATHS) == PATHS
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
     assert frozenset(cake_jit.GATE_STAGES) == GATE_STAGES
@@ -580,18 +580,31 @@ def test_registry_records_are_well_formed() -> None:
                 for n in names
                 if stage in GATE_STAGES
             ), (stage, gate)
-            kinds = [cake_jit.MODULES[n]["select_rule"]["kind"] for n in names]
             if not names:
                 assert stage in OPTIONAL_STAGES and stage in GATE_STAGES, (stage, gate)
-            elif len(names) == 1 and stage in OPTIONAL_STAGES:
-                assert kinds[0] not in ("always", "otherwise"), (stage, gate)
-            elif len(names) == 1:
-                assert kinds == ["always"], (stage, gate)
-            else:
-                assert "always" not in kinds and kinds.count("otherwise") <= 1, (
-                    stage,
-                    gate,
-                )
+            # and per in-kernel Q/K L2 norm mode (a record serves the modes its ``l2n`` lists, ``["off"]`` when
+            # absent); an l2n mode's class may still be empty (its records ship later; planning refuses the mode)
+            for mode in cake_jit.L2N_MODES:
+                mnames = [
+                    n for n in names if mode in cake_jit.MODULES[n].get("l2n", ["off"])
+                ]
+                kinds = [cake_jit.MODULES[n]["select_rule"]["kind"] for n in mnames]
+                if not mnames:  # the fallback stages serve no other mode
+                    assert mode != "off" or stage in OPTIONAL_STAGES, (
+                        stage,
+                        gate,
+                        mode,
+                    )
+                elif len(mnames) == 1 and stage in OPTIONAL_STAGES:
+                    assert kinds[0] not in ("always", "otherwise"), (stage, gate, mode)
+                elif len(mnames) == 1:
+                    assert kinds == ["always"], (stage, gate, mode)
+                else:
+                    assert "always" not in kinds and kinds.count("otherwise") <= 1, (
+                        stage,
+                        gate,
+                        mode,
+                    )
     assert cake_jit.records_of_stage("gate_epilogue", "raw") == ()
     assert cake_jit.records_of_stage("param_finalize") == ()
     with pytest.raises(ValueError, match="gate"):
@@ -929,6 +942,12 @@ def test_the_raw_gate_records_mirror_the_g_records() -> None:
     parameter finalize runs on every backward path with one CTA per head, reading the partials alone."""
     modules = cake_jit.MODULES
     raw_names = {name for name, rec in modules.items() if rec.get("gate") == "raw"}
+    # the in-kernel Q/K L2 norm's raw GLM intra capture form serves the fallback mode alone (test_cake_kda_det_train_l2n)
+    l2n_raw = {
+        name for name in raw_names if "off" not in modules[name].get("l2n", ["off"])
+    }
+    assert l2n_raw == {"glm_intra_raw_l2n_capture"}
+    raw_names -= l2n_raw
     assert raw_names == set(RAW_TWIN_RECORDS.values()) | {RAW_GLM_INTRA, RAW_FINALIZE}
     assert modules["gate_epilogue"]["gate"] == "g"
     tensors, scalars = set(cake_jit.LOGICAL_TENSORS), set(cake_jit.LOGICAL_SCALARS)
@@ -1010,7 +1029,12 @@ def test_the_raw_gate_records_mirror_the_g_records() -> None:
         assert cake_jit.records_of_stage(stage, "raw") == tuple(
             RAW_TWIN_RECORDS[n] for n in g_names
         ), stage
-    assert cake_jit.records_of_stage("glm_intra", "raw") == (RAW_GLM_INTRA,)
+    # flag off (the in-kernel Q/K L2 norm's raw capture form serves the fallback mode alone)
+    assert tuple(
+        n
+        for n in cake_jit.records_of_stage("glm_intra", "raw")
+        if "off" in cake_jit.MODULES[n].get("l2n", ["off"])
+    ) == (RAW_GLM_INTRA,)
     assert cake_jit.records_of_stage("param_finalize", "raw") == (RAW_FINALIZE,)
 
 
@@ -3511,16 +3535,16 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    # The 76 programs of cake_jit.MODULES (65 of the g gate, the 8 raw-gate programs and the 3 of the Q/K L2 norm's
-    # fallback route), each built for the architectures its record delivers (72 on all three, the four of
-    # RECORD_ARCHES on one each: 220 libraries); the KCP programs have their own package.
+    # The 78 programs of cake_jit.MODULES (65 of the g gate, the 8 raw-gate programs and the 5 of the Q/K L2 norm's
+    # fallback route), each built for the architectures its record delivers (74 on all three, the four of
+    # RECORD_ARCHES on one each: 226 libraries); the KCP programs have their own package.
     train_libraries = {
         (record["library"], arch)
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
-    assert len(train_libraries) == 220
-    assert len(names) == len(set(names)) == 220
+    assert len(train_libraries) == 226
+    assert len(names) == len(set(names)) == 226
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"
