@@ -242,6 +242,26 @@ WORK_BIN_MIX_SPAN_ARCHES = ("sm_103a",)
 WORK_BIN_MIX_MAX_GIVE = 8
 WORK_BIN_MIX_SLOTS = 8
 WORK_BIN_MIX_SLOT_ELEMENTS = 16384
+# Helper-pool build of the bin-mix build (``_RENDERED_WORK_BIN_POOL_ROUTES``):
+# every bin holding one long task is an owner that gives its last ``give``
+# chunks, and a helper bin serves up to WORK_BIN_POOL_MAX_PIECES owners, one
+# piece each, back to back after its own tasks, through the bin-mix ring.  The
+# rule admits launches of WORK_BIN_POOL_LONG and WORK_BIN_POOL_SHORT token
+# sequences only, a long one present, with more tasks than SMs, every long
+# task alone in its turnover bin and at most WORK_BIN_POOL_MAX_PIECES owners
+# per helper; give = min(WORK_BIN_POOL_MAX_GIVE, WORK_BIN_MIX_SLOTS, long
+# chunks - 1).  Owners go in bin order to the helper with the least projected
+# load.  The plan holds the bin-mix words (four per bin), then
+# WORK_BIN_POOL_MAGIC, then four words per bin for a helper's second piece.
+# Measured on B200 (148 SMs) and GB300 (152 SMs) with 8 x (1024 + 64) tokens
+# and 12 heads: 0.921 to 0.923 of the launch time without the pool.
+WORK_BIN_POOL_MAGIC = 0x58313223
+# Architectures whose admitted launches take the helper-pool build.
+WORK_BIN_POOL_ARCHES = ("sm_100a", "sm_103a")
+WORK_BIN_POOL_LONG = 1024
+WORK_BIN_POOL_SHORT = 64
+WORK_BIN_POOL_MAX_GIVE = 8
+WORK_BIN_POOL_MAX_PIECES = 2
 # Architectures whose one-wave BF16 grid sweep selected the M64 value split over
 # every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
 BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
@@ -1474,6 +1494,119 @@ def _work_bin_mix_program(program, gpu_arch: str):
     return None
 
 
+def _work_bin_pool_program(program, gpu_arch: str):
+    """The ``_RENDERED_WORK_BIN_POOL_ROUTES`` build beside the work-bin turnover
+    build ``program`` (``_RENDERED_WORK_BIN_TURN_ROUTES``), or ``None``; always
+    ``None`` on an architecture outside ``WORK_BIN_POOL_ARCHES``."""
+    if program is None or gpu_arch not in WORK_BIN_POOL_ARCHES:
+        return None
+    pool = getattr(_kda_registry, "_RENDERED_WORK_BIN_POOL_ROUTES", {}).get(
+        gpu_arch, {}
+    )
+    if not pool:
+        return None
+    turn = _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {})
+    for module, turnover in turn.items():
+        if turnover == program and module in pool:
+            return pool[module]
+    return None
+
+
+@cache
+def _work_bin_pool_plan(
+    table: tuple[int, ...],
+    num_bins: int,
+    seq_lens: tuple[int, ...],
+    num_heads: int,
+    sm_count: int,
+) -> Optional[tuple[int, ...]]:
+    """The helper-pool plan words of a turnover work-bin table, or ``None`` to
+    keep the turnover or bin-mix build (the rule above
+    ``WORK_BIN_POOL_MAGIC``).  Owner words ``(g, tf, 0, 0)``; a helper's
+    first piece ``(-g, owner, helper chunks, tf)`` in the bin-mix words, its
+    second piece ``(-g, owner, helper chunks + g, tf)`` in the extension words
+    after the magic."""
+    if (
+        num_bins < 2
+        or not seq_lens
+        or len(table) != num_bins + 1 + len(seq_lens) * num_heads
+        or WORK_BIN_POOL_LONG not in seq_lens
+        or any(
+            length not in (WORK_BIN_POOL_LONG, WORK_BIN_POOL_SHORT)
+            for length in seq_lens
+        )
+        or len(seq_lens) * num_heads <= sm_count
+    ):
+        return None
+    chunks = [(length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in seq_lens]
+    tasks = [table[table[index] : table[index + 1]] for index in range(num_bins)]
+    loads = [
+        sum(chunks[task // num_heads] for task in bin_tasks) for bin_tasks in tasks
+    ]
+    longest = max(chunks)
+    owners = [
+        index
+        for index, bin_tasks in enumerate(tasks)
+        if any(chunks[task // num_heads] == longest for task in bin_tasks)
+    ]
+    if any(len(tasks[owner]) != 1 for owner in owners):
+        return None
+    owner_set = set(owners)
+    helpers = [index for index in range(num_bins) if index not in owner_set]
+    give = min(WORK_BIN_POOL_MAX_GIVE, WORK_BIN_MIX_SLOTS, longest - 1)
+    if give < 1 or not helpers or len(owners) > WORK_BIN_POOL_MAX_PIECES * len(helpers):
+        return None
+    projected = {helper: loads[helper] for helper in helpers}
+    pieces: dict[int, list[int]] = {helper: [] for helper in helpers}
+    for owner in owners:
+        helper = min(
+            (h for h in helpers if len(pieces[h]) < WORK_BIN_POOL_MAX_PIECES),
+            key=lambda h: (projected[h], h),
+        )
+        pieces[helper].append(owner)
+        projected[helper] += give
+    words = [0] * (4 * num_bins)
+    extension = [0] * (4 * num_bins)
+    for owner in owners:
+        words[4 * owner : 4 * owner + 4] = [give, loads[owner] - give, 0, 0]
+    for helper in helpers:
+        base = loads[helper]
+        for index, owner in enumerate(pieces[helper]):
+            quad = [-give, owner, base, loads[owner] - give]
+            (words if index == 0 else extension)[4 * helper : 4 * helper + 4] = quad
+            base += give
+    return (*words, WORK_BIN_POOL_MAGIC, *extension)
+
+
+def _use_pool_work_bins(
+    seq_lens: tuple[int, ...], *, num_heads: int, sm_count: int, gpu_arch: str
+) -> bool:
+    """Whether the helper-pool rule admits the turnover work-bin table of an
+    unbounded direct M128 N32 launch on a part that ships a pool build."""
+    if gpu_arch not in WORK_BIN_POOL_ARCHES or not getattr(
+        _kda_registry, "_RENDERED_WORK_BIN_POOL_ROUTES", {}
+    ).get(gpu_arch):
+        return False
+    seq_lens = tuple(seq_lens)
+    if (
+        not seq_lens
+        or WORK_BIN_POOL_LONG not in seq_lens
+        or len(seq_lens) * num_heads <= sm_count
+    ):
+        return False
+    table, num_bins = _make_direct_work_bins(
+        seq_lens,
+        num_heads=num_heads,
+        worker_count=sm_count,
+        chunk_tokens=BF16_M128_CHUNK,
+        task_cost=BF16_WORK_BIN_TURNOVER_TASK_COST,
+    )
+    return (
+        _work_bin_pool_plan(tuple(table), num_bins, seq_lens, num_heads, sm_count)
+        is not None
+    )
+
+
 @cache
 def _work_bin_mix_plan(
     table: tuple[int, ...],
@@ -2533,6 +2666,24 @@ def _direct_work_bin_route(
     bounded turnover of rule 1 needs it true, so each launch takes at most one
     rule.
     """
+    # An unbounded direct M128 N32 launch whose turnover bin table the
+    # helper-pool rule admits takes the turnover work bins and the turnover
+    # build (the plan site then launches the module's helper-pool build).
+    if (
+        route == BF16_ROUTE_DIRECT_M128
+        and (not tf32_direct)
+        and (not n32_ft_slab)
+        and gate_kind == KDAGateKind.UNBOUNDED_SOFTPLUS
+        and _use_pool_work_bins(
+            seq_lens, num_heads=num_heads, sm_count=sm_count, gpu_arch=gpu_arch
+        )
+    ):
+        return _DirectWorkBinRoute(
+            work_bins=True,
+            turnover_bins_only=True,
+            turnover=True,
+            task_cost=BF16_WORK_BIN_TURNOVER_TASK_COST,
+        )
     direct_n16 = route == BF16_ROUTE_DIRECT_M128_N16
     strict = (
         route in {BF16_ROUTE_DIRECT_M128, BF16_ROUTE_DIRECT_M128_N16}
@@ -4245,6 +4396,24 @@ class FlashKDABlackwellBF16FusedLaunch:
                     num_heads,
                     gpu_arch in WORK_BIN_MIX_SPAN_ARCHES,
                 )
+            # A turnover launch whose bins the helper-pool rule admits takes
+            # the module's helper-pool build instead: its plan words follow the
+            # table the same way and it runs the same bins on the same grid.
+            bin_pool_program = (
+                _work_bin_pool_program(getattr(self.module, "name", None), gpu_arch)
+                if bin_mix_program is not None
+                else None
+            )
+            bin_pool_plan = (
+                _work_bin_pool_plan(
+                    tuple(work_bin_table), num_work_bins, seq_lens, num_heads, sm_count
+                )
+                if bin_pool_program is not None
+                else None
+            )
+            if bin_pool_plan is not None:
+                bin_mix_program = bin_pool_program
+                bin_mix_plan = bin_pool_plan
             work_bin_upload = _upload_int32_batch(
                 q.device,
                 {"seq_order": list(work_bin_table) + list(bin_mix_plan or ())},

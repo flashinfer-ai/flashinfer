@@ -225,6 +225,21 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_WORK_BIN_POOL_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_WORK_BIN_POOL_ROUTES.items():
+        # A helper-pool build ships only where the runtime launches it.
+        assert not modules or arch in runtime.WORK_BIN_POOL_ARCHES, arch
+        for module, program in modules.items():
+            # Every launch the pool rule does not admit keeps the module's
+            # turnover or bin-mix program.
+            assert module in registry._RENDERED_WORK_BIN_MIX_ROUTES[arch], (
+                arch,
+                module,
+            )
+            assert program != registry._RENDERED_WORK_BIN_MIX_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -290,6 +305,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].items(),
             *registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].items(),
+            *registry._RENDERED_WORK_BIN_POOL_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -1096,6 +1112,7 @@ def unrouted(monkeypatch):
             "_RENDERED_WORK_BIN_TURN_ROUTES",
             "_RENDERED_M64_OWNER_HELPER_ROUTES",
             "_RENDERED_WORK_BIN_MIX_ROUTES",
+            "_RENDERED_WORK_BIN_POOL_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -1130,6 +1147,7 @@ def test_serving_rows_match_the_fp32_reference(
         set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_POOL_ROUTES[arch].values())
     )
     if loaded & work_bin_programs:
         with monkeypatch.context() as patch:
@@ -1149,6 +1167,7 @@ def test_serving_rows_match_the_fp32_reference(
                 "_use_direct_work_bins",
                 "_use_turnover_work_bins",
                 "_use_bounded_work_bins",
+                "_use_pool_work_bins",
             ):
                 patch.setattr(runtime, rule, lambda *args, **kwargs: False)
             unbinned = _Call(d, lower_bound)
@@ -1556,6 +1575,75 @@ def test_bin_mix_rows_keep_the_turnover_build_elsewhere(
     got = turned.run()
     _assert_bitwise(got, plain.run(), "turnover vs work-binned")
     _assert_bitwise(turned.run(), got, "turnover repeat")
+
+
+# Unbounded launches of 1024- and 64-token sequences whose turnover bin table
+# the helper-pool rule admits on a 148-SM sm_100a and a 152-SM sm_103a part:
+# every long task alone in its bin, at most two owners per helper bin.
+BIN_POOL_ROWS = [
+    pytest.param([1024, 64] * 8, 12, id="8x1024+64-h12"),
+    pytest.param([1024, 64] * 7, 12, id="7x1024+64-h12"),
+    pytest.param([1024, 64] * 6, 16, id="6x1024+64-h16"),
+]
+# Launches the rule refuses: more owners than two per helper bin, a short
+# length outside the rule.
+BIN_POOL_REFUSED_ROWS = [
+    pytest.param([1024, 64] * 8, 16, id="8x1024+64-h16"),
+    pytest.param([1024, 128] * 8, 12, id="8x1024+128-h12"),
+]
+
+
+def _bin_pool_programs():
+    arch = registry.device_arch()
+    if arch not in runtime.WORK_BIN_POOL_ARCHES:
+        pytest.skip(f"{arch} launches keep their build without the pool")
+    programs = set(registry._RENDERED_WORK_BIN_POOL_ROUTES[arch].values())
+    assert programs, f"the loader names no helper-pool build on {arch}"
+    return programs
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads", BIN_POOL_ROWS)
+def test_bin_pool_launch_is_bitwise_the_unpooled_launch(
+    lengths, heads, rows, monkeypatch
+):
+    """A launch whose turnover bin table the helper-pool rule admits takes
+    the helper-pool build (a helper bin prepares the last chunks of up to two
+    owners after its own tasks) with the turnover launch's schedule plus
+    ``_bin_mix``; bit for bit the launch without the pool table, with and
+    without checkpoint rows, launch after launch, in either order."""
+    pool = _bin_pool_programs()
+    d = _inputs(lengths, heads)
+    pooled = _Call(d, None, rows=rows)
+    schedule = str(pooled.prepared.schedule)
+    assert schedule.endswith("_turnover_bin_mix"), schedule
+    assert _modules(pooled.prepared) & pool
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            registry,
+            "_RENDERED_WORK_BIN_POOL_ROUTES",
+            {arch: {} for arch in registry.ARCHES},
+        )
+        unpooled = _Call(d, None, rows=rows)
+    assert not _modules(unpooled.prepared) & pool
+    got = pooled.run()
+    want = unpooled.run()
+    _assert_bitwise(got, want, "helper pool vs unpooled")
+    _assert_bitwise(pooled.run(), want, "helper pool after the unpooled launch")
+    _assert_bitwise(unpooled.run(), got, "unpooled repeat")
+
+
+@requires_blackwell
+@pytest.mark.parametrize("lengths,heads", BIN_POOL_REFUSED_ROWS)
+def test_bin_pool_refused_rows_keep_their_build(lengths, heads):
+    """A launch the helper-pool rule refuses never loads the helper-pool
+    build."""
+    pool = _bin_pool_programs()
+    d = _inputs(lengths, heads)
+    kept = _Call(d, None, rows=False)
+    assert not _modules(kept.prepared) & pool
+    _assert_bitwise(kept.run(), kept.run(), "refused row repeat")
 
 
 @requires_blackwell
