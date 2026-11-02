@@ -126,6 +126,9 @@ TOKEN_LIBRARY = {
     "ao22_rae7_rf3_pd1_l2l_ntr": "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr",
     "ao22_rae7_pd1_tma_ntr": "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr",
     "dot_ao8_l2l": "cake_mhc_det_train_bwd_token__dot_ao8_l2l",
+    # the group-row dynamic forms (BWD_ROW_BANDS: sm_100a / sm_103a above 14927 tokens)
+    "ao15_rae8_tma_ntr_trows_dyn": "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr_trows_dyn",
+    "dot_ao8_trows_dyn": "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn",
 }
 # The run-time-count records (select rule ``run_time_iters``): record -> the kernel it stands in for at every
 # Sinkhorn count but the compiled one (the count is their ``sinkhorn_iters`` argument, at most SINKHORN_ITERS_MAX).
@@ -146,6 +149,10 @@ REDUCE_LIBRARY = {
     "s27_wcvt_fadd_fshfl": "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl",
     "wpu4_fadd": "cake_mhc_det_train_bwd_reduce__wpu4_fadd",
     "wpu4_spred": "cake_mhc_det_train_bwd_reduce__wpu4_spred",
+    # the group-row forms (BWD_ROW_BANDS)
+    "pt32_trows": "cake_mhc_det_train_bwd_reduce__pt32_trows",
+    "wpu4_fadd_trows": "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows",
+    "wpu4_spred_trows": "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows",
 }
 COEF_TOKENS_PER_CTA = {
     "qe_mb10": 8,
@@ -169,6 +176,9 @@ REDUCE_GRID = {
     "s27_wcvt_fadd_fshfl": 411,
     "wpu4_fadd": 411,
     "wpu4_spred": 411,
+    "pt32_trows": 3099,
+    "wpu4_fadd_trows": 411,
+    "wpu4_spred_trows": 411,
 }
 FINISH_LIBRARY = {
     "production": "cake_mhc_det_train_fwd_finish",
@@ -179,12 +189,15 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_bwd_prepare": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_bwd_prepare__t128": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_bwd_reduce__pt32": ("sm_103a",),
+    "cake_mhc_det_train_bwd_reduce__pt32_trows": ("sm_103a",),
     "cake_mhc_det_train_bwd_reduce__pt64": ("sm_103a",),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": ("sm_107a",),
     "cake_mhc_det_train_bwd_reduce__wpu4": ("sm_107a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__dynl": ("sm_100a",),
     "cake_mhc_det_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_bwd_slab__xrsg": ("sm_100a", "sm_107a"),
@@ -193,6 +206,7 @@ LIBRARY_ARCHES = {
         "sm_103a",
         "sm_107a",
     ),
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr_trows_dyn": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr": (
         "sm_100a",
         "sm_103a",
@@ -202,6 +216,7 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ("sm_107a",),
     "cake_mhc_det_train_bwd_token__dot_ao8": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_bwd_token__dot_ao8_l2l": ("sm_107a",),
+    "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fn_split__tv128": ("sm_100a", "sm_103a"),
@@ -285,7 +300,7 @@ MULTI_RECORDS = {
         "cake_mhc_det_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 62, 46
+N_RECORDS, N_LIBRARIES = 67, 51
 RECORD_SCALARS = {
     "cake_mhc_det_train_fn_split": {"want_t": 0},
     "cake_mhc_det_train_fn_split__tv128__t": {"want_t": 1},
@@ -377,6 +392,10 @@ TABLES = {
         "s27_wcvt_fadd_fshfl": 411,
         "wpu4_fadd": 411,
         "wpu4_spred": 411,
+        "pt32_trows": 3099,
+        "s27_wcvt_fadd_fshfl_trows": 411,
+        "wpu4_fadd_trows": 411,
+        "wpu4_spred_trows": 411,
     },
     "BWD_REDUCE_PARTS": {
         "sm_100a": {
@@ -397,6 +416,11 @@ TABLES = {
             (0, 1024, "ao22_rae7_rf3_pd1_l2l_ntr"),
             (1024, 4096, "ao22_rae7_pd1_tma_ntr"),
         ),
+    },
+    "BWD_ROW_BANDS": {
+        "sm_100a": ((14927, None),),
+        "sm_103a": ((14927, None),),
+        "sm_107a": (),
     },
     "K5_GRID_BANDS": {
         "sm_100a": ((0, 1024, 2),),
@@ -1243,6 +1267,8 @@ RECORD_ARCHES = {
     "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_tma_ntr": ("sm_100a", "sm_107a"),
     "cake_mhc_det_train_bwd_token__dot_ao8__a3": ("sm_100a",),
     "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr__a3": ("sm_100a",),
+    "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_bwd_token__ao15_rae8_tma_ntr_trows_dyn": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ("sm_107a",),
     "cake_mhc_det_train_bwd_token__ao22_rae7_pd1_ntr__a7": ("sm_107a",),
     "cake_mhc_det_train_bwd_token__dot_ao8_l2l": ("sm_107a",),
@@ -1254,9 +1280,12 @@ RECORD_ARCHES = {
     "cake_mhc_det_train_bwd_slab__xrsg__a7": ("sm_107a",),
     "cake_mhc_det_train_bwd_reduce__pt64": ("sm_103a",),
     "cake_mhc_det_train_bwd_reduce__pt32": ("sm_103a",),
+    "cake_mhc_det_train_bwd_reduce__pt32_trows": ("sm_103a",),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_fadd_fshfl": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_spred": ("sm_100a",),
+    "cake_mhc_det_train_bwd_reduce__wpu4_spred_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__wpu4_fadd": ("sm_100a", "sm_107a"),
+    "cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows": ("sm_100a",),
     "cake_mhc_det_train_bwd_reduce__s27_wcvt_spred": ("sm_107a",),
     "cake_mhc_det_train_bwd_reduce__wpu4": ("sm_107a",),
 }
@@ -1782,6 +1811,7 @@ def test_registry_tables_are_literals() -> None:
         "BWD_REDUCE_GRID",
         "BWD_REDUCE_PARTS",
         "BWD_TOKEN_BANDS",
+        "BWD_ROW_BANDS",
         "FWD_FINISH_PROGRAM",
         "FWD_FINISH_ROWS",
         "K5_GRID_BANDS",
