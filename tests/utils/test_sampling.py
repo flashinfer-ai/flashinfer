@@ -3034,10 +3034,12 @@ def test_per_request_top_k_with_indices_dtype(api, indices_dtype, threshold_dtyp
         )
 
 
-@pytest.mark.parametrize("api", ["top_k", "min_p"])
+@pytest.mark.parametrize(
+    "api,vocab_size", [("top_k", 4), ("min_p", 4), ("top_k", 8192)]
+)
 @pytest.mark.parametrize("remap", ["keep_all", "argmax", "mixed"])
 @pytest.mark.parametrize("expanded", [False, True], ids=["equal_rows", "more_outputs"])
-def test_per_request_param_indexed_by_row(api, remap, expanded):
+def test_per_request_param_indexed_by_row(api, vocab_size, remap, expanded):
     """A per-request threshold must be read from the probs row ``indices`` selects.
 
     The three rows have different argmax classes and binary-exact probabilities, so
@@ -3050,17 +3052,20 @@ def test_per_request_param_indexed_by_row(api, remap, expanded):
     read stays in bounds: it is a negative control with a wrong answer rather than a
     crash. ``more_outputs`` is the shape the fix enables -- fewer probs rows than
     outputs -- where the output-indexed read would run off the threshold array.
+
+    At vocab 8192, top-k takes the SM90 split-row kernel.
     """
-    rows = torch.tensor(
+    num_classes = 4
+    stride = vocab_size // num_classes
+    rows = torch.zeros(3, vocab_size, dtype=torch.float32, device="cuda:0")
+    rows[:, ::stride] = torch.tensor(
         [
             [0.5, 0.25, 0.125, 0.125],
             [0.125, 0.5, 0.25, 0.125],
             [0.125, 0.125, 0.5, 0.25],
         ],
-        dtype=torch.float32,
-        device="cuda:0",
+        device=rows.device,
     )
-    num_classes = rows.size(1)
     lanes = 1024
     # row 1 keeps every class; rows 0 and 2 keep their argmax only.
     if api == "top_k":
@@ -3092,12 +3097,13 @@ def test_per_request_param_indexed_by_row(api, remap, expanded):
     assert samples.dtype == indices.dtype
     assert valid.shape == indices.shape and valid.dtype == torch.bool
     assert bool(valid.all())
-    assert bool(((samples >= 0) & (samples < num_classes)).all())
+    assert bool(((samples >= 0) & (samples < vocab_size)).all())
+    assert bool((samples % stride == 0).all())
     assert torch.equal(probs, probs_before)
     assert torch.equal(threshold, threshold_before)
     assert torch.equal(indices, indices_before)
 
-    samples = samples.reshape(lanes, len(mapping))
+    samples = samples.reshape(lanes, len(mapping)) // stride
     for lane, row_idx in enumerate(mapping):
         counts = torch.bincount(samples[:, lane].long(), minlength=num_classes)
         if row_idx == 1:
