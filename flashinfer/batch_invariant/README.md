@@ -19,7 +19,7 @@ With `batch_invariant=True` an output's bits depend on the input values and the 
 
 Each class has one fixed dataflow, named and hashed into a **fingerprint**; `flashinfer.batch_invariant.fingerprint(op,
 **dims)` returns it, scoped to (fingerprint, FlashInfer version, architecture). Bitwise equality is the acceptance
-criterion of every test in `tests/batch_invariant`.
+criterion of every test of the mode (`tests/gemm/test_batch_invariant_mm_bf16.py`, `tests/batch_invariant/test_lean.py`).
 
 ## Supported operators
 
