@@ -68,16 +68,41 @@ _E4M3X4_TO_F16X4 = """
 """
 
 
-def _asm_for(mma_dtype: type[cutlass.Numeric], native_cvt: bool) -> str:
+def _select_asm(
+    mma_dtype: type[cutlass.Numeric],
+    native_cvt: bool,
+    bf16_native: str,
+    bf16_alu: str,
+    f16: str,
+) -> str:
+    """The PTX for ``mma_dtype``: the native bf16 ``cvt`` when the toolkit has it
+    and the caller allows it (sm_100+), else the ALU chain; fp16 always converts
+    natively."""
     if mma_dtype is cutlass.BFloat16:
-        return (
-            _E4M3X4_TO_BF16X4_NATIVE
-            if native_cvt and _HAS_NATIVE_E4M3_BF16_CVT
-            else _E4M3X4_TO_BF16X4_ALU
-        )
+        return bf16_native if native_cvt and _HAS_NATIVE_E4M3_BF16_CVT else bf16_alu
     if mma_dtype is cutlass.Float16:
-        return _E4M3X4_TO_F16X4
+        return f16
     raise ValueError(f"W8A16 converts e4m3 to bf16 or fp16, not {mma_dtype}")
+
+
+def _pack_result(out_words: list, mma_dtype: type[cutlass.Numeric], *, loc, ip):
+    """The converted 32-bit words (two ``mma_dtype`` values each) as one TensorSSA."""
+    out_words_type = ir.VectorType.get([len(out_words)], Uint32.mlir_type, loc=loc)
+    out_words_vector = vector.from_elements(out_words_type, out_words, loc=loc, ip=ip)
+    count = 2 * len(out_words)
+    result_type = ir.VectorType.get([count], mma_dtype.mlir_type, loc=loc)
+    result_vector = llvm.bitcast(result_type, out_words_vector, loc=loc, ip=ip)
+    return cute.TensorSSA(result_vector, (count,), mma_dtype)
+
+
+def _asm_for(mma_dtype: type[cutlass.Numeric], native_cvt: bool) -> str:
+    return _select_asm(
+        mma_dtype,
+        native_cvt,
+        _E4M3X4_TO_BF16X4_NATIVE,
+        _E4M3X4_TO_BF16X4_ALU,
+        _E4M3X4_TO_F16X4,
+    )
 
 
 @dsl_user_op
@@ -117,11 +142,7 @@ def convert_e4m3_fragment(
         )
         out_words.append(llvm.extractvalue(Uint32.mlir_type, pair, [0], loc=loc, ip=ip))
         out_words.append(llvm.extractvalue(Uint32.mlir_type, pair, [1], loc=loc, ip=ip))
-    out_words_type = ir.VectorType.get([2 * num_words], Uint32.mlir_type, loc=loc)
-    out_words_vector = vector.from_elements(out_words_type, out_words, loc=loc, ip=ip)
-    result_type = ir.VectorType.get([count], mma_dtype.mlir_type, loc=loc)
-    result_vector = llvm.bitcast(result_type, out_words_vector, loc=loc, ip=ip)
-    return cute.TensorSSA(result_vector, (count,), mma_dtype)
+    return _pack_result(out_words, mma_dtype, loc=loc, ip=ip)
 
 
 # One e4m3 pair, zero-extended into a 32-bit register ($1, bytes 0 and 1) -> one bf16x2
@@ -155,15 +176,13 @@ _E4M3X2_TO_F16X2_W = """
 
 
 def _asm_for_pair(mma_dtype: type[cutlass.Numeric], native_cvt: bool) -> str:
-    if mma_dtype is cutlass.BFloat16:
-        return (
-            _E4M3X2_TO_BF16X2_NATIVE_W
-            if native_cvt and _HAS_NATIVE_E4M3_BF16_CVT
-            else _E4M3X2_TO_BF16X2_ALU_W
-        )
-    if mma_dtype is cutlass.Float16:
-        return _E4M3X2_TO_F16X2_W
-    raise ValueError(f"W8A16 converts e4m3 to bf16 or fp16, not {mma_dtype}")
+    return _select_asm(
+        mma_dtype,
+        native_cvt,
+        _E4M3X2_TO_BF16X2_NATIVE_W,
+        _E4M3X2_TO_BF16X2_ALU_W,
+        _E4M3X2_TO_F16X2_W,
+    )
 
 
 @dsl_user_op
@@ -196,7 +215,6 @@ def convert_e4m3_words(
     """Convert e4m3 pairs held zero-extended in 32-bit registers (``Uint32`` each, from
     ``load_e4m3_unit``) to ``mma_dtype``; ``2 * len(words)`` values in order."""
     asm = _asm_for_pair(mma_dtype, native_cvt)
-    count = len(words)
     out_words: list[ir.Value] = []
     for w in words:
         out = llvm.inline_asm(
@@ -211,11 +229,7 @@ def convert_e4m3_words(
             ip=ip,
         )
         out_words.append(out)
-    out_words_type = ir.VectorType.get([count], Uint32.mlir_type, loc=loc)
-    out_words_vector = vector.from_elements(out_words_type, out_words, loc=loc, ip=ip)
-    result_type = ir.VectorType.get([2 * count], mma_dtype.mlir_type, loc=loc)
-    result_vector = llvm.bitcast(result_type, out_words_vector, loc=loc, ip=ip)
-    return cute.TensorSSA(result_vector, (2 * count,), mma_dtype)
+    return _pack_result(out_words, mma_dtype, loc=loc, ip=ip)
 
 
 def _asm_op(result_type, operands, asm, constraints, *, loc, ip):

@@ -72,6 +72,22 @@ _SM100_TILES: Dict[int, _Sm100Tile] = {
 }
 _SM100_SPLITK = 5
 _SM100_STREAMK = 6
+# The plain 2SM tiles the cost models choose among, in tie-break order, with the
+# measured MMA efficiency of each relative to the 256x128 tile.
+_SM100_PLAIN_CANDIDATES: Tuple[Tuple[int, float], ...] = (
+    (1, 1.00),
+    (7, 0.96),
+    (4, 1.02),
+)
+
+
+def _sm100_plain_waves(m: int, n: int, algo: int, clusters: int) -> int:
+    """Waves of ``clusters`` the plain tile ``algo`` needs for the output: weight
+    tiles of 256 rows times activation tiles of the variant's rows."""
+    tile_a = _SM100_TILES[algo].mma_tiler[1]
+    return _tiles(_tiles(n, 256) * _tiles(m, tile_a), clusters)
+
+
 # Largest splits x M the split-K kernel's 32-bit row coordinates represent.
 _SM100_MAX_STACKED_ROWS = 2**31 - 1
 
@@ -143,23 +159,21 @@ def _sm100_streamk_substitute(m: int, n: int, k: int, num_sms: int) -> Tuple[int
     Falls back to the plain 256x128 tile when K cannot be sliced."""
     clusters = num_sms // 2 if num_sms > 1 else 1
     ktiles = k // 128
-    w_tiles = _tiles(n, 256)
 
-    def plain(tile_a: int, eff: float) -> float:
-        return (
-            _tiles(w_tiles * _tiles(m, tile_a), clusters)
-            * ktiles
-            * (tile_a / 128)
-            / eff
-        )
+    def plain(algo: int, eff: float) -> float:
+        # Whole waves of k-tiles, each tile's work in units of the 128-row tile.
+        tile_a = _SM100_TILES[algo].mma_tiler[1]
+        return _sm100_plain_waves(m, n, algo, clusters) * ktiles * (tile_a / 128) / eff
 
-    best_algo, best_cost = 1, plain(128, 1.00)
-    for algo, tile_a, eff in ((7, 160, 0.96), (4, 192, 1.02)):
-        c = plain(tile_a, eff)
+    # The first strict winner in candidate order (all costs 0 on K < 128: the
+    # 256x128 tile).
+    best_algo, best_cost = 1, plain(*_SM100_PLAIN_CANDIDATES[0])
+    for algo, eff in _SM100_PLAIN_CANDIDATES[1:]:
+        c = plain(algo, eff)
         if c < best_cost:
             best_algo, best_cost = algo, c
     best_splits = 1
-    units = w_tiles * _tiles(m, 128)
+    units = _tiles(n, 256) * _tiles(m, 128)
     # One k-tile-wave: the whole grid advancing one k-tile.  The reduce streams
     # (splits + 0.5) * m * n fp32 words; the ratio to one k-tile-wave's MMA work is
     # a constant of the machine (about 1/400 per byte-per-FLOP here).
@@ -186,15 +200,13 @@ def sm100_pick_algo(m: int, n: int, k: int, num_sms: int) -> int:
     if _sm100_split_k(m, n, k, num_sms) > 1:
         return _SM100_SPLITK
     clusters = num_sms // 2 if num_sms > 1 else 1
-    w_tiles = _tiles(n, 256)
 
-    def cost(tile_a: int, eff: float) -> float:
-        units = w_tiles * _tiles(m, tile_a)
-        return _tiles(units, clusters) * tile_a / eff
+    def cost(algo: int, eff: float) -> float:
+        tile_a = _SM100_TILES[algo].mma_tiler[1]
+        return _sm100_plain_waves(m, n, algo, clusters) * tile_a / eff
 
-    c128 = cost(128, 1.00)
-    c160 = cost(160, 0.96)
-    c192 = cost(192, 1.02)
+    # The widest tile wins ties here (one wave of 192-row tiles beats one of 128).
+    c128, c160, c192 = (cost(algo, eff) for algo, eff in _SM100_PLAIN_CANDIDATES)
     if c192 <= c128 and c192 <= c160:
         return 4
     if c160 < c128:
@@ -489,7 +501,7 @@ def w8a16_fp8_gemm_workspace_bytes(
     num_sms = get_device_sm_count(device)
     if get_compute_capability(device)[0] == 9:
         plan = _sm90_plan(algo, m, n, k, num_sms)
-        tile_w, tile_a = _SM90_TILES[plan.tile_algo]
+        tile_w, tile_a = _SM90_TILES[plan.tile_algo].rows
         if plan.tail_tiles == 0:
             return 0
         return _sm90_workspace_layout(
@@ -618,15 +630,35 @@ def _w8a16_fp8_gemm_sm100(
 
 
 # ======================================================================= Hopper
-# Tile configurations by algo code: (weight rows, activation rows).
-_SM90_TILES: Dict[int, Tuple[int, int]] = {
-    2: (128, 256),
-    3: (128, 192),
-    4: (128, 160),
-    5: (128, 128),
-    6: (64, 256),
-    9: (64, 128),
+class _Sm90Tile(NamedTuple):
+    """A Hopper kernel tile and its cost-model entry."""
+
+    algo: int
+    weight_rows: int
+    act_rows: int
+    pingpong: bool
+    # ns per unit of K of one tile alone on an SM; None = not a candidate of the
+    # cost model (selectable by name only).
+    ns_per_k: Optional[float]
+
+    @property
+    def rows(self) -> Tuple[int, int]:
+        return self.weight_rows, self.act_rows
+
+
+# Tile configurations by algo code.
+_SM90_TILES: Dict[int, _Sm90Tile] = {
+    2: _Sm90Tile(2, 128, 256, False, 11.37),
+    3: _Sm90Tile(3, 128, 192, False, 9.00),
+    4: _Sm90Tile(4, 128, 160, False, None),
+    5: _Sm90Tile(5, 128, 128, False, 7.45),
+    6: _Sm90Tile(6, 64, 256, True, 6.15),
+    9: _Sm90Tile(9, 64, 128, True, 4.50),
 }
+# The cost model's candidates, in tie-break order.
+_SM90_TILE_CANDIDATES: Tuple[_Sm90Tile, ...] = tuple(
+    _SM90_TILES[a] for a in (2, 3, 5, 6, 9)
+)
 # The policy codes map to the tile they run.  Stream-K codes run the whole waves of
 # that tile plain and cut only the last partial wave into K-slices (sm90_tail_plan;
 # CUTLASS's stream-K scheduler itself is not ported); split-K codes cut every tile.
@@ -637,23 +669,16 @@ _SM90_MAX_SPLITS = 8
 _SM90_MIN_KTILES_PER_SPLIT = 8
 _SM90_MAX_PARTIALS_BYTES = 64 << 20
 
-# The cost model's tile menu: (algo, weight rows, activation rows, ns per unit of K of one
-# tile alone on an SM, ping-pong).  Candidate order breaks ties.
-_SM90_TILE_COSTS: Tuple[Tuple[int, int, int, float, bool], ...] = (
-    (2, 128, 256, 11.37, False),
-    (3, 128, 192, 9.00, False),
-    (5, 128, 128, 7.45, False),
-    (6, 64, 256, 6.15, True),
-    (9, 64, 128, 4.50, True),
-)
 
-
-def _sm90_tile_of(algo: int) -> Tuple[int, int, int, float, bool]:
+def _sm90_tile_of(algo: int) -> _Sm90Tile:
+    """The cost-model tile a code runs on (policies map to their base tile); a code
+    with no cost entry (128x160, or an unknown code) is costed as the first
+    candidate."""
     base = _SM90_STREAMK_TILE.get(algo, _SM90_SPLITK_TILE.get(algo, algo))
-    for t in _SM90_TILE_COSTS:
-        if t[0] == base:
-            return t
-    return _SM90_TILE_COSTS[0]
+    t = _SM90_TILES.get(base)
+    if t is None or t.ns_per_k is None:
+        return _SM90_TILE_CANDIDATES[0]
+    return t
 
 
 def _sm90_is_legal_split(k: int, s: int) -> bool:
@@ -663,14 +688,13 @@ def _sm90_is_legal_split(k: int, s: int) -> bool:
     return ktiles % s == 0 and ktiles // s >= _SM90_MIN_KTILES_PER_SPLIT
 
 
-def _sm90_tile_us(t, k_len: float) -> float:
-    _, _, tile_a, ns_per_k, pingpong = t
-    epi = 0.0 if pingpong else 2.0 * tile_a / 256
-    return ns_per_k * 1e-3 * k_len + epi
+def _sm90_tile_us(t: _Sm90Tile, k_len: float) -> float:
+    epi = 0.0 if t.pingpong else 2.0 * t.act_rows / 256
+    return t.ns_per_k * 1e-3 * k_len + epi
 
 
-def _sm90_tiles_of(t, m: int, n: int) -> float:
-    return float(_tiles(n, t[1])) * float(_tiles(m, t[2]))
+def _sm90_tiles_of(t: _Sm90Tile, m: int, n: int) -> float:
+    return float(_tiles(n, t.weight_rows)) * float(_tiles(m, t.act_rows))
 
 
 def _sm90_split_us(t, m: int, n: int, k: int, num_sms: int, s: int) -> float:
@@ -744,8 +768,8 @@ def _sm90_pick_by_cost(m: int, n: int, k: int, num_sms: int) -> int:
         if us < best_us:
             best_us, best = us, a
 
-    for t in _SM90_TILE_COSTS:
-        consider(t[0], _sm90_plain_us(t, m, n, k, num_sms))
+    for t in _SM90_TILE_CANDIDATES:
+        consider(t.algo, _sm90_plain_us(t, m, n, k, num_sms))
     for a in (7, 8):
         consider(a, _sm90_streamk_us(_sm90_tile_of(a), m, n, k, num_sms))
     for a in (10, 11, 12):
@@ -826,7 +850,7 @@ def _get_sm90_kernel(
     if compiled is not None:
         return compiled
     kernel = Sm90W8A16Fp8GemmKernel(
-        _SM90_TILES[tile_algo],
+        _SM90_TILES[tile_algo].rows,
         has_bias=has_bias,
         group_size=group,
         has_tail=has_tail,
@@ -882,7 +906,7 @@ def sm90_tail_plan(
     of the shortest slices under the workspace cap), or plain when CUTLASS's own
     stream-K would run data-parallel (no tail, or a tail of at least half a wave)."""
     tile_algo = _SM90_STREAMK_TILE.get(algo, _SM90_SPLITK_TILE.get(algo, algo))
-    tile_w, tile_a = _SM90_TILES[tile_algo]
+    tile_w, tile_a = _SM90_TILES[tile_algo].rows
     tiles = _tiles(n, tile_w) * _tiles(m, tile_a)
     k_tiles = k // _SM90_TILE_K
     if algo in _SM90_SPLITK_TILE:
@@ -928,7 +952,7 @@ def _sm90_plan(algo: int, m: int, n: int, k: int, num_sms: int) -> _Sm90Plan:
             f"w8a16_fp8_gemm split-K cannot slice K={k}: K must be a multiple of 64 "
             "with at least 8 k-tiles per slice"
         )
-    tile_w, tile_a = _SM90_TILES[tile_algo]
+    tile_w, tile_a = _SM90_TILES[tile_algo].rows
     tiles = _tiles(n, tile_w) * _tiles(m, tile_a)
     tail_tiles = tiles - body_items
     if tail_splits < 2 or tail_tiles * tail_splits > num_sms:
@@ -964,7 +988,7 @@ def _w8a16_fp8_gemm_sm90(
     tile_algo, body_items, tail_splits, tail_tiles, group = _sm90_plan(
         algo, m, n, k, num_sms
     )
-    tile_w, tile_a = _SM90_TILES[tile_algo]
+    tile_w, tile_a = _SM90_TILES[tile_algo].rows
     has_tail = tail_tiles > 0
     tail_blocks = tail_tiles * tail_splits
     if has_tail:
