@@ -1099,8 +1099,8 @@ def prims_ts_fp4_block_scale_routed_moe_precompile(
     that untuned calls of any size can pick, on the given batch, so later
     untuned calls compile nothing. A few tokens are enough.
 
-    Takes the arguments of :func:`prims_ts_fp4_block_scale_routed_moe` that
-    select its kernels.
+    See :func:`prims_ts_fp4_block_scale_routed_moe` for the meaning of each
+    parameter. This function takes only that op's kernel-selecting arguments.
 
     Returns
     -------
