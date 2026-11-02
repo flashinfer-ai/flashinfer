@@ -2438,6 +2438,101 @@ def _check_save_mode(save_mode: str) -> None:
 # ``save_transfer=False`` --, ``"transfer"`` also the owner's c1 receive tensor (``save_transfer=True``).
 CHECKPOINT_KEEPS = ("states", "transfer")
 
+# Checkpoint hand-off (``cake_kcp.chunk_kda_kcp(..., checkpoint_handoff=)``): under ``torch.utils.checkpoint`` the
+# forward keeps the local tape set ``KCP_HANDOFF_BUFFERS`` in its saved set (non-reentrant: both passes; reentrant: the
+# recompute only, its first pass runs under no_grad), and the backward reads it instead of re-running the intra
+# program, WY and the K1 tape walk.  ``"on"`` engages on every call it supports, ``"off"`` never, ``"auto"`` (the
+# default) where :func:`kcp_handoff_auto_refusal` admits the call:
+#
+#     (architecture, SM count, Cake build toolkit "major.minor") of the device in KCP_HANDOFF_VERIFIED
+#     and H in KCP_HANDOFF_HEADS
+#     and H * (total packed tokens // world size) >= KCP_HANDOFF_MIN_HEAD_TOKENS
+#
+# Measured on the four keys below (B200, B300, GB300, R200; T = 261392 packed tokens in 4 documents, BF16, head dim
+# 128), ckpt step time with the hand-off off / on.  On the rows "auto" admits, measured with "auto" at this version on
+# all four keys with the output and every gradient bitwise those of "off": H4 at CP2 (H * T // W = 522784) 1.058-1.106;
+# H16 and H64 1.073-1.147 (and 1.034 on one B200 CP8 H16 row whose timing drifted 5.20 %, over the bench's 2 % limit);
+# H8 and H32, which stay in KCP_HANDOFF_HEADS on this evidence, 1.041-1.146.  Per key, H8: B200 1.093-1.128, B300
+# 1.082-1.122, GB300 1.041-1.124, R200 1.078-1.124; H32: B200 1.117-1.146, B300 1.118-1.139, GB300 1.129-1.137, R200
+# 1.127-1.134.  The H4 rows "auto" refuses were measured with "on" forced on the hand-off's first version: H4 at CP4
+# (261392) 1.033-1.043 on B200, 1.011-1.030 on B300, 1.025-1.034 on R200 and 0.978-0.989 on GB300 (a loss); H4 at CP8
+# (130696) 0.985-1.002 on B200 and 0.979-1.010 on B300.  That run measured every H4 CP2, H16 and H64 row at least 5 %
+# faster.  H8 at CP8 (261392) is below the bound and refused as "work" on the 8-GPU parts.  The bound 393216 lies
+# between 261392 and 522784: it admits every measured row that gains at least 5 % and refuses every measured loss (and
+# the 1.1-4.3 % H4 CP4 gains of B200, B300 and R200 with it).  Every key measured the output and every gradient bitwise
+# equal with the hand-off on and off.  The hand-off raises the checkpoint peak by at most :func:`kda_handoff_bytes_kcp`
+# per rank (measured with "on" on the first version: +152 MiB at CP8 H4 to +10196 MiB at CP2 H64; with "auto" at this
+# version: +625.5 MiB at CP8 H16 to +10196 MiB at CP2 H64).  A new device, toolkit or head count needs those rows again
+# before it enters KCP_HANDOFF_VERIFIED or KCP_HANDOFF_HEADS.
+#
+# H, the total and the world size are the same on every rank (the layer's head count and the partition every rank
+# builds its context from), so every rank of a group of one device kind decides alike.  A rank may still differ (a
+# rank without tokens keeps no set; a group of mixed devices): the hand-off moves no collective -- the launches it
+# skips are rank-local stages, walks and merges -- so the collectives are the same in count, order and bytes either
+# way and ranks that decide differently neither hang nor change a bit.
+KCP_HANDOFF_MODES = ("auto", "on", "off")
+KCP_HANDOFF_DEFAULT = "auto"
+KCP_HANDOFF_VERIFIED: frozenset[tuple[str, int, str]] = frozenset(
+    {
+        ("sm_100a", 148, "13.4"),  # B200
+        ("sm_103a", 148, "13.4"),  # B300
+        ("sm_103a", 152, "13.4"),  # GB300
+        ("sm_107a", 212, "13.4"),  # R200
+    }
+)
+KCP_HANDOFF_HEADS: frozenset[int] = frozenset({4, 8, 16, 32, 64})
+KCP_HANDOFF_MIN_HEAD_TOKENS = 393216
+# the tape set, in saved-set order: the h tape BF16 [NC_pad, H, 128, 128], v_new and w BF16 [R, H, 128], the internal
+# Aqk / Akk rows BF16 [R, H, 64]
+KCP_HANDOFF_BUFFERS = ("h", "v_new", "w", "aqk_int", "akk_int")
+
+
+def kda_handoff_bytes_kcp(ctx: ContextKcp, *, H: int = 64) -> int:
+    """Bytes of the checkpoint hand-off's tape set on this rank (:data:`KCP_HANDOFF_BUFFERS`)::
+
+    NC_pad * H * 32768                                         # the h tape
+    + R * H * (256 + 256 + 128 + 128)                          # v_new, w, aqk_int, akk_int
+
+    1280 B per internal token-head.  A forward that keeps the set keeps no carry plane (only the tape replay it
+    replaces reads the plane): :func:`kda_saved_bytes_kcp` with ``checkpoint_handoff=True`` is the saved set of such
+    a forward.  The set lives from the recompute to the end of that node's backward (and, under non-reentrant
+    checkpoint, inside the original forward call too, freed at its return): the checkpoint peak of a call the hand-off
+    engages on is at most this many bytes higher than with ``checkpoint_handoff="off"`` (the saved set grows by
+    ``kda_saved_bytes_kcp(..., checkpoint_handoff=True) - kda_saved_bytes_kcp(...)``, this less the carry plane at
+    ``P > 1``)."""
+    H = int(H)
+    return ctx.NC_pad * H * 32768 + ctx.R * H * 768
+
+
+def kcp_handoff_auto_refusal(
+    key: tuple[str, int, str | None], H: int, total_tokens: int, world_size: int
+) -> str | None:
+    """Why ``checkpoint_handoff="auto"`` keeps the light set for a call (``None``: it keeps the tape set; see the rule
+    above :data:`KCP_HANDOFF_VERIFIED`): ``"heads"`` (``H`` not in :data:`KCP_HANDOFF_HEADS`), ``"work"``
+    (``H * (total_tokens // world_size)`` below :data:`KCP_HANDOFF_MIN_HEAD_TOKENS`) or ``"unverified"`` (``key``, the
+    device's (architecture, SM count, toolkit), not in :data:`KCP_HANDOFF_VERIFIED`).  ``total_tokens`` is the packed
+    batch's token count (``ctx.partition.total``) and ``world_size`` the group's (``ctx.world_size``), not this
+    rank's share."""
+    reason = kcp_handoff_shape_refusal(H, total_tokens, world_size)
+    if reason is not None:
+        return reason
+    if tuple(key) not in KCP_HANDOFF_VERIFIED:
+        return "unverified"
+    return None
+
+
+def kcp_handoff_shape_refusal(H: int, total_tokens: int, world_size: int) -> str | None:
+    """The part of :func:`kcp_handoff_auto_refusal` the call's shape decides, before the device key: ``"heads"``,
+    ``"work"`` or ``None``.  A function of its arguments and of :data:`KCP_HANDOFF_HEADS` and
+    :data:`KCP_HANDOFF_MIN_HEAD_TOKENS` only (read at call time), so the original forward and the recompute of a
+    checkpointed call compute the same value as long as neither constant changes between the two passes."""
+    H, total_tokens, world_size = int(H), int(total_tokens), int(world_size)
+    if H not in KCP_HANDOFF_HEADS:
+        return "heads"
+    if H * (total_tokens // world_size) < KCP_HANDOFF_MIN_HEAD_TOKENS:
+        return "work"
+    return None
+
 
 def _check_checkpoint_keep(
     checkpoint_keep: str | None, save_transfer: bool | None
@@ -2470,6 +2565,7 @@ def kda_saved_bytes_kcp(
     C: int = 8192,
     saved_carry: bool = True,
     checkpoint_keep: str | None = None,
+    checkpoint_handoff: bool = False,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kda_saved_bytes_kcp(ctx, ...)``)::
 
@@ -2506,7 +2602,19 @@ def kda_saved_bytes_kcp(
     The tier fixes ``save_transfer`` (``False`` / ``True``; ``None``, the default, is ``SAVE_TRANSFER_DEFAULT``
     without a tier; an explicit value that contradicts the tier raises ``ValueError``, as the entry point does);
     ``save_mode`` and ``saved_carry`` are not read.  The saved set itself is released by the checkpoint as before
-    (#7039)."""
+    (#7039).
+
+    ``checkpoint_handoff`` (without ``checkpoint_keep``): ``False`` (the default) is the light set above, the saved
+    set of every call the checkpoint hand-off does not engage on; ``True`` is the saved set of a forward that keeps
+    the hand-off's tape set -- plus :func:`kda_handoff_bytes_kcp`, without the carry plane term -- that is, of a
+    checkpointed call with ``checkpoint_handoff="on"``, or ``"auto"`` where :func:`kcp_handoff_auto_refusal` admits
+    it.  A rank without tokens keeps no tape set: query it with ``False``.  The flag is that decision, not the entry's
+    mode: a value that is not a ``bool`` raises ``TypeError``."""
+    if not isinstance(checkpoint_handoff, bool):
+        raise TypeError(
+            "checkpoint_handoff of the byte query is the hand-off decision (a bool), not chunk_kda_kcp's mode; "
+            f"got {checkpoint_handoff!r}"
+        )
     _check_save_mode(save_mode)
     save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
     H, C = int(H), int(C)
@@ -2527,12 +2635,14 @@ def kda_saved_bytes_kcp(
         total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * STATE_TILE_BYTES
         if hp.P > 1:
             total += hp.NSEG * s
-    if saved_carry and hp.P > 1:
+    if saved_carry and hp.P > 1 and not checkpoint_handoff:
         total += (ctx.n_frag * (hp.P - 1) + max(ctx.n_in, ctx.n_out)) * s
     if with_conv:
         total += ctx.halo.n_hist_rows * C * 2
     if save_mode == "tape":
         total += ctx.NC_pad * H * 32768 + ctx.R * H * 256
+    if checkpoint_handoff:
+        total += kda_handoff_bytes_kcp(ctx, H=H)
     return total
 
 
@@ -3015,6 +3125,7 @@ def kda_workspace_bytes_kcp(
     C: int = 8192,
     local_arena: str | None = None,
     lean_passes: int | None = None,
+    use_gate_in_kernel: bool = False,
 ) -> int:
     """Caller-held workspace bytes of one rank: the local arena for ``(T_r, n_frag, H)`` (zero on a rank without
     tokens; the existing backend's arena, ``kda_train_workspace_bytes``, or for a backward workspace under
@@ -3036,7 +3147,15 @@ def kda_workspace_bytes_kcp(
     ``reserve`` binds it), and the scratch table set of every distinct ``(T_r, n_frag)`` that has one (zero at
     ``H = 64``; KiB scale where present).  The bytes of a list of one context are those of the context.
     ``lean_passes``: the tail passes a lean arena is sized for (``WorkspaceKcp(lean_passes=...)``; ``None``:
-    :data:`LEAN_PASSES_DEFAULT`)."""
+    :data:`LEAN_PASSES_DEFAULT`).  ``use_gate_in_kernel``: ``False`` only (the explicit gate, this package's mode);
+    ``True``, the raw gate mode of the deterministic package's ``kda_det_workspace_bytes_kcp``, raises
+    ``ValueError``."""
+    if use_gate_in_kernel is not False:
+        raise ValueError(
+            f"kda_workspace_bytes_kcp: use_gate_in_kernel={use_gate_in_kernel!r}: the raw gate mode runs on the "
+            "deterministic package only (kda_det_workspace_bytes_kcp, or flashinfer.cake_kda_train_kcp."
+            "kda_workspace_bytes_kcp with deterministic=True)"
+        )
     _check_save_mode(save_mode)
     check_lean_passes(lean_passes)
     lean = (
@@ -3209,6 +3328,15 @@ __all__ = [
     "partition_kcp",
     "kcp_plan",
     "kda_saved_bytes_kcp",
+    "kda_handoff_bytes_kcp",
+    "KCP_HANDOFF_BUFFERS",
+    "KCP_HANDOFF_DEFAULT",
+    "KCP_HANDOFF_HEADS",
+    "KCP_HANDOFF_MIN_HEAD_TOKENS",
+    "KCP_HANDOFF_MODES",
+    "KCP_HANDOFF_VERIFIED",
+    "kcp_handoff_auto_refusal",
+    "kcp_handoff_shape_refusal",
     "kda_workspace_bytes_kcp",
     "near_equal",
     "owner_of_head",

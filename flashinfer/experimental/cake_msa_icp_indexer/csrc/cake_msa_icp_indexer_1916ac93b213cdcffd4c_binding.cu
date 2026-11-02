@@ -36,6 +36,16 @@ void CheckCuda(cudaError_t status, const char* what) {
 
 void* DataPtr(const TensorView& t) { return static_cast<char*>(t.data_ptr()) + t.byte_offset(); }
 
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
+}
+
+int64_t CMod(int64_t a, int64_t b) {
+  if (b == 0) NoInt64(a, "%", b);
+  return b == -1 ? 0 : a % b;
+}
+
 void Run(TensorView a_pool, TensorView a_recv_bases, TensorView a_errors, TensorView a_generations, int64_t a_total_q, int64_t a_num_heads, int64_t a_splits, int64_t a_pool_row_stride, int64_t a_slot, int64_t a_rank, int64_t a_world, int64_t a_heads_per_rank, int64_t a_capacity, int64_t a_spin_limit, int64_t a_tagged, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_pool.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
@@ -83,6 +93,8 @@ void Run(TensorView a_pool, TensorView a_recv_bases, TensorView a_errors, Tensor
   check_same_device(a_errors, a_pool, "errors", "pool");
   check_contiguous(a_generations, "generations");
   check_same_device(a_generations, a_pool, "generations", "pool");
+  TVM_FFI_CHECK((CMod(a_pool_row_stride, 2LL) == 0LL), ValueError)
+      << KERNEL_NAME << ": requires (CMod(pool_row_stride, 2) == 0)";
   TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
       << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)

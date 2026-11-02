@@ -39,6 +39,7 @@ previous name                           det name
 ``kcp_workspace_bytes``                 ``kda_det_workspace_bytes_kcp``
 ``kcp_saved_bytes``                     ``kda_det_saved_bytes_kcp``
 ``kcp_comm_bytes``                      ``kda_det_comm_bytes_kcp``
+``kcp_reduce_gate_param_grads``         ``reduce_gate_param_grads_det_kcp``
 ``KcpContext``                          ``ContextDetKcp``
 ``KcpOptions``                          ``OptionsDetKcp``
 ``KcpPartition``                        ``PartitionDetKcp``
@@ -87,6 +88,8 @@ chunk_kda_kcp = _kcp.chunk_kda_det_kcp
 kcp_workspace_bytes = _kcp.kda_det_workspace_bytes_kcp
 kcp_saved_bytes = _kcp.kda_det_saved_bytes_kcp
 kcp_comm_bytes = _kcp.kda_det_comm_bytes_kcp
+# the raw gate mode's bitwise reproducible sum of the rank-local parameter gradients (previous-style name)
+kcp_reduce_gate_param_grads = _kcp.reduce_gate_param_grads_det_kcp
 
 # The KCP types under their previous names, resolved on first access through ``flashinfer.cake_kda_det_train_kcp``
 # (which imports the KCP host module lazily): previous name -> det name.
@@ -123,6 +126,7 @@ __all__ = [
     "is_kda_train_supported",
     "kcp_comm_bytes",
     "kcp_partition",
+    "kcp_reduce_gate_param_grads",
     "kcp_saved_bytes",
     "kcp_workspace_bytes",
     "kda_train_arena",

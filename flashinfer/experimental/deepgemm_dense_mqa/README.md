@@ -180,7 +180,10 @@ in-kernel scan classes `fused_scan_ceilings` (`[32, 768]` query blocks) with one
 (`fused_scan32_max_kv`, `fused_scan768_max_kv`) and the `fp4` block (`fused_q1_max_kv`, `fused_scan_ceilings`
 `[32, 1024]`, `fused_scan32_max_kv`, `fused_scan1024_max_kv` -- each a PER-ARCHITECTURE map, `{"sm_100a": 1048576,
 "sm_103a": 1048832}` and `{"sm_100a": 65536, "sm_103a": 65792}`: the logical `route_name` applies the most permissive
-bound, `served_route` the device's own --, `first_tile_prefetch_max_queries_scan1024`: the query
+bound, `served_route` the device's own --, the per-architecture small-Q bands of the FP8 32-block class and the FP4 32- and
+1024-block classes, `fused_scan<ceiling>_small_q_max_queries` / `fused_scan<ceiling>_small_q_max_kv`: a class's KV bound
+rises to the band's KV bound for a query count up to the band's query bound (no band where the query bound is below the
+class's query counts -- 1 for a 32-block class, 128 for the 1024-block class; published: FP8 32-block class sm_100a up to Q = 29 at K <= 1048832; FP4 32-block class sm_100a up to Q = 63 at K <= 1048832; FP4 1024-block class sm_100a up to Q = 511 at K <= 65792), `first_tile_prefetch_max_queries_scan1024`: the query
 count up to which the 1024-block FP4 class is served by `fp4:qle1024:short`, its first-tile-prefetch program, instead of
 `fp4:le1024:short`, and the PER-ARCHITECTURE map `first_tile_prefetch_forms` -- `{"sm_100a": ["q1", "qle1024"],
 "sm_103a": ["q1", "le32", "qle1024"]}` -- naming the single-launch forms whose program carries the prefetch on each
@@ -190,7 +193,7 @@ architecture) that bound the single-launch 32-head routes, -- v10 --
 PER-ARCHITECTURE map `{"sm_100a": 34048, "sm_103a": 65536}` -- the logical `route_name` applies the most permissive
 bound, `served_route` the device's own; the per-architecture small-Q band `fused_qle2048_small_q_max_queries` /
 `fused_qle2048_small_q_max_kv` raises it to the band's KV bound for a query count up to the band's query bound -- sm_103a
-up to Q = 256 at K <= 65792, none on sm_100a (query bound 128)) and `single_launch_precedence` (per architecture and overlap tier `le128` /
+up to Q = 256 at K <= 65792, sm_100a up to Q = 256 at K <= 65792) and `single_launch_precedence` (per architecture and overlap tier `le128` /
 `le2048`, the consultation order of the two single-launch families `le_class` / `qle`; a reader must know every key --
 the schema version carries them together), -- v13 -- `h32_text_options` (per architecture, `{route: [option, ...]}` over the
 32-head routes whose delivered logits program is built with an adopted cache-hint / ordering option -- `scan_window_l2_prefetch`,
@@ -289,9 +292,9 @@ and on a `:kvsplit` route of the `partial` kind or a `:short` route a program of
 (`kv_min`, `kv_alignment`) and its metadata buffer are the record's; no fallback of `served_route` lands on a
 `:kvsplit` route. `route_stages(record, arch, K, queries)` applies the rule; `program_names(route, arch)` lists the record's
 programs, then the bucket programs.
-Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:le32:short` (on sm_100a the
-`stage_buckets` of `fp8:q128:short` for `K <= 4096` and of `fp8:full:le32:short` for `K <= 32768` launch the warp-scan
-text with a four-stage TMEM accumulator ring), `fp8:{full,partial}:le768:short`,
+Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:le32:short` (the
+`stage_buckets` of `fp8:q128:short` for `K <= 4096` on sm_100a and sm_103a and of `fp8:full:le32:short` for
+`K <= 32768` on sm_100a launch the warp-scan text with a four-stage TMEM accumulator ring), `fp8:{full,partial}:le768:short`,
 `fp8:qle128:short` (one `logits` stage, the program `fp8_fused_qle128` -- bound per architecture since v13: the
 `source_consumer_release` text on sm_100a, the pinned text on sm_103a, `policy.h32_text_options` -- writing the tiered schedule in-kernel for
 `1 < Q <= 128`, `K <= fused_qle128_max_kv`; catalogued where the `le128` tier's precedence reaches it -- under the

@@ -42,7 +42,11 @@ two decodes loading the first item of their unit in the kernel setup, which
 item pair; the combine's is
 ``reduce_general``, a combine that reads the first pair of splits of a row
 from its top loads, which ``select_reduce_record`` picks for plans of more
-than two splits per row.  A renamed program still changes no host code.  A
+than two splits per row, and ``reduce_two_splits``, an SM100 combine without
+the per-row split-count load, which ``select_reduce_record`` picks for short
+plans whose rows of two splits form one contiguous range, launched over that
+range alone (its grid rule's rows are the range's, its row arguments offset
+to the range's first row).  A renamed program still changes no host code.  A
 record carries the host plan only: the
 program's ``library`` stem (its ``build.json`` entries are
 ``<library>_<arch>``), the architectures it is delivered for, the source
@@ -77,8 +81,9 @@ digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted,
 every default spelled>, "module": <dotted source module>}`` of the kernel the
 program was rendered from; a changed keyword is a new program.  The exception
 is a keyword at its implicit default (``qk_ahead``, ``short_rows``, ``xv``,
-``epi_warp``, ``spec_uh`` and ``general_splits`` at ``False``): the name omits
-it, so programs named before the keyword existed keep their names.
+``epi_warp``, ``spec_uh``, ``general_splits`` and ``two_splits`` at
+``False``): the name omits it, so programs named before the keyword existed
+keep their names.
 """
 
 from __future__ import annotations
@@ -801,6 +806,53 @@ MODULES: dict[str, dict[str, Any]] = {
             "use_pdl": False,
         },
         "library": "cake_nvfp4_mla_decode_d3e21f744c0427fef73d",
+        "logical": {
+            "lse": "lse",
+            "max_splits": "max_splits",
+            "num_heads": "num_heads",
+            "o": "o",
+            "partial_lse": "partial_lse",
+            "partial_o": "partial_o",
+            "row_splits": "row_splits",
+            "total_q": "total_q",
+        },
+        "max_splits": 64,
+        "module": "tart.attention_split_kv_merge_bf16_rowsplits_with_lse.sm100_sm103.dsv4_nvfp4_fmha_decode_reduce",
+        "stage": "reduce",
+    },
+    "reduce_two_splits": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "o"],
+            ["buffer", "lse"],
+            ["buffer", "partial_o"],
+            ["buffer", "partial_lse"],
+            ["buffer", "row_splits"],
+            ["parameter", "total_q"],
+            ["parameter", "num_heads"],
+            ["parameter", "max_splits"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "build": {"two_splits": True},
+        "ffi_entry": "run",
+        "grid_rule": {
+            "heads_per_cta": 16,
+            "kind": "rows_by_heads",
+        },
+        "kernel": "cake_nvfp4_mla_decode_654cb434614f1d4f26c6",
+        "kernel_symbol": "kernel_cake_nvfp4_mla_decode_654cb434614f1d4f26c6",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_nvfp4_mla_decode_654cb434614f1d4f26c6",
         "logical": {
             "lse": "lse",
             "max_splits": "max_splits",
