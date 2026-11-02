@@ -661,7 +661,7 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm100a", "g4_q64", 256, 64, 1024, 32, 8, 4, False),
     ("sm100a", "g4_q128", 256, 128, 1024, 32, 8, 4, False),
     ("sm100a", "g8_q64", 256, 64, 1024, 32, 4, 8, True),
-    ("sm100a", "g8_q128", 256, 128, 1024, 32, 4, 8, False),
+    ("sm100a", "g8_q128", 256, 128, 1024, 32, 4, 8, True),
     ("sm100a", "g1_q32_b64", 64, 32, 1024, 32, 32, 1, False),
     ("sm100a", "g1_q32_b128", 128, 32, 1024, 32, 32, 1, False),
     ("sm100a", "g2_q32_b64", 64, 32, 1024, 32, 16, 2, True),
@@ -688,7 +688,7 @@ _FP8_RUNTIME_ROUTE_ROWS = [
 # Calls the sm100a rule of many query rows at long query lengths covers, over
 # caches of at least :data:`_CONTEXT_FP8_RUNTIME_ROWS_KV` keys (timed B200 with
 # five seeded memory layouts: the runtime-size program ran faster back to
-# back at the power limit on every row); ``g8_q128`` above stays below them.
+# back at the power limit on every row, ``g8_q128`` above among them).
 _FP8_RUNTIME_ROWS_KV_ROUTE_ROWS = [
     ("sm100a", "kv_g8_q128_k4096", 256, 128, 4096, 32, 4, 8, True),
     ("sm100a", "kv_g8_q256_k16384", 128, 256, 16384, 32, 4, 8, True),

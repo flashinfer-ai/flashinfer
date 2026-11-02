@@ -5470,9 +5470,9 @@ def _context_fp8_runtime_pack(pack_g: int) -> int:
 # module: over these caches the runtime-size program ran 1.4 .. 3.3 % faster
 # back to back at the power limit and was not slower cold (1.0 .. 4.2 % faster
 # in the median) (timed B200: packs 1, 2, 4 and 8, 128 .. 2048 query tokens,
-# 2^20 and 2^21 query rows, 16 .. 256 requests, pages 16 and 64, 2048 ..
-# 16384 keys).
-_CONTEXT_FP8_RUNTIME_ROWS_KV: dict[str, int] = {"sm100a": 2048}
+# 2^20 and 2^21 query rows, 16 .. 256 requests, pages 16 and 64, 1024 ..
+# 16384 keys, on two B200 boards).
+_CONTEXT_FP8_RUNTIME_ROWS_KV: dict[str, int] = {"sm100a": 1024}
 
 
 @functools.lru_cache(maxsize=1024)
