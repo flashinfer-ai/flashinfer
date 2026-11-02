@@ -128,15 +128,36 @@ def _deterministic(deterministic: bool, entry: str) -> bool:
     return False
 
 
+# A deterministic-route option the non-deterministic package does not have yet.
+_DET_ONLY_L2N = "use_qk_l2norm_in_kernel"
+
+
+def _nd_without_l2n(mapping: dict) -> dict:
+    """``mapping`` for the non-deterministic route: ``use_qk_l2norm_in_kernel`` dropped when ``False``, refused when
+    ``True`` (that route has no in-kernel Q / K L2 norm yet)."""
+    if _DET_ONLY_L2N not in mapping:
+        return mapping
+    if mapping[_DET_ONLY_L2N]:
+        raise ValueError(
+            "the non-deterministic KCP route does not support use_qk_l2norm_in_kernel yet; "
+            "pass deterministic=True for the in-kernel Q/K L2 norm"
+        )
+    return {k: v for k, v in mapping.items() if k != _DET_ONLY_L2N}
+
+
 def _options_for(det: bool, options: Any) -> Any:
     """``options`` for the routed package: an options instance of the other route becomes the mapping of its fields
-    (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through."""
-    if options is None or isinstance(options, dict):
+    (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through.  On the
+    non-deterministic route ``use_qk_l2norm_in_kernel`` is dropped when ``False`` and refused when ``True``."""
+    if options is None:
         return options
+    if isinstance(options, dict):
+        return options if det else _nd_without_l2n(options)
     own = _det().OptionsDetKcp if det else _pkg().OptionsKcp
     if isinstance(options, own) or not dataclasses.is_dataclass(options):
         return options
-    return {f.name: getattr(options, f.name) for f in dataclasses.fields(options)}
+    fields = {f.name: getattr(options, f.name) for f in dataclasses.fields(options)}
+    return fields if det else _nd_without_l2n(fields)
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -304,7 +325,7 @@ def chunk_gdn_fwd_kcp(
         workspace=workspace,
         options=_options_for(False, options),
         deterministic=False,
-        **knobs,
+        **_nd_without_l2n(knobs),
     )
 
 
@@ -381,7 +402,7 @@ def chunk_gdn_bwd_kcp(
         workspace=workspace,
         options=_options_for(False, options),
         deterministic=False,
-        **knobs,
+        **_nd_without_l2n(knobs),
     )
 
 
@@ -496,7 +517,7 @@ def chunk_gdn_kcp(
         options=_options_for(False, options),
         recompute_handle=recompute_handle,
         deterministic=False,
-        **knobs,
+        **_nd_without_l2n(knobs),
     )
 
 

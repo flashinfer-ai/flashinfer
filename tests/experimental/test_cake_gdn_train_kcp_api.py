@@ -1019,7 +1019,8 @@ def test_facade_context_graph_replay_hint(monkeypatch) -> None:
 
 
 def test_facade_converts_an_options_instance_of_the_other_route(monkeypatch) -> None:
-    """An options instance of the other route reaches the routed package as the mapping of its fields; the routed
+    """An options instance of the other route reaches the routed package as the mapping of its fields (the
+    deterministic-only ``use_qk_l2norm_in_kernel`` left out at ``False`` on the non-deterministic route); the routed
     package's own instance, a mapping and ``None`` pass through unchanged."""
     facade = importlib.import_module(FACADE)
     det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
@@ -1032,7 +1033,11 @@ def test_facade_converts_an_options_instance_of_the_other_route(monkeypatch) -> 
     )
     got = seen[-1][1]["options"]
     assert isinstance(got, dict) and got["save_mode"] == "full"
-    assert got == {f.name: getattr(det_o, f.name) for f in dataclasses.fields(det_o)}
+    assert got == {
+        f.name: getattr(det_o, f.name)
+        for f in dataclasses.fields(det_o)
+        if f.name != "use_qk_l2norm_in_kernel"
+    }
     facade.chunk_gdn_fwd_kcp(
         t, t, t, t, t, object(), options=own_o, deterministic=False
     )

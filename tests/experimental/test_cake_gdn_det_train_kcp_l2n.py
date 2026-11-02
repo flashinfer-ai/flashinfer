@@ -1139,3 +1139,36 @@ def test_no_fla_import() -> None:
     ctx, ops = _setup()
     _saved_pass(ctx, ops, use_qk_l2norm_in_kernel=True)
     assert "fla" not in sys.modules
+
+
+def test_nondeterministic_route_drops_or_refuses_the_l2n_option() -> None:
+    """The ``flashinfer.cake_gdn_train_kcp`` facade's ``deterministic=False`` route: a deterministic options instance
+    or mapping with ``use_qk_l2norm_in_kernel=False`` reaches the non-deterministic package without the key (its real
+    ``make_options`` accepts the result), and ``True`` is refused with a ``ValueError`` (no fallback, no ``TypeError``)."""
+    facade = importlib.import_module("flashinfer.cake_gdn_train_kcp")
+    nd_options = importlib.import_module(
+        "flashinfer.experimental.cake_gdn_train_kcp.cake_options"
+    )
+    det_options = _mod("cake_options")
+    for off in (
+        det_options.OptionsDetKcp(),
+        det_options.OptionsDetKcp(use_qk_l2norm_in_kernel=False),
+        {"use_qk_l2norm_in_kernel": False},
+        {"save_mode": "full", "use_qk_l2norm_in_kernel": False},
+    ):
+        mapped = facade._options_for(False, off)
+        assert "use_qk_l2norm_in_kernel" not in mapped
+        assert isinstance(nd_options.make_options(mapped), nd_options.OptionsKcp)
+    assert facade._nd_without_l2n({"use_qk_l2norm_in_kernel": False}) == {}
+    for on in (
+        det_options.OptionsDetKcp(use_qk_l2norm_in_kernel=True),
+        {"use_qk_l2norm_in_kernel": True},
+    ):
+        with pytest.raises(
+            ValueError, match="does not support use_qk_l2norm_in_kernel"
+        ):
+            facade._options_for(False, on)
+    with pytest.raises(ValueError, match="does not support use_qk_l2norm_in_kernel"):
+        facade._nd_without_l2n({"use_qk_l2norm_in_kernel": True})
+    det_mapped = facade._options_for(True, {"use_qk_l2norm_in_kernel": True})
+    assert det_options.make_options(det_mapped).use_qk_l2norm_in_kernel is True
