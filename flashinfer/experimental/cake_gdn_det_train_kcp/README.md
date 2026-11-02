@@ -287,17 +287,19 @@ other reader (#2, #3, #5, #7) is the unchanged program bound to `qn` / `kn`.
 
 | path | `qn` / `kn` from | `r` the pullback reads | dropped |
 |---|---|---|---|
-| forward | `fwd_prep_l2n` | -- | `kn` before `out`, `qn` after #5; the arena `r` after #1 (the saved `r` is a fresh tensor) |
+| forward | `fwd_prep_l2n` | -- | `kn` before `out`, `qn` after #5 (a hand-off forward hands both over with its tapes); the arena `r` after #1 (the saved `r` is a fresh tensor) |
 | light backward | the replay's `fwd_prep_l2n` | saved | after #8 |
-| `save_mode="full"`, kept recompute tapes | `qk_apply` after #6 | saved | after #8 |
+| kept recompute tapes | the recompute forward's `fwd_prep_l2n` (handed over with the tapes; no `qk_apply`) | saved | after #8 |
+| `save_mode="full"` | `qk_apply` after #6 | saved | after #8 |
 | `boundary_mode="replay"` | the replayed forward's `fwd_prep_l2n` | arena | after #8 |
 | recompute handle | `fwd_prep_l2n` (the recompute is a forward) | -- | as the forward |
 | `graph="replay"` | as eager | as eager | never (the graph bakes the arena) |
 
 The saved set gains `qk_rstd` (FP32 `[2, T_r, H_qk]`, `8 T_r H_qk` bytes;
-`KCP_SAVED_VERSION` 2); the normalized rows are workspace only
-(`2 x 256 T_r H_qk` bytes, in the forward's tape walk and every backward
-phase).  The byte queries take `use_qk_l2norm_in_kernel=`;
+`KCP_SAVED_VERSION` 2); the normalized rows are never saved
+(`2 x 256 T_r H_qk` bytes: workspace in the forward's tape walk and every
+backward phase; in the kept-tape backward they are hand-off tensors,
+`bwd.kept_tapes`).  The byte queries take `use_qk_l2norm_in_kernel=`;
 `LAST_CALL[...]` records `qk_l2norm`, `qk_source`, `rstd_source` and
 `arena_tapes`.  The recompute handle's entry key includes the flag.  Until
 the registry renders the three programs the kernel backend refuses the
