@@ -516,24 +516,35 @@ def test_choose_one_recovers_from_memory_error_during_preparation(monkeypatch, p
 
 
 @pytest.mark.parametrize("grouped", (False, True))
-@pytest.mark.parametrize("entry", ("choose_one", "rank_tactics"))
+@pytest.mark.parametrize("entry", ("choose_one", "rank_tactics", "nested"))
 def test_tuning_stops_after_a_tactic_loses_the_cuda_context(
     monkeypatch, entry, grouped
 ):
     """A failed tactic after which the CUDA context is unusable stops tuning with
     an error naming it, before another runner fails on the dead context. A
-    tuning-group member cannot rejoin the per-tactic reduces, so it stops too."""
+    tuning-group member cannot rejoin the per-tactic reduces, so it stops too,
+    also when the ranking runs inside a runner's get_valid_tactics (MoE)."""
     module = "flashinfer.autotuner.autotuner"
-    lost = RuntimeError("CUDA error: an illegal memory access was encountered")
+    failure = RuntimeError("tactic failed")
+    lost = RuntimeError(
+        "CUDA error: an illegal memory access was encountered\n"
+        "CUDA kernel errors might be asynchronously reported"
+    )
     profiled = []
 
     class PoisoningRunner(DummyRunner):
         pass
 
+    class RankingRunner(DummyRunner):
+        def get_valid_tactics(self, inputs, profile):
+            return tuner.rank_tactics(
+                "lost_context", [PoisoningRunner((0, 1))], TuningConfig(), inputs, k=2
+            )
+
     def profile(self, runner, inputs, tactic, *args, **kwargs):
         profiled.append((type(runner).__name__, tactic))
         if isinstance(runner, PoisoningRunner):
-            raise lost
+            raise failure
         return 1.0
 
     tuner = reset_autotuner()
@@ -559,9 +570,13 @@ def test_tuning_stops_after_a_tactic_loses_the_cuda_context(
     ):
         if entry == "choose_one":
             tuner.choose_one("lost_context", runners, TuningConfig(), inputs)
-        else:
+        elif entry == "rank_tactics":
             tuner.rank_tactics("lost_context", runners[:1], TuningConfig(), inputs, k=2)
-    assert exc.value.__cause__ is lost
+        else:
+            tuner.choose_one("moe", [RankingRunner()], TuningConfig(), inputs)
+    assert exc.value.__cause__ is failure
+    assert "(CUDA error: an illegal memory access was encountered)" in str(exc.value)
+    assert "asynchronously" not in str(exc.value)
     assert profiled == [("PoisoningRunner", 0)]
     if entry == "choose_one":
         failed = tuner.stats.failed_tactics["lost_context::PoisoningRunner"]
@@ -634,7 +649,7 @@ def test_choose_one_stops_on_a_device_side_assert():
     assert worker["ordinary_tactic"] == 0, log
     error = worker.get("error", "")
     assert "Runner tactic 1 failed while tuning lost_context" in error, log
-    assert "CUDA context unusable" in error, log
+    assert "CUDA context is unusable (CUDA error: device-side assert" in error, log
     assert worker["prepared"] == ["skips", "poisons"], log
 
 
