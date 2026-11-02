@@ -370,12 +370,20 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
 
   // Selection index -> (physical page or -1, page offset), then -> byte offsets and valid bits.
   // NVFP4: index / page_size as (umulhi(index, mul) + index) >> shift, exact for 0 <= index < 2^31.
+  // mul - 1 = floor(n * 2^32 / page_size) with n = 2^shift - page_size < page_size: a reciprocal
+  // estimate within 2^12, then two exact remainder corrections. A 64-bit division here compiles to
+  // a call that first waits for every load issued above.
   uint32_t page_shift = 0, page_mul = 0;
   if constexpr (F == KvFormat::kNVFP4) {
-    page_shift = 32 - __clz(uint32_t(p.page_size) - 1);
-    page_mul = uint32_t(((uint64_t(1) << page_shift) - uint32_t(p.page_size)) *
-                            (uint64_t(1) << 32) / uint32_t(p.page_size) +
-                        1);
+    const uint32_t page_size = uint32_t(p.page_size);
+    page_shift = 32 - __clz(page_size - 1);
+    const uint32_t n = (1u << page_shift) - page_size;
+    const int64_t scaled = int64_t(uint64_t(n) << 32);
+    const float rcp = math::ptx_rcp(float(page_size));
+    uint32_t q = __float2uint_rz(float(n) * 4294967296.f * rcp);
+    q += __float2int_rd(float(scaled - int64_t(uint64_t(q) * page_size)) * rcp);
+    const int64_t r = scaled - int64_t(uint64_t(q) * page_size);
+    page_mul = (r < 0 ? q - 1 : r >= page_size ? q + 1 : q) + 1;
   }
   auto lookup = [&](int index, int& page, int& offset) {
     const int safe = max(index, 0);
