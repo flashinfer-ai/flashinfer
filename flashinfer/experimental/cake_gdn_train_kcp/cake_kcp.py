@@ -6052,9 +6052,10 @@ def chunk_gdn_kcp(
 
     ``q`` / ``k`` / ``v`` that are head views of one packed ``[..., T, (2 H_qk + HV) * 128]`` row get the full backward
     speed as :func:`packed_qkv_views_kcp` views (conditions: README, "Packed Q/K/V").  Plain ``split`` / ``view``
-    views of the row run the same programs on the same operands and give the same results, but torch's split
-    backward concatenates ``dq`` / ``dk`` / ``dv`` into a new row: about 1.1-1.2 ms (33-37 %) more backward per call
-    at ``(16, 48)`` and 32,768 tokens on B200 and GB300, with the in-kernel norm off or on (README, "Packed Q/K/V")."""
+    views of the row run the same programs on the same operands and give the same results, but the backward writes
+    three contiguous ``dq`` / ``dk`` / ``dv`` for them and torch's split backward concatenates them into a new row:
+    about 0.2 ms (6-7 %) more backward per call at ``(16, 48)`` and 32,768 tokens on B200 and GB300 and 0.17 ms
+    (7-8 %) on R200, with the in-kernel norm off or on (README, "Packed Q/K/V")."""
     check_mode(deterministic, "chunk_gdn_kcp")
     over = _literal_overrides(
         options,

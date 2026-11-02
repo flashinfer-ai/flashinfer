@@ -161,8 +161,9 @@ The packed GDN training routes come in four combinations:
   same results within the accuracy budgets.
 * When `q` / `k` / `v` are head views of one packed row, take them with
   `packed_qkv_views_kcp` for full backward speed: plain `split` views of the
-  row give the same gradients, but the backward is about 1.1-1.2 ms (33-37 %)
-  slower at `(16, 48)` and 32,768 tokens (**Packed Q/K/V** below).
+  row give the same gradients, but torch's split backward concatenates them:
+  about 0.2 ms (6-7 %) more backward on B200 and GB300 and 0.17 ms (7-8 %) on
+  R200 at `(16, 48)` and 32,768 tokens (**Packed Q/K/V** below).
 * `scale` defaults to `128 ** -0.5`.
 * The host reads no tensor contents (no `.item()`, `.tolist()`, no implicit
   synchronization): every table is built on the CPU from the partition
@@ -336,25 +337,33 @@ concatenates them).  Plain views of the same row
 (`qkv.split((H_qk * 128, H_qk * 128, HV * 128), -1)`, then
 `.view(T, heads, 128)`) run the same programs on the same operands and give
 the same results (within the accuracy budgets; bitwise in every run measured
-below), and the backward still writes one packed row, but torch's split
-backward then concatenates `dq` / `dk` / `dv` into a new row.  Measured cost
+below).  The backward writes one packed row only for the outputs of
+`packed_qkv_views_kcp` (or of the deterministic package's
+`packed_qkv_views_det_kcp`), as recorded by the forward.  For plain views,
+column slices and other views it writes three contiguous `dq` / `dk` / `dv`,
+and torch's split backward concatenates them into a new row.  Measured cost
 of the plain views (the #8367 repro with `deterministic=False`:
 `(H_qk, HV) = (16, 48)`, 32,768 tokens in five documents, one-rank context,
 forward and backward to the packed row, and the checkpointed step
 `torch.utils.checkpoint(views + chunk_gdn_kcp, use_reentrant=False)` =
 two forwards and one backward; CUDA-event ms, the median of 16 group
 medians (2 runs x 8 groups; a group = 2 blocks of 5 warm-up + 20 timed calls
-per view form, the forms interleaved in palindromic order; the B200 norm-off
-forward is from the one re-measure pair, after the first pair drifted by more
-than 2 %); one GPU per exclusive node; PyTorch 2.14.1+cu130, CUDA 13.0
-runtime):
+per view form, the forms interleaved in palindromic order).  The B200
+forward and backward reached the GPU's power cap and are the median of the
+steady-block medians of 3 palindromic block pairs (a block = 5 s idle, 20 s
+warm-up, 300 timed calls); the R200 norm-off checkpointed step and norm-on
+forward are from the one re-measure pair, after the first pair drifted by
+more than 2 %.  One GPU per exclusive node (R200: a 208-SM board);
+PyTorch 2.14.1+cu130, CUDA 13.0 runtime:
 
 | GPU | in-kernel L2 norm | forward split / packed | backward split / packed | backward split - packed | checkpointed step split / packed |
 |---|---|---|---|---|---|
-| B200 (sm_100a, 148 SMs) | off | 1.568 / 1.575 | 4.386 / 3.195 | +1.191 (1.373x) | 6.039 / 4.839 (1.248x) |
-| B200 (sm_100a, 148 SMs) | on | 1.757 / 1.763 | 4.657 / 3.487 | +1.170 (1.336x) | 6.505 / 5.345 (1.217x) |
-| GB300 (sm_103a, 152 SMs) | off | 1.416 / 1.432 | 4.017 / 2.946 | +1.071 (1.364x) | 5.490 / 4.438 (1.237x) |
-| GB300 (sm_103a, 152 SMs) | on | 1.575 / 1.594 | 4.311 / 3.239 | +1.072 (1.331x) | 5.947 / 4.895 (1.215x) |
+| B200 (sm_100a, 148 SMs) | off | 1.674 / 1.666 | 3.390 / 3.187 | +0.203 (1.064x) | 5.214 / 5.023 (1.038x) |
+| B200 (sm_100a, 148 SMs) | on | 1.862 / 1.852 | 3.678 / 3.473 | +0.205 (1.059x) | 5.678 / 5.481 (1.036x) |
+| GB300 (sm_103a, 152 SMs) | off | 1.538 / 1.534 | 3.139 / 2.944 | +0.195 (1.066x) | 4.789 / 4.611 (1.039x) |
+| GB300 (sm_103a, 152 SMs) | on | 1.866 / 1.855 | 3.437 / 3.242 | +0.195 (1.060x) | 5.535 / 5.357 (1.033x) |
+| R200 (sm_107a, 208 SMs) | off | 1.111 / 1.108 | 2.264 / 2.093 | +0.171 (1.082x) | 3.467 / 3.302 (1.050x) |
+| R200 (sm_107a, 208 SMs) | on | 1.244 / 1.242 | 2.465 / 2.292 | +0.173 (1.075x) | 3.807 / 3.643 (1.045x) |
 
 The three views are the outputs of one custom autograd node.  Hooks and
 `retain_grad` on them fire as on any autograd output.  Its backward returns
