@@ -280,8 +280,7 @@ K1_ROW_MAJOR_BLOCK_N: tuple[int, ...] = (192,)
 #: test (p < 0.05) with a median time ratio below 0.99, in eager launches and in CUDA graph replays, at token counts
 #: 16172 to 16384, and no more than 3 % slower than that plan next to a kernel holding 8, 16 or 32 SMs on another
 #: stream.  A ``None`` entry is a measured row that missed; a row without an entry was not measured.  Both run the
-#: deterministic program.  On sm_100a and sm_103a parts of 152 SMs or more a verdict does not hold at the token counts
-#: of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`.
+#: deterministic program.  A verdict does not hold at the token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`.
 # fmt: off
 K1_SPLIT_RULES: dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]] = {
     # sm_100a: two splits of 64-wide tiles (one wave of the CTA pairs; two partials, bitwise reproducible).  d_out 128
@@ -340,11 +339,13 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
     ("sm_103a", 1, 4096, 48, "bf16"): 152,
     ("sm_103a", 1, 4096, 48, "f32"): 152,
 }
-#: Token counts at which a row of :data:`K1_SPLIT_RULES` on sm_100a / sm_103a does not take its verdict,
-#: ``key -> ((min_sm_count, min_tokens, max_tokens), ...)``: on a part of at least ``min_sm_count`` SMs, a token count
-#: (``K`` of the weight gradient) from ``min_tokens`` to ``max_tokens`` (``None``: no upper bound) runs the
-#: deterministic program; every other token count, and a part with fewer SMs, keeps the row's verdict.  The verdicts
-#: were measured at 16172 to 16384 tokens.  The entries come from a re-measurement at 512, 1024, 2048, 4096, 8192,
+#: Token counts at which a row of :data:`K1_SPLIT_RULES` or of a table of :data:`K1_SPLIT_RULES_BY_SM` does not take
+#: its verdict, ``key -> ((sm_count, min_tokens, max_tokens), ...)``: a token count (``K`` of the weight gradient) from
+#: ``min_tokens`` to ``max_tokens`` (``None``: no upper bound) runs the deterministic program on a part of at least
+#: ``sm_count`` SMs where ``sm_count`` is at or above the row's SM-count floor (:data:`K1_MIN_SM_COUNT`,
+#: :data:`K1_RULE_MIN_SM_COUNT`), and on a part of exactly ``sm_count`` SMs below it (the parts of
+#: :data:`K1_SPLIT_RULES_BY_SM`); every other token count and part keeps the row's verdict.  The verdicts were measured
+#: at 16172 to 16384 tokens.  The sm_100a / sm_103a entries come from a re-measurement at 512, 1024, 2048, 4096, 8192,
 #: 16231, 32768 and 65536 tokens on two 152-SM parts per row and token count (GB200, GB300; the strict runs of 8 GB300
 #: points ran on two other parts, four GB300 parts in all; the protocol is in the K1 token table of the README).  A
 #: measured token count is an entry where the split program failed in at least one run (the rule above; the backward
@@ -355,7 +356,16 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: seed on both parts.  A token count between two consecutive measured entries is an entry too (not measured), and so is
 #: every token count above 65536 of a row whose split program failed that FP64 comparison at 65536 tokens.  Unmeasured
 #: token counts keep the verdict: below 512, above 65536 (except those rows), between two measured token counts with
-#: different outcomes, and on parts with fewer than 152 SMs.
+#: different outcomes, and on parts with fewer than 152 SMs.  The sm_107a entries are single token counts of the
+#: deterministic package's sm_107a rules for one token count (16231 and 16384 tokens; 16231 only for ``4096 -> 1024``),
+#: which give the row a faster deterministic plan there.  On 208 and 212 SMs they come from a re-measurement at 16172,
+#: 16231 and 16384 tokens against those plans (the protocol is in the sm_107a K1 token table of the README): a measured
+#: token count is an entry where the row's program failed the rule above in some run, or left the backward pass or the
+#: checkpointed step more than 1.3 % slower than the deterministic program (ratio of the medians over the runs, or
+#: median of the paired ratios, in eager launches or in graph replays).  The 216-SM entries were not measured on
+#: 216-SM parts: they are the token counts where the deterministic package's speed-up of the row on a 216-SM part (its
+#: own measurement against its earlier plan) leaves this package's program less than 2 % faster than the deterministic
+#: program; the other rows keep their 216-SM verdicts there.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
@@ -388,6 +398,20 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ("sm_103a", 1, 6144, 32, "f32"): ((152, 512, 512),),
     ("sm_103a", 1, 6144, 128, "bf16"): ((152, 512, 8192),),
     ("sm_103a", 1, 6144, 128, "f32"): ((152, 512, 8192),),
+    ("sm_107a", 1, 4096, 48, "f32"): (
+        (208, 16231, 16231), (208, 16384, 16384), (216, 16231, 16231), (216, 16384, 16384),
+    ),
+    ("sm_107a", 1, 4096, 64, "f32"): ((208, 16231, 16231), (208, 16384, 16384)),
+    ("sm_107a", 1, 4096, 512, "f32"): (
+        (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (212, 16384, 16384),
+        (216, 16231, 16231), (216, 16384, 16384),
+    ),
+    ("sm_107a", 1, 4096, 1024, "f32"): ((208, 16231, 16231), (212, 16231, 16231), (216, 16231, 16231)),
+    ("sm_107a", 1, 5120, 48, "f32"): (
+        (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (216, 16231, 16231),
+    ),
+    ("sm_107a", 1, 5120, 64, "f32"): ((208, 16231, 16231), (212, 16231, 16231), (216, 16231, 16231)),
+    ("sm_107a", 1, 5120, 512, "f32"): ((212, 16231, 16231), (212, 16384, 16384)),
 }
 # fmt: on
 #: Per-SM-count verdicts of the parts of an architecture with fewer SMs than its :data:`K1_MIN_SM_COUNT`,
@@ -398,14 +422,14 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
 #: deterministic program.  The sm_107a tables were measured on 208-SM and 212-SM R200 parts.  Rows whose deterministic
 #: program is a stream-K launch that did not complete next to a kernel holding SMs on another stream have no measured
 #: verdict and stay on it, on 208 and on 212 SMs: ``4096 -> 32`` and ``4096 -> 64`` BF16, ``5120 -> 32`` BF16 and
-#: ``6144 -> 32``.  On 212 SMs ``4096 -> 4096`` FP32 takes 256-wide tiles at one split (256 tiles on a grid of one CTA
-#: per SM), where 128-wide tiles at one split (512 tiles on the same grid, the candidate that missed on 216 SMs) were
-#: more than 3 % slower than the deterministic plan in some graph replays behind a kernel holding 8 to 32 SMs.  Not
-#: faster than the deterministic plan in every run on 208 SMs (one of the parts runs at a lower SM clock):
-#: ``8192 -> 128``, ``4096 -> 4096`` FP32 and ``5120 -> 1024`` BF16; the last also runs the deterministic program on 212
-#: SMs, where it is 1.3 to 2.5 % faster.  On 212 SMs ``4096 -> 1024`` FP32 takes the 192-wide row-major program at one
-#: split (88 tiles of 256 ``d_out`` rows by 192 ``d_in`` columns, 176 CTAs, one wave next to a kernel holding 32 SMs),
-#: which keeps more SMs busy than the 128 CTAs of the 256-wide transposed tile.
+#: ``6144 -> 32``.  ``4096 -> 4096`` FP32 runs the deterministic program on 212 SMs too: the deterministic package's
+#: sm_107a rule for the row (160-wide tiles at every token count) is faster than this package's 256-wide tiles at one
+#: split there in every run.  Not faster than the deterministic plan in every run on 208 SMs (one of the parts runs at
+#: a lower SM clock): ``8192 -> 128``, ``4096 -> 4096`` FP32 and ``5120 -> 1024`` BF16; the last also runs the
+#: deterministic program on 212 SMs, where it is 1.3 to 2.5 % faster.  On 212 SMs ``4096 -> 1024`` FP32 takes the
+#: 192-wide row-major program at one split (88 tiles of 256 ``d_out`` rows by 192 ``d_in`` columns, 176 CTAs, one wave
+#: next to a kernel holding 32 SMs), which keeps more SMs busy than the 128 CTAs of the 256-wide transposed tile.  The
+#: token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for a part's SM count run the deterministic program.
 # fmt: off
 K1_SPLIT_RULES_BY_SM: dict[
     tuple[str, int], dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]]
@@ -431,7 +455,7 @@ K1_SPLIT_RULES_BY_SM: dict[
         ("sm_107a", 1, 4096, 64, "bf16"): None, ("sm_107a", 1, 4096, 64, "f32"): (64, 3),
         ("sm_107a", 1, 4096, 512, "bf16"): None, ("sm_107a", 1, 4096, 512, "f32"): (128, 1),
         ("sm_107a", 1, 4096, 1024, "f32"): (192, 1),
-        ("sm_107a", 1, 4096, 4096, "f32"): (256, 1),
+        ("sm_107a", 1, 4096, 4096, "f32"): None,
         ("sm_107a", 1, 5120, 32, "bf16"): None, ("sm_107a", 1, 5120, 32, "f32"): (64, 3),
         ("sm_107a", 1, 5120, 48, "f32"): (64, 3),
         ("sm_107a", 1, 5120, 64, "f32"): (64, 3),
@@ -467,26 +491,24 @@ def k1_plan(
     """``(block_n, num_splits)`` of this package's K1 program for the transposed-store launch ``out[l, n, m]``
     (``M``, ``N`` as in the comment above; ``K`` the token count) on a device of ``sm_count`` SMs, or ``None``: the
     row runs the deterministic program.  The row's verdict in :data:`K1_SPLIT_RULES` from the SM-count floor of the
-    row (:data:`K1_MIN_SM_COUNT`, :data:`K1_RULE_MIN_SM_COUNT`) up, except at a ``K`` of the row's entries in
-    :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` (sm_100a / sm_103a); below the floor the row's verdict in the table of
-    :data:`K1_SPLIT_RULES_BY_SM` for exactly ``sm_count``, only at a ``K`` of :data:`K1_SPLIT_RULES_BY_SM_TOKENS`; a row
-    without a verdict, a ``K`` of those entries, every other ``K`` below the floor and a ``K`` too short for the split
-    count (:func:`k1_splits_fit`) run the deterministic program."""
+    row (:data:`K1_MIN_SM_COUNT`, :data:`K1_RULE_MIN_SM_COUNT`) up; below the floor the row's verdict in the table of
+    :data:`K1_SPLIT_RULES_BY_SM` for exactly ``sm_count``, only at a ``K`` of :data:`K1_SPLIT_RULES_BY_SM_TOKENS`;
+    either except at a ``K`` of the row's entries in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for this part (from the
+    entry's SM count up where that count is at or above the floor, exactly that SM count below it).  A row without a
+    verdict, a ``K`` of those entries, every other ``K`` below the floor and a ``K`` too short for the split count
+    (:func:`k1_splits_fit`) run the deterministic program."""
     key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
     floor = max(K1_MIN_SM_COUNT.get(arch, 0), K1_RULE_MIN_SM_COUNT.get(key, 0))
     if int(sm_count) >= floor:
         choice = K1_SPLIT_RULES.get(key)
-        for min_sms, lo, hi in K1_SPLIT_RULE_EXCLUDED_TOKENS.get(key, ()):
-            if (
-                int(sm_count) >= min_sms
-                and lo <= int(K)
-                and (hi is None or int(K) <= hi)
-            ):
-                choice = None
     elif K1_SPLIT_RULES_BY_SM_TOKENS[0] <= int(K) <= K1_SPLIT_RULES_BY_SM_TOKENS[1]:
         choice = K1_SPLIT_RULES_BY_SM.get((arch, int(sm_count)), {}).get(key)
     else:
         choice = None
+    for sms, lo, hi in K1_SPLIT_RULE_EXCLUDED_TOKENS.get(key, ()):
+        on_part = int(sm_count) >= sms if sms >= floor else int(sm_count) == sms
+        if on_part and lo <= int(K) and (hi is None or int(K) <= hi):
+            choice = None
     if choice is None:
         return None
     block_n, splits = (int(v) for v in choice)
