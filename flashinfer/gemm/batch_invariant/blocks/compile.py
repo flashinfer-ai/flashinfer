@@ -1,8 +1,10 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Compile wrapper for the block-built GEMM: one TVM-FFI object per (knobs, B major, chunks, SM count) with dynamic M, N, K;
-cache module ``batch_invariant_gemm_bf16`` in FlashInfer's CuTe-DSL disk cache. Operand conventions: A (M, K)
-K-major, B (K, N) N-major (torch row-major) or K-major (a transposed weight), C (M, N) N-major, fp32 accumulate.
+"""Compile wrapper for the block-built GEMM: one TVM-FFI object per (knobs, B major, chunks, SM count, formats) with dynamic
+M, N, K; cache module ``batch_invariant_gemm`` in FlashInfer's CuTe-DSL disk cache (both formats share one source closure).
+Operand conventions: A (M, K) K-major, B (K, N) N-major (torch row-major) or K-major (a transposed weight), C (M, N)
+N-major, fp32 accumulate; the fp8 kernels take the two per-tensor scales as 1-element fp32 tensors, and the batched
+unsplit fp8 kernel has a dynamic batch extent (``bmm_fp8``: the batch is the operands' third mode).
 """
 
 from __future__ import annotations
@@ -14,10 +16,10 @@ import cutlass.cute as cute
 
 from ....batch_invariant import jit
 from ..generator import Knobs
-from .kernel import BlockGemm
+from .kernel import BlockGemm, ScaledBlockGemm
 from .operands import ALIGN, IN_DT, OUT_DT, can_implement  # noqa: F401  (re-exported)
 
-MODULE = "batch_invariant_gemm_bf16"
+MODULE = "batch_invariant_gemm"
 
 
 def max_active_clusters(cfg: Knobs, sm_count: int) -> int:
@@ -26,23 +28,45 @@ def max_active_clusters(cfg: Knobs, sm_count: int) -> int:
     return sm_count // (cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1])
 
 
-def kernel_name(cfg: Knobs, b_major: str, chunks: int, sm_count: int) -> str:
+def kernel_name(
+    cfg: Knobs,
+    b_major: str,
+    chunks: int,
+    sm_count: int,
+    in_fmt: str = "bf16",
+    out_fmt: str = "bf16",
+    batched: bool = False,
+) -> str:
     return jit.sanitize_symbol_name(
-        f"bf16_b{b_major}_C{chunks}_{cfg.describe()}_sm{sm_count}"
+        f"{in_fmt}_{out_fmt}_b{b_major}_C{chunks}_{cfg.describe()}_sm{sm_count}"
+        + ("_bL" if batched else "")
     )
 
 
 @functools.cache
-def get_compiled_gemm(cfg: Knobs, b_major: str, chunks: int, sm_count: int):
-    """``kernel(a3, b3, c3)``: the unsplit class (``chunks == 1``, L = 1), the fixed-chunk split (batch index = K chunk,
-    fp32 partials) or, with ``cfg.cta_chunks``, the in-CTA chunk fold (the same operand views, the output direct with
-    L = 1). ``sm_count`` sizes the persistent grid (the launch device's) and is part of the cache key."""
-    in_dt, al = IN_DT["bf16"], ALIGN["bf16"]
+def get_compiled_gemm(
+    cfg: Knobs,
+    b_major: str,
+    chunks: int,
+    sm_count: int,
+    in_fmt: str = "bf16",
+    out_fmt: str = "bf16",
+    batched: bool = False,
+):
+    """bf16: ``kernel(a3, b3, c3)``; fp8: ``kernel(a3, b3, c3, a_scale, b_scale)`` with 1-element fp32 scales, for the
+    direct stores: the unsplit class and the in-CTA chunk fold, whose chain multiplies by their product. The unsplit class
+    has L = 1, or a dynamic L (the batch) with ``batched``; the fixed-chunk split (batch index = K chunk) stores fp32
+    partials through the UNSCALED body (the fixup applies the chain) or, with ``cfg.cta_chunks``, folds the chunks in the
+    CTA (the same operand views, the output direct with L = 1). ``sm_count`` sizes the persistent grid (the launch
+    device's) and is part of the cache key."""
+    in_dt, al = IN_DT[in_fmt], ALIGN[in_fmt]
     in_cta = cfg.cta_chunks and chunks > 1
     direct = chunks == 1 or in_cta
-    out_dt = OUT_DT["bf16"] if direct else cutlass.Float32
-    oal = ALIGN["bf16"] if direct else ALIGN["f32"]
-    name = kernel_name(cfg, b_major, chunks, sm_count)
+    scaled = in_fmt != "bf16" and direct
+    assert not batched or chunks == 1, "the batched kernel is the unsplit class's"
+    out_dt = OUT_DT[out_fmt] if direct else cutlass.Float32
+    oal = ALIGN[out_fmt] if direct else ALIGN["f32"]
+    name = kernel_name(cfg, b_major, chunks, sm_count, in_fmt, out_fmt, batched)
 
     def compile_fn():
         sym_m, sym_n, sym_kc = (
@@ -50,7 +74,9 @@ def get_compiled_gemm(cfg: Knobs, b_major: str, chunks: int, sm_count: int):
             cute.sym_int(32, divisibility=al),
             cute.sym_int(32, divisibility=al),
         )
-        L = chunks
+        L = (
+            cute.sym_int(32) if batched else chunks
+        )  # the batch extent is dynamic for the batched kernel
         Lc = 1 if in_cta else L
         a_fake = cute.runtime.make_fake_tensor(
             in_dt,
@@ -80,13 +106,32 @@ def get_compiled_gemm(cfg: Knobs, b_major: str, chunks: int, sm_count: int):
         )
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         grid = cfg.grid_clusters or max_active_clusters(cfg, sm_count)
+        body_out = out_fmt if direct else "f32"
+        if not scaled:
+            return cute.compile(
+                BlockGemm(cfg, in_fmt, body_out, chunks),
+                a_fake,
+                b_fake,
+                c_fake,
+                grid,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
+        sa_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float32, (1,), (1,), assumed_align=4
+        )
+        sb_fake = cute.runtime.make_fake_tensor(
+            cutlass.Float32, (1,), (1,), assumed_align=4
+        )
         return cute.compile(
-            BlockGemm(cfg, "bf16" if direct else "f32", chunks),
+            ScaledBlockGemm(cfg, in_fmt, body_out, chunks),
             a_fake,
             b_fake,
             c_fake,
             grid,
             stream_fake,
+            sa_fake,
+            sb_fake,
             options="--enable-tvm-ffi",
         )
 

@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Epilogue block: the spec's elementwise chain after the fold, then the store.
 
-Per epilogue subtile: TMEM -> registers (fp32), then the chain's single ``cvt.rn`` as the vector
-conversion to the output type, registers -> smem
--> TMA store (clipped at the tensor bounds). The subtile order, the C smem buffer rotation and
+Per epilogue subtile: TMEM -> registers (fp32), the chain's ops before the conversion applied per element by
+``EpilogueChain.apply_pre`` (the same function that builds the spec term: ``mul.rn alpha`` for the fp8
+classes, nothing for bf16), then the chain's single ``cvt.rn`` as the vector conversion to the output type,
+registers -> smem -> TMA store (clipped at the tensor bounds). The subtile order, the C smem buffer rotation and
 the barriers are placements. Built from the library's epilogue atoms (``get_tmem_load_op``,
 ``get_smem_store_op``); the body is ours.
 
@@ -30,6 +31,14 @@ from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 from ....batch_invariant.fp_interface.cute import CuteF32
 from .operands import ACC_DTYPE, BAR_EPILOGUE, EPILOGUE_WARPS
+
+
+def apply_chain_pre_cvt(chain, frag, alpha):
+    """The chain's ops before the conversion, per element, in fp32 through ``CuteF32``; the conversion itself is the
+    vector ``.to(out dtype)`` that follows in the caller."""
+    if chain.pre:
+        for i in range(cute.size(frag)):
+            frag[i] = chain.apply_pre(CuteF32, frag[i], alpha)
 
 
 def tmem_store_atom_for(load_atom: cute.CopyAtom, elem_ty) -> cute.CopyAtom:
@@ -88,6 +97,7 @@ def chunk_fold_pass(
 @cute.jit
 def epilogue_loop(
     st,
+    chain,
     atom_thr_size: cutlass.Constexpr,
     tidx: cutlass.Int32,
     warp_idx: cutlass.Int32,
@@ -98,11 +108,13 @@ def epilogue_loop(
     tCgC_base: cute.Tensor,
     epi_tile: cute.Tile,
     acc_pipeline,
+    alpha,
     chunks: cutlass.Constexpr = 1,
 ):
-    """``chunks > 1``: the in-CTA chunk fold (module docstring) -- the mainloop commits one accumulator stage per chunk,
-    the first ``chunks - 1`` are folded into the TMEM running sum (``st.sum_stage``) and released, the last one receives
-    the fold and is stored through the ordinary subtile loop below."""
+    """``chain`` is the specification's epilogue chain (``spec.EpilogueChain``) and ``alpha`` its runtime scalar (None for
+    the unscaled chain). ``chunks > 1``: the in-CTA chunk fold (module docstring) -- the mainloop commits one accumulator
+    stage per chunk, the first ``chunks - 1`` are folded into the TMEM running sum (``st.sum_stage``) and released, the
+    last one receives the fold and is stored through the ordinary subtile loop below (the chain once, after the fold)."""
     # ((ATOM_M, MMA_M), (ATOM_N, MMA_N), ...)
     tCgC = transform_partitioned_tensor_layout(tCgC_base)
     tCtAcc = transform_partitioned_tensor_layout(tCtAcc_base)
@@ -241,6 +253,9 @@ def epilogue_loop(
         num_prev_subtiles = num_tiles_executed * subtile_cnt
         for s in range(subtile_cnt):
             cute.copy(tiled_copy_t2r, tTR_tAcc[(None, None, None, s)], tTR_rAcc)
+            apply_chain_pre_cvt(
+                chain, tTR_rAcc, alpha
+            )  # the chain's fp32 ops (mul.rn alpha when scaled)
             acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
             tRS_rC.store(
                 acc_vec.to(st.c_dtype)

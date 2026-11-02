@@ -1,10 +1,14 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Cost model of the bf16 GEMM records: the dispatcher behind `mm_bf16(batch_invariant=True)`.
+"""Cost model of the GEMM records: the dispatcher behind `mm_bf16(batch_invariant=True)` and `mm_fp8(batch_invariant=True)`.
 
 For one knob record at one shape the model predicts the device time (us) from the part's structure (`Arch`) and fitted
 constants (`Fit`); `rank` evaluates a whole configuration space at once and `schedule.default_config` takes the argmin.
-Nothing here reaches the bits: every record of the space computes the class (R3), the model only orders them.
+Nothing here reaches the bits: every record of the space computes the class (R3), the model only orders them. The
+operand format enters through its structure (element width, K step, the 8-bit kind's doubled instruction rate) and
+four format-specific constants (the fp8 instruction's sustained efficiency, its 2-CTA per-k-tile multiplier and the
+smem-swizzle penalties of an MN-major fp8 B whose tile row is narrower than 128 bytes); every other constant is shared by
+the formats.
 
 The time is a soft maximum of four bounds -- the per-CTA tile time (waves of tiles, each the slowest of the MMA, TMA,
 smem and latency paths per k-tile, plus the epilogue), the HBM traffic under the persistent raster's L2 footprint rule,
@@ -27,7 +31,7 @@ from typing import Dict, Optional, Sequence, Tuple
 import numpy as np
 
 from .generator import Knobs, inner_radix
-from .spec import ELEM_BITS, MMA_K
+from .spec import ELEM_BITS_OF, MMA_K_OF
 
 # ----------------------------------------------------------------------------- the part
 
@@ -40,7 +44,9 @@ class Arch:
     name: str
     sm_count: int
     clock_ghz: float  # sustained SM clock under load
-    flop_per_clk_sm: int = 8192  # dense bf16 FLOP / clk / SM
+    flop_per_clk_sm: int = (
+        8192  # dense bf16 FLOP / clk / SM (the 8-bit kind runs at twice it)
+    )
     hbm_tbps: float = 9.1  # copy bandwidth, TB/s
     l2_bytes: int = 112 << 20
     smem_bytes: int = 334848  # shared memory per CTA the kernel plans against (`cutlass.memory.get_smem_capacity_in_bytes`)
@@ -120,7 +126,11 @@ class Fit:
     replace). Per-SM constants carry across the parts of a family; part-level ones (the aggregate L2, the HBM efficiency,
     the launch and fixup floors, `softmax_p`, `cl4_ns`, `oob_gbps`) are fitted per family."""
 
-    mma_eff: float = 0.92  # sustained fraction of the MMA instruction rate
+    mma_eff: float = 0.92  # sustained fraction of the MMA instruction rate (kind::f16)
+    mma_eff_fp8: float = 0.86  # the same for kind::f8f6f4 (twice the rate per clock, its own issue / operand-delivery efficiency)
+    two_cta_gain_fp8: float = 1.0  # per-k-tile time multiplier of the 2-CTA kind::f8f6f4 instruction (the pair shares B: its operand delivery per CTA is lighter)
+    fp8_swz64_pen: float = 1.08  # kind::f8f6f4 with an MN-major B whose per-CTA tile row is 64 bytes (64-byte smem swizzle atom)
+    fp8_swz32_pen: float = 1.25  # ... a 32- or 96-byte row (32-byte swizzle atom): the narrower swizzle feeds the fp8 instruction slower
     inst_min_clk: float = 18.0  # minimum time of one tcgen05.mma, in SM clocks
     ktile_ns: float = 60.0  # per k-tile per CTA: TMA issue + mbarrier hand-shakes
     ktile_2cta_ns: float = 60.0  # the same for the 2-CTA instruction
@@ -224,6 +234,7 @@ def predict_arrays(
     M,
     N,
     K,
+    in_fmt: str,
     chunks,
     b_major: str,
     out_bytes: int,
@@ -231,16 +242,18 @@ def predict_arrays(
     fit: Fit,
     parts: bool = False,
 ):
-    """The model on arrays: one entry per (record, shape); ``M``, ``N``, ``K``, ``chunks`` scalars or arrays matching the records."""
+    """The model on arrays: one entry per (record, shape); ``M``, ``N``, ``K``, ``chunks`` scalars or arrays matching the records;
+    ``in_fmt`` the operand format (``bf16`` / ``e4m3`` / ``e5m2``)."""
     M = np.asarray(M, dtype=np.float64)
     N = np.asarray(N, dtype=np.float64)
     K = np.asarray(K, dtype=np.float64)
     chunks = np.asarray(chunks, dtype=np.float64)
-    elem = ELEM_BITS / 8.0
-    inst_k = MMA_K
-    inner = inner_radix()
+    fp8 = in_fmt != "bf16"
+    elem = ELEM_BITS_OF[in_fmt] / 8.0
+    inst_k = MMA_K_OF[in_fmt]
+    inner = inner_radix(in_fmt)
     kb = inst_k * inner  # K elements per 128-byte stage
-    fpc = arch.flop_per_clk_sm
+    fpc = arch.flop_per_clk_sm * (2 if fp8 else 1)
     two = a["two"]
     cta_div = np.where(two, 2.0, 1.0)
     ctm = a["tm"] / cta_div  # the CTA's rows
@@ -273,12 +286,16 @@ def predict_arrays(
     k_tiles = np.ceil(Kc / kb) * nchunk_cta  # k-tiles per tile per CTA
 
     # per k-tile time
-    mma_eff = fit.mma_eff
+    mma_eff = fit.mma_eff_fp8 if fp8 else fit.mma_eff
     t_inst = np.maximum(
         2.0 * ctm * ctn * inst_k / (fpc * arch.clock_ghz) / mma_eff,
         fit.inst_min_clk / arch.clock_ghz,
     )  # ns
-    t_mma_kt = inner * t_inst * np.where(two, fit.two_cta_gain, 1.0)
+    t_mma_kt = (
+        inner
+        * t_inst
+        * np.where(two, fit.two_cta_gain_fp8 if fp8 else fit.two_cta_gain, 1.0)
+    )
     a_stage = ctm * kb * elem
     b_stage = ctn * kb * elem / cta_div
     # the `n` layout's B box: a row narrower than a 128-byte line still costs the line (times a fitted penalty)
@@ -286,6 +303,16 @@ def predict_arrays(
     b_eff = np.where(
         (b_major == "n") & (b_row < 128), kb * 128.0 * fit.nmajor_pen, b_stage
     )
+    if fp8 and b_major == "n":
+        # the fp8 instruction consumes smem at twice the bf16 rate: with an MN-major B the tile row's byte count sets the smem
+        # swizzle atom (128 bytes: full rate; 64-byte rows: `fp8_swz64_pen`; 32- / 96-byte rows: `fp8_swz32_pen`) and the fp8
+        # mainloop has no slack to hide the narrower atom; K-major B rows are the 128-byte K tile
+        swz_pen = np.where(
+            b_row % 128 == 0,
+            1.0,
+            np.where(b_row % 64 == 0, fit.fp8_swz64_pen, fit.fp8_swz32_pen),
+        )
+        t_mma_kt = t_mma_kt * swz_pen
     out_b = np.where(ws, 4.0, float(out_bytes))
     ep = np.array(
         [
@@ -457,12 +484,13 @@ def predict_many(
     arch: Optional[Arch] = None,
     fit: Optional[Fit] = None,
     parts: bool = False,
+    in_fmt: str = "bf16",
 ):
     """Predicted device time (us) of every record of ``recs`` at (M, N, K); ``parts=True`` also returns the terms."""
     arch = arch or arch_for()
     fit = fit or fit_for(arch)
     return predict_arrays(
-        knob_arrays(recs), M, N, K, chunks, b_major, out_bytes, arch, fit, parts
+        knob_arrays(recs), M, N, K, in_fmt, chunks, b_major, out_bytes, arch, fit, parts
     )
 
 
@@ -476,9 +504,14 @@ def predict(
     out_bytes: int = 2,
     arch: Optional[Arch] = None,
     fit: Optional[Fit] = None,
+    in_fmt: str = "bf16",
 ) -> float:
     """Predicted device time (us) of one record at one shape."""
-    return float(predict_many([k], M, N, K, chunks, b_major, out_bytes, arch, fit)[0])
+    return float(
+        predict_many(
+            [k], M, N, K, chunks, b_major, out_bytes, arch, fit, in_fmt=in_fmt
+        )[0]
+    )
 
 
 def explain(
@@ -491,9 +524,12 @@ def explain(
     out_bytes: int = 2,
     arch: Optional[Arch] = None,
     fit: Optional[Fit] = None,
+    in_fmt: str = "bf16",
 ) -> Dict[str, float]:
     """The predicted time and every term of one record (for the docs and the tests)."""
-    t, p = predict_many([k], M, N, K, chunks, b_major, out_bytes, arch, fit, parts=True)
+    t, p = predict_many(
+        [k], M, N, K, chunks, b_major, out_bytes, arch, fit, parts=True, in_fmt=in_fmt
+    )
     return dict(us=float(t[0]), **{n: float(v[0]) for n, v in p.items()})
 
 
@@ -527,18 +563,19 @@ def rank(
     family: Optional[str] = None,
     arch_name: Optional[str] = None,
     topk: Optional[int] = None,
+    in_fmt: str = "bf16",
 ) -> Tuple[Tuple[Knobs, float], ...]:
-    """The records of the class's enumerated space for the shape and layout (at M <= DECODE_M the `decode_sane` subset) ordered
-    by predicted time, best first; ``topk`` truncates. Cached per argument tuple."""
+    """The records of the class's enumerated space for the shape, layout and format (at M <= DECODE_M the `decode_sane`
+    subset) ordered by predicted time, best first; ``topk`` truncates. Cached per argument tuple."""
     from .generator import enumerate_space
 
     arch = arch_for(sm_count, arch_name, family)
-    space = enumerate_space(M, N, K, chunks=chunks, b_major=b_major)
+    space = enumerate_space(M, N, K, chunks=chunks, b_major=b_major, in_fmt=in_fmt)
     guarded = [k for k in space if decode_sane(k, M)]
     space = guarded or space
     if not space:
         return ()  # nothing implements the shape in this layout / class: the caller decides
-    t = predict_many(space, M, N, K, chunks, b_major, out_bytes, arch)
+    t = predict_many(space, M, N, K, chunks, b_major, out_bytes, arch, in_fmt=in_fmt)
     order = np.argsort(t, kind="stable")
     out = tuple((space[i], float(t[i])) for i in order)
     return out[:topk] if topk else out
@@ -553,9 +590,12 @@ def best_record(
     out_bytes: int = 2,
     sm_count: Optional[int] = None,
     family: Optional[str] = None,
+    in_fmt: str = "bf16",
 ) -> Knobs:
     """The model's pick: the argmin of `rank` (a member of the enumerated space by construction)."""
-    return rank(M, N, K, chunks, b_major, out_bytes, sm_count, family)[0][0]
+    return rank(M, N, K, chunks, b_major, out_bytes, sm_count, family, in_fmt=in_fmt)[
+        0
+    ][0]
 
 
 def fit_to_dict(fit: Fit) -> Dict[str, float]:
