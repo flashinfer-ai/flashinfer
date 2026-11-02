@@ -40,7 +40,8 @@ live in the routed package; this module forwards every keyword.  Every switch
 is a keyword argument; no environment variable is read.
 
 Operands of one rank (its ``T_r`` local tokens in fragment order): ``q, k``
-BF16 ``[1, T_r, H_qk, 128]`` (L2-normalized by the caller), ``v`` BF16
+BF16 ``[1, T_r, H_qk, 128]`` (L2-normalized by the caller, or raw with
+``use_qk_l2norm_in_kernel=True`` on either route), ``v`` BF16
 ``[1, T_r, HV, 128]`` with ``HV % H_qk == 0`` (production ``(16, 48)``),
 ``g`` FP32 ``[1, T_r, HV]`` (the natural-log decay, preactivated, no clamp),
 ``beta`` FP32 ``[1, T_r, HV]`` (through the sigmoid).  Strided packed-QKV
@@ -130,7 +131,8 @@ def _deterministic(deterministic: bool, entry: str) -> bool:
 
 def _options_for(det: bool, options: Any) -> Any:
     """``options`` for the routed package: an options instance of the other route becomes the mapping of its fields
-    (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through."""
+    (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through.  Both
+    routes take every field, ``use_qk_l2norm_in_kernel`` included."""
     if options is None or isinstance(options, dict):
         return options
     own = _det().OptionsDetKcp if det else _pkg().OptionsKcp

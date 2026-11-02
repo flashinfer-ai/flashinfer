@@ -302,6 +302,142 @@ def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
     assert torch.isnan(actual).all()
 
 
+# One shape per Blackwell Softmax route: (rows, vocab_size, temperature,
+# enable_pdl, route).
+_BLACKWELL_SOFTMAX_ROUTE_SHAPES = [
+    (1, 111, 0.5, False, 1),
+    (64, 256, 0.5, False, 1),
+    (256, 32004, None, False, 2),
+    (16, 16380, None, False, 2),
+    # An odd vocabulary misaligns rows: unaligned head and tail elements.
+    (200, 32003, 0.5, False, 2),
+    (1, 32004, None, False, 3),
+    # One tile per row: a single split per row.
+    (200, 250, None, False, 3),
+    (256, 32000, None, False, 5),
+    (1, 256000, None, False, 5),
+    (48, 256000, None, False, 6),
+    (100, 128000, 0.5, True, 6),
+    (512, 256000, None, False, 7),
+]
+
+
+def _blackwell_softmax_route_and_output(logits, temperature, enable_pdl):
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    actual = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    return route, actual
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature,enable_pdl,expected_route",
+    _BLACKWELL_SOFTMAX_ROUTE_SHAPES,
+)
+@pytest.mark.parametrize("offset", [1.0e7, 3.0e9, -1.0e10, 1.0e30])
+@pytest.mark.parametrize("scale", [1.0, 1.0e6])
+def test_blackwell_softmax_large_magnitude_logits_match_torch(
+    rows, vocab_size, temperature, enable_pdl, expected_route, offset, scale
+):
+    # Row maxima from 2^30 on take the exact exponent shift m; every route
+    # must still match torch.
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(11)
+    logits = torch.randn(rows, vocab_size, device="cuda") * scale + offset
+    route, actual = _blackwell_softmax_route_and_output(logits, temperature, enable_pdl)
+    expected = torch.softmax(
+        logits if temperature is None else logits / temperature, dim=-1
+    )
+
+    assert route == expected_route
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-3)
+    significant = expected > 1e-6
+    torch.testing.assert_close(
+        actual[significant], expected[significant], atol=0.0, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        actual.sum(-1), torch.ones(rows, device="cuda"), atol=1e-5, rtol=0.0
+    )
+
+
+_FLOAT32_1E38 = float(torch.tensor(1.0e38, dtype=torch.float32))
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature,enable_pdl,expected_route",
+    _BLACKWELL_SOFTMAX_ROUTE_SHAPES,
+)
+@pytest.mark.parametrize(
+    "low,high,fill",
+    [
+        # Maxima of magnitude below 2^30 and from 2^30 on.
+        (2.0**30 - 64, 2.0**30, 0.0),
+        (-(2.0**30) - 128, -(2.0**30) + 64, -1.0e10),
+        # Maxima near and past 2^127: one twice the other, adjacent floats,
+        # and both past 2^127 with a fill whose difference overflows.
+        (_FLOAT32_1E38, 2 * _FLOAT32_1E38, 0.0),
+        (-2 * _FLOAT32_1E38, -_FLOAT32_1E38, -3.0e38),
+        (2.0**127 - 2.0**103, 2.0**127, 0.0),
+        (3.0e38, torch.finfo(torch.float32).max, -3.0e38),
+    ],
+)
+def test_blackwell_softmax_extreme_maxima_match_torch(
+    rows, vocab_size, temperature, enable_pdl, expected_route, low, high, fill
+):
+    # Each row holds `low` before and after three copies of `high`. Where a
+    # thread's chunk spans 2048 columns, thread 0 sees `low` at column 0 and
+    # then `high` at column 2048 (one tile, group or stride later) while its
+    # warp neighbour keeps `low` from column 8, so thread, warp, cluster and
+    # output rescales go from `low` to `high`. The result is 1/3 at `high`
+    # and 0 elsewhere.
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    values = torch.full((rows, vocab_size), fill, device="cuda")
+    low_cols = [0, 8, vocab_size // 3, vocab_size - 2]
+    high_cols = [min(2048, vocab_size - 3), vocab_size // 2, vocab_size - 1]
+    values[:, low_cols] = low
+    values[:, high_cols] = high
+    # Powers of two keep the scaled logits exact.
+    logits = values if temperature is None else values * temperature
+    route, actual = _blackwell_softmax_route_and_output(logits, temperature, enable_pdl)
+    expected = torch.zeros_like(values)
+    expected[:, high_cols] = 1.0 / 3.0
+
+    assert route == expected_route
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        actual, torch.softmax(values, dim=-1), atol=1e-6, rtol=1e-6
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,enable_pdl",
+    [(64, 256, False), (256, 32000, False), (100, 128000, True), (512, 256000, False)],
+)
+def test_blackwell_softmax_low_temperature_huge_logits_match_torch(
+    rows, vocab_size, enable_pdl
+):
+    # A temperature of 0.005 takes logits near 1e36 past 2^127.
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(17)
+    logits = torch.rand(rows, vocab_size, device="cuda") * 1.0e36
+    logits[:, vocab_size // 2] = 1.5e36
+    actual = flashinfer.sampling.softmax(
+        logits, temperature=0.005, enable_pdl=enable_pdl
+    )
+    expected = torch.softmax(logits / 0.005, dim=-1)
+
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_blackwell_route_observer_falls_back_off_blackwell():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
@@ -831,9 +967,8 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         (71, 28672, "none", 4096, 4096),
         (75, 24584, "none", 6176, 4096),
         # 8-CTA shared-tile and persistent kernels (on sm_103 the persistent
-        # kernel only with a cut of at least 1/10; on sm_100 not for a 6-tile
-        # chunk with a cut of at least 1/10, which keeps whole tiles).
-        (45, 81928, "none", 12288, 10272),
+        # kernel only with a cut of at least 1/10).
+        (45, 81928, "none", 10272, 10272),
         (320, 69632, "none", 8704, 8704),
         (82, 70000, "none", 8768, 8768),
         (52, 100000, "scalar_pdl", 12512, 12512),
@@ -865,8 +1000,7 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         # wave, the 4-tile row kernels of 4 and 8 CTAs with other chunk tile
         # counts, the 4-tile row kernels of 1 and 2 CTAs, the 8-tile 16-CTA row
         # kernel, rows past five waves (on sm_100 past seven for the 8-CTA
-        # kernels) or past one wave with a cut of at most 1/16, and on sm_100
-        # the 8-CTA kernels of a 6-tile chunk with a cut of at least 1/10.
+        # kernels) or past one wave with a cut of at most 1/16.
         (8, 256000, "none", 26624, 22528),
         (24, 151936, "none", 10240, 16384),
         (100, 30720, "none", 8192, 8192),
@@ -1022,13 +1156,12 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
     "rows,vocab_size,temperature_kind,sm100_chunk,sm103_chunk",
     [
         # 8-CTA shared-tile kernel with a cut of at least 1/10: 6-, 7- and
-        # 8-tile chunks (whole tiles on sm_100 for 6 tiles, per-row
-        # temperatures included).
-        (79, 81928, "none", 12288, 10272),
-        (45, 81928, "per_row", 12288, 10272),
-        (296, 81928, "scalar", 12288, 12288),
-        (370, 88320, "scalar_pdl", 12288, 12288),
-        (371, 88320, "none", 12288, 12288),
+        # 8-tile chunks, per-row temperatures included.
+        (79, 81928, "none", 10272, 10272),
+        (45, 81928, "per_row", 10272, 10272),
+        (296, 81928, "scalar", 10272, 12288),
+        (370, 88320, "scalar_pdl", 11040, 12288),
+        (371, 88320, "none", 11040, 12288),
         (53, 98312, "none", 12320, 12320),
         (73, 98312, "per_row", 12320, 12320),
         (370, 103168, "none", 12896, 12896),
@@ -1041,8 +1174,8 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
         (115, 76544, "per_row", 9568, 9568),
         (116, 76544, "none", 9568, 10240),
         (79, 88328, "scalar", 11072, 11072),
-        (296, 88328, "none", 11072, 11072),
-        (370, 91904, "per_row", 12288, 11488),
+        (296, 88328, "none", 11072, 12288),
+        (370, 91904, "per_row", 12288, 12288),
         (371, 91904, "scalar_pdl", 11488, 12288),
         (53, 103176, "none", 12928, 12928),
         (73, 103176, "scalar", 12928, 12928),
@@ -1052,10 +1185,10 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
         (51, 117768, "per_row", 7392, 14752),
         (74, 126720, "scalar", 16384, 15840),
         # 8-CTA persistent kernel: 6-, 7- and 8-tile chunks.
-        (92, 81928, "scalar_pdl", 12288, 10272),
-        (93, 81928, "per_row", 12288, 12288),
-        (93, 81928, "none", 12288, 12288),
-        (180, 88320, "scalar", 12288, 12288),
+        (92, 81928, "scalar_pdl", 10272, 10272),
+        (93, 81928, "per_row", 10272, 10272),
+        (93, 81928, "none", 10272, 10272),
+        (180, 88320, "scalar", 11040, 11040),
         (181, 88320, "per_row", 12288, 12288),
         (128, 98312, "none", 12320, 12320),
         (129, 98312, "scalar_pdl", 12320, 12320),
@@ -1069,12 +1202,11 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
 def test_blackwell_cached_cluster_eight_cta_balanced_chunk_rows_per_arch(
     rows, vocab_size, temperature_kind, sm100_chunk, sm103_chunk
 ):
-    # On sm_103 the 8-CTA kernels of a 5- to 8-tile chunk take the balanced
-    # chunk up to the rows set per kernel, cut and chunk tile count: every
-    # row up to five waves or trips, except for 6-tile chunks with a cut of
-    # at least 1/10 (shared-tile kernel up to 79 rows, persistent kernel up
-    # to 92 rows). On sm_100 the 8-CTA kernels keep whole tiles for 6-tile
-    # chunks with a cut of at least 1/10.
+    # The 8-CTA kernels of a 5- to 8-tile chunk take the balanced chunk up to
+    # five waves or trips, on sm_100 up to seven unless the temperature is per
+    # row (371 rows of 88320 pass five shared-tile waves on sm_103). On sm_103,
+    # 296 to 443 rows of a 5- or 6-tile chunk whose CTA share exceeds 5 tiles
+    # run the persistent kernel with whole tiles instead.
     _skip_unless_b200_or_gb300()
     torch.manual_seed(13)
     logits = torch.randn(rows, vocab_size, device="cuda")

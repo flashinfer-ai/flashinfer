@@ -82,6 +82,10 @@ def chunk_kda_det_fwd(
     save_mode: Optional[str] = None,
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
+    use_gate_in_kernel: bool = False,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
 ) -> tuple[torch.Tensor, Optional[Any]]:
     r"""Packed KDA chunked training forward.
 
@@ -90,7 +94,9 @@ def chunk_kda_det_fwd(
     q, k, v : torch.Tensor
         BF16 ``[1, S, H, 128]`` (or ``[S, H, 128]``), contiguous.
     g : torch.Tensor
-        FP32 ``[1, S, H, 128]`` natural-log decay gate.
+        FP32 ``[1, S, H, 128]`` natural-log decay gate (preactivated); with ``use_gate_in_kernel=True`` the raw
+        gate, BF16 ``[1, S, H, 128]``, which may be a strided view (unit innermost stride, token and head strides
+        multiples of 8 elements, rows that do not overlap, a 16-byte aligned address; never copied).
     beta : torch.Tensor
         BF16 ``[1, S, H]`` delta-rule gate after the sigmoid.
     cu_seqlens : torch.Tensor
@@ -115,6 +121,17 @@ def chunk_kda_det_fwd(
     doc_lengths : sequence of int, optional
         The documents' token counts in ``cu_seqlens`` order (host integers; ``len == num_docs``, ``sum == S``),
         required under a batched option (the host reads no tensor) and checked against ``cu_seqlens`` on the device.
+    use_gate_in_kernel : bool
+        ``False`` (the default): ``g`` is the activated FP32 gate and ``A_log``, ``dt_bias``, ``lower_bound`` must
+        be ``None``.  ``True``: ``g`` is the raw BF16 gate and the kernels activate it as
+        ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``; the workspace must be allocated with
+        ``use_gate_in_kernel=True`` and the saved set records the mode.
+    A_log : torch.Tensor, optional
+        FP32 ``[H]``, contiguous (raw gate mode).
+    dt_bias : torch.Tensor, optional
+        FP32 ``[H * 128]`` or ``[H, 128]``, contiguous (raw gate mode).
+    lower_bound : float, optional
+        The gate's lower bound, required in raw gate mode: finite, ``-5.0 <= lower_bound < 0.0``.
 
     Returns
     -------
@@ -135,6 +152,10 @@ def chunk_kda_det_fwd(
         save_mode=save_mode,
         arena=arena,
         doc_lengths=doc_lengths,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
     )
 
 
@@ -153,7 +174,11 @@ def chunk_kda_det_bwd(
     workspace: Optional[Any] = None,
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    use_gate_in_kernel: bool = False,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
+) -> tuple[torch.Tensor, ...]:
     r"""Packed KDA chunked training backward.
 
     Parameters
@@ -176,11 +201,16 @@ def chunk_kda_det_bwd(
     doc_lengths : sequence of int, optional
         The documents' token counts in ``cu_seqlens`` order (host integers), required under a batched option and
         checked against ``cu_seqlens`` on the device.
+    use_gate_in_kernel, A_log, dt_bias, lower_bound
+        The forward's gate mode and raw gate parameters (see :func:`chunk_kda_det_fwd`); a saved set of the other mode,
+        or with another ``lower_bound``, is refused.
 
     Returns
     -------
     ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
-    like the inputs.  Bitwise reproducible for the same inputs.
+    like the inputs.  With ``use_gate_in_kernel=True``: ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg``
+    the BF16 gradient of the raw gate (contiguous, ranked like ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias``
+    FP32 shaped like ``dt_bias``.  Bitwise reproducible for the same inputs.
     """
     from .experimental.cake_kda_det_train import cake_backend
 
@@ -197,6 +227,10 @@ def chunk_kda_det_bwd(
         workspace=workspace,
         arena=arena,
         doc_lengths=doc_lengths,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
     )
 
 
@@ -214,12 +248,18 @@ def chunk_kda_det(
     save_mode: Optional[str] = None,
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
+    use_gate_in_kernel: bool = False,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    lower_bound: Optional[float] = None,
 ) -> torch.Tensor:
     r"""Packed KDA chunked training as an autograd node (``torch.utils.checkpoint`` compatible).
 
     Returns ``out`` BF16 like ``v`` with gradients to ``q, k, v, g, beta``; see :func:`chunk_kda_det_fwd` for the
-    operands, ``save_mode``, ``arena`` and ``doc_lengths`` (the node records the option and the document lengths,
-    so a backward that allocates its own workspace takes them too) and :func:`chunk_kda_det_bwd` for the gradients.
+    operands, ``save_mode``, ``arena``, ``doc_lengths`` (the node records the option and the document lengths,
+    so a backward that allocates its own workspace takes them too) and the raw gate mode
+    (``use_gate_in_kernel=True``, ``A_log``, ``dt_bias``, ``lower_bound``: gradients to the raw gate ``g``, BF16,
+    and to ``A_log`` / ``dt_bias``, FP32) and :func:`chunk_kda_det_bwd` for the gradients.
     """
     from .experimental.cake_kda_det_train import cake_backend
 
@@ -235,6 +275,10 @@ def chunk_kda_det(
         save_mode=save_mode,
         arena=arena,
         doc_lengths=doc_lengths,
+        use_gate_in_kernel=use_gate_in_kernel,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
     )
 
 
@@ -277,13 +321,15 @@ def kda_det_train_workspace(
     save_mode: str = "light",
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
+    use_gate_in_kernel: bool = False,
 ) -> Any:
     """A caller-owned ``KdaDetWorkspace`` (one arena of internal intermediates) for ``S`` tokens in ``num_docs``
     documents with ``H`` heads on ``device``, reused by every call that receives it: the forward layout only with
     ``backward=False``; ``save_mode`` is the default of the calls on it and sizes the arena for that mode;
     ``arena`` (:func:`kda_det_train_arena`) is the lower-memory arena option, off when ``None``; under a batched
     option ``doc_lengths`` (the documents' token counts) sizes the arena for the exact document groups instead of
-    the bound of every group."""
+    the bound of every group; ``use_gate_in_kernel`` is the gate mode of the calls it serves (a call in the other
+    mode is refused)."""
     from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.KdaDetWorkspace.for_problem(
@@ -295,6 +341,7 @@ def kda_det_train_workspace(
         save_mode=save_mode,
         arena=arena,
         doc_lengths=doc_lengths,
+        gate=_gate(use_gate_in_kernel),
     )
 
 
@@ -308,11 +355,13 @@ def kda_det_train_workspace_bytes(
     sm_count: Optional[int] = None,
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
+    use_gate_in_kernel: bool = False,
 ) -> int:
     """Bytes :func:`kda_det_train_workspace` allocates for the problem (``sm_count``: the device's SM count, the
     current CUDA device's when ``None``; it sets the segment count of the segmented recurrences; ``arena``: the
     lower-memory arena option, off when ``None``; ``doc_lengths``: the exact document groups of a batched option,
-    else their bound)."""
+    else their bound; ``use_gate_in_kernel``: the gate mode, whose backward layouts carry no gate epilogue
+    buffers in raw mode)."""
     from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.workspace_bytes(
@@ -324,7 +373,17 @@ def kda_det_train_workspace_bytes(
         sm_count=sm_count,
         arena=arena,
         doc_lengths=doc_lengths,
+        gate=_gate(use_gate_in_kernel),
     )
+
+
+def _gate(use_gate_in_kernel: bool) -> str:
+    """The backend's gate mode of ``use_gate_in_kernel`` (``ValueError`` for a non-bool)."""
+    if not isinstance(use_gate_in_kernel, bool):
+        raise ValueError(
+            f"use_gate_in_kernel must be a bool, got {use_gate_in_kernel!r}"
+        )
+    return "raw" if use_gate_in_kernel else "g"
 
 
 def kda_det_train_saved_bytes(

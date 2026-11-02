@@ -1409,7 +1409,12 @@ def test_sm90_moe_runner_rejects_bad_activation_config():
     def make(**kwargs):
         return CuteDslFusedMoESm90Runner(_moe_core_impl, 4, 2, 4, **kwargs)
 
-    for bad in (ActivationType.Geglu, ActivationType.Silu, ActivationType.Gelu):
+    for bad in (
+        ActivationType.Geglu,
+        ActivationType.Silu,
+        ActivationType.Gelu,
+        ActivationType.ClampedRelu2,
+    ):
         with pytest.raises(ValueError, match="Unsupported activation_type"):
             make(activation_type=bad.value)
     for bad_alpha in (float("nan"), float("inf"), 1e39):

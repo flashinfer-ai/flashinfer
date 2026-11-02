@@ -1491,14 +1491,62 @@ def _requested_prefill_source(monkeypatch, **overrides):
         )
         return {"name": f"stub:{schedule_attr}"}
 
-    cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+    # The resolver and the memoised ragged DV-split map must neither serve a real record to
+    # the stub nor keep the stub's answers for later tests.
+    memoised = (
+        cake_gdn.select_cake_gdn_prefill_variant,
+        cake_gdn._ragged_dvsplit_routes,
+    )
+    for fn in memoised:
+        fn.cache_clear()
     monkeypatch.setattr(cake_gdn, "_variant_for", fake_variant_for)
     try:
         route = _prefill(**overrides)
     finally:
-        cake_gdn.select_cake_gdn_prefill_variant.cache_clear()
+        for fn in memoised:
+            fn.cache_clear()
     assert captured["domain"] == "prefill"
     return captured["schedule_attr"], captured["specializations"], route.route_id
+
+
+@pytest.mark.cpu_only
+def test_requested_prefill_source_keeps_no_stub_answer_in_the_record_probes(
+    monkeypatch,
+) -> None:
+    """The stub-catalog helper drives the memoised sm_107a map of the ragged DV-split route
+    (built from the catalog when a ragged batch with the host lengths reaches it); a stub
+    record is never a key of the real map, and none of the stub's answers may survive the
+    helper into later tests."""
+    mixed16 = (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1)
+    stateful = dict(
+        arch="sm_107a",
+        io_dtype="bfloat16",
+        state_dtype="float32",
+        use_initial_state=True,
+        store_final_state=True,
+        gates_present=True,
+    )
+    for key, expected in (
+        (
+            dict(num_seqs=4, total_seq_len=4096, max_seq_len=1024),
+            "flashinfer.gdn_prefill.noncp.dvsplit",
+        ),
+        (
+            dict(
+                num_seqs=16,
+                total_seq_len=sum(mixed16),
+                max_seq_len=8192,
+                num_q_heads=8,
+                num_k_heads=8,
+                num_v_heads=16,
+                host_seq_lens=mixed16,
+            ),
+            "flashinfer.gdn_prefill.noncp.full_dv",
+        ),
+    ):
+        _, _, route = _requested_prefill_source(monkeypatch, **stateful, **key)
+        assert route == expected
+        assert cake_gdn._ragged_dvsplit_routes.cache_info().currsize == 0
 
 
 # Hq16/Hv16, fp16 I/O, fp32 state, initial + final state, 4 x 16 x 2 = 128 DV-split tiles: neither gatepipe4

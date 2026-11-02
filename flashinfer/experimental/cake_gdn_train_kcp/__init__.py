@@ -23,7 +23,8 @@ limitations under the License.
 # contracts and accuracy budgets, not its bitwise results.  The public
 # entry points are ``flashinfer.cake_gdn_train_kcp.partition_kcp``,
 # ``build_context_kcp``, ``chunk_gdn_kcp``, ``chunk_gdn_fwd_kcp``,
-# ``chunk_gdn_bwd_kcp`` and the byte queries; the partition / context plan, the
+# ``chunk_gdn_bwd_kcp`` and the byte queries (``packed_qkv_views_kcp`` is this
+# package's own); the partition / context plan, the
 # host orchestration, the options, the registry and the generated sources live
 # here.  This package imports itself, torch and torch.distributed only (never
 # another FlashInfer package, its deterministic twin included) and reads no
@@ -40,6 +41,7 @@ from .cake_kcp import (
     ChunkGDNFunctionKcp,
     FakeBackend,
     KernelBackend,
+    PackedQKVSplitKcp,
     RecomputeHandleKcp,
     SavedKcp,
     WorkspaceKcp,
@@ -52,6 +54,7 @@ from .cake_kcp import (
     gdn_workspace_bytes_kcp,
     get_backend,
     graph_cache_clear,
+    packed_qkv_views_kcp,
     set_backend,
 )
 from .cake_kcp_plan import (
@@ -77,6 +80,7 @@ __all__ = [
     "FragmentKcp",
     "KernelBackend",
     "OptionsKcp",
+    "PackedQKVSplitKcp",
     "PartitionKcp",
     "RecomputeHandleKcp",
     "SavedKcp",
@@ -92,6 +96,7 @@ __all__ = [
     "get_backend",
     "graph_cache_clear",
     "make_options",
+    "packed_qkv_views_kcp",
     "partition_kcp",
     "set_backend",
     "validate_heads",

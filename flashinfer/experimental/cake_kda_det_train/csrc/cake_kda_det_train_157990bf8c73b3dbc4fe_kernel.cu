@@ -392,90 +392,90 @@ kernel_cake_kda_det_train_157990bf8c73b3dbc4fe(const __grid_constant__ CUtensorM
             if (use_dht == 1) {
                 long long dht_base = ((long long)seq * (long long)num_heads + (long long)head) * 16384 + (long long)(k_row * 128);
                 #pragma unroll
-                for (int q = 0; q < 4; q++) {
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(q * 4));
-                        init_row[q * 4 + 0] = _v4.x;
-                        init_row[q * 4 + 1] = _v4.y;
-                        init_row[q * 4 + 2] = _v4.z;
-                        init_row[q * 4 + 3] = _v4.w;
-                    }
-                }
-                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base, init_row);
-                #pragma unroll
                 for (int q_0 = 0; q_0 < 4; q_0++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(16 + q_0 * 4));
+                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(q_0 * 4));
                         init_row[q_0 * 4 + 0] = _v4.x;
                         init_row[q_0 * 4 + 1] = _v4.y;
                         init_row[q_0 * 4 + 2] = _v4.z;
                         init_row[q_0 * 4 + 3] = _v4.w;
                     }
                 }
-                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 16, init_row);
+                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base, init_row);
                 #pragma unroll
                 for (int q_1 = 0; q_1 < 4; q_1++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(32 + q_1 * 4));
+                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(16 + q_1 * 4));
                         init_row[q_1 * 4 + 0] = _v4.x;
                         init_row[q_1 * 4 + 1] = _v4.y;
                         init_row[q_1 * 4 + 2] = _v4.z;
                         init_row[q_1 * 4 + 3] = _v4.w;
                     }
                 }
-                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 32, init_row);
+                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 16, init_row);
                 #pragma unroll
                 for (int q_2 = 0; q_2 < 4; q_2++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(48 + q_2 * 4));
+                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(32 + q_2 * 4));
                         init_row[q_2 * 4 + 0] = _v4.x;
                         init_row[q_2 * 4 + 1] = _v4.y;
                         init_row[q_2 * 4 + 2] = _v4.z;
                         init_row[q_2 * 4 + 3] = _v4.w;
                     }
                 }
-                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 48, init_row);
+                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 32, init_row);
                 #pragma unroll
                 for (int q_3 = 0; q_3 < 4; q_3++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(64 + q_3 * 4));
+                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(48 + q_3 * 4));
                         init_row[q_3 * 4 + 0] = _v4.x;
                         init_row[q_3 * 4 + 1] = _v4.y;
                         init_row[q_3 * 4 + 2] = _v4.z;
                         init_row[q_3 * 4 + 3] = _v4.w;
                     }
                 }
-                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 64, init_row);
+                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 48, init_row);
                 #pragma unroll
                 for (int q_4 = 0; q_4 < 4; q_4++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(80 + q_4 * 4));
+                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(64 + q_4 * 4));
                         init_row[q_4 * 4 + 0] = _v4.x;
                         init_row[q_4 * 4 + 1] = _v4.y;
                         init_row[q_4 * 4 + 2] = _v4.z;
                         init_row[q_4 * 4 + 3] = _v4.w;
                     }
                 }
-                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 80, init_row);
+                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 64, init_row);
                 #pragma unroll
                 for (int q_5 = 0; q_5 < 4; q_5++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(96 + q_5 * 4));
+                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(80 + q_5 * 4));
                         init_row[q_5 * 4 + 0] = _v4.x;
                         init_row[q_5 * 4 + 1] = _v4.y;
                         init_row[q_5 * 4 + 2] = _v4.z;
                         init_row[q_5 * 4 + 3] = _v4.w;
                     }
                 }
-                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 96, init_row);
+                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 80, init_row);
                 #pragma unroll
                 for (int q_6 = 0; q_6 < 4; q_6++) {
                     {
-                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(112 + q_6 * 4));
+                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(96 + q_6 * 4));
                         init_row[q_6 * 4 + 0] = _v4.x;
                         init_row[q_6 * 4 + 1] = _v4.y;
                         init_row[q_6 * 4 + 2] = _v4.z;
                         init_row[q_6 * 4 + 3] = _v4.w;
+                    }
+                }
+                tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 96, init_row);
+                #pragma unroll
+                for (int q_7 = 0; q_7 < 4; q_7++) {
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(dht + dht_base + (long long)(112 + q_7 * 4));
+                        init_row[q_7 * 4 + 0] = _v4.x;
+                        init_row[q_7 * 4 + 1] = _v4.y;
+                        init_row[q_7 * 4 + 2] = _v4.z;
+                        init_row[q_7 * 4 + 3] = _v4.w;
                     }
                 }
                 tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 112, init_row);
@@ -522,8 +522,8 @@ kernel_cake_kda_det_train_157990bf8c73b3dbc4fe(const __grid_constant__ CUtensorM
                     _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
                 #pragma unroll
-                for (int q_7 = 0; q_7 < 2; q_7++) {
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((dhs_addr + (unsigned int)(q_7 * 8 / 64 * 16384 + k_row * 128 + q_7 * 8 % 64 * 2 ^ (q_7 * 8 / 64 * 16384 + k_row * 128 + q_7 * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(_tmem_load_0_bf16[q_7 * 4]), "r"(_tmem_load_0_bf16[q_7 * 4 + 1]), "r"(_tmem_load_0_bf16[q_7 * 4 + 2]), "r"(_tmem_load_0_bf16[q_7 * 4 + 3]) : "memory");
+                for (int q = 0; q < 2; q++) {
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((dhs_addr + (unsigned int)(q * 8 / 64 * 16384 + k_row * 128 + q * 8 % 64 * 2 ^ (q * 8 / 64 * 16384 + k_row * 128 + q * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(_tmem_load_0_bf16[q * 4]), "r"(_tmem_load_0_bf16[q * 4 + 1]), "r"(_tmem_load_0_bf16[q * 4 + 2]), "r"(_tmem_load_0_bf16[q * 4 + 3]) : "memory");
                 }
                 float _tmem_load_1[16];
                 tmem_ld_x16(&_tmem_load_1[0], taddr + (unsigned int)m128_row_base + 16);
@@ -1155,70 +1155,70 @@ kernel_cake_kda_det_train_157990bf8c73b3dbc4fe(const __grid_constant__ CUtensorM
                 tmem_ld_x16(&tmem_load_r_0[0], taddr + (unsigned int)m128_row_base + 16);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
-                for (int q_7_1 = 0; q_7_1 < 4; q_7_1++) {
+                for (int q_8_1 = 0; q_8_1 < 4; q_8_1++) {
                     {
-                        float4 _v4 = make_float4(tmem_load_r_0[q_7_1 * 4 + 0], tmem_load_r_0[q_7_1 * 4 + 1], tmem_load_r_0[q_7_1 * 4 + 2], tmem_load_r_0[q_7_1 * 4 + 3]);
-                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(16 + q_7_1 * 4)) = _v4;
+                        float4 _v4 = make_float4(tmem_load_r_0[q_8_1 * 4 + 0], tmem_load_r_0[q_8_1 * 4 + 1], tmem_load_r_0[q_8_1 * 4 + 2], tmem_load_r_0[q_8_1 * 4 + 3]);
+                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(16 + q_8_1 * 4)) = _v4;
                     }
                 }
                 float tmem_load_r_1[16];
                 tmem_ld_x16(&tmem_load_r_1[0], taddr + (unsigned int)m128_row_base + 32);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
-                for (int q_8_1 = 0; q_8_1 < 4; q_8_1++) {
+                for (int q_9_1 = 0; q_9_1 < 4; q_9_1++) {
                     {
-                        float4 _v4 = make_float4(tmem_load_r_1[q_8_1 * 4 + 0], tmem_load_r_1[q_8_1 * 4 + 1], tmem_load_r_1[q_8_1 * 4 + 2], tmem_load_r_1[q_8_1 * 4 + 3]);
-                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(32 + q_8_1 * 4)) = _v4;
+                        float4 _v4 = make_float4(tmem_load_r_1[q_9_1 * 4 + 0], tmem_load_r_1[q_9_1 * 4 + 1], tmem_load_r_1[q_9_1 * 4 + 2], tmem_load_r_1[q_9_1 * 4 + 3]);
+                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(32 + q_9_1 * 4)) = _v4;
                     }
                 }
                 float tmem_load_r_2[16];
                 tmem_ld_x16(&tmem_load_r_2[0], taddr + (unsigned int)m128_row_base + 48);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
-                for (int q_9_1 = 0; q_9_1 < 4; q_9_1++) {
+                for (int q_10_1 = 0; q_10_1 < 4; q_10_1++) {
                     {
-                        float4 _v4 = make_float4(tmem_load_r_2[q_9_1 * 4 + 0], tmem_load_r_2[q_9_1 * 4 + 1], tmem_load_r_2[q_9_1 * 4 + 2], tmem_load_r_2[q_9_1 * 4 + 3]);
-                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(48 + q_9_1 * 4)) = _v4;
+                        float4 _v4 = make_float4(tmem_load_r_2[q_10_1 * 4 + 0], tmem_load_r_2[q_10_1 * 4 + 1], tmem_load_r_2[q_10_1 * 4 + 2], tmem_load_r_2[q_10_1 * 4 + 3]);
+                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(48 + q_10_1 * 4)) = _v4;
                     }
                 }
                 float tmem_load_r_3[16];
                 tmem_ld_x16(&tmem_load_r_3[0], taddr + (unsigned int)m128_row_base + 64);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
-                for (int q_10_1 = 0; q_10_1 < 4; q_10_1++) {
+                for (int q_11_1 = 0; q_11_1 < 4; q_11_1++) {
                     {
-                        float4 _v4 = make_float4(tmem_load_r_3[q_10_1 * 4 + 0], tmem_load_r_3[q_10_1 * 4 + 1], tmem_load_r_3[q_10_1 * 4 + 2], tmem_load_r_3[q_10_1 * 4 + 3]);
-                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(64 + q_10_1 * 4)) = _v4;
+                        float4 _v4 = make_float4(tmem_load_r_3[q_11_1 * 4 + 0], tmem_load_r_3[q_11_1 * 4 + 1], tmem_load_r_3[q_11_1 * 4 + 2], tmem_load_r_3[q_11_1 * 4 + 3]);
+                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(64 + q_11_1 * 4)) = _v4;
                     }
                 }
                 float tmem_load_r_4[16];
                 tmem_ld_x16(&tmem_load_r_4[0], taddr + (unsigned int)m128_row_base + 80);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
-                for (int q_11_1 = 0; q_11_1 < 4; q_11_1++) {
+                for (int q_12_1 = 0; q_12_1 < 4; q_12_1++) {
                     {
-                        float4 _v4 = make_float4(tmem_load_r_4[q_11_1 * 4 + 0], tmem_load_r_4[q_11_1 * 4 + 1], tmem_load_r_4[q_11_1 * 4 + 2], tmem_load_r_4[q_11_1 * 4 + 3]);
-                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(80 + q_11_1 * 4)) = _v4;
+                        float4 _v4 = make_float4(tmem_load_r_4[q_12_1 * 4 + 0], tmem_load_r_4[q_12_1 * 4 + 1], tmem_load_r_4[q_12_1 * 4 + 2], tmem_load_r_4[q_12_1 * 4 + 3]);
+                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(80 + q_12_1 * 4)) = _v4;
                     }
                 }
                 float tmem_load_r_5[16];
                 tmem_ld_x16(&tmem_load_r_5[0], taddr + (unsigned int)m128_row_base + 96);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
-                for (int q_12_1 = 0; q_12_1 < 4; q_12_1++) {
+                for (int q_13_1 = 0; q_13_1 < 4; q_13_1++) {
                     {
-                        float4 _v4 = make_float4(tmem_load_r_5[q_12_1 * 4 + 0], tmem_load_r_5[q_12_1 * 4 + 1], tmem_load_r_5[q_12_1 * 4 + 2], tmem_load_r_5[q_12_1 * 4 + 3]);
-                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(96 + q_12_1 * 4)) = _v4;
+                        float4 _v4 = make_float4(tmem_load_r_5[q_13_1 * 4 + 0], tmem_load_r_5[q_13_1 * 4 + 1], tmem_load_r_5[q_13_1 * 4 + 2], tmem_load_r_5[q_13_1 * 4 + 3]);
+                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(96 + q_13_1 * 4)) = _v4;
                     }
                 }
                 float tmem_load_r_6[16];
                 tmem_ld_x16(&tmem_load_r_6[0], taddr + (unsigned int)m128_row_base + 112);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                 #pragma unroll
-                for (int q_13_1 = 0; q_13_1 < 4; q_13_1++) {
+                for (int q_14_1 = 0; q_14_1 < 4; q_14_1++) {
                     {
-                        float4 _v4 = make_float4(tmem_load_r_6[q_13_1 * 4 + 0], tmem_load_r_6[q_13_1 * 4 + 1], tmem_load_r_6[q_13_1 * 4 + 2], tmem_load_r_6[q_13_1 * 4 + 3]);
-                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(112 + q_13_1 * 4)) = _v4;
+                        float4 _v4 = make_float4(tmem_load_r_6[q_14_1 * 4 + 0], tmem_load_r_6[q_14_1 * 4 + 1], tmem_load_r_6[q_14_1 * 4 + 2], tmem_load_r_6[q_14_1 * 4 + 3]);
+                        *reinterpret_cast<float4*>(ht_out + ht_base + (long long)(112 + q_14_1 * 4)) = _v4;
                     }
                 }
             }
