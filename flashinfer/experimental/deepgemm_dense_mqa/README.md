@@ -201,7 +201,7 @@ the schema version carries them together), -- v13 -- `h32_text_options` (per arc
 32-head routes whose delivered logits program is built with an adopted cache-hint / ordering option -- `scan_window_l2_prefetch`,
 `pre_issue`, `source_consumer_release`; the same logits and schedule words as the knob-off program; informational: the route
 record already binds the option program, per architecture where only one adopted it -- `fp8:qle128:short` on sm_100a,
-`fp8:full:le128` / `fp8:full:le2048` on sm_103a), and
+`fp8:full:le128` / `fp8:full:le2048` / `fp8:qle2048:short` on sm_103a), and
 `paged` (`heads` -- the paged head counts, independent of the dense `heads`; `block_kv`, `split_kv`,
 `next_n_atoms` -- 1 for every exported `next_n`, the logits programs iterate the atoms in-kernel;
 `max_batch`, `metadata_program`, `admission` -- per architecture and route the ordered boxes a call must lie in to be served:
@@ -309,8 +309,9 @@ Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}
 `1 < Q <= 128`, `K <= fused_qle128_max_kv`; catalogued where the `le128` tier's precedence reaches it -- under the
 published order on both architectures),
 `fp8:qle2048:short` (one `logits` stage, the program `fp8_fused_qle2048` writing the tiered `le2048` schedule in-kernel for
-`128 < Q <= 2048`; on sm_103a its `stage_buckets` launch the fused text with a four-stage TMEM accumulator ring for
-`Q <= 136` and `K <= 8448`), `fp8:{full,partial}:<tier>`, `fp4:q1:short`, `fp4:q1`, `fp4:le32:short` (one `logits` stage whose
+`128 < Q <= 2048`; bound per architecture: the `source_consumer_release` text on sm_103a; on sm_103a its `stage_buckets`
+launch that text with a four-stage TMEM accumulator ring for `Q <= 136` and `K <= 8448`), `fp8:{full,partial}:<tier>`,
+`fp4:q1:short`, `fp4:q1`, `fp4:le32:short` (one `logits` stage whose
 program is bound per architecture: the warp-scan text with the first-tile L2 prefetch where
 `fp4.first_tile_prefetch_forms[arch]` lists `le32` -- sm_103a -- and without it elsewhere -- sm_100a, whose
 `stage_buckets` launch the prefetch text for `K <= 4096`, and for `K <= 32768` when `Q <= 36`), `fp4:qle1024:short` (one
