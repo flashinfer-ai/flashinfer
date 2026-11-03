@@ -1,4 +1,4 @@
-# Review draft: legacy NVFP4 NCCL GIN
+# Review notes: legacy NVFP4 NCCL GIN
 
 Reviewer entry point: [PR design and measured results](pr-design.md).
 
@@ -37,7 +37,8 @@ geometry and a separate two-domain N2R2 lane. Suggested files are the new GIN
 tests, `test_nvfp4_cutedsl_kernel_vs_reference.py`, the NVFP4/BF16/MXFP8 layer
 files, `test_mega_cuda_graph_multirank.py`, and workspace/native-reducer tests.
 The graph file also contains next/GenPhase cases; keep selectors explicit.
-No bot request, PR publication, push or merge is part of this delivery.
+The branch is submitted as [PR #8485](https://github.com/flashinfer-ai/flashinfer/pull/8485).
+No additional CI-bot request or merge was made.
 
 ## Reviewer notes
 

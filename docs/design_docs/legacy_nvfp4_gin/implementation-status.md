@@ -8,8 +8,11 @@ reported in [performance-fix-blackwell.md](performance-fix-blackwell.md).
 Receiver: branch `port/legacy-nvfp4-nccl-gin`, worktree
 `port/flashinfer-nvfp4-gin`, based on
 `e74a1677ab95a1b97aa1c6b6a80b3cf5c0ebac34`. Original FI and donor checkouts
-remain unchanged. Implementation commits: `fb033d522`, `79a519e20`. No merge, push or
-publication has been performed.
+remain unchanged. Implementation commits: `fb033d522`, `79a519e20`.
+The branch is published through the existing `qiangf-nv/flashinfer` fork as
+[PR #8485](https://github.com/flashinfer-ai/flashinfer/pull/8485), targeting
+`flashinfer-ai/flashinfer:main`. No merge or additional CI-bot request was made.
+Reviewer overview: [interfaces, design, changes and performance](pr-design.md).
 
 | Phase | Result | Evidence |
 | --- | --- | --- |
