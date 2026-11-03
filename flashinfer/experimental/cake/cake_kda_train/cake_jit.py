@@ -693,10 +693,22 @@ MODULES: dict[str, dict[str, Any]] = {
             "write_prep": "write_prep",
         },
         "select_rule": {
-            "kind": "any_of",
+            "kind": "all_of",
             "rules": [
-                {"kind": "route_in", "routes": ["serial"]},
-                {"kind": "docs_above", "min": 256},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "route_in", "routes": ["serial"]},
+                        {"kind": "docs_above", "min": 256},
+                    ],
+                },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "l2n_in", "modes": ["off", "fallback"]},
+                        {"kind": "path_in", "paths": ["replay"]},
+                    ],
+                },
             ],
         },
         "stage": "fwd_intra",
@@ -3298,7 +3310,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "qg_out": "qg",
             "v_new": "v_new",
         },
-        "select_rule": {"kind": "path_in", "paths": ["replay"]},
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["replay"]},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "l2n_in", "modes": ["off", "fallback"]},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "route_in", "routes": ["seg"]},
+                                {"kind": "docs_at_most", "max": 256},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
         "stage": "bwd_prep",
         "variant": "g8_replay",
     },
@@ -6434,6 +6464,9 @@ def _admits(
         return arch in rule["arches"]
     if kind == "path_in":
         return path in rule["paths"]
+    if kind == "l2n_in":
+        # this package refuses use_qk_l2norm_in_kernel=True at every entry: its l2n is always "off"
+        return "off" in rule["modes"]
     raise ValueError(f"unknown Cake KDA training selection rule: {kind!r}")
 
 
