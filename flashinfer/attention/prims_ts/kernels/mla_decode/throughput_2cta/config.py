@@ -530,12 +530,12 @@ def make_mla_decode_config(
         and page_size == 1
         and sparse_gather_warps == 1
         and not has_nvfp4_kv
-        and not rope_dim
         and not fuse_output_quant
     )
     if sparse_kv_stages and split_fp8_kv_stages:
-        # Native FP8 D512 counts both split streams: two K stages, the rest V.
-        # A third V stage spends the remaining 32 KiB per CTA on gather depth.
+        # Native FP8 counts both split streams: two K stages, the rest V. A
+        # third V stage spends the remaining 32 KiB per CTA on gather depth
+        # (D512; D576 on SM107, where the policy requests it).
         if sparse_kv_stages not in (4, 5):
             raise ValueError("FP8 split K/V pipeline supports four or five stages")
         cfg.load_k_stage, cfg.load_v_stage = 2, sparse_kv_stages - 2

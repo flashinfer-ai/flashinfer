@@ -56,6 +56,7 @@ from .config import (
     MlaConfig,
     make_throughput_latency_mla_config,
     configure_sparse_mla,
+    target_smem_capacity_bytes,
 )
 from .resources import (
     SmemKvResource,
@@ -1173,6 +1174,7 @@ def build_throughput_latency_mla_task_manager(
         # releases drain. Its warning mode still runs all schedule checks.
         skip_validation=cfg.serial_swap_reuse,
         smem_allocator=smem_allocator,
+        smem_capacity_bytes=target_smem_capacity_bytes(),
         tmem_allocator=tmem_allocator,
         verbose=verbose,
         exhaustive_deadlock_race_check=exhaustive_deadlock_race_check,
@@ -1728,6 +1730,7 @@ def _make_single_kv_pipe_task_graph(
         # warning mode for BF16 reuse instead of maintaining a second verifier.
         skip_validation=cfg.sparse_reuse_kv and not cfg.is_fp8_qkv(),
         smem_allocator=smem_allocator,
+        smem_capacity_bytes=target_smem_capacity_bytes(),
         tmem_allocator=tmem_allocator,
         verbose=verbose,
         exhaustive_deadlock_race_check=exhaustive_deadlock_race_check,

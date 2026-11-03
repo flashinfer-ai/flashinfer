@@ -608,7 +608,8 @@ def select_sparse_mla_profile(
     ``heads`` is not a multiple of 16: the cluster finisher needs whole M16
     head tiles, a kernel constraint rather than a measured crossover.
     ``compute_capability`` is the device's ``(major, minor)``; it enables
-    architecture-specific choices (SM107 NVFP4 D576 unsplit waves), and
+    architecture-specific choices (SM107 NVFP4 D576 unsplit waves and the
+    D576 native FP8 third V stage), and
     ``None`` keeps the architecture-independent schedule.
     """
     kwargs = dict(
@@ -700,6 +701,18 @@ def resolve_sparse_mla_profile(
             # The third V stage was measured only for native E4M3 pools;
             # converted pools keep their loader stages.
             profile = replace(profile, kv_pipeline_stages=0)
+        elif (
+            rope_dim
+            and profile.family == "2cta"
+            and profile.scheduler == "static"
+            and query_length <= 8
+            and compute_capability == (10, 7)
+        ):
+            # D576 wave grids take the same third V stage on SM107 only:
+            # VR200 top-k 2048, H128 1024 rows: 132.3 -> 129.4 us, H96:
+            # 131.0 -> 128.4 us (1-2.3% from one wave of rows). GB300 gains
+            # at most 1% on H128 and nothing on H96.
+            profile = replace(profile, kv_pipeline_stages=5)
     else:
         profile = choose_bf16_profile(rows, heads, query_length, capacity, sm_count)
     # Converted KV keeps this schedule down to one row: the general small-grid
