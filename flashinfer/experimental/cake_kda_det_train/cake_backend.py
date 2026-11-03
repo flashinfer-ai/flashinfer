@@ -147,7 +147,7 @@ import struct
 import threading
 import types
 import weakref
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from typing import Any, Protocol
 
 import torch
@@ -1885,8 +1885,67 @@ def _rstd_bytes(S: int, H: int) -> int:
 
 def _l2n_bwd_rows_bytes(S: int, H: int) -> int:
     """The backward's per-call ``qn`` / ``kn`` BF16 ``[S, H, 128]`` each (in-kernel Q/K L2 norm modes): written by
-    the first q / k reader, dropped after the last GLM intra launch."""
+    the first q / k reader, dropped after the last GLM intra launch.  The saved-set paths keep them in the arena
+    instead where :func:`_l2n_rows_in_arena` holds (no per-call bytes)."""
     return 2 * int(S) * int(H) * D * 2
+
+
+# The backward stages that write the token-row gradients dq / dk; they run after every other stage of a path
+# (:func:`_backward_launches`, one tail pass).
+_DQK_WRITER_STAGES = ("glm_intra", "qk_pullback", "gate_epilogue")
+
+
+def _l2n_rows_in_arena(
+    p: Plan, path: str, buffers: Collection[str], tail_passes: int
+) -> bool:
+    """Whether the backward on ``path`` (one whole-problem launch sequence on a layout with the arena ``buffers``)
+    keeps the in-kernel Q/K L2 norm's ``qn`` / ``kn`` without per-call bytes: ``qn`` on the bytes of ``do_int``
+    (the replay prep's copy of ``dout``; no record of a saved-set path binds it), ``kn`` on the bytes of ``dv2``,
+    and ``dv2`` itself on the bytes of the call's ``dq`` / ``dk`` (one BF16 ``[2, S, H, 128]`` tensor, ``2 S >= R``),
+    which only the stages of :data:`_DQK_WRITER_STAGES` write, after the last ``dv2`` read.  It holds on a saved-set
+    path with one tail pass whose layout has both buffers (not the lean ones), where no record of the path binds
+    ``do_int``, no record of those stages binds ``dv2`` and no other record binds ``dq`` / ``dk``; else the
+    backward allocates ``qn`` / ``kn`` per call (:func:`_l2n_bwd_rows_bytes`)."""
+    if p.l2n == "off" or path == "replay" or tail_passes != 1 or 2 * p.S < p.R:
+        return False
+    if "do_int" not in buffers or "dv2" not in buffers:
+        return False
+    for stage, name in p._records(path).items():
+        if name is None:
+            continue
+        names = set(cake_jit.MODULES[name]["logical"].values())
+        late = stage in _DQK_WRITER_STAGES
+        if (
+            "do_int" in names
+            or (late and "dv2" in names)
+            or (not late and names & {"dq", "dk"})
+        ):
+            return False
+    return True
+
+
+# The per-call outputs and raw partials of the backward (:func:`_backward`) that no prep record binds: a whole-problem
+# fused in-kernel Q/K L2 norm backward allocates them after the prep launch (:func:`_l2n_prep_first`).
+_PREP_LATE_NAMES = frozenset(
+    {"dv", "dg", "dbeta", "dg_raw", "dA_part", "db_part", "dA_log", "ddt_bias"}
+)
+
+
+def _l2n_prep_first(p: Plan, path: str, replay: bool) -> bool:
+    """Whether a whole-problem backward on ``path`` of the fused in-kernel Q/K L2 norm (``p.l2n == "fused"``) launches
+    its prep record first (no ``qk_apply`` / ``qk_l2norm`` stage, and not the replay's intra-first order: the replay
+    without a table launch) and that record binds none of :data:`_PREP_LATE_NAMES`: the backward then allocates
+    those after the prep launch, so the first backward kernel is queued before that host work."""
+    if (
+        p.l2n != "fused"
+        or p.dispatched("qk_apply", path)
+        or p.dispatched("qk_l2norm", path)
+    ):
+        return False
+    if replay and not p.dispatched("table", path):
+        return False
+    names = cake_jit.MODULES[p.record("bwd_prep", path)]["logical"].values()
+    return not any(n in _PREP_LATE_NAMES for n in names)
 
 
 def output_bytes(
@@ -2066,10 +2125,11 @@ def memory_report(
     architecture, ``out_bwd`` is the raw mode's outputs (:func:`output_bytes`) and ``bwd_partials`` the per-call
     parameter partials ``dA_part`` / ``db_part`` (``2 * NC_pad * H * 128 * 8`` bytes, allocated by the backward
     outside the arena; 0 in ``"g"`` mode), which the backward totals include.  ``l2n`` is the in-kernel Q/K L2 norm
-    mode (:attr:`Plan.l2n`): the saved set gains ``qk_rstd`` (``saved_qk_rstd``, ``8 * S * H``), the backward
-    allocates the transient ``qn`` / ``kn`` (``bwd_qn_kn``, ``2 * S * H * 256``; dropped after GLM intra) and the
-    replay without a set a transient ``qk_rstd`` (``replay_rstd``), which the totals include; the forward's ``qn``
-    / ``kn`` ride in the arena's ``u`` / ``w`` slots (no bytes)."""
+    mode (:attr:`Plan.l2n`): the saved set gains ``qk_rstd`` (``saved_qk_rstd``, ``8 * S * H``), the backward from
+    the saved set allocates the transient ``qn`` / ``kn`` (``bwd_qn_kn``, ``2 * S * H * 256``; dropped after GLM
+    intra) only where they cannot ride in its arena (0 where :func:`_l2n_rows_in_arena` holds for the saved set's
+    path), the replay always (``replay_qn_kn``) together with a transient ``qk_rstd`` (``replay_rstd``), which the
+    totals include; the forward's ``qn`` / ``kn`` ride in the arena's ``u`` / ``w`` slots (no bytes)."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
             f"memory_report: save_mode must be one of {SAVE_MODES}, got {save_mode!r}"
@@ -2170,10 +2230,32 @@ def memory_report(
     out_b = output_bytes(S, H, backward=True, gate=gate, l2n=l2n)
     # the raw backward's per-call parameter partials (outside the arena, live from GLM intra to param_finalize)
     partials = _raw_partials_bytes(nc_pad, H) if gate == "raw" else 0
-    # the in-kernel Q/K L2 norm's backward transients: qn / kn of every backward, the rstd of the replay
+    # the in-kernel Q/K L2 norm's backward transients: qn / kn of the replay, and of the saved-set backward where they
+    # cannot ride in its arena; the rstd of the replay
     l2n_on = l2n != "off"
-    bwd_rows = _l2n_bwd_rows_bytes(S, H) if l2n_on else 0
+    replay_rows = _l2n_bwd_rows_bytes(S, H) if l2n_on else 0
+    bwd_rows = replay_rows
     replay_rstd = _rstd_bytes(S, H) if l2n_on else 0
+    if l2n_on and not arena.batched:
+        p_l2n = p
+        if p_l2n is None:
+            try:
+                p_l2n = plan(S, num_docs, H, sms, arch, gate=gate, l2n=l2n)
+            except ValueError:  # no record serves the mode here (the call would raise)
+                p_l2n = None
+        if p_l2n is not None:
+            mode = arena.mode("bwd_tape" if tape else "bwd")
+            tail = arena.tail_passes if arena.lean else 1
+            path = (
+                "tape"
+                if tape
+                else "light_states"
+                if recur == "seg" and seg_states_saved(S, num_segments)
+                else "light"
+            )
+            names = {r.name for r in p_l2n.layout(mode, tail)}
+            if _l2n_rows_in_arena(p_l2n, path, names, tail):
+                bwd_rows = 0
     # The per-call segment states in the saved set: tape two blocks (seg_state, its transfer half is the saved
     # seg_m), light three (hseg and the seg_state pair, version 4) when the size rule holds; none on the serial route.
     if recur != "seg":
@@ -2228,6 +2310,7 @@ def memory_report(
         "bwd_partials": partials,
         "saved_qk_rstd": _rstd_bytes(S, H) if l2n_on else 0,
         "bwd_qn_kn": bwd_rows,
+        "replay_qn_kn": replay_rows,
         "replay_rstd": replay_rstd,
         "fwd_total_fwd_arena": arena_fwd_conf
         + out_f
@@ -2244,13 +2327,22 @@ def memory_report(
         + saved
         + out_b
         + partials
-        + bwd_rows
+        + replay_rows
         + replay_rstd,  # the default arena: lean serves no replay
     }
 
 
 # ----------------------------------------------------------------------------------------------------------------
 # Saved set and workspace
+
+
+def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
+    """The element strides of a contiguous tensor of ``shape``."""
+    strides, step = [], 1
+    for n in reversed(shape):
+        strides.append(step)
+        step *= int(n)
+    return tuple(reversed(strides))
 
 
 def _alloc(
@@ -2644,6 +2736,12 @@ class KdaDetWorkspace:
         self._batch_views: dict[tuple[int, int, int], KdaDetWorkspace] = {}
         self._doc_cache: dict[tuple[int, ...], _Packing] = {}
         self._doc_graphs: set[tuple[int, ...]] = set()
+        # the in-kernel Q/K L2 norm backward's host facts of this workspace's plan and arena, pure functions of them
+        # (host time before every such backward's first launch): ("rows", path, layout mode, tail passes) ->
+        # :func:`_l2n_rows_in_arena`; ("prep_first", path, replay) -> :func:`_l2n_prep_first`; ("views", layout mode)
+        # -> the arena's qn / kn row views and the shape / strides of dv2 on the dq / dk bytes.  A view under another
+        # plan (:meth:`_view`) starts its own
+        self._l2n_host_cache: dict[tuple[Any, ...], Any] = {}
 
     def views(self, mode: str) -> types.SimpleNamespace:
         """The buffer views of layout ``mode`` on this arena (``ValueError`` when the arena is too small for it);
@@ -2835,6 +2933,7 @@ class KdaDetWorkspace:
         other._batch_views = {}
         other._doc_cache = {}
         other._doc_graphs = set()
+        other._l2n_host_cache = {}  # per plan: never shared with the parent's
         return other
 
     def with_plan(self, plan: Plan) -> KdaDetWorkspace:
@@ -3254,6 +3353,20 @@ def _check_qk_raw(
     ``c0 % 8 == 0``.  ``ValueError`` otherwise; the host never copies it.  An axis of extent 1 has no stride that
     matters: it is viewed with the canonical one (the same elements, no copy), so ``H == 1`` takes any head stride
     and ``S == 1`` any token stride; an empty view (``S == 0``) is checked for shape, dtype and device only."""
+    st = x.stride()
+    if (
+        len(st) == 3
+        and st[2] == 1
+        and st[1] == D
+        and (S > 1 or (S == 1 and st[0] == H * D))
+        and st[0] % 8 == 0
+        and st[0] >= H * D
+        and x.dtype == torch.bfloat16
+        and x.shape == (S, H, D)
+        and x.device == device
+        and x.data_ptr() % 16 == 0
+    ):  # a view the checks below accept and return unchanged (a contiguous tensor, a packed q / k column slice)
+        return x
     if tuple(x.shape) != (S, H, D):
         raise ValueError(
             f"{name}: expected shape {(S, H, D)} (or a leading batch axis of 1), got {tuple(x.shape)}"
@@ -3325,7 +3438,7 @@ def _internal_to_tokens(
     out: torch.Tensor,
 ) -> None:
     """Scatter the internal rows ``rows [64 * NC, H, 128]`` (row ``64 c + i`` of chunk ``c``) of the real tokens
-    (``i < chunk_len[c]``) to their token rows ``chunk_bos[c] + i`` of ``out [S, H, 128]`` (the test hook only)."""
+    (``i < chunk_len[c]``) to their token rows ``chunk_bos[c] + i`` of ``out [S, H, 128]`` (a test helper)."""
     nc = int(chunk_bos.numel())
     r = torch.arange(nc * BT, device=rows.device)
     c, i = r // BT, r % BT
@@ -3929,7 +4042,6 @@ def _forward_launches(
     u: torch.Tensor | None = None,
     gate_values: dict[str, Any] | None = None,
     l2n_values: dict[str, Any] | None = None,
-    after_intra: Callable[[], None] | None = None,
 ) -> None:
     """The launches of one forward on ``ws`` (the whole problem, or one document group through its view, its
     ``cu_seqlens`` slice, its tables and its tape slices; the token tensors always whole): the intra program (the
@@ -3939,9 +4051,7 @@ def _forward_launches(
     operands (:func:`_raw_values`; ``g`` is then ``None``): the plan's raw intra record reads them.
     ``l2n_values`` are the in-kernel Q/K L2 norm's (:func:`_l2n_values`; ``q`` / ``k`` then name the normalized
     rows): the fused intra record reads the raw rows and writes ``qn`` / ``kn`` (and the rstd per ``write_rstd``),
-    the fallback's plain intra record reads the ``qn`` / ``kn`` its ``qk_l2norm`` launch wrote.  ``after_intra``
-    runs on the host right after the intra launch is enqueued (the test hook's copy of the arena's ``qn`` / ``kn``,
-    before WY overwrites the slots)."""
+    the fallback's plain intra record reads the ``qn`` / ``kn`` its ``qk_l2norm`` launch wrote."""
     p = ws.plan
     values = _values(
         ws,
@@ -3974,8 +4084,6 @@ def _forward_launches(
         write_int=1 if p.internal_rows(path) else 0,
         write_prep=1,
     )
-    if after_intra is not None:
-        after_intra()
     if p.dispatched("wy_fwd", path):
         ws.run("wy_fwd", values, path=path)
     _forward_recurrence(
@@ -4169,7 +4277,9 @@ def _forward(
     # qk_l2norm writes token-layout qn / kn (the first S rows of the slots, or per-call under a batched arena) and
     # the plain intra program reads them as q / k.
     fallback = l2n == "fallback"
-    # the test hook's token-layout copies of the forward's normalized rows (only when the hook is on)
+    # the test hook's token-layout rows of the forward's normalization (only when the hook is on): the fused intra
+    # program writes them itself (write_qkn = 1 into qn_tok / kn_tok; a fused program may keep its normalized rows
+    # on chip and write no qn_int / kn_int, so the slots are not read back); q / k stay bound as without the hook
     hook = _l2n_record is not None and l2n != "off"
     qn_tok = kn_tok = None
     fallback_rows: dict[str, torch.Tensor] = {}
@@ -4189,7 +4299,7 @@ def _forward(
         ):  # the slot views: token layout for the fallback, placeholders of the fused program
             qn = a.qn_int[:S] if fallback else a.qn_int
             kn = a.kn_int[:S] if fallback else a.kn_int
-        return _l2n_values(
+        lv = _l2n_values(
             q,
             k,
             qn,
@@ -4201,6 +4311,9 @@ def _forward(
             qn_int=a.qn_int,
             kn_int=a.kn_int,
         )
+        if hook and not fallback:
+            lv.update(qn=qn_tok, kn=kn_tok, write_qkn=1)
+        return lv
 
     def qk_l2norm(lv: dict[str, Any] | None) -> None:
         """The fallback's token-local normalization of the whole problem, once, before the intra program(s); the
@@ -4212,18 +4325,6 @@ def _forward(
                     lv["qn"].clone(),
                     lv["kn"].clone(),
                 )
-
-    def record_rows(a: types.SimpleNamespace, tables_a: tuple[torch.Tensor, ...]):
-        """The hook's copy of the fused intra program's internal rows into token layout (right after the intra
-        launch, before WY overwrites the slots)."""
-        if not hook or fallback:
-            return None
-
-        def copy_rows() -> None:
-            _internal_to_tokens(a.qn_int, tables_a[0], tables_a[1], qn_tok)
-            _internal_to_tokens(a.kn_int, tables_a[0], tables_a[1], kn_tok)
-
-        return copy_rows
 
     qn = kn = None
     seg_state = hseg = seg_m = None
@@ -4255,7 +4356,6 @@ def _forward(
         lv = l2n_values(a, None, None)
         if fallback:
             qn, kn = lv["qn"], lv["kn"]
-        record = record_rows(a, tables)
         qk_l2norm(lv)
         _forward_launches(
             ws,
@@ -4274,7 +4374,6 @@ def _forward(
             w=w_saved,
             u=u_saved,
             l2n_values=lv,
-            after_intra=record,
             **common,
         )
     else:
@@ -4336,7 +4435,6 @@ def _forward(
                 w=None if w_saved is None else w_saved[rows_b],
                 u=None if u_saved is None else u_saved[rows_b],
                 l2n_values=l2n_values(a, qn, kn),
-                after_intra=record_rows(a, tables_b),
                 **common,
             )
             if run is not None:  # one run: contiguous copies of the halves
@@ -4441,6 +4539,7 @@ def _backward_launches(
     nc_vec: torch.Tensor | None = None,
     gate_values: dict[str, Any] | None = None,
     l2n_values: dict[str, Any] | None = None,
+    late_values: Callable[[], dict[str, Any]] | None = None,
 ) -> None:
     """The launches of one backward on ``ws`` (the whole problem, or one document group through its view, its
     ``cu_seqlens`` slice, its tables, its tape slices, its slices of the saved ``qg`` / ``w`` / ``u``, its blocks of
@@ -4456,7 +4555,9 @@ def _backward_launches(
     reader of the path (the l2n prep record, or the l2n intra record where the replay runs it first) writes them
     from the raw rows and the rstd, every later reader binds them, and the l2n GLM intra program pulls the
     gradients back to the raw rows; in the fallback route the GLM intra capture program leaves ``dq_hat`` /
-    ``dk_hat`` in ``dq_f`` / ``dk_f`` and ``qk_pullback`` follows it (per tail range)."""
+    ``dk_hat`` in ``dq_f`` / ``dk_f`` and ``qk_pullback`` follows it (per tail range).  ``late_values`` (the fused
+    in-kernel Q/K L2 norm's whole-problem calls, :func:`_l2n_prep_first`) allocates the values the prep record does
+    not bind; they join ``values`` right after the prep launch."""
     p = ws.plan
     b = views
     # The operand sources of the backward programs: the saved Aqk / Akk token rows and the user's dout on the
@@ -4518,6 +4619,8 @@ def _backward_launches(
         {**values, "v_new": b.v_new_scratch if tape else v_new},
         path=path,
     )
+    if late_values is not None:
+        values.update(late_values())
     if replay and not intra_first:
         replay_intra()
     if p.dispatched("wy", path):
@@ -4617,11 +4720,13 @@ def chunk_kda_det_bwd(
     refused with ``ValueError``, as is a workspace of the other mode.
 
     In-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel=True``, the forward's raw ``q`` / ``k``): ``dq`` / ``dk`` are
-    the gradients of the raw rows.  The first q / k reader of the path writes the normalized rows into per-call
-    backward-only ``qn`` / ``kn`` (bitwise the forward's: the same raw rows and the saved ``qk_rstd``; the replay
-    computes the rstd again into a per-call tensor), every later reader binds them, and the l2n GLM intra program
-    applies the pullback ``r * (dq_hat - y * <dq_hat, y>)`` (``y = x * r`` in FP32) before its one BF16 store.  A
-    saved set of the other mode is refused.
+    the gradients of the raw rows.  The first q / k reader of the path writes the normalized rows into backward-only
+    ``qn`` / ``kn`` (bitwise the forward's: the same raw rows and the saved ``qk_rstd``; the replay computes the rstd
+    again into a per-call tensor): on a saved-set path in the arena's ``do_int`` / ``dv2`` bytes, ``dv2`` then on the
+    bytes of ``dq`` / ``dk`` (two halves of one tensor) until GLM intra writes them (:func:`_l2n_rows_in_arena`), so
+    that backward allocates nothing for them; else per call.  Every later reader binds them, and the l2n GLM intra
+    program applies the pullback ``r * (dq_hat - y * <dq_hat, y>)`` (``y = x * r`` in FP32) before its one BF16
+    store.  A saved set of the other mode is refused.
     """
     gate = _gate_mode(use_gate_in_kernel)
     l2n = _l2n_mode(use_qk_l2norm_in_kernel)
@@ -4817,29 +4922,64 @@ def _backward(
     if replay:
         mode = {"bwd": "replay", "bwd_tape": "replay_tape"}[mode]
     packing = ws._packing(doc_lengths)
-    dq = _alloc((S, H, D), torch.bfloat16, ws.device)
-    dk = _alloc((S, H, D), torch.bfloat16, ws.device)
-    dv = _alloc((S, H, D), torch.bfloat16, ws.device)
-    # the gate's gradient: FP32 dg, or in raw mode the raw gate's BF16 gradient (contiguous token rows)
-    dg = _alloc((S, H, D), torch.float32 if gp is None else torch.bfloat16, ws.device)
-    dbeta = _alloc((S, H), torch.bfloat16, ws.device)
+    # the in-kernel Q/K L2 norm's qn / kn in the arena of a saved-set path (:func:`_l2n_rows_in_arena`): dq / dk are
+    # then the two halves of one tensor, whose bytes carry dv2 until GLM intra / the pullback write them
+    l2n = ws.l2n
+    rows_in_arena = False
+    if l2n != "off" and packing is None:
+        key = ("rows", path, mode, ws.tail_passes)
+        rows_in_arena = ws._l2n_host_cache.get(key)
+        if rows_in_arena is None:
+            rows_in_arena = ws._l2n_host_cache[key] = _l2n_rows_in_arena(
+                p, path, vars(ws.views(mode)), ws.tail_passes
+            )
+    # the fused mode's whole-problem calls launch the prep before allocating dv / dg / dbeta (and the raw partials),
+    # which no prep record binds (:func:`_l2n_prep_first`): the first backward kernel is queued earlier
+    late = False
+    if l2n == "fused" and packing is None:
+        prep_key = ("prep_first", path, replay)
+        late = ws._l2n_host_cache.get(prep_key)
+        if late is None:
+            late = ws._l2n_host_cache[prep_key] = _l2n_prep_first(p, path, replay)
+    if rows_in_arena:
+        dqk = _alloc((2, S, H, D), torch.bfloat16, ws.device)
+        dq, dk = dqk.unbind(0)
+    else:
+        dq = _alloc((S, H, D), torch.bfloat16, ws.device)
+        dk = _alloc((S, H, D), torch.bfloat16, ws.device)
+    dv = dg = dbeta = None
     # raw mode: the parameter gradients and their per-chunk (hi, lo) partials, per call and outside the arena (GLM
     # intra writes the partials of the real chunks only; param_finalize reads those alone)
     raw_out: dict[str, torch.Tensor] = {}
-    if gp is not None:
-        raw_out = {
-            "dg_raw": dg,
-            "dA_part": _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
-            "db_part": _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
-            "dA_log": _alloc((H,), torch.float32, ws.device),
-            "ddt_bias": _alloc((H * D,), torch.float32, ws.device),
-        }
+
+    def outputs() -> dict[str, Any]:
+        """Allocate dv, dg (the gate's gradient: FP32 dg, or in raw mode the raw gate's BF16 gradient, contiguous
+        token rows), dbeta and the raw mode's outputs; their entries of the whole problem's launch values."""
+        nonlocal dv, dg, dbeta
+        dv = _alloc((S, H, D), torch.bfloat16, ws.device)
+        dg = _alloc(
+            (S, H, D), torch.float32 if gp is None else torch.bfloat16, ws.device
+        )
+        dbeta = _alloc((S, H), torch.bfloat16, ws.device)
+        if gp is None:
+            return {"dv": dv, "dg": dg, "dbeta": dbeta}
+        raw_out.update(
+            dg_raw=dg,
+            dA_part=_alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
+            db_part=_alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
+            dA_log=_alloc((H,), torch.float32, ws.device),
+            ddt_bias=_alloc((H * D,), torch.float32, ws.device),
+        )
+        return {"dv": dv, "dg": None, "dbeta": dbeta, **gate_values()}
 
     def gate_values(c0: int = 0) -> dict[str, Any] | None:
         """The raw mode's operands and outputs of a launch sequence whose chunks start at the pack's chunk ``c0``
-        (a group's first chunk): the partials as views offset by it, like the per-chunk rows of ``gk``."""
+        (a group's first chunk): the partials as views offset by it, like the per-chunk rows of ``gk``; before
+        :func:`outputs` (a late call's prep launch) the operands alone."""
         if gp is None:
             return None
+        if not raw_out:
+            return _raw_values(g, gp)
         return {
             **_raw_values(g, gp),
             **raw_out,
@@ -4847,14 +4987,31 @@ def _backward(
             "db_part": raw_out["db_part"][c0:],
         }
 
-    # the in-kernel Q/K L2 norm: per-call backward-only qn / kn written by the path's first q / k reader from the raw
-    # rows and the saved rstd (the replay computes the rstd again into a per-call tensor); in the fallback route the
-    # token-local apply / normalize runs once for the whole problem before the groups
-    l2n = ws.l2n
+    if not late:
+        outputs()
+    # the in-kernel Q/K L2 norm: backward-only qn / kn written by the path's first q / k reader from the raw rows and
+    # the saved rstd (the replay computes the rstd again into a per-call tensor): on the arena's do_int / dv2 bytes
+    # with dv2 on the dq / dk bytes where rows_in_arena holds, else per call; in the fallback route the token-local
+    # apply / normalize runs once for the whole problem before the groups
     lv = None
     if l2n != "off":
-        qn = _alloc((S, H, D), torch.bfloat16, ws.device)
-        kn = _alloc((S, H, D), torch.bfloat16, ws.device)
+        if rows_in_arena:
+            # qn / kn: views of the arena's do_int / dv2 rows; dv2: the contiguous layout shape on the dq / dk bytes
+            rows = ws._l2n_host_cache.get(("views", mode))
+            if rows is None:
+                b_rows = ws.views(mode)
+                shape = tuple(b_rows.dv2.shape)
+                rows = ws._l2n_host_cache[("views", mode)] = (
+                    b_rows.do_int[:S],
+                    b_rows.dv2[:S],
+                    shape,
+                    _contiguous_strides(shape),
+                )
+            qn, kn, dv2_shape, dv2_strides = rows
+            dv2 = dqk.as_strided(dv2_shape, dv2_strides)
+        else:
+            qn = _alloc((S, H, D), torch.bfloat16, ws.device)
+            kn = _alloc((S, H, D), torch.bfloat16, ws.device)
         if replay:
             qk_rstd, read_rstd, write_rstd = (
                 _alloc((2, S, H), torch.float32, ws.device),
@@ -4873,6 +5030,8 @@ def _backward(
             write_rstd=write_rstd,
             write_qkn=1,
         )
+        if rows_in_arena:
+            lv["dv2"] = dv2
         if p.dispatched("qk_apply", path) and not replay:
             ws.run("qk_apply", {**lv, "num_heads": H}, path=path)
         elif p.dispatched("qk_l2norm", path):
@@ -4932,6 +5091,7 @@ def _backward(
             u=u_saved,
             gate_values=gate_values(),
             l2n_values=lv,
+            late_values=outputs if late else None,
             **common,
         )
         if gp is not None:
