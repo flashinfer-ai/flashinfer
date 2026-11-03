@@ -30,8 +30,11 @@ accumulation into a nonzero ``.grad``.  The checkpoint hand-off's intra twins (`
 records against their intra records, no rule selecting them, and their rows against the light prep's on a GPU.  The
 tape path's w-only WY twin (``cake_jit.TAPE_TWINS``): its record against its WY record, no rule selecting it, the
 rule that launches it, and on a GPU its ``w`` and the tape backward's gradients against the WY record's at every head
-count.  The mode keyword, the facade and the legacy names are covered by ``test_cake_kda_train_api.py``; the hand-off
-itself by ``test_cake_kda_train_handoff.py``.
+count.  The in-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel``): its records are the deterministic package's, record
+for record, and the fused gradient's l2n class copies the deterministic records (``L2N_DQKG``), so an l2n mode runs
+the deterministic pair on every row; its host and device rows are in ``test_cake_kda_train_l2n.py``.  The mode
+keyword, the facade and the legacy names are covered by ``test_cake_kda_train_api.py``; the hand-off itself by
+``test_cake_kda_train_handoff.py``.
 """
 
 import contextlib
@@ -229,7 +232,7 @@ WU_SEG_SAVED_ARCHES = ("sm_103a", "sm_107a")
 WU_SEG_MIN_CHAINS = 32
 # the table stage is optional too: on the forward and the replay of the segmented route up to 256 documents the
 # intra program writes the tables and no table record is selected; the gate epilogue launches on sm_100a alone (and
-# never in raw mode), the parameter finalize in raw mode alone
+# never in raw mode or an in-kernel Q/K L2 norm mode), the parameter finalize in raw mode alone
 OPTIONAL_STAGES = (
     "table",
     "seg_table",
@@ -241,6 +244,10 @@ OPTIONAL_STAGES = (
     "dav",
     "gate_epilogue",
     "param_finalize",
+    # the in-kernel Q/K L2 norm's token-local stages (#7817): dispatched in the fallback mode alone
+    "qk_l2norm",
+    "qk_apply",
+    "qk_pullback",
 )
 # The stages of each path, in the registry's order (the forward's; the backward's with the tables, the intra
 # program on the replay path and seg_carry on the segmented route).
@@ -404,16 +411,19 @@ GRID_KINDS = (
     "segments_heads",
     "head_chunk_blocks",
     "heads",
+    "tokens",  # the in-kernel Q/K L2 norm's token-local fallback programs (#7817)
 )
 # the records delivered for a subset of the architectures (every other record ships on all three, the two-level
 # carry and the no-kb prep among them): the gate epilogue and its unfused GLM intra programs on sm_100a, the fused
 # ones on sm_103a (glm_intra_v14, glm_intra_v22) and sm_107a (glm_intra_v18, glm_intra_v23), and the S1 fused
 # gradient's builds with the L2 hints off on sm_107a (its rows from 16 heads).  The deterministic copies keep the
 # deterministic package's architectures (the same builds; dqkg_davq / dqkg_int_davq share their programs with the
-# raw class, so they ship on the three though their g rules launch them on sm_100a / sm_103a alone), and the raw
-# class's two fused gradient builds with the L2 hints off ship on sm_107a alone, as the deterministic package's do.
-# The raw gate's parameter-gradient pair: the R1c pairs on sm_100a / sm_103a (8 replicas on sm_100a alone), the
-# deterministic pair (glm_intra_raw, param_finalize) narrowed to sm_107a.
+# raw class, so they ship on the three though their g rules launch them on sm_100a / sm_103a alone; the in-kernel
+# Q/K L2 norm's sm_103a forms fwd_intra_v37_l2n and glm_intra_v30_l2n on sm_103a alone, and its replay prep's
+# saved-rstd twin on sm_100a / sm_103a), and the raw and l2n classes' two fused gradient builds with the L2 hints off
+# ship on sm_107a alone, as the deterministic package's do.  The raw gate's parameter-gradient pair: the R1c pairs on
+# sm_100a / sm_103a (8 replicas on sm_100a alone), the deterministic pair (glm_intra_raw, param_finalize) narrowed to
+# sm_107a.
 RECORD_ARCHES = {
     "glm_intra": ("sm_100a",),
     "glm_intra_v14": ("sm_103a",),
@@ -432,41 +442,37 @@ RECORD_ARCHES = {
     "param_finalize_cast": ("sm_100a", "sm_103a"),
     "glm_intra_v20c_r8": ("sm_100a",),
     "param_finalize_cast_r8": ("sm_100a",),
+    "fwd_intra_v37_l2n": ("sm_103a",),
+    "glm_intra_v30_l2n": ("sm_103a",),
+    "bwd_prep_g8_replay_saved_l2n": ("sm_100a", "sm_103a"),
+    "dqkg_davq_nohint_l2n": ("sm_107a",),
+    "dqkg_int_davq_nohint_l2n": ("sm_107a",),
 }
 # The deterministic package's records no cell of this package launches: the sm_107a rows from 16 heads (the only
-# rows of the builds with the L2 hints off) run the S1 pair on every backward path of the g mode (their programs ship
-# as the raw class's, RAW_DQKG), and the in-kernel Q/K L2 norm's records (#7817: its fused class, 7 g records with
-# their 7 raw twins, the sm_103a forward intra and GLM intra forms and the replay prep's saved-rstd twin, the 2 GLM
-# intra capture forms and the 3 programs of its fallback route) run only under use_qk_l2norm_in_kernel=True, which
-# this package refuses.
-DET_RECORDS_NOT_LAUNCHED = frozenset(
-    (
-        "dqkg_davq_nohint",
-        "dqkg_int_davq_nohint",
-        "fwd_intra_l2n",
-        "fwd_intra_v14_l2n",
-        "fwd_intra_v37_l2n",
-        "bwd_prep_g8_l2n",
-        "bwd_prep_g8_replay_l2n",
-        "bwd_prep_g8_replay_saved_l2n",  # the replay prep's saved-rstd twin
-        "bwd_prep_g8_noqg_l2n",
-        "bwd_prep_g8_noqg_nokb_l2n",
-        "glm_intra_l2n",
-        "glm_intra_v30_l2n",  # the fused class's sm_103a GLM intra form
-        "fwd_intra_raw_l2n",
-        "fwd_intra_v14_raw_l2n",
-        "bwd_prep_g8_raw_l2n",
-        "bwd_prep_g8_replay_raw_l2n",
-        "bwd_prep_g8_noqg_raw_l2n",
-        "bwd_prep_g8_noqg_nokb_raw_l2n",
-        "glm_intra_raw_l2n",
-        "glm_intra_l2n_capture",
-        "glm_intra_raw_l2n_capture",
+# rows of the builds with the L2 hints off) run the S1 pair on every backward path of the g mode with the in-kernel
+# Q/K L2 norm off (their programs ship as the raw and l2n classes', RAW_DQKG and L2N_DQKG).  The in-kernel Q/K L2
+# norm's records (#7817: its fused class, 7 g records with their 7 raw twins, the sm_103a forward intra and GLM intra
+# forms and the replay prep's saved-rstd twin, the 2 GLM intra capture forms and the 3 programs of its fallback route)
+# are copied, record for record.
+DET_RECORDS_NOT_LAUNCHED = frozenset(("dqkg_davq_nohint", "dqkg_int_davq_nohint"))
+# The in-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel``): the modes, and the stages that select within the class of
+# the call's mode (a record's ``l2n``, ``["off"]`` when absent) -- the deterministic package's and the fused gradient,
+# whose S1 records serve ``"off"`` alone (no GLM intra program of an l2n mode adds the ``q * dq`` term).
+L2N_MODES = ("off", "fused", "fallback")
+L2N_ON = ("fused", "fallback")
+L2N_STAGES = frozenset(
+    {
+        "fwd_intra",
+        "bwd_prep",
+        "glm_intra",
         "qk_l2norm",
-        "qk_l2norm_apply",
+        "qk_apply",
         "qk_pullback",
-    )
+        "dqkg",
+    }
 )
+# The token-local stages of the fallback route: dispatched in the "fallback" mode alone.
+L2N_FALLBACK_STAGES = ("qk_l2norm", "qk_apply", "qk_pullback")
 # The raw forget-gate mode (``use_gate_in_kernel=True``): the stages whose records come in a ``g`` and a ``raw`` class
 # (a record's ``gate``, ``"g"`` when absent) -- the deterministic package's and the fused gradient, whose S1 records
 # serve the activated gate alone -- and the fused gradient's raw class, record -> the deterministic record it copies
@@ -485,6 +491,21 @@ RAW_DQKG = {
 }
 # the raw-class fused gradient records that share their program with a g-class record of the same build
 RAW_DQKG_SHARED = ("dqkg_raw", "dqkg_int_raw", "dqkg_davq_raw", "dqkg_int_davq_raw")
+# The fused gradient's l2n class (g mode, ``l2n`` ``["fused", "fallback"]``), record -> the deterministic record it
+# copies (rule, plan and program): an l2n mode runs the deterministic pair on every row.  Each shares its program
+# with the raw-class record of the same deterministic record (L2N_DQKG_RAW), which serves every l2n mode.
+L2N_DQKG = {
+    "dqkg_l2n": "dqkg",
+    "dqkg_int_l2n": "dqkg_int",
+    "dqkg_davq_l2n": "dqkg_davq",
+    "dqkg_int_davq_l2n": "dqkg_int_davq",
+    "dqkg_davq_nohint_l2n": "dqkg_davq_nohint",
+    "dqkg_int_davq_nohint_l2n": "dqkg_int_davq_nohint",
+}
+L2N_DQKG_RAW = {name: f"{det}_raw" for name, det in L2N_DQKG.items()}
+# The deterministic record of every copied record (the fused gradient's raw and l2n classes: their RAW_DQKG /
+# L2N_DQKG record; every other copy: its own name).
+DET_SOURCE = {**RAW_DQKG, **L2N_DQKG}
 # The checkpoint hand-off's intra twins, intra record -> twin: new programs that also write every gk row and the
 # internal beta (``beta_int``); no path selects them, the hand-off's recompute launches one in place of its record.
 HANDOFF_TWINS = {"fwd_intra": "fwd_intra_v20", "fwd_intra_v14": "fwd_intra_v19"}
@@ -525,7 +546,7 @@ def _r1c_glm(arch: str, h: int) -> str | None:
 
 
 # The registry's size: the deterministic package's 97 records, less those, plus the seven S1 records, the hand-off
-# twins, the tape WY twin, the fused gradient's raw class and the R1c pairs.
+# twins, the tape WY twin, the fused gradient's raw and l2n classes and the R1c pairs.
 MODULE_COUNT = (
     97
     - len(DET_RECORDS_NOT_LAUNCHED)
@@ -534,6 +555,7 @@ MODULE_COUNT = (
     + len(TAPE_WY_RECORDS)
     + len(RAW_DQKG)
     + len(R1C_RECORDS)
+    + len(L2N_DQKG)
 )
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
@@ -652,13 +674,17 @@ L2N_UNFUSED = {"kind": "l2n_in", "modes": ["off", "fallback"]}
 
 
 def test_registry_records_are_well_formed() -> None:
-    # the deterministic package's records (their own copies) less the deterministic forms no g-mode cell of this
-    # package launches, plus the S1 records, the hand-off twins, the tape WY twin, the fused gradient's raw class and
-    # the R1c pairs; six library pairs are shared (see the twins below)
+    # the deterministic package's records (their own copies, the in-kernel Q/K L2 norm's among them) less the
+    # deterministic forms no g-mode cell of this package launches, plus the S1 records, the hand-off twins, the tape
+    # WY twin, the fused gradient's raw and l2n classes and the R1c pairs; twelve libraries are shared (see the twins
+    # below): the two pairs of the deterministic package, the four raw-class fused gradient records with their
+    # g-class records and the six l2n-class ones with their raw-class records
     assert cake_jit.HANDOFF_TWINS == HANDOFF_TWINS
     assert cake_jit.TAPE_TWINS == TAPE_TWINS
     assert cake_jit.R1C_PAIRS == R1C_PAIRS and cake_jit.R1C_STRIPES == R1C_STRIPES
     assert cake_jit.GATE_STAGES == GATE_STAGES and tuple(cake_jit.GATES) == GATES
+    assert tuple(cake_jit.L2N_MODES) == L2N_MODES
+    assert frozenset(cake_jit.L2N_STAGES) == L2N_STAGES
     assert (
         set(cake_jit.MODULES)
         == (set(det_jit.MODULES) - DET_RECORDS_NOT_LAUNCHED)
@@ -667,12 +693,13 @@ def test_registry_records_are_well_formed() -> None:
         | TAPE_WY_RECORDS
         | set(RAW_DQKG)
         | R1C_RECORDS
+        | set(L2N_DQKG)
     )
-    assert len(cake_jit.MODULES) == MODULE_COUNT == 93
+    assert len(cake_jit.MODULES) == MODULE_COUNT == 121
     assert (
         len({r["library"] for r in cake_jit.MODULES.values()})
-        == (MODULE_COUNT - 2 - len(RAW_DQKG_SHARED))
-        == 87
+        == (MODULE_COUNT - 2 - len(RAW_DQKG_SHARED) - len(L2N_DQKG))
+        == 109
     )
     assert set(cake_jit.S1_RECORDS) == S1_RECORDS and len(cake_jit.S1_RECORDS) == 7
     assert tuple(cake_jit.PATHS) == PATHS
@@ -707,6 +734,9 @@ def test_registry_records_are_well_formed() -> None:
             if record["variant"] is None
             else f"{record['stage']}_{record['variant']}"
         )
+        # the one name outside stage[_variant]: the Q/K L2 norm fallback's apply program (#7817), stage qk_apply
+        if name == "qk_l2norm_apply":
+            expected_name = name if record["stage"] == "qk_apply" else expected_name
         assert name == expected_name, name
         # every record ships on all three architectures but the few of RECORD_ARCHES, each on an ordered subset
         assert list(record["arches"]) == list(RECORD_ARCHES.get(name, ARCHES)), name
@@ -762,30 +792,63 @@ def test_registry_records_are_well_formed() -> None:
         assert twins == [] or {name, *twins} in (
             {"fwdh_v3", "fwdh_p3"},
             {"wy_bwd", "wy_fwd_rows"},
-            *({raw, RAW_DQKG[raw]} for raw in RAW_DQKG_SHARED),
+            *(
+                {raw, RAW_DQKG[raw], l2n}
+                for l2n, raw in L2N_DQKG_RAW.items()
+                if raw in RAW_DQKG_SHARED
+            ),
+            *(
+                {raw, l2n}
+                for l2n, raw in L2N_DQKG_RAW.items()
+                if raw not in RAW_DQKG_SHARED
+            ),
         ), name
         # only a gate stage's records name a class
         assert record.get("gate", "g") in (
             GATES if record["stage"] in GATE_STAGES else ("g",)
         ), name
         assert record["stage"] in GATE_STAGES or "gate" not in record, name
+        # only an l2n stage's records name the modes they serve, a nonempty ordered subset of L2N_MODES
+        if "l2n" in record:
+            assert record["stage"] in L2N_STAGES, name
+            modes = list(record["l2n"])
+            assert modes and len(set(modes)) == len(modes), name
+            assert set(modes) <= set(L2N_MODES), name
     assert stages == set(cake_jit.STAGES)
     for stage in cake_jit.STAGES:
         for gate in GATES if stage in GATE_STAGES else ("g",):
             names = cake_jit.records_of_stage(stage, gate)
-            kinds = [cake_jit.MODULES[n]["select_rule"]["kind"] for n in names]
             if not names:
                 # only an optional stage leaves a gate class empty (the gate epilogue's raw class, the finalize's g)
                 assert stage in OPTIONAL_STAGES and stage in GATE_STAGES, (stage, gate)
-            elif len(names) == 1 and stage in OPTIONAL_STAGES:
-                assert kinds[0] not in ("always", "otherwise"), (stage, gate)
-            elif len(names) == 1:
-                assert kinds == ["always"], (stage, gate)
-            else:
-                assert "always" not in kinds and kinds.count("otherwise") <= 1, (
-                    stage,
-                    gate,
-                )
+            # the single-record rules hold per in-kernel Q/K L2 norm mode on the l2n stages (a record serves the
+            # modes its ``l2n`` lists, ``["off"]`` when absent), per class on every other stage (whose records serve
+            # every mode)
+            for mode in L2N_MODES if stage in L2N_STAGES else ("off",):
+                mnames = [
+                    n
+                    for n in names
+                    if stage not in L2N_STAGES
+                    or mode in cake_jit.MODULES[n].get("l2n", ["off"])
+                ]
+                kinds = [cake_jit.MODULES[n]["select_rule"]["kind"] for n in mnames]
+                where = (stage, gate, mode)
+                if not mnames:  # the fallback route's stages serve no other mode
+                    assert stage in OPTIONAL_STAGES, where
+                elif len(mnames) == 1 and stage in OPTIONAL_STAGES:
+                    assert kinds[0] not in ("always", "otherwise"), where
+                elif len(mnames) == 1:
+                    assert kinds == ["always"], where
+                else:
+                    assert "always" not in kinds and kinds.count("otherwise") <= 1, (
+                        where
+                    )
+            # every non-optional l2n stage has a record of every mode in every gate class it has
+            if stage in L2N_STAGES and stage not in OPTIONAL_STAGES and names:
+                for mode in L2N_MODES:
+                    assert any(
+                        mode in cake_jit.MODULES[n].get("l2n", ["off"]) for n in names
+                    ), (stage, gate, mode)
     for name in cake_jit.MODULES:
         assert cake_jit.launches(name) == (2 if name in TWO_PASS_RECORDS else 1), name
     # the segmented records read the route (segment_plan's: the head bound, or a plan head of the architecture);
@@ -813,8 +876,8 @@ def test_registry_records_are_well_formed() -> None:
         "kind": "all_of",
         "rules": [seg_rule, docs_rule],
     }
-    # the deterministic package's fused Q/K L2 norm programs take its forward rows (#7817); this package's l2n is
-    # "off", which the leaf admits
+    # the deterministic package's fused Q/K L2 norm programs take its forward rows (#7817, copied here): the leaf
+    # keeps the plain record in the unfused modes and on the replay
     assert cake_jit.MODULES["fwd_intra"]["select_rule"] == {
         "kind": "all_of",
         "rules": [
@@ -1056,7 +1119,11 @@ def test_registry_records_are_well_formed() -> None:
         "arches": unfused,
     }
     glm_records = set(cake_jit.records_of_stage("glm_intra"))
-    assert glm_records == set(DET_GLM.values()) | set(S1_GLM.values())
+    # and the deterministic package's GLM intra programs of the in-kernel Q/K L2 norm (fused, fallback capture)
+    assert glm_records == set(DET_GLM.values()) | set(S1_GLM.values()) | {
+        "glm_intra_l2n",
+        "glm_intra_l2n_capture",
+    }
     for name in (*sorted(glm_records), "gate_epilogue"):
         assert cake_jit.MODULES[name]["grid_rule"] == {"kind": "chunks", "x_factor": 1}
     assert set(cake_jit.records_of_stage("dqkg")) >= set(S1_DQKG.values()) | {
@@ -1393,24 +1460,28 @@ def _r1c_narrowed(name: str, det_record: dict) -> dict:
 def test_the_raw_class_is_the_deterministic_raw_class() -> None:
     """Raw mode is the deterministic package's, record for record, but for the parameter-gradient reduce: every
     raw-class record of the registry outside the R1c pairs is the deterministic record of its name (a fused gradient
-    record: of its ``RAW_DQKG`` record, with the class and its own variant) under the copied library, every
-    deterministic raw-class record has its copy (but the in-kernel Q/K L2 norm's, ``DET_RECORDS_NOT_LAUNCHED``), the
-    deterministic parameter-gradient pair (``R1C_NARROWED``) differs only in its architectures and rule, narrowed to
-    ``sm_107a``, and the gate epilogue keeps the deterministic record's g class."""
+    record: of its ``RAW_DQKG`` record, with the class, its own variant and every in-kernel Q/K L2 norm mode) under
+    the copied library, every deterministic raw-class record has its copy (the in-kernel Q/K L2 norm's among them,
+    with the deterministic record's ``l2n``), the deterministic parameter-gradient pair (``R1C_NARROWED``) differs
+    only in its architectures and rule, narrowed to ``sm_107a``, and the gate epilogue keeps the deterministic
+    record's g class."""
     renamed = {"library", "kernel_symbol"}
-    # the deterministic record's ``l2n`` (the in-kernel Q/K L2 norm modes it serves, #7817) is not copied: this
-    # package runs l2n "off" alone, which every copied record serves
-    det_only = {"l2n"}
     raw = {name for name, rec in cake_jit.MODULES.items() if rec.get("gate") == "raw"}
-    # the deterministic raw class less its in-kernel Q/K L2 norm records (#7817), which this package does not ship
     det_raw = {
         name for name, rec in det_jit.MODULES.items() if rec.get("gate") == "raw"
-    } - DET_RECORDS_NOT_LAUNCHED
+    }
+    assert not det_raw & DET_RECORDS_NOT_LAUNCHED
     assert raw == det_raw | set(RAW_DQKG) | R1C_RECORDS
     assert not det_raw & R1C_RECORDS and set(R1C_NARROWED) <= det_raw
     assert set(RAW_DQKG.values()) <= {
         name for name, rec in det_jit.MODULES.items() if rec["stage"] == "dqkg"
     }
+    # the deterministic raw class's in-kernel Q/K L2 norm records are copied too (#7817)
+    assert {
+        name
+        for name in det_raw
+        if "off" not in det_jit.MODULES[name].get("l2n", ["off"])
+    } <= raw
     checked = 0
     for name in sorted((raw - R1C_RECORDS) | {"gate_epilogue"}):
         record, twin = cake_jit.MODULES[name], det_jit.MODULES[RAW_DQKG.get(name, name)]
@@ -1418,12 +1489,13 @@ def test_the_raw_class_is_the_deterministic_raw_class() -> None:
             "cake_kda_det_train_", "cake_kda_train_"
         ), name
         assert record["kernel_symbol"] == f"kernel_{record['library']}", name
-        assert "off" in twin.get("l2n", ["off"]), name
-        expected = {
-            key: value for key, value in twin.items() if key not in renamed | det_only
-        }
+        expected = {key: value for key, value in twin.items() if key not in renamed}
         if name in RAW_DQKG:
-            expected.update(variant=name.removeprefix("dqkg_"), gate="raw")
+            # the fused gradient is an l2n stage here: its raw class serves every mode
+            assert "l2n" not in twin, name
+            expected.update(
+                variant=name.removeprefix("dqkg_"), gate="raw", l2n=list(L2N_MODES)
+            )
         if name in R1C_NARROWED:
             expected.update(_r1c_narrowed(name, twin))
         assert {
@@ -1550,7 +1622,77 @@ def test_r1c_records_are_the_raw_glm_plan_on_fp64_accumulators(monkeypatch) -> N
             cake_jit.run_module(name, missing, grid=(7, 8, 9), device_index=0)
 
 
-# the deterministic memory report's in-kernel Q/K L2 norm fields (#7817): the mode, then its byte counts
+def test_the_l2n_class_is_the_deterministic_l2n_class() -> None:
+    """The in-kernel Q/K L2 norm is the deterministic package's, record for record: every deterministic record
+    that serves an l2n mode (its fused class, the sm_103a forward intra form, the GLM intra capture forms, the
+    fallback route's programs and the plain records the l2n route keeps) is copied with its ``l2n`` under the copied
+    library; the fused gradient's l2n class (``L2N_DQKG``) is the deterministic ``dqkg`` records' rules, plans and
+    programs in the g class, serving ``"fused"`` / ``"fallback"``, each sharing its program with the raw-class record
+    of the same deterministic record, which serves every mode.  The S1 records, the R1c records, the hand-off twins
+    and the tape WY twin serve the flag-off mode alone, and so do the narrowed g-class copies of the pair stages: no ND-only program
+    runs in an l2n mode."""
+    renamed = {"library", "kernel_symbol"}
+
+    def serves(record: dict, mode: str) -> bool:
+        return mode in record.get("l2n", ["off"])
+
+    det_l2n = {
+        name
+        for name, rec in det_jit.MODULES.items()
+        if rec["stage"] in L2N_STAGES
+        and (serves(rec, "fused") or serves(rec, "fallback"))
+    }
+    # the deterministic l2n records: the 7 g + 7 raw fused ones, the sm_103a form, the 2 capture forms, the 3
+    # fallback programs and the 4 plain records the fused route keeps (fwd_intra / bwd_prep_g8_replay, g and raw)
+    det_l2n_only = {n for n in det_l2n if not serves(det_jit.MODULES[n], "off")}
+    assert len(det_l2n_only) == 20, sorted(det_l2n_only)
+    assert det_l2n <= set(cake_jit.MODULES)
+    compared = 0
+    for name in sorted(det_l2n):
+        if det_jit.MODULES[name]["stage"] in ("dqkg", "glm_intra") and serves(
+            det_jit.MODULES[name], "off"
+        ):
+            continue  # a pair-stage record serving the flag-off mode too: none in this registry
+        record, twin = cake_jit.MODULES[name], det_jit.MODULES[name]
+        assert record["library"] == twin["library"].replace(
+            "cake_kda_det_train_", "cake_kda_train_"
+        ), name
+        assert {k: v for k, v in record.items() if k not in renamed} == {
+            k: v for k, v in twin.items() if k not in renamed
+        }, name
+        compared += 1
+    assert compared == len(det_l2n) > len(det_l2n_only)
+    # the fused gradient's l2n class
+    assert len(L2N_DQKG) == 6
+    for name, det_name in L2N_DQKG.items():
+        record, twin = cake_jit.MODULES[name], det_jit.MODULES[det_name]
+        raw = cake_jit.MODULES[L2N_DQKG_RAW[name]]
+        assert RAW_DQKG[L2N_DQKG_RAW[name]] == det_name, name
+        assert record["stage"] == "dqkg" and record.get("gate", "g") == "g", name
+        assert record["l2n"] == list(L2N_ON), name
+        assert raw["gate"] == "raw" and raw["l2n"] == list(L2N_MODES), name
+        assert (
+            record["library"]
+            == raw["library"]
+            == twin["library"].replace("cake_kda_det_train_", "cake_kda_train_")
+        ), name
+        expected = {k: v for k, v in twin.items() if k not in renamed}
+        expected.update(variant=name.removeprefix("dqkg_"), l2n=list(L2N_ON))
+        assert {k: v for k, v in record.items() if k not in renamed} == expected, name
+    # no ND-only program serves an l2n mode
+    nd_only = set(S1_RECORDS) | R1C_RECORDS | TWIN_RECORDS | TAPE_WY_RECORDS
+    for name in sorted(nd_only):
+        assert "l2n" not in cake_jit.MODULES[name], name
+    for stage in ("dqkg", "glm_intra"):
+        for name in cake_jit.records_of_stage(stage):
+            record = cake_jit.MODULES[name]
+            if serves(record, "off"):
+                assert record.get("l2n", ["off"]) == ["off"], name
+            else:
+                assert name in det_l2n or name in L2N_DQKG, name
+
+
+# the memory reports' in-kernel Q/K L2 norm fields (#7817): the mode, then its byte counts
 DET_L2N_REPORT_KEYS = (
     "l2n",
     "saved_qk_rstd",
@@ -1658,8 +1800,14 @@ def test_records_of_stage_filters_the_gate_stages_by_class() -> None:
         else:
             assert g == raw, stage
     assert set(cake_jit.records_of_stage("dqkg", "raw")) == set(RAW_DQKG)
+    # the fused gradient's l2n class is of the g class (the raw class serves every in-kernel Q/K L2 norm mode)
+    assert set(L2N_DQKG) <= set(cake_jit.records_of_stage("dqkg"))
+    # the raw GLM intra program of each in-kernel Q/K L2 norm mode (off, the fallback's capture form, fused) and the
+    # R1c GLM intra programs (off)
     assert cake_jit.records_of_stage("glm_intra", "raw") == (
         "glm_intra_raw",
+        "glm_intra_raw_l2n_capture",
+        "glm_intra_raw_l2n",
         "glm_intra_v20c",
         "glm_intra_v20c_r8",
     )
@@ -1806,12 +1954,10 @@ def test_raw_plans_are_the_deterministic_raw_plans() -> None:
                 tag = (lengths, heads, arch, save_mode)
                 nd = cake_backend.memory_report(S, N, heads, save_mode, gate="raw", **q)
                 det = det_backend.memory_report(S, N, heads, save_mode, gate="raw", **q)
-                # the deterministic report's in-kernel Q/K L2 norm fields (#7817) at their off values: this package
-                # runs without it
+                # the in-kernel Q/K L2 norm fields (#7817) at their off values in both reports (the flag off)
                 assert det["l2n"] == "off" and not any(
                     det[key] for key in DET_L2N_REPORT_KEYS[1:]
                 ), tag
-                det = {k: v for k, v in det.items() if k not in DET_L2N_REPORT_KEYS}
                 # the R1c rows: param_acc in place of the per-call partials, in both backward totals, and held by
                 # the backward workspace across its forwards
                 moved = (
@@ -2199,10 +2345,10 @@ def test_select_record_checks_its_inputs() -> None:
         cake_jit.select_record("dqkg", **kwargs, arch="sm_100a", path="fwd")
 
 
-def test_the_l2n_leaf_admits_exactly_when_off_is_listed() -> None:
-    """The package refuses the in-kernel Q/K L2 norm at every entry, so an ``l2n_in`` leaf of a copied rule reads
-    l2n ``"off"``: it admits exactly when ``"off"`` is one of its modes, alone or under ``all_of`` / ``any_of``,
-    whatever the other scalars; an unknown kind still raises."""
+def test_the_l2n_leaf_admits_exactly_when_the_calls_mode_is_listed() -> None:
+    """An ``l2n_in`` leaf of a copied rule reads the call's in-kernel Q/K L2 norm mode (``l2n``, ``"off"`` when the
+    caller passes none, as the flag-off selection always did): it admits exactly when that mode is one of its modes,
+    alone or under ``all_of`` / ``any_of``, whatever the other scalars; an unknown kind still raises."""
     scalars = dict(
         ctas=64,
         num_seqs=2,
@@ -2212,26 +2358,39 @@ def test_the_l2n_leaf_admits_exactly_when_off_is_listed() -> None:
         arch="sm_100a",
         path="fwd",
     )
-    modes = ("off", "fallback", "fused")
-    for n in range(len(modes) + 1):
-        for listed in itertools.combinations(modes, n):
+    checked = 0
+    for n in range(len(L2N_MODES) + 1):
+        for listed in itertools.combinations(L2N_MODES, n):
             leaf = {"kind": "l2n_in", "modes": list(listed)}
-            expected = "off" in listed
-            assert cake_jit._admits(leaf, **scalars) is expected, listed
-            for path in PATHS:
+            # the default is the flag-off mode
+            assert cake_jit._admits(leaf, **scalars) is ("off" in listed), listed
+            for mode in L2N_MODES:
+                expected = mode in listed
+                assert cake_jit._admits(leaf, **scalars, l2n=mode) is expected, (
+                    listed,
+                    mode,
+                )
+                for path in PATHS:
+                    assert (
+                        cake_jit._admits(leaf, **{**scalars, "path": path}, l2n=mode)
+                        is expected
+                    ), (listed, path, mode)
+                always = {"kind": "always"}
                 assert (
-                    cake_jit._admits(leaf, **{**scalars, "path": path}) is expected
-                ), (listed, path)
-            always = {"kind": "always"}
-            assert (
-                cake_jit._admits({"kind": "all_of", "rules": [always, leaf]}, **scalars)
-                is expected
-            )
-            never = {"kind": "path_in", "paths": []}
-            assert (
-                cake_jit._admits({"kind": "any_of", "rules": [never, leaf]}, **scalars)
-                is expected
-            )
+                    cake_jit._admits(
+                        {"kind": "all_of", "rules": [always, leaf]}, **scalars, l2n=mode
+                    )
+                    is expected
+                )
+                never = {"kind": "path_in", "paths": []}
+                assert (
+                    cake_jit._admits(
+                        {"kind": "any_of", "rules": [never, leaf]}, **scalars, l2n=mode
+                    )
+                    is expected
+                )
+                checked += 1
+    assert checked == 2 ** len(L2N_MODES) * len(L2N_MODES)
     with pytest.raises(ValueError, match="unknown Cake KDA training selection rule"):
         cake_jit._admits({"kind": "l2n"}, **scalars)
 
@@ -2255,10 +2414,11 @@ PRE_L2N_RULES = {
 
 
 def test_the_l2n_leaf_keeps_every_pick_of_the_pre_l2n_rules(monkeypatch) -> None:
-    """With l2n ``"off"`` the re-copied rules select the same record as the rules this package copied before the
-    fused Q/K L2 norm class (``PRE_L2N_RULES``) on every stage that holds one of them, in both gate modes: every path
-    and architecture, device sizes, head counts and (tokens, documents) rows with one-token, sub-chunk, chunk-plus-one and long
-    documents around the 256-document bound.  A later change of a copied rule that moves a pick fails here."""
+    """With l2n ``"off"`` (the flag-off selection, no ``l2n`` passed) the re-copied rules select the same record as
+    the rules this package copied before the fused Q/K L2 norm class (``PRE_L2N_RULES``) on every stage that holds
+    one of them, in both gate modes: every path and architecture, device sizes, head counts and (tokens, documents)
+    rows with one-token, sub-chunk, chunk-plus-one and long documents around the 256-document bound.  A later change
+    of a copied rule that moves a pick fails here."""
     with_l2n = {
         name
         for name, record in cake_jit.MODULES.items()
@@ -2731,16 +2891,36 @@ def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None
         "bwd_prep_g8_noqg",
         "bwd_prep_g8_noqg_nokb",
     )
-    assert cake_jit.records_of_stage("bwd_prep") == preps
-    for name in preps:
+    # the in-kernel Q/K L2 norm's fused class (l2n ["fused"] alone, the deterministic package's) has one form per
+    # flag-off one
+    fused_preps = tuple(f"{name}_l2n" for name in preps)
+
+    def l2n_class(fused: bool) -> tuple[str, ...]:
+        return tuple(
+            n
+            for n in cake_jit.records_of_stage("bwd_prep")
+            if (cake_jit.MODULES[n].get("l2n", ["off"]) == ["fused"]) == fused
+        )
+
+    assert l2n_class(False) == preps
+    assert l2n_class(True) == fused_preps
+    for name in preps + fused_preps:
         prep = cake_jit.MODULES[name]
         assert prep["grid_rule"] == {"kind": "chunks", "x_factor": 1}
         assert not {"ke_out", "qe_out", "v_int", "vb_out"} & set(prep["logical"])
     # the saved-set paths' prep copies nothing of dout either; the replay's keeps the internal copy
-    for name in preps:
+    for name in preps + fused_preps:
         values = set(cake_jit.MODULES[name]["logical"].values())
-        assert ("do_int" in values) == (name == "bwd_prep_g8_replay"), name
-        assert ("dout" in values) == (name == "bwd_prep_g8_replay"), name
+        replay = name.startswith("bwd_prep_g8_replay")
+        assert ("do_int" in values) == replay, name
+        assert ("dout" in values) == replay, name
+    # the fused forms read the raw rows (the backward's first q / k reader) in place of q / k
+    for name in fused_preps:
+        values = set(cake_jit.MODULES[name]["logical"].values())
+        off = set(cake_jit.MODULES[name.removesuffix("_l2n")]["logical"].values())
+        assert {"q_raw", "k_raw", "qn", "kn", "qk_rstd"} <= values, name
+        assert not {"q", "k"} & values, name
+        assert off - {"q", "k"} <= values, name
     # the tape set's and the replay's prep fold q into qg; the light sets' forms read no q and write no qg (the
     # version-4 set carries the forward's), and the w / u rows' form writes no kb either (no wy launch there)
     for name in ("bwd_prep_g8", "bwd_prep_g8_replay"):
@@ -3439,8 +3619,8 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
     # explicit gate and its backward refuses a raw-mode set
     assert KdaChunkSaved.__dataclass_fields__["gate"].default == "g"
     assert KdaChunkSaved.__dataclass_fields__["lower_bound"].default is None
-    # the deterministic package's in-kernel Q/K L2 norm fields (#7817), at its defaults: this package's forward
-    # writes no reciprocal norms and the mode off, and its backward refuses a set with the mode on
+    # the deterministic package's in-kernel Q/K L2 norm fields (#7817), at its defaults: a forward with the flag
+    # writes the reciprocal norms (qk_rstd, FP32 [2, S, H]) and the mode on, as the deterministic package's does
     assert KdaChunkSaved.__dataclass_fields__["qk_l2norm"].default is False
     # the mode of the forward that wrote the set: this package's forward writes False (the deterministic package's
     # sets have the same format, and the backward reads either)
@@ -3448,10 +3628,12 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
     assert [f.name for f in dataclasses.fields(KdaChunkSaved)][:-1] == [
         f.name for f in dataclasses.fields(det_backend.KdaDetChunkSaved)
     ]
+    # the in-kernel Q/K L2 norm's reciprocal norms ride last in both versions (the deterministic package's order)
     assert cake_backend._EXTRA_FIELDS == {
-        4: ("qg", "hseg", "seg_state", "w", "u"),
-        2: ("h", "v_new", "seg_m"),
+        4: ("qg", "hseg", "seg_state", "w", "u", "qk_rstd"),
+        2: ("h", "v_new", "seg_m", "qk_rstd"),
     }
+    assert cake_backend._EXTRA_FIELDS == det_backend._EXTRA_FIELDS
     t = torch.empty(0)
     light = KdaChunkSaved(4, t, t, None, 1, 1, 1, SCALE, qg=t)
     tensors, names = cake_backend._saved_extra(light)
@@ -3467,6 +3649,12 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
     assert cake_backend._saved_extra(tape)[1] == ("h", "v_new")
     tape_seg = KdaChunkSaved(2, t, t, None, 1, 1, 1, SCALE, h=t, v_new=t, seg_m=t)
     assert cake_backend._saved_extra(tape_seg)[1] == ("h", "v_new", "seg_m")
+    r = torch.empty(2, 1, 1)
+    l2n = KdaChunkSaved(4, t, t, None, 1, 1, 1, SCALE, qg=t, qk_rstd=r, qk_l2norm=True)
+    tensors, names = cake_backend._saved_extra(l2n)
+    assert names == ("qg", "qk_rstd") and tensors[-1] is r
+    l2n_tape = dataclasses.replace(tape, qk_rstd=r, qk_l2norm=True)
+    assert cake_backend._saved_extra(l2n_tape)[1] == ("h", "v_new", "qk_rstd")
 
 
 def test_the_light_set_saves_qg_everywhere_and_w_u_where_the_prep_writes_no_kb() -> (
@@ -4408,17 +4596,22 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
     # The programs of cake_jit.MODULES, each built for the architectures its record delivers (all three but the
-    # records of RECORD_ARCHES; the library twins, fwdh_v3 / fwdh_p3, wy_bwd / wy_fwd_rows and the four raw-class
-    # fused gradient records with their g-class records, are built once per architecture); the KCP programs have
-    # their own package.
+    # records of RECORD_ARCHES; the library twins, fwdh_v3 / fwdh_p3, wy_bwd / wy_fwd_rows, the four raw-class
+    # fused gradient records with their g-class records and the six l2n-class ones with their raw-class records,
+    # are built once per architecture); the KCP programs have their own package.
     train_libraries = {
         (record["library"], arch)
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
-    count = sum(len(RECORD_ARCHES.get(name, ARCHES)) for name in cake_jit.MODULES) - (
-        2 + len(RAW_DQKG_SHARED)
-    ) * len(ARCHES)
+    count = (
+        sum(len(RECORD_ARCHES.get(name, ARCHES)) for name in cake_jit.MODULES)
+        - (2 + len(RAW_DQKG_SHARED)) * len(ARCHES)
+        - sum(len(RECORD_ARCHES.get(name, ARCHES)) for name in L2N_DQKG)
+    )
+    # 227 entries before the in-kernel Q/K L2 norm's copies, plus its 58 (19 programs x 3 architectures and the
+    # sm_103a forward intra form); the l2n class of the fused gradient adds no build
+    assert count == 285
     assert len(train_libraries) == count
     assert len(names) == len(set(names)) == count
     for entry in libraries:
@@ -4455,12 +4648,13 @@ def test_copied_programs_are_the_deterministic_packages_sources(
     manifest: dict,
 ) -> None:
     """Every record but the S1 ones, the hand-off twins and the tape WY twin is a copy of the deterministic
-    package's record of the same name (a raw-class fused gradient record: of its ``RAW_DQKG`` record): the same
-    digest in its library name (the package prefix aside), stage, launch, operands and grid, and (outside the
-    g class of the two pair stages, whose rules route the S1 cells) the same rule and architectures; each of its
-    libraries has the deterministic library's flags and sources, byte for byte once the package name in them is
-    replaced.  The S1 programs, the twins and the R1c pairs are the only new code (the deterministic raw
-    parameter-gradient pair keeps its programs, narrowed to ``sm_107a``)."""
+    package's record of the same name (a raw-class or l2n-class fused gradient record: of its ``RAW_DQKG`` /
+    ``L2N_DQKG`` record): the same digest in its library name (the package prefix aside), stage, launch, operands
+    and grid, and (outside the g class of the two pair stages with the in-kernel Q/K L2 norm off, whose rules route
+    the S1 cells) the same rule and architectures; each of its libraries has the deterministic library's flags and
+    sources, byte for byte once the package name in them is replaced.  The S1 programs, the twins and the R1c pairs
+    are the only new code (the deterministic raw parameter-gradient pair keeps its programs, narrowed to
+    ``sm_107a``)."""
     det_manifest = _det_manifest_or_skip()
     det_dir = Path(det_jit.__file__).resolve().parent
     ours = {entry["name"]: entry for entry in manifest["libraries"]}
@@ -4474,7 +4668,7 @@ def test_copied_programs_are_the_deterministic_packages_sources(
             or name in R1C_RECORDS
         ):
             continue
-        det_name = RAW_DQKG.get(name, name)
+        det_name = DET_SOURCE.get(name, name)
         twin = det_jit.MODULES[det_name]
         assert record["library"] == twin["library"].replace(
             "cake_kda_det_train_", "cake_kda_train_"
@@ -4484,16 +4678,25 @@ def test_copied_programs_are_the_deterministic_packages_sources(
         if name in RAW_DQKG:
             assert record["variant"] == name.removeprefix("dqkg_"), name
             assert record["gate"] == "raw" and "gate" not in twin, name
+        elif name in L2N_DQKG:
+            assert record["variant"] == name.removeprefix("dqkg_"), name
+            assert "gate" not in record and "gate" not in twin, name
+            assert record["l2n"] == list(L2N_ON) and "l2n" not in twin, name
         else:
             assert record["variant"] == twin["variant"], name
             assert record.get("gate") == twin.get("gate"), name
+            # the in-kernel Q/K L2 norm modes it serves: the deterministic record's
+            assert record.get("l2n") == twin.get("l2n"), name
         assert record["grid_rule"] == twin["grid_rule"], name
+        pair_off = record["stage"] in ("dqkg", "glm_intra") and "off" in record.get(
+            "l2n", ["off"]
+        )
         if name in R1C_NARROWED:
             # the deterministic raw parameter-gradient pair ships on sm_107a alone (the R1c pairs elsewhere)
             narrowed = _r1c_narrowed(name, twin)
             assert record["select_rule"] == narrowed["select_rule"], name
             assert list(record["arches"]) == narrowed["arches"], name
-        elif record["stage"] not in ("dqkg", "glm_intra") or name in RAW_DQKG:
+        elif not pair_off or name in RAW_DQKG:
             assert record["select_rule"] == twin["select_rule"], name
             assert list(record["arches"]) == list(twin["arches"]), name
         else:

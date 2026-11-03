@@ -1515,7 +1515,8 @@ def test_the_auto_rule(monkeypatch) -> None:
     on a ``HANDOFF_VERIFIED`` (architecture, SM count, toolkit) device, counting ``unverified`` at those head counts
     on another architecture, SM count or toolkit (also one that cannot be read).  The node makes no ``"auto"``
     request at other head counts, before it reads any torch state.  A plan of the raw gate mode (``gate="raw"``)
-    engages in no mode and counts nothing.  The shipped devices name exported architectures and ``major.minor``
+    or of an in-kernel Q/K L2 norm mode (``l2n`` ``"fused"`` / ``"fallback"``) engages in no mode and counts
+    nothing.  The shipped devices name exported architectures and ``major.minor``
     toolkits; the head counts start at two (one head is host-bound)."""
     for arch, sms, toolkit in cake_backend.HANDOFF_VERIFIED:
         assert arch in ARCHES and sms > 0, (arch, sms, toolkit)
@@ -1543,15 +1544,29 @@ def test_the_auto_rule(monkeypatch) -> None:
     unverified = 0
     for mode, arch_, sms, toolkit, H, want, counted in cases:
         monkeypatch.setattr(cake_backend, "_handoff_toolkit", lambda a, t=toolkit: t)
-        p = types.SimpleNamespace(arch=arch_, sm_count=sms, H=H, gate="g")
+        p = types.SimpleNamespace(arch=arch_, sm_count=sms, H=H, gate="g", l2n="off")
         assert cake_backend._handoff_engages(p, mode, 0) is want, (mode, p, toolkit)
         unverified += counted
         assert cake_backend._handoff_stats(0)["unverified"] == unverified, (mode, p)
     monkeypatch.setattr(cake_backend, "_handoff_toolkit", lambda a: "9.9")
+    refused = 0
+    off_modes = [("raw", "off")] + [
+        (g, m) for g in ("g", "raw") for m in ("fused", "fallback")
+    ]
     for mode in ("on", "auto", "off"):
         for sms in (152, 148):
-            p = types.SimpleNamespace(arch=arch, sm_count=sms, H=heads, gate="raw")
-            assert cake_backend._handoff_engages(p, mode, 0) is False, (mode, sms)
+            for gate, l2n in off_modes:
+                p = types.SimpleNamespace(
+                    arch=arch, sm_count=sms, H=heads, gate=gate, l2n=l2n
+                )
+                assert cake_backend._handoff_engages(p, mode, 0) is False, (
+                    mode,
+                    sms,
+                    gate,
+                    l2n,
+                )
+                refused += 1
+    assert refused == 3 * 2 * 5
     assert cake_backend._handoff_stats(0)["unverified"] == unverified
 
     def read_torch_state():
