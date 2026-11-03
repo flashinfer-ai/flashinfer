@@ -3146,12 +3146,12 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # 512 / 1024 BF16 projection rows add 26 sm_107a keys; the thin FP32 input gradients, thin BF16 forwards and FP32
     # weight gradients add 34 sm_107a keys (17 ragged, 17 T-exact weight-gradient keys at T 16231 / 16384); the GB
     # T-exact forward / input-gradient rules add 8 sm_100a and 8 sm_103a keys (test_gb_t_exact_rules_plan_their_programs);
-    # their round 2 adds 4 sm_100a and 5 sm_103a keys (the q_b input gradient: test_gb_t_exact_rules_plan_their_programs;
+    # their round 2 adds 4 sm_100a and 6 sm_103a keys (the q_b input gradient: test_gb_t_exact_rules_plan_their_programs;
     # the 17408 x 5120 weight gradients: test_gb_t_exact_wgrad_rules_plan_their_programs)
-    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 9
+    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10
     assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8 + 4
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34
-    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 5
+    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
         "sm_100a": {"pro": 7},
@@ -8365,8 +8365,7 @@ def test_gb_t_exact_rows_match_fp64_and_their_plan_without_the_key(key, monkeypa
 
 # The GB T-exact weight-gradient rules (round 2): ROW_RULES key -> the program it plans at its T (K = T, in the direct
 # orientation the row plans without it, G[T, M].T @ X[T, N]), with the per-tile K partitions of the row's plan without it
-# (whole K per output tile on both), so every output is bitwise equal to that plan's.  ``None``: an empty sm_103a key that
-# keeps the row's plan there instead of the sm_100a key (the parent lookup).
+# (whole K per output tile on both), so every output is bitwise equal to that plan's.
 GB_T_EXACT_WGRAD_ROWS = {
     (
         "sm_100a",
@@ -8398,11 +8397,42 @@ GB_T_EXACT_WGRAD_ROWS = {
         False,
         False,
         5120,
+        16231,
+        17408,
+    ): "dense_proj_det_gemm_nn_n256_m256_ht_tma1_pro7",
+    (
+        "sm_103a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        5120,
         16384,
         17408,
     ): "dense_proj_det_gemm_nn_n256_m256_ht_tma1_pro7",
-    ("sm_103a", True, True, False, False, False, 17408, 16231, 5120): None,
-    ("sm_103a", True, True, False, False, False, 17408, 16384, 5120): None,
+    (
+        "sm_103a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        17408,
+        16231,
+        5120,
+    ): "dense_proj_det_gemm_nn_n256_m256_ht_tma1_pro7",
+    (
+        "sm_103a",
+        True,
+        True,
+        False,
+        False,
+        False,
+        17408,
+        16384,
+        5120,
+    ): "dense_proj_det_gemm_nn_n256_m256_ht_tma1_pro7",
 }
 
 
@@ -8417,11 +8447,10 @@ def _gb_wgrad_views(N, T, M):
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
 def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
     """The GB T-exact weight-gradient rules (sm_100a: the 17408 -> 5120 weight gradient at T 16231 / 16384; sm_103a: the
-    5120 -> 17408 weight gradient at T 16384; both with the half-tail program through the one-slot TMA store and
-    12-row raster groups) plan their program at their T on every SM count of the architecture's parts, in the direct
-    orientation and with whole K per output tile like the row's plan without the key; one token more or less plans
-    that plan.  The two empty sm_103a keys of the 17408 -> 5120 weight gradient keep the row's plan there (without
-    them the parent's T-exact key would apply)."""
+    5120 -> 17408 and 17408 -> 5120 weight gradients at T 16231 / 16384; all with the half-tail program through the
+    one-slot TMA store and 12-row raster groups) plan their program at their T on every SM count of the architecture's
+    parts, in the direct orientation and with whole K per output tile like the row's plan without the key (on sm_103a
+    without the sm_100a key it restates as well); one token more or less plans that plan."""
     monkeypatch.setattr(cake_backend, "_DUMMIES", {})
     exact = sorted(
         key
@@ -8441,7 +8470,7 @@ def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
     for key in exact:
         _arch, _a_mn, _b_mn, _f32, _out_t, _batched, N, T, M = key
         template = GB_T_EXACT_WGRAD_ROWS[key]
-        assert template is None or template in registered, (key, template)
+        assert template in registered, (key, template)
         for sm_count in (148, 152, 160) if arch == "sm_103a" else (148, 152):
             kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, arch=arch, _fallback=False)
             plans = {t: plan_at(N, t, M, kw) for t in (T - 1, T, T + 1)}
@@ -8455,16 +8484,6 @@ def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
                     t,
                 )
             plan, ragged = plans[T], without[T]
-            if template is None:
-                assert ROW_RULES[key] == {}
-                assert _plan_signature(plan) == _plan_signature(ragged), key
-                with monkeypatch.context() as m:
-                    m.delitem(ROW_RULES, key)
-                    parent = plan_at(N, T, M, kw)
-                assert (
-                    parent.template == GB_T_EXACT_WGRAD_ROWS[("sm_100a",) + key[1:]]
-                ), (key, parent.template)
-                continue
             assert plan.template == template, (key, sm_count, plan.template)
             assert not (
                 plan.rule_fallback or plan.knob_fallback or plan.swap_fallback
@@ -8482,7 +8501,7 @@ def test_gb_t_exact_wgrad_rules_plan_their_programs(arch, monkeypatch):
 
 @pytest.mark.parametrize(
     "key",
-    sorted(key for key, template in GB_T_EXACT_WGRAD_ROWS.items() if template),
+    sorted(GB_T_EXACT_WGRAD_ROWS),
     ids=lambda key: f"{key[0]}-nn-{key[6]}x{key[8]}-T{key[7]}",
 )
 def test_gb_t_exact_wgrad_rows_match_fp64_and_their_plan_without_the_key(

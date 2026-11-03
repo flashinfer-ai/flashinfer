@@ -237,6 +237,14 @@ __global__ __launch_bounds__(256) void kernel_alpha_moe_fused_router_small(
         }
       }
     }
+    // The loop above skips NaN logits: an all-NaN row matches no logit and leaves MAX_EXPERTS (out
+    // of range) on every route lane. Such a lane takes the expert with its route index and a +inf
+    // logit, so the row selects experts 0..k-1 with NaN weights and the plan stays in bounds. Any
+    // other row stays in range, but can repeat an expert once its logits above -inf run out.
+    if (lane < (unsigned int)routed_top_k && selected_expert >= routed_experts) {
+      selected_expert = (int)lane;
+      selected_logit = LOOM_INF;
+    }
     if (has_shared_expert != 0) {
       if (lane == (unsigned int)routed_top_k) {
         selected_expert = E - 1;
