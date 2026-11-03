@@ -1396,12 +1396,15 @@ def test_l2n_lean_and_batched_arenas_are_bitwise_the_deterministic_l2n(
     shape, gate: str
 ) -> None:
     """Lean workspaces of one to three tail passes and document groups (default and lean layouts) give the
-    deterministic package's default l2n results bit for bit: the forward, the backward from either package's
-    default set and from its own, the replay group by group (not lean), the autograd node carrying the option.  A
-    lean workspace refuses the replay."""
+    deterministic package's default l2n results bit for bit: the forward; the backward from its own set and, on the
+    workspace and per call with the arena option, from either package's default set (lean); the backward of a
+    grouped workspace from either default set and from its own grouped set, which the default and the deterministic
+    backward read too; and the replay group by group (not lean).  A lean workspace refuses the replay.  The test
+    makes exactly the comparisons it lists."""
     device = _l2n_device()
     lengths, H = shape
     S, N = sum(lengths), len(lengths)
+    parts = _partitions(lengths)
     inputs = _l2n_inputs(lengths, H, device, gate)
     ref_out, ref, det_saved = _reference(inputs, gate)
     _, saved = _fwd(inputs, gate)
@@ -1430,7 +1433,7 @@ def test_l2n_lean_and_batched_arenas_are_bitwise_the_deterministic_l2n(
         with pytest.raises(ValueError, match="lean=False"):
             _bwd(inputs, None, gate, workspace=ws)
         del ws
-    for label, kw in _partitions(lengths):
+    for label, kw in parts:
         for lean in (False, True):
             arena = cake_backend.KdaArena(lean=lean, tail_passes=3 if lean else 1, **kw)
             tag = (label, lean)
@@ -1465,7 +1468,10 @@ def test_l2n_lean_and_batched_arenas_are_bitwise_the_deterministic_l2n(
                 got = _bwd(inputs, None, gate, workspace=ws, doc_lengths=lengths)
                 count.grads(got, ref, gate, (*tag, "replay"))
             del ws
-    assert count.n > 0
+    G = len(_names(gate))
+    # per tail pass: out, the backward from its own set, from both default sets on the workspace and per call; per
+    # grouping: out and six backwards on the default layout (the replay among them), out and five on the lean one
+    assert parts and count.n == 3 * (1 + 5 * G) + len(parts) * (2 + 11 * G)
 
 
 @pytest.mark.parametrize("gate", GATES)
