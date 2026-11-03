@@ -1041,20 +1041,20 @@ def program_spec(arch: str, name: str):
     """JIT build specification of one generated program for ``arch``."""
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec
+    from flashinfer.experimental._sources import shared_csrc_dir, shared_include_dirs
 
+    root = shared_csrc_dir()
     record = MODULES[name]
     return gen_jit_spec(
         name=f"{name}_{arch}",
-        sources=[
-            env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/") for p in record["sources"]
-        ],
+        sources=[root / p.removeprefix("csrc/") for p in record["sources"]],
         extra_cuda_cflags=[
             *_nvcc_flags(arch),
             *record["compile_flags"],
             "--device-entity-has-hidden-visibility=false",
         ],
         extra_ldflags=["-lcuda"],
-        extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
+        extra_include_paths=[*shared_include_dirs(), env.FLASHINFER_INCLUDE_DIR],
         use_fast_math=False,
     )
 

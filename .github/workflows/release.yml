@@ -165,11 +165,21 @@ jobs:
           pip install build wheel
 
       - name: Build flashinfer-python wheel and sdist
+        env:
+          # Release wheels leave the experimental packages' generated kernel
+          # sources out so flashinfer-python stays under PyPI's 100 MB file limit
+          # (flashinfer-ai/flashinfer#7977); nightlies and source installs keep them.
+          FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES: "1"
         run: |
           echo "Building flashinfer-python..."
           echo "Git commit: $(git rev-parse HEAD)"
           python -m build
           ls -lh dist/
+          # build_backend writes the excluded experimental kernel sources beside
+          # the wheel; create-release uploads it as the asset that
+          # `flashinfer download-experimental-sources` fetches. Fail loudly if the
+          # release build did not produce it.
+          ls -l dist/*-experimental-sources.tar.xz
 
       - name: Upload flashinfer-python artifact
         uses: actions/upload-artifact@v4
@@ -490,6 +500,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
         run: |
+          # The wheel, the sdist and flashinfer_python-<version>-experimental-sources.tar.xz
+          # (the kernel sources the release wheel leaves out; see build_backend._slim_wheel).
           gh release upload "${RELEASE_TAG}" dist-python/* --clobber
 
       - name: Download flashinfer-cubin artifact
@@ -551,8 +563,10 @@ jobs:
 
       - name: Check packages with twine
         run: |
+          # Only the distributions: dist-python also holds the experimental-sources
+          # tarball, which is a release asset, not a package.
           echo "Running twine check..."
-          twine check dist-python/*
+          twine check dist-python/*.whl dist-python/*.tar.gz
           echo "✓ Package validation passed"
 
       - name: Upload flashinfer-python to PyPI
@@ -561,7 +575,7 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
           echo "Uploading flashinfer (sdist and wheel) to PyPI..."
-          twine upload --verbose --non-interactive dist-python/*
+          twine upload --verbose --non-interactive dist-python/*.whl dist-python/*.tar.gz
           echo "✓ Successfully uploaded flashinfer to PyPI"
 
   update-wheel-index:

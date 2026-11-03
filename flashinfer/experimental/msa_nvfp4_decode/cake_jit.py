@@ -27,6 +27,7 @@ from ...jit.core import (
     sm103a_nvcc_flags,
     sm107a_nvcc_flags,
 )
+from .._sources import package_csrc_dir
 
 # Generated programs of the NVFP4 paged-KV MSA decode, one record per delivered
 # source pair.  A program lists the architectures its source compiles for
@@ -518,7 +519,7 @@ def gen_program_spec(name: str, arch: str):
             "the CUDA toolkit of this checkout cannot compile it (nvcc does not "
             "list compute_107a; a Rubin-capable toolkit is required)"
         )
-    root = Path(__file__).resolve().parent / "csrc"
+    root = package_csrc_dir(__file__)
     sources = [root / relative for relative in record["sources"]]
     return gen_jit_spec(
         name=f"{name}_{arch}",

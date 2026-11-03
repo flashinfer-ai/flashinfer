@@ -15,17 +15,17 @@ limitations under the License.
 """
 
 import functools
-from pathlib import Path
 from typing import Any
 
 from ...jit.core import JitSpec, current_compilation_context, gen_jit_spec
+from .._sources import package_csrc_dir
 
 
 def gen_qsa_nvfp4_module() -> JitSpec:
     # SM80 instructions only (cp.async, mma.sync m16n8k16); one build serves SM80 through SM90.
     return gen_jit_spec(
         "qsa_nvfp4_attention",
-        [Path(__file__).resolve().parent / "csrc" / "qsa_nvfp4_attention.cu"],
+        [package_csrc_dir(__file__) / "qsa_nvfp4_attention.cu"],
         extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
             supported_major_versions=[8, 9]
         ),

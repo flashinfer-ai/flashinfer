@@ -23,6 +23,7 @@ from typing import Any
 
 from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .._sources import package_csrc_dir
 
 # Registry of the generated programs of the Kimi-K3 Stable LatentMoE front /
 # tail projections.  Every program is one source pair (kernel + launcher)
@@ -2684,7 +2685,7 @@ def gen_cake_kimi_k3_latent_moe_module(arch: str, key: str):
     name = kernel_module_name(arch, key)
     record = MODULES[name]
     defines = kernel_defines(key)
-    root = Path(__file__).resolve().parent / "csrc"
+    root = package_csrc_dir(__file__)
     sources = [root / relative for relative in record["sources"]]
     # The module name is salted with the specialisation constants only; the kernel
     # symbol of a folded key follows from its program and those constants.

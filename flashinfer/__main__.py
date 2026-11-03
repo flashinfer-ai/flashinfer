@@ -607,6 +607,26 @@ def show_config_cmd():
     except Exception as e:
         click.secho(f"Error checking package versions: {e}", fg="yellow")
 
+    # Section: experimental kernel sources (release wheels leave them out; #7977)
+    from .experimental import _sources
+
+    click.secho("=== Experimental Kernel Sources ===", fg="yellow")
+    sources_state = _sources.status()
+    if sources_state.state == "in_package":
+        click.secho("Shipped in the installed package", fg="green")
+    elif sources_state.state == "installed":
+        click.secho(
+            f"Installed at {sources_state.root} ({sources_state.files} files)",
+            fg="green",
+        )
+    else:
+        click.secho(
+            f"Not installed (expected at {sources_state.root}); "
+            f"run `{_sources.COMMAND}`",
+            fg="red",
+        )
+    click.secho("", fg="white")
+
     # Section: Torch Version Info
     import torch
 
@@ -860,6 +880,69 @@ def download_kernels_cmd(
         dry_run,
         sm_architectures,
     )
+
+
+@cli.command("download-experimental-sources")
+@click.option(
+    "--file",
+    "tarball",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Install from a copy of the release tarball already on disk instead of "
+        "downloading it (hosts without network access)."
+    ),
+)
+@click.option(
+    "--url",
+    default=None,
+    help=(
+        "Download the tarball from this URL instead of the GitHub release of the "
+        "installed version (mirrors)."
+    ),
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace sources already installed for this version.",
+)
+def download_experimental_sources_cmd(tarball, url, force):
+    """Fetch the experimental kernel sources that release wheels leave out.
+
+    Release wheels of flashinfer-python on PyPI omit flashinfer/experimental/*/csrc
+    and csrc/experimental to stay under PyPI's file size limit, so an experimental
+    feature raises at its first kernel compile. This downloads the matching
+    tarball from the GitHub release of the installed version, verifies its SHA-256
+    against flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt and unpacks it
+    under FLASHINFER_CACHE_DIR/experimental-sources/<version> (or
+    FLASHINFER_EXPERIMENTAL_SOURCES_DIR), where the experimental loaders find it.
+    No reinstall is needed. Nightly wheels and source installs ship the sources.
+    """
+    from .experimental import _sources
+
+    try:
+        result = _sources.install_sources(
+            tarball=tarball,
+            url=url,
+            force=force,
+            log=lambda message: click.secho(message, fg="white"),
+        )
+    except _sources.SourcesError as error:
+        raise click.ClickException(str(error)) from error
+    except OSError as error:  # download or filesystem failure
+        raise click.ClickException(str(error)) from error
+    if result.already_installed:
+        click.secho(
+            f"✅ Experimental kernel sources already installed at {result.root} "
+            f"({result.files} files verified); pass --force to replace them.",
+            fg="green",
+        )
+    else:
+        click.secho(
+            f"✅ Installed {result.files} experimental kernel source files from "
+            f"{result.source} into {result.root}",
+            fg="green",
+        )
 
 
 @cli.command("module-status")

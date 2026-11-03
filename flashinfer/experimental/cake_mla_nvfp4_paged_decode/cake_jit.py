@@ -23,6 +23,7 @@ from typing import Any
 from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 from ...jit.cpp_ext import get_cuda_version
+from .._sources import package_csrc_dir
 
 # Registry of the generated Cake programs (written by the generated-program
 # export; do not edit by hand).
@@ -292,7 +293,7 @@ def gen_program(program: str, arch: str):
     record = PROGRAMS[program]
     if arch not in record["arches"]:
         raise ValueError(f"program {program!r} is not built for {arch!r}")
-    root = Path(__file__).resolve().parent / "csrc"
+    root = package_csrc_dir(__file__)
     sources = [root / relative for relative in record["sources"]]
     return gen_jit_spec(
         name=f"{program}_{arch}",

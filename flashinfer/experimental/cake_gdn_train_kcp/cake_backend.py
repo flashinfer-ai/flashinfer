@@ -237,7 +237,7 @@ def test_jit_spec(library: str) -> Any:
         )
     sources: list[Path] = []
     for relative in entry["sources"]:
-        path = _PACKAGE / relative
+        path = cake_build._source_root() / relative
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if digest != entry["sha256"][relative]:
             raise RuntimeError(
@@ -255,7 +255,9 @@ def test_jit_spec(library: str) -> Any:
         sources,
         extra_cuda_cflags=flags,
         extra_ldflags=list(document["common"]["link_flags"]),
-        extra_include_paths=[_PACKAGE / d for d in document["common"]["include_dirs"]],
+        extra_include_paths=[
+            cake_build._source_root() / d for d in document["common"]["include_dirs"]
+        ],
         use_fast_math=False,
     )
 

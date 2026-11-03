@@ -196,6 +196,42 @@ cubins are downloaded on demand and kernels are JIT-compiled, as if the
 wheels were not installed. Set ``FLASHINFER_DISABLE_VERSION_CHECK=1`` to use
 mismatched wheels anyway.
 
+Download Experimental Sources
+-----------------------------
+
+Release wheels on PyPI leave out the generated kernel sources of the
+experimental features under ``flashinfer.experimental``
+(``flashinfer/experimental/*/csrc`` and ``csrc/experimental``) so that
+``flashinfer-python`` stays under PyPI's file size limit. An experimental feature
+then raises at its first kernel compile with an error that names this command.
+Fetch the sources once, without reinstalling FlashInfer:
+
+.. code-block:: bash
+
+   # Download the tarball of the installed version from its GitHub release,
+   # verify its SHA-256 and unpack it
+   flashinfer download-experimental-sources
+
+   # Hosts without network access: install a copy of the release asset
+   flashinfer download-experimental-sources --file flashinfer_python-0.7.3-experimental-sources.tar.xz
+
+   # Replace an installed copy
+   flashinfer download-experimental-sources --force
+
+The tarball, ``flashinfer_python-<version>-experimental-sources.tar.xz``, is an
+asset of the GitHub release of the installed version, and the wheel records its
+expected SHA-256 in ``flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt``, so
+a corrupted or substituted download is refused. The files are unpacked under
+``FLASHINFER_CACHE_DIR/experimental-sources/<version>``
+(``~/.cache/flashinfer/experimental-sources/<version>`` unless
+``FLASHINFER_WORKSPACE_BASE`` moves the cache). ``FLASHINFER_EXPERIMENTAL_SOURCES_DIR``
+selects another directory, for example a shared read-only copy an administrator
+unpacked by hand (``tar -xJf <tarball> -C <dir>``; inside it,
+``sha256sum -c EXPERIMENTAL_SOURCES_MANIFEST.txt`` checks the copy).
+``flashinfer show-config`` reports whether the sources are shipped with the
+package, installed, or missing. Nightly wheels and source installs ship the
+sources and need none of this.
+
 Cache Management
 ----------------
 

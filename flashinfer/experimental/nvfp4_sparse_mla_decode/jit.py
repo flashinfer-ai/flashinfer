@@ -22,8 +22,8 @@ from pathlib import Path
 
 from ...jit import env as jit_env
 from ...jit.core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .._sources import package_csrc_dir
 
-_CSRC = Path(__file__).resolve().parent / "csrc"
 _SOURCES = ("nvfp4_sparse_mla_decode.cu", "nvfp4_sparse_mla_decode_jit_binding.cu")
 _HEADERS = ("nvfp4_sparse_mla_decode.cuh",)
 # Architecture-specific targets: the kernel uses e2m1 conversions that the family-portable targets lack.
@@ -44,10 +44,15 @@ def _header_dirs() -> list[Path]:
     )
 
 
+def _csrc() -> Path:
+    return package_csrc_dir(__file__)
+
+
 def _source_digest() -> str:
     digest = hashlib.sha256()
+    csrc = _csrc()
     for name in (*_SOURCES, *_HEADERS):
-        digest.update((_CSRC / name).read_bytes())
+        digest.update((csrc / name).read_bytes())
     return digest.hexdigest()[:16]
 
 
@@ -56,11 +61,12 @@ def gen_nvfp4_sparse_mla_decode_module(arch: str) -> JitSpec:
     """JIT spec of the NVFP4 sparse-MLA decode kernel for ``arch`` (``sm_100a`` or ``sm_103a``)."""
     if arch not in _ARCH_NVCC_FLAGS:
         raise ValueError(f"NVFP4 sparse MLA decode is not built for {arch}")
+    csrc = _csrc()
     return gen_jit_spec(
         name=f"nvfp4_sparse_mla_decode_{arch.replace('_', '')}_{_source_digest()}",
-        sources=[_CSRC / name for name in _SOURCES],
+        sources=[csrc / name for name in _SOURCES],
         extra_cuda_cflags=list(_ARCH_NVCC_FLAGS[arch]),
-        extra_include_paths=[_CSRC, *_header_dirs()],
+        extra_include_paths=[csrc, *_header_dirs()],
         # The kernel was validated without fast math; keep exp2f and the f16 conversions exact.
         use_fast_math=False,
     )

@@ -22,6 +22,7 @@ from typing import Any
 
 from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .._sources import package_csrc_dir
 
 # Explicit target-owned registration of the generated programs: one record per
 # program (its translation units and argument plan) and the architectures that
@@ -169,7 +170,7 @@ def gen_cake_balanced_gqa_decode_module(name: str, arch: str):
     record = PROGRAMS[name]
     if arch not in record["arches"]:
         raise NotImplementedError(f"program {name} is not built for {arch}")
-    root = Path(__file__).resolve().parent / "csrc"
+    root = package_csrc_dir(__file__)
     sources = [root / relative for relative in record["sources"]]
     return gen_jit_spec(
         name=f"{name}_{arch}",

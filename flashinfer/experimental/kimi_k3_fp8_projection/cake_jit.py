@@ -22,6 +22,7 @@ from typing import Any
 
 from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .._sources import package_csrc_dir
 
 # Registration of the generated programs of the Kimi-K3 serialized ``FP8_PB_WO``
 # projection GEMMs (SM100 / SM103).
@@ -5009,7 +5010,7 @@ def gen_cake_kimi_k3_fp8_projection_module(name: str, arch: str, defines: Define
         raise ValueError(
             f"program {name!r} is not built for {arch} ({record['arches']})"
         )
-    root = Path(__file__).resolve().parent / "csrc"
+    root = package_csrc_dir(__file__)
     sources = [root / relative for relative in record["sources"]]
     suffix = "".join(f"_{key}{value}" for key, value in defines)
     return gen_jit_spec(

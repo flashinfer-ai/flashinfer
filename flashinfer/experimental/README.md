@@ -343,6 +343,28 @@ default in supported framework releases. A request for default or supported
 release-path integration is a signal that the feature should be considered
 for graduation.
 
+Release wheels published to PyPI do not carry the experimental packages'
+generated kernel sources (`csrc/**` and `csrc/experimental/**`): the release
+workflow builds with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` so that
+`flashinfer-python` stays under PyPI's per-file size limit (#7977). The Python
+modules stay importable; the first kernel load of such a feature raises an
+`ExperimentalSourcesNotFound` error that names the fix, and
+`flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt` in the wheel explains it.
+The dropped files are published with the GitHub release as
+`flashinfer_python-<version>-experimental-sources.tar.xz`;
+`flashinfer download-experimental-sources` fetches it, verifies the SHA-256 the
+marker records and unpacks it under
+`FLASHINFER_CACHE_DIR/experimental-sources/<version>` (or
+`FLASHINFER_EXPERIMENTAL_SOURCES_DIR`), never into the installed package.
+Every loader resolves its sources through `flashinfer/experimental/_sources.py`:
+`package_csrc_dir(__file__)` for a package's own `csrc/` (the in-package copy
+when present, else the fetched one) and `shared_csrc_dir()` /
+`shared_include_dirs()` for the generated programs under `csrc/experimental`.
+A new experimental package must use these rather than hardcode
+`Path(__file__).parent / "csrc"` or `FLASHINFER_CSRC_DIR`, or it will not work
+from a release wheel. Nightly wheels on https://flashinfer.ai/whl and source
+installs include the sources, matching the audience above.
+
 ## Graduation checklist
 
 To graduate a feature to stable:

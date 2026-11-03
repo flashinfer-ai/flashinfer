@@ -37,6 +37,15 @@ Package Options
 FlashInfer provides three packages:
 
 - **flashinfer-python**: Core package that compiles/downloads kernels on first use
+
+  Release wheels on PyPI leave out the kernel sources of the experimental features under ``flashinfer.experimental`` to stay under PyPI's file size limit. To use those features from a release wheel, fetch the sources once; no reinstall is needed:
+
+  .. code-block:: bash
+
+      flashinfer download-experimental-sources
+
+  This downloads ``flashinfer_python-<version>-experimental-sources.tar.xz`` from the matching GitHub release, verifies its checksum against the installed wheel and unpacks it under ``~/.cache/flashinfer/experimental-sources/<version>`` (``FLASHINFER_WORKSPACE_BASE`` moves the whole cache; ``FLASHINFER_EXPERIMENTAL_SOURCES_DIR`` moves only this directory, for a shared read-only copy). On a host without network access, download that release asset elsewhere and run ``flashinfer download-experimental-sources --file <tarball>``, or unpack it by hand into that directory. See :ref:`cli` for details. Nightly wheels from https://flashinfer.ai/whl and source installs include the sources.
+
 - **flashinfer-cubin**: Pre-compiled kernel binaries for all supported GPU architectures
 - **flashinfer-jit-cache**: CUDA-specific shim that installs architecture-specific pre-built kernel providers
 

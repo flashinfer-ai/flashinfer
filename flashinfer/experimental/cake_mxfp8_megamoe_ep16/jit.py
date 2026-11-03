@@ -42,6 +42,7 @@ from ...jit.core import (
     sm107a_nvcc_flags,
 )
 from ...jit.cpp_ext import is_cuda_version_at_least
+from .._sources import package_csrc_dir
 
 _OPERATOR_DIR = "cake_mxfp8_megamoe_ep16"
 _MANIFEST = "cake_mxfp8_megamoe_ep16_manifest.json"
@@ -64,7 +65,7 @@ _CUTE_DSL_ROLES = ("fused", "fused_return_all_cta", "topk_reduce")
 
 
 def _get_csrc_root() -> Path:
-    package_sources = Path(__file__).resolve().parent / "csrc"
+    package_sources = package_csrc_dir(__file__)
     if (package_sources / _OPERATOR_DIR / _MANIFEST).is_file():
         return package_sources
 

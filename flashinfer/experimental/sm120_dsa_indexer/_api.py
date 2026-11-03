@@ -16,14 +16,13 @@
 
 import functools
 import math
-from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
 
 from ...utils import device_support_pdl, is_sm120f_supported
+from .._sources import package_csrc_dir
 
-_CSRC = Path(__file__).resolve().parent / "csrc"
 _HEAD_DIM = 128
 _CAPACITY = 8192  # candidates a scanned row keeps
 _MAX_TOP_K = _CAPACITY // 2
@@ -46,13 +45,14 @@ def _module():
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[12]
     )
+    csrc = package_csrc_dir(__file__)
     return gen_jit_spec(
         "sm120_dsa_indexer",
-        [_CSRC / "binding.cu"],
+        [csrc / "binding.cu"],
         # No fast math: the scores must match DeepGEMM's bit for bit. -uumn:
         # ptxas keeps setmaxnreg in kernels with calls (with the kernels' knob).
         extra_cuda_cflags=[*nvcc_flags, "-O3", "-Xptxas=-uumn"],
-        extra_include_paths=[_CSRC],
+        extra_include_paths=[csrc],
         extra_ldflags=["-lcuda"],
         use_fast_math=False,
     ).build_and_load()

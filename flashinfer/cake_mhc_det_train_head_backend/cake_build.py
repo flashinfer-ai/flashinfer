@@ -165,11 +165,28 @@ def _toolkit_builds(entry: dict[str, Any], cuda: tuple[int, int]) -> bool:
     return cuda >= _version(entry["min_cuda"])
 
 
+def _source_root() -> Path:
+    """The directory the manifest's package-relative ``csrc/...`` paths resolve against.
+
+    This package while its ``csrc/`` is present; otherwise the copy a release
+    wheel's user fetched with ``flashinfer download-experimental-sources``
+    (release wheels leave the experimental kernel sources out, and the fetched
+    tree keeps the wheel layout, so the package directory sits at the same
+    relative path there).  Only the JIT path reaches this, and that path
+    imports ``flashinfer`` already.
+    """
+    if (_PACKAGE / "csrc").is_dir():
+        return _PACKAGE
+    from flashinfer.experimental._sources import package_csrc_dir
+
+    return package_csrc_dir(__file__).parent
+
+
 def _verified_sources(entry: dict[str, Any]) -> list[Path]:
     """The entry's sources as package paths, each checked against its digest."""
     sources: list[Path] = []
     for relative in entry["sources"]:
-        path = _PACKAGE / relative
+        path = _source_root() / relative
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         expected = entry["sha256"][relative]
         if digest != expected:
@@ -204,7 +221,7 @@ def jit_spec(name: str) -> Any:
         *entry["nvcc_flags"],
         *_conditional_flags(entry["nvcc_flags_if"], cuda),
     ]
-    include_dirs = [_PACKAGE / d for d in document["common"]["include_dirs"]]
+    include_dirs = [_source_root() / d for d in document["common"]["include_dirs"]]
     return gen_jit_spec(
         f"{name}_{entry['closure_sha256'][:20]}",
         _verified_sources(entry),
