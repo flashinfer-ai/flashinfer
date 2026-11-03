@@ -96,10 +96,6 @@ def scale_types(
 ) -> tuple[bool, bool, bool]: ...
 
 
-@overload
-def scale_types(*values: GlobalScale) -> tuple[bool, ...]: ...
-
-
 def scale_types(*values: GlobalScale) -> tuple[bool, ...]:
     """Return a cacheable ABI signature that contains no values or tensor owners."""
     return tuple(isinstance(value, torch.Tensor) for value in values)
