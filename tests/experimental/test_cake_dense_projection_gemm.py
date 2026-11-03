@@ -4791,6 +4791,54 @@ def test_gpu_k1_sm_count_overrides_run_their_programs():
     assert ran
 
 
+def test_gpu_k1_sm_count_overrides_through_the_convenience_binding():
+    """Unforced (``deterministic=False``, no split count), on a part of exactly the SM count of a table of
+    :data:`K1_SPLIT_OVERRIDES_BY_SM` (``sm_107a``: 216 SMs): the convenience path of every overridden row binds the
+    override's program (its :data:`_K1_ATOMIC_CACHE` entry) at the first and the last token count of
+    :data:`K1_SPLIT_RULES_BY_SM_TOKENS` and gives the bits of the prepared launch, the tickets zero after.  A part of
+    any other SM count skips."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    table = cake_backend.K1_SPLIT_OVERRIDES_BY_SM.get((arch, sm_count), {})
+    rows = sorted((key, choice) for key, choice in table.items() if choice is not None)
+    if not rows:
+        pytest.skip(f"no K1 override of {arch} on {sm_count} SMs")
+    g = torch.Generator(device=device).manual_seed(SEED + 94)
+    ran = 0
+    for key, (block_n, splits) in rows:
+        _, L, M, N, dt = key
+        f32 = dt == "f32"
+        for T in cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS:
+            plan = cake_backend.k1_plan(
+                arch=arch, L=L, M=M, N=N, K=T, out_f32=f32, sm_count=sm_count
+            )
+            if plan != (block_n, splits):  # an excluded token count
+                continue
+            G, X = _bf16((T, N), device, g), _bf16((T, M), device, g)
+            out_dtype = torch.float32 if f32 else torch.bfloat16
+            want = torch.full((N, M), float("nan"), device=device, dtype=out_dtype)
+            prepared = cake_backend.prepare_projection_wgrad(
+                G, X, want, deterministic=False
+            )
+            prepared.launch()
+            cake_backend.clear_convenience_caches()
+            out = torch.full_like(want, float("nan"))
+            assert cake_backend.projection_wgrad(G, X, out, deterministic=False) is out
+            torch.cuda.synchronize()
+            (entry,) = [
+                e for e in cake_backend._K1_ATOMIC_CACHE.values() if e.plan is not None
+            ]
+            assert entry.k1 is not None, (key, T)
+            assert (entry.plan.block_n, entry.plan.splits) == plan, (key, T)
+            if splits <= 2:  # at most two partials per element: bitwise reproducible
+                assert torch.equal(out, want), (key, T)
+            else:
+                _k1_check(out, G.double().t() @ X.double(), f"{M} {N} {dt} {T}")
+            assert _arena_tickets_zero()
+            ran += 1
+    assert ran
+
+
 def test_gpu_router_token_windows_run_at_their_edges():
     """Unforced (``deterministic=False``, no split count): at the first and the last token count of every token window
     of a router weight-gradient row of this architecture (the smallest measured count, 64, for a window that starts
