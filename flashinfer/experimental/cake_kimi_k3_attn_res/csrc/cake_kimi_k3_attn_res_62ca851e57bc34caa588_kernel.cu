@@ -47,27 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
-#define TMEM__TMEM_VALUES_OFFSET 0
-#define NUM_CHUNK_PIPE_STAGES 2
-#define SMEM_V_BUFS_OFF 0
-#define SMEM_V_BUFS_STAGE_BYTES 57344
-#define SMEM_V_BUFS_STRIDE 57344
-#define SMEM_DELTA_BUFS_OFF 114688
-#define SMEM_DELTA_BUFS_STAGE_BYTES 14336
-#define SMEM_DELTA_BUFS_STRIDE 14336
-#define SMEM_OUTPUT_NORM_BUF_OFF 143360
-#define SMEM_OUTPUT_NORM_BUF_STAGE_BYTES 14336
-#define SMEM_OUTPUT_NORM_BUF_STRIDE 14336
-#define SMEM_STATS_OFF 157696
-#define SMEM_STATS_STAGE_BYTES 512
-#define SMEM_STATS_STRIDE 512
-#define SMEM_OUTPUT_STATS_OFF 158208
-#define SMEM_OUTPUT_STATS_STAGE_BYTES 64
-#define SMEM_OUTPUT_STATS_STRIDE 64
-#define SMEM_TOTAL 158336
-#define THREADS 288
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -108,24 +87,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         "DONE:\n\t"
         "}\n"
         :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Exact plain CTA wait (no .sem/.scope, PTX's default .acquire.cta) used by
-// source schedules whose PTX spells no qualifier while retaining a typed
-// suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_plain_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_PLAIN_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_PLAIN_HINT;\n\t"
-        "bra LAB_WAIT_PLAIN_HINT;\n\t"
-        "DONE_PLAIN_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
 }
 
 
@@ -229,7 +190,7 @@ __device__ __forceinline__ __nv_bfloat162 __as_bf16x2(unsigned int v) {
 extern "C" {
 
 __global__ __launch_bounds__(288, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kimi_k3_attn_res_9506658679324ca65a9a(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
+kernel_cake_kimi_k3_attn_res_62ca851e57bc34caa588(__nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ prefix, __nv_bfloat16* __restrict__ delta, __nv_bfloat16* __restrict__ blocks, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ qk_weight, __nv_bfloat16* __restrict__ output_norm_weight, unsigned long long blocks_m_stride, unsigned long long blocks_k_stride, float eps, float output_norm_eps, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -249,7 +210,7 @@ kernel_cake_kimi_k3_attn_res_9506658679324ca65a9a(__nv_bfloat16* __restrict__ ou
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* v_bufs = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int v_bufs_addr = smem + 0;
     __nv_bfloat16* delta_bufs = reinterpret_cast<__nv_bfloat16*>(smem_raw + 114688);
@@ -261,8 +222,7 @@ kernel_cake_kimi_k3_attn_res_9506658679324ca65a9a(__nv_bfloat16* __restrict__ ou
     float* output_stats = reinterpret_cast<float*>(smem_raw + 158208);
     const int output_stats_addr = smem + 158208;
 
-    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 5 barriers)
-    // Mbarriers at smem_raw[158272..158312)
+    // Mbarrier init (5 barriers at smem_raw[158272..158312))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -293,10 +253,8 @@ kernel_cake_kimi_k3_attn_res_9506658679324ca65a9a(__nv_bfloat16* __restrict__ ou
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem__tmem_values = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem__tmem_values = taddr;
 
     // ---- Role: producer ----
     if (warp == 0) {
@@ -307,7 +265,7 @@ kernel_cake_kimi_k3_attn_res_9506658679324ca65a9a(__nv_bfloat16* __restrict__ ou
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                     "[%0], [%1], %2, [%3];"
-                    :: "r"(output_norm_buf_addr), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(output_norm_weight) + ((unsigned long long)0 * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(output_norm_ready_addr)
+                    :: "r"(output_norm_buf_addr), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(output_norm_weight) + (unsigned long long)0 * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(output_norm_ready_addr)
                     : "memory");
             }
             unsigned int producer_stage = 0;
@@ -319,7 +277,7 @@ kernel_cake_kimi_k3_attn_res_9506658679324ca65a9a(__nv_bfloat16* __restrict__ ou
                     const int source_base = chunk * 4;
                     const int remaining_sources = 7 - source_base;
                     const int active_rows = ((remaining_sources > 4) ? 4 : remaining_sources);
-                    mbarrier_wait_plain_hint(consumed_addr + (producer_stage) * 8, _phase_consumed, 10000000);
+                    mbarrier_wait(consumed_addr + (producer_stage) * 8, _phase_consumed);
                     if (elect_sync()) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         const int extra_delta_row = ((chunk == 1) ? 1 : 0);
@@ -332,18 +290,18 @@ kernel_cake_kimi_k3_attn_res_9506658679324ca65a9a(__nv_bfloat16* __restrict__ ou
                                     asm volatile(
                                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                                         "[%0], [%1], %2, [%3];"
-                                        :: "r"(v_bufs_addr + (producer_stage * 4 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
+                                        :: "r"(v_bufs_addr + (producer_stage * 4 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(prefix) + (unsigned long long)(token * 7168) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
                                         : "memory");
                                     asm volatile(
                                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                                         "[%0], [%1], %2, [%3];"
-                                        :: "r"(delta_bufs_addr + producer_stage * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(delta) + ((unsigned long long)(token * 7168) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
+                                        :: "r"(delta_bufs_addr + producer_stage * 7168 * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(delta) + (unsigned long long)(token * 7168) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
                                         : "memory");
                                 } else {
                                     asm volatile(
                                         "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                                         "[%0], [%1], %2, [%3];"
-                                        :: "r"(v_bufs_addr + (producer_stage * 4 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + ((unsigned long long)((unsigned long long)token * blocks_m_stride + (unsigned long long)source * blocks_k_stride) * (unsigned long long)2))), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
+                                        :: "r"(v_bufs_addr + (producer_stage * 4 * 7168 + (unsigned int)(source_in_chunk * 7168)) * 2), "l"(reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(blocks) + (unsigned long long)((unsigned long long)token * blocks_m_stride + (unsigned long long)source * blocks_k_stride) * (unsigned long long)2)), "r"((uint32_t)(14336)), "r"(ready_addr + (producer_stage) * 8)
                                         : "memory");
                                 }
                             }
