@@ -3033,7 +3033,8 @@ def _skip_unless_runnable(W: int, *, gate: str | None = "g") -> None:
         pytest.skip(f"{W} CUDA devices required, {torch.cuda.device_count()} visible")
     if not _programs_exported():
         pytest.skip("the KCP programs are not exported in the package's build.json yet")
-    if cake_jit.device_arch(torch.cuda.current_device()) not in cake_jit.ARCHES:
+    capability = tuple(torch.cuda.get_device_capability(torch.cuda.current_device()))
+    if cake_jit.arch_for_capability(capability) is None:
         pytest.skip("the current device's architecture is not covered by the package")
 
 
