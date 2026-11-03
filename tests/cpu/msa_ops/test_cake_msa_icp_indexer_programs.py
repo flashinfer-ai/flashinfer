@@ -51,6 +51,7 @@ import torch
 import flashinfer.msa_ops as msa_ops
 from flashinfer.experimental.cake_msa_icp_indexer import cake_backend as cb
 from flashinfer.experimental.cake_msa_icp_indexer import cake_indexer, cake_jit
+from flashinfer.msa_ops import cake_icp_indexer as msa_icp
 from tests.test_helpers import cake_msa_icp_inputs as ref
 
 FP8 = torch.float8_e4m3fn
@@ -560,6 +561,8 @@ def test_records_are_well_formed() -> None:
         "prefill_list_carrier": ("tokens_per_cta_by_head",),
         "plan": cake_jit.GRID_RULES,
     }
+    for role in DEVICE_COUNT_ROLES:
+        grid_kind[role + "_dc"] = grid_kind[role]
     for name, record in cake_jit.MODULES.items():
         assert re.fullmatch(r"[a-z][a-z0-9_]*", name), name
         assert re.fullmatch(rf"{cake_jit.PREFIX}_[0-9a-f]{{20}}", record["library"]), (
@@ -734,12 +737,40 @@ def test_package_supersedes_the_top_level_sources() -> None:
         )
 
 
-@pytest.mark.parametrize("arch", ARCHES)
-def test_backend_binds_every_kernel_parameter(monkeypatch, arch: str) -> None:
-    """Drive one valid call per role through the exported registry and check
-    that each launched record receives a value for every kernel parameter."""
-    launches = _intercept(monkeypatch, arch, real_registry=True)
-    vocabulary = _vocabulary()
+DEVICE_COUNT_ROLES = (
+    "select_prefill",
+    "select_publish",
+    "topk16_publish",
+    "merge",
+    "merge_legacy",
+    "merge_prefill",
+)
+_TOKEN_COUNT_ENTRIES = frozenset(
+    (
+        "topk_select_prefill",
+        "topk_select_publish",
+        "decode_score_publish",
+        "merge_candidates",
+    )
+)
+_REAL_CAKE = msa_icp._cake
+
+
+class _WithTokenCount:
+    """The backend with ``token_count`` passed to every entry that takes one."""
+
+    def __init__(self, inner: Any, count: torch.Tensor) -> None:
+        self._inner, self._count = inner, count
+
+    def __getattr__(self, name: str) -> Any:
+        fn = getattr(self._inner, name)
+        if name not in _TOKEN_COUNT_ENTRIES:
+            return fn
+        return lambda *a, **k: fn(*a, token_count=self._count, **k)
+
+
+def _drive_every_role(arch: str) -> None:
+    """One valid call per exported role (every layout, tagged and legacy)."""
     for page, tp in LAYOUTS:
         _call(
             msa_ops.msa_icp_index_score_sharded,
@@ -763,6 +794,22 @@ def test_backend_binds_every_kernel_parameter(monkeypatch, arch: str) -> None:
         _call(msa_ops.msa_icp_merge_candidates, merge_args(tp, prefill=True))
         # legacy decode merges of 8+ tokens take the one-token-per-CTA program
         _call(msa_ops.msa_icp_merge_candidates, merge_args(tp, t=9, cap=9))
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_backend_binds_every_kernel_parameter(monkeypatch, arch: str) -> None:
+    """Drive one valid call per role through the exported registry and check
+    that each launched record receives a value for every kernel parameter."""
+    launches = _intercept(monkeypatch, arch, real_registry=True)
+    vocabulary = _vocabulary()
+    _drive_every_role(arch)
+    # The device-count programs: the same calls with a device token count.
+    count = torch.empty((1,), dtype=torch.int32, device=META)
+    monkeypatch.setattr(cb, "_token_count", lambda t: "" if t is None else "_dc")
+    monkeypatch.setattr(
+        msa_icp, "_cake", lambda backend: _WithTokenCount(_REAL_CAKE(backend), count)
+    )
+    _drive_every_role(arch)
     launched = {launch.name for launch in launches}
     want = {
         name for name, record in cake_jit.MODULES.items() if arch in record["arches"]
