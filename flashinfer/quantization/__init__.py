@@ -15,7 +15,7 @@ Licensed under the Apache License, Version 2.0.
 from .packbits import packbits, segment_packbits
 
 # Re-export CSF block-scale compression
-from .csf import CsfScales, encode_csf_scales
+from .csf import CsfScales, encode_csf_scales, expand_csf_scales
 
 # Re-export JIT module generator (used by tests and AOT compilation)
 from ..jit.quantization import gen_quantization_module
@@ -92,6 +92,7 @@ __all__ = [
     # CSF block scales
     "CsfScales",
     "encode_csf_scales",
+    "expand_csf_scales",
     # JIT module generator
     "gen_quantization_module",
     # FP8

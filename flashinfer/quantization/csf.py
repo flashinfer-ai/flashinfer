@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 
 from ..api_logging import flashinfer_api
+from ..tllm_enums import SfLayout
 from .packbits import get_quantization_module
 
 
@@ -107,3 +108,59 @@ def encode_csf_scales(scales: torch.Tensor) -> CsfScales:
         return CsfScales(
             fixed, exceptions, row_offsets[::16].to(torch.int32), rows, cols
         )
+
+
+@flashinfer_api
+def expand_csf_scales(
+    csf: CsfScales,
+    out: torch.Tensor,
+    token_selected_experts: Optional[torch.Tensor] = None,
+    layout: SfLayout = SfLayout.layout_linear,
+    swap_row_halves: bool = False,
+) -> torch.Tensor:
+    r"""Expand CSF block scales into a scale buffer, one matrix per expert.
+
+    Nothing is read back to the host, so the expansion can run under CUDA graph capture, with
+    the routing changing between replays.
+
+    Parameters
+    ----------
+    csf : CsfScales
+        Scales from :func:`encode_csf_scales`, one matrix per expert.
+    out : torch.Tensor
+        Contiguous destination in a one-byte dtype on the scales' device, written in place:
+
+        - ``layout_128x4``: ``[num_experts, round_up(rows, 128), round_up(cols, 4)]`` in the
+          128x4 swizzled layout of the fused MoE kernels, the padding written as zeros.
+        - ``layout_linear``: ``[num_experts, rows, cols]``.
+    token_selected_experts : Optional[torch.Tensor]
+        Contiguous int32 expert ids of any shape, such as the ``[num_tokens, top_k]`` routing
+        of a fused MoE call. Only these experts are expanded and the rest of ``out`` keeps its
+        bytes; ids outside ``[0, num_experts)`` are skipped. ``None`` expands every expert.
+        The routed expansion costs more as the ids grow, while ``None`` costs the same for any
+        routing: with 512 experts and top-10 routing on SM80, passing the ids was faster up to
+        64 tokens and ``None`` from 128 tokens.
+    layout : SfLayout
+        ``SfLayout.layout_128x4`` or ``SfLayout.layout_linear``.
+    swap_row_halves : bool
+        Swap the two halves of each matrix's rows, e.g. to turn ``[w1; w3]`` checkpoint
+        order into the ``[w3; w1]`` order of the fused MoE kernels. Needs ``rows % 32 == 0``.
+
+    Returns
+    -------
+    torch.Tensor
+        ``out``.
+    """
+    if out.element_size() != 1:
+        raise ValueError(f"out must have a one-byte dtype, got {out.dtype}")
+    with torch.cuda.device(out.device):
+        get_quantization_module().csf_expand(
+            csf.fixed,
+            csf.exceptions,
+            csf.exc_offsets,
+            token_selected_experts,
+            out.view(torch.uint8),
+            int(layout),
+            swap_row_halves,
+        )
+    return out

@@ -18,7 +18,8 @@ import numpy as np
 import pytest
 import torch
 
-from flashinfer.quantization import encode_csf_scales
+from flashinfer.quantization import SfLayout, encode_csf_scales, expand_csf_scales
+from flashinfer.utils import round_up
 
 
 def encode_ref(scales: np.ndarray):
@@ -104,3 +105,99 @@ def test_encode_csf_scales_position_limit():
     check_encode(scales)
     with pytest.raises(Exception, match="2\\^24"):
         encode_csf_scales(torch.zeros(1 << 16, 258, dtype=torch.uint8, device="cuda"))
+
+
+def random_scales(rng, shape, spread=6.0):
+    center = rng.integers(0, 256, (*shape[:2], 1))
+    return torch.from_numpy(
+        np.clip(np.rint(rng.normal(center, spread, shape)), 0, 255).astype(np.uint8)
+    ).cuda()
+
+
+def swap_halves(scales: torch.Tensor):
+    rows = scales.shape[1]
+    return torch.cat((scales[:, rows // 2 :], scales[:, : rows // 2]), 1)
+
+
+def swizzle_128x4_ref(scales: torch.Tensor):
+    num_matrices, rows, cols = scales.shape
+    padded = scales.new_zeros(num_matrices, round_up(rows, 128), round_up(cols, 4))
+    padded[:, :rows, :cols] = scales
+    m, k = padded.shape[1:]
+    padded = padded.reshape(num_matrices, m // 128, 4, 32, k // 4, 4)
+    return padded.permute(0, 1, 4, 3, 2, 5).reshape(num_matrices, m, k)
+
+
+@pytest.mark.parametrize(
+    "num_matrices,rows,cols", [(3, 32, 2), (2, 256, 40), (4, 384, 10), (2, 160, 20)]
+)
+@pytest.mark.parametrize("swap_row_halves", [False, True])
+def test_expand_csf_scales_layouts(num_matrices, rows, cols, swap_row_halves):
+    scales = random_scales(
+        np.random.default_rng(rows + cols), (num_matrices, rows, cols)
+    )
+    csf = encode_csf_scales(scales)
+    if swap_row_halves:
+        scales = swap_halves(scales)
+    for ref, layout in (
+        (scales, SfLayout.layout_linear),
+        (swizzle_128x4_ref(scales), SfLayout.layout_128x4),
+    ):
+        out = torch.full_like(ref, 0x5A)
+        expand_csf_scales(csf, out, layout=layout, swap_row_halves=swap_row_halves)
+        assert torch.equal(out, ref), layout
+
+
+def test_expand_csf_scales_no_rows():
+    csf = encode_csf_scales(torch.zeros(1, 0, 40, dtype=torch.uint8, device="cuda"))
+    out = torch.empty(1, 0, 40, dtype=torch.uint8, device="cuda")
+    for layout in (SfLayout.layout_linear, SfLayout.layout_128x4):
+        expand_csf_scales(csf, out, layout=layout)
+
+
+def check_routed(out, ref, poison, routed):
+    for e in range(ref.shape[0]):
+        assert torch.equal(
+            out[e], ref[e] if e in routed else torch.full_like(out[e], poison)
+        )
+
+
+@pytest.mark.parametrize("swap_row_halves", [False, True])
+def test_expand_csf_scales_routed(swap_row_halves):
+    scales = random_scales(np.random.default_rng(2), (16, 256, 40))
+    csf = encode_csf_scales(scales)
+    ref = swizzle_128x4_ref(swap_halves(scales) if swap_row_halves else scales)
+    # Repeated experts and ids outside [0, 16).
+    ids = torch.tensor([[3, 7], [7, 15], [3, 0], [-1, 16]], dtype=torch.int32).cuda()
+    out = torch.full_like(ref, 0xAB)
+    expand_csf_scales(
+        csf, out, ids, layout=SfLayout.layout_128x4, swap_row_halves=swap_row_halves
+    )
+    check_routed(out, ref, 0xAB, {0, 3, 7, 15})
+
+
+def test_expand_csf_scales_cuda_graph():
+    num_experts, top_k = 32, 4
+    scales = random_scales(np.random.default_rng(3), (num_experts, 384, 40))
+    csf = encode_csf_scales(scales)
+    ref = swizzle_128x4_ref(swap_halves(scales))
+    ids = torch.zeros(8, top_k, dtype=torch.int32, device="cuda")
+    out = torch.empty_like(ref)
+
+    def expand():
+        expand_csf_scales(
+            csf, out, ids, layout=SfLayout.layout_128x4, swap_row_halves=True
+        )
+
+    expand()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        expand()
+    for seed in range(3):
+        routing = torch.rand(
+            8, num_experts, generator=torch.Generator().manual_seed(seed)
+        )
+        ids.copy_(routing.topk(top_k).indices)
+        out.fill_(0xFF)
+        graph.replay()
+        check_routed(out, ref, 0xFF, set(ids.flatten().tolist()))

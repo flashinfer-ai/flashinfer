@@ -15,6 +15,8 @@
  */
 #include "tvm_ffi_utils.h"
 
+using tvm::ffi::Optional;
+
 void packbits(TensorView x, const std::string& bitorder, TensorView y);
 
 void segment_packbits(TensorView x, TensorView input_indptr, TensorView output_indptr,
@@ -29,8 +31,13 @@ void csf_encode_rows(TensorView scales, TensorView fixed, TensorView row_excepti
 void csf_encode_exceptions(TensorView scales, TensorView fixed, TensorView row_offsets,
                            TensorView exceptions);
 
+void csf_expand(TensorView fixed, TensorView exceptions, TensorView exc_offsets,
+                Optional<TensorView> token_selected_experts, TensorView out, int64_t layout,
+                bool swap_row_halves);
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(packbits, packbits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(segment_packbits, segment_packbits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(per_token_group_quant_8bit, per_token_group_quant_8bit);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(csf_encode_rows, csf_encode_rows);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(csf_encode_exceptions, csf_encode_exceptions);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(csf_expand, csf_expand);
