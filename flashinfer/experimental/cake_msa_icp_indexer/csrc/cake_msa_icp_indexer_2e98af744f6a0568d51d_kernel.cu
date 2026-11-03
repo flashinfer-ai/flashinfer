@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_SLAB_K_OFF 0
-#define SMEM_SLAB_K_STAGE_BYTES 1024
-#define SMEM_SLAB_K_STRIDE 1024
-#define SMEM_SLAB_C_OFF 1024
-#define SMEM_SLAB_C_STAGE_BYTES 1024
-#define SMEM_SLAB_C_STRIDE 1024
-#define SMEM_TOTAL 2048
-#define THREADS 128
-
 #include <math_constants.h>
 
 __device__ __forceinline__ float max_noftz(float a, float b) {

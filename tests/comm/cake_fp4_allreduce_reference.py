@@ -94,7 +94,6 @@ E2M1_VALUES = (
 )
 WORLD_SIZES = (2, 4)
 TWOSHOT_WORLD_SIZE = 4
-TP4_ROW_MULTIPLE = 4
 
 # Fused residual + Gemma RMSNorm family.
 EPS = 1e-6
@@ -237,13 +236,14 @@ def row_scales(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def encode_rows(
-    values: torch.Tensor, inv: torch.Tensor
+    values: torch.Tensor, inv: torch.Tensor, *, canonical: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Float32 rows ``[R, 6144]`` with the row scales ``inv`` ``[R]`` -> (values ``[R, 3072]`` u8, scales ``[R, 384]`` u8).
 
     Per block of 16: ``sf = e4m3(div_rn(mul_rn(blockmax, inv), 6))``,
     ``m = sf > 0 ? div_rn(inv, sf) : 0``, ``q = e2m1(mul_rn(x, m))`` with ``-0``
-    canonicalised to ``+0``.
+    canonicalised to ``+0``; ``canonical=False`` keeps the ``-0`` codes that
+    ``cvt.rn.satfinite.e2m1x2.f32`` emits for small negative values.
     """
     rows = values.shape[0]
     blocks = values.reshape(rows, BLOCKS_PER_ROW, BLOCK)
@@ -254,7 +254,9 @@ def encode_rows(
     sff = e4m3_to_f32(sf)
     m = torch.where(sff > 0, f32_div_rn(inv_b, sff), torch.zeros_like(sff))
     g = f32_mul_rn(blocks, m.reshape(rows, BLOCKS_PER_ROW, 1).expand_as(blocks))
-    codes = canon_neg0(e2m1_rn_satfinite(g))
+    codes = e2m1_rn_satfinite(g)
+    if canonical:
+        codes = canon_neg0(codes)
     return pack_e2m1(codes.reshape(rows, HIDDEN)), sf
 
 
@@ -292,12 +294,16 @@ def global_scale(x: torch.Tensor) -> torch.Tensor:
 
 
 def encode_records(x: torch.Tensor, gs: torch.Tensor) -> torch.Tensor:
-    """The pre-quantised input records ``[R, 3456]`` u8 of ``x`` under the static scale ``gs``: ``inv = div_rn(1, gs)`` for every row."""
+    """The pre-quantised input records ``[R, 3456]`` u8 of ``x`` under the static scale ``gs``: ``inv = div_rn(1, gs)`` for every row.
+
+    The records keep the E2M1 ``-0`` codes a producer's quantiser emits; the
+    kernels canonicalise them on the wire, where ``-0`` is the sentinel.
+    """
     f = x.to(torch.float32)
     rows = f.shape[0]
     one = torch.ones((rows,), dtype=torch.float32, device=f.device)
     inv = f32_div_rn(one, gs.to(torch.float32).reshape(-1)[:1].expand(rows))
-    q, sf = encode_rows(f, inv)
+    q, sf = encode_rows(f, inv, canonical=False)
     return torch.cat((q, sf), dim=1).contiguous()
 
 
@@ -365,10 +371,6 @@ def _check_world(count: int) -> None:
 
 def _finish(acc: torch.Tensor, world_size: int) -> torch.Tensor:
     if world_size == TWOSHOT_WORLD_SIZE:
-        if acc.shape[0] % TP4_ROW_MULTIPLE:
-            raise ValueError(
-                f"the two-shot all-reduce needs a multiple of {TP4_ROW_MULTIPLE} rows, got {acc.shape[0]}"
-            )
         acc = twoshot(acc)
     return acc.to(torch.bfloat16)
 
@@ -443,8 +445,15 @@ def records_of(
 # ---------------------------------------------------------------------------
 
 
-# The fused-norm programs' ``ss_order`` (a registry key): the chunk order of each lane's pass-1 chains.
-SS_ORDERS = ("natural", "perm")
+# The fused-norm programs' sum-of-squares order: the one-shot programs' ``ss_order`` registry key (the
+# chunk order of each lane's pass-1 chains), and ``"halves"`` for the two-shot programs, whose record has
+# no ``ss_order`` (:func:`ss_order_of`).
+SS_ORDERS = ("natural", "perm", "halves")
+
+
+def ss_order_of(record: dict) -> str:
+    """The sum-of-squares order of a fused-norm program's registry record."""
+    return record["ss_order"] if record["ss_order"] is not None else "halves"
 
 
 def sum_of_squares(z: torch.Tensor, *, order: str = "natural") -> torch.Tensor:
@@ -458,13 +467,23 @@ def sum_of_squares(z: torch.Tensor, *, order: str = "natural") -> torch.Tensor:
     ``ss_order``: ``"natural"`` takes a pair's four chunks in the row's order
     ``k = 0..3``; ``"perm"`` takes them in the lane's loaded order ``f ^ k`` with
     ``f = (l >> 1) & 3`` (the same squares in another float32 order, so ``ss``
-    may differ in its last ulp).
+    may differ in its last ulp).  ``"halves"`` (the two-shot programs) runs the
+    natural chains over pairs 0-2 and over pairs 3-5 separately, reduces each
+    half across the lanes, and adds the second half's sum to the first's: a
+    two-warp team of the two-shot kernel owns one half per warp, so every
+    phase-B schedule gives the same bits.
     """
     if order not in SS_ORDERS:
         raise ValueError(f"order must be one of {SS_ORDERS}, got {order!r}")
     rows = z.shape[0]
     # [rows, lane, pair, chunk, word, parity]
     chains = z.reshape(rows, 6, 32, 4, 4, 2).permute(0, 2, 1, 3, 4, 5)
+    if order == "halves":
+        halves = [
+            _lane_sum(chains[:, :, 3 * h : 3 * h + 3].reshape(rows, 32, 48, 2))
+            for h in range(2)
+        ]
+        return f32_add_rn(halves[0], halves[1])
     if order == "perm":
         lanes = torch.arange(32, device=z.device)
         # slot k of lane l holds chunk f ^ k
@@ -474,13 +493,19 @@ def sum_of_squares(z: torch.Tensor, *, order: str = "natural") -> torch.Tensor:
         chains = torch.gather(
             chains, 3, chunk.reshape(1, 32, 1, 4, 1, 1).expand(rows, 32, 6, 4, 4, 2)
         )
-    chains = chains.reshape(rows, 32, 96, 2)
-    acc = torch.zeros((rows, 32, 2), dtype=torch.float32, device=z.device)
-    for step in range(96):
+    return _lane_sum(chains.reshape(rows, 32, 96, 2))
+
+
+def _lane_sum(chains: torch.Tensor) -> torch.Tensor:
+    """The warp's sum of squares of ``chains`` ``[rows, lane, step, parity]``: per lane two ``fma.rn.f32`` chains
+    over the steps, added, then the ``add.rn.f32`` butterfly over lane masks 16, 8, 4, 2, 1."""
+    rows, _, steps, _ = chains.shape
+    acc = torch.zeros((rows, 32, 2), dtype=torch.float32, device=chains.device)
+    for step in range(steps):
         v = chains[:, :, step, :]
         acc = f32_fma_rn(v, v, acc)
     ss = f32_add_rn(acc[:, :, 0], acc[:, :, 1])
-    lanes = torch.arange(32, device=z.device)
+    lanes = torch.arange(32, device=chains.device)
     for mask in (16, 8, 4, 2, 1):
         ss = f32_add_rn(ss, ss[:, lanes ^ mask])
     return ss[:, 0]
@@ -554,7 +579,8 @@ def reference_fused_rmsnorm(
     weight_bias: float = WEIGHT_BIAS,
     ss_order: str = "natural",
 ) -> FusedNormReference:
-    """Reference of the fused call on two ranks' bfloat16 partials, or (``records`` + ``global_scales``) NVFP4 records.
+    """Reference of the fused call on every rank's bfloat16 partial, or (``records`` + ``global_scales``) NVFP4 records:
+    the one-shot sum on two ranks, the two-shot decode (bfloat16 partials) on four.
 
     A ``weight_bias`` other than 1 or another ``eps`` builds the reference of a
     call with those runtime scalars (or a deliberately wrong one for a negative
@@ -571,14 +597,17 @@ def reference_fused_rmsnorm(
         if global_scales is None:
             raise ValueError("records need global_scales")
         if len(records) != 2:
-            raise ValueError("the fused-norm family is the two-rank one-shot exchange")
+            raise ValueError(
+                "the NVFP4-input fused norm is the two-rank one-shot exchange"
+            )
         acc = oneshot_sum(sources_records(records, global_scales))
     else:
         if partials_bf16 is None:
             raise ValueError("partials_bf16 or records is required")
-        if len(partials_bf16) != 2:
-            raise ValueError("the fused-norm family is the two-rank one-shot exchange")
+        _check_world(len(partials_bf16))
         acc = oneshot_sum(sources_bf16(partials_bf16))
+        if len(partials_bf16) == TWOSHOT_WORLD_SIZE:
+            acc = twoshot(acc)
     if residual_bf16.shape != acc.shape:
         raise ValueError(
             f"residual must be {tuple(acc.shape)}, got {tuple(residual_bf16.shape)}"

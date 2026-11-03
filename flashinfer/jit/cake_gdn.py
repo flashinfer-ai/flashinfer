@@ -46,6 +46,14 @@ _EXPORT_SCHEMA = "flashinfer-cake-gdn-decode-standalone-export-v1"
 _DEFINE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RECORD_NAME = re.compile(r"^(decode|prefill)_(.+)_[0-9a-f]{12}$")
 _RECORD_TMA_ABI = {"decode": "pointer", "prefill": "grid_constant"}
+# A decode record whose kernel takes its state as a ``const __grid_constant__ CUtensorMap``
+# (the TMA-state bodies) spells ``"tma_abi": "grid_constant"``; its host template encodes the
+# tensor map (``_DECODE_TMA_TEMPLATES``).  Every other decode record derives ``pointer``.
+_RECORD_TMA_ABI_SPELLED = {
+    "decode": ("pointer", "grid_constant"),
+    "prefill": ("grid_constant",),
+}
+_DECODE_TMA_TEMPLATES = frozenset({"host/templates/decode_fp32_t1_tma_state.cc.in"})
 _ARCH_ACTIVE_CLUSTERS: dict[CakeGDNArch, int] = {
     "sm_100a": 148,
     "sm_103a": 160,
@@ -147,7 +155,8 @@ def _derive_record_fields(record: dict[str, Any]) -> None:
     ``<domain>_<schedule>_<12 hex>`` names every record: ``domain`` is its
     first token, ``source_schedule`` is
     ``flashinfer.cake_gdn.generated.<domain>:<schedule>``, ``tma_abi`` is
-    fixed per domain, ``host_binding.entry`` is ``run_<name>`` and the
+    fixed per domain (a TMA-state decode record spells ``grid_constant``,
+    the ABI of its host template), ``host_binding.entry`` is ``run_<name>`` and the
     record-level ``architectures`` is the sorted union of its outputs'.  A
     field the manifest spells out must agree with the derived value.
     """
@@ -157,10 +166,23 @@ def _derive_record_fields(record: dict[str, Any]) -> None:
     if match is None:
         raise RuntimeError(f"unparseable Cake GDN record name {name!r}")
     domain, schedule = match.groups()
+    tma_abi = record.get("tma_abi", _RECORD_TMA_ABI[domain])
+    if tma_abi not in _RECORD_TMA_ABI_SPELLED[domain]:
+        raise RuntimeError(
+            f"Cake GDN record {name!r} spells tma_abi={tma_abi!r}; a {domain} record takes "
+            f"{list(_RECORD_TMA_ABI_SPELLED[domain])}"
+        )
+    if domain == "decode" and (tma_abi == "grid_constant") != (
+        record["host_binding"]["template"] in _DECODE_TMA_TEMPLATES
+    ):
+        raise RuntimeError(
+            f"Cake GDN record {name!r}: tma_abi={tma_abi!r} does not match its host "
+            f"template {record['host_binding']['template']!r}"
+        )
     derived: dict[str, Any] = {
         "domain": domain,
         "source_schedule": f"flashinfer.cake_gdn.generated.{domain}:{schedule}",
-        "tma_abi": _RECORD_TMA_ABI[domain],
+        "tma_abi": tma_abi,
         "architectures": sorted(
             {arch for output in record["outputs"] for arch in output["architectures"]}
         ),
@@ -815,7 +837,11 @@ def _variant_for(
         "prefill": "flashinfer.cake_gdn.generated.prefill",
     }[domain]
     expected_source = f"{source_schedule}:{schedule_attr}"
-    expected_tma_abi = "grid_constant" if domain == "prefill" else "pointer"
+    expected_tma_abi = (
+        "grid_constant"
+        if domain == "prefill" or schedule_attr in CAKE_GDN_DECODE_TMA_STATE_SCHEDULES
+        else "pointer"
+    )
     matches = [
         record
         for record in _manifest()["variants"]
@@ -1521,14 +1547,32 @@ def cake_gdn_bf16_t1_route(
 # of the serial recurrence, fully unrolled token loop; bitwise-identical output),
 # B200/B300 keep the shipped body.  Mirrors
 # the Cake decode kernel program's `select_bf16_verify_tile16_body`.
+# Rubin takes the `_hqx` twin of `tile16_vpre_es_pro` (the h.q partial sums reduced
+# by a transpose exchange instead of a butterfly; bitwise-identical output), except
+# for the (H, HV, batch) rows below, where it measured no faster than the shipped
+# body on R200 and the shipped body stays.
 CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES: dict[str, str] = {
-    "sm_107a": "tile16_vpre_es_pro"
+    "sm_107a": "tile16_vpre_es_pro_hqx"
+}
+# ((architecture, num_q_heads, num_v_heads, batch_size) -> body)
+CAKE_GDN_BF16_VERIFY_TILE16_ARCH_ROW_BODIES: dict[tuple[str, int, int, int], str] = {
+    ("sm_107a", 4, 8, 2): "tile16_vpre_es_pro",
 }
 
 
-def cake_gdn_bf16_verify_tile16_schedule(arch: CakeGDNArch) -> str:
-    """Schedule attribute of the full-warp tile-v16 BF16 verify kernel on ``arch``."""
+def cake_gdn_bf16_verify_tile16_schedule(
+    arch: CakeGDNArch,
+    *,
+    num_q_heads: int | None = None,
+    num_v_heads: int | None = None,
+    batch_size: int | None = None,
+) -> str:
+    """Schedule attribute of the full-warp tile-v16 BF16 verify kernel on ``arch`` (for one row when its heads and batch are given)."""
     body = CAKE_GDN_BF16_VERIFY_TILE16_ARCH_BODIES.get(arch, "tile16")
+    if num_q_heads is not None and num_v_heads is not None and batch_size is not None:
+        body = CAKE_GDN_BF16_VERIFY_TILE16_ARCH_ROW_BODIES.get(
+            (arch, num_q_heads, num_v_heads, batch_size), body
+        )
     return f"gdn_decode_pretranspose_t4_bf16state_{body}"
 
 
@@ -1541,6 +1585,26 @@ def cake_gdn_bf16_verify_tile16_schedule(arch: CakeGDNArch) -> str:
 # sm_107a takes the `wide128_vpre_xchg` twin (exchange-based
 # output path of `wide128_vpre`; bitwise-identical output) for the T >= 2 wide rows.
 CAKE_GDN_BF16_WIDE_ARCH_BODIES: dict[str, str] = {"sm_107a": "wide128_vpre_xchg"}
+# Per (architecture, TILE_V_WIDE), the T >= 2 wide rows run a twin of that body by draft
+# window: sm_107a takes the `_pro` prologue twin (every independent global load of the
+# window issued before the first reduction; bitwise-identical output) at TILE_V_WIDE 64
+# for T = 2 and TILE_V_WIDE 32 from T = 3, and its `_pro_qpre` twin (`_pro` with the
+# second row quad's state slab prefetched to shared memory) at TILE_V_WIDE 64 from
+# T = 3.  The TILE_V_WIDE 32 T = 2 row keeps the shipped body (the `_pro` twin measured
+# 1.6 % slower there on R200).
+# ((architecture, TILE_V_WIDE) -> ((largest T of the band or None for the open band, body), ...))
+CAKE_GDN_BF16_WIDE_ARCH_TILE_BODIES: dict[
+    tuple[str, int], tuple[tuple[int | None, str], ...]
+] = {
+    ("sm_107a", 64): (
+        (2, "wide128_vpre_xchg_pro_w64"),
+        (None, "wide128_vpre_xchg_pro_qpre"),
+    ),
+    ("sm_107a", 32): (
+        (2, "wide128_vpre_xchg"),
+        (None, "wide128_vpre_xchg_pro_w32"),
+    ),
+}
 # The promoted fp32-state MTP update body (B4 T4 with the intermediate-state cache,
 # `..._mtp_t4_splitv8`) is routed per architecture as well: Rubin (sm_107a) runs its
 # `_pro` twin (producer phase parallel over the draft tokens, every independent global
@@ -1561,10 +1625,13 @@ CAKE_GDN_FP32_MTP_ARCH_BODIES: dict[tuple[str, str], str] = {
         "sm_107a",
         "gdn_decode_pretranspose_mtp_t4_splitv2_tile64",
     ): "gdn_decode_pretranspose_mtp_t4_splitv2_tile64_sl2",
+    # The B1/T2 verify record runs the `_tok_loads_hoist` twin of `_bb` on sm_107a
+    # (both draft tokens' k/q/a/b/v loads issued before the token loop;
+    # bitwise-identical output).
     (
         "sm_107a",
         "gdn_decode_pretranspose_mtp_t2_inline_tile8",
-    ): "gdn_decode_pretranspose_mtp_t2_inline_tile8_bb",
+    ): "gdn_decode_pretranspose_mtp_t2_inline_tile8_bb_tok_loads_hoist",
 }
 # The fp32-state T=1 pretranspose body (`..._splitv8`, route `indexed_fp32_t1_splitv8`)
 # is routed per architecture by the state-head count B*HV: Rubin (sm_107a) runs the
@@ -1584,12 +1651,17 @@ CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS = 256
 # (same loads, FMA and reduction order; the warp's four output rows are remapped contiguous so
 # lane 0 issues one 64-bit store instead of four scalar bf16 stores).  Bitwise-identical output.
 CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS = 64
+# From 2048 state heads (B >= 64 at HV = 32) Rubin runs the `splitv8_tilev32_ord_outlate_ld_grp`
+# twin of `splitv8_tilev32` (per-row out stores deferred behind the row loop, one cp.async
+# commit group per row group; bitwise-identical output): 4-6 % faster on R200 there.
+CAKE_GDN_FP32_T1_SPLITV8_GRP_MIN_STATE_HEADS = 2048
 # (largest state-head count of the band or None for the open last band, body)
 CAKE_GDN_FP32_T1_SPLITV8_ARCH_BANDS: dict[str, tuple[tuple[int | None, str], ...]] = {
     "sm_107a": (
         (CAKE_GDN_FP32_T1_SPLITV8_REG_MIN_STATE_HEADS, "splitv8"),
         (CAKE_GDN_FP32_T1_SPLITV8_TILEV32_MIN_STATE_HEADS - 1, "splitv8_reg_ost"),
-        (None, "splitv8_tilev32"),
+        (CAKE_GDN_FP32_T1_SPLITV8_GRP_MIN_STATE_HEADS - 1, "splitv8_tilev32"),
+        (None, "splitv8_tilev32_ord_outlate_ld_grp"),
     ),
 }
 # CTAs per state head each fp32 T=1 body launches (the host grid is B * HV times this),
@@ -1599,6 +1671,7 @@ CAKE_GDN_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
     "gdn_decode_pretranspose_splitv8": 8,
     "gdn_decode_pretranspose_splitv8_tilev32": 4,
     "gdn_decode_pretranspose_splitv8_reg_ost": 8,  # replaces the unrouted splitv8_reg entry
+    "gdn_decode_pretranspose_splitv8_tilev32_ord_outlate_ld_grp": 4,
 }
 
 
@@ -1634,17 +1707,25 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
 # head) below 32 batch rows and the shipped large body (one CTA per state head) from 32
 # on, except on Rubin (sm_107a), which runs the `mid4` twin in the small band -- four CTAs
 # per state head, each owning one Kx32 value panel over 128-byte state segments -- and the
-# `tilev32_x2` twin in the large band's wave-fit range 32 <= B < 35 -- two CTAs per state
-# head, each owning half of the V ring tiles (the single-CTA grid of 1024 .. 1088 CTAs on
-# 212 SMs becomes 2048 .. 2176 CTAs of half the work; the split pays on this edge of the
-# band only).  Both twins keep the per-lane statements and the accumulation order:
+# `hqsplit_tma3` twin in the whole large band (B >= 32): the large body's update loop split
+# in two (`hqsplit`), with each 32-wide V panel of the state loaded and stored by TMA
+# through a three-stage ring of 128-byte-swizzled shared-memory panels instead of cp.async
+# loads and per-thread stores.  Its kernel takes the state as a tensor map (``tma_abi``
+# ``grid_constant``) and 51328 bytes of dynamic shared memory (the 1024-byte aligned panel
+# ring after its three mbarriers, then q and k).  It replaces, on sm_107a, the
+# `tilev32_x2` twin of the wave-fit range 32 <= B < 37 and the `hqsplit` twin from 37 on,
+# whose records stay in the manifest.  Like the twins it replaces (whose 16-byte
+# vector state loads and stores fault on a misaligned address), it needs a 16-byte
+# aligned state base: its host shim refuses any other state with a ValueError before
+# launch.  Every twin keeps the per-lane statements and the accumulation order:
 # bitwise-identical output and state.  B200 / B300 keep the shipped bodies.  The rule
 # band folds onto the band of the shipped body / route id through the `_RULE_BANDS`
-# table, so route ids keep naming `small` / `large` (plus the twin suffix).  Mirrors
-# `NONTRANSPOSE_SMALL_BATCH_THRESHOLD` / `NONTRANSPOSE_LARGE_WAVEFIT_BATCH_LIMIT` /
+# table, so route ids keep naming `small` / `large` (plus the twin suffix).  The
+# tables follow `NONTRANSPOSE_SMALL_BATCH_THRESHOLD` /
+# `NONTRANSPOSE_LARGE_WAVEFIT_BATCH_LIMIT` /
 # `NONTRANSPOSE_FP32_T1_RULE_BANDS` / `NONTRANSPOSE_FP32_T1_ARCH_BODIES` /
-# `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` / `select_nontranspose_fp32_t1_body` in
-# the Cake decode kernel program (the Cake tree cross-checks these copies).
+# `NONTRANSPOSE_FP32_T1_CTAS_PER_STATE` / `select_nontranspose_fp32_t1_body` of the
+# Cake decode kernel program; they are kept in step by hand (no test compares them).
 CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD = 32
 CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT = (
     37  # 35 -> 37; see the Cake launcher
@@ -1661,11 +1742,14 @@ CAKE_GDN_NONTRANSPOSE_FP32_T1_RULE_BANDS: dict[str, str] = {
 }
 # ((architecture, rule band) -> schedule of the twin the rule routes there)
 CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES: dict[tuple[str, str], str] = {
-    ("sm_107a", "small"): "gdn_decode_nontranspose_fp32_t1_mid4",
-    ("sm_107a", "large_wavefit"): "gdn_decode_nontranspose_fp32_t1_tilev32_x2",
-    # Adopted 2026-10-18: the large band
-    # (B >= 37) runs the ``hqsplit`` recurrence twin on sm_107a.
-    ("sm_107a", "large"): "gdn_decode_nontranspose_fp32_t1_hqsplit",
+    # Adopted 2026-11-02: the `_rc_kq128` twin of `mid4` (q/k fetched from shared memory
+    # as 128-bit loads into registers; bitwise-identical output).
+    ("sm_107a", "small"): "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128",
+    # Adopted 2026-11-03: the whole large band (B >= 32; formerly `tilev32_x2` for
+    # 32 <= B < 37 and the ``hqsplit`` recurrence twin from 37) runs the TMA-state
+    # `hqsplit_tma3` twin on sm_107a.
+    ("sm_107a", "large_wavefit"): "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
+    ("sm_107a", "large"): "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
 }
 # CTAs per state head each nontranspose fp32 T=1 body launches (the host grid is B * HV
 # times this), keyed by the record's schedule.
@@ -1673,9 +1757,16 @@ CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE: dict[str, int] = {
     "gdn_decode_nontranspose_fp32_t1_small": 8,
     "gdn_decode_nontranspose_fp32_t1": 1,
     "gdn_decode_nontranspose_fp32_t1_mid4": 4,
+    "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128": 4,
     "gdn_decode_nontranspose_fp32_t1_tilev32_x2": 2,
     "gdn_decode_nontranspose_fp32_t1_hqsplit": 1,
+    "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3": 1,
 }
+# The decode schedules whose kernel takes its state as a tensor map (records spelling
+# ``"tma_abi": "grid_constant"``).
+CAKE_GDN_DECODE_TMA_STATE_SCHEDULES = frozenset(
+    {"gdn_decode_nontranspose_fp32_t1_hqsplit_tma3"}
+)
 
 
 def cake_gdn_nontranspose_fp32_t1_rule_band(batch_size: int) -> str:
@@ -1717,10 +1808,21 @@ def cake_gdn_nontranspose_fp32_t1_ctas_per_state(variant_name: str) -> int:
     return ctas_per_state
 
 
-def cake_gdn_bf16_wide_schedule(arch: CakeGDNArch, seq_len: int) -> str:
+def cake_gdn_bf16_wide_schedule(
+    arch: CakeGDNArch, seq_len: int, tile_v: int | None = None
+) -> str:
     if int(seq_len) <= 1:
         return "gdn_decode_pretranspose_mtp_t4_bf16state_wide128"
     body = CAKE_GDN_BF16_WIDE_ARCH_BODIES.get(arch, "wide128")
+    bands = (
+        CAKE_GDN_BF16_WIDE_ARCH_TILE_BODIES.get((arch, tile_v), ())
+        if tile_v is not None
+        else ()
+    )
+    for max_seq_len, twin in bands:
+        if max_seq_len is None or int(seq_len) <= max_seq_len:
+            body = twin
+            break
     return f"gdn_decode_pretranspose_mtp_t4_bf16state_{body}"
 
 
@@ -1897,7 +1999,12 @@ def select_cake_gdn_decode_variant(
             record = _variant_for(
                 arch=arch,
                 domain="decode",
-                schedule_attr=cake_gdn_bf16_verify_tile16_schedule(arch),
+                schedule_attr=cake_gdn_bf16_verify_tile16_schedule(
+                    arch,
+                    num_q_heads=num_q_heads,
+                    num_v_heads=num_v_heads,
+                    batch_size=batch_size,
+                ),
                 specializations={
                     "H": num_q_heads,
                     "HV": num_v_heads,
@@ -1913,7 +2020,12 @@ def select_cake_gdn_decode_variant(
                 record["name"],
             )
         if num_q_heads == 4 and num_v_heads == 8:
-            schedule_attr = cake_gdn_bf16_verify_tile16_schedule(arch)
+            schedule_attr = cake_gdn_bf16_verify_tile16_schedule(
+                arch,
+                num_q_heads=num_q_heads,
+                num_v_heads=num_v_heads,
+                batch_size=batch_size,
+            )
             specializations = {
                 "H": num_q_heads,
                 "HV": num_v_heads,
@@ -1937,7 +2049,7 @@ def select_cake_gdn_decode_variant(
         record = _variant_for(
             arch=arch,
             domain="decode",
-            schedule_attr=cake_gdn_bf16_wide_schedule(arch, seq_len),
+            schedule_attr=cake_gdn_bf16_wide_schedule(arch, seq_len, tile_v),
             specializations={
                 "CACHE_INTERMEDIATE_STATES": int(cache_intermediate_states),
                 "H": num_q_heads,

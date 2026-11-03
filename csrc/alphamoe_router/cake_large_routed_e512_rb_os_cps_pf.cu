@@ -47,17 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_STAGE_OFF 4224
-#define SMEM_STAGE_STAGE_BYTES 16384
-#define SMEM_STAGE_STRIDE 16384
-#define SMEM_LOCAL_OFFSETS_OFF 0
-#define SMEM_LOCAL_OFFSETS_STAGE_BYTES 4100
-#define SMEM_LOCAL_OFFSETS_STRIDE 4100
-#define SMEM_SCAN_VALUES_OFF 4100
-#define SMEM_SCAN_VALUES_STAGE_BYTES 32
-#define SMEM_SCAN_VALUES_STRIDE 32
-#define SMEM_TOTAL 20608
 #define THREADS 1024
 #define NUM_WARPS 32
 #define MAX_EXPERTS 512
@@ -372,7 +361,7 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_owner_stage_entry_pref
             route_by_route = 0;
             unsigned int candidate_bits = 0;
             unsigned int candidate_id = 0;
-            unsigned int candidate_key = 0;
+            unsigned int candidate_key = 4286578688;
             unsigned int _warp_redux_42;
             asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_42) : "r"(own_count));
             int own_trips = (int)_warp_redux_42;
@@ -409,14 +398,17 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_owner_stage_entry_pref
                 if ((candidate_bits & 2139095040) == 0) {
                     candidate_flat = 0;
                 }
-                candidate_key = candidate_flat ^ 2147483648u;
-                if ((candidate_flat & 2147483648u) != 0) {
-                    candidate_key = candidate_flat ^ 4294967295u;
-                }
+                candidate_key = candidate_flat;
             }
             stage[stage_base + 96 + lane] = candidate_key;
             __syncwarp();
-            int candidate_rank = 0;
+            float candidate_value_rank = 0.0f;
+            candidate_value_rank = reinterpret_cast<float*>(&candidate_key)[0];
+            float rank_counts[4];
+            rank_counts[0] = 0.0f;
+            rank_counts[1] = 0.0f;
+            rank_counts[2] = 0.0f;
+            rank_counts[3] = 0.0f;
             unsigned int keys[16];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(0) + 3]))
@@ -430,54 +422,70 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_owner_stage_entry_pref
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&keys[12])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&keys[(12) + 3]))
                 : "r"(stage_addr + (unsigned int)((stage_base + 96 + 12) * 4)));
-            if (keys[0] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[1] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[2] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[3] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[4] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[5] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[6] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[7] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[8] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[9] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[10] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[11] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[12] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[13] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[14] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
-            if (keys[15] > candidate_key) {
-                candidate_rank = candidate_rank + 1;
-            }
+            float staged_value_0 = 0.0f;
+            unsigned int _bit_cast_src_44 = keys[0];
+            staged_value_0 = reinterpret_cast<float*>(&_bit_cast_src_44)[0];
+            rank_counts[0] = rank_counts[0] + ((staged_value_0 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_1 = 0.0f;
+            unsigned int _bit_cast_src_45 = keys[1];
+            staged_value_1 = reinterpret_cast<float*>(&_bit_cast_src_45)[0];
+            rank_counts[1] = rank_counts[1] + ((staged_value_1 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_2 = 0.0f;
+            unsigned int _bit_cast_src_46 = keys[2];
+            staged_value_2 = reinterpret_cast<float*>(&_bit_cast_src_46)[0];
+            rank_counts[2] = rank_counts[2] + ((staged_value_2 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_3 = 0.0f;
+            unsigned int _bit_cast_src_47 = keys[3];
+            staged_value_3 = reinterpret_cast<float*>(&_bit_cast_src_47)[0];
+            rank_counts[3] = rank_counts[3] + ((staged_value_3 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_4 = 0.0f;
+            unsigned int _bit_cast_src_48 = keys[4];
+            staged_value_4 = reinterpret_cast<float*>(&_bit_cast_src_48)[0];
+            rank_counts[0] = rank_counts[0] + ((staged_value_4 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_5 = 0.0f;
+            unsigned int _bit_cast_src_49 = keys[5];
+            staged_value_5 = reinterpret_cast<float*>(&_bit_cast_src_49)[0];
+            rank_counts[1] = rank_counts[1] + ((staged_value_5 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_6 = 0.0f;
+            unsigned int _bit_cast_src_50 = keys[6];
+            staged_value_6 = reinterpret_cast<float*>(&_bit_cast_src_50)[0];
+            rank_counts[2] = rank_counts[2] + ((staged_value_6 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_7 = 0.0f;
+            unsigned int _bit_cast_src_51 = keys[7];
+            staged_value_7 = reinterpret_cast<float*>(&_bit_cast_src_51)[0];
+            rank_counts[3] = rank_counts[3] + ((staged_value_7 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_8 = 0.0f;
+            unsigned int _bit_cast_src_52 = keys[8];
+            staged_value_8 = reinterpret_cast<float*>(&_bit_cast_src_52)[0];
+            rank_counts[0] = rank_counts[0] + ((staged_value_8 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_9 = 0.0f;
+            unsigned int _bit_cast_src_53 = keys[9];
+            staged_value_9 = reinterpret_cast<float*>(&_bit_cast_src_53)[0];
+            rank_counts[1] = rank_counts[1] + ((staged_value_9 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_10 = 0.0f;
+            unsigned int _bit_cast_src_54 = keys[10];
+            staged_value_10 = reinterpret_cast<float*>(&_bit_cast_src_54)[0];
+            rank_counts[2] = rank_counts[2] + ((staged_value_10 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_11 = 0.0f;
+            unsigned int _bit_cast_src_55 = keys[11];
+            staged_value_11 = reinterpret_cast<float*>(&_bit_cast_src_55)[0];
+            rank_counts[3] = rank_counts[3] + ((staged_value_11 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_12 = 0.0f;
+            unsigned int _bit_cast_src_56 = keys[12];
+            staged_value_12 = reinterpret_cast<float*>(&_bit_cast_src_56)[0];
+            rank_counts[0] = rank_counts[0] + ((staged_value_12 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_13 = 0.0f;
+            unsigned int _bit_cast_src_57 = keys[13];
+            staged_value_13 = reinterpret_cast<float*>(&_bit_cast_src_57)[0];
+            rank_counts[1] = rank_counts[1] + ((staged_value_13 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_14 = 0.0f;
+            unsigned int _bit_cast_src_58 = keys[14];
+            staged_value_14 = reinterpret_cast<float*>(&_bit_cast_src_58)[0];
+            rank_counts[2] = rank_counts[2] + ((staged_value_14 > candidate_value_rank) ? 1.0f : 0.0f);
+            float staged_value_15 = 0.0f;
+            unsigned int _bit_cast_src_59 = keys[15];
+            staged_value_15 = reinterpret_cast<float*>(&_bit_cast_src_59)[0];
+            rank_counts[3] = rank_counts[3] + ((staged_value_15 > candidate_value_rank) ? 1.0f : 0.0f);
             if (candidates > 16) {
                 unsigned int keys_0[16];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -492,55 +500,74 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_owner_stage_entry_pref
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&keys_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&keys_0[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&keys_0[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&keys_0[(12) + 3]))
                     : "r"(stage_addr + (unsigned int)((stage_base + 96 + 28) * 4)));
-                if (keys_0[0] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[1] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[2] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[3] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[4] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[5] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[6] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[7] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[8] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[9] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[10] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[11] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[12] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[13] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[14] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
-                if (keys_0[15] > candidate_key) {
-                    candidate_rank = candidate_rank + 1;
-                }
+                float staged_value_16 = 0.0f;
+                unsigned int _bit_cast_src_60 = keys_0[0];
+                staged_value_16 = reinterpret_cast<float*>(&_bit_cast_src_60)[0];
+                rank_counts[0] = rank_counts[0] + ((staged_value_16 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_17 = 0.0f;
+                unsigned int _bit_cast_src_61 = keys_0[1];
+                staged_value_17 = reinterpret_cast<float*>(&_bit_cast_src_61)[0];
+                rank_counts[1] = rank_counts[1] + ((staged_value_17 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_18 = 0.0f;
+                unsigned int _bit_cast_src_62 = keys_0[2];
+                staged_value_18 = reinterpret_cast<float*>(&_bit_cast_src_62)[0];
+                rank_counts[2] = rank_counts[2] + ((staged_value_18 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_19 = 0.0f;
+                unsigned int _bit_cast_src_63 = keys_0[3];
+                staged_value_19 = reinterpret_cast<float*>(&_bit_cast_src_63)[0];
+                rank_counts[3] = rank_counts[3] + ((staged_value_19 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_20 = 0.0f;
+                unsigned int _bit_cast_src_64 = keys_0[4];
+                staged_value_20 = reinterpret_cast<float*>(&_bit_cast_src_64)[0];
+                rank_counts[0] = rank_counts[0] + ((staged_value_20 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_21 = 0.0f;
+                unsigned int _bit_cast_src_65 = keys_0[5];
+                staged_value_21 = reinterpret_cast<float*>(&_bit_cast_src_65)[0];
+                rank_counts[1] = rank_counts[1] + ((staged_value_21 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_22 = 0.0f;
+                unsigned int _bit_cast_src_66 = keys_0[6];
+                staged_value_22 = reinterpret_cast<float*>(&_bit_cast_src_66)[0];
+                rank_counts[2] = rank_counts[2] + ((staged_value_22 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_23 = 0.0f;
+                unsigned int _bit_cast_src_67 = keys_0[7];
+                staged_value_23 = reinterpret_cast<float*>(&_bit_cast_src_67)[0];
+                rank_counts[3] = rank_counts[3] + ((staged_value_23 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_24 = 0.0f;
+                unsigned int _bit_cast_src_68 = keys_0[8];
+                staged_value_24 = reinterpret_cast<float*>(&_bit_cast_src_68)[0];
+                rank_counts[0] = rank_counts[0] + ((staged_value_24 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_25 = 0.0f;
+                unsigned int _bit_cast_src_69 = keys_0[9];
+                staged_value_25 = reinterpret_cast<float*>(&_bit_cast_src_69)[0];
+                rank_counts[1] = rank_counts[1] + ((staged_value_25 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_26 = 0.0f;
+                unsigned int _bit_cast_src_70 = keys_0[10];
+                staged_value_26 = reinterpret_cast<float*>(&_bit_cast_src_70)[0];
+                rank_counts[2] = rank_counts[2] + ((staged_value_26 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_27 = 0.0f;
+                unsigned int _bit_cast_src_71 = keys_0[11];
+                staged_value_27 = reinterpret_cast<float*>(&_bit_cast_src_71)[0];
+                rank_counts[3] = rank_counts[3] + ((staged_value_27 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_28 = 0.0f;
+                unsigned int _bit_cast_src_72 = keys_0[12];
+                staged_value_28 = reinterpret_cast<float*>(&_bit_cast_src_72)[0];
+                rank_counts[0] = rank_counts[0] + ((staged_value_28 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_29 = 0.0f;
+                unsigned int _bit_cast_src_73 = keys_0[13];
+                staged_value_29 = reinterpret_cast<float*>(&_bit_cast_src_73)[0];
+                rank_counts[1] = rank_counts[1] + ((staged_value_29 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_30 = 0.0f;
+                unsigned int _bit_cast_src_74 = keys_0[14];
+                staged_value_30 = reinterpret_cast<float*>(&_bit_cast_src_74)[0];
+                rank_counts[2] = rank_counts[2] + ((staged_value_30 > candidate_value_rank) ? 1.0f : 0.0f);
+                float staged_value_31 = 0.0f;
+                unsigned int _bit_cast_src_75 = keys_0[15];
+                staged_value_31 = reinterpret_cast<float*>(&_bit_cast_src_75)[0];
+                rank_counts[3] = rank_counts[3] + ((staged_value_31 > candidate_value_rank) ? 1.0f : 0.0f);
             }
+            float candidate_rank_sum = rank_counts[0] + rank_counts[1] + (rank_counts[2] + rank_counts[3]);
+            int _min_76 = (((int)candidate_rank_sum) < (31) ? ((int)candidate_rank_sum) : (31));
+            int candidate_rank = ((_min_76) > (0) ? (_min_76) : (0));
             unsigned int tied_lanes = __ballot_sync(0xFFFFFFFF, candidates > lane);
             int rank_bit_set_r_0 = candidate_rank & 1;
             unsigned int rank_bit_lanes_r_0 = __ballot_sync(0xFFFFFFFF, rank_bit_set_r_0 != 0);
@@ -652,8 +679,8 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_owner_stage_entry_pref
             }
             __syncwarp();
             if (routed_top_k > lane) {
-                unsigned int _bit_cast_src_44 = stage[stage_base + 64 + lane];
-                selected_logit = reinterpret_cast<float*>(&_bit_cast_src_44)[0];
+                unsigned int _bit_cast_src_77 = stage[stage_base + 64 + lane];
+                selected_logit = reinterpret_cast<float*>(&_bit_cast_src_77)[0];
                 selected_expert = (int)stage[stage_base + 80 + lane];
             }
         }
@@ -771,8 +798,8 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_owner_stage_entry_pref
         int count_ordinal = 0;
         if (lane < top_k) {
             if (use_cta_reservations != 0) {
-                int _atomic_fetch_add_45 = atomicAdd(&local_offsets[selected_expert & MAX_EXPERTS - 1], 1);
-                count_ordinal = _atomic_fetch_add_45;
+                int _atomic_fetch_add_78 = atomicAdd(&local_offsets[selected_expert & MAX_EXPERTS - 1], 1);
+                count_ordinal = _atomic_fetch_add_78;
             } else {
                 atomicAdd(&local_offsets[selected_expert & MAX_EXPERTS - 1], 1);
             }
@@ -786,8 +813,8 @@ kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_owner_stage_entry_pref
         asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(selected_max) : "f"(selected_for_max));
         float selected_exp = 0.0f;
         if (softmax_top_k > lane) {
-            float _exp2_46 = approx_exp2((selected_logit - selected_max) * 1.442695f);
-            selected_exp = _exp2_46;
+            float _exp2_79 = approx_exp2((selected_logit - selected_max) * 1.442695f);
+            selected_exp = _exp2_79;
         }
         float selected_sum = selected_exp;
         #pragma unroll

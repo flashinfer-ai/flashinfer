@@ -133,7 +133,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "specializations": {},
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_103a"],
         "closure_sha256": "584440e8f6d6df05f1dc1e8b228af88b4d2667ce9b15e88db34207ea1a8fb876",
     },
     "cake_kimi_k3_nvfp4_situ_routed_moe_194f5c89b6e5659e023f": {
@@ -221,6 +221,49 @@ MODULES: dict[str, dict[str, Any]] = {
         "specializations": {},
         "arches": ["sm_100a", "sm_103a"],
         "closure_sha256": "2651b1c5946829ea0065f3869e4462ecf62b12a08a718218634ade1a84d63c8e",
+    },
+    "cake_kimi_k3_nvfp4_situ_routed_moe_1f5e15666872ca2273c0": {
+        "sources": [
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_1f5e15666872ca2273c0_kernel.cu",
+            "csrc/fused_moe/cake_kimi_k3_situ/cake_kimi_k3_nvfp4_situ_routed_moe_1f5e15666872ca2273c0_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "A"],
+            ["buffer", "B"],
+            ["tma_buffer", "SFA"],
+            ["buffer", "SFB"],
+            ["tma_buffer", "C"],
+            ["buffer", "SFC"],
+            ["buffer", "total_tiles"],
+            ["buffer", "x"],
+            ["buffer", "qx"],
+            ["buffer", "topk_ids"],
+            ["buffer", "token_to_permuted"],
+            ["buffer", "expert_counts"],
+            ["buffer", "expert_tile_offsets"],
+            ["buffer", "expert_scatter_offsets"],
+            ["buffer", "route_map"],
+            ["buffer", "tile_expert"],
+            ["buffer", "tile_mn_limit"],
+            ["buffer", "scale_c"],
+            ["buffer", "scale_gate"],
+            ["buffer", "clamp_limit"],
+            ["buffer", "act_alpha"],
+            ["buffer", "act_beta"],
+            ["parameter", "M_out"],
+            ["parameter", "K"],
+            ["parameter", "grid_m"],
+            ["parameter", "grid_n"],
+            ["parameter", "K_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "specializations": {},
+        "arches": ["sm_100a"],
+        "closure_sha256": "62400f8ae6078a5b476953f2698544cd3fc225810dd91461c32be806d14a991e",
     },
     "cake_kimi_k3_nvfp4_situ_routed_moe_21e60b8de2ebfd3e71bd": {
         "sources": [
@@ -1329,7 +1372,7 @@ KERNELS: dict[str, dict[str, str]] = {
         "fc1:n32_claim8": "cake_kimi_k3_nvfp4_situ_routed_moe_93e2350178fff1f9c9ac",
         "fc1:n8": "cake_kimi_k3_nvfp4_situ_routed_moe_d8a21008075dd1af4de1",
         "fc1:n8_persistent_ef": "cake_kimi_k3_nvfp4_situ_routed_moe_ffc17ea7b5160932a22c",
-        "fc1:n8_s2a": "cake_kimi_k3_nvfp4_situ_routed_moe_177a36ce879102b71f56",
+        "fc1:n8_s2a_m1ef": "cake_kimi_k3_nvfp4_situ_routed_moe_1f5e15666872ca2273c0",
         "fc2:n128": "cake_kimi_k3_nvfp4_situ_routed_moe_1b1fd4abd86b36aca7f2",
         "fc2:n128_q8i": "cake_kimi_k3_nvfp4_situ_routed_moe_d38238b36758aa7bd6d9",
         "fc2:n16": "cake_kimi_k3_nvfp4_situ_routed_moe_d49ae2797759f6ac37fb",
@@ -1423,6 +1466,7 @@ KERNELS: dict[str, dict[str, str]] = {
 #   194f5c export 160ede77     sm_100a=194f5c89b6e5659e023f
 #   1b1fd4 rev f8d3729e9       sm_100a=1b1fd4abd86b36aca7f2 sm_103a=d1df5f44ad0b1609b6ae
 #   1dc27d rev f8d3729e9       sm_100a=1dc27deff743b34ea395 sm_103a=9de635e77a52b5ac3cf9
+#   1f5e15 export 85f13cd1 m1  sm_100a=1f5e15666872ca2273c0
 #   2edb34 export 160ede77     sm_100a=2edb34923b075b7ab878
 #   33aa68 rev f8d3729e9       sm_100a=33aa68fb31dbfec22b5e sm_103a=2181a3eddddb148553eb
 #   43cac4 rev f8d3729e9       sm_100a=43cac4c0eddfbf24a375 sm_103a=e0380732d28096abc164

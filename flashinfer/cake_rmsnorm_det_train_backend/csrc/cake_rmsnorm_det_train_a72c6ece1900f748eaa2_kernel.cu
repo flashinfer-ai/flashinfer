@@ -47,21 +47,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_PARTIALS_OFF 0
-#define SMEM_PARTIALS_STAGE_BYTES 32
-#define SMEM_PARTIALS_STRIDE 32
-#define SMEM_TOTAL 128
-#define THREADS 64
-#define ROWS_PER_CTA 2
-#define GROUP_THREADS 64
-#define LAUNCH_BOUNDS_THREADS 64
-
 #include <math_constants.h>
 
 extern "C" {
 
-__global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) void
+__global__ __launch_bounds__(64) void
 kernel_cake_rmsnorm_det_train_a72c6ece1900f748eaa2(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, float* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, float eps, long long x_stride_p0, long long u_stride_p0)
 {
     const int tid = threadIdx.x;
@@ -83,12 +73,12 @@ kernel_cake_rmsnorm_det_train_a72c6ece1900f748eaa2(__nv_bfloat16* __restrict__ x
 
     // === Task calls (declaration order) ===
     int warp_0 = warp;
-    int group = tid / GROUP_THREADS;
-    int gtid = tid - group * GROUP_THREADS;
+    int group = tid / 64;
+    int gtid = tid - group * 64;
     float h_f = 2048.0f;
     int it = 0;
     #pragma unroll 1
-    for (int row0 = bid * ROWS_PER_CTA; row0 < T; row0 += num_bids * ROWS_PER_CTA) {
+    for (int row0 = bid * 2; row0 < T; row0 += num_bids * 2) {
         float x_cache[64];
         float sums[2];
         float zero = 0.0f;
@@ -106,7 +96,7 @@ kernel_cake_rmsnorm_det_train_a72c6ece1900f748eaa2(__nv_bfloat16* __restrict__ x
                 for (int v = 0; v < 2; v++) {
                     float _vec_load_0[16];
                     {
-                        const void* _v8p_0 = (const void*)(x + (xbasea + (long long)(gtid * 16 + v * (GROUP_THREADS * 16))) + (0));
+                        const void* _v8p_0 = (const void*)(x + (xbasea + (long long)(gtid * 16 + v * (64 * 16))) + (0));
                         uint32_t _v8_0_0[8];
                         asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
                             : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const void*)((const char*)_v8p_0 + 0)), "l"(0x12F0000000000000ULL) : "memory");
@@ -201,7 +191,7 @@ kernel_cake_rmsnorm_det_train_a72c6ece1900f748eaa2(__nv_bfloat16* __restrict__ x
                         unsigned _ldv8_3_6;
                         unsigned _ldv8_3_7;
                         asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                            : "=r"(_ldv8_3_0), "=r"(_ldv8_3_1), "=r"(_ldv8_3_2), "=r"(_ldv8_3_3), "=r"(_ldv8_3_4), "=r"(_ldv8_3_5), "=r"(_ldv8_3_6), "=r"(_ldv8_3_7) : "l"((const void*)(w + (gtid * 16 + v_2 * (GROUP_THREADS * 16)) + (0))) : "memory");
+                            : "=r"(_ldv8_3_0), "=r"(_ldv8_3_1), "=r"(_ldv8_3_2), "=r"(_ldv8_3_3), "=r"(_ldv8_3_4), "=r"(_ldv8_3_5), "=r"(_ldv8_3_6), "=r"(_ldv8_3_7) : "l"((const void*)(w + (gtid * 16 + v_2 * (64 * 16)) + (0))) : "memory");
                         _vec_load_1[0 + 0] = __uint_as_float(_ldv8_3_0);
                         _vec_load_1[0 + 1] = __uint_as_float(_ldv8_3_1);
                         _vec_load_1[0 + 2] = __uint_as_float(_ldv8_3_2);
@@ -221,7 +211,7 @@ kernel_cake_rmsnorm_det_train_a72c6ece1900f748eaa2(__nv_bfloat16* __restrict__ x
                         unsigned _ldv8_4_6;
                         unsigned _ldv8_4_7;
                         asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                            : "=r"(_ldv8_4_0), "=r"(_ldv8_4_1), "=r"(_ldv8_4_2), "=r"(_ldv8_4_3), "=r"(_ldv8_4_4), "=r"(_ldv8_4_5), "=r"(_ldv8_4_6), "=r"(_ldv8_4_7) : "l"((const void*)(w + (gtid * 16 + v_2 * (GROUP_THREADS * 16) + 8) + (0))) : "memory");
+                            : "=r"(_ldv8_4_0), "=r"(_ldv8_4_1), "=r"(_ldv8_4_2), "=r"(_ldv8_4_3), "=r"(_ldv8_4_4), "=r"(_ldv8_4_5), "=r"(_ldv8_4_6), "=r"(_ldv8_4_7) : "l"((const void*)(w + (gtid * 16 + v_2 * (64 * 16) + 8) + (0))) : "memory");
                         _vec_load_1[8 + 0] = __uint_as_float(_ldv8_4_0);
                         _vec_load_1[8 + 1] = __uint_as_float(_ldv8_4_1);
                         _vec_load_1[8 + 2] = __uint_as_float(_ldv8_4_2);
@@ -280,7 +270,7 @@ kernel_cake_rmsnorm_det_train_a72c6ece1900f748eaa2(__nv_bfloat16* __restrict__ x
                         const unsigned* _raw_stv8_5 = reinterpret_cast<const unsigned*>(packed_1);
                         asm volatile(
                             "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                            :: "l"((void*)(y + (obasec + (long long)(gtid * 16 + v_2 * (GROUP_THREADS * 16))))), "r"(_raw_stv8_5[0]), "r"(_raw_stv8_5[1]), "r"(_raw_stv8_5[2]), "r"(_raw_stv8_5[3]), "r"(_raw_stv8_5[4]), "r"(_raw_stv8_5[5]), "r"(_raw_stv8_5[6]), "r"(_raw_stv8_5[7]) : "memory");
+                            :: "l"((void*)(y + (obasec + (long long)(gtid * 16 + v_2 * (64 * 16))))), "r"(_raw_stv8_5[0]), "r"(_raw_stv8_5[1]), "r"(_raw_stv8_5[2]), "r"(_raw_stv8_5[3]), "r"(_raw_stv8_5[4]), "r"(_raw_stv8_5[5]), "r"(_raw_stv8_5[6]), "r"(_raw_stv8_5[7]) : "memory");
                     }
                 }
             }

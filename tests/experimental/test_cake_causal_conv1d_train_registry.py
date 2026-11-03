@@ -646,7 +646,7 @@ def test_row_plans_follow_a_replaced_override_table(
     arch, fake_device, monkeypatch
 ) -> None:
     """A row planned before ``TILE_OVERRIDES`` changes keeps its plan until :func:`plan_cache_clear` empties the
-    cache; after it, with the rows of every architecture on ``arch`` (sm_107a ships none), every row's calls on both
+    cache; after it, with the rows of every architecture on ``arch``, every row's calls on both
     sides of its token range plan as a per-call plan does, the override's tiles inside the range."""
 
     fake_device(arch, PLAN_SWEEP_SMS[arch][0])

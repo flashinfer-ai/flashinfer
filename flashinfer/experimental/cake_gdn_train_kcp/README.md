@@ -107,18 +107,25 @@ The packed GDN training routes come in four combinations:
   `chunk_gdn_bwd_kcp`) take `deterministic: bool = True` as well and raise
   `ValueError` unless it is `False`: the package holds no deterministic
   program and never falls back.
-* Faster schedule: the default segment plan of this package (`fill_small`)
+* Faster schedule: the default segment plan of this package (`fill_small_guard`)
   walks fewer intra-rank segments than the deterministic package's plan where
   segment merges cost more than they save: at `HV <= 12`, when no fragment
   exceeds 160 chunks, every rank walks each fragment as one chain (`P = 1`: no
   segment merges, compose chain or staging planes); elsewhere a rank below the
-  256-step chain cap takes the one-wave fill `P` when that is smaller.  It
+  256-step chain cap takes the one-wave fill `P` when that is smaller.  On
+  GPUs with at least 153 SMs (R200) a row guard keeps the deterministic
+  package's plan when every rank holds at least two fragments, the fill
+  would walk a fragment of at least 200 chunks as one chain (`P = 1`), and
+  that raises the slowest rank's walk steps above those of the deterministic
+  package's plan (on a zigzag rank with three fragments that walk becomes the
+  row's slowest walk); B200 and B300 / GB300 plans are unchanged by the
+  guard.  It
   never raises a rank's `P`, needs no host synchronization, and the plan stays
   a pure function of the fragment tables, `HV` and the SM count (the same `P`
   on every rank).  A context built with `graph_replay=True` (for calls with
-  `graph="replay"`) keeps the one-wave fill but not the `P = 1` rows
-  (`fill_down`): graph replay removes the launch cost that the fewer merges
-  save, and the longer walks then cost more.
+  `graph="replay"`) keeps the one-wave fill and the guard but not the `P = 1`
+  rows (`fill_down_guard`): graph replay removes the launch cost that the
+  fewer merges save, and the longer walks then cost more.
 * Reproducibility: the results are not bitwise equal to the deterministic
   package's (the different segment plan and the fixed-order levers of this
   package reassociate FP32 sums).  Every path of
@@ -159,6 +166,11 @@ The packed GDN training routes come in four combinations:
   `layout="copy"` makes a contiguous copy first; its time is part of the
   measured module when reported.  Strided and contiguous inputs give the
   same results within the accuracy budgets.
+* When `q` / `k` / `v` are head views of one packed row, take them with
+  `packed_qkv_views_kcp` for full backward speed: plain `split` views of the
+  row give the same gradients, but torch's split backward concatenates them:
+  about 0.2 ms (6-7 %) more backward on B200 and GB300 and 0.17 ms (7-8 %) on
+  R200 at `(16, 48)` and 32,768 tokens (**Packed Q/K/V** below).
 * `scale` defaults to `128 ** -0.5`.
 * The host reads no tensor contents (no `.item()`, `.tolist()`, no implicit
   synchronization): every table is built on the CPU from the partition
@@ -242,7 +254,7 @@ eager calls too.
 | `graph` | **`"off"`**, `"replay"` | CUDA-graph replay of the steady state (a static pool per key) |
 | `reuse_recompute_tapes` | **`"auto"`**, `True`, `False` | under `torch.utils.checkpoint(use_reentrant=False)` the light backward binds the forward tapes torch's recompute just wrote instead of replaying #1 and the #2 tape walk (bitwise the same gradients, the retention unchanged; a no-op outside that backward; `False` restores the replay form). `"auto"` keeps the tapes only when the GDN node is the last operation of the checkpointed region that saves a tensor (the same checkpoint-frame proof as `recompute_output="auto"`): then its backward is the region's first and the kept tapes die before any other backward runs; with a later saver in the region (an output projection, an MLP) the kept set would live through those operations' backward and raise the region's backward peak by the full tape set (`gdn_saved_bytes_kcp(save_mode="full")` minus the saved states), so `"auto"` takes the replay form there. Measured on one GB300 (torch 2.14.1), 261,987 tokens, `(H_qk, HV) = (2, 6)`: a region of GDN + a 768x768 output projection + a 768->2x2048->768 SwiGLU has a backward peak of 9250.54 MiB with the kept tapes (`True`) and 6927.31 MiB with the replay form (`False` and `"auto"`), at 21.29 vs 22.70 ms per training step of the region; a region the GDN node closes keeps the tapes under `"auto"` (five 240k-262k-token (16, 48) packs: training step and steady peak unchanged against `True`). `True` always keeps the tapes, `False` never. With `graph="replay"`, the one mode that excludes the kept tapes, the default is `False` and an explicit `True` / `"auto"` is refused. One live kept set: in a checkpoint segment with several GDN layers only the last layer skips the replay, the earlier layers replay as before |
 | `recompute_output` | **`"auto"`**, `"always"` | under `torch.utils.checkpoint(use_reentrant=False)` torch re-runs the forward inside `.backward()` only to re-save its tensors and discards that run's output; when the GDN node is the last operation of the checkpointed region that saves a tensor, `"auto"` does not launch the output program (#5) of that re-run. The proof is read from torch's checkpoint frame (the node is executable, the remaining saved-tensor holders are exactly this node's, early stop is on, and the torch release -- `torch.__version__` without its local `+cuNNN` build tag (`cake_kcp.torch_release`) -- is one of the verified releases in `cake_kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS`); any other state -- a later saver in the region such as the next layer or a norm on the output, a non-executable node, a reentrant checkpoint, `graph="replay"`, another torch build -- launches it as before, and `cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]` records why. Gradients and retained bytes are the same either way; `"always"` is the unconditional launch |
-| `p_rule`, `walk_seg` | plan policy / explicit override | how many intra-rank segments a fragment is walked as (`P`); a function of metadata and the SM count only. The shipped policy `fill_small` starts from the deterministic twin's `row_cost_lpt` plan, which costs the three per-rank programs over every rank's fragment table with a crossing-aware model and switches the whole row away from the per-rank default only when an alternative is cheaper by at least its margin (2 % for the `occ` program; 0 % for the `one` program, which has no segment composition and takes a model tie), then lowers `P` as described under "Numerical mode" (faster schedule); the same topology gives the same `P` on every rank |
+| `p_rule`, `walk_seg` | plan policy / explicit override | how many intra-rank segments a fragment is walked as (`P`); a function of metadata and the SM count only. The shipped policy `fill_small_guard` starts from the deterministic twin's `row_cost_lpt` plan, which costs the three per-rank programs over every rank's fragment table with a crossing-aware model and switches the whole row away from the per-rank default only when an alternative is cheaper by at least its margin (2 % for the `occ` program; 0 % for the `one` program, which has no segment composition and takes a model tie), then lowers `P` as described under "Numerical mode" (faster schedule); the same topology gives the same `P` on every rank |
 | `offset_class` | **`"fla"`**, `"fp32"` | the class of the forward offset `B_f`: the walk from zero with the reference rounding points, or an FP32 walk (`B_f` only) |
 | `use_qk_l2norm_in_kernel` | **`False`**, `True` | the per-token L2 norm of every 128-channel Q / K head inside the programs (FLA's `use_qk_l2norm_in_kernel`; see "In-kernel Q / K L2 norm" below); a literal keyword of the three entry points as well |
 | `test_knobs` | **`None`** | names the test-only values a test selects (`precision_mode` 1 or 2) and private levers such as `fwdh_vh` (forces the #2 value width) and `fused_o` (`0` forces the split tape walk and #5); without it every test-only value is refused |
@@ -334,6 +346,54 @@ row, and the split's backward returns that row as the gradient of `qkv`: no
 concatenation and no copy between the GDN backward and the convolution's
 backward.  The gradient values are bitwise those of separate operands
 (`LAST_CALL["bwd"]["grad_layout"]` is `"packed"` or `"separate"`).
+
+Callers whose `q` / `k` / `v` are head views of one packed row get the full
+backward speed through `packed_qkv_views_kcp`.  Its conditions: `qkv` is
+dense over `[..., T, (2 H_qk + HV) * 128]` (channel stride 1 and token stride
+exactly `(2 H_qk + HV) * 128`; a column slice of a wider row does not
+qualify), `q` / `k` / `v` are its three head views in that order, and the GDN
+call keeps the default `layout="tma"` (`layout="copy"` gives the programs
+contiguous copies, so the gradients come back as three rows and the split
+concatenates them).  Plain views of the same row
+(`qkv.split((H_qk * 128, H_qk * 128, HV * 128), -1)`, then
+`.view(T, heads, 128)`) run the same programs on the same operands and give
+the same results (within the accuracy budgets; bitwise in every run measured
+below).  The backward writes one packed row only for the outputs of
+`packed_qkv_views_kcp` (or of the deterministic package's
+`packed_qkv_views_det_kcp`), as recorded by the forward.  For plain views,
+column slices and other views it writes three contiguous `dq` / `dk` / `dv`,
+and torch's split backward concatenates them into a new row.  Measured cost
+of the plain views (the #8367 repro with `deterministic=False`:
+`(H_qk, HV) = (16, 48)`, 32,768 tokens in five documents, one-rank context,
+forward and backward to the packed row, and the checkpointed step
+`torch.utils.checkpoint(views + chunk_gdn_kcp, use_reentrant=False)` =
+two forwards and one backward; CUDA-event ms, the median of 16 group
+medians (2 runs x 8 groups; a group = 2 blocks of 5 warm-up + 20 timed calls
+per view form, the forms interleaved in palindromic order).  The B200
+norm-off forward and backward reached the GPU's power cap: they are the
+median of the steady-block medians of 3 palindromic block pairs (a block =
+5 s idle, 20 warm-up calls, 300 timed calls), which still hit the cap in
+more than 5 % of the samples, so take them as approximate.  One GPU per
+exclusive node (R200: a 208-SM board); PyTorch 2.14.1+cu130, CUDA 13.0
+runtime:
+
+| GPU | in-kernel L2 norm | forward split / packed | backward split / packed | backward split - packed | checkpointed step split / packed |
+|---|---|---|---|---|---|
+| B200 (sm_100a, 148 SMs) | off | 1.436 / 1.432 | 3.389 / 3.187 | +0.202 (1.063x) | 4.992 / 4.795 (1.041x) |
+| B200 (sm_100a, 148 SMs) | on | 1.619 / 1.611 | 3.680 / 3.474 | +0.206 (1.059x) | 5.446 / 5.248 (1.038x) |
+| GB300 (sm_103a, 152 SMs) | off | 1.302 / 1.298 | 3.142 / 2.947 | +0.195 (1.066x) | 4.562 / 4.387 (1.040x) |
+| GB300 (sm_103a, 152 SMs) | on | 1.469 / 1.465 | 3.440 / 3.244 | +0.196 (1.060x) | 5.039 / 4.857 (1.037x) |
+| R200 (sm_107a, 208 SMs) | off | 0.945 / 0.944 | 2.264 / 2.090 | +0.174 (1.083x) | 3.309 / 3.144 (1.052x) |
+| R200 (sm_107a, 208 SMs) | on | 1.075 / 1.072 | 2.460 / 2.289 | +0.171 (1.075x) | 3.641 / 3.474 (1.048x) |
+
+The three views are the outputs of one custom autograd node.  Hooks and
+`retain_grad` on them fire as on any autograd output.  Its backward returns
+the incoming packed row itself when `dq` / `dk` / `dv` are the head views of
+one row of `qkv`'s shape and dtype (`PACKED_SPLIT_STATS["aliased"]`), and
+concatenates them otherwise (`PACKED_SPLIT_STATS["concatenated"]`): a missing
+gradient counts as zeros, and a hook that returns a new gradient also makes it
+concatenate.  Autograd refuses an in-place change to the views while `qkv`
+requires grad.  Plain `split` views keep torch's own autograd path and hooks.
 
 ```
 gdn_comm_bytes_kcp(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1_send, b2_recv, halo_fwd, halo_bwd}}
@@ -506,6 +566,6 @@ Experimental.  The kernels are the deterministic route's programs, rendered
 from the same Cake sources under this package's names, and the output walk
 `kcp_fwdh_out`, which has no deterministic twin; `build.json`'s
 `generator` block names the producing revision.  This package differs from
-its deterministic twin in the default segment plan (`fill_small`, see
+its deterministic twin in the default segment plan (`fill_small_guard`, see
 "Numerical mode").  The tests are `tests/experimental/test_cake_gdn_train_kcp*.py`
 (API, single GPU and multi-GPU rows).

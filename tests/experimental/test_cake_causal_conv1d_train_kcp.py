@@ -25,8 +25,9 @@ suite's rows, contexts and FP64 oracle, plus a C = 10240 row for (a) and (b).
 (c) The autograd entry equals the direct calls (``y`` / ``dx`` bitwise), activation checkpointing with and without a
     recompute handle (2 x forward + backward; one exchange per direction, none in a recompute with a handle),
     gradient accumulation, graph replay (bitwise ``y`` / ``hist`` / ``dx``), the legacy channel-tile plan, the side
-    kernel of FlashInfer issues #7038 / #7548 (the backward is an ordinary launch: no stall beside a resident kernel)
-    and torch's deterministic mode (the backward alerts).
+    kernel of FlashInfer issues #7038 / #7548 (the backward is an ordinary launch: no stall beside a resident kernel),
+    the grid that gives up one SM when the last channel-tile rank is partial (issue #8365) and torch's deterministic
+    mode (the backward alerts).
 
 Every test skips until the exporter has rendered the non-deterministic package.
 """
@@ -255,6 +256,84 @@ def test_kcp_plans_with_the_legacy_tile_rule(monkeypatch):
         p.x_local, p.w, p.ctx, p.dy_local, hist_det
     )
     assert torch.equal(dx, dx_det) and torch.isfinite(dw).all()
+
+
+def _one_sm_rows(device: torch.device) -> list[tuple[int, tuple[int, int, int]]]:
+    """``(C, expected main backward grid)`` of the first ``C`` (a multiple of 1024 up to 16384) whose single-wave grid
+    gives up one SM's CTAs on this device and of the first whose grid stays whole (issue #8365): ``ctas_per_sm x SM
+    count`` less ``ctas_per_sm`` when ``grid % n_ch_tiles >= ctas_per_sm``, from the record and the legacy split."""
+
+    arch = conv_kcp._loader.device_arch(device.index)
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    rows: dict[bool, tuple[int, tuple[int, int, int]]] = {}
+    for C in range(1024, 16385, 1024):
+        (name,) = conv_kcp.selected_modules(arch, conv_kcp.KCP_BWD, C=C)
+        rule = conv_kcp._loader.MODULES[name]["grid_rule"]
+        k, mult = int(rule["ctas_per_sm"]), int(rule["grid_mult"][arch])
+        full = mult * k * sms
+        n = conv_kcp.plan(1, C, 1, geometry=rule["geometry"], legacy=True)["n_ch_tiles"]
+        trims = mult == 1 and full % n >= k
+        rows.setdefault(trims, (C, (full - k if trims else full, 1, 1)))
+    return [rows[t] for t in (True, False) if t in rows]
+
+
+def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
+    monkeypatch,
+) -> None:
+    """FlashInfer issue #8365: the main backward launches ``ctas_per_sm x SM count`` CTAs, less ``ctas_per_sm`` when
+    the last channel-tile rank of that grid holds at least ``ctas_per_sm`` CTAs (so a kernel on another stream that
+    keeps one SM's shared memory leaves the launch one wave), else the whole grid, on both host paths; ``dx`` is
+    bitwise the deterministic backward's, ``dweight`` within budget of the FP64 oracle and the workspace reads back
+    zero either way."""
+
+    device = torch.device("cuda")
+    rows = _one_sm_rows(device)
+    assert len(rows) == 2, rows
+    seen = []
+    launch_plan, run_module = conv_kcp._launch_plan, conv_kcp.run_module
+
+    def main(name: str) -> bool:
+        return conv_kcp._loader.MODULES[name]["role"] == conv_kcp.KCP_BWD
+
+    def recording_plan(name, grid, device_index):
+        if main(name):
+            seen.append(tuple(grid))
+        return launch_plan(name, grid, device_index)
+
+    def recording_run(name, values, *, device_index, grid=None):
+        if main(name):
+            seen.append(None if grid is None else tuple(grid))
+        return run_module(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(conv_kcp, "_launch_plan", recording_plan)
+    monkeypatch.setattr(conv_kcp, "run_module", recording_run)
+    monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
+    try:
+        for C, expected in rows:
+            p = _problem((5000, 1003), (1, 2, 4997, 1003), C, device)
+            _, hist = _fwd(p.x_local, p.w, p.ctx)
+            _, hist_det = det_kcp.cake_causal_conv1d_det_forward_kcp(
+                p.x_local, p.w, p.ctx
+            )
+            dx_det, _ = det_kcp.cake_causal_conv1d_det_backward_kcp(
+                p.x_local, p.w, p.ctx, p.dy_local, hist_det
+            )
+            _, _, dw_ref = _reference(p.x, p.w, p.cu, p.dy)
+            for host_trim in (1, 0):
+                conv_kcp._set_test_knobs({"host_trim": host_trim})
+                conv_kcp.host_cache_clear()
+                seen.clear()
+                dx, dw = _bwd(p.x_local, p.w, p.ctx, p.dy_local, hist)
+                torch.cuda.synchronize()
+                label = f"C={C} host_trim={host_trim}"
+                assert seen == [expected], (label, seen)
+                assert torch.equal(_bits(dx), _bits(dx_det)), label
+                _dw_within(dw, dw_ref, f"dweight vs FP64 oracle, {label}")
+                held = _stream_workspace()
+                assert held is None or int(torch.count_nonzero(held)) == 0, label
+    finally:
+        conv_kcp._set_test_knobs(None)
+        conv_kcp.host_cache_clear()
 
 
 @pytest.mark.parametrize("form", ["knob", "keyword"])

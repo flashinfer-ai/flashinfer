@@ -1702,9 +1702,32 @@ class _WgmmaWindow(NamedTuple):
 # tile, timed through tinygemm_bf16 at every shape measured inside the window, was
 # bit for bit equal, at least 3% faster than the reference, and faster than the
 # selected tile in every round and by at least the larger of 0.5% and 40 ns at the
-# median; the windows of the cluster tiles keep their tile.  The packed tiles serve
-# inputs that are multiples of 64 only: off that step they measured at parity.
+# median; the windows of the cluster tiles keep their tile, and a window moves to
+# a cluster tile under the same rule.  The packed tiles serve inputs that are
+# multiples of 64 only: off that step they measured at parity.
 _TINYGEMM2_WGMMA_WINDOWS: Tuple[_WgmmaWindow, ...] = (
+    _WgmmaWindow("CLUSTER_S8U8", 2, 7, False, 17, 128, 2113, 2879),
+    _WgmmaWindow("CLUSTER_S8U8", 9, 12, False, 17, 127, 2880, 4096),
+    _WgmmaWindow("CLUSTER_S8U8", 13, 13, False, 17, 127, 2880, 2880),
+    _WgmmaWindow("CLUSTER_S8U8", 16, 16, False, 17, 128, 2880, 4096),
+    _WgmmaWindow("CLUSTER_S8U8", 9, 12, False, 128, 128, 2880, 4095),
+    _WgmmaWindow("CLUSTER_S8U8", 13, 13, False, 128, 128, 2880, 4096),
+    _WgmmaWindow("CLUSTER_S8U8", 1, 2, False, 129, 255, 2880, 4095),
+    _WgmmaWindow("CLUSTER_S8U8", 5, 6, False, 129, 255, 2880, 2880),
+    _WgmmaWindow("CLUSTER_S8U8", 7, 7, False, 129, 255, 2880, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 14, 15, False, 17, 128, 2881, 4096),
+    _WgmmaWindow("CLUSTER_S8U8", 13, 13, False, 17, 127, 4096, 4096),
+    _WgmmaWindow("CLUSTER_S8U8", 1, 1, False, 256, 383, 4096, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 7, 8, False, 256, 256, 4096, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 1, 1, False, 129, 255, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 2, 2, False, 129, 384, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 3, 3, False, 129, 256, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 4, 6, False, 129, 384, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 8, 8, False, 129, 255, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 8, 8, False, 257, 384, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 1, 1, False, 384, 384, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 3, 3, False, 384, 384, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 7, 7, False, 384, 384, 4097, 14336),
     _WgmmaWindow("PACKED_S8", 1, 1, False, 2880, 2880, 2880, 2880),
     _WgmmaWindow("PACKED_U4_IL", 1, 1, False, 4096, 4096, 4096, 4096),
     _WgmmaWindow("PACKED_S8", 4, 4, False, 2880, 2880, 2880, 2880),
@@ -1907,6 +1930,17 @@ _TINYGEMM2_WGMMA_WINDOWS: Tuple[_WgmmaWindow, ...] = (
     _WgmmaWindow("ACCUMULATORS_CN32", 64, 64, False, 2049, 4096, 14336, 14336),
     _WgmmaWindow("ACCUMULATORS_CN16", 9, 32, False, 2880, 2880, 14336, 14336),
     _WgmmaWindow("PACKED_U4_IL", 1, 12, False, 2881, 4096, 7168, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 3, 13, True, 16, 16, 2113, 2879),
+    _WgmmaWindow("CLUSTER_S8U8", 4, 4, True, 128, 128, 4096, 4096),
+    _WgmmaWindow("CLUSTER_S8U8", 7, 7, True, 128, 128, 4096, 4096),
+    _WgmmaWindow("CLUSTER_S8U8", 13, 13, True, 128, 128, 4096, 4096),
+    _WgmmaWindow("CLUSTER_S8U8", 1, 2, True, 129, 384, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 3, 3, True, 129, 256, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 4, 6, True, 129, 384, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 7, 7, True, 129, 256, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 8, 8, True, 129, 384, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 3, 3, True, 384, 384, 4097, 14336),
+    _WgmmaWindow("CLUSTER_S8U8", 7, 7, True, 384, 384, 4097, 14336),
     _WgmmaWindow("CLUSTER_S8U8", 1, 1, True, 128, 128, 4096, 4096),
     _WgmmaWindow("PACKED_S8", 1, 1, True, 2880, 2880, 2880, 2880),
     _WgmmaWindow("PACKED_S8", 4, 4, True, 2880, 2880, 2880, 2880),
